@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use gts::GtsTypeId;
+use gts::{GtsInstanceId, GtsTypeId};
 use uuid::Uuid;
 
 use super::commit::TxCommitHandleParts;
@@ -21,7 +21,7 @@ use super::{
 };
 use crate::error::{ConsumerError, EventBrokerError};
 use crate::gts::{EventV1, StoredPosition};
-use crate::ids::{ConsumerGroupId, TopicId};
+use crate::ids::ConsumerGroupId;
 use crate::sequence::Sequence;
 use crate::warn_capture::WarnCapture;
 
@@ -30,9 +30,9 @@ fn group() -> ConsumerGroupId {
     ConsumerGroupId::new(Uuid::from_u128(0x7501))
 }
 
-/// The topic id every handle in these tests commits for.
-fn topic_id() -> TopicId {
-    TopicId::new(Uuid::from_u128(0x7502))
+/// The topic every handle in these tests commits for.
+fn topic() -> GtsInstanceId {
+    ginst(TOPIC)
 }
 
 /// `[ok, ok, bad]` at sequences 41 to 43: `k = 2`, `last = 42`.
@@ -45,7 +45,7 @@ const DECODE_REASON: &str = "event data of gts.cf.core.events.event.v1~example.o
                              does not decode as the payload type (data)";
 
 /// One offset write: group, topic, partition and offset.
-type RecordedCommit = (ConsumerGroupId, TopicId, u32, i64);
+type RecordedCommit = (ConsumerGroupId, GtsInstanceId, u32, i64);
 
 /// Records every offset written into a transaction.
 #[derive(Default)]
@@ -58,7 +58,7 @@ impl OffsetStore for RecordingTxOffsetManager {
     async fn load_position(
         &self,
         _group: &ConsumerGroupId,
-        _topic: &TopicId,
+        _topic: &GtsInstanceId,
         _partition: u32,
     ) -> Result<Position, OffsetManagerError> {
         Ok(Fallback::Earliest.into())
@@ -71,7 +71,7 @@ impl CommitOffsetInTx for RecordingTxOffsetManager {
         &self,
         _txn: &TX,
         group: &ConsumerGroupId,
-        topic: &TopicId,
+        topic: &GtsInstanceId,
         partition: u32,
         offset: Sequence,
     ) -> Result<(), OffsetManagerError>
@@ -81,7 +81,7 @@ impl CommitOffsetInTx for RecordingTxOffsetManager {
         self.calls
             .lock()
             .unwrap()
-            .push((*group, *topic, partition, offset.as_i64()));
+            .push((*group, topic.clone(), partition, offset.as_i64()));
         Ok(())
     }
 }
@@ -322,7 +322,7 @@ async fn deliver_through(
         offsets: positions.iter().map(|at| at.sequence).collect(),
         offset_manager: manager.clone(),
         group: group(),
-        topic: topic_id(),
+        topic: topic(),
     });
     let committed = handle.committed_offset.clone();
     let result = adapter
@@ -361,7 +361,7 @@ async fn deliver_batch(
 }
 
 fn write(offset: i64) -> RecordedCommit {
-    (group(), topic_id(), 7, offset)
+    (group(), topic(), 7, offset)
 }
 
 /// The typed single-event call for [`good_at`]`(id, ..)`, with a handle over `scope`.

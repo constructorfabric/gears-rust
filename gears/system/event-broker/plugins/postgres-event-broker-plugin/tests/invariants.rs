@@ -45,10 +45,6 @@ fn topic() -> GtsInstanceId {
     .unwrap()
 }
 
-fn topic_uuid(topic: &GtsInstanceId) -> Uuid {
-    event_broker_sdk::backend::support::topic_uuid(topic)
-}
-
 /// Event `n`, the same bytes every run: the figures a violation reports are
 /// exact.
 fn keyed(n: u64) -> KeyedEvent {
@@ -56,14 +52,16 @@ fn keyed(n: u64) -> KeyedEvent {
         key: format!("k{}", n % 7),
         event: Event {
             id: Uuid::from_u128(u128::from(n) + 1),
-            type_id: GtsTypeId::new("gts.cf.core.events.event.v1~cf.pgtest.x.happened.v1~"),
-            tenant_id: Uuid::from_u128(1),
+            event_type: GtsTypeId::new("gts.cf.core.events.event.v1~cf.pgtest.x.happened.v1~"),
+            subject_tenant: Uuid::from_u128(1),
             source: "pgtest".to_owned(),
             subject: format!("s-{n:06}"),
             subject_type: GtsTypeId::new("gts.cf.pgtest.x.thing.v1~"),
+            subject_owner: None,
             occurred_at: "2026-01-01T00:00:00Z".parse().unwrap(),
             trace_parent: None,
             data: Some(serde_json::json!({ "n": format!("{n:06}") })),
+            ingest: None,
             partition: None,
             sequence: None,
             sequence_time: None,
@@ -72,11 +70,15 @@ fn keyed(n: u64) -> KeyedEvent {
     }
 }
 
-async fn provision(backend: &dyn Backend, topic: &GtsInstanceId, retention: Retention) {
+/// Provisions `topic` under a fresh Registry Reference and returns it, the
+/// key of every row and table of the topic.
+async fn provision(backend: &dyn Backend, topic: &GtsInstanceId, retention: Retention) -> Uuid {
+    let reference = Uuid::new_v4();
     backend
         .provision(
             &TopicSpec {
                 topic: topic.clone(),
+                uuid: reference,
                 partitions: 1,
                 retention,
             },
@@ -87,6 +89,7 @@ async fn provision(backend: &dyn Backend, topic: &GtsInstanceId, retention: Rete
         )
         .await
         .expect("provision");
+    reference
 }
 
 /// Appends events `from..from + count` under fence `(key, seq)`: one fence key
@@ -177,7 +180,7 @@ async fn invariants_hold_after_every_segment_state() {
     let by_age = topic();
     let by_bytes = topic();
     let kept = topic();
-    provision(
+    let by_age_reference = provision(
         backend.as_ref(),
         &by_age,
         Retention {
@@ -186,7 +189,7 @@ async fn invariants_hold_after_every_segment_state() {
         },
     )
     .await;
-    provision(
+    let by_bytes_reference = provision(
         backend.as_ref(),
         &by_bytes,
         Retention {
@@ -218,8 +221,8 @@ async fn invariants_hold_after_every_segment_state() {
     // Proof the workload crossed every state: both bounded topics removed
     // segments, and S3 above found none still expired or detaching.
     assert_eq!(heads(&pool, &schema).await, vec![600, 600, 600]);
-    assert!(floor(&pool, &schema, topic_uuid(&by_age)).await > 0);
-    assert!(floor(&pool, &schema, topic_uuid(&by_bytes)).await > 0);
+    assert!(floor(&pool, &schema, by_age_reference).await > 0);
+    assert!(floor(&pool, &schema, by_bytes_reference).await > 0);
 
     // A fresh session defines the check again, finds nothing, and leaves the
     // schema as it found it. The backend stops first: its maintenance keeps
@@ -260,14 +263,13 @@ impl Broken {
         let schema = common::fresh_schema();
         let backend = common::backend(&server.url, &schema, small_segments()).await;
         let topic = topic();
-        provision(backend.as_ref(), &topic, KEEP).await;
+        let t = provision(backend.as_ref(), &topic, KEEP).await;
         append(backend.as_ref(), &topic, (1, 1), 0, 120).await;
         let mut invariants = Invariants::connect(&server.url)
             .await
             .expect("check session");
         check_settles(&mut invariants, &schema, Mode::Settled, &[]).await;
         backend.stop(CancellationToken::new()).await;
-        let t = topic_uuid(&topic);
         let pool = PgPool::connect(&server.url).await.expect("control pool");
         Self {
             _server: server,
@@ -343,7 +345,7 @@ async fn l1_floor_below_zero() {
 async fn l2_an_event_above_the_head() {
     let mut b = Broken::new("invariant-l2").await;
     b.run(format!(
-        "INSERT INTO {s}.{p} SELECT 130, sequence_time, tenant_id, body FROM {s}.{p} WHERE sequence = 120",
+        "INSERT INTO {s}.{p} SELECT 130, sequence_time, subject_tenant, body FROM {s}.{p} WHERE sequence = 120",
         s = b.schema,
         p = b.parent
     ))

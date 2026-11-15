@@ -123,6 +123,85 @@ async fn the_binding_and_identity_tables_have_typed_columns() {
     );
 }
 
+/// `(seqno, column)` of every column of index `name`, and whether it is
+/// unique, as `SQLite` reports them.
+async fn index_info(
+    conn: &sea_orm::DatabaseConnection,
+    table: &str,
+    name: &str,
+) -> (Vec<(i64, String)>, bool) {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let unique = conn
+        .query_all_raw(Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            format!("PRAGMA index_list({table})"),
+        ))
+        .await
+        .expect("read the table's indexes")
+        .into_iter()
+        .find(|row| row.try_get::<String>("", "name").expect("name") == name)
+        .unwrap_or_else(|| panic!("{table} has no index {name}"))
+        .try_get::<i64>("", "unique")
+        .expect("unique")
+        == 1;
+    let columns = conn
+        .query_all_raw(Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            format!("PRAGMA index_info({name})"),
+        ))
+        .await
+        .expect("read the index's columns")
+        .into_iter()
+        .map(|row| {
+            (
+                row.try_get::<i64>("", "seqno").expect("seqno"),
+                row.try_get::<String>("", "name").expect("name"),
+            )
+        })
+        .collect();
+    (columns, unique)
+}
+
+/// An event type's topic and allowed subject types sit in columns of their
+/// own, so a topic's candidates are one read of the `(kind, topic)` index; a
+/// topic row has no topic, and the list is a document of unbounded size.
+#[tokio::test]
+async fn the_spec_cache_holds_a_topic_and_a_subject_type_list_indexed_by_kind_and_topic() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let dsn = format!(
+        "sqlite://{}?mode=rwc",
+        dir.path().join("schema.db").to_string_lossy()
+    );
+    let db = toolkit_db::connect_db(&dsn, toolkit_db::ConnectOpts::default())
+        .await
+        .expect("connect sqlite");
+    toolkit_db::migration_runner::run_migrations_for_testing(&db, Migrator::migrations())
+        .await
+        .expect("migrations");
+    let conn = sea_orm::Database::connect(&dsn)
+        .await
+        .expect("connect sqlite");
+
+    assert_eq!(
+        column_info(&conn, "event_broker_spec_cache", "topic").await,
+        vec![col("topic", "varchar(1024)", false, 0)]
+    );
+    assert_eq!(
+        column_info(&conn, "event_broker_spec_cache", "allowed_subject_types").await,
+        vec![col("allowed_subject_types", "TEXT", true, 0)]
+    );
+    assert_eq!(
+        index_info(
+            &conn,
+            "event_broker_spec_cache",
+            "event_broker_spec_cache_kind_topic_idx"
+        )
+        .await,
+        (vec![(0, "kind".to_owned()), (1, "topic".to_owned())], false)
+    );
+}
+
 /// `sql` as its statements, with comments stripped, whitespace collapsed and
 /// no space inside parentheses, so the document's layout is free.
 fn normalised_statements(sql: &str) -> Vec<String> {

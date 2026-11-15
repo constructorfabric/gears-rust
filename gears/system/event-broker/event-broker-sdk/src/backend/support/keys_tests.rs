@@ -1,20 +1,9 @@
-use super::{partition_for, topic_uuid};
-use crate::GtsInstanceId;
+use super::partition_for;
 use toolkit_gts::GTS_ID_PREFIX;
 
 #[test]
 fn zero_partitions_is_one() {
     assert_eq!(partition_for("order-service", 0).value(), 0);
-}
-
-#[test]
-fn topic_uuid_is_the_gts_uuid() {
-    let topic = GtsInstanceId::try_new("gts.cf.core.events.topic.v1~acme.orders.x.topic.v1")
-        .expect("valid id");
-    let expected = ::gts::GtsId::try_new(topic.as_ref())
-        .expect("valid id")
-        .to_uuid();
-    assert_eq!(topic_uuid(&topic), expected);
 }
 
 #[test]

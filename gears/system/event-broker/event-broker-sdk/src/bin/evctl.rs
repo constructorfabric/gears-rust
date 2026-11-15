@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use event_broker_sdk::api::{
-    Ack, FrameStream, JoinRequest, Position, SeekPosition, SubscriptionInterest, WireFrame,
+    Ack, FrameStream, JoinRequest, OwnershipFilter, Position, SeekPosition, SubscriptionInterest,
+    WireFrame,
 };
 use event_broker_sdk::models::CreateConsumerGroupRequest;
 use event_broker_sdk::rest::{RestBroker, StreamTransport};
@@ -178,10 +179,10 @@ fn make_event(
     data: serde_json::Value,
 ) -> Result<EventV1, String> {
     EventV1::builder_for(GtsTypeId::new(&args.type_id), data)
-        .tenant_id(tenant)
+        .subject_tenant(tenant)
         .source(args.source.clone())
         .subject(args.subject.clone())
-        .subject_type_id(GtsTypeId::new(&args.subject_type))
+        .subject_type_of(GtsTypeId::new(&args.subject_type))
         .build()
         .map_err(|e| e.to_string())
 }
@@ -322,7 +323,9 @@ async fn open_stream(
             .topic(
                 event_broker_sdk::GtsInstanceId::try_new(&args.topic).map_err(|e| e.to_string())?,
             )
-            .tenant_id(tenant)
+            .subject_tenant(tenant)
+            // The demo's events carry no `subject_owner`.
+            .ownership_filter(OwnershipFilter::EntireTenant)
             .types([event_broker_sdk::GtsIdPattern::try_new(&args.type_id)
                 .map_err(|e| e.to_string())?])
             .build()
@@ -331,7 +334,7 @@ async fn open_stream(
         .join(
             ctx,
             JoinRequest {
-                group,
+                consumer_group: group,
                 client_agent: "cf-evctl".to_owned(),
                 interests: vec![interest],
                 session_timeout: None,
@@ -350,17 +353,12 @@ async fn open_stream(
         .collect();
     if !positions.is_empty() {
         broker
-            .seek(
-                ctx,
-                assignment.subscription_id,
-                assignment.topology_version,
-                &positions,
-            )
+            .seek(ctx, assignment.id, assignment.topology_version, &positions)
             .await
             .map_err(|e| e.to_string())?;
     }
     broker
-        .stream(ctx, assignment.subscription_id)
+        .stream(ctx, assignment.id)
         .await
         .map_err(|e| e.to_string())
 }

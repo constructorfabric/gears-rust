@@ -84,10 +84,10 @@ pub fn to_broker_event(queued: &QueuedEvent) -> Result<EventV1, EventBrokerError
         Ok(data) => EventV1::builder_for(event_type, data),
         Err(_) => EventV1::builder_without_data(event_type),
     }
-    .tenant_id(envelope.tenant_id)
+    .subject_tenant(envelope.tenant_id)
     .source(EVENT_SOURCE)
     .subject(envelope.correlation_id.to_string())
-    .subject_type_id(GtsTypeId::new(ADMISSION_CONTROL_RESOURCE))
+    .subject_type_of(GtsTypeId::new(ADMISSION_CONTROL_RESOURCE))
     .occurred_at(occurred_at)
     .build()
 }

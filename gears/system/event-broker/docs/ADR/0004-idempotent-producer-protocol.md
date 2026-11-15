@@ -51,8 +51,8 @@ The initial design (DESIGN.md §3.2 Producer Modes) **inferred mode per request*
 
 | Mode | Producer sets |
 |---|---|
-| chained | `producer_id`, `previous`, `sequence` |
-| monotonic | `producer_id`, `sequence` (no `previous`) |
+| chained | `producer`, `previous`, `sequence` |
+| monotonic | `producer`, `sequence` (no `previous`) |
 | stateless | none |
 
 This mirrors the partition-override problem in [ADR-0002](0002-partition-selection.md): a producer refactor that drops `meta.previous` silently downgrades the producer from chained-mode dedup to monotonic-mode dedup with **no error and no observable signal** until a duplicate slips through. Same silent-switch hazard, different field.
@@ -66,8 +66,8 @@ The broker is unshipped — no production data, no live producers — so this AD
 * Explicit contract: producer mode must be a declared property, not an emergent property of which fields a producer happened to set
 * Hard errors at the wire boundary: mode-shape violations reject the publish loudly, not silently weaken dedup
 * Symmetry with partition selection: same principle ([ADR-0002 revised](0002-partition-selection.md)) - the producer never chooses a partition; the backend assigns it ([feature 0007](../features/0007-storage-backend-api.md)), and producer freedom is constrained to the choice the producer intended to make
-* Principal binding: a `producer_id` is owned by the principal that created it; cross-principal use is rejected
-* Per-event chain values in batches: every event carries its own `meta`, so one batch of one topic carries events of several producer ids, and each `(producer_id, topic)` run in it is validated against its own chain
+* Principal binding: a producer is owned by the principal that created it; cross-principal use is rejected (not yet implemented on publish)
+* Per-event chain values in batches: every event carries its own `meta`, so one batch of one topic carries events of several producer ids, and each `(producer, topic)` run in it is validated against its own chain
 * Future-mode extensibility: new modes (e.g., post-MVP recent-`event.id` LRU stateless variant) ship as new registration values without changing the event schema
 * Operator-driven reset must exist but must be auditable
 * Idle producers should age out automatically so producer-state storage doesn't grow without bound
@@ -80,21 +80,21 @@ The broker is unshipped — no production data, no live producers — so this AD
 
 ## Decision Outcome
 
-Adopt **Option B - mode declared at producer registration, enforced per request**. A producer registers once with `POST /v1/producers { "mode": "chained" | "monotonic" }`, the broker stores `mode` on the producer row, and every subsequent publish referencing that `producer_id` is validated against the stored mode. Mode-shape mismatches reject with `400`. Stateless mode does **not** register: no row, no `meta.producer_id` on publish, no broker-side dedup. A producer id is not bound to a topic: it publishes to any number of topics, and the broker keeps one chain per `(producer_id, topic)` (see [Chain Scope](#chain-scope)).
+Adopt **Option B - mode declared at producer registration, enforced per request**. A producer registers once with `POST /v1/producers { "mode": "chained" | "monotonic", "client_agent": "<agent>" }`, the broker stores `mode` on the producer row, and every subsequent publish referencing that producer is validated against the stored mode. Mode-shape mismatches reject with `400`. Stateless mode does **not** register: no row, no `meta.producer` on publish, no broker-side dedup. A producer id is not bound to a topic: it publishes to any number of topics, and the broker keeps one chain per `(producer, topic)` (see [Chain Scope](#chain-scope)).
 
 ### Three Modes, Wire Shapes
 
 The `meta` block (per [ADR-0003 Event Schema](0003-event-schema.md)) is the carrier for all producer-protocol fields. Mode determines its shape:
 
 ```jsonc
-// Chained — registered with POST /v1/producers { "mode": "chained" }
-"meta": { "version": 1, "producer_id": "<uuid>", "previous": 7, "sequence": 8 }
+// Chained - registered with POST /v1/producers { "mode": "chained", "client_agent": "<agent>" }
+"meta": { "version": 1, "producer": "<uuid>", "previous": 7, "sequence": 8 }
 
-// Monotonic — registered with POST /v1/producers { "mode": "monotonic" }
-"meta": { "version": 1, "producer_id": "<uuid>", "sequence": 8 }
+// Monotonic - registered with POST /v1/producers { "mode": "monotonic", "client_agent": "<agent>" }
+"meta": { "version": 1, "producer": "<uuid>", "sequence": 8 }
 
 // Stateless — no registration, meta omitted entirely
-// (no producer_id, no chain state, no broker dedup)
+// (no producer, no chain state, no broker dedup)
 ```
 
 Within `meta`, `previous` and `sequence` are the producer-chain pair (no naming collision with the body-level `sequence` — the `meta.` qualifier disambiguates per [ADR-0003 § Terminology Cleanup](0003-event-schema.md#terminology-cleanup-offset--sequence)).
@@ -115,13 +115,13 @@ Rule of thumb:
 
 ### Registration: `POST /v1/producers`
 
-- **Request body**: `{ "mode": "chained" | "monotonic", "client_agent": "<rfc-9110-user-agent-string>" }`. Both fields are required. The body MUST NOT contain `producer_id` or `id` — broker-minted.
+- **Request body**: `{ "mode": "chained" | "monotonic", "client_agent": "<rfc-9110-user-agent-string>" }`. Both fields are required. The body MUST NOT contain the producer's id (`id`) - broker-minted.
 - **Response**: `201 Created`, body `{ "id": "<uuid>", "mode": "<mode>", "client_agent": "<echoed>" }`, header `Location: /v1/producers/<id>`.
 - **Authn**: requires an authenticated principal. The producer row records the principal as `owner_id`.
 - **Modes other than `chained` / `monotonic`** (including `stateless`) → `400 InvalidMode`. Stateless does not register.
 - **`client_agent`** is an informational diagnostic hint — purely observational. The broker persists it on the producer row, echoes it on the registration and cursor responses, and surfaces it in operational logs and metric labels. It does **not** participate in deduplication, authorization, ownership, or any other load-bearing decision; collisions across producers are allowed. Validation: ASCII, 1–256 bytes, conforms to RFC 9110 User-Agent grammar (`product *( RWS ( product / comment ) )`). Failure surfaces as the canonical RFC 9457 `400` problem type; no broker-specific error code. Immutable after create — no mutation endpoint exists. The HTTP `User-Agent` request header continues to be captured in access logs on every request independently of `client_agent` and is NOT a fallback for a missing `client_agent`.
 
-The caller persists the returned `id` (as `producer_id`) and distributes it to its producer fleet (DB, ConfigMap, env var, secret store — caller's choice of coordination mechanism).
+The caller persists the returned `id` (it goes in `meta.producer` on publish) and distributes it to its producer fleet (DB, ConfigMap, env var, secret store - caller's choice of coordination mechanism).
 
 ### Mode-Shape Enforcement at Publish Time
 
@@ -129,18 +129,18 @@ On every publish, after authn but before any storage write:
 
 1. If `meta` is absent → stateless publish path. Broker does not consult the producer registry. Accept at face value (subject to event-schema validation).
 2. If `meta` is present:
-   - If `meta.producer_id` is absent but other producer-protocol fields are present (`meta.previous` or `meta.sequence`) → reject `400 MetaWithoutProducerId`.
-   - If `meta.producer_id` is absent and no other producer-protocol fields → stateless publish path (treat as if `meta` were absent).
-   - If `meta.producer_id` is present:
+   - If `meta.producer` is absent but other producer-protocol fields are present (`meta.previous` or `meta.sequence`) → reject `400 MetaWithoutProducerId`.
+   - If `meta.producer` is absent and no other producer-protocol fields → stateless publish path (treat as if `meta` were absent; step 3's version check still applies).
+   - If `meta.producer` is present:
      - Look up the producer row.
      - If not found → reject `404 ProducerNotFound`.
-     - If owner principal does not match the calling principal → reject `403 ProducerPrincipalMismatch`.
+     - If owner principal does not match the calling principal → reject `403 ProducerNotOwned` (not yet implemented on publish).
      - Validate shape against the stored mode:
 
 | Stored mode | Required in `meta` | Forbidden in `meta` | Error on mismatch |
 |---|---|---|---|
-| `chained` | `producer_id`, `previous`, `sequence` | — | `400 ChainModeFieldsMissing` |
-| `monotonic` | `producer_id`, `sequence` | `previous` | `400 MonotonicModeFieldsViolation` |
+| `chained` | `producer`, `previous`, `sequence` | - | `400 ChainModeFieldsMissing` |
+| `monotonic` | `producer`, `sequence` | `previous` | `400 MonotonicModeFieldsViolation` |
 
 3. If `meta.version` exceeds the broker's supported version → reject `400 UnknownMetaVersion` (per [ADR-0003 § Optional Versioned `meta` Block](0003-event-schema.md#optional-versioned-meta-block)).
 
@@ -153,17 +153,17 @@ After validation passes, mode-specific business rules apply:
 
 ### Mode Immutability
 
-`mode` is immutable for the lifetime of a `producer_id`. The broker exposes no operation that changes the mode of an existing producer row. To switch modes, a producer:
+`mode` is immutable for the lifetime of a producer id. The broker exposes no operation that changes the mode of an existing producer row. To switch modes, a producer:
 
-1. Registers a fresh `producer_id` via `POST /v1/producers` with the new mode.
-2. Distributes the new `producer_id` across its fleet.
-3. Retires the old `producer_id` (its state ages out via the Reaper, not yet implemented, tracked in #5651; see [Producer Registration TTL](#producer-registration-ttl)).
+1. Registers a fresh producer id via `POST /v1/producers` with the new mode.
+2. Distributes the new producer id across its fleet.
+3. Retires the old producer id (its state ages out via the Reaper, not yet implemented, tracked in #5651; see [Producer Registration TTL](#producer-registration-ttl)).
 
 Why immutable: reusing `event_broker_producer_sequence` rows across modes is unsafe. The chained invariant (`previous` == `last_sequence`) does not hold against the monotonic gap-accepting rule, and switching mid-stream would cause both modes to misbehave on in-flight events.
 
 ### Chain Scope
 
-Chain state is kept per `(producer_id, topic)`: `event_broker_producer_sequence` has `PRIMARY KEY (producer_id, topic)` and holds the pair's `last_sequence`.
+Chain state is kept per `(producer, topic)`: `event_broker_producer_sequence` has `PRIMARY KEY (producer_id, topic)` and holds the pair's `last_sequence`.
 
 - **No topic binding.** A producer id is not bound to a topic; registration names none (`[mode, client_agent]`). One id publishes to any number of topics, each topic its own chain, ordered and checked independently of the others.
 - **No partition.** The partition is not part of the chain. The backend assigns it after ingest admits the event ([feature 0007](../features/0007-storage-backend-api.md)); neither the producer nor the broker computes one for the chain, and `meta` carries no partition.
@@ -177,7 +177,7 @@ The rule is required, not advisory. A sequence space shared across producer part
 
 ### Bootstrap Chain Value
 
-The first accepted publish for a `(producer_id, topic)` pair creates its `event_broker_producer_sequence` row and takes its numbers. The contract:
+The first accepted publish for a `(producer, topic)` pair creates its `event_broker_producer_sequence` row and takes its numbers. The contract:
 
 - A missing row admits the first publish without a chain check; the row is inserted with `last_sequence = meta.sequence`.
 - Chained mode accepts any `meta.previous` on that first publish (the shape rule `meta.sequence > meta.previous` still applies); the conventional first step is `meta.previous = 0, meta.sequence = 1`.
@@ -190,11 +190,11 @@ Two distinct paths exist for chain reset, serving different scenarios:
 
 #### Operator-driven reset: `POST /v1/producers/{producer_id}:reset`
 
-- **Request body** (optional): `{ "topic": "..." }` to scope the reset to the `(producer_id, topic)` row. Body absent -> reset all `event_broker_producer_sequence` rows for the `producer_id`.
-- **Authz**: owning principal only. Cross-principal → `403 ProducerPrincipalMismatch`.
+- **Request body** (optional): `{ "topic": "..." }` to scope the reset to the `(producer_id, topic)` row. Body absent -> reset all `event_broker_producer_sequence` rows for the producer id.
+- **Authz**: owning principal only. Cross-principal → `403 ProducerNotOwned`.
 - **Audit**: every reset emits an audit record (operator-driven destructive operation).
 - **Effect**: deletes `event_broker_producer_sequence` rows; next publish bootstraps fresh (see [Bootstrap Chain Value](#bootstrap-chain-value)).
-- **`producer_id` is preserved**. The fleet does not need to redistribute a new id.
+- **The producer id is preserved**. The fleet does not need to redistribute a new id.
 
 Use case: the producer's fleet is alive and well, but the chain state on the broker side is wrong (or needs to be cleared for testing / debugging) and the producer resumes from any sequence: the next accepted publish takes its numbers.
 
@@ -202,7 +202,7 @@ Use case: the producer's fleet is alive and well, but the chain state on the bro
 
 Not yet implemented; tracked in #5651.
 
-A producer's registration row carries `last_seen_at`, updated on every publish of the producer id, on any topic. The Reaper purges `event_broker_producer` rows whose `last_seen_at` is older than the platform's producer-registration TTL, together with their chain rows (see [Producer Registration TTL](#producer-registration-ttl)). After purge, the `producer_id` is gone - the next publish referencing it gets `404 ProducerNotFound`, the producer re-registers, distributes the new id, and continues.
+A producer's registration row carries `last_seen_at`, updated on every publish of the producer id, on any topic. The Reaper purges `event_broker_producer` rows whose `last_seen_at` is older than the platform's producer-registration TTL, together with their chain rows (see [Producer Registration TTL](#producer-registration-ttl)) (not yet implemented, tracked in #5651). After purge, the producer id is gone - the next publish referencing it gets `404 ProducerNotFound`, the producer re-registers, distributes the new id, and continues.
 
 Use case: long-quiet producers (monthly batch job that hasn't run in 6 months) shouldn't keep their identity forever. The TTL forces a natural re-registration cycle.
 
@@ -214,8 +214,8 @@ Not yet implemented; tracked in #5651.
 - TTL is **per producer registration row**. A `(producer_id, topic)` chain row lives as long as its producer registration and has no retention of its own; a quiet topic's row stays while the producer publishes to other topics.
 - A producer's `event_broker_producer.last_seen_at` is updated with every publish of the producer id, on any topic.
 - Reaper sweep cadence: bounded (default `PT5M`); exact cadence is implementation detail, not spec.
-- Purge cascade: an `event_broker_producer` row and every `event_broker_producer_sequence` row of the same `producer_id` are deleted together, in one transaction.
-- Post-purge publish: `404 ProducerNotFound`. Producer must re-register and obtain a new `producer_id`.
+- Purge cascade: an `event_broker_producer` row and every `event_broker_producer_sequence` row of the same producer id are deleted together, in one transaction.
+- Post-purge publish: `404 ProducerNotFound`. Producer must re-register and obtain a new producer id.
 
 ### Stateless Safety Floor
 
@@ -235,23 +235,23 @@ Captured here so the registration body's future evolution is anticipated. If/whe
 
 ### Producer Concurrency
 
-The broker supports **single-writer per `producer_id`**. HA producer topologies use external leader election (Raft, etcd, Consul, DB row lock — caller's choice). The broker does NOT provide:
+The broker supports **single-writer per producer id**. HA producer topologies use external leader election (Raft, etcd, Consul, DB row lock - caller's choice). The broker does NOT provide:
 
 - Producer epochs / leases / fencing
 - Cluster-wide active/standby coordination
 
-Concurrent writers sharing a `producer_id` will see chain failures (`412 SequenceViolation` for chained mode) or monotonic regressions (the lower-`sequence` writer gets `200 OK` duplicate, then catches up against the higher-sequence writer's state — natural divergence detector). This is documented as **misuse, not a bug**.
+Concurrent writers sharing a producer id will see chain failures (`412 SequenceViolation` for chained mode) or monotonic regressions (the lower-`sequence` writer gets `200 OK` duplicate, then catches up against the higher-sequence writer's state - natural divergence detector). This is documented as **misuse, not a bug**.
 
 This keeps the broker simple: sequence-ordering itself is the only guard. Adding epoch fields to `meta` was considered and rejected — see [More Information](#more-information).
 
 ### Producer Identity Principal Binding
 
-The `owner_id` is recorded on the producer row at `POST /v1/producers` time. Every endpoint that touches the producer's state (`POST /v1/events`, `GET /v1/producers/{id}/cursors`, `POST /v1/producers/{id}:reset`) validates the calling principal against `owner_id`:
+The `owner_id` is recorded on the producer row at `POST /v1/producers` time. Every endpoint that touches the producer's state (`POST /v1/events`, `GET /v1/producers/{id}/cursors`, `POST /v1/producers/{id}:reset`) validates the calling principal against `owner_id` (not yet implemented on `POST /v1/events`):
 
 - Match → proceed.
-- Mismatch → `403 ProducerPrincipalMismatch`.
+- Mismatch → `403 ProducerNotOwned`.
 
-`producer_id` is not a secret — it is distributed across the producer's fleet via the caller's coordination mechanism. The `403` is explicit ("you don't own this") rather than `404` (info-protective); concealing existence offers no real security benefit because the id is intentionally widely distributed.
+A producer id is not a secret - it is distributed across the producer's fleet via the caller's coordination mechanism. The `403` is explicit ("you don't own this") rather than `404` (info-protective); concealing existence offers no real security benefit because the id is intentionally widely distributed.
 
 Cursor-endpoint authz: ownership IS the authz check. No separate permission constant beyond the principal-ownership rule.
 
@@ -291,7 +291,7 @@ A publish is answered `202 Accepted` once the enqueue commits. A producer that n
 
 ### Batch Publish
 
-`POST /v1/events:batch` targets one topic and carries events of any producer ids, and stateless events, in one request; a batch whose events resolve to more than one topic -> `400 MixedTopics`. Each event's `meta` passes mode-shape enforcement on its own. The broker then splits the chained and monotonic events into runs, one run per `(producer_id, topic)`, each keeping request order; stateless events belong to no run. A single-event publish is a run of one.
+`POST /v1/events:batch` targets one topic and carries events of any producer ids, and stateless events, in one request; a batch whose events resolve to more than one topic -> `400 MixedTopics`. Each event's `meta` passes mode-shape enforcement on its own. The broker then splits the chained and monotonic events into runs, one run per `(producer, topic)`, each keeping request order; stateless events belong to no run. A single-event publish is a run of one.
 
 Request-shape rules, checked before any chain state is read:
 
@@ -306,7 +306,7 @@ Chain rules, per run against the pair's `last_sequence`:
 
 Outcome:
 
-- **All-or-nothing.** The first violation rejects the whole batch with `412 SequenceViolation`, whose `sequence_mismatch` violation's `description` names `index` (the violating run's first event), `producer_id`, `topic` and `last_sequence` as `key=value` text; nothing is enqueued.
+- **All-or-nothing.** The first violation rejects the whole batch with `412 SequenceViolation`, whose `sequence_mismatch` violation's `description` names `index` (the violating run's first event), `producer`, `topic` and `last_sequence` as `key=value` text; nothing is enqueued.
 - **Duplicates skipped.** Duplicate events are not enqueued; the rest of the batch is. A batch of only duplicates is answered `200 OK`.
 - **No cross-run order.** Runs are checked independently; a batch promises no order between events of different runs beyond per-key order (ADR-0002).
 
@@ -314,22 +314,23 @@ Outcome:
 
 | HTTP | Code | When | Recovery |
 |---|---|---|---|
-| 400 | `BadRequest` | Top-level forbidden field (producer-protocol, backend-assigned, or explicit `partition`) | Fix request shape |
+| 400 | `InvalidBody` | Top-level forbidden field (producer-protocol, backend-assigned, or explicit `partition`), or any other key the event does not declare; the `detail` names the field | Fix request shape |
 | 400 | `InvalidMode` | Registration with mode other than `chained` / `monotonic` | Use a valid mode (stateless = no registration) |
 | 400 | `ChainModeFieldsMissing` | Chained-mode publish missing `meta.previous` or `meta.sequence` | Fix request shape |
 | 400 | `MonotonicModeFieldsViolation` | Monotonic-mode publish with forbidden `meta.previous` or missing `meta.sequence` | Fix request shape |
-| 400 | `MetaWithoutProducerId` | `meta` carries `previous` / `sequence` but no `producer_id` | Either omit `meta` entirely (stateless) or include `meta.producer_id` |
-| 404 | `ProducerNotFound` | `meta.producer_id` not found in registry (or aged out by TTL, not yet implemented, tracked in #5651); names the producer resource | Re-register and distribute new id |
-| 400 | `UnknownMetaVersion` | `meta.version` exceeds broker's supported version | SDK rolls back to a supported version |
+| 400 | `MetaWithoutProducerId` | `meta` carries `previous` / `sequence` but no `producer` | Either omit `meta` entirely (stateless) or include `meta.producer` |
+| 404 | `ProducerNotFound` | `meta.producer` not found in registry (or aged out by TTL, not yet implemented, tracked in #5651); names the producer resource | Re-register and distribute new id |
+| 400 | `UnknownMetaVersion` | `meta.version` exceeds broker's supported version | Client resends with a supported `meta.version` (every SDK producer sends `1`) |
 | 400 | `InvalidEventFieldEncoding` | Non-ASCII bytes in event field | Sanitize input |
 | 400 | `EventFieldTooLong` | Event string field exceeds length cap | Sanitize input |
-| 403 | `ProducerPrincipalMismatch` | Cross-principal publish / cursor read / reset | Use the owning principal |
-| 403 | `TenantIdNotAuthorized` | Platform authz resolver denied the `tenant_id` | Acquire grant (platform-side) |
-| 400 | `BadRequest` (`empty_batch`) | Batch with no events (R1) | Send at least one event |
-| 400 | `BadRequest` (`malformed_run`) | A run's events do not link or increase (R3); names the event at `events[<index>].meta` | Fix the run's numbering |
-| 400 | `BadRequest` (`duplicate_event_id`) | An `event.id` repeated within one batch (R13); names the event at `events[<index>].id` | Send each event once |
+| 403 | `ProducerNotOwned` | Cross-principal cursor read / reset / publish (not yet implemented on publish) | Use the owning principal |
+| 403 | `TenantIdNotAuthorized` | The caller may not reach the event's `subject_tenant` (the tenant check denied) and no barrier right admits it (`produce_ignore_barrier` denied) | Acquire grant (platform-side) |
+| 403 | `NotAuthorizedToProduce` | The caller's own tenant lacks `produce` on the event type (the type check denied) | Acquire grant (platform-side) |
+| 400 | `EmptyBatch` (reason `empty_batch`) | Batch with no events (R1) | Send at least one event |
+| 400 | `MalformedRun` (reason `malformed_run`) | A run's events do not link or increase (R3); names the event at `events[<index>].meta` | Fix the run's numbering |
+| 400 | `DuplicateEventId` (reason `duplicate_event_id`) | An `event.id` repeated within one batch (R13); names the event at `events[<index>].id` | Send each event once |
 | 400 | `MixedTopics` | Batch event types resolve to more than one topic | Send one batch per topic |
-| 412 | `SequenceViolation` | Chained run neither advances nor duplicates the chain head (R4); the canonical error (DESIGN.md §3.3 "Error Response Format") whose `sequence_mismatch` violation's `description` names `index`, `producer_id`, `topic` and `last_sequence` as `key=value` text | `GET /v1/producers/{id}/cursors` -> reconcile -> resume |
+| 412 | `SequenceViolation` | Chained run neither advances nor duplicates the chain head (R4); the canonical error (DESIGN.md §3.3 "Error Response Format") whose `sequence_mismatch` violation's `description` names `index`, `producer`, `topic` and `last_sequence` as `key=value` text | `GET /v1/producers/{id}/cursors` -> reconcile -> resume |
 
 ### Consequences
 
@@ -337,10 +338,10 @@ Outcome:
 - Good, because the wire `meta` block has three crisp shapes, one per mode, each enforced by JSON Schema `oneOf` + broker-side mode lookup
 - Good, because the `:reset` lever + producer-TTL lever cover both operator-driven and natural reset scenarios without forcing one paradigm
 - Good, because future modes (post-MVP stateless-with-LRU, or future "monotonic-with-gap-rejection") slot in as new registration mode values without changing the event schema
-- Good, because principal binding is enforced uniformly across publish, cursor read, and reset
+- Good, because principal binding is enforced uniformly across publish, cursor read, and reset (not yet implemented on publish)
 - Bad / accepted, because registration is now a required step for chained / monotonic producers (already true today; one extra HTTP call at first-publish)
 - Bad / accepted, because mode immutability forces re-registration to switch modes (deliberate friction; mode-switching is rare and dangerous)
-- Bad / accepted, because the no-fencing concurrency model means concurrent writers on the same `producer_id` cause data anomalies that surface as `412` / monotonic regressions, not as a clean error. Mitigation: producer-author guidance ("single-writer per `producer_id`").
+- Bad / accepted, because the no-fencing concurrency model means concurrent writers on the same producer id cause data anomalies that surface as `412` / monotonic regressions, not as a clean error. Mitigation: producer-author guidance ("single-writer per producer id").
 - Neutral, because `POST /v1/producers/{id}:reset` is destructive and authz-fenced; operators must explicitly choose to call it, and every call is audited.
 
 ### Confirmation
@@ -352,9 +353,9 @@ The decision is verified by:
 - **Atomicity test**: simulate ingest crash between outbox enqueue and state update; verify no half-state visible after recovery.
 - **Reset audit test**: every successful `:reset` call produces an audit record with operator principal + timestamp + scope.
 - **TTL reap test**: idle producer's row is reaped after the TTL window; next publish gets `404 ProducerNotFound` (not yet implemented, tracked in #5651).
-- **Principal binding test**: cross-principal calls to publish / cursor read / reset all return `403 ProducerPrincipalMismatch`.
+- **Principal binding test**: cross-principal calls to cursor read / reset / publish all return `403 ProducerNotOwned` (not yet implemented on publish).
 - **Batch run test**: one batch of one topic with events of two producer ids and stateless events; each of R1, R3, R4, R5 and R13 produces its documented outcome, and a `412` leaves nothing enqueued.
-- **Concurrent writer test**: two writers sharing a `producer_id` produce `412 SequenceViolation` (chained) or monotonic regression (monotonic) without broker error — documented behavior.
+- **Concurrent writer test**: two writers sharing a producer id produce `412 SequenceViolation` (chained) or monotonic regression (monotonic) without broker error - documented behavior.
 
 ## Pros and Cons of the Options
 
@@ -374,7 +375,7 @@ The decision is verified by:
 * Good, because no registration round-trip for chained / monotonic
 * Good, because the wire is self-describing per event
 * Bad / decisive against, because **a producer refactor that drops `meta.previous` silently downgrades chained → monotonic** with no error and no signal; same silent-switch hazard as the partition override removed in [ADR-0002 (revised)](0002-partition-selection.md)
-* Bad, because principal binding has no natural home; ad-hoc per-publish lookup of "who owns this `producer_id`?" against an implicit registry
+* Bad, because principal binding has no natural home; ad-hoc per-publish lookup of "who owns this producer id?" against an implicit registry
 * Bad, because future modes require adding new per-request fields or discriminators
 
 ### Per-Request `meta.mode` Discriminator
@@ -394,7 +395,7 @@ The decision is verified by:
 - **Stateless LRU** (post-MVP): an opt-in recent-`event.id` cache at registration time (`{ mode: "stateless", dedup_window: "PT5M" }`) is captured as a future addition. Ships as a new mode value or a new registration field; no event-schema change.
 - **Mode evolution**: new modes after MVP (e.g., `monotonic-strict` that rejects gaps) are added as new registration values. The mode-shape table grows; existing producers continue to work unchanged.
 - **Reset audit log destination**: the `:reset` audit record's storage location is a platform concern (per existing audit infrastructure), not specified here.
-- **`event_broker_producer` row shape**: minimum fields are `id` (PK, broker-minted UUID: the `producer_id`), `owner_id` (the registering principal), `mode`, `client_agent`, `created_at`, `last_seen_at` (not yet implemented, tracked in #5651). `client_agent` is required, persisted, and immutable. Implementation may add observability columns; not constrained by this ADR.
+- **`event_broker_producer` row shape**: minimum fields are `id` (PK, broker-minted UUID: the producer's id), `owner_id` (the registering principal), `mode`, `client_agent`, `created_at`, `last_seen_at` (not yet implemented, tracked in #5651). `client_agent` is required, persisted, and immutable. Implementation may add observability columns; not constrained by this ADR.
 
 External references:
 
@@ -408,12 +409,12 @@ External references:
 - **PRD**: [PRD.md](../PRD.md)
   - `cpt-cf-evbk-fr-producer-modes` — three producer modes; chained / monotonic dedup; principal binding
   - `cpt-cf-evbk-fr-publish-single` — single-event publish carries `meta` per this ADR's wire shapes
-  - `cpt-cf-evbk-fr-publish-batch` - batch publish carries per-event `meta`; validated per `(producer_id, topic)` run (see [Batch Publish](#batch-publish) and [ADR-0003](0003-event-schema.md))
+  - `cpt-cf-evbk-fr-publish-batch` - batch publish carries per-event `meta`; validated per `(producer, topic)` run (see [Batch Publish](#batch-publish) and [ADR-0003](0003-event-schema.md))
 - **DESIGN**: [DESIGN.md](../DESIGN.md)
   - §3.2 Producer Modes — shrunk to summary + link to `docs/features/0001-idempotent-producers.md`
   - §3.6 Two Sequences — producer chain in `meta` (per this ADR); server-assigned `sequence` (per [ADR-0003](0003-event-schema.md))
   - §3.7 Database schemas - `event_broker_producer` row shape (this ADR); `event_broker_producer_sequence` row shape (existing); both governed by [ADR-0003](0003-event-schema.md) field-level changes
 - **Related ADRs**:
   - [`0002-partition-selection`](0002-partition-selection.md) - partition key contract; the chain does not depend on the partition
-  - [`0003-event-schema`](0003-event-schema.md) — canonical event shape; `meta` block placement (`writeOnly`); `tenant_id` flips to producer-supplied; `subject_type` stays; ASCII encoding rule
+  - [`0003-event-schema`](0003-event-schema.md) - canonical event shape; `meta` block placement (`writeOnly`); `subject_tenant` flips to producer-supplied; `subject_type` stays; ASCII encoding rule
 - **Feature doc**: [`docs/features/0001-idempotent-producers.md`](../features/0001-idempotent-producers.md) — CDSL flows, mode-choice producer-author guidance, acceptance criteria, test plan

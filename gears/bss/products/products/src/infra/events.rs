@@ -190,9 +190,9 @@ pub(crate) async fn enqueue_typed<E: BrokerEvent>(
             let trace_parent = event.trace_parent().map(Cow::into_owned);
             let mut builder = event_broker_sdk::EventV1::builder(event)
                 .subject(subject)
-                .subject_type_id(event_broker_sdk::GtsTypeId::new(subject_type));
+                .subject_type_of(event_broker_sdk::GtsTypeId::new(subject_type));
             if let Some(tenant_id) = tenant_id {
-                builder = builder.tenant_id(tenant_id);
+                builder = builder.subject_tenant(tenant_id);
             }
             if let Some(trace_parent) = trace_parent {
                 builder = builder.trace_parent(trace_parent);
@@ -214,7 +214,7 @@ pub(crate) async fn enqueue_typed<E: BrokerEvent>(
                 "event_id": uuid::Uuid::now_v7(),
                 "type": E::TYPE_ID,
                 "topic": crate::infra::broker::TOPIC,
-                "tenant_id": event.tenant_id(),
+                "subject_tenant": event.tenant_id(),
                 "source": crate::infra::broker::SOURCE,
                 "subject": event.subject(),
                 "subject_type": subject_type,

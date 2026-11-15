@@ -48,7 +48,7 @@ The existing design imposes hard constraints on this decision:
 
 - The partition count cannot be grown or shrunk on a live topic. Re-partitioning would break per-key ordering for every key already published; the migration path is "create new topic, dual-write, cut consumers over." Partition selection MUST therefore behave deterministically across the topic's full lifetime.
 - A topic's log lives in a storage backend (feature 0007), and the backend assigns the consumer-visible `event.sequence` per `(topic, partition)`. Producers never set `sequence`; they only carry chain state for ingest-side dedup in `meta.previous` and `meta.sequence` (see [ADR-0003 Event Schema](0003-event-schema.md)).
-- Producer chain state is keyed by `(producer_id, topic)` and checked at ingest, before any partition exists (see [ADR-0004](0004-idempotent-producer-protocol.md)), so deduplication does not depend on where an event lands.
+- Producer chain state is keyed by `(producer, topic)` and checked at ingest, before any partition exists (see [ADR-0004](0004-idempotent-producer-protocol.md)), so deduplication does not depend on where an event lands.
 - Storage media place keys differently: a Kafka cluster has its own partitioner, a database plugin its own hash. A contract that mandates one function binds every medium to it.
 - Every consumer of a topic depends on the *same* key-to-partition mapping. Ordering is a property the whole set of consumers observes, so the choice of key cannot be one that individual publishers make independently.
 
@@ -74,11 +74,11 @@ The existing design imposes hard constraints on this decision:
 
 ## Decision Outcome
 
-Adopt a **JSON Pointer (RFC 6901) declared by the event type**, naming the member of an event whose value is the event's partition key. The pointer is an `x-gts-traits` value on the event type's GTS schema, merged along the derivation chain like every other trait, and the base event type defaults it to `/tenant_id`.
+Adopt a **JSON Pointer (RFC 6901) declared by the event type**, naming the member of an event whose value is the event's partition key. The pointer is an `x-gts-traits` value on the event type's GTS schema, merged along the derivation chain like every other trait, and the base event type defaults it to `/subject_tenant`.
 
 An event carries no partition key. There is no publish-time way to choose one, and no explicit `partition` field. Ingest resolves the pointer and hands the key to the topic's storage backend with the event; the backend maps the key to a partition with a function of its own choice.
 
-The `/tenant_id` default gives **per-tenant total ordering** out of the box - every event a tenant emits to a topic lands on one partition and is observed in publish order, the property the audit pipeline needs. A type that wants finer-grained grouping declares a pointer at the member it wants to group by.
+The `/subject_tenant` default gives **per-tenant total ordering** out of the box - every event a tenant emits to a topic lands on one partition and is observed in publish order, the property the audit pipeline needs. A type that wants finer-grained grouping declares a pointer at the member it wants to group by.
 
 ### Key to Partition
 
@@ -95,6 +95,7 @@ partition = backend_function(topic, key)    # the storage backend's own choice
 - A changed function, re-partitioning, or a move between backends with different functions changes where keys land. Per-key ordering across such a change is the end user's to handle; the broker does not carry it across.
 - The key MUST be the **ASCII byte representation** of the resolved value. Per the platform convention recorded in [ADR-0003 Event Schema § Event Field Encoding](0003-event-schema.md#event-field-encoding-ascii-only), all event string fields are ASCII; UTF-8 is permitted only inside `data`. A pointer into `data` therefore carries a caller obligation to name an ASCII member.
 - A pointer resolving to a JSON string yields its contents as the key; one resolving to a number or boolean yields its JSON form, so a numeric identifier is usable without a producer stringifying it. A pointer resolving to an object, an array, or null is an error rather than a silent fallback.
+- **A pointer at `/subject_owner`** makes the owner required for that type. The base admits `null` for `subject_owner`, so such a type must narrow the member, in one of its own `allOf` branches or an ancestor's below the base, to a required string (`"type": "string"` with `subject_owner` in that branch's `required`); a type without that branch is excluded when the broker loads its specification. A publish of such a type with no owner is refused (`400 PartitionKeyUnresolved`) after its `data` is validated.
 - Producers MUST NOT provide a top-level topic `partition`. An event has no partition until its backend stores it.
 
 ### The Pointer
@@ -107,7 +108,7 @@ The base event type declares:
     "partition_key": {
       "type": "string",
       "format": "json-pointer",
-      "default": "/tenant_id"
+      "default": "/subject_tenant"
     }
   }
 }
@@ -115,9 +116,9 @@ The base event type declares:
 
 A derived event type overrides it by fixing its own value in `x-gts-traits`, for example `"/subject"` to group by the entity an event is about, or `"/data/order_id"` to group by a payload member. A pointer into `data` is the case a bare field name could not express, and is why the contract is a pointer rather than a member name.
 
-`tenant_id`, `subject`, and the partition key are conceptually different:
+`subject_tenant`, `subject`, and the partition key are conceptually different:
 
-- `tenant_id` identifies the tenant the event belongs to - the default co-location key, giving per-tenant ordering.
+- `subject_tenant` identifies the tenant the event belongs to - the default co-location key, giving per-tenant ordering.
 - `subject` identifies the entity the event is *about*.
 - the partition key names *which of the event's members* controls co-location, and is a property of the type rather than of any one event.
 
@@ -178,7 +179,7 @@ The decision is verified by:
 - **Ingest test**: the key handed to `append` is the value the pointer resolves to, and ingest stamps no partition on the event.
 - **Routing tests**: a type declaring no pointer partitions by tenant, so two events of one tenant share a partition; a type pointing at a member two *different* tenants share routes both to one partition, which is the property that proves the key is the type's choice rather than the tenant's.
 - **Broker rejection tests**:
-  - Publish with top-level `partition` field → `400 BadRequest` (`...partition.forbidden.v1`).
+  - Publish with top-level `partition` field → `400 InvalidBody` (the publish body declares no `partition` key; the `detail` names the field).
   - Publish with non-ASCII bytes in the resolved value → `400 InvalidEventFieldEncoding`.
 
 ## Pros and Cons of the Options
@@ -275,16 +276,16 @@ External references:
 - **PRD**: [PRD.md](../PRD.md)
   - `cpt-cf-evbk-fr-publish-single` - single-event publish; the storage backend assigns the partition
   - `cpt-cf-evbk-fr-publish-batch` - batch publish; ingest resolves each event's key and the backend places each event
-  - `cpt-cf-evbk-fr-producer-modes` - chained / monotonic dedup checks chain state per `(producer_id, topic)`, independent of the partition
+  - `cpt-cf-evbk-fr-producer-modes` - chained / monotonic dedup checks chain state per `(producer, topic)`, independent of the partition
 - **DESIGN**: [DESIGN.md](../DESIGN.md)
   - §1.1 Architectural Vision — per-topic ordering centrality
   - §2.1 Design Principles — Per-topic ordering, Immutable log
   - §3.1 Domain Model — "Partition count is broker configuration" subsection
   - §3.2 Producer Modes — references [ADR-0004](0004-idempotent-producer-protocol.md)
   - §3.6 Two Sequences — producer chain in `meta` / server-assigned `sequence` (per [ADR-0003](0003-event-schema.md))
-  - producer chain state - keyed by `(producer_id, topic)`
+  - producer chain state - keyed by `(producer, topic)`
 - **Features**:
   - [0007 Storage Backend API](../features/0007-storage-backend-api.md) - `append` takes the key; the backend maps it to a partition
 - **Related ADRs**:
   - [`0003-event-schema`](0003-event-schema.md) — canonical event shape; `partition` is `readOnly` (server-stamped on read)
-  - [`0004-idempotent-producer-protocol`](0004-idempotent-producer-protocol.md) - chain dedup is keyed by `(producer_id, topic)`, independent of the partition
+  - [`0004-idempotent-producer-protocol`](0004-idempotent-producer-protocol.md) - chain dedup is keyed by `(producer, topic)`, independent of the partition

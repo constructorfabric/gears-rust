@@ -461,7 +461,7 @@ async fn a_released_reference_is_lost_only_behind_a_fence_and_found_again_when_i
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0]["data"][t.lost_event().1], created.1["id"]);
         assert_eq!(
-            events[0]["tenant_id"],
+            events[0]["subject_tenant"],
             f.ctx.subject_tenant_id().to_string()
         );
         // Still fenced: reconciliation leaves the lost reference alone and announces nothing

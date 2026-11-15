@@ -17,8 +17,9 @@ use toolkit_gts::GtsInstanceId;
 use uuid::Uuid;
 
 use crate::domain::model::{
-    Assignment, BarrierMode, Cursor, Event, Interest, Sequence, TenantTraversalDepth,
+    Assignment, BarrierMode, Cursor, Event, Interest, OwnershipFilter, Sequence,
 };
+use crate::domain::streaming::assignment::Generation;
 use crate::domain::streaming::filter::{EventFilter, InterestFilter};
 use crate::domain::streaming::frames::{ControlCode, Frame};
 use crate::domain::streaming::lease::{InProcessStreamLeases, StreamLeases};
@@ -47,14 +48,16 @@ fn event(sequence: i64, tenant: Uuid) -> Event {
         id: Uuid::nil(),
         r#type: crate::test_support::event_type_id(CREATED),
         topic: gts(TOPIC),
-        tenant_id: tenant,
+        subject_tenant: tenant,
         source: "test".to_owned(),
         subject: "test".to_owned(),
         subject_type: gts::GtsTypeId::new("test"),
+        subject_owner: None,
         occurred_at: Utc::now(),
         trace_parent: None,
         data: json!({ "n": sequence }),
         meta: None,
+        ingest: None,
         partition: Some(0),
         sequence: Some(sequence),
         sequence_time: None,
@@ -139,22 +142,24 @@ fn wire(partitions: &[i32], cursors: &[Cursor], tenant: Uuid) -> Wired {
 
     let filter: Arc<dyn EventFilter> = Arc::new(InterestFilter::compile(&[Interest {
         topic: gts(TOPIC),
-        tenant_id: tenant,
-        depth: TenantTraversalDepth::CurrentTenant,
+        subject_tenant: tenant,
+        ownership: OwnershipFilter::EntireTenant,
         barrier_mode: BarrierMode::Respect,
         types: vec![gts::GtsIdPattern::try_new(CREATED).unwrap()],
+        subject_types: Vec::new(),
         filter: None,
     }]));
 
     let now: NowFn = Arc::new(Utc::now);
     let (generations, membership) = membership(8);
+    let baseline = Generation::new(3, generations.borrow().assigned.clone());
     let session = StreamSession::open(SessionOpening {
         read_set: ReadSet::seed(slots),
         filter,
         progress: ProgressConfig::default(),
         heartbeat_interval: Duration::from_secs(5),
         limit: ReadLimit::new(MaxEvents(256), MaxBytes(1024 * 1024)),
-        topology_version: 3,
+        baseline,
         ready: Arc::clone(&ready),
         started_at: Instant::now(),
         now,
@@ -162,6 +167,7 @@ fn wire(partitions: &[i32], cursors: &[Cursor], tenant: Uuid) -> Wired {
         lease,
         generations,
         membership,
+        scope: None,
     });
 
     Wired {

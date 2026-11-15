@@ -110,14 +110,14 @@ Today a module needing these properties must either bring up an external broker 
 | Event Type | A derived GTS type schema describing one kind of event. It narrows the base event schema's `data` member into the payload contract that validates `event.data` at ingest, and declares the metadata governing the type - owning topic, allowed subject types - in its `x-gts-traits`. See [DESIGN.md §3.1 Event Type](DESIGN.md). |
 | Subject Type | The GTS-typed kind of entity an event concerns (e.g., user, account, invoice). Enforced on two dimensions: authorization (per-principal) and schema (`event_type.allowed_subject_types`). |
 | Producer | A client that publishes events. Three modes: chained (producer-id + previous + sequence chain), monotonic (producer-id + sequence), stateless (no producer-id). |
-| Consumer Group | A logical set of cooperating consumer instances sharing partition assignments and a single committed offset per partition. Persistent broker resource, GTS-typed, with two creation paths (anonymous via `POST /v1/consumer-groups`, named via `types_registry`). |
-| Subscription | An ephemeral session a consumer instance opens against a consumer group via `POST /v1/subscriptions`. Holds the partition assignment, declared `interests[]`, compiled filter handles, and streaming session state. Identified by `subscription_id`; lives in cache; expires on `session_timeout`. See [DESIGN.md §3.1 Subscription Schema](DESIGN.md). |
-| Interest | A topic-anchored, typed-filter selection declared at JOIN per [ADR-0005](ADR/0005-subscription-filter-typing.md). One subscription carries 1–64 interests. Each interest has required `topic`, `tenant_id`, `types[]` plus an optional `filter { engine, expression }` object. Multiple interests OR together. |
-| FilterEngine | Plugin trait (`compile()` + `eval()`) for evaluating filter expressions over events. GTS-typed; base type `gts.cf.core.events.filter.v1~`; v1 built-in CEL engine. Resolved at JOIN via `ClientHub`. |
+| Consumer Group | A logical set of cooperating consumer instances sharing partition assignments and a single committed offset per partition. Persistent broker resource, GTS-typed, with two creation paths (anonymous via `POST /v1/consumer-groups`, named via `types_registry` (not yet implemented, tracked in #5702)). |
+| Subscription | An ephemeral session a consumer instance opens against a consumer group via `POST /v1/subscriptions`. Holds the partition assignment, declared `interests[]`, compiled filter handles, and streaming session state. Identified by `subscription_id`; lives in cache (not yet implemented, tracked in #5979); expires on `session_timeout`. See [DESIGN.md §3.1 Subscription Schema](DESIGN.md). |
+| Interest | A topic-anchored, typed-filter selection declared at JOIN per [ADR-0005](ADR/0005-subscription-filter-typing.md). One subscription carries 1-64 interests (at least one not yet enforced, tracked in #5978). Each interest has required `topic` and `types[]`, an optional `subject_tenant` (the caller's own tenant by default) and `ownership_filter` (`only_mine` by default: the caller's own events in its own tenant; or `entire_tenant`, or `tenant_subtree_included`), plus an optional `filter { engine, expression }` object. Multiple interests OR together. |
+| FilterEngine | Plugin trait (`compile()` + `eval()`) for evaluating filter expressions over events. GTS-typed; base type `gts.cf.core.events.filter.v1~`; v1 built-in CEL engine. Resolved at JOIN via `ClientHub` (not yet implemented, tracked in #5978). |
 | FilterContext | Per-engine declaration of which event fields are visible to filter expressions. CEL engine v1 exposes the read-side event (`gts.cf.core.events.event.v1~.schema.json` with `readOnly` fields populated; `writeOnly` `meta` stripped). |
-| Offset | Backend-assigned, monotonic-per-`(topic, partition)` ordering key. Consumer-visible; the only sequence consumers paginate by. |
+| Offset | Backend-assigned, monotonic-per-`(topic, partition)` ordering key. Consumer-visible: consumer offsets (an exact SEEK position, the `offset` of a frame position, a committed cursor) are values of it. |
 | Storage Backend | Pluggable persistence layer for events. Each instance is a named entry in the `backends` registry, built by a `backend::Provider` linked into the build ([feature 0005](features/0005-backend-registry-and-routing.md) §2.1, [feature 0007](features/0007-storage-backend-api.md) §2.7). Backend enforces retention, compaction, and offset assignment. |
-| Cluster Module | The platform-level `modules/system/cluster` system module providing KV-with-TTL, leader election, and distributed locks. Consumed by the broker for coordination. |
+| Cluster Module | The platform-level `gears/system/cluster` system module providing KV-with-TTL, leader election, and distributed locks. Consumed by the broker for coordination. |
 | GTS | Global Type System — the platform's schema and instance registration system used for type identification, validation, and pattern matching in authorization. |
 
 ### 1.5 Domain Model
@@ -136,7 +136,7 @@ Before the functional requirements, this section establishes the conceptual enti
 
 6. **Consumer Group** — A named, **persistent** grouping of cooperating consumer instances that together consume a set of topics. The group is the unit across which **partitions are distributed** (a partition is processed by at most one member at a time) and against which delivery progress is committed. Membership is dynamic; the group's committed position survives individual member churn.
 
-7. **Offset / Cursor** — The **offset** is a backend-assigned, monotonic position within a `(topic, partition)` log; it is the only ordering coordinate consumers observe. The **cursor** is the group-scoped ephemeral session position set by SEEK. The cursor advances **forward-only** during streaming and may be repositioned explicitly for replay via SEEK (`POST /v1/subscriptions/{id}:seek`).
+7. **Offset / Cursor** - The **offset** is a backend-assigned, monotonic position within a `(topic, partition)` log; it is the only ordering coordinate consumers observe. The **cursor** is the group-scoped ephemeral session position set by SEEK. Delivery does not move the cursor (a stream's read position advances in the stream session only); only SEEK (`POST /v1/subscriptions/{id}:seek`) sets it, backward for replay included, and a SEEK while a stream is open is refused with `409 StreamingInProgress`.
 
 8. **Storage Backend** - The pluggable persistence layer bound to a topic. It durably stores events, **assigns their offsets**, and **enforces retention, compaction/consolidation, and deletion** - retention as the topic declares it, the rest as its own configuration directs. Every backend, first-party or third-party, is a `backend::Provider` linked into the build and instantiated from the `backends` registry ([feature 0005](features/0005-backend-registry-and-routing.md) §2.1), without modifying broker core.
 
@@ -165,7 +165,7 @@ Subscription *  ──*  Partition       (a subscription is assigned partitions 
 
 **ID**: `cpt-cf-evbk-actor-platform-operator`
 
-- **Role**: Configures broker deployment topology (standalone vs cluster), partition count, the backend registry and per-topic backend routing, and operational policies (stream connection caps, group caps, retention via backend config).
+- **Role**: Configures broker deployment topology (standalone vs cluster), partition count, the backend registry and per-topic backend routing, and operational policies (stream connection caps (not yet implemented, tracked in #4353), group caps (not yet implemented, tracked in #4438), retention via the per-topic settings).
 - **Needs**: Operate broker as a managed platform service; observe per-topic / per-group lag; scale delivery shards horizontally; route topics to backend instances through `backend_routing` ([feature 0005](features/0005-backend-registry-and-routing.md) §2.2) and move a topic between backends per [ADR-0008](ADR/0008-topic-log-identity.md) O3.
 
 #### Module Developer (Producer Side)
@@ -179,7 +179,7 @@ Subscription *  ──*  Partition       (a subscription is assigned partitions 
 
 **ID**: `cpt-cf-evbk-actor-module-dev-consumer`
 
-- **Role**: Authors a Gears module that consumes events. Joins a consumer group, declares per-member topic / filter set, polls and acknowledges events; handles topology changes and re-JOIN semantics.
+- **Role**: Authors a Gears module that consumes events. Joins a consumer group, declares per-member topic / filter set, streams events and commits its positions; handles topology changes and re-JOIN semantics.
 - **Needs**: At-least-once delivery; per-member filters (no canonical group filter to fight); a clear recovery contract distinguishing shard shutdown from subscription loss, with re-JOIN semantics; ability to seek for replay.
 
 ### 2.2 System Actors
@@ -212,7 +212,7 @@ Subscription *  ──*  Partition       (a subscription is assigned partitions 
 
 **ID**: `cpt-cf-evbk-actor-types-registry`
 
-- **Role**: Stores GTS schema and instance registrations. The broker uses it to validate topic / event-type / consumer-group GTS identifiers; to resolve the event-type `data_schema` against which event payloads are validated at ingest; reads named consumer-group instances at startup to upsert `event_broker_consumer_group` rows.
+- **Role**: Stores GTS schema and instance registrations. The broker uses it to validate topic / event-type GTS identifiers and to resolve the event-type `data_schema` against which event payloads are validated at ingest; it also validates named consumer-group GTS identifiers against it and reads named consumer-group instances at startup to upsert `event_broker_consumer_group` rows (both not yet implemented, tracked in #5702).
 
 #### Storage Backend Plugin
 
@@ -230,22 +230,22 @@ The Event Broker follows standard Gears module conventions. Module-specific depl
 
 - **Two deployment topologies** are first-class: **Standalone** (single process; in-process `cluster` provider; one ingest + one delivery in-process) and **Cluster** (separate ingest / delivery / dispatcher processes, scaled independently, coordinating via the platform `cluster` module backed by Redis / etcd / NATS).
 - **Per-module DB schema invariant**: in standalone mode, the producer module's outbox and the broker module's ingest outbox live in distinct DB schemas (one per Gears module), so no table-name collision arises.
-- **Every ingest and delivery instance handles every topic** in cluster mode. An instance may declare an **affinity** - a routing hint the dispatcher prefers for matching topics, for noisy-neighbor isolation or hardware affinity - without becoming unable to serve any other topic ([feature 0005](features/0005-backend-registry-and-routing.md) §2.3).
+- **Every ingest and delivery instance handles every topic** in cluster mode. An instance may declare an **affinity** - a routing hint the dispatcher prefers for matching topics, for noisy-neighbor isolation or hardware affinity - without becoming unable to serve any other topic (not yet implemented, tracked in #5552 and #5701) ([feature 0005](features/0005-backend-registry-and-routing.md) §2.3).
 
 ## 4. Scope
 
 ### 4.1 In Scope
 
-- REST API for produce (single + batch), consume (stream, ack, seek, leave), producer lifecycle, consumer-group lifecycle, topic introspection.
+- REST API for produce (single + batch), consume (stream, seek, leave), producer lifecycle, consumer-group lifecycle, topic introspection.
 - Three producer modes (chained / monotonic / stateless) with broker-side chain-of-custody dedup at ingest.
-- Long-poll consumption with per-partition append-only in-memory cache woken through each backend's head watch ([feature 0007](features/0007-storage-backend-api.md) §4.2).
+- Streaming consumption (`GET /v1/events:stream`) with per-partition append-only in-memory cache woken through each backend's head watch ([feature 0007](features/0007-storage-backend-api.md) §4.2).
 - GTS-typed topics, event types, subject types, consumer groups; full GTS pattern wildcards in authorization.
 - Storage backend plugin contract; first-party and vendor backends alike are plugins linked through a `backend::Provider`.
 - Per-(resource, action) authorization via the `authz-resolver` framework (4 resource types × 3 actions: `produce`, `consume`, `define`).
-- Persistent consumer-group registry (`event_broker_consumer_group`) with two exclusive provisioning paths (anonymous via REST, named via `types_registry`).
+- Persistent consumer-group registry (`event_broker_consumer_group`) with two exclusive provisioning paths (anonymous via REST, named via `types_registry` (not yet implemented, tracked in #5702)).
 - Per-event size limit (60 KiB combined headers + payload); partition-key cap (1024 bytes); per-batch limit (100 events / 1 MiB).
-- Cluster-mode failover with `DirectoryService` as source of truth for delivery-shard liveness.
-- Standalone and cluster deployment topologies; affinity-preferring dispatcher routing over instances that each handle every topic.
+- Cluster-mode failover with `DirectoryService` as source of truth for delivery-shard liveness (not yet implemented, tracked in #4438).
+- Standalone and cluster deployment topologies; affinity-preferring dispatcher routing (not yet implemented, tracked in #5552 and #5701) over instances that each handle every topic.
 - RFC 9457 Problem Details for all error responses with stable GTS type identifiers.
 
 ### 4.2 Out of Scope
@@ -253,7 +253,7 @@ The Event Broker follows standard Gears module conventions. Module-specific depl
 - Consumer-facing dead-letter queues — the broker provides none. A consumer that needs one creates its own dedicated dead-letter **topic** (single event type, `object`-typed payload) and republishes events it cannot process. (Distinct from the ingest-side *outbox dead-letter* that records terminal `backend.persist` failures for operators — see DESIGN §3.7.)
 - Webhooks / outbound HTTP push delivery — the added load, authorization, and retry semantics belong in a separate component adjacent to the broker, not in the broker itself.
 - Event-type schema evolution (forward / backward compatibility, inter-version casting). v1 treats event types as immutable; schema changes require a new GTS event-type identifier.
-- Quotas and rate limiting. Limits **must** exist before broad production exposure — scoped **per topic, per producer, and per consumer** (produce rate, poll rate, active-subscription and resource-creation caps, storage quotas) — but the full scheme needs dedicated design and is deferred to the post-MVP **Quotas & Rate Limiting** feature (see §12 Risks). Interim per-tenant safety-floor caps on resource-creation endpoints are tracked now (see §6.2, `cpt-cf-evbk-nfr-tenant-rate-caps`).
+- Quotas and rate limiting. Limits **must** exist before broad production exposure - scoped **per topic, per producer, and per consumer** (produce rate, consume rate, active-subscription and resource-creation caps, storage quotas) - but the full scheme needs dedicated design and is deferred to the post-MVP **Quotas & Rate Limiting** feature (see §12 Risks). Interim per-tenant safety-floor caps on resource-creation endpoints are tracked now (see §6.2, `cpt-cf-evbk-nfr-tenant-rate-caps`).
 - Topic soft-delete with grace-period serving.
 - Backend-failure backpressure (ingest auto-marking topics as failed and refusing produces).
 - DB-restore resync tooling (CLI to realign producer / consumer state after broker DB restore).
@@ -290,7 +290,7 @@ The system MUST support event-type registration via `types_registry`. Each event
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-fr-topic-introspection`
 
-The system MUST expose read-only REST endpoints for listing topics, listing event types, retrieving a single topic's metadata, and retrieving a single event type's schema. Read access is gated by the `topic:consume` PEP check.
+The system MUST expose read-only REST endpoints for listing topics, listing event types, retrieving a single topic's metadata, and retrieving a single event type's schema. A caller reads a topic it may consume, or one of whose event types it may publish, in its own tenant: producers read specs to validate; consumers may read them too, for example for code generation.
 
 - **Rationale**: Producers and SDKs may need topic metadata for batching, consumers need event-type schemas to validate, and tooling needs discovery.
 - **Actors**: `cpt-cf-evbk-actor-module-dev-producer`, `cpt-cf-evbk-actor-module-dev-consumer`
@@ -301,7 +301,7 @@ The system MUST expose read-only REST endpoints for listing topics, listing even
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-fr-publish-single`
 
-The system MUST accept single-event publish requests. The event MUST carry `id` (UUID, client-provided), `type`, `subject`, `subject_type`, `tenant_id`, and `data`; the owning topic is resolved from the event type, and the partition is backend-assigned, not client-set. Publish MUST be **accepted asynchronously and durably** - the broker acknowledges once the event is durably recorded in the ingest outbox, with persistence to the storage backend completing asynchronously under an at-least-once guarantee. A synchronous mode (`Prefer: wait=N`) MUST be available for callers needing read-after-write, acknowledging stored only after backend persistence completes. Wire endpoint, status codes, and headers are defined in DESIGN §3.3.
+The system MUST accept single-event publish requests. The event MUST carry `id` (UUID, client-provided), `type`, `subject`, `subject_type`, `subject_tenant`, and `data`, and MAY carry `subject_owner` (the principal of its tenant it is addressed to); the owning topic is resolved from the event type, and the partition is backend-assigned, not client-set. Publish MUST be **accepted asynchronously and durably** - the broker acknowledges once the event is durably recorded in the ingest outbox, with persistence to the storage backend completing asynchronously under an at-least-once guarantee. A synchronous mode (`Prefer: wait=N`) MUST be available for callers needing read-after-write, acknowledging stored only after backend persistence completes. A nil `subject_tenant` or `subject_owner` MUST be refused before authorization. Wire endpoint, status codes, and headers are defined in DESIGN §3.3.
 
 - **Rationale**: Standard event-streaming publish primitive with explicit at-least-once semantics.
 - **Actors**: `cpt-cf-evbk-actor-module-dev-producer`
@@ -310,7 +310,7 @@ The system MUST accept single-event publish requests. The event MUST carry `id` 
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-fr-publish-batch`
 
-The system MUST accept batch publish via `POST /v1/events:batch`. A batch targets one topic and MAY carry events of several producer ids; it is validated per `(producer_id, topic)` run (rules in DESIGN §3.3 and ADR-0004). Hard limits: 100 events per batch, 1 MiB total payload, 60 KiB per event. The batch is atomic - if any event fails dedup validation, the entire batch is rejected and nothing is enqueued.
+The system MUST accept batch publish via `POST /v1/events:batch`. A batch targets one topic and MAY carry events of several producer ids; it is validated per `(producer, topic)` run (rules in DESIGN §3.3 and ADR-0004). Hard limits: 100 events per batch, 1 MiB total payload, 60 KiB per event. The batch is atomic - if any event fails dedup validation, the entire batch is rejected and nothing is enqueued.
 
 - **Rationale**: High-throughput producers benefit from batching; ingest cannot know an event's partition, so a batch is not bounded by one.
 - **Actors**: `cpt-cf-evbk-actor-module-dev-producer`
@@ -319,7 +319,7 @@ The system MUST accept batch publish via `POST /v1/events:batch`. A batch target
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-fr-producer-modes`
 
-The system MUST recognize three producer modes, declared at registration and validated against the fields set on each event: **chained** (`producer_id` + `previous` + `sequence`), **monotonic** (`producer_id` + `sequence` only), **stateless** (none). Chained mode MUST admit an event when `event.previous == state.last_sequence` AND `event.sequence > state.last_sequence` against `event_broker_producer_sequence`, and MUST treat a resend of the head (`event.sequence == state.last_sequence`, whatever its `previous`) as a duplicate answered `200 OK`; in a batch run that contains the head, the events up to and including it are that duplicate and the events after it advance the chain; any other chained publish MUST surface as `412 SequenceViolation`. Monotonic mode MUST verify only `event.sequence > state.last_sequence`. Stateless mode MUST do no broker-side dedup. A duplicate needs no handling: it is success. On `412 SequenceViolation` there are two cases. **(1) Benign reorder** - resolved automatically with no human involvement: re-driven from the broker's cursor. **(2) Genuine divergence** - e.g. the producer's local DB was restored from backup and its sequence regressed - which cannot be reconciled silently and MUST surface for **operator acknowledgement**; the operator reconciles against `GET /v1/producers/{producer_id}/cursors` (resume from `last_sequence + 1`) or rotates to a fresh `producer_id` to start a new chain.
+The system MUST recognize three producer modes, declared at registration and validated against the fields set on each event: **chained** (`producer` + `previous` + `sequence`), **monotonic** (`producer` + `sequence` only), **stateless** (none). Chained mode MUST admit an event when `event.previous == state.last_sequence` AND `event.sequence > state.last_sequence` against `event_broker_producer_sequence`, and MUST treat a resend of the head (`event.sequence == state.last_sequence`, whatever its `previous`) as a duplicate answered `200 OK`; in a batch run that contains the head, the events up to and including it are that duplicate and the events after it advance the chain; any other chained publish MUST surface as `412 SequenceViolation`. Monotonic mode MUST verify only `event.sequence > state.last_sequence`. Stateless mode MUST do no broker-side dedup. A duplicate needs no handling: it is success. On `412 SequenceViolation` there are two cases. **(1) Benign reorder** - resolved automatically with no human involvement: re-driven from the broker's cursor. **(2) Genuine divergence** - e.g. the producer's local DB was restored from backup and its sequence regressed - which cannot be reconciled silently and MUST surface for **operator acknowledgement**; the operator reconciles against `GET /v1/producers/{producer_id}/cursors` (resume from `last_sequence + 1`) or rotates to a fresh producer id to start a new chain.
 
 - **Rationale**: Different producer profiles need different dedup guarantees; chain-of-custody is the broker-side primitive that supports all three without an event.id index.
 - **Actors**: `cpt-cf-evbk-actor-module-dev-producer`
@@ -328,9 +328,9 @@ The system MUST recognize three producer modes, declared at registration and val
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-fr-producer-registration`
 
-The system MUST expose `POST /v1/producers` returning a server-issued `id` (UUID) bound to the calling principal. Subsequent `POST /v1/events` requests carrying this id in `meta.producer_id` MUST be accepted only when the call's principal matches the registered owner; mismatch MUST surface as `403 Forbidden`.
+The system MUST expose `POST /v1/producers` returning a server-issued `id` (UUID) bound to the calling principal. Subsequent `POST /v1/events` requests carrying this id in `meta.producer` MUST be accepted only when the call's principal matches the registered owner; mismatch MUST surface as `403 Forbidden` (not yet implemented on publish).
 
-- **Rationale**: Prevents unauthenticated `meta.producer_id` claiming and same-tenant ordering chaos.
+- **Rationale**: Prevents unauthenticated `meta.producer` claiming and same-tenant ordering chaos.
 - **Actors**: `cpt-cf-evbk-actor-module-dev-producer`
 
 #### Producer Cursor Recovery
@@ -348,9 +348,9 @@ The system MUST expose `GET /v1/producers/{producer_id}/cursors` returning the b
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-fr-subscription-join`
 
-The system MUST accept `POST /v1/subscriptions` (JOIN) with body containing `consumer_group` (GTS identifier, required), `client_agent` (RFC 9110 User-Agent grammar, required, per ADR-0004), `interests[]` (≥1, ≤64 entries), and `session_timeout`. Each entry in `interests[]` is a topic-anchored typed-filter selection per [ADR/0005-subscription-filter-typing.md](ADR/0005-subscription-filter-typing.md), with three required fields (`topic`, `tenant_id`, `types`) and an optional `filter { engine, expression }` object (both `engine` and `expression` required when `filter` is present). The system MUST validate the consumer group exists; for each interest, validate topic existence + topic-level `consume` authz + per-tenant authz + type-pattern syntax + topic-scoped pattern resolution (per-name latest + minor-version-omitted) + per-type authz + (if `filter` supplied) engine resolution + expression compilation. Failed JOIN MUST leave no broker state. On success, the broker computes the topic set as the union of `interest.topic` values, runs the rebalance algorithm, and returns `subscription_id` + `assigned[]` (topic, partition pairs) + `topology_version`. Subject to the per-tenant JOIN rate cap (`cpt-cf-evbk-nfr-tenant-rate-caps`).
+The system MUST accept `POST /v1/subscriptions` (JOIN) with body containing `consumer_group` (GTS identifier, required), `client_agent` (RFC 9110 User-Agent grammar, required, per ADR-0004), `interests[]` (≤64 entries), and `session_timeout`; `interests[]` holds at least one entry (not yet implemented, tracked in #5978). Each entry in `interests[]` is a topic-anchored typed-filter selection per [ADR/0005-subscription-filter-typing.md](ADR/0005-subscription-filter-typing.md), with two required fields (`topic`, `types`), an optional `subject_tenant` (the caller's own tenant by default), `ownership_filter` (`only_mine` by default, `entire_tenant` or `tenant_subtree_included`) and `barrier_mode` (`respect` by default, or `ignore`), an optional `subject_types` selector (1-32 GTS type patterns on the event's `subject_type`; a delivery filter, not an access grant) and an optional `filter { engine, expression }` object (both `engine` and `expression` required when `filter` is present). The REST handler parses the request first: a body that is not valid JSON answers 400, and a missing, unknown or mistyped field (a `filter` without `engine` or `expression` included) answers 422; it then validates `client_agent`, `session_timeout` and the `consumer_group` id (400), answers 501 for a named consumer group, and validates each interest's topic id, `filter.engine` id and type-pattern syntax, refusing an interest that sends `max_depth` (400). The system MUST then refuse a caller whose subject or tenant id is the nil UUID, and check the interest limits (at most 64 interests, 32 `types` and 32 `subject_types` per interest) and that no interest tenant is the nil UUID and no `only_mine` interest names a tenant other than the caller's, before any read or authorization call. It MUST then validate the consumer group exists and that the caller may join it (for an anonymous group the creator check, then the group check); authorize consumption per interest group (topic and tenant context, which the ownership filter sets) with the policy decision point: the barrier right for `barrier_mode: ignore`, then the consume scope over the topic's registered event types, which also decides delivery; refuse an exact type or subject-type selector the granted scope can never deliver; and validate topic existence + topic-scoped pattern resolution (per-name latest + minor-version-omitted) + (if `filter` supplied) engine resolution + expression compilation (not yet implemented, tracked in #5978). A pattern that matches no registered event type does not fail the JOIN: the response reports it in that interest's `unmatched_types`. Failed JOIN MUST leave no broker state. On success, the broker computes the topic set as the union of `interest.topic` values, runs the rebalance algorithm, and returns `id` + `assigned[]` (topic, partition pairs) + `topology_version` + the echoed `interests[]`, each with its `unmatched_types`. Subject to the per-tenant JOIN rate cap (`cpt-cf-evbk-nfr-tenant-rate-caps`) (not yet implemented, tracked in #5697). Only the principal that joined a subscription may LEAVE it (`DELETE /v1/subscriptions/{id}`; 403 `SubscriptionNotOwned` otherwise).
 
-- **Rationale**: The JOIN is the contract entry point for consumers; authorization, group identity, partition assignment, and filter-engine compilation all converge here. The interests model gives unambiguous topic-anchored declarations and the optional `filter` object allows the common "match topic+tenant+types" case to omit expressions entirely.
+- **Rationale**: The JOIN is the contract entry point for consumers; authorization, group identity, partition assignment, and filter-engine compilation (not yet implemented, tracked in #5978) all converge here. The interests model gives unambiguous topic-anchored declarations and the optional `filter` object allows the common "match topic+tenant+types" case to omit expressions entirely.
 - **Actors**: `cpt-cf-evbk-actor-module-dev-consumer`
 
 #### Typed Filter Expressions
@@ -362,11 +362,11 @@ The system MUST support typed filter expressions as an optional `filter { engine
 - **Rationale**: Typed filters open the door to additional expression languages without breaking the wire; GTS-typed engines are consistent with how every other plugin in the platform is identified.
 - **Actors**: `cpt-cf-evbk-actor-module-dev-consumer`
 
-#### Long-Poll Consumption
+#### Streaming Consumption
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-fr-streaming-delivery`
 
-The system MUST serve `GET /v1/events:stream?subscription_id={uuid}` as a long-lived `multipart/mixed` stream that emits one event per multipart part. The broker MUST emit `heartbeat` frames at a configurable cadence (default 5 s) on idle subscriptions. The response MUST include `topology` frames whenever assignment / topology version changes mid-stream. The stream MUST use a per-`(topic, partition)` in-memory append-only cache + iterator pattern to avoid per-group backend re-queries on event publish.
+The system MUST serve `GET /v1/events:stream?subscription={uuid}` as a long-lived `multipart/mixed` stream that emits one event per multipart part. Only the principal that joined the subscription may open its stream (`403 SubscriptionNotOwned`), and the open also runs the group check, `consume` on the subscription's consumer group (`404 ConsumerGroupNotFound` when the group is no longer registered, `403 ConsumerGroupNotAuthorized` when the policy refuses it). The broker MUST emit `heartbeat` frames at a configurable cadence (default 5 s) on idle subscriptions. The response MUST include `topology` frames whenever assignment / topology version changes mid-stream. The stream MUST use a per-`(topic, partition)` in-memory append-only cache + iterator pattern to avoid per-group backend re-queries on event publish.
 
 - **Rationale**: Streaming `multipart/mixed` is the only consumption surface in MVP for server-to-server consumers; per-partition cache + iterators is the design center for fan-out efficiency.
 - **Actors**: `cpt-cf-evbk-actor-module-dev-consumer`
@@ -375,7 +375,7 @@ The system MUST serve `GET /v1/events:stream?subscription_id={uuid}` as a long-l
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-fr-ack-seek`
 
-The system MUST support `POST /v1/subscriptions/{id}:seek` (advance cursor via SEEK, sets `cursor.offset` per `(topic, partition)`; forward-only during streaming via `MAX(current, requested)`; unrestricted before streaming opens). Cursor state MUST be group-scoped (shared across all subscriptions in the group), held in the cluster cache (no SQL cursor table).
+The system MUST support `POST /v1/subscriptions/{id}:seek`, which sets the group's stored cursor for each topic and partition the request's `positions` names to the resolved value (an integer offset, `earliest`, `latest` or `at:<ISO-8601>`, within the partition's valid range); a SEEK may move a cursor backward (there is no forward-only rule), and a SEEK while a stream is open on the subscription is refused with `409 StreamingInProgress`. Only the principal that joined the subscription may SEEK it (`403 SubscriptionNotOwned`), and a SEEK also runs the group check on the subscription's consumer group (`404 ConsumerGroupNotFound`, `403 ConsumerGroupNotAuthorized`). Cursor state MUST be group-scoped (shared across all subscriptions in the group), held in the cluster cache (no SQL cursor table).
 
 - **Rationale**: Replay and cursor advance require seek; cursor's lifetime should match the group's, not any specific subscription.
 - **Actors**: `cpt-cf-evbk-actor-module-dev-consumer`
@@ -384,7 +384,7 @@ The system MUST support `POST /v1/subscriptions/{id}:seek` (advance cursor via S
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-fr-subscription-recovery`
 
-The system MUST distinguish graceful delivery-shard shutdown (in-flight streams drained) from ungraceful subscription loss, signalling each distinctly to the consumer. The SDK contract MUST require re-JOIN with the original `consumer_group` / `topics` / filters on either signal — the group cursor preserves position across re-JOIN when the cache survives. The specific status codes are defined in DESIGN §3.3.
+The system MUST distinguish graceful delivery-shard shutdown (in-flight streams drained) from ungraceful subscription loss, signalling each distinctly to the consumer (not yet implemented, tracked in #4438). The SDK contract MUST require re-JOIN with the original `consumer_group` / `topics` / filters on either signal - the group cursor preserves position across re-JOIN when the cache survives. The specific status codes are defined in DESIGN §3.3.
 
 - **Rationale**: Shard ownership migration is a routine operational event; clean, normative recovery semantics keep consumer code simple.
 - **Actors**: `cpt-cf-evbk-actor-module-dev-consumer`, `cpt-cf-evbk-actor-cluster`
@@ -395,16 +395,16 @@ The system MUST distinguish graceful delivery-shard shutdown (in-flight streams 
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-fr-anonymous-group-create`
 
-The system MUST accept `POST /v1/consumer-groups` with a UUID-backed GTS identifier (`gts.cf.core.events.consumer_group.v1~{uuid}`). The row's `tenant_id` and `owner_principal_id` MUST come from `SecurityContext` and be non-overridable. Named (vendor-namespaced) identifiers MUST be rejected with `400 NamedGroupRequiresRegistry`.
+The system MUST accept `POST /v1/consumer-groups` and mint the new group's UUID-backed GTS identifier (`gts.cf.core.events.consumer_group.v1~{uuid}`); the request body carries no identifier, and a body key it does not declare (an `id` included) is rejected with `400 InvalidBody`. The row's `tenant_id` and `owner_principal_id` MUST come from `SecurityContext` and be non-overridable. A named (vendor-namespaced) identifier on JOIN or on `GET` / `DELETE /v1/consumer-groups/{id}` answers `501` (named consumer groups are not yet implemented, tracked in #5702).
 
-- **Rationale**: Anonymous groups are caller-driven, tenant-private; this endpoint is the only path. Named groups have a separate, authority-controlled path.
+- **Rationale**: Anonymous groups are caller-driven and private to the principal that created them, in its tenant: only it may JOIN or delete one, while a read by id or a list shows the group to any caller that may consume as its tenant; this endpoint is the only path. Named groups have a separate, authority-controlled path (not yet implemented, tracked in #5702).
 - **Actors**: `cpt-cf-evbk-actor-module-dev-consumer`
 
 #### Named Group Provisioning
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-fr-named-group-provisioning`
 
-The system MUST read `types_registry` at startup for instances of `gts.cf.core.events.consumer_group.v1~` and upsert each into `event_broker_consumer_group` with `kind='named'` and `owner_principal_id` set to the registering module's principal. The upsert MUST be idempotent - re-running startup MUST NOT change ownership of existing named groups.
+The system MUST read `types_registry` at startup for instances of `gts.cf.core.events.consumer_group.v1~` and upsert each into `event_broker_consumer_group` with `kind='named'` and `owner_principal_id` set to the registering module's principal (not yet implemented, tracked in #5702). The upsert MUST be idempotent - re-running startup MUST NOT change ownership of existing named groups (not yet implemented, tracked in #5702).
 
 - **Rationale**: Named groups are platform-level resources; their lifecycle is tied to module registration, not REST.
 - **Actors**: `cpt-cf-evbk-actor-platform-operator`, `cpt-cf-evbk-actor-types-registry`
@@ -413,9 +413,9 @@ The system MUST read `types_registry` at startup for instances of `gts.cf.core.e
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-fr-group-join-authz`
 
-The system MUST enforce two distinct authorization paths at JOIN: **anonymous groups** require caller's `tenant_id` to equal the row's `owner_tenant_id` (`403 ConsumerGroupNotOwned` otherwise); **named groups** require an explicit `:consume` PEP grant on the concrete GTS instance via `authz-resolver`.
+The system MUST enforce two distinct authorization paths at JOIN: **anonymous groups** admit only the principal that created the group, in its tenant (`403 ConsumerGroupNotOwned` otherwise, checked before any PDP call), and then run the group check, `consume` on the group (`403 ConsumerGroupNotAuthorized` when the policy refuses it); **named groups** require an explicit `:consume` PEP grant on the concrete GTS instance via `authz-resolver` (not yet implemented, tracked in #5702; a named group's JOIN answers `501`).
 
-- **Rationale**: Anonymous groups are tenant-private by construction; named groups are the legitimate cross-tenant cooperative path gated by explicit grants.
+- **Rationale**: Anonymous groups are private by construction to the principal that created them, in its tenant (only it may JOIN or delete one; a read by id or a list shows the group to any caller that may consume as its tenant); named groups are the legitimate cross-tenant cooperative path gated by explicit grants.
 - **Actors**: `cpt-cf-evbk-actor-authz-resolver`
 
 ### 5.5 Storage Backend Plugin System
@@ -494,23 +494,17 @@ All error responses MUST follow RFC 9457 Problem Details (`application/problem+j
 
 Per-event hard size limit: 60 KiB combined headers + payload, leaving 4 KiB of the 64 KiB outbox row for the outbox wrappers. Enforced at ingest right after the request is parsed, before the event type is looked up. The partition key an event resolves to is capped at 1024 bytes, since the ingest outbox row stores it beside the event. Larger events MUST be split or referenced (referenced-payload mechanism is post-MVP).
 
-#### Long-Poll Timeout
-
-- [ ] `p1` - **ID**: `cpt-cf-evbk-nfr-long-poll-timeout`
-
-Long-poll maximum timeout: 30 seconds. Consumers behind aggressive corporate proxies SHOULD request a lower timeout (e.g., 20 seconds) to keep responses well within proxy idle limits.
-
 #### Tenant Resource-Creation Safety Caps
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-nfr-tenant-rate-caps`
 
-Before the full post-MVP quotas feature exists, the broker MUST enforce interim per-tenant safety-floor caps on resource-creation endpoints: `POST /v1/consumer-groups`, `POST /v1/producers`, and `POST /v1/subscriptions`. These caps are abuse controls for resource creation only; they do not replace the deferred full quota model for produce rate, poll rate, active-subscription caps, or storage quotas.
+Before the full post-MVP quotas feature exists, the broker MUST enforce interim per-tenant safety-floor caps on resource-creation endpoints: `POST /v1/consumer-groups`, `POST /v1/producers`, and `POST /v1/subscriptions` (not yet implemented, tracked in #5697). These caps are abuse controls for resource creation only; they do not replace the deferred full quota model for produce rate, consume rate, active-subscription caps, or storage quotas.
 
 #### Group Cap Per Delivery Instance
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-nfr-group-cap`
 
-Maximum consumer groups owned per delivery instance: 1000 (default, configurable per deployment). When all delivery instances are at cap, JOIN MUST return `503` with `Retry-After` (operator's signal to scale out).
+Maximum consumer groups owned per delivery instance: 1000 (default, configurable per deployment) (not yet implemented, tracked in #4438). When all delivery instances are at cap, JOIN MUST return `503` with `Retry-After` (operator's signal to scale out) (not yet implemented, tracked in #4438).
 
 #### Cluster Mode Failover Bound
 
@@ -533,13 +527,11 @@ These targets are measured under stated conditions: small payloads (≈1 KiB, no
 
 ### 6.2 NFR Exclusions
 
-- **Per-tenant produce rate ceilings, per-subscription poll rate ceilings, per-tenant storage quotas** — deferred to a post-MVP "Quotas and rate limiting" feature. (Per-tenant safety-floor caps on resource-creation endpoints — `POST /v1/consumer-groups`, `POST /v1/producers`, `POST /v1/subscriptions` — are tracked separately as `cpt-cf-evbk-nfr-tenant-rate-caps` and land via the BACKLOG.md §6.1 work.)
+- **Per-tenant produce rate ceilings, per-subscription consume rate ceilings, per-tenant storage quotas** - deferred to a post-MVP "Quotas and rate limiting" feature. (Per-tenant safety-floor caps on resource-creation endpoints - `POST /v1/consumer-groups`, `POST /v1/producers`, `POST /v1/subscriptions` - are tracked separately as `cpt-cf-evbk-nfr-tenant-rate-caps` and land via the BACKLOG.md §6.1 work.)
 - **Absolute events/sec throughput targets** — superseded by `cpt-cf-evbk-nfr-throughput-efficiency`, which states throughput as backend-relative efficiency rather than an absolute figure (absolute numbers depend on the chosen backend and topology).
-- **Specific p99 publish / poll latency targets** — publish-accept latency is bounded by ingest-outbox durability (a local write), but end-to-end persist/poll latency depends on the chosen backend and topology, so no absolute p99 is set at the broker level.
-- **Dynamic type-pattern refresh in subscriptions** — newly-registered event types matching an active subscription's patterns don't auto-extend the resolved set; consumer re-JOINs. Future `dynamic_types_refresh` flag, post-MVP. Per ADR-0005 § More Information.
+- **Specific p99 publish / delivery latency targets** - publish-accept latency is bounded by ingest-outbox durability (a local write), but end-to-end persist/delivery latency depends on the chosen backend and topology, so no absolute p99 is set at the broker level.
 - **Second built-in filter engine** — CEL is the v1 default; starlark / rego / vendor-custom are plugins via the GTS-typed registry. Per ADR-0005.
-- **Implicit derived-type coverage** (GTS spec §3.6 auto-matching) — v1 requires explicit patterns / full identifiers. Future opt-in. Per ADR-0005 § Acknowledged GTS Features.
-- **Runtime-configurable filter limits** — `MAX_INTERESTS_PER_SUBSCRIPTION` / `MAX_TYPES_PER_INTEREST` / `MAX_EXPRESSION_LENGTH_BYTES` / `MAX_COMPILED_FILTER_BYTES` / `EVAL_TIMEOUT_MICROS` are compile-time constants in v1. Per ADR-0005.
+- **Runtime-configurable filter limits** - `JoinRequest::MAX_INTERESTS` / `MAX_TYPES_PER_INTEREST` / `MAX_SUBJECT_TYPES_PER_INTEREST` are compile-time constants in v1, and so are `MAX_EXPRESSION_LENGTH_BYTES` / `MAX_COMPILED_FILTER_BYTES` / `EVAL_TIMEOUT_MICROS` (not yet implemented, tracked in #5978). Per ADR-0005.
 
 ## 7. Public Library Interfaces
 
@@ -550,7 +542,7 @@ The Event Broker exposes its capability via a versioned REST API. The full surfa
 ```
 POST   /v1/events                                # produce single event
 POST   /v1/events:batch                          # produce batch (atomic; one topic, any producer ids)
-GET    /v1/events:stream?subscription_id=...       # streaming consume
+GET    /v1/events:stream?subscription=...        # streaming consume
 
 POST   /v1/producers                             # register producer (server-issued id)
 GET    /v1/producers/{producer_id}/cursors       # read broker's last_sequence per topic
@@ -561,7 +553,7 @@ GET    /v1/consumer-groups                       # list groups visible to caller
 DELETE /v1/consumer-groups/{id}                  # remove consumer group from registry
 
 POST   /v1/subscriptions                         # JOIN (create subscription, claim group, get assignments)
-POST   /v1/subscriptions/{id}:seek               # seek (set cursor.offset, forward-only during streaming)
+POST   /v1/subscriptions/{id}:seek               # seek (set the group cursor for each partition in positions; refused with 409 while a stream is open)
 DELETE /v1/subscriptions/{id}                    # leave (explicit teardown)
 GET    /v1/subscriptions                         # list active subscriptions for caller
 GET    /v1/subscriptions/{id}                    # read subscription state
@@ -576,7 +568,7 @@ GET    /v1/event-types/{id}                      # read event-type schema and al
 
 **Producer SDK trait** — `cf-gears-event-broker-sdk` will export a `EventBrokerProducer` trait whose concrete implementation wraps the `toolkit-db` outbox so producers atomically commit business state and event-publish intent in one transaction. Trait shape, error types, retry policies, and reconnection semantics are implementation-phase deliverables.
 
-**Consumer SDK trait** — `cf-gears-event-broker-sdk` will export a `EventBrokerConsumer` trait covering JOIN / poll / seek / leave with normative behavior on `410 Gone` / `404 SubscriptionNotFound` / `412 SequenceViolation` / `409 PartitionNotAssigned` (re-JOIN, drop in-flight, etc.). Per-language SDK realization is implementation-phase work.
+**Consumer SDK trait** - `cf-gears-event-broker-sdk` will export a `EventBrokerConsumer` trait covering JOIN / stream / seek / leave with normative behavior on `410 Gone` / `404 SubscriptionNotFound` / `412 SequenceViolation` / `409 PartitionNotAssigned` (re-JOIN, drop in-flight, etc.). Per-language SDK realization is implementation-phase work.
 
 **Storage Backend plugin contract** - third-party plugins implement `backend::Backend` and ship a `backend::Provider` linked into the build, whose GTS backend type extends `gts.cf.core.events.backend.v1~` ([feature 0007](features/0007-storage-backend-api.md)). Each topic resolves to a `backends` registry entry through `backend_routing` ([feature 0005](features/0005-backend-registry-and-routing.md)); no broker-core modification needed.
 
@@ -589,14 +581,14 @@ GET    /v1/event-types/{id}                      # read event-type schema and al
 **Actor**: `cpt-cf-evbk-actor-module-dev-consumer`
 
 **Preconditions**:
-- A named consumer group `gts.cf.core.events.consumer_group.v1~vendor.audit.pipeline.v1` is registered in `types_registry`.
+- A named consumer group `gts.cf.core.events.consumer_group.v1~vendor.audit.pipeline.v1` is registered in `types_registry` (not yet implemented, tracked in #5702).
 - The audit-pipeline principal holds `:consume` PEP grants on the relevant audit topics, event types, subject types, and the consumer group.
 
 **Main Flow**:
 1. A platform module emits an audit event (e.g., `gts.cf.core.events.event.v1~vendor.audit.user_changed.v1~`) on every privileged action.
-2. The audit-pipeline module JOINs the named consumer group and streams.
+2. The audit-pipeline module JOINs the named consumer group and streams (not yet implemented, tracked in #5702).
 3. The broker delivers events at-least-once; audit-pipeline processes idempotently into long-term storage.
-4. Audit-pipeline seeks past processed events via SEEK (`POST /v1/subscriptions/{id}:seek`); broker advances `cursor.offset` for the group.
+4. Audit-pipeline seeks past processed events via SEEK (`POST /v1/subscriptions/{id}:seek`) while no stream is open on its subscription (a SEEK during an open stream is refused with `409 StreamingInProgress`); the broker sets the group's cursor for each partition the SEEK names.
 
 **Ordering**: Because the default partition key is `tenant` (per [ADR-0002](ADR/0002-partition-selection.md)), all of a tenant's audit events land on one partition and are delivered in publish order — the pipeline observes a **per-tenant total order** of audit events without any dedicated single-partition topic. Cross-tenant order is unspecified, which is acceptable for audit (records are inspected within a tenant); a deployment needing one global ordered stream would use a single-partition audit topic.
 
@@ -604,7 +596,7 @@ GET    /v1/event-types/{id}                      # read event-type schema and al
 - Each privileged action has a corresponding audit-storage record (at-least-once, idempotent), with per-tenant ordering preserved.
 
 **Alternative Flows**:
-- **Cross-tenant audit**: multiple tenants' audit events flow through the same named group; per-event `tenant_id` is preserved for downstream filtering, and each tenant's events remain individually ordered (separate partitions).
+- **Cross-tenant audit**: multiple tenants' audit events flow through the same named group (not yet implemented, tracked in #5702); per-event `subject_tenant` is preserved for downstream filtering, and each tenant's events remain individually ordered (separate partitions).
 
 #### Real-Time Notification Fan-out
 
@@ -620,14 +612,14 @@ GET    /v1/event-types/{id}                      # read event-type schema and al
 1. The producer publishes events to the topic.
 2. Each subscribed group's owning delivery shard receives notifications via the per-partition cache.
 3. Iterators in each group's open stream wake, advance, apply per-member filters, and emit matching events as multipart parts.
-4. Each consumer module processes independently and acks at its own pace.
+4. Each consumer module processes independently and saves its position in its own offset store at its own pace.
 
 **Postconditions**:
 - Every subscribed group sees every event matching its filter, at-least-once.
 - Fan-out cost is O(active iterators) memory walks rather than O(groups) backend queries.
 
 **Alternative Flows**:
-- **Group falls behind**: `evbk_cursor_lag` gauge surfaces the lagging group; operator alerts; group catches up via continued polling.
+- **Group falls behind**: `evbk_cursor_lag` gauge (not yet implemented, tracked in #5692) surfaces the lagging group; operator alerts; group catches up via continued streaming.
 
 #### Backfill on New Subscriber
 
@@ -640,16 +632,16 @@ GET    /v1/event-types/{id}                      # read event-type schema and al
 - The storage backend has a configurable `earliest_available_offset` per `(topic, partition)`.
 
 **Main Flow**:
-1. The new module calls `POST /v1/consumer-groups` (anonymous group) or registers a named group via `types_registry`.
+1. The new module calls `POST /v1/consumer-groups` (anonymous group) or registers a named group via `types_registry` (not yet implemented, tracked in #5702).
 2. On JOIN, the broker assigns partitions and sets the cursor to `earliest_available_offset`.
-3. The consumer pulls historical events via the streaming endpoint, processes idempotently, acks as it goes.
+3. The consumer pulls historical events via the streaming endpoint, processes idempotently, saving its position in its own offset store as it goes.
 4. After catching up to the live tail, the consumer transitions to receiving live events from the per-partition cache.
 
 **Postconditions**:
 - The new module has processed every available historical event and is now consuming live.
 
 **Alternative Flows**:
-- **Backend retention horizon below acked target**: backend may have purged older events; consumer starts from the backend's current `earliest_available_offset` and the operator accepts the gap.
+- **Backend retention horizon past the consumer's saved position**: backend may have purged older events; a SEEK to the saved position is refused with `400 OffsetOutOfRange` (reason `below_retention_floor`), so the application resets its offset store to `earliest` to start from the backend's current `earliest_available_offset`, and the operator accepts the gap. The SDK consumer does not reset by itself: it logs the refusal, leaves the subscription and re-JOINs until its re-JOIN budget ends with `SubscriptionRecoveryExhausted`.
 
 #### Producer Restart with Persistent Chain State
 
@@ -658,24 +650,24 @@ GET    /v1/event-types/{id}                      # read event-type schema and al
 **Actor**: `cpt-cf-evbk-actor-module-dev-producer`
 
 **Preconditions**:
-- A producer module previously registered via `POST /v1/producers` and persisted `producer_id` + last-known `sequence` alongside its business data.
+- A producer module previously registered via `POST /v1/producers` and persisted producer id + last-known `sequence` alongside its business data.
 
 **Main Flow**:
-1. The producer module restarts and reads its persisted `producer_id` + `last_sequence` from local storage.
+1. The producer module restarts and reads its persisted producer id + `last_sequence` from local storage.
 2. The producer resumes publishing with the next `sequence` after `last_sequence`.
 
 **Postconditions**:
 - Publishing continues with no chain breaks; broker's `event_broker_producer_sequence` advances normally.
 
 **Alternative Flows**:
-- **Local DB restored from backup (sequence regressed)**: producer detects the divergence (e.g., business data has rows newer than `last_sequence` claims), calls `GET /v1/producers/{producer_id}/cursors` to read the broker's authoritative view; producer either reconciles its own state or registers a fresh `producer_id` via `POST /v1/producers` to start a new chain.
+- **Local DB restored from backup (sequence regressed)**: producer detects the divergence (e.g., business data has rows newer than `last_sequence` claims), calls `GET /v1/producers/{producer_id}/cursors` to read the broker's authoritative view; producer either reconciles its own state or registers a fresh producer via `POST /v1/producers` to start a new chain.
 
 ## 9. Acceptance Criteria
 
 - All P1 functional requirements (5.1–5.7) implemented and covered by tests at the levels documented in DESIGN.md.
 - All P1 NFRs (6.1) verifiable via integration tests or static configuration assertions.
-- The DESIGN.md document is in canonical place (`modules/system/event-broker/docs/DESIGN.md`) and is the source of truth for technical decisions.
-- The partition-selection ADR is in canonical place (`modules/system/event-broker/docs/ADR/0002-partition-selection.md`).
+- The DESIGN.md document is in canonical place (`gears/system/event-broker/docs/DESIGN.md`) and is the source of truth for technical decisions.
+- The partition-selection ADR is in canonical place (`gears/system/event-broker/docs/ADR/0002-partition-selection.md`).
 - Standalone deployment (single process, in-process cluster provider, a storage backend that needs no external service) functions end-to-end against the producer + consumer SDKs.
 - Cluster deployment (multi-process; persistent cluster provider; a durable storage backend shared by the processes) functions end-to-end with at least 2 ingest, 2 delivery, 1 dispatcher.
 - All authorization decisions go through `authz-resolver`'s PEP — no broker-local authz rules.
@@ -688,7 +680,7 @@ GET    /v1/event-types/{id}                      # read event-type schema and al
 | `cluster` system module | KV-with-TTL, leader election, distributed locks (`ClusterCacheV1`, `LeaderElectionV1`, `DistributedLockV1`) — `cpt-cf-evbk-actor-cluster`. | p1 |
 | `authz-resolver` | `PolicyEnforcer` PEP for all authorization decisions (`cpt-cf-evbk-actor-authz-resolver`). | p1 |
 | `tenant-resolver` | Tenant identity, hierarchy resolution, `ROOT_TENANT_ID` (`cpt-cf-evbk-actor-tenant-resolver`). | p1 |
-| `types-registry` | GTS schema and instance registration; named consumer-group provisioning at startup (`cpt-cf-evbk-actor-types-registry`). | p1 |
+| `types-registry` | GTS schema and instance registration; named consumer-group provisioning at startup (not yet implemented, tracked in #5702) (`cpt-cf-evbk-actor-types-registry`). | p1 |
 | `api_ingress` | REST API hosting at the platform's HTTP entry point. | p1 |
 | `toolkit-security` | Bearer token authentication. | p1 |
 
@@ -696,7 +688,7 @@ GET    /v1/event-types/{id}                      # read event-type schema and al
 
 - The platform's `cluster` system module is operational and provides KV-with-TTL, leader election, and distributed lock primitives (verified during design).
 - Consumers and producers are responsible for idempotent processing at their layer — the broker's at-least-once contract presumes this.
-- `types_registry` is operational at broker startup so named consumer groups can be upserted on launch.
+- `types_registry` is operational at broker startup so named consumer groups can be upserted on launch (not yet implemented, tracked in #5702).
 - Storage backend instances bound to topics remain operational; backend-failure backpressure is post-MVP.
 - The platform's authentication layer populates `SecurityContext` reliably; the broker reads tenant + principal from it without further validation.
 
@@ -706,14 +698,14 @@ GET    /v1/event-types/{id}                      # read event-type schema and al
 |------|--------|------------|
 | Storage backend selection lock-in | A topic's log stays on the backend `backend_routing` named when it was provisioned; moving it is a data-plus-log-id operation by tooling outside the broker ([ADR-0008](ADR/0008-topic-log-identity.md) O3). Routing a topic to an inappropriate backend may require a full topic rebuild for migration. | Document backend characteristics and capacity ceilings clearly before routing a topic; restrict ad-hoc backend choices; prefer the deployment's default durable backend unless an explicit scale or compliance constraint forces an alternative. Backend instance migration tooling is on the post-MVP roadmap. |
 | Consumer-cursor durability under cache-only model | In standalone mode, broker runtime cursors die with the process; consumers may re-process from their chosen start position after restart unless they persist progress themselves. | Idempotent consumer processing is a normative SDK requirement (per the at-least-once contract). Consumers that need durable progress persist offsets in their own store; broker runtime cursor state is not the durable source of truth. |
-| Hot-topic noisy neighbor | A hot topic sharing instances with every other topic becomes a noisy neighbor for them. | Instances with `affinity` for the hot topic take its traffic by preference; every instance still handles every topic, so losing the dedicated instances falls back to the rest ([feature 0005](features/0005-backend-registry-and-routing.md) §2.3). Operators adding dedicated instances are responsible for their capacity planning. Partition-sharded ingest (sub-topic level) is on the post-MVP roadmap. |
+| Hot-topic noisy neighbor | A hot topic sharing instances with every other topic becomes a noisy neighbor for them. | Instances with `affinity` for the hot topic take its traffic by preference (not yet implemented, tracked in #5552 and #5701); every instance still handles every topic, so losing the dedicated instances falls back to the rest ([feature 0005](features/0005-backend-registry-and-routing.md) §2.3). Operators adding dedicated instances are responsible for their capacity planning. Partition-sharded ingest (sub-topic level) is on the post-MVP roadmap. |
 | Schema evolution gap | v1's "new GTS identifier per change" rule makes long-lived event logs operationally awkward without the post-MVP compatible-evolution feature. | Consumers use type-pattern wildcards (`gts.cf.core.events.event.v1~vendor.audit.*`) to subscribe to families of versions. Compatible schema evolution + inter-version casting is on the post-MVP roadmap. |
-| Abuse / resource exhaustion without quotas | Without rate limits and storage quotas, a misbehaving or malicious tenant can flood ingest, exhaust backend storage, or starve consumers. The limits **must** be set before broad production exposure. | Interim per-tenant safety-floor caps on resource-creation endpoints (`cpt-cf-evbk-nfr-tenant-rate-caps`) bound the worst vector now. Full **Quotas & Rate Limiting** — scoped per topic / per producer / per consumer (produce rate, poll rate, active-subscription caps, storage quotas) — is the immediate post-MVP feature and needs dedicated design; tracked in BACKLOG.md. |
+| Abuse / resource exhaustion without quotas | Without rate limits and storage quotas, a misbehaving or malicious tenant can flood ingest, exhaust backend storage, or starve consumers. The limits **must** be set before broad production exposure. | Interim per-tenant safety-floor caps on resource-creation endpoints (`cpt-cf-evbk-nfr-tenant-rate-caps`) bound the worst vector now (not yet implemented, tracked in #5697). Full **Quotas & Rate Limiting** - scoped per topic / per producer / per consumer (produce rate, consume rate, active-subscription caps, storage quotas) - is the immediate post-MVP feature and needs dedicated design; tracked in BACKLOG.md. |
 
 ## 13. Open Questions
 
 - **Outbox extension for partition-level scaling** (deferred): should `toolkit-db` outbox grow native partitioning so a topic with N partitions has N outbox sub-queues? Decision deferred to post-MVP, gated by the outbox library's roadmap.
-- **Long-poll protocol revisit**: the per-partition cache + condvar-driven iterator model needs a focused pass after broader feedback closes — cache eviction policy, backfill semantics, fairness across waiters.
+- **Delivery cache revisit**: resolved in DESIGN (section 4.7 Open Questions): the per-partition cache is accounted segments with registered readers.
 - **Tenant-scoped GTS namespaces** for consumer groups: not in MVP; future design may introduce per-tenant namespaces (e.g., `gts.cf.core.events.consumer_group.v1~tenant.{tenant_id}.foo.v1`).
 
 ## 14. Traceability

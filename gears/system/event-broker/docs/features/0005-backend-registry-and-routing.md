@@ -42,7 +42,9 @@
 
 A deployment names every storage backend instance it runs in a **backend registry**, and maps topics onto those names in a separate **backend routing** section. Both are event-broker configuration, checked for consistency when the process starts.
 
-Every ingest and delivery instance is configured alike and handles any request. The shared configuration also names **affinity groups** - sets of topic patterns - and an instance may select one. It publishes its group in `DirectoryService`; a dispatcher reads every instance's group and prefers the most specific match, falling back to any live instance.
+Every ingest and delivery instance is configured alike and handles any request. The shared configuration also names **affinity groups** - sets of topic patterns - and an instance may select one (not yet implemented, tracked in #5552). It publishes its group in `DirectoryService` (not yet implemented, tracked in #5552); a dispatcher reads every instance's group and prefers the most specific match, falling back to any live instance (not yet implemented, tracked in #5701).
+
+Built today: the backend registry (§2.1), backend routing (§2.2), the startup check (§2.4) except its affinity rules C6 and C7, and the `default` outbox group (§2.5); affinity groups and their label are tracked in #5552, the dispatcher's affinity routing in #5701 and named outbox groups in #5553, none of them implemented yet.
 
 Routing says where a topic's log is expected to be. Putting it there the first time is feature 0006; proving later that it is really there is ADR-0008.
 
@@ -50,14 +52,14 @@ Routing says where a topic's log is expected to be. Putting it there the first t
 
 - Let one deployment run several backends and several instances of one backend type, and put each topic on the one its operator chose.
 - Keep backend addresses and credentials in one place, apart from the decision of which topic lives where.
-- Let a loud topic get dedicated instances by config rollout alone, without any instance becoming unable to serve it.
+- Let a loud topic get dedicated instances by config rollout alone, without any instance becoming unable to serve it (not yet implemented, tracked in #5552 and #5701).
 
 ### 1.3 Actors
 
-- **Operator**: writes the registry, the routing, the affinity groups and each instance's group.
+- **Operator**: writes the registry and the routing, and the affinity groups and each instance's group (not yet implemented, tracked in #5552).
 - **Ingest instance**: validates configuration, builds the registry, resolves routing, handles any topic.
 - **Delivery instance**: validates configuration, builds the registry, resolves routing, handles any topic and owns any group.
-- **Dispatcher**: reads the affinity groups, fetches every instance's published group and routes by preference.
+- **Dispatcher**: reads the affinity groups, fetches every instance's published group and routes by preference (not yet implemented, tracked in #5552 and #5701).
 - **Storage backend plugin**: builds a backend from an entry's settings, rejecting settings it does not define.
 
 ### 1.4 References
@@ -73,6 +75,8 @@ Routing says where a topic's log is expected to be. Putting it there the first t
 - `event-broker/src/infra/dispatcher/` - route classification and forwarding
 
 ## 2. Configuration
+
+Not yet implemented: the `affinity_groups` and `affinity` keys wherever this section names them, and the dispatcher preference they drive, are tracked in #5552 and #5701; the named outbox group `audit` in its examples is tracked in #5553. A configuration naming the affinity keys fails to load today, and one naming an outbox group other than `default` is refused at startup.
 
 ```yaml
 modules:
@@ -104,9 +108,9 @@ modules:
       default: { partitions: 16 }
 ```
 
-`backends`, `backend_routing`, `affinity_groups` and `outbox_groups` describe the deployment: every ingest and delivery instance, and every dispatcher, carries the same four. `affinity` is the only setting that may differ between instances, and one file can be deployed everywhere with `affinity` set per instance (for example from the environment).
+`backends`, `backend_routing`, `affinity_groups` and `outbox_groups` describe the deployment: every ingest and delivery instance, and every dispatcher, carries the same four. `mode`, `affinity` and `registration` (the address the instance registers with `DirectoryService`: `advertise_addr`, or else `listen_addr`) are the only settings that may differ between instances, and one file can be deployed everywhere with them set per instance (for example from the environment).
 
-These sections replace the per-topic `backend` block and `default_storage_backend`; neither exists, and a configuration carrying either is refused at startup. A cluster deployment, for example, runs one file in every process and varies only `mode` and `affinity`:
+These sections replace the per-topic `backend` block and `default_storage_backend`; neither exists, and a configuration carrying either is refused at startup. A cluster deployment, for example, runs one file in every process and varies only `mode`, `affinity` and `registration`:
 
 ```yaml
 config:
@@ -124,6 +128,8 @@ config:
     audit:   { partitions: 4, topics: ["gts.cf.core.events.topic.v1~vendor.audit.v1"] }
     default: { partitions: 16 }
 ```
+
+The example leaves out `registration`: a `cluster_ingest` or `cluster_delivery` instance whose `registration.listen_addr` is a wildcard address, as the default `0.0.0.0:0` is, must also set `registration.advertise_addr`, or it fails at startup. Give `advertise_addr` a nonzero port: a host alone, or a `:0` port, takes the port of `listen_addr`, which is 0 by default, and port 0 registers an address the dispatcher cannot reach (tracked in #5988).
 
 | Deployment | `mode` | `affinity` | The dispatcher prefers it for |
 |---|---|---|---|
@@ -153,6 +159,8 @@ config:
 
 ### 2.3 Affinity
 
+Not yet implemented: affinity groups, the `affinity` key and the label are tracked in #5552, the dispatcher's preference in #5701. A configuration naming affinity keys fails to load today.
+
 ```yaml
 affinity_groups:
   audit:   ["gts.cf.core.events.topic.v1~vendor.audit.v1"]
@@ -177,8 +185,8 @@ Configuration-level checks. Any failure stops the process from starting.
 | C3 | ingest, delivery | Every `backend_routing` value names a registry entry. |
 | C4 | ingest, delivery | `backend_routing` carries the instance-less key `gts.cf.core.events.topic.v1~`. |
 | C5 | ingest, delivery | Every registry entry is named by at least one route. An unreferenced entry is an operator mistake, and would open connections for nothing. |
-| C6 | ingest, delivery, dispatcher | Every group name follows §2.3, and every group pattern is well-formed. |
-| C7 | ingest, delivery | `affinity`, when present, names a group in `affinity_groups` or `default`. |
+| C6 | ingest, delivery, dispatcher | Every group name follows §2.3, and every group pattern is well-formed (not yet implemented, tracked in #5552). |
+| C7 | ingest, delivery | `affinity`, when present, names a group in `affinity_groups` or `default` (not yet implemented, tracked in #5552). |
 | C8 | ingest | Every `outbox_groups` name follows §2.3's name rule, every pattern is well-formed, and every `partitions` is a power of 2 from 1 to 64 (the toolkit-db outbox's limit); `default` sets nothing but `partitions`. |
 | C9 | ingest | No two outbox groups match a topic pattern at equal specificity, so every topic belongs to exactly one outbox. Applies once named groups exist (§2.5); today any group but `default` is refused. |
 | C10 | cluster_ingest, cluster_delivery, cluster_dispatcher | Neither the gear's database nor any registry entry is SQLite (`gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~`): a SQLite file serves one process, so only `standalone` runs on SQLite. The dispatcher builds no backend and is subject to the database half alone. |
@@ -196,7 +204,7 @@ outbox_groups:
   default: { partitions: 16 }      # reserved, always ["*"]; implicit with 16 partitions when absent
 ```
 
-A configuration naming any other group is refused at startup. Named groups (`audit: { partitions: 4, topics: [...] }`) and C9 are not implemented: each group needs its own outbox tables, those tables are created by the migrations the gear declares, and the migrations run before configuration is read, so a group known only from configuration has no tables yet. Named groups need either migrations that see configuration or a runtime DDL step; the bullets below marked *named groups* describe them once one exists.
+A configuration naming any other group is refused at startup. Named groups (`audit: { partitions: 4, topics: [...] }`) and C9 are not implemented (tracked in #5553): each group needs its own outbox tables, those tables are created by the migrations the gear declares, and the migrations run before configuration is read, so a group known only from configuration has no tables yet. Named groups need either migrations that see configuration or a runtime DDL step; the bullets below marked *named groups* describe them once one exists.
 
 - **Same shape as affinity groups** *(named groups)*. Names follow the affinity group rule (§2.3) with `default` reserved, and patterns use DESIGN §"Pattern Syntax". The difference is that the choice is deterministic: a topic belongs to the group whose pattern matches it most specifically (exact > longer prefix > `*`), and a tie is a startup error (C9).
 - **Independent of affinity** *(named groups)*. A dedicated topic typically gets both an affinity group and an outbox group, often with the same name; nothing requires it.
@@ -215,6 +223,8 @@ CREATE TABLE event_broker__outbox_identity (
 ```
 
 ## 3. Actor Flows (CDSL)
+
+Not yet implemented: the flows below need affinity groups and the label (tracked in #5552) and the dispatcher's routing table, tiers and connect retry (tracked in #5701).
 
 The layout below is §2.3's: `affinity_groups` names `audit` (`gts.cf.core.events.topic.v1~vendor.audit.v1`); ingest-1 and ingest-2 select no affinity, ingest-3 and ingest-4 select `audit`. Delivery instances are laid out alike.
 
@@ -252,6 +262,8 @@ The layout below is §2.3's: `affinity_groups` names `audit` (`gts.cf.core.event
 ```
 
 ## 4. Processes / Business Logic (CDSL)
+
+Not yet implemented: the published label (§4.1) is tracked in #5552, and the routing table, tiers, connect retry and pre-parsing (§4.2-§4.5) in #5701; today the dispatcher forwards every request to a registered instance of its role, round-robin, preferring ready ones, with no retry.
 
 Dispatcher routing. A dispatcher holds no registry and no backend routing. It carries `affinity_groups`, learns each instance's group from `DirectoryService`, and uses it to prefer an instance, never to exclude one.
 
@@ -327,7 +339,7 @@ Dispatcher routing is a preference; it rejects nothing.
 
 - A body that does not parse, a `type` it cannot resolve, a topic no group covers: the request goes to any live instance, which validates it and answers with the real error.
 - A connection to the chosen instance that fails before any byte of the request is sent is retried once on the next member of the same tier, or of the next tier when the tier has no other member. Nothing is retried once the request has started.
-- The dispatcher's own answers are the existing transport ones only: `503` when no instance of the role is live or reachable, `413` for an oversized body.
+- The dispatcher's own answers are the existing transport ones only: `503` when it cannot resolve an instance of the role or complete the forward to it, `413` for an oversized body.
 - The table trails reality by at most one refresh. A request routed on a stale table lands on an instance that handles it anyway, or, if that instance is gone, on the retry target; staleness costs isolation for a few seconds, never a failed request.
 
 ### 4.5 Pre-Parsing
@@ -343,7 +355,7 @@ The one piece of a publish the dispatcher reads is the event `type`, and it need
 
 - Backend capability negotiation.
 - Topic provisioning - feature 0006; log identity checks - ADR-0008.
-- Delivery group ownership, placement caps and failover - DESIGN §"Delivery Routing (Cache-Based, Not Hash-Based)"; this feature only chooses the tier placement happens in.
+- Delivery group ownership, placement caps and failover - DESIGN §"Delivery Routing (Cache-Based, Not Hash-Based)"; this feature only chooses the tier placement happens in (not yet implemented, tracked in #5701).
 - Refusing a request because of affinity; nothing does.
 
 ## 6. Definitions of Done
@@ -352,7 +364,7 @@ The one piece of a publish the dispatcher reads is the event `type`, and it need
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-dod-backend-registry-and-routing-configuration`
 
-- `backends`, `backend_routing`, `affinity_groups`, `affinity` and `outbox_groups` parse as §2 describes.
+- `backends`, `backend_routing` and `outbox_groups` parse as §2 describes, and so do `affinity_groups` and `affinity` (not yet implemented, tracked in #5552).
 - Every rule C1-C10 is enforced at startup, in the roles §2.4 assigns.
 - Each outbox group is one toolkit-db queue with an identity row minted on first registration (§2.5); today that is the `default` group alone.
 - Each registry entry is built once per process and shared by every topic routed to it.
@@ -362,6 +374,8 @@ The one piece of a publish the dispatcher reads is the event `type`, and it need
 
 - [ ] `p1` - **ID**: `cpt-cf-evbk-dod-backend-registry-and-routing-dispatcher`
 
+Not yet implemented: the label is tracked in #5552, and the routing table, connect retry and type-to-topic lookup in #5701.
+
 - Ingest and delivery publish the `evbk-affinity` label at every registration, `default` included.
 - The dispatcher rebuilds its routing table from every instance on each refresh and routes every request from it (§4.3), retrying once on a connect failure (§4.4).
 - The dispatcher reads only the event `type` from a publish body and resolves it through a bounded type-to-topic cache (§4.5).
@@ -370,37 +384,37 @@ The one piece of a publish the dispatcher reads is the event `type`, and it need
 ## 7. Acceptance Criteria
 
 - **AC-1**: A registry entry whose `type` no linked provider serves stops the process at start.
-- **AC-2**: A route naming an absent registry entry, a missing instance-less route, an unreferenced registry entry, or an `affinity` naming an undefined group stops ingest and delivery at start.
+- **AC-2**: A route naming an absent registry entry, a missing instance-less route, an unreferenced registry entry, or an `affinity` naming an undefined group (not yet implemented, tracked in #5552) stops ingest and delivery at start.
 - **AC-3**: An instance accepts publishes for, and a delivery instance admits groups on, topics outside its group exactly as it does inside it.
 - **AC-4**: Two topics routed to one registry entry share one built backend.
 - **AC-5**: No startup error or log line reproduces a backend settings value.
-- **AC-6**: With two default instances and two in group `audit`, the dispatcher sends `audit` publishes to the dedicated pair and every other topic's to the default pair.
-- **AC-7**: With both dedicated instances down, `audit` publishes succeed on a default instance.
-- **AC-8**: A group joining with interests in `audit` and `orders` is placed on a default instance.
-- **AC-9**: A publish whose body the dispatcher cannot parse, or whose type it cannot resolve, reaches an instance and gets that instance's answer.
-- **AC-10**: After an instance's group changes, the dispatcher routes by the new group within one refresh.
+- **AC-6**: With two default instances and two in group `audit`, the dispatcher sends `audit` publishes to the dedicated pair and every other topic's to the default pair (not yet implemented, tracked in #5552 and #5701).
+- **AC-7**: With both dedicated instances down, `audit` publishes succeed on a default instance (not yet implemented, tracked in #5552 and #5701).
+- **AC-8**: A group joining with interests in `audit` and `orders` is placed on a default instance (not yet implemented, tracked in #5552 and #5701).
+- **AC-9**: A publish whose body the dispatcher cannot parse, or whose type it cannot resolve, reaches an instance and gets that instance's answer (not yet implemented, tracked in #5701).
+- **AC-10**: After an instance's group changes, the dispatcher routes by the new group within one refresh (not yet implemented, tracked in #5552 and #5701).
 - **AC-11**: A backend unreachable at start does not stop the process; its topics fail with `Unavailable` and readiness reports it.
 
 ## 8. Unit Test Plan
 
 - **config checks**: each of C1-C10 fails on its own violation and passes otherwise; the unmatched-routing-key warning.
-- **outbox groups**: exact beats prefix beats `default`; an absent `default` is 16 partitions; an identity row is minted once per group and reused on restart.
-- **specificity**: exact beats every prefix, a longer prefix beats a shorter one, any prefix beats `*`.
-- **tiers**: a multi-topic request is ranked by its least specifically covered topic; an instance not covering every topic drops to the last-resort tier; the chain always ends in every live instance.
-- **routing table**: a missing label is `default`; an unknown group is `["*"]` with a warning; non-live instances are not candidates.
-- **retry**: a connect failure before any byte is retried once on the next candidate; a failure after the request started is not.
-- **pre-parsing**: `type` read from a single event and from a batch's first event; unparseable body and unknown type route as "no topic"; a miss does not wait for the lookup; the cache never exceeds its bound.
+- **outbox groups**: exact beats prefix beats `default` (not yet implemented, tracked in #5553); an absent `default` is 16 partitions; an identity row is minted once per group and reused on restart.
+- **specificity**: exact beats every prefix, a longer prefix beats a shorter one, any prefix beats `*` (not yet implemented, tracked in #5701).
+- **tiers**: a multi-topic request is ranked by its least specifically covered topic; an instance not covering every topic drops to the last-resort tier; the chain always ends in every live instance (not yet implemented, tracked in #5701).
+- **routing table**: a missing label is `default`; an unknown group is `["*"]` with a warning; non-live instances are not candidates (not yet implemented, tracked in #5552 and #5701).
+- **retry**: a connect failure before any byte is retried once on the next candidate; a failure after the request started is not (not yet implemented, tracked in #5701).
+- **pre-parsing**: `type` read from a single event and from a batch's first event; unparseable body and unknown type route as "no topic"; a miss does not wait for the lookup; the cache never exceeds its bound (not yet implemented, tracked in #5701).
 - **routing resolution**: a fully qualified key wins over the instance-less key; a topic no specific key names takes the instance-less route.
 
 ## 9. E2E Test Plan
 
 Suite: `testing/e2e/suites/event_broker/`.
 
-- **S1 - bad config refuses to start**: an unknown backend type, a route to an absent entry, an unreferenced entry, a missing instance-less route, an undefined affinity group; assert each stops the process with its rule named.
+- **S1 - bad config refuses to start**: an unknown backend type, a route to an absent entry, an unreferenced entry, a missing instance-less route, an undefined affinity group (not yet implemented, tracked in #5552); assert each stops the process with its rule named.
 - **S2 - two backends**: route two topics to two registry entries; publish to both; assert each topic's events are read back from its own backend.
-- **S3 - dedicated routing**: two default and two `audit` instances behind one dispatcher; publish to `audit` and to `orders`; assert each lands on its pair (AC-6).
-- **S4 - fallback**: stop both `audit` instances; assert `audit` publishes succeed through the dispatcher (AC-7).
-- **S5 - wide group**: join a group with `audit` and `orders` interests; assert it is owned by a default instance and streams both (AC-8).
+- **S3 - dedicated routing**: two default and two `audit` instances behind one dispatcher; publish to `audit` and to `orders`; assert each lands on its pair (AC-6) (not yet implemented, tracked in #5552 and #5701).
+- **S4 - fallback**: stop both `audit` instances; assert `audit` publishes succeed through the dispatcher (AC-7) (not yet implemented, tracked in #5552 and #5701).
+- **S5 - wide group**: join a group with `audit` and `orders` interests; assert it is owned by a default instance and streams both (AC-8) (not yet implemented, tracked in #5552 and #5701).
 - **S6 - direct request**: publish to `audit` directly on a default instance, bypassing the dispatcher; assert it succeeds (AC-3).
-- **S7 - rollout convergence**: change an instance's group, restarting it; assert the dispatcher follows within one refresh with no failed request meanwhile (AC-10).
+- **S7 - rollout convergence**: change an instance's group, restarting it; assert the dispatcher follows within one refresh with no failed request meanwhile (AC-10) (not yet implemented, tracked in #5552 and #5701).
 - **S8 - unreachable backend at start**: point a registry entry at an unreachable host; assert the process starts, its topics answer `Unavailable`, the other entry's topics work (AC-11).

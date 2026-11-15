@@ -5,7 +5,7 @@ use toolkit_canonical_errors::resource_error;
 use toolkit_canonical_errors::{CanonicalError, Http};
 
 use crate::backend::BackendError;
-use crate::ids::{ConsumerGroupId, ProducerId, SubscriptionId};
+use crate::ids::{ProducerId, SubscriptionId};
 use crate::sequence::Sequence;
 
 #[resource_error(gts_id!("cf.core.events.producer_options.v1~"))]
@@ -68,6 +68,8 @@ pub mod reasons {
     pub const ASCII_ONLY: &str = "ascii_only";
     /// A text value fell outside its field's byte bounds.
     pub const FIELD_TOO_LONG: &str = "field_too_long";
+    /// A `client_agent` broke the RFC 9110 User-Agent grammar.
+    pub const USER_AGENT_GRAMMAR: &str = "user_agent_grammar";
     pub const EVENT_DATA_INVALID: &str = "event_data_invalid";
     /// An event's data is not well-formed JSON. SDK-local, like the three
     /// decode reasons below: the broker never answers them.
@@ -333,21 +335,23 @@ pub enum EventBrokerError {
     #[error("invalid consumer options: {detail}")]
     InvalidConsumerOptions { detail: String },
 
-    #[error("event type not declared on producer: {type_id}")]
-    EventTypeNotDeclared { type_id: String, detail: String },
+    #[error("event type not declared on producer: {event_type}")]
+    EventTypeNotDeclared { event_type: String, detail: String },
 
-    #[error("event type unknown to types-registry: {type_id}")]
-    EventTypeUnknown { type_id: String, detail: String },
+    #[error("event type unknown to types-registry: {event_type}")]
+    EventTypeUnknown { event_type: String, detail: String },
 
-    #[error("resolved type's parent topic differs from declared topics: {type_id}")]
+    #[error("resolved type's parent topic differs from declared topics: {event_type}")]
     TypeNotInDeclaredTopic {
-        type_id: String,
+        event_type: String,
         expected_topic: String,
         detail: String,
     },
 
-    #[error("schema not prepared for {type_id}; call `prepare_event_type` before opening the txn")]
-    SchemaNotPrepared { type_id: String, detail: String },
+    #[error(
+        "schema not prepared for {event_type}; call `prepare_event_type` before opening the txn"
+    )]
+    SchemaNotPrepared { event_type: String, detail: String },
 
     #[error("event field invalid: {field}: {detail}")]
     InvalidEventField { field: &'static str, detail: String },
@@ -364,15 +368,15 @@ pub enum EventBrokerError {
 
     /// An event's `data` did not decode as the payload type asked for. Names the type and
     /// the failure class, and carries no part of the data.
-    #[error("event data of {type_id} does not decode as the payload type ({category})")]
+    #[error("event data of {event_type} does not decode as the payload type ({category})")]
     Decode {
-        type_id: String,
+        event_type: String,
         category: DecodeCategory,
     },
 
-    #[error("event data invalid for {type_id}: {errors:?}")]
+    #[error("event data invalid for {event_type}: {errors:?}")]
     EventDataInvalid {
-        type_id: String,
+        event_type: String,
         errors: Vec<String>,
         detail: String,
     },
@@ -382,7 +386,8 @@ pub enum EventBrokerError {
 
     #[error("consumer group not found")]
     ConsumerGroupNotFound {
-        group_id: ConsumerGroupId,
+        /// The group's GTS id as the broker sent it.
+        consumer_group: String,
         detail: String,
     },
 
@@ -395,9 +400,9 @@ pub enum EventBrokerError {
     #[error("not authorized: {detail}")]
     Unauthorized { detail: String },
 
-    #[error("unknown producer: {producer_id:?}")]
+    #[error("unknown producer: {producer:?}")]
     UnknownProducer {
-        producer_id: crate::ids::ProducerId,
+        producer: crate::ids::ProducerId,
         detail: String,
     },
 
@@ -636,37 +641,37 @@ impl From<EventBrokerError> for CanonicalError {
                     .create()
             }
             EventBrokerError::EventTypeNotDeclared {
-                type_id, detail, ..
+                event_type, detail, ..
             } => EventResourceError::invalid_argument()
-                .with_resource(type_id)
+                .with_resource(event_type)
                 .with_field_violation("event_type", detail, reasons::EVENT_TYPE_NOT_DECLARED)
                 .create(),
             // The only arm carrying no reason: a 404 whose `resource` names the
             // unresolvable type already says everything a caller can act on, and
             // no other arm reports not-found on this resource.
             EventBrokerError::EventTypeUnknown {
-                type_id, detail, ..
+                event_type, detail, ..
             } => EventTypeResourceError::not_found(detail)
-                .with_resource(type_id)
+                .with_resource(event_type)
                 .create(),
             EventBrokerError::TypeNotInDeclaredTopic {
-                type_id,
+                event_type,
                 expected_topic,
                 detail,
                 ..
             } => EventResourceError::failed_precondition()
-                .with_resource(type_id.clone())
+                .with_resource(event_type.clone())
                 .with_precondition_violation(
-                    type_id,
+                    event_type,
                     format!("{detail}; expected topic {expected_topic}"),
                     reasons::TYPE_NOT_IN_DECLARED_TOPIC,
                 )
                 .create(),
             EventBrokerError::SchemaNotPrepared {
-                type_id, detail, ..
+                event_type, detail, ..
             } => EventResourceError::failed_precondition()
-                .with_resource(type_id.clone())
-                .with_precondition_violation(type_id, detail, reasons::SCHEMA_NOT_PREPARED)
+                .with_resource(event_type.clone())
+                .with_precondition_violation(event_type, detail, reasons::SCHEMA_NOT_PREPARED)
                 .create(),
             EventBrokerError::InvalidEventField { field, detail, .. } => {
                 EventResourceError::invalid_argument()
@@ -683,17 +688,20 @@ impl From<EventBrokerError> for CanonicalError {
                 .create(),
             // SDK-local: a decode happens in the caller's process, so this never travels
             // and the reverse mapping does not recover it.
-            EventBrokerError::Decode { type_id, category } => {
+            EventBrokerError::Decode {
+                event_type,
+                category,
+            } => {
                 let description = format!(
-                    "event data of {type_id} does not decode as the payload type ({category})"
+                    "event data of {event_type} does not decode as the payload type ({category})"
                 );
                 EventResourceError::invalid_argument()
-                    .with_resource(type_id)
+                    .with_resource(event_type)
                     .with_field_violation("data", description, category.reason())
                     .create()
             }
             EventBrokerError::EventDataInvalid {
-                type_id,
+                event_type,
                 errors,
                 detail,
                 ..
@@ -704,7 +712,7 @@ impl From<EventBrokerError> for CanonicalError {
                     format!("{detail}: {}", errors.join("; "))
                 };
                 EventResourceError::invalid_argument()
-                    .with_resource(type_id)
+                    .with_resource(event_type)
                     .with_field_violation("data", description, reasons::EVENT_DATA_INVALID)
                     .create()
             }
@@ -714,9 +722,11 @@ impl From<EventBrokerError> for CanonicalError {
                     .create()
             }
             EventBrokerError::ConsumerGroupNotFound {
-                group_id, detail, ..
+                consumer_group,
+                detail,
+                ..
             } => ConsumerGroupResourceError::not_found(detail)
-                .with_resource(group_id.to_string())
+                .with_resource(consumer_group)
                 .create(),
             EventBrokerError::ConsumerGroupHasActiveMembers { detail, .. } => {
                 ConsumerGroupResourceError::failed_precondition()
@@ -739,11 +749,9 @@ impl From<EventBrokerError> for CanonicalError {
                     .create()
             }
             EventBrokerError::UnknownProducer {
-                producer_id,
-                detail,
-                ..
+                producer, detail, ..
             } => ProducerResourceError::not_found(detail)
-                .with_resource(producer_id.0.to_string())
+                .with_resource(producer.0.to_string())
                 .create(),
             EventBrokerError::SequenceViolation {
                 expected_previous,
@@ -1049,7 +1057,7 @@ impl From<CanonicalError> for EventBrokerError {
                         detail,
                     },
                     Some(resources::CONSUMER_GROUP) => Self::ConsumerGroupNotFound {
-                        group_id: ConsumerGroupId::from_gts(&name),
+                        consumer_group: name,
                         detail,
                     },
                     Some(resources::SUBSCRIPTION) => match uuid::Uuid::parse_str(&name) {
@@ -1061,13 +1069,13 @@ impl From<CanonicalError> for EventBrokerError {
                     },
                     Some(resources::PRODUCER) => match uuid::Uuid::parse_str(&name) {
                         Ok(id) => Self::UnknownProducer {
-                            producer_id: ProducerId(id),
+                            producer: ProducerId(id),
                             detail,
                         },
                         Err(_) => Self::Other { canonical },
                     },
                     Some(resources::EVENT_TYPE) => Self::EventTypeUnknown {
-                        type_id: name,
+                        event_type: name,
                         detail,
                     },
                     Some(resources::PARTITION) => {
@@ -1160,13 +1168,13 @@ impl From<CanonicalError> for EventBrokerError {
                     // topic is not carried, so it takes a neutral value.
                     (_, Some(reasons::TYPE_NOT_IN_DECLARED_TOPIC)) => {
                         Self::TypeNotInDeclaredTopic {
-                            type_id: name,
+                            event_type: name,
                             expected_topic: String::new(),
                             detail,
                         }
                     }
                     (_, Some(reasons::SCHEMA_NOT_PREPARED)) => Self::SchemaNotPrepared {
-                        type_id: name,
+                        event_type: name,
                         detail,
                     },
                     _ => Self::Other { canonical },
@@ -1214,11 +1222,15 @@ impl From<CanonicalError> for EventBrokerError {
                     Some(reasons::INVALID_EVENT_FIELD) => {
                         Self::InvalidEventField { field: "", detail }
                     }
-                    Some(reason @ (reasons::ASCII_ONLY | reasons::FIELD_TOO_LONG)) => {
-                        let reason = if reason == reasons::ASCII_ONLY {
-                            reasons::ASCII_ONLY
-                        } else {
-                            reasons::FIELD_TOO_LONG
+                    Some(
+                        reason @ (reasons::ASCII_ONLY
+                        | reasons::FIELD_TOO_LONG
+                        | reasons::USER_AGENT_GRAMMAR),
+                    ) => {
+                        let reason = match reason {
+                            reasons::ASCII_ONLY => reasons::ASCII_ONLY,
+                            reasons::FIELD_TOO_LONG => reasons::FIELD_TOO_LONG,
+                            _ => reasons::USER_AGENT_GRAMMAR,
                         };
                         Self::InvalidTextField {
                             field: "",
@@ -1229,7 +1241,7 @@ impl From<CanonicalError> for EventBrokerError {
                     // The event type rides in `resource_name`; the per-error
                     // list is not carried on the wire.
                     Some(reasons::EVENT_DATA_INVALID) => Self::EventDataInvalid {
-                        type_id: name,
+                        event_type: name,
                         errors: Vec::new(),
                         detail,
                     },
@@ -1497,16 +1509,23 @@ mod canonical_roundtrip_tests {
                 .to_owned(),
                 detail: "no such topic".to_owned(),
             },
+            EventBrokerError::ConsumerGroupNotFound {
+                consumer_group: toolkit_gts::gts_id!(
+                    "cf.core.events.consumer_group.v1~acme.billing.orders.projector.v1"
+                )
+                .to_owned(),
+                detail: "gone".to_owned(),
+            },
             EventBrokerError::SubscriptionNotFound {
                 id: SubscriptionId(uuid::Uuid::from_u128(7)),
                 detail: "gone".to_owned(),
             },
             EventBrokerError::UnknownProducer {
-                producer_id: ProducerId(uuid::Uuid::from_u128(9)),
+                producer: ProducerId(uuid::Uuid::from_u128(9)),
                 detail: "gone".to_owned(),
             },
             EventBrokerError::EventTypeUnknown {
-                type_id: toolkit_gts::gts_id!(
+                event_type: toolkit_gts::gts_id!(
                     "cf.core.events.event.v1~acme.orders.order.created.v1~"
                 )
                 .to_owned(),
@@ -1547,7 +1566,7 @@ mod canonical_roundtrip_tests {
                 reason: reasons::ASCII_ONLY,
             },
             EventBrokerError::EventDataInvalid {
-                type_id: toolkit_gts::gts_id!(
+                event_type: toolkit_gts::gts_id!(
                     "cf.core.events.event.v1~acme.orders.order.created.v1~"
                 )
                 .to_owned(),
@@ -1562,7 +1581,7 @@ mod canonical_roundtrip_tests {
                 detail: "too big".to_owned(),
             },
             EventBrokerError::TypeNotInDeclaredTopic {
-                type_id: toolkit_gts::gts_id!(
+                event_type: toolkit_gts::gts_id!(
                     "cf.core.events.event.v1~acme.orders.order.created.v1~"
                 )
                 .to_owned(),
@@ -1573,7 +1592,7 @@ mod canonical_roundtrip_tests {
                 detail: "wrong topic".to_owned(),
             },
             EventBrokerError::SchemaNotPrepared {
-                type_id: toolkit_gts::gts_id!(
+                event_type: toolkit_gts::gts_id!(
                     "cf.core.events.event.v1~acme.orders.order.created.v1~"
                 )
                 .to_owned(),
@@ -1620,6 +1639,74 @@ mod canonical_roundtrip_tests {
         }
     }
 
+    /// A missing consumer group reads back with the `resource_name` the broker sent,
+    /// unchanged: a named group's id, an anonymous group's id, or empty when the
+    /// broker sent none. The canonical builder always names a resource, so the
+    /// nameless case is decoded from a wire problem body the way the REST client
+    /// decodes one.
+    #[test]
+    fn a_missing_consumer_group_reads_back_with_the_id_the_broker_sent() {
+        let named = toolkit_gts::gts_id!(
+            "cf.core.events.consumer_group.v1~acme.billing.orders.projector.v1"
+        );
+        let anonymous = format!(
+            "{}00000000-0000-0000-0000-000000000abc",
+            crate::gts::CONSUMER_GROUP_RESOURCE_TYPE
+        );
+        let cases = [
+            (
+                ConsumerGroupResourceError::not_found(format!(
+                    "consumer group '{named}' is not registered"
+                ))
+                .with_resource(named.to_owned())
+                .create(),
+                named.to_owned(),
+                format!("consumer group '{named}' is not registered"),
+            ),
+            (
+                ConsumerGroupResourceError::not_found(format!(
+                    "consumer group '{anonymous}' is not registered"
+                ))
+                .with_resource(anonymous.clone())
+                .create(),
+                anonymous.clone(),
+                format!("consumer group '{anonymous}' is not registered"),
+            ),
+            (
+                CanonicalError::try_from(
+                    serde_json::from_value::<toolkit_canonical_errors::Problem>(
+                        serde_json::json!({
+                            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
+                            "title": "Not Found",
+                            "status": 404,
+                            "detail": "consumer group is not registered",
+                            "context": {
+                                "resource_type": "gts.cf.core.events.consumer_group.v1~",
+                            },
+                        }),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+                String::new(),
+                "consumer group is not registered".to_owned(),
+            ),
+        ];
+
+        for (canonical, expected_group, expected_detail) in cases {
+            let read_back = EventBrokerError::from(canonical);
+            let EventBrokerError::ConsumerGroupNotFound {
+                consumer_group,
+                detail,
+            } = read_back
+            else {
+                panic!("expected ConsumerGroupNotFound, got {read_back:?}");
+            };
+            assert_eq!(consumer_group, expected_group);
+            assert_eq!(detail, expected_detail);
+        }
+    }
+
     #[test]
     fn sequence_violation_recovers_expected_previous() {
         let original = EventBrokerError::SequenceViolation {
@@ -1632,6 +1719,33 @@ mod canonical_roundtrip_tests {
             } => assert_eq!(expected_previous, 41),
             other => panic!("expected SequenceViolation, got {other:?}"),
         }
+    }
+
+    /// A `client_agent` grammar refusal reads back, over REST and in process alike,
+    /// as the text-field error it was, with its own reason. The field name is not
+    /// recoverable (`field` is `&'static str`), and the wire `detail` is the
+    /// canonical validation phrase.
+    #[test]
+    fn a_grammar_refusal_reads_back_as_a_text_field_error_with_its_reason() {
+        let original = EventBrokerError::InvalidTextField {
+            field: "client_agent",
+            detail: "must follow the RFC 9110 User-Agent grammar: \
+                     product *( SP ( product / comment ) )"
+                .to_owned(),
+            reason: reasons::USER_AGENT_GRAMMAR,
+        };
+        let read_back = EventBrokerError::from(CanonicalError::from(original));
+        let EventBrokerError::InvalidTextField {
+            field,
+            detail,
+            reason,
+        } = read_back
+        else {
+            panic!("expected InvalidTextField, got {read_back:?}");
+        };
+        assert_eq!(field, "");
+        assert_eq!(detail, "Request validation failed");
+        assert_eq!(reason, "user_agent_grammar");
     }
 
     /// The SDK's size refusals take the broker's canonical shape (category, resource,
@@ -1767,7 +1881,7 @@ mod canonical_roundtrip_tests {
     fn expected_previous_from_detail_reads_the_trailing_last_sequence() {
         assert_eq!(
             expected_previous_from_detail(
-                "index=1 producer_id=0190f1a2-0000-7000-8000-000000000a02 \
+                "index=1 producer=0190f1a2-0000-7000-8000-000000000a02 \
                  topic=gts.cf.core.events.topic.v1~x.eb.chain.orders.v1 last_sequence=17"
             ),
             17
@@ -1782,7 +1896,7 @@ mod kind_tests {
     #[test]
     fn kind_names_the_variant_and_none_of_its_values() {
         let data_invalid = EventBrokerError::EventDataInvalid {
-            type_id: "PLANTED-VALUE-7f3a".to_owned(),
+            event_type: "PLANTED-VALUE-7f3a".to_owned(),
             errors: vec!["PLANTED-VALUE-7f3a".to_owned()],
             detail: "PLANTED-VALUE-7f3a".to_owned(),
         };
@@ -1836,7 +1950,7 @@ mod kind_tests {
     fn a_decode_error_is_kind_decode_and_an_invalid_argument() {
         let type_id = toolkit_gts::gts_id!("cf.core.events.event.v1~acme.orders.order.created.v1~");
         let err = EventBrokerError::Decode {
-            type_id: type_id.to_owned(),
+            event_type: type_id.to_owned(),
             category: DecodeCategory::Data,
         };
         assert_eq!(err.kind(), "Decode");
@@ -1903,7 +2017,7 @@ mod kind_tests {
         ]
         .map(|category| {
             let canonical = CanonicalError::from(EventBrokerError::Decode {
-                type_id: type_id.to_owned(),
+                event_type: type_id.to_owned(),
                 category,
             });
             let CanonicalError::InvalidArgument { ctx, .. } = &canonical else {

@@ -40,7 +40,7 @@ base's trait schema, so Rust checks trait field names and types.
 `.with_allowed_subject_types(...)`, in either order. Only then is `.build()`
 available; omitting either required method is a compile error. An explicitly
 empty subject-type list rejects every subject type at publish time. The partition
-pointer defaults to `"/tenant_id"`; use `.with_partition_key("/data/order_id")` at
+pointer defaults to `"/subject_tenant"`; use `.with_partition_key("/data/order_id")` at
 any point before `.build()` to override it. Setters accept borrowed strings or
 owned `String` values; subject types can be any iterator of strings. Values are
 written explicitly into the derived schema. Omitting a trait from `x-gts-traits`
@@ -108,9 +108,10 @@ pub struct OrderCreatedV1 {
 pub type OrderCreated = EventV1<OrderCreatedV1>;
 
 let event = OrderCreated::builder(OrderCreatedV1 { order_id, total_cents: 4299 })
-    .tenant_id(tenant_id)
+    .subject_tenant(tenant_id)
     .subject(order_id.to_string())
-    .subject_type_id(GtsTypeId::new(gts_id!("acme.shop.orders.order.v1~")))
+    .subject_type_of(GtsTypeId::new(gts_id!("acme.shop.orders.order.v1~")))
+    .subject_owner(customer_id) // optional
     .build()?;
 ```
 
@@ -119,8 +120,10 @@ that is missing or invalid. The event's `type` comes from the payload type. `id`
 new UUID v7 and `occurred_at` to the current time, both fixed when `build()` runs; set them
 with `.id(..)` and `.occurred_at(..)`. `.source(..)` and `.trace_parent(..)` are optional; a
 producer stamps its own `source` and refuses an event that already has one.
+`.subject_owner(..)` is optional too: it addresses the event to one principal of its tenant,
+and without it the event is tenant-wide.
 `.subject_type::<S>()` takes the type id of `S`, any GTS type declared in Rust;
-`.subject_type_id(..)` takes the id itself. `EventV1::builder_for(type_id, data)` and `EventV1::builder_without_data(type_id)`
+`.subject_type_of(..)` takes the id itself. `EventV1::builder_for(type_id, data)` and `EventV1::builder_without_data(type_id)`
 build untyped events. A payload declared with `#[gts_type_schema]` carries every field: an
 unset `Option` field travels as `null` (see `EventPayload` for the schema attribute that says
 so).
@@ -270,13 +273,28 @@ handler writes it through `event_broker_sdk::dlq` helpers or application code, t
 `Success` only after the parking operation is durable. If parking fails, return retry or an
 error so the source offset does not advance.
 
+A consumer joins and reads as the `SecurityContext` passed to `.security_context(..)`
+(over REST, with the context's bearer token when it carries one).
+`start()` refuses a context whose subject or tenant id is nil unless it carries a bearer
+token, with `InvalidConsumerOptions`, so the default `SecurityContext::anonymous()` is
+refused. `ConsumerBuilder::require_identity()` runs the same check without starting.
+
+An interest reads `OwnershipFilter::OnlyMine` by default: the events of the caller's tenant
+whose `subject_owner` is the caller. An event with no `subject_owner` is never delivered to
+it; reading unowned events needs `OwnershipFilter::EntireTenant`, which the examples below
+set. `.subject_tenant(..)` names another tenant to read, which `OnlyMine` refuses.
+`start()` also refuses, with `InvalidConsumerOptions`, settings that resolve to invalid
+values, `parallelism(0)`, a group named by `ConsumerGroupRef::gts(..)` and invalid routes;
+it returns the broker's error when the broker cannot list the event types or create the
+consumer's anonymous group, and `Internal` for a builder made with `new_unbound()`.
+
 ### Single-event consumer
 
 ```rust
 use event_broker_sdk::{
     ConsumerBuilder, ConsumerError, ConsumerGroupRef, ConsumerProfile, Delivery, EventHandler,
     EventV1, Fallback, GtsIdPattern, GtsInstanceId, HandlerOutcome, InMemoryOffsetManager,
-    SubscriptionInterest,
+    OwnershipFilter, SubscriptionInterest,
 };
 
 struct BillingProjector;
@@ -296,10 +314,12 @@ let orders_topic = GtsInstanceId::try_new("gts.cf.core.events.topic.v1~acme.shop
 let orders_interest = SubscriptionInterest::builder()
     .topic(orders_topic.clone())
     .types([GtsIdPattern::try_new("gts.cf.core.events.event.v1~acme.shop.orders.*")?])
+    .ownership_filter(OwnershipFilter::EntireTenant)
     .build()?;
 
 let handle = ConsumerBuilder::new(broker.clone())
     .group(ConsumerGroupRef::auto_anonymous("billing-projector"))
+    .security_context(ctx.clone())
     .subscription_interests([orders_interest.clone()])
     .profile(ConsumerProfile::low_latency())
     .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
@@ -342,6 +362,7 @@ impl BatchHandler<serde_json::Value> for BatchProjector {
 
 let handle = ConsumerBuilder::new(broker.clone())
     .group(ConsumerGroupRef::auto_anonymous("billing-batch"))
+    .security_context(ctx.clone())
     .subscription_interests([orders_interest.clone()])
     .batching(ConsumerBatching { max_events: 128, max_wait: Duration::from_millis(250) })
     .retry(ConsumerRetry {
@@ -385,6 +406,7 @@ use event_broker_sdk::{GtsIdPattern, GtsInstanceId};
 
 let handle = ConsumerBuilder::new(broker.clone())
     .group(ConsumerGroupRef::auto_anonymous("commerce-router"))
+    .security_context(ctx.clone())
     .subscription_interests([orders_interest.clone()])
     .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
     .default_handler(DefaultProjector)
@@ -437,7 +459,7 @@ struct SkipLogger;
 #[async_trait]
 impl ConsumerRuntimeListener for SkipLogger {
     async fn on_consumer_event(&self, event: &ConsumerRuntimeEvent) -> Result<(), ConsumerError> {
-        if let ConsumerRuntimeEvent::EventSkipped { sequence, type_id, category, .. } = event {
+        if let ConsumerRuntimeEvent::EventSkipped { sequence, event_type, category, .. } = event {
             // count or log the skipped event; it carries no part of the data
         }
         Ok(())
@@ -446,6 +468,7 @@ impl ConsumerRuntimeListener for SkipLogger {
 
 let handle = ConsumerBuilder::new(broker.clone())
     .group(ConsumerGroupRef::auto_anonymous("orders-typed"))
+    .security_context(ctx.clone())
     .subscription_interests([orders_interest.clone()])
     .register_listener(SkipLogger)
     .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
@@ -528,6 +551,7 @@ let dlq = ConsumerDlqOutbox::builder(Arc::clone(outbox_handle.outbox()))
 
 let handle = ConsumerBuilder::new(broker.clone())
     .group(...)
+    .security_context(ctx.clone())
     .subscription_interests([...])
     .offset_manager(LocalDbOffsetManager::new(db.clone(), Fallback::Earliest))
     .handler(MyHandler { db, dlq })
@@ -558,6 +582,7 @@ use event_broker_sdk::TxUndecodable;
 // `TypedOrderHandler` implements `TxEventHandler<OrderCreatedV1, LocalDbOffsetManager>`.
 let handle = ConsumerBuilder::new(broker.clone())
     .group(ConsumerGroupRef::auto_anonymous("orders-typed-tx"))
+    .security_context(ctx.clone())
     .subscription_interests([orders_interest.clone()])
     .offset_manager(LocalDbOffsetManager::new(db.clone(), Fallback::Earliest))
     .route()

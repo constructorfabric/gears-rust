@@ -13,6 +13,7 @@ pub mod gts_pattern_serde;
 pub mod id_parse;
 pub mod idempotency;
 pub mod ingest;
+pub mod join_scope;
 pub mod local_broker;
 pub mod model;
 pub mod outbox;
@@ -25,6 +26,10 @@ pub mod specification;
 pub mod streaming;
 pub mod sync_wait;
 
+#[cfg(test)]
+mod consume_authz_pin_tests;
+#[cfg(test)]
+mod join_authz_tests;
 #[cfg(test)]
 mod local_broker_tests;
 #[cfg(test)]

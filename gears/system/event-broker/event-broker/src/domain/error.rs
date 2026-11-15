@@ -224,8 +224,11 @@ pub enum ErrorCode {
 
     // -- Forbidden (403) --
     ProducerNotOwned,
+    SubscriptionNotOwned,
+    ConsumerGroupNotOwned,
     TopicNotAuthorized,
     EventTypeNotAuthorized,
+    SubjectTypeNotAuthorized,
     ConsumerGroupNotAuthorized,
     TenantIdNotAuthorized,
     NotAuthorizedToProduce,
@@ -244,6 +247,7 @@ pub enum ErrorCode {
 
     // -- Validation (400) --
     BadTypePattern,
+    ChainModeFieldsMissing,
     InvalidBody,
     InvalidHeader,
     InvalidPartition,
@@ -252,13 +256,21 @@ pub enum ErrorCode {
     InvalidSeekValue,
     InvalidSessionTimeout,
     InvalidSpec,
+    InvalidSubjectOwner,
     InvalidSubjectType,
     InvalidSubjectTypePattern,
+    InvalidTenant,
     InvalidTimestamp,
+    MetaWithoutProducerId,
     MixedTopics,
+    MonotonicModeFieldsViolation,
     OffsetOutOfRange,
     PartitionKeyUnresolved,
     SubjectTypeNotAllowed,
+    TooManyInterests,
+    TooManySubjectTypes,
+    TooManyTypes,
+    UnknownMetaVersion,
 }
 
 impl ErrorCode {
@@ -274,8 +286,11 @@ impl ErrorCode {
             Self::PartitionNotFound => "PartitionNotFound",
             Self::RateLimited => "RateLimited",
             Self::ProducerNotOwned => "ProducerNotOwned",
+            Self::SubscriptionNotOwned => "SubscriptionNotOwned",
+            Self::ConsumerGroupNotOwned => "ConsumerGroupNotOwned",
             Self::TopicNotAuthorized => "TopicNotAuthorized",
             Self::EventTypeNotAuthorized => "EventTypeNotAuthorized",
+            Self::SubjectTypeNotAuthorized => "SubjectTypeNotAuthorized",
             Self::ConsumerGroupNotAuthorized => "ConsumerGroupNotAuthorized",
             Self::TenantIdNotAuthorized => "TenantIdNotAuthorized",
             Self::NotAuthorizedToProduce => "NotAuthorizedToProduce",
@@ -287,6 +302,7 @@ impl ErrorCode {
             Self::PartitionNotAssigned => "PartitionNotAssigned",
             Self::TopologyVersionMismatch => "TopologyVersionMismatch",
             Self::BadTypePattern => "BadTypePattern",
+            Self::ChainModeFieldsMissing => "ChainModeFieldsMissing",
             Self::InvalidBody => "InvalidBody",
             Self::InvalidHeader => "InvalidHeader",
             Self::InvalidPartition => "InvalidPartition",
@@ -295,13 +311,21 @@ impl ErrorCode {
             Self::InvalidSeekValue => "InvalidSeekValue",
             Self::InvalidSessionTimeout => "InvalidSessionTimeout",
             Self::InvalidSpec => "InvalidSpec",
+            Self::InvalidSubjectOwner => "InvalidSubjectOwner",
             Self::InvalidSubjectType => "InvalidSubjectType",
             Self::InvalidSubjectTypePattern => "InvalidSubjectTypePattern",
+            Self::InvalidTenant => "InvalidTenant",
             Self::InvalidTimestamp => "InvalidTimestamp",
+            Self::MetaWithoutProducerId => "MetaWithoutProducerId",
             Self::MixedTopics => "MixedTopics",
+            Self::MonotonicModeFieldsViolation => "MonotonicModeFieldsViolation",
             Self::OffsetOutOfRange => "OffsetOutOfRange",
             Self::PartitionKeyUnresolved => "PartitionKeyUnresolved",
             Self::SubjectTypeNotAllowed => "SubjectTypeNotAllowed",
+            Self::TooManyInterests => "TooManyInterests",
+            Self::TooManySubjectTypes => "TooManySubjectTypes",
+            Self::TooManyTypes => "TooManyTypes",
+            Self::UnknownMetaVersion => "UnknownMetaVersion",
         }
     }
 
@@ -314,11 +338,13 @@ impl ErrorCode {
             Self::TopicNotFound | Self::TopicNotAuthorized => resources::TOPIC,
             Self::EventTypeNotFound | Self::EventTypeNotAuthorized => resources::EVENT_TYPE,
             Self::SubscriptionNotFound
+            | Self::SubscriptionNotOwned
             | Self::PositionsNotSet
             | Self::StreamingInProgress
             | Self::PartitionNotAssigned
             | Self::TopologyVersionMismatch => resources::SUBSCRIPTION,
             Self::ConsumerGroupNotFound
+            | Self::ConsumerGroupNotOwned
             | Self::ConsumerGroupNotAuthorized
             | Self::ConsumerGroupHasActiveMembers => resources::CONSUMER_GROUP,
             Self::ProducerNotFound | Self::ProducerNotOwned => resources::PRODUCER,
@@ -420,8 +446,10 @@ impl From<event_broker_sdk::backend::BackendError> for DomainError {
 /// (`TopicNotAuthorized`, `EventTypeNotAuthorized`, `NotAuthorizedToProduce`,
 /// `TenantIdNotAuthorized`) overwrite `code` after this conversion
 /// (`eb-authz-enforcement`'s design.md "code-per-call-site" - tenant scope is
-/// its own `PolicyEnforcer` call via `domain::authz::tenant_authorized`, not
-/// a separate SDK, so it flows through this same `From` impl). The two
+/// its own `PolicyEnforcer` call (`domain::authz::tenant_authorized` on the
+/// consume and management paths, R and I in
+/// `IngestServiceImpl::authorize_publish` on publish), not a separate SDK, so
+/// it flows through this same `From` impl). The two
 /// non-denial variants are PDP/evaluation failures, not policy denials -
 /// lifted to `Internal`, matching `oagw`'s own `EnforcerError`-to-domain-error
 /// mapping.

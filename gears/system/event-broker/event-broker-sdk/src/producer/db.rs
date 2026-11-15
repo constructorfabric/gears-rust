@@ -647,7 +647,7 @@ impl DbProducer {
             && !self.cache.is_prepared(&type_id).await
         {
             return Err(EventBrokerError::SchemaNotPrepared {
-                type_id,
+                event_type: type_id,
                 detail: "call prepare_event_type outside the business transaction first".to_owned(),
             });
         }

@@ -59,9 +59,9 @@ fn raw_event(offset: i64) -> EventV1 {
         serde_json::json!({ "offset": offset }),
     )
     .id(Uuid::from_u128(u128::try_from(offset).unwrap()))
-    .tenant_id(Uuid::from_u128(0x0f1e_0001))
+    .subject_tenant(Uuid::from_u128(0x0f1e_0001))
     .subject(format!("order-{offset}"))
-    .subject_type_id(gts::GtsTypeId::new("gts.x.eb.test.subject.v1~"))
+    .subject_type_of(gts::GtsTypeId::new("gts.x.eb.test.subject.v1~"))
     .occurred_at("2026-01-02T03:04:05Z".parse().unwrap())
     .build()
     .unwrap()
@@ -75,9 +75,7 @@ fn raw_event(offset: i64) -> EventV1 {
 fn dead_letter_record(offset: i64) -> DeadLetterRecord {
     let delivery = Delivery::new(gts::GtsInstanceId::try_new(TOPIC).unwrap(), 6, 1);
     DeadLetterRecord::builder(&raw_event(offset), &delivery, "permanent failure")
-        .group_id(ConsumerGroupId::from_gts(gts_id!(
-            "cf.core.events.group.v1~example.orders.projector.x.v1"
-        )))
+        .consumer_group(ConsumerGroupId::new(Uuid::from_u128(1)))
         .attempts(3)
         .build()
 }

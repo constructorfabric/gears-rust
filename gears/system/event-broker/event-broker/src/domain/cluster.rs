@@ -1,7 +1,7 @@
-//! `ClusterCapabilities` usage (`DESIGN.md:596,739-768`). Per
-//! `docs/ADR/0007-service-decomposition.md` D2/D3, this wraps the platform
-//! `cluster` gear's real `cluster-sdk` facades directly - no bespoke
-//! coordination abstraction is introduced.
+//! `ClusterCapabilities` usage (`DESIGN.md` "`ClusterCapabilities` (Platform
+//! Dependency)"). Per `docs/ADR/0007-service-decomposition.md` D2/D3, this
+//! wraps the platform `cluster` gear's real `cluster-sdk` facades directly - no
+//! bespoke coordination abstraction is introduced.
 
 use cluster_sdk::{
     ClusterCacheV1, ClusterError, ClusterProfile, DistributedLockV1, LeaderElectionV1,
@@ -10,7 +10,8 @@ use toolkit::client_hub::ClientHub;
 use toolkit::domain_model;
 
 /// Every Event Broker cache key / lock name / election name is scoped under
-/// this prefix (`DESIGN.md:756-764`'s `evbk.*` cache-key table).
+/// this prefix (the `evbk.*` table of `DESIGN.md`
+/// "`ClusterCapabilities` (Platform Dependency)").
 pub const CLUSTER_SCOPE_PREFIX: &str = "evbk";
 
 /// The cluster-gear profile the event broker binds to. Operators configure
@@ -26,9 +27,9 @@ impl ClusterProfile for EventBrokerProfile {
 }
 
 /// Resolved handle onto the platform `cluster` gear's three coordination
-/// primitives, scoped for the Event Broker. Both standalone and cluster
-/// modes resolve the same facade types (`DESIGN.md:2208`'s "variants of the
-/// same module wiring") - standalone is simply backed by the
+/// primitives, scoped for the Event Broker. Both standalone and cluster modes
+/// resolve the same facade types (`DESIGN.md` "3.8 Deployment Topology":
+/// "variants of the same module wiring") - standalone is simply backed by the
 /// zero-dependency `standalone` cluster-gear provider instead of a
 /// network-backed one.
 ///

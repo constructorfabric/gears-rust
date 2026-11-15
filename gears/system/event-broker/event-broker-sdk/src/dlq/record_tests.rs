@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::consumer::Delivery;
 use crate::gts::{EventV1, StoredPosition};
-use crate::ids::{ConsumerGroupId, TopicId};
+use crate::ids::ConsumerGroupId;
 
 use super::DeadLetterRecord;
 
@@ -29,9 +29,9 @@ fn unstamped_event() -> EventV1 {
         serde_json::json!({ "order_id": "order-1" }),
     )
     .id(EVENT_ID)
-    .tenant_id(Uuid::nil())
+    .subject_tenant(Uuid::nil())
     .subject("order-1")
-    .subject_type_id(gts::GtsTypeId::new(SUBJECT_TYPE))
+    .subject_type_of(gts::GtsTypeId::new(SUBJECT_TYPE))
     .trace_parent("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")
     .occurred_at(occurred_at())
     .build()
@@ -53,18 +53,15 @@ fn delivery() -> Delivery {
 
 #[test]
 fn dead_letter_record_exposes_context_fields_for_diagnosis_and_replay() {
-    let group_id = ConsumerGroupId::new(GROUP_ID);
-    let topic_id = TopicId::from_gts(TOPIC);
+    let consumer_group = ConsumerGroupId::new(GROUP_ID);
     let raw = raw_event();
 
     let record = DeadLetterRecord::builder(&raw, &delivery(), "schema mismatch")
-        .group_id(group_id)
-        .topic_id(topic_id)
+        .consumer_group(consumer_group)
         .attempts(2)
         .build();
 
-    assert_eq!(record.group_id, Some(group_id));
-    assert_eq!(record.topic_id, Some(topic_id));
+    assert_eq!(record.consumer_group, Some(consumer_group));
     assert_eq!(record.topic, TOPIC);
     assert_eq!(record.event_type, EVENT_TYPE);
     assert_eq!(record.subject, "order-1");
@@ -74,21 +71,29 @@ fn dead_letter_record_exposes_context_fields_for_diagnosis_and_replay() {
     assert_eq!(record.payload, serde_json::json!({ "order_id": "order-1" }));
     assert_eq!(record.reason, "schema mismatch");
     assert_eq!(record.attempts, Some(2));
-    assert_eq!(record.event_id, EVENT_ID);
+    assert_eq!(record.event, EVENT_ID);
 }
 
 #[test]
-fn dead_letter_record_allows_absent_group_and_topic_id() {
+fn a_dead_letter_record_allows_an_absent_consumer_group() {
     let raw = raw_event();
 
     let record = DeadLetterRecord::builder(&raw, &delivery(), "no registry context")
-        .without_topic_id()
+        .occurred_at(dead_lettered_at())
         .build();
 
-    assert_eq!(record.group_id, None);
-    assert_eq!(record.topic_id, None);
+    assert_eq!(record.consumer_group, None);
     assert_eq!(record.topic, TOPIC);
+    assert_eq!(record.event_type, EVENT_TYPE);
+    assert_eq!(record.subject, "order-1");
+    assert_eq!(record.subject_type, SUBJECT_TYPE);
+    assert_eq!(record.partition, 3);
+    assert_eq!(record.offset, Sequence::assigned(42));
+    assert_eq!(record.attempts, Some(2));
     assert_eq!(record.reason, "no registry context");
+    assert_eq!(record.payload, serde_json::json!({ "order_id": "order-1" }));
+    assert_eq!(record.occurred_at, dead_lettered_at());
+    assert_eq!(record.event, EVENT_ID);
 }
 
 /// The event is stored at partition 3 and the delivery says partition 5, so the record's
@@ -102,8 +107,7 @@ fn a_dead_letter_record_takes_topic_partition_and_attempts_from_the_delivery() {
         .occurred_at(dead_lettered_at())
         .build();
 
-    assert_eq!(record.group_id, None);
-    assert_eq!(record.topic_id, Some(TopicId::from_gts(TOPIC)));
+    assert_eq!(record.consumer_group, None);
     assert_eq!(record.topic, TOPIC);
     assert_eq!(record.event_type, EVENT_TYPE);
     assert_eq!(record.subject, "order-1");
@@ -114,16 +118,16 @@ fn a_dead_letter_record_takes_topic_partition_and_attempts_from_the_delivery() {
     assert_eq!(record.reason, "permanent failure");
     assert_eq!(record.payload, serde_json::json!({ "order_id": "order-1" }));
     assert_eq!(record.occurred_at, dead_lettered_at());
-    assert_eq!(record.event_id, EVENT_ID);
+    assert_eq!(record.event, EVENT_ID);
 }
 
 #[test]
 fn a_body_less_event_dead_letters_with_a_null_payload() {
     let raw = EventV1::builder_without_data(gts::GtsTypeId::new(EVENT_TYPE))
         .id(EVENT_ID)
-        .tenant_id(Uuid::nil())
+        .subject_tenant(Uuid::nil())
         .subject("order-1")
-        .subject_type_id(gts::GtsTypeId::new(SUBJECT_TYPE))
+        .subject_type_of(gts::GtsTypeId::new(SUBJECT_TYPE))
         .occurred_at(occurred_at())
         .build()
         .unwrap()
@@ -137,7 +141,7 @@ fn a_body_less_event_dead_letters_with_a_null_payload() {
 
     assert_eq!(record.payload, serde_json::Value::Null);
     assert_eq!(record.offset, Sequence::assigned(42));
-    assert_eq!(record.event_id, EVENT_ID);
+    assert_eq!(record.event, EVENT_ID);
 }
 
 #[test]
@@ -152,7 +156,7 @@ fn an_unstamped_event_dead_letters_at_no_position() {
     assert_eq!(record.partition, 3);
     assert_eq!(record.attempts, Some(2));
     assert_eq!(record.payload, serde_json::json!({ "order_id": "order-1" }));
-    assert_eq!(record.event_id, EVENT_ID);
+    assert_eq!(record.event, EVENT_ID);
 }
 
 /// The payload may carry personal or secret data, so the builder's `Debug` leaves it out.
@@ -164,9 +168,9 @@ fn the_builder_debug_output_leaves_the_payload_out() {
         serde_json::json!({ "order_id": "order-1", "card": planted }),
     )
     .id(EVENT_ID)
-    .tenant_id(Uuid::nil())
+    .subject_tenant(Uuid::nil())
     .subject("order-1")
-    .subject_type_id(gts::GtsTypeId::new(SUBJECT_TYPE))
+    .subject_type_of(gts::GtsTypeId::new(SUBJECT_TYPE))
     .occurred_at(occurred_at())
     .build()
     .unwrap()
@@ -181,7 +185,7 @@ fn the_builder_debug_output_leaves_the_payload_out() {
     );
 
     let builder = DeadLetterRecord::builder(&raw, &delivery(), "schema mismatch")
-        .group_id(ConsumerGroupId::new(GROUP_ID))
+        .consumer_group(ConsumerGroupId::new(GROUP_ID))
         .occurred_at(dead_lettered_at());
 
     let debug = format!("{builder:?}");
@@ -189,15 +193,14 @@ fn the_builder_debug_output_leaves_the_payload_out() {
         debug,
         concat!(
             r#"DeadLetterRecordBuilder { reason: "schema mismatch", "#,
-            "group_id: Some(ConsumerGroupId(00000000-0000-0000-0000-00000d1e0002)), ",
-            "topic_id: Some(TopicId(88505383-6439-57ce-8683-8b20022a2177)), ",
+            "consumer_group: Some(ConsumerGroupId(00000000-0000-0000-0000-00000d1e0002)), ",
             r#"topic: GtsInstanceId(GtsEntityId("gts.cf.core.events.topic.v1~example.orders.x.x.v1")), "#,
             r#"event_type: GtsTypeId(GtsEntityId("gts.cf.core.events.event.v1~example.orders.rejected.x.v1~")), "#,
             r#"subject: "order-1", "#,
             r#"subject_type: GtsTypeId(GtsEntityId("gts.x.eb.test.subject.v1~")), "#,
             "partition: 3, offset: Sequence(42), attempts: Some(2), ",
             "occurred_at: 2026-01-02T03:05:00Z, ",
-            "event_id: 00000000-0000-0000-0000-00000d1e0001, .. }",
+            "event: 00000000-0000-0000-0000-00000d1e0001, .. }",
         )
     );
     assert!(!debug.contains(planted));

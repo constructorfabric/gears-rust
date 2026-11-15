@@ -3,16 +3,17 @@ use std::time::Duration;
 use toolkit_gts::gts_id;
 
 use gts::{GtsIdPattern, GtsInstanceId, GtsSchema, GtsTypeId};
+use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 #[cfg(feature = "db")]
 use super::commit::TxCommitHandle;
 #[cfg(feature = "db")]
 use super::offset_manager::CommitOffsetInTx;
-use crate::api::{AssignedPartition, Position};
+use crate::api::{AssignedPartition, EventBrokerApi, Position};
 use crate::error::{ConsumerError, DecodeCategory, EventBrokerError};
 use crate::gts::{EventPayload, EventV1, StoredPosition};
-use crate::ids::{ConsumerGroupId, SubscriptionId, TopicId};
+use crate::ids::{ConsumerGroupId, SubscriptionId};
 use crate::sequence::Sequence;
 
 /// How an event or a batch reaches its handler: the topic and partition it was read
@@ -174,13 +175,56 @@ impl ConsumerGroupRef {
         Self::Id(id)
     }
 
+    /// A group named by its GTS reference. `start()` refuses a consumer with this
+    /// reference, because a GTS reference must be resolved to an id before startup;
+    /// pass the id with [`Self::id`].
     pub fn gts(gts: GtsInstanceId) -> Self {
         Self::Gts(gts)
     }
 
+    /// A new anonymous group, created once when the consumer starts and shared by
+    /// all its slots. `alias` is the client agent the group is created with: the
+    /// broker refuses one outside the RFC 9110 User-Agent grammar at the group
+    /// create, so `start()` fails before any slot starts.
     pub fn auto_anonymous(alias: impl Into<String>) -> Self {
         Self::AutoAnonymous {
             alias: alias.into(),
+        }
+    }
+
+    /// The id of the group this reference names, creating the group for
+    /// [`Self::AutoAnonymous`]. Each call of an `AutoAnonymous` reference creates a
+    /// new group, so a consumer resolves its reference once.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConsumerOptions` for a [`Self::Gts`] reference, which has to
+    /// be resolved to an id before the consumer starts, and the broker's error when
+    /// it cannot create the anonymous group.
+    pub(crate) async fn resolve(
+        &self,
+        broker: &dyn EventBrokerApi,
+        ctx: &SecurityContext,
+    ) -> Result<ConsumerGroupId, EventBrokerError> {
+        match self {
+            Self::Id(id) => Ok(*id),
+            Self::Gts(gts) => Err(EventBrokerError::InvalidConsumerOptions {
+                detail: format!(
+                    "consumer group GTS reference '{gts}' must be resolved before startup"
+                ),
+            }),
+            Self::AutoAnonymous { alias } => {
+                let group = broker
+                    .create_consumer_group(
+                        ctx,
+                        crate::models::CreateConsumerGroupRequest {
+                            client_agent: alias.clone(),
+                            description: None,
+                        },
+                    )
+                    .await?;
+                Ok(group.id)
+            }
         }
     }
 }
@@ -583,9 +627,8 @@ pub enum SlowConsumerTrigger {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionBufferStateSnapshot {
-    pub group_id: ConsumerGroupId,
-    pub subscription_id: SubscriptionId,
-    pub topic_id: TopicId,
+    pub consumer_group: ConsumerGroupId,
+    pub subscription: SubscriptionId,
     pub topic: GtsInstanceId,
     pub partition: u32,
     pub state: PartitionBufferState,
@@ -600,7 +643,6 @@ pub struct PartitionBufferStateSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionDropReason {
     SlowConsumer {
-        topic_id: TopicId,
         topic: GtsInstanceId,
         partition: u32,
         trigger: SlowConsumerTrigger,
@@ -612,7 +654,6 @@ pub enum ConnectionDropReason {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionProgress {
-    pub topic_id: TopicId,
     pub topic: GtsInstanceId,
     pub partition: u32,
     pub offset: Sequence,
@@ -621,72 +662,71 @@ pub struct PartitionProgress {
 #[derive(Debug, Clone)]
 pub enum ConsumerRuntimeEvent {
     SubscriptionJoining {
-        group_id: ConsumerGroupId,
+        consumer_group: ConsumerGroupId,
     },
     SubscriptionStarted {
-        group_id: ConsumerGroupId,
-        subscription_id: SubscriptionId,
+        consumer_group: ConsumerGroupId,
+        subscription: SubscriptionId,
         assigned: Vec<AssignedPartition>,
     },
     SubscriptionRejoining {
-        group_id: ConsumerGroupId,
-        previous_subscription_id: SubscriptionId,
+        consumer_group: ConsumerGroupId,
+        previous_subscription: SubscriptionId,
     },
     /// The consumer closed a subscription's stream before it re-JOINs. Emitted only for a
     /// stream that opened (got its first frame): one that failed to open or ended before
     /// its first frame reports [`Self::SubscriptionRejoining`] only.
     SubscriptionTerminated {
-        subscription_id: SubscriptionId,
+        subscription: SubscriptionId,
         reason: ConnectionDropReason,
     },
     SubscriptionConnectionDropped {
-        subscription_id: SubscriptionId,
+        subscription: SubscriptionId,
         reason: ConnectionDropReason,
         affected: Vec<AssignedPartition>,
     },
+    /// The partitions a subscription reads. Emitted at each JOIN with the assigned
+    /// partitions, and again whenever a topology frame on its stream carries a different
+    /// set: a rebalance that takes partitions from it, or over REST a reconnect that
+    /// reopens the stream on a changed assignment. A gain or the loss of every partition
+    /// on an open stream ends the stream instead, and shows as a new JOIN.
     AssignmentChanged {
-        subscription_id: SubscriptionId,
+        subscription: SubscriptionId,
         assigned: Vec<AssignedPartition>,
     },
     ProgressAdvanced {
-        subscription_id: SubscriptionId,
+        subscription: SubscriptionId,
         progress: Vec<PartitionProgress>,
     },
     PartitionBufferStateChanged {
         state: PartitionBufferStateSnapshot,
     },
     HandlerBatchStarted {
-        topic_id: TopicId,
         topic: GtsInstanceId,
         partition: u32,
         len: usize,
     },
     HandlerBatchCompleted {
-        topic_id: TopicId,
         topic: GtsInstanceId,
         partition: u32,
         outcome: BatchHandlerOutcome,
     },
     HandlerFailed {
-        topic_id: TopicId,
         topic: GtsInstanceId,
         partition: u32,
         error: String,
     },
     OffsetLoaded {
-        topic_id: TopicId,
         topic: GtsInstanceId,
         partition: u32,
         position: Position,
     },
     OffsetCommitted {
-        topic_id: TopicId,
         topic: GtsInstanceId,
         partition: u32,
         offset: Sequence,
     },
     RetryScheduled {
-        topic_id: TopicId,
         topic: GtsInstanceId,
         partition: u32,
         attempt: u16,
@@ -698,7 +738,7 @@ pub enum ConsumerRuntimeEvent {
         topic: GtsInstanceId,
         partition: u32,
         sequence: Sequence,
-        type_id: GtsTypeId,
+        event_type: GtsTypeId,
         category: DecodeCategory,
     },
 }
@@ -716,7 +756,7 @@ pub trait ConsumerRuntimeListener: Send + Sync {
 /// - Delivery is at-least-once: events after the last committed offset are redelivered
 ///   after a restart or a rebalance.
 /// - Event ids are not unique. The broker refuses a repeated id only within one batch,
-///   and dedups only the retries of a deduplicating producer (`producer_id` and
+///   and dedups only the retries of a deduplicating producer (`meta.producer` and
 ///   `sequence`).
 /// - A handler whose effect must not repeat makes that effect idempotent itself.
 #[async_trait::async_trait]
@@ -743,7 +783,7 @@ pub trait EventHandler<P: EventPayload>: Send + Sync {
 /// - Delivery is at-least-once: events after the last committed offset are redelivered
 ///   after a restart or a rebalance.
 /// - Event ids are not unique. The broker refuses a repeated id only within one batch,
-///   and dedups only the retries of a deduplicating producer (`producer_id` and
+///   and dedups only the retries of a deduplicating producer (`meta.producer` and
 ///   `sequence`).
 /// - A handler whose effect must not repeat makes that effect idempotent itself.
 #[async_trait::async_trait]
@@ -768,7 +808,7 @@ pub trait BatchHandler<P: EventPayload>: Send + Sync {
 /// - Delivery is at-least-once: events after the last committed offset are redelivered
 ///   after a restart or a rebalance.
 /// - Event ids are not unique. The broker refuses a repeated id only within one batch,
-///   and dedups only the retries of a deduplicating producer (`producer_id` and
+///   and dedups only the retries of a deduplicating producer (`meta.producer` and
 ///   `sequence`).
 /// - The handler commits the offset in the same transaction as its writes, so while the
 ///   consumer owns the partition a redelivered event never re-applies a committed
@@ -802,7 +842,7 @@ pub trait TxEventHandler<P: EventPayload, OM: CommitOffsetInTx>: Send + Sync {
 /// - Delivery is at-least-once: events after the last committed offset are redelivered
 ///   after a restart or a rebalance.
 /// - Event ids are not unique. The broker refuses a repeated id only within one batch,
-///   and dedups only the retries of a deduplicating producer (`producer_id` and
+///   and dedups only the retries of a deduplicating producer (`meta.producer` and
 ///   `sequence`).
 /// - The handler commits the offset in the same transaction as its writes, so while the
 ///   consumer owns the partition a redelivered event never re-applies a committed

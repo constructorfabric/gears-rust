@@ -3,17 +3,27 @@ mod tx {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
+    use gts::GtsInstanceId;
+    use toolkit_gts::gts_id;
     use uuid::Uuid;
 
     use super::super::commit::TxCommitHandleParts;
     use crate::consumer::{
         CommitOffsetInTx, Fallback, OffsetManagerError, OffsetStore, Position, TxCommitHandle,
     };
-    use crate::ids::{ConsumerGroupId, TopicId};
+    use crate::ids::ConsumerGroupId;
     use crate::sequence::Sequence;
 
-    type RecordedCommit = (ConsumerGroupId, TopicId, u32, i64);
+    type RecordedCommit = (ConsumerGroupId, GtsInstanceId, u32, i64);
     type RecordedCommits = Mutex<Vec<RecordedCommit>>;
+
+    /// The topic every handle in these tests commits for.
+    fn topic() -> GtsInstanceId {
+        GtsInstanceId::try_new(gts_id!(
+            "cf.core.events.topic.v1~example.commit.handle.x.v1"
+        ))
+        .expect("valid GTS instance id")
+    }
 
     #[derive(Default)]
     struct RecordingTxOffsetManager {
@@ -25,7 +35,7 @@ mod tx {
         async fn load_position(
             &self,
             _group: &ConsumerGroupId,
-            _topic: &TopicId,
+            _topic: &GtsInstanceId,
             _partition: u32,
         ) -> Result<Position, OffsetManagerError> {
             Ok(Fallback::Earliest.into())
@@ -38,7 +48,7 @@ mod tx {
             &self,
             _txn: &TX,
             group: &ConsumerGroupId,
-            topic: &TopicId,
+            topic: &GtsInstanceId,
             partition: u32,
             offset: Sequence,
         ) -> Result<(), OffsetManagerError>
@@ -47,7 +57,7 @@ mod tx {
         {
             self.calls.lock().expect("recording mutex").push((
                 *group,
-                *topic,
+                topic.clone(),
                 partition,
                 offset.as_i64(),
             ));
@@ -69,13 +79,13 @@ mod tx {
 
         let manager = Arc::new(RecordingTxOffsetManager::default());
         let group = ConsumerGroupId::new(Uuid::new_v4());
-        let topic = TopicId::new(Uuid::new_v4());
+        let topic = topic();
         let handle = TxCommitHandle::new(TxCommitHandleParts {
             partition: 5,
             offsets: vec![Sequence::assigned(123)],
             offset_manager: manager.clone(),
             group,
-            topic,
+            topic: topic.clone(),
         });
         let committed = handle.committed_offset.clone();
 
@@ -116,7 +126,7 @@ mod tx {
 
         let manager = Arc::new(RecordingTxOffsetManager::default());
         let group = ConsumerGroupId::new(Uuid::new_v4());
-        let topic = TopicId::new(Uuid::new_v4());
+        let topic = topic();
         let handle = TxCommitHandle::new(TxCommitHandleParts {
             partition: 5,
             offsets: vec![
@@ -126,7 +136,7 @@ mod tx {
             ],
             offset_manager: manager.clone(),
             group,
-            topic,
+            topic: topic.clone(),
         });
         let committed = handle.committed_offset.clone();
 
@@ -166,7 +176,7 @@ mod tx {
 
         let manager = Arc::new(RecordingTxOffsetManager::default());
         let group = ConsumerGroupId::new(Uuid::new_v4());
-        let topic = TopicId::new(Uuid::new_v4());
+        let topic = topic();
         let handle = TxCommitHandle::new(TxCommitHandleParts {
             partition: 5,
             offsets: vec![
@@ -176,7 +186,7 @@ mod tx {
             ],
             offset_manager: manager.clone(),
             group,
-            topic,
+            topic: topic.clone(),
         });
         let committed = handle.committed_offset.clone();
 
@@ -216,7 +226,7 @@ mod tx {
 
         let manager = Arc::new(RecordingTxOffsetManager::default());
         let group = ConsumerGroupId::new(Uuid::new_v4());
-        let topic = TopicId::new(Uuid::new_v4());
+        let topic = topic();
         let handle = TxCommitHandle::new(TxCommitHandleParts {
             partition: 5,
             offsets: vec![
@@ -226,7 +236,7 @@ mod tx {
             ],
             offset_manager: manager.clone(),
             group,
-            topic,
+            topic: topic.clone(),
         });
         let committed = handle.committed_offset.clone();
 

@@ -60,10 +60,10 @@ async fn wait_until(mut predicate: impl FnMut() -> bool) {
 /// A publishable event of the test type for `tenant`, about `subject`.
 fn event(tenant: Uuid, subject: &str) -> EventV1 {
     EventV1::builder_for(GtsTypeId::new(EVENT_TYPE), json!({ "ok": true }))
-        .tenant_id(tenant)
+        .subject_tenant(tenant)
         .source("rest-roundtrip-source")
         .subject(subject)
-        .subject_type_id(GtsTypeId::new(SUBJECT_TYPE))
+        .subject_type_of(GtsTypeId::new(SUBJECT_TYPE))
         .build()
         .expect("a valid event")
 }
@@ -107,9 +107,13 @@ async fn rest_round_trip(framing: StreamTransport) {
     );
 
     let subjects = Arc::new(Mutex::new(Vec::new()));
+    // The server runs every request as its injected context; the consumer's own
+    // context only has to carry an identity for `start()` to accept it.
     let handle = ConsumerBuilder::new(broker.clone())
         .group(ConsumerGroupRef::auto_anonymous("rest-roundtrip"))
-        .tenant_id(tenant)
+        .security_context(harness.security_context().clone())
+        .subject_tenant(tenant)
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
         .topics([GtsInstanceId::try_new(TOPIC).unwrap()])
         .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
         .handler(RecordingHandler {
@@ -176,7 +180,9 @@ async fn a_persisted_publish_reports_persisted_once_stored() {
     let subjects = Arc::new(Mutex::new(Vec::new()));
     let handle = ConsumerBuilder::new(broker.clone())
         .group(ConsumerGroupRef::auto_anonymous("rest-roundtrip-persisted"))
-        .tenant_id(tenant)
+        .security_context(harness.security_context().clone())
+        .subject_tenant(tenant)
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
         .topics([GtsInstanceId::try_new(TOPIC).unwrap()])
         .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
         .handler(RecordingHandler {

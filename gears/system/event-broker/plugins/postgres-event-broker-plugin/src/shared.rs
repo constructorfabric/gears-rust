@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 
 use event_broker_sdk::GtsInstanceId;
-use event_broker_sdk::backend::support::{LocalHeads, topic_uuid};
+use event_broker_sdk::backend::support::LocalHeads;
 use event_broker_sdk::backend::{BackendError, Role};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -22,7 +22,8 @@ use crate::settings::PostgresSettings;
 pub struct KnownTopic {
     /// The topic the log belongs to.
     pub id: GtsInstanceId,
-    /// `topic_uuid(id)`, the key of every plugin row of the topic.
+    /// The `TopicSpec.uuid` the topic was provisioned under, the key of every
+    /// plugin row of the topic.
     pub uuid: Uuid,
     /// The topic's partition count.
     pub partitions: u32,
@@ -33,9 +34,31 @@ pub struct KnownTopic {
 /// A topic's `evbk__log` row with its tables, by partition.
 #[derive(sqlx::FromRow)]
 struct LogRow {
+    topic_uuid: Uuid,
     topic_id: String,
     partitions: i32,
     tables: Vec<String>,
+}
+
+/// What a topic's `evbk__log` row is looked up by.
+enum LogKey<'a> {
+    /// The topic's GTS id, which an operation names (unique `topic_id`).
+    Topic(&'a GtsInstanceId),
+    /// The key of every plugin row of the topic, which a notification
+    /// carries (primary key `topic_uuid`).
+    Uuid(Uuid),
+}
+
+/// The `evbk__log` row, with its tables by partition, `WHERE $key`.
+macro_rules! log_lookup {
+    ($key:literal) => {
+        concat!(
+            "SELECT l.topic_uuid, l.topic_id, l.partitions, ARRAY(SELECT p.table_name \
+             FROM evbk__partition p WHERE p.topic_uuid = l.topic_uuid ORDER BY p.partition) AS tables \
+             FROM evbk__log l WHERE ",
+            $key
+        )
+    };
 }
 
 /// The topics resolved so far, by both of their names: operations come with
@@ -149,7 +172,7 @@ impl Shared {
         if let Some(known) = cached {
             return Ok(known);
         }
-        self.load(topic_uuid(topic), operation)
+        self.load(LogKey::Topic(topic), operation)
             .await?
             .ok_or_else(|| BackendError::not_provisioned(operation.name()))
     }
@@ -171,24 +194,26 @@ impl Shared {
         if cached.is_some() {
             return Ok(cached);
         }
-        self.load(topic, operation).await
+        self.load(LogKey::Uuid(topic), operation).await
     }
 
     async fn load(
         &self,
-        topic: Uuid,
+        key: LogKey<'_>,
         operation: Operation,
     ) -> Result<Option<Arc<KnownTopic>>, BackendError> {
-        let row: Option<LogRow> = sqlx::query_as(
-            "SELECT l.topic_id, l.partitions, ARRAY(SELECT p.table_name FROM evbk__partition p \
-             WHERE p.topic_uuid = l.topic_uuid ORDER BY p.partition) AS tables \
-             FROM evbk__log l WHERE l.topic_uuid = $1",
-        )
-        .bind(topic)
-        .fetch_optional(self.pool()?)
-        .await
-        .map_err(|e| error::map(operation, &e))?;
+        let query = match key {
+            LogKey::Topic(topic) => {
+                sqlx::query_as(log_lookup!("l.topic_id = $1")).bind(topic.as_ref())
+            }
+            LogKey::Uuid(uuid) => sqlx::query_as(log_lookup!("l.topic_uuid = $1")).bind(uuid),
+        };
+        let row: Option<LogRow> = query
+            .fetch_optional(self.pool()?)
+            .await
+            .map_err(|e| error::map(operation, &e))?;
         let Some(LogRow {
+            topic_uuid,
             topic_id,
             partitions,
             tables,
@@ -200,7 +225,7 @@ impl Shared {
             id: GtsInstanceId::try_new(&topic_id).map_err(|_| {
                 BackendError::Internal(format!("{operation}: evbk__log holds a malformed topic id"))
             })?,
-            uuid: topic,
+            uuid: topic_uuid,
             partitions: u32::try_from(partitions).map_err(|_| {
                 BackendError::Internal(format!(
                     "{operation}: evbk__log holds a negative partition count"

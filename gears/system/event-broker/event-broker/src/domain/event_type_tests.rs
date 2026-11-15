@@ -37,7 +37,7 @@ fn base() -> serde_json::Value {
         "type": "object",
         "x-gts-abstract": true,
         "properties": {
-            "tenant_id": { "type": "string" },
+            "subject_tenant": { "type": "string" },
             "data": { "type": ["object", "null"] }
         },
         "x-gts-traits-schema": {
@@ -53,7 +53,7 @@ fn base() -> serde_json::Value {
                 "partition_key": {
                     "type": "string",
                     "format": "json-pointer",
-                    "default": "/tenant_id"
+                    "default": "/subject_tenant"
                 }
             }
         }
@@ -105,7 +105,7 @@ fn unadmitted(effective_traits: serde_json::Value) -> TypeSchema {
         resolved_schema: Some(json!({
             "type": "object",
             "allOf": [
-                { "type": "object", "properties": { "tenant_id": { "type": "string" } } },
+                { "type": "object", "properties": { "subject_tenant": { "type": "string" } } },
                 {
                     "type": "object",
                     "properties": {
@@ -234,7 +234,7 @@ fn topic_is_an_internal_error_when_no_trait_is_declared_anywhere_in_the_chain() 
     // `topic` is required by the base's trait schema, so the registry refuses
     // a type that resolves none.
     let event_type =
-        unadmitted(json!({ "allowed_subject_types": [], "partition_key": "/tenant_id" }));
+        unadmitted(json!({ "allowed_subject_types": [], "partition_key": "/subject_tenant" }));
 
     let err = topic(&event_type)
         .expect_err("an event type with no topic trait names no stream and cannot be published to");
@@ -254,7 +254,7 @@ fn topic_is_an_internal_error_when_the_trait_names_a_type_rather_than_an_instanc
     let event_type = unadmitted(json!({
         "topic": "gts.cf.core.events.topic.v1~fabrikam.shop._.orders.v1~",
         "allowed_subject_types": [],
-        "partition_key": "/tenant_id",
+        "partition_key": "/subject_tenant",
     }));
 
     let err = topic(&event_type).expect_err("a topic trait must name a GTS instance");
@@ -289,7 +289,7 @@ fn an_event_type_listed_without_a_resolved_schema_is_internal() {
     let mut event_type = unadmitted(json!({
         "topic": EXAMPLE_TOPIC,
         "allowed_subject_types": [],
-        "partition_key": "/tenant_id",
+        "partition_key": "/subject_tenant",
     }));
     event_type.resolved_schema = None;
 
@@ -375,6 +375,26 @@ async fn a_pointer_naming_nothing_is_rejected_and_names_itself() {
     );
 }
 
+#[tokio::test]
+async fn a_type_naming_the_old_tenant_pointer_is_excluded_at_spec_load() {
+    // The base names the event's tenant `subject_tenant`, so `/tenant_id` names
+    // no declared member and is refused like any other such pointer.
+    let event_type = derived_with_payload(&json!({
+        "topic": EXAMPLE_TOPIC,
+        "partition_key": "/tenant_id",
+    }))
+    .await;
+
+    let err = validate_partition_key(&event_type)
+        .expect_err("a pointer naming the old tenant member cannot be admitted");
+
+    assert_eq!(
+        err.to_string(),
+        "InvalidSpec: gts.cf.core.events.event.v1~fabrikam.shop.orders.order_placed.v1~ \
+         declares partition key `/tenant_id`, which names no declared member `tenant_id`"
+    );
+}
+
 #[test]
 fn a_value_that_is_not_a_pointer_is_rejected() {
     // The base's trait schema declares `partition_key` a JSON Pointer, so the
@@ -382,7 +402,7 @@ fn a_value_that_is_not_a_pointer_is_rejected() {
     let event_type = unadmitted(json!({
         "topic": EXAMPLE_TOPIC,
         "allowed_subject_types": [],
-        "partition_key": "tenant_id",
+        "partition_key": "subject_tenant",
     }));
 
     let err = validate_partition_key(&event_type).expect_err("a bare field name is not a pointer");
@@ -390,6 +410,241 @@ fn a_value_that_is_not_a_pointer_is_rejected() {
     assert_eq!(
         err.to_string(),
         "InvalidSpec: gts.cf.core.events.event.v1~fabrikam.shop.orders.order_placed.v1~ \
-         declares partition key `tenant_id`, which is not a JSON Pointer into the event"
+         declares partition key `subject_tenant`, which is not a JSON Pointer into the event"
+    );
+}
+
+// -- the subject-owner partition key ------------------------------------------
+
+/// The base as `base()` declares it, plus the owner member the real base declares
+/// through the GTS `Option` convention: required, and `null` allowed.
+fn base_declaring_the_owner() -> serde_json::Value {
+    let mut base = base();
+    base["properties"]["subject_owner"] = json!({ "type": ["string", "null"], "format": "uuid" });
+    base["required"] = json!(["subject_tenant", "subject_owner"]);
+    base
+}
+
+/// A branch that narrows the owner to a required UUID string.
+fn owner_override() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "required": ["subject_owner"],
+        "properties": { "subject_owner": { "type": "string", "format": "uuid" } }
+    })
+}
+
+/// `DERIVED_ID` keyed on `/subject_owner`, its own `allOf` holding `branches`
+/// after the base reference.
+async fn keyed_on_the_owner(branches: &[serde_json::Value]) -> TypeSchema {
+    let mut all_of = vec![json!({ "$ref": format!("gts://{BASE_ID}") })];
+    all_of.extend(branches.iter().cloned());
+    listed(&[
+        (BASE_ID, base_declaring_the_owner()),
+        (
+            DERIVED_ID,
+            json!({
+                "$id": format!("gts://{DERIVED_ID}"),
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "x-gts-traits": { "topic": EXAMPLE_TOPIC, "partition_key": "/subject_owner" },
+                "allOf": all_of,
+            }),
+        ),
+    ])
+    .await
+}
+
+/// The rejection a type keyed on `/subject_owner` gets without an override.
+const NO_OWNER_OVERRIDE: &str = "InvalidSpec: \
+    gts.cf.core.events.event.v1~fabrikam.shop.orders.order_placed.v1~ declares partition key \
+    `/subject_owner`, which needs a branch of the type that lists `subject_owner` in \
+    `required` and declares it as type `string`";
+
+/// Resolution keeps `allOf` as it is: the inlined base keeps its nullable,
+/// required owner and the derived branch its own narrowing, side by side. The
+/// override check relies on finding that branch, not a merged `required`.
+#[tokio::test]
+async fn resolution_keeps_the_owner_override_beside_the_base_under_all_of() {
+    let event_type = keyed_on_the_owner(&[owner_override()]).await;
+
+    let resolved = event_type
+        .resolved_schema
+        .as_ref()
+        .expect("a resolved schema");
+
+    assert_eq!(
+        resolved["allOf"],
+        json!([
+            {
+                "type": "object",
+                "properties": {
+                    "data": { "type": ["object", "null"] },
+                    "subject_owner": { "type": ["string", "null"], "format": "uuid" },
+                    "subject_tenant": { "type": "string" }
+                },
+                "required": ["subject_tenant", "subject_owner"]
+            },
+            {
+                "type": "object",
+                "required": ["subject_owner"],
+                "properties": { "subject_owner": { "type": "string", "format": "uuid" } }
+            }
+        ])
+    );
+}
+
+#[tokio::test]
+async fn an_owner_key_with_an_override_on_the_type_is_accepted() {
+    let event_type = keyed_on_the_owner(&[owner_override()]).await;
+
+    validate_partition_key(&event_type).expect("the type narrows the owner to required");
+}
+
+#[tokio::test]
+async fn an_owner_key_with_the_override_on_an_intermediate_type_is_accepted() {
+    // The family narrows the owner, and the leaf declares nothing about it, so
+    // the override sits one `allOf` deeper than the leaf's own branches.
+    let family = "gts.cf.core.events.event.v1~fabrikam.shop.orders.family.v1~";
+    let leaf = "gts.cf.core.events.event.v1~fabrikam.shop.orders.family.v1~\
+                fabrikam.shop.orders.order_placed.v1~";
+    let event_type = listed_as(
+        leaf,
+        &[
+            (BASE_ID, base_declaring_the_owner()),
+            (
+                family,
+                json!({
+                    "$id": format!("gts://{family}"),
+                    "$schema": "http://json-schema.org/draft-07/schema#",
+                    "type": "object",
+                    "x-gts-traits": { "topic": EXAMPLE_TOPIC, "partition_key": "/subject_owner" },
+                    "allOf": [{ "$ref": format!("gts://{BASE_ID}") }, owner_override()]
+                }),
+            ),
+            (
+                leaf,
+                json!({
+                    "$id": format!("gts://{leaf}"),
+                    "$schema": "http://json-schema.org/draft-07/schema#",
+                    "type": "object",
+                    "allOf": [
+                        { "$ref": format!("gts://{family}") },
+                        {
+                            "type": "object",
+                            "properties": { "data": { "type": "object" } }
+                        }
+                    ]
+                }),
+            ),
+        ],
+    )
+    .await;
+
+    validate_partition_key(&event_type).expect("an inherited override counts");
+}
+
+#[tokio::test]
+async fn an_owner_key_without_an_override_is_rejected() {
+    // The base lists the owner in `required` but admits `null`, so it is no
+    // override.
+    let event_type = keyed_on_the_owner(&[]).await;
+
+    let err =
+        validate_partition_key(&event_type).expect_err("a nullable owner cannot key a partition");
+
+    assert_eq!(err.to_string(), NO_OWNER_OVERRIDE);
+}
+
+#[tokio::test]
+async fn an_owner_override_that_keeps_null_or_is_not_required_is_rejected() {
+    let mut nullable = owner_override();
+    nullable["properties"]["subject_owner"]["type"] = json!(["string", "null"]);
+    let mut not_required = owner_override();
+    not_required["required"] = json!([]);
+
+    let mut refusals = Vec::new();
+    for branch in [nullable, not_required] {
+        let event_type = keyed_on_the_owner(&[branch]).await;
+        refusals.push(validate_partition_key(&event_type).map_err(|err| err.to_string()));
+    }
+
+    assert_eq!(
+        refusals,
+        vec![
+            Err(NO_OWNER_OVERRIDE.to_owned()),
+            Err(NO_OWNER_OVERRIDE.to_owned()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn an_owner_override_of_another_type_is_rejected() {
+    // The registry refuses a branch that retypes the base's owner, so this is
+    // the type as it would reach the broker had it been admitted.
+    let mut event_type = keyed_on_the_owner(&[owner_override()]).await;
+    event_type
+        .resolved_schema
+        .as_mut()
+        .expect("a resolved schema")["allOf"][1]["properties"]["subject_owner"]["type"] =
+        json!("integer");
+
+    let err =
+        validate_partition_key(&event_type).expect_err("an integer owner is not a principal id");
+
+    assert_eq!(err.to_string(), NO_OWNER_OVERRIDE);
+}
+
+#[tokio::test]
+async fn a_pointer_at_an_object_or_array_member_is_rejected() {
+    let mut refusals = Vec::new();
+    for member in ["/data/lines", "/data/customer"] {
+        let event_type = listed(&[
+            (BASE_ID, base()),
+            (
+                DERIVED_ID,
+                json!({
+                    "$id": format!("gts://{DERIVED_ID}"),
+                    "$schema": "http://json-schema.org/draft-07/schema#",
+                    "type": "object",
+                    "x-gts-traits": { "topic": EXAMPLE_TOPIC, "partition_key": member },
+                    "allOf": [
+                        { "$ref": format!("gts://{BASE_ID}") },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "data": {
+                                    "type": "object",
+                                    "properties": {
+                                        "lines": { "type": "array", "items": { "type": "string" } },
+                                        "customer": { "type": ["object", "null"] }
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }),
+            ),
+        ])
+        .await;
+        refusals.push(validate_partition_key(&event_type).map_err(|err| err.to_string()));
+    }
+
+    assert_eq!(
+        refusals,
+        vec![
+            Err(
+                "InvalidSpec: gts.cf.core.events.event.v1~fabrikam.shop.orders.order_placed.v1~ \
+                 declares partition key `/data/lines`, which names a member declared as an \
+                 object or array, which has no stable hash input"
+                    .to_owned()
+            ),
+            Err(
+                "InvalidSpec: gts.cf.core.events.event.v1~fabrikam.shop.orders.order_placed.v1~ \
+                 declares partition key `/data/customer`, which names a member declared as an \
+                 object or array, which has no stable hash input"
+                    .to_owned()
+            ),
+        ]
     );
 }

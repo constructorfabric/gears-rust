@@ -374,9 +374,9 @@ async fn a_body_less_event_reaches_the_typed_handler_without_data() {
     let calls = handler.calls.clone();
     let event = EventV1::builder_without_data(GtsTypeId::new(ORDER_PLACED))
         .id(Uuid::from_u128(2))
-        .tenant_id(Uuid::nil())
+        .subject_tenant(Uuid::nil())
         .subject("order-2")
-        .subject_type_id(GtsTypeId::new("gts.x.eb.test.subject.v1~"))
+        .subject_type_of(GtsTypeId::new("gts.x.eb.test.subject.v1~"))
         .occurred_at("2026-01-02T03:04:05Z".parse().unwrap())
         .build()
         .unwrap()

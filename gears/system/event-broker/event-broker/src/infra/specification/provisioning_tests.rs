@@ -12,11 +12,20 @@ use event_broker_sdk::backend::{
 };
 use event_broker_sdk::models::Event;
 use event_broker_sdk::{PartitionRange, Position, Sequence, TopicSegment};
+use sea_orm::EntityTrait;
 use serde_json::json;
 use tokio::sync::Notify;
-use toolkit_db::migration_runner::run_migrations_for_testing;
-use toolkit_db::{ConnectOpts, DBProvider, connect_db};
+use toolkit_canonical_errors::CanonicalError;
+use toolkit_db::DBProvider;
+use toolkit_db::secure::SecureEntityExt;
 use toolkit_gts::GtsInstanceId;
+use toolkit_security::{AccessScope, PlatformSecurityContext};
+use types_registry_sdk::testing_platform::MockTypesRegistry;
+use types_registry_sdk::{
+    BatchGetEntitiesRequest, BatchGetEntitiesResponse, DeleteEntitiesRequest, DeletionOperation,
+    IdempotencyKey, ListEntitiesRequest, ListEntitiesResponse, Operation, PlatformTypesRegistryApi,
+    RegisterEntitiesRequest, RegistrationOperation,
+};
 use uuid::Uuid;
 
 use super::super::TypesRegistrySpecificationManager;
@@ -24,10 +33,9 @@ use crate::config::EventBrokerConfig;
 use crate::domain::error::DomainError;
 use crate::domain::specification::{ProvisioningLimits, SpecificationManager, TopicState};
 use crate::infra::storage::entity::topic_binding;
-use crate::infra::storage::migrations::Migrator;
 use crate::test_support::SingleBackendResolver;
+use crate::test_support::gear_db::ScratchSqlite;
 use crate::test_support::type_registry::registry_holding;
-use sea_orm_migration::MigratorTrait;
 
 const TOPIC_A: &str = "gts.cf.core.events.topic.v1~example.eb.prov.a.v1";
 const TOPIC_B: &str = "gts.cf.core.events.topic.v1~example.eb.prov.b.v1";
@@ -211,40 +219,17 @@ fn limits(attempt_timeout: Duration) -> ProvisioningLimits {
 
 const LONG: Duration = Duration::from_mins(5);
 
-async fn test_db() -> Arc<DBProvider<toolkit_db::DbError>> {
-    test_db_with_dsn().await.0
-}
-
-/// [`test_db`], with a DSN that reaches the same file.
-async fn test_db_with_dsn() -> (Arc<DBProvider<toolkit_db::DbError>>, String) {
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "cf-eb-provisioning-test-{}.db",
-        Uuid::now_v7().simple()
-    ));
-    let dsn = format!(
-        "sqlite://{}?mode=rwc",
-        path.to_string_lossy().replace('\\', "/")
-    );
-    let opts = ConnectOpts {
-        max_conns: Some(1),
-        min_conns: Some(1),
-        ..Default::default()
-    };
-    let db = connect_db(&dsn, opts).await.expect("connect sqlite");
-    run_migrations_for_testing(&db, Migrator::migrations())
-        .await
-        .expect("migrations");
-    (Arc::new(DBProvider::new(db)), dsn)
+async fn test_db() -> ScratchSqlite {
+    ScratchSqlite::open("cf-eb-provisioning-test").await
 }
 
 /// The topics, loaded through the real load path with 4 partitions each, into
 /// a fresh database; a second manager over the same database is a second
 /// instance.
-async fn loaded(topics: &[&str]) -> Arc<DBProvider<toolkit_db::DbError>> {
-    let db = test_db().await;
-    load(&db, topics, json!({ "partitions": 4 })).await;
-    db
+async fn loaded(topics: &[&str]) -> ScratchSqlite {
+    let scratch = test_db().await;
+    load(scratch.db(), topics, json!({ "partitions": 4 })).await;
+    scratch
 }
 
 /// Runs the real load path over `db` with `settings` as every topic's
@@ -254,6 +239,16 @@ async fn load(
     topics: &[&str],
     settings: serde_json::Value,
 ) {
+    let client: Arc<dyn PlatformTypesRegistryApi> = registry_holding(&documents(topics), &[]);
+    load_with(db, &client, settings).await;
+}
+
+/// Runs the real load path over `db`, reading the registry through `client`.
+async fn load_with(
+    db: &Arc<DBProvider<toolkit_db::DbError>>,
+    client: &Arc<dyn PlatformTypesRegistryApi>,
+    settings: serde_json::Value,
+) {
     let cfg: EventBrokerConfig = serde_json::from_value(json!({
         "mode": "standalone",
         "backends": { "main": { "type": MEMORY_BACKEND } },
@@ -261,15 +256,75 @@ async fn load(
         "topics": { "gts.cf.core.events.topic.v1~": settings },
     }))
     .expect("test configuration deserializes");
-    let documents: Vec<serde_json::Value> = topics
-        .iter()
-        .map(|id| json!({ "id": id, "description": "a topic to provision" }))
-        .collect();
-    let client: Arc<dyn types_registry_sdk::PlatformTypesRegistryApi> =
-        registry_holding(&documents, &[]);
-    super::super::bulk_load(&client, db, &cfg)
+    super::super::bulk_load(client, db, &cfg)
         .await
         .expect("bulk_load");
+}
+
+/// The topic instance documents an owning gear registers for `topics`.
+fn documents(topics: &[&str]) -> Vec<serde_json::Value> {
+    topics
+        .iter()
+        .map(|id| json!({ "id": id, "description": "a topic to provision" }))
+        .collect()
+}
+
+/// A Registry Reference no identifier derivation yields: a version-0 UUID,
+/// which the registry's version-5 identifiers never equal.
+const REFERENCE: Uuid = Uuid::from_u128(0x1);
+
+/// Answers as `inner` does, except that a listed `TOPIC_A` carries
+/// [`REFERENCE`] as its Registry Reference. Only listings are rewritten: the
+/// load path reads the registry through listings alone.
+struct ReferencingRegistry {
+    inner: Arc<MockTypesRegistry>,
+}
+
+#[async_trait]
+impl PlatformTypesRegistryApi for ReferencingRegistry {
+    async fn batch_get_entities(
+        &self,
+        ctx: &PlatformSecurityContext,
+        request: BatchGetEntitiesRequest,
+    ) -> Result<BatchGetEntitiesResponse, CanonicalError> {
+        self.inner.batch_get_entities(ctx, request).await
+    }
+    async fn list_entities(
+        &self,
+        ctx: &PlatformSecurityContext,
+        request: ListEntitiesRequest,
+    ) -> Result<ListEntitiesResponse, CanonicalError> {
+        let mut page = self.inner.list_entities(ctx, request).await?;
+        for entity in &mut page.items {
+            if entity.gts_id.as_ref() == TOPIC_A {
+                entity.gts_uuid = REFERENCE;
+            }
+        }
+        Ok(page)
+    }
+    async fn register_entities(
+        &self,
+        ctx: &PlatformSecurityContext,
+        key: IdempotencyKey,
+        request: RegisterEntitiesRequest,
+    ) -> Result<RegistrationOperation, CanonicalError> {
+        self.inner.register_entities(ctx, key, request).await
+    }
+    async fn delete_entities(
+        &self,
+        ctx: &PlatformSecurityContext,
+        key: IdempotencyKey,
+        request: DeleteEntitiesRequest,
+    ) -> Result<DeletionOperation, CanonicalError> {
+        self.inner.delete_entities(ctx, key, request).await
+    }
+    async fn get_operation(
+        &self,
+        ctx: &PlatformSecurityContext,
+        operation_id: Uuid,
+    ) -> Result<Operation, CanonicalError> {
+        self.inner.get_operation(ctx, operation_id).await
+    }
 }
 
 fn instance(db: &Arc<DBProvider<toolkit_db::DbError>>) -> TypesRegistrySpecificationManager {
@@ -280,11 +335,25 @@ fn resolver(backend: &Arc<ScriptedBackend>) -> SingleBackendResolver {
     SingleBackendResolver::new(Arc::clone(backend) as Arc<dyn Backend>)
 }
 
+/// Where `topic` stands; `None` when it is not a registered topic or has no
+/// record.
 async fn state(manager: &TypesRegistrySpecificationManager, topic: &str) -> Option<TopicState> {
-    manager
-        .topic_state(&GtsInstanceId::try_new(topic).unwrap())
+    let topic = manager
+        .get_topic(&GtsInstanceId::try_new(topic).unwrap())
         .await
-        .expect("state reads")
+        .expect("the topic reads")?;
+    manager.topic_state(&topic).await.expect("state reads")
+}
+
+/// The key of `topic`'s binding record: the Registry Reference its cached
+/// topic carries.
+async fn record_key(manager: &TypesRegistrySpecificationManager, topic: &str) -> Uuid {
+    manager
+        .get_topic(&GtsInstanceId::try_new(topic).unwrap())
+        .await
+        .expect("the topic reads")
+        .expect("the topic is loaded")
+        .uuid
 }
 
 /// AC-1: two instances seeing a new topic provision it once, under one log
@@ -292,7 +361,8 @@ async fn state(manager: &TypesRegistrySpecificationManager, topic: &str) -> Opti
 /// finds it provisioned with unchanged retention and makes no call (§3.1).
 #[tokio::test]
 async fn a_new_topic_is_provisioned_once_under_one_log_id() {
-    let db = loaded(&[TOPIC_A]).await;
+    let scratch = loaded(&[TOPIC_A]).await;
+    let db = Arc::clone(scratch.db());
     let backend = Arc::new(ScriptedBackend::answering(TOPIC_A, [Answer::Ready(4)]));
     let (one, two) = (instance(&db), instance(&db));
 
@@ -322,7 +392,8 @@ async fn a_new_topic_is_provisioned_once_under_one_log_id() {
 /// again - not by a restart, not by a second instance, not on a later pass.
 #[tokio::test]
 async fn a_provisioned_topic_is_not_provisioned_again_while_its_retention_is_unchanged() {
-    let db = loaded(&[TOPIC_A]).await;
+    let scratch = loaded(&[TOPIC_A]).await;
+    let db = Arc::clone(scratch.db());
     let backend = Arc::new(ScriptedBackend::answering(TOPIC_A, [Answer::Ready(4)]));
     let (one, two) = (instance(&db), instance(&db));
 
@@ -337,11 +408,13 @@ async fn a_provisioned_topic_is_not_provisioned_again_while_its_retention_is_unc
     let &[(_, LogClaim { new: log, .. })] = calls.as_slice() else {
         panic!("expected one provision call: {calls:?}")
     };
+    let reference = record_key(&two, TOPIC_A).await;
     assert_eq!(
         backend.calls(TOPIC_A),
         vec![(
             TopicSpec {
                 topic: GtsInstanceId::try_new(TOPIC_A).unwrap(),
+                uuid: reference,
                 partitions: 4,
                 retention: Retention {
                     max_age: Some(Duration::from_hours(24 * 7)),
@@ -364,7 +437,8 @@ async fn a_provisioned_topic_is_not_provisioned_again_while_its_retention_is_unc
 /// same log id; later passes find it recorded and make no call.
 #[tokio::test]
 async fn a_retention_change_re_provisions_once_under_the_same_log_id() {
-    let db = test_db().await;
+    let scratch = test_db().await;
+    let db = Arc::clone(scratch.db());
     load(
         &db,
         &[TOPIC_A],
@@ -395,12 +469,14 @@ async fn a_retention_change_re_provisions_once_under_the_same_log_id() {
         panic!("expected two provision calls: {calls:?}")
     };
     let topic = GtsInstanceId::try_new(TOPIC_A).unwrap();
+    let reference = record_key(&manager, TOPIC_A).await;
     assert_eq!(
         backend.calls(TOPIC_A),
         vec![
             (
                 TopicSpec {
                     topic: topic.clone(),
+                    uuid: reference,
                     partitions: 4,
                     retention: Retention {
                         max_age: Some(Duration::from_hours(24)),
@@ -415,6 +491,7 @@ async fn a_retention_change_re_provisions_once_under_the_same_log_id() {
             (
                 TopicSpec {
                     topic,
+                    uuid: reference,
                     partitions: 4,
                     retention: Retention {
                         max_age: Some(Duration::from_hours(48)),
@@ -438,7 +515,8 @@ async fn a_retention_change_re_provisions_once_under_the_same_log_id() {
 /// was, so the next pass calls again; once `Ready`, no further call.
 #[tokio::test]
 async fn a_failed_re_provision_is_retried_on_the_next_pass() {
-    let db = test_db().await;
+    let scratch = test_db().await;
+    let db = Arc::clone(scratch.db());
     load(
         &db,
         &[TOPIC_A],
@@ -471,12 +549,14 @@ async fn a_failed_re_provision_is_retried_on_the_next_pass() {
         panic!("expected three provision calls: {calls:?}")
     };
     let topic = GtsInstanceId::try_new(TOPIC_A).unwrap();
+    let reference = record_key(&manager, TOPIC_A).await;
     assert_eq!(
         backend.calls(TOPIC_A),
         vec![
             (
                 TopicSpec {
                     topic: topic.clone(),
+                    uuid: reference,
                     partitions: 4,
                     retention: Retention {
                         max_age: Some(Duration::from_hours(24)),
@@ -492,6 +572,7 @@ async fn a_failed_re_provision_is_retried_on_the_next_pass() {
             (
                 TopicSpec {
                     topic: topic.clone(),
+                    uuid: reference,
                     partitions: 4,
                     retention: Retention {
                         max_age: Some(Duration::from_hours(48)),
@@ -506,6 +587,7 @@ async fn a_failed_re_provision_is_retried_on_the_next_pass() {
             (
                 TopicSpec {
                     topic,
+                    uuid: reference,
                     partitions: 4,
                     retention: Retention {
                         max_age: Some(Duration::from_hours(48)),
@@ -536,7 +618,8 @@ const BOUND: Duration = Duration::from_secs(10);
 /// reaches the backend again, and then no call.
 #[tokio::test]
 async fn instances_that_record_retention_out_of_order_converge_once_their_configs_agree() {
-    let db = test_db().await;
+    let scratch = test_db().await;
+    let db = Arc::clone(scratch.db());
     load(
         &db,
         &[TOPIC_A],
@@ -595,10 +678,12 @@ async fn instances_that_record_retention_out_of_order_converge_once_their_config
     let &[(_, LogClaim { new: log, .. }), ..] = calls.as_slice() else {
         panic!("expected provision calls: {calls:?}")
     };
+    let reference = record_key(&one, TOPIC_A).await;
     let call = |hours: u64, replacing: Replacing| {
         (
             TopicSpec {
                 topic: GtsInstanceId::try_new(TOPIC_A).unwrap(),
+                uuid: reference,
                 partitions: 4,
                 retention: Retention {
                     max_age: Some(Duration::from_hours(hours)),
@@ -632,7 +717,8 @@ async fn instances_that_record_retention_out_of_order_converge_once_their_config
 /// the configuration returns to the recorded retention, it is handed again.
 #[tokio::test]
 async fn a_re_provision_whose_answer_is_not_seen_is_provisioned_again_once_the_config_returns() {
-    let db = test_db().await;
+    let scratch = test_db().await;
+    let db = Arc::clone(scratch.db());
     load(
         &db,
         &[TOPIC_A],
@@ -674,10 +760,12 @@ async fn a_re_provision_whose_answer_is_not_seen_is_provisioned_again_once_the_c
     let &[(_, LogClaim { new: log, .. }), ..] = calls.as_slice() else {
         panic!("expected provision calls: {calls:?}")
     };
+    let reference = record_key(&manager, TOPIC_A).await;
     let call = |hours: u64, replacing: Replacing| {
         (
             TopicSpec {
                 topic: GtsInstanceId::try_new(TOPIC_A).unwrap(),
+                uuid: reference,
                 partitions: 4,
                 retention: Retention {
                     max_age: Some(Duration::from_hours(hours)),
@@ -711,7 +799,8 @@ async fn a_re_provision_whose_answer_is_not_seen_is_provisioned_again_once_the_c
 /// the recorded retention, it is handed again.
 #[tokio::test]
 async fn a_re_provision_dropped_mid_call_is_provisioned_again_once_the_config_returns() {
-    let db = test_db().await;
+    let scratch = test_db().await;
+    let db = Arc::clone(scratch.db());
     load(
         &db,
         &[TOPIC_A],
@@ -765,10 +854,12 @@ async fn a_re_provision_dropped_mid_call_is_provisioned_again_once_the_config_re
     let &[(_, LogClaim { new: log, .. }), ..] = calls.as_slice() else {
         panic!("expected provision calls: {calls:?}")
     };
+    let reference = record_key(&manager, TOPIC_A).await;
     let call = |hours: u64, replacing: Replacing| {
         (
             TopicSpec {
                 topic: GtsInstanceId::try_new(TOPIC_A).unwrap(),
+                uuid: reference,
                 partitions: 4,
                 retention: Retention {
                     max_age: Some(Duration::from_hours(hours)),
@@ -802,7 +893,8 @@ async fn a_re_provision_dropped_mid_call_is_provisioned_again_once_the_config_re
 /// handed again, and then no call.
 #[tokio::test]
 async fn a_lost_retention_record_is_provisioned_again_when_its_call_was_applied_last() {
-    let db = test_db().await;
+    let scratch = test_db().await;
+    let db = Arc::clone(scratch.db());
     load(
         &db,
         &[TOPIC_A],
@@ -861,10 +953,12 @@ async fn a_lost_retention_record_is_provisioned_again_when_its_call_was_applied_
     let &[(_, LogClaim { new: log, .. }), ..] = calls.as_slice() else {
         panic!("expected provision calls: {calls:?}")
     };
+    let reference = record_key(&one, TOPIC_A).await;
     let call = |hours: u64, replacing: Replacing| {
         (
             TopicSpec {
                 topic: GtsInstanceId::try_new(TOPIC_A).unwrap(),
+                uuid: reference,
                 partitions: 4,
                 retention: Retention {
                     max_age: Some(Duration::from_hours(hours)),
@@ -900,7 +994,8 @@ async fn a_lost_retention_record_is_provisioned_again_when_its_call_was_applied_
 /// after A's mark.
 #[tokio::test]
 async fn a_mark_after_a_lost_record_cannot_be_cleared_by_an_earlier_read() {
-    let db = test_db().await;
+    let scratch = test_db().await;
+    let db = Arc::clone(scratch.db());
     load(
         &db,
         &[TOPIC_A],
@@ -971,10 +1066,12 @@ async fn a_mark_after_a_lost_record_cannot_be_cleared_by_an_earlier_read() {
     let &[(_, LogClaim { new: log, .. }), ..] = calls.as_slice() else {
         panic!("expected provision calls: {calls:?}")
     };
+    let reference = record_key(&b, TOPIC_A).await;
     let call = |hours: u64, replacing: Replacing| {
         (
             TopicSpec {
                 topic: GtsInstanceId::try_new(TOPIC_A).unwrap(),
+                uuid: reference,
                 partitions: 4,
                 retention: Retention {
                     max_age: Some(Duration::from_hours(hours)),
@@ -1013,7 +1110,8 @@ async fn a_mark_after_a_lost_record_cannot_be_cleared_by_an_earlier_read() {
 /// again, and then no call.
 #[tokio::test]
 async fn a_first_provisioning_that_loses_its_record_is_provisioned_again_once_the_configs_agree() {
-    let db = test_db().await;
+    let scratch = test_db().await;
+    let db = Arc::clone(scratch.db());
     load(
         &db,
         &[TOPIC_A],
@@ -1064,10 +1162,12 @@ async fn a_first_provisioning_that_loses_its_record_is_provisioned_again_once_th
     let &[(_, LogClaim { new: log, .. }), ..] = calls.as_slice() else {
         panic!("expected provision calls: {calls:?}")
     };
+    let reference = record_key(&one, TOPIC_A).await;
     let call = |hours: u64, replacing: Replacing| {
         (
             TopicSpec {
                 topic: GtsInstanceId::try_new(TOPIC_A).unwrap(),
+                uuid: reference,
                 partitions: 4,
                 retention: Retention {
                     max_age: Some(Duration::from_hours(hours)),
@@ -1103,7 +1203,8 @@ async fn a_first_provisioning_that_loses_its_record_is_provisioned_again_once_th
 /// then no call.
 #[tokio::test]
 async fn a_first_provisioning_left_pending_after_another_instance_recorded_is_provisioned_again() {
-    let db = test_db().await;
+    let scratch = test_db().await;
+    let db = Arc::clone(scratch.db());
     load(
         &db,
         &[TOPIC_A],
@@ -1154,10 +1255,12 @@ async fn a_first_provisioning_left_pending_after_another_instance_recorded_is_pr
     let &[(_, LogClaim { new: log, .. }), ..] = calls.as_slice() else {
         panic!("expected provision calls: {calls:?}")
     };
+    let reference = record_key(&one, TOPIC_A).await;
     let call = |hours: u64, replacing: Replacing| {
         (
             TopicSpec {
                 topic: GtsInstanceId::try_new(TOPIC_A).unwrap(),
+                uuid: reference,
                 partitions: 4,
                 retention: Retention {
                     max_age: Some(Duration::from_hours(hours)),
@@ -1193,7 +1296,8 @@ async fn a_first_provisioning_left_pending_after_another_instance_recorded_is_pr
 /// on the recorded retention, it is handed again, and then no call.
 #[tokio::test]
 async fn a_first_provisioning_failed_after_another_instance_recorded_is_provisioned_again() {
-    let db = test_db().await;
+    let scratch = test_db().await;
+    let db = Arc::clone(scratch.db());
     load(
         &db,
         &[TOPIC_A],
@@ -1244,10 +1348,12 @@ async fn a_first_provisioning_failed_after_another_instance_recorded_is_provisio
     let &[(_, LogClaim { new: log, .. }), ..] = calls.as_slice() else {
         panic!("expected provision calls: {calls:?}")
     };
+    let reference = record_key(&one, TOPIC_A).await;
     let call = |hours: u64, replacing: Replacing| {
         (
             TopicSpec {
                 topic: GtsInstanceId::try_new(TOPIC_A).unwrap(),
+                uuid: reference,
                 partitions: 4,
                 retention: Retention {
                     max_age: Some(Duration::from_hours(hours)),
@@ -1282,7 +1388,8 @@ async fn a_first_provisioning_failed_after_another_instance_recorded_is_provisio
 #[tracing_test::traced_test]
 #[tokio::test]
 async fn a_partition_mismatch_is_logged_on_every_pass() {
-    let db = loaded(&[TOPIC_A]).await;
+    let scratch = loaded(&[TOPIC_A]).await;
+    let db = Arc::clone(scratch.db());
     let backend = Arc::new(ScriptedBackend::answering(TOPIC_A, [Answer::Ready(2)]));
     let manager = instance(&db);
 
@@ -1296,11 +1403,13 @@ async fn a_partition_mismatch_is_logged_on_every_pass() {
     let &[(_, LogClaim { new: log, .. })] = calls.as_slice() else {
         panic!("expected one provision call: {calls:?}")
     };
+    let reference = record_key(&manager, TOPIC_A).await;
     assert_eq!(
         backend.calls(TOPIC_A),
         vec![(
             TopicSpec {
                 topic: GtsInstanceId::try_new(TOPIC_A).unwrap(),
+                uuid: reference,
                 partitions: 4,
                 retention: Retention {
                     max_age: Some(Duration::from_hours(24 * 7)),
@@ -1330,7 +1439,8 @@ async fn a_partition_mismatch_is_logged_on_every_pass() {
 /// new log id, claiming the old one, and completes.
 #[tokio::test]
 async fn an_abandoned_attempt_is_replaced_under_a_new_log_id() {
-    let db = loaded(&[TOPIC_A]).await;
+    let scratch = loaded(&[TOPIC_A]).await;
+    let db = Arc::clone(scratch.db());
     let backend = Arc::new(ScriptedBackend::answering(
         TOPIC_A,
         [Answer::Hang, Answer::Ready(4)],
@@ -1391,7 +1501,8 @@ async fn an_abandoned_attempt_is_replaced_under_a_new_log_id() {
 /// until it answers `Ready`.
 #[tokio::test]
 async fn pending_is_retried_under_the_same_log_id() {
-    let db = loaded(&[TOPIC_A]).await;
+    let scratch = loaded(&[TOPIC_A]).await;
+    let db = Arc::clone(scratch.db());
     let backend = Arc::new(ScriptedBackend::answering(
         TOPIC_A,
         [Answer::Pending, Answer::Ready(4)],
@@ -1437,7 +1548,8 @@ async fn pending_is_retried_under_the_same_log_id() {
 /// the topic stays provisioning under the same log id, pass after pass.
 #[tokio::test]
 async fn a_log_conflict_keeps_the_attempt_and_its_log_id() {
-    let db = loaded(&[TOPIC_A]).await;
+    let scratch = loaded(&[TOPIC_A]).await;
+    let db = Arc::clone(scratch.db());
     let backend = Arc::new(ScriptedBackend::answering(TOPIC_A, [Answer::Conflict]));
     let manager = instance(&db);
 
@@ -1475,7 +1587,8 @@ async fn a_log_conflict_keeps_the_attempt_and_its_log_id() {
 /// from being provisioned in the same pass.
 #[tokio::test]
 async fn a_hanging_topic_does_not_hold_up_another() {
-    let db = loaded(&[TOPIC_A, TOPIC_B]).await;
+    let scratch = loaded(&[TOPIC_A, TOPIC_B]).await;
+    let db = Arc::clone(scratch.db());
     let backend = Arc::new(ScriptedBackend::answering(TOPIC_A, [Answer::Hang]));
     backend.also(TOPIC_B, [Answer::Ready(4)]);
     let manager = instance(&db);
@@ -1522,7 +1635,8 @@ async fn a_hanging_topic_does_not_hold_up_another() {
 /// says: a topic configured with 4 but held with 2 resolves with 2.
 #[tokio::test]
 async fn the_backends_partition_count_is_in_force() {
-    let db = loaded(&[TOPIC_A]).await;
+    let scratch = loaded(&[TOPIC_A]).await;
+    let db = Arc::clone(scratch.db());
     let backend = Arc::new(ScriptedBackend::answering(TOPIC_A, [Answer::Ready(2)]));
     let manager = instance(&db);
 
@@ -1546,7 +1660,8 @@ async fn the_backends_partition_count_is_in_force() {
 /// configured count would be wrong for a topic its backend holds with another.
 #[tokio::test]
 async fn a_binding_read_failure_is_an_error_not_the_configured_count() {
-    let (db, dsn) = test_db_with_dsn().await;
+    let scratch = test_db().await;
+    let (db, dsn) = (Arc::clone(scratch.db()), scratch.dsn().to_owned());
     load(&db, &[TOPIC_A], json!({ "partitions": 4 })).await;
     let backend = Arc::new(ScriptedBackend::answering(TOPIC_A, [Answer::Ready(2)]));
     let manager = instance(&db);
@@ -1575,7 +1690,8 @@ async fn a_binding_read_failure_is_an_error_not_the_configured_count() {
 /// A topic with no record has no state: registered, nothing attempted.
 #[tokio::test]
 async fn a_topic_never_attempted_has_no_state() {
-    let db = loaded(&[TOPIC_A]).await;
+    let scratch = loaded(&[TOPIC_A]).await;
+    let db = Arc::clone(scratch.db());
     assert_eq!(state(&instance(&db), TOPIC_A).await, None);
 }
 
@@ -1583,7 +1699,8 @@ async fn a_topic_never_attempted_has_no_state() {
 /// holds, not the configured one - the recorded count stays in force.
 #[tokio::test]
 async fn a_re_provision_hands_the_recorded_partition_count() {
-    let db = test_db().await;
+    let scratch = test_db().await;
+    let db = Arc::clone(scratch.db());
     load(
         &db,
         &[TOPIC_A],
@@ -1611,12 +1728,14 @@ async fn a_re_provision_hands_the_recorded_partition_count() {
         panic!("expected two provision calls: {calls:?}")
     };
     let topic = GtsInstanceId::try_new(TOPIC_A).unwrap();
+    let reference = record_key(&manager, TOPIC_A).await;
     assert_eq!(
         backend.calls(TOPIC_A),
         vec![
             (
                 TopicSpec {
                     topic: topic.clone(),
+                    uuid: reference,
                     partitions: 4,
                     retention: Retention {
                         max_age: Some(Duration::from_hours(24)),
@@ -1631,6 +1750,7 @@ async fn a_re_provision_hands_the_recorded_partition_count() {
             (
                 TopicSpec {
                     topic,
+                    uuid: reference,
                     partitions: 2,
                     retention: Retention {
                         max_age: Some(Duration::from_hours(48)),
@@ -1654,7 +1774,8 @@ async fn a_re_provision_hands_the_recorded_partition_count() {
 /// for a topic it already holds: the re-provision carries the recorded count.
 #[tokio::test]
 async fn a_re_provision_hands_the_recorded_partition_count_over_an_out_of_range_one() {
-    let db = test_db().await;
+    let scratch = test_db().await;
+    let db = Arc::clone(scratch.db());
     load(
         &db,
         &[TOPIC_A],
@@ -1682,12 +1803,14 @@ async fn a_re_provision_hands_the_recorded_partition_count_over_an_out_of_range_
         panic!("expected two provision calls: {calls:?}")
     };
     let topic = GtsInstanceId::try_new(TOPIC_A).unwrap();
+    let reference = record_key(&manager, TOPIC_A).await;
     assert_eq!(
         backend.calls(TOPIC_A),
         vec![
             (
                 TopicSpec {
                     topic: topic.clone(),
+                    uuid: reference,
                     partitions: 4,
                     retention: Retention {
                         max_age: Some(Duration::from_hours(24)),
@@ -1702,6 +1825,7 @@ async fn a_re_provision_hands_the_recorded_partition_count_over_an_out_of_range_
             (
                 TopicSpec {
                     topic,
+                    uuid: reference,
                     partitions: 2,
                     retention: Retention {
                         max_age: Some(Duration::from_hours(48)),
@@ -1726,7 +1850,8 @@ async fn a_re_provision_hands_the_recorded_partition_count_over_an_out_of_range_
 /// and makes no call.
 #[tokio::test]
 async fn an_unrepresentable_retention_is_recorded_saturated() {
-    let db = test_db().await;
+    let scratch = test_db().await;
+    let db = Arc::clone(scratch.db());
     load(
         &db,
         &[TOPIC_A],
@@ -1750,11 +1875,13 @@ async fn an_unrepresentable_retention_is_recorded_saturated() {
     let &[(_, LogClaim { new: log, .. })] = calls.as_slice() else {
         panic!("expected one provision call: {calls:?}")
     };
+    let reference = record_key(&manager, TOPIC_A).await;
     assert_eq!(
         calls,
         vec![(
             TopicSpec {
                 topic: GtsInstanceId::try_new(TOPIC_A).unwrap(),
+                uuid: reference,
                 partitions: 4,
                 retention: Retention {
                     max_age: Some(Duration::from_hours(300_000_000 * 8_766)),
@@ -1772,9 +1899,7 @@ async fn an_unrepresentable_retention_is_recorded_saturated() {
         Some(TopicState::Provisioned { log, partitions: 4 })
     );
     let row = manager
-        .binding(super::binding_key(
-            &GtsInstanceId::try_new(TOPIC_A).unwrap(),
-        ))
+        .binding(record_key(&manager, TOPIC_A).await)
         .await
         .expect("record reads")
         .expect("record exists");
@@ -1791,7 +1916,8 @@ async fn an_unrepresentable_retention_is_recorded_saturated() {
 #[tracing_test::traced_test]
 #[tokio::test]
 async fn a_log_conflict_on_re_provision_is_logged_as_an_error() {
-    let db = test_db().await;
+    let scratch = test_db().await;
+    let db = Arc::clone(scratch.db());
     load(
         &db,
         &[TOPIC_A],
@@ -1823,12 +1949,14 @@ async fn a_log_conflict_on_re_provision_is_logged_as_an_error() {
     };
     let log = first.1.new;
     let topic = GtsInstanceId::try_new(TOPIC_A).unwrap();
+    let reference = record_key(&manager, TOPIC_A).await;
     assert_eq!(
         [first.clone(), second.clone()],
         [
             (
                 TopicSpec {
                     topic: topic.clone(),
+                    uuid: reference,
                     partitions: 4,
                     retention: Retention {
                         max_age: Some(Duration::from_hours(24)),
@@ -1843,6 +1971,7 @@ async fn a_log_conflict_on_re_provision_is_logged_as_an_error() {
             (
                 TopicSpec {
                     topic: topic.clone(),
+                    uuid: reference,
                     partitions: 4,
                     retention: Retention {
                         max_age: Some(Duration::from_hours(48)),
@@ -1862,7 +1991,7 @@ async fn a_log_conflict_on_re_provision_is_logged_as_an_error() {
     );
     assert_eq!(
         manager
-            .binding(super::binding_key(&topic))
+            .binding(record_key(&manager, TOPIC_A).await)
             .await
             .expect("record reads")
             .map(|row| (row.retention_max_age_ms, row.retention_max_bytes)),
@@ -1904,7 +2033,8 @@ async fn a_log_conflict_on_re_provision_is_logged_as_an_error() {
 #[tracing_test::traced_test]
 #[tokio::test]
 async fn a_re_provision_never_creates_the_log_on_a_newly_routed_backend() {
-    let db = test_db().await;
+    let scratch = test_db().await;
+    let db = Arc::clone(scratch.db());
     load(
         &db,
         &[TOPIC_A],
@@ -1948,7 +2078,7 @@ async fn a_re_provision_never_creates_the_log_on_a_newly_routed_backend() {
         Some(TopicState::Provisioned { log, partitions: 4 })
     );
     let recorded = |row: topic_binding::Model| (row.retention_max_age_ms, row.retention_max_bytes);
-    let key = super::binding_key(&topic);
+    let key = record_key(&manager, TOPIC_A).await;
     assert_eq!(
         manager
             .binding(key)
@@ -1992,4 +2122,126 @@ async fn a_re_provision_never_creates_the_log_on_a_newly_routed_backend() {
             ))
         }
     });
+}
+
+/// A topic's binding record is keyed by the Registry Reference the registry
+/// hands out for the topic, not by a UUID derived from its identifier: the
+/// double gives `TOPIC_A` a reference no derivation yields.
+#[tokio::test]
+async fn a_topics_binding_is_keyed_by_its_registry_reference() {
+    let scratch = test_db().await;
+    let db = Arc::clone(scratch.db());
+    let client: Arc<dyn PlatformTypesRegistryApi> = Arc::new(ReferencingRegistry {
+        inner: registry_holding(&documents(&[TOPIC_A]), &[]),
+    });
+    load_with(&db, &client, json!({ "partitions": 4 })).await;
+    let manager = instance(&db);
+    let backend = Arc::new(ScriptedBackend::answering(TOPIC_A, [Answer::Ready(4)]));
+
+    manager
+        .provision_topics(&resolver(&backend), limits(LONG))
+        .await;
+
+    let rows = topic_binding::Entity::find()
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .all(&db.conn().expect("a connection"))
+        .await
+        .expect("the records read");
+    let [row] = rows.as_slice() else {
+        panic!("expected one binding record: {rows:?}")
+    };
+    assert_eq!(
+        (row.topic_uuid, row.topic_id.as_str(), row.partitions),
+        (REFERENCE, TOPIC_A, Some(4))
+    );
+    let topic = manager
+        .get_topic(&GtsInstanceId::try_new(TOPIC_A).unwrap())
+        .await
+        .expect("the topic reads")
+        .expect("the topic is loaded");
+    assert_eq!(topic.uuid, REFERENCE);
+    let claims = backend.claims(TOPIC_A);
+    let &[LogClaim { new: log, .. }] = claims.as_slice() else {
+        panic!("expected one provision call: {claims:?}")
+    };
+    assert_eq!(
+        manager.topic_state(&topic).await.expect("state reads"),
+        Some(TopicState::Provisioned { log, partitions: 4 })
+    );
+}
+
+/// Every spec the gear hands the backend carries the Registry Reference the
+/// registry hands out for the topic, on the first provision and on a
+/// re-provision after a retention change: the double gives `TOPIC_A` a
+/// reference no derivation yields.
+#[tokio::test]
+async fn a_topics_spec_carries_its_registry_reference_on_every_provision() {
+    let scratch = test_db().await;
+    let db = Arc::clone(scratch.db());
+    let client: Arc<dyn PlatformTypesRegistryApi> = Arc::new(ReferencingRegistry {
+        inner: registry_holding(&documents(&[TOPIC_A]), &[]),
+    });
+    load_with(
+        &db,
+        &client,
+        json!({ "partitions": 4, "retention": { "duration": "1d" } }),
+    )
+    .await;
+    let backend = Arc::new(ScriptedBackend::answering(TOPIC_A, [Answer::Ready(4)]));
+    let manager = instance(&db);
+    manager
+        .provision_topics(&resolver(&backend), limits(LONG))
+        .await;
+
+    load_with(
+        &db,
+        &client,
+        json!({ "partitions": 4, "retention": { "duration": "2d", "size_bytes": 4096 } }),
+    )
+    .await;
+    manager
+        .provision_topics(&resolver(&backend), limits(LONG))
+        .await;
+
+    let calls = backend.calls(TOPIC_A);
+    let &[(_, LogClaim { new: log, .. }), _] = calls.as_slice() else {
+        panic!("expected two provision calls: {calls:?}")
+    };
+    let topic = GtsInstanceId::try_new(TOPIC_A).unwrap();
+    assert_eq!(
+        calls,
+        vec![
+            (
+                TopicSpec {
+                    topic: topic.clone(),
+                    uuid: REFERENCE,
+                    partitions: 4,
+                    retention: Retention {
+                        max_age: Some(Duration::from_hours(24)),
+                        max_bytes: None,
+                    },
+                },
+                LogClaim {
+                    replacing: Replacing::Nothing,
+                    new: log
+                },
+            ),
+            (
+                TopicSpec {
+                    topic,
+                    uuid: REFERENCE,
+                    partitions: 4,
+                    retention: Retention {
+                        max_age: Some(Duration::from_hours(48)),
+                        max_bytes: Some(4096),
+                    },
+                },
+                LogClaim {
+                    replacing: Replacing::Held,
+                    new: log
+                },
+            ),
+        ]
+    );
 }

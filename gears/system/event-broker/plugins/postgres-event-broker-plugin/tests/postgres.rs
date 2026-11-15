@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use event_broker_sdk::backend::support::partition_for;
 use event_broker_sdk::backend::{
     AppendRequest, Appended, Backend, BackendError, BuildContext, Fence, FenceKey, FenceSeq, Flush,
@@ -40,25 +41,21 @@ fn topic() -> GtsInstanceId {
     .unwrap()
 }
 
-fn topic_uuid(topic: &GtsInstanceId) -> String {
-    event_broker_sdk::backend::support::topic_uuid(topic)
-        .simple()
-        .to_string()
-}
-
 fn keyed(n: u64) -> KeyedEvent {
     KeyedEvent {
         key: "k".to_owned(),
         event: Event {
             id: Uuid::new_v4(),
-            type_id: GtsTypeId::new("gts.cf.core.events.event.v1~cf.pgtest.x.happened.v1~"),
-            tenant_id: Uuid::from_u128(1),
+            event_type: GtsTypeId::new("gts.cf.core.events.event.v1~cf.pgtest.x.happened.v1~"),
+            subject_tenant: Uuid::from_u128(1),
             source: "pgtest".to_owned(),
             subject: format!("s-{n}"),
             subject_type: GtsTypeId::new("gts.cf.pgtest.x.thing.v1~"),
+            subject_owner: None,
             occurred_at: chrono::Utc::now(),
             trace_parent: None,
             data: Some(serde_json::json!({ "n": n })),
+            ingest: None,
             partition: None,
             sequence: None,
             sequence_time: None,
@@ -67,16 +64,20 @@ fn keyed(n: u64) -> KeyedEvent {
     }
 }
 
+/// Provisions `topic` under a fresh Registry Reference and returns it, the
+/// key of every row and table of the topic.
 async fn provision(
     backend: &dyn Backend,
     topic: &GtsInstanceId,
     partitions: u32,
     retention: Retention,
-) {
+) -> Uuid {
+    let reference = Uuid::new_v4();
     backend
         .provision(
             &TopicSpec {
                 topic: topic.clone(),
+                uuid: reference,
                 partitions,
                 retention,
             },
@@ -87,6 +88,7 @@ async fn provision(
         )
         .await
         .expect("provision");
+    reference
 }
 
 async fn append(
@@ -216,9 +218,9 @@ async fn provision_creates_parents_and_first_segments() {
     )
     .await;
     let topic = topic();
-    provision(backend.as_ref(), &topic, 2, KEEP).await;
+    let reference = provision(backend.as_ref(), &topic, 2, KEEP).await;
 
-    let t = topic_uuid(&topic);
+    let t = reference.simple().to_string();
     let pool = control(&server.url).await;
     assert_eq!(
         relations(&pool, &schema, &format!("evbk__{t}")).await,
@@ -276,6 +278,7 @@ async fn too_many_partitions_is_refused() {
         .provision(
             &TopicSpec {
                 topic: topic(),
+                uuid: Uuid::from_u128(0x7091),
                 partitions: 10_000,
                 retention: KEEP,
             },
@@ -307,6 +310,7 @@ async fn a_re_provision_does_not_wait_for_an_open_append() {
     let topic = topic();
     let spec = TopicSpec {
         topic: topic.clone(),
+        uuid: Uuid::from_u128(0x7091),
         partitions: 1,
         retention: KEEP,
     };
@@ -324,7 +328,7 @@ async fn a_re_provision_does_not_wait_for_an_open_append() {
     let mut open_append = pool.begin().await.unwrap();
     sqlx::query(AssertSqlSafe(format!(
         "LOCK TABLE {schema}.evbk__{}_p0 IN ROW EXCLUSIVE MODE",
-        topic_uuid(&topic)
+        spec.uuid.simple()
     )))
     .execute(&mut *open_append)
     .await
@@ -340,6 +344,243 @@ async fn a_re_provision_does_not_wait_for_an_open_append() {
         "{again:?}"
     );
     assert!(waited < Duration::from_secs(2), "waited {waited:?}");
+}
+
+/// `(topic_uuid, topic_id, log_id, partitions, max_age in seconds, max_bytes,
+/// provisioned_at)` of an `evbk__log` row.
+type LogRow = (
+    Uuid,
+    String,
+    Uuid,
+    i32,
+    Option<f64>,
+    Option<i64>,
+    DateTime<Utc>,
+);
+
+/// Every `evbk__log` row of `schema`, by `topic_uuid`.
+async fn log_rows(pool: &PgPool, schema: &str) -> Vec<LogRow> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT topic_uuid, topic_id, log_id, partitions, EXTRACT(EPOCH FROM max_age)::float8, max_bytes, \
+         provisioned_at FROM {schema}.evbk__log ORDER BY topic_uuid"
+    )))
+    .fetch_all(pool)
+    .await
+    .expect("log rows")
+}
+
+/// `(topic_uuid, partition, table_name)` of every `evbk__partition` row of
+/// `schema`, in order.
+async fn partition_keys(pool: &PgPool, schema: &str) -> Vec<(Uuid, i32, String)> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT topic_uuid, partition, table_name FROM {schema}.evbk__partition \
+         ORDER BY topic_uuid, partition"
+    )))
+    .fetch_all(pool)
+    .await
+    .expect("partition rows")
+}
+
+/// The server's `now()`, the clock `provision` stamps `provisioned_at` with.
+async fn server_now(pool: &PgPool) -> DateTime<Utc> {
+    sqlx::query_scalar("SELECT now()")
+        .fetch_one(pool)
+        .await
+        .expect("server time")
+}
+
+/// A topic's rows are keyed by the Registry Reference its spec carries, and
+/// an instance that did not provision it finds it by its GTS id. The
+/// reference is a version-0 UUID, which no derivation from the id yields.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_topic_is_stored_and_found_under_its_registry_reference() {
+    let server = common::server("a-topic-is-stored-under-its-registry-reference").await;
+    let schema = common::fresh_schema();
+    let first = common::backend(&server.url, &schema, serde_json::json!({})).await;
+    let pool = control(&server.url).await;
+    let reference = Uuid::from_u128(0x5ee1);
+    let spec = TopicSpec {
+        topic: topic(),
+        uuid: reference,
+        partitions: 1,
+        retention: KEEP,
+    };
+    let log = LogId::new_v4();
+    let before = server_now(&pool).await;
+    let provisioned = first
+        .provision(
+            &spec,
+            &LogClaim {
+                replacing: Replacing::Nothing,
+                new: log,
+            },
+        )
+        .await;
+    let after = server_now(&pool).await;
+    assert_eq!(
+        format!("{provisioned:?}"),
+        format!(
+            "{:?}",
+            Ok::<_, BackendError>(Provisioning::Ready { partitions: 1 })
+        )
+    );
+
+    let logs = log_rows(&pool, &schema).await;
+    let [(.., provisioned_at)] = logs.as_slice() else {
+        panic!("expected one evbk__log row: {logs:?}")
+    };
+    assert!(
+        (before..=after).contains(provisioned_at),
+        "provisioned_at {provisioned_at} outside [{before}, {after}]"
+    );
+    assert_eq!(
+        logs,
+        vec![(
+            reference,
+            spec.topic.to_string(),
+            log.uuid(),
+            1,
+            Some(86_400.0),
+            None,
+            *provisioned_at
+        )]
+    );
+    assert_eq!(
+        partition_keys(&pool, &schema).await,
+        vec![(
+            reference,
+            0,
+            "evbk__00000000000000000000000000005ee1_p0".to_owned()
+        )]
+    );
+    first.stop(CancellationToken::new()).await;
+    drop(first);
+
+    let second = common::backend(&server.url, &schema, serde_json::json!({})).await;
+    let at = TopicPartition::new(spec.topic.clone(), Partition::new(0));
+    let appended = append(
+        second.as_ref(),
+        &spec.topic,
+        FenceKey::new(0x5ee1),
+        1,
+        &[keyed(1)],
+    )
+    .await;
+
+    assert_eq!(
+        format!("{appended:?}"),
+        format!(
+            "{:?}",
+            Ok::<_, BackendError>(Appended::Heads(vec![Head {
+                at: at.clone(),
+                sequence: Sequence::assigned(1),
+            }]))
+        )
+    );
+    assert_eq!(
+        read_all(second.as_ref(), &at).await,
+        vec![(1, "s-1".to_owned())]
+    );
+    second.stop(CancellationToken::new()).await;
+}
+
+/// A topic holds one Registry Reference: a provision that names a
+/// provisioned topic under another one breaks the registry's stable mapping.
+/// The unique `topic_id` keeps its row out, and the call is refused with
+/// nothing written.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_reference_for_a_provisioned_topic_is_refused() {
+    let server = common::server("a-second-reference-is-refused").await;
+    let schema = common::fresh_schema();
+    let backend = common::backend(&server.url, &schema, serde_json::json!({})).await;
+    let pool = control(&server.url).await;
+    let reference = Uuid::from_u128(0x5ee1);
+    let spec = TopicSpec {
+        topic: topic(),
+        uuid: reference,
+        partitions: 2,
+        retention: KEEP,
+    };
+    let log = LogId::new_v4();
+    let before = server_now(&pool).await;
+    backend
+        .provision(
+            &spec,
+            &LogClaim {
+                replacing: Replacing::Nothing,
+                new: log,
+            },
+        )
+        .await
+        .unwrap();
+    let after = server_now(&pool).await;
+
+    let second = backend
+        .provision(
+            &TopicSpec {
+                uuid: Uuid::from_u128(0x5ee2),
+                ..spec.clone()
+            },
+            &LogClaim {
+                replacing: Replacing::Nothing,
+                new: LogId::new_v4(),
+            },
+        )
+        .await;
+
+    assert_eq!(
+        format!("{second:?}"),
+        r#"Err(Internal("provision: evbk__log holds no row after the insert"))"#
+    );
+    let logs = log_rows(&pool, &schema).await;
+    let [(.., provisioned_at)] = logs.as_slice() else {
+        panic!("expected one evbk__log row: {logs:?}")
+    };
+    assert!(
+        (before..=after).contains(provisioned_at),
+        "provisioned_at {provisioned_at} outside [{before}, {after}]"
+    );
+    assert_eq!(
+        logs,
+        vec![(
+            reference,
+            spec.topic.to_string(),
+            log.uuid(),
+            2,
+            Some(86_400.0),
+            None,
+            *provisioned_at
+        )]
+    );
+    assert_eq!(
+        partition_keys(&pool, &schema).await,
+        vec![
+            (
+                reference,
+                0,
+                "evbk__00000000000000000000000000005ee1_p0".to_owned()
+            ),
+            (
+                reference,
+                1,
+                "evbk__00000000000000000000000000005ee1_p1".to_owned()
+            ),
+        ]
+    );
+    assert_eq!(
+        relations(&pool, &schema, "evbk__00000000000000000000000000005ee2").await,
+        Vec::<String>::new()
+    );
+    let other: (i64, i64) = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT (SELECT count(*) FROM {schema}.evbk__retention WHERE topic_uuid = $1), \
+         (SELECT count(*) FROM {schema}.evbk__segment WHERE topic_uuid = $1)"
+    )))
+    .bind(Uuid::from_u128(0x5ee2))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(other, (0, 0));
+    backend.stop(CancellationToken::new()).await;
 }
 
 /// Deadlocks the server has detected in the current database so far.
@@ -448,6 +689,7 @@ async fn provision_append_and_maintenance_together_never_deadlock() {
     let topic = topic();
     let spec = TopicSpec {
         topic: topic.clone(),
+        uuid: Uuid::from_u128(0x7091),
         partitions: 4,
         retention: KEEP,
     };
@@ -757,7 +999,7 @@ async fn a_head_committed_by_an_append_whose_caller_went_away_is_still_notified(
     )
     .await;
     let topic = topic();
-    provision(writer.as_ref(), &topic, 1, KEEP).await;
+    let reference = provision(writer.as_ref(), &topic, 1, KEEP).await;
     let at = TopicPartition::new(topic.clone(), Partition::new(0));
     let mut heads = match watcher.watch() {
         event_broker_sdk::backend::Watch::Native(watch) => watch.watch(std::slice::from_ref(&at)),
@@ -773,7 +1015,7 @@ async fn a_head_committed_by_an_append_whose_caller_went_away_is_still_notified(
 
     // The append is driven until its commit is visible, then dropped.
     let pool = control(&server.url).await;
-    let t = topic_uuid(&topic);
+    let t = reference.simple().to_string();
     let committed = async {
         loop {
             let hwm: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
@@ -823,9 +1065,9 @@ async fn resolve_at_starts_past_sealed_segments() {
     let schema = common::fresh_schema();
     let backend = common::backend(&server.url, &schema, quick()).await;
     let topic = topic();
-    provision(backend.as_ref(), &topic, 1, KEEP).await;
+    let reference = provision(backend.as_ref(), &topic, 1, KEEP).await;
     let pool = control(&server.url).await;
-    let t = topic_uuid(&topic);
+    let t = reference.simple().to_string();
     let parent = format!("evbk__{t}_p0");
 
     let indexes: Vec<String> = sqlx::query_scalar(
@@ -913,7 +1155,7 @@ async fn segments_are_kept_ahead_of_appends() {
     )
     .await;
     let topic = topic();
-    provision(backend.as_ref(), &topic, 1, KEEP).await;
+    let reference = provision(backend.as_ref(), &topic, 1, KEEP).await;
     let pool = control(&server.url).await;
     await_segment_rows(&pool, &schema, 2).await;
 
@@ -937,7 +1179,7 @@ async fn segments_are_kept_ahead_of_appends() {
     .await
     .unwrap();
     // Full segments are sealed meanwhile.
-    let t = topic_uuid(&topic);
+    let t = reference.simple().to_string();
     settles(
         partition_rows(
             &t,
@@ -980,7 +1222,7 @@ async fn an_append_with_no_segment_recovers() {
     )
     .await;
     let topic = topic();
-    provision(backend.as_ref(), &topic, 1, KEEP).await;
+    let reference = provision(backend.as_ref(), &topic, 1, KEEP).await;
     append(
         backend.as_ref(),
         &topic,
@@ -991,7 +1233,7 @@ async fn an_append_with_no_segment_recovers() {
     .await
     .unwrap();
     let pool = control(&server.url).await;
-    let t = topic_uuid(&topic);
+    let t = reference.simple().to_string();
     // Settled: room made and both full segments sealed, so no count is due
     // once the room is back.
     settles(
@@ -1221,9 +1463,9 @@ async fn the_sealer_seals_full_segments_with_their_table_size() {
     let schema = common::fresh_schema();
     let backend = common::backend(&server.url, &schema, quick()).await;
     let topic = topic();
-    provision(backend.as_ref(), &topic, 1, KEEP).await;
+    let reference = provision(backend.as_ref(), &topic, 1, KEEP).await;
     let pool = control(&server.url).await;
-    let t = topic_uuid(&topic);
+    let t = reference.simple().to_string();
 
     let steps: [(u64, u64, &[Staged]); 3] = [
         (
@@ -1297,9 +1539,9 @@ async fn a_segment_missing_events_is_still_sealed() {
     )
     .await;
     let topic = topic();
-    provision(backend.as_ref(), &topic, 1, KEEP).await;
+    let reference = provision(backend.as_ref(), &topic, 1, KEEP).await;
     let pool = control(&server.url).await;
-    let t = topic_uuid(&topic);
+    let t = reference.simple().to_string();
     append(
         backend.as_ref(),
         &topic,
@@ -1342,7 +1584,7 @@ async fn retention_by_age_expires_whole_sealed_segments() {
     let schema = common::fresh_schema();
     let backend = common::backend(&server.url, &schema, quick()).await;
     let topic = topic();
-    provision(
+    let reference = provision(
         backend.as_ref(),
         &topic,
         1,
@@ -1373,7 +1615,7 @@ async fn retention_by_age_expires_whole_sealed_segments() {
     )
     .await
     .unwrap();
-    let t = topic_uuid(&topic);
+    let t = reference.simple().to_string();
 
     settles(1000, || floor_of(&pool, &schema, &t)).await;
     let ranges = [(1001, 1501), (1501, 2001), (2001, 2501)];
@@ -1409,7 +1651,7 @@ async fn retention_by_bytes_never_goes_under_the_bound_and_yields_to_a_holder() 
     let schema = common::fresh_schema();
     let backend = common::backend(&server.url, &schema, quick()).await;
     let topic = topic();
-    provision(
+    let reference = provision(
         backend.as_ref(),
         &topic,
         1,
@@ -1420,7 +1662,7 @@ async fn retention_by_bytes_never_goes_under_the_bound_and_yields_to_a_holder() 
     )
     .await;
     let pool = control(&server.url).await;
-    let t = topic_uuid(&topic);
+    let t = reference.simple().to_string();
 
     // Another instance's detacher, holding the partition: expired segments
     // stay attached until it lets go.
@@ -1524,9 +1766,9 @@ async fn a_pending_detach_is_finalized() {
     let schema = common::fresh_schema();
     let backend = common::backend(&server.url, &schema, quick()).await;
     let topic = topic();
-    provision(backend.as_ref(), &topic, 1, KEEP).await;
+    let reference = provision(backend.as_ref(), &topic, 1, KEEP).await;
     let pool = control(&server.url).await;
-    let t = topic_uuid(&topic);
+    let t = reference.simple().to_string();
     let parent = format!("{schema}.evbk__{t}_p0");
     let first = format!("{schema}.evbk__{t}_p0_s{:016x}", 1);
 
@@ -1583,9 +1825,9 @@ async fn a_detaching_row_with_no_table_is_deleted() {
     let schema = common::fresh_schema();
     let backend = common::backend(&server.url, &schema, quick()).await;
     let topic = topic();
-    provision(backend.as_ref(), &topic, 1, KEEP).await;
+    let reference = provision(backend.as_ref(), &topic, 1, KEEP).await;
     let pool = control(&server.url).await;
-    let t = topic_uuid(&topic);
+    let t = reference.simple().to_string();
     sqlx::raw_sql(AssertSqlSafe(format!(
         "BEGIN; \
          DROP TABLE {schema}.evbk__{t}_p0_s{:016x}; \
@@ -1615,14 +1857,16 @@ async fn the_cross_check_repairs_drift_and_reports_lost_events() {
     let schema = common::fresh_schema();
     let backend = common::backend(&server.url, &schema, quick()).await;
     let [unbuilt, unrecorded, leftover, lost] = [topic(), topic(), topic(), topic()];
+    let mut references = Vec::new();
     for topic in [&unbuilt, &unrecorded, &leftover, &lost] {
-        provision(backend.as_ref(), topic, 1, KEEP).await;
+        let reference = provision(backend.as_ref(), topic, 1, KEEP).await;
+        references.push(reference.simple().to_string());
     }
     append(backend.as_ref(), &lost, FenceKey::new(61), 1, &batch(0, 10))
         .await
         .unwrap();
     let pool = control(&server.url).await;
-    let [a, b, c, d] = [&unbuilt, &unrecorded, &leftover, &lost].map(topic_uuid);
+    let [a, b, c, d]: [String; 4] = references.try_into().unwrap();
     let segment = |t: &str, first: i64| format!("{schema}.evbk__{t}_p0_s{first:016x}");
     sqlx::raw_sql(AssertSqlSafe(format!(
         "DROP TABLE {}; \
@@ -1695,9 +1939,9 @@ async fn a_detach_cut_off_by_its_timeout_finishes_and_releases_its_lock() {
     let schema = common::fresh_schema();
     let backend = common::backend(&server.url, &schema, quick()).await;
     let topic = topic();
-    provision(backend.as_ref(), &topic, 1, KEEP).await;
+    let reference = provision(backend.as_ref(), &topic, 1, KEEP).await;
     let pool = control(&server.url).await;
-    let t = topic_uuid(&topic);
+    let t = reference.simple().to_string();
     let first = format!("{schema}.evbk__{t}_p0_s{:016x}", 1);
 
     let mut reader = pool.begin().await.unwrap();
@@ -1750,9 +1994,9 @@ async fn a_name_collision_is_adopted_at_once() {
     )
     .await;
     let topic = topic();
-    provision(backend.as_ref(), &topic, 1, KEEP).await;
+    let reference = provision(backend.as_ref(), &topic, 1, KEEP).await;
     let pool = control(&server.url).await;
-    let t = topic_uuid(&topic);
+    let t = reference.simple().to_string();
     let parent = format!("{schema}.evbk__{t}_p0");
     sqlx::raw_sql(AssertSqlSafe(format!(
         "CREATE TABLE {parent}_s{first:016x} (LIKE {parent} INCLUDING ALL); \

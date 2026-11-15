@@ -1,7 +1,7 @@
 {
   "$id": "gts://gts.cf.core.events.event.v1~",
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "description": "Event schema. Single canonical resource shape used by both publish input (POST /v1/events, POST /v1/events:batch) and read responses (poll / query). Per-direction semantics are encoded via JSON Schema field-level markers: `writeOnly` fields (meta) are accepted on publish and stripped on read; `readOnly` fields (partition, sequence, sequence_time) are server-stamped on read and rejected with 400 BadRequest if supplied on publish. The top-level `required` list is the union of publish-required and read-required fields; strict-validator producers must filter `readOnly` fields before submission.",
+  "description": "Event schema. Single canonical resource shape used by both publish input (POST /v1/events, POST /v1/events:batch) and read responses (the `payload` of each `event` frame of GET /v1/events:stream and GET /v1/events:sse). Per-direction semantics are encoded via JSON Schema field-level markers: `writeOnly` fields (meta) are accepted on publish and stripped on read; `readOnly` fields (partition, sequence, sequence_time) are server-stamped on read and rejected with 400 InvalidBody if supplied on publish. The top-level `required` list is the union of publish-required and read-required fields; strict-validator producers must filter `readOnly` fields before submission.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -15,8 +15,8 @@
       "type": "string",
       "x-gts-type-ref": "/$id"
     },
-    "tenant_id": {
-      "description": "Tenant the event belongs to. Producer-supplied. Ingest validates the producer's principal is authorized to publish to this tenant via the platform's authz resolver; unauthorized publishes are rejected with 403 TenantIdNotAuthorized.",
+    "subject_tenant": {
+      "description": "The tenant of the subject the event is about. Producer-supplied. A nil UUID is refused with 400 InvalidTenant; the publishing principal must reach this tenant, and to reach it across a self-managed tenant must also hold produce_ignore_barrier on the event type; otherwise the publish is refused with 403 TenantIdNotAuthorized.",
       "type": "string",
       "format": "uuid"
     },
@@ -37,6 +37,14 @@
       "description": "Full GTS subject-type identifier - the type of the entity the event is about. Required and NOT derivable from `type`: event types may be generic (e.g., `rule_applied`) across multiple subject kinds, and events may have no `data` body to introspect. ASCII only.",
       "type": "string",
       "x-gts-type-ref": "gts.*"
+    },
+    "subject_owner": {
+      "description": "The platform principal of the subject's tenant that owns the event, or null for a tenant-wide event. Producer-supplied and optional: an explicit null is the same as an absent member, and a nil UUID is refused with 400 InvalidSubjectOwner. An event type whose partition key is `/subject_owner` must narrow it to a required UUID string.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
     },
     "occurred_at": {
       "description": "When the event occurred (producer-stamped). ISO 8601 / RFC 3339 timestamp.",
@@ -59,39 +67,39 @@
       ]
     },
     "partition": {
-      "description": "Server-stamped partition for the event, surfaced on read. Computed at ingest via the partition contract. Producers MUST NOT supply this field on publish; doing so is rejected with 400 BadRequest.",
+      "description": "Server-stamped partition for the event, surfaced on read. Assigned by the storage backend from the key the event type's `partition_key` trait resolves to. Producers MUST NOT supply this field on publish; doing so is rejected with 400 InvalidBody.",
       "type": "integer",
       "format": "int32",
       "minimum": 0,
       "readOnly": true
     },
     "sequence": {
-      "description": "Server-assigned monotonic ordering key per (topic, partition), surfaced on read. The only sequence consumers paginate by. Distinct from `meta.sequence` (publish-only producer-side chain field). Producers MUST NOT supply this field on publish; doing so is rejected with 400 BadRequest.",
+      "description": "Server-assigned monotonic ordering key per (topic, partition), surfaced on read. Consumer offsets (an exact SEEK position and a committed cursor) are values of it. Distinct from `meta.sequence` (publish-only producer-side chain field). Producers MUST NOT supply this field on publish; doing so is rejected with 400 InvalidBody.",
       "type": "integer",
       "format": "int64",
       "minimum": 0,
       "readOnly": true
     },
     "sequence_time": {
-      "description": "Server-stamped timestamp recording when `sequence` was assigned. Surfaced on read. Producers MUST NOT supply this field on publish; doing so is rejected with 400 BadRequest.",
+      "description": "Server-stamped timestamp recording when `sequence` was assigned. Surfaced on read. Producers MUST NOT supply this field on publish; doing so is rejected with 400 InvalidBody.",
       "type": "string",
       "format": "date-time",
       "readOnly": true
     },
     "meta": {
-      "description": "Optional publish-time transport-metadata block. Carries producer-protocol fields (producer_id, previous, sequence) for chained / monotonic modes. Omit entirely for stateless publish. Stripped on read responses; consumers MUST NOT rely on it.",
+      "description": "Optional publish-time transport-metadata block. Carries producer-protocol fields (producer, previous, sequence) for chained / monotonic modes. Omit entirely for stateless publish. Stripped on read responses; consumers MUST NOT rely on it.",
       "type": [
         "object",
         "null"
       ],
       "properties": {
         "version": {
-          "description": "Meta-block schema version. The broker accepts version <= current_supported and rejects newer with 400 UnknownMetaVersion.",
+          "description": "Meta-block schema version. The broker supports version 1 and rejects a higher one with `400 UnknownMetaVersion`; it does not enforce the minimum declared here, so a lower value is accepted.",
           "type": "integer",
           "format": "uint32",
           "minimum": 1
         },
-        "producer_id": {
+        "producer": {
           "description": "Producer registered via POST /v1/producers; bound to the calling principal. Required for chained / monotonic mode publishes. Omit for stateless.",
           "type": [
             "string",
@@ -101,7 +109,7 @@
           "default": null
         },
         "previous": {
-          "description": "Predecessor's sequence for chain dedup. Required and only valid in chained mode. On the first chained-mode publish for a (producer_id, topic), set to 0.",
+          "description": "Predecessor's sequence for chain dedup. Required and only valid in chained mode. On the first chained-mode publish for a (producer, topic), set to 0.",
           "type": [
             "integer",
             "null"
@@ -111,7 +119,7 @@
           "default": null
         },
         "sequence": {
-          "description": "Producer-assigned monotonic sequence per (producer_id, topic). Required in chained and monotonic modes; omitted in stateless.",
+          "description": "Producer-assigned monotonic sequence per (producer, topic). Required in chained and monotonic modes; omitted in stateless.",
           "type": [
             "integer",
             "null"
@@ -132,10 +140,11 @@
   "required": [
     "id",
     "type",
-    "tenant_id",
+    "subject_tenant",
     "source",
     "subject",
     "subject_type",
+    "subject_owner",
     "occurred_at",
     "partition",
     "sequence",
@@ -162,7 +171,7 @@
         "description": "JSON Pointer naming the member of an event whose value determines its partition. May point into `data`, which a bare field name could not express. Defaults to the event's tenant, so a type declaring nothing partitions per tenant. The broker checks at registration that the pointer names a member this type's resolved schema declares.",
         "type": "string",
         "format": "json-pointer",
-        "default": "/tenant_id"
+        "default": "/subject_tenant"
       }
     },
     "additionalProperties": false,

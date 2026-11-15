@@ -119,12 +119,12 @@ async fn concurrent_resubmission_stores_once(engine: Engine) {
         &json!({
             "id": "0190f1a2-0000-7000-8000-000000000d01",
             "type": EVENT_TYPE,
-            "tenant_id": "0190f1a2-0000-7000-a000-000000000d01",
+            "subject_tenant": "0190f1a2-0000-7000-a000-000000000d01",
             "source": "chain-test",
             "subject": "order-1",
             "subject_type": SUBJECT_TYPE,
             "occurred_at": "2026-10-01T12:00:00Z",
-            "meta": { "version": 1, "producer_id": producer_id, "previous": 0, "sequence": 1 },
+            "meta": { "version": 1, "producer": producer_id, "previous": 0, "sequence": 1 },
         }),
         COPIES,
     )
@@ -148,12 +148,12 @@ async fn concurrent_resubmission_stores_once(engine: Engine) {
         &json!({
             "id": "0190f1a2-0000-7000-8000-000000000d02",
             "type": EVENT_TYPE,
-            "tenant_id": "0190f1a2-0000-7000-a000-000000000d01",
+            "subject_tenant": "0190f1a2-0000-7000-a000-000000000d01",
             "source": "chain-test",
             "subject": "order-1",
             "subject_type": SUBJECT_TYPE,
             "occurred_at": "2026-10-01T12:00:01Z",
-            "meta": { "version": 1, "producer_id": producer_id, "previous": 1, "sequence": 2 },
+            "meta": { "version": 1, "producer": producer_id, "previous": 1, "sequence": 2 },
         }),
         COPIES,
     )
@@ -181,7 +181,7 @@ async fn concurrent_resubmission_stores_once(engine: Engine) {
     assert_eq!(
         cursors.json(),
         json!({
-            "producer_id": producer_id,
+            "id": producer_id,
             "client_agent": "chain-test",
             "topics": [{ "topic": TOPIC, "last_sequence": 2 }],
         })
@@ -214,12 +214,12 @@ async fn chained_head_never_moves_backwards(engine: Engine) {
             &json!({
                 "id": id,
                 "type": EVENT_TYPE,
-                "tenant_id": "0190f1a2-0000-7000-a000-000000000e01",
+                "subject_tenant": "0190f1a2-0000-7000-a000-000000000e01",
                 "source": "chain-test",
                 "subject": "order-1",
                 "subject_type": SUBJECT_TYPE,
                 "occurred_at": "2026-10-01T12:00:00Z",
-                "meta": { "version": 1, "producer_id": producer_id, "previous": n, "sequence": n + 1 },
+                "meta": { "version": 1, "producer": producer_id, "previous": n, "sequence": n + 1 },
             }),
             2,
         )
@@ -240,7 +240,7 @@ async fn chained_head_never_moves_backwards(engine: Engine) {
         assert_eq!(
             cursors.json(),
             json!({
-                "producer_id": producer_id,
+                "id": producer_id,
                 "client_agent": "chain-test",
                 "topics": [{ "topic": TOPIC, "last_sequence": n + 1 }],
             }),
@@ -316,12 +316,12 @@ async fn held_original_loses_to_its_copy_and_answers_duplicate(engine: Engine) {
         &json!({
             "id": "0190f1a2-0000-7000-8000-000000000f01",
             "type": EVENT_TYPE,
-            "tenant_id": "0190f1a2-0000-7000-a000-000000000f01",
+            "subject_tenant": "0190f1a2-0000-7000-a000-000000000f01",
             "source": "chain-test",
             "subject": "order-1",
             "subject_type": SUBJECT_TYPE,
             "occurred_at": "2026-10-01T12:00:00Z",
-            "meta": { "version": 1, "producer_id": producer_id, "previous": 0, "sequence": 1 },
+            "meta": { "version": 1, "producer": producer_id, "previous": 0, "sequence": 1 },
         }),
     )
     .await;
@@ -333,12 +333,12 @@ async fn held_original_loses_to_its_copy_and_answers_duplicate(engine: Engine) {
         &json!({
             "id": "0190f1a2-0000-7000-8000-000000000f02",
             "type": EVENT_TYPE,
-            "tenant_id": "0190f1a2-0000-7000-a000-000000000f01",
+            "subject_tenant": "0190f1a2-0000-7000-a000-000000000f01",
             "source": "chain-test",
             "subject": "order-1",
             "subject_type": SUBJECT_TYPE,
             "occurred_at": "2026-10-01T12:00:01Z",
-            "meta": { "version": 1, "producer_id": producer_id, "previous": 1, "sequence": 2 },
+            "meta": { "version": 1, "producer": producer_id, "previous": 1, "sequence": 2 },
         }),
     )
     .await;
@@ -353,7 +353,7 @@ async fn held_original_loses_to_its_copy_and_answers_duplicate(engine: Engine) {
     assert_eq!(
         cursors.json(),
         json!({
-            "producer_id": producer_id,
+            "id": producer_id,
             "client_agent": "chain-test",
             "topics": [{ "topic": TOPIC, "last_sequence": 2 }],
         })
@@ -403,22 +403,22 @@ async fn opposite_order_batches_each_store_once(engine: Engine) {
         let p1 = json!({
             "id": p_id,
             "type": EVENT_TYPE,
-            "tenant_id": "0190f1a2-0000-7000-a000-000000001001",
+            "subject_tenant": "0190f1a2-0000-7000-a000-000000001001",
             "source": "chain-test",
             "subject": "order-p",
             "subject_type": SUBJECT_TYPE,
             "occurred_at": "2026-10-01T12:00:00Z",
-            "meta": { "version": 1, "producer_id": p, "previous": 0, "sequence": 1 },
+            "meta": { "version": 1, "producer": p, "previous": 0, "sequence": 1 },
         });
         let q1 = json!({
             "id": q_id,
             "type": EVENT_TYPE,
-            "tenant_id": "0190f1a2-0000-7000-a000-000000001001",
+            "subject_tenant": "0190f1a2-0000-7000-a000-000000001001",
             "source": "chain-test",
             "subject": "order-q",
             "subject_type": SUBJECT_TYPE,
             "occurred_at": "2026-10-01T12:00:00Z",
-            "meta": { "version": 1, "producer_id": q, "previous": 0, "sequence": 1 },
+            "meta": { "version": 1, "producer": q, "previous": 0, "sequence": 1 },
         });
         let forward = {
             let harness = Arc::clone(&harness);
@@ -450,7 +450,7 @@ async fn opposite_order_batches_each_store_once(engine: Engine) {
             assert_eq!(
                 cursors.json(),
                 json!({
-                    "producer_id": producer_id,
+                    "id": producer_id,
                     "client_agent": "chain-test",
                     "topics": [{ "topic": TOPIC, "last_sequence": 1 }],
                 }),
@@ -492,12 +492,12 @@ async fn an_original_that_read_an_absent_head_retries_after_its_copy_commits(eng
         &json!({
             "id": "0190f1a2-0000-7000-8000-000000001301",
             "type": EVENT_TYPE,
-            "tenant_id": "0190f1a2-0000-7000-a000-000000001101",
+            "subject_tenant": "0190f1a2-0000-7000-a000-000000001101",
             "source": "chain-test",
             "subject": "order-1",
             "subject_type": SUBJECT_TYPE,
             "occurred_at": "2026-10-01T12:00:00Z",
-            "meta": { "version": 1, "producer_id": producer_id, "previous": 0, "sequence": 1 },
+            "meta": { "version": 1, "producer": producer_id, "previous": 0, "sequence": 1 },
         }),
     )
     .await;
@@ -512,7 +512,7 @@ async fn an_original_that_read_an_absent_head_retries_after_its_copy_commits(eng
     assert_eq!(
         cursors.json(),
         json!({
-            "producer_id": producer_id,
+            "id": producer_id,
             "client_agent": "chain-test",
             "topics": [{ "topic": TOPIC, "last_sequence": 1 }],
         })
@@ -547,22 +547,22 @@ async fn opposite_order_batches_over_existing_heads_store_once(engine: Engine) {
             {
                 "id": "0190f1a2-0000-7000-8000-000000001401",
                 "type": EVENT_TYPE,
-                "tenant_id": "0190f1a2-0000-7000-a000-000000001101",
+                "subject_tenant": "0190f1a2-0000-7000-a000-000000001101",
                 "source": "chain-test",
                 "subject": "order-p",
                 "subject_type": SUBJECT_TYPE,
                 "occurred_at": "2026-10-01T12:00:00Z",
-                "meta": { "version": 1, "producer_id": p, "previous": 0, "sequence": 1 },
+                "meta": { "version": 1, "producer": p, "previous": 0, "sequence": 1 },
             },
             {
                 "id": "0190f1a2-0000-7000-8000-000000001402",
                 "type": EVENT_TYPE,
-                "tenant_id": "0190f1a2-0000-7000-a000-000000001101",
+                "subject_tenant": "0190f1a2-0000-7000-a000-000000001101",
                 "source": "chain-test",
                 "subject": "order-q",
                 "subject_type": SUBJECT_TYPE,
                 "occurred_at": "2026-10-01T12:00:00Z",
-                "meta": { "version": 1, "producer_id": q, "previous": 0, "sequence": 1 },
+                "meta": { "version": 1, "producer": q, "previous": 0, "sequence": 1 },
             },
         ] }),
     )
@@ -572,22 +572,22 @@ async fn opposite_order_batches_over_existing_heads_store_once(engine: Engine) {
     let p2 = json!({
         "id": "0190f1a2-0000-7000-8000-000000001403",
         "type": EVENT_TYPE,
-        "tenant_id": "0190f1a2-0000-7000-a000-000000001101",
+        "subject_tenant": "0190f1a2-0000-7000-a000-000000001101",
         "source": "chain-test",
         "subject": "order-p",
         "subject_type": SUBJECT_TYPE,
         "occurred_at": "2026-10-01T12:00:01Z",
-        "meta": { "version": 1, "producer_id": p, "previous": 1, "sequence": 2 },
+        "meta": { "version": 1, "producer": p, "previous": 1, "sequence": 2 },
     });
     let q2 = json!({
         "id": "0190f1a2-0000-7000-8000-000000001404",
         "type": EVENT_TYPE,
-        "tenant_id": "0190f1a2-0000-7000-a000-000000001101",
+        "subject_tenant": "0190f1a2-0000-7000-a000-000000001101",
         "source": "chain-test",
         "subject": "order-q",
         "subject_type": SUBJECT_TYPE,
         "occurred_at": "2026-10-01T12:00:01Z",
-        "meta": { "version": 1, "producer_id": q, "previous": 1, "sequence": 2 },
+        "meta": { "version": 1, "producer": q, "previous": 1, "sequence": 2 },
     });
     let forward = {
         let harness = Arc::clone(&harness);
@@ -611,7 +611,7 @@ async fn opposite_order_batches_over_existing_heads_store_once(engine: Engine) {
     assert_eq!(
         p_cursors.json(),
         json!({
-            "producer_id": p,
+            "id": p,
             "client_agent": "chain-test",
             "topics": [{ "topic": TOPIC, "last_sequence": 2 }],
         })
@@ -621,7 +621,7 @@ async fn opposite_order_batches_over_existing_heads_store_once(engine: Engine) {
     assert_eq!(
         q_cursors.json(),
         json!({
-            "producer_id": q,
+            "id": q,
             "client_agent": "chain-test",
             "topics": [{ "topic": TOPIC, "last_sequence": 2 }],
         })
@@ -663,7 +663,7 @@ async fn publish_sentinel(harness: &EventBrokerHarness, id: &str) {
         .with_body(Json(&json!({
             "id": id,
             "type": EVENT_TYPE,
-            "tenant_id": "0190f1a2-0000-7000-a000-000000001101",
+            "subject_tenant": "0190f1a2-0000-7000-a000-000000001101",
             "source": "chain-test",
             "subject": "order-sentinel",
             "subject_type": SUBJECT_TYPE,
@@ -692,22 +692,22 @@ async fn a_rejected_batch_stores_nothing(engine: Engine) {
                 {
                     "id": "0190f1a2-0000-7000-8000-000000001101",
                     "type": EVENT_TYPE,
-                    "tenant_id": "0190f1a2-0000-7000-a000-000000001101",
+                    "subject_tenant": "0190f1a2-0000-7000-a000-000000001101",
                     "source": "chain-test",
                     "subject": "order-1",
                     "subject_type": SUBJECT_TYPE,
                     "occurred_at": "2026-10-01T12:00:00Z",
-                    "meta": { "version": 1, "producer_id": producer_id, "previous": 0, "sequence": 1 },
+                    "meta": { "version": 1, "producer": producer_id, "previous": 0, "sequence": 1 },
                 },
                 {
                     "id": "0190f1a2-0000-7000-8000-000000001102",
                     "type": EVENT_TYPE,
-                    "tenant_id": "0190f1a2-0000-7000-a000-000000001101",
+                    "subject_tenant": "0190f1a2-0000-7000-a000-000000001101",
                     "source": "chain-test",
                     "subject": "order-1",
                     "subject_type": SUBJECT_TYPE,
                     "occurred_at": "2026-10-01T12:00:01Z",
-                    "meta": { "version": 1, "producer_id": producer_id, "previous": 2, "sequence": 3 },
+                    "meta": { "version": 1, "producer": producer_id, "previous": 2, "sequence": 3 },
                 },
             ],
         })))
@@ -741,7 +741,7 @@ async fn a_rejected_batch_stores_nothing(engine: Engine) {
     cursors.assert_status(200);
     assert_eq!(
         cursors.json(),
-        json!({ "producer_id": producer_id, "client_agent": "chain-test", "topics": [] })
+        json!({ "id": producer_id, "client_agent": "chain-test", "topics": [] })
     );
     publish_sentinel(&harness, "0190f1a2-0000-7000-8000-0000000011ff").await;
     assert_eq!(
@@ -768,12 +768,12 @@ async fn a_stale_second_run_refuses_the_whole_batch(engine: Engine) {
         .with_body(Json(&json!({
             "id": "0190f1a2-0000-7000-8000-000000001200",
             "type": EVENT_TYPE,
-            "tenant_id": "0190f1a2-0000-7000-a000-000000001101",
+            "subject_tenant": "0190f1a2-0000-7000-a000-000000001101",
             "source": "chain-test",
             "subject": "order-q",
             "subject_type": SUBJECT_TYPE,
             "occurred_at": "2026-10-01T12:00:00Z",
-            "meta": { "version": 1, "producer_id": q, "previous": 0, "sequence": 1 },
+            "meta": { "version": 1, "producer": q, "previous": 0, "sequence": 1 },
         })))
         .send()
         .await;
@@ -787,22 +787,22 @@ async fn a_stale_second_run_refuses_the_whole_batch(engine: Engine) {
                 {
                     "id": "0190f1a2-0000-7000-8000-000000001201",
                     "type": EVENT_TYPE,
-                    "tenant_id": "0190f1a2-0000-7000-a000-000000001101",
+                    "subject_tenant": "0190f1a2-0000-7000-a000-000000001101",
                     "source": "chain-test",
                     "subject": "order-p",
                     "subject_type": SUBJECT_TYPE,
                     "occurred_at": "2026-10-01T12:00:01Z",
-                    "meta": { "version": 1, "producer_id": p, "previous": 0, "sequence": 1 },
+                    "meta": { "version": 1, "producer": p, "previous": 0, "sequence": 1 },
                 },
                 {
                     "id": "0190f1a2-0000-7000-8000-000000001202",
                     "type": EVENT_TYPE,
-                    "tenant_id": "0190f1a2-0000-7000-a000-000000001101",
+                    "subject_tenant": "0190f1a2-0000-7000-a000-000000001101",
                     "source": "chain-test",
                     "subject": "order-q",
                     "subject_type": SUBJECT_TYPE,
                     "occurred_at": "2026-10-01T12:00:02Z",
-                    "meta": { "version": 1, "producer_id": q, "previous": 5, "sequence": 6 },
+                    "meta": { "version": 1, "producer": q, "previous": 5, "sequence": 6 },
                 },
             ],
         })))
@@ -824,7 +824,7 @@ async fn a_stale_second_run_refuses_the_whole_batch(engine: Engine) {
                 "violations": [{
                     "type": "sequence_mismatch",
                     "subject": "(producer)",
-                    "description": format!("index=1 producer_id={q} topic={TOPIC} last_sequence=1"),
+                    "description": format!("index=1 producer={q} topic={TOPIC} last_sequence=1"),
                 }],
             },
         })
@@ -833,14 +833,14 @@ async fn a_stale_second_run_refuses_the_whole_batch(engine: Engine) {
     p_cursors.assert_status(200);
     assert_eq!(
         p_cursors.json(),
-        json!({ "producer_id": p, "client_agent": "chain-test", "topics": [] })
+        json!({ "id": p, "client_agent": "chain-test", "topics": [] })
     );
     let q_cursors = harness.api_v1().get_producer_cursors(&q).send().await;
     q_cursors.assert_status(200);
     assert_eq!(
         q_cursors.json(),
         json!({
-            "producer_id": q,
+            "id": q,
             "client_agent": "chain-test",
             "topics": [{ "topic": TOPIC, "last_sequence": 1 }],
         })
@@ -869,12 +869,12 @@ async fn a_different_id_resend_at_the_head_is_stored_once(engine: Engine) {
         json!({
             "id": id,
             "type": EVENT_TYPE,
-            "tenant_id": "0190f1a2-0000-7000-a000-000000001101",
+            "subject_tenant": "0190f1a2-0000-7000-a000-000000001101",
             "source": "chain-test",
             "subject": "order-1",
             "subject_type": SUBJECT_TYPE,
             "occurred_at": "2026-10-01T12:00:00Z",
-            "meta": { "version": 1, "producer_id": producer_id, "previous": 0, "sequence": 1 },
+            "meta": { "version": 1, "producer": producer_id, "previous": 0, "sequence": 1 },
         })
     };
 
@@ -908,7 +908,7 @@ async fn a_different_id_resend_at_the_head_is_stored_once(engine: Engine) {
     assert_eq!(
         cursors.json(),
         json!({
-            "producer_id": producer_id,
+            "id": producer_id,
             "client_agent": "chain-test",
             "topics": [{ "topic": TOPIC, "last_sequence": 1 }],
         })

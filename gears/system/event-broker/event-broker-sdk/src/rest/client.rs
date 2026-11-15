@@ -10,8 +10,8 @@ use toolkit_http::{HttpClient, HttpClientBuilder, HttpResponse, RequestBuilder};
 use toolkit_security::SecurityContext;
 
 use crate::api::{
-    Ack, EventBrokerApi, IngestOutcome, JoinRequest, ProducerCursors, ProducerMode, SeekPosition,
-    SeekResult, SubscriptionAssignment, TenantTraversalDepth,
+    Ack, EventBrokerApi, IngestOutcome, InterestTenant, JoinRequest, ProducerCursors, ProducerMode,
+    SeekPosition, SeekResult, SubscriptionAssignment,
 };
 use crate::error::EventBrokerError;
 use crate::gts::EventV1;
@@ -422,20 +422,22 @@ impl RestBroker {
 
 /// Builds one interest wire body from a public [`SubscriptionInterest`].
 fn interest_to_wire(interest: &crate::api::SubscriptionInterest) -> wire::InterestWire {
-    let max_depth = match interest.tenant_depth() {
-        TenantTraversalDepth::CurrentTenant => wire::MaxDepthWire::Levels(0),
-        TenantTraversalDepth::Descendants(n) => {
-            wire::MaxDepthWire::Levels(i32::try_from(n.get()).unwrap_or(i32::MAX))
-        }
-        TenantTraversalDepth::UnlimitedDescendants => wire::MaxDepthWire::Unlimited,
+    let named_tenant = match interest.subject_tenant() {
+        InterestTenant::Caller => None,
+        InterestTenant::Tenant(tenant) => Some(tenant),
     };
     wire::InterestWire {
         topic: interest.topic().clone(),
-        tenant_id: interest.tenant_id(),
-        max_depth,
+        subject_tenant: named_tenant,
+        ownership_filter: interest.ownership_filter().into(),
         barrier_mode: interest.barrier_mode().into(),
         types: interest
             .types()
+            .iter()
+            .map(|p| p.pattern().to_owned())
+            .collect(),
+        subject_types: interest
+            .subject_types()
             .iter()
             .map(|p| p.pattern().to_owned())
             .collect(),
@@ -460,8 +462,8 @@ fn consumer_group_id_from_wire(gts: &str) -> Result<ConsumerGroupId, EventBroker
 fn consumer_group_from_wire(w: wire::ConsumerGroupWire) -> Result<ConsumerGroup, EventBrokerError> {
     Ok(ConsumerGroup {
         id: consumer_group_id_from_wire(&w.id)?,
-        tenant_id: w.tenant_id,
-        owner_principal_id: w.owner_principal_id,
+        tenant: w.tenant,
+        owner_principal: w.owner_principal,
         kind: w.kind.into(),
         description: w.description,
         created_at: w.created_at,
@@ -501,22 +503,53 @@ fn subscription_from_wire(w: wire::SubscriptionWire) -> Result<Subscription, Eve
     })
 }
 
-/// Builds one public [`SubscriptionInterest`] from its wire echo. `max_depth`
-/// carries the tri-state: `null` is unlimited, `0` current-tenant, `n`
-/// descendants.
+/// The JOIN `201` body -> the assignment. Only the interests that report
+/// entries are kept, each by its position in the response's interests.
+impl TryFrom<wire::JoinSubscriptionResponseWire> for SubscriptionAssignment {
+    type Error = EventBrokerError;
+
+    fn try_from(w: wire::JoinSubscriptionResponseWire) -> Result<Self, Self::Error> {
+        let unmatched_types = w
+            .interests
+            .into_iter()
+            .enumerate()
+            .filter(|(_, interest)| !interest.unmatched_types.is_empty())
+            .map(|(interest, echo)| {
+                let types = echo
+                    .unmatched_types
+                    .iter()
+                    .map(|s| {
+                        gts::GtsIdPattern::try_new(s).map_err(|err| {
+                            EventBrokerError::Transport(format!(
+                                "subscription interest carried an invalid unmatched type: {err}"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, EventBrokerError>>()?;
+                Ok(crate::api::UnmatchedTypes { interest, types })
+            })
+            .collect::<Result<Vec<_>, EventBrokerError>>()?;
+        Ok(SubscriptionAssignment {
+            id: SubscriptionId(w.id),
+            topology_version: w.topology_version,
+            assigned: w
+                .assigned
+                .into_iter()
+                .map(|a| crate::api::AssignedPartition {
+                    topic: a.topic,
+                    partition: u32::try_from(a.partition).unwrap_or_default(),
+                })
+                .collect(),
+            unmatched_types,
+        })
+    }
+}
+
+/// Builds one public [`SubscriptionInterest`] from its wire echo, whose
+/// `subject_tenant` the broker has resolved.
 fn interest_from_wire(
     w: wire::InterestResponseWire,
 ) -> Result<crate::api::SubscriptionInterest, EventBrokerError> {
-    let depth = match w.max_depth {
-        None => TenantTraversalDepth::UnlimitedDescendants,
-        Some(levels) => match u32::try_from(levels)
-            .ok()
-            .and_then(std::num::NonZeroU32::new)
-        {
-            Some(nonzero) => TenantTraversalDepth::descendants(nonzero),
-            None => TenantTraversalDepth::CurrentTenant,
-        },
-    };
     let barrier_mode = match w.barrier_mode.as_str() {
         "ignore" => crate::api::BarrierMode::Ignore,
         _ => crate::api::BarrierMode::Respect,
@@ -532,12 +565,24 @@ fn interest_from_wire(
             })
         })
         .collect::<Result<Vec<_>, EventBrokerError>>()?;
+    let subject_types = w
+        .subject_types
+        .iter()
+        .map(|s| {
+            gts::GtsIdPattern::try_new(s).map_err(|err| {
+                EventBrokerError::Transport(format!(
+                    "subscription interest carried an invalid subject type pattern: {err}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, EventBrokerError>>()?;
     let mut builder = crate::api::SubscriptionInterest::builder()
         .topic(w.topic)
-        .tenant_id(w.tenant_id)
-        .tenant_depth(depth)
+        .subject_tenant(w.subject_tenant)
+        .ownership_filter(w.ownership_filter.into())
         .barrier_mode(barrier_mode)
-        .types(types);
+        .types(types)
+        .subject_types(subject_types);
     if let Some(filter) = w.filter {
         builder = builder.filter(crate::api::Filter::new(filter.engine, filter.expression)?);
     }
@@ -776,27 +821,18 @@ impl EventBrokerApi for RestBroker {
         req: JoinRequest,
     ) -> Result<SubscriptionAssignment, EventBrokerError> {
         let body = wire::JoinSubscriptionWire {
-            consumer_group: req.group.to_gts(),
+            consumer_group: req.consumer_group.to_gts(),
             client_agent: req.client_agent,
             interests: req.interests.iter().map(interest_to_wire).collect(),
-            session_timeout: req.session_timeout.map(|d| format!("PT{}S", d.as_secs())),
+            session_timeout: req
+                .session_timeout
+                .map(|d| toolkit_utils::iso8601_duration::Iso8601Duration::from(d).to_string()),
         };
         let url = self.url(&format!("{V1}/subscriptions"));
-        let resp: wire::SubscriptionWire = self
+        let resp: wire::JoinSubscriptionResponseWire = self
             .call_json(ctx, Method::Post, &url, Some(to_value(&body)?))
             .await?;
-        Ok(SubscriptionAssignment {
-            subscription_id: SubscriptionId(resp.id),
-            topology_version: resp.topology_version,
-            assigned: resp
-                .assigned
-                .into_iter()
-                .map(|a| crate::api::AssignedPartition {
-                    topic: a.topic,
-                    partition: u32::try_from(a.partition).unwrap_or_default(),
-                })
-                .collect(),
-        })
+        SubscriptionAssignment::try_from(resp)
     }
 
     async fn get_subscription(
@@ -911,7 +947,7 @@ impl EventBrokerApi for RestBroker {
             self.list_all(ctx, &format!("{V1}/event-types")).await?;
         let found = wires.into_iter().find(|w| w.id == id).ok_or_else(|| {
             EventBrokerError::EventTypeUnknown {
-                type_id: id.to_owned(),
+                event_type: id.to_owned(),
                 detail: "no such event type".to_owned(),
             }
         })?;

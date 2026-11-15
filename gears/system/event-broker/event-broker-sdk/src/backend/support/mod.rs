@@ -13,5 +13,5 @@ mod keys_tests;
 mod poll_tests;
 
 pub use heads::LocalHeads;
-pub use keys::{partition_for, topic_uuid};
+pub use keys::partition_for;
 pub use poll::poll_heads;

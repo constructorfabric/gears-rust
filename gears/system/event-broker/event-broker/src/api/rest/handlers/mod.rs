@@ -1,4 +1,5 @@
-//! REST handlers, grouped per `DESIGN.md:578-591`'s module tree
+//! REST handlers, grouped per the module tree of
+//! `DESIGN.md` "Module Structure"
 //! (`eb-rest-handlers`, all 19 endpoints), split into `ingest`/`delivery`
 //! submodules mirroring `domain::{ingest, delivery}`'s `IngestService`/
 //! `DeliveryService` split - every handler function calls exactly one of

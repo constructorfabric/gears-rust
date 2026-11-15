@@ -177,9 +177,9 @@ async fn insert(
     bodies: Vec<Vec<u8>>,
 ) -> Result<(), sqlx::Error> {
     let sequences: Vec<i64> = (first..).take(events.len()).collect();
-    let tenants: Vec<Uuid> = events.iter().map(|k| k.event.tenant_id).collect();
+    let tenants: Vec<Uuid> = events.iter().map(|k| k.event.subject_tenant).collect();
     sqlx::query(AssertSqlSafe(format!(
-        "INSERT INTO {table} (sequence, sequence_time, tenant_id, body) \
+        "INSERT INTO {table} (sequence, sequence_time, subject_tenant, body) \
          SELECT s, $2, tn, b FROM UNNEST($1::bigint[], $3::uuid[], $4::bytea[]) AS x(s, tn, b)"
     )))
     .bind(sequences)

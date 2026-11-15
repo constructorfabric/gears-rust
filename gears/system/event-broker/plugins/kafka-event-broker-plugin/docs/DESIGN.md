@@ -58,10 +58,10 @@ The role (`Ingest`, `Delivery`, `Standalone`) changes nothing: the plugin has no
 | One event-broker topic's log | `<prefix>.<topic uuid, 32 hex>` | `cleanup.policy=delete`, `message.timestamp.type=LogAppendTime`, `retention.ms`, `retention.bytes`, `segment.ms` (§6), `min.insync.replicas`; partitions and replication from the spec and settings |
 | Log records (§2.3) | `<prefix>.logs` | 1 partition, `cleanup.policy=compact` |
 | Fence records (§2.3) | `<prefix>.fences` | `fence_partitions` partitions, `cleanup.policy=compact` |
-| Provisioning lock of one topic | transactional id `<prefix>.log.<topic uuid>` | - |
+| Provisioning lock of one topic's reference | transactional id `<prefix>.log.<topic uuid>` | - |
 | One fence key's producer | transactional id `<prefix>.fence.<fence key, 32 hex>` | - |
 
-The topic uuid is `support::topic_uuid` of the GTS topic id. The plugin creates the logs and fences topics on an instance's first need (`TopicAlreadyExists` is success) and takes an existing one as it is. The plugin's consumers carry the group id `<prefix>.reader` but never join it, commit or store an offset: every read assigns its partition and offset itself.
+The topic uuid is `TopicSpec.uuid`, the topic's Registry Reference, at provisioning, and the log record's `uuid` on lookup. The plugin creates the logs and fences topics on an instance's first need (`TopicAlreadyExists` is success) and takes an existing one as it is. The plugin's consumers carry the group id `<prefix>.reader` but never join it, commit or store an offset: every read assigns its partition and offset itself.
 
 ### 2.2 Event Records
 
@@ -75,7 +75,7 @@ One event is one record in its partition (`support::partition_for` of the event'
 
 | Topic | Key | Value |
 |---|---|---|
-| logs | the topic uuid as 32 hex characters | JSON `{"v":1,"topic":<GTS id>,"log_id":<uuid>,"partitions":<n>}` |
+| logs | the topic's GTS id, as UTF-8 bytes | JSON `{"v":1,"topic":<GTS id>,"uuid":<uuid>,"log_id":<uuid>,"partitions":<n>}`; a value without `uuid` is not read |
 | fences | the fence key's 16 bytes, big-endian | 9 bytes: version `1`, then the last applied fence seq as a big-endian `i64` |
 
 A fence key's records all go to partition `key mod fence_partitions`, chosen by the plugin, not the client's partitioner. A value of another version is read as absent.
@@ -147,14 +147,14 @@ Every write is transactional, and each transaction leaves a commit (or abort) ma
 The attempt:
 
 1. Create the logs and fences topics if this instance has not yet.
-2. Open a producer with the topic's transactional id `<prefix>.log.<uuid>` (`init_transactions`): it fences every other provisioning of the topic until this call ends, so the compare-and-set below is one at a time per topic across processes.
-3. Catch up the logs topic (§3.3) and read the topic's record. If `LogClaim::check` refuses it, its error: `LogConflict` for a foreign log id, `NotProvisioned` for a `Held` claim with no record.
+2. Open a producer with the topic's transactional id `<prefix>.log.<uuid>` (`init_transactions`): it fences every other provisioning of the topic's reference until this call ends, so the compare-and-set below is one at a time per reference across processes. The registry hands out one reference per topic.
+3. Catch up the logs topic (§3.3) and read the topic's record. A record naming another reference than `TopicSpec.uuid` is refused first, before `LogClaim::check`, with `Internal` (`provision: the topic's log record names another reference`): nothing is created or written. If `LogClaim::check` refuses it, its error: `LogConflict` for a foreign log id, `NotProvisioned` for a `Held` claim with no record.
 4. Look the Kafka topic up in the cluster metadata.
    - Missing under a `Held` claim: `NotProvisioned`, and nothing is created - a `Held` claim never creates.
    - Missing otherwise: create it (`CreateTopics` with the §2.1 configuration; `TopicAlreadyExists` is success) and answer **`Pending`** without claiming the log: the topic is not provisioned until a later call finds it ready. The gear calls again with the same claim.
    - A partition without a leader: `Pending`.
 5. Bring the topic's configuration to the spec's if any owned setting differs (§6). `AlterConfigs` is the non-incremental one librdkafka's Rust binding offers, so it carries the whole owned set and resets any other topic setting to the broker default.
-6. Unless the stored record already says the same, write `{log id, partitions}` to the logs topic in a transaction of the producer from step 2, and commit. A producer fenced meanwhile by another provisioning cannot commit, so a lost race never overwrites the winner.
+6. Unless the stored record already says the same, write `{uuid, log id, partitions}` to the logs topic in a transaction of the producer from step 2, and commit. A producer fenced meanwhile by another provisioning cannot commit, so a lost race never overwrites the winner.
 7. `Ready { partitions }` with the count the Kafka topic holds, which an existing topic may make differ from the spec's. The plugin does not add partitions.
 
 An event-broker topic without a record is `NotProvisioned` for `append`, `read`, `resolve`, `query` and the watch, even when its Kafka topic exists. An instance remembers a provisioned topic forever (a topic is never removed); a topic it does not know costs a logs catch-up per call, one offsets request when nothing is new.
@@ -227,6 +227,7 @@ Both age by the broker's `LogAppendTime` - storage time - never by `occurred_at`
 | Any other broker or client error code | `AppendFailed` in `append`, `ReadFailed` in `read`, `resolve`, `query`, `Internal` in `provision` |
 | A client failure with no code (configuration, creation) | `Internal` |
 | No log record for the topic | `NotProvisioned` |
+| At provisioning, the topic's log record names another reference | `Internal`; nothing is created or written |
 | A partition index past the topic's count | `PartitionNotFound` |
 | A catch-up past `request_timeout_ms` | `Unavailable` |
 | Any call after `stop` | `Unavailable` |

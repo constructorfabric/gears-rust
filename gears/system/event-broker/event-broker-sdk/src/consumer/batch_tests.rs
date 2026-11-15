@@ -29,9 +29,9 @@ fn raw_event(offset: i64) -> EventV1 {
         serde_json::json!({ "offset": offset }),
     )
     .id(Uuid::from_u128(u128::try_from(offset).unwrap()))
-    .tenant_id(Uuid::nil())
+    .subject_tenant(Uuid::nil())
     .subject(format!("order-{offset}"))
-    .subject_type_id(gts::GtsTypeId::new("gts.x.eb.test.subject.v1~"))
+    .subject_type_of(gts::GtsTypeId::new("gts.x.eb.test.subject.v1~"))
     .occurred_at("2026-01-02T03:04:05Z".parse().unwrap())
     .build()
     .unwrap()

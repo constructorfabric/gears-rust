@@ -103,10 +103,11 @@ fn the_base_schema_keeps_source_and_the_stamped_members_required() {
         serde_json::json!([
             "id",
             "type",
-            "tenant_id",
+            "subject_tenant",
             "source",
             "subject",
             "subject_type",
+            "subject_owner",
             "occurred_at",
             "partition",
             "sequence",
@@ -125,7 +126,7 @@ fn the_base_schema_keeps_source_and_the_stamped_members_required() {
     assert_eq!(
         base["properties"]["partition"],
         serde_json::json!({
-            "description": "Server-stamped partition for the event, surfaced on read. Computed at ingest via the partition contract. Producers MUST NOT supply this field on publish; doing so is rejected with 400 BadRequest.",
+            "description": "Server-stamped partition for the event, surfaced on read. Assigned by the storage backend from the key the event type's `partition_key` trait resolves to. Producers MUST NOT supply this field on publish; doing so is rejected with 400 InvalidBody.",
             "type": "integer",
             "format": "int32",
             "minimum": 0,
@@ -135,7 +136,7 @@ fn the_base_schema_keeps_source_and_the_stamped_members_required() {
     assert_eq!(
         base["properties"]["sequence"],
         serde_json::json!({
-            "description": "Server-assigned monotonic ordering key per (topic, partition), surfaced on read. The only sequence consumers paginate by. Distinct from `meta.sequence` (publish-only producer-side chain field). Producers MUST NOT supply this field on publish; doing so is rejected with 400 BadRequest.",
+            "description": "Server-assigned monotonic ordering key per (topic, partition), surfaced on read. Consumer offsets (an exact SEEK position and a committed cursor) are values of it. Distinct from `meta.sequence` (publish-only producer-side chain field). Producers MUST NOT supply this field on publish; doing so is rejected with 400 InvalidBody.",
             "type": "integer",
             "format": "int64",
             "minimum": 0,
@@ -145,11 +146,26 @@ fn the_base_schema_keeps_source_and_the_stamped_members_required() {
     assert_eq!(
         base["properties"]["sequence_time"],
         serde_json::json!({
-            "description": "Server-stamped timestamp recording when `sequence` was assigned. Surfaced on read. Producers MUST NOT supply this field on publish; doing so is rejected with 400 BadRequest.",
+            "description": "Server-stamped timestamp recording when `sequence` was assigned. Surfaced on read. Producers MUST NOT supply this field on publish; doing so is rejected with 400 InvalidBody.",
             "type": "string",
             "format": "date-time",
             "readOnly": true,
         })
+    );
+}
+
+/// The base's top-level description names the code a publish carrying a
+/// `readOnly` member is refused with. Unlike the committed-file compares above,
+/// this runs in every test pass.
+#[test]
+fn the_base_schema_description_names_the_invalid_body_refusal() {
+    let base = emitted(&<EventV1>::gts_schema_with_refs_as_string());
+
+    assert_eq!(
+        base["description"],
+        serde_json::json!(
+            "Event schema. Single canonical resource shape used by both publish input (POST /v1/events, POST /v1/events:batch) and read responses (the `payload` of each `event` frame of GET /v1/events:stream and GET /v1/events:sse). Per-direction semantics are encoded via JSON Schema field-level markers: `writeOnly` fields (meta) are accepted on publish and stripped on read; `readOnly` fields (partition, sequence, sequence_time) are server-stamped on read and rejected with 400 InvalidBody if supplied on publish. The top-level `required` list is the union of publish-required and read-required fields; strict-validator producers must filter `readOnly` fields before submission."
+        )
     );
 }
 
@@ -214,11 +230,112 @@ fn subscribe_with_selector(selector: &str) -> Result<(), gts::StoreError> {
         "client_agent": "test/1.0",
         "interests": [{
             "topic": "gts.cf.core.events.topic.v1~fabrikam.shop._.orders.v1",
-            "tenant_id": "00000000-0000-0000-0000-000000000001",
+            "subject_tenant": "00000000-0000-0000-0000-000000000001",
             "types": [selector],
         }],
     });
     store.validate_payload_with(type_id, &subscription, gts::GtsRefValidation::None)
+}
+
+/// Validates a subscription whose single interest carries `subject_types` against
+/// the committed subscription schema, through `GtsStore` as above.
+fn subscribe_with_subject_types(subject_types: &[String]) -> Result<(), gts::StoreError> {
+    let type_id = "gts.cf.core.events.subscription.v1~";
+    let mut store = gts::GtsStore::new();
+    store.register_schema(
+        type_id,
+        &committed("gts.cf.core.events.subscription.v1~.schema.json"),
+    )?;
+    let subscription = serde_json::json!({
+        "consumer_group": "gts.cf.core.events.consumer_group.v1~fabrikam.shop.orders.billing.v1",
+        "client_agent": "test/1.0",
+        "interests": [{
+            "topic": "gts.cf.core.events.topic.v1~fabrikam.shop._.orders.v1",
+            "subject_tenant": "00000000-0000-0000-0000-000000000001",
+            "types": ["gts.cf.core.events.event.v1~fabrikam.shop.orders.*"],
+            "subject_types": subject_types,
+        }],
+    });
+    store.validate_payload_with(type_id, &subscription, gts::GtsRefValidation::None)
+}
+
+/// Validates a subscription whose single interest is `interest` against the
+/// committed subscription schema, through `GtsStore` as above.
+fn subscribe_with_interest(interest: serde_json::Value) -> Result<(), gts::StoreError> {
+    let type_id = "gts.cf.core.events.subscription.v1~";
+    let mut store = gts::GtsStore::new();
+    store.register_schema(
+        type_id,
+        &committed("gts.cf.core.events.subscription.v1~.schema.json"),
+    )?;
+    let subscription = serde_json::json!({
+        "consumer_group": "gts.cf.core.events.consumer_group.v1~fabrikam.shop.orders.billing.v1",
+        "client_agent": "test/1.0",
+        "interests": [interest],
+    });
+    store.validate_payload_with(type_id, &subscription, gts::GtsRefValidation::None)
+}
+
+#[test]
+fn subscription_schema_accepts_an_interest_without_a_tenant_and_each_ownership_filter() {
+    for ownership_filter in ["only_mine", "entire_tenant", "tenant_subtree_included"] {
+        subscribe_with_interest(serde_json::json!({
+            "topic": "gts.cf.core.events.topic.v1~fabrikam.shop._.orders.v1",
+            "ownership_filter": ownership_filter,
+            "types": ["gts.cf.core.events.event.v1~fabrikam.shop.orders.*"],
+        }))
+        .unwrap_or_else(|error| panic!("{ownership_filter} must be accepted: {error}"));
+    }
+}
+
+#[test]
+fn subscription_schema_refuses_max_depth_and_an_unknown_ownership_filter() {
+    for (label, extra) in [
+        ("max_depth", serde_json::json!({ "max_depth": 0 })),
+        (
+            "ownership_filter",
+            serde_json::json!({ "ownership_filter": "everyone" }),
+        ),
+    ] {
+        let mut interest = serde_json::json!({
+            "topic": "gts.cf.core.events.topic.v1~fabrikam.shop._.orders.v1",
+            "types": ["gts.cf.core.events.event.v1~fabrikam.shop.orders.*"],
+        });
+        if let (Some(interest), Some(extra)) = (interest.as_object_mut(), extra.as_object()) {
+            interest.extend(extra.clone());
+        }
+        assert!(
+            subscribe_with_interest(interest).is_err(),
+            "{label} must be refused"
+        );
+    }
+}
+
+#[test]
+fn subscription_schema_accepts_a_subject_type_selector() {
+    subscribe_with_subject_types(&["gts.fabrikam.shop.orders.customer.v1~".to_owned()])
+        .unwrap_or_else(|error| panic!("a subject type selector must be accepted: {error}"));
+}
+
+#[test]
+fn subscription_schema_refuses_33_subject_types() {
+    let selectors: Vec<String> = (0..33)
+        .map(|i| format!("gts.fabrikam.shop.orders.subject{i}.v1~"))
+        .collect();
+
+    let result = subscribe_with_subject_types(&selectors);
+
+    let Err(error) = result else {
+        panic!("33 subject types must be refused");
+    };
+    // The `maxItems` keyword's message, which quotes the array it refuses.
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "Validation failed: {} has more than 32 items",
+            serde_json::to_string(&selectors).unwrap()
+        )
+    );
 }
 
 #[test]
@@ -394,10 +511,11 @@ fn the_worked_example_is_admitted_and_holds_events_to_its_data() {
         serde_json::json!({
             "id": "01930000-0000-7000-8000-000000000001",
             "type": OrderPlacedV1::TYPE_ID,
-            "tenant_id": "01930000-0000-7000-8000-000000000002",
+            "subject_tenant": "01930000-0000-7000-8000-000000000002",
             "source": "orders-service",
             "subject": "order-1",
             "subject_type": "gts.fabrikam.shop.orders.order.v1~",
+            "subject_owner": null,
             "occurred_at": "2026-11-06T10:00:00Z",
             "data": data,
             "partition": 0,

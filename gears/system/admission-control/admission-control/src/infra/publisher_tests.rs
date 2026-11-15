@@ -217,7 +217,7 @@ fn broker_event_shape() {
     let event = to_broker_event(&queued).unwrap();
     assert_eq!(event.event_type(), &GtsTypeId::new(REFUSAL_EVENT_TYPE));
     assert_eq!(event.source(), Some(EVENT_SOURCE));
-    assert_eq!(event.tenant_id(), queued.envelope.tenant_id);
+    assert_eq!(event.subject_tenant(), queued.envelope.tenant_id);
     assert_eq!(event.subject(), queued.envelope.correlation_id.to_string());
     assert_eq!(
         event.subject_type(),

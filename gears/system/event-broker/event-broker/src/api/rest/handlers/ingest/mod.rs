@@ -1,5 +1,5 @@
-//! `IngestService`-backed REST handlers (`DESIGN.md:579-583`): publish,
-//! producers, topics, event-types catalog reads.
+//! `IngestService`-backed REST handlers (`DESIGN.md` "Module
+//! Structure"): publish, producers, topics, event-types catalog reads.
 
 pub mod dto;
 pub mod event_types;

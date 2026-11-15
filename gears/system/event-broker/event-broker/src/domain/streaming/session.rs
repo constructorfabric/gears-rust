@@ -16,10 +16,13 @@ use toolkit::domain_model;
 
 use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
+use tokio_util::sync::DropGuard;
 
 use crate::domain::consumer_group_coordinator::MembershipHandle;
+use crate::domain::consumer_group_coordinator::member_scope::{CachedScope, ScopeGeneration};
+use crate::domain::error::DomainError;
 use crate::domain::streaming::assignment::{AssignmentDelta, Generation};
-use crate::domain::streaming::filter::EventFilter;
+use crate::domain::streaming::filter::{EventFilter, Prepared};
 use crate::domain::streaming::frames::{CloseReason, ControlCode, Frame, Position};
 use crate::domain::streaming::heartbeat::HeartbeatSchedule;
 use crate::domain::streaming::lease::StreamLease;
@@ -89,6 +92,17 @@ pub struct StreamSession {
     /// can be classified against what it held rather than against the previous
     /// published value.
     current: Generation,
+    /// The member's consume scope, when the filter decides from one; see
+    /// [`SessionOpening::scope`].
+    scope: Option<ScopeFeed>,
+    /// The scope generation last handed to the filter; `None` until the
+    /// first pass hands it the member's current scope.
+    scope_seen: Option<ScopeGeneration>,
+    /// When the scope last read stops serving: its earliest group expiry.
+    /// The session ends the stream there on its own, so a scope whose
+    /// refresh worker died or fell behind never serves past its window.
+    /// `None` with no feed, or a scope with no group.
+    scope_expires_at: Option<Instant>,
     _membership: MembershipHandle,
     /// Released on drop, which is what makes at-most-one-stream a property of
     /// ownership rather than of a guard somebody has to run.
@@ -96,9 +110,32 @@ pub struct StreamSession {
 }
 
 impl StreamSession {
+    /// Opens a session and picks the assignment it classifies every later
+    /// one against.
+    ///
+    /// `opening.baseline` is the subscription as the stream open read it: the
+    /// read set was seeded from it, and the opening `topology` frame carries
+    /// its version. The member's watch is taken after that read, so a
+    /// rebalance in between may already sit in it. When the watch holds other
+    /// partitions than the baseline, the session classifies against the
+    /// baseline, so its first pass reports the move: a loss narrows the read
+    /// set with a `topology` frame, and a gain or the loss of every partition
+    /// ends the stream.
+    /// When it holds the same partitions, the session classifies against the
+    /// watch: the coordinator republishes a member only when its partitions
+    /// move, while every rebalance advances the version the subscription
+    /// carries, so the watch's version can trail the baseline's, and
+    /// classifying against the baseline would send a `topology` frame with
+    /// that older version.
     #[must_use]
     pub fn open(opening: SessionOpening) -> Self {
-        let current = opening.generations.borrow().clone();
+        let watched = opening.generations.borrow().clone();
+        let moved = !matches!(
+            AssignmentDelta::classify(&opening.baseline, &watched),
+            AssignmentDelta::Unchanged | AssignmentDelta::VersionOnly { .. }
+        );
+        let topology_version = opening.baseline.topology_version;
+        let current = if moved { opening.baseline } else { watched };
         Self {
             state: SessionState::Opening,
             read_set: opening.read_set,
@@ -106,7 +143,7 @@ impl StreamSession {
             heartbeat: HeartbeatSchedule::new(opening.heartbeat_interval, opening.started_at),
             progress: ProgressPolicy::new(&opening.progress, opening.started_at),
             limit: opening.limit,
-            topology_version: opening.topology_version,
+            topology_version,
             pending: VecDeque::new(),
             ready: opening.ready,
             now: opening.now,
@@ -116,6 +153,9 @@ impl StreamSession {
             unanswerable_tolerance: opening.unanswerable_tolerance,
             generations: opening.generations,
             current,
+            scope: opening.scope,
+            scope_seen: None,
+            scope_expires_at: None,
             _membership: opening.membership,
             _lease: opening.lease,
         }
@@ -140,6 +180,64 @@ impl StreamSession {
         let delta = AssignmentDelta::classify(&self.current, &next);
         self.current = next;
         delta
+    }
+
+    /// Reads the member's latest consume scope, the one the open stored
+    /// included, and notes its earliest group expiry; ends the stream when
+    /// that expiry has come by `now`. A member that holds no scope, or is
+    /// gone, is left to the caller to close.
+    fn check_scope(&mut self, now: Instant) -> ScopeCheck {
+        let Some(ScopeFeed { receiver: feed, .. }) = self.scope.as_mut() else {
+            return ScopeCheck::Unscoped;
+        };
+        // A closed feed is the member's removal; its last value is stale.
+        let latest = match feed.has_changed() {
+            Ok(_) => feed.borrow_and_update().clone(),
+            Err(_closed) => None,
+        };
+        let Some(scope) = latest else {
+            return ScopeCheck::Cleared;
+        };
+        self.scope_expires_at = scope.groups.iter().map(|group| group.expires_at).min();
+        if self
+            .scope_expires_at
+            .is_some_and(|expires_at| now >= expires_at)
+        {
+            tracing::warn!("consume scope expired; closing stream");
+            self.state = SessionState::Closing(CloseReason::Teardown);
+            return ScopeCheck::Expired;
+        }
+        ScopeCheck::Serving(scope)
+    }
+
+    /// Hands the filter the member's latest scope before a read, or ends
+    /// the stream when that scope is cleared, gone or expired. Returns
+    /// whether the pass goes on to read.
+    fn observe_scope(&mut self, now: Instant) -> bool {
+        match self.check_scope(now) {
+            ScopeCheck::Unscoped => true,
+            ScopeCheck::Serving(scope) => {
+                self.hand_scope_to_filter(scope);
+                true
+            }
+            ScopeCheck::Cleared => {
+                tracing::warn!("consume scope cleared; closing stream");
+                self.state = SessionState::Closing(CloseReason::Teardown);
+                false
+            }
+            ScopeCheck::Expired => false,
+        }
+    }
+
+    /// Hands the filter `scope` when it is a generation the filter has not
+    /// had. Detected by comparing generations, as `observe_assignment`
+    /// compares, so a scope that the park's `changed()`, or the check after
+    /// a batch's decisions, already marked seen is still handed over.
+    fn hand_scope_to_filter(&mut self, scope: Arc<CachedScope>) {
+        if self.scope_seen != Some(scope.generation) {
+            self.scope_seen = Some(scope.generation);
+            self.filter.swap_scope(scope);
+        }
     }
 
     /// Applies an assignment change.
@@ -245,6 +343,14 @@ impl StreamSession {
             return true;
         }
 
+        // Before any read: a cleared or expired scope ends the stream here,
+        // and a newer one decides every event read from now on. After the
+        // assignment, so a member removed by a LEAVE still closes with
+        // `lose_all`.
+        if !self.observe_scope(now) {
+            return true;
+        }
+
         if self.progress.due(now) {
             // Rearmed whether or not anything is reported. Declining to report
             // is a decision taken at *this* tick, and recording it only on the
@@ -313,22 +419,40 @@ impl StreamSession {
         }
 
         // Bounded by the next frame deadline, so an idle stream still emits its
-        // cadence rather than waiting for data that may never come.
-        let deadline = self.heartbeat.next_due().min(self.progress.next_due());
+        // cadence rather than waiting for data that may never come, and by the
+        // scope's expiry, so an idle stream ends when its scope stops serving.
+        let cadence = self.heartbeat.next_due().min(self.progress.next_due());
+        let deadline = self
+            .scope_expires_at
+            .map_or(cadence, |expires_at| cadence.min(expires_at));
         // The timeout expiring is the normal case - it means the cadence came
         // due before any partition did - so the result is deliberately ignored
         // rather than distinguished.
-        // Three ways out, and the assignment arm is why this is a `select!`
-        // rather than a `timeout_at`: a membership change lands on the
-        // generation watch, which does not touch the readiness waker, so a
-        // parked session would otherwise sleep through a rebalance until its
+        // Four ways out, and the assignment and scope arms are why this is a
+        // `select!` rather than a `timeout_at`: a membership change lands on
+        // the generation watch and a new or cleared scope on the scope watch,
+        // neither of which touches the readiness waker, so a parked session
+        // would otherwise sleep through a rebalance or a revocation until its
         // next heartbeat.
         let ready = Arc::clone(&self.ready);
+        let generations = &mut self.generations;
+        let scope = &mut self.scope;
+        let scope_changed = async {
+            match scope {
+                // A close resolves at once too; the next pass ends the stream.
+                Some(ScopeFeed { receiver: feed, .. }) => {
+                    let _changed_or_closed = feed.changed().await;
+                }
+                // No feed: nothing to wait for on this arm.
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             () = ready.notified() => {}
             // `Err` means the coordinator dropped this member's sender - the
             // group is gone. Waking is right; the next pass classifies it.
-            _ = self.generations.changed() => {}
+            _ = generations.changed() => {}
+            () = scope_changed => {}
             () = tokio::time::sleep_until(deadline) => {}
         }
         self.read_set.open_round();
@@ -345,10 +469,14 @@ impl StreamSession {
             return false;
         };
         let offset = slot.offset();
+        // Where the reader stands before the read: a slot is seeded together
+        // with its reader, and each recorded batch moves both to one frontier.
+        let examined_before = slot.last_examined();
+        let reader = Arc::clone(slot.reader());
 
         // No offset passed: the reader is the authority on where it is, and it
         // advances itself over what it accounted for.
-        let outcome = match slot.reader().read(self.limit) {
+        let outcome = match reader.read(self.limit) {
             PartitionRead::Hit {
                 events,
                 accounted_through,
@@ -357,18 +485,67 @@ impl StreamSession {
                 let mut examined = 0;
                 let mut delivered_through = offset;
 
-                for event in events.iter() {
+                // The read moved the reader past the batch. Holding it back
+                // where it stood keeps the batch's span from being reclaimed
+                // while its decisions are awaited, so a cut batch rereads its
+                // rest from memory; a pass between the read and this seek can
+                // still take the span, which is then fetched again. Until the
+                // release below, up to the evaluation deadline, the cache sees
+                // the reader up to one batch behind, which shifts the inputs
+                // that read reader positions (retained windows, memory
+                // pressure, loader sizing) by that batch. On a failure the
+                // stream tears down and where the reader stands no longer
+                // matters.
+                reader.seek(examined_before);
+                // The only await on the delivery path. A failure tears the
+                // stream down before anything of the batch is queued.
+                let prepared = self.filter.prepare(&events).await;
+                // The scope may have been cleared, or expired, while the
+                // batch was decided: then none of it is handed over or
+                // counted, and the reader stays where it stood. An expiry
+                // ends the stream here. A clear is closed by the next pass,
+                // which reads the assignment first, so a member removed by a
+                // LEAVE meanwhile still closes with `lose_all`. A newer
+                // generation is not handed to the filter here: the batch
+                // keeps the decisions it was prepared with, under the scope
+                // that served when it was read, and the next read uses the
+                // newer one.
+                match self.check_scope(Instant::now()) {
+                    ScopeCheck::Unscoped | ScopeCheck::Serving(_) => {}
+                    ScopeCheck::Cleared | ScopeCheck::Expired => return false,
+                }
+                let (decidable, examined_through) = match prepared {
+                    Ok(Prepared::All) => (events.len(), accounted_through),
+                    // A cut batch counts as examined through its last decided
+                    // event, so the next read starts at the first undecided
+                    // one.
+                    Ok(Prepared::UpTo(decidable)) => {
+                        let Some(last) = decidable
+                            .checked_sub(1)
+                            .and_then(|last| events.iter().nth(last))
+                            .and_then(|event| event.sequence)
+                        else {
+                            self.fail_batch(&DomainError::Internal(
+                                "a cut batch has no last decided event with a sequence".to_owned(),
+                            ));
+                            return false;
+                        };
+                        (decidable, last)
+                    }
+                    Err(error) => {
+                        self.fail_batch(&error);
+                        return false;
+                    }
+                };
+                // Released to the batch's examined frontier, the frontier
+                // `record_batch` gives the slot below.
+                reader.seek(examined_through);
+                for event in events.iter().take(decidable) {
                     examined += 1;
-                    let allowed = match self.filter.allows(event).await {
+                    let allowed = match self.filter.admits(event) {
                         Ok(allowed) => allowed,
                         Err(error) => {
-                            tracing::warn!(%error, "event authorization failed; closing stream");
-                            // The reader has advanced internally, but the batch
-                            // is not committed to the reported frontier. Drop
-                            // its queued frames too, so a retry can replay it
-                            // without losing events during a PDP outage.
-                            self.pending.clear();
-                            self.state = SessionState::Closing(CloseReason::Teardown);
+                            self.fail_batch(&error);
                             return false;
                         }
                     };
@@ -380,7 +557,7 @@ impl StreamSession {
                     }
                 }
 
-                BatchOutcome::builder(accounted_through)
+                BatchOutcome::builder(examined_through)
                     .delivered_through(delivered_through)
                     .counts(matched, examined)
                     .build()
@@ -401,6 +578,16 @@ impl StreamSession {
         true
     }
 
+    /// Ends the stream over a batch delivery could not decide. The reader may
+    /// stand past the reported frontier, but the batch is not committed to
+    /// it. Its queued frames are dropped too, so a retry can replay it without
+    /// losing events during a PDP outage.
+    fn fail_batch(&mut self, error: &DomainError) {
+        tracing::warn!(%error, "event authorization failed; closing stream");
+        self.pending.clear();
+        self.state = SessionState::Closing(CloseReason::Teardown);
+    }
+
     fn enqueue_topology(&mut self) {
         self.pending.push_back(Frame::Topology {
             topology_version: self.topology_version,
@@ -409,10 +596,24 @@ impl StreamSession {
     }
 }
 
+/// Whether the member's consume scope still serves a session.
+enum ScopeCheck {
+    /// No feed: the filter decides alone.
+    Unscoped,
+    /// The member's latest scope, serving.
+    Serving(Arc<CachedScope>),
+    /// Cleared, or the member is gone: nothing is closed yet, so a caller
+    /// can read the assignment first and close with the reason it gives.
+    Cleared,
+    /// Past its earliest group expiry: the stream is closing with
+    /// `teardown`.
+    Expired,
+}
+
 /// What a session needs to open.
 ///
-/// A struct rather than nine arguments: several are same-typed and a positional
-/// call would let them be transposed silently.
+/// A struct rather than a long argument list: several fields are same-typed,
+/// and a positional call would let them be transposed silently.
 #[domain_model]
 pub struct SessionOpening {
     pub read_set: ReadSet,
@@ -420,7 +621,10 @@ pub struct SessionOpening {
     pub progress: crate::domain::streaming::progress::ProgressConfig,
     pub heartbeat_interval: std::time::Duration,
     pub limit: ReadLimit,
-    pub topology_version: i64,
+    /// The assignment the read set was seeded from; the opening `topology`
+    /// frame carries its version. See [`StreamSession::open`] for how a watch
+    /// that moved since then is classified.
+    pub baseline: Generation,
     pub ready: Arc<Notify>,
     pub started_at: Instant,
     pub now: NowFn,
@@ -438,6 +642,54 @@ pub struct SessionOpening {
     /// Held for its `Drop`: releasing it is what reports the stream closed and
     /// starts the group's grace period. Never read.
     pub membership: MembershipHandle,
+    /// The member's consume scope as the coordinator holds it, when the
+    /// filter decides from it; `None` for a filter that decides alone.
+    ///
+    /// Every pass hands the filter a newer generation before it reads, and
+    /// a cleared scope, a closed feed (the member is gone) or a scope past
+    /// its earliest group expiry ends the stream with `teardown`, unless
+    /// the pass that closes it finds the member's assignment changed first:
+    /// a LEAVE closes with `lose_all`, a gain with `rebalanced`. That is
+    /// checked before each read and again once a batch is decided, so no
+    /// event of a batch decided after it is handed over and the batch
+    /// records no progress; a parked session wakes at that expiry.
+    /// The session holds the feed until it is dropped, and with it the
+    /// scope's refresh worker.
+    pub scope: Option<ScopeFeed>,
+}
+
+/// The member's consume scope as a session reads it: the coordinator's watch
+/// of it and, for a stream open, the guard of the worker that refreshes it.
+/// Dropping the feed, which the session does when the stream is dropped,
+/// cancels that worker.
+#[derive(Debug)]
+pub struct ScopeFeed {
+    receiver: watch::Receiver<Option<Arc<CachedScope>>>,
+    _refresh: Option<DropGuard>,
+}
+
+impl ScopeFeed {
+    /// `receiver`, with the guard that cancels the scope's refresh worker
+    /// when the feed is dropped.
+    #[must_use]
+    pub fn refreshed(
+        receiver: watch::Receiver<Option<Arc<CachedScope>>>,
+        refresh: DropGuard,
+    ) -> Self {
+        Self {
+            receiver,
+            _refresh: Some(refresh),
+        }
+    }
+
+    /// `receiver` alone: nothing refreshes the scope it watches.
+    #[must_use]
+    pub fn fixed(receiver: watch::Receiver<Option<Arc<CachedScope>>>) -> Self {
+        Self {
+            receiver,
+            _refresh: None,
+        }
+    }
 }
 
 /// A [`StreamSession`] as a `Stream`, which is what a transport consumes.

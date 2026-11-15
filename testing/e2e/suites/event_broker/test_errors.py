@@ -85,7 +85,7 @@ async def test_403_permission_denied_envelope(api):
             json={
                 "id": str(uuid.uuid4()),
                 "type": EVENT_TYPE_STREAM,
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id,
                 "source": "e2e-test",
                 "subject": "s1",
                 "subject_type": SUBJECT_TYPE,
@@ -152,7 +152,8 @@ async def test_409_failed_precondition_envelope(api):
                 "interests": [
                     {
                         "topic": TOPIC_STREAM,
-                        "tenant_id": tenant_id,
+                        "subject_tenant": tenant_id,
+                        "ownership_filter": "entire_tenant",
                         "types": [EVENT_TYPE_STREAM],
                     }
                 ],
@@ -163,7 +164,7 @@ async def test_409_failed_precondition_envelope(api):
 
         # Stream without a prior SEEK → PositionsNotSet.
         stream_resp = await client.get(
-            f"/events:stream?subscription_id={sub_id}",
+            f"/events:stream?subscription={sub_id}",
             headers={"Accept": "multipart/mixed"},
         )
     assert stream_resp.status_code == 409
@@ -210,14 +211,14 @@ async def test_412_sequence_violation_envelope(api):
             json={
                 "id": str(uuid.uuid4()),
                 "type": EVENT_TYPE_STREAM,
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id,
                 "source": "e2e-test",
                 "subject": "s1",
                 "subject_type": SUBJECT_TYPE,
                 "occurred_at": datetime.now(timezone.utc).isoformat(),
                 "meta": {
                     "version": 1,
-                    "producer_id": producer_id,
+                    "producer": producer_id,
                     "previous": 0,
                     "sequence": 1,
                 },
@@ -231,14 +232,14 @@ async def test_412_sequence_violation_envelope(api):
             json={
                 "id": str(uuid.uuid4()),
                 "type": EVENT_TYPE_STREAM,
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id,
                 "source": "e2e-test",
                 "subject": "s1",
                 "subject_type": SUBJECT_TYPE,
                 "occurred_at": datetime.now(timezone.utc).isoformat(),
                 "meta": {
                     "version": 1,
-                    "producer_id": producer_id,
+                    "producer": producer_id,
                     "previous": 999,  # wrong - broker has last_sequence=1
                     "sequence": 1000,
                 },
@@ -258,7 +259,9 @@ async def test_412_sequence_violation_envelope(api):
                 {
                     "type": "sequence_mismatch",
                     "subject": "(producer)",
-                    "description": body["context"]["violations"][0]["description"],
+                    "description": (
+                        f"index=0 producer={producer_id} topic={TOPIC_STREAM} last_sequence=1"
+                    ),
                 }
             ],
             "resource_type": "gts.cf.core.events.topic.v1~",
@@ -280,7 +283,7 @@ async def test_429_rate_limited_envelope(api):
                 json={
                     "id": str(uuid.uuid4()),
                     "type": EVENT_TYPE_STREAM,
-                    "tenant_id": tenant_id,
+                    "subject_tenant": tenant_id,
                     "source": "e2e-test",
                     "subject": "s1",
                     "subject_type": SUBJECT_TYPE,

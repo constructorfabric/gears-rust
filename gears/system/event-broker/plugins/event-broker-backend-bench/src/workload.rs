@@ -187,7 +187,7 @@ pub struct EventFactory {
     pools: Arc<KeyPools>,
     type_id: GtsTypeId,
     subject_type: GtsTypeId,
-    tenant_id: Uuid,
+    subject_tenant: Uuid,
     rng: Rng,
 }
 
@@ -201,7 +201,7 @@ impl EventFactory {
                 "cf.core.events.event.v1~cf.bench.x.happened.v1~"
             )),
             subject_type: GtsTypeId::new(toolkit_gts::gts_id!("cf.bench.x.thing.v1~")),
-            tenant_id: Uuid::from_u128(0x0b0e_4c40_0001),
+            subject_tenant: Uuid::from_u128(0x0b0e_4c40_0001),
             rng: Rng::seeded(),
         }
     }
@@ -218,11 +218,12 @@ impl EventFactory {
             key: format!("k{key}"),
             event: Event {
                 id,
-                type_id: self.type_id.clone(),
-                tenant_id: self.tenant_id,
+                event_type: self.type_id.clone(),
+                subject_tenant: self.subject_tenant,
                 source: "bench".to_owned(),
                 subject: format!("k{key}"),
                 subject_type: self.subject_type.clone(),
+                subject_owner: None,
                 occurred_at: Utc::now(),
                 trace_parent: None,
                 data: Some(serde_json::json!({
@@ -232,6 +233,7 @@ impl EventFactory {
                     "t": scheduled,
                     "pad": &*self.padding,
                 })),
+                ingest: None,
                 partition: None,
                 sequence: None,
                 sequence_time: None,
@@ -264,6 +266,7 @@ pub async fn provision_topic(
     .map_err(|err| BackendError::Internal(format!("bench topic id: {err}")))?;
     let spec = TopicSpec {
         topic,
+        uuid: Uuid::new_v4(),
         partitions: PARTITIONS,
         retention: KEEP,
     };

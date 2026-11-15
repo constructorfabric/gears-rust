@@ -18,7 +18,7 @@
 use std::fmt::Write as _;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -120,14 +120,42 @@ impl EventLog {
     }
 }
 
-/// Builds the `types-registry` `entities:` list as a YAML flow sequence of
-/// JSON-object literals (YAML is a superset of JSON for values) - avoids
-/// hand-crafting indentation-sensitive block-style YAML per entity.
+/// The `streaming:` keys a test sets on the server it boots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "each field is named after the config key it sets, unit suffix included"
+)]
+pub struct Streaming {
+    /// `heartbeat_interval_secs`: the idle cadence of an open stream.
+    pub heartbeat_secs: u32,
+    /// `authz_scope_ttl_secs`: how long a consume scope window serves.
+    pub authz_scope_ttl_secs: u32,
+    /// `authz_eval_deadline_secs`: the longest the broker waits on the PDP.
+    pub authz_eval_deadline_secs: u32,
+}
+
+impl Default for Streaming {
+    /// The values `StreamingConfig::default()` gives these keys: heartbeat 5,
+    /// scope TTL 60 and evaluation deadline 10 seconds.
+    fn default() -> Self {
+        Self {
+            heartbeat_secs: 5,
+            authz_scope_ttl_secs: 60,
+            authz_eval_deadline_secs: 10,
+        }
+    }
+}
+
+/// Builds the server's config. The `types-registry` `entities:` list is a
+/// YAML flow sequence of JSON-object literals (YAML is a superset of JSON for
+/// values) - avoids hand-crafting indentation-sensitive block-style YAML per
+/// entity.
 fn config_yaml(
     home_dir: &Path,
     port: u16,
     entities: &[Value],
-    heartbeat_secs: Option<u32>,
+    streaming: Streaming,
     event_log: EventLog,
 ) -> String {
     let (documents, partitions) = split_fixtures(entities);
@@ -143,12 +171,15 @@ fn config_yaml(
         )
         .expect("writing to a String never fails");
     }
-    // `None` means the default the production uses: 5s.
-    // The `streaming:` block below is always spelled out in full because
-    // `StreamingConfig` is `deny_unknown_fields` with no per-field defaults, so a
-    // partial block won't deserialize; every field other than the heartbeat is
-    // its `StreamingConfig::default()` value, so pinning them changes nothing.
-    let heartbeat_interval_secs = heartbeat_secs.unwrap_or(5);
+    // The `streaming:` block below is spelled out in full so every value a
+    // test's server runs with is visible here. `StreamingConfig` defaults any
+    // key left out (`#[serde(deny_unknown_fields, default)]`), and every key a
+    // test does not set is written at that default.
+    let Streaming {
+        heartbeat_secs,
+        authz_scope_ttl_secs,
+        authz_eval_deadline_secs,
+    } = streaming;
     format!(
         r#"
 server:
@@ -210,11 +241,13 @@ gears:
 {backend_entry}      backend_routing:
         "gts.cf.core.events.topic.v1~": main
       streaming:
-        heartbeat_interval_secs: {heartbeat_interval_secs}
+        heartbeat_interval_secs: {heartbeat_secs}
         read_batch_max_events: 256
         read_batch_max_bytes: 1048576
         progress_drift_threshold: 1000
         progress_min_interval_secs: 30
+        authz_scope_ttl_secs: {authz_scope_ttl_secs}
+        authz_eval_deadline_secs: {authz_eval_deadline_secs}
       topics:
         "gts.cf.core.events.topic.v1~": {{}}
 {topic_settings}
@@ -242,27 +275,41 @@ fn drain<R: AsyncRead + Unpin + Send + 'static>(reader: R, logs: &Arc<Mutex<Vec<
     });
 }
 
+/// Writes the config into `home_dir` and builds the command that runs the
+/// binary against it. The process is killed when its handle is dropped.
+fn server_command(
+    home_dir: &Path,
+    port: u16,
+    entities: &[Value],
+    streaming: Streaming,
+    event_log: EventLog,
+) -> Command {
+    let config_path = home_dir.join("config.yaml");
+    std::fs::write(
+        &config_path,
+        config_yaml(home_dir, port, entities, streaming, event_log),
+    )
+    .expect("write config");
+
+    let mut command = Command::new(bin_path());
+    command
+        .arg("--config")
+        .arg(&config_path)
+        .arg("run")
+        .kill_on_drop(true);
+    command
+}
+
 fn spawn_server(
     home_dir: &Path,
     port: u16,
     entities: &[Value],
-    heartbeat_secs: Option<u32>,
+    streaming: Streaming,
     event_log: EventLog,
 ) -> (Child, Arc<Mutex<Vec<String>>>) {
-    let config_path = home_dir.join("config.yaml");
-    std::fs::write(
-        &config_path,
-        config_yaml(home_dir, port, entities, heartbeat_secs, event_log),
-    )
-    .expect("write config");
-
-    let mut child = Command::new(bin_path())
-        .arg("--config")
-        .arg(&config_path)
-        .arg("run")
+    let mut child = server_command(home_dir, port, entities, streaming, event_log)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
         .spawn()
         .expect("spawn cf-gears-event-broker-server");
 
@@ -316,11 +363,21 @@ pub struct TestServer {
     base_url: String,
     home_dir: TempDir,
     entities: Vec<Value>,
-    /// The heartbeat cadence this server was booted with, re-applied on
+    /// The `streaming:` keys this server was booted with, re-applied on
     /// `restart` so a restarted server keeps whatever a test configured.
-    heartbeat_secs: Option<u32>,
+    streaming: Streaming,
     /// Where the event log lives, re-applied on `restart`.
     event_log: EventLog,
+}
+
+/// What a server that refused to start left behind.
+#[derive(Debug)]
+pub struct Refused {
+    /// How the process exited, or `None` when it was still running at the
+    /// bound and was killed.
+    pub status: Option<ExitStatus>,
+    /// Its stdout, then its stderr, one entry per line.
+    pub logs: Vec<String>,
 }
 
 impl TestServer {
@@ -328,28 +385,75 @@ impl TestServer {
     /// config (the same `entities:` mechanism `config/event-broker-
     /// standalone.yaml` documents) - typically topic/event-type fixtures.
     pub async fn start(entities: Vec<Value>) -> Self {
-        Self::boot(entities, None, EventLog::Memory).await
+        Self::boot(entities, Streaming::default(), EventLog::Memory).await
     }
 
     /// Boots with its event log in `event_log` instead of the memory backend.
     pub async fn start_with_event_log(entities: Vec<Value>, event_log: EventLog) -> Self {
-        Self::boot(entities, None, event_log).await
+        Self::boot(entities, Streaming::default(), event_log).await
     }
 
-    /// Boots with an explicit idle heartbeat cadence (seconds); `None` keeps the
-    /// 5s default. The server has no proactive disconnect watcher, so it notices
-    /// a subscriber that departs by dropping its connection no later than the next
-    /// frame it fails to write - a heartbeat, for an idle stream. A short cadence
-    /// bounds that detection latency, which a disconnect-departure test relies on.
-    pub async fn start_with_heartbeat(entities: Vec<Value>, heartbeat_secs: Option<u32>) -> Self {
-        Self::boot(entities, heartbeat_secs, EventLog::Memory).await
+    /// Boots with an explicit idle heartbeat cadence (seconds). The server has
+    /// no proactive disconnect watcher, so it notices a subscriber that departs
+    /// by dropping its connection no later than the next frame it fails to
+    /// write - a heartbeat, for an idle stream. A short cadence bounds that
+    /// detection latency, which a disconnect-departure test relies on.
+    pub async fn start_with_heartbeat(entities: Vec<Value>, heartbeat_secs: u32) -> Self {
+        let streaming = Streaming {
+            heartbeat_secs,
+            ..Streaming::default()
+        };
+        Self::boot(entities, streaming, EventLog::Memory).await
     }
 
-    async fn boot(entities: Vec<Value>, heartbeat_secs: Option<u32>, event_log: EventLog) -> Self {
+    /// Boots with the `streaming:` keys in `streaming`.
+    pub async fn start_with_streaming(entities: Vec<Value>, streaming: Streaming) -> Self {
+        Self::boot(entities, streaming, EventLog::Memory).await
+    }
+
+    /// Runs a server that is expected to refuse to start, and waits up to 15s
+    /// for it to exit. A process still running then is killed and reported
+    /// with no status. Its home directory is a `TempDir`, removed on return.
+    pub async fn start_refused(entities: Vec<Value>, streaming: Streaming) -> Refused {
+        let home_dir = TempDir::new().expect("tempdir");
+        let output = tokio::time::timeout(
+            Duration::from_secs(15),
+            server_command(
+                home_dir.path(),
+                alloc_port(),
+                &entities,
+                streaming,
+                EventLog::Memory,
+            )
+            .output(),
+        )
+        .await;
+        match output {
+            Ok(output) => {
+                let output = output.expect("run cf-gears-event-broker-server");
+                let logs = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .chain(String::from_utf8_lossy(&output.stderr).lines())
+                    .map(str::to_owned)
+                    .collect();
+                Refused {
+                    status: Some(output.status),
+                    logs,
+                }
+            }
+            // Dropping the timed-out `output()` kills the process.
+            Err(_elapsed) => Refused {
+                status: None,
+                logs: Vec::new(),
+            },
+        }
+    }
+
+    async fn boot(entities: Vec<Value>, streaming: Streaming, event_log: EventLog) -> Self {
         let home_dir = TempDir::new().expect("tempdir");
         let port = alloc_port();
         let (mut child, logs) =
-            spawn_server(home_dir.path(), port, &entities, heartbeat_secs, event_log);
+            spawn_server(home_dir.path(), port, &entities, streaming, event_log);
         let base_url = format!("http://127.0.0.1:{port}");
         wait_for_ready(&mut child, &base_url, &logs).await;
         Self {
@@ -358,7 +462,7 @@ impl TestServer {
             base_url,
             home_dir,
             entities,
-            heartbeat_secs,
+            streaming,
             event_log,
         }
     }
@@ -367,8 +471,8 @@ impl TestServer {
     /// owns its own internal `CancellationToken` with no external hook, and
     /// an abrupt kill is the more realistic "restart after crash" scenario
     /// anyway) and boots a fresh one against the SAME `home_dir` - and
-    /// therefore the same `SQLite` file - on a new ephemeral port. For task
-    /// 10.3's durability test: data must survive; subscription state must
+    /// therefore the same `SQLite` file - on a new ephemeral port. For a
+    /// durability test: data must survive; subscription state must
     /// not (it lives in the `ClusterCacheV1` standalone in-memory profile,
     /// which dies with the process).
     pub async fn restart(&mut self) {
@@ -379,7 +483,7 @@ impl TestServer {
             self.home_dir.path(),
             port,
             &self.entities,
-            self.heartbeat_secs,
+            self.streaming,
             self.event_log,
         );
         let base_url = format!("http://127.0.0.1:{port}");
@@ -391,6 +495,11 @@ impl TestServer {
 
     pub fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base_url)
+    }
+
+    /// The lines the running process has written to stdout and stderr so far.
+    pub fn logs(&self) -> Vec<String> {
+        self.logs.lock().expect("logs mutex").clone()
     }
 }
 

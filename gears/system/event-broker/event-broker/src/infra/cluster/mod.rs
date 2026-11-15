@@ -1,7 +1,6 @@
-//! `ClusterCapabilities` integration: event notification via
-//! `ClusterCacheV1::put` + `watch` (`DESIGN.md:604-605,756-758`), and
-//! `DirectoryService` advertise-address resolution
-//! (`eb-dispatcher-routing`).
+//! `ClusterCapabilities` integration: `DirectoryService` advertise-address
+//! resolution. The routing markers the broker keeps in `ClusterCacheV1` are
+//! `Storage`'s (`infra::storage::facade`); nothing here watches the cache.
 
 mod advertise_address;
 

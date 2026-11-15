@@ -48,8 +48,8 @@ pub struct EventType {
 #[derive(Debug, Clone)]
 pub struct ConsumerGroup {
     pub id: ConsumerGroupId,
-    pub tenant_id: Uuid,
-    pub owner_principal_id: Uuid,
+    pub tenant: Uuid,
+    pub owner_principal: Uuid,
     pub kind: ConsumerGroupKind,
     pub description: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -195,11 +195,13 @@ pub enum ResetScope<'a> {
 #[derive(Debug, Clone)]
 pub struct Event {
     pub id: Uuid,
-    pub type_id: GtsTypeId,
-    pub tenant_id: Uuid,
+    pub event_type: GtsTypeId,
+    pub subject_tenant: Uuid,
     pub source: String,
     pub subject: String,
     pub subject_type: GtsTypeId,
+    /// The principal that owns the event; `None` for a tenant-wide event.
+    pub subject_owner: Option<Uuid>,
     pub occurred_at: DateTime<Utc>,
     pub trace_parent: Option<String>,
     pub data: Option<serde_json::Value>,
@@ -211,6 +213,18 @@ pub struct Event {
 
     // Chain metadata a backend record can carry; the broker's backend conversions leave it unset.
     pub meta: Option<ProducerMeta>,
+
+    /// Who published the event, stamped by the broker at ingest; `None` for an anonymous
+    /// publisher. A backend stores it, and the broker never delivers it.
+    pub ingest: Option<IngestStamp>,
+}
+
+/// The publisher of an event as the broker saw it at ingest: the caller's tenant and
+/// principal. Internal to the broker, for audit and limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IngestStamp {
+    pub tenant: Uuid,
+    pub actor: Uuid,
 }
 
 impl Event {
@@ -234,11 +248,12 @@ impl Event {
     fn addressable(&self) -> serde_json::Value {
         serde_json::json!({
             "id": self.id,
-            "type": self.type_id,
-            "tenant_id": self.tenant_id,
+            "type": self.event_type,
+            "subject_tenant": self.subject_tenant,
             "source": self.source,
             "subject": self.subject,
             "subject_type": self.subject_type,
+            "subject_owner": self.subject_owner,
             "occurred_at": self.occurred_at,
             "trace_parent": self.trace_parent,
             "data": self.data,
@@ -287,7 +302,7 @@ pub(crate) fn resolve_partition_input(
 #[derive(Debug, Clone)]
 pub struct ProducerMeta {
     pub version: u8,
-    pub producer_id: Option<uuid::Uuid>,
+    pub producer: Option<uuid::Uuid>,
     pub previous: Option<i64>,
     pub sequence: Option<i64>,
 }

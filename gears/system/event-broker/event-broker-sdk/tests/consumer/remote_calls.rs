@@ -51,6 +51,9 @@ async fn if_i_need_remote_calls_the_handler_owns_its_client_and_auth() {
     };
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("showcase-remote-calls"))
         .topics([topic(TOPIC)])
         .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))

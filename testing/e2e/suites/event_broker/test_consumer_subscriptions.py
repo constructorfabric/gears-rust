@@ -1,4 +1,4 @@
-"""Subscription (JOIN/LEAVE) scenarios (consumer/subscriptions/1.01-1.13).
+"""Subscription (JOIN/LEAVE) scenarios (consumer/subscriptions/1.01-1.15, 1.18-1.24).
 
 Each test manages its own consumer group.  Tests that need multiple members
 (rebalance tests 1.11, 1.12) use TOPIC_4P (4 partitions) so there are enough
@@ -16,6 +16,8 @@ import httpx
 import pytest
 
 from .conftest import (
+    API_BASE,
+    DEFAULT_TENANT_ID,
     SKIP_LIMITS,
     group_seek_positions,
     EVENT_TYPE_4P,
@@ -25,14 +27,17 @@ from .conftest import (
     TOPIC_4P,
     TOPIC_STREAM,
     TOPIC_LONGPOLL,
+    TOKEN_PRINCIPAL_A,
+    TOKEN_PRINCIPAL_B,
     XFAIL_AUTH_DISABLED,
+    XFAIL_UNLESS_STATIC_TOKENS,
     SseFrameReader,
     TRACE_ID,
 )
 
 
 def _interest(topic: str, event_type: str, tenant_id: str) -> dict:
-    return {"topic": topic, "tenant_id": tenant_id, "types": [event_type]}
+    return {"topic": topic, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [event_type]}
 
 
 def _now() -> str:
@@ -64,11 +69,52 @@ async def test_cold_join_fresh_group_returns_201(api):
         "interests": [
             {
                 "topic": TOPIC_STREAM,
-                "tenant_id": tenant_id,
-                "max_depth": 0,
+                "subject_tenant": tenant_id,
+                "ownership_filter": "entire_tenant",
                 "barrier_mode": body["interests"][0]["barrier_mode"],
                 "types": [EVENT_TYPE_STREAM],
                 "filter": None,
+                "unmatched_types": [],
+            }
+        ],
+        "assigned": [{"topic": TOPIC_STREAM, "partition": 0}],
+        "topology_version": 1,
+        "created_at": body["created_at"],
+    }
+
+
+async def test_join_unregistered_type_reported(api):
+    """scenario: consumer/subscriptions/1.18-positive-join-unregistered-type-reported.md"""
+    unregistered = "gts.cf.core.events.event.v1~cf.e2e.event_broker.never_registered.v1~"
+    tenant_id = str(uuid.uuid4())
+    async with api() as client:
+        group_resp = await client.post("/consumer-groups")
+        assert group_resp.status_code == 201
+        group_id = group_resp.json()["id"]
+
+        sub_resp = await client.post(
+            "/subscriptions",
+            json={
+                "consumer_group": group_id,
+                "client_agent": "e2e-test",
+                "interests": [_interest(TOPIC_STREAM, unregistered, tenant_id)],
+            },
+        )
+    assert sub_resp.status_code == 201, sub_resp.text
+    body = sub_resp.json()
+    assert body == {
+        "id": body["id"],
+        "consumer_group": group_id,
+        "client_agent": "e2e-test",
+        "interests": [
+            {
+                "topic": TOPIC_STREAM,
+                "subject_tenant": tenant_id,
+                "ownership_filter": "entire_tenant",
+                "barrier_mode": "respect",
+                "types": [unregistered],
+                "filter": None,
+                "unmatched_types": [unregistered],
             }
         ],
         "assigned": [{"topic": TOPIC_STREAM, "partition": 0}],
@@ -120,7 +166,8 @@ async def test_join_with_typed_filter_returns_201(api):
                 "interests": [
                     {
                         "topic": TOPIC_STREAM,
-                        "tenant_id": tenant_id,
+                        "subject_tenant": tenant_id,
+                        "ownership_filter": "entire_tenant",
                         "types": [EVENT_TYPE_STREAM],
                         "filter": {
                             "engine": "gts.cf.core.events.filter.v1~cf.core.expression.cel.v1",
@@ -180,7 +227,7 @@ async def test_parallelism_multiple_subscriptions(api, test_env):
         base_url=f"{test_env.base_url}/event-broker/v1", timeout=None
     ) as stream_client:
         async with stream_client.stream(
-            "GET", f"/events:sse?subscription_id={sub1_id}"
+            "GET", f"/events:sse?subscription={sub1_id}"
         ) as stream_resp:
             assert stream_resp.status_code == 200
             reader = SseFrameReader(stream_resp)
@@ -277,7 +324,6 @@ async def test_join_unauthorized_topic_returns_403(api):
     }
 
 
-@SKIP_LIMITS
 async def test_too_many_interests_returns_400(api):
     """scenario: consumer/subscriptions/1.07-negative-join-too-many-interests.md
 
@@ -300,16 +346,377 @@ async def test_too_many_interests_returns_400(api):
                 ],
             },
         )
+
+        list_resp = await client.get(
+            "/subscriptions", params={"$filter": f"consumer_group eq '{group_id}'"}
+        )
     assert sub_resp.status_code == 400
-    body = sub_resp.json()
-    assert body == {
+    assert sub_resp.json() == {
         "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
         "title": "Invalid Argument",
         "status": 400,
-        "detail": body["detail"],
-        "instance": body["instance"],
+        "detail": "TooManyInterests: interests count 65 exceeds the maximum of 64",
+        "instance": f"{API_BASE}/subscriptions",
         "trace_id": TRACE_ID,
-        "context": body["context"],
+        "context": {
+            "format": "TooManyInterests: interests count 65 exceeds the maximum of 64",
+            "resource_type": "gts.cf.core.events.request.v1~",
+        },
+    }
+    assert list_resp.status_code == 200
+    assert list_resp.json() == {
+        "items": [],
+        "page_info": {"next_cursor": None, "prev_cursor": None, "limit": 25},
+    }
+
+
+async def test_join_with_a_nil_interest_tenant_returns_400(api):
+    """scenario: consumer/subscriptions/1.20-negative-join-nil-interest-tenant.md"""
+    async with api() as client:
+        group_resp = await client.post("/consumer-groups")
+        assert group_resp.status_code == 201
+        group_id = group_resp.json()["id"]
+
+        sub_resp = await client.post(
+            "/subscriptions",
+            json={
+                "consumer_group": group_id,
+                "client_agent": "e2e-test",
+                "interests": [
+                    _interest(
+                        TOPIC_STREAM,
+                        EVENT_TYPE_STREAM,
+                        "00000000-0000-0000-0000-000000000000",
+                    )
+                ],
+            },
+        )
+
+        list_resp = await client.get(
+            "/subscriptions", params={"$filter": f"consumer_group eq '{group_id}'"}
+        )
+    assert sub_resp.status_code == 400
+    assert sub_resp.json() == {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": "InvalidTenant: interest 0: the interest's tenant must not be the nil UUID",
+        "instance": f"{API_BASE}/subscriptions",
+        "trace_id": TRACE_ID,
+        "context": {
+            "format": "InvalidTenant: interest 0: the interest's tenant must not be the nil UUID",
+            "resource_type": "gts.cf.core.events.request.v1~",
+        },
+    }
+    assert list_resp.status_code == 200
+    assert list_resp.json() == {
+        "items": [],
+        "page_info": {"next_cursor": None, "prev_cursor": None, "limit": 25},
+    }
+
+
+async def test_join_with_too_many_types_returns_400(api):
+    """scenario: consumer/subscriptions/1.21-negative-join-too-many-types.md"""
+    tenant_id = str(uuid.uuid4())
+    too_many_types = [
+        f"gts.cf.core.events.event.v1~x.e2e.toomany.t{i}.v1~" for i in range(33)
+    ]
+    async with api() as client:
+        group_resp = await client.post("/consumer-groups")
+        assert group_resp.status_code == 201
+        group_id = group_resp.json()["id"]
+
+        sub_resp = await client.post(
+            "/subscriptions",
+            json={
+                "consumer_group": group_id,
+                "client_agent": "e2e-test",
+                "interests": [
+                    _interest(TOPIC_STREAM, EVENT_TYPE_STREAM, tenant_id),
+                    {
+                        "topic": TOPIC_STREAM,
+                        "subject_tenant": tenant_id,
+                        "ownership_filter": "entire_tenant",
+                        "types": too_many_types,
+                    },
+                ],
+            },
+        )
+
+        list_resp = await client.get(
+            "/subscriptions", params={"$filter": f"consumer_group eq '{group_id}'"}
+        )
+    assert sub_resp.status_code == 400
+    assert sub_resp.json() == {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": "TooManyTypes: interest 1: types count 33 exceeds the maximum of 32",
+        "instance": f"{API_BASE}/subscriptions",
+        "trace_id": TRACE_ID,
+        "context": {
+            "format": "TooManyTypes: interest 1: types count 33 exceeds the maximum of 32",
+            "resource_type": "gts.cf.core.events.request.v1~",
+        },
+    }
+    assert list_resp.status_code == 200
+    assert list_resp.json() == {
+        "items": [],
+        "page_info": {"next_cursor": None, "prev_cursor": None, "limit": 25},
+    }
+
+
+async def test_join_with_too_many_subject_types_returns_400(api):
+    """scenario: consumer/subscriptions/1.22-negative-join-too-many-subject-types.md"""
+    tenant_id = str(uuid.uuid4())
+    too_many_subject_types = [
+        f"gts.cf.e2e.event_broker.toomany_s{i}.v1~" for i in range(33)
+    ]
+    async with api() as client:
+        group_resp = await client.post("/consumer-groups")
+        assert group_resp.status_code == 201
+        group_id = group_resp.json()["id"]
+
+        sub_resp = await client.post(
+            "/subscriptions",
+            json={
+                "consumer_group": group_id,
+                "client_agent": "e2e-test",
+                "interests": [
+                    _interest(TOPIC_STREAM, EVENT_TYPE_STREAM, tenant_id),
+                    {
+                        "topic": TOPIC_STREAM,
+                        "subject_tenant": tenant_id,
+                        "ownership_filter": "entire_tenant",
+                        "types": [EVENT_TYPE_STREAM],
+                        "subject_types": too_many_subject_types,
+                    },
+                ],
+            },
+        )
+
+        list_resp = await client.get(
+            "/subscriptions", params={"$filter": f"consumer_group eq '{group_id}'"}
+        )
+    assert sub_resp.status_code == 400
+    assert sub_resp.json() == {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": "TooManySubjectTypes: interest 1: subject types count 33 exceeds the maximum of 32",
+        "instance": f"{API_BASE}/subscriptions",
+        "trace_id": TRACE_ID,
+        "context": {
+            "format": "TooManySubjectTypes: interest 1: subject types count 33 exceeds the maximum of 32",
+            "resource_type": "gts.cf.core.events.request.v1~",
+        },
+    }
+    assert list_resp.status_code == 200
+    assert list_resp.json() == {
+        "items": [],
+        "page_info": {"next_cursor": None, "prev_cursor": None, "limit": 25},
+    }
+
+
+async def test_join_only_mine_default(api):
+    """scenario: consumer/subscriptions/1.14-positive-join-only-mine.md
+
+    An interest that names neither ``ownership_filter`` nor ``subject_tenant``
+    reads the caller's own events: the JOIN echoes ``only_mine`` and the
+    caller's tenant, the default identity's under ``auth_disabled``.
+    """
+    async with api() as client:
+        group_resp = await client.post("/consumer-groups")
+        assert group_resp.status_code == 201
+        group_id = group_resp.json()["id"]
+
+        sub_resp = await client.post(
+            "/subscriptions",
+            json={
+                "consumer_group": group_id,
+                "client_agent": "e2e-test",
+                "interests": [{"topic": TOPIC_STREAM, "types": [EVENT_TYPE_STREAM]}],
+            },
+        )
+    assert sub_resp.status_code == 201, sub_resp.text
+    body = sub_resp.json()
+    assert body == {
+        "id": body["id"],
+        "consumer_group": group_id,
+        "client_agent": "e2e-test",
+        "interests": [
+            {
+                "topic": TOPIC_STREAM,
+                "subject_tenant": DEFAULT_TENANT_ID,
+                "ownership_filter": "only_mine",
+                "barrier_mode": "respect",
+                "types": [EVENT_TYPE_STREAM],
+                "filter": None,
+                "unmatched_types": [],
+            }
+        ],
+        "assigned": [{"topic": TOPIC_STREAM, "partition": 0}],
+        "topology_version": 1,
+        "created_at": body["created_at"],
+    }
+
+
+async def test_join_only_mine_foreign_tenant(api):
+    """scenario: consumer/subscriptions/1.19-negative-join-only-mine-foreign-tenant.md
+
+    ``only_mine`` reads only the caller's own tenant, so an interest that keeps
+    the default filter and names another tenant is refused 400, and no
+    subscription is created.
+    """
+    async with api() as client:
+        group_resp = await client.post("/consumer-groups")
+        assert group_resp.status_code == 201
+        group_id = group_resp.json()["id"]
+
+        sub_resp = await client.post(
+            "/subscriptions",
+            json={
+                "consumer_group": group_id,
+                "client_agent": "e2e-test",
+                "interests": [
+                    {
+                        "topic": TOPIC_STREAM,
+                        "subject_tenant": str(uuid.uuid4()),
+                        "types": [EVENT_TYPE_STREAM],
+                    }
+                ],
+            },
+        )
+
+        list_resp = await client.get(
+            "/subscriptions", params={"$filter": f"consumer_group eq '{group_id}'"}
+        )
+    assert sub_resp.status_code == 400
+    assert sub_resp.json() == {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": "InvalidTenant: interest 0: only_mine reads the caller's own tenant",
+        "instance": f"{API_BASE}/subscriptions",
+        "trace_id": TRACE_ID,
+        "context": {
+            "format": "InvalidTenant: interest 0: only_mine reads the caller's own tenant",
+            "resource_type": "gts.cf.core.events.request.v1~",
+        },
+    }
+    assert list_resp.status_code == 200
+    assert list_resp.json() == {
+        "items": [],
+        "page_info": {"next_cursor": None, "prev_cursor": None, "limit": 25},
+    }
+
+
+async def test_join_max_depth_rejected(api):
+    """scenario: consumer/subscriptions/1.15-negative-join-max-depth-rejected.md
+
+    ``max_depth`` is not an interest field: a JOIN that sends it is refused
+    400, naming the field and its replacement, and no subscription is
+    created.
+    """
+    tenant_id = str(uuid.uuid4())
+    async with api() as client:
+        group_resp = await client.post("/consumer-groups")
+        assert group_resp.status_code == 201
+        group_id = group_resp.json()["id"]
+
+        sub_resp = await client.post(
+            "/subscriptions",
+            json={
+                "consumer_group": group_id,
+                "client_agent": "e2e-test",
+                "interests": [
+                    {
+                        "topic": TOPIC_STREAM,
+                        "subject_tenant": tenant_id,
+                        "ownership_filter": "entire_tenant",
+                        "max_depth": 0,
+                        "types": [EVENT_TYPE_STREAM],
+                    }
+                ],
+            },
+        )
+
+        list_resp = await client.get(
+            "/subscriptions", params={"$filter": f"consumer_group eq '{group_id}'"}
+        )
+    assert sub_resp.status_code == 400
+    assert sub_resp.json() == {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": "InvalidBody: 'max_depth' is not supported; use 'ownership_filter'",
+        "instance": f"{API_BASE}/subscriptions",
+        "trace_id": TRACE_ID,
+        "context": {
+            "format": "InvalidBody: 'max_depth' is not supported; use 'ownership_filter'",
+            "resource_type": "gts.cf.core.events.request.v1~",
+        },
+    }
+    assert list_resp.status_code == 200
+    assert list_resp.json() == {
+        "items": [],
+        "page_info": {"next_cursor": None, "prev_cursor": None, "limit": 25},
+    }
+
+
+@XFAIL_AUTH_DISABLED
+async def test_join_subject_type_not_authorized(api):
+    """scenario: consumer/subscriptions/1.24-negative-join-subject-type-not-authorized.md
+
+    The interest selects an exact subject type the consume scope excludes, on
+    a topic with a registered event type, so the JOIN is refused
+    ``SubjectTypeNotAuthorized``, naming the subject type. Under
+    ``auth_disabled`` the scope has no subject-type rule, so the JOIN answers
+    201.
+    """
+    tenant_id = str(uuid.uuid4())
+    async with api() as client:
+        group_resp = await client.post("/consumer-groups")
+        assert group_resp.status_code == 201
+        group_id = group_resp.json()["id"]
+
+        sub_resp = await client.post(
+            "/subscriptions",
+            json={
+                "consumer_group": group_id,
+                "client_agent": "e2e-test",
+                "interests": [
+                    {
+                        "topic": TOPIC_STREAM,
+                        "subject_tenant": tenant_id,
+                        "ownership_filter": "entire_tenant",
+                        "types": [EVENT_TYPE_STREAM],
+                        "subject_types": [SUBJECT_TYPE],
+                    },
+                ],
+            },
+        )
+
+        list_resp = await client.get(
+            "/subscriptions", params={"$filter": f"consumer_group eq '{group_id}'"}
+        )
+    assert sub_resp.status_code == 403
+    assert sub_resp.json() == {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~",
+        "title": "Permission Denied",
+        "status": 403,
+        "detail": "You do not have permission to perform this operation",
+        "instance": f"{API_BASE}/subscriptions",
+        "trace_id": TRACE_ID,
+        "context": {
+            "reason": f"calling principal lacks consume on subject type '{SUBJECT_TYPE}'",
+            "resource_type": "gts.cf.core.events.request.v1~",
+        },
+    }
+    assert list_resp.status_code == 200
+    assert list_resp.json() == {
+        "items": [],
+        "page_info": {"next_cursor": None, "prev_cursor": None, "limit": 25},
     }
 
 
@@ -357,8 +764,28 @@ async def test_list_subscriptions_returns_paged_list(api):
             "/subscriptions", params={"$filter": f"consumer_group eq '{group_id}'"}
         )
     assert list_resp.status_code == 200
+    # The listing echoes the subscription without the JOIN-only `unmatched_types`.
     assert list_resp.json() == {
-        "items": [created],
+        "items": [
+            {
+                "id": created["id"],
+                "consumer_group": group_id,
+                "client_agent": "e2e-test",
+                "interests": [
+                    {
+                        "topic": TOPIC_STREAM,
+                        "subject_tenant": tenant_id,
+                        "ownership_filter": "entire_tenant",
+                        "barrier_mode": "respect",
+                        "types": [EVENT_TYPE_STREAM],
+                        "filter": None,
+                    }
+                ],
+                "assigned": [{"topic": TOPIC_STREAM, "partition": 0}],
+                "topology_version": 1,
+                "created_at": created["created_at"],
+            }
+        ],
         "page_info": {"next_cursor": None, "prev_cursor": None, "limit": 25},
     }
 
@@ -392,8 +819,8 @@ async def test_read_subscription_returns_200(api):
         "interests": [
             {
                 "topic": TOPIC_STREAM,
-                "tenant_id": tenant_id,
-                "max_depth": 0,
+                "subject_tenant": tenant_id,
+                "ownership_filter": "entire_tenant",
                 "barrier_mode": body["interests"][0]["barrier_mode"],
                 "types": [EVENT_TYPE_STREAM],
                 "filter": None,
@@ -558,7 +985,8 @@ async def test_cross_tenant_join_anonymous_group_returns_403(api):
                 "interests": [
                     {
                         "topic": TOPIC_STREAM,
-                        "tenant_id": tenant_id,
+                        "subject_tenant": tenant_id,
+                        "ownership_filter": "entire_tenant",
                         "types": [EVENT_TYPE_STREAM],
                     }
                 ],
@@ -575,3 +1003,50 @@ async def test_cross_tenant_join_anonymous_group_returns_403(api):
         "trace_id": TRACE_ID,
         "context": body["context"],
     }
+
+
+@XFAIL_UNLESS_STATIC_TOKENS
+async def test_leave_subscription_not_owned(api):
+    """scenario: consumer/subscriptions/1.23-negative-leave-subscription-not-owned.md
+
+    Principal A JOINs a fresh group with one interest on its own tenant (the
+    tenant its group records); principal B, a subject of the same tenant,
+    LEAVEs A's subscription and is refused ``SubscriptionNotOwned``, and A
+    still reads it. Under ``auth_disabled`` the gateway ignores both tokens and
+    injects one default identity, so B's LEAVE answers 204.
+    """
+    principal_a = {"Authorization": f"Bearer {TOKEN_PRINCIPAL_A}"}
+    principal_b = {"Authorization": f"Bearer {TOKEN_PRINCIPAL_B}"}
+    async with api() as client:
+        group_resp = await client.post("/consumer-groups", headers=principal_a)
+        assert group_resp.status_code == 201, group_resp.text
+        group = group_resp.json()
+        sub_resp = await client.post(
+            "/subscriptions",
+            headers=principal_a,
+            json={
+                "consumer_group": group["id"],
+                "client_agent": "e2e-test",
+                "interests": [_interest(TOPIC_STREAM, EVENT_TYPE_STREAM, group["tenant"])],
+            },
+        )
+        assert sub_resp.status_code == 201, sub_resp.text
+        sub_id = str(sub_resp.json()["id"])
+
+        leave_resp = await client.delete(f"/subscriptions/{sub_id}", headers=principal_b)
+        read_resp = await client.get(f"/subscriptions/{sub_id}", headers=principal_a)
+
+    assert leave_resp.status_code == 403, leave_resp.text
+    assert leave_resp.json() == {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~",
+        "title": "Permission Denied",
+        "status": 403,
+        "detail": "You do not have permission to perform this operation",
+        "instance": f"{API_BASE}/subscriptions/{sub_id}",
+        "trace_id": TRACE_ID,
+        "context": {
+            "reason": f"subscription '{sub_id}' was joined by another principal",
+            "resource_type": "gts.cf.core.events.subscription.v1~",
+        },
+    }
+    assert read_resp.status_code == 200, read_resp.text

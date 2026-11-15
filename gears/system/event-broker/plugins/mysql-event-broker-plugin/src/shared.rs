@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 
 use event_broker_sdk::GtsInstanceId;
-use event_broker_sdk::backend::support::{LocalHeads, topic_uuid};
+use event_broker_sdk::backend::support::LocalHeads;
 use event_broker_sdk::backend::{BackendError, Partition, Role};
 use sqlx::MySqlPool;
 use uuid::Uuid;
@@ -24,7 +24,8 @@ use crate::settings::MysqlSettings;
 pub struct KnownTopic {
     /// The topic the log belongs to.
     pub id: GtsInstanceId,
-    /// `topic_uuid(id)`, the key of every plugin row of the topic.
+    /// The `TopicSpec.uuid` the topic was provisioned under, the key of every
+    /// plugin row of the topic.
     pub uuid: Uuid,
     /// The topic's partition count.
     pub partitions: u32,
@@ -183,15 +184,16 @@ impl Shared {
     ) -> Result<Option<Arc<KnownTopic>>, BackendError> {
         let pool = self.pool()?;
         let map = |e| error::map(operation, &e);
-        let uuid = topic_uuid(topic);
-        let row: Option<(String, i32)> = error::retried(|| {
-            sqlx::query_as("SELECT topic_id, partitions FROM evbk__log WHERE topic_uuid = ?")
-                .bind(uuid)
-                .fetch_optional(pool)
+        let row: Option<(Uuid, String, i32)> = error::retried(|| {
+            sqlx::query_as(
+                "SELECT topic_uuid, topic_id, partitions FROM evbk__log WHERE topic_id = ?",
+            )
+            .bind(topic.as_ref())
+            .fetch_optional(pool)
         })
         .await
         .map_err(map)?;
-        let Some((topic_id, partitions)) = row else {
+        let Some((uuid, topic_id, partitions)) = row else {
             return Ok(None);
         };
         let tables: Vec<(i32, String)> = error::retried(|| {

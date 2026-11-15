@@ -69,7 +69,7 @@ async fn events_publish_requires_a_registered_event_type() {
         .with_body(crate::test_support::Json(serde_json::json!({
             "id": uuid::Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": uuid::Uuid::new_v4(),
+            "subject_tenant": uuid::Uuid::new_v4(),
             "source": "test",
             "subject": "s1",
             "subject_type": "gts.x.eb.t1.subject.v1~",

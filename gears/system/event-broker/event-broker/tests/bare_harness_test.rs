@@ -54,7 +54,10 @@ async fn a_bare_harness_knows_no_gear_contract_linked_into_the_binary() {
     let ctx = harness.security_context();
 
     let (type_id, detail) = match broker.get_event_type(ctx, PROBE_EVENT_TYPE).await {
-        Err(EventBrokerError::EventTypeUnknown { type_id, detail }) => (type_id, detail),
+        Err(EventBrokerError::EventTypeUnknown {
+            event_type: type_id,
+            detail,
+        }) => (type_id, detail),
         other => panic!("the probe event type must be unknown to a bare harness: {other:?}"),
     };
     assert_eq!(type_id, PROBE_EVENT_TYPE);

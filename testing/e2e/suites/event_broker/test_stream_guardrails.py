@@ -30,7 +30,7 @@ async def test_stream_rejects_application_json_accept(api):
     sub_id = str(uuid.uuid4())
     async with api() as client:
         resp = await client.get(
-            f"/events:stream?subscription_id={sub_id}",
+            f"/events:stream?subscription={sub_id}",
             headers={"Accept": "application/json"},
         )
 
@@ -51,7 +51,7 @@ async def test_stream_rejects_text_event_stream_accept(api):
     sub_id = str(uuid.uuid4())
     async with api() as client:
         resp = await client.get(
-            f"/events:stream?subscription_id={sub_id}",
+            f"/events:stream?subscription={sub_id}",
             headers={"Accept": "text/event-stream"},
         )
 
@@ -70,7 +70,7 @@ async def test_sse_rejects_multipart_mixed_accept(api):
     sub_id = str(uuid.uuid4())
     async with api() as client:
         resp = await client.get(
-            f"/events:sse?subscription_id={sub_id}",
+            f"/events:sse?subscription={sub_id}",
             headers={"Accept": "multipart/mixed"},
         )
 
@@ -92,7 +92,7 @@ async def test_stream_accepts_wildcard_accept(api):
     sub_id = str(uuid.uuid4())
     async with api() as client:
         resp = await client.get(
-            f"/events:stream?subscription_id={sub_id}",
+            f"/events:stream?subscription={sub_id}",
             headers={"Accept": "*/*"},
         )
 

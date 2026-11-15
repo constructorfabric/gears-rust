@@ -117,7 +117,9 @@ impl StaticTypesRegistry {
     ///   Type-id pattern strings, defaults to `[]` - the true minimal value,
     ///   which rejects every `subject_type` at publish time), and
     ///   `partition_key` (a JSON Pointer, defaulting to the tenant the base
-    ///   declares).
+    ///   declares), and `subject_owner_required` (boolean, defaults to `false`:
+    ///   when `true`, the type narrows `subject_owner` to a required UUID string,
+    ///   which a `/subject_owner` partition key needs).
     ///
     /// An event type may name a topic deliberately left unregistered - the only
     /// way to reach the broker's "the type resolves a topic nobody registered"
@@ -224,6 +226,19 @@ impl StaticTypesRegistry {
                 // type that groups by a payload member.
                 if let Some(pointer) = entry.get("partition_key").and_then(JsonValue::as_str) {
                     traits = traits.with_partition_key(pointer);
+                }
+                if entry
+                    .get("subject_owner_required")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false)
+                {
+                    body["allOf"][1]["properties"]["subject_owner"] =
+                        json!({ "type": "string", "format": "uuid" });
+                    let required = &mut body["allOf"][1]["required"];
+                    match required.as_array_mut() {
+                        Some(names) => names.push(json!("subject_owner")),
+                        None => *required = json!(["subject_owner"]),
+                    }
                 }
                 body["x-gts-traits"] = json!(traits.build());
                 event_types.push(body);

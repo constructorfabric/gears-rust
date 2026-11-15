@@ -47,7 +47,7 @@ pub struct SubjectTypeRef(#[schemars(extend("x-gts-pattern-ref" = gts_id!("*")))
 
 /// The default the base declares for [`EventV1Traits::partition_key`]: the event's
 /// tenant. Every event carries one, so the default always resolves.
-const TENANT_POINTER: &str = "/tenant_id";
+const SUBJECT_TENANT_POINTER: &str = "/subject_tenant";
 
 // A JSON Pointer (RFC 6901) into an event, naming the member whose value is
 // hashed to pick the partition. `json-pointer` is a registered JSON Schema
@@ -82,7 +82,7 @@ pub struct EventV1Traits {
     allowed_subject_types: Vec<SubjectTypeRef>,
     /// JSON Pointer naming the member of an event whose value determines its partition. May point into `data`, which a bare field name could not express. Defaults to the event's tenant, so a type declaring nothing partitions per tenant. The broker checks at registration that the pointer names a member this type's resolved schema declares.
     #[serde(default = "default_partition_key")]
-    #[schemars(extend("default" = TENANT_POINTER))]
+    #[schemars(extend("default" = SUBJECT_TENANT_POINTER))]
     partition_key: PartitionKeyRef,
 }
 
@@ -90,7 +90,7 @@ impl EventV1Traits {
     /// Starts a builder requiring a topic and allowed subject-type patterns.
     ///
     /// Both required methods may be called in either order. The partition
-    /// pointer defaults to `/tenant_id`. All values are serialized explicitly.
+    /// pointer defaults to `/subject_tenant`. All values are serialized explicitly.
     #[must_use]
     pub fn builder() -> EventV1TraitsBuilder {
         EventV1TraitsBuilder {
@@ -139,7 +139,7 @@ impl<T, S> EventV1TraitsBuilder<T, S> {
         }
     }
 
-    /// Sets the JSON Pointer used to partition events, overriding `/tenant_id`.
+    /// Sets the JSON Pointer used to partition events, overriding `/subject_tenant`.
     #[must_use]
     pub fn with_partition_key(mut self, pointer: impl Into<String>) -> Self {
         self.partition_key = PartitionKeyRef(pointer.into());
@@ -160,7 +160,7 @@ impl EventV1TraitsBuilder<TopicRef, Vec<SubjectTypeRef>> {
 }
 
 fn default_partition_key() -> PartitionKeyRef {
-    PartitionKeyRef(TENANT_POINTER.to_owned())
+    PartitionKeyRef(SUBJECT_TENANT_POINTER.to_owned())
 }
 
 /// Base topic type. A concrete topic is a well-known instance of it, carrying
@@ -195,17 +195,17 @@ pub struct TopicV1 {
 #[serde(deny_unknown_fields)]
 #[schemars(inline)]
 pub struct EventMeta {
-    /// Meta-block schema version. The broker accepts version <= current_supported and rejects newer with 400 UnknownMetaVersion.
+    /// Meta-block schema version. The broker supports version 1 and rejects a higher one with `400 UnknownMetaVersion`; it does not enforce the minimum declared here, so a lower value is accepted.
     #[schemars(range(min = 1))]
     pub version: u32,
     /// Producer registered via POST /v1/producers; bound to the calling principal. Required for chained / monotonic mode publishes. Omit for stateless.
     #[serde(default)]
-    pub producer_id: Option<Uuid>,
-    /// Predecessor's sequence for chain dedup. Required and only valid in chained mode. On the first chained-mode publish for a (producer_id, topic), set to 0.
+    pub producer: Option<Uuid>,
+    /// Predecessor's sequence for chain dedup. Required and only valid in chained mode. On the first chained-mode publish for a (producer, topic), set to 0.
     #[serde(default)]
     #[schemars(range(min = 0))]
     pub previous: Option<i64>,
-    /// Producer-assigned monotonic sequence per (producer_id, topic). Required in chained and monotonic modes; omitted in stateless.
+    /// Producer-assigned monotonic sequence per (producer, topic). Required in chained and monotonic modes; omitted in stateless.
     #[serde(default)]
     #[schemars(range(min = 1))]
     pub sequence: Option<i64>,
@@ -217,7 +217,7 @@ impl EventMeta {
     fn largest_stamp() -> Self {
         Self {
             version: 1,
-            producer_id: Some(Uuid::nil()),
+            producer: Some(Uuid::nil()),
             previous: Some(i64::MAX),
             sequence: Some(i64::MAX),
         }
@@ -228,17 +228,16 @@ impl EventMeta {
 /// under it, narrowing `data` to its own payload contract and fixing its traits.
 ///
 /// One canonical shape serves both publish input and read responses; direction is
-/// encoded per field. `writeOnly` fields are accepted on publish and stripped on
-/// read; `readOnly` fields are server-stamped on read and rejected if supplied on
-/// publish. `required` is therefore the union of publish-required and
-/// read-required, and a strict-validator producer filters `readOnly` fields
-/// before submitting.
+/// encoded per field. `writeOnly` fields are accepted on publish and stripped on read;
+/// `readOnly` fields are server-stamped on read and rejected if supplied on publish.
+/// `required` is therefore the union of publish-required and read-required, and a
+/// strict-validator producer filters `readOnly` fields before submitting.
 #[gts_type_schema(
     dir_path = "schemas",
     base = true,
     type_id = gts_id!("cf.core.events.event.v1~"),
-    description = "Event schema. Single canonical resource shape used by both publish input (POST /v1/events, POST /v1/events:batch) and read responses (poll / query). Per-direction semantics are encoded via JSON Schema field-level markers: `writeOnly` fields (meta) are accepted on publish and stripped on read; `readOnly` fields (partition, sequence, sequence_time) are server-stamped on read and rejected with 400 BadRequest if supplied on publish. The top-level `required` list is the union of publish-required and read-required fields; strict-validator producers must filter `readOnly` fields before submission.",
-    properties = "id,r#type,tenant_id,source,subject,subject_type,occurred_at,trace_parent,data,partition,sequence,sequence_time,meta",
+    description = "Event schema. Single canonical resource shape used by both publish input (POST /v1/events, POST /v1/events:batch) and read responses (the `payload` of each `event` frame of GET /v1/events:stream and GET /v1/events:sse). Per-direction semantics are encoded via JSON Schema field-level markers: `writeOnly` fields (meta) are accepted on publish and stripped on read; `readOnly` fields (partition, sequence, sequence_time) are server-stamped on read and rejected with 400 InvalidBody if supplied on publish. The top-level `required` list is the union of publish-required and read-required fields; strict-validator producers must filter `readOnly` fields before submission.",
+    properties = "id,r#type,subject_tenant,source,subject,subject_type,subject_owner,occurred_at,trace_parent,data,partition,sequence,sequence_time,meta",
     traits_schema = inline(EventV1Traits),
     gts_abstract = true,
 )]
@@ -257,8 +256,8 @@ pub struct EventV1<P = serde_json::Value> {
         extend("x-gts-type-ref" = SELF_ID_REF)
     )]
     r#type: GtsTypeId,
-    /// Tenant the event belongs to. Producer-supplied. Ingest validates the producer's principal is authorized to publish to this tenant via the platform's authz resolver; unauthorized publishes are rejected with 403 TenantIdNotAuthorized.
-    tenant_id: Uuid,
+    /// The tenant of the subject the event is about. Producer-supplied. A nil UUID is refused with 400 InvalidTenant; the publishing principal must reach this tenant, and to reach it across a self-managed tenant must also hold produce_ignore_barrier on the event type; otherwise the publish is refused with 403 TenantIdNotAuthorized.
+    subject_tenant: Uuid,
     /// Origin of the event (e.g., service name). ASCII only.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(required, with = "String", regex(pattern = ASCII_PRINTABLE), length(max = 256))]
@@ -269,6 +268,9 @@ pub struct EventV1<P = serde_json::Value> {
     /// Full GTS subject-type identifier - the type of the entity the event is about. Required and NOT derivable from `type`: event types may be generic (e.g., `rule_applied`) across multiple subject kinds, and events may have no `data` body to introspect. ASCII only.
     #[schemars(with = "String", extend("x-gts-type-ref" = gts_id!("*")))]
     subject_type: GtsTypeId,
+    /// The platform principal of the subject's tenant that owns the event, or null for a tenant-wide event. Producer-supplied and optional: an explicit null is the same as an absent member, and a nil UUID is refused with 400 InvalidSubjectOwner. An event type whose partition key is `/subject_owner` must narrow it to a required UUID string.
+    #[schemars(required, extend("type" = ["string", "null"], "format" = "uuid"))]
+    subject_owner: Option<Uuid>,
     /// When the event occurred (producer-stamped). ISO 8601 / RFC 3339 timestamp.
     #[schemars(with = "String", extend("format" = "date-time"))]
     occurred_at: DateTime<Utc>,
@@ -278,15 +280,15 @@ pub struct EventV1<P = serde_json::Value> {
     trace_parent: Option<String>,
     /// Event payload, validated at ingest against the resolved schema of the event's type. The only field where UTF-8 (or any non-ASCII bytes) is permitted; all other event fields are ASCII per platform convention. May be absent for body-less events (e.g., notification-only events whose semantics are fully carried by `type` + `subject`).
     data: Option<P>,
-    /// Server-stamped partition for the event, surfaced on read. Computed at ingest via the partition contract. Producers MUST NOT supply this field on publish; doing so is rejected with 400 BadRequest.
+    /// Server-stamped partition for the event, surfaced on read. Assigned by the storage backend from the key the event type's `partition_key` trait resolves to. Producers MUST NOT supply this field on publish; doing so is rejected with 400 InvalidBody.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(required, with = "i32", range(min = 0), extend("readOnly" = true))]
     partition: Option<u32>,
-    /// Server-assigned monotonic ordering key per (topic, partition), surfaced on read. The only sequence consumers paginate by. Distinct from `meta.sequence` (publish-only producer-side chain field). Producers MUST NOT supply this field on publish; doing so is rejected with 400 BadRequest.
+    /// Server-assigned monotonic ordering key per (topic, partition), surfaced on read. Consumer offsets (an exact SEEK position and a committed cursor) are values of it. Distinct from `meta.sequence` (publish-only producer-side chain field). Producers MUST NOT supply this field on publish; doing so is rejected with 400 InvalidBody.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(required, with = "i64", range(min = 0), extend("readOnly" = true))]
     sequence: Option<Sequence>,
-    /// Server-stamped timestamp recording when `sequence` was assigned. Surfaced on read. Producers MUST NOT supply this field on publish; doing so is rejected with 400 BadRequest.
+    /// Server-stamped timestamp recording when `sequence` was assigned. Surfaced on read. Producers MUST NOT supply this field on publish; doing so is rejected with 400 InvalidBody.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(
         required,
@@ -294,7 +296,7 @@ pub struct EventV1<P = serde_json::Value> {
         extend("readOnly" = true, "format" = "date-time")
     )]
     sequence_time: Option<DateTime<Utc>>,
-    /// Optional publish-time transport-metadata block. Carries producer-protocol fields (producer_id, previous, sequence) for chained / monotonic modes. Omit entirely for stateless publish. Stripped on read responses; consumers MUST NOT rely on it.
+    /// Optional publish-time transport-metadata block. Carries producer-protocol fields (producer, previous, sequence) for chained / monotonic modes. Omit entirely for stateless publish. Stripped on read responses; consumers MUST NOT rely on it.
     #[serde(default)]
     #[schemars(extend("writeOnly" = true))]
     meta: Option<EventMeta>,
@@ -345,10 +347,10 @@ impl<P: GtsSchema> EventV1<P> {
         &self.r#type
     }
 
-    /// Tenant the event belongs to.
+    /// The tenant of the subject the event is about.
     #[must_use]
-    pub fn tenant_id(&self) -> Uuid {
-        self.tenant_id
+    pub fn subject_tenant(&self) -> Uuid {
+        self.subject_tenant
     }
 
     /// Origin of the event; `None` until it is set. A stored or delivered event always
@@ -368,6 +370,12 @@ impl<P: GtsSchema> EventV1<P> {
     #[must_use]
     pub fn subject_type(&self) -> &GtsTypeId {
         &self.subject_type
+    }
+
+    /// The principal that owns the event; `None` for a tenant-wide event.
+    #[must_use]
+    pub fn subject_owner(&self) -> Option<Uuid> {
+        self.subject_owner
     }
 
     /// When the event occurred, as the producer stamped it.
@@ -482,13 +490,13 @@ impl<P: GtsSchema> EventV1<P> {
         }
     }
 
-    /// Checks the envelope's values that a decoded event can break (`source`, `subject`
-    /// and `trace_parent`) against the rules [`EventV1Builder::build`] applies, with the
-    /// same errors: a producer calls it before it sends an event, since an event read with
-    /// serde never passed through the builder. `type` and `subject_type` are not
+    /// Checks the envelope's values that a decoded event can break (`source`, `subject`,
+    /// `subject_owner` and `trace_parent`) against the rules [`EventV1Builder::build`]
+    /// applies, with the same errors: a producer calls it before it sends an event, since
+    /// an event read with serde never passed through the builder. `type` and `subject_type` are not
     /// re-checked: the builder refuses an empty one, and decoding a `GtsTypeId` refuses an
     /// empty id, so neither is empty on a built or decoded event. Presence is not checked
-    /// either: a built or decoded `EventV1` always has a `tenant_id`, a `subject` and a
+    /// either: a built or decoded `EventV1` always has a `subject_tenant`, a `subject` and a
     /// `subject_type`.
     ///
     /// # Errors
@@ -498,6 +506,8 @@ impl<P: GtsSchema> EventV1<P> {
     ///   [`crate::validate::source`];
     /// - [`EventBrokerError::InvalidTextField`] for `subject` when it breaks
     ///   [`crate::validate::subject`];
+    /// - [`EventBrokerError::InvalidEventField`] for `subject_owner` when it is the nil
+    ///   UUID;
     /// - [`EventBrokerError::InvalidEventField`] for `trace_parent` when it is set and is
     ///   not a W3C traceparent.
     pub(crate) fn check_envelope(&self) -> Result<(), EventBrokerError> {
@@ -505,6 +515,9 @@ impl<P: GtsSchema> EventV1<P> {
             Self::check_source(source)?;
         }
         Self::check_subject(&self.subject)?;
+        if let Some(owner) = self.subject_owner {
+            Self::check_subject_owner(owner)?;
+        }
         if let Some(trace_parent) = &self.trace_parent {
             Self::check_trace_parent(trace_parent)?;
         }
@@ -529,6 +542,17 @@ impl<P: GtsSchema> EventV1<P> {
     fn check_subject_type(subject_type: &GtsTypeId) -> Result<(), EventBrokerError> {
         if subject_type.is_empty() {
             return Err(Self::required("subject_type"));
+        }
+        Ok(())
+    }
+
+    /// Refuses the nil UUID as an owner: absence is how an event says it has none.
+    fn check_subject_owner(owner: Uuid) -> Result<(), EventBrokerError> {
+        if owner.is_nil() {
+            return Err(EventBrokerError::InvalidEventField {
+                field: "subject_owner",
+                detail: "must not be the nil UUID".to_owned(),
+            });
         }
         Ok(())
     }
@@ -562,10 +586,11 @@ impl<P: GtsSchema + Clone> Clone for EventV1<P> {
         Self {
             id: self.id,
             r#type: self.r#type.clone(),
-            tenant_id: self.tenant_id,
+            subject_tenant: self.subject_tenant,
             source: self.source.clone(),
             subject: self.subject.clone(),
             subject_type: self.subject_type.clone(),
+            subject_owner: self.subject_owner,
             occurred_at: self.occurred_at,
             trace_parent: self.trace_parent.clone(),
             data: self.data.clone(),
@@ -584,10 +609,11 @@ impl<P: GtsSchema> std::fmt::Debug for EventV1<P> {
         f.debug_struct("EventV1")
             .field("id", &self.id)
             .field("type", &self.r#type)
-            .field("tenant_id", &self.tenant_id)
+            .field("subject_tenant", &self.subject_tenant)
             .field("source", &self.source)
             .field("subject", &self.subject)
             .field("subject_type", &self.subject_type)
+            .field("subject_owner", &self.subject_owner)
             .field("occurred_at", &self.occurred_at)
             .field("trace_parent", &self.trace_parent)
             .field(
@@ -636,10 +662,11 @@ impl<P: EventPayload> TryFrom<&EventV1<P>> for EventV1 {
         Ok(EventV1 {
             id: event.id,
             r#type: event.r#type.clone(),
-            tenant_id: event.tenant_id,
+            subject_tenant: event.subject_tenant,
             source: event.source.clone(),
             subject: event.subject.clone(),
             subject_type: event.subject_type.clone(),
+            subject_owner: event.subject_owner,
             occurred_at: event.occurred_at,
             trace_parent: event.trace_parent.clone(),
             data,
@@ -670,8 +697,9 @@ impl EventV1 {
 
     /// What an outbox row adds around an event of at most
     /// [`MAX_ENCODED_BYTES`](Self::MAX_ENCODED_BYTES): the broker's ingest row (the topic
-    /// twice, the partition key, the stored event's empty server-stamped members) and the
-    /// SDK producer's envelope (the topic, the mode, the client agent).
+    /// twice, the partition key, the stored event's empty server-stamped members, the
+    /// broker's ingest stamp) and the SDK producer's envelope (the topic, the mode, the
+    /// client agent).
     pub const OUTBOX_RESERVE_BYTES: usize = 4 * 1024;
 
     /// The most bytes a resolved partition key may take, as
@@ -802,16 +830,17 @@ impl EventV1 {
             .map(<P as ::gts::GtsDeserialize<'_>>::gts_deserialize)
             .transpose()
             .map_err(|err| EventBrokerError::Decode {
-                type_id: self.r#type.to_string(),
+                event_type: self.r#type.to_string(),
                 category: err.classify().into(),
             })?;
         Ok(EventV1 {
             id: self.id,
             r#type: self.r#type.clone(),
-            tenant_id: self.tenant_id,
+            subject_tenant: self.subject_tenant,
             source: self.source.clone(),
             subject: self.subject.clone(),
             subject_type: self.subject_type.clone(),
+            subject_owner: self.subject_owner,
             occurred_at: self.occurred_at,
             trace_parent: self.trace_parent.clone(),
             data,
@@ -853,16 +882,17 @@ impl EventV1 {
         crate::models::resolve_partition_input(&self.addressable(), pointer)
     }
 
-    /// The event's publish-time members by their schema names: the nine members
+    /// The event's publish-time members by their schema names: the ten members
     /// [`crate::models::Event`] exposes to a partition-key pointer.
     fn addressable(&self) -> serde_json::Value {
         serde_json::json!({
             "id": self.id,
             "type": self.r#type,
-            "tenant_id": self.tenant_id,
+            "subject_tenant": self.subject_tenant,
             "source": self.source,
             "subject": self.subject,
             "subject_type": self.subject_type,
+            "subject_owner": self.subject_owner,
             "occurred_at": self.occurred_at,
             "trace_parent": self.trace_parent,
             "data": self.data,
@@ -877,10 +907,11 @@ pub struct EventV1Builder<P> {
     r#type: GtsTypeId,
     data: Option<P>,
     id: Option<Uuid>,
-    tenant_id: Option<Uuid>,
+    subject_tenant: Option<Uuid>,
     source: Option<String>,
     subject: Option<String>,
     subject_type: Option<GtsTypeId>,
+    subject_owner: Option<Uuid>,
     occurred_at: Option<DateTime<Utc>>,
     trace_parent: Option<String>,
 }
@@ -891,10 +922,11 @@ impl<P: EventPayload> EventV1Builder<P> {
             r#type,
             data: None,
             id: None,
-            tenant_id: None,
+            subject_tenant: None,
             source: None,
             subject: None,
             subject_type: None,
+            subject_owner: None,
             occurred_at: None,
             trace_parent: None,
         }
@@ -907,10 +939,11 @@ impl<P: EventPayload> EventV1Builder<P> {
         self
     }
 
-    /// Sets the tenant the event belongs to. Required.
+    /// Sets the tenant of the subject the event is about. Required. The broker refuses the
+    /// nil UUID with 400 `InvalidTenant`.
     #[must_use]
-    pub fn tenant_id(mut self, id: Uuid) -> Self {
-        self.tenant_id = Some(id);
+    pub fn subject_tenant(mut self, id: Uuid) -> Self {
+        self.subject_tenant = Some(id);
         self
     }
 
@@ -943,8 +976,16 @@ impl<P: EventPayload> EventV1Builder<P> {
     /// against the event type's `allowed_subject_types`. Replaces any earlier subject
     /// type.
     #[must_use]
-    pub fn subject_type_id(mut self, subject_type: GtsTypeId) -> Self {
+    pub fn subject_type_of(mut self, subject_type: GtsTypeId) -> Self {
         self.subject_type = Some(subject_type);
+        self
+    }
+
+    /// Sets the principal of the subject's tenant that owns the event. Without it the
+    /// event is tenant-wide. `build()` refuses the nil UUID.
+    #[must_use]
+    pub fn subject_owner(mut self, owner: Uuid) -> Self {
+        self.subject_owner = Some(owner);
         self
     }
 
@@ -970,21 +1011,23 @@ impl<P: EventPayload> EventV1Builder<P> {
     /// Returns the first failure, in this order:
     /// - [`EventBrokerError::InvalidEventField`] for `type` when it is empty, as for an
     ///   untyped payload passed to [`EventV1::builder`];
-    /// - [`EventBrokerError::InvalidEventField`] for `tenant_id` when it is unset;
+    /// - [`EventBrokerError::InvalidEventField`] for `subject_tenant` when it is unset;
     /// - [`EventBrokerError::InvalidTextField`] for `source` when it is set and breaks
     ///   [`crate::validate::source`];
     /// - [`EventBrokerError::InvalidEventField`] for `subject` when it is unset, or
     ///   [`EventBrokerError::InvalidTextField`] when it breaks [`crate::validate::subject`];
     /// - [`EventBrokerError::InvalidEventField`] for `subject_type` when it is unset or
     ///   empty;
+    /// - [`EventBrokerError::InvalidEventField`] for `subject_owner` when it is the nil
+    ///   UUID;
     /// - [`EventBrokerError::InvalidEventField`] for `trace_parent` when it is set and is
     ///   not a W3C traceparent.
     pub fn build(self) -> Result<EventV1<P>, EventBrokerError> {
         // The value rules are `EventV1`'s; `check_envelope` shares those a decoded
         // event can break.
         EventV1::<P>::check_type(&self.r#type)?;
-        let Some(tenant_id) = self.tenant_id else {
-            return Err(EventV1::<P>::required("tenant_id"));
+        let Some(subject_tenant) = self.subject_tenant else {
+            return Err(EventV1::<P>::required("subject_tenant"));
         };
         if let Some(source) = &self.source {
             EventV1::<P>::check_source(source)?;
@@ -997,6 +1040,9 @@ impl<P: EventPayload> EventV1Builder<P> {
             return Err(EventV1::<P>::required("subject_type"));
         };
         EventV1::<P>::check_subject_type(&subject_type)?;
+        if let Some(owner) = self.subject_owner {
+            EventV1::<P>::check_subject_owner(owner)?;
+        }
         if let Some(trace_parent) = &self.trace_parent {
             EventV1::<P>::check_trace_parent(trace_parent)?;
         }
@@ -1004,10 +1050,11 @@ impl<P: EventPayload> EventV1Builder<P> {
         Ok(EventV1 {
             id: self.id.unwrap_or_else(Uuid::now_v7),
             r#type: self.r#type,
-            tenant_id,
+            subject_tenant,
             source: self.source,
             subject,
             subject_type,
+            subject_owner: self.subject_owner,
             occurred_at: self.occurred_at.unwrap_or_else(Utc::now),
             trace_parent: self.trace_parent,
             data: self.data,
@@ -1029,10 +1076,11 @@ impl<P> std::fmt::Debug for EventV1Builder<P> {
                 &self.data.as_ref().map(|_| std::any::type_name::<P>()),
             )
             .field("id", &self.id)
-            .field("tenant_id", &self.tenant_id)
+            .field("subject_tenant", &self.subject_tenant)
             .field("source", &self.source)
             .field("subject", &self.subject)
             .field("subject_type", &self.subject_type)
+            .field("subject_owner", &self.subject_owner)
             .field("occurred_at", &self.occurred_at)
             .field("trace_parent", &self.trace_parent)
             .finish()

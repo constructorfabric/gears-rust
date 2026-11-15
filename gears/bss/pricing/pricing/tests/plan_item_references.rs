@@ -556,7 +556,7 @@ async fn an_attach_refused_loses_the_item_once_and_reconciliation_finds_it_again
     assert_eq!(data["skuId"], item.sku_id.to_string());
     assert_eq!(data["reservationId"], Value::Null);
     assert_eq!(
-        events[0]["tenant_id"],
+        events[0]["subject_tenant"],
         f.ctx.subject_tenant_id().to_string()
     );
     assert_eq!(events[0]["subject"], item.id.to_string());

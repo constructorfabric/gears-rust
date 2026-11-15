@@ -363,7 +363,7 @@ fn stored_bytes(event: &Event) -> u64 {
     });
     let variable = event.source.len()
         + event.subject.len()
-        + event.type_id.as_ref().len()
+        + event.event_type.as_ref().len()
         + event.subject_type.as_ref().len()
         + event.trace_parent.as_ref().map_or(0, String::len)
         + data;

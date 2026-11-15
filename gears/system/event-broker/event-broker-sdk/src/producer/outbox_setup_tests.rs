@@ -354,6 +354,28 @@ async fn a_setup_build_refuses_each_invalid_option_before_any_call() {
     }
 }
 
+/// A set `client_agent` that is printable ASCII within 256 bytes but breaks
+/// the RFC 9110 User-Agent grammar is refused at the same point as one that
+/// breaks the encoding or length rule, before any broker call.
+#[tokio::test]
+async fn a_setup_build_refuses_a_client_agent_that_breaks_the_user_agent_grammar() {
+    let built = Options {
+        client_agent: Some("agent/".to_owned()),
+        ..Options::valid()
+    }
+    .build()
+    .await;
+
+    let Err(EventBrokerError::InvalidProducerOptions { detail }) = &built else {
+        panic!("a client agent ending in '/' must be refused, got {built:?}");
+    };
+    assert_eq!(
+        detail,
+        "client_agent must follow the RFC 9110 User-Agent grammar: \
+         product *( SP ( product / comment ) )"
+    );
+}
+
 /// A lazy setup refuses to enqueue a type it has not prepared, inside the
 /// caller's transaction, without preparing it there: no broker call, and the
 /// transaction writes nothing.
@@ -371,8 +393,12 @@ async fn a_lazy_setup_refuses_an_unprepared_type_without_a_broker_call() {
         })
         .await;
 
-    let Err(TxError::Broker(err @ EventBrokerError::SchemaNotPrepared { type_id, detail })) =
-        &enqueued
+    let Err(TxError::Broker(
+        err @ EventBrokerError::SchemaNotPrepared {
+            event_type: type_id,
+            detail,
+        },
+    )) = &enqueued
     else {
         panic!("expected SchemaNotPrepared, got {enqueued:?}");
     };
@@ -473,9 +499,9 @@ fn order() -> EventV1<OrderCreated> {
     EventV1::builder(OrderCreated {
         order_id: Uuid::from_u128(1),
     })
-    .tenant_id(TENANT)
+    .subject_tenant(TENANT)
     .subject("order-1")
-    .subject_type_id(GtsTypeId::new(SUBJECT_TYPE))
+    .subject_type_of(GtsTypeId::new(SUBJECT_TYPE))
     .build()
     .expect("a valid order event")
 }

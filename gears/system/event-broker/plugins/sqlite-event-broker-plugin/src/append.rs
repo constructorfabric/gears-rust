@@ -29,7 +29,7 @@ const OP: Operation = Operation::Append;
 
 /// One event as it is inserted: its tenant and its encoded body.
 struct Row {
-    tenant_id: Uuid,
+    subject_tenant: Uuid,
     body: Vec<u8>,
 }
 
@@ -67,7 +67,7 @@ pub async fn append(
             .or_default();
         batch.bytes += i64::try_from(encoded.len()).unwrap_or(i64::MAX);
         batch.rows.push(Row {
-            tenant_id: keyed.event.tenant_id,
+            subject_tenant: keyed.event.subject_tenant,
             body: encoded,
         });
     }
@@ -169,7 +169,7 @@ async fn insert(
     rows: Vec<Row>,
 ) -> Result<(), sqlx::Error> {
     let mut insert = QueryBuilder::<Sqlite>::new(
-        "INSERT INTO evbk__event (topic_uuid, partition, sequence, sequence_time, tenant_id, size, body) ",
+        "INSERT INTO evbk__event (topic_uuid, partition, sequence, sequence_time, subject_tenant, size, body) ",
     );
     insert.push_values((first..).zip(rows), |mut values, (sequence, row)| {
         values
@@ -177,7 +177,7 @@ async fn insert(
             .push_bind(column(partition))
             .push_bind(sequence)
             .push_bind(stored_at)
-            .push_bind(row.tenant_id)
+            .push_bind(row.subject_tenant)
             .push_bind(i64::try_from(row.body.len()).unwrap_or(i64::MAX))
             .push_bind(row.body);
     });

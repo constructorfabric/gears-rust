@@ -12,20 +12,21 @@ fn uuid(n: u128) -> Uuid {
 }
 
 #[test]
-fn publish_event_serialises_with_type_rename_and_meta() {
+fn publish_event_serialises_with_type_rename_owner_and_meta() {
     let wire = PublishEventWire {
         id: uuid(1),
         type_id: gts::GtsTypeId::new("gts.cf.core.events.event.v1~acme.orders.created.v1~"),
-        tenant_id: uuid(2),
+        subject_tenant: uuid(2),
         source: "orders".to_owned(),
         subject: "order-1".to_owned(),
         subject_type: gts::GtsTypeId::new("gts.acme.shop.orders.order.v1~"),
+        subject_owner: Some(uuid(6)),
         occurred_at: "2026-01-02T03:04:05Z".parse().unwrap(),
         trace_parent: Some("00-abc-def-01".to_owned()),
         data: Some(json!({ "amount": 100 })),
         meta: Some(MetaWire {
             version: 1,
-            producer_id: Some(uuid(3)),
+            producer: Some(uuid(3)),
             previous: Some(4),
             sequence: Some(5),
         }),
@@ -35,16 +36,17 @@ fn publish_event_serialises_with_type_rename_and_meta() {
         json!({
             "id": "00000000-0000-0000-0000-000000000001",
             "type": "gts.cf.core.events.event.v1~acme.orders.created.v1~",
-            "tenant_id": "00000000-0000-0000-0000-000000000002",
+            "subject_tenant": "00000000-0000-0000-0000-000000000002",
             "source": "orders",
             "subject": "order-1",
             "subject_type": "gts.acme.shop.orders.order.v1~",
+            "subject_owner": "00000000-0000-0000-0000-000000000006",
             "occurred_at": "2026-01-02T03:04:05Z",
             "trace_parent": "00-abc-def-01",
             "data": { "amount": 100 },
             "meta": {
                 "version": 1,
-                "producer_id": "00000000-0000-0000-0000-000000000003",
+                "producer": "00000000-0000-0000-0000-000000000003",
                 "previous": 4,
                 "sequence": 5
             }
@@ -57,10 +59,11 @@ fn publish_event_omits_absent_optionals() {
     let wire = PublishEventWire {
         id: uuid(1),
         type_id: gts::GtsTypeId::new("t"),
-        tenant_id: uuid(2),
+        subject_tenant: uuid(2),
         source: "s".to_owned(),
         subject: "sub".to_owned(),
         subject_type: gts::GtsTypeId::new("st"),
+        subject_owner: None,
         occurred_at: "2026-01-02T03:04:05Z".parse().unwrap(),
         trace_parent: None,
         data: None,
@@ -71,12 +74,63 @@ fn publish_event_omits_absent_optionals() {
         json!({
             "id": "00000000-0000-0000-0000-000000000001",
             "type": "t",
-            "tenant_id": "00000000-0000-0000-0000-000000000002",
+            "subject_tenant": "00000000-0000-0000-0000-000000000002",
             "source": "s",
             "subject": "sub",
             "subject_type": "st",
             "occurred_at": "2026-01-02T03:04:05Z"
         })
+    );
+}
+
+/// The publish body of an owned event names its owner; an unowned event's body leaves
+/// the member out.
+#[test]
+fn a_publish_body_carries_the_events_owner() {
+    let event = |owner: Option<Uuid>| {
+        let builder = EventV1::builder_without_data(gts::GtsTypeId::new(
+            "gts.cf.core.events.event.v1~a.b.c.d.v1~",
+        ))
+        .id(uuid(1))
+        .subject_tenant(uuid(2))
+        .source("s")
+        .subject("sub")
+        .subject_type_of(gts::GtsTypeId::new("gts.a.b.c.e.v1~"))
+        .occurred_at("2026-01-02T03:04:05Z".parse().unwrap());
+        match owner {
+            Some(owner) => builder.subject_owner(owner),
+            None => builder,
+        }
+        .build()
+        .unwrap()
+    };
+    let bodies = [Some(uuid(9)), None].map(|owner| {
+        serde_json::to_value(PublishEventWire::try_from(&event(owner)).unwrap()).unwrap()
+    });
+
+    assert_eq!(
+        bodies,
+        [
+            json!({
+                "id": "00000000-0000-0000-0000-000000000001",
+                "type": "gts.cf.core.events.event.v1~a.b.c.d.v1~",
+                "subject_tenant": "00000000-0000-0000-0000-000000000002",
+                "source": "s",
+                "subject": "sub",
+                "subject_type": "gts.a.b.c.e.v1~",
+                "subject_owner": "00000000-0000-0000-0000-000000000009",
+                "occurred_at": "2026-01-02T03:04:05Z"
+            }),
+            json!({
+                "id": "00000000-0000-0000-0000-000000000001",
+                "type": "gts.cf.core.events.event.v1~a.b.c.d.v1~",
+                "subject_tenant": "00000000-0000-0000-0000-000000000002",
+                "source": "s",
+                "subject": "sub",
+                "subject_type": "gts.a.b.c.e.v1~",
+                "occurred_at": "2026-01-02T03:04:05Z"
+            }),
+        ]
     );
 }
 
@@ -93,13 +147,14 @@ fn register_producer_uses_snake_case_mode() {
 }
 
 #[test]
-fn interest_max_depth_is_untagged_int_or_null() {
-    let unlimited = InterestWire {
+fn an_interest_request_names_its_tenant_only_when_set() {
+    let named = InterestWire {
         topic: gts::GtsInstanceId::new("gts.cf.core.events.topic.v1~acme.orders.v1", ""),
-        tenant_id: uuid(2),
-        max_depth: MaxDepthWire::Unlimited,
+        subject_tenant: Some(uuid(2)),
+        ownership_filter: OwnershipFilterWire::TenantSubtreeIncluded,
         barrier_mode: BarrierModeWire::Ignore,
         types: vec!["gts.cf.core.events.event.v1~acme.orders.*".to_owned()],
+        subject_types: Vec::new(),
         filter: Some(FilterSpecWire {
             engine: gts::GtsInstanceId::new(
                 "gts.cf.core.events.filter.v1~cf.core.expression.cel.v1",
@@ -109,11 +164,11 @@ fn interest_max_depth_is_untagged_int_or_null() {
         }),
     };
     assert_eq!(
-        serde_json::to_value(&unlimited).unwrap(),
+        serde_json::to_value(&named).unwrap(),
         json!({
             "topic": "gts.cf.core.events.topic.v1~acme.orders.v1",
-            "tenant_id": "00000000-0000-0000-0000-000000000002",
-            "max_depth": null,
+            "subject_tenant": "00000000-0000-0000-0000-000000000002",
+            "ownership_filter": "tenant_subtree_included",
             "barrier_mode": "ignore",
             "types": ["gts.cf.core.events.event.v1~acme.orders.*"],
             "filter": {
@@ -123,22 +178,141 @@ fn interest_max_depth_is_untagged_int_or_null() {
         })
     );
 
-    let levels = InterestWire {
+    let callers = InterestWire {
         topic: gts::GtsInstanceId::new("t", ""),
-        tenant_id: uuid(2),
-        max_depth: MaxDepthWire::Levels(2),
+        subject_tenant: None,
+        ownership_filter: OwnershipFilterWire::OnlyMine,
         barrier_mode: BarrierModeWire::Respect,
         types: vec!["e".to_owned()],
+        subject_types: Vec::new(),
         filter: None,
     };
     assert_eq!(
-        serde_json::to_value(&levels).unwrap(),
+        serde_json::to_value(&callers).unwrap(),
         json!({
             "topic": "t",
-            "tenant_id": "00000000-0000-0000-0000-000000000002",
-            "max_depth": 2,
+            "ownership_filter": "only_mine",
             "barrier_mode": "respect",
             "types": ["e"]
+        })
+    );
+}
+
+#[test]
+fn an_interest_request_carries_its_subject_type_selector_only_when_set() {
+    let selecting = InterestWire {
+        topic: gts::GtsInstanceId::new("gts.cf.core.events.topic.v1~acme.orders.x.x.v1", ""),
+        subject_tenant: Some(uuid(2)),
+        ownership_filter: OwnershipFilterWire::EntireTenant,
+        barrier_mode: BarrierModeWire::Respect,
+        types: vec!["gts.cf.core.events.event.v1~acme.orders.x.*".to_owned()],
+        subject_types: vec!["gts.acme.orders.x.customer.v1~".to_owned()],
+        filter: None,
+    };
+    assert_eq!(
+        serde_json::to_value(&selecting).unwrap(),
+        json!({
+            "topic": "gts.cf.core.events.topic.v1~acme.orders.x.x.v1",
+            "subject_tenant": "00000000-0000-0000-0000-000000000002",
+            "ownership_filter": "entire_tenant",
+            "barrier_mode": "respect",
+            "types": ["gts.cf.core.events.event.v1~acme.orders.x.*"],
+            "subject_types": ["gts.acme.orders.x.customer.v1~"]
+        })
+    );
+
+    let unselecting = InterestWire {
+        subject_types: Vec::new(),
+        ..selecting
+    };
+    assert_eq!(
+        serde_json::to_value(&unselecting).unwrap(),
+        json!({
+            "topic": "gts.cf.core.events.topic.v1~acme.orders.x.x.v1",
+            "subject_tenant": "00000000-0000-0000-0000-000000000002",
+            "ownership_filter": "entire_tenant",
+            "barrier_mode": "respect",
+            "types": ["gts.cf.core.events.event.v1~acme.orders.x.*"]
+        })
+    );
+}
+
+#[test]
+fn an_interest_echo_without_subject_types_decodes_to_no_selector() {
+    let echo: InterestResponseWire = serde_json::from_value(json!({
+        "topic": "gts.cf.core.events.topic.v1~acme.orders.x.x.v1",
+        "subject_tenant": "00000000-0000-0000-0000-000000000002",
+        "ownership_filter": "entire_tenant",
+        "barrier_mode": "respect",
+        "types": ["gts.cf.core.events.event.v1~acme.orders.x.*"],
+        "filter": null
+    }))
+    .unwrap();
+
+    assert_eq!(echo.subject_types, Vec::<String>::new());
+}
+
+/// Each JOIN interest carries its `unmatched_types` next to the echo; an
+/// interest without the key decodes to none.
+#[test]
+fn a_join_response_decodes_each_interests_unmatched_types() {
+    let interest = |types: serde_json::Value| {
+        json!({
+            "topic": "gts.cf.core.events.topic.v1~acme.orders.x.x.v1",
+            "subject_tenant": "00000000-0000-0000-0000-000000000002",
+            "ownership_filter": "entire_tenant",
+            "barrier_mode": "respect",
+            "types": types,
+            "subject_types": [],
+            "filter": null,
+        })
+    };
+    let mut reported = interest(json!(["gts.cf.core.events.event.v1~acme.orders.x.*"]));
+    reported["unmatched_types"] = json!(["gts.cf.core.events.event.v1~acme.orders.x.*"]);
+    let without_key = interest(json!(["gts.cf.core.events.event.v1~acme.orders.y.v1~"]));
+    let body = json!({
+        "id": "00000000-0000-0000-0000-000000000001",
+        "consumer_group": "gts.cf.core.events.consumer_group.v1~00000000-0000-0000-0000-000000000003",
+        "client_agent": "orders/1.0",
+        "interests": [reported, without_key],
+        "assigned": [{ "topic": "gts.cf.core.events.topic.v1~acme.orders.x.x.v1", "partition": 0 }],
+        "topology_version": 1,
+        "created_at": "2026-01-02T03:04:05Z",
+    });
+
+    let wire: JoinSubscriptionResponseWire = serde_json::from_value(body).unwrap();
+
+    assert_eq!(
+        serde_json::to_value(&wire).unwrap(),
+        json!({
+            "id": "00000000-0000-0000-0000-000000000001",
+            "consumer_group": "gts.cf.core.events.consumer_group.v1~00000000-0000-0000-0000-000000000003",
+            "client_agent": "orders/1.0",
+            "interests": [
+                {
+                    "topic": "gts.cf.core.events.topic.v1~acme.orders.x.x.v1",
+                    "subject_tenant": "00000000-0000-0000-0000-000000000002",
+                    "ownership_filter": "entire_tenant",
+                    "barrier_mode": "respect",
+                    "types": ["gts.cf.core.events.event.v1~acme.orders.x.*"],
+                    "subject_types": [],
+                    "filter": null,
+                    "unmatched_types": ["gts.cf.core.events.event.v1~acme.orders.x.*"],
+                },
+                {
+                    "topic": "gts.cf.core.events.topic.v1~acme.orders.x.x.v1",
+                    "subject_tenant": "00000000-0000-0000-0000-000000000002",
+                    "ownership_filter": "entire_tenant",
+                    "barrier_mode": "respect",
+                    "types": ["gts.cf.core.events.event.v1~acme.orders.y.v1~"],
+                    "subject_types": [],
+                    "filter": null,
+                    "unmatched_types": [],
+                },
+            ],
+            "assigned": [{ "topic": "gts.cf.core.events.topic.v1~acme.orders.x.x.v1", "partition": 0 }],
+            "topology_version": 1,
+            "created_at": "2026-01-02T03:04:05Z",
         })
     );
 }
@@ -186,7 +360,7 @@ fn event_type_response_deserialises() {
         "topic": "gts.cf.core.events.topic.v1~acme.orders.order.stream.v1",
         "description": null,
         "allowed_subject_types": ["gts.acme.orders.order.entity.v1~"],
-        "partition_key": "/tenant_id",
+        "partition_key": "/subject_tenant",
         "data_schema": { "type": "object" }
     }))
     .unwrap();
@@ -203,7 +377,7 @@ fn event_type_response_deserialises() {
         wire.allowed_subject_types,
         vec!["gts.acme.orders.order.entity.v1~".to_owned()]
     );
-    assert_eq!(wire.partition_key, "/tenant_id");
+    assert_eq!(wire.partition_key, "/subject_tenant");
     assert_eq!(wire.data_schema, json!({ "type": "object" }));
 }
 
@@ -235,8 +409,7 @@ fn frame_event_decodes_into_wire_frame() {
         "payload": {
             "id": "00000000-0000-0000-0000-000000000001",
             "type": "gts.cf.core.events.event.v1~acme.orders.order.created.v1~",
-            "topic": "gts.cf.core.events.topic.v1~acme.orders.order.stream.v1",
-            "tenant_id": "00000000-0000-0000-0000-000000000002",
+            "subject_tenant": "00000000-0000-0000-0000-000000000002",
             "source": "orders",
             "subject": "order-1",
             "subject_type": "gts.acme.orders.order.entity.v1~",
@@ -270,8 +443,7 @@ fn delivered_event_frame(overrides: serde_json::Value) -> FrameWire {
     let mut payload = json!({
         "id": "00000000-0000-0000-0000-000000000001",
         "type": "gts.cf.core.events.event.v1~acme.orders.order.created.v1~",
-        "topic": "gts.cf.core.events.topic.v1~acme.orders.order.stream.v1",
-        "tenant_id": "00000000-0000-0000-0000-000000000002",
+        "subject_tenant": "00000000-0000-0000-0000-000000000002",
         "source": "order-service",
         "subject": "order-1",
         "subject_type": "gts.acme.orders.order.entity.v1~",
@@ -305,7 +477,148 @@ fn a_delivered_event_frame_keeps_its_source_and_position() {
         event.event_type(),
         "gts.cf.core.events.event.v1~acme.orders.order.created.v1~"
     );
-    assert_eq!(event.tenant_id(), uuid(2));
+    assert_eq!(event.subject_tenant(), uuid(2));
+    assert_eq!(event.source(), Some("order-service"));
+    assert_eq!(event.subject(), "order-1");
+    assert_eq!(event.subject_type(), "gts.acme.orders.order.entity.v1~");
+    assert_eq!(
+        event.occurred_at(),
+        "2026-01-02T03:04:05Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap()
+    );
+    assert_eq!(
+        event.trace_parent(),
+        Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")
+    );
+    assert_eq!(event.data(), Some(&json!({ "amount": 100 })));
+    assert_eq!(event.partition(), Some(2));
+    assert_eq!(event.sequence(), Some(Sequence::assigned(7)));
+    assert_eq!(
+        event.sequence_time(),
+        Some(
+            "2026-01-02T03:04:06Z"
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .unwrap()
+        )
+    );
+    assert!(event.meta().is_none());
+}
+
+/// A delivered event keeps the owner its frame names; a frame without one is a
+/// tenant-wide event.
+#[test]
+fn a_delivered_event_frame_keeps_its_owner() {
+    let owners = [
+        delivered_event_frame(json!({ "subject_owner": "00000000-0000-0000-0000-000000000009" })),
+        delivered_event_frame(json!({})),
+    ]
+    .map(|frame| match frame.into_frame().unwrap() {
+        crate::api::WireFrame::Event(event) => event.subject_owner(),
+        other => panic!("expected an Event frame, got {other:?}"),
+    });
+
+    assert_eq!(owners, [Some(uuid(9)), None]);
+}
+
+/// The broker's event payload names no topic: a consumer knows it from the event's
+/// type. A frame without one decodes to the whole delivered event.
+#[test]
+fn an_event_frame_without_a_topic_decodes_to_the_published_event() {
+    let decoded = serde_json::from_value::<FrameWire>(json!({
+        "kind": "event",
+        "payload": {
+            "id": "00000000-0000-0000-0000-000000000001",
+            "type": "gts.cf.core.events.event.v1~acme.orders.order.created.v1~",
+            "subject_tenant": "00000000-0000-0000-0000-000000000002",
+            "source": "order-service",
+            "subject": "order-1",
+            "subject_type": "gts.acme.orders.order.entity.v1~",
+            "occurred_at": "2026-01-02T03:04:05Z",
+            "trace_parent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+            "data": { "amount": 100 },
+            "partition": 2,
+            "sequence": 7,
+            "sequence_time": "2026-01-02T03:04:06Z"
+        }
+    }));
+    let frame = match decoded {
+        Ok(frame) => frame.into_frame().unwrap(),
+        Err(err) => panic!("a frame without a topic must decode: {err}"),
+    };
+
+    let crate::api::WireFrame::Event(event) = frame else {
+        panic!("expected an Event frame, got {frame:?}");
+    };
+    assert_eq!(event.id(), uuid(1));
+    assert_eq!(
+        event.event_type(),
+        "gts.cf.core.events.event.v1~acme.orders.order.created.v1~"
+    );
+    assert_eq!(event.subject_tenant(), uuid(2));
+    assert_eq!(event.source(), Some("order-service"));
+    assert_eq!(event.subject(), "order-1");
+    assert_eq!(event.subject_type(), "gts.acme.orders.order.entity.v1~");
+    assert_eq!(
+        event.occurred_at(),
+        "2026-01-02T03:04:05Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap()
+    );
+    assert_eq!(
+        event.trace_parent(),
+        Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")
+    );
+    assert_eq!(event.data(), Some(&json!({ "amount": 100 })));
+    assert_eq!(event.partition(), Some(2));
+    assert_eq!(event.sequence(), Some(Sequence::assigned(7)));
+    assert_eq!(
+        event.sequence_time(),
+        Some(
+            "2026-01-02T03:04:06Z"
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .unwrap()
+        )
+    );
+    assert!(event.meta().is_none());
+}
+
+/// An older broker still sends `topic` in the payload; the payload refuses no
+/// unknown member, so such a frame decodes to the same event.
+#[test]
+fn an_event_frame_from_an_older_broker_with_a_topic_still_decodes() {
+    let decoded = serde_json::from_value::<FrameWire>(json!({
+        "kind": "event",
+        "payload": {
+            "id": "00000000-0000-0000-0000-000000000001",
+            "type": "gts.cf.core.events.event.v1~acme.orders.order.created.v1~",
+            "topic": "gts.cf.core.events.topic.v1~acme.orders.order.stream.v1",
+            "subject_tenant": "00000000-0000-0000-0000-000000000002",
+            "source": "order-service",
+            "subject": "order-1",
+            "subject_type": "gts.acme.orders.order.entity.v1~",
+            "occurred_at": "2026-01-02T03:04:05Z",
+            "trace_parent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+            "data": { "amount": 100 },
+            "partition": 2,
+            "sequence": 7,
+            "sequence_time": "2026-01-02T03:04:06Z"
+        }
+    }));
+    let frame = match decoded {
+        Ok(frame) => frame.into_frame().unwrap(),
+        Err(err) => panic!("a frame that still carries a topic must decode: {err}"),
+    };
+
+    let crate::api::WireFrame::Event(event) = frame else {
+        panic!("expected an Event frame, got {frame:?}");
+    };
+    assert_eq!(event.id(), uuid(1));
+    assert_eq!(
+        event.event_type(),
+        "gts.cf.core.events.event.v1~acme.orders.order.created.v1~"
+    );
+    assert_eq!(event.subject_tenant(), uuid(2));
     assert_eq!(event.source(), Some("order-service"));
     assert_eq!(event.subject(), "order-1");
     assert_eq!(event.subject_type(), "gts.acme.orders.order.entity.v1~");
@@ -384,7 +697,7 @@ fn a_delivered_event_with_a_malformed_trace_parent_is_delivered_without_it() {
         event.event_type(),
         "gts.cf.core.events.event.v1~acme.orders.order.created.v1~"
     );
-    assert_eq!(event.tenant_id(), uuid(2));
+    assert_eq!(event.subject_tenant(), uuid(2));
     assert_eq!(event.source(), Some("order-service"));
     assert_eq!(event.subject(), "order-1");
     assert_eq!(event.subject_type(), "gts.acme.orders.order.entity.v1~");
@@ -481,8 +794,7 @@ fn frame_event_missing_sequence_is_transport_error() {
         "payload": {
             "id": "00000000-0000-0000-0000-000000000001",
             "type": "gts.cf.core.events.event.v1~acme.orders.order.created.v1~",
-            "topic": "gts.cf.core.events.topic.v1~acme.orders.order.stream.v1",
-            "tenant_id": "00000000-0000-0000-0000-000000000002",
+            "subject_tenant": "00000000-0000-0000-0000-000000000002",
             "source": "s",
             "subject": "sub",
             "subject_type": "gts.acme.orders.order.entity.v1~",

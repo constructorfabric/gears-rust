@@ -6,7 +6,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use event_broker_sdk::backend::support::topic_uuid;
 use event_broker_sdk::backend::{
     BackendError, LogClaim, LogId, Partition, Provisioning, Stored, TopicSpec,
 };
@@ -43,7 +42,7 @@ pub async fn provision(
         )));
     }
     let pool = shared.pool()?;
-    let topic = topic_uuid(&spec.topic);
+    let topic = spec.uuid;
     let max_age_ms = spec
         .retention
         .max_age
@@ -136,8 +135,10 @@ async fn claim_log(
         return Ok(Err(refused));
     }
     let Some((_, partitions)) = stored else {
-        // `check` refuses a missing row unless the claim allows creation, and
-        // then the insert above wrote it.
+        // `check` refuses a missing row unless the claim allows creation; the
+        // insert above then wrote it, unless the topic's id is held under
+        // another reference, which the registry never hands out (one
+        // reference per topic).
         tx.rollback().await?;
         return Ok(Err(BackendError::Internal(format!(
             "{OP}: evbk__log holds no row after the insert"

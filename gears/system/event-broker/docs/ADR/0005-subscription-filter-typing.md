@@ -73,7 +73,8 @@ Adopt **topic-anchored `interests[]` with GTS-typed filter engines**. The JOIN b
   "interests": [
     {
       "topic":           "gts.cf.core.events.topic.v1~yourorg.orders.v1",
-      "tenant_id":       "<uuid>",
+      "subject_tenant":  "<uuid>",
+      "ownership_filter": "entire_tenant",
       "types":           ["gts.cf.core.events.event.v1~yourorg.orders.placed.v1~"],
       "filter": {
         "engine":     "gts.cf.core.events.filter.v1~cf.core.expression.cel.v1",
@@ -83,7 +84,8 @@ Adopt **topic-anchored `interests[]` with GTS-typed filter engines**. The JOIN b
     {
       // No filter expression — match every event of these types under this tenant.
       "topic":     "gts.cf.core.events.topic.v1~yourorg.refunds.v1",
-      "tenant_id": "<other-uuid>",
+      "subject_tenant": "<other-uuid>",
+      "ownership_filter": "entire_tenant",
       "types":     ["gts.cf.core.events.event.v1~yourorg.refunds.*"]
     }
   ]
@@ -92,16 +94,19 @@ Adopt **topic-anchored `interests[]` with GTS-typed filter engines**. The JOIN b
 
 ### Interest Body Shape
 
-Three required fields + one optional `filter` object. No capability flags.
+Two required fields and five optional ones, `subject_tenant`, `ownership_filter`, `barrier_mode`, `subject_types` and `filter`. No capability flags.
 
 | Field | Cardinality | Description |
 |---|---|---|
 | `topic` | required | Full GTS topic identifier. Partition / rebalance / authz unit (Kafka-style). |
-| `tenant_id` | required | UUID. Tenant scope. Authz-validated by the platform tenant resolver. Different interests MAY declare different tenant_ids. |
-| `types` | required, non-empty | Array of GTS event-type-instance patterns. Scoped to `topic`. Wildcards per GTS §10. |
+| `subject_tenant` | optional | UUID, the caller's own tenant when absent; echoed resolved. The tenant the interest reads. Not the nil UUID (`400 InvalidTenant`). Different interests MAY declare different tenants. |
+| `ownership_filter` | optional | `only_mine` (the default): the events of the caller's own tenant whose `subject_owner` is the caller (an event with no owner never matches); a `subject_tenant` other than the caller's answers `400 InvalidTenant`. `entire_tenant`: every event of `subject_tenant`. `tenant_subtree_included`: the events of `subject_tenant` and the tenants below it that the consume scope admits. Echoed. Any other value answers `422`. `max_depth` is not accepted (`400 InvalidBody`), and a `tenant_id` field is an unknown field (`422`). |
+| `barrier_mode` | optional | `respect` (the default) or `ignore`. An `ignore` interest needs the barrier right (see Authorization); no effect under `only_mine`. Any other value answers `422`. |
+| `types` | required, non-empty (non-empty not yet enforced, tracked in #5978) | Array of GTS event-type-instance patterns. Scoped to `topic`. Wildcards per GTS §10. |
+| `subject_types` | optional | Array of 1-32 GTS type patterns matched against the event's `subject_type`. A delivery filter, not an access grant: it never widens what the caller may read. Absent or `[]` means no selector. Echoed only when non-empty. |
 | `filter` | optional | Consolidated engine-typed filter object with required `engine` (full GTS identifier extending `gts.cf.core.events.filter.v1~`, always full GTS — no short-discriminator shortcut) and `expression` (engine-specific source string). Absent means no filter. |
 
-**Filter object rule**: `filter` is either present or absent. When present, both `engine` and `expression` are required (enforced by the schema; a `filter` object missing either → `400 BadRequest`). An interest without `filter` delivers every event matching topic + tenant + types — no engine round-trip.
+**Filter object rule**: `filter` is either present or absent. When present, both `engine` and `expression` are required: a `filter` object missing either fails the REST handler's body deserialization → `422`. An interest without `filter` delivers every event matching topic + ownership filter + types - no engine round-trip.
 
 **Multiple interests OR together**: an event matches a subscription if at least one interest matches. Consumers wanting AND-of-two-predicates encode both in the single `expression`.
 
@@ -117,7 +122,7 @@ Per `GlobalTypeSystem/gts-spec` README §10 "Collecting Identifiers with Wildcar
 
 ```
 type_pattern     = exact_pattern | wildcard_pattern
-exact_pattern    = full GTS event-type instance identifier
+exact_pattern    = full GTS event-type identifier (ends with `~`, no `*`)
 wildcard_pattern = gts_prefix ("." | "~") "*"
 gts_prefix       = canonical GTS prefix ending at a segment boundary
                    (.vendor | .package | .namespace | .name | .v<major> | .v<major>.<minor> | ~<instance-segments>)
@@ -125,7 +130,7 @@ gts_prefix       = canonical GTS prefix ending at a segment boundary
 
 Valid examples (under topic `~yourorg.orders.v1`):
 
-- `gts.cf.core.events.event.v1~yourorg.orders.placed.v1~` — exact match.
+- `gts.cf.core.events.event.v1~yourorg.orders.placed.v1~` - `placed.v1` and every type derived from it (implicit derived-type coverage, see Acknowledged GTS Features).
 - `gts.cf.core.events.event.v1~yourorg.orders.placed.v1~` matches every `placed.v1.x` (minor-version-omitted matching; see below).
 - `gts.cf.core.events.event.v1~yourorg.orders.placed.v*` — all versions of `placed` (rule 4).
 - `gts.cf.core.events.event.v1~yourorg.orders.placed.*` — broader: all continuations of `placed.`.
@@ -145,13 +150,15 @@ At JOIN, the broker:
 
 1. Filters `types_registry` entries to those with `parent_topic == interest.topic`.
 2. Applies each pattern in `interest.types[]` against that filtered set.
-3. **Per-name latest** rule: among matches, select the highest version per `(vendor.package.namespace.name)` tuple.
+3. **Per-name latest** rule: among matches, select the highest version per `(vendor.package.namespace.name)` tuple (not yet implemented, tracked in #5978).
 4. **Minor-version-omitted matching** (GTS §10 rule 5, applied in v1): a pattern that pins only the major version (e.g., `placed.v1` without explicit minor) matches every registered minor of that major; per-name latest then picks the highest minor (e.g., `placed.v1.7` over `placed.v1.0`). A higher major (`placed.v2.0`) is **not** picked unless the pattern explicitly admits it.
-5. **Type-belongs-to-topic** defense-in-depth: every resolved type's `parent_topic` MUST equal `interest.topic`; mismatch → `400 TypeNotInTopic`.
-6. **Empty match**: a pattern resolving to zero registered types → `400 NoTypesMatched`. All-or-nothing — partial JOINs over the subset that did match are NOT permitted.
-7. **Pinned at JOIN**: newly-registered types matching the pattern after JOIN do NOT auto-subscribe. Consumer re-JOINs to refresh.
+5. **Type-belongs-to-topic** defense-in-depth: every resolved type's `parent_topic` MUST equal `interest.topic`; mismatch → `400 TypeNotInTopic` (not yet implemented, tracked in #5978).
+6. **Unmatched entries**: a pattern that matches no registered type does not fail the JOIN. The `201` body lists it in that interest's `unmatched_types` (`[]` when every entry matched), so a typo is visible at once. On a topic with more than 256 registered event types only exact entries are checked, and a wildcard is never listed. The list belongs to the JOIN response: a read or a listing of the subscription does not carry it.
+7. **Matching is live**: a type that registers after the JOIN and matches the pattern is delivered without a re-JOIN, once the caller's consume scope admits it.
 
 ### Filter-Engine Plugin Pattern
+
+Not yet implemented; tracked in #5978.
 
 Mirrors OAGW plugins:
 
@@ -196,13 +203,15 @@ pub enum FilterError {
 
 ### CEL Engine Filter Context (v1)
 
+Not yet implemented; tracked in #5978.
+
 The CEL engine binds one variable `event` whose fields are the read-side event (the same `gts.cf.core.events.event.v1~.schema.json` resource consumers receive — `meta` is stripped on read via its `writeOnly` marker; `partition`/`sequence`/`sequence_time` are server-stamped via `readOnly`):
 
 | CEL identifier | Type | Source |
 |---|---|---|
 | `event.id` | string (UUID) | publish input |
 | `event.type` | string (GTS) | publish input |
-| `event.tenant_id` | string (UUID) | publish input (authz-validated) |
+| `event.subject_tenant` | string (UUID) | publish input (authz-validated) |
 | `event.source` | string | publish input |
 | `event.subject` | string | publish input |
 | `event.subject_type` | string (GTS) | publish input |
@@ -219,13 +228,14 @@ The CEL engine binds one variable `event` whose fields are the read-side event (
 
 All values are Rust `const`s. Runtime configurability is deferred — once workloads characterize the typical bounds, v2 lifts them to deployment config.
 
-- `MAX_INTERESTS_PER_SUBSCRIPTION: usize = 64`
-- `MAX_TYPES_PER_INTEREST: usize = 32`
-- `MAX_EXPRESSION_LENGTH_BYTES: usize = 4096`
-- `MAX_COMPILED_FILTER_BYTES: usize = 65_536` (engine-reported)
-- `EVAL_TIMEOUT_MICROS: u64 = 10_000` (10ms per `(event, interest)` evaluation)
+- `JoinRequest::MAX_INTERESTS: usize = 64`
+- `JoinRequest::MAX_TYPES_PER_INTEREST: usize = 32`
+- `JoinRequest::MAX_SUBJECT_TYPES_PER_INTEREST: usize = 32`
+- `MAX_EXPRESSION_LENGTH_BYTES: usize = 4096` (not yet implemented, tracked in #5978)
+- `MAX_COMPILED_FILTER_BYTES: usize = 65_536` (engine-reported) (not yet implemented, tracked in #5978)
+- `EVAL_TIMEOUT_MICROS: u64 = 10_000` (10ms per `(event, interest)` evaluation) (not yet implemented, tracked in #5978)
 
-Breaches → `400 TooManyInterests` / `400 TooManyTypes` / `400 ExpressionTooLong` / `400 CompiledFilterTooLarge` at JOIN. Eval-timeout at delivery drops the offending event from this consumer's batch + warn log + `evbk_filter_eval_timeout_total{consumer_group}` metric (does NOT fail the poll).
+Breaches → `400 TooManyInterests` / `400 TooManyTypes` / `400 TooManySubjectTypes` at JOIN; `400 ExpressionTooLong` / `400 CompiledFilterTooLarge` at JOIN (not yet implemented, tracked in #5978). Eval-timeout at delivery drops the offending event from this consumer's batch + warn log + `evbk_filter_eval_timeout_total{consumer_group}` metric (does NOT fail the stream) (not yet implemented, tracked in #5978).
 
 ### JOIN Validation Order
 
@@ -233,39 +243,63 @@ Breaches → `400 TooManyInterests` / `400 TooManyTypes` / `400 ExpressionTooLon
 POST /v1/subscriptions { consumer_group, client_agent, session_timeout, interests[] }
   ↓
 1. Authn: SecurityContext present? else 401.
-2. Per-tenant rate cap on JOIN (`cpt-cf-evbk-nfr-tenant-rate-caps`; default 60/min/tenant) else 429.
-3. consumer_group exists in event_broker_consumer_group? else 404 ConsumerGroupNotFound.
-4. interests[] length cap check → 400 TooManyInterests.
-5. For each interest in interests[]:
-   5a. topic exists in the specification cache (`event_broker_spec_cache`)? else 404 TopicNotFound.
-   5b. tenant_id authz via platform tenant resolver → 403 TenantIdNotAuthorized.
-   5c. topic-level consume authz → 403 TopicNotAuthorized.
-   5d. types[] length cap → 400 TooManyTypes.
-   5e. expression length cap (only if `filter.expression` supplied) → 400 ExpressionTooLong.
-   5f. For each pattern in types[]:
-       - Pattern syntax valid per GTS spec → else 400 BadTypePattern.
-       - Resolve via types_registry filtered to parent_topic == interest.topic:
-         - 0 matches → 400 NoTypesMatched (whole JOIN fails).
-         - Otherwise expand to concrete type GTS instances; apply per-name-latest + minor-version-omitted.
-       - Defense-in-depth: every resolved type's parent_topic == interest.topic → else 400 TypeNotInTopic.
-       - Per-resolved-type consume authz → 403 EventTypeNotAuthorized on any miss.
-   5g. Filter-object check: if `filter` present, both `engine` and `expression` required
-       (schema-enforced) → 400 BadRequest on a malformed `filter`. If `filter` absent, skip
-       5h–5i; this interest has no compiled filter.
-   5h. If `filter` present: resolve `filter.engine` via ClientHub → 400 UnknownFilterEngine on miss.
-   5i. If `filter` present: engine.compile(`filter.expression`, MAX_EXPRESSION_LENGTH_BYTES) → 400 InvalidFilterExpression
-       on err; 400 CompiledFilterTooLarge on size budget exceed.
-
-   > Note on ordering: the steps above are listed in their canonical evaluation order for
-   > readability, but the `filter` object's shape is validated *earlier*, at request
-   > deserialization — the JSON schema (`filter.required: [engine, expression]`,
-   > `additionalProperties: false`) rejects a malformed `filter` (e.g. an `expression` with no
-   > `engine`) with `400 BadRequest` before any of steps 5a–5i run. So step 5e cannot be
-   > reached with a half-populated `filter`; the 5e/5g ordering is not load-bearing.
-6. Collect the topic set from interest.topic across all interests (no derivation; topics are explicit).
-7. Run rebalance with this member's (topic, partition) interest set.
-8. Persist subscription cache entry: { compiled_filters_or_None[], resolved_type_sets[], topic_set, assignments }.
-9. Return 201 Created with { id, assigned, topology_version, interests[] (echoed) }.
+2. Per-tenant rate cap on JOIN (`cpt-cf-evbk-nfr-tenant-rate-caps`; default 60/min/tenant) else 429
+   (not yet implemented, tracked in #5697).
+3. Request parsing, in the REST handler: a body that is not valid JSON → 400; a missing,
+   unknown or mistyped field → 422 (an unknown barrier_mode, and a `filter` object
+   missing `engine` or `expression`, included); then client_agent, session_timeout and
+   the consumer_group id → 400; a named consumer group → 501; then each interest's
+   max_depth (refused when present), topic id, filter.engine id and the GTS syntax of
+   every types[] and subject_types[] pattern → 400 (400 BadTypePattern for a pattern).
+   In process, the SDK-to-domain conversion (`LocalBroker`) parses the consumer_group id
+   and each interest (its topic id and patterns), resolving an absent subject_tenant and
+   session_timeout; the domain then checks client_agent (400, reason ascii_only,
+   field_too_long or user_agent_grammar) and session_timeout (400
+   InvalidSessionTimeout), which the REST handler has already refused on that path.
+4. Caller identity (domain): a subject or tenant id that is the nil UUID → 403
+   TenantIdNotAuthorized. A bearer token does not exempt the caller.
+5. Limits (domain): interests[] count → 400 TooManyInterests; then each interest in
+   order: types[] count → 400 TooManyTypes, subject_types[] count → 400
+   TooManySubjectTypes, a nil subject_tenant or an only_mine subject_tenant other than
+   the caller's → 400 InvalidTenant.
+   No read and no PDP call happen before this point.
+6. consumer_group exists in event_broker_consumer_group? else 404 ConsumerGroupNotFound.
+   Anonymous group: the caller is the principal that created it, in its tenant? else
+   403 ConsumerGroupNotOwned (no PDP call). Then the group check: consume on the group?
+   else 403 ConsumerGroupNotAuthorized (500 when its answer does not compile).
+7. Every types[] pattern can match some event type (it covers, or is covered by, the
+   event family) → else 400 BadTypePattern.
+8. For each interest group - the interests sharing a topic and a tenant context (the
+   caller's tenant, root only, barriers respected for only_mine; subject_tenant, root
+   only for entire_tenant or with its subtree for tenant_subtree_included, in the
+   interest's barrier_mode), in the order each group first appears:
+   8a. The event types registered on the topic (the candidates) → 503 when unavailable.
+   8b. barrier_mode ignore only: the barrier right (consume_ignore_barrier on the topic)
+       → 403 TenantIdNotAuthorized when denied or when its answer does not compile.
+   8c. The consume scope on the topic for the group's patterns and, when the topic has at
+       most 256 registered event types, the candidates they match.
+   8d. Only when 8c is refused (denied, not compilable, or nothing enforceable): the
+       tenant check picks the code → 403 TopicNotAuthorized when it reaches the context
+       (or its answer does not compile), 403 TenantIdNotAuthorized when it does not.
+   8e. The entries of each interest's types[] that match no registered type, for
+       unmatched_types.
+   The first refused group ends the JOIN.
+   Per interest (not yet implemented, tracked in #5978):
+   - Defense-in-depth: every resolved type's parent_topic == interest.topic → else 400 TypeNotInTopic.
+   - expression length cap (only if `filter.expression` supplied) → 400 ExpressionTooLong.
+   - If `filter` present: resolve `filter.engine` via ClientHub → 400 UnknownFilterEngine on miss.
+   - If `filter` present: engine.compile(`filter.expression`, MAX_EXPRESSION_LENGTH_BYTES) → 400 InvalidFilterExpression
+     on err; 400 CompiledFilterTooLarge on size budget exceed.
+9. Once every group is allowed, each exact selector is checked against its group's scope:
+   an exact types[] entry whose registered types the scope admits none of → 403
+   EventTypeNotAuthorized; an exact subject_types[] entry that overlaps a subject type a
+   matched event type allows, and that no constraint of the scope admits → 403
+   SubjectTypeNotAuthorized.
+10. Each interest.topic exists in the specification cache (`event_broker_spec_cache`)? else 404 TopicNotFound.
+11. Collect the topic set from interest.topic across all interests (no derivation; topics are explicit).
+12. Write the routing markers (subscription, group) → 503 when the cluster cache is unavailable.
+13. Add the member to its group (its interests, topic set and assignment) and run rebalance with its (topic, partition) interest set.
+14. Return 201 Created with { id, consumer_group, client_agent, interests[] (echoed, each with unmatched_types), assigned, topology_version, created_at }.
 ```
 
 All validation BEFORE persistence. Failed JOIN leaves no broker state.
@@ -277,11 +311,17 @@ delivery service has event E for (topic, partition) assigned to subscription S
   ↓
 For each interest I in S.compiled_interests:
   if E.topic       != I.topic              → skip this interest, continue
-  if E.tenant_id   != I.tenant_id          → skip this interest, continue
+  if I's ownership narrowing does not hold → skip this interest, continue
+    (only_mine: E.subject_tenant == caller's tenant and E.subject_owner == caller;
+     entire_tenant: E.subject_tenant == I.subject_tenant; tenant_subtree_included: none)
   if E.type not in I.resolved_type_set     → skip this interest, continue
+  if I.subject_types is set and E.subject_type matches none of them
+                                           → skip this interest, continue
+  if the member's consume scope does not admit E (tenant, owner, type, subject type)
+                                           → skip this interest, continue
   if I.compiled is None:                    // no filter object supplied at JOIN
     → INCLUDE E in this subscription's batch; short-circuit (other interests not evaluated)
-  else:
+  else:                                     // not yet implemented, tracked in #5978
     match I.engine.eval(I.compiled, FilterContext::from(E)) {
       Ok(true)  → INCLUDE E; short-circuit
       Ok(false) → continue to next interest
@@ -291,20 +331,30 @@ For each interest I in S.compiled_interests:
 If no interest matched → drop E from this subscription's batch.
 ```
 
-Short-circuit on first match. Filter-eval failures (timeout, missing field) DO NOT propagate as broker errors — events are silently dropped from the offending consumer's batch and counted via metric.
+Short-circuit on first match. Filter-eval failures (timeout, missing field) DO NOT propagate as broker errors - events are silently dropped from the offending consumer's batch and counted via metric (not yet implemented, tracked in #5978).
 
 ### Authorization
 
-Two layers, both all-or-nothing:
+A caller whose subject or tenant id is the nil UUID is refused `403 TenantIdNotAuthorized` before any read or PDP call; a bearer token does not exempt it.
 
-- **Topic-level** (common grant shape): platform authz resolver checks `consume` against `interest.topic`. Denial → `403 TopicNotAuthorized`.
-- **Per-resolved-type** (fine-grained, optional in deployments that grant per-type): resolver additionally checks each resolved event type. Denial → `403 EventTypeNotAuthorized` with the offending type in the response body.
-- **Per-interest tenant** (platform resolver): `interest.tenant_id` authorized for the calling principal. Denial → `403 TenantIdNotAuthorized`.
+JOIN authorizes per interest group: the interests sharing a topic and a tenant context, which the ownership filter sets (`only_mine`: the caller's tenant, root only, barriers respected; `entire_tenant`: the interest's tenant, root only; `tenant_subtree_included`: the interest's tenant with its subtree; both in the interest's barrier mode). For each group it asks the PDP in that context:
+
+- **I, the barrier right**, only for a `barrier_mode: ignore` group: `consume_ignore_barrier` on the topic. Denied, or an answer that does not compile → `403 TenantIdNotAuthorized`, and nothing more is asked for the group.
+- **E, the consume scope**: `consume` on the topic, naming the group's type patterns and, when the topic has at most 256 registered event types, the ones they match and the subject types those allow. The answer is a scope that may constrain the tenant, the owner (`owner_id`), the event type and the subject type, and it decides delivery.
+- **R, the tenant check**, only when E is refused (denied, not compilable, or leaving nothing the broker can enforce), to pick the refusal's code: R reaches the tenant (or its answer does not compile) → `403 TopicNotAuthorized`; R denies → `403 TenantIdNotAuthorized`.
+
+The first refused group ends the JOIN. Once every group is allowed, each exact selector is checked against its scope: an exact `types` entry whose registered types the scope admits none of → `403 EventTypeNotAuthorized`, and an exact `subject_types` entry that overlaps a subject type a matched event type allows, and that no constraint of the scope admits → `403 SubjectTypeNotAuthorized`. Both name the entry in the message. Wildcards are not checked: the broker cannot tell what they will match. An exact `subject_types` entry that no allowed pattern covers and that covers none of them is not checked either, even when it partly overlaps one; skipping it never widens delivery, because the consume scope still gates each event (a known gap, tracked in #5976).
+
+An interest group's barrier-right, consume-scope or tenant-check answer that does not compile is a refusal (`403`). The group check (JOIN, stream open and seek) and the tenant gate at stream open and seek answer `500` for one, as publish does. A failed evaluation (the PDP could not answer) is a `500` on JOIN, stream open, seek and publish.
+
+`subject_types` has no authorization meaning: the PDP decides what the caller may read, and the selector only narrows delivery within that.
+
+**Answers reused.** A JOIN always asks the PDP and keeps each allowed barrier right and each consume scope for `streaming.authz_scope_ttl_secs` (default 60), keyed by the exact request it answered, while the instance holds fewer than 1,024 live answers. A stream open reuses a kept answer within that time instead of asking again, and keeps what it had to ask; an open stream's renewal of its consume scope does the same, reusing only an answer that outlasts the renewal's lead time. A refusal is never kept. The key covers every field the request sends, the caller's token scopes included, so a caller whose scopes change is asked again. The bearer token is outside the key (#5502): a caller whose token alone changes reuses an answer until its time ends.
 
 ### Acknowledged GTS Features
 
 - **Applied in v1**: minor-version-omitted matching (§10 rule 5). A pattern pinning only the major version matches every registered minor of that major; per-name-latest rule picks the highest minor.
-- **Not applied in v1**: implicit derived-type coverage (§3.6 — bare `~` type identifier auto-matched to derived-type instances). Broker requires explicit patterns or full identifiers; future versions MAY opt in as an additive change.
+- **Applied in v1**: implicit derived-type coverage (§3.6). A bare type identifier (no `*`) also matches every type derived from it, at any depth. The broker matches interest `types` and `subject_types`, and resolves JOIN candidates, with the GTS library's pattern matching (`GtsId::matches_pattern`) and adds no matching rule of its own. The consume scope then admits each delivered event type, and each subject type it constrains, by exact id, never as a pattern; a scope constraint without an event-type filter admits every type.
 
 ### Consequences
 
@@ -316,16 +366,16 @@ Two layers, both all-or-nothing:
 - Good, because GTS-spec-compliant patterns mean every other system that handles GTS identifiers (types_registry, authz resolver, observability) understands the broker's patterns natively.
 - Good, because per-name-latest + minor-version-omitted matching gives consumers a stable major-pinned subscription that gracefully picks up minor-version updates.
 - Bad / accepted, because two-level addressing (topic + type-patterns) is more surface than topic-only. Mitigation: documented; the `types: ["gts.cf.core.events.event.v1~*"]` idiom is the "all types in this topic" pattern.
-- Bad / accepted, because version-resolution pinned at JOIN means new versions don't auto-flow to active subscriptions. Mitigation: future `dynamic_types_refresh` flag; out of v1 scope.
-- Bad / accepted, because the per-event eval timeout silently drops events from the offending consumer's batch rather than failing the poll. Mitigation: alert-able metric.
+- Good, because matching is live: a type that registers after the JOIN reaches an active subscription without a re-JOIN, once the caller's consume scope admits it, and a typo in a pattern shows at once in `unmatched_types`.
+- Bad / accepted, because the per-event eval timeout silently drops events from the offending consumer's batch rather than failing the stream (not yet implemented, tracked in #5978). Mitigation: alert-able metric.
 - Bad / accepted, because all-or-nothing JOIN validation (one denied type or unauthorized tenant fails the whole JOIN). Mitigation: clearer authz model; no surprise partial subscriptions.
 
 ### Confirmation
 
 - **GTS spec compliance test**: every example pattern in ADRs, DESIGN, scenarios, schemas, and fixtures is verified against the GTS spec's wildcard rules (single trailing `*`, segment-boundary, no `**`, no substring-within-segment).
-- **JOIN wire-shape test**: schema codegen produces a strongly-typed `Interest` struct with `topic`, `tenant_id`, `types` required and an optional `filter { engine, expression }` object.
+- **JOIN wire-shape test**: schema codegen produces a strongly-typed `Interest` struct with `topic` and `types` required, optional `subject_tenant` and `ownership_filter`, and an optional `filter { engine, expression }` object.
 - **JOIN validation test matrix**: each step in the JOIN validation order has a test asserting the documented error code on a triggering input.
-- **Per-event delivery test**: short-circuit on first match; no-filter interest matches by prerequisites alone; eval timeout drops event silently + metric.
+- **Per-event delivery test**: short-circuit on first match; no-filter interest matches by prerequisites alone; eval timeout drops event silently + metric (not yet implemented, tracked in #5978).
 - **Rolling-deploy test**: v1 + v2 members with different interests in the same group; partition handoff preserves the per-member filter on subsequent events; cursor preserves position.
 
 ## Pros and Cons of the Options
@@ -362,9 +412,7 @@ Two layers, both all-or-nothing:
 
 ## More Information
 
-- **Dynamic type-pattern refresh** (post-v1): a `dynamic_types_refresh: true` flag on interests would cause the broker to re-resolve patterns on each topology change and silently extend the resolved type set. Deferred — pinned-at-JOIN is simpler and meets the typical use case.
 - **Second built-in filter engine** (post-v1): starlark, rego, or jsonpath. The plugin pattern is the unblock; choosing the second engine is a separate decision.
-- **Implicit derived-type coverage** (GTS §3.6, post-v1): treat a bare `~` type identifier as auto-matching its derived-type instances. Adds an additive matching path; out of v1 scope to keep the resolution rule simple.
 - **Filter-engine cardinality**: today's `filter.v1~` base type allows N concurrent engines in a deployment. Limits are implementation-defined.
 
 External references:
@@ -378,18 +426,18 @@ External references:
 - **PRD**: [PRD.md](../PRD.md)
   - `cpt-cf-evbk-fr-subscription-join` — JOIN body shape (this ADR pins the interests[] structure).
   - `cpt-cf-evbk-fr-filter-expression` — new FR for typed filter engines + plugin pattern.
-  - `cpt-cf-evbk-nfr-tenant-rate-caps` — extended to cover `POST /v1/subscriptions` per-tenant rate cap.
+  - `cpt-cf-evbk-nfr-tenant-rate-caps` - extended to cover `POST /v1/subscriptions` per-tenant rate cap (not yet implemented, tracked in #5697).
 - **DESIGN**: [DESIGN.md](../DESIGN.md)
   - §3.1 Subscription Schema — updated to reference the new interests[] body shape.
   - §3.2 SubscriptionResolutionCache — adds filter-engine handle caching.
   - §3.3 JOIN endpoint — references this ADR for the validation flow.
-  - §3.5 Long-Poll Consumption Flow — per-event filter evaluation step added.
-  - §4.3 Metrics — `evbk_filter_eval_timeout_total`, `evbk_filter_eval_error_total` added.
+  - §3.6 Stream Consumption Flow - per-event filter evaluation step added.
+  - §4.3 Metrics - `evbk_filter_eval_timeout_total`, `evbk_filter_eval_error_total` added (not yet implemented, tracked in #5978).
 - **Scenario and test coverage**: JOIN shape, interest body, pattern syntax, version resolution, topic / tenant / type authz, filter-engine resolution, expression compilation, per-event delivery, limits, and rolling deploy are covered by repository scenarios and tests.
 - **Related ADRs**:
   - [`0002-partition-selection`](0002-partition-selection.md) — partition derivation; the subscription rebalance still operates on `(topic, partition)`.
   - [`0003-event-schema`](0003-event-schema.md) — read-side event fields exposed to the CEL filter context (the `gts.cf.core.events.event.v1~.schema.json` resource with `readOnly` fields populated and `writeOnly` `meta` stripped).
-  - [`0004-idempotent-producer-protocol`](0004-idempotent-producer-protocol.md) — `client_agent` field convention on resource-creating endpoints; JOIN reuses the consumer-group's `client_agent` rather than re-declaring per subscription.
+  - [`0004-idempotent-producer-protocol`](0004-idempotent-producer-protocol.md) - `client_agent` field convention on resource-creating endpoints; JOIN carries its own `client_agent`, checked as on the other resource-creating endpoints.
 - **Feature doc**: [`docs/features/0002-consumer-subscription-lifecycle.md`](../features/0002-consumer-subscription-lifecycle.md) — CDSL flows, ACs, test plans.
 - **Schemas**:
   - [`schemas/gts.cf.core.events.subscription.v1~.schema.json`](../schemas/gts.cf.core.events.subscription.v1~.schema.json) — subscription resource (updated for interests[]).

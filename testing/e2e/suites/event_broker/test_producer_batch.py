@@ -1,4 +1,4 @@
-"""Batch publish scenarios (producer/batch/1.01-1.12).
+"""Batch publish scenarios (producer/batch/1.01-1.14).
 
 - 1.01: batch of two events, same topic → 202
 - 1.02: batch mixing topics → 400 (the two pre-provisioned topics serve as
@@ -13,6 +13,8 @@
 - 1.10: sync batch (Prefer: wait=N) → 201 once every admitted event is stored
 - 1.11: batch with an event over the 60 KiB per-event limit → 413 naming it
 - 1.12: batch with a partition key over 1024 bytes → 400 naming its event
+- 1.13: batch with one event in an unreachable tenant → 403, nothing enqueued
+- 1.14: batch with a chained event missing ``meta.previous`` → 400, nothing enqueued
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ from .conftest import (
     TOPIC_LONGPOLL,
     TOPIC_STRICT,
     TRACE_ID,
+    XFAIL_AUTH_DISABLED,
 )
 
 
@@ -41,7 +44,7 @@ def _event(event_type: str, tenant_id: str, subject: str = "s1") -> dict:
     return {
         "id": str(uuid.uuid4()),
         "type": event_type,
-        "tenant_id": tenant_id,
+        "subject_tenant": tenant_id,
         "source": "e2e-test",
         "subject": subject,
         "subject_type": SUBJECT_TYPE,
@@ -260,12 +263,12 @@ async def test_batch_repeating_an_event_id_is_refused_naming_the_repeat_400(api)
                     {
                         **_event(EVENT_TYPE_STREAM, tenant_id),
                         "id": repeated_id,
-                        "meta": {"version": 1, "producer_id": producer_id, "previous": 0, "sequence": 1},
+                        "meta": {"version": 1, "producer": producer_id, "previous": 0, "sequence": 1},
                     },
                     {
                         **_event(EVENT_TYPE_STREAM, tenant_id),
                         "id": repeated_id,
-                        "meta": {"version": 1, "producer_id": producer_id, "previous": 1, "sequence": 2},
+                        "meta": {"version": 1, "producer": producer_id, "previous": 1, "sequence": 2},
                     },
                 ]
             },
@@ -292,7 +295,7 @@ async def test_batch_repeating_an_event_id_is_refused_naming_the_repeat_400(api)
     }
     assert cursors.status_code == 200
     assert cursors.json() == {
-        "producer_id": producer_id,
+        "id": producer_id,
         "client_agent": "e2e-test/1.0",
         "topics": [],
     }
@@ -314,11 +317,11 @@ async def test_batch_with_a_chained_run_that_does_not_link_is_refused_as_malform
                 "events": [
                     {
                         **_event(EVENT_TYPE_STREAM, tenant_id),
-                        "meta": {"version": 1, "producer_id": producer_id, "previous": 0, "sequence": 1},
+                        "meta": {"version": 1, "producer": producer_id, "previous": 0, "sequence": 1},
                     },
                     {
                         **_event(EVENT_TYPE_STREAM, tenant_id),
-                        "meta": {"version": 1, "producer_id": producer_id, "previous": 2, "sequence": 3},
+                        "meta": {"version": 1, "producer": producer_id, "previous": 2, "sequence": 3},
                     },
                 ]
             },
@@ -345,7 +348,7 @@ async def test_batch_with_a_chained_run_that_does_not_link_is_refused_as_malform
     }
     assert cursors.status_code == 200
     assert cursors.json() == {
-        "producer_id": producer_id,
+        "id": producer_id,
         "client_agent": "e2e-test/1.0",
         "topics": [],
     }
@@ -365,7 +368,7 @@ async def test_batch_with_a_run_behind_the_committed_head_is_refused_naming_the_
             "/events",
             json={
                 **_event(EVENT_TYPE_STREAM, tenant_id),
-                "meta": {"version": 1, "producer_id": producer_id, "previous": 6, "sequence": 7},
+                "meta": {"version": 1, "producer": producer_id, "previous": 6, "sequence": 7},
             },
         )
         assert seed.status_code == 202
@@ -376,11 +379,11 @@ async def test_batch_with_a_run_behind_the_committed_head_is_refused_naming_the_
                 "events": [
                     {
                         **_event(EVENT_TYPE_STREAM, tenant_id),
-                        "meta": {"version": 1, "producer_id": producer_id, "previous": 3, "sequence": 4},
+                        "meta": {"version": 1, "producer": producer_id, "previous": 3, "sequence": 4},
                     },
                     {
                         **_event(EVENT_TYPE_STREAM, tenant_id),
-                        "meta": {"version": 1, "producer_id": producer_id, "previous": 4, "sequence": 5},
+                        "meta": {"version": 1, "producer": producer_id, "previous": 4, "sequence": 5},
                     },
                 ]
             },
@@ -402,7 +405,7 @@ async def test_batch_with_a_run_behind_the_committed_head_is_refused_naming_the_
                     "type": "sequence_mismatch",
                     "subject": "(producer)",
                     "description": (
-                        f"index=0 producer_id={producer_id} topic={TOPIC_STREAM} last_sequence=7"
+                        f"index=0 producer={producer_id} topic={TOPIC_STREAM} last_sequence=7"
                     ),
                 }
             ],
@@ -410,7 +413,7 @@ async def test_batch_with_a_run_behind_the_committed_head_is_refused_naming_the_
     }
     assert cursors.status_code == 200
     assert cursors.json() == {
-        "producer_id": producer_id,
+        "id": producer_id,
         "client_agent": "e2e-test/1.0",
         "topics": [{"topic": TOPIC_STREAM, "last_sequence": 7}],
     }
@@ -430,7 +433,7 @@ async def test_batch_resent_after_a_lost_ack_answers_200_and_keeps_the_cursor(ap
             "/events",
             json={
                 **_event(EVENT_TYPE_STREAM, tenant_id),
-                "meta": {"version": 1, "producer_id": producer_id, "previous": 8, "sequence": 9},
+                "meta": {"version": 1, "producer": producer_id, "previous": 8, "sequence": 9},
             },
         )
         assert seed.status_code == 202
@@ -439,15 +442,15 @@ async def test_batch_resent_after_a_lost_ack_answers_200_and_keeps_the_cursor(ap
             "events": [
                 {
                     **_event(EVENT_TYPE_STREAM, tenant_id),
-                    "meta": {"version": 1, "producer_id": producer_id, "previous": 9, "sequence": 10},
+                    "meta": {"version": 1, "producer": producer_id, "previous": 9, "sequence": 10},
                 },
                 {
                     **_event(EVENT_TYPE_STREAM, tenant_id),
-                    "meta": {"version": 1, "producer_id": producer_id, "previous": 10, "sequence": 11},
+                    "meta": {"version": 1, "producer": producer_id, "previous": 10, "sequence": 11},
                 },
                 {
                     **_event(EVENT_TYPE_STREAM, tenant_id),
-                    "meta": {"version": 1, "producer_id": producer_id, "previous": 11, "sequence": 12},
+                    "meta": {"version": 1, "producer": producer_id, "previous": 11, "sequence": 12},
                 },
             ]
         }
@@ -460,7 +463,7 @@ async def test_batch_resent_after_a_lost_ack_answers_200_and_keeps_the_cursor(ap
     assert resp.text == "", "200 OK must carry no body"
     assert cursors.status_code == 200
     assert cursors.json() == {
-        "producer_id": producer_id,
+        "id": producer_id,
         "client_agent": "e2e-test/1.0",
         "topics": [{"topic": TOPIC_STREAM, "last_sequence": 12}],
     }
@@ -478,8 +481,14 @@ def _sized_event(tenant_id: str, pad: int) -> dict:
 
 def _encoded_len(event: dict) -> int:
     """The event's size as the broker counts it: its compact JSON in the SDK's
-    ``EventV1`` form, an absent ``trace_parent`` or ``meta`` written as ``null``."""
-    counted = {**event, "trace_parent": event.get("trace_parent"), "meta": event.get("meta")}
+    ``EventV1`` form, an absent ``subject_owner``, ``trace_parent`` or ``meta``
+    written as ``null``."""
+    counted = {
+        **event,
+        "subject_owner": event.get("subject_owner"),
+        "trace_parent": event.get("trace_parent"),
+        "meta": event.get("meta"),
+    }
     return len(json.dumps(counted, separators=(",", ":"), ensure_ascii=False).encode())
 
 
@@ -549,4 +558,91 @@ async def test_batch_with_a_partition_key_over_its_cap_rejected_400(api):
             ],
             "resource_type": "gts.cf.core.events.request.v1~",
         },
+    }
+
+
+@XFAIL_AUTH_DISABLED
+async def test_batch_with_one_event_in_an_unreachable_tenant_returns_403(api):
+    """scenario: producer/batch/1.13-negative-batch-tenant-not-authorized.md
+
+    The middle event's tenant is a fresh one the caller cannot reach; the
+    whole batch is refused ``TenantIdNotAuthorized``, the events around it
+    included.
+    """
+    tenant_id = str(uuid.uuid4())
+    unreachable_tenant_id = str(uuid.uuid4())
+    async with api() as client:
+        resp = await client.post(
+            "/events:batch",
+            json={
+                "events": [
+                    _event(EVENT_TYPE_STREAM, tenant_id, "s1"),
+                    _event(EVENT_TYPE_STREAM, unreachable_tenant_id, "s2"),
+                    _event(EVENT_TYPE_STREAM, tenant_id, "s3"),
+                ]
+            },
+        )
+    assert resp.status_code == 403
+    assert resp.json() == {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~",
+        "title": "Permission Denied",
+        "status": 403,
+        "detail": "You do not have permission to perform this operation",
+        "instance": f"{API_BASE}/events:batch",
+        "trace_id": TRACE_ID,
+        "context": {
+            "reason": "access denied by policy",
+            "resource_type": "gts.cf.core.events.request.v1~",
+        },
+    }
+
+
+async def test_batch_with_a_chained_event_missing_previous_is_refused_400(api):
+    """scenario: producer/batch/1.14-negative-batch-mode-shape-violation.md"""
+    tenant_id = str(uuid.uuid4())
+    async with api() as client:
+        reg = await client.post(
+            "/producers", json={"mode": "chained", "client_agent": "e2e-test/1.0"}
+        )
+        assert reg.status_code == 201
+        producer_id = reg.json()["id"]
+
+        resp = await client.post(
+            "/events:batch",
+            json={
+                "events": [
+                    {
+                        **_event(EVENT_TYPE_STREAM, tenant_id),
+                        "meta": {"version": 1, "producer": producer_id, "previous": 0, "sequence": 1},
+                    },
+                    {
+                        **_event(EVENT_TYPE_STREAM, tenant_id),
+                        "meta": {"version": 1, "producer": producer_id, "sequence": 2},
+                    },
+                    {
+                        **_event(EVENT_TYPE_STREAM, tenant_id),
+                        "meta": {"version": 1, "producer": producer_id, "previous": 2, "sequence": 3},
+                    },
+                ]
+            },
+        )
+        cursors = await client.get(f"/producers/{producer_id}/cursors")
+    assert resp.status_code == 400, resp.text
+    assert resp.json() == {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": "ChainModeFieldsMissing: a chained-mode publish needs meta.previous and meta.sequence",
+        "instance": f"{API_BASE}/events:batch",
+        "trace_id": TRACE_ID,
+        "context": {
+            "format": "ChainModeFieldsMissing: a chained-mode publish needs meta.previous and meta.sequence",
+            "resource_type": "gts.cf.core.events.request.v1~",
+        },
+    }
+    assert cursors.status_code == 200
+    assert cursors.json() == {
+        "id": producer_id,
+        "client_agent": "e2e-test/1.0",
+        "topics": [],
     }

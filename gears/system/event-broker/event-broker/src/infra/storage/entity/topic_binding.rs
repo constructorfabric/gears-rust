@@ -10,7 +10,8 @@ use uuid::Uuid;
 #[sea_orm(table_name = "event_broker__topic_binding")]
 #[secure(unrestricted)]
 pub struct Model {
-    /// `GtsId::to_uuid(topic_id)`.
+    /// The topic's Registry Reference (`Instance.uuid`, stored on the topic's spec row at
+    /// `bulk_load`).
     #[sea_orm(primary_key, auto_increment = false)]
     pub topic_uuid: Uuid,
     pub topic_id: String,

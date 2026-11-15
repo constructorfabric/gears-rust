@@ -349,7 +349,7 @@ pub(crate) fn interim_envelope<E: BrokerEvent>(
         "event_id": Uuid::now_v7(),
         "type": E::TYPE_ID,
         "topic": TOPIC,
-        "tenant_id": event.tenant_id(),
+        "subject_tenant": event.tenant_id(),
         "source": SOURCE,
         "subject": event.subject(),
         "subject_type": subject_type,
@@ -385,9 +385,9 @@ pub async fn enqueue<E: BrokerEvent + Clone>(
             let failed = |e| RepoError::from_event_broker(E::TYPE_ID, &e);
             let mut builder = event_broker_sdk::EventV1::builder(event.clone())
                 .subject(event.subject())
-                .subject_type_id(event_broker_sdk::GtsTypeId::new(subject_type));
+                .subject_type_of(event_broker_sdk::GtsTypeId::new(subject_type));
             if let Some(tenant_id) = event.tenant_id() {
-                builder = builder.tenant_id(tenant_id);
+                builder = builder.subject_tenant(tenant_id);
             }
             if let Some(trace_parent) = event.trace_parent() {
                 builder = builder.trace_parent(trace_parent);

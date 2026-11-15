@@ -295,9 +295,9 @@ impl TxEvents {
         let tenant_id = event.tenant_id();
         let mut builder = event_broker_sdk::EventV1::builder(event)
             .subject(subject)
-            .subject_type_id(event_broker_sdk::GtsTypeId::new(ORDER_SUBJECT_TYPE));
+            .subject_type_of(event_broker_sdk::GtsTypeId::new(ORDER_SUBJECT_TYPE));
         if let Some(tenant_id) = tenant_id {
-            builder = builder.tenant_id(tenant_id);
+            builder = builder.subject_tenant(tenant_id);
         }
         let event = builder.build().map_err(EventEnqueueError::Producer)?;
         let wake = self

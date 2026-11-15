@@ -15,10 +15,14 @@ mod common;
 
 use std::time::Duration;
 
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
-use common::{EventLog, SseFrameReader, TestServer};
+use common::{EventLog, SseFrameReader, Streaming, TestServer};
+
+/// The bound on each request a test makes, so a server that stops answering
+/// fails the test instead of hanging it.
+const REQUEST_BOUND: Duration = Duration::from_secs(10);
 
 #[tokio::test]
 async fn publish_then_consume_happy_path() {
@@ -59,7 +63,7 @@ async fn publish_then_consume_happy_path() {
             "client_agent": "integration-test",
             "interests": [{
                 "topic": topic,
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id, "ownership_filter": "entire_tenant",
                 "types": [event_type],
             }],
         }))
@@ -87,7 +91,7 @@ async fn publish_then_consume_happy_path() {
 
     let stream_resp = client
         .get(server.url(&format!(
-            "/event-broker/v1/events:sse?subscription_id={sub_id}"
+            "/event-broker/v1/events:sse?subscription={sub_id}"
         )))
         .send()
         .await
@@ -113,7 +117,7 @@ async fn publish_then_consume_happy_path() {
         &json!({
             "id": event_id,
             "type": event_type,
-            "tenant_id": tenant_id,
+            "subject_tenant": tenant_id,
             "source": "integration-test",
             "subject": "s1",
             "subject_type": subject_type,
@@ -146,8 +150,7 @@ async fn publish_then_consume_happy_path() {
             "payload": {
                 "id": event_id,
                 "type": event_type,
-                "topic": topic,
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id,
                 "source": "integration-test",
                 "subject": "s1",
                 "subject_type": subject_type,
@@ -205,7 +208,7 @@ async fn restart_preserves_events_and_consumer_groups_but_not_subscriptions() {
         .json(&json!({
             "consumer_group": group_id,
             "client_agent": "integration-test",
-            "interests": [{ "topic": topic, "tenant_id": tenant_id, "types": [event_type] }],
+            "interests": [{ "topic": topic, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [event_type] }],
         }))
         .send()
         .await
@@ -232,7 +235,7 @@ async fn restart_preserves_events_and_consumer_groups_but_not_subscriptions() {
 
     let stream1_resp = client
         .get(server.url(&format!(
-            "/event-broker/v1/events:sse?subscription_id={sub1_id}"
+            "/event-broker/v1/events:sse?subscription={sub1_id}"
         )))
         .send()
         .await
@@ -249,7 +252,7 @@ async fn restart_preserves_events_and_consumer_groups_but_not_subscriptions() {
         &json!({
             "id": event_id,
             "type": event_type,
-            "tenant_id": tenant_id,
+            "subject_tenant": tenant_id,
             "source": "integration-test",
             "subject": "s1",
             "subject_type": subject_type,
@@ -259,9 +262,9 @@ async fn restart_preserves_events_and_consumer_groups_but_not_subscriptions() {
     .await;
     assert_eq!(publish_resp.status(), 202);
 
-    // Consuming it (rather than just publishing) persists a real `Cursor`
-    // row for `(consumer_group, topic, partition)` via `stream()`'s
-    // `put_cursor` call - the fact this test cares about below.
+    // The SEEK above persisted the `Cursor` row for
+    // `(consumer_group, topic, partition)` - the fact this test cares about
+    // below; reading the event confirms the stream serves from it.
     let (event1_kind, event1_data) = reader1.next_frame(Duration::from_secs(5)).await;
     assert_eq!(event1_kind, "event");
     assert_eq!(event1_data["payload"]["id"], event_id.to_string());
@@ -287,9 +290,8 @@ async fn restart_preserves_events_and_consumer_groups_but_not_subscriptions() {
         "the consumer group must survive a restart unchanged"
     );
 
-    // `SubscriptionRepo` is `ClusterCacheV1`-backed - under the standalone
-    // cache provider that's an in-process, in-memory namespace, so it must
-    // NOT survive.
+    // A subscription is held in the memory of its group's coordinator, so it
+    // must NOT survive.
     let sub1_resp_after = client
         .get(server.url(&format!("/event-broker/v1/subscriptions/{sub1_id}")))
         .send()
@@ -298,20 +300,20 @@ async fn restart_preserves_events_and_consumer_groups_but_not_subscriptions() {
     assert_eq!(
         sub1_resp_after.status(),
         404,
-        "a subscription must not survive a restart (ClusterCacheV1 standalone profile is ephemeral)"
+        "a subscription must not survive a restart (subscriptions live in the coordinator memory)"
     );
 
     // A brand-new subscription under the SAME consumer group, deliberately
     // NOT seeked: `stream()` only rejects an unseeded partition
     // (`PositionsNotSet`, 409) when `find_cursor` finds nothing. Getting
-    // `200` here - not 409 - is the proof the `Cursor` row `reader1`
+    // `200` here - not 409 - is the proof the `Cursor` row the SEEK
     // persisted before the restart is still there.
     let sub2_resp = client
         .post(server.url("/event-broker/v1/subscriptions"))
         .json(&json!({
             "consumer_group": group_id,
             "client_agent": "integration-test",
-            "interests": [{ "topic": topic, "tenant_id": tenant_id, "types": [event_type] }],
+            "interests": [{ "topic": topic, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [event_type] }],
         }))
         .send()
         .await
@@ -327,7 +329,7 @@ async fn restart_preserves_events_and_consumer_groups_but_not_subscriptions() {
 
     let stream2_resp = client
         .get(server.url(&format!(
-            "/event-broker/v1/events:sse?subscription_id={sub2_id}"
+            "/event-broker/v1/events:sse?subscription={sub2_id}"
         )))
         .send()
         .await
@@ -387,12 +389,12 @@ async fn producer_chain_sequence_resubmission_is_deduped_not_double_persisted() 
     let body = json!({
         "id": Uuid::new_v4(),
         "type": event_type,
-        "tenant_id": Uuid::new_v4(),
+        "subject_tenant": Uuid::new_v4(),
         "source": "integration-test",
         "subject": "s1",
         "subject_type": subject_type,
         "occurred_at": chrono::Utc::now().to_rfc3339(),
-        "meta": { "version": 1, "producer_id": producer_id, "previous": 0, "sequence": 1 },
+        "meta": { "version": 1, "producer": producer_id, "previous": 0, "sequence": 1 },
     });
 
     // Retried while unavailable, the way a real producer publishes: a `503`
@@ -559,4 +561,272 @@ async fn consumer_group_listing_paginates_against_the_real_sqlite_backend() {
         "walking prev_cursor from page 2 must return exactly page 1"
     );
     assert!(body_back["page_info"]["prev_cursor"].is_null());
+}
+
+/// A consume scope window of 5s, and a stream held for 12s: it stays open and
+/// delivers only because its refresh worker renews the scope before each
+/// window ends.
+///
+/// Margins, with a 5s TTL, a 1s evaluation deadline, a 1s heartbeat and one
+/// interest group:
+/// - The open's window ends about 5s after the JOIN. The JOIN stores its
+///   consume answer in the decision memo for one TTL. The open gives its one
+///   group (`k = 0`, so no stagger) a window of one TTL from the open, capped
+///   by the memo entry it reuses (`ScopeExpiry::of_group`, `Remembered::cap`
+///   in `domain/delivery.rs`). The open follows the JOIN by milliseconds.
+/// - A `respect` group's refresh lead is one evaluation deadline plus 2s, so
+///   3s (`StreamingConfig::refresh_lead`). A renewal starts 3s before its
+///   group expires, cannot reuse the memo entry it replaces, and opens a new
+///   5s window from its start, so renewals come about every 2s, each with 3s
+///   to finish against a PDP that answers in milliseconds.
+/// - Without a renewal the session ends the stream at the scope's expiry,
+///   about 5s after the open, with a `terminal` control frame.
+/// - The publish at 7s is 2s past that edge, and the 12s mark 7s past it. An
+///   open stream owes a heartbeat for each idle second, so the 2s after the
+///   mark always hold one.
+#[tokio::test]
+async fn a_stream_outlives_its_consume_scope_window_through_renewals() {
+    const PUBLISH_AFTER: Duration = Duration::from_secs(7);
+    const HELD_FOR: Duration = Duration::from_secs(12);
+    const HEARTBEAT_WITHIN: Duration = Duration::from_secs(2);
+
+    let topic = "gts.cf.core.events.topic.v1~x.eb.renew.topic.v1";
+    let event_type = "gts.cf.core.events.event.v1~x.eb.renew.foo.v1~";
+    let subject_type = "gts.x.eb.renew.subject.v1~";
+    let server = TestServer::start_with_streaming(
+        vec![
+            json!({ "id": topic, "partitions": 1, }),
+            json!({
+                "id": event_type,
+                "topic_id": topic,
+                "allowed_subject_types": [subject_type],
+                "data_schema": {},
+            }),
+        ],
+        Streaming {
+            heartbeat_secs: 1,
+            authz_scope_ttl_secs: 5,
+            authz_eval_deadline_secs: 1,
+        },
+    )
+    .await;
+    // The whole request, body included, is bounded; the stream is opened with
+    // a client of its own, since its body never ends.
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_BOUND)
+        .build()
+        .expect("build client");
+    let stream_client = reqwest::Client::new();
+
+    let group_resp = client
+        .post(server.url("/event-broker/v1/consumer-groups"))
+        .send()
+        .await
+        .expect("create consumer group");
+    assert_eq!(group_resp.status(), 201);
+    let group_id = group_resp.json::<Value>().await.expect("group json")["id"]
+        .as_str()
+        .expect("group id")
+        .to_owned();
+
+    let tenant_id = Uuid::new_v4();
+    let sub_resp = client
+        .post(server.url("/event-broker/v1/subscriptions"))
+        .json(&json!({
+            "consumer_group": group_id,
+            "client_agent": "integration-test",
+            "interests": [{
+                "topic": topic,
+                "subject_tenant": tenant_id, "ownership_filter": "entire_tenant",
+                "types": [event_type],
+            }],
+        }))
+        .send()
+        .await
+        .expect("join subscription");
+    assert_eq!(sub_resp.status(), 201);
+    let sub_id = sub_resp.json::<Value>().await.expect("sub json")["id"]
+        .as_str()
+        .expect("sub id")
+        .to_owned();
+
+    let seek_resp = client
+        .post(server.url(&format!("/event-broker/v1/subscriptions/{sub_id}:seek")))
+        .json(&json!({
+            "topology_version": 1, "positions": { topic: [{ "partition": 0, "value": "earliest" }] }
+        }))
+        .send()
+        .await
+        .expect("seek");
+    assert_eq!(seek_resp.status(), 200);
+
+    let stream_resp = tokio::time::timeout(
+        REQUEST_BOUND,
+        stream_client
+            .get(server.url(&format!(
+                "/event-broker/v1/events:sse?subscription={sub_id}"
+            )))
+            .send(),
+    )
+    .await
+    .expect("stream opens within the bound")
+    .expect("open sse stream");
+    assert_eq!(stream_resp.status(), 200);
+    let opened = tokio::time::Instant::now();
+    let mut reader = SseFrameReader::new(stream_resp);
+
+    // Each frame and how long after the open it arrived, up to the first
+    // heartbeat past `HELD_FOR`, the end of the stream, or the read deadline.
+    let mut frames: Vec<(Duration, String, Value)> = Vec::new();
+    let read_deadline = opened + HELD_FOR + HEARTBEAT_WITHIN;
+    let read = async {
+        // One deadline for the whole read: a heartbeat every second would
+        // keep a bound per frame from ever firing.
+        let _read_until_deadline = tokio::time::timeout_at(read_deadline, async {
+            while let Some((kind, data)) = reader
+                .try_next_frame(
+                    read_deadline.saturating_duration_since(tokio::time::Instant::now()),
+                )
+                .await
+            {
+                let at = opened.elapsed();
+                let held = kind == "heartbeat" && at >= HELD_FOR;
+                frames.push((at, kind, data));
+                if held {
+                    break;
+                }
+            }
+        })
+        .await;
+    };
+
+    let event_id = Uuid::new_v4();
+    let publish = async {
+        tokio::time::sleep_until(opened + PUBLISH_AFTER).await;
+        common::publish_retrying_while_unavailable(
+            &client,
+            &server.url("/event-broker/v1/events"),
+            &json!({
+                "id": event_id,
+                "type": event_type,
+                "subject_tenant": tenant_id,
+                "source": "integration-test",
+                "subject": "s1",
+                "subject_type": subject_type,
+                "occurred_at": chrono::Utc::now().to_rfc3339(),
+            }),
+        )
+        .await
+    };
+    let ((), publish_resp) = tokio::join!(read, publish);
+    assert_eq!(publish_resp.status(), 202);
+    assert_eq!(
+        publish_resp.text().await.expect("publish body"),
+        "",
+        "202 Accepted must carry no body"
+    );
+
+    let non_heartbeat: Vec<(String, Value)> = frames
+        .iter()
+        .filter(|(_, kind, _)| kind != "heartbeat")
+        .map(|(_, kind, data)| (kind.clone(), data.clone()))
+        .collect();
+    // `occurred_at` is normalized by the server and `sequence_time` is set by
+    // it, so both are taken from the frame (`Null` when no event arrived).
+    let delivered = non_heartbeat
+        .iter()
+        .find(|(kind, _)| kind == "event")
+        .map_or(Value::Null, |(_, data)| data.clone());
+    let round_tripped_occurred_at = delivered["payload"]["occurred_at"].clone();
+    let sequence_time = delivered["payload"]["sequence_time"].clone();
+    assert_eq!(
+        non_heartbeat,
+        vec![
+            (
+                "topology".to_owned(),
+                json!({
+                    "kind": "topology",
+                    "topology_version": 1,
+                    "assigned": [{
+                        "topic": topic,
+                        "partition": 0,
+                        "offset": 0,
+                        "last_examined": 0,
+                    }],
+                })
+            ),
+            (
+                "event".to_owned(),
+                json!({
+                    "kind": "event",
+                    "payload": {
+                        "id": event_id,
+                        "type": event_type,
+                        "subject_tenant": tenant_id,
+                        "source": "integration-test",
+                        "subject": "s1",
+                        "subject_type": subject_type,
+                        "occurred_at": round_tripped_occurred_at,
+                        "trace_parent": null,
+                        "data": null,
+                        "partition": 0,
+                        "sequence": 1,
+                        "sequence_time": sequence_time,
+                    },
+                })
+            ),
+        ],
+        "frames after the open: {frames:#?}"
+    );
+    assert!(
+        frames
+            .iter()
+            .any(|(at, kind, _)| kind == "heartbeat" && *at >= HELD_FOR),
+        "the stream must still be open {HELD_FOR:?} after the open: {frames:#?}"
+    );
+    assert!(
+        !frames
+            .iter()
+            .any(|(_, kind, data)| kind == "control" && data["code"] == "terminal"),
+        "the stream must not end: {frames:#?}"
+    );
+    let expired: Vec<String> = server
+        .logs()
+        .into_iter()
+        .filter(|line| line.contains("consume scope expired"))
+        .collect();
+    assert_eq!(expired, Vec::<String>::new());
+}
+
+/// The startup check refuses a consume scope TTL that does not outlast the
+/// longest refresh lead: 4s is not greater than 2 x 1s + 2s, so the process
+/// exits at init with the check's message instead of serving.
+#[tokio::test]
+async fn a_server_whose_scope_ttl_is_too_short_refuses_to_start() {
+    let refused = TestServer::start_refused(
+        vec![],
+        Streaming {
+            heartbeat_secs: 5,
+            authz_scope_ttl_secs: 4,
+            authz_eval_deadline_secs: 1,
+        },
+    )
+    .await;
+
+    let message = concat!(
+        "streaming: authz_scope_ttl_secs is 4 and authz_eval_deadline_secs is 1; ",
+        "in standalone and cluster_delivery modes authz_scope_ttl_secs must be greater than ",
+        "2 x authz_eval_deadline_secs + 2, so a stream's consume scope is refreshed ahead of ",
+        "its expiry",
+    );
+    assert!(
+        refused.logs.iter().any(|line| line.contains(message)),
+        "the server's output must carry the check's message: {:#?}",
+        refused.logs
+    );
+    assert!(
+        refused.status.is_some_and(|status| !status.success()),
+        "the server must exit with a failure status: {:?}",
+        refused.status
+    );
 }

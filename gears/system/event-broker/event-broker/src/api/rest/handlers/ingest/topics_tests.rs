@@ -13,11 +13,14 @@
 //! `description`, `retention` - so every expected body here is fully known up
 //! front, with nothing server-generated to read back out of the response.
 
+use authz_resolver_sdk::{EvaluationRequest, PolicyEnforcer};
 use chrono::{DateTime, Utc};
 use serde_json::json;
 use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
+use toolkit_security::SecurityContext;
 
-use crate::test_support::{EventBrokerHarness, Json, StaticTypesRegistry};
+use crate::test_support::{DenyingAuthZ, EventBrokerHarness, Json, StaticTypesRegistry};
 
 #[tokio::test]
 async fn list_topics_happy_path_returns_all_seeded_topics() {
@@ -246,7 +249,7 @@ async fn get_topic_segments_happy_path_reflects_published_events() {
             .with_body(Json(&json!({
                 "id": uuid::Uuid::new_v4(),
                 "type": "gts.cf.core.events.event.v1~x.eb.a.foo.v1~",
-                "tenant_id": uuid::Uuid::new_v4(),
+                "subject_tenant": uuid::Uuid::new_v4(),
                 "source": "test",
                 "subject": "s1",
                 "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -347,6 +350,86 @@ async fn get_topic_segments_unregistered_topic_returns_404() {
     );
 }
 
+/// A caller the policy refuses gets `403` for a topic that is not registered,
+/// as for one that is: the refusal comes before the lookup, so the answer does
+/// not tell the two apart.
+#[tokio::test]
+async fn get_topic_segments_unregistered_topic_the_caller_may_not_read_returns_403() {
+    let subject = uuid::Uuid::from_u128(0x456);
+    let tenant = uuid::Uuid::from_u128(0x123);
+    let recorded: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
+    let sink = Arc::clone(&recorded);
+    let harness = EventBrokerHarness::builder()
+        .with_policy_enforcer(PolicyEnforcer::new(Arc::new(DenyingAuthZ {
+            deny_if: move |req: &EvaluationRequest| {
+                sink.lock()
+                    .unwrap()
+                    .push(serde_json::to_value(req).unwrap());
+                true
+            },
+        })))
+        .with_security_context(
+            SecurityContext::builder()
+                .subject_id(subject)
+                .subject_tenant_id(tenant)
+                .build()
+                .expect("valid security context"),
+        )
+        .build()
+        .await;
+
+    let resp = harness
+        .api_v1()
+        .get_topic_segments()
+        .with_query("topic", "gts.cf.core.events.topic.v1~x.eb.missing.topic.v1")
+        .with_query("partition", "0")
+        .send()
+        .await;
+
+    resp.assert_status(403);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~",
+            "title": "Permission Denied",
+            "status": 403,
+            "detail": "You do not have permission to perform this operation",
+            "instance": "/event-broker/v1/topics/segments",
+            "context": {
+                "reason": "access denied by policy",
+                "resource_type": "gts.cf.core.events.topic.v1~",
+            },
+        })
+    );
+    // The consume check is refused, and a topic with no registered event type
+    // has no type to ask the produce check about.
+    assert_eq!(
+        *recorded.lock().unwrap(),
+        vec![json!({
+            "subject": { "id": subject, "properties": { "tenant_id": tenant } },
+            "action": { "name": "consume" },
+            "resource": {
+                "type": "gts.cf.core.events.topic.v1~x.eb.missing.topic.v1",
+                "properties": {
+                    "topic_id": "gts.cf.core.events.topic.v1~x.eb.missing.topic.v1",
+                    "owner_tenant_id": tenant,
+                },
+            },
+            "context": {
+                "tenant_context": {
+                    "mode": "root_only",
+                    "root_id": tenant,
+                    "barrier_mode": "respect",
+                },
+                "token_scopes": [],
+                "require_constraints": false,
+                "capabilities": [],
+                "supported_properties": ["owner_tenant_id", "owner_id", "event_type", "event_subject_type"],
+            },
+        })]
+    );
+}
+
 #[tokio::test]
 async fn get_topic_segments_partition_past_topic_count_returns_400_invalid_partition() {
     let harness = EventBrokerHarness::builder()
@@ -438,7 +521,7 @@ async fn publishes_drain_through_an_outbox_with_a_configured_partition_count() {
         .build()
         .await;
     let topic_id = toolkit_gts::GtsInstanceId::try_new(topic).expect("a valid topic id");
-    // The event type partitions on `/tenant_id`.
+    // The event type partitions on `/subject_tenant`.
     let tenants: Vec<uuid::Uuid> = (1..=u128::MAX)
         .map(uuid::Uuid::from_u128)
         .filter(|tenant| {
@@ -458,7 +541,7 @@ async fn publishes_drain_through_an_outbox_with_a_configured_partition_count() {
             .with_body(Json(&json!({
                 "id": uuid::Uuid::new_v4(),
                 "type": "gts.cf.core.events.event.v1~x.eb.a.foo.v1~",
-                "tenant_id": tenant,
+                "subject_tenant": tenant,
                 "source": "test",
                 "subject": "s1",
                 "subject_type": "gts.x.eb.t1.subject.v1~",

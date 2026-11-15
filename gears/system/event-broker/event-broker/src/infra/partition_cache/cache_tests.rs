@@ -1,6 +1,6 @@
-//! Segment-map behaviour. Everything except the two `wait` tests is
-//! synchronous: `watch::channel` constructs without a runtime, so readiness is
-//! testable without one.
+//! Segment-map behaviour. A test that awaits a reader's or a session's wake
+//! runs on a runtime; readiness itself is testable without one, since
+//! `watch::channel` constructs without a runtime.
 
 use chrono::Utc;
 use serde_json::json;
@@ -10,6 +10,7 @@ use uuid::Uuid;
 use crate::domain::model::{Event, Sequence};
 
 use super::cache::{AbsorbedFetch, PartitionCache};
+use super::demand::{Demand, FetchReason};
 use super::reclaim::{GapThresholdEvents, ReclaimPolicy, ResidencyLimitBytes};
 use super::segment::Segment;
 use crate::domain::streaming::read::{MaxBytes, MaxEvents, PartitionRead, ReadLimit};
@@ -23,14 +24,16 @@ fn event(sequence: i64) -> Event {
         ),
         topic: GtsInstanceId::try_new("gts.cf.core.events.topic.v1~x.eb.orders.acme.v1")
             .expect("static gts id is valid"),
-        tenant_id: Uuid::nil(),
+        subject_tenant: Uuid::nil(),
         source: "test".to_owned(),
         subject: "test".to_owned(),
         subject_type: gts::GtsTypeId::new("test"),
+        subject_owner: None,
         occurred_at: Utc::now(),
         trace_parent: None,
         data: json!({ "n": sequence }),
         meta: None,
+        ingest: None,
         partition: Some(0),
         sequence: Some(sequence),
         sequence_time: None,
@@ -354,8 +357,7 @@ fn dead_spans_are_reclaimed() {
     let _reader = cache.track_reader(Sequence::assigned(200));
     assert_eq!(cache.segment_count(), 2);
 
-    // Readers only move forward, so a span entirely at or below every reader
-    // will never be read again.
+    // A span entirely at or below every reader is one no reader reads next.
     let report = cache.reclaim();
 
     assert_eq!(report.dead().segments(), 1);
@@ -655,7 +657,7 @@ fn a_span_between_reader_clusters_is_reclaimed_and_charged_as_a_refetch() {
 
     let report = cache.reclaim();
 
-    // Behind every reader: nobody can ask again, so it costs nothing.
+    // Behind every reader: no refetch unless one seeks back.
     assert_eq!(report.dead().segments(), 1);
     // The laggard's runway is spent inside 2000..=2099, so that segment stays.
     // What is beyond it, and what sits behind the tail reader, will both be
@@ -675,8 +677,8 @@ fn a_span_between_reader_clusters_is_reclaimed_and_charged_as_a_refetch() {
 /// demand, wakes it, and leaves it no starvation credit for the round - all
 /// keyed on what the fetch actually recorded rather than on what a threshold
 /// guessed it would reach.
-#[tokio::test]
-async fn a_fetch_that_covers_another_reader_removes_its_demand() {
+#[test]
+fn a_fetch_that_covers_another_reader_removes_its_demand() {
     let cache = PartitionCache::new();
     let served = cache.track_reader(Sequence::assigned(10));
     let carried = cache.track_reader(Sequence::assigned(20));
@@ -722,8 +724,8 @@ async fn a_fetch_that_covers_another_reader_removes_its_demand() {
 
 /// The other half: a fetch that stops short of a reader leaves that reader's
 /// demand exactly where it was, and it is now the furthest behind.
-#[tokio::test]
-async fn a_fetch_that_stops_short_leaves_the_further_readers_demand() {
+#[test]
+fn a_fetch_that_stops_short_leaves_the_further_readers_demand() {
     let cache = PartitionCache::new();
     let _served = cache.track_reader(Sequence::assigned(10));
     let _waiting = cache.track_reader(Sequence::assigned(20));
@@ -997,4 +999,109 @@ fn resident_events_after_counts_across_segments_and_does_not_subtract() {
         "only 250 remains"
     );
     assert_eq!(cache.resident_events_after(Sequence::assigned(300)), 0);
+}
+
+/// Absorbs a fetch that accounted for `from..=through` and found `events`, the
+/// very values a test later compares a read with.
+fn absorb_events(cache: &PartitionCache, from: i64, through: i64, events: &[Event]) {
+    let segment = Segment::builder()
+        .from(Sequence::assigned(from))
+        .through(Sequence::assigned(through))
+        .events(events.to_vec())
+        .build();
+    cache.absorb(AbsorbedFetch::builder(segment).build());
+}
+
+/// `events` as JSON, every field included, since an event has no equality of
+/// its own.
+fn as_json<'a>(events: impl IntoIterator<Item = &'a Event>) -> serde_json::Value {
+    serde_json::to_value(events.into_iter().collect::<Vec<_>>()).expect("an event serializes")
+}
+
+/// A reader moved back below a span that reclamation took once the reader had
+/// passed it. The read answers `Unknown`, the scan asks for one backfill at the
+/// reader's position, and the fetch that answers it serves the span again.
+/// The span ahead keeps the map non-empty and the frontier above the reader,
+/// which is what makes the demand a backfill.
+#[test]
+fn a_reader_seeked_back_over_a_reclaimed_span_backfills_it() {
+    let cache = PartitionCache::new();
+    let span = [event(100), event(150), event(199)];
+    absorb_events(&cache, 100, 199, &span);
+    absorb(&cache, 300, 399, &[300]);
+    let reader = cache.track_reader(Sequence::assigned(99));
+
+    let PartitionRead::Hit {
+        events,
+        accounted_through,
+    } = reader.read(ReadLimit::unbounded())
+    else {
+        panic!("the span serves the reader");
+    };
+    assert_eq!(as_json(events.iter()), as_json(&span));
+    assert_eq!(accounted_through, Sequence::assigned(199));
+    assert_eq!(reader.position(), Sequence::assigned(199));
+
+    let report = cache.reclaim();
+    assert_eq!(report.dead().segments(), 1);
+    assert_eq!(spans(&cache), vec![(300, 399)]);
+
+    reader.seek(Sequence::assigned(99));
+
+    let read = reader.read(ReadLimit::unbounded());
+    assert!(matches!(read, PartitionRead::Unknown), "got {read:?}");
+    assert_eq!(reader.position(), Sequence::assigned(99));
+    assert_eq!(
+        cache.scan_demands(),
+        vec![
+            Demand::builder(Sequence::assigned(99))
+                .readers_behind(1)
+                .starved_rounds(0)
+                .reason(FetchReason::Backfill)
+                .build()
+        ]
+    );
+
+    absorb_events(&cache, 100, 199, &span);
+
+    let PartitionRead::Hit {
+        events,
+        accounted_through,
+    } = reader.read(ReadLimit::unbounded())
+    else {
+        panic!("the backfill serves the reader");
+    };
+    assert_eq!(as_json(events.iter()), as_json(&span));
+    assert_eq!(accounted_through, Sequence::assigned(199));
+    assert_eq!(reader.position(), Sequence::assigned(199));
+}
+
+/// A reader moved back below a span before a pass keeps that span: the pass
+/// takes nothing, nothing is demanded, and the next read is served from
+/// memory.
+#[test]
+fn a_reader_seeked_back_before_reclamation_keeps_its_span() {
+    let cache = PartitionCache::new();
+    let span = [event(100), event(150), event(199)];
+    absorb_events(&cache, 100, 199, &span);
+    absorb(&cache, 300, 399, &[300]);
+    let reader = cache.track_reader(Sequence::assigned(99));
+    let read = reader.read(ReadLimit::unbounded());
+    assert_eq!(hit_sequences(&read), vec![100, 150, 199]);
+
+    reader.seek(Sequence::assigned(99));
+    let report = cache.reclaim();
+
+    assert_eq!(spans(&cache), vec![(100, 199), (300, 399)]);
+    assert!(!report.freed_anything());
+    assert_eq!(cache.scan_demands(), Vec::<Demand>::new());
+    let PartitionRead::Hit {
+        events,
+        accounted_through,
+    } = reader.read(ReadLimit::unbounded())
+    else {
+        panic!("the kept span serves the reader");
+    };
+    assert_eq!(as_json(events.iter()), as_json(&span));
+    assert_eq!(accounted_through, Sequence::assigned(199));
 }

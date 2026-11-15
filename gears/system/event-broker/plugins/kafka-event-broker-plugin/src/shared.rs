@@ -7,14 +7,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use event_broker_sdk::GtsInstanceId;
 use event_broker_sdk::Sequence;
-use event_broker_sdk::backend::support::{LocalHeads, topic_uuid};
+use event_broker_sdk::backend::support::LocalHeads;
 use event_broker_sdk::backend::{BackendError, TopicPartition};
 use rdkafka::admin::{AdminOptions, NewTopic, TopicReplication};
 use rdkafka::consumer::BaseConsumer;
 use rdkafka::error::RDKafkaErrorCode;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use crate::clients::{self, Admin, ConsumerPool, Lease};
 use crate::error::{self, Operation};
@@ -58,7 +57,7 @@ pub struct Shared {
     /// The fences topic's partition count, once both internal topics exist.
     internal: tokio::sync::OnceCell<u32>,
     logs: SharedTail,
-    known: Mutex<HashMap<Uuid, KnownTopic>>,
+    known: Mutex<HashMap<GtsInstanceId, KnownTopic>>,
     fence_tails: Mutex<HashMap<i32, SharedTail>>,
     /// Appends between their start and their end; `stop` waits for none.
     in_flight: AtomicUsize,
@@ -336,11 +335,11 @@ impl Shared {
     }
 
     /// Caches a topic this instance has provisioned or looked up.
-    pub fn remember(&self, topic: Uuid, known: KnownTopic) {
+    pub fn remember(&self, topic: &GtsInstanceId, known: KnownTopic) {
         self.known
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(topic, known);
+            .insert(topic.clone(), known);
     }
 
     /// The topic, from memory or the logs topic; `NotProvisioned` when it
@@ -351,25 +350,24 @@ impl Shared {
         operation: Operation,
     ) -> Result<KnownTopic, BackendError> {
         self.check_running(operation)?;
-        let uuid = topic_uuid(topic);
         if let Some(known) = self
             .known
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(&uuid)
+            .get(topic)
         {
             return Ok(known.clone());
         }
         let logs = self.logs(operation).await?;
         let record = logs
-            .get(&log_key(uuid))
+            .get(&log_key(topic))
             .and_then(LogRecord::decode)
             .ok_or_else(|| BackendError::not_provisioned(operation.name()))?;
         let known = KnownTopic {
-            name: Arc::from(names::event_topic(&self.settings.topic_prefix, uuid)),
+            name: Arc::from(names::event_topic(&self.settings.topic_prefix, record.uuid)),
             partitions: record.partitions,
         };
-        self.remember(uuid, known.clone());
+        self.remember(topic, known.clone());
         Ok(known)
     }
 

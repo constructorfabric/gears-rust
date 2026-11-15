@@ -1,4 +1,4 @@
-"""Single-event publish scenarios (producer/single/1.01-1.09).
+"""Single-event publish scenarios (producer/single/1.01-1.09, 1.13).
 
 Each test exercises one publish path:
 - 1.01: publish → 202, no body (async by default)
@@ -12,6 +12,7 @@ Each test exercises one publish path:
 - 1.07: malformed ``trace_parent`` → 400
 - 1.08: event over the 60 KiB per-event limit → 413 ``event_too_large``
 - 1.09: partition key over 1024 bytes → 400 ``partition_key_too_long``
+- 1.13: event tenant is the nil UUID → 400 ``InvalidTenant``
 """
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ def _base_event(tenant_id: str, event_type: str = EVENT_TYPE_STREAM) -> dict:
     return {
         "id": str(uuid.uuid4()),
         "type": event_type,
-        "tenant_id": tenant_id,
+        "subject_tenant": tenant_id,
         "source": "e2e-test",
         "subject": "s1",
         "subject_type": SUBJECT_TYPE,
@@ -101,7 +102,7 @@ async def test_publish_prefer_wait_201_event_is_readable(api, test_env):
             json={
                 "id": event_id,
                 "type": EVENT_TYPE_STREAM,
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id,
                 "source": "e2e-test",
                 "subject": "s1",
                 "subject_type": SUBJECT_TYPE,
@@ -117,7 +118,7 @@ async def test_publish_prefer_wait_201_event_is_readable(api, test_env):
                 "consumer_group": group_id,
                 "client_agent": "e2e-test",
                 "interests": [
-                    {"topic": TOPIC_STREAM, "tenant_id": tenant_id, "types": [EVENT_TYPE_STREAM]}
+                    {"topic": TOPIC_STREAM, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_STREAM]}
                 ],
             },
         )
@@ -138,7 +139,7 @@ async def test_publish_prefer_wait_201_event_is_readable(api, test_env):
         base_url=f"{test_env.base_url}/event-broker/v1", timeout=None
     ) as stream_client:
         async with stream_client.stream(
-            "GET", f"/events:sse?subscription_id={sub_id}"
+            "GET", f"/events:sse?subscription={sub_id}"
         ) as stream_resp:
             assert stream_resp.status_code == 200
             reader = SseFrameReader(stream_resp)
@@ -182,14 +183,14 @@ async def test_publish_prefer_wait_duplicate_returns_200(api):
     """
     tenant_id = str(uuid.uuid4())
     event_id = str(uuid.uuid4())
-    meta = {"version": 1, "producer_id": None, "previous": 0, "sequence": 1}
+    meta = {"version": 1, "producer": None, "previous": 0, "sequence": 1}
     async with api() as client:
         reg = await client.post(
             "/producers",
             json={"mode": "chained", "client_agent": "e2e-test/1.0"},
         )
         assert reg.status_code == 201
-        meta["producer_id"] = reg.json()["id"]
+        meta["producer"] = reg.json()["id"]
 
         first = await client.post(
             "/events",
@@ -378,8 +379,14 @@ def _sized_event(tenant_id: str, pad: int) -> dict:
 
 def _encoded_len(event: dict) -> int:
     """The event's size as the broker counts it: its compact JSON in the SDK's
-    ``EventV1`` form, an absent ``trace_parent`` or ``meta`` written as ``null``."""
-    counted = {**event, "trace_parent": event.get("trace_parent"), "meta": event.get("meta")}
+    ``EventV1`` form, an absent ``subject_owner``, ``trace_parent`` or ``meta``
+    written as ``null``."""
+    counted = {
+        **event,
+        "subject_owner": event.get("subject_owner"),
+        "trace_parent": event.get("trace_parent"),
+        "meta": event.get("meta"),
+    }
     return len(json.dumps(counted, separators=(",", ":"), ensure_ascii=False).encode())
 
 
@@ -442,6 +449,30 @@ async def test_a_partition_key_over_its_cap_returns_400(api):
                     "reason": "partition_key_too_long",
                 }
             ],
+            "resource_type": "gts.cf.core.events.request.v1~",
+        },
+    }
+
+
+async def test_publish_with_a_nil_tenant_returns_400(api):
+    """scenario: producer/single/1.13-negative-publish-nil-tenant.md
+
+    An event whose ``subject_tenant`` is the nil UUID is refused 400 before any
+    authorization call; the event is not admitted.
+    """
+    event = _base_event("00000000-0000-0000-0000-000000000000")
+    async with api() as client:
+        resp = await client.post("/events", json=event)
+    assert resp.status_code == 400
+    assert resp.json() == {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": "InvalidTenant: event 0: the event's tenant must not be the nil UUID",
+        "instance": f"{API_BASE}/events",
+        "trace_id": TRACE_ID,
+        "context": {
+            "format": "InvalidTenant: event 0: the event's tenant must not be the nil UUID",
             "resource_type": "gts.cf.core.events.request.v1~",
         },
     }

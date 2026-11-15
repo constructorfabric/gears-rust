@@ -13,6 +13,7 @@ use toolkit::{ClientHub, GearCtx};
 use uuid::Uuid;
 
 use super::GearDb;
+use super::gear_db::MigratedGearDb;
 use crate::EventBrokerModule;
 
 /// The platform's configuration, fixed to one JSON document.
@@ -26,9 +27,12 @@ impl ConfigProvider for StaticConfigProvider {
     }
 }
 
-/// `gear_db` opened and migrated, as the platform hands it to `init()`.
-pub async fn migrated_gear_db(gear_db: &GearDb) -> toolkit_db::DBProvider<toolkit_db::DbError> {
-    (*gear_db.migrated().await.db).clone()
+/// `gear_db` opened and migrated, as the platform hands it to `init()`. Keep
+/// the returned value bound for as long as its pool (or a clone of it) is in
+/// use: dropping it removes a `SQLite` file, best effort, as
+/// [`GearDb::Sqlite`] says.
+pub async fn migrated_gear_db(gear_db: &GearDb) -> MigratedGearDb {
+    gear_db.migrated().await
 }
 
 /// A context for `mode`, with `db` attached and `extra` merged into the

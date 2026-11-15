@@ -272,7 +272,7 @@ async fn postgres_forced_release_reconciles_both_ways_and_announces_a_lost_refer
                 assert_eq!(read["reference_state"], "lost", "{kind:?}: {read}");
                 assert_eq!(lost.len(), 1, "{lost:?}");
                 assert_eq!(lost[0]["data"][lost_field], created.1["id"]);
-                assert_eq!(lost[0]["tenant_id"], p.tenant().to_string());
+                assert_eq!(lost[0]["subject_tenant"], p.tenant().to_string());
                 if kind == Kind::Entry {
                     let conn = p.db.conn().unwrap();
                     let entry = price_book_entry_repo::find(

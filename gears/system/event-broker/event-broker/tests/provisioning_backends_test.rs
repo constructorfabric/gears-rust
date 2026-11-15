@@ -315,10 +315,11 @@ async fn a_lost_retention_record_is_provisioned_again_when_its_call_was_applied_
         return;
     };
     let gear_db = matrix.gear_db();
-    let (one_db, two_db) = (
-        Arc::new(migrated_gear_db(&gear_db).await),
-        Arc::new(migrated_gear_db(&gear_db).await),
+    let (one_migrated, two_migrated) = (
+        migrated_gear_db(&gear_db).await,
+        migrated_gear_db(&gear_db).await,
     );
+    let (one_db, two_db) = (Arc::clone(one_migrated.db()), Arc::clone(two_migrated.db()));
     load(
         &one_db,
         json!({ "partitions": 4, "retention": { "duration": "1d" } }),
@@ -382,10 +383,16 @@ async fn a_lost_retention_record_is_provisioned_again_when_its_call_was_applied_
     let &[(_, LogClaim { new: log, .. }), ..] = calls.as_slice() else {
         panic!("expected provision calls: {calls:?}")
     };
+    let topic = one
+        .get_topic(&GtsInstanceId::try_new(TOPIC).unwrap())
+        .await
+        .expect("the topic reads")
+        .expect("the topic is loaded");
     let call = |hours: u64, replacing: Replacing| {
         (
             TopicSpec {
                 topic: GtsInstanceId::try_new(TOPIC).unwrap(),
+                uuid: topic.uuid,
                 partitions: 4,
                 retention: Retention {
                     max_age: Some(Duration::from_hours(hours)),
@@ -409,7 +416,7 @@ async fn a_lost_retention_record_is_provisioned_again_when_its_call_was_applied_
         ]
     );
     assert_eq!(
-        one.topic_state(&GtsInstanceId::try_new(TOPIC).unwrap())
+        one.topic_state(&topic)
             .await
             .expect("the topic binding reads"),
         Some(TopicState::Provisioned { log, partitions: 4 })

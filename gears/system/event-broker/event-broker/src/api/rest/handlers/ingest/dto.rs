@@ -11,11 +11,11 @@ use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
-use crate::domain::ingest::{ProducerCursors, ProducerMode, PublishRequest};
+use crate::domain::ingest::{ProducerCursors, ProducerMode, PublishMeta, PublishRequest};
 use crate::domain::producer_reset::ProducerResetSelector;
 use event_broker_sdk::models::EventType;
 
-use crate::domain::model::{Meta, Sequence, Topic, TopicSegmentManifest};
+use crate::domain::model::{Sequence, Topic, TopicSegmentManifest};
 
 // ---------------------------------------------------------------------------
 // events.rs: POST /v1/events, POST /v1/events:batch
@@ -29,9 +29,21 @@ use crate::domain::model::{Meta, Sequence, Topic, TopicSegmentManifest};
 #[serde(deny_unknown_fields)]
 pub struct MetaDto {
     pub version: i32,
-    pub producer_id: Option<Uuid>,
+    pub producer: Option<Uuid>,
     pub previous: Option<i64>,
     pub sequence: Option<i64>,
+}
+
+/// Field for field: an absent field stays absent, for the mode-shape check.
+impl From<MetaDto> for PublishMeta {
+    fn from(meta: MetaDto) -> Self {
+        Self {
+            version: meta.version,
+            producer: meta.producer,
+            previous: meta.previous,
+            sequence: meta.sequence,
+        }
+    }
 }
 
 /// `POST /v1/events` request body. Deliberately omits `partition`/
@@ -47,10 +59,13 @@ pub struct PublishEventRequest {
     pub id: Uuid,
     #[serde(rename = "type")]
     pub type_id: String,
-    pub tenant_id: Uuid,
+    pub subject_tenant: Uuid,
     pub source: String,
     pub subject: String,
     pub subject_type: String,
+    /// Absent and `null` both mean a tenant-wide event.
+    #[serde(default)]
+    pub subject_owner: Option<Uuid>,
     pub occurred_at: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
     pub trace_parent: Option<String>,
@@ -86,19 +101,15 @@ impl TryFrom<PublishEventRequest> for PublishRequest {
         Ok(PublishRequest {
             id: req.id,
             r#type,
-            tenant_id: req.tenant_id,
+            subject_tenant: req.subject_tenant,
             source: req.source,
             subject: req.subject,
             subject_type,
+            subject_owner: req.subject_owner,
             occurred_at: req.occurred_at,
             trace_parent: req.trace_parent,
             data: req.data.unwrap_or(JsonValue::Null),
-            meta: req.meta.map(|m| Meta {
-                version: m.version,
-                producer_id: m.producer_id.unwrap_or_default(),
-                previous: m.previous,
-                sequence: m.sequence.unwrap_or(0),
-            }),
+            meta: req.meta.map(PublishMeta::from),
         })
     }
 }
@@ -197,7 +208,7 @@ pub struct RegisterProducerResponse {
 }
 
 /// A producer's chain on one topic. No partition: the chain is kept per
-/// `(producer_id, topic)` (ADR-0004 "Chain Scope").
+/// `(producer, topic)` (ADR-0004 "Chain Scope").
 #[derive(Debug)]
 #[toolkit_macros::api_dto(response)]
 pub struct ProducerTopicCursorsDto {
@@ -208,7 +219,7 @@ pub struct ProducerTopicCursorsDto {
 #[derive(Debug)]
 #[toolkit_macros::api_dto(response)]
 pub struct ProducerCursorsResponse {
-    pub producer_id: Uuid,
+    pub id: Uuid,
     pub client_agent: String,
     pub topics: Vec<ProducerTopicCursorsDto>,
 }
@@ -216,7 +227,7 @@ pub struct ProducerCursorsResponse {
 impl From<ProducerCursors> for ProducerCursorsResponse {
     fn from(cursors: ProducerCursors) -> Self {
         Self {
-            producer_id: cursors.producer_id,
+            id: cursors.producer_id,
             client_agent: cursors.client_agent,
             topics: cursors
                 .topics

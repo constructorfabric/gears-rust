@@ -1,4 +1,4 @@
-"""Streaming transport scenarios (consumer/stream/1.01-1.14).
+"""Streaming transport scenarios (consumer/stream/1.01-1.20).
 
 Skips:
 - 1.07 and 1.08 are already covered by ``test_stream_guardrails.py``
@@ -8,6 +8,11 @@ Skips:
 - 1.14 (control-progress-frame) runs on TOPIC_PROGRESS: a producer fills it with
   events another tenant's subscription rejects, past the drift threshold the
   generated config sets.
+- 1.17 (only-mine-delivery) runs on TOPIC_OWNERSHIP and 1.19 (subtree-delivery)
+  on TOPIC_SUBTREE: one partition each, written by that test alone. 1.19 is
+  xfail: the suite runs with auth disabled and has no tenant tree.
+- 1.18 (subject-types-selector) runs on TOPIC_SUBJECT_SELECTOR: one partition,
+  and an event type admitting two subject types.
 
 Patterns:
 - Multipart (``/events:stream``) tests use ``MultipartReader`` from conftest.
@@ -25,18 +30,32 @@ import httpx
 import pytest
 
 from .conftest import (
+    API_BASE,
+    DEFAULT_SUBJECT_ID,
+    DEFAULT_TENANT_ID,
+    EVENT_TYPE_OWNERSHIP,
     EVENT_TYPE_STREAM,
+    EVENT_TYPE_SUBTREE,
     group_seek_positions,
     SUBJECT_TYPE,
     TOPIC_STREAM,
     TOPIC_4P,
     EVENT_TYPE_4P,
     EVENT_TYPE_PROGRESS,
+    EVENT_TYPE_SUBJECT_SELECTOR,
     PROGRESS_DRIFT_THRESHOLD,
+    SUBJECT_TYPE_OTHER,
     TOPIC_PROGRESS,
+    TOPIC_OWNERSHIP,
+    TOPIC_SUBJECT_SELECTOR,
+    TOPIC_SUBTREE,
     MultipartReader,
     SseFrameReader,
+    TOKEN_PRINCIPAL_A,
+    TOKEN_PRINCIPAL_B,
     TRACE_ID,
+    XFAIL_AUTH_DISABLED,
+    XFAIL_UNLESS_STATIC_TOKENS,
 )
 
 
@@ -56,7 +75,7 @@ async def _setup_seeded_sub(client, topic: str = TOPIC_STREAM, event_type: str =
         json={
             "consumer_group": group_id,
             "client_agent": "e2e-test",
-            "interests": [{"topic": topic, "tenant_id": tenant_id, "types": [event_type]}],
+            "interests": [{"topic": topic, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [event_type]}],
         },
     )
     assert sub_resp.status_code == 201
@@ -94,7 +113,7 @@ async def test_multipart_stream_delivers_event_frame(api, test_env):
     ) as stream_client:
         async with stream_client.stream(
             "GET",
-            f"/events:stream?subscription_id={sub_id}",
+            f"/events:stream?subscription={sub_id}",
             headers={"Accept": "multipart/mixed"},
         ) as stream_resp:
             assert stream_resp.status_code == 200
@@ -113,7 +132,7 @@ async def test_multipart_stream_delivers_event_frame(api, test_env):
                     json={
                         "id": event_id,
                         "type": EVENT_TYPE_STREAM,
-                        "tenant_id": tenant_id,
+                        "subject_tenant": tenant_id,
                         "source": "e2e-test",
                         "subject": "s1",
                         "subject_type": SUBJECT_TYPE,
@@ -130,8 +149,7 @@ async def test_multipart_stream_delivers_event_frame(api, test_env):
         "payload": {
             "id": event_id,
             "type": EVENT_TYPE_STREAM,
-            "topic": TOPIC_STREAM,
-            "tenant_id": tenant_id,
+            "subject_tenant": tenant_id,
             "source": "e2e-test",
             "subject": "s1",
             "subject_type": SUBJECT_TYPE,
@@ -160,7 +178,7 @@ async def test_heartbeat_frame_arrives_on_idle_stream(api, test_env):
         base_url=f"{test_env.base_url}/event-broker/v1", timeout=None
     ) as stream_client:
         async with stream_client.stream(
-            "GET", f"/events:sse?subscription_id={sub_id}"
+            "GET", f"/events:sse?subscription={sub_id}"
         ) as stream_resp:
             assert stream_resp.status_code == 200
             reader = SseFrameReader(stream_resp)
@@ -192,7 +210,7 @@ async def test_topology_frame_on_rebalance(api, test_env):
             json={
                 "consumer_group": group_id,
                 "client_agent": "e2e-test-1",
-                "interests": [{"topic": TOPIC_4P, "tenant_id": tenant_id, "types": [EVENT_TYPE_4P]}],
+                "interests": [{"topic": TOPIC_4P, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_4P]}],
             },
         )
         assert sub1_resp.status_code == 201
@@ -211,7 +229,7 @@ async def test_topology_frame_on_rebalance(api, test_env):
         base_url=f"{test_env.base_url}/event-broker/v1", timeout=None
     ) as stream_client:
         async with stream_client.stream(
-            "GET", f"/events:sse?subscription_id={sub1_id}"
+            "GET", f"/events:sse?subscription={sub1_id}"
         ) as stream_resp:
             assert stream_resp.status_code == 200
             reader = SseFrameReader(stream_resp)
@@ -234,7 +252,7 @@ async def test_topology_frame_on_rebalance(api, test_env):
                     json={
                         "consumer_group": group_id,
                         "client_agent": "e2e-test-2",
-                        "interests": [{"topic": TOPIC_4P, "tenant_id": tenant_id, "types": [EVENT_TYPE_4P]}],
+                        "interests": [{"topic": TOPIC_4P, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_4P]}],
                     },
                 )
             assert sub2_resp.status_code == 201
@@ -274,7 +292,7 @@ async def test_positions_not_set_returns_409(api):
             json={
                 "consumer_group": group_id,
                 "client_agent": "e2e-test",
-                "interests": [{"topic": TOPIC_STREAM, "tenant_id": tenant_id, "types": [EVENT_TYPE_STREAM]}],
+                "interests": [{"topic": TOPIC_STREAM, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_STREAM]}],
             },
         )
         assert sub_resp.status_code == 201
@@ -282,7 +300,7 @@ async def test_positions_not_set_returns_409(api):
 
         # No SEEK performed - stream must reject.
         stream_resp = await client.get(
-            f"/events:stream?subscription_id={sub_id}",
+            f"/events:stream?subscription={sub_id}",
             headers={"Accept": "multipart/mixed"},
         )
     assert stream_resp.status_code == 409
@@ -312,7 +330,7 @@ async def test_unknown_subscription_returns_404(api):
     fake_sub_id = str(uuid.uuid4())
     async with api() as client:
         resp = await client.get(
-            f"/events:stream?subscription_id={fake_sub_id}",
+            f"/events:stream?subscription={fake_sub_id}",
             headers={"Accept": "multipart/mixed"},
         )
     assert resp.status_code == 404
@@ -345,7 +363,7 @@ async def test_terminated_subscription_returns_410(api):
         _, sub_id = await _setup_seeded_sub(client)
     async with httpx.AsyncClient(timeout=None) as stream_client:
         async with stream_client.stream(
-            "GET", f"/events:sse?subscription_id={sub_id}"
+            "GET", f"/events:sse?subscription={sub_id}"
         ) as stream_resp:
             assert stream_resp.status_code == 410
 
@@ -358,26 +376,29 @@ async def test_stream_rejects_unknown_query_params(api):
     """scenario: consumer/stream/1.10-negative-stream-rejects-timeout-collect-params.md
 
     Legacy ``timeout`` and ``collect`` query parameters are not accepted;
-    the endpoint only recognises ``subscription_id``.
+    the endpoint only recognises ``subscription``.
     """
     fake_sub_id = str(uuid.uuid4())
     async with api() as client:
         resp = await client.get(
-            f"/events:stream?subscription_id={fake_sub_id}&timeout=20&collect=50",
+            f"/events:stream?subscription={fake_sub_id}&timeout=20&collect=50",
             headers={"Accept": "multipart/mixed"},
         )
-    # Either 400 (unknown params) or 404 (sub not found) is acceptable; this
-    # scenario specifically requires 400 for the unknown-param rejection.
+    # The query is checked before the subscription lookup, so a random id
+    # still answers 400, naming the first unknown parameter.
     assert resp.status_code == 400
     body = resp.json()
     assert body == {
         "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
         "title": "Invalid Argument",
         "status": 400,
-        "detail": body["detail"],
+        "detail": "InvalidQuery: unknown field `timeout`, expected `subscription`",
         "instance": body["instance"],
         "trace_id": TRACE_ID,
-        "context": body["context"],
+        "context": {
+            "format": "InvalidQuery: unknown field `timeout`, expected `subscription`",
+            "resource_type": "gts.cf.core.events.request.v1~",
+        },
     }
 
 
@@ -394,13 +415,13 @@ async def test_second_stream_on_same_subscription_returns_409(api, test_env):
         base_url=f"{test_env.base_url}/event-broker/v1", timeout=None
     ) as stream_client:
         async with stream_client.stream(
-            "GET", f"/events:sse?subscription_id={sub_id}"
+            "GET", f"/events:sse?subscription={sub_id}"
         ) as stream_resp:
             assert stream_resp.status_code == 200
 
             async with api() as second_client:
                 second_resp = await second_client.get(
-                    f"/events:sse?subscription_id={sub_id}",
+                    f"/events:sse?subscription={sub_id}",
                 )
 
     assert second_resp.status_code == 409
@@ -439,7 +460,7 @@ async def test_delete_while_streaming_closes_connection(api, test_env):
         base_url=f"{test_env.base_url}/event-broker/v1", timeout=None
     ) as stream_client:
         async with stream_client.stream(
-            "GET", f"/events:sse?subscription_id={sub_id}"
+            "GET", f"/events:sse?subscription={sub_id}"
         ) as stream_resp:
             assert stream_resp.status_code == 200
 
@@ -482,7 +503,7 @@ async def test_stream_terminates_with_control_on_rebalance_gain(api, test_env):
             json={
                 "consumer_group": group_id,
                 "client_agent": "consumer-a",
-                "interests": [{"topic": TOPIC_4P, "tenant_id": tenant_id, "types": [EVENT_TYPE_4P]}],
+                "interests": [{"topic": TOPIC_4P, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_4P]}],
             },
         )
         assert sub_a_resp.status_code == 201
@@ -504,7 +525,7 @@ async def test_stream_terminates_with_control_on_rebalance_gain(api, test_env):
             json={
                 "consumer_group": group_id,
                 "client_agent": "consumer-b",
-                "interests": [{"topic": TOPIC_4P, "tenant_id": tenant_id, "types": [EVENT_TYPE_4P]}],
+                "interests": [{"topic": TOPIC_4P, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_4P]}],
             },
         )
         assert sub_b_resp.status_code == 201
@@ -537,7 +558,7 @@ async def test_stream_terminates_with_control_on_rebalance_gain(api, test_env):
 
     # Open A's stream.
     async with httpx.AsyncClient(base_url=base_url, timeout=None) as stream_a:
-        async with stream_a.stream("GET", f"/events:sse?subscription_id={sub_a_id}") as resp_a:
+        async with stream_a.stream("GET", f"/events:sse?subscription={sub_a_id}") as resp_a:
             assert resp_a.status_code == 200
             reader_a = SseFrameReader(resp_a)
 
@@ -580,7 +601,7 @@ async def test_control_progress_frame_emitted_on_filtered_stream(api, test_env):
             json={
                 "consumer_group": reader_group,
                 "client_agent": "e2e-test",
-                "interests": [{"topic": TOPIC_PROGRESS, "tenant_id": producer_tenant, "types": [EVENT_TYPE_PROGRESS]}],
+                "interests": [{"topic": TOPIC_PROGRESS, "subject_tenant": producer_tenant, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_PROGRESS]}],
             },
         )
         assert reader.status_code == 201
@@ -595,7 +616,7 @@ async def test_control_progress_frame_emitted_on_filtered_stream(api, test_env):
                 {
                     "id": str(uuid.uuid4()),
                     "type": EVENT_TYPE_PROGRESS,
-                    "tenant_id": producer_tenant,
+                    "subject_tenant": producer_tenant,
                     "source": "e2e-test",
                     "subject": f"s{n}",
                     "subject_type": SUBJECT_TYPE,
@@ -610,14 +631,14 @@ async def test_control_progress_frame_emitted_on_filtered_stream(api, test_env):
     base_url = f"{test_env.base_url}/event-broker/v1"
     async with httpx.AsyncClient(base_url=base_url, timeout=None) as stream_client:
         # Every event stored, and the last one's sequence: read them back.
-        async with stream_client.stream("GET", f"/events:sse?subscription_id={reader_sub}") as resp:
+        async with stream_client.stream("GET", f"/events:sse?subscription={reader_sub}") as resp:
             assert resp.status_code == 200
             frames = SseFrameReader(resp)
             await frames.await_kind("topology", timeout=5)
             for _ in range(count):
                 head = (await frames.await_kind("event", timeout=15))["payload"]["sequence"]
 
-        async with stream_client.stream("GET", f"/events:sse?subscription_id={filtered_sub}") as resp:
+        async with stream_client.stream("GET", f"/events:sse?subscription={filtered_sub}") as resp:
             assert resp.status_code == 200
             frames = SseFrameReader(resp)
             await frames.await_kind("topology", timeout=5)
@@ -634,3 +655,354 @@ async def test_control_progress_frame_emitted_on_filtered_stream(api, test_env):
         "code": "progress",
         "positions": [{"topic": TOPIC_PROGRESS, "partition": 0, "offset": 0, "last_examined": head}],
     }
+
+
+@pytest.mark.timeout(30, func_only=True)
+async def test_subject_types_selector(api, test_env):
+    """scenario: consumer/stream/1.18-positive-subject-types-selector.md
+
+    An interest whose ``subject_types`` names only SUBJECT_TYPE_OTHER is not
+    delivered an event about SUBJECT_TYPE. Event A (SUBJECT_TYPE) is published
+    before event B (SUBJECT_TYPE_OTHER) on a one-partition topic, so a stream
+    that ignored the selector would deliver A first.
+    """
+    tenant_id = str(uuid.uuid4())
+    async with api() as client:
+        group_resp = await client.post("/consumer-groups")
+        assert group_resp.status_code == 201
+        group_id = group_resp.json()["id"]
+
+        sub_resp = await client.post(
+            "/subscriptions",
+            json={
+                "consumer_group": group_id,
+                "client_agent": "e2e-test",
+                "interests": [
+                    {
+                        "topic": TOPIC_SUBJECT_SELECTOR,
+                        "subject_tenant": tenant_id,
+                        "ownership_filter": "entire_tenant",
+                        "types": [EVENT_TYPE_SUBJECT_SELECTOR],
+                        "subject_types": [SUBJECT_TYPE_OTHER],
+                    }
+                ],
+            },
+        )
+        assert sub_resp.status_code == 201, sub_resp.text
+        joined = sub_resp.json()
+        assert joined["interests"] == [
+            {
+                "topic": TOPIC_SUBJECT_SELECTOR,
+                "subject_tenant": tenant_id,
+                "ownership_filter": "entire_tenant",
+                "types": [EVENT_TYPE_SUBJECT_SELECTOR],
+                "subject_types": [SUBJECT_TYPE_OTHER],
+                "barrier_mode": "respect",
+                "filter": None,
+                "unmatched_types": [],
+            }
+        ]
+        sub_id = joined["id"]
+        seek_resp = await client.post(
+            f"/subscriptions/{sub_id}:seek",
+            json={
+                "topology_version": joined["topology_version"],
+                "positions": group_seek_positions(
+                    [
+                        {"topic": a["topic"], "partition": a["partition"], "value": "earliest"}
+                        for a in joined["assigned"]
+                    ]
+                ),
+            },
+        )
+        assert seek_resp.status_code == 200, seek_resp.text
+
+    event_a = str(uuid.uuid4())
+    event_b = str(uuid.uuid4())
+    async with httpx.AsyncClient(
+        base_url=f"{test_env.base_url}/event-broker/v1", timeout=None
+    ) as stream_client:
+        async with stream_client.stream(
+            "GET",
+            f"/events:stream?subscription={sub_id}",
+            headers={"Accept": "multipart/mixed"},
+        ) as stream_resp:
+            assert stream_resp.status_code == 200
+            reader = MultipartReader(stream_resp)
+            await reader.await_kind("topology")
+
+            async with api() as pub_client:
+                for event_id, subject_type in [
+                    (event_a, SUBJECT_TYPE),
+                    (event_b, SUBJECT_TYPE_OTHER),
+                ]:
+                    pub_resp = await pub_client.post(
+                        "/events",
+                        json={
+                            "id": event_id,
+                            "type": EVENT_TYPE_SUBJECT_SELECTOR,
+                            "subject_tenant": tenant_id,
+                            "source": "e2e-test",
+                            "subject": "s1",
+                            "subject_type": subject_type,
+                            "occurred_at": _now(),
+                        },
+                    )
+                    assert pub_resp.status_code == 202, pub_resp.text
+
+            event_frame = await reader.await_kind("event", timeout=15)
+
+    payload = event_frame["payload"]
+    assert event_frame == {
+        "kind": "event",
+        "payload": {
+            "id": event_b,
+            "type": EVENT_TYPE_SUBJECT_SELECTOR,
+            "subject_tenant": tenant_id,
+            "source": "e2e-test",
+            "subject": "s1",
+            "subject_type": SUBJECT_TYPE_OTHER,
+            "occurred_at": payload["occurred_at"],
+            "trace_parent": None,
+            "data": None,
+            "partition": 0,
+            "sequence": payload["sequence"],
+            "sequence_time": payload["sequence_time"],
+        },
+    }
+
+async def _join_seeded(client, interest: dict) -> str:
+    """JOINs a fresh group with one interest and SEEKs it to "earliest"; returns
+    the subscription id."""
+    group_resp = await client.post("/consumer-groups")
+    assert group_resp.status_code == 201
+    sub_resp = await client.post(
+        "/subscriptions",
+        json={
+            "consumer_group": group_resp.json()["id"],
+            "client_agent": "e2e-test",
+            "interests": [interest],
+        },
+    )
+    assert sub_resp.status_code == 201, sub_resp.text
+    joined = sub_resp.json()
+    seek_resp = await client.post(
+        f"/subscriptions/{joined['id']}:seek",
+        json={
+            "topology_version": joined["topology_version"],
+            "positions": {interest["topic"]: [{"partition": 0, "value": "earliest"}]},
+        },
+    )
+    assert seek_resp.status_code == 200, seek_resp.text
+    return str(joined["id"])
+
+
+async def _read_events(base_url: str, sub_id: str, count: int) -> list[dict]:
+    """Opens the subscription's multipart stream and returns its first ``count``
+    event frames."""
+    async with httpx.AsyncClient(base_url=f"{base_url}{API_BASE}", timeout=None) as client:
+        async with client.stream(
+            "GET",
+            f"/events:stream?subscription={sub_id}",
+            headers={"Accept": "multipart/mixed"},
+        ) as stream_resp:
+            assert stream_resp.status_code == 200
+            reader = MultipartReader(stream_resp)
+            await reader.await_kind("topology")
+            return [await reader.await_kind("event", timeout=10) for _ in range(count)]
+
+
+def _delivered(event: dict, frame: dict) -> dict:
+    """The event frame that delivers the published ``event`` on partition 0: the
+    published members plus the broker's, with the times the broker set taken
+    from ``frame``."""
+    payload = frame["payload"]
+    return {
+        "kind": "event",
+        "payload": {
+            **event,
+            "occurred_at": payload["occurred_at"],
+            "trace_parent": None,
+            "data": None,
+            "partition": 0,
+            "sequence": payload["sequence"],
+            "sequence_time": payload["sequence_time"],
+        },
+    }
+
+
+@pytest.mark.timeout(45, func_only=True)
+async def test_only_mine_delivery(api, test_env):
+    """scenario: consumer/stream/1.17-positive-only-mine-delivery.md
+
+    Three events of the caller's tenant on a one-partition topic: one with no
+    owner, one owned by another subject, then one owned by the caller. A JOIN
+    without ``ownership_filter`` is delivered only the caller's event, so the
+    two before it were skipped; an ``entire_tenant`` JOIN is delivered all
+    three, in order.
+    """
+    unowned = {
+        "id": str(uuid.uuid4()),
+        "type": EVENT_TYPE_OWNERSHIP,
+        "subject_tenant": DEFAULT_TENANT_ID,
+        "source": "e2e-test",
+        "subject": "unowned",
+        "subject_type": SUBJECT_TYPE,
+    }
+    foreign = {
+        "id": str(uuid.uuid4()),
+        "type": EVENT_TYPE_OWNERSHIP,
+        "subject_tenant": DEFAULT_TENANT_ID,
+        "source": "e2e-test",
+        "subject": "foreign",
+        "subject_type": SUBJECT_TYPE,
+        "subject_owner": str(uuid.uuid4()),
+    }
+    mine = {
+        "id": str(uuid.uuid4()),
+        "type": EVENT_TYPE_OWNERSHIP,
+        "subject_tenant": DEFAULT_TENANT_ID,
+        "source": "e2e-test",
+        "subject": "mine",
+        "subject_type": SUBJECT_TYPE,
+        "subject_owner": DEFAULT_SUBJECT_ID,
+    }
+    async with api() as client:
+        only_mine_sub = await _join_seeded(
+            client, {"topic": TOPIC_OWNERSHIP, "types": [EVENT_TYPE_OWNERSHIP]}
+        )
+        entire_tenant_sub = await _join_seeded(
+            client,
+            {
+                "topic": TOPIC_OWNERSHIP,
+                "subject_tenant": DEFAULT_TENANT_ID,
+                "ownership_filter": "entire_tenant",
+                "types": [EVENT_TYPE_OWNERSHIP],
+            },
+        )
+        for event in (unowned, foreign, mine):
+            pub_resp = await client.post("/events", json={**event, "occurred_at": _now()})
+            assert pub_resp.status_code == 202, pub_resp.text
+
+    only_mine_frames = await _read_events(test_env.base_url, only_mine_sub, 1)
+    assert only_mine_frames == [_delivered(mine, only_mine_frames[0])]
+
+    entire_tenant_frames = await _read_events(test_env.base_url, entire_tenant_sub, 3)
+    assert entire_tenant_frames == [
+        _delivered(event, frame)
+        for event, frame in zip((unowned, foreign, mine), entire_tenant_frames)
+    ]
+
+
+@pytest.mark.xfail(reason="no tenant tree: static PDP scope is the caller's tenant only", strict=True)
+@pytest.mark.timeout(45, func_only=True)
+async def test_subtree_delivery(api, test_env):
+    """scenario: consumer/stream/1.19-positive-subtree-delivery.md
+
+    A ``tenant_subtree_included`` interest rooted at the caller's tenant is
+    delivered an event of a child tenant and not one of a tenant outside the
+    subtree, published first on the same partition. The suite runs with
+    ``auth_disabled`` and has no tenant tree, so the broker cannot place either
+    tenant under the caller's and the stream does not deliver the child's event
+    alone.
+    """
+    outsider = {
+        "id": str(uuid.uuid4()),
+        "type": EVENT_TYPE_SUBTREE,
+        "subject_tenant": str(uuid.uuid4()),
+        "source": "e2e-test",
+        "subject": "outsider",
+        "subject_type": SUBJECT_TYPE,
+    }
+    child = {
+        "id": str(uuid.uuid4()),
+        "type": EVENT_TYPE_SUBTREE,
+        "subject_tenant": str(uuid.uuid4()),
+        "source": "e2e-test",
+        "subject": "child",
+        "subject_type": SUBJECT_TYPE,
+    }
+    async with api() as client:
+        sub_id = await _join_seeded(
+            client,
+            {
+                "topic": TOPIC_SUBTREE,
+                "ownership_filter": "tenant_subtree_included",
+                "types": [EVENT_TYPE_SUBTREE],
+            },
+        )
+        for event in (outsider, child):
+            pub_resp = await client.post("/events", json={**event, "occurred_at": _now()})
+            assert pub_resp.status_code == 202, pub_resp.text
+
+    frames = await _read_events(test_env.base_url, sub_id, 1)
+    assert frames == [_delivered(child, frames[0])]
+
+
+async def _open_status(client, sub_id: str, headers: dict) -> tuple[int, dict | None]:
+    """Opens ``:stream`` for ``sub_id`` and closes it at once: the status, and
+    the problem body when the open is refused (an open stream never ends)."""
+    async with client.stream(
+        "GET",
+        f"/events:stream?subscription={sub_id}",
+        headers={**headers, "Accept": "multipart/mixed"},
+    ) as resp:
+        if resp.status_code == 200:
+            return 200, None
+        await resp.aread()
+        return resp.status_code, resp.json()
+
+
+@XFAIL_UNLESS_STATIC_TOKENS
+@pytest.mark.timeout(20, func_only=True)
+async def test_stream_subscription_not_owned(api):
+    """scenario: consumer/stream/1.20-negative-stream-subscription-not-owned.md
+
+    Principal A JOINs a fresh group with one interest on its own tenant (the
+    tenant its group records) and SEEKs it; principal B, a subject of the same
+    tenant, opens its stream and is refused ``SubscriptionNotOwned``; A's own
+    open then answers 200. Under ``auth_disabled`` the gateway ignores both
+    tokens and injects one default identity, so B's open answers 200.
+    """
+    principal_a = {"Authorization": f"Bearer {TOKEN_PRINCIPAL_A}"}
+    principal_b = {"Authorization": f"Bearer {TOKEN_PRINCIPAL_B}"}
+    async with api() as client:
+        group_resp = await client.post("/consumer-groups", headers=principal_a)
+        assert group_resp.status_code == 201, group_resp.text
+        group = group_resp.json()
+        sub_resp = await client.post(
+            "/subscriptions",
+            headers=principal_a,
+            json={
+                "consumer_group": group["id"],
+                "client_agent": "e2e-test",
+                "interests": [
+                    {"topic": TOPIC_STREAM, "subject_tenant": group["tenant"], "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_STREAM]}
+                ],
+            },
+        )
+        assert sub_resp.status_code == 201, sub_resp.text
+        sub_id = str(sub_resp.json()["id"])
+        seek_resp = await client.post(
+            f"/subscriptions/{sub_id}:seek",
+            headers=principal_a,
+            json={"topology_version": 1, "positions": {TOPIC_STREAM: [{"partition": 0, "value": "earliest"}]}},
+        )
+        assert seek_resp.status_code == 200, seek_resp.text
+
+        refused_status, refused_body = await _open_status(client, sub_id, principal_b)
+        assert refused_status == 403
+        assert refused_body == {
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~",
+            "title": "Permission Denied",
+            "status": 403,
+            "detail": "You do not have permission to perform this operation",
+            "instance": f"{API_BASE}/events:stream",
+            "trace_id": TRACE_ID,
+            "context": {
+                "reason": f"subscription '{sub_id}' was joined by another principal",
+                "resource_type": "gts.cf.core.events.subscription.v1~",
+            },
+        }
+        own_status, own_body = await _open_status(client, sub_id, principal_a)
+    assert (own_status, own_body) == (200, None)

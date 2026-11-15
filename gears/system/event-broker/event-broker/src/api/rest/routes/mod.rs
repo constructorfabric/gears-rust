@@ -1,24 +1,19 @@
-//! `OperationBuilder` route registration (`DESIGN.md:586`). Real ingest/
-//! delivery registration (DTOs, `OpenAPI` schemas, `OperationBuilder`
-//! chains) lands with #4346 - `register_ingest_routes`/
-//! `register_delivery_routes` remain shells for that. `register_dispatcher_routes`
-//! is implemented here (`eb-dispatcher-routing`): every route is an opaque
-//! forward to a resolved ingest/delivery instance, so its declared response
-//! is a placeholder - the authoritative contract lives with #4346's own
-//! registration of the same paths. `summary` text is copied verbatim from
-//! `DESIGN.md:1022-1041`'s Request Routing table's Purpose column, matching
-//! what #4346's own registration of the same path is expected to say - only
-//! `description` notes that this particular registration forwards rather
-//! than executes the operation. License requirements for these routes are
-//! left to whatever #4346 decides for the underlying endpoints; dispatcher
-//! forwarding does not invent its own.
+//! `OperationBuilder` route registration (DESIGN.md "Request Routing").
+//! `register_ingest_routes` and `register_delivery_routes` register each
+//! role's endpoints with their handlers, DTO schemas and declared responses.
+//! `register_dispatcher_routes` registers the same paths as opaque forwards
+//! to a resolved ingest or delivery instance, so their declared responses
+//! are placeholders - the authoritative contract lives with the role
+//! builders' registration of the same paths. A forwarding route's
+//! `description` notes that it forwards rather than executes the operation.
+//! Like the role builders, the forwarding routes require no license.
 //!
 //! Two routes register a bare `{id}` axum template rather than DESIGN.md's
 //! literal `{id}:reset`/`{id}:seek`: matchit (axum's router, pinned to
-//! `=0.8.4` even in the latest published axum release) cannot mix a path
-//! parameter with literal text in one segment (design.md D13 - a git-pinned
-//! axum fix was investigated and rejected; pulling in *only* the matchit fix
-//! would mean vendoring a hand-patched fork). The real wire path is
+//! `=0.8.4` by the locked axum 0.8.9) cannot mix a path parameter with
+//! literal text in one segment (a git-pinned axum fix was investigated and
+//! rejected; pulling in *only* the matchit fix would mean vendoring a
+//! hand-patched fork). The real wire path is
 //! unaffected: `{id}` captures the whole segment value including the colon
 //! suffix, and the forwarded request is the client's original, untouched
 //! `Request`, whose URI still carries it - see the comments at each
@@ -45,6 +40,27 @@ const TOPICS_TAG: &str = "topics";
 const EVENT_TYPES_TAG: &str = "event-types";
 const CONSUMER_GROUPS_TAG: &str = "consumer-groups";
 const SUBSCRIPTIONS_TAG: &str = "subscriptions";
+
+/// The 413 of a route whose handler reads the request body: api-gateway caps
+/// the body at `defaults.body_limit_bytes`, answering 413 from its
+/// `RequestBodyLimitLayer` when `Content-Length` is over the cap, or from the
+/// `Bytes`/`Json` extractor when the body read crosses it.
+const BODY_OVER_LIMIT: &str = "Payload Too Large - the request body is over the request body \
+                               limit (api-gateway `defaults.body_limit_bytes`).";
+
+/// The 413 a dispatcher node answers itself on a forwarded body route: the
+/// api-gateway body limit sits in front of the forwarding handler too, and
+/// the handler buffers the body under its own cap before it forwards it.
+const FORWARDED_BODY_OVER_LIMIT: &str = "Payload Too Large - the request body is over the \
+                                         api-gateway request body limit \
+                                         (`defaults.body_limit_bytes`) or over the dispatcher's \
+                                         forwarding body cap.";
+
+/// The 415 of a route whose handler takes axum's `Json` extractor, which
+/// accepts only `application/json` and `application/<subtype>+json`.
+const NOT_JSON_MEDIA_TYPE: &str = "Unsupported Media Type - the request `Content-Type` is \
+                                   missing or is not a JSON media type (`application/json` or \
+                                   an `application/<subtype>+json` type).";
 
 /// Adds `$filter`/`$orderby`/`limit`/`cursor` - the four list endpoints'
 /// shared query-param shape (`docs/openapi.yaml`). Not `OperationBuilderODataExt`
@@ -140,7 +156,9 @@ pub fn register_ingest_routes(mut router: Router, openapi: &dyn OpenApiRegistry)
         .problem_response(
             openapi,
             StatusCode::PAYLOAD_TOO_LARGE,
-            "EventTooLarge - the event's encoding is over the 60 KiB per-event limit.",
+            "EventTooLarge - the event's encoding is over the 60 KiB per-event limit; or Payload \
+             Too Large - the request body is over the request body limit (api-gateway \
+             `defaults.body_limit_bytes`).",
         )
         .problem_response(
             openapi,
@@ -195,7 +213,8 @@ pub fn register_ingest_routes(mut router: Router, openapi: &dyn OpenApiRegistry)
             StatusCode::PAYLOAD_TOO_LARGE,
             "BatchTooLarge (more events than the configured max) or BatchPayloadTooLarge \
              (total payload over the configured byte ceiling), or EventTooLarge (an event's \
-             encoding over the 60 KiB per-event limit)",
+             encoding over the 60 KiB per-event limit), or Payload Too Large (the request body \
+             over the request body limit, api-gateway `defaults.body_limit_bytes`)",
         )
         .problem_response(
             openapi,
@@ -231,6 +250,24 @@ pub fn register_ingest_routes(mut router: Router, openapi: &dyn OpenApiRegistry)
             StatusCode::CREATED,
             "Producer registered; id minted",
         )
+        .problem_response(openapi, StatusCode::PAYLOAD_TOO_LARGE, BODY_OVER_LIMIT)
+        .problem_response(
+            openapi,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            NOT_JSON_MEDIA_TYPE,
+        )
+        .problem_response(
+            openapi,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Unprocessable Entity - the body is valid JSON but does not fit the request shape: \
+             a missing, unknown or mistyped field, or an unknown `mode` value.",
+        )
+        .problem_response(
+            openapi,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ServiceUnavailable, retryable - the broker's database is unavailable: the producer \
+             insert.",
+        )
         .standard_errors(openapi)
         .register(router, openapi);
 
@@ -251,12 +288,18 @@ pub fn register_ingest_routes(mut router: Router, openapi: &dyn OpenApiRegistry)
             StatusCode::OK,
             "Producer cursors (topics may be empty)",
         )
+        .problem_response(
+            openapi,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ServiceUnavailable, retryable - the broker's database is unavailable: the producer \
+             read, or the producer cursor read.",
+        )
         .standard_errors(openapi)
         .register(router, openapi);
 
     // Registered as bare `{id}` (matchit can't mix a path param with literal
     // text in one segment - same limitation `register_dispatcher_routes`
-    // already documents for this exact path). `producers_h::reset_producer`
+    // documents for this exact path). `producers_h::reset_producer`
     // splits the `:reset` suffix out of the captured value itself.
     // NOTE: revisit route tags on the next axum update.
     router = OperationBuilder::post("/event-broker/v1/producers/{id}")
@@ -277,7 +320,14 @@ pub fn register_ingest_routes(mut router: Router, openapi: &dyn OpenApiRegistry)
         .json_request::<ingest_dto::ResetProducerRequest>(openapi, "Optional reset scope")
         .request_optional()
         .handler(producers_h::reset_producer)
-        .json_response(StatusCode::OK, "Reset applied; audit record emitted")
+        .no_content_response(StatusCode::OK, "Reset applied; audit record emitted")
+        .problem_response(openapi, StatusCode::PAYLOAD_TOO_LARGE, BODY_OVER_LIMIT)
+        .problem_response(
+            openapi,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ServiceUnavailable, retryable - the broker's database is unavailable: the producer \
+             read, or the producer chain delete.",
+        )
         .standard_errors(openapi)
         .register(router, openapi);
 
@@ -299,6 +349,12 @@ pub fn register_ingest_routes(mut router: Router, openapi: &dyn OpenApiRegistry)
         StatusCode::OK,
         "Page of topics",
     )
+    .problem_response(
+        openapi,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "ServiceUnavailable, retryable - the broker's database is unavailable: the topic list \
+         read, or a topic's event type read.",
+    )
     .standard_errors(openapi)
     .register(router, openapi);
 
@@ -316,6 +372,13 @@ pub fn register_ingest_routes(mut router: Router, openapi: &dyn OpenApiRegistry)
             openapi,
             StatusCode::OK,
             "Segment manifest",
+        )
+        .problem_response(
+            openapi,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ServiceUnavailable, retryable - the broker's database or the topic's storage backend \
+             is unavailable: the topic's event type read, the topic lookup, or the segment read \
+             on the backend.",
         )
         .standard_errors(openapi)
         .register(router, openapi);
@@ -351,16 +414,21 @@ pub fn register_ingest_routes(mut router: Router, openapi: &dyn OpenApiRegistry)
 /// naming violation.
 #[allow(unknown_lints)]
 #[allow(de0801_api_endpoint_version)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one declarative builder chain per delivery route; the length is the route table"
+)]
 pub fn register_delivery_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
     router = OperationBuilder::get("/event-broker/v1/events:stream")
         .operation_id("event_broker.stream_events")
         .summary("Multipart event consumption (default transport)")
         .description(
-            "The single consumption endpoint for multipart/mixed-framed delivery. Long-lived: \
-             the response stays open and emits frames as events arrive.",
+            "The default consumption endpoint, framing delivery as multipart/mixed; \
+             `/v1/events:sse` serves the same frame kinds as Server-Sent Events. Long-lived: the \
+             response stays open and emits frames as events arrive.",
         )
         .tag(INGEST_API_TAG)
-        .query_param("subscription_id", true, "Subscription id")
+        .query_param("subscription", true, "Subscription id")
         .authenticated()
         .no_license_required()
         .handler(delivery_h::stream_events)
@@ -375,23 +443,42 @@ pub fn register_delivery_routes(mut router: Router, openapi: &dyn OpenApiRegistr
             "Accept header excludes multipart/mixed",
         )
         .problem_response(openapi, StatusCode::GONE, "SubscriptionTerminated")
+        .problem_response(
+            openapi,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ServiceUnavailable, retryable - the broker's database is unavailable: the \
+             consumer group read, a cursor read, or the event-type candidate query of an \
+             interest group the open evaluates.",
+        )
         .standard_errors(openapi)
         .register(router, openapi);
 
     router = OperationBuilder::get("/event-broker/v1/events:sse")
         .operation_id("event_broker.sse_events")
-        .summary("Server-Sent Events consumption (opt-in)")
+        .summary("Server-Sent Events consumption")
         .description(
             "Browser-native text/event-stream consumption endpoint. Same frame kinds as \
              `/v1/events:stream`.",
         )
         .tag(INGEST_API_TAG)
-        .query_param("subscription_id", true, "Subscription id")
+        .query_param("subscription", true, "Subscription id")
         .authenticated()
         .no_license_required()
         .handler(delivery_h::sse_events)
         .sse_json::<delivery_dto::FrameDto>(openapi, "Long-lived text/event-stream of frames")
+        .problem_response(
+            openapi,
+            StatusCode::NOT_ACCEPTABLE,
+            "Accept header excludes text/event-stream",
+        )
         .problem_response(openapi, StatusCode::GONE, "SubscriptionTerminated")
+        .problem_response(
+            openapi,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ServiceUnavailable, retryable - the broker's database is unavailable: the \
+             consumer group read, a cursor read, or the event-type candidate query of an \
+             interest group the open evaluates.",
+        )
         .standard_errors(openapi)
         .register(router, openapi);
 
@@ -416,6 +503,13 @@ pub fn register_delivery_routes(mut router: Router, openapi: &dyn OpenApiRegistr
             StatusCode::CREATED,
             "Created",
         )
+        .problem_response(openapi, StatusCode::PAYLOAD_TOO_LARGE, BODY_OVER_LIMIT)
+        .problem_response(
+            openapi,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ServiceUnavailable, retryable - the broker's database is unavailable: the \
+             consumer group insert.",
+        )
         .standard_errors(openapi)
         .register(router, openapi);
 
@@ -433,6 +527,12 @@ pub fn register_delivery_routes(mut router: Router, openapi: &dyn OpenApiRegistr
         StatusCode::OK,
         "Page of consumer groups",
     )
+    .problem_response(
+        openapi,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "ServiceUnavailable, retryable - the broker's database is unavailable: the \
+         consumer group list read.",
+    )
     .standard_errors(openapi)
     .register(router, openapi);
 
@@ -449,6 +549,18 @@ pub fn register_delivery_routes(mut router: Router, openapi: &dyn OpenApiRegistr
             StatusCode::OK,
             "Consumer group record",
         )
+        .problem_response(
+            openapi,
+            StatusCode::NOT_IMPLEMENTED,
+            "Unimplemented - `id` is a named group (a valid consumer-group id whose suffix is \
+             not a UUID); only anonymous groups are served.",
+        )
+        .problem_response(
+            openapi,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ServiceUnavailable, retryable - the broker's database is unavailable: the \
+             consumer group read.",
+        )
         .standard_errors(openapi)
         .register(router, openapi);
 
@@ -462,6 +574,18 @@ pub fn register_delivery_routes(mut router: Router, openapi: &dyn OpenApiRegistr
         .no_license_required()
         .handler(consumer_groups_h::delete_consumer_group)
         .no_content_response(StatusCode::NO_CONTENT, "Deleted")
+        .problem_response(
+            openapi,
+            StatusCode::NOT_IMPLEMENTED,
+            "Unimplemented - `id` is a named group (a valid consumer-group id whose suffix is \
+             not a UUID); only anonymous groups are served.",
+        )
+        .problem_response(
+            openapi,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ServiceUnavailable, retryable - the broker's database is unavailable: the \
+             consumer group read, or the consumer group delete.",
+        )
         .standard_errors(openapi)
         .register(router, openapi);
 
@@ -469,18 +593,44 @@ pub fn register_delivery_routes(mut router: Router, openapi: &dyn OpenApiRegistr
         .operation_id("event_broker.join_subscription")
         .summary("JOIN - register a subscription against a consumer group")
         .description(
-            "Creates a subscription with one or more typed-filter interests[] entries. \
-             Subject to per-tenant rate cap.",
+            "Creates a subscription with one or more typed-filter interests[] entries (at least \
+             one not yet enforced, tracked in #5978).",
         )
         .tag(SUBSCRIPTIONS_TAG)
         .authenticated()
         .no_license_required()
         .json_request::<delivery_dto::JoinSubscriptionRequest>(openapi, "JOIN request")
         .handler(subscriptions_h::join_subscription)
-        .json_response_with_schema::<delivery_dto::SubscriptionDto>(
+        .json_response_with_schema::<delivery_dto::JoinSubscriptionResponseDto>(
             openapi,
             StatusCode::CREATED,
             "Subscription created; assignment computed",
+        )
+        .problem_response(openapi, StatusCode::PAYLOAD_TOO_LARGE, BODY_OVER_LIMIT)
+        .problem_response(
+            openapi,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            NOT_JSON_MEDIA_TYPE,
+        )
+        .problem_response(
+            openapi,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Unprocessable Entity - the body is valid JSON but does not fit the request shape: \
+             a missing, unknown or mistyped field, or an unknown enum value.",
+        )
+        .problem_response(
+            openapi,
+            StatusCode::NOT_IMPLEMENTED,
+            "Unimplemented - `consumer_group` is a named group (a valid consumer-group id whose \
+             suffix is not a UUID); only anonymous groups are served.",
+        )
+        .problem_response(
+            openapi,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ServiceUnavailable, retryable - the broker's database or cluster cache is \
+             unavailable: the consumer group read, the event-type candidate query of an interest \
+             group, the registered-type lookup on a topic with more than 256 event types, the \
+             topic lookup, or a routing-marker write.",
         )
         .standard_errors(openapi)
         .error_429(openapi)
@@ -563,6 +713,32 @@ pub fn register_delivery_routes(mut router: Router, openapi: &dyn OpenApiRegistr
             StatusCode::OK,
             "Cursor seeded/updated; resolved integer offsets per partition",
         )
+        .problem_response(
+            openapi,
+            StatusCode::PRECONDITION_FAILED,
+            "TopologyVersionMismatch - `topology_version` differs from the subscription's current \
+             one (a concurrent rebalance moved the assignment); the caller re-reads the \
+             subscription and re-seeks.",
+        )
+        .problem_response(openapi, StatusCode::PAYLOAD_TOO_LARGE, BODY_OVER_LIMIT)
+        .problem_response(
+            openapi,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            NOT_JSON_MEDIA_TYPE,
+        )
+        .problem_response(
+            openapi,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Unprocessable Entity - the body is valid JSON but does not fit the request shape: \
+             a missing, unknown or mistyped field.",
+        )
+        .problem_response(
+            openapi,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ServiceUnavailable, retryable - the broker's database or the topic's storage backend \
+             is unavailable: the consumer group read, the topic lookup, the resolution of a \
+             position on the backend, or a cursor write.",
+        )
         .standard_errors(openapi)
         .register(router, openapi);
 
@@ -576,8 +752,9 @@ pub fn register_dispatcher_routes(mut router: Router, openapi: &dyn OpenApiRegis
 }
 
 /// A placeholder success response for an opaque proxy route: the real shape
-/// is whatever the resolved instance returns, documented by #4346's own
-/// registration of the same path.
+/// is whatever the resolved instance returns, documented by the role
+/// builders' registration of the same path (`register_ingest_routes`,
+/// `register_delivery_routes`).
 fn proxied_response(status: axum::http::StatusCode) -> ResponseSpec {
     ResponseSpec::new(
         status.as_u16(),
@@ -588,9 +765,16 @@ fn proxied_response(status: axum::http::StatusCode) -> ResponseSpec {
     )
 }
 
+/// [`proxied_response`] for a route whose resolved instance answers without
+/// a body.
+fn proxied_body_less_response(status: axum::http::StatusCode) -> ResponseSpec {
+    let mut response = proxied_response(status);
+    response.content_type = "";
+    response
+}
+
 /// The forwarding note appended via `.description()`, distinct from
-/// `summary`, so the declared "what it does" text stays identical to the
-/// underlying operation's own registration.
+/// `summary`, which carries the dispatcher's own short "what it does" text.
 fn forwarded_to(role: &str) -> String {
     format!("Forwarded to the resolved {role} instance.")
 }
@@ -613,6 +797,11 @@ fn register_ingest_forwarding_routes(mut router: Router, openapi: &dyn OpenApiRe
         .no_license_required()
         .handler(proxy::handle)
         .response(proxied_response(axum::http::StatusCode::OK))
+        .problem_response(
+            openapi,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            FORWARDED_BODY_OVER_LIMIT,
+        )
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -626,6 +815,11 @@ fn register_ingest_forwarding_routes(mut router: Router, openapi: &dyn OpenApiRe
         .no_license_required()
         .handler(proxy::handle)
         .response(proxied_response(axum::http::StatusCode::OK))
+        .problem_response(
+            openapi,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            FORWARDED_BODY_OVER_LIMIT,
+        )
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -639,6 +833,11 @@ fn register_ingest_forwarding_routes(mut router: Router, openapi: &dyn OpenApiRe
         .no_license_required()
         .handler(proxy::handle)
         .response(proxied_response(axum::http::StatusCode::OK))
+        .problem_response(
+            openapi,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            FORWARDED_BODY_OVER_LIMIT,
+        )
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -672,7 +871,12 @@ fn register_ingest_forwarding_routes(mut router: Router, openapi: &dyn OpenApiRe
         .authenticated()
         .no_license_required()
         .handler(proxy::handle)
-        .response(proxied_response(axum::http::StatusCode::OK))
+        .response(proxied_body_less_response(axum::http::StatusCode::OK))
+        .problem_response(
+            openapi,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            FORWARDED_BODY_OVER_LIMIT,
+        )
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -704,7 +908,7 @@ fn register_delivery_forwarding_routes(
 
     router = OperationBuilder::get("/event-broker/v1/events:sse")
         .operation_id("event_broker.dispatcher.sse_events")
-        .summary("SSE event stream (opt-in, browser-native)")
+        .summary("SSE event stream (browser-native)")
         .description(forwarded_to("delivery"))
         .tag(DELIVERY_TAG)
         .authenticated()
@@ -724,6 +928,11 @@ fn register_delivery_forwarding_routes(
         .no_license_required()
         .handler(router::handle)
         .response(proxied_response(axum::http::StatusCode::OK))
+        .problem_response(
+            openapi,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            FORWARDED_BODY_OVER_LIMIT,
+        )
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -764,7 +973,9 @@ fn register_delivery_forwarding_routes(
         .authenticated()
         .no_license_required()
         .handler(router::handle)
-        .response(proxied_response(axum::http::StatusCode::NO_CONTENT))
+        .response(proxied_body_less_response(
+            axum::http::StatusCode::NO_CONTENT,
+        ))
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -778,6 +989,11 @@ fn register_delivery_forwarding_routes(
         .no_license_required()
         .handler(router::handle)
         .response(proxied_response(axum::http::StatusCode::OK))
+        .problem_response(
+            openapi,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            FORWARDED_BODY_OVER_LIMIT,
+        )
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -818,7 +1034,9 @@ fn register_delivery_forwarding_routes(
         .authenticated()
         .no_license_required()
         .handler(router::handle)
-        .response(proxied_response(axum::http::StatusCode::NO_CONTENT))
+        .response(proxied_body_less_response(
+            axum::http::StatusCode::NO_CONTENT,
+        ))
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -841,6 +1059,11 @@ fn register_delivery_forwarding_routes(
         .no_license_required()
         .handler(router::handle)
         .response(proxied_response(axum::http::StatusCode::OK))
+        .problem_response(
+            openapi,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            FORWARDED_BODY_OVER_LIMIT,
+        )
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -849,8 +1072,8 @@ fn register_delivery_forwarding_routes(
 }
 
 fn register_shared_forwarding_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
-    // Shared routes forward to the ingest service (design.md D2 - an
-    // arbitrary but documented pick between two equally-valid targets).
+    // Shared routes forward to the ingest service: an arbitrary pick
+    // between two equally valid targets.
     router = OperationBuilder::get("/event-broker/v1/topics")
         .operation_id("event_broker.dispatcher.list_topics")
         .summary("List topics")
@@ -994,5 +1217,17 @@ pub fn test_router(
 mod routes_tests;
 
 #[cfg(test)]
+#[path = "route_spec_recorder.rs"]
+mod route_spec_recorder;
+
+#[cfg(test)]
 #[path = "ingest_routes_tests.rs"]
 mod ingest_routes_tests;
+
+#[cfg(test)]
+#[path = "delivery_routes_tests.rs"]
+mod delivery_routes_tests;
+
+#[cfg(test)]
+#[path = "dispatcher_routes_tests.rs"]
+mod dispatcher_routes_tests;

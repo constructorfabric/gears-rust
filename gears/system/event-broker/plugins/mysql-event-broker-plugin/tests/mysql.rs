@@ -18,11 +18,11 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
 use common::Engine;
-use event_broker_sdk::backend::support::{partition_for, topic_uuid};
+use event_broker_sdk::backend::support::partition_for;
 use event_broker_sdk::backend::{
-    AppendRequest, Appended, Backend, BackendError, Fence, FenceKey, FenceSeq, Flush, KeyedEvent,
-    LogClaim, LogId, Partition, Provisioning, Replacing, Retention, TopicPartition, TopicSpec,
-    Wait,
+    AppendRequest, Appended, Backend, BackendError, Fence, FenceKey, FenceSeq, Flush, Head,
+    KeyedEvent, LogClaim, LogId, Partition, Provisioning, Replacing, Retention, TopicPartition,
+    TopicSpec, Wait,
 };
 use event_broker_sdk::models::Event;
 use event_broker_sdk::{GtsInstanceId, GtsTypeId, Position, Sequence};
@@ -55,6 +55,8 @@ macro_rules! on_both {
 
 on_both!(
     provision_creates_tables_and_first_segments,
+    a_topic_is_stored_and_found_under_its_registry_reference,
+    a_second_reference_for_a_provisioned_topic_is_refused,
     a_replayed_fence_on_an_unprovisioned_topic_is_not_provisioned,
     a_hung_fence_row_times_out_the_retry,
     a_re_provision_does_not_wait_for_an_open_append,
@@ -89,14 +91,16 @@ fn keyed_padded(key: &str, n: u64, pad: usize) -> KeyedEvent {
         key: key.to_owned(),
         event: Event {
             id: Uuid::from_u128(0xe1),
-            type_id: GtsTypeId::new("gts.cf.core.events.event.v1~cf.mysqltest.x.happened.v1~"),
-            tenant_id: Uuid::from_u128(0x7e4a_0001),
+            event_type: GtsTypeId::new("gts.cf.core.events.event.v1~cf.mysqltest.x.happened.v1~"),
+            subject_tenant: Uuid::from_u128(0x7e4a_0001),
             source: "mysql-test".to_owned(),
             subject: "s".to_owned(),
             subject_type: GtsTypeId::new("gts.cf.mysqltest.x.thing.v1~"),
+            subject_owner: None,
             occurred_at: Utc.timestamp_opt(1_767_225_600, 0).single().unwrap(),
             trace_parent: None,
             data: Some(serde_json::json!({ "n": n, "pad": "x".repeat(pad) })),
+            ingest: None,
             partition: None,
             sequence: None,
             sequence_time: None,
@@ -125,6 +129,7 @@ async fn provision(
 ) -> (TopicSpec, LogClaim) {
     let spec = TopicSpec {
         topic: topic(),
+        uuid: Uuid::new_v4(),
         partitions,
         retention,
     };
@@ -179,7 +184,7 @@ async fn read_all(backend: &dyn Backend, at: &TopicPartition) -> Vec<i64> {
 }
 
 fn table(spec: &TopicSpec, partition: u32) -> String {
-    format!("evbk__{}_p{partition}", topic_uuid(&spec.topic).simple())
+    format!("evbk__{}_p{partition}", spec.uuid.simple())
 }
 
 /// `(first, end, name, state)` of every segment row of a partition.
@@ -192,7 +197,7 @@ async fn rows(
         "SELECT first_seq, end_seq, segment_name, CAST(state AS CHAR) FROM evbk__segment \
          WHERE topic_uuid = ? AND partition_no = ? ORDER BY first_seq",
     )
-    .bind(topic_uuid(&spec.topic))
+    .bind(spec.uuid)
     .bind(i32::try_from(partition).unwrap())
     .fetch_all(pool)
     .await
@@ -219,7 +224,7 @@ async fn figures(pool: &MySqlPool, spec: &TopicSpec, partition: u32) -> (i64, i6
          JOIN evbk__retention r ON r.topic_uuid = p.topic_uuid AND r.partition_no = p.partition_no \
          WHERE p.topic_uuid = ? AND p.partition_no = ?",
     )
-    .bind(topic_uuid(&spec.topic))
+    .bind(spec.uuid)
     .bind(i32::try_from(partition).unwrap())
     .fetch_one(pool)
     .await
@@ -292,7 +297,7 @@ async fn provision_creates_tables_and_first_segments(engine: Engine) {
     let tables: Vec<(i32, String, i64, i64)> = sqlx::query_as(
         "SELECT partition_no, table_name, hwm, bytes FROM evbk__partition WHERE topic_uuid = ? ORDER BY partition_no",
     )
-    .bind(topic_uuid(&spec.topic))
+    .bind(spec.uuid)
     .fetch_all(&control)
     .await
     .unwrap();
@@ -305,6 +310,293 @@ async fn provision_creates_tables_and_first_segments(engine: Engine) {
         assert_eq!(rows(&control, &spec, partition).await, expected);
         assert_eq!(held(&control, &spec, partition).await, names_of(&expected));
     }
+    backend.stop(CancellationToken::new()).await;
+}
+
+/// A day's age bound, so `evbk__log` holds a value for it.
+const DAY: Retention = Retention {
+    max_age: Some(Duration::from_hours(24)),
+    max_bytes: None,
+};
+
+/// `(topic_uuid, topic_id, log_id, partitions, max_age_ms, max_bytes,
+/// provisioned_at)` of an `evbk__log` row.
+type LogRow = (
+    Uuid,
+    String,
+    Uuid,
+    i32,
+    Option<i64>,
+    Option<i64>,
+    DateTime<Utc>,
+);
+
+/// `(INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME, SUB_PART)` of an
+/// `information_schema.STATISTICS` row.
+type IndexPart = (String, i64, i64, String, Option<i64>);
+
+/// Every `evbk__log` row, by `topic_uuid`.
+async fn log_rows(control: &MySqlPool) -> Vec<LogRow> {
+    sqlx::query_as(
+        "SELECT topic_uuid, topic_id, log_id, partitions, max_age_ms, max_bytes, provisioned_at \
+         FROM evbk__log ORDER BY topic_uuid",
+    )
+    .fetch_all(control)
+    .await
+    .unwrap()
+}
+
+/// `(topic_uuid, partition_no, table_name)` of every `evbk__partition` row,
+/// in order.
+async fn partition_keys(control: &MySqlPool) -> Vec<(Uuid, i32, String)> {
+    sqlx::query_as(
+        "SELECT topic_uuid, partition_no, table_name FROM evbk__partition \
+         ORDER BY topic_uuid, partition_no",
+    )
+    .fetch_all(control)
+    .await
+    .unwrap()
+}
+
+/// The server's `UTC_TIMESTAMP(6)`, the clock `provision` stamps
+/// `provisioned_at` with.
+async fn server_now(control: &MySqlPool) -> DateTime<Utc> {
+    sqlx::query_scalar("SELECT UTC_TIMESTAMP(6)")
+        .fetch_one(control)
+        .await
+        .unwrap()
+}
+
+/// A topic's rows are keyed by the Registry Reference its spec carries, and
+/// an instance that did not provision it finds it by its GTS id, through the
+/// unique ASCII `topic_id` key. The reference is a version-0 UUID, which no
+/// derivation from the id yields.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "one scenario asserted step by step, every row in full"
+)]
+async fn a_topic_is_stored_and_found_under_its_registry_reference(engine: Engine) {
+    let server = common::server(engine, "reference").await;
+    let database = common::fresh_database();
+    let first = common::backend(&server.url, &database, serde_json::json!({})).await;
+    let control = server.control(&database).await;
+    let reference = Uuid::from_u128(0x5ee1);
+    let spec = TopicSpec {
+        topic: topic(),
+        uuid: reference,
+        partitions: 1,
+        retention: DAY,
+    };
+    let log = LogId::new_v4();
+    let before = server_now(&control).await;
+    let provisioned = first
+        .provision(
+            &spec,
+            &LogClaim {
+                replacing: Replacing::Nothing,
+                new: log,
+            },
+        )
+        .await;
+    let after = server_now(&control).await;
+    assert_eq!(
+        format!("{provisioned:?}"),
+        format!(
+            "{:?}",
+            Ok::<_, BackendError>(Provisioning::Ready { partitions: 1 })
+        )
+    );
+
+    let logs = log_rows(&control).await;
+    let [(.., provisioned_at)] = logs.as_slice() else {
+        panic!("expected one evbk__log row: {logs:?}")
+    };
+    assert!(
+        (before..=after).contains(provisioned_at),
+        "provisioned_at {provisioned_at} outside [{before}, {after}]"
+    );
+    assert_eq!(
+        logs,
+        vec![(
+            reference,
+            spec.topic.to_string(),
+            log.uuid(),
+            1,
+            Some(86_400_000),
+            None,
+            *provisioned_at
+        )]
+    );
+    assert_eq!(
+        partition_keys(&control).await,
+        vec![(
+            reference,
+            0,
+            "evbk__00000000000000000000000000005ee1_p0".to_owned()
+        )]
+    );
+    let column: Vec<(String, String)> = sqlx::query_as(
+        "SELECT CHARACTER_SET_NAME, COLLATION_NAME FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'evbk__log' AND COLUMN_NAME = 'topic_id'",
+    )
+    .fetch_all(&control)
+    .await
+    .unwrap();
+    assert_eq!(column, vec![("ascii".to_owned(), "ascii_bin".to_owned())]);
+    let keys: Vec<IndexPart> = sqlx::query_as(
+        "SELECT INDEX_NAME, CAST(NON_UNIQUE AS SIGNED), CAST(SEQ_IN_INDEX AS SIGNED), COLUMN_NAME, \
+         CAST(SUB_PART AS SIGNED) FROM information_schema.STATISTICS \
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'evbk__log' ORDER BY INDEX_NAME, SEQ_IN_INDEX",
+    )
+    .fetch_all(&control)
+    .await
+    .unwrap();
+    assert_eq!(
+        keys,
+        vec![
+            ("PRIMARY".to_owned(), 0, 1, "topic_uuid".to_owned(), None),
+            (
+                "uq_evbk__log__topic_id".to_owned(),
+                0,
+                1,
+                "topic_id".to_owned(),
+                None
+            ),
+        ]
+    );
+    first.stop(CancellationToken::new()).await;
+    drop(first);
+
+    let second = common::backend(&server.url, &database, serde_json::json!({})).await;
+    let at = TopicPartition::new(spec.topic.clone(), Partition::new(0));
+    // Straight to the backend, not through `append`: provisioning made the
+    // first segments, and any error is the answer under test.
+    let appended = second
+        .append(&AppendRequest {
+            fence: Fence {
+                key: FenceKey::new(0x5ee1),
+                seq: FenceSeq::new(1),
+            },
+            topic: &spec.topic,
+            events: &[keyed("k", 1000)],
+            flush: Flush::Sync,
+        })
+        .await;
+
+    assert_eq!(
+        format!("{appended:?}"),
+        format!(
+            "{:?}",
+            Ok::<_, BackendError>(Appended::Heads(vec![Head {
+                at: at.clone(),
+                sequence: Sequence::assigned(1),
+            }]))
+        )
+    );
+    assert_eq!(read_all(second.as_ref(), &at).await, vec![1]);
+    second.stop(CancellationToken::new()).await;
+}
+
+/// A topic holds one Registry Reference: a provision that names a
+/// provisioned topic under another one breaks the registry's stable mapping.
+/// `INSERT IGNORE` skips its row on the unique `topic_id` key, and the call
+/// is refused with nothing written.
+async fn a_second_reference_for_a_provisioned_topic_is_refused(engine: Engine) {
+    let server = common::server(engine, "second-reference").await;
+    let database = common::fresh_database();
+    let backend = common::backend(&server.url, &database, serde_json::json!({})).await;
+    let control = server.control(&database).await;
+    let reference = Uuid::from_u128(0x5ee1);
+    let spec = TopicSpec {
+        topic: topic(),
+        uuid: reference,
+        partitions: 2,
+        retention: DAY,
+    };
+    let log = LogId::new_v4();
+    let before = server_now(&control).await;
+    backend
+        .provision(
+            &spec,
+            &LogClaim {
+                replacing: Replacing::Nothing,
+                new: log,
+            },
+        )
+        .await
+        .unwrap();
+    let after = server_now(&control).await;
+
+    let second = backend
+        .provision(
+            &TopicSpec {
+                uuid: Uuid::from_u128(0x5ee2),
+                ..spec.clone()
+            },
+            &LogClaim {
+                replacing: Replacing::Nothing,
+                new: LogId::new_v4(),
+            },
+        )
+        .await;
+
+    assert_eq!(
+        format!("{second:?}"),
+        r#"Err(Internal("provision: evbk__log holds no row after the insert"))"#
+    );
+    let logs = log_rows(&control).await;
+    let [(.., provisioned_at)] = logs.as_slice() else {
+        panic!("expected one evbk__log row: {logs:?}")
+    };
+    assert!(
+        (before..=after).contains(provisioned_at),
+        "provisioned_at {provisioned_at} outside [{before}, {after}]"
+    );
+    assert_eq!(
+        logs,
+        vec![(
+            reference,
+            spec.topic.to_string(),
+            log.uuid(),
+            2,
+            Some(86_400_000),
+            None,
+            *provisioned_at
+        )]
+    );
+    assert_eq!(
+        partition_keys(&control).await,
+        vec![
+            (
+                reference,
+                0,
+                "evbk__00000000000000000000000000005ee1_p0".to_owned()
+            ),
+            (
+                reference,
+                1,
+                "evbk__00000000000000000000000000005ee1_p1".to_owned()
+            ),
+        ]
+    );
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT TABLE_NAME FROM information_schema.TABLES \
+         WHERE TABLE_SCHEMA = DATABASE() AND LEFT(TABLE_NAME, 38) = 'evbk__00000000000000000000000000005ee2'",
+    )
+    .fetch_all(&control)
+    .await
+    .unwrap();
+    assert_eq!(tables, Vec::<String>::new());
+    let other: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM evbk__retention WHERE topic_uuid = ?), \
+         (SELECT COUNT(*) FROM evbk__segment WHERE topic_uuid = ?)",
+    )
+    .bind(Uuid::from_u128(0x5ee2))
+    .bind(Uuid::from_u128(0x5ee2))
+    .fetch_one(&control)
+    .await
+    .unwrap();
+    assert_eq!(other, (0, 0));
     backend.stop(CancellationToken::new()).await;
 }
 
@@ -395,7 +687,7 @@ async fn a_re_provision_does_not_wait_for_an_open_append(engine: Engine) {
     append(backend.as_ref(), &spec.topic, &[keyed("k", 1000)]).await;
     let mut open = control.begin().await.unwrap();
     sqlx::query("UPDATE evbk__partition SET hwm = hwm WHERE topic_uuid = ?")
-        .bind(topic_uuid(&spec.topic))
+        .bind(spec.uuid)
         .execute(&mut *open)
         .await
         .unwrap();
@@ -493,7 +785,7 @@ async fn the_sealer_weighs_full_segments(engine: Engine) {
             "SELECT first_seq, CAST(state AS CHAR), bytes, newest_at FROM evbk__segment \
              WHERE topic_uuid = ? AND first_seq < 3000 ORDER BY first_seq",
         )
-        .bind(topic_uuid(&spec.topic))
+        .bind(spec.uuid)
         .fetch_all(&control)
         .await
         .unwrap()
@@ -772,7 +1064,7 @@ async fn a_server_that_does_not_flush_every_commit_is_refused_unless_allowed(eng
 /// What [`a_crash_between_ddl_and_catalog_is_settled`] leaves behind, made by
 /// hand on a stopped backend's database.
 async fn crash_in_every_place(control: &MySqlPool, spec: &TopicSpec) {
-    let topic = topic_uuid(&spec.topic);
+    let topic = spec.uuid;
     let run = |sql: String| {
         let control = control.clone();
         async move {
@@ -830,7 +1122,7 @@ async fn a_clock_step_back_does_not_lower_seq_time(engine: Engine) {
     let ahead =
         ahead - chrono::Duration::nanoseconds(i64::from(ahead.timestamp_subsec_nanos() % 1000));
     sqlx::query(AssertSqlSafe(format!(
-        "INSERT INTO {} (seq, seq_time, tenant_id, cum_bytes, body) VALUES (1, ?, ?, 0, '')",
+        "INSERT INTO {} (seq, seq_time, subject_tenant, cum_bytes, body) VALUES (1, ?, ?, 0, '')",
         table(&spec, 0)
     )))
     .bind(ahead)
@@ -839,7 +1131,7 @@ async fn a_clock_step_back_does_not_lower_seq_time(engine: Engine) {
     .await
     .unwrap();
     sqlx::query("UPDATE evbk__partition SET hwm = 1 WHERE topic_uuid = ?")
-        .bind(topic_uuid(&spec.topic))
+        .bind(spec.uuid)
         .execute(&control)
         .await
         .unwrap();

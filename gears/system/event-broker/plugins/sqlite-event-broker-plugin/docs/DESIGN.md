@@ -67,14 +67,14 @@ Defined in `src/migrations/0001_plugin_tables.sql`, which also lists the queries
 
 | Table | Key | Holds |
 |---|---|---|
-| `evbk__log` | `topic_uuid` | one row per provisioned topic: its id, log id (feature 0006), partition count, retention bounds (`max_age_ms`, `max_bytes`, NULL = unbounded) |
+| `evbk__log` | `topic_uuid`; `topic_id` is unique (`evbk__log_topic_id`) | one row per provisioned topic: its id, log id (feature 0006), partition count, retention bounds (`max_age_ms`, `max_bytes`, NULL = unbounded) |
 | `evbk__partition` | `(topic_uuid, partition)` | `hwm` (highest sequence ever assigned), `floor` (highest sequence removed), `bytes` (body bytes in `(floor, hwm]`), `head_time` (`sequence_time` at `hwm`) |
 | `evbk__fence` | `fence_key` | `last_seq` applied under each fence key |
-| `evbk__event` | `(topic_uuid, partition, sequence)` | every stored event: `sequence_time`, `tenant_id`, `size` (= `length(body)`), `body` |
+| `evbk__event` | `(topic_uuid, partition, sequence)` | every stored event: `sequence_time`, `subject_tenant`, `size` (= `length(body)`), `body` |
 
-Index `evbk__event_time (topic_uuid, partition, sequence_time, sequence)` covers the age cut, the sweep's oldest-event check and `resolve(At)` without reading the table.
+Index `evbk__event_time (topic_uuid, partition, sequence_time, sequence)` covers the age cut, the sweep's oldest-event check and `resolve(At)` without reading the table. The unique index `evbk__log_topic_id (topic_id)` keeps one `evbk__log` row per topic and serves the topic lookup by GTS id.
 
-`tenant_id` is written with every event and read by no query today, as in the PostgreSQL plugin, which keeps it as a column for tenant scoping: it is there so a tenant-filtered read or a per-tenant purge needs no change to the stored rows. The body carries it too, so a read never needs the column.
+`subject_tenant` is written with every event and read by no query today, as in the PostgreSQL plugin, which keeps it as a column for tenant scoping: it is there so a tenant-filtered read or a per-tenant purge needs no change to the stored rows. The body carries it too, so a read never needs the column.
 
 `evbk__fence` grows by one row per fence key ever used and nothing removes rows, as in the PostgreSQL plugin: fence keys are per outbox identity, so the table stays small in practice.
 
@@ -89,7 +89,7 @@ SQLite has type affinity, not types, and does not enforce a declared length; so 
 | Column | Declared | Why |
 |---|---|---|
 | `topic_id` | `VARCHAR(1024)`, `CHECK (length(topic_id) <= 1024)` | a GTS instance id, at most `gts_id::GTS_ID_MAX_LENGTH` (1024) |
-| `topic_uuid`, `log_id`, `fence_key`, `tenant_id` | `BLOB`, `CHECK (length(...) = 16)` where it is a key | 16 raw bytes, half the size of the text form; `topic_uuid` is `support::topic_uuid` (`GtsId::to_uuid`) |
+| `topic_uuid`, `log_id`, `fence_key`, `subject_tenant` | `BLOB`, `CHECK (length(...) = 16)` where it is a key | 16 raw bytes, half the size of the text form; `topic_uuid` is `TopicSpec.uuid`, the topic's Registry Reference; the plugin never derives it |
 | `partition`, `sequence`, `hwm`, `floor`, `bytes`, `size`, `last_seq`, `max_bytes` | `INTEGER` | 64-bit signed, SQLite's native integer |
 | `sequence_time`, `head_time`, `provisioned_at` | `INTEGER` | microseconds since the Unix epoch, UTC: ordered, compact, and compared with no parsing |
 | `max_age_ms` | `INTEGER` | milliseconds |
@@ -99,7 +99,7 @@ No column is `TEXT`: the only unbounded content is the body, and it is bytes.
 
 ### 2.3 Event Body
 
-`body` is versioned JSON (`{"v": 1, ...}`) of every event field no column carries: `id`, `type_id`, `tenant_id`, `source`, `subject`, `subject_type`, `occurred_at`, `trace_parent`, `data`. `meta` (publisher-only) is not stored; `partition`, `sequence` and `sequence_time` come from the columns. It is the same encoding as the PostgreSQL plugin's. A body of an unknown version fails the read with `Internal`.
+`body` is versioned JSON (`{"v": 1, ...}`) of every event field no column carries: `id`, `type_id`, `subject_tenant`, `source`, `subject`, `subject_type`, `occurred_at`, `trace_parent`, `data`. `meta` (publisher-only) is not stored; `partition`, `sequence` and `sequence_time` come from the columns. It is the same encoding as the PostgreSQL plugin's. A body of an unknown version fails the read with `Internal`.
 
 ## 3. Component Model
 
@@ -139,7 +139,7 @@ Every instance over one file in this process shares a hub, found in a process-wi
 
 One write transaction:
 
-1. `INSERT INTO evbk__log ... ON CONFLICT (topic_uuid) DO NOTHING` with the claim's log id, the spec's partition count and retention. Skipped for a `Held` claim, which never creates.
+1. `INSERT INTO evbk__log ... ON CONFLICT (topic_uuid) DO NOTHING` under `TopicSpec.uuid`, with the topic's GTS id, the claim's log id, the spec's partition count and retention. Skipped for a `Held` claim, which never creates. A second reference for a provisioned topic is not the conflict target: the unique index `evbk__log_topic_id` fails the insert, `Internal` (`provision: database error (SQLite code 2067)`, §7), and the transaction rolls back with nothing written.
 2. Read the stored `log_id` and `partitions`, if any. If `LogClaim::check` refuses it, roll back and answer its error: `LogConflict` for a foreign log id, `NotProvisioned` for a `Held` claim with no row - and so creates no row and no partition.
 3. `UPDATE` the row to the claim's log id and the spec's retention - the sweep reads the bounds on its next pass, so a retention change takes effect within `sweep.interval_ms`.
 4. Insert one `evbk__partition` row per partition of the **stored** count, `ON CONFLICT DO NOTHING`.
@@ -148,7 +148,7 @@ Answers `Ready { partitions }` with the stored count: a topic provisioned with 4
 
 ### 4.2 append
 
-1. **Provisioned?** The topic's partition count, from the instance's cache or `evbk__log`; none is `NotProvisioned` - before the fence, so a fence that has passed its seq is no answer for a topic this backend does not hold.
+1. **Provisioned?** The topic's partition count, from the instance's cache or `evbk__log` by `topic_id`; none is `NotProvisioned` - before the fence, so a fence that has passed its seq is no answer for a topic this backend does not hold.
 2. Group the events by partition (`partition_for`) and encode their bodies, outside any lock.
 3. Take the hub's write turn, then `BEGIN IMMEDIATE`: the file's write lock is taken up front, so no read-to-write upgrade can fail midway.
 4. **Fence**: `INSERT INTO evbk__fence ... ON CONFLICT (fence_key) DO UPDATE SET last_seq = excluded.last_seq WHERE last_seq < excluded.last_seq`. No row changed means the fence has passed this seq: roll back, `Duplicate`.

@@ -98,6 +98,7 @@ pub async fn provisioned(
 ) -> TopicSpec {
     let spec = TopicSpec {
         topic: topic(name),
+        uuid: Uuid::new_v4(),
         partitions,
         retention,
     };

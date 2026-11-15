@@ -21,8 +21,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use event_broker_sdk::backend::{
     AppendRequest, Appended, Backend, BackendError, Fence, FenceKey, FenceSeq, Flush, Head,
-    KeyedEvent, LogClaim, Partition, Replacing, Retention, Role, TopicPartition, TopicSpec, Wait,
-    Watch,
+    KeyedEvent, LogClaim, LogId, Partition, Provisioning, Replacing, Retention, Role,
+    TopicPartition, TopicSpec, Wait, Watch,
 };
 use event_broker_sdk::models::{Event, PartitionRange};
 use event_broker_sdk::{GtsInstanceId, GtsTypeId, Position, Sequence};
@@ -40,16 +40,18 @@ fn event(key: &str, n: u64) -> KeyedEvent {
         key: key.to_owned(),
         event: Event {
             id: Uuid::from_u128(0x5eed_0000 + u128::from(n)),
-            type_id: GtsTypeId::new(toolkit_gts::gts_id!(
+            event_type: GtsTypeId::new(toolkit_gts::gts_id!(
                 "cf.core.events.event.v1~cf.sqlite_test.x.happened.v1~"
             )),
-            tenant_id: Uuid::from_u128(0x7e4a_0001),
+            subject_tenant: Uuid::from_u128(0x7e4a_0001),
             source: "sqlite-test".to_owned(),
             subject: format!("{key}-{n}"),
             subject_type: GtsTypeId::new(toolkit_gts::gts_id!("cf.sqlite_test.x.thing.v1~")),
+            subject_owner: None,
             occurred_at: STORED_AT_LEAST,
             trace_parent: None,
             data: Some(serde_json::json!({ "key": key, "n": n })),
+            ingest: None,
             partition: None,
             sequence: None,
             sequence_time: None,
@@ -112,6 +114,10 @@ async fn inspect(path: &Path) -> SqlitePool {
         .await
         .expect("the test opens the file")
 }
+
+/// An `evbk__log` row: `topic_uuid`, `topic_id`, `log_id`, `partitions`,
+/// `max_age_ms`, `max_bytes`, `provisioned_at`.
+type LogRow = (Uuid, String, Uuid, i64, Option<i64>, Option<i64>, i64);
 
 /// Polls `check` every 50 ms until it holds, for up to 5 s.
 async fn eventually<F, Fut>(what: &str, mut check: F)
@@ -218,6 +224,180 @@ async fn a_restart_on_the_same_file_keeps_events_heads_and_fences() {
     assert_eq!(next, Appended::Heads(vec![head(&spec.topic, 0, 4)]));
     assert_eq!(sequences(second.as_ref(), &at).await, [1, 2, 3, 4]);
     second.stop(CancellationToken::new()).await;
+}
+
+/// A topic's rows are keyed by the Registry Reference its spec carries, and
+/// an instance that did not provision it finds it by its GTS id. The
+/// reference is a version-0 UUID, which no derivation from the id yields.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_topic_is_stored_and_found_under_its_registry_reference() {
+    let files = common::Files::new();
+    let path = files.path("events.db");
+    let first = common::started(common::built(&path).await).await;
+    let reference = Uuid::from_u128(0x5ee1);
+    let spec = TopicSpec {
+        topic: common::topic("reference"),
+        uuid: reference,
+        partitions: 1,
+        retention: UNBOUNDED,
+    };
+    let log = LogId::new_v4();
+    let before = Utc::now().timestamp_micros();
+    let provisioned = first
+        .provision(
+            &spec,
+            &LogClaim {
+                replacing: Replacing::Nothing,
+                new: log,
+            },
+        )
+        .await;
+    let after = Utc::now().timestamp_micros();
+    assert_eq!(
+        format!("{provisioned:?}"),
+        format!(
+            "{:?}",
+            Ok::<_, BackendError>(Provisioning::Ready { partitions: 1 })
+        )
+    );
+
+    let pool = inspect(&path).await;
+    let logs: Vec<LogRow> = sqlx::query_as(
+        "SELECT topic_uuid, topic_id, log_id, partitions, max_age_ms, max_bytes, provisioned_at \
+         FROM evbk__log",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let [(.., provisioned_at)] = logs.as_slice() else {
+        panic!("expected one evbk__log row: {logs:?}")
+    };
+    assert!(
+        (before..=after).contains(provisioned_at),
+        "provisioned_at {provisioned_at} outside [{before}, {after}]"
+    );
+    assert_eq!(
+        logs,
+        vec![(
+            reference,
+            spec.topic.to_string(),
+            log.uuid(),
+            1,
+            None,
+            None,
+            *provisioned_at
+        )]
+    );
+    let partitions: Vec<(Uuid, i64)> =
+        sqlx::query_as("SELECT topic_uuid, partition FROM evbk__partition ORDER BY partition")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(partitions, vec![(reference, 0)]);
+    first.stop(CancellationToken::new()).await;
+    drop(first);
+
+    let second = common::started(common::built(&path).await).await;
+    let at = TopicPartition::new(spec.topic.clone(), Partition::new(0));
+    let appended = append(second.as_ref(), fence(1, 1), &spec.topic, &[event("k", 0)]).await;
+
+    assert_eq!(
+        format!("{appended:?}"),
+        format!(
+            "{:?}",
+            Ok::<_, BackendError>(Appended::Heads(vec![head(&spec.topic, 0, 1)]))
+        )
+    );
+    assert_eq!(sequences(second.as_ref(), &at).await, [1]);
+    let events: Vec<Uuid> = sqlx::query_scalar("SELECT topic_uuid FROM evbk__event")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(events, vec![reference]);
+    second.stop(CancellationToken::new()).await;
+}
+
+/// A topic holds one Registry Reference: a provision that names a
+/// provisioned topic under another one breaks the registry's stable mapping,
+/// is refused by the unique index on `topic_id`, and writes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_reference_for_a_provisioned_topic_is_refused() {
+    let files = common::Files::new();
+    let path = files.path("events.db");
+    let backend = common::started(common::built(&path).await).await;
+    let reference = Uuid::from_u128(0x5ee1);
+    let spec = TopicSpec {
+        topic: common::topic("second_reference"),
+        uuid: reference,
+        partitions: 2,
+        retention: UNBOUNDED,
+    };
+    let log = LogId::new_v4();
+    let before = Utc::now().timestamp_micros();
+    backend
+        .provision(
+            &spec,
+            &LogClaim {
+                replacing: Replacing::Nothing,
+                new: log,
+            },
+        )
+        .await
+        .unwrap();
+    let after = Utc::now().timestamp_micros();
+
+    let second = backend
+        .provision(
+            &TopicSpec {
+                uuid: Uuid::from_u128(0x5ee2),
+                ..spec.clone()
+            },
+            &LogClaim {
+                replacing: Replacing::Nothing,
+                new: LogId::new_v4(),
+            },
+        )
+        .await;
+
+    assert_eq!(
+        format!("{second:?}"),
+        r#"Err(Internal("provision: database error (SQLite code 2067)"))"#
+    );
+    let pool = inspect(&path).await;
+    let logs: Vec<LogRow> = sqlx::query_as(
+        "SELECT topic_uuid, topic_id, log_id, partitions, max_age_ms, max_bytes, provisioned_at \
+         FROM evbk__log",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let [(.., provisioned_at)] = logs.as_slice() else {
+        panic!("expected one evbk__log row: {logs:?}")
+    };
+    assert!(
+        (before..=after).contains(provisioned_at),
+        "provisioned_at {provisioned_at} outside [{before}, {after}]"
+    );
+    assert_eq!(
+        logs,
+        vec![(
+            reference,
+            spec.topic.to_string(),
+            log.uuid(),
+            2,
+            None,
+            None,
+            *provisioned_at
+        )]
+    );
+    let partitions: Vec<(Uuid, i64)> = sqlx::query_as(
+        "SELECT topic_uuid, partition FROM evbk__partition ORDER BY topic_uuid, partition",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(partitions, vec![(reference, 0), (reference, 1)]);
+    backend.stop(CancellationToken::new()).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -451,6 +631,7 @@ async fn partition_counts_out_of_range_are_refused() {
             .provision(
                 &TopicSpec {
                     topic: common::topic("too_many"),
+                    uuid: Uuid::new_v4(),
                     partitions,
                     retention: UNBOUNDED,
                 },

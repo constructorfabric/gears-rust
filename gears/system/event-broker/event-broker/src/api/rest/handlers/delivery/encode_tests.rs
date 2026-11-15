@@ -45,10 +45,11 @@ fn event() -> Event {
             "gts.cf.core.events.event.v1~x.eb.o.created.v1~",
         ),
         topic: gts(TOPIC),
-        tenant_id: Uuid::nil(),
+        subject_tenant: Uuid::nil(),
         source: "encode-tests".to_owned(),
         subject: "order-1".to_owned(),
         subject_type: gts::GtsTypeId::new("gts.x.eb.encode.order.v1~"),
+        subject_owner: None,
         occurred_at: at(),
         trace_parent: None,
         data: serde_json::json!({ "n": 1 }),
@@ -58,6 +59,7 @@ fn event() -> Event {
             previous: Some(0),
             sequence: 1,
         }),
+        ingest: None,
         partition: Some(3),
         sequence: Some(Sequence::assigned(42)),
         sequence_time: Some(at()),
@@ -159,12 +161,33 @@ fn an_event_frame_strips_the_producer_chain() {
     );
     // `meta` is publish-input only and must not reach a consumer.
     assert!(
-        !body.contains("\"meta\"") && !body.contains("producer_id"),
+        !body.contains("\"meta\"") && !body.contains("\"producer\""),
         "the producer chain must be stripped from the read projection: {body}"
     );
     assert!(
         body.contains(r#""sequence":42"#) && body.contains(r#""partition":3"#),
         "the broker-derived fields must be present: {body}"
+    );
+}
+
+/// The whole body of an event frame: the read projection of the stored event,
+/// with no `topic` (a consumer knows it from the event's type) and no `meta`
+/// (the producer chain is publish input only).
+#[test]
+fn an_event_frame_body_is_the_payload_without_topic_or_meta() {
+    assert_eq!(
+        part_body(Frame::Event(Box::new(event()))),
+        concat!(
+            r#"{"kind":"event","payload":{"#,
+            r#""id":"00000000-0000-0000-0000-000000000000","#,
+            r#""type":"gts.cf.core.events.event.v1~x.eb.o.created.v1~","#,
+            r#""subject_tenant":"00000000-0000-0000-0000-000000000000","#,
+            r#""source":"encode-tests","subject":"order-1","#,
+            r#""subject_type":"gts.x.eb.encode.order.v1~","#,
+            r#""occurred_at":"2026-01-01T00:00:00Z","trace_parent":null,"#,
+            r#""data":{"n":1},"partition":3,"sequence":42,"#,
+            r#""sequence_time":"2026-01-01T00:00:00Z"}}"#
+        )
     );
 }
 

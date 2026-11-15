@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use event_broker_sdk::models::EventType;
 use gts::{GtsIdPattern, GtsTypeId};
 use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, Set};
+use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set};
 use serde_json::Value as JsonValue;
 use toolkit_db::DBProvider;
 use toolkit_db::secure::{DBRunner, SecureEntityExt, SecureUpdateExt, secure_insert};
@@ -41,7 +41,9 @@ use crate::domain::backend::BackendResolver;
 use crate::domain::error::{DomainError, ErrorCode};
 use crate::domain::model::Topic;
 use crate::domain::resolution::{Declaration, resolve};
-use crate::domain::specification::{ProvisioningLimits, SpecificationManager, TopicState};
+use crate::domain::specification::{
+    EventTypeCandidate, EventTypeCandidates, ProvisioningLimits, SpecificationManager, TopicState,
+};
 use crate::domain::{event_type as event_type_traits, projection};
 use crate::infra::storage::entity::spec_cache::{
     self, ActiveModel as SpecCacheAM, Column as SpecCacheColumn, Entity as SpecCacheEntity,
@@ -147,7 +149,51 @@ impl TypesRegistrySpecificationManager {
             .await?;
         Ok(rows)
     }
+
+    /// `topic`'s event-type rows, ordered by `gts_id`: at most one more than
+    /// [`EventTypeCandidates::CAP`], which is enough to tell the cap was passed.
+    async fn event_type_candidate_rows(
+        &self,
+        topic: &GtsInstanceId,
+    ) -> Result<Vec<CandidateRow>, DomainError> {
+        let conn = self.db.conn()?;
+        let rows = SpecCacheEntity::find()
+            // Topic rows hold no topic, so `topic` alone selects the same rows;
+            // `kind` is here to match the `(kind, topic)` index.
+            .filter(SpecCacheColumn::Kind.eq(SpecKind::EventType.as_str()))
+            .filter(SpecCacheColumn::Topic.eq(topic.as_ref()))
+            .order_by_asc(SpecCacheColumn::GtsId)
+            .limit(CANDIDATE_ROWS)
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .project_all(&conn, |select| {
+                select
+                    .select_only()
+                    .column(SpecCacheColumn::GtsId)
+                    .column(SpecCacheColumn::AllowedSubjectTypes)
+                    .into_model::<CandidateRow>()
+            })
+            .await?;
+        Ok(rows)
+    }
 }
+
+/// The two columns [`TypesRegistrySpecificationManager::event_type_candidate_rows`]
+/// reads, leaving `payload` and its `data_schema` behind.
+#[derive(sea_orm::FromQueryResult)]
+struct CandidateRow {
+    gts_id: String,
+    allowed_subject_types: String,
+}
+
+/// The one column the registered-type lookup reads.
+#[derive(sea_orm::FromQueryResult)]
+struct GtsIdRow {
+    gts_id: String,
+}
+
+/// [`EventTypeCandidates::CAP`] plus the one row that shows it was passed.
+const CANDIDATE_ROWS: u64 = EventTypeCandidates::CAP as u64 + 1;
 
 /// Reads every topic and event type `types-registry` holds, projects each one,
 /// resolves a topic's settings against configuration, and upserts the result
@@ -236,11 +282,12 @@ pub async fn bulk_load(
         }
         let topic = Topic {
             id: projected.id.clone(),
+            uuid: instance.uuid,
             description: projected.description,
             retention: projected.retention,
             settings,
         };
-        upsert_spec_row(&conn, SpecKind::Topic, topic.id.as_ref(), &topic).await?;
+        upsert_spec_row(&conn, topic.id.as_ref(), &topic, SpecColumns::Topic).await?;
     }
     if !listing_failed {
         for key in routing
@@ -292,9 +339,12 @@ pub async fn bulk_load(
         };
         upsert_spec_row(
             &conn,
-            SpecKind::EventType,
             projected.id.as_ref(),
             &EventTypeRecord::from(&projected),
+            SpecColumns::EventType {
+                topic: &projected.topic,
+                allowed_subject_types: &projected.allowed_subject_types,
+            },
         )
         .await?;
     }
@@ -328,20 +378,76 @@ async fn cached_routes(
         .collect())
 }
 
-/// Updates the row's `payload` in place if `(kind, gts_id)` already exists
-/// (preserving `id`), else inserts a fresh row. Tries the update first via
-/// `update_many().filter(...)` (generic over any primary-key type, unlike
-/// `secure_update_with_scope`, which hardcodes `id: uuid::Uuid` and can't
-/// address `spec_cache`'s `i64` key) and falls back to insert only if it
-/// affected zero rows - avoiding a separate existence-check round trip.
+/// The columns a row stores beside its `payload`, and its `kind`.
+enum SpecColumns<'a> {
+    /// `topic` is `NULL` and `allowed_subject_types` is `[]`.
+    Topic,
+    EventType {
+        topic: &'a GtsInstanceId,
+        allowed_subject_types: &'a [GtsIdPattern],
+    },
+}
+
+impl SpecColumns<'_> {
+    fn kind(&self) -> SpecKind {
+        match self {
+            Self::Topic => SpecKind::Topic,
+            Self::EventType { .. } => SpecKind::EventType,
+        }
+    }
+
+    fn topic(&self) -> Option<String> {
+        match self {
+            Self::Topic => None,
+            Self::EventType { topic, .. } => Some(topic.as_ref().to_owned()),
+        }
+    }
+
+    fn allowed_subject_types(&self) -> Result<String, DomainError> {
+        let patterns = match self {
+            Self::Topic => &[][..],
+            Self::EventType {
+                allowed_subject_types,
+                ..
+            } => allowed_subject_types,
+        };
+        serde_json::to_string(&SubjectTypesColumn(patterns))
+            .map_err(|e| DomainError::Internal(format!("failed to serialize subject types: {e}")))
+    }
+}
+
+/// The `allowed_subject_types` column: a JSON array in the form
+/// `EventTypeRecord` writes the same list in `payload`.
+#[derive(serde::Serialize)]
+#[serde(transparent)]
+struct SubjectTypesColumn<'a>(
+    #[serde(serialize_with = "crate::domain::gts_pattern_serde::serialize")] &'a [GtsIdPattern],
+);
+
+/// [`SubjectTypesColumn`] as read back.
+#[derive(serde::Deserialize)]
+#[serde(transparent)]
+struct StoredSubjectTypes(
+    #[serde(deserialize_with = "crate::domain::gts_pattern_serde::deserialize")] Vec<GtsIdPattern>,
+);
+
+/// Updates the row's `payload` and `columns` in place if `(kind, gts_id)`
+/// already exists (preserving `id`), else inserts a fresh row. Tries the
+/// update first via `update_many().filter(...)` (generic over any primary-key
+/// type, unlike `secure_update_with_scope`, which hardcodes `id: uuid::Uuid`
+/// and can't address `spec_cache`'s `i64` key) and falls back to insert only
+/// if it affected zero rows - avoiding a separate existence-check round trip.
 async fn upsert_spec_row(
     conn: &impl DBRunner,
-    kind: SpecKind,
     gts_id: &str,
     spec: &impl serde::Serialize,
+    columns: SpecColumns<'_>,
 ) -> Result<(), DomainError> {
+    let kind = columns.kind();
     let payload = serde_json::to_string(spec)
         .map_err(|e| DomainError::Internal(format!("failed to serialize spec: {e}")))?;
+    let topic = columns.topic();
+    let allowed_subject_types = columns.allowed_subject_types()?;
 
     let update_result = SpecCacheEntity::update_many()
         .secure()
@@ -352,6 +458,11 @@ async fn upsert_spec_row(
                 .add(SpecCacheColumn::Kind.eq(kind.as_str())),
         )
         .col_expr(SpecCacheColumn::Payload, Expr::value(payload.clone()))
+        .col_expr(SpecCacheColumn::Topic, Expr::value(topic.clone()))
+        .col_expr(
+            SpecCacheColumn::AllowedSubjectTypes,
+            Expr::value(allowed_subject_types.clone()),
+        )
         .exec(conn)
         .await?;
 
@@ -361,6 +472,8 @@ async fn upsert_spec_row(
             gts_id: Set(gts_id.to_owned()),
             kind: Set(kind.as_str().to_owned()),
             payload: Set(payload),
+            topic: Set(topic),
+            allowed_subject_types: Set(allowed_subject_types),
         };
         secure_insert::<SpecCacheEntity>(am, &AccessScope::allow_all(), conn).await?;
     }
@@ -433,7 +546,7 @@ impl SpecificationManager for TypesRegistrySpecificationManager {
         let Some(topic) = deserialize_row::<Topic>(&row) else {
             return Ok(None);
         };
-        Ok(Some(match self.read_topic_state(id).await? {
+        Ok(Some(match self.read_topic_state(&topic).await? {
             Some(TopicState::Provisioned { partitions, .. }) => {
                 with_backend_partitions(topic, i64::from(partitions))
             }
@@ -446,6 +559,70 @@ impl SpecificationManager for TypesRegistrySpecificationManager {
             return Ok(None);
         };
         Ok(deserialize_row::<EventTypeRecord>(&row).map(EventType::from))
+    }
+
+    async fn get_event_type_candidates(
+        &self,
+        topic: &GtsInstanceId,
+    ) -> Result<EventTypeCandidates, DomainError> {
+        let rows = self.event_type_candidate_rows(topic).await?;
+        if rows.len() > EventTypeCandidates::CAP {
+            return Ok(EventTypeCandidates::OverCap);
+        }
+        rows.into_iter()
+            .map(|row| {
+                // Only `upsert_spec_row` writes these columns, so a value that
+                // does not parse is a broken cache. The parse messages quote
+                // the stored value, so the errors leave them out.
+                let id = GtsTypeId::try_new(&row.gts_id).map_err(|_| {
+                    DomainError::Internal("a cached event type id does not parse".to_owned())
+                })?;
+                let StoredSubjectTypes(allowed_subject_types) =
+                    serde_json::from_str(&row.allowed_subject_types).map_err(|_| {
+                        DomainError::Internal(
+                            "a cached allowed_subject_types list does not decode".to_owned(),
+                        )
+                    })?;
+                Ok(EventTypeCandidate {
+                    id,
+                    allowed_subject_types,
+                })
+            })
+            .collect::<Result<_, _>>()
+            .map(EventTypeCandidates::Listed)
+    }
+
+    async fn get_registered_event_types(
+        &self,
+        topic: &GtsInstanceId,
+        ids: &[GtsTypeId],
+    ) -> Result<Vec<GtsTypeId>, DomainError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.db.conn()?;
+        let rows = SpecCacheEntity::find()
+            .filter(SpecCacheColumn::Kind.eq(SpecKind::EventType.as_str()))
+            .filter(SpecCacheColumn::Topic.eq(topic.as_ref()))
+            .filter(SpecCacheColumn::GtsId.is_in(ids.iter().map(AsRef::<str>::as_ref)))
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .project_all(&conn, |select| {
+                select
+                    .select_only()
+                    .column(SpecCacheColumn::GtsId)
+                    .into_model::<GtsIdRow>()
+            })
+            .await?;
+        rows.iter()
+            .map(|row| {
+                // Only `upsert_spec_row` writes this column; the parse message
+                // quotes the stored value, so the error leaves it out.
+                GtsTypeId::try_new(&row.gts_id).map_err(|_| {
+                    DomainError::Internal("a cached event type id does not parse".to_owned())
+                })
+            })
+            .collect()
     }
 
     async fn validate_event_data(
@@ -501,8 +678,8 @@ impl SpecificationManager for TypesRegistrySpecificationManager {
             })
     }
 
-    async fn topic_state(&self, id: &GtsInstanceId) -> Result<Option<TopicState>, DomainError> {
-        self.read_topic_state(id).await
+    async fn topic_state(&self, topic: &Topic) -> Result<Option<TopicState>, DomainError> {
+        self.read_topic_state(topic).await
     }
 
     async fn provision_topics(
@@ -529,19 +706,19 @@ fn with_backend_partitions(mut topic: Topic, partitions: i64) -> Topic {
 mod tests {
     use serde_json::json;
     use toolkit_canonical_errors::CanonicalError;
-    use toolkit_db::migration_runner::run_migrations_for_testing;
-    use toolkit_db::{ConnectOpts, DBProvider, connect_db};
+    use toolkit_db::DBProvider;
     use types_registry_sdk::PlatformTypesRegistryApi;
     use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry};
-    use uuid::Uuid;
 
-    use super::{Arc, DomainError, GtsInstanceId, GtsSchema, GtsTypeId, SpecificationManager};
+    use super::{
+        Arc, DomainError, GtsIdPattern, GtsInstanceId, GtsSchema, GtsTypeId, SpecificationManager,
+    };
     use crate::config::EventBrokerConfig;
     use crate::domain::resolution::Source;
-    use crate::infra::storage::migrations::Migrator;
-    use crate::test_support::type_registry::registry_holding;
+    use crate::domain::specification::{EventTypeCandidate, EventTypeCandidates};
+    use crate::test_support::gear_db::ScratchSqlite;
+    use crate::test_support::type_registry::{StaticTypesRegistry, registry_holding};
     use event_broker_sdk::gts::{EventV1, EventV1Traits};
-    use sea_orm_migration::MigratorTrait;
 
     const TOPIC_ID: &str = toolkit_gts::gts_id!("cf.core.events.topic.v1~example.eb.t1.topic.v1");
     const EVENT_TYPE_ID: &str = <FooV1 as GtsSchema>::TYPE_ID;
@@ -575,6 +752,21 @@ mod tests {
     )]
     struct SilentFooV1;
 
+    // Names `/tenant_id`, a member the base does not declare.
+    #[toolkit_gts::gts_type_schema(
+        dir_path = "schemas",
+        base = EventV1,
+        type_id = toolkit_gts::gts_id!("cf.core.events.event.v1~example.eb.t1.old_pointer.v1~"),
+        description = "An event partitioned by the old tenant pointer.",
+        properties = "",
+        traits = json!({
+            "topic": TOPIC_ID,
+            "allowed_subject_types": [SUBJECT_TYPE],
+            "partition_key": "/tenant_id",
+        }),
+    )]
+    struct OldPointerV1;
+
     /// A topic instance carrying exactly what its base type declares - the
     /// partition count is not among them, and a document that named one would
     /// be refused at registration.
@@ -596,47 +788,27 @@ mod tests {
         .expect("test configuration deserializes")
     }
 
-    async fn test_db() -> Arc<DBProvider<toolkit_db::DbError>> {
-        test_db_with_dsn().await.0
-    }
-
-    /// [`test_db`], with a DSN that reaches the same file.
-    async fn test_db_with_dsn() -> (Arc<DBProvider<toolkit_db::DbError>>, String) {
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "cf-eb-spec-cache-test-{}.db",
-            Uuid::now_v7().simple()
-        ));
-        let mut file = path.to_string_lossy().replace('\\', "/");
-        if !file.starts_with('/') {
-            file.insert(0, '/');
-        }
-        let dsn = format!("sqlite://{file}?mode=rwc");
-        let opts = ConnectOpts {
-            max_conns: Some(1),
-            min_conns: Some(1),
-            ..Default::default()
-        };
-        let db = connect_db(&dsn, opts).await.expect("connect sqlite");
-        run_migrations_for_testing(&db, Migrator::migrations())
-            .await
-            .expect("migrations");
-        (Arc::new(DBProvider::new(db)), dsn)
+    async fn test_db() -> ScratchSqlite {
+        ScratchSqlite::open("cf-eb-spec-cache-test").await
     }
 
     /// Loads the given documents through the real load path, so every test here
-    /// is evidence about what a booting process does.
+    /// is evidence about what a booting process does; the manager comes back
+    /// with the database it reads.
     async fn manager_with(
         instances: Vec<serde_json::Value>,
         schemas: Vec<serde_json::Value>,
         cfg: &EventBrokerConfig,
-    ) -> super::TypesRegistrySpecificationManager {
+    ) -> (super::TypesRegistrySpecificationManager, ScratchSqlite) {
         let client: Arc<dyn PlatformTypesRegistryApi> = registry_holding(&instances, &schemas);
-        let db = test_db().await;
-        super::bulk_load(&client, &db, cfg)
+        let scratch = test_db().await;
+        super::bulk_load(&client, scratch.db(), cfg)
             .await
             .expect("bulk_load");
-        super::TypesRegistrySpecificationManager::new(db)
+        (
+            super::TypesRegistrySpecificationManager::new(Arc::clone(scratch.db())),
+            scratch,
+        )
     }
 
     #[tokio::test]
@@ -644,7 +816,8 @@ mod tests {
         let cfg = config(
             &json!({ toolkit_gts::gts_id!("cf.core.events.topic.v1~"): { "partitions": 4 } }),
         );
-        let manager = manager_with(vec![topic_document(TOPIC_ID)], Vec::new(), &cfg).await;
+        let (manager, _scratch) =
+            manager_with(vec![topic_document(TOPIC_ID)], Vec::new(), &cfg).await;
 
         let topic = manager
             .get_topic(&GtsInstanceId::try_new(TOPIC_ID).unwrap())
@@ -662,7 +835,8 @@ mod tests {
     #[tokio::test]
     async fn a_declared_retention_survives_a_deployment_that_states_none() {
         let cfg = config(&json!({}));
-        let manager = manager_with(vec![topic_document(TOPIC_ID)], Vec::new(), &cfg).await;
+        let (manager, _scratch) =
+            manager_with(vec![topic_document(TOPIC_ID)], Vec::new(), &cfg).await;
 
         let topic = manager
             .get_topic(&GtsInstanceId::try_new(TOPIC_ID).unwrap())
@@ -683,7 +857,7 @@ mod tests {
     #[tokio::test]
     async fn an_event_type_resolves_from_its_derived_schema() {
         let cfg = config(&json!({}));
-        let manager = manager_with(
+        let (manager, _scratch) = manager_with(
             vec![topic_document(TOPIC_ID)],
             vec![FooV1::gts_schema_with_refs()],
             &cfg,
@@ -706,7 +880,7 @@ mod tests {
             vec![SUBJECT_TYPE]
         );
         assert_eq!(
-            event_type.partition_key, "/tenant_id",
+            event_type.partition_key, "/subject_tenant",
             "the pointer this type declares for itself"
         );
     }
@@ -721,7 +895,8 @@ mod tests {
     async fn a_type_declaring_no_pointer_resolves_the_bases_default() {
         let cfg = config(&json!({}));
         let silent = SilentFooV1::gts_schema_with_refs();
-        let manager = manager_with(vec![topic_document(TOPIC_ID)], vec![silent], &cfg).await;
+        let (manager, _scratch) =
+            manager_with(vec![topic_document(TOPIC_ID)], vec![silent], &cfg).await;
 
         let event_type = manager
             .get_event_type(&GtsTypeId::try_new(EVENT_TYPE_ID).unwrap())
@@ -729,9 +904,48 @@ mod tests {
             .expect("the cache reads")
             .expect("it resolves");
         assert_eq!(
-            event_type.partition_key, "/tenant_id",
+            event_type.partition_key, "/subject_tenant",
             "the default on the base's trait schema reaches a type that states none"
         );
+    }
+
+    /// A type naming `/tenant_id`, which the base does not declare, is left out at
+    /// boot with a warning; its publishes find no event type.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_type_naming_the_old_tenant_pointer_is_not_loaded_and_is_warned_about() {
+        let cfg = config(&json!({}));
+        let (manager, _scratch) = manager_with(
+            vec![topic_document(TOPIC_ID)],
+            vec![OldPointerV1::gts_schema_with_refs()],
+            &cfg,
+        )
+        .await;
+
+        let event_type = manager
+            .get_event_type(&GtsTypeId::try_new(<OldPointerV1 as GtsSchema>::TYPE_ID).unwrap())
+            .await
+            .expect("the cache reads");
+        assert!(event_type.is_none(), "{event_type:?}");
+        logs_assert(|lines: &[&str]| {
+            let warned: Vec<&&str> = lines
+                .iter()
+                .filter(|line| {
+                    line.contains("event type excluded: its partition key does not validate")
+                })
+                .collect();
+            match warned.as_slice() {
+                [line]
+                    if line.contains(<OldPointerV1 as GtsSchema>::TYPE_ID)
+                        && line.contains("names no declared member `tenant_id`") =>
+                {
+                    Ok(())
+                }
+                _ => Err(format!(
+                    "expected one warning naming the type, got {warned:?}"
+                )),
+            }
+        });
     }
 
     /// The listing of a base type's derived schemas includes the base, because
@@ -740,7 +954,7 @@ mod tests {
     #[tokio::test]
     async fn the_abstract_base_is_not_materialized_as_an_event_type() {
         let cfg = config(&json!({}));
-        let manager = manager_with(
+        let (manager, _scratch) = manager_with(
             vec![topic_document(TOPIC_ID)],
             vec![FooV1::gts_schema_with_refs()],
             &cfg,
@@ -763,7 +977,8 @@ mod tests {
     /// therefore serve one topic under two partition counts.
     #[tokio::test]
     async fn a_manager_serves_what_a_load_resolved_under_configuration_it_never_saw() {
-        let db = test_db().await;
+        let scratch = test_db().await;
+        let db = Arc::clone(scratch.db());
         let client: Arc<dyn PlatformTypesRegistryApi> =
             registry_holding(&[topic_document(TOPIC_ID)], &[]);
         let ingest_config = config(
@@ -787,7 +1002,7 @@ mod tests {
     #[tokio::test]
     async fn get_topic_returns_none_for_an_unregistered_id() {
         let cfg = config(&json!({}));
-        let manager = manager_with(Vec::new(), Vec::new(), &cfg).await;
+        let (manager, _scratch) = manager_with(Vec::new(), Vec::new(), &cfg).await;
 
         let missing = GtsInstanceId::try_new(toolkit_gts::gts_id!(
             "cf.core.events.topic.v1~example.eb.missing.topic.v1"
@@ -800,7 +1015,8 @@ mod tests {
     /// A cache that cannot be read says nothing about what is registered.
     #[tokio::test]
     async fn a_spec_cache_read_failure_is_an_error_not_not_found() {
-        let (db, dsn) = test_db_with_dsn().await;
+        let scratch = test_db().await;
+        let (db, dsn) = (Arc::clone(scratch.db()), scratch.dsn().to_owned());
         super::bulk_load(&client_with(&[TOPIC_ID]), &db, &config(&json!({})))
             .await
             .expect("bulk_load");
@@ -827,7 +1043,8 @@ mod tests {
     /// An unreadable cache says nothing about which event types are registered.
     #[tokio::test]
     async fn an_event_type_read_failure_is_an_error_not_not_found() {
-        let (db, dsn) = test_db_with_dsn().await;
+        let scratch = test_db().await;
+        let (db, dsn) = (Arc::clone(scratch.db()), scratch.dsn().to_owned());
         let client: Arc<dyn PlatformTypesRegistryApi> = registry_holding(
             &[topic_document(TOPIC_ID)],
             &[FooV1::gts_schema_with_refs()],
@@ -858,7 +1075,8 @@ mod tests {
         let cfg = config(&json!({}));
         let client: Arc<dyn PlatformTypesRegistryApi> =
             registry_holding(&[topic_document(TOPIC_ID)], &[]);
-        let db = test_db().await;
+        let scratch = test_db().await;
+        let db = Arc::clone(scratch.db());
 
         super::bulk_load(&client, &db, &cfg).await.expect("first");
         let manager = super::TypesRegistrySpecificationManager::new(Arc::clone(&db));
@@ -880,7 +1098,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_topic_id_returns_not_found_for_an_unregistered_id() {
         let cfg = config(&json!({}));
-        let manager = manager_with(Vec::new(), Vec::new(), &cfg).await;
+        let (manager, _scratch) = manager_with(Vec::new(), Vec::new(), &cfg).await;
 
         let missing = GtsInstanceId::try_new(toolkit_gts::gts_id!(
             "cf.core.events.topic.v1~example.eb.missing.topic.v1"
@@ -919,6 +1137,22 @@ mod tests {
         registry_holding(&topics, &[])
     }
 
+    /// The Registry Reference `client` answers for the topic `id`.
+    async fn registry_reference(
+        client: &Arc<dyn PlatformTypesRegistryApi>,
+        id: &str,
+    ) -> uuid::Uuid {
+        use super::PlatformTypesRegistryApiExt;
+
+        client
+            .resolve_instance_uuid(
+                &super::PlatformSecurityContext::outbound_marker(),
+                &GtsInstanceId::try_new(id).unwrap(),
+            )
+            .await
+            .expect("the registry holds the topic")
+    }
+
     async fn cached_topic_payload(
         db: &Arc<DBProvider<toolkit_db::DbError>>,
         id: &str,
@@ -939,15 +1173,19 @@ mod tests {
             BASE_ROUTE: "main",
             TOPIC_ID: "audit",
         }));
-        let db = test_db().await;
-        super::bulk_load(&client_with(&[TOPIC_ID]), &db, &cfg)
+        let scratch = test_db().await;
+        let db = Arc::clone(scratch.db());
+        let client = client_with(&[TOPIC_ID]);
+        super::bulk_load(&client, &db, &cfg)
             .await
             .expect("bulk_load");
+        let reference = registry_reference(&client, TOPIC_ID).await;
 
         assert_eq!(
             cached_topic_payload(&db, TOPIC_ID).await,
             json!({
                 "id": TOPIC_ID,
+                "uuid": reference.to_string(),
                 "description": "events this test publishes",
                 "retention": "PT168H",
                 "settings": {
@@ -971,7 +1209,7 @@ mod tests {
             BASE_ROUTE: "main",
             MISTYPED_KEY: "audit",
         }));
-        super::bulk_load(&client_with(&[TOPIC_ID]), &test_db().await, &cfg)
+        super::bulk_load(&client_with(&[TOPIC_ID]), test_db().await.db(), &cfg)
             .await
             .expect("bulk_load");
 
@@ -1005,7 +1243,7 @@ mod tests {
             SPECIAL_TOPIC_TYPE: "audit",
             TOPIC_ID: "audit",
         }));
-        super::bulk_load(&client_with(&[TOPIC_ID]), &test_db().await, &cfg)
+        super::bulk_load(&client_with(&[TOPIC_ID]), test_db().await.db(), &cfg)
             .await
             .expect("bulk_load");
 
@@ -1027,7 +1265,7 @@ mod tests {
         registry
             .inject(Fault::on(Call::List).fail(CanonicalError::internal("registry down").create()));
         let client: Arc<dyn PlatformTypesRegistryApi> = Arc::new(registry);
-        super::bulk_load(&client, &test_db().await, &cfg)
+        super::bulk_load(&client, test_db().await.db(), &cfg)
             .await
             .expect("a failed listing is not a failed load");
 
@@ -1042,7 +1280,8 @@ mod tests {
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn a_topic_moved_to_another_entry_is_warned_about_once() {
-        let db = test_db().await;
+        let scratch = test_db().await;
+        let db = Arc::clone(scratch.db());
         let client = client_with(&[TOPIC_ID, OTHER_TOPIC_ID]);
         let before = routed_config(&json!({ BASE_ROUTE: "main", OTHER_TOPIC_ID: "audit" }));
         let after = routed_config(&json!({ BASE_ROUTE: "main", TOPIC_ID: "audit" }));
@@ -1099,10 +1338,12 @@ mod tests {
                 ))
             }
         });
+        let reference = registry_reference(&client, TOPIC_ID).await;
         assert_eq!(
             cached_topic_payload(&db, TOPIC_ID).await,
             json!({
                 "id": TOPIC_ID,
+                "uuid": reference.to_string(),
                 "description": "events this test publishes",
                 "retention": "PT168H",
                 "settings": {
@@ -1115,5 +1356,376 @@ mod tests {
                 },
             })
         );
+    }
+
+    // ── Event-type candidates ───────────────────────────────────────────────
+
+    const TOPIC_A: &str = toolkit_gts::gts_id!("cf.core.events.topic.v1~x.eb.cand.a.v1");
+    const TOPIC_B: &str = toolkit_gts::gts_id!("cf.core.events.topic.v1~x.eb.cand.b.v1");
+    const TOPIC_NO_TYPES: &str = toolkit_gts::gts_id!("cf.core.events.topic.v1~x.eb.cand.none.v1");
+    const TOPIC_AT_CAP: &str = toolkit_gts::gts_id!("cf.core.events.topic.v1~x.eb.cand.at_cap.v1");
+    const TOPIC_OVER_CAP: &str =
+        toolkit_gts::gts_id!("cf.core.events.topic.v1~x.eb.cand.over_cap.v1");
+    const TYPE_A1: &str = toolkit_gts::gts_id!("cf.core.events.event.v1~x.eb.cand.a1.v1~");
+    const TYPE_A2: &str = toolkit_gts::gts_id!("cf.core.events.event.v1~x.eb.cand.a2.v1~");
+    const TYPE_B1: &str = toolkit_gts::gts_id!("cf.core.events.event.v1~x.eb.cand.b1.v1~");
+    const SUBJECT_S1: &str = toolkit_gts::gts_id!("x.eb.cand.s1.v1~");
+    const SUBJECT_S2_ANY: &str = toolkit_gts::gts_id!("x.eb.cand.s2.v1~acme.*");
+
+    /// Loads `topics` and `event_types` (`(id, topic, allowed_subject_types)`)
+    /// into `db` through [`super::bulk_load`], the cache's only writer.
+    async fn load_candidates(
+        db: &Arc<DBProvider<toolkit_db::DbError>>,
+        topics: &[&str],
+        event_types: &[(String, &str, Vec<&str>)],
+    ) {
+        let mut spec: Vec<serde_json::Value> = topics
+            .iter()
+            .map(|id| json!({ "id": id, "partitions": 1 }))
+            .collect();
+        spec.extend(event_types.iter().map(|(id, topic, allowed)| {
+            json!({ "id": id, "topic": topic, "allowed_subject_types": allowed })
+        }));
+        let fixtures = StaticTypesRegistry::of(serde_json::Value::Array(spec));
+        let topic_documents: Vec<serde_json::Value> =
+            topics.iter().map(|id| topic_document(id)).collect();
+        let client: Arc<dyn PlatformTypesRegistryApi> =
+            registry_holding(&topic_documents, fixtures.event_type_schemas());
+        super::bulk_load(&client, db, &config(&json!({})))
+            .await
+            .expect("bulk_load");
+    }
+
+    async fn candidates_of(
+        manager: &super::TypesRegistrySpecificationManager,
+        topic: &str,
+    ) -> EventTypeCandidates {
+        manager
+            .get_event_type_candidates(&GtsInstanceId::try_new(topic).unwrap())
+            .await
+            .expect("the cache answers")
+    }
+
+    fn candidate(id: &str, allowed_subject_types: &[&str]) -> EventTypeCandidate {
+        EventTypeCandidate {
+            id: GtsTypeId::try_new(id).unwrap(),
+            allowed_subject_types: allowed_subject_types
+                .iter()
+                .map(|pattern| GtsIdPattern::try_new(pattern).unwrap())
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_spec_cache_returns_a_topics_event_type_ids_on_sqlite() {
+        let scratch = test_db().await;
+        let db = Arc::clone(scratch.db());
+        load_candidates(
+            &db,
+            &[TOPIC_A, TOPIC_B, TOPIC_NO_TYPES],
+            &[
+                (
+                    TYPE_A2.to_owned(),
+                    TOPIC_A,
+                    vec![SUBJECT_S1, SUBJECT_S2_ANY],
+                ),
+                (TYPE_B1.to_owned(), TOPIC_B, vec![SUBJECT_S2_ANY]),
+                (TYPE_A1.to_owned(), TOPIC_A, vec![SUBJECT_S1]),
+            ],
+        )
+        .await;
+        let manager = super::TypesRegistrySpecificationManager::new(db);
+
+        assert_eq!(
+            candidates_of(&manager, TOPIC_A).await,
+            EventTypeCandidates::Listed(vec![
+                candidate(TYPE_A1, &[SUBJECT_S1]),
+                candidate(TYPE_A2, &[SUBJECT_S1, SUBJECT_S2_ANY]),
+            ])
+        );
+        assert_eq!(
+            candidates_of(&manager, TOPIC_B).await,
+            EventTypeCandidates::Listed(vec![candidate(TYPE_B1, &[SUBJECT_S2_ANY])])
+        );
+        assert_eq!(
+            candidates_of(&manager, TOPIC_NO_TYPES).await,
+            EventTypeCandidates::Listed(Vec::new())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_topic_with_256_event_types_lists_them_and_one_with_257_is_over_the_cap() {
+        let type_id = |name: &str, n: usize| {
+            format!("gts.cf.core.events.event.v1~x.eb.cand.{name}_{n:03}.v1~")
+        };
+        let mut event_types: Vec<(String, &str, Vec<&str>)> = (0..256)
+            .map(|n| (type_id("at_cap", n), TOPIC_AT_CAP, vec![SUBJECT_S1]))
+            .collect();
+        event_types.extend((0..257).map(|n| (type_id("over_cap", n), TOPIC_OVER_CAP, vec![])));
+        let scratch = test_db().await;
+        let db = Arc::clone(scratch.db());
+        load_candidates(&db, &[TOPIC_AT_CAP, TOPIC_OVER_CAP], &event_types).await;
+        let manager = super::TypesRegistrySpecificationManager::new(db);
+
+        let EventTypeCandidates::Listed(listed) = candidates_of(&manager, TOPIC_AT_CAP).await
+        else {
+            panic!("256 event types are within the cap");
+        };
+        assert_eq!(listed.len(), 256);
+        let (Some(first), Some(last)) = (listed.first(), listed.last()) else {
+            panic!("the list holds 256 entries");
+        };
+        assert_eq!(first, &candidate(&type_id("at_cap", 0), &[SUBJECT_S1]));
+        assert_eq!(last, &candidate(&type_id("at_cap", 255), &[SUBJECT_S1]));
+        assert_eq!(
+            candidates_of(&manager, TOPIC_OVER_CAP).await,
+            EventTypeCandidates::OverCap
+        );
+    }
+
+    fn type_ids(ids: &[&str]) -> Vec<GtsTypeId> {
+        ids.iter()
+            .map(|id| GtsTypeId::try_new(id).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_spec_cache_returns_which_of_the_given_ids_are_registered_on_the_topic() {
+        const TYPE_X: &str = toolkit_gts::gts_id!("cf.core.events.event.v1~x.eb.cand.x.v1~");
+        let scratch = test_db().await;
+        let db = Arc::clone(scratch.db());
+        load_candidates(
+            &db,
+            &[TOPIC_A, TOPIC_B],
+            &[
+                (TYPE_A1.to_owned(), TOPIC_A, vec![SUBJECT_S1]),
+                (TYPE_A2.to_owned(), TOPIC_A, vec![SUBJECT_S1]),
+                (TYPE_B1.to_owned(), TOPIC_B, vec![SUBJECT_S1]),
+            ],
+        )
+        .await;
+        let manager = super::TypesRegistrySpecificationManager::new(db);
+
+        let registered = manager
+            .get_registered_event_types(
+                &GtsInstanceId::try_new(TOPIC_A).unwrap(),
+                &type_ids(&[TYPE_A1, TYPE_B1, TYPE_X]),
+            )
+            .await
+            .expect("the cache answers");
+
+        assert_eq!(registered, type_ids(&[TYPE_A1]));
+    }
+
+    /// The table is gone, so any statement fails: an empty ask that answers
+    /// sent none.
+    #[tokio::test]
+    async fn asking_for_no_ids_makes_no_query() {
+        let scratch = test_db().await;
+        let (db, dsn) = (Arc::clone(scratch.db()), scratch.dsn().to_owned());
+        load_candidates(
+            &db,
+            &[TOPIC_A],
+            &[(TYPE_A1.to_owned(), TOPIC_A, vec![SUBJECT_S1])],
+        )
+        .await;
+        crate::test_support::tables::drop_table(&dsn, "event_broker_spec_cache").await;
+        let manager = super::TypesRegistrySpecificationManager::new(db);
+
+        let registered = manager
+            .get_registered_event_types(&GtsInstanceId::try_new(TOPIC_A).unwrap(), &[])
+            .await
+            .expect("an empty ask reads nothing");
+
+        assert_eq!(registered, Vec::<GtsTypeId>::new());
+    }
+
+    #[tokio::test]
+    async fn a_topic_row_stores_no_topic_and_an_empty_subject_type_list() {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        use toolkit_db::secure::SecureEntityExt;
+
+        let scratch = test_db().await;
+        let db = Arc::clone(scratch.db());
+        load_candidates(&db, &[TOPIC_A], &[]).await;
+
+        let row = super::SpecCacheEntity::find()
+            .filter(super::SpecCacheColumn::GtsId.eq(TOPIC_A))
+            .secure()
+            .scope_with(&super::AccessScope::allow_all())
+            .one(&db.conn().expect("a connection"))
+            .await
+            .expect("the cache answers")
+            .expect("the topic is cached");
+        assert_eq!(
+            (
+                row.gts_id.as_str(),
+                row.kind.as_str(),
+                row.topic,
+                row.allowed_subject_types.as_str()
+            ),
+            (TOPIC_A, "topic", None, "[]")
+        );
+    }
+
+    #[tokio::test]
+    async fn reloading_an_event_type_rewrites_its_topic_and_subject_types() {
+        let scratch = test_db().await;
+        let db = Arc::clone(scratch.db());
+        load_candidates(
+            &db,
+            &[TOPIC_A, TOPIC_B],
+            &[(TYPE_A1.to_owned(), TOPIC_A, vec![SUBJECT_S1])],
+        )
+        .await;
+        load_candidates(
+            &db,
+            &[TOPIC_A, TOPIC_B],
+            &[(TYPE_A1.to_owned(), TOPIC_B, vec![SUBJECT_S2_ANY])],
+        )
+        .await;
+        let manager = super::TypesRegistrySpecificationManager::new(db);
+
+        assert_eq!(
+            candidates_of(&manager, TOPIC_A).await,
+            EventTypeCandidates::Listed(Vec::new())
+        );
+        assert_eq!(
+            candidates_of(&manager, TOPIC_B).await,
+            EventTypeCandidates::Listed(vec![candidate(TYPE_A1, &[SUBJECT_S2_ANY])])
+        );
+    }
+
+    /// Overwrites `column` of the row `gts_id` with `value`, as no writer of
+    /// the cache would.
+    async fn plant(
+        db: &Arc<DBProvider<toolkit_db::DbError>>,
+        gts_id: &str,
+        column: super::SpecCacheColumn,
+        value: &str,
+    ) {
+        use sea_orm::{ColumnTrait, EntityTrait};
+        use toolkit_db::secure::SecureUpdateExt;
+
+        super::SpecCacheEntity::update_many()
+            .secure()
+            .scope_with(&super::AccessScope::allow_all())
+            .filter(super::Condition::all().add(super::SpecCacheColumn::GtsId.eq(gts_id)))
+            .col_expr(column, super::Expr::value(value.to_owned()))
+            .exec(&db.conn().expect("a connection"))
+            .await
+            .expect("the row is overwritten");
+    }
+
+    #[tokio::test]
+    async fn a_stored_subject_type_list_that_does_not_decode_is_an_internal_error_without_it() {
+        const PLANTED: &str = r#"["gts.PLANTED.subject"]"#;
+        let raw = serde_json::from_str::<super::StoredSubjectTypes>(PLANTED)
+            .err()
+            .expect("the planted list does not decode")
+            .to_string();
+        assert!(raw.contains("PLANTED"), "{raw}");
+        let scratch = test_db().await;
+        let db = Arc::clone(scratch.db());
+        load_candidates(
+            &db,
+            &[TOPIC_A],
+            &[(TYPE_A1.to_owned(), TOPIC_A, vec![SUBJECT_S1])],
+        )
+        .await;
+        plant(
+            &db,
+            TYPE_A1,
+            super::SpecCacheColumn::AllowedSubjectTypes,
+            PLANTED,
+        )
+        .await;
+        let manager = super::TypesRegistrySpecificationManager::new(db);
+
+        let err = manager
+            .get_event_type_candidates(&GtsInstanceId::try_new(TOPIC_A).unwrap())
+            .await
+            .expect_err("a list that does not decode fails the read");
+        assert!(
+            matches!(
+                &err,
+                DomainError::Internal(message)
+                    if message == "a cached allowed_subject_types list does not decode"
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stored_event_type_id_that_does_not_parse_is_an_internal_error_without_it() {
+        const PLANTED: &str = "gts.PLANTED.event~";
+        let raw = GtsTypeId::try_new(PLANTED)
+            .expect_err("the planted id does not parse")
+            .to_string();
+        assert!(raw.contains("PLANTED"), "{raw}");
+        let scratch = test_db().await;
+        let db = Arc::clone(scratch.db());
+        load_candidates(
+            &db,
+            &[TOPIC_A],
+            &[(TYPE_A1.to_owned(), TOPIC_A, vec![SUBJECT_S1])],
+        )
+        .await;
+        plant(&db, TYPE_A1, super::SpecCacheColumn::GtsId, PLANTED).await;
+        let manager = super::TypesRegistrySpecificationManager::new(db);
+
+        let err = manager
+            .get_event_type_candidates(&GtsInstanceId::try_new(TOPIC_A).unwrap())
+            .await
+            .expect_err("an id that does not parse fails the read");
+        assert!(
+            matches!(
+                &err,
+                DomainError::Internal(message)
+                    if message == "a cached event type id does not parse"
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A topic row stored without the topic's Registry Reference, as rows were
+    /// before a topic carried one, reads as no topic: a guessed reference
+    /// would address the wrong binding record.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_topic_row_written_without_its_registry_reference_reads_as_absent() {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        use toolkit_db::secure::SecureEntityExt;
+
+        let cfg = config(&json!({ BASE_ROUTE: { "partitions": 4 } }));
+        let (manager, scratch) =
+            manager_with(vec![topic_document(TOPIC_ID)], Vec::new(), &cfg).await;
+        let conn = scratch.db().conn().expect("a connection");
+        let row = super::SpecCacheEntity::find()
+            .filter(super::SpecCacheColumn::GtsId.eq(TOPIC_ID))
+            .secure()
+            .scope_with(&super::AccessScope::allow_all())
+            .one(&conn)
+            .await
+            .expect("the cache answers")
+            .expect("the topic is cached");
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&row.payload).expect("the payload is JSON");
+        payload
+            .as_object_mut()
+            .expect("the payload is an object")
+            .remove("uuid");
+        super::upsert_spec_row(&conn, TOPIC_ID, &payload, super::SpecColumns::Topic)
+            .await
+            .expect("the row is rewritten");
+
+        let topic = manager
+            .get_topic(&GtsInstanceId::try_new(TOPIC_ID).unwrap())
+            .await
+            .expect("the cache reads");
+        assert!(topic.is_none(), "the row must read as absent: {topic:?}");
+        let topics = manager.list_topics().await.expect("the cache reads");
+        assert!(topics.is_empty(), "the row must not be listed: {topics:?}");
+        assert!(logs_contain("failed to deserialize cached spec row"));
     }
 }

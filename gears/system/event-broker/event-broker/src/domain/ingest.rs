@@ -1,17 +1,20 @@
-//! `IngestService` (`DESIGN.md:623-639`): producer-facing, owns the write
+//! `IngestService` (`DESIGN.md` "`IngestService`"): producer-facing, owns the write
 //! path.
 
 use crate::domain::model::Sequence;
 use async_trait::async_trait;
-use authz_resolver_sdk::{AccessRequest, PolicyEnforcer};
+use authz_resolver_sdk::{AccessRequest, BarrierMode, EnforcerError, PolicyEnforcer, TenantMode};
 use gts::{GtsId, GtsTypeId};
 use toolkit::domain_model;
 use toolkit_gts::GtsInstanceId;
-use toolkit_security::SecurityContext;
+use toolkit_security::{SecurityContext, pep_properties};
 use uuid::Uuid;
 
 use crate::domain::audit;
-use crate::domain::authz::{event_type_resource, tenant_authorized};
+use crate::domain::authz::{
+    MetadataAccess, TENANT_SCOPE_RESOURCE, event_type_resource, tenant_authorized,
+    with_forbidden_code,
+};
 use crate::domain::backend::BackendResolver;
 use crate::domain::error::{DomainError, ErrorCode};
 use crate::domain::idempotency::{ChainRun, ProducerIdempotencyOutcome};
@@ -19,7 +22,8 @@ use crate::domain::producer_reset::ProducerResetScope;
 use event_broker_sdk::EventV1;
 use event_broker_sdk::models::EventType;
 
-use crate::domain::model::{Event, Meta};
+use crate::domain::model::{Event, IngestStamp, Meta};
+use crate::domain::streaming::scope::EVENT_SUBJECT_TYPE;
 
 /// One event as a producer submits it: what the publish schema admits, and
 /// nothing the broker derives.
@@ -36,14 +40,105 @@ use crate::domain::model::{Event, Meta};
 pub struct PublishRequest {
     pub id: Uuid,
     pub r#type: GtsTypeId,
-    pub tenant_id: Uuid,
+    pub subject_tenant: Uuid,
     pub source: String,
     pub subject: String,
     pub subject_type: GtsTypeId,
+    /// The principal that owns the event; `None` for a tenant-wide event.
+    pub subject_owner: Option<Uuid>,
     pub occurred_at: chrono::DateTime<chrono::Utc>,
     pub trace_parent: Option<String>,
     pub data: serde_json::Value,
-    pub meta: Option<Meta>,
+    pub meta: Option<PublishMeta>,
+}
+
+/// The `meta` block of a [`PublishRequest`] as the producer sent it. A field the
+/// producer left out stays `None`: ADR-0004 decides a publish's mode shape from
+/// which fields are present, so none is defaulted.
+#[domain_model]
+#[derive(Debug, Clone, Copy)]
+pub struct PublishMeta {
+    pub version: i32,
+    pub producer: Option<Uuid>,
+    pub previous: Option<i64>,
+    pub sequence: Option<i64>,
+}
+
+impl PublishMeta {
+    /// The newest `meta.version` the broker reads (ADR-0003, "Optional Versioned
+    /// `meta` Block"); a newer one is refused with `UnknownMetaVersion`.
+    pub const SUPPORTED_VERSION: i32 = 1;
+
+    /// The producer the block names. A literal nil id names none, as an absent
+    /// one does.
+    #[must_use]
+    pub fn producer(&self) -> Option<Uuid> {
+        self.producer.filter(|id| !id.is_nil())
+    }
+
+    /// Refuses a block that names no producer but carries a chain field
+    /// (ADR-0004, "Mode-Shape Enforcement at Publish Time"). A block with neither
+    /// is a stateless publish's once [`Self::check_version`] passes it, and the
+    /// caller then treats it as absent.
+    fn check_without_producer(&self) -> Result<(), DomainError> {
+        if self.previous.is_some() || self.sequence.is_some() {
+            return Err(DomainError::Validation {
+                code: ErrorCode::MetaWithoutProducerId,
+                message: "meta carries previous or sequence but no producer".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Refuses a block newer than [`Self::SUPPORTED_VERSION`] (ADR-0003,
+    /// "Optional Versioned `meta` Block"), whether or not it names a producer.
+    fn check_version(&self) -> Result<(), DomainError> {
+        if self.version > Self::SUPPORTED_VERSION {
+            return Err(DomainError::Validation {
+                code: ErrorCode::UnknownMetaVersion,
+                message: format!(
+                    "meta.version is newer than the broker supports ({})",
+                    Self::SUPPORTED_VERSION
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// The stored `meta` of a publish whose block names `producer_id`, registered
+    /// in `mode`. Checks the mode shape (ADR-0004, "Mode-Shape Enforcement at
+    /// Publish Time"), then the version (ADR-0003), so a stored `Meta` always has
+    /// a producer and a sequence.
+    fn into_stored(self, producer_id: Uuid, mode: ProducerMode) -> Result<Meta, DomainError> {
+        // The caller resolved `producer_id` from this block, so the two agree.
+        debug_assert_eq!(self.producer(), Some(producer_id));
+        let sequence = match (mode, self.previous, self.sequence) {
+            (ProducerMode::Chained, Some(_), Some(sequence))
+            | (ProducerMode::Monotonic, None, Some(sequence)) => sequence,
+            (ProducerMode::Chained, ..) => {
+                return Err(DomainError::Validation {
+                    code: ErrorCode::ChainModeFieldsMissing,
+                    message: "a chained-mode publish needs meta.previous and meta.sequence"
+                        .to_owned(),
+                });
+            }
+            (ProducerMode::Monotonic, ..) => {
+                return Err(DomainError::Validation {
+                    code: ErrorCode::MonotonicModeFieldsViolation,
+                    message: "a monotonic-mode publish needs meta.sequence and must omit \
+                              meta.previous"
+                        .to_owned(),
+                });
+            }
+        };
+        self.check_version()?;
+        Ok(Meta {
+            version: self.version,
+            producer_id,
+            previous: self.previous,
+            sequence,
+        })
+    }
 }
 
 impl PublishRequest {
@@ -62,12 +157,11 @@ impl PublishRequest {
 
     /// The request's size as the per-event limit counts it: the bytes the SDK's
     /// `EventV1::encoded_len` counts for the same event, or fewer, never more.
-    /// Parsing makes a `null` `data` of an absent one, a nil `meta.producer_id` of an
-    /// absent one and a `meta.sequence` of 0 of an absent one, so the request cannot
-    /// tell those apart. Each counts as the shorter of its two forms: `data` left out
-    /// (12 bytes fewer than the SDK's `"data":null` for a set `null`), the producer id
-    /// as `null` (34 fewer for a literal nil id) and the sequence as `0` (3 fewer for
-    /// an absent one).
+    /// Parsing makes a `null` `data` of an absent one, so the request cannot tell
+    /// those apart, and [`PublishMeta::producer`] reads a literal nil `meta.producer`
+    /// as an absent one. Each counts as the shorter of its two forms: `data` left out
+    /// (12 bytes fewer than the SDK's `"data":null` for a set `null`) and the producer
+    /// id as `null` (34 fewer for a literal nil id).
     ///
     /// # Errors
     ///
@@ -77,16 +171,17 @@ impl PublishRequest {
         let encoded = EncodedEvent {
             id: self.id,
             r#type: &self.r#type,
-            tenant_id: self.tenant_id,
+            subject_tenant: self.subject_tenant,
             source: &self.source,
             subject: &self.subject,
             subject_type: &self.subject_type,
+            subject_owner: self.subject_owner,
             occurred_at: self.occurred_at,
             trace_parent: self.trace_parent.as_deref(),
             data: (!self.data.is_null()).then_some(&self.data),
             meta: self.meta.as_ref().map(|meta| EncodedMeta {
                 version: meta.version,
-                producer_id: (!meta.producer_id.is_nil()).then_some(meta.producer_id),
+                producer: meta.producer(),
                 previous: meta.previous,
                 sequence: meta.sequence,
             }),
@@ -120,6 +215,42 @@ impl PublishRequest {
         }
         Ok(())
     }
+
+    /// Refuses a request whose event tenant is the nil UUID, naming it as event
+    /// `index` of its request. Each publish path runs it before
+    /// `prepare_publish`, so such a request reaches no PDP call.
+    ///
+    /// # Errors
+    ///
+    /// [`DomainError::Validation`] with [`ErrorCode::InvalidTenant`] when the
+    /// tenant is nil.
+    pub(crate) fn check_tenant(&self, index: usize) -> Result<(), DomainError> {
+        if self.subject_tenant.is_nil() {
+            return Err(DomainError::Validation {
+                code: ErrorCode::InvalidTenant,
+                message: format!("event {index}: the event's tenant must not be the nil UUID"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Refuses a request whose owner is the nil UUID, naming it as event `index`
+    /// of its request: an event with no owner leaves the member out or `null`.
+    /// Each publish path runs it beside [`check_tenant`](Self::check_tenant).
+    ///
+    /// # Errors
+    ///
+    /// [`DomainError::Validation`] with [`ErrorCode::InvalidSubjectOwner`] when
+    /// the owner is nil.
+    pub(crate) fn check_subject_owner(&self, index: usize) -> Result<(), DomainError> {
+        if self.subject_owner.is_some_and(|owner| owner.is_nil()) {
+            return Err(DomainError::Validation {
+                code: ErrorCode::InvalidSubjectOwner,
+                message: format!("event {index}: the event's owner must not be the nil UUID"),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// A [`PublishRequest`] in the shape the SDK's `EventV1` serializes to, borrowed, for
@@ -130,10 +261,11 @@ impl PublishRequest {
 struct EncodedEvent<'a> {
     id: Uuid,
     r#type: &'a GtsTypeId,
-    tenant_id: Uuid,
+    subject_tenant: Uuid,
     source: &'a str,
     subject: &'a str,
     subject_type: &'a GtsTypeId,
+    subject_owner: Option<Uuid>,
     occurred_at: chrono::DateTime<chrono::Utc>,
     trace_parent: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -145,9 +277,9 @@ struct EncodedEvent<'a> {
 #[derive(serde::Serialize)]
 struct EncodedMeta {
     version: i32,
-    producer_id: Option<Uuid>,
+    producer: Option<Uuid>,
     previous: Option<i64>,
-    sequence: i64,
+    sequence: Option<i64>,
 }
 
 /// Outcome of admitting a batch, all-or-nothing (feature 0001 §5.2): some
@@ -173,12 +305,12 @@ pub enum PublishAck {
     Duplicate(Event),
 }
 
-/// Outcome of a synchronous publish (`Prefer: wait=N`, DESIGN.md:1335): the
-/// backend stored every admitted event within N (`201 Created`), N elapsed
-/// first with the events still enqueued to be stored later (`202 Accepted`),
-/// or every event was a duplicate so nothing was enqueued and there was
-/// nothing to wait for (`200 OK`). An append failure is retried, never
-/// answered, so it surfaces as `TimedOut`, not an error.
+/// Outcome of a synchronous publish (`Prefer: wait=N`, `DESIGN.md` "Sync vs
+/// Async Persist Modes"): the backend stored every admitted event within N
+/// (`201 Created`), N elapsed first with the events still enqueued to be stored
+/// later (`202 Accepted`), or every event was a duplicate so nothing was
+/// enqueued and there was nothing to wait for (`200 OK`). An append failure is
+/// retried, never answered, so it surfaces as `TimedOut`, not an error.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncPublishAck {
@@ -270,14 +402,17 @@ pub struct ProducerRegistration {
     pub client_agent: String,
 }
 
-/// A registered producer's identity and dedup mode, as
-/// [`ProducerRegistry::find`] returns it. Folds existence, ownership, and mode
-/// into one lookup so the publish path resolves all three from a single query
-/// instead of one call for existence and another for mode.
+/// A registered producer's identity, tenant and dedup mode, as
+/// [`ProducerRegistry::find`] returns it. Folds existence, ownership, tenant
+/// and mode into one lookup so the publish path resolves them from a single
+/// query, and the cursor and reset paths ask the tenant check about the
+/// producer's own tenant without a second read.
 #[domain_model]
 #[derive(Debug, Clone, Copy)]
 pub struct ProducerRecord {
     pub owner: Uuid,
+    /// The tenant the producer was registered in: the registering caller's.
+    pub tenant: Uuid,
     pub mode: ProducerMode,
 }
 
@@ -302,10 +437,49 @@ pub struct ProducerCursors {
     pub topics: Vec<ProducerTopicCursors>,
 }
 
+/// Which items of a metadata list the caller asked for. A list applies it
+/// before it authorizes each item, so an item the caller did not ask for
+/// costs no PDP call: REST passes its `$filter`, in-process callers pass
+/// [`Selection::all`].
+pub struct Selection<'a, T> {
+    keep: Option<Keep<'a, T>>,
+}
+
+/// The predicate a [`Selection`] keeps an item by.
+type Keep<'a, T> = &'a (dyn Fn(&T) -> bool + Send + Sync);
+
+impl<'a, T> Selection<'a, T> {
+    /// Every item.
+    #[must_use]
+    pub fn all() -> Self {
+        Self { keep: None }
+    }
+
+    /// The items `keep` returns `true` for.
+    #[must_use]
+    pub fn only(keep: Keep<'a, T>) -> Self {
+        Self { keep: Some(keep) }
+    }
+
+    /// Whether `item` is selected.
+    #[must_use]
+    pub fn selects(&self, item: &T) -> bool {
+        self.keep.is_none_or(|keep| keep(item))
+    }
+}
+
+impl<T> std::fmt::Debug for Selection<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Selection")
+            .field("all", &self.keep.is_none())
+            .finish()
+    }
+}
+
 #[async_trait]
 pub trait IngestService: Send + Sync {
     /// Validate, sequence, and enqueue one event for persistence
-    /// (`DESIGN.md:638`).
+    /// (`DESIGN.md` "`IngestService`").
     async fn publish_event(
         &self,
         ctx: &SecurityContext,
@@ -323,10 +497,10 @@ pub trait IngestService: Send + Sync {
     ) -> Result<BatchAck, DomainError>;
 
     /// [`publish_event`](Self::publish_event), held until the backend stores
-    /// the event or `wait` elapses (`Prefer: wait=N`, DESIGN.md:1335). `wait`
-    /// is the requested hold, clamped to the broker's configured ceiling; pass
-    /// `Duration::MAX` to hold for as long as the broker allows. A duplicate is
-    /// answered at once, never waited on.
+    /// the event or `wait` elapses (`Prefer: wait=N`, `DESIGN.md` "Sync vs
+    /// Async Persist Modes"). `wait` is the requested hold, clamped to the
+    /// broker's configured ceiling; pass `Duration::MAX` to hold for as long as
+    /// the broker allows. A duplicate is answered at once, never waited on.
     async fn publish_event_sync(
         &self,
         ctx: &SecurityContext,
@@ -354,7 +528,9 @@ pub trait IngestService: Send + Sync {
     fn max_sync_wait(&self) -> std::time::Duration;
 
     /// Mint a fresh `producer_id` bound to `ctx`'s calling principal
-    /// (`docs/openapi.yaml`'s `POST /v1/producers`).
+    /// (`docs/openapi.yaml`'s `POST /v1/producers`). The `client_agent` is
+    /// checked first, then the tenant check (`produce` at the caller's own
+    /// tenant), then the producer is stored.
     async fn register_producer(
         &self,
         ctx: &SecurityContext,
@@ -363,7 +539,9 @@ pub trait IngestService: Send + Sync {
 
     /// Read a producer's per-topic `last_sequence` cursors.
     /// Principal-bound - only the registering principal may call this
-    /// (`docs/openapi.yaml`'s `GET /v1/producers/{id}/cursors`).
+    /// (`docs/openapi.yaml`'s `GET /v1/producers/{id}/cursors`). The tenant
+    /// check (`produce` at the producer's own tenant) runs before the owner
+    /// check.
     async fn get_producer_cursors(
         &self,
         ctx: &SecurityContext,
@@ -372,7 +550,8 @@ pub trait IngestService: Send + Sync {
 
     /// Operator-driven chain reset. Principal-bound - only the registering
     /// principal may call this (`docs/openapi.yaml`'s
-    /// `POST /v1/producers/{id}:reset`).
+    /// `POST /v1/producers/{id}:reset`). The tenant check (`produce` at the
+    /// producer's own tenant) runs before the owner check.
     async fn reset_producer(
         &self,
         ctx: &SecurityContext,
@@ -380,18 +559,17 @@ pub trait IngestService: Send + Sync {
         scope: ProducerResetScope,
     ) -> Result<(), DomainError>;
 
-    /// `GET /v1/topics` - shared/read-side, forwarded to ingest per the
-    /// dispatcher's classification (`eb-dispatcher-routing`, design.md D2).
-    /// Takes `ctx` (the security-context-first convention) and returns
-    /// `Result` so a future authorization denial is expressible; a topic is a
-    /// global, non-tenant-scoped resource, so there is no per-tenant filtering
-    /// to apply here as there is for consumer groups and subscriptions.
+    /// `GET /v1/topics`: the registered topics `select` keeps that the caller
+    /// may read ([`MetadataAccess::may_read_topic`]).
     async fn list_topics(
         &self,
         ctx: &SecurityContext,
+        select: &Selection<'_, crate::domain::model::Topic>,
     ) -> Result<Vec<crate::domain::model::Topic>, DomainError>;
 
-    /// `GET /v1/topics/segments`.
+    /// `GET /v1/topics/segments`, for a topic the caller may read
+    /// ([`MetadataAccess::may_read_topic`]); a refused caller gets
+    /// `TopicNotAuthorized` whether or not the topic is registered.
     async fn list_topic_segments(
         &self,
         ctx: &SecurityContext,
@@ -399,9 +577,23 @@ pub trait IngestService: Send + Sync {
         partition: i32,
     ) -> Result<crate::domain::model::TopicSegmentManifest, DomainError>;
 
-    /// `GET /v1/event-types` - same classification and `ctx`/`Result`
-    /// rationale as `list_topics`.
-    async fn list_event_types(&self, ctx: &SecurityContext) -> Result<Vec<EventType>, DomainError>;
+    /// `GET /v1/event-types`: the registered event types `select` keeps that
+    /// the caller may read: it may consume the type's topic, or else publish
+    /// the type.
+    async fn list_event_types(
+        &self,
+        ctx: &SecurityContext,
+        select: &Selection<'_, EventType>,
+    ) -> Result<Vec<EventType>, DomainError>;
+
+    /// One registered event type the caller may read, as
+    /// [`list_event_types`](Self::list_event_types) decides it; `None` when
+    /// `id` is not registered or the caller may not read it.
+    async fn get_event_type(
+        &self,
+        ctx: &SecurityContext,
+        id: &GtsTypeId,
+    ) -> Result<Option<EventType>, DomainError>;
 }
 
 /// Producer identity/ownership bookkeeping - separate from the
@@ -497,6 +689,98 @@ impl<R> IngestServiceImpl<R> {
         wait.min(self.sync_wait_max)
     }
 
+    /// The metadata-read checks, asked as `ctx`.
+    fn metadata_access(&self, ctx: &SecurityContext) -> MetadataAccess {
+        MetadataAccess::new(ctx, &self.policy_enforcer, &self.spec_manager)
+    }
+
+    /// Authorizes one publish (#5492). A non-event type is refused first, so it
+    /// gets `404` before any PDP call. Then, in order:
+    ///
+    /// - the tenant check: `produce` on the tenant-scope resource, rooted at
+    ///   the event's tenant with barriers respected;
+    /// - only when the tenant check is denied, the barrier right:
+    ///   `produce_ignore_barrier` on the event type, rooted at the event's
+    ///   tenant with barriers ignored;
+    /// - the type check: `produce` on the event type, rooted at the caller's
+    ///   own tenant, with the event's tenant, subject type and owner (when it has
+    ///   one) as resource properties.
+    ///
+    /// A tenant check that fails to evaluate is an outage, not a denial, so it
+    /// is returned as is and never retried as the barrier right.
+    ///
+    /// # Errors
+    ///
+    /// `DomainError::NotFound` (`EventTypeNotFound`) for a non-event type;
+    /// `DomainError::Forbidden` with `TenantIdNotAuthorized` when the tenant
+    /// check and the barrier right are both denied, or with
+    /// `NotAuthorizedToProduce` when the type check is denied;
+    /// `DomainError::Internal` when an evaluation fails.
+    async fn authorize_publish(
+        &self,
+        ctx: &SecurityContext,
+        request: &PublishRequest,
+    ) -> Result<(), DomainError> {
+        let event_type_resource = event_type_resource(&request.r#type)?;
+        let caller_tenant = ctx.subject_tenant_id();
+        let event_tenant = request.subject_tenant;
+
+        match self
+            .policy_enforcer
+            .access_scope_with(
+                ctx,
+                &TENANT_SCOPE_RESOURCE,
+                "produce",
+                None,
+                &Self::reach(event_tenant, BarrierMode::Respect),
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(EnforcerError::AccessDenied(_)) => {
+                self.policy_enforcer
+                    .access_scope_with(
+                        ctx,
+                        &event_type_resource,
+                        "produce_ignore_barrier",
+                        None,
+                        &Self::reach(event_tenant, BarrierMode::Ignore)
+                            .resource_property("event_type_id", request.r#type.as_ref()),
+                    )
+                    .await
+                    .map_err(|e| with_forbidden_code(e.into(), ErrorCode::TenantIdNotAuthorized))?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        let mut type_check = AccessRequest::new()
+            .context_tenant_id(caller_tenant)
+            .tenant_mode(TenantMode::RootOnly)
+            .resource_property("event_type_id", request.r#type.as_ref())
+            .resource_property(pep_properties::OWNER_TENANT_ID, event_tenant)
+            .resource_property(EVENT_SUBJECT_TYPE, request.subject_type.as_ref())
+            .require_constraints(false);
+        if let Some(owner) = request.subject_owner {
+            type_check = type_check.resource_property(pep_properties::OWNER_ID, owner);
+        }
+        self.policy_enforcer
+            .access_scope_with(ctx, &event_type_resource, "produce", None, &type_check)
+            .await
+            .map_err(|e| with_forbidden_code(e.into(), ErrorCode::NotAuthorizedToProduce))?;
+        Ok(())
+    }
+
+    /// The tenant context and owner a publish's reach requests share: rooted
+    /// at the event's tenant alone, with the given barrier mode.
+    fn reach(event_tenant: Uuid, barrier_mode: BarrierMode) -> AccessRequest {
+        AccessRequest::new()
+            .context_tenant_id(event_tenant)
+            .tenant_mode(TenantMode::RootOnly)
+            .barrier_mode(barrier_mode)
+            .resource_property(pep_properties::OWNER_TENANT_ID, event_tenant)
+            .require_constraints(false)
+    }
+
     // Each argument is a distinct, fully-required dependency and this is the
     // single construction site (via `build_handler_state`), so a deps-struct
     // would add indirection without preventing any real mistake.
@@ -540,43 +824,22 @@ where
     R: ProducerRegistry + Send + Sync + 'static,
 {
     /// Everything a publish checks before its chain is: authorization, the
-    /// event and subject types, the topic and its provisioning, the producer,
-    /// the payload schema; then the stamped event and its ingest partition.
+    /// event and subject types, the topic and its provisioning, the producer
+    /// and its `meta` shape, the payload schema; then the stamped event and its
+    /// ingest partition.
     /// Writes nothing, so a batch prepares every event before enqueueing any.
     /// `index` is the request's position in its batch (`0` for a single publish),
     /// which a refused partition key names.
     async fn prepare_publish(
         &self,
         ctx: &SecurityContext,
-        request: PublishRequest,
+        mut request: PublishRequest,
         index: usize,
         stamp: OutboxStamp,
     ) -> Result<PreparedPublish, DomainError> {
-        // Reject non-event types, then authorize before topic/schema validation
-        // (`docs/DESIGN.md`, Validation Pipeline step 1 and §3.3).
-        let event_type_resource = event_type_resource(&request.r#type)?;
-        self.policy_enforcer
-            .access_scope_with(
-                ctx,
-                &event_type_resource,
-                "produce",
-                None,
-                &AccessRequest::new()
-                    .resource_property("event_type_id", request.r#type.as_ref())
-                    .resource_property(
-                        toolkit_security::pep_properties::OWNER_TENANT_ID,
-                        request.tenant_id,
-                    )
-                    .require_constraints(false),
-            )
-            .await
-            .map_err(|e| {
-                crate::domain::authz::with_forbidden_code(
-                    e.into(),
-                    ErrorCode::NotAuthorizedToProduce,
-                )
-            })?;
-        tenant_authorized(ctx, &self.policy_enforcer, "produce", request.tenant_id).await?;
+        // Authorize before topic/schema validation (`docs/DESIGN.md`,
+        // Validation Pipeline step 1 and §3.3).
+        self.authorize_publish(ctx, &request).await?;
 
         // NOTE(perf): most first-level fields are deterministic per type (a few
         // are type-overridden), so they could be checked without full schema
@@ -608,7 +871,7 @@ where
         // A topic its backend does not hold yet cannot take events: answered
         // `503`, retryable, until provisioning completes (feature 0006 §4.2).
         if !matches!(
-            self.spec_manager.topic_state(&topic.id).await?,
+            self.spec_manager.topic_state(&topic).await?,
             Some(crate::domain::specification::TopicState::Provisioned { .. })
         ) {
             return Err(DomainError::StorageUnavailable {
@@ -620,42 +883,37 @@ where
             });
         }
 
-        // A chained/monotonic publish names a registered producer. Resolving it
-        // before the chain check reports an unknown `producer_id` - never
-        // registered, or since deleted - as a `404 ProducerNotFound` naming the
-        // producer. The producer's own outbox recovers this into a
-        // re-registration, so it is the producer resource that is named (not
-        // the targeted topic). The same lookup yields the registered `mode`,
-        // which the chain check needs to apply the right rule. A stateless
-        // publish carries a nil `producer_id` and is not subject to this.
-        let producer_mode =
-            if let Some(meta) = &request.meta
-                && !meta.producer_id.is_nil()
-            {
-                let record = self.repo.find(meta.producer_id).await?.ok_or_else(|| {
-                    DomainError::NotFound {
-                        code: ErrorCode::ProducerNotFound,
-                        message: "the producer is not registered or its registration has expired"
-                            .to_owned(),
-                        resource: meta.producer_id.to_string(),
-                    }
-                })?;
-
-                // `meta.previous` is a chained-mode field. A monotonic producer
-                // sending it is a mode-shape violation, rejected here - before the
-                // sequence comparison in `check_and_enqueue` - so the otherwise
-                // acceptable sequence is not applied either.
-                if record.mode == ProducerMode::Monotonic && meta.previous.is_some() {
-                    return Err(DomainError::TextField {
-                        field: "meta.previous",
-                        detail: "must be absent for a monotonic-mode producer".to_owned(),
-                        reason: "field_not_allowed",
-                    });
+        // The `meta` block, in the order ADR-0004 gives ("Mode-Shape Enforcement
+        // at Publish Time"). A block naming no producer is refused when it carries
+        // a chain field, then when its version is newer than supported; otherwise
+        // it is a stateless publish's, stored as if it were absent. A block naming
+        // one is resolved first: an unknown producer - never registered, or since
+        // deleted - is a `404 ProducerNotFound` naming the producer, which the
+        // producer's own outbox recovers into a re-registration. The registered
+        // mode then decides the shape and which rule the chain check below
+        // applies, and the version is checked last.
+        let chain = match request.meta.take() {
+            None => None,
+            Some(meta) => match meta.producer() {
+                None => {
+                    meta.check_without_producer()?;
+                    meta.check_version()?;
+                    None
                 }
-                Some(record.mode)
-            } else {
-                None
-            };
+                Some(producer_id) => {
+                    let record = self.repo.find(producer_id).await?.ok_or_else(|| {
+                        DomainError::NotFound {
+                            code: ErrorCode::ProducerNotFound,
+                            message:
+                                "the producer is not registered or its registration has expired"
+                                    .to_owned(),
+                            resource: producer_id.to_string(),
+                        }
+                    })?;
+                    Some((meta.into_stored(producer_id, record.mode)?, record.mode))
+                }
+            },
+        };
 
         self.spec_manager
             .validate_event_data(&event_type, &request.data)
@@ -688,14 +946,16 @@ where
             id: request.id,
             r#type: request.r#type,
             topic: topic.id.clone(),
-            tenant_id: request.tenant_id,
+            subject_tenant: request.subject_tenant,
             source: request.source,
             subject: request.subject,
             subject_type: request.subject_type,
+            subject_owner: request.subject_owner,
             occurred_at: request.occurred_at,
             trace_parent: request.trace_parent,
             data: request.data,
-            meta: request.meta,
+            meta: chain.as_ref().map(|(meta, _)| meta.clone()),
+            ingest: IngestStamp::of_caller(ctx),
             partition: None,
             sequence: None,
             sequence_time: None,
@@ -721,15 +981,16 @@ where
         if let Some(trace) = stamp.trace() {
             request = request.trace(trace);
         }
-        if let Some(meta) = event.meta.clone() {
+        if let Some((meta, mode)) = chain {
             request = request.chain(crate::domain::idempotency::ProducerChainCheck {
                 producer_id: meta.producer_id,
                 topic: topic.id.clone(),
+                // A chained producer's `meta` always carries `previous`
+                // (`PublishMeta::into_stored`); a monotonic one's never does,
+                // and its check ignores this field.
                 previous: meta.previous.unwrap_or(0),
                 sequence: meta.sequence,
-                // `producer_mode` is set for every non-nil producer resolved
-                // above; a nil producer_id is checked as chained.
-                mode: producer_mode.unwrap_or(ProducerMode::Chained),
+                mode,
             });
         }
 
@@ -740,11 +1001,11 @@ where
     }
 
     /// Everything a batch publish checks and prepares before any row is
-    /// written (feature 0001 §5.2): the size and payload bounds, the
-    /// repeated-id and single-topic rules, each event's own preparation
-    /// (stamped with `trace`), and each run's shape (R3). Writes nothing, so
-    /// the caller runs the one enqueue transaction. Shared by the async and
-    /// synchronous batch paths.
+    /// written (feature 0001 §5.2): the size and payload bounds, each
+    /// event's tenant, the repeated-id and single-topic rules, each event's
+    /// own preparation (stamped with `trace`), and each run's shape (R3).
+    /// Writes nothing, so the caller runs the one enqueue transaction. Shared
+    /// by the async and synchronous batch paths.
     async fn prepare_batch(
         &self,
         ctx: &SecurityContext,
@@ -786,6 +1047,8 @@ where
         }
         for (index, request) in requests.iter().enumerate() {
             request.check_size(index)?;
+            request.check_tenant(index)?;
+            request.check_subject_owner(index)?;
         }
 
         // A batch is atomic per topic, and a request names only its event
@@ -841,6 +1104,8 @@ where
     ) -> Result<PublishAck, DomainError> {
         // A single publish is a run of one, so a refusal names index 0.
         request.check_size(0)?;
+        request.check_tenant(0)?;
+        request.check_subject_owner(0)?;
         let PreparedPublish { event, enqueue } = self
             .prepare_publish(ctx, request, 0, OutboxStamp::Async)
             .await?;
@@ -913,6 +1178,8 @@ where
         let trace = SyncTrace::new();
         // A single publish is a run of one, so a refusal names index 0.
         request.check_size(0)?;
+        request.check_tenant(0)?;
+        request.check_subject_owner(0)?;
         let PreparedPublish { event, enqueue } = self
             .prepare_publish(ctx, request, 0, OutboxStamp::Sync(trace))
             .await?;
@@ -1000,6 +1267,17 @@ where
         // persists, into a column documented as printable ASCII within 256
         // bytes.
         event_broker_sdk::validate::client_agent(&input.client_agent)?;
+        // No caller-identity guard yet: the nil-tenant producers of bss-pricing
+        // and bss-products register at start (#5955, #5956), and a guard would
+        // refuse them even under a PDP that allows them. The shipped PDPs
+        // refuse a nil tenant here on their own.
+        tenant_authorized(
+            ctx,
+            &self.policy_enforcer,
+            "produce",
+            ctx.subject_tenant_id(),
+        )
+        .await?;
         self.repo
             .register(
                 ctx.subject_id(),
@@ -1024,6 +1302,7 @@ where
                 message: format!("producer '{producer_id}' is not registered"),
                 resource: producer_id.to_string(),
             })?;
+        tenant_authorized(ctx, &self.policy_enforcer, "produce", record.tenant).await?;
         if record.owner != ctx.subject_id() {
             return Err(DomainError::Forbidden {
                 code: ErrorCode::ProducerNotOwned,
@@ -1056,6 +1335,7 @@ where
                 message: format!("producer '{producer_id}' is not registered"),
                 resource: producer_id.to_string(),
             })?;
+        tenant_authorized(ctx, &self.policy_enforcer, "produce", record.tenant).await?;
         if record.owner != ctx.subject_id() {
             return Err(DomainError::Forbidden {
                 code: ErrorCode::ProducerNotOwned,
@@ -1070,23 +1350,40 @@ where
 
     async fn list_topics(
         &self,
-        _ctx: &SecurityContext,
+        ctx: &SecurityContext,
+        select: &Selection<'_, crate::domain::model::Topic>,
     ) -> Result<Vec<crate::domain::model::Topic>, DomainError> {
-        // Topics are global, non-tenant-scoped resources, so there is no
-        // per-tenant read filtering to apply (unlike consumer groups /
-        // subscriptions). `ctx` is accepted for the security-context-first
-        // convention and to keep a denial expressible; the specification
-        // manager it reads from is the ctx-less Tier-1 boundary (it also
-        // serves ctx-less retention/refresh workers).
-        self.spec_manager.list_topics().await
+        let mut topics = self.spec_manager.list_topics().await?;
+        topics.retain(|topic| select.selects(topic));
+        let access = self.metadata_access(ctx);
+        let readable = MetadataAccess::decide_each(&topics, |topic| {
+            let access = access.clone();
+            let topic = topic.id.clone();
+            async move { access.may_read_topic(&topic).await }
+        })
+        .await?;
+        Ok(topics
+            .into_iter()
+            .zip(readable)
+            .filter_map(|(topic, readable)| readable.then_some(topic))
+            .collect())
     }
 
     async fn list_topic_segments(
         &self,
-        _ctx: &SecurityContext,
+        ctx: &SecurityContext,
         topic_id: &GtsInstanceId,
         partition: i32,
     ) -> Result<crate::domain::model::TopicSegmentManifest, DomainError> {
+        // Before the lookup, so a refused caller cannot tell a registered
+        // topic from a missing one.
+        if !self.metadata_access(ctx).may_read_topic(topic_id).await? {
+            return Err(DomainError::Forbidden {
+                code: ErrorCode::TopicNotAuthorized,
+                message: "access denied by policy".to_owned(),
+                resource: topic_id.to_string(),
+            });
+        }
         let topic = self
             .spec_manager
             .get_topic(topic_id)
@@ -1150,11 +1447,65 @@ where
 
     async fn list_event_types(
         &self,
-        _ctx: &SecurityContext,
+        ctx: &SecurityContext,
+        select: &Selection<'_, EventType>,
     ) -> Result<Vec<EventType>, DomainError> {
-        // Same rationale as `list_topics`: event types are global resources,
-        // read from the ctx-less Tier-1 specification manager.
-        self.spec_manager.list_event_types().await
+        let mut event_types = self.spec_manager.list_event_types().await?;
+        event_types.retain(|event_type| select.selects(event_type));
+        let access = self.metadata_access(ctx);
+        // One consume check per topic, then one produce check per type of a
+        // refused topic.
+        let mut seen = std::collections::HashSet::new();
+        let topics: Vec<GtsInstanceId> = event_types
+            .iter()
+            .filter(|event_type| seen.insert(&event_type.topic))
+            .map(|event_type| event_type.topic.clone())
+            .collect();
+        let consumable = MetadataAccess::decide_each(&topics, |topic| {
+            let access = access.clone();
+            let topic = topic.clone();
+            async move { access.may_consume(&topic).await }
+        })
+        .await?;
+        let consumable: std::collections::HashSet<GtsInstanceId> = topics
+            .into_iter()
+            .zip(consumable)
+            .filter_map(|(topic, consumable)| consumable.then_some(topic))
+            .collect();
+        let refused: Vec<GtsTypeId> = event_types
+            .iter()
+            .filter(|event_type| !consumable.contains(&event_type.topic))
+            .map(|event_type| event_type.id.clone())
+            .collect();
+        let mut producible = MetadataAccess::decide_each(&refused, |event_type| {
+            let access = access.clone();
+            let event_type = event_type.clone();
+            async move { access.may_produce(&event_type).await }
+        })
+        .await?
+        .into_iter();
+        // `refused` lists the types of refused topics in list order, so each
+        // such type takes the next produce decision.
+        event_types.retain(|event_type| {
+            consumable.contains(&event_type.topic) || producible.next().unwrap_or(false)
+        });
+        Ok(event_types)
+    }
+
+    async fn get_event_type(
+        &self,
+        ctx: &SecurityContext,
+        id: &GtsTypeId,
+    ) -> Result<Option<EventType>, DomainError> {
+        let Some(event_type) = self.spec_manager.get_event_type(id).await? else {
+            return Ok(None);
+        };
+        let access = self.metadata_access(ctx);
+        if access.may_consume(&event_type.topic).await? || access.may_produce(id).await? {
+            Ok(Some(event_type))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -1211,3 +1562,9 @@ fn subject_type_allowed(event_type: &EventType, subject_type: &str) -> Result<()
 #[cfg(test)]
 #[path = "ingest_tests.rs"]
 mod ingest_tests;
+#[cfg(test)]
+#[path = "metadata_authz_tests.rs"]
+mod metadata_authz_tests;
+#[cfg(test)]
+#[path = "publish_authz_tests.rs"]
+mod publish_authz_tests;

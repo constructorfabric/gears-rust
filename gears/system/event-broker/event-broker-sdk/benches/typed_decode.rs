@@ -119,10 +119,10 @@ impl Fixture {
             .id(Uuid::from_u128(
                 0x0193_0000_0000_7000_8000_0000_0000_0000 + n,
             ))
-            .tenant_id(Uuid::from_u128(0x0193_0000_0000_7000_8000_0000_0000_ffff))
+            .subject_tenant(Uuid::from_u128(0x0193_0000_0000_7000_8000_0000_0000_ffff))
             .source("bench")
             .subject(format!("order-{i}"))
-            .subject_type_id(GtsTypeId::new("gts.fabrikam.bench.orders.order.v1~"))
+            .subject_type_of(GtsTypeId::new("gts.fabrikam.bench.orders.order.v1~"))
             .occurred_at(
                 chrono::DateTime::from_timestamp(1_793_000_000, 0).expect("fixed timestamp"),
             )

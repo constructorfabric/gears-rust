@@ -1,5 +1,9 @@
+use std::time::Duration;
+
 use gts::GtsTypeId;
 use serde::Deserialize;
+
+use crate::domain::model::BarrierMode;
 
 /// Transport-level safety cap on `infra::dispatcher::proxy_client::proxy`'s
 /// raw, not-yet-typed proxied request body - bounds a read that bypasses any
@@ -18,7 +22,7 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 /// Which of the four deployment-mode wiring variants this instance runs as.
 /// Drives [`crate::module::EventBrokerModule`]'s per-mode service/route
-/// gating (`DESIGN.md:2224`'s Deployment Modes table;
+/// gating (the Deployment Modes table of `DESIGN.md` "4.1 Deployment Modes";
 /// `docs/ADR/0007-service-decomposition.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -39,8 +43,6 @@ pub struct EventBrokerConfig {
     pub batch: BatchConfig,
     #[serde(default)]
     pub publish: PublishConfig,
-    #[serde(default)]
-    pub polling: PollingConfig,
     #[serde(default)]
     pub subscription: SubscriptionConfig,
     #[serde(default)]
@@ -141,30 +143,11 @@ impl Default for PublishConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
-pub struct PollingConfig {
-    pub default_timeout_secs: u32,
-    pub max_timeout_secs: u32,
-}
-
-impl Default for PollingConfig {
-    fn default() -> Self {
-        // `DESIGN.md` §2.2 Constraints: 30s long-poll max timeout.
-        Self {
-            default_timeout_secs: 30,
-            max_timeout_secs: 30,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields, default)]
 pub struct SubscriptionConfig {
-    /// ISO 8601 duration (e.g. `"PT30S"`); parsing lives with the real
-    /// config-loading implementation, not this skeleton.
-    pub default_session_timeout: String,
-    pub min_session_timeout: String,
     /// How long a subscription may sit joined without ever opening a stream
-    /// before it is reaped. Default 60.
+    /// before it is reaped. Default 60. Must be at least 1: 0 would reap a
+    /// joined subscription at the next sweep, at most a second after it
+    /// joined.
     #[serde(deserialize_with = "deserialize_nonzero_secs")]
     pub join_timeout_secs: u32,
 }
@@ -172,8 +155,6 @@ pub struct SubscriptionConfig {
 impl Default for SubscriptionConfig {
     fn default() -> Self {
         Self {
-            default_session_timeout: "PT30S".to_owned(),
-            min_session_timeout: "PT1S".to_owned(),
             join_timeout_secs: 60,
         }
     }
@@ -192,7 +173,8 @@ impl Default for SubscriptionConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct StreamingConfig {
     /// Idle cadence. Any frame resets it, so a delivering stream never pays for
-    /// a heartbeat. Default 5.
+    /// a heartbeat. Default 5. Must be at least 1: 0 would keep the heartbeat
+    /// permanently due, so the session loop would never park.
     #[serde(deserialize_with = "deserialize_nonzero_secs")]
     pub heartbeat_interval_secs: u32,
     /// Events one read may return. Bounds a session's working set, and with the
@@ -213,9 +195,32 @@ pub struct StreamingConfig {
     pub progress_drift_threshold: usize,
     /// Floor between two `control:progress` frames. Without it a heavily
     /// filtered stream would emit one per batch, each carrying almost no new
-    /// information. Default 30.
+    /// information. Default 30. Must be at least 1: 0 would keep the progress
+    /// timer permanently due, so the session loop would never park.
     #[serde(deserialize_with = "deserialize_nonzero_secs")]
     pub progress_min_interval_secs: u32,
+    /// How long a consume answer the PDP allowed stays in the decision memo,
+    /// keyed by the exact request it answered, and how long each interest
+    /// group of a member's consume scope serves before it is evaluated again.
+    /// The first window of a scope a stream open evaluates is staggered:
+    /// group `k` of `G` serves for `ttl x (1 + k / G)`. Default 60. Must be at
+    /// least 1, and greater than `2 x authz_eval_deadline_secs + 2` where
+    /// delivery runs (a startup check), since a stream's refresh worker
+    /// re-evaluates a group one refresh lead (`StreamingConfig::refresh_lead`)
+    /// before it expires and a shorter window would be due again the moment
+    /// it is stored.
+    #[serde(deserialize_with = "deserialize_nonzero_secs")]
+    pub authz_scope_ttl_secs: u32,
+    /// The longest the delivery service waits on the PDP: each consume
+    /// evaluation of JOIN and stream open, each I and E a stream's scope
+    /// refresh asks, and the one wave of single-type evaluations a read
+    /// batch asks. A stream whose batch misses it ends without advancing
+    /// past the batch. It also sets the refresh lead
+    /// (`StreamingConfig::refresh_lead`) and so the startup check on
+    /// `authz_scope_ttl_secs`. Default 10. Must be at least 1: 0 would fail
+    /// every evaluation that does not answer at once.
+    #[serde(deserialize_with = "deserialize_nonzero_secs")]
+    pub authz_eval_deadline_secs: u32,
 }
 
 impl Default for StreamingConfig {
@@ -226,7 +231,39 @@ impl Default for StreamingConfig {
             read_batch_max_bytes: 1024 * 1024,
             progress_drift_threshold: 1000,
             progress_min_interval_secs: 30,
+            authz_scope_ttl_secs: 60,
+            authz_eval_deadline_secs: 10,
         }
+    }
+}
+
+/// The margin a refresh lead adds to its evaluation deadlines, for the indexed
+/// candidate query that runs before them.
+const REFRESH_MARGIN_SECS: u64 = 2;
+
+impl StreamingConfig {
+    /// How long before an interest group of a consume scope expires the
+    /// stream's refresh worker re-evaluates it: one evaluation deadline per
+    /// PDP call the refresh makes (I and E for an `ignore` group, E alone for
+    /// a `respect` one) plus 2 seconds for the candidate query. At the
+    /// defaults, 12 seconds for `respect` and 22 for `ignore`.
+    #[must_use]
+    pub fn refresh_lead(&self, barrier_mode: BarrierMode) -> Duration {
+        let calls: u64 = match barrier_mode {
+            BarrierMode::Respect => 1,
+            BarrierMode::Ignore => 2,
+        };
+        Duration::from_secs(calls * u64::from(self.authz_eval_deadline_secs) + REFRESH_MARGIN_SECS)
+    }
+
+    /// Whether a scope window outlasts the longest refresh lead, the
+    /// `ignore` one: `authz_scope_ttl_secs > 2 x authz_eval_deadline_secs +
+    /// 2`. Otherwise a refreshed group would be due again the moment it is
+    /// stored, and its refresh worker would evaluate without pause.
+    #[must_use]
+    pub fn outlasts_refresh_lead(&self) -> bool {
+        Duration::from_secs(u64::from(self.authz_scope_ttl_secs))
+            > self.refresh_lead(BarrierMode::Ignore)
     }
 }
 
@@ -348,21 +385,23 @@ impl Default for WorkersConfig {
 }
 
 /// `DirectoryService` self-registration address in `cluster_ingest`/
-/// `cluster_delivery` mode (`eb-dispatcher-routing` design.md D5) - unused
+/// `cluster_delivery` mode - unused
 /// in `standalone`/`cluster_dispatcher` mode. Mirrors `grpc-hub`'s
 /// `listen_addr`/`advertise_addr` pattern
 /// (`gears/system/grpc-hub/src/gear.rs`).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct RegistrationConfig {
-    /// The address this instance's REST listener binds to.
+    /// The address this instance registers when `advertise_addr` is unset, and
+    /// whose port an `advertise_addr` without one takes. The broker binds
+    /// nothing to it: the REST listener is the API gateway's.
     pub listen_addr: String,
     /// The address other instances (the dispatcher, in cluster mode) reach
     /// this one at, if different from `listen_addr`. Accepted forms:
-    /// `host:<u16>` (literal host and port; `:0` means "use the actual
-    /// bound port") or `host` alone (the actual bound port is appended).
-    /// `None` falls back to `listen_addr` unless that's a wildcard bind
-    /// (`0.0.0.0`), which fails `init` in cluster mode rather than
+    /// `host:<u16>` (literal host and port; `:0` means "use `listen_addr`'s
+    /// port") or `host` alone (`listen_addr`'s port is appended).
+    /// `None` falls back to `listen_addr` unless its host is a wildcard
+    /// address (`0.0.0.0`), which fails `init` in cluster mode rather than
     /// registering an unroutable address.
     #[serde(default)]
     pub advertise_addr: Option<String>,
@@ -565,20 +604,15 @@ impl RetentionSize {
     }
 }
 
-/// A whole-second cadence that must be at least 1. Zero would make the schedule
-/// permanently due, so the delivery session loop would emit that frame every
-/// pass and never park - the failure documented for both the heartbeat and the
-/// progress timer in `domain::streaming::session`. Rejecting it at deserialization
-/// keeps that footgun out of any accepted config.
+/// A whole number of seconds that must be at least 1. Each field using it
+/// says why 0 is invalid for it.
 fn deserialize_nonzero_secs<'de, D>(deserializer: D) -> Result<u32, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let secs = u32::deserialize(deserializer)?;
     if secs == 0 {
-        return Err(serde::de::Error::custom(
-            "must be at least 1 second; 0 would spin the delivery session loop",
-        ));
+        return Err(serde::de::Error::custom("must be at least 1 second"));
     }
     Ok(secs)
 }

@@ -3,7 +3,8 @@
 //! head, decides, and writes, and a commit by anyone else in between must not
 //! turn an accept into a `503`. On `SQLite` that commit invalidates the
 //! publish's read snapshot (`SQLITE_BUSY_SNAPSHOT`), the intermittent `503`
-//! CI saw on a first publish.
+//! CI saw on a first publish. Likewise two first writes of one consumer cursor
+//! must both succeed rather than the second answering `503`.
 //!
 //! Each engine runs the gear database and the storage backend on one server
 //! (`SQLite`: a temp file and the memory backend). Retries are off for this
@@ -22,8 +23,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
+use event_broker::domain::model::{ConsumerGroup, ConsumerGroupKind, Cursor, Sequence};
+use event_broker::domain::repo::{ConsumerGroupRepo, CursorRepo};
 use event_broker::test_support::{EventBrokerHarness, Json, StaticTypesRegistry};
+use gts::GtsInstanceId;
 use serde_json::json;
+use uuid::Uuid;
 
 use support::matrix::{Engine, Matrix};
 use support::stored::stored_ids;
@@ -40,6 +46,9 @@ const BACKGROUND_WRITERS: u32 = 4;
 const ROUNDS: u32 = 20;
 /// The rounds stop early once this much wall clock is spent.
 const BUDGET: Duration = Duration::from_secs(60);
+/// How long a test waits for a held write to reach its pause point, or for a
+/// write to finish.
+const BOUND: Duration = Duration::from_secs(10);
 
 async fn harness(matrix: &Matrix) -> Arc<EventBrokerHarness> {
     Arc::new(
@@ -92,7 +101,7 @@ async fn first_publishes_race_the_outbox_drain(engine: Engine) {
                             .with_body(Json(&json!({
                                 "id": id,
                                 "type": EVENT_TYPE,
-                                "tenant_id": format!("0190f1a2-0000-7000-b000-{n:012x}"),
+                                "subject_tenant": format!("0190f1a2-0000-7000-b000-{n:012x}"),
                                 "source": "contention-test",
                                 "subject": "order-stateless",
                                 "subject_type": SUBJECT_TYPE,
@@ -137,14 +146,14 @@ async fn first_publishes_race_the_outbox_drain(engine: Engine) {
                         .with_body(Json(&json!({
                             "id": id,
                             "type": EVENT_TYPE,
-                            "tenant_id": format!("0190f1a2-0000-7000-a000-{producer:012x}"),
+                            "subject_tenant": format!("0190f1a2-0000-7000-a000-{producer:012x}"),
                             "source": "contention-test",
                             "subject": "order-1",
                             "subject_type": SUBJECT_TYPE,
                             "occurred_at": "2026-10-01T12:00:00Z",
                             "meta": {
                                 "version": 1,
-                                "producer_id": producer_id,
+                                "producer": producer_id,
                                 "previous": 0,
                                 "sequence": 1,
                             },
@@ -196,7 +205,7 @@ async fn first_publishes_race_the_outbox_drain(engine: Engine) {
             assert_eq!(
                 cursors.json(),
                 json!({
-                    "producer_id": producer_id,
+                    "id": producer_id,
                     "client_agent": "contention-test",
                     "topics": [{ "topic": TOPIC, "last_sequence": 1 }],
                 })
@@ -261,12 +270,12 @@ async fn first_publish_with_a_committed_writer_between_read_and_write(engine: En
                 .with_body(Json(&json!({
                     "id": "0190f1a2-0000-7000-8000-000000000c01",
                     "type": EVENT_TYPE,
-                    "tenant_id": "0190f1a2-0000-7000-a000-000000000c01",
+                    "subject_tenant": "0190f1a2-0000-7000-a000-000000000c01",
                     "source": "contention-test",
                     "subject": "order-1",
                     "subject_type": SUBJECT_TYPE,
                     "occurred_at": "2026-10-01T12:00:00Z",
-                    "meta": { "version": 1, "producer_id": producer_id, "previous": 0, "sequence": 1 },
+                    "meta": { "version": 1, "producer": producer_id, "previous": 0, "sequence": 1 },
                 })))
                 .send()
                 .await;
@@ -283,7 +292,7 @@ async fn first_publish_with_a_committed_writer_between_read_and_write(engine: En
         .with_body(Json(&json!({
             "id": "0190f1a2-0000-7000-8000-000000000c02",
             "type": EVENT_TYPE,
-            "tenant_id": "0190f1a2-0000-7000-a000-000000000c02",
+            "subject_tenant": "0190f1a2-0000-7000-a000-000000000c02",
             "source": "contention-test",
             "subject": "order-stateless",
             "subject_type": SUBJECT_TYPE,
@@ -307,7 +316,7 @@ async fn first_publish_with_a_committed_writer_between_read_and_write(engine: En
     assert_eq!(
         cursors.json(),
         json!({
-            "producer_id": producer_id,
+            "id": producer_id,
             "client_agent": "contention-test",
             "topics": [{ "topic": TOPIC, "last_sequence": 1 }],
         })
@@ -320,6 +329,88 @@ async fn first_publish_with_a_committed_writer_between_read_and_write(engine: En
             "0190f1a2-0000-7000-8000-000000000c01".to_owned(),
             "0190f1a2-0000-7000-8000-000000000c02".to_owned(),
         ]
+    );
+}
+
+/// Two members seeding the same partition at once: the first cursor write is
+/// held inside its transaction before its upsert while the second creates the
+/// row and commits, then the first writes. It is not refused with `503`: the
+/// later commit's offset stands. The cursor's primary key leaves at most one
+/// row to read back.
+async fn two_first_writes_of_one_cursor_both_succeed(engine: Engine) {
+    let Some(matrix) = Matrix::start(engine, "cursor-first-writes").await else {
+        return;
+    };
+    let harness = harness(&matrix).await;
+    let group = ConsumerGroup {
+        id: GtsInstanceId::try_new(
+            "gts.cf.core.events.consumer_group.v1~x.eb.contention.seeders.v1",
+        )
+        .unwrap(),
+        kind: ConsumerGroupKind::Anonymous,
+        tenant_id: Uuid::from_u128(0x0190_f1a2_0000_7000_a000_0000_0000_0c03),
+        owner_principal_id: Uuid::from_u128(0x0190_f1a2_0000_7000_b000_0000_0000_0c03),
+        description: None,
+        created_at: DateTime::parse_from_rfc3339("2026-10-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc),
+    };
+    harness
+        .repo()
+        .create_consumer_group(group.clone())
+        .await
+        .expect("create the group");
+    let topic = GtsInstanceId::try_new(TOPIC).unwrap();
+    let cursor_at = |offset| Cursor {
+        topic: topic.clone(),
+        consumer_group: group.id.clone(),
+        partition: 2,
+        offset: Sequence::assigned(offset),
+    };
+
+    let pause = harness.repo().before_cursor_write_pause().clone();
+    pause.arm();
+    let held = {
+        let harness = Arc::clone(&harness);
+        let cursor = cursor_at(5);
+        tokio::spawn(async move {
+            harness
+                .repo()
+                .put_cursors(std::slice::from_ref(&cursor))
+                .await
+        })
+    };
+    tokio::time::timeout(BOUND, pause.reached())
+        .await
+        .expect("the first write reaches the pause point");
+
+    tokio::time::timeout(BOUND, harness.repo().put_cursors(&[cursor_at(7)]))
+        .await
+        .expect("the second write finishes")
+        .expect("the second write succeeds");
+    pause.release();
+    let held = tokio::time::timeout(BOUND, held)
+        .await
+        .expect("the held write finishes")
+        .expect("the held write's task");
+    assert_eq!(held.map_err(|err| format!("{err:?}")), Ok(()));
+
+    let found = harness
+        .repo()
+        .find_cursor(&group.id, &topic, 2)
+        .await
+        .expect("read the cursor")
+        .map(|found| {
+            (
+                found.topic,
+                found.consumer_group,
+                found.partition,
+                found.offset,
+            )
+        });
+    assert_eq!(
+        found,
+        Some((topic.clone(), group.id.clone(), 2, Sequence::assigned(5)))
     );
 }
 
@@ -351,4 +442,19 @@ async fn first_publish_with_a_committed_writer_between_read_and_write_on_postgre
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn first_publish_with_a_committed_writer_between_read_and_write_on_mysql() {
     first_publish_with_a_committed_writer_between_read_and_write(Engine::Mysql).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_first_writes_of_one_cursor_both_succeed_on_sqlite() {
+    two_first_writes_of_one_cursor_both_succeed(Engine::Sqlite).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_first_writes_of_one_cursor_both_succeed_on_postgres() {
+    two_first_writes_of_one_cursor_both_succeed(Engine::Postgres).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_first_writes_of_one_cursor_both_succeed_on_mysql() {
+    two_first_writes_of_one_cursor_both_succeed(Engine::Mysql).await;
 }

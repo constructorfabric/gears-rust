@@ -1,4 +1,4 @@
-//! JOIN, list, read, leave, seek (`DESIGN.md:591`,
+//! JOIN, list, read, leave, seek (`DESIGN.md` "Module Structure",
 //! `docs/schemas/gts.cf.core.events.subscription.v1~.schema.json`).
 
 use std::collections::BTreeMap;
@@ -13,15 +13,14 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use super::dto::{
-    JoinSubscriptionRequest, ResolvedPositionEntryDto, SeekResponse, SeekSubscriptionRequest,
-    SubscriptionDto,
+    JoinSubscriptionRequest, JoinSubscriptionResponseDto, PositionEntryDto,
+    ResolvedPositionEntryDto, SeekResponse, SeekSubscriptionRequest, SubscriptionDto,
 };
 use crate::api::rest::handlers::action_suffix::parse_action_suffixed_id;
 use crate::api::rest::pagination::{eval_filter, paginate_by_key};
 use crate::api::rest::state::HandlerState;
 use crate::domain::delivery::{JoinRequest, SeekTarget};
 use crate::domain::error::{DomainError, ErrorCode};
-use crate::domain::model::Interest;
 
 const DEFAULT_SESSION_TIMEOUT_SECS: u64 = 30;
 
@@ -96,13 +95,17 @@ pub async fn join_subscription(
         interests: req
             .interests
             .into_iter()
-            .map(Interest::try_from)
+            .map(|interest| interest.into_interest(ctx.subject_tenant_id()))
             .collect::<Result<Vec<_>, _>>()?,
         session_timeout,
     };
-    let subscription = state.delivery.join(&ctx, request).await?;
-    let id = subscription.id.to_string();
-    Ok(created_json(SubscriptionDto::from(subscription), &uri, &id))
+    let outcome = state.delivery.join(&ctx, request).await?;
+    let id = outcome.subscription.id.to_string();
+    Ok(created_json(
+        JoinSubscriptionResponseDto::from(outcome),
+        &uri,
+        &id,
+    ))
 }
 
 /// # Errors
@@ -169,8 +172,8 @@ pub async fn leave_subscription(
 /// # Errors
 /// Returns the mapped `CanonicalError` for any `DomainError`
 /// `DeliveryService::seek` produces, or a `400` if the path segment isn't
-/// `<uuid>:seek`, the body isn't valid JSON, or a `value` sentinel is
-/// malformed.
+/// `<uuid>:seek`, the body isn't valid JSON, `positions` names the same topic
+/// more than once, or a `value` sentinel is malformed.
 pub async fn seek_subscription(
     Extension(ctx): Extension<SecurityContext>,
     Extension(state): Extension<HandlerState>,
@@ -179,8 +182,23 @@ pub async fn seek_subscription(
 ) -> ApiResult<JsonBody<SeekResponse>> {
     let subscription_id = parse_action_suffixed_id(&raw_id, "seek", "subscription")?;
 
-    let mut targets = Vec::new();
+    // A `BTreeMap` so targets reach the broker in topic order, which fixes the
+    // order of out-of-range violations and which unassigned partition is named.
+    let mut by_topic: BTreeMap<String, Vec<PositionEntryDto>> = BTreeMap::new();
     for (raw_topic, entries) in req.positions {
+        // The message does not echo the key: it is unparsed caller input of
+        // unbounded length.
+        if by_topic.insert(raw_topic, entries).is_some() {
+            return Err(DomainError::Validation {
+                code: ErrorCode::InvalidBody,
+                message: "`positions` names the same topic more than once".to_owned(),
+            }
+            .into());
+        }
+    }
+
+    let mut targets = Vec::new();
+    for (raw_topic, entries) in by_topic {
         let topic = crate::domain::id_parse::parse_topic_id(&raw_topic)?;
         for entry in entries {
             targets.push(SeekTarget {

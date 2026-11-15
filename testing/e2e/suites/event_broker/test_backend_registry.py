@@ -121,7 +121,7 @@ def _event(event_type: str, tenant_id: str) -> dict:
     return {
         "id": str(uuid.uuid4()),
         "type": event_type,
-        "tenant_id": tenant_id,
+        "subject_tenant": tenant_id,
         "source": "e2e-test",
         "subject": "s1",
         "subject_type": SUBJECT_TYPE,

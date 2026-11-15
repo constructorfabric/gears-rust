@@ -253,7 +253,7 @@ async fn extend(
             "CREATE TABLE IF NOT EXISTS {table} (\
                  seq BIGINT NOT NULL, \
                  seq_time DATETIME(6) NOT NULL, \
-                 tenant_id BINARY(16) NOT NULL, \
+                 subject_tenant BINARY(16) NOT NULL, \
                  cum_bytes BIGINT NOT NULL, \
                  body LONGBLOB NOT NULL, \
                  PRIMARY KEY (seq)\

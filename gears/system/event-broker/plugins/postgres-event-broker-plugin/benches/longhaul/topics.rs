@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use event_broker_sdk::backend::support::{partition_for, topic_uuid};
+use event_broker_sdk::backend::support::partition_for;
 use event_broker_sdk::backend::{
     Backend, KeyedEvent, LogClaim, LogId, Partition, Replacing, Retention, TopicPartition,
     TopicSpec,
@@ -38,6 +38,16 @@ impl Kind {
             Self::Age => 0,
             Self::Bytes => 1,
             Self::Keep => 2,
+        }
+    }
+
+    /// The topic's Registry Reference: fixed per kind, so a run over a
+    /// database an earlier run provisioned hands the same one.
+    pub const fn reference(self) -> Uuid {
+        match self {
+            Self::Age => Uuid::from_u128(0x1),
+            Self::Bytes => Uuid::from_u128(0x2),
+            Self::Keep => Uuid::from_u128(0x3),
         }
     }
 }
@@ -93,6 +103,7 @@ pub async fn provision(
             .provision(
                 &TopicSpec {
                     topic: id.clone(),
+                    uuid: kind.reference(),
                     partitions,
                     retention,
                 },
@@ -103,7 +114,7 @@ pub async fn provision(
             )
             .await
             .map_err(|err| format!("provision {}: {err}", kind.name()))?;
-        let uuid = topic_uuid(&id);
+        let uuid = kind.reference();
         topics.push(Topic {
             kind,
             id,
@@ -143,14 +154,16 @@ pub fn event(stamp: Stamp, pad: &str) -> KeyedEvent {
         key: key(stamp.k),
         event: Event {
             id: Uuid::new_v4(),
-            type_id: GtsTypeId::new("gts.cf.core.events.event.v1~cf.longhaul.x.written.v1~"),
-            tenant_id: Uuid::from_u128(1),
+            event_type: GtsTypeId::new("gts.cf.core.events.event.v1~cf.longhaul.x.written.v1~"),
+            subject_tenant: Uuid::from_u128(1),
             source: "longhaul".to_owned(),
             subject: key(stamp.k),
             subject_type: GtsTypeId::new("gts.cf.longhaul.x.key.v1~"),
+            subject_owner: None,
             occurred_at: chrono::Utc::now(),
             trace_parent: None,
             data: Some(serde_json::json!({ "w": stamp.w, "k": stamp.k, "n": stamp.n, "pad": pad })),
+            ingest: None,
             partition: None,
             sequence: None,
             sequence_time: None,

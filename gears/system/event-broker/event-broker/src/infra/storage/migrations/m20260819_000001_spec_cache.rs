@@ -5,7 +5,7 @@
 
 use sea_orm_migration::prelude::*;
 
-use super::columns::{create_index, document, gts_id};
+use super::columns::{create_index, document, gts_id, gts_id_nullable};
 
 /// `SpecKind::as_str`: `topic` or `event_type`.
 const KIND_LEN: u32 = 10;
@@ -32,6 +32,8 @@ impl MigrationTrait for Migration {
                     .col(gts_id(manager, T::GtsId))
                     .col(ColumnDef::new(T::Kind).string_len(KIND_LEN).not_null())
                     .col(document(manager, T::Payload))
+                    .col(gts_id_nullable(manager, T::Topic))
+                    .col(document(manager, T::AllowedSubjectTypes))
                     .to_owned(),
             )
             .await?;
@@ -41,6 +43,14 @@ impl MigrationTrait for Migration {
             T::Table,
             &[T::GtsId],
             true,
+        )
+        .await?;
+        create_index(
+            manager,
+            "event_broker_spec_cache_kind_topic_idx",
+            T::Table,
+            &[T::Kind, T::Topic],
+            false,
         )
         .await
     }
@@ -64,4 +74,6 @@ enum EventBrokerSpecCache {
     GtsId,
     Kind,
     Payload,
+    Topic,
+    AllowedSubjectTypes,
 }

@@ -35,11 +35,12 @@ use toolkit_security::AccessScope;
 const BROKER_PARTITIONS: u32 = 4;
 const ROOT: u128 = 1_000;
 const PRODUCER: u128 = 1_100;
+const PRODUCER_TENANT: u128 = 1_101;
 
 fn settings() -> ProducerSettings {
     ProducerSettings {
         subject_id: u(PRODUCER),
-        tenant_id: u(1_101),
+        tenant_id: u(PRODUCER_TENANT),
     }
 }
 /// Fast retries, plus a short idle poll: after a restart nothing signals a message that is
@@ -53,7 +54,8 @@ fn fast_retry() -> toolkit_db::outbox::WorkerTuning {
 }
 
 /// Explicit grants at the broker's PEP: only the Orders producer may produce the Orders event
-/// family, and only under the platform-root tenant. `granted` revokes the tenant grant.
+/// family, and only under the platform-root tenant, besides registration in the producer's own
+/// tenant. `granted` revokes the platform-root grant.
 fn grants(granted: Arc<AtomicBool>) -> Arc<ScriptedPdp> {
     ScriptedPdp::new(move |request| {
         let producer = request.subject.id == u(PRODUCER);
@@ -72,15 +74,18 @@ fn grants(granted: Arc<AtomicBool>) -> Arc<ScriptedPdp> {
                         .is_some_and(|t| t.starts_with(events::EVENT_BASE))
             }
             "gts.cf.core.events.request.v1~" => {
+                let owner = request
+                    .resource
+                    .properties
+                    .get("owner_tenant_id")
+                    .and_then(serde_json::Value::as_str);
+                // Registration asks for `produce` in the producer's own tenant; publish asks
+                // under the platform root, which `granted` revokes.
                 producer
                     && produce
-                    && granted.load(Ordering::SeqCst)
-                    && request
-                        .resource
-                        .properties
-                        .get("owner_tenant_id")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(u(ROOT).to_string().as_str())
+                    && (owner == Some(u(PRODUCER_TENANT).to_string().as_str())
+                        || (granted.load(Ordering::SeqCst)
+                            && owner == Some(u(ROOT).to_string().as_str())))
             }
             _ => false,
         };
@@ -368,11 +373,11 @@ async fn committed_transitions_deliver_root_tenant_events_routed_by_order() -> a
     let mut partitions = std::collections::BTreeSet::new();
     for event in &stored {
         assert_eq!(
-            event.type_id.as_ref(),
+            event.event_type.as_ref(),
             <events::OrderEvent<OrderSubmitted> as toolkit_gts::GtsSchema>::TYPE_ID
         );
         assert_eq!(
-            event.tenant_id,
+            event.subject_tenant,
             u(ROOT),
             "explicit platform-root envelope tenant"
         );
@@ -727,7 +732,7 @@ async fn accepted_persisted_and_duplicate_outcomes_acknowledge_once() -> anyhow:
 fn assert_same_message(first: &DeliveredPublish, retry: &DeliveredPublish) {
     assert_eq!(retry.event_id, first.event_id, "original event id");
     let (a, b) = (first.meta.as_ref().unwrap(), retry.meta.as_ref().unwrap());
-    assert_eq!(b.producer_id, a.producer_id, "stable producer identity");
+    assert_eq!(b.producer, a.producer, "stable producer identity");
     assert_eq!(b.sequence, a.sequence, "stable meta.sequence");
 }
 
@@ -988,7 +993,7 @@ async fn a_forgotten_producer_re_registers_and_delivers() -> anyhow::Result<()> 
         .delivered_publishes()
         .into_iter()
         .filter(|p| p.subject == u(700).to_string())
-        .map(|p| (p.event_id, p.meta.and_then(|m| m.producer_id), p.outcome))
+        .map(|p| (p.event_id, p.meta.and_then(|m| m.producer), p.outcome))
         .collect();
     let cancel = attempts[1].0;
     assert_eq!(
@@ -1040,10 +1045,13 @@ async fn root_tenant_grant_is_required_and_rejection_advances() -> anyhow::Resul
                 .map(str::to_owned)
         })
         .collect();
-    assert!(!tenants.is_empty());
+    assert!(tenants.iter().any(|t| *t == u(ROOT).to_string()));
     assert!(
-        tenants.iter().all(|t| *t == u(ROOT).to_string()),
-        "the broker authorized only the root envelope tenant: {tenants:?}"
+        tenants
+            .iter()
+            .all(|t| *t == u(ROOT).to_string() || *t == u(PRODUCER_TENANT).to_string()),
+        "the broker authorized only the root envelope tenant and, at registration, the \
+         producer's own tenant: {tenants:?}"
     );
     bound.stop().await;
     Ok(())

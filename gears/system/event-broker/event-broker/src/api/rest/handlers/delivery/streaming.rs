@@ -1,4 +1,4 @@
-//! `GET /v1/events:stream`, `GET /v1/events:sse` (`DESIGN.md:589`,
+//! `GET /v1/events:stream`, `GET /v1/events:sse` (`DESIGN.md` "Module Structure",
 //! `event-broker-consumption-frames`, baseline subset only - see
 //! `domain/delivery.rs`'s module doc comment).
 
@@ -52,7 +52,7 @@ fn check_accept_multipart(headers: &HeaderMap) -> Result<(), CanonicalError> {
         .create())
 }
 
-// Symmetric guard for /v1/events:sse — rejects anything that is not
+// Symmetric guard for /v1/events:sse - rejects anything that is not
 // text/event-stream or */*.
 fn check_accept_sse(headers: &HeaderMap) -> Result<(), CanonicalError> {
     let accept = headers
@@ -94,7 +94,7 @@ pub async fn stream_events(
     let query = parse_stream_query(raw_query.as_deref())?;
     let boundary = format!("eb-frame-{}", Uuid::new_v4().simple());
     let content_type = format!("multipart/mixed; boundary={boundary}");
-    let frames = state.delivery.stream(&ctx, query.subscription_id).await?;
+    let frames = state.delivery.stream(&ctx, query.subscription).await?;
     let stream = frames
         .map(move |frame| encode::to_multipart_part(&boundary, frame))
         .map(Ok::<Bytes, Infallible>);
@@ -117,7 +117,7 @@ pub async fn sse_events(
 ) -> ApiResult<Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>>> {
     check_accept_sse(&headers)?;
     let query = parse_stream_query(raw_query.as_deref())?;
-    let frames = state.delivery.stream(&ctx, query.subscription_id).await?;
+    let frames = state.delivery.stream(&ctx, query.subscription).await?;
     let stream = frames.map(|frame| Ok::<SseEvent, Infallible>(encode::to_sse_event(frame)));
     // Heartbeats are already real domain frames on the documented cadence -
     // no need for axum's own comment-based keepalive on top.

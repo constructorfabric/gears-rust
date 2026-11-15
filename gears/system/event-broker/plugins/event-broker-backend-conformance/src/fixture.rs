@@ -39,16 +39,18 @@ pub fn event_at(key: &str, n: u64, occurred_at: DateTime<Utc>) -> KeyedEvent {
         key: key.to_owned(),
         event: Event {
             id: Uuid::new_v4(),
-            type_id: GtsTypeId::new(toolkit_gts::gts_id!(
+            event_type: GtsTypeId::new(toolkit_gts::gts_id!(
                 "cf.core.events.event.v1~cf.conformance.x.happened.v1~"
             )),
-            tenant_id: Uuid::from_u128(0x7e4a_0001),
+            subject_tenant: Uuid::from_u128(0x7e4a_0001),
             source: "conformance".to_owned(),
             subject: format!("{key}-{n}"),
             subject_type: GtsTypeId::new(toolkit_gts::gts_id!("cf.conformance.x.thing.v1~")),
+            subject_owner: None,
             occurred_at,
             trace_parent: None,
             data: Some(serde_json::json!({ "key": key, "n": n })),
+            ingest: None,
             partition: None,
             sequence: None,
             sequence_time: None,
@@ -145,6 +147,7 @@ pub async fn provisioned(
 ) -> TopicSpec {
     let spec = TopicSpec {
         topic: topic(scenario),
+        uuid: Uuid::new_v4(),
         partitions,
         retention,
     };

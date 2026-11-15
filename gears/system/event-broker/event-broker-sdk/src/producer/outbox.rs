@@ -21,7 +21,7 @@ pub(crate) const PRODUCER_OUTBOX_ENVELOPE_VERSION: u16 = 1;
 pub(crate) const PRODUCER_OUTBOX_PAYLOAD_TYPE: &str =
     "application/vnd.constructorfabric.event-broker.producer-outbox+json;version=1";
 
-/// A producer's chain is kept per `(producer_id, topic)` (ADR-0004 "Chain Scope").
+/// A producer's chain is kept per `(producer, topic)` (ADR-0004 "Chain Scope").
 type ProducerOutboxCursorKey = (ProducerId, String);
 type ProducerOutboxCursorMap = HashMap<ProducerOutboxCursorKey, i64>;
 type SharedProducerOutboxCursor = Arc<Mutex<ProducerOutboxCursorMap>>;
@@ -33,10 +33,12 @@ pub(crate) struct ProducerOutboxEnvelope {
     #[serde(rename = "type")]
     event_type_id: GtsTypeId,
     topic: String,
-    tenant_id: uuid::Uuid,
+    subject_tenant: uuid::Uuid,
     source: String,
     subject: String,
     subject_type: GtsTypeId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subject_owner: Option<uuid::Uuid>,
     occurred_at: chrono::DateTime<chrono::Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     trace_parent: Option<String>,
@@ -129,10 +131,11 @@ impl ProducerOutboxEnvelope {
             event_id: event.id(),
             event_type_id: event.event_type().clone(),
             topic,
-            tenant_id: event.tenant_id(),
+            subject_tenant: event.subject_tenant(),
             source,
             subject: event.subject().to_owned(),
             subject_type: event.subject_type().clone(),
+            subject_owner: event.subject_owner(),
             occurred_at: event.occurred_at(),
             trace_parent: event.trace_parent().map(str::to_owned),
             data: event.into_data(),
@@ -161,7 +164,7 @@ impl ProducerOutboxEnvelope {
             }
             (ProducerMode::Monotonic, Some(producer_id)) => Some(EventMeta {
                 version: 1,
-                producer_id: Some(producer_id.0),
+                producer: Some(producer_id.0),
                 previous: None,
                 sequence: Some(seq),
             }),
@@ -173,7 +176,7 @@ impl ProducerOutboxEnvelope {
                 })?;
                 Some(EventMeta {
                     version: 1,
-                    producer_id: Some(producer_id.0),
+                    producer: Some(producer_id.0),
                     previous: Some(previous),
                     sequence: Some(seq),
                 })
@@ -184,11 +187,14 @@ impl ProducerOutboxEnvelope {
             None => EventV1::builder_without_data(self.event_type_id.clone()),
         }
         .id(self.event_id)
-        .tenant_id(self.tenant_id)
+        .subject_tenant(self.subject_tenant)
         .source(self.source.clone())
         .subject(self.subject.clone())
-        .subject_type_id(self.subject_type.clone())
+        .subject_type_of(self.subject_type.clone())
         .occurred_at(self.occurred_at);
+        if let Some(owner) = self.subject_owner {
+            builder = builder.subject_owner(owner);
+        }
         if let Some(trace_parent) = &self.trace_parent {
             builder = builder.trace_parent(trace_parent.clone());
         }
@@ -357,7 +363,10 @@ impl ProducerOutboxProcessor {
             .await
         {
             Ok(previous) => previous,
-            Err(EventBrokerError::UnknownProducer { producer_id, .. }) => {
+            Err(EventBrokerError::UnknownProducer {
+                producer: producer_id,
+                ..
+            }) => {
                 return self.replace_unknown(partition, producer_id).await;
             }
             Err(err) => return retry_or_reject(&err),
@@ -402,7 +411,7 @@ impl ProducerOutboxProcessor {
         let (IngestOutcome::Accepted | IngestOutcome::Persisted | IngestOutcome::Duplicate) =
             outcome;
         if let Some(meta) = event.meta()
-            && let (Some(producer_id), Some(sequence)) = (meta.producer_id, meta.sequence)
+            && let (Some(producer_id), Some(sequence)) = (meta.producer, meta.sequence)
         {
             let mut cursor_state = self
                 .cursor_state
@@ -423,9 +432,10 @@ impl ProducerOutboxProcessor {
     ) -> MessageResult {
         match result {
             Ok(_) => MessageResult::Ok,
-            Err(EventBrokerError::UnknownProducer { producer_id, .. }) => {
-                self.replace_unknown(partition, producer_id).await
-            }
+            Err(EventBrokerError::UnknownProducer {
+                producer: producer_id,
+                ..
+            }) => self.replace_unknown(partition, producer_id).await,
             Err(err) => retry_or_reject(&err),
         }
     }
@@ -483,7 +493,10 @@ impl LeasedMessageHandler for ProducerOutboxProcessor {
             .await
         {
             Ok(event) => event,
-            Err(EventBrokerError::UnknownProducer { producer_id, .. }) => {
+            Err(EventBrokerError::UnknownProducer {
+                producer: producer_id,
+                ..
+            }) => {
                 return self.replace_unknown(partition, producer_id).await;
             }
             Err(err) => return retry_or_reject(&err),

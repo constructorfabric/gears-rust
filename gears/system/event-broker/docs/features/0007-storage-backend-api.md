@@ -66,7 +66,7 @@ The backend owns a topic's log: it picks each event's partition from the event's
 - Feature 0006 - topic provisioning: `provision`, the log id
 - ADR-0001 - offset semantics: sequences start at 1, the offset is the last-processed position
 - ADR-0002 - partition selection: the partition key is the value at the event type's JSON Pointer; the backend maps it to a partition
-- ADR-0004 - idempotent producer protocol: chain state per `(producer_id, topic)`, checked before enqueue
+- ADR-0004 - idempotent producer protocol: chain state per `(producer, topic)`, checked before enqueue
 - `event-broker-sdk/src/sequence.rs` - `Sequence`
 - `libs/toolkit-db/src/outbox/core.rs` - `Outbox::subscribe`, traced batches
 - `event-broker/src/infra/loader/scheduler.rs` - the loader's demand rounds and fetch pool
@@ -237,6 +237,9 @@ pub trait HeadWatch: Send + Sync {
 ```rust
 pub struct TopicSpec {
     pub topic: GtsInstanceId,
+    /// The topic's Registry Reference, which the gear reads from types-registry; a backend that keys
+    /// the topic's storage by a UUID uses this one and never derives one from `topic`.
+    pub uuid: Uuid,
     /// The count to create the log with; the backend partitions keys into this many.
     /// For a log the backend already holds, it is the count the backend reported when it provisioned that log.
     pub partitions: u32,

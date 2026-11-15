@@ -222,7 +222,7 @@ async fn event_type_defaults_allowed_subject_types_to_empty() {
         json!({
             "id": ORDER_TYPE,
             "topic": AUDIT_TOPIC,
-            "partition_key": "/tenant_id",
+            "partition_key": "/subject_tenant",
             "description": null,
             "allowed_subject_types": [],
             // The type narrows nothing, so the base's `data` member is the whole
@@ -261,7 +261,7 @@ async fn event_type_inherits_traits_from_an_ancestor() {
         json!({
             "id": ORDER_EU_TYPE,
             "topic": NOTIFY_TOPIC,
-            "partition_key": "/tenant_id",
+            "partition_key": "/subject_tenant",
             "description": null,
             "allowed_subject_types": [
                 "gts.example.proj.shop.order.v1~",
@@ -303,7 +303,7 @@ async fn event_type_composes_the_data_narrowings_with_the_leaf_last() {
         json!({
             "id": ORDER_TYPE,
             "topic": AUDIT_TOPIC,
-            "partition_key": "/tenant_id",
+            "partition_key": "/subject_tenant",
             "description": null,
             "allowed_subject_types": [],
             "data_schema": {
@@ -322,7 +322,7 @@ fn event_type_without_a_topic_trait_is_internal() {
     // a type that resolves none.
     let schema = unadmitted_event_type(
         ORDER_TYPE,
-        json!({ "allowed_subject_types": [], "partition_key": "/tenant_id" }),
+        json!({ "allowed_subject_types": [], "partition_key": "/subject_tenant" }),
     );
 
     assert_eq!(
@@ -343,7 +343,7 @@ fn event_type_naming_a_type_shaped_topic_is_internal() {
         json!({
             "topic": type_shaped,
             "allowed_subject_types": [],
-            "partition_key": "/tenant_id",
+            "partition_key": "/subject_tenant",
         }),
     );
 

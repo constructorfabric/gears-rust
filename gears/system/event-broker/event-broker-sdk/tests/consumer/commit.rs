@@ -7,7 +7,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use event_broker_sdk::{
     BatchHandlerOutcome, CommitOffset, ConsumerBuilder, ConsumerCommitMode, ConsumerGroupId,
-    ConsumerGroupRef, OffsetManagerError, OffsetStore, Position, Sequence, TopicId, gts_id,
+    ConsumerGroupRef, GtsInstanceId, OffsetManagerError, OffsetStore, Position, Sequence, gts_id,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -30,7 +30,7 @@ impl OffsetStore for RecordingOffsetManager {
     async fn load_position(
         &self,
         _group: &ConsumerGroupId,
-        _topic: &TopicId,
+        _topic: &GtsInstanceId,
         _partition: u32,
     ) -> Result<Position, OffsetManagerError> {
         Ok(Position::Earliest)
@@ -42,13 +42,13 @@ impl CommitOffset for RecordingOffsetManager {
     async fn commit(
         &self,
         group: &ConsumerGroupId,
-        topic: &TopicId,
+        topic: &GtsInstanceId,
         partition: u32,
         offset: Sequence,
     ) -> Result<(), OffsetManagerError> {
         self.commits.lock().expect("recording commits").push((
             *group,
-            *topic,
+            topic.clone(),
             partition,
             offset.as_i64(),
         ));
@@ -58,14 +58,14 @@ impl CommitOffset for RecordingOffsetManager {
 
 async fn wait_for_first_non_negative_commit(
     commits: &SharedCommits,
-) -> (ConsumerGroupId, TopicId, u32, i64) {
+) -> (ConsumerGroupId, GtsInstanceId, u32, i64) {
     for _ in 0..300 {
         if let Some(commit) = commits
             .lock()
             .expect("recording commits")
             .iter()
-            .copied()
             .find(|commit| commit.3 >= 0)
+            .cloned()
         {
             return commit;
         }
@@ -82,6 +82,9 @@ async fn async_auto_commit_uses_resolved_group_topic_partition_and_frontier_offs
     let calls = Arc::new(Mutex::new(Vec::new()));
 
     let handle = ConsumerBuilder::new(fx.broker.clone())
+        .subject_tenant(fx.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fx.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("auto-commit-metadata"))
         .topics([topic(TOPIC)])
         .commit_mode(ConsumerCommitMode::auto(Duration::from_millis(5)))
@@ -96,7 +99,7 @@ async fn async_auto_commit_uses_resolved_group_topic_partition_and_frontier_offs
         .expect("consumer starts");
 
     for _ in 0..100 {
-        if handle.subscription_ids().len() == 1 {
+        if handle.subscriptions().len() == 1 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -116,7 +119,7 @@ async fn async_auto_commit_uses_resolved_group_topic_partition_and_frontier_offs
     handle.stop().await.expect("consumer stops");
 
     assert_ne!(commit.0, ConsumerGroupId::new(Uuid::nil()));
-    assert_eq!(commit.1, TopicId::from_gts(TOPIC));
+    assert_eq!(commit.1, topic(TOPIC));
     assert_eq!(commit.2, 0);
     assert!(commit.3 >= 0);
 }

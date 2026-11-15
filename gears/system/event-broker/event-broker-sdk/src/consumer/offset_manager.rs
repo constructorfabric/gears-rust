@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use gts::GtsInstanceId;
 #[cfg(feature = "db")]
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set, sea_query::OnConflict};
 #[cfg(feature = "db")]
@@ -9,11 +10,11 @@ use toolkit_db::secure::{AccessScope, SecureEntityExt, SecureInsertExt};
 
 use crate::api::Position;
 use crate::error::OffsetManagerError;
-use crate::ids::{ConsumerGroupId, TopicId};
+use crate::ids::ConsumerGroupId;
 use crate::sequence::Sequence;
 
-type OffsetKey = (ConsumerGroupId, TopicId, u32);
-type PartitionOffsetKey = (TopicId, u32);
+type OffsetKey = (ConsumerGroupId, GtsInstanceId, u32);
+type PartitionOffsetKey = (GtsInstanceId, u32);
 type CommittedOffsets = HashMap<OffsetKey, Sequence>;
 type SeedOffsets = HashMap<PartitionOffsetKey, Sequence>;
 
@@ -27,7 +28,7 @@ mod offset_row {
         #[sea_orm(primary_key, auto_increment = false)]
         pub consumer_group_id: Uuid,
         #[sea_orm(primary_key, auto_increment = false)]
-        pub topic_id: Uuid,
+        pub topic: String,
         #[sea_orm(primary_key, auto_increment = false)]
         pub partition: i32,
         pub offset: i64,
@@ -62,15 +63,20 @@ impl From<Fallback> for Position {
     }
 }
 
+/// DDL of the [`LocalDbOffsetManager`] table, keyed by the consumer group, the
+/// topic's GTS id and the partition. It is tested on SQLite; Postgres is not yet
+/// tested (tracked in #5985). On MySQL, which has no `UUID` type, the DDL
+/// does not run as written; the `topic` key column would also need
+/// `CHARACTER SET ascii` to fit the 3,072-byte index limit.
 #[cfg(feature = "db")]
 pub const LOCAL_DB_OFFSET_STORE_MIGRATION_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS evbk_consumer_offsets (
     consumer_group_id UUID NOT NULL,
-    topic_id UUID NOT NULL,
+    topic VARCHAR(1024) NOT NULL,
     partition INTEGER NOT NULL,
     offset BIGINT NOT NULL,
     updated_at TIMESTAMP NOT NULL,
-    PRIMARY KEY (consumer_group_id, topic_id, partition)
+    PRIMARY KEY (consumer_group_id, topic, partition)
 );
 "#;
 
@@ -90,25 +96,28 @@ CREATE TABLE IF NOT EXISTS evbk_consumer_offsets (
 /// partition begin?": an exact last-processed offset (verbatim from the backing
 /// store or a configured per-partition override) or a sentinel for the broker to
 /// resolve. Read-only - persistence is [`CommitOffset`] / [`CommitOffsetInTx`].
+///
+/// `topic` is the topic's GTS id; the built-in stores key a position by it as given.
 #[async_trait]
 pub trait OffsetStore: Send + Sync {
     async fn load_position(
         &self,
         group: &ConsumerGroupId,
-        topic: &TopicId,
+        topic: &GtsInstanceId,
         partition: u32,
     ) -> Result<Position, OffsetManagerError>;
 }
 
 /// Eventual / batched commit of a processed offset to the client store
-/// (at-least-once). The dispatcher's auto-commit timer drives this.
+/// (at-least-once). The dispatcher's auto-commit timer and the positions that control
+/// and topology frames carry drive this.
 #[async_trait]
 pub trait CommitOffset: OffsetStore {
     /// Persist `offset` as the last-processed offset for `(group, topic, partition)`.
     async fn commit(
         &self,
         group: &ConsumerGroupId,
-        topic: &TopicId,
+        topic: &GtsInstanceId,
         partition: u32,
         offset: Sequence,
     ) -> Result<(), OffsetManagerError>;
@@ -125,7 +134,7 @@ pub trait CommitOffsetInTx: OffsetStore {
         &self,
         txn: &TX,
         group: &ConsumerGroupId,
-        topic: &TopicId,
+        topic: &GtsInstanceId,
         partition: u32,
         offset: Sequence,
     ) -> Result<(), OffsetManagerError>
@@ -138,7 +147,8 @@ pub trait CommitOffsetInTx: OffsetStore {
 /// DB-backed offset store. Implements [`OffsetStore`] + [`CommitOffsetInTx`] -
 /// its purpose is the transactional commit (exactly-once with the handler's
 /// writes). Cursor table: `evbk_consumer_offsets`.
-/// Key: `(consumer_group_id UUID, topic_id UUID, partition INTEGER)`.
+/// Key: `(consumer_group_id UUID, topic VARCHAR(1024), partition INTEGER)`, where
+/// `topic` is the topic's GTS id.
 /// Requires the `db` feature.
 #[cfg(feature = "db")]
 pub struct LocalDbOffsetManager {
@@ -173,7 +183,7 @@ impl OffsetStore for LocalDbOffsetManager {
     async fn load_position(
         &self,
         group: &ConsumerGroupId,
-        topic: &TopicId,
+        topic: &GtsInstanceId,
         partition: u32,
     ) -> Result<Position, OffsetManagerError> {
         let conn = self.db.conn().map_err(|err| {
@@ -182,7 +192,7 @@ impl OffsetStore for LocalDbOffsetManager {
 
         let row = offset_row::Entity::find()
             .filter(offset_row::Column::ConsumerGroupId.eq(group.as_uuid()))
-            .filter(offset_row::Column::TopicId.eq(topic.as_uuid()))
+            .filter(offset_row::Column::Topic.eq(topic.as_ref()))
             .filter(offset_row::Column::Partition.eq(partition_to_i32(partition)?))
             .secure()
             .scope_with(&AccessScope::allow_all())
@@ -196,7 +206,7 @@ impl OffsetStore for LocalDbOffsetManager {
             return Ok(Position::Exact(Sequence::assigned(row.offset)));
         }
 
-        if let Some(&off) = self.overrides.get(&(*topic, partition)) {
+        if let Some(&off) = self.overrides.get(&(topic.clone(), partition)) {
             return Ok(Position::Exact(off));
         }
         Ok(self.fallback.into())
@@ -210,7 +220,7 @@ impl CommitOffsetInTx for LocalDbOffsetManager {
         &self,
         txn: &TX,
         group: &ConsumerGroupId,
-        topic: &TopicId,
+        topic: &GtsInstanceId,
         partition: u32,
         offset: Sequence,
     ) -> Result<(), OffsetManagerError>
@@ -219,7 +229,7 @@ impl CommitOffsetInTx for LocalDbOffsetManager {
     {
         let row = offset_row::ActiveModel {
             consumer_group_id: Set(group.as_uuid()),
-            topic_id: Set(topic.as_uuid()),
+            topic: Set(topic.to_string()),
             partition: Set(partition_to_i32(partition)?),
             offset: Set(offset.as_i64()),
             updated_at: Set(chrono::Utc::now()),
@@ -234,7 +244,7 @@ impl CommitOffsetInTx for LocalDbOffsetManager {
             .on_conflict_raw(
                 OnConflict::columns([
                     offset_row::Column::ConsumerGroupId,
-                    offset_row::Column::TopicId,
+                    offset_row::Column::Topic,
                     offset_row::Column::Partition,
                 ])
                 .update_columns([offset_row::Column::Offset, offset_row::Column::UpdatedAt])
@@ -287,18 +297,18 @@ impl OffsetStore for InMemoryOffsetManager {
     async fn load_position(
         &self,
         group: &ConsumerGroupId,
-        topic: &TopicId,
+        topic: &GtsInstanceId,
         partition: u32,
     ) -> Result<Position, OffsetManagerError> {
         let guard = self
             .inner
             .lock()
             .map_err(|_| OffsetManagerError::Internal("mutex poisoned".into()))?;
-        if let Some(&stored) = guard.get(&(*group, *topic, partition)) {
+        if let Some(&stored) = guard.get(&(*group, topic.clone(), partition)) {
             return Ok(Position::Exact(stored));
         }
         drop(guard);
-        if let Some(&off) = self.overrides.get(&(*topic, partition)) {
+        if let Some(&off) = self.overrides.get(&(topic.clone(), partition)) {
             return Ok(Position::Exact(off));
         }
         Ok(self.fallback.into())
@@ -310,7 +320,7 @@ impl CommitOffset for InMemoryOffsetManager {
     async fn commit(
         &self,
         group: &ConsumerGroupId,
-        topic: &TopicId,
+        topic: &GtsInstanceId,
         partition: u32,
         offset: Sequence,
     ) -> Result<(), OffsetManagerError> {
@@ -319,7 +329,7 @@ impl CommitOffset for InMemoryOffsetManager {
             .lock()
             .map_err(|_| OffsetManagerError::Internal("mutex poisoned".into()))?;
         let entry = guard
-            .entry((*group, *topic, partition))
+            .entry((*group, topic.clone(), partition))
             .or_insert(Sequence::NONE);
         *entry = (*entry).max(offset);
         Ok(())

@@ -6,7 +6,7 @@ use event_broker_sdk::backend::{
     AppendRequest, Appended, Backend, BackendError, Dedup, Fence, FenceKey, FenceSeq, Flush, Head,
     KeyedEvent, LogClaim, LogId, Partition, Replacing, Retention, TopicPartition, TopicSpec, Wait,
 };
-use event_broker_sdk::models::Event;
+use event_broker_sdk::models::{Event, IngestStamp};
 use event_broker_sdk::{GtsInstanceId, GtsTypeId, PartitionRange, Position, Sequence};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -19,6 +19,9 @@ const OCCURRED: i64 = 1_767_225_600; // 2026-01-01T00:00:00Z
 fn topic() -> GtsInstanceId {
     GtsInstanceId::try_new("gts.cf.core.events.topic.v1~acme.orders.x.topic.v1").expect("valid id")
 }
+
+/// The Registry Reference the tests hand the backend for `topic()`.
+const TOPIC_REFERENCE: Uuid = Uuid::from_u128(0x7091);
 
 fn at(partition: u32) -> TopicPartition {
     TopicPartition::new(topic(), Partition::new(partition))
@@ -35,14 +38,16 @@ fn time(seconds: i64) -> DateTime<Utc> {
 fn event(id: u128, occurred_at: DateTime<Utc>) -> Event {
     Event {
         id: Uuid::from_u128(id),
-        type_id: GtsTypeId::new("gts.cf.core.events.event.v1~acme.orders.x.created.v1~"),
-        tenant_id: Uuid::from_u128(100),
+        event_type: GtsTypeId::new("gts.cf.core.events.event.v1~acme.orders.x.created.v1~"),
+        subject_tenant: Uuid::from_u128(100),
         source: "svc".to_owned(),
         subject: "s".to_owned(),
         subject_type: GtsTypeId::new("gts.acme.orders.x.order.v1~"),
+        subject_owner: None,
         occurred_at,
         trace_parent: None,
         data: Some(serde_json::json!({ "n": 1 })),
+        ingest: None,
         partition: None,
         sequence: None,
         sequence_time: None,
@@ -85,6 +90,7 @@ fn provisioned(store: &Store, retention: Retention) {
         .provision(
             &TopicSpec {
                 topic: topic(),
+                uuid: TOPIC_REFERENCE,
                 partitions: 2,
                 retention,
             },
@@ -156,6 +162,42 @@ fn append_assigns_partition_and_sequence_and_answers_heads() {
     assert_eq!(
         debug(&store.read(&at(1), Sequence::NONE, 10).unwrap()),
         debug(&[stored(2, time(OCCURRED), 1, 1, now)])
+    );
+}
+
+/// A stored event keeps its owner and its ingest stamp.
+#[test]
+fn a_stored_event_keeps_its_owner_and_ingest_stamp() {
+    let store = Store::default();
+    provisioned(&store, Retention::default());
+    let now = time(OCCURRED + 5);
+    let owned = |id| Event {
+        subject_owner: Some(Uuid::from_u128(0x0e)),
+        ingest: Some(IngestStamp {
+            tenant: Uuid::from_u128(0x7e),
+            actor: Uuid::from_u128(0xac),
+        }),
+        ..event(id, time(OCCURRED))
+    };
+
+    append(
+        &store,
+        1,
+        &[KeyedEvent {
+            key: "a".to_owned(),
+            event: owned(1),
+        }],
+        now,
+    );
+
+    assert_eq!(
+        debug(&store.read(&at(0), Sequence::NONE, 10).unwrap()),
+        debug(&[Event {
+            partition: Some(0),
+            sequence: Some(Sequence::assigned(1)),
+            sequence_time: Some(now),
+            ..owned(1)
+        }])
     );
 }
 
@@ -615,6 +657,7 @@ async fn a_waiting_read_returns_on_append() {
         .provision(
             &TopicSpec {
                 topic: topic(),
+                uuid: TOPIC_REFERENCE,
                 partitions: 2,
                 retention: Retention::default(),
             },
@@ -659,6 +702,7 @@ async fn fill_past_the_bound(backend: &MemoryBackend) {
         .provision(
             &TopicSpec {
                 topic: topic(),
+                uuid: TOPIC_REFERENCE,
                 partitions: 2,
                 retention: Retention {
                     max_age: None,

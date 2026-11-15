@@ -2,7 +2,7 @@
 //!
 //! These types are the transport's own; they carry serde so the public SDK
 //! models do not. Field names, renames, `deny_unknown_fields`, the `kind`-tagged
-//! frame enum and the untagged `max_depth`/`seek value` shapes reproduce the
+//! frame enum and the untagged `seek value` shape reproduce the
 //! server DTOs in `event-broker/src/api/rest/handlers/{ingest,delivery}/dto.rs`
 //! exactly (the server applies `#[serde(rename_all = "snake_case")]` via
 //! `#[toolkit_macros::api_dto]`, matched here). Sequences travel as bare `i64`
@@ -48,7 +48,7 @@ pub(crate) struct PageInfoWire {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) struct MetaWire {
     pub version: i32,
-    pub producer_id: Option<Uuid>,
+    pub producer: Option<Uuid>,
     pub previous: Option<i64>,
     pub sequence: Option<i64>,
 }
@@ -59,10 +59,12 @@ pub(crate) struct PublishEventWire {
     pub id: Uuid,
     #[serde(rename = "type")]
     pub type_id: GtsTypeId,
-    pub tenant_id: Uuid,
+    pub subject_tenant: Uuid,
     pub source: String,
     pub subject: String,
     pub subject_type: GtsTypeId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_owner: Option<Uuid>,
     pub occurred_at: chrono::DateTime<chrono::Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_parent: Option<String>,
@@ -98,7 +100,7 @@ impl TryFrom<&EventV1> for PublishEventWire {
                 })?;
                 Ok::<_, EventBrokerError>(MetaWire {
                     version,
-                    producer_id: meta.producer_id,
+                    producer: meta.producer,
                     previous: meta.previous,
                     sequence: meta.sequence,
                 })
@@ -107,10 +109,11 @@ impl TryFrom<&EventV1> for PublishEventWire {
         Ok(Self {
             id: event.id(),
             type_id: event.event_type().clone(),
-            tenant_id: event.tenant_id(),
+            subject_tenant: event.subject_tenant(),
             source: source.to_owned(),
             subject: event.subject().to_owned(),
             subject_type: event.subject_type().clone(),
+            subject_owner: event.subject_owner(),
             occurred_at: event.occurred_at(),
             trace_parent: event.trace_parent().map(str::to_owned),
             data: event.data().cloned(),
@@ -161,7 +164,7 @@ pub(crate) struct ProducerTopicCursorsWire {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) struct ProducerCursorsResponseWire {
-    pub producer_id: Uuid,
+    pub id: Uuid,
     pub client_agent: String,
     pub topics: Vec<ProducerTopicCursorsWire>,
 }
@@ -169,7 +172,7 @@ pub(crate) struct ProducerCursorsResponseWire {
 impl From<ProducerCursorsResponseWire> for crate::api::ProducerCursors {
     fn from(w: ProducerCursorsResponseWire) -> Self {
         Self {
-            producer_id: crate::ids::ProducerId(w.producer_id),
+            id: crate::ids::ProducerId(w.id),
             client_agent: w.client_agent,
             topics: w
                 .topics
@@ -300,8 +303,8 @@ impl From<ConsumerGroupKindWire> for crate::models::ConsumerGroupKind {
 pub(crate) struct ConsumerGroupWire {
     pub id: String,
     pub kind: ConsumerGroupKindWire,
-    pub tenant_id: Uuid,
-    pub owner_principal_id: Uuid,
+    pub tenant: Uuid,
+    pub owner_principal: Uuid,
     pub description: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
@@ -317,19 +320,32 @@ pub(crate) struct FilterSpecWire {
     pub expression: String,
 }
 
-/// Untagged tri-state: an integer depth, or an explicit JSON `null` for
-/// unbounded. Matches the server's `MaxDepthDto` (whose `#[serde(default)]` is
-/// `Levels(0)` - current tenant only).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(untagged)]
-pub(crate) enum MaxDepthWire {
-    Unlimited,
-    Levels(i32),
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OwnershipFilterWire {
+    #[default]
+    OnlyMine,
+    EntireTenant,
+    TenantSubtreeIncluded,
 }
 
-impl Default for MaxDepthWire {
-    fn default() -> Self {
-        Self::Levels(0)
+impl From<crate::api::OwnershipFilter> for OwnershipFilterWire {
+    fn from(filter: crate::api::OwnershipFilter) -> Self {
+        match filter {
+            crate::api::OwnershipFilter::OnlyMine => Self::OnlyMine,
+            crate::api::OwnershipFilter::EntireTenant => Self::EntireTenant,
+            crate::api::OwnershipFilter::TenantSubtreeIncluded => Self::TenantSubtreeIncluded,
+        }
+    }
+}
+
+impl From<OwnershipFilterWire> for crate::api::OwnershipFilter {
+    fn from(filter: OwnershipFilterWire) -> Self {
+        match filter {
+            OwnershipFilterWire::OnlyMine => Self::OnlyMine,
+            OwnershipFilterWire::EntireTenant => Self::EntireTenant,
+            OwnershipFilterWire::TenantSubtreeIncluded => Self::TenantSubtreeIncluded,
+        }
     }
 }
 
@@ -354,12 +370,16 @@ impl From<crate::api::BarrierMode> for BarrierModeWire {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) struct InterestWire {
     pub topic: GtsInstanceId,
-    pub tenant_id: Uuid,
+    /// Absent for the caller's own tenant, which the broker resolves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_tenant: Option<Uuid>,
     #[serde(default)]
-    pub max_depth: MaxDepthWire,
+    pub ownership_filter: OwnershipFilterWire,
     #[serde(default)]
     pub barrier_mode: BarrierModeWire,
     pub types: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subject_types: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<FilterSpecWire>,
 }
@@ -385,10 +405,13 @@ pub(crate) struct FilterSpecResponseWire {
 #[serde(rename_all = "snake_case")]
 pub(crate) struct InterestResponseWire {
     pub topic: GtsInstanceId,
-    pub tenant_id: Uuid,
-    pub max_depth: Option<i32>,
+    pub subject_tenant: Uuid,
+    pub ownership_filter: OwnershipFilterWire,
     pub barrier_mode: String,
     pub types: Vec<String>,
+    /// Absent from the server's echo when the interest has no subject-type selector.
+    #[serde(default)]
+    pub subject_types: Vec<String>,
     pub filter: Option<FilterSpecResponseWire>,
 }
 
@@ -406,6 +429,31 @@ pub(crate) struct SubscriptionWire {
     pub consumer_group: String,
     pub client_agent: String,
     pub interests: Vec<InterestResponseWire>,
+    pub assigned: Vec<AssignedPartitionWire>,
+    pub topology_version: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One interest of the JOIN response: the echo, plus the entries of its
+/// `types` that matched no registered event type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct JoinInterestResponseWire {
+    #[serde(flatten)]
+    pub interest: InterestResponseWire,
+    #[serde(default)]
+    pub unmatched_types: Vec<String>,
+}
+
+/// The JOIN `201` body: the subscription, with each interest carrying its
+/// `unmatched_types`. A read or a listing answers [`SubscriptionWire`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct JoinSubscriptionResponseWire {
+    pub id: Uuid,
+    pub consumer_group: String,
+    pub client_agent: String,
+    pub interests: Vec<JoinInterestResponseWire>,
     pub assigned: Vec<AssignedPartitionWire>,
     pub topology_version: i64,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -508,17 +556,20 @@ impl SeekResponseWire {
 // Delivery: stream frames (kind-tagged), mirroring the server `FrameDto`.
 // ---------------------------------------------------------------------------
 
+/// The `payload` of an `event` frame. It refuses no unknown member, so a member a newer
+/// broker adds, or the `topic` an older broker still sends, does not stop the consumer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) struct EventPayloadWire {
     pub id: Uuid,
     #[serde(rename = "type")]
     pub type_id: GtsTypeId,
-    pub topic: GtsInstanceId,
-    pub tenant_id: Uuid,
+    pub subject_tenant: Uuid,
     pub source: String,
     pub subject: String,
     pub subject_type: GtsTypeId,
+    #[serde(default)]
+    pub subject_owner: Option<Uuid>,
     pub occurred_at: chrono::DateTime<chrono::Utc>,
     pub trace_parent: Option<String>,
     pub data: JsonValue,
@@ -570,11 +621,15 @@ impl EventPayloadWire {
         };
         let builder = builder
             .id(self.id)
-            .tenant_id(self.tenant_id)
+            .subject_tenant(self.subject_tenant)
             .source(self.source)
             .subject(self.subject)
-            .subject_type_id(self.subject_type)
+            .subject_type_of(self.subject_type)
             .occurred_at(self.occurred_at);
+        let builder = match self.subject_owner {
+            Some(owner) => builder.subject_owner(owner),
+            None => builder,
+        };
         let builder = match trace_parent {
             Some(trace_parent) => builder.trace_parent(trace_parent),
             None => builder,

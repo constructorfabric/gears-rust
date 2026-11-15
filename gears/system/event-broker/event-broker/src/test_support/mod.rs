@@ -1,4 +1,4 @@
-//! Shared test fixtures (`DESIGN.md:614`) - real cluster-mode wiring for
+//! Shared test fixtures (`DESIGN.md` "Module Structure") - real cluster-mode wiring for
 //! dispatcher tests (`eb-dispatcher-routing`), not the comment-only shell
 //! `gears-rust#4427` removed. `harness`/`api_v1`/`request`/`response`/`body`
 //! (`eb-rest-handlers`) are the HTTP integration-test harness for this
@@ -56,10 +56,11 @@ pub mod pause;
 pub mod request;
 pub mod response;
 pub mod single_backend;
+pub mod spec_query_hook;
 pub mod tables;
 pub mod type_registry;
 
-pub use authz_doubles::DenyingAuthZ;
+pub use authz_doubles::{DenyingAuthZ, Grant, PolicyAuthZ, PolicyAuthZError, Tenant};
 #[allow(
     unused_imports,
     reason = "general-purpose harness API surface, not all of it exercised yet"
@@ -92,6 +93,7 @@ pub use request::RequestCase;
 )]
 pub use response::TestResponse;
 pub use single_backend::SingleBackendResolver;
+pub use spec_query_hook::{SpecQuery, SpecQueryHook};
 pub use type_registry::StaticTypesRegistry;
 
 /// The GTS **type** identifier an event names, for a test that builds an

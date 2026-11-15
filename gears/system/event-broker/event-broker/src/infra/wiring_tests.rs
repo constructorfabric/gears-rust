@@ -85,7 +85,7 @@ async fn the_wired_loader_fills_the_cache_the_delivery_service_holds() {
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": EVENT_TYPE,
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-the_wired_loader_fills_the_cache",
             "subject": "s-the_wired_loader_fills_the_cache",
             "subject_type": "gts.x.eb.t1.subject.v1~",

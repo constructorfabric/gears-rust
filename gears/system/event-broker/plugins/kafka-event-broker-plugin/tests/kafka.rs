@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use event_broker_sdk::backend::support::topic_uuid;
+use event_broker_sdk::backend::support::partition_for;
 use event_broker_sdk::backend::{
     AppendRequest, Appended, Backend, BackendError, Fence, FenceKey, FenceSeq, Flush, Head,
     KeyedEvent, LogClaim, LogId, Partition, Provisioning, Replacing, Retention, TopicPartition,
@@ -24,10 +24,11 @@ use event_broker_sdk::backend::{
 };
 use event_broker_sdk::models::Event;
 use event_broker_sdk::{GtsInstanceId, GtsTypeId, Position, Sequence};
-use rdkafka::ClientConfig;
 use rdkafka::admin::{AdminClient, AdminOptions, ResourceSpecifier};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::consumer::{BaseConsumer, Consumer};
+use rdkafka::error::KafkaError;
+use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -50,16 +51,18 @@ fn event(n: u64) -> KeyedEvent {
         key: "k".to_owned(),
         event: Event {
             id: Uuid::from_u128(0x6b61_0000 + u128::from(n)),
-            type_id: GtsTypeId::new(toolkit_gts::gts_id!(
+            event_type: GtsTypeId::new(toolkit_gts::gts_id!(
                 "cf.core.events.event.v1~cf.kafkatest.x.happened.v1~"
             )),
-            tenant_id: Uuid::from_u128(0x7e4a_0001),
+            subject_tenant: Uuid::from_u128(0x7e4a_0001),
             source: "kafka-test".to_owned(),
             subject: format!("k-{n}"),
             subject_type: GtsTypeId::new(toolkit_gts::gts_id!("cf.kafkatest.x.thing.v1~")),
+            subject_owner: None,
             occurred_at: Utc::now(),
             trace_parent: None,
             data: Some(serde_json::json!({ "n": n })),
+            ingest: None,
             partition: None,
             sequence: None,
             sequence_time: None,
@@ -111,6 +114,7 @@ async fn provisioned(backend: &dyn Backend, spec: &TopicSpec) -> LogId {
 fn spec(name: &str, partitions: u32, retention: Retention) -> TopicSpec {
     TopicSpec {
         topic: topic(name),
+        uuid: Uuid::new_v4(),
         partitions,
         retention,
     }
@@ -242,14 +246,10 @@ async fn provisioning_is_pending_until_the_topic_exists() {
     );
 }
 
-/// The configuration of the Kafka topic named for `topic` under `prefix`,
+/// The configuration of the Kafka topic named for `spec` under `prefix`,
 /// for the settings the plugin owns.
-async fn topic_config(
-    bootstrap: &str,
-    prefix: &str,
-    topic: &GtsInstanceId,
-) -> BTreeMap<String, String> {
-    let name = format!("{prefix}.{}", topic_uuid(topic).simple());
+async fn topic_config(bootstrap: &str, prefix: &str, spec: &TopicSpec) -> BTreeMap<String, String> {
+    let name = format!("{prefix}.{}", spec.uuid.simple());
     let described = admin(bootstrap)
         .describe_configs([&ResourceSpecifier::Topic(&name)], &AdminOptions::new())
         .await
@@ -291,7 +291,7 @@ async fn a_retention_change_reconfigures_the_topic() {
         },
     );
     let log = provisioned(backend.as_ref(), &spec).await;
-    let before = topic_config(&cluster.bootstrap, &prefix, &spec.topic).await;
+    let before = topic_config(&cluster.bootstrap, &prefix, &spec).await;
 
     spec.retention = Retention {
         max_age: Some(Duration::from_hours(2)),
@@ -307,7 +307,7 @@ async fn a_retention_change_reconfigures_the_topic() {
         )
         .await
         .expect("provision again");
-    let after = topic_config(&cluster.bootstrap, &prefix, &spec.topic).await;
+    let after = topic_config(&cluster.bootstrap, &prefix, &spec).await;
 
     let config = |pairs: [(&str, &str); 6]| -> BTreeMap<String, String> {
         pairs
@@ -403,20 +403,224 @@ async fn a_restart_keeps_events_heads_and_the_log() {
     assert_eq!(ns(second.as_ref(), &spec.topic).await, [1, 2, 3]);
 }
 
-/// The last stable offset of partition 0 of `topic`'s Kafka topic, as a
+/// The last stable offset of partition 0 of `spec`'s Kafka topic, as a
 /// `read_committed` consumer sees it.
-fn stable_offset(bootstrap: &str, prefix: &str, topic: &GtsInstanceId) -> i64 {
+fn stable_offset(bootstrap: &str, prefix: &str, spec: &TopicSpec) -> i64 {
     let consumer: BaseConsumer = ClientConfig::new()
         .set("bootstrap.servers", bootstrap)
         .set("group.id", "kafka-test")
         .set("isolation.level", "read_committed")
         .create()
         .expect("consumer");
-    let name = format!("{prefix}.{}", topic_uuid(topic).simple());
+    let name = format!("{prefix}.{}", spec.uuid.simple());
     consumer
         .fetch_watermarks(&name, 0, Duration::from_secs(10))
         .expect("watermarks")
         .1
+}
+
+/// The partition count of the Kafka topic `name`; `None` when the cluster
+/// reports no such topic, or an error for it.
+fn kafka_partitions(bootstrap: &str, name: &str) -> Option<usize> {
+    let consumer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", bootstrap)
+        .create()
+        .expect("consumer");
+    let metadata = consumer
+        .fetch_metadata(Some(name), Duration::from_secs(10))
+        .expect("metadata");
+    metadata
+        .topics()
+        .iter()
+        .find(|t| t.name() == name && t.error().is_none())
+        .map(|t| t.partitions().len())
+}
+
+/// Every committed record of the logs topic under `prefix`, the last value per
+/// key, decoded as JSON.
+fn log_records(bootstrap: &str, prefix: &str) -> BTreeMap<Vec<u8>, serde_json::Value> {
+    let consumer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", bootstrap)
+        .set("group.id", "kafka-test")
+        .set("isolation.level", "read_committed")
+        .set("enable.auto.commit", "false")
+        .set("enable.partition.eof", "true")
+        .create()
+        .expect("consumer");
+    let mut assignment = TopicPartitionList::new();
+    assignment
+        .add_partition_offset(&format!("{prefix}.logs"), 0, Offset::Beginning)
+        .expect("partition");
+    consumer.assign(&assignment).expect("assign");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut records = BTreeMap::new();
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the logs topic was not read to its end within 30s"
+        );
+        match consumer.poll(Duration::from_secs(1)) {
+            None => {}
+            Some(Err(KafkaError::PartitionEOF(_))) => return records,
+            Some(Err(err)) => panic!("logs topic: {err}"),
+            Some(Ok(message)) => {
+                let key = message.key().expect("a keyed record").to_vec();
+                let value = serde_json::from_slice(message.payload().expect("a value"))
+                    .expect("a JSON record");
+                records.insert(key, value);
+            }
+        }
+    }
+}
+
+/// Provisions `spec` under `claim`, waiting out `Pending`.
+async fn answer(
+    backend: &dyn Backend,
+    spec: &TopicSpec,
+    claim: &LogClaim,
+) -> Result<Provisioning, BackendError> {
+    for _ in 0..100 {
+        match backend.provision(spec, claim).await {
+            Ok(Provisioning::Pending) => tokio::time::sleep(Duration::from_millis(100)).await,
+            other => return other,
+        }
+    }
+    panic!("provisioning stayed Pending");
+}
+
+/// A topic is provisioned under the reference its spec carries: the Kafka
+/// event topic is named by it, and the logs topic holds the topic's record
+/// under its GTS id. An instance that never provisioned the topic finds it
+/// through that record and appends to the same Kafka topic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_topic_is_stored_and_found_under_its_registry_reference() {
+    let cluster = common::cluster("reference").await;
+    let prefix = common::fresh_prefix();
+    let first = common::backend(&cluster.bootstrap, &prefix).await;
+    // A fixed reference, not derived from the topic's id, so only the spec
+    // can name the Kafka topic.
+    let spec = TopicSpec {
+        uuid: Uuid::from_u128(0x5ee1),
+        ..spec("reference", 2, KEEP)
+    };
+    let log = provisioned(first.as_ref(), &spec).await;
+    let partitions = kafka_partitions(
+        &cluster.bootstrap,
+        &format!("{prefix}.00000000000000000000000000005ee1"),
+    );
+    let records = log_records(&cluster.bootstrap, &prefix);
+
+    let second = common::backend(&cluster.bootstrap, &prefix).await;
+    let at = TopicPartition::new(spec.topic.clone(), partition_for("k", 2));
+    let key = FenceKey::new(Uuid::new_v4().as_u128());
+    let appended = append(second.as_ref(), fence(key, 1), &spec.topic, &[event(1)]).await;
+    let sequences = |events: Vec<Event>| -> Vec<i64> {
+        events
+            .iter()
+            .map(|e| e.sequence.expect("sequence").as_i64())
+            .collect()
+    };
+    let read_second = sequences(
+        second
+            .read(&at, Sequence::NONE, 10, Wait::No)
+            .await
+            .expect("read"),
+    );
+    let read_first = sequences(
+        first
+            .read(&at, Sequence::NONE, 10, Wait::No)
+            .await
+            .expect("read"),
+    );
+
+    assert_eq!(partitions, Some(2));
+    assert_eq!(
+        records,
+        BTreeMap::from([(
+            spec.topic.as_ref().as_bytes().to_vec(),
+            serde_json::json!({
+                "v": 1,
+                "topic": spec.topic.as_ref(),
+                "uuid": "00000000-0000-0000-0000-000000005ee1",
+                "log_id": log.uuid().to_string(),
+                "partitions": 2,
+            }),
+        )])
+    );
+    assert_eq!(
+        appended,
+        Appended::Heads(vec![Head {
+            at: at.clone(),
+            sequence: Sequence::assigned(1),
+        }])
+    );
+    assert_eq!((read_second, read_first), (vec![1], vec![1]));
+}
+
+/// Provisioning a provisioned topic under another reference is refused
+/// before its claim is checked, for a fresh log id and for the stored one,
+/// and nothing is created or written: no Kafka topic under the other
+/// reference, and the log record unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_reference_for_a_provisioned_topic_is_refused() {
+    let cluster = common::cluster("second-reference").await;
+    let prefix = common::fresh_prefix();
+    let backend = common::backend(&cluster.bootstrap, &prefix).await;
+    let spec = TopicSpec {
+        uuid: Uuid::from_u128(0x5ee1),
+        ..spec("second-reference", 1, KEEP)
+    };
+    let log = provisioned(backend.as_ref(), &spec).await;
+    let other = TopicSpec {
+        uuid: Uuid::from_u128(0x5ee2),
+        ..spec.clone()
+    };
+
+    let fresh = answer(
+        backend.as_ref(),
+        &other,
+        &LogClaim {
+            replacing: Replacing::Nothing,
+            new: LogId::new_v4(),
+        },
+    )
+    .await;
+    let resumed = answer(
+        backend.as_ref(),
+        &other,
+        &LogClaim {
+            replacing: Replacing::Nothing,
+            new: log,
+        },
+    )
+    .await;
+    let partitions = kafka_partitions(
+        &cluster.bootstrap,
+        &format!("{prefix}.00000000000000000000000000005ee2"),
+    );
+    let records = log_records(&cluster.bootstrap, &prefix);
+
+    assert_eq!(
+        [format!("{fresh:?}"), format!("{resumed:?}")],
+        [
+            r#"Err(Internal("provision: the topic's log record names another reference"))"#,
+            r#"Err(Internal("provision: the topic's log record names another reference"))"#,
+        ]
+    );
+    assert_eq!(partitions, None);
+    assert_eq!(
+        records,
+        BTreeMap::from([(
+            spec.topic.as_ref().as_bytes().to_vec(),
+            serde_json::json!({
+                "v": 1,
+                "topic": spec.topic.as_ref(),
+                "uuid": "00000000-0000-0000-0000-000000005ee1",
+                "log_id": log.uuid().to_string(),
+                "partitions": 1,
+            }),
+        )])
+    );
 }
 
 /// The head an append reports, `Latest` and the head a watch starts from
@@ -455,7 +659,7 @@ async fn heads_are_the_last_event_never_the_watermark() {
         .iter()
         .map(|e| e.sequence.expect("sequence").as_i64())
         .collect();
-    let stable = stable_offset(&cluster.bootstrap, &prefix, &spec.topic);
+    let stable = stable_offset(&cluster.bootstrap, &prefix, &spec);
 
     let head = |sequence| {
         Appended::Heads(vec![Head {
@@ -670,10 +874,10 @@ async fn stop_waits_for_an_append_in_flight() {
     };
     tokio::time::sleep(Duration::from_millis(2)).await;
     backend.stop(CancellationToken::new()).await;
-    let at_stop = stable_offset(&cluster.bootstrap, &prefix, &spec.topic);
+    let at_stop = stable_offset(&cluster.bootstrap, &prefix, &spec);
     let outcome = appending.await.expect("append task");
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let later = stable_offset(&cluster.bootstrap, &prefix, &spec.topic);
+    let later = stable_offset(&cluster.bootstrap, &prefix, &spec);
 
     assert_eq!(
         later, at_stop,

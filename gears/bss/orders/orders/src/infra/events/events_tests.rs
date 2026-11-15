@@ -94,7 +94,7 @@ async fn the_platform_registry_lists_the_event_contract_from_the_inventory() {
         if id == EVENT_BASE {
             assert_eq!(
                 schema.effective_traits,
-                Some(json!({"allowed_subject_types": [], "partition_key": "/tenant_id"})),
+                Some(json!({"allowed_subject_types": [], "partition_key": "/subject_tenant"})),
                 "the abstract family base declares no publishable traits"
             );
             assert_eq!(schema.content, Some(schema::abstract_base()), "{id}");

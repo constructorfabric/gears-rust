@@ -23,9 +23,9 @@ pub trait StreamLeases: Send + Sync {
     /// `subscription_id`.
     fn acquire(&self, subscription_id: Uuid) -> Option<StreamLease>;
 
-    /// Whether a stream is open. Every call carrying a subscription id except
-    /// `DELETE` consults this - a second `:stream`, a `:seek`, and a plain
-    /// `GET` all conflict with an open stream.
+    /// Whether a stream is open. `:seek` asks this; a second `:stream` or `:sse`
+    /// is refused by `acquire` instead. `GET` and `DELETE` do not consult the
+    /// lease: a `GET` is answered during a stream, and a `DELETE` ends it.
     fn is_held(&self, subscription_id: Uuid) -> bool;
 }
 

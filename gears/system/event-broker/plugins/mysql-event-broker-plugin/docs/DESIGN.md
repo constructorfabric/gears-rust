@@ -66,7 +66,7 @@ Created by the plugin's migration (`src/migrations/0001_plugin_tables.sql`, whic
 
 | Table | One row per | Holds |
 |---|---|---|
-| `evbk__log` | topic | `topic_uuid BINARY(16)` (`GtsId::to_uuid`), `topic_id VARCHAR(1024)`, `log_id BINARY(16)` (feature 0006), `partitions`, `max_age_ms`, `max_bytes` (NULL = unbounded), `provisioned_at DATETIME(6)` |
+| `evbk__log` | topic | `topic_uuid BINARY(16)` (`TopicSpec.uuid`, the topic's Registry Reference), `topic_id VARCHAR(1024) CHARACTER SET ascii COLLATE ascii_bin` with the unique key `uq_evbk__log__topic_id`, `log_id BINARY(16)` (feature 0006), `partitions`, `max_age_ms`, `max_bytes` (NULL = unbounded), `provisioned_at DATETIME(6)` |
 | `evbk__partition` | (topic, partition) | `table_name VARCHAR(64)` as created (authoritative), `hwm` (highest sequence ever assigned), `bytes` (weight of every event ever appended); append's row |
 | `evbk__retention` | (topic, partition) | `floor_seq` (highest removed sequence: stored = `(floor_seq, hwm]`), `removed_bytes` (weight of the expired segments); retention's row, apart from append's so the two never wait on each other |
 | `evbk__segment` | segment | `[first_seq, end_seq)`, `segment_name` (the range partition, as created), `state` (§2.3), `bytes` and `newest_at` once sealed, `changed_at` |
@@ -82,7 +82,7 @@ Each (topic, partition) has one table, `evbk__{topic_uuid}_p{partition}` (44 byt
 |---|---|---|
 | `seq` | `BIGINT` | primary key, the partitioning column |
 | `seq_time` | `DATETIME(6)` | when the append stored it; never below the previous event's, so it rises with `seq` even across a server clock stepped back (§4.2) |
-| `tenant_id` | `BINARY(16)` | |
+| `subject_tenant` | `BINARY(16)` | |
 | `cum_bytes` | `BIGINT` | the partition's running weight through this event |
 | `body` | `LONGBLOB` | everything else, as versioned JSON (`src/body.rs`); `meta` and the positions are not stored |
 
@@ -159,7 +159,7 @@ A statement or transaction chosen as a deadlock victim (`1213`) - by `InnoDB`, o
 ### 4.1 provision
 
 1. Refuse a partition count outside `1..=9999` (`InvalidConfig`): four digits keep every name within 64 bytes.
-2. In one transaction: `INSERT IGNORE` the `evbk__log` row (skipped for a `Held` claim, which never creates), read it back `FOR UPDATE`, refuse what `LogClaim::check` refuses (`LogConflict` for a foreign log id; `NotProvisioned` for a `Held` claim with no row, and so creates no row and no table), set the claim's id and the spec's retention (an age above 100 years is stored as 100 years), and insert the `evbk__partition` and `evbk__retention` rows of each partition that has none. A partition keeps the table name it was given first.
+2. In one transaction: `INSERT IGNORE` the `evbk__log` row (skipped for a `Held` claim, which never creates), read it back `FOR UPDATE`, refuse what `LogClaim::check` refuses (`LogConflict` for a foreign log id; `NotProvisioned` for a `Held` claim with no row, and so creates no row and no table), set the claim's id and the spec's retention (an age above 100 years is stored as 100 years), and insert the `evbk__partition` and `evbk__retention` rows of each partition that has none. A partition keeps the table name it was given first. An `INSERT IGNORE` skipped by `uq_evbk__log__topic_id` (the topic is held under another reference, which types-registry never hands out) leaves no row under `TopicSpec.uuid`: the transaction rolls back, nothing is written, and the call is `Internal` (`provision: evbk__log holds no row after the insert`).
 3. For each partition whose table the server does not hold: a maintenance run (§4.9) under the partition's named lock, waiting up to 5 s for it, which records the first segments `adding`, creates the table with them, and opens them. A busy lock answers `Pending`.
 4. `Ready` with the partition count the log row holds.
 
@@ -167,7 +167,7 @@ A re-provision of a written topic finds every table and takes no lock and runs n
 
 ### 4.2 append
 
-1. Refuse more than 1000 events (`AppendFailed`). Look the topic up (cached for the life of the process): no log row is `NotProvisioned`, checked before the fence, so a fence that has passed this seq is no answer for a topic the backend does not hold.
+1. Refuse more than 1000 events (`AppendFailed`). Look the topic up by `topic_id` (cached for the life of the process): no log row is `NotProvisioned`, checked before the fence, so a fence that has passed this seq is no answer for a topic the backend does not hold.
 2. Group the events by partition and encode them, before any transaction opens.
 3. In one transaction:
    1. the fence: `SELECT last_seq ... FOR UPDATE`; at or above the seq is `Duplicate` and nothing is written; below it, `UPDATE`; no row, `INSERT`, and a duplicate-key error from a concurrent first applier reads the row again;
@@ -279,6 +279,7 @@ backends:
 | `1044`, `1045`, `1698`, `1227`, `1142` (access denied) | `Unavailable`, logged as access denied |
 | No `evbk__log` row | `NotProvisioned` |
 | Foreign log id at provisioning | `LogConflict` |
+| A second reference for a provisioned topic: no `evbk__log` row after a creating insert (§4.1) | `Internal` |
 | `Exact(n)` outside `[Earliest, Latest]` | `OffsetOutOfRange` |
 | Unknown or invalid setting, or a partition count outside `1..=9999` | `InvalidConfig` |
 | Any other server error in `append`, `1146` (missing table: a table dropped by hand, or one a concurrent provisioning has not created yet) included | `AppendFailed` |

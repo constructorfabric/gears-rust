@@ -65,7 +65,7 @@ async fn publish_event_happy_path_returns_202_accepted() {
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_happy_path_returns_202_accepted",
             "subject": "s-publish_event_happy_path_returns_202_accepted",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -107,7 +107,7 @@ async fn publish_event_prefer_wait_returns_201_once_stored() {
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_prefer_wait_returns_201",
             "subject": "s-publish_event_prefer_wait_returns_201",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -153,7 +153,7 @@ async fn publish_event_prefer_wait_returns_202_when_the_wait_elapses() {
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_prefer_wait_returns_202",
             "subject": "s-publish_event_prefer_wait_returns_202",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -198,7 +198,7 @@ async fn publish_event_prefer_nonzero_wait_that_runs_out_returns_202() {
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_prefer_nonzero_wait_that_runs_out",
             "subject": "s-publish_event_prefer_nonzero_wait_that_runs_out",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -241,7 +241,7 @@ async fn publish_event_prefer_wait_beyond_u64_saturates_to_the_cap() {
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_prefer_wait_beyond_u64",
             "subject": "s-publish_event_prefer_wait_beyond_u64",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -286,7 +286,7 @@ async fn publish_event_prefer_wait_with_a_malformed_value_returns_400() {
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_prefer_wait_malformed",
             "subject": "s-publish_event_prefer_wait_malformed",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -346,7 +346,7 @@ async fn publish_event_prefer_wait_above_the_cap_clamps_and_reports_the_applied_
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_prefer_wait_above_cap",
             "subject": "s-publish_event_prefer_wait_above_cap",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -385,7 +385,7 @@ async fn publish_event_prefer_bare_wait_uses_the_cap() {
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_prefer_bare_wait",
             "subject": "s-publish_event_prefer_bare_wait",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -419,7 +419,7 @@ async fn an_async_publish_carries_no_preference_applied_header() {
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-async-no-preference-applied",
             "subject": "s-async-no-preference-applied",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -444,7 +444,7 @@ async fn publish_event_prefer_wait_malformed_enqueues_nothing() {
     let producer = register_test_producer(&harness).await;
     let tenant_id = Uuid::from_u128(0x4a11_defe);
     let event_id = Uuid::from_u128(0x4a11_0001);
-    let meta = json!({ "version": 1, "producer_id": producer, "previous": 0, "sequence": 1 });
+    let meta = json!({ "version": 1, "producer": producer, "previous": 0, "sequence": 1 });
 
     // Malformed `Prefer: wait` on the first chain link: rejected `400`.
     harness
@@ -457,7 +457,7 @@ async fn publish_event_prefer_wait_malformed_enqueues_nothing() {
         .with_body(Json(&json!({
             "id": event_id,
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": tenant_id,
+            "subject_tenant": tenant_id,
             "source": "order-service",
             "subject": "order-malformed-wait",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -477,7 +477,7 @@ async fn publish_event_prefer_wait_malformed_enqueues_nothing() {
         .with_body(Json(&json!({
             "id": event_id,
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": tenant_id,
+            "subject_tenant": tenant_id,
             "source": "order-service",
             "subject": "order-malformed-wait",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -519,7 +519,7 @@ async fn publish_batch_prefer_wait_returns_201_once_stored() {
                 {
                     "id": Uuid::new_v4(),
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": Uuid::new_v4(),
+                    "subject_tenant": Uuid::new_v4(),
                     "source": "test-publish_batch_prefer_wait_returns_201",
                     "subject": "s-publish_batch_prefer_wait_returns_201",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -528,7 +528,7 @@ async fn publish_batch_prefer_wait_returns_201_once_stored() {
                 {
                     "id": Uuid::new_v4(),
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": Uuid::new_v4(),
+                    "subject_tenant": Uuid::new_v4(),
                     "source": "test-publish_batch_prefer_wait_returns_201",
                     "subject": "s-publish_batch_prefer_wait_returns_201",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -577,7 +577,7 @@ async fn publish_batch_prefer_wait_returns_202_when_the_wait_elapses() {
                 {
                     "id": Uuid::new_v4(),
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": Uuid::new_v4(),
+                    "subject_tenant": Uuid::new_v4(),
                     "source": "test-publish_batch_prefer_wait_returns_202",
                     "subject": "s-publish_batch_prefer_wait_returns_202",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -601,7 +601,7 @@ async fn publish_batch_prefer_wait_returns_202_when_the_wait_elapses() {
 
 // A synchronous publish of an idempotent duplicate is answered `200` at once:
 // the event is already durable, so nothing is written and there is nothing to
-// wait on (DESIGN.md:1335).
+// wait on (`DESIGN.md` "Sync vs Async Persist Modes").
 #[tokio::test]
 async fn publish_event_prefer_wait_duplicate_returns_200() {
     let harness = run_rules_harness().await;
@@ -610,12 +610,12 @@ async fn publish_event_prefer_wait_duplicate_returns_200() {
     let event = json!({
         "id": Uuid::from_u128(0xe100_1701),
         "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-        "tenant_id": tenant_id,
+        "subject_tenant": tenant_id,
         "source": "order-service",
         "subject": "order-sync-dup",
         "subject_type": "gts.x.eb.t1.subject.v1~",
         "occurred_at": "2026-05-29T10:12:00Z",
-        "meta": { "version": 1, "producer_id": producer, "previous": 0, "sequence": 1 },
+        "meta": { "version": 1, "producer": producer, "previous": 0, "sequence": 1 },
     });
 
     // The first publish is stored on the memory backend within the wait.
@@ -661,22 +661,22 @@ async fn publish_batch_prefer_wait_all_duplicate_returns_200() {
             {
                 "id": Uuid::from_u128(0xe100_1801),
                 "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id,
                 "source": "order-service",
                 "subject": "order-sync-dup-batch",
                 "subject_type": "gts.x.eb.t1.subject.v1~",
                 "occurred_at": "2026-05-29T10:13:00Z",
-                "meta": { "version": 1, "producer_id": producer, "previous": 0, "sequence": 1 },
+                "meta": { "version": 1, "producer": producer, "previous": 0, "sequence": 1 },
             },
             {
                 "id": Uuid::from_u128(0xe100_1802),
                 "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id,
                 "source": "order-service",
                 "subject": "order-sync-dup-batch",
                 "subject_type": "gts.x.eb.t1.subject.v1~",
                 "occurred_at": "2026-05-29T10:13:01Z",
-                "meta": { "version": 1, "producer_id": producer, "previous": 1, "sequence": 2 },
+                "meta": { "version": 1, "producer": producer, "previous": 1, "sequence": 2 },
             },
         ],
     });
@@ -726,12 +726,12 @@ async fn publish_batch_prefer_wait_mixed_new_and_duplicate_returns_201() {
             .with_body(Json(&json!({
                 "id": Uuid::new_v4(),
                 "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id,
                 "source": "order-service",
                 "subject": "order-mixed",
                 "subject_type": "gts.x.eb.t1.subject.v1~",
                 "occurred_at": "2026-05-29T10:14:00Z",
-                "meta": { "version": 1, "producer_id": producer, "previous": previous, "sequence": sequence },
+                "meta": { "version": 1, "producer": producer, "previous": previous, "sequence": sequence },
             })))
             .send()
             .await
@@ -745,22 +745,22 @@ async fn publish_batch_prefer_wait_mixed_new_and_duplicate_returns_201() {
             {
                 "id": Uuid::from_u128(0x3e7a_2201),
                 "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id,
                 "source": "order-service",
                 "subject": "order-mixed",
                 "subject_type": "gts.x.eb.t1.subject.v1~",
                 "occurred_at": "2026-05-29T10:14:01Z",
-                "meta": { "version": 1, "producer_id": producer, "previous": 1, "sequence": 2 },
+                "meta": { "version": 1, "producer": producer, "previous": 1, "sequence": 2 },
             },
             {
                 "id": Uuid::from_u128(0x3e7a_2202),
                 "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id,
                 "source": "order-service",
                 "subject": "order-mixed",
                 "subject_type": "gts.x.eb.t1.subject.v1~",
                 "occurred_at": "2026-05-29T10:14:02Z",
-                "meta": { "version": 1, "producer_id": producer, "previous": 2, "sequence": 3 },
+                "meta": { "version": 1, "producer": producer, "previous": 2, "sequence": 3 },
             },
         ],
     });
@@ -806,7 +806,7 @@ async fn publish_event_prefer_respond_async_is_the_default_returns_202() {
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_prefer_respond_async_is_the_default_returns_202",
             "subject": "s-publish_event_prefer_respond_async_is_the_default_returns_202",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -841,7 +841,7 @@ async fn publish_event_whose_type_names_an_unregistered_topic_returns_404_topic_
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_whose_type_names_an_unregistered_topic",
             "subject": "s-publish_event_whose_type_names_an_unregistered_topic",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -888,7 +888,7 @@ async fn publish_event_readonly_field_rejected_via_deny_unknown_fields() {
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_readonly_field_rejected_via_deny_unknown_fields",
             "subject": "s-publish_event_readonly_field_rejected_via_deny_unknown_fields",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -909,6 +909,53 @@ async fn publish_event_readonly_field_rejected_via_deny_unknown_fields() {
         "detail must start with 'InvalidBody:', got: {}",
         body["detail"]
     );
+}
+
+/// A `meta` naming `producer_id`, a key `meta` does not declare (it names the
+/// producer `producer`), is refused as an unknown field, and nothing is
+/// enqueued. The body is sent as written, so the reported column is the byte
+/// offset just past the key's closing quote.
+#[tokio::test]
+async fn a_publish_whose_meta_names_producer_id_is_refused() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+        ])))
+        .build()
+        .await;
+
+    let resp = harness
+        .api_v1()
+        .post_events()
+        .with_header(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        )
+        .with_body(
+            r#"{"id":"00000000-0000-0000-0000-00000000b901","type":"gts.cf.core.events.event.v1~x.eb.t1.foo.v1~","subject_tenant":"00000000-0000-0000-0000-00000000b902","source":"test-old-producer-id-key","subject":"s-old-producer-id-key","subject_type":"gts.x.eb.t1.subject.v1~","occurred_at":"2026-11-13T00:00:00Z","meta":{"version":1,"producer_id":"00000000-0000-0000-0000-00000000b903"}}"#,
+        )
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "InvalidBody: invalid JSON body: unknown field `producer_id`, expected one \
+                       of `version`, `producer`, `previous`, `sequence` at line 1 column 335",
+            "instance": "/event-broker/v1/events",
+            "context": {
+                "format": "InvalidBody: invalid JSON body: unknown field `producer_id`, expected \
+                           one of `version`, `producer`, `previous`, `sequence` at line 1 column \
+                           335",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    assert_eq!(harness.outbox_bodies().await, 0);
 }
 
 #[tokio::test]
@@ -936,7 +983,7 @@ async fn publish_event_schema_violation_returns_422() {
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_schema_violation_returns_422",
             "subject": "s-publish_event_schema_violation_returns_422",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -992,12 +1039,12 @@ async fn a_single_publish_412_names_index_zero_its_producer_and_the_committed_he
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_sequence_violation_returns_412_with_expected_previous",
             "subject": "s-publish_event_sequence_violation_returns_412_with_expected_previous",
             "subject_type": "gts.x.eb.t1.subject.v1~",
             "occurred_at": Utc::now().to_rfc3339(),
-            "meta": { "version": 1, "producer_id": producer_id, "previous": 0, "sequence": 1 },
+            "meta": { "version": 1, "producer": producer_id, "previous": 0, "sequence": 1 },
         })))
         .send()
         .await
@@ -1013,12 +1060,12 @@ async fn a_single_publish_412_names_index_zero_its_producer_and_the_committed_he
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_sequence_violation_returns_412_with_expected_previous",
             "subject": "s-publish_event_sequence_violation_returns_412_with_expected_previous",
             "subject_type": "gts.x.eb.t1.subject.v1~",
             "occurred_at": Utc::now().to_rfc3339(),
-            "meta": { "version": 1, "producer_id": producer_id, "previous": 5, "sequence": 6 },
+            "meta": { "version": 1, "producer": producer_id, "previous": 5, "sequence": 6 },
         })))
         .send()
         .await;
@@ -1039,7 +1086,7 @@ async fn a_single_publish_412_names_index_zero_its_producer_and_the_committed_he
                     "type": "sequence_mismatch",
                     "subject": "(producer)",
                     "description": format!(
-                        "index=0 producer_id={producer_id} \
+                        "index=0 producer={producer_id} \
                          topic=gts.cf.core.events.topic.v1~x.eb.t1.topic.v1 last_sequence=1"
                     ),
                 }],
@@ -1069,7 +1116,7 @@ async fn publish_to_a_topic_not_provisioned_returns_503_then_202_once_provisione
     let body = json!({
         "id": "0190f1a2-0000-7000-8000-000000000001",
         "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-        "tenant_id": "0190f1a2-0000-7000-8000-000000000002",
+        "subject_tenant": "0190f1a2-0000-7000-8000-000000000002",
         "source": "test-publish-before-provisioning",
         "subject": "s-1",
         "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -1143,7 +1190,7 @@ async fn a_publish_during_a_spec_cache_fault_answers_503() {
         .with_body(Json(&json!({
             "id": "0190f1a2-0000-7000-8000-000000000011",
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": "0190f1a2-0000-7000-8000-000000000012",
+            "subject_tenant": "0190f1a2-0000-7000-8000-000000000012",
             "source": "test-publish-during-a-spec-cache-fault",
             "subject": "s-1",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -1212,7 +1259,7 @@ async fn a_publish_during_a_topic_binding_fault_answers_503() {
         .with_body(Json(&json!({
             "id": "0190f1a2-0000-7000-8000-000000000031",
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": "0190f1a2-0000-7000-8000-000000000032",
+            "subject_tenant": "0190f1a2-0000-7000-8000-000000000032",
             "source": "test-publish-during-a-topic-binding-fault",
             "subject": "s-1",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -1280,7 +1327,7 @@ async fn a_batch_publish_during_a_spec_cache_fault_answers_503() {
                 {
                     "id": "0190f1a2-0000-7000-8000-000000000021",
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": "0190f1a2-0000-7000-8000-000000000023",
+                    "subject_tenant": "0190f1a2-0000-7000-8000-000000000023",
                     "source": "test-batch-during-a-spec-cache-fault",
                     "subject": "s-1",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -1289,7 +1336,7 @@ async fn a_batch_publish_during_a_spec_cache_fault_answers_503() {
                 {
                     "id": "0190f1a2-0000-7000-8000-000000000022",
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": "0190f1a2-0000-7000-8000-000000000023",
+                    "subject_tenant": "0190f1a2-0000-7000-8000-000000000023",
                     "source": "test-batch-during-a-spec-cache-fault",
                     "subject": "s-2",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -1360,12 +1407,12 @@ async fn a_producers_chain_spans_every_key_of_a_topic() {
             .with_body(Json(&json!({
                 "id": Uuid::new_v4(),
                 "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                "tenant_id": tenant,
+                "subject_tenant": tenant,
                 "source": "test-a_producers_chain_spans_every_key_of_a_topic",
                 "subject": "s",
                 "subject_type": "gts.x.eb.t1.subject.v1~",
                 "occurred_at": Utc::now().to_rfc3339(),
-                "meta": { "version": 1, "producer_id": producer_id, "previous": previous, "sequence": sequence },
+                "meta": { "version": 1, "producer": producer_id, "previous": previous, "sequence": sequence },
             })))
             .send()
             .await
@@ -1390,12 +1437,12 @@ async fn publish_event_duplicate_resubmission_returns_200_not_an_error() {
     let body = json!({
         "id": Uuid::new_v4(),
         "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-        "tenant_id": Uuid::new_v4(),
+        "subject_tenant": Uuid::new_v4(),
         "source": "test-publish_event_duplicate_resubmission_is_ignored_not_an_error",
         "subject": "s-publish_event_duplicate_resubmission_is_ignored_not_an_error",
         "subject_type": "gts.x.eb.t1.subject.v1~",
         "occurred_at": Utc::now().to_rfc3339(),
-        "meta": { "version": 1, "producer_id": producer_id, "previous": 0, "sequence": 1 },
+        "meta": { "version": 1, "producer": producer_id, "previous": 0, "sequence": 1 },
     });
 
     harness
@@ -1441,7 +1488,7 @@ async fn publish_batch_happy_path_returns_202() {
                 {
                     "id": Uuid::new_v4(),
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": Uuid::new_v4(),
+                    "subject_tenant": Uuid::new_v4(),
                     "source": "test-publish_batch_happy_path_returns_202",
                     "subject": "s-publish_batch_happy_path_returns_202",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -1450,7 +1497,7 @@ async fn publish_batch_happy_path_returns_202() {
                 {
                     "id": Uuid::new_v4(),
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": Uuid::new_v4(),
+                    "subject_tenant": Uuid::new_v4(),
                     "source": "test-publish_batch_happy_path_returns_202",
                     "subject": "s-publish_batch_happy_path_returns_202",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -1496,7 +1543,7 @@ async fn publish_batch_mixed_topics_returns_400() {
                 {
                     "id": Uuid::new_v4(),
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": Uuid::new_v4(),
+                    "subject_tenant": Uuid::new_v4(),
                     "source": "test-publish_batch_mixed_topics_returns_400",
                     "subject": "s-publish_batch_mixed_topics_returns_400",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -1505,7 +1552,7 @@ async fn publish_batch_mixed_topics_returns_400() {
                 {
                     "id": Uuid::new_v4(),
                     "type": "gts.cf.core.events.event.v1~x.eb.t2.foo.v1~",
-                    "tenant_id": Uuid::new_v4(),
+                    "subject_tenant": Uuid::new_v4(),
                     "source": "test-publish_batch_mixed_topics_returns_400",
                     "subject": "s-publish_batch_mixed_topics_returns_400",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -1547,7 +1594,7 @@ async fn publish_batch_too_large_returns_413() {
             json!({
                 "id": Uuid::new_v4(),
                 "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(),
                 "source": "test-publish_batch_too_large_returns_413",
                 "subject": "s-publish_batch_too_large_returns_413",
                 "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -1596,17 +1643,17 @@ async fn a_chained_run_whose_second_event_does_not_link_is_refused_as_malformed_
                 {
                     "id": Uuid::from_u128(0xe000_1001),
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": Uuid::from_u128(0x7e7a_1001),
+                    "subject_tenant": Uuid::from_u128(0x7e7a_1001),
                     "source": "order-service",
                     "subject": "order-unlinked",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
                     "occurred_at": "2026-05-29T10:11:00Z",
-                    "meta": { "version": 1, "producer_id": producer_id, "previous": 0, "sequence": 1 },
+                    "meta": { "version": 1, "producer": producer_id, "previous": 0, "sequence": 1 },
                 },
                 {
                     "id": Uuid::from_u128(0xe000_1002),
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": Uuid::from_u128(0x7e7a_1001),
+                    "subject_tenant": Uuid::from_u128(0x7e7a_1001),
                     "source": "order-service",
                     "subject": "order-unlinked",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -1614,7 +1661,7 @@ async fn a_chained_run_whose_second_event_does_not_link_is_refused_as_malformed_
                     // `previous` (5) does not link to the first event's
                     // `sequence` (1): the run is malformed on its own (feature
                     // 0001 §5.2 R3), before any chain state is read.
-                    "meta": { "version": 1, "producer_id": producer_id, "previous": 5, "sequence": 6 },
+                    "meta": { "version": 1, "producer": producer_id, "previous": 5, "sequence": 6 },
                 },
             ],
         })))
@@ -1649,7 +1696,7 @@ async fn a_chained_run_whose_second_event_does_not_link_is_refused_as_malformed_
     cursors.assert_status(200);
     assert_eq!(
         cursors.json(),
-        json!({ "producer_id": producer_id, "client_agent": "test-agent", "topics": [] })
+        json!({ "id": producer_id, "client_agent": "test-agent", "topics": [] })
     );
     let sentinel = publish_sentinel(
         &harness,
@@ -1749,7 +1796,7 @@ async fn a_batch_with_an_invalid_second_event_stores_nothing() {
                 {
                     "id": Uuid::from_u128(0xe000_0101),
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": tenant_id,
+                    "subject_tenant": tenant_id,
                     "source": "order-service",
                     "subject": "order-atomic",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -1759,7 +1806,7 @@ async fn a_batch_with_an_invalid_second_event_stores_nothing() {
                 {
                     "id": Uuid::from_u128(0xe000_0102),
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": tenant_id,
+                    "subject_tenant": tenant_id,
                     "source": "order-service",
                     "subject": "order-atomic",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -1798,7 +1845,7 @@ async fn a_batch_with_an_invalid_second_event_stores_nothing() {
         .with_body(Json(&json!({
             "id": sentinel_id,
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": tenant_id,
+            "subject_tenant": tenant_id,
             "source": "order-service",
             "subject": "order-atomic",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -1845,12 +1892,12 @@ async fn a_batch_whose_second_run_is_stale_stores_nothing_and_keeps_both_chains(
         .with_body(Json(&json!({
             "id": seed_id,
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": tenant_id,
+            "subject_tenant": tenant_id,
             "source": "order-service",
             "subject": "order-chain",
             "subject_type": "gts.x.eb.t1.subject.v1~",
             "occurred_at": "2026-05-29T10:10:00Z",
-            "meta": { "version": 1, "producer_id": stale_producer, "previous": 0, "sequence": 1 },
+            "meta": { "version": 1, "producer": stale_producer, "previous": 0, "sequence": 1 },
         })))
         .send()
         .await
@@ -1866,22 +1913,22 @@ async fn a_batch_whose_second_run_is_stale_stores_nothing_and_keeps_both_chains(
                 {
                     "id": Uuid::from_u128(0xe000_0201),
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": tenant_id,
+                    "subject_tenant": tenant_id,
                     "source": "order-service",
                     "subject": "order-chain",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
                     "occurred_at": "2026-05-29T10:11:00Z",
-                    "meta": { "version": 1, "producer_id": fresh_producer, "previous": 0, "sequence": 1 },
+                    "meta": { "version": 1, "producer": fresh_producer, "previous": 0, "sequence": 1 },
                 },
                 {
                     "id": Uuid::from_u128(0xe000_0202),
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": tenant_id,
+                    "subject_tenant": tenant_id,
                     "source": "order-service",
                     "subject": "order-chain",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
                     "occurred_at": "2026-05-29T10:11:01Z",
-                    "meta": { "version": 1, "producer_id": stale_producer, "previous": 2, "sequence": 3 },
+                    "meta": { "version": 1, "producer": stale_producer, "previous": 2, "sequence": 3 },
                 },
             ],
         })))
@@ -1904,7 +1951,7 @@ async fn a_batch_whose_second_run_is_stale_stores_nothing_and_keeps_both_chains(
                     "type": "sequence_mismatch",
                     "subject": "(producer)",
                     "description": format!(
-                        "index=1 producer_id={stale_producer} \
+                        "index=1 producer={stale_producer} \
                          topic=gts.cf.core.events.topic.v1~x.eb.t1.topic.v1 last_sequence=1"
                     ),
                 }],
@@ -1921,7 +1968,7 @@ async fn a_batch_whose_second_run_is_stale_stores_nothing_and_keeps_both_chains(
     fresh.assert_status(200);
     assert_eq!(
         fresh.json(),
-        json!({ "producer_id": fresh_producer, "client_agent": "test-agent", "topics": [] })
+        json!({ "id": fresh_producer, "client_agent": "test-agent", "topics": [] })
     );
     let stale = harness
         .api_v1()
@@ -1932,7 +1979,7 @@ async fn a_batch_whose_second_run_is_stale_stores_nothing_and_keeps_both_chains(
     assert_eq!(
         stale.json(),
         json!({
-            "producer_id": stale_producer,
+            "id": stale_producer,
             "client_agent": "test-agent",
             "topics": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
@@ -1947,7 +1994,7 @@ async fn a_batch_whose_second_run_is_stale_stores_nothing_and_keeps_both_chains(
         .with_body(Json(&json!({
             "id": sentinel_id,
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": tenant_id,
+            "subject_tenant": tenant_id,
             "source": "order-service",
             "subject": "order-chain",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -1988,12 +2035,12 @@ async fn a_batch_skips_a_duplicate_and_stores_the_rest() {
     let first = json!({
         "id": first_id,
         "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-        "tenant_id": tenant_id,
+        "subject_tenant": tenant_id,
         "source": "order-service",
         "subject": "order-dup",
         "subject_type": "gts.x.eb.t1.subject.v1~",
         "occurred_at": "2026-05-29T10:11:00Z",
-        "meta": { "version": 1, "producer_id": producer_id, "previous": 0, "sequence": 1 },
+        "meta": { "version": 1, "producer": producer_id, "previous": 0, "sequence": 1 },
     });
 
     harness
@@ -2013,12 +2060,12 @@ async fn a_batch_skips_a_duplicate_and_stores_the_rest() {
                 {
                     "id": second_id,
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": tenant_id,
+                    "subject_tenant": tenant_id,
                     "source": "order-service",
                     "subject": "order-dup",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
                     "occurred_at": "2026-05-29T10:11:01Z",
-                    "meta": { "version": 1, "producer_id": producer_id, "previous": 1, "sequence": 2 },
+                    "meta": { "version": 1, "producer": producer_id, "previous": 1, "sequence": 2 },
                 },
             ],
         })))
@@ -2037,7 +2084,7 @@ async fn a_batch_skips_a_duplicate_and_stores_the_rest() {
     assert_eq!(
         cursors.json(),
         json!({
-            "producer_id": producer_id,
+            "id": producer_id,
             "client_agent": "test-agent",
             "topics": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
@@ -2085,7 +2132,7 @@ async fn publish_sentinel(harness: &EventBrokerHarness, id: Uuid, tenant_id: Uui
         .with_body(Json(&json!({
             "id": id,
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": tenant_id,
+            "subject_tenant": tenant_id,
             "source": "order-service",
             "subject": "order-sentinel",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -2160,22 +2207,22 @@ async fn a_repeated_event_id_is_refused_naming_the_repeat() {
                 {
                     "id": repeated_id,
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": Uuid::from_u128(0x7e7a_1101),
+                    "subject_tenant": Uuid::from_u128(0x7e7a_1101),
                     "source": "order-service",
                     "subject": "order-repeat",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
                     "occurred_at": "2026-05-29T10:11:00Z",
-                    "meta": { "version": 1, "producer_id": producer_id, "previous": 0, "sequence": 1 },
+                    "meta": { "version": 1, "producer": producer_id, "previous": 0, "sequence": 1 },
                 },
                 {
                     "id": repeated_id,
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": Uuid::from_u128(0x7e7a_1101),
+                    "subject_tenant": Uuid::from_u128(0x7e7a_1101),
                     "source": "order-service",
                     "subject": "order-repeat",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
                     "occurred_at": "2026-05-29T10:11:01Z",
-                    "meta": { "version": 1, "producer_id": producer_id, "previous": 1, "sequence": 2 },
+                    "meta": { "version": 1, "producer": producer_id, "previous": 1, "sequence": 2 },
                 },
             ],
         })))
@@ -2210,7 +2257,7 @@ async fn a_repeated_event_id_is_refused_naming_the_repeat() {
     cursors.assert_status(200);
     assert_eq!(
         cursors.json(),
-        json!({ "producer_id": producer_id, "client_agent": "test-agent", "topics": [] })
+        json!({ "id": producer_id, "client_agent": "test-agent", "topics": [] })
     );
     let sentinel = publish_sentinel(
         &harness,
@@ -2245,22 +2292,22 @@ async fn a_gap_inside_a_chained_run_is_refused_as_malformed_run() {
                 {
                     "id": Uuid::from_u128(0xe000_1201),
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": Uuid::from_u128(0x7e7a_1201),
+                    "subject_tenant": Uuid::from_u128(0x7e7a_1201),
                     "source": "order-service",
                     "subject": "order-gap",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
                     "occurred_at": "2026-05-29T10:11:00Z",
-                    "meta": { "version": 1, "producer_id": producer_id, "previous": 0, "sequence": 1 },
+                    "meta": { "version": 1, "producer": producer_id, "previous": 0, "sequence": 1 },
                 },
                 {
                     "id": Uuid::from_u128(0xe000_1202),
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": Uuid::from_u128(0x7e7a_1201),
+                    "subject_tenant": Uuid::from_u128(0x7e7a_1201),
                     "source": "order-service",
                     "subject": "order-gap",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
                     "occurred_at": "2026-05-29T10:11:01Z",
-                    "meta": { "version": 1, "producer_id": producer_id, "previous": 2, "sequence": 3 },
+                    "meta": { "version": 1, "producer": producer_id, "previous": 2, "sequence": 3 },
                 },
             ],
         })))
@@ -2295,7 +2342,7 @@ async fn a_gap_inside_a_chained_run_is_refused_as_malformed_run() {
     cursors.assert_status(200);
     assert_eq!(
         cursors.json(),
-        json!({ "producer_id": producer_id, "client_agent": "test-agent", "topics": [] })
+        json!({ "id": producer_id, "client_agent": "test-agent", "topics": [] })
     );
     let sentinel = publish_sentinel(
         &harness,
@@ -2329,12 +2376,12 @@ async fn a_lost_ack_resend_of_a_whole_run_answers_200() {
         .with_body(Json(&json!({
             "id": seed_id,
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": tenant_id,
+            "subject_tenant": tenant_id,
             "source": "order-service",
             "subject": "order-resend",
             "subject_type": "gts.x.eb.t1.subject.v1~",
             "occurred_at": "2026-05-29T10:10:00Z",
-            "meta": { "version": 1, "producer_id": producer_id, "previous": 8, "sequence": 9 },
+            "meta": { "version": 1, "producer": producer_id, "previous": 8, "sequence": 9 },
         })))
         .send()
         .await
@@ -2345,32 +2392,32 @@ async fn a_lost_ack_resend_of_a_whole_run_answers_200() {
             {
                 "id": Uuid::from_u128(0xe000_1310),
                 "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id,
                 "source": "order-service",
                 "subject": "order-resend",
                 "subject_type": "gts.x.eb.t1.subject.v1~",
                 "occurred_at": "2026-05-29T10:11:00Z",
-                "meta": { "version": 1, "producer_id": producer_id, "previous": 9, "sequence": 10 },
+                "meta": { "version": 1, "producer": producer_id, "previous": 9, "sequence": 10 },
             },
             {
                 "id": Uuid::from_u128(0xe000_1311),
                 "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id,
                 "source": "order-service",
                 "subject": "order-resend",
                 "subject_type": "gts.x.eb.t1.subject.v1~",
                 "occurred_at": "2026-05-29T10:11:01Z",
-                "meta": { "version": 1, "producer_id": producer_id, "previous": 10, "sequence": 11 },
+                "meta": { "version": 1, "producer": producer_id, "previous": 10, "sequence": 11 },
             },
             {
                 "id": Uuid::from_u128(0xe000_1312),
                 "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id,
                 "source": "order-service",
                 "subject": "order-resend",
                 "subject_type": "gts.x.eb.t1.subject.v1~",
                 "occurred_at": "2026-05-29T10:11:02Z",
-                "meta": { "version": 1, "producer_id": producer_id, "previous": 11, "sequence": 12 },
+                "meta": { "version": 1, "producer": producer_id, "previous": 11, "sequence": 12 },
             },
         ],
     });
@@ -2402,7 +2449,7 @@ async fn a_lost_ack_resend_of_a_whole_run_answers_200() {
     assert_eq!(
         cursors.json(),
         json!({
-            "producer_id": producer_id,
+            "id": producer_id,
             "client_agent": "test-agent",
             "topics": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
@@ -2438,22 +2485,22 @@ async fn a_resend_overlapping_the_head_skips_the_duplicate_prefix() {
     let tenth = json!({
         "id": Uuid::from_u128(0xe000_1410),
         "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-        "tenant_id": tenant_id,
+        "subject_tenant": tenant_id,
         "source": "order-service",
         "subject": "order-overlap",
         "subject_type": "gts.x.eb.t1.subject.v1~",
         "occurred_at": "2026-05-29T10:11:00Z",
-        "meta": { "version": 1, "producer_id": producer_id, "previous": 9, "sequence": 10 },
+        "meta": { "version": 1, "producer": producer_id, "previous": 9, "sequence": 10 },
     });
     let eleventh = json!({
         "id": Uuid::from_u128(0xe000_1411),
         "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-        "tenant_id": tenant_id,
+        "subject_tenant": tenant_id,
         "source": "order-service",
         "subject": "order-overlap",
         "subject_type": "gts.x.eb.t1.subject.v1~",
         "occurred_at": "2026-05-29T10:11:01Z",
-        "meta": { "version": 1, "producer_id": producer_id, "previous": 10, "sequence": 11 },
+        "meta": { "version": 1, "producer": producer_id, "previous": 10, "sequence": 11 },
     });
 
     // The head reaches 11 through single publishes: 9, then 10, then 11.
@@ -2461,12 +2508,12 @@ async fn a_resend_overlapping_the_head_skips_the_duplicate_prefix() {
         json!({
             "id": seed_id,
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": tenant_id,
+            "subject_tenant": tenant_id,
             "source": "order-service",
             "subject": "order-overlap",
             "subject_type": "gts.x.eb.t1.subject.v1~",
             "occurred_at": "2026-05-29T10:10:00Z",
-            "meta": { "version": 1, "producer_id": producer_id, "previous": 8, "sequence": 9 },
+            "meta": { "version": 1, "producer": producer_id, "previous": 8, "sequence": 9 },
         }),
         tenth.clone(),
         eleventh.clone(),
@@ -2492,12 +2539,12 @@ async fn a_resend_overlapping_the_head_skips_the_duplicate_prefix() {
                 {
                     "id": Uuid::from_u128(0xe000_1412),
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": tenant_id,
+                    "subject_tenant": tenant_id,
                     "source": "order-service",
                     "subject": "order-overlap",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
                     "occurred_at": "2026-05-29T10:11:02Z",
-                    "meta": { "version": 1, "producer_id": producer_id, "previous": 11, "sequence": 12 },
+                    "meta": { "version": 1, "producer": producer_id, "previous": 11, "sequence": 12 },
                 },
             ],
         })))
@@ -2515,7 +2562,7 @@ async fn a_resend_overlapping_the_head_skips_the_duplicate_prefix() {
     assert_eq!(
         cursors.json(),
         json!({
-            "producer_id": producer_id,
+            "id": producer_id,
             "client_agent": "test-agent",
             "topics": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
@@ -2554,12 +2601,12 @@ async fn a_resend_at_the_head_with_another_previous_answers_200_and_stores_nothi
         .with_body(Json(&json!({
             "id": first_id,
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": tenant_id,
+            "subject_tenant": tenant_id,
             "source": "order-service",
             "subject": "order-head-previous",
             "subject_type": "gts.x.eb.t1.subject.v1~",
             "occurred_at": "2026-05-29T10:10:00Z",
-            "meta": { "version": 1, "producer_id": producer_id, "previous": 7, "sequence": 8 },
+            "meta": { "version": 1, "producer": producer_id, "previous": 7, "sequence": 8 },
         })))
         .send()
         .await
@@ -2572,12 +2619,12 @@ async fn a_resend_at_the_head_with_another_previous_answers_200_and_stores_nothi
         .with_body(Json(&json!({
             "id": Uuid::from_u128(0xe000_1918),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": tenant_id,
+            "subject_tenant": tenant_id,
             "source": "order-service",
             "subject": "order-head-previous",
             "subject_type": "gts.x.eb.t1.subject.v1~",
             "occurred_at": "2026-05-29T10:10:01Z",
-            "meta": { "version": 1, "producer_id": producer_id, "previous": 3, "sequence": 8 },
+            "meta": { "version": 1, "producer": producer_id, "previous": 3, "sequence": 8 },
         })))
         .send()
         .await;
@@ -2593,7 +2640,7 @@ async fn a_resend_at_the_head_with_another_previous_answers_200_and_stores_nothi
     assert_eq!(
         cursors.json(),
         json!({
-            "producer_id": producer_id,
+            "id": producer_id,
             "client_agent": "test-agent",
             "topics": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
@@ -2629,12 +2676,12 @@ async fn a_batch_led_by_a_head_resend_with_another_previous_stores_only_the_rest
         .with_body(Json(&json!({
             "id": first_id,
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": tenant_id,
+            "subject_tenant": tenant_id,
             "source": "order-service",
             "subject": "order-head-previous",
             "subject_type": "gts.x.eb.t1.subject.v1~",
             "occurred_at": "2026-05-29T10:10:00Z",
-            "meta": { "version": 1, "producer_id": producer_id, "previous": 7, "sequence": 8 },
+            "meta": { "version": 1, "producer": producer_id, "previous": 7, "sequence": 8 },
         })))
         .send()
         .await
@@ -2650,22 +2697,22 @@ async fn a_batch_led_by_a_head_resend_with_another_previous_stores_only_the_rest
                 {
                     "id": Uuid::from_u128(0xe000_2018),
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": tenant_id,
+                    "subject_tenant": tenant_id,
                     "source": "order-service",
                     "subject": "order-head-previous",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
                     "occurred_at": "2026-05-29T10:10:01Z",
-                    "meta": { "version": 1, "producer_id": producer_id, "previous": 3, "sequence": 8 },
+                    "meta": { "version": 1, "producer": producer_id, "previous": 3, "sequence": 8 },
                 },
                 {
                     "id": ninth_id,
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": tenant_id,
+                    "subject_tenant": tenant_id,
                     "source": "order-service",
                     "subject": "order-head-previous",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
                     "occurred_at": "2026-05-29T10:10:02Z",
-                    "meta": { "version": 1, "producer_id": producer_id, "previous": 8, "sequence": 9 },
+                    "meta": { "version": 1, "producer": producer_id, "previous": 8, "sequence": 9 },
                 },
             ],
         })))
@@ -2683,7 +2730,7 @@ async fn a_batch_led_by_a_head_resend_with_another_previous_stores_only_the_rest
     assert_eq!(
         cursors.json(),
         json!({
-            "producer_id": producer_id,
+            "id": producer_id,
             "client_agent": "test-agent",
             "topics": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
@@ -2727,12 +2774,12 @@ async fn a_monotonic_run_skips_its_leading_duplicates() {
         .with_body(Json(&json!({
             "id": seed_id,
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": tenant_id,
+            "subject_tenant": tenant_id,
             "source": "order-service",
             "subject": "order-monotonic",
             "subject_type": "gts.x.eb.t1.subject.v1~",
             "occurred_at": "2026-05-29T10:10:00Z",
-            "meta": { "version": 1, "producer_id": producer_id, "sequence": 5 },
+            "meta": { "version": 1, "producer": producer_id, "sequence": 5 },
         })))
         .send()
         .await
@@ -2746,42 +2793,42 @@ async fn a_monotonic_run_skips_its_leading_duplicates() {
                 {
                     "id": Uuid::from_u128(0xe000_1514),
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": tenant_id,
+                    "subject_tenant": tenant_id,
                     "source": "order-service",
                     "subject": "order-monotonic",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
                     "occurred_at": "2026-05-29T10:11:00Z",
-                    "meta": { "version": 1, "producer_id": producer_id, "sequence": 4 },
+                    "meta": { "version": 1, "producer": producer_id, "sequence": 4 },
                 },
                 {
                     "id": Uuid::from_u128(0xe000_1515),
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": tenant_id,
+                    "subject_tenant": tenant_id,
                     "source": "order-service",
                     "subject": "order-monotonic",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
                     "occurred_at": "2026-05-29T10:11:01Z",
-                    "meta": { "version": 1, "producer_id": producer_id, "sequence": 5 },
+                    "meta": { "version": 1, "producer": producer_id, "sequence": 5 },
                 },
                 {
                     "id": Uuid::from_u128(0xe000_1516),
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": tenant_id,
+                    "subject_tenant": tenant_id,
                     "source": "order-service",
                     "subject": "order-monotonic",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
                     "occurred_at": "2026-05-29T10:11:02Z",
-                    "meta": { "version": 1, "producer_id": producer_id, "sequence": 6 },
+                    "meta": { "version": 1, "producer": producer_id, "sequence": 6 },
                 },
                 {
                     "id": Uuid::from_u128(0xe000_1517),
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": tenant_id,
+                    "subject_tenant": tenant_id,
                     "source": "order-service",
                     "subject": "order-monotonic",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
                     "occurred_at": "2026-05-29T10:11:03Z",
-                    "meta": { "version": 1, "producer_id": producer_id, "sequence": 7 },
+                    "meta": { "version": 1, "producer": producer_id, "sequence": 7 },
                 },
             ],
         })))
@@ -2799,7 +2846,7 @@ async fn a_monotonic_run_skips_its_leading_duplicates() {
     assert_eq!(
         cursors.json(),
         json!({
-            "producer_id": producer_id,
+            "id": producer_id,
             "client_agent": "test-agent",
             "topics": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
@@ -2836,12 +2883,12 @@ async fn a_412_names_the_run_index_producer_and_committed_head() {
         .with_body(Json(&json!({
             "id": seed_id,
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": tenant_id,
+            "subject_tenant": tenant_id,
             "source": "order-service",
             "subject": "order-stale",
             "subject_type": "gts.x.eb.t1.subject.v1~",
             "occurred_at": "2026-05-29T10:10:00Z",
-            "meta": { "version": 1, "producer_id": producer_id, "previous": 6, "sequence": 7 },
+            "meta": { "version": 1, "producer": producer_id, "previous": 6, "sequence": 7 },
         })))
         .send()
         .await
@@ -2857,7 +2904,7 @@ async fn a_412_names_the_run_index_producer_and_committed_head() {
                 {
                     "id": Uuid::from_u128(0xe000_1610),
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": tenant_id,
+                    "subject_tenant": tenant_id,
                     "source": "order-service",
                     "subject": "order-stale",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -2866,22 +2913,22 @@ async fn a_412_names_the_run_index_producer_and_committed_head() {
                 {
                     "id": Uuid::from_u128(0xe000_1611),
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": tenant_id,
+                    "subject_tenant": tenant_id,
                     "source": "order-service",
                     "subject": "order-stale",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
                     "occurred_at": "2026-05-29T10:11:01Z",
-                    "meta": { "version": 1, "producer_id": producer_id, "previous": 3, "sequence": 4 },
+                    "meta": { "version": 1, "producer": producer_id, "previous": 3, "sequence": 4 },
                 },
                 {
                     "id": Uuid::from_u128(0xe000_1612),
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": tenant_id,
+                    "subject_tenant": tenant_id,
                     "source": "order-service",
                     "subject": "order-stale",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
                     "occurred_at": "2026-05-29T10:11:02Z",
-                    "meta": { "version": 1, "producer_id": producer_id, "previous": 4, "sequence": 5 },
+                    "meta": { "version": 1, "producer": producer_id, "previous": 4, "sequence": 5 },
                 },
             ],
         })))
@@ -2904,7 +2951,7 @@ async fn a_412_names_the_run_index_producer_and_committed_head() {
                     "type": "sequence_mismatch",
                     "subject": "(producer)",
                     "description": format!(
-                        "index=1 producer_id={producer_id} \
+                        "index=1 producer={producer_id} \
                          topic=gts.cf.core.events.topic.v1~x.eb.t1.topic.v1 last_sequence=7"
                     ),
                 }],
@@ -2921,7 +2968,7 @@ async fn a_412_names_the_run_index_producer_and_committed_head() {
     assert_eq!(
         cursors.json(),
         json!({
-            "producer_id": producer_id,
+            "id": producer_id,
             "client_agent": "test-agent",
             "topics": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
@@ -2953,32 +3000,32 @@ async fn an_all_duplicate_batch_answers_200() {
             {
                 "id": Uuid::from_u128(0xe000_1701),
                 "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id,
                 "source": "order-service",
                 "subject": "order-two-runs",
                 "subject_type": "gts.x.eb.t1.subject.v1~",
                 "occurred_at": "2026-05-29T10:11:00Z",
-                "meta": { "version": 1, "producer_id": first_producer, "previous": 0, "sequence": 1 },
+                "meta": { "version": 1, "producer": first_producer, "previous": 0, "sequence": 1 },
             },
             {
                 "id": Uuid::from_u128(0xe000_1702),
                 "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id,
                 "source": "order-service",
                 "subject": "order-two-runs",
                 "subject_type": "gts.x.eb.t1.subject.v1~",
                 "occurred_at": "2026-05-29T10:11:01Z",
-                "meta": { "version": 1, "producer_id": second_producer, "previous": 0, "sequence": 1 },
+                "meta": { "version": 1, "producer": second_producer, "previous": 0, "sequence": 1 },
             },
             {
                 "id": Uuid::from_u128(0xe000_1703),
                 "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id,
                 "source": "order-service",
                 "subject": "order-two-runs",
                 "subject_type": "gts.x.eb.t1.subject.v1~",
                 "occurred_at": "2026-05-29T10:11:02Z",
-                "meta": { "version": 1, "producer_id": first_producer, "previous": 1, "sequence": 2 },
+                "meta": { "version": 1, "producer": first_producer, "previous": 1, "sequence": 2 },
             },
         ],
     });
@@ -3009,7 +3056,7 @@ async fn an_all_duplicate_batch_answers_200() {
         assert_eq!(
             cursors.json(),
             json!({
-                "producer_id": producer_id,
+                "id": producer_id,
                 "client_agent": "test-agent",
                 "topics": [{
                     "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
@@ -3044,12 +3091,12 @@ async fn a_batch_with_a_stateless_event_beside_duplicates_answers_202() {
     let head = json!({
         "id": Uuid::from_u128(0xe000_1801),
         "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-        "tenant_id": tenant_id,
+        "subject_tenant": tenant_id,
         "source": "order-service",
         "subject": "order-mixed",
         "subject_type": "gts.x.eb.t1.subject.v1~",
         "occurred_at": "2026-05-29T10:11:00Z",
-        "meta": { "version": 1, "producer_id": producer_id, "previous": 0, "sequence": 1 },
+        "meta": { "version": 1, "producer": producer_id, "previous": 0, "sequence": 1 },
     });
     harness
         .api_v1()
@@ -3070,7 +3117,7 @@ async fn a_batch_with_a_stateless_event_beside_duplicates_answers_202() {
                 {
                     "id": Uuid::from_u128(0xe000_1802),
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": tenant_id,
+                    "subject_tenant": tenant_id,
                     "source": "order-service",
                     "subject": "order-mixed",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -3092,7 +3139,7 @@ async fn a_batch_with_a_stateless_event_beside_duplicates_answers_202() {
     assert_eq!(
         cursors.json(),
         json!({
-            "producer_id": producer_id,
+            "id": producer_id,
             "client_agent": "test-agent",
             "topics": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
@@ -3119,7 +3166,12 @@ async fn publish_rejected_for_missing_event_type_produce_permission_returns_403_
 {
     let harness = EventBrokerHarness::builder()
         .with_policy_enforcer(PolicyEnforcer::new(Arc::new(DenyingAuthZ {
-            deny_if: |req: &EvaluationRequest| req.action.name == "produce",
+            // Denies only the type check: `produce` on the event type, not
+            // the tenant check on the tenant-scope resource.
+            deny_if: |req: &EvaluationRequest| {
+                req.action.name == "produce"
+                    && req.resource.resource_type != "gts.cf.core.events.request.v1~"
+            },
         })))
         .build()
         .await;
@@ -3133,7 +3185,7 @@ async fn publish_rejected_for_missing_event_type_produce_permission_returns_403_
             // lookup that resolves the topic (a 404 here instead of 403 would
             // mean the ordering regressed).
             "type": "gts.cf.core.events.event.v1~x.eb.missing.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_rejected_for_missing_event_type_produce_permission_returns_403_before_type_lookup",
             "subject": "s-publish_rejected_for_missing_event_type_produce_permission_returns_403_before_type_lookup",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -3166,13 +3218,13 @@ async fn publish_rejected_for_unauthorized_tenant_id_returns_403() {
             { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
         ])))
         .with_policy_enforcer(PolicyEnforcer::new(Arc::new(DenyingAuthZ {
-            // The tenant-scope check is its own `PolicyEnforcer` call
-            // (`domain::authz::TENANT_SCOPE_RESOURCE`), distinguishable by
-            // the `OWNER_TENANT_ID` resource property it alone sets.
+            // Denies the tenant check (`produce` on the tenant-scope resource)
+            // and the barrier right (`produce_ignore_barrier`), so the event's
+            // tenant is unreachable; the type check would pass.
             deny_if: |req: &EvaluationRequest| {
-                req.resource
-                    .properties
-                    .contains_key(pep_properties::OWNER_TENANT_ID)
+                (req.action.name == "produce"
+                    && req.resource.resource_type == "gts.cf.core.events.request.v1~")
+                    || req.action.name == "produce_ignore_barrier"
             },
         })))
         .build()
@@ -3184,7 +3236,7 @@ async fn publish_rejected_for_unauthorized_tenant_id_returns_403() {
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_rejected_for_unauthorized_tenant_id_returns_403",
             "subject": "s-publish_rejected_for_unauthorized_tenant_id_returns_403",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -3250,7 +3302,7 @@ async fn publish_checks_produce_on_the_events_own_type_not_a_family_label() {
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": target_tenant,
+            "subject_tenant": target_tenant,
             "source": "test-publish_checks_produce_on_the_events_own_type",
             "subject": "s-publish_checks_produce_on_the_events_own_type",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -3305,7 +3357,7 @@ async fn publish_succeeds_when_produce_permission_and_tenant_checks_both_pass() 
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": allowed_tenant_id,
+            "subject_tenant": allowed_tenant_id,
             "source": "test-publish_succeeds_when_produce_permission_and_tenant_checks_both_pass",
             "subject": "s-publish_succeeds_when_produce_permission_and_tenant_checks_both_pass",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -3350,10 +3402,11 @@ async fn publish_batch_aborts_on_an_unauthorized_event() {
             r#type: crate::test_support::event_type_id(
                 "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
             ),
-            tenant_id: Uuid::new_v4(),
+            subject_tenant: Uuid::new_v4(),
             source: "test".to_owned(),
             subject: "s1".to_owned(),
             subject_type: gts::GtsTypeId::new("gts.x.eb.t1.subject.v1~"),
+            subject_owner: None,
             occurred_at: Utc::now(),
             trace_parent: None,
             data: json!({}),
@@ -3364,10 +3417,11 @@ async fn publish_batch_aborts_on_an_unauthorized_event() {
             r#type: crate::test_support::event_type_id(
                 "gts.cf.core.events.event.v1~x.eb.t1.bar.v1~",
             ),
-            tenant_id: Uuid::new_v4(),
+            subject_tenant: Uuid::new_v4(),
             source: "test".to_owned(),
             subject: "s1".to_owned(),
             subject_type: gts::GtsTypeId::new("gts.x.eb.t1.subject.v1~"),
+            subject_owner: None,
             occurred_at: Utc::now(),
             trace_parent: None,
             data: json!({}),
@@ -3412,7 +3466,7 @@ async fn publish_event_unregistered_event_type_returns_404_event_type_not_found(
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.unregistered.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_unregistered_event_type_returns_404_event_type_not_found",
             "subject": "s-publish_event_unregistered_event_type_returns_404_event_type_not_found",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -3448,7 +3502,7 @@ async fn publish_event_with_nothing_registered_returns_404_event_type_not_found(
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.unregistered.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_with_nothing_registered",
             "subject": "s-publish_event_with_nothing_registered",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -3487,7 +3541,7 @@ async fn publish_event_malformed_subject_type_returns_400() {
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_malformed_subject_type_returns_400",
             "subject": "s-publish_event_malformed_subject_type_returns_400",
             "subject_type": "not-a-gts-id",
@@ -3541,7 +3595,7 @@ async fn publish_event_carrying_a_partition_key_is_refused() {
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_carrying_a_partition_key_is_refused",
             "subject": "s-publish_event_carrying_a_partition_key_is_refused",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -3590,7 +3644,7 @@ async fn publish_event_instance_shaped_type_returns_400() {
             "id": Uuid::new_v4(),
             // The same registered type, spelled as an instance would be.
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_instance_shaped_type_returns_400",
             "subject": "s-publish_event_instance_shaped_type_returns_400",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -3633,7 +3687,7 @@ async fn a_publish_with_a_malformed_trace_parent_is_rejected_and_stores_nothing(
         .with_body(Json(&json!({
             "id": Uuid::from_u128(0xe000_1201),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": tenant_id,
+            "subject_tenant": tenant_id,
             "source": "order-service",
             "subject": "order-42",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -3689,7 +3743,7 @@ async fn a_batch_with_one_malformed_trace_parent_is_rejected_whole() {
                 {
                     "id": Uuid::from_u128(0xe000_1202),
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": tenant_id,
+                    "subject_tenant": tenant_id,
                     "source": "order-service",
                     "subject": "order-42",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -3698,7 +3752,7 @@ async fn a_batch_with_one_malformed_trace_parent_is_rejected_whole() {
                 {
                     "id": Uuid::from_u128(0xe000_1203),
                     "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                    "tenant_id": tenant_id,
+                    "subject_tenant": tenant_id,
                     "source": "order-service",
                     "subject": "order-42",
                     "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -3756,7 +3810,7 @@ async fn a_malformed_trace_parent_is_rejected_before_the_type_is_looked_up() {
         .with_body(Json(&json!({
             "id": Uuid::from_u128(0xe000_1204),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.unregistered.v1~",
-            "tenant_id": tenant_id,
+            "subject_tenant": tenant_id,
             "source": "order-service",
             "subject": "order-42",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -3811,7 +3865,7 @@ async fn a_well_formed_trace_parent_is_accepted() {
         .with_body(Json(&json!({
             "id": event_id,
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": tenant_id,
+            "subject_tenant": tenant_id,
             "source": "order-service",
             "subject": "order-42",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -3857,8 +3911,8 @@ async fn a_well_formed_trace_parent_is_accepted() {
     assert_eq!(
         (
             event.id,
-            event.type_id.as_ref(),
-            event.tenant_id,
+            event.event_type.as_ref(),
+            event.subject_tenant,
             event.source.as_str(),
             event.subject.as_str(),
             event.subject_type.as_ref(),
@@ -3902,7 +3956,7 @@ async fn publish_event_with_a_scenario_shaped_type_returns_202() {
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~acme.shop.orders.created.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_with_a_scenario_shaped_type_returns_202",
             "subject": "order-1",
             "subject_type": "gts.acme.shop.orders.order.v1~",
@@ -3935,7 +3989,7 @@ async fn publish_event_instance_shaped_subject_type_returns_400() {
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_instance_shaped_subject_type_returns_400",
             "subject": "s-publish_event_instance_shaped_subject_type_returns_400",
             // Well-formed GTS id, but an Instance (no trailing '~') - proves
@@ -3978,7 +4032,7 @@ async fn publish_event_subject_type_exact_match_returns_202() {
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_subject_type_exact_match_returns_202",
             "subject": "s-publish_event_subject_type_exact_match_returns_202",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -4010,7 +4064,7 @@ async fn publish_event_subject_type_wildcard_suffix_match_returns_202() {
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_subject_type_wildcard_suffix_match_returns_202",
             "subject": "s-publish_event_subject_type_wildcard_suffix_match_returns_202",
             // Chained under the wildcard's "acme" prefix - a Type, still
@@ -4044,7 +4098,7 @@ async fn publish_event_subject_type_wildcard_wrong_prefix_returns_400() {
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_subject_type_wildcard_wrong_prefix_returns_400",
             "subject": "s-publish_event_subject_type_wildcard_wrong_prefix_returns_400",
             // Same shape as the wildcard-match test, but chained under a
@@ -4089,7 +4143,7 @@ async fn publish_event_subject_type_bare_base_implicit_coverage_returns_202() {
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_subject_type_bare_base_implicit_coverage_returns_202",
             "subject": "s-publish_event_subject_type_bare_base_implicit_coverage_returns_202",
             // Chained under the bare-base pattern - matched via GTS's
@@ -4124,7 +4178,7 @@ async fn publish_event_subject_type_not_allowed_returns_400() {
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_subject_type_not_allowed_returns_400",
             "subject": "s-publish_event_subject_type_not_allowed_returns_400",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -4155,6 +4209,134 @@ async fn publish_event_subject_type_not_allowed_returns_400() {
 }
 
 #[tokio::test]
+async fn publish_event_with_a_nil_tenant_returns_400() {
+    // A backend that never stores keeps an admitted event in the outbox, so
+    // `outbox_bodies` counts it.
+    let harness = EventBrokerHarness::builder()
+        .with_backend(Arc::new(NeverStoringBackend::new(Arc::new(
+            memory_event_broker_plugin::MemoryBackend::new(),
+        ))))
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+            {
+                "id": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
+            },
+        ])))
+        .build()
+        .await;
+
+    let resp = harness
+        .api_v1()
+        .post_events()
+        .with_body(Json(&json!({
+            "id": Uuid::new_v4(),
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "subject_tenant": "00000000-0000-0000-0000-000000000000",
+            "source": "test-publish_event_with_a_nil_tenant_returns_400",
+            "subject": "s-publish_event_with_a_nil_tenant_returns_400",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": Utc::now().to_rfc3339(),
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "InvalidTenant: event 0: the event's tenant must not be the nil UUID",
+            "instance": "/event-broker/v1/events",
+            "context": {
+                "format": "InvalidTenant: event 0: the event's tenant must not be the nil UUID",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    assert_eq!(harness.outbox_bodies().await, 0, "nothing is enqueued");
+}
+
+#[tokio::test]
+/// The nil tenant is the second event, so the rejection names its index and the
+/// whole batch is refused: the other two events are not enqueued either.
+async fn publish_batch_with_a_nil_tenant_event_returns_400() {
+    // A backend that never stores keeps an admitted event in the outbox, so
+    // `outbox_bodies` counts it.
+    let harness = EventBrokerHarness::builder()
+        .with_backend(Arc::new(NeverStoringBackend::new(Arc::new(
+            memory_event_broker_plugin::MemoryBackend::new(),
+        ))))
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+            {
+                "id": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
+            },
+        ])))
+        .build()
+        .await;
+
+    let resp = harness
+        .api_v1()
+        .post_events_batch()
+        .with_body(Json(&json!({
+            "events": [
+                {
+                    "id": Uuid::from_u128(145),
+                    "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                    "subject_tenant": Uuid::from_u128(0x7a),
+                    "source": "test-publish_batch_with_a_nil_tenant_event_returns_400",
+                    "subject": "s-publish_batch_with_a_nil_tenant_event_returns_400",
+                    "subject_type": "gts.x.eb.t1.subject.v1~",
+                    "occurred_at": "2026-05-29T10:13:00Z",
+                },
+                {
+                    "id": Uuid::from_u128(146),
+                    "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                    "subject_tenant": "00000000-0000-0000-0000-000000000000",
+                    "source": "test-publish_batch_with_a_nil_tenant_event_returns_400",
+                    "subject": "s-publish_batch_with_a_nil_tenant_event_returns_400",
+                    "subject_type": "gts.x.eb.t1.subject.v1~",
+                    "occurred_at": "2026-05-29T10:13:00Z",
+                },
+                {
+                    "id": Uuid::from_u128(147),
+                    "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                    "subject_tenant": Uuid::from_u128(0x7b),
+                    "source": "test-publish_batch_with_a_nil_tenant_event_returns_400",
+                    "subject": "s-publish_batch_with_a_nil_tenant_event_returns_400",
+                    "subject_type": "gts.x.eb.t1.subject.v1~",
+                    "occurred_at": "2026-05-29T10:13:00Z",
+                },
+            ],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "InvalidTenant: event 1: the event's tenant must not be the nil UUID",
+            "instance": "/event-broker/v1/events:batch",
+            "context": {
+                "format": "InvalidTenant: event 1: the event's tenant must not be the nil UUID",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    assert_eq!(harness.outbox_bodies().await, 0, "nothing is enqueued");
+}
+
+#[tokio::test]
 async fn publish_event_empty_allowed_subject_types_rejects_everything() {
     let harness = EventBrokerHarness::builder()
         .with_type_registry(StaticTypesRegistry::of(json!([
@@ -4174,7 +4356,7 @@ async fn publish_event_empty_allowed_subject_types_rejects_everything() {
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_empty_allowed_subject_types_rejects_everything",
             "subject": "s-publish_event_empty_allowed_subject_types_rejects_everything",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -4210,7 +4392,7 @@ async fn publish_event_unregistered_event_type_short_circuits_subject_type_check
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.unregistered.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-publish_event_unregistered_event_type_short_circuits_subject_type_check",
             "subject": "s-publish_event_unregistered_event_type_short_circuits_subject_type_check",
             // Malformed - would also fail the subject-type check if it were
@@ -4263,7 +4445,7 @@ async fn publish_event_rejects_a_non_printable_source() {
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "orders\nservice",
             "subject": "s1",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -4293,7 +4475,7 @@ async fn publish_event_rejects_an_over_length_subject() {
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "orders-service",
             "subject": "s".repeat(1025),
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -4322,7 +4504,7 @@ async fn publish_event_envelope_encoding_is_checked_before_event_type_lookup() {
         json!({
             "id": Uuid::new_v4(),
             "type": "gts.cf.core.events.event.v1~x.eb.t1.unregistered.v1~",
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": source,
             "subject": "s1",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -4392,18 +4574,19 @@ async fn tenant_scoped_produce_denial_has_no_persistence_side_effects() {
                 r#type: crate::test_support::event_type_id(
                     "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
                 ),
-                tenant_id: target,
+                subject_tenant: target,
                 source: "denied".to_owned(),
                 subject: "s".to_owned(),
                 subject_type: gts::GtsTypeId::new("gts.x.eb.t1.subject.v1~"),
+                subject_owner: None,
                 occurred_at: Utc::now(),
                 trace_parent: None,
                 data: json!({}),
-                meta: Some(crate::domain::model::Meta {
+                meta: Some(crate::domain::ingest::PublishMeta {
                     version: 1,
-                    producer_id: producer,
+                    producer: Some(producer),
                     previous: Some(0),
-                    sequence: 1,
+                    sequence: Some(1),
                 }),
             },
         )
@@ -4478,7 +4661,7 @@ fn foo_event_of(id: u128, bytes: usize) -> serde_json::Value {
     let mut body = json!({
         "id": Uuid::from_u128(id),
         "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-        "tenant_id": Uuid::from_u128(0x7e7a_2001),
+        "subject_tenant": Uuid::from_u128(0x7e7a_2001),
         "source": "order-service",
         "subject": "order-1",
         "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -4497,7 +4680,7 @@ fn keyed_event(id: u128, key: &str) -> serde_json::Value {
     json!({
         "id": Uuid::from_u128(id),
         "type": "gts.cf.core.events.event.v1~x.eb.t1.keyed.v1~",
-        "tenant_id": Uuid::from_u128(0x7e7a_2001),
+        "subject_tenant": Uuid::from_u128(0x7e7a_2001),
         "source": "order-service",
         "subject": "order-1",
         "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -4816,4 +4999,1398 @@ async fn a_synchronous_publish_over_a_size_limit_is_refused_and_writes_nothing()
         })
     );
     assert_eq!(written_events(&harness).await, 0);
+}
+
+// -- meta mode shape (ADR-0004 "Mode-Shape Enforcement at Publish Time") ----
+
+/// Registers a monotonic-mode producer and returns its id.
+async fn register_monotonic_producer(harness: &EventBrokerHarness) -> Uuid {
+    harness
+        .ingest()
+        .register_producer(
+            harness.security_context(),
+            ProducerRegistrationInput {
+                mode: ProducerMode::Monotonic,
+                client_agent: "test-agent".to_owned(),
+            },
+        )
+        .await
+        .expect("producer registration must succeed")
+        .id
+}
+
+#[tokio::test]
+async fn a_meta_with_a_sequence_and_no_producer_is_refused_as_meta_without_producer_id() {
+    let harness = run_rules_harness().await;
+    let tenant_id = Uuid::from_u128(0x7e7a_1801);
+
+    let resp = harness
+        .api_v1()
+        .post_events()
+        .with_body(Json(&json!({
+            "id": Uuid::from_u128(0xe000_1801),
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "subject_tenant": tenant_id,
+            "source": "order-service",
+            "subject": "order-mode-shape",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": "2026-05-29T10:40:00Z",
+            "meta": { "version": 1, "sequence": 5 },
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "MetaWithoutProducerId: meta carries previous or sequence but no producer",
+            "instance": "/event-broker/v1/events",
+            "context": {
+                "format": "MetaWithoutProducerId: meta carries previous or sequence but no producer",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    let sentinel = publish_sentinel(&harness, Uuid::from_u128(0x5e7_1801), tenant_id).await;
+    assert_eq!(
+        stored_ids_through(
+            &harness,
+            "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+            sentinel
+        )
+        .await,
+        vec![sentinel],
+        "a refused publish stores nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_meta_with_a_previous_and_no_producer_is_refused_as_meta_without_producer_id() {
+    let harness = run_rules_harness().await;
+    let tenant_id = Uuid::from_u128(0x7e7a_1811);
+
+    let resp = harness
+        .api_v1()
+        .post_events()
+        .with_body(Json(&json!({
+            "id": Uuid::from_u128(0xe000_1811),
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "subject_tenant": tenant_id,
+            "source": "order-service",
+            "subject": "order-mode-shape",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": "2026-05-29T10:40:00Z",
+            "meta": { "version": 1, "previous": 4 },
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "MetaWithoutProducerId: meta carries previous or sequence but no producer",
+            "instance": "/event-broker/v1/events",
+            "context": {
+                "format": "MetaWithoutProducerId: meta carries previous or sequence but no producer",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    let sentinel = publish_sentinel(&harness, Uuid::from_u128(0x5e7_1811), tenant_id).await;
+    assert_eq!(
+        stored_ids_through(
+            &harness,
+            "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+            sentinel
+        )
+        .await,
+        vec![sentinel],
+        "a refused publish stores nothing"
+    );
+}
+
+/// A literal nil producer id names no producer, the same as an absent one.
+#[tokio::test]
+async fn a_meta_with_a_nil_producer_and_a_sequence_is_refused_as_meta_without_producer_id() {
+    let harness = run_rules_harness().await;
+    let tenant_id = Uuid::from_u128(0x7e7a_1821);
+
+    let resp = harness
+        .api_v1()
+        .post_events()
+        .with_body(Json(&json!({
+            "id": Uuid::from_u128(0xe000_1821),
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "subject_tenant": tenant_id,
+            "source": "order-service",
+            "subject": "order-mode-shape",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": "2026-05-29T10:40:00Z",
+            "meta": { "version": 1, "producer": Uuid::nil(), "sequence": 3 },
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "MetaWithoutProducerId: meta carries previous or sequence but no producer",
+            "instance": "/event-broker/v1/events",
+            "context": {
+                "format": "MetaWithoutProducerId: meta carries previous or sequence but no producer",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    let sentinel = publish_sentinel(&harness, Uuid::from_u128(0x5e7_1821), tenant_id).await;
+    assert_eq!(
+        stored_ids_through(
+            &harness,
+            "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+            sentinel
+        )
+        .await,
+        vec![sentinel],
+        "a refused publish stores nothing"
+    );
+}
+
+/// The synchronous path runs the same check before anything is enqueued.
+#[tokio::test]
+async fn a_sync_publish_with_a_sequence_and_no_producer_is_refused_as_meta_without_producer_id() {
+    let harness = run_rules_harness().await;
+    let tenant_id = Uuid::from_u128(0x7e7a_1831);
+
+    let resp = harness
+        .api_v1()
+        .post_events()
+        .with_header(
+            axum::http::header::HeaderName::from_static("prefer"),
+            axum::http::HeaderValue::from_static("wait=5"),
+        )
+        .with_body(Json(&json!({
+            "id": Uuid::from_u128(0xe000_1831),
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "subject_tenant": tenant_id,
+            "source": "order-service",
+            "subject": "order-mode-shape",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": "2026-05-29T10:40:00Z",
+            "meta": { "version": 1, "sequence": 5 },
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "MetaWithoutProducerId: meta carries previous or sequence but no producer",
+            "instance": "/event-broker/v1/events",
+            "context": {
+                "format": "MetaWithoutProducerId: meta carries previous or sequence but no producer",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    let sentinel = publish_sentinel(&harness, Uuid::from_u128(0x5e7_1831), tenant_id).await;
+    assert_eq!(
+        stored_ids_through(
+            &harness,
+            "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+            sentinel
+        )
+        .await,
+        vec![sentinel],
+        "a refused publish stores nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_chained_publish_without_previous_is_refused_as_chain_mode_fields_missing() {
+    let harness = run_rules_harness().await;
+    let producer_id = register_test_producer(&harness).await;
+    let tenant_id = Uuid::from_u128(0x7e7a_1841);
+
+    let resp = harness
+        .api_v1()
+        .post_events()
+        .with_body(Json(&json!({
+            "id": Uuid::from_u128(0xe000_1841),
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "subject_tenant": tenant_id,
+            "source": "order-service",
+            "subject": "order-mode-shape",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": "2026-05-29T10:40:00Z",
+            "meta": { "version": 1, "producer": producer_id, "sequence": 1 },
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "ChainModeFieldsMissing: a chained-mode publish needs meta.previous and meta.sequence",
+            "instance": "/event-broker/v1/events",
+            "context": {
+                "format": "ChainModeFieldsMissing: a chained-mode publish needs meta.previous and meta.sequence",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    let cursors = harness
+        .api_v1()
+        .get_producer_cursors(&producer_id.to_string())
+        .send()
+        .await;
+    cursors.assert_status(200);
+    assert_eq!(
+        cursors.json(),
+        json!({ "id": producer_id, "client_agent": "test-agent", "topics": [] })
+    );
+    let sentinel = publish_sentinel(&harness, Uuid::from_u128(0x5e7_1841), tenant_id).await;
+    assert_eq!(
+        stored_ids_through(
+            &harness,
+            "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+            sentinel
+        )
+        .await,
+        vec![sentinel],
+        "a refused publish stores nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_chained_publish_without_sequence_is_refused_as_chain_mode_fields_missing() {
+    let harness = run_rules_harness().await;
+    let producer_id = register_test_producer(&harness).await;
+    let tenant_id = Uuid::from_u128(0x7e7a_1851);
+
+    let resp = harness
+        .api_v1()
+        .post_events()
+        .with_body(Json(&json!({
+            "id": Uuid::from_u128(0xe000_1851),
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "subject_tenant": tenant_id,
+            "source": "order-service",
+            "subject": "order-mode-shape",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": "2026-05-29T10:40:00Z",
+            "meta": { "version": 1, "producer": producer_id, "previous": 0 },
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "ChainModeFieldsMissing: a chained-mode publish needs meta.previous and meta.sequence",
+            "instance": "/event-broker/v1/events",
+            "context": {
+                "format": "ChainModeFieldsMissing: a chained-mode publish needs meta.previous and meta.sequence",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    let cursors = harness
+        .api_v1()
+        .get_producer_cursors(&producer_id.to_string())
+        .send()
+        .await;
+    cursors.assert_status(200);
+    assert_eq!(
+        cursors.json(),
+        json!({ "id": producer_id, "client_agent": "test-agent", "topics": [] })
+    );
+    let sentinel = publish_sentinel(&harness, Uuid::from_u128(0x5e7_1851), tenant_id).await;
+    assert_eq!(
+        stored_ids_through(
+            &harness,
+            "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+            sentinel
+        )
+        .await,
+        vec![sentinel],
+        "a refused publish stores nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_monotonic_publish_with_previous_is_refused_as_monotonic_mode_fields_violation() {
+    let harness = run_rules_harness().await;
+    let producer_id = register_monotonic_producer(&harness).await;
+    let tenant_id = Uuid::from_u128(0x7e7a_1861);
+    let seed_id = Uuid::from_u128(0xe000_1867);
+
+    harness
+        .api_v1()
+        .post_events()
+        .with_body(Json(&json!({
+            "id": seed_id,
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "subject_tenant": tenant_id,
+            "source": "order-service",
+            "subject": "order-mode-shape",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": "2026-05-29T10:40:00Z",
+            "meta": { "version": 1, "producer": producer_id, "sequence": 7 },
+        })))
+        .send()
+        .await
+        .assert_status(202);
+
+    let resp = harness
+        .api_v1()
+        .post_events()
+        .with_body(Json(&json!({
+            "id": Uuid::from_u128(0xe000_1868),
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "subject_tenant": tenant_id,
+            "source": "order-service",
+            "subject": "order-mode-shape",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": "2026-05-29T10:40:01Z",
+            "meta": { "version": 1, "producer": producer_id, "previous": 7, "sequence": 8 },
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "MonotonicModeFieldsViolation: a monotonic-mode publish needs meta.sequence and must omit meta.previous",
+            "instance": "/event-broker/v1/events",
+            "context": {
+                "format": "MonotonicModeFieldsViolation: a monotonic-mode publish needs meta.sequence and must omit meta.previous",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    let cursors = harness
+        .api_v1()
+        .get_producer_cursors(&producer_id.to_string())
+        .send()
+        .await;
+    cursors.assert_status(200);
+    assert_eq!(
+        cursors.json(),
+        json!({
+            "id": producer_id,
+            "client_agent": "test-agent",
+            "topics": [{
+                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                "last_sequence": 7,
+            }],
+        })
+    );
+    let sentinel = publish_sentinel(&harness, Uuid::from_u128(0x5e7_1861), tenant_id).await;
+    assert_eq!(
+        stored_ids_through(
+            &harness,
+            "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+            sentinel
+        )
+        .await,
+        vec![seed_id, sentinel],
+        "the refused publish stores nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_monotonic_publish_without_sequence_is_refused_as_monotonic_mode_fields_violation() {
+    let harness = run_rules_harness().await;
+    let producer_id = register_monotonic_producer(&harness).await;
+    let tenant_id = Uuid::from_u128(0x7e7a_1871);
+
+    let resp = harness
+        .api_v1()
+        .post_events()
+        .with_body(Json(&json!({
+            "id": Uuid::from_u128(0xe000_1871),
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "subject_tenant": tenant_id,
+            "source": "order-service",
+            "subject": "order-mode-shape",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": "2026-05-29T10:40:00Z",
+            "meta": { "version": 1, "producer": producer_id },
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "MonotonicModeFieldsViolation: a monotonic-mode publish needs meta.sequence and must omit meta.previous",
+            "instance": "/event-broker/v1/events",
+            "context": {
+                "format": "MonotonicModeFieldsViolation: a monotonic-mode publish needs meta.sequence and must omit meta.previous",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    let cursors = harness
+        .api_v1()
+        .get_producer_cursors(&producer_id.to_string())
+        .send()
+        .await;
+    cursors.assert_status(200);
+    assert_eq!(
+        cursors.json(),
+        json!({ "id": producer_id, "client_agent": "test-agent", "topics": [] })
+    );
+    let sentinel = publish_sentinel(&harness, Uuid::from_u128(0x5e7_1871), tenant_id).await;
+    assert_eq!(
+        stored_ids_through(
+            &harness,
+            "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+            sentinel
+        )
+        .await,
+        vec![sentinel],
+        "a refused publish stores nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_meta_version_above_the_supported_one_is_refused_as_unknown_meta_version() {
+    let harness = run_rules_harness().await;
+    let producer_id = register_test_producer(&harness).await;
+    let tenant_id = Uuid::from_u128(0x7e7a_1881);
+
+    let resp = harness
+        .api_v1()
+        .post_events()
+        .with_body(Json(&json!({
+            "id": Uuid::from_u128(0xe000_1881),
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "subject_tenant": tenant_id,
+            "source": "order-service",
+            "subject": "order-mode-shape",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": "2026-05-29T10:40:00Z",
+            "meta": { "version": 2, "producer": producer_id, "previous": 0, "sequence": 1 },
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "UnknownMetaVersion: meta.version is newer than the broker supports (1)",
+            "instance": "/event-broker/v1/events",
+            "context": {
+                "format": "UnknownMetaVersion: meta.version is newer than the broker supports (1)",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    let cursors = harness
+        .api_v1()
+        .get_producer_cursors(&producer_id.to_string())
+        .send()
+        .await;
+    cursors.assert_status(200);
+    assert_eq!(
+        cursors.json(),
+        json!({ "id": producer_id, "client_agent": "test-agent", "topics": [] })
+    );
+    let sentinel = publish_sentinel(&harness, Uuid::from_u128(0x5e7_1881), tenant_id).await;
+    assert_eq!(
+        stored_ids_through(
+            &harness,
+            "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+            sentinel
+        )
+        .await,
+        vec![sentinel],
+        "a refused publish stores nothing"
+    );
+}
+/// The version check applies to every `meta` that is present (ADR-0003,
+/// "Optional Versioned `meta` Block"): a block that names no producer and
+/// carries no chain field is not stateless when its version is newer.
+#[tokio::test]
+async fn a_newer_meta_version_with_no_producer_is_refused_as_unknown_meta_version() {
+    let harness = run_rules_harness().await;
+    let tenant_id = Uuid::from_u128(0x7e7a_18e1);
+
+    let resp = harness
+        .api_v1()
+        .post_events()
+        .with_body(Json(&json!({
+            "id": Uuid::from_u128(0xe000_18e1),
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "subject_tenant": tenant_id,
+            "source": "order-service",
+            "subject": "order-stateless-meta",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": "2026-05-29T10:40:00Z",
+            "meta": { "version": 2 },
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "UnknownMetaVersion: meta.version is newer than the broker supports (1)",
+            "instance": "/event-broker/v1/events",
+            "context": {
+                "format": "UnknownMetaVersion: meta.version is newer than the broker supports (1)",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    let sentinel = publish_sentinel(&harness, Uuid::from_u128(0x5e7_18e1), tenant_id).await;
+    assert_eq!(
+        stored_ids_through(
+            &harness,
+            "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+            sentinel
+        )
+        .await,
+        vec![sentinel],
+        "a refused publish stores nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_batch_with_a_newer_meta_version_with_no_producer_is_refused_as_unknown_meta_version() {
+    let harness = run_rules_harness().await;
+    let tenant_id = Uuid::from_u128(0x7e7a_18f1);
+
+    let resp = harness
+        .api_v1()
+        .post_events_batch()
+        .with_body(Json(&json!({
+            "events": [
+                {
+                    "id": Uuid::from_u128(0xe000_18f1),
+                    "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                    "subject_tenant": tenant_id,
+                    "source": "order-service",
+                    "subject": "order-stateless-meta",
+                    "subject_type": "gts.x.eb.t1.subject.v1~",
+                    "occurred_at": "2026-05-29T10:40:00Z",
+                },
+                {
+                    "id": Uuid::from_u128(0xe000_18f2),
+                    "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                    "subject_tenant": tenant_id,
+                    "source": "order-service",
+                    "subject": "order-stateless-meta",
+                    "subject_type": "gts.x.eb.t1.subject.v1~",
+                    "occurred_at": "2026-05-29T10:40:01Z",
+                    "meta": { "version": 2 },
+                },
+            ],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "UnknownMetaVersion: meta.version is newer than the broker supports (1)",
+            "instance": "/event-broker/v1/events:batch",
+            "context": {
+                "format": "UnknownMetaVersion: meta.version is newer than the broker supports (1)",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    let sentinel = publish_sentinel(&harness, Uuid::from_u128(0x5e7_18f1), tenant_id).await;
+    assert_eq!(
+        stored_ids_through(
+            &harness,
+            "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+            sentinel
+        )
+        .await,
+        vec![sentinel],
+        "a refused batch stores nothing"
+    );
+}
+
+/// A block naming no producer is checked for chain fields before its version
+/// (ADR-0004, "Mode-Shape Enforcement at Publish Time").
+#[tokio::test]
+async fn a_sequence_without_a_producer_at_a_newer_version_is_refused_as_meta_without_producer_id() {
+    let harness = run_rules_harness().await;
+    let tenant_id = Uuid::from_u128(0x7e7a_18e9);
+
+    let resp = harness
+        .api_v1()
+        .post_events()
+        .with_body(Json(&json!({
+            "id": Uuid::from_u128(0xe000_18e9),
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "subject_tenant": tenant_id,
+            "source": "order-service",
+            "subject": "order-mode-shape",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": "2026-05-29T10:40:00Z",
+            "meta": { "version": 2, "sequence": 1 },
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "MetaWithoutProducerId: meta carries previous or sequence but no producer",
+            "instance": "/event-broker/v1/events",
+            "context": {
+                "format": "MetaWithoutProducerId: meta carries previous or sequence but no producer",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    let sentinel = publish_sentinel(&harness, Uuid::from_u128(0x5e7_18e9), tenant_id).await;
+    assert_eq!(
+        stored_ids_through(
+            &harness,
+            "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+            sentinel
+        )
+        .await,
+        vec![sentinel],
+        "a refused publish stores nothing"
+    );
+}
+
+/// Two senders whose `meta` names no producer and carries no chain field are
+/// each stateless: neither is checked against a chain, so neither is taken
+/// for a duplicate of the other.
+#[tokio::test]
+async fn two_publishes_with_a_version_only_meta_are_both_stored() {
+    let harness = run_rules_harness().await;
+    let tenant_id = Uuid::from_u128(0x7e7a_1891);
+    let first_id = Uuid::from_u128(0xe000_1891);
+    let second_id = Uuid::from_u128(0xe000_1892);
+
+    let first = harness
+        .api_v1()
+        .post_events()
+        .with_body(Json(&json!({
+            "id": first_id,
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "subject_tenant": tenant_id,
+            "source": "order-service",
+            "subject": "order-stateless-meta",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": "2026-05-29T10:40:00Z",
+            "meta": { "version": 1 },
+        })))
+        .send()
+        .await;
+    let second = harness
+        .api_v1()
+        .post_events()
+        .with_body(Json(&json!({
+            "id": second_id,
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "subject_tenant": tenant_id,
+            "source": "billing-service",
+            "subject": "invoice-stateless-meta",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": "2026-05-29T10:40:01Z",
+            "meta": { "version": 1 },
+        })))
+        .send()
+        .await;
+
+    first.assert_status(202);
+    second.assert_status(202);
+    assert_eq!(
+        stored_ids_through(
+            &harness,
+            "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+            second_id
+        )
+        .await,
+        vec![first_id, second_id],
+        "both stateless events are stored, in publish order"
+    );
+}
+
+/// The event a version-only `meta` becomes carries no `meta`, as if the
+/// producer had left it out.
+#[tokio::test]
+async fn a_version_only_meta_is_admitted_as_an_event_without_meta() {
+    let harness = run_rules_harness().await;
+    let caller = harness.security_context();
+    let request = |id: Uuid, subject: &str| {
+        let body: crate::api::rest::handlers::ingest::dto::PublishEventRequest =
+            serde_json::from_value(json!({
+                "id": id,
+                "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                "subject_tenant": Uuid::from_u128(0x7e7a_18a1),
+                "source": "order-service",
+                "subject": subject,
+                "subject_type": "gts.x.eb.t1.subject.v1~",
+                "occurred_at": "2026-05-29T10:40:00Z",
+                "meta": { "version": 1 },
+            }))
+            .expect("the REST handler reads the body");
+        PublishRequest::try_from(body).expect("the REST handler takes it")
+    };
+
+    let first = harness
+        .ingest()
+        .publish_event(
+            harness.security_context(),
+            request(Uuid::from_u128(0xe000_18a1), "order-1"),
+        )
+        .await;
+    let second = harness
+        .ingest()
+        .publish_event(
+            harness.security_context(),
+            request(Uuid::from_u128(0xe000_18a2), "order-2"),
+        )
+        .await;
+
+    let Ok(crate::domain::ingest::PublishAck::Accepted(first)) = first else {
+        panic!("the first event must be accepted, got {first:?}");
+    };
+    let Ok(crate::domain::ingest::PublishAck::Accepted(second)) = second else {
+        panic!("the second event must be accepted, got {second:?}");
+    };
+    assert_eq!(
+        (
+            serde_json::to_value(first).expect("the event serializes"),
+            serde_json::to_value(second).expect("the event serializes"),
+        ),
+        (
+            json!({
+                "id": Uuid::from_u128(0xe000_18a1),
+                "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                "subject_tenant": Uuid::from_u128(0x7e7a_18a1),
+                "source": "order-service",
+                "subject": "order-1",
+                "subject_type": "gts.x.eb.t1.subject.v1~",
+                "occurred_at": "2026-05-29T10:40:00Z",
+                "trace_parent": null,
+                "data": null,
+                "meta": null,
+                "ingest": { "tenant": caller.subject_tenant_id(), "actor": caller.subject_id() },
+                "partition": null,
+                "sequence": null,
+                "sequence_time": null,
+            }),
+            json!({
+                "id": Uuid::from_u128(0xe000_18a2),
+                "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                "subject_tenant": Uuid::from_u128(0x7e7a_18a1),
+                "source": "order-service",
+                "subject": "order-2",
+                "subject_type": "gts.x.eb.t1.subject.v1~",
+                "occurred_at": "2026-05-29T10:40:00Z",
+                "trace_parent": null,
+                "data": null,
+                "meta": null,
+                "ingest": { "tenant": caller.subject_tenant_id(), "actor": caller.subject_id() },
+                "partition": null,
+                "sequence": null,
+                "sequence_time": null,
+            }),
+        )
+    );
+}
+
+/// The producer lookup comes before the shape check: an unknown producer is
+/// answered `404` whatever its `meta` shape.
+#[tokio::test]
+async fn an_unknown_producer_with_a_bad_shape_is_answered_producer_not_found() {
+    let harness = run_rules_harness().await;
+    let unknown = Uuid::from_u128(0x0190_f1a2_0000_7000_8000_0000_0000_18b1);
+    let tenant_id = Uuid::from_u128(0x7e7a_18b1);
+
+    let resp = harness
+        .api_v1()
+        .post_events()
+        .with_body(Json(&json!({
+            "id": Uuid::from_u128(0xe000_18b1),
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "subject_tenant": tenant_id,
+            "source": "order-service",
+            "subject": "order-mode-shape",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": "2026-05-29T10:40:00Z",
+            "meta": { "version": 1, "producer": unknown, "sequence": 1 },
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(404);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
+            "title": "Not Found",
+            "status": 404,
+            "detail": "the producer is not registered or its registration has expired",
+            "instance": "/event-broker/v1/events",
+            "context": {
+                "resource_type": "gts.cf.core.events.producer.v1~",
+                "resource_name": unknown,
+            },
+        })
+    );
+    let sentinel = publish_sentinel(&harness, Uuid::from_u128(0x5e7_18b1), tenant_id).await;
+    assert_eq!(
+        stored_ids_through(
+            &harness,
+            "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+            sentinel
+        )
+        .await,
+        vec![sentinel],
+        "a refused publish stores nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_batch_with_a_chained_event_missing_previous_is_refused_as_chain_mode_fields_missing() {
+    let harness = run_rules_harness().await;
+    let producer_id = register_test_producer(&harness).await;
+    let tenant_id = Uuid::from_u128(0x7e7a_18c1);
+
+    let resp = harness
+        .api_v1()
+        .post_events_batch()
+        .with_body(Json(&json!({
+            "events": [
+                {
+                    "id": Uuid::from_u128(0xe000_18c1),
+                    "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                    "subject_tenant": tenant_id,
+                    "source": "order-service",
+                    "subject": "order-mode-shape",
+                    "subject_type": "gts.x.eb.t1.subject.v1~",
+                    "occurred_at": "2026-05-29T10:40:00Z",
+                    "meta": { "version": 1, "producer": producer_id, "previous": 0, "sequence": 1 },
+                },
+                {
+                    "id": Uuid::from_u128(0xe000_18c2),
+                    "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                    "subject_tenant": tenant_id,
+                    "source": "order-service",
+                    "subject": "order-mode-shape",
+                    "subject_type": "gts.x.eb.t1.subject.v1~",
+                    "occurred_at": "2026-05-29T10:40:01Z",
+                    "meta": { "version": 1, "producer": producer_id, "sequence": 2 },
+                },
+                {
+                    "id": Uuid::from_u128(0xe000_18c3),
+                    "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                    "subject_tenant": tenant_id,
+                    "source": "order-service",
+                    "subject": "order-mode-shape",
+                    "subject_type": "gts.x.eb.t1.subject.v1~",
+                    "occurred_at": "2026-05-29T10:40:02Z",
+                    "meta": { "version": 1, "producer": producer_id, "previous": 2, "sequence": 3 },
+                },
+            ],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "ChainModeFieldsMissing: a chained-mode publish needs meta.previous and meta.sequence",
+            "instance": "/event-broker/v1/events:batch",
+            "context": {
+                "format": "ChainModeFieldsMissing: a chained-mode publish needs meta.previous and meta.sequence",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    let cursors = harness
+        .api_v1()
+        .get_producer_cursors(&producer_id.to_string())
+        .send()
+        .await;
+    cursors.assert_status(200);
+    assert_eq!(
+        cursors.json(),
+        json!({ "id": producer_id, "client_agent": "test-agent", "topics": [] })
+    );
+    let sentinel = publish_sentinel(&harness, Uuid::from_u128(0x5e7_18c1), tenant_id).await;
+    assert_eq!(
+        stored_ids_through(
+            &harness,
+            "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+            sentinel
+        )
+        .await,
+        vec![sentinel],
+        "a refused batch stores nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_batch_with_a_sequence_and_no_producer_is_refused_as_meta_without_producer_id() {
+    let harness = run_rules_harness().await;
+    let tenant_id = Uuid::from_u128(0x7e7a_18d1);
+
+    let resp = harness
+        .api_v1()
+        .post_events_batch()
+        .with_body(Json(&json!({
+            "events": [
+                {
+                    "id": Uuid::from_u128(0xe000_18d1),
+                    "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                    "subject_tenant": tenant_id,
+                    "source": "order-service",
+                    "subject": "order-mode-shape",
+                    "subject_type": "gts.x.eb.t1.subject.v1~",
+                    "occurred_at": "2026-05-29T10:40:00Z",
+                },
+                {
+                    "id": Uuid::from_u128(0xe000_18d2),
+                    "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                    "subject_tenant": tenant_id,
+                    "source": "order-service",
+                    "subject": "order-mode-shape",
+                    "subject_type": "gts.x.eb.t1.subject.v1~",
+                    "occurred_at": "2026-05-29T10:40:01Z",
+                    "meta": { "version": 1, "sequence": 2 },
+                },
+            ],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "MetaWithoutProducerId: meta carries previous or sequence but no producer",
+            "instance": "/event-broker/v1/events:batch",
+            "context": {
+                "format": "MetaWithoutProducerId: meta carries previous or sequence but no producer",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    let sentinel = publish_sentinel(&harness, Uuid::from_u128(0x5e7_18d1), tenant_id).await;
+    assert_eq!(
+        stored_ids_through(
+            &harness,
+            "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+            sentinel
+        )
+        .await,
+        vec![sentinel],
+        "a refused batch stores nothing"
+    );
+}
+
+// -- subject_owner and the ingest stamp ------------------------------------------
+
+/// The events the backend holds on partition 0 of `topic`, as
+/// `(id, subject_owner, ingest stamp as (tenant, actor))`, in sequence order.
+async fn stored_owners_and_stamps(
+    harness: &EventBrokerHarness,
+    topic: &str,
+) -> Vec<(Uuid, Option<Uuid>, Option<(Uuid, Uuid)>)> {
+    use event_broker_sdk::backend::{Partition, TopicPartition, Wait};
+
+    let at = TopicPartition::new(
+        toolkit_gts::GtsInstanceId::try_new(topic).expect("a valid topic id"),
+        Partition::new(0),
+    );
+    harness
+        .backend()
+        .read(&at, crate::domain::model::Sequence::NONE, 1024, Wait::No)
+        .await
+        .expect("read the stored events")
+        .iter()
+        .map(|event| {
+            (
+                event.id,
+                event.subject_owner,
+                event.ingest.map(|stamp| (stamp.tenant, stamp.actor)),
+            )
+        })
+        .collect()
+}
+
+/// An owned publish stores its owner; `"subject_owner": null` and an absent key
+/// both store a tenant-wide event. Each stored event carries the caller's tenant
+/// and principal as its ingest stamp.
+#[tokio::test]
+async fn a_publish_stores_its_owner_and_the_callers_ingest_stamp() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+            {
+                "id": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
+            },
+        ])))
+        .build()
+        .await;
+    let owner = Uuid::from_u128(0x0e);
+    let mut bodies = [
+        json!({ "id": Uuid::from_u128(0x5a01), "subject_owner": owner }),
+        json!({ "id": Uuid::from_u128(0x5a02), "subject_owner": null }),
+        json!({ "id": Uuid::from_u128(0x5a03) }),
+    ];
+    for body in &mut bodies {
+        let members = body.as_object_mut().expect("an object");
+        for (key, value) in json!({
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "subject_tenant": Uuid::from_u128(0x7e7a_5a00),
+            "source": "test-owner-and-stamp",
+            "subject": "s-owner-and-stamp",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": "2026-11-15T10:00:00Z",
+        })
+        .as_object()
+        .expect("an object")
+        {
+            members.insert(key.clone(), value.clone());
+        }
+    }
+
+    for body in &bodies {
+        harness
+            .api_v1()
+            .post_events()
+            .with_header(
+                axum::http::header::HeaderName::from_static("prefer"),
+                axum::http::HeaderValue::from_static("wait=5"),
+            )
+            .with_body(Json(body))
+            .send()
+            .await
+            .assert_status(201);
+    }
+
+    let caller = harness.security_context();
+    let stamp = Some((caller.subject_tenant_id(), caller.subject_id()));
+    assert_eq!(
+        stored_owners_and_stamps(&harness, "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1").await,
+        vec![
+            (Uuid::from_u128(0x5a01), Some(owner), stamp),
+            (Uuid::from_u128(0x5a02), None, stamp),
+            (Uuid::from_u128(0x5a03), None, stamp),
+        ]
+    );
+}
+
+/// An anonymous publisher leaves no ingest stamp on the event it publishes.
+#[tokio::test]
+async fn an_anonymous_publish_carries_no_ingest_stamp() {
+    let harness = run_rules_harness().await;
+    let request = |id: u128| PublishRequest {
+        id: Uuid::from_u128(id),
+        r#type: crate::test_support::event_type_id("gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"),
+        subject_tenant: Uuid::from_u128(0x7e7a_5b00),
+        source: "test-anonymous-stamp".to_owned(),
+        subject: "s-anonymous-stamp".to_owned(),
+        subject_type: gts::GtsTypeId::new("gts.x.eb.t1.subject.v1~"),
+        subject_owner: None,
+        occurred_at: Utc::now(),
+        trace_parent: None,
+        data: json!(null),
+        meta: None,
+    };
+
+    let anonymous = harness
+        .ingest()
+        .publish_event(
+            &toolkit_security::SecurityContext::anonymous(),
+            request(0x5b01),
+        )
+        .await;
+    let known = harness
+        .ingest()
+        .publish_event(harness.security_context(), request(0x5b02))
+        .await;
+
+    let (
+        Ok(crate::domain::ingest::PublishAck::Accepted(anonymous)),
+        Ok(crate::domain::ingest::PublishAck::Accepted(known)),
+    ) = (anonymous, known)
+    else {
+        panic!("both publishes must be accepted");
+    };
+    let caller = harness.security_context();
+    assert_eq!(
+        (anonymous.ingest, known.ingest),
+        (
+            None,
+            Some(crate::domain::model::IngestStamp {
+                tenant: caller.subject_tenant_id(),
+                actor: caller.subject_id(),
+            })
+        )
+    );
+}
+
+#[tokio::test]
+async fn publish_event_with_a_nil_owner_returns_400() {
+    // A backend that never stores keeps an admitted event in the outbox, so
+    // `outbox_bodies` counts it.
+    let harness = EventBrokerHarness::builder()
+        .with_backend(Arc::new(NeverStoringBackend::new(Arc::new(
+            memory_event_broker_plugin::MemoryBackend::new(),
+        ))))
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+            {
+                "id": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
+            },
+        ])))
+        .build()
+        .await;
+
+    let resp = harness
+        .api_v1()
+        .post_events()
+        .with_body(Json(&json!({
+            "id": Uuid::new_v4(),
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "subject_tenant": Uuid::new_v4(),
+            "source": "test-publish_event_with_a_nil_owner_returns_400",
+            "subject": "s-publish_event_with_a_nil_owner_returns_400",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "subject_owner": "00000000-0000-0000-0000-000000000000",
+            "occurred_at": Utc::now().to_rfc3339(),
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "InvalidSubjectOwner: event 0: the event's owner must not be the nil UUID",
+            "instance": "/event-broker/v1/events",
+            "context": {
+                "format": "InvalidSubjectOwner: event 0: the event's owner must not be the nil UUID",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    assert_eq!(harness.outbox_bodies().await, 0, "nothing is enqueued");
+}
+
+/// The ingest stamp is the broker's: a publish body carrying `meta.ingest_actor`
+/// is refused as an unknown field, `400 InvalidBody` from the handler's own
+/// parsing, and nothing is enqueued.
+#[tokio::test]
+async fn a_publish_whose_meta_carries_an_ingest_stamp_is_refused() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+        ])))
+        .build()
+        .await;
+
+    let resp = harness
+        .api_v1()
+        .post_events()
+        .with_header(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        )
+        .with_body(
+            r#"{"id":"00000000-0000-0000-0000-00000000b911","type":"gts.cf.core.events.event.v1~x.eb.t1.foo.v1~","subject_tenant":"00000000-0000-0000-0000-00000000b912","source":"test-ingest-stamp-key","subject":"s-ingest-stamp-key","subject_type":"gts.x.eb.t1.subject.v1~","occurred_at":"2026-11-15T00:00:00Z","meta":{"version":1,"ingest_actor":"00000000-0000-0000-0000-00000000b913"}}"#,
+        )
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "InvalidBody: invalid JSON body: unknown field `ingest_actor`, expected one \
+                       of `version`, `producer`, `previous`, `sequence` at line 1 column 330",
+            "instance": "/event-broker/v1/events",
+            "context": {
+                "format": "InvalidBody: invalid JSON body: unknown field `ingest_actor`, expected \
+                           one of `version`, `producer`, `previous`, `sequence` at line 1 column \
+                           330",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    assert_eq!(harness.outbox_bodies().await, 0);
+}
+
+/// A type keyed on `/subject_owner` (which narrows the owner to required) takes an
+/// owned event; an unowned one, absent or `null`, is `400 PartitionKeyUnresolved`;
+/// and an unowned one with bad `data` gets the `data` refusal first.
+#[tokio::test]
+async fn a_type_keyed_on_the_owner_refuses_an_unowned_event_after_its_data_check() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+            {
+                "id": "gts.cf.core.events.event.v1~x.eb.t1.owned.v1~",
+                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
+                "partition_key": "/subject_owner",
+                "subject_owner_required": true,
+                "data_schema": { "type": "object", "required": ["order_id"] },
+            },
+        ])))
+        .build()
+        .await;
+    let body = |data: serde_json::Value| {
+        json!({
+            "id": Uuid::new_v4(),
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.owned.v1~",
+            "subject_tenant": Uuid::from_u128(0x7e7a_5c00),
+            "source": "test-owner-keyed",
+            "subject": "s-owner-keyed",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": "2026-11-15T10:00:00Z",
+            "data": data,
+        })
+    };
+    let mut owned = body(json!({ "order_id": "o-1" }));
+    owned["subject_owner"] = json!(Uuid::from_u128(0x0e));
+    let absent = body(json!({ "order_id": "o-2" }));
+    let mut null_owner = body(json!({ "order_id": "o-3" }));
+    null_owner["subject_owner"] = json!(null);
+    let mut bad_data = body(json!({}));
+    bad_data["subject_owner"] = json!(null);
+    let unresolved = json!({
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": "PartitionKeyUnresolved: event type \
+                   'gts.cf.core.events.event.v1~x.eb.t1.owned.v1~' partitions on \
+                   `/subject_owner`, which this event does not resolve: internal: \
+                   partition-key pointer `/subject_owner` resolves to null",
+        "instance": "/event-broker/v1/events",
+        "context": {
+            "format": "PartitionKeyUnresolved: event type \
+                       'gts.cf.core.events.event.v1~x.eb.t1.owned.v1~' partitions on \
+                       `/subject_owner`, which this event does not resolve: internal: \
+                       partition-key pointer `/subject_owner` resolves to null",
+            "resource_type": "gts.cf.core.events.request.v1~",
+        },
+    });
+
+    let mut outcomes = Vec::new();
+    for body in [owned, absent, null_owner, bad_data] {
+        let resp = harness
+            .api_v1()
+            .post_events()
+            .with_body(Json(&body))
+            .send()
+            .await;
+        let status = resp.status().as_u16();
+        let text = resp.text();
+        outcomes.push((
+            status,
+            serde_json::from_str::<serde_json::Value>(&text).unwrap_or(json!(text)),
+        ));
+    }
+
+    assert_eq!(
+        outcomes,
+        vec![
+            (202, json!("")),
+            (400, unresolved.clone()),
+            (400, unresolved),
+            (
+                422,
+                json!({
+                    "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+                    "title": "Invalid Argument",
+                    "status": 422,
+                    "detail": "Request validation failed",
+                    "instance": "/event-broker/v1/events",
+                    "context": {
+                        "field_violations": [{
+                            "field": "(payload)",
+                            "description": "event data does not satisfy the event type's data schema",
+                            "reason": "schema_validation",
+                        }],
+                        "resource_type": "gts.cf.core.events.topic.v1~",
+                        "resource_name": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                    },
+                })
+            ),
+        ]
+    );
 }

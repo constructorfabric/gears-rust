@@ -21,8 +21,8 @@ fn a_second_acquire_is_refused_while_the_first_is_held() {
     let id = Uuid::new_v4();
     let _first = leases.acquire(id).expect("first acquire");
 
-    // This is the `409 StreamingInProgress` case, and every call carrying the
-    // id except DELETE asks the same question.
+    // This is the `409 StreamingInProgress` case of a second `:stream`; a
+    // `:seek` asks `is_held` the same question.
     assert!(leases.acquire(id).is_none());
     assert!(leases.is_held(id));
 }

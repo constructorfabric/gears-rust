@@ -84,10 +84,11 @@ async fn response_text(router: Router, method: Method, path: &str) -> (StatusCod
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn classifies_every_endpoint_to_the_correct_role() {
-    // DESIGN.md:1354-1392's routing table: 5 Ingest + 11 Delivery + 3 Shared
-    // (Shared forwards to Ingest - design.md D2). Expected role is the
-    // `DirectoryService` gear name `forward()` resolves (design.md D4),
-    // minus the `"event-broker-"` prefix `forward()` adds internally.
+    // The routing table of `DESIGN.md` "Dispatcher Routing Table": 6 Ingest +
+    // 11 Delivery + 2 Shared (Shared forwards to Ingest - design.md D2).
+    // Expected role is the `DirectoryService` gear name `forward()` resolves
+    // (design.md D4), minus the `"event-broker-"` prefix `forward()` adds
+    // internally.
     let cases: &[(Method, &str, &str)] = &[
         (Method::POST, "/event-broker/v1/events", "ingest"),
         (Method::POST, "/event-broker/v1/events:batch", "ingest"),
@@ -136,7 +137,7 @@ async fn classifies_every_endpoint_to_the_correct_role() {
     assert_eq!(
         cases.len(),
         19,
-        "DESIGN.md:1354-1392 lists 19 endpoints - update this table deliberately if that changes"
+        "DESIGN.md's Dispatcher Routing Table lists 19 endpoints - update this table deliberately"
     );
 
     let (hub, _cluster) = crate::test_support::standalone_event_broker_cluster().await;
@@ -358,7 +359,7 @@ async fn returns_503_within_the_timeout_when_a_resolved_instance_accepts_but_nev
 
 /// Emits three heartbeat bytes a little apart, then goes silent (holding the
 /// connection open) rather than ever completing the response - simulating a
-/// long-poll/SSE upstream (`DESIGN.md:1825`'s heartbeat-cadence framing).
+/// streaming/SSE upstream (`DESIGN.md` "Streaming connection - proxy interaction").
 async fn heartbeat_then_silence() -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
     tokio::spawn(async move {

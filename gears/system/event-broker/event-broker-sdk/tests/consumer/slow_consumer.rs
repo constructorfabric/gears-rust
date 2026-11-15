@@ -8,8 +8,8 @@ use event_broker_sdk::gts_id;
 use event_broker_sdk::{
     BatchHandler, BatchHandlerOutcome, CommitOffset, ConnectionDropReason, ConsumerBuffering,
     ConsumerBuilder, ConsumerError, ConsumerGroupId, ConsumerGroupRef, ConsumerRuntimeEvent,
-    ConsumerRuntimeListener, Delivery, EventBatch, Fallback, InMemoryOffsetManager,
-    OffsetManagerError, OffsetStore, Position, TopicId,
+    ConsumerRuntimeListener, Delivery, EventBatch, Fallback, GtsInstanceId, InMemoryOffsetManager,
+    OffsetManagerError, OffsetStore, Position,
 };
 use serde_json::json;
 
@@ -43,7 +43,7 @@ impl OffsetStore for SequencedOffsetManager {
     async fn load_position(
         &self,
         _group: &ConsumerGroupId,
-        _topic: &TopicId,
+        _topic: &GtsInstanceId,
         _partition: u32,
     ) -> Result<Position, OffsetManagerError> {
         self.timeline.lock().unwrap().push("load");
@@ -56,7 +56,7 @@ impl CommitOffset for SequencedOffsetManager {
     async fn commit(
         &self,
         _group: &ConsumerGroupId,
-        _topic: &TopicId,
+        _topic: &GtsInstanceId,
         _partition: u32,
         _offset: Sequence,
     ) -> Result<(), OffsetManagerError> {
@@ -125,6 +125,9 @@ async fn if_a_partition_is_slow_the_sdk_drops_drains_and_rejoins_from_offsets() 
     let timeline = Arc::new(Mutex::new(Vec::new()));
 
     let handle = ConsumerBuilder::new(broker.clone())
+        .subject_tenant(ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("showcase-slow-drop"))
         .topics([topic(SLOW_TOPIC)])
         .buffering(ConsumerBuffering {
@@ -143,7 +146,7 @@ async fn if_a_partition_is_slow_the_sdk_drops_drains_and_rejoins_from_offsets() 
         .await
         .expect("consumer starts");
 
-    wait_until(|| handle.subscription_ids().len() == 1).await;
+    wait_until(|| handle.subscriptions().len() == 1).await;
     publish_json(
         &broker,
         &ctx,
@@ -223,6 +226,9 @@ async fn if_a_topic_is_noisy_i_can_isolate_it_in_a_separate_consumer_handle() {
     let fast_subjects = Arc::new(Mutex::new(Vec::new()));
 
     let slow_handle = ConsumerBuilder::new(broker.clone())
+        .subject_tenant(ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("showcase-noisy-slow"))
         .topics([topic(SLOW_TOPIC)])
         .buffering(ConsumerBuffering {
@@ -242,6 +248,9 @@ async fn if_a_topic_is_noisy_i_can_isolate_it_in_a_separate_consumer_handle() {
         .expect("slow consumer starts");
 
     let fast_handle = ConsumerBuilder::new(broker.clone())
+        .subject_tenant(ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("showcase-noisy-fast"))
         .topics([topic(FAST_TOPIC)])
         .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
@@ -252,10 +261,8 @@ async fn if_a_topic_is_noisy_i_can_isolate_it_in_a_separate_consumer_handle() {
         .await
         .expect("fast consumer starts");
 
-    wait_until(|| {
-        slow_handle.subscription_ids().len() == 1 && fast_handle.subscription_ids().len() == 1
-    })
-    .await;
+    wait_until(|| slow_handle.subscriptions().len() == 1 && fast_handle.subscriptions().len() == 1)
+        .await;
 
     publish_json(
         &broker,

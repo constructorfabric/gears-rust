@@ -1,5 +1,5 @@
-//! `DeliveryService`-backed REST handlers (`DESIGN.md:581,584-585`):
-//! streaming, consumer groups, subscriptions.
+//! `DeliveryService`-backed REST handlers (`DESIGN.md` "Module
+//! Structure"): streaming, consumer groups, subscriptions.
 
 pub mod consumer_groups;
 pub mod dto;

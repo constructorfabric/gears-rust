@@ -1,4 +1,5 @@
-//! The synchronous-publish wait seam (`DESIGN.md:1335`, feature 0007 §4.1).
+//! The synchronous-publish wait seam (`DESIGN.md` "Sync vs Async Persist
+//! Modes", feature 0007 §4.1).
 //!
 //! A `Prefer: wait=N` publish holds until the backend stores its events. Ingest
 //! mints a trace (a UUID, never on the wire), subscribes to it *before* the

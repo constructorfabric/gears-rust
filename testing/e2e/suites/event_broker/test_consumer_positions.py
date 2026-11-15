@@ -1,4 +1,4 @@
-"""SEEK / cursor scenarios (consumer/positions/1.01-1.14).
+"""SEEK / cursor scenarios (consumer/positions/1.01-1.18).
 
 All SEEK requests use the topic-keyed wire format:
 ``{"topology_version": 1, "positions": {"<topic>": [{"partition": int, "value": ...}]}}``.
@@ -35,7 +35,10 @@ from .conftest import (
     TOPIC_STREAM,
     TOPIC_PREFILLED,
     SseFrameReader,
+    TOKEN_PRINCIPAL_A,
+    TOKEN_PRINCIPAL_B,
     TRACE_ID,
+    XFAIL_UNLESS_STATIC_TOKENS,
 )
 
 
@@ -62,7 +65,8 @@ async def test_seek_earliest_returns_resolved_cursor(api, prefilled_topic):
                 "interests": [
                     {
                         "topic": TOPIC_PREFILLED,
-                        "tenant_id": PREFILLED_TENANT_ID,
+                        "subject_tenant": PREFILLED_TENANT_ID,
+                        "ownership_filter": "entire_tenant",
                         "types": [EVENT_TYPE_PREFILLED],
                     }
                 ],
@@ -104,7 +108,8 @@ async def test_seek_latest_returns_hwm_cursor(api, prefilled_topic):
                 "interests": [
                     {
                         "topic": TOPIC_PREFILLED,
-                        "tenant_id": PREFILLED_TENANT_ID,
+                        "subject_tenant": PREFILLED_TENANT_ID,
+                        "ownership_filter": "entire_tenant",
                         "types": [EVENT_TYPE_PREFILLED],
                     }
                 ],
@@ -147,7 +152,8 @@ async def test_seek_exact_offset_accepted(api, prefilled_topic):
                 "interests": [
                     {
                         "topic": TOPIC_PREFILLED,
-                        "tenant_id": PREFILLED_TENANT_ID,
+                        "subject_tenant": PREFILLED_TENANT_ID,
+                        "ownership_filter": "entire_tenant",
                         "types": [EVENT_TYPE_PREFILLED],
                     }
                 ],
@@ -198,7 +204,8 @@ async def test_mixed_sentinels_and_integers_accepted(api, prefilled_topic):
                 "interests": [
                     {
                         "topic": TOPIC_PREFILLED,
-                        "tenant_id": PREFILLED_TENANT_ID,
+                        "subject_tenant": PREFILLED_TENANT_ID,
+                        "ownership_filter": "entire_tenant",
                         "types": [EVENT_TYPE_PREFILLED],
                     }
                 ],
@@ -251,7 +258,8 @@ async def test_out_of_range_below_rf_rejected_400(api, prefilled_topic):
                 "interests": [
                     {
                         "topic": TOPIC_PREFILLED,
-                        "tenant_id": PREFILLED_TENANT_ID,
+                        "subject_tenant": PREFILLED_TENANT_ID,
+                        "ownership_filter": "entire_tenant",
                         "types": [EVENT_TYPE_PREFILLED],
                     }
                 ],
@@ -310,7 +318,8 @@ async def test_offset_above_hwm_rejected_400(api, prefilled_topic):
                 "interests": [
                     {
                         "topic": TOPIC_PREFILLED,
-                        "tenant_id": PREFILLED_TENANT_ID,
+                        "subject_tenant": PREFILLED_TENANT_ID,
+                        "ownership_filter": "entire_tenant",
                         "types": [EVENT_TYPE_PREFILLED],
                     }
                 ],
@@ -368,7 +377,8 @@ async def test_seek_while_streaming_returns_409(api, test_env):
                 "interests": [
                     {
                         "topic": TOPIC_STREAM,
-                        "tenant_id": str(uuid.uuid4()),
+                        "subject_tenant": str(uuid.uuid4()),
+                        "ownership_filter": "entire_tenant",
                         "types": [EVENT_TYPE_STREAM],
                     }
                 ],
@@ -390,7 +400,7 @@ async def test_seek_while_streaming_returns_409(api, test_env):
         base_url=f"{test_env.base_url}/event-broker/v1", timeout=None
     ) as stream_client:
         async with stream_client.stream(
-            "GET", f"/events:sse?subscription_id={sub_id}"
+            "GET", f"/events:sse?subscription={sub_id}"
         ) as stream_resp:
             assert stream_resp.status_code == 200
 
@@ -467,7 +477,8 @@ async def test_seek_unassigned_partition_rejected_409(api):
     tenant_id = str(uuid.uuid4())
     interest = {
         "topic": TOPIC_4P,
-        "tenant_id": tenant_id,
+        "subject_tenant": tenant_id,
+        "ownership_filter": "entire_tenant",
         "types": [EVENT_TYPE_4P],
     }
     async with api() as client:
@@ -523,7 +534,7 @@ async def test_seek_stale_topology_version_rejected_412(api):
     subscription for the fresh state.
     """
     tenant_id = str(uuid.uuid4())
-    interest = {"topic": TOPIC_4P, "tenant_id": tenant_id, "types": [EVENT_TYPE_4P]}
+    interest = {"topic": TOPIC_4P, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_4P]}
     async with api() as client:
         group_id = (await client.post("/consumer-groups")).json()["id"]
 
@@ -585,7 +596,8 @@ async def test_seek_any_value_in_retention_range_accepted(api, prefilled_topic):
                 "interests": [
                     {
                         "topic": TOPIC_PREFILLED,
-                        "tenant_id": PREFILLED_TENANT_ID,
+                        "subject_tenant": PREFILLED_TENANT_ID,
+                        "ownership_filter": "entire_tenant",
                         "types": [EVENT_TYPE_PREFILLED],
                     }
                 ],
@@ -627,7 +639,8 @@ async def test_seek_at_timestamp_returns_resolved_integer(api, prefilled_topic):
                 "interests": [
                     {
                         "topic": TOPIC_PREFILLED,
-                        "tenant_id": PREFILLED_TENANT_ID,
+                        "subject_tenant": PREFILLED_TENANT_ID,
+                        "ownership_filter": "entire_tenant",
                         "types": [EVENT_TYPE_PREFILLED],
                     }
                 ],
@@ -670,7 +683,8 @@ async def test_seek_timestamp_before_retention_clamps_to_rf(api, prefilled_topic
                 "interests": [
                     {
                         "topic": TOPIC_PREFILLED,
-                        "tenant_id": PREFILLED_TENANT_ID,
+                        "subject_tenant": PREFILLED_TENANT_ID,
+                        "ownership_filter": "entire_tenant",
                         "types": [EVENT_TYPE_PREFILLED],
                     }
                 ],
@@ -713,7 +727,8 @@ async def test_seek_timestamp_beyond_hwm_clamps_to_hwm(api, prefilled_topic):
                 "interests": [
                     {
                         "topic": TOPIC_PREFILLED,
-                        "tenant_id": PREFILLED_TENANT_ID,
+                        "subject_tenant": PREFILLED_TENANT_ID,
+                        "ownership_filter": "entire_tenant",
                         "types": [EVENT_TYPE_PREFILLED],
                     }
                 ],
@@ -764,7 +779,8 @@ async def test_seek_resume_from_cursor(api, test_env, prefilled_topic):
                 "interests": [
                     {
                         "topic": TOPIC_PREFILLED,
-                        "tenant_id": PREFILLED_TENANT_ID,
+                        "subject_tenant": PREFILLED_TENANT_ID,
+                        "ownership_filter": "entire_tenant",
                         "types": [EVENT_TYPE_PREFILLED],
                     }
                 ],
@@ -788,7 +804,7 @@ async def test_seek_resume_from_cursor(api, test_env, prefilled_topic):
         base_url=f"{test_env.base_url}/event-broker/v1", timeout=None
     ) as stream_client:
         async with stream_client.stream(
-            "GET", f"/events:sse?subscription_id={sub1_id}"
+            "GET", f"/events:sse?subscription={sub1_id}"
         ) as stream_resp:
             assert stream_resp.status_code == 200
             reader = SseFrameReader(stream_resp)
@@ -812,7 +828,8 @@ async def test_seek_resume_from_cursor(api, test_env, prefilled_topic):
                 "interests": [
                     {
                         "topic": TOPIC_PREFILLED,
-                        "tenant_id": PREFILLED_TENANT_ID,
+                        "subject_tenant": PREFILLED_TENANT_ID,
+                        "ownership_filter": "entire_tenant",
                         "types": [EVENT_TYPE_PREFILLED],
                     }
                 ],
@@ -836,7 +853,7 @@ async def test_seek_resume_from_cursor(api, test_env, prefilled_topic):
         base_url=f"{test_env.base_url}/event-broker/v1", timeout=None
     ) as stream_client:
         async with stream_client.stream(
-            "GET", f"/events:sse?subscription_id={sub2_id}"
+            "GET", f"/events:sse?subscription={sub2_id}"
         ) as stream_resp:
             assert stream_resp.status_code == 200
             reader = SseFrameReader(stream_resp)
@@ -849,8 +866,7 @@ async def test_seek_resume_from_cursor(api, test_env, prefilled_topic):
     assert event_data["payload"] == {
         "id": nxt["id"],
         "type": EVENT_TYPE_PREFILLED,
-        "topic": TOPIC_PREFILLED,
-        "tenant_id": PREFILLED_TENANT_ID,
+        "subject_tenant": PREFILLED_TENANT_ID,
         "source": "e2e-prefill",
         "subject": "prefill-subject",
         "subject_type": SUBJECT_TYPE,
@@ -872,7 +888,7 @@ async def test_seek_after_join_rebalance_recovers(api):
     and succeeds (200).
     """
     tenant_id = str(uuid.uuid4())
-    interest = {"topic": TOPIC_4P, "tenant_id": tenant_id, "types": [EVENT_TYPE_4P]}
+    interest = {"topic": TOPIC_4P, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_4P]}
     async with api() as client:
         group_id = (await client.post("/consumer-groups")).json()["id"]
 
@@ -936,7 +952,7 @@ async def test_seek_after_leave_rebalance_recovers(api, test_env):
     since its assignment is never revised in place.
     """
     tenant_id = str(uuid.uuid4())
-    interest = {"topic": TOPIC_4P, "tenant_id": tenant_id, "types": [EVENT_TYPE_4P]}
+    interest = {"topic": TOPIC_4P, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_4P]}
     async with api() as client:
         group_id = (await client.post("/consumer-groups")).json()["id"]
 
@@ -975,7 +991,7 @@ async def test_seek_after_leave_rebalance_recovers(api, test_env):
         base_url=f"{test_env.base_url}{API_BASE}", timeout=None
     ) as stream_client:
         async with stream_client.stream(
-            "GET", f"/events:sse?subscription_id={sub1_id}"
+            "GET", f"/events:sse?subscription={sub1_id}"
         ) as stream_resp:
             assert stream_resp.status_code == 200
             reader = SseFrameReader(stream_resp)
@@ -1023,3 +1039,88 @@ async def test_seek_after_leave_rebalance_recovers(api, test_env):
         )
     assert ok.status_code == 200, ok.text
     assert ok.json()["positions"][TOPIC_4P] == [{"partition": 0, "value": 0}]
+
+async def _open_status(client, sub_id: str, headers: dict) -> tuple[int, dict | None]:
+    """Opens ``:stream`` for ``sub_id`` and closes it at once: the status, and
+    the problem body when the open is refused (an open stream never ends)."""
+    async with client.stream(
+        "GET",
+        f"/events:stream?subscription={sub_id}",
+        headers={**headers, "Accept": "multipart/mixed"},
+    ) as resp:
+        if resp.status_code == 200:
+            return 200, None
+        await resp.aread()
+        return resp.status_code, resp.json()
+
+
+@XFAIL_UNLESS_STATIC_TOKENS
+@pytest.mark.timeout(20, func_only=True)
+async def test_seek_subscription_not_owned(api):
+    """scenario: consumer/positions/1.18-negative-seek-subscription-not-owned.md
+
+    Principal A JOINs a fresh group with one interest on its own tenant (the
+    tenant its group records) and does not SEEK; principal B, a subject of the
+    same tenant, SEEKs A's subscription and is refused ``SubscriptionNotOwned``,
+    so no cursor exists and A's stream open answers 409 ``PositionsNotSet``.
+    Under ``auth_disabled`` the gateway ignores both tokens and injects one
+    default identity, so B's SEEK answers 200.
+    """
+    principal_a = {"Authorization": f"Bearer {TOKEN_PRINCIPAL_A}"}
+    principal_b = {"Authorization": f"Bearer {TOKEN_PRINCIPAL_B}"}
+    async with api() as client:
+        group_resp = await client.post("/consumer-groups", headers=principal_a)
+        assert group_resp.status_code == 201, group_resp.text
+        group = group_resp.json()
+        sub_resp = await client.post(
+            "/subscriptions",
+            headers=principal_a,
+            json={
+                "consumer_group": group["id"],
+                "client_agent": "e2e-test",
+                "interests": [
+                    {"topic": TOPIC_STREAM, "subject_tenant": group["tenant"], "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_STREAM]}
+                ],
+            },
+        )
+        assert sub_resp.status_code == 201, sub_resp.text
+        sub_id = str(sub_resp.json()["id"])
+
+        seek_resp = await client.post(
+            f"/subscriptions/{sub_id}:seek",
+            headers=principal_b,
+            json={"topology_version": 1, "positions": {TOPIC_STREAM: [{"partition": 0, "value": "earliest"}]}},
+        )
+        assert seek_resp.status_code == 403, seek_resp.text
+        assert seek_resp.json() == {
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~",
+            "title": "Permission Denied",
+            "status": 403,
+            "detail": "You do not have permission to perform this operation",
+            "instance": f"{API_BASE}/subscriptions/{sub_id}:seek",
+            "trace_id": TRACE_ID,
+            "context": {
+                "reason": f"subscription '{sub_id}' was joined by another principal",
+                "resource_type": "gts.cf.core.events.subscription.v1~",
+            },
+        }
+        open_status, open_body = await _open_status(client, sub_id, principal_a)
+    assert open_status == 409
+    assert open_body == {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~",
+        "title": "Failed Precondition",
+        "status": 409,
+        "detail": "Operation precondition not met",
+        "instance": f"{API_BASE}/events:stream",
+        "trace_id": TRACE_ID,
+        "context": {
+            "resource_type": "gts.cf.core.events.subscription.v1~",
+            "violations": [
+                {
+                    "type": "positions_not_set",
+                    "subject": f"{TOPIC_STREAM}:0",
+                    "description": f"call POST /v1/subscriptions/{sub_id}:seek before re-opening the stream",
+                }
+            ],
+        },
+    }

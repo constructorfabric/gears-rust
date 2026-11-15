@@ -17,9 +17,8 @@ use tokio_util::sync::CancellationToken;
 use toolkit_gts::GtsInstanceId;
 use uuid::Uuid;
 
-use crate::domain::model::{
-    Assignment, BarrierMode, Event, Interest, Sequence, TenantTraversalDepth,
-};
+use crate::domain::model::{Assignment, BarrierMode, Event, Interest, OwnershipFilter, Sequence};
+use crate::domain::streaming::assignment::Generation;
 use crate::domain::streaming::filter::{EventFilter, InterestFilter};
 use crate::domain::streaming::frames::Frame;
 use crate::domain::streaming::lease::{InProcessStreamLeases, StreamLeases};
@@ -52,14 +51,16 @@ fn event(sequence: i64, tenant: Uuid) -> Event {
         id: Uuid::nil(),
         r#type: crate::test_support::event_type_id(CREATED),
         topic: gts(TOPIC),
-        tenant_id: tenant,
+        subject_tenant: tenant,
         source: "test".to_owned(),
         subject: "test".to_owned(),
         subject_type: gts::GtsTypeId::new("test"),
+        subject_owner: None,
         occurred_at: Utc::now(),
         trace_parent: None,
         data: json!({ "n": sequence }),
         meta: None,
+        ingest: None,
         partition: Some(0),
         sequence: Some(sequence),
         sequence_time: None,
@@ -127,10 +128,11 @@ fn membership(
 fn interest_filter(tenant: Uuid) -> Arc<dyn EventFilter> {
     Arc::new(InterestFilter::compile(&[Interest {
         topic: gts(TOPIC),
-        tenant_id: tenant,
-        depth: TenantTraversalDepth::CurrentTenant,
+        subject_tenant: tenant,
+        ownership: OwnershipFilter::EntireTenant,
         barrier_mode: BarrierMode::Respect,
         types: vec![gts::GtsIdPattern::try_new(CREATED).unwrap()],
+        subject_types: Vec::new(),
         filter: None,
     }]))
 }
@@ -197,13 +199,14 @@ async fn the_loader_fills_a_cache_a_session_is_reading() {
 
     let now: NowFn = Arc::new(Utc::now);
     let (generations, membership) = membership(8);
+    let baseline = Generation::new(1, generations.borrow().assigned.clone());
     let mut session = StreamSession::open(SessionOpening {
         read_set: ReadSet::seed(slots),
         filter: interest_filter(tenant),
         progress: ProgressConfig::default(),
         heartbeat_interval: Duration::from_millis(50),
         limit: ReadLimit::new(MaxEvents(8), MaxBytes(1024 * 1024)),
-        topology_version: 1,
+        baseline,
         ready: Arc::clone(&ready),
         started_at: Instant::now(),
         now,
@@ -211,6 +214,7 @@ async fn the_loader_fills_a_cache_a_session_is_reading() {
         lease,
         generations,
         membership,
+        scope: None,
     });
 
     let delivered = drain_events(&mut session, 12).await;

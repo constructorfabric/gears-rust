@@ -22,6 +22,15 @@ fn is_mysql(manager: &SchemaManager<'_>) -> bool {
 /// collation would compare it case-insensitively, and at four bytes per
 /// character a 1024-character key exceeds `InnoDB`'s 3072-byte key limit.
 pub(super) fn gts_id<T: IntoIden>(manager: &SchemaManager<'_>, col: T) -> ColumnDef {
+    gts_id_typed(manager, col).not_null().to_owned()
+}
+
+/// [`gts_id`], `NULL` where the row has none.
+pub(super) fn gts_id_nullable<T: IntoIden>(manager: &SchemaManager<'_>, col: T) -> ColumnDef {
+    gts_id_typed(manager, col).null().to_owned()
+}
+
+fn gts_id_typed<T: IntoIden>(manager: &SchemaManager<'_>, col: T) -> ColumnDef {
     let mut def = ColumnDef::new(col);
     if is_mysql(manager) {
         def.custom(Alias::new(format!(
@@ -30,7 +39,7 @@ pub(super) fn gts_id<T: IntoIden>(manager: &SchemaManager<'_>, col: T) -> Column
     } else {
         def.string_len(GTS_ID_LEN);
     }
-    def.not_null().to_owned()
+    def
 }
 
 /// A UTC timestamp with microseconds. On `MySQL` it is `datetime(6)`: a

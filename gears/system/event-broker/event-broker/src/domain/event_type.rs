@@ -74,19 +74,27 @@ pub fn partition_key(event_type: &TypeSchema) -> Result<String, DomainError> {
         })
 }
 
-/// Checks that an event type's partition-key pointer names a member its resolved
-/// schema declares.
+/// Checks that an event type's partition-key pointer names a scalar member its
+/// resolved schema declares, and that a type keyed on `/subject_owner` makes the
+/// owner required.
 ///
-/// A pointer naming nothing would fail identically on every publish of the type,
-/// so it is an admission failure rather than a message failure. The resolved
-/// schema needed to check it is already in hand at registration.
+/// A pointer naming nothing, or naming a member declared as an object or array,
+/// would fail identically on every publish of the type, so it is an admission
+/// failure rather than a message failure. The resolved schema needed to check it
+/// is already in hand at registration.
+///
+/// The base requires `subject_owner` but admits `null`, so a type keyed on it
+/// must narrow it in one of its own branches, or in a branch of an ancestor
+/// below the base.
 ///
 /// # Errors
 ///
 /// [`DomainError::Validation`] when the pointer is not a JSON Pointer into the
-/// event, or names a member the resolved schema does not declare - the registering
-/// gear can correct either. [`DomainError::Internal`] when the trait itself is
-/// unreadable, or the schema carries no effective traits or resolved schema.
+/// event, names a member the resolved schema does not declare, names a member
+/// declared only as an object or array, or is `/subject_owner` without a branch
+/// narrowing the owner to a required string - the registering gear can correct
+/// each. [`DomainError::Internal`] when the trait itself is unreadable, or the
+/// schema carries no effective traits or resolved schema.
 pub fn validate_partition_key(event_type: &TypeSchema) -> Result<(), DomainError> {
     let pointer = partition_key(event_type)?;
     // `InvalidSpec` is the code every rejected specification carries
@@ -117,7 +125,75 @@ pub fn validate_partition_key(event_type: &TypeSchema) -> Result<(), DomainError
         };
         here = member;
     }
+    if declares_only_containers(&here) {
+        return Err(rejected(
+            "names a member declared as an object or array, which has no stable hash input",
+        ));
+    }
+    if pointer == SUBJECT_OWNER_POINTER && !overrides_subject_owner(resolved, 0) {
+        return Err(rejected(
+            "needs a branch of the type that lists `subject_owner` in `required` and declares \
+             it as type `string`",
+        ));
+    }
     Ok(())
+}
+
+/// The pointer at the event's owner.
+const SUBJECT_OWNER_POINTER: &str = "/subject_owner";
+
+/// Bounds the `allOf` walk so a schema that resolved into a cycle cannot recurse
+/// forever. Real chains are two or three deep.
+const MAX_ALL_OF_DEPTH: usize = 32;
+
+/// Whether a member's declared `type` (one name, or a list) names only `object`,
+/// `array` or `null`, so no event can carry a scalar there. A member declaring no
+/// `type` is left to the publish-time check.
+fn declares_only_containers(member: &serde_json::Value) -> bool {
+    let names: Vec<&str> = match member.get("type") {
+        Some(serde_json::Value::String(name)) => vec![name.as_str()],
+        Some(serde_json::Value::Array(names)) => {
+            names.iter().filter_map(serde_json::Value::as_str).collect()
+        }
+        _ => return false,
+    };
+    let mut non_null = names.iter().filter(|name| **name != "null").peekable();
+    non_null.peek().is_some() && non_null.all(|name| matches!(*name, "object" | "array"))
+}
+
+/// Whether `schema`, or a branch of it at any depth of `allOf`, both lists
+/// `subject_owner` in its own `required` and declares its `type` as exactly
+/// `"string"` (or `["string"]`). The walk recurses because an override on an
+/// intermediate type sits in a nested `allOf`. The inlined base never qualifies:
+/// its owner admits `null`.
+fn overrides_subject_owner(schema: &serde_json::Value, depth: usize) -> bool {
+    if depth == MAX_ALL_OF_DEPTH {
+        return false;
+    }
+    let requires = schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|required| required.iter().any(|name| name == "subject_owner"));
+    let owner_type = schema
+        .get("properties")
+        .and_then(|properties| properties.get("subject_owner"))
+        .and_then(|owner| owner.get("type"));
+    let only_string = match owner_type {
+        Some(serde_json::Value::String(name)) => name == "string",
+        Some(serde_json::Value::Array(names)) => names.as_slice() == [serde_json::json!("string")],
+        _ => false,
+    };
+    if requires && only_string {
+        return true;
+    }
+    schema
+        .get("allOf")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|branches| {
+            branches
+                .iter()
+                .any(|branch| overrides_subject_owner(branch, depth + 1))
+        })
 }
 
 /// The trait values `types-registry` materialized for an event type, merged

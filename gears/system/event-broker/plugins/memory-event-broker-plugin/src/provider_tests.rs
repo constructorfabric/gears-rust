@@ -14,6 +14,7 @@ fn topic() -> GtsInstanceId {
 fn spec() -> TopicSpec {
     TopicSpec {
         topic: topic(),
+        uuid: Uuid::from_u128(0x7091),
         partitions: 2,
         retention: Retention::default(),
     }

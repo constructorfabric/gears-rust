@@ -145,7 +145,7 @@ async fn list_event_types_of_a_topic_returns_a_paged_list() {
                 "topic": TOPIC,
                 "description": null,
                 "allowed_subject_types": [SUBJECT_TYPE],
-                "partition_key": "/tenant_id",
+                "partition_key": "/subject_tenant",
                 "data_schema": {
                     "allOf": [
                         { "type": ["object", "null"] },
@@ -175,7 +175,7 @@ async fn segments_report_the_stored_range() {
             .with_body(Json(&json!({
                 "id": id,
                 "type": EVENT_TYPE,
-                "tenant_id": "0190f1a2-0000-7000-8000-0000000000a1",
+                "subject_tenant": "0190f1a2-0000-7000-8000-0000000000a1",
                 "source": "topics-test",
                 "subject": subject,
                 "subject_type": SUBJECT_TYPE,

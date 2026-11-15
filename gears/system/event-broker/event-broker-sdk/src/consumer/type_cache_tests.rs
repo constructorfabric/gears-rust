@@ -59,7 +59,7 @@ impl CannedBroker {
                 topic: topic_id(topic),
                 description: None,
                 allowed_subject_types: Vec::new(),
-                partition_key: "/tenant_id".to_owned(),
+                partition_key: "/subject_tenant".to_owned(),
                 data_schema: json!({ "type": "object" }),
             })
             .collect();
@@ -90,7 +90,7 @@ impl BrokerStub for CannedBroker {
             .find(|event_type| event_type.id.as_ref() == id)
             .cloned()
             .ok_or_else(|| EventBrokerError::EventTypeUnknown {
-                type_id: id.to_owned(),
+                event_type: id.to_owned(),
                 detail: "no such event type".to_owned(),
             })
     }
@@ -197,7 +197,7 @@ async fn an_unresolvable_type_is_reported_with_its_identifier() {
         .expect_err("a type no broker knows cannot resolve to a topic");
 
     assert!(
-        matches!(err, EventBrokerError::EventTypeUnknown { ref type_id, .. } if type_id == EVENT_TYPE),
+        matches!(err, EventBrokerError::EventTypeUnknown { ref event_type, .. } if event_type == EVENT_TYPE),
         "the failure must name the type it could not resolve: {err:?}"
     );
 }

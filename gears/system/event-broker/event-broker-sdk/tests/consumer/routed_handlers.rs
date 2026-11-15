@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use event_broker_sdk::{
     Ack, BatchHandler, BatchHandlerOutcome, ConsumerBuilder, ConsumerError, ConsumerGroupRef,
     ConsumerRetry, ConsumerRuntimeEvent, DecodeCategory, Delivery, EventBatch, EventHandler,
-    EventV1, Fallback, GtsTypeId, HandlerOutcome, InMemoryOffsetManager, Sequence, TopicId,
-    Undecodable, gts_id,
+    EventV1, Fallback, GtsTypeId, HandlerOutcome, InMemoryOffsetManager, Sequence, Undecodable,
+    gts_id,
 };
 use gts::GtsSchema;
 use serde::{Deserialize, Serialize};
@@ -55,6 +55,9 @@ async fn if_i_need_topic_type_routing_i_can_register_specific_and_default_handle
 
     let calls = Arc::new(Mutex::new(Vec::new()));
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("showcase-routed"))
         .topics([topic(TOPIC)])
         .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
@@ -140,10 +143,10 @@ async fn typed_fixture() -> TopicFixture {
 async fn publish_order(fixture: &TopicFixture, id: Uuid, data: serde_json::Value) {
     let event = EventV1::builder_for(GtsTypeId::new(ORDER_PLACED), data)
         .id(id)
-        .tenant_id(fixture.ctx.subject_tenant_id())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
         .source("typed-route")
         .subject(id.to_string())
-        .subject_type_id(GtsTypeId::new(SHOWCASE_SUBJECT_TYPE))
+        .subject_type_of(GtsTypeId::new(SHOWCASE_SUBJECT_TYPE))
         .build()
         .expect("a valid event");
     fixture
@@ -225,6 +228,9 @@ async fn a_typed_route_hands_the_decoded_payload_to_its_handler() {
     let default_calls = default.calls.clone();
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("typed-route-decoded"))
         .topics([topic(TOPIC)])
         .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
@@ -266,6 +272,9 @@ async fn an_undecodable_event_on_a_skip_route_is_skipped_and_reported() {
     let runtime_events = listener.events.clone();
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("typed-route-skip"))
         .topics([topic(TOPIC)])
         .register_listener(listener)
@@ -340,7 +349,7 @@ async fn an_undecodable_event_on_a_skip_route_is_skipped_and_reported() {
             topic: skipped_topic,
             partition,
             sequence,
-            type_id,
+            event_type,
             category,
         },
     ] = skipped.as_slice()
@@ -350,7 +359,7 @@ async fn an_undecodable_event_on_a_skip_route_is_skipped_and_reported() {
     assert_eq!(*skipped_topic, topic(TOPIC));
     assert_eq!(*partition, 0);
     assert_eq!(*sequence, Sequence::assigned(1));
-    assert_eq!(*type_id, GtsTypeId::new(ORDER_PLACED));
+    assert_eq!(*event_type, GtsTypeId::new(ORDER_PLACED));
     assert_eq!(*category, DecodeCategory::Data);
 }
 
@@ -363,6 +372,9 @@ async fn an_undecodable_event_on_a_stall_route_is_retried_and_never_handed_over(
     let runtime_events = listener.events.clone();
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("typed-route-stall"))
         .topics([topic(TOPIC)])
         .register_listener(listener)
@@ -388,24 +400,23 @@ async fn an_undecodable_event_on_a_stall_route_is_retried_and_never_handed_over(
     )
     .await;
 
-    let retries = || -> Vec<(TopicId, String, u32, u16, Duration)> {
+    let retries = || -> Vec<(String, u32, u16, Duration)> {
         runtime_events
             .lock()
             .unwrap()
             .iter()
             .filter_map(|event| match event {
                 ConsumerRuntimeEvent::RetryScheduled {
-                    topic_id,
                     topic,
                     partition,
                     attempt,
                     delay,
-                } => Some((*topic_id, topic.to_string(), *partition, *attempt, *delay)),
+                } => Some((topic.to_string(), *partition, *attempt, *delay)),
                 _ => None,
             })
             .collect()
     };
-    wait_within_bound(|| retries().iter().any(|retry| retry.3 >= 3)).await;
+    wait_within_bound(|| retries().iter().any(|retry| retry.2 >= 3)).await;
     tokio::time::timeout(BOUND, handle.stop())
         .await
         .expect("the consumer stops within the bound")
@@ -415,15 +426,7 @@ async fn an_undecodable_event_on_a_stall_route_is_retried_and_never_handed_over(
     let [first, second, third, ..] = retries.as_slice() else {
         panic!("expected at least three RetryScheduled, got {retries:?}");
     };
-    let retry = |attempt| {
-        (
-            TopicId::from_gts(TOPIC),
-            TOPIC.to_owned(),
-            0,
-            attempt,
-            Duration::from_millis(1),
-        )
-    };
+    let retry = |attempt| (TOPIC.to_owned(), 0, attempt, Duration::from_millis(1));
     assert_eq!([first, second, third], [&retry(1), &retry(2), &retry(3)]);
     assert_eq!(*typed_calls.lock().unwrap(), vec![]);
     let events = runtime_events.lock().unwrap();
@@ -462,6 +465,9 @@ async fn an_undecodable_event_on_a_fallback_route_goes_to_the_raw_handler() {
     let fallback_calls = fallback.calls.clone();
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("typed-route-fallback"))
         .topics([topic(TOPIC)])
         .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
@@ -520,6 +526,9 @@ async fn the_skip_warn_carries_no_payload_value() {
     let typed_calls = typed.calls.clone();
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("typed-route-skip-warn"))
         .topics([topic(TOPIC)])
         .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
@@ -583,6 +592,9 @@ async fn the_stall_retry_reason_carries_no_payload_value() {
     let runtime_events = listener.events.clone();
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("typed-route-stall-reason"))
         .topics([topic(TOPIC)])
         .register_listener(listener)
@@ -677,6 +689,9 @@ async fn a_typed_batch_route_hands_decoded_batches_to_its_handler() {
     let default_calls = default.calls.clone();
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous(
             "typed-batch-route-decoded",
         ))
@@ -737,6 +752,9 @@ async fn an_undecodable_event_on_a_typed_batch_skip_route_is_skipped_and_reporte
     let runtime_events = listener.events.clone();
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("typed-batch-route-skip"))
         .topics([topic(TOPIC)])
         .register_listener(listener)
@@ -780,7 +798,7 @@ async fn an_undecodable_event_on_a_typed_batch_skip_route_is_skipped_and_reporte
             topic: skipped_topic,
             partition,
             sequence,
-            type_id,
+            event_type,
             category,
         },
     ] = skipped.as_slice()
@@ -790,6 +808,6 @@ async fn an_undecodable_event_on_a_typed_batch_skip_route_is_skipped_and_reporte
     assert_eq!(*skipped_topic, topic(TOPIC));
     assert_eq!(*partition, 0);
     assert_eq!(*sequence, Sequence::assigned(1));
-    assert_eq!(*type_id, GtsTypeId::new(ORDER_PLACED));
+    assert_eq!(*event_type, GtsTypeId::new(ORDER_PLACED));
     assert_eq!(*category, DecodeCategory::Data);
 }

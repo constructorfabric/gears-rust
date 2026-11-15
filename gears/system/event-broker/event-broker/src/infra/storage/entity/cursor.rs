@@ -1,9 +1,9 @@
-//! `Storage`'s `cursor` namespace (eb-single-process-implementation D2) -
+//! `Storage`'s `cursor` namespace -
 //! the one durable piece of consumer-group progress (DESIGN.md's own
 //! "the cursor (the only persistent piece)"). Composite natural key
 //! `(consumer_group, topic_id, partition)`, matching
 //! `CursorRepo::find_cursor`'s own lookup shape. `topic_id` is the
-//! `SpecificationManager`-resolved integer surrogate (D1), not the raw GTS
+//! `SpecificationManager`-resolved integer surrogate, not the raw GTS
 //! id string - resolved by the repo implementation before every read/write,
 //! not stored redundantly as a string here. `tenant_id` is denormalized from
 //! the owning `ConsumerGroup` at write time - no

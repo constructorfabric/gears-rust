@@ -1,132 +1,98 @@
-//! Whether an event belongs to a subscription.
+//! Whether an event belongs to a subscription, and whether delivery hands it
+//! over.
 //!
 //! The subscription predicates: the event's topic equals the interest's topic,
-//! its type matches one of the interest's GTS patterns, and its tenant is within
-//! the interest's scope. An interest may also carry a `FilterSpec`, but the
-//! expression language, the engine contract and the evaluation semantics belong
-//! to ADR-0005; this module owns only *where* such an engine is invoked.
+//! its tenant is the interest's tenant, its type matches one of the interest's
+//! GTS patterns, and, when the interest carries a subject-type selector, its
+//! subject type matches one of those patterns. An interest may also carry a
+//! `FilterSpec`, but the expression language, the engine contract and the
+//! evaluation semantics belong to ADR-0005; this module owns only *where* such
+//! an engine is invoked.
 //!
 //! Compiled once at stream open. Type patterns are already validated
 //! `GtsIdPattern`s (the wildcard grammar is enforced when a pattern is
 //! constructed), so a malformed pattern never reaches a subscription.
-//! Production delivery additionally checks consume permission on each concrete
-//! event tenant, topic, and type; selector matching alone is not authorization.
+//! Selector matching alone is not authorization: production delivery decides
+//! each matching event from the member's consume scope
+//! ([`crate::domain::streaming::scoped_filter::ScopedFilter`]).
 
+use std::cell::OnceCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use authz_resolver_sdk::{AccessRequest, EnforcerError, PolicyEnforcer};
 use toolkit::domain_model;
-use toolkit_security::{SecurityContext, pep_properties};
 
 use gts::{GtsId, GtsIdPattern};
 use uuid::Uuid;
 
-use crate::domain::authz::{TENANT_SCOPE_RESOURCE, event_type_resource, topic_resource};
+use crate::domain::consumer_group_coordinator::member_scope::CachedScope;
 use crate::domain::error::DomainError;
 use crate::domain::model::{Event, FilterSpec, Interest};
+use crate::domain::streaming::read::EventBatch;
 
-/// Whether one event is wanted.
+/// Whether one event is wanted, and whether it is delivered.
+///
+/// The session calls [`Self::prepare`] once per read batch, then
+/// [`Self::admits`] for each event it made decidable, in order. `prepare` is
+/// the only await on the delivery path; `admits` never waits.
 #[async_trait]
 pub trait EventFilter: Send + Sync {
+    /// Whether some interest's selector matches `event`. Authorizes nothing.
     fn matches(&self, event: &Event) -> bool;
 
-    /// Applies the filter, including asynchronous authorization when configured.
+    /// Gets ready to decide the events of `events` without waiting: all of
+    /// them, or only a leading part when deciding more would take more than
+    /// one wait. The session delivers that part and reads the rest again.
     ///
     /// # Errors
-    /// Returns an authorization evaluation error if permission cannot be
-    /// established. Delivery must terminate rather than skip unread events.
-    async fn allows(&self, event: &Event) -> Result<bool, DomainError> {
-        Ok(self.matches(event))
+    ///
+    /// Whatever stopped a decision from being made: a failed or late policy
+    /// evaluation, or a failed read of an event type. Delivery then ends the
+    /// stream without advancing past the batch, never skipping events it
+    /// could not decide.
+    async fn prepare(&self, _events: &EventBatch) -> Result<Prepared, DomainError> {
+        Ok(Prepared::All)
     }
+
+    /// Whether `event`, one [`Self::prepare`] made decidable, is delivered.
+    ///
+    /// # Errors
+    ///
+    /// Only on a broken internal invariant, such as no decision prepared
+    /// for the event. Delivery then ends the stream as it does for a
+    /// `prepare` error.
+    fn admits(&self, event: &Event) -> Result<bool, DomainError>;
+
+    /// Takes `scope` as the member's consume scope from now on. Called by
+    /// the session whenever the member holds a newer one; a filter that
+    /// decides nothing from the scope ignores it.
+    fn swap_scope(&self, _scope: Arc<CachedScope>) {}
 }
 
-/// Combines subscription matching with tenant, topic, and concrete type decisions.
-/// A bare GTS selector includes descendants, but a grant on that selector's
-/// root need not include them. Never infer a descendant's permission from JOIN.
-#[domain_model]
-pub struct AuthorizedInterestFilter {
-    interests: InterestFilter,
-    policy_enforcer: PolicyEnforcer,
-    ctx: SecurityContext,
-}
-
-impl AuthorizedInterestFilter {
-    /// Captures the stream caller so each matching event is checked as that
-    /// principal. Decisions are not cached across events: revocation and deny
-    /// rules must remain effective for an already-open stream.
-    #[must_use]
-    pub fn new(
-        interests: &[Interest],
-        policy_enforcer: PolicyEnforcer,
-        ctx: SecurityContext,
-    ) -> Self {
-        Self {
-            interests: InterestFilter::compile(interests),
-            policy_enforcer,
-            ctx,
-        }
-    }
-}
-
-#[async_trait]
-impl EventFilter for AuthorizedInterestFilter {
-    fn matches(&self, event: &Event) -> bool {
-        self.interests.matches(event)
-    }
-
-    async fn allows(&self, event: &Event) -> Result<bool, DomainError> {
-        if !self.matches(event) {
-            return Ok(false);
-        }
-        // JOIN authorizes the requested interests, not an enduring grant. All
-        // three independent decisions use the stored event's tenant, so an
-        // allow in the caller's tenant cannot authorize another tenant's event.
-        let tenant_request = AccessRequest::new()
-            .resource_property(pep_properties::OWNER_TENANT_ID, event.tenant_id)
-            .require_constraints(false);
-        let checks = [
-            (TENANT_SCOPE_RESOURCE, tenant_request.clone()),
-            (
-                topic_resource(&event.topic),
-                tenant_request
-                    .clone()
-                    .resource_property("topic_id", event.topic.as_ref()),
-            ),
-            (
-                event_type_resource(&event.r#type)?,
-                tenant_request.resource_property("event_type_id", event.r#type.as_ref()),
-            ),
-        ];
-        for (resource, request) in checks {
-            match self
-                .policy_enforcer
-                .access_scope_with(&self.ctx, &resource, "consume", None, &request)
-                .await
-            {
-                Ok(_) => {}
-                Err(EnforcerError::AccessDenied(_)) => {
-                    return Ok(false);
-                }
-                // An outage must terminate the batch without advancing progress;
-                // treating it as a denial would silently skip unread events.
-                // Unknown outcome classes also terminate the batch; conversion
-                // classifies them as internal failures.
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(true)
-    }
+/// Which events of a batch [`EventFilter::prepare`] made decidable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Prepared {
+    /// Every event of the batch.
+    All,
+    /// Only the first `n` events, in batch order; the batch is cut before
+    /// event `n`, whose decision would have taken another wait. At least 1
+    /// for a batch that is not empty, so every pass decides something.
+    UpTo(usize),
 }
 
 /// One interest, compiled.
 #[derive(Debug)]
-struct CompiledInterest {
-    tenant_id: Uuid,
+pub(crate) struct CompiledInterest {
+    /// The interest's tenant, which only [`InterestFilter`] compares: the
+    /// scoped filter narrows by the ownership filter instead.
+    subject_tenant: Uuid,
     /// Canonical GTS patterns, carried by the interest and matched via
     /// [`GtsId::matches_pattern`]. The grammar was validated when each pattern
     /// was constructed (`GtsIdPattern::try_new`), so no re-parsing happens here.
     patterns: Vec<GtsIdPattern>,
+    /// Subject-type selector, matched like `patterns`; empty selects every subject type.
+    subject_patterns: Vec<GtsIdPattern>,
     /// Carried, not evaluated, and deliberately unread until ADR-0005 lands.
     ///
     /// This is the seam an engine plugs into. Dropping the field instead would
@@ -138,6 +104,48 @@ struct CompiledInterest {
         reason = "the engine that reads it is ADR-0005's, still proposed"
     )]
     filter: Option<FilterSpec>,
+}
+
+impl CompiledInterest {
+    /// Compiles `interest`.
+    pub(crate) fn new(interest: &Interest) -> Self {
+        Self {
+            subject_tenant: interest.subject_tenant,
+            patterns: interest.types.clone(),
+            subject_patterns: interest.subject_types.clone(),
+            filter: interest.filter.clone(),
+        }
+    }
+
+    /// Whether the interest's type patterns and subject-type selector match
+    /// `event`, whatever its topic and tenant. A type that does not parse
+    /// matches no pattern.
+    pub(crate) fn selects(&self, event: &Event) -> bool {
+        GtsId::try_new(event.r#type.as_ref()).is_ok_and(|event_type| {
+            self.patterns
+                .iter()
+                .any(|pattern| event_type.matches_pattern(pattern))
+        }) && self.selects_subject(&OnceCell::new(), event)
+    }
+
+    /// Whether this interest's subject-type selector admits the event. No selector
+    /// admits every subject type; a subject type that does not parse matches no
+    /// selector. `subject_type` holds the event's parsed subject type, shared by
+    /// every candidate interest of one event, so it is parsed at most once and
+    /// only when a selector reads it.
+    fn selects_subject(&self, subject_type: &OnceCell<Option<GtsId>>, event: &Event) -> bool {
+        if self.subject_patterns.is_empty() {
+            return true;
+        }
+        subject_type
+            .get_or_init(|| GtsId::try_new(event.subject_type.as_ref()).ok())
+            .as_ref()
+            .is_some_and(|subject_type| {
+                self.subject_patterns
+                    .iter()
+                    .any(|pattern| subject_type.matches_pattern(pattern))
+            })
+    }
 }
 
 /// A subscription's interests, compiled and indexed by topic.
@@ -161,11 +169,7 @@ impl InterestFilter {
             by_topic
                 .entry(interest.topic.as_ref().to_owned())
                 .or_default()
-                .push(CompiledInterest {
-                    tenant_id: interest.tenant_id,
-                    patterns: interest.types.clone(),
-                    filter: interest.filter.clone(),
-                });
+                .push(CompiledInterest::new(interest));
         }
 
         Self { by_topic }
@@ -195,12 +199,21 @@ impl EventFilter for InterestFilter {
             return false;
         };
 
+        let subject_type = OnceCell::new();
         candidates.iter().any(|interest| {
-            interest.tenant_id == event.tenant_id
+            interest.subject_tenant == event.subject_tenant
                 && interest
                     .patterns
                     .iter()
                     .any(|pattern| event_type.matches_pattern(pattern))
+                && interest.selects_subject(&subject_type, event)
         })
+    }
+
+    /// Delivered when some interest's selector matches in the interest's
+    /// tenant: no consume scope and no ownership filter is read, so this is
+    /// for tests and benches that open a stream without one.
+    fn admits(&self, event: &Event) -> Result<bool, DomainError> {
+        Ok(self.matches(event))
     }
 }

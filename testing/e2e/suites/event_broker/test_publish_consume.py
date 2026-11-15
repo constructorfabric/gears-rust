@@ -39,7 +39,8 @@ async def test_publish_then_consume_happy_path(api, test_env):
                 "interests": [
                     {
                         "topic": TOPIC_STREAM,
-                        "tenant_id": tenant_id,
+                        "subject_tenant": tenant_id,
+                        "ownership_filter": "entire_tenant",
                         "types": [EVENT_TYPE_STREAM],
                     }
                 ],
@@ -60,7 +61,7 @@ async def test_publish_then_consume_happy_path(api, test_env):
         base_url=f"{test_env.base_url}/event-broker/v1", timeout=None
     ) as stream_client:
         async with stream_client.stream(
-            "GET", f"/events:sse?subscription_id={sub_id}"
+            "GET", f"/events:sse?subscription={sub_id}"
         ) as stream_resp:
             assert stream_resp.status_code == 200
             reader = SseFrameReader(stream_resp)
@@ -86,7 +87,7 @@ async def test_publish_then_consume_happy_path(api, test_env):
                     json={
                         "id": event_id,
                         "type": EVENT_TYPE_STREAM,
-                        "tenant_id": tenant_id,
+                        "subject_tenant": tenant_id,
                         "source": "e2e-test",
                         "subject": "s1",
                         "subject_type": SUBJECT_TYPE,
@@ -105,17 +106,16 @@ async def test_publish_then_consume_happy_path(api, test_env):
             # with no caller-supplied value to compare against at all.
             #
             # `sequence` is server-assigned per `(topic, partition)`, and the
-            # partition is derived by hashing `tenant_id`. TOPIC_STREAM has one
+            # partition is derived by hashing `subject_tenant`. TOPIC_STREAM has one
             # partition, so every test publishing here shares a single counter
             # and no test can predict its own absolute value - a unique
-            # `tenant_id` isolates which events are delivered, not how they are
+            # `subject_tenant` isolates which events are delivered, not how they are
             # numbered.
             payload = event_data["payload"]
             assert payload == {
                 "id": event_id,
                 "type": EVENT_TYPE_STREAM,
-                "topic": TOPIC_STREAM,
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id,
                 "source": "e2e-test",
                 "subject": "s1",
                 "subject_type": SUBJECT_TYPE,
@@ -153,7 +153,8 @@ async def test_wildcard_interest_delivers_every_event_type(api, test_env):
                 "interests": [
                     {
                         "topic": TOPIC_STREAM,
-                        "tenant_id": tenant_id,
+                        "subject_tenant": tenant_id,
+                        "ownership_filter": "entire_tenant",
                         "types": [ALL_EVENT_TYPES_PATTERN],
                     }
                 ],
@@ -175,7 +176,7 @@ async def test_wildcard_interest_delivers_every_event_type(api, test_env):
         base_url=f"{test_env.base_url}/event-broker/v1", timeout=None
     ) as stream_client:
         async with stream_client.stream(
-            "GET", f"/events:sse?subscription_id={sub_id}"
+            "GET", f"/events:sse?subscription={sub_id}"
         ) as stream_resp:
             assert stream_resp.status_code == 200
             reader = SseFrameReader(stream_resp)
@@ -197,7 +198,7 @@ async def test_wildcard_interest_delivers_every_event_type(api, test_env):
                     json={
                         "id": event_id,
                         "type": EVENT_TYPE_STREAM,
-                        "tenant_id": tenant_id,
+                        "subject_tenant": tenant_id,
                         "source": "e2e-test",
                         "subject": "s1",
                         "subject_type": SUBJECT_TYPE,
@@ -216,8 +217,7 @@ async def test_wildcard_interest_delivers_every_event_type(api, test_env):
             assert payload == {
                 "id": event_id,
                 "type": EVENT_TYPE_STREAM,
-                "topic": TOPIC_STREAM,
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id,
                 "source": "e2e-test",
                 "subject": "s1",
                 "subject_type": SUBJECT_TYPE,

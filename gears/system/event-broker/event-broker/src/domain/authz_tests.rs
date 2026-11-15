@@ -1,11 +1,11 @@
 //! The decisions behind the PEP resources the broker asks about: which
-//! interests are checked on the exact type and which on the event base type,
-//! and which ids are refused before the PEP is asked at all.
+//! event-type selectors can match an event type, and which ids are refused
+//! before the PEP is asked at all.
 
 use authz_resolver_sdk::test_support::EmptyScopePdp;
 use gts::{GtsIdPattern, GtsTypeId};
 
-use super::{event_type_interest_resource, event_type_resource};
+use super::{check_event_type_selector, event_type_resource};
 use crate::domain::error::{DomainError, ErrorCode};
 
 const EVENT_BASE: &str = "gts.cf.core.events.event.v1~";
@@ -14,37 +14,26 @@ fn pattern(raw: &str) -> GtsIdPattern {
     GtsIdPattern::try_new(raw).expect("test pattern must be a valid GTS pattern")
 }
 
-/// The PEP resource type an interest is checked on, or the refusal code.
-fn interest_check(raw: &str) -> Result<String, ErrorCode> {
-    event_type_interest_resource(&pattern(raw))
-        .map(|resource| resource.name().to_owned())
-        .map_err(|err| match err {
-            DomainError::Validation { code, .. } => code,
-            other => panic!("unexpected error kind: {other:?}"),
-        })
+/// Whether a selector passes the check, or the refusal code.
+fn selector_check(raw: &str) -> Result<(), ErrorCode> {
+    check_event_type_selector(&pattern(raw)).map_err(|err| match err {
+        DomainError::Validation { code, .. } => code,
+        other => panic!("unexpected error kind: {other:?}"),
+    })
 }
 
 #[test]
-fn exact_interests_are_checked_on_the_type_they_name() {
-    let exact = "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~";
-    assert_eq!(interest_check(exact).as_deref(), Ok(exact));
-    // The base type is wildcard-free too, and is what a family grant covers.
-    assert_eq!(interest_check(EVENT_BASE).as_deref(), Ok(EVENT_BASE));
-}
-
-#[test]
-fn wildcard_interests_are_checked_on_the_event_base_type() {
-    // A wildcard pattern is not a GTS identifier, so it never becomes the
-    // resource type - whether it is narrower than the event family...
+fn selectors_that_can_match_an_event_type_are_accepted() {
+    // An exact type, and the base type a family grant covers.
     assert_eq!(
-        interest_check("gts.cf.core.events.event.v1~x.eb.*").as_deref(),
-        Ok(EVENT_BASE)
+        selector_check("gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"),
+        Ok(())
     );
-    // ...or broader than it, which still matches every event type.
-    assert_eq!(
-        interest_check("gts.cf.core.events.*").as_deref(),
-        Ok(EVENT_BASE)
-    );
+    assert_eq!(selector_check(EVENT_BASE), Ok(()));
+    // A wildcard narrower than the event family, and one broader than it,
+    // which still matches every event type.
+    assert_eq!(selector_check("gts.cf.core.events.event.v1~x.eb.*"), Ok(()));
+    assert_eq!(selector_check("gts.cf.core.events.*"), Ok(()));
 }
 
 #[test]
@@ -52,11 +41,11 @@ fn interests_that_cannot_match_an_event_type_are_refused_before_the_pep() {
     // Another gear's type, exact or as a family: no event can match, and
     // asking the PEP would turn it into a question about that gear's resource.
     assert_eq!(
-        interest_check("gts.cf.irm.core.resource.v1~"),
+        selector_check("gts.cf.irm.core.resource.v1~"),
         Err(ErrorCode::BadTypePattern)
     );
     assert_eq!(
-        interest_check("gts.cf.irm.*"),
+        selector_check("gts.cf.irm.*"),
         Err(ErrorCode::BadTypePattern)
     );
 }
@@ -92,8 +81,6 @@ fn event_and_topic_resources_advertise_the_target_tenant_property() {
     for resource in [
         super::topic_resource(&topic),
         event_type_resource(&GtsTypeId::new(EVENT_BASE)).unwrap(),
-        event_type_interest_resource(&pattern(EVENT_BASE)).unwrap(),
-        event_type_interest_resource(&pattern("gts.cf.core.events.*")).unwrap(),
     ] {
         assert!(resource.supported_properties().contains(&OWNER_TENANT_ID));
     }

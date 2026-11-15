@@ -29,14 +29,16 @@ fn event(sequence: Option<Sequence>) -> Event {
             "gts.cf.core.events.topic.v1~x.eb.orders.acme.v1",
         )
         .expect("static gts id is valid"),
-        tenant_id: Uuid::nil(),
+        subject_tenant: Uuid::nil(),
         source: "wire".to_owned(),
         subject: "order-1".to_owned(),
         subject_type: gts::GtsTypeId::new("gts.x.eb.dto.subject.v1~"),
+        subject_owner: None,
         occurred_at: occurred_at(),
         trace_parent: None,
         data: json!({ "n": 1 }),
         meta: None,
+        ingest: None,
         partition: Some(0),
         sequence,
         sequence_time: None,
@@ -55,8 +57,7 @@ fn a_stamped_sequence_renders_as_a_bare_number() {
         json!({
             "id": "00000000-0000-0000-0000-000000000000",
             "type": "gts.cf.core.events.event.v1~x.eb.orders.created.v1~",
-            "topic": "gts.cf.core.events.topic.v1~x.eb.orders.acme.v1",
-            "tenant_id": "00000000-0000-0000-0000-000000000000",
+            "subject_tenant": "00000000-0000-0000-0000-000000000000",
             "source": "wire",
             "subject": "order-1",
             "subject_type": "gts.x.eb.dto.subject.v1~",
@@ -92,5 +93,63 @@ fn a_sequence_beyond_32_bits_survives_the_crossing() {
     assert_eq!(
         serde_json::to_value(&dto).expect("the DTO must serialise")["sequence"],
         json!(2_147_483_648_i64)
+    );
+}
+
+/// A delivered event names its owner and never its ingest stamp; an unowned
+/// event leaves the owner out.
+#[test]
+fn a_delivered_event_carries_its_owner_and_never_its_ingest_stamp() {
+    let stamp = Some(crate::domain::model::IngestStamp {
+        tenant: Uuid::from_u128(0x7e),
+        actor: Uuid::from_u128(0xac),
+    });
+    let owned = Event {
+        subject_owner: Some(Uuid::from_u128(0x0e)),
+        ingest: stamp,
+        ..event(Some(Sequence::assigned(1)))
+    };
+    let unowned = Event {
+        ingest: stamp,
+        ..event(Some(Sequence::assigned(2)))
+    };
+
+    let bodies = [owned, unowned].map(|event| {
+        serde_json::to_value(EventPayloadDto::from(event)).expect("the DTO must serialise")
+    });
+
+    assert_eq!(
+        bodies,
+        [
+            json!({
+                "id": "00000000-0000-0000-0000-000000000000",
+                "type": "gts.cf.core.events.event.v1~x.eb.orders.created.v1~",
+                "subject_tenant": "00000000-0000-0000-0000-000000000000",
+                "source": "wire",
+                "subject": "order-1",
+                "subject_type": "gts.x.eb.dto.subject.v1~",
+                "subject_owner": "00000000-0000-0000-0000-00000000000e",
+                "occurred_at": "2026-09-07T12:00:00Z",
+                "trace_parent": null,
+                "data": { "n": 1 },
+                "partition": 0,
+                "sequence": 1,
+                "sequence_time": null,
+            }),
+            json!({
+                "id": "00000000-0000-0000-0000-000000000000",
+                "type": "gts.cf.core.events.event.v1~x.eb.orders.created.v1~",
+                "subject_tenant": "00000000-0000-0000-0000-000000000000",
+                "source": "wire",
+                "subject": "order-1",
+                "subject_type": "gts.x.eb.dto.subject.v1~",
+                "occurred_at": "2026-09-07T12:00:00Z",
+                "trace_parent": null,
+                "data": { "n": 1 },
+                "partition": 0,
+                "sequence": 2,
+                "sequence_time": null,
+            }),
+        ]
     );
 }

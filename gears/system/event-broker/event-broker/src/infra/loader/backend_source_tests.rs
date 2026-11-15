@@ -3,9 +3,7 @@
 use std::sync::Arc;
 
 use memory_event_broker_plugin::MemoryBackend;
-use toolkit_db::DBProvider;
 use toolkit_gts::GtsInstanceId;
-use uuid::Uuid;
 
 use super::backend_source::BackendEventSource;
 use crate::domain::model::Sequence;
@@ -13,7 +11,7 @@ use crate::domain::streaming::source::PartitionKey;
 use crate::infra::loader::heads::HeadSource;
 use crate::infra::loader::source::{EventSource, SourceError};
 use crate::infra::specification::TypesRegistrySpecificationManager;
-use crate::infra::storage::migrations::Migrator;
+use crate::test_support::gear_db::ScratchSqlite;
 use crate::test_support::type_registry::registry_holding;
 use crate::test_support::{SingleBackendResolver, StaticTypesRegistry};
 
@@ -22,34 +20,11 @@ const TOPIC_ID: &str =
 const MISSING_TOPIC_ID: &str =
     toolkit_gts::gts_id!("cf.core.events.topic.v1~example.eb.backendsource.missing.v1");
 
-/// A source over a fresh `SQLite` gear database holding `TOPIC_ID`, and a DSN
-/// that reaches the same file.
-async fn source() -> (BackendEventSource, String) {
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "cf-eb-backendsource-test-{}.db",
-        Uuid::now_v7().simple()
-    ));
-    let mut file = path.to_string_lossy().replace('\\', "/");
-    if !file.starts_with('/') {
-        file.insert(0, '/');
-    }
-    let dsn = format!("sqlite://{file}?mode=rwc");
-    let opts = toolkit_db::ConnectOpts {
-        max_conns: Some(1),
-        min_conns: Some(1),
-        ..Default::default()
-    };
-    let db = toolkit_db::connect_db(&dsn, opts)
-        .await
-        .expect("connect sqlite");
-    toolkit_db::migration_runner::run_migrations_for_testing(
-        &db,
-        <Migrator as sea_orm_migration::MigratorTrait>::migrations(),
-    )
-    .await
-    .expect("migrations");
-    let db = Arc::new(DBProvider::new(db));
+/// A source over a fresh `SQLite` gear database holding `TOPIC_ID`, and that
+/// database.
+async fn source() -> (BackendEventSource, ScratchSqlite) {
+    let scratch = ScratchSqlite::open("cf-eb-backendsource-test").await;
+    let db = Arc::clone(scratch.db());
     let client: Arc<dyn types_registry_sdk::PlatformTypesRegistryApi> = registry_holding(
         &[serde_json::json!({ "id": TOPIC_ID, "description": "a topic the loader reads" })],
         &[],
@@ -61,12 +36,13 @@ async fn source() -> (BackendEventSource, String) {
         Arc::new(TypesRegistrySpecificationManager::new(db)),
         Arc::new(SingleBackendResolver::new(Arc::new(MemoryBackend::new()))),
     );
-    (source, dsn)
+    (source, scratch)
 }
 
 #[tokio::test]
 async fn a_loader_read_during_a_spec_cache_fault_is_unavailable() {
-    let (source, dsn) = source().await;
+    let (source, scratch) = source().await;
+    let dsn = scratch.dsn().to_owned();
     crate::test_support::tables::drop_table(&dsn, "event_broker_spec_cache").await;
     let topic = GtsInstanceId::try_new(TOPIC_ID).unwrap();
 
@@ -85,7 +61,7 @@ async fn a_loader_read_during_a_spec_cache_fault_is_unavailable() {
 
 #[tokio::test]
 async fn a_loader_read_of_an_unregistered_topic_fails() {
-    let (source, _dsn) = source().await;
+    let (source, _scratch) = source().await;
     let topic = GtsInstanceId::try_new(MISSING_TOPIC_ID).unwrap();
 
     let read = source

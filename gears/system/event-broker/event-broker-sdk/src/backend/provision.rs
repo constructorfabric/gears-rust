@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use uuid::Uuid;
+
 use super::BackendError;
 use super::ids::LogId;
 use crate::GtsInstanceId;
@@ -10,6 +12,10 @@ use crate::GtsInstanceId;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopicSpec {
     pub topic: GtsInstanceId,
+    /// The topic's Registry Reference, which the gear reads from
+    /// types-registry; a backend that keys the topic's storage by a UUID uses
+    /// this one and never derives one from `topic`.
+    pub uuid: Uuid,
     /// The count to create the log with; the backend partitions keys into
     /// this many. For a log the backend already holds, it is the count the
     /// backend reported when it provisioned that log.

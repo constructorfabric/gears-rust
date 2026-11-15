@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 
 use event_broker_sdk::GtsInstanceId;
-use event_broker_sdk::backend::support::topic_uuid;
 use event_broker_sdk::backend::{BackendError, Partition, Role, TopicPartition};
 use sqlx::SqlitePool;
 use uuid::Uuid;
@@ -18,7 +17,8 @@ use crate::settings::SqliteSettings;
 /// cached for the life of the instance.
 #[derive(Debug, Clone, Copy)]
 pub struct KnownTopic {
-    /// `topic_uuid(id)`, the key of every row of the topic.
+    /// The `TopicSpec.uuid` the topic was provisioned under, the key of every
+    /// row of the topic.
     pub uuid: Uuid,
     /// The topic's partition count.
     pub partitions: u32,
@@ -98,15 +98,14 @@ impl Shared {
         if let Some(known) = cached {
             return Ok(known);
         }
-        let uuid = topic_uuid(topic);
-        let partitions: Option<i64> =
-            sqlx::query_scalar("SELECT partitions FROM evbk__log WHERE topic_uuid = ?1")
-                .bind(uuid)
+        let row: Option<(Uuid, i64)> =
+            sqlx::query_as("SELECT topic_uuid, partitions FROM evbk__log WHERE topic_id = ?1")
+                .bind(topic.as_ref())
                 .fetch_optional(&self.opened()?.pool)
                 .await
                 .map_err(|e| error::map(operation, &e))?;
-        let partitions =
-            partitions.ok_or_else(|| BackendError::not_provisioned(operation.name()))?;
+        let (uuid, partitions) =
+            row.ok_or_else(|| BackendError::not_provisioned(operation.name()))?;
         let known = KnownTopic {
             uuid,
             partitions: u32::try_from(partitions).map_err(|_| {

@@ -57,6 +57,8 @@ TRACE_ID = "0af7651916cd43dd8448eb211c80319c"
 TRACEPARENT = f"00-{TRACE_ID}-b7ad6b7169203331-01"
 
 SUBJECT_TYPE = "gts.cf.e2e.event_broker.subject.v1~"
+# A second subject type, admitted only by the subject-selector topic's event type.
+SUBJECT_TYPE_OTHER = "gts.cf.e2e.event_broker.subject_other.v1~"
 
 # Active streaming topic: tests publish events here and verify delivery via
 # the SSE or multipart stream. Each test generates a unique tenant_id so
@@ -159,12 +161,140 @@ TOPIC_KEYED = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.keyed.v1"
 EVENT_TYPE_KEYED = "gts.cf.core.events.event.v1~cf.e2e.event_broker.keyed.v1~"
 KEYED_POINTER = "/data/k"
 
+# Subject-selector topic: one partition, and an event type admitting both
+# SUBJECT_TYPE and SUBJECT_TYPE_OTHER, so a test publishes one event of each in
+# order and checks that a subject-type selector delivers only its own.
+TOPIC_SUBJECT_SELECTOR = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.subject_selector.v1"
+EVENT_TYPE_SUBJECT_SELECTOR = "gts.cf.core.events.event.v1~cf.e2e.event_broker.subject_selector.v1~"
+
+# Selector-matching topics (`test_selector_matching.py`): one partition each, and
+# one per type family, so a test publishes excluded events and then an admitted
+# sentinel on the same partition, and no family sees another's types.
+#
+# Exact selector: a type and a sibling of it.
+TOPIC_SEL_EXACT = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.sel_exact.v1"
+EVENT_TYPE_SEL_EXACT = "gts.cf.core.events.event.v1~cf.e2e.event_broker.sel_exact.v1~"
+EVENT_TYPE_SEL_EXACT_SIBLING = "gts.cf.core.events.event.v1~cf.e2e.event_broker.sel_exact_sibling.v1~"
+# A type family: a base, two types derived from it, one derived from the first of
+# those (two levels below the base), and a type of another family.
+TOPIC_SEL_FAMILY = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.sel_family.v1"
+EVENT_TYPE_SEL_BASE = "gts.cf.core.events.event.v1~cf.e2e.event_broker.sel_base.v1~"
+EVENT_TYPE_SEL_EXPRESS = EVENT_TYPE_SEL_BASE + "cf.e2e.event_broker.sel_express.v1~"
+EVENT_TYPE_SEL_RUSH = EVENT_TYPE_SEL_BASE + "cf.e2e.event_broker.sel_rush.v1~"
+EVENT_TYPE_SEL_PRIORITY = EVENT_TYPE_SEL_EXPRESS + "cf.e2e.event_broker.sel_priority.v1~"
+EVENT_TYPE_SEL_OTHER = "gts.cf.core.events.event.v1~cf.e2e.event_broker.sel_other.v1~"
+# Prefix wildcard: two types under the `cf.e2e.sel_prefix` namespace and an
+# outsider on the same topic. The suite's own namespace would cover the outsider
+# too, so the types under the prefix use a namespace of their own.
+TOPIC_SEL_PREFIX = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.sel_prefix.v1"
+EVENT_TYPE_SEL_PREFIX_PATTERN = "gts.cf.core.events.event.v1~cf.e2e.sel_prefix.*"
+EVENT_TYPE_SEL_PREFIX_CREATED = "gts.cf.core.events.event.v1~cf.e2e.sel_prefix.created.v1~"
+EVENT_TYPE_SEL_PREFIX_PLACED = "gts.cf.core.events.event.v1~cf.e2e.sel_prefix.placed.v1~"
+EVENT_TYPE_SEL_PREFIX_OUTSIDER = "gts.cf.core.events.event.v1~cf.e2e.event_broker.sel_prefix_outsider.v1~"
+# No match: a wildcard no type of the topic falls under, and a sentinel type a
+# second interest names.
+TOPIC_SEL_NOMATCH = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.sel_nomatch.v1"
+EVENT_TYPE_SEL_NOMATCH_PATTERN = "gts.cf.core.events.event.v1~cf.e2e.sel_nothing.*"
+EVENT_TYPE_SEL_NOMATCH = "gts.cf.core.events.event.v1~cf.e2e.event_broker.sel_nomatch.v1~"
+EVENT_TYPE_SEL_NOMATCH_SENTINEL = "gts.cf.core.events.event.v1~cf.e2e.event_broker.sel_nomatch_sentinel.v1~"
+# Late types: the base is seeded; the types derived from it are admitted by the
+# tests while the server runs, after their JOIN.
+TOPIC_SEL_LATE = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.sel_late.v1"
+EVENT_TYPE_SEL_LATE = "gts.cf.core.events.event.v1~cf.e2e.event_broker.sel_late.v1~"
+EVENT_TYPE_SEL_LATE_ALLOWED = EVENT_TYPE_SEL_LATE + "cf.e2e.event_broker.sel_late_allowed.v1~"
+EVENT_TYPE_SEL_LATE_DENIED = EVENT_TYPE_SEL_LATE + "cf.e2e.event_broker.sel_late_denied.v1~"
+# Subject-type selectors: an event type allowing a base subject type (and so its
+# derived subject types) and an outsider, and a sentinel type a second interest
+# names. One derived subject type sits under the `cf` vendor, the other under
+# another vendor; subject types need no registration, publish checks only the
+# allowed patterns.
+TOPIC_SEL_SUBJECT = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.sel_subject.v1"
+EVENT_TYPE_SEL_SUBJECT = "gts.cf.core.events.event.v1~cf.e2e.event_broker.sel_subject.v1~"
+EVENT_TYPE_SEL_SUBJECT_SENTINEL = "gts.cf.core.events.event.v1~cf.e2e.event_broker.sel_subject_sentinel.v1~"
+SUBJECT_TYPE_SEL_CUSTOMER = "gts.cf.e2e.event_broker.sel_customer.v1~"
+SUBJECT_TYPE_SEL_MEMBER = SUBJECT_TYPE_SEL_CUSTOMER + "cf.e2e.event_broker.sel_member.v1~"
+SUBJECT_TYPE_SEL_PARTNER = SUBJECT_TYPE_SEL_CUSTOMER + "fabrikam.e2e.event_broker.sel_member.v1~"
+SUBJECT_TYPE_SEL_CUSTOMER_PREFIX = SUBJECT_TYPE_SEL_CUSTOMER + "cf.*"
+SUBJECT_TYPE_SEL_SUPPLIER = "gts.cf.e2e.event_broker.sel_supplier.v1~"
+SUBJECT_TYPE_SEL_AUDITOR = "gts.cf.e2e.event_broker.sel_auditor.v1~"
+
+# Ownership-filter topics: one partition each, written only by their own test,
+# so a stream read from "earliest" holds exactly the events that test published.
+# TOPIC_OWNERSHIP carries events of the default tenant with and without an owner;
+# TOPIC_SUBTREE carries events of tenants other than the caller's.
+TOPIC_OWNERSHIP = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.ownership.v1"
+EVENT_TYPE_OWNERSHIP = "gts.cf.core.events.event.v1~cf.e2e.event_broker.ownership.v1~"
+TOPIC_SUBTREE = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.subtree.v1"
+EVENT_TYPE_SUBTREE = "gts.cf.core.events.event.v1~cf.e2e.event_broker.subtree.v1~"
+
+# The identity the api-gateway injects under `auth_disabled: true`
+# (toolkit_security::constants, libs/toolkit-security/src/constants.rs).
+DEFAULT_TENANT_ID = "00000000-df51-5b42-9538-d2b56b7ee953"
+DEFAULT_SUBJECT_ID = "11111111-6a88-4768-9dfc-6bcd5187d9ed"
+
 # Shared xfail marker for tests that require real auth enforcement.
 # The standalone config sets ``auth_disabled: true``; these tests document the
 # expected behaviour and will pass once a multi-tenant config is wired.
 XFAIL_AUTH_DISABLED = pytest.mark.xfail(
     reason="standalone config sets auth_disabled: true; tenant isolation is not enforced",
     strict=True,
+)
+
+# For tests whose scenario denies one event type to the caller: the suite's
+# policy allows every type, so the event is delivered and the test fails.
+XFAIL_NO_ACTION_AWARE_PDP = pytest.mark.xfail(
+    reason="the suite runs no action-aware PDP; denying one event type needs one",
+    strict=True,
+)
+
+# Static-token identities for a static-tokens config of this suite. Each token
+# is bound in that config's `static-authn-plugin` token list:
+# Principal A: a fixed non-nil subject in the shared e2e tenant.
+TOKEN_PRINCIPAL_A = "eb-e2e-principal-a"
+# Principal B: a second fixed non-nil subject in the same tenant as A.
+TOKEN_PRINCIPAL_B = "eb-e2e-principal-b"
+# The nil-subject identity: subject id is the nil UUID, tenant the shared one.
+TOKEN_NIL_SUBJECT = "eb-e2e-nil-subject"
+# The nil-tenant identity: a fixed non-nil subject whose tenant id is the nil
+# UUID, which the shipped policies refuse.
+TOKEN_NIL_TENANT = "eb-e2e-nil-tenant"
+
+
+def _api_gateway_auth_disabled(config_text: str) -> bool:
+    """Whether the config's ``api-gateway`` module sets ``auth_disabled: true``.
+
+    Reads the module block (the ``  api-gateway:`` line and every line indented
+    deeper below it); the session config patch (``_patch_config``) never
+    touches that block, so the file decides it.
+    """
+    lines = config_text.splitlines()
+    try:
+        start = lines.index("  api-gateway:")
+    except ValueError:
+        return False
+    for line in lines[start + 1 :]:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and len(line) - len(line.lstrip()) <= 2:
+            break
+        if stripped.split("#", 1)[0].strip() == "auth_disabled: true":
+            return True
+    return False
+
+
+# Read once at import from CONFIG, the config `gear_test_env` boots: its
+# ``api-gateway.config.auth_disabled`` (config/event-broker-standalone.yaml:218).
+API_GATEWAY_AUTH_DISABLED = _api_gateway_auth_disabled(CONFIG.read_text(encoding="utf-8"))
+
+# For tests that send a static token: under an auth-disabled config the gateway
+# ignores the token and injects its own default identity, so the test is a
+# strict xfail; under any other config it runs unmarked.
+XFAIL_UNLESS_STATIC_TOKENS = (
+    pytest.mark.xfail(
+        reason="config sets api-gateway auth_disabled: true; static tokens are not read",
+        strict=True,
+    )
+    if API_GATEWAY_AUTH_DISABLED
+    else (lambda test: test)
 )
 
 # Quotas and caps - rate limits, consumer-group capacity, interest counts - are
@@ -189,6 +319,15 @@ _TOPIC_PARTITIONS = {
     TOPIC_BYTES: 1,
     TOPIC_PROGRESS: 1,
     TOPIC_KEYED: 1,
+    TOPIC_SUBJECT_SELECTOR: 1,
+    TOPIC_SEL_EXACT: 1,
+    TOPIC_SEL_FAMILY: 1,
+    TOPIC_SEL_PREFIX: 1,
+    TOPIC_SEL_NOMATCH: 1,
+    TOPIC_SEL_LATE: 1,
+    TOPIC_SEL_SUBJECT: 1,
+    TOPIC_OWNERSHIP: 1,
+    TOPIC_SUBTREE: 1,
 }
 
 # Topics bounded tighter than the default retention: their `retention` block.
@@ -231,26 +370,36 @@ def _topic_instance(topic_id: str) -> dict:
     return {"id": topic_id, "description": "a topic this E2E suite publishes to"}
 
 
-def _derived_event_type(type_id: str, topic_id: str) -> dict:
+def _derived_event_type(
+    type_id: str,
+    topic_id: str,
+    subject_types: list[str] | None = None,
+    parent: str = "gts.cf.core.events.event.v1~",
+) -> dict:
     """An event type as `types-registry` holds it: a derived *type schema*.
 
     Its traits are what govern the type - the topic its events land on, the
     subject types they may declare, and the member of an event that decides its
-    partition. `data` narrows to the base's own `["object", "null"]`: an empty
-    schema would be *wider* than the base, and registration refuses a derived
-    type that widens.
+    partition. `subject_types` lists the allowed subject types; `None` means
+    `[SUBJECT_TYPE]`. `data` narrows to the base's own `["object", "null"]`: an
+    empty schema would be *wider* than the base, and registration refuses a
+    derived type that widens. `parent` is the type it derives from, the event
+    base unless it sits deeper in a chain; its traits are set in full all the
+    same.
     """
+    if subject_types is None:
+        subject_types = [SUBJECT_TYPE]
     return {
         "$id": f"gts://{type_id}",
         "$schema": "http://json-schema.org/draft-07/schema#",
         "x-gts-traits": {
             "topic": topic_id,
-            "allowed_subject_types": [SUBJECT_TYPE],
-            "partition_key": "/tenant_id",
+            "allowed_subject_types": subject_types,
+            "partition_key": "/subject_tenant",
         },
         "type": "object",
         "allOf": [
-            {"$ref": "gts://gts.cf.core.events.event.v1~"},
+            {"$ref": f"gts://{parent}"},
             {"type": "object", "properties": {"data": {"type": ["object", "null"]}}},
         ],
     }
@@ -299,7 +448,7 @@ def _strict_event_type(type_id: str, topic_id: str) -> dict:
         "x-gts-traits": {
             "topic": topic_id,
             "allowed_subject_types": [SUBJECT_TYPE],
-            "partition_key": "/tenant_id",
+            "partition_key": "/subject_tenant",
         },
         "type": "object",
         "allOf": [
@@ -345,6 +494,41 @@ _EXTRA_ENTITIES = [
     _derived_event_type(EVENT_TYPE_PROGRESS, TOPIC_PROGRESS),
     _topic_instance(TOPIC_KEYED),
     _keyed_event_type(EVENT_TYPE_KEYED, TOPIC_KEYED),
+    _topic_instance(TOPIC_SUBJECT_SELECTOR),
+    _derived_event_type(
+        EVENT_TYPE_SUBJECT_SELECTOR,
+        TOPIC_SUBJECT_SELECTOR,
+        subject_types=[SUBJECT_TYPE, SUBJECT_TYPE_OTHER],
+    ),
+    _topic_instance(TOPIC_SEL_EXACT),
+    _derived_event_type(EVENT_TYPE_SEL_EXACT, TOPIC_SEL_EXACT),
+    _derived_event_type(EVENT_TYPE_SEL_EXACT_SIBLING, TOPIC_SEL_EXACT),
+    _topic_instance(TOPIC_SEL_FAMILY),
+    _derived_event_type(EVENT_TYPE_SEL_BASE, TOPIC_SEL_FAMILY),
+    _derived_event_type(EVENT_TYPE_SEL_EXPRESS, TOPIC_SEL_FAMILY, parent=EVENT_TYPE_SEL_BASE),
+    _derived_event_type(EVENT_TYPE_SEL_RUSH, TOPIC_SEL_FAMILY, parent=EVENT_TYPE_SEL_BASE),
+    _derived_event_type(EVENT_TYPE_SEL_PRIORITY, TOPIC_SEL_FAMILY, parent=EVENT_TYPE_SEL_EXPRESS),
+    _derived_event_type(EVENT_TYPE_SEL_OTHER, TOPIC_SEL_FAMILY),
+    _topic_instance(TOPIC_SEL_PREFIX),
+    _derived_event_type(EVENT_TYPE_SEL_PREFIX_CREATED, TOPIC_SEL_PREFIX),
+    _derived_event_type(EVENT_TYPE_SEL_PREFIX_PLACED, TOPIC_SEL_PREFIX),
+    _derived_event_type(EVENT_TYPE_SEL_PREFIX_OUTSIDER, TOPIC_SEL_PREFIX),
+    _topic_instance(TOPIC_SEL_NOMATCH),
+    _derived_event_type(EVENT_TYPE_SEL_NOMATCH, TOPIC_SEL_NOMATCH),
+    _derived_event_type(EVENT_TYPE_SEL_NOMATCH_SENTINEL, TOPIC_SEL_NOMATCH),
+    _topic_instance(TOPIC_SEL_LATE),
+    _derived_event_type(EVENT_TYPE_SEL_LATE, TOPIC_SEL_LATE),
+    _topic_instance(TOPIC_SEL_SUBJECT),
+    _derived_event_type(
+        EVENT_TYPE_SEL_SUBJECT,
+        TOPIC_SEL_SUBJECT,
+        subject_types=[SUBJECT_TYPE_SEL_CUSTOMER, SUBJECT_TYPE_SEL_SUPPLIER],
+    ),
+    _derived_event_type(EVENT_TYPE_SEL_SUBJECT_SENTINEL, TOPIC_SEL_SUBJECT),
+    _topic_instance(TOPIC_OWNERSHIP),
+    _derived_event_type(EVENT_TYPE_OWNERSHIP, TOPIC_OWNERSHIP),
+    _topic_instance(TOPIC_SUBTREE),
+    _derived_event_type(EVENT_TYPE_SUBTREE, TOPIC_SUBTREE),
 ]
 
 _TEMP_HOME = tempfile.mkdtemp(prefix="cf-gears-e2e-event-broker-")
@@ -602,13 +786,13 @@ def wait_provisioned(base_url: str, event_types: dict[str, str]) -> None:
                     json={
                         "id": str(uuid.uuid4()),
                         "type": event_type,
-                        "tenant_id": str(uuid.uuid4()),
+                        "subject_tenant": str(uuid.uuid4()),
                         "source": "e2e-probe",
                         "subject": "probe",
                         "subject_type": SUBJECT_TYPE,
                         "occurred_at": datetime.now(timezone.utc).isoformat(),
                         "data": {"strict_field": "probe"},
-                        "meta": {"version": 1, "producer_id": str(uuid.uuid4()), "previous": 0, "sequence": 1},
+                        "meta": {"version": 1, "producer": str(uuid.uuid4()), "previous": 0, "sequence": 1},
                     },
                 ),
                 f"topic {topic}",
@@ -630,6 +814,15 @@ _TOPIC_EVENT_TYPES = {
     TOPIC_BYTES: EVENT_TYPE_BYTES,
     TOPIC_PROGRESS: EVENT_TYPE_PROGRESS,
     TOPIC_KEYED: EVENT_TYPE_KEYED,
+    TOPIC_SUBJECT_SELECTOR: EVENT_TYPE_SUBJECT_SELECTOR,
+    TOPIC_SEL_EXACT: EVENT_TYPE_SEL_EXACT,
+    TOPIC_SEL_FAMILY: EVENT_TYPE_SEL_BASE,
+    TOPIC_SEL_PREFIX: EVENT_TYPE_SEL_PREFIX_CREATED,
+    TOPIC_SEL_NOMATCH: EVENT_TYPE_SEL_NOMATCH,
+    TOPIC_SEL_LATE: EVENT_TYPE_SEL_LATE,
+    TOPIC_SEL_SUBJECT: EVENT_TYPE_SEL_SUBJECT_SENTINEL,
+    TOPIC_OWNERSHIP: EVENT_TYPE_OWNERSHIP,
+    TOPIC_SUBTREE: EVENT_TYPE_SUBTREE,
 }
 
 
@@ -685,7 +878,7 @@ async def prefilled_topic(test_env) -> Prefilled:
         {
             "id": str(uuid.uuid4()),
             "type": EVENT_TYPE_PREFILLED,
-            "tenant_id": PREFILLED_TENANT_ID,
+            "subject_tenant": PREFILLED_TENANT_ID,
             "source": "e2e-prefill",
             "subject": "prefill-subject",
             "subject_type": SUBJECT_TYPE,
@@ -707,7 +900,8 @@ async def prefilled_topic(test_env) -> Prefilled:
                 "interests": [
                     {
                         "topic": TOPIC_PREFILLED,
-                        "tenant_id": PREFILLED_TENANT_ID,
+                        "subject_tenant": PREFILLED_TENANT_ID,
+                        "ownership_filter": "entire_tenant",
                         "types": [EVENT_TYPE_PREFILLED],
                     }
                 ],
@@ -728,7 +922,7 @@ async def prefilled_topic(test_env) -> Prefilled:
     # implemented yet.
     delivered: list[dict] = []
     async with httpx.AsyncClient(base_url=base_url, timeout=None) as stream_client:
-        async with stream_client.stream("GET", f"/events:sse?subscription_id={sub_id}") as resp:
+        async with stream_client.stream("GET", f"/events:sse?subscription={sub_id}") as resp:
             assert resp.status_code == 200
             reader = SseFrameReader(resp)
             await reader.await_kind("topology", timeout=5)
