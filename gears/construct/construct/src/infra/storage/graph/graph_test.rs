@@ -24,8 +24,9 @@ use graph_storage::infra::fake_store::{FakeGraphEngine, FakeGraphStore};
 use graph_storage_sdk::GraphStorageClientV1;
 use graph_storage_sdk::models::{
     DeleteOutcome, EdgeKey, EdgeSpec, GraphRevision, GtsTypeId, IngestOutcome, IngestRequest,
-    NeighborhoodRequest, NodeKey, NodeRow, NodeSpec, NodeView, Page, SearchRequest, SearchResponse,
-    TraversalResponse, TraverseRequest, TruncationReason, TypeQuery, TypeRecord, TypeRegistration,
+    NeighborhoodRequest, NodeKey, NodeRow, NodeSpec, NodeView, Page, RegisteredType, SearchRequest,
+    SearchResponse, TraversalResponse, TraverseRequest, TruncationReason, TypeQuery, TypeRecord,
+    TypeRegistration, TypeRegistrationOptions,
 };
 use serde_json::{Value, json};
 use tokio::sync::Barrier;
@@ -217,11 +218,12 @@ impl Scripted {
 
 #[async_trait]
 impl GraphStorageClientV1 for Scripted {
-    async fn register_types(
+    async fn register_types_with(
         &self,
         ctx: &SecurityContext,
         batch: Vec<TypeRegistration>,
-    ) -> Result<Vec<TypeRecord>, CanonicalError> {
+        options: TypeRegistrationOptions,
+    ) -> Result<Vec<RegisteredType>, CanonicalError> {
         self.registrations.fetch_add(1, Ordering::SeqCst);
         if self.fail_next_registration.swap(false, Ordering::SeqCst) {
             return Err(unavailable());
@@ -232,14 +234,6 @@ impl GraphStorageClientV1 for Scripted {
         {
             return Err(cas_conflict());
         }
-        self.inner.register_types(ctx, batch).await
-    }
-    async fn register_types_with(
-        &self,
-        ctx: &SecurityContext,
-        batch: Vec<TypeRegistration>,
-        options: graph_storage_sdk::models::TypeRegistrationOptions,
-    ) -> Result<Vec<graph_storage_sdk::models::RegisteredType>, CanonicalError> {
         self.inner.register_types_with(ctx, batch, options).await
     }
     async fn count_nodes(
@@ -2169,6 +2163,55 @@ async fn registration_is_remembered_per_tenant_and_a_failed_one_is_not() {
         "{failed:?}"
     );
     assert_eq!(scripted.registrations.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn schemas_of_an_earlier_version_are_upgraded_on_registration() {
+    let client = graph_storage();
+    let ctx = construct_in(Uuid::new_v4());
+    // The registry as an earlier release left it: the person types without
+    // the properties added since.
+    let earlier: Vec<TypeRegistration> = construct_sdk::profile_types::graph_types()
+        .into_iter()
+        .map(|graph_type| {
+            let mut schema: Value = serde_json::from_str(graph_type.schema).unwrap();
+            if let Some(Value::Object(properties)) =
+                schema.pointer_mut("/allOf/1/properties/payload/properties")
+            {
+                for added in [
+                    "projects",
+                    "repositories",
+                    "programming_languages",
+                    "tools_and_frameworks",
+                    "development_environment",
+                    "coding_conventions",
+                ] {
+                    properties.remove(added);
+                }
+            }
+            TypeRegistration {
+                type_id: graph_type.type_id.to_owned(),
+                schema,
+            }
+        })
+        .collect();
+    client.register_types(&ctx, earlier.clone()).await.unwrap();
+    let changed = earlier
+        .iter()
+        .filter(|registered| {
+            let current = construct_sdk::profile_types::graph_types()
+                .into_iter()
+                .find(|graph_type| graph_type.type_id == registered.type_id)
+                .unwrap();
+            serde_json::from_str::<Value>(current.schema).unwrap() != registered.schema
+        })
+        .count();
+    assert_eq!(changed, 3, "the role, skill and preference types differ");
+
+    GraphTypes::new(Arc::clone(&client))
+        .ensure(&ctx)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

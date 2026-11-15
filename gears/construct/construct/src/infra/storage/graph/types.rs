@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use construct_sdk::profile_types::graph_types;
 use graph_storage_sdk::GraphStorageClientV1;
-use graph_storage_sdk::models::TypeRegistration;
+use graph_storage_sdk::models::{OnExisting, TypeRegistration, TypeRegistrationOptions};
 use parking_lot::Mutex;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -16,7 +16,10 @@ use crate::domain::error::DomainError;
 
 /// Registers Construct's graph types in a tenant before the first write there.
 /// Graph storage keeps types per tenant. Registering the same schemas again
-/// converges, so a restart, or two instances registering at once, is safe; the
+/// converges, so a restart, or two instances registering at once, is safe. A
+/// tenant that holds an earlier version of a schema gets the new one when the
+/// change is backward compatible, as adding a property to a person type is;
+/// any other change is refused. The
 /// tenants already done are remembered for the life of the process only, and a
 /// registration that failed is not remembered.
 ///
@@ -25,6 +28,14 @@ pub struct GraphTypes {
     client: Arc<dyn GraphStorageClientV1>,
     timeout: Duration,
     registered: Mutex<HashSet<Uuid>>,
+}
+
+/// A changed schema of a registered type is admitted when graph storage proves it backward compatible.
+fn update_existing() -> TypeRegistrationOptions {
+    TypeRegistrationOptions {
+        on_existing: OnExisting::Update,
+        ..TypeRegistrationOptions::default()
+    }
 }
 
 impl GraphTypes {
@@ -76,9 +87,12 @@ impl GraphTypes {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let first =
-            tokio::time::timeout(self.timeout, self.client.register_types(ctx, batch.clone()))
-                .await;
+        let first = tokio::time::timeout(
+            self.timeout,
+            self.client
+                .register_types_with(ctx, batch.clone(), update_existing()),
+        )
+        .await;
         match first {
             Ok(Ok(_)) => {}
             // Two first registrations in a tenant race, and the one that
@@ -90,7 +104,8 @@ impl GraphTypes {
                 bounded(
                     self.timeout,
                     "type registration",
-                    self.client.register_types(ctx, batch),
+                    self.client
+                        .register_types_with(ctx, batch, update_existing()),
                 )
                 .await?;
             }
