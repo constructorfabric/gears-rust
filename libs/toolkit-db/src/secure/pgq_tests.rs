@@ -12,8 +12,9 @@ use crate::secure::{ScopableEntity, ScopeError};
 mod node {
     use sea_orm::entity::prelude::*;
 
-    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, toolkit_db::secure::Scopable)]
     #[sea_orm(table_name = "graph_node")]
+    #[secure(tenant_col = "tenant_id", resource_col = "id", no_owner, no_type)]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
         pub tenant_id: Uuid,
@@ -26,40 +27,15 @@ mod node {
     pub enum Relation {}
 
     impl ActiveModelBehavior for ActiveModel {}
-
-    impl crate::secure::ScopableEntity for Entity {
-        fn tenant_col() -> Option<Column> {
-            Some(Column::TenantId)
-        }
-        fn resource_col() -> Option<Column> {
-            Some(Column::Id)
-        }
-        fn owner_col() -> Option<Column> {
-            None
-        }
-        fn type_col() -> Option<Column> {
-            None
-        }
-        fn resolve_property(property: &str) -> Option<Column> {
-            use toolkit_security::access_scope::pep_properties;
-            match property {
-                p if p == pep_properties::OWNER_TENANT_ID => Some(Column::TenantId),
-                p if p == pep_properties::RESOURCE_ID => Some(Column::Id),
-                _ => None,
-            }
-        }
-        fn scope_columns() -> Vec<Column> {
-            vec![Column::TenantId, Column::Id]
-        }
-    }
 }
 
 /// An edge that carries a tenant, as a secure graph element must.
 mod edge {
     use sea_orm::entity::prelude::*;
 
-    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, toolkit_db::secure::Scopable)]
     #[sea_orm(table_name = "graph_edge")]
+    #[secure(tenant_col = "tenant_id", resource_col = "id", no_owner, no_type)]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
         pub tenant_id: Uuid,
@@ -73,32 +49,6 @@ mod edge {
     pub enum Relation {}
 
     impl ActiveModelBehavior for ActiveModel {}
-
-    impl crate::secure::ScopableEntity for Entity {
-        fn tenant_col() -> Option<Column> {
-            Some(Column::TenantId)
-        }
-        fn resource_col() -> Option<Column> {
-            Some(Column::Id)
-        }
-        fn owner_col() -> Option<Column> {
-            None
-        }
-        fn type_col() -> Option<Column> {
-            None
-        }
-        fn resolve_property(property: &str) -> Option<Column> {
-            use toolkit_security::access_scope::pep_properties;
-            match property {
-                p if p == pep_properties::OWNER_TENANT_ID => Some(Column::TenantId),
-                p if p == pep_properties::RESOURCE_ID => Some(Column::Id),
-                _ => None,
-            }
-        }
-        fn scope_columns() -> Vec<Column> {
-            vec![Column::TenantId, Column::Id]
-        }
-    }
 }
 
 /// A vertex whose scope columns are **not** all key columns. Without one of
@@ -107,8 +57,14 @@ mod edge {
 mod owned {
     use sea_orm::entity::prelude::*;
 
-    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, toolkit_db::secure::Scopable)]
     #[sea_orm(table_name = "owned_thing")]
+    #[secure(
+        tenant_col = "tenant_id",
+        resource_col = "id",
+        owner_col = "owner_id",
+        no_type
+    )]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
         pub id: i64,
@@ -120,33 +76,6 @@ mod owned {
     pub enum Relation {}
 
     impl ActiveModelBehavior for ActiveModel {}
-
-    impl crate::secure::ScopableEntity for Entity {
-        fn tenant_col() -> Option<Column> {
-            Some(Column::TenantId)
-        }
-        fn resource_col() -> Option<Column> {
-            Some(Column::Id)
-        }
-        fn owner_col() -> Option<Column> {
-            Some(Column::OwnerId)
-        }
-        fn type_col() -> Option<Column> {
-            None
-        }
-        fn resolve_property(property: &str) -> Option<Column> {
-            use toolkit_security::access_scope::pep_properties;
-            match property {
-                p if p == pep_properties::OWNER_TENANT_ID => Some(Column::TenantId),
-                p if p == pep_properties::RESOURCE_ID => Some(Column::Id),
-                p if p == pep_properties::OWNER_ID => Some(Column::OwnerId),
-                _ => None,
-            }
-        }
-        fn scope_columns() -> Vec<Column> {
-            vec![Column::TenantId, Column::Id, Column::OwnerId]
-        }
-    }
 }
 
 /// A closure table, shaped exactly like the platform's real ones: a pair of
@@ -155,8 +84,9 @@ mod owned {
 mod closure {
     use sea_orm::entity::prelude::*;
 
-    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, toolkit_db::secure::Scopable)]
     #[sea_orm(table_name = "tenant_closure")]
+    #[secure(no_tenant, no_resource, no_owner, no_type)]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
         pub ancestor_id: Uuid,
@@ -168,27 +98,6 @@ mod closure {
     pub enum Relation {}
 
     impl ActiveModelBehavior for ActiveModel {}
-
-    impl crate::secure::ScopableEntity for Entity {
-        fn tenant_col() -> Option<Column> {
-            None
-        }
-        fn resource_col() -> Option<Column> {
-            None
-        }
-        fn owner_col() -> Option<Column> {
-            None
-        }
-        fn type_col() -> Option<Column> {
-            None
-        }
-        fn resolve_property(_property: &str) -> Option<Column> {
-            None
-        }
-        fn scope_columns() -> Vec<Column> {
-            Vec::new()
-        }
-    }
 }
 
 struct Kb;
@@ -447,9 +356,9 @@ fn the_derive_enumerates_custom_pep_properties() {
         impl ActiveModelBehavior for ActiveModel {}
     }
 
-    let names: Vec<&str> = <derived::Entity as ScopableEntity>::scope_columns()
-        .iter()
-        .map(sea_orm::IdenStatic::as_str)
+    let names: Vec<&str> = <derived::Entity as ScopableEntity>::SCOPE
+        .scope_columns()
+        .map(|column| sea_orm::IdenStatic::as_str(&column))
         .collect();
     assert!(names.contains(&"tenant_id"), "{names:?}");
     assert!(names.contains(&"id"), "{names:?}");
@@ -999,6 +908,36 @@ fn a_scope_no_constraint_of_which_resolves_is_refused() {
         ),
         "unexpected error: {err}"
     );
+}
+
+/// A resolvable empty branch cannot mask an unresolvable live branch.
+/// All-empty scopes still resolve through empty branches and return no rows.
+#[test]
+fn an_empty_branch_does_not_satisfy_the_live_scope_resolvability_gate() {
+    use toolkit_security::access_scope::{ScopeConstraint, ScopeFilter, pep_properties};
+    let dead = ScopeConstraint::new(vec![
+        ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, uuid::Uuid::from_u128(1)),
+        ScopeFilter::in_uuids(pep_properties::RESOURCE_ID, vec![]),
+    ]);
+    let unresolved_live = ScopeConstraint::new(vec![ScopeFilter::in_uuids(
+        "department_id",
+        vec![uuid::Uuid::from_u128(2)],
+    )]);
+
+    let mixed = AccessScope::from_constraints(vec![dead.clone(), unresolved_live]);
+    let err = two_hop(&mixed).expect_err("the live branch does not resolve");
+    assert!(
+        matches!(
+            &err,
+            ScopeError::UnresolvedScopeProperty { element, property }
+                if *element == "a" && property == "department_id"
+        ),
+        "unexpected error: {err}"
+    );
+
+    let all_dead = AccessScope::from_constraints(vec![dead]);
+    assert!(all_dead.matches_nothing());
+    two_hop(&all_dead).expect("an entirely empty scope is served as no rows");
 }
 
 /// Policy 3 on the query path: `VertexOf` ties an entity to the graph *type*,

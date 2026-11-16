@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-tr-authz-plugin"
-version = "0.1.25"
+version = "0.1.27"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -19,10 +19,10 @@ workspace = true
 
 [dependencies]
 # Local dependencies
-authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.6.3", path = "../../authz-resolver-sdk" }
-tenant-resolver-sdk = { package = "cf-gears-tenant-resolver-sdk", version = "0.4.9", path = "../../../tenant-resolver/tenant-resolver-sdk" }
+authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.6.5", path = "../../authz-resolver-sdk" }
+tenant-resolver-sdk = { package = "cf-gears-tenant-resolver-sdk", version = "0.4.11", path = "../../../tenant-resolver/tenant-resolver-sdk" }
 # Publishes through the consumed platform API (local or resolving REST client).
-types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.5.0", path = "../../../types-registry/types-registry-sdk", features = ["rest-client"] }
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.5.2", path = "../../../types-registry/types-registry-sdk", features = ["rest-client"] }
 # `deps = [tenant_resolver]`: its `init` takes the `TenantResolverClient` that gear registers.
 tenant-resolver = { workspace = true }
 

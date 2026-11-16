@@ -98,6 +98,8 @@ jobs:
               - 'deploy/components.yaml'
               - 'tools/scripts/resolve_release.py'
               - 'tools/scripts/tests/test_resolve_release.py'
+              - 'tools/scripts/release_retry.py'
+              - 'tools/scripts/tests/test_release_retry.py'
               # Input to `e2e_sidecar_pins_the_same_timescaledb_image` in
               # libs/test-containers: a Python-only edit to the E2E sidecar must
               # still get the cross-lane TimescaleDB pin checked, or the guard
@@ -109,6 +111,8 @@ jobs:
               - 'libs/toolkit/**'
               - 'libs/toolkit-http/**'
               - 'libs/toolkit-http-proxy/**'
+              - 'libs/toolkit-contract/**'
+              - 'libs/toolkit-contract-macros/**'
               - 'libs/rustls-*/**'
             magika:
               - 'gears/file-parser/**'
@@ -727,8 +731,7 @@ jobs:
           cargo test -p cf-gears-toolkit-auth --features toolkit-security/fips --lib providers::jwks
           cargo test -p cf-gears-rustls-corecrypto-provider --features fips
           cargo test -p cf-gears-toolkit-http --features fips
-          cargo test -p cf-gears-toolkit-contract --features fips --lib runtime::config
-          cargo test -p cf-gears-toolkit-contract --features fips --test wiring_config
+          cargo test -p cf-gears-toolkit-contract --features fips,rest-client,rest-server,grpc-client,otel,canonical-errors
           cargo test -p cf-gears-toolkit-http-proxy --features fips --no-run
 
       # Windows: execute native CNG operations through internal test injection.

@@ -599,7 +599,9 @@ impl<Resource> ResourceErrorBuilder<Resource, HasQuotaViolations> {
     /// Attach a retry hint to the most-recently-pushed quota violation.
     /// Use for rate-limit-style violations where the upstream knows when
     /// capacity returns; omit for hard exhaustion (memory, non-replenishing
-    /// quota) where there is no useful retry window.
+    /// quota) where there is no useful retry window. The error's hint is the
+    /// largest among its violations (`CanonicalError::retry_after_seconds`),
+    /// sent over HTTP as `Retry-After`.
     ///
     /// Silently noop if the violation list is empty — the typestate
     /// already guarantees at least one violation is present on

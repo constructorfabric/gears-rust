@@ -224,6 +224,11 @@ fn samples() -> Vec<(&'static str, Value, Value)> {
         ),
         ("coding_conventions", json!("tests before code"), json!("")),
         (
+            "remembered_notes",
+            json!("sister is called Anna"),
+            json!("  "),
+        ),
+        (
             "research_areas",
             json!({ "name": "Computational biology", "weight": 0.7 }),
             json!({ "name": "Computational biology", "weight": 1.5 }),
@@ -428,6 +433,7 @@ fn each_property_holds_one_value_unless_a_person_can_have_several() {
     let many: BTreeSet<&str> = [
         "name_variants",
         "public_mentions",
+        "remembered_notes",
         "public_profiles",
         "assistive_tools",
         "communication_channel",

@@ -164,7 +164,13 @@ impl<R: UsersRepository + 'static, CR: CitiesRepository, AR: AddressesRepository
 
         let scope = self
             .policy_enforcer
-            .access_scope(ctx, &resources::USER, actions::LIST, None)
+            .access_scope_with(
+                ctx,
+                &resources::USER,
+                actions::LIST,
+                None,
+                &AccessRequest::new().allow_empty_scope(true),
+            )
             .await?;
 
         let page = self.repo.list_page(&conn, &scope, query).await?;

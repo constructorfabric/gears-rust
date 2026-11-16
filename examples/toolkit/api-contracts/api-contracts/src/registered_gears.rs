@@ -2,14 +2,17 @@
 // present in this OoP binary.
 //
 // This binary links ONLY:
-//   * the target provider gear (this crate's own library), and
+//   * the target provider gear (this crate's own library); built with
+//     `grpc-server`, the library also brings the `api-contracts-grpc` gear and
+//     grpc-hub, which serve PaymentApi over gRPC and publish it in the
+//     directory, and
 //   * the tenant-plane authn stack it needs to turn a bearer token into a
 //     `SecurityContext` locally (authn-resolver + static-authn-plugin +
-//     types-registry).
+//     types-registry), for both REST and gRPC calls.
 //
-// It deliberately does NOT link api-gateway, grpc-hub, or authz-resolver: the
-// HTTP surface comes from the OoP bootstrap and the directory is dialed
-// remotely (`TOOLKIT_DIRECTORY_ENDPOINT`).
+// It deliberately does NOT link api-gateway or authz-resolver: the HTTP
+// surface comes from the OoP bootstrap and the directory is dialed remotely
+// (`TOOLKIT_DIRECTORY_ENDPOINT`).
 #![allow(unused_imports)]
 
 // Target gear (this crate's library target).

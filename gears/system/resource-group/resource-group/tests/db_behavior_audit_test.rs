@@ -494,10 +494,10 @@ async fn trace_update_type() {
     );
 }
 
-/// `list_memberships`'s tenant scoping runs as a correlated EXISTS
-/// subquery embedded in the page's single `SELECT`, not a second round trip
-/// and not one subquery evaluation per row (the DB engine evaluates the
-/// EXISTS per candidate row server-side, inside one statement -- there is no
+/// `list_memberships`'s tenant scoping is applied as
+/// `group_id IN (subquery over resource_group)` inside the page's single
+/// `SELECT`, not a second round trip (the DB engine evaluates the
+/// subquery server-side, inside one statement -- there is no
 /// N+1 at the client/statement level, which is what this audit suite
 /// measures).
 #[tokio::test]
@@ -532,7 +532,7 @@ async fn trace_list_memberships() {
 
     snapshot_trace("list_memberships", &rec);
     // baseline: exactly 1 resource_group_membership SELECT for the
-    // whole page (the EXISTS subquery against resource_group lives inside
+    // whole page (the `group_id IN (SELECT id FROM resource_group ...)` subquery lives inside
     // that single statement's WHERE clause, so it doesn't add a
     // resource_group_membership SELECT of its own, and -- crucially -- it
     // does not scale with the number of rows in the page: 5 items, 1
@@ -542,7 +542,7 @@ async fn trace_list_memberships() {
         membership_selects,
         1,
         "RG-12 regression: expected exactly 1 resource_group_membership \
-         SELECT for the page (no N+1 from the per-row tenant-scope subquery), \
+         SELECT for the page (no N+1 from the tenant-scope subquery), \
          got {membership_selects}:\n{}",
         rec.dump()
     );
@@ -573,9 +573,11 @@ async fn trace_list_memberships() {
 /// was invisible to a pre-transaction read of the same row: it could commit
 /// between that read and this insert with neither side raising `40001`. The
 /// check now runs inside the same transaction as the tenant check and the
-/// insert, so all three are covered by the one SSI cycle. Only `resolve_id`
-/// (the resource type's own surrogate-id lookup) and the initial group read
-/// stay on the pool -- out of scope for this fix, tracked separately.
+/// insert, so all three are covered by the one SSI cycle. The scoped group
+/// read and `resolve_id` (the resource type's own surrogate-id lookup) run
+/// first in each attempt of that same transaction, so a group deleted and
+/// re-created under another tenant between the check and the insert cannot
+/// pass the gate.
 #[tokio::test]
 async fn trace_add_membership() {
     let (db, rec) = common::test_db_with_recorder().await;

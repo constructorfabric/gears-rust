@@ -8330,12 +8330,15 @@ mod tests {
     /// failure (fail closed).
     #[test]
     fn enforcer_errors_map_to_authorization_failed() {
-        use authz_resolver_sdk::EnforcerError;
         use authz_resolver_sdk::pep::ConstraintCompileError;
+        use authz_resolver_sdk::{AccessDenial, EnforcerError};
 
         // (error, source is AuthzUnavailable rather than Forbidden)
         let errors = [
-            (EnforcerError::Denied { deny_reason: None }, false),
+            (
+                EnforcerError::AccessDenied(AccessDenial::Pdp { reason: None }),
+                false,
+            ),
             (
                 EnforcerError::EvaluationFailed(
                     toolkit_canonical_errors::CanonicalError::service_unavailable()

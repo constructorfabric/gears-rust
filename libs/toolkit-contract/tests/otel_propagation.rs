@@ -33,6 +33,13 @@ use toolkit_contract::{contract, rest_contract};
 use toolkit_http::otel::parse_trace_id;
 use toolkit_security::SecurityContext;
 
+/// Config for a plaintext mock server. A FIPS build requires TLS by default
+/// and installs no crypto provider, so opt in to plaintext and install one.
+fn plaintext_config(base_url: impl Into<String>) -> ClientConfig {
+    drop(toolkit_security::tls::configured_provider().install_default());
+    ClientConfig::new(base_url).with_require_tls(false)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Pong {
     pub ok: bool,
@@ -134,7 +141,7 @@ async fn client_span_trace_id_propagates_to_server() {
     let _subscriber_guard = tracing::subscriber::set_default(subscriber);
 
     let (base_url, captured) = start_server().await;
-    let client = PingApiRestClient::new(ClientConfig::new(base_url)).unwrap();
+    let client = PingApiRestClient::new(plaintext_config(base_url)).unwrap();
 
     // Root span for this call. The macro's per-method span (and, beneath it,
     // toolkit-http's `outgoing_http` span) become its children, so all three

@@ -113,7 +113,7 @@ async fn pdp_scope_with<T>(
                 Err(denied)
             }
         },
-        Err(err @ (EnforcerError::Denied { .. } | EnforcerError::CompileFailed(_))) => {
+        Err(err @ (EnforcerError::AccessDenied(_) | EnforcerError::CompileFailed(_))) => {
             metrics.record_pdp_decision(op, AuthzDecision::Deny, seconds);
             Err(DomainError::from(err))
         }
@@ -125,6 +125,12 @@ async fn pdp_scope_with<T>(
             metrics.record_pdp_failure(op, PdpFailureCause::Unreachable, seconds);
             Err(DomainError::from(err))
         } // @cpt-end:cpt-cf-usage-collector-algo-foundation-pdp-authorize:p2:inst-algo-pdp-failure-metrics
+        // An unknown outcome class is an internal failure: counted as one,
+        // never as a deny or an unreachable PDP.
+        Err(err) => {
+            metrics.record_pdp_failure(op, PdpFailureCause::Internal, seconds);
+            Err(DomainError::from(err))
+        }
     }
 }
 
@@ -704,9 +710,11 @@ fn value_matches(tuple_value: TupleValue, kind: OdataFieldKind, scope_value: &Sc
 /// [`crate::domain::service::Service::list_usage_records`]); with
 /// `require_constraints(false)` the PDP returned `allow_all`, leaving LIST
 /// unscoped across tenants (no tenant isolation). As defence in depth, a
-/// degenerate `allow_all` that still slips through (a non-empty constraints
-/// list whose constraints are all empty compiles to `allow_all`) is denied
-/// by [`scope_to_odata_filter`], never passed through as "no row narrowing".
+/// degenerate `allow_all` that still slips through is denied by
+/// [`scope_to_odata_filter`], never passed through as "no row narrowing".
+/// `allow_empty_scope(true)` is set here only: a permitted scope whose every
+/// branch is an empty set reaches the query as a deny-all scope, which
+/// [`scope_to_odata_filter`] lowers to an always-false contradiction.
 ///
 /// The request carries no per-record attribution attributes (LIST is
 /// pre-row), so the composed PEP request is action+resource-type only —
@@ -734,7 +742,11 @@ pub(crate) async fn authorize_list_usage_records(
         &usage_record::RESOURCE,
         usage_record::actions::LIST,
         None,
-        &AccessRequest::new().require_constraints(true),
+        // A permitted empty scope reaches storage as a contradictory
+        // filter, so aggregates keep the backend's empty-input semantics.
+        &AccessRequest::new()
+            .require_constraints(true)
+            .allow_empty_scope(true),
         // LIST authorizes in two stages like the per-record path: the PDP permit
         // must ALSO yield a projectable row scope (tenant-pinned, no tree
         // predicates, known properties) or it fails closed. Running
@@ -769,14 +781,20 @@ pub(crate) async fn authorize_list_usage_records(
 /// | `usage_record::PROP_RESOURCE_ID`      | `resource_id`   | string     |
 /// | `usage_record::PROP_SUBJECT_TYPE`     | `subject_type`  | string     |
 ///
+/// A deny-all scope — in practice a permitted scope whose every branch was an
+/// empty set, normalized out of [`AccessScope::constraints`] — projects to the
+/// always-false contradiction `tenant_id eq nil and not (tenant_id eq nil)`,
+/// which the caller's `$filter` is AND-ed with and the backend still executes.
+///
 /// Always projects to a narrowing predicate (`Ok(expr)`) or fails closed.
 /// There is **no** "no row narrowing" pass-through: under
 /// `require_constraints(true)` (see [`authorize_list_usage_records`]) a
 /// legitimate permit always carries `OWNER_TENANT_ID In [..]` narrowing
-/// (admin included, as `In [all tenants]`), so an unconstrained /
-/// empty-constraint scope is a degenerate empty-predicate permit and is
-/// denied rather than allowed to leak every tenant's rows — mirroring the
-/// per-record [`scope_admits_attribution_tuple`] gate.
+/// (admin included, as `In [all tenants]`), so an unconstrained scope or a
+/// filter-less (allow-all) constraint is a degenerate permit and is denied
+/// rather than allowed to leak every tenant's rows — mirroring the per-record
+/// [`scope_admits_attribution_tuple`] gate. The deny-all contradiction above
+/// is not such a pass-through: it narrows to no rows.
 ///
 /// # Errors
 ///
@@ -791,10 +809,6 @@ pub(crate) async fn authorize_list_usage_records(
 ///   user query as a cross-tenant predicate, so it is denied. This mirrors the
 ///   per-record gate's tenant-pinning requirement (see
 ///   [`is_owner_tenant_filter`]).
-/// * [`DomainError::AuthorizationDenied`] when the scope is deny-all
-///   ([`AccessScope::is_deny_all`]) — the PDP explicitly authorized no
-///   rows, which is observationally indistinguishable from a deny on
-///   this surface.
 /// * [`DomainError::AuthorizationDenied`] when a constraint carries a
 ///   tree predicate ([`ScopeFilter::InGroup`] /
 ///   [`ScopeFilter::InGroupSubtree`] / [`ScopeFilter::InTenantSubtree`])
@@ -820,13 +834,13 @@ pub(crate) fn scope_to_odata_filter(scope: &AccessScope) -> Result<ast::Expr, Do
         });
     }
     if scope.is_deny_all() {
-        tracing::warn!(
-            target: "authz",
-            "PDP returned a deny-all scope on the usage_record query path"
-        );
-        return Err(DomainError::AuthorizationDenied {
-            reason: Some("PDP returned a deny-all scope".to_owned()),
-        });
+        // A permitted scope whose every branch was an empty set (the query
+        // path opts into it). It matches no rows, so it is lowered to a
+        // contradiction and the query still runs: aggregates keep the
+        // backend's empty-input semantics instead of a fabricated result.
+        // Empty branches are not re-validated here; the PEP compiler
+        // validated them before normalization removed them.
+        return odata_contradiction();
     }
 
     let mut disjunction: Option<ast::Expr> = None;
@@ -838,7 +852,7 @@ pub(crate) fn scope_to_odata_filter(scope: &AccessScope) -> Result<ast::Expr, Do
         });
     }
     // Unreachable in practice — the `is_unconstrained` / `is_deny_all` guards
-    // above leave `constraints()` non-empty, and a non-empty constraint always
+    // above leave the normalized `constraints()` non-empty, and a non-empty constraint always
     // yields a `Some` disjunct (an empty one fails closed). Deny anyway so the
     // projection can never silently emit "no row narrowing".
     disjunction.ok_or_else(|| DomainError::AuthorizationDenied {
@@ -925,6 +939,11 @@ fn scope_filter_to_expr(filter: &ScopeFilter) -> Result<ast::Expr, DomainError> 
         }
         ScopeFilter::In(in_filter) => {
             let field = pep_property_to_field(in_filter.property())?;
+            if in_filter.values().is_empty() {
+                // Normalized scopes never carry an empty set in a live
+                // branch; lower one to FALSE rather than an invalid `in ()`.
+                return odata_contradiction();
+            }
             let values: Vec<ast::Expr> = in_filter
                 .values()
                 .iter()
@@ -955,6 +974,19 @@ fn scope_filter_to_expr(filter: &ScopeFilter) -> Result<ast::Expr, DomainError> 
             })
         }
     }
+}
+
+/// `OData` rejects bare booleans and empty IN lists; use UUID `x AND NOT x`
+/// for FALSE while preserving the backend's empty-input aggregate semantics.
+fn odata_contradiction() -> Result<ast::Expr, DomainError> {
+    let field = pep_property_to_field(pep_properties::OWNER_TENANT_ID)?;
+    let value = scope_value_to_ast(field, &ScopeValue::Uuid(uuid::Uuid::nil()))?;
+    let eq = ast::Expr::Compare(
+        Box::new(ast::Expr::Identifier(field.name.to_owned())),
+        ast::CompareOperator::Eq,
+        Box::new(ast::Expr::Value(value)),
+    );
+    Ok(eq.contradiction())
 }
 
 /// Wire description of a PDP property's `OData` projection.

@@ -1,6 +1,6 @@
 [package]
 name = "cf-api-contracts"
-version = "0.1.3"
+version = "0.1.5"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -13,7 +13,9 @@ publish = false
 name = "cf_api_contracts"
 
 [features]
-default = []
+# `grpc-client` is on so `cargo test --workspace` (what CI runs) covers the
+# gRPC client, resolving and runtime tests of this example.
+default = ["grpc-client"]
 # OpenTelemetry in generated clients: W3C traceparent propagation + RED metrics.
 otel = ["toolkit/otel", "api-contracts-sdk/otel"]
 grpc-client = [
@@ -22,7 +24,14 @@ grpc-client = [
     "dep:tonic",
     "dep:toolkit-transport-grpc",
 ]
-# OoP binary (api-contracts-oop): bootstrap + embedded authn stack.
+# Serve PaymentApi over gRPC: adds the `api-contracts-grpc` gear and links
+# grpc-hub, which hosts the service and publishes it in the directory. Calls are
+# authenticated with the in-process AuthN resolver. Not part of `oop_module`:
+# the hub needs its own `gears.grpc-hub` config (listen and advertise address),
+# which a deployment of the REST-only binary does not have.
+grpc-server = ["grpc-client", "dep:grpc_hub", "dep:authn-resolver-sdk"]
+# OoP binary (api-contracts-oop): bootstrap + embedded authn stack. Add
+# `grpc-server` to serve PaymentApi over gRPC as well.
 oop_module = [
     "dep:tokio",
     "dep:clap",
@@ -33,7 +42,7 @@ oop_module = [
     "dep:types-registry",
 ]
 # Kubernetes TokenReview platform-plane auth.
-k8s-auth = ["toolkit/k8s-auth"]
+k8s-auth = ["toolkit/k8s-auth", "grpc_hub?/k8s-auth"]
 
 [lints]
 workspace = true
@@ -66,6 +75,8 @@ axum.workspace = true
 
 tonic = { workspace = true, features = ["transport"], optional = true }
 toolkit-transport-grpc = { workspace = true, optional = true }
+grpc_hub = { workspace = true, optional = true }
+authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.41", path = "../../../../gears/system/authn-resolver/authn-resolver-sdk", optional = true }
 
 # OoP-only, gated behind `oop_module`.
 tokio = { workspace = true, optional = true }
@@ -77,6 +88,7 @@ types-registry = { package = "cf-gears-types-registry", path = "../../../../gear
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+toolkit-resilience = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 toolkit-canonical-errors.workspace = true

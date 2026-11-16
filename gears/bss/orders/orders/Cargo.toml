@@ -46,7 +46,7 @@ uuid = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 arc-swap = { workspace = true }
-# Synchronous locks (guidelines/DEPENDENCIES.md): no poisoning, guard returned directly.
+# Synchronous locks: no poisoning, guard returned directly.
 parking_lot = { workspace = true }
 axum = { workspace = true }
 # The gear-local per-(caller, order) edge limiter (Foundation §3.7, D-185), the same keyed
@@ -71,7 +71,7 @@ toolkit-canonical-errors = { workspace = true }
 # The D-194 commercial service principal (Q13): `exchange_client_credentials` turns the configured
 # seller identity into the SecurityContext the gate presents to Pricing and Products. No workspace
 # entry exists; path form as mini-chat, settings-service and api-gateway declare it.
-authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.41", path = "../../../system/authn-resolver/authn-resolver-sdk" }
+authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.43", path = "../../../system/authn-resolver/authn-resolver-sdk" }
 # The `deps = [authn_resolver]` gear-macro edge re-exports `::authn_resolver`, so the gear crate
 # must be a direct dependency (init ordering, D-194; not used in code), as mini-chat and
 # api-gateway declare it.

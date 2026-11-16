@@ -53,6 +53,10 @@ impl From<TransportError> for CanonicalError {
             TransportError::Unresolved { gear } => CanonicalError::service_unavailable()
                 .with_detail(format!("provider `{gear}` is not resolvable"))
                 .create(),
+            TransportError::CircuitOpen { retry_after } => CanonicalError::service_unavailable()
+                .with_retry_after_seconds(retry_after.as_secs().max(1))
+                .with_detail("circuit breaker open: recent calls to the provider failed")
+                .create(),
             TransportError::Timeout(d) => {
                 CanonicalError::internal(format!("timeout after {d:?}")).create()
             }
@@ -155,6 +159,15 @@ fn grpc_code_to_canonical(code: tonic::Code, message: String) -> CanonicalError 
         Code::NotFound => synth_to_canonical(ProblemCategory::NotFound, &message),
         Code::AlreadyExists => synth_to_canonical(ProblemCategory::AlreadyExists, &message),
         Code::PermissionDenied => synth_to_canonical(ProblemCategory::PermissionDenied, &message),
+        // The provider does not serve this RPC. Within one major version that
+        // means it runs an older minor release that predates the method.
+        Code::Unimplemented => synth_to_canonical(
+            ProblemCategory::Unimplemented,
+            &format!(
+                "provider does not implement this RPC; it may run an older minor version \
+                 of the contract ({message})"
+            ),
+        ),
         other => CanonicalError::internal(format!("gRPC {other:?}: {message}")).create(),
     }
 }

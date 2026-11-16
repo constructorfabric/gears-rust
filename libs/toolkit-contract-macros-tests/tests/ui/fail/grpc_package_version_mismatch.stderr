@@ -1,0 +1,33 @@
+warning: unexpected `cfg` condition value: `grpc-client`
+  --> tests/ui/fail/grpc_package_version_mismatch.rs:11:1
+   |
+11 | #[grpc_contract(package = "billing.v2", service = "BillingBackend", stubs_module = "crate::stubs")]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: no expected values for `feature`
+   = note: using a cfg inside a attribute macro will use the cfgs from the destination crate and not the ones from the defining crate
+   = help: try referring to `grpc_contract` crate for guidance on how handle this unexpected cfg
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+   = note: `#[warn(unexpected_cfgs)]` on by default
+   = note: this warning originates in the attribute macro `grpc_contract` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0080]: evaluation panicked: gRPC package major version does not match the contract's `version`: a `vN` package must equal #[toolkit::contract(version = "vN")]
+  --> tests/ui/fail/grpc_package_version_mismatch.rs:11:1
+   |
+11 | #[grpc_contract(package = "billing.v2", service = "BillingBackend", stubs_module = "crate::stubs")]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `_` failed inside this call
+   |
+note: inside `assert_grpc_package_major::<dyn BillingBackend>`
+  --> $RUST/core/src/panic.rs
+   |
+   |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+   |
+  ::: $WORKSPACE/libs/toolkit-contract/src/contract.rs
+   |
+   | /     assert!(
+   | |         same,
+   | |         "gRPC package major version does not match the contract's `version`: \
+   | |          a `vN` package must equal #[toolkit::contract(version = \"vN\")]"
+   | |     );
+   | |_____- in this macro invocation

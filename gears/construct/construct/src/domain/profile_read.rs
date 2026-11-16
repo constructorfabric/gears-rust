@@ -7,7 +7,7 @@ use std::sync::{Arc, Once};
 use async_trait::async_trait;
 use authz_resolver_sdk::models::TenantMode;
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
-use authz_resolver_sdk::{EnforcerError, PolicyEnforcer};
+use authz_resolver_sdk::{AccessDenial, EnforcerError, PolicyEnforcer};
 use futures::future::join_all;
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -20,6 +20,7 @@ use super::plan::NodeKey;
 use super::planner::processing::ProcessingContexts;
 use super::profile::Category;
 use super::review_queue::FactsUnderReview;
+use super::subject_reach::reach;
 use super::subject_settings::{SubjectKey, SubjectSettingsReader};
 
 /// The policy property that names a profile category.
@@ -206,12 +207,9 @@ fn named_categories<'a>(values: impl IntoIterator<Item = &'a ScopeValue>) -> Has
 }
 
 /// What one constraint of a policy scope grants on the profile at `key`:
-/// nothing when it does not reach it, otherwise the categories it names, or
-/// every category when it names none. A constraint reaches the profile only
-/// when it names the profile's tenant, so a grant is always bound to it; one
-/// that names only a subject or categories grants nothing. A filter that
-/// cannot be decided in memory (a group or tenant-subtree filter) grants
-/// nothing, and so does a filter on a property the profile has not.
+/// nothing when it does not [`reach`] it, otherwise the categories it names,
+/// or every category when it names none. A filter on a property the profile
+/// has not grants nothing.
 ///
 /// Reading profiles is a permission of its own, which the platform grants to
 /// the applications and agents that act for the tenant's subjects: a
@@ -219,30 +217,15 @@ fn named_categories<'a>(values: impl IntoIterator<Item = &'a ScopeValue>) -> Has
 /// it. A policy may narrow that to named subjects with a resource id filter.
 fn granted_by(constraint: &ScopeConstraint, key: SubjectKey) -> Option<Grant> {
     let mut named: Option<HashSet<Category>> = None;
-    let mut tenant_named = false;
-    for filter in constraint.filters() {
-        if !filter.is_representable_in_memory() {
+    for filter in reach(constraint, key)? {
+        if filter.property() != CATEGORY_PROPERTY {
             return None;
         }
-        let values = filter.values();
-        let holds = |id: Uuid| values.iter().any(|value| value.as_uuid() == Some(id));
-        match filter.property() {
-            pep_properties::OWNER_TENANT_ID if !holds(key.tenant_id) => return None,
-            pep_properties::RESOURCE_ID if !holds(key.subject_id) => return None,
-            pep_properties::OWNER_TENANT_ID => tenant_named = true,
-            pep_properties::RESOURCE_ID => {}
-            CATEGORY_PROPERTY => {
-                let these = named_categories(&values);
-                named = Some(match named {
-                    Some(before) => before.intersection(&these).copied().collect(),
-                    None => these,
-                });
-            }
-            _ => return None,
-        }
-    }
-    if !tenant_named {
-        return None;
+        let these = named_categories(filter.values());
+        named = Some(match named {
+            Some(before) => before.intersection(&these).copied().collect(),
+            None => these,
+        });
     }
     Some(match named {
         Some(categories) => Grant {
@@ -327,9 +310,9 @@ enum PolicyFailure {
 /// each category alike.
 fn policy_failure(err: EnforcerError) -> PolicyFailure {
     match err {
-        EnforcerError::Denied {
-            deny_reason: Some(reason),
-        } => PolicyFailure::Denied(format!(
+        EnforcerError::AccessDenied(AccessDenial::Pdp {
+            reason: Some(reason),
+        }) => PolicyFailure::Denied(format!(
             "the platform refuses the read: {}{}",
             reason.error_code,
             reason
@@ -337,19 +320,21 @@ fn policy_failure(err: EnforcerError) -> PolicyFailure {
                 .map(|details| format!(" ({details})"))
                 .unwrap_or_default()
         )),
-        EnforcerError::Denied { deny_reason: None } => {
+        EnforcerError::AccessDenied(_) => {
             PolicyFailure::Denied("the platform refuses the read".to_owned())
         }
         EnforcerError::CompileFailed(cause) => PolicyFailure::Uncompilable(format!(
             "the platform's answer cannot be compiled: {cause}"
         )),
         other @ EnforcerError::EvaluationFailed(_) => PolicyFailure::Failed(other.into()),
+        // An unknown outcome class fails the read; it is never a refusal.
+        unknown => PolicyFailure::Failed(unknown.into()),
     }
 }
 
 /// A failed policy call on the profile: a refusal as a subject that is not
 /// visible, any other failure as the gear's own error.
-fn not_visible(err: EnforcerError) -> DomainError {
+pub(crate) fn not_visible(err: EnforcerError) -> DomainError {
     match policy_failure(err) {
         PolicyFailure::Denied(reason) | PolicyFailure::Uncompilable(reason) => {
             DomainError::NotVisible(reason)
@@ -378,6 +363,7 @@ pub(crate) fn read_failure(err: DomainError) -> DomainError {
         err @ (DomainError::Refused(_)
         | DomainError::NotVisible(_)
         | DomainError::Unavailable(_)
+        | DomainError::WriteUnknown(_)
         | DomainError::NotConfigured(_)
         | DomainError::NoSuchFact(_)
         | DomainError::NoSuchReviewRequest(_)
@@ -655,6 +641,25 @@ mod tests {
         )
         .unwrap();
         assert!(both.unnamed, "one path without a category is enough");
+    }
+
+    #[test]
+    fn a_constraint_with_no_category_is_no_path_to_the_profile() {
+        let key = key();
+        let dead = path_to(key, &[]);
+        assert!(dead.matches_nothing());
+
+        // Alone it reaches nothing: the profile is not visible, never an empty grant.
+        assert_eq!(granted(&AccessScope::single(dead.clone()), key), None);
+        // Beside a live path it adds nothing and takes nothing away.
+        let live = path_to(key, &[Category::Skill]);
+        assert_eq!(
+            granted(
+                &AccessScope::from_constraints(vec![dead, live.clone()]),
+                key
+            ),
+            granted(&AccessScope::single(live), key)
+        );
     }
 
     #[test]

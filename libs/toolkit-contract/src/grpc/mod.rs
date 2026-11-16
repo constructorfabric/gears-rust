@@ -11,7 +11,13 @@
 //!   from the runtime credential, not the argument).
 //!
 //! It also provides [`map_tonic_status`], which classifies a `tonic::Status`
-//! into the `TransportError` taxonomy used by the rest of the contract runtime.
+//! into the `TransportError` taxonomy used by the rest of the contract runtime,
+//! and the channel generated clients send through: [`GrpcChannel`], a tonic
+//! channel behind the client's circuit breaker (see
+//! [`crate::runtime::breaker`]).
+
+use std::sync::Arc;
+use std::time::Duration;
 
 use tonic::Code;
 use tonic::Status;
@@ -49,6 +55,13 @@ impl crate::grpc_repr::SecurityContextMarker for toolkit_security::PlatformSecur
 ///   `toolkit-contract::runtime::canonical`.
 #[must_use]
 pub fn map_tonic_status(status: &Status) -> TransportError {
+    if let Some(rejected) =
+        std::error::Error::source(status).and_then(crate::runtime::breaker::find_rejected)
+    {
+        return TransportError::CircuitOpen {
+            retry_after: rejected.retry_after(),
+        };
+    }
     match toolkit_transport_grpc::extract_problem::<Problem>(status.metadata()) {
         Ok(Some(problem)) => return TransportError::problem(problem),
         Ok(None) => {}
@@ -67,6 +80,173 @@ pub fn map_tonic_status(status: &Status) -> TransportError {
         code,
         message: status.message().to_owned(),
     }
+}
+
+/// [`map_tonic_status`] for a unary call or a stream open made with the
+/// per-call `timeout` ([`ClientConfig::timeout`]): a deadline that fired in the
+/// channel becomes [`TransportError::Timeout`] with that value, as on the REST
+/// path, instead of tonic's `CANCELLED "Timeout expired"`. The channel timeout
+/// ends at the response headers, so stream items never carry it.
+///
+/// [`ClientConfig::timeout`]: crate::runtime::config::ClientConfig::timeout
+#[must_use]
+pub fn map_call_status(status: &Status, timeout: Duration) -> TransportError {
+    let mut cur = std::error::Error::source(status);
+    while let Some(err) = cur {
+        if err.downcast_ref::<tonic::TimeoutExpired>().is_some() {
+            return TransportError::Timeout(timeout);
+        }
+        cur = err.source();
+    }
+    map_tonic_status(status)
+}
+
+/// What a gRPC attempt says about the backend: a channel error (connect,
+/// reset, deadline) is a failure, and so is a trailers-only `UNAVAILABLE` or
+/// `DEADLINE_EXCEEDED` that carries no canonical Problem. Everything else,
+/// including a Problem, is an answer. Requests marked
+/// [`SkipCircuitBreaker`](crate::runtime::breaker::SkipCircuitBreaker) bypass
+/// the breaker.
+///
+/// A status sent in trailers after the response headers is not seen here;
+/// tonic servers send unary errors trailers-only, so that covers them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GrpcEndpointFailure;
+
+impl<B, E> toolkit_resilience::circuit_breaker::Classify<http::Response<B>, E>
+    for GrpcEndpointFailure
+{
+    fn classify(
+        &self,
+        result: &Result<http::Response<B>, E>,
+    ) -> toolkit_resilience::circuit_breaker::Outcome {
+        use toolkit_resilience::circuit_breaker::Outcome;
+        let Ok(resp) = result else {
+            return Outcome::Failure;
+        };
+        let headers = resp.headers();
+        let gone = headers
+            .get("grpc-status")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|code| {
+                code == (Code::Unavailable as i32).to_string()
+                    || code == (Code::DeadlineExceeded as i32).to_string()
+            });
+        if gone && !headers.contains_key(toolkit_transport_grpc::PROBLEM_METADATA_KEY) {
+            Outcome::Failure
+        } else {
+            Outcome::Success
+        }
+    }
+}
+
+impl<B> toolkit_resilience::circuit_breaker::Bypass<http::Request<B>> for GrpcEndpointFailure {
+    fn bypass(&self, req: &http::Request<B>) -> bool {
+        req.extensions()
+            .get::<crate::runtime::breaker::SkipCircuitBreaker>()
+            .is_some()
+    }
+}
+
+/// The transport of a generated gRPC client: a tonic channel behind the
+/// client's circuit breaker.
+pub type GrpcChannel = toolkit_resilience::circuit_breaker::CircuitBreakerService<
+    tonic::transport::Channel,
+    GrpcEndpointFailure,
+>;
+
+/// Put `channel` behind `config`'s circuit breaker. A config without one gets
+/// a breaker that lets everything through.
+#[must_use]
+pub fn guard_channel(
+    channel: tonic::transport::Channel,
+    config: &crate::runtime::config::ClientConfig,
+) -> GrpcChannel {
+    use toolkit_resilience::circuit_breaker::{CircuitBreaker, CircuitBreakerLayer};
+    use tower::Layer;
+
+    let breaker = config
+        .circuit_breaker
+        .clone()
+        .unwrap_or_else(|| Arc::new(CircuitBreaker::disabled()));
+    let mut layer = CircuitBreakerLayer::new(breaker, GrpcEndpointFailure);
+    if let Some(hook) = &config.on_endpoint_failure {
+        layer = layer.on_failure(Arc::clone(&hook.0));
+    }
+    layer.layer(channel)
+}
+
+/// Connect timeout of the channels [`lazy_channel`] builds.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A channel to `config.base_url` that connects on first use and reconnects
+/// by itself after the connection drops.
+///
+/// Applies `config.timeout` per call (enforced in the channel; not sent to the
+/// server as `grpc-timeout`), a connect timeout, and HTTP/2 keepalive so a
+/// dead peer is noticed while idle. Needs no network to build.
+///
+/// # Errors
+/// [`TransportError::Network`] when [`check_tls`] refuses the endpoint, when
+/// the URI is invalid, or when called outside a Tokio runtime.
+pub fn lazy_channel(
+    config: &crate::runtime::config::ClientConfig,
+) -> Result<tonic::transport::Channel, TransportError> {
+    check_tls(config)?;
+    if tokio::runtime::Handle::try_current().is_err() {
+        return Err(TransportError::network(
+            "a gRPC channel needs a Tokio runtime to connect lazily",
+        ));
+    }
+    let endpoint = configured_endpoint(config)?;
+    Ok(endpoint.connect_lazy())
+}
+
+/// Check `config.base_url` before a channel is built.
+///
+/// tonic is built without TLS here, and without it tonic connects to an
+/// `https://` URI over plain TCP. So an `https` endpoint is refused rather
+/// than silently sent in cleartext, and since every endpoint is then
+/// plaintext, `require_tls` refuses them all, so the process-scoped platform
+/// credential is never sent over cleartext h2c (`cpt-cf-adr-two-plane-auth`).
+/// See [`ClientConfig::check_tls_scheme`] for the FIPS default and the
+/// plaintext opt-in warning.
+///
+/// [`ClientConfig::check_tls_scheme`]: crate::runtime::config::ClientConfig::check_tls_scheme
+///
+/// # Errors
+/// [`TransportError::Network`] for an `https` endpoint, or for a plaintext
+/// one when TLS is required.
+pub fn check_tls(config: &crate::runtime::config::ClientConfig) -> Result<(), TransportError> {
+    if crate::runtime::config::is_https(&config.base_url) {
+        return Err(TransportError::network(format!(
+            "gRPC client: TLS is not supported yet and tonic would connect to an \
+             https endpoint in plaintext; refusing {}",
+            config.base_url,
+        )));
+    }
+    config
+        .check_tls_scheme()
+        .map_err(|reason| TransportError::network(format!("gRPC client: {reason}")))
+}
+
+/// The tonic endpoint for `config`: per-call timeout, connect timeout and
+/// HTTP/2 keepalive.
+///
+/// # Errors
+/// [`TransportError::Network`] for an invalid URI.
+pub fn configured_endpoint(
+    config: &crate::runtime::config::ClientConfig,
+) -> Result<tonic::transport::Endpoint, TransportError> {
+    Ok(
+        tonic::transport::Endpoint::from_shared(config.base_url.clone())
+            .map_err(TransportError::network)?
+            .timeout(config.timeout)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_timeout(Duration::from_secs(10))
+            .keep_alive_while_idle(true),
+    )
 }
 
 /// Attach the bearer token from a security context onto gRPC request
@@ -119,6 +299,84 @@ pub fn attach_internal_token(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use toolkit_resilience::circuit_breaker::{Bypass, Classify, Outcome};
+
+    fn classify_headers(headers: &[(&'static str, &'static str)]) -> Outcome {
+        let mut resp = http::Response::new(());
+        for (k, v) in headers {
+            resp.headers_mut()
+                .insert(*k, http::HeaderValue::from_static(v));
+        }
+        Classify::<http::Response<()>, Status>::classify(&GrpcEndpointFailure, &Ok(resp))
+    }
+
+    #[test]
+    fn a_bare_unavailable_or_deadline_is_an_endpoint_failure() {
+        assert_eq!(classify_headers(&[("grpc-status", "14")]), Outcome::Failure);
+        assert_eq!(classify_headers(&[("grpc-status", "4")]), Outcome::Failure);
+    }
+
+    #[test]
+    fn an_unavailable_carrying_a_problem_is_an_answer() {
+        let problem = (toolkit_transport_grpc::PROBLEM_METADATA_KEY, "e30");
+        assert_eq!(
+            classify_headers(&[("grpc-status", "14"), problem]),
+            Outcome::Success
+        );
+        assert_eq!(
+            classify_headers(&[("grpc-status", "4"), problem]),
+            Outcome::Success
+        );
+    }
+
+    #[test]
+    fn other_statuses_and_streamed_responses_are_answers() {
+        // No `grpc-status` in the headers: a normal response whose status
+        // comes in the trailers later.
+        assert_eq!(classify_headers(&[]), Outcome::Success);
+        for code in ["0", "2", "5", "8", "12", "13", "16"] {
+            let mut resp = http::Response::new(());
+            resp.headers_mut()
+                .insert("grpc-status", http::HeaderValue::from_str(code).unwrap());
+            assert_eq!(
+                Classify::<http::Response<()>, Status>::classify(&GrpcEndpointFailure, &Ok(resp)),
+                Outcome::Success,
+                "grpc-status {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_https_endpoint_is_refused_since_tonic_has_no_tls_here() {
+        use crate::runtime::config::ClientConfig;
+        for url in ["https://svc:50051", " HTTPS://svc:50051"] {
+            for require_tls in [false, true] {
+                let config = ClientConfig::new(url).with_require_tls(require_tls);
+                let err = check_tls(&config).unwrap_err().to_string();
+                assert!(err.contains("TLS is not supported"), "{url}: {err}");
+            }
+        }
+        let plain = ClientConfig::new("http://svc:50051");
+        assert!(check_tls(&plain.clone().with_require_tls(false)).is_ok());
+        assert!(check_tls(&plain.with_require_tls(true)).is_err());
+    }
+
+    #[test]
+    fn a_channel_error_is_an_endpoint_failure() {
+        let err: Result<http::Response<()>, Status> = Err(Status::unavailable("refused"));
+        assert_eq!(GrpcEndpointFailure.classify(&err), Outcome::Failure);
+    }
+
+    #[test]
+    fn the_skip_marker_bypasses() {
+        let plain = http::Request::new(());
+        let mut marked = http::Request::new(());
+        marked
+            .extensions_mut()
+            .insert(crate::runtime::breaker::SkipCircuitBreaker);
+        assert!(!GrpcEndpointFailure.bypass(&plain));
+        assert!(GrpcEndpointFailure.bypass(&marked));
+    }
 
     #[test]
     fn preserves_unavailable_code_as_transient() {

@@ -216,6 +216,8 @@ Each change `c` is one of five variants. The format is a contract between replic
 | `route_deleted` | `tenant`, `id` | route delete (its upstream is not known) | entries holding `id` |
 | `routes_of_upstream` | `tenant`, `upstream` | all routes of an upstream deleted | the route entry of `(tenant, upstream)` |
 
+**Proposed extension, not current behavior.** [ADR-0021](0021-upstream-credentials.md#request-limits) adds two cleanup-only variants: `credential_limit_retired { tenant, credential, generation }` and `credential_deleted { tenant, credential }`. They retire limiter buckets, not routing entries. Roll them out to all readers/writers before enabling named credentials. Lost cleanup events leave only idle counters; live credential reads enforce revocation independently of this log. The existing five routing variants and their stale-serving rules remain unchanged.
+
 Emptying the whole cache is never logged: it is a local decision of the replica that cannot know what it missed.
 
 * **Key**: `proxy-config-changes` in the cluster cache of the `oagw` profile, scoped to `oagw` (the backend sees `oagw/proxy-config-changes`). It never expires.

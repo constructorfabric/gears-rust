@@ -9,7 +9,6 @@
 //!    admitted instance.
 
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
 use async_trait::async_trait;
 use authn_resolver_sdk::AuthNResolverPluginSpecV1;
@@ -24,6 +23,7 @@ use types_registry_sdk::GtsId;
 use crate::config::{INSTANCE_SUFFIX, OidcAuthNGearConfig};
 use crate::domain::authenticate::OidcAuthNPlugin;
 use crate::domain::metrics::AuthNMetrics;
+use crate::infra::idp_http::IdpHttpClient;
 use crate::infra::runtime::build_oidc_authn_plugin;
 
 /// `ToolKit` gear responsible for wiring oidc-authn plugin into runtime.
@@ -88,7 +88,7 @@ impl Gear for OidcAuthNPluginGear {
         let cfg = Self::resolved(ctx.config().map_err(anyhow::Error::from))?;
         let plugin_config = cfg.plugin;
 
-        let http_client = build_http_client(
+        let http_client = IdpHttpClient::from_settings(
             cfg.request_timeout,
             cfg.custom_ca_certificate_paths.as_slice(),
         )?;
@@ -99,7 +99,7 @@ impl Gear for OidcAuthNPluginGear {
             plugin_config,
             http_client,
             metrics,
-        ));
+        )?);
 
         self.plugin
             .set(Arc::clone(&plugin))
@@ -128,37 +128,6 @@ fn normalize_priority(priority: u32) -> i16 {
         );
         i16::MAX
     }
-}
-
-fn build_http_client(
-    request_timeout: Duration,
-    custom_ca_certificate_paths: &[String],
-) -> anyhow::Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(request_timeout);
-    let mut custom_ca_certificates = Vec::new();
-
-    for path in custom_ca_certificate_paths {
-        let pem_bundle = std::fs::read(path).map_err(|error| {
-            anyhow::anyhow!("failed to read custom CA certificate bundle {path:?}: {error}")
-        })?;
-        let certificates = reqwest::Certificate::from_pem_bundle(&pem_bundle).map_err(|error| {
-            anyhow::anyhow!("failed to parse custom CA certificate bundle {path:?}: {error}")
-        })?;
-        if certificates.is_empty() {
-            anyhow::bail!("custom CA certificate bundle {path:?} did not contain any certificates");
-        }
-        custom_ca_certificates.extend(certificates);
-    }
-
-    if !custom_ca_certificates.is_empty() {
-        builder = builder.tls_certs_merge(custom_ca_certificates);
-    }
-
-    builder
-        .build()
-        .map_err(|error| anyhow::anyhow!("failed to build HTTP client: {error}"))
 }
 
 #[cfg(test)]

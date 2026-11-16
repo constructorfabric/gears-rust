@@ -776,6 +776,81 @@ async fn reads_are_scoped_to_the_tenant() {
     assert!(matches!(err, DomainError::NotFound { .. }), "{err:?}");
 }
 
+/// As [`AllowAuthZ`], except that LIST gets the scope of `EmptyScopePdp`.
+struct EmptyListScopeAuthZ {
+    live: bool,
+}
+
+#[async_trait::async_trait]
+impl authz_resolver_sdk::AuthZResolverApi for EmptyListScopeAuthZ {
+    async fn evaluate(
+        &self,
+        ctx: toolkit_security::PlatformSecurityContext,
+        request: authz_resolver_sdk::models::EvaluationRequest,
+    ) -> Result<
+        authz_resolver_sdk::models::EvaluationResponse,
+        toolkit_canonical_errors::CanonicalError,
+    > {
+        if request.action.name != actions::LIST {
+            return AllowAuthZ.evaluate(ctx, request).await;
+        }
+        authz_resolver_sdk::test_support::EmptyScopePdp { live: self.live }
+            .evaluate(ctx, request)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn list_with_an_empty_scope_is_an_empty_page() {
+    for live in [false, true] {
+        let env = env_with(Arc::new(EmptyListScopeAuthZ { live })).await;
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        let g = env
+            .grants
+            .issue(&ctx(a), a, vec![terms()], false, token())
+            .await
+            .unwrap()
+            .grants
+            .remove(0);
+        env.grants
+            .issue(&ctx(b), b, vec![terms()], false, token())
+            .await
+            .unwrap();
+
+        let page = env
+            .grants
+            .list_grants(&ctx(a), &ODataQuery::new())
+            .await
+            .expect("a permitted LIST succeeds even when its scope is empty");
+        let expected = if live { vec![g.clone()] } else { vec![] };
+        assert_eq!(page.items, expected, "live: {live}");
+        assert!(page.page_info.next_cursor.is_none(), "live: {live}");
+
+        // The query is still validated.
+        let bad =
+            ODataQuery::new().with_order(toolkit::api::odata::parse_orderby("state asc").unwrap());
+        let err = env.grants.list_grants(&ctx(a), &bad).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DomainError::Query(toolkit_odata::Error::InvalidOrderByField(_))
+            ),
+            "live: {live}: {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn list_refused_by_the_pdp_is_permission_denied() {
+    let env = env_with(Arc::new(DenyAuthZ)).await;
+    let err = env
+        .grants
+        .list_grants(&ctx(Uuid::now_v7()), &ODataQuery::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DomainError::PermissionDenied), "{err:?}");
+}
+
 #[tokio::test]
 async fn bind_refused_by_the_pdp_is_permission_denied() {
     let env = env_with(Arc::new(DenyAuthZ)).await;

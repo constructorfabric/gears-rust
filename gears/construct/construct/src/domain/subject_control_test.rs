@@ -925,10 +925,11 @@ struct OddWriter {
 
 #[async_trait]
 impl crate::domain::planner::processing::PlanWriter for OddWriter {
-    async fn write(
+    async fn write_by(
         &self,
         ctx: &SecurityContext,
         plan: &crate::domain::plan::Plan,
+        _deadline: tokio::time::Instant,
     ) -> Result<crate::domain::planner::processing::Written, DomainError> {
         tokio::time::sleep(self.delay).await;
         let written = self.inner.write(ctx, plan).await?;

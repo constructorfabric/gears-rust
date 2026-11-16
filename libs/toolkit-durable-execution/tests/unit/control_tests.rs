@@ -21,6 +21,9 @@ fn errors_are_triaged_into_pause_skip_and_retry() {
     for error in [
         StoreError::AuthorizationUnavailable,
         StoreError::Authorization(AuthorizationError::denied()),
+        // An unclassified authorization failure pauses the worker; it is
+        // never skipped.
+        StoreError::Authorization(AuthorizationError::internal()),
         StoreError::Forbidden,
     ] {
         assert_eq!(triage(&error), Triage::Pause, "{error}");

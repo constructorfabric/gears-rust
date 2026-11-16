@@ -1,19 +1,24 @@
 """Self-managed lifecycle for the out-of-process (loopback) E2E suite.
 
-Boots flight-control (edge + DirectoryService) and three OoP gear processes
+Boots flight-control (edge + DirectoryService) and four OoP gear processes
 on loopback, waits for the edge to sync their routes from the DirectoryService,
 and yields the edge base URL. Everything is torn down on session teardown.
 
 Topology (all on 127.0.0.1):
     flight-control (edge)        :8087   + DirectoryService :50051
     hello-oop                    :9091   (anonymous REST)
-    api-contracts-oop            :9092   (PaymentApi REST provider)
-    api-contracts-consumer-oop   :9093   (resolves PaymentApi from the provider)
+    api-contracts-oop            :9092   (PaymentApi provider, REST)
+                                 :9192   (the same provider, gRPC via its grpc-hub)
+    api-contracts-consumer-oop   :9093   (calls PaymentApi over REST)
+    api-contracts-grpc-consumer-oop :9094 (calls PaymentApi over gRPC)
+
+Both consumers find the provider through the DirectoryService: the REST one by
+the provider's REST endpoint, the gRPC one by the published gRPC service name.
 
 This is a Profile 2 (Host + Workers) topology on loopback: flight-control runs
 the DirectoryService + built-in edge, and the workers are separate OoP
 processes discovered through the directory. It exercises the same OoP software
-path (bootstrap, directory-resolved REST clients, edge reverse-proxy) that a
+path (bootstrap, directory-resolved REST and gRPC clients, edge reverse-proxy) that a
 Profile 3 (Kubernetes) deployment shares — only with processes on 127.0.0.1
 instead of pods behind an external gateway. Heavy work (cargo build, process
 boot, route sync) happens in the session fixture; run pytest with
@@ -28,6 +33,7 @@ runs `pytest -m smoke` across the whole tree under the 10s `pytest.ini` timeout
 from __future__ import annotations
 
 import os
+import signal
 import socket
 import subprocess
 import time
@@ -47,9 +53,18 @@ LOG_PREFIX = "oop-"
 EDGE_PORT = 8087
 DIRECTORY_PORT = 50051
 DIRECTORY_ENDPOINT = f"http://127.0.0.1:{DIRECTORY_PORT}"
+# The provider's grpc-hub listener (gears.grpc-hub.config.listen_addr), and the
+# port a lifecycle test moves it to.
+PROVIDER_GRPC_PORT = 9192
+PROVIDER_GRPC_PORT_MOVED = 9193
 BASE_URL = f"http://127.0.0.1:{EDGE_PORT}"
-# static-authn accept_all maps any non-empty bearer to the platform-root tenant.
-TOKEN = os.environ.get("OOP_E2E_TOKEN", "oop-e2e-token")
+# The edge and the consumers accept any bearer (static-authn accept_all), but the
+# provider re-authenticates the forwarded one against static tokens
+# (config/oop-api-contracts.yaml), so every token used here is listed there.
+TOKEN = "oop-e2e-token"
+# Two more principals in two other tenants, for tenant-scoping checks.
+TOKEN_TENANT_A = "oop-e2e-token-tenant-a"
+TOKEN_TENANT_B = "oop-e2e-token-tenant-b"
 
 # Per-request timeout for the test HTTP calls (distinct from the lifecycle
 # build/boot/route-sync timeouts below). Imported by the test modules.
@@ -76,14 +91,24 @@ class Proc:
     log_fh: object
 
 
-# flight-control binary + the three OoP gear binaries.
+# flight-control binary + the four OoP gear binaries.
 FLIGHT_CONTROL = Binary(name="flight-control", package="cf-gears-flight-control", features="")
 GEARS = [
     Binary(name="hello-oop", package="hello", features="oop_module"),
-    Binary(name="api-contracts-oop", package="cf-api-contracts", features="oop_module"),
+    # `grpc-server` adds the gear that serves PaymentApi over gRPC, and grpc-hub.
+    Binary(
+        name="api-contracts-oop",
+        package="cf-api-contracts",
+        features="oop_module,grpc-server",
+    ),
     Binary(
         name="api-contracts-consumer-oop",
         package="cf-api-contracts-consumer",
+        features="oop_module",
+    ),
+    Binary(
+        name="api-contracts-grpc-consumer-oop",
+        package="cf-api-contracts-grpc-consumer",
         features="oop_module",
     ),
 ]
@@ -94,6 +119,7 @@ GEAR_LAUNCH = [
     ("hello-oop", "config/oop-hello.yaml"),
     ("api-contracts-oop", "config/oop-api-contracts.yaml"),
     ("api-contracts-consumer-oop", "config/oop-api-contracts-consumer.yaml"),
+    ("api-contracts-grpc-consumer-oop", "config/oop-api-contracts-grpc-consumer.yaml"),
 ]
 
 # Each gear's own HTTP listener (oop_http.listen_addr in its config). Reaching a
@@ -104,6 +130,7 @@ GEAR_PORTS = {
     "hello-oop": 9091,
     "api-contracts-oop": 9092,
     "api-contracts-consumer-oop": 9093,
+    "api-contracts-grpc-consumer-oop": 9094,
 }
 
 
@@ -124,19 +151,25 @@ def _cargo_build(bin_: Binary) -> None:
 
 
 def _ensure_built() -> None:
-    force = os.environ.get("OOP_E2E_FORCE_BUILD") == "1"
+    """Build every binary with the features the suite needs.
+
+    Always through cargo, even when the binary exists: a binary left by a build
+    with other features (the provider without `grpc-server`) would start and
+    fail the suite in a confusing way. On an up-to-date build cargo does nothing.
+    """
     for b in [FLIGHT_CONTROL, *GEARS]:
+        _cargo_build(b)
         path = TARGET_DIR / b.name
-        if force or not path.exists():
-            _cargo_build(b)
         if not path.exists():
             pytest.fail(f"binary not produced: {path}")
 
 
-def _launch(bin_name: str, config: str, *, is_flight_control: bool, child_home: str) -> Proc:
+def _launch(
+    bin_name: str, config: str, *, is_flight_control: bool, child_home: str, fresh_log: bool
+) -> Proc:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = LOG_DIR / f"{LOG_PREFIX}{bin_name}.log"
-    log_fh = open(log_path, "w")
+    # A restarted gear appends, so a failure shows every incarnation.
     # Isolate on-disk state (SQLite DBs live under `~/.cf-gears-*`) into a
     # throwaway HOME so runs are repeatable and the real home stays clean.
     env = {**os.environ, "HOME": child_home, "RUST_LOG": os.environ.get("RUST_LOG", "info")}
@@ -145,7 +178,10 @@ def _launch(bin_name: str, config: str, *, is_flight_control: bool, child_home: 
     if is_flight_control:
         cmd.append("run")  # flight-control uses a `run` subcommand
     print(f"[oop-e2e] launching {bin_name} -> {log_path}")
+    log_fh = open(log_path, "w" if fresh_log else "a")
     try:
+        log_fh.write(f"\n===== [oop-e2e] launch {bin_name} --config {config} =====\n")
+        log_fh.flush()
         popen = subprocess.Popen(
             cmd, cwd=str(ROOT), stdout=log_fh, stderr=subprocess.STDOUT, env=env
         )
@@ -206,6 +242,7 @@ class Cluster:
         self._procs: dict[str, Proc] = {}
         # bin_name -> (config, is_flight_control), so a stopped gear can restart.
         self._specs: dict[str, tuple[str, bool]] = {}
+        self._launched: set[str] = set()
 
     @property
     def procs(self) -> list[Proc]:
@@ -215,8 +252,13 @@ class Cluster:
     def launch(self, bin_name: str, config: str, *, is_flight_control: bool = False) -> Proc:
         self._specs[bin_name] = (config, is_flight_control)
         pr = _launch(
-            bin_name, config, is_flight_control=is_flight_control, child_home=self._child_home
+            bin_name,
+            config,
+            is_flight_control=is_flight_control,
+            child_home=self._child_home,
+            fresh_log=bin_name not in self._launched,
         )
+        self._launched.add(bin_name)
         self._procs[bin_name] = pr
         return pr
 
@@ -229,6 +271,7 @@ class Cluster:
         pr = self._procs.pop(bin_name, None)
         if pr is None:
             return
+        pr.popen.send_signal(signal.SIGCONT)  # in case a test left it paused
         pr.popen.terminate()
         try:
             pr.popen.wait(timeout=10)  # time to drain + deregister from the directory
@@ -243,10 +286,36 @@ class Cluster:
         except Exception:
             pass
 
-    def start_gear(self, bin_name: str) -> Proc:
-        """Relaunch a previously-stopped gear with the same config."""
-        config, is_flight_control = self._specs[bin_name]
-        return self.launch(bin_name, config, is_flight_control=is_flight_control)
+    def start_gear(self, bin_name: str, config: str | None = None) -> Proc:
+        """Relaunch a stopped gear, with its usual config or with `config`.
+
+        A `config` given here is used for this launch only: the next plain
+        `start_gear` goes back to the usual one.
+        """
+        usual, is_flight_control = self._specs[bin_name]
+        pr = self.launch(bin_name, config or usual, is_flight_control=is_flight_control)
+        self._specs[bin_name] = (usual, is_flight_control)
+        return pr
+
+    def variant_config(self, bin_name: str, name: str, edit) -> str:
+        """Write a copy of the gear's usual config changed by `edit(text) -> text`.
+
+        Returns its path. The copy lives in the session's throwaway home.
+        """
+        usual, _ = self._specs[bin_name]
+        text = (ROOT / usual).read_text()
+        changed = edit(text)
+        assert changed != text, f"variant {name!r} of {usual} changed nothing"
+        path = Path(self._child_home) / f"{bin_name}-{name}.yaml"
+        path.write_text(changed)
+        return str(path)
+
+    def pause_gear(self, bin_name: str) -> None:
+        """SIGSTOP: the process keeps its sockets but answers nothing."""
+        self._procs[bin_name].popen.send_signal(signal.SIGSTOP)
+
+    def resume_gear(self, bin_name: str) -> None:
+        self._procs[bin_name].popen.send_signal(signal.SIGCONT)
 
     def status(self, method: str, path: str, **kw) -> int:
         return _status(method, path, **kw)
@@ -261,6 +330,8 @@ class Cluster:
     def shutdown_all(self) -> None:
         procs = list(self._procs.values())
         for pr in reversed(procs):
+            # A paused process cannot act on SIGTERM.
+            pr.popen.send_signal(signal.SIGCONT)
             pr.popen.terminate()
         for pr in reversed(procs):
             try:
@@ -306,7 +377,13 @@ def cluster(tmp_path_factory):
     """Build, boot, and tear down the loopback OoP cluster; yield its controller."""
     if os.environ.get("OOP_E2E_SKIP") == "1":
         pytest.skip("OOP_E2E_SKIP=1")
-    for port in (EDGE_PORT, DIRECTORY_PORT, *GEAR_PORTS.values()):
+    for port in (
+        EDGE_PORT,
+        DIRECTORY_PORT,
+        PROVIDER_GRPC_PORT,
+        PROVIDER_GRPC_PORT_MOVED,
+        *GEAR_PORTS.values(),
+    ):
         if _port_in_use(port):
             pytest.skip(
                 f"port {port} already in use — another server is running; "
@@ -328,17 +405,19 @@ def cluster(tmp_path_factory):
         for bin_name, cfg in GEAR_LAUNCH:
             c.launch(bin_name, cfg)
 
-        # 3) wait for the edge to sync each gear's routes from the directory
+        # 3) wait for the edge to sync each gear's routes from the directory,
+        #    and for each consumer to reach the provider: 200, not just routed.
         c.wait("hello route synced at edge", lambda: _status("GET", "/hello/v1/ping") == 200)
-        c.wait(
-            "consumer route synced at edge",
-            lambda: _status(
-                "POST",
-                "/api-contracts-consumer/v1/charge",
-                headers={"Authorization": f"Bearer {TOKEN}"},
-                json={"amount_cents": 1, "currency": "USD", "description": "warmup"},
-            ) not in (0, 404),
-        )
+        for consumer in ("api-contracts-consumer", "api-contracts-grpc-consumer"):
+            c.wait(
+                f"{consumer} charges through the edge",
+                lambda consumer=consumer: _status(
+                    "POST",
+                    f"/{consumer}/v1/charge",
+                    headers={"Authorization": f"Bearer {TOKEN}"},
+                    json={"amount_cents": 1, "currency": "USD", "description": "warmup"},
+                ) == 200,
+            )
 
         yield c
     finally:
@@ -353,5 +432,15 @@ def oop_cluster(cluster):
 
 @pytest.fixture(scope="session")
 def auth():
-    """Bearer header accepted by static-authn accept_all."""
+    """Bearer header of the suite's default principal."""
     return {"Authorization": f"Bearer {TOKEN}"}
+
+
+@pytest.fixture(scope="session")
+def auth_tenant_a():
+    return {"Authorization": f"Bearer {TOKEN_TENANT_A}"}
+
+
+@pytest.fixture(scope="session")
+def auth_tenant_b():
+    return {"Authorization": f"Bearer {TOKEN_TENANT_B}"}

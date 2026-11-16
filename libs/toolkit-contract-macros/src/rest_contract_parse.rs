@@ -3,6 +3,8 @@
 //! Recognized attributes on trait methods:
 //! - `#[get("/path/{param}")]`, `#[post(...)]`, `#[put(...)]`, `#[delete(...)]`
 //! - `#[retryable]` — marks the method as safe to retry on transport failure.
+//! - `#[circuit_breaker(skip)]` — the client's circuit breaker lets the call
+//!   through uncounted (long polls whose deadline is a normal outcome).
 //! - `#[streaming]`, `#[streaming(sse)]`, `#[streaming(multipart_mixed)]` —
 //!   marks the method as server-streaming and selects the wire framing. A bare
 //!   `#[streaming]` is SSE. The method's `asyncness` selects the *open shape*
@@ -73,6 +75,9 @@ pub struct RestMethodModel {
     pub path_template: String,
     /// Whether the client may retry the call on transient failures.
     pub retryable: bool,
+    /// `#[circuit_breaker(skip)]`: the client's circuit breaker lets the call
+    /// through and does not count it.
+    pub breaker_skip: bool,
     /// Unary, or server-streaming with how its stream is opened
     /// (`#[streaming] fn` → `Stream(Immediate)`, `#[streaming] async fn` →
     /// `Stream(Awaited)`). Folds what was a `streaming: bool` + `open:
@@ -296,6 +301,7 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<RestMethodModel> {
 
     let mut http: Option<(HttpVerb, String, Span)> = None;
     let mut retryable = false;
+    let mut breaker_skip = false;
     let mut streaming = false;
     let mut stream_framing = StreamFraming::default();
     let mut stream_open_arg: Option<StreamOpen> = None;
@@ -334,6 +340,9 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<RestMethodModel> {
             http = Some((verb, path_lit, attr.span()));
         } else if path.is_ident("retryable") {
             retryable = true;
+        } else if path.is_ident("circuit_breaker") {
+            crate::support::parse_circuit_breaker_skip(attr)?;
+            breaker_skip = true;
         } else if path.is_ident("streaming") {
             // Reject a SECOND `#[streaming]` before it overwrites the framing /
             // open selectors — last-one-wins would silently change the emitted
@@ -451,6 +460,7 @@ fn parse_method(method: &TraitItemFn) -> syn::Result<RestMethodModel> {
         http_method,
         path_template,
         retryable,
+        breaker_skip,
         shape,
         stream_framing,
         params,

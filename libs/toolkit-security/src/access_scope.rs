@@ -89,7 +89,7 @@ impl From<bool> for ScopeValue {
 /// Well-known authorization property names.
 ///
 /// These constants are shared between the PEP compiler and the ORM condition
-/// builder (`ScopableEntity::resolve_property()`), ensuring a single source of
+/// builder (`EntityScope::resolve_property()` in toolkit-db), ensuring a single source of
 /// truth for property names.
 pub mod pep_properties {
     /// Tenant-ownership property. Typically maps to the `tenant_id` column.
@@ -105,7 +105,7 @@ pub mod pep_properties {
 /// A single scope filter — a typed predicate on a named resource property.
 ///
 /// The property name (e.g., `"owner_tenant_id"`, `"id"`) is an authorization
-/// concept. Mapping to DB columns is done by `ScopableEntity::resolve_property()`.
+/// concept. Mapping to DB columns is done by `EntityScope::resolve_property()` in toolkit-db.
 ///
 /// Variants mirror the predicate types from the PDP response:
 /// - [`ScopeFilter::Eq`] — equality (`property = value`)
@@ -459,6 +459,18 @@ impl InTenantSubtreeScopeFilter {
 }
 
 impl ScopeFilter {
+    /// Whether an empty membership set makes this filter statically false.
+    /// This does not evaluate data-dependent predicates or general contradictions.
+    #[must_use]
+    pub fn matches_nothing(&self) -> bool {
+        match self {
+            Self::In(filter) => filter.values().is_empty(),
+            Self::InGroup(filter) => filter.group_ids().is_empty(),
+            Self::InGroupSubtree(filter) => filter.ancestor_ids().is_empty(),
+            Self::Eq(_) | Self::InTenantSubtree(_) => false,
+        }
+    }
+
     /// Create an equality filter (`property = value`).
     #[must_use]
     pub fn eq(property: impl Into<String>, value: impl Into<ScopeValue>) -> Self {
@@ -735,6 +747,12 @@ pub struct ScopeConstraint {
 pub struct EmptyScopeConstraint;
 
 impl ScopeConstraint {
+    /// Whether an empty-set conjunct makes this entire AND branch false.
+    #[must_use]
+    pub fn matches_nothing(&self) -> bool {
+        self.filters.iter().any(ScopeFilter::matches_nothing)
+    }
+
     /// Create a new scope constraint from a non-empty list of filters.
     ///
     /// # Errors
@@ -789,6 +807,21 @@ impl ScopeConstraint {
 /// Each constraint is an independent access path (OR-ed). Filters within a
 /// constraint are AND-ed. An unconstrained scope bypasses row-level filtering.
 ///
+/// # Normalization
+///
+/// Constructors move branches containing empty `In`/`InGroup`/`InGroupSubtree`
+/// sets out of [`Self::constraints`]. General contradictions and data-dependent
+/// emptiness are not detected; empty `InTenantSubtree.descendant_status`
+/// disables the status filter.
+///
+/// [`Self::original_constraints`] restores input order without allocating.
+/// Each branch is stored once without cloning; scopes without removed
+/// branches allocate nothing extra.
+///
+/// All-empty scopes are operationally deny-all but retain their originals.
+/// Equality compares live branches, removed branches and positions, and the
+/// unconstrained flag, so they differ from [`Self::deny_all`].
+///
 /// # Examples
 ///
 /// ```
@@ -804,12 +837,70 @@ impl ScopeConstraint {
 /// let scope = AccessScope::for_tenant(tid);
 /// assert!(!scope.is_deny_all());
 /// assert!(scope.contains_uuid(pep_properties::OWNER_TENANT_ID, tid));
+///
+/// // an empty tenant set is removed from `constraints()` but kept as an original
+/// let scope = AccessScope::for_tenants(vec![]);
+/// assert!(scope.is_deny_all());
+/// assert!(scope.constraints().is_empty());
+/// assert_eq!(scope.original_constraints().count(), 1);
 /// ```
 #[derive(Clone, Debug, PartialEq)]
 pub struct AccessScope {
+    /// Branches not statically known to match nothing, in input order.
     constraints: Vec<ScopeConstraint>,
+    /// Statically false branches moved out of `constraints`, by increasing
+    /// original position. Empty (and unallocated) for most scopes.
+    removed: Vec<RemovedConstraint>,
     unconstrained: bool,
 }
+
+/// A statically false branch and its position in the constructor input.
+#[derive(Clone, Debug, PartialEq)]
+struct RemovedConstraint {
+    index: usize,
+    constraint: ScopeConstraint,
+}
+
+/// Iterator over [`AccessScope::original_constraints`].
+///
+/// Merges live and removed branches back into input order without allocating
+/// or cloning.
+#[derive(Clone, Debug)]
+pub struct OriginalConstraints<'a> {
+    live: std::slice::Iter<'a, ScopeConstraint>,
+    removed: std::slice::Iter<'a, RemovedConstraint>,
+    position: usize,
+}
+
+impl<'a> Iterator for OriginalConstraints<'a> {
+    type Item = &'a ScopeConstraint;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let removed_here = self
+            .removed
+            .as_slice()
+            .first()
+            .is_some_and(|r| r.index == self.position);
+        let next = if removed_here {
+            self.removed.next().map(|r| &r.constraint)
+        } else {
+            self.live
+                .next()
+                .or_else(|| self.removed.next().map(|r| &r.constraint))
+        };
+        self.position += 1;
+        next
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.live.len() + self.removed.len();
+        (n, Some(n))
+    }
+}
+
+impl ExactSizeIterator for OriginalConstraints<'_> {}
+
+impl std::iter::FusedIterator for OriginalConstraints<'_> {}
 
 impl Default for AccessScope {
     /// Default is deny-all: no constraints and not unconstrained.
@@ -822,10 +913,37 @@ impl AccessScope {
     // ── Constructors ────────────────────────────────────────────────
 
     /// Create an access scope from a list of constraints (OR-ed).
+    ///
+    /// Normalizes in place: statically false branches are moved out of
+    /// [`Self::constraints`] and kept for [`Self::original_constraints`].
     #[must_use]
-    pub fn from_constraints(constraints: Vec<ScopeConstraint>) -> Self {
+    pub fn from_constraints(mut constraints: Vec<ScopeConstraint>) -> Self {
+        let mut removed = Vec::new();
+        let mut index = 0;
+        constraints.retain_mut(|constraint| {
+            let position = index;
+            index += 1;
+            if !constraint.matches_nothing() {
+                return true;
+            }
+            // Move the filter buffer out; the emptied husk dropped by
+            // `retain_mut` owns no heap memory.
+            removed.push(RemovedConstraint {
+                index: position,
+                constraint: ScopeConstraint {
+                    filters: std::mem::take(&mut constraint.filters),
+                },
+            });
+            false
+        });
+        if constraints.is_empty() {
+            // All branches were removed: release the live buffer instead of
+            // holding it next to `removed`. Mixed scopes keep their buffer.
+            constraints = Vec::new();
+        }
         Self {
             constraints,
+            removed,
             unconstrained: false,
         }
     }
@@ -844,6 +962,7 @@ impl AccessScope {
     pub fn allow_all() -> Self {
         Self {
             constraints: Vec::new(),
+            removed: Vec::new(),
             unconstrained: true,
         }
     }
@@ -853,6 +972,7 @@ impl AccessScope {
     pub fn deny_all() -> Self {
         Self {
             constraints: Vec::new(),
+            removed: Vec::new(),
             unconstrained: false,
         }
     }
@@ -891,11 +1011,30 @@ impl AccessScope {
 
     // ── Accessors ───────────────────────────────────────────────────
 
-    /// The constraints in this scope (OR-ed).
+    /// The normalized constraints in this scope (OR-ed).
+    ///
+    /// Lists only branches not statically known to match nothing, in input
+    /// order. Empty for both allow-all and deny-all; check
+    /// [`Self::is_unconstrained`] first. Use this for every enforcement and
+    /// grant-inspection purpose.
     #[inline]
     #[must_use]
     pub fn constraints(&self) -> &[ScopeConstraint] {
         &self.constraints
+    }
+
+    /// Input branches in order, including those removed from [`Self::constraints`].
+    ///
+    /// Compiled scopes contain validated branches, not raw PDP JSON. Transforms
+    /// such as [`Self::tenant_only`] start fresh originals from live branches.
+    /// Use for diagnostics, not access enforcement.
+    #[must_use]
+    pub fn original_constraints(&self) -> OriginalConstraints<'_> {
+        OriginalConstraints {
+            live: self.constraints.iter(),
+            removed: self.removed.iter(),
+            position: 0,
+        }
     }
 
     /// Returns `true` if this scope is unconstrained (allow-all).
@@ -907,13 +1046,26 @@ impl AccessScope {
 
     /// Returns `true` if this scope denies all access.
     ///
-    /// A scope is deny-all when it is not unconstrained and has no constraints.
+    /// A scope is deny-all when it is not unconstrained and has no live
+    /// constraints — including a scope whose every branch was removed as
+    /// statically false (its [`Self::original_constraints`] stay available).
     #[must_use]
     pub fn is_deny_all(&self) -> bool {
         !self.unconstrained && self.constraints.is_empty()
     }
 
-    /// Collect all values for a given property across all constraints.
+    /// Whether this scope is statically known to match no resources.
+    ///
+    /// Same answer as [`Self::is_deny_all`]: normalization leaves no live
+    /// branch in a scope whose every branch has an empty membership set. Does
+    /// not evaluate data-dependent predicates or general contradictions. An
+    /// unconstrained scope never matches nothing.
+    #[must_use]
+    pub fn matches_nothing(&self) -> bool {
+        self.is_deny_all()
+    }
+
+    /// Collect values for a property across the normalized constraints.
     ///
     /// **Reports on the constraint list only.** An allow-all scope has no
     /// constraints, so this returns an empty `Vec` for it — which means "no
@@ -934,7 +1086,7 @@ impl AccessScope {
         result
     }
 
-    /// Collect all UUID values for a given property across all constraints.
+    /// Collect UUID values for a property across the normalized constraints.
     ///
     /// Convenience wrapper — skips non-UUID values.
     ///
@@ -954,7 +1106,7 @@ impl AccessScope {
         result
     }
 
-    /// Whether any filter, in any constraint, names `property` with this UUID.
+    /// Whether a filter in a normalized constraint names this UUID.
     ///
     /// Matches both `ScopeValue::Uuid` and `ScopeValue::String` variants so
     /// that UUID-as-string values are treated consistently with
@@ -963,11 +1115,13 @@ impl AccessScope {
     ///
     /// # This is not an authorization decision
     ///
-    /// It searches filter *values*. It does not evaluate a constraint, which is
+    /// Statically false branches (empty membership sets) were removed by
+    /// normalization. Within the rest it searches filter *values*, without
+    /// evaluating general contradictions or the rest of the constraint. A constraint is
     /// a conjunction: for a grant of `[owner_tenant_id = A AND owner_id = Alice]`
     /// this answers `true` for `(owner_tenant_id, A)` even when the row in
     /// question belongs to Bob. A `true` here means "the scope mentions this
-    /// value somewhere", nothing more.
+    /// value in a normalized branch", nothing more.
     ///
     /// It also reports on the constraint list alone, so an allow-all scope —
     /// which has no constraints — answers `false` for a value it permits, and
@@ -1027,7 +1181,9 @@ impl AccessScope {
     /// if you are narrowing a scope for the same entity, and the resulting
     /// scope must not be the only thing authorizing the access: mini-chat, for
     /// example, checks the parent chat against the full scope first and only
-    /// then uses `tenant_only()` for its messages.
+    /// then uses `tenant_only()` for its messages. The result is built from the
+    /// normalized constraints only, so statically false branches are never
+    /// widened and the source's removed branches are not carried over.
     #[must_use]
     pub fn tenant_only(&self) -> Self {
         self.retain_properties(&[pep_properties::OWNER_TENANT_ID])
@@ -1058,7 +1214,7 @@ impl AccessScope {
     /// narrowed to exactly that single value.
     ///
     /// - **Unconstrained** → single constraint with only the `owner_id` filter.
-    /// - **Deny-all** → stays deny-all.
+    /// - **Deny-all** (including all-empty) → a fresh deny-all.
     /// - **No existing owner filter** → `owner_id` is injected.
     /// - **Existing owner filter containing `owner_id`** → narrowed to `Eq`.
     /// - **Existing owner filter NOT containing `owner_id`** → constraint dropped
@@ -1068,6 +1224,9 @@ impl AccessScope {
     /// Use this as a defence-in-depth measure for user-owned resources when
     /// the PDP may not always return `owner_id` constraints or may return a
     /// broader set than the current subject.
+    ///
+    /// Like the other projections, the result is built from the normalized
+    /// constraints only; the source's removed branches are not carried over.
     #[must_use]
     pub fn ensure_owner(&self, owner_id: Uuid) -> Self {
         if self.is_deny_all() {
@@ -1125,13 +1284,15 @@ impl AccessScope {
         Self::from_constraints(constraints)
     }
 
-    /// Internal helper: build a new scope keeping only filters whose property
-    /// is in the given whitelist.
+    /// Internal helper: keep filters whose property is in the given whitelist,
+    /// building a new scope from the normalized constraints only.
     fn retain_properties(&self, properties: &[&str]) -> Self {
         if self.unconstrained {
             return Self::deny_all();
         }
 
+        // Removed branches stay out: projection must not resurrect an
+        // impossible access path, and the result has its own provenance.
         let constraints = self
             .constraints
             .iter()
@@ -1160,6 +1321,96 @@ impl AccessScope {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    fn dead_branch(tenant: Uuid, empty: ScopeFilter) -> ScopeConstraint {
+        ScopeConstraint::new(vec![
+            ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, tenant),
+            empty,
+        ])
+    }
+
+    fn live_branch(tenant: Uuid) -> ScopeConstraint {
+        ScopeConstraint::new(vec![ScopeFilter::eq(
+            pep_properties::OWNER_TENANT_ID,
+            tenant,
+        )])
+    }
+
+    fn empty_filters() -> [ScopeFilter; 4] {
+        [
+            ScopeFilter::in_uuids(pep_properties::RESOURCE_ID, vec![]),
+            ScopeFilter::in_uuids(pep_properties::OWNER_ID, vec![]),
+            ScopeFilter::in_group_typed(pep_properties::RESOURCE_ID, MEMBER_TYPE, vec![]),
+            ScopeFilter::in_group_subtree_typed(pep_properties::RESOURCE_ID, MEMBER_TYPE, vec![]),
+        ]
+    }
+
+    #[test]
+    fn projections_build_from_live_branches_only_and_reset_provenance() {
+        let t1 = Uuid::from_u128(1);
+        let t2 = Uuid::from_u128(2);
+        let owner = Uuid::from_u128(9);
+        for empty in empty_filters() {
+            let dead = dead_branch(t1, empty);
+            let all_dead = AccessScope::from_constraints(vec![dead.clone()]);
+            let all_dead_before = all_dead.clone();
+            for projected in [
+                all_dead.tenant_only(),
+                all_dead.tenant_and_owner(),
+                all_dead.ensure_owner(owner),
+            ] {
+                // A fresh deny-all, not the source's removed history.
+                assert_eq!(projected, AccessScope::deny_all());
+                assert_eq!(projected.original_constraints().count(), 0);
+            }
+            assert_eq!(all_dead, all_dead_before, "projection must not mutate");
+
+            let live = ScopeConstraint::new(vec![
+                ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, t2),
+                ScopeFilter::in_uuids(pep_properties::RESOURCE_ID, vec![Uuid::from_u128(3)]),
+            ]);
+            let mixed = AccessScope::from_constraints(vec![dead.clone(), live]);
+            let mixed_before = mixed.clone();
+            let tenant_only = mixed.tenant_only();
+            assert_eq!(
+                tenant_only.all_uuid_values_for(pep_properties::OWNER_TENANT_ID),
+                vec![t2]
+            );
+            for projected in [
+                tenant_only,
+                mixed.tenant_and_owner(),
+                mixed.ensure_owner(owner),
+            ] {
+                assert!(!projected.matches_nothing());
+                assert!(
+                    projected.original_constraints().eq(projected.constraints()),
+                    "old removed branches must not be carried into a projection"
+                );
+            }
+            assert_eq!(mixed, mixed_before, "projection must not mutate");
+        }
+    }
+
+    #[test]
+    fn ensure_owner_fast_clone_path_does_not_carry_removed_history() {
+        let owner = Uuid::from_u128(9);
+        let owner_branch = ScopeConstraint::new(vec![
+            ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, Uuid::from_u128(1)),
+            ScopeFilter::eq(pep_properties::OWNER_ID, owner),
+        ]);
+        let dead = dead_branch(
+            Uuid::from_u128(2),
+            ScopeFilter::in_uuids(pep_properties::RESOURCE_ID, vec![]),
+        );
+        let scope = AccessScope::from_constraints(vec![dead, owner_branch.clone()]);
+        let narrowed = scope.ensure_owner(owner);
+        assert_eq!(narrowed, AccessScope::single(owner_branch));
+        assert!(narrowed.removed.is_empty());
+
+        let unconstrained = AccessScope::allow_all().ensure_owner(owner);
+        assert!(unconstrained.removed.is_empty());
+        assert_eq!(unconstrained.constraints().len(), 1);
+    }
 
     const T1: &str = "11111111-1111-1111-1111-111111111111";
     const T2: &str = "22222222-2222-2222-2222-222222222222";
@@ -1209,6 +1460,197 @@ mod tests {
         ]);
         let values = scope.all_uuid_values_for(pep_properties::OWNER_TENANT_ID);
         assert_eq!(values, &[uid(T1), uid(T2)]);
+    }
+
+    #[test]
+    fn empty_scope_is_deny_all_equivalent_but_distinct_from_unconstrained() {
+        assert!(!AccessScope::allow_all().matches_nothing());
+        assert!(!AccessScope::allow_all().is_deny_all());
+        assert!(AccessScope::deny_all().matches_nothing());
+        assert!(!AccessScope::for_tenant(Uuid::nil()).matches_nothing());
+
+        let all_empty = AccessScope::for_tenants(vec![]);
+        assert!(all_empty.is_deny_all());
+        assert!(all_empty.matches_nothing());
+        assert!(!all_empty.is_unconstrained());
+        assert!(all_empty.constraints().is_empty());
+        assert_eq!(all_empty.original_constraints().count(), 1);
+        assert_ne!(
+            all_empty,
+            AccessScope::deny_all(),
+            "structural equality keeps provenance"
+        );
+    }
+
+    /// Every live/dead interleaving of four branches: `constraints()` is the
+    /// live subsequence and `original_constraints()` restores the input order.
+    #[test]
+    fn normalization_preserves_order_for_every_interleaving() {
+        for mask in 0u8..16 {
+            let input: Vec<ScopeConstraint> = (0..4u8)
+                .map(|i| {
+                    let tenant = Uuid::from_u128(u128::from(i) + 1);
+                    if mask & (1 << i) == 0 {
+                        live_branch(tenant)
+                    } else {
+                        dead_branch(
+                            tenant,
+                            ScopeFilter::in_uuids(pep_properties::RESOURCE_ID, vec![]),
+                        )
+                    }
+                })
+                .collect();
+            let expected_live: Vec<&ScopeConstraint> =
+                input.iter().filter(|c| !c.matches_nothing()).collect();
+
+            let scope = AccessScope::from_constraints(input.clone());
+            assert_eq!(
+                scope.constraints().iter().collect::<Vec<_>>(),
+                expected_live
+            );
+            assert!(scope.constraints().iter().all(|c| !c.matches_nothing()));
+            let originals = scope.original_constraints();
+            assert_eq!(originals.len(), input.len());
+            assert_eq!(
+                originals.collect::<Vec<_>>(),
+                input.iter().collect::<Vec<_>>()
+            );
+            assert_eq!(scope.matches_nothing(), mask == 0b1111);
+            assert_eq!(scope.is_deny_all(), mask == 0b1111);
+            assert!(!scope.is_unconstrained());
+            if mask == 0b1111 {
+                assert_eq!(
+                    scope.constraints.capacity(),
+                    0,
+                    "an all-empty scope must release its live buffer"
+                );
+            }
+            if mask == 0 {
+                assert_eq!(
+                    scope.removed.capacity(),
+                    0,
+                    "all-live scopes must not allocate a removed list"
+                );
+            }
+        }
+
+        let empty = AccessScope::from_constraints(Vec::new());
+        assert_eq!(empty, AccessScope::deny_all());
+        assert_eq!(empty.original_constraints().count(), 0);
+        assert_eq!(AccessScope::allow_all().original_constraints().count(), 0);
+    }
+
+    #[test]
+    fn normalization_moves_branch_payloads_instead_of_cloning() {
+        let input = vec![
+            live_branch(uid(T1)),
+            dead_branch(
+                uid(T1),
+                ScopeFilter::in_uuids(pep_properties::RESOURCE_ID, vec![]),
+            ),
+            ScopeConstraint::new(vec![ScopeFilter::in_uuids(
+                pep_properties::OWNER_TENANT_ID,
+                vec![uid(T1), uid(T2)],
+            )]),
+            dead_branch(
+                uid(T2),
+                ScopeFilter::in_group_typed(pep_properties::RESOURCE_ID, MEMBER_TYPE, vec![]),
+            ),
+        ];
+        let filter_buffers: Vec<*const ScopeFilter> =
+            input.iter().map(|c| c.filters().as_ptr()).collect();
+        let ScopeFilter::In(nested) = &input[2].filters()[0] else {
+            unreachable!("built as In")
+        };
+        let nested_values = nested.values().as_ptr();
+
+        let scope = AccessScope::from_constraints(input);
+        let moved: Vec<*const ScopeFilter> = scope
+            .original_constraints()
+            .map(|c| c.filters().as_ptr())
+            .collect();
+        assert_eq!(moved, filter_buffers);
+        let ScopeFilter::In(nested) = &scope.constraints()[1].filters()[0] else {
+            unreachable!("built as In")
+        };
+        assert_eq!(nested.values().as_ptr(), nested_values);
+    }
+
+    #[test]
+    fn clone_and_equality_are_structural_over_provenance() {
+        let dead = dead_branch(
+            uid(T1),
+            ScopeFilter::in_uuids(pep_properties::RESOURCE_ID, vec![]),
+        );
+        let live = live_branch(uid(T2));
+        let dead_first = AccessScope::from_constraints(vec![dead.clone(), live.clone()]);
+        let live_first = AccessScope::from_constraints(vec![live.clone(), dead.clone()]);
+        let live_only = AccessScope::single(live.clone());
+
+        let cloned = dead_first.clone();
+        assert_eq!(cloned, dead_first);
+        assert!(
+            cloned
+                .original_constraints()
+                .eq(dead_first.original_constraints())
+        );
+
+        // Same effective scope, different provenance: not equal.
+        assert_eq!(dead_first.constraints(), live_only.constraints());
+        assert_ne!(dead_first, live_only);
+        assert_ne!(dead_first, live_first, "removed positions are compared");
+        assert_ne!(AccessScope::allow_all(), AccessScope::deny_all());
+        assert_eq!(AccessScope::from_constraints(vec![dead, live]), dead_first);
+    }
+
+    #[test]
+    fn a_dead_branch_is_removed_whole_never_narrowed() {
+        let dead = dead_branch(
+            uid(T1),
+            ScopeFilter::in_uuids(pep_properties::RESOURCE_ID, vec![]),
+        );
+        let all_dead = AccessScope::from_constraints(vec![dead.clone(), dead.clone()]);
+        assert!(all_dead.constraints().is_empty());
+        assert!(all_dead.original_constraints().all(|c| *c == dead));
+        assert!(!all_dead.has_property(pep_properties::OWNER_TENANT_ID));
+        assert!(!all_dead.contains_uuid(pep_properties::OWNER_TENANT_ID, uid(T1)));
+    }
+
+    #[test]
+    fn contains_uuid_ignores_empty_branches_and_preserves_live_alternatives() {
+        let dead_tenant = Uuid::from_u128(1);
+        let live_tenant = Uuid::from_u128(2);
+        for empty in empty_filters() {
+            let dead = dead_branch(dead_tenant, empty);
+            for with_alternative in [false, true] {
+                let mut constraints = vec![dead.clone()];
+                if with_alternative {
+                    constraints.push(ScopeConstraint::new(vec![ScopeFilter::eq(
+                        pep_properties::OWNER_TENANT_ID,
+                        live_tenant,
+                    )]));
+                }
+                let scope = AccessScope::from_constraints(constraints);
+                assert!(!scope.contains_uuid(pep_properties::OWNER_TENANT_ID, dead_tenant));
+                assert_eq!(scope.matches_nothing(), !with_alternative);
+                assert_eq!(
+                    scope.all_uuid_values_for(pep_properties::OWNER_TENANT_ID),
+                    if with_alternative {
+                        vec![live_tenant]
+                    } else {
+                        vec![]
+                    }
+                );
+                assert_eq!(
+                    scope.all_values_for(pep_properties::OWNER_TENANT_ID).len(),
+                    usize::from(with_alternative)
+                );
+                assert_eq!(
+                    scope.contains_uuid(pep_properties::OWNER_TENANT_ID, live_tenant),
+                    with_alternative
+                );
+            }
+        }
     }
 
     #[test]

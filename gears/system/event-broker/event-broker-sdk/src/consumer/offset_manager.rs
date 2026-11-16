@@ -40,30 +40,8 @@ mod offset_row {
     impl ActiveModelBehavior for ActiveModel {}
 
     impl toolkit_db::secure::ScopableEntity for Entity {
-        const IS_UNRESTRICTED: bool = true;
-
-        fn tenant_col() -> Option<Self::Column> {
-            None
-        }
-
-        fn resource_col() -> Option<Self::Column> {
-            None
-        }
-
-        fn owner_col() -> Option<Self::Column> {
-            None
-        }
-
-        fn type_col() -> Option<Self::Column> {
-            None
-        }
-
-        fn resolve_property(_property: &str) -> Option<Self::Column> {
-            None
-        }
-        fn scope_columns() -> Vec<Self::Column> {
-            Vec::new()
-        }
+        const SCOPE: toolkit_db::secure::EntityScope<Self::Column> =
+            toolkit_db::secure::EntityScope::Unrestricted;
     }
 }
 

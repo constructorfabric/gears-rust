@@ -2389,7 +2389,7 @@ The matrix relies on two core capabilities provided by `tr-authz-plugin`:
 1. **`is_parent(ancestor, descendant)`** — reflexive ancestor check, implemented in `tr-authz-plugin` as `Service::is_in_subtree` on top of `TenantResolverClient::is_ancestor` (with the reflexive `anchor == candidate` short-circuit returning `true`).
 2. **Reading `context.tenant_context.mode`** — `root_only` / `subtree` selection used to route R1–R8 branches; surfaced through `authz-resolver-sdk::TenantMode` on `TenantContext`.
 
-Test coverage must hit all 8 rules plus fail-closed paths (missing subject tenant, `is_parent` returns false, TR error, empty descendants set).
+Test all 8 rules and fail-closed paths (missing subject tenant, `is_parent` returns false, TR error). An authorized empty descendants set must remain constrained and yield an empty LIST.
 
 ---
 

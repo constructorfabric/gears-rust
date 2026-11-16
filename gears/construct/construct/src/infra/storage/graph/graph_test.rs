@@ -145,6 +145,12 @@ fn aborted(reason: &str) -> CanonicalError {
         .create()
 }
 
+fn throttled() -> CanonicalError {
+    GraphTestError::resource_exhausted("too many requests")
+        .with_quota_violation("ingest", "rate limit")
+        .create()
+}
+
 fn serialization() -> CanonicalError {
     aborted("SERIALIZATION")
 }
@@ -1166,6 +1172,7 @@ impl FactRemoval for HangingRemoval {
     }
 }
 
+#[tracing_test::traced_test]
 #[tokio::test(start_paused = true)]
 async fn a_cleanup_that_runs_out_of_time_leaves_every_key_listed_and_the_write_stored() {
     let profiles = Profiles::new();
@@ -1193,6 +1200,7 @@ async fn a_cleanup_that_runs_out_of_time_leaves_every_key_listed_and_the_write_s
         profiles.root().await.unwrap().removals,
         keys.iter().cloned().map(FactKey).collect::<BTreeSet<_>>()
     );
+    assert!(logs_contain("the cleanup ran out of the call timeout"));
 }
 
 #[tokio::test]
@@ -1591,13 +1599,36 @@ async fn the_send_that_checks_a_refusal_counts_toward_the_attempts() {
         .await;
 
     assert!(
-        matches!(written, Err(DomainError::Unavailable(_))),
+        matches!(written, Err(DomainError::WriteUnknown(_))),
         "{written:?}"
     );
     assert_eq!(
         scripted.ingest_calls.load(Ordering::SeqCst),
         DEFAULT_ATTEMPTS.get(),
         "sent, refused, checked: the last send"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_throttled_send_after_a_send_without_an_answer_leaves_the_result_unknown() {
+    let profiles = Profiles::new();
+    let scripted = Scripted::over(Arc::clone(&profiles.client));
+    scripted.script([Ingest::LoseAnswer, Ingest::Fail(throttled)]);
+
+    let written = profiles
+        .scripted_writer(&scripted)
+        .write(&profiles.ctx, &profiles.plan(None, vec![add_skill("Rust")]))
+        .await;
+
+    assert!(
+        matches!(written, Err(DomainError::WriteUnknown(_))),
+        "{written:?}"
+    );
+    assert_eq!(scripted.ingest_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        profiles.read().await.version,
+        Some(1),
+        "the send without an answer was stored"
     );
 }
 
@@ -1622,7 +1653,7 @@ async fn a_refusal_on_the_last_send_after_an_unknown_one_stays_unknown() {
 
     // An earlier send may have landed, and no send is left to check it.
     assert!(
-        matches!(written, Err(DomainError::Unavailable(_))),
+        matches!(written, Err(DomainError::WriteUnknown(_))),
         "{written:?}"
     );
     assert_eq!(
@@ -1709,6 +1740,160 @@ async fn a_lost_serialization_race_is_sent_again() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_write_whose_deadline_passed_calls_nothing_and_writes_nothing() {
+    let profiles = Profiles::new();
+    let scripted = Scripted::over(Arc::clone(&profiles.client));
+
+    let written = profiles
+        .scripted_writer(&scripted)
+        .write_by(
+            &profiles.ctx,
+            &profiles.plan(None, vec![add_skill("Rust")]),
+            tokio::time::Instant::now(),
+        )
+        .await;
+
+    assert!(
+        matches!(&written, Err(DomainError::Unavailable(message))
+            if message == "graph storage profile write ran out of time; nothing was written"),
+        "{written:?}"
+    );
+    assert_eq!(scripted.registrations.load(Ordering::SeqCst), 0);
+    assert!(scripted.reads.lock().unwrap().is_empty());
+    assert_eq!(scripted.ingest_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(profiles.read().await.version, None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_profile_read_that_hangs_past_the_deadline_is_cut_and_writes_nothing() {
+    let profiles = Profiles::new();
+    let scripted = Scripted::over(Arc::clone(&profiles.client));
+    scripted.hang_reads.store(true, Ordering::SeqCst);
+    let started = tokio::time::Instant::now();
+
+    let written = profiles
+        .scripted_writer(&scripted)
+        .write_by(
+            &profiles.ctx,
+            &profiles.plan(None, vec![add_skill("Rust")]),
+            started + Duration::from_secs(2),
+        )
+        .await;
+
+    assert!(
+        matches!(&written, Err(DomainError::Unavailable(message))
+            if message == "graph storage profile write ran out of time; nothing was written"),
+        "{written:?}"
+    );
+    assert_eq!(started.elapsed(), Duration::from_secs(2));
+    assert_eq!(scripted.reads.lock().unwrap().len(), 1);
+    assert_eq!(scripted.ingest_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(profiles.read().await.version, None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_send_the_deadline_cuts_is_not_sent_again_and_its_result_is_unknown() {
+    let profiles = Profiles::new();
+    let scripted = Scripted::over(Arc::clone(&profiles.client));
+    scripted.script([Ingest::Hang]);
+    let started = tokio::time::Instant::now();
+
+    let written = profiles
+        .scripted_writer(&scripted)
+        .write_by(
+            &profiles.ctx,
+            &profiles.plan(None, vec![add_skill("Rust")]),
+            started + Duration::from_secs(3),
+        )
+        .await;
+
+    assert!(
+        matches!(&written, Err(DomainError::WriteUnknown(message))
+            if message == "graph storage profile write: result unknown after 1 sends: no answer \
+                           within 3s; no time is left to send it again"),
+        "{written:?}"
+    );
+    assert_eq!(scripted.ingest_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(started.elapsed(), Duration::from_secs(3));
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_resend_starts_when_its_pause_would_pass_the_deadline() {
+    let profiles = Profiles::new();
+    let scripted = Scripted::over(Arc::clone(&profiles.client));
+    scripted.script([Ingest::Fail(unavailable)]);
+
+    let written = profiles
+        .scripted_writer(&scripted)
+        .write_by(
+            &profiles.ctx,
+            &profiles.plan(None, vec![add_skill("Rust")]),
+            tokio::time::Instant::now() + Duration::from_millis(50),
+        )
+        .await;
+
+    assert!(
+        matches!(&written, Err(DomainError::WriteUnknown(message))
+            if message.starts_with("graph storage profile write: result unknown after 1 sends: ")
+                && message.ends_with("; no time is left to send it again")),
+        "{written:?}"
+    );
+    assert_eq!(scripted.ingest_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(profiles.read().await.version, None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_resend_within_the_deadline_keeps_its_key_and_lands_once() {
+    let profiles = Profiles::new();
+    let scripted = Scripted::over(Arc::clone(&profiles.client));
+    scripted.script([Ingest::LoseAnswer]);
+
+    let written = profiles
+        .scripted_writer(&scripted)
+        .write_by(
+            &profiles.ctx,
+            &profiles.plan(None, vec![add_skill("Rust")]),
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(written, Written::Stored);
+    let keys = scripted.keys.lock().unwrap().clone();
+    assert_eq!(keys.len(), 2);
+    assert!(keys[0].is_some() && keys[0] == keys[1], "{keys:?}");
+    assert_eq!(profiles.read().await.version, Some(1));
+}
+
+#[tracing_test::traced_test]
+#[tokio::test(start_paused = true)]
+async fn the_cleanup_after_a_stored_write_ends_at_the_deadline() {
+    let profiles = Profiles::new();
+    let rust = add_skill("Rust");
+    let key = key_of(&rust);
+    profiles.given(None, vec![rust]).await;
+    let writer = Profiles::writer_with(Arc::clone(&profiles.client), Arc::new(HangingRemoval));
+    let started = tokio::time::Instant::now();
+
+    let written = writer
+        .write_by(
+            &profiles.ctx,
+            &profiles.plan(Some(1), vec![remove(&key)]),
+            started + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(written, Written::Stored);
+    assert_eq!(started.elapsed(), Duration::from_secs(2));
+    assert_eq!(
+        profiles.root().await.unwrap().removals,
+        BTreeSet::from([FactKey(key)])
+    );
+    assert!(logs_contain("the cleanup ran out of the write's deadline"));
+}
+
+#[tokio::test(start_paused = true)]
 async fn the_default_writer_sends_three_times_and_waits_ten_seconds_for_each() {
     let profiles = Profiles::new();
     let scripted = Scripted::over(Arc::clone(&profiles.client));
@@ -1721,7 +1906,7 @@ async fn the_default_writer_sends_three_times_and_waits_ten_seconds_for_each() {
         .await;
 
     assert!(
-        matches!(written, Err(DomainError::Unavailable(_))),
+        matches!(written, Err(DomainError::WriteUnknown(_))),
         "{written:?}"
     );
     assert_eq!(scripted.ingest_calls.load(Ordering::SeqCst), 3);
@@ -1746,7 +1931,7 @@ async fn a_write_that_stays_unavailable_gives_up_after_its_attempts() {
         .await;
 
     assert!(
-        matches!(result, Err(DomainError::Unavailable(_))),
+        matches!(result, Err(DomainError::WriteUnknown(_))),
         "{result:?}"
     );
     assert_eq!(
@@ -1769,7 +1954,7 @@ async fn a_write_that_never_gets_an_answer_gives_up_after_its_attempts_as_unavai
         .await;
 
     assert!(
-        matches!(result, Err(DomainError::Unavailable(_))),
+        matches!(result, Err(DomainError::WriteUnknown(_))),
         "{result:?}"
     );
     assert_eq!(
@@ -1812,7 +1997,7 @@ async fn a_writer_given_one_attempt_sends_once() {
         .await;
 
     assert!(
-        matches!(result, Err(DomainError::Unavailable(_))),
+        matches!(result, Err(DomainError::WriteUnknown(_))),
         "{result:?}"
     );
     assert_eq!(scripted.ingest_calls.load(Ordering::SeqCst), 1);

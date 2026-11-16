@@ -1,4 +1,4 @@
-use crate::api::rest::error::{for_rest, for_reviews};
+use crate::api::rest::error::{WRITE_UNKNOWN_DETAIL, for_facts, for_rest, for_reviews};
 use crate::domain::error::DomainError;
 use crate::domain::pagination::QueryError;
 use crate::domain::profile::{FactCount, FullProfile};
@@ -204,6 +204,26 @@ fn unavailable_maps_to_503_without_leaking_detail() {
 
     assert_eq!(problem.status, Some(503));
     assert!(!visible_text(&problem).contains("10.0.0.7"));
+}
+
+#[test]
+fn a_write_with_an_unknown_result_maps_to_503_that_says_it_may_have_been_stored() {
+    let unknown = || {
+        DomainError::WriteUnknown(
+            "graph storage at 10.0.0.7: result unknown after 1 sends: no answer within 3s"
+                .to_owned(),
+        )
+    };
+    let on_the_facts_route = Problem::from(for_facts(unknown(), uuid::Uuid::new_v4()));
+    let unavailable = wire(DomainError::Unavailable("graph storage is down".to_owned()));
+
+    for problem in [wire(unknown()), on_the_facts_route] {
+        assert_eq!(problem.status, Some(503));
+        assert_eq!(problem.detail, WRITE_UNKNOWN_DETAIL);
+        assert!(!visible_text(&problem).contains("10.0.0.7"));
+    }
+    assert_eq!(unavailable.status, Some(503));
+    assert_ne!(unavailable.detail, WRITE_UNKNOWN_DETAIL);
 }
 
 #[test]

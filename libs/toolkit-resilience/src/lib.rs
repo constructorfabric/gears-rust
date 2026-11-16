@@ -10,6 +10,10 @@
 //! [`metrics`] names the metrics of every pattern here under one scheme. A
 //! breaker reports its events to observers; with the `otel` feature it can
 //! report them as OpenTelemetry metrics.
+//!
+//! The generated contract clients in `toolkit-contract` put it in front of
+//! every attempt when they are built through wiring; hand-written clients can
+//! add the layer themselves.
 
 pub mod circuit_breaker;
 pub mod metrics;

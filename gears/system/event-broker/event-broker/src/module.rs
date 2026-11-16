@@ -123,11 +123,13 @@ fn registry_to_build(
     deployment.zip(mode.backend_role())
 }
 
-#[toolkit::consumes(contract = authz_resolver_sdk::AuthZResolverApi, from = "authz-resolver")]
-#[toolkit::consumes(contract = types_registry_sdk::PlatformTypesRegistryApi, from = "types-registry")]
+#[toolkit::consumes(contract = [
+    authz_resolver_sdk::AuthZResolverApi(from = "authz-resolver"),
+    types_registry_sdk::PlatformTypesRegistryApi(from = "types-registry"),
+])]
 #[toolkit::gear(
     name = "event-broker",
-    deps = [cluster, types_registry],
+    deps = [],
     capabilities = [db, rest, stateful],
     lifecycle(entry = "serve", stop_timeout = "30s")
 )]
@@ -309,15 +311,10 @@ impl Gear for EventBrokerModule {
 
         // eb-single-process-implementation D2 risk mitigation: the real
         // `Storage`, wired against the same `db` and `spec_manager`. Its
-        // `ClusterCacheV1` (backing the routing markers)
-        // is deliberately NOT resolved here - `ClusterGear` only registers
-        // its backends into the `ClientHub` during the platform's *start*
-        // phase, which runs after every gear's `init()`
-        // (`host_runtime.rs`'s phase order). `serve()` resolves and wires it
-        // in once that phase has begun (`Storage::set_cache`'s own doc
-        // comment has the full story - found by actually booting the
-        // standalone binary, since every test wires the cluster cache
-        // directly, bypassing this ordering constraint entirely).
+        // `ClusterCacheV1` (backing the routing markers) is deliberately NOT
+        // resolved here - the cluster's backends are available only once the
+        // *start* phase has begun, so `serve()` wires it in. See
+        // `Storage::set_cache`.
         self.storage
             .set(Arc::new(Storage::new(
                 db,
@@ -601,13 +598,9 @@ impl EventBrokerModule {
             }
         }
 
-        // Must happen before anything else that follows: `cluster`'s own
-        // `start()` (which actually registers its backends into the
-        // `ClientHub`) is guaranteed to have already run by the time
-        // `serve()` is invoked (topo-sorted dependency order within the
-        // platform's start phase - `EventBrokerModule`'s `deps = [cluster,
-        // ...]`), but nothing before `serve()` is. See `Storage::set_cache`'s
-        // doc comment.
+        // Resolves the cluster cache and wires it into `Storage`. Deferred to
+        // `serve()`, and does not block on the cluster being up - see
+        // `wire_cluster_cache` and `Storage::set_cache`.
         self.wire_cluster_cache().await?;
 
         if mode.ingest_active() {

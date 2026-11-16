@@ -85,11 +85,11 @@ The four contract types are distinguished by their operational semantics, not de
 | Transaction scope | Can participate in caller's ACID transaction | Cannot participate -- independent transaction boundary |
 | Failure domain | Same as caller -- if it fails, you fail | Independent -- the callee can fail without crashing the caller |
 | Timeout / retry | Not applicable -- in-process call | Required -- network may be slow or unreachable |
-| Circuit breaker | Not applicable | Recommended -- protect against cascading failure |
+| Circuit breaker | Not applicable | On by default in generated clients: per endpoint, counts transport failures only, fails fast with `ServiceUnavailable` + `retry_after` ([ADR-0009](./ADR/0009-cpt-cf-binding-adr-client-circuit-breaker.md)) |
 | Error mapping | Rust errors directly | Problem Details over the wire, reconstructed via `ContractError` |
 | Serialization | None (zero-copy, shared memory) | JSON / protobuf -- all data crosses a serialization boundary |
 | Lifecycle | Shared with host process | Independent process with own lifecycle |
-| Settings | Shared config context | Own config (URL, timeout, retry policy) via `ClientConfig` |
+| Settings | Shared config context | Own config (URL, timeout, retry policy, circuit breaker) via `ClientConfig` |
 | Dependencies | Shared DI context (ClientHub) | Own connection / HTTP client |
 
 ### 1.4 Naming Convention Matrix
@@ -925,7 +925,14 @@ The **remote-side requirement** is unchanged: remote services MUST preserve back
 
 ### Remote Backend Unavailability
 
-Circuit breakers, fallback methods, and degraded-mode behavior when remote plugins are temporarily unavailable. The `#[retryable]` annotation handles transient failures, but sustained unavailability (minutes, not seconds) requires a different strategy: circuit breaker state, fallback to a default implementation, or graceful degradation with cached data. Needs a separate ADR.
+**Circuit breaking resolved — see [ADR-0009](./ADR/0009-cpt-cf-binding-adr-client-circuit-breaker.md) (`cpt-cf-binding-adr-client-circuit-breaker`).** The `#[retryable]` annotation handles failures that clear within one call; sustained unavailability is now handled by a circuit breaker in every generated client built through wiring (`#[toolkit::consumes]`, `#[toolkit::provides]`, REST and gRPC), on by default:
+
+- It sits in the transport stack and runs once per attempt (REST: the `toolkit-http` attempt layer; gRPC: around the tonic channel), with state per endpoint, so one failing instance does not cut off the others.
+- It counts transport failures only: connect/TLS errors, timeouts, 502/503/504 without a Problem body, gRPC `UNAVAILABLE`/`DEADLINE_EXCEEDED` without a Problem trailer. A canonical Problem, even a 503, is an answer, so breakers do not open up the call chain when one dependency deep down is out.
+- An open breaker fails the call at once with `TransportError::CircuitOpen`, which maps to `ServiceUnavailable` with `retry_after`; a failing endpoint is looked up again in the directory on the next call.
+- Thresholds are config (`clients.consumes.<dep>.circuit_breaker`, `clients.provides.<contract>.circuit_breaker`, or `clients.defaults.circuit_breaker`); the contract can only exempt a method with `#[circuit_breaker(skip)]`, e.g. a long poll.
+
+Still open: fallback methods and degraded-mode behavior (fallback to a default implementation, or serving cached data while the provider is down). Those are domain decisions a generated client cannot make and would need their own ADR.
 
 ### gRPC Transport Projection — **shipped**
 
@@ -937,6 +944,12 @@ a committed `.proto` regenerated from the contract IR (`toolkit-contract-protoge
 pinned by `proto.lock.toml`); `tonic` for the transport; server-streaming only;
 and REST and gRPC projections do coexist on one base trait — the `api-contracts`
 example ships both.
+
+Since then the gRPC projection also generates the consumer side: a
+`<Contract>GrpcResolvingClient` that `#[toolkit::consumes(.., transport = grpc)]`
+wires and that resolves the provider by gRPC service name (see
+[ADR-0004](./ADR/0004-cpt-cf-binding-adr-consumer-wiring.md)). Servers stay
+hand-written.
 
 Still open: client-streaming and bidirectional RPCs, and reconnect/idle-timeout
 for server-streaming (the REST/SSE path has both, the gRPC path does not).
@@ -989,5 +1002,6 @@ bodies — these fall to a manual `impl Base for MyClient` (ADR-0002 escape hatc
 - **ADR-0006** — client observability (tracing/OTEL): [`./ADR/0006-cpt-cf-binding-adr-client-observability.md`](./ADR/0006-cpt-cf-binding-adr-client-observability.md)
 - **ADR-0007** — contract versioning (additive + parallel traits): [`./ADR/0007-cpt-cf-binding-adr-contract-versioning.md`](./ADR/0007-cpt-cf-binding-adr-contract-versioning.md)
 - **ADR-0008** — gRPC transport projection: [`./ADR/0008-cpt-cf-binding-adr-grpc-projection.md`](./ADR/0008-cpt-cf-binding-adr-grpc-projection.md)
+- **ADR-0009** — client-side circuit breaker (`cpt-cf-binding-adr-client-circuit-breaker`): [`./ADR/0009-cpt-cf-binding-adr-client-circuit-breaker.md`](./ADR/0009-cpt-cf-binding-adr-client-circuit-breaker.md)
 - **PoC**: [striped-zebra-dev/toolkit-binding-poc](https://github.com/striped-zebra-dev/toolkit-binding-poc)
 - **Gear/plugin declaration and resolution**: [PR #1380](https://github.com/constructorfabric/gears-rust/pull/1380)

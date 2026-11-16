@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use authz_resolver_sdk::PolicyEnforcer;
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
+use authz_resolver_sdk::{EnforcerError, PolicyEnforcer};
 use chrono::{DateTime, Utc};
 use github_mirror_sdk::{
     Artifact, Branch, CheckRun, Comment, Commit, CommitComment, CommitFile, CommitStatus,
@@ -1201,6 +1201,7 @@ impl Service {
                 actions::LIST,
                 None,
                 &AccessRequest::new()
+                    .allow_empty_scope(true)
                     .resource_property(pep_properties::OWNER_TENANT_ID, ctx.subject_tenant_id()),
             )
             .await?;
@@ -1226,6 +1227,7 @@ impl Service {
                 actions::LIST,
                 None,
                 &AccessRequest::new()
+                    .allow_empty_scope(true)
                     .resource_property(pep_properties::OWNER_TENANT_ID, ctx.subject_tenant_id()),
             )
             .await?;
@@ -3874,9 +3876,14 @@ impl Service {
     /// Scope for this tenant's per-repository run-status rows.
     /// GitHub's id for a mirrored repository, once Discovery has stored it.
     /// A repository not yet mirrored, or a lookup the caller may not make,
-    /// simply leaves the run-status row without an id.
-    async fn stored_repo_id(&self, ctx: &SecurityContext, repo_full_name: &str) -> Option<i64> {
-        let scope = self
+    /// simply leaves the run-status row without an id. An unknown enforcer
+    /// outcome class is an internal failure and stops the write instead.
+    async fn stored_repo_id(
+        &self,
+        ctx: &SecurityContext,
+        repo_full_name: &str,
+    ) -> Result<Option<i64>, DomainError> {
+        let scope = match self
             .policy_enforcer
             .access_scope_with(
                 ctx,
@@ -3887,12 +3894,22 @@ impl Service {
                     .resource_property(pep_properties::OWNER_TENANT_ID, ctx.subject_tenant_id()),
             )
             .await
-            .ok()?;
-        self.repo
+        {
+            Ok(scope) => scope,
+            Err(
+                EnforcerError::AccessDenied(_)
+                | EnforcerError::EvaluationFailed(_)
+                | EnforcerError::CompileFailed(_),
+            ) => return Ok(None),
+            Err(unknown) => return Err(unknown.into()),
+        };
+        Ok(self
+            .repo
             .find_by_full_name(&scope, repo_full_name)
             .await
-            .ok()?
-            .map(|repo| repo.id)
+            .ok()
+            .flatten()
+            .map(|repo| repo.id))
     }
 
     async fn repo_status_scope(
@@ -3922,7 +3939,7 @@ impl Service {
         session_id: Uuid,
     ) -> Result<(), DomainError> {
         let scope = self.repo_status_scope(ctx, actions::UPSERT).await?;
-        let repo_id = self.stored_repo_id(ctx, repo_full_name).await;
+        let repo_id = self.stored_repo_id(ctx, repo_full_name).await?;
         let written = self
             .repo_sync_status
             .complete_if_last_session(&scope, repo_full_name, session_id, repo_id, &now_rfc3339())
@@ -3951,7 +3968,7 @@ impl Service {
         let previous = self.repo_sync_status.find(scope, repo_full_name).await?;
         let repo_id = match previous.as_ref().and_then(|p| p.repo_id) {
             Some(id) => Some(id),
-            None => self.stored_repo_id(ctx, repo_full_name).await,
+            None => self.stored_repo_id(ctx, repo_full_name).await?,
         };
         let record = RepoSyncStatusRecord {
             repo_full_name: repo_full_name.to_owned(),

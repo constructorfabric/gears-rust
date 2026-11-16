@@ -153,10 +153,13 @@ pub(crate) async fn target_chain(
 pub(crate) async fn may_read_pii(
     enforcer: &authz_resolver_sdk::PolicyEnforcer,
     ctx: &SecurityContext,
-) -> bool {
-    authz::access_scope(enforcer, ctx, &resource::VALUE, READ_UNMASKED, None)
-        .await
-        .is_ok()
+) -> Result<bool, DomainError> {
+    // A known refusal masks; any other failure is an error, never a mask.
+    Ok(
+        authz::optional_scope(enforcer, ctx, &resource::VALUE, READ_UNMASKED)
+            .await?
+            .is_some(),
+    )
 }
 
 // @cpt-dod:cpt-cf-settings-service-dod-value-resolution-rest-read-surface:p1
@@ -226,7 +229,7 @@ pub async fn get_setting(
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-read:p1:inst-vr-aread-5
     let governed = effective.data_classification == "pii"
         || effective.trail.iter().any(|entry| entry.set_by.is_some());
-    let pii = governed && may_read_pii(&enforcer, &ctx).await;
+    let pii = governed && may_read_pii(&enforcer, &ctx).await?;
     // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-read:p1:inst-vr-aread-13
     // The reader is the caller's own tenant; what lies above it is collapsed
     // and each identity is shown only where it belongs, per request, never in
@@ -632,7 +635,7 @@ pub async fn browse_settings(
         // The entitlement is decided before the first batch: the corpus the
         // declaration text is matched in and the rendering of the value half
         // follow it.
-        let pii = may_read_pii(&enforcer, &ctx).await;
+        let pii = may_read_pii(&enforcer, &ctx).await?;
         narrowed_page(
             &resolver,
             &conn,
@@ -679,7 +682,7 @@ pub async fn browse_settings(
                 .as_ref()
                 .is_ok_and(|effective| effective.trail.iter().any(|entry| entry.set_by.is_some()))
         });
-        let pii = (has_pii || names_a_setter) && may_read_pii(&enforcer, &ctx).await;
+        let pii = (has_pii || names_a_setter) && may_read_pii(&enforcer, &ctx).await?;
         let items: Vec<SettingItemDto> = page
             .items
             .iter()
@@ -858,7 +861,7 @@ pub async fn list_review(
     // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-review-list:p1:inst-vr-review-8
     // Every row names who set it, an administrator's identity, so the
     // entitlement is asked whenever the page has a row.
-    let pii = !page.items.is_empty() && may_read_pii(&enforcer, &ctx).await;
+    let pii = !page.items.is_empty() && may_read_pii(&enforcer, &ctx).await?;
     // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-review-list:p1:inst-vr-review-10
     // The path from the reader tenant down to the target is the target's chain
     // from the reader; each row's path extends it by the walk's parent links
@@ -993,7 +996,7 @@ pub async fn get_history(
         || page.items.iter().any(|r| {
             r.actor_classification == crate::audit::ActorClassification::Pii || r.has_pii_image()
         });
-    let pii = needs_entitlement && may_read_pii(&enforcer, &ctx).await;
+    let pii = needs_entitlement && may_read_pii(&enforcer, &ctx).await?;
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-9
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-10
     // The path from the reader tenant down to the record's tenant is the

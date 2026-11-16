@@ -52,6 +52,7 @@ mod common;
 
 use std::sync::Arc;
 
+use resource_group::domain::error::DomainError;
 use resource_group::domain::group_service::GroupService;
 use resource_group::domain::type_service::TypeService;
 use resource_group::infra::storage::entity::gts_type::{
@@ -494,4 +495,66 @@ async fn pg_membership_filters_resolve_gts_and_accept_quoted_uuid() {
         assert_eq!(page.items[0].resource_type, member_type.code);
         assert_eq!(page.items[0].resource_id, "expected");
     }
+}
+
+/// Tenant scope on membership list and remove, on a real `PostgreSQL`: the
+/// scope is applied through the owning group, and a membership of another
+/// tenant's group is invisible and cannot be removed.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_membership_scope_isolates_two_tenants() {
+    let fixture = pg_fixture_or_skip!();
+    let db = fixture.db.clone();
+    let types = common::make_type_service(db.clone());
+    let groups = common::make_group_service(db.clone());
+    let memberships = common::make_membership_service(db);
+    let tenant_a = Uuid::now_v7();
+    let tenant_b = Uuid::now_v7();
+    let ctx_a = common::make_ctx(tenant_a);
+    let ctx_b = common::make_ctx(tenant_b);
+    let member_type = common::create_root_type(&types, "pgisomember").await;
+    let group_type = common::create_root_type(&types, "pgisogroup").await;
+    types
+        .update_type_unscoped(
+            &group_type.code,
+            UpdateTypeRequest {
+                can_be_root: true,
+                allowed_parent_types: vec![],
+                allowed_membership_types: vec![member_type.code.clone()],
+                metadata_schema: None,
+            },
+        )
+        .await
+        .unwrap();
+    let group_a =
+        common::create_root_group(&groups, &ctx_a, &group_type.code, "iso-a", tenant_a).await;
+    let group_b =
+        common::create_root_group(&groups, &ctx_b, &group_type.code, "iso-b", tenant_b).await;
+    memberships
+        .add_membership(&ctx_a, group_a.id, &member_type.code, "res-a")
+        .await
+        .unwrap();
+    memberships
+        .add_membership(&ctx_b, group_b.id, &member_type.code, "res-b")
+        .await
+        .unwrap();
+
+    let query = toolkit_odata::ODataQuery::default();
+    let page_b = memberships.list_memberships(&ctx_b, &query).await.unwrap();
+    assert_eq!(page_b.items.len(), 1);
+    assert_eq!(page_b.items[0].group_id, group_b.id);
+    assert_eq!(page_b.items[0].resource_id, "res-b");
+
+    let err = memberships
+        .remove_membership(&ctx_b, group_a.id, &member_type.code, "res-a")
+        .await
+        .expect_err("B must not remove A's membership");
+    assert!(
+        matches!(err, DomainError::MembershipNotFound { .. }),
+        "got: {err:?}"
+    );
+
+    let page_a = memberships.list_memberships(&ctx_a, &query).await.unwrap();
+    assert_eq!(page_a.items.len(), 1);
+    assert_eq!(page_a.items[0].group_id, group_a.id);
+    assert_eq!(page_a.items[0].resource_id, "res-a");
 }

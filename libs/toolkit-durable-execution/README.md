@@ -84,15 +84,20 @@ impl OrdersAuthorizer {
         let resource = ResourceType::from_static(resource.name(), resource.properties());
         let request = AccessRequest::new().require_constraints(constraints == ConstraintPolicy::Required);
         self.enforcer.access_scope_with(ctx, &resource, action, None, &request).await.map_err(|e| match e {
-            EnforcerError::Denied { .. } => AuthorizationError::denied(),
-            other => AuthorizationError::unavailable().with_source(other),
+            EnforcerError::AccessDenied(_) => AuthorizationError::denied(),
+            other @ (EnforcerError::EvaluationFailed(_) | EnforcerError::CompileFailed(_)) => {
+                AuthorizationError::unavailable().with_source(other)
+            }
+            // An unknown outcome class (`EnforcerError` is non-exhaustive) is an
+            // internal failure: never a denial, never `unavailable`.
+            other => AuthorizationError::internal().with_source(other),
         })
     }
 }
 ```
 
 The engine keeps the policy-independent checks: it rejects callers without a subject or tenant, rejects an unconstrained scope for actions whose `constraints()` are `Required`, limits owner operations to the calling subject, hides other owners' runs and bounds every call with `EngineBuilder::authorization_timeout`.
-Rejections are logged with the action, resource and reason (`denied`, `unavailable`, `timeout`, `unconstrained_scope`, `missing_identity`) and, for callers, the subject and tenant ids; never with the authorizer's error text.
+Rejections are logged with the action, resource and reason (`denied`, `unavailable`, `timeout`, `unconstrained_scope`, `missing_identity`, `internal`) and, for callers, the subject and tenant ids; never with the authorizer's error text.
 Both `Authorizer` futures may be dropped when the timeout expires, so they must be cancel-safe.
 
 ## Authoring

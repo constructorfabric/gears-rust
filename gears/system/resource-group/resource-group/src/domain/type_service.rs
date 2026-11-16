@@ -323,7 +323,37 @@ impl<TR: TypeRepositoryTrait> TypeService<TR> {
         ctx: &SecurityContext,
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupType>, DomainError> {
-        self.gate(ctx, "list").await?;
+        let scope = self
+            .enforcer
+            .access_scope_with(
+                ctx,
+                &RG_TYPE_RESOURCE,
+                "list",
+                None,
+                &AccessRequest::new()
+                    .require_constraints(false)
+                    .allow_empty_scope(true),
+            )
+            .await
+            .map_err(DomainError::from)?;
+        let empty_query;
+        let query = if scope.matches_nothing() {
+            use toolkit_odata::ast::{CompareOperator, Expr, Value};
+            let eq = Expr::Compare(
+                Box::new(Expr::Identifier("code".to_owned())),
+                CompareOperator::Eq,
+                Box::new(Expr::Value(Value::String(String::new()))),
+            );
+            let empty = eq.contradiction();
+            let filter = match query.filter().cloned() {
+                Some(user) => user.and(empty),
+                None => empty,
+            };
+            empty_query = query.clone().with_filter(filter);
+            &empty_query
+        } else {
+            query
+        };
         self.list_types_unscoped(query).await
     }
 

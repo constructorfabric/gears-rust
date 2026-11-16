@@ -1,0 +1,42 @@
+gdl_version = "1.0"
+
+# Every GDL field: https://github.com/constructorfabric/gearbox/blob/main/docs/gdl.md
+#
+# Gearbox product metadata for the api-contracts-grpc-consumer example gear.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (rest). The contract edge
+# and its transport (grpc) come from #[toolkit::consumes]; what is declared
+# here is which SDK supplies the contract.
+
+PAYMENT_SDK = cargo(
+    crate_name = "cf-api-contracts-sdk",
+    lib = "cf_api_contracts_sdk",
+    path = "../api-contracts-sdk",
+    features = ["grpc-client"],
+)
+
+gear(
+    deps = [],
+    source = git(url = "https://github.com/constructorfabric/gears-rust", path = "examples/toolkit/api-contracts/api-contracts-grpc-consumer"),
+    maturity = "preview",
+    name = "Payments gRPC Consumer (example)",
+    description = "Calls PaymentApi of another gear over gRPC, found through the directory.",
+    category = "example",
+    visibility = "public",
+
+    package = cargo(
+        crate_name = "cf-api-contracts-grpc-consumer",
+        lib = "cf_api_contracts_grpc_consumer",
+        path = ".",
+    ),
+
+    consumes = [
+        consume(
+            contract = "PaymentApi",
+            rust = "api_contracts_sdk::PaymentApi",
+            sdk = PAYMENT_SDK,
+        ),
+    ],
+
+    serves = [endpoint(name = "rest", via = "rest_host")],
+)

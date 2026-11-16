@@ -114,6 +114,16 @@ pub enum TransportError {
         /// Logical gear name that could not be resolved to an endpoint.
         gear: String,
     },
+
+    /// The client's circuit breaker is open for this endpoint: recent calls
+    /// failed at the transport level, so this one was refused without being
+    /// sent. Not transient within one call — retrying it at once would only be
+    /// refused again; callers see `service_unavailable` with `retry_after`.
+    #[error("circuit breaker open; retry after {} ms", retry_after.as_millis())]
+    CircuitOpen {
+        /// Time until the breaker lets a probe through.
+        retry_after: std::time::Duration,
+    },
 }
 
 impl TransportError {
@@ -206,9 +216,12 @@ impl TransportError {
             ),
             // `Overloaded` is a local shed, not a network condition: retrying it
             // adds load to an already-saturated client, so it fails fast.
+            // `CircuitOpen` fails fast for the same reason, and so the breaker
+            // also stops an in-call retry loop or stream reconnect at once.
             TransportError::Serialization(_)
             | TransportError::UrlBuild(_)
-            | TransportError::Overloaded => false,
+            | TransportError::Overloaded
+            | TransportError::CircuitOpen { .. } => false,
         }
     }
 }

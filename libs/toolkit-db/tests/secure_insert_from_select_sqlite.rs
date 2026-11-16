@@ -9,7 +9,7 @@
 use sea_orm::entity::prelude::*;
 use sea_orm_migration::prelude as mig;
 use toolkit_db::migration_runner::run_migrations_for_testing;
-use toolkit_db::secure::{ScopableEntity, ScopeError, secure_insert_from_select};
+use toolkit_db::secure::{ScopeError, secure_insert_from_select};
 use toolkit_db::{ConnectOpts, connect_db};
 use toolkit_security::AccessScope;
 
@@ -18,8 +18,9 @@ use toolkit_security::AccessScope;
 mod link {
     use sea_orm::entity::prelude::*;
 
-    #[derive(Debug, Clone, PartialEq, Eq, DeriveEntityModel)]
+    #[derive(Debug, Clone, PartialEq, Eq, DeriveEntityModel, toolkit_db::secure::Scopable)]
     #[sea_orm(table_name = "insert_from_select_link")]
+    #[secure(no_tenant, no_resource, no_owner, no_type)]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
         pub left_id: i64,
@@ -31,27 +32,6 @@ mod link {
     pub enum Relation {}
 
     impl ActiveModelBehavior for ActiveModel {}
-}
-
-impl ScopableEntity for link::Entity {
-    fn tenant_col() -> Option<<Self as EntityTrait>::Column> {
-        None
-    }
-    fn resource_col() -> Option<<Self as EntityTrait>::Column> {
-        None
-    }
-    fn owner_col() -> Option<<Self as EntityTrait>::Column> {
-        None
-    }
-    fn type_col() -> Option<<Self as EntityTrait>::Column> {
-        None
-    }
-    fn resolve_property(_property: &str) -> Option<<Self as EntityTrait>::Column> {
-        None
-    }
-    fn scope_columns() -> Vec<<Self as EntityTrait>::Column> {
-        Vec::new()
-    }
 }
 
 struct CreateLinkTable;

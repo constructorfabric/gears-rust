@@ -187,7 +187,13 @@ impl<
 
         let chat_scope = self
             .enforcer
-            .access_scope(ctx, &resources::CHAT, actions::LIST, None)
+            .access_scope_with(
+                ctx,
+                &resources::CHAT,
+                actions::LIST,
+                None,
+                &AccessRequest::new().allow_empty_scope(true),
+            )
             .await?
             .ensure_owner(ctx.subject_id());
 

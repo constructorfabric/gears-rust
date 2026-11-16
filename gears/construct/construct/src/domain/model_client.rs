@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
+use uuid::Uuid;
 
 /// One message of the conversation sent to a model.
 #[domain_model]
@@ -55,6 +56,8 @@ pub struct ModelRequest {
     pub answer: AnswerKind,
     /// The most tokens the answer may use; `None` leaves it to the model service.
     pub max_output_tokens: Option<u32>,
+    /// The person the call is for, so the model service can charge the call to them. It never goes into the prompt.
+    pub subject_id: Uuid,
 }
 
 /// What a model answered: text, tool calls, or a JSON value for a structured answer.

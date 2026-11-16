@@ -102,7 +102,13 @@ impl<R: AddressesRepository, U: UsersRepository> AddressesService<R, U> {
 
         let scope = self
             .policy_enforcer
-            .access_scope(ctx, &resources::ADDRESS, actions::LIST, None)
+            .access_scope_with(
+                ctx,
+                &resources::ADDRESS,
+                actions::LIST,
+                None,
+                &AccessRequest::new().allow_empty_scope(true),
+            )
             .await?;
 
         let page = self.repo.list_page(&conn, &scope, query).await?;

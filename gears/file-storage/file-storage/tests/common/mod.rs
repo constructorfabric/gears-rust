@@ -643,6 +643,16 @@ impl Authorizer for ScopedTestAuthorizer {
 
         Ok(AccessScope::for_tenant(ctx.subject_tenant_id()))
     }
+
+    async fn authorize_allow_empty(
+        &self,
+        ctx: &SecurityContext,
+        action: &str,
+        gts_file_type: &str,
+        file_id: Option<Uuid>,
+    ) -> Result<AccessScope, DomainError> {
+        self.authorize(ctx, action, gts_file_type, file_id).await
+    }
 }
 
 /// Backend decorator counting calls; every method delegates to `inner`.

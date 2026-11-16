@@ -14,6 +14,7 @@ use serde::de::DeserializeOwned;
 use toolkit_http::RequestBuilder;
 
 use crate::ir::binding::StreamFraming;
+use crate::runtime::breaker::AttemptStart;
 use crate::runtime::config::{ClientConfig, ReconnectConfig};
 use crate::runtime::http::{
     body_to_byte_stream, map_http_error, parse_retry_after, read_error_body_prefix,
@@ -39,7 +40,9 @@ type BoxByteStream = Pin<
 ///
 /// `timeout` bounds the **whole** attempt — connection, response headers, and
 /// reading the response body — as a per-attempt deadline (mirroring the
-/// streaming path). Elapse maps to [`TransportError::Timeout`], which is
+/// streaming path). It runs from the moment the attempt reaches the transport,
+/// after auth and the client's queue, so time spent there is not taken from
+/// the backend. Elapse maps to [`TransportError::Timeout`], which is
 /// transient, so a `#[retryable]` method retries a timed-out attempt. `None`
 /// leaves the deadline to the underlying transport.
 ///
@@ -53,7 +56,9 @@ where
     F: FnOnce() -> Result<RequestBuilder, TransportError>,
     R: DeserializeOwned,
 {
-    let builder = build()?;
+    let attempt = AttemptStart::default();
+    let builder = build()?.extension(attempt.clone());
+    let started = tokio::time::Instant::now();
     let op = async move {
         let response = builder.send().await.map_err(map_send_error)?;
         let status = response.status();
@@ -77,13 +82,23 @@ where
             Err(map_http_error(status.as_u16(), body, retry_after))
         }
     };
+    // The transport's own timeout, set to the same length, bounds the wait
+    // for response headers, so a timed-out attempt reaches the circuit
+    // breaker's attempt layer as a timeout. This timer, which also bounds the
+    // body, runs from the same start plus a grace, so it never fires first;
+    // if it did, the breaker would see only a dropped call.
     match timeout {
-        Some(d) => tokio::time::timeout(d, op)
+        Some(d) => attempt
+            .bound(started, d + HEADER_DEADLINE_GRACE, op)
             .await
-            .map_err(|_| TransportError::Timeout(d))?,
+            .ok_or(TransportError::Timeout(d))?,
         None => op.await,
     }
 }
+
+/// Slack the outer per-attempt timer gives the transport's timeout layer, so
+/// the transport reports a timed-out attempt first. See [`send_unary`].
+const HEADER_DEADLINE_GRACE: Duration = Duration::from_millis(50);
 
 /// Shared transport-construction chain for both cfg variants of
 /// [`build_default_http_client`] — in one place so a knob can't be added to one
@@ -95,7 +110,7 @@ where
 /// and matching the transport's `TimeoutLayer` to it stops a `config.timeout`
 /// above toolkit-http's 30s default being silently capped at 30s.
 fn transport_builder(config: &ClientConfig) -> toolkit_http::HttpClientBuilder {
-    toolkit_http::HttpClient::builder()
+    let builder = toolkit_http::HttpClient::builder()
         .retry(None)
         .transport(transport_security(config.require_tls))
         .timeout(config.timeout)
@@ -107,7 +122,8 @@ fn transport_builder(config: &ClientConfig) -> toolkit_http::HttpClientBuilder {
                 .map(|max_concurrent_requests| toolkit_http::RateLimitConfig {
                     max_concurrent_requests,
                 }),
-        )
+        );
+    crate::runtime::breaker::install_http_breaker(builder, config)
 }
 
 /// Build the default `toolkit-http` client used by macro-generated REST clients.
@@ -213,6 +229,8 @@ fn transport_security(require_tls: bool) -> toolkit_http::TransportSecurity {
 /// - `Overloaded`: the concurrency limiter shed the request before it was sent
 ///   → [`TransportError::Overloaded`] (non-transient), so the retry loop can
 ///   tell a locally-shed request from a network failure.
+/// - A circuit-breaker rejection from the attempt layer →
+///   [`TransportError::CircuitOpen`] (non-transient).
 /// - `Timeout` / `DeadlineExceeded`: the transport timeout layer fired. It is
 ///   set to `config.timeout`, which the SDK also enforces per call, so either
 ///   timer can win; both map to [`TransportError::Timeout`] to keep the
@@ -222,6 +240,14 @@ fn map_send_error(err: toolkit_http::HttpError) -> TransportError {
         toolkit_http::HttpError::Overloaded => TransportError::Overloaded,
         toolkit_http::HttpError::Timeout(d) | toolkit_http::HttpError::DeadlineExceeded(d) => {
             TransportError::Timeout(d)
+        }
+        toolkit_http::HttpError::Transport(err) => {
+            match crate::runtime::breaker::find_rejected(err.as_ref()) {
+                Some(rejected) => TransportError::CircuitOpen {
+                    retry_after: rejected.retry_after(),
+                },
+                None => TransportError::network(toolkit_http::HttpError::Transport(err)),
+            }
         }
         other => TransportError::network(other),
     }
@@ -367,11 +393,19 @@ async fn send_open_request(
     builder: RequestBuilder,
     timeout: Option<Duration>,
 ) -> Result<toolkit_http::HttpResponse, OpenFailure> {
-    let send_fut = builder.send();
+    let attempt = AttemptStart::default();
+    let started = tokio::time::Instant::now();
+    let send_fut = builder.extension(attempt.clone()).send();
+    // Timed from the attempt's arrival at the transport, plus a grace, so the
+    // transport's timer reports the timeout to the circuit breaker first, as
+    // in `send_unary`.
     let sent = match timeout {
-        Some(d) => match tokio::time::timeout(d, send_fut).await {
-            Ok(r) => r,
-            Err(_) => return Err(OpenFailure::Retryable(TransportError::Timeout(d))),
+        Some(d) => match attempt
+            .bound(started, d + HEADER_DEADLINE_GRACE, send_fut)
+            .await
+        {
+            Some(r) => r,
+            None => return Err(OpenFailure::Retryable(TransportError::Timeout(d))),
         },
         None => send_fut.await,
     };

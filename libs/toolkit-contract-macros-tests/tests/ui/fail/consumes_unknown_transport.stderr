@@ -1,0 +1,5 @@
+error: `transport` is `rest` or `grpc`
+ --> tests/ui/fail/consumes_unknown_transport.rs:9:57
+  |
+9 | #[consumes(contract = FooApi, from = "bar", transport = soap)]
+  |                                                         ^^^^

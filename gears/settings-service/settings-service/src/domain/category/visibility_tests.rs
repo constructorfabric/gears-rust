@@ -160,3 +160,51 @@ fn two_restrictions_narrow_to_the_domains_both_let_through() {
     assert!(is_visible(&disjoint, None));
     assert!(!is_visible(&disjoint, Some("commercial")));
 }
+
+#[test]
+fn a_branch_that_matches_nothing_contributes_no_domain() {
+    let nothing = || ScopeFilter::In(InScopeFilter::new("tenant_id", vec![]));
+    let dead_domain = || {
+        ScopeConstraint::new(vec![
+            ScopeFilter::In(InScopeFilter::new(DOMAIN_PROPERTY, vec!["billing".into()])),
+            nothing(),
+        ])
+    };
+    let live_domain = ScopeConstraint::new(vec![ScopeFilter::In(InScopeFilter::new(
+        DOMAIN_PROPERTY,
+        vec!["infra".into()],
+    ))]);
+    let live_unrelated = ScopeConstraint::new(vec![ScopeFilter::Eq(EqScopeFilter::new(
+        "tenant_id",
+        "acme",
+    ))]);
+
+    // A dead branch neither widens a live domain restriction...
+    assert_eq!(
+        domain_visibility(&AccessScope::from_constraints(vec![
+            dead_domain(),
+            live_domain
+        ])),
+        DomainVisibility::Restricted(vec!["infra".to_owned()])
+    );
+    // ...nor restricts a live branch that carries no domain constraint.
+    assert_eq!(
+        domain_visibility(&AccessScope::from_constraints(vec![
+            dead_domain(),
+            live_unrelated
+        ])),
+        DomainVisibility::Unrestricted
+    );
+    // A scope that matches nothing at all is never read as unrestricted:
+    // deny-all, or dead branches with or without a domain filter.
+    for all_dead in [
+        AccessScope::deny_all(),
+        AccessScope::from_constraints(vec![dead_domain()]),
+        AccessScope::from_constraints(vec![ScopeConstraint::new(vec![nothing()])]),
+    ] {
+        assert_eq!(
+            domain_visibility(&all_dead),
+            DomainVisibility::Restricted(Vec::new())
+        );
+    }
+}

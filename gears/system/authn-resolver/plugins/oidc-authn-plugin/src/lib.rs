@@ -49,7 +49,7 @@ mod thread_safety {
     const _: fn() = || {
         fn must_be_send_sync<T: Send + Sync>() {}
         must_be_send_sync::<crate::domain::authenticate::OidcAuthNPlugin>();
-        must_be_send_sync::<crate::infra::circuit_breaker::CircuitBreaker>();
+        must_be_send_sync::<crate::infra::circuit_breaker::HostCircuitBreakers>();
         must_be_send_sync::<crate::domain::validator::JwtValidator>();
         must_be_send_sync::<crate::infra::jwks::JwksFetcher>();
     };

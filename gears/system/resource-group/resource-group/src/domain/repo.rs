@@ -26,9 +26,21 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         id: Uuid,
     ) -> Result<Option<ResourceGroup>, DomainError>;
 
+    /// Find the raw entity model by ID.
+    ///
+    /// Reads under the system scope, with no caller scope applied. Never use
+    /// it as an authorization gate, use `find_model_by_id_scoped` for that.
     async fn find_model_by_id<C: DBRunner>(
         &self,
         db: &C,
+        id: Uuid,
+    ) -> Result<Option<rg_entity::Model>, DomainError>;
+
+    /// Find the raw entity model by ID, visible under `scope`.
+    async fn find_model_by_id_scoped<C: DBRunner>(
+        &self,
+        db: &C,
+        scope: &AccessScope,
         id: Uuid,
     ) -> Result<Option<rg_entity::Model>, DomainError>;
 
@@ -390,9 +402,12 @@ pub trait TypeRepositoryTrait: Send + Sync + 'static {
 
 #[async_trait]
 pub trait MembershipRepositoryTrait: Send + Sync + 'static {
+    /// List memberships. `scope` is the caller's scope and is applied through
+    /// the owning group; an unconstrained scope means no tenant filtering.
     async fn list_memberships<C: DBRunner>(
         &self,
         db: &C,
+        scope: &AccessScope,
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupMembership>, DomainError>;
 
@@ -404,21 +419,17 @@ pub trait MembershipRepositoryTrait: Send + Sync + 'static {
         resource_id: &str,
     ) -> Result<membership_entity::Model, DomainError>;
 
+    /// Delete a membership. `scope` is the caller's scope and is applied
+    /// through the owning group; an unconstrained scope means no tenant
+    /// filtering.
     async fn delete<C: DBRunner>(
         &self,
         db: &C,
+        scope: &AccessScope,
         group_id: Uuid,
         gts_type_id: i16,
         resource_id: &str,
     ) -> Result<u64, DomainError>;
-
-    async fn find_by_composite_key<C: DBRunner>(
-        &self,
-        db: &C,
-        group_id: Uuid,
-        gts_type_id: i16,
-        resource_id: &str,
-    ) -> Result<Option<membership_entity::Model>, DomainError>;
 
     /// Whether `(gts_type_id, resource_id)` already has a membership owned by
     /// a tenant other than `tenant_id`.

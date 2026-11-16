@@ -51,14 +51,22 @@ pub struct ClientTuning {
     #[serde(default)]
     pub require_tls: Option<bool>,
 
+    /// Circuit breaker for each endpoint this client calls. Missing keeps the
+    /// defaults (on: opens when at least half of at least 10 calls in 30s
+    /// failed at the transport level, open for 10s, then one probe);
+    /// `{ enabled: false }` turns it off. Unknown keys and invalid values are
+    /// rejected at parse time.
+    #[cfg(feature = "runtime-client")]
+    #[serde(default)]
+    pub circuit_breaker: Option<toolkit_resilience::circuit_breaker::CircuitBreakerConfig>,
+
     /// Max idle keep-alive connections per upstream host. Raise this to at least
     /// the expected per-upstream request concurrency so HTTP/1.1 connections are
     /// reused instead of churned under load. Missing keeps the SDK default
     /// ([`ClientConfig::pool_max_idle_per_host`](crate::runtime::config::ClientConfig::pool_max_idle_per_host)).
     ///
-    /// **REST transport only.** A `transport: grpc` wiring accepts this key but
-    /// it has no effect — the gRPC client reads only `endpoint`, `timeout` and
-    /// `require_tls` (a warning is logged at gRPC client construction).
+    /// **REST transport only.** A gRPC client accepts this key but it has no
+    /// effect (a warning is logged when such a client is wired).
     #[serde(default)]
     pub pool_max_idle_per_host: Option<usize>,
 
@@ -101,21 +109,25 @@ impl ClientTuning {
         "stream_reconnect",
         "sse_reconnect",
         "require_tls",
+        "circuit_breaker",
         "pool_max_idle_per_host",
         "pool_idle_timeout",
         "max_concurrent_requests",
     ];
 
-    /// REST-only transport knobs that were explicitly set on this tuning.
+    /// The knobs set on this tuning that a gRPC client does not apply.
     ///
-    /// Used to warn when a non-REST transport is selected: the gRPC client reads
-    /// only `endpoint`, `timeout` and `require_tls`, so
-    /// `pool_max_idle_per_host`, `pool_idle_timeout` and
-    /// `max_concurrent_requests` on a `transport: grpc` wiring silently go
-    /// nowhere. Returns their names (empty when none are set).
+    /// Used to warn when a gRPC client is wired: it reads the endpoint,
+    /// `timeout`, `retry`, `require_tls` and `circuit_breaker`. The pool and
+    /// concurrency knobs are REST-only, and gRPC streams do not reconnect yet,
+    /// so `stream_reconnect` (or `sse_reconnect`) is not applied either.
+    /// Returns their names (empty when none are set).
     #[must_use]
-    pub fn rest_only_knobs_set(&self) -> Vec<&'static str> {
+    pub fn grpc_ignored_knobs(&self) -> Vec<&'static str> {
         let mut set = Vec::new();
+        if self.stream_reconnect.is_some() {
+            set.push("stream_reconnect");
+        }
         if self.pool_max_idle_per_host.is_some() {
             set.push("pool_max_idle_per_host");
         }
@@ -212,7 +224,7 @@ where
 /// Consumer-side wiring for one dependency, read from
 /// `gears.<owner>.clients.consumes.<dep>` (with `gears.<owner>.clients.defaults`
 /// merged under it) by the runtime's proxy-wiring phase and applied to the
-/// directory-resolving REST client that `#[toolkit::consumes]` registers.
+/// directory-resolving client that `#[toolkit::consumes]` registers.
 ///
 /// An object with an optional `endpoint` (omit to keep discovery) plus a
 /// flattened [`ClientTuning`]:
@@ -223,13 +235,15 @@ where
 ///     api-contracts:
 ///       timeout: "5s"
 ///       max_concurrent_requests: 256
-///       # endpoint: "http://..."   # optional; omit to keep discovery
+///       # endpoint: "http://..."        # optional; omit to keep discovery
+///       # grpc_endpoint: "http://..."   # optional; for gRPC clients of this dep
 /// ```
 ///
-/// Unlike [`ClientWiring`] there is **no** `transport` tag: the
-/// `#[toolkit::consumes]` path is REST-only, so every tuning knob applies. (A
-/// hand-written [`ConsumerRegistration`](crate::runtime) may bind a non-REST
-/// transport, which reads only the knobs it understands.)
+/// Unlike [`ClientWiring`] there is **no** `transport` tag: the transport is
+/// chosen in code (`#[toolkit::consumes(.., transport = grpc)]`). A gRPC client
+/// uses `grpc_endpoint` when set, else `endpoint`; it ignores the REST-only
+/// pool and concurrency knobs and `stream_reconnect` (see
+/// [`ClientTuning::grpc_ignored_knobs`]).
 ///
 /// Must be an object; a bare `<dep>: "http://host"` string (the old shape) is
 /// rejected at parse time — use the `endpoint` field.
@@ -240,7 +254,12 @@ pub struct ConsumerWiring {
     /// at parse time unless it is an absolute URI (see [`is_absolute_endpoint`]).
     #[serde(default, deserialize_with = "deserialize_optional_endpoint")]
     pub endpoint: Option<String>,
-    /// REST client tuning, flattened into the same map as `endpoint`.
+    /// Static-endpoint override for gRPC clients of this dep, when they must
+    /// not use `endpoint` (a gear that consumes the dep over both REST and
+    /// gRPC). Validated like `endpoint`.
+    #[serde(default, deserialize_with = "deserialize_optional_endpoint")]
+    pub grpc_endpoint: Option<String>,
+    /// Client tuning, flattened into the same map as `endpoint`.
     #[serde(default, flatten)]
     pub tuning: ClientTuning,
 }
@@ -308,6 +327,28 @@ impl ClientTuning {
         }
         cfg = cfg.with_internal_token_provider(self.internal_token_provider.clone());
         cfg
+    }
+
+    /// The circuit breaker this tuning asks for, named `name` in logs and
+    /// rejections; `None` when it is turned off.
+    #[must_use]
+    pub fn circuit_breaker_for(
+        &self,
+        name: &str,
+    ) -> Option<std::sync::Arc<toolkit_resilience::circuit_breaker::CircuitBreaker>> {
+        use toolkit_resilience::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+
+        let config = self.circuit_breaker.clone().unwrap_or_default();
+        if !config.enabled() {
+            return None;
+        }
+        // Parsed configs are validated already; a hand-built invalid one runs
+        // with the defaults rather than without a breaker.
+        let breaker = CircuitBreaker::new(config).or_else(|err| {
+            tracing::warn!(breaker = name, error = %err, "invalid circuit breaker config; using defaults");
+            CircuitBreaker::new(CircuitBreakerConfig::default())
+        });
+        breaker.ok().map(|b| std::sync::Arc::new(b.with_name(name)))
     }
 
     /// Attach the platform-plane credential source forwarded onto the built

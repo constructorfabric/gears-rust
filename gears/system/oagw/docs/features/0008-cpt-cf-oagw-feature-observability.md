@@ -186,6 +186,8 @@ Operators need full visibility into outbound API traffic patterns, errors, and p
 
 ### Audit Log Emission
 
+**Planned for [upstream credentials](../ADR/0021-upstream-credentials.md#errors-and-observability).** Audit create, replace, delete, suspend and resume, including repeated suspends and registry changes. Record actor/source, tenant, credential UUID, action, UTC time and result. Keep secret values, references, pins and auth headers out of audit data.
+
 - [ ] `p2` - **ID**: `cpt-cf-oagw-algo-obs-audit-logging`
 
 **Input**: Completed proxy request context (request metadata, response metadata, error if any)

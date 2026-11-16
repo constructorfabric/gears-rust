@@ -918,7 +918,12 @@ struct FailingWriter;
 
 #[async_trait]
 impl PlanWriter for FailingWriter {
-    async fn write(&self, _: &SecurityContext, _: &Plan) -> Result<Written, DomainError> {
+    async fn write_by(
+        &self,
+        _: &SecurityContext,
+        _: &Plan,
+        _deadline: tokio::time::Instant,
+    ) -> Result<Written, DomainError> {
         Err(DomainError::Unavailable("graph storage is down".to_owned()))
     }
 }
@@ -933,7 +938,12 @@ struct AddedMeanwhile {
 
 #[async_trait]
 impl PlanWriter for AddedMeanwhile {
-    async fn write(&self, ctx: &SecurityContext, plan: &Plan) -> Result<Written, DomainError> {
+    async fn write_by(
+        &self,
+        ctx: &SecurityContext,
+        plan: &Plan,
+        _deadline: tokio::time::Instant,
+    ) -> Result<Written, DomainError> {
         if !self.raced.swap(true, Ordering::SeqCst) {
             let Change::AddEntity { properties, .. } = &plan.steps[0].change else {
                 panic!("not an add: {plan:?}");

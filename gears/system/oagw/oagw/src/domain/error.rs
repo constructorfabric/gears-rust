@@ -290,8 +290,8 @@ pub enum DomainError {
     Forbidden {
         /// Stable, machine-readable code identifying the policy
         /// rule or subsystem that denied the request. Comes from
-        /// `EnforcerError::Denied.deny_reason.error_code` when the
-        /// PEP supplies one, or from a fixed taxonomy
+        /// `AccessDenial::Pdp { reason }`'s `reason.error_code`
+        /// when the PDP supplies one, or from a fixed taxonomy
         /// (`AUTHZ_DENIED`, `TENANT_RESOLVER_UNAUTHORIZED`, …)
         /// otherwise. Surfaces on the wire as the
         /// `permission_denied.reason` field — clients branch on
@@ -469,11 +469,11 @@ impl From<tenant_resolver_sdk::TenantResolverError> for DomainError {
 /// Convert an authorization enforcer error into a domain error.
 impl From<authz_resolver_sdk::EnforcerError> for DomainError {
     fn from(e: authz_resolver_sdk::EnforcerError) -> Self {
-        use authz_resolver_sdk::EnforcerError;
+        use authz_resolver_sdk::{AccessDenial, EnforcerError};
 
         tracing::error!(error = %e, "OAGW authorization check failed");
         match e {
-            EnforcerError::Denied { deny_reason } => match deny_reason {
+            EnforcerError::AccessDenied(AccessDenial::Pdp { reason }) => match reason {
                 Some(r) => Self::Forbidden {
                     reason: r.error_code,
                     detail: r
@@ -485,11 +485,21 @@ impl From<authz_resolver_sdk::EnforcerError> for DomainError {
                     detail: "access denied by policy".into(),
                 },
             },
+            // PEP-local access denial after successful compilation.
+            EnforcerError::AccessDenied(local) => Self::Forbidden {
+                reason: reason::permission::AUTHZ_DENIED.into(),
+                detail: local.to_string(),
+            },
             EnforcerError::CompileFailed(_) => Self::Internal {
                 message: "authorization constraint compilation failed".to_string(),
             },
             EnforcerError::EvaluationFailed(_) => Self::Internal {
                 message: "authorization evaluation failed".to_string(),
+            },
+            // An unknown outcome class is an internal failure, never a denial;
+            // the cause is logged above.
+            _ => Self::Internal {
+                message: "authorization failed with an unknown outcome".to_string(),
             },
         }
     }

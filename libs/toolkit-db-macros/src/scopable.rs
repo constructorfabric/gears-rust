@@ -63,192 +63,65 @@ pub fn expand_derive_scopable(input: DeriveInput) -> syn::Result<TokenStream> {
 
     let entity_ident = syn::Ident::new("Entity", input.ident.span());
 
-    // If unrestricted, generate simple implementation with all None
-    if config.unrestricted.is_some() {
-        return Ok(quote! {
-            impl ::toolkit_db::secure::ScopableEntity for #entity_ident {
-                const IS_UNRESTRICTED: bool = true;
+    let scope = if config.unrestricted.is_some() {
+        quote! { ::toolkit_db::secure::EntityScope::Unrestricted }
+    } else {
+        // Every field is written out: `Dimensions` has no default by design.
+        let tenant = dimension_column(config.tenant_col.as_ref())?;
+        let resource = dimension_column(config.resource_col.as_ref())?;
+        let owner = dimension_column(config.owner_col.as_ref())?;
+        let type_col = dimension_column(config.type_col.as_ref())?;
+        let custom = config
+            .pep_props
+            .iter()
+            .map(|(property, column, span)| {
+                let column = column_path(column, *span)?;
+                Ok(quote! { (#property, #column) })
+            })
+            .collect::<syn::Result<Vec<_>>>()?;
+        quote! {
+            ::toolkit_db::secure::EntityScope::Scoped(::toolkit_db::secure::Dimensions {
+                tenant: #tenant,
+                resource: #resource,
+                owner: #owner,
+                type_col: #type_col,
+                custom: &[#(#custom),*],
+            })
+        }
+    };
 
-                fn tenant_col() -> ::core::option::Option<Self::Column> {
-                    ::core::option::Option::None
-                }
-
-                fn resource_col() -> ::core::option::Option<Self::Column> {
-                    ::core::option::Option::None
-                }
-
-                fn owner_col() -> ::core::option::Option<Self::Column> {
-                    ::core::option::Option::None
-                }
-
-                fn type_col() -> ::core::option::Option<Self::Column> {
-                    ::core::option::Option::None
-                }
-
-                fn scope_columns() -> ::std::vec::Vec<Self::Column> {
-                    ::std::vec::Vec::new()
-                }
-
-                fn resolve_property(_property: &str) -> ::core::option::Option<Self::Column> {
-                    ::core::option::Option::None
-                }
-            }
-        });
-    }
-
-    // Generate tenant_col implementation
-    let tenant_col_impl =
-        generate_col_impl("tenant_col", config.tenant_col.as_ref(), input.ident.span());
-
-    // Generate resource_col implementation
-    let resource_col_impl = generate_col_impl(
-        "resource_col",
-        config.resource_col.as_ref(),
-        input.ident.span(),
-    );
-
-    // Generate owner_col implementation
-    let owner_col_impl =
-        generate_col_impl("owner_col", config.owner_col.as_ref(), input.ident.span());
-
-    // Generate type_col implementation
-    let type_col_impl = generate_col_impl("type_col", config.type_col.as_ref(), input.ident.span());
-
-    // Generate resolve_property implementation
-    let resolve_property_impl = generate_resolve_property(&config, input.ident.span());
-    let scope_columns_impl = generate_scope_columns(&config, input.ident.span());
-
-    // Generate the implementation
     Ok(quote! {
         impl ::toolkit_db::secure::ScopableEntity for #entity_ident {
-            const IS_UNRESTRICTED: bool = false;
-
-            #tenant_col_impl
-
-            #resource_col_impl
-
-            #owner_col_impl
-
-            #type_col_impl
-
-            #resolve_property_impl
-            #scope_columns_impl
+            const SCOPE: ::toolkit_db::secure::EntityScope<Self::Column> = #scope;
         }
     })
 }
 
-/// Generate a column method implementation
-fn generate_col_impl(
-    method_name: &str,
-    col: Option<&(String, Span)>,
-    default_span: Span,
-) -> TokenStream {
-    let method_ident = syn::Ident::new(method_name, default_span);
-
-    if let Some((col_name, _)) = col {
-        let col_variant = snake_to_upper_camel(col_name);
-        let col_ident = syn::Ident::new(&col_variant, default_span);
-        quote! {
-            fn #method_ident() -> ::core::option::Option<Self::Column> {
-                ::core::option::Option::Some(Self::Column::#col_ident)
-            }
+/// `Some(Column::X)` for a dimension that names a column, `None` otherwise.
+fn dimension_column(col: Option<&(String, Span)>) -> syn::Result<TokenStream> {
+    match col {
+        Some((name, span)) => {
+            let column = column_path(name, *span)?;
+            Ok(quote! { ::core::option::Option::Some(#column) })
         }
-    } else {
-        quote! {
-            fn #method_ident() -> ::core::option::Option<Self::Column> {
-                ::core::option::Option::None
-            }
-        }
+        None => Ok(quote! { ::core::option::Option::None }),
     }
 }
 
-/// Enumerate every column a scope predicate can address.
+/// The `Self::Column` variant a column name maps to.
 ///
-/// Built from the same configuration as `resolve_property`, so the two cannot
-/// disagree about what counts as a scope column — which matters because a
-/// property-graph declaration derives its `PROPERTIES` list from this, and a
-/// scope column left out of that list is silently unfilterable.
-///
-/// `type_col` is deliberately absent: `resolve_property` emits no arm for it
-/// (there is no well-known property name), so no scope constraint can address
-/// it — listing it here would let an entity whose only dimension is `type_col`
-/// pass the Policy 2 gates while resolving nothing, which is the silent
-/// deny-all those gates exist to refuse.
-fn generate_scope_columns(config: &SecureConfig, span: Span) -> TokenStream {
-    let mut columns = Vec::new();
-
-    for col_name in [
-        config.tenant_col.as_ref().map(|(name, _)| name),
-        config.resource_col.as_ref().map(|(name, _)| name),
-        config.owner_col.as_ref().map(|(name, _)| name),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let col_ident = syn::Ident::new(&snake_to_upper_camel(col_name), span);
-        columns.push(quote! { Self::Column::#col_ident });
-    }
-
-    // `pep_prop` columns are scope columns too: `resolve_property` maps them,
-    // so a scope can address them, so a pattern must be able to filter on them.
-    for (_, column, _) in &config.pep_props {
-        let col_ident = syn::Ident::new(&snake_to_upper_camel(column), span);
-        columns.push(quote! { Self::Column::#col_ident });
-    }
-
-    quote! {
-        fn scope_columns() -> ::std::vec::Vec<Self::Column> {
-            ::std::vec![#(#columns),*]
-        }
-    }
-}
-
-/// Generate the `resolve_property` match arms from dimension columns and `pep_prop` entries.
-fn generate_resolve_property(config: &SecureConfig, span: Span) -> TokenStream {
-    let mut arms = Vec::new();
-
-    // Auto-map dimension columns to their well-known property names
-    if let Some((col_name, _)) = &config.tenant_col {
-        let col_variant = snake_to_upper_camel(col_name);
-        let col_ident = syn::Ident::new(&col_variant, span);
-        arms.push(quote! {
-            #PEP_PROP_OWNER_TENANT_ID => ::core::option::Option::Some(Self::Column::#col_ident),
-        });
-    }
-
-    if let Some((col_name, _)) = &config.resource_col {
-        let col_variant = snake_to_upper_camel(col_name);
-        let col_ident = syn::Ident::new(&col_variant, span);
-        arms.push(quote! {
-            #PEP_PROP_RESOURCE_ID => ::core::option::Option::Some(Self::Column::#col_ident),
-        });
-    }
-
-    if let Some((col_name, _)) = &config.owner_col {
-        let col_variant = snake_to_upper_camel(col_name);
-        let col_ident = syn::Ident::new(&col_variant, span);
-        arms.push(quote! {
-            #PEP_PROP_OWNER_ID => ::core::option::Option::Some(Self::Column::#col_ident),
-        });
-    }
-
-    // Custom pep_prop entries
-    for (property, column, _) in &config.pep_props {
-        let col_variant = snake_to_upper_camel(column);
-        let col_ident = syn::Ident::new(&col_variant, span);
-        arms.push(quote! {
-            #property => ::core::option::Option::Some(Self::Column::#col_ident),
-        });
-    }
-
-    quote! {
-        fn resolve_property(property: &str) -> ::core::option::Option<Self::Column> {
-            match property {
-                #(#arms)*
-                _ => ::core::option::Option::None,
-            }
-        }
-    }
+/// A name that does not convert to an identifier is reported at the attribute
+/// rather than panicking inside the macro, which `syn::Ident::new` would do.
+fn column_path(name: &str, span: Span) -> syn::Result<TokenStream> {
+    let variant = snake_to_upper_camel(name);
+    let ident = syn::parse_str::<syn::Ident>(&variant).map_err(|_| {
+        syn::Error::new(
+            span,
+            format!("secure: column name '{name}' is not a valid column identifier"),
+        )
+    })?;
+    let ident = syn::Ident::new(&ident.to_string(), span);
+    Ok(quote! { Self::Column::#ident })
 }
 
 /// Validate the configuration for strict compile-time checks
@@ -264,7 +137,8 @@ fn validate_config(config: &SecureConfig, input: &DeriveInput) -> syn::Result<()
             || config.owner_col.is_some()
             || config.no_owner.is_some()
             || config.type_col.is_some()
-            || config.no_type.is_some();
+            || config.no_type.is_some()
+            || !config.pep_props.is_empty();
 
         if has_other {
             return Err(syn::Error::new(

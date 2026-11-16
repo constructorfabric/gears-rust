@@ -26,6 +26,13 @@ use toolkit_security::SecurityContext;
 
 use futures_core::Stream;
 
+/// Config for a plaintext mock server. A FIPS build requires TLS by default
+/// and installs no crypto provider, so opt in to plaintext and install one.
+fn plaintext_config(base_url: impl Into<String>) -> ClientConfig {
+    drop(toolkit_security::tls::configured_provider().install_default());
+    ClientConfig::new(base_url).with_require_tls(false)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct EchoRequest {
     pub message: String,
@@ -522,7 +529,7 @@ fn anonymous_ctx() -> SecurityContext {
 #[tokio::test]
 async fn projection_trait_is_implementable_for_generated_client() {
     let (base_url, _) = start_server().await;
-    let client = std::sync::Arc::new(DemoApiRestClient::new(ClientConfig::new(base_url)).unwrap());
+    let client = std::sync::Arc::new(DemoApiRestClient::new(plaintext_config(base_url)).unwrap());
 
     let as_base: std::sync::Arc<dyn DemoApi> = client.clone();
     let as_projection: std::sync::Arc<dyn DemoApiRest> = client.clone();
@@ -543,7 +550,7 @@ async fn unary_delete_empty_body_decodes_to_unit() {
     // A `204 No Content` (empty body) on a `Result<(), _>` method must decode
     // to `Ok(())` rather than failing JSON deserialization (M-4).
     let (base_url, _) = start_server().await;
-    let client = DemoApiRestClient::new(ClientConfig::new(base_url)).unwrap();
+    let client = DemoApiRestClient::new(plaintext_config(base_url)).unwrap();
     DemoApi::remove(&client, anonymous_ctx(), "abc".to_owned())
         .await
         .expect("204/empty body should decode to Ok(())");
@@ -552,7 +559,7 @@ async fn unary_delete_empty_body_decodes_to_unit() {
 #[tokio::test]
 async fn unary_get_round_trip() {
     let (base_url, _) = start_server().await;
-    let client = DemoApiRestClient::new(ClientConfig::new(base_url)).unwrap();
+    let client = DemoApiRestClient::new(plaintext_config(base_url)).unwrap();
     let resp = DemoApi::echo_get(&client, anonymous_ctx(), "abc".to_owned())
         .await
         .unwrap();
@@ -562,7 +569,7 @@ async fn unary_get_round_trip() {
 #[tokio::test]
 async fn unary_post_round_trip() {
     let (base_url, _) = start_server().await;
-    let client = DemoApiRestClient::new(ClientConfig::new(base_url)).unwrap();
+    let client = DemoApiRestClient::new(plaintext_config(base_url)).unwrap();
     let resp = DemoApi::echo_post(
         &client,
         anonymous_ctx(),
@@ -578,7 +585,7 @@ async fn unary_post_round_trip() {
 #[tokio::test]
 async fn retryable_recovers_after_transient_failure() {
     let (base_url, state) = start_server().await;
-    let cfg = ClientConfig::new(base_url).with_retry(RetryConfig {
+    let cfg = plaintext_config(base_url).with_retry(RetryConfig {
         max_attempts: 4,
         base_delay: Duration::from_millis(0),
         max_delay: Duration::from_millis(0),
@@ -597,7 +604,7 @@ async fn unary_timeout_is_enforced() {
     // A tight `ClientConfig::timeout` must bound the unary call; the slow
     // handler sleeps 500ms while the client deadline is 50ms.
     let (base_url, _) = start_server().await;
-    let cfg = ClientConfig::new(base_url).with_timeout(Duration::from_millis(50));
+    let cfg = plaintext_config(base_url).with_timeout(Duration::from_millis(50));
     let client = DemoApiRestClient::new(cfg).unwrap();
     let err = DemoApi::echo_get(&client, anonymous_ctx(), "slow".to_owned())
         .await
@@ -646,7 +653,7 @@ async fn streaming_uses_idle_timeout_not_unary_timeout() {
     // A tight unary timeout (30ms) must NOT kill a healthy stream whose events
     // are 150ms apart; the generous SSE idle timeout (5s) governs instead.
     let base_url = start_delayed_ticks_server().await;
-    let cfg = ClientConfig::new(base_url)
+    let cfg = plaintext_config(base_url)
         .with_timeout(Duration::from_millis(30))
         .with_stream_idle_timeout(Duration::from_secs(5));
     let client = DemoApiRestClient::new(cfg).unwrap();
@@ -669,7 +676,7 @@ async fn streaming_open_is_bounded_by_open_timeout_not_idle_timeout() {
     // Asserting the returned `Timeout` carries the 50ms deadline pins which of
     // the two applied to the open.
     let base_url = start_silent_open_server().await;
-    let cfg = ClientConfig::new(base_url)
+    let cfg = plaintext_config(base_url)
         .with_timeout(Duration::from_millis(50))
         .with_stream_idle_timeout(Duration::from_secs(5));
     let client = DemoApiRestClient::new(cfg).unwrap();
@@ -690,7 +697,7 @@ async fn streaming_sends_accept_event_stream_header() {
     // PRD §5.6: the generated streaming client must advertise the SSE media
     // type on the connect request.
     let (base_url, state) = start_server().await;
-    let client = DemoApiRestClient::new(ClientConfig::new(base_url)).unwrap();
+    let client = DemoApiRestClient::new(plaintext_config(base_url)).unwrap();
     let stream = DemoApi::ticks(&client, anonymous_ctx(), 1);
     let _items: Vec<_> = stream.collect().await;
     let accept = state.last_accept.lock().unwrap().clone();
@@ -700,7 +707,7 @@ async fn streaming_sends_accept_event_stream_header() {
 #[tokio::test]
 async fn streaming_yields_typed_items() {
     let (base_url, _) = start_server().await;
-    let client = DemoApiRestClient::new(ClientConfig::new(base_url)).unwrap();
+    let client = DemoApiRestClient::new(plaintext_config(base_url)).unwrap();
     let stream = DemoApi::ticks(&client, anonymous_ctx(), 3);
     let items: Vec<Tick> = stream
         .collect::<Vec<_>>()
@@ -727,7 +734,7 @@ async fn streaming_yields_typed_items() {
 #[tokio::test]
 async fn streaming_with_reconnect_config_happy_path() {
     let (base_url, _) = start_server().await;
-    let cfg = ClientConfig::new(base_url).with_stream_reconnect(
+    let cfg = plaintext_config(base_url).with_stream_reconnect(
         toolkit_contract::runtime::config::ReconnectConfig::enabled(3, Duration::from_millis(1)),
     );
     let client = DemoApiRestClient::new(cfg).unwrap();
@@ -752,7 +759,7 @@ async fn streaming_with_reconnect_config_happy_path() {
 #[tokio::test]
 async fn streaming_reconnects_and_sends_last_event_id_after_doneless_disconnect() {
     let (base_url, state) = start_reconnect_server().await;
-    let cfg = ClientConfig::new(base_url).with_stream_reconnect(
+    let cfg = plaintext_config(base_url).with_stream_reconnect(
         toolkit_contract::runtime::config::ReconnectConfig::enabled(3, Duration::from_millis(1)),
     );
     let client = DemoApiRestClient::new(cfg).unwrap();
@@ -790,7 +797,7 @@ async fn reconnect_budget_resets_after_a_healthy_connection() {
 
     // Hold each connection open (40ms) longer than the healthy threshold (20ms).
     let (base_url, state) = start_flapping_server(BLIPS, Duration::from_millis(40)).await;
-    let cfg = ClientConfig::new(base_url).with_stream_reconnect(
+    let cfg = plaintext_config(base_url).with_stream_reconnect(
         toolkit_contract::runtime::config::ReconnectConfig::enabled(
             MAX_ATTEMPTS,
             Duration::from_millis(1),
@@ -825,7 +832,7 @@ async fn reconnect_budget_is_not_reset_by_a_brief_one_item_connection() {
     const MAX_ATTEMPTS: u32 = 2;
 
     let (base_url, state) = start_flapping_server(BLIPS, Duration::ZERO).await;
-    let cfg = ClientConfig::new(base_url).with_stream_reconnect(
+    let cfg = plaintext_config(base_url).with_stream_reconnect(
         // Default 5s min_healthy_uptime: an instant connection never qualifies.
         toolkit_contract::runtime::config::ReconnectConfig::enabled(
             MAX_ATTEMPTS,
@@ -868,7 +875,7 @@ async fn reconnect_absolute_cap_bounds_a_healthy_looking_flapping_peer() {
     // Hold (15ms) exceeds the healthy threshold (5ms), so every connection
     // resets the burst budget — only the absolute cap can end the loop.
     let (base_url, state) = start_flapping_server(BLIPS, Duration::from_millis(15)).await;
-    let cfg = ClientConfig::new(base_url).with_stream_reconnect(
+    let cfg = plaintext_config(base_url).with_stream_reconnect(
         toolkit_contract::runtime::config::ReconnectConfig::enabled(2, Duration::from_millis(1))
             .with_min_healthy_uptime(Duration::from_millis(5))
             .with_max_total_reopens(MAX_TOTAL_REOPENS),
@@ -901,7 +908,7 @@ async fn reconnect_budget_still_caps_a_burst_with_no_progress() {
     let addr = listener.local_addr().unwrap();
     drop(listener); // Nothing is listening: connection refused on every attempt.
 
-    let cfg = ClientConfig::new(format!("http://{addr}")).with_stream_reconnect(
+    let cfg = plaintext_config(format!("http://{addr}")).with_stream_reconnect(
         toolkit_contract::runtime::config::ReconnectConfig::enabled(2, Duration::from_millis(1)),
     );
     let client = DemoApiRestClient::new(cfg).unwrap();
@@ -929,7 +936,7 @@ async fn reconnect_budget_still_caps_a_burst_with_no_progress() {
 #[tokio::test]
 async fn awaited_open_that_fails_yields_err_and_no_stream() {
     let (base_url, _) = start_server().await;
-    let client = DemoApiRestClient::new(ClientConfig::new(base_url)).unwrap();
+    let client = DemoApiRestClient::new(plaintext_config(base_url)).unwrap();
 
     // `409` selects the PositionsNotSet-shaped Problem response.
     let opened = DemoApi::frames(&client, anonymous_ctx(), 409).await;
@@ -953,7 +960,7 @@ async fn awaited_open_that_fails_yields_err_and_no_stream() {
 #[tokio::test]
 async fn awaited_open_that_succeeds_reports_a_failing_item_on_the_stream() {
     let (base_url, _) = start_server().await;
-    let client = DemoApiRestClient::new(ClientConfig::new(base_url)).unwrap();
+    let client = DemoApiRestClient::new(plaintext_config(base_url)).unwrap();
 
     // `since == 1` sends one good frame, then a frame whose `data` is not a
     // valid `Tick`.
@@ -979,7 +986,7 @@ async fn awaited_open_that_succeeds_reports_a_failing_item_on_the_stream() {
 #[tokio::test]
 async fn awaited_open_yields_typed_items() {
     let (base_url, _) = start_server().await;
-    let client = DemoApiRestClient::new(ClientConfig::new(base_url)).unwrap();
+    let client = DemoApiRestClient::new(plaintext_config(base_url)).unwrap();
 
     let items: Vec<Tick> = DemoApi::frames(&client, anonymous_ctx(), 3)
         .await
@@ -1009,7 +1016,7 @@ async fn reconnect_is_derived_from_the_open_shape_not_from_client_config() {
     const MAX_ATTEMPTS: u32 = 2;
 
     let (base_url, ticks_connections, frames_connections) = start_doneless_server().await;
-    let cfg = ClientConfig::new(base_url).with_stream_reconnect(
+    let cfg = plaintext_config(base_url).with_stream_reconnect(
         toolkit_contract::runtime::config::ReconnectConfig::enabled(
             MAX_ATTEMPTS,
             Duration::from_millis(1),
@@ -1053,7 +1060,7 @@ async fn reconnect_is_derived_from_the_open_shape_not_from_client_config() {
 #[tokio::test]
 async fn server_problem_envelope_round_trips() {
     let (base_url, _) = start_server().await;
-    let cfg = ClientConfig::new(base_url).with_retry(RetryConfig::off());
+    let cfg = plaintext_config(base_url).with_retry(RetryConfig::off());
     let client = DemoApiRestClient::new(cfg).unwrap();
     let err = DemoApi::flaky_get(&client, anonymous_ctx(), "xyz".to_owned())
         .await

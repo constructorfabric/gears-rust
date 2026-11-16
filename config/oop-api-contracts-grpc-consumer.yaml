@@ -1,0 +1,61 @@
+# Local multi-process: api-contracts-grpc-consumer OoP gear.
+#
+# Run:
+#   TOOLKIT_DIRECTORY_ENDPOINT=http://127.0.0.1:50051 \
+#     cargo run -p cf-api-contracts-grpc-consumer --features oop_module --bin api-contracts-grpc-consumer-oop \
+#       -- --config config/oop-api-contracts-grpc-consumer.yaml
+#
+# Then:
+#   curl -X POST -H 'Authorization: Bearer oop-e2e-token' -H 'Content-Type: application/json' \
+#     -d '{"amount_cents":1000,"currency":"USD","description":"test"}' \
+#     http://127.0.0.1:9094/api-contracts-grpc-consumer/v1/charge
+#
+# The consumer calls the PaymentApi contract of the SEPARATE api-contracts provider
+# process over gRPC: `#[toolkit::consumes(.., transport = grpc)]` resolves the
+# api_contracts.payment.v1.PaymentApi service through the DirectoryService on each
+# call, and /readyz stays 503 until the provider has published it. No
+# clients.consumes.api-contracts.grpc_endpoint here: that would pin the address and
+# skip the directory.
+
+server:
+  home_dir: "~/.cf-gears-api-contracts-grpc-consumer"
+
+logging:
+  default:
+    console_level: info
+    file: "logs/oop-api-contracts-grpc-consumer.log"
+    file_level: info
+
+oop_http:
+  listen_addr: "127.0.0.1:9094"
+  advertise_uri: "http://127.0.0.1:9094"
+  allow_loopback_advertise: true
+
+database:
+  servers:
+    sqlite:
+      engine: "sqlite"
+      params:
+        busy_timeout: "5000"
+
+gears:
+  api-contracts-grpc-consumer:
+    config: {}
+
+  # Embedded tenant-plane authn stack, over the registry database below.
+  authn-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  static-authn-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+      mode: accept_all
+
+  # Database-backed catalogue for AuthN plugin publication and selection.
+  types-registry:
+    database:
+      server: "sqlite"
+      file: "types_registry.db"
+    config: {}

@@ -174,7 +174,7 @@ fn make_plugin(issuer: &str) -> OidcAuthNPlugin {
         circuit_breaker: Some(circuit_breaker_config()),
         retry_policy: retry_policy(),
         s2s: S2sConfig {
-            discovery_url: reqwest::Url::parse(issuer).expect("bench issuer URL should parse"),
+            discovery_url: url::Url::parse(issuer).expect("bench issuer URL should parse"),
             token_cache_ttl_secs: 300,
             token_cache_max_entries: 10_000,
         },
@@ -183,9 +183,10 @@ fn make_plugin(issuer: &str) -> OidcAuthNPlugin {
         base_jwt_validation_config(),
         exact_issuer_trust(issuer.to_owned()).expect("trust config should build"),
         plugin_config,
-        reqwest::Client::new(),
+        oidc_authn_plugin::infra::idp_http::IdpHttpClient::insecure_for_tests(),
         create_test_metrics(),
     )
+    .expect("test plugin config should be valid")
 }
 
 fn make_request(scopes: Vec<String>) -> ClientCredentialsRequest {
@@ -255,6 +256,8 @@ fn assert_latency_targets(rt: &tokio::runtime::Runtime, plugin: &OidcAuthNPlugin
 
 fn benchmark_s2s_exchange(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    // `HttpClient::build` spawns its buffer worker and needs a runtime context.
+    let _rt_guard = rt.enter();
     let server = MockOidcServer::spawn();
     let issuer = server.issuer();
     let plugin = make_plugin(&issuer);

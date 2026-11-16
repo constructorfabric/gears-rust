@@ -432,7 +432,7 @@ mod no_target {
         #[tokio::test]
         async fn a_target_tenant_an_implementation_cannot_honour_is_refused() {
             let ctx = SecurityContext::anonymous();
-            let scoped = NoTargetTenant.in_tenant(uuid::Uuid::now_v7());
+            let scoped = NoTargetTenant.in_tenant(uuid::Uuid::from_u128(7));
             let error = scoped.revision(&ctx).await.expect_err("refused");
             assert!(
                 format!("{error:?}")

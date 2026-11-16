@@ -218,7 +218,7 @@ documented properties of SQL/PGQ make it unsafe for this ORM:
   manual applies `LABEL person` to both `customers` and `employees`.
 - Label disjunction is part of the pattern language: `(IS label1|label2)` matches either.
 
-Security in this ORM is decided per entity — `E::resolve_property` maps a PEP property to a
+Security in this ORM is decided per entity — `E::SCOPE.resolve_property` maps a PEP property to a
 column of one concrete table. A label-addressed element therefore potentially has *several
 different* security mappings, and the builder would have to pick one. Every pattern element is
 consequently addressed by a Rust entity type, and the emitted `IS` names a label the platform
@@ -235,7 +235,7 @@ resolve drops its whole constraint
 ([cond.rs:98](../../../../libs/toolkit-db/src/secure/cond.rs#L98)), and if every constraint
 drops, the result is `deny_all()` — `WHERE false`
 ([cond.rs:66-83](../../../../libs/toolkit-db/src/secure/cond.rs#L66-L83)). It does **not**
-consult `ScopableEntity::IS_UNRESTRICTED`; that flag short-circuits only the write path
+check `EntityScope::Unrestricted`; that variant short-circuits only the write path
 ([db_ops.rs:68](../../../../libs/toolkit-db/src/secure/db_ops.rs#L68)).
 
 Now consider the platform's existing edge-shaped tables. Every one of them declares no
@@ -328,7 +328,7 @@ duplicate the compiler:
 AccessScope
     |
     v
-ScopableEntity::resolve_property()      <- unchanged: which column means what
+EntityScope::resolve_property()         <- unchanged: which column means what
     |
     v
 column addressing                        <- the only new degree of freedom
@@ -656,7 +656,7 @@ broken code.
 
 - Good, because scope is embedded in every element pattern — isolation is a compile-time
   guarantee, not a review obligation.
-- Good, because it reuses `build_scope_condition` and `ScopableEntity::resolve_property`
+- Good, because it reuses `build_scope_condition` and `EntityScope::resolve_property`
   unchanged in meaning; only column addressing is generalised.
 - Good, because it adds no raw-SQL surface to gear code, and no `Statement`/`ConnectionTrait`
   escape from `toolkit-db`.

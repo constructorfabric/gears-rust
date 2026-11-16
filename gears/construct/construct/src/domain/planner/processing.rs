@@ -13,6 +13,7 @@ use crate::domain::admission::{Admission, AdmissionOutcome};
 use crate::domain::error::DomainError;
 use crate::domain::plan::{Change, Plan};
 use crate::domain::profile::Profile;
+use crate::domain::profile_writes::WRITER_LIMIT;
 use crate::domain::record_intake::{
     DropEvent, DropReason, DropStage, IntakeEvents, ReceivedRecord,
 };
@@ -59,10 +60,30 @@ pub enum Written {
 /// decided before it is called.
 #[async_trait]
 pub trait PlanWriter: Send + Sync {
+    /// [`Self::write_by`] with [`WRITER_LIMIT`] from now, for a write no caller waits on.
+    ///
     /// # Errors
     ///
-    /// When the write cannot run. The record is then dropped.
-    async fn write(&self, ctx: &SecurityContext, plan: &Plan) -> Result<Written, DomainError>;
+    /// The errors of [`Self::write_by`]. The record is then dropped.
+    async fn write(&self, ctx: &SecurityContext, plan: &Plan) -> Result<Written, DomainError> {
+        self.write_by(ctx, plan, Instant::now() + WRITER_LIMIT)
+            .await
+    }
+
+    /// Stores `plan` by `deadline`: no call to the store and no resend starts once it passed, and a call still
+    /// running then is cut.
+    ///
+    /// # Errors
+    ///
+    /// When the write cannot run. [`DomainError::Unavailable`] when `deadline` passed before the plan was sent:
+    /// nothing was written. [`DomainError::WriteUnknown`] when the plan was sent and its result is unknown, also when
+    /// `deadline` passed after the send.
+    async fn write_by(
+        &self,
+        ctx: &SecurityContext,
+        plan: &Plan,
+        deadline: Instant,
+    ) -> Result<Written, DomainError>;
 }
 
 /// The security context and the scope processing runs under for a tenant. Intake hands off no context: the
@@ -178,7 +199,7 @@ impl Changes {
 pub enum NothingStored {
     /// The message held nothing to store, or every value it held was blocked.
     NoChange,
-    /// The deadline passed before the write started.
+    /// The deadline of the steps before the write passed, and nothing is stored.
     Timeout,
     /// Every step touched a fact under an open review request.
     UnderReview,
@@ -196,6 +217,16 @@ impl NothingStored {
             Self::Dropped(reason) => reason.name(),
         }
     }
+}
+
+/// When a manage-facts call must have done its steps, so the caller hears how the call ended.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManageDeadlines {
+    /// The end of the steps before the write.
+    pub before_write: Instant,
+    /// The end of the write.
+    pub answer: Instant,
 }
 
 /// What a manage-facts call did.
@@ -341,13 +372,15 @@ impl Processing {
     }
 
     /// Takes what a subject told an agent through the planner, the checks, Admission and the writer, under the
-    /// caller's own context and scope. The deadline cuts off only the steps before the write: a write that started is
-    /// awaited, so the answer never says nothing changed while the write lands. A conflict plans again on a new read
-    /// while time is left, at most `max_reruns` times.
+    /// processing context and scope of the message's tenant. The steps before the write end by
+    /// `deadlines.before_write`, and nothing is stored when they run out. The write ends by `deadlines.answer`; one it
+    /// cuts after the plan was sent answers unavailable with its result unknown, never that nothing changed. A conflict
+    /// plans again on a new read while time is left, at most `max_reruns` times.
     ///
     /// # Errors
     ///
-    /// When the profile, the subject's settings, the tenant's rules or the write cannot be reached.
+    /// When the profile, the subject's settings, the tenant's rules or the write cannot be reached, and when the
+    /// write runs out of time.
     ///
     /// @cpt-dod:cpt-cf-construct-dod-planner-manage:p1
     pub async fn manage(
@@ -355,17 +388,24 @@ impl Processing {
         ctx: &SecurityContext,
         scope: &AccessScope,
         message: &AgentMessage,
-        deadline: Instant,
+        deadlines: ManageDeadlines,
     ) -> Result<Managed, DomainError> {
         for _ in 0..=self.max_reruns {
-            let Ok(prepared) = timeout_at(deadline, self.prepare(ctx, scope, message)).await else {
+            let Ok(prepared) =
+                timeout_at(deadlines.before_write, self.prepare(ctx, scope, message)).await
+            else {
                 return Ok(nothing_stored(message, NothingStored::Timeout));
             };
             let plan = match prepared? {
                 Prepared::Write(plan) => plan,
                 Prepared::Nothing(nothing) => return Ok(nothing_stored(message, nothing)),
             };
-            match self.ports.writer.write(ctx, &plan).await? {
+            match self
+                .ports
+                .writer
+                .write_by(ctx, &plan, deadlines.answer)
+                .await?
+            {
                 Written::Stored => return Ok(Managed::Stored(Changes::of(&plan))),
                 Written::Conflict => {}
             }

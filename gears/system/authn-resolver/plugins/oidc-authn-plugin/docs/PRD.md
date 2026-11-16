@@ -528,7 +528,7 @@ Bearer tokens and client secrets MUST never be logged, persisted, or included in
 | `toolkit` | Plugin framework, GTS integration, ClientHub registration | `p1` |
 | OIDC Identity Provider | External IdP that issues tokens, publishes JWKS, exposes discovery and token endpoints | `p1` |
 | `jsonwebtoken` crate | JWT signature verification library (MIT) | `p1` |
-| `reqwest` crate | HTTP client for IdP communication (MIT/Apache-2.0) | `p1` |
+| `toolkit-http` / `toolkit-resilience` | HTTP client and circuit breaker for IdP communication | `p1` |
 
 ## 11. Assumptions
 

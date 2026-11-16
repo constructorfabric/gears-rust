@@ -281,6 +281,33 @@ fn confinement_requires_every_path_to_name_only_the_subject_resource_tenant() {
         ]),
         own
     ));
+    // A path with an empty ID set serves no rows: it neither breaks confinement of a live own
+    // path nor confines a scope with no live path.
+    let empty_foreign = path(vec![
+        eq(properties::RESOURCE_TENANT_ID, u(11)),
+        ScopeFilter::in_uuids(properties::ID, vec![]),
+    ]);
+    assert!(confined_to_subject(
+        &AccessScope::from_constraints(vec![
+            empty_foreign.clone(),
+            path(vec![eq(properties::RESOURCE_TENANT_ID, own)]),
+        ]),
+        own
+    ));
+    assert!(!confined_to_subject(
+        &AccessScope::from_constraints(vec![path(vec![
+            eq(properties::RESOURCE_TENANT_ID, own),
+            ScopeFilter::in_uuids(properties::ID, vec![]),
+        ])]),
+        own
+    ));
+    assert!(!confined_to_subject(
+        &AccessScope::from_constraints(vec![
+            empty_foreign,
+            path(vec![eq(properties::SELLER_TENANT_ID, own)]),
+        ]),
+        own
+    ));
     // Own tenant AND a finite ID restriction is still confined (the ID only narrows).
     assert!(confined_to_subject(
         &AccessScope::single(path(vec![

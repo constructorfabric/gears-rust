@@ -186,6 +186,19 @@ pub fn validate_grpc_binding(
     }
 }
 
+/// Receives the Rust types a gRPC projection puts on the wire.
+///
+/// `#[toolkit::grpc_contract]` generates `<base>_grpc_schemas(&mut V)`, which
+/// calls [`visit`](Self::visit) once per request and response type of the
+/// projection. `toolkit-contract-protogen` implements it for every
+/// `JsonSchema` type to collect the schemas a `.proto` is generated from, so
+/// an SDK never lists its model types by hand. The bound lives on the
+/// generated function, so an SDK that never calls it needs no `schemars`.
+pub trait VisitType<T: ?Sized> {
+    /// Record `T`.
+    fn visit(&mut self);
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[allow(clippy::unwrap_used)]

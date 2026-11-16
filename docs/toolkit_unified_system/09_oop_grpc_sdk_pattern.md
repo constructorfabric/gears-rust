@@ -6,7 +6,8 @@ ToolKit supports running gears as separate processes with gRPC-based inter-proce
 
 - **Rule**: For OoP gears, use the SDK pattern with a single `*-sdk` crate containing API trait, types, gRPC client, and wiring helpers.
 - **Rule**: For gRPC: server implementations live in the gear itself; the SDK crate provides only the client.
-- **Rule**: For gRPC clients: always use `toolkit_transport_grpc::client` utilities (`connect_with_stack`, `connect_with_retry`).
+- **Rule**: Prefer the generated client: declare the contract with `#[toolkit::grpc_contract]` and consume it with `#[toolkit::consumes(..., transport = grpc)]` (see [Generated gRPC consumer](#generated-grpc-consumer)).
+- **Rule**: For hand-written gRPC clients: always use `toolkit_transport_grpc::client` utilities (`connect_with_stack`, `connect_with_retry`).
 - **Rule**: Use `CancellationToken` for coordinated shutdown across the entire process tree.
 
 ## RuntimeKind
@@ -138,6 +139,117 @@ gears/my_gear/
 - The `-sdk` crate contains everything consumers need: API trait, types, gRPC client, and wiring helpers
 - Server implementations are owned by the gear itself, not the SDK
 - Consumers only need one dependency: `my_gear-sdk`
+
+## Generated gRPC consumer
+
+When the contract is declared with `#[toolkit::contract]` and projected with `#[toolkit::grpc_contract]`
+(ADR `cpt-cf-binding-adr-grpc-projection`), the SDK gets a generated client and the consumer needs no
+wiring code. The hand-written pattern in the rest of this page remains the alternative for clients the
+macros cannot express (client or bidirectional streaming, DNS-derived endpoints, a channel shared by
+several services, RPCs without a deadline).
+
+### SDK
+
+The `grpc_contract` projection must be named `<Contract>Grpc`. Built with the `grpc-client` feature, it
+generates, among others:
+
+- `<Contract>GrpcClient` — the client for one endpoint (`connect`, `connect_lazy`);
+- `<Contract>GrpcResolvingClient` — resolves the provider from the directory on every call;
+- `<BASE>_GRPC_SERVICE` — the fully qualified service name (`package.Service`), equal to tonic's
+  `NamedService::NAME` for the server.
+
+`#[toolkit::consumes]` looks for the resolving client next to the base trait, so the SDK re-exports both
+at the same level:
+
+```rust
+// payments-sdk/src/lib.rs
+pub use contract::PaymentApi;
+
+#[cfg(feature = "grpc-client")]
+pub use grpc::{PAYMENT_API_GRPC_SERVICE, PaymentApiGrpc, PaymentApiGrpcClient, PaymentApiGrpcResolvingClient};
+```
+
+The committed `.proto` is generated from the contract; see `toolkit_contract_protogen::check_proto` for
+the drift test and `cargo xtask proto-regen` for regeneration.
+
+### Provider
+
+The server stays hand-written. The provider gear declares the `grpc` capability and registers the server
+under the generated name, so grpc-hub publishes it in the directory under that name:
+
+```rust
+#[async_trait]
+impl GrpcServiceCapability for PaymentsGear {
+    async fn get_grpc_services(&self, _ctx: &GearCtx) -> anyhow::Result<Vec<RegisterGrpcServiceFn>> {
+        let svc = Arc::clone(&self.service);
+        Ok(vec![RegisterGrpcServiceFn {
+            service_name: payments_sdk::PAYMENT_API_GRPC_SERVICE,
+            register: Box::new(move |routes| {
+                routes.add_service(PaymentApiGrpcService::new(Arc::clone(&svc)).into_server()); // hand-written
+            }),
+        }])
+    }
+}
+```
+
+The provider's process must run grpc-hub with a `listen_addr` and an `advertise_addr` the directory can
+register; otherwise the consumer's readiness probe never finds the service and logs a hint after about
+ten rounds.
+
+For a tenant-plane contract (methods take `SecurityContext`):
+
+- the client sends only the caller's bearer. A hub with `internal_auth` must set
+  `internal_auth_enforcement: permissive`, or it refuses every call for the missing internal token;
+- `permissive` applies to every service on the hub, and a process has one hub: a call without an
+  internal token reaches platform-plane services too (a present but invalid token is still refused).
+  Serve only tenant-plane services from a process whose hub is `permissive`, and keep platform-plane
+  services (cluster, the directory) in processes whose hub is `required`;
+- grpc-hub does not authenticate the bearer. The server does it itself, for example with the in-process
+  `AuthNResolverClient` wrapped in `AuthNResolverBearerAuthenticator`.
+
+```yaml
+gears:
+  grpc-hub:
+    config:
+      listen_addr: "0.0.0.0:50051"
+      advertise_addr: "payments:50051"
+      internal_auth: { provider: kube, audiences: ["toolkit-internal"] }
+      internal_auth_enforcement: permissive
+```
+
+The `api-contracts` example (`api-contracts/src/grpc_gear.rs`, `config/oop-api-contracts.yaml`) runs this
+setup in the OoP E2E suite.
+
+### Consumer
+
+```rust
+#[toolkit::gear(name = "orders")]
+#[toolkit::consumes(contract = payments_sdk::PaymentApi, from = "payments", transport = grpc)]
+pub struct OrdersGear { /* ... */ }
+```
+
+The consumer depends on `payments-sdk` with `grpc-client`. At startup the runtime registers
+`PaymentApiGrpcResolvingClient` as `Arc<dyn PaymentApi>` unless a local implementation is in the hub, and
+`/readyz` stays 503 until the directory resolves `PAYMENT_API_GRPC_SERVICE`. The directory resolves by
+service name; `from` names the provider for logs, errors and readiness.
+
+Configuration goes under the consumer's `clients.consumes.<dep>`, a section next to the gear's `config`:
+
+```yaml
+gears:
+  orders:
+    clients:
+      consumes:
+        payments:
+          timeout: "5s"                              # per-call deadline (client side; not sent as grpc-timeout)
+          retry: { max_attempts: 3 }                 # for #[retryable] methods
+          circuit_breaker: { open_for: "30s" }       # on by default; { enabled: false } turns it off
+          # grpc_endpoint: "http://payments:50051"  # static address instead of the directory
+```
+
+`endpoint` also works for a gRPC-only consumer; a gear that consumes the same dep over both REST and gRPC
+must set `grpc_endpoint` for the gRPC client. REST pool and concurrency knobs have no effect on a gRPC
+client. See ADR `cpt-cf-binding-adr-consumer-wiring` and `cpt-cf-binding-adr-client-circuit-breaker`.
 
 ## SDK Crate Structure
 
@@ -434,6 +546,7 @@ async fn test_grpc_client() {
 
 ## Quick checklist
 
+- [ ] Prefer `#[toolkit::grpc_contract]` + `#[toolkit::consumes(..., transport = grpc)]`; write the client by hand only when the macros cannot express it.
 - [ ] Create `*-sdk` crate with API trait, types, gRPC client, and wiring helpers.
 - [ ] Define `.proto` file and generate gRPC stubs in SDK.
 - [ ] Implement gRPC server in gear crate.

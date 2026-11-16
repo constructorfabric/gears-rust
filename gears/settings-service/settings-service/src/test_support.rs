@@ -1681,6 +1681,11 @@ impl RestHarness {
         .await
     }
 
+    /// The same surface with a policy decision point supplied by the test.
+    pub async fn with_pdp(pdp: Arc<dyn authz_resolver_sdk::AuthZResolverApi>) -> Self {
+        Self::build(pdp, Arc::new(FixedStepUp::verified()), nobody()).await
+    }
+
     /// The same surface with a directory the test scripts, for the history
     /// tests that read actor names.
     pub async fn with_directory(

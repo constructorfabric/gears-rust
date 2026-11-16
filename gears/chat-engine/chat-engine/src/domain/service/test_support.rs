@@ -391,7 +391,7 @@ impl AuthZResolverApi for AllowUnconstrainedAuthZResolver {
 }
 
 /// PDP that explicitly denies every request (`decision=false`) →
-/// `EnforcerError::Denied` → `ChatEngineError::Forbidden`.
+/// `EnforcerError::AccessDenied` → `ChatEngineError::Forbidden`.
 //
 // @cpt-cf-chat-engine-design-auth-model
 pub struct DenyAllAuthZResolver;

@@ -28,6 +28,7 @@ pub mod sensitive_data;
 pub mod settings_scope;
 pub mod subject_access;
 pub mod subject_control;
+pub(crate) mod subject_reach;
 pub mod subject_settings;
 
 #[cfg(test)]

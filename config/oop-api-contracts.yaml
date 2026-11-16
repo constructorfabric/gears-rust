@@ -2,11 +2,13 @@
 #
 # Run:
 #   TOOLKIT_DIRECTORY_ENDPOINT=http://127.0.0.1:50051 \
-#     cargo run -p cf-api-contracts --features oop_module --bin api-contracts-oop -- --config config/oop-api-contracts.yaml
+#     cargo run -p cf-api-contracts --features oop_module,grpc-server --bin api-contracts-oop -- --config config/oop-api-contracts.yaml
 #
 # The process authenticates the bearer locally (embedded authn stack) and serves the
-# PaymentApi REST contract at /api-contracts/v1/... . Consumer processes discover this
-# endpoint via the DirectoryService and call it over REST (OoP gear-to-gear).
+# PaymentApi contract twice: over REST at /api-contracts/v1/... (the oop_http listener)
+# and over gRPC as api_contracts.payment.v1.PaymentApi (grpc-hub below). Consumer
+# processes discover both through the DirectoryService: api-contracts-consumer calls
+# it over REST, api-contracts-grpc-consumer over gRPC.
 
 server:
   home_dir: "~/.cf-gears-api-contracts"
@@ -33,16 +35,61 @@ gears:
   api-contracts:
     config: {}
 
+  # Serves PaymentApi over gRPC (binary built with the `grpc-server` feature).
+  api-contracts-grpc:
+    config: {}
+
+  # Hosts the PaymentApi gRPC service and publishes it in flight-control's
+  # directory. A fixed loopback port, so a restarted provider comes back on the
+  # same address.
+  #
+  # internal_auth is set as it must be off loopback, with `permissive`
+  # enforcement: PaymentApi is a tenant-plane contract, and a tenant-plane call
+  # carries only the user's bearer, no internal token. `required` (the default)
+  # would refuse every PaymentApi call. The service authenticates the bearer
+  # itself (see api-contracts/src/grpc_gear.rs).
+  grpc-hub:
+    config:
+      listen_addr: "127.0.0.1:9192"
+      internal_auth:
+        provider: shared_secret
+        secret: "oop-e2e-internal-token"
+      internal_auth_enforcement: permissive
+
   # Embedded tenant-plane authn stack, over the registry database below.
   authn-resolver:
     config:
       vendor: "constructorfabric"
 
+  # Static tokens, not accept_all: the provider re-authenticates the bearer a
+  # consumer forwards, and two tenants let the E2E suite check that the tenant
+  # survives the hop (REST and gRPC alike). The edge and the consumers accept
+  # any token, so a token missing here fails only at the provider, with 401.
+  # testing/e2e/suites/oop uses these three tokens.
   static-authn-plugin:
     config:
       vendor: "constructorfabric"
       priority: 100
-      mode: accept_all
+      mode: static_tokens
+      tokens:
+        - token: "oop-e2e-token"
+          identity:
+            subject_id: "11111111-6a88-4768-9dfc-6bcd5187d9ed"
+            subject_tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+            subject_type: "gts.cf.core.security.subject_user.v1~"
+            token_scopes: ["*"]
+        - token: "oop-e2e-token-tenant-a"
+          identity:
+            subject_id: "aaaaaaaa-0000-4000-8000-000000000001"
+            subject_tenant_id: "aaaaaaaa-0000-4000-8000-00000000000a"
+            subject_type: "gts.cf.core.security.subject_user.v1~"
+            token_scopes: ["*"]
+        - token: "oop-e2e-token-tenant-b"
+          identity:
+            subject_id: "bbbbbbbb-0000-4000-8000-000000000001"
+            subject_tenant_id: "bbbbbbbb-0000-4000-8000-00000000000b"
+            subject_type: "gts.cf.core.security.subject_user.v1~"
+            token_scopes: ["*"]
 
   # Database-backed catalogue for AuthN plugin publication and selection.
   types-registry:

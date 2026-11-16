@@ -22,9 +22,9 @@ use toolkit_odata::{Page as OdataPage, SortDir};
 use uuid::Uuid;
 
 use crate::infra::projections::{
-    EdgeHop, EdgePayload, NodeIdent, NodeTyped, TypeName, TypeTraits, edge_hop_columns,
-    edge_payload_columns, node_ident_columns, node_typed_columns, type_name_columns,
-    type_traits_columns,
+    EdgeHop, EdgePayload, NodeIdent, NodeTyped, NodeViewRow, TypeName, TypeTraits,
+    edge_hop_columns, edge_payload_columns, node_ident_columns, node_typed_columns,
+    node_view_columns, type_name_columns, type_traits_columns,
 };
 use crate::infra::storage::entity::{edge, graph_meta, gts_type, node};
 use crate::infra::storage::odata_mapper::NodeODataMapper;
@@ -36,7 +36,18 @@ use crate::infra::store::{PgGraphStore, map_db_error, map_scope_err};
 /// a caller who named a field that does not exist sends them the wrong way,
 /// and the two carry different canonical categories. Only the page-size
 /// variant is genuinely `out_of_range`.
-fn map_odata_err(error: toolkit_odata::Error) -> GraphStoreError {
+///
+/// Nor is a failed server a malformed query (gears-rust #5789): the pager
+/// runs the listing's statements, so a database that did not answer comes
+/// back through this binding as `Db`, and answering it as `InvalidQuery` told
+/// the caller to fix a request that was fine and not to retry it. It is
+/// `Unavailable`, worded and logged as every other database failure of the
+/// store (`map_db_error`), so the driver's text stays in the log. It is not
+/// yet classified by SQLSTATE as the store's other database errors are
+/// (`map_db_err`): the pager reports it as text, without the code
+/// (gears-rust #5914). The match names every variant, so a new one is
+/// classified where it is added rather than defaulting to the caller's fault.
+fn map_odata_err(error: &toolkit_odata::Error) -> GraphStoreError {
     use toolkit_odata::Error as E;
     match error {
         E::InvalidLimit => GraphStoreError::LimitExceeded {
@@ -48,9 +59,28 @@ fn map_odata_err(error: toolkit_odata::Error) -> GraphStoreError {
         E::InvalidFilter(_) | E::InvalidOrderByField(_) => GraphStoreError::InvalidQuery {
             what: format!("{error}; the projection accepts {}", declared_fields()),
         },
-        other => GraphStoreError::InvalidQuery {
-            what: other.to_string(),
+        E::OrderMismatch
+        | E::FilterMismatch
+        | E::InvalidCursor
+        | E::OrderWithCursor
+        | E::CursorInvalidBase64
+        | E::CursorInvalidJson
+        | E::CursorInvalidVersion
+        | E::CursorInvalidKeys
+        | E::CursorInvalidFields
+        | E::CursorInvalidDirection => GraphStoreError::InvalidQuery {
+            what: error.to_string(),
         },
+        E::Db(_) => {
+            tracing::warn!(
+                error = %crate::domain::diagnostics::logged(error),
+                "the database did not answer a listing"
+            );
+            GraphStoreError::Unavailable {
+                reason: "the database did not answer; the reason is in the gear's log".to_owned(),
+            }
+        }
+        E::ParsingUnavailable(_) => GraphStoreError::Internal(error.to_string()),
     }
 }
 
@@ -300,6 +330,7 @@ async fn observed_revision(
 
 fn to_view(
     model: node::Model,
+    has_embedding: bool,
     type_id: String,
     adjacency: Vec<AdjacencyEntry>,
     truncated: bool,
@@ -311,7 +342,7 @@ fn to_view(
         type_id,
         name: (!model.name.is_empty()).then_some(model.name),
         payload: Some(model.payload),
-        has_embedding: model.embedding.is_some(),
+        has_embedding,
         labels: Vec::new(),
         adjacency,
         adjacency_truncated: truncated,
@@ -326,14 +357,23 @@ pub async fn get_node(
     adjacency_limit: u32,
 ) -> Result<NodeView, GraphStoreError> {
     let conn = store.db().conn().map_err(|error| map_db_error(&error))?;
-    let model = node::Entity::find()
+    let NodeViewRow {
+        model,
+        has_embedding,
+    } = node::Entity::find()
         .secure()
         .scope_with(ctx.scope)
         .filter(Condition::all().add(node::Column::NodeKey.eq(key.clone())))
         .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
-        .one(&conn)
+        .project_all(&conn, |query| {
+            node_view_columns(query)
+                .limit(1)
+                .into_model::<NodeViewRow>()
+        })
         .await
         .map_err(map_scope_err)?
+        .into_iter()
+        .next()
         .ok_or(GraphStoreError::NotFound)?;
 
     // Bidirectional adjacency, one extra row so truncation is observed rather
@@ -436,7 +476,14 @@ pub async fn get_node(
         .cloned()
         .unwrap_or_else(unknown);
     let revision = observed_revision(ctx, &conn).await?;
-    Ok(to_view(model, type_id, adjacency, truncated, revision))
+    Ok(to_view(
+        model,
+        has_embedding,
+        type_id,
+        adjacency,
+        truncated,
+        revision,
+    ))
 }
 
 /// The gear-assigned envelope of an edge row (`fr-audit-envelope`).
@@ -718,16 +765,18 @@ pub async fn hydrate_nodes(
         return Ok(Vec::new());
     }
     let conn = store.db().conn().map_err(|error| map_db_error(&error))?;
-    let models = node::Entity::find()
+    let rows = node::Entity::find()
         .secure()
         .scope_with(ctx.scope)
         .filter(Condition::all().add(node::Column::Id.is_in(ids.to_vec())))
         .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
-        .all(&conn)
+        .project_all(&conn, |query| {
+            node_view_columns(query).into_model::<NodeViewRow>()
+        })
         .await
         .map_err(map_scope_err)?;
 
-    let mut type_ids: Vec<i32> = models.iter().map(|m| m.gts_node_type_id).collect();
+    let mut type_ids: Vec<i32> = rows.iter().map(|r| r.model.gts_node_type_id).collect();
     type_ids.sort_unstable();
     type_ids.dedup();
     let names = type_names(ctx, &conn, &type_ids).await?;
@@ -735,15 +784,26 @@ pub async fn hydrate_nodes(
     // Preserve the caller's order — the walk's order is deterministic and
     // callers rely on seeds coming first.
     let revision = observed_revision(ctx, &conn).await?;
-    let mut by_id: BTreeMap<i64, node::Model> = models.into_iter().map(|m| (m.id, m)).collect();
+    let mut by_id: BTreeMap<i64, NodeViewRow> = rows.into_iter().map(|r| (r.model.id, r)).collect();
     let mut views = Vec::new();
     for id in ids {
-        if let Some(model) = by_id.remove(id) {
+        if let Some(NodeViewRow {
+            model,
+            has_embedding,
+        }) = by_id.remove(id)
+        {
             let type_id = names
                 .get(&model.gts_node_type_id)
                 .cloned()
                 .unwrap_or_default();
-            views.push(to_view(model, type_id, Vec::new(), false, revision));
+            views.push(to_view(
+                model,
+                has_embedding,
+                type_id,
+                Vec::new(),
+                false,
+                revision,
+            ));
         }
     }
     Ok(views)
@@ -881,7 +941,7 @@ pub async fn project_table(
         |model| model,
     )
     .await
-    .map_err(map_odata_err)?;
+    .map_err(|error| map_odata_err(&error))?;
 
     rows_to_page(ctx, &conn, page.items, page.page_info).await
 }
@@ -1078,7 +1138,7 @@ async fn rows_to_page(
 
 #[cfg(test)]
 mod tests {
-    use super::{count_bound, node, stored_vector_columns};
+    use super::{count_bound, map_odata_err, node, stored_vector_columns};
 
     /// A count is bounded in the database: the statement it counts over
     /// carries `LIMIT max + 1`. The answer would be the same without it --
@@ -1128,5 +1188,27 @@ mod tests {
                 "embedding state needs `{needed}`: {sql}"
             );
         }
+    }
+
+    /// The server's failures are not the caller's (gears-rust #5789): a
+    /// database error is `Unavailable` and carries none of the driver's text,
+    /// while a bad cursor stays an invalid query.
+    #[test]
+    fn a_database_error_in_a_listing_is_unavailable() {
+        use graph_storage_sdk::plugin_api::GraphStoreError as G;
+        use toolkit_odata::Error as E;
+
+        match map_odata_err(&E::Db("connection reset by peer".to_owned())) {
+            G::Unavailable { reason } => assert!(!reason.contains("reset"), "{reason}"),
+            other => panic!("a database error is unavailable: {other:?}"),
+        }
+        assert!(matches!(
+            map_odata_err(&E::ParsingUnavailable("x")),
+            G::Internal(_)
+        ));
+        assert!(matches!(
+            map_odata_err(&E::InvalidCursor),
+            G::InvalidQuery { .. }
+        ));
     }
 }

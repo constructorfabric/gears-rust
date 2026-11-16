@@ -631,3 +631,71 @@ async fn hierarchy_failure_leaves_set_and_clear_unchanged() {
     assert_eq!(cleared.body["effective"]["access"], "overridable");
     assert!(cleared.body.get("stored").is_none());
 }
+
+/// Clearing removes the only stored identity in this response, so it must not
+/// consult the independent entitlement for disclosing that identity.
+#[tokio::test]
+async fn clearing_a_restriction_does_not_probe_pii_entitlement() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RecordingPdp {
+        pii_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl authz_resolver_sdk::AuthZResolverApi for RecordingPdp {
+        async fn evaluate(
+            &self,
+            _ctx: toolkit_security::PlatformSecurityContext,
+            request: authz_resolver_sdk::models::EvaluationRequest,
+        ) -> Result<
+            authz_resolver_sdk::models::EvaluationResponse,
+            toolkit::api::canonical_prelude::CanonicalError,
+        > {
+            if request.action.name == "read_unmasked" {
+                self.pii_calls.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(authz_resolver_sdk::models::EvaluationResponse {
+                decision: true,
+                context: authz_resolver_sdk::models::EvaluationResponseContext::default(),
+            })
+        }
+    }
+
+    let pdp = Arc::new(RecordingPdp {
+        pii_calls: AtomicUsize::new(0),
+    });
+    let h = RestHarness::with_pdp(pdp.clone()).await;
+    h.inner.declare("proxy", "cascading", json!(true)).await;
+    let uri = format!("{}?tenant={}", permissions(&h, "proxy"), h.inner.tree.a);
+    let set = h
+        .send(
+            "PUT",
+            &uri,
+            Some(json!({ "access": "read_only" })),
+            Some("absent"),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(set.status, 200, "{}", set.body);
+    assert!(set.body.get("stored").is_some());
+    assert_eq!(pdp.pii_calls.swap(0, Ordering::Relaxed), 1);
+
+    let cleared = h
+        .send("DELETE", &uri, None, set.etag.as_deref(), h.inner.tree.root)
+        .await;
+    assert_eq!(cleared.status, 200, "{}", cleared.body);
+    assert_eq!(cleared.body["effective"]["access"], "overridable");
+    assert_eq!(cleared.etag.as_deref(), Some("\"absent\""));
+    assert!(cleared.body.get("stored").is_none(), "{}", cleared.body);
+    assert_eq!(
+        pdp.pii_calls.load(Ordering::Relaxed),
+        0,
+        "a cleared response has no stored setter to unmask"
+    );
+
+    let (read_back, tag) = read(&h, "proxy", h.inner.tree.a, h.inner.tree.root).await;
+    assert!(read_back.get("stored").is_none(), "{read_back}");
+    assert_eq!(tag, "\"absent\"");
+}

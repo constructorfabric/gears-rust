@@ -98,7 +98,7 @@ work added two findings that code comments reference by letter rather than by
 
 | ID | Kind | Where | Status |
 |----|------|-------|--------|
-| (a) | redundant-io | `group_repo.rs` `find_model_by_id_scoped` — the membership tenant gate needed a scoped single-row read; reusing the unscoped `find_model_by_id` plus a separate scope check would have cost an extra statement per call (`repo.rs`, `membership_service.rs`) | Fixed on the source branch; not in this one — it serves the membership tenant gate |
+| (a) | redundant-io | `group_repo.rs` `find_model_by_id_scoped` — the membership tenant gate needed a scoped single-row read; reusing the unscoped `find_model_by_id` plus a separate scope check would have cost an extra statement per call (`repo.rs`, `membership_service.rs`) | Fixed: `find_model_by_id_scoped` backs the membership tenant gate |
 | (b) | n-plus-one | `type_repo.rs` — one `resolve_id` per value while resolving a type filter, and one violation lookup per candidate parent in the hierarchy safety check (slope 2.0) | Fixed: `collect_type_filter_paths` + a single `WHERE schema_id IN (...)`, and `find_groups_violating_removed_parents` |
 
 | (c) | n-plus-one | `group_service.rs` `classify_children_for_delete` — the non-force delete rejection resolved each blocking child's type path with its own `SELECT`, memoized per `gts_type_id`, so the cost grew with the number of *distinct* child types. Landed after this report, in the unfinished `name blocking children on delete` commit | Fixed on the source branch; not in this one — the code it fixes arrived with an unrelated feature |

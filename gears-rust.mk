@@ -70,6 +70,27 @@ OPENAPI_URL ?= http://127.0.0.1:$(OPENAPI_PORT)/openapi.json
 OPENAPI_READY_URL ?= $(patsubst %/openapi.json,%/readyz,$(OPENAPI_URL))
 OPENAPI_OUT ?= docs/api/api.json
 OPENAPI_CONFIG ?= config/e2e-local.yaml
+# Gears that keep their data in graph storage need PostgreSQL 16+ with pgvector to start.
+# `make openapi GEAR=<one of them>` runs a throwaway pgvector container on a free local port
+# and points the `pg_graph` server of OPENAPI_CONFIG at it (host, port, user and password), so no
+# config edit is needed. The container's database is `graph_storage`, the one the config names.
+# An EXIT trap removes the container however the recipe ends, including Ctrl-C under dash.
+OPENAPI_PG_GEARS ?= graph-storage construct
+OPENAPI_PG_IMAGE ?= pgvector/pgvector:0.8.7-pg18
+OPENAPI_GEAR_NEEDS_PG := $(filter $(GEAR),$(OPENAPI_PG_GEARS))
+OPENAPI_PG_UP = command -v docker >/dev/null || { echo "docker is required: GEAR=$(GEAR) needs PostgreSQL with pgvector"; exit 1; }; \
+	PG_CID=$$(docker run -d --rm -e POSTGRES_PASSWORD=graph -e POSTGRES_DB=graph_storage -p 127.0.0.1::5432 $(OPENAPI_PG_IMAGE)) && \
+	trap 'docker rm -f "$$PG_CID" >/dev/null 2>&1' EXIT && trap 'exit 130' INT TERM && \
+	echo "Started $(OPENAPI_PG_IMAGE) for GEAR=$(GEAR)" && \
+	for i in $$(seq 1 60); do \
+		docker exec $$PG_CID pg_isready -q -h 127.0.0.1 -U postgres -d graph_storage && break; \
+		sleep 1; \
+	done && \
+	docker exec $$PG_CID pg_isready -q -h 127.0.0.1 -U postgres -d graph_storage || { echo "PostgreSQL did not become ready"; exit 1; }; \
+	export APP__DATABASE__SERVERS__PG_GRAPH__HOST=127.0.0.1 \
+		APP__DATABASE__SERVERS__PG_GRAPH__PORT=$$(docker port $$PG_CID 5432/tcp | head -n1 | sed 's/.*://') \
+		APP__DATABASE__SERVERS__PG_GRAPH__USER=postgres \
+		APP__DATABASE__SERVERS__PG_GRAPH__PASSWORD=graph
 
 EMPTY :=
 SPACE := $(EMPTY) $(EMPTY)
@@ -352,17 +373,17 @@ ifeq ($(GEAR_HAS_SERVER_FEATURE),)
 else
 	@command -v curl >/dev/null || (echo "curl is required to generate OpenAPI spec" && exit 1)
 	@echo "Starting cf-gears-example-server to generate OpenAPI spec..."
-	@mkdir -p $$(dirname "$(if $(GEAR),$(GEAR_OPENAPI_TMP),$(OPENAPI_OUT))") && \
+	@$(if $(OPENAPI_GEAR_NEEDS_PG),$(OPENAPI_PG_UP) && )( \
+	mkdir -p $$(dirname "$(GEAR_OPENAPI_TMP)") && \
 	$(call start_server_and_wait,$(EXAMPLE_SERVER_DEBUG_BINARY) --config $(OPENAPI_CONFIG) --port $(OPENAPI_PORT),$(OPENAPI_READY_URL),300) && \
 	echo "Fetching OpenAPI spec..." && \
-	curl -fsS "$(OPENAPI_URL)" -o "$(if $(GEAR),$(GEAR_OPENAPI_TMP),$(OPENAPI_OUT))" && \
-	if [ -n "$(GEAR)" ]; then \
-		echo "Merging $(GEAR) OpenAPI into $(OPENAPI_OUT)..." && \
-		$(PYTHON) tools/scripts/merge_openapi_json.py "$(OPENAPI_OUT)" "$(GEAR_OPENAPI_TMP)"; \
-	fi && \
+	curl -fsS "$(OPENAPI_URL)" -o "$(GEAR_OPENAPI_TMP)" && \
+	echo "Merging $(GEAR) OpenAPI into $(OPENAPI_OUT)..." && \
+	$(PYTHON) tools/scripts/merge_openapi_json.py "$(OPENAPI_OUT)" "$(GEAR_OPENAPI_TMP)" && \
 	echo "Sorting OpenAPI JSON for deterministic ordering..." && \
 	$(PYTHON) tools/scripts/sort_openapi_json.py "$(OPENAPI_OUT)" && \
-	echo "OpenAPI spec saved to $(OPENAPI_OUT)"
+	echo "OpenAPI spec saved to $(OPENAPI_OUT)" \
+	)
 endif
 else
 	@command -v curl >/dev/null || (echo "curl is required to generate OpenAPI spec" && exit 1)
@@ -837,8 +858,7 @@ test-fips: install-tools
 	$(call print_target_banner)
 	cargo test -p cf-gears-toolkit-security --features fips,jwt,internal-auth-cache --lib --test jwt_no_backend_fallback
 	cargo test -p cf-gears-toolkit-auth --features toolkit-security/fips --lib providers::jwks
-	cargo test -p cf-gears-toolkit-contract --features fips --lib runtime::config
-	cargo test -p cf-gears-toolkit-contract --features fips --test wiring_config
+	cargo test -p cf-gears-toolkit-contract --features fips,rest-client,rest-server,grpc-client,otel,canonical-errors
 	cargo nextest run -p cf-gears-toolkit -p cf-gears-toolkit-http -p cf-gears-toolkit-http-proxy -p cf-gears-oagw -p cf-gears-clickhouse-usage-collector-plugin \
 		--features cf-gears-toolkit/bootstrap,cf-gears-toolkit/fips,cf-gears-toolkit-http/fips,cf-gears-toolkit-http-proxy/fips,cf-gears-oagw/fips
 
@@ -1110,7 +1130,7 @@ e2e-orders: py-env
 ## Run event-broker E2E tests (its own standalone binary, not a cf-gears-example-server feature)
 e2e-event-broker: py-env
 	$(call print_target_banner)
-	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
+	cargo build -p cf-gears-event-broker-server --bin cf-gears-event-broker-server
 	E2E_BINARY=target/debug/cf-gears-event-broker-server \
 		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv
 
@@ -1118,7 +1138,7 @@ e2e-event-broker: py-env
 ## The backend-sensitive tests of e2e-event-broker, with a PostgreSQL sidecar.
 e2e-event-broker-pg: py-env
 	$(call print_target_banner)
-	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
+	cargo build -p cf-gears-event-broker-server --bin cf-gears-event-broker-server
 	EB_E2E_BACKEND=postgres E2E_BINARY=target/debug/cf-gears-event-broker-server \
 		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv -m backend_sensitive
 
@@ -1126,7 +1146,7 @@ e2e-event-broker-pg: py-env
 ## The backend-sensitive tests of e2e-event-broker, the events in a file under the server's home.
 e2e-event-broker-sqlite: py-env
 	$(call print_target_banner)
-	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
+	cargo build -p cf-gears-event-broker-server --bin cf-gears-event-broker-server
 	EB_E2E_BACKEND=sqlite E2E_BINARY=target/debug/cf-gears-event-broker-server \
 		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv -m backend_sensitive
 
@@ -1134,7 +1154,7 @@ e2e-event-broker-sqlite: py-env
 ## The backend-sensitive tests of e2e-event-broker, with a MySQL sidecar.
 e2e-event-broker-mysql: py-env
 	$(call print_target_banner)
-	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
+	cargo build -p cf-gears-event-broker-server --bin cf-gears-event-broker-server
 	EB_E2E_BACKEND=mysql E2E_BINARY=target/debug/cf-gears-event-broker-server \
 		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv -m backend_sensitive
 
@@ -1142,7 +1162,7 @@ e2e-event-broker-mysql: py-env
 ## The backend-sensitive tests of e2e-event-broker, with a MariaDB sidecar.
 e2e-event-broker-mariadb: py-env
 	$(call print_target_banner)
-	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
+	cargo build -p cf-gears-event-broker-server --bin cf-gears-event-broker-server
 	EB_E2E_BACKEND=mariadb E2E_BINARY=target/debug/cf-gears-event-broker-server \
 		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv -m backend_sensitive
 
@@ -1150,7 +1170,7 @@ e2e-event-broker-mariadb: py-env
 ## The backend-sensitive tests of e2e-event-broker, with a single-node Kafka sidecar.
 e2e-event-broker-kafka: py-env
 	$(call print_target_banner)
-	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
+	cargo build -p cf-gears-event-broker-server --bin cf-gears-event-broker-server
 	EB_E2E_BACKEND=kafka E2E_BINARY=target/debug/cf-gears-event-broker-server \
 		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv -m backend_sensitive
 
@@ -1166,8 +1186,9 @@ e2e-oop: py-env
 	$(call print_target_banner)
 	cargo build -p cf-gears-flight-control --bin flight-control
 	cargo build -p hello --features oop_module --bin hello-oop
-	cargo build -p cf-api-contracts --features oop_module --bin api-contracts-oop
+	cargo build -p cf-api-contracts --features oop_module,grpc-server --bin api-contracts-oop
 	cargo build -p cf-api-contracts-consumer --features oop_module --bin api-contracts-consumer-oop
+	cargo build -p cf-api-contracts-grpc-consumer --features oop_module --bin api-contracts-grpc-consumer-oop
 	OOP_E2E=1 $(PYTHON) -m pytest testing/e2e/suites/oop \
 		-o timeout_func_only=true --timeout=30 -vv
 

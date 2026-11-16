@@ -154,7 +154,7 @@ fn make_service_with_checker(
 /// Build a `ConversionService` with a caller-supplied `PolicyEnforcer`
 /// (`mock_enforcer` / `deny_all_enforcer` / etc.). Used by the
 /// caller-facing PEP-deny tests at the bottom of this file that pin
-/// the `EnforcerError::Denied → DomainError::CrossTenantDenied`
+/// the `EnforcerError::AccessDenied → DomainError::CrossTenantDenied`
 /// propagation contract for every public method that runs through
 /// `self.authorize(...)`.
 fn make_service_with_enforcer(
@@ -3314,7 +3314,7 @@ async fn approve_under_url_binding_mismatch_collapses_to_not_found() {
 //
 // Each test below builds a `ConversionService` wired to
 // `deny_all_enforcer()` — a PDP fake that refuses every evaluation
-// with `decision: false`. The corresponding `EnforcerError::Denied`
+// with `decision: false`. The corresponding `EnforcerError::AccessDenied`
 // then maps to `DomainError::CrossTenantDenied` via the `From` impl
 // in `domain::error`. The tests pin that every caller-facing public
 // method (`request_conversion` / `cancel` / `reject` / `approve` /

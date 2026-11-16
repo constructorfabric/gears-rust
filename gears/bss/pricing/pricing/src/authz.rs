@@ -1,8 +1,8 @@
 //! Pricing resource labels and the deny-by-default PEP gate.
 
-use authz_resolver_sdk::PolicyEnforcer;
 use authz_resolver_sdk::models::TenantMode;
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
+use authz_resolver_sdk::{AccessDenial, PolicyEnforcer};
 use toolkit_security::{AccessScope, ScopeFilter, SecurityContext, pep_properties};
 use uuid::Uuid;
 
@@ -90,9 +90,15 @@ pub enum AuthzError {
     /// The PDP was unreachable or its response could not be compiled.
     #[error("authz unavailable: {0}")]
     Unavailable(String),
+    /// The enforcer returned an outcome class this gate does not know: an
+    /// internal failure (HTTP 500), never a denial or an unavailable PDP. The
+    /// message is generic; the cause is logged where it is classified.
+    #[error("authz internal failure: {0}")]
+    Internal(String),
 }
 
-/// The denial the PDP itself decided.
+/// A denial from the PDP outcome: the PDP's own deny, or a permitted decision the
+/// PEP refuses (an empty scope, uncompilable constraints). `reason` says which.
 #[must_use]
 pub fn pdp_denial(
     ctx: &SecurityContext,
@@ -244,8 +250,8 @@ pub async fn access_scope(
         .access_scope_with(ctx, rt, action, resource_id, &request)
         .await
         .map_err(|e| match e {
-            authz_resolver_sdk::EnforcerError::Denied { ref deny_reason } => {
-                let reason = deny_reason.as_ref().map_or_else(
+            authz_resolver_sdk::EnforcerError::AccessDenied(AccessDenial::Pdp { ref reason }) => {
+                let reason = reason.as_ref().map_or_else(
                     || e.to_string(),
                     |dr| match &dr.details {
                         Some(details) => format!("{}: {details}", dr.error_code),
@@ -261,6 +267,15 @@ pub async fn access_scope(
                     reason,
                 ))
             }
+            // A PEP-local refusal carries no PDP reason; its Display names it.
+            authz_resolver_sdk::EnforcerError::AccessDenied(_) => denied(pdp_denial(
+                ctx,
+                rt,
+                action,
+                resource_id,
+                owner_tenant_id,
+                e.to_string(),
+            )),
             authz_resolver_sdk::EnforcerError::CompileFailed(ref compile_err) => {
                 // The compiler diagnostic names PDP predicates and properties — an
                 // internal detail, not something the PDP told the caller. It goes
@@ -290,6 +305,14 @@ pub async fn access_scope(
             }
             authz_resolver_sdk::EnforcerError::EvaluationFailed(_) => {
                 AuthzError::Unavailable(e.to_string())
+            }
+            ref unknown => {
+                tracing::error!(
+                    target: "pricing.authz.internal",
+                    error = %unknown,
+                    "authz failed with an unknown outcome"
+                );
+                AuthzError::Internal("authorization failed with an unknown outcome".to_owned())
             }
         })?;
 
@@ -332,7 +355,7 @@ pub async fn grant_scope(
     {
         Ok(scope) => Ok(scope),
         Err(AuthzError::Denied(_)) => Ok(AccessScope::deny_all()),
-        Err(error @ AuthzError::Unavailable(_)) => Err(error),
+        Err(error @ (AuthzError::Unavailable(_) | AuthzError::Internal(_))) => Err(error),
     }
 }
 

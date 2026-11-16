@@ -29,6 +29,13 @@ use toolkit_contract::runtime::client::{
 use toolkit_contract::runtime::config::{ClientConfig, ReconnectConfig};
 use toolkit_contract::runtime::transport_error::TransportError;
 
+/// Config for a plaintext mock server. A FIPS build requires TLS by default
+/// and installs no crypto provider, so opt in to plaintext and install one.
+fn plaintext_config(base_url: impl Into<String>) -> ClientConfig {
+    drop(toolkit_security::tls::configured_provider().install_default());
+    ClientConfig::new(base_url).with_require_tls(false)
+}
+
 #[derive(Clone)]
 struct HoldState {
     /// Fired by the handler when a request reaches it (so the test knows the
@@ -77,7 +84,7 @@ async fn second_request_is_shed_while_first_is_in_flight() {
     let (base_url, state) = start_hold_server().await;
     let url = format!("{base_url}/hold");
 
-    let config = ClientConfig::new(&base_url).with_max_concurrent_requests(Some(1));
+    let config = plaintext_config(&base_url).with_max_concurrent_requests(Some(1));
     let client = build_default_http_client("concurrency-limit-test", &config).unwrap();
 
     // Request A: occupies the single permit and blocks in the handler.
@@ -125,7 +132,7 @@ async fn cap_zero_is_clamped_and_still_serves() {
     let (base_url, _state) = start_hold_server().await;
     let url = format!("{base_url}/ok");
 
-    let config = ClientConfig::new(&base_url).with_max_concurrent_requests(Some(0));
+    let config = plaintext_config(&base_url).with_max_concurrent_requests(Some(0));
     let client = build_default_http_client("concurrency-limit-zero-test", &config).unwrap();
 
     let result =
@@ -149,7 +156,7 @@ async fn transport_timeout_maps_to_timeout_variant() {
 
     // Short transport timeout baked into the client; no per-call deadline, so
     // the transport's TimeoutLayer is the only timer that can fire.
-    let config = ClientConfig::new(&base_url).with_timeout(Duration::from_millis(50));
+    let config = plaintext_config(&base_url).with_timeout(Duration::from_millis(50));
     let client = build_default_http_client("transport-timeout-test", &config).unwrap();
 
     let result = send_unary::<_, serde_json::Value>(|| Ok(client.get(&url)), None).await;
@@ -177,7 +184,7 @@ async fn stream_open_shed_is_not_retried_despite_reconnect_budget() {
     let (base_url, state) = start_hold_server().await;
     let url = format!("{base_url}/hold");
 
-    let config = ClientConfig::new(&base_url).with_max_concurrent_requests(Some(1));
+    let config = plaintext_config(&base_url).with_max_concurrent_requests(Some(1));
     let client = build_default_http_client("stream-open-shed-test", &config).unwrap();
 
     // Request A: a unary call that occupies the single permit and blocks.

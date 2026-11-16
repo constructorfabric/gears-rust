@@ -779,3 +779,23 @@ async fn create_session_with_unknown_session_type_is_not_found() {
         .unwrap_err();
     assert!(matches!(err, ChatEngineError::NotFound { .. }));
 }
+
+#[tokio::test]
+async fn list_sessions_empty_scope_preserves_live_or() {
+    use authz_resolver_sdk::test_support::EmptyScopePdp;
+    let db = inmem_db().await;
+    let (tenant, user, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, user).await;
+    seed_session(&db, Uuid::new_v4(), Uuid::new_v4(), user).await;
+    for live in [false, true] {
+        let svc = build_session_service(&db, PolicyEnforcer::new(Arc::new(EmptyScopePdp { live })));
+        let page = svc
+            .list_sessions(&ctx_for_subject(user, tenant), &ODataQuery::default())
+            .await
+            .expect("permitted LIST succeeds even when its scope is empty");
+        assert_eq!(page.items.len(), usize::from(live));
+        if live {
+            assert_eq!(page.items[0].session_id, sid);
+        }
+    }
+}

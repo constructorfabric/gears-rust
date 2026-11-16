@@ -4,7 +4,7 @@
 # cluster/network dependencies.
 #
 # Run it from the repo root:
-#   cargo run -p cf-gears-event-broker --bin cf-gears-event-broker-server \
+#   cargo run -p cf-gears-event-broker-server --bin cf-gears-event-broker-server \
 #     -- --config config/event-broker-standalone.yaml run
 #
 # Then, e.g.:

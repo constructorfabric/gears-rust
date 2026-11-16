@@ -817,9 +817,9 @@ Own the subscription as the primary commercial aggregate for recurring revenue: 
 - [ ] p1 - subscription lifecycle state machine (create, activate, suspend, cancel, expire)
 - [ ] p1 - versioning and effective-dated plan/add-on composition
 - [ ] p1 - multi-tenant ownership (resource, payer, seller tenants)
-- [ ] p2 - plan changes (upgrade/downgrade) with proration triggers
+- [ ] p2 - quantity increases and component additions on an active subscription (base-plan changes deferred)
 - [ ] p2 - renewal semantics, grace periods, and failed-renewal handling
-- [ ] p2 - entitlement lifecycle (issue, revoke, point-of-use check)
+- [ ] p2 - commercial posture published to Entitlements, which applies it to providers and reports readiness
 - [ ] p3 - trial runtime and conversion
 - [ ] p3 - event model and billing alignment
 #### More details
@@ -828,9 +828,31 @@ Own the subscription as the primary commercial aggregate for recurring revenue: 
 - TODO: API link
 - TODO: SDK link
 
+### Billing Accounts (proposed)
+#### Responsibility
+Proposed owner of billing-party identity (opaque legal-party ids with verified identity evidence and versioned billing profiles), billing accounts scoped to one payer tenant, one commercial seller tenant, one issuer party, one debtor party and one billing currency, billing arrangements (payer-owned offer and buyer-owned acceptance recording consent that a commercial buyer's purchases may use an account), account-use grants that authorize one exact use at one serialization point against revocation, and seller-to-issuer eligibility coordinated with Ledger. Tenant-scoped RBAC is unchanged; accounts are not access scopes. Ledger owns books, book resolution, settlement pools and allocation; Invoicing owns issued-document snapshots; Payments owns instruments; Contracts owns negotiated terms. Proposed in the ownership ADR `cpt-cf-bss-adr-commercial-ownership-tenant-rbac`; `bss-accounts` is a working name; no implementation or SDK exists.
+#### High Level Scenarios
+- [ ] p1 - billing-party identity: opaque ids, namespaced identity evidence, representation, versioned billing profiles
+- [ ] p1 - billing-account lifecycle with a fixed payer/seller/issuer/debtor/currency binding
+- [ ] p1 - billing arrangement consent as payer offer and buyer acceptance, revocation and withdrawal of new uses
+- [ ] p1 - account-use grant authorization, use recording and release, replay-safe by attempt identity
+- [ ] p1 - per-use payer approval and consumption policy for usage-based purchases
+- [ ] p1 - issuer bindings and authorized Ledger setup coordination
+- [ ] p2 - approval-inbox integration
+- [ ] p2 - account blocking and closure with retained financial history in owning gears
+#### More details
+- [PRD](../gears/bss/accounts/docs/PRD.md)
+- [Design](../gears/bss/accounts/docs/DESIGN.md)
+- [Ownership ADR](../gears/bss/docs/ADR/0002-cpt-cf-bss-adr-commercial-ownership-tenant-rbac.md)
+- [Resale ADR](../gears/bss/docs/ADR/0003-cpt-cf-bss-adr-multi-tier-resale-model.md)
+- [Commercial-model PRD](arch/bss-commercial-model/PRD.md)
+- [Commercial-model Design](arch/bss-commercial-model/DESIGN.md)
+- TODO: API link
+- TODO: SDK link
+
 ### Contracts & Agreements
 #### Responsibility
-System of Record for the signed commercial relationship between selling and paying tenants: terms, negotiated prices, commitments, and renewal rules consumed by downstream BSS gears.
+System of Record for the signed commercial agreement between a seller/issuer legal party and a buyer/debtor legal party (with their tenant references): terms, negotiated prices, commitments, and renewal rules consumed by downstream BSS gears. An agreement may restrict eligible payer accounts without making the payer a party; operational billing arrangements and account-use consent are owned by Billing Accounts. The party model revision from seller/payer to seller/issuer–buyer/debtor is proposed pending Contracts adoption.
 #### High Level Scenarios
 - [ ] p1 - contract document lifecycle (draft, active, expired, terminated)
 - [ ] p1 - terms consumed by Subscriptions (renewal, grace, limits)

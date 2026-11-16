@@ -12,6 +12,7 @@
   - [Proxy HTTP Request](#proxy-http-request)
 - [3. Processes / Business Logic (CDSL)](#3-processes--business-logic-cdsl)
   - [Alias Resolution](#alias-resolution)
+  - [Credential Resolution](#credential-resolution)
   - [Route Matching](#route-matching)
   - [Plugin Chain Execution](#plugin-chain-execution)
   - [Header Transformation](#header-transformation)
@@ -163,6 +164,8 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
 
 **Output**: Resolved `UpstreamConfig` or error
 
+**Planned.** Named requests use the ADR-0020 cache for alias, route and parent policies, then read the selected local credential live. Usual visibility and route checks still apply. Pass the resolved parent policies to `cpt-cf-oagw-algo-credential-resolution`. See [ADR-0021](../ADR/0021-upstream-credentials.md).
+
 **With the proxy configuration cache** (a database and `proxy_cache.enabled: true`; `cpt-cf-oagw-algo-obs-proxy-config-cache`): step 1 reads the alias section, keyed by the alias and the tenant chain. A hit runs no query; a miss runs step 1's query and stores its rows as they are (disabled and not-visible upstreams included), or an empty list. Steps 2–6 run on every request, unchanged. An alias that fails validation answers *not found* without a read and without a cache entry.
 
 **Steps**:
@@ -177,6 +180,20 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
 5. [x] - `p1` - **IF** a disabled match was recorded - `inst-alias-4b1-ret`
    1. [x] - `p1` - **RETURN** error: upstream disabled (503 LinkUnavailable) - `inst-alias-4b1a`
 6. [x] - `p1` - **RETURN** error: upstream not found for alias (404 RouteNotFound) - `inst-alias-5`
+
+### Credential Resolution
+
+- [ ] `p1` - **ID**: `cpt-cf-oagw-algo-credential-resolution`
+
+**Input**: Authorized invoke context, single validated selector, selected upstream and route, applicable ancestor policies and server from the routing cache.
+
+**Output**: Authorized credential UUID, API-key configuration and optional bucket policy, or an error before forwarding. SDK preview returns only safe identifiers.
+
+1. [ ] - `p1` - Check use at credential type/owner scope, then read the current row by caller tenant, selected local upstream UUID and name. Check its UUID before disclosing state. Refuse unsupported scopes. Do not cache rows or misses - `inst-cred-resolve-1`
+2. [ ] - `p1` - For proxy and preview, check enabled state, then suspension (503), then cached ancestor constraints, auth compatibility and every destination against the owner's approvals (403). Runtime use requires no ancestor management grant - `inst-cred-resolve-2`
+3. [ ] - `p1` - Preview returns safe IDs without secrets, debits or forwarding. Proxy handles preflight without a debit, then checks upstream, credential and route limits before CredStore. Pass the pin to auth and the generation to the limiter. Keep attempt debits on later failure and check final outbound headers - `inst-cred-resolve-3`
+
+[ADR-0021](../ADR/0021-upstream-credentials.md) defines the request header and when a key revocation takes effect.
 
 ### Route Matching
 

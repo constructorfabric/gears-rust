@@ -3,6 +3,7 @@
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -23,11 +24,12 @@ use crate::domain::model_client::ModelClient;
 use crate::domain::one_step::OneStepPath;
 use crate::domain::planner::agent::{Planner, PlannerCaps};
 use crate::domain::planner::catalog::PropertyCatalog;
+use crate::domain::planner::manage::{ManageBudget, ManageFacts};
 use crate::domain::planner::processing::{
     PlanWriter, Processing, ProcessingContexts, ProcessingPorts,
 };
 use crate::domain::profile_read::{CategoryCheck, ProfileReadPorts, ProfileReadService};
-use crate::domain::profile_writes::ProfileWrites;
+use crate::domain::profile_writes::{ProfileWrites, WRITE_BUDGET};
 use crate::domain::record_intake::{
     DropEvent, DropReason, DropStage, IntakeEvents, RecordHandOff, RecordKey,
 };
@@ -153,13 +155,23 @@ pub struct Pipeline {
     pub subject_control: Arc<SubjectControlService>,
     pub review_queue: Arc<ReviewQueueService>,
     pub admin_facts: Arc<AdminFactsService>,
+    /// Manage-facts, on the worker's processing chain; not configured when processing is not.
+    pub manage: Arc<ManageFacts>,
 }
+
+/// How long manage-facts may take: [`WRITE_BUDGET`] for the steps before the write, as the other write paths have,
+/// and 27 seconds for the whole call, the write included, inside the API gateway's 30-second request timeout.
+pub(crate) const MANAGE_BUDGET: ManageBudget = ManageBudget {
+    before_write: WRITE_BUDGET,
+    answer: Duration::from_secs(27),
+};
 
 /// Build the pipeline from the config.
 ///
 /// Processing runs when both a processing identity and a model are
 /// configured; otherwise intake keeps dropping received records with an
-/// event, as before the planner existed. The profile read needs the identity.
+/// event, as before the planner existed, and manage-facts answers not
+/// configured. The profile read needs the identity.
 ///
 /// # Errors
 ///
@@ -308,7 +320,7 @@ pub fn assemble(
             one_step,
             events: Arc::new(LogAdminFactsEvents),
         },
-        policy_enforcer,
+        policy_enforcer.clone(),
     ));
     // @cpt-end:cpt-cf-construct-algo-admin-facts-wire:p2:inst-wire-admin-facts
 
@@ -325,6 +337,11 @@ pub fn assemble(
             subject_control,
             review_queue,
             admin_facts,
+            manage: Arc::new(ManageFacts::not_configured(
+                contexts,
+                policy_enforcer,
+                MANAGE_BUDGET,
+            )),
         });
     };
     let (hand_off, queue) = record_queue(cfg.config().processing.queue_capacity);
@@ -353,7 +370,7 @@ pub fn assemble(
         checks,
         admission,
         ProcessingPorts {
-            contexts,
+            contexts: Arc::clone(&contexts),
             profiles: reader,
             writer,
             events: Arc::clone(&events),
@@ -361,6 +378,14 @@ pub fn assemble(
         },
         cfg.config().processing.max_reruns,
     ));
+    // @cpt-begin:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-manage
+    let manage = Arc::new(ManageFacts::new(
+        Arc::clone(&processing),
+        contexts,
+        policy_enforcer,
+        MANAGE_BUDGET,
+    ));
+    // @cpt-end:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-manage
     Ok(Pipeline {
         hand_off,
         worker: Some(Worker {
@@ -375,6 +400,7 @@ pub fn assemble(
         subject_control,
         review_queue,
         admin_facts,
+        manage,
     })
     // @cpt-end:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-processing
 }
@@ -453,8 +479,8 @@ impl Configured {
     /// Say at start-up what is not configured: an info line when processing
     /// is off on purpose (neither identity nor model), a warning when it is
     /// only partly configured or lacks the opt-in to run without
-    /// sensitive-data checks, and a warning when the profile read is not
-    /// configured.
+    /// sensitive-data checks, each naming manage-facts as not configured too,
+    /// and a warning when the profile read is not configured.
     #[expect(
         clippy::cognitive_complexity,
         reason = "three log lines; the tracing macros count toward the complexity"
@@ -463,18 +489,21 @@ impl Configured {
         let (identity, model) = (self.identity.present(), self.model.present());
         if !identity && !model {
             tracing::info!(
-                "construct: record processing is not configured; received records are dropped"
+                "construct: record processing is not configured; received records are dropped \
+                 and manage-facts answers 501"
             );
         } else if identity && model {
             tracing::warn!(
                 "construct: record processing needs processing.run_without_sensitive_data_checks \
-                 while no sensitive-data check exists; received records are dropped"
+                 while no sensitive-data check exists; received records are dropped and manage-facts \
+                 answers 501"
             );
         } else {
             tracing::warn!(
                 processing_identity = identity,
                 model = model,
-                "construct: record processing is only partly configured; received records are dropped"
+                "construct: record processing is only partly configured; received records are \
+                 dropped and manage-facts answers 501"
             );
         }
         if !identity {

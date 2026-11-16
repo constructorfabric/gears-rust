@@ -40,7 +40,9 @@ pub trait Authorizer: Send + Sync + 'static {
     ///
     /// # Errors
     /// [`AuthorizationErrorKind::Denied`] when policy rejects the action,
-    /// [`AuthorizationErrorKind::Unavailable`] when it cannot be evaluated.
+    /// [`AuthorizationErrorKind::Unavailable`] when it cannot be evaluated,
+    /// [`AuthorizationErrorKind::Internal`] when it failed in a way the
+    /// authorizer does not classify.
     async fn caller_scope(
         &self,
         ctx: &SecurityContext,
@@ -243,6 +245,11 @@ pub enum AuthorizationErrorKind {
     /// Policy or credentials cannot be evaluated now. Callers receive `Unavailable`;
     /// background work pauses and retries.
     Unavailable,
+    /// Authorization failed in a way the authorizer does not classify, such as
+    /// an unknown policy-enforcer outcome. Callers receive `Internal`, never a
+    /// denial or `Unavailable`; background work stops the step like any other
+    /// authorization failure and never skips it.
+    Internal,
 }
 
 /// Failure returned by an [`Authorizer`].
@@ -271,6 +278,15 @@ impl AuthorizationError {
     pub fn unavailable() -> Self {
         Self {
             kind: AuthorizationErrorKind::Unavailable,
+            source: None,
+        }
+    }
+
+    /// Authorization failed internally, without a cause.
+    #[must_use]
+    pub fn internal() -> Self {
+        Self {
+            kind: AuthorizationErrorKind::Internal,
             source: None,
         }
     }
@@ -306,6 +322,9 @@ impl fmt::Display for AuthorizationError {
             AuthorizationErrorKind::Unavailable => {
                 f.write_str("durable execution authorization is unavailable")
             }
+            AuthorizationErrorKind::Internal => {
+                f.write_str("durable execution authorization failed internally")
+            }
         }
     }
 }
@@ -334,6 +353,7 @@ enum Rejection {
     Timeout,
     UnconstrainedScope,
     MissingIdentity,
+    Internal,
 }
 
 impl Rejection {
@@ -344,6 +364,7 @@ impl Rejection {
             Self::Timeout => "timeout",
             Self::UnconstrainedScope => "unconstrained_scope",
             Self::MissingIdentity => "missing_identity",
+            Self::Internal => "internal",
         }
     }
 }
@@ -431,6 +452,7 @@ impl Authority {
                 let rejection = match error.kind {
                     AuthorizationErrorKind::Denied => Rejection::Denied,
                     AuthorizationErrorKind::Unavailable => Rejection::Unavailable,
+                    AuthorizationErrorKind::Internal => Rejection::Internal,
                 };
                 return Err((rejection, error));
             }

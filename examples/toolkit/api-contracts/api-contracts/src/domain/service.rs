@@ -143,10 +143,12 @@ impl PaymentDomainService {
     ///
     /// # Errors
     ///
-    /// Returns `CanonicalError::NotFound` if the payment does not exist.
+    /// Returns `CanonicalError::NotFound` if the payment does not exist or
+    /// belongs to another tenant: the two are indistinguishable to the caller,
+    /// so an ID does not reveal that another tenant's payment exists.
     pub fn get_invoice(
         &self,
-        _ctx: &SecurityContext,
+        ctx: &SecurityContext,
         invoice_id: &str,
     ) -> Result<Invoice, CanonicalError> {
         let id = Uuid::parse_str(invoice_id).map_err(|_| {
@@ -156,11 +158,14 @@ impl PaymentDomainService {
         })?;
 
         let payments = self.payments.read();
-        let record = payments.get(&id).ok_or_else(|| {
-            PaymentResourceError::not_found(format!("invoice not found: {invoice_id}"))
-                .with_resource(invoice_id)
-                .create()
-        })?;
+        let record = payments
+            .get(&id)
+            .filter(|record| record.owner_tenant_id == ctx.subject_tenant_id())
+            .ok_or_else(|| {
+                PaymentResourceError::not_found(format!("invoice not found: {invoice_id}"))
+                    .with_resource(invoice_id)
+                    .create()
+            })?;
 
         Ok(Invoice::new(
             record.payment_id,
@@ -340,5 +345,35 @@ mod tests {
             .collect()
             .await;
         assert_eq!(a_feed.len(), 2, "open_feed is tenant-scoped too");
+    }
+
+    /// Another tenant's invoice is `NotFound`, the same answer as an unknown ID.
+    #[test]
+    fn get_invoice_is_tenant_scoped() {
+        let svc = PaymentDomainService::new();
+        let ctx_a = tenant_ctx(Uuid::new_v4());
+        let ctx_b = tenant_ctx(Uuid::new_v4());
+        let paid = svc
+            .charge(&ctx_a, &ChargeRequest::new(100, "USD", "a1"))
+            .expect("charge a1");
+        let id = paid.payment_id.to_string();
+
+        assert_eq!(
+            svc.get_invoice(&ctx_a, &id)
+                .expect("owner reads it")
+                .payment_id,
+            paid.payment_id
+        );
+        let other = svc
+            .get_invoice(&ctx_b, &id)
+            .expect_err("another tenant does not");
+        let unknown = svc
+            .get_invoice(&ctx_b, &Uuid::new_v4().to_string())
+            .expect_err("unknown ID");
+        assert!(
+            matches!(other, CanonicalError::NotFound { .. }),
+            "{other:?}"
+        );
+        assert_eq!(other.status_code(), unknown.status_code());
     }
 }

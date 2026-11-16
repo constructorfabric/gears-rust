@@ -252,11 +252,15 @@ deployment configuration.
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-algo-planner-manage`
 
-1. [ ] - `p1` - What a subject told an agent runs through the same chain as a record, under the caller's own security
-   context and scope, and answers at once - `inst-manage-chain`
+1. [ ] - `p1` - What a subject told an agent runs through the same chain as a record and answers at once. Whether the
+   caller is the subject itself or an application or agent acting for the subject, it runs as Construct, under the
+   processing context and scope of the subject's tenant, as a record does: the profile is read and the facts are
+   written by one identity - `inst-manage-chain`
 2. [ ] - `p1` - A deadline bounds the steps before the write: the profile read, the agent loop, the checks and
-   Admission. Past it, nothing is stored and the answer is `timeout`. A write that started is awaited, so the answer
-   never says nothing was stored while the write lands - `inst-manage-deadline`
+   Admission. Past it, nothing is stored and the answer is `timeout`. A later deadline bounds the write, which starts
+   no call to graph storage and no resend past it; a write it cuts after the plan was sent answers unavailable with
+   its result unknown, never that nothing was stored. The `503` of a result unknown says in its detail that the write
+   may have been stored - `inst-manage-deadline`
 3. [ ] - `p1` - A write conflict plans again on a new read while time is left, up to the rerun limit, then answers
    `rerun_limit` - `inst-manage-rerun`
 4. [ ] - `p1` - A stored plan answers what it changed, counted by its steps: added, replaced and removed. The writer
@@ -419,19 +423,19 @@ record that fails with one content-free event.
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-planner-manage`
 
 The system **MUST** take what a subject told an agent through the planner, the checks, Admission and the writer under
-the caller's context, **MUST** answer what it stored or why it stored nothing, and **MUST** cut off only the steps
-before the write at the deadline.
+the processing context of the subject's tenant, **MUST** answer what it stored or why it stored nothing, **MUST** cut
+off the steps before the write at their deadline, and **MUST** end the write by the call's deadline.
 
 **Implements**:
 - `cpt-cf-construct-algo-planner-manage`
 
 **Touches**:
-- Code: `domain::planner::processing::{Processing::manage, Managed, Changes, NothingStored}`
+- Code: `domain::planner::processing::{Processing::manage, ManageDeadlines, Managed, Changes, NothingStored}`
 
 **Verified by**: `what_a_subject_told_an_agent_is_written_and_counted`, `a_conflict_plans_the_message_again_on_a_new_read`,
 `a_call_that_stores_nothing_answers_why_and_sends_no_record_drop_event`,
-`the_deadline_cuts_off_the_steps_before_the_write`, `a_write_that_started_is_awaited_past_the_deadline` and
-`an_unreachable_profile_is_an_error`.
+`the_deadline_cuts_off_the_steps_before_the_write`, `a_write_that_started_is_awaited_past_the_deadline_before_the_write`,
+`the_write_runs_by_the_answer_deadline` and `an_unreachable_profile_is_an_error`.
 
 ### Manage-Facts Route
 
@@ -439,25 +443,59 @@ before the write at the deadline.
 
 The system **MUST** offer `POST /api/construct/v1/subjects/{subject_id}/facts/manage`, which takes `message` and
 `conversation` and answers `200` with `outcome` (`stored` or `nothing_changed`), `reason`, and the counts `added`,
-`replaced` and `removed`. It **MUST** answer `404`, as for a subject that does not exist, when the caller may not act
-for the subject: another subject, no "manage facts" permission from the AuthZ resolver, or a policy scope that leaves
-the subject's settings out. It **MUST** answer `400`
+`replaced` and `removed`. The caller is the subject itself, or an application or agent acting for it; the tenant is the
+caller's own, or the one named in the optional `tenant` query parameter, as for the profile read. Every caller, the
+subject itself or another, **MUST** have the "manage facts" permission: the route asks the AuthZ resolver for
+`gts.cf.construct.subject.fact.v1~` with the
+action `manage`, the subject as the resource id and the tenant as the context tenant (root only) and as the owner
+tenant, with constraints required. One constraint of the answer must name the tenant, and may narrow the grant to named
+subjects with a resource id filter: a constraint that names only the tenant covers every subject in it, and one that
+names no tenant, or a property Construct cannot decide, grants nothing. For the subject itself and for another caller
+alike, the profile is then read and the facts are written as Construct's processing identity in the subject's tenant,
+never as the caller, and without one the call answers `501`. It **MUST** answer `404`, as for a subject that does not
+exist, when the caller may not act for the subject: no "manage facts" permission from the AuthZ resolver, or a policy
+scope that does not reach the subject in the tenant. It **MUST** answer
+`400`
 naming the field, without a model call, for a `message` longer than 4 000 characters or a `conversation` longer than
-16 000. A blank message stores nothing without a model call. A failed dependency answers `503`. The agent in the plan's origin is the caller the
-platform authenticated, and the steps before the write have a deadline inside the gateway's request timeout.
+16 000. A blank message stores nothing without a model call. A failed dependency answers `503`, which stored nothing, so the call can be sent again; a write whose result is
+unknown answers `503` with a detail that says it may have been stored, so the agent reads the profile before it
+sends the call again. The agent in the plan's origin is the caller the
+platform authenticated. The steps before the write have 20 seconds and the whole call, the write included, 27: inside
+the gateway's 30-second request timeout. The AuthZ resolver call is one of the steps before the write: when it does not
+answer by their deadline, the call answers `503` and nothing is read or written. The gear
+registers the route on the record worker's processing chain (`cpt-cf-construct-algo-profile-reader-wire`); a deployment
+without record processing answers `501`.
 
 **Implements**:
 - `cpt-cf-construct-algo-planner-manage`
 
 **Touches**:
-- Code: `domain::planner::manage::ManageFacts`, `api::rest::routes::register_manage_route`,
-  `api::rest::dto::{ManageFactsRequest, ManageFactsResponse}`, `api::rest::error::{for_facts, too_long}`
+- Code: `domain::planner::manage::{ManageFacts, ManageBudget}`, `api::rest::routes::register_manage_route`, `gear::ConstructGear`,
+  `api::rest::dto::{ManageFactsRequest, ManageFactsResponse, TenantQuery}`, `api::rest::error::{for_facts, too_long}`
 
 **Verified by**: `the_subject_gets_what_was_stored`,
 `a_subject_the_caller_may_not_act_for_answers_as_one_that_does_not_exist`,
+`a_policy_service_that_does_not_answer_within_the_budget_answers_unavailable`,
+`an_application_with_the_permission_manages_the_facts_of_a_subject_in_the_named_tenant`,
+`a_caller_with_the_permission_manages_another_subject_of_its_own_tenant`,
+`the_subject_naming_a_tenant_is_authorized_for_that_tenant`,
+`a_grant_narrowed_to_another_subject_refuses_every_caller`,
+`a_grant_that_names_only_the_tenant_covers_every_subject_in_it`,
+`an_application_without_a_grant_on_the_named_tenant_answers_as_a_subject_that_does_not_exist`,
+`an_application_asks_the_policy_service_about_the_named_tenant`,
+`the_subject_and_an_application_both_read_and_write_as_construct`,
+`without_a_processing_context_no_caller_stores_anything`,
+`a_tenant_constraint_reaches_every_subject_in_the_tenant_and_no_other_tenant`,
+`a_resource_id_filter_narrows_the_grant_to_the_subjects_it_names`,
+`a_constraint_without_the_tenant_or_with_another_property_reaches_nothing`, `an_unconstrained_scope_reaches_nothing`,
 `a_text_past_its_limit_is_refused_before_a_model_call`,
-`a_blank_message_stores_nothing_without_a_model_call`, `a_call_with_personalization_off_says_so` and
-`an_unreachable_profile_answers_unavailable`.
+`a_blank_message_stores_nothing_without_a_model_call`, `a_call_with_personalization_off_says_so`,
+`an_unreachable_profile_answers_unavailable`, `the_write_ends_by_the_budget_of_the_whole_call`,
+`manage_facts_gets_the_manage_budget`,
+`a_write_with_an_unknown_result_maps_to_503_that_says_it_may_have_been_stored`,
+`the_gear_routes_manage_facts_to_the_processing_chain`,
+`without_processing_the_gear_answers_manage_facts_not_configured` and
+`without_processing_a_caller_who_may_not_act_for_the_subject_gets_not_found`.
 
 ### Reference Evaluation Set
 

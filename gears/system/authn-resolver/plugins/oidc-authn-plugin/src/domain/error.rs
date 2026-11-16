@@ -60,6 +60,12 @@ pub enum AuthNError {
     #[error("invalid token type")]
     InvalidTokenType,
 
+    /// The call never reached the `IdP`: the local HTTP client refused it or
+    /// could not build or route it (bad URL, proxy credentials rejected).
+    /// Not an `IdP` failure: it does not count against the circuit breaker.
+    #[error("HTTP client unavailable: {0}")]
+    HttpClientUnavailable(String),
+
     /// Oidc (or OIDC Discovery / JWKS endpoint) is unreachable.
     #[error("identity provider unreachable")]
     IdpUnreachable,
@@ -101,7 +107,9 @@ impl From<AuthNError> for AuthNResolverError {
             | AuthNError::UnsupportedAlgorithm
             | AuthNError::InvalidAudience
             | AuthNError::InvalidTokenType => AuthNResolverError::Unauthorized(format!("{value}")),
-            AuthNError::IdpUnreachable | AuthNError::CryptoUnavailable(_) => {
+            AuthNError::IdpUnreachable
+            | AuthNError::CryptoUnavailable(_)
+            | AuthNError::HttpClientUnavailable(_) => {
                 AuthNResolverError::ServiceUnavailable(format!("{value}"))
             }
             AuthNError::TokenEndpointUnsuccessfulStatus(_)

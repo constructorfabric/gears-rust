@@ -30,23 +30,25 @@ let parsed: HashMap<String, String> = serde_saphyr::from_str(&yaml_string)?;
 
 ## Concurrency
 
-### Synchronous locks
+### Choosing a lock
 
-**Always use `parking_lot::Mutex` and `parking_lot::RwLock` for synchronous locks, not `std::sync::Mutex` / `std::sync::RwLock`.**
+| Case | Use |
+|---|---|
+| Short in-memory update, no `.await` and no blocking call while the guard is held (sync or async code) | `std::sync::Mutex` / `RwLock` |
+| Data needed across an `.await` | Copy it out, drop the guard, then await; still `std::sync` |
+| The awaited work itself must be serialized (e.g. one in-flight token refresh) | `tokio::sync::Mutex` / `RwLock`; say why in the lock's doc comment |
+| Blocking I/O or long computation on the data | Copy out under the guard, release it, then run the work in `tokio::task::spawn_blocking()`. Never hold a `std` lock during blocking work, even inside `spawn_blocking`: async tasks waiting for that lock block their executor threads |
+| Blocking work that must stay serialized with the data | `tokio::sync::Mutex` held across the `spawn_blocking(..).await`, so waiters yield instead of blocking a thread |
 
-- **Reason**: `parking_lot` locks are faster (no syscall on uncontended path), have smaller lock metadata than `std`, never poison on panic, and return the guard directly from `lock()` — no `Result` unwrapping needed.
-- **Workspace dep**: `parking_lot` is already declared in the workspace `Cargo.toml`.
+Existing `parking_lot` code is left as is; new code uses `std::sync`.
+
+### Poisoning
+
+`std` lock calls return a `Result`, and `unwrap`/`expect` are denied outside tests. Decide per lock, not per call site:
+
+- Recover with `PoisonError::into_inner` only if no critical section on that lock can leave the data inconsistent when it panics (each one is a single push, insert or assignment).
+- Otherwise return an error.
 
 ```rust
-use parking_lot::Mutex;
-
-let data = Mutex::new(Vec::new());
-// Blocking lock — returns MutexGuard directly, no unwrap needed
-data.lock().push(42);
+data.lock().unwrap_or_else(PoisonError::into_inner).push(42);
 ```
-
-### When to use `tokio::sync` instead
-
-Use `tokio::sync::Mutex` or `tokio::sync::RwLock` only when you need to **hold the lock across an `.await` point**. If the critical section is purely synchronous (no `.await` inside), prefer `parking_lot` even in async code — it avoids the overhead of the async mutex and won't block the executor as long as the critical section is short.
-
-If a synchronous lock guard must be held while performing blocking I/O or expensive computation, wrap the call in `tokio::task::spawn_blocking()` to avoid stalling the async executor.

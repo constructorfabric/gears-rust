@@ -598,7 +598,7 @@ pub fn register_admin_facts_routes(
     router.merge(not_stored(ops)).layer(Extension(svc))
 }
 
-/// The synchronous manage-facts route. The gear registers it together with the planner chain it runs on.
+/// The synchronous manage-facts route. The gear always registers it; without record processing it answers 501.
 ///
 /// @cpt-dod:cpt-cf-construct-dod-planner-manage-route:p1
 pub fn register_manage_route(
@@ -612,12 +612,20 @@ pub fn register_manage_route(
         .description(
             "Decide how what the subject told an agent changes the subject's profile, store it, and answer what \
              changed, or why nothing was stored. The recent conversation only shows what the message refers to. \
-             A subject the caller may not act for answers 404.",
+             The caller is the subject itself, or an application or agent the platform lets manage the subject's \
+             facts. The tenant is the caller's own, or the one named in `tenant`. A subject the caller may not act \
+             for answers 404, like one that does not exist.",
         )
         .tag(SUBJECT_FACTS_TAG)
         .authenticated()
         .require_license_features::<License>([])
-        .path_param("subject_id", "The subject: the caller's own subject id")
+        .path_param("subject_id", "The subject whose facts change")
+        .query_param_typed(
+            "tenant",
+            false,
+            "Tenant of the subject, when not the caller's own",
+            "string",
+        )
         .json_request::<dto::ManageFactsRequest>(openapi, "What the subject said")
         .handler(handlers::manage_facts)
         .json_response_with_schema::<dto::ManageFactsResponse>(
@@ -627,6 +635,11 @@ pub fn register_manage_route(
         )
         .standard_errors(openapi)
         .error_503(openapi)
+        .problem_response(
+            openapi,
+            StatusCode::NOT_IMPLEMENTED,
+            "The deployment does not provide manage-facts",
+        )
         .register(Router::new(), openapi);
     router.merge(not_stored(facts)).layer(Extension(manage))
 }

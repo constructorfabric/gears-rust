@@ -50,7 +50,7 @@ pub mod resource_types {
 #[derive(Debug, thiserror::Error)]
 pub enum AuthzError {
     /// The PDP explicitly denied access, or returned constraints this PEP
-    /// could not compile (`authz_resolver_sdk::EnforcerError::Denied` and
+    /// could not compile (`authz_resolver_sdk::EnforcerError::AccessDenied` and
     /// `CompileFailed` both land here — an uncompilable *allow* is refused
     /// exactly like an explicit deny, never treated as an unconstrained one).
     #[error("permission denied: {0}")]
@@ -60,6 +60,11 @@ pub enum AuthzError {
     /// (`authz_resolver_sdk::EnforcerError::EvaluationFailed`).
     #[error("authz unavailable: {0}")]
     Unavailable(String),
+    /// The enforcer returned an outcome class this gate does not know: an
+    /// internal failure (HTTP 500), never a denial or an unavailable PDP. The
+    /// message is generic; the cause is logged where it is classified.
+    #[error("authz internal failure: {0}")]
+    Internal(String),
 }
 
 /// Shared PEP gate: asks the PDP whether `(resource_type, action)` is
@@ -132,7 +137,7 @@ pub async fn access_scope(
         .access_scope_with(ctx, resource, action, None, &request)
         .await
         .map_err(|e| match e {
-            authz_resolver_sdk::EnforcerError::Denied { .. } => denial(e.to_string()),
+            authz_resolver_sdk::EnforcerError::AccessDenied(_) => denial(e.to_string()),
             authz_resolver_sdk::EnforcerError::CompileFailed(ref compile_err) => {
                 // The compiler's diagnostic names PDP predicates and properties: an internal
                 // detail, not something the PDP told the caller. It stays in the log, and the
@@ -149,6 +154,14 @@ pub async fn access_scope(
             }
             authz_resolver_sdk::EnforcerError::EvaluationFailed(_) => {
                 AuthzError::Unavailable(e.to_string())
+            }
+            unknown => {
+                tracing::error!(
+                    target: "bss_products.authz.internal",
+                    error = %unknown,
+                    "bss-products: authz failed with an unknown outcome"
+                );
+                AuthzError::Internal("authorization failed with an unknown outcome".to_owned())
             }
         })?;
 

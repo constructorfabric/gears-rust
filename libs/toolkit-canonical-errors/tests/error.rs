@@ -287,3 +287,45 @@ fn validate_all_gts_ids() {
         GtsId::try_new(id).unwrap_or_else(|e| panic!("Invalid GTS type ID '{id}': {e}"));
     }
 }
+
+#[test]
+fn retry_after_seconds_reads_service_unavailable_hint() {
+    let err = CanonicalError::service_unavailable()
+        .with_retry_after_seconds(30)
+        .create();
+    assert_eq!(err.retry_after_seconds(), Some(30));
+    assert_eq!(
+        CanonicalError::service_unavailable()
+            .create()
+            .retry_after_seconds(),
+        None
+    );
+}
+
+#[test]
+fn retry_after_seconds_is_largest_quota_violation_hint() {
+    let err = R::resource_exhausted("Several limits reached")
+        .with_quota_violation("CONCURRENCY_LIMIT", "Queue runs 64 tasks")
+        .with_quota_violation_retry_after_seconds(2)
+        .with_quota_violation("QUEUE_DEPTH_LIMIT", "Queue holds 10000 tasks")
+        .with_quota_violation_retry_after_seconds(25)
+        .with_quota_violation("EVENT_WAIT_LIMIT", "Tenant has 1000 event waits")
+        .create();
+    assert_eq!(err.retry_after_seconds(), Some(25));
+}
+
+#[test]
+fn retry_after_seconds_is_none_without_quota_hint() {
+    let err = R::resource_exhausted("Storage quota exhausted")
+        .with_quota_violation("storage_bytes", "No space left in the tenant quota")
+        .create();
+    assert_eq!(err.retry_after_seconds(), None);
+}
+
+#[test]
+fn retry_after_seconds_is_none_for_other_categories() {
+    let err = R::not_found("Resource not found")
+        .with_resource("user-123")
+        .create();
+    assert_eq!(err.retry_after_seconds(), None);
+}

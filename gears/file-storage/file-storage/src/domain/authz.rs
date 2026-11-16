@@ -35,6 +35,16 @@ pub trait Authorizer: Send + Sync {
         gts_file_type: &str,
         file_id: Option<Uuid>,
     ) -> Result<AccessScope, DomainError>;
+
+    /// Authorize a LIST that applies the returned scope, including empty scopes.
+    /// Point operations and permission gates use [`Self::authorize`].
+    async fn authorize_allow_empty(
+        &self,
+        ctx: &SecurityContext,
+        action: &str,
+        gts_file_type: &str,
+        file_id: Option<Uuid>,
+    ) -> Result<AccessScope, DomainError>;
 }
 
 /// Enforces only the tenant boundary: any authenticated caller may act within
@@ -54,5 +64,15 @@ impl Authorizer for TenantOnlyAuthorizer {
         _file_id: Option<Uuid>,
     ) -> Result<AccessScope, DomainError> {
         Ok(AccessScope::for_tenant(ctx.subject_tenant_id()))
+    }
+
+    async fn authorize_allow_empty(
+        &self,
+        ctx: &SecurityContext,
+        action: &str,
+        gts_file_type: &str,
+        file_id: Option<Uuid>,
+    ) -> Result<AccessScope, DomainError> {
+        self.authorize(ctx, action, gts_file_type, file_id).await
     }
 }

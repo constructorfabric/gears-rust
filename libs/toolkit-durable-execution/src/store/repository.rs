@@ -91,6 +91,14 @@ impl DomainError {
             {
                 Self::Forbidden
             }
+            // Never `Unavailable`: an unclassified authorization failure is
+            // internal.
+            StoreError::Authorization(e)
+                if e.kind() == crate::authorization::AuthorizationErrorKind::Internal =>
+            {
+                tracing::error!(error = %e, "durable execution authorization failed internally");
+                Self::Internal("authorization failed internally")
+            }
             StoreError::DefinitionInactive => Self::DefinitionInactive,
             StoreError::DeliveryDisabled => Self::DeliveryDisabled,
             StoreError::Conflict => Self::ConcurrentUpdate,

@@ -169,48 +169,58 @@ fn default_wiring_is_local() {
     assert!(matches!(w, ClientWiring::Local));
 }
 
-/// `rest_only_knobs_set` names exactly the pool/concurrency knobs that were
-/// explicitly set — this is what the runtime warns on when a `grpc` transport
-/// carries a REST-only knob that would silently go nowhere.
+/// `grpc_ignored_knobs` names exactly the knobs a gRPC client does not apply
+/// that were explicitly set: what the runtime warns on, since they would
+/// silently go nowhere.
 #[test]
-fn rest_only_knobs_set_reports_which_were_set() {
-    // None set on a bare grpc wiring -> empty.
-    let w = parse(r#"{"transport": "grpc", "endpoint": "http://x:50051"}"#).unwrap();
-    let ClientWiring::Grpc { tuning, .. } = w else {
-        unreachable!()
+fn grpc_ignored_knobs_reports_which_were_set() {
+    let tuning = |json: &str| {
+        let ClientWiring::Grpc { tuning, .. } = parse(json).unwrap() else {
+            unreachable!()
+        };
+        tuning
     };
-    assert!(tuning.rest_only_knobs_set().is_empty());
 
-    // A subset set -> only those names, in declaration order.
-    let w = parse(
-        r#"{"transport": "grpc", "endpoint": "http://x:50051", "max_concurrent_requests": 10}"#,
-    )
-    .unwrap();
-    let ClientWiring::Grpc { tuning, .. } = w else {
-        unreachable!()
-    };
+    // None set on a bare grpc wiring -> empty.
+    assert!(
+        tuning(r#"{"transport": "grpc", "endpoint": "http://x:50051"}"#)
+            .grpc_ignored_knobs()
+            .is_empty()
+    );
+
+    // A subset set -> only those names.
     assert_eq!(
-        tuning.rest_only_knobs_set(),
+        tuning(
+            r#"{"transport": "grpc", "endpoint": "http://x:50051", "max_concurrent_requests": 10}"#
+        )
+        .grpc_ignored_knobs(),
         vec!["max_concurrent_requests"]
     );
 
-    // All three set -> all three names.
-    let w = parse(
-        r#"{
-            "transport": "grpc",
-            "endpoint": "http://x:50051",
-            "pool_max_idle_per_host": 256,
-            "pool_idle_timeout": "30s",
-            "max_concurrent_requests": 500
-        }"#,
-    )
-    .unwrap();
-    let ClientWiring::Grpc { tuning, .. } = w else {
-        unreachable!()
-    };
+    // The legacy `sse_reconnect` spelling is reported under the field name.
     assert_eq!(
-        tuning.rest_only_knobs_set(),
+        tuning(
+            r#"{"transport": "grpc", "endpoint": "http://x:50051", "sse_reconnect": {"max_attempts": 3}}"#
+        )
+        .grpc_ignored_knobs(),
+        vec!["stream_reconnect"]
+    );
+
+    // All set -> all names, in declaration order.
+    assert_eq!(
+        tuning(
+            r#"{
+                "transport": "grpc",
+                "endpoint": "http://x:50051",
+                "stream_reconnect": {"max_attempts": 3},
+                "pool_max_idle_per_host": 256,
+                "pool_idle_timeout": "30s",
+                "max_concurrent_requests": 500
+            }"#
+        )
+        .grpc_ignored_knobs(),
         vec![
+            "stream_reconnect",
             "pool_max_idle_per_host",
             "pool_idle_timeout",
             "max_concurrent_requests"
@@ -220,7 +230,7 @@ fn rest_only_knobs_set_reports_which_were_set() {
 
 /// `ConsumerWiring` — the consumer-side (`#[toolkit::consumes]`) schema:
 /// an object with an optional `endpoint` (omit to keep discovery) plus flattened
-/// `ClientTuning`. No `transport` tag (the consumer path is REST-only). The
+/// `ClientTuning`. No `transport` tag (the transport is chosen in code). The
 /// bare-string form earlier drafts accepted is deliberately rejected.
 mod consumer_wiring {
     use super::*;

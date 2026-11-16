@@ -372,11 +372,20 @@ impl GroupRepositoryTrait for GroupRepository {
         db: &C,
         id: Uuid,
     ) -> Result<Option<rg_entity::Model>, DomainError> {
-        let scope = system_scope();
+        self.find_model_by_id_scoped(db, &system_scope(), id).await
+    }
+
+    /// Find the raw entity model by ID, visible under `scope`.
+    async fn find_model_by_id_scoped<C: DBRunner>(
+        &self,
+        db: &C,
+        scope: &AccessScope,
+        id: Uuid,
+    ) -> Result<Option<rg_entity::Model>, DomainError> {
         ResourceGroupEntity::find()
             .filter(rg_entity::Column::Id.eq(id))
             .secure()
-            .scope_with(&scope)
+            .scope_with(scope)
             .one(db)
             .await
             .map_err(|e| DomainError::database(e.to_string()))

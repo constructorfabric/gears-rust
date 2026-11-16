@@ -132,6 +132,24 @@ async fn every_probe_must_succeed_before_closing() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn only_half_open_permits_are_probes() {
+    let b = breaker(small());
+    let closed = b.try_acquire().unwrap();
+    assert!(!closed.is_probe());
+    drop(closed);
+
+    record(&b, &[F, F, F, F]);
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let probe = b.try_acquire().unwrap();
+    assert!(probe.is_probe());
+    probe.success();
+
+    assert!(!b.try_acquire().unwrap().is_probe(), "closed again");
+    let disabled = Arc::new(CircuitBreaker::disabled());
+    assert!(!disabled.try_acquire().unwrap().is_probe());
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_dropped_probe_returns_its_slot() {
     let b = breaker(small());
     record(&b, &[F, F, F, F]);

@@ -71,11 +71,16 @@ impl DomainVisibility {
 /// query is returned unchanged rather than augmented with a predicate matching
 /// everything. A domain constraint that is present but yields no usable name is
 /// the opposite case and restricts to the undomained categories alone.
+///
+/// Deny-all scopes expose only undomained categories.
 #[must_use]
 pub fn domain_visibility(scope: &AccessScope) -> DomainVisibility {
     // @cpt-begin:cpt-cf-settings-service-algo-category-management-visibility-filter:p1:inst-cat-visfilter-1
     if scope.is_unconstrained() {
         return DomainVisibility::Unrestricted;
+    }
+    if scope.matches_nothing() {
+        return DomainVisibility::Restricted(Vec::new());
     }
 
     let mut domains: Vec<String> = Vec::new();

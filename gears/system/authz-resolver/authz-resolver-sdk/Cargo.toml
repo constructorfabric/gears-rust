@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-authz-resolver-sdk"
-version = "0.6.3"
+version = "0.6.5"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -48,6 +48,8 @@ toolkit-http = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 
 [features]
+# Shared authorization fixtures for downstream tests only.
+test-util = []
 # Generated directory-resolving REST client (`AuthZResolverApiRestClient` +
 # `...ResolvingClient`) used by out-of-process PEP consumers.
 rest-client = ["toolkit-contract/rest-client", "dep:toolkit-http"]

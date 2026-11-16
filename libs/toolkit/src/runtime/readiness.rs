@@ -68,6 +68,12 @@ impl DependencyChecker {
         self.deps.write().entry(dep_gear.into()).or_insert(false);
     }
 
+    /// Mark a dependency unresolved again, registering it if unknown: a
+    /// consumer wired later needs a target that is not resolved yet.
+    pub fn mark_unresolved(&self, dep_gear: &str) {
+        self.deps.write().insert(dep_gear.to_owned(), false);
+    }
+
     /// Mark a previously-registered dependency as resolved. Unknown names are
     /// ignored. Returns `true` only on the `false → true` transition (so callers
     /// can log the resolution exactly once).

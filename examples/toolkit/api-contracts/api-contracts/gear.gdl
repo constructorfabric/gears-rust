@@ -12,9 +12,12 @@ gdl_version = "1.0"
 # paths and the local factory.
 #
 # Note what that means here: the SDK has PaymentApiGrpc for v1, but this gear
-# provides both versions over `[local, rest]` only -- the `grpc-client` feature
-# is opt-in and used by a test that builds the gRPC client by hand. So there
-# is no `grpc(...)` binding to declare: nothing could select it.
+# provides both versions over `[local, rest]` only, so there is no `grpc(...)`
+# binding to declare: nothing in this gear could select it. The `grpc-server`
+# feature is a different thing: it adds a second gear, `api-contracts-grpc`
+# (src/grpc_gear.rs), that hosts a hand-written PaymentApi v1 gRPC service
+# through grpc-hub, which a consumer reaches with
+# `#[toolkit::consumes(.., transport = grpc)]` (api-contracts-grpc-consumer).
 
 PAYMENT_SDK = cargo(
     crate_name = "cf-api-contracts-sdk",
@@ -63,6 +66,6 @@ gear(
 
     serves = [endpoint(name = "rest", via = "rest_host")],
 
-    # `default` is Cargo's own and not a choice; the other two are.
-    cargo_features = [feature("otel"), feature("grpc-client")],
+    # `default` is Cargo's own and not a choice; the others are.
+    cargo_features = [feature("otel"), feature("grpc-client"), feature("grpc-server")],
 )
