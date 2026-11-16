@@ -16,9 +16,14 @@ use graph_storage_sdk::models::{
 };
 use graph_storage_sdk::plugin_api::{EmbeddingPlan, GraphStoreError, StoreCtx};
 use sea_orm::sea_query::{Expr, OnConflict};
-use sea_orm::{ActiveValue, ColumnTrait, Condition, EntityTrait, ExprTrait, QueryFilter};
+use sea_orm::{
+    ActiveValue, ColumnTrait, Condition, EntityTrait, ExprTrait, QueryFilter, QueryOrder,
+    QuerySelect,
+};
 use time::OffsetDateTime;
-use toolkit_db::secure::{DBRunner, SecureEntityExt, SecureInsertExt, SecureUpdateExt};
+use toolkit_db::secure::{
+    DBRunner, SecureEntityExt, SecureInsertExt, SecureInsertManyExt, SecureUpdateExt,
+};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
@@ -217,7 +222,7 @@ fn outcome_from_json(value: &serde_json::Value) -> Result<IngestOutcome, GraphSt
 }
 
 /// Read the tenant's revision inside the write transaction.
-async fn current_revision(
+pub(crate) async fn current_revision(
     scope: &AccessScope,
     runner: &impl DBRunner,
 ) -> Result<i64, GraphStoreError> {
@@ -231,7 +236,10 @@ async fn current_revision(
     Ok(row.and_then(|r| r.value.as_i64()).unwrap_or(0))
 }
 
-async fn source_epoch(scope: &AccessScope, runner: &impl DBRunner) -> Result<i64, GraphStoreError> {
+pub(crate) async fn source_epoch(
+    scope: &AccessScope,
+    runner: &impl DBRunner,
+) -> Result<i64, GraphStoreError> {
     let row = graph_meta::Entity::find()
         .secure()
         .scope_with(scope)
@@ -353,9 +361,10 @@ struct Writer<'a> {
     subject: &'a Subject,
     /// What is left of the request's absolute deadline.
     ///
-    /// A producer-sized batch is tens of thousands of sequential statements
-    /// inside one transaction holding one pool connection, so "the deadline
-    /// passed" has to be able to stop it between items. It cannot stop a
+    /// A producer-sized batch's updates are still one statement each inside
+    /// one transaction holding one pool connection (new rows are inserted
+    /// in bulk, gears-rust #5040), so "the deadline passed" has to be able
+    /// to stop it between items. It cannot stop a
     /// statement already in flight -- that needs a server-side bound
     /// toolkit-db does not offer yet (gears-rust #4761) -- but it can stop
     /// the gear from starting the next ten thousand.
@@ -504,9 +513,11 @@ async fn ingest_in_tx(
 /// removal) happens while that lock is held. Reading the row back afterwards
 /// therefore reads a settled value, and the decision is made on that.
 ///
-/// The platform's secure ORM exposes no row-locking surface at all
-/// (`SELECT … FOR UPDATE` is unreachable from a gear), so this statement is
-/// not a clever alternative to a lock — it is the only lock available.
+/// When this was written the platform's secure ORM exposed no row-locking
+/// surface; it now does (`lock_shared`, and a lock set inside `project_all`,
+/// which the node phase uses). The upsert stays the instrument here because
+/// the row may not exist yet, and a locking read cannot lock a row that is
+/// not there.
 async fn fence_scope(
     tenant: Uuid,
     scope: &AccessScope,
@@ -696,6 +707,360 @@ async fn endpoint_types(
         .collect())
 }
 
+/// How many keys one up-front read carries, and how many rows one bulk insert
+/// carries.
+///
+/// Both are bounded by the server's 65 535 bind parameters: a key is one, a
+/// node row about two dozen, so a thousand rows stay near a third of it. The
+/// size does not bound what a batch locks -- every row a statement writes
+/// stays locked until the transaction ends, however the batch is split -- so
+/// the one constant sets only how many statements a batch takes.
+const PREFETCH_CHUNK: usize = 1_000;
+
+/// The live nodes named by `keys`, read in one statement per
+/// [`PREFETCH_CHUNK`] keys rather than one per key (gears-rust #5040).
+async fn lookup_endpoints(
+    scope: &AccessScope,
+    tx: &impl DBRunner,
+    keys: &[&str],
+) -> Result<BTreeMap<String, Endpoint>, GraphStoreError> {
+    let mut found = BTreeMap::new();
+    for chunk in keys.chunks(PREFETCH_CHUNK) {
+        let rows = node::Entity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(
+                Condition::all()
+                    .add(node::Column::NodeKey.is_in(chunk.iter().map(|key| (*key).to_owned()))),
+            )
+            .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
+            .project_all(tx, |query| {
+                node_typed_columns(query).into_model::<NodeTyped>()
+            })
+            .await
+            .map_err(map_scope_err)?;
+        for row in rows {
+            found.insert(
+                row.node_key,
+                Endpoint {
+                    id: row.id,
+                    type_id: row.gts_node_type_id,
+                },
+            );
+        }
+    }
+    Ok(found)
+}
+
+/// The stored rows, tombstoned ones included, of the nodes a batch carries,
+/// keyed by node key: what `upsert_node` would read one key at a time.
+async fn stored_nodes(
+    scope: &AccessScope,
+    tx: &impl DBRunner,
+    keys: &[&str],
+) -> Result<BTreeMap<String, node::Model>, GraphStoreError> {
+    let mut found = BTreeMap::new();
+    for chunk in keys.chunks(PREFETCH_CHUNK) {
+        let rows = node::Entity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(
+                Condition::all()
+                    .add(node::Column::NodeKey.is_in(chunk.iter().map(|key| (*key).to_owned()))),
+            )
+            .all(tx)
+            .await
+            .map_err(map_scope_err)?;
+        found.extend(rows.into_iter().map(|row| (row.node_key.clone(), row)));
+    }
+    Ok(found)
+}
+
+/// Which lock a prefetched node is read again under at its turn.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Relock {
+    /// A node the batch carries and writes.
+    Written,
+    /// An endpoint the batch only links to.
+    Linked,
+}
+
+/// What decides whether a step's prefetched row is read again, and with which
+/// lock, before the step runs.
+struct RelockState<'a> {
+    request: &'a IngestRequest,
+    stored: &'a BTreeMap<String, node::Model>,
+    seen: &'a std::collections::BTreeSet<String>,
+    relocked: &'a std::collections::BTreeSet<String>,
+    prefetched: &'a std::collections::BTreeSet<String>,
+}
+
+impl RelockState<'_> {
+    /// The lock a step's prefetched row is read again under, or `None` when
+    /// it has no prefetched row or was read again already.
+    fn mode(&self, step: &NodeStep<'_>) -> Option<Relock> {
+        match *step {
+            NodeStep::Node(index) => {
+                let key = self.request.nodes[index].node_key.as_str();
+                (self.stored.contains_key(key)
+                    && !self.seen.contains(key)
+                    && !self.relocked.contains(key))
+                .then_some(Relock::Written)
+            }
+            NodeStep::Endpoint { key, .. } => (self.prefetched.contains(key)
+                && !self.relocked.contains(key))
+            .then_some(Relock::Linked),
+        }
+    }
+
+    /// The keys of the consecutive steps from the first of `steps` that are
+    /// read again under the same lock, at most a chunk of them.
+    fn run_keys(&self, steps: &[NodeStep<'_>], mode: Relock) -> Vec<String> {
+        let mut keys: Vec<String> = Vec::new();
+        for step in steps {
+            if self.mode(step) != Some(mode) || keys.len() == PREFETCH_CHUNK {
+                break;
+            }
+            let key = step.key(self.request).to_owned();
+            if keys.last() != Some(&key) {
+                keys.push(key);
+            }
+        }
+        keys
+    }
+}
+
+/// Read a run of prefetched rows again under its lock and replace what the
+/// up-front read said about them.
+async fn relock_run(
+    scope: &AccessScope,
+    tx: &impl DBRunner,
+    mode: Relock,
+    keys: &[String],
+    stored: &mut BTreeMap<String, node::Model>,
+    node_ids: &mut BTreeMap<String, Endpoint>,
+) -> Result<(), GraphStoreError> {
+    match mode {
+        Relock::Written => {
+            let mut fresh = relock_rows(scope, tx, keys).await?;
+            for key in keys {
+                // Gone since the up-front read -- purged or removed by a
+                // scope replacement -- the key is new again.
+                match fresh.remove(key) {
+                    Some(row) => stored.insert(key.clone(), row),
+                    None => stored.remove(key),
+                };
+            }
+        }
+        Relock::Linked => {
+            let mut fresh = relock_endpoints(scope, tx, keys).await?;
+            for key in keys {
+                // Tombstoned or gone since: the per-key resolution decides,
+                // refusal or phantom included.
+                match fresh.remove(key) {
+                    Some(endpoint) => node_ids.insert(key.clone(), endpoint),
+                    None => node_ids.remove(key),
+                };
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The keys of the consecutive edges from the first of `checked` whose
+/// up-front row has not been read again yet, at most a chunk of them; empty
+/// when the first has none.
+fn stale_edge_run(
+    checked: &[(String, usize, Endpoint, Endpoint)],
+    stored: &BTreeMap<String, edge::Model>,
+    seen: &std::collections::BTreeSet<String>,
+    relocked: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    let stale =
+        |key: &String| stored.contains_key(key) && !seen.contains(key) && !relocked.contains(key);
+    let mut keys: Vec<String> = Vec::new();
+    for (key, ..) in checked {
+        if !stale(key) || keys.len() == PREFETCH_CHUNK {
+            break;
+        }
+        if keys.last() != Some(key) {
+            keys.push(key.clone());
+        }
+    }
+    keys
+}
+
+/// Read a run of stored edges again under their lock and replace what the
+/// up-front read said about them.
+async fn relock_edge_run(
+    scope: &AccessScope,
+    tx: &impl DBRunner,
+    keys: &[String],
+    stored: &mut BTreeMap<String, edge::Model>,
+) -> Result<(), GraphStoreError> {
+    let mut fresh = relock_edge_rows(scope, tx, keys).await?;
+    for key in keys {
+        match fresh.remove(key) {
+            Some(row) => stored.insert(key.clone(), row),
+            // Gone since -- removed by a scope replacement or a purge -- the
+            // edge is new again.
+            None => stored.remove(key),
+        };
+    }
+    Ok(())
+}
+
+/// The stored edges of `keys`, tombstoned ones included, read under
+/// `FOR NO KEY UPDATE` in key order -- the lock their update takes anyway.
+async fn relock_edge_rows(
+    scope: &AccessScope,
+    tx: &impl DBRunner,
+    keys: &[String],
+) -> Result<BTreeMap<String, edge::Model>, GraphStoreError> {
+    let rows: Vec<edge::Model> = edge::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(Condition::all().add(edge::Column::EdgeKey.is_in(keys.to_vec())))
+        .project_all(tx, |query| {
+            query
+                .order_by_asc(edge::Column::EdgeKey)
+                .lock(sea_orm::sea_query::LockType::NoKeyUpdate)
+                .into_model::<edge::Model>()
+        })
+        .await
+        .map_err(map_scope_err)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.edge_key.clone(), row))
+        .collect())
+}
+
+/// The stored rows of `keys`, tombstoned ones included, read under
+/// `FOR NO KEY UPDATE` in key order -- the lock their update takes anyway.
+async fn relock_rows(
+    scope: &AccessScope,
+    tx: &impl DBRunner,
+    keys: &[String],
+) -> Result<BTreeMap<String, node::Model>, GraphStoreError> {
+    let rows: Vec<node::Model> = node::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(Condition::all().add(node::Column::NodeKey.is_in(keys.to_vec())))
+        .project_all(tx, |query| {
+            query
+                .order_by_asc(node::Column::NodeKey)
+                .lock(sea_orm::sea_query::LockType::NoKeyUpdate)
+                .into_model::<node::Model>()
+        })
+        .await
+        .map_err(map_scope_err)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.node_key.clone(), row))
+        .collect())
+}
+
+/// The live endpoints among `keys`, read under `FOR SHARE` in key order.
+async fn relock_endpoints(
+    scope: &AccessScope,
+    tx: &impl DBRunner,
+    keys: &[String],
+) -> Result<BTreeMap<String, Endpoint>, GraphStoreError> {
+    let rows: Vec<NodeTyped> = node::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(Condition::all().add(node::Column::NodeKey.is_in(keys.to_vec())))
+        .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
+        .project_all(tx, |query| {
+            node_typed_columns(query)
+                .order_by_asc(node::Column::NodeKey)
+                .lock(sea_orm::sea_query::LockType::Share)
+                .into_model::<NodeTyped>()
+        })
+        .await
+        .map_err(map_scope_err)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.node_key,
+                Endpoint {
+                    id: row.id,
+                    type_id: row.gts_node_type_id,
+                },
+            )
+        })
+        .collect())
+}
+
+/// The stored rows, tombstoned ones included, of the edges a batch carries,
+/// keyed by edge key: what `upsert_edge` would read one key at a time.
+async fn stored_edges(
+    scope: &AccessScope,
+    tx: &impl DBRunner,
+    keys: &[&str],
+) -> Result<BTreeMap<String, edge::Model>, GraphStoreError> {
+    let mut found = BTreeMap::new();
+    for chunk in keys.chunks(PREFETCH_CHUNK) {
+        let rows = edge::Entity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(
+                Condition::all()
+                    .add(edge::Column::EdgeKey.is_in(chunk.iter().map(|key| (*key).to_owned()))),
+            )
+            .all(tx)
+            .await
+            .map_err(map_scope_err)?;
+        found.extend(rows.into_iter().map(|row| (row.edge_key.clone(), row)));
+    }
+    Ok(found)
+}
+
+/// What a prefetch answered for one item of the batch.
+///
+/// `Some(row)` is the prefetched answer, absent included; `None` means "read
+/// it now", which is what a key the batch carries a second time gets, so the
+/// second occurrence sees what the first one wrote.
+type Known<T> = Option<Option<T>>;
+
+/// Take the prefetched answer for `key` on its first occurrence in the batch.
+fn known<T>(
+    stored: &mut BTreeMap<String, T>,
+    seen: &mut std::collections::BTreeSet<String>,
+    key: &str,
+) -> Known<T> {
+    seen.insert(key.to_owned()).then(|| stored.remove(key))
+}
+
+/// The types of a batch's edge endpoints, read once per type rather than once
+/// per edge: interned types are not changed by an ingest, so an answer stays
+/// true for the rest of the transaction.
+#[derive(Default)]
+struct EndpointTypeCache(BTreeMap<i32, (String, Option<String>)>);
+
+impl EndpointTypeCache {
+    async fn resolve(
+        &mut self,
+        scope: &AccessScope,
+        tx: &impl DBRunner,
+        ids: &[i32],
+    ) -> Result<BTreeMap<i32, (String, Option<String>)>, GraphStoreError> {
+        let missing: Vec<i32> = ids
+            .iter()
+            .copied()
+            .filter(|id| !self.0.contains_key(id))
+            .collect();
+        if !missing.is_empty() {
+            self.0.extend(endpoint_types(scope, tx, &missing).await?);
+        }
+        Ok(ids
+            .iter()
+            .filter_map(|id| self.0.get(id).map(|meta| (*id, meta.clone())))
+            .collect())
+    }
+}
+
 /// Revalidate every live edge incident to a node that has just become
 /// concrete.
 ///
@@ -868,6 +1233,10 @@ fn plan_vector(current: Option<&node::Model>, planned: PlannedVector<'_>) -> Vec
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one node write over the transaction's working state; the namespace set is the batch's, shared with the bulk path"
+)]
 async fn upsert_node(
     w: Writer<'_>,
     tx: &impl DBRunner,
@@ -875,15 +1244,20 @@ async fn upsert_node(
     info: &TypeInfo,
     index: usize,
     planned: PlannedVector<'_>,
+    known: Known<node::Model>,
+    authorized: &mut std::collections::BTreeSet<String>,
 ) -> Result<(i64, ItemOutcome), GraphStoreError> {
     let (tenant, scope, subject) = (w.tenant, w.scope, w.subject);
-    let existing = node::Entity::find()
-        .secure()
-        .scope_with(scope)
-        .filter(Condition::all().add(node::Column::NodeKey.eq(spec.node_key.clone())))
-        .one(tx)
-        .await
-        .map_err(map_scope_err)?;
+    let existing = match known {
+        Some(row) => row,
+        None => node::Entity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(Condition::all().add(node::Column::NodeKey.eq(spec.node_key.clone())))
+            .one(tx)
+            .await
+            .map_err(map_scope_err)?,
+    };
 
     let payload = spec
         .payload
@@ -910,8 +1284,12 @@ async fn upsert_node(
     {
         ownership::Namespaced::None => None,
         ownership::Namespaced::Under(namespace) => {
-            let writer = subject.principal();
-            super::namespaces::authorize_write(tenant, scope, tx, namespace, &writer).await?;
+            // Once per batch, whichever path meets the namespace first: the
+            // claim and the check are the same for every node that names it.
+            if authorized.insert(namespace.to_owned()) {
+                let writer = subject.principal();
+                super::namespaces::authorize_write(tenant, scope, tx, namespace, &writer).await?;
+            }
             Some(namespace.to_owned())
         }
     };
@@ -935,34 +1313,19 @@ async fn upsert_node(
                 ),
             });
         }
-        let active = node::ActiveModel {
-            tenant_id: ActiveValue::Set(tenant),
-            id: ActiveValue::NotSet,
-            node_key: ActiveValue::Set(spec.node_key.clone()),
-            gts_node_type_id: ActiveValue::Set(info.id),
-            name: ActiveValue::Set(name.clone()),
-            payload: ActiveValue::Set(payload.clone()),
-            search_text: ActiveValue::Set(search_text.clone()),
-            embedding: ActiveValue::Set(vector.embedding),
-            embedding_epoch: ActiveValue::Set(vector.epoch),
-            embedding_input_hash: ActiveValue::Set(vector.input_hash),
-            // Written once, on insert, and never by an upsert: the row's
-            // record of who created it is provenance, and provenance that a
-            // later write can rewrite is not provenance. Who may write the
-            // namespace *now* is the registry's answer, not this column's.
-            source_namespace: ActiveValue::Set(namespace),
-            owner_principal: ActiveValue::Set(subject.principal()),
-            version: ActiveValue::Set(1),
-            created_at: ActiveValue::Set(now),
-            updated_at: ActiveValue::Set(now),
-            deleted_at: ActiveValue::Set(None),
-            created_by_subject_id: ActiveValue::Set(subject.subject_id),
-            created_by_subject_type: ActiveValue::Set(subject.subject_type.clone()),
-            updated_by_subject_id: ActiveValue::Set(subject.subject_id),
-            updated_by_subject_type: ActiveValue::Set(subject.subject_type.clone()),
-            deleted_by_subject_id: ActiveValue::Set(None),
-            deleted_by_subject_type: ActiveValue::Set(None),
-        };
+        let active = new_node_row(
+            w,
+            spec,
+            info,
+            NewNode {
+                name: name.clone(),
+                payload: payload.clone(),
+                search_text: search_text.clone(),
+                vector,
+                namespace,
+                now,
+            },
+        );
         if let Some(id) = insert_node_row(scope, tx, active).await? {
             return Ok((id, ItemOutcome::Inserted));
         }
@@ -1165,6 +1528,122 @@ async fn upsert_node(
 /// this one then updated is exactly what the caller's update branch writes.
 /// The same shape as `insert_phantom`, including how the elided insert is
 /// reported.
+/// What a new node row carries besides its key, type and writer.
+struct NewNode {
+    name: String,
+    payload: serde_json::Value,
+    search_text: String,
+    vector: VectorWrite,
+    namespace: Option<String>,
+    now: OffsetDateTime,
+}
+
+/// The row a node is inserted as, by the item path and the bulk insert alike.
+fn new_node_row(
+    w: Writer<'_>,
+    spec: &NodeSpec,
+    info: &TypeInfo,
+    new: NewNode,
+) -> node::ActiveModel {
+    let subject = w.subject;
+    node::ActiveModel {
+        tenant_id: ActiveValue::Set(w.tenant),
+        id: ActiveValue::NotSet,
+        node_key: ActiveValue::Set(spec.node_key.clone()),
+        gts_node_type_id: ActiveValue::Set(info.id),
+        name: ActiveValue::Set(new.name),
+        payload: ActiveValue::Set(new.payload),
+        search_text: ActiveValue::Set(new.search_text),
+        embedding: ActiveValue::Set(new.vector.embedding),
+        embedding_epoch: ActiveValue::Set(new.vector.epoch),
+        embedding_input_hash: ActiveValue::Set(new.vector.input_hash),
+        // Written once, on insert, and never by an upsert: the row's record
+        // of who created it is provenance, and provenance that a later write
+        // can rewrite is not provenance. Who may write the namespace *now* is
+        // the registry's answer, not this column's.
+        source_namespace: ActiveValue::Set(new.namespace),
+        owner_principal: ActiveValue::Set(subject.principal()),
+        version: ActiveValue::Set(1),
+        created_at: ActiveValue::Set(new.now),
+        updated_at: ActiveValue::Set(new.now),
+        deleted_at: ActiveValue::Set(None),
+        created_by_subject_id: ActiveValue::Set(subject.subject_id),
+        created_by_subject_type: ActiveValue::Set(subject.subject_type.clone()),
+        updated_by_subject_id: ActiveValue::Set(subject.subject_id),
+        updated_by_subject_type: ActiveValue::Set(subject.subject_type.clone()),
+        deleted_by_subject_id: ActiveValue::Set(None),
+        deleted_by_subject_type: ActiveValue::Set(None),
+    }
+}
+
+/// The conflict clause of a bulk insert: `ON CONFLICT (tenant_id, key) DO
+/// UPDATE SET key = EXCLUDED.key WHERE false`.
+///
+/// It inserts what `DO NOTHING` inserts and returns what it returns -- a row
+/// whose update `WHERE false` rejects is not in `RETURNING` -- but PostgreSQL
+/// locks a conflicting row even when the update's condition is false. So a key
+/// another batch took since the up-front read is locked here, inside the
+/// statement and in its key order, rather than later by the item path, after
+/// the rows behind it in the run are already locked; the batch then takes
+/// every lock in key order, as #5042 requires (gears-rust #5040).
+fn locking_conflict<C>(tenant: C, key: C) -> OnConflict
+where
+    C: sea_orm::sea_query::IntoIden + Copy + 'static,
+{
+    OnConflict::columns([tenant, key])
+        .update_column(key)
+        .action_and_where(Expr::val(false))
+        .to_owned()
+}
+
+/// Insert `rows` -- new keys, in key order -- in one statement per
+/// [`PREFETCH_CHUNK`] rows, and return the keys and ids of the rows that
+/// landed.
+///
+/// `RETURNING` returns only the rows the statement inserted, so a key another
+/// batch inserted since the up-front read is absent from the answer -- and,
+/// with `conflict` from [`locking_conflict`], already locked by this
+/// transaction in key order. The caller writes it on the item path, which
+/// settles a lost race as before (gears-rust #5040).
+async fn insert_new_rows<E>(
+    scope: &AccessScope,
+    tx: &impl DBRunner,
+    budget: RemainingBudget,
+    rows: Vec<E::ActiveModel>,
+    conflict: OnConflict,
+    key_and_id: impl Fn(&E::Model) -> (String, i64),
+) -> Result<BTreeMap<String, i64>, GraphStoreError>
+where
+    E: sea_orm::EntityTrait + toolkit_db::secure::ScopableEntity,
+    E::ActiveModel: sea_orm::ActiveModelTrait<Entity = E> + Send,
+    E::Model: sea_orm::IntoActiveModel<E::ActiveModel>,
+{
+    let mut landed = BTreeMap::new();
+    let mut rest = rows;
+    while !rest.is_empty() {
+        // Between statements, as the item loops check between items: a batch
+        // past its deadline does not start its next thousand rows.
+        if budget.is_exhausted() {
+            return Err(GraphStoreError::Deadline);
+        }
+        let take = PREFETCH_CHUNK.min(rest.len());
+        let chunk: Vec<E::ActiveModel> = rest.drain(..take).collect();
+        // Unlike the single-row insert, a chunk whose every row lost its race
+        // is not an error: the returning select reads all rows, and none is
+        // an empty answer.
+        let models = E::insert_many(chunk)
+            .secure()
+            .scope_unchecked(scope)
+            .map_err(map_scope_err)?
+            .on_conflict_raw(conflict.clone())
+            .exec_with_returning(tx)
+            .await
+            .map_err(map_scope_err)?;
+        landed.extend(models.iter().map(&key_and_id));
+    }
+    Ok(landed)
+}
+
 async fn insert_node_row(
     scope: &AccessScope,
     tx: &impl DBRunner,
@@ -1366,6 +1845,47 @@ async fn insert_phantom(
     }
 }
 
+/// What a new edge row carries besides its spec and writer.
+struct NewEdge<'a> {
+    key: String,
+    type_id: i32,
+    src: i64,
+    dst: i64,
+    payload: serde_json::Value,
+    declaring: Option<(&'a str, &'a str)>,
+    now: OffsetDateTime,
+}
+
+/// The row an edge is inserted as, by the item path and the bulk insert alike.
+fn new_edge_row(w: Writer<'_>, spec: &EdgeSpec, new: NewEdge<'_>) -> edge::ActiveModel {
+    let subject = w.subject;
+    edge::ActiveModel {
+        tenant_id: ActiveValue::Set(w.tenant),
+        id: ActiveValue::NotSet,
+        edge_key: ActiveValue::Set(new.key),
+        gts_edge_type_id: ActiveValue::Set(new.type_id),
+        src_node_id: ActiveValue::Set(new.src),
+        dst_node_id: ActiveValue::Set(new.dst),
+        discriminator: ActiveValue::Set(spec.discriminator.clone()),
+        payload: ActiveValue::Set(new.payload),
+        created_at: ActiveValue::Set(new.now),
+        updated_at: ActiveValue::Set(new.now),
+        deleted_at: ActiveValue::Set(None),
+        scope_attribute: ActiveValue::Set(new.declaring.map(|(attribute, _)| attribute.to_owned())),
+        scope_value: ActiveValue::Set(new.declaring.map(|(_, value)| value.to_owned())),
+        created_by_subject_id: ActiveValue::Set(subject.subject_id),
+        created_by_subject_type: ActiveValue::Set(subject.subject_type.clone()),
+        updated_by_subject_id: ActiveValue::Set(subject.subject_id),
+        updated_by_subject_type: ActiveValue::Set(subject.subject_type.clone()),
+        deleted_by_subject_id: ActiveValue::Set(None),
+        deleted_by_subject_type: ActiveValue::Set(None),
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one item of the edge phase over the transaction's working state; bundling it would name a struct for a single call site"
+)]
 async fn upsert_edge(
     w: Writer<'_>,
     tx: &impl DBRunner,
@@ -1374,8 +1894,9 @@ async fn upsert_edge(
     src: i64,
     dst: i64,
     declaring: Option<(&str, &str)>,
+    known: Known<edge::Model>,
 ) -> Result<ItemOutcome, GraphStoreError> {
-    let (tenant, scope, subject) = (w.tenant, w.scope, w.subject);
+    let (scope, subject) = (w.scope, w.subject);
     let edge_key = identity::derive_edge_key(info.uuid, spec);
     let now = OffsetDateTime::now_utc();
     let payload = spec
@@ -1383,38 +1904,33 @@ async fn upsert_edge(
         .clone()
         .unwrap_or_else(|| serde_json::json!({}));
 
-    let existing = edge::Entity::find()
-        .secure()
-        .scope_with(scope)
-        .filter(Condition::all().add(edge::Column::EdgeKey.eq(edge_key.clone())))
-        .one(tx)
-        .await
-        .map_err(map_scope_err)?;
+    let existing = match known {
+        Some(row) => row,
+        None => edge::Entity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(Condition::all().add(edge::Column::EdgeKey.eq(edge_key.clone())))
+            .one(tx)
+            .await
+            .map_err(map_scope_err)?,
+    };
 
     let current = if let Some(current) = existing {
         current
     } else {
-        let active = edge::ActiveModel {
-            tenant_id: ActiveValue::Set(tenant),
-            id: ActiveValue::NotSet,
-            edge_key: ActiveValue::Set(edge_key.clone()),
-            gts_edge_type_id: ActiveValue::Set(info.id),
-            src_node_id: ActiveValue::Set(src),
-            dst_node_id: ActiveValue::Set(dst),
-            discriminator: ActiveValue::Set(spec.discriminator.clone()),
-            payload: ActiveValue::Set(payload.clone()),
-            created_at: ActiveValue::Set(now),
-            updated_at: ActiveValue::Set(now),
-            deleted_at: ActiveValue::Set(None),
-            scope_attribute: ActiveValue::Set(declaring.map(|(attribute, _)| attribute.to_owned())),
-            scope_value: ActiveValue::Set(declaring.map(|(_, value)| value.to_owned())),
-            created_by_subject_id: ActiveValue::Set(subject.subject_id),
-            created_by_subject_type: ActiveValue::Set(subject.subject_type.clone()),
-            updated_by_subject_id: ActiveValue::Set(subject.subject_id),
-            updated_by_subject_type: ActiveValue::Set(subject.subject_type.clone()),
-            deleted_by_subject_id: ActiveValue::Set(None),
-            deleted_by_subject_type: ActiveValue::Set(None),
-        };
+        let active = new_edge_row(
+            w,
+            spec,
+            NewEdge {
+                key: edge_key.clone(),
+                type_id: info.id,
+                src,
+                dst,
+                payload: payload.clone(),
+                declaring,
+                now,
+            },
+        );
         // Two batches declaring one new edge both found no row, and the
         // second lost a unique violation on `(tenant_id, edge_key)` -- the
         // edge half of what `insert_node_row` settles for nodes (gears-rust
@@ -2132,6 +2648,7 @@ pub const fn migrated_embedding_dimension() -> u32 {
 
 /// One step of the node phase: a node the batch carries, or an edge endpoint
 /// it names without carrying (`edge` is the first edge that names it).
+#[derive(Clone, Copy)]
 enum NodeStep<'a> {
     Node(usize),
     Endpoint { key: &'a str, edge: usize },
@@ -2189,14 +2706,115 @@ async fn write_nodes(
     // Stable, so a key the batch carries twice is written in request order.
     steps.sort_by(|a, b| a.key(request).cmp(b.key(request)));
 
+    // What the item loop below would read one key at a time, read up front
+    // in a few statements (gears-rust #5040): the live nodes the edges name
+    // without carrying, and the stored rows of the nodes carried. They take
+    // no lock and run before the batch waits on any key, so what they find is
+    // read again under a lock at its turn in key order (below); a key not
+    // found here is new, and a concurrent insert of it is met by the
+    // lost-race paths. A key not found as a live endpoint still takes the
+    // per-key path, tombstone check and phantom included.
+    let external: Vec<&str> = named.iter().copied().collect();
+    node_ids.extend(lookup_endpoints(w.scope, tx, &external).await?);
+    let carried_keys: Vec<&str> = carried.iter().copied().collect();
+    let mut stored = stored_nodes(w.scope, tx, &carried_keys).await?;
+    let mut seen = std::collections::BTreeSet::new();
+
+    // The nodes the up-front read found no row for are inserted together,
+    // in key order, before the item loop: one statement per thousand rows
+    // instead of one per node. Only a first occurrence qualifies, and only
+    // one the item path would insert without a question to ask -- no
+    // `expected_version` other than `Some(0)`, a registered type, a planned
+    // vector. A namespace is authorized once, before the rows that name it.
+    // Whatever does not qualify, or lost its key to a concurrent batch, is
+    // written by the item loop as before.
+    // New nodes are inserted in bulk, but never ahead of the key order: the
+    // steps run in one global key order, as #5042 requires of every write, a
+    // run of consecutive new nodes is collected, and the run is inserted
+    // before any step that writes on its own -- a phantom endpoint, an
+    // update, a repeat -- and at the end. A node qualifies when the item path
+    // would insert it without a question to ask: its first occurrence, no
+    // stored row, no `expected_version` but `Some(0)`, a registered type and
+    // a planned vector. A namespace is authorized once, at the first node
+    // that names it (gears-rust #5040).
+    let batch = NodeBatch {
+        w,
+        request,
+        types,
+        embedding,
+        now: OffsetDateTime::now_utc(),
+    };
+    let mut authorized = std::collections::BTreeSet::new();
+    let mut run: Vec<(usize, node::ActiveModel)> = Vec::new();
     let mut changed = false;
     let mut outcomes: Vec<Option<ItemOutcome>> = vec![None; request.nodes.len()];
-    for step in steps {
+    // The up-front reads above took no lock and ran before this batch waited
+    // on any key. A row another batch commits while this one waits on an
+    // earlier key is therefore missing from them, where the per-key read they
+    // replace -- made at the key's turn, after those waits -- saw it. So each
+    // prefetched row is read again at its turn in key order, under a lock,
+    // a run of consecutive keys per statement: a node this batch writes under
+    // `FOR NO KEY UPDATE`, the lock its update takes anyway, and an endpoint
+    // it only links to under `FOR SHARE`, which keeps a concurrent batch from
+    // materializing it into a type the edge does not admit until this one
+    // commits. Neither blocks a foreign-key check of another batch's edge.
+    let prefetched_endpoints: std::collections::BTreeSet<String> = external
+        .iter()
+        .filter(|key| node_ids.contains_key(**key))
+        .map(|key| (*key).to_owned())
+        .collect();
+    let mut relocked = std::collections::BTreeSet::new();
+    for position in 0..steps.len() {
         // Between items, not inside one: an item half written is not a state
         // this store has, and the transaction is what guarantees that.
         if w.budget.is_exhausted() {
             return Err(GraphStoreError::Deadline);
         }
+        let step = steps[position];
+        let state = RelockState {
+            request,
+            stored: &stored,
+            seen: &seen,
+            relocked: &relocked,
+            prefetched: &prefetched_endpoints,
+        };
+        if let Some(mode) = state.mode(&step) {
+            let keys = state.run_keys(&steps[position..], mode);
+            // The pending run holds earlier keys; its locks come first.
+            batch
+                .flush(tx, &mut run, node_ids, &mut outcomes, &mut authorized)
+                .await?;
+            relock_run(w.scope, tx, mode, &keys, &mut stored, node_ids).await?;
+            relocked.extend(keys);
+        }
+        if let NodeStep::Node(index) = step
+            && let Some((row, namespace)) = batch.new_row(index, &stored, &seen)
+        {
+            // A claim locks the namespace row, so the earlier keys pending
+            // in the run are inserted before it, not after.
+            if let Some(namespace) = namespace
+                && !authorized.contains(&namespace)
+            {
+                batch
+                    .flush(tx, &mut run, node_ids, &mut outcomes, &mut authorized)
+                    .await?;
+                super::namespaces::authorize_write(
+                    w.tenant,
+                    w.scope,
+                    tx,
+                    &namespace,
+                    &w.subject.principal(),
+                )
+                .await?;
+                authorized.insert(namespace);
+            }
+            seen.insert(request.nodes[index].node_key.clone());
+            run.push((index, row));
+            continue;
+        }
+        batch
+            .flush(tx, &mut run, node_ids, &mut outcomes, &mut authorized)
+            .await?;
         let index = match step {
             NodeStep::Node(index) => index,
             NodeStep::Endpoint { key, edge } => {
@@ -2224,28 +2842,15 @@ async fn write_nodes(
                 "type is not registered".into(),
             )
         })?;
-        // Index-aligned with the request's nodes, by the port's contract. A
-        // missing entry would silently unembed a node, so it is a store
-        // failure rather than a default.
-        let decided = embedding.nodes.get(index).ok_or_else(|| {
-            GraphStoreError::Internal(format!(
-                "embedding plan covers {} nodes; the batch has {}",
-                embedding.nodes.len(),
-                request.nodes.len()
-            ))
-        })?;
-        let (id, write) = upsert_node(
-            w,
-            tx,
-            spec,
-            info,
-            index,
-            PlannedVector {
-                decided,
-                active_epoch: embedding.epoch,
-            },
-        )
-        .await?;
+        let (id, write) = batch
+            .upsert(
+                tx,
+                index,
+                info,
+                known(&mut stored, &mut seen, &spec.node_key),
+                &mut authorized,
+            )
+            .await?;
         node_ids.insert(
             spec.node_key.clone(),
             Endpoint {
@@ -2255,14 +2860,168 @@ async fn write_nodes(
         );
         outcomes[index] = Some(write);
     }
+    batch
+        .flush(tx, &mut run, node_ids, &mut outcomes, &mut authorized)
+        .await?;
     for outcome in outcomes.into_iter().flatten() {
         changed |= tally.node(&outcome);
     }
     Ok(changed)
 }
 
-/// Resolve one edge endpoint: from this batch, from storage, or — when the
-/// request allows it — as a freshly created phantom.
+/// The node phase's fixed inputs, for the steps that insert new nodes in
+/// runs and write the rest one at a time.
+struct NodeBatch<'a> {
+    w: Writer<'a>,
+    request: &'a IngestRequest,
+    types: &'a BTreeMap<String, TypeInfo>,
+    embedding: &'a EmbeddingPlan,
+    now: OffsetDateTime,
+}
+
+impl NodeBatch<'_> {
+    /// The row node `index` is inserted as when it joins a bulk run, with the
+    /// namespace it names, or `None` when the item path has a question to ask
+    /// about it. The namespace is not authorized here: a claim takes a lock,
+    /// and the caller first inserts the pending run of earlier keys.
+    fn new_row(
+        &self,
+        index: usize,
+        stored: &BTreeMap<String, node::Model>,
+        seen: &std::collections::BTreeSet<String>,
+    ) -> Option<(node::ActiveModel, Option<String>)> {
+        let spec = &self.request.nodes[index];
+        if seen.contains(spec.node_key.as_str())
+            || stored.contains_key(&spec.node_key)
+            || !matches!(spec.expected_version, None | Some(0))
+        {
+            return None;
+        }
+        let (Some(info), Some(decided)) = (
+            self.types.get(&spec.type_id),
+            self.embedding.nodes.get(index),
+        ) else {
+            return None;
+        };
+        let Ok(namespaced) = ownership::namespace_of(info.family.as_deref(), spec.payload.as_ref())
+        else {
+            return None;
+        };
+        let namespace = match namespaced {
+            ownership::Namespaced::None => None,
+            ownership::Namespaced::Under(namespace) => Some(namespace.to_owned()),
+        };
+        let row = new_node_row(
+            self.w,
+            spec,
+            info,
+            NewNode {
+                name: spec.name.clone().unwrap_or_default(),
+                payload: spec
+                    .payload
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({})),
+                search_text: compose_search_text(
+                    spec.name.as_deref(),
+                    spec.payload.as_ref(),
+                    &info.full_text_search,
+                ),
+                vector: plan_vector(
+                    None,
+                    PlannedVector {
+                        decided,
+                        active_epoch: self.embedding.epoch,
+                    },
+                ),
+                namespace: namespace.clone(),
+                now: self.now,
+            },
+        );
+        Some((row, namespace))
+    }
+
+    /// Insert the pending run, then write on the item path, right after it,
+    /// every node of the run a concurrent batch took since the up-front read:
+    /// `RETURNING` leaves it out, and the item path settles the lost race.
+    async fn flush(
+        &self,
+        tx: &impl DBRunner,
+        run: &mut Vec<(usize, node::ActiveModel)>,
+        node_ids: &mut BTreeMap<String, Endpoint>,
+        outcomes: &mut [Option<ItemOutcome>],
+        authorized: &mut std::collections::BTreeSet<String>,
+    ) -> Result<(), GraphStoreError> {
+        if run.is_empty() {
+            return Ok(());
+        }
+        let (indices, rows): (Vec<usize>, Vec<node::ActiveModel>) = run.drain(..).unzip();
+        let landed = insert_new_rows::<node::Entity>(
+            self.w.scope,
+            tx,
+            self.w.budget,
+            rows,
+            locking_conflict(node::Column::TenantId, node::Column::NodeKey),
+            |row| (row.node_key.clone(), row.id),
+        )
+        .await?;
+        for index in indices {
+            if self.w.budget.is_exhausted() {
+                return Err(GraphStoreError::Deadline);
+            }
+            let spec = &self.request.nodes[index];
+            let info = &self.types[&spec.type_id];
+            let (id, outcome) = match landed.get(&spec.node_key) {
+                Some(&id) => (id, ItemOutcome::Inserted),
+                None => self.upsert(tx, index, info, None, authorized).await?,
+            };
+            node_ids.insert(
+                spec.node_key.clone(),
+                Endpoint {
+                    id,
+                    type_id: info.id,
+                },
+            );
+            outcomes[index] = Some(outcome);
+        }
+        Ok(())
+    }
+
+    /// Node `index` on the item path.
+    async fn upsert(
+        &self,
+        tx: &impl DBRunner,
+        index: usize,
+        info: &TypeInfo,
+        known: Known<node::Model>,
+        authorized: &mut std::collections::BTreeSet<String>,
+    ) -> Result<(i64, ItemOutcome), GraphStoreError> {
+        // Index-aligned with the request's nodes, by the port's contract. A
+        // missing entry would silently unembed a node, so it is a store
+        // failure rather than a default.
+        let decided = self.embedding.nodes.get(index).ok_or_else(|| {
+            GraphStoreError::Internal(format!(
+                "embedding plan covers {} nodes; the batch has {}",
+                self.embedding.nodes.len(),
+                self.request.nodes.len()
+            ))
+        })?;
+        upsert_node(
+            self.w,
+            tx,
+            &self.request.nodes[index],
+            info,
+            index,
+            PlannedVector {
+                decided,
+                active_epoch: self.embedding.epoch,
+            },
+            known,
+            authorized,
+        )
+        .await
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "one resolution step over the transaction's whole working state; bundling it would name a struct for a single call site"
@@ -2363,7 +3122,26 @@ async fn write_edges(
     order.sort();
     let mut outcomes: Vec<Option<ItemOutcome>> = vec![None; request.edges.len()];
 
-    for (_, index) in order {
+    // The stored edges, read up front as `write_nodes` reads the nodes, and
+    // the endpoint types, read once per type rather than once per edge.
+    let edge_keys: Vec<&str> = order
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .filter(|key| !key.is_empty())
+        .collect();
+    let mut stored = stored_edges(w.scope, tx, &edge_keys).await?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut endpoint_type_cache = EndpointTypeCache::default();
+
+    let declaring = request
+        .replace_scope
+        .as_ref()
+        .map(|replace| (replace.attribute.as_str(), replace.value.as_str()));
+
+    // First pass, reads only: every edge's endpoints resolved and its endpoint
+    // constraints checked, in key order.
+    let mut checked: Vec<(String, usize, Endpoint, Endpoint)> = Vec::with_capacity(order.len());
+    for (edge_key, index) in order {
         let spec = &request.edges[index];
         if w.budget.is_exhausted() {
             return Err(GraphStoreError::Deadline);
@@ -2398,7 +3176,9 @@ async fn write_edges(
         // Endpoint constraints, checked here because this is the only place
         // both endpoints are resolved and still inside the ingest transaction,
         // so an endpoint's type cannot change between the check and the commit.
-        let resolved = endpoint_types(w.scope, tx, &[src.type_id, dst.type_id]).await?;
+        let resolved = endpoint_type_cache
+            .resolve(w.scope, tx, &[src.type_id, dst.type_id])
+            .await?;
         for (end, endpoint, patterns, pointer) in [
             (&spec.src_node_key, src, &info.src_types, "/src_node_key"),
             (&spec.dst_node_key, dst, &info.dst_types, "/dst_node_key"),
@@ -2424,6 +3204,68 @@ async fn write_edges(
             }
         }
 
+        checked.push((edge_key, index, src, dst));
+    }
+
+    // The writes, in key order. New edges are inserted in runs, as
+    // `write_nodes` inserts new nodes: a first occurrence with no stored row
+    // joins the pending run, and the run is inserted before any edge written
+    // on its own and at the end, so no lock is taken out of key order. A key
+    // a concurrent batch took since the read is written on the item path
+    // right after its run.
+    //
+    // A stored edge is read again at its turn, under the lock its update
+    // takes, as `write_nodes` reads a stored node again: the up-front read
+    // ran before the endpoint pass and every earlier write, and a delete or
+    // a rewrite that committed since would otherwise be answered as
+    // `Unchanged` from the old row. One statement per run of consecutive
+    // stored keys.
+    let now = OffsetDateTime::now_utc();
+    let mut run: Vec<(usize, String, Endpoint, Endpoint, edge::ActiveModel)> = Vec::new();
+    let mut relocked = std::collections::BTreeSet::new();
+    for position in 0..checked.len() {
+        if w.budget.is_exhausted() {
+            return Err(GraphStoreError::Deadline);
+        }
+        let keys = stale_edge_run(&checked[position..], &stored, &seen, &relocked);
+        if !keys.is_empty() {
+            // The pending run holds earlier keys; its locks come first.
+            flush_new_edges(w, tx, request, types, declaring, &mut run, &mut outcomes).await?;
+            relock_edge_run(w.scope, tx, &keys, &mut stored).await?;
+            relocked.extend(keys);
+        }
+        let (edge_key, index, src, dst) = checked[position].clone();
+        let spec = &request.edges[index];
+        let info = types.get(&spec.type_id).ok_or_else(|| {
+            item_error(
+                index,
+                ItemFamily::Edge,
+                &spec.type_id,
+                "type is not registered".into(),
+            )
+        })?;
+        if !seen.contains(edge_key.as_str()) && !stored.contains_key(&edge_key) {
+            seen.insert(edge_key.clone());
+            let row = new_edge_row(
+                w,
+                spec,
+                NewEdge {
+                    key: edge_key.clone(),
+                    type_id: info.id,
+                    src: src.id,
+                    dst: dst.id,
+                    payload: spec
+                        .payload
+                        .clone()
+                        .unwrap_or_else(|| serde_json::json!({})),
+                    declaring,
+                    now,
+                },
+            );
+            run.push((index, edge_key, src, dst, row));
+            continue;
+        }
+        flush_new_edges(w, tx, request, types, declaring, &mut run, &mut outcomes).await?;
         outcomes[index] = Some(
             upsert_edge(
                 w,
@@ -2432,18 +3274,71 @@ async fn write_edges(
                 info,
                 src.id,
                 dst.id,
-                request
-                    .replace_scope
-                    .as_ref()
-                    .map(|replace| (replace.attribute.as_str(), replace.value.as_str())),
+                declaring,
+                known(&mut stored, &mut seen, &edge_key),
             )
             .await?,
         );
     }
+    flush_new_edges(w, tx, request, types, declaring, &mut run, &mut outcomes).await?;
     for outcome in outcomes.into_iter().flatten() {
         changed |= tally.edge(&outcome);
     }
     Ok(changed)
+}
+
+/// Insert a pending run of new edges, then write on the item path, right
+/// after it, every edge of the run a concurrent batch took since the
+/// up-front read: `RETURNING` leaves it out.
+async fn flush_new_edges(
+    w: Writer<'_>,
+    tx: &impl DBRunner,
+    request: &IngestRequest,
+    types: &BTreeMap<String, TypeInfo>,
+    declaring: Option<(&str, &str)>,
+    run: &mut Vec<(usize, String, Endpoint, Endpoint, edge::ActiveModel)>,
+    outcomes: &mut [Option<ItemOutcome>],
+) -> Result<(), GraphStoreError> {
+    if run.is_empty() {
+        return Ok(());
+    }
+    let mut pending = Vec::with_capacity(run.len());
+    let mut rows = Vec::with_capacity(run.len());
+    for (index, key, src, dst, row) in run.drain(..) {
+        pending.push((index, key, src, dst));
+        rows.push(row);
+    }
+    let landed = insert_new_rows::<edge::Entity>(
+        w.scope,
+        tx,
+        w.budget,
+        rows,
+        locking_conflict(edge::Column::TenantId, edge::Column::EdgeKey),
+        |row| (row.edge_key.clone(), row.id),
+    )
+    .await?;
+    for (index, key, src, dst) in pending {
+        if w.budget.is_exhausted() {
+            return Err(GraphStoreError::Deadline);
+        }
+        outcomes[index] = Some(if landed.contains_key(&key) {
+            ItemOutcome::Inserted
+        } else {
+            let spec = &request.edges[index];
+            upsert_edge(
+                w,
+                tx,
+                spec,
+                &types[&spec.type_id],
+                src.id,
+                dst.id,
+                declaring,
+                None,
+            )
+            .await?
+        });
+    }
+    Ok(())
 }
 
 /// A recorded receipt for this key, when the request matches it.

@@ -219,7 +219,7 @@ The graph stores what queries need: names, indexed attributes, vectorizable text
 
 - [ ] `p1` - **ID**: `cpt-cf-graph-storage-principle-provenance-survives-resync`
 
-Re-importing source data is always safe: scope replacement removes only static content, and analysis-originated nodes and edges — identified by provenance — persist across it.
+Re-importing source data is always safe: scope replacement removes only static content, and live analysis-originated nodes and edges — identified by provenance — persist across it. A *tombstoned* analysis edge incident to a node the replacement removes goes with it: it is a conclusion someone already deleted, and left in place its row would keep the node from leaving and the scope from converging (§ Soft Delete Contract).
 
 #### Tenant-Scoped by Construction
 
@@ -2355,10 +2355,50 @@ its chunks, its labels and its provenance stay in place.
    and deleting the node takes its edges with it (rule 2). Held by
    `a_deleted_edge_is_revived_by_the_next_upsert` against both stores.
 
-Undelete and a retention job that hard-deletes past a configurable window are
-p2. They are separated deliberately: the tombstone is reversible and cheap,
-while purge has to decide cascade ordering, key reuse and index reconciliation,
-and none of those need to block v1.
+**Purge removes for good** (gears-rust #5194). `DELETE /nodes/{node_key}?mode=purge`,
+`GraphStorageClientV1::purge_node`, authorized as its own action `purge`, removes
+a node -- live or tombstoned -- and every edge incident to it in one transaction:
+the edges first, static, analysis, live and tombstoned alike, because the
+endpoint foreign keys are `ON DELETE RESTRICT` and an erasure outranks a
+conclusion drawn about what it erases; then the node. The edges are deleted in
+the node's own tenant, not under the caller's scope, which can name resources
+by id (a node's id is not its edges') or carry no tenant constraint at all. The key is free again,
+the revision advances once, and a key with no stored node is no change: the
+SDK answers `purged_nodes: 0` and REST answers `204` either way, so a retry after
+an unknown outcome is answered as the first call was -- **as long as the key is
+not written again in between**: a purge frees the key, and a retry finds
+whatever node holds it by then. Where keys are reused (a profile root keyed by
+subject, a mirror node keyed by its source identity), soft-delete first and
+purge with `only_tombstoned` (`PurgeOptions`, `?only_tombstoned=true`): a
+tombstoned key cannot be reused, and a live node under it is refused with
+`409`, so a late retry meets a conflict instead of erasing a new node. That
+still lets a retry erase a later node that was itself soft-deleted in
+between; `expected_created_at` (`?expected_created_at=`) closes it, binding
+the purge to the node created at that instant -- the envelope's
+`created_at`, set at insert and never changed -- and refusing any other node
+under the key with `409`, live or tombstoned. It compares timestamps at the
+store's precision, taken from the inserting process's clock, and is not a
+unique instance identity: two nodes under one key are separated by a purge,
+so they match only if a clock ran backwards between them by exactly their
+distance. An identity that cannot repeat, for delete and purge alike, is
+tracked in [#5944](https://github.com/constructorfabric/gears-rust/issues/5944).
+Random keys need neither. An edge another batch
+attaches between the two statements makes the node delete fail on the foreign
+key, a conflict the caller retries. Purge is the way to erase the tombstones
+deletes left: rule 4's key comes back with it, and rule 5's index entries go
+with the row. What the gear removes is the rows; dead tuples until `VACUUM`,
+WAL and backups follow the deployment's retention, so "gone from all storage
+within N days" is a deployment property, not this call's.
+
+**A scope replacement removes tombstoned members too.** A tombstone keeps its
+payload, search text and vector, and an empty replacement is the scope's
+erasure, so a member deleted before it is removed with the live ones -- the
+same rules apply, a live analysis edge still keeps its endpoint. Tombstoned edges
+removed with a departing node count in `scope_removed_edges` and move the
+revision like any other removal.
+
+Undelete and a retention job that purges tombstones past a configurable window
+remain p2; the job needs a window and a key-reuse policy of its own.
 
 ### Closed Enum Contract
 
@@ -2471,6 +2511,7 @@ Tenant scoping is the outer wall; the PDP-derived `AccessScope` is the inner, re
 | Ingest | graph node | write | edges authorize via both endpoints; chunks via parent node; scope replacement via owned scope; reference nodes additionally authorize against the source-namespace owner |
 | Node read | graph node | read | chunks, labels and adjacency via the node's scope; unauthorized key follows the anti-enumeration contract |
 | Delete | graph node (+ edge via endpoints) | delete | incident edges follow the node; a caller authorized for the node is authorized for the cascade |
+| Purge | graph node (+ edge via endpoints) | purge | as delete, and every incident edge goes, analysis edges included. `purge` does not imply `read`, as `delete` does not: an erasure identity need not see the content it erases. The answer discloses only whether a node was stored under the key and how many edges it had; a policy that wants erasers to hold `read` too grants the two together |
 | Labels (registry) | graph type | admin | none (tenant-level) — labels are deferred; the row is the intended binding |
 | Labels (attach / detach) | graph node, graph edge | label | authorized on the target object, not on the label; distinct from ingest write — deferred with labels; the `label` action and the edge resource are declared and unused |
 | Search | graph node | read | resource predicate inside all four arms before UNION/ranking/LIMIT; chunk rows authorize through their parent node; folding, counts, snippets, fusion inputs, pagination, and hydration re-apply the same scope |
@@ -3079,8 +3120,8 @@ which is not part of the ontology) to the `toolkit-gts` inventory
 (`graph_storage_sdk::gts`), as the other gears publish their type schemas: the
 ontology is the public contract producers derive from, and a process that links
 only the SDK publishes it too. The gear submits its permission instances (one
-`AuthzPermissionV1` per resource and action the PEP checks: node read, write
-and delete; type read and admin; `src/gts.rs`). Every permission's resource
+`AuthzPermissionV1` per resource and action the PEP checks: node read, write,
+delete and purge; type read and admin; `src/gts.rs`). Every permission's resource
 type is therefore in the registry, which the policy-engine requires of a policy
 naming it without a wildcard. types-registry seeds the inventory at its own startup,
 so producers can derive types and administrators can grant permissions before

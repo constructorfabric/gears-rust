@@ -829,6 +829,24 @@ impl GraphServices {
             .await?)
     }
 
+    /// Remove a node and every edge incident to it for good (gears-rust
+    /// #5194). Authorized as `purge`, pinned to one tenant like every write.
+    pub async fn purge_node(
+        &self,
+        call: impl Into<Call<'_>>,
+        node_key: &NodeKey,
+        options: graph_storage_sdk::models::PurgeOptions,
+    ) -> Result<graph_storage_sdk::models::PurgeOutcome, DomainError> {
+        let auth = self
+            .authorize(call, &authz::node_resource(), authz::actions::PURGE)
+            .await?;
+        admission::admit_identifier(&self.config, "node_key", node_key)?;
+        Ok(self
+            .store
+            .purge_node(&Self::store_ctx(&auth, None), node_key.clone(), options)
+            .await?)
+    }
+
     pub async fn delete_edge(
         &self,
         call: impl Into<Call<'_>>,

@@ -941,6 +941,47 @@ impl GraphStoreV1 for FakeGraphStore {
         })
     }
 
+    async fn purge_node(
+        &self,
+        ctx: &StoreCtx<'_>,
+        key: NodeKey,
+        options: graph_storage_sdk::models::PurgeOptions,
+    ) -> Result<graph_storage_sdk::models::PurgeOutcome, GraphStoreError> {
+        let mut tenants = self.tenants.lock().map_err(|_| poisoned())?;
+        let tenant = tenants.entry(ctx.tenant).or_default();
+        // Live or tombstoned, as the built-in store: both hold the key.
+        let Some(position) = tenant.nodes.iter().position(|n| n.key == key) else {
+            return Ok(graph_storage_sdk::models::PurgeOutcome {
+                revision: self.revision_of(tenant),
+                purged_nodes: 0,
+                purged_edges: 0,
+            });
+        };
+        if let Some(expected) = options.expected_created_at
+            && tenant.nodes[position].audit.created_at != expected
+        {
+            return Err(crate::infra::store::purge::another_instance(
+                &key,
+                expected,
+                tenant.nodes[position].audit.created_at,
+            ));
+        }
+        if options.only_tombstoned && !tenant.nodes[position].deleted {
+            return Err(live_under_only_tombstoned(&key));
+        }
+        let id = tenant.nodes[position].id;
+        let before = tenant.edges.len();
+        tenant.edges.retain(|edge| edge.src != id && edge.dst != id);
+        let purged_edges = (before - tenant.edges.len()) as u64;
+        tenant.nodes.remove(position);
+        tenant.revision += 1;
+        Ok(graph_storage_sdk::models::PurgeOutcome {
+            revision: self.revision_of(tenant),
+            purged_nodes: 1,
+            purged_edges,
+        })
+    }
+
     async fn begin_read(&self, ctx: &StoreCtx<'_>) -> Result<ReadSnapshot, GraphStoreError> {
         assert!(
             !self.declines_snapshots,
@@ -2745,9 +2786,10 @@ fn replace_scope(
     let owner = (replace.attribute.clone(), replace.value.clone());
     let dropped: Vec<i64> = nodes
         .iter()
+        // Tombstoned members included: a tombstone keeps its payload and
+        // vector, and a replacement is the scope's erasure (gears-rust #5194).
         .filter(|node| {
-            !node.deleted
-                && managed_node_types.contains(&node.type_id)
+            managed_node_types.contains(&node.type_id)
                 && !written.contains(node.key.as_str())
                 && node
                     .payload
@@ -2782,10 +2824,12 @@ fn replace_scope(
     // A tombstoned edge is a deleted conclusion and must not keep a departing
     // node alive on its behalf; left in place it would make the scope stop
     // converging, permanently. Purged with the node, as the built-in store
-    // purges it.
+    // purges it, and counted with the other removed edges: a row left.
+    let before = edges.len();
     edges.retain(|edge| {
         !(edge.deleted && (dropped.contains(&edge.src) || dropped.contains(&edge.dst)))
     });
+    tally.counts.scope_removed_edges += (before - edges.len()) as u64;
 
     let referenced: BTreeSet<i64> = edges.iter().flat_map(|edge| [edge.src, edge.dst]).collect();
     let before = nodes.len();
@@ -3041,6 +3085,16 @@ mod eval {
             }
         }
         Ordering::Equal
+    }
+}
+
+/// The refusal both stores give a live node under `only_tombstoned`.
+fn live_under_only_tombstoned(key: &str) -> GraphStoreError {
+    GraphStoreError::Conflict {
+        reason: format!(
+            "node `{key}` is live and the purge asked for a tombstoned one only; soft-delete \
+             it first, or purge without only_tombstoned"
+        ),
     }
 }
 

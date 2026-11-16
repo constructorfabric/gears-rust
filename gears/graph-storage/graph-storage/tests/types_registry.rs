@@ -32,7 +32,7 @@ use uuid::Uuid;
 
 /// The permissions `src/gts.rs` declares, one per resource and action the PEP
 /// checks.
-const PERMISSIONS: [(&str, &str, &str); 5] = [
+const PERMISSIONS: [(&str, &str, &str); 6] = [
     ("node_read", graph_storage_sdk::gts::NODE_RESOURCE, "read"),
     ("node_write", graph_storage_sdk::gts::NODE_RESOURCE, "write"),
     (
@@ -40,6 +40,7 @@ const PERMISSIONS: [(&str, &str, &str); 5] = [
         graph_storage_sdk::gts::NODE_RESOURCE,
         "delete",
     ),
+    ("node_purge", graph_storage_sdk::gts::NODE_RESOURCE, "purge"),
     ("type_read", graph_storage_sdk::gts::TYPE_RESOURCE, "read"),
     ("type_admin", graph_storage_sdk::gts::TYPE_RESOURCE, "admin"),
 ];

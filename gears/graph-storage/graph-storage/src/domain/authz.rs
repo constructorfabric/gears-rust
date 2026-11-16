@@ -24,6 +24,9 @@ pub mod actions {
     pub const READ: &str = "read";
     /// Soft deletes.
     pub const DELETE: &str = "delete";
+    /// Purge: removing a node and its edges for good. Its own action, since
+    /// erasure is stronger than a tombstone (gears-rust #5194).
+    pub const PURGE: &str = "purge";
 }
 
 /// PDP resource type for graph nodes (edges are fenced by the same scope's

@@ -21,10 +21,11 @@ use crate::models::{
     ComponentReadiness, DeleteOutcome, DeleteRequest, Direction, EdgeKey, EdgeRef, EdgeView,
     EmbeddingSpaceId, EngineCapabilities, GraphRevision, GtsTypeId, HopBudget, IngestOutcome,
     IngestRequest, ItemError, LabelAssignment, LabelFilter, LabelId, LabelRecord, LabelSpec,
-    NodeCount, NodeId, NodeKey, NodeRow, NodeView, Page, ProjectionRequest, ReadSnapshot,
-    RegisteredType, RemainingBudget, RevisionOutcome, SearchRequest, SearchResponse,
-    SourceNamespaceOwner, StoreCapabilities, Subject, TenantId, TopologyPage, TopologyRequest,
-    TruncationReason, TypeIdSet, TypeQuery, TypeRecord, TypeRegistration, TypeRegistrationOptions,
+    NodeCount, NodeId, NodeKey, NodeRow, NodeView, Page, ProjectionRequest, PurgeOptions,
+    PurgeOutcome, ReadSnapshot, RegisteredType, RemainingBudget, RevisionOutcome, SearchRequest,
+    SearchResponse, SourceNamespaceOwner, StoreCapabilities, Subject, TenantId, TopologyPage,
+    TopologyRequest, TruncationReason, TypeIdSet, TypeQuery, TypeRecord, TypeRegistration,
+    TypeRegistrationOptions,
 };
 
 /// Per-call context. The compiled scope is mandatory, not optional:
@@ -280,6 +281,23 @@ pub trait GraphStoreV1: Send + Sync + 'static {
         ctx: &StoreCtx<'_>,
         req: DeleteRequest,
     ) -> Result<DeleteOutcome, GraphStoreError>;
+
+    /// Remove a node -- live or tombstoned -- and every edge incident to it,
+    /// in one transaction, so its key is free again (gears-rust #5194). A
+    /// key with no stored node is no change, not an error; a live node under
+    /// `options.only_tombstoned` is a `Conflict`.
+    ///
+    /// Provided as unsupported, so a store that predates purge keeps
+    /// compiling and says so rather than tombstoning instead.
+    async fn purge_node(
+        &self,
+        ctx: &StoreCtx<'_>,
+        key: NodeKey,
+        options: PurgeOptions,
+    ) -> Result<PurgeOutcome, GraphStoreError> {
+        let _ = (ctx, key, options);
+        Err(GraphStoreError::Unsupported { what: "purge" })
+    }
 
     // --- labels -----------------------------------------------------------
     // Labels are deferred: no store in this release provides them and the

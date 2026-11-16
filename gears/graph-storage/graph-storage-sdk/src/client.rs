@@ -12,8 +12,8 @@ use toolkit_security::SecurityContext;
 use crate::models::{
     DeleteOutcome, EdgeKey, EdgeView, GraphRevision, GtsTypeId, IngestOutcome, IngestRequest,
     NeighborhoodRequest, NodeCount, NodeEdgesRequest, NodeKey, NodeRow, NodeView, Page,
-    RegisteredType, SearchRequest, SearchResponse, TraversalResponse, TraverseRequest, TypeQuery,
-    TypeRecord, TypeRegistration, TypeRegistrationOptions,
+    PurgeOptions, PurgeOutcome, RegisteredType, SearchRequest, SearchResponse, TraversalResponse,
+    TraverseRequest, TypeQuery, TypeRecord, TypeRegistration, TypeRegistrationOptions,
 };
 
 /// Object-safe client for in-process consumption by other gears (version 1).
@@ -150,6 +150,36 @@ pub trait GraphStorageClientV1: Send + Sync {
         ctx: &SecurityContext,
         edge_key: &EdgeKey,
     ) -> Result<DeleteOutcome, CanonicalError>;
+
+    /// Remove a node and every edge incident to it for good: the rows are
+    /// deleted, not tombstoned, and the key is free again (gears-rust #5194).
+    ///
+    /// It takes a live node or one already soft-deleted, so the tombstones a
+    /// `delete_node` left can be erased afterwards. A key with no stored node
+    /// is a success with `purged_nodes: 0`, so a retry after an unknown
+    /// outcome does not fail. That retry is safe only while the key cannot
+    /// be written again in between: a purge frees the key, and a retry finds
+    /// whatever node holds it by then. Where keys are reused, purge with
+    /// `options.expected_created_at` -- the node's envelope `created_at` --
+    /// which refuses any other node under the key with a conflict;
+    /// `options.only_tombstoned` refuses a live one only. Analysis edges go with the node: an erasure
+    /// outranks a conclusion. Authorized as its own action, `purge`, not as
+    /// `delete`. Dead tuples, WAL and backups follow the deployment's
+    /// retention, not this call.
+    ///
+    /// The provided implementation refuses as `unimplemented`, so other
+    /// implementations of this trait keep compiling.
+    async fn purge_node(
+        &self,
+        ctx: &SecurityContext,
+        node_key: &NodeKey,
+        options: PurgeOptions,
+    ) -> Result<PurgeOutcome, CanonicalError> {
+        let _ = (ctx, node_key, options);
+        Err(no_target::unimplemented(
+            "this GraphStorageClientV1 implementation does not support purge",
+        ))
+    }
 
     // --- read -------------------------------------------------------------
 
@@ -303,17 +333,14 @@ mod no_target {
     /// implementation that cannot honour a target tenant.
     pub struct NoTargetTenant;
 
-    /// The `unimplemented` error a provided client method answers with when
-    /// the implementation does not override it.
-    pub fn unimplemented(message: &'static str) -> CanonicalError {
-        TargetTenantError::unimplemented(message).create()
+    /// An `unimplemented` answer of the graph node resource, for a provided
+    /// method an implementation of the client trait does not override.
+    pub fn unimplemented(detail: &str) -> CanonicalError {
+        TargetTenantError::unimplemented(detail.to_owned()).create()
     }
 
     fn refused() -> CanonicalError {
-        TargetTenantError::unimplemented(
-            "this GraphStorageClientV1 implementation does not support a target tenant",
-        )
-        .create()
+        unimplemented("this GraphStorageClientV1 implementation does not support a target tenant")
     }
 
     #[async_trait]

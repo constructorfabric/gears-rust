@@ -10,6 +10,7 @@ pub mod evolution;
 pub mod ingest;
 pub mod namespaces;
 pub mod projection;
+pub mod purge;
 pub mod reads;
 pub mod scope;
 pub mod search;
@@ -378,6 +379,15 @@ impl GraphStoreV1 for PgGraphStore {
         req: DeleteRequest,
     ) -> Result<DeleteOutcome, GraphStoreError> {
         ingest::soft_delete(self, ctx, req).await
+    }
+
+    async fn purge_node(
+        &self,
+        ctx: &StoreCtx<'_>,
+        key: graph_storage_sdk::models::NodeKey,
+        options: graph_storage_sdk::models::PurgeOptions,
+    ) -> Result<graph_storage_sdk::models::PurgeOutcome, GraphStoreError> {
+        purge::purge_node(self, ctx, key, options).await
     }
 
     async fn begin_read(&self, ctx: &StoreCtx<'_>) -> Result<ReadSnapshot, GraphStoreError> {

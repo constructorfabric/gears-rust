@@ -13,12 +13,13 @@
 //! - **Only what the batch did not re-supply.** Membership is the payload
 //!   attribute, so a node the batch wrote is by definition still in the
 //!   scope.
-//! - **Never analysis-originated content.** Static edges go first, then only
-//!   those nodes that have no incident edge left. A node still referenced by
-//!   an analysis edge stays, because the conclusion drawn about it must
-//!   survive the re-import of the thing it was drawn about — that is
-//!   `principle-provenance-survives-resync`, and the foreign key would refuse
-//!   the delete anyway.
+//! - **Never live analysis-originated content.** Static edges go first, then
+//!   only those nodes that have no incident edge left. A node still
+//!   referenced by a live analysis edge stays, because the conclusion drawn
+//!   about it must survive the re-import of the thing it was drawn about —
+//!   that is `principle-provenance-survives-resync`, and the foreign key would
+//!   refuse the delete anyway. An analysis edge already tombstoned, incident
+//!   to a departing node, goes with the node (below).
 //!
 //! Removal is a **hard delete**, not a tombstone, and that is deliberate: a
 //! tombstoned node key is not reusable before purge (Soft Delete Contract), so
@@ -152,9 +153,12 @@ pub(crate) async fn remove_stale(
             .secure()
             .scope_with(scope)
             .filter(
+                // Tombstoned members included: a tombstone keeps its payload,
+                // search text and vector, and a replacement -- an empty one
+                // above all -- is the scope's erasure (gears-rust #5194). A
+                // tombstoned key cannot be in `written`: ingest refuses it.
                 Condition::all()
                     .add(node::Column::GtsNodeTypeId.is_in(types.managed_nodes))
-                    .add(node::Column::DeletedAt.is_null())
                     .add(member()),
             )
             .project_all(tx, |query| {
@@ -186,7 +190,7 @@ pub(crate) async fn remove_stale(
     // node satisfying both -- so "every edge between nodes of this scope"
     // would take edges another producer declared. An edge no scope has
     // claimed is left alone here and leaves only by the second route.
-    let removed_edges = if types.static_edges.is_empty() {
+    let mut removed_edges = if types.static_edges.is_empty() {
         0
     } else {
         let abandoned = Condition::all()
@@ -235,7 +239,11 @@ pub(crate) async fn remove_stale(
     // reference query instead — the obvious reading — would leave the row
     // behind and have the foreign key refuse the delete, turning a silent
     // leak into a failed transaction.)
-    edge::Entity::delete_many()
+    //
+    // Counted with the static edges: a row left the store, so the replacement
+    // changed stored state and the revision moves, even when this is all it
+    // removed.
+    removed_edges += edge::Entity::delete_many()
         .filter(
             Condition::all()
                 .add(edge::Column::DeletedAt.is_not_null())
@@ -249,7 +257,8 @@ pub(crate) async fn remove_stale(
         .scope_with(scope)
         .exec(tx)
         .await
-        .map_err(map_scope_err)?;
+        .map_err(map_scope_err)?
+        .rows_affected;
 
     // Then the nodes that nothing references any more. A node still carrying
     // an analysis edge stays: removing it would destroy the provenance the
@@ -300,7 +309,6 @@ pub(crate) async fn remove_stale(
             .filter(
                 Condition::all()
                     .add(node::Column::Id.is_in(removable))
-                    .add(node::Column::DeletedAt.is_null())
                     .add(member()),
             )
             .secure()

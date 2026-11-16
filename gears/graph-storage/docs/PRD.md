@@ -219,7 +219,7 @@ Several platform initiatives need to persist and query relationships between het
 - Cross-tenant or cross-graph federation queries
 - A bundled visualization UI — consumers build UIs on the projection API
 - Bitemporal versioning and node-level history — the graph reflects the latest ingested state; history is a future consideration
-- Undelete, and a retention job that hard-deletes tombstoned rows past a configurable window — both p2; hard delete additionally has to settle cascade ordering, key reuse after purge, and vector/full-text index reconciliation, none of which need to block v1
+- Undelete, and a retention job that hard-deletes tombstoned rows past a configurable window — both p2. Purge of one node on request is built (gears-rust #5194, DESIGN § Soft Delete Contract); the job still needs a window and a key-reuse policy
 - Whole-graph analytics computation — degree, PageRank, components, betweenness and community detection move to the `graph-analytics` gear (its ADR-0002); this gear stores the graph they read and annotates projections from their cache
 - Embedding model training or fine-tuning
 
@@ -294,11 +294,15 @@ Convergence **MUST** hold under retries with unknown commit outcomes **for an in
 - **Rationale**: Producers re-run pipelines; idempotent atomic batches make re-runs safe and cheap, and the prototype's row-at-a-time writes were a measured bottleneck.
 - **Actors**: `cpt-cf-graph-storage-actor-producer-gear`
 
-> **Found while building the prototype.** Two clauses are not met as written:
-> writes are one statement per node and per edge rather than batched
-> statements. The measured § 6.1 ingest budget is met regardless (10k nodes +
-> 20k edges in ~20 s on developer hardware), so batching is a cost question
-> rather than a correctness one. The producer scope *is* met: the writing
+> **Found while building the prototype.** Two clauses are not met as written.
+> The first was batching, and it is met for new rows since gears-rust #5040:
+> a batch reads its stored nodes, endpoints and edges in one statement per
+> thousand keys, and inserts its new nodes and edges in one statement per
+> thousand rows. An update of a stored row is still a statement of its own,
+> and a row left unchanged costs none. Measured locally (pgvector
+> 0.8.7-pg18, `netem` for the round trip), 5k nodes and 10k edges take
+> ~0.9 s at +1 ms and ~1.1 s at +2 ms per round trip, where one statement
+> per element took 61 s and 138 s. The producer scope *is* met: the writing
 > principal is carried into the store, the idempotency receipt's key is
 > `(tenant, producer, idempotency_key)`, and a scope records its owning
 > producer and refuses a replacement from any other. Both columns existed from
@@ -377,7 +381,7 @@ When an ingested edge references a node key that does not exist, the system **MU
 
 - [x] `p1` - **ID**: `cpt-cf-graph-storage-fr-edge-provenance`
 
-The system **MUST** distinguish static edges (derived deterministically from source data) from analysis edges (produced by an analysis process). Analysis edges and analysis-originated nodes **MUST** carry provenance metadata: origin, creating actor, method, and optionally model and confidence. Scope replacement (see `cpt-cf-graph-storage-fr-scope-replace`) **MUST NOT** delete analysis-originated content.
+The system **MUST** distinguish static edges (derived deterministically from source data) from analysis edges (produced by an analysis process). Analysis edges and analysis-originated nodes **MUST** carry provenance metadata: origin, creating actor, method, and optionally model and confidence. Scope replacement (see `cpt-cf-graph-storage-fr-scope-replace`) **MUST NOT** delete live analysis-originated content; an analysis edge already soft-deleted, incident to a node the replacement removes, is removed with that node.
 
 - **Rationale**: Re-importing source data must not destroy conclusions computed on top of it; provenance is also required to audit machine-generated edges.
 - **Actors**: `cpt-cf-graph-storage-actor-producer-gear`, `cpt-cf-graph-storage-actor-data-analyst`
@@ -386,7 +390,7 @@ The system **MUST** distinguish static edges (derived deterministically from sou
 
 - [x] `p1` - **ID**: `cpt-cf-graph-storage-fr-scope-replace`
 
-The system **MUST** support declarative scope replacement on ingest: the producer names a scope (an indexed payload attribute and value, e.g., a source repository), and the system deletes previously ingested static nodes and edges of that scope that are absent from the new batch, in the same transaction as the upserts. Analysis-originated content in the scope **MUST** survive replacement.
+The system **MUST** support declarative scope replacement on ingest: the producer names a scope (an indexed payload attribute and value, e.g., a source repository), and the system deletes previously ingested static nodes and edges of that scope that are absent from the new batch, in the same transaction as the upserts. Live analysis-originated content in the scope **MUST** survive replacement; a soft-deleted analysis edge incident to a removed node does not.
 
 A scope **MUST** have a canonical identity (tenant, owning producer, scope attribute and value). Replacements of one scope **MUST** serialize on that identity through a lock held to commit, and ordinary ingests writing static content into an owned scope **MUST** participate in the same locking protocol. Every replacement snapshot **MUST** carry a monotonic source generation: the system persists the highest accepted generation per scope and compares-and-updates it atomically under the scope lock; an older generation **MUST** be rejected as stale, an equal-generation identical retry **MUST** return the recorded outcome, and an equal-generation different-content snapshot **MUST** be rejected as a conflict (see DESIGN § Concurrent Ingest Protocol).
 
@@ -782,7 +786,7 @@ The system **MUST** report readiness per capability — database and migrations,
 
 The system **MUST** ingest a batch of 10,000 nodes and 20,000 edges (validation and storage, embedding disabled) in 60 seconds or less on the reference deployment configuration.
 
-> **Found while building the prototype.** Not claimed as met: the only measurement is against a local container (about 20 s for this batch, see the note under `fr-bulk-ingest`), where round-trip time is near zero, and the per-item statements that #4872 replaces are what a managed endpoint pays for. Pending a run on the reference profile.
+> **Found while building the prototype.** Not claimed as met: there is no run on the reference profile yet. The per-item statements #4872 described are replaced for new rows (gears-rust #5040), so the cost no longer grows with the round trip to the database for a first sync: locally, 5k nodes and 10k edges take about 1 s with up to 2 ms added per round trip (note under `fr-bulk-ingest`). An update of a stored row is still one statement each.
 
 - **Threshold**: 10,000 nodes + 20,000 edges in <= 60 s, embedding excluded, single tenant, reference hardware profile defined in the benchmark suite
 - **Rationale**: Producers re-sync whole repositories; the prototype's row-at-a-time writes made large syncs impractical and batching is the required fix.

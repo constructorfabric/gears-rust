@@ -126,7 +126,7 @@ platform namespace for good, which is the thing to fix.
 - `tests/types_registry.rs` initialises the real types-registry gear on an
   in-memory database, runs its startup seeding over the whole inventory, and
   reads back the nine base schemas (equal to `BASE_SCHEMAS`), the
-  type-catalogue resource schema, the five permissions and the resource type
+  type-catalogue resource schema, the six permissions and the resource type
   each permission names. Removing one schema from the inventory, or altering
   one, fails it.
 - A seeding probe on `main` (2026-10-30, not committed) admitted the nine base

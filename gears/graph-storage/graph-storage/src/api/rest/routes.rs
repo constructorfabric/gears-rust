@@ -461,18 +461,42 @@ fn read_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
 
     let router = OperationBuilder::delete(format!("{BASE}/nodes/{{node_key}}"))
         .operation_id("graph_storage.delete_node")
-        .summary("Soft-delete a node and its incident edges")
+        .summary("Soft-delete a node and its incident edges, or purge them")
+        .description(
+            "`mode=soft` (the default) tombstones the node and its incident edges. \
+             `mode=purge` removes the node, live or tombstoned, and every edge \
+             incident to it for good, freeing the key; it needs the `purge` \
+             permission and answers 204 whether or not a node was stored under \
+             the key. A retry after an unknown outcome finds whatever node holds \
+             the key by then; where keys are reused, purge with \
+             `expected_created_at` (the node's envelope `created_at`), which \
+             answers 409 for any other node under the key",
+        )
         .tag(API_TAG)
         .authenticated()
         .require_license_features::<License>([])
         .path_param("node_key", "Producer-supplied node key")
         .query_param_typed("tenant", false, TENANT_PARAM, "string")
+        .query_param("mode", false, "`soft` (default) or `purge`")
+        .query_param_typed(
+            "only_tombstoned",
+            false,
+            "With `mode=purge`: purge only a node already soft-deleted; 409 for a live one",
+            "boolean",
+        )
+        .query_param(
+            "expected_created_at",
+            false,
+            "With `mode=purge`: purge only the node whose envelope `created_at` is this RFC 3339 instant; 409 for another node under the key",
+        )
         .handler(handlers::delete_node)
         .json_response_with_schema::<dto::GraphDeleteResultDto>(
             openapi,
             http::StatusCode::OK,
             "What was tombstoned",
         )
+        .no_content_response(http::StatusCode::NO_CONTENT, "Purged, or nothing to purge")
+        .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
         .error_404(openapi)
