@@ -40,6 +40,7 @@ use crate::redact::redacted_word;
 /// Items asked for per request. GitHub's maximum, so a listing of a given
 /// size costs the fewest requests.
 const FIRST_PAGE_SIZE: u32 = 100;
+const WORKFLOW_JOBS_PAGE_SIZE: u32 = 30;
 const ACCEPT_JSON: &str = "application/vnd.github+json";
 
 fn within_since(state: &str, updated_at: &str, since: Option<DateTime<Utc>>) -> bool {
@@ -3857,7 +3858,7 @@ impl GithubPort for GithubClient {
         let jobs = self
             .get_json_all_wrapped(
                 &format!(
-                    "/repos/{owner}/{name}/actions/runs/{run_id}/jobs?per_page={FIRST_PAGE_SIZE}"
+                    "/repos/{owner}/{name}/actions/runs/{run_id}/jobs?per_page={WORKFLOW_JOBS_PAGE_SIZE}"
                 ),
                 options,
                 |page: GhWorkflowJobsPage| page.jobs,
@@ -3892,7 +3893,19 @@ impl GithubPort for GithubClient {
     ) -> Result<u64, DomainError> {
         let prefixes = self.cache_prefixes(owner, Some(name), repo_ids);
         let prefixes: Vec<&str> = prefixes.iter().map(String::as_str).collect();
-        self.cache.size(scope, tenant_id, &prefixes).await
+        let own = self.cache.size(scope, tenant_id, &prefixes).await?;
+        if tenant_id == SHARED_CACHE_PARTITION {
+            return Ok(own);
+        }
+        let shared = self
+            .cache
+            .size(
+                &AccessScope::for_tenant(SHARED_CACHE_PARTITION),
+                SHARED_CACHE_PARTITION,
+                &prefixes,
+            )
+            .await?;
+        Ok(own + shared)
     }
 
     async fn expire_cache(

@@ -3825,8 +3825,8 @@ impl Service {
             .await?)
     }
 
-    /// Bytes the HTTP cache holds for one repository, for `status`. Guarded
-    /// like `clear_cache`, since it reads exactly what a clear would drop.
+    /// Bytes the HTTP cache holds for one repository, for `status`, shared
+    /// partition included. Guarded like `clear_cache`.
     ///
     /// # Errors
     /// `Validation` when `owner/name` is not a usable path; `Forbidden`/

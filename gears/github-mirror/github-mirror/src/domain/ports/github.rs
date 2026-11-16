@@ -542,8 +542,8 @@ pub trait GithubPort: Send + Sync {
         fetched_before: DateTime<Utc>,
     ) -> Result<u64, DomainError>;
 
-    /// Bytes the cache holds for one `owner/name` repository, matched exactly
-    /// as `clear_cache` matches, so `status` can show what a clear would free.
+    /// Bytes the cache holds for one `owner/name` repository, matched as
+    /// `clear_cache` matches, in the caller's partition plus the shared one.
     ///
     /// # Errors
     /// Storage failures.
