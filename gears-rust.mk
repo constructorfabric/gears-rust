@@ -1130,7 +1130,7 @@ e2e-orders: py-env
 ## Run event-broker E2E tests (its own standalone binary, not a cf-gears-example-server feature)
 e2e-event-broker: py-env
 	$(call print_target_banner)
-	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
+	cargo build -p cf-gears-event-broker-server --bin cf-gears-event-broker-server
 	E2E_BINARY=target/debug/cf-gears-event-broker-server \
 		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv
 
@@ -1138,7 +1138,7 @@ e2e-event-broker: py-env
 ## The backend-sensitive tests of e2e-event-broker, with a PostgreSQL sidecar.
 e2e-event-broker-pg: py-env
 	$(call print_target_banner)
-	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
+	cargo build -p cf-gears-event-broker-server --bin cf-gears-event-broker-server
 	EB_E2E_BACKEND=postgres E2E_BINARY=target/debug/cf-gears-event-broker-server \
 		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv -m backend_sensitive
 
@@ -1146,7 +1146,7 @@ e2e-event-broker-pg: py-env
 ## The backend-sensitive tests of e2e-event-broker, the events in a file under the server's home.
 e2e-event-broker-sqlite: py-env
 	$(call print_target_banner)
-	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
+	cargo build -p cf-gears-event-broker-server --bin cf-gears-event-broker-server
 	EB_E2E_BACKEND=sqlite E2E_BINARY=target/debug/cf-gears-event-broker-server \
 		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv -m backend_sensitive
 
@@ -1154,7 +1154,7 @@ e2e-event-broker-sqlite: py-env
 ## The backend-sensitive tests of e2e-event-broker, with a MySQL sidecar.
 e2e-event-broker-mysql: py-env
 	$(call print_target_banner)
-	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
+	cargo build -p cf-gears-event-broker-server --bin cf-gears-event-broker-server
 	EB_E2E_BACKEND=mysql E2E_BINARY=target/debug/cf-gears-event-broker-server \
 		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv -m backend_sensitive
 
@@ -1162,7 +1162,7 @@ e2e-event-broker-mysql: py-env
 ## The backend-sensitive tests of e2e-event-broker, with a MariaDB sidecar.
 e2e-event-broker-mariadb: py-env
 	$(call print_target_banner)
-	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
+	cargo build -p cf-gears-event-broker-server --bin cf-gears-event-broker-server
 	EB_E2E_BACKEND=mariadb E2E_BINARY=target/debug/cf-gears-event-broker-server \
 		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv -m backend_sensitive
 
@@ -1170,7 +1170,7 @@ e2e-event-broker-mariadb: py-env
 ## The backend-sensitive tests of e2e-event-broker, with a single-node Kafka sidecar.
 e2e-event-broker-kafka: py-env
 	$(call print_target_banner)
-	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
+	cargo build -p cf-gears-event-broker-server --bin cf-gears-event-broker-server
 	EB_E2E_BACKEND=kafka E2E_BINARY=target/debug/cf-gears-event-broker-server \
 		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv -m backend_sensitive
 

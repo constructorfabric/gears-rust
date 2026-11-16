@@ -1003,15 +1003,35 @@ fn domain_to_problem_tenant_root_already_exists_is_409() {
 // @cpt-dod:cpt-cf-resource-group-dod-testing-error-conversions:p2
 // ── Error conversions: From<EnforcerError> -> DomainError ────────────────
 
-// TC-ERR-01: EnforcerError::Denied -> DomainError::AccessDenied
+// TC-ERR-01: EnforcerError::AccessDenied -> DomainError::AccessDenied
 #[test]
 fn enforcer_denied_maps_to_access_denied() {
-    use authz_resolver_sdk::pep::EnforcerError;
+    use authz_resolver_sdk::pep::{AccessDenial, EnforcerError};
 
-    let err: DomainError = EnforcerError::Denied { deny_reason: None }.into();
+    let err: DomainError = EnforcerError::AccessDenied(AccessDenial::Pdp { reason: None }).into();
     assert!(
         matches!(err, DomainError::AccessDenied { .. }),
         "Expected AccessDenied, got: {err:?}"
+    );
+}
+
+// A permitted scope that matches nothing is an access denial, not an internal
+// error, and its message does not blame the PDP.
+#[test]
+fn enforcer_scope_matches_nothing_maps_to_access_denied() {
+    use authz_resolver_sdk::pep::{AccessDenial, EnforcerError};
+
+    let err: DomainError = EnforcerError::AccessDenied(AccessDenial::ScopeMatchesNothing).into();
+    match err {
+        DomainError::AccessDenied { message } => {
+            assert!(!message.contains("PDP"), "{message}");
+        }
+        other => panic!("Expected AccessDenied, got: {other:?}"),
+    }
+    let pdp: DomainError = EnforcerError::AccessDenied(AccessDenial::Pdp { reason: None }).into();
+    assert!(
+        matches!(&pdp, DomainError::AccessDenied { message } if message.contains("PDP")),
+        "a reasonless PDP deny keeps its origin: {pdp:?}"
     );
 }
 

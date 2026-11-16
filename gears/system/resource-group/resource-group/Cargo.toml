@@ -82,6 +82,7 @@ toolkit-odata = { workspace = true, features = ["with-utoipa"] }
 toolkit-macros = { workspace = true }
 
 [dev-dependencies]
+authz-resolver-sdk = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["metrics", "testing"] }

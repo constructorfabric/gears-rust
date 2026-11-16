@@ -43,8 +43,9 @@ fn key_value(column: entity::Column, key: SubjectKey) -> Option<uuid::Uuid> {
 /// entity itself (`ScopableEntity::resolve_property`), so this cannot disagree
 /// with the column the secure ORM filters on.
 fn filter_coverage(filter: &ScopeFilter, key: SubjectKey) -> Result<(), ScopeRefusal> {
-    let Some(expected) =
-        SubjectSettingsEntity::resolve_property(filter.property()).and_then(|c| key_value(c, key))
+    let Some(expected) = SubjectSettingsEntity::SCOPE
+        .resolve_property(filter.property())
+        .and_then(|c| key_value(c, key))
     else {
         return Err(ScopeRefusal::NotCovered);
     };

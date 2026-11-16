@@ -105,9 +105,13 @@ impl EventFilter for AuthorizedInterestFilter {
                 .await
             {
                 Ok(_) => {}
-                Err(EnforcerError::Denied { .. }) => return Ok(false),
+                Err(EnforcerError::AccessDenied(_)) => {
+                    return Ok(false);
+                }
                 // An outage must terminate the batch without advancing progress;
                 // treating it as a denial would silently skip unread events.
+                // Unknown outcome classes also terminate the batch; conversion
+                // classifies them as internal failures.
                 Err(error) => return Err(error.into()),
             }
         }

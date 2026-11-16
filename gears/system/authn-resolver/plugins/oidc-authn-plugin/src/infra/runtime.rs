@@ -3,24 +3,29 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use toolkit_resilience::circuit_breaker::ConfigError;
+
 use crate::config::{IssuerTrustConfig, JwtValidationConfig, OidcPluginConfig};
 use crate::domain::authenticate::{OidcAuthNPlugin, OidcAuthNPluginBuilder};
 use crate::domain::metrics::AuthNMetrics;
 use crate::infra::circuit_breaker::HostCircuitBreakers;
+use crate::infra::idp_http::IdpHttpClient;
 use crate::infra::jwks::{JwksFetcher, JwksFetcherConfig, JwksFetcherDeps};
 use crate::infra::oidc::OidcDiscovery;
 use crate::infra::token_client::TokenClient;
 use crate::infra::url_policy::UrlSecurityPolicy;
 
 /// Build the domain plugin with HTTP-backed infrastructure adapters.
-#[must_use]
+///
+/// # Errors
+/// Returns [`ConfigError`] when the circuit-breaker settings cannot work.
 pub fn build_oidc_authn_plugin(
     jwt_config: JwtValidationConfig,
     issuer_trust: IssuerTrustConfig,
     plugin_config: OidcPluginConfig,
-    http_client: reqwest::Client,
+    http_client: IdpHttpClient,
     metrics: Arc<AuthNMetrics>,
-) -> OidcAuthNPlugin {
+) -> Result<OidcAuthNPlugin, ConfigError> {
     build_oidc_authn_plugin_with_url_policy(
         jwt_config,
         issuer_trust,
@@ -31,16 +36,18 @@ pub fn build_oidc_authn_plugin(
     )
 }
 
-/// Build the domain plugin while permitting plain HTTP IdP URLs.
-#[doc(hidden)]
-#[must_use]
+/// Build the domain plugin while permitting plain HTTP `IdP` URLs.
+///
+/// # Errors
+/// Returns [`ConfigError`] when the circuit-breaker settings cannot work.
+#[cfg(any(test, feature = "test-util"))]
 pub fn build_oidc_authn_plugin_allowing_insecure_http_for_tests(
     jwt_config: JwtValidationConfig,
     issuer_trust: IssuerTrustConfig,
     plugin_config: OidcPluginConfig,
-    http_client: reqwest::Client,
+    http_client: IdpHttpClient,
     metrics: Arc<AuthNMetrics>,
-) -> OidcAuthNPlugin {
+) -> Result<OidcAuthNPlugin, ConfigError> {
     build_oidc_authn_plugin_with_url_policy(
         jwt_config,
         issuer_trust,
@@ -55,17 +62,22 @@ fn build_oidc_authn_plugin_with_url_policy(
     jwt_config: JwtValidationConfig,
     issuer_trust: IssuerTrustConfig,
     plugin_config: OidcPluginConfig,
-    http_client: reqwest::Client,
+    http_client: IdpHttpClient,
     metrics: Arc<AuthNMetrics>,
     url_policy: UrlSecurityPolicy,
-) -> OidcAuthNPlugin {
-    let circuit_breakers = plugin_config.circuit_breaker.as_ref().map(|config| {
-        Arc::new(HostCircuitBreakers::new(
-            config.failure_threshold,
-            config.reset_timeout_secs,
-            Arc::clone(&metrics),
-        ))
-    });
+) -> Result<OidcAuthNPlugin, ConfigError> {
+    let circuit_breakers = plugin_config
+        .circuit_breaker
+        .as_ref()
+        .map(|config| {
+            HostCircuitBreakers::new(
+                config.failure_threshold,
+                config.reset_timeout_secs,
+                Arc::clone(&metrics),
+            )
+            .map(Arc::new)
+        })
+        .transpose()?;
 
     let retry_policy = plugin_config.retry_policy;
     let mut discovery = OidcDiscovery::new_with_url_policy(
@@ -111,7 +123,7 @@ fn build_oidc_authn_plugin_with_url_policy(
     let jwks_provider = Arc::new(fetcher);
     let token_exchanger = Arc::new(token_client);
 
-    OidcAuthNPluginBuilder::new(
+    Ok(OidcAuthNPluginBuilder::new(
         jwt_config,
         issuer_trust,
         plugin_config.s2s_default_subject_type,
@@ -119,5 +131,5 @@ fn build_oidc_authn_plugin_with_url_policy(
     .claim_mapper_config(plugin_config.claim_mapper)
     .s2s_claim_mapper_config(plugin_config.s2s_claim_mapper)
     .claim_mapper_options(plugin_config.claim_mapper_options)
-    .build(jwks_provider, token_exchanger, metrics)
+    .build(jwks_provider, token_exchanger, metrics))
 }

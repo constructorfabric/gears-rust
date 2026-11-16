@@ -75,12 +75,17 @@ quota-enforcement = [
 magika = ["file_parser/magika"]
 bss-products = ["dep:bss_products"]
 # Orders requires the Event Broker gear (D-200) and the plugins its standalone deployment
-# resolves: the standalone cluster cache and the SQLite event-log backend.
+# resolves: the standalone cluster cache and the SQLite event-log backend. Event Broker
+# consumes the cluster gear through `cluster-sdk` with no `deps` edge, so a host that runs EB
+# must link `cluster` itself (with grpc-hub, which cluster requires) or enable
+# `cluster-sdk/grpc-client`; a standalone orders host links it here.
 # Orders E2E/development hosts only; ordinary bss-orders builds do not enable this.
 bss-orders-test-authz = ["bss-orders", "dep:bss-orders-test-authz-plugin"]
 bss-orders = [
     "dep:bss_orders",
     "dep:event_broker",
+    "dep:cluster",
+    "grpc-hub",
     "dep:standalone-cluster-plugin",
     "dep:sqlite-event-broker-plugin",
 ]

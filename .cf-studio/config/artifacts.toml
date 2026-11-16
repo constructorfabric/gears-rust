@@ -23,7 +23,7 @@ reason = "Ignore 'gears/bss/libs' — not a module, only a grouping for shared B
 patterns = ["gears/bss/libs"]
 
 [[ignore]]
-reason = "Ignore 'gears/bss/docs' — BSS-wide architecture decisions shared by the BSS gears (ADR/), not a module; each gear's own design set stays under gears/bss/$system/docs."
+reason = "Ignore the BSS documentation grouping as a module candidate. The cross-gear quota documentation package is registered separately below."
 patterns = ["gears/bss/docs"]
 
 [[ignore]]
@@ -636,6 +636,43 @@ extensions = [".rs"]
 name = "Nested SDK"
 path = "{system_root}/{system}-sdk/src"
 extensions = [".rs"]
+
+# Cross-gear quota specification: documentation scope, not a runtime gear.
+[[systems.autodetect]]
+kit = "gears"
+system_root = "{project_root}/gears/bss/docs/quotas"
+artifacts_root = "{system_root}"
+codebase = []
+
+[systems.autodetect.artifacts.PRD]
+pattern = "PRD.md"
+traceability = "DOCS-ONLY"
+required = true
+
+[systems.autodetect.artifacts.DESIGN]
+pattern = "DESIGN.md"
+traceability = "DOCS-ONLY"
+required = true
+
+[systems.autodetect.artifacts.ADR]
+pattern = "ADR/*.md"
+traceability = "DOCS-ONLY"
+required = false
+
+[systems.autodetect.artifacts.DECOMPOSITION]
+pattern = "DECOMPOSITION.md"
+traceability = "DOCS-ONLY"
+required = true
+
+[systems.autodetect.artifacts.FEATURE]
+pattern = "features/*.md"
+traceability = "DOCS-ONLY"
+required = true
+
+[systems.autodetect.validation]
+require_kind_registered_in_kit = true
+require_md_extension = true
+fail_on_unmatched_markdown = true
 
 [[systems]]
 name = "examples"

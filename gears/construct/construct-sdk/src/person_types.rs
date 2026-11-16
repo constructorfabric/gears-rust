@@ -94,6 +94,7 @@ pub const PROPERTIES: &[FactProperty] = &[
     one(IDENTITY_TYPE, "orcid_id"),
     many(IDENTITY_TYPE, "public_mentions"),
     many(IDENTITY_TYPE, "public_profiles"),
+    many(IDENTITY_TYPE, "remembered_notes"),
     one(IDENTITY_TYPE, "scopus_author_id"),
     one(IDENTITY_TYPE, "timezone"),
     one(PREFERENCE_TYPE, "analogy_domain"),

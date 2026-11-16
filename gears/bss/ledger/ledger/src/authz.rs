@@ -240,6 +240,11 @@ pub enum AuthzError {
     /// The PDP was unreachable or its response could not be compiled.
     #[error("authz unavailable: {0}")]
     Unavailable(String),
+    /// The enforcer returned an outcome class this gate does not know: an
+    /// internal failure (HTTP 500), never a denial or an unavailable PDP. The
+    /// message is generic; the cause is logged where it is classified.
+    #[error("authz internal failure: {0}")]
+    Internal(String),
 }
 
 /// Minimal, deterministic type-schema body for an authz label. Key order is
@@ -309,12 +314,16 @@ pub async fn access_scope(
         .access_scope_with(ctx, rt, action, resource_id, &request)
         .await
         .map_err(|e| match e {
-            authz_resolver_sdk::EnforcerError::Denied { .. }
+            authz_resolver_sdk::EnforcerError::AccessDenied(_)
             | authz_resolver_sdk::EnforcerError::CompileFailed(_) => {
                 AuthzError::Denied(e.to_string())
             }
             authz_resolver_sdk::EnforcerError::EvaluationFailed(_) => {
                 AuthzError::Unavailable(e.to_string())
+            }
+            unknown => {
+                tracing::error!(error = %unknown, "ledger: authz failed with an unknown outcome");
+                AuthzError::Internal("authorization failed with an unknown outcome".to_owned())
             }
         })?;
 

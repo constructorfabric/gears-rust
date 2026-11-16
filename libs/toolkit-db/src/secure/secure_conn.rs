@@ -427,7 +427,7 @@ impl SecureConn {
         E: ScopableEntity + EntityTrait,
         E::Column: ColumnTrait + Copy,
     {
-        let resource_col = E::resource_col().ok_or_else(|| {
+        let resource_col = E::SCOPE.resource().ok_or_else(|| {
             ScopeError::Invalid("Entity must have a resource_col to use delete_by_id()")
         })?;
 

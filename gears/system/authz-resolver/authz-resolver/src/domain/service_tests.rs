@@ -256,7 +256,9 @@ mod pep {
 
     use authz_resolver_sdk::constraints::{Constraint, InPredicate, Predicate};
     use authz_resolver_sdk::models::{DenyReason, EvaluationResponseContext};
-    use authz_resolver_sdk::pep::{AccessRequest, EnforcerError, PolicyEnforcer, ResourceType};
+    use authz_resolver_sdk::pep::{
+        AccessDenial, AccessRequest, EnforcerError, PolicyEnforcer, ResourceType,
+    };
     use toolkit_security::{SecurityContext, pep_properties};
     use uuid::Uuid;
 
@@ -339,9 +341,9 @@ mod pep {
             .await;
 
         match denied {
-            Err(EnforcerError::Denied {
-                deny_reason: Some(reason),
-            }) => {
+            Err(EnforcerError::AccessDenied(AccessDenial::Pdp {
+                reason: Some(reason),
+            })) => {
                 assert_eq!(reason.error_code, "tenant_barrier");
                 assert_eq!(reason.details.as_deref(), Some("crossed"));
             }

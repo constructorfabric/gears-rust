@@ -4,6 +4,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use authz_resolver_sdk::test_support::EmptyScopePdp;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
@@ -403,4 +404,102 @@ async fn idempotency_key_scoped_to_subject() {
         .await
         .expect("caller A's own replay must still succeed");
     assert_eq!(replay_a.file_id, ticket_a.file_id);
+}
+
+#[tokio::test]
+async fn empty_scope_cannot_create_or_presign_but_lists_no_files() {
+    use file_storage::infra::authz::PolicyEnforcerAuthorizer;
+    let tenant = Uuid::from_u128(1);
+    let owner = Uuid::from_u128(2);
+    let ctx = ctx(tenant, owner);
+    let baseline = common::StackBuilder::new("empty-scope-seed").build().await;
+    let ticket = baseline
+        .svc
+        .create_file(&ctx, owned_file(owner), None, false)
+        .await
+        .expect("seed file");
+    for live in [false, true] {
+        let stack = common::StackBuilder::new("empty-scope")
+            .db(baseline.db.clone(), &baseline.dsn)
+            .authorizer(std::sync::Arc::new(PolicyEnforcerAuthorizer::new(
+                std::sync::Arc::new(EmptyScopePdp { live }),
+            )))
+            .build()
+            .await;
+        let result = stack
+            .svc
+            .create_file(&ctx, owned_file(owner), None, false)
+            .await;
+        assert_eq!(result.is_ok(), live);
+        if !live {
+            assert!(matches!(result, Err(DomainError::Forbidden)));
+        }
+        let presign = stack.svc.presign_version(&ctx, ticket.file_id).await;
+        assert_eq!(presign.is_ok(), live);
+        if !live {
+            assert!(matches!(presign, Err(DomainError::Forbidden)));
+        }
+        let page = stack
+            .svc
+            .list_files(
+                &ctx,
+                OwnerFilter {
+                    owner_kind: OwnerKind::User,
+                    owner_id: owner,
+                },
+                Some(10),
+                None,
+            )
+            .await
+            .expect("allowed empty LIST returns a successful page");
+        assert_eq!(page.items.is_empty(), !live);
+        let invalid_cursor = toolkit_odata::CursorV1 {
+            k: vec![],
+            o: toolkit_odata::SortDir::Desc,
+            s: "invalid".to_owned(),
+            f: None,
+            d: "fwd".to_owned(),
+        };
+        assert!(
+            stack
+                .svc
+                .list_files(
+                    &ctx,
+                    OwnerFilter {
+                        owner_kind: OwnerKind::User,
+                        owner_id: owner
+                    },
+                    Some(10),
+                    Some(invalid_cursor)
+                )
+                .await
+                .is_err(),
+            "empty scopes retain cursor validation"
+        );
+        if !live {
+            let actual = baseline
+                .svc
+                .list_files(
+                    &ctx,
+                    OwnerFilter {
+                        owner_kind: OwnerKind::User,
+                        owner_id: owner,
+                    },
+                    Some(10),
+                    None,
+                )
+                .await
+                .expect("inspect storage after refused writes");
+            assert_eq!(actual.items.len(), 1);
+            assert_eq!(
+                baseline
+                    .store
+                    .list_versions(ticket.file_id)
+                    .await
+                    .expect("inspect versions after refused presign")
+                    .len(),
+                1
+            );
+        }
+    }
 }

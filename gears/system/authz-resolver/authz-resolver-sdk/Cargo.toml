@@ -48,6 +48,8 @@ toolkit-http = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 
 [features]
+# Shared authorization fixtures for downstream tests only.
+test-util = []
 # Generated directory-resolving REST client (`AuthZResolverApiRestClient` +
 # `...ResolvingClient`) used by out-of-process PEP consumers.
 rest-client = ["toolkit-contract/rest-client", "dep:toolkit-http"]

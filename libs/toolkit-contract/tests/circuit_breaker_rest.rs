@@ -15,7 +15,9 @@ use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use toolkit_contract::runtime::breaker::{EndpointFailureHook, SkipCircuitBreaker};
+use toolkit_contract::runtime::breaker::{
+    EndpointFailureHook, SkipCircuitBreaker, install_http_breaker,
+};
 use toolkit_contract::runtime::client::{
     StreamRequest, build_default_http_client, open_streaming, send_unary,
 };
@@ -186,9 +188,9 @@ async fn a_timed_out_attempt_reaches_the_breaker() {
 }
 
 /// The breaker sits below the auth layer, so an attempt whose token took a
-/// while starts its transport timer late. `send_unary`'s own timer, started
-/// before auth, must still leave the transport time to report the timeout:
-/// if it fired first, the dropped call would never be counted.
+/// while starts its transport timer late. `send_unary`'s own timer must still
+/// leave the transport time to report the timeout: if it fired first, the
+/// dropped call would never be counted.
 #[tokio::test]
 async fn a_timeout_after_slow_auth_still_reaches_the_breaker() {
     let (base, _hits) = server().await;
@@ -229,16 +231,17 @@ async fn a_stream_open_timeout_after_slow_auth_still_reaches_the_breaker() {
     assert_eq!(b.state(), Breaker::Open);
 }
 
-/// A client whose auth layer takes 20 ms, above the breaker and the
-/// transport timeout.
-fn slow_auth_client(b: &Arc<CircuitBreaker>, timeout: Duration) -> toolkit_http::HttpClient {
-    use toolkit_contract::runtime::breaker::HttpEndpointFailure;
-    use toolkit_resilience::circuit_breaker::{BoxError, CircuitBreakerLayer};
-    use tower::{Layer, ServiceExt};
+/// How long the auth layer of [`slow_auth_client`] takes: longer than the
+/// grace the caller's timer gives the transport's.
+const SLOW_AUTH: Duration = Duration::from_millis(100);
 
-    install_crypto_provider();
-    let layer = CircuitBreakerLayer::new(Arc::clone(b), HttpEndpointFailure);
-    toolkit_http::HttpClient::builder()
+/// A client whose auth layer takes [`SLOW_AUTH`], above the breaker and the
+/// transport timeout, wired as generated clients wire the breaker.
+fn slow_auth_client(b: &Arc<CircuitBreaker>, timeout: Duration) -> toolkit_http::HttpClient {
+    use tower::ServiceExt;
+
+    let config = plaintext_config("http://unused").with_circuit_breaker(Arc::clone(b));
+    let builder = toolkit_http::HttpClient::builder()
         .retry(None)
         .transport(toolkit_http::TransportSecurity::AllowInsecureHttp)
         .timeout(timeout)
@@ -246,24 +249,12 @@ fn slow_auth_client(b: &Arc<CircuitBreaker>, timeout: Duration) -> toolkit_http:
             tower::util::BoxCloneService::new(tower::service_fn(move |req| {
                 let inner = inner.clone();
                 async move {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    tokio::time::sleep(SLOW_AUTH).await;
                     inner.oneshot(req).await
                 }
             }))
-        })
-        .with_attempt_layer(move |inner| {
-            layer
-                .layer(inner)
-                .map_err(
-                    |e: BoxError| match e.downcast::<toolkit_http::HttpError>() {
-                        Ok(http) => *http,
-                        Err(other) => toolkit_http::HttpError::Transport(other),
-                    },
-                )
-                .boxed_clone()
-        })
-        .build()
-        .unwrap()
+        });
+    install_http_breaker(builder, &config).build().unwrap()
 }
 
 #[tokio::test]

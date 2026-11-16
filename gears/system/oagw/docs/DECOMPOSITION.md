@@ -41,6 +41,13 @@ The OAGW design is decomposed into eight features organized along functional bou
 - `cpt-cf-oagw-nfr-ssrf-protection` — Feature 4 owns request-path SSRF guards, Feature 8 owns IP pinning and header-stripping hardening.
 - `cpt-cf-oagw-nfr-credential-isolation` — Feature 3 owns auth plugin credential handling, Feature 4 owns proxy-time credential flow.
 
+**Planned work across features 1–8 for `cpt-cf-oagw-fr-upstream-credentials`.** [ADR-0021](ADR/0021-upstream-credentials.md) is proposed. Implementation follows its approval.
+
+- [ ] Foundation and management: additive storage, ownership and atomic parent/child lifecycle on each backend; scoped REST/SDK CRUD and registry reconciliation.
+- [ ] Plugins, proxy and hierarchy: constrained API-key configuration, named resolution/preview, use authorization and owner endpoint checks, including streaming handshakes.
+- [ ] Limiting and observability: credential bucket, error-source handling, bounded labels, credential ID in access logs and replica cleanup.
+- [ ] Deployment and verification: cached routing with live credential reads, registry writer fencing and mixed-version rollout/rollback. Exercise the [acceptance scenarios](../scenarios/upstream-credentials/README.md).
+
 ## 2. Entries
 
 ### 1. [Core Domain & Storage Foundation](features/0001-cpt-cf-oagw-feature-domain-foundation.md) - HIGH

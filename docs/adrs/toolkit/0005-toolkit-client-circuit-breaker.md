@@ -148,8 +148,10 @@ The breaker sees each attempt, below retry:
 * **gRPC.** The layer wraps the tonic channel, under tonic's own call handling.
 
 A caller's own timer around an attempt must not fire before the transport timeout, or the breaker
-sees a dropped permit instead of a timeout. The contract runtime's `send_unary` gives its outer
-timer a 50 ms grace over the transport timeout for this reason.
+sees a dropped permit instead of a timeout. The contract runtime's `send_unary` and stream open
+start their outer timer when the attempt reaches the attempt layer, not when the call starts, and
+give it a 50 ms grace over the transport timeout. Auth and queueing before the transport do not
+eat into the grace.
 
 ### Breaker and Retry
 

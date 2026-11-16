@@ -29,8 +29,10 @@ use usage_collector_sdk::{
 use uuid::Uuid;
 
 use super::{
-    AttributionTupleKey, authorize_attribution_tuple, authorize_usage_record, usage_record,
+    AttributionTupleKey, authorize, authorize_attribution_tuple, authorize_list_usage_records,
+    authorize_usage_record, usage_record,
 };
+use crate::domain::error::DomainError;
 use crate::domain::ports::metrics::{NoopMetrics, PdpOp};
 use crate::domain::test_support::{CapturingTenantPermitResolver, enforcer_for};
 
@@ -296,6 +298,86 @@ async fn authorize_attribution_tuple_denies_record_outside_granted_tenant() {
 // scope_to_odata_filter — projects AccessScope into ODataQuery filter
 // ---------------------------------------------------------------------------
 
+/// Permits an empty `In(owner_tenant_id, [])` scope.
+struct EmptyScopePermit;
+
+#[async_trait::async_trait]
+impl authz_resolver_sdk::AuthZResolverApi for EmptyScopePermit {
+    async fn evaluate(
+        &self,
+        _ctx: toolkit_security::PlatformSecurityContext,
+        _request: EvaluationRequest,
+    ) -> Result<
+        authz_resolver_sdk::models::EvaluationResponse,
+        toolkit_canonical_errors::CanonicalError,
+    > {
+        use authz_resolver_sdk::constraints::{Constraint, InPredicate, Predicate};
+        Ok(authz_resolver_sdk::models::EvaluationResponse {
+            decision: true,
+            context: authz_resolver_sdk::models::EvaluationResponseContext {
+                constraints: vec![Constraint {
+                    predicates: vec![Predicate::In(InPredicate::new(
+                        toolkit_security::pep_properties::OWNER_TENANT_ID,
+                        Vec::<Uuid>::new(),
+                    ))],
+                }],
+                ..Default::default()
+            },
+        })
+    }
+}
+
+/// Only LIST preserves empty scopes; catalog and per-record gates refuse them.
+#[tokio::test]
+async fn only_the_query_entry_point_allows_an_empty_scope() {
+    let enforcer = enforcer_for(Arc::new(EmptyScopePermit));
+    let denied = |r: Result<(), DomainError>, what: &str| {
+        assert!(
+            matches!(r, Err(DomainError::AuthorizationDenied { .. })),
+            "{what}: {r:?}"
+        );
+    };
+
+    denied(
+        authorize(
+            &enforcer,
+            &NoopMetrics,
+            PdpOp::Ingest,
+            &ctx(),
+            &usage_record::RESOURCE,
+            usage_record::actions::CREATE,
+        )
+        .await,
+        "catalog gate",
+    );
+    let record = record_with(None);
+    denied(
+        authorize_usage_record(
+            &enforcer,
+            &NoopMetrics,
+            PdpOp::Ingest,
+            &ctx(),
+            &record,
+            usage_record::actions::CREATE,
+        )
+        .await,
+        "per-record gate",
+    );
+    let key = AttributionTupleKey::from_record(&record, usage_record::actions::CREATE);
+    denied(
+        authorize_attribution_tuple(&enforcer, &NoopMetrics, PdpOp::Ingest, &ctx(), &key).await,
+        "attribution tuple gate",
+    );
+
+    let scope =
+        authorize_list_usage_records(&enforcer, &NoopMetrics, PdpOp::QueryAggregated, &ctx())
+            .await
+            .expect("a permitted empty scope reaches the query");
+    assert!(scope.matches_nothing());
+    assert!(!scope.is_unconstrained());
+    assert_eq!(scope.original_constraints().len(), 1);
+}
+
 #[cfg(test)]
 mod scope_to_odata_tests {
     use super::SAMPLE_MEMBER_TYPE;
@@ -308,6 +390,107 @@ mod scope_to_odata_tests {
 
     use crate::domain::DomainError;
     use crate::domain::authz::{scope_to_odata_filter, usage_record};
+
+    /// `x AND NOT x` over the non-null `tenant_id`: never TRUE, even for a
+    /// NULL value (`NULL AND NOT NULL` is NULL). `x OR NOT x` would be TRUE
+    /// and expose every row.
+    fn contradiction() -> String {
+        let nil = Uuid::nil();
+        format!("(and (eq tenant_id uuid:{nil}) (not (eq tenant_id uuid:{nil})))")
+    }
+
+    #[test]
+    fn an_empty_scope_projects_to_a_valid_contradiction() {
+        use toolkit_odata::filter::convert_expr_to_filter_node;
+        use usage_collector_sdk::UsageRecordFilterField;
+        for empty in [
+            // All-empty compiled scope (normalized, keeps its originals).
+            AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::in_uuids(
+                pep_properties::OWNER_TENANT_ID,
+                vec![],
+            )])),
+            AccessScope::single(ScopeConstraint::new(vec![
+                ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, uid(7)),
+                ScopeFilter::in_uuids(pep_properties::OWNER_ID, vec![]),
+            ])),
+            // Operationally identical: a literal deny-all.
+            AccessScope::deny_all(),
+        ] {
+            assert!(empty.is_deny_all());
+            let expr = scope_to_odata_filter(&empty).expect("an empty scope is queryable");
+            convert_expr_to_filter_node::<UsageRecordFilterField>(&expr).unwrap();
+            assert_eq!(fmt_expr(&expr), contradiction(), "{empty:?}");
+        }
+    }
+
+    #[test]
+    fn an_empty_branch_beside_a_live_one_is_normalized_away() {
+        let scope = AccessScope::from_constraints(vec![
+            ScopeConstraint::new(vec![ScopeFilter::in_uuids(
+                pep_properties::OWNER_TENANT_ID,
+                vec![],
+            )]),
+            ScopeConstraint::new(vec![ScopeFilter::eq(
+                pep_properties::OWNER_TENANT_ID,
+                uid(42),
+            )]),
+        ]);
+        assert_eq!(
+            fmt_expr(&scope_to_odata_filter(&scope).unwrap()),
+            format!("(eq tenant_id uuid:{})", uid(42))
+        );
+    }
+
+    /// Accepted boundary: the PEP compiler validates every PDP branch, so a
+    /// statically empty branch is not re-validated here. An empty-only scope
+    /// is a contradiction whatever its originals named, and an empty sibling
+    /// cannot fail a live, valid branch. Live branches stay validated.
+    #[test]
+    fn empty_branches_are_not_revalidated_but_live_ones_are() {
+        for property in ["unknown_property", pep_properties::OWNER_ID] {
+            let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::in_uuids(
+                property,
+                vec![],
+            )]));
+            assert_eq!(
+                fmt_expr(&scope_to_odata_filter(&scope).unwrap()),
+                contradiction()
+            );
+        }
+        let scope = AccessScope::from_constraints(vec![
+            ScopeConstraint::new(vec![ScopeFilter::eq(
+                pep_properties::OWNER_TENANT_ID,
+                uid(42),
+            )]),
+            ScopeConstraint::new(vec![ScopeFilter::in_uuids(
+                pep_properties::OWNER_ID,
+                vec![],
+            )]),
+        ]);
+        assert_eq!(
+            fmt_expr(&scope_to_odata_filter(&scope).unwrap()),
+            format!("(eq tenant_id uuid:{})", uid(42))
+        );
+
+        // A live tenant-less or unknown-property branch still fails closed,
+        // even beside an empty one.
+        for live in [
+            ScopeFilter::eq(pep_properties::OWNER_ID, "subject"),
+            ScopeFilter::eq("unknown_property", "x"),
+        ] {
+            let scope = AccessScope::from_constraints(vec![
+                ScopeConstraint::new(vec![ScopeFilter::in_uuids(
+                    pep_properties::OWNER_TENANT_ID,
+                    vec![],
+                )]),
+                ScopeConstraint::new(vec![live]),
+            ]);
+            assert!(matches!(
+                scope_to_odata_filter(&scope),
+                Err(DomainError::AuthorizationDenied { .. })
+            ));
+        }
+    }
 
     /// Helper — flatten an Expr to a debuggable s-expression string so
     /// assertions can read at a glance.
@@ -357,9 +540,8 @@ mod scope_to_odata_tests {
     fn unconstrained_scope_is_denied_fail_closed() {
         // Under `require_constraints(true)` a legitimate LIST/aggregate permit
         // always carries `OWNER_TENANT_ID In [..]` narrowing (admin included).
-        // An `allow_all` scope only arises from a degenerate empty-predicate
-        // permit (compiler.rs returns `allow_all()` when every compiled
-        // constraint is empty), so emitting "no row narrowing" here would leak
+        // An `allow_all` scope only arises from a degenerate permit with no
+        // constraints at all, so emitting "no row narrowing" here would leak
         // every tenant's records. It MUST fail closed, mirroring the per-record
         // gate's `scope_admits_attribution_tuple`.
         let scope = AccessScope::allow_all();
@@ -378,13 +560,6 @@ mod scope_to_odata_tests {
             ScopeConstraint::try_new(vec![]).is_err(),
             "an empty constraint must not be constructible"
         );
-    }
-
-    #[test]
-    fn deny_all_scope_lifts_to_authorization_denied() {
-        let scope = AccessScope::deny_all();
-        let err = scope_to_odata_filter(&scope).expect_err("deny_all -> authz denied");
-        assert!(matches!(err, DomainError::AuthorizationDenied { .. }));
     }
 
     #[test]

@@ -13,22 +13,22 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use jsonwebtoken::jwk::JwkSet;
-use reqwest::Url;
 use tracing::{debug, info, instrument, warn};
+use url::Url;
 
 use crate::config::RetryPolicyConfig;
 use crate::domain::error::AuthNError;
 use crate::domain::metrics::AuthNMetrics;
 use crate::domain::ports::JwksProvider;
 use crate::infra::circuit_breaker::{HostCircuitBreakers, host_key};
-use crate::infra::http_response::read_json_response_limited;
 use crate::infra::oidc::OidcDiscovery;
-use crate::infra::retry::{RetriedRequestError, send_with_retry};
+use crate::infra::retry::{idp_get_error, send_with_retry};
 use crate::infra::single_flight::{
     SingleFlightGate, release_single_flight_gate as release_gate,
     single_flight_gate_with_leadership as acquire_gate,
 };
 use crate::infra::ttl_cache::{Timestamped, TtlCache};
+use crate::infra::url_policy::loggable_url;
 
 /// A cached JWKS entry.
 #[derive(Debug, Clone)]
@@ -65,7 +65,7 @@ pub struct JwksFetcherDeps {
     /// Shared OIDC discovery cache used to resolve JWKS endpoints.
     pub discovery: Arc<OidcDiscovery>,
     /// HTTP client used to fetch JWKS documents.
-    pub client: reqwest::Client,
+    pub client: crate::infra::idp_http::IdpHttpClient,
     /// Metrics recorder for JWKS cache and fetch observations.
     pub metrics: Arc<AuthNMetrics>,
     /// Retry policy applied to JWKS endpoint requests.
@@ -80,7 +80,7 @@ pub struct JwksFetcherDeps {
 pub struct JwksFetcher {
     cache: TtlCache<CachedJwks>,
     discovery: Arc<OidcDiscovery>,
-    client: reqwest::Client,
+    client: crate::infra::idp_http::IdpHttpClient,
     circuit_breakers: Option<Arc<HostCircuitBreakers>>,
     last_force_refresh: DashMap<String, Instant>,
     in_flight: DashMap<String, Arc<SingleFlightGate>>,
@@ -320,28 +320,12 @@ impl JwksFetcher {
     }
 
     async fn fetch_jwks_uri_unchecked(&self, jwks_uri: &Url) -> Result<JwkSet, AuthNError> {
-        let response = send_with_retry(&self.retry_policy, || {
-            self.client.get(jwks_uri.clone()).send()
-        })
-        .await
-        .map_err(|error| {
-            match error {
-                RetriedRequestError::Transport(e) => {
-                    warn!(url = %jwks_uri, error = %e, "JWKS fetch failed");
-                }
-                RetriedRequestError::Status(status) => {
-                    warn!(
-                        url = %jwks_uri,
-                        status = %status,
-                        "JWKS endpoint returned non-success status"
-                    );
-                }
-            }
-            AuthNError::IdpUnreachable
-        })?;
+        let response = send_with_retry(&self.retry_policy, || self.client.get(jwks_uri))
+            .await
+            .map_err(|error| idp_get_error(&error, "jwks", jwks_uri))?;
 
-        read_json_response_limited(response).await.map_err(|e| {
-            warn!(url = %jwks_uri, error = %e, "JWKS response parse failed");
+        self.client.read_json(response).await.map_err(|e| {
+            warn!(url = %loggable_url(jwks_uri.as_str()), error = %e, "JWKS response parse failed");
             AuthNError::IdpUnreachable
         })
     }
@@ -406,12 +390,13 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::mpsc;
 
-    use crate::circuit_breaker::{HostCircuitBreakers, STATE_CLOSED, STATE_OPEN, host_key};
+    use crate::circuit_breaker::{HostCircuitBreakers, host_key};
     use crate::domain::metrics::test_harness::MetricsHarness;
     use crate::oidc::OidcDiscovery;
     use crate::test_support::test_fixtures::test_jwk_json;
     use httpmock::prelude::{GET, HttpMockResponse, MockServer};
     use serde_json::json;
+    use toolkit_resilience::circuit_breaker::State;
 
     const TEST_ISSUER: &str = "https://oidc.example.com/realms/platform";
 
@@ -433,7 +418,7 @@ mod tests {
             config,
             JwksFetcherDeps {
                 discovery,
-                client: reqwest::Client::new(),
+                client: crate::infra::idp_http::IdpHttpClient::insecure_for_tests(),
                 metrics,
                 retry_policy: crate::config::default_retry_policy_config(),
             },
@@ -444,7 +429,7 @@ mod tests {
         let discovery = Arc::new(OidcDiscovery::new(
             3600,
             10,
-            reqwest::Client::new(),
+            crate::infra::idp_http::IdpHttpClient::insecure_for_tests(),
             crate::config::default_retry_policy_config(),
         ));
         make_fetcher_with_deps(
@@ -469,7 +454,7 @@ mod tests {
         let discovery = Arc::new(OidcDiscovery::new(
             3600,
             10,
-            reqwest::Client::new(),
+            crate::infra::idp_http::IdpHttpClient::insecure_for_tests(),
             crate::config::default_retry_policy_config(),
         ));
         make_fetcher_with_deps(
@@ -531,7 +516,7 @@ mod tests {
         let discovery = Arc::new(OidcDiscovery::new(
             3600,
             10,
-            reqwest::Client::new(),
+            crate::infra::idp_http::IdpHttpClient::insecure_for_tests(),
             crate::config::default_retry_policy_config(),
         ));
         let fetcher = make_fetcher_with_deps(
@@ -600,7 +585,10 @@ mod tests {
     #[tokio::test]
     async fn test_stale_entry_falls_back_to_cached_when_circuit_is_open() {
         let metrics = MetricsHarness::new().metrics();
-        let breakers = Arc::new(HostCircuitBreakers::new(1, 30, Arc::clone(&metrics)));
+        let breakers = Arc::new(
+            HostCircuitBreakers::new(1, 30, Arc::clone(&metrics))
+                .expect("test breaker config should be valid"),
+        );
         let discovery_base = test_issuer_url();
         let host = host_key(&discovery_base);
         drop(
@@ -608,12 +596,12 @@ mod tests {
                 .call(&host, || async { Err::<(), _>(AuthNError::IdpUnreachable) })
                 .await,
         );
-        assert_eq!(breakers.state_for_host(&host), Some(STATE_OPEN));
+        assert_eq!(breakers.state_for_host(&host), Some(State::Open));
 
         let discovery = Arc::new(OidcDiscovery::new(
             3600,
             10,
-            reqwest::Client::new(),
+            crate::infra::idp_http::IdpHttpClient::insecure_for_tests(),
             crate::config::default_retry_policy_config(),
         ));
         let fetcher = make_fetcher_with_deps(
@@ -664,12 +652,15 @@ mod tests {
         });
 
         let metrics = MetricsHarness::new().metrics();
-        let breakers = Arc::new(HostCircuitBreakers::new(1, 30, Arc::clone(&metrics)));
+        let breakers = Arc::new(
+            HostCircuitBreakers::new(1, 30, Arc::clone(&metrics))
+                .expect("test breaker config should be valid"),
+        );
         let discovery = Arc::new(
             OidcDiscovery::new_allowing_insecure_http_for_tests(
                 3600,
                 10,
-                reqwest::Client::new(),
+                crate::infra::idp_http::IdpHttpClient::insecure_for_tests(),
                 crate::config::default_retry_policy_config(),
             )
             .with_circuit_breakers(Arc::clone(&breakers)),
@@ -684,7 +675,7 @@ mod tests {
             },
             JwksFetcherDeps {
                 discovery,
-                client: reqwest::Client::new(),
+                client: crate::infra::idp_http::IdpHttpClient::insecure_for_tests(),
                 metrics,
                 retry_policy: crate::config::default_retry_policy_config(),
             },
@@ -698,12 +689,12 @@ mod tests {
         assert!(matches!(result, Err(AuthNError::IdpUnreachable)));
         assert_eq!(
             breakers.state_for_host(&host_key(&jwks_uri)),
-            Some(STATE_OPEN),
+            Some(State::Open),
             "JWKS endpoint failure should open the breaker keyed by jwks_uri"
         );
         assert_eq!(
             breakers.state_for_host(&host_key(&discovery_base)),
-            Some(STATE_CLOSED),
+            Some(State::Closed),
             "successful discovery must not be opened by a later JWKS endpoint failure"
         );
 
@@ -803,7 +794,7 @@ mod tests {
         let discovery = Arc::new(OidcDiscovery::new_allowing_insecure_http_for_tests(
             3600,
             10,
-            reqwest::Client::new(),
+            crate::infra::idp_http::IdpHttpClient::insecure_for_tests(),
             crate::config::default_retry_policy_config(),
         ));
         let fetcher = Arc::new(make_fetcher_with_deps(
@@ -883,7 +874,7 @@ mod tests {
         let discovery = Arc::new(OidcDiscovery::new(
             3600,
             10,
-            reqwest::Client::new(),
+            crate::infra::idp_http::IdpHttpClient::insecure_for_tests(),
             crate::config::default_retry_policy_config(),
         ));
         let fetcher = make_fetcher_with_deps(

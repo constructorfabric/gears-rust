@@ -395,7 +395,7 @@ impl AuthZResolverApi for PermitEmptyConstraintsResolver {
 }
 
 /// PDP fake that denies every evaluation (`decision: false`), surfacing as
-/// `EnforcerError::Denied` (`deny`).
+/// `EnforcerError::AccessDenied` (`deny`).
 #[derive(Debug, Default)]
 pub struct DenyAllResolver;
 
@@ -883,6 +883,8 @@ pub struct HappyPathPlugin {
     deactivate_input: Mutex<Option<Uuid>>,
     delete_usage_type_input: Mutex<Option<UsageTypeGtsId>>,
     create_usage_type_input: Mutex<Option<UsageType>>,
+    /// The last `ODataQuery` forwarded to `query_aggregated_usage_records`.
+    query_aggregated_usage_records_input: Mutex<Option<ODataQuery>>,
     /// Every `ODataQuery` ever forwarded to `list_usage_types`, in call
     /// order. Lets handler tests pin that the handler forwarded the
     /// query unchanged to the service (and hence to the SPI).
@@ -923,6 +925,7 @@ impl HappyPathPlugin {
             deactivate_input: Mutex::new(None),
             delete_usage_type_input: Mutex::new(None),
             create_usage_type_input: Mutex::new(None),
+            query_aggregated_usage_records_input: Mutex::new(None),
             list_usage_types_inputs: Mutex::new(Vec::new()),
             get_usage_type_inputs: Mutex::new(Vec::new()),
             get_usage_record_inputs: Mutex::new(Vec::new()),
@@ -1029,6 +1032,12 @@ impl HappyPathPlugin {
     pub fn last_create_records_input(&self) -> Option<Vec<UsageRecord>> {
         self.create_records_input.lock().expect("mutex").clone()
     }
+    pub fn last_query_aggregated_usage_records_input(&self) -> Option<ODataQuery> {
+        self.query_aggregated_usage_records_input
+            .lock()
+            .expect("mutex")
+            .clone()
+    }
     pub fn last_deactivate_input(&self) -> Option<Uuid> {
         *self.deactivate_input.lock().expect("mutex")
     }
@@ -1090,10 +1099,14 @@ impl UsageCollectorPluginV1 for HappyPathPlugin {
     async fn query_aggregated_usage_records(
         &self,
         _gts_id: UsageTypeGtsId,
-        _query: &ODataQuery,
+        query: &ODataQuery,
         _metadata_filter: &[MetadataFilter],
         _aggregation: AggregationSpec,
     ) -> Result<AggregationResult, UsageCollectorPluginError> {
+        *self
+            .query_aggregated_usage_records_input
+            .lock()
+            .expect("mutex") = Some(query.clone());
         self.query_aggregated_usage_records_response
             .lock()
             .expect("mutex")

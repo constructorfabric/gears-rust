@@ -14,6 +14,7 @@ use serde::de::DeserializeOwned;
 use toolkit_http::RequestBuilder;
 
 use crate::ir::binding::StreamFraming;
+use crate::runtime::breaker::AttemptStart;
 use crate::runtime::config::{ClientConfig, ReconnectConfig};
 use crate::runtime::http::{
     body_to_byte_stream, map_http_error, parse_retry_after, read_error_body_prefix,
@@ -39,7 +40,9 @@ type BoxByteStream = Pin<
 ///
 /// `timeout` bounds the **whole** attempt — connection, response headers, and
 /// reading the response body — as a per-attempt deadline (mirroring the
-/// streaming path). Elapse maps to [`TransportError::Timeout`], which is
+/// streaming path). It runs from the moment the attempt reaches the transport,
+/// after auth and the client's queue, so time spent there is not taken from
+/// the backend. Elapse maps to [`TransportError::Timeout`], which is
 /// transient, so a `#[retryable]` method retries a timed-out attempt. `None`
 /// leaves the deadline to the underlying transport.
 ///
@@ -53,22 +56,11 @@ where
     F: FnOnce() -> Result<RequestBuilder, TransportError>,
     R: DeserializeOwned,
 {
-    let builder = build()?;
-    // The transport's own timeout (set to the same deadline) bounds the wait
-    // for response headers, so a timed-out attempt reaches the circuit
-    // breaker's attempt layer as a timeout. This outer timer starts before
-    // the auth layer and the transport's timer; without the grace it fires
-    // first whenever auth delays the attempt, and the breaker sees only a
-    // dropped call. It still bounds the whole attempt, body included.
+    let attempt = AttemptStart::default();
+    let builder = build()?.extension(attempt.clone());
     let started = tokio::time::Instant::now();
     let op = async move {
-        let response = match timeout {
-            Some(d) => tokio::time::timeout(d + HEADER_DEADLINE_GRACE, builder.send())
-                .await
-                .map_err(|_| TransportError::Timeout(d))?,
-            None => builder.send().await,
-        }
-        .map_err(map_send_error)?;
+        let response = builder.send().await.map_err(map_send_error)?;
         let status = response.status();
         if status.is_success() {
             // `HttpResponse::bytes` does NOT enforce status check; we already did.
@@ -90,10 +82,16 @@ where
             Err(map_http_error(status.as_u16(), body, retry_after))
         }
     };
+    // The transport's own timeout, set to the same length, bounds the wait
+    // for response headers, so a timed-out attempt reaches the circuit
+    // breaker's attempt layer as a timeout. This timer, which also bounds the
+    // body, runs from the same start plus a grace, so it never fires first;
+    // if it did, the breaker would see only a dropped call.
     match timeout {
-        Some(d) => tokio::time::timeout_at(started + d + HEADER_DEADLINE_GRACE, op)
+        Some(d) => attempt
+            .bound(started, d + HEADER_DEADLINE_GRACE, op)
             .await
-            .map_err(|_| TransportError::Timeout(d))?,
+            .ok_or(TransportError::Timeout(d))?,
         None => op.await,
     }
 }
@@ -395,13 +393,19 @@ async fn send_open_request(
     builder: RequestBuilder,
     timeout: Option<Duration>,
 ) -> Result<toolkit_http::HttpResponse, OpenFailure> {
-    let send_fut = builder.send();
-    // The grace lets the transport's timer, started after auth, report the
-    // timeout to the circuit breaker first, as in `send_unary`.
+    let attempt = AttemptStart::default();
+    let started = tokio::time::Instant::now();
+    let send_fut = builder.extension(attempt.clone()).send();
+    // Timed from the attempt's arrival at the transport, plus a grace, so the
+    // transport's timer reports the timeout to the circuit breaker first, as
+    // in `send_unary`.
     let sent = match timeout {
-        Some(d) => match tokio::time::timeout(d + HEADER_DEADLINE_GRACE, send_fut).await {
-            Ok(r) => r,
-            Err(_) => return Err(OpenFailure::Retryable(TransportError::Timeout(d))),
+        Some(d) => match attempt
+            .bound(started, d + HEADER_DEADLINE_GRACE, send_fut)
+            .await
+        {
+            Some(r) => r,
+            None => return Err(OpenFailure::Retryable(TransportError::Timeout(d))),
         },
         None => send_fut.await,
     };

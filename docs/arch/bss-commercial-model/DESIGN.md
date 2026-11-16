@@ -612,7 +612,7 @@ Concrete event payloads are final. All use immutable event IDs, source/version, 
 - **Platform baseline**: [Security and scoped database access](../../toolkit_unified_system/06_authn_authz_secure_orm.md).
 - **Contracts PRD**: [Contracts & Agreements](../../../gears/bss/contracts/docs/PRD.md); [gear descriptor](../../../gears/bss/contracts/gear.gdl) — design-only.
 - **Approvals PRD**: [Approval inbox](../../../gears/bss/approvals/docs/PRD.md).
-- **Subscriptions**: [PRD](../../../gears/bss/subscriptions/docs/PRD.md), [events and billing](../../../gears/bss/subscriptions/docs/design/08-events-billing.md), [tenancy and transfer](../../../gears/bss/subscriptions/docs/design/07-tenancy-transfer.md), [entitlements and quotas](../../../gears/bss/subscriptions/docs/design/05-entitlements.md).
+- **Subscriptions**: [PRD](../../../gears/bss/subscriptions/docs/PRD.md), [commercial facts](../../../gears/bss/subscriptions/docs/features/08-commercial-facts.md), [tenant ownership](../../../gears/bss/subscriptions/docs/features/07-tenancy-import.md), [entitlements and quotas](../../../gears/bss/subscriptions/docs/features/05-entitlements.md).
 - **Orders**: [DECISIONS](../../../gears/bss/orders/docs/DECISIONS.md) (D-215, D-198, D-194, D-130), [DESIGN](../../../gears/bss/orders/docs/DESIGN.md), [UPSTREAM_REQS](../../../gears/bss/orders/docs/UPSTREAM_REQS.md).
 - **Orders Workflow**: [PRD](../../../gears/bss/orders-workflow/docs/PRD.md). **Orders Changes**: [PRD](../../../gears/bss/orders-changes/docs/PRD.md).
 - **Rating**: [DESIGN](../../../gears/bss/rating/docs/DESIGN.md) — attribution, aggregation and counter keys, result identity, boundary split.

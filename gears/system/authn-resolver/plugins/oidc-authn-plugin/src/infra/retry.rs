@@ -7,17 +7,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use reqwest::StatusCode;
+use http::StatusCode;
 use tokio_retry::RetryIf;
 use tokio_retry::strategy::{ExponentialBackoff, jitter};
+use toolkit_http::{HttpError, ProxyErrorKind};
+
+use tracing::warn;
 
 use crate::config::RetryPolicyConfig;
+use crate::domain::error::AuthNError;
+use crate::infra::idp_http::IdpResponse;
+use crate::infra::url_policy::loggable_url;
 
 /// Terminal failure returned after retry policy handling is exhausted or skipped.
 #[derive(Debug)]
 pub enum RetriedRequestError {
     /// A non-retryable transport error, or a retryable one after all retries.
-    Transport(reqwest::Error),
+    Transport(HttpError),
     /// A non-success HTTP status, retryable or not, after policy handling.
     Status(StatusCode),
 }
@@ -29,49 +35,100 @@ pub fn is_retryable_status(status: StatusCode) -> bool {
 }
 
 /// Returns `true` when a transport error is retryable under policy.
+///
+/// Only failures to establish a connection are retried (refused or
+/// unreachable, DNS, TLS handshake), plus a refused proxy `CONNECT`: the
+/// request never left, so a retry cannot send the token POST twice. This is
+/// the set reqwest's `is_connect()` covered. A connection lost after the
+/// request went out, timeouts (the connect timeout included) and
+/// configuration errors are not retried.
 #[must_use]
-pub fn is_retryable_transport(error: &reqwest::Error) -> bool {
-    if error.is_timeout()
-        || error.is_builder()
-        || error.is_redirect()
-        || error.is_status()
-        || error.is_body()
-        || error.is_decode()
-    {
-        return false;
+pub fn is_retryable_transport(error: &HttpError) -> bool {
+    match error {
+        HttpError::Transport(_) => is_connect_error(error) && !has_timed_out_source(error),
+        HttpError::Proxy { kind, .. } => matches!(kind, ProxyErrorKind::TunnelRejected),
+        _ => false,
     }
-
-    error.is_connect() || has_transient_io_source(error)
 }
 
-fn has_transient_io_source(error: &reqwest::Error) -> bool {
-    let mut source = error.source();
+/// Returns `true` for failures that never reached the `IdP`: the local client
+/// refused the request (load shedding, a dead buffer worker) or could not
+/// build or route it (bad URL or header, form encoding, proxy credentials
+/// rejected). These must not count as an unreachable `IdP`. A bad proxy URL
+/// already fails when the client is built; the proxy arm only guards it.
+#[must_use]
+pub fn is_local_client_failure(error: &HttpError) -> bool {
+    match error {
+        HttpError::Overloaded
+        | HttpError::ServiceClosed
+        | HttpError::RequestBuild(_)
+        | HttpError::InvalidHeaderName(_)
+        | HttpError::InvalidHeaderValue(_)
+        | HttpError::FormEncode(_)
+        | HttpError::InvalidUri { .. }
+        | HttpError::InvalidScheme { .. } => true,
+        HttpError::Proxy { kind, .. } => !matches!(kind, ProxyErrorKind::TunnelRejected),
+        _ => false,
+    }
+}
 
+/// Log a failed `IdP` GET (discovery, JWKS) and map it to the domain error.
+///
+/// A request that never reached the `IdP` is `HttpClientUnavailable`, which
+/// the circuit breaker does not count; everything else is `IdpUnreachable`.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "the score comes from the expansion of three tracing macros"
+)]
+pub fn idp_get_error(
+    error: &RetriedRequestError,
+    endpoint: &'static str,
+    url: &url::Url,
+) -> AuthNError {
+    match error {
+        RetriedRequestError::Transport(e) if is_local_client_failure(e) => {
+            warn!(endpoint, url = %loggable_url(url.as_str()), error = %e, "IdP request not sent by the local HTTP client");
+            return AuthNError::HttpClientUnavailable(e.to_string());
+        }
+        RetriedRequestError::Transport(e) => {
+            warn!(endpoint, url = %loggable_url(url.as_str()), error = %e, "IdP request failed");
+        }
+        RetriedRequestError::Status(status) => {
+            warn!(endpoint, url = %loggable_url(url.as_str()), %status, "IdP returned non-success status");
+        }
+    }
+    AuthNError::IdpUnreachable
+}
+
+/// Whether hyper-util failed before the request was sent, while connecting.
+fn is_connect_error(error: &HttpError) -> bool {
+    let mut source = error.source();
+    while let Some(err) = source {
+        if let Some(client_error) = err.downcast_ref::<hyper_util::client::legacy::Error>() {
+            return client_error.is_connect();
+        }
+        source = err.source();
+    }
+    false
+}
+
+fn has_timed_out_source(error: &HttpError) -> bool {
+    let mut source = error.source();
     while let Some(err) = source {
         if let Some(io_error) = err.downcast_ref::<io::Error>()
-            && matches!(
-                io_error.kind(),
-                io::ErrorKind::ConnectionRefused
-                    | io::ErrorKind::ConnectionReset
-                    | io::ErrorKind::ConnectionAborted
-                    | io::ErrorKind::NotConnected
-                    | io::ErrorKind::BrokenPipe
-                    | io::ErrorKind::UnexpectedEof
-            )
+            && io_error.kind() == io::ErrorKind::TimedOut
         {
             return true;
         }
-
         source = err.source();
     }
-
     false
 }
 
 /// Parse `Retry-After` delta-seconds or HTTP-date value and cap to `max_backoff`.
 #[must_use]
-pub fn retry_after_delay(response: &reqwest::Response, max_backoff: Duration) -> Option<Duration> {
-    let raw = response.headers().get(reqwest::header::RETRY_AFTER)?;
+pub fn retry_after_delay(response: &IdpResponse, max_backoff: Duration) -> Option<Duration> {
+    let raw = response.headers().get(http::header::RETRY_AFTER)?;
     let raw = raw.to_str().ok()?;
     parse_retry_after_delay(raw, SystemTime::now(), max_backoff)
 }
@@ -83,10 +140,10 @@ pub fn retry_after_delay(response: &reqwest::Response, max_backoff: Duration) ->
 pub async fn send_with_retry<F, Fut>(
     policy: &RetryPolicyConfig,
     mut send: F,
-) -> Result<reqwest::Response, RetriedRequestError>
+) -> Result<IdpResponse, RetriedRequestError>
 where
     F: FnMut() -> Fut,
-    Fut: Future<Output = reqwest::Result<reqwest::Response>>,
+    Fut: Future<Output = Result<IdpResponse, HttpError>>,
 {
     // Server `Retry-After` (HTTP 429) overrides our computed backoff for the
     // next delay. The action writes the parsed value (ms; `0` = none) here and
@@ -158,9 +215,176 @@ fn parse_retry_after_delay(raw: &str, now: SystemTime, max_backoff: Duration) ->
     Some(delay.min(max_backoff))
 }
 
+/// A loopback TCP endpoint that answers every request with fixed bytes.
+#[cfg(test)]
+pub mod raw_endpoint {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// The running endpoint.
+    pub struct RawEndpoint {
+        /// Where it listens.
+        pub addr: SocketAddr,
+        connections: Arc<AtomicUsize>,
+    }
+
+    impl RawEndpoint {
+        /// Connections accepted so far.
+        pub fn connections(&self) -> usize {
+            self.connections.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Accept connections; on each, read the request head, write `reply`,
+    /// then keep the connection open until the client closes it.
+    pub async fn spawn(reply: &'static [u8]) -> RawEndpoint {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&connections);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0_u8; 1024];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    if stream.write_all(reply).await.is_err() {
+                        return;
+                    }
+                    while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {}
+                });
+            }
+        });
+        RawEndpoint { addr, connections }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn transport(kind: io::ErrorKind) -> HttpError {
+        HttpError::Transport(Box::new(io::Error::new(kind, "test")))
+    }
+
+    #[test]
+    fn does_not_retry_timeouts() {
+        assert!(!is_retryable_transport(&transport(io::ErrorKind::TimedOut)));
+        assert!(!is_retryable_transport(&HttpError::Timeout(
+            Duration::from_secs(1)
+        )));
+        assert!(!is_retryable_transport(&HttpError::DeadlineExceeded(
+            Duration::from_secs(1)
+        )));
+    }
+
+    #[test]
+    fn local_client_failures_are_not_retried_and_not_idp_failures() {
+        let request_build = http::Request::builder()
+            .method("not a method")
+            .body(())
+            .expect_err("invalid method");
+        for error in [
+            HttpError::Overloaded,
+            HttpError::ServiceClosed,
+            HttpError::RequestBuild(request_build),
+            HttpError::InvalidScheme {
+                scheme: "http".to_owned(),
+                reason: "test".to_owned(),
+            },
+            HttpError::InvalidUri {
+                url: "x".to_owned(),
+                kind: toolkit_http::InvalidUriKind::ParseError,
+                reason: "test".to_owned(),
+            },
+        ] {
+            assert!(is_local_client_failure(&error), "{error:?}");
+            assert!(!is_retryable_transport(&error), "{error:?}");
+        }
+        assert!(!is_local_client_failure(&transport(
+            io::ErrorKind::ConnectionRefused
+        )));
+    }
+
+    #[tokio::test]
+    async fn proxy_rejecting_credentials_is_a_local_failure() {
+        let proxy =
+            raw_endpoint::spawn(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n").await;
+        let http = crate::infra::idp_http::IdpHttpClient::builder(Duration::from_secs(5))
+            .tls_roots(toolkit_http::TlsRootConfig::WebPki)
+            .outbound_proxy(toolkit_http::OutboundProxy::Explicit(
+                toolkit_http::ExplicitProxy::all(format!("http://{}", proxy.addr)),
+            ))
+            .build()
+            .expect("client should build");
+        let client = crate::infra::idp_http::IdpHttpClient::new(http, Duration::from_secs(5));
+
+        let error = client
+            .get(&url::Url::parse("https://idp.example.com/").expect("URL should parse"))
+            .await
+            .expect_err("the proxy answers 407");
+
+        assert!(is_local_client_failure(&error), "{error:?}");
+        assert!(!is_retryable_transport(&error), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn failure_after_the_request_was_sent_is_not_retried() {
+        let endpoint = raw_endpoint::spawn(b"HTTP/1.1 not-a-status\r\n\r\n").await;
+
+        let error = crate::infra::idp_http::IdpHttpClient::insecure_for_tests()
+            .get(&url::Url::parse(&format!("http://{}/", endpoint.addr)).expect("URL should parse"))
+            .await
+            .expect_err("the status line is invalid");
+
+        assert!(matches!(error, HttpError::Transport(_)), "{error:?}");
+        assert!(!is_retryable_transport(&error), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn real_dns_failure_is_retryable() {
+        let error = crate::infra::idp_http::IdpHttpClient::insecure_for_tests()
+            .get(&url::Url::parse("http://idp.invalid/").expect("URL should parse"))
+            .await
+            .expect_err("the .invalid TLD never resolves");
+
+        assert!(is_retryable_transport(&error), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn real_connection_refused_is_retryable() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("addr").port()
+        };
+        let error = crate::infra::idp_http::IdpHttpClient::insecure_for_tests()
+            .get(&url::Url::parse(&format!("http://127.0.0.1:{port}/")).expect("URL should parse"))
+            .await
+            .expect_err("nothing listens on the port");
+
+        assert!(is_retryable_transport(&error), "{error:?}");
+    }
+
+    #[test]
+    fn does_not_retry_tls_or_body_errors() {
+        assert!(!is_retryable_transport(&HttpError::Tls(Box::new(
+            io::Error::new(io::ErrorKind::ConnectionReset, "tls")
+        ))));
+        assert!(!is_retryable_transport(&HttpError::BodyTooLarge {
+            limit: 1,
+            actual: 2
+        }));
+    }
 
     #[test]
     fn parses_retry_after_delta_seconds() {

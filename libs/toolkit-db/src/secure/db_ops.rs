@@ -51,7 +51,9 @@ fn sea_value_to_scope_value(v: &sea_orm::Value) -> Option<toolkit_security::Scop
 ///   that constraint to pass.
 /// - A filter whose property resolves to a column where the `ActiveModel` value
 ///   is `NotSet` is **skipped** (the column is not being inserted, so there's
-///   nothing to validate).
+///   nothing to validate). An empty-set constraint never matches, even when
+///   its column is `NotSet`: `AccessScope` normalizes such branches out of
+///   `constraints()`, and a scope left with none is deny-all.
 /// - A filter whose property does **not** resolve (unknown property) causes
 ///   that constraint to fail (fail-closed), consistent with the query-path
 ///   behavior in `build_scope_condition`.
@@ -65,7 +67,7 @@ where
     A::Entity: ScopableEntity + EntityTrait,
     <A::Entity as EntityTrait>::Column: ColumnTrait + Copy,
 {
-    if scope.is_unconstrained() || A::Entity::IS_UNRESTRICTED {
+    if scope.is_unconstrained() || A::Entity::SCOPE.is_unrestricted() {
         return Ok(());
     }
     if scope.is_deny_all() {
@@ -78,7 +80,8 @@ where
     'next_constraint: for constraint in scope.constraints() {
         // AND over filters within this constraint.
         for filter in constraint.filters() {
-            let Some(col) = <A::Entity as ScopableEntity>::resolve_property(filter.property())
+            let Some(col) =
+                <A::Entity as ScopableEntity>::SCOPE.resolve_property(filter.property())
             else {
                 // Unknown property → this constraint fails (fail-closed).
                 continue 'next_constraint;
@@ -188,7 +191,7 @@ where
     E::Model: sea_orm::IntoActiveModel<E::ActiveModel>,
 {
     // Tenant-scoped entities must have tenant_id set in the ActiveModel.
-    if let Some(tenant_col) = E::tenant_col()
+    if let Some(tenant_col) = E::SCOPE.tenant()
         && let sea_orm::ActiveValue::NotSet = am.get(tenant_col)
     {
         return Err(ScopeError::Invalid("tenant_id is required"));
@@ -268,7 +271,7 @@ where
     // in the batch inserts nothing at all -- including when the batch is about
     // to be split into several statements below.
     for am in &models {
-        if let Some(tenant_col) = E::tenant_col()
+        if let Some(tenant_col) = E::SCOPE.tenant()
             && let sea_orm::ActiveValue::NotSet = am.get(tenant_col)
         {
             return Err(ScopeError::Invalid("tenant_id is required"));
@@ -302,7 +305,7 @@ where
 /// be checked without a database.
 ///
 /// Only an entity that declares no scope column at all may be written this
-/// way.
+/// way: no dimension, the type column included, and no custom PEP property.
 ///
 /// # Errors
 ///
@@ -311,11 +314,7 @@ fn insert_from_select_allowed<E>() -> Result<(), ScopeError>
 where
     E: ScopableEntity + EntityTrait,
 {
-    if E::tenant_col().is_some()
-        || E::resource_col().is_some()
-        || E::owner_col().is_some()
-        || E::type_col().is_some()
-    {
+    if !E::SCOPE.has_no_columns() {
         return Err(ScopeError::Invalid(
             "insert-from-select is limited to entities without scope columns: \
              rows produced inside the database cannot be validated per row",
@@ -502,7 +501,7 @@ where
         ));
     };
 
-    if let Some(tcol) = E::tenant_col() {
+    if let Some(tcol) = E::SCOPE.tenant() {
         let sea_orm::Value::Uuid(Some(stored)) = existing.get(tcol) else {
             return Err(ScopeError::Invalid("tenant_id has unexpected type"));
         };
@@ -937,7 +936,7 @@ where
 
 /// A secure builder for `ON CONFLICT DO UPDATE` clauses that enforces tenant immutability.
 ///
-/// For tenant-scoped entities (`ScopableEntity::tenant_col() != None`), this builder
+/// For tenant-scoped entities (`ScopableEntity::SCOPE.tenant()` is `Some`), this builder
 /// ensures that `tenant_id` is never included in the update columns. Attempting to
 /// update `tenant_id` via `update_columns()` or `value()` returns an error.
 ///
@@ -1022,7 +1021,7 @@ where
         let cols: Vec<C> = cols.into_iter().collect();
 
         // Check if tenant column is in the update list
-        if let Some(tenant_col) = E::tenant_col() {
+        if let Some(tenant_col) = E::SCOPE.tenant() {
             let tenant_iden = tenant_col.into_iden();
             for col in &cols {
                 let col_iden = col.into_iden();
@@ -1047,7 +1046,7 @@ where
         C: IntoIden + Copy + 'static,
     {
         // Check if this is the tenant column
-        if let Some(tenant_col) = E::tenant_col() {
+        if let Some(tenant_col) = E::SCOPE.tenant() {
             let tenant_iden = tenant_col.into_iden();
             let col_iden = col.into_iden();
             if col_iden.to_string() == tenant_iden.to_string() {
@@ -1116,7 +1115,7 @@ where
     /// Set a column expression (mirrors `SeaORM`'s `UpdateMany::col_expr`).
     #[must_use]
     pub fn col_expr(mut self, col: E::Column, expr: sea_orm::sea_query::SimpleExpr) -> Self {
-        if let Some(tcol) = E::tenant_col()
+        if let Some(tcol) = E::SCOPE.tenant()
             && std::mem::discriminant(&col) == std::mem::discriminant(&tcol)
         {
             self.tenant_update_attempted = true;
@@ -1343,10 +1342,10 @@ mod tests {
     // Test entity with tenant_col for SecureOnConflict tests
     mod test_entity {
         use super::*;
-        use toolkit_security::pep_properties;
 
-        #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+        #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, toolkit_db::secure::Scopable)]
         #[sea_orm(table_name = "test_table")]
+        #[secure(tenant_col = "tenant_id", resource_col = "id", no_owner, no_type)]
         pub struct Model {
             #[sea_orm(primary_key)]
             pub id: Uuid,
@@ -1359,31 +1358,6 @@ mod tests {
         pub enum Relation {}
 
         impl ActiveModelBehavior for ActiveModel {}
-
-        impl ScopableEntity for Entity {
-            fn tenant_col() -> Option<Column> {
-                Some(Column::TenantId)
-            }
-            fn resource_col() -> Option<Column> {
-                Some(Column::Id)
-            }
-            fn owner_col() -> Option<Column> {
-                None
-            }
-            fn type_col() -> Option<Column> {
-                None
-            }
-            fn resolve_property(property: &str) -> Option<Column> {
-                match property {
-                    pep_properties::OWNER_TENANT_ID => Self::tenant_col(),
-                    pep_properties::RESOURCE_ID => Self::resource_col(),
-                    _ => None,
-                }
-            }
-            fn scope_columns() -> Vec<Column> {
-                vec![Column::TenantId, Column::Id]
-            }
-        }
     }
 
     #[test]
@@ -1414,8 +1388,9 @@ mod tests {
     mod unscoped_entity {
         use super::*;
 
-        #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+        #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, toolkit_db::secure::Scopable)]
         #[sea_orm(table_name = "unscoped_table")]
+        #[secure(no_tenant, no_resource, no_owner, no_type)]
         pub struct Model {
             #[sea_orm(primary_key, auto_increment = false)]
             pub left_id: Uuid,
@@ -1428,35 +1403,59 @@ mod tests {
         pub enum Relation {}
 
         impl ActiveModelBehavior for ActiveModel {}
+    }
 
-        impl ScopableEntity for Entity {
-            fn tenant_col() -> Option<Column> {
-                None
-            }
-            fn resource_col() -> Option<Column> {
-                None
-            }
-            fn owner_col() -> Option<Column> {
-                None
-            }
-            fn type_col() -> Option<Column> {
-                None
-            }
-            fn resolve_property(_property: &str) -> Option<Column> {
-                None
-            }
-            fn scope_columns() -> Vec<Column> {
-                Vec::new()
-            }
+    /// No named dimension, one custom PEP property: a column a scope can
+    /// still constrain.
+    mod pep_prop_entity {
+        use super::*;
+
+        #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, toolkit_db::secure::Scopable)]
+        #[sea_orm(table_name = "pep_prop_only_table")]
+        #[secure(
+            no_tenant,
+            no_resource,
+            no_owner,
+            no_type,
+            pep_prop(department_id = "department_id")
+        )]
+        pub struct Model {
+            #[sea_orm(primary_key, auto_increment = false)]
+            pub id: Uuid,
+            pub department_id: Uuid,
         }
+
+        #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+        pub enum Relation {}
+
+        impl ActiveModelBehavior for ActiveModel {}
+    }
+
+    #[test]
+    fn insert_from_select_refuses_an_entity_scoped_only_by_a_pep_prop() {
+        use pep_prop_entity::Entity;
+
+        let scope = <Entity as ScopableEntity>::SCOPE;
+        assert!(
+            scope.tenant().is_none()
+                && scope.resource().is_none()
+                && scope.owner().is_none()
+                && scope.type_col().is_none(),
+            "premise: every named dimension is None"
+        );
+
+        let err = insert_from_select_allowed::<Entity>()
+            .expect_err("a pep_prop is a scope column like any other");
+        assert!(matches!(err, ScopeError::Invalid(_)), "got: {err:?}");
     }
 
     // Test entity without tenant_col (global entity)
     mod global_entity {
         use super::*;
 
-        #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+        #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, toolkit_db::secure::Scopable)]
         #[sea_orm(table_name = "global_table")]
+        #[secure(no_tenant, resource_col = "id", no_owner, no_type)]
         pub struct Model {
             #[sea_orm(primary_key)]
             pub id: Uuid,
@@ -1468,29 +1467,34 @@ mod tests {
         pub enum Relation {}
 
         impl ActiveModelBehavior for ActiveModel {}
+    }
 
-        impl ScopableEntity for Entity {
-            fn tenant_col() -> Option<Column> {
-                None // Global entity - no tenant column
+    #[test]
+    fn tenant_validation_ignores_empty_branches() {
+        use toolkit_security::{AccessScope, ScopeConstraint, ScopeFilter, pep_properties};
+        let tenant = Uuid::from_u128(1);
+        let other = Uuid::from_u128(2);
+        let dead = ScopeConstraint::new(vec![
+            ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, tenant),
+            ScopeFilter::in_uuids(pep_properties::RESOURCE_ID, vec![]),
+        ]);
+        for live_tenant in [None, Some(tenant), Some(other)] {
+            let mut constraints = vec![dead.clone()];
+            if let Some(id) = live_tenant {
+                constraints.push(ScopeConstraint::new(vec![ScopeFilter::eq(
+                    pep_properties::OWNER_TENANT_ID,
+                    id,
+                )]));
             }
-            fn resource_col() -> Option<Column> {
-                Some(Column::Id)
-            }
-            fn owner_col() -> Option<Column> {
-                None
-            }
-            fn type_col() -> Option<Column> {
-                None
-            }
-            fn resolve_property(property: &str) -> Option<Column> {
-                match property {
-                    "id" => Self::resource_col(),
-                    _ => None,
-                }
-            }
-            fn scope_columns() -> Vec<Column> {
-                vec![Column::Id]
-            }
+            let scope = AccessScope::from_constraints(constraints);
+            assert_eq!(
+                validate_tenant_in_scope(tenant, &scope).is_ok(),
+                live_tenant == Some(tenant)
+            );
+            assert_eq!(
+                validate_tenant_in_scope(other, &scope).is_ok(),
+                live_tenant == Some(other)
+            );
         }
     }
 
@@ -1666,10 +1670,16 @@ mod tests {
     // mimicking the Address entity from the users-info example.
     mod owner_entity {
         use super::*;
-        use toolkit_security::pep_properties;
 
-        #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+        #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, toolkit_db::secure::Scopable)]
         #[sea_orm(table_name = "addresses")]
+        #[secure(
+            tenant_col = "tenant_id",
+            resource_col = "id",
+            owner_col = "user_id",
+            no_type,
+            pep_prop(city_id = "city_id")
+        )]
         pub struct Model {
             #[sea_orm(primary_key)]
             pub id: Uuid,
@@ -1682,32 +1692,46 @@ mod tests {
         pub enum Relation {}
 
         impl ActiveModelBehavior for ActiveModel {}
+    }
 
-        impl ScopableEntity for Entity {
-            fn tenant_col() -> Option<Column> {
-                Some(Column::TenantId)
-            }
-            fn resource_col() -> Option<Column> {
-                Some(Column::Id)
-            }
-            fn owner_col() -> Option<Column> {
-                Some(Column::UserId)
-            }
-            fn type_col() -> Option<Column> {
-                None
-            }
-            fn resolve_property(property: &str) -> Option<Column> {
-                match property {
-                    pep_properties::OWNER_TENANT_ID => Some(Column::TenantId),
-                    pep_properties::RESOURCE_ID => Some(Column::Id),
-                    pep_properties::OWNER_ID => Some(Column::UserId),
-                    "city_id" => Some(Column::CityId),
-                    _ => None,
-                }
-            }
-            fn scope_columns() -> Vec<Column> {
-                vec![Column::TenantId, Column::Id, Column::UserId, Column::CityId]
-            }
+    #[test]
+    fn empty_insert_filter_rejects_not_set_but_preserves_or_alternative() {
+        use owner_entity::ActiveModel;
+        use sea_orm::{NotSet, Set};
+        use toolkit_security::pep_properties;
+        let tenant = Uuid::from_u128(1);
+        let am = ActiveModel {
+            id: NotSet,
+            tenant_id: Set(tenant),
+            user_id: NotSet,
+            city_id: NotSet,
+        };
+        for empty_filter in [
+            crate::secure::ScopeFilter::in_uuids(pep_properties::RESOURCE_ID, vec![]),
+            crate::secure::ScopeFilter::in_group_typed(
+                pep_properties::RESOURCE_ID,
+                toolkit_gts::gts_id!("cf.core.test.entity.v1~"),
+                vec![],
+            ),
+            crate::secure::ScopeFilter::in_group_subtree_typed(
+                pep_properties::RESOURCE_ID,
+                toolkit_gts::gts_id!("cf.core.test.entity.v1~"),
+                vec![],
+            ),
+        ] {
+            let empty = crate::secure::ScopeConstraint::new(vec![
+                crate::secure::ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, tenant),
+                empty_filter,
+            ]);
+            let scope = crate::secure::AccessScope::from_constraints(vec![empty.clone()]);
+            assert!(validate_insert_scope(&am, &scope).is_err());
+            let alternative =
+                crate::secure::ScopeConstraint::new(vec![crate::secure::ScopeFilter::eq(
+                    pep_properties::OWNER_TENANT_ID,
+                    tenant,
+                )]);
+            let scope = crate::secure::AccessScope::from_constraints(vec![empty, alternative]);
+            assert!(validate_insert_scope(&am, &scope).is_ok());
         }
     }
 
@@ -1950,10 +1974,16 @@ mod tests {
     /// unsupported-type path fails closed rather than allowing the insert.
     mod unsupported_value_entity {
         use super::*;
-        use toolkit_security::pep_properties;
 
-        #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+        #[derive(Clone, Debug, PartialEq, DeriveEntityModel, toolkit_db::secure::Scopable)]
         #[sea_orm(table_name = "unsupported_value_table")]
+        #[secure(
+            tenant_col = "tenant_id",
+            no_resource,
+            no_owner,
+            no_type,
+            pep_prop(score = "score")
+        )]
         pub struct Model {
             #[sea_orm(primary_key)]
             pub id: Uuid,
@@ -1967,31 +1997,6 @@ mod tests {
         pub enum Relation {}
 
         impl ActiveModelBehavior for ActiveModel {}
-
-        impl ScopableEntity for Entity {
-            fn tenant_col() -> Option<Column> {
-                Some(Column::TenantId)
-            }
-            fn resource_col() -> Option<Column> {
-                Some(Column::Id)
-            }
-            fn owner_col() -> Option<Column> {
-                None
-            }
-            fn type_col() -> Option<Column> {
-                None
-            }
-            fn resolve_property(property: &str) -> Option<Column> {
-                match property {
-                    pep_properties::OWNER_TENANT_ID => Self::tenant_col(),
-                    "score" => Some(Column::Score),
-                    _ => None,
-                }
-            }
-            fn scope_columns() -> Vec<Column> {
-                vec![Column::TenantId, Column::Id, Column::Score]
-            }
-        }
     }
 
     // -----------------------------------------------------------------------

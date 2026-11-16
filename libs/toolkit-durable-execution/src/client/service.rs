@@ -78,6 +78,9 @@ impl Service {
             let domain = match error.kind() {
                 AuthorizationErrorKind::Denied => DomainError::Forbidden,
                 AuthorizationErrorKind::Unavailable => DomainError::Unavailable,
+                AuthorizationErrorKind::Internal => {
+                    DomainError::Internal("authorization failed internally")
+                }
             };
             Error::from(domain).with_source(error)
         })

@@ -40,7 +40,10 @@ changelog_path = "CHANGELOG.md"
 # Enable semver checks by default (can be overridden per package if needed later).
 semver_check = true
 
-# To prevent crates.io throttling
+# Upper bound on each registry lookup (`cargo info`) and on the wait for a published
+# version to appear in the index when `cargo publish` did not confirm it itself. Not a
+# rate-limit setting: a crates.io 429 fails the publish, and the workflow retries the
+# whole release.
 publish_timeout = "10m"
 
 [changelog]

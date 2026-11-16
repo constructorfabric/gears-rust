@@ -16,10 +16,10 @@ const BACKENDS: [DbBackend; 3] = [DbBackend::Postgres, DbBackend::MySql, DbBacke
 /// fixture serves both the flat and the recursive tests.
 mod node {
     use sea_orm::entity::prelude::*;
-    use toolkit_security::access_scope::pep_properties;
 
-    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, toolkit_db::secure::Scopable)]
     #[sea_orm(table_name = "cte_node")]
+    #[secure(tenant_col = "tenant_id", resource_col = "id", no_owner, no_type)]
     pub struct Model {
         #[sea_orm(primary_key)]
         pub id: Uuid,
@@ -32,41 +32,16 @@ mod node {
     pub enum Relation {}
 
     impl ActiveModelBehavior for ActiveModel {}
-
-    impl crate::secure::ScopableEntity for Entity {
-        fn tenant_col() -> Option<Column> {
-            Some(Column::TenantId)
-        }
-        fn resource_col() -> Option<Column> {
-            Some(Column::Id)
-        }
-        fn owner_col() -> Option<Column> {
-            None
-        }
-        fn type_col() -> Option<Column> {
-            None
-        }
-        fn resolve_property(property: &str) -> Option<Column> {
-            match property {
-                p if p == pep_properties::OWNER_TENANT_ID => Some(Column::TenantId),
-                p if p == pep_properties::RESOURCE_ID => Some(Column::Id),
-                _ => None,
-            }
-        }
-        fn scope_columns() -> Vec<Column> {
-            vec![Column::TenantId, Column::Id]
-        }
-    }
 }
 
 /// A second scoped entity, for asserting that *every* CTE body is scoped rather
 /// than just the first.
 mod item {
     use sea_orm::entity::prelude::*;
-    use toolkit_security::access_scope::pep_properties;
 
-    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, toolkit_db::secure::Scopable)]
     #[sea_orm(table_name = "cte_item")]
+    #[secure(tenant_col = "tenant_id", resource_col = "id", no_owner, no_type)]
     pub struct Model {
         #[sea_orm(primary_key)]
         pub id: Uuid,
@@ -78,31 +53,6 @@ mod item {
     pub enum Relation {}
 
     impl ActiveModelBehavior for ActiveModel {}
-
-    impl crate::secure::ScopableEntity for Entity {
-        fn tenant_col() -> Option<Column> {
-            Some(Column::TenantId)
-        }
-        fn resource_col() -> Option<Column> {
-            Some(Column::Id)
-        }
-        fn owner_col() -> Option<Column> {
-            None
-        }
-        fn type_col() -> Option<Column> {
-            None
-        }
-        fn resolve_property(property: &str) -> Option<Column> {
-            match property {
-                p if p == pep_properties::OWNER_TENANT_ID => Some(Column::TenantId),
-                p if p == pep_properties::RESOURCE_ID => Some(Column::Id),
-                _ => None,
-            }
-        }
-        fn scope_columns() -> Vec<Column> {
-            vec![Column::TenantId, Column::Id]
-        }
-    }
 }
 
 fn tenant_scope(tenant: uuid::Uuid) -> AccessScope {

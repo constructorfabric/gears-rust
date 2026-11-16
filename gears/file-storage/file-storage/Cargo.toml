@@ -35,7 +35,7 @@ default = []
 cf-gears-file-storage-sdk = { version = "0.3.2", path = "../file-storage-sdk" }
 
 # Authorization Service (PEP) — per-type access decisions
-cf-gears-authz-resolver-sdk = { version = "0.6.5", path = "../../system/authz-resolver/authz-resolver-sdk" }
+authz-resolver-sdk = { workspace = true }
 authz-resolver = { workspace = true }
 
 # Core dependencies
@@ -109,6 +109,7 @@ toolkit-odata = { workspace = true, features = ["with-utoipa"] }
 gts = { workspace = true }
 
 [dev-dependencies]
+authz-resolver-sdk = { workspace = true, features = ["test-util"] }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 tower = { workspace = true }

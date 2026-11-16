@@ -275,7 +275,7 @@ where
         E: ScopableEntity,
         E::Column: ColumnTrait + Copy,
     {
-        let resource_col = E::resource_col().ok_or(ScopeError::Invalid(
+        let resource_col = E::SCOPE.resource().ok_or(ScopeError::Invalid(
             "Entity must have a resource_col to use and_id()",
         ))?;
         let cond = sea_orm::Condition::all().add(Expr::col(resource_col).eq(id));
@@ -487,7 +487,7 @@ where
     /// # Automatic Scoping
     /// - The primary entity `E` is already scoped by the parent `SecureSelect`.
     /// - The related entity `R` will automatically have tenant filtering applied
-    ///   **if it has a tenant column** (i.e., `R::tenant_col()` returns `Some`).
+    ///   **if it has a tenant column** (i.e., `R::SCOPE.tenant()` returns `Some`).
     /// - For **global entities** (those with `#[secure(no_tenant)]`), no additional
     ///   filtering is applied — the scoping becomes a no-op automatically.
     ///
@@ -548,7 +548,7 @@ where
     /// # Automatic Scoping
     /// - The primary entity `E` is already scoped by the parent `SecureSelect`.
     /// - The related entity `R` will automatically have tenant filtering applied
-    ///   **if it has a tenant column** (i.e., `R::tenant_col()` returns `Some`).
+    ///   **if it has a tenant column** (i.e., `R::SCOPE.tenant()` returns `Some`).
     /// - For **global entities** (those with `#[secure(no_tenant)]`), no additional
     ///   filtering is applied — the scoping becomes a no-op automatically.
     ///

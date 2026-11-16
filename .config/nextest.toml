@@ -32,7 +32,7 @@ retries = 0
 # binary's fifth case, rolling_replacement_via_disconnect, has not been seen
 # failing and runs without retries.
 [[profile.default.overrides]]
-filter = '''package(cf-gears-event-broker) & binary(consumer_group_rebalance_integration_tests) & (
+filter = '''package(cf-gears-event-broker-server) & binary(consumer_group_rebalance_integration_tests) & (
   test(=two_subscribers_baseline_then_third_joins_mid_stream)
   | test(=scale_down_via_disconnect)
   | test(=rolling_replacement_via_delete)

@@ -70,15 +70,15 @@ fn authorization_denied_lifts_to_permission_denied_preserving_reason() {
 
 #[test]
 fn enforcer_denied_extracts_deny_reason_fields_into_reason_string() {
-    use authz_resolver_sdk::EnforcerError;
     use authz_resolver_sdk::models::DenyReason;
+    use authz_resolver_sdk::{AccessDenial, EnforcerError};
 
-    let with_details: DomainError = EnforcerError::Denied {
-        deny_reason: Some(DenyReason {
+    let with_details: DomainError = EnforcerError::AccessDenied(AccessDenial::Pdp {
+        reason: Some(DenyReason {
             error_code: "TENANT_BARRIER".to_owned(),
             details: Some("subject home tenant != context".to_owned()),
         }),
-    }
+    })
     .into();
     match with_details {
         DomainError::AuthorizationDenied { reason } => assert_eq!(
@@ -88,12 +88,12 @@ fn enforcer_denied_extracts_deny_reason_fields_into_reason_string() {
         other => panic!("expected AuthorizationDenied, got {other:?}"),
     }
 
-    let bare: DomainError = EnforcerError::Denied {
-        deny_reason: Some(DenyReason {
+    let bare: DomainError = EnforcerError::AccessDenied(AccessDenial::Pdp {
+        reason: Some(DenyReason {
             error_code: "FORBIDDEN".to_owned(),
             details: None,
         }),
-    }
+    })
     .into();
     match bare {
         DomainError::AuthorizationDenied { reason } => {
@@ -102,7 +102,8 @@ fn enforcer_denied_extracts_deny_reason_fields_into_reason_string() {
         other => panic!("expected AuthorizationDenied, got {other:?}"),
     }
 
-    let missing: DomainError = EnforcerError::Denied { deny_reason: None }.into();
+    let missing: DomainError =
+        EnforcerError::AccessDenied(AccessDenial::Pdp { reason: None }).into();
     match missing {
         DomainError::AuthorizationDenied { reason } => assert!(reason.is_none()),
         other => panic!("expected AuthorizationDenied, got {other:?}"),

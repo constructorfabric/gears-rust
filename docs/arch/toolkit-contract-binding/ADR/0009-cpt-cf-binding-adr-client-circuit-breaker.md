@@ -81,6 +81,13 @@ timeout, so a timed-out attempt reached the breaker as a dropped call and counte
 `send_unary` now lets the transport timeout end the header phase; the outer timer keeps a 50 ms
 grace and still bounds the whole attempt, body included.
 
+A fixed grace was not enough. Auth, the buffer and the concurrency limiter run before the
+transport timer starts; when they took more than 50 ms (a token fetch, a loaded CI runner) the
+outer timer still fired first. The outer timer of `send_unary` and of a stream open now runs from
+the moment the attempt reaches the attempt layer, marked there (`AttemptStart`), and falls back to
+the call start only while the attempt has not arrived. Time spent before the transport is no
+longer taken from the backend's budget, and an attempt that never arrives is still bounded.
+
 ### Classification (`toolkit_contract::runtime::breaker`, `grpc::GrpcEndpointFailure`)
 
 | Outcome | REST | gRPC |

@@ -13,6 +13,8 @@ succeed, it closes.
 
 - The caller decides what a failure is: each call takes a `Permit` and records an `Outcome` on it.
   A permit dropped without an outcome counts for nothing.
+  `Permit::is_probe()` tells a half-open probe from an ordinary call, for callers that judge an
+  outcome differently while probing.
 - `CircuitBreakerConfig` defaults: open when at least half of at least 10 calls in the last 30
   seconds failed, stay open 10 seconds, then one probe. `with_consecutive_failures(k)` trips on `k`
   failures in a row instead.

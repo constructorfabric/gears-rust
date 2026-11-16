@@ -18,6 +18,9 @@ The public contract of the graph-storage gear, for consumers and plugin authors:
 
 ```rust,ignore
 let graph = ctx.client_hub().get::<dyn graph_storage_sdk::GraphStorageClientV1>()?;
+// A service that acts in tenants it is not a subject of names the tenant;
+// the PDP decides, and a refusal is not found.
+let in_tenant = graph.in_tenant(tenant_id);
 ```
 
 See the gear's [DESIGN](../docs/DESIGN.md) for the API semantics.

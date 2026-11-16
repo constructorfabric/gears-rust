@@ -67,11 +67,15 @@ mod scopable;
 /// - `unrestricted` - Mark as global entity (forbids all other attributes)
 /// - `pep_prop(property_name = "column_name")` - Custom PEP property mapping (repeatable)
 ///
-/// The macro auto-generates `resolve_property()` from dimension columns and `pep_prop` entries:
+/// The macro generates `const SCOPE: EntityScope<Column>`: `EntityScope::Unrestricted`
+/// for `unrestricted`, otherwise `EntityScope::Scoped(Dimensions { .. })` with one field
+/// per dimension and the `pep_prop` entries as `custom`. The property names a scope
+/// addresses them by:
 /// - `tenant_col` → `"owner_tenant_id"`
 /// - `resource_col` → `"id"`
 /// - `owner_col` → `"owner_id"`
 /// - Each `pep_prop(name = "col")` → `"name"`
+/// - `type_col` has no property name and is not a scope column
 ///
 /// # Example
 ///

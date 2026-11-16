@@ -513,6 +513,16 @@ impl Permit {
         }
     }
 
+    /// Whether this permit is a half-open probe, i.e. holds a probe slot.
+    ///
+    /// Callers that judge a call differently while probing should ask the
+    /// permit rather than [`CircuitBreaker::state`], which may already have
+    /// moved on.
+    #[must_use]
+    pub fn is_probe(&self) -> bool {
+        self.slot.is_some()
+    }
+
     /// Record the call's outcome.
     pub fn record(mut self, outcome: Outcome) {
         if let Some(breaker) = self.breaker.take() {

@@ -761,3 +761,96 @@ async fn session_scoped_results_omit_session_metadata() {
     assert_eq!(page.items.len(), 1);
     assert!(page.items[0].session_metadata.is_none());
 }
+
+#[tokio::test]
+async fn empty_pdp_scope_preserves_session_and_cross_session_search_results() {
+    use authz_resolver_sdk::{
+        AuthZResolverApi,
+        constraints::{Constraint, InPredicate, Predicate},
+        models::{EvaluationRequest, EvaluationResponse, EvaluationResponseContext},
+    };
+    use toolkit_canonical_errors::CanonicalError;
+    use toolkit_security::PlatformSecurityContext;
+
+    struct SearchPermit(Vec<Constraint>);
+
+    #[async_trait]
+    impl AuthZResolverApi for SearchPermit {
+        async fn evaluate(
+            &self,
+            _ctx: PlatformSecurityContext,
+            _request: EvaluationRequest,
+        ) -> std::result::Result<EvaluationResponse, CanonicalError> {
+            Ok(EvaluationResponse {
+                decision: true,
+                context: EvaluationResponseContext {
+                    constraints: self.0.clone(),
+                    ..Default::default()
+                },
+            })
+        }
+    }
+
+    let sid = Uuid::from_u128(10);
+    let query = SearchQuery {
+        q: Some("find me".into()),
+        ..Default::default()
+    };
+    for dead_tenant in [TENANT, Uuid::from_u128(99)] {
+        for empty_property in [pep_properties::OWNER_ID, pep_properties::RESOURCE_ID] {
+            let dead = Constraint {
+                predicates: vec![
+                    Predicate::In(InPredicate::new(
+                        pep_properties::OWNER_TENANT_ID,
+                        [dead_tenant],
+                    )),
+                    Predicate::In(InPredicate::new(empty_property, Vec::<Uuid>::new())),
+                ],
+            };
+            for live in [false, true] {
+                let mut constraints = vec![dead.clone()];
+                if live {
+                    constraints.push(Constraint {
+                        predicates: vec![
+                            Predicate::In(InPredicate::new(
+                                pep_properties::OWNER_TENANT_ID,
+                                [TENANT],
+                            )),
+                            Predicate::In(InPredicate::new(pep_properties::OWNER_ID, [USER])),
+                        ],
+                    });
+                }
+                let mut svc = make_service(
+                    owner_session(sid),
+                    vec![fixture_message(sid, MessageRole::User, "find me", 1, false)],
+                );
+                svc.enforcer = test_support::enforcer(Arc::new(SearchPermit(constraints)));
+                for page in [
+                    svc.search_in_session(&ctx(), sid, &query).await.unwrap(),
+                    svc.search_across_sessions(&ctx(), &query).await.unwrap(),
+                ] {
+                    assert_eq!(page.items.len(), usize::from(live));
+                    assert_eq!(page.total_count, u64::from(live));
+                    assert!(page.next_cursor.is_none());
+                    if live {
+                        assert_eq!(page.items[0].session_id, sid);
+                    }
+                }
+                let invalid_cursor = SearchQuery {
+                    cursor: Some("invalid".into()),
+                    ..query.clone()
+                };
+                assert!(
+                    svc.search_in_session(&ctx(), sid, &invalid_cursor)
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    svc.search_across_sessions(&ctx(), &invalid_cursor)
+                        .await
+                        .is_err()
+                );
+            }
+        }
+    }
+}

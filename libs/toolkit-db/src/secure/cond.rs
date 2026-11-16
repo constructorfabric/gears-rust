@@ -345,7 +345,8 @@ where
     // match k times. That holds whether the other alternatives need a sibling
     // of their own or not, so the condition is "a sibling exists and the OR has
     // more than one branch". Refused loudly rather than compiled wrong
-    // (`docs/arch/secure-orm/ADR/0002`).
+    // (`docs/arch/secure-orm/ADR/0002`). Statically FALSE alternatives never
+    // get here: `AccessScope` normalizes them out of `constraints()`.
     if !siblings.is_empty() && compiled.len() > 1 {
         return Err(ScopeError::Invalid(
             "more than one OR-ed scope constraint survives and one of them needs a \
@@ -543,7 +544,7 @@ where
 
     let mut and_cond = Condition::all();
     for (filter_index, filter) in constraint.filters().iter().enumerate() {
-        let Some(col) = E::resolve_property(filter.property()) else {
+        let Some(col) = E::SCOPE.resolve_property(filter.property()) else {
             return Ok(None);
         };
         let column = addressed::<E>(col, address);
@@ -555,7 +556,12 @@ where
             }
             ScopeFilter::In(inf) => {
                 let sea_values = scope_values_to_sea_values(inf.values());
-                and_cond = and_cond.add(column.is_in(sea_values));
+                and_cond = if sea_values.is_empty() {
+                    // A valid empty value set matches no rows on every backend.
+                    and_cond.add(Expr::value(false))
+                } else {
+                    and_cond.add(column.is_in(sea_values))
+                };
             }
             ScopeFilter::InGroup(gf) => {
                 // CAST(col AS text) IN (
@@ -568,11 +574,9 @@ where
                     and_cond = and_cond.add(Expr::value(false));
                     continue;
                 };
-                // An empty selector means "member of no group" — semantically
-                // a deny; building the subquery would emit `IN ()`, a SQL
-                // error on some engines.
+                // A valid empty selector matches no rows; no membership
+                // subquery or empty SQL IN expression is needed.
                 if group_values.is_empty() {
-                    warn_group_filter_denied("InGroup", gf.property(), "empty group_ids");
                     and_cond = and_cond.add(Expr::value(false));
                     continue;
                 }
@@ -624,10 +628,8 @@ where
                     and_cond = and_cond.add(Expr::value(false));
                     continue;
                 };
-                // See the InGroup arm: an empty selector is a deny, and the
-                // closure subquery would otherwise emit `IN ()`.
+                // An empty value set is valid and lowers to FALSE, as above.
                 if ancestor_values.is_empty() {
-                    warn_group_filter_denied("InGroupSubtree", sf.property(), "empty ancestor_ids");
                     and_cond = and_cond.add(Expr::value(false));
                     continue;
                 }
@@ -1075,6 +1077,99 @@ mod tests {
         );
     }
 
+    /// Statically FALSE branches are normalized out of the scope before
+    /// lowering: they add no `FROM` item, do not count as an OR alternative
+    /// beside a sibling, and are no longer validated against the entity (the
+    /// PEP compiler already validated them; see the 06 guide's boundary note).
+    #[test]
+    fn an_empty_branch_is_normalized_and_adds_no_sibling_or_alternative() {
+        use custom_prop_entity::Entity as E;
+        let group = |id: u128| {
+            ScopeFilter::in_group_typed(
+                pep_properties::RESOURCE_ID,
+                MEMBERSHIP_TYPE,
+                vec![ScopeValue::Uuid(uuid::Uuid::from_u128(id))],
+            )
+        };
+        let live = ScopeConstraint::new(vec![
+            group(7),
+            ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, NIL),
+        ]);
+        // Would need a sibling of its own, were it not statically FALSE.
+        let dead = ScopeConstraint::new(vec![
+            group(8),
+            ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, NIL),
+            // Resolvable on this entity, so the branch survives resolution
+            // and reaches the empty-branch handling.
+            ScopeFilter::in_uuids("department_id", vec![]),
+        ]);
+        assert!(dead.matches_nothing());
+
+        // Dead-only: compiled, yet placing no `FROM` item and rendering FALSE.
+        let dead_only = build_scope_predicate::<E>(
+            &AccessScope::from_constraints(vec![dead.clone()]),
+            graph(SiblingSupport::Allowed),
+        )
+        .expect("an empty branch is servable as no rows");
+        assert!(
+            dead_only.siblings().is_empty(),
+            "no sibling for a FALSE branch"
+        );
+        let sql = render(&dead_only.condition);
+        assert!(sql.contains("FALSE"), "{sql}");
+        assert!(!sql.contains("resource_group_membership"), "{sql}");
+
+        let alone_constraint = live.clone();
+        let alone = build_scope_predicate::<E>(
+            &AccessScope::from_constraints(vec![live.clone()]),
+            graph(SiblingSupport::Allowed),
+        )
+        .expect("one live sibling-needing branch is servable");
+        let mixed = build_scope_predicate::<E>(
+            &AccessScope::from_constraints(vec![dead.clone(), live.clone()]),
+            graph(SiblingSupport::Allowed),
+        )
+        .expect("a FALSE alternative does not make the disjunction unservable");
+        assert_eq!(mixed.siblings().len(), 1, "only the live branch places one");
+        assert_eq!(
+            render_sibling(&mixed.siblings()[0]),
+            render_sibling(&alone.siblings()[0])
+        );
+
+        // Two live alternatives beside a sibling stay refused with a dead one present.
+        let err = build_scope_predicate::<E>(
+            &AccessScope::from_constraints(vec![
+                dead.clone(),
+                live,
+                ScopeConstraint::new(vec![ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, NIL)]),
+            ]),
+            graph(SiblingSupport::Allowed),
+        )
+        .expect_err("two live alternatives beside a sibling are refused");
+        assert!(
+            matches!(err, ScopeError::Invalid(msg) if msg.contains("more than one OR-ed")),
+            "unexpected error: {err}"
+        );
+
+        // Accepted loss of downstream diagnostics: an empty-only scope is
+        // deny-all, so even where no sibling could be placed its group arm is
+        // never lowered — FALSE, no sibling, no error.
+        let rejected = build_scope_predicate::<E>(
+            &AccessScope::from_constraints(vec![dead.clone()]),
+            graph(SiblingSupport::Rejected),
+        )
+        .expect("an empty-only scope lowers to FALSE without validating its arms");
+        assert!(rejected.siblings().is_empty());
+        assert_eq!(render(&rejected.condition), render(&dead_only.condition));
+
+        // A live inexpressible arm still fails loudly.
+        build_scope_predicate::<E>(
+            &AccessScope::from_constraints(vec![dead, alone_constraint]),
+            graph(SiblingSupport::Rejected),
+        )
+        .expect_err("a live arm that needs a sibling still fails where none can be placed");
+    }
+
     /// The same scope compiled for two pattern elements must name the same
     /// sibling, so the two references share one `FROM` item. Two aliases would
     /// place the relation twice and multiply rows.
@@ -1182,8 +1277,15 @@ mod tests {
         use super::*;
         use sea_orm::entity::prelude::*;
 
-        #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+        #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, toolkit_db::secure::Scopable)]
         #[sea_orm(table_name = "custom_prop_test")]
+        #[secure(
+            tenant_col = "tenant_id",
+            resource_col = "id",
+            no_owner,
+            no_type,
+            pep_prop(department_id = "department_id")
+        )]
         pub struct Model {
             #[sea_orm(primary_key)]
             pub id: Uuid,
@@ -1195,32 +1297,6 @@ mod tests {
         pub enum Relation {}
 
         impl ActiveModelBehavior for ActiveModel {}
-
-        impl crate::secure::ScopableEntity for Entity {
-            fn tenant_col() -> Option<Column> {
-                Some(Column::TenantId)
-            }
-            fn resource_col() -> Option<Column> {
-                Some(Column::Id)
-            }
-            fn owner_col() -> Option<Column> {
-                None
-            }
-            fn type_col() -> Option<Column> {
-                None
-            }
-            fn resolve_property(property: &str) -> Option<Column> {
-                match property {
-                    p if p == pep_properties::OWNER_TENANT_ID => Some(Column::TenantId),
-                    p if p == pep_properties::RESOURCE_ID => Some(Column::Id),
-                    "department_id" => Some(Column::DepartmentId),
-                    _ => None,
-                }
-            }
-            fn scope_columns() -> Vec<Column> {
-                vec![Column::TenantId, Column::Id, Column::DepartmentId]
-            }
-        }
     }
 
     #[test]
@@ -1428,12 +1504,10 @@ mod tests {
         );
     }
 
-    /// An empty group selector means "member of no group" and must deny
-    /// before SQL generation — building the membership subquery would emit
-    /// `IN ()`, a SQL error on some engines. The PEP compiler rejects empty
-    /// selectors upstream, so only directly constructed scopes reach this arm.
+    /// Empty selectors are valid predicates that match nothing, lowered to FALSE rather
+    /// than invalid SQL IN (). They must never create a membership subquery.
     #[test]
-    fn test_empty_group_selectors_deny_before_sql_generation() {
+    fn test_empty_group_selectors_match_nothing_before_sql_generation() {
         let tenant_id = uuid::Uuid::new_v4();
         let group_scope = AccessScope::single(ScopeConstraint::new(vec![
             ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant_id]),
@@ -1459,6 +1533,79 @@ mod tests {
                 !cond_str.contains("resource_group_membership"),
                 "no membership subquery may be emitted for an empty selector, got: {cond_str}"
             );
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn empty_set_filters_return_no_rows_and_preserve_or_alternatives() {
+        use sea_orm::sea_query::{MysqlQueryBuilder, PostgresQueryBuilder, SqliteQueryBuilder};
+        use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.execute_unprepared("CREATE TABLE custom_prop_test (tenant_id TEXT)")
+            .await
+            .unwrap();
+        let tenant = uuid::Uuid::from_u128(1);
+        let other_tenant = uuid::Uuid::from_u128(2);
+        for id in [tenant, other_tenant] {
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO custom_prop_test (tenant_id) VALUES (?)",
+                [id.into()],
+            ))
+            .await
+            .unwrap();
+        }
+
+        for empty_filter in [
+            ScopeFilter::in_uuids(pep_properties::RESOURCE_ID, vec![]),
+            ScopeFilter::in_group_typed(pep_properties::RESOURCE_ID, MEMBERSHIP_TYPE, vec![]),
+            ScopeFilter::in_group_subtree_typed(
+                pep_properties::RESOURCE_ID,
+                MEMBERSHIP_TYPE,
+                vec![],
+            ),
+        ] {
+            let empty = ScopeConstraint::new(vec![
+                ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, tenant),
+                empty_filter,
+            ]);
+            for include_alternative in [false, true] {
+                let mut constraints = vec![empty.clone()];
+                if include_alternative {
+                    constraints.push(ScopeConstraint::new(vec![ScopeFilter::eq(
+                        pep_properties::OWNER_TENANT_ID,
+                        other_tenant,
+                    )]));
+                }
+                let scope = AccessScope::from_constraints(constraints);
+                let condition = build_scope_condition::<custom_prop_entity::Entity>(&scope);
+                let query = Query::select()
+                    .expr(Expr::value(1))
+                    .from(Alias::new("custom_prop_test"))
+                    .cond_where(condition)
+                    .to_owned();
+                // The empty branch is normalized away; only an empty-only
+                // scope renders FALSE.
+                assert_eq!(
+                    query.to_string(PostgresQueryBuilder).contains("FALSE"),
+                    !include_alternative
+                );
+                for sql in [
+                    query.to_string(PostgresQueryBuilder),
+                    query.to_string(MysqlQueryBuilder),
+                    query.to_string(SqliteQueryBuilder),
+                ] {
+                    assert!(!sql.contains("IN ()"), "invalid empty IN: {sql}");
+                    assert!(
+                        !sql.contains("resource_group_membership"),
+                        "unnecessary subquery: {sql}"
+                    );
+                }
+                let rows = db.query_all(&query).await.unwrap();
+                assert_eq!(rows.len(), usize::from(include_alternative));
+            }
         }
     }
 

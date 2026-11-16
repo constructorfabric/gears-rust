@@ -47,22 +47,13 @@ pub async fn module_ctx(
     hub.register::<dyn types_registry_sdk::PlatformTypesRegistryApi>(Arc::new(
         types_registry_sdk::testing_platform::MockTypesRegistry::new(),
     ));
-    if crate::domain::cluster::EventBrokerCluster::resolve(&hub)
-        .await
-        .is_err()
-    {
-        let config: cluster::ClusterConfig = serde_json::from_value(json!({
-            "profiles": { "event-broker": { "cache": { "provider": "standalone" } } }
-        }))
-        .expect("valid test cluster config");
-        let providers = cluster::ProviderRegistry::new()
-            .with_cache_provider(Arc::new(standalone_cluster_plugin::StandaloneCacheProvider));
-        let handle = cluster::ClusterWiring::from_config(Arc::clone(&hub), &config, &providers)
-            .await
-            .expect("standalone provider wires cleanly");
-        // Intentionally leaked - matches `standalone_event_broker_cluster()`'s
-        // own "no graceful shutdown needed in tests" precedent.
-        std::mem::forget(handle);
+    if hub.try_get::<dyn cluster_sdk::ClusterClient>().is_none() {
+        // Bind the `event-broker` cluster profile through `cluster-sdk`'s stub
+        // over a `standalone-cluster-plugin` cache, the way a consumer's tests
+        // do - no cluster gear is linked. Tested on the client's presence, not
+        // on `resolve()`: `resolve()` returns an unbound backend on an empty
+        // hub rather than erring, so it would never take this branch.
+        super::register_standalone_cluster_stub(&hub).await;
     }
     let mut cfg = json!({
         "event-broker": {

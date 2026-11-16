@@ -1,5 +1,6 @@
-use authz_resolver_sdk::EnforcerError;
 use authz_resolver_sdk::models::DenyReason;
+use authz_resolver_sdk::pep::ConstraintCompileError;
+use authz_resolver_sdk::{AccessDenial, EnforcerError};
 use quota_enforcement_sdk::{LeaseToken, PolicyId, QuotaId, StorageError};
 use toolkit::plugins::ChoosePluginError;
 use toolkit_canonical_errors::CanonicalError;
@@ -9,20 +10,42 @@ use super::{Dependency, DomainError, PluginKind, ResourceKind};
 
 #[test]
 fn enforcer_denial_and_compile_failure_are_denials_and_transport_failure_is_unavailability() {
-    let denied = DomainError::from_enforcer(EnforcerError::Denied {
-        deny_reason: Some(DenyReason {
+    let denied = DomainError::from_enforcer(EnforcerError::AccessDenied(AccessDenial::Pdp {
+        reason: Some(DenyReason {
             error_code: "NO_GRANT".to_owned(),
             details: Some("operator log only".to_owned()),
         }),
-    });
+    }));
     assert_eq!(
         denied,
         DomainError::PdpDenied {
             reason: Some("NO_GRANT".to_owned())
         }
     );
-    let bare = DomainError::from_enforcer(EnforcerError::Denied { deny_reason: None });
+    let bare = DomainError::from_enforcer(EnforcerError::AccessDenied(AccessDenial::Pdp {
+        reason: None,
+    }));
     assert_eq!(bare, DomainError::PdpDenied { reason: None });
+
+    // PEP-local refusals and compile failures keep their closed reason tokens.
+    let empty = DomainError::from_enforcer(EnforcerError::AccessDenied(
+        AccessDenial::ScopeMatchesNothing,
+    ));
+    assert_eq!(
+        empty,
+        DomainError::PdpDenied {
+            reason: Some(DomainError::SCOPE_MATCHES_NOTHING.to_owned())
+        }
+    );
+    let uncompilable = DomainError::from_enforcer(EnforcerError::CompileFailed(
+        ConstraintCompileError::ConstraintsRequiredButAbsent,
+    ));
+    assert_eq!(
+        uncompilable,
+        DomainError::PdpDenied {
+            reason: Some(DomainError::CONSTRAINT_COMPILE_FAILED.to_owned())
+        }
+    );
 
     let failed = DomainError::from_enforcer(EnforcerError::EvaluationFailed(
         CanonicalError::internal("pdp down").create(),

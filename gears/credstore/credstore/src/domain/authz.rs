@@ -35,7 +35,7 @@ pub mod actions {
 #[must_use]
 pub fn map_enforcer_err(err: EnforcerError) -> DomainError {
     match err {
-        EnforcerError::Denied { .. } | EnforcerError::CompileFailed(_) => {
+        EnforcerError::AccessDenied(_) | EnforcerError::CompileFailed(_) => {
             DomainError::AccessDenied {
                 cause: Some(Box::new(err)),
             }
@@ -44,6 +44,11 @@ pub fn map_enforcer_err(err: EnforcerError) -> DomainError {
             detail: "authorization evaluation failed".to_owned(),
             retry_after: None,
             cause: Some(Box::new(EnforcerError::EvaluationFailed(source))),
+        },
+        // An unknown outcome class is an internal failure, never a denial.
+        unknown => DomainError::Internal {
+            diagnostic: "authorization failed with an unknown outcome".to_owned(),
+            cause: Some(Box::new(unknown)),
         },
     }
 }

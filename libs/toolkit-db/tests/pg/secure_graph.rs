@@ -54,8 +54,9 @@ const TENANT_B: Uuid = Uuid::from_u128(0xB);
 mod node {
     use super::*;
 
-    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, toolkit_db::secure::Scopable)]
     #[sea_orm(table_name = "pgq_node")]
+    #[secure(tenant_col = "tenant_id", resource_col = "id", no_owner, no_type)]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
         pub tenant_id: Uuid,
@@ -68,40 +69,14 @@ mod node {
     pub enum Relation {}
 
     impl ActiveModelBehavior for ActiveModel {}
-
-    impl toolkit_db::secure::ScopableEntity for Entity {
-        fn tenant_col() -> Option<Column> {
-            Some(Column::TenantId)
-        }
-        fn resource_col() -> Option<Column> {
-            Some(Column::Id)
-        }
-        fn owner_col() -> Option<Column> {
-            None
-        }
-        fn type_col() -> Option<Column> {
-            None
-        }
-        fn resolve_property(property: &str) -> Option<Column> {
-            match property {
-                p if p == toolkit_security::pep_properties::OWNER_TENANT_ID => {
-                    Some(Column::TenantId)
-                }
-                p if p == toolkit_security::pep_properties::RESOURCE_ID => Some(Column::Id),
-                _ => None,
-            }
-        }
-        fn scope_columns() -> Vec<Column> {
-            vec![Column::TenantId, Column::Id]
-        }
-    }
 }
 
 mod edge {
     use super::*;
 
-    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, toolkit_db::secure::Scopable)]
     #[sea_orm(table_name = "pgq_edge")]
+    #[secure(tenant_col = "tenant_id", resource_col = "id", no_owner, no_type)]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
         pub tenant_id: Uuid,
@@ -115,33 +90,6 @@ mod edge {
     pub enum Relation {}
 
     impl ActiveModelBehavior for ActiveModel {}
-
-    impl toolkit_db::secure::ScopableEntity for Entity {
-        fn tenant_col() -> Option<Column> {
-            Some(Column::TenantId)
-        }
-        fn resource_col() -> Option<Column> {
-            Some(Column::Id)
-        }
-        fn owner_col() -> Option<Column> {
-            None
-        }
-        fn type_col() -> Option<Column> {
-            None
-        }
-        fn resolve_property(property: &str) -> Option<Column> {
-            match property {
-                p if p == toolkit_security::pep_properties::OWNER_TENANT_ID => {
-                    Some(Column::TenantId)
-                }
-                p if p == toolkit_security::pep_properties::RESOURCE_ID => Some(Column::Id),
-                _ => None,
-            }
-        }
-        fn scope_columns() -> Vec<Column> {
-            vec![Column::TenantId, Column::Id]
-        }
-    }
 }
 
 struct Kb;
@@ -183,8 +131,9 @@ impl toolkit_db::secure::pgq::EdgeOf<Kb> for edge::Entity {
 mod open_node {
     use super::*;
 
-    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, toolkit_db::secure::Scopable)]
     #[sea_orm(table_name = "pgq_open_node")]
+    #[secure(tenant_col = "tenant_id", resource_col = "id", no_owner, no_type)]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
         pub id: i64,
@@ -196,40 +145,14 @@ mod open_node {
     pub enum Relation {}
 
     impl ActiveModelBehavior for ActiveModel {}
-
-    impl toolkit_db::secure::ScopableEntity for Entity {
-        fn tenant_col() -> Option<Column> {
-            Some(Column::TenantId)
-        }
-        fn resource_col() -> Option<Column> {
-            Some(Column::Id)
-        }
-        fn owner_col() -> Option<Column> {
-            None
-        }
-        fn type_col() -> Option<Column> {
-            None
-        }
-        fn resolve_property(property: &str) -> Option<Column> {
-            match property {
-                p if p == toolkit_security::pep_properties::OWNER_TENANT_ID => {
-                    Some(Column::TenantId)
-                }
-                p if p == toolkit_security::pep_properties::RESOURCE_ID => Some(Column::Id),
-                _ => None,
-            }
-        }
-        fn scope_columns() -> Vec<Column> {
-            vec![Column::TenantId, Column::Id]
-        }
-    }
 }
 
 mod open_edge {
     use super::*;
 
-    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, toolkit_db::secure::Scopable)]
     #[sea_orm(table_name = "pgq_open_edge")]
+    #[secure(tenant_col = "tenant_id", resource_col = "id", no_owner, no_type)]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
         pub id: i64,
@@ -242,33 +165,6 @@ mod open_edge {
     pub enum Relation {}
 
     impl ActiveModelBehavior for ActiveModel {}
-
-    impl toolkit_db::secure::ScopableEntity for Entity {
-        fn tenant_col() -> Option<Column> {
-            Some(Column::TenantId)
-        }
-        fn resource_col() -> Option<Column> {
-            Some(Column::Id)
-        }
-        fn owner_col() -> Option<Column> {
-            None
-        }
-        fn type_col() -> Option<Column> {
-            None
-        }
-        fn resolve_property(property: &str) -> Option<Column> {
-            match property {
-                p if p == toolkit_security::pep_properties::OWNER_TENANT_ID => {
-                    Some(Column::TenantId)
-                }
-                p if p == toolkit_security::pep_properties::RESOURCE_ID => Some(Column::Id),
-                _ => None,
-            }
-        }
-        fn scope_columns() -> Vec<Column> {
-            vec![Column::TenantId, Column::Id]
-        }
-    }
 }
 
 struct OpenKb;

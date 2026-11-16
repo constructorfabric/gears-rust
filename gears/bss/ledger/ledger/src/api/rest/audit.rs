@@ -391,7 +391,10 @@ async fn cross_tenant_role_authorized(
     {
         Ok(_) => Ok(true),
         Err(crate::authz::AuthzError::Denied(_)) => Ok(false),
-        Err(e @ crate::authz::AuthzError::Unavailable(_)) => Err(authz_error_to_canonical(e)),
+        // A failure to decide is an error, never "not authorized".
+        Err(
+            e @ (crate::authz::AuthzError::Unavailable(_) | crate::authz::AuthzError::Internal(_)),
+        ) => Err(authz_error_to_canonical(e)),
     }
 }
 

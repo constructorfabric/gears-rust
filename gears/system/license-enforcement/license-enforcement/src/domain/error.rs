@@ -96,7 +96,7 @@ impl From<toolkit_db::DbError> for DomainError {
 impl From<authz_resolver_sdk::EnforcerError> for DomainError {
     fn from(e: authz_resolver_sdk::EnforcerError) -> Self {
         match e {
-            authz_resolver_sdk::EnforcerError::Denied { .. } => Self::PermissionDenied,
+            authz_resolver_sdk::EnforcerError::AccessDenied(_) => Self::PermissionDenied,
             // Fail closed as a deny, but log it: a permit whose constraints do
             // not compile is a PDP misconfiguration, not a decision.
             authz_resolver_sdk::EnforcerError::CompileFailed(e) => {
@@ -105,6 +105,11 @@ impl From<authz_resolver_sdk::EnforcerError> for DomainError {
             }
             authz_resolver_sdk::EnforcerError::EvaluationFailed(e) => {
                 Self::DependencyUnavailable(format!("PDP: {e}"))
+            }
+            // An unknown outcome class is an internal failure, never a denial.
+            unknown => {
+                tracing::error!(error = %unknown, "authz failed with an unknown outcome");
+                Self::Internal("authorization failed with an unknown outcome".to_owned())
             }
         }
     }

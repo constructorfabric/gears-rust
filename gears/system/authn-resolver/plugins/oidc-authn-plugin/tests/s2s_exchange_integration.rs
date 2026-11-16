@@ -20,8 +20,8 @@ fn make_request(client_id: &str, client_secret: &str) -> ClientCredentialsReques
     }
 }
 
-fn parse_url(value: &str) -> reqwest::Url {
-    reqwest::Url::parse(value).expect("test URL should parse")
+fn parse_url(value: &str) -> url::Url {
+    url::Url::parse(value).expect("test URL should parse")
 }
 
 fn make_plugin_with_s2s(issuer: String, s2s_config: S2sConfig) -> OidcAuthNPlugin {
@@ -46,7 +46,7 @@ fn make_plugin_with_s2s_and_options(
         jwt_config,
         issuer_trust,
         plugin_config,
-        reqwest::Client::new(),
+        oidc_authn_plugin::infra::idp_http::IdpHttpClient::insecure_for_tests(),
     )
 }
 
@@ -198,10 +198,9 @@ async fn s2s_exchange_unreachable_discovery_returns_service_unavailable() {
         jwt_config,
         issuer_trust,
         plugin_config,
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_millis(200))
-            .build()
-            .unwrap(),
+        oidc_authn_plugin::infra::idp_http::IdpHttpClient::insecure_for_tests_with_timeout(
+            std::time::Duration::from_millis(200),
+        ),
     );
 
     let request = make_request("svc", "secret");

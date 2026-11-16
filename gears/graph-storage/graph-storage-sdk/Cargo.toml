@@ -40,3 +40,6 @@ toolkit-gts = { workspace = true }
 toolkit-odata = { workspace = true, features = ["with-utoipa"] }
 toolkit-odata-macros = { workspace = true }
 toolkit-security = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

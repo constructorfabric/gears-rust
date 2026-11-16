@@ -336,6 +336,19 @@ fn a_write_to_each_developer_property_is_accepted() {
 }
 
 #[test]
+fn a_write_to_remembered_notes_is_accepted() {
+    let catalog = catalog();
+    let mut draft = PlanDraft::new(&catalog, profile());
+
+    draft
+        .apply(&add("remembered_notes", &json!("sister is called Anna")))
+        .unwrap_or_else(|refusal| panic!("remembered_notes: {refusal:?}"));
+
+    let plan = draft.finish(TENANT, SUBJECT, origin());
+    assert_eq!(plan.steps.len(), 1);
+}
+
+#[test]
 fn a_value_that_breaks_the_property_schema_is_refused_with_the_schema() {
     let catalog = catalog();
     for (refused, property) in [

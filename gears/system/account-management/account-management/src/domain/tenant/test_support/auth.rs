@@ -24,7 +24,7 @@
 //!   extension layer.
 //! * [`deny_all_enforcer`] wires [`DenyAllAuthZResolver`], which
 //!   models a PDP that refuses every evaluation with
-//!   `decision: false`. Used to pin the `EnforcerError::Denied →
+//!   `decision: false`. Used to pin the `EnforcerError::AccessDenied →
 //!   DomainError::CrossTenantDenied` mapping at every caller-facing
 //!   service seam: a regression that drops the `self.authorize(...)`
 //!   call from a public method (or wires it past the deny path)
@@ -185,7 +185,7 @@ pub fn constraint_bearing_enforcer(root_tenant_id: uuid::Uuid) -> PolicyEnforcer
 /// no constraints. Drives the [`crate::domain::error::DomainError::CrossTenantDenied`]
 /// regression tests: every caller-facing service method that runs
 /// through `self.authorize(...)` MUST propagate
-/// `EnforcerError::Denied → DomainError::CrossTenantDenied`. A
+/// `EnforcerError::AccessDenied → DomainError::CrossTenantDenied`. A
 /// regression that strips the `authorize` call from a public method
 /// (or wires it past the deny path) surfaces here as a lifted /
 /// non-`CrossTenantDenied` error.

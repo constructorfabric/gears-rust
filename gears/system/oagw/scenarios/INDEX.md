@@ -861,3 +861,31 @@ For E2E coverage, ensure at least one scenario exists for each cell:
 ### Error source
 - Gateway-generated (validation/rate-limit/etc)
 - Upstream passthrough (4xx/5xx)
+
+## Named upstream credentials (planned)
+
+Phase 1 specifications for [ADR-0021](../docs/ADR/0021-upstream-credentials.md). Use the [shared fixture](upstream-credentials/README.md#shared-setup); these cases describe future behavior, not implemented endpoints.
+
+- [Select accounts on one route](upstream-credentials/positive-30.1-select-several-accounts.md)
+- [Reject empty selector](upstream-credentials/negative-30.2-empty-selector.md)
+- [Reject duplicate selector](upstream-credentials/negative-30.3-duplicate-selector.md)
+- [Reject comma selector](upstream-credentials/negative-30.4-comma-selector.md)
+- [Reject mixed case selector](upstream-credentials/negative-30.5-mixed-case-selector.md)
+- [Reject reserved default](upstream-credentials/negative-30.6-reserved-default.md)
+- [Reject malformed selector](upstream-credentials/negative-30.7-malformed-selector.md)
+- [Hide absent and inaccessible items](upstream-credentials/negative-30.8-hide-unavailable-items.md)
+- [Deny an operation before exposing items](upstream-credentials/negative-30.9-operation-permission.md)
+- [Refuse a private shadow or recreated record](upstream-credentials/negative-30.10-pin-mismatch.md)
+- [Reject an exhausted credential before CredStore](upstream-credentials/negative-30.11-independent-and-shared-limits.md)
+- [Suspend during an outage with CRUD disabled](upstream-credentials/positive-30.12-suspend-without-crud.md)
+- [Keep a newer suspension](upstream-credentials/negative-30.13-resume-suspend-race.md)
+- [Reject invalid registry ownership](upstream-credentials/negative-30.14-registry-ownership-conflict.md)
+- [Ignore delayed cleanup of retired counters](upstream-credentials/positive-30.15-generation-cleanup.md)
+- [Use live credential state with cached parent policies](upstream-credentials/positive-30.16-live-state-cached-parents.md)
+- [Fail a live read without stale credential fallback](upstream-credentials/negative-30.17-live-read-outage.md)
+- [Keep attempt debits on a secret failure](upstream-credentials/negative-30.18-credstore-outage.md)
+- [Reject incompatible parent auth](upstream-credentials/negative-30.19-incompatible-parent.md)
+- [Handle preflight without capacity](upstream-credentials/positive-30.20-cors-preflight.md)
+- [Keep approvals on replace](upstream-credentials/positive-30.21-preserve-endpoint-approval.md)
+- [Read a complete credential resource](upstream-credentials/positive-30.22-resource-and-list.md)
+- [Keep wrong-account forwarding out of rollout](upstream-credentials/positive-30.23-rollout-and-audit.md)

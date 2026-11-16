@@ -190,10 +190,10 @@ async fn sqlite_registration_rows_written_as_legacy_text_still_load() {
 /// The registration table as the previous release wrote it: TEXT timestamps.
 mod legacy {
     use sea_orm::entity::prelude::*;
-    use toolkit_db::secure::ScopableEntity;
 
-    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, toolkit_db::secure::Scopable)]
     #[sea_orm(table_name = "event_broker_producer_registrations")]
+    #[secure(unrestricted)]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
         pub registration_key: String,
@@ -213,32 +213,4 @@ mod legacy {
     pub enum Relation {}
 
     impl ActiveModelBehavior for ActiveModel {}
-
-    impl ScopableEntity for Entity {
-        const IS_UNRESTRICTED: bool = true;
-
-        fn tenant_col() -> Option<Self::Column> {
-            None
-        }
-
-        fn resource_col() -> Option<Self::Column> {
-            None
-        }
-
-        fn owner_col() -> Option<Self::Column> {
-            None
-        }
-
-        fn type_col() -> Option<Self::Column> {
-            None
-        }
-
-        fn resolve_property(_property: &str) -> Option<Self::Column> {
-            None
-        }
-
-        fn scope_columns() -> Vec<Self::Column> {
-            Vec::new()
-        }
-    }
 }

@@ -208,6 +208,7 @@ members = [
     "gears/system/event-broker/plugins/mysql-event-broker-plugin",
     "gears/system/event-broker/plugins/kafka-event-broker-plugin",
     "gears/system/event-broker/event-broker",
+    "gears/system/event-broker/event-broker-server",
     "gears/system/license-resolver/license-resolver-sdk",
     "gears/system/license-resolver/license-resolver",
     "gears/system/license-resolver/plugins/static-license-plugin",

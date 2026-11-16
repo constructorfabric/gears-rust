@@ -112,7 +112,7 @@ pub async fn search_settings(
     // Decided before any query, not after the page comes back: whether `pii`
     // content is in the corpus at all. Browse asks only when a page carries
     // pii; search has to ask every time, since the answer shapes the query.
-    let pii = may_read_pii(&enforcer, &ctx).await;
+    let pii = may_read_pii(&enforcer, &ctx).await?;
     let corpus = Corpus::for_caller(pii);
     // @cpt-end:cpt-cf-settings-service-flow-search-discoverability-search:p2:inst-sd-search-5
 

@@ -198,7 +198,7 @@ pub async fn revival_report(
         .iter()
         .map(|row| strictest_classification([row.data_classification, report.data_classification]))
         .collect();
-    let pii = classes.contains(&DataClassification::Pii) && may_read_pii(&enforcer, &ctx).await;
+    let pii = classes.contains(&DataClassification::Pii) && may_read_pii(&enforcer, &ctx).await?;
     let values: Vec<RevivalValueDto> = report
         .rows
         .iter()

@@ -1126,7 +1126,7 @@ These test domain invariants that prevent data corruption or violate core busine
 | **TC-SEED-01..03** | seed_types create/update/skip | Bootstrap data corruption |
 | **TC-SEED-05,06** | seed_groups create + skip | Hierarchy bootstrap broken |
 | **TC-SEED-07,08** | seed_memberships create + skip | Membership bootstrap broken |
-| **TC-ERR-01** | EnforcerError::Denied -> AccessDenied | Auth errors mishandled |
+| **TC-ERR-01** | EnforcerError::AccessDenied -> AccessDenied | Auth errors mishandled |
 | **TC-REST-10** | Error response HTTP mapping — status codes + Content-Type | Incorrect HTTP status codes or missing `application/problem+json` Content-Type |
 
 #### P2 - Important (error paths, REST layer, edges) — 53 tests

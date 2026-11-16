@@ -64,7 +64,7 @@ use toolkit_security::{AccessScope, InTenantSubtreeScopeFilter, ScopeConstraint,
 /// Clone `scope`, flipping every [`ScopeFilter::InTenantSubtree`] to
 /// `respect_barriers = false`. All other filter shapes, constraint
 /// composition, the per-filter `descendant_status` list, and
-/// `allow_all` / `deny_all` states are preserved verbatim.
+/// `allow_all` / `deny_all` behavior is preserved. The result is a fresh scope.
 ///
 /// Intended as a service-layer-only transformation on the
 /// PDP-emitted scope, applied only to the *enumeration* / *fallback
@@ -73,8 +73,11 @@ use toolkit_security::{AccessScope, InTenantSubtreeScopeFilter, ScopeConstraint,
 /// `BarrierMode::Ignore`.
 #[must_use]
 pub(super) fn relax_barriers(scope: &AccessScope) -> AccessScope {
-    if scope.is_unconstrained() || scope.is_deny_all() {
-        return scope.clone();
+    if scope.is_unconstrained() {
+        return AccessScope::allow_all();
+    }
+    if scope.is_deny_all() {
+        return AccessScope::deny_all();
     }
     let constraints = scope
         .constraints()

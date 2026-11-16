@@ -103,6 +103,11 @@ async fn a_stale_vector_stops_ranking_but_the_node_stays() {
 }
 
 #[tokio::test]
+async fn the_view_reads_report_whether_a_vector_is_stored() {
+    conformance::the_view_reads_report_whether_a_vector_is_stored(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
 async fn only_the_active_epoch_ranks() {
     conformance::only_the_active_epoch_ranks(&store(), Uuid::now_v7()).await;
 }
@@ -228,6 +233,24 @@ async fn a_deeper_chain_registers_and_its_ancestor_admits_the_leaf() {
 async fn a_backward_compatible_change_updates_the_type_in_place() {
     conformance::a_backward_compatible_change_updates_the_type_in_place(&store(), Uuid::now_v7())
         .await;
+}
+
+#[tokio::test]
+async fn a_type_referencing_a_non_ancestor_gains_an_optional_property() {
+    conformance::a_type_referencing_a_non_ancestor_gains_an_optional_property(
+        &store(),
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_type_referencing_a_non_ancestor_still_refuses_a_breaking_change() {
+    conformance::a_type_referencing_a_non_ancestor_still_refuses_a_breaking_change(
+        &store(),
+        Uuid::now_v7(),
+    )
+    .await;
 }
 
 #[tokio::test]

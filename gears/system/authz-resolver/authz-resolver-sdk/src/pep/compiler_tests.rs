@@ -21,6 +21,24 @@ const R1: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 
 const DEFAULT_PROPS: &[&str] = &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID];
 
+/// Low-level compilation with a group membership type and no capability
+/// negotiation (default options).
+fn compile_to_access_scope_with_resource_type(
+    response: &EvaluationResponse,
+    require_constraints: bool,
+    supported_properties: &[&str],
+    group_membership_type: Option<&str>,
+) -> Result<AccessScope, ConstraintCompileError> {
+    compile_to_access_scope_impl(
+        response,
+        require_constraints,
+        supported_properties,
+        group_membership_type,
+        None,
+        false,
+    )
+}
+
 // === Constraint Compilation Matrix Tests ===
 
 #[test]
@@ -634,6 +652,7 @@ fn unadvertised_native_group_predicate_fails_closed() {
         DEFAULT_PROPS,
         Some(GROUP_MEMBERSHIP_TYPE),
         &[Capability::TenantHierarchy],
+        false,
     );
     let Err(ConstraintCompileError::UnadvertisedCapabilities { predicate, missing }) = result
     else {
@@ -668,6 +687,7 @@ fn unadvertised_tenant_subtree_predicate_fails_closed() {
         DEFAULT_PROPS,
         None,
         &[],
+        false,
     );
     let Err(ConstraintCompileError::UnadvertisedCapabilities { predicate, missing }) = result
     else {
@@ -720,6 +740,7 @@ fn mixed_unadvertised_and_structural_failures_aggregate_generic() {
         DEFAULT_PROPS,
         Some(GROUP_MEMBERSHIP_TYPE),
         &[Capability::TenantHierarchy],
+        false,
     );
     let Err(ConstraintCompileError::AllConstraintsFailed { reason }) = result else {
         panic!("mixed failures must aggregate to AllConstraintsFailed: {result:?}");
@@ -761,6 +782,7 @@ fn in_group_subtree_reports_missing_capability_set() {
         DEFAULT_PROPS,
         Some(GROUP_MEMBERSHIP_TYPE),
         &[Capability::GroupMembership],
+        false,
     );
     let Err(ConstraintCompileError::UnadvertisedCapabilities { predicate, missing }) = result
     else {
@@ -775,6 +797,7 @@ fn in_group_subtree_reports_missing_capability_set() {
         DEFAULT_PROPS,
         Some(GROUP_MEMBERSHIP_TYPE),
         &[],
+        false,
     );
     let Err(error @ ConstraintCompileError::UnadvertisedCapabilities { .. }) = result else {
         panic!("subtree without either capability must fail closed: {result:?}");
@@ -874,58 +897,277 @@ fn supported_properties_validation() {
     ));
 }
 
-// === Empty value list guards (fail-closed) ===
+// === Empty value lists are valid, constrained predicates that match nothing ===
 
-#[test]
-fn empty_in_values_fails_constraint() {
-    let response = EvaluationResponse {
+fn respond(constraints: Vec<Constraint>) -> EvaluationResponse {
+    EvaluationResponse {
         decision: true,
         context: EvaluationResponseContext {
-            constraints: vec![Constraint {
-                predicates: vec![Predicate::In(InPredicate {
-                    property: pep_properties::OWNER_TENANT_ID.to_owned(),
-                    values: vec![],
-                })],
-            }],
+            constraints,
             ..Default::default()
         },
-    };
+    }
+}
 
-    let result = compile_to_access_scope(&response, true, DEFAULT_PROPS);
-    assert!(
-        matches!(
-            result,
-            Err(ConstraintCompileError::AllConstraintsFailed { .. })
-        ),
-        "empty In values must fail-closed, got: {result:?}"
-    );
+fn empty_tenant_set() -> Constraint {
+    Constraint {
+        predicates: vec![Predicate::In(InPredicate {
+            property: pep_properties::OWNER_TENANT_ID.to_owned(),
+            values: vec![],
+        })],
+    }
+}
+
+fn tenant_eq(tenant: &str) -> Constraint {
+    Constraint {
+        predicates: vec![Predicate::Eq(EqPredicate {
+            property: pep_properties::OWNER_TENANT_ID.to_owned(),
+            value: jid(tenant),
+        })],
+    }
+}
+
+/// Semantically invalid branch (unsupported property) next to valid ones.
+fn invalid_branch() -> Constraint {
+    Constraint {
+        predicates: vec![Predicate::Eq(EqPredicate {
+            property: "unsupported_property".to_owned(),
+            value: jid(T1),
+        })],
+    }
+}
+
+fn with_allow(allow: bool) -> CompileOptions {
+    CompileOptions::new().allow_empty_scope(allow)
 }
 
 #[test]
-fn empty_in_group_ids_fails_constraint() {
-    use crate::constraints::InGroupPredicate;
+fn compile_options_default_to_refusing_empty_scopes() {
+    assert_eq!(CompileOptions::default(), CompileOptions::new());
+    assert_eq!(CompileOptions::new(), with_allow(false));
+    assert_ne!(with_allow(true), with_allow(false));
+}
 
-    let response = EvaluationResponse {
-        decision: true,
-        context: EvaluationResponseContext {
-            constraints: vec![Constraint {
-                predicates: vec![Predicate::InGroup(InGroupPredicate {
-                    property: pep_properties::RESOURCE_ID.to_owned(),
-                    group_ids: vec![],
-                })],
-            }],
-            ..Default::default()
-        },
-    };
+/// Flag matrix for an all-empty compiled scope: the public default and an
+/// explicit `false` refuse it with a typed reason distinct from malformed
+/// responses; an explicit `true` returns the normalized scope with originals.
+#[test]
+fn all_empty_scope_flag_matrix_on_the_public_compiler() {
+    let response = respond(vec![empty_tenant_set(), empty_tenant_set()]);
+    for require_constraints in [true, false] {
+        for result in [
+            compile_to_access_scope(&response, require_constraints, DEFAULT_PROPS),
+            compile_to_access_scope_with_options(
+                &response,
+                require_constraints,
+                DEFAULT_PROPS,
+                with_allow(false),
+            ),
+        ] {
+            assert!(
+                matches!(result, Err(ConstraintCompileError::ScopeMatchesNothing)),
+                "{result:?}"
+            );
+        }
 
-    let result = compile_to_access_scope(&response, true, DEFAULT_PROPS);
+        let scope = compile_to_access_scope_with_options(
+            &response,
+            require_constraints,
+            DEFAULT_PROPS,
+            with_allow(true),
+        )
+        .unwrap();
+        assert!(!scope.is_unconstrained());
+        assert!(scope.is_deny_all());
+        assert!(scope.constraints().is_empty());
+        assert_eq!(scope.original_constraints().len(), 2);
+        for original in scope.original_constraints() {
+            let [ScopeFilter::In(filter)] = original.filters() else {
+                panic!("expected the empty In filter, got {original:?}");
+            };
+            assert_eq!(filter.property(), pep_properties::OWNER_TENANT_ID);
+            assert!(filter.values().is_empty());
+        }
+    }
+}
+
+/// `allow_empty_scope` never changes how absent outer constraints are handled.
+#[test]
+fn absent_constraints_follow_require_constraints_for_both_flags() {
+    let response = respond(vec![]);
+    for allow in [false, true] {
+        let scope = compile_to_access_scope_with_options(
+            &response,
+            false,
+            DEFAULT_PROPS,
+            with_allow(allow),
+        )
+        .unwrap();
+        assert!(scope.is_unconstrained(), "allow={allow}");
+        let err =
+            compile_to_access_scope_with_options(&response, true, DEFAULT_PROPS, with_allow(allow))
+                .unwrap_err();
+        assert!(
+            matches!(err, ConstraintCompileError::ConstraintsRequiredButAbsent),
+            "allow={allow}: {err:?}"
+        );
+    }
+}
+
+/// The invalid-branch policy is unchanged (#5958 tracks strict rejection):
+/// an invalid sibling is dropped; the request fails only if nothing compiled.
+/// A valid empty branch is not invalid, so it decides via the flag.
+#[test]
+fn invalid_sibling_is_dropped_and_valid_empty_branch_decides() {
+    let empty_and_invalid = respond(vec![empty_tenant_set(), invalid_branch()]);
+    let err = compile_to_access_scope(&empty_and_invalid, true, DEFAULT_PROPS).unwrap_err();
     assert!(
-        matches!(
-            result,
-            Err(ConstraintCompileError::AllConstraintsFailed { .. })
-        ),
-        "empty InGroup group_ids must fail-closed, got: {result:?}"
+        matches!(err, ConstraintCompileError::ScopeMatchesNothing),
+        "{err:?}"
     );
+    let scope = compile_to_access_scope_with_options(
+        &empty_and_invalid,
+        true,
+        DEFAULT_PROPS,
+        with_allow(true),
+    )
+    .unwrap();
+    assert!(scope.is_deny_all());
+    assert_eq!(
+        scope.original_constraints().len(),
+        1,
+        "only compiled branches are originals, never the dropped invalid one"
+    );
+
+    for allow in [false, true] {
+        let only_invalid = respond(vec![invalid_branch()]);
+        let err = compile_to_access_scope_with_options(
+            &only_invalid,
+            true,
+            DEFAULT_PROPS,
+            with_allow(allow),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, ConstraintCompileError::AllConstraintsFailed { reason } if reason.contains("unsupported property")),
+            "allow={allow}: {err:?}"
+        );
+
+        let mixed = respond(vec![empty_tenant_set(), invalid_branch(), tenant_eq(T1)]);
+        let scope =
+            compile_to_access_scope_with_options(&mixed, true, DEFAULT_PROPS, with_allow(allow))
+                .unwrap();
+        assert_eq!(scope.constraints().len(), 1);
+        assert_eq!(
+            scope.all_uuid_values_for(pep_properties::OWNER_TENANT_ID),
+            &[uuid(T1)]
+        );
+        assert_eq!(scope.original_constraints().len(), 2);
+        assert!(
+            scope
+                .original_constraints()
+                .next()
+                .is_some_and(ScopeConstraint::matches_nothing),
+            "original order keeps the empty branch first"
+        );
+    }
+}
+
+#[test]
+fn empty_group_selectors_compile_with_tenant_and_negotiated_capabilities() {
+    use crate::constraints::{InGroupPredicate, InGroupSubtreePredicate};
+
+    for (predicate, subtree) in [
+        (
+            Predicate::InGroup(InGroupPredicate {
+                property: pep_properties::RESOURCE_ID.to_owned(),
+                group_ids: vec![],
+            }),
+            false,
+        ),
+        (
+            Predicate::InGroupSubtree(InGroupSubtreePredicate {
+                property: pep_properties::RESOURCE_ID.to_owned(),
+                ancestor_ids: vec![],
+            }),
+            true,
+        ),
+    ] {
+        let response = respond(vec![Constraint {
+            predicates: vec![
+                Predicate::Eq(EqPredicate {
+                    property: pep_properties::OWNER_TENANT_ID.to_owned(),
+                    value: jid(T1),
+                }),
+                predicate,
+            ],
+        }]);
+        let capabilities = [Capability::GroupMembership, Capability::GroupHierarchy];
+        let err = compile_to_access_scope_with_negotiated_capabilities(
+            &response,
+            true,
+            DEFAULT_PROPS,
+            Some(GROUP_MEMBERSHIP_TYPE),
+            &capabilities,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ConstraintCompileError::ScopeMatchesNothing),
+            "{err:?}"
+        );
+        let scope = compile_to_access_scope_with_negotiated_capabilities(
+            &response,
+            true,
+            DEFAULT_PROPS,
+            Some(GROUP_MEMBERSHIP_TYPE),
+            &capabilities,
+            true,
+        )
+        .unwrap();
+        assert!(!scope.is_unconstrained());
+        assert!(scope.matches_nothing());
+        let [original] = scope.original_constraints().collect::<Vec<_>>()[..] else {
+            panic!("expected one original branch");
+        };
+        let filters = original.filters();
+        assert_eq!(filters.len(), 2);
+        match (&filters[1], subtree) {
+            (ScopeFilter::InGroup(f), false) => {
+                assert_eq!(f.property(), pep_properties::RESOURCE_ID);
+                assert_eq!(f.membership_resource_type(), GROUP_MEMBERSHIP_TYPE);
+                assert!(f.group_ids().is_empty());
+            }
+            (ScopeFilter::InGroupSubtree(f), true) => {
+                assert_eq!(f.property(), pep_properties::RESOURCE_ID);
+                assert_eq!(f.membership_resource_type(), GROUP_MEMBERSHIP_TYPE);
+                assert!(f.ancestor_ids().is_empty());
+            }
+            (other, _) => panic!("expected the empty group selector, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn empty_in_branch_preserves_a_valid_or_alternative() {
+    let response = respond(vec![empty_tenant_set(), tenant_eq(T1)]);
+    for allow in [false, true] {
+        let scope =
+            compile_to_access_scope_with_options(&response, true, DEFAULT_PROPS, with_allow(allow))
+                .unwrap();
+        assert!(!scope.is_unconstrained());
+        assert!(!scope.matches_nothing());
+        assert_eq!(
+            scope.constraints().len(),
+            1,
+            "empty branch is normalized away"
+        );
+        assert_eq!(scope.original_constraints().len(), 2);
+        assert_eq!(
+            scope.all_uuid_values_for(pep_properties::OWNER_TENANT_ID),
+            &[uuid(T1)]
+        );
+    }
 }
 
 #[test]
@@ -1184,28 +1426,132 @@ fn in_tenant_subtree_non_uuid_root_array_fails_constraint() {
 }
 
 #[test]
-fn empty_in_group_subtree_ancestor_ids_fails_constraint() {
-    use crate::constraints::InGroupSubtreePredicate;
-
+fn empty_sets_do_not_bypass_compiler_validation() {
+    use crate::constraints::{InGroupPredicate, InGroupSubtreePredicate};
+    for predicate in [
+        Predicate::InGroup(InGroupPredicate {
+            property: pep_properties::RESOURCE_ID.into(),
+            group_ids: vec![],
+        }),
+        Predicate::InGroupSubtree(InGroupSubtreePredicate {
+            property: pep_properties::RESOURCE_ID.into(),
+            ancestor_ids: vec![],
+        }),
+    ] {
+        let tenant = Predicate::Eq(EqPredicate {
+            property: pep_properties::OWNER_TENANT_ID.into(),
+            value: jid(T1),
+        });
+        let wrong_property = match &predicate {
+            Predicate::InGroup(_) => Predicate::InGroup(InGroupPredicate {
+                property: pep_properties::OWNER_ID.into(),
+                group_ids: vec![],
+            }),
+            _ => Predicate::InGroupSubtree(InGroupSubtreePredicate {
+                property: pep_properties::OWNER_ID.into(),
+                ancestor_ids: vec![],
+            }),
+        };
+        for (predicates, membership_type, capabilities, expected_reason) in [
+            (
+                vec![tenant.clone(), predicate.clone()],
+                Some(GROUP_MEMBERSHIP_TYPE),
+                vec![],
+                None,
+            ),
+            (
+                vec![predicate.clone()],
+                Some(GROUP_MEMBERSHIP_TYPE),
+                vec![Capability::GroupMembership, Capability::GroupHierarchy],
+                Some("owner_tenant_id"),
+            ),
+            (
+                vec![tenant.clone(), predicate],
+                None,
+                vec![Capability::GroupMembership, Capability::GroupHierarchy],
+                Some("canonical GTS resource type"),
+            ),
+            (
+                vec![tenant, wrong_property],
+                Some(GROUP_MEMBERSHIP_TYPE),
+                vec![Capability::GroupMembership, Capability::GroupHierarchy],
+                Some("must target 'id'"),
+            ),
+        ] {
+            let response = EvaluationResponse {
+                decision: true,
+                context: EvaluationResponseContext {
+                    constraints: vec![Constraint { predicates }],
+                    ..Default::default()
+                },
+            };
+            // Validation precedes emptiness: opting in never skips it.
+            for allow in [false, true] {
+                let err = compile_to_access_scope_with_negotiated_capabilities(
+                    &response,
+                    true,
+                    DEFAULT_PROPS,
+                    membership_type,
+                    &capabilities,
+                    allow,
+                )
+                .unwrap_err();
+                if let Some(expected) = expected_reason {
+                    assert!(
+                        matches!(&err, ConstraintCompileError::AllConstraintsFailed { reason } if reason.contains(expected)),
+                        "allow={allow}: {err:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(err, ConstraintCompileError::UnadvertisedCapabilities { .. }),
+                        "allow={allow}: {err:?}"
+                    );
+                }
+            }
+        }
+    }
     let response = EvaluationResponse {
         decision: true,
         context: EvaluationResponseContext {
             constraints: vec![Constraint {
-                predicates: vec![Predicate::InGroupSubtree(InGroupSubtreePredicate {
-                    property: pep_properties::RESOURCE_ID.to_owned(),
-                    ancestor_ids: vec![],
+                predicates: vec![Predicate::In(InPredicate {
+                    property: "unknown_property".into(),
+                    values: vec![],
                 })],
             }],
             ..Default::default()
         },
     };
-
-    let result = compile_to_access_scope(&response, true, DEFAULT_PROPS);
-    assert!(
-        matches!(
-            result,
-            Err(ConstraintCompileError::AllConstraintsFailed { .. })
-        ),
-        "empty InGroupSubtree ancestor_ids must fail-closed, got: {result:?}"
-    );
+    let malformed_tenant = respond(vec![Constraint {
+        predicates: vec![
+            Predicate::Eq(EqPredicate {
+                property: pep_properties::OWNER_TENANT_ID.into(),
+                value: json!("not-a-uuid"),
+            }),
+            Predicate::In(InPredicate {
+                property: pep_properties::RESOURCE_ID.into(),
+                values: vec![],
+            }),
+        ],
+    }]);
+    for allow in [false, true] {
+        let err =
+            compile_to_access_scope_with_options(&response, true, DEFAULT_PROPS, with_allow(allow))
+                .unwrap_err();
+        assert!(
+            matches!(&err, ConstraintCompileError::AllConstraintsFailed { reason } if reason.contains("unsupported property")),
+            "allow={allow}: {err:?}"
+        );
+        let err = compile_to_access_scope_with_options(
+            &malformed_tenant,
+            true,
+            DEFAULT_PROPS,
+            with_allow(allow),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, ConstraintCompileError::AllConstraintsFailed { reason } if reason.contains("UUID")),
+            "allow={allow}: {err:?}"
+        );
+    }
 }

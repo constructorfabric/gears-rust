@@ -4,7 +4,7 @@
 //! domain authentication flow.
 
 pub mod circuit_breaker;
-pub(crate) mod http_response;
+pub mod idp_http;
 pub mod jwks;
 pub mod oidc;
 pub(crate) mod retry;

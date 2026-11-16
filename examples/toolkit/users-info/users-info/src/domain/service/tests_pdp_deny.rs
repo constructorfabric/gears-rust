@@ -13,7 +13,7 @@ use crate::test_support::{
 use users_info_sdk::{NewAddress, NewCity, NewUser};
 
 // ---------------------------------------------------------------------------
-// Explicit PDP denial tests (decision=false → EnforcerError::Denied → Forbidden)
+// Explicit PDP denial tests (decision=false → EnforcerError::AccessDenied → Forbidden)
 // ---------------------------------------------------------------------------
 
 /// When the PDP explicitly denies access, `list_users_page` must return
@@ -383,7 +383,7 @@ async fn pdp_denied_returns_forbidden_for_delete_address() {
 }
 
 // ---------------------------------------------------------------------------
-// Additional PDP denial tests (decision=false → EnforcerError::Denied → Forbidden)
+// Additional PDP denial tests (decision=false → EnforcerError::AccessDenied → Forbidden)
 // ---------------------------------------------------------------------------
 
 /// PDP returns `decision=false` → `DomainError::Forbidden`.

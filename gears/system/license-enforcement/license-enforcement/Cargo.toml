@@ -66,6 +66,7 @@ inventory = { workspace = true }
 integration = []
 
 [dev-dependencies]
+authz-resolver-sdk = { workspace = true, features = ["test-util"] }
 # Path-only: a versioned dev-dependency that is not a normal one fails
 # `tools/scripts/check_release_config.py`.
 le-default-evaluator = { package = "cf-gears-le-default-evaluator", path = "../plugins/default-evaluator" }

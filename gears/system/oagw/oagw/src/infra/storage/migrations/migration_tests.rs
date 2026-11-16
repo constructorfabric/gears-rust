@@ -281,7 +281,7 @@ async fn case_all_tables_exist_with_tenant_id(db: &Db) {
             $(
                 assert!(
                     matches!(
-                        <$entity::Entity as ScopableEntity>::tenant_col(),
+                        <$entity::Entity as ScopableEntity>::SCOPE.tenant(),
                         Some($entity::Column::TenantId)
                     ),
                     "{} is tenant-scoped on tenant_id",

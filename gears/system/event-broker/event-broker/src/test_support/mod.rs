@@ -110,7 +110,8 @@ pub fn event_type_id(raw: &str) -> gts::GtsTypeId {
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use cluster::{ClusterConfig, ClusterHandle, ClusterWiring, ProviderRegistry};
+use cluster_sdk::ClusterCacheProvider as _;
+use cluster_sdk::test_support::{StubClusterClient, unbound_leader_election, unbound_lock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use toolkit::client_hub::ClientHub;
@@ -137,56 +138,52 @@ pub fn test_directory_client(hub: &ClientHub) -> Arc<dyn DirectoryClient> {
         .expect("standalone_event_broker_cluster() registers a LocalDirectoryClient")
 }
 
-/// Wires a `standalone` cache provider under the `event-broker` cluster
-/// profile (matching `domain::cluster::EventBrokerCluster::resolve()`'s
-/// profile name) and resolves an `EventBrokerCluster` against it.
+/// The cluster profile the broker binds to, matching the private
+/// `EventBrokerProfile::NAME` in `domain::cluster`. The harness binds the stub
+/// under the same name so `EventBrokerCluster::resolve()` finds it.
+const EVENT_BROKER_PROFILE: &str = "event-broker";
+
+/// Binds the `event-broker` cluster profile into `hub` through `cluster-sdk`'s
+/// [`StubClusterClient`], over a `standalone-cluster-plugin` in-memory cache -
+/// the way a consumer's tests resolve a cluster facade without linking the
+/// cluster gear (same pattern as `examples/toolkit/api-contracts`'s
+/// `cluster_round_trip`).
+///
+/// Only the cache primitive is bound; the lock and leader-election primitives
+/// are left unbound (resolution succeeds, use would fail) because no
+/// event-broker test exercises them. The cache's background TTL sweeper
+/// (`stop`) is intentionally dropped rather than stopped: tests need no
+/// graceful shutdown and the process ends shortly after.
+pub async fn register_standalone_cluster_stub(hub: &ClientHub) {
+    let (cache, _stop) = standalone_cluster_plugin::StandaloneCacheProvider
+        .build_cache(&serde_json::Map::new())
+        .await
+        .expect("the standalone cache builds");
+    StubClusterClient::for_profile(EVENT_BROKER_PROFILE)
+        .with_cache(cache)
+        .with_lock(unbound_lock(EVENT_BROKER_PROFILE))
+        .with_leader_election(unbound_leader_election(EVENT_BROKER_PROFILE))
+        .register(hub);
+}
+
+/// Binds the `event-broker` cluster profile (via
+/// [`register_standalone_cluster_stub`]) and resolves an `EventBrokerCluster`
+/// against it.
 ///
 /// The returned `ClientHub` is the same one `EventBrokerCluster` resolved
 /// against, so a test's own `register()`/`discover()` calls observe the
-/// same underlying state. The `ClusterHandle` is intentionally leaked
-/// (`ClusterHandle::drop` without `stop()` panics in debug builds by
-/// design, as a production safety net - tests don't need graceful
-/// shutdown, the process ends shortly after).
+/// same underlying state.
 pub async fn standalone_event_broker_cluster() -> (Arc<ClientHub>, EventBrokerCluster) {
     let hub = Arc::new(ClientHub::default());
     hub.register::<dyn DirectoryClient>(Arc::new(toolkit::directory::LocalDirectoryClient::new(
         Arc::new(GearManager::new()),
     )));
-    let config: ClusterConfig = serde_json::from_value(serde_json::json!({
-        "profiles": { "event-broker": { "cache": { "provider": "standalone" } } }
-    }))
-    .expect("valid test cluster config");
-    let providers = ProviderRegistry::new()
-        .with_cache_provider(Arc::new(standalone_cluster_plugin::StandaloneCacheProvider));
-
-    // `from_config` returns `(ClusterHandle, Vec<Arc<BoundProfile>>)` and
-    // wiring alone does not make a profile resolvable: the bound set must be
-    // published into a `ProfileRegistry` and a local cluster client registered,
-    // which is the step the cluster gear's own `start` performs. A harness
-    // standing in for the gear has to do the same.
-    //
-    // Skipping it does not fail here - `resolve` returns an *unbound stub* by
-    // design, deferring the error to first use - so the symptom is a `503` on
-    // an unrelated request much later, its cause ("no backend bound for
-    // profile") only in the server log.
-    let (mut handle, bound) = ClusterWiring::from_config(Arc::clone(&hub), &config, &providers)
-        .await
-        .expect("standalone provider wires cleanly");
-    let profiles = Arc::new(cluster::ProfileRegistry::new());
-    handle.publish(&profiles, bound);
-    // Leaked with the handle: clearing the registry is the other half of the
-    // gear's shutdown job, and a test process ends before it matters.
-    std::mem::forget(profiles);
-    forget_handle(handle);
+    register_standalone_cluster_stub(&hub).await;
 
     let cluster = EventBrokerCluster::resolve(&hub)
         .await
         .expect("event-broker profile is bound");
     (hub, cluster)
-}
-
-fn forget_handle(handle: ClusterHandle) {
-    std::mem::forget(handle);
 }
 
 /// A running mock ingest/delivery instance: a real axum server on an

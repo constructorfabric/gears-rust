@@ -35,6 +35,8 @@ pub(super) fn authorization(error: AuthzError) -> CanonicalError {
                 .with_detail("AuthZResolverApi: authorization unavailable")
                 .create()
         }
+        // Logged where it was classified; the detail stays off the wire.
+        AuthzError::Internal(detail) => CanonicalError::internal(detail).create(),
     }
 }
 

@@ -103,3 +103,10 @@ types-registry-sdk = { workspace = true }
 # Drives the gear's own axum router in-process: the REST cases send real
 # requests through it rather than calling the handlers as functions.
 tower = { workspace = true }
+# The target-tenant cases run against the platform's tenant-hierarchy PDP, over
+# a tenant tree from the static resolver's configuration (gears-rust #5623).
+tenant-resolver-sdk = { workspace = true }
+# Captures the events a refused target tenant must log (`tests/target_tenant.rs`).
+tracing-subscriber = { workspace = true }
+tr-authz-plugin = { package = "cf-gears-tr-authz-plugin", path = "../../system/authz-resolver/plugins/tr-authz-plugin" }
+static-tr-plugin = { package = "cf-gears-static-tr-plugin", path = "../../system/tenant-resolver/plugins/static-tr-plugin" }

@@ -979,3 +979,25 @@ impl From<m::TraversalResponse> for GraphTraversalResponseDto {
 fn truncation_name(reason: m::TruncationReason) -> String {
     reason.as_str().to_owned()
 }
+
+/// `?tenant=`: the tenant a call is about, on every route but readiness
+/// (gears-rust #5623). Absent, the call is about the caller's own tenant.
+/// Present, the PDP decides whether the caller may act there; a refusal is
+/// `404`, the same answer an unknown tenant gets.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct TargetTenantParam {
+    pub tenant: Option<uuid::Uuid>,
+}
+
+impl TargetTenantParam {
+    #[must_use]
+    pub fn call<'a>(
+        &self,
+        ctx: &'a toolkit_security::SecurityContext,
+    ) -> crate::domain::authz::Call<'a> {
+        crate::domain::authz::Call {
+            ctx,
+            tenant: self.tenant,
+        }
+    }
+}
