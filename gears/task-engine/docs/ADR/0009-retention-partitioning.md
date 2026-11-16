@@ -1,7 +1,7 @@
 ---
 status: accepted
-date: 2026-10-25
-description: "Keep non-terminal tasks in a small unpartitioned live table, store append-only history in a fixed ring of N list partitions keyed by a time-bucket slot, measure retention from terminal time, and recycle the oldest slot by rescue-then-truncate."
+date: 2026-11-10
+description: "Keep non-terminal tasks in a small unpartitioned live table, store append-only history in a fixed ring of N list partitions keyed by a time-bucket slot, measure retention from terminal time, and recycle the oldest slot by rescue-then-truncate: detach, truncate and attach again on PostgreSQL; truncate in place on MySQL."
 ---
 
 # Split Live and History Storage; Keep History in a Fixed Partition Ring (Rescue-then-Truncate)
@@ -45,7 +45,8 @@ The Event Broker solves the same "bounded history" problem for its event log wit
 * Measure retention from the terminal time, so late completions keep their full retention.
 * One tenant's long policy (legal hold) must not block cleanup for everyone else.
 * No runtime `CREATE` / `DROP` partition DDL; a fixed, bounded number of partitions.
-* Work on PostgreSQL and MySQL in production, and on SQLite for development.
+* Recycling must not stall reads or writes of the other slots where the backend allows it.
+* Work on PostgreSQL and MySQL in production, and on SQLite for development. PostgreSQL is the backend for deployments that need steady latency.
 
 ## Considered Options
 
@@ -86,13 +87,16 @@ A singleton maintenance loop per domain (advisory lock `te-maintenance`) drives 
 1. **Mark** `s` as `recycling` for bucket `B` in the domain's `te_ring_state` (one row per slot), in a transaction that locks that row. This is a **fence**, not a timer: every write for a task of an old bucket (`b ≤ c + 2 − N`; the bucket being recycled, older ones, and one bucket of margin for clock differences) locks the same row first, writes to the ring only if the row is `active` for its bucket, and otherwise writes to the `_retained` tables. So the mark waits for writers that already hold the row, and every later writer sees `recycling`. When the mark commits, no new row can land in `s`. Newer tasks skip the check, so the hot path pays nothing.
 2. **Hard limit.** Force-cancel non-terminal tasks older than `hard_retention_days` through `finalize()` with `forcibly_cancelled`, in bounded batches.
 3. **Rescue.** Copy into `te_*_retained` (batched, idempotent) every row in `s` of a task that must outlive it: the task is still **non-terminal**, or it is terminal and `terminal_at + effective_retention > now` (late completions, longer type policies, tenant legal holds).
-4. **Truncate** slot `s` in every history table: PostgreSQL `TRUNCATE` of the partition, MySQL `ALTER TABLE … TRUNCATE PARTITION`, SQLite bounded `DELETE … WHERE ring_slot = s`. Through the ToolKit helper only (below), with a short lock timeout and retry.
-5. **Free** `s` for bucket `B + N` in `te_ring_state`.
+4. **Recycle** slot `s` in every history table, through the ToolKit helper only (below):
+   * **PostgreSQL**: detach, truncate, attach again. `ALTER TABLE t DETACH PARTITION t_s CONCURRENTLY` runs outside a transaction block with a short `statement_timeout` (about 2 s); a detach cut off by it stays pending, and the next attempt finishes it with `DETACH PARTITION … FINALIZE`. Then `TRUNCATE t_s`, which no query can reach any more, and `ALTER TABLE t ATTACH PARTITION t_s FOR VALUES IN (s)`, which scans nothing because the table is empty. Detach and attach take `SHARE UPDATE EXCLUSIVE` on the parent, which reads and writes do not conflict with, so recycling never makes another query wait. A slow reader of slot `s` only delays the detach. Between detach and attach the slot has no partition. That is safe: the fence sends every write for bucket `B` to the `_retained` tables, and the slot receives new rows only once bucket `B + N` begins, a full bucket later.
+   * **MySQL and MariaDB**: `ALTER TABLE t TRUNCATE PARTITION p_s`. Every partition DDL on MySQL, `ADD` / `DROP` / `TRUNCATE PARTITION` alike, takes the table's exclusive metadata lock. That lock waits for every open transaction that touched the table, and every new statement on the table, in any slot, waits behind it. So each attempt runs with the shortest wait the server allows (`lock_wait_timeout = 1`, on MariaDB too: its `WAIT n` takes no fraction of a second, so `WAIT 0.05` behaves as `NOWAIT` and never gets the lock under steady inserts) and is retried with backoff. On MySQL an attempt is skipped while a session that has held the table for longer than a few hundred milliseconds still holds its metadata lock (`performance_schema.metadata_locks`). This is an accepted trade-off (see Consequences).
+   * **SQLite**: bounded `DELETE … WHERE ring_slot = s`.
+5. **Reactivate** `s` for bucket `B + N` in `te_ring_state`: the slot is `active` again; there is no separate free state.
 6. **Expire leftovers.** Bounded `DELETE` of expired `_retained` rows, of rows under policies **shorter** than the drop horizon (by `ring_slot` and `terminal_at`), of `te_dedup` rows with `expires_at < now`, and of `te_supersede_heads` rows of removed tasks.
 
 A task is **retained** once its bucket's slot was recycled; its reads and writes then use the `_retained` tables, and history reads union the partitioned table with its retained table.
 
-**ToolKit dependency.** Two small helpers in `toolkit-db` (TODO(toolkit)): (1) a migration helper that declares a table list-partitioned by a slot column with exactly `N` partitions on PostgreSQL/MySQL and unpartitioned on SQLite; (2) `truncate_partition(table, slot)` with the per-backend statements above. There is no runtime `CREATE PARTITION` or `DROP PARTITION`.
+**ToolKit dependency.** Two small helpers in `toolkit-db` (TODO(toolkit)): (1) a migration helper that declares a table list-partitioned by a slot column with exactly `N` partitions on PostgreSQL/MySQL and unpartitioned on SQLite; (2) `recycle_partition(table, slot)` with the per-backend statements above, including resuming a pending PostgreSQL detach. There is no runtime `CREATE PARTITION` or `DROP PARTITION`: the PostgreSQL recycle detaches and attaches the same table, so every history table keeps exactly `N` partitions after each pass.
 
 **Large long-retention workloads.** A tenant or type whose long policy covers a large share of the data is routed to its own task domain, whose ring is sized for that policy, so rescue sets stay small everywhere.
 
@@ -100,7 +104,9 @@ A task is **retained** once its bucket's slot was recycled; its reads and writes
 
 * Claims and deadline scans run on a small unpartitioned table, independent of history size.
 * Daily retention at the capacity target costs one truncation per history table per `W` days plus a small rescue copy and narrow row deletes.
-* The number of partitions is fixed (`N` per table) and known at installation: bounded planning cost, no partition provisioning, no runtime DDL except `TRUNCATE`.
+* The number of partitions is fixed (`N` per table) and known at installation: bounded planning cost, no partition provisioning. The only runtime DDL is the recycle step: detach, truncate and attach again of one existing partition on PostgreSQL, and `TRUNCATE PARTITION` on MySQL.
+* On PostgreSQL, recycling makes no other query wait.
+* On MySQL and MariaDB, recycling stalls every statement on the table being recycled, in every slot, writes to the current slot included. The stall lasts while the truncate waits for an open transaction on that table, up to the lock wait of one attempt (1 s at the minimum). Without a long transaction it is a few tens of milliseconds. The pre-check keeps most attempts from meeting a long holder. This is accepted: a deployment that needs steady latency runs PostgreSQL.
 * Live tasks and data under longer policies are never lost by a truncation; writes for retained tasks never target a recycled slot.
 * A late completion keeps its full retention; one tenant's legal hold does not block cleanup for the domain.
 * Changing `W` or `N` (for example a longer drop horizon) is a schema migration that builds a new ring, not a configuration change.
@@ -115,6 +121,7 @@ Tests MUST check that:
 * no truncation removes data of a non-terminal task or of a task whose retention has not ended;
 * rows written for a task of a `recycling` bucket land in the `_retained` tables, and reads by task ID find them;
 * a slot is never written after it was marked `recycling`, including by transactions that started before the mark and by nodes whose cache or clock is out of date;
+* on PostgreSQL, recycling a slot while other slots are read and written makes none of those queries wait, a detach cut off by its timeout is finished by the next attempt, and every history table has exactly `N` attached partitions after each pass;
 * a task completing late keeps its full retention from `terminal_at`;
 * a tenant with a long policy is rescued and does not block truncation for other tenants;
 * claim latency is independent of history volume, and a search with a `created_at` window touches only the slots that cover it;
@@ -163,11 +170,13 @@ The previous decision.
 ### Option 5: Live/history split with a fixed partition ring, rescue-then-truncate
 
 * Good, because the hot path touches one small table with global indexes.
-* Good, because the partition count is fixed and all partition DDL runs once, in migrations; recycling is a `TRUNCATE`.
+* Good, because the partition count is fixed and every partition is created once, in migrations; recycling reuses the same partition (detach, truncate, attach on PostgreSQL; `TRUNCATE PARTITION` on MySQL).
+* Good, because on PostgreSQL recycling makes no other query wait.
 * Good, because the drop horizon is the common retention, independent of long policies, and retained tasks have a defined home for new rows.
 * Good, because it follows the Event Broker's sliding-window semantics and paced retention worker.
 * Neutral, because changing the ring geometry is a migration.
 * Bad, because reads of history union a partitioned table with a small retained table.
+* Bad, because on MySQL the truncate takes a table-wide metadata lock, so a recycle that meets a long transaction stalls the whole table for up to one lock wait.
 
 **Chosen.**
 
@@ -179,14 +188,16 @@ live-only : te_wait_conditions, te_dependencies, te_timers (unpartitioned, delet
 history   : te_tasks, te_task_results, te_events, te_task_entries, te_tags, te_resource_refs
             (LIST-partitioned by ring_slot; exactly N partitions; SQLite unpartitioned)
 ring      : bucket = floor(days(task_created_at) / W); ring_slot = bucket mod N; N = ceil(H / W) + 2 (W = 7, H = 100 -> N = 17)
-recycle   : during bucket c, slot (c + 1) mod N: mark recycling -> hard limit -> rescue -> TRUNCATE -> free
+recycle   : during bucket c, slot (c + 1) mod N: mark recycling -> hard limit -> rescue -> recycle -> active for B + N
+            PostgreSQL: DETACH PARTITION CONCURRENTLY (FINALIZE if pending) -> TRUNCATE -> ATTACH PARTITION
+            MySQL/MariaDB: ALTER TABLE ... TRUNCATE PARTITION, lock_wait_timeout 1 s, retry; SQLite: bounded DELETE
 identity  : te_dedup, te_supersede_heads (unpartitioned, bounded batch deletes)
 retained  : te_*_retained (unpartitioned, rescued rows and new rows of retained tasks)
 expiry    : terminal_at + effective_retention
 FKs       : none between task tables
 ```
 
-See DESIGN §3.7 Live / history split, §3.2 RetentionService, and §4.1 Configuration (`retention`). Event Broker reference: `infra/workers/retention.rs` (paced retention worker) and the SQLite backend's `maintain()` (bounded prefix removal).
+See DESIGN §3.7 Live / history split, §3.2 RetentionService, and §4.1 Configuration (`retention`); the per-backend recycle rules are in [DATABASE.md](../DATABASE.md#rules-the-implementation-must-keep) (rule 7). Event Broker reference: `infra/workers/retention.rs` (paced retention worker), the SQLite backend's `maintain()` (bounded prefix removal), the PostgreSQL plugin's detacher (`DETACH … CONCURRENTLY`, then `FINALIZE` after a cut-off) and the MySQL plugin's metadata-lock notes (its DESIGN §7.2).
 
 ## Traceability
 

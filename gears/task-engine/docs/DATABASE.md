@@ -2,7 +2,7 @@
 
 A guide to the Task Engine's storage: which tables exist, how rows move between them, which tables each request and background loop touches, and the rules an implementation must keep. It is drawn from the draft reference DDL in [`migration.sql`](migration.sql) (PostgreSQL form) and the algorithms in [DESIGN.md](DESIGN.md) §3.7 and §4.6, with the decisions of the Task Engine gap review. The gear's own migrations stay authoritative; this file and `migration.sql` describe the target layout.
 
-> **Status: draft.** Builds on the design proposals in #5730, taken as accepted. Section [Verified behaviour](#verified-behaviour) records load probes run against this DDL on PostgreSQL 18.
+> **Status: draft.** Builds on the design proposals in #5730, taken as accepted.
 
 ## At a glance
 
@@ -189,14 +189,14 @@ Each flow is one request or background loop, with the tables it touches in order
 
 ### Retention recycle
 
-`Maintenance leader · per domain` · Retention truncates one partition per bucket instead of deleting rows.
+`Maintenance leader · per domain` · Retention empties one partition per bucket instead of deleting rows.
 
 | # | Tables | Access | What happens |
 |---|---|---|---|
 | 1 | `te_ring_state` | `L` `W` | Mark slot s recycling |
 | 2 | `te_task_state` | `W` | Force-cancel live tasks past hard_retention_days, via finalize() |
 | 3 | `te_*_retained` | `W` | Rescue rows of slot s that must outlive it |
-| 4 | `history ring` | `T` | Truncate partition s of the 8 ring tables |
+| 4 | `history ring` | `T` | Empty partition s of the 8 ring tables: PostgreSQL detaches it, truncates it and attaches it again; MySQL truncates it in place (rule 7) |
 | 5 | `te_ring_state` | `W` | Slot s active again, for bucket B + N |
 | 6 | `te_dedup`, `te_supersede_heads` | `D` | Expired keys and removed group heads |
 
@@ -215,86 +215,19 @@ Each flow is one request or background loop, with the tables it touches in order
 
 ## Rules the implementation must keep
 
-These rules carry the correctness of the design. Each links to its source; the [Verified behaviour](#verified-behaviour) section shows what breaks without the ones that were probed.
+These rules carry the correctness of the design. Each links to its source and, where it is not obvious, says what breaks without it. Rules 5 and 7 were checked with load tests against this DDL on PostgreSQL 18, MySQL 8.4 and 9.7, and MariaDB 11.4.
 
 1. **One lock order, counters first.** Every transaction takes row locks in this order: `te_concurrency_slots` (1), `te_tenant_concurrency_slots` (2), `te_tenant_wait_counters` (3), then `te_task_state` rows (ascending `task_id`, or parent before child), and `te_worker_sessions` last (DESIGN §3.7 Lock ordering, ADR-0008; the proposals removed `te_dependency_locks` and `te_tenant_queue_backlog`).
 2. **Plan, then counters, then transition.** Read the tasks without a lock, apply the counter deltas in lock order with guarded updates, then run each task transition as an update guarded on the expected state. A guard that matches nothing rolls the transaction back (single task) or skips and redoes the task (bulk).
 3. **Claims never use locking reads.** They pick with `FOR UPDATE SKIP LOCKED` and decide with guarded updates.
 4. **Releases decrement the recorded shard.** A reservation stores the shard it took on the task row (`queue_slot_shard`, `type_slot_shard`, `tenant_queue_slot_shard`, `tenant_type_slot_shard`); the release decrements exactly that shard.
-5. **Counter reconciliation is lock, then count, in two statements.** Per counter row, in its own short transaction: lock the counter row (`FOR UPDATE`), then count the live holders in a **separate, later statement**, then write if different (DESIGN §3.7 Counter reconciliation). Counting first, or one `UPDATE … SET used = (SELECT count(*) …)`, loses concurrent changes and lets a shard admit beyond its limit ([probe 1](#probe-1-concurrency-counters)). On MySQL and MariaDB the transaction runs at `READ COMMITTED`.
+5. **Counter reconciliation is lock, then count, in two statements.** Per counter row, in its own short transaction: lock the counter row (`FOR UPDATE`), then count the live holders in a **separate, later statement**, then write if different (DESIGN §3.7 Counter reconciliation). Counting first, or one `UPDATE … SET used = (SELECT count(*) …)`, loses concurrent changes and lets a shard admit beyond its limit: in the one-statement form the subquery's snapshot is taken before the statement waits for the counter row, so a change that commits during the wait is overwritten. It is also the form an ORM produces most naturally. Done right, a pass under full claim load makes no corrections at all. On MySQL and MariaDB the transaction runs at `READ COMMITTED`.
 6. **Old-bucket writes go through the ring fence.** A transaction that writes a history row for a task of bucket `b ≤ c + 2 − N` first locks that slot's `te_ring_state` row; if the slot is not `active` for `b`, the row goes to the `_retained` twin (DESIGN §3.7 Ring fence). Newer tasks skip the check.
-7. **Truncate a slot without stalling readers** ([probe 2](#probe-2-ring-fence-and-truncation)):
-   - run `TRUNCATE` with a short `lock_timeout` (about 50 ms), retry with backoff and jitter, and cap the attempts per maintenance run (the next run continues);
-   - before each attempt, skip it while another session holds a lock on the partition (`pg_locks`), so the attempt does not queue behind a long reader;
-   - give queries that span ring slots (queue history, searches over `te_task_results`, `te_tags`, `te_resource_refs`) a `statement_timeout`, so no reader holds a slot for long;
-   - keep reads on custom plans (`plan_cache_mode = force_custom_plan` on the gear's connections), because a generic plan locks all 17 partitions of the table.
-8. **No runtime partition DDL.** The partitions are created once by the migrations; retention only truncates (ADR-0009).
-
-## Verified behaviour
-
-Load probes against this DDL on PostgreSQL 18 (Docker `postgres:18-alpine`, 14 CPUs), run on 2026-11-09.
-
-### Probe 1: concurrency counters
-
-**Question.** Do the sharded counters stay exact under concurrent claims, completions and requeues, and is the reconciliation safe to run during that load?
-
-**Setup.** One queue, 4 tenants. `queue_global` limit 256 in 8 shards of 32; `queue_tenant` limit 96 per tenant in 3 shards of 32, so both dimensions bind. 100,000 queued tasks. 16 clients: claim (60%), complete (30%), requeue (10%); complete and requeue pick among the oldest leased tasks, so they race for the same rows. Reconciliation runs one full pass (20 counter rows, one transaction each) every 50 ms. A checker compares every counter with its live holders in one snapshot every 20 ms. 30 s per run.
-
-| Reconciliation | Throughput | Corrections | Checker: over limit | End state |
-|---|---|---|---|---|
-| **Lock, then count in a new statement (DESIGN)** | 8,751 tx/s | **0** of 9,160 row passes | **0** of 1,291 snapshots | exact (256 = 256) |
-| Count, then lock and write | 7,954 tx/s | 3,109 spurious | 596 snapshots, up to +4 | drifted |
-| One `UPDATE … SET used = (SELECT count(*) …)` | 8,053 tx/s | 2,614 spurious | 973 snapshots, up to +4 | drifted |
-| DESIGN, with 40 injected ±3 errors | 8,432 tx/s | 31, each exactly ±3 | 11 snapshots, until the next pass | exact |
-
-- No deadlocks in any run. About 51,000 lost races between complete and requeue all rolled back through the expected-state guard.
-- The one-statement form is wrong because the subquery's snapshot is taken before the statement waits for the counter row, so a change that commits during the wait is overwritten. It is also the form an ORM produces most naturally, which is why rule 5 names it.
-- Downward drift (only from a bug or a manual edit) lets a shard admit beyond its limit until the next pass, so the exposure is one `slot_reconcile_interval_secs`.
-
-### Probe 2: ring fence and truncation
-
-**Question.** Can a slot be recycled while the engine keeps writing and reading, without losing a committed row and without stalling traffic?
-
-**Setup.** `te_events` with 100,000 rows in each of the 17 slots. Concurrent for 20 s: 4 clients inserting into the current slot, 2 clients writing events for 200 live tasks of the old bucket through the ring fence, 2 clients each of point reads by `(id, ring_slot)` on generic and on custom plans, 2 clients reading queue history across all slots. At 5 s a slow reader holds the old slot for 4 s; at 6 s retention marks the slot, rescues the live tasks' rows into `te_events_retained`, truncates and reactivates it.
-
-| Check | Result |
-|---|---|
-| Old-bucket writes committed during the cycle | ~16,000 (~4,800 to the ring before the mark, the rest to `_retained`) |
-| Committed writes missing afterwards | **0** |
-| Writes to the ring after the mark | **0** |
-| Rows left in the recycled slot | **0** |
-| Live tasks' rows rescued | 1,000 of 1,000 |
-
-Latency in ms; "worst in cycle" covers mark to reactivation.
-
-| Workload | p50 | p99 | Worst in cycle, `lock_timeout` 200 ms | Worst in cycle, no lock timeout |
-|---|---|---|---|---|
-| Insert into the current slot | 0.31 | 0.47 | 3.7 | 3.4 |
-| Fenced old-bucket write | 2.48 | 2.91 | 5.9 | 5.5 |
-| Point read, generic plan | 0.06 | 0.13 | 201 | 2,947 |
-| Point read, custom plan | 0.09 | 0.16 | 201 (reads of the old slot only) | 2,946 |
-| Queue history, all slots | 0.23 | 0.35 | 201 | 2,947 |
-
-With the partition locked, a direct check shows which statements wait:
-
-| Statement against slot 3, while slot 9 is locked | Waits? |
-|---|---|
-| Point read with a literal `ring_slot`, or a prepared read on a custom plan | no |
-| Prepared read on a **generic** plan | **yes**: a generic plan locks every partition |
-| Insert through the parent (literal or prepared) | no: rows are routed lazily |
-| Read without a `ring_slot` filter (for example by `queue_id`) | **yes** |
-| `UNION ALL` of the ring slot and its `_retained` twin | no |
-
-- The fence works: no write lands in a slot after it is marked, and nothing committed is lost.
-- Writers never stall. Readers stall because a waiting `TRUNCATE` queues an exclusive lock on the partition, and every later reader of that partition queues behind it until the slow reader ends. Without a lock timeout the stall lasts as long as the slowest reader; with a 200 ms timeout each retry stalls readers for up to 200 ms (10 retries in this run). Rule 7 bounds both.
-- PostgreSQL's default `plan_cache_mode = auto` chose custom plans for the point read (8 of 8 executions), so the generic-plan stall needs a plan switch to happen; pinning custom plans removes the risk.
-- An alternative is `DETACH PARTITION … CONCURRENTLY`, truncate, then `ATTACH`. It does not stall readers, but it is runtime partition DDL, which ADR-0009 rules out.
-
-### Not covered yet
-
-- MySQL and MariaDB: `ALTER TABLE … TRUNCATE PARTITION` takes a metadata lock on the whole table rather than one partition, so its effect on readers and writers is likely larger and needs its own probe.
-- Type dimensions, the wait counters, and shard-count changes (draining shards). They use the same mechanism as the probed counters.
-- Ring tables other than `te_events`. The lock behaviour is per partition, so it is the same.
+7. **Recycle a slot per backend** (ADR-0009 step 4):
+   - **PostgreSQL: detach, truncate, attach again.** Per ring table, `ALTER TABLE t DETACH PARTITION t_pNN CONCURRENTLY` on a connection of its own, outside a transaction block: one statement per round trip, because several statements sent as one string run as one implicit transaction, which `CONCURRENTLY` refuses. Give it a `statement_timeout` of about 2 s. A detach cut off by the timeout stays pending (`pg_inherits.inhdetachpending`); the next attempt finishes it with `DETACH PARTITION … FINALIZE`. Then `TRUNCATE t_pNN` and `ALTER TABLE t ATTACH PARTITION t_pNN FOR VALUES IN (s)`. No other query waits, generic plans included. A long transaction on the table, in any slot, delays only the detach; without one the whole cycle takes tens of milliseconds. Between detach and attach the slot has no partition, which is safe because the fence (rule 6) already sends every write for that bucket to `_retained`. The ring tables have no `DEFAULT` partition, which a concurrent detach would refuse. Do not `TRUNCATE` an attached partition: a truncate waiting behind a reader queues an exclusive lock, and every later reader of that partition waits behind it, as does every prepared statement on a generic plan and every read without a `ring_slot` filter, since those lock all partitions. A lock timeout only shortens each stall to the timeout.
+   - **MySQL and MariaDB: truncate in place, and accept a bounded stall.** `ALTER TABLE t TRUNCATE PARTITION pNN` with `SET SESSION lock_wait_timeout = 1`, the minimum the server accepts, retried with backoff and jitter, with the attempts per maintenance run capped (the next run continues). On MySQL, skip an attempt while a session whose transaction is older than about 200 ms holds a metadata lock on the table (`performance_schema.metadata_locks` joined with `events_transactions_current`; `information_schema.innodb_trx.trx_started` has 1 s resolution, too coarse for this). On MariaDB, `WAIT 0.05` and `NOWAIT` fail at once under steady inserts and never get the lock, so use the 1 s session wait there too. The truncate takes the table's exclusive metadata lock, so each attempt that waits stalls every statement on that table, in every slot, writes to the current slot included, for up to 1 s; statements on other tables, `_retained` twins included, do not wait. The pre-check cannot see a long transaction that starts after it, so 1 s stays the bound per attempt. A bounded `DELETE` would avoid the lock but deletes every row of the slot (undo, redo, binary log, purge), so it stays the SQLite fallback only. Keep sessions on the domain database short, and run at `READ COMMITTED`. A deployment that needs steady latency runs PostgreSQL.
+   - **SQLite**: bounded `DELETE … WHERE ring_slot = s`.
+8. **No partition provisioning.** The partitions are created once by the migrations. The only runtime partition DDL is the recycle step of rule 7, which reuses the same partition, so every ring table keeps exactly 17 (ADR-0009).
 
 ## Table directory
 
@@ -374,3 +307,6 @@ To take into account when the gear's migrations and queries are written:
 
 - **Per-table autovacuum settings** on the hot, update-heavy tables: `te_task_state`, `te_timers`, `te_worker_sessions` and the counter tables (`te_concurrency_slots`, `te_tenant_concurrency_slots`, `te_tenant_wait_counters`).
 - **Documented `ORDER BY` choices** in sweep queries (timers, deadlines, session expiry, retention), so the planner stays on the intended partial index.
+- **Ring reads name their slot.** Reads of a task's history carry its `ring_slot`, derived from the creation time in its UUID v7 task id (DESIGN §3.7), and union the ring table with its `_retained` twin. This keeps them on one partition and out of the way of a recycle.
+- **Load tests to carry into the gear.** Counter reconciliation under concurrent claims, completions and requeues ends exact, with no corrections and no shard over its limit. A slot recycle under steady reads and writes loses no committed row, writes nothing to the slot after the mark, rescues every live task's rows, and leaves exactly 17 partitions; on PostgreSQL no query waits, including behind a slow reader.
+- **Not yet measured:** recycle cost at full slot size (millions of rows; the tests used 100,000 per slot), and a MariaDB pre-check that does not need `performance_schema` (`information_schema.METADATA_LOCK_INFO` needs a plugin that is not loaded by default).
