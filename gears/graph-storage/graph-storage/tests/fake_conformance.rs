@@ -743,13 +743,9 @@ async fn a_count_agrees_with_the_listing() {
 }
 
 #[tokio::test]
-async fn a_hubs_edges_are_listed_a_page_at_a_time() {
-    conformance::a_hubs_edges_are_listed_a_page_at_a_time(&store(), Uuid::now_v7()).await;
-}
-
-#[tokio::test]
-async fn edge_payloads_are_read_for_live_edges_only() {
-    conformance::edge_payloads_are_read_for_live_edges_only(&store(), Uuid::now_v7()).await;
+async fn a_key_carried_twice_is_written_twice_in_request_order() {
+    conformance::a_key_carried_twice_is_written_twice_in_request_order(&store(), Uuid::now_v7())
+        .await;
 }
 
 #[tokio::test]
@@ -788,7 +784,11 @@ async fn a_purge_bound_to_a_creation_instant_leaves_a_later_node_alone() {
 }
 
 #[tokio::test]
-async fn a_key_carried_twice_is_written_twice_in_request_order() {
-    conformance::a_key_carried_twice_is_written_twice_in_request_order(&store(), Uuid::now_v7())
-        .await;
+async fn a_hubs_edges_are_listed_a_page_at_a_time() {
+    conformance::a_hubs_edges_are_listed_a_page_at_a_time(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn edge_payloads_are_read_for_live_edges_only() {
+    conformance::edge_payloads_are_read_for_live_edges_only(&store(), Uuid::now_v7()).await;
 }

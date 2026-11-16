@@ -429,6 +429,10 @@ pg_case!(
     conformance::a_stale_vector_stops_ranking_but_the_node_stays
 );
 pg_case!(
+    the_view_reads_report_whether_a_vector_is_stored,
+    conformance::the_view_reads_report_whether_a_vector_is_stored
+);
+pg_case!(
     only_the_active_epoch_ranks,
     conformance::only_the_active_epoch_ranks
 );
@@ -476,28 +480,8 @@ pg_case!(
 );
 
 pg_case!(
-    a_hubs_edges_are_listed_a_page_at_a_time,
-    conformance::a_hubs_edges_are_listed_a_page_at_a_time
-);
-
-pg_case!(
-    edge_payloads_are_read_for_live_edges_only,
-    conformance::edge_payloads_are_read_for_live_edges_only
-);
-
-pg_case!(
-    the_view_reads_report_whether_a_vector_is_stored,
-    conformance::the_view_reads_report_whether_a_vector_is_stored
-);
-
-pg_case!(
-    a_type_referencing_a_non_ancestor_gains_an_optional_property,
-    conformance::a_type_referencing_a_non_ancestor_gains_an_optional_property
-);
-
-pg_case!(
-    a_type_referencing_a_non_ancestor_still_refuses_a_breaking_change,
-    conformance::a_type_referencing_a_non_ancestor_still_refuses_a_breaking_change
+    a_key_carried_twice_is_written_twice_in_request_order,
+    conformance::a_key_carried_twice_is_written_twice_in_request_order
 );
 
 pg_case!(
@@ -531,8 +515,13 @@ pg_case!(
 );
 
 pg_case!(
-    a_key_carried_twice_is_written_twice_in_request_order,
-    conformance::a_key_carried_twice_is_written_twice_in_request_order
+    a_hubs_edges_are_listed_a_page_at_a_time,
+    conformance::a_hubs_edges_are_listed_a_page_at_a_time
+);
+
+pg_case!(
+    edge_payloads_are_read_for_live_edges_only,
+    conformance::edge_payloads_are_read_for_live_edges_only
 );
 
 pg_case!(
@@ -1053,6 +1042,14 @@ pg_case!(
 pg_case!(
     a_backward_compatible_change_updates_the_type_in_place,
     conformance::a_backward_compatible_change_updates_the_type_in_place
+);
+pg_case!(
+    a_type_referencing_a_non_ancestor_gains_an_optional_property,
+    conformance::a_type_referencing_a_non_ancestor_gains_an_optional_property
+);
+pg_case!(
+    a_type_referencing_a_non_ancestor_still_refuses_a_breaking_change,
+    conformance::a_type_referencing_a_non_ancestor_still_refuses_a_breaking_change
 );
 pg_case!(
     an_incompatible_change_is_refused_with_its_location,
@@ -2653,98 +2650,6 @@ async fn a_count_applies_a_column_filter_as_the_listing_does() {
     assert_eq!((counted.count, counted.capped), (2, false));
 }
 
-/// An edge whose far endpoint the caller cannot see is left out of the
-/// listing, and the listing still moves past it: the page that held it comes
-/// back short and carries a cursor, and the next page goes on from there.
-///
-/// The endpoint is hidden the way `an_edge_whose_endpoint_is_hidden_is_not_found_and_stays_live`
-/// hides one -- tombstoned by hand while its edge stays live -- which is the
-/// shape a scope the caller does not hold also takes.
-#[tokio::test]
-async fn a_listed_edge_whose_far_endpoint_is_hidden_is_skipped() {
-    use sea_orm::ConnectionTrait as _;
-    let Some(stand) = stand().await else {
-        return;
-    };
-    let tenant = tenant_on(&stand).await;
-    let scope = AccessScope::for_tenant(tenant);
-    let ctx = conformance::ctx(tenant, &scope, None);
-    stand
-        .store
-        .register_types(&ctx, conformance::ontology_batch())
-        .await
-        .expect("the ontology registers");
-    // One batch per edge, so storage ids follow the order written here.
-    conformance::ingest_batch(
-        stand.store.as_ref(),
-        &ctx,
-        conformance::batch(vec![conformance::node("hid-hub", "hub")], Vec::new()),
-    )
-    .await
-    .expect("the hub commits");
-    for far in ["hid-a", "hid-b", "hid-c"] {
-        conformance::ingest_batch(
-            stand.store.as_ref(),
-            &ctx,
-            conformance::batch(
-                vec![conformance::node(far, far)],
-                vec![conformance::edge("hid-hub", far)],
-            ),
-        )
-        .await
-        .expect("the edge commits");
-    }
-    let raw = sea_orm::Database::connect(&stand.dsn)
-        .await
-        .expect("a plain connection to hide the endpoint");
-    raw.execute_unprepared(&format!(
-        "UPDATE node SET deleted_at = now() \
-         WHERE tenant_id = '{tenant}' AND node_key = 'hid-b'"
-    ))
-    .await
-    .expect("the endpoint is tombstoned alone");
-
-    let query = |after: Option<i64>| graph_storage_sdk::plugin_api::NodeEdgesQuery {
-        node_key: "hid-hub".to_owned(),
-        direction: graph_storage_sdk::models::Direction::Outgoing,
-        edge_types: None,
-        discriminators: Vec::new(),
-        after,
-        limit: 2,
-    };
-    let first = stand
-        .store
-        .list_node_edges(&ctx, &query(None))
-        .await
-        .expect("the first page answers");
-    assert_eq!(
-        first
-            .items
-            .iter()
-            .map(|e| e.dst.as_str())
-            .collect::<Vec<_>>(),
-        vec!["hid-a"],
-        "the edge to the hidden endpoint is skipped"
-    );
-    let after = first
-        .next_after
-        .expect("a short page still carries the position past the skipped edge");
-    let second = stand
-        .store
-        .list_node_edges(&ctx, &query(Some(after)))
-        .await
-        .expect("the second page answers");
-    assert_eq!(
-        second
-            .items
-            .iter()
-            .map(|e| e.dst.as_str())
-            .collect::<Vec<_>>(),
-        vec!["hid-c"]
-    );
-    assert_eq!(second.next_after, None, "and the listing ends");
-}
-
 /// A listing whose statement the database fails is the server's failure, not
 /// the caller's (gears-rust #5789). The pager reports it as an `OData` `Db`
 /// error, which the store used to answer as `InvalidQuery` -- a 400 that tells
@@ -2795,164 +2700,6 @@ async fn a_listing_the_database_fails_is_unavailable_not_an_invalid_query() {
         ),
         "a database failure is the server's, not an invalid query: {error:?}"
     );
-}
-
-/// A purge under a scope that names the node by id removes its edges too.
-/// `id` is each entity's own column, so that scope applied to the edge delete
-/// would match edges by `edge.id`, keep the node's incident edges, and the
-/// foreign key would refuse the node. The edges go under the tenant part of
-/// the scope, after the node was found under the whole of it.
-#[tokio::test]
-async fn a_purge_under_a_node_id_scope_removes_the_nodes_edges() {
-    use toolkit_security::{ScopeConstraint, ScopeFilter, pep_properties};
-
-    let Some(stand) = stand().await else {
-        return;
-    };
-    let tenant = tenant_on(&stand).await;
-    let scope = AccessScope::for_tenant(tenant);
-    let ctx = conformance::ctx(tenant, &scope, None);
-    stand
-        .store
-        .register_types(&ctx, conformance::ontology_batch())
-        .await
-        .expect("the ontology registers");
-    // Edges first, so the edge ids run ahead of the node ids: with equal ids,
-    // a node-id filter applied to `edge.id` would match by coincidence.
-    conformance::ingest_batch(
-        stand.store.as_ref(),
-        &ctx,
-        conformance::batch(
-            vec![
-                conformance::node("filler-a", "a"),
-                conformance::node("filler-b", "b"),
-            ],
-            (0..3)
-                .map(|n| {
-                    let mut filler = conformance::edge("filler-a", "filler-b");
-                    filler.discriminator = Some(format!("f{n}"));
-                    filler
-                })
-                .collect(),
-        ),
-    )
-    .await
-    .expect("the filler commits");
-    conformance::ingest_batch(
-        stand.store.as_ref(),
-        &ctx,
-        conformance::batch(
-            vec![
-                conformance::node("by-id", "by id"),
-                conformance::node("by-id-peer", "peer"),
-            ],
-            vec![conformance::edge("by-id", "by-id-peer")],
-        ),
-    )
-    .await
-    .expect("the batch commits");
-    let id = stand
-        .store
-        .resolve_node_ids(&ctx, &["by-id".to_owned()])
-        .await
-        .expect("the key resolves")[0]
-        .1;
-    {
-        use sea_orm::ConnectionTrait as _;
-        let raw = sea_orm::Database::connect(&stand.dsn)
-            .await
-            .expect("a plain connection");
-        let clash = raw
-            .query_one_raw(sea_orm::Statement::from_string(
-                sea_orm::DatabaseBackend::Postgres,
-                format!(
-                    "SELECT count(*)::bigint AS n FROM edge e JOIN node s ON s.id = e.src_node_id \
-                     WHERE e.tenant_id = '{tenant}' AND s.node_key = 'by-id' AND e.id = {id}"
-                ),
-            ))
-            .await
-            .expect("reads")
-            .expect("one row")
-            .try_get::<i64>("", "n")
-            .expect("a count");
-        assert_eq!(
-            clash, 0,
-            "precondition: the node's edge has an id of its own"
-        );
-    }
-
-    let by_id = AccessScope::from_constraints(vec![ScopeConstraint::new(vec![
-        ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, tenant),
-        ScopeFilter::eq(pep_properties::RESOURCE_ID, id),
-    ])]);
-    let narrow = conformance::ctx(tenant, &by_id, None);
-    let outcome = stand
-        .store
-        .purge_node(
-            &narrow,
-            "by-id".to_owned(),
-            graph_storage_sdk::models::PurgeOptions::default(),
-        )
-        .await
-        .expect("the purge commits");
-    assert_eq!((outcome.purged_nodes, outcome.purged_edges), (1, 1));
-    let peer = stand
-        .store
-        .get_node(&ctx, &"by-id-peer".to_owned(), 10)
-        .await
-        .expect("the peer stays");
-    assert!(peer.adjacency.is_empty(), "the edge went with the node");
-}
-
-/// A purge under a scope with no tenant constraint -- a direct store call;
-/// the service always pins a write to one tenant -- removes the node's edges
-/// in the node's own tenant rather than in an empty scope, so the foreign key
-/// does not refuse the node (gears-rust #5906, a review finding).
-#[tokio::test]
-async fn a_purge_under_an_unconstrained_scope_removes_the_nodes_edges() {
-    let Some(stand) = stand().await else {
-        return;
-    };
-    let tenant = tenant_on(&stand).await;
-    let scope = AccessScope::for_tenant(tenant);
-    let ctx = conformance::ctx(tenant, &scope, None);
-    stand
-        .store
-        .register_types(&ctx, conformance::ontology_batch())
-        .await
-        .expect("the ontology registers");
-    conformance::ingest_batch(
-        stand.store.as_ref(),
-        &ctx,
-        conformance::batch(
-            vec![
-                conformance::node("open-a", "a"),
-                conformance::node("open-b", "b"),
-            ],
-            vec![conformance::edge("open-a", "open-b")],
-        ),
-    )
-    .await
-    .expect("the batch commits");
-
-    let everything = AccessScope::allow_all();
-    let open = conformance::ctx(tenant, &everything, None);
-    let outcome = stand
-        .store
-        .purge_node(
-            &open,
-            "open-a".to_owned(),
-            graph_storage_sdk::models::PurgeOptions::default(),
-        )
-        .await
-        .expect("the purge commits");
-    assert_eq!((outcome.purged_nodes, outcome.purged_edges), (1, 1));
-    let peer = stand
-        .store
-        .get_node(&ctx, &"open-b".to_owned(), 10)
-        .await
-        .expect("the peer stays");
-    assert!(peer.adjacency.is_empty(), "the edge went with the node");
 }
 
 /// A key another batch inserts between this batch's up-front read and its
@@ -3698,4 +3445,254 @@ async fn an_edge_tombstoned_meanwhile_is_revived_not_reported_unchanged() {
         row.try_get::<bool>("", "live").expect("a flag"),
         "the replay revives the edge it names, as a replay after the delete does"
     );
+}
+
+/// A purge under a scope that names the node by id removes its edges too.
+/// `id` is each entity's own column, so that scope applied to the edge delete
+/// would match edges by `edge.id`, keep the node's incident edges, and the
+/// foreign key would refuse the node. The edges go under the tenant part of
+/// the scope, after the node was found under the whole of it.
+#[tokio::test]
+async fn a_purge_under_a_node_id_scope_removes_the_nodes_edges() {
+    use toolkit_security::{ScopeConstraint, ScopeFilter, pep_properties};
+
+    let Some(stand) = stand().await else {
+        return;
+    };
+    let tenant = tenant_on(&stand).await;
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = conformance::ctx(tenant, &scope, None);
+    stand
+        .store
+        .register_types(&ctx, conformance::ontology_batch())
+        .await
+        .expect("the ontology registers");
+    // Edges first, so the edge ids run ahead of the node ids: with equal ids,
+    // a node-id filter applied to `edge.id` would match by coincidence.
+    conformance::ingest_batch(
+        stand.store.as_ref(),
+        &ctx,
+        conformance::batch(
+            vec![
+                conformance::node("filler-a", "a"),
+                conformance::node("filler-b", "b"),
+            ],
+            (0..3)
+                .map(|n| {
+                    let mut filler = conformance::edge("filler-a", "filler-b");
+                    filler.discriminator = Some(format!("f{n}"));
+                    filler
+                })
+                .collect(),
+        ),
+    )
+    .await
+    .expect("the filler commits");
+    conformance::ingest_batch(
+        stand.store.as_ref(),
+        &ctx,
+        conformance::batch(
+            vec![
+                conformance::node("by-id", "by id"),
+                conformance::node("by-id-peer", "peer"),
+            ],
+            vec![conformance::edge("by-id", "by-id-peer")],
+        ),
+    )
+    .await
+    .expect("the batch commits");
+    let id = stand
+        .store
+        .resolve_node_ids(&ctx, &["by-id".to_owned()])
+        .await
+        .expect("the key resolves")[0]
+        .1;
+    {
+        use sea_orm::ConnectionTrait as _;
+        let raw = sea_orm::Database::connect(&stand.dsn)
+            .await
+            .expect("a plain connection");
+        let clash = raw
+            .query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!(
+                    "SELECT count(*)::bigint AS n FROM edge e JOIN node s ON s.id = e.src_node_id \
+                     WHERE e.tenant_id = '{tenant}' AND s.node_key = 'by-id' AND e.id = {id}"
+                ),
+            ))
+            .await
+            .expect("reads")
+            .expect("one row")
+            .try_get::<i64>("", "n")
+            .expect("a count");
+        assert_eq!(
+            clash, 0,
+            "precondition: the node's edge has an id of its own"
+        );
+    }
+
+    let by_id = AccessScope::from_constraints(vec![ScopeConstraint::new(vec![
+        ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, tenant),
+        ScopeFilter::eq(pep_properties::RESOURCE_ID, id),
+    ])]);
+    let narrow = conformance::ctx(tenant, &by_id, None);
+    let outcome = stand
+        .store
+        .purge_node(
+            &narrow,
+            "by-id".to_owned(),
+            graph_storage_sdk::models::PurgeOptions::default(),
+        )
+        .await
+        .expect("the purge commits");
+    assert_eq!((outcome.purged_nodes, outcome.purged_edges), (1, 1));
+    let peer = stand
+        .store
+        .get_node(&ctx, &"by-id-peer".to_owned(), 10)
+        .await
+        .expect("the peer stays");
+    assert!(peer.adjacency.is_empty(), "the edge went with the node");
+}
+
+/// A purge under a scope with no tenant constraint -- a direct store call;
+/// the service always pins a write to one tenant -- removes the node's edges
+/// in the node's own tenant rather than in an empty scope, so the foreign key
+/// does not refuse the node (gears-rust #5906, a review finding).
+#[tokio::test]
+async fn a_purge_under_an_unconstrained_scope_removes_the_nodes_edges() {
+    let Some(stand) = stand().await else {
+        return;
+    };
+    let tenant = tenant_on(&stand).await;
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = conformance::ctx(tenant, &scope, None);
+    stand
+        .store
+        .register_types(&ctx, conformance::ontology_batch())
+        .await
+        .expect("the ontology registers");
+    conformance::ingest_batch(
+        stand.store.as_ref(),
+        &ctx,
+        conformance::batch(
+            vec![
+                conformance::node("open-a", "a"),
+                conformance::node("open-b", "b"),
+            ],
+            vec![conformance::edge("open-a", "open-b")],
+        ),
+    )
+    .await
+    .expect("the batch commits");
+
+    let everything = AccessScope::allow_all();
+    let open = conformance::ctx(tenant, &everything, None);
+    let outcome = stand
+        .store
+        .purge_node(
+            &open,
+            "open-a".to_owned(),
+            graph_storage_sdk::models::PurgeOptions::default(),
+        )
+        .await
+        .expect("the purge commits");
+    assert_eq!((outcome.purged_nodes, outcome.purged_edges), (1, 1));
+    let peer = stand
+        .store
+        .get_node(&ctx, &"open-b".to_owned(), 10)
+        .await
+        .expect("the peer stays");
+    assert!(peer.adjacency.is_empty(), "the edge went with the node");
+}
+
+/// An edge whose far endpoint the caller cannot see is left out of the
+/// listing, and the listing still moves past it: the page that held it comes
+/// back short and carries a cursor, and the next page goes on from there.
+///
+/// The endpoint is hidden the way `an_edge_whose_endpoint_is_hidden_is_not_found_and_stays_live`
+/// hides one -- tombstoned by hand while its edge stays live -- which is the
+/// shape a scope the caller does not hold also takes.
+#[tokio::test]
+async fn a_listed_edge_whose_far_endpoint_is_hidden_is_skipped() {
+    use sea_orm::ConnectionTrait as _;
+    let Some(stand) = stand().await else {
+        return;
+    };
+    let tenant = tenant_on(&stand).await;
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = conformance::ctx(tenant, &scope, None);
+    stand
+        .store
+        .register_types(&ctx, conformance::ontology_batch())
+        .await
+        .expect("the ontology registers");
+    // One batch per edge, so storage ids follow the order written here.
+    conformance::ingest_batch(
+        stand.store.as_ref(),
+        &ctx,
+        conformance::batch(vec![conformance::node("hid-hub", "hub")], Vec::new()),
+    )
+    .await
+    .expect("the hub commits");
+    for far in ["hid-a", "hid-b", "hid-c"] {
+        conformance::ingest_batch(
+            stand.store.as_ref(),
+            &ctx,
+            conformance::batch(
+                vec![conformance::node(far, far)],
+                vec![conformance::edge("hid-hub", far)],
+            ),
+        )
+        .await
+        .expect("the edge commits");
+    }
+    let raw = sea_orm::Database::connect(&stand.dsn)
+        .await
+        .expect("a plain connection to hide the endpoint");
+    raw.execute_unprepared(&format!(
+        "UPDATE node SET deleted_at = now() \
+         WHERE tenant_id = '{tenant}' AND node_key = 'hid-b'"
+    ))
+    .await
+    .expect("the endpoint is tombstoned alone");
+
+    let query = |after: Option<i64>| graph_storage_sdk::plugin_api::NodeEdgesQuery {
+        node_key: "hid-hub".to_owned(),
+        direction: graph_storage_sdk::models::Direction::Outgoing,
+        edge_types: None,
+        discriminators: Vec::new(),
+        after,
+        limit: 2,
+    };
+    let first = stand
+        .store
+        .list_node_edges(&ctx, &query(None))
+        .await
+        .expect("the first page answers");
+    assert_eq!(
+        first
+            .items
+            .iter()
+            .map(|e| e.dst.as_str())
+            .collect::<Vec<_>>(),
+        vec!["hid-a"],
+        "the edge to the hidden endpoint is skipped"
+    );
+    let after = first
+        .next_after
+        .expect("a short page still carries the position past the skipped edge");
+    let second = stand
+        .store
+        .list_node_edges(&ctx, &query(Some(after)))
+        .await
+        .expect("the second page answers");
+    assert_eq!(
+        second
+            .items
+            .iter()
+            .map(|e| e.dst.as_str())
+            .collect::<Vec<_>>(),
+        vec!["hid-c"]
+    );
+    assert_eq!(second.next_after, None, "and the listing ends");
 }
