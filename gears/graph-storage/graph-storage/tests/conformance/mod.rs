@@ -8214,3 +8214,91 @@ pub async fn the_view_reads_report_whether_a_vector_is_stored(
         assert_eq!(row.envelope, view.envelope, "both reads agree on {key}");
     }
 }
+
+/// A batch may carry one key twice, and each occurrence is written over the
+/// one before it, in request order: for a node and for an edge alike. The
+/// built-in store reads a batch's stored rows up front (gears-rust #5040);
+/// what it read for a key describes the row before the batch, and the
+/// second occurrence must be compared with what the first one wrote. Here
+/// the second occurrence puts back what was stored, which only that
+/// comparison sees as a change.
+pub async fn a_key_carried_twice_is_written_twice_in_request_order(
+    store: &impl GraphStoreV1,
+    tenant: Uuid,
+) {
+    use graph_storage_sdk::models::ItemOutcome;
+
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    store
+        .register_types(&ctx, ontology_batch())
+        .await
+        .expect("ontology registers");
+    ingest_batch(
+        store,
+        &ctx,
+        batch(
+            vec![node("twice", "stored name"), node("other", "other")],
+            vec![edge("twice", "other")],
+        ),
+    )
+    .await
+    .expect("the first batch commits");
+
+    let mut changed = edge("twice", "other");
+    changed.payload = Some(serde_json::json!({ "weight": 1 }));
+    let mut request = batch(
+        vec![
+            node("twice", "changed name"),
+            node("other", "other"),
+            node("twice", "stored name"),
+        ],
+        vec![changed, edge("twice", "other")],
+    );
+    request.options.report_per_item = true;
+    let outcome = ingest_batch(store, &ctx, request)
+        .await
+        .expect("the batch commits");
+
+    assert_eq!(
+        outcome.per_item_nodes,
+        Some(vec![
+            ItemOutcome::Updated,
+            ItemOutcome::Unchanged,
+            ItemOutcome::Updated
+        ]),
+        "the second occurrence changes what the first one wrote back"
+    );
+    assert_eq!(
+        outcome.per_item_edges,
+        Some(vec![ItemOutcome::Updated, ItemOutcome::Updated]),
+        "and the same for an edge"
+    );
+
+    let view = store
+        .get_node(&ctx, &"twice".to_owned(), 10)
+        .await
+        .expect("the node reads");
+    assert_eq!(
+        view.name.as_deref(),
+        Some("stored name"),
+        "the last write wins"
+    );
+    assert_eq!(
+        view.envelope.version,
+        Some(3),
+        "a stored row and two writes, three versions"
+    );
+    assert_eq!(view.adjacency.len(), 1, "one edge, written twice");
+    let stored = store
+        .get_edge(&ctx, &view.adjacency[0].edge_key)
+        .await
+        .expect("the edge reads");
+    // The two stores spell an empty edge payload differently (`{}` and
+    // absent); what matters here is that the first write's weight is gone.
+    assert_eq!(
+        stored.payload.unwrap_or_else(|| serde_json::json!({})),
+        serde_json::json!({}),
+        "the last write wins"
+    );
+}

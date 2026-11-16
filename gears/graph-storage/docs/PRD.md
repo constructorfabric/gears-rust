@@ -294,11 +294,15 @@ Convergence **MUST** hold under retries with unknown commit outcomes **for an in
 - **Rationale**: Producers re-run pipelines; idempotent atomic batches make re-runs safe and cheap, and the prototype's row-at-a-time writes were a measured bottleneck.
 - **Actors**: `cpt-cf-graph-storage-actor-producer-gear`
 
-> **Found while building the prototype.** Two clauses are not met as written:
-> writes are one statement per node and per edge rather than batched
-> statements. The measured § 6.1 ingest budget is met regardless (10k nodes +
-> 20k edges in ~20 s on developer hardware), so batching is a cost question
-> rather than a correctness one. The producer scope *is* met: the writing
+> **Found while building the prototype.** Two clauses are not met as written.
+> The first was batching, and it is met for new rows since gears-rust #5040:
+> a batch reads its stored nodes, endpoints and edges in one statement per
+> thousand keys, and inserts its new nodes and edges in one statement per
+> thousand rows. An update of a stored row is still a statement of its own,
+> and a row left unchanged costs none. Measured locally (pgvector
+> 0.8.7-pg18, `netem` for the round trip), 5k nodes and 10k edges take
+> ~0.9 s at +1 ms and ~1.1 s at +2 ms per round trip, where one statement
+> per element took 61 s and 138 s. The producer scope *is* met: the writing
 > principal is carried into the store, the idempotency receipt's key is
 > `(tenant, producer, idempotency_key)`, and a scope records its owning
 > producer and refuses a replacement from any other. Both columns existed from
@@ -782,7 +786,7 @@ The system **MUST** report readiness per capability — database and migrations,
 
 The system **MUST** ingest a batch of 10,000 nodes and 20,000 edges (validation and storage, embedding disabled) in 60 seconds or less on the reference deployment configuration.
 
-> **Found while building the prototype.** Not claimed as met: the only measurement is against a local container (about 20 s for this batch, see the note under `fr-bulk-ingest`), where round-trip time is near zero, and the per-item statements that #4872 replaces are what a managed endpoint pays for. Pending a run on the reference profile.
+> **Found while building the prototype.** Not claimed as met: there is no run on the reference profile yet. The per-item statements #4872 described are replaced for new rows (gears-rust #5040), so the cost no longer grows with the round trip to the database for a first sync: locally, 5k nodes and 10k edges take about 1 s with up to 2 ms added per round trip (note under `fr-bulk-ingest`). An update of a stored row is still one statement each.
 
 - **Threshold**: 10,000 nodes + 20,000 edges in <= 60 s, embedding excluded, single tenant, reference hardware profile defined in the benchmark suite
 - **Rationale**: Producers re-sync whole repositories; the prototype's row-at-a-time writes made large syncs impractical and batching is the required fix.

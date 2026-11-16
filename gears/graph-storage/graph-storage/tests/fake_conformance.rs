@@ -776,3 +776,9 @@ async fn a_type_referencing_a_non_ancestor_still_refuses_a_breaking_change() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn a_key_carried_twice_is_written_twice_in_request_order() {
+    conformance::a_key_carried_twice_is_written_twice_in_request_order(&store(), Uuid::now_v7())
+        .await;
+}
