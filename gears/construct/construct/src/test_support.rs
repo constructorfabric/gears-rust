@@ -1996,6 +1996,10 @@ pub struct MemoryDeletionStore {
     pub failing_tenant: std::sync::Mutex<Option<Uuid>>,
     /// Fail the list of tenants.
     pub tenants_down: std::sync::atomic::AtomicBool,
+    /// Fail the list of erasures under way.
+    pub under_way_down: std::sync::atomic::AtomicBool,
+    /// Fail every note of an attempt.
+    pub attempts_down: std::sync::atomic::AtomicBool,
 }
 
 impl MemoryDeletionStore {
@@ -2092,6 +2096,9 @@ impl crate::domain::deletion::DeletionStore for MemoryDeletionStore {
         key: SubjectKey,
         at: time::OffsetDateTime,
     ) -> Result<(), DomainError> {
+        if self.attempts_down.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(DomainError::Unavailable("the database is down".to_owned()));
+        }
         if self.is_marked(key) {
             self.attempts
                 .lock()
@@ -2106,6 +2113,12 @@ impl crate::domain::deletion::DeletionStore for MemoryDeletionStore {
         marked_before: time::OffsetDateTime,
         limit: u64,
     ) -> Result<Vec<SubjectKey>, DomainError> {
+        if self
+            .under_way_down
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(DomainError::Unavailable("the database is down".to_owned()));
+        }
         let attempts = self.attempts.lock().unwrap().clone();
         let mut stopped: Vec<(time::OffsetDateTime, SubjectKey)> = self
             .marks
@@ -2238,18 +2251,6 @@ impl RecordingDeletionEvents {
 impl crate::domain::deletion::DeletionEvents for RecordingDeletionEvents {
     fn record(&self, event: crate::domain::deletion::DeletionEvent) {
         self.events.lock().unwrap().push(event);
-    }
-}
-
-/// Keeps every erasure handed on.
-#[derive(Default)]
-pub struct RecordingErasures {
-    pub queued: std::sync::Mutex<Vec<SubjectKey>>,
-}
-
-impl crate::domain::erasure::ErasureQueue for RecordingErasures {
-    fn enqueue(&self, key: SubjectKey) {
-        self.queued.lock().unwrap().push(key);
     }
 }
 

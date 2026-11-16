@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use time::OffsetDateTime;
-use tokio::sync::{Semaphore, SemaphorePermit};
 use toolkit_macros::domain_model;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
@@ -234,9 +233,6 @@ pub enum Erasure {
     /// No erasure of the subject is under way: none was asked for, or
     /// another run finished it.
     NotUnderWay,
-    /// The erasure was marked so long ago that the leader's job runs it;
-    /// this run did nothing.
-    LeftToLeader,
 }
 
 /// How long after its mark an erasure waits before it removes the facts
@@ -321,18 +317,6 @@ enum Expired {
     RequestsLeftOpen,
 }
 
-/// A permit of `busy`, when there is one.
-async fn permit(busy: Option<&Semaphore>) -> Result<Option<SemaphorePermit<'_>>, DomainError> {
-    match busy {
-        None => Ok(None),
-        Some(busy) => busy
-            .acquire()
-            .await
-            .map(Some)
-            .map_err(|_| DomainError::internal("the erasure workers were closed")),
-    }
-}
-
 /// What one removal of facts left: the keys of the facts it removed, and of
 /// the subject's live facts after it.
 #[derive(Default)]
@@ -374,108 +358,49 @@ impl Deletion {
         Self { ports }
     }
 
-    /// Run the subject's erasure, when one is under way: remove its facts
-    /// and its profile root from graph storage, wait until no record checked
-    /// before the mark can still keep its identity, then remove its review
-    /// requests and record identities, move its profile generation on and
-    /// clear the mark, in one transaction. Every step can run again.
+    /// Run the subject's erasure, when one is under way. Every step can run
+    /// again; the sequence is in `erasure.md`.
     ///
-    /// NOT cancel-safe: a run dropped part way leaves the steps it did done
-    /// and the mark set; the next run does the rest.
+    /// NOT cancel-safe: a dropped run leaves the mark, and the next run does
+    /// the rest.
     ///
     /// # Errors
     ///
     /// Not configured without a processing identity; unavailable when the
-    /// profile kept changing, a write may have landed, or a write landed
-    /// after the facts were removed; otherwise the errors of the stores. The
-    /// mark stays, so the erasure runs again.
+    /// profile kept changing or a write landed after the removal; otherwise
+    /// the stores' errors. The mark stays, so the erasure runs again.
     ///
     /// @cpt-dod:cpt-cf-construct-dod-erasure-run:p1
     #[tracing::instrument(skip_all, fields(tenant_id = %key.tenant_id, subject_id = %key.subject_id))]
     pub async fn erase(&self, key: SubjectKey) -> Result<Erasure, DomainError> {
-        self.run(key, None).await
-    }
-
-    /// [`Self::erase`] for the run its request started: an erasure marked
-    /// more than `stale` ago is left to the leader's job, and a run still
-    /// going `stale` after the mark stops there, so the request's run and
-    /// the leader's do not overlap on one instance. Runs can still overlap
-    /// across instances, when a repeat request lands on another one or two
-    /// instances both think they lead; that is safe, as every step can run
-    /// again and the removals are against the profile's version.
-    ///
-    /// The graph and table steps run only while holding a permit of `busy`;
-    /// the wait after the mark holds none, so it does not keep a worker.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::erase`].
-    #[tracing::instrument(skip_all, fields(tenant_id = %key.tenant_id, subject_id = %key.subject_id))]
-    pub async fn erase_requested(
-        &self,
-        key: SubjectKey,
-        stale: Duration,
-        busy: &Semaphore,
-    ) -> Result<Erasure, DomainError> {
-        self.run(key, Some((stale, busy))).await
-    }
-
-    async fn run(
-        &self,
-        key: SubjectKey,
-        requested: Option<(Duration, &Semaphore)>,
-    ) -> Result<Erasure, DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-erasure-erase:p1:inst-erase-marked
         let (construct, scope) = self.ports.writes.construct(key.tenant_id).await?;
         let Some(mark) = self.ports.store.marked(&scope, key).await? else {
             return Ok(Erasure::NotUnderWay);
         };
-        let Some((stale, busy)) = requested else {
-            return self.steps(&construct, &scope, key, mark, None).await;
-        };
-        let left = mark
-            .at
-            .checked_add(time::Duration::try_from(stale).unwrap_or(time::Duration::MAX))
-            .map(|cut| cut - OffsetDateTime::now_utc())
-            .and_then(|left| Duration::try_from(left).ok())
-            .filter(|left| !left.is_zero());
-        let Some(left) = left else {
-            return Ok(Erasure::LeftToLeader);
-        };
         // @cpt-end:cpt-cf-construct-algo-erasure-erase:p1:inst-erase-marked
-        let steps = self.steps(&construct, &scope, key, mark, Some(busy));
-        if let Ok(done) = tokio::time::timeout(left, steps).await {
-            return done;
-        }
-        tracing::warn!("construct: an erasure ran past its time; the leader's job runs it again");
-        Ok(Erasure::LeftToLeader)
+        self.steps(&construct, &scope, key, mark).await
     }
 
     /// The steps of the erasure `mark` names, from the first removal to the
-    /// finish, the graph and table steps each under a permit of `busy` when
-    /// there is one. Every graph step stays on the generation the mark
-    /// erases: another run can finish the erasure at any point, and the
-    /// subject start a new profile in the next generation, which this run
-    /// must leave alone.
+    /// finish. Every graph step stays on the generation the mark erases:
+    /// another run can finish the erasure at any point, and the subject start
+    /// a new profile in the next generation, which this run must leave alone.
     async fn steps(
         &self,
         construct: &SecurityContext,
         scope: &AccessScope,
         key: SubjectKey,
         mark: Mark,
-        busy: Option<&Semaphore>,
     ) -> Result<Erasure, DomainError> {
+        // The root stays until the wait is over: a write admitted before the
+        // mark can still attach a fact to it, and the removal after the wait
+        // finds that fact only through the root.
+        if !self
+            .remove_every_fact(construct, key, mark.generation)
+            .await?
         {
-            let _busy = permit(busy).await?;
-            // The root stays until the wait is over: a write admitted before
-            // the mark can still attach a fact to it, and the removal after
-            // the wait finds that fact only through the root.
-            if !self
-                .remove_every_fact(construct, key, mark.generation)
-                .await?
-            {
-                return Ok(Erasure::NotUnderWay);
-            }
+            return Ok(Erasure::NotUnderWay);
         }
         // @cpt-begin:cpt-cf-construct-algo-erasure-erase:p1:inst-erase-wait
         let wait = mark
@@ -489,7 +414,6 @@ impl Deletion {
         // landed during the wait, also creating a root where there was none;
         // it goes now, before the generation moves on and nothing looks at
         // this one again.
-        let _busy = permit(busy).await?;
         // Another run may have finished this erasure during the wait, and the
         // subject started a new profile since: only the erasure this run
         // started is cleared and finished. The check saves the graph calls;
@@ -565,18 +489,15 @@ impl Deletion {
         // @cpt-end:cpt-cf-construct-algo-erasure-erase:p1:inst-erase-facts
     }
 
-    /// Remove what is past `period` in the tenant: its review requests and
-    /// record identities first, then, subject by subject, the facts stored
-    /// before the period began, closing an open review request on each as
-    /// deleted. A subject that fails is logged and left for the next run.
+    /// Remove what is past `period` in the tenant; the sequence is in
+    /// `retention.md`. A subject that fails is left for the next run.
     ///
-    /// NOT cancel-safe: a run dropped part way leaves the removals it did
-    /// done; the next run does the rest.
+    /// NOT cancel-safe: the next run does what a dropped one left.
     ///
     /// # Errors
     ///
-    /// Not configured without a processing identity; the errors of the
-    /// stores for the tenant's rows and its list of subjects.
+    /// Not configured without a processing identity; otherwise the stores'
+    /// errors for the tenant's rows and its list of subjects.
     ///
     /// @cpt-dod:cpt-cf-construct-dod-retention-job:p2
     #[tracing::instrument(skip_all, fields(%tenant_id))]
@@ -741,16 +662,9 @@ impl Deletion {
         // @cpt-end:cpt-cf-construct-algo-retention-expire:p2:inst-expire-close
     }
 
-    /// Remove every live fact of the subject that `chosen` picks, as one plan
-    /// against the profile's version: read and written again after a short
-    /// pause on a conflict, within the rerun limit and the write budget, so
-    /// a fact a write changed in between is decided again.
-    ///
-    /// With a `generation`, only a profile read in that generation is
-    /// changed: none, and nothing written, once a read finds the profile in
-    /// another one. The version a read gives names its generation, so a plan
-    /// read in one generation conflicts with a root of another and is read
-    /// again.
+    /// Remove the subject's live facts `chosen` picks, as one plan against
+    /// the profile's version, read again on a conflict. With a `generation`,
+    /// none once a read finds the profile in another generation.
     async fn remove_facts(
         &self,
         construct: &SecurityContext,

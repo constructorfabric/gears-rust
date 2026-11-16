@@ -102,16 +102,12 @@ pub struct RetentionConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct DeletionConfig {
-    /// How often, in seconds, the cluster leader runs the erasures that
-    /// stopped again.
+    /// How often, in seconds, the cluster leader runs the marked erasures.
     pub job_interval_secs: NonZeroU64,
     /// How often, in seconds, the cluster leader removes what is past the
     /// retention periods. Periods are counted in days, so far less often than
     /// the reruns: each run reads every profile of every swept tenant.
     pub retention_interval_secs: NonZeroU64,
-    /// The most erasures one instance runs the graph and table steps of at
-    /// once; any number wait out their marks meanwhile.
-    pub erasure_workers: NonZeroUsize,
 }
 
 impl Default for DeletionConfig {
@@ -119,7 +115,6 @@ impl Default for DeletionConfig {
         Self {
             job_interval_secs: NonZeroU64::new(300).unwrap_or(NonZeroU64::MIN),
             retention_interval_secs: NonZeroU64::new(3600).unwrap_or(NonZeroU64::MIN),
-            erasure_workers: NonZeroUsize::new(4).unwrap_or(NonZeroUsize::MIN),
         }
     }
 }
@@ -228,8 +223,6 @@ pub const MAX_VALUE_CHARS_LIMIT: usize = 100_000;
 pub const MAX_RETENTION_DAYS: u32 = 36_500;
 /// The shortest and the longest interval of the deletion job, in seconds.
 pub const JOB_INTERVAL_SECS: std::ops::RangeInclusive<u64> = 10..=86_400;
-/// The most erasures one instance may run at once.
-pub const MAX_ERASURE_WORKERS: usize = 64;
 
 /// A config the gear refuses to start with.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -431,12 +424,6 @@ impl ConstructConfig {
                 JOB_INTERVAL_SECS.start(),
                 JOB_INTERVAL_SECS.end(),
                 deletion.retention_interval_secs
-            )));
-        }
-        if deletion.erasure_workers.get() > MAX_ERASURE_WORKERS {
-            return Err(InvalidConfig(format!(
-                "deletion.erasure_workers must be from 1 to {MAX_ERASURE_WORKERS}, not {}",
-                deletion.erasure_workers
             )));
         }
         Ok(())
@@ -824,7 +811,6 @@ mod tests {
         assert!(config.retention.tenants.is_empty());
         assert_eq!(config.deletion.job_interval_secs.get(), 300);
         assert_eq!(config.deletion.retention_interval_secs.get(), 3600);
-        assert_eq!(config.deletion.erasure_workers.get(), 4);
     }
 
     #[test]
@@ -846,7 +832,7 @@ mod tests {
         let tenant = "8b0b4c4e-0000-4000-8000-000000000002";
         let config = parse(serde_json::json!({
             "retention": { "default_days": 365, "tenants": { tenant: 30 } },
-            "deletion": { "job_interval_secs": 60, "retention_interval_secs": 7200, "erasure_workers": 2 },
+            "deletion": { "job_interval_secs": 60, "retention_interval_secs": 7200 },
         }))
         .expect("known keys");
         assert_eq!(
@@ -863,7 +849,6 @@ mod tests {
         );
         assert_eq!(config.deletion.job_interval_secs.get(), 60);
         assert_eq!(config.deletion.retention_interval_secs.get(), 7200);
-        assert_eq!(config.deletion.erasure_workers.get(), 2);
     }
 
     #[test]
@@ -886,10 +871,6 @@ mod tests {
                 serde_json::json!({ "deletion": { "retention_interval_secs": 86_401 } }),
                 "deletion.retention_interval_secs",
             ),
-            (
-                serde_json::json!({ "deletion": { "erasure_workers": 65 } }),
-                "deletion.erasure_workers",
-            ),
         ] {
             let err = valid(json).expect_err(names);
             assert!(err.0.contains(names), "{err}");
@@ -902,7 +883,6 @@ mod tests {
             serde_json::json!({ "retention": { "tenants": { tenant: 36_500 } } }),
             serde_json::json!({ "deletion": { "job_interval_secs": 10 } }),
             serde_json::json!({ "deletion": { "job_interval_secs": 86_400 } }),
-            serde_json::json!({ "deletion": { "erasure_workers": 64 } }),
         ] {
             valid(json.clone()).unwrap_or_else(|err| panic!("{json} is valid: {err}"));
         }

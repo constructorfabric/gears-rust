@@ -15,14 +15,11 @@ use uuid::Uuid;
 use crate::api::rest::routes::register_erasure_routes;
 use crate::domain::erasure::ErasureService;
 use crate::domain::subject_settings::SubjectKey;
-use crate::test_support::{
-    AllowResolver, DenyResolver, MemoryDeletionStore, RecordingErasures, context_of,
-};
+use crate::test_support::{AllowResolver, DenyResolver, MemoryDeletionStore, context_of};
 
 struct Subject {
     key: SubjectKey,
     store: Arc<MemoryDeletionStore>,
-    queue: Arc<RecordingErasures>,
 }
 
 impl Subject {
@@ -33,7 +30,6 @@ impl Subject {
                 subject_id: Uuid::new_v4(),
             },
             store: Arc::default(),
-            queue: Arc::default(),
         }
     }
 
@@ -41,7 +37,6 @@ impl Subject {
     fn routes(&self, resolver: Arc<dyn AuthZResolverApi>, caller: Uuid) -> Router {
         let service = ErasureService::new(
             Arc::clone(&self.store) as _,
-            Arc::clone(&self.queue) as _,
             Arc::default() as Arc<crate::test_support::RecordingDeletionEvents>,
             PolicyEnforcer::new(resolver),
         );
@@ -105,7 +100,6 @@ async fn the_owner_is_answered_202_with_the_erasure_under_way_and_no_store() {
         Some("no-store")
     );
     assert!(subject.store.is_marked(subject.key));
-    assert_eq!(*subject.queue.queued.lock().unwrap(), [subject.key]);
 }
 
 #[tokio::test]
@@ -119,6 +113,5 @@ async fn another_subject_or_a_refusal_answers_404_and_marks_nothing() {
 
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
         assert!(!subject.store.is_marked(subject.key));
-        assert!(subject.queue.queued.lock().unwrap().is_empty());
     }
 }

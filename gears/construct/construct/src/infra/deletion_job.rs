@@ -1,9 +1,7 @@
-//! Where Deletion runs: the erasures the subjects ask for, on the instance
-//! that took the request, and the leader's job, which runs again every
-//! erasure that stopped and removes what is past the retention periods.
+//! Where Deletion runs: the leader's job, which runs every marked erasure
+//! until it is done and removes what is past the retention periods.
 
-use std::collections::{BTreeSet, HashMap};
-use std::num::NonZeroUsize;
+use std::collections::BTreeSet;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,33 +12,18 @@ use cluster_sdk::{
 };
 use futures::FutureExt as _;
 use time::OffsetDateTime;
-use tokio::sync::{Semaphore, mpsc};
-use tokio::task::{Id, JoinError, JoinSet};
-use tokio_retry::strategy::jitter;
+use tokio_retry::strategy::{ExponentialBackoff, jitter};
 use tokio_util::sync::CancellationToken;
 use toolkit::client_hub::ClientHub;
 use uuid::Uuid;
 
 use crate::config::DeletionConfig;
-use crate::domain::deletion::{Deletion, DeletionStore, Erasure, RetentionPeriods};
-use crate::domain::erasure::ErasureQueue;
+use crate::domain::deletion::{Deletion, DeletionStore, ERASURE_WAIT, Erasure, RetentionPeriods};
 use crate::domain::error::DomainError;
 use crate::domain::subject_settings::SubjectKey;
 use crate::infra::panics::panic_message;
 
-/// How many erasures wait for a worker on one instance; more are left to
-/// the leader's job.
-const QUEUE: usize = 1024;
-
-/// How old a mark is before the leader's job runs its erasure. A run the
-/// request started stops at this age, so the two never run it at once.
-pub const STALE: Duration = Duration::from_mins(5);
-
-// A request's own run waits out its mark, then removes the facts once more,
-// which takes as long as a write; it has that much time before it stops.
-const _: () = assert!(STALE.as_secs() >= 2 * crate::domain::deletion::ERASURE_WAIT.as_secs());
-
-/// How many stopped erasures one run of the job takes.
+/// How many marked erasures one run of the job takes.
 const BATCH: u64 = 100;
 
 /// The shortest and the longest pause before the leader election is tried
@@ -55,7 +38,7 @@ const RETRY_LONGEST: Duration = Duration::from_mins(5);
 /// is logged as an error, as the erasure stays stuck until someone fixes it.
 #[expect(
     clippy::cognitive_complexity,
-    reason = "six log lines; the tracing macros count toward the complexity"
+    reason = "five log lines; the tracing macros count toward the complexity"
 )]
 fn log_erasure(key: SubjectKey, ended: Result<Erasure, DomainError>) {
     match ended {
@@ -75,16 +58,11 @@ fn log_erasure(key: SubjectKey, ended: Result<Erasure, DomainError>) {
             subject_id = %key.subject_id,
             "construct: the erasure waits for a processing identity"
         ),
-        Ok(Erasure::LeftToLeader) => tracing::debug!(
-            tenant_id = %key.tenant_id,
-            subject_id = %key.subject_id,
-            "construct: the erasure is old enough for the leader's job to run"
-        ),
         Err(err @ (DomainError::Unavailable(_) | DomainError::Database(_))) => tracing::warn!(
             tenant_id = %key.tenant_id,
             subject_id = %key.subject_id,
             error = %err,
-            "construct: an erasure stopped; it stays marked and the leader runs it again"
+            "construct: an erasure stopped; it stays marked and the next run goes on"
         ),
         Err(err) => tracing::error!(
             tenant_id = %key.tenant_id,
@@ -125,150 +103,17 @@ fn log_retention(
     }
 }
 
-/// [`ErasureQueue`] as a bounded channel to this instance's
-/// [`ErasureWorker`].
-///
-/// @cpt-dod:cpt-cf-construct-dod-erasure-run:p1
-pub struct ChannelErasures {
-    sender: mpsc::Sender<SubjectKey>,
-}
-
-#[cfg(test)]
-impl ChannelErasures {
-    /// Whether the worker ended and let go of its end of the queue.
-    #[must_use]
-    pub fn is_closed(&self) -> bool {
-        self.sender.is_closed()
-    }
-}
-
-impl ErasureQueue for ChannelErasures {
-    fn enqueue(&self, key: SubjectKey) {
-        // @cpt-begin:cpt-cf-construct-flow-erasure-request:p1:inst-request-hand-off
-        if let Err(err) = self.sender.try_send(key) {
-            tracing::warn!(
-                tenant_id = %key.tenant_id,
-                subject_id = %key.subject_id,
-                error = %err,
-                "construct: the erasure is left to the leader's job"
-            );
-        }
-        // @cpt-end:cpt-cf-construct-flow-erasure-request:p1:inst-request-hand-off
-    }
-}
-
-/// Runs the erasures this instance took: their graph and table steps at
-/// most `workers` at once, while any number wait out their marks.
-pub struct ErasureWorker {
-    receiver: mpsc::Receiver<SubjectKey>,
-    deletion: Arc<Deletion>,
-    busy: Arc<Semaphore>,
-}
-
-/// A queue for the erasure requests and the worker that drains it.
-#[must_use]
-pub fn erasure_queue(
-    deletion: Arc<Deletion>,
-    workers: NonZeroUsize,
-) -> (ChannelErasures, ErasureWorker) {
-    let (sender, receiver) = mpsc::channel(QUEUE);
-    (
-        ChannelErasures { sender },
-        ErasureWorker {
-            receiver,
-            deletion,
-            busy: Arc::new(Semaphore::new(workers.get())),
-        },
-    )
-}
-
-/// The erasures one worker is running, by task.
-#[derive(Default)]
-struct Running {
-    tasks: JoinSet<()>,
-    keys: HashMap<Id, SubjectKey>,
-}
-
-impl Running {
-    fn holds(&self, key: SubjectKey) -> bool {
-        self.keys.values().any(|running| *running == key)
-    }
-
-    /// Note that a task ended; log it when it panicked, with its subject.
-    fn ended(&mut self, joined: Result<(Id, ()), JoinError>) {
-        match joined {
-            Ok((id, ())) => {
-                self.keys.remove(&id);
-            }
-            Err(err) => {
-                let key = self.keys.remove(&err.id());
-                if !err.is_cancelled() {
-                    tracing::error!(
-                        tenant_id = key.map(|key| key.tenant_id.to_string()),
-                        subject_id = key.map(|key| key.subject_id.to_string()),
-                        error = %err,
-                        "construct: an erasure panicked; it stays marked and the leader runs it \
-                         again"
-                    );
-                }
-            }
-        }
-    }
-}
-
-impl ErasureWorker {
-    /// Run queued erasures until `cancel` fires: up to [`QUEUE`] at once,
-    /// whose graph and table steps take turns for the workers' permits. An
-    /// erasure this worker is running already is not started twice, and one
-    /// marked longer than [`STALE`] ago is left to the leader's job.
-    ///
-    /// NOT cancel-safe for the erasures in flight: they stop where they are,
-    /// with their mark set, and the leader's job runs them again.
-    pub async fn run(mut self, cancel: CancellationToken) {
-        let mut running = Running::default();
-        loop {
-            // Room for one more first, then the next erasure.
-            if running.tasks.len() >= QUEUE {
-                tokio::select! {
-                    () = cancel.cancelled() => return,
-                    Some(joined) = running.tasks.join_next_with_id() => running.ended(joined),
-                }
-                continue;
-            }
-            let key = tokio::select! {
-                () = cancel.cancelled() => return,
-                Some(joined) = running.tasks.join_next_with_id(), if !running.tasks.is_empty() => {
-                    running.ended(joined);
-                    continue;
-                }
-                key = self.receiver.recv() => key,
-            };
-            let Some(key) = key else {
-                return;
-            };
-            if running.holds(key) {
-                continue;
-            }
-            let (deletion, busy) = (Arc::clone(&self.deletion), Arc::clone(&self.busy));
-            let task = running.tasks.spawn(async move {
-                log_erasure(key, deletion.erase_requested(key, STALE, &busy).await);
-            });
-            running.keys.insert(task.id(), key);
-        }
-    }
-}
-
-/// The leader's job: the erasures that stopped, and retention.
+/// The leader's job: the marked erasures, and retention.
 ///
 /// @cpt-dod:cpt-cf-construct-dod-retention-job:p2
 pub struct DeletionJob {
     pub deletion: Arc<Deletion>,
     pub store: Arc<dyn DeletionStore>,
     pub periods: Arc<dyn RetentionPeriods>,
-    /// How often the stopped erasures are run again.
+    /// How often the marked erasures are run.
     pub interval: Duration,
     /// How often retention runs; periods are counted in days, so far less
-    /// often than the reruns.
+    /// often than the erasures.
     pub retention_interval: Duration,
 }
 
@@ -290,37 +135,37 @@ impl DeletionJob {
         }
     }
 
-    /// One run: every erasure marked longer than [`STALE`] ago and still
+    /// One run: every erasure marked at least [`ERASURE_WAIT`] ago and still
     /// under way, up to [`BATCH`], then each tenant with a retention period.
     /// What fails is logged and left for the next run.
     pub async fn run_once(&self) {
-        self.run_stopped_erasures().await;
+        self.run_erasures().await;
         self.run_retention().await;
     }
 
-    /// Every erasure marked longer than [`STALE`] ago, up to [`BATCH`], the
-    /// longest untried first. Each attempt is noted before it runs, so an
-    /// erasure that keeps failing goes behind the others and does not hold
-    /// up the batch.
-    async fn run_stopped_erasures(&self) {
+    /// Every erasure marked at least [`ERASURE_WAIT`] ago, up to [`BATCH`],
+    /// the longest untried first. A younger one would only sleep out its
+    /// wait here and hold up the batch. Each attempt is noted before it runs,
+    /// so an erasure that keeps failing goes behind the others.
+    async fn run_erasures(&self) {
         // @cpt-begin:cpt-cf-construct-algo-erasure-rerun:p1:inst-rerun-run
-        let marked_before = OffsetDateTime::now_utc() - STALE;
+        let marked_before = OffsetDateTime::now_utc() - ERASURE_WAIT;
         match self.store.under_way(marked_before, BATCH).await {
             Ok(keys) => {
                 for key in keys {
-                    self.rerun(key).await;
+                    self.run_erasure(key).await;
                 }
             }
             Err(err) => tracing::warn!(
                 error = %err,
-                "construct: the stopped erasures could not be listed; the next run tries again"
+                "construct: the marked erasures could not be listed; the next run tries again"
             ),
         }
         // @cpt-end:cpt-cf-construct-algo-erasure-rerun:p1:inst-rerun-run
     }
 
     /// Note the attempt, then run the erasure.
-    async fn rerun(&self, key: SubjectKey) {
+    async fn run_erasure(&self, key: SubjectKey) {
         // @cpt-begin:cpt-cf-construct-algo-erasure-rerun:p1:inst-rerun-attempt
         if let Err(err) = self.store.attempted(key, OffsetDateTime::now_utc()).await {
             tracing::warn!(
@@ -386,16 +231,15 @@ impl DeletionJob {
         tenants
     }
 
-    /// Run the job until `cancel` fires: the reruns of stopped erasures every
-    /// `interval` and retention every `retention_interval`, each in a loop of
-    /// its own, so a long retention sweep does not hold off a stopped
-    /// erasure.
+    /// Run the job until `cancel` fires: the marked erasures every `interval`
+    /// and retention every `retention_interval`, each in a loop of its own,
+    /// so a long retention sweep does not hold off an erasure.
     ///
     /// NOT cancel-safe for the runs in flight: they stop where they are, and
     /// the next leader's runs go on from what is left.
     pub async fn run(self: Arc<Self>, cancel: CancellationToken) {
         tokio::join!(
-            self.every_interval(&cancel, self.interval, || self.run_stopped_erasures()),
+            self.every_interval(&cancel, self.interval, || self.run_erasures()),
             self.every_interval(&cancel, self.retention_interval, || self.run_retention()),
         );
     }
@@ -459,28 +303,24 @@ pub struct ClusterLeadership {
     hub: Arc<ClientHub>,
 }
 
-/// The pause before the next try of the leader election: doubling from
-/// [`RETRY_FIRST`] up to [`RETRY_LONGEST`], with up to as much again at
-/// random, so instances that failed together do not come back together.
-struct Backoff(Duration);
-
-impl Backoff {
-    fn new() -> Self {
-        Self(RETRY_FIRST)
-    }
-
-    fn next(&mut self) -> Duration {
-        let pause = self.0;
-        self.0 = self.0.saturating_mul(2).min(RETRY_LONGEST);
-        pause.saturating_add(jitter(pause))
-    }
+/// The pauses before the next tries of the leader election: from
+/// [`RETRY_FIRST`], doubling up to [`RETRY_LONGEST`].
+fn election_backoff() -> ExponentialBackoff {
+    // The base is raised to the power of the try, so with a base of 2 a
+    // factor of half the first pause starts there.
+    ExponentialBackoff::from_millis(2)
+        .factor(RETRY_FIRST.as_secs() * 500)
+        .max_delay(RETRY_LONGEST)
 }
 
-/// Sleep for the next pause of `backoff`; false when `cancel` fires first.
-async fn pause(backoff: &mut Backoff, cancel: &CancellationToken) -> bool {
+/// Sleep for the next pause of `backoff`, with up to as much again at random,
+/// so instances that failed together do not come back together; false when
+/// `cancel` fires first.
+async fn pause(backoff: &mut ExponentialBackoff, cancel: &CancellationToken) -> bool {
+    let pause = backoff.next().unwrap_or(RETRY_LONGEST);
     tokio::select! {
         () = cancel.cancelled() => false,
-        () = tokio::time::sleep(backoff.next()) => true,
+        () = tokio::time::sleep(pause.saturating_add(jitter(pause))) => true,
     }
 }
 
@@ -509,7 +349,7 @@ impl ClusterLeadership {
     /// The election, resolved once the cluster gear answers; none when
     /// `cancel` fires first.
     async fn election(&self, cancel: &CancellationToken) -> Option<LeaderElectionV1> {
-        let mut backoff = Backoff::new();
+        let mut backoff = election_backoff();
         loop {
             let resolving = LeaderElectionV1::resolver(&self.hub)
                 .profile(ConstructProfile)
@@ -523,8 +363,8 @@ impl ClusterLeadership {
                 Ok(election) => return Some(election),
                 Err(err) => tracing::warn!(
                     error = %err,
-                    "construct: no leader election for the deletion job; stopped erasures are \
-                     not run again and nothing is removed for retention until there is one"
+                    "construct: no leader election for the deletion job; no erasure runs and \
+                     nothing is removed for retention until there is one"
                 ),
             }
             if !pause(&mut backoff, cancel).await {
@@ -543,13 +383,12 @@ impl Leadership for ClusterLeadership {
                 tracing::warn!(
                     profile = ConstructProfile::NAME,
                     "construct: the host binds no `construct` cluster profile; the deletion job \
-                     does not run, so stopped erasures are not run again and nothing is removed \
-                     for retention"
+                     does not run, so no erasure runs and nothing is removed for retention"
                 );
             }
             return;
         }
-        let mut backoff = Backoff::new();
+        let mut backoff = election_backoff();
         loop {
             let Some(election) = self.election(&cancel).await else {
                 return;
@@ -560,7 +399,7 @@ impl Leadership for ClusterLeadership {
             };
             match watch {
                 Ok(watch) => {
-                    backoff = Backoff::new();
+                    backoff = election_backoff();
                     let job = Arc::clone(&job);
                     // Dropping the watch on shutdown stops the job it runs.
                     // The job starts when this instance gains the lead and is
@@ -595,12 +434,13 @@ impl Leadership for ClusterLeadership {
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU32;
+    use std::sync::atomic::Ordering;
 
     use serde_json::json;
 
     use super::*;
     use crate::config::RetentionConfig;
-    use crate::domain::deletion::{DeletionPorts, ERASURE_WAIT, SubjectsPage};
+    use crate::domain::deletion::{DeletionPorts, SubjectsPage};
     use crate::domain::profile::Category;
     use crate::infra::retention_periods::ConfigRetentionPeriods;
     use crate::test_support::{
@@ -663,14 +503,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_job_runs_the_stopped_erasures_but_leaves_a_fresh_one_to_its_request() {
+    async fn the_job_runs_the_erasures_past_their_wait_and_leaves_a_fresh_one_for_later() {
         let job = job();
         let fresh = SubjectKey {
             tenant_id: Uuid::new_v4(),
             subject_id: Uuid::new_v4(),
         };
         job.store
-            .mark_at(job.key, OffsetDateTime::now_utc() - STALE * 2);
+            .mark_at(job.key, OffsetDateTime::now_utc() - ERASURE_WAIT * 2);
         job.store.mark_at(fresh, OffsetDateTime::now_utc());
         let runner = DeletionJob {
             deletion: Arc::clone(&job.deletion),
@@ -684,7 +524,10 @@ mod tests {
 
         assert_eq!(job.store.finished(), [job.key]);
         assert!(job.profile.live().is_empty());
-        assert!(job.store.is_marked(fresh), "the request's own run has it");
+        assert!(
+            job.store.is_marked(fresh),
+            "a later run takes it once its wait is over"
+        );
     }
 
     #[tokio::test]
@@ -761,78 +604,6 @@ mod tests {
         }
     }
 
-    fn removed_roots(job: &Job) -> usize {
-        job.roots.calls.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn the_worker_runs_no_more_graph_steps_at_once_than_it_has_workers_and_waits_without_one()
-    {
-        let job = job();
-        let keys = [job.key, another_subject(), another_subject()];
-        for key in keys {
-            job.store.mark_at(key, OffsetDateTime::now_utc());
-        }
-        let step = Duration::from_secs(10);
-        *job.roots.takes.lock().unwrap() = step;
-        let (queue, worker) = erasure_queue(Arc::clone(&job.deletion), NonZeroUsize::MIN);
-        let cancel = CancellationToken::new();
-        let running = tokio::spawn(worker.run(cancel.clone()));
-        let started = tokio::time::Instant::now();
-
-        for key in keys {
-            queue.enqueue(key);
-        }
-        tokio::time::timeout(ERASURE_WAIT * 3, async {
-            while job.store.finished().len() < keys.len() {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .expect("every erasure finishes");
-
-        assert_eq!(
-            job.roots
-                .most_at_once
-                .load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "one worker, so one graph step at a time"
-        );
-        // Each erasure looks at its root twice, one at a time; the waits
-        // after the marks run side by side, not one after another.
-        let waited = started.elapsed();
-        assert!(
-            waited < ERASURE_WAIT + step * 6 + Duration::from_secs(1),
-            "{waited:?}"
-        );
-        cancel.cancel();
-        running.await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn the_worker_does_not_start_an_erasure_it_is_running_already() {
-        let job = job();
-        job.store.mark_at(job.key, OffsetDateTime::now_utc());
-        let (queue, worker) =
-            erasure_queue(Arc::clone(&job.deletion), NonZeroUsize::new(4).unwrap());
-        let cancel = CancellationToken::new();
-        let running = tokio::spawn(worker.run(cancel.clone()));
-
-        queue.enqueue(job.key);
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        queue.enqueue(job.key);
-        tokio::time::sleep(ERASURE_WAIT * 2).await;
-
-        assert_eq!(
-            removed_roots(&job),
-            1,
-            "one run for both requests, which removes the root after its wait"
-        );
-        assert_eq!(job.store.finished(), [job.key]);
-        cancel.cancel();
-        running.await.unwrap();
-    }
-
     /// Wait until `done` holds, for at most ten seconds.
     async fn until(what: &str, done: impl Fn() -> bool) {
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -842,38 +613,6 @@ mod tests {
         })
         .await
         .unwrap_or_else(|_| panic!("{what}"));
-    }
-
-    #[tokio::test]
-    async fn the_worker_leaves_an_erasure_marked_long_ago_to_the_leader() {
-        let job = job();
-        let fresh = another_subject();
-        job.store
-            .mark_at(job.key, OffsetDateTime::now_utc() - STALE * 2);
-        job.store
-            .mark_at(fresh, OffsetDateTime::now_utc() - ERASURE_WAIT);
-        let (queue, worker) = erasure_queue(Arc::clone(&job.deletion), NonZeroUsize::MIN);
-        let cancel = CancellationToken::new();
-        let running = tokio::spawn(worker.run(cancel.clone()));
-
-        // One worker runs them in turn, so the fresh one finishing shows the
-        // stale one's run ended.
-        queue.enqueue(job.key);
-        queue.enqueue(fresh);
-        until("the fresh erasure runs", || {
-            !job.store.finished().is_empty()
-        })
-        .await;
-        cancel.cancel();
-        running.await.unwrap();
-
-        assert_eq!(job.store.finished(), [fresh]);
-        assert_eq!(
-            removed_roots(&job),
-            1,
-            "only the fresh one's root, after its wait"
-        );
-        assert!(job.store.is_marked(job.key), "the leader's job runs it");
     }
 
     #[tokio::test]
@@ -941,46 +680,12 @@ mod tests {
     }
 
     #[test]
-    fn the_election_backoff_doubles_up_to_its_longest_with_jitter() {
-        let mut backoff = Backoff::new();
-        let pauses: Vec<Duration> = (0..10).map(|_| backoff.next()).collect();
-        assert!(pauses[0] >= RETRY_FIRST && pauses[0] <= RETRY_FIRST * 2);
-        assert!(pauses[1] >= RETRY_FIRST * 2);
-        assert!(
-            pauses
-                .iter()
-                .all(|pause| *pause <= RETRY_LONGEST.saturating_mul(2))
-        );
-        assert!(pauses[9] >= RETRY_LONGEST, "it stays at the longest");
-    }
-
-    #[tracing_test::traced_test]
-    #[tokio::test]
-    async fn an_erasure_that_panicked_can_run_again_on_the_same_worker() {
-        let job = job();
-        job.store
-            .mark_at(job.key, OffsetDateTime::now_utc() - ERASURE_WAIT);
-        job.roots
-            .panic_once
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        let (queue, worker) = erasure_queue(Arc::clone(&job.deletion), NonZeroUsize::MIN);
-        let cancel = CancellationToken::new();
-        let running = tokio::spawn(worker.run(cancel.clone()));
-
-        queue.enqueue(job.key);
-        until("the panic is logged with its subject", || {
-            logs_contain("an erasure panicked")
-        })
-        .await;
-        assert!(logs_contain(&job.key.subject_id.to_string()));
-        assert!(job.store.is_marked(job.key), "the panicked run left it");
-        queue.enqueue(job.key);
-        until("the subject is not stuck after the panic", || {
-            !job.store.finished().is_empty()
-        })
-        .await;
-        cancel.cancel();
-        running.await.unwrap();
+    fn the_election_pauses_start_at_the_first_and_double_up_to_the_longest() {
+        let pauses: Vec<u64> = election_backoff()
+            .take(9)
+            .map(|pause| pause.as_secs())
+            .collect();
+        assert_eq!(pauses, [5, 10, 20, 40, 80, 160, 300, 300, 300]);
     }
 
     #[tracing_test::traced_test]
@@ -988,7 +693,7 @@ mod tests {
     async fn a_rerun_that_panics_is_logged_and_the_next_run_finishes_the_erasure() {
         let job = job();
         job.store
-            .mark_at(job.key, OffsetDateTime::now_utc() - STALE * 2);
+            .mark_at(job.key, OffsetDateTime::now_utc() - ERASURE_WAIT * 2);
         job.roots
             .panic_once
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1085,6 +790,141 @@ mod tests {
         );
     }
 
+    /// The job over `job`'s stores with `retention`, run once a minute.
+    fn runner(job: &Job, retention: RetentionConfig) -> DeletionJob {
+        DeletionJob {
+            deletion: Arc::clone(&job.deletion),
+            store: Arc::clone(&job.store) as _,
+            periods: periods(retention),
+            interval: Duration::from_secs(60),
+            retention_interval: Duration::from_secs(60),
+        }
+    }
+
+    /// The tenants retention removed rows of, in order.
+    fn swept(job: &Job) -> Vec<Uuid> {
+        job.store
+            .expired
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(tenant, _)| *tenant)
+            .collect()
+    }
+
+    #[test]
+    fn the_job_takes_its_intervals_from_the_config() {
+        let job = job();
+        let config: DeletionConfig = serde_json::from_value(json!({
+            "job_interval_secs": 45,
+            "retention_interval_secs": 7200,
+        }))
+        .unwrap();
+
+        let built = DeletionJob::new(
+            Arc::clone(&job.deletion),
+            Arc::clone(&job.store) as _,
+            periods(RetentionConfig::default()),
+            &config,
+        );
+
+        assert_eq!(built.interval, Duration::from_secs(45));
+        assert_eq!(built.retention_interval, Duration::from_secs(7200));
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn erasures_that_cannot_be_listed_leave_retention_to_run() {
+        let job = job();
+        job.store
+            .mark_at(job.key, OffsetDateTime::now_utc() - ERASURE_WAIT * 2);
+        job.store.under_way_down.store(true, Ordering::SeqCst);
+        let days = NonZeroU32::new(30).unwrap();
+        let tenant = Uuid::new_v4();
+
+        runner(
+            &job,
+            RetentionConfig {
+                default_days: None,
+                tenants: [(tenant, days)].into(),
+            },
+        )
+        .run_once()
+        .await;
+
+        assert!(logs_contain("the marked erasures could not be listed"));
+        assert!(job.store.is_marked(job.key), "the next run takes it");
+        assert_eq!(swept(&job), [tenant]);
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn an_attempt_that_cannot_be_noted_still_runs_the_erasure() {
+        let job = job();
+        let other = another_subject();
+        job.store
+            .mark_at(job.key, OffsetDateTime::now_utc() - ERASURE_WAIT * 2);
+        job.store
+            .mark_at(other, OffsetDateTime::now_utc() - ERASURE_WAIT * 2);
+        job.store.attempts_down.store(true, Ordering::SeqCst);
+
+        runner(&job, RetentionConfig::default()).run_once().await;
+
+        assert!(logs_contain("the erasure's attempt could not be noted"));
+        let finished = job.store.finished();
+        assert_eq!(finished.len(), 2, "{finished:?}");
+        assert!(finished.contains(&job.key) && finished.contains(&other));
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_period_that_cannot_be_read_skips_only_its_tenant() {
+        let job = job();
+        let (first, second) = {
+            let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+            (a.min(b), a.max(b))
+        };
+        let runner = DeletionJob {
+            periods: Arc::new(FailsFor {
+                failing: first,
+                others: second,
+            }),
+            ..runner(&job, RetentionConfig::default())
+        };
+
+        runner.run_once().await;
+
+        assert!(logs_contain(
+            "the tenant's retention period could not be read"
+        ));
+        assert_eq!(swept(&job), [second], "the next tenant is swept");
+    }
+
+    /// Retention periods that fail for `failing` and give `others` thirty
+    /// days; both are listed.
+    struct FailsFor {
+        failing: Uuid,
+        others: Uuid,
+    }
+
+    #[async_trait]
+    impl RetentionPeriods for FailsFor {
+        async fn period(&self, tenant_id: Uuid) -> Result<Option<Duration>, DomainError> {
+            if tenant_id == self.failing {
+                return Err(DomainError::Unavailable("settings are down".to_owned()));
+            }
+            Ok(Some(Duration::from_hours(30 * 24)))
+        }
+
+        fn listed(&self) -> BTreeSet<Uuid> {
+            [self.failing, self.others].into()
+        }
+
+        fn has_default(&self) -> bool {
+            false
+        }
+    }
+
     /// Retention periods whose first read panics, then give no period.
     struct PanicsOnce {
         tenant_id: Uuid,
@@ -1135,59 +975,6 @@ mod tests {
 
         cancel.cancel();
         running.await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn the_worker_runs_no_more_erasures_at_once_than_its_queue_and_the_next_once_one_ends() {
-        let job = job();
-        let keys: Vec<SubjectKey> = (0..QUEUE).map(|_| another_subject()).collect();
-        for key in &keys {
-            job.store.mark_at(*key, OffsetDateTime::now_utc());
-        }
-        let (queue, worker) = erasure_queue(Arc::clone(&job.deletion), NonZeroUsize::MIN);
-        let cancel = CancellationToken::new();
-        let running = tokio::spawn(worker.run(cancel.clone()));
-
-        for key in &keys {
-            queue.enqueue(*key);
-        }
-        let started = || job.profile.reads.lock().unwrap().len();
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        assert_eq!(
-            started(),
-            QUEUE,
-            "each erasure read the profile once and waits out its mark"
-        );
-        let next = another_subject();
-        job.store.mark_at(next, OffsetDateTime::now_utc());
-        queue.enqueue(next);
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        assert_eq!(started(), QUEUE, "the next waits for room");
-
-        tokio::time::sleep(ERASURE_WAIT * 2).await;
-        assert!(
-            job.store.finished().contains(&next),
-            "it runs once one ended"
-        );
-        cancel.cancel();
-        running.await.unwrap();
-    }
-
-    #[tracing_test::traced_test]
-    #[tokio::test]
-    async fn a_full_queue_drops_the_erasure_for_the_leader_without_waiting() {
-        let job = job();
-        let (queue, _worker) = erasure_queue(Arc::clone(&job.deletion), NonZeroUsize::MIN);
-
-        tokio::time::timeout(Duration::from_secs(5), async {
-            for _ in 0..=QUEUE {
-                queue.enqueue(another_subject());
-            }
-        })
-        .await
-        .expect("enqueue never waits");
-
-        assert!(logs_contain("the erasure is left to the leader's job"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1271,10 +1058,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_retention_sweep_that_does_not_end_does_not_hold_off_a_stopped_erasure() {
+    async fn a_retention_sweep_that_does_not_end_does_not_hold_off_an_erasure() {
         let job = job();
         job.store
-            .mark_at(job.key, OffsetDateTime::now_utc() - STALE * 2);
+            .mark_at(job.key, OffsetDateTime::now_utc() - ERASURE_WAIT * 2);
         let runner = Arc::new(DeletionJob {
             deletion: Arc::clone(&job.deletion),
             store: Arc::clone(&job.store) as _,
@@ -1285,7 +1072,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let running = tokio::spawn(Arc::clone(&runner).run(cancel.clone()));
 
-        until("the stopped erasure runs beside the sweep", || {
+        until("the erasure runs beside the sweep", || {
             job.store.finished() == [job.key]
         })
         .await;
@@ -1429,7 +1216,7 @@ mod tests {
     async fn the_job_runs_while_this_instance_leads_and_stops_when_it_loses_the_lead() {
         let job = job();
         job.store
-            .mark_at(job.key, OffsetDateTime::now_utc() - STALE * 2);
+            .mark_at(job.key, OffsetDateTime::now_utc() - ERASURE_WAIT * 2);
         let runner = Arc::new(DeletionJob {
             deletion: Arc::clone(&job.deletion),
             store: Arc::clone(&job.store) as _,
@@ -1456,7 +1243,7 @@ mod tests {
             .send_status(cluster_sdk::LeaderStatus::Leader)
             .await
             .unwrap();
-        until("the leader runs the stopped erasure", || {
+        until("the leader runs the erasure", || {
             job.store.finished() == [job.key]
         })
         .await;
@@ -1483,8 +1270,8 @@ mod tests {
         let job = job();
         let (failing, done) = (job.key, another_subject());
         let started = OffsetDateTime::now_utc();
-        job.store.mark_at(failing, started - STALE * 3);
-        job.store.mark_at(done, started - STALE * 2);
+        job.store.mark_at(failing, started - ERASURE_WAIT * 3);
+        job.store.mark_at(done, started - ERASURE_WAIT * 2);
         job.roots
             .answers
             .lock()
@@ -1513,7 +1300,7 @@ mod tests {
         // One marked after the failing one, but never tried, now runs first:
         // it takes the next failure, and the one tried before gets through.
         let later = another_subject();
-        job.store.mark_at(later, started - STALE * 2);
+        job.store.mark_at(later, started - ERASURE_WAIT * 2);
         job.roots
             .answers
             .lock()

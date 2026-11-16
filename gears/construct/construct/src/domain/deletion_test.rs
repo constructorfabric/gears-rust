@@ -637,40 +637,6 @@ async fn an_erasure_another_run_finished_meanwhile_is_not_under_way_and_says_not
 }
 
 #[tokio::test]
-async fn the_requests_run_leaves_an_erasure_marked_long_ago_to_the_leader() {
-    let fx = Fixture::new();
-    fx.marked_long_ago();
-
-    let done = fx
-        .deletion(FixedDirectory::default())
-        .erase_requested(fx.key, WINDOW, &tokio::sync::Semaphore::new(1))
-        .await
-        .unwrap();
-
-    assert_eq!(done, Erasure::LeftToLeader);
-    assert!(fx.writer.plans().is_empty());
-    assert!(fx.store.is_marked(fx.key));
-}
-
-#[tokio::test(start_paused = true)]
-async fn the_requests_run_stops_once_its_mark_is_stale_and_leaves_the_rest_to_the_leader() {
-    let fx = Fixture::new();
-    fx.store.mark_at(fx.key, OffsetDateTime::now_utc());
-
-    // The run waits out the whole wait after the mark, past the cut.
-    let done = fx
-        .deletion(FixedDirectory::default())
-        .erase_requested(fx.key, WINDOW / 2, &tokio::sync::Semaphore::new(1))
-        .await
-        .unwrap();
-
-    assert_eq!(done, Erasure::LeftToLeader);
-    assert!(fx.profile.live().is_empty(), "what it did stays done");
-    assert!(fx.store.is_marked(fx.key));
-    assert!(fx.store.finished().is_empty(), "the leader finishes it");
-}
-
-#[tokio::test]
 async fn retention_whose_write_conflicts_decides_again_on_the_new_profile() {
     let fx = Fixture::new().conflicting(1);
 

@@ -43,7 +43,7 @@ use crate::infra::admin_facts_events::LogAdminFactsEvents;
 use crate::infra::admission_events::LogAdmissionEvents;
 use crate::infra::admission_rules::{ConfigAdmissionRules, warn_open_lists};
 use crate::infra::deletion_events::LogDeletionEvents;
-use crate::infra::deletion_job::{DeletionJob, ErasureWorker, erasure_queue};
+use crate::infra::deletion_job::DeletionJob;
 use crate::infra::intake_events::LogIntakeEvents;
 use crate::infra::model::chat_completions::{ChatCompletionsModel, ChatCompletionsSettings};
 use crate::infra::panics::panic_message;
@@ -166,8 +166,6 @@ pub struct Pipeline {
     /// Manage-facts, on the worker's processing chain; not configured when processing is not.
     pub manage: Arc<ManageFacts>,
     pub erasure: Arc<ErasureService>,
-    /// Runs the erasures this instance takes.
-    pub erasure_worker: ErasureWorker,
     /// The cluster leader's deletion job.
     pub deletion_job: Arc<DeletionJob>,
     /// The tenants' retention periods, which intake checks a record against.
@@ -369,11 +367,8 @@ pub fn assemble(
         review_events: Arc::new(LogReviewQueueEvents),
         events: Arc::clone(&deletion_events) as _,
     }));
-    let (erasures, erasure_worker) =
-        erasure_queue(Arc::clone(&runner), cfg.config().deletion.erasure_workers);
     let erasure = Arc::new(ErasureService::new(
         Arc::clone(&deletion) as _,
-        Arc::new(erasures),
         deletion_events,
         policy_enforcer.clone(),
     ));
@@ -404,7 +399,6 @@ pub fn assemble(
                 MANAGE_BUDGET,
             )),
             erasure,
-            erasure_worker,
             deletion_job,
             retention: periods,
             generations: deletion,
@@ -469,7 +463,6 @@ pub fn assemble(
         admin_facts,
         manage,
         erasure,
-        erasure_worker,
         deletion_job,
         retention: periods,
         generations: deletion,

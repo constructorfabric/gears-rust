@@ -1,13 +1,8 @@
 use sea_orm_migration::prelude::*;
 
-/// What Erasure and retention need of the tables other features made: on
-/// `construct__subject_settings`, the subject's profile generation, which an
-/// erasure moves on so that a later profile gets a new root key, when the
-/// erasure under way was marked, and when the leader's job last tried it; an
-/// index that serves retention's delete of
-/// the record identities received before a time; and `construct__tenants`,
-/// the tenants Construct has held a row for, which retention keeps sweeping
-/// after their rows are gone.
+/// Erasure and retention: the profile generation and the mark and attempt
+/// times on `construct__subject_settings`, an index on the record identities'
+/// received time, and `construct__tenants`.
 ///
 /// @cpt-dod:cpt-cf-construct-dod-erasure-storage:p1
 #[derive(DeriveMigrationName)]

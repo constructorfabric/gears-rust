@@ -29,7 +29,7 @@ use crate::domain::planner::manage::ManageFacts;
 use crate::domain::record_intake::{IntakePorts, RecordIntakeService};
 use crate::domain::subject_settings::SubjectSettingsService;
 use crate::infra::connector_switch::ConfigConnectorSwitch;
-use crate::infra::deletion_job::{ClusterLeadership, DeletionJob, ErasureWorker, Leadership};
+use crate::infra::deletion_job::{ClusterLeadership, DeletionJob, Leadership};
 use crate::infra::pipeline::{self, Worker};
 use crate::infra::processing_metrics::WorkerLoad;
 use crate::infra::record_types::RegistryRecordTypes;
@@ -61,20 +61,19 @@ pub struct ConstructGear {
     /// The processing worker, until `start` takes it.
     worker: Mutex<Option<Worker>>,
     running: Mutex<Option<Running>>,
-    /// The erasure worker and the deletion job, until `start` takes them.
+    /// The deletion job, until `start` takes it.
     deletion: Mutex<Option<DeletionTasks>>,
-    /// The started erasure worker and deletion job.
+    /// The started deletion job.
     deleting: Mutex<Option<Deleting>>,
 }
 
 /// What `start` runs for Deletion.
 struct DeletionTasks {
-    worker: ErasureWorker,
     job: Arc<DeletionJob>,
     leadership: Arc<dyn Leadership>,
 }
 
-/// The started erasure worker and deletion job, and their stop token.
+/// The started deletion job, and its stop token.
 struct Deleting {
     token: CancellationToken,
     handles: Vec<(&'static str, JoinHandle<()>)>,
@@ -197,7 +196,6 @@ impl Gear for ConstructGear {
         *self.worker.lock() = pipeline.worker;
         // @cpt-begin:cpt-cf-construct-algo-erasure-wire:p1:inst-wire-tasks
         *self.deletion.lock() = Some(DeletionTasks {
-            worker: pipeline.erasure_worker,
             job: pipeline.deletion_job,
             leadership: Arc::new(ClusterLeadership::new(Arc::clone(&hub))),
         });
@@ -313,28 +311,20 @@ impl ConstructGear {
 
 #[async_trait]
 impl RunnableCapability for ConstructGear {
-    /// Start the erasure worker and the leader's deletion job, and the
+    /// Start the leader's deletion job, and the
     /// processing of received records when it is configured.
     async fn start(&self, cancel: CancellationToken) -> anyhow::Result<()> {
         // @cpt-begin:cpt-cf-construct-algo-erasure-wire:p1:inst-wire-start
         let tasks = self.deletion.lock().take();
-        if let Some(DeletionTasks {
-            worker,
-            job,
-            leadership,
-        }) = tasks
-        {
+        if let Some(DeletionTasks { job, leadership }) = tasks {
             let token = cancel.child_token();
-            let handles = vec![
-                ("erasure worker", tokio::spawn(worker.run(token.clone()))),
-                (
-                    "deletion job",
-                    tokio::spawn({
-                        let token = token.clone();
-                        async move { leadership.lead(job, token).await }
-                    }),
-                ),
-            ];
+            let handles = vec![(
+                "deletion job",
+                tokio::spawn({
+                    let token = token.clone();
+                    async move { leadership.lead(job, token).await }
+                }),
+            )];
             *self.deleting.lock() = Some(Deleting { token, handles });
         }
         // @cpt-end:cpt-cf-construct-algo-erasure-wire:p1:inst-wire-start
@@ -360,8 +350,8 @@ impl RunnableCapability for ConstructGear {
     /// is lost, as the DESIGN says, and its identity stays, so a resend is a
     /// repeat. How many were lost is logged.
     async fn stop(&self, deadline: CancellationToken) -> anyhow::Result<()> {
-        // Erasures in flight stop with their mark set, and the deletion job
-        // stops where it is; the next run goes on from what is left.
+        // The deletion job stops where it is, an erasure in flight with its
+        // mark set; the next run goes on from what is left.
         let deleting = self.deleting.lock().take();
         let deletion_failed = match deleting {
             Some(deleting) => stop_deletion(deleting, &deadline).await,
@@ -420,9 +410,9 @@ impl RunnableCapability for ConstructGear {
     }
 }
 
-/// Cancel the erasure worker and the deletion job, wait for each until
-/// `deadline`, then abort it and wait [`ABORT_GRACE`] more. Each task that
-/// panicked or did not end is logged; the first is returned for the host.
+/// Cancel the deletion job, wait for it until `deadline`, then abort it and
+/// wait [`ABORT_GRACE`] more. Each task that panicked or did not end is
+/// logged; the first is returned for the host.
 async fn stop_deletion(
     Deleting { token, handles }: Deleting,
     deadline: &CancellationToken,

@@ -443,16 +443,11 @@ impl Leadership for FakeLeadership {
 struct DeletingGear {
     gear: ConstructGear,
     leadership: Arc<FakeLeadership>,
-    /// The erasure worker's queue, kept so the worker waits on it.
-    queue: crate::infra::deletion_job::ChannelErasures,
-    store: Arc<crate::test_support::MemoryDeletionStore>,
 }
 
 fn gear_deleting(leads: Leads) -> DeletingGear {
-    use crate::infra::deletion_job::erasure_queue;
     let store = Arc::new(crate::test_support::MemoryDeletionStore::default());
     let deletion = crate::test_support::deletion_over(Arc::clone(&store));
-    let (queue, worker) = erasure_queue(Arc::clone(&deletion), NonZeroUsize::MIN);
     let leadership = Arc::new(FakeLeadership {
         leads,
         entered: tokio::sync::Notify::new(),
@@ -460,10 +455,9 @@ fn gear_deleting(leads: Leads) -> DeletingGear {
     });
     let gear = ConstructGear::default();
     *gear.deletion.lock() = Some(DeletionTasks {
-        worker,
         job: Arc::new(DeletionJob {
             deletion,
-            store: Arc::new(crate::test_support::MemoryDeletionStore::default()),
+            store,
             periods: Arc::new(
                 crate::infra::retention_periods::ConfigRetentionPeriods::new(
                     crate::config::RetentionConfig::default(),
@@ -474,23 +468,12 @@ fn gear_deleting(leads: Leads) -> DeletingGear {
         }),
         leadership: Arc::clone(&leadership) as _,
     });
-    DeletingGear {
-        gear,
-        leadership,
-        queue,
-        store,
-    }
+    DeletingGear { gear, leadership }
 }
 
 #[tokio::test]
-async fn start_runs_the_erasure_worker_and_the_leaders_job_and_stop_ends_them() {
-    use crate::domain::erasure::ErasureQueue;
-    let DeletingGear {
-        gear,
-        leadership,
-        queue,
-        store,
-    } = gear_deleting(Leads::UntilStopped);
+async fn start_runs_the_leaders_job_and_stop_ends_it() {
+    let DeletingGear { gear, leadership } = gear_deleting(Leads::UntilStopped);
 
     gear.start(CancellationToken::new()).await.unwrap();
     tokio::time::timeout(
@@ -500,25 +483,6 @@ async fn start_runs_the_erasure_worker_and_the_leaders_job_and_stop_ends_them() 
     .await
     .expect("the leadership is entered");
     assert!(gear.deletion.lock().is_none(), "taken by start");
-    // An erasure past its wait, and not yet the leader's, runs at once.
-    let key = crate::domain::subject_settings::SubjectKey {
-        tenant_id: uuid::Uuid::new_v4(),
-        subject_id: uuid::Uuid::new_v4(),
-    };
-    store.mark_at(
-        key,
-        time::OffsetDateTime::now_utc()
-            - crate::domain::deletion::ERASURE_WAIT
-            - std::time::Duration::from_secs(1),
-    );
-    queue.enqueue(key);
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while store.finished().is_empty() {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the worker runs the queued erasure");
 
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -531,17 +495,11 @@ async fn start_runs_the_erasure_worker_and_the_leaders_job_and_stop_ends_them() 
         leadership.stopped.load(std::sync::atomic::Ordering::SeqCst),
         "the leadership saw the cancel and ended on its own"
     );
-    assert!(
-        queue.is_closed(),
-        "the worker ended and let go of its queue"
-    );
 }
 
 #[tokio::test]
 async fn a_deletion_task_that_ignores_stop_is_aborted_at_the_deadline() {
-    let DeletingGear {
-        gear, leadership, ..
-    } = gear_deleting(Leads::Forever);
+    let DeletingGear { gear, leadership } = gear_deleting(Leads::Forever);
     gear.start(CancellationToken::new()).await.unwrap();
     leadership.entered.notified().await;
     let deadline = CancellationToken::new();
@@ -556,9 +514,7 @@ async fn a_deletion_task_that_ignores_stop_is_aborted_at_the_deadline() {
 #[tracing_test::traced_test]
 #[tokio::test]
 async fn a_deletion_task_that_panicked_makes_stop_fail() {
-    let DeletingGear {
-        gear, leadership, ..
-    } = gear_deleting(Leads::Panics);
+    let DeletingGear { gear, leadership } = gear_deleting(Leads::Panics);
     gear.start(CancellationToken::new()).await.unwrap();
     leadership.entered.notified().await;
     tokio::task::yield_now().await;

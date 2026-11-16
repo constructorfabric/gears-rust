@@ -5,9 +5,12 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::domain::planner::processing::ProcessingContexts;
 
-/// The subject type on every processing context: Construct acts as its
-/// application, the subject type the platform's policy service takes beside
-/// `user`, so a policy can tell Construct's service account from a person.
+/// The subject type on every processing context. The platform's policy
+/// service takes only `user` and `application` and denies any other, so with
+/// another type every graph storage and settings call Construct makes as
+/// itself, in processing, erasure and retention, is denied. Policies grant
+/// Construct's application id, not the type, so other applications' grants
+/// do not reach it.
 pub const PROCESSING_SUBJECT_TYPE: &str = "application";
 
 /// [`ProcessingContexts`] as one configured identity, Construct's processing

@@ -1,6 +1,6 @@
 //! Erasure: the subject's request to erase everything Construct holds about
-//! it. The request marks the erasure and hands it to Deletion, which runs it
-//! in the background; a run that stopped is run again by the leader's job.
+//! it. The request marks the erasure; the leader's deletion job runs it in
+//! the background, and runs it again until it is done.
 
 use std::sync::Arc;
 
@@ -14,25 +14,17 @@ use super::deletion::{DeletionEvent, DeletionEvents, DeletionStore};
 use super::error::DomainError;
 use super::profile_read::settings_scope;
 use super::subject_access::own;
-use super::subject_settings::{SettingsWrite, SubjectKey, SubjectSettings, out_of_scope};
+use super::subject_settings::{SettingsWrite, SubjectSettings, out_of_scope};
 
 pub(crate) mod actions {
     /// The subject erases everything Construct holds about it.
     pub const ERASE: &str = "erase";
 }
 
-/// Where a marked erasure goes to be run.
-pub trait ErasureQueue: Send + Sync {
-    /// Run the subject's erasure soon. A queue that cannot take it now drops
-    /// it: the mark stays, and the leader's job runs it later.
-    fn enqueue(&self, key: SubjectKey);
-}
-
 /// The subject's erasure request, owner only.
 #[domain_model]
 pub struct ErasureService {
     store: Arc<dyn DeletionStore>,
-    queue: Arc<dyn ErasureQueue>,
     events: Arc<dyn DeletionEvents>,
     policy_enforcer: PolicyEnforcer,
 }
@@ -41,34 +33,25 @@ impl ErasureService {
     #[must_use]
     pub fn new(
         store: Arc<dyn DeletionStore>,
-        queue: Arc<dyn ErasureQueue>,
         events: Arc<dyn DeletionEvents>,
         policy_enforcer: PolicyEnforcer,
     ) -> Self {
         Self {
             store,
-            queue,
             events,
             policy_enforcer,
         }
     }
 
-    /// Erase everything about the subject, which is the caller: set its
-    /// personalization off and mark the erasure under way, so nothing is
-    /// served about it and no plan for it is stored from now on, then hand
-    /// the erasure to Deletion. A request while one is under way marks
-    /// nothing new and hands it on again. Returns the settings as they are
-    /// now.
+    /// Mark the caller's erasure under way and set its personalization off;
+    /// the leader's deletion job runs it. A repeat request keeps the mark.
     ///
-    /// cancel-safe: the mark is one write. A drop before it changes nothing;
-    /// a drop after it leaves the erasure marked, and the leader's job runs
-    /// it.
+    /// cancel-safe: the mark is one write.
     ///
     /// # Errors
     ///
-    /// [`DomainError::Forbidden`] when the caller is not the subject or the
-    /// platform refuses; [`DomainError::OutOfScope`] when the scope does not
-    /// reach the subject's settings; otherwise the errors of the store.
+    /// Forbidden when the caller is not the subject; out of scope when the
+    /// scope does not reach its settings; otherwise the store's errors.
     ///
     /// @cpt-dod:cpt-cf-construct-dod-erasure-request:p1
     #[tracing::instrument(skip_all, fields(tenant_id = %ctx.subject_tenant_id(), %subject_id))]
@@ -97,7 +80,6 @@ impl ErasureService {
             tenant_id: key.tenant_id,
             subject_id,
         });
-        self.queue.enqueue(key);
         Ok(SubjectSettings {
             personalization_enabled: false,
             erasure_in_progress: true,
