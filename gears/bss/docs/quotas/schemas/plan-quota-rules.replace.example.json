@@ -1,0 +1,23 @@
+{
+  "quota_rules": [
+    {
+      "rule_id": "5a98046b-4a1b-46fb-a031-f7b3a8876707",
+      "definition_ref": {
+        "id": "4a1e7d60-34b2-4e5b-8709-eab681e15940",
+        "version": "1",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "item_id": "db440bf6-e51e-42f3-afdc-0d9295a5932f",
+      "dimension_value": null,
+      "logical_binding_key": "compute",
+      "subject_selector": "resource_owner",
+      "amount": "10",
+      "unit_ref": "gts.cf.bss.products.quota_unit.v1~cf.bss.products.vcpu.v1",
+      "basis": "PerPlanUnit",
+      "scope_selection": {
+        "region": "region-1",
+        "resource_pool": "pool-1"
+      }
+    }
+  ]
+}
