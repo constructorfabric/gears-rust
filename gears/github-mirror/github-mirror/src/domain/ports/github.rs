@@ -562,4 +562,14 @@ pub trait GithubPort: Send + Sync {
     /// # Errors
     /// `Internal` when GitHub cannot be reached or answers something else.
     async fn rate_limit(&self) -> Result<Vec<RateLimitQuota>, DomainError>;
+
+    async fn rate_limit_for_tenant(
+        &self,
+        _tenant_id: uuid::Uuid,
+        _scope: &AccessScope,
+    ) -> Result<Vec<RateLimitQuota>, DomainError> {
+        self.rate_limit().await
+    }
+
+    fn reload_tokens(&self, _tenant_id: Option<uuid::Uuid>) {}
 }

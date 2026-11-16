@@ -45,7 +45,3 @@ api_base_url = "https://api.github.com"
 max_concurrent_syncs = 1
 max_concurrent_tasks = 4
 max_concurrent_requests = 4
-
-[gears.github-mirror.config.github_token_secret]
-tenant_id = "00000000-df51-5b42-9538-d2b56b7ee953"
-key = "github-token"

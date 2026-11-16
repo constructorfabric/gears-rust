@@ -13,12 +13,6 @@ use crate::infra::github::compression::Compression;
 pub struct GithubMirrorConfig {
     #[serde(default = "default_api_base_url")]
     pub api_base_url: String,
-    /// Where the GitHub tokens live in the credential store: one secret, or a
-    /// list of them; all are read once at init. Without any the gear syncs
-    /// unauthenticated, which works for public repositories at a much lower
-    /// rate limit.
-    #[serde(default, deserialize_with = "one_or_many")]
-    pub github_token_secret: Vec<GithubTokenSecret>,
     /// What a sync collects when the request does not say (PRD §5.4): the
     /// type's default, which leaves timeline events off until a deployment or
     /// a request turns them on (PRD §5.2).
@@ -74,8 +68,6 @@ pub struct GithubMirrorConfig {
 pub struct TenantConfig {
     #[serde(default)]
     pub cache_max_age_days: Option<NonZeroU64>,
-    #[serde(default, deserialize_with = "one_or_many")]
-    pub github_token_secret: Vec<GithubTokenSecret>,
 }
 
 /// Repositories synced at once when the config says nothing: enough to keep
@@ -100,30 +92,6 @@ fn default_max_concurrent_tasks() -> NonZeroUsize {
 /// stuck rather than to cut a healthy one short.
 fn default_sync_deadline_minutes() -> NonZeroU64 {
     NonZeroU64::new(360).unwrap_or(NonZeroU64::MIN)
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GithubTokenSecret {
-    pub tenant_id: Uuid,
-    pub key: String,
-}
-
-fn one_or_many<'de, D>(deserializer: D) -> Result<Vec<GithubTokenSecret>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum OneOrMany {
-        One(GithubTokenSecret),
-        Many(Vec<GithubTokenSecret>),
-    }
-    Ok(match Option::<OneOrMany>::deserialize(deserializer)? {
-        None => Vec::new(),
-        Some(OneOrMany::One(secret)) => vec![secret],
-        Some(OneOrMany::Many(secrets)) => secrets,
-    })
 }
 
 impl GithubMirrorConfig {
@@ -173,35 +141,7 @@ impl GithubMirrorConfig {
         }
         // A token would travel in cleartext over plain `http`. Loopback is
         // allowed so a local mock server still works without TLS.
-        let any_token = !self.github_token_secret.is_empty()
-            || self
-                .tenants
-                .values()
-                .any(|tenant| !tenant.github_token_secret.is_empty());
-        if parsed.scheme() == "http" && any_token && !is_loopback(&parsed) {
-            return Err(crate::domain::error::DomainError::Validation {
-                field: "api_base_url".to_owned(),
-                message: format!(
-                    concat!(
-                        "`{}` uses http, which would send the GitHub token in cleartext; ",
-                        "use https (or a loopback host for local testing)"
-                    ),
-                    crate::redact::redacted_word(&self.api_base_url)
-                ),
-            });
-        }
         Ok(self.api_base_url.clone())
-    }
-}
-
-/// Whether the URL points at this machine, where plain `http` carries no
-/// token over a network.
-fn is_loopback(url: &url::Url) -> bool {
-    match url.host() {
-        Some(url::Host::Domain(host)) => host == "localhost" || host.ends_with(".localhost"),
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        None => false,
     }
 }
 
@@ -209,7 +149,6 @@ impl Default for GithubMirrorConfig {
     fn default() -> Self {
         Self {
             api_base_url: default_api_base_url(),
-            github_token_secret: Vec::new(),
             scope: ScopeConfig::default(),
             cache_compression: Compression::default(),
             max_concurrent_syncs: default_max_concurrent_syncs(),

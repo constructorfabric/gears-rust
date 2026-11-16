@@ -10,12 +10,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use authn_resolver_sdk::AuthNResolverClient;
 use clap::{Parser, Subcommand};
-use credstore_sdk::{
-    CredStoreClientV1, CredStoreError, SecretRef, SecretValue, SharingMode, WritePrecondition,
-};
 use figment::Figment;
 use figment::providers::Serialized;
-use github_mirror::config::GithubTokenSecret;
 use github_mirror::domain::ports::github::ForceMode;
 use github_mirror::domain::service::{Service, SyncRequest};
 use serde_json::Value;
@@ -52,13 +48,30 @@ struct Cli {
     #[arg(
         long,
         global = true,
-        env = "GITHUB_TOKEN",
-        hide_env_values = true,
+        conflicts_with = "token_only",
         value_delimiter = ',',
         value_parser = |raw: &str| Ok::<_, std::convert::Infallible>(SecretString::new(raw)),
-        help = "GitHub token, repeat for several; falls back to GITHUB_TOKEN (comma-separated), then ~/.github-mirror/gh_token.txt (one per line)"
+        help = "Add one or more GitHub tokens to the authenticated tenant's pool; repeat or separate with commas"
     )]
     token: Vec<SecretString>,
+
+    #[arg(
+        long,
+        global = true,
+        conflicts_with = "token",
+        value_delimiter = ',',
+        value_parser = |raw: &str| Ok::<_, std::convert::Infallible>(SecretString::new(raw)),
+        help = "Replace the authenticated tenant's GitHub token pool with these tokens"
+    )]
+    token_only: Option<Vec<SecretString>>,
+
+    #[arg(
+        long,
+        global = true,
+        value_delimiter = ',',
+        help = "Optional scope notes, one per --token/--token-only value and in the same order"
+    )]
+    token_scope_note: Vec<String>,
 
     #[arg(
         long,
@@ -236,6 +249,11 @@ enum Command {
         about = "Show the GitHub token's remaining REST and GraphQL quotas"
     )]
     CheckRateLimit,
+    #[command(about = "Manage the authenticated tenant's GitHub token pool")]
+    Tokens {
+        #[command(subcommand)]
+        action: TokenCommand,
+    },
     #[command(
         name = "clear-cache",
         about = "Remove everything mirrored for a repository: its data, change-detection state and cached responses"
@@ -243,6 +261,17 @@ enum Command {
     ClearCache {
         #[arg(help = "ORG/REPO")]
         repo: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TokenCommand {
+    #[command(about = "List token fingerprints and scope notes")]
+    List,
+    #[command(about = "Remove a token by its fingerprint")]
+    Remove {
+        #[arg(help = "Full token fingerprint from `tokens list`")]
+        fingerprint: String,
     },
 }
 
@@ -254,7 +283,7 @@ impl Command {
             | Self::Query { repo, .. }
             | Self::Status { repo }
             | Self::ClearCache { repo } => Some(repo),
-            Self::CheckRateLimit => None,
+            Self::CheckRateLimit | Self::Tokens { .. } => None,
         }
     }
 }
@@ -286,10 +315,11 @@ async fn run(cli: Cli) -> Result<()> {
             "no platform token: pass --platform-token, set CF_PLATFORM_TOKEN or write ~/.github-mirror/platform_token.txt"
         )
     })?;
-    let github_tokens = config::resolve_tokens(&cli.token, "gh_token.txt");
+    let github_tokens = cli.token;
+    let github_tokens_only = cli.token_only;
+    let token_scope_notes = cli.token_scope_note;
     let loaded = config::load(
         &cli.config,
-        &github_tokens,
         StorageFlags {
             storage_dir: cli.storage_dir,
             database_url: cli.database_url,
@@ -304,6 +334,7 @@ async fn run(cli: Cli) -> Result<()> {
         | Command::Status { .. }
         | Command::CheckRateLimit
         | Command::ClearCache { .. } => OutputFormat::Table,
+        Command::Tokens { .. } => OutputFormat::Json,
     });
 
     let database_file = config::sqlite_file(&loaded.app);
@@ -313,11 +344,9 @@ async fn run(cli: Cli) -> Result<()> {
         command,
         &platform_token,
         loaded.tenant_id,
-        loaded
-            .github_token_secrets
-            .iter()
-            .zip(&github_tokens)
-            .collect(),
+        github_tokens,
+        github_tokens_only,
+        token_scope_notes,
         database_file.as_deref(),
     )
     .await;
@@ -334,7 +363,9 @@ async fn execute(
     command: Command,
     platform_token: &SecretString,
     tenant_id: Option<Uuid>,
-    github_tokens: Vec<(&GithubTokenSecret, &SecretString)>,
+    github_tokens: Vec<SecretString>,
+    github_tokens_only: Option<Vec<SecretString>>,
+    token_scope_notes: Vec<String>,
     database_file: Option<&Path>,
 ) -> Result<Value> {
     let service = runtime.service().await?;
@@ -347,8 +378,14 @@ async fn execute(
             ctx.subject_tenant_id()
         );
     }
-    for (secret, token) in github_tokens {
-        runtime.save_github_token(&ctx, secret, token).await?;
+    if let Some(tokens) = github_tokens_only {
+        let values = token_inputs(tokens, token_scope_notes)?;
+        service.replace_tokens(&ctx, &values).await?;
+    } else if !github_tokens.is_empty() {
+        let values = token_inputs(github_tokens, token_scope_notes)?;
+        service.add_tokens(&ctx, &values).await?;
+    } else if !token_scope_notes.is_empty() {
+        bail!("--token-scope-note requires --token or --token-only");
     }
     match command {
         Command::Sync {
@@ -420,7 +457,39 @@ async fn execute(
         Command::Status { repo } => commands::status(&service, &ctx, &repo, database_file).await,
         Command::ClearCache { repo } => commands::clear_cache(&service, &ctx, &repo).await,
         Command::CheckRateLimit => commands::check_rate_limit(&service, &ctx).await,
+        Command::Tokens { action } => match action {
+            TokenCommand::List => {
+                let tokens = service.list_tokens(&ctx).await?;
+                Ok(serde_json::json!({
+                    "tokens": tokens
+                        .into_iter()
+                        .map(|record| serde_json::json!({
+                            "fingerprint": record.fingerprint,
+                            "scope_note": record.scope_note,
+                        }))
+                        .collect::<Vec<_>>(),
+                }))
+            }
+            TokenCommand::Remove { fingerprint } => {
+                service.remove_token(&ctx, &fingerprint).await?;
+                Ok(serde_json::json!({ "removed": fingerprint }))
+            }
+        },
     }
+}
+
+fn token_inputs(
+    tokens: Vec<SecretString>,
+    notes: Vec<String>,
+) -> Result<Vec<(SecretString, Option<String>)>> {
+    if !notes.is_empty() && notes.len() != tokens.len() {
+        bail!("provide exactly one --token-scope-note for each token");
+    }
+    Ok(tokens
+        .into_iter()
+        .enumerate()
+        .map(|(index, token)| (token, notes.get(index).cloned()))
+        .collect())
 }
 
 fn init_logging(cli: &Cli) {
@@ -489,41 +558,6 @@ impl Runtime {
     async fn service(&self) -> Result<Arc<Service>> {
         self.wait_for(|hub| hub.try_get::<Service>().filter(|service| service.started()))
             .await
-    }
-
-    async fn save_github_token(
-        &self,
-        ctx: &SecurityContext,
-        secret: &GithubTokenSecret,
-        token: &SecretString,
-    ) -> Result<()> {
-        let credstore = self
-            .wait_for(ClientHub::try_get::<dyn CredStoreClientV1>)
-            .await?;
-        let key = SecretRef::new(secret.key.clone())?;
-        let saved = match credstore
-            .create(
-                ctx,
-                &key,
-                SecretValue::from(token.expose()),
-                SharingMode::Tenant,
-            )
-            .await
-        {
-            Err(CredStoreError::Conflict) => {
-                credstore
-                    .put(
-                        ctx,
-                        &key,
-                        SecretValue::from(token.expose()),
-                        SharingMode::Tenant,
-                        WritePrecondition::Exists,
-                    )
-                    .await
-            }
-            other => other,
-        };
-        saved.map_err(|e| anyhow!("could not save the GitHub token in the credential store: {e}"))
     }
 
     async fn stop(self) -> Result<()> {
@@ -632,7 +666,6 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let mut loaded = config::load(
             Path::new("does-not-exist.toml"),
-            &[],
             StorageFlags {
                 storage_dir: Some(home.path().to_path_buf()),
                 database_url: None,
@@ -648,7 +681,16 @@ mod tests {
         let runtime = Runtime::start(loaded.app).unwrap();
         let token = SecretString::new("platform");
         let run = |args: &'static [&'static str]| {
-            execute(&runtime, command(args), &token, None, Vec::new(), database)
+            execute(
+                &runtime,
+                command(args),
+                &token,
+                None,
+                Vec::new(),
+                None,
+                Vec::new(),
+                database,
+            )
         };
 
         let synced = run(&[

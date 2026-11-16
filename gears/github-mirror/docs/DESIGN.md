@@ -158,7 +158,7 @@ The gear is started and stopped by the framework. `stop()` cancels the pool and 
 
 - [x] `p1` - **ID**: `cpt-cf-github-mirror-constraint-one-token`
 
-`github_token_secret` names the GitHub token's secret in the credential store, or a list of secrets for several tokens; all are read on the gear's first request to GitHub and kept until a restart. Each request goes to the token with the most calls left above its reserve that is not backing off; when none is ready, it waits for the one ready soonest ([#5367](https://github.com/constructorfabric/gears-rust/issues/5367)). A token GitHub answers `401 Unauthorized` leaves the pool until a restart (the log names it only by the first 12 hex digits of its SHA-256) and the request is retried with another token; when every token has been refused, the sync fails as access lost. Access to a private repository depends on the token: a classic token's `X-OAuth-Scopes` from its first answer show whether it has `repo`, and a fine-grained or app token shows nothing until a repository answers it. So a `404` from a token not yet shown the repository in this run is checked against `GET /repos/{owner}/{name}` with that token: if GitHub hides the repository from it, the token is left out for the rest of the run and the request is retried with another one; a `404` from a token that sees the repository, or on a public one, is a real one. GraphQL, which answers a hidden repository with a partial `null`, goes to tokens already shown the repository when there are any. What a run learns starts empty for the next run, since access can change between runs. Each tenant gets its own pool, built from its `tenants.<tenant_id>.github_token_secret` (or the gear-wide list when it has none) on its first request, so a tenant's sync never sends another tenant's token; the pools share one rate-limit counter per token, so a token listed for two tenants still has one quota. All tenants' syncs share these tokens' rate limits, so a backoff on one token moves requests to the others. A token per tenant is future work. Unknown keys in the gear's config are refused at start-up, so the `github_token` key of earlier builds fails loudly instead of leaving the gear unauthenticated.
+Token pool membership is stored in `gm_token_secrets` and scoped to one tenant; the DB is the source of truth. Token values live in credstore, and only secret references, full SHA-256 fingerprints, and optional scope notes are stored in the database. For each outbound GitHub request, the gear checks the tenant's current reference set in the DB. It caches the resolved token pool and reads values from credstore only when that set changes. A successful add, replace, or remove invalidates the local tenant pool immediately; other instances observe the DB reference change on their next request. Requests use the token with the most calls left above its reserve that is not backing off; when none is ready, the client waits for the one ready soonest ([#5367](https://github.com/constructorfabric/gears-rust/issues/5367)). A token GitHub answers `401 Unauthorized` leaves the active pool until it is rebuilt, and the request is retried with another token; when every token has been refused, the sync fails as access lost. A `404` from a token not yet shown a private repository is checked against `GET /repos/{owner}/{name}` with that token; if GitHub hides the repository from it, that token is skipped for the rest of the run and the request is retried with another one. Per-token scope notes are managed alongside each tenant's references.
 
 #### Tenant Isolation in Storage
 
@@ -276,6 +276,7 @@ Response store with compression and a content hash, in `gm_http_cache` or, with 
 | `POST /sync/resume` | Re-queue repositories still `in_progress` (optionally one, `?repo=owner/name`) |
 | `GET /sessions`, `GET /sessions/{id}` | Session list and one session: status, progress, error, summary |
 | `GET /sync-status` | Per-repository run status; filter `status=in_progress\|complete` |
+| `POST /tokens`, `DELETE /tokens/{label}` | `POST` takes `{"token": "ghp_…"}`, saves it in the credential store as `github-mirror-<label>` and adds that name to the caller's tenant's token pool (`gm_token_secrets`); `DELETE` takes it out and deletes the secret. The pool is read again on the tenant's next request |
 | `GET /rate-limit` | Each pool token's GitHub quota (REST, GraphQL and the other resources), named by the first 12 hex digits of the token's SHA-256 |
 | `DELETE /cache` | Clear the caller's cached responses for `?owner=` or `?repo=owner/name`; shared public-repository entries stay, and a sync with `force=true` re-fetches them |
 | `GET /repos` | Mirrored repositories |
@@ -577,7 +578,6 @@ Configuration (`config` of the gear):
 | Setting | Default |
 |---|---|
 | `api_base_url` | `https://api.github.com` |
-| `github_token_secret` | none (`tenant_id` and `key` of the token's secret in the credential store, or a list of them; the first is used until the token pool lands) |
 | `scope` | every family except security; actions and reactions `open`, timeline `none` |
 | `cache_compression` | `gzip` |
 | `max_concurrent_syncs` | 4 |
@@ -588,7 +588,7 @@ Configuration (`config` of the gear):
 | `cache_max_age_days` | none; cached responses are kept until cleared |
 | `cache_dir` | none; cached responses go to `gm_http_cache` |
 | `tenants.<tenant_id>.cache_max_age_days` | `cache_max_age_days` |
-| `tenants.<tenant_id>.github_token_secret` | the gear-wide `github_token_secret` |
+| Token pool | managed per tenant through the token API or CLI; membership is stored in the DB and values in credstore |
 
 At the start of each sync the gear deletes the syncing tenant's `gm_http_cache` rows whose `fetched_at` is older than that tenant's `cache_max_age_days`, and the shared public-repository rows older than the gear-wide `cache_max_age_days`. A `304` does not rewrite a row, so `fetched_at` is the time of the last `200`. A delete that fails is logged and the sync goes on.
 

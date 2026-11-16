@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use async_trait::async_trait;
@@ -11,21 +10,26 @@ use toolkit::{Gear, GearCtx, Healthcheck, HealthcheckResult, RestApiCapability};
 use tracing::{info, warn};
 
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
-use credstore_sdk::{CredStoreClientV1, SecretRef};
+use credstore_sdk::{
+    CredStoreClientV1, CredStoreError, SecretRef, SecretValue, SharingMode, WritePrecondition,
+};
 use github_mirror_sdk::GithubMirrorClientV1;
 use toolkit_security::SecurityContext;
 use toolkit_utils::SecretString;
 use uuid::Uuid;
 
 use crate::api::rest::routes;
-use crate::config::{GithubMirrorConfig, GithubTokenSecret};
+use crate::config::GithubMirrorConfig;
 use crate::domain::error::DomainError;
 use crate::domain::local_client::LocalClient;
 use crate::domain::ports::github::GithubPort;
+use crate::domain::ports::token_vault::{TokenVault, vault_secret_name};
+use crate::domain::repo::TokenSecretRepository;
 use crate::domain::service::{ACTIVE_SYNC_TOUCH_EVERY, SWEEP_AGAIN_AFTER, Service, ServiceConfig};
 use crate::domain::sync::SyncPoolRunner;
 use crate::infra::github::cache::HttpCache;
 use crate::infra::github::client::{GithubClient, TokenSource};
+use crate::infra::github::rate_limit::TokenFingerprint;
 use crate::infra::storage::fs_cache::FilesystemHttpCache;
 use crate::infra::storage::sea_orm_repo::{
     SeaOrmActiveSyncRepository, SeaOrmArtifactRepository, SeaOrmBranchRepository,
@@ -39,7 +43,8 @@ use crate::infra::storage::sea_orm_repo::{
     SeaOrmRepoRepository, SeaOrmRepoSyncStatusRepository, SeaOrmReviewCommentRepository,
     SeaOrmReviewRepository, SeaOrmReviewThreadRepository, SeaOrmSyncSessionRepository,
     SeaOrmSyncWatermarkRepository, SeaOrmSyncWriter, SeaOrmTagRepository,
-    SeaOrmWorkflowJobRepository, SeaOrmWorkflowRepository, SeaOrmWorkflowRunRepository,
+    SeaOrmTokenSecretRepository, SeaOrmWorkflowJobRepository, SeaOrmWorkflowRepository,
+    SeaOrmWorkflowRunRepository,
 };
 use crate::infra::telemetry_sink::JsonlTelemetrySink;
 
@@ -49,85 +54,149 @@ const GEAR_ACTOR_ID: Uuid = uuid::uuid!("00000000-0000-cf01-0000-676d73797374");
 const SERVICE_SUBJECT_TYPE: &str = toolkit_gts::gts_id!("cf.core.security.subject_service.v1~");
 
 struct CredstoreTokens {
-    credstore: Arc<dyn CredStoreClientV1>,
-    secrets: Vec<(GithubTokenSecret, SecretRef)>,
-    tenant_secrets: HashMap<Uuid, Vec<(GithubTokenSecret, SecretRef)>>,
+    credstore: Option<Arc<dyn CredStoreClientV1>>,
+    secrets_repo: Arc<dyn TokenSecretRepository>,
 }
 
 impl CredstoreTokens {
     fn new(
         ctx: &GearCtx,
-        secrets: Vec<GithubTokenSecret>,
-        tenant_secrets: HashMap<Uuid, Vec<GithubTokenSecret>>,
+        secrets_repo: Arc<dyn TokenSecretRepository>,
     ) -> anyhow::Result<Self> {
-        let credstore = ctx
-            .client_hub()
-            .get::<dyn CredStoreClientV1>()
-            .map_err(|e| anyhow::anyhow!("failed to get the credential store: {e}"))?;
-        let tenant_secrets = tenant_secrets
-            .into_iter()
-            .map(|(tenant_id, secrets)| Ok((tenant_id, secret_refs(secrets)?)))
-            .collect::<anyhow::Result<_>>()?;
         Ok(Self {
-            credstore,
-            secrets: secret_refs(secrets)?,
-            tenant_secrets,
+            credstore: ctx.client_hub().get::<dyn CredStoreClientV1>().ok(),
+            secrets_repo,
         })
     }
 }
 
-fn secret_refs(
-    secrets: Vec<GithubTokenSecret>,
-) -> anyhow::Result<Vec<(GithubTokenSecret, SecretRef)>> {
-    secrets
-        .into_iter()
-        .map(|secret| {
-            let key = SecretRef::new(secret.key.clone())
-                .map_err(|e| anyhow::anyhow!("invalid github_token_secret key: {e}"))?;
-            Ok((secret, key))
-        })
-        .collect()
-}
-
 #[async_trait]
 impl TokenSource for CredstoreTokens {
-    async fn tokens(&self, tenant_id: Option<Uuid>) -> Result<Vec<SecretString>, DomainError> {
-        let secrets = tenant_id
-            .and_then(|tenant_id| self.tenant_secrets.get(&tenant_id))
-            .unwrap_or(&self.secrets);
-        let mut tokens = Vec::new();
-        for (secret, key) in secrets {
-            tokens.extend(
-                github_token(self.credstore.as_ref(), secret, key)
-                    .await
-                    .map_err(|e| DomainError::internal(e.to_string()))?,
-            );
+    async fn references(&self, scope: &toolkit_security::AccessScope) -> Result<Vec<String>, DomainError> {
+        Ok(self
+            .secrets_repo
+            .list(scope)
+            .await?
+            .into_iter()
+            .map(|record| record.secret_key)
+            .collect())
+    }
+
+    async fn tokens(
+        &self,
+        tenant_id: Uuid,
+        references: &[String],
+    ) -> Result<Vec<SecretString>, DomainError> {
+        if references.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(credstore) = &self.credstore else {
+            return Err(DomainError::internal(
+                "no credential store is available to read tenant GitHub tokens",
+            ));
+        };
+        let mut tokens = Vec::with_capacity(references.len());
+        for key in references {
+            match github_token(credstore.as_ref(), tenant_id, key).await {
+                Ok(Some(token)) => tokens.push(token),
+                Ok(None) => {}
+                Err(error) => warn!(%tenant_id, %key, %error, "a tenant GitHub token could not be read and was excluded from the pool"),
+            }
         }
         Ok(tokens)
     }
 }
 
+struct CredstoreVault {
+    credstore: Option<Arc<dyn CredStoreClientV1>>,
+}
+
+impl CredstoreVault {
+    fn credstore(&self) -> Result<&dyn CredStoreClientV1, DomainError> {
+        self.credstore
+            .as_deref()
+            .ok_or_else(|| DomainError::internal("no credential store to keep GitHub tokens in"))
+    }
+}
+
+#[async_trait]
+impl TokenVault for CredstoreVault {
+    async fn save(
+        &self,
+        ctx: &SecurityContext,
+        token: &SecretString,
+    ) -> Result<String, DomainError> {
+        let credstore = self.credstore()?;
+        let label = TokenFingerprint::of(token.expose()).full().to_owned();
+        let key = SecretRef::new(vault_secret_name(&label))
+            .map_err(|e| DomainError::internal(e.to_string()))?;
+        let saved = match credstore
+            .create(
+                ctx,
+                &key,
+                SecretValue::from(token.expose()),
+                SharingMode::Tenant,
+            )
+            .await
+        {
+            Err(CredStoreError::Conflict) => {
+                credstore
+                    .put(
+                        ctx,
+                        &key,
+                        SecretValue::from(token.expose()),
+                        SharingMode::Tenant,
+                        WritePrecondition::Exists,
+                    )
+                    .await
+            }
+            other => other,
+        };
+        saved.map_err(|e| {
+            DomainError::internal(format!(
+                "could not save the GitHub token in the credential store: {e}"
+            ))
+        })?;
+        Ok(label)
+    }
+
+    async fn delete(&self, ctx: &SecurityContext, label: &str) -> Result<(), DomainError> {
+        let key = SecretRef::new(vault_secret_name(label))
+            .map_err(|e| DomainError::internal(e.to_string()))?;
+        match self
+            .credstore()?
+            .delete(ctx, &key, WritePrecondition::Exists)
+            .await
+        {
+            Ok(()) | Err(CredStoreError::NotFound | CredStoreError::Conflict) => Ok(()),
+            Err(e) => Err(DomainError::internal(format!(
+                "could not delete the GitHub token from the credential store: {e}"
+            ))),
+        }
+    }
+}
+
 async fn github_token(
     credstore: &dyn CredStoreClientV1,
-    secret: &GithubTokenSecret,
-    key: &SecretRef,
+    tenant_id: Uuid,
+    name: &str,
 ) -> anyhow::Result<Option<SecretString>> {
+    let key = SecretRef::new(name.to_owned())
+        .map_err(|e| anyhow::anyhow!("invalid token secret key: {e}"))?;
     let system_ctx = SecurityContext::builder()
         .subject_id(GEAR_ACTOR_ID)
         .subject_type(SERVICE_SUBJECT_TYPE)
-        .subject_tenant_id(secret.tenant_id)
+        .subject_tenant_id(tenant_id)
         .build()?;
     let found = credstore
-        .get(&system_ctx, key)
+        .get(&system_ctx, &key)
         .await
         .map_err(|e| {
             anyhow::anyhow!("failed to read the GitHub token from the credential store: {e}")
         })?
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "the credential store has no secret `{}` for tenant {}",
-                secret.key,
-                secret.tenant_id
+                "the credential store has no secret `{name}` for tenant {tenant_id}"
             )
         })?;
     let token = std::str::from_utf8(found.value.as_bytes())
@@ -211,21 +280,14 @@ impl Gear for GithubMirrorGear {
             Some(dir) => Arc::new(FilesystemHttpCache::new(dir, cfg.cache_compression)),
             None => Arc::new(SeaOrmHttpCache::new(Arc::clone(&db), cfg.cache_compression)),
         };
+        let token_secrets: Arc<dyn TokenSecretRepository> =
+            Arc::new(SeaOrmTokenSecretRepository::new(Arc::clone(&db)));
         let client = GithubClient::with_cache(cfg.api_base_url.clone(), None, http_cache)?
             .with_max_concurrent_requests(cfg.max_concurrent_requests);
-        let tenant_secrets: HashMap<Uuid, Vec<GithubTokenSecret>> = cfg
-            .tenants
-            .iter()
-            .filter(|(_, tenant)| !tenant.github_token_secret.is_empty())
-            .map(|(tenant_id, tenant)| (*tenant_id, tenant.github_token_secret.clone()))
-            .collect();
-        if !cfg.github_token_secret.is_empty() || !tenant_secrets.is_empty() {
-            client.set_token_source(Arc::new(CredstoreTokens::new(
-                ctx,
-                cfg.github_token_secret,
-                tenant_secrets,
-            )?))?;
-        }
+        client.set_token_source(Arc::new(CredstoreTokens::new(
+            ctx,
+            Arc::clone(&token_secrets),
+        )?))?;
         let github: Arc<dyn GithubPort> = Arc::new(client);
 
         let authz = ctx
@@ -234,65 +296,71 @@ impl Gear for GithubMirrorGear {
             .map_err(|e| anyhow::anyhow!("failed to get AuthZ resolver: {e}"))?;
         let policy_enforcer = PolicyEnforcer::new(authz);
 
-        let service = Arc::new(Service::new(
-            Arc::clone(&db),
-            repo,
-            issues,
-            pull_requests,
-            commits,
-            comments,
-            review_comments,
-            reviews,
-            labels,
-            milestones,
-            releases,
-            branches,
-            contributors,
-            workflow_runs,
-            pull_request_files,
-            tags,
-            commit_files,
-            review_threads,
-            conversations,
-            commit_comments,
-            issue_events,
-            deployments,
-            artifacts,
-            workflows,
-            pull_request_commits,
-            commit_statuses,
-            workflow_jobs,
-            issue_reactions,
-            check_runs,
-            issue_timeline,
-            sync_sessions,
-            repo_sync_status,
-            Arc::new(SeaOrmActiveSyncRepository::new(Arc::clone(&db))),
-            Arc::new(SeaOrmSyncWriter::new(Arc::clone(&db))),
-            Arc::new(SeaOrmEntityFingerprintRepository::new(Arc::clone(&db))),
-            Arc::new(SeaOrmSyncWatermarkRepository::new(Arc::clone(&db))),
-            github,
-            policy_enforcer,
-            ServiceConfig {
-                api_base_url: cfg.api_base_url,
-                scope: cfg.scope,
-                max_concurrent_syncs: cfg.max_concurrent_syncs,
-                max_concurrent_tasks: cfg.max_concurrent_tasks,
-                sync_deadline: std::time::Duration::from_secs(
-                    cfg.sync_deadline_minutes.get().saturating_mul(60),
-                ),
-                telemetry_dir: cfg.telemetry_dir,
-                cache_max_age_days: cfg.cache_max_age_days,
-                tenant_cache_max_age_days: cfg
-                    .tenants
-                    .into_iter()
-                    .filter_map(|(tenant_id, tenant)| {
-                        tenant.cache_max_age_days.map(|days| (tenant_id, days))
-                    })
-                    .collect(),
-            },
-            Arc::new(JsonlTelemetrySink::start()?),
-        ));
+        let service = Arc::new(
+            Service::new(
+                Arc::clone(&db),
+                repo,
+                issues,
+                pull_requests,
+                commits,
+                comments,
+                review_comments,
+                reviews,
+                labels,
+                milestones,
+                releases,
+                branches,
+                contributors,
+                workflow_runs,
+                pull_request_files,
+                tags,
+                commit_files,
+                review_threads,
+                conversations,
+                commit_comments,
+                issue_events,
+                deployments,
+                artifacts,
+                workflows,
+                pull_request_commits,
+                commit_statuses,
+                workflow_jobs,
+                issue_reactions,
+                check_runs,
+                issue_timeline,
+                sync_sessions,
+                repo_sync_status,
+                Arc::new(SeaOrmActiveSyncRepository::new(Arc::clone(&db))),
+                token_secrets,
+                Arc::new(SeaOrmSyncWriter::new(Arc::clone(&db))),
+                Arc::new(SeaOrmEntityFingerprintRepository::new(Arc::clone(&db))),
+                Arc::new(SeaOrmSyncWatermarkRepository::new(Arc::clone(&db))),
+                github,
+                policy_enforcer,
+                ServiceConfig {
+                    api_base_url: cfg.api_base_url,
+                    scope: cfg.scope,
+                    max_concurrent_syncs: cfg.max_concurrent_syncs,
+                    max_concurrent_tasks: cfg.max_concurrent_tasks,
+                    sync_deadline: std::time::Duration::from_secs(
+                        cfg.sync_deadline_minutes.get().saturating_mul(60),
+                    ),
+                    telemetry_dir: cfg.telemetry_dir,
+                    cache_max_age_days: cfg.cache_max_age_days,
+                    tenant_cache_max_age_days: cfg
+                        .tenants
+                        .into_iter()
+                        .filter_map(|(tenant_id, tenant)| {
+                            tenant.cache_max_age_days.map(|days| (tenant_id, days))
+                        })
+                        .collect(),
+                },
+                Arc::new(JsonlTelemetrySink::start()?),
+            )
+            .with_token_vault(Arc::new(CredstoreVault {
+                credstore: ctx.client_hub().get::<dyn CredStoreClientV1>().ok(),
+            })),
+        );
 
         self.service
             .set(service.clone())
@@ -513,6 +581,6 @@ mod tests {
     fn gear_provides_all_migrations() {
         use toolkit::contracts::DatabaseCapability;
         let gear = GithubMirrorGear::default();
-        assert_eq!(gear.migrations().len(), 2);
+        assert_eq!(gear.migrations().len(), 3);
     }
 }

@@ -24,6 +24,11 @@ impl TokenFingerprint {
     pub fn short(&self) -> &str {
         &self.0[..12]
     }
+
+    #[must_use]
+    pub fn full(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Registry mapping token fingerprints to their controllers.

@@ -1209,6 +1209,37 @@ pub struct RateLimitDto {
     pub quotas: Vec<RateLimitQuotaDto>,
 }
 
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+#[schema(as = GithubMirrorTokenInputDto)]
+pub struct TokenInputDto {
+    #[schema(value_type = String)]
+    pub token: toolkit_utils::SecretString,
+    pub scope_note: Option<String>,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+#[schema(as = GithubMirrorTokenBatchDto)]
+pub struct TokenBatchDto {
+    pub tokens: Vec<TokenInputDto>,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+#[schema(as = GithubMirrorTokenDto)]
+pub struct TokenDto {
+    pub fingerprint: String,
+    pub scope_note: Option<String>,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+#[schema(as = GithubMirrorTokensDto)]
+pub struct TokensDto {
+    pub tokens: Vec<TokenDto>,
+}
+
 /// Sessions queued by one resume call.
 #[derive(Debug)]
 #[toolkit_macros::api_dto(response)]

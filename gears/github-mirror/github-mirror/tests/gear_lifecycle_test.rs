@@ -12,11 +12,17 @@ use credstore_sdk::test_util::MockCredStoreClient;
 use github_mirror::GithubMirrorGear;
 use github_mirror::domain::error::DomainError;
 use github_mirror::domain::ports::github::RateLimitQuota;
+use github_mirror::domain::ports::token_vault::vault_secret_name;
+use github_mirror::domain::repo::{TokenSecretRecord, TokenSecretRepository};
 use github_mirror::domain::service::Service;
+use github_mirror::infra::github::rate_limit::TokenFingerprint;
+use github_mirror::infra::storage::sea_orm_repo::SeaOrmTokenSecretRepository;
 use httpmock::MockServer;
 use toolkit::api::OpenApiRegistryImpl;
+use toolkit_security::AccessScope;
 use toolkit::{ClientHub, Gear, RestApiCapability};
 use tower::ServiceExt;
+use uuid::Uuid;
 
 #[tokio::test]
 async fn init_then_register_rest_serves_health_without_the_upstream_url() {
@@ -88,13 +94,31 @@ async fn register_rest_before_init_fails() {
 fn token_secret_config(api_base_url: &str) -> serde_json::Value {
     serde_json::json!({
         "config": {
-            "api_base_url": api_base_url,
-            "github_token_secret": {
-                "tenant_id": "00000000-df51-5b42-9538-d2b56b7ee953",
-                "key": "github-token"
-            }
+            "api_base_url": api_base_url
         }
     })
+}
+
+const TOKEN_TENANT_ID: Uuid = uuid::uuid!("00000000-df51-5b42-9538-d2b56b7ee953");
+
+async fn seed_token(ctx: &toolkit::GearCtx, token: &str) -> String {
+    let fingerprint = TokenFingerprint::of(token).full().to_owned();
+    let record = TokenSecretRecord {
+        fingerprint: fingerprint.clone(),
+        secret_key: vault_secret_name(&fingerprint),
+        scope_note: None,
+    };
+    let repo = SeaOrmTokenSecretRepository::new(Arc::new(
+        ctx.db_required().expect("the gear test has a database"),
+    ));
+    repo.add_many(
+        &AccessScope::for_tenant(TOKEN_TENANT_ID),
+        TOKEN_TENANT_ID,
+        &[record],
+    )
+    .await
+    .expect("the tenant token reference must be saved");
+    fingerprint
 }
 
 fn hub_with(credstore: MockCredStoreClient) -> Arc<ClientHub> {
@@ -106,17 +130,17 @@ fn hub_with(credstore: MockCredStoreClient) -> Arc<ClientHub> {
 async fn first_github_request(
     credstore: MockCredStoreClient,
     server: &MockServer,
+    token: Option<&str>,
 ) -> Result<Vec<RateLimitQuota>, DomainError> {
     let gear = GithubMirrorGear::default();
     let hub = hub_with(credstore);
-    let ctx = common::gear_ctx(
-        Arc::clone(&hub),
-        Some(token_secret_config(&server.base_url())),
-    )
-    .await;
+    let ctx = common::gear_ctx(Arc::clone(&hub), Some(token_secret_config(&server.base_url()))).await;
+    if let Some(token) = token {
+        seed_token(&ctx, token).await;
+    }
     gear.init(&ctx).await.expect("init must succeed");
     let service = hub.get::<Service>().expect("init registers the service");
-    service.rate_limit(&common::caller()).await
+    service.rate_limit(&common::caller_in(TOKEN_TENANT_ID)).await
 }
 
 fn rate_limit_body() -> serde_json::Value {
@@ -129,67 +153,29 @@ fn rate_limit_body() -> serde_json::Value {
 
 #[tokio::test]
 async fn the_first_github_request_reads_the_token_from_the_credential_store() {
+    let token = "ghp_from_credstore";
     let server = MockServer::start_async().await;
     let rate_limit = server
         .mock_async(|when, then| {
             when.method("GET")
                 .path("/rate_limit")
-                .header("authorization", "Bearer ghp_from_credstore");
+                .header("authorization", format!("Bearer {token}"));
             then.status(200).json_body(rate_limit_body());
         })
         .await;
     let credstore = MockCredStoreClient::with_secrets(vec![(
-        "github-token".to_owned(),
-        "ghp_from_credstore".to_owned(),
+        vault_secret_name(TokenFingerprint::of(token).full()),
+        token.to_owned(),
     )]);
 
-    first_github_request(credstore, &server)
+    first_github_request(credstore, &server, Some(token))
         .await
         .expect("the request must carry the token from the credential store");
     rate_limit.assert_async().await;
 }
 
 #[tokio::test]
-async fn the_first_github_request_fails_when_the_configured_secret_is_missing() {
-    let server = MockServer::start_async().await;
-
-    let message = first_github_request(MockCredStoreClient::empty(), &server)
-        .await
-        .expect_err("a configured secret that is not there must fail the request")
-        .to_string();
-    assert!(message.contains("github-token"), "{message}");
-}
-
-#[tokio::test]
-async fn the_first_github_request_fails_when_the_credential_store_cannot_be_read() {
-    let server = MockServer::start_async().await;
-
-    let message = first_github_request(MockCredStoreClient::always_failing(), &server)
-        .await
-        .expect_err("a failing credential store must fail the request")
-        .to_string();
-    assert!(message.contains("credential store"), "{message}");
-}
-
-#[tokio::test]
-async fn init_fails_when_a_secret_is_configured_but_no_credential_store_is_there() {
-    let gear = GithubMirrorGear::default();
-    let ctx = common::gear_ctx(
-        Arc::new(ClientHub::new()),
-        Some(token_secret_config("https://api.github.com")),
-    )
-    .await;
-
-    let message = gear
-        .init(&ctx)
-        .await
-        .expect_err("a configured secret without a credential store must stop init")
-        .to_string();
-    assert!(message.contains("credential store"), "{message}");
-}
-
-#[tokio::test]
-async fn an_empty_token_secret_means_an_unauthenticated_gear() {
+async fn a_missing_credstore_secret_is_skipped_and_public_requests_remain_unauthenticated() {
     let server = MockServer::start_async().await;
     let rate_limit = server
         .mock_async(|when, then| {
@@ -199,10 +185,47 @@ async fn an_empty_token_secret_means_an_unauthenticated_gear() {
             then.status(200).json_body(rate_limit_body());
         })
         .await;
-    let credstore =
-        MockCredStoreClient::with_secrets(vec![("github-token".to_owned(), String::new())]);
 
-    first_github_request(credstore, &server)
+    first_github_request(MockCredStoreClient::empty(), &server, Some("ghp_missing"))
+        .await
+        .expect("a missing token must not block public unauthenticated requests");
+    rate_limit.assert_async().await;
+}
+
+#[tokio::test]
+async fn an_unreadable_credstore_secret_is_skipped_for_public_requests() {
+    let server = MockServer::start_async().await;
+    let rate_limit = server
+        .mock_async(|when, then| {
+            when.method("GET")
+                .path("/rate_limit")
+                .header_missing("authorization");
+            then.status(200).json_body(rate_limit_body());
+        })
+        .await;
+
+    first_github_request(
+        MockCredStoreClient::always_failing(),
+        &server,
+        Some("ghp_unreadable"),
+    )
+        .await
+        .expect("a failed token lookup must leave public requests unauthenticated");
+    rate_limit.assert_async().await;
+}
+
+#[tokio::test]
+async fn an_empty_database_pool_starts_without_a_credential_store() {
+    let server = MockServer::start_async().await;
+    let rate_limit = server
+        .mock_async(|when, then| {
+            when.method("GET")
+                .path("/rate_limit")
+                .header_missing("authorization");
+            then.status(200).json_body(rate_limit_body());
+        })
+        .await;
+    first_github_request(MockCredStoreClient::empty(), &server, None)
         .await
         .expect("an empty token must leave the gear unauthenticated, not fail it");
     rate_limit.assert_async().await;

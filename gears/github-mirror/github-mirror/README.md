@@ -73,22 +73,18 @@ gears:
   github-mirror:
     config:
       api_base_url: https://api.github.com
-      github_token_secret:
-        tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
-        key: "github-token"
 ```
 
-All keys are optional — `api_base_url` falls back to the public GitHub API and without
-`github_token_secret` the gear syncs unauthenticated (public repositories only, at
-GitHub's anonymous rate limit).
+`api_base_url` falls back to the public GitHub API. Token pool membership is stored in
+the gear database and is always scoped to the authenticated tenant. Token values are
+stored in the credential store; config files do not define tokens.
 
-`github_token_secret` names a secret in the credential store (`credstore` gear), or a
-list of secrets for several tokens: the gear reads them on its first request to GitHub, so
-a replaced token takes effect after a restart. Each request goes to the token with the
-most calls left (#5367). It is a
-single gear-wide credential: every tenant's sync authenticates to GitHub with it, so
-don't point one deployment's token at repositories whose visibility should differ per
-tenant.
+The API provides `GET`, `POST`, `PUT`, and `DELETE /github-mirror/v1/tokens` for listing,
+adding, replacing, and removing tokens. CLI token management uses `--token` to add and
+`--token-only` to replace; `tokens list` and `tokens remove <fingerprint>` inspect and
+remove entries. Both interfaces use the same tenant-scoped service operations. The gear
+checks the tenant's DB references when selecting a pool and reads token values from the
+credential store only when that reference set changes.
 
 ## Documentation
 

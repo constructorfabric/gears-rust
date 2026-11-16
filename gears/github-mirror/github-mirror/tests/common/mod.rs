@@ -35,8 +35,8 @@ use github_mirror::infra::storage::sea_orm_repo::{
     SeaOrmPullRequestRepository, SeaOrmReleaseRepository, SeaOrmRepoRepository,
     SeaOrmRepoSyncStatusRepository, SeaOrmReviewCommentRepository, SeaOrmReviewRepository,
     SeaOrmReviewThreadRepository, SeaOrmSyncSessionRepository, SeaOrmSyncWatermarkRepository,
-    SeaOrmSyncWriter, SeaOrmTagRepository, SeaOrmWorkflowJobRepository, SeaOrmWorkflowRepository,
-    SeaOrmWorkflowRunRepository,
+    SeaOrmSyncWriter, SeaOrmTagRepository, SeaOrmTokenSecretRepository,
+    SeaOrmWorkflowJobRepository, SeaOrmWorkflowRepository, SeaOrmWorkflowRunRepository,
 };
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit::{ClientHub, ConfigProvider, GearCtx};
@@ -572,6 +572,7 @@ pub fn service_with_deadline(
         Arc::new(SeaOrmSyncSessionRepository::new(Arc::clone(&db))),
         Arc::new(SeaOrmRepoSyncStatusRepository::new(Arc::clone(&db))),
         Arc::new(SeaOrmActiveSyncRepository::new(Arc::clone(&db))),
+        Arc::new(SeaOrmTokenSecretRepository::new(Arc::clone(&db))),
         Arc::new(SeaOrmSyncWriter::new(Arc::clone(&db))),
         Arc::new(SeaOrmEntityFingerprintRepository::new(Arc::clone(&db))),
         Arc::new(SeaOrmSyncWatermarkRepository::new(Arc::clone(&db))),

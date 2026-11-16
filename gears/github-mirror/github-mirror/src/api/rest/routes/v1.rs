@@ -236,6 +236,82 @@ fn register_session_routes(mut router: Router, openapi: &dyn OpenApiRegistry) ->
         .error_500(openapi)
         .register(router, openapi);
 
+    router = OperationBuilder::get("/github-mirror/v1/tokens")
+        .operation_id("github_mirror.v1.list_tokens")
+        .summary("List the caller tenant's token fingerprints and scope notes")
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .handler(handlers::list_tokens)
+        .json_response_with_schema::<dto::TokensDto>(
+            openapi,
+            StatusCode::OK,
+            "Tenant token fingerprints and scope annotations; token values are never returned",
+        )
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::post("/github-mirror/v1/tokens")
+        .operation_id("github_mirror.v1.add_tokens")
+        .summary("Save and add one or more GitHub tokens to the caller tenant's pool")
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .json_request::<dto::TokenBatchDto>(openapi, "Tokens and optional per-token scope notes")
+        .handler(handlers::add_tokens)
+        .json_response_with_schema::<dto::TokensDto>(
+            openapi,
+            StatusCode::OK,
+            "The tenant pool after idempotently adding the submitted tokens",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::put("/github-mirror/v1/tokens")
+        .operation_id("github_mirror.v1.replace_tokens")
+        .summary("Replace the caller tenant's GitHub token pool")
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .json_request::<dto::TokenBatchDto>(openapi, "The complete replacement token pool; an empty list clears it")
+        .handler(handlers::replace_tokens)
+        .json_response_with_schema::<dto::TokensDto>(
+            openapi,
+            StatusCode::OK,
+            "The replaced tenant pool; token values are never returned",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::delete("/github-mirror/v1/tokens/{fingerprint}")
+        .operation_id("github_mirror.v1.remove_token")
+        .summary("Remove one token from the caller tenant's pool")
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param(
+            "fingerprint",
+            "The token fingerprint returned by GET or POST /tokens",
+        )
+        .handler(handlers::remove_token)
+        .no_content_response(
+            StatusCode::NO_CONTENT,
+            "The token is out of the pool and the credential store",
+        )
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
     router = OperationBuilder::get("/github-mirror/v1/sessions")
         .operation_id("github_mirror.v1.list_sync_sessions")
         .summary("List sync sessions, newest first")

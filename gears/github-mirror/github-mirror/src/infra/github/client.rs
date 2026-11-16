@@ -394,11 +394,21 @@ fn cache_partition(options: &FetchOptions) -> (AccessScope, uuid::Uuid) {
 /// Where the client gets its GitHub tokens the first time it needs them.
 #[async_trait]
 pub(crate) trait TokenSource: Send + Sync {
-    async fn tokens(&self, tenant_id: Option<uuid::Uuid>)
-    -> Result<Vec<SecretString>, DomainError>;
+    async fn references(&self, scope: &AccessScope) -> Result<Vec<String>, DomainError>;
+
+    async fn tokens(
+        &self,
+        tenant_id: uuid::Uuid,
+        references: &[String],
+    ) -> Result<Vec<SecretString>, DomainError>;
 }
 
-type TenantPools = HashMap<Option<uuid::Uuid>, Arc<tokio::sync::OnceCell<Arc<TokenPool>>>>;
+struct BuiltPool {
+    references: Option<Vec<String>>,
+    pool: Arc<TokenPool>,
+}
+
+type TenantPools = HashMap<Option<uuid::Uuid>, BuiltPool>;
 
 fn token_pool(
     http: &reqwest::Client,
@@ -531,9 +541,6 @@ impl GithubClient {
 
     /// Read the tokens from `source` on the first GitHub request instead of fixed ones.
     pub(crate) fn set_token_source(&self, source: Arc<dyn TokenSource>) -> Result<(), DomainError> {
-        let parsed = url::Url::parse(&self.api_base_url)
-            .map_err(|e| DomainError::internal(format!("invalid GitHub API base URL: {e}")))?;
-        refuse_cleartext(&self.api_base_url, &parsed)?;
         self.token_source
             .set(source)
             .map_err(|_| DomainError::internal("the GitHub client already has a token source"))
@@ -605,28 +612,55 @@ impl GithubClient {
         Ok(Some(quotas))
     }
 
-    async fn pool(&self, tenant_id: Option<uuid::Uuid>) -> Result<Arc<TokenPool>, DomainError> {
-        let cell = Arc::clone(
-            self.pools
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .entry(tenant_id)
-                .or_default(),
-        );
-        cell.get_or_try_init(|| async {
-            let tokens = match self.token_source.get() {
-                Some(source) => source.tokens(tenant_id).await?,
-                None => self.tokens.clone(),
-            };
-            Ok(Arc::new(token_pool(
-                &self.http,
-                &self.api_base_url,
-                &self.registry,
-                tokens,
-            )))
-        })
-        .await
-        .map(Arc::clone)
+    async fn build_or_get_pool(
+        &self,
+        tenant_id: Option<uuid::Uuid>,
+        scope: &AccessScope,
+    ) -> Result<Arc<TokenPool>, DomainError> {
+        let source = self.token_source.get();
+        let tenant_references = match (source, tenant_id) {
+            (Some(source), Some(_)) => Some(source.references(scope).await?),
+            (Some(_), None) => Some(Vec::new()),
+            (None, _) => None,
+        };
+        {
+            let pools = self.pools.lock().unwrap_or_else(PoisonError::into_inner);
+            // Reuse the tenant's pool while its secret names are unchanged.
+            if let Some(built) = pools.get(&tenant_id)
+                && built.references == tenant_references
+            {
+                return Ok(Arc::clone(&built.pool));
+            }
+        }
+        let tokens = match (source, tenant_id, tenant_references.as_deref()) {
+            (Some(source), Some(tenant_id), Some(references)) => {
+                source.tokens(tenant_id, references).await?
+            }
+            (Some(_), _, _) => Vec::new(),
+            (None, _, _) => self.tokens.clone(),
+        };
+        if !tokens.is_empty() {
+            let parsed = url::Url::parse(&self.api_base_url)
+                .map_err(|e| DomainError::internal(format!("invalid GitHub API base URL: {e}")))?;
+            refuse_cleartext(&self.api_base_url, &parsed)?;
+        }
+        let pool = Arc::new(token_pool(
+            &self.http,
+            &self.api_base_url,
+            &self.registry,
+            tokens,
+        ));
+        self.pools
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                tenant_id,
+                BuiltPool {
+                    references: tenant_references,
+                    pool: Arc::clone(&pool),
+                },
+            );
+        Ok(pool)
     }
 
     #[must_use]
@@ -661,7 +695,9 @@ impl GithubClient {
     ) -> Result<(Admission, SemaphorePermit<'_>), DomainError> {
         let telemetry = &options.telemetry;
         let cancel = &options.cancel;
-        let pool = self.pool(Some(options.tenant_id)).await?;
+        let pool = self
+            .build_or_get_pool(Some(options.tenant_id), &options.access_scope)
+            .await?;
         loop {
             let picked = pool
                 .pick(
@@ -829,7 +865,9 @@ impl GithubClient {
                  this run leaves the token out for that repository"
             );
         }
-        self.pool(Some(options.tenant_id)).await.is_ok_and(|pool| {
+        self.build_or_get_pool(Some(options.tenant_id), &options.access_scope)
+            .await
+            .is_ok_and(|pool| {
             pool.iter().any(|other| {
                 !other.is_dropped()
                     && other
@@ -3866,10 +3904,38 @@ impl GithubPort for GithubClient {
         self.cache.expire(scope, tenant_id, fetched_before).await
     }
 
+    fn reload_tokens(&self, tenant_id: Option<uuid::Uuid>) {
+        let mut pools = self.pools.lock().unwrap_or_else(PoisonError::into_inner);
+        if tenant_id.is_some() {
+            pools.remove(&tenant_id);
+        } else {
+            pools.clear();
+        }
+    }
+
     async fn rate_limit(&self) -> Result<Vec<RateLimitQuota>, DomainError> {
+        self.rate_limit_pool(self.build_or_get_pool(None, &AccessScope::allow_all()).await?)
+            .await
+    }
+
+    async fn rate_limit_for_tenant(
+        &self,
+        tenant_id: uuid::Uuid,
+        scope: &AccessScope,
+    ) -> Result<Vec<RateLimitQuota>, DomainError> {
+        self.rate_limit_pool(self.build_or_get_pool(Some(tenant_id), scope).await?)
+            .await
+    }
+}
+
+impl GithubClient {
+    async fn rate_limit_pool(
+        &self,
+        pool: Arc<TokenPool>,
+    ) -> Result<Vec<RateLimitQuota>, DomainError> {
         let mut quotas = Vec::new();
         let mut answered = false;
-        for pooled in self.pool(None).await?.iter() {
+        for pooled in pool.iter() {
             if let Some(token_quotas) = self.token_rate_limit(pooled).await? {
                 answered = true;
                 quotas.extend(token_quotas);
