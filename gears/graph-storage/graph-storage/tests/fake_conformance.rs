@@ -741,3 +741,9 @@ async fn overlapping_batches_all_land() {
 async fn a_count_agrees_with_the_listing() {
     conformance::a_count_agrees_with_the_listing(&store(), Uuid::now_v7()).await;
 }
+
+#[tokio::test]
+async fn a_key_carried_twice_is_written_twice_in_request_order() {
+    conformance::a_key_carried_twice_is_written_twice_in_request_order(&store(), Uuid::now_v7())
+        .await;
+}
