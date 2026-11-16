@@ -1,15 +1,13 @@
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use sea_orm::sea_query::{Expr, ExprTrait, Func};
-use sea_orm::{
-    ActiveValue, ColumnTrait, Condition, EntityTrait, FromQueryResult, QuerySelect, SqlErr,
-};
+use sea_orm::{ActiveValue, ColumnTrait, Condition, EntityTrait, FromQueryResult, QuerySelect};
 use time::OffsetDateTime;
 use toolkit_db::DBProvider;
 use toolkit_db::secure::{
-    DBRunner, ScopeError, SecureDeleteExt, SecureEntityExt, SecureInsertExt, SecureUpdateExt,
+    DBRunner, SecureDeleteExt, SecureEntityExt, SecureInsertExt, SecureUpdateExt,
 };
 use toolkit_security::AccessScope;
 use uuid::Uuid;
@@ -33,7 +31,9 @@ use super::tenants_entity::{self as tenants, Entity as TenantEntity};
 pub struct DeletionTables {
     db: Arc<DbProvider>,
     /// The tenants this instance noted already, so an add notes each once.
-    noted: parking_lot::Mutex<BTreeSet<Uuid>>,
+    /// Only a cache: a panic while it was held leaves a set that is still
+    /// right, so a poisoned lock is taken as it is.
+    noted: Mutex<BTreeSet<Uuid>>,
 }
 
 impl DeletionTables {
@@ -41,7 +41,7 @@ impl DeletionTables {
     pub fn new(db: Arc<DbProvider>) -> Self {
         Self {
             db,
-            noted: parking_lot::Mutex::default(),
+            noted: Mutex::default(),
         }
     }
 }
@@ -65,7 +65,7 @@ async fn insert_tenant(
         .await
     {
         Ok(_) => Ok(()),
-        Err(err) if is_unique_violation(&err) => Ok(()),
+        Err(err) if err.is_unique_violation() => Ok(()),
         Err(err) => Err(map_scope_error(err)),
     }
 }
@@ -73,12 +73,20 @@ async fn insert_tenant(
 #[async_trait]
 impl KnownTenants for DeletionTables {
     async fn note(&self, tenant_id: Uuid) -> Result<(), DomainError> {
-        if self.noted.lock().contains(&tenant_id) {
+        if self
+            .noted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&tenant_id)
+        {
             return Ok(());
         }
         let conn = self.db.conn().map_err(DomainError::from)?;
         insert_tenant(&conn, tenant_id, OffsetDateTime::now_utc()).await?;
-        self.noted.lock().insert(tenant_id);
+        self.noted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(tenant_id);
         Ok(())
     }
 }
@@ -102,13 +110,6 @@ async fn row<C: DBRunner>(
         .one(conn)
         .await
         .map_err(map_scope_error)
-}
-
-fn is_unique_violation(err: &ScopeError) -> bool {
-    matches!(
-        err,
-        ScopeError::Db(db) if matches!(db.sql_err(), Some(SqlErr::UniqueConstraintViolation(_)))
-    )
 }
 
 #[derive(FromQueryResult)]
@@ -159,7 +160,7 @@ impl DeletionStore for DeletionTables {
             .await;
         match inserted {
             Ok(_) => return Ok(SettingsWrite::Written),
-            Err(err) if !is_unique_violation(&err) => return Err(map_scope_error(err)),
+            Err(err) if !err.is_unique_violation() => return Err(map_scope_error(err)),
             Err(_) => {}
         }
         SubjectSettingsEntity::update_many()

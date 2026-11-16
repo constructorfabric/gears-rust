@@ -1,7 +1,7 @@
 use async_trait::async_trait;
-use sea_orm::{ActiveValue, EntityTrait, SqlErr};
+use sea_orm::{ActiveValue, EntityTrait};
 use time::OffsetDateTime;
-use toolkit_db::secure::{DBRunner, ScopeError, SecureInsertExt};
+use toolkit_db::secure::{DBRunner, SecureInsertExt};
 use toolkit_security::AccessScope;
 
 use crate::domain::error::DomainError;
@@ -20,13 +20,6 @@ impl SeaOrmRecordIdRepository {
     pub fn new() -> Self {
         Self
     }
-}
-
-fn is_unique_violation(err: &ScopeError) -> bool {
-    matches!(
-        err,
-        ScopeError::Db(db) if matches!(db.sql_err(), Some(SqlErr::UniqueConstraintViolation(_)))
-    )
 }
 
 #[async_trait]
@@ -57,7 +50,7 @@ impl RecordIdRepository for SeaOrmRecordIdRepository {
         match inserted {
             Ok(_) => Ok(IdInsert::Inserted),
             // @cpt-begin:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-repeat
-            Err(err) if is_unique_violation(&err) => Ok(IdInsert::AlreadyThere),
+            Err(err) if err.is_unique_violation() => Ok(IdInsert::AlreadyThere),
             // @cpt-end:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-repeat
             Err(err) => Err(map_scope_error(err)),
         }
