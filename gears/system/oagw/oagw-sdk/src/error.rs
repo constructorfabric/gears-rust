@@ -89,8 +89,9 @@ pub enum ServiceGatewayError {
     // ─── Retryable transient ──────────────────────────────────────────
     /// Rate limit exceeded. Backoff and retry.
     ///
-    /// `retry_after_secs` carries the per-violation retry hint when the
-    /// gateway knows when capacity returns (e.g. token-bucket refill window).
+    /// `retry_after_secs` carries the retry hint when the gateway knows when
+    /// capacity returns (e.g. token-bucket refill window): the largest
+    /// per-violation hint, the same value as the wire `Retry-After` header.
     /// It is `None` when the upstream rate-limit middleware did not attach
     /// one to the canonical `QuotaViolation`.
     #[error("rate limit exceeded")]
@@ -247,14 +248,14 @@ impl From<CanonicalError> for ServiceGatewayError {
             // OAGW only emits ResourceExhausted with subject=quota::RATE_LIMIT
             // today. If the impl ever emits a different subject, the
             // projection will silently misrepresent it — revisit then.
-            CanonicalError::ResourceExhausted { ctx, .. } => Self::RateLimited {
-                retry_after_secs: ctx.violations.first().and_then(|v| v.retry_after_seconds),
+            CanonicalError::ResourceExhausted { .. } => Self::RateLimited {
+                retry_after_secs: err.retry_after_seconds(),
             },
 
             CanonicalError::DeadlineExceeded { .. } => Self::Timeout,
 
-            CanonicalError::ServiceUnavailable { ctx, .. } => Self::Unavailable {
-                retry_after_secs: ctx.retry_after_seconds,
+            CanonicalError::ServiceUnavailable { .. } => Self::Unavailable {
+                retry_after_secs: err.retry_after_seconds(),
             },
 
             CanonicalError::Unauthenticated { ctx, .. } => Self::AuthFailed {
@@ -554,6 +555,23 @@ mod projection_tests {
                 retry_after_secs: None,
             } => {}
             other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resource_exhausted_projects_largest_violation_retry_after() {
+        // Same rule as the wire `Retry-After` header: the largest hint wins.
+        let canonical = ProxyScope::resource_exhausted("rate limit exceeded")
+            .with_quota_violation(crate::quota::RATE_LIMIT, "per-second limit exceeded")
+            .with_quota_violation_retry_after_seconds(1)
+            .with_quota_violation(crate::quota::RATE_LIMIT, "per-minute limit exceeded")
+            .with_quota_violation_retry_after_seconds(40)
+            .create();
+        match ServiceGatewayError::from(canonical) {
+            ServiceGatewayError::RateLimited {
+                retry_after_secs: Some(40),
+            } => {}
+            other => panic!("expected RateLimited with retry=40, got {other:?}"),
         }
     }
 

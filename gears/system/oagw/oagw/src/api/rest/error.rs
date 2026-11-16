@@ -248,10 +248,20 @@ impl From<DomainError> for CanonicalError {
                     .create()
             }
 
-            DomainError::RateLimitExceeded { detail, .. } => {
-                OagwProxyError::resource_exhausted(detail.clone())
-                    .with_quota_violation(quota::RATE_LIMIT, detail)
-                    .create()
+            // The limiter's retry hint rides on the quota violation, so the
+            // wire `Retry-After` header (set by `Problem::into_response`) and
+            // the SDK's `RateLimited { retry_after_secs }` carry the same value.
+            DomainError::RateLimitExceeded {
+                detail,
+                retry_after_secs,
+                ..
+            } => {
+                let mut builder = OagwProxyError::resource_exhausted(detail.clone())
+                    .with_quota_violation(quota::RATE_LIMIT, detail);
+                if let Some(secs) = retry_after_secs {
+                    builder = builder.with_quota_violation_retry_after_seconds(secs);
+                }
+                builder.create()
             }
 
             DomainError::SecretNotFound { detail, .. } => {
@@ -524,9 +534,10 @@ pub(crate) fn domain_error_to_problem(err: DomainError, instance: &str) -> Probl
 /// `x-oagw-error-source: gateway` header. Used by the proxy data-plane.
 ///
 /// Rate-limit metadata (when present in `DomainError::RateLimitExceeded`)
-/// is converted into wire headers (`Retry-After`, `X-RateLimit-*`) and the
-/// detail is sanitised to avoid leaking internal key structure (resource
-/// IDs, tenant IDs, scope) in the body.
+/// is converted into `X-RateLimit-*` wire headers and the detail is
+/// sanitised to avoid leaking internal key structure (resource IDs, tenant
+/// IDs, scope) in the body. `Retry-After` comes from the quota violation's
+/// retry hint via `Problem::into_response`.
 ///
 /// `instance` / `trace_id` are NOT set here — the canonical error
 /// middleware (`toolkit::api::canonical_error_middleware`) injects them on
@@ -534,12 +545,11 @@ pub(crate) fn domain_error_to_problem(err: DomainError, instance: &str) -> Probl
 pub fn error_response(err: DomainError) -> Response {
     let rate_limit_meta = match &err {
         DomainError::RateLimitExceeded {
-            retry_after_secs,
             limit,
             remaining,
             reset_epoch,
             ..
-        } => Some((*retry_after_secs, *limit, *remaining, *reset_epoch)),
+        } => Some((*limit, *remaining, *reset_epoch)),
         _ => None,
     };
 
@@ -559,12 +569,9 @@ pub fn error_response(err: DomainError) -> Response {
         HeaderValue::from_static(ErrorSource::Gateway.as_str()),
     );
 
-    if let Some((retry_after_secs, limit, remaining, reset_epoch)) = rate_limit_meta {
-        if let Some(secs) = retry_after_secs
-            && let Ok(v) = secs.to_string().parse()
-        {
-            response.headers_mut().insert("retry-after", v);
-        }
+    // `Retry-After` is not set here: the retry hint travels on the quota
+    // violation and `Problem::into_response` derives the header from it.
+    if let Some((limit, remaining, reset_epoch)) = rate_limit_meta {
         if let Some(l) = limit
             && let Ok(v) = l.to_string().parse()
         {
@@ -703,6 +710,65 @@ mod tests {
         let p: Problem = err.into_test_problem();
         assert_eq!(p.status, Some(429));
         assert_eq!(p.problem_type, RESOURCE_EXHAUSTED_TYPE);
+        assert_eq!(
+            p.context["violations"][0]["retry_after_seconds"].as_u64(),
+            Some(30),
+        );
+    }
+
+    fn rate_limit_error(retry_after_secs: Option<u64>) -> DomainError {
+        DomainError::RateLimitExceeded {
+            detail: "rate limit exceeded for upstream".into(),
+            instance: "/oagw/v1/proxy/api.openai.com/v1/chat/completions".into(),
+            retry_after_secs,
+            limit: Some(100),
+            remaining: Some(0),
+            reset_epoch: Some(1706626800),
+        }
+    }
+
+    /// The SDK projection and the REST `Retry-After` header must agree on
+    /// the limiter's retry hint.
+    #[test]
+    fn rate_limit_retry_hint_reaches_sdk_and_wire() {
+        for hint in [Some(30), None] {
+            let sdk =
+                oagw_sdk::ServiceGatewayError::from(CanonicalError::from(rate_limit_error(hint)));
+            assert!(
+                matches!(
+                    sdk,
+                    oagw_sdk::ServiceGatewayError::RateLimited { retry_after_secs }
+                        if retry_after_secs == hint
+                ),
+                "hint {hint:?}: got {sdk:?}",
+            );
+
+            let resp = error_response(rate_limit_error(hint));
+            assert_eq!(resp.status(), 429);
+            let header = resp
+                .headers()
+                .get("retry-after")
+                .map(|v| v.to_str().unwrap().to_owned());
+            assert_eq!(header, hint.map(|s| s.to_string()), "hint {hint:?}");
+            assert_eq!(
+                resp.headers().get_all("retry-after").iter().count(),
+                usize::from(hint.is_some())
+            );
+            assert_eq!(resp.headers().get("x-ratelimit-limit").unwrap(), "100");
+        }
+    }
+
+    /// Clients that rebuild the error from the problem body see the hint too.
+    #[test]
+    fn rate_limit_retry_hint_survives_problem_round_trip() {
+        let p: Problem = rate_limit_error(Some(30)).into_test_problem();
+        let rebuilt = CanonicalError::try_from(p).expect("problem should round-trip");
+        assert!(matches!(
+            oagw_sdk::ServiceGatewayError::from(rebuilt),
+            oagw_sdk::ServiceGatewayError::RateLimited {
+                retry_after_secs: Some(30)
+            }
+        ));
     }
 
     #[test]
