@@ -3913,6 +3913,39 @@ impl GithubPort for GithubClient {
         }
     }
 
+    async fn rejects_token(&self, token: &SecretString) -> Result<bool, DomainError> {
+        let parsed = url::Url::parse(&self.api_base_url)
+            .map_err(|e| DomainError::internal(format!("invalid GitHub API base URL: {e}")))?;
+        refuse_cleartext(&self.api_base_url, &parsed)?;
+        let url = format!("{}/rate_limit", self.api_base_url.trim_end_matches('/'));
+        let answer = self
+            .http
+            .get(&url)
+            .header("Accept", ACCEPT_JSON)
+            .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+            .bearer_auth(token.expose())
+            .send()
+            .await;
+        match answer {
+            Ok(response) if response.status() == reqwest::StatusCode::UNAUTHORIZED => Ok(true),
+            Ok(response) if response.status().is_success() => Ok(false),
+            Ok(response) => {
+                tracing::warn!(
+                    status = %response.status(),
+                    "GitHub could not check a new token; it is added unchecked"
+                );
+                Ok(false)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "GitHub could not check a new token; it is added unchecked"
+                );
+                Ok(false)
+            }
+        }
+    }
+
     async fn rate_limit(&self) -> Result<Vec<RateLimitQuota>, DomainError> {
         self.rate_limit_pool(self.build_or_get_pool(None, &AccessScope::allow_all()).await?)
             .await

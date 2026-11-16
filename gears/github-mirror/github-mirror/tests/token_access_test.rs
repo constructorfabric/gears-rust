@@ -305,3 +305,59 @@ async fn a_classic_token_without_the_repo_scope_is_left_out_on_a_private_repo() 
     assert_eq!(without_repo_scope.calls_async().await, 0);
     with_repo_scope.assert_async().await;
 }
+
+#[tokio::test]
+async fn a_token_github_answers_401_is_rejected() {
+    let server = MockServer::start_async().await;
+    let refused = server
+        .mock_async(|when, then| {
+            when.method("GET")
+                .path("/rate_limit")
+                .header("authorization", "Bearer tok-revoked");
+            then.status(401);
+        })
+        .await;
+    let accepted = server
+        .mock_async(|when, then| {
+            when.method("GET")
+                .path("/rate_limit")
+                .header("authorization", "Bearer tok-good");
+            then.status(200).json_body(json!({ "resources": {} }));
+        })
+        .await;
+    let client = client(&server, &[]);
+
+    assert!(
+        client
+            .rejects_token(&SecretString::new("tok-revoked"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !client
+            .rejects_token(&SecretString::new("tok-good"))
+            .await
+            .unwrap()
+    );
+    refused.assert_async().await;
+    accepted.assert_async().await;
+}
+
+#[tokio::test]
+async fn a_token_github_cannot_check_is_not_rejected() {
+    let server = MockServer::start_async().await;
+    let unavailable = server
+        .mock_async(|when, then| {
+            when.method("GET").path("/rate_limit");
+            then.status(503);
+        })
+        .await;
+
+    assert!(
+        !client(&server, &[])
+            .rejects_token(&SecretString::new("tok-a"))
+            .await
+            .unwrap()
+    );
+    unavailable.assert_async().await;
+}

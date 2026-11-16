@@ -3858,6 +3858,21 @@ impl Service {
         self.token_secrets.list(&scope).await
     }
 
+    async fn ensure_github_accepts(
+        &self,
+        tokens: &[(SecretString, Option<String>)],
+    ) -> Result<(), DomainError> {
+        for (index, (token, _)) in tokens.iter().enumerate() {
+            if self.github.rejects_token(token).await? {
+                return Err(DomainError::Validation {
+                    field: "tokens".to_owned(),
+                    message: format!("GitHub answers 401 Unauthorized to token {}", index + 1),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub async fn add_tokens(
         &self,
         ctx: &SecurityContext,
@@ -3879,6 +3894,7 @@ impl Service {
                 ))
             })
             .collect::<Result<Vec<_>, DomainError>>()?;
+        self.ensure_github_accepts(&normalized).await?;
         let existing = self.token_secrets.list(&scope).await?;
         let existing_fingerprints: HashSet<String> = existing
             .iter()
@@ -3956,6 +3972,7 @@ impl Service {
                 ))
             })
             .collect::<Result<Vec<_>, DomainError>>()?;
+        self.ensure_github_accepts(&normalized).await?;
         let existing = self.token_secrets.list(&scope).await?;
         let existing_fingerprints: HashSet<String> = existing
             .iter()

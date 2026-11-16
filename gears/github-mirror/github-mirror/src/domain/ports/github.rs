@@ -572,4 +572,17 @@ pub trait GithubPort: Send + Sync {
     }
 
     fn reload_tokens(&self, _tenant_id: Option<uuid::Uuid>) {}
+
+    /// Whether GitHub answers `401 Unauthorized` to `token`. A token GitHub
+    /// cannot be asked about, because it is down or answers anything else,
+    /// counts as not rejected.
+    ///
+    /// # Errors
+    /// `Internal` when the GitHub API base URL would send the token in cleartext.
+    async fn rejects_token(
+        &self,
+        _token: &toolkit_utils::SecretString,
+    ) -> Result<bool, DomainError> {
+        Ok(false)
+    }
 }
