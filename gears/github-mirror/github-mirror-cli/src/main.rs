@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 /// The command implementations, configuration loading and output formatting.
 mod app;
 mod registered_gears;

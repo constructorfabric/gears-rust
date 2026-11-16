@@ -131,6 +131,11 @@ pub fn resolve_token(given: Option<&SecretString>, file_name: &str) -> Option<Se
         .and_then(|token| trimmed(&token))
 }
 
+fn trimmed(token: &SecretString) -> Option<SecretString> {
+    let text = token.expose().trim();
+    (!text.is_empty()).then(|| SecretString::new(text))
+}
+
 fn merge(base: &mut Value, overrides: Value) {
     match (base, overrides) {
         (Value::Object(base), Value::Object(overrides)) => {

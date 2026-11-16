@@ -6301,11 +6301,11 @@ impl TokenSecretRepository for SeaOrmTokenSecretRepository {
         tenant_id: Uuid,
         records: &[TokenSecretRecord],
     ) -> Result<(), DomainError> {
-        let conn = self.db.conn()?;
         let records = records.to_vec();
         let scope = scope.clone();
-        let (_conn, result) = conn
-            .in_transaction_mapped(DomainError::database_infra, move |tx| {
+        self.db
+            .db()
+            .transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
                     for record in records {
                         upsert_token_secret(tx, &scope, tenant_id, &record).await?;
@@ -6313,8 +6313,7 @@ impl TokenSecretRepository for SeaOrmTokenSecretRepository {
                     Ok(())
                 })
             })
-            .await;
-        result
+            .await
     }
 
     async fn replace(
@@ -6323,11 +6322,11 @@ impl TokenSecretRepository for SeaOrmTokenSecretRepository {
         tenant_id: Uuid,
         records: &[TokenSecretRecord],
     ) -> Result<Vec<TokenSecretRecord>, DomainError> {
-        let conn = self.db.conn()?;
-        let (_conn, result) = conn
-            .in_transaction_mapped(DomainError::database_infra, move |tx| {
-                let records = records.to_vec();
-                let scope = scope.clone();
+        let records = records.to_vec();
+        let scope = scope.clone();
+        self.db
+            .db()
+            .transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
                     let previous: Vec<TokenSecretRecord> = TokenSecretEntity::find()
                         .secure()
@@ -6350,8 +6349,7 @@ impl TokenSecretRepository for SeaOrmTokenSecretRepository {
                     Ok(previous)
                 })
             })
-            .await;
-        result
+            .await
     }
 
     async fn remove(
@@ -6363,7 +6361,7 @@ impl TokenSecretRepository for SeaOrmTokenSecretRepository {
         let existing = TokenSecretEntity::find()
             .secure()
             .scope_with(scope)
-            .filter(token_secrets::Column::Fingerprint.eq(fingerprint))
+            .filter(sea_orm::Condition::all().add(token_secrets::Column::Fingerprint.eq(fingerprint)))
             .one(&conn)
             .await
             .map_err(map_scope_error)?;
@@ -6373,7 +6371,7 @@ impl TokenSecretRepository for SeaOrmTokenSecretRepository {
         TokenSecretEntity::delete_many()
             .secure()
             .scope_with(scope)
-            .filter(token_secrets::Column::Fingerprint.eq(fingerprint))
+            .filter(sea_orm::Condition::all().add(token_secrets::Column::Fingerprint.eq(fingerprint)))
             .exec(&conn)
             .await
             .map_err(map_scope_error)?;
