@@ -17,7 +17,8 @@ pub mod m0008_edge_scope_owner;
 pub mod m0009_read_path_indexes;
 pub mod m0010_drop_property_graph;
 pub mod m0011_empty_discriminator;
-pub mod m0012_edge_listing_indexes;
+pub mod m0012_tombstoned_payload_index;
+pub mod m0013_edge_listing_indexes;
 
 /// Text-search configuration used for both the GIN index expression and every
 /// lexical query. One constant, so predicate and index cannot drift apart —
@@ -40,7 +41,8 @@ impl MigratorTrait for Migrator {
             Box::new(m0009_read_path_indexes::Migration),
             Box::new(m0010_drop_property_graph::Migration),
             Box::new(m0011_empty_discriminator::Migration),
-            Box::new(m0012_edge_listing_indexes::Migration),
+            Box::new(m0012_tombstoned_payload_index::Migration),
+            Box::new(m0013_edge_listing_indexes::Migration),
         ]
     }
 }

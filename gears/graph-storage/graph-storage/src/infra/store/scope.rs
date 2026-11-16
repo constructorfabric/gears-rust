@@ -149,23 +149,40 @@ pub(crate) async fn remove_stale(
     let stale_ids: Vec<i64> = if types.managed_nodes.is_empty() {
         Vec::new()
     } else {
-        let candidates: Vec<NodeIdent> = node::Entity::find()
-            .secure()
-            .scope_with(scope)
-            .filter(
-                // Tombstoned members included: a tombstone keeps its payload,
-                // search text and vector, and a replacement -- an empty one
-                // above all -- is the scope's erasure (gears-rust #5194). A
-                // tombstoned key cannot be in `written`: ingest refuses it.
-                Condition::all()
-                    .add(node::Column::GtsNodeTypeId.is_in(types.managed_nodes))
-                    .add(member()),
-            )
-            .project_all(tx, |query| {
-                node_ident_columns(query).into_model::<NodeIdent>()
-            })
-            .await
-            .map_err(map_scope_err)?;
+        // Tombstoned members included: a tombstone keeps its payload, search
+        // text and vector, and a replacement -- an empty one above all -- is
+        // the scope's erasure (gears-rust #5194). A tombstoned key cannot be
+        // in `written`: ingest refuses it.
+        //
+        // Two statements, live and tombstoned, because every index that
+        // serves this query is partial on `deleted_at` (m0005 and m0001 on
+        // `IS NULL`, m0012 on `IS NOT NULL`), and PostgreSQL uses a partial
+        // index only for a query that states its condition. One statement
+        // without it read every node of the tenant, under the scope's lock.
+        let mut candidates: Vec<NodeIdent> = Vec::new();
+        for tombstoned in [false, true] {
+            let state = if tombstoned {
+                node::Column::DeletedAt.is_not_null()
+            } else {
+                node::Column::DeletedAt.is_null()
+            };
+            candidates.extend(
+                node::Entity::find()
+                    .secure()
+                    .scope_with(scope)
+                    .filter(
+                        Condition::all()
+                            .add(node::Column::GtsNodeTypeId.is_in(types.managed_nodes.clone()))
+                            .add(member())
+                            .add(state),
+                    )
+                    .project_all(tx, |query| {
+                        node_ident_columns(query).into_model::<NodeIdent>()
+                    })
+                    .await
+                    .map_err(map_scope_err)?,
+            );
+        }
 
         let stale: Vec<&NodeIdent> = candidates
             .iter()

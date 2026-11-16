@@ -819,6 +819,40 @@ async fn a_purge_of_tombstones_only_is_refused_for_a_live_node_over_rest() {
     assert_eq!(status, StatusCode::NO_CONTENT, "its own instant: {body}");
 }
 
+/// A purge precondition on a soft delete is refused, not ignored: the caller
+/// that sent it meant to bind the delete to one node, and a soft delete would
+/// have taken whichever node holds the key.
+#[tokio::test]
+async fn a_purge_precondition_without_mode_purge_is_refused() {
+    let stand = Stand::new(Harness::allowed());
+    seed(&stand).await;
+    let (status, body) = stand
+        .post(
+            "/ingest",
+            &serde_json::json!({
+                "nodes": [{"node_key": "rest-soft", "type_id": conformance::OWNED}]
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for query in [
+        "only_tombstoned=true",
+        "expected_created_at=2026-11-01T10:00:00Z",
+        "mode=soft&only_tombstoned=true",
+    ] {
+        let (status, problem) = stand.delete(&format!("/nodes/rest-soft?{query}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {problem}");
+    }
+    let (status, node) = stand.get("/nodes/rest-soft").await;
+    assert_eq!(status, StatusCode::OK, "the node is still live: {node}");
+    let (status, problem) = stand.delete("/nodes/rest-soft?mode=sideways").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unknown mode: {problem}"
+    );
+}
+
 /// A node's edges over REST: repeated filter keys are honoured, the cursor
 /// continues the listing, an unknown option is refused rather than ignored,
 /// and a traversal returns edge payloads only when asked.

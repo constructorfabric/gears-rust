@@ -1178,7 +1178,7 @@ because each was answerable more than one way:
   resolved type set means a type registered between pages does not void the
   cursor; its edges appear on the pages still to come. Each side of the node
   is one ordered statement over `(tenant_id, src_node_id | dst_node_id, id)`
-  partial on `deleted_at IS NULL` (migration m0012), merged by id for
+  partial on `deleted_at IS NULL` (migration m0013), merged by id for
   `either`: an `OR` across the two columns cannot use either index for the
   order, and on a stand table of 2 million edges the planner then walked the
   primary key, 120 to 220 ms a page of a 10 000-edge hub, against 0.1 ms per

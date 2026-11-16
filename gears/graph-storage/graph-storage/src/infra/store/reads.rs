@@ -656,7 +656,7 @@ pub async fn list_node_edges(
 
     // One ordered statement per side, merged by id: an `OR` across the two
     // endpoint columns cannot use either paging index for the ordering, and
-    // the planner then walks the primary key (m0012). The first `limit + 1`
+    // the planner then walks the primary key (m0013). The first `limit + 1`
     // rows of the union are among the first `limit + 1` of each side.
     let limit = Ord::max(query.limit, 1);
     let fetch = u64::from(limit) + 1;
