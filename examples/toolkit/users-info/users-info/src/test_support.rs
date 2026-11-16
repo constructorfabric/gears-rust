@@ -236,7 +236,7 @@ pub fn build_services_with_authz(
 ///
 /// This is the canonical PDP denial path: the PDP evaluates the request and
 /// explicitly sets `decision=false`. The enforcer converts this into
-/// `EnforcerError::Denied`.
+/// `EnforcerError::AccessDenied`.
 pub struct DenyAllAuthZResolver;
 
 #[async_trait]

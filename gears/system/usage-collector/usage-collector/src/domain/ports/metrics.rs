@@ -148,6 +148,9 @@ pub enum PdpFailureCause {
     Unreachable,
     /// Reserved for a future host-side dispatch deadline (not emitted in v1).
     Timeout,
+    /// The enforcer returned an outcome class this gear does not know: an
+    /// internal failure, neither a decision nor an unreachable PDP.
+    Internal,
 }
 
 impl PdpFailureCause {
@@ -157,6 +160,7 @@ impl PdpFailureCause {
         match self {
             Self::Unreachable => "unreachable",
             Self::Timeout => "timeout",
+            Self::Internal => "internal",
         }
     }
 }
@@ -168,8 +172,9 @@ pub enum AuthzDecision {
     /// The gear permitted the request: the PDP permitted AND the post-permit
     /// gate (per-record attribution / query scope projection) admitted it.
     Permit,
-    /// The gear denied the request: a PDP deny (`EnforcerError::Denied`), a
-    /// fail-closed compile failure (`EnforcerError::CompileFailed`), or a
+    /// The gear denied the request: a PDP deny (`EnforcerError::AccessDenied`), a
+    /// permitted scope that matches nothing (`AccessDenial::ScopeMatchesNothing`),
+    /// a fail-closed compile failure (`EnforcerError::CompileFailed`), or a
     /// permit-with-constraints the post-permit gate rejected (e.g. cross-tenant
     /// attribution outside the granted scope).
     Deny,

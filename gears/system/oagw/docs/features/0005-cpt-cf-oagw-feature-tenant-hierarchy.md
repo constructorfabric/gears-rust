@@ -210,6 +210,8 @@ Enables partner/customer hierarchies where partners share upstream access with c
 
 **Output**: Effective configuration with all merge strategies applied across all three layers
 
+**Planned for named credentials.** Proxy and preview merge parent policies from the ADR-0020 cache and read the local credential live. Runtime callers need credential use permission, not ancestor management permission; create/replace keep bind-time override checks. The entire resolved server must fit the credential owner's approved endpoints. See the [ownership table](../ADR/0021-upstream-credentials.md#ownership-and-sharing) and cache freshness rules.
+
 **Steps**:
 1. [x] - `p2` - Initialize effective config from root ancestor's upstream (if shared) — absent fields default to null/unset - `inst-merge-1`
 2. [x] - `p2` - Apply route-level overrides: **IF** matched route has field-level config, overlay onto effective upstream base — route config takes priority over upstream base per `cpt-cf-oagw-fr-config-layering` (upstream base < route < tenant); route-level sharing follows the same `private`/`inherit`/`enforce` semantics as upstream-level sharing - `inst-merge-2`

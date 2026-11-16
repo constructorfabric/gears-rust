@@ -109,31 +109,98 @@ type HttpInner = tower::util::BoxCloneService<
     toolkit_http::HttpError,
 >;
 
+/// When an attempt reached the transport, as opposed to when the caller
+/// started it.
+///
+/// The auth layer, the buffer and the concurrency limiter all run before the
+/// transport's own timeout starts. A caller-side timer started earlier, with
+/// the same length, can fire first and drop the attempt, and the breaker never
+/// sees the timeout. [`bound`](Self::bound) runs the caller's timer from this
+/// mark instead, so the transport's timeout always ends a slow attempt first.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AttemptStart(Arc<std::sync::OnceLock<tokio::time::Instant>>);
+
+impl AttemptStart {
+    /// Record now as the start. Only the first mark counts.
+    fn mark(&self) {
+        self.0.set(tokio::time::Instant::now()).ok();
+    }
+
+    /// Run `fut` for at most `budget` after the attempt reached the
+    /// transport, or after `started` while it has not. `None` when it ran out.
+    pub(crate) async fn bound<F: std::future::Future>(
+        &self,
+        started: tokio::time::Instant,
+        budget: std::time::Duration,
+        fut: F,
+    ) -> Option<F::Output> {
+        let deadline = || self.0.get().copied().unwrap_or(started) + budget;
+        let mut fut = std::pin::pin!(fut);
+        let mut armed = deadline();
+        loop {
+            if let Ok(out) = tokio::time::timeout_at(armed, fut.as_mut()).await {
+                return Some(out);
+            }
+            // The attempt can reach the transport after the timer was set.
+            let later = deadline();
+            if later <= armed {
+                return None;
+            }
+            armed = later;
+        }
+    }
+}
+
 /// Add the config's circuit breaker to a `toolkit-http` client being built,
-/// as its attempt layer. A config without a breaker leaves the builder as is.
-pub(crate) fn install_http_breaker(
+/// as its attempt layer, behind a layer that marks each attempt's
+/// [`AttemptStart`]. A config without a breaker gets the marking layer only.
+///
+/// Public for tests that build their own client around a custom auth layer;
+/// generated clients get it from
+/// [`build_default_http_client`](crate::runtime::client::build_default_http_client).
+#[must_use]
+pub fn install_http_breaker(
     builder: toolkit_http::HttpClientBuilder,
     config: &crate::runtime::config::ClientConfig,
 ) -> toolkit_http::HttpClientBuilder {
     let Some(breaker) = config.circuit_breaker.clone() else {
-        return builder;
+        return builder.with_attempt_layer(|svc: HttpInner| mark_attempt_start(svc).boxed_clone());
     };
     let mut layer = CircuitBreakerLayer::new(breaker, HttpEndpointFailure);
     if let Some(hook) = &config.on_endpoint_failure {
         layer = layer.on_failure(Arc::clone(&hook.0));
     }
     builder.with_attempt_layer(move |svc: HttpInner| {
-        layer
-            .layer(svc)
-            .map_err(|e: toolkit_resilience::circuit_breaker::BoxError| {
-                match e.downcast::<toolkit_http::HttpError>() {
-                    Ok(http) => *http,
-                    Err(other) => toolkit_http::HttpError::Transport(other),
-                }
-            })
-            .boxed_clone()
+        let guarded =
+            layer
+                .layer(svc)
+                .map_err(|e: toolkit_resilience::circuit_breaker::BoxError| {
+                    match e.downcast::<toolkit_http::HttpError>() {
+                        Ok(http) => *http,
+                        Err(other) => toolkit_http::HttpError::Transport(other),
+                    }
+                });
+        mark_attempt_start(guarded).boxed_clone()
     })
 }
+
+/// Mark the request's [`AttemptStart`] when `svc` is called. `call` runs the
+/// breaker and the transport's timeout setup synchronously below it, so the
+/// mark and the transport timer start together.
+fn mark_attempt_start<S>(svc: S) -> tower::util::MapRequest<S, fn(HttpRequest) -> HttpRequest>
+where
+    S: tower::Service<HttpRequest>,
+{
+    fn mark(req: HttpRequest) -> HttpRequest {
+        if let Some(start) = req.extensions().get::<AttemptStart>() {
+            start.mark();
+        }
+        req
+    }
+    svc.map_request(mark as fn(HttpRequest) -> HttpRequest)
+}
+
+type HttpRequest = http::Request<Full<Bytes>>;
 
 /// The breaker rejection inside an error chain, if the call was refused.
 pub(crate) fn find_rejected<'a>(
@@ -154,6 +221,75 @@ pub(crate) fn find_rejected<'a>(
 mod tests {
     use super::*;
     use toolkit_http::HttpError;
+
+    use std::time::Duration;
+
+    use tokio::time::{Instant, sleep};
+
+    const BUDGET: Duration = Duration::from_millis(100);
+
+    #[tokio::test(start_paused = true)]
+    async fn bound_runs_from_started_while_the_attempt_is_unmarked() {
+        let start = AttemptStart::default();
+        let started = Instant::now();
+
+        let out = start.bound(started, BUDGET, sleep(BUDGET * 2)).await;
+
+        assert!(out.is_none());
+        assert_eq!(started.elapsed(), BUDGET);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bound_moves_to_a_late_mark() {
+        let start = AttemptStart::default();
+        let started = Instant::now();
+        let late = start.clone();
+        let fut = async move {
+            sleep(BUDGET / 2).await;
+            late.mark();
+            sleep(BUDGET * 7 / 10).await;
+        };
+
+        let out = start.bound(started, BUDGET, fut).await;
+
+        assert!(
+            out.is_some(),
+            "the budget runs from the mark, not from the start"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_mark_after_the_budget_ran_out_is_too_late() {
+        let start = AttemptStart::default();
+        let started = Instant::now();
+        let late = start.clone();
+        let fut = async move {
+            sleep(BUDGET * 3 / 2).await;
+            late.mark();
+        };
+
+        let out = start.bound(started, BUDGET, fut).await;
+
+        assert!(out.is_none());
+        assert_eq!(started.elapsed(), BUDGET);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bound_ends_a_budget_after_the_mark() {
+        let start = AttemptStart::default();
+        let started = Instant::now();
+        let late = start.clone();
+        let fut = async move {
+            sleep(BUDGET / 2).await;
+            late.mark();
+            sleep(BUDGET * 2).await;
+        };
+
+        let out = start.bound(started, BUDGET, fut).await;
+
+        assert!(out.is_none());
+        assert_eq!(started.elapsed(), BUDGET * 3 / 2);
+    }
 
     fn resp(status: u16, content_type: Option<&str>) -> Result<http::Response<()>, HttpError> {
         let mut b = http::Response::builder().status(status);

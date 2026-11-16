@@ -18,6 +18,8 @@ use oidc_authn_plugin::domain::metrics::AuthNMetrics;
 use oidc_authn_plugin::infra::runtime::build_oidc_authn_plugin_allowing_insecure_http_for_tests;
 use serde_json::json;
 
+pub mod tls_idp;
+
 struct TestKeyMaterial {
     encoding_key: EncodingKey,
     jwks_json: String,
@@ -47,8 +49,9 @@ fn build_key_material() -> TestKeyMaterial {
     }
 }
 
+/// JWKS document with the public half of the [`sign_jwt`] key.
 #[must_use]
-fn test_jwk_json() -> &'static str {
+pub fn test_jwk_json() -> &'static str {
     &key_material().jwks_json
 }
 
@@ -164,7 +167,7 @@ pub fn default_circuit_breaker_config() -> CircuitBreakerConfig {
 #[must_use]
 pub fn default_s2s_config() -> S2sConfig {
     S2sConfig {
-        discovery_url: match reqwest::Url::parse("https://s2s.example.com") {
+        discovery_url: match url::Url::parse("https://s2s.example.com") {
             Ok(url) => url,
             Err(error) => unreachable!("static S2S test discovery URL is invalid: {error}"),
         },
@@ -190,12 +193,16 @@ pub fn plugin_config() -> OidcPluginConfig {
 }
 
 /// Build a plugin with production HTTP-backed infrastructure for integration tests.
+///
+/// # Panics
+///
+/// Panics if the circuit-breaker settings in `plugin_config` are invalid.
 #[must_use]
 pub fn build_test_plugin(
     jwt_config: JwtValidationConfig,
     issuer_trust: IssuerTrustConfig,
     plugin_config: OidcPluginConfig,
-    http_client: reqwest::Client,
+    http_client: oidc_authn_plugin::infra::idp_http::IdpHttpClient,
 ) -> OidcAuthNPlugin {
     build_oidc_authn_plugin_allowing_insecure_http_for_tests(
         jwt_config,
@@ -204,6 +211,7 @@ pub fn build_test_plugin(
         http_client,
         create_test_metrics(),
     )
+    .expect("test plugin config should be valid")
 }
 
 /// `httpmock` server that serves OIDC Discovery, JWKS, and token endpoints.
@@ -221,7 +229,7 @@ impl MockOidcServer {
     /// Returns an error if the generated base URL is unexpectedly invalid.
     pub fn spawn() -> anyhow::Result<Self> {
         let server = MockServer::start();
-        reqwest::Url::parse(&server.base_url())?;
+        url::Url::parse(&server.base_url())?;
         let discovery_requests = Arc::new(Mutex::new(HashMap::new()));
         let jwks_requests = Arc::new(Mutex::new(HashMap::new()));
 

@@ -50,14 +50,20 @@ pub fn type_resource() -> ResourceType {
 
 /// Map a PEP enforcement failure to a domain error, fail-closed:
 /// `Denied` / `CompileFailed` deny; `EvaluationFailed` is a dependency
-/// outage, never a grant.
+/// outage, never a grant; an unknown outcome class is an internal failure.
 #[must_use]
 pub fn map_enforcer_err(error: &EnforcerError) -> DomainError {
     match error {
-        EnforcerError::Denied { .. } | EnforcerError::CompileFailed(_) => DomainError::AccessDenied,
+        EnforcerError::AccessDenied(_) | EnforcerError::CompileFailed(_) => {
+            DomainError::AccessDenied
+        }
         EnforcerError::EvaluationFailed(_) => DomainError::Unavailable {
             detail: "authorization evaluation failed".to_owned(),
         },
+        unknown => {
+            tracing::error!(error = %unknown, "authz failed with an unknown outcome");
+            DomainError::internal("authorization failed with an unknown outcome")
+        }
     }
 }
 
@@ -241,6 +247,7 @@ pub fn pinned_to(scope: &AccessScope, tenant: Uuid) -> AccessScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use authz_resolver_sdk::pep::AccessDenial;
 
     /// Pinning intersects: it can take a subtree down to its root and can
     /// never admit a tenant the PDP left out.
@@ -303,7 +310,9 @@ mod tests {
     /// error.
     #[test]
     fn a_denial_and_an_outage_are_not_the_same_answer() {
-        let denied = map_enforcer_err(&EnforcerError::Denied { deny_reason: None });
+        let denied = map_enforcer_err(&EnforcerError::AccessDenied(AccessDenial::Pdp {
+            reason: None,
+        }));
         assert!(
             matches!(denied, DomainError::AccessDenied),
             "a denial is a denial: {denied:?}"

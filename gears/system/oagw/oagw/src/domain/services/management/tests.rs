@@ -7406,3 +7406,91 @@ async fn a_disabled_ancestors_enforced_auth_does_not_pin_bindings() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn empty_scope_denies_each_ancestor_permission() {
+    struct EmptyActionPdp {
+        action: &'static str,
+        live: bool,
+    }
+    #[async_trait::async_trait]
+    impl authz_resolver_sdk::AuthZResolverApi for EmptyActionPdp {
+        async fn evaluate(
+            &self,
+            _: toolkit_security::PlatformSecurityContext,
+            request: authz_resolver_sdk::EvaluationRequest,
+        ) -> Result<
+            authz_resolver_sdk::EvaluationResponse,
+            toolkit::api::canonical_prelude::CanonicalError,
+        > {
+            use authz_resolver_sdk::constraints::{Constraint, InPredicate, Predicate};
+            let mut constraints = vec![];
+            if request.action.name == self.action {
+                constraints.push(Constraint {
+                    predicates: vec![Predicate::In(InPredicate::new(
+                        "owner_tenant_id",
+                        Vec::<Uuid>::new(),
+                    ))],
+                });
+                if self.live {
+                    constraints.push(Constraint {
+                        predicates: vec![Predicate::In(InPredicate::new(
+                            "owner_tenant_id",
+                            [Uuid::from_u128(1)],
+                        ))],
+                    });
+                }
+            }
+            Ok(authz_resolver_sdk::EvaluationResponse {
+                decision: true,
+                context: authz_resolver_sdk::EvaluationResponseContext {
+                    constraints,
+                    deny_reason: None,
+                },
+            })
+        }
+    }
+    let auth = AuthConfig {
+        plugin_type: "apikey".into(),
+        sharing: SharingMode::Inherit,
+        config: None,
+    };
+    let rate = make_rate_limit(SharingMode::Inherit, 10, Window::Second);
+    let plugins = PluginsConfig {
+        sharing: SharingMode::Inherit,
+        items: vec![],
+    };
+    let ancestor = make_upstream(
+        Uuid::from_u128(1),
+        "api",
+        Some(auth.clone()),
+        Some(rate.clone()),
+        Some(plugins.clone()),
+        vec![],
+    );
+    let overrides = BindOverrides {
+        server: &ancestor.server,
+        auth: Some(&auth),
+        rate_limit: Some(&rate),
+        plugins: Some(&plugins),
+        cors: None,
+    };
+    for action in ["bind", "override_auth", "override_rate", "add_plugins"] {
+        for live in [false, true] {
+            let pep =
+                authz_resolver_sdk::PolicyEnforcer::new(Arc::new(EmptyActionPdp { action, live }));
+            let result = super::bind::validate_bind_constraints(
+                &test_ctx(Uuid::from_u128(2)),
+                &pep,
+                &ancestor,
+                None,
+                &overrides,
+            )
+            .await;
+            assert_eq!(result.is_ok(), live, "action={action}, live OR={live}");
+            if !live {
+                assert!(matches!(result, Err(DomainError::Forbidden { .. })));
+            }
+        }
+    }
+}

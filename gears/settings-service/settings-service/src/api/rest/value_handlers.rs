@@ -143,10 +143,13 @@ fn respond<T: IntoResponse>(outcome: Result<T, DomainError>) -> ApiResult<Respon
 async fn may_read_pii(
     enforcer: &authz_resolver_sdk::PolicyEnforcer,
     ctx: &SecurityContext,
-) -> bool {
-    authz::access_scope(enforcer, ctx, &resource::VALUE, READ_UNMASKED, None)
-        .await
-        .is_ok()
+) -> Result<bool, DomainError> {
+    // A known refusal masks; any other failure is an error, never a mask.
+    Ok(
+        authz::optional_scope(enforcer, ctx, &resource::VALUE, READ_UNMASKED)
+            .await?
+            .is_some(),
+    )
 }
 
 /// `PUT /settings-service/v1/settings/{key}/value?tenant={tenant_id}`
@@ -176,18 +179,21 @@ pub async fn set_value(
     let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, WRITE, None).await?;
     // @cpt-end:cpt-cf-settings-service-algo-value-writes-gates:p1:inst-vw-gate-1
     let actor = actor(&ctx, &headers, domain_visibility(&scope));
+    let value = checked_value(&body.value)?;
+    // Asked before the write: a failure to decide must not follow a committed
+    // change. A known refusal masks; any other failure stops here.
+    let pii = may_read_pii(&enforcer, &ctx).await?;
     let outcome = writes
         .change(
             &actor,
             &key,
             tenant,
-            Change::Set(checked_value(&body.value)?),
+            Change::Set(value),
             if_match(&headers),
             StepUpOperation::Set,
         )
         .await;
     // @cpt-begin:cpt-cf-settings-service-flow-value-writes-set:p1:inst-vw-set-6
-    let pii = may_read_pii(&enforcer, &ctx).await;
     respond(outcome.map(|committed| {
         let dto = render_committed(&committed, pii);
         ([(header::ETAG, super::etag_header(&dto.etag))], Json(dto))
@@ -210,6 +216,9 @@ async fn fall_back(
     let tenant = parse_tenant(params.tenant.as_deref())?;
     let scope = authz::access_scope(enforcer, ctx, &resource::VALUE, WRITE, None).await?;
     let actor = actor(ctx, &headers, domain_visibility(&scope));
+    // Asked before the write: a failure to decide must not follow a committed
+    // change. A known refusal masks; any other failure stops here.
+    let pii = may_read_pii(enforcer, ctx).await?;
     let outcome = writes
         .change(&actor, &key, tenant, change, if_match(&headers), operation)
         .await;
@@ -226,7 +235,6 @@ async fn fall_back(
     // which the change never touched.
     let target = crate::domain::resolution::ScopeTarget::parse(&committed.scope)?;
     let effective = writes.effective_after(&key, target).await?;
-    let pii = may_read_pii(enforcer, ctx).await;
     // @cpt-begin:cpt-cf-settings-service-flow-value-writes-revert:p1:inst-vw-rev-6
     // @cpt-begin:cpt-cf-settings-service-flow-value-writes-remove:p1:inst-vw-rm-5
     // Rendered for the reader, as the single read renders it: what lies above
@@ -335,11 +343,13 @@ pub async fn clone_value(
     let writable = authz::access_scope(&enforcer, &ctx, &resource::VALUE, WRITE, None).await?;
     let visibility = domain_visibility(&readable).narrowed(domain_visibility(&writable));
     let actor = actor(&ctx, &headers, visibility);
+    // Asked before the write: a failure to decide must not follow a committed
+    // change. A known refusal masks; any other failure stops here.
+    let pii = may_read_pii(&enforcer, &ctx).await?;
     let outcome = writes
         .clone_value(&actor, &key, body.from, to, if_match(&headers))
         .await;
     // @cpt-begin:cpt-cf-settings-service-flow-value-writes-clone:p1:inst-vw-clone-7
-    let pii = may_read_pii(&enforcer, &ctx).await;
     respond(outcome.map(|committed| {
         let dto = render_committed(&committed, pii);
         ([(header::ETAG, super::etag_header(&dto.etag))], Json(dto))
@@ -399,9 +409,11 @@ pub async fn batch_set(
         entries.push(judged.map_err(|error| RefusedEntry { key, tenant, error }));
     }
     // @cpt-end:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-1
+    // Asked before the write: a failure to decide must not follow a committed
+    // change. A known refusal masks; any other failure stops here.
+    let pii = may_read_pii(&enforcer, &ctx).await?;
     let outcome = writes.batch_entries(&actor, entries).await;
     // @cpt-begin:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-9
-    let pii = may_read_pii(&enforcer, &ctx).await;
     respond(outcome.map(|batch| {
         Json(BatchResultDto {
             change_set_id: batch.change_set_id,
@@ -484,7 +496,7 @@ pub async fn validate_value(
         .validate(&actor, &key, tenant, &checked_value(&body.value)?, page)
         .await?;
     // @cpt-begin:cpt-cf-settings-service-flow-value-writes-validate:p1:inst-vw-val-8
-    let pii = may_read_pii(&enforcer, &ctx).await;
+    let pii = may_read_pii(&enforcer, &ctx).await?;
     // @cpt-begin:cpt-cf-settings-service-flow-value-writes-validate:p1:inst-vw-val-9
     // The embedded effective value is rendered for the reader, as the single
     // read renders it.
@@ -540,7 +552,7 @@ pub async fn impact(
     // @cpt-begin:cpt-cf-settings-service-flow-value-writes-impact:p1:inst-vw-imp-5
     // Each descendant's current value is masked by the declaration's own
     // classification, exactly as a read of that descendant would mask it.
-    let pii = may_read_pii(&enforcer, &ctx).await;
+    let pii = may_read_pii(&enforcer, &ctx).await?;
     Ok(Json(render_impact(
         &outcome.report,
         &outcome.data_classification,

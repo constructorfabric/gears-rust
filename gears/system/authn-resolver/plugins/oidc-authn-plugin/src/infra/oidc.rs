@@ -9,17 +9,16 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use reqwest::Url;
 use serde::Deserialize;
 use tracing::{debug, info, instrument, warn};
+use url::Url;
 
 use crate::config::RetryPolicyConfig;
 use crate::domain::error::AuthNError;
 use crate::infra::circuit_breaker::{HostCircuitBreakers, host_key};
-use crate::infra::http_response::read_json_response_limited;
-use crate::infra::retry::{RetriedRequestError, send_with_retry};
+use crate::infra::retry::{idp_get_error, send_with_retry};
 use crate::infra::ttl_cache::{Timestamped, TtlCache};
-use crate::infra::url_policy::UrlSecurityPolicy;
+use crate::infra::url_policy::{UrlSecurityPolicy, loggable_url};
 
 /// The subset of the OIDC Discovery document we care about.
 #[derive(Debug, Deserialize)]
@@ -78,7 +77,7 @@ impl Timestamped for CachedDiscovery {
 pub struct OidcDiscovery {
     // Debug is implemented manually below to show cache size without contents.
     cache: TtlCache<CachedDiscovery>,
-    client: reqwest::Client,
+    client: crate::infra::idp_http::IdpHttpClient,
     retry_policy: RetryPolicyConfig,
     circuit_breakers: Option<Arc<HostCircuitBreakers>>,
     url_policy: UrlSecurityPolicy,
@@ -98,7 +97,7 @@ impl OidcDiscovery {
     pub fn new(
         ttl_secs: u64,
         max_entries: usize,
-        client: reqwest::Client,
+        client: crate::infra::idp_http::IdpHttpClient,
         retry_policy: RetryPolicyConfig,
     ) -> Self {
         Self::new_with_url_policy(
@@ -114,7 +113,7 @@ impl OidcDiscovery {
     pub(crate) fn new_with_url_policy(
         ttl_secs: u64,
         max_entries: usize,
-        client: reqwest::Client,
+        client: crate::infra::idp_http::IdpHttpClient,
         retry_policy: RetryPolicyConfig,
         url_policy: UrlSecurityPolicy,
     ) -> Self {
@@ -127,13 +126,13 @@ impl OidcDiscovery {
         }
     }
 
-    /// Create a new `OidcDiscovery` that permits plain HTTP IdP URLs.
-    #[doc(hidden)]
+    /// Create a new `OidcDiscovery` that permits plain HTTP `IdP` URLs.
+    #[cfg(any(test, feature = "test-util"))]
     #[must_use]
     pub fn new_allowing_insecure_http_for_tests(
         ttl_secs: u64,
         max_entries: usize,
-        client: reqwest::Client,
+        client: crate::infra::idp_http::IdpHttpClient,
         retry_policy: RetryPolicyConfig,
     ) -> Self {
         Self::new_with_url_policy(
@@ -192,31 +191,14 @@ impl OidcDiscovery {
         discovery_base_key: &str,
         discovery_url: &Url,
     ) -> Result<OidcConfig, AuthNError> {
-        let response = send_with_retry(&self.retry_policy, || {
-            self.client.get(discovery_url.clone()).send()
-        })
-        .await
-        .map_err(|error| {
-            match error {
-                RetriedRequestError::Transport(e) => {
-                    warn!(url = %discovery_url, error = %e, "OIDC discovery fetch failed");
-                }
-                RetriedRequestError::Status(status) => {
-                    warn!(
-                        url = %discovery_url,
-                        status = %status,
-                        "OIDC discovery returned non-success status"
-                    );
-                }
-            }
+        let response = send_with_retry(&self.retry_policy, || self.client.get(discovery_url))
+            .await
+            .map_err(|error| idp_get_error(&error, "oidc_discovery", discovery_url))?;
+
+        let config: OidcDiscoveryDocument = self.client.read_json(response).await.map_err(|e| {
+            warn!(url = %discovery_url, error = %e, "OIDC discovery response parse failed");
             AuthNError::IdpUnreachable
         })?;
-
-        let config: OidcDiscoveryDocument =
-            read_json_response_limited(response).await.map_err(|e| {
-                warn!(url = %discovery_url, error = %e, "OIDC discovery response parse failed");
-                AuthNError::IdpUnreachable
-            })?;
         let config = self.validate_config(config, discovery_url)?;
 
         self.cache.insert_with_eviction(
@@ -255,7 +237,7 @@ impl OidcDiscovery {
             .map_err(|error| {
                 warn!(
                     url = %discovery_url,
-                    jwks_uri = %config.jwks_uri,
+                    jwks_uri = %loggable_url(&config.jwks_uri),
                     error,
                     "OIDC discovery jwks_uri rejected by HTTPS policy"
                 );
@@ -269,7 +251,7 @@ impl OidcDiscovery {
                     .map_err(|error| {
                         warn!(
                             url = %discovery_url,
-                            token_endpoint,
+                            token_endpoint = %loggable_url(token_endpoint),
                             error,
                             "OIDC discovery token_endpoint rejected by HTTPS policy"
                         );
@@ -304,7 +286,8 @@ impl OidcDiscovery {
 mod tests {
     use super::*;
     use crate::domain::metrics::test_harness::MetricsHarness;
-    use crate::infra::circuit_breaker::{HostCircuitBreakers, STATE_OPEN, host_key};
+    use crate::infra::circuit_breaker::{HostCircuitBreakers, host_key};
+    use toolkit_resilience::circuit_breaker::State;
 
     const TEST_ISSUER: &str = "http://127.0.0.1:19090/realms/platform";
 
@@ -316,7 +299,7 @@ mod tests {
         OidcDiscovery::new_allowing_insecure_http_for_tests(
             ttl_secs,
             max_entries,
-            reqwest::Client::new(),
+            crate::infra::idp_http::IdpHttpClient::insecure_for_tests(),
             crate::config::default_retry_policy_config(),
         )
     }
@@ -365,7 +348,7 @@ mod tests {
         let discovery = OidcDiscovery::new(
             3600,
             10,
-            reqwest::Client::new(),
+            crate::infra::idp_http::IdpHttpClient::insecure_for_tests(),
             crate::config::default_retry_policy_config(),
         );
         let issuer = test_issuer_url();
@@ -378,12 +361,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn strict_policy_rejects_http_jwks_uri_from_discovery_metadata() {
+    #[tokio::test]
+    async fn strict_policy_rejects_http_jwks_uri_from_discovery_metadata() {
         let discovery = OidcDiscovery::new(
             3600,
             10,
-            reqwest::Client::new(),
+            crate::infra::idp_http::IdpHttpClient::insecure_for_tests(),
             crate::config::default_retry_policy_config(),
         );
         let metadata = OidcDiscoveryDocument {
@@ -404,15 +387,14 @@ mod tests {
 
     #[tokio::test]
     async fn discovery_failure_opens_only_that_host_breaker() {
-        let breakers = Arc::new(HostCircuitBreakers::new(
-            1,
-            30,
-            MetricsHarness::new().metrics(),
-        ));
+        let breakers = Arc::new(
+            HostCircuitBreakers::new(1, 30, MetricsHarness::new().metrics())
+                .expect("test breaker config should be valid"),
+        );
         let discovery = OidcDiscovery::new_allowing_insecure_http_for_tests(
             3600,
             10,
-            reqwest::Client::new(),
+            crate::infra::idp_http::IdpHttpClient::insecure_for_tests(),
             crate::config::default_retry_policy_config(),
         )
         .with_circuit_breakers(Arc::clone(&breakers));
@@ -423,7 +405,7 @@ mod tests {
         assert!(matches!(result, Err(AuthNError::IdpUnreachable)));
         assert_eq!(
             breakers.state_for_host(&host_key(&issuer)),
-            Some(STATE_OPEN)
+            Some(State::Open)
         );
         assert_eq!(
             breakers.state_for_host("unrelated.example.com"),
@@ -437,7 +419,7 @@ mod tests {
         let discovery = OidcDiscovery::new(
             0,
             10,
-            reqwest::Client::new(),
+            crate::infra::idp_http::IdpHttpClient::insecure_for_tests(),
             crate::config::default_retry_policy_config(),
         );
         discovery.inject_cached_config(TEST_ISSUER, fake_config(TEST_ISSUER));
@@ -455,7 +437,7 @@ mod tests {
         let discovery = OidcDiscovery::new(
             0,
             10,
-            reqwest::Client::new(),
+            crate::infra::idp_http::IdpHttpClient::insecure_for_tests(),
             crate::config::default_retry_policy_config(),
         );
         let issuer = test_issuer_url();

@@ -12,15 +12,16 @@
 //! pattern" structural rather than a convention a reviewer has to enforce.
 
 use sea_orm::entity::prelude::*;
+use toolkit_db::secure::ScopeError;
 use toolkit_db::secure::SecureEntityExt;
 use toolkit_db::secure::pgq::{GraphDeclaration, PropertyGraph, VertexOf};
-use toolkit_db::secure::ScopeError;
 
 mod test_entity {
     use super::*;
 
-    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, toolkit_db::secure::Scopable)]
     #[sea_orm(table_name = "graph_unscoped_table")]
+    #[secure(tenant_col = "tenant_id", resource_col = "id", no_owner, no_type)]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
         pub id: i32,
@@ -31,27 +32,6 @@ mod test_entity {
     pub enum Relation {}
 
     impl ActiveModelBehavior for ActiveModel {}
-
-    impl toolkit_db::secure::ScopableEntity for Entity {
-        fn tenant_col() -> Option<Column> {
-            Some(Column::TenantId)
-        }
-        fn resource_col() -> Option<Column> {
-            Some(Column::Id)
-        }
-        fn owner_col() -> Option<Column> {
-            None
-        }
-        fn type_col() -> Option<Column> {
-            None
-        }
-        fn resolve_property(_property: &str) -> Option<Column> {
-            Some(Column::TenantId)
-        }
-        fn scope_columns() -> Vec<Column> {
-            vec![Column::TenantId, Column::Id]
-        }
-    }
 }
 
 use test_entity::Entity;

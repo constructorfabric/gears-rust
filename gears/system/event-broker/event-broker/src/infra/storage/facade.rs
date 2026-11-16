@@ -120,23 +120,11 @@ fn parse_gts_id(raw: &str) -> Result<GtsInstanceId, DomainError> {
 pub struct Storage {
     db: Arc<DBProvider<toolkit_db::DbError>>,
     spec_manager: Arc<dyn SpecificationManager>,
-    /// `None` until `EventBrokerModule::serve()` resolves it. `ClusterGear`
-    /// (a `RunnableCapability`) only registers its backends into the
-    /// `ClientHub` during the platform's *start* phase - which runs after
-    /// *every* gear's `init()` (`host_runtime.rs`'s phase order: `init` ->
-    /// ... -> REST -> start). `Storage` is built in `init()` (needed there
-    /// for `spec_manager`/`db` wiring), so at that point
-    /// `EventBrokerCluster::resolve()` would always fail - discovered by
-    /// actually booting the standalone binary, not by any test (every
-    /// existing test wires the cluster cache directly via
-    /// `standalone_event_broker_cluster()`, bypassing the real gear
-    /// lifecycle entirely). Set once via [`Self::set_cache`], called from
-    /// `serve()` after the start phase has begun (so `cluster`'s own
-    /// `start()`, which the topo-sorted dep order runs first, has already
-    /// completed). A request can still arrive before that: the listener
-    /// accepts traffic as soon as the start phase *spawns* `serve()`, so
-    /// every reader goes through [`Self::cache`] and reports an unavailable
-    /// storage path rather than assuming the wiring is done.
+    /// The routing markers' cache, `None` until `EventBrokerModule::serve()`
+    /// resolves and wires it via [`Self::set_cache`] (which carries the
+    /// ordering rationale). Reads go through [`Self::cache`], never this
+    /// field directly, so a request arriving before the wiring gets an
+    /// unavailable storage path rather than a panic.
     cache: OnceLock<ClusterCacheV1>,
     /// The ingest outbox pipeline - `None` until `EventBrokerModule::serve()`
     /// starts it (`Outbox::builder(..).start()` needs a running Tokio
@@ -197,6 +185,17 @@ impl Storage {
 
     /// Wires the routing markers' `ClusterCacheV1` in once
     /// `EventBrokerModule::serve()` has resolved it.
+    ///
+    /// Resolved in `serve()`, not `init()`: a co-located `ClusterGear`
+    /// registers its backends into the `ClientHub` only in the platform's
+    /// *start* phase (`host_runtime.rs` runs every gear's `init()` first),
+    /// whereas `Storage` is built in `init()`. EB reaches the cluster through
+    /// `cluster-sdk` with no `deps = [cluster]` edge; `resolve()` binds
+    /// against whatever `ClusterClient` is registered - a co-located backend
+    /// or a remote handle via `cluster-sdk/grpc-client` - and does not block
+    /// on the cluster being up, deferring validation to readiness. This was
+    /// found by booting the standalone binary, not by any test: every test
+    /// wires the cache directly, bypassing the lifecycle.
     ///
     /// # Panics
     /// Panics if called more than once.

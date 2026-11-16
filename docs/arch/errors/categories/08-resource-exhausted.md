@@ -26,6 +26,13 @@ Quota violation:
 |-------|------|-------------|
 | `subject` | `String` | What the quota applies to (e.g., `"requests_per_minute"`) |
 | `description` | `String` | Human-readable explanation |
+| `retry_after_seconds` | `Option<u64>` | Minimum seconds to wait before retrying; set when the limit replenishes (rate limits), absent for hard exhaustion |
+
+## HTTP Headers
+
+When at least one violation carries `retry_after_seconds`, the HTTP response also carries `Retry-After` with the largest of those values, so a client that waits that long has waited for every violated limit. With no hint on any violation, there is no `Retry-After` header.
+
+In Rust the same value is `CanonicalError::retry_after_seconds()`; SDK projections that expose a retry delay use it (ADR-0005).
 
 ## Constructor Example
 
@@ -40,6 +47,7 @@ let err = UserResourceError::resource_exhausted("Quota exceeded")
         "requests_per_minute",
         "Limit of 100 requests per minute exceeded",
     )
+    .with_quota_violation_retry_after_seconds(30)
     .create();
 ```
 
@@ -91,7 +99,12 @@ let err = UserResourceError::resource_exhausted("Quota exceeded")
       "required": ["subject", "description"],
       "properties": {
         "subject": { "type": "string", "description": "What the quota applies to" },
-        "description": { "type": "string", "description": "Human-readable explanation" }
+        "description": { "type": "string", "description": "Human-readable explanation" },
+        "retry_after_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Minimum seconds to wait before retrying; absent for hard exhaustion"
+        }
       },
       "additionalProperties": false
     }
@@ -100,6 +113,8 @@ let err = UserResourceError::resource_exhausted("Quota exceeded")
 ```
 
 ## JSON Wire — JSON Example
+
+Sent with the header `Retry-After: 30`.
 
 ```json
 {
@@ -112,7 +127,8 @@ let err = UserResourceError::resource_exhausted("Quota exceeded")
     "violations": [
       {
         "subject": "requests_per_minute",
-        "description": "Limit of 100 requests per minute exceeded"
+        "description": "Limit of 100 requests per minute exceeded",
+        "retry_after_seconds": 30
       }
     ]
   }

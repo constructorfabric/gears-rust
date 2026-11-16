@@ -8060,3 +8060,157 @@ pub async fn a_purge_bound_to_a_creation_instant_leaves_a_later_node_alone(
         "the later node was there all along"
     );
 }
+
+/// The evolving requirement with a payload property that references the
+/// provenance attribute — a sibling family, never an ancestor.
+fn referencing_revision(
+    with_owner: bool,
+    without_priority: bool,
+    required: &[&str],
+) -> TypeRegistration {
+    let mut properties = requirement_properties(&["proposed", "approved"], with_owner, false);
+    properties["origin"] = serde_json::json!({
+        "$ref": format!("gts://{}", graph_storage_sdk::gts::PROVENANCE_ATTRIBUTE_TYPE)
+    });
+    if without_priority && let Some(map) = properties.as_object_mut() {
+        map.remove("priority");
+    }
+    requirement_revision(&properties, required, &["/payload/status"])
+}
+
+/// A `$ref` to a type outside the chain does not stop the comparison: adding an
+/// optional property to a closed payload is still proved compatible.
+pub async fn a_type_referencing_a_non_ancestor_gains_an_optional_property(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    let mut types = ontology_batch();
+    types.push(referencing_revision(false, false, &["key", "statement"]));
+    store
+        .register_types(&ctx, types)
+        .await
+        .expect("the type registers");
+
+    let registered = store
+        .register_types_with(
+            &ctx,
+            vec![referencing_revision(true, false, &["key", "statement"])],
+            update_options(),
+        )
+        .await
+        .expect("an optional property is admitted on a type with a non-ancestor reference");
+    let updated = registered
+        .iter()
+        .find(|item| item.record.type_id == EVOLVING)
+        .expect("the edited type is reported");
+    assert_eq!(
+        updated.basis,
+        Some(graph_storage_sdk::models::AdmissionBasis::SchemaProved)
+    );
+    assert_eq!(updated.record.revision, 2);
+}
+
+/// The same type still refuses what is not backward compatible: a removed
+/// property and a new required one.
+pub async fn a_type_referencing_a_non_ancestor_still_refuses_a_breaking_change(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    let mut types = ontology_batch();
+    types.push(referencing_revision(true, false, &["key", "statement"]));
+    store
+        .register_types(&ctx, types)
+        .await
+        .expect("the type registers");
+
+    let breaking = [
+        referencing_revision(true, true, &["key", "statement"]),
+        referencing_revision(true, false, &["key", "statement", "owner"]),
+    ];
+    for candidate in breaking {
+        let error = store
+            .register_types_with(&ctx, vec![candidate], update_options())
+            .await
+            .expect_err("a breaking change is refused");
+        assert!(
+            matches!(error, GraphStoreError::Conflict { .. }),
+            "a refused change is a conflict, not {error:?}"
+        );
+    }
+    let stored = store
+        .get_type(&ctx, &EVOLVING.to_owned())
+        .await
+        .expect("the type is untouched");
+    assert_eq!(stored.revision, 1);
+}
+
+/// The two view reads -- `get_node` and the hydration a traversal ends in --
+/// say whether a vector is stored, for a node that has one and a node that
+/// has none, and return the node as it was written. On the built-in store
+/// both read the presence from the database without fetching the vector.
+pub async fn the_view_reads_report_whether_a_vector_is_stored(
+    store: &impl GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    store
+        .register_types(&ctx, ontology_batch())
+        .await
+        .expect("ontology registers");
+    ingest_batch(
+        store,
+        &ctx,
+        batch(
+            vec![summarized(
+                "with-vector",
+                "Embedded",
+                "a text the provider embeds",
+            )],
+            Vec::new(),
+        ),
+    )
+    .await
+    .expect("the embedded batch commits");
+    // A node's name is always embedded, so the node without a vector is the
+    // one written with embedding switched off, and nothing stored before it.
+    let mut plain = batch(vec![node("without-vector", "Plain")], Vec::new());
+    plain.options.embed = Some(false);
+    ingest_batch(store, &ctx, plain)
+        .await
+        .expect("the unembedded batch commits");
+
+    let keys = ["with-vector".to_owned(), "without-vector".to_owned()];
+    let ids: Vec<_> = store
+        .resolve_node_ids(&ctx, &keys)
+        .await
+        .expect("the keys resolve")
+        .into_iter()
+        .map(|(_, id)| id)
+        .collect();
+    let hydrated = store
+        .hydrate_nodes(&ctx, &ids)
+        .await
+        .expect("hydration succeeds");
+    assert_eq!(hydrated.len(), 2, "both nodes hydrate: {hydrated:?}");
+
+    for (key, embedded) in [("with-vector", true), ("without-vector", false)] {
+        let view = store
+            .get_node(&ctx, &key.to_owned(), 10)
+            .await
+            .expect("the node is readable");
+        assert_eq!(view.has_embedding, embedded, "get_node on {key}");
+        let row = hydrated
+            .iter()
+            .find(|row| row.node_key == key)
+            .expect("the node is hydrated");
+        assert_eq!(row.has_embedding, embedded, "hydration of {key}");
+        assert_eq!(row.name, view.name, "both reads agree on {key}");
+        assert_eq!(row.payload, view.payload, "both reads agree on {key}");
+        assert_eq!(row.envelope, view.envelope, "both reads agree on {key}");
+    }
+}

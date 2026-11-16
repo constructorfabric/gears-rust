@@ -699,23 +699,23 @@ When constraints are present, the PEP compiles each constraint to SQL WHERE clau
 
 1. **Predicates within a constraint** (`predicates` array) are AND'd together
 2. **Multiple constraints** (`constraints` array) are OR'd together
-3. **Unknown predicate types** cause that constraint to be treated as false (fail-closed)
+3. **Validation and matching are separate:** reject undecodable responses and discard semantically invalid branches whole. A nonempty constraints array requires a valid branch, which may match nothing.
 
 #### Fail-Closed Rules
 
 The PEP MUST:
 
-1. **Validate decision** - `decision: false` or missing -> deny all (403 Forbidden)
-2. **Enforce require_constraints** - If `require_constraints: true` and `decision: true` but no `constraints` -> deny all (403 Forbidden)
-3. **Apply constraints when present** - If `constraints` array is present, apply to SQL; if all constraints evaluate to false -> deny all
+1. **Validate decision** - Deny `decision: false` (403 Forbidden); reject a missing `decision` as a decoding error.
+2. **Enforce require_constraints** - If `require_constraints: true` and `decision: true` but absent or empty `constraints` -> deny all (403 Forbidden)
+3. **Apply constraints** - Compile and enforce valid branches; fail if none compiles. Empty scopes follow [empty-scope handling](#permission-gates-and-empty-scopes).
 4. **Trust decision when constraints not required** - `decision: true` without `constraints` AND `require_constraints: false` -> allow (non-resource decisions only; all standard CRUD operations use `require_constraints: true`)
 5. **Handle unreachable PDP** - Network failure, timeout -> deny all
-6. **Handle unknown predicate types** - Treat containing constraint as false; if all constraints false -> deny all
-7. **Handle empty or missing predicates** - If a constraint has empty `predicates: []` or missing `predicates` field -> treat constraint as malformed -> deny all. Constraints MUST have at least one predicate.
-8. **Handle missing required fields** - Treat containing constraint as false
-9. **Handle unknown property names** - Treat containing constraint as false (PEP doesn't know how to map). This is a **PDP contract violation** — PDP MUST only return properties from the `supported_properties` list provided in the request. PEP MUST log this as an error for debugging, then fail-closed. If all constraints evaluate to false, deny access (403 Forbidden).
-10. **Handle empty constraints array** - If `constraints` field is present but empty (`constraints: []`) -> deny all. An empty array means no access paths exist (OR of empty set is false).
-11. **Handle empty value lists in set predicates** - If an `In`, `InGroup`, or `InGroupSubtree` predicate has an empty value list (`values: []`, `group_ids: []`, `ancestor_ids: []`) -> treat containing constraint as false (fail-closed). An empty set means "match nothing", which is semantically a deny. Passing it to the ORM would generate `WHERE col IN ()` — a SQL error on some engines. This is a **PDP contract violation**: a well-behaved PDP MUST NOT emit set predicates with empty lists.
+6. **Handle unknown predicate operators** - Unknown `op` is a decoding error; reject the entire response.
+7. **Handle empty predicate arrays** - `predicates: []` invalidates its branch; a missing `predicates` field rejects the response (rule #8).
+8. **Handle structurally invalid responses** - Reject missing required fields or invalid wire types. Semantic errors (e.g. malformed group UUIDs) invalidate the entire branch.
+9. **Handle unknown property names** - Properties outside `supported_properties` invalidate the branch and must be logged as PDP contract violations.
+10. **Handle absent or empty constraints** - With `decision: true`, absent or empty outer `constraints` yield `allow_all` only when `require_constraints: false`; otherwise reject. Empty `predicates` remain malformed (rule #7).
+11. **Handle empty value lists in set predicates** - Empty `In`/`InGroup`/`InGroupSubtree` sets are valid `FALSE` predicates, never SQL `IN ()`. Existing validation still applies; remove whole false branches as described under [Normalized scopes](#normalized-scopes).
 
 ---
 
@@ -743,6 +743,39 @@ No protocol-level differentiator is needed to tell PDP whether to apply subject 
 Adding a scope hint (e.g., `"scope_mode": "owner"`) would leak authorization logic into PEP, violating PDP/PEP separation. The PEP declares what it can enforce; the PDP decides what to enforce.
 
 For "my resources" endpoints (e.g., `GET /tasks/my`), PEP can either use a semantic `action.name` that PDP policies recognize (e.g., `list_own`), or apply `owner_id` as an application-level filter on top of authorization constraints — this is a UI filter, not an authorization decision.
+
+#### Permission gates and empty scopes
+
+`AccessRequest::allow_empty_scope` is PEP-local (never sent to the PDP), defaults to `false`, and is independent of `require_constraints`:
+
+| Compiled scope | Default (`false`) | `true` |
+|---|---|---|
+| Has live branches | Normalized scope | Same |
+| All branches are empty | `EnforcerError::AccessDenied(AccessDenial::ScopeMatchesNothing)` (403) | Empty scope with its originals |
+
+PDP denials and validation failures retain their existing error handling. Invalid branches are discarded individually, so `[valid-empty, invalid]` is a valid empty scope; strict rejection is separate work in [#5958](https://github.com/constructorfabric/gears-rust/issues/5958).
+
+The low-level `compile_to_access_scope` also refuses empty scopes (`ConstraintCompileError::ScopeMatchesNothing`; `EnforcerError::from` classifies it as `AccessDenial::ScopeMatchesNothing`). Opt in with `compile_to_access_scope_with_options` and `CompileOptions::new().allow_empty_scope(true)`.
+
+Keep the default for point operations and action gates. Opt in for:
+
+- **Scoped queries:** AND the whole scope with caller filters and execute against empty input to preserve backend semantics (e.g. an ungrouped `COUNT(*)` returns one row with `0`). Do not synthesize `[]`.
+- **Catalog gates:** return an empty catalog when `matches_nothing()` holds; otherwise apply catalog visibility rules.
+
+Row access must enforce the returned scope even when it is nonempty. Never widen it through caller-ID fallbacks or `allow_all()`. Empty outer `constraints: []` in a PDP response still follow `require_constraints` (rule #10).
+
+#### Normalized scopes
+
+Every `AccessScope` constructor removes whole branches made false by empty membership sets. General contradictions and data-dependent emptiness are not detected; empty `InTenantSubtree.descendant_status` disables the status filter.
+
+- `constraints()` contains live branches in input order and is used by enforcement and grant helpers. `original_constraints()` replays all input branches, including removed ones, for diagnostics or structural checks. Compiled originals are validated branches, not raw PDP JSON.
+- Live and removed branches (with their original positions) are stored once, without cloning payloads. No removed branches means no extra allocation; replay also allocates nothing.
+- With `is_unconstrained() == false`, no live branches means `is_deny_all()` and `matches_nothing()` are true. Equality compares both lists, positions and the flag, so an all-empty scope can differ from `deny_all()`.
+- Transforms (`tenant_only`, `tenant_and_owner`, `ensure_owner`, gear-local projections) start fresh from live branches: old removed branches are not inherited; new empty branches are retained in the result. `clone()` preserves both lists.
+
+The compiler validates branches before normalization. Storage checks only live branches, so diagnostics for removed branches are lost without widening access. INSERT rejects all-empty scopes even for `NotSet` columns.
+
+**Consumer limitations:** file-storage enforces only a tenant pin on nonempty scopes; resource-group memberships are scoped through their owning group.
 
 ---
 
@@ -945,9 +978,9 @@ The `barrier_mode` and `tenant_status` parameters apply to any scope source — 
 | `decision` | `constraints` | `require_constraints` | PEP Action |
 |------------|---------------|----------------------|------------|
 | `false` | (any) | (any) | **403 Forbidden** |
-| `true` | absent | `false` | Allow (trust PDP decision) |
-| `true` | absent | `true` | **403 Forbidden** (constraints required but missing) |
-| `true` | present | (any) | Apply constraints to SQL |
+| `true` | absent or empty | `false` | Allow (trust PDP decision) |
+| `true` | absent or empty | `true` | **403 Forbidden** (constraints required but missing) |
+| `true` | nonempty | (any) | Compile constraints; apply [empty-scope handling](#permission-gates-and-empty-scopes) |
 
 **Key insight:** PEP declares via `require_constraints` capability whether it needs constraints for the operation. For LIST operations, this should typically be `true`; for CREATE, it can be `false`.
 
@@ -1303,9 +1336,9 @@ The PEP declares its capabilities in the request. This determines what predicate
 
 #### `require_constraints` Flag
 
-The `require_constraints` field (separate from capabilities array) controls PEP behavior when constraints are absent:
+The `require_constraints` field (separate from capabilities array) controls PEP behavior when constraints are absent or the outer array is empty:
 
-| `require_constraints` | `decision: true` without `constraints` |
+| `require_constraints` | `decision: true` with absent or empty `constraints` |
 |-----------------------|----------------------------------------|
 | `true` | **deny** (constraints required but missing) |
 | `false` | **allow** (trust PDP decision) |

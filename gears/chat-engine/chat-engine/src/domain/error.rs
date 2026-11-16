@@ -223,7 +223,7 @@ impl From<authz_resolver_sdk::pep::EnforcerError> for ChatEngineError {
     fn from(err: authz_resolver_sdk::pep::EnforcerError) -> Self {
         use authz_resolver_sdk::pep::EnforcerError;
         match err {
-            EnforcerError::Denied { .. } => Self::Forbidden {
+            EnforcerError::AccessDenied(_) => Self::Forbidden {
                 reason: "authorization denied".to_string(),
             },
             EnforcerError::CompileFailed(cause) => {
@@ -238,6 +238,11 @@ impl From<authz_resolver_sdk::pep::EnforcerError> for ChatEngineError {
                     reason: "authorization unavailable".to_string(),
                 }
             }
+            // An unknown outcome class is an internal failure, never a denial.
+            unknown => Self::Internal {
+                reason: "authorization failed with an unknown outcome".to_string(),
+                source: Some(Box::new(unknown)),
+            },
         }
     }
 }

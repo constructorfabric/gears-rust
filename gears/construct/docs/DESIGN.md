@@ -684,7 +684,7 @@ Construct uses graph storage as it is (`cpt-cf-construct-adr-graph-storage-as-is
 |-------------------|---------------|---------|
 | Model endpoint | OpenAI chat completions API through OAGW, or the LLM gateway's API | Runs the planner loop and the sensitive-data checks |
 
-This is the PRD's LLM gateway actor (`cpt-cf-construct-actor-llm-gateway`): the platform's LLM gateway, or a service with the OpenAI chat completions API that the deployment's configuration sets. The model endpoint gets the record payload with its schema, the numbered profile values, and the tools. It never gets an ID. Configuration chooses the adapter. Construct approves no models and no endpoints. Model policy belongs to the LLM gateway. With the chat completions adapter, the deployment's configuration sets the endpoint.
+This is the PRD's LLM gateway actor (`cpt-cf-construct-actor-llm-gateway`): the platform's LLM gateway, or a service with the OpenAI chat completions API that the deployment's configuration sets. The model endpoint gets the record payload with its schema, the numbered profile values, and the tools. The prompt never holds an ID. Each call names its subject's id outside the prompt, in the `user` field of a chat completions call, so the model service can charge the call to that person. Configuration chooses the adapter. Construct approves no models and no endpoints. Model policy belongs to the LLM gateway. With the chat completions adapter, the deployment's configuration sets the endpoint.
 
 #### Audit Gear
 

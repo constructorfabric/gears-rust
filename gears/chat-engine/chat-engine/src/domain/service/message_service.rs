@@ -365,7 +365,13 @@ impl MessageService {
         // @cpt-cf-chat-engine-interface-pep
         let scope = self
             .enforcer
-            .access_scope(ctx, &resource_types::MESSAGE, actions::LIST, None)
+            .access_scope_with(
+                ctx,
+                &resource_types::MESSAGE,
+                actions::LIST,
+                None,
+                &AccessRequest::new().allow_empty_scope(true),
+            )
             .await?;
         // Ownership travels with the scope into the `WHERE` clause: post-
         // filtering a page would leave the paging counts wrong.

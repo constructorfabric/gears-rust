@@ -517,7 +517,13 @@ impl SessionService {
         // @cpt-cf-chat-engine-interface-pep
         let scope = self
             .enforcer
-            .access_scope(ctx, &resource_types::SESSION, actions::LIST, None)
+            .access_scope_with(
+                ctx,
+                &resource_types::SESSION,
+                actions::LIST,
+                None,
+                &AccessRequest::new().allow_empty_scope(true),
+            )
             .await?;
         let page = self.sessions.list_scoped(&scope, query).await?;
         Ok(page.map_items(redact_session))

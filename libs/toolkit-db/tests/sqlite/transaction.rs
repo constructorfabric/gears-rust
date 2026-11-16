@@ -13,7 +13,7 @@ use sea_orm::Set;
 use sea_orm::entity::prelude::*;
 use sea_orm_migration::prelude as mig;
 use toolkit_db::migration_runner::run_migrations_for_testing;
-use toolkit_db::secure::{Db, ScopableEntity, SecureEntityExt, secure_insert};
+use toolkit_db::secure::{Db, SecureEntityExt, secure_insert};
 use toolkit_db::{ConnectOpts, DbError, connect_db};
 use toolkit_security::access_scope::{ScopeConstraint, ScopeFilter};
 use toolkit_security::{AccessScope, pep_properties};
@@ -22,8 +22,14 @@ use uuid::Uuid;
 mod ent {
     use super::*;
 
-    #[derive(Debug, Clone, PartialEq, Eq, DeriveEntityModel)]
+    #[derive(Debug, Clone, PartialEq, Eq, DeriveEntityModel, toolkit_db::secure::Scopable)]
     #[sea_orm(table_name = "tx_test")]
+    #[secure(
+        tenant_col = "tenant_id",
+        resource_col = "resource_id",
+        no_owner,
+        no_type
+    )]
     pub struct Model {
         #[sea_orm(primary_key)]
         pub id: i64,
@@ -36,35 +42,6 @@ mod ent {
     pub enum Relation {}
 
     impl ActiveModelBehavior for ActiveModel {}
-}
-
-impl ScopableEntity for ent::Entity {
-    fn tenant_col() -> Option<<Self as EntityTrait>::Column> {
-        Some(ent::Column::TenantId)
-    }
-
-    fn resource_col() -> Option<<Self as EntityTrait>::Column> {
-        Some(ent::Column::ResourceId)
-    }
-
-    fn owner_col() -> Option<<Self as EntityTrait>::Column> {
-        None
-    }
-
-    fn type_col() -> Option<<Self as EntityTrait>::Column> {
-        None
-    }
-
-    fn resolve_property(property: &str) -> Option<<Self as EntityTrait>::Column> {
-        match property {
-            p if p == pep_properties::OWNER_TENANT_ID => Self::tenant_col(),
-            p if p == pep_properties::RESOURCE_ID => Self::resource_col(),
-            _ => None,
-        }
-    }
-    fn scope_columns() -> Vec<<Self as EntityTrait>::Column> {
-        vec![ent::Column::TenantId, ent::Column::ResourceId]
-    }
 }
 
 struct CreateTxTest;

@@ -1996,7 +1996,7 @@ proof reference was supplied on the allowed request, since Orders cannot observe
 but PolicyEnforcer/AccessScope returns compiled property constraints with no marker saying which
 alternative is delegated, so the local branch could not be built. Evaluating the proof in policy
 aligns with the platform rule "Use PolicyEnforcer from authz-resolver-sdk for all authorization
-decisions" and with D-34's no-local-evaluator stance; `EnforcerError::Denied` already surfaces a
+decisions" and with D-34's no-local-evaluator stance; `EnforcerError::AccessDenied` already surfaces a
 `DenyReason.error_code`, so only a request carrier and agreed codes are new, recorded under
 `…-upreq-pdp-policy-integration`. Rejected alternative: PDP returns a per-alternative delegation
 marker and Orders enforces proof — it needs a new PDP response contract and still keeps a local

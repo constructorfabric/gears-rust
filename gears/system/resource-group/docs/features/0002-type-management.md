@@ -438,7 +438,7 @@ Test setup: SQLite in-memory + TypeService + GroupService (for hierarchy safety 
 
 Existing tests cover `DomainError -> ResourceGroupError` and `DomainError -> Problem`, but miss conversions FROM external crate errors.
 
-#### TC-ERR-01: EnforcerError::Denied -> DomainError::AccessDenied [P1]
+#### TC-ERR-01: EnforcerError::AccessDenied -> DomainError::AccessDenied [P1]
 - **Covers**: G49
 - **Assert**: Mapping produces AccessDenied variant
 

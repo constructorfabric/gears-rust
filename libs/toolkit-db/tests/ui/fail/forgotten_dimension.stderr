@@ -1,0 +1,5 @@
+error[E0063]: missing field `type_col` in initializer of `toolkit_db::secure::Dimensions<_>`
+  --> tests/ui/fail/forgotten_dimension.rs:27:64
+   |
+27 |         const SCOPE: EntityScope<Column> = EntityScope::Scoped(Dimensions {
+   |                                                                ^^^^^^^^^^ missing `type_col`

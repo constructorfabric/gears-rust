@@ -109,6 +109,13 @@
               "pattern": "^https?://",
               "maxLength": 2048
             },
+            "remembered_notes": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500,
+              "pattern": "\\S",
+              "description": "One short statement the person asked to be remembered, in their own words, for example \"sister is called Anna\". Use it only when the person explicitly asks to remember something (\"remember that\", \"note that\", \"don't forget\") and it fits no other property. Never use it for facts the person merely mentions."
+            },
             "scopus_author_id": {
               "type": "string",
               "pattern": "^\\d+$",

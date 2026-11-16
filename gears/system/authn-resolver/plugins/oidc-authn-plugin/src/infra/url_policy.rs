@@ -1,9 +1,24 @@
 //! URL validation for outbound `IdP` communication.
 
-use reqwest::Url;
+use url::Url;
 
 /// Standard OIDC discovery document path appended to issuer/discovery bases.
 pub(crate) const OIDC_DISCOVERY_PATH: &str = "/.well-known/openid-configuration";
+
+/// `value` for a log line, without userinfo, query string and fragment: they
+/// can carry credentials (a signed `jwks_uri`, say). A value that does not
+/// parse is not logged at all.
+pub(crate) fn loggable_url(value: &str) -> String {
+    let Ok(mut url) = Url::parse(value) else {
+        return "<invalid URL>".to_owned();
+    };
+    // Both fail only for URLs without a host, which carry no userinfo.
+    url.set_username("").ok();
+    url.set_password(None).ok();
+    url.set_query(None);
+    url.set_fragment(None);
+    url.into()
+}
 
 /// URL security policy for IdP-facing endpoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,7 +32,7 @@ impl UrlSecurityPolicy {
     };
 
     /// Build a policy that permits plain HTTP for test-only mock servers.
-    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-util"))]
     pub const fn allow_insecure_http_for_tests() -> Self {
         Self {
             allow_insecure_http: true,
@@ -90,5 +105,27 @@ impl UrlSecurityPolicy {
         url.set_path(&discovery_path);
 
         Ok(url)
+    }
+}
+
+#[cfg(test)]
+mod loggable_url_tests {
+    use super::loggable_url;
+
+    #[test]
+    fn drops_userinfo_query_and_fragment() {
+        assert_eq!(
+            loggable_url("https://user:secret@idp.example.com:8443/certs?sig=abc#frag"),
+            "https://idp.example.com:8443/certs"
+        );
+    }
+
+    #[test]
+    fn keeps_a_plain_url_and_hides_an_invalid_one() {
+        assert_eq!(
+            loggable_url("https://idp.example.com/realms/a/certs"),
+            "https://idp.example.com/realms/a/certs"
+        );
+        assert_eq!(loggable_url("not a url ?token=x"), "<invalid URL>");
     }
 }

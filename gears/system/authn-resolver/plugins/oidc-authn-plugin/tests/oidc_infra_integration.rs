@@ -16,7 +16,7 @@ fn make_discovery(max_entries: usize, ttl_secs: u64) -> OidcDiscovery {
     OidcDiscovery::new_allowing_insecure_http_for_tests(
         ttl_secs,
         max_entries,
-        reqwest::Client::new(),
+        oidc_authn_plugin::infra::idp_http::IdpHttpClient::insecure_for_tests(),
         common::default_retry_policy_config(),
     )
 }
@@ -36,9 +36,9 @@ async fn oidc_discovery_cache_evicts_oldest_entry_at_capacity() -> anyhow::Resul
     let issuer_1 = server.issuer("realms/issuer1");
     let issuer_2 = server.issuer("realms/issuer2");
     let issuer_3 = server.issuer("realms/issuer3");
-    let issuer_1_url = reqwest::Url::parse(&issuer_1)?;
-    let issuer_2_url = reqwest::Url::parse(&issuer_2)?;
-    let issuer_3_url = reqwest::Url::parse(&issuer_3)?;
+    let issuer_1_url = url::Url::parse(&issuer_1)?;
+    let issuer_2_url = url::Url::parse(&issuer_2)?;
+    let issuer_3_url = url::Url::parse(&issuer_3)?;
 
     discovery.get_config(&issuer_1_url).await?;
     discovery.get_config(&issuer_2_url).await?;
@@ -70,8 +70,8 @@ async fn oidc_discovery_refreshing_existing_issuer_at_capacity_keeps_cache_full(
     let server = common::MockOidcServer::spawn()?;
     let issuer_1 = server.issuer("realms/issuer1");
     let issuer_2 = server.issuer("realms/issuer2");
-    let issuer_1_url = reqwest::Url::parse(&issuer_1)?;
-    let issuer_2_url = reqwest::Url::parse(&issuer_2)?;
+    let issuer_1_url = url::Url::parse(&issuer_1)?;
+    let issuer_2_url = url::Url::parse(&issuer_2)?;
     let discovery = make_discovery(2, 0);
 
     discovery.get_config(&issuer_2_url).await?;
@@ -90,7 +90,7 @@ async fn oidc_discovery_refreshing_existing_issuer_at_capacity_keeps_cache_full(
 async fn jwks_discovery_issuer_mismatch_rejects_before_jwks_fetch() -> anyhow::Result<()> {
     let server = common::MockOidcServer::spawn()?;
     let discovery_base = server.issuer("realms/attacker");
-    let discovery_base_url = reqwest::Url::parse(&discovery_base)?;
+    let discovery_base_url = url::Url::parse(&discovery_base)?;
     let fetcher = JwksFetcher::new(
         JwksFetcherConfig {
             ttl: Duration::from_hours(1),
@@ -101,7 +101,7 @@ async fn jwks_discovery_issuer_mismatch_rejects_before_jwks_fetch() -> anyhow::R
         },
         JwksFetcherDeps {
             discovery: Arc::new(make_discovery(10, 3600)),
-            client: reqwest::Client::new(),
+            client: oidc_authn_plugin::infra::idp_http::IdpHttpClient::insecure_for_tests(),
             metrics: common::create_test_metrics(),
             retry_policy: common::default_retry_policy_config(),
         },

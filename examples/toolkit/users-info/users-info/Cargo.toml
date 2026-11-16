@@ -22,7 +22,7 @@ integration = []    # gate integration tests
 users-info-sdk = { path = "../users-info-sdk", features = ["odata"] }
 
 # AuthZ resolver for authorization (PEP flow)
-authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", path = "../../../../gears/system/authz-resolver/authz-resolver-sdk" }
+authz-resolver-sdk = { workspace = true }
 authz-resolver = { workspace = true }
 
 # Core dependencies
@@ -73,6 +73,7 @@ toolkit-macros = { workspace = true }
 opentelemetry = { workspace = true }
 
 [dev-dependencies]
+authz-resolver-sdk = { workspace = true, features = ["test-util"] }
 tokio-util = { workspace = true }
 serde_json = { workspace = true }
 

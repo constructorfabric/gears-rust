@@ -125,3 +125,28 @@ fn mixed_filter_constraint_only_subtree_flips() {
     assert!(!its.respect_barriers());
     assert!(matches!(&filters[1], ScopeFilter::In(_)));
 }
+
+/// A projection builds its own scope from live branches: removed empty
+/// branches of the source are not carried over, on the early-return path
+/// (all-empty) or the mapping path (mixed).
+#[test]
+fn removed_empty_branches_are_not_carried_into_the_relaxed_scope() {
+    let root = Uuid::new_v4();
+    let dead = ScopeConstraint::new(vec![
+        ScopeFilter::InTenantSubtree(InTenantSubtreeScopeFilter::new(
+            pep_properties::OWNER_TENANT_ID,
+            root,
+        )),
+        ScopeFilter::in_uuids(pep_properties::RESOURCE_ID, vec![]),
+    ]);
+    let all_empty = AccessScope::from_constraints(vec![dead.clone()]);
+    assert_eq!(relax_barriers(&all_empty), AccessScope::deny_all());
+
+    let live = ScopeConstraint::new(vec![ScopeFilter::InTenantSubtree(
+        InTenantSubtreeScopeFilter::new(pep_properties::OWNER_TENANT_ID, root),
+    )]);
+    let mixed = AccessScope::from_constraints(vec![dead, live]);
+    let relaxed = relax_barriers(&mixed);
+    assert_eq!(relaxed.constraints().len(), 1);
+    assert!(relaxed.original_constraints().eq(relaxed.constraints()));
+}

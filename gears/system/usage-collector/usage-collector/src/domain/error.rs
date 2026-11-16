@@ -55,7 +55,7 @@ pub enum DomainError {
     },
 
     /// PDP-supplied deny on the requested operation. Surfaces both an explicit
-    /// `EnforcerError::Denied` and the fail-closed `EnforcerError::CompileFailed`
+    /// `EnforcerError::AccessDenied` and the fail-closed `EnforcerError::CompileFailed`
     /// branch; both collapse to the same deterministic platform authorization
     /// deny envelope and never derive a permissive fallback.
     #[error("authorization denied{}", reason.as_ref().map(|r| format!(": {r}")).unwrap_or_default())]
@@ -169,7 +169,7 @@ impl From<toolkit::plugins::ChoosePluginError> for DomainError {
 #[allow(unknown_lints, de1302_error_from_to_string)]
 impl From<authz_resolver_sdk::EnforcerError> for DomainError {
     fn from(e: authz_resolver_sdk::EnforcerError) -> Self {
-        use authz_resolver_sdk::EnforcerError;
+        use authz_resolver_sdk::{AccessDenial, EnforcerError};
         match e {
             // @cpt-begin:cpt-cf-usage-collector-flow-foundation-pdp-authorize:p1:inst-pdp-deny
             // @cpt-begin:cpt-cf-usage-collector-algo-foundation-pdp-authorize:p2:inst-algo-pdp-deny
@@ -177,11 +177,17 @@ impl From<authz_resolver_sdk::EnforcerError> for DomainError {
             // `DenyReason` field addition cannot leak struct internals into
             // operator logs. The wire envelope drops the reason; this string
             // only feeds the `tracing` Display path.
-            EnforcerError::Denied { deny_reason } => Self::AuthorizationDenied {
-                reason: deny_reason.map(|r| match r.details {
-                    Some(details) => format!("{}: {details}", r.error_code),
-                    None => r.error_code,
-                }),
+            EnforcerError::AccessDenied(AccessDenial::Pdp { reason }) => {
+                Self::AuthorizationDenied {
+                    reason: reason.map(|r| match r.details {
+                        Some(details) => format!("{}: {details}", r.error_code),
+                        None => r.error_code,
+                    }),
+                }
+            }
+            // PEP-local refusal; it carries no PDP reason.
+            EnforcerError::AccessDenied(local) => Self::AuthorizationDenied {
+                reason: Some(local.to_string()),
             },
             EnforcerError::CompileFailed(err) => Self::AuthorizationDenied {
                 reason: Some(err.to_string()),
@@ -197,6 +203,11 @@ impl From<authz_resolver_sdk::EnforcerError> for DomainError {
             // @cpt-end:cpt-cf-usage-collector-algo-foundation-pdp-authorize:p2:inst-algo-pdp-catch
             // @cpt-end:cpt-cf-usage-collector-flow-foundation-pdp-authorize:p1:inst-pdp-fail-closed
             // @cpt-end:cpt-cf-usage-collector-flow-foundation-pdp-authorize:p1:inst-pdp-resolver-catch
+            // An unknown outcome class is an internal failure, never a denial.
+            unknown => {
+                tracing::error!(error = %unknown, "authz failed with an unknown outcome");
+                Self::Internal("authorization failed with an unknown outcome".to_owned())
+            }
         }
     }
 }

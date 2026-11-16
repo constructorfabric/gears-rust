@@ -1020,6 +1020,44 @@ fn a_constrained_grant_on_the_tenant_is_not_a_cross_tenant_denial() {
     }
 }
 
+/// A branch that matches nothing (an empty resource-id set) grants the tenant
+/// nothing: the refusal stays cross-tenant rather than a narrower-grant one,
+/// and a live tenant-wide branch beside it still authorizes.
+#[test]
+fn a_tenant_named_only_in_a_branch_that_matches_nothing_is_a_cross_tenant_denial() {
+    use toolkit_security::{ScopeConstraint, ScopeFilter, pep_properties};
+    let tenant = Uuid::now_v7();
+    let dead = ScopeConstraint::new(vec![
+        ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant]),
+        ScopeFilter::in_uuids(pep_properties::RESOURCE_ID, vec![]),
+    ]);
+    let elsewhere = ScopeConstraint::new(vec![ScopeFilter::in_uuids(
+        pep_properties::OWNER_TENANT_ID,
+        vec![Uuid::now_v7()],
+    )]);
+    for scope in [
+        AccessScope::single(dead.clone()),
+        AccessScope::from_constraints(vec![dead.clone(), elsewhere]),
+    ] {
+        assert!(matches!(
+            authorize_tenant_scope(&scope, tenant, SourceDocType::InvoicePost),
+            Err(DomainError::CrossTenantAccessDenied(_))
+        ));
+    }
+    let own = ScopeConstraint::new(vec![ScopeFilter::in_uuids(
+        pep_properties::OWNER_TENANT_ID,
+        vec![tenant],
+    )]);
+    assert!(
+        authorize_tenant_scope(
+            &AccessScope::from_constraints(vec![dead, own]),
+            tenant,
+            SourceDocType::InvoicePost
+        )
+        .is_ok()
+    );
+}
+
 /// One labelled single-field change to an invoice intent.
 type InvoiceMutation = fn(&mut PostedInvoice);
 

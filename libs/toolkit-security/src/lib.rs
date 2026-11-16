@@ -69,8 +69,8 @@ pub mod tls;
 
 pub use access_scope::{
     AccessScope, EmptyScopeConstraint, EqScopeFilter, InGroupScopeFilter,
-    InGroupSubtreeScopeFilter, InScopeFilter, InTenantSubtreeScopeFilter, ScopeConstraint,
-    ScopeFilter, ScopeValue, pep_properties,
+    InGroupSubtreeScopeFilter, InScopeFilter, InTenantSubtreeScopeFilter, OriginalConstraints,
+    ScopeConstraint, ScopeFilter, ScopeValue, pep_properties,
 };
 pub use authenticator::{
     AuthNError, BearerAuthenticator, DynBearerAuthenticator, DynInternalAuthenticator,

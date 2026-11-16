@@ -753,3 +753,26 @@ async fn a_purge_bound_to_a_creation_instant_leaves_a_later_node_alone() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn the_view_reads_report_whether_a_vector_is_stored() {
+    conformance::the_view_reads_report_whether_a_vector_is_stored(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn a_type_referencing_a_non_ancestor_gains_an_optional_property() {
+    conformance::a_type_referencing_a_non_ancestor_gains_an_optional_property(
+        &store(),
+        Uuid::now_v7(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_type_referencing_a_non_ancestor_still_refuses_a_breaking_change() {
+    conformance::a_type_referencing_a_non_ancestor_still_refuses_a_breaking_change(
+        &store(),
+        Uuid::now_v7(),
+    )
+    .await;
+}

@@ -41,6 +41,25 @@ impl PolicyEnforcerAuthorizer {
             enforcer: PolicyEnforcer::new(authz),
         }
     }
+
+    async fn authorize_with_request(
+        &self,
+        ctx: &SecurityContext,
+        action: &str,
+        file_id: Option<Uuid>,
+        request: AccessRequest,
+    ) -> Result<AccessScope, DomainError> {
+        self.enforcer
+            .access_scope_with(ctx, &FILE_RESOURCE, action, file_id, &request)
+            .await
+            .map_err(|e| map_enforcer_error(&e))
+    }
+}
+
+fn file_request(ctx: &SecurityContext, gts_file_type: &str) -> AccessRequest {
+    AccessRequest::new()
+        .resource_property(pep_properties::OWNER_TENANT_ID, ctx.subject_tenant_id())
+        .resource_property(GTS_FILE_TYPE_PROP, gts_file_type.to_owned())
 }
 
 #[async_trait]
@@ -52,20 +71,32 @@ impl Authorizer for PolicyEnforcerAuthorizer {
         gts_file_type: &str,
         file_id: Option<Uuid>,
     ) -> Result<AccessScope, DomainError> {
-        let request = AccessRequest::new()
-            .resource_property(pep_properties::OWNER_TENANT_ID, ctx.subject_tenant_id())
-            .resource_property(GTS_FILE_TYPE_PROP, gts_file_type.to_owned());
-
-        self.enforcer
-            .access_scope_with(ctx, &FILE_RESOURCE, action, file_id, &request)
+        let request = file_request(ctx, gts_file_type);
+        self.authorize_with_request(ctx, action, file_id, request)
             .await
-            .map_err(|e| map_enforcer_error(&e))
+    }
+
+    async fn authorize_allow_empty(
+        &self,
+        ctx: &SecurityContext,
+        action: &str,
+        gts_file_type: &str,
+        file_id: Option<Uuid>,
+    ) -> Result<AccessScope, DomainError> {
+        let request = file_request(ctx, gts_file_type).allow_empty_scope(true);
+        self.authorize_with_request(ctx, action, file_id, request)
+            .await
     }
 }
 
 fn map_enforcer_error(e: &EnforcerError) -> DomainError {
     match e {
-        EnforcerError::Denied { .. } | EnforcerError::CompileFailed(_) => DomainError::Forbidden,
+        EnforcerError::AccessDenied(_) | EnforcerError::CompileFailed(_) => DomainError::Forbidden,
         EnforcerError::EvaluationFailed(_) => DomainError::InternalError,
+        // An unknown outcome class is an internal failure, never a denial.
+        unknown => {
+            tracing::error!(error = %unknown, "authz failed with an unknown outcome");
+            DomainError::InternalError
+        }
     }
 }

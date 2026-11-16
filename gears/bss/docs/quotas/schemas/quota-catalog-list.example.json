@@ -1,0 +1,88 @@
+{
+  "rows": [
+    {
+      "definition_id": "4a1e7d60-34b2-4e5b-8709-eab681e15940",
+      "version": "1",
+      "definition_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "sku_id": "6ec734f1-d3fb-4722-85ea-108132e61e27",
+      "sku_version": "3",
+      "metric_ref": "gts.cf.bss.products.quota_metric.v1~cf.bss.products.vcpu.v1",
+      "metric_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "quota_kind": "allocation",
+      "display_name": "Virtual CPUs",
+      "description": "Maximum total number of vCPUs allocated to the tenant's virtual machines.",
+      "locale": "en",
+      "canonical_unit_ref": "gts.cf.bss.products.quota_unit.v1~cf.bss.products.vcpu.v1",
+      "allowed_units": [
+        {
+          "unit_ref": "gts.cf.bss.products.quota_unit.v1~cf.bss.products.vcpu.v1",
+          "digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "symbol": "vCPU",
+          "numerator": "1",
+          "denominator": "1",
+          "min": "0",
+          "step": "1",
+          "max": "1024"
+        }
+      ],
+      "subject_type_ref": "gts.cf.core.compute.tenant.v1~",
+      "resource_type_refs": [
+        "gts.cf.core.compute.vm.v1~"
+      ],
+      "mapping_ref": {
+        "id": "af93a4ef-3316-4273-8112-e244823a4f55",
+        "version": "1",
+        "digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "profile_ref": {
+        "id": "832ebd19-94f6-4a04-aa52-9681d3b2f053",
+        "version": "1",
+        "digest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "qualification_ref": {
+        "id": "5bd5231a-7c8d-4b05-9fd1-36e93dcab65f",
+        "version": "1",
+        "digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "profile_conditions": "Allocated vCPUs count while a virtual machine is stopped. The allowance is shared within the selected region and resource pool only.",
+      "supported_bases": [
+        "Fixed",
+        "PerPlanUnit"
+      ],
+      "availability": {
+        "state": "enabled",
+        "revision": "7",
+        "observed_at": "2026-11-13T12:00:00Z",
+        "reason_code": null
+      },
+      "accounting_policy_ref": "gts.cf.bss.products.quota_accounting_policy.v1~cf.bss.products.allocated_vcpu.v1",
+      "accounting_policy_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+      "accounting_policy": {
+        "id": "gts.cf.bss.products.quota_accounting_policy.v1~cf.bss.products.allocated_vcpu.v1",
+        "quantity_basis": "allocated_capacity",
+        "aggregation": "sum",
+        "description": {
+          "en": "Counts allocated vCPUs, including stopped virtual machines."
+        }
+      },
+      "scope_policy_ref": "gts.cf.bss.products.quota_scope_policy.v1~cf.bss.products.regional_pool.v1",
+      "scope_policy_digest": "3333333333333333333333333333333333333333333333333333333333333333",
+      "scope_policy": {
+        "id": "gts.cf.bss.products.quota_scope_policy.v1~cf.bss.products.regional_pool.v1",
+        "subject_selector": "resource_owner",
+        "aggregation": "single_verified_scope",
+        "required_dimensions": [
+          "region",
+          "resource_pool"
+        ]
+      },
+      "change_support": {
+        "initial_set": true,
+        "increase": true
+      }
+    }
+  ],
+  "page_info": {
+    "next_cursor": null
+  }
+}

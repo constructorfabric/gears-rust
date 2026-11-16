@@ -1734,7 +1734,7 @@ Chat Engine maps `EnforcerError` (and 0-row point-op outcomes) onto `ChatEngineE
 
 | Condition | Mapping | Client status |
 |-----------|---------|---------------|
-| `EnforcerError::Denied` — type-level deny (LIST/CREATE/UPDATE/DELETE, or READ where the type is not permitted) | `ChatEngineError::Forbidden` | **403** |
+| `EnforcerError::AccessDenied` — type-level deny (LIST/CREATE/UPDATE/DELETE, or READ where the type is not permitted) | `ChatEngineError::Forbidden` | **403** |
 | Point op where the resource exists but is out of the caller's scope (scoped query returns 0 rows) | `ChatEngineError::NotFound` | **404** (hide existence) |
 | `EnforcerError::CompileFailed` — missing/unknown/empty constraints | `ChatEngineError::Forbidden` | **403** (fail-closed) |
 | `EnforcerError::EvaluationFailed` — PDP unreachable, timeout, or invalid response | `ChatEngineError::Forbidden` | **403** (fail-closed) |
@@ -1743,7 +1743,7 @@ Chat Engine deliberately maps **`EvaluationFailed` to 403, not 503/500**: PDP av
 
 ### 3.5.6 Session-type permission model
 
-`session_type` create/update/delete are authorized by a **PDP permission decision** (a non-resource `access_scope_with(require_constraints=false)` call), not a hardcoded token-scope. `EnforcerError::Denied` → 403. The `session_types` entity stays `#[secure(unrestricted)]`; authorization is a decision gate, not a SQL constraint. Session-type **reads** (`list`/`get`) remain `.authenticated()`-only with no PDP call (public catalog within the tenant).
+`session_type` create/update/delete are authorized by a **PDP permission decision** (a non-resource `access_scope_with(require_constraints=false)` call), not a hardcoded token-scope. `EnforcerError::AccessDenied` → 403. The `session_types` entity stays `#[secure(unrestricted)]`; authorization is a decision gate, not a SQL constraint. Session-type **reads** (`list`/`get`) remain `.authenticated()`-only with no PDP call (public catalog within the tenant).
 
 ### 3.5.7 Trusted-internal writes and the bypass registry
 

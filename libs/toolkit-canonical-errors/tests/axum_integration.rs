@@ -123,6 +123,97 @@ fn service_unavailable_status_override_keeps_retry_after_header() {
 }
 
 #[test]
+fn resource_exhausted_sets_retry_after_header_from_violation_hint() {
+    let response = AxumTestR::resource_exhausted("Queue depth limit reached")
+        .with_quota_violation("QUEUE_DEPTH_LIMIT", "Queue holds 10000 tasks")
+        .with_quota_violation_retry_after_seconds(30)
+        .create()
+        .into_response();
+
+    assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response.headers().get(http::header::RETRY_AFTER),
+        Some(&http::HeaderValue::from_static("30"))
+    );
+}
+
+#[test]
+fn resource_exhausted_retry_after_header_is_largest_violation_hint() {
+    let response = AxumTestR::resource_exhausted("Several limits reached")
+        .with_quota_violation("CONCURRENCY_LIMIT", "Queue runs 64 tasks")
+        .with_quota_violation_retry_after_seconds(2)
+        .with_quota_violation("QUEUE_DEPTH_LIMIT", "Queue holds 10000 tasks")
+        .with_quota_violation_retry_after_seconds(25)
+        .with_quota_violation("EVENT_WAIT_LIMIT", "Tenant has 1000 event waits")
+        .create()
+        .into_response();
+
+    assert_eq!(
+        response.headers().get(http::header::RETRY_AFTER),
+        Some(&http::HeaderValue::from_static("25"))
+    );
+}
+
+#[test]
+fn resource_exhausted_without_violation_hints_omits_retry_after_header() {
+    let response = AxumTestR::resource_exhausted("Storage quota exhausted")
+        .with_quota_violation("storage_bytes", "No space left in the tenant quota")
+        .create()
+        .into_response();
+
+    assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+    assert!(response.headers().get(http::header::RETRY_AFTER).is_none());
+}
+
+#[test]
+fn resource_exhausted_zero_hint_emits_zero_header() {
+    let response = AxumTestR::resource_exhausted("Rate limited")
+        .with_quota_violation("requests_per_second", "Limit of 10 per second")
+        .with_quota_violation_retry_after_seconds(0)
+        .create()
+        .into_response();
+
+    assert_eq!(
+        response.headers().get(http::header::RETRY_AFTER),
+        Some(&http::HeaderValue::from_static("0"))
+    );
+}
+
+#[test]
+fn resource_exhausted_problem_from_upstream_json_sets_retry_after_header() {
+    // A 429 relayed from another service arrives as a Problem, not a CanonicalError.
+    let mut problem = Problem::from(
+        AxumTestR::resource_exhausted("Rate limited")
+            .with_quota_violation("requests_per_minute", "Limit of 100 per minute")
+            .create(),
+    );
+    problem.context["violations"][0]["retry_after_seconds"] = serde_json::json!(45);
+
+    let response = problem.into_response();
+
+    assert_eq!(
+        response.headers().get(http::header::RETRY_AFTER),
+        Some(&http::HeaderValue::from_static("45"))
+    );
+}
+
+#[test]
+fn malformed_resource_exhausted_context_omits_retry_after_header() {
+    let mut problem = Problem::from(
+        AxumTestR::resource_exhausted("Rate limited")
+            .with_quota_violation("requests_per_minute", "Limit of 100 per minute")
+            .with_quota_violation_retry_after_seconds(30)
+            .create(),
+    );
+    problem.context["violations"][0]["retry_after_seconds"] = serde_json::json!("soon");
+
+    let response = problem.into_response();
+
+    assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+    assert!(response.headers().get(http::header::RETRY_AFTER).is_none());
+}
+
+#[test]
 fn canonical_error_into_response_delegates_through_problem() {
     let err = CanonicalError::internal("db failure").create();
     let response = err.into_response();

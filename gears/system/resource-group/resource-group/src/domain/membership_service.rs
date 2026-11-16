@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use authz_resolver_sdk::pep::{PolicyEnforcer, ResourceType};
+use authz_resolver_sdk::pep::{AccessRequest, PolicyEnforcer, ResourceType};
 use resource_group_sdk::{GROUP_MEMBERSHIP_RESOURCE_TYPE, models::ResourceGroupMembership};
 use toolkit_db::secure::TxConfig;
 use toolkit_odata::{ODataQuery, Page};
@@ -38,7 +38,7 @@ pub const RG_MEMBERSHIP_RESOURCE: ResourceType = ResourceType::from_static(
 #[must_use]
 pub(crate) fn group_scope_for_membership(scope: &AccessScope) -> AccessScope {
     if scope.is_unconstrained() {
-        return scope.clone();
+        return AccessScope::allow_all();
     }
     let foreign_property = scope.constraints().iter().any(|c| {
         c.filters()
@@ -48,7 +48,7 @@ pub(crate) fn group_scope_for_membership(scope: &AccessScope) -> AccessScope {
     if foreign_property {
         AccessScope::deny_all()
     } else {
-        scope.clone()
+        AccessScope::from_constraints(scope.constraints().to_vec())
     }
 }
 
@@ -413,7 +413,13 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         // AuthZ gate: verify the caller can list memberships
         let scope = self
             .enforcer
-            .access_scope(ctx, &RG_MEMBERSHIP_RESOURCE, "list", None)
+            .access_scope_with(
+                ctx,
+                &RG_MEMBERSHIP_RESOURCE,
+                "list",
+                None,
+                &AccessRequest::new().allow_empty_scope(true),
+            )
             .await
             .map_err(DomainError::from)?;
 
@@ -510,5 +516,32 @@ mod tests {
             )]),
         ]);
         assert_eq!(group_scope_for_membership(&mixed), AccessScope::deny_all());
+    }
+
+    /// The narrowed scope is built from live branches only: removed empty
+    /// branches of the source are not carried over.
+    #[test]
+    fn group_scope_for_membership_does_not_carry_removed_branches() {
+        let tenant = Uuid::now_v7();
+        let dead = ScopeConstraint::new(vec![
+            ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, tenant),
+            ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![]),
+        ]);
+        let all_empty = AccessScope::from_constraints(vec![dead.clone()]);
+        assert_eq!(
+            group_scope_for_membership(&all_empty),
+            AccessScope::deny_all()
+        );
+
+        let mixed = AccessScope::from_constraints(vec![
+            dead,
+            ScopeConstraint::new(vec![ScopeFilter::eq(
+                pep_properties::OWNER_TENANT_ID,
+                tenant,
+            )]),
+        ]);
+        let narrowed = group_scope_for_membership(&mixed);
+        assert_eq!(narrowed.constraints(), mixed.constraints());
+        assert!(narrowed.original_constraints().eq(narrowed.constraints()));
     }
 }

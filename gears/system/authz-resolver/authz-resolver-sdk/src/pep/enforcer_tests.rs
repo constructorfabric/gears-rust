@@ -286,6 +286,7 @@ async fn evaluate_times_out_when_pdp_is_slow() {
         .expect_err("a PDP slower than the deadline must fail fast");
 
     assert!(matches!(err, EnforcerError::EvaluationFailed(_)));
+    assert!(err.is_pdp_unavailable(), "a timed-out PDP is unavailable");
     assert!(
         start.elapsed() < std::time::Duration::from_secs(1),
         "the deadline must bound the call to well under the PDP's response time"
@@ -650,7 +651,9 @@ async fn access_scope_denied_returns_denied_error() {
 
     assert!(matches!(
         result,
-        Err(EnforcerError::Denied { deny_reason: None })
+        Err(EnforcerError::AccessDenied(AccessDenial::Pdp {
+            reason: None
+        }))
     ));
 }
 
@@ -664,7 +667,9 @@ async fn access_scope_denied_with_reason() {
     let result = e.access_scope(&ctx, &TEST_RESOURCE, "get", None).await;
 
     match result {
-        Err(EnforcerError::Denied { deny_reason }) => {
+        Err(EnforcerError::AccessDenied(AccessDenial::Pdp {
+            reason: deny_reason,
+        })) => {
             let reason = deny_reason.expect("should have deny_reason");
             assert_eq!(reason.error_code, "INSUFFICIENT_PERMISSIONS");
             assert_eq!(reason.details.as_deref(), Some("Missing admin role"));
@@ -692,7 +697,9 @@ async fn access_scope_anonymous_denied_by_pdp() {
 
     assert!(matches!(
         result,
-        Err(EnforcerError::Denied { deny_reason: None })
+        Err(EnforcerError::AccessDenied(AccessDenial::Pdp {
+            reason: None
+        }))
     ));
 }
 
@@ -719,6 +726,7 @@ fn access_request_default_is_empty() {
     let req = AccessRequest::new();
     assert!(req.resource_properties.is_empty());
     assert!(req.tenant_context.is_none());
+    assert!(req.require_constraints.is_none());
 }
 
 #[test]
@@ -1098,4 +1106,646 @@ fn explicit_root_id_overrides_subject_tenant() {
 
     let tc = request.context.tenant_context.as_ref().unwrap();
     assert_eq!(tc.root_id, Some(explicit_tenant));
+}
+
+// ── empty scopes: default vs allow_empty_scope ───────
+
+/// Request for scoped queries that apply the whole scope.
+fn allow_empty() -> AccessRequest {
+    AccessRequest::new().allow_empty_scope(true)
+}
+
+/// PDP returning a fixed decision and constraint list.
+struct FixedResponse {
+    decision: bool,
+    deny_reason: Option<crate::models::DenyReason>,
+    constraints: Vec<Constraint>,
+}
+
+impl FixedResponse {
+    fn permit(constraints: Vec<Constraint>) -> Self {
+        Self {
+            decision: true,
+            deny_reason: None,
+            constraints,
+        }
+    }
+}
+
+#[async_trait]
+impl AuthZResolverApi for FixedResponse {
+    async fn evaluate(
+        &self,
+        _: PlatformSecurityContext,
+        _: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        Ok(EvaluationResponse {
+            decision: self.decision,
+            context: EvaluationResponseContext {
+                constraints: self.constraints.clone(),
+                deny_reason: self.deny_reason.clone(),
+            },
+        })
+    }
+}
+
+const OTHER_TENANT: &str = "44444444-4444-4444-4444-444444444444";
+
+fn tenant_in(tenant: &str) -> Predicate {
+    Predicate::In(InPredicate::new(
+        pep_properties::OWNER_TENANT_ID,
+        [uuid(tenant)],
+    ))
+}
+
+/// Every empty set predicate kind, each in a branch that passes all other
+/// validation (tenant co-location, `id` property, negotiated capability).
+fn empty_set_predicates() -> Vec<Predicate> {
+    vec![
+        Predicate::In(InPredicate::new(
+            pep_properties::RESOURCE_ID,
+            Vec::<Uuid>::new(),
+        )),
+        Predicate::InGroup(InGroupPredicate::new(
+            pep_properties::RESOURCE_ID,
+            Vec::<Uuid>::new(),
+        )),
+        Predicate::InGroupSubtree(crate::constraints::InGroupSubtreePredicate::new(
+            pep_properties::RESOURCE_ID,
+            Vec::<Uuid>::new(),
+        )),
+    ]
+}
+
+fn group_enforcer(mock: FixedResponse) -> PolicyEnforcer {
+    enforcer(mock).with_capabilities(vec![
+        Capability::GroupMembership,
+        Capability::GroupHierarchy,
+    ])
+}
+
+#[tokio::test]
+async fn all_empty_scope_is_refused_by_default_and_returned_when_allowed() {
+    for empty in empty_set_predicates() {
+        let dead = Constraint {
+            predicates: vec![tenant_in(TENANT), empty.clone()],
+        };
+        for require in [true, false] {
+            let request = AccessRequest::new().require_constraints(require);
+            let pep = group_enforcer(FixedResponse::permit(vec![dead.clone()]));
+
+            let gate = pep
+                .access_scope_with(
+                    &test_ctx(),
+                    &GROUP_ENABLED_TEST_RESOURCE,
+                    "list",
+                    None,
+                    &request,
+                )
+                .await;
+            assert!(
+                matches!(
+                    gate,
+                    Err(EnforcerError::AccessDenied(
+                        AccessDenial::ScopeMatchesNothing
+                    ))
+                ),
+                "{empty:?} require={require}: {gate:?}"
+            );
+
+            let scope = pep
+                .access_scope_with(
+                    &test_ctx(),
+                    &GROUP_ENABLED_TEST_RESOURCE,
+                    "list",
+                    None,
+                    &request.clone().allow_empty_scope(true),
+                )
+                .await
+                .expect("a permitted empty scope is a scope");
+            assert!(!scope.is_unconstrained(), "must never widen to allow_all");
+            assert!(scope.matches_nothing());
+            assert!(scope.is_deny_all(), "operationally deny-all");
+            assert!(scope.constraints().is_empty(), "empty branch is normalized");
+            let originals: Vec<_> = scope.original_constraints().collect();
+            assert_eq!(originals.len(), 1, "empty branch is kept as an original");
+            assert_eq!(originals[0].filters().len(), 2);
+            assert_ne!(scope, AccessScope::deny_all(), "provenance is kept");
+        }
+    }
+}
+
+#[tokio::test]
+async fn defaults_refuse_empty_scope_and_allow_flag_is_resettable() {
+    let dead = Constraint {
+        predicates: vec![tenant_in(TENANT), empty_set_predicates().remove(0)],
+    };
+    let pep = enforcer(FixedResponse::permit(vec![dead]));
+    assert!(matches!(
+        pep.access_scope(&test_ctx(), &TEST_RESOURCE, "list", None)
+            .await,
+        Err(EnforcerError::AccessDenied(
+            AccessDenial::ScopeMatchesNothing
+        ))
+    ));
+    // Every request that does not end with the flag set is fail-closed,
+    // including one where it was set and then reset.
+    for request in [
+        AccessRequest::new(),
+        AccessRequest::default(),
+        AccessRequest::new().allow_empty_scope(false),
+        allow_empty().allow_empty_scope(false),
+    ] {
+        let result = pep
+            .access_scope_with(&test_ctx(), &TEST_RESOURCE, "list", None, &request)
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(EnforcerError::AccessDenied(
+                    AccessDenial::ScopeMatchesNothing
+                ))
+            ),
+            "{request:?}: {result:?}"
+        );
+    }
+    let scope = pep
+        .access_scope_with(&test_ctx(), &TEST_RESOURCE, "list", None, &allow_empty())
+        .await
+        .expect("empty scope is a scope");
+    assert!(scope.matches_nothing() && scope.is_deny_all());
+    assert_eq!(scope.original_constraints().len(), 1);
+}
+
+#[tokio::test]
+async fn allow_empty_scope_is_never_sent_to_the_pdp() {
+    // Requests differing only in the PEP-local flag, with every PDP-facing
+    // option set, must produce the same serialized evaluation request.
+    let base = AccessRequest::new()
+        .resource_property(pep_properties::OWNER_TENANT_ID, uuid(TENANT))
+        .context_tenant_id(uuid(OTHER_TENANT))
+        .tenant_mode(TenantMode::RootOnly)
+        .barrier_mode(BarrierMode::Ignore)
+        .tenant_status(vec!["active".to_owned()])
+        .require_constraints(false);
+    let mut sent = Vec::new();
+    for request in [
+        base.clone().allow_empty_scope(false),
+        base.allow_empty_scope(true),
+    ] {
+        let mock = CapturingMock::new();
+        let captured = mock.captured.clone();
+        enforcer(mock)
+            .access_scope_with(
+                &test_ctx(),
+                &TEST_RESOURCE,
+                "list",
+                Some(uuid(RESOURCE)),
+                &request,
+            )
+            .await
+            .expect("capturing mock permits");
+        let (_, evaluation) = captured.lock().unwrap().take().expect("PDP was called");
+        sent.push(serde_json::to_value(&evaluation).unwrap());
+    }
+    assert_eq!(sent[0], sent[1]);
+    assert_eq!(sent[0]["context"]["require_constraints"], false);
+}
+
+#[tokio::test]
+async fn mixed_or_scope_is_identical_for_both_flags_and_normalizes_dead_branch() {
+    for empty in empty_set_predicates() {
+        let dead = Constraint {
+            predicates: vec![tenant_in(OTHER_TENANT), empty],
+        };
+        let live = Constraint {
+            predicates: vec![tenant_in(TENANT)],
+        };
+        let pep = group_enforcer(FixedResponse::permit(vec![dead, live]));
+
+        let gate = pep
+            .access_scope(&test_ctx(), &GROUP_ENABLED_TEST_RESOURCE, "list", None)
+            .await
+            .expect("live branch keeps the permit");
+        let full = pep
+            .access_scope_with(
+                &test_ctx(),
+                &GROUP_ENABLED_TEST_RESOURCE,
+                "list",
+                None,
+                &allow_empty(),
+            )
+            .await
+            .expect("live branch keeps the permit");
+        assert_eq!(gate, full, "the flag only decides all-empty scopes");
+
+        assert_eq!(full.constraints().len(), 1, "dead branch is normalized");
+        assert!(!full.constraints()[0].matches_nothing());
+        assert!(!full.matches_nothing());
+        let originals: Vec<_> = full.original_constraints().collect();
+        assert_eq!(originals.len(), 2);
+        assert!(originals[0].matches_nothing(), "original order is kept");
+        assert_eq!(originals[1], &full.constraints()[0]);
+        assert!(!full.contains_uuid(pep_properties::OWNER_TENANT_ID, uuid(OTHER_TENANT)));
+        assert_eq!(
+            full.all_uuid_values_for(pep_properties::OWNER_TENANT_ID),
+            vec![uuid(TENANT)]
+        );
+        assert_eq!(
+            full.tenant_only()
+                .all_uuid_values_for(pep_properties::OWNER_TENANT_ID),
+            vec![uuid(TENANT)]
+        );
+    }
+}
+
+#[tokio::test]
+async fn default_leaves_live_and_unconstrained_scopes_untouched() {
+    let live = vec![
+        Constraint {
+            predicates: vec![tenant_in(TENANT)],
+        },
+        Constraint {
+            predicates: vec![tenant_in(OTHER_TENANT)],
+        },
+    ];
+    let pep = enforcer(FixedResponse::permit(live));
+    let gate = pep
+        .access_scope(&test_ctx(), &TEST_RESOURCE, "list", None)
+        .await
+        .unwrap();
+    let full = pep
+        .access_scope_with(&test_ctx(), &TEST_RESOURCE, "list", None, &allow_empty())
+        .await
+        .unwrap();
+    assert_eq!(gate, full);
+    assert_eq!(gate.constraints().len(), 2);
+
+    // Absent constraints: require=false is an unrestricted permit on both
+    // paths (the empty-scope check must not turn it into a refusal);
+    // require=true fails.
+    let pep = enforcer(FixedResponse::permit(vec![]));
+    let request = AccessRequest::new().require_constraints(false);
+    for scope in [
+        pep.access_scope_with(&test_ctx(), &TEST_RESOURCE, "list", None, &request)
+            .await,
+        pep.access_scope_with(
+            &test_ctx(),
+            &TEST_RESOURCE,
+            "list",
+            None,
+            &request.clone().allow_empty_scope(true),
+        )
+        .await,
+    ] {
+        assert!(scope.expect("allow_all").is_unconstrained());
+    }
+    for result in [
+        pep.access_scope(&test_ctx(), &TEST_RESOURCE, "list", None)
+            .await,
+        pep.access_scope_with(&test_ctx(), &TEST_RESOURCE, "list", None, &allow_empty())
+            .await,
+    ] {
+        assert!(matches!(
+            result,
+            Err(EnforcerError::CompileFailed(
+                ConstraintCompileError::ConstraintsRequiredButAbsent
+            ))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn pdp_denial_keeps_its_reason_on_both_paths_even_with_empty_sets() {
+    let dead = Constraint {
+        predicates: vec![tenant_in(TENANT), empty_set_predicates().remove(0)],
+    };
+    let pep = enforcer(FixedResponse {
+        decision: false,
+        deny_reason: Some(crate::models::DenyReason {
+            error_code: "NO_LIST".to_owned(),
+            details: None,
+        }),
+        constraints: vec![dead],
+    });
+    for result in [
+        pep.access_scope(&test_ctx(), &TEST_RESOURCE, "list", None)
+            .await,
+        pep.access_scope_with(&test_ctx(), &TEST_RESOURCE, "list", None, &allow_empty())
+            .await,
+    ] {
+        match result {
+            Err(EnforcerError::AccessDenied(AccessDenial::Pdp {
+                reason: Some(reason),
+            })) => assert_eq!(reason.error_code, "NO_LIST"),
+            other => panic!("expected PDP denial with reason, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn reasonless_pdp_denial_stays_denied_and_differs_from_an_empty_scope() {
+    let dead = Constraint {
+        predicates: vec![tenant_in(TENANT), empty_set_predicates().remove(0)],
+    };
+    let deny = enforcer(FixedResponse {
+        decision: false,
+        deny_reason: None,
+        constraints: vec![dead.clone()],
+    });
+    let empty = enforcer(FixedResponse::permit(vec![dead]));
+    for request in [AccessRequest::new(), allow_empty()] {
+        let denied = deny
+            .access_scope_with(&test_ctx(), &TEST_RESOURCE, "list", None, &request)
+            .await;
+        assert!(
+            matches!(
+                denied,
+                Err(EnforcerError::AccessDenied(AccessDenial::Pdp {
+                    reason: None
+                }))
+            ),
+            "a PDP deny is never reported as an empty scope: {denied:?}"
+        );
+    }
+    let refused = empty
+        .access_scope(&test_ctx(), &TEST_RESOURCE, "list", None)
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(EnforcerError::AccessDenied(
+                AccessDenial::ScopeMatchesNothing
+            ))
+        ),
+        "a permitted empty scope is not a PDP deny: {refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn empty_and_constraint_stays_malformed_on_both_paths() {
+    // `predicates: []` is a malformed constraint, not an empty scope:
+    // allowing empty scopes must not legalize it, alone or next to a
+    // valid empty branch.
+    let malformed = Constraint { predicates: vec![] };
+    let pep = enforcer(FixedResponse::permit(vec![malformed.clone()]));
+    for allow_empty in [false, true] {
+        for require in [true, false] {
+            let request = AccessRequest::new()
+                .require_constraints(require)
+                .allow_empty_scope(allow_empty);
+            let result = pep
+                .access_scope_with(&test_ctx(), &TEST_RESOURCE, "list", None, &request)
+                .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(EnforcerError::CompileFailed(
+                        ConstraintCompileError::AllConstraintsFailed { .. }
+                    ))
+                ),
+                "allow_empty={allow_empty} require={require}: {result:?}"
+            );
+        }
+    }
+
+    let dead = Constraint {
+        predicates: vec![tenant_in(TENANT), empty_set_predicates().remove(0)],
+    };
+    let pep = enforcer(FixedResponse::permit(vec![malformed, dead]));
+    assert!(matches!(
+        pep.access_scope(&test_ctx(), &TEST_RESOURCE, "list", None)
+            .await,
+        Err(EnforcerError::AccessDenied(
+            AccessDenial::ScopeMatchesNothing
+        ))
+    ));
+    let scope = pep
+        .access_scope_with(&test_ctx(), &TEST_RESOURCE, "list", None, &allow_empty())
+        .await
+        .expect("valid empty branch compiles");
+    assert!(scope.constraints().is_empty());
+    assert_eq!(
+        scope.original_constraints().len(),
+        1,
+        "malformed branch is dropped, never an original"
+    );
+    assert!(scope.matches_nothing());
+}
+
+#[tokio::test]
+async fn invalid_sibling_is_dropped_and_valid_empty_branch_decides() {
+    // Empty predicate first, so validation cannot stop at it.
+    let invalid = Constraint {
+        predicates: vec![
+            empty_set_predicates().remove(0),
+            tenant_in(TENANT),
+            Predicate::In(InPredicate::new("unknown_property", [uuid(TENANT)])),
+        ],
+    };
+    let dead = Constraint {
+        predicates: vec![tenant_in(TENANT), empty_set_predicates().remove(0)],
+    };
+
+    // Alone, the invalid branch fails compilation on both paths.
+    let pep = enforcer(FixedResponse::permit(vec![invalid.clone()]));
+    for result in [
+        pep.access_scope(&test_ctx(), &TEST_RESOURCE, "list", None)
+            .await,
+        pep.access_scope_with(&test_ctx(), &TEST_RESOURCE, "list", None, &allow_empty())
+            .await,
+    ] {
+        assert!(matches!(
+            result,
+            Err(EnforcerError::CompileFailed(
+                ConstraintCompileError::AllConstraintsFailed { .. }
+            ))
+        ));
+    }
+
+    // Next to a valid empty branch it is dropped, as before this change.
+    let pep = enforcer(FixedResponse::permit(vec![invalid, dead]));
+    assert!(matches!(
+        pep.access_scope(&test_ctx(), &TEST_RESOURCE, "list", None)
+            .await,
+        Err(EnforcerError::AccessDenied(
+            AccessDenial::ScopeMatchesNothing
+        ))
+    ));
+    let scope = pep
+        .access_scope_with(&test_ctx(), &TEST_RESOURCE, "list", None, &allow_empty())
+        .await
+        .expect("valid empty branch compiles");
+    assert!(scope.constraints().is_empty());
+    assert_eq!(scope.original_constraints().len(), 1);
+    assert!(scope.matches_nothing());
+}
+
+#[tokio::test]
+async fn empty_group_selector_still_requires_negotiated_capability() {
+    let dead = Constraint {
+        predicates: vec![tenant_in(TENANT), empty_set_predicates().remove(1)],
+    };
+    let pep = enforcer(FixedResponse::permit(vec![dead]));
+    for result in [
+        pep.access_scope(&test_ctx(), &GROUP_ENABLED_TEST_RESOURCE, "list", None)
+            .await,
+        pep.access_scope_with(
+            &test_ctx(),
+            &GROUP_ENABLED_TEST_RESOURCE,
+            "list",
+            None,
+            &allow_empty(),
+        )
+        .await,
+    ] {
+        assert!(matches!(
+            result,
+            Err(EnforcerError::CompileFailed(
+                ConstraintCompileError::UnadvertisedCapabilities {
+                    predicate: "InGroup",
+                    ..
+                }
+            ))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn empty_descendant_status_is_not_an_empty_scope() {
+    // An empty `descendant_status` disables the status filter; it does not
+    // empty the subtree, so neither path may refuse it.
+    let subtree = Constraint {
+        predicates: vec![Predicate::InTenantSubtree(
+            crate::constraints::InTenantSubtreePredicate::new(
+                pep_properties::OWNER_TENANT_ID,
+                uuid(TENANT),
+            )
+            .with_descendant_status(vec![]),
+        )],
+    };
+    let pep = enforcer(FixedResponse::permit(vec![subtree]))
+        .with_capabilities(vec![Capability::TenantHierarchy]);
+    for scope in [
+        pep.access_scope(&test_ctx(), &TEST_RESOURCE, "list", None)
+            .await,
+        pep.access_scope_with(&test_ctx(), &TEST_RESOURCE, "list", None, &allow_empty())
+            .await,
+    ] {
+        let scope = scope.expect("subtree without status filter is a live permit");
+        assert!(!scope.matches_nothing());
+        assert_eq!(scope.constraints().len(), 1);
+        assert!(scope.original_constraints().eq(scope.constraints()));
+        assert!(matches!(
+            scope.constraints()[0].filters(),
+            [toolkit_security::ScopeFilter::InTenantSubtree(_)]
+        ));
+    }
+}
+
+// ── EnforcerError contract ───────────────────────────────────────
+
+#[test]
+fn compile_scope_matches_nothing_converts_to_local_denial() {
+    let err = EnforcerError::from(ConstraintCompileError::ScopeMatchesNothing);
+    assert!(
+        matches!(
+            err,
+            EnforcerError::AccessDenied(AccessDenial::ScopeMatchesNothing)
+        ),
+        "an empty permitted scope is an access refusal, got {err:?}"
+    );
+}
+
+#[test]
+fn other_compile_failures_stay_compile_failures_with_their_source() {
+    let err = EnforcerError::from(ConstraintCompileError::ConstraintsRequiredButAbsent);
+    assert!(
+        matches!(
+            err,
+            EnforcerError::CompileFailed(ConstraintCompileError::ConstraintsRequiredButAbsent)
+        ),
+        "got {err:?}"
+    );
+    let source = std::error::Error::source(&err).expect("compile failure keeps its cause");
+    assert!(
+        source
+            .downcast_ref::<ConstraintCompileError>()
+            .is_some_and(|e| matches!(e, ConstraintCompileError::ConstraintsRequiredButAbsent)),
+        "source is the compile error, got {source:?}"
+    );
+}
+
+#[test]
+fn denial_display_names_who_refused() {
+    let pdp = EnforcerError::AccessDenied(AccessDenial::Pdp { reason: None });
+    let pdp_with_reason = EnforcerError::AccessDenied(AccessDenial::Pdp {
+        reason: Some(crate::models::DenyReason {
+            error_code: "NO_LIST".to_owned(),
+            details: Some("missing role".to_owned()),
+        }),
+    });
+    let local = EnforcerError::AccessDenied(AccessDenial::ScopeMatchesNothing);
+
+    // The PDP's reason is structured data for the consumer to log
+    // deliberately; Display never echoes it.
+    assert_eq!(pdp.to_string(), "access denied by PDP");
+    assert_eq!(pdp_with_reason.to_string(), "access denied by PDP");
+    assert_eq!(
+        local.to_string(),
+        "access denied: the permitted scope matches nothing"
+    );
+}
+
+#[toolkit_canonical_errors::resource_error(toolkit_gts::gts_id!("cf.core.authz.evaluation.v1~"))]
+struct EvaluationResourceError;
+
+#[test]
+fn is_pdp_unavailable_only_for_an_unavailable_or_timed_out_evaluation() {
+    let cases = [
+        (
+            "service unavailable",
+            EnforcerError::EvaluationFailed(CanonicalError::service_unavailable().create()),
+            true,
+        ),
+        (
+            "deadline exceeded",
+            EnforcerError::EvaluationFailed(
+                EvaluationResourceError::deadline_exceeded("pdp too slow").create(),
+            ),
+            true,
+        ),
+        (
+            "internal",
+            EnforcerError::EvaluationFailed(CanonicalError::internal("pdp bug").create()),
+            false,
+        ),
+        (
+            "failed precondition",
+            EnforcerError::EvaluationFailed(
+                EvaluationResourceError::failed_precondition()
+                    .with_precondition_violation("pdp", "not configured", "STATE")
+                    .create(),
+            ),
+            false,
+        ),
+        (
+            "pdp denial",
+            EnforcerError::AccessDenied(AccessDenial::Pdp { reason: None }),
+            false,
+        ),
+        (
+            "local denial",
+            EnforcerError::AccessDenied(AccessDenial::ScopeMatchesNothing),
+            false,
+        ),
+        (
+            "compile failure",
+            EnforcerError::CompileFailed(ConstraintCompileError::ConstraintsRequiredButAbsent),
+            false,
+        ),
+    ];
+    for (case, err, unavailable) in cases {
+        assert_eq!(err.is_pdp_unavailable(), unavailable, "{case}");
+    }
 }

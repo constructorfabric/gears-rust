@@ -503,6 +503,21 @@ pg_case!(
 );
 
 pg_case!(
+    the_view_reads_report_whether_a_vector_is_stored,
+    conformance::the_view_reads_report_whether_a_vector_is_stored
+);
+
+pg_case!(
+    a_type_referencing_a_non_ancestor_gains_an_optional_property,
+    conformance::a_type_referencing_a_non_ancestor_gains_an_optional_property
+);
+
+pg_case!(
+    a_type_referencing_a_non_ancestor_still_refuses_a_breaking_change,
+    conformance::a_type_referencing_a_non_ancestor_still_refuses_a_breaking_change
+);
+
+pg_case!(
     tombstoned_rows_are_invisible,
     conformance::tombstones_are_invisible
 );
@@ -2776,4 +2791,56 @@ async fn a_purge_under_an_unconstrained_scope_removes_the_nodes_edges() {
         .await
         .expect("the peer stays");
     assert!(peer.adjacency.is_empty(), "the edge went with the node");
+}
+
+/// A listing whose statement the database fails is the server's failure, not
+/// the caller's (gears-rust #5789). The pager reports it as an `OData` `Db`
+/// error, which the store used to answer as `InvalidQuery` -- a 400 that tells
+/// a client to fix a request that was fine and never to retry it.
+///
+/// The failure is made deterministic rather than hoped for: a plain
+/// connection holds `node` under `ACCESS EXCLUSIVE`, and the listing runs on a
+/// pool whose `lock_timeout` makes the server refuse to wait for it.
+#[tokio::test]
+async fn a_listing_the_database_fails_is_unavailable_not_an_invalid_query() {
+    use sea_orm::{ConnectionTrait as _, TransactionTrait as _};
+    let Some(stand) = stand().await else {
+        return;
+    };
+    let tenant = tenant_on(&stand).await;
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = conformance::ctx(tenant, &scope, None);
+
+    let raw = sea_orm::Database::connect(&stand.dsn)
+        .await
+        .expect("a plain connection to hold the table");
+    let holder = raw.begin().await.expect("the holder begins");
+    holder
+        .execute_unprepared("LOCK TABLE node IN ACCESS EXCLUSIVE MODE")
+        .await
+        .expect("the holder locks the node table");
+
+    let impatient = store_with(&stand, "-c lock_timeout=200").await;
+    let error = impatient
+        .project_table(
+            &ctx,
+            graph_storage_sdk::models::ProjectionRequest::default(),
+        )
+        .await
+        .expect_err("the listing cannot read a table it may not lock");
+    holder.rollback().await.expect("the holder lets go");
+
+    // Which server-side category a lock timeout gets is not pinned here: the
+    // pager hands the store the driver's text without its SQLSTATE, so the
+    // listing cannot classify it as the rest of the store does (55P03 is a
+    // serialization failure there). What holds is that it is not the caller's
+    // mistake.
+    assert!(
+        !matches!(
+            error,
+            graph_storage_sdk::plugin_api::GraphStoreError::InvalidQuery { .. }
+                | graph_storage_sdk::plugin_api::GraphStoreError::LimitExceeded { .. }
+        ),
+        "a database failure is the server's, not an invalid query: {error:?}"
+    );
 }

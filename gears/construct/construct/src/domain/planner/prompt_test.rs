@@ -46,6 +46,7 @@ fn the_instructions_list_every_property_with_its_cardinality_and_form() {
         "identity: timezone (one): text (A time zone name in the IANA form, such as Europe/Berlin, or UTC. The pattern checks the form, not that the zone exists.)",
         "identity: orcid_id (one): text matching ^\\d{4}-\\d{4}-\\d{4}-\\d{3}[\\dX]$",
         "identity: public_profiles (many): URL",
+        "identity: remembered_notes (many): text (One short statement the person asked to be remembered, in their own words, for example \"sister is called Anna\". Use it only when the person explicitly asks to remember something (\"remember that\", \"note that\", \"don't forget\") and it fits no other property. Never use it for facts the person merely mentions.)",
         "preference: captions (one): true or false",
         "preference: average_session_length (one): integer (Duration in minutes.)",
         "skill: mean_citedness_2y (one): number",

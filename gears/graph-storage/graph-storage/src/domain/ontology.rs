@@ -634,6 +634,30 @@ impl jsonschema::Retrieve for MapRetriever {
     }
 }
 
+/// Every definition a `gts://` reference can resolve to: the chain as given,
+/// then each base ontology type the chain does not already carry.
+///
+/// The base set is always resolvable, ancestor or not, and a base type the
+/// chain carries keeps that (stored) definition: what the database holds is
+/// what a check is about, and a second, different copy of one id would be
+/// refused by the schema store. A base schema that does not parse is an error
+/// naming it, not a silent gap.
+pub fn resolvable_definitions(
+    chain: impl IntoIterator<Item = (String, Value)>,
+) -> Result<Vec<(String, Value)>, DomainError> {
+    let mut definitions: Vec<(String, Value)> = chain.into_iter().collect();
+    for (type_id, raw) in BASE_SCHEMAS {
+        if definitions.iter().any(|(carried, _)| carried == type_id) {
+            continue;
+        }
+        let schema = serde_json::from_str(raw).map_err(|error| {
+            DomainError::internal(format!("base schema `{type_id}` does not parse: {error}"))
+        })?;
+        definitions.push(((*type_id).to_owned(), schema));
+    }
+    Ok(definitions)
+}
+
 impl ChainValidator {
     /// Compile the leaf schema, resolving `gts://` references from the given
     /// chain (ancestors and the leaf itself, in any order).
@@ -647,19 +671,10 @@ impl ChainValidator {
         leaf: &Value,
         chain: impl IntoIterator<Item = (String, Value)>,
     ) -> Result<Self, DomainError> {
-        let mut schemas: BTreeMap<String, Value> = BASE_SCHEMAS
-            .iter()
-            .filter_map(|(id, raw)| {
-                serde_json::from_str(raw)
-                    .ok()
-                    .map(|schema| (format!("gts://{id}"), schema))
-            })
+        let schemas: BTreeMap<String, Value> = resolvable_definitions(chain)?
+            .into_iter()
+            .map(|(id, schema)| (format!("gts://{id}"), schema))
             .collect();
-        schemas.extend(
-            chain
-                .into_iter()
-                .map(|(id, schema)| (format!("gts://{id}"), schema)),
-        );
         let validator = jsonschema::options()
             .with_retriever(MapRetriever { schemas })
             .build(leaf)

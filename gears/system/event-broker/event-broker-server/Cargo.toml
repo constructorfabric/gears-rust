@@ -1,0 +1,68 @@
+[package]
+name = "cf-gears-event-broker-server"
+description = "Standalone-mode deployment binary for the Event Broker gear"
+version = "0.5.2"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["constructorfabric", "cf-gears", "event-broker"]
+categories = ["asynchronous"]
+publish = false
+
+[[bin]]
+name = "cf-gears-event-broker-server"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Host-mode bootstrap: `toolkit::bootstrap::{AppConfig, run_server}` drives the
+# whole binary. This is the one crate in the event-broker tree that needs it -
+# the gear library itself is contract-only.
+toolkit = { workspace = true, features = ["bootstrap"] }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing = { workspace = true }
+
+# The target gear. Its library pulls in the storage-backend plugins it wires
+# through `backend_providers()` (memory/sqlite/postgres/mysql/kafka), so they do
+# not need to be named here.
+event-broker = { workspace = true }
+
+# The gears the single-process `Standalone` deployment runs in-process. Each is
+# linked only so its `inventory::submit!` registration is present in this
+# binary; `event_broker` reaches them at runtime through their SDK contracts via
+# the `ClientHub`, never by a direct crate path. `cluster` additionally brings
+# its own `standalone` cache provider (`ClusterGear::provider_registry()`), which
+# is how the `standalone` profile in the config resolves without linking
+# `standalone-cluster-plugin` here.
+cluster = { workspace = true }
+types-registry = { workspace = true }
+authz-resolver = { workspace = true }
+api-gateway = { workspace = true }
+authn-resolver = { workspace = true }
+# The static accept-all AuthN/AuthZ plugin gears standalone mode uses.
+static-authn-plugin = { workspace = true }
+static-authz-plugin = { workspace = true }
+
+[dev-dependencies]
+# The full-process integration tests spawn this crate's own compiled binary
+# (`CARGO_BIN_EXE_cf-gears-event-broker-server`, defined only here) and drive it
+# over real HTTP. `test-utils` gives the shared harness
+# (`event_broker::test_support::StaticTypesRegistry`) used to seed fixtures.
+event-broker = { workspace = true, features = ["test-utils"] }
+reqwest = { workspace = true, features = ["json", "stream"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "time"] }
+tokio-stream = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+chrono = { workspace = true, features = ["clock", "serde"] }
+bytes = { workspace = true }
+# `consumer_group_rebalance_integration_tests.rs` recomputes the partition hash
+# (`murmur3_x86_32`) to predict which partition a subject lands on.
+toolkit-stable-hash = { workspace = true }

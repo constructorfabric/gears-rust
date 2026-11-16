@@ -131,7 +131,7 @@ impl From<authz_resolver_sdk::EnforcerError> for DomainError {
         match e {
             // @cpt-begin:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-enforcer-denied
             // @cpt-begin:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-enforcer-denied-return
-            authz_resolver_sdk::EnforcerError::Denied { .. }
+            authz_resolver_sdk::EnforcerError::AccessDenied(_)
             | authz_resolver_sdk::EnforcerError::CompileFailed(_) => Self::Forbidden(e.to_string()),
             // @cpt-end:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-enforcer-denied-return
             // @cpt-end:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-enforcer-denied
@@ -144,6 +144,11 @@ impl From<authz_resolver_sdk::EnforcerError> for DomainError {
             }
             authz_resolver_sdk::EnforcerError::EvaluationFailed(inner) => {
                 Self::Internal(describe_failure(&inner))
+            }
+            // An unknown outcome class is an internal failure, never a denial.
+            unknown => {
+                tracing::error!(error = %unknown, "authz failed with an unknown outcome");
+                Self::Internal("authorization failed with an unknown outcome".to_owned())
             }
         }
         // @cpt-end:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-enforcer-failed-return

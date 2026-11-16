@@ -3495,7 +3495,7 @@ which is the key the projection and the totals depend on.
 | selected_items | jsonb | Item IDs, optional choices, positive exact-decimal quantities and selected dimension values under §4.3 |
 | currency | char(3) | The line's currency; the single-currency predicate reads it |
 | order_pin | jsonb | Versioned `OrderPin` under [03 §4.3](#contract-03-4-3), schema 2 complete immutable Pricing receipt/query/bindings plus assessment and exact issued deadline (D-192); NULL only on the draft version |
-| overlap_scope_key | text | Subscriptions' registry-owned `catalogSubscriptionProductKey` (SUB-G1) for this accepted line, stored as received from its owner and never computed here; the PriceBook derivation proposed to that owner is the SKU of the line's paid recurring item(s). Persisted and reused by claims and activation; D-153, D-163. |
+| overlap_scope_key | text | Subscriptions' versioned-policy `overlapScopeKey` for this accepted line (historically SUB-G1's `catalogSubscriptionProductKey`), stored with the owner's policy provenance and never computed here. Persisted and reused by claims and activation; the earlier SKU derivation proposal in D-153/D-163 does not fix the current owner's policy. |
 | contract_effective_date | date | Mandatory |
 | service_activation_date | date | Requested activation; retained even when deferred. Never NULL on an admitted line: the authored value or, where the snapshot does not require it, the contract-effective default (D-60, D-208) |
 | acceptance_due_date | date | A calendar field; never recorded assent. Never NULL on an admitted line: the authored value or, where the snapshot does not require it, the contract-effective default (D-60, D-208) |
@@ -3523,7 +3523,7 @@ without one.
 | claim_id | uuid | Claim identity |
 | payer_tenant_id | uuid | Billing party that owns the overlap scope |
 | resource_tenant_id | uuid | The order's resource recipient, copied from `orders_order.resource_tenant_id`; immutable once the order is `submitted`, so a claim's value never changes. Scopes the claim to one customer so a partner paying for several customers does not collide across them (D-179) |
-| overlap_scope_key | text | Subscriptions' registry-owned `catalogSubscriptionProductKey` (SUB-G1) for this accepted line, stored as received from its owner and never computed here; the PriceBook derivation proposed to that owner is the SKU of the line's paid recurring item(s). Persisted and reused by claims and activation; D-153, D-163. |
+| overlap_scope_key | text | Subscriptions' versioned-policy `overlapScopeKey` for this accepted line (historically SUB-G1's `catalogSubscriptionProductKey`), stored with the owner's policy provenance and never computed here. Persisted and reused by claims and activation; the earlier SKU derivation proposal in D-153/D-163 does not fix the current owner's policy. |
 | order_id, version | uuid, integer | Order and proposed version of the reservation attempt; a refused attempt's version may never materialize and is not proof of admission |
 | claimed_at | timestamptz | Server-recorded reservation instant inside the transaction, not an admission or commit timestamp |
 | released_at | timestamptz, nullable | Server-recorded release instant; also set on provisional reservations released before committing a refusal |
@@ -6154,12 +6154,12 @@ that another customer under the same payer had an order in flight. Adding the re
 closes both: different customers never collide, and the conflicting order a refusal names always
 belongs to the caller's own resource tenant, so it is one the caller could already read under
 [08 §4.4](DESIGN.md#contract-08-4-4). The refusal **MUST NOT** name an order the caller cannot read. This
-follows the extra-dimension form Subscriptions already permits for its own key
-(`subscriptions/docs/design/03-plan-changes.md` §4.4: active subscriptions may coexist "when they
-differ on `overlapScopeKey` (extra dimensions)"), and the resource tenant is an immutable order
+follows the key Subscriptions defines for its own occupancy
+([Subscriptions PRD §6.3](../../subscriptions/docs/PRD.md#overlap-occupancy-and-cardinality): `(payerTenantId, resourceTenantId, overlapScopeKey)`,
+with the business scope key supplied by versioned policy), and the resource tenant is an immutable order
 axis after submit, not something Orders derives. The key is the one Subscriptions
 already defines and keys its own cardinality rule on: the registry-owned
-`catalogSubscriptionProductKey` of SUB-G1, "bound to a published SKU/product key" (D-163). Products
+versioned-policy `overlapScopeKey` of Subscriptions PRD §6.3 (historically SUB-G1's `catalogSubscriptionProductKey`, D-163). Products
 no longer has a Product entity but still has SKUs, and resolve names each item's `sku_id` and
 `charge_kind`, so the derivation proposed to Subscriptions is the SKU of the line's paid `recurring`
 item(s); `plan_id` is not proposed, because two plans selling the same family would stop colliding.
@@ -9002,10 +9002,10 @@ migration seeds the five permanent platform rows of §3.7 with `draft` **90 days
 **14 days**, `pending_approval` **14 days**, `approved` **30 days** and `on_hold` **30 days**, at
 `policy_revision` 1 with `provisional = true`. Product refines any of them under Q-06 or Q-07(b) by
 promoting a new revision through the policy channel, which sets `provisional = false`; no code or
-design change follows. This is the Subscriptions posture for its own draft TTL — a 90-day platform
-default shipped while Product's value is TBD (`gears/bss/subscriptions/docs/PRD.md` §15, SUB-D-11
-amendment) — and the Orders posture for unset elections, which read as their safe value
-([05 §3.7](DESIGN.md#contract-05-3-7)). The values are deliberately long so that a
+design change follows. These are Orders-owned provisional values. Subscriptions separately
+resolves its draft housekeeping TTL from versioned policy; it defines no 90-day default
+([Subscriptions decisions](../../subscriptions/docs/DECISIONS.md), SUB-D-11). Orders unset elections
+read as their safe value ([05 §3.7](DESIGN.md#contract-05-3-7)). The values are deliberately long so that a
 provisional bound expires only orders that are genuinely abandoned: `submitted` and
 `pending_approval` at 14 days exceed the sibling gear's 72-hour default approval escalation
 (`gears/bss/orders-workflow/docs/PRD.md` §6.2 *Escalation Timer*) several times over, and `approved` and `on_hold` at
@@ -9461,7 +9461,7 @@ platform rows at `policy_revision` 1 with `provisional = true`, not code constan
 | `approved` TTL | row 7 | **30 days** | The **ordinary** exit for a declined payment instrument, per [05-preconditions — What this design cannot express (normative statement of limitation)](DESIGN.md#contract-05-4-4). Because it is never unset in production, that order always has its automatic exit; the caps below stop a hold/resume or amendment cycle restarting it without limit, and [05 §4.4](DESIGN.md#contract-05-4-4) states it from the other side |
 | `on_hold` TTL | row 7 | **30 days** | The PRD names this the worst case, being deliberately open-ended in intent; does not apply to holds taken from `in_fulfillment` (§4.3) |
 | Override scope | row 7 | off | Whether seller scope may override platform scope per state. The mechanism is specified (§3.6, §3.7) and ready; it ships behind `ttl_seller_override_enabled`, default **off**, so the open choice is answered by turning the flag on or leaving it off ([DECISIONS.md](DECISIONS.md) D-137, Q-06) |
-| `draft` auto-void TTL | row 5 | **90 days** | Bounds basket accumulation; matches the Subscriptions draft auto-void platform default (SUB-D-11 amendment). The same row carries the program retention period, tracked as [DECISIONS.md](DECISIONS.md) Q-07, which stays open |
+| `draft` auto-void TTL | row 5 | **90 days** | Bounds basket accumulation under Orders' own provisional policy (D-181), independently of Subscriptions housekeeping TTL. The same row carries the program retention period, tracked as [DECISIONS.md](DECISIONS.md) Q-07, which stays open |
 
 Rows 5 and 7 are the two §15 questions this slice waits on for **confirmation**, no longer for a
 bound. Nothing else here is open: the
@@ -11948,7 +11948,7 @@ Primary engineering basis: [PostgreSQL row locking](https://www.postgresql.org/d
 and [serializable isolation](https://www.postgresql.org/docs/current/transaction-iso.html) provide local
 transaction boundaries; [sagas](https://microservices.io/patterns/data/saga.html) require explicit
 compensation/isolation controls. Local precedents are [ADR-0007](ADR/0007-cpt-cf-bss-orders-adr-in-transaction-concurrency.md),
-[Subscriptions async foundation](../../subscriptions/docs/design/01-foundation-lifecycle.md),
+[Subscriptions foundation](../../subscriptions/docs/features/01-foundation.md),
 and [coord's external-effect limitations](../../libs/coord/README.md). These support the design,
 not a claim that missing peer runtime has been implemented.
 

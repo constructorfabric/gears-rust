@@ -50,9 +50,12 @@ impl From<authz_resolver_sdk::EnforcerError> for DomainError {
     fn from(e: authz_resolver_sdk::EnforcerError) -> Self {
         tracing::error!(error = %e, "AuthZ scope resolution failed");
         match e {
-            authz_resolver_sdk::EnforcerError::Denied { .. }
+            authz_resolver_sdk::EnforcerError::AccessDenied(_)
             | authz_resolver_sdk::EnforcerError::CompileFailed(_) => Self::Forbidden(e.to_string()),
             authz_resolver_sdk::EnforcerError::EvaluationFailed(_) => Self::Internal(e.to_string()),
+            // An unknown outcome class is an internal failure, never a denial;
+            // its details stay in the log above.
+            _ => Self::Internal("authorization failed with an unknown outcome".to_owned()),
         }
     }
 }

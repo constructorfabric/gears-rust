@@ -332,7 +332,7 @@ pub enum DomainError {
 
     // ---- PermissionDenied (HTTP 403) ----
     /// `cause` is `Some` only when the denial originates upstream
-    /// (e.g. `From<authz_resolver_sdk::EnforcerError::Denied>`); plain
+    /// (e.g. `From<authz_resolver_sdk::EnforcerError::AccessDenied>`); plain
     /// AM-side ancestry rejections leave it `None`.
     #[error("cross-tenant access denied")]
     CrossTenantDenied {
@@ -532,10 +532,13 @@ impl From<authz_resolver_sdk::EnforcerError> for DomainError {
     ///   shape AM cannot enforce locally — by the fail-closed rule
     ///   that MUST be a deny, not a 500. Raw compile error is kept on
     ///   the `cause` chain for the audit trail.
+    /// - An unknown outcome class (`EnforcerError` is `#[non_exhaustive]`)
+    ///   → [`DomainError::Internal`] (HTTP 500), never a denial; the error
+    ///   is kept on the `cause` chain.
     fn from(err: authz_resolver_sdk::EnforcerError) -> Self {
         use authz_resolver_sdk::EnforcerError;
         match err {
-            denied @ EnforcerError::Denied { .. } => Self::CrossTenantDenied {
+            denied @ EnforcerError::AccessDenied(_) => Self::CrossTenantDenied {
                 cause: Some(Box::new(denied)),
             },
             EnforcerError::EvaluationFailed(source) => Self::ServiceUnavailable {
@@ -550,6 +553,12 @@ impl From<authz_resolver_sdk::EnforcerError> for DomainError {
             },
             compile_failed @ EnforcerError::CompileFailed(_) => Self::CrossTenantDenied {
                 cause: Some(Box::new(compile_failed)),
+            },
+            // An unknown outcome class is an internal failure (HTTP 500),
+            // never a denial; the cause stays on the `cause` chain.
+            unknown => Self::Internal {
+                diagnostic: "authorization failed with an unknown outcome".to_owned(),
+                cause: Some(Box::new(unknown)),
             },
         }
     }

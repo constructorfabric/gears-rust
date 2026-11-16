@@ -9,11 +9,12 @@ use serde_json::json;
 use super::*;
 use crate::config::{TrustedIssuerEntry, TrustedIssuerInput, default_retry_policy_config};
 use crate::domain::metrics::test_harness::MetricsHarness;
-use crate::infra::circuit_breaker::{HostCircuitBreakers, STATE_OPEN, host_key};
+use crate::infra::circuit_breaker::{HostCircuitBreakers, host_key};
+use toolkit_resilience::circuit_breaker::State;
 
 fn make_s2s_config(discovery_url: impl AsRef<str>) -> S2sConfig {
     S2sConfig {
-        discovery_url: reqwest::Url::parse(discovery_url.as_ref())
+        discovery_url: url::Url::parse(discovery_url.as_ref())
             .expect("test S2S discovery URL should parse"),
         token_cache_ttl_secs: 300,
         token_cache_max_entries: 100,
@@ -51,7 +52,7 @@ fn spawn_sequenced_token_endpoint(
 ) -> anyhow::Result<SequencedTokenEndpoint> {
     let server = MockServer::start();
     let endpoint = server.url("/token");
-    reqwest::Url::parse(&endpoint)?;
+    url::Url::parse(&endpoint)?;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = Arc::clone(&calls);
 
@@ -92,7 +93,7 @@ fn token_endpoint_response(status: u16, retry_after: Option<&str>) -> HttpMockRe
     response.build()
 }
 
-fn make_discovery(client: reqwest::Client) -> Arc<OidcDiscovery> {
+fn make_discovery(client: crate::infra::idp_http::IdpHttpClient) -> Arc<OidcDiscovery> {
     Arc::new(OidcDiscovery::new_allowing_insecure_http_for_tests(
         3600,
         10,
@@ -142,7 +143,7 @@ fn spawn_counting_oidc_server_with_issuer_suffix(
 ) -> anyhow::Result<CountingOidcServer> {
     let server = MockServer::start();
     let base_url = server.base_url();
-    reqwest::Url::parse(&base_url)?;
+    url::Url::parse(&base_url)?;
     let issuer = format!("{base_url}{issuer_suffix}");
     let token_calls = Arc::new(AtomicUsize::new(0));
 
@@ -223,10 +224,9 @@ fn cache_identity_isolates_credentials_and_scope_sets() {
 
 #[tokio::test]
 async fn post_to_unreachable_endpoint_returns_idp_unreachable() {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(200))
-        .build()
-        .unwrap();
+    let client = crate::infra::idp_http::IdpHttpClient::insecure_for_tests_with_timeout(
+        Duration::from_millis(200),
+    );
     let discovery = make_discovery(client.clone());
     let config = make_s2s_config("https://s2s.example.com");
     let tc = TokenClient::new(client, discovery, config, default_retry_policy_config());
@@ -234,7 +234,7 @@ async fn post_to_unreachable_endpoint_returns_idp_unreachable() {
     let request = make_request("svc", "secret");
     let scopes = TokenClient::normalize_scopes(&request.scopes);
     let endpoint =
-        reqwest::Url::parse("http://127.0.0.1:1/token").expect("test endpoint URL should parse");
+        url::Url::parse("http://127.0.0.1:1/token").expect("test endpoint URL should parse");
     let result = tc
         .post_client_credentials(&endpoint, &request, &scopes)
         .await;
@@ -247,11 +247,11 @@ async fn post_to_unreachable_endpoint_returns_idp_unreachable() {
 #[tokio::test]
 async fn post_to_endpoint_with_unsuccessful_status_returns_typed_error() -> anyhow::Result<()> {
     let token_endpoint = spawn_sequenced_token_endpoint(vec![(401, None)])?;
-    let client = reqwest::Client::new();
+    let client = crate::infra::idp_http::IdpHttpClient::insecure_for_tests();
     let discovery = make_discovery(client.clone());
     let config = make_s2s_config("https://s2s.example.com");
     let tc = TokenClient::new(client, discovery, config, default_retry_policy_config());
-    let endpoint = reqwest::Url::parse(&token_endpoint.endpoint())?;
+    let endpoint = url::Url::parse(&token_endpoint.endpoint())?;
     let request = make_request("svc", "secret");
     let scopes = TokenClient::normalize_scopes(&request.scopes);
 
@@ -275,11 +275,11 @@ async fn post_to_endpoint_with_invalid_json_returns_parse_failure() -> anyhow::R
             .header("content-type", "application/json")
             .body("not-json");
     });
-    let client = reqwest::Client::new();
+    let client = crate::infra::idp_http::IdpHttpClient::insecure_for_tests();
     let discovery = make_discovery(client.clone());
     let config = make_s2s_config("https://s2s.example.com");
     let tc = TokenClient::new(client, discovery, config, default_retry_policy_config());
-    let endpoint = reqwest::Url::parse(&server.url("/token"))?;
+    let endpoint = url::Url::parse(&server.url("/token"))?;
     let request = make_request("svc", "secret");
     let scopes = TokenClient::normalize_scopes(&request.scopes);
 
@@ -304,17 +304,16 @@ async fn token_endpoint_breaker_opens_after_retryable_failure_and_blocks_host() 
         max_backoff: std::time::Duration::from_millis(10),
         jitter: false,
     };
-    let client = reqwest::Client::new();
+    let client = crate::infra::idp_http::IdpHttpClient::insecure_for_tests();
     let discovery = make_discovery(client.clone());
     let config = make_s2s_config("https://s2s.example.com");
-    let breakers = Arc::new(HostCircuitBreakers::new(
-        1,
-        30,
-        MetricsHarness::new().metrics(),
-    ));
+    let breakers = Arc::new(
+        HostCircuitBreakers::new(1, 30, MetricsHarness::new().metrics())
+            .expect("test breaker config should be valid"),
+    );
     let tc = TokenClient::new(client, discovery, config, retry_policy)
         .with_circuit_breakers(Arc::clone(&breakers));
-    let endpoint_url = reqwest::Url::parse(&endpoint)?;
+    let endpoint_url = url::Url::parse(&endpoint)?;
     let request = make_request("svc", "secret");
     let scopes = TokenClient::normalize_scopes(&request.scopes);
 
@@ -324,7 +323,7 @@ async fn token_endpoint_breaker_opens_after_retryable_failure_and_blocks_host() 
     assert!(matches!(first, Err(AuthNError::IdpUnreachable)));
     assert_eq!(
         breakers.state_for_host(&host_key(&endpoint_url)),
-        Some(STATE_OPEN)
+        Some(State::Open)
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
@@ -343,7 +342,7 @@ async fn token_endpoint_breaker_opens_after_retryable_failure_and_blocks_host() 
 
 #[tokio::test]
 async fn cache_hit_returns_without_network() {
-    let client = reqwest::Client::new();
+    let client = crate::infra::idp_http::IdpHttpClient::insecure_for_tests();
     let discovery = make_discovery(client.clone());
     let config = make_s2s_config("https://s2s.example.com");
     let issuer_trust = make_issuer_trust("https://s2s.example.com".to_owned());
@@ -370,7 +369,7 @@ async fn concurrent_same_key_miss_uses_single_token_endpoint_call() -> anyhow::R
     let oidc_server = spawn_counting_oidc_server_with_issuer_suffix(Duration::from_millis(75), "")?;
     let discovery_url = oidc_server.discovery_url();
     let token_calls = oidc_server.token_calls();
-    let client = reqwest::Client::new();
+    let client = crate::infra::idp_http::IdpHttpClient::insecure_for_tests();
     let discovery = make_discovery(client.clone());
     let config = make_s2s_config(&discovery_url);
     let issuer_trust = Arc::new(make_issuer_trust(discovery_url));
@@ -418,7 +417,7 @@ async fn exchange_rejects_untrusted_discovery_issuer_before_posting_credentials(
     )?;
     let discovery_url = oidc_server.discovery_url();
     let token_calls = oidc_server.token_calls();
-    let client = reqwest::Client::new();
+    let client = crate::infra::idp_http::IdpHttpClient::insecure_for_tests();
     let discovery = make_discovery(client.clone());
     let config = make_s2s_config(discovery_url.clone());
     let issuer_trust = make_issuer_trust(format!("{discovery_url}/realms/trusted"));
@@ -440,9 +439,9 @@ async fn exchange_rejects_untrusted_discovery_issuer_before_posting_credentials(
     Ok(())
 }
 
-#[test]
-fn single_flight_cleanup_preserves_reacquired_gate() {
-    let client = reqwest::Client::new();
+#[tokio::test]
+async fn single_flight_cleanup_preserves_reacquired_gate() {
+    let client = crate::infra::idp_http::IdpHttpClient::insecure_for_tests();
     let discovery = make_discovery(client.clone());
     let config = make_s2s_config("https://s2s.example.com");
     let tc = TokenClient::new(client, discovery, config, default_retry_policy_config());
@@ -475,11 +474,11 @@ async fn retries_transient_5xx_then_succeeds() -> anyhow::Result<()> {
         max_backoff: std::time::Duration::from_millis(10),
         jitter: false,
     };
-    let client = reqwest::Client::new();
+    let client = crate::infra::idp_http::IdpHttpClient::insecure_for_tests();
     let discovery = make_discovery(client.clone());
     let config = make_s2s_config("https://s2s.example.com");
     let tc = TokenClient::new(client, discovery, config, retry_policy);
-    let endpoint_url = reqwest::Url::parse(&endpoint)?;
+    let endpoint_url = url::Url::parse(&endpoint)?;
 
     let request = make_request("svc", "secret");
     let scopes = TokenClient::normalize_scopes(&request.scopes);
@@ -504,11 +503,11 @@ async fn retries_429_using_retry_after_capped_by_max_backoff() -> anyhow::Result
         max_backoff: std::time::Duration::from_millis(120),
         jitter: false,
     };
-    let client = reqwest::Client::new();
+    let client = crate::infra::idp_http::IdpHttpClient::insecure_for_tests();
     let discovery = make_discovery(client.clone());
     let config = make_s2s_config("https://s2s.example.com");
     let tc = TokenClient::new(client, discovery, config, retry_policy);
-    let endpoint_url = reqwest::Url::parse(&endpoint)?;
+    let endpoint_url = url::Url::parse(&endpoint)?;
 
     let request = make_request("svc", "secret");
     let scopes = TokenClient::normalize_scopes(&request.scopes);
@@ -532,5 +531,65 @@ async fn retries_429_using_retry_after_capped_by_max_backoff() -> anyhow::Result
         "Retry-After (1s) should be capped to max_backoff (~120ms), not waited in full; got {elapsed:?}"
     );
 
+    Ok(())
+}
+
+fn no_backoff_retries(max_retries: u32) -> RetryPolicyConfig {
+    RetryPolicyConfig {
+        max_retries,
+        backoff_base_ms: 1,
+        backoff_factor: 1,
+        max_backoff: std::time::Duration::from_millis(1),
+        jitter: false,
+    }
+}
+
+#[tokio::test]
+async fn token_post_lost_after_sending_is_not_sent_again() -> anyhow::Result<()> {
+    let endpoint = crate::infra::retry::raw_endpoint::spawn(b"HTTP/1.1 not-a-status\r\n\r\n").await;
+    let client = crate::infra::idp_http::IdpHttpClient::insecure_for_tests();
+    let discovery = make_discovery(client.clone());
+    let config = make_s2s_config("https://s2s.example.com");
+    let tc = TokenClient::new(client, discovery, config, no_backoff_retries(3));
+    let endpoint_url = url::Url::parse(&format!("http://{}/token", endpoint.addr))?;
+    let request = make_request("svc", "secret");
+    let scopes = TokenClient::normalize_scopes(&request.scopes);
+
+    let result = tc
+        .post_client_credentials(&endpoint_url, &request, &scopes)
+        .await;
+
+    assert!(
+        matches!(result, Err(AuthNError::IdpUnreachable)),
+        "{result:?}"
+    );
+    assert_eq!(endpoint.connections(), 1, "the token POST was sent again");
+    Ok(())
+}
+
+#[tokio::test]
+async fn token_body_stall_is_an_idp_failure() -> anyhow::Result<()> {
+    let endpoint = crate::infra::retry::raw_endpoint::spawn(
+        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{",
+    )
+    .await;
+    let client = crate::infra::idp_http::IdpHttpClient::insecure_for_tests_with_timeout(
+        std::time::Duration::from_millis(300),
+    );
+    let discovery = make_discovery(client.clone());
+    let config = make_s2s_config("https://s2s.example.com");
+    let tc = TokenClient::new(client, discovery, config, no_backoff_retries(0));
+    let endpoint_url = url::Url::parse(&format!("http://{}/token", endpoint.addr))?;
+    let request = make_request("svc", "secret");
+    let scopes = TokenClient::normalize_scopes(&request.scopes);
+
+    let result = tc
+        .post_client_credentials(&endpoint_url, &request, &scopes)
+        .await;
+
+    assert!(
+        matches!(result, Err(AuthNError::IdpUnreachable)),
+        "{result:?}"
+    );
     Ok(())
 }

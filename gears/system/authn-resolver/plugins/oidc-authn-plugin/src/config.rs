@@ -5,8 +5,8 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use jsonwebtoken::Algorithm;
 use regex::Regex;
-use reqwest::Url;
 use serde::Deserialize;
+use url::Url;
 
 use crate::domain::claim_mapper::{ClaimMapperConfig, ClaimMapperOptions};
 use crate::infra::url_policy::UrlSecurityPolicy;
@@ -80,8 +80,12 @@ impl OidcAuthNGearConfig {
         self.resolve_with_url_policy(UrlSecurityPolicy::STRICT)
     }
 
-    /// Resolve raw gear input config while permitting HTTP IdP URLs.
-    #[doc(hidden)]
+    /// Resolve raw gear input config while permitting HTTP `IdP` URLs.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`resolve`](Self::resolve).
+    #[cfg(any(test, feature = "test-util"))]
     pub fn resolve_allowing_insecure_http_for_tests(self) -> Result<ResolvedGearConfig> {
         self.resolve_with_url_policy(UrlSecurityPolicy::allow_insecure_http_for_tests())
     }
@@ -589,7 +593,11 @@ impl IssuerTrustConfig {
     }
 
     /// Build runtime trust config while permitting HTTP issuer/discovery URLs.
-    #[doc(hidden)]
+    ///
+    /// # Errors
+    ///
+    /// Same as [`from_inputs`](Self::from_inputs).
+    #[cfg(any(test, feature = "test-util"))]
     pub fn from_inputs_allowing_insecure_http_for_tests(
         inputs: impl IntoIterator<Item = TrustedIssuerInput>,
     ) -> Result<Self> {

@@ -99,3 +99,30 @@ fn the_table_the_contract_publishes_is_the_table_the_parser_uses() {
     assert!(FieldKind::DateTimeUtc.allows(FilterOp::Ge));
     assert!(!FieldKind::DateTimeUtc.allows(FilterOp::EndsWith));
 }
+
+/// A deny-all query still goes through the normal schema validation, for both
+/// string catalogs and UUID-scoped storage; an invalid predicate stays invalid.
+#[test]
+fn contradictions_preserve_field_validation() {
+    use toolkit_odata::ast::{CompareOperator, Expr, Value};
+    use toolkit_odata::filter::convert_expr_to_filter_node;
+
+    for (field, value) in [
+        ("name", Value::String(String::new())),
+        ("id", Value::Uuid(uuid::Uuid::nil())),
+    ] {
+        let predicate = Expr::Compare(
+            Box::new(Expr::Identifier(field.to_owned())),
+            CompareOperator::Eq,
+            Box::new(Expr::Value(value)),
+        );
+        convert_expr_to_filter_node::<Field>(&predicate.contradiction())
+            .expect("a typed contradiction is accepted by the filter translator");
+    }
+    let invalid = Expr::Compare(
+        Box::new(Expr::Identifier("id".to_owned())),
+        CompareOperator::Eq,
+        Box::new(Expr::Value(Value::String(String::new()))),
+    );
+    assert!(convert_expr_to_filter_node::<Field>(&invalid.contradiction()).is_err());
+}

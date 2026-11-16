@@ -339,7 +339,7 @@ fn snapshot_data(tenant: &Tenant) -> TenantData {
 /// belongs to a real store's statement, and a fake that pretended otherwise
 /// would let a scoping bug pass here and fail in production.
 fn scope_admits(scope: &toolkit_security::AccessScope, tenant: Uuid) -> bool {
-    if scope.is_deny_all() {
+    if scope.matches_nothing() {
         return false;
     }
     if scope.is_unconstrained() {
@@ -3008,3 +3008,7 @@ fn live_under_only_tombstoned(key: &str) -> GraphStoreError {
         ),
     }
 }
+
+#[cfg(test)]
+#[path = "fake_store_tests.rs"]
+mod tests;

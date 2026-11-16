@@ -27,8 +27,9 @@ env:
 jobs:
   # `release-plz release` publishes only versions present in the manifests and absent
   # from crates.io, so running it on every push is safe and makes an interrupted release
-  # self-healing: the next push to main finishes it. That is why this needs no
-  # pull_request trigger and no label matching to decide whether a release is happening.
+  # self-healing: a retry within the job, or the next push to main, finishes it. That
+  # is why this needs no pull_request trigger and no label matching to decide whether a
+  # release is happening.
   release:
     name: Publish crates
     runs-on: ubuntu-latest
@@ -57,8 +58,8 @@ jobs:
     # Exposed so the publish jobs below know what was released. `releases` is a JSON
     # array of {package_name, tag, version}; empty when nothing was published.
     outputs:
-      releases: ${{ steps.release-plz.outputs.releases }}
-      releases_created: ${{ steps.release-plz.outputs.releases_created }}
+      releases: ${{ steps.releases.outputs.releases }}
+      releases_created: ${{ steps.releases.outputs.releases_created }}
     steps:
       # No `ref:` needed. On push, checkout defaults to github.sha, which is exactly the
       # commit that was pushed — for a release PR merge, its merge commit.
@@ -146,8 +147,26 @@ jobs:
             https://api.github.com/rate_limit 2>/dev/null | tr -d ' \n' | sed -n 's/.*"core":{\([^}]*\)}.*/\1/p' | tr -d '"' | tr ',' ' ' | sed 's/:/=/g') || true
           echo "RATE-APP ts=$(date -u +%Y-%m-%dT%H:%M:%SZ) token=$src workflow=$GITHUB_WORKFLOW job=$GITHUB_JOB ${core:-unavailable}"
 
+      # Up to three attempts. A retry is safe: release-plz skips versions crates.io
+      # already has and packages whose tag exists. Before each retry
+      # tools/scripts/release_retry.py waits (5, then 10 minutes, or until the GitHub API
+      # budget resets if it is nearly spent; crates.io 429s ask for seconds) and fetches
+      # tags, because release-plz checks for a tag with a local `git tag -l` and would
+      # otherwise fail creating one a concurrent run already made ("Reference already
+      # exists"). An App token lives one hour and the retries can outlast it, so each
+      # retry mints a fresh one, falling back to the previous one.
+      #
+      # The snapshot is the baseline for "Collect releases"; it is taken here, not at
+      # checkout, so tags made by other runs during the setup steps are not counted.
+      - name: Snapshot tags
+        id: snapshot
+        env:
+          TAGS_BEFORE: ${{ runner.temp }}/tags-before
+        run: python3 tools/scripts/release_retry.py snapshot
+
       - name: release-plz release
-        id: release-plz
+        id: release-plz-1
+        continue-on-error: true
         uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.3.155
         with:
           command: release
@@ -155,6 +174,88 @@ jobs:
           GITHUB_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
           CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+
+      - name: Wait and fetch tags before retry 1
+        if: steps.release-plz-1.outcome == 'failure'
+        env:
+          API_TOKEN: ${{ steps.app.outputs.token || github.token }}
+        run: python3 tools/scripts/release_retry.py wait --min-delay 300
+
+      - name: Mint gears-rust-release app token (retry 1)
+        id: app-2
+        if: >-
+          steps.release-plz-1.outcome == 'failure' &&
+          steps.app.outputs.token != ''
+        continue-on-error: true  # falls back to the first token below
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.GEARS_RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.GEARS_RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: read
+
+      - name: release-plz release (retry 1)
+        id: release-plz-2
+        if: steps.release-plz-1.outcome == 'failure'
+        continue-on-error: true
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.3.155
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ steps.app-2.outputs.token || steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+
+      - name: Wait and fetch tags before retry 2
+        if: steps.release-plz-2.outcome == 'failure'
+        env:
+          API_TOKEN: ${{ steps.app-2.outputs.token || steps.app.outputs.token || github.token }}
+        run: python3 tools/scripts/release_retry.py wait --min-delay 600
+
+      - name: Mint gears-rust-release app token (retry 2)
+        id: app-3
+        if: >-
+          steps.release-plz-2.outcome == 'failure' &&
+          steps.app.outputs.token != ''
+        continue-on-error: true  # falls back to an earlier token below
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.GEARS_RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.GEARS_RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: read
+
+      # Last attempt: no continue-on-error, so its failure fails the job.
+      - name: release-plz release (retry 2)
+        id: release-plz-3
+        if: steps.release-plz-2.outcome == 'failure'
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.3.155
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ steps.app-3.outputs.token || steps.app-2.outputs.token || steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+
+      # Builds the `releases` output: the successful attempt's list plus, after a retry,
+      # the packages earlier attempts released (recovered from tags created during this
+      # job). Also tags published crates that release-plz left untagged. See the
+      # docstring of tools/scripts/release_retry.py. Runs even when every attempt
+      # failed, so packages that were released still get their image and chart; a
+      # later run would no longer list them.
+      - name: Collect releases
+        id: releases
+        if: ${{ !cancelled() && steps.snapshot.outcome == 'success' }}
+        env:
+          TAGS_BEFORE: ${{ runner.temp }}/tags-before
+          OUTCOME_1: ${{ steps.release-plz-1.outcome }}
+          RELEASES_1: ${{ steps.release-plz-1.outputs.releases }}
+          OUTCOME_2: ${{ steps.release-plz-2.outcome }}
+          RELEASES_2: ${{ steps.release-plz-2.outputs.releases }}
+          OUTCOME_3: ${{ steps.release-plz-3.outcome }}
+          RELEASES_3: ${{ steps.release-plz-3.outputs.releases }}
+          GH_TOKEN: ${{ steps.app-3.outputs.token || steps.app-2.outputs.token || steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+        run: python3 tools/scripts/release_retry.py collect
 
       - name: Disk report (post-mortem)
         if: always()
@@ -283,7 +384,9 @@ jobs:
   plan-publish:
     name: Plan publish
     needs: release
-    if: needs.release.outputs.releases_created == 'true'
+    # `!cancelled()`: a release job that failed after releasing some packages still
+    # publishes their images and charts.
+    if: ${{ !cancelled() && needs.release.outputs.releases_created == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

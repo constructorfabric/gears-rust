@@ -98,7 +98,13 @@ impl<R: CitiesRepository> CitiesService<R> {
 
         let scope = self
             .policy_enforcer
-            .access_scope(ctx, &resources::CITY, actions::LIST, None)
+            .access_scope_with(
+                ctx,
+                &resources::CITY,
+                actions::LIST,
+                None,
+                &AccessRequest::new().allow_empty_scope(true),
+            )
             .await?;
 
         let page = self.repo.list_page(&conn, &scope, query).await?;

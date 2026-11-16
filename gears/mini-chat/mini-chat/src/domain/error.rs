@@ -249,8 +249,14 @@ impl From<authz_resolver_sdk::EnforcerError> for DomainError {
     #[allow(clippy::cognitive_complexity)]
     fn from(e: authz_resolver_sdk::EnforcerError) -> Self {
         match e {
-            authz_resolver_sdk::EnforcerError::Denied { ref deny_reason } => {
-                tracing::warn!(deny_reason = ?deny_reason, "AuthZ denied access");
+            authz_resolver_sdk::EnforcerError::AccessDenied(
+                authz_resolver_sdk::AccessDenial::Pdp { ref reason },
+            ) => {
+                tracing::warn!(deny_reason = ?reason, "AuthZ denied access");
+                Self::Forbidden
+            }
+            authz_resolver_sdk::EnforcerError::AccessDenied(ref local) => {
+                tracing::warn!(denial = %local, "AuthZ refused: PEP-local denial");
                 Self::Forbidden
             }
             authz_resolver_sdk::EnforcerError::CompileFailed(ref err) => {
@@ -262,6 +268,11 @@ impl From<authz_resolver_sdk::EnforcerError> for DomainError {
             authz_resolver_sdk::EnforcerError::EvaluationFailed(ref err) => {
                 tracing::error!(error = %err, "AuthZ evaluation failed - request refused");
                 Self::AuthzUnavailable
+            }
+            // An unknown outcome class is an internal failure, never a denial.
+            ref unknown => {
+                tracing::error!(error = %unknown, "AuthZ failed with an unknown outcome");
+                Self::internal("authorization failed with an unknown outcome")
             }
         }
     }

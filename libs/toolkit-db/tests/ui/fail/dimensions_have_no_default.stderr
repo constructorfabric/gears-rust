@@ -1,0 +1,5 @@
+error[E0277]: the trait bound `Dimensions<test_entity::Column>: std::default::Default` is not satisfied
+  --> tests/ui/fail/dimensions_have_no_default.rs:27:50
+   |
+27 |     let _dims: Dimensions<test_entity::Column> = Default::default();
+   |                                                  ^^^^^^^^^^^^^^^^^^ the trait `std::default::Default` is not implemented for `Dimensions<test_entity::Column>`

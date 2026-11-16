@@ -95,7 +95,12 @@ async fn the_tool_calls_of_each_round_become_a_plan_for_the_record_subject() {
         "{:?}",
         plan.steps
     );
-    assert_eq!(model.requests().len(), 3);
+    let requests = model.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(
+        requests.iter().all(|request| request.subject_id == SUBJECT),
+        "every round names the record's subject"
+    );
     assert!(events.taken().is_empty());
 }
 
@@ -426,6 +431,7 @@ async fn what_a_subject_told_an_agent_becomes_a_plan_with_the_agent_as_origin() 
         }
     );
     assert_eq!(plan.steps.len(), 1);
+    assert_eq!(model.requests()[0].subject_id, SUBJECT);
     let Message::User(input) = &model.requests()[0].messages[1] else {
         panic!("the input as the user message");
     };

@@ -21,7 +21,7 @@ scope condition**. This is guaranteed mechanically, not by convention:
   the same scope
   ([select.rs:22-25](../../../../libs/toolkit-db/src/secure/select.rs#L22-L25)).
 - `build_scope_condition::<E>()` attaches a `WHERE` for the concrete entity `E` via
-  `E::resolve_property()`
+  `E::SCOPE.resolve_property()`
   ([cond.rs:54-83](../../../../libs/toolkit-db/src/secure/cond.rs#L54-L83)).
 
 A Common Table Expression (`WITH x AS (SELECT ... FROM sensitive_table) ...`) breaks

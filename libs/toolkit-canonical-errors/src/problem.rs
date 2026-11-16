@@ -711,15 +711,29 @@ impl TryFrom<Problem> for CanonicalError {
 // axum integration (feature = "axum")
 // ---------------------------------------------------------------------------
 
+/// Seconds for the wire `Retry-After` header, read from the problem's context.
+///
+/// - `service_unavailable`: `context.retry_after_seconds`.
+/// - `resource_exhausted`: the largest `context.violations[].retry_after_seconds`
+///   (`ResourceExhaustedV1::retry_after_seconds`); with no hint there is no header.
+///
+/// Same rule as `CanonicalError::retry_after_seconds`, applied to the wire form
+/// so a `Problem` relayed from another service gets the header too.
+///
+/// Every other category, and a context that does not deserialize, gets no header.
 #[cfg(feature = "axum")]
-fn service_unavailable_retry_after_seconds(problem: &Problem) -> Option<u64> {
-    if category_from_problem_type(&problem.problem_type) != Some("service_unavailable") {
-        return None;
+fn retry_after_seconds(problem: &Problem) -> Option<u64> {
+    match category_from_problem_type(&problem.problem_type)? {
+        "service_unavailable" => {
+            ServiceUnavailable::deserialize(&problem.context)
+                .ok()?
+                .retry_after_seconds
+        }
+        "resource_exhausted" => ResourceExhausted::deserialize(&problem.context)
+            .ok()?
+            .retry_after_seconds(),
+        _ => None,
     }
-
-    ServiceUnavailable::deserialize(&problem.context)
-        .ok()?
-        .retry_after_seconds
 }
 
 #[cfg(feature = "axum")]
@@ -731,7 +745,7 @@ impl axum::response::IntoResponse for Problem {
                     .status
                     .and_then(|s| http::StatusCode::from_u16(s).ok())
                     .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
-                let retry_after_seconds = service_unavailable_retry_after_seconds(&self);
+                let retry_after_seconds = retry_after_seconds(&self);
                 let mut response = (
                     status,
                     [(http::header::CONTENT_TYPE, APPLICATION_PROBLEM_JSON)],

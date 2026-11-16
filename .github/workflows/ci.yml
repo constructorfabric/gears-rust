@@ -98,6 +98,8 @@ jobs:
               - 'deploy/components.yaml'
               - 'tools/scripts/resolve_release.py'
               - 'tools/scripts/tests/test_resolve_release.py'
+              - 'tools/scripts/release_retry.py'
+              - 'tools/scripts/tests/test_release_retry.py'
               # Input to `e2e_sidecar_pins_the_same_timescaledb_image` in
               # libs/test-containers: a Python-only edit to the E2E sidecar must
               # still get the cross-lane TimescaleDB pin checked, or the guard

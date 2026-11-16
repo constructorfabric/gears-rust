@@ -86,7 +86,7 @@ C4Context
 | First-party vs third-party app detection | `cpt-cf-authn-plugin-fr-first-party-detection` | Claim Mapper checks `client_id`/`azp` against a configured first-party clients list. First-party apps receive unrestricted scopes (`["*"]`); third-party apps receive only their granted scopes. |
 | S2S client credentials exchange | `cpt-cf-authn-plugin-fr-s2s-exchange`, `cpt-cf-authn-plugin-fr-s2s-caching`, `cpt-cf-authn-plugin-fr-s2s-default-subject-type` | Token Client component implements OAuth2 `client_credentials` grant (RFC 6749 §4.4) for service-to-service authentication, with token caching, IdP endpoint resolution, and configured default `subject_type` fallback when the token omits that claim. |
 | Plugin discovery and registration | `cpt-cf-authn-plugin-fr-clienthub-registration` | Plugin registers with Gears ClientHub using GTS schema identity for vendor-based selection and priority-based fallback. |
-| Resilience & timeouts | `cpt-cf-authn-plugin-fr-request-timeout`, `cpt-cf-authn-plugin-fr-retry-policy`, `cpt-cf-authn-plugin-fr-circuit-breaker` | HTTP Client component applies `http_client.request_timeout` per attempt and retries transient failures (connection errors, 5xx, 429) with exponential backoff + jitter per `retry_policy`. Circuit Breaker component keys state by outbound HTTP host and honors the global `circuit_breaker.enabled` toggle. Retries run **inside** the breaker call so one logical operation equals one breaker attempt. |
+| Resilience & timeouts | `cpt-cf-authn-plugin-fr-request-timeout`, `cpt-cf-authn-plugin-fr-retry-policy`, `cpt-cf-authn-plugin-fr-circuit-breaker` | HTTP Client component applies `http_client.request_timeout` per attempt and retries transient failures (connection errors, 5xx, 429) with exponential backoff + jitter per `retry_policy`. Circuit Breaker component keys state by outbound HTTP host and honors the global `circuit_breaker.enabled` toggle. Retries run **inside** the breaker call so one logical operation equals one breaker attempt; the HTTP client's own retry is disabled, so the plugin's retry loop is the only one. The request timeout covers the response body as well as the headers. Redirects are followed only within the same origin. TLS trusts the OS store plus `custom_ca_certificate_paths`; outbound connections honour `HTTPS_PROXY` / `NO_PROXY`. |
 
 #### NFR Allocation
 
@@ -231,7 +231,7 @@ The SDK traits (`AuthNResolverClient`, `AuthNResolverPluginClient`) are stable i
 
 - [x] `p2` - **ID**: `cpt-cf-authn-plugin-constraint-vendor-licensing`
 
-The plugin uses only platform-approved open-source dependencies. No proprietary or copyleft-licensed dependencies are introduced. The `jsonwebtoken` crate (MIT) is the primary JWT validation library; HTTP client uses the platform-standard `reqwest` (MIT/Apache-2.0).
+The plugin uses only platform-approved open-source dependencies. No proprietary or copyleft-licensed dependencies are introduced. The `jsonwebtoken` crate (MIT) is the primary JWT validation library; outbound HTTP uses the platform `toolkit-http` client and the circuit breaker uses `toolkit-resilience` (both Apache-2.0, in this repository).
 
 **ADRs**: Platform convention — dependency licensing policy defined at project level.
 
@@ -570,12 +570,15 @@ A full operator-facing configuration example covering every knob documented in t
 
 | Failure | Retried? | Notes |
 |---------|----------|-------|
-| Connection error (DNS, refused, TLS, reset) | Yes | Transient infra failure. |
+| Failure to connect (DNS, refused, unreachable, TLS handshake) or a proxy refusing `CONNECT` | Yes | Transient infra failure. The request was not sent. |
+| Connection lost after the request was sent (reset, invalid response) | No | The `IdP` may have processed it; repeating the token POST could mint a second token. Counts as an `IdP` failure. |
+| Request never sent (local client overloaded or stopped, bad URL or header, proxy `407`) | No | Returned as `ServiceUnavailable`. Not an `IdP` failure: does not count against the circuit breaker. An invalid proxy URL in `HTTPS_PROXY` is not a request-time failure: the HTTP client fails to build and the gear does not start. |
 | Request timeout (`request_timeout` elapsed) | **No** | Not retried. A timeout is a slow failure — retrying multiplies user-facing latency (worst case `(max_retries + 1) × request_timeout`) and adds load to an already-struggling IdP. Repeated timeouts for a host are instead absorbed by the circuit breaker: each timed-out logical operation counts as one failure, and the host's breaker opens at `failure_threshold`. |
 | HTTP 5xx | Yes | Server-side transient. |
 | HTTP 429 | Yes | Honors `Retry-After` header when present; otherwise uses computed backoff. Bounded by `retry_policy.max_retries` and `retry_policy.max_backoff_ms`. |
 | HTTP 4xx (not 429) | No | Treated as permanent — retrying will not succeed (e.g., bad credentials, bad request). |
 | 2xx with unparseable body | No | Permanent — returned as parse error. |
+| 2xx whose body stalls or breaks off | No | Counts as an `IdP` failure, like a missing response. |
 
 **Operations**:
 
@@ -1176,6 +1179,8 @@ Not applicable — the plugin has no persistent state. All caches are ephemeral 
 The plugin is stateless. Recovery after restart consists of: (1) re-fetching OIDC discovery on first request per issuer; (2) re-fetching JWKS on first JWT validation per issuer. Both are automatic and transparent. S2S token cache is cold after restart — tokens are re-acquired on next exchange. No manual intervention is required.
 
 ### Observability
+
+Each outbound IdP call (discovery, JWKS, token) runs in a client span `outgoing_http`. When the host enables `toolkit-http`'s `otel` feature, the call also carries a `traceparent` header, so the trace id is visible to the IdP.
 
 #### Performance Metrics
 
