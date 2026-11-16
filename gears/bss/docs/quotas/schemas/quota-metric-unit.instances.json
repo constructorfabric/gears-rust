@@ -1,0 +1,24 @@
+[
+  {
+    "id": "gts.cf.bss.products.quota_unit.v1~cf.bss.products.vcpu.v1",
+    "symbol": "vCPU",
+    "canonical_unit_ref": "gts.cf.bss.products.quota_unit.v1~cf.bss.products.vcpu.v1",
+    "numerator": "1",
+    "denominator": "1"
+  },
+  {
+    "id": "gts.cf.bss.products.quota_metric.v1~cf.bss.products.vcpu.v1",
+    "name": "Allocated vCPU",
+    "display_name": {
+      "en": "Virtual CPUs",
+      "ru": "Виртуальные процессоры"
+    },
+    "description": {
+      "en": "Maximum total number of vCPUs allocated to the tenant's virtual machines.",
+      "ru": "Максимальное суммарное количество vCPU, выделенных виртуальным машинам тенанта."
+    },
+    "quota_kind": "allocation",
+    "canonical_unit_ref": "gts.cf.bss.products.quota_unit.v1~cf.bss.products.vcpu.v1",
+    "properties": {}
+  }
+]
