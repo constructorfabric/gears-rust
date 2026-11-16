@@ -7708,3 +7708,70 @@ pub async fn a_count_agrees_with_the_listing(store: &dyn GraphStoreV1, tenant: U
         .expect("the delete commits");
     assert_eq!(count("payload/severity eq 'high'", 100).await.count, 2);
 }
+
+/// The two view reads -- `get_node` and the hydration a traversal ends in --
+/// say whether a vector is stored, for a node that has one and a node that
+/// has none, and return the node as it was written. On the built-in store
+/// both read the presence from the database without fetching the vector.
+pub async fn the_view_reads_report_whether_a_vector_is_stored(
+    store: &impl GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    store
+        .register_types(&ctx, ontology_batch())
+        .await
+        .expect("ontology registers");
+    ingest_batch(
+        store,
+        &ctx,
+        batch(
+            vec![summarized(
+                "with-vector",
+                "Embedded",
+                "a text the provider embeds",
+            )],
+            Vec::new(),
+        ),
+    )
+    .await
+    .expect("the embedded batch commits");
+    // A node's name is always embedded, so the node without a vector is the
+    // one written with embedding switched off, and nothing stored before it.
+    let mut plain = batch(vec![node("without-vector", "Plain")], Vec::new());
+    plain.options.embed = Some(false);
+    ingest_batch(store, &ctx, plain)
+        .await
+        .expect("the unembedded batch commits");
+
+    let keys = ["with-vector".to_owned(), "without-vector".to_owned()];
+    let ids: Vec<_> = store
+        .resolve_node_ids(&ctx, &keys)
+        .await
+        .expect("the keys resolve")
+        .into_iter()
+        .map(|(_, id)| id)
+        .collect();
+    let hydrated = store
+        .hydrate_nodes(&ctx, &ids)
+        .await
+        .expect("hydration succeeds");
+    assert_eq!(hydrated.len(), 2, "both nodes hydrate: {hydrated:?}");
+
+    for (key, embedded) in [("with-vector", true), ("without-vector", false)] {
+        let view = store
+            .get_node(&ctx, &key.to_owned(), 10)
+            .await
+            .expect("the node is readable");
+        assert_eq!(view.has_embedding, embedded, "get_node on {key}");
+        let row = hydrated
+            .iter()
+            .find(|row| row.node_key == key)
+            .expect("the node is hydrated");
+        assert_eq!(row.has_embedding, embedded, "hydration of {key}");
+        assert_eq!(row.name, view.name, "both reads agree on {key}");
+        assert_eq!(row.payload, view.payload, "both reads agree on {key}");
+        assert_eq!(row.envelope, view.envelope, "both reads agree on {key}");
+    }
+}

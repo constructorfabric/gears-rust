@@ -944,7 +944,7 @@ Does not implement any model — providers are plugins behind the embedding cont
 
 ##### Why this component exists
 
-Hybrid retrieval quality depends on running arms independently and fusing by rank; this component owns arms, fusion, and result provenance.
+Hybrid retrieval quality depends on running arms independently and fusing by rank; this component owns arms, fusion, and result provenance. It realizes `cpt-cf-graph-storage-fr-lexical-search`, `cpt-cf-graph-storage-fr-vector-search`, `cpt-cf-graph-storage-fr-hybrid-search` and `cpt-cf-graph-storage-nfr-search-latency`; since ADR-0005 was superseded, this is where hybrid search is designed.
 
 ##### Responsibility scope
 

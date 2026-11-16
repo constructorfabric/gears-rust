@@ -15,7 +15,7 @@
 //! the statement.
 
 use sea_orm::sea_query::Expr;
-use sea_orm::{EntityTrait, QuerySelect, Select};
+use sea_orm::{EntityTrait, ExprTrait as _, QuerySelect, Select};
 
 use crate::infra::storage::entity::{edge, gts_type, node};
 
@@ -233,8 +233,14 @@ pub fn edge_hop_columns(query: Select<edge::Entity>) -> Select<edge::Entity> {
 /// listing's cursor and envelope are built from it -- while the values a
 /// listing never looks at are not read from the table.
 pub fn node_listing_select() -> Select<node::Entity> {
+    narrow_node_columns(node::Entity::find())
+}
+
+/// Every `node` column but the two wide ones, which are selected as a typed
+/// `NULL` and an empty string so the row still decodes as a `node::Model`.
+fn narrow_node_columns(query: Select<node::Entity>) -> Select<node::Entity> {
     use sea_orm::Iterable as _;
-    node::Entity::find()
+    query
         .select_only()
         .columns(
             node::Column::iter()
@@ -244,6 +250,37 @@ pub fn node_listing_select() -> Select<node::Entity> {
         .column_as(Expr::val(""), "search_text")
 }
 
+/// A node as the view reads (`get_node`, hydration) decode it: the narrow
+/// model plus whether a vector is stored.
+///
+/// A `NodeView` says only `has_embedding` about the vector and nothing about
+/// the search text, so neither is read from the table: the model's two wide
+/// fields are the placeholders of [`narrow_node_columns`], and the flag is the
+/// database's answer to `embedding IS NOT NULL`. Hydrating a neighbourhood of
+/// 1 000 nodes no longer carries 1 000 vectors over the wire to test each for
+/// presence.
+#[derive(Debug)]
+pub struct NodeViewRow {
+    pub model: node::Model,
+    pub has_embedding: bool,
+}
+
+impl sea_orm::FromQueryResult for NodeViewRow {
+    fn from_query_result(res: &sea_orm::QueryResult, pre: &str) -> Result<Self, sea_orm::DbErr> {
+        Ok(Self {
+            model: node::Model::from_query_result(res, pre)?,
+            has_embedding: res.try_get(pre, "has_embedding")?,
+        })
+    }
+}
+
+pub fn node_view_columns(query: Select<node::Entity>) -> Select<node::Entity> {
+    narrow_node_columns(query).column_as(
+        Expr::col((node::Entity, node::Column::Embedding)).is_not_null(),
+        "has_embedding",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use sea_orm::{DatabaseBackend, EntityTrait, QueryTrait};
@@ -251,8 +288,8 @@ mod tests {
     use super::{
         edge, edge_ends_columns, edge_hop_columns, edge_owner_columns, edge_state_columns,
         endpoint_pair_columns, gts_type, node, node_ident_columns, node_listing_select,
-        node_state_columns, node_typed_columns, type_id_columns, type_meta_columns,
-        type_name_columns, type_traits_columns,
+        node_state_columns, node_typed_columns, node_view_columns, type_id_columns,
+        type_meta_columns, type_name_columns, type_traits_columns,
     };
 
     /// The columns no projection here may read, by entity. Each of them is
@@ -333,6 +370,33 @@ mod tests {
             assert!(!sql.contains(wide), "must not read {wide}: {sql}");
         }
         for want in ["node_key", "payload", "version", "updated_at"] {
+            assert!(sql.contains(want), "needs `{want}`: {sql}");
+        }
+    }
+
+    #[test]
+    fn a_view_read_tests_the_vector_for_presence_and_reads_no_search_text() {
+        let sql = rendered(&node_view_columns(node::Entity::find()));
+        assert!(
+            !sql.contains("\"node\".\"search_text\""),
+            "must not read the search text: {sql}"
+        );
+        assert_eq!(
+            sql.matches("\"node\".\"embedding\"").count(),
+            1,
+            "the vector is named once, inside the presence test: {sql}"
+        );
+        assert!(
+            sql.contains("\"node\".\"embedding\" IS NOT NULL AS \"has_embedding\""),
+            "the presence is computed by the database: {sql}"
+        );
+        for want in [
+            "node_key",
+            "payload",
+            "version",
+            "updated_at",
+            "deleted_by_subject_id",
+        ] {
             assert!(sql.contains(want), "needs `{want}`: {sql}");
         }
     }
