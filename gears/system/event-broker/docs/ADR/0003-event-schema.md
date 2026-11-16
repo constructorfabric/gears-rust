@@ -64,7 +64,7 @@ The decision is about *what fields exist on the broker's event* and *how the sch
 ## Decision Drivers
 
 * SDK authors MUST be able to tell from the schema alone which fields are inputs and which are outputs
-* Consumers MUST NOT see producer-side transport mechanics (`producer_id`, `previous`, producer-side `sequence`)
+* Consumers MUST NOT see producer-side transport mechanics (`producer`, `previous`, producer-side `sequence`)
 * Single source of truth for the consumer-visible ordering key (wire and cursor agree on naming)
 * The producer protocol MUST be able to evolve independently of the event schema
 * Batch publish MUST support per-event chain values (each event in a contiguous chain has its own `previous` / `sequence`)
@@ -89,7 +89,7 @@ One JSON Schema replaces the publish-input / read-projection pair:
 - **`gts.cf.core.events.event.v1~.schema.json`** is the single source of truth for the event resource shape.
 - Field-level markers encode per-direction semantics:
   - `meta`: `"writeOnly": true` — accepted on publish, stripped on read.
-  - `partition`, `sequence`, `sequence_time`: `"readOnly": true` — server-stamped on read, rejected with `400 BadRequest` if supplied on publish.
+  - `partition`, `sequence`, `sequence_time`: `"readOnly": true` - server-stamped on read, rejected with `400 InvalidBody` if supplied on publish (the publish body declares none of them).
   - All other fields round-trip without markers.
 - The top-level `required` array is the **union** of publish-required and read-required fields. Per-direction enforcement is the broker's responsibility at the wire, NOT the schema's responsibility at validation. Strict-validator producers must filter `readOnly` fields before submission.
 
@@ -102,7 +102,7 @@ A top-level publish-input field `meta` (marked `writeOnly`) carries producer-pro
 ```jsonc
 "meta": {
   "version": 1,                  // required when meta is present
-  "producer_id": "<uuid>",       // chained / monotonic
+  "producer": "<uuid>",          // chained / monotonic
   "previous": <i64>,             // chained only
   "sequence": <i64>              // chained / monotonic
 }
@@ -125,8 +125,8 @@ Concrete edits to the event shape vs. today's `gts.cf.core.events.event.v1~.sche
 | `id`, `type`, `source`, `subject`, `occurred_at`, `data` | body | body (unchanged) | Event-semantic, consumer-visible, names stay broker-native |
 | `subject_type` | body | body (kept) | Carries entity-kind not derivable from `type` (e.g., generic `rule_applied` may apply to many subject kinds; body-less events have no `data` to introspect) |
 | `trace_parent` | body | body (kept) | Distributed-tracing context is event-correlated, not publish-correlated; useful to consumers for post-hoc trace correlation |
-| `tenant_id` | body, `readOnly: true` | body, **producer-supplied** | A system service legitimately publishes events on behalf of arbitrary tenants (billing aggregator, audit emitter); authz delegated to platform resolver |
-| `producer_id` | body | **moved to `meta`** | Producer-protocol mechanic; should not appear on the consumer-visible body |
+| `subject_tenant` | body, `readOnly: true` | body, **producer-supplied** | A system service legitimately publishes events on behalf of arbitrary tenants (billing aggregator, audit emitter); authz delegated to platform resolver |
+| `producer` | body | **moved to `meta`** | Producer-protocol mechanic; should not appear on the consumer-visible body |
 | `previous` | body | **moved to `meta`** | Producer-protocol mechanic; per-event in batches |
 | `sequence` (producer-side) | body | **moved to `meta`** | Producer-protocol mechanic; renamed under `meta` (the body-level `sequence` after this ADR is the server-assigned consumer-visible field, see "Terminology Cleanup") |
 | `partition` | body, producer-set | body, `readOnly` | The backend assigns it from the partition key - the member the event type's partition-key pointer names, per [ADR-0002](0002-partition-selection.md) ([feature 0007](../features/0007-storage-backend-api.md) §2.2); rejected on publish; surfaced on read |
@@ -173,18 +173,18 @@ JSON Schema codegen tools vary in how they handle `readOnly` / `writeOnly`:
 - Tools that **honor** the markers produce two struct variants (or one struct with markers translated to language-level read/write controls).
 - Tools that **ignore** the markers produce a single struct with all fields present, including server-stamped ones.
 
-For the codegen-ignores-markers case, producers using such SDKs MUST filter `readOnly` fields (`partition`, `sequence`, `sequence_time`) before submitting publish requests. The broker enforces the rule at the wire: any publish carrying a `readOnly` field is rejected with `400 BadRequest` naming the offending field. SDK contract docs make this requirement explicit. The opposite direction is symmetric: the broker never emits `writeOnly` `meta` on read, so consumers cannot accidentally observe producer-protocol state.
+For the codegen-ignores-markers case, producers using such SDKs MUST filter `readOnly` fields (`partition`, `sequence`, `sequence_time`) before submitting publish requests. The broker enforces the rule at the wire: any publish carrying a `readOnly` field is rejected with `400 InvalidBody` naming the offending field. SDK contract docs make this requirement explicit. The opposite direction is symmetric: the broker never emits `writeOnly` `meta` on read, so consumers cannot accidentally observe producer-protocol state.
 
 ### Consequences
 
 - Good, because SDK authors get a single schema with explicit per-direction markers; codegen tools that honor `readOnly` / `writeOnly` produce correct types; tools that don't are handled by SDK-side filters + broker-side wire enforcement.
-- Good, because consumers never see `producer_id`, `previous`, or producer-side `sequence` — producer-side state is opaque to them by construction (the `meta` `writeOnly` marker + broker read-projection logic enforce this together).
+- Good, because consumers never see `producer`, `previous`, or producer-side `sequence` - producer-side state is opaque to them by construction (the `meta` `writeOnly` marker + broker read-projection logic enforce this together).
 - Good, because the producer protocol can evolve without bumping the event schema; new `meta.version`s ship behind feature flags on producer SDKs.
 - Good, because batch publish ergonomics are uniform — each event carries its own `meta`; HTTP headers do not block batch chain support.
 - Good, because wire and cursor agree on `sequence` terminology; the "Three Sequences" mental model collapses to two.
 - Good, because the broker stays a thin validator: `required` + property markers in JSON Schema cover most of the shape; only runtime checks (mode lookup, `readOnly`-on-publish rejection) need broker code; the backend assigns the partition from the partition key.
 - Good, because one schema file replaces two — no `$ref` duplication burden.
-- Bad / accepted, because strict JSON-Schema validators that don't honor `readOnly` will demand `partition` on publish unless the SDK filters first. Mitigation: prose descriptions are explicit; broker `400 BadRequest` is unambiguous; SDK contract spells out the filter requirement.
+- Bad / accepted, because strict JSON-Schema validators that don't honor `readOnly` will demand `partition` on publish unless the SDK filters first. Mitigation: prose descriptions are explicit; broker `400 InvalidBody` is unambiguous; SDK contract spells out the filter requirement.
 - Bad / accepted, because `meta.sequence` (producer-side) and body-level `sequence` (server-assigned) share a word. Mitigation: the `meta.` qualifier disambiguates; documentation always shows the full path; `writeOnly` vs. `readOnly` markers reinforce the directional distinction.
 - Bad / accepted, because the change requires editing DESIGN.md significantly (§3.1 field tables, §3.2 producer modes, §3.6 sequences) and the existing JSON Schema file. The change is unshipped, so this cost is one-time.
 - Bad / accepted, because the ASCII-only rule rejects legitimate UTF-8 subject identifiers in some legacy systems. Mitigation: producers normalize to ASCII (e.g., URL-encoded forms, UUIDs, ULIDs) at the broker boundary; the platform convention applies broadly, not just to the broker.
@@ -196,7 +196,7 @@ The decision is verified by:
 
 - **Schema codegen run**: generating Rust types from the single schema and confirming the producer-facing API on a `readOnly`-honoring tool excludes `partition` / `sequence` / `sequence_time` from publish constructors; the consumer-facing API excludes `meta`.
 - **Round-trip test**: a producer publishes an event with `meta`; storage retains `meta`; the read response strips `meta` and surfaces server-assigned `partition`, `sequence`, `sequence_time`. Assertion: the consumer-visible body contains no producer-protocol fields.
-- **Mode-shape rejection tests**: publishes carrying `partition`, `sequence`, `sequence_time` as top-level body fields are rejected with `400 BadRequest`. Publishes carrying `producer_id`, `previous`, producer-side `sequence` *outside* `meta` (i.e., as top-level body fields) are rejected with `400 BadRequest`.
+- **Mode-shape rejection tests**: publishes carrying `partition`, `sequence`, `sequence_time` as top-level body fields are rejected with `400 InvalidBody`. Publishes carrying `producer`, `previous`, producer-side `sequence` *outside* `meta` (i.e., as top-level body fields) are rejected with `400 InvalidBody`.
 - **Encoding tests**: publishes with non-ASCII bytes in any event field are rejected with `400 InvalidEventFieldEncoding`; publishes with UTF-8 inside `data` and ASCII elsewhere are accepted.
 - **`meta.version` compatibility test**: a publish with `meta.version > current_supported` is rejected with `400 UnknownMetaVersion`; a publish with `meta.version <= current_supported` is accepted (assuming other validation passes).
 
@@ -267,7 +267,7 @@ External references:
 - **PRD**: [PRD.md](../PRD.md)
   - `cpt-cf-evbk-fr-publish-single` — single-event publish accepts the event shape defined here
   - `cpt-cf-evbk-fr-publish-batch` — batch publish accepts the event with per-event `meta`
-  - `cpt-cf-evbk-fr-producer-modes` — producer modes consume `meta.{producer_id, previous, sequence}` per [ADR-0004](0004-idempotent-producer-protocol.md)
+  - `cpt-cf-evbk-fr-producer-modes` - producer modes consume `meta.{producer, previous, sequence}` per [ADR-0004](0004-idempotent-producer-protocol.md)
 - **DESIGN**: [DESIGN.md](../DESIGN.md)
   - §3.1 Domain Model — `Event` field table is updated against this ADR
   - §3.2 Producer Modes — references [ADR-0004](0004-idempotent-producer-protocol.md)

@@ -73,7 +73,7 @@ def _event(tenant_id: str) -> dict:
     return {
         "id": str(uuid.uuid4()),
         "type": EVENT_TYPE,
-        "tenant_id": tenant_id,
+        "subject_tenant": tenant_id,
         "source": "e2e-test",
         "subject": "s1",
         "subject_type": SUBJECT_TYPE,
@@ -180,7 +180,7 @@ async def test_a_server_started_with_its_backend_down_serves_once_it_is_up(test_
                 json={
                     "consumer_group": group.json()["id"],
                     "client_agent": "e2e-test",
-                    "interests": [{"topic": TOPIC, "tenant_id": tenant_id, "types": [EVENT_TYPE]}],
+                    "interests": [{"topic": TOPIC, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE]}],
                 },
             )
             assert sub.status_code == 201
@@ -195,14 +195,13 @@ async def test_a_server_started_with_its_backend_down_serves_once_it_is_up(test_
             assert published.status_code == 202
 
         async with httpx.AsyncClient(base_url=BASE_URL, timeout=None) as stream_client:
-            async with stream_client.stream("GET", f"/events:sse?subscription_id={sub_id}") as resp:
+            async with stream_client.stream("GET", f"/events:sse?subscription={sub_id}") as resp:
                 assert resp.status_code == 200
                 reader = SseFrameReader(resp)
                 await reader.await_kind("topology", timeout=5)
                 payload = (await reader.await_kind("event", timeout=15))["payload"]
         assert payload == {
-            **{k: event[k] for k in ("id", "type", "tenant_id", "source", "subject", "subject_type")},
-            "topic": TOPIC,
+            **{k: event[k] for k in ("id", "type", "subject_tenant", "source", "subject", "subject_type")},
             "occurred_at": payload["occurred_at"],
             "trace_parent": None,
             "data": None,

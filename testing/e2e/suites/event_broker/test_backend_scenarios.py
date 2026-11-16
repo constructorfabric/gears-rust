@@ -61,7 +61,7 @@ def _event(event_type: str, tenant_id: str, n: int) -> dict:
     return {
         "id": str(uuid.uuid4()),
         "type": event_type,
-        "tenant_id": tenant_id,
+        "subject_tenant": tenant_id,
         "source": "e2e-test",
         "subject": f"s{n}",
         "subject_type": SUBJECT_TYPE,
@@ -83,7 +83,7 @@ async def test_events_of_one_key_arrive_in_publish_order_from_one_partition(api,
         sub_id = await _subscribe(
             client,
             TOPIC_ORDER,
-            [{"topic": TOPIC_ORDER, "tenant_id": t, "types": [EVENT_TYPE_ORDER]} for t in tenants],
+            [{"topic": TOPIC_ORDER, "subject_tenant": t, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_ORDER]} for t in tenants],
         )
         seek = await client.post(
             f"/subscriptions/{sub_id}:seek",
@@ -95,7 +95,7 @@ async def test_events_of_one_key_arrive_in_publish_order_from_one_partition(api,
         assert seek.status_code == 200
 
     async with httpx.AsyncClient(base_url=f"{test_env.base_url}/event-broker/v1", timeout=None) as stream_client:
-        async with stream_client.stream("GET", f"/events:sse?subscription_id={sub_id}") as stream_resp:
+        async with stream_client.stream("GET", f"/events:sse?subscription={sub_id}") as stream_resp:
             assert stream_resp.status_code == 200
             reader = SseFrameReader(stream_resp)
             await reader.await_kind("topology", timeout=5)
@@ -110,7 +110,7 @@ async def test_events_of_one_key_arrive_in_publish_order_from_one_partition(api,
             for _ in range(6):
                 body = await reader.await_kind("event", timeout=10)
                 payload = body["payload"]
-                delivered.append((payload["tenant_id"], payload["partition"], payload["data"]["n"]))
+                delivered.append((payload["subject_tenant"], payload["partition"], payload["data"]["n"]))
 
     for tenant in tenants:
         mine = [(partition, n) for t, partition, n in delivered if t == tenant]
@@ -131,7 +131,7 @@ async def test_a_consumer_joined_before_any_publish_receives_the_first_event(api
         sub_id = await _subscribe(
             client,
             TOPIC_FRESH,
-            [{"topic": TOPIC_FRESH, "tenant_id": tenant_id, "types": [EVENT_TYPE_FRESH]}],
+            [{"topic": TOPIC_FRESH, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_FRESH]}],
         )
         seek = await client.post(
             f"/subscriptions/{sub_id}:seek",
@@ -141,7 +141,7 @@ async def test_a_consumer_joined_before_any_publish_receives_the_first_event(api
         assert seek.json() == {"positions": {TOPIC_FRESH: [{"partition": 0, "value": 0}]}}
 
     async with httpx.AsyncClient(base_url=f"{test_env.base_url}/event-broker/v1", timeout=None) as stream_client:
-        async with stream_client.stream("GET", f"/events:sse?subscription_id={sub_id}") as stream_resp:
+        async with stream_client.stream("GET", f"/events:sse?subscription={sub_id}") as stream_resp:
             assert stream_resp.status_code == 200
             reader = SseFrameReader(stream_resp)
             topology = await reader.await_kind("topology", timeout=5)
@@ -160,8 +160,7 @@ async def test_a_consumer_joined_before_any_publish_receives_the_first_event(api
             assert payload == {
                 "id": event["id"],
                 "type": EVENT_TYPE_FRESH,
-                "topic": TOPIC_FRESH,
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id,
                 "source": "e2e-test",
                 "subject": "s1",
                 "subject_type": SUBJECT_TYPE,
@@ -238,7 +237,7 @@ async def _stream(test_env, sub_id: str):
     stream's lag behind storage, not that plus however long the publish took.
     """
     async with httpx.AsyncClient(base_url=f"{test_env.base_url}/event-broker/v1", timeout=None) as stream_client:
-        async with stream_client.stream("GET", f"/events:sse?subscription_id={sub_id}") as stream_resp:
+        async with stream_client.stream("GET", f"/events:sse?subscription={sub_id}") as stream_resp:
             assert stream_resp.status_code == 200
             reader = SseFrameReader(stream_resp)
             await reader.await_kind("topology", timeout=5)
@@ -325,7 +324,7 @@ async def test_retention_removes_the_events_past_their_age_and_keeps_the_rest(ap
       the 15 green runs of 2026-11-04, with an age bound 4 s shorter.
     """
     tenant_id = str(uuid.uuid4())
-    interest = [{"topic": TOPIC_RETENTION, "tenant_id": tenant_id, "types": [EVENT_TYPE_RETENTION]}]
+    interest = [{"topic": TOPIC_RETENTION, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_RETENTION]}]
     async with api() as client:
         reader_sub = await _subscribe(client, TOPIC_RETENTION, interest)
         assert (await _seek(client, reader_sub, "earliest")).status_code == 200
@@ -370,8 +369,7 @@ async def test_retention_removes_the_events_past_their_age_and_keeps_the_rest(ap
     assert delivered == {
         "id": fresh["id"],
         "type": EVENT_TYPE_RETENTION,
-        "topic": TOPIC_RETENTION,
-        "tenant_id": tenant_id,
+        "subject_tenant": tenant_id,
         "source": "e2e-test",
         "subject": fresh["subject"],
         "subject_type": SUBJECT_TYPE,
@@ -468,7 +466,7 @@ async def test_retention_by_bytes_keeps_a_suffix_within_the_bound(api, test_env)
     started = loop.time()
     deadline = started + BYTES_TIMEOUT_S - BYTES_FINAL_S
     tenant_id = str(uuid.uuid4())
-    interest = [{"topic": TOPIC_BYTES, "tenant_id": tenant_id, "types": [EVENT_TYPE_BYTES]}]
+    interest = [{"topic": TOPIC_BYTES, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_BYTES]}]
     async with api() as client:
         published = await _publish(
             client, EVENT_TYPE_BYTES, tenant_id, BYTES_EVENTS, data=lambda n: {"n": n, "pad": BYTES_PAD}
@@ -483,7 +481,7 @@ async def test_retention_by_bytes_keeps_a_suffix_within_the_bound(api, test_env)
     delivered = []
     read_started = loop.time()
     async with httpx.AsyncClient(base_url=f"{test_env.base_url}/event-broker/v1", timeout=None) as stream_client:
-        async with stream_client.stream("GET", f"/events:sse?subscription_id={sub_id}") as stream_resp:
+        async with stream_client.stream("GET", f"/events:sse?subscription={sub_id}") as stream_resp:
             assert stream_resp.status_code == 200
             reader = SseFrameReader(stream_resp)
             await reader.await_kind("topology", timeout=5)
@@ -534,7 +532,7 @@ async def test_latest_still_names_the_last_event_once_retention_removed_every_on
     test took 21-26 s in the 15 green runs of 2026-11-04.
     """
     tenant_id = str(uuid.uuid4())
-    interest = [{"topic": TOPIC_DRAIN, "tenant_id": tenant_id, "types": [EVENT_TYPE_DRAIN]}]
+    interest = [{"topic": TOPIC_DRAIN, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_DRAIN]}]
     async with api() as client:
         reader_sub = await _subscribe(client, TOPIC_DRAIN, interest)
         assert (await _seek(client, reader_sub, "earliest", TOPIC_DRAIN)).status_code == 200
@@ -565,8 +563,7 @@ async def test_latest_still_names_the_last_event_once_retention_removed_every_on
     assert delivered == {
         "id": fresh["id"],
         "type": EVENT_TYPE_DRAIN,
-        "topic": TOPIC_DRAIN,
-        "tenant_id": tenant_id,
+        "subject_tenant": tenant_id,
         "source": "e2e-test",
         "subject": fresh["subject"],
         "subject_type": SUBJECT_TYPE,
@@ -607,7 +604,7 @@ async def test_a_batch_published_for_longer_than_its_age_bound_is_read_back_whol
     publish, so there the test passes either way.
     """
     tenant_id = str(uuid.uuid4())
-    interest = [{"topic": TOPIC_SLOW_PUBLISH, "tenant_id": tenant_id, "types": [EVENT_TYPE_SLOW_PUBLISH]}]
+    interest = [{"topic": TOPIC_SLOW_PUBLISH, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_SLOW_PUBLISH]}]
     async with api() as client:
         sub_id = await _subscribe(client, TOPIC_SLOW_PUBLISH, interest)
         assert (await _seek(client, sub_id, "earliest", TOPIC_SLOW_PUBLISH)).status_code == 200

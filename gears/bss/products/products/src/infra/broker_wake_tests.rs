@@ -110,7 +110,7 @@ async fn stored(broker: &EventBrokerHarness) -> Vec<(String, Value)> {
             .await
             .unwrap();
         for event in events {
-            all.push((event.type_id.to_string(), event.data.unwrap_or_default()));
+            all.push((event.event_type.to_string(), event.data.unwrap_or_default()));
         }
     }
     all
@@ -214,9 +214,9 @@ async fn commit_unwoken(state: &crate::api::rest::ApiState, event: SkuPublished)
                 Box::pin(async move {
                     let (subject, tenant_id) = (event.sku_id.to_string(), event.tenant_id);
                     let event = event_broker_sdk::EventV1::builder(event)
-                        .tenant_id(tenant_id)
+                        .subject_tenant(tenant_id)
                         .subject(subject)
-                        .subject_type_id(event_broker_sdk::GtsTypeId::new(SKU_SUBJECT_TYPE))
+                        .subject_type_of(event_broker_sdk::GtsTypeId::new(SKU_SUBJECT_TYPE))
                         .build()?;
                     producer.enqueue(tx, event).await?.discard();
                     Ok(())

@@ -12,9 +12,10 @@ use event_broker_sdk::gts_id;
 use event_broker_sdk::{
     BatchHandler, BatchHandlerOutcome, ConsumerBuilder, ConsumerCommitMode, ConsumerError,
     ConsumerGroupRef, ConsumerRuntimeEvent, Delivery, EventBatch, EventBrokerApi, EventV1,
-    Fallback, GtsTypeId, InMemoryOffsetManager, TopicId, WireFrame,
+    Fallback, GtsInstanceId, GtsTypeId, InMemoryOffsetManager, WireFrame,
 };
 use serde_json::json;
+use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use super::common::{
@@ -50,6 +51,9 @@ async fn seek_recovers_from_one_shot_topology_version_mismatch() {
     let scopes = recorder.scopes.clone();
 
     let handle = ConsumerBuilder::new(broker.clone())
+        .subject_tenant(fx.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fx.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("reseek"))
         .topics([topic(TOPIC)])
         .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
@@ -83,15 +87,15 @@ async fn seek_recovers_from_one_shot_topology_version_mismatch() {
 }
 
 #[tokio::test]
-async fn seek_topology_mismatch_is_bounded_and_surfaces() {
-    // Mirrors `dispatcher::RESEEK_ON_TOPOLOGY_MISMATCH_ATTEMPTS` (a pub(crate)
+async fn seek_topology_mismatch_is_bounded_per_seek() {
+    // Mirrors `dispatcher::RESEEK_ON_TOPOLOGY_MISMATCH_ATTEMPTS` (a crate-private
     // tuning constant not reachable from an integration test).
     const RESEEK_ATTEMPTS: u32 = 5;
 
     let fx = topic_fixture(TOPIC, EVENT, 1).await;
 
-    // Every seek mismatches: recovery must give up after a bounded number of
-    // re-reads and surface the error instead of looping forever.
+    // Every seek mismatches, so each SEEK re-reads the subscription and retries a
+    // bounded number of times; the seek count reaches `RESEEK_ATTEMPTS + 1`.
     let faulty = SeekFaultBroker::new(fx.broker.clone(), usize::MAX, false);
     let seek_calls = faulty.seek_calls.clone();
     let get_sub_calls = faulty.get_subscription_calls.clone();
@@ -101,6 +105,9 @@ async fn seek_topology_mismatch_is_bounded_and_surfaces() {
     let scopes = recorder.scopes.clone();
 
     let handle = ConsumerBuilder::new(broker.clone())
+        .subject_tenant(fx.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fx.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("reseekfail"))
         .topics([topic(TOPIC)])
         .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
@@ -112,7 +119,7 @@ async fn seek_topology_mismatch_is_bounded_and_surfaces() {
     publish_json(&fx.broker, &fx.ctx, EVENT, "s", None, json!({})).await;
 
     // One resolve_and_seek issues `RESEEK_ATTEMPTS + 1` seeks (each retry
-    // re-reads the subscription) then surfaces the mismatch.
+    // re-reads the subscription), then hands the mismatch to the re-JOIN loop.
     let want_seeks = (RESEEK_ATTEMPTS + 1) as usize;
     for _ in 0..300 {
         if seek_calls.load(Ordering::SeqCst) >= want_seeks {
@@ -179,10 +186,10 @@ async fn a_delivered_event_without_a_stamped_position_is_skipped() {
     let fx = topic_fixture(TOPIC, EVENT, 1).await;
     let unstamped = EventV1::builder_for(event_type(EVENT), json!({}))
         .id(Uuid::from_u128(1))
-        .tenant_id(Uuid::nil())
+        .subject_tenant(Uuid::nil())
         .source("injected")
         .subject("unstamped")
-        .subject_type_id(GtsTypeId::new(SHOWCASE_SUBJECT_TYPE))
+        .subject_type_of(GtsTypeId::new(SHOWCASE_SUBJECT_TYPE))
         .occurred_at("2026-01-02T03:04:05Z".parse().unwrap())
         .build()
         .unwrap();
@@ -196,6 +203,9 @@ async fn a_delivered_event_without_a_stamped_position_is_skipped() {
     let commits = offset_manager.commits.clone();
 
     let handle = ConsumerBuilder::new(broker.clone())
+        .subject_tenant(fx.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fx.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("unstamped"))
         .topics([topic(TOPIC)])
         .offset_manager(offset_manager)
@@ -219,13 +229,13 @@ async fn a_delivered_event_without_a_stamped_position_is_skipped() {
     // Control frames may also commit the broker's position (0 here), so the check is
     // the cursor's furthest point: the stamped event's offset, which the skip did
     // not move past.
-    let furthest: Option<(TopicId, u32, i64)> = commits
+    let furthest: Option<(GtsInstanceId, u32, i64)> = commits
         .lock()
         .unwrap()
         .iter()
-        .map(|(_group, topic_id, partition, offset)| (*topic_id, *partition, *offset))
+        .map(|(_group, topic, partition, offset)| (topic.clone(), *partition, *offset))
         .max_by_key(|commit| commit.2);
-    assert_eq!(furthest, Some((TopicId::from_gts(TOPIC), 0, 1)));
+    assert_eq!(furthest, Some((topic(TOPIC), 0, 1)));
 }
 
 /// A transport error ends the stream and the consumer re-joins; the error is
@@ -246,6 +256,9 @@ async fn a_transport_error_on_the_stream_is_logged_before_the_rejoin() {
     let runtime_events = listener.events.clone();
 
     let handle = ConsumerBuilder::new(broker.clone())
+        .subject_tenant(fx.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fx.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("transport-fault"))
         .topics([topic(TOPIC)])
         .register_listener(listener)
@@ -365,6 +378,7 @@ impl BatchHandler<serde_json::Value> for PlacementRecorder {
 /// A plain consumer in `group` handing each batch to a `PlacementRecorder`.
 struct PlacementConsumer<'a> {
     group: &'a str,
+    ctx: &'a SecurityContext,
 }
 
 impl FaultRunConsumer for PlacementConsumer<'_> {
@@ -375,6 +389,9 @@ impl FaultRunConsumer for PlacementConsumer<'_> {
         handled: SharedPlacements,
     ) -> ConsumerHandle {
         ConsumerBuilder::new(broker)
+            .subject_tenant(self.ctx.subject_tenant_id())
+            .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+            .security_context(self.ctx.clone())
             .group(ConsumerGroupRef::auto_anonymous(self.group))
             .topics([topic(TOPIC)])
             .register_listener(listener)
@@ -404,11 +421,14 @@ async fn a_consumer_resumes_delivery_promptly_after_a_transport_fault() {
         faulty,
         PlacementConsumer {
             group: "transport-resume",
+            ctx: &fx.ctx,
         },
     )
     .await;
 
     assert_eq!(run.placements, vec![(FIRST, 0, 1), (SECOND, 1, 1)]);
+    let (rejoin_group, _) = run.rejoin();
+    assert_eq!(rejoin_group, run.group);
 }
 
 /// A stream that ends takes the same way out as a transport fault: the consumer
@@ -426,11 +446,14 @@ async fn a_consumer_resumes_delivery_promptly_after_its_stream_ends() {
         faulty,
         PlacementConsumer {
             group: "end-resume",
+            ctx: &fx.ctx,
         },
     )
     .await;
 
     assert_eq!(run.placements, vec![(FIRST, 0, 1), (SECOND, 1, 1)]);
+    let (rejoin_group, _) = run.rejoin();
+    assert_eq!(rejoin_group, run.group);
 }
 
 /// A subscription whose stream fails to open is left before the re-join. Its member
@@ -450,12 +473,15 @@ async fn a_consumer_resumes_delivery_promptly_after_a_failed_stream_open() {
         faulty,
         PlacementConsumer {
             group: "open-failure-resume",
+            ctx: &fx.ctx,
         },
     )
     .await;
 
     assert_eq!(run.placements, vec![(FIRST, 0, 1), (SECOND, 1, 1)]);
-    assert_eq!(run.leave_calls, vec![run.rejoined_from()]);
+    let (rejoin_group, rejoined_from) = run.rejoin();
+    assert_eq!(rejoin_group, run.group);
+    assert_eq!(run.leave_calls, vec![rejoined_from]);
 }
 
 /// A transport that opens lazily (REST) reports a refused open as the stream's
@@ -475,12 +501,15 @@ async fn a_consumer_resumes_delivery_promptly_after_an_error_before_the_first_fr
         faulty,
         PlacementConsumer {
             group: "open-error-resume",
+            ctx: &fx.ctx,
         },
     )
     .await;
 
     assert_eq!(run.placements, vec![(FIRST, 0, 1), (SECOND, 1, 1)]);
-    assert_eq!(run.leave_calls, vec![run.rejoined_from()]);
+    let (rejoin_group, rejoined_from) = run.rejoin();
+    assert_eq!(rejoin_group, run.group);
+    assert_eq!(run.leave_calls, vec![rejoined_from]);
 }
 
 /// A stream that ends before its first frame never opened either: the consumer
@@ -498,12 +527,15 @@ async fn a_consumer_resumes_delivery_promptly_after_a_stream_that_ends_before_it
         faulty,
         PlacementConsumer {
             group: "open-end-resume",
+            ctx: &fx.ctx,
         },
     )
     .await;
 
     assert_eq!(run.placements, vec![(FIRST, 0, 1), (SECOND, 1, 1)]);
-    assert_eq!(run.leave_calls, vec![run.rejoined_from()]);
+    let (rejoin_group, rejoined_from) = run.rejoin();
+    assert_eq!(rejoin_group, run.group);
+    assert_eq!(run.leave_calls, vec![rejoined_from]);
 }
 
 /// A stream open refused with `PositionsNotSet` can be transient for a member that
@@ -512,8 +544,9 @@ async fn a_consumer_resumes_delivery_promptly_after_a_stream_that_ends_before_it
 /// the fresh assignment, then delivers on every partition.
 #[tokio::test]
 async fn positions_not_set_at_open_is_recovered_by_a_fresh_join() {
-    // Diverges from docs/openapi.yaml:310-313 (seek the unseeded partitions and retry
-    // the same subscription); the code re-JOINs. Pending #5819.
+    // Diverges from docs/openapi.yaml, GET /v1/events:stream 409 PositionsNotSet (seek
+    // the unseeded partitions and retry the same subscription); the code re-JOINs.
+    // Pending #5819.
     let fx = topic_fixture(TOPIC, EVENT, 2).await;
     let faulty = SeekFaultBroker::new(fx.broker.clone(), 0, true);
     let stream_calls = faulty.stream_calls.clone();
@@ -524,6 +557,7 @@ async fn positions_not_set_at_open_is_recovered_by_a_fresh_join() {
         faulty,
         PlacementConsumer {
             group: "pns-open-resume",
+            ctx: &fx.ctx,
         },
     )
     .await;
@@ -531,7 +565,9 @@ async fn positions_not_set_at_open_is_recovered_by_a_fresh_join() {
     assert_eq!(run.placements, vec![(FIRST, 0, 1), (SECOND, 1, 1)]);
     // The refused open and the one after the re-join; the second stream stays open.
     assert_eq!(stream_calls.load(Ordering::SeqCst), 2);
-    assert_eq!(run.leave_calls, vec![run.rejoined_from()]);
+    let (rejoin_group, rejoined_from) = run.rejoin();
+    assert_eq!(rejoin_group, run.group);
+    assert_eq!(run.leave_calls, vec![rejoined_from]);
     let Ok(()) = stopped else {
         panic!("expected the consumer to stop cleanly, got {stopped:?}");
     };
@@ -541,8 +577,9 @@ async fn positions_not_set_at_open_is_recovered_by_a_fresh_join() {
 /// item. `PositionsNotSet` there takes the same way out as at open.
 #[tokio::test]
 async fn a_positions_not_set_before_the_first_frame_is_recovered_by_a_fresh_join() {
-    // Diverges from docs/openapi.yaml:310-313 (seek the unseeded partitions and retry
-    // the same subscription); the code re-JOINs. Pending #5819.
+    // Diverges from docs/openapi.yaml, GET /v1/events:stream 409 PositionsNotSet (seek
+    // the unseeded partitions and retry the same subscription); the code re-JOINs.
+    // Pending #5819.
     let fx = topic_fixture(TOPIC, EVENT, 2).await;
     let faulty = SeekFaultBroker::new(fx.broker.clone(), 0, false).with_open_error(
         ConsumerError::PositionsNotSet {
@@ -557,12 +594,15 @@ async fn a_positions_not_set_before_the_first_frame_is_recovered_by_a_fresh_join
         faulty,
         PlacementConsumer {
             group: "pns-first-item-resume",
+            ctx: &fx.ctx,
         },
     )
     .await;
 
     assert_eq!(run.placements, vec![(FIRST, 0, 1), (SECOND, 1, 1)]);
-    assert_eq!(run.leave_calls, vec![run.rejoined_from()]);
+    let (rejoin_group, rejoined_from) = run.rejoin();
+    assert_eq!(rejoin_group, run.group);
+    assert_eq!(run.leave_calls, vec![rejoined_from]);
     let Ok(()) = stopped else {
         panic!("expected the consumer to stop cleanly, got {stopped:?}");
     };

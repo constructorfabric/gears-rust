@@ -6,18 +6,20 @@
 //! crate has two distinct handler groups rather than one.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use chrono::{DateTime, Utc};
 use gts::{GtsIdPattern, GtsInstanceId};
-use serde::Deserialize;
+use serde::de::{IgnoredAny, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
-use crate::domain::delivery::{ControlCode, Frame, Position};
+use crate::domain::delivery::{ControlCode, Frame, JoinOutcome, Position};
 use crate::domain::error::{DomainError, ErrorCode};
 use crate::domain::model::{
     Assignment, BarrierMode, ConsumerGroup, ConsumerGroupCreateInput, ConsumerGroupKind, Event,
-    FilterSpec, Interest, Sequence, Subscription, TenantTraversalDepth,
+    FilterSpec, Interest, OwnershipFilter, Sequence, Subscription,
 };
 
 // ---------------------------------------------------------------------------
@@ -46,8 +48,8 @@ impl From<ConsumerGroupKind> for ConsumerGroupKindDto {
 pub struct ConsumerGroupDto {
     pub id: String,
     pub kind: ConsumerGroupKindDto,
-    pub tenant_id: uuid::Uuid,
-    pub owner_principal_id: uuid::Uuid,
+    pub tenant: uuid::Uuid,
+    pub owner_principal: uuid::Uuid,
     pub description: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
@@ -57,8 +59,8 @@ impl From<ConsumerGroup> for ConsumerGroupDto {
         Self {
             id: g.id.to_string(),
             kind: g.kind.into(),
-            tenant_id: g.tenant_id,
-            owner_principal_id: g.owner_principal_id,
+            tenant: g.tenant_id,
+            owner_principal: g.owner_principal_id,
             description: g.description,
             created_at: g.created_at,
         }
@@ -95,12 +97,12 @@ impl From<CreateConsumerGroupRequest> for ConsumerGroupCreateInput {
 
 /// `deny_unknown_fields` so a legacy `timeout`/`collect` (or any other
 /// unrecognised) query parameter is rejected as a `400` rather than silently
-/// ignored - the endpoint recognises only `subscription_id`
+/// ignored - the endpoint recognises only `subscription`
 /// (`scenarios/consumer/stream/1.10`).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StreamQuery {
-    pub subscription_id: Uuid,
+    pub subscription: Uuid,
 }
 
 /// Wire shape of one event delivered in an `Event` frame.
@@ -109,11 +111,12 @@ pub struct StreamQuery {
 pub(crate) struct EventPayloadDto {
     id: Uuid,
     r#type: String,
-    topic: String,
-    tenant_id: Uuid,
+    subject_tenant: Uuid,
     source: String,
     subject: String,
     subject_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subject_owner: Option<Uuid>,
     occurred_at: DateTime<Utc>,
     trace_parent: Option<String>,
     data: JsonValue,
@@ -128,11 +131,11 @@ impl From<Event> for EventPayloadDto {
         Self {
             id: e.id,
             r#type: e.r#type.into_string(),
-            topic: e.topic.into_string(),
-            tenant_id: e.tenant_id,
+            subject_tenant: e.subject_tenant,
             source: e.source,
             subject: e.subject,
             subject_type: e.subject_type.into_string(),
+            subject_owner: e.subject_owner,
             occurred_at: e.occurred_at,
             trace_parent: e.trace_parent,
             data: e.data,
@@ -143,7 +146,7 @@ impl From<Event> for EventPayloadDto {
     }
 }
 
-/// Wire shape of a partition position: committed offset and last examined sequence.
+/// Wire shape of a partition position: the last delivered and last examined sequences.
 #[derive(Debug)]
 #[toolkit_macros::api_dto(response)]
 pub(crate) struct PositionDto {
@@ -178,7 +181,8 @@ pub(crate) enum FrameDto {
         /// Partitions now assigned to this member, with their positions.
         assigned: Vec<PositionDto>,
     },
-    /// Terminal control frame ending the stream.
+    /// Control frame: `progress` reports positions and the stream continues;
+    /// `terminal` ends the stream.
     Control {
         /// Machine-readable control code.
         code: &'static str,
@@ -257,34 +261,32 @@ impl TryFrom<FilterSpecDto> for FilterSpec {
     }
 }
 
-/// Deserializes a present field - `null` included - into `Some(..)`, leaving
-/// the outer `None` to mean "the field was absent". Only reached when the
-/// field is present, so wrapping unconditionally is what draws the
-/// distinction.
-/// Wire form of an interest's `max_depth`, whose three states arrive as two
-/// JSON shapes: an integer, or an explicit `null` meaning unbounded. Matching
-/// that shape with an untagged enum is what keeps an absent field and a `null`
-/// distinguishable - a plain `Option<i32>` collapses them, and `serde` maps a
-/// `null` onto the outer `None` of a nested `Option` too.
-#[derive(Debug, Clone, Copy)]
-#[toolkit_macros::api_dto(request)]
-#[serde(untagged)]
-pub enum MaxDepthDto {
-    /// An explicit JSON `null`.
-    Unlimited,
-    /// A concrete depth. `i32` rather than `u32` so a negative value is
-    /// rejected by name below, instead of as an untagged "matched no variant".
-    #[schema(value_type = i32)]
-    Levels(i32),
+#[derive(Debug, Clone, Copy, Default)]
+#[toolkit_macros::api_dto(request, response)]
+pub enum OwnershipFilterDto {
+    #[default]
+    OnlyMine,
+    EntireTenant,
+    TenantSubtreeIncluded,
 }
 
-impl Default for MaxDepthDto {
-    /// An omitted `max_depth` is the *current tenant only*, per the schema's
-    /// `default: 0`. Deliberately not `Unlimited`: that is the widest scope
-    /// this field can express, so defaulting to it would silently widen every
-    /// request that leaves the field out.
-    fn default() -> Self {
-        Self::Levels(0)
+impl From<OwnershipFilter> for OwnershipFilterDto {
+    fn from(filter: OwnershipFilter) -> Self {
+        match filter {
+            OwnershipFilter::OnlyMine => Self::OnlyMine,
+            OwnershipFilter::EntireTenant => Self::EntireTenant,
+            OwnershipFilter::TenantSubtreeIncluded => Self::TenantSubtreeIncluded,
+        }
+    }
+}
+
+impl From<OwnershipFilterDto> for OwnershipFilter {
+    fn from(filter: OwnershipFilterDto) -> Self {
+        match filter {
+            OwnershipFilterDto::OnlyMine => Self::OnlyMine,
+            OwnershipFilterDto::EntireTenant => Self::EntireTenant,
+            OwnershipFilterDto::TenantSubtreeIncluded => Self::TenantSubtreeIncluded,
+        }
     }
 }
 
@@ -310,31 +312,43 @@ impl From<BarrierModeDto> for BarrierMode {
 #[serde(deny_unknown_fields)]
 pub struct InterestDto {
     pub topic: String,
-    pub tenant_id: Uuid,
+    /// The tenant the interest reads; the caller's own tenant when absent.
     #[serde(default)]
-    pub max_depth: MaxDepthDto,
+    pub subject_tenant: Option<Uuid>,
+    #[serde(default)]
+    pub ownership_filter: OwnershipFilterDto,
+    /// A removed field, read only so a body that still sends it gets a `400`
+    /// that names it: `deny_unknown_fields` would make it a `422`.
+    #[serde(default, deserialize_with = "InterestDto::present")]
+    #[schema(ignore)]
+    pub max_depth: Option<IgnoredAny>,
     #[serde(default)]
     pub barrier_mode: BarrierModeDto,
     pub types: Vec<String>,
     #[serde(default)]
+    pub subject_types: Vec<String>,
+    #[serde(default)]
     pub filter: Option<FilterSpecDto>,
 }
 
-impl TryFrom<InterestDto> for Interest {
-    type Error = DomainError;
-
-    fn try_from(i: InterestDto) -> Result<Self, DomainError> {
+impl InterestDto {
+    /// The domain interest for a caller of tenant `caller_tenant`: an absent
+    /// `subject_tenant` is the caller's own.
+    ///
+    /// # Errors
+    ///
+    /// [`DomainError::Validation`] with [`ErrorCode::InvalidBody`] for a body
+    /// that sends `max_depth`, or the code of the first invalid topic, type
+    /// pattern or filter.
+    pub fn into_interest(self, caller_tenant: Uuid) -> Result<Interest, DomainError> {
+        let i = self;
+        if i.max_depth.is_some() {
+            return Err(DomainError::Validation {
+                code: ErrorCode::InvalidBody,
+                message: "'max_depth' is not supported; use 'ownership_filter'".to_owned(),
+            });
+        }
         let topic = crate::domain::id_parse::parse_topic_id(&i.topic)?;
-        let depth = match i.max_depth {
-            MaxDepthDto::Unlimited => TenantTraversalDepth::UnlimitedDescendants,
-            MaxDepthDto::Levels(depth) => {
-                let depth = u32::try_from(depth).map_err(|_| DomainError::Validation {
-                    code: ErrorCode::InvalidBody,
-                    message: format!("'max_depth' must be >= 0 or null, got {depth}"),
-                })?;
-                TenantTraversalDepth::from_max_depth(Some(depth))
-            }
-        };
         let types = i
             .types
             .iter()
@@ -345,14 +359,32 @@ impl TryFrom<InterestDto> for Interest {
                 })
             })
             .collect::<Result<Vec<_>, DomainError>>()?;
-        Ok(Self {
+        // An explicit `[]` reads as no selector, as the field's absence does.
+        let subject_types = i
+            .subject_types
+            .iter()
+            .map(|selector| {
+                GtsIdPattern::try_new(selector).map_err(|_| DomainError::Validation {
+                    code: ErrorCode::BadTypePattern,
+                    message: "subject type selector must be a valid GTS pattern".to_owned(),
+                })
+            })
+            .collect::<Result<Vec<_>, DomainError>>()?;
+        Ok(Interest {
             topic,
-            tenant_id: i.tenant_id,
-            depth,
+            subject_tenant: i.subject_tenant.unwrap_or(caller_tenant),
+            ownership: i.ownership_filter.into(),
             barrier_mode: i.barrier_mode.into(),
             types,
+            subject_types,
             filter: i.filter.map(FilterSpec::try_from).transpose()?,
         })
+    }
+
+    /// Reads a present field, `null` included, as `Some`, so only an absent
+    /// field is `None`.
+    fn present<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<IgnoredAny>, D::Error> {
+        IgnoredAny::deserialize(deserializer).map(Some)
     }
 }
 
@@ -387,12 +419,14 @@ impl From<FilterSpec> for FilterSpecResponseDto {
 #[toolkit_macros::api_dto(response)]
 pub struct InterestResponseDto {
     pub topic: String,
-    pub tenant_id: Uuid,
-    /// Echoed in the wire's own tri-state form: `0` for the current tenant
-    /// only, `n` for `n` levels of descendants, `null` for unbounded.
-    pub max_depth: Option<i32>,
+    /// The tenant the interest reads, resolved at JOIN.
+    pub subject_tenant: Uuid,
+    pub ownership_filter: OwnershipFilterDto,
     pub barrier_mode: String,
     pub types: Vec<String>,
+    /// Echoed only when the interest carries a subject-type selector.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub subject_types: Vec<String>,
     pub filter: Option<FilterSpecResponseDto>,
 }
 
@@ -400,17 +434,16 @@ impl From<Interest> for InterestResponseDto {
     fn from(i: Interest) -> Self {
         Self {
             topic: i.topic.into_string(),
-            tenant_id: i.tenant_id,
-            // Saturating, not `try_from(..).ok()`: a `None` here would echo
-            // `null`, which the wire reads as *unbounded* - the widest
-            // possible answer to an out-of-range depth.
-            max_depth: i
-                .depth
-                .max_depth()
-                .map(|depth| i32::try_from(depth).unwrap_or(i32::MAX)),
+            subject_tenant: i.subject_tenant,
+            ownership_filter: i.ownership.into(),
             barrier_mode: i.barrier_mode.as_wire().to_owned(),
             types: i
                 .types
+                .iter()
+                .map(|pattern| pattern.pattern().to_owned())
+                .collect(),
+            subject_types: i
+                .subject_types
                 .iter()
                 .map(|pattern| pattern.pattern().to_owned())
                 .collect(),
@@ -445,6 +478,65 @@ pub struct SubscriptionDto {
     pub assigned: Vec<AssignedPartitionDto>,
     pub topology_version: i64,
     pub created_at: DateTime<Utc>,
+}
+
+/// One interest of the JOIN response: the echo, then the entries of its
+/// `types` that matched no event type registered on the topic.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct JoinInterestResponseDto {
+    #[serde(flatten)]
+    pub interest: InterestResponseDto,
+    /// The entries of `types` that matched no registered event type; `[]` when all matched.
+    pub unmatched_types: Vec<String>,
+}
+
+/// The JOIN `201` body: the subscription, with each interest's
+/// `unmatched_types`. A read or a listing answers [`SubscriptionDto`].
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct JoinSubscriptionResponseDto {
+    pub id: Uuid,
+    pub consumer_group: String,
+    pub client_agent: String,
+    pub interests: Vec<JoinInterestResponseDto>,
+    pub assigned: Vec<AssignedPartitionDto>,
+    pub topology_version: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<JoinOutcome> for JoinSubscriptionResponseDto {
+    fn from(outcome: JoinOutcome) -> Self {
+        let mut unmatched: BTreeMap<usize, Vec<GtsIdPattern>> =
+            outcome.unmatched_types.into_iter().collect();
+        let s = outcome.subscription;
+        Self {
+            id: s.id,
+            consumer_group: s.consumer_group.to_string(),
+            client_agent: s.client_agent,
+            interests: s
+                .interests
+                .into_iter()
+                .enumerate()
+                .map(|(position, interest)| JoinInterestResponseDto {
+                    interest: InterestResponseDto::from(interest),
+                    unmatched_types: unmatched
+                        .remove(&position)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|pattern| pattern.pattern().to_owned())
+                        .collect(),
+                })
+                .collect(),
+            assigned: s
+                .assigned
+                .into_iter()
+                .map(AssignedPartitionDto::from)
+                .collect(),
+            topology_version: s.topology_version,
+            created_at: s.created_at,
+        }
+    }
 }
 
 impl From<Subscription> for SubscriptionDto {
@@ -526,9 +618,48 @@ pub struct SeekSubscriptionRequest {
     /// (412) so the caller re-reads the subscription and re-seeks.
     pub topology_version: i64,
     /// Seek targets keyed by topic GTS id, each mapping to its per-partition
-    /// entries. A `BTreeMap` so the flattened order the broker assigns entry
-    /// indices from (used only in an out-of-range rejection) is deterministic.
-    pub positions: BTreeMap<String, Vec<PositionEntryDto>>,
+    /// entries. A topic key named more than once rejects the whole seek with
+    /// `InvalidBody` (400).
+    // Kept as pairs in request order, a repeated key included: a map would keep
+    // only the last array for that key and silently drop the earlier entries.
+    #[serde(deserialize_with = "SeekSubscriptionRequest::deserialize_positions")]
+    #[schema(value_type = BTreeMap<String, Vec<PositionEntryDto>>)]
+    pub positions: Vec<(String, Vec<PositionEntryDto>)>,
+}
+
+/// `SeekSubscriptionRequest::positions` as `(topic, entries)` pairs.
+type PositionPairs = Vec<(String, Vec<PositionEntryDto>)>;
+
+impl SeekSubscriptionRequest {
+    /// Reads `positions` as its `(topic, entries)` pairs in request order, a
+    /// repeated key included.
+    fn deserialize_positions<'de, D>(deserializer: D) -> Result<PositionPairs, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PairsVisitor;
+
+        impl<'de> Visitor<'de> for PairsVisitor {
+            type Value = PositionPairs;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("an object mapping topic ids to arrays of position entries")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut pairs = Vec::new();
+                while let Some(pair) = map.next_entry()? {
+                    pairs.push(pair);
+                }
+                Ok(pairs)
+            }
+        }
+
+        deserializer.deserialize_map(PairsVisitor)
+    }
 }
 
 /// One partition's resolved integer offset within a topic; the topic is the map

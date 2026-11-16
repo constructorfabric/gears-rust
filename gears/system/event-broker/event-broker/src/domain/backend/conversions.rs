@@ -5,18 +5,18 @@
 //! `domain::model`, so it stays within the "no infra dependencies in
 //! domain" invariant despite talking about the backend boundary.
 
-use event_broker_sdk::models::Event as SdkEvent;
+use event_broker_sdk::models::{Event as SdkEvent, IngestStamp as SdkIngestStamp};
 use toolkit_gts::GtsInstanceId;
 
 use crate::domain::error::{DomainError, ErrorCode};
 use crate::domain::ingest::PublishRequest;
-use crate::domain::model::Event;
+use crate::domain::model::{Event, IngestStamp};
 
 /// The value an event type's partition-key pointer resolves to within a publish
 /// request, as the string whose bytes are hashed.
 ///
 /// Delegates to the SDK's own [`SdkEvent::partition_input`], which owns the
-/// mapping from schema member names to fields: a pointer addresses `/tenant_id`
+/// mapping from schema member names to fields: a pointer addresses `/subject_tenant`
 /// or `/data/order_id`, not a Rust identifier, and a second copy of that
 /// mapping here is exactly the kind of thing that drifts. A producer computing
 /// a local hint resolves the pointer through the same function.
@@ -29,11 +29,12 @@ use crate::domain::model::Event;
 pub fn partition_input(request: &PublishRequest, pointer: &str) -> Result<String, DomainError> {
     let addressable = SdkEvent {
         id: request.id,
-        type_id: request.r#type.clone(),
-        tenant_id: request.tenant_id,
+        event_type: request.r#type.clone(),
+        subject_tenant: request.subject_tenant,
         source: request.source.clone(),
         subject: request.subject.clone(),
         subject_type: request.subject_type.clone(),
+        subject_owner: request.subject_owner,
         occurred_at: request.occurred_at,
         trace_parent: request.trace_parent.clone(),
         data: Some(request.data.clone()),
@@ -41,6 +42,7 @@ pub fn partition_input(request: &PublishRequest, pointer: &str) -> Result<String
         sequence: None,
         sequence_time: None,
         meta: None,
+        ingest: None,
     };
     addressable
         .partition_input(pointer)
@@ -58,7 +60,7 @@ pub fn partition_input(request: &PublishRequest, pointer: &str) -> Result<String
 /// `append` stores. Carries no partition, no sequence and no producer
 /// metadata: the first two are the backend's to assign, and the producer
 /// chain was checked and recorded at admission, so nothing downstream reads
-/// it.
+/// it. Carries the ingest stamp, which the backend stores.
 ///
 /// The owning topic is not part of the SDK event: `append` takes it as its
 /// own argument, so the caller names the log it is appending to rather than
@@ -67,11 +69,12 @@ pub fn partition_input(request: &PublishRequest, pointer: &str) -> Result<String
 pub fn to_sdk_event(event: &Event) -> SdkEvent {
     SdkEvent {
         id: event.id,
-        type_id: event.r#type.clone(),
-        tenant_id: event.tenant_id,
+        event_type: event.r#type.clone(),
+        subject_tenant: event.subject_tenant,
         source: event.source.clone(),
         subject: event.subject.clone(),
         subject_type: event.subject_type.clone(),
+        subject_owner: event.subject_owner,
         occurred_at: event.occurred_at,
         trace_parent: event.trace_parent.clone(),
         data: Some(event.data.clone()),
@@ -79,6 +82,7 @@ pub fn to_sdk_event(event: &Event) -> SdkEvent {
         sequence: None,
         sequence_time: None,
         meta: None,
+        ingest: event.ingest.map(SdkIngestStamp::from),
     }
 }
 
@@ -86,6 +90,7 @@ pub fn to_sdk_event(event: &Event) -> SdkEvent {
 /// `meta` is always `None` on the way back - the read projection strips
 /// publish-input-only fields, matching `domain::model::Event::meta`'s own
 /// doc comment ("Publish-input only; stripped on the read projection").
+/// The ingest stamp is kept: it is internal, and no delivery shape carries it.
 ///
 /// `topic` comes from the caller, which already knows the log it read: the
 /// SDK event carries no topic, and re-deriving one per event from its type
@@ -93,26 +98,46 @@ pub fn to_sdk_event(event: &Event) -> SdkEvent {
 /// already answered.
 ///
 /// # Errors
-/// Returns `DomainError::Internal` if `type_id` isn't a well-formed GTS
+/// Returns `DomainError::Internal` if `event_type` isn't a well-formed GTS
 /// instance id - would indicate backend-stored data corruption, since
 /// nothing publishes an event without validating it first.
 pub fn from_sdk_event(topic: &GtsInstanceId, event: SdkEvent) -> Result<Event, DomainError> {
     Ok(Event {
         id: event.id,
-        r#type: parse_gts_type_id(&event.type_id)?,
+        r#type: parse_gts_type_id(&event.event_type)?,
         topic: topic.clone(),
-        tenant_id: event.tenant_id,
+        subject_tenant: event.subject_tenant,
         source: event.source,
         subject: event.subject,
         subject_type: event.subject_type,
+        subject_owner: event.subject_owner,
         occurred_at: event.occurred_at,
         trace_parent: event.trace_parent,
         data: event.data.unwrap_or(serde_json::Value::Null),
         meta: None,
+        ingest: event.ingest.map(IngestStamp::from),
         partition: event.partition.and_then(|p| i32::try_from(p).ok()),
         sequence: event.sequence,
         sequence_time: event.sequence_time,
     })
+}
+
+impl From<IngestStamp> for SdkIngestStamp {
+    fn from(stamp: IngestStamp) -> Self {
+        Self {
+            tenant: stamp.tenant,
+            actor: stamp.actor,
+        }
+    }
+}
+
+impl From<SdkIngestStamp> for IngestStamp {
+    fn from(stamp: SdkIngestStamp) -> Self {
+        Self {
+            tenant: stamp.tenant,
+            actor: stamp.actor,
+        }
+    }
 }
 
 /// The same, for the event's own type: a backend stores the identifier as a
@@ -124,3 +149,7 @@ fn parse_gts_type_id(raw: &str) -> Result<gts::GtsTypeId, DomainError> {
         ))
     })
 }
+
+#[cfg(test)]
+#[path = "conversions_tests.rs"]
+mod conversions_tests;

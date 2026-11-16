@@ -7,7 +7,7 @@ use serde_json::json;
 use toolkit_gts::GtsInstanceId;
 use uuid::Uuid;
 
-use crate::domain::model::{BarrierMode, Event, FilterSpec, Interest, TenantTraversalDepth};
+use crate::domain::model::{BarrierMode, Event, FilterSpec, Interest, OwnershipFilter};
 
 use super::filter::{EventFilter, InterestFilter};
 
@@ -32,10 +32,11 @@ const CREATED: &str = "gts.cf.core.events.event.v1~x.eb.orders.created.v1~";
 fn interest(tenant: Uuid, patterns: &[&str]) -> Interest {
     Interest {
         topic: topic(),
-        tenant_id: tenant,
-        depth: TenantTraversalDepth::CurrentTenant,
+        subject_tenant: tenant,
+        ownership: OwnershipFilter::EntireTenant,
         barrier_mode: BarrierMode::Respect,
         types: patterns.iter().map(|p| pattern(p)).collect(),
+        subject_types: Vec::new(),
         filter: None,
     }
 }
@@ -45,14 +46,16 @@ fn event(tenant: Uuid, on_topic: GtsInstanceId, event_type: &str) -> Event {
         id: Uuid::nil(),
         r#type: crate::test_support::event_type_id(event_type),
         topic: on_topic,
-        tenant_id: tenant,
+        subject_tenant: tenant,
         source: "filter-test".to_owned(),
         subject: "order".to_owned(),
         subject_type: GtsTypeId::new("gts.x.eb.orders.subject.v1~"),
+        subject_owner: None,
         occurred_at: Utc::now(),
         trace_parent: None,
         data: json!({}),
         meta: None,
+        ingest: None,
         partition: Some(0),
         sequence: Some(Sequence::assigned(1)),
         sequence_time: None,
@@ -198,196 +201,92 @@ fn a_filter_spec_compiles_and_does_not_yet_decide() {
     assert!(filter.matches(&event(tenant, topic(), CREATED)));
 }
 
-/// An open stream must not keep using an earlier allow after policy changes.
-#[tokio::test]
-async fn concrete_type_permission_is_rechecked_for_each_event() {
-    use super::filter::AuthorizedInterestFilter;
-    use crate::test_support::DenyingAuthZ;
-    use authz_resolver_sdk::{EvaluationRequest, PolicyEnforcer};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+// -- The subject-type selector --
 
-    let denied = Arc::new(AtomicBool::new(false));
-    let policy_denied = Arc::clone(&denied);
-    let tenant = Uuid::new_v4();
-    let filter = AuthorizedInterestFilter::new(
-        &[interest(tenant, &[CREATED])],
-        PolicyEnforcer::new(Arc::new(DenyingAuthZ {
-            deny_if: move |request: &EvaluationRequest| {
-                assert_eq!(request.action.name, "consume");
-                request.resource.resource_type == CREATED && policy_denied.load(Ordering::Relaxed)
-            },
-        })),
-        toolkit_security::SecurityContext::builder()
-            .subject_tenant_id(tenant)
-            .subject_id(Uuid::new_v4())
-            .build()
-            .expect("valid stream caller"),
-    );
-    let candidate = event(tenant, topic(), CREATED);
-    assert!(filter.allows(&candidate).await.unwrap());
-    denied.store(true, Ordering::Relaxed);
-    assert!(!filter.allows(&candidate).await.unwrap());
+const SELECTOR_TENANT: Uuid = Uuid::from_u128(0x1901);
+const CUSTOMER: &str = "gts.x.eb.orders.customer.v1~";
+const SUPPLIER: &str = "gts.x.eb.orders.supplier.v1~";
+
+/// `interest` with `subject_patterns` as its subject-type selector.
+fn selecting(mut interest: Interest, subject_patterns: &[&str]) -> Interest {
+    interest.subject_types = subject_patterns.iter().map(|p| pattern(p)).collect();
+    interest
 }
 
-/// Every independent delivery grant can be revoked after the stream opens.
-#[tokio::test]
-async fn delivery_rechecks_all_three_gates_in_the_event_tenant() {
-    use super::filter::AuthorizedInterestFilter;
-    use crate::test_support::DenyingAuthZ;
-    use authz_resolver_sdk::{EvaluationRequest, PolicyEnforcer};
-    use std::sync::{Arc, Mutex};
-    for revoked_resource in [
-        event_broker_sdk::gts::REQUEST_RESOURCE_TYPE,
-        topic().as_ref(),
-        CREATED,
-    ] {
-        let denied = Arc::new(Mutex::new(None::<String>));
-        let policy_denied = Arc::clone(&denied);
-        let tenant = Uuid::new_v4();
-        let filter = AuthorizedInterestFilter::new(
-            &[interest(tenant, &[CREATED])],
-            PolicyEnforcer::new(Arc::new(DenyingAuthZ {
-                deny_if: move |request: &EvaluationRequest| {
-                    assert_eq!(
-                        request.resource.properties.get("owner_tenant_id"),
-                        Some(&json!(tenant))
-                    );
-                    policy_denied.lock().unwrap().as_deref()
-                        == Some(request.resource.resource_type.as_str())
-                },
-            })),
-            toolkit_security::SecurityContext::builder()
-                .subject_tenant_id(Uuid::new_v4())
-                .subject_id(Uuid::new_v4())
-                .build()
-                .unwrap(),
-        );
-        let candidate = event(tenant, topic(), CREATED);
-        assert!(filter.allows(&candidate).await.unwrap());
-        *denied.lock().unwrap() = Some(revoked_resource.to_owned());
-        assert!(
-            !filter.allows(&candidate).await.unwrap(),
-            "revoked {revoked_resource}"
-        );
-    }
+/// `event` about a subject of `subject_type`.
+fn about(mut event: Event, subject_type: GtsTypeId) -> Event {
+    event.subject_type = subject_type;
+    event
 }
 
-/// An unavailable policy service at any gate is an error, never a skipped event.
-#[tokio::test]
-async fn delivery_preserves_evaluation_errors_from_each_gate() {
-    use super::filter::AuthorizedInterestFilter;
-    use authz_resolver_sdk::{
-        AuthZResolverApi, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
-        PolicyEnforcer,
-    };
-    use std::sync::Arc;
-    use toolkit_canonical_errors::CanonicalError;
-    use toolkit_security::PlatformSecurityContext;
+#[test]
+fn an_interest_with_a_subject_type_selector_matches_only_that_subject_type() {
+    let filter = InterestFilter::compile(&[selecting(
+        interest(SELECTOR_TENANT, &[CREATED]),
+        &[CUSTOMER],
+    )]);
 
-    struct UnavailableAt(String);
-    #[async_trait::async_trait]
-    impl AuthZResolverApi for UnavailableAt {
-        async fn evaluate(
-            &self,
-            _ctx: PlatformSecurityContext,
-            request: EvaluationRequest,
-        ) -> Result<EvaluationResponse, CanonicalError> {
-            if request.resource.resource_type == self.0 {
-                Err(CanonicalError::service_unavailable().create())
-            } else {
-                Ok(EvaluationResponse {
-                    decision: true,
-                    context: EvaluationResponseContext::default(),
-                })
-            }
-        }
-    }
-    for unavailable in [
-        event_broker_sdk::gts::REQUEST_RESOURCE_TYPE,
-        topic().as_ref(),
-        CREATED,
-    ] {
-        let tenant = Uuid::new_v4();
-        let filter = AuthorizedInterestFilter::new(
-            &[interest(tenant, &[CREATED])],
-            PolicyEnforcer::new(Arc::new(UnavailableAt(unavailable.to_owned()))),
-            toolkit_security::SecurityContext::builder()
-                .subject_tenant_id(tenant)
-                .subject_id(Uuid::new_v4())
-                .build()
-                .unwrap(),
-        );
-        assert!(
-            matches!(
-                filter.allows(&event(tenant, topic(), CREATED)).await,
-                Err(crate::domain::error::DomainError::Internal(_))
-            ),
-            "unavailable {unavailable}"
-        );
-    }
+    let created = event(SELECTOR_TENANT, topic(), CREATED);
+    assert!(filter.matches(&about(created.clone(), GtsTypeId::new(CUSTOMER))));
+    assert!(!filter.matches(&about(created, GtsTypeId::new(SUPPLIER))));
 }
 
-/// A permitted scope that matches nothing at any gate skips the event like a
-/// denial; it must not fail the batch as an internal error.
-#[tokio::test]
-async fn delivery_skips_an_event_whose_permitted_scope_matches_nothing() {
-    use super::filter::AuthorizedInterestFilter;
-    use authz_resolver_sdk::constraints::{Constraint, InPredicate, Predicate};
-    use authz_resolver_sdk::{
-        AuthZResolverApi, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
-        PolicyEnforcer,
-    };
-    use std::sync::Arc;
-    use toolkit_canonical_errors::CanonicalError;
-    use toolkit_security::PlatformSecurityContext;
+#[test]
+fn an_interest_without_a_subject_type_selector_matches_every_subject_type() {
+    let filter = InterestFilter::compile(&[interest(SELECTOR_TENANT, &[CREATED])]);
 
-    struct EmptyScopeAt(String);
-    #[async_trait::async_trait]
-    impl AuthZResolverApi for EmptyScopeAt {
-        async fn evaluate(
-            &self,
-            _ctx: PlatformSecurityContext,
-            request: EvaluationRequest,
-        ) -> Result<EvaluationResponse, CanonicalError> {
-            let constraints = if request.resource.resource_type == self.0 {
-                vec![Constraint {
-                    predicates: vec![Predicate::In(InPredicate::new(
-                        toolkit_security::pep_properties::OWNER_TENANT_ID,
-                        Vec::<Uuid>::new(),
-                    ))],
-                }]
-            } else {
-                Vec::new()
-            };
-            Ok(EvaluationResponse {
-                decision: true,
-                context: EvaluationResponseContext {
-                    constraints,
-                    deny_reason: None,
-                },
-            })
-        }
-    }
-    for empty in [
-        event_broker_sdk::gts::REQUEST_RESOURCE_TYPE,
-        topic().as_ref(),
-        CREATED,
-    ] {
-        let tenant = Uuid::new_v4();
-        let filter = AuthorizedInterestFilter::new(
-            &[interest(tenant, &[CREATED])],
-            PolicyEnforcer::new(Arc::new(EmptyScopeAt(empty.to_owned()))),
-            toolkit_security::SecurityContext::builder()
-                .subject_tenant_id(tenant)
-                .subject_id(Uuid::new_v4())
-                .build()
-                .unwrap(),
-        );
-        let allowed = filter.allows(&event(tenant, topic(), CREATED)).await;
-        assert!(
-            matches!(allowed, Ok(false)),
-            "empty scope at {empty}: {allowed:?}"
-        );
-    }
+    let created = event(SELECTOR_TENANT, topic(), CREATED);
+    assert!(filter.matches(&about(created.clone(), GtsTypeId::new(CUSTOMER))));
+    assert!(filter.matches(&about(created, GtsTypeId::new(SUPPLIER))));
+}
+
+#[test]
+fn a_subject_type_pattern_matches_its_derived_types() {
+    let created = event(SELECTOR_TENANT, topic(), CREATED);
+    let derived = GtsTypeId::new("gts.x.eb.orders.customer.v1~acme.retail.loyalty.member.v1~");
+
+    // A bare type id covers its derived subtree, as for `types`.
+    let bare = InterestFilter::compile(&[selecting(
+        interest(SELECTOR_TENANT, &[CREATED]),
+        &[CUSTOMER],
+    )]);
+    assert!(bare.matches(&about(created.clone(), derived.clone())));
+
+    // A trailing `*` covers its prefix and nothing outside it.
+    let wildcard = InterestFilter::compile(&[selecting(
+        interest(SELECTOR_TENANT, &[CREATED]),
+        &["gts.x.eb.orders.customer.v1~acme.*"],
+    )]);
+    assert!(wildcard.matches(&about(created.clone(), derived)));
+    assert!(!wildcard.matches(&about(created, GtsTypeId::new(SUPPLIER))));
+}
+
+#[test]
+fn a_subject_type_that_does_not_parse_matches_no_selector() {
+    let filter = InterestFilter::compile(&[selecting(
+        interest(SELECTOR_TENANT, &[CREATED]),
+        &[CUSTOMER],
+    )]);
+
+    assert!(!filter.matches(&about(
+        event(SELECTOR_TENANT, topic(), CREATED),
+        GtsTypeId::new("not-gts"),
+    )));
+}
+
+#[test]
+fn the_subject_type_selector_narrows_but_the_type_still_decides() {
+    let filter = InterestFilter::compile(&[selecting(
+        interest(SELECTOR_TENANT, &[CREATED]),
+        &[CUSTOMER],
+    )]);
+
+    assert!(!filter.matches(&about(
+        event(
+            SELECTOR_TENANT,
+            topic(),
+            "gts.cf.core.events.event.v1~x.eb.orders.cancelled.v1~"
+        ),
+        GtsTypeId::new(CUSTOMER),
+    )));
 }

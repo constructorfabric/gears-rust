@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use crate::consumer::Delivery;
 use crate::gts::{EventV1, StoredPosition};
-use crate::ids::{ConsumerGroupId, TopicId};
+use crate::ids::ConsumerGroupId;
 
 use super::{DeadLetterEnvelope, DeadLetterRecord};
 
@@ -19,9 +19,9 @@ fn raw_event() -> EventV1 {
         serde_json::json!({ "order_id": "order-1", "valid": false }),
     )
     .id(EVENT_ID)
-    .tenant_id(Uuid::from_u128(0x0e1e_0002))
+    .subject_tenant(Uuid::from_u128(0x0e1e_0002))
     .subject("order-1")
-    .subject_type_id(gts::GtsTypeId::new("gts.x.eb.test.subject.v1~"))
+    .subject_type_of(gts::GtsTypeId::new("gts.x.eb.test.subject.v1~"))
     .occurred_at("2026-01-02T03:04:05Z".parse().unwrap())
     .build()
     .unwrap()
@@ -38,12 +38,10 @@ fn delivery() -> Delivery {
 
 #[test]
 fn dead_letter_envelope_preserves_record_context_and_payload_type_convention() {
-    let group_id = ConsumerGroupId::new(Uuid::from_u128(0x0e1e_0003));
-    let topic_id = TopicId::from_gts(TOPIC);
+    let consumer_group = ConsumerGroupId::new(Uuid::from_u128(0x0e1e_0003));
     let raw = raw_event();
     let record = DeadLetterRecord::builder(&raw, &delivery(), "permanent validation failure")
-        .group_id(group_id)
-        .topic_id(topic_id)
+        .consumer_group(consumer_group)
         .attempts(6)
         .build();
 
@@ -55,8 +53,7 @@ fn dead_letter_envelope_preserves_record_context_and_payload_type_convention() {
         "application/vnd.constructorfabric.event-broker.dlq+json"
     );
     assert_eq!(envelope.version, DeadLetterEnvelope::VERSION);
-    assert_eq!(envelope.group_id, Some(group_id));
-    assert_eq!(envelope.topic_id, Some(topic_id));
+    assert_eq!(envelope.consumer_group, Some(consumer_group));
     assert_eq!(envelope.topic, TOPIC);
     assert_eq!(envelope.event_type, EVENT_TYPE);
     assert_eq!(envelope.subject, "order-1");
@@ -69,7 +66,7 @@ fn dead_letter_envelope_preserves_record_context_and_payload_type_convention() {
         envelope.payload,
         serde_json::json!({ "order_id": "order-1", "valid": false })
     );
-    assert_eq!(envelope.event_id, EVENT_ID);
+    assert_eq!(envelope.event, EVENT_ID);
 }
 
 #[test]
@@ -89,7 +86,7 @@ fn dead_letter_envelope_round_trips_from_outbox_payload() {
     assert_eq!(coordinates.subject_type, "gts.x.eb.test.subject.v1~");
     assert_eq!(coordinates.partition, 7);
     assert_eq!(coordinates.offset, Sequence::assigned(99));
-    assert_eq!(coordinates.event_id, EVENT_ID);
+    assert_eq!(coordinates.event, EVENT_ID);
 }
 
 #[test]
@@ -98,4 +95,37 @@ fn invalid_dead_letter_envelope_payload_returns_consumer_error() {
         .expect_err("invalid payload should not deserialize");
 
     assert!(err.to_string().contains("deserialize dead-letter envelope"));
+}
+
+/// The envelope is the payload a consumer DLQ stores, so its JSON keys are a durable
+/// format: an envelope stored earlier is decoded by these keys.
+#[test]
+fn a_dead_letter_envelope_is_stored_with_these_keys() {
+    let raw = raw_event();
+    let record = DeadLetterRecord::builder(&raw, &delivery(), "permanent validation failure")
+        .consumer_group(ConsumerGroupId::new(Uuid::from_u128(0x0e1e_0003)))
+        .occurred_at("2026-01-02T03:05:00Z".parse().unwrap())
+        .build();
+    let mut envelope = DeadLetterEnvelope::from_record(record);
+    envelope.parked_at = "2026-01-02T03:06:00Z".parse().unwrap();
+
+    assert_eq!(
+        serde_json::to_value(&envelope).unwrap(),
+        serde_json::json!({
+            "version": 1,
+            "consumer_group": "00000000-0000-0000-0000-00000e1e0003",
+            "topic": TOPIC,
+            "event_type": EVENT_TYPE,
+            "subject": "order-1",
+            "subject_type": "gts.x.eb.test.subject.v1~",
+            "partition": 7,
+            "offset": 99,
+            "attempts": 1,
+            "reason": "permanent validation failure",
+            "payload": { "order_id": "order-1", "valid": false },
+            "occurred_at": "2026-01-02T03:05:00Z",
+            "parked_at": "2026-01-02T03:06:00Z",
+            "event": "00000000-0000-0000-0000-00000e1e0001",
+        })
+    );
 }

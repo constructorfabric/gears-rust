@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use event_broker_sdk::gts_id;
 use event_broker_sdk::{
     CommitOffset, ConsumerBuilder, ConsumerCommitMode, ConsumerError, ConsumerGroupId,
-    ConsumerGroupRef, Delivery, EventHandler, EventV1, Fallback, HandlerOutcome,
-    OffsetManagerError, OffsetStore, Position, TopicId,
+    ConsumerGroupRef, Delivery, EventHandler, EventV1, Fallback, GtsInstanceId, HandlerOutcome,
+    OffsetManagerError, OffsetStore, Position,
 };
 
 use super::common::{publish_json, topic, topic_fixture, wait_until};
@@ -15,8 +15,8 @@ use super::common::{publish_json, topic, topic_fixture, wait_until};
 const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.customoffset.v1");
 const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.customoffset.v1~");
 
-type LoadCall = (ConsumerGroupId, TopicId, u32);
-type CommitCall = (ConsumerGroupId, TopicId, u32, i64);
+type LoadCall = (ConsumerGroupId, GtsInstanceId, u32);
+type CommitCall = (ConsumerGroupId, GtsInstanceId, u32, i64);
 type RecordedLoads = Arc<Mutex<Vec<LoadCall>>>;
 type RecordedCommits = Arc<Mutex<Vec<CommitCall>>>;
 
@@ -31,10 +31,13 @@ impl OffsetStore for RecordingOffsetStore {
     async fn load_position(
         &self,
         group: &ConsumerGroupId,
-        topic: &TopicId,
+        topic: &GtsInstanceId,
         partition: u32,
     ) -> Result<Position, OffsetManagerError> {
-        self.loads.lock().unwrap().push((*group, *topic, partition));
+        self.loads
+            .lock()
+            .unwrap()
+            .push((*group, topic.clone(), partition));
         Ok(Fallback::Earliest.into())
     }
 }
@@ -44,14 +47,14 @@ impl CommitOffset for RecordingOffsetStore {
     async fn commit(
         &self,
         group: &ConsumerGroupId,
-        topic: &TopicId,
+        topic: &GtsInstanceId,
         partition: u32,
         offset: Sequence,
     ) -> Result<(), OffsetManagerError> {
         self.commits
             .lock()
             .unwrap()
-            .push((*group, *topic, partition, offset.as_i64()));
+            .push((*group, topic.clone(), partition, offset.as_i64()));
         Ok(())
     }
 }
@@ -79,6 +82,9 @@ async fn if_i_want_my_own_offset_store_i_implement_the_minimal_traits() {
     let commits = store.commits.clone();
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("showcase-custom-offset"))
         .topics([topic(TOPIC)])
         .commit_mode(ConsumerCommitMode::auto(Duration::from_millis(5)))

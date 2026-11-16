@@ -54,7 +54,7 @@ async fn list_event_types_happy_path_returns_all_seeded_types() {
                     "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
                     "description": null,
                     "allowed_subject_types": [],
-                    "partition_key": "/tenant_id",
+                    "partition_key": "/subject_tenant",
                     "data_schema": {
                         "allOf": [
                             { "type": ["object", "null"] },
@@ -67,7 +67,7 @@ async fn list_event_types_happy_path_returns_all_seeded_types() {
                     "topic": "gts.cf.core.events.topic.v1~x.eb.t2.topic.v1",
                     "description": null,
                     "allowed_subject_types": [],
-                    "partition_key": "/tenant_id",
+                    "partition_key": "/subject_tenant",
                     "data_schema": {
                         "allOf": [
                             { "type": ["object", "null"] },
@@ -118,7 +118,7 @@ async fn list_event_types_filters_by_id() {
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
                 "description": null,
                 "allowed_subject_types": [],
-                "partition_key": "/tenant_id",
+                "partition_key": "/subject_tenant",
                 "data_schema": {
                         "allOf": [
                             { "type": ["object", "null"] },
@@ -168,7 +168,7 @@ async fn list_event_types_filters_by_topic() {
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t2.topic.v1",
                 "description": null,
                 "allowed_subject_types": [],
-                "partition_key": "/tenant_id",
+                "partition_key": "/subject_tenant",
                 "data_schema": {
                         "allOf": [
                             { "type": ["object", "null"] },

@@ -20,7 +20,7 @@ pub fn fences_topic(prefix: &str) -> String {
     format!("{prefix}.fences")
 }
 
-/// The transactional id that serializes provisioning of one topic.
+/// The transactional id that serializes provisioning of one topic's reference.
 pub fn log_transaction(prefix: &str, topic: Uuid) -> String {
     format!("{prefix}.log.{}", topic.simple())
 }

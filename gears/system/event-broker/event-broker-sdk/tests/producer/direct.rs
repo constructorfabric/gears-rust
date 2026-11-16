@@ -82,7 +82,7 @@ async fn every_publish_advances_the_producers_cursor() {
 
     assert_eq!(outcome, IngestOutcome::Accepted);
     let cursors = broker
-        .get_producer_cursors(&SecurityContext::anonymous(), producer.producer_id())
+        .get_producer_cursors(&SecurityContext::anonymous(), producer.id())
         .await
         .unwrap();
     assert_eq!(cursors.last_sequence(&topic_instance()), Some(0));
@@ -111,7 +111,7 @@ async fn a_chained_producer_registers_an_id_and_publishes_the_first_sequence() {
     let broker = harness.broker();
     let producer = producer_over(Arc::clone(&broker)).await;
 
-    let producer_id = producer.producer_id();
+    let producer_id = producer.id();
     let outcome = producer.publish(order(), Ack::Accepted).await.unwrap();
 
     assert_eq!(outcome, IngestOutcome::Accepted);
@@ -170,12 +170,12 @@ async fn a_rebuilt_producer_registers_a_new_id_and_starts_its_own_chain() {
     let rebuilt = producer_over(Arc::clone(&broker)).await;
     let rebuilt_outcome = rebuilt.publish(order(), Ack::Accepted).await.unwrap();
 
-    assert_ne!(first.producer_id(), rebuilt.producer_id());
+    assert_ne!(first.id(), rebuilt.id());
     assert_eq!(
         (first_outcome, rebuilt_outcome),
         (IngestOutcome::Accepted, IngestOutcome::Accepted)
     );
-    for producer_id in [first.producer_id(), rebuilt.producer_id()] {
+    for producer_id in [first.id(), rebuilt.id()] {
         let cursors = broker
             .get_producer_cursors(&ctx, producer_id)
             .await
@@ -207,7 +207,7 @@ async fn a_persisted_publish_reports_persisted_once_stored() {
     assert_eq!(outcome, IngestOutcome::Persisted);
     assert_eq!(stored_count(&harness, TENANT_PARTITION).await, 1);
     let cursors = broker
-        .get_producer_cursors(&SecurityContext::anonymous(), producer.producer_id())
+        .get_producer_cursors(&SecurityContext::anonymous(), producer.id())
         .await
         .unwrap();
     assert_eq!(cursors.last_sequence(&topic_instance()), Some(0));
@@ -260,9 +260,9 @@ async fn a_payload_that_fails_to_serialize_is_refused_without_its_text() {
     };
     let subject = poisoned.order_id.to_string();
     let event = EventV1::builder(poisoned)
-        .tenant_id(test_tenant())
+        .subject_tenant(test_tenant())
         .subject(subject)
-        .subject_type_id(GtsTypeId::new(SUBJECT_TYPE))
+        .subject_type_of(GtsTypeId::new(SUBJECT_TYPE))
         .build()
         .unwrap();
 
@@ -285,7 +285,7 @@ async fn a_publish_after_a_lost_ack_is_stamped_from_the_brokers_head() {
     let broker = FaultInjectingBroker::new(harness.broker());
     let producer = producer_over(Arc::clone(&broker) as Arc<dyn EventBrokerApi>).await;
     let reads_at_build = broker.cursor_reads();
-    let producer_id = producer.producer_id();
+    let producer_id = producer.id();
     broker.lose_publish_acks(1);
 
     let lost = producer.publish(order(), Ack::Accepted).await;
@@ -306,7 +306,7 @@ async fn a_publish_after_a_lost_ack_is_stamped_from_the_brokers_head() {
         .map(|publish| {
             let meta = publish.meta.expect("a chained publish carries meta");
             (
-                (meta.version, meta.producer_id, meta.previous, meta.sequence),
+                (meta.version, meta.producer, meta.previous, meta.sequence),
                 publish.outcome,
                 publish.ack_lost,
             )
@@ -354,7 +354,7 @@ async fn a_republished_event_after_a_lost_ack_is_stored_once() {
     let broker = FaultInjectingBroker::new(harness.broker());
     let producer = producer_over(Arc::clone(&broker) as Arc<dyn EventBrokerApi>).await;
     let reads_at_build = broker.cursor_reads();
-    let producer_id = producer.producer_id();
+    let producer_id = producer.id();
     broker.lose_publish_acks(1);
     let x = order();
     let x_id = x.id();
@@ -374,7 +374,7 @@ async fn a_republished_event_after_a_lost_ack_is_stored_once() {
             let meta = publish.meta.expect("a chained publish carries meta");
             (
                 publish.event_id,
-                (meta.version, meta.producer_id, meta.previous, meta.sequence),
+                (meta.version, meta.producer, meta.previous, meta.sequence),
                 publish.outcome,
                 publish.ack_lost,
             )
@@ -407,7 +407,7 @@ async fn a_republished_event_after_a_lost_ack_is_stored_once() {
 }
 
 /// A real in-process broker seeded with the orders topic and its event type. The
-/// event type declares no `partition_key`, so the base default (`/tenant_id`)
+/// event type declares no `partition_key`, so the base default (`/subject_tenant`)
 /// applies and events partition by tenant.
 async fn harness() -> EventBrokerHarness {
     EventBrokerHarness::builder()
@@ -459,9 +459,9 @@ fn order() -> EventV1<OrderCreated> {
 fn order_event(payload: OrderCreated) -> EventV1<OrderCreated> {
     let subject = payload.order_id.to_string();
     EventV1::builder(payload)
-        .tenant_id(test_tenant())
+        .subject_tenant(test_tenant())
         .subject(subject)
-        .subject_type_id(GtsTypeId::new(SUBJECT_TYPE))
+        .subject_type_of(GtsTypeId::new(SUBJECT_TYPE))
         .build()
         .unwrap()
 }

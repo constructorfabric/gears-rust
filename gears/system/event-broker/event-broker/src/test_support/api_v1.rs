@@ -137,11 +137,11 @@ impl<'a> ApiV1<'a> {
 
     pub fn get_events_stream(&self, subscription_id: &str) -> RequestCase<'a> {
         RequestCase::new(self.harness, Method::GET, "/event-broker/v1/events:stream")
-            .with_query("subscription_id", subscription_id)
+            .with_query("subscription", subscription_id)
     }
 
     pub fn get_events_sse(&self, subscription_id: &str) -> RequestCase<'a> {
         RequestCase::new(self.harness, Method::GET, "/event-broker/v1/events:sse")
-            .with_query("subscription_id", subscription_id)
+            .with_query("subscription", subscription_id)
     }
 }

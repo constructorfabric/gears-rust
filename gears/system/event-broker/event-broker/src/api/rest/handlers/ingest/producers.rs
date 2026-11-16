@@ -1,5 +1,5 @@
 //! `POST /v1/producers`, `GET .../cursors`, `POST .../{id}:reset`
-//! (`DESIGN.md:585`).
+//! (`DESIGN.md` "Module Structure").
 
 use axum::Extension;
 use axum::body::Bytes;

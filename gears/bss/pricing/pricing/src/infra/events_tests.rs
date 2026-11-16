@@ -92,7 +92,7 @@ fn the_interim_envelope_is_the_v1_stateless_envelope() {
             "event_id": event_id.to_string(),
             "type": "gts.cf.core.events.event.v1~cf.bss.pricing.approval_unit_decided.v1~",
             "topic": "gts.cf.core.events.topic.v1~cf.bss.pricing.catalog.v1",
-            "tenant_id": "5a0e8d1c-7b2f-4c6a-8e3d-9f4b1c2d3e4f",
+            "subject_tenant": "5a0e8d1c-7b2f-4c6a-8e3d-9f4b1c2d3e4f",
             "source": "bss-pricing",
             "subject": "6b1f9e2d-8c3a-4d7b-9f4e-0a5c2d3e4f5a",
             "subject_type": "gts.cf.bss.pricing.approval_unit.v1~",

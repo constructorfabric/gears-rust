@@ -1,4 +1,4 @@
-//! CRUD for consumer groups (`DESIGN.md:590`).
+//! CRUD for consumer groups (`DESIGN.md` "Module Structure").
 
 use axum::Extension;
 use axum::body::Bytes;
@@ -24,8 +24,6 @@ pub async fn create_consumer_group(
     uri: Uri,
     body: Bytes,
 ) -> ApiResult<impl IntoResponse> {
-    // [question]: don't we have named groups? How does the user specify named group? check in DESIGN.md; report
-
     let input: ConsumerGroupCreateInput = if body.is_empty() {
         ConsumerGroupCreateInput::default()
     } else {
@@ -47,7 +45,10 @@ pub async fn create_consumer_group(
 }
 
 /// # Errors
-/// Returns `400` for an invalid `$filter` expression or pagination cursor.
+/// Returns `400` for an invalid `$filter` expression or pagination cursor, or
+/// the mapped `CanonicalError` for any `DomainError`
+/// `DeliveryService::list_consumer_groups` produces: `503` when the database is
+/// unavailable (the consumer group list read).
 pub async fn list_consumer_groups(
     Extension(ctx): Extension<SecurityContext>,
     Extension(state): Extension<HandlerState>,
@@ -79,7 +80,8 @@ pub async fn list_consumer_groups(
 
 /// # Errors
 /// Returns the mapped `CanonicalError` for `DomainError::NotFound` if the
-/// group isn't registered.
+/// group isn't registered, or `503` when the database is unavailable (the
+/// consumer group read).
 pub async fn get_consumer_group(
     Extension(ctx): Extension<SecurityContext>,
     Extension(state): Extension<HandlerState>,
@@ -93,8 +95,9 @@ pub async fn get_consumer_group(
 
 /// # Errors
 /// Returns the mapped `CanonicalError` for `DomainError::NotFound` if the
-/// group isn't registered, or `DomainError::Conflict` if it still has
-/// active members.
+/// group isn't registered, `DomainError::Conflict` if it still has
+/// active members, or `503` when the database is unavailable (the consumer
+/// group read, or the consumer group delete).
 pub async fn delete_consumer_group(
     Extension(ctx): Extension<SecurityContext>,
     Extension(state): Extension<HandlerState>,

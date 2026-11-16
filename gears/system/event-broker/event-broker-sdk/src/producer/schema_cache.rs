@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use gts::{GtsId, GtsIdPattern};
 use toolkit_security::SecurityContext;
 
 use crate::api::EventBrokerApi;
@@ -46,7 +47,7 @@ impl PreparedEventType {
             Ok(())
         } else {
             Err(EventBrokerError::EventDataInvalid {
-                type_id: self.type_id.clone(),
+                event_type: self.type_id.clone(),
                 errors,
                 detail: "event payload failed schema validation".to_owned(),
             })
@@ -97,7 +98,7 @@ impl ProducerSchemaCache {
 
         if selected.is_empty() {
             return Err(EventBrokerError::EventTypeUnknown {
-                type_id: patterns.join(","),
+                event_type: patterns.join(","),
                 detail: "declared producer event type patterns matched zero event types".to_owned(),
             });
         }
@@ -109,7 +110,7 @@ impl ProducerSchemaCache {
             let prepared = PreparedEventType::new(event_type)?;
             if !declared_topics.contains(&prepared.topic) {
                 return Err(EventBrokerError::TypeNotInDeclaredTopic {
-                    type_id: prepared.type_id,
+                    event_type: prepared.type_id,
                     expected_topic: topics.join(","),
                     detail: "resolved event type belongs to a topic not declared on producer"
                         .to_owned(),
@@ -135,7 +136,7 @@ impl ProducerSchemaCache {
         let prepared = PreparedEventType::new(&event_type)?;
         if !topics.iter().any(|topic| topic == &prepared.topic) {
             return Err(EventBrokerError::TypeNotInDeclaredTopic {
-                type_id: type_id.to_owned(),
+                event_type: type_id.to_owned(),
                 expected_topic: topics.join(","),
                 detail: "event type belongs to a topic not declared on producer".to_owned(),
             });
@@ -166,7 +167,7 @@ impl ProducerSchemaCache {
             Ok(())
         } else {
             Err(EventBrokerError::EventTypeNotDeclared {
-                type_id: type_id.to_owned(),
+                event_type: type_id.to_owned(),
                 detail: "this event type does not match any declared event_type_patterns"
                     .to_owned(),
             })
@@ -205,7 +206,7 @@ impl ProducerSchemaCache {
             .get(type_id)
             .cloned()
             .ok_or_else(|| EventBrokerError::SchemaNotPrepared {
-                type_id: type_id.to_owned(),
+                event_type: type_id.to_owned(),
                 detail: "schema must be prepared before validating this event".to_owned(),
             })
     }
@@ -259,12 +260,13 @@ impl ProducerSchemaCache {
     }
 }
 
+/// Matches by the GTS library rule (derived-type coverage, trailing `*`), as
+/// the consumer does; an unparsable pattern matches nothing.
 pub(crate) fn gts_pattern_matches(pattern: &str, type_id: &str) -> bool {
-    if let Some(prefix) = pattern.strip_suffix(".*") {
-        type_id.starts_with(prefix)
-    } else {
-        pattern == type_id
-    }
+    let (Ok(pattern), Ok(id)) = (GtsIdPattern::try_new(pattern), GtsId::try_new(type_id)) else {
+        return false;
+    };
+    id.matches_pattern(&pattern)
 }
 
 #[cfg(test)]

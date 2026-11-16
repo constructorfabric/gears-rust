@@ -25,9 +25,9 @@ use event_broker_sdk::models::{
 use event_broker_sdk::{
     Ack, BatchHandler, BatchHandlerOutcome, CommitOffset, ConsumerError, ConsumerGroupId,
     ConsumerRuntimeEvent, ConsumerRuntimeListener, Delivery, EventBatch, EventBrokerApi, EventV1,
-    FrameStream, IngestOutcome, JoinRequest, OffsetManagerError, OffsetStore, Position,
-    ProducerCursors, ProducerId, ProducerMode, SeekPosition, SeekResult, Sequence,
-    SubscriptionAssignment, SubscriptionId, TopicId, WireFrame,
+    FrameStream, GtsInstanceId, IngestOutcome, JoinRequest, OffsetManagerError, OffsetStore,
+    Position, ProducerCursors, ProducerId, ProducerMode, SeekPosition, SeekResult, Sequence,
+    SubscriptionAssignment, SubscriptionId, WireFrame,
 };
 use futures_util::StreamExt;
 
@@ -35,7 +35,7 @@ pub(super) type SharedScopes = Arc<Mutex<Vec<(String, u32, usize)>>>;
 pub(super) type SharedViolations = Arc<Mutex<Vec<String>>>;
 pub(super) type SharedNamedOffsets = Arc<Mutex<Vec<(&'static str, i64)>>>;
 pub(super) type SharedSubjectOffsets = Arc<Mutex<Vec<(String, i64)>>>;
-pub(super) type SharedCommits = Arc<Mutex<Vec<(ConsumerGroupId, TopicId, u32, i64)>>>;
+pub(super) type SharedCommits = Arc<Mutex<Vec<(ConsumerGroupId, GtsInstanceId, u32, i64)>>>;
 
 /// Records the first event of each batch as `(name, offset)` and returns a
 /// fixed outcome - a handler for asserting what the runtime dispatched.
@@ -109,8 +109,10 @@ impl BatchHandler<serde_json::Value> for BatchScopeRecorder {
 }
 
 /// A broker decorator over the real harness broker that injects seek/stream
-/// faults, for exercising the consumer's topology-version-mismatch recovery,
-/// its recovery from `PositionsNotSet` at open and its handling of injected frames.
+/// faults, for exercising the consumer's topology-version-mismatch recovery, its
+/// recovery from `PositionsNotSet` at open, from a failed open and from a stream
+/// that breaks off, its stop during a silent open, and its handling of injected
+/// frames.
 /// Every operation delegates unchanged except the injected ones; the call
 /// counters let a test observe the recovery path without racing timing.
 pub(super) struct SeekFaultBroker {
@@ -131,6 +133,9 @@ pub(super) struct SeekFaultBroker {
     /// Answer the first `stream` call with this fault instead of opening the real
     /// broker's stream, so the member never streams.
     open_fault: Mutex<Option<OpenFault>>,
+    /// Notified when the first `stream` call hands out a stream that never yields
+    /// (`with_silent_open`), so a test knows the consumer awaits its first frame.
+    pub(super) silent_open: Arc<tokio::sync::Notify>,
     pub(super) seek_calls: Arc<AtomicUsize>,
     pub(super) get_subscription_calls: Arc<AtomicUsize>,
     pub(super) stream_calls: Arc<AtomicUsize>,
@@ -138,7 +143,7 @@ pub(super) struct SeekFaultBroker {
     pub(super) leave_calls: Arc<Mutex<Vec<SubscriptionId>>>,
 }
 
-/// How the first `stream` call fails without opening the real broker's stream.
+/// How the first `stream` call fails or stalls without opening the real broker's stream.
 enum OpenFault {
     /// `stream` itself returns the error, as an in-process open does.
     Failure(ConsumerError),
@@ -147,6 +152,9 @@ enum OpenFault {
     Error(ConsumerError),
     /// `stream` returns a stream that ends before its first frame.
     End,
+    /// `stream` returns a stream that never yields, as a connection that goes
+    /// silent before its first frame.
+    Silent,
 }
 
 impl SeekFaultBroker {
@@ -163,6 +171,7 @@ impl SeekFaultBroker {
             stream_break: Mutex::new(Vec::new()),
             end_first_stream: AtomicBool::new(false),
             open_fault: Mutex::new(None),
+            silent_open: Arc::new(tokio::sync::Notify::new()),
             seek_calls: Arc::new(AtomicUsize::new(0)),
             get_subscription_calls: Arc::new(AtomicUsize::new(0)),
             stream_calls: Arc::new(AtomicUsize::new(0)),
@@ -221,6 +230,15 @@ impl SeekFaultBroker {
     pub(super) fn with_open_end(self) -> Self {
         Self {
             open_fault: Mutex::new(Some(OpenFault::End)),
+            ..self
+        }
+    }
+
+    /// Makes the first `stream` call return a stream that never yields, without
+    /// opening the real broker's stream, and notify `silent_open` as it does.
+    pub(super) fn with_silent_open(self) -> Self {
+        Self {
+            open_fault: Mutex::new(Some(OpenFault::Silent)),
             ..self
         }
     }
@@ -375,6 +393,10 @@ impl EventBrokerApi for SeekFaultBroker {
                 return Ok(Box::pin(futures_util::stream::iter([Err(error)])));
             }
             Some(OpenFault::End) => return Ok(Box::pin(futures_util::stream::empty())),
+            Some(OpenFault::Silent) => {
+                self.silent_open.notify_one();
+                return Ok(Box::pin(futures_util::stream::pending()));
+            }
             None => {}
         }
         let stream = self.inner.stream(ctx, id).await?;
@@ -542,7 +564,7 @@ impl OffsetStore for SequencedOffsetManager {
     async fn load_position(
         &self,
         _group: &ConsumerGroupId,
-        _topic: &TopicId,
+        _topic: &GtsInstanceId,
         _partition: u32,
     ) -> Result<Position, OffsetManagerError> {
         self.timeline.lock().unwrap().push("load");
@@ -555,7 +577,7 @@ impl CommitOffset for SequencedOffsetManager {
     async fn commit(
         &self,
         _group: &ConsumerGroupId,
-        _topic: &TopicId,
+        _topic: &GtsInstanceId,
         _partition: u32,
         _offset: Sequence,
     ) -> Result<(), OffsetManagerError> {
@@ -675,7 +697,7 @@ impl OffsetStore for RecordingCommitOffsetManager {
     async fn load_position(
         &self,
         _group: &ConsumerGroupId,
-        _topic: &TopicId,
+        _topic: &GtsInstanceId,
         _partition: u32,
     ) -> Result<Position, OffsetManagerError> {
         Ok(Position::Earliest)
@@ -687,14 +709,14 @@ impl CommitOffset for RecordingCommitOffsetManager {
     async fn commit(
         &self,
         group: &ConsumerGroupId,
-        topic: &TopicId,
+        topic: &GtsInstanceId,
         partition: u32,
         offset: Sequence,
     ) -> Result<(), OffsetManagerError> {
         self.commits
             .lock()
             .unwrap()
-            .push((*group, *topic, partition, offset.as_i64()));
+            .push((*group, topic.clone(), partition, offset.as_i64()));
         Ok(())
     }
 }

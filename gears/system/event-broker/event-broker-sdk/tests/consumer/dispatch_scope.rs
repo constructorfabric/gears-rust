@@ -68,6 +68,9 @@ async fn runtime_dispatch_never_mixes_topics_or_partitions_in_handler_batches() 
     let violations = recorder.violations.clone();
 
     let handle = ConsumerBuilder::new(fx.broker.clone())
+        .subject_tenant(fx.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fx.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("batch-scope"))
         .topics([topic(ORDERS_TOPIC), topic(PAYMENTS_TOPIC)])
         .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
@@ -77,7 +80,7 @@ async fn runtime_dispatch_never_mixes_topics_or_partitions_in_handler_batches() 
         .expect("consumer starts");
 
     for _ in 0..100 {
-        if handle.subscription_ids().len() == 1 {
+        if handle.subscriptions().len() == 1 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -94,10 +97,10 @@ async fn runtime_dispatch_never_mixes_topics_or_partitions_in_handler_batches() 
             GtsTypeId::try_new(event_type_id).expect("valid event type"),
             json!({}),
         )
-        .tenant_id(fx.ctx.subject_tenant_id())
+        .subject_tenant(fx.ctx.subject_tenant_id())
         .source("runtime.dispatch.test")
         .subject(subject.clone())
-        .subject_type_id(subject_type.clone())
+        .subject_type_of(subject_type.clone())
         .build()
         .expect("a valid event");
         fx.broker

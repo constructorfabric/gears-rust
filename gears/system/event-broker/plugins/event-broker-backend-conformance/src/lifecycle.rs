@@ -5,6 +5,7 @@ use std::time::Duration;
 use event_broker_sdk::Sequence;
 use event_broker_sdk::backend::{BackendError, Partition, Retention, TopicPartition, TopicSpec};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::fixture::{
     KEEP, Writer, event, provisioned, read_all, sequences, started, topic, wait_for_count,
@@ -34,6 +35,7 @@ pub async fn start_succeeds_with_the_medium_unreachable(harness: &dyn Harness) {
     assert!(start.is_ok(), "start: {start:?}");
     let spec = TopicSpec {
         topic: topic("unreachable"),
+        uuid: Uuid::new_v4(),
         partitions: 1,
         retention: KEEP,
     };

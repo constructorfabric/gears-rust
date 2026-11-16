@@ -7,13 +7,12 @@ use gts::{GtsInstanceId, GtsTypeId};
 use crate::consumer::Delivery;
 use crate::error::ConsumerError;
 use crate::gts::EventV1;
-use crate::ids::{ConsumerGroupId, TopicId};
+use crate::ids::ConsumerGroupId;
 use crate::sequence::Sequence;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeadLetterRecord {
-    pub group_id: Option<ConsumerGroupId>,
-    pub topic_id: Option<TopicId>,
+    pub consumer_group: Option<ConsumerGroupId>,
     pub topic: GtsInstanceId,
     pub event_type: GtsTypeId,
     pub subject: String,
@@ -24,14 +23,14 @@ pub struct DeadLetterRecord {
     pub reason: String,
     pub payload: serde_json::Value,
     pub occurred_at: DateTime<Utc>,
-    pub event_id: Uuid,
+    pub event: Uuid,
 }
 
 impl DeadLetterRecord {
     /// Starts a record of `event`, delivered as `delivery` says, parked for `reason`.
     ///
-    /// The topic, its `topic_id`, the partition and `attempts` come from `delivery`; the
-    /// event type, subject, subject type and id from `event`. `offset` is the event's
+    /// The topic, the partition and `attempts` come from `delivery`; the event type,
+    /// subject, subject type and id from `event`. `offset` is the event's
     /// sequence, or [`Sequence::NONE`] (no position) for an event that carries none.
     /// `payload` is the event's data, or JSON `null` for a body-less event. `occurred_at`
     /// is the time `builder` is called (the dead-lettering time), unless set.
@@ -43,8 +42,7 @@ impl DeadLetterRecord {
     ) -> DeadLetterRecordBuilder {
         DeadLetterRecordBuilder {
             reason: reason.into(),
-            group_id: None,
-            topic_id: Some(TopicId::from_gts(delivery.topic())),
+            consumer_group: None,
             topic: delivery.topic().clone(),
             event_type: event.event_type().clone(),
             subject: event.subject().to_owned(),
@@ -54,7 +52,7 @@ impl DeadLetterRecord {
             attempts: Some(delivery.attempts()),
             payload: event.data().cloned().unwrap_or(serde_json::Value::Null),
             occurred_at: Utc::now(),
-            event_id: event.id(),
+            event: event.id(),
         }
     }
 
@@ -67,8 +65,7 @@ impl DeadLetterRecord {
 
 pub struct DeadLetterRecordBuilder {
     reason: String,
-    group_id: Option<ConsumerGroupId>,
-    topic_id: Option<TopicId>,
+    consumer_group: Option<ConsumerGroupId>,
     topic: GtsInstanceId,
     event_type: GtsTypeId,
     subject: String,
@@ -78,7 +75,7 @@ pub struct DeadLetterRecordBuilder {
     attempts: Option<u16>,
     payload: serde_json::Value,
     occurred_at: DateTime<Utc>,
-    event_id: Uuid,
+    event: Uuid,
 }
 
 // Leaves the payload out: it may carry personal or secret data.
@@ -86,8 +83,7 @@ impl std::fmt::Debug for DeadLetterRecordBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeadLetterRecordBuilder")
             .field("reason", &self.reason)
-            .field("group_id", &self.group_id)
-            .field("topic_id", &self.topic_id)
+            .field("consumer_group", &self.consumer_group)
             .field("topic", &self.topic)
             .field("event_type", &self.event_type)
             .field("subject", &self.subject)
@@ -96,24 +92,14 @@ impl std::fmt::Debug for DeadLetterRecordBuilder {
             .field("offset", &self.offset)
             .field("attempts", &self.attempts)
             .field("occurred_at", &self.occurred_at)
-            .field("event_id", &self.event_id)
+            .field("event", &self.event)
             .finish_non_exhaustive()
     }
 }
 
 impl DeadLetterRecordBuilder {
-    pub fn group_id(mut self, group_id: ConsumerGroupId) -> Self {
-        self.group_id = Some(group_id);
-        self
-    }
-
-    pub fn topic_id(mut self, topic_id: TopicId) -> Self {
-        self.topic_id = Some(topic_id);
-        self
-    }
-
-    pub fn without_topic_id(mut self) -> Self {
-        self.topic_id = None;
+    pub fn consumer_group(mut self, consumer_group: ConsumerGroupId) -> Self {
+        self.consumer_group = Some(consumer_group);
         self
     }
 
@@ -129,8 +115,7 @@ impl DeadLetterRecordBuilder {
 
     pub fn build(self) -> DeadLetterRecord {
         DeadLetterRecord {
-            group_id: self.group_id,
-            topic_id: self.topic_id,
+            consumer_group: self.consumer_group,
             topic: self.topic,
             event_type: self.event_type,
             subject: self.subject,
@@ -141,7 +126,7 @@ impl DeadLetterRecordBuilder {
             reason: self.reason,
             payload: self.payload,
             occurred_at: self.occurred_at,
-            event_id: self.event_id,
+            event: self.event,
         }
     }
 }

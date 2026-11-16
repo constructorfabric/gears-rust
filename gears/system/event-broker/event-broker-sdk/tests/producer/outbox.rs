@@ -32,7 +32,7 @@ const TOPIC2: &str = "gts.cf.core.events.topic.v1~example.sdk.outbox.billing.v1"
 const EVENT_TYPE: &str = "gts.cf.core.events.event.v1~example.sdk.outbox.created.v1~";
 const EVENT_TYPE2: &str = "gts.cf.core.events.event.v1~example.sdk.outbox.charged.v1~";
 /// A third event type on `TOPIC` whose declared `partition_key` points into the
-/// payload (`/data/partition_key`) rather than at `/tenant_id`. The real broker
+/// payload (`/data/partition_key`) rather than at `/subject_tenant`. The real broker
 /// fixes a type's partition key at registration, so steering the partition by
 /// payload is a *separate* catalog type - not a runtime repoint of `EVENT_TYPE`.
 const EVENT_TYPE_KEYED: &str = "gts.cf.core.events.event.v1~example.sdk.outbox.keyed.v1~";
@@ -171,7 +171,7 @@ async fn an_interim_row_written_like_products_drains_through_the_processor() {
         "event_id": event_id,
         "type": EVENT_TYPE,
         "topic": TOPIC,
-        "tenant_id": test_tenant(),
+        "subject_tenant": test_tenant(),
         "source": "order-service",
         "subject": order_id.to_string(),
         "subject_type": SUBJECT_TYPE,
@@ -232,8 +232,8 @@ async fn an_interim_row_written_like_products_drains_through_the_processor() {
     assert_eq!(
         (
             event.id,
-            event.type_id.as_ref(),
-            event.tenant_id,
+            event.event_type.as_ref(),
+            event.subject_tenant,
             event.source.as_str(),
             event.subject.clone(),
             event.subject_type.as_ref(),
@@ -293,7 +293,7 @@ async fn an_interim_row_written_like_pricing_drains_through_the_processor() {
         "event_id": event_id,
         "type": EVENT_TYPE,
         "topic": TOPIC,
-        "tenant_id": test_tenant(),
+        "subject_tenant": test_tenant(),
         "source": "bss-pricing",
         "subject": order_id.to_string(),
         "subject_type": SUBJECT_TYPE,
@@ -354,8 +354,8 @@ async fn an_interim_row_written_like_pricing_drains_through_the_processor() {
     assert_eq!(
         (
             event.id,
-            event.type_id.as_ref(),
-            event.tenant_id,
+            event.event_type.as_ref(),
+            event.subject_tenant,
             event.source.as_str(),
             event.subject.clone(),
             event.subject_type.as_ref(),
@@ -549,9 +549,9 @@ async fn one_queue_can_carry_multiple_topics() {
                 charge_id,
                 total_cents: 30,
             })
-            .tenant_id(test_tenant())
+            .subject_tenant(test_tenant())
             .subject(charge_id.to_string())
-            .subject_type_id(GtsTypeId::new(SUBJECT_TYPE))
+            .subject_type_of(GtsTypeId::new(SUBJECT_TYPE))
             .build()
             .unwrap(),
         )
@@ -807,11 +807,11 @@ async fn an_outbox_duplicate_ack_advances_the_chain() {
         panic!("expected A, its resend and B, got {delivered:?}");
     };
     let a_meta = lost.meta.as_ref().expect("a chained publish carries meta");
-    let producer_id = a_meta.producer_id;
+    let producer_id = a_meta.producer;
     let a_sequence = a_meta.sequence.expect("a chained publish has a sequence");
     let stamp = |meta: &Option<EventMeta>| {
         meta.as_ref()
-            .map(|meta| (meta.version, meta.producer_id, meta.previous, meta.sequence))
+            .map(|meta| (meta.version, meta.producer, meta.previous, meta.sequence))
     };
     assert_eq!(
         [
@@ -1032,14 +1032,14 @@ async fn fixture_at(dsn: &str) -> (toolkit_db::Db, Arc<dyn EventBrokerApi>, Even
                 "topic": TOPIC,
                 "data_schema": order_schema(),
                 "allowed_subject_types": [SUBJECT_TYPE],
-                "partition_key": "/tenant_id",
+                "partition_key": "/subject_tenant",
             },
             {
                 "id": EVENT_TYPE2,
                 "topic": TOPIC2,
                 "data_schema": billing_schema(),
                 "allowed_subject_types": [SUBJECT_TYPE],
-                "partition_key": "/tenant_id",
+                "partition_key": "/subject_tenant",
             },
             {
                 "id": EVENT_TYPE_KEYED,
@@ -1192,9 +1192,9 @@ fn order() -> EventV1<OrderCreated> {
         order_id,
         total_cents: 10,
     })
-    .tenant_id(test_tenant())
+    .subject_tenant(test_tenant())
     .subject(order_id.to_string())
-    .subject_type_id(GtsTypeId::new(SUBJECT_TYPE))
+    .subject_type_of(GtsTypeId::new(SUBJECT_TYPE))
     .build()
     .unwrap()
 }
@@ -1207,9 +1207,9 @@ fn keyed_order(partition_key: &str) -> EventV1<KeyedOrderCreated> {
         total_cents: 10,
         partition_key: partition_key.to_owned(),
     })
-    .tenant_id(test_tenant())
+    .subject_tenant(test_tenant())
     .subject(order_id.to_string())
-    .subject_type_id(GtsTypeId::new(SUBJECT_TYPE))
+    .subject_type_of(GtsTypeId::new(SUBJECT_TYPE))
     .build()
     .unwrap()
 }
@@ -1253,7 +1253,7 @@ fn chained_event_for_sequence(producer_id: ProducerId, sequence: i64, previous: 
     serde_json::from_value(serde_json::json!({
         "id": Uuid::new_v4(),
         "type": EVENT_TYPE,
-        "tenant_id": test_tenant(),
+        "subject_tenant": test_tenant(),
         "source": "order-service",
         "subject": Uuid::new_v4().to_string(),
         "subject_type": SUBJECT_TYPE,
@@ -1265,7 +1265,7 @@ fn chained_event_for_sequence(producer_id: ProducerId, sequence: i64, previous: 
         },
         "meta": {
             "version": 1,
-            "producer_id": producer_id.0,
+            "producer": producer_id.0,
             "previous": previous,
             "sequence": sequence,
         },
@@ -1358,8 +1358,8 @@ async fn a_started_setup_drains_an_event_enqueued_in_a_committed_transaction() {
     assert_eq!(
         (
             event.id,
-            event.type_id.as_ref(),
-            event.tenant_id,
+            event.event_type.as_ref(),
+            event.subject_tenant,
             event.source.as_str(),
             event.subject.as_str(),
             event.subject_type.as_ref(),
@@ -1533,10 +1533,10 @@ async fn the_outbox_producer_refuses_input_it_stamps_or_an_envelope_rule_breaks(
     let producer = handle.producer();
     let with_source = EventV1::builder(order_payload(2))
         .id(order_event_id(2))
-        .tenant_id(test_tenant())
+        .subject_tenant(test_tenant())
         .source("other")
         .subject(order_id(2).to_string())
-        .subject_type_id(GtsTypeId::new(SUBJECT_TYPE))
+        .subject_type_of(GtsTypeId::new(SUBJECT_TYPE))
         .occurred_at(order_occurred_at())
         .build()
         .unwrap();
@@ -1691,9 +1691,9 @@ async fn a_schema_invalid_payload_is_refused_without_its_value() {
         total_cents: "PLANTED-VALUE-7f3a".to_owned(),
     })
     .id(order_event_id(1))
-    .tenant_id(test_tenant())
+    .subject_tenant(test_tenant())
     .subject(order_id(1).to_string())
-    .subject_type_id(GtsTypeId::new(SUBJECT_TYPE))
+    .subject_type_of(GtsTypeId::new(SUBJECT_TYPE))
     .occurred_at(order_occurred_at())
     .build()
     .unwrap();
@@ -1704,7 +1704,7 @@ async fn a_schema_invalid_payload_is_refused_without_its_value() {
 
     let TxError::Broker(
         err @ EventBrokerError::EventDataInvalid {
-            type_id,
+            event_type,
             errors,
             detail,
         },
@@ -1713,7 +1713,7 @@ async fn a_schema_invalid_payload_is_refused_without_its_value() {
         panic!("expected EventDataInvalid, got {err:?}");
     };
     assert_eq!(
-        (type_id.as_str(), errors.as_slice(), detail.as_str()),
+        (event_type.as_str(), errors.as_slice(), detail.as_str()),
         (
             EVENT_TYPE,
             ["type at /allOf/1/properties/total_cents/type".to_owned()].as_slice(),
@@ -1826,7 +1826,7 @@ async fn a_managed_producer_rotates_and_resets_and_keeps_draining() {
     handle.stop().await;
 }
 
-/// The broker partition the test tenant's events land in (`/tenant_id` keys
+/// The broker partition the test tenant's events land in (`/subject_tenant` keys
 /// them, over `FIXTURE_BROKER_PARTITIONS`).
 const TENANT_BROKER_PARTITION: u32 = 2;
 
@@ -1967,9 +1967,9 @@ fn order_payload(n: u128) -> OrderCreatedV1 {
 fn order_v1(n: u128) -> EventV1<OrderCreatedV1> {
     EventV1::builder(order_payload(n))
         .id(order_event_id(n))
-        .tenant_id(test_tenant())
+        .subject_tenant(test_tenant())
         .subject(order_id(n).to_string())
-        .subject_type_id(GtsTypeId::new(SUBJECT_TYPE))
+        .subject_type_of(GtsTypeId::new(SUBJECT_TYPE))
         .occurred_at(order_occurred_at())
         .build()
         .unwrap()
@@ -1986,7 +1986,7 @@ fn decoded_order_with(member: &str, value: serde_json::Value) -> EventV1 {
     let mut body = serde_json::json!({
         "id": order_event_id(1),
         "type": EVENT_TYPE,
-        "tenant_id": test_tenant(),
+        "subject_tenant": test_tenant(),
         "subject": order_id(1).to_string(),
         "subject_type": SUBJECT_TYPE,
         "occurred_at": "2026-11-07T10:00:00Z",

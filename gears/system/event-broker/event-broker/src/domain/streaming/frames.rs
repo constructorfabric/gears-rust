@@ -96,8 +96,8 @@ pub enum CloseReason {
     Rebalanced,
     /// Every partition was taken away.
     LoseAll,
-    /// The broker is stopping this stream: a sustained read failure, or a
-    /// shutdown.
+    /// The broker is stopping this stream: a sustained read failure, a consume
+    /// scope that expired or was cleared, or an event decision that failed.
     Teardown,
 }
 

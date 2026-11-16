@@ -146,7 +146,7 @@ async def test_restart_preserves_events_and_consumer_groups_but_not_subscription
                     "consumer_group": group_id,
                     "client_agent": "e2e-test",
                     "interests": [
-                        {"topic": TOPIC, "tenant_id": tenant_id, "types": [EVENT_TYPE]}
+                        {"topic": TOPIC, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE]}
                     ],
                 },
             )
@@ -164,7 +164,7 @@ async def test_restart_preserves_events_and_consumer_groups_but_not_subscription
         event_id = str(uuid.uuid4())
         async with httpx.AsyncClient(base_url=base_url, timeout=None) as stream_client:
             async with stream_client.stream(
-                "GET", f"/events:sse?subscription_id={sub1_id}"
+                "GET", f"/events:sse?subscription={sub1_id}"
             ) as stream1_resp:
                 assert stream1_resp.status_code == 200
                 reader1 = SseFrameReader(stream1_resp)
@@ -177,7 +177,7 @@ async def test_restart_preserves_events_and_consumer_groups_but_not_subscription
                         json={
                             "id": event_id,
                             "type": EVENT_TYPE,
-                            "tenant_id": tenant_id,
+                            "subject_tenant": tenant_id,
                             "source": "e2e-test",
                             "subject": "s1",
                             "subject_type": SUBJECT_TYPE,
@@ -223,7 +223,7 @@ async def test_restart_preserves_events_and_consumer_groups_but_not_subscription
                     "consumer_group": group_id,
                     "client_agent": "e2e-test",
                     "interests": [
-                        {"topic": TOPIC, "tenant_id": tenant_id, "types": [EVENT_TYPE]}
+                        {"topic": TOPIC, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE]}
                     ],
                 },
             )
@@ -232,7 +232,7 @@ async def test_restart_preserves_events_and_consumer_groups_but_not_subscription
 
         async with httpx.AsyncClient(base_url=base_url, timeout=None) as stream_client:
             async with stream_client.stream(
-                "GET", f"/events:sse?subscription_id={sub2_id}"
+                "GET", f"/events:sse?subscription={sub2_id}"
             ) as stream2_resp:
                 assert stream2_resp.status_code == 200
                 reader2 = SseFrameReader(stream2_resp)
@@ -277,12 +277,12 @@ async def test_a_publish_replayed_after_restart_is_stored_once(test_env):
         return {
             "id": event_id,
             "type": EVENT_TYPE,
-            "tenant_id": tenant_id,
+            "subject_tenant": tenant_id,
             "source": "e2e-test",
             "subject": f"s{sequence}",
             "subject_type": SUBJECT_TYPE,
             "occurred_at": datetime.now(timezone.utc).isoformat(),
-            "meta": {"version": 1, "producer_id": producer_id, "previous": previous, "sequence": sequence},
+            "meta": {"version": 1, "producer": producer_id, "previous": previous, "sequence": sequence},
         }
 
     async def read_from_start(client, count: int) -> list[dict]:
@@ -293,7 +293,7 @@ async def test_a_publish_replayed_after_restart_is_stored_once(test_env):
             json={
                 "consumer_group": group.json()["id"],
                 "client_agent": "e2e-test",
-                "interests": [{"topic": TOPIC, "tenant_id": tenant_id, "types": [EVENT_TYPE]}],
+                "interests": [{"topic": TOPIC, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE]}],
             },
         )
         assert sub.status_code == 201
@@ -304,7 +304,7 @@ async def test_a_publish_replayed_after_restart_is_stored_once(test_env):
         )
         assert seek.status_code == 200
         async with httpx.AsyncClient(base_url=base_url, timeout=None) as stream_client:
-            async with stream_client.stream("GET", f"/events:sse?subscription_id={sub_id}") as resp:
+            async with stream_client.stream("GET", f"/events:sse?subscription={sub_id}") as resp:
                 assert resp.status_code == 200
                 reader = SseFrameReader(resp)
                 await reader.await_kind("topology", timeout=5)

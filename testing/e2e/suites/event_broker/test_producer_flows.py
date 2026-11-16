@@ -1,16 +1,12 @@
-"""Producer flow scenarios (producer/flows/1.01-1.12).
+"""Producer flow scenarios (producer/flows/1.01-1.18).
 
 Register-and-publish patterns that exercise the exactly-once ingest-side
 deduplication protocol: registration, chained sequence, idempotency key dedup,
 sequence-violation rejection, cursor recovery, chain reset, and unknown-producer
-rejection, plus the monotonic-mode publish rules.
+rejection, plus the monotonic-mode publish rules and the `meta` mode-shape
+checks.
 
 Each test registers its own producer so tests are independent.
-
-The three monotonic publish tests (1.10-1.12) are expected to fail until the
-gear threads the registered mode into its idempotency check: today the chained
-rule is applied to every producer regardless of mode, so a legal monotonic gap
-is rejected as a sequence violation and `meta.previous` is never refused.
 """
 
 from __future__ import annotations
@@ -30,7 +26,7 @@ def _event(tenant_id: str, event_id: str | None = None) -> dict:
     return {
         "id": event_id or str(uuid.uuid4()),
         "type": EVENT_TYPE_STREAM,
-        "tenant_id": tenant_id,
+        "subject_tenant": tenant_id,
         "source": "e2e-test",
         "subject": "s1",
         "subject_type": "gts.cf.e2e.event_broker.subject.v1~",
@@ -94,7 +90,7 @@ async def test_chained_mode_sequence_advances(api):
                 **_event(tenant_id),
                 "meta": {
                     "version": 1,
-                    "producer_id": producer_id,
+                    "producer": producer_id,
                     "previous": 0,
                     "sequence": 1,
                 },
@@ -109,7 +105,7 @@ async def test_chained_mode_sequence_advances(api):
                 **_event(tenant_id),
                 "meta": {
                     "version": 1,
-                    "producer_id": producer_id,
+                    "producer": producer_id,
                     "previous": 1,
                     "sequence": 2,
                 },
@@ -141,7 +137,7 @@ async def test_a_resend_at_the_chain_head_is_a_duplicate_whatever_its_id(api):
             **_event(tenant_id, event_id=first_id),
             "meta": {
                 "version": 1,
-                "producer_id": producer_id,
+                "producer": producer_id,
                 "previous": 0,
                 "sequence": 1,
             },
@@ -160,7 +156,7 @@ async def test_a_resend_at_the_chain_head_is_a_duplicate_whatever_its_id(api):
                 **_event(tenant_id, event_id=next_id),
                 "meta": {
                     "version": 1,
-                    "producer_id": producer_id,
+                    "producer": producer_id,
                     "previous": 1,
                     "sequence": 2,
                 },
@@ -172,7 +168,7 @@ async def test_a_resend_at_the_chain_head_is_a_duplicate_whatever_its_id(api):
         cursors = await client.get(f"/producers/{producer_id}/cursors")
         assert cursors.status_code == 200
         assert cursors.json() == {
-            "producer_id": producer_id,
+            "id": producer_id,
             "client_agent": "e2e-test/1.0",
             "topics": [{"topic": TOPIC_STREAM, "last_sequence": 2}],
         }
@@ -189,8 +185,7 @@ async def test_a_resend_at_the_chain_head_is_a_duplicate_whatever_its_id(api):
         {
             "id": first_id,
             "type": EVENT_TYPE_STREAM,
-            "topic": TOPIC_STREAM,
-            "tenant_id": tenant_id,
+            "subject_tenant": tenant_id,
             "source": "e2e-test",
             "subject": "s1",
             "subject_type": SUBJECT_TYPE,
@@ -204,8 +199,7 @@ async def test_a_resend_at_the_chain_head_is_a_duplicate_whatever_its_id(api):
         {
             "id": next_id,
             "type": EVENT_TYPE_STREAM,
-            "topic": TOPIC_STREAM,
-            "tenant_id": tenant_id,
+            "subject_tenant": tenant_id,
             "source": "e2e-test",
             "subject": "s1",
             "subject_type": SUBJECT_TYPE,
@@ -244,7 +238,7 @@ async def test_a_resend_at_the_chain_head_is_a_duplicate_whatever_its_previous(a
                 **_event(tenant_id, event_id=first_id),
                 "meta": {
                     "version": 1,
-                    "producer_id": producer_id,
+                    "producer": producer_id,
                     "previous": 0,
                     "sequence": 1,
                 },
@@ -257,7 +251,7 @@ async def test_a_resend_at_the_chain_head_is_a_duplicate_whatever_its_previous(a
             **_event(tenant_id, event_id=second_id),
             "meta": {
                 "version": 1,
-                "producer_id": producer_id,
+                "producer": producer_id,
                 "previous": 1,
                 "sequence": 2,
             },
@@ -273,7 +267,7 @@ async def test_a_resend_at_the_chain_head_is_a_duplicate_whatever_its_previous(a
                 "id": resend_id,
                 "meta": {
                     "version": 1,
-                    "producer_id": producer_id,
+                    "producer": producer_id,
                     "previous": 0,
                     "sequence": 2,
                 },
@@ -288,7 +282,7 @@ async def test_a_resend_at_the_chain_head_is_a_duplicate_whatever_its_previous(a
                 **_event(tenant_id, event_id=next_id),
                 "meta": {
                     "version": 1,
-                    "producer_id": producer_id,
+                    "producer": producer_id,
                     "previous": 2,
                     "sequence": 3,
                 },
@@ -300,7 +294,7 @@ async def test_a_resend_at_the_chain_head_is_a_duplicate_whatever_its_previous(a
         cursors = await client.get(f"/producers/{producer_id}/cursors")
         assert cursors.status_code == 200
         assert cursors.json() == {
-            "producer_id": producer_id,
+            "id": producer_id,
             "client_agent": "e2e-test/1.0",
             "topics": [{"topic": TOPIC_STREAM, "last_sequence": 3}],
         }
@@ -317,8 +311,7 @@ async def test_a_resend_at_the_chain_head_is_a_duplicate_whatever_its_previous(a
         {
             "id": first_id,
             "type": EVENT_TYPE_STREAM,
-            "topic": TOPIC_STREAM,
-            "tenant_id": tenant_id,
+            "subject_tenant": tenant_id,
             "source": "e2e-test",
             "subject": "s1",
             "subject_type": SUBJECT_TYPE,
@@ -332,8 +325,7 @@ async def test_a_resend_at_the_chain_head_is_a_duplicate_whatever_its_previous(a
         {
             "id": second_id,
             "type": EVENT_TYPE_STREAM,
-            "topic": TOPIC_STREAM,
-            "tenant_id": tenant_id,
+            "subject_tenant": tenant_id,
             "source": "e2e-test",
             "subject": "s1",
             "subject_type": SUBJECT_TYPE,
@@ -347,8 +339,7 @@ async def test_a_resend_at_the_chain_head_is_a_duplicate_whatever_its_previous(a
         {
             "id": next_id,
             "type": EVENT_TYPE_STREAM,
-            "topic": TOPIC_STREAM,
-            "tenant_id": tenant_id,
+            "subject_tenant": tenant_id,
             "source": "e2e-test",
             "subject": "s1",
             "subject_type": SUBJECT_TYPE,
@@ -380,7 +371,7 @@ async def test_chained_sequence_violation_returns_412(api):
                 **_event(tenant_id),
                 "meta": {
                     "version": 1,
-                    "producer_id": producer_id,
+                    "producer": producer_id,
                     "previous": 0,
                     "sequence": 1,
                 },
@@ -395,7 +386,7 @@ async def test_chained_sequence_violation_returns_412(api):
                 **_event(tenant_id),
                 "meta": {
                     "version": 1,
-                    "producer_id": producer_id,
+                    "producer": producer_id,
                     "previous": 99,
                     "sequence": 100,
                 },
@@ -415,7 +406,9 @@ async def test_chained_sequence_violation_returns_412(api):
                 {
                     "type": "sequence_mismatch",
                     "subject": "(producer)",
-                    "description": body["context"]["violations"][0]["description"],
+                    "description": (
+                        f"index=0 producer={producer_id} topic={TOPIC_STREAM} last_sequence=1"
+                    ),
                 }
             ],
             "resource_type": "gts.cf.core.events.topic.v1~",
@@ -442,7 +435,7 @@ async def test_cursor_recovery_returns_last_sequence(api):
                 **_event(tenant_id),
                 "meta": {
                     "version": 1,
-                    "producer_id": producer_id,
+                    "producer": producer_id,
                     "previous": 0,
                     "sequence": 1,
                 },
@@ -454,7 +447,7 @@ async def test_cursor_recovery_returns_last_sequence(api):
                 **_event(tenant_id),
                 "meta": {
                     "version": 1,
-                    "producer_id": producer_id,
+                    "producer": producer_id,
                     "previous": 1,
                     "sequence": 2,
                 },
@@ -465,7 +458,7 @@ async def test_cursor_recovery_returns_last_sequence(api):
     assert cursor_resp.status_code == 200
     body = cursor_resp.json()
     assert body == {
-        "producer_id": producer_id,
+        "id": producer_id,
         "client_agent": "e2e-test/1.0",
         "topics": [
             {
@@ -494,7 +487,7 @@ async def test_chain_reset_returns_200(api):
                 **_event(tenant_id),
                 "meta": {
                     "version": 1,
-                    "producer_id": producer_id,
+                    "producer": producer_id,
                     "previous": 0,
                     "sequence": 1,
                 },
@@ -525,7 +518,7 @@ async def test_unknown_producer_returns_404(api):
                 **_event(tenant_id),
                 "meta": {
                     "version": 1,
-                    "producer_id": fake_producer_id,
+                    "producer": fake_producer_id,
                     "previous": 0,
                     "sequence": 1,
                 },
@@ -574,7 +567,7 @@ async def test_chained_producer_desync_recovery(api):
                     **_event(tenant_id),
                     "meta": {
                         "version": 1,
-                        "producer_id": producer_id,
+                        "producer": producer_id,
                         "previous": seq - 1,
                         "sequence": seq,
                     },
@@ -590,7 +583,7 @@ async def test_chained_producer_desync_recovery(api):
                 **_event(tenant_id),
                 "meta": {
                     "version": 1,
-                    "producer_id": producer_id,
+                    "producer": producer_id,
                     "previous": 0,
                     "sequence": 1,
                 },
@@ -622,7 +615,7 @@ async def test_chained_producer_desync_recovery(api):
         cursors_resp = await client.get(f"/producers/{producer_id}/cursors")
         assert cursors_resp.status_code == 200
         cursor_body = cursors_resp.json()
-        assert cursor_body["producer_id"] == producer_id
+        assert cursor_body["id"] == producer_id
         assert cursor_body["topics"] == [{"topic": TOPIC_STREAM, "last_sequence": 2}]
         last_seq = 2
 
@@ -633,7 +626,7 @@ async def test_chained_producer_desync_recovery(api):
                 **_event(tenant_id),
                 "meta": {
                     "version": 1,
-                    "producer_id": producer_id,
+                    "producer": producer_id,
                     "previous": last_seq,
                     "sequence": last_seq + 1,
                 },
@@ -657,7 +650,8 @@ async def _deliveries_through(client, tenant_id: str, last_id: str) -> list[dict
             "interests": [
                 {
                     "topic": TOPIC_STREAM,
-                    "tenant_id": tenant_id,
+                    "subject_tenant": tenant_id,
+                    "ownership_filter": "entire_tenant",
                     "types": [EVENT_TYPE_STREAM],
                 }
             ],
@@ -678,7 +672,7 @@ async def _deliveries_through(client, tenant_id: str, last_id: str) -> list[dict
     }
 
     delivered: list[dict] = []
-    async with client.stream("GET", f"/events:sse?subscription_id={sub_id}") as stream:
+    async with client.stream("GET", f"/events:sse?subscription={sub_id}") as stream:
         assert stream.status_code == 200
         reader = SseFrameReader(stream)
         loop = asyncio.get_running_loop()
@@ -700,9 +694,33 @@ async def _register_monotonic(client) -> str:
     return reg.json()["id"]
 
 
+async def _register_chained(client) -> str:
+    reg = await client.post(
+        "/producers", json={"mode": "chained", "client_agent": "e2e-test/1.0"}
+    )
+    assert reg.status_code == 201
+    return reg.json()["id"]
+
+
+# The `detail` (and `context.format`) of each mode-shape refusal.
+META_WITHOUT_PRODUCER_ID = (
+    "MetaWithoutProducerId: meta carries previous or sequence but no producer"
+)
+CHAIN_MODE_FIELDS_MISSING = (
+    "ChainModeFieldsMissing: a chained-mode publish needs meta.previous and meta.sequence"
+)
+MONOTONIC_MODE_FIELDS_VIOLATION = (
+    "MonotonicModeFieldsViolation: a monotonic-mode publish needs meta.sequence "
+    "and must omit meta.previous"
+)
+UNKNOWN_META_VERSION = (
+    "UnknownMetaVersion: meta.version is newer than the broker supports (1)"
+)
+
+
 def _monotonic_meta(producer_id: str, sequence: int) -> dict:
     """Monotonic publish meta: `previous` is absent, by contract."""
-    return {"version": 1, "producer_id": producer_id, "sequence": sequence}
+    return {"version": 1, "producer": producer_id, "sequence": sequence}
 
 
 async def _last_sequence(client, producer_id: str) -> int:
@@ -794,10 +812,6 @@ async def test_monotonic_publish_with_previous_rejected_400(api):
     ``meta.previous`` is a chained-mode field.  A monotonic producer sending it
     is a mode-shape violation, rejected before the sequence comparison, so the
     otherwise-acceptable sequence is not applied either.
-
-    ``reason: "field_not_allowed"`` is the value the scenario proposes; no
-    existing scenario or the Hard-Error Catalog defines one for a field that is
-    present but forbidden, so it may change on review.
     """
     tenant_id = str(uuid.uuid4())
     async with api() as client:
@@ -815,7 +829,7 @@ async def test_monotonic_publish_with_previous_rejected_400(api):
                 **_event(tenant_id),
                 "meta": {
                     "version": 1,
-                    "producer_id": producer_id,
+                    "producer": producer_id,
                     "previous": 7,
                     "sequence": 8,
                 },
@@ -827,17 +841,11 @@ async def test_monotonic_publish_with_previous_rejected_400(api):
             "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
             "title": "Invalid Argument",
             "status": 400,
-            "detail": "Request validation failed",
+            "detail": MONOTONIC_MODE_FIELDS_VIOLATION,
             "instance": f"{API_BASE}/events",
             "trace_id": TRACE_ID,
             "context": {
-                "field_violations": [
-                    {
-                        "field": "meta.previous",
-                        "description": "must be absent for a monotonic-mode producer",
-                        "reason": "field_not_allowed",
-                    }
-                ],
+                "format": MONOTONIC_MODE_FIELDS_VIOLATION,
                 "resource_type": "gts.cf.core.events.request.v1~",
             },
         }
@@ -845,3 +853,243 @@ async def test_monotonic_publish_with_previous_rejected_400(api):
         # The shape check precedes the sequence comparison, so sequence 8 was
         # never applied.
         assert await _last_sequence(client, producer_id) == 7
+
+
+async def test_chained_publish_without_previous_rejected_400(api):
+    """scenario: producer/flows/1.13-negative-chained-publish-missing-previous.md
+
+    A chained producer's ``meta`` without ``meta.previous`` is refused before
+    any sequence comparison; the chain is not started.
+    """
+    tenant_id = str(uuid.uuid4())
+    async with api() as client:
+        producer_id = await _register_chained(client)
+
+        resp = await client.post(
+            "/events",
+            json={
+                **_event(tenant_id),
+                "meta": {"version": 1, "producer": producer_id, "sequence": 1},
+            },
+        )
+        cursors = await client.get(f"/producers/{producer_id}/cursors")
+    assert resp.status_code == 400, resp.text
+    assert resp.json() == {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": CHAIN_MODE_FIELDS_MISSING,
+        "instance": f"{API_BASE}/events",
+        "trace_id": TRACE_ID,
+        "context": {
+            "format": CHAIN_MODE_FIELDS_MISSING,
+            "resource_type": "gts.cf.core.events.request.v1~",
+        },
+    }
+    assert cursors.status_code == 200
+    assert cursors.json() == {
+        "id": producer_id,
+        "client_agent": "e2e-test/1.0",
+        "topics": [],
+    }
+
+
+async def test_chained_publish_without_sequence_rejected_400(api):
+    """scenario: producer/flows/1.14-negative-chained-publish-missing-sequence.md
+
+    A chained producer's ``meta`` without ``meta.sequence`` is refused before
+    any sequence comparison; the chain is not started.
+    """
+    tenant_id = str(uuid.uuid4())
+    async with api() as client:
+        producer_id = await _register_chained(client)
+
+        resp = await client.post(
+            "/events",
+            json={
+                **_event(tenant_id),
+                "meta": {"version": 1, "producer": producer_id, "previous": 0},
+            },
+        )
+        cursors = await client.get(f"/producers/{producer_id}/cursors")
+    assert resp.status_code == 400, resp.text
+    assert resp.json() == {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": CHAIN_MODE_FIELDS_MISSING,
+        "instance": f"{API_BASE}/events",
+        "trace_id": TRACE_ID,
+        "context": {
+            "format": CHAIN_MODE_FIELDS_MISSING,
+            "resource_type": "gts.cf.core.events.request.v1~",
+        },
+    }
+    assert cursors.status_code == 200
+    assert cursors.json() == {
+        "id": producer_id,
+        "client_agent": "e2e-test/1.0",
+        "topics": [],
+    }
+
+
+async def test_monotonic_publish_without_sequence_rejected_400(api):
+    """scenario: producer/flows/1.15-negative-monotonic-publish-missing-sequence.md
+
+    A monotonic producer's ``meta`` without ``meta.sequence`` is refused before
+    any sequence comparison; no ``last_sequence`` is recorded.
+    """
+    tenant_id = str(uuid.uuid4())
+    async with api() as client:
+        producer_id = await _register_monotonic(client)
+
+        resp = await client.post(
+            "/events",
+            json={**_event(tenant_id), "meta": {"version": 1, "producer": producer_id}},
+        )
+        cursors = await client.get(f"/producers/{producer_id}/cursors")
+    assert resp.status_code == 400, resp.text
+    assert resp.json() == {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": MONOTONIC_MODE_FIELDS_VIOLATION,
+        "instance": f"{API_BASE}/events",
+        "trace_id": TRACE_ID,
+        "context": {
+            "format": MONOTONIC_MODE_FIELDS_VIOLATION,
+            "resource_type": "gts.cf.core.events.request.v1~",
+        },
+    }
+    assert cursors.status_code == 200
+    assert cursors.json() == {
+        "id": producer_id,
+        "client_agent": "e2e-test/1.0",
+        "topics": [],
+    }
+
+
+async def test_meta_without_producer_rejected_400(api):
+    """scenario: producer/flows/1.16-negative-meta-without-producer.md
+
+    A ``meta`` carrying ``meta.sequence`` but no ``meta.producer`` is refused;
+    a stream read through a later sentinel delivers only the sentinel.
+    """
+    tenant_id = str(uuid.uuid4())
+    sentinel_id = str(uuid.uuid4())
+    async with api() as client:
+        resp = await client.post(
+            "/events",
+            json={**_event(tenant_id), "meta": {"version": 1, "sequence": 5}},
+        )
+        sentinel = await client.post("/events", json=_event(tenant_id, sentinel_id))
+        assert sentinel.status_code == 202, sentinel.text
+        delivered = await _deliveries_through(client, tenant_id, sentinel_id)
+    assert resp.status_code == 400, resp.text
+    assert resp.json() == {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": META_WITHOUT_PRODUCER_ID,
+        "instance": f"{API_BASE}/events",
+        "trace_id": TRACE_ID,
+        "context": {
+            "format": META_WITHOUT_PRODUCER_ID,
+            "resource_type": "gts.cf.core.events.request.v1~",
+        },
+    }
+    assert [event["id"] for event in delivered] == [sentinel_id]
+
+
+async def test_unknown_meta_version_rejected_400(api):
+    """scenario: producer/flows/1.17-negative-unknown-meta-version.md
+
+    A chained-shape ``meta`` at ``version`` 2 is refused; the chain is not
+    started.
+    """
+    tenant_id = str(uuid.uuid4())
+    async with api() as client:
+        producer_id = await _register_chained(client)
+
+        resp = await client.post(
+            "/events",
+            json={
+                **_event(tenant_id),
+                "meta": {"version": 2, "producer": producer_id, "previous": 0, "sequence": 1},
+            },
+        )
+        cursors = await client.get(f"/producers/{producer_id}/cursors")
+    assert resp.status_code == 400, resp.text
+    assert resp.json() == {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": UNKNOWN_META_VERSION,
+        "instance": f"{API_BASE}/events",
+        "trace_id": TRACE_ID,
+        "context": {
+            "format": UNKNOWN_META_VERSION,
+            "resource_type": "gts.cf.core.events.request.v1~",
+        },
+    }
+    assert cursors.status_code == 200
+    assert cursors.json() == {
+        "id": producer_id,
+        "client_agent": "e2e-test/1.0",
+        "topics": [],
+    }
+
+
+async def test_meta_with_only_a_newer_version_rejected_400(api):
+    """scenario: producer/flows/1.17-negative-unknown-meta-version.md
+
+    A ``meta`` carrying only ``version`` 2, with no producer, is refused rather
+    than read as stateless; a stream read through a later sentinel delivers
+    only the sentinel.
+    """
+    tenant_id = str(uuid.uuid4())
+    sentinel_id = str(uuid.uuid4())
+    async with api() as client:
+        resp = await client.post(
+            "/events", json={**_event(tenant_id), "meta": {"version": 2}}
+        )
+        sentinel = await client.post("/events", json=_event(tenant_id, sentinel_id))
+        assert sentinel.status_code == 202, sentinel.text
+        delivered = await _deliveries_through(client, tenant_id, sentinel_id)
+    assert resp.status_code == 400, resp.text
+    assert resp.json() == {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": UNKNOWN_META_VERSION,
+        "instance": f"{API_BASE}/events",
+        "trace_id": TRACE_ID,
+        "context": {
+            "format": UNKNOWN_META_VERSION,
+            "resource_type": "gts.cf.core.events.request.v1~",
+        },
+    }
+    assert [event["id"] for event in delivered] == [sentinel_id]
+
+async def test_meta_with_only_version_is_stateless(api):
+    """scenario: producer/flows/1.18-positive-meta-with-only-version-is-stateless.md
+
+    Two publishes whose ``meta`` carries only a version are each stateless:
+    both are accepted and both are delivered, in publish order.
+    """
+    tenant_id = str(uuid.uuid4())
+    first_id = str(uuid.uuid4())
+    second_id = str(uuid.uuid4())
+    async with api() as client:
+        first = await client.post(
+            "/events", json={**_event(tenant_id, first_id), "meta": {"version": 1}}
+        )
+        second = await client.post(
+            "/events", json={**_event(tenant_id, second_id), "meta": {"version": 1}}
+        )
+        assert first.status_code == 202, first.text
+        assert second.status_code == 202, second.text
+        delivered = await _deliveries_through(client, tenant_id, second_id)
+    assert first.text == "", "202 Accepted must carry no body"
+    assert second.text == "", "202 Accepted must carry no body"
+    assert [event["id"] for event in delivered] == [first_id, second_id]

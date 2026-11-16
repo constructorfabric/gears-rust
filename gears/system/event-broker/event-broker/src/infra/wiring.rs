@@ -21,6 +21,8 @@ use crate::domain::ingest::{IngestService, IngestServiceImpl};
 use crate::domain::outbox::OutboxPartitions;
 use crate::domain::specification::SpecificationManager;
 use crate::domain::streaming::lease::InProcessStreamLeases;
+use crate::domain::streaming::scope::TenantSetInterner;
+use crate::domain::streaming::scope_memo::ScopeMemo;
 use crate::infra::loader::backend_source::BackendEventSource;
 use crate::infra::loader::heads::{DEFAULT_RECONCILE, HeadWatcher};
 use crate::infra::loader::poll::PollPolicy;
@@ -58,6 +60,8 @@ pub fn build_handler_state(
     attacher: Arc<dyn crate::domain::streaming::source::ReaderAttacher>,
     groups: Arc<ConsumerGroupCoordinator>,
     leases: Arc<InProcessStreamLeases>,
+    scope_memo: Arc<ScopeMemo>,
+    tenant_sets: Arc<TenantSetInterner>,
     batch: BatchConfig,
     outbox_partitions: OutboxPartitions,
     sync_wait_max: std::time::Duration,
@@ -77,14 +81,21 @@ pub fn build_handler_state(
         sync_wait,
         sync_wait_max,
     ));
+    // Every PDP wait of delivery is bounded by its own key; ingest keeps the
+    // enforcer's default.
+    let delivery_enforcer = policy_enforcer.with_deadline(Duration::from_secs(u64::from(
+        streaming.authz_eval_deadline_secs,
+    )));
     let delivery_impl = DeliveryServiceImpl::new(
         storage,
-        policy_enforcer,
+        delivery_enforcer,
         spec_manager,
         backend_resolver,
         groups,
         attacher,
         leases,
+        scope_memo,
+        tenant_sets,
         streaming,
         heartbeat_interval,
     );

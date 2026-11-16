@@ -1,7 +1,7 @@
 //! Resolve-and-forward seam shared by `proxy::handle`/`router::handle`
 //! (`eb-dispatcher-routing`). Any real per-instance routing algorithm beyond
-//! random selection (topic-pattern matching, cache-based consumer-group
-//! ownership, failover) is #4438's job (design.md D1).
+//! round-robin selection is tracked elsewhere: topic-affinity routing in #5701,
+//! cache-based consumer-group ownership and failover in #4438 (design.md D1).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,12 +21,12 @@ use crate::config::MAX_REQUEST_BODY_BYTES;
 /// every byte received (heartbeat or data), not tied to total connection
 /// duration. It also bounds the wait for the *response head*, so it must sit
 /// above the two things a dispatched route can legitimately hold before its
-/// first byte: the consumer SDK's ~50s stream self-heal window
-/// (`DESIGN.md:1825`) - the binding constraint - and - sending nothing until it
-/// resolves - a synchronous `Prefer: wait=N` publish, capped at
-/// `config::checks::MAX_PUBLISH_WAIT_SECS` (20s) on an ingest upstream. 90s
-/// clears the self-heal window with margin, and the publish cap sits well under
-/// it.
+/// first byte: the consumer SDK's ~50s stream self-heal window (`DESIGN.md`
+/// "Streaming connection - proxy interaction") - the binding constraint - and -
+/// sending nothing until it resolves - a synchronous `Prefer: wait=N` publish,
+/// capped at `config::checks::MAX_PUBLISH_WAIT_SECS` (20s) on an ingest
+/// upstream. 90s clears the self-heal window with margin, and the publish cap
+/// sits well under it.
 const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Bound on the TCP connect to a resolved instance. Unlike the idle-read

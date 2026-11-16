@@ -1,9 +1,9 @@
-//! `SpecificationManager` (`DESIGN.md:721-737`): shared by Ingest and
+//! `SpecificationManager` (`DESIGN.md` "`SpecificationManager`"): shared by Ingest and
 //! Delivery, owns topic/event-type metadata.
 
 use async_trait::async_trait;
 use event_broker_sdk::models::EventType;
-use gts::GtsTypeId;
+use gts::{GtsIdPattern, GtsTypeId};
 use serde_json::Value as JsonValue;
 use toolkit_gts::GtsInstanceId;
 
@@ -37,6 +37,29 @@ pub struct ProvisioningLimits {
     pub attempt_timeout: std::time::Duration,
 }
 
+/// A topic's registered event type with the subject types it allows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventTypeCandidate {
+    pub id: GtsTypeId,
+    pub allowed_subject_types: Vec<GtsIdPattern>,
+}
+
+/// A topic's registered event types, or the fact that it has more than
+/// [`Self::CAP`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum EventTypeCandidates {
+    /// Every registered event type of the topic, in the order the database
+    /// returns them; callers sort.
+    Listed(Vec<EventTypeCandidate>),
+    /// The topic has more registered event types than [`Self::CAP`].
+    OverCap,
+}
+
+impl EventTypeCandidates {
+    /// The most event types a topic's list holds.
+    pub const CAP: usize = 256;
+}
+
 /// Everything the rest of the gear asks about a topic or an event type.
 ///
 /// There is no registration path: a topic and an event type are registered by
@@ -65,6 +88,32 @@ pub trait SpecificationManager: Send + Sync {
     /// Returns `DomainError::StorageUnavailable` if the event type's record
     /// cannot be read.
     async fn get_event_type(&self, id: &GtsTypeId) -> Result<Option<EventType>, DomainError>;
+    /// The registered event types of `topic`, in the order the database
+    /// returns them (callers sort), each with the subject types it allows;
+    /// `OverCap` when the topic has more than [`EventTypeCandidates::CAP`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `DomainError::StorageUnavailable` if the event type records
+    /// cannot be read, and `DomainError::Internal` if a stored event type id
+    /// or subject type list does not parse, which only a broken cache causes.
+    async fn get_event_type_candidates(
+        &self,
+        topic: &GtsInstanceId,
+    ) -> Result<EventTypeCandidates, DomainError>;
+    /// The ids among `ids` that are event types registered on `topic`, in the
+    /// order the database returns them. An empty `ids` reads nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DomainError::StorageUnavailable` if the event type records
+    /// cannot be read, and `DomainError::Internal` if a stored event type id
+    /// does not parse, which only a broken cache causes.
+    async fn get_registered_event_types(
+        &self,
+        topic: &GtsInstanceId,
+        ids: &[GtsTypeId],
+    ) -> Result<Vec<GtsTypeId>, DomainError>;
     async fn validate_event_data(
         &self,
         event_type: &EventType,
@@ -91,8 +140,7 @@ pub trait SpecificationManager: Send + Sync {
     /// cannot be read.
     async fn list_event_types(&self) -> Result<Vec<EventType>, DomainError>;
 
-    /// Resolves a topic's stable integer surrogate id
-    /// (eb-single-process-implementation D1/D6) - what `Storage`'s durable
+    /// Resolves a topic's stable integer surrogate id - what `Storage`'s durable
     /// tables (`cursor`, `consumer_group`) use as their foreign key into
     /// topics, instead of the much wider `GtsInstanceId` string. Stable
     /// across restarts: the same `id` is never assigned to two different
@@ -109,12 +157,13 @@ pub trait SpecificationManager: Send + Sync {
     /// Returns `DomainError::NotFound` if `id` is not a known event type.
     async fn resolve_event_type_id(&self, id: &GtsTypeId) -> Result<i64, DomainError>;
 
-    /// Where `id` stands on its storage backend; `None` while no attempt has
-    /// been recorded for it.
+    /// Where `topic` stands on its storage backend, read from the binding
+    /// record its `uuid` keys; `None` while no attempt has been recorded for
+    /// it.
     ///
     /// # Errors
     /// Returns a `DomainError` if the record cannot be read.
-    async fn topic_state(&self, id: &GtsInstanceId) -> Result<Option<TopicState>, DomainError>;
+    async fn topic_state(&self, topic: &Topic) -> Result<Option<TopicState>, DomainError>;
 
     /// One provisioning pass over every registered topic (feature 0006 §4.1):
     /// starts an attempt for a topic with no record, continues a live one,

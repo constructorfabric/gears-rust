@@ -176,7 +176,6 @@ mod tests {
     use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
     use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
     use tokio_util::sync::CancellationToken;
-    use toolkit_db::DBProvider;
     use uuid::Uuid;
 
     use event_broker_sdk::backend::Partition;
@@ -186,12 +185,14 @@ mod tests {
     use crate::domain::outbox::{INGEST_PAYLOAD_TYPE, INGEST_QUEUE_NAME};
     use crate::infra::metrics::SCOPE;
     use crate::infra::specification::TypesRegistrySpecificationManager;
-    use crate::infra::storage::migrations::Migrator;
     use crate::test_support::SingleBackendResolver;
+    use crate::test_support::gear_db::ScratchSqlite;
     use crate::test_support::type_registry::registry_holding;
 
     const TOPIC_ID: &str =
         toolkit_gts::gts_id!("cf.core.events.topic.v1~example.eb.ingestoutbox.topic.v1");
+    /// The Registry Reference the tests hand the backend for `TOPIC_ID`.
+    const TOPIC_REFERENCE: Uuid = Uuid::from_u128(0x7091);
     const OUTBOX: OutboxId = OutboxId::new(0x0123_4567_89ab_cdef);
     const RETRIES: &str = "evbk_ingest_append_retries_total";
     const OLDEST_AGE: &str = "evbk_ingest_outbox_oldest_age_seconds";
@@ -275,50 +276,21 @@ mod tests {
     }
 
     /// A fresh `SQLite` gear database, and a DSN that reaches the same file.
-    async fn test_db() -> (Arc<DBProvider<toolkit_db::DbError>>, String) {
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "cf-eb-ingestoutbox-test-{}.db",
-            Uuid::now_v7().simple()
-        ));
-        let mut file = path.to_string_lossy().replace('\\', "/");
-        if !file.starts_with('/') {
-            file.insert(0, '/');
-        }
-        let dsn = format!("sqlite://{file}?mode=rwc");
-        let opts = toolkit_db::ConnectOpts {
-            max_conns: Some(1),
-            min_conns: Some(1),
-            ..Default::default()
-        };
-        let db = toolkit_db::connect_db(&dsn, opts)
-            .await
-            .expect("connect sqlite");
-        toolkit_db::migration_runner::run_migrations_for_testing(
-            &db,
-            <Migrator as sea_orm_migration::MigratorTrait>::migrations(),
-        )
-        .await
-        .expect("migrations");
-        (Arc::new(DBProvider::new(db)), dsn)
+    async fn test_db() -> ScratchSqlite {
+        ScratchSqlite::open("cf-eb-ingestoutbox-test").await
     }
 
     fn topic() -> toolkit_gts::GtsInstanceId {
         toolkit_gts::GtsInstanceId::try_new(TOPIC_ID).unwrap()
     }
 
-    /// The handler over a registered topic; `provisioned` decides whether the
-    /// backend holds the topic's log.
-    async fn test_handler(provisioned: bool) -> (IngestOutboxHandler, MemoryBackend, Recorder) {
-        let (handler, backend, recorder, _dsn) = test_handler_with_dsn(provisioned).await;
-        (handler, backend, recorder)
-    }
-
-    /// [`test_handler`], with a DSN that reaches its gear database.
-    async fn test_handler_with_dsn(
+    /// The handler over a registered topic, and its gear database;
+    /// `provisioned` decides whether the backend holds the topic's log.
+    async fn test_handler(
         provisioned: bool,
-    ) -> (IngestOutboxHandler, MemoryBackend, Recorder, String) {
-        let (db, dsn) = test_db().await;
+    ) -> (IngestOutboxHandler, MemoryBackend, Recorder, ScratchSqlite) {
+        let scratch = test_db().await;
+        let db = Arc::clone(scratch.db());
         let client: Arc<dyn types_registry_sdk::PlatformTypesRegistryApi> = registry_holding(
             &[serde_json::json!({
                 "id": TOPIC_ID,
@@ -341,6 +313,7 @@ mod tests {
                 .provision(
                     &TopicSpec {
                         topic: topic(),
+                        uuid: TOPIC_REFERENCE,
                         partitions: 1,
                         retention: Retention::default(),
                     },
@@ -358,7 +331,7 @@ mod tests {
             IngestOutboxHandler::new(spec_manager, resolver, OUTBOX, metrics),
             backend,
             recorder,
-            dsn,
+            scratch,
         )
     }
 
@@ -369,12 +342,13 @@ mod tests {
                 "cf.core.events.event.v1~example.eb.ingestoutbox.event.v1~"
             )),
             topic: topic(),
-            tenant_id: Uuid::new_v4(),
+            subject_tenant: Uuid::new_v4(),
             source: "test".to_owned(),
             subject: "subject".to_owned(),
             subject_type: gts::GtsTypeId::new(toolkit_gts::gts_id!(
                 "example.eb.ingestoutbox.subject.v1~"
             )),
+            subject_owner: None,
             occurred_at: chrono::Utc::now(),
             trace_parent: None,
             data: serde_json::json!({"k": "v"}),
@@ -384,6 +358,7 @@ mod tests {
                 previous: Some(0),
                 sequence,
             }),
+            ingest: None,
             partition: None,
             sequence: None,
             sequence_time: None,
@@ -419,7 +394,7 @@ mod tests {
     /// is stored once.
     #[tokio::test]
     async fn redelivery_after_append_is_a_duplicate() {
-        let (handler, backend, recorder) = test_handler(true).await;
+        let (handler, backend, recorder, _scratch) = test_handler(true).await;
         let event = test_event(1);
         let msg = test_message(&event);
 
@@ -457,7 +432,7 @@ mod tests {
     /// the message's age reported while it waits.
     #[tokio::test]
     async fn a_topic_not_provisioned_is_retried() {
-        let (handler, _backend, recorder) = test_handler(false).await;
+        let (handler, _backend, recorder, _scratch) = test_handler(false).await;
         let result = handler.handle(&test_message(&test_event(1))).await;
         assert!(matches!(result, MessageResult::Retry), "{result:?}");
         assert_eq!(
@@ -485,7 +460,7 @@ mod tests {
     /// outbox partition, visibly.
     #[tokio::test]
     async fn malformed_payload_is_retried() {
-        let (handler, _backend, recorder) = test_handler(true).await;
+        let (handler, _backend, recorder, _scratch) = test_handler(true).await;
         let msg = OutboxMessage {
             partition_id: 0,
             seq: 1,
@@ -521,7 +496,7 @@ mod tests {
     /// is the operator's call.
     #[tokio::test]
     async fn unregistered_topic_is_retried() {
-        let (handler, _backend, recorder) = test_handler(true).await;
+        let (handler, _backend, recorder, _scratch) = test_handler(true).await;
         let mut event = test_event(1);
         event.topic = toolkit_gts::GtsInstanceId::try_new(toolkit_gts::gts_id!(
             "cf.core.events.topic.v1~example.eb.ingestoutbox.unregistered.v1"
@@ -622,9 +597,11 @@ mod tests {
     }
 
     /// A handler whose backend records every append's [`Flush`], over a
-    /// provisioned memory backend, plus the shared record it appends to.
-    async fn recording_handler() -> (IngestOutboxHandler, Arc<Mutex<Vec<Flush>>>) {
-        let (db, _dsn) = test_db().await;
+    /// provisioned memory backend, plus the shared record it appends to and
+    /// its gear database.
+    async fn recording_handler() -> (IngestOutboxHandler, Arc<Mutex<Vec<Flush>>>, ScratchSqlite) {
+        let scratch = test_db().await;
+        let db = Arc::clone(scratch.db());
         let client: Arc<dyn types_registry_sdk::PlatformTypesRegistryApi> = registry_holding(
             &[serde_json::json!({
                 "id": TOPIC_ID,
@@ -646,6 +623,7 @@ mod tests {
             .provision(
                 &TopicSpec {
                     topic: topic(),
+                    uuid: TOPIC_REFERENCE,
                     partitions: 1,
                     retention: Retention::default(),
                 },
@@ -666,6 +644,7 @@ mod tests {
         (
             IngestOutboxHandler::new(spec_manager, resolver, OUTBOX, metrics),
             flushes,
+            scratch,
         )
     }
 
@@ -677,7 +656,7 @@ mod tests {
     /// unchanged.
     #[tokio::test]
     async fn a_traced_row_is_appended_flush_sync_and_an_untraced_row_flush_async() {
-        let (handler, flushes) = recording_handler().await;
+        let (handler, flushes, _scratch) = recording_handler().await;
 
         // Two distinct fences (seq 1 and 2) so both are genuine appends, not a
         // duplicate of the other.
@@ -698,7 +677,8 @@ mod tests {
     /// so an operator can tell a database fault from a deregistered topic.
     #[tokio::test]
     async fn an_outbox_append_during_a_spec_cache_fault_retries_as_specification_unavailable() {
-        let (handler, _backend, recorder, dsn) = test_handler_with_dsn(true).await;
+        let (handler, _backend, recorder, scratch) = test_handler(true).await;
+        let dsn = scratch.dsn().to_owned();
         crate::test_support::tables::drop_table(&dsn, "event_broker_spec_cache").await;
 
         let result = handler.handle(&test_message(&test_event(1))).await;

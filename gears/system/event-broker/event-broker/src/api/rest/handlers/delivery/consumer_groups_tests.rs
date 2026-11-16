@@ -22,10 +22,9 @@ use crate::test_support::{DenyingAuthZ, EventBrokerHarness, Json};
 #[tokio::test]
 async fn create_consumer_group_mints_a_gts_id_and_returns_201() {
     let harness = EventBrokerHarness::builder().build().await;
-    // `ConsumerGroup.tenant_id`/`owner_principal_id` are stamped from the
-    // caller's `SecurityContext`, not request-suppliable - read back
-    // whatever the harness's own (random) context carries, rather than
-    // pinning it via a builder override that only existed for this.
+    // The group's `tenant`/`owner_principal` are stamped from the caller's
+    // `SecurityContext`, not request-suppliable, so the expected values are
+    // read from the harness's own (random) context.
     let tenant_id = harness.security_context().subject_tenant_id();
     let subject_id = harness.security_context().subject_id();
 
@@ -47,8 +46,8 @@ async fn create_consumer_group_mints_a_gts_id_and_returns_201() {
         json!({
             "id": id,
             "kind": "anonymous",
-            "tenant_id": tenant_id,
-            "owner_principal_id": subject_id,
+            "tenant": tenant_id,
+            "owner_principal": subject_id,
             "description": null,
             "created_at": created_at,
         })
@@ -216,11 +215,25 @@ async fn get_consumer_group_happy_path() {
     let harness = EventBrokerHarness::builder().build().await;
     let created = harness.api_v1().post_consumer_groups().send().await;
 
-    let id = created.json()["id"].as_str().unwrap().to_owned();
-    let resp = harness.api_v1().get_consumer_group(&id).send().await;
+    let created = created.json();
+    let (Some(id), Some(created_at)) = (created["id"].as_str(), created["created_at"].as_str())
+    else {
+        panic!("the 201 body carries an id and a created_at: {created}");
+    };
+    let resp = harness.api_v1().get_consumer_group(id).send().await;
 
     resp.assert_status(200);
-    assert_eq!(resp.json(), created.json());
+    assert_eq!(
+        resp.json(),
+        json!({
+            "id": id,
+            "kind": "anonymous",
+            "tenant": harness.security_context().subject_tenant_id(),
+            "owner_principal": harness.security_context().subject_id(),
+            "description": null,
+            "created_at": created_at,
+        })
+    );
 }
 
 #[tokio::test]
@@ -656,7 +669,7 @@ async fn list_consumer_groups_excludes_a_named_group_without_consume_permission(
     assert_eq!(ids, vec![visible_id]);
 }
 
-// -- text-field encoding and length ---------------------------------------
+// -- text-field encoding, length and grammar ------------------------------
 //
 // The response body names the field and states the requirement, and carries
 // no part of the submitted value: a caller already knows what it sent, and an
@@ -759,6 +772,49 @@ async fn create_consumer_group_rejects_an_empty_client_agent() {
 }
 
 #[tokio::test]
+async fn create_consumer_group_rejects_a_client_agent_that_breaks_the_user_agent_grammar() {
+    let harness = EventBrokerHarness::builder().build().await;
+
+    let resp = harness
+        .api_v1()
+        .post_consumer_groups()
+        .with_body(Json(&json!({ "client_agent": "agent/" })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "Request validation failed",
+            "instance": "/event-broker/v1/consumer-groups",
+            "context": {
+                "field_violations": [{
+                    "field": "client_agent",
+                    "description": "must follow the RFC 9110 User-Agent grammar: \
+                                    product *( SP ( product / comment ) )",
+                    "reason": "user_agent_grammar",
+                }],
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    let listed = harness.api_v1().get_consumer_groups().send().await;
+    listed.assert_status(200);
+    assert_eq!(
+        listed.json(),
+        json!({
+            "items": [],
+            "page_info": { "next_cursor": null, "prev_cursor": null, "limit": 25 },
+        }),
+        "a refused create stores no group"
+    );
+}
+
+#[tokio::test]
 async fn create_consumer_group_rejects_a_non_ascii_description() {
     let harness = EventBrokerHarness::builder().build().await;
 
@@ -840,4 +896,206 @@ fn a_text_field_rejection_is_identical_from_the_gear_and_the_mock() {
         gear["context"]["field_violations"][0]["reason"],
         json!("ascii_only")
     );
+}
+
+// -- the caller-identity guard (#5494) --
+
+const NIL_CALLER_GROUP: &str =
+    "gts.cf.core.events.consumer_group.v1~0190f1c2-7a3b-7c4d-8e5f-6a7b8c9d0e3c";
+
+type RecordedPdp = Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+
+/// A harness acting as a caller whose subject and tenant are the nil UUID,
+/// under a PDP that allows every request and records each one.
+async fn nil_caller_harness() -> (EventBrokerHarness, RecordedPdp) {
+    let recorded = RecordedPdp::default();
+    let sink = Arc::clone(&recorded);
+    let harness = EventBrokerHarness::builder()
+        .with_policy_enforcer(PolicyEnforcer::new(Arc::new(DenyingAuthZ {
+            deny_if: move |req: &EvaluationRequest| {
+                sink.lock()
+                    .unwrap()
+                    .push(serde_json::to_value(req).unwrap());
+                false
+            },
+        })))
+        .with_security_context(
+            toolkit_security::SecurityContext::builder()
+                .subject_id(Uuid::nil())
+                .subject_tenant_id(Uuid::nil())
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .await;
+    (harness, recorded)
+}
+
+/// The guard's `403` body at `instance`.
+fn refused_with_no_identity(instance: &str) -> serde_json::Value {
+    json!({
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~",
+        "title": "Permission Denied",
+        "status": 403,
+        "detail": "You do not have permission to perform this operation",
+        "instance": instance,
+        "context": {
+            "reason": "the caller has no identity: its subject or tenant is the nil UUID",
+            "resource_type": "gts.cf.core.events.request.v1~",
+        },
+    })
+}
+
+/// The ids of every stored consumer group, sorted, read from the repo so the
+/// read does not run as the nil caller.
+async fn stored_group_ids(harness: &EventBrokerHarness) -> Vec<String> {
+    let mut ids: Vec<String> = harness
+        .repo()
+        .list_consumer_groups()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|group| group.id.to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[tokio::test]
+async fn a_list_of_consumer_groups_by_a_caller_with_no_identity_is_refused_before_any_pdp_call_over_rest()
+ {
+    let (harness, pdp) = nil_caller_harness().await;
+
+    let resp = harness.api_v1().get_consumer_groups().send().await;
+
+    resp.assert_status(403);
+    assert_eq!(
+        resp.json(),
+        refused_with_no_identity("/event-broker/v1/consumer-groups")
+    );
+    assert_eq!(*pdp.lock().unwrap(), Vec::<serde_json::Value>::new());
+}
+
+#[tokio::test]
+async fn a_consumer_group_create_by_a_caller_with_no_identity_is_refused_before_any_pdp_call_over_rest()
+ {
+    let (harness, pdp) = nil_caller_harness().await;
+
+    let resp = harness
+        .api_v1()
+        .post_consumer_groups()
+        .with_body(Json(&json!({ "client_agent": "test-agent/1.0" })))
+        .send()
+        .await;
+
+    resp.assert_status(403);
+    assert_eq!(
+        resp.json(),
+        refused_with_no_identity("/event-broker/v1/consumer-groups")
+    );
+    assert_eq!(*pdp.lock().unwrap(), Vec::<serde_json::Value>::new());
+    assert_eq!(stored_group_ids(&harness).await, Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn a_consumer_group_delete_by_a_caller_with_no_identity_is_refused_before_any_pdp_call_over_rest()
+ {
+    let (harness, pdp) = nil_caller_harness().await;
+    harness
+        .repo()
+        .create_consumer_group(ConsumerGroup {
+            id: GtsInstanceId::try_new(NIL_CALLER_GROUP).unwrap(),
+            kind: ConsumerGroupKind::Anonymous,
+            tenant_id: Uuid::from_u128(0x3c01),
+            owner_principal_id: Uuid::from_u128(0x3c02),
+            description: None,
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let resp = harness
+        .api_v1()
+        .delete_consumer_group(NIL_CALLER_GROUP)
+        .send()
+        .await;
+
+    resp.assert_status(403);
+    assert_eq!(
+        resp.json(),
+        refused_with_no_identity(&format!(
+            "/event-broker/v1/consumer-groups/{NIL_CALLER_GROUP}"
+        ))
+    );
+    assert_eq!(*pdp.lock().unwrap(), Vec::<serde_json::Value>::new());
+    assert_eq!(
+        stored_group_ids(&harness).await,
+        vec![NIL_CALLER_GROUP.to_owned()]
+    );
+}
+
+/// A harness whose REST caller is a subject of `tenant`, and an anonymous
+/// group another subject of the same tenant created in process. Returns the
+/// harness and the group's id.
+async fn harness_with_a_group_created_by_another_principal(
+    tenant: Uuid,
+) -> (EventBrokerHarness, String) {
+    let harness = EventBrokerHarness::builder()
+        .with_security_context(
+            toolkit_security::SecurityContext::builder()
+                .subject_id(Uuid::from_u128(0x3613))
+                .subject_tenant_id(tenant)
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .await;
+    let creator = toolkit_security::SecurityContext::builder()
+        .subject_id(Uuid::from_u128(0x3611))
+        .subject_tenant_id(tenant)
+        .build()
+        .unwrap();
+    let group = harness
+        .delivery()
+        .create_consumer_group(
+            &creator,
+            crate::domain::model::ConsumerGroupCreateInput {
+                client_agent: Some("creator".to_owned()),
+                description: None,
+            },
+        )
+        .await
+        .expect("the group is created")
+        .id;
+    (harness, group.to_string())
+}
+
+#[tokio::test]
+async fn delete_by_another_principal_of_the_tenant_returns_403_consumer_group_not_owned() {
+    let (harness, id) =
+        harness_with_a_group_created_by_another_principal(Uuid::from_u128(0x3612)).await;
+
+    let resp = harness.api_v1().delete_consumer_group(&id).send().await;
+
+    resp.assert_status(403);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~",
+            "title": "Permission Denied",
+            "status": 403,
+            "detail": "You do not have permission to perform this operation",
+            "instance": format!("/event-broker/v1/consumer-groups/{id}"),
+            "context": {
+                "reason": format!("consumer group '{id}' was created by another principal"),
+                "resource_type": "gts.cf.core.events.consumer_group.v1~",
+            },
+        })
+    );
+    harness
+        .api_v1()
+        .get_consumer_group(&id)
+        .send()
+        .await
+        .assert_status(200);
 }

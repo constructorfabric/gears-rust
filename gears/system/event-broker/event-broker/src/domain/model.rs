@@ -1,8 +1,9 @@
-//! Domain entities (`DESIGN.md` §3.1 Domain Model). Shapes only - no
-//! persistence, validation, or transport concerns live here.
+//! Domain entities (`DESIGN.md` §3.1 Domain Model): their shapes, their wire
+//! tokens, and the checks that read only an entity and the caller
+//! (`Subscription::require_joiner`, `ConsumerGroup::require_owner`). No
+//! persistence lives here.
 
 use std::collections::HashMap;
-use std::num::NonZeroU32;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -11,8 +12,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use toolkit::domain_model;
 use toolkit_gts::GtsInstanceId;
+use toolkit_security::SecurityContext;
 use toolkit_utils::iso8601_duration::Iso8601Duration;
 
+use crate::domain::error::{DomainError, ErrorCode};
 use crate::domain::resolution::EffectiveSettings;
 use uuid::Uuid;
 
@@ -38,9 +41,10 @@ pub use event_broker_sdk::Sequence;
 /// broker holds it: what the registered instance says, and what this deployment
 /// resolved for it.
 ///
-/// The first three fields are the instance's own data, projected by
-/// [`crate::domain::projection::topic`]. `settings` is what that projection and
-/// configuration resolved to together
+/// `id`, `description` and `retention` are the instance's own data, projected
+/// by [`crate::domain::projection::topic`]; `uuid` is the instance's Registry
+/// Reference, which no API shape carries. `settings` is what that projection
+/// and configuration resolved to together
 /// ([`crate::domain::resolution::resolve`]), so a caller needing a partition
 /// count, a retention bound or a backend has one place to look and no second
 /// source to reconcile it against.
@@ -52,6 +56,9 @@ pub use event_broker_sdk::Sequence;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Topic {
     pub id: GtsInstanceId,
+    /// The topic's Registry Reference (`Instance.uuid`), stored at `bulk_load`;
+    /// never derived from `id`. It keys the topic's binding record.
+    pub uuid: Uuid,
     /// Required on the instance, so always present on a projected topic.
     pub description: String,
     /// What the topic itself declares, which is advisory: it is one tier of the
@@ -84,20 +91,47 @@ pub struct Event {
     /// resolves to. Present here so the outbox payload and every read-side
     /// consumer of an `Event` can name the log without re-resolving it.
     pub topic: GtsInstanceId,
-    pub tenant_id: Uuid,
+    pub subject_tenant: Uuid,
     pub source: String,
     pub subject: String,
     pub subject_type: GtsTypeId,
+    /// The principal that owns the event; `None` for a tenant-wide event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_owner: Option<Uuid>,
     pub occurred_at: DateTime<Utc>,
     pub trace_parent: Option<String>,
     pub data: JsonValue,
     /// Publish-input only; stripped on the read projection.
     pub meta: Option<Meta>,
+    /// Who published the event, stamped at ingest; `None` for an anonymous
+    /// publisher. Stored, never delivered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest: Option<IngestStamp>,
     /// Read-projection only; broker-derived.
     pub partition: Option<i32>,
     /// Read-projection only.
     pub sequence: Option<Sequence>,
     pub sequence_time: Option<DateTime<Utc>>,
+}
+
+/// The publisher of an event as ingest saw it: the caller's tenant and principal.
+/// Internal to the broker, for audit and limits.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestStamp {
+    pub tenant: Uuid,
+    pub actor: Uuid,
+}
+
+impl IngestStamp {
+    /// The stamp of a publish made as `ctx`; `None` for an anonymous context.
+    #[must_use]
+    pub fn of_caller(ctx: &SecurityContext) -> Option<Self> {
+        (!ctx.is_anonymous()).then(|| Self {
+            tenant: ctx.subject_tenant_id(),
+            actor: ctx.subject_id(),
+        })
+    }
 }
 
 /// Producer chain metadata. Publish-input only; stripped on read.
@@ -166,61 +200,41 @@ impl BarrierMode {
     }
 }
 
-/// How far below `Interest::tenant_id` a subscription's topic visibility
-/// reaches, bounded by [`BarrierMode`]. Aligned with
-/// `tenant_resolver_sdk::GetDescendantsOptions::max_depth`.
-///
-/// An enum rather than the wire's `max_depth: integer | null` because that
-/// shape overloads one field with three meanings - `0` for this tenant only,
-/// `n` for `n` levels of descendants, `null` for unbounded - and an
-/// `Option<u32>` in the domain would leave "unspecified" and "unlimited"
-/// indistinguishable at every use site.
+impl From<BarrierMode> for authz_resolver_sdk::BarrierMode {
+    fn from(mode: BarrierMode) -> Self {
+        match mode {
+            BarrierMode::Respect => Self::Respect,
+            BarrierMode::Ignore => Self::Ignore,
+        }
+    }
+}
+
+/// Which of the events a consume scope admits an interest reads, on top of
+/// that scope.
 #[domain_model]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum TenantTraversalDepth {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnershipFilter {
+    /// The caller's mailbox: events of the caller's own tenant whose
+    /// `subject_owner` is the caller. An unowned event never matches.
     #[default]
-    CurrentTenant,
-    Descendants(NonZeroU32),
-    UnlimitedDescendants,
+    OnlyMine,
+    /// Every event of the interest's tenant, owned or not.
+    EntireTenant,
+    /// Every event of the interest's tenant and of the tenants below it, as
+    /// far as the barrier mode and the consume scope reach.
+    TenantSubtreeIncluded,
 }
 
-impl TenantTraversalDepth {
-    /// Reconstructs the depth from the wire's tri-state `max_depth`: absent or
-    /// `Some(0)` is the current tenant, `Some(n)` is `n` levels, `None` (an
-    /// explicit JSON `null`) is unbounded.
+impl OwnershipFilter {
+    /// The value as the wire spells it.
     #[must_use]
-    pub fn from_max_depth(max_depth: Option<u32>) -> Self {
-        match max_depth {
-            None => Self::UnlimitedDescendants,
-            Some(0) => Self::CurrentTenant,
-            Some(depth) => NonZeroU32::new(depth).map_or(Self::CurrentTenant, Self::Descendants),
-        }
-    }
-
-    /// The wire's `max_depth`, inverse of [`Self::from_max_depth`].
-    #[must_use]
-    pub fn max_depth(self) -> Option<u32> {
+    pub fn as_wire(self) -> &'static str {
         match self {
-            Self::CurrentTenant => Some(0),
-            Self::Descendants(depth) => Some(depth.get()),
-            Self::UnlimitedDescendants => None,
+            Self::OnlyMine => "only_mine",
+            Self::EntireTenant => "entire_tenant",
+            Self::TenantSubtreeIncluded => "tenant_subtree_included",
         }
-    }
-}
-
-/// Round-trips through the wire's `max_depth` so a stored `Subscription` and a
-/// request body share one representation.
-impl Serialize for TenantTraversalDepth {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.max_depth().serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for TenantTraversalDepth {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Ok(Self::from_max_depth(Option::<u32>::deserialize(
-            deserializer,
-        )?))
     }
 }
 
@@ -228,20 +242,17 @@ impl<'de> Deserialize<'de> for TenantTraversalDepth {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Interest {
     pub topic: GtsInstanceId,
-    /// Authz-validated against the calling principal
-    /// (`DeliveryServiceImpl::join`'s `tenant_authorized` call,
-    /// `gears-rust#4516`) - a dedicated `authz-resolver` PEP check
-    /// (`domain::authz::TENANT_SCOPE_RESOURCE`), not a `tenant-resolver-sdk`
-    /// call.
-    pub tenant_id: Uuid,
-    /// Topic visibility below `tenant_id`. Carried and echoed, but not yet
-    /// expanded into a concrete tenant set - fan-out currently matches
-    /// `tenant_id` alone, so a depth other than `CurrentTenant` widens
-    /// nothing.
-    #[serde(default, rename = "max_depth")]
-    pub depth: TenantTraversalDepth,
-    /// Bounds `depth` at self-managed tenant boundaries. Inert for the same
-    /// reason `depth` is.
+    /// The tenant the interest reads, resolved at JOIN: the caller's tenant
+    /// when the request names none. Under `TenantSubtreeIncluded` it is the
+    /// root of the subtree read.
+    pub subject_tenant: Uuid,
+    /// Which events of the tenant (or subtree) the interest reads.
+    #[serde(default, rename = "ownership_filter")]
+    pub ownership: OwnershipFilter,
+    /// Whether the interest asks to read across a self-managed tenant
+    /// boundary. JOIN sends it as the tenant context's barrier mode, and for
+    /// `Ignore` first asks the PDP for `consume_ignore_barrier` on the topic.
+    /// No effect under `OnlyMine`, which reads only the caller's own tenant.
     #[serde(default)]
     pub barrier_mode: BarrierMode,
     /// Event-type selectors as canonical GTS patterns. A bare type id already
@@ -250,7 +261,36 @@ pub struct Interest {
     /// the cluster cache as strings via [`crate::domain::gts_pattern_serde`].
     #[serde(with = "crate::domain::gts_pattern_serde")]
     pub types: Vec<GtsIdPattern>,
+    /// Subject-type selectors as GTS patterns; empty for none. A delivery filter, not a grant.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        with = "crate::domain::gts_pattern_serde"
+    )]
+    pub subject_types: Vec<GtsIdPattern>,
     pub filter: Option<FilterSpec>,
+}
+
+/// The principal that joined a subscription: the subject, its tenant and its
+/// subject type, as the JOIN's `SecurityContext` carried them. The token scopes
+/// are left out, so the same principal holding another token is still the
+/// joiner. Kept in memory with the subscription and never sent on the wire.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Joiner {
+    pub subject: Uuid,
+    pub tenant: Uuid,
+    pub subject_type: Option<String>,
+}
+
+impl From<&SecurityContext> for Joiner {
+    fn from(ctx: &SecurityContext) -> Self {
+        Self {
+            subject: ctx.subject_id(),
+            tenant: ctx.subject_tenant_id(),
+            subject_type: ctx.subject_type().map(str::to_owned),
+        }
+    }
 }
 
 /// `gts.cf.core.events.subscription.v1~` - ephemeral consumer instance, held in
@@ -260,6 +300,8 @@ pub struct Interest {
 pub struct Subscription {
     pub id: Uuid,
     pub tenant_id: Uuid,
+    /// Only this principal may stream, seek or LEAVE the subscription.
+    pub joiner: Joiner,
     pub consumer_group: GtsInstanceId,
     pub client_agent: String,
     pub interests: Vec<Interest>,
@@ -276,6 +318,26 @@ pub struct Subscription {
     /// deterministic page position rather than one that depends on its random
     /// id.
     pub created_at: DateTime<Utc>,
+}
+
+impl Subscription {
+    /// Refuses a caller that is not the subscription's joiner. It reads only the
+    /// subscription and the caller, so it asks the PDP nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`DomainError::Forbidden`] with [`ErrorCode::SubscriptionNotOwned`] when
+    /// the caller's subject, tenant or subject type differs from the joiner's.
+    pub fn require_joiner(&self, ctx: &SecurityContext) -> Result<(), DomainError> {
+        if self.joiner != Joiner::from(ctx) {
+            return Err(DomainError::Forbidden {
+                code: ErrorCode::SubscriptionNotOwned,
+                message: format!("subscription '{}' was joined by another principal", self.id),
+                resource: self.id.to_string(),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[domain_model]
@@ -333,6 +395,35 @@ pub struct ConsumerGroup {
     pub owner_principal_id: Uuid,
     pub description: Option<String>,
     pub created_at: DateTime<Utc>,
+}
+
+impl ConsumerGroup {
+    /// Refuses a caller that is not the principal that created this anonymous
+    /// group: its subject in its tenant. The same subject in another tenant is
+    /// another principal. A named group is shared by permission, so it passes.
+    /// It reads only the group and the caller, so it asks the PDP nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`DomainError::Forbidden`] with [`ErrorCode::ConsumerGroupNotOwned`] when
+    /// the group is anonymous and the caller's subject is not its
+    /// `owner_principal_id` or the caller's tenant is not its `tenant_id`.
+    pub fn require_owner(&self, ctx: &SecurityContext) -> Result<(), DomainError> {
+        if self.kind == ConsumerGroupKind::Anonymous
+            && (ctx.subject_id() != self.owner_principal_id
+                || ctx.subject_tenant_id() != self.tenant_id)
+        {
+            return Err(DomainError::Forbidden {
+                code: ErrorCode::ConsumerGroupNotOwned,
+                message: format!(
+                    "consumer group '{}' was created by another principal",
+                    self.id
+                ),
+                resource: self.id.to_string(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Which consumer groups a listing keeps: the documented filterable fields,

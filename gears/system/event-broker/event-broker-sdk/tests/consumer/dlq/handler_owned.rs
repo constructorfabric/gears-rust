@@ -27,9 +27,9 @@ fn rejected_event() -> EventV1 {
         serde_json::json!({ "reject": true }),
     )
     .id(Uuid::from_u128(0xd1e_0001))
-    .tenant_id(Uuid::nil())
+    .subject_tenant(Uuid::nil())
     .subject("dlq-1")
-    .subject_type_id(event_type(gts_id!("x.eb.showcase.subject.v1~")))
+    .subject_type_of(event_type(gts_id!("x.eb.showcase.subject.v1~")))
     .occurred_at("2026-01-02T03:04:05Z".parse().unwrap())
     .build()
     .unwrap()
@@ -96,6 +96,9 @@ async fn if_i_want_permanent_failures_parked_i_do_it_in_the_handler() {
     let records = sink.records.clone();
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("showcase-dlq"))
         .topics([topic(TOPIC)])
         .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))

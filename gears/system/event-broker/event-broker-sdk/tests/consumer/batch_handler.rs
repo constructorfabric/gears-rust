@@ -61,6 +61,9 @@ async fn if_i_want_native_batches_they_stay_inside_one_partition() {
     let batches = Arc::new(Mutex::new(Vec::new()));
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("showcase-batch"))
         .topics([topic(TOPIC)])
         .batching(ConsumerBatching {
@@ -141,6 +144,9 @@ async fn a_batch_handler_sees_one_delivery_per_topic_partition_batch() {
     let placements = Placements::default();
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("showcase-batch-delivery"))
         .topics([topic(ORDERS_TOPIC), topic(AUDIT_TOPIC)])
         .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
@@ -154,10 +160,10 @@ async fn a_batch_handler_sees_one_delivery_per_topic_partition_batch() {
     for (id, event_type) in [(ORDER_ID, ORDERS_EVENT), (AUDIT_ID, AUDIT_EVENT)] {
         let event = EventV1::builder_for(GtsTypeId::new(event_type), json!({}))
             .id(id)
-            .tenant_id(fixture.ctx.subject_tenant_id())
+            .subject_tenant(fixture.ctx.subject_tenant_id())
             .source("batch-delivery")
             .subject("subject-1")
-            .subject_type_id(GtsTypeId::new(SHOWCASE_SUBJECT_TYPE))
+            .subject_type_of(GtsTypeId::new(SHOWCASE_SUBJECT_TYPE))
             .build()
             .expect("a valid event");
         fixture

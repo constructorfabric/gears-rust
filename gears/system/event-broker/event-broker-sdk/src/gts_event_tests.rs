@@ -82,7 +82,7 @@ fn published_body() -> serde_json::Value {
     json!({
         "id": EVENT_ID,
         "type": EVENT_TYPE,
-        "tenant_id": TENANT_ID,
+        "subject_tenant": TENANT_ID,
         "source": "orders-service",
         "subject": "order-1",
         "subject_type": SUBJECT_TYPE,
@@ -97,7 +97,7 @@ fn a_published_event_deserializes_without_its_server_stamped_members() {
 
     assert_eq!(event.id(), EVENT_ID);
     assert_eq!(event.event_type(), &GtsTypeId::new(EVENT_TYPE));
-    assert_eq!(event.tenant_id(), TENANT_ID);
+    assert_eq!(event.subject_tenant(), TENANT_ID);
     assert_eq!(event.source(), Some("orders-service"));
     assert_eq!(event.subject(), "order-1");
     assert_eq!(event.subject_type(), &GtsTypeId::new(SUBJECT_TYPE));
@@ -130,10 +130,11 @@ fn a_stored_event_round_trips_with_its_stamped_members() {
         json!({
             "id": EVENT_ID,
             "type": EVENT_TYPE,
-            "tenant_id": TENANT_ID,
+            "subject_tenant": TENANT_ID,
             "source": "orders-service",
             "subject": "order-1",
             "subject_type": SUBJECT_TYPE,
+            "subject_owner": null,
             "occurred_at": "2026-11-06T10:00:00Z",
             "trace_parent": null,
             "data": { "order_id": "o-1" },
@@ -154,10 +155,11 @@ fn an_unstamped_event_serializes_without_its_server_stamped_members() {
         json!({
             "id": EVENT_ID,
             "type": EVENT_TYPE,
-            "tenant_id": TENANT_ID,
+            "subject_tenant": TENANT_ID,
             "source": "orders-service",
             "subject": "order-1",
             "subject_type": SUBJECT_TYPE,
+            "subject_owner": null,
             "occurred_at": "2026-11-06T10:00:00Z",
             "trace_parent": null,
             "data": { "order_id": "o-1" },
@@ -205,7 +207,7 @@ fn debug_names_the_payload_type_but_never_prints_it() {
 fn a_typed_event_takes_its_type_from_the_payload() {
     let event = OrderPlaced::builder(order_placed())
         .id(EVENT_ID)
-        .tenant_id(TENANT_ID)
+        .subject_tenant(TENANT_ID)
         .source("orders-service")
         .subject("order-1")
         .subject_type::<OrderV1>()
@@ -220,10 +222,11 @@ fn a_typed_event_takes_its_type_from_the_payload() {
         json!({
             "id": EVENT_ID,
             "type": EVENT_TYPE,
-            "tenant_id": TENANT_ID,
+            "subject_tenant": TENANT_ID,
             "source": "orders-service",
             "subject": "order-1",
             "subject_type": SUBJECT_TYPE,
+            "subject_owner": null,
             "occurred_at": "2026-11-06T10:00:00Z",
             "trace_parent": TRACE,
             "data": { "order_id": ORDER_ID, "total_cents": 4299, "currency": "EUR", "coupon_code": null },
@@ -236,7 +239,7 @@ fn a_typed_event_takes_its_type_from_the_payload() {
 fn an_id_and_occurred_at_default_once_at_build() {
     let before = Utc::now();
     let event = OrderPlaced::builder(order_placed())
-        .tenant_id(TENANT_ID)
+        .subject_tenant(TENANT_ID)
         .subject("order-1")
         .subject_type::<OrderV1>()
         .build()
@@ -270,12 +273,12 @@ fn building_without_a_required_field_names_it() {
     else {
         panic!("an event without a tenant must be refused as an invalid field");
     };
-    assert_eq!((field, detail.as_str()), ("tenant_id", "required"));
+    assert_eq!((field, detail.as_str()), ("subject_tenant", "required"));
 
     let Err(EventBrokerError::InvalidEventField { field, detail }) =
         OrderPlaced::builder(order_placed())
             .id(EVENT_ID)
-            .tenant_id(TENANT_ID)
+            .subject_tenant(TENANT_ID)
             .source("orders-service")
             .subject_type::<OrderV1>()
             .occurred_at(occurred_at())
@@ -288,7 +291,7 @@ fn building_without_a_required_field_names_it() {
     let Err(EventBrokerError::InvalidEventField { field, detail }) =
         OrderPlaced::builder(order_placed())
             .id(EVENT_ID)
-            .tenant_id(TENANT_ID)
+            .subject_tenant(TENANT_ID)
             .source("orders-service")
             .subject("order-1")
             .occurred_at(occurred_at())
@@ -304,7 +307,7 @@ fn an_untyped_payload_needs_its_type_named() {
     let Err(EventBrokerError::InvalidEventField { field, detail }) =
         EventV1::builder(json!({ "k": 1 }))
             .id(EVENT_ID)
-            .tenant_id(TENANT_ID)
+            .subject_tenant(TENANT_ID)
             .source("orders-service")
             .subject("order-1")
             .subject_type::<OrderV1>()
@@ -317,7 +320,7 @@ fn an_untyped_payload_needs_its_type_named() {
 
     let named = EventV1::builder_for(GtsTypeId::new(EVENT_TYPE), json!({ "order_id": "o-1" }))
         .id(EVENT_ID)
-        .tenant_id(TENANT_ID)
+        .subject_tenant(TENANT_ID)
         .source("orders-service")
         .subject("order-1")
         .subject_type::<OrderV1>()
@@ -329,10 +332,11 @@ fn an_untyped_payload_needs_its_type_named() {
         json!({
             "id": EVENT_ID,
             "type": EVENT_TYPE,
-            "tenant_id": TENANT_ID,
+            "subject_tenant": TENANT_ID,
             "source": "orders-service",
             "subject": "order-1",
             "subject_type": SUBJECT_TYPE,
+            "subject_owner": null,
             "occurred_at": "2026-11-06T10:00:00Z",
             "trace_parent": null,
             "data": { "order_id": "o-1" },
@@ -342,7 +346,7 @@ fn an_untyped_payload_needs_its_type_named() {
 
     let body_less = EventV1::builder_without_data(GtsTypeId::new(EVENT_TYPE))
         .id(EVENT_ID)
-        .tenant_id(TENANT_ID)
+        .subject_tenant(TENANT_ID)
         .source("orders-service")
         .subject("order-1")
         .subject_type::<OrderV1>()
@@ -355,10 +359,11 @@ fn an_untyped_payload_needs_its_type_named() {
         json!({
             "id": EVENT_ID,
             "type": EVENT_TYPE,
-            "tenant_id": TENANT_ID,
+            "subject_tenant": TENANT_ID,
             "source": "orders-service",
             "subject": "order-1",
             "subject_type": SUBJECT_TYPE,
+            "subject_owner": null,
             "occurred_at": "2026-11-06T10:00:00Z",
             "trace_parent": null,
             "meta": null,
@@ -369,7 +374,7 @@ fn an_untyped_payload_needs_its_type_named() {
 #[test]
 fn a_subject_type_comes_from_a_declared_domain_type_or_an_id() {
     let declared = OrderPlaced::builder(order_placed())
-        .tenant_id(TENANT_ID)
+        .subject_tenant(TENANT_ID)
         .subject("order-1")
         .subject_type::<OrderV1>()
         .build()
@@ -377,9 +382,9 @@ fn a_subject_type_comes_from_a_declared_domain_type_or_an_id() {
     assert_eq!(declared.subject_type(), &GtsTypeId::new(SUBJECT_TYPE));
 
     let named = OrderPlaced::builder(order_placed())
-        .tenant_id(TENANT_ID)
+        .subject_tenant(TENANT_ID)
         .subject("order-1")
-        .subject_type_id(GtsTypeId::new("gts.acme.av.vendors.vendor.v1~"))
+        .subject_type_of(GtsTypeId::new("gts.acme.av.vendors.vendor.v1~"))
         .build()
         .unwrap();
     assert_eq!(
@@ -388,10 +393,10 @@ fn a_subject_type_comes_from_a_declared_domain_type_or_an_id() {
     );
 
     let last_wins = OrderPlaced::builder(order_placed())
-        .tenant_id(TENANT_ID)
+        .subject_tenant(TENANT_ID)
         .subject("order-1")
         .subject_type::<OrderV1>()
-        .subject_type_id(GtsTypeId::new("gts.acme.av.vendors.vendor.v1~"))
+        .subject_type_of(GtsTypeId::new("gts.acme.av.vendors.vendor.v1~"))
         .build()
         .unwrap();
     assert_eq!(
@@ -401,7 +406,7 @@ fn a_subject_type_comes_from_a_declared_domain_type_or_an_id() {
 
     let Err(EventBrokerError::InvalidEventField { field, detail }) =
         OrderPlaced::builder(order_placed())
-            .tenant_id(TENANT_ID)
+            .subject_tenant(TENANT_ID)
             .subject("order-1")
             .subject_type::<serde_json::Value>()
             .build()
@@ -415,7 +420,7 @@ fn a_subject_type_comes_from_a_declared_domain_type_or_an_id() {
 fn source_is_optional_and_checked_when_set() {
     let unsourced = OrderPlaced::builder(order_placed())
         .id(EVENT_ID)
-        .tenant_id(TENANT_ID)
+        .subject_tenant(TENANT_ID)
         .subject("order-1")
         .subject_type::<OrderV1>()
         .occurred_at(occurred_at())
@@ -427,9 +432,10 @@ fn source_is_optional_and_checked_when_set() {
         json!({
             "id": EVENT_ID,
             "type": EVENT_TYPE,
-            "tenant_id": TENANT_ID,
+            "subject_tenant": TENANT_ID,
             "subject": "order-1",
             "subject_type": SUBJECT_TYPE,
+            "subject_owner": null,
             "occurred_at": "2026-11-06T10:00:00Z",
             "trace_parent": null,
             "data": { "order_id": ORDER_ID, "total_cents": 4299, "currency": "EUR", "coupon_code": null },
@@ -438,7 +444,7 @@ fn source_is_optional_and_checked_when_set() {
     );
 
     let sourced = OrderPlaced::builder(order_placed())
-        .tenant_id(TENANT_ID)
+        .subject_tenant(TENANT_ID)
         .source("orders-service")
         .subject("order-1")
         .subject_type::<OrderV1>()
@@ -447,7 +453,7 @@ fn source_is_optional_and_checked_when_set() {
     assert_eq!(sourced.source(), Some("orders-service"));
 
     let Err(err) = OrderPlaced::builder(order_placed())
-        .tenant_id(TENANT_ID)
+        .subject_tenant(TENANT_ID)
         .source("x".repeat(257))
         .subject("order-1")
         .subject_type::<OrderV1>()
@@ -472,7 +478,7 @@ fn source_is_optional_and_checked_when_set() {
 #[test]
 fn subject_text_rules_apply_at_build() {
     let Err(err) = OrderPlaced::builder(order_placed())
-        .tenant_id(TENANT_ID)
+        .subject_tenant(TENANT_ID)
         .subject("")
         .subject_type::<OrderV1>()
         .build()
@@ -493,7 +499,7 @@ fn subject_text_rules_apply_at_build() {
     );
 
     let Err(err) = OrderPlaced::builder(order_placed())
-        .tenant_id(TENANT_ID)
+        .subject_tenant(TENANT_ID)
         .subject("PLANTED-\u{e9}")
         .subject_type::<OrderV1>()
         .build()
@@ -527,7 +533,7 @@ fn subject_text_rules_apply_at_build() {
 #[test]
 fn a_trace_parent_must_be_a_w3c_traceparent() {
     let traced = OrderPlaced::builder(order_placed())
-        .tenant_id(TENANT_ID)
+        .subject_tenant(TENANT_ID)
         .subject("order-1")
         .subject_type::<OrderV1>()
         .trace_parent(TRACE)
@@ -543,7 +549,7 @@ fn a_trace_parent_must_be_a_w3c_traceparent() {
     ] {
         let Err(EventBrokerError::InvalidEventField { field, detail }) =
             OrderPlaced::builder(order_placed())
-                .tenant_id(TENANT_ID)
+                .subject_tenant(TENANT_ID)
                 .subject("order-1")
                 .subject_type::<OrderV1>()
                 .trace_parent(invalid)
@@ -580,10 +586,10 @@ fn a_hand_declared_payload_keeps_its_own_field_names() {
         version: 3,
     })
     .id(EVENT_ID)
-    .tenant_id(TENANT_ID)
+    .subject_tenant(TENANT_ID)
     .source("catalog-service")
     .subject("sku-1")
-    .subject_type_id(GtsTypeId::new("gts.fabrikam.shop.catalog.sku.v1~"))
+    .subject_type_of(GtsTypeId::new("gts.fabrikam.shop.catalog.sku.v1~"))
     .occurred_at(occurred_at())
     .build()
     .unwrap();
@@ -597,10 +603,11 @@ fn a_hand_declared_payload_keeps_its_own_field_names() {
         json!({
             "id": EVENT_ID,
             "type": "gts.cf.core.events.event.v1~fabrikam.shop.catalog.sku_published.v1~",
-            "tenant_id": TENANT_ID,
+            "subject_tenant": TENANT_ID,
             "source": "catalog-service",
             "subject": "sku-1",
             "subject_type": "gts.fabrikam.shop.catalog.sku.v1~",
+            "subject_owner": null,
             "occurred_at": "2026-11-06T10:00:00Z",
             "trace_parent": null,
             "data": { "skuId": SKU_ID, "version": 3 },
@@ -670,10 +677,11 @@ fn decode_gives_a_typed_view_and_leaves_the_raw_event() {
         json!({
             "id": EVENT_ID,
             "type": EVENT_TYPE,
-            "tenant_id": TENANT_ID,
+            "subject_tenant": TENANT_ID,
             "source": "orders-service",
             "subject": "order-1",
             "subject_type": SUBJECT_TYPE,
+            "subject_owner": null,
             "occurred_at": "2026-11-06T10:00:00Z",
             "trace_parent": null,
             "data": { "order_id": ORDER_ID, "total_cents": 4299, "currency": "EUR", "coupon_code": null },
@@ -730,7 +738,11 @@ fn a_macro_payload_reads_every_field_as_present() {
     let Err(err) = absent else {
         panic!("an absent optional field must not decode");
     };
-    let EventBrokerError::Decode { type_id, category } = &err else {
+    let EventBrokerError::Decode {
+        event_type: type_id,
+        category,
+    } = &err
+    else {
         panic!("expected a decode error, got {err:?}");
     };
     assert_eq!(
@@ -754,10 +766,11 @@ fn a_body_less_event_decodes_without_data() {
         json!({
             "id": EVENT_ID,
             "type": EVENT_TYPE,
-            "tenant_id": TENANT_ID,
+            "subject_tenant": TENANT_ID,
             "source": "orders-service",
             "subject": "order-1",
             "subject_type": SUBJECT_TYPE,
+            "subject_owner": null,
             "occurred_at": "2026-11-06T10:00:00Z",
             "trace_parent": null,
             "meta": null,
@@ -787,7 +800,11 @@ fn data_that_does_not_fit_is_a_value_free_decode_error() {
         panic!("a total_cents that is not an integer must not decode");
     };
 
-    let EventBrokerError::Decode { type_id, category } = &err else {
+    let EventBrokerError::Decode {
+        event_type: type_id,
+        category,
+    } = &err
+    else {
         panic!("expected a decode error, got {err:?}");
     };
     assert_eq!(
@@ -822,7 +839,7 @@ fn a_hand_declared_payload_decodes_with_its_own_field_names() {
 fn a_typed_event_converts_to_its_raw_form() {
     let typed = OrderPlaced::builder(order_placed())
         .id(EVENT_ID)
-        .tenant_id(TENANT_ID)
+        .subject_tenant(TENANT_ID)
         .source("orders-service")
         .subject("order-1")
         .subject_type::<OrderV1>()
@@ -843,10 +860,11 @@ fn a_typed_event_converts_to_its_raw_form() {
         json!({
             "id": EVENT_ID,
             "type": EVENT_TYPE,
-            "tenant_id": TENANT_ID,
+            "subject_tenant": TENANT_ID,
             "source": "orders-service",
             "subject": "order-1",
             "subject_type": SUBJECT_TYPE,
+            "subject_owner": null,
             "occurred_at": "2026-11-06T10:00:00Z",
             "trace_parent": TRACE,
             "data": { "order_id": ORDER_ID, "total_cents": 4299, "currency": "EUR", "coupon_code": null },
@@ -862,17 +880,18 @@ fn a_cloned_event_keeps_every_member() {
     let event: EventV1 = serde_json::from_value(json!({
         "id": EVENT_ID,
         "type": EVENT_TYPE,
-        "tenant_id": TENANT_ID,
+        "subject_tenant": TENANT_ID,
         "source": "orders-service",
         "subject": "order-1",
         "subject_type": SUBJECT_TYPE,
+        "subject_owner": "01930000-0000-7000-8000-000000000006",
         "occurred_at": "2026-11-06T10:00:00Z",
         "trace_parent": TRACE,
         "data": { "order_id": "o-1" },
         "partition": 3,
         "sequence": 42,
         "sequence_time": "2026-11-06T10:00:01Z",
-        "meta": { "version": 1, "producer_id": PRODUCER_ID, "previous": 4, "sequence": 5 },
+        "meta": { "version": 1, "producer": PRODUCER_ID, "previous": 4, "sequence": 5 },
     }))
     .unwrap();
 
@@ -881,17 +900,18 @@ fn a_cloned_event_keeps_every_member() {
         json!({
             "id": EVENT_ID,
             "type": EVENT_TYPE,
-            "tenant_id": TENANT_ID,
+            "subject_tenant": TENANT_ID,
             "source": "orders-service",
             "subject": "order-1",
             "subject_type": SUBJECT_TYPE,
+            "subject_owner": "01930000-0000-7000-8000-000000000006",
             "occurred_at": "2026-11-06T10:00:00Z",
             "trace_parent": TRACE,
             "data": { "order_id": "o-1" },
             "partition": 3,
             "sequence": 42,
             "sequence_time": "2026-11-06T10:00:01Z",
-            "meta": { "version": 1, "producer_id": PRODUCER_ID, "previous": 4, "sequence": 5 },
+            "meta": { "version": 1, "producer": PRODUCER_ID, "previous": 4, "sequence": 5 },
         })
     );
 }
@@ -910,14 +930,16 @@ fn the_raw_event_resolves_a_partition_key_as_the_backend_record_does() {
     let event = published_with_data(data.clone());
     let record = models::Event {
         id: EVENT_ID,
-        type_id: GtsTypeId::new(EVENT_TYPE),
-        tenant_id: TENANT_ID,
+        event_type: GtsTypeId::new(EVENT_TYPE),
+        subject_tenant: TENANT_ID,
         source: "orders-service".to_owned(),
         subject: "order-1".to_owned(),
         subject_type: GtsTypeId::new(SUBJECT_TYPE),
+        subject_owner: None,
         occurred_at: occurred_at(),
         trace_parent: None,
         data: Some(data),
+        ingest: None,
         partition: None,
         sequence: None,
         sequence_time: None,
@@ -929,7 +951,7 @@ fn the_raw_event_resolves_a_partition_key_as_the_backend_record_does() {
         Err(other) => panic!("expected an `Internal` error, got {other:?}"),
     };
     let pointers = [
-        "/tenant_id",
+        "/subject_tenant",
         "/subject",
         "/type",
         "/data/order_id",
@@ -991,10 +1013,11 @@ fn stamping_a_position_sets_the_three_server_members() {
         json!({
             "id": EVENT_ID,
             "type": EVENT_TYPE,
-            "tenant_id": TENANT_ID,
+            "subject_tenant": TENANT_ID,
             "source": "orders-service",
             "subject": "order-1",
             "subject_type": SUBJECT_TYPE,
+            "subject_owner": null,
             "occurred_at": "2026-11-06T10:00:00Z",
             "trace_parent": null,
             "data": { "order_id": "o-1" },
@@ -1009,10 +1032,10 @@ fn stamping_a_position_sets_the_three_server_members() {
 #[test]
 fn check_publishable_refuses_stamped_members_and_a_missing_source() {
     let built = EventV1::builder_for(GtsTypeId::new(EVENT_TYPE), json!({ "order_id": "o-1" }))
-        .tenant_id(TENANT_ID)
+        .subject_tenant(TENANT_ID)
         .source("orders-service")
         .subject("order-1")
-        .subject_type_id(GtsTypeId::new(SUBJECT_TYPE))
+        .subject_type_of(GtsTypeId::new(SUBJECT_TYPE))
         .build()
         .unwrap();
     built.check_publishable().unwrap();
@@ -1041,9 +1064,9 @@ fn check_publishable_refuses_stamped_members_and_a_missing_source() {
 #[test]
 fn check_producer_input_refuses_stamped_members_meta_and_a_source() {
     let built = EventV1::builder_for(GtsTypeId::new(EVENT_TYPE), json!({ "order_id": "o-1" }))
-        .tenant_id(TENANT_ID)
+        .subject_tenant(TENANT_ID)
         .subject("order-1")
-        .subject_type_id(GtsTypeId::new(SUBJECT_TYPE))
+        .subject_type_of(GtsTypeId::new(SUBJECT_TYPE))
         .build()
         .unwrap();
     built.check_producer_input().unwrap();
@@ -1059,7 +1082,7 @@ fn check_producer_input_refuses_stamped_members_meta_and_a_source() {
 
     let mut with_meta = published_without_source();
     with_meta["meta"] =
-        json!({ "version": 1, "producer_id": null, "previous": null, "sequence": null });
+        json!({ "version": 1, "producer": null, "previous": null, "sequence": null });
     let with_meta: EventV1 = serde_json::from_value(with_meta).unwrap();
     let Err(EventBrokerError::InvalidEventField { field, detail }) =
         with_meta.check_producer_input()
@@ -1084,10 +1107,10 @@ fn check_producer_input_refuses_stamped_members_meta_and_a_source() {
 fn published_builder() -> EventV1Builder<serde_json::Value> {
     EventV1::builder_for(GtsTypeId::new(EVENT_TYPE), json!({ "order_id": "o-1" }))
         .id(EVENT_ID)
-        .tenant_id(TENANT_ID)
+        .subject_tenant(TENANT_ID)
         .source("orders-service")
         .subject("order-1")
-        .subject_type_id(GtsTypeId::new(SUBJECT_TYPE))
+        .subject_type_of(GtsTypeId::new(SUBJECT_TYPE))
         .occurred_at(occurred_at())
 }
 
@@ -1210,11 +1233,11 @@ fn an_event_counts_its_whole_json_form_and_one_byte_over_the_limit_is_too_large(
 }
 
 /// A deduplicating producer later stamps `meta` in place of the event's `null`, so it
-/// counts its largest stamp, 124 bytes more; a stateless one stamps none.
+/// counts its largest stamp, 121 bytes more; a stateless one stamps none.
 #[test]
 fn a_deduplicating_producer_counts_the_largest_meta_it_stamps() {
-    let fits_stamped = event_of(EventV1::MAX_ENCODED_BYTES - 124);
-    let over_stamped = event_of(EventV1::MAX_ENCODED_BYTES - 123);
+    let fits_stamped = event_of(EventV1::MAX_ENCODED_BYTES - 121);
+    let over_stamped = event_of(EventV1::MAX_ENCODED_BYTES - 120);
     let at_limit = event_of(EventV1::MAX_ENCODED_BYTES);
 
     for mode in [ProducerMode::Chained, ProducerMode::Monotonic] {
@@ -1249,4 +1272,97 @@ fn a_partition_key_counts_its_escaped_form_and_one_byte_over_the_cap_is_too_long
     assert!(EventV1::check_partition_key(&"\"".repeat(512)).is_ok());
     assert!(EventV1::check_partition_key(&"\u{1}".repeat(170)).is_ok());
     assert_eq!(refused, [(1025, 1024), (1026, 1024), (1026, 1024)]);
+}
+
+// -- subject_owner -------------------------------------------------------------
+
+const OWNER_ID: Uuid = Uuid::from_u128(0x0193_0000_0000_7000_8000_0000_0000_0006);
+
+/// An event the builder leaves without an owner is tenant-wide: the getter is `None`
+/// and the macro writes the member as `null`.
+#[test]
+fn a_built_event_has_no_owner_unless_one_is_set() {
+    let unowned = published_builder().build().unwrap();
+    let owned = published_builder().subject_owner(OWNER_ID).build().unwrap();
+
+    assert_eq!(
+        (unowned.subject_owner(), owned.subject_owner()),
+        (None, Some(OWNER_ID))
+    );
+    assert_eq!(
+        serde_json::to_value(&owned).unwrap(),
+        json!({
+            "id": EVENT_ID,
+            "type": EVENT_TYPE,
+            "subject_tenant": TENANT_ID,
+            "source": "orders-service",
+            "subject": "order-1",
+            "subject_type": SUBJECT_TYPE,
+            "subject_owner": "01930000-0000-7000-8000-000000000006",
+            "occurred_at": "2026-11-06T10:00:00Z",
+            "trace_parent": null,
+            "data": { "order_id": "o-1" },
+            "meta": null,
+        })
+    );
+}
+
+/// The nil UUID is not an owner: the builder refuses it, and so does
+/// `check_envelope` for a decoded event carrying it.
+#[test]
+fn a_nil_owner_is_refused_by_the_builder_and_the_envelope_check() {
+    let built = published_builder().subject_owner(Uuid::nil()).build();
+    let decoded = published_with("subject_owner", json!(Uuid::nil())).check_envelope();
+
+    for (path, outcome) in [("built", built.map(|_| ())), ("decoded", decoded)] {
+        let Err(EventBrokerError::InvalidEventField { field, detail }) = outcome else {
+            panic!("{path}: a nil owner must be refused, got {outcome:?}");
+        };
+        assert_eq!(
+            (field, detail.as_str()),
+            ("subject_owner", "must not be the nil UUID"),
+            "{path}"
+        );
+    }
+}
+
+/// `/subject_owner` resolves on both addressable maps to the owner, and to `null`,
+/// which is refused, on an unowned event.
+#[test]
+fn an_owner_pointer_resolves_on_both_addressable_maps() {
+    let record = |owner: Option<Uuid>| models::Event {
+        id: EVENT_ID,
+        event_type: GtsTypeId::new(EVENT_TYPE),
+        subject_tenant: TENANT_ID,
+        source: "orders-service".to_owned(),
+        subject: "order-1".to_owned(),
+        subject_type: GtsTypeId::new(SUBJECT_TYPE),
+        subject_owner: owner,
+        occurred_at: occurred_at(),
+        trace_parent: None,
+        data: None,
+        partition: None,
+        sequence: None,
+        sequence_time: None,
+        meta: None,
+        ingest: None,
+    };
+    let owned = published_builder().subject_owner(OWNER_ID).build().unwrap();
+    let unowned = published_builder().build().unwrap();
+    let key = |result: Result<String, EventBrokerError>| result.map_err(|err| err.to_string());
+
+    assert_eq!(
+        [
+            key(owned.partition_input("/subject_owner")),
+            key(record(Some(OWNER_ID)).partition_input("/subject_owner")),
+            key(unowned.partition_input("/subject_owner")),
+            key(record(None).partition_input("/subject_owner")),
+        ],
+        [
+            Ok("01930000-0000-7000-8000-000000000006".to_owned()),
+            Ok("01930000-0000-7000-8000-000000000006".to_owned()),
+            Err("internal: partition-key pointer `/subject_owner` resolves to null".to_owned()),
+            Err("internal: partition-key pointer `/subject_owner` resolves to null".to_owned()),
+        ]
+    );
 }

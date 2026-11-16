@@ -7,17 +7,20 @@
 --     INSERT IGNORE INTO evbk__log (...) VALUES (...)
 --     SELECT log_id, partitions FROM evbk__log WHERE topic_uuid = ? FOR UPDATE
 --     UPDATE evbk__log SET log_id = ?, max_age_ms = ?, max_bytes = ? WHERE topic_uuid = ?
---   topic lookup, once per topic per process (cached), on any operation:
---     SELECT topic_id, partitions FROM evbk__log WHERE topic_uuid = ?
+--   topic lookup, once per topic per process (cached), on any operation, by uq_evbk__log__topic_id:
+--     SELECT topic_uuid, topic_id, partitions FROM evbk__log WHERE topic_id = ?
 --   joined by the maintenance (per run) and the rescan (full scan) for the bounds (see evbk__partition)
 CREATE TABLE evbk__log (                               -- one row per provisioned topic
-    topic_uuid     BINARY(16)    NOT NULL PRIMARY KEY,  -- GtsId::to_uuid(topic)
-    topic_id       VARCHAR(1024) NOT NULL,
+    topic_uuid     BINARY(16)    NOT NULL PRIMARY KEY,  -- TopicSpec.uuid (Registry Reference)
+    -- A GTS id is ASCII (gts-id admits [a-z0-9_] tokens, '.', '~' and a hex UUID
+    -- tail), so one byte a character keeps the key at 1,024 bytes, under InnoDB's 3,072.
+    topic_id       VARCHAR(1024) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
     log_id         BINARY(16)    NOT NULL,              -- feature 0006
     partitions     INT           NOT NULL,              -- at most 9999 (table naming)
     max_age_ms     BIGINT        NULL,                  -- NULL = unbounded
     max_bytes      BIGINT        NULL,                  -- per partition; NULL = unbounded
-    provisioned_at DATETIME(6)   NOT NULL               -- UTC
+    provisioned_at DATETIME(6)   NOT NULL,              -- UTC
+    UNIQUE KEY uq_evbk__log__topic_id (topic_id)        -- one row per topic; the topic lookup
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_bin;
 
 -- Queries:

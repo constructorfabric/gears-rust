@@ -7,7 +7,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use event_broker_sdk::consumer::ConsumerHandle;
-use event_broker_sdk::{Ack, ConsumerError, ConsumerRuntimeEvent, EventBrokerApi, SubscriptionId};
+use event_broker_sdk::{
+    Ack, ConsumerError, ConsumerGroupId, ConsumerGroupQuery, ConsumerRuntimeEvent, EventBrokerApi,
+    SubscriptionId,
+};
 use uuid::Uuid;
 
 use super::common::{TopicFixture, two_partition_event};
@@ -51,13 +54,17 @@ pub(super) struct FaultRun {
     runtime_events: Vec<ConsumerRuntimeEvent>,
     /// The subscriptions left before the consumer was stopped.
     pub(super) leave_calls: Vec<SubscriptionId>,
+    /// The one consumer group the broker holds by the stop: the one it created for
+    /// the consumer's alias.
+    pub(super) group: ConsumerGroupId,
 }
 
 impl FaultRun {
     /// Starts `consumer` on `faulty`, whose first stream breaks off, waits for the
     /// re-join, publishes the two `event_type` events and records what the handler
-    /// was handed within `BOUND` of that, the runtime events and the subscriptions
-    /// left before the stop (whose own leave is not counted).
+    /// was handed within `BOUND` of that, the runtime events, the subscriptions left
+    /// before the stop (whose own leave is not counted), and the one consumer group
+    /// the broker holds by then; a run fails if it holds any other number.
     pub(super) async fn after_a_first_stream_fault(
         fx: &TopicFixture,
         event_type: &str,
@@ -137,30 +144,39 @@ impl FaultRun {
         let mut handled = handled.lock().unwrap().clone();
         handled.sort_by_key(|&(_, partition, _)| partition);
         let runtime_events = runtime_events.lock().unwrap().clone();
+        let groups = fx
+            .broker
+            .list_consumer_groups(&fx.ctx, ConsumerGroupQuery::default())
+            .await
+            .expect("consumer groups listed");
+        let [group] = groups.items.as_slice() else {
+            panic!("expected the consumer's one group, saw {:?}", groups.items);
+        };
         let run = Self {
             placements: handled,
             runtime_events,
             leave_calls: left_before_stop,
+            group: group.id,
         };
         (run, stopped)
     }
 
-    /// The subscription the one re-join replaced.
-    pub(super) fn rejoined_from(&self) -> SubscriptionId {
-        let rejoins: Vec<SubscriptionId> = self
+    /// The group and the replaced subscription the one re-join reported.
+    pub(super) fn rejoin(&self) -> (ConsumerGroupId, SubscriptionId) {
+        let rejoins: Vec<(ConsumerGroupId, SubscriptionId)> = self
             .runtime_events
             .iter()
             .filter_map(|event| match event {
                 ConsumerRuntimeEvent::SubscriptionRejoining {
-                    previous_subscription_id,
-                    ..
-                } => Some(*previous_subscription_id),
+                    consumer_group,
+                    previous_subscription,
+                } => Some((*consumer_group, *previous_subscription)),
                 _ => None,
             })
             .collect();
-        let [previous] = rejoins.as_slice() else {
+        let [rejoin] = rejoins.as_slice() else {
             panic!("expected one re-join, saw {rejoins:?}");
         };
-        *previous
+        *rejoin
     }
 }

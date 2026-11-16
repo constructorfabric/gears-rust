@@ -7,7 +7,7 @@ use uuid::Uuid;
 use super::*;
 use crate::error::EventBrokerError;
 use crate::gts::{EventV1, StoredPosition};
-use crate::ids::{ConsumerGroupId, EventTypeId, TopicId};
+use crate::ids::{ConsumerGroupId, EventTypeId};
 use gts::{GtsIdPattern, GtsInstanceId};
 
 fn ginst(id: impl AsRef<str>) -> GtsInstanceId {
@@ -45,18 +45,14 @@ impl ConsumerRuntimeListener for NoOffsetDecisionRuntimeListener {
 
 #[test]
 fn uuid_identity_newtypes_preserve_uuid_values() {
-    let topic_uuid = Uuid::new_v4();
     let event_type_uuid = Uuid::new_v4();
     let group_uuid = Uuid::new_v4();
 
-    let topic_id = TopicId::new(topic_uuid);
     let event_type_id = EventTypeId::new(event_type_uuid);
     let group_id = ConsumerGroupId::new(group_uuid);
 
-    assert_eq!(topic_id.as_uuid(), topic_uuid);
     assert_eq!(event_type_id.as_uuid(), event_type_uuid);
     assert_eq!(group_id.as_uuid(), group_uuid);
-    assert_eq!(topic_id.to_string(), topic_uuid.to_string());
     assert_eq!(event_type_id.to_string(), event_type_uuid.to_string());
     assert_eq!(group_id.to_string(), group_uuid.to_string());
 }
@@ -83,9 +79,9 @@ fn stamped_event(offset: i64) -> EventV1 {
         serde_json::json!({ "order_id": "order-1" }),
     )
     .id(Uuid::from_u128(u128::try_from(offset).unwrap()))
-    .tenant_id(Uuid::nil())
+    .subject_tenant(Uuid::nil())
     .subject("order-1")
-    .subject_type_id(gts::GtsTypeId::new("gts.x.eb.test.subject.v1~"))
+    .subject_type_of(gts::GtsTypeId::new("gts.x.eb.test.subject.v1~"))
     .occurred_at("2026-01-02T03:04:05Z".parse().unwrap())
     .build()
     .unwrap()
@@ -98,20 +94,17 @@ fn stamped_event(offset: i64) -> EventV1 {
 
 #[test]
 fn dead_letter_record_exposes_context_fields_for_diagnosis_and_replay() {
-    let group_id = ConsumerGroupId::new(Uuid::from_u128(0x7e57_0001));
+    let consumer_group = ConsumerGroupId::new(Uuid::from_u128(0x7e57_0001));
     let topic = gts_id!("cf.core.events.topic.v1~example.orders.x.x.v1");
-    let topic_id = TopicId::from_gts(topic);
     let raw = stamped_event(42);
     let delivery = Delivery::new(ginst(topic), 3, 1);
 
     let record = crate::dlq::DeadLetterRecord::builder(&raw, &delivery, "schema mismatch")
-        .group_id(group_id)
-        .topic_id(topic_id)
+        .consumer_group(consumer_group)
         .attempts(2)
         .build();
 
-    assert_eq!(record.group_id, Some(group_id));
-    assert_eq!(record.topic_id, Some(topic_id));
+    assert_eq!(record.consumer_group, Some(consumer_group));
     assert_eq!(record.topic, topic);
     assert_eq!(record.partition, 3);
     assert_eq!(record.offset, Sequence::assigned(42));

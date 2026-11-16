@@ -123,7 +123,7 @@ async def test_list_event_types_returns_paged_list(api):
                 "topic": TOPIC_STREAM,
                 "description": None,
                 "allowed_subject_types": [SUBJECT_TYPE],
-                "partition_key": "/tenant_id",
+                "partition_key": "/subject_tenant",
                 "data_schema": {
                     "allOf": [
                         {"type": ["object", "null"]},

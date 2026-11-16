@@ -7,6 +7,7 @@ use event_broker_sdk::backend::{Provider, Role};
 use memory_event_broker_plugin::MemoryBackendProvider;
 use serde_json::json;
 use toolkit_gts::GtsInstanceId;
+use uuid::Uuid;
 
 use super::{BuildError, Registry};
 use crate::config::checks::{self, Deployment};
@@ -49,6 +50,7 @@ fn topic(cfg: &EventBrokerConfig, id: &str) -> Topic {
     let settings = resolve(cfg, &routing, &id, &Declaration::default()).expect("resolves");
     Topic {
         id,
+        uuid: Uuid::from_u128(0x7012),
         description: "a topic".to_owned(),
         retention: None,
         settings,

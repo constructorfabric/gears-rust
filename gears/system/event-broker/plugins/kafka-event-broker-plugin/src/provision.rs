@@ -6,13 +6,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use event_broker_sdk::backend::support::topic_uuid;
+use event_broker_sdk::GtsInstanceId;
 use event_broker_sdk::backend::{BackendError, LogClaim, Provisioning, Stored, TopicSpec};
 use rdkafka::admin::{AlterConfig, NewTopic, ResourceSpecifier, TopicReplication};
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use tokio::sync::watch;
-use uuid::Uuid;
 
 use crate::clients::{self, Admin};
 use crate::error::{self, Operation};
@@ -81,12 +80,13 @@ pub struct Job {
     answer: watch::Receiver<Option<Result<Provisioning, BackendError>>>,
 }
 
-/// The jobs of an instance, by topic uuid.
-pub type Jobs = Mutex<HashMap<Uuid, Job>>;
+/// The jobs of an instance, by topic.
+pub type Jobs = Mutex<HashMap<GtsInstanceId, Job>>;
 
 /// Claims the topic's log for `claim` and creates its Kafka topic; refused
-/// per [`LogClaim::check`]. A `Held` claim never creates: with no log record,
-/// or with the record but no Kafka event topic, it answers `NotProvisioned`.
+/// per [`LogClaim::check`], and `Internal` when the topic's log record names
+/// another reference. A `Held` claim never creates: with no log record, or
+/// with the record but no Kafka event topic, it answers `NotProvisioned`.
 ///
 /// The work runs as a task of the instance, not in the caller's future: a
 /// caller that gives up (the gear bounds startup provisioning) cancels
@@ -105,19 +105,19 @@ pub async fn provision(
         )));
     }
     shared.check_running(OP)?;
-    let topic = topic_uuid(&spec.topic);
+    let topic = &spec.topic;
     let mut answer = {
         let mut jobs = shared
             .provisions
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        match jobs.get(&topic) {
+        match jobs.get(topic) {
             Some(job) if job.spec == *spec && job.claim == *claim => job.answer.clone(),
             Some(job) if job.answer.borrow().is_none() => return Ok(Provisioning::Pending),
             _ => {
-                let answer = spawn_job(shared, topic, spec.clone(), *claim);
+                let answer = spawn_job(shared, spec.clone(), *claim);
                 jobs.insert(
-                    topic,
+                    topic.clone(),
                     Job {
                         spec: spec.clone(),
                         claim: *claim,
@@ -148,17 +148,16 @@ pub async fn provision(
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     if jobs
-        .get(&topic)
+        .get(topic)
         .is_some_and(|job| job.answer.same_channel(&answer))
     {
-        jobs.remove(&topic);
+        jobs.remove(topic);
     }
     result
 }
 
 fn spawn_job(
     shared: &Arc<Shared>,
-    topic: Uuid,
     spec: TopicSpec,
     claim: LogClaim,
 ) -> watch::Receiver<Option<Result<Provisioning, BackendError>>> {
@@ -167,7 +166,7 @@ fn spawn_job(
     tokio::spawn(async move {
         let result = match shared.enter_owned(OP) {
             Ok(in_flight) => {
-                let result = attempt(&shared, topic, &spec, &claim).await;
+                let result = attempt(&shared, &spec, &claim).await;
                 drop(in_flight);
                 result
             }
@@ -182,21 +181,20 @@ fn spawn_job(
 /// One provisioning attempt, start to end.
 async fn attempt(
     shared: &Shared,
-    topic: Uuid,
     spec: &TopicSpec,
     claim: &LogClaim,
 ) -> Result<Provisioning, BackendError> {
     shared.ensure_internal(OP).await?;
-    let name = names::event_topic(&shared.settings.topic_prefix, topic);
-    let id = names::log_transaction(&shared.settings.topic_prefix, topic);
-    // Fences every other provisioning of this topic until it is dropped.
+    let name = names::event_topic(&shared.settings.topic_prefix, spec.uuid);
+    let id = names::log_transaction(&shared.settings.topic_prefix, spec.uuid);
+    // Fences every other provisioning of this topic's reference until it is dropped.
     let budget = shared.settings.request_timeout * OPEN_BUDGET_TIMEOUTS;
     let producer = fence::open_producer(shared, &id, OP, budget).await?;
     let (provisioning, partitions) =
         claimed(shared, spec, claim, &name, producer.producer()).await?;
     if let Provisioning::Ready { .. } = provisioning {
         shared.remember(
-            topic,
+            &spec.topic,
             KnownTopic {
                 name: Arc::from(name),
                 partitions,
@@ -213,10 +211,20 @@ async fn claimed(
     name: &str,
     producer: &Arc<FutureProducer>,
 ) -> Result<(Provisioning, u32), BackendError> {
-    let topic = topic_uuid(&spec.topic);
-    let key = log_key(topic);
+    let key = log_key(&spec.topic);
     let mut logs = shared.logs(OP).await?;
     let stored = logs.get(&key).and_then(LogRecord::decode);
+    // The registry hands out one reference per topic, so a record naming
+    // another one is a broken invariant: refused before the Kafka topic is
+    // created or the record written.
+    if stored
+        .as_ref()
+        .is_some_and(|record| record.uuid != spec.uuid)
+    {
+        return Err(BackendError::Internal(format!(
+            "{OP}: the topic's log record names another reference"
+        )));
+    }
     claim.check(
         OP.name(),
         stored
@@ -237,7 +245,7 @@ async fn claimed(
         return Ok((Provisioning::Pending, 0));
     }
     reconfigure(shared, &admin, spec, name).await?;
-    let record = LogRecord::new(spec.topic.as_ref(), claim.new, partitions);
+    let record = LogRecord::new(&spec.topic, spec.uuid, claim.new, partitions);
     if stored.as_ref() != Some(&record) {
         let value = record.encode();
         write_record(shared, producer, &key, &value)

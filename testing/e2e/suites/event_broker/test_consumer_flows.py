@@ -60,7 +60,7 @@ async def test_two_consumer_rebalance(api, test_env):
             json={
                 "consumer_group": group_id,
                 "client_agent": "consumer-a",
-                "interests": [{"topic": TOPIC_4P, "tenant_id": tenant_id, "types": [EVENT_TYPE_4P]}],
+                "interests": [{"topic": TOPIC_4P, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_4P]}],
             },
         )
         assert sub_a_resp.status_code == 201
@@ -78,7 +78,7 @@ async def test_two_consumer_rebalance(api, test_env):
 
     # Open A's stream.
     async with httpx.AsyncClient(base_url=base_url, timeout=None) as stream_a:
-        async with stream_a.stream("GET", f"/events:sse?subscription_id={sub_a_id}") as resp_a:
+        async with stream_a.stream("GET", f"/events:sse?subscription={sub_a_id}") as resp_a:
             assert resp_a.status_code == 200
             reader_a = SseFrameReader(resp_a)
             kind, _ = await reader_a.next_frame(timeout=5)
@@ -91,7 +91,7 @@ async def test_two_consumer_rebalance(api, test_env):
                     json={
                         "consumer_group": group_id,
                         "client_agent": "consumer-b",
-                        "interests": [{"topic": TOPIC_4P, "tenant_id": tenant_id, "types": [EVENT_TYPE_4P]}],
+                        "interests": [{"topic": TOPIC_4P, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_4P]}],
                     },
                 )
                 assert sub_b_resp.status_code == 201
@@ -134,7 +134,7 @@ async def test_positions_not_set_recovery(api):
             json={
                 "consumer_group": group_id,
                 "client_agent": "e2e-test",
-                "interests": [{"topic": TOPIC_STREAM, "tenant_id": tenant_id, "types": [EVENT_TYPE_STREAM]}],
+                "interests": [{"topic": TOPIC_STREAM, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_STREAM]}],
             },
         )
         assert sub_resp.status_code == 201
@@ -143,7 +143,7 @@ async def test_positions_not_set_recovery(api):
 
         # Step 1: try streaming without seek → 409.
         bad_resp = await client.get(
-            f"/events:stream?subscription_id={sub_id}",
+            f"/events:stream?subscription={sub_id}",
             headers={"Accept": "multipart/mixed"},
         )
         assert bad_resp.status_code == 409
@@ -176,7 +176,7 @@ async def test_positions_not_set_recovery(api):
         # Step 3: stream now succeeds - open it, check the status, close it.
         async with client.stream(
             "GET",
-            f"/events:stream?subscription_id={sub_id}",
+            f"/events:stream?subscription={sub_id}",
             headers={"Accept": "multipart/mixed"},
         ) as stream_resp:
             assert stream_resp.status_code == 200
@@ -205,7 +205,7 @@ async def test_path_a_consumer_reconnects_from_exact_offset(api, test_env):
             json={
                 "consumer_group": group_id,
                 "client_agent": "e2e-test",
-                "interests": [{"topic": TOPIC_STREAM, "tenant_id": tenant_id, "types": [EVENT_TYPE_STREAM]}],
+                "interests": [{"topic": TOPIC_STREAM, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_STREAM]}],
             },
         )
         assert sub_resp.status_code == 201
@@ -219,7 +219,7 @@ async def test_path_a_consumer_reconnects_from_exact_offset(api, test_env):
 
     event_id = str(uuid.uuid4())
     async with httpx.AsyncClient(base_url=base_url, timeout=None) as stream_client:
-        async with stream_client.stream("GET", f"/events:sse?subscription_id={sub_id}") as resp:
+        async with stream_client.stream("GET", f"/events:sse?subscription={sub_id}") as resp:
             assert resp.status_code == 200
             reader = SseFrameReader(resp)
             _, _ = await reader.next_frame(timeout=5)  # topology
@@ -231,7 +231,7 @@ async def test_path_a_consumer_reconnects_from_exact_offset(api, test_env):
                     json={
                         "id": event_id,
                         "type": EVENT_TYPE_STREAM,
-                        "tenant_id": tenant_id,
+                        "subject_tenant": tenant_id,
                         "source": "e2e-test",
                         "subject": "s1",
                         "subject_type": SUBJECT_TYPE,
@@ -253,7 +253,7 @@ async def test_path_a_consumer_reconnects_from_exact_offset(api, test_env):
             json={
                 "consumer_group": group_id,
                 "client_agent": "e2e-test",
-                "interests": [{"topic": TOPIC_STREAM, "tenant_id": tenant_id, "types": [EVENT_TYPE_STREAM]}],
+                "interests": [{"topic": TOPIC_STREAM, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_STREAM]}],
             },
         )
         assert sub2_resp.status_code == 201
@@ -269,7 +269,7 @@ async def test_path_a_consumer_reconnects_from_exact_offset(api, test_env):
     # Publish a second event to verify the stream position is correct.
     event2_id = str(uuid.uuid4())
     async with httpx.AsyncClient(base_url=base_url, timeout=None) as stream_client:
-        async with stream_client.stream("GET", f"/events:sse?subscription_id={sub2_id}") as resp:
+        async with stream_client.stream("GET", f"/events:sse?subscription={sub2_id}") as resp:
             assert resp.status_code == 200
             reader2 = SseFrameReader(resp)
             _, _ = await reader2.next_frame(timeout=5)  # topology
@@ -280,7 +280,7 @@ async def test_path_a_consumer_reconnects_from_exact_offset(api, test_env):
                     json={
                         "id": event2_id,
                         "type": EVENT_TYPE_STREAM,
-                        "tenant_id": tenant_id,
+                        "subject_tenant": tenant_id,
                         "source": "e2e-test",
                         "subject": "s1",
                         "subject_type": SUBJECT_TYPE,
@@ -320,7 +320,7 @@ async def test_gain_and_terminate(api, test_env, disconnect):
             json={
                 "consumer_group": group_id,
                 "client_agent": "consumer-a",
-                "interests": [{"topic": TOPIC_4P, "tenant_id": tenant_id, "types": [EVENT_TYPE_4P]}],
+                "interests": [{"topic": TOPIC_4P, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_4P]}],
             },
         )
         assert sub_a_resp.status_code == 201
@@ -329,7 +329,7 @@ async def test_gain_and_terminate(api, test_env, disconnect):
         b_join: dict = {
             "consumer_group": group_id,
             "client_agent": "consumer-b",
-            "interests": [{"topic": TOPIC_4P, "tenant_id": tenant_id, "types": [EVENT_TYPE_4P]}],
+            "interests": [{"topic": TOPIC_4P, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_4P]}],
         }
         if disconnect:
             b_join["session_timeout"] = "PT2S"
@@ -355,7 +355,7 @@ async def test_gain_and_terminate(api, test_env, disconnect):
             )
 
     async with httpx.AsyncClient(base_url=base_url, timeout=None) as stream_a:
-        async with stream_a.stream("GET", f"/events:sse?subscription_id={sub_a_id}") as resp_a:
+        async with stream_a.stream("GET", f"/events:sse?subscription={sub_a_id}") as resp_a:
             assert resp_a.status_code == 200
             reader_a = SseFrameReader(resp_a)
             kind, _ = await reader_a.next_frame(timeout=5)
@@ -363,7 +363,7 @@ async def test_gain_and_terminate(api, test_env, disconnect):
 
             if disconnect:
                 async with httpx.AsyncClient(base_url=base_url, timeout=None) as stream_b:
-                    async with stream_b.stream("GET", f"/events:sse?subscription_id={sub_b_id}") as resp_b:
+                    async with stream_b.stream("GET", f"/events:sse?subscription={sub_b_id}") as resp_b:
                         assert resp_b.status_code == 200
                         reader_b = SseFrameReader(resp_b)
                         kind, _ = await reader_b.next_frame(timeout=5)

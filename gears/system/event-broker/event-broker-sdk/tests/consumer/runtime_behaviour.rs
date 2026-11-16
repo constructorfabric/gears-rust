@@ -54,10 +54,10 @@ async fn publish_one(
         GtsTypeId::try_new(event_type).expect("valid event type"),
         data,
     )
-    .tenant_id(ctx.subject_tenant_id())
+    .subject_tenant(ctx.subject_tenant_id())
     .source("runtime.behaviour.test")
     .subject(subject)
-    .subject_type_id(GtsTypeId::try_new(SHOWCASE_SUBJECT_TYPE).expect("valid subject type"))
+    .subject_type_of(GtsTypeId::try_new(SHOWCASE_SUBJECT_TYPE).expect("valid subject type"))
     .build()
     .expect("a valid event");
     broker
@@ -96,12 +96,15 @@ async fn slow_detection_emits_listener_events_and_drops_subscription_stream() {
 
     let fx = fast_harness(TOPIC, EVENT_TYPE, 1).await;
     let broker = fx.broker();
-    let ctx = SecurityContext::anonymous();
+    let ctx = fx.security_context().clone();
     let listener = RecordingRuntimeListener::default();
     let recorded = listener.events.clone();
     let calls = Arc::new(Mutex::new(Vec::new()));
 
     let handle = ConsumerBuilder::new(broker.clone())
+        .subject_tenant(ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("slow-drop"))
         .topics([topic(TOPIC)])
         .buffering(ConsumerBuffering {
@@ -119,7 +122,7 @@ async fn slow_detection_emits_listener_events_and_drops_subscription_stream() {
         .expect("consumer starts");
 
     for _ in 0..100 {
-        if handle.subscription_ids().len() == 1 {
+        if handle.subscriptions().len() == 1 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -205,12 +208,15 @@ async fn runtime_listener_observes_representative_non_dlq_event_variants() {
 
     let fx = fast_harness(TOPIC, EVENT_TYPE, 1).await;
     let broker = fx.broker();
-    let ctx = SecurityContext::anonymous();
+    let ctx = fx.security_context().clone();
     let listener = RecordingRuntimeListener::default();
     let recorded = listener.events.clone();
     let handler_calls = Arc::new(Mutex::new(Vec::new()));
 
     let handle = ConsumerBuilder::new(broker.clone())
+        .subject_tenant(ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("listener-all"))
         .topics([topic(TOPIC)])
         .buffering(ConsumerBuffering {
@@ -233,7 +239,7 @@ async fn runtime_listener_observes_representative_non_dlq_event_variants() {
         .expect("consumer starts");
 
     for _ in 0..100 {
-        if handle.subscription_ids().len() == 1 {
+        if handle.subscriptions().len() == 1 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -284,7 +290,7 @@ async fn listener_failure_does_not_commit_drop_or_stop_consumer_events() {
 
     let fx = fast_harness(TOPIC, EVENT_TYPE, 1).await;
     let broker = fx.broker();
-    let ctx = SecurityContext::anonymous();
+    let ctx = fx.security_context().clone();
     let recorder = RecordingRuntimeListener::default();
     let recorded_events = recorder.events.clone();
     let handler_calls = Arc::new(Mutex::new(Vec::new()));
@@ -292,6 +298,9 @@ async fn listener_failure_does_not_commit_drop_or_stop_consumer_events() {
     let commits = offset_manager.commits.clone();
 
     let handle = ConsumerBuilder::new(broker.clone())
+        .subject_tenant(ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("listener-failure"))
         .topics([topic(TOPIC)])
         // 100 s of silence at the 10 ms heartbeat: a slow outbox drain must not trigger a voluntary reconnect that legally redelivers event 1.
@@ -308,7 +317,7 @@ async fn listener_failure_does_not_commit_drop_or_stop_consumer_events() {
         .expect("consumer starts despite listener that will fail");
 
     for _ in 0..100 {
-        if handle.subscription_ids().len() == 1 {
+        if handle.subscriptions().len() == 1 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -332,7 +341,7 @@ async fn listener_failure_does_not_commit_drop_or_stop_consumer_events() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    let active_subscriptions = handle.subscription_ids();
+    let active_subscriptions = handle.subscriptions();
     handle.stop().await.expect("consumer stops cleanly");
 
     let calls = handler_calls.lock().unwrap().clone();
@@ -384,12 +393,15 @@ async fn slow_listener_timeout_does_not_block_runtime_delivery_or_handler_proces
 
     let fx = fast_harness(TOPIC, EVENT_TYPE, 1).await;
     let broker = fx.broker();
-    let ctx = SecurityContext::anonymous();
+    let ctx = fx.security_context().clone();
     let recorder = RecordingRuntimeListener::default();
     let recorded_events = recorder.events.clone();
     let handler_calls = Arc::new(Mutex::new(Vec::new()));
 
     let handle = ConsumerBuilder::new(broker.clone())
+        .subject_tenant(ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("listener-timeout"))
         .topics([topic(TOPIC)])
         // 100 s of silence at the 10 ms heartbeat: a slow outbox drain must not trigger a voluntary reconnect that legally redelivers the event.
@@ -411,7 +423,7 @@ async fn slow_listener_timeout_does_not_block_runtime_delivery_or_handler_proces
         .expect("consumer starts");
 
     for _ in 0..100 {
-        if handle.subscription_ids().len() == 1 {
+        if handle.subscriptions().len() == 1 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -467,12 +479,15 @@ async fn handler_latency_strikes_emit_listener_events_and_drop_subscription_stre
 
     let fx = fast_harness(TOPIC, EVENT_TYPE, 1).await;
     let broker = fx.broker();
-    let ctx = SecurityContext::anonymous();
+    let ctx = fx.security_context().clone();
     let listener = RecordingRuntimeListener::default();
     let recorded = listener.events.clone();
     let calls = Arc::new(Mutex::new(Vec::new()));
 
     let handle = ConsumerBuilder::new(broker.clone())
+        .subject_tenant(ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("latency-drop"))
         .topics([topic(TOPIC)])
         .buffering(ConsumerBuffering {
@@ -495,7 +510,7 @@ async fn handler_latency_strikes_emit_listener_events_and_drop_subscription_stre
         .expect("consumer starts");
 
     for _ in 0..100 {
-        if handle.subscription_ids().len() == 1 {
+        if handle.subscriptions().len() == 1 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -581,11 +596,14 @@ async fn slow_drop_reports_other_assignments_owned_by_same_subscription_slot() {
 
     let fx = fast_harness(TOPIC, EVENT_TYPE, 2).await;
     let broker = fx.broker();
-    let ctx = SecurityContext::anonymous();
+    let ctx = fx.security_context().clone();
     let listener = RecordingRuntimeListener::default();
     let recorded = listener.events.clone();
 
     let handle = ConsumerBuilder::new(broker.clone())
+        .subject_tenant(ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("affected-assignments"))
         .topics([topic(TOPIC)])
         // 100 s of silence at the 10 ms heartbeat: a slow outbox drain must not trigger a voluntary reconnect, whose re-JOIN could see the event before both partitions are assigned again.
@@ -605,7 +623,7 @@ async fn slow_drop_reports_other_assignments_owned_by_same_subscription_slot() {
         .expect("consumer starts");
 
     for _ in 0..100 {
-        if handle.subscription_ids().len() == 1 {
+        if handle.subscriptions().len() == 1 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -623,7 +641,7 @@ async fn slow_drop_reports_other_assignments_owned_by_same_subscription_slot() {
     let affected = wait_for_slow_drop_affected_assignments(&recorded).await;
     handle.stop().await.expect("consumer stops");
 
-    // The single anonymous consumer owns both partitions on one subscription
+    // The single consumer owns both partitions on one subscription
     // slot, so dropping that slot's stream must report every partition it holds,
     // not only the one that overflowed.
     assert_eq!(
@@ -676,10 +694,13 @@ async fn slow_drop_drains_buffer_before_rejoin_load_position() {
 
     let fx = fast_harness(TOPIC, EVENT_TYPE, 1).await;
     let broker = fx.broker();
-    let ctx = SecurityContext::anonymous();
+    let ctx = fx.security_context().clone();
     let timeline: SharedTimeline = Arc::new(Mutex::new(Vec::new()));
 
     let handle = ConsumerBuilder::new(broker.clone())
+        .subject_tenant(ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("drain-rejoin"))
         .topics([topic(TOPIC)])
         .buffering(ConsumerBuffering {
@@ -699,7 +720,7 @@ async fn slow_drop_drains_buffer_before_rejoin_load_position() {
         .expect("consumer starts");
 
     for _ in 0..100 {
-        if handle.subscription_ids().len() == 1 {
+        if handle.subscriptions().len() == 1 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -762,25 +783,38 @@ async fn wait_for_drain_rejoin_timeline(timeline: &SharedTimeline) -> Vec<&'stat
     );
 }
 
-/// Documents a real gap, so it is ignored rather than asserting the wrong
-/// behaviour: the single-process broker's group coordinator assigns every
-/// partition to every member, so two parallel slots each receive all four
-/// partitions instead of two disjoint halves. When the coordinator distributes
-/// partitions exclusively across a group's members, drop the `#[ignore]`.
-#[ignore = "single-process broker assigns every partition to every group member; parallel slots are not yet disjoint"]
+/// Two slots of one auto-anonymous consumer end up owning disjoint halves of four
+/// partitions, as each slot reports through `AssignmentChanged`. The wait allows 3 s
+/// for a split that settles within tens of milliseconds in process (two JOINs, and the
+/// first slot's loss on its topology frame); with the 1 s heartbeat a slot re-JOINs on
+/// its own only after 10 idle heartbeats, so no subscription changes within the wait.
 #[tokio::test]
 async fn parallelism_creates_independent_slots_with_shared_group_and_interests() {
-    use std::collections::BTreeMap;
-
     const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.parallel.v1");
     const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.parallel.v1~");
 
-    let fx = fast_harness(TOPIC, EVENT_TYPE, 4).await;
+    // The default 1 s heartbeat: under a 10 ms one an idle slot re-JOINs every 100 ms,
+    // so its subscription keeps changing while the test waits.
+    let fx = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": TOPIC, "partitions": 4 },
+            {
+                "id": EVENT_TYPE,
+                "topic": TOPIC,
+                "allowed_subject_types": [SHOWCASE_SUBJECT_TYPE],
+                "data_schema": { "type": "object" },
+            },
+        ])))
+        .build()
+        .await;
     let broker = fx.broker();
     let listener = RecordingRuntimeListener::default();
     let recorded = listener.events.clone();
 
     let handle = ConsumerBuilder::new(broker.clone())
+        .subject_tenant(fx.security_context().subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fx.security_context().clone())
         .group(ConsumerGroupRef::auto_anonymous("parallel-slots"))
         .topics([topic(TOPIC)])
         .parallelism(2)
@@ -793,34 +827,41 @@ async fn parallelism_creates_independent_slots_with_shared_group_and_interests()
         .await
         .expect("consumer starts");
 
-    // The assignment each slot holds is read from its own topology frame, i.e.
-    // the AssignmentChanged the runtime emits per subscription - never a
-    // control-plane re-read, which the real broker does not offer.
-    let mut per_slot: BTreeMap<String, BTreeSet<(String, u32)>> = BTreeMap::new();
+    // A slot reports its partitions through `AssignmentChanged` at each JOIN, and again
+    // when a topology frame takes partitions from it. Only the slots' current
+    // subscriptions count: a subscription a slot has left keeps its last report.
+    let halves = vec![
+        BTreeSet::from([(TOPIC.to_owned(), 0), (TOPIC.to_owned(), 1)]),
+        BTreeSet::from([(TOPIC.to_owned(), 2), (TOPIC.to_owned(), 3)]),
+    ];
+    let mut current = Vec::new();
+    let mut held: Vec<BTreeSet<(String, u32)>> = Vec::new();
     for _ in 0..300 {
-        per_slot.clear();
-        for event in recorded.lock().unwrap().iter() {
-            if let ConsumerRuntimeEvent::AssignmentChanged {
-                subscription_id,
-                assigned,
-            } = event
-            {
-                per_slot.insert(
-                    format!("{subscription_id:?}"),
-                    assigned
-                        .iter()
-                        .map(|slot| (slot.topic.to_string(), slot.partition))
-                        .collect(),
-                );
-            }
-        }
-        let non_empty = per_slot.values().filter(|set| !set.is_empty()).count();
-        let covered = per_slot
-            .values()
-            .flatten()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        if non_empty == 2 && covered.len() == 4 {
+        current = handle.subscriptions();
+        let events = recorded.lock().unwrap().clone();
+        held = current
+            .iter()
+            .map(|id| {
+                events
+                    .iter()
+                    .rev()
+                    .find_map(|event| match event {
+                        ConsumerRuntimeEvent::AssignmentChanged {
+                            subscription,
+                            assigned,
+                        } if subscription == id => Some(
+                            assigned
+                                .iter()
+                                .map(|slot| (slot.topic.to_string(), slot.partition))
+                                .collect(),
+                        ),
+                        _ => None,
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
+        held.sort();
+        if held == halves {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -828,32 +869,8 @@ async fn parallelism_creates_independent_slots_with_shared_group_and_interests()
 
     handle.stop().await.expect("consumer stops");
 
-    let non_empty_slots = per_slot
-        .values()
-        .filter(|set| !set.is_empty())
-        .collect::<Vec<_>>();
     assert_eq!(
-        non_empty_slots.len(),
-        2,
-        "two parallel slots should each own a share of the partitions; got {per_slot:?}"
-    );
-    for assignment in &non_empty_slots {
-        assert_eq!(
-            assignment.len(),
-            2,
-            "each of two slots should own half of the four partitions; got {per_slot:?}"
-        );
-    }
-    let covered = per_slot
-        .values()
-        .flatten()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        covered,
-        (0..4)
-            .map(|partition| (TOPIC.to_owned(), partition))
-            .collect::<BTreeSet<_>>(),
-        "parallel slots should cover every partition exactly once"
+        held, halves,
+        "the two slots' current subscriptions {current:?} should own disjoint halves"
     );
 }

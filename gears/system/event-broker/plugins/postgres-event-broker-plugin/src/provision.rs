@@ -4,7 +4,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use event_broker_sdk::backend::support::topic_uuid;
 use event_broker_sdk::backend::{
     BackendError, LogClaim, LogId, Partition, Provisioning, Stored, TopicSpec,
 };
@@ -35,7 +34,7 @@ pub async fn provision(
         )));
     }
     let pool = shared.pool()?;
-    let topic = topic_uuid(&spec.topic);
+    let topic = spec.uuid;
     let max_age_secs = spec.retention.max_age.map(|age| age.as_secs_f64());
     let max_bytes = spec
         .retention
@@ -47,7 +46,7 @@ pub async fn provision(
     if claim.allows_creation() {
         sqlx::query(
             "INSERT INTO evbk__log (topic_uuid, topic_id, log_id, partitions, max_age, max_bytes, provisioned_at) \
-             VALUES ($1, $2, $3, $4, make_interval(secs => $5), $6, now()) ON CONFLICT (topic_uuid) DO NOTHING",
+             VALUES ($1, $2, $3, $4, make_interval(secs => $5), $6, now()) ON CONFLICT DO NOTHING",
         )
         .bind(topic)
         .bind(spec.topic.as_ref())
@@ -75,8 +74,10 @@ pub async fn provision(
         return Err(refused);
     }
     let Some((_, partitions)) = stored else {
-        // `check` refuses a missing row unless the claim allows creation, and
-        // then the insert above wrote it.
+        // `check` refuses a missing row unless the claim allows creation; the
+        // insert above then wrote it, unless the topic's id is held under
+        // another reference, which the registry never hands out (one
+        // reference per topic).
         tx.rollback().await.map_err(map)?;
         return Err(BackendError::Internal(format!(
             "{OP}: evbk__log holds no row after the insert"
@@ -126,7 +127,7 @@ pub async fn provision(
             "CREATE TABLE IF NOT EXISTS {parent} (\
                  sequence BIGINT NOT NULL, \
                  sequence_time TIMESTAMPTZ NOT NULL, \
-                 tenant_id UUID NOT NULL, \
+                 subject_tenant UUID NOT NULL, \
                  body BYTEA NOT NULL, \
                  PRIMARY KEY (sequence)\
              ) PARTITION BY RANGE (sequence); \

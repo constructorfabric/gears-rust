@@ -1,69 +1,10 @@
 //! The `OpenAPI` operations `register_ingest_routes` declares, read back through
 //! a registry that records every registered `OperationSpec`.
 
-use std::sync::Mutex;
-
 use axum::Router;
-use toolkit::api::OpenApiRegistry;
-use toolkit::api::operation_builder::OperationSpec;
 
 use super::register_ingest_routes;
-
-#[derive(Default)]
-struct RecordingOpenApiRegistry {
-    operations: Mutex<Vec<OperationSpec>>,
-}
-
-impl OpenApiRegistry for RecordingOpenApiRegistry {
-    fn register_operation(&self, spec: &OperationSpec) {
-        self.operations
-            .lock()
-            .expect("operations lock")
-            .push(spec.clone());
-    }
-
-    fn ensure_schema_raw(
-        &self,
-        name: &str,
-        _schemas: Vec<(
-            String,
-            utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
-        )>,
-    ) -> String {
-        name.to_owned()
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
-
-/// `(status, content_type, description)` of every response `path` declares,
-/// in registration order. An empty content type is a body-less response.
-fn declared_responses(
-    registry: &RecordingOpenApiRegistry,
-    path: &str,
-) -> Vec<(u16, &'static str, String)> {
-    let operations = registry.operations.lock().expect("operations lock");
-    let [operation] = operations
-        .iter()
-        .filter(|operation| operation.path == path)
-        .collect::<Vec<_>>()[..]
-    else {
-        panic!("expected one operation on {path}");
-    };
-    operation
-        .responses
-        .iter()
-        .map(|response| {
-            (
-                response.status,
-                response.content_type,
-                response.description.clone(),
-            )
-        })
-        .collect()
-}
+use super::route_spec_recorder::{RecordingOpenApiRegistry, declared_responses};
 
 #[test]
 fn the_single_publish_route_declares_its_full_response_list() {
@@ -100,7 +41,9 @@ fn the_single_publish_route_declares_its_full_response_list() {
             (
                 413,
                 "application/problem+json",
-                "EventTooLarge - the event's encoding is over the 60 KiB per-event limit."
+                "EventTooLarge - the event's encoding is over the 60 KiB per-event limit; or \
+                 Payload Too Large - the request body is over the request body limit \
+                 (api-gateway `defaults.body_limit_bytes`)."
                     .to_owned()
             ),
             (
@@ -172,7 +115,8 @@ fn the_batch_route_declares_its_full_response_list() {
                 "application/problem+json",
                 "BatchTooLarge (more events than the configured max) or BatchPayloadTooLarge \
                  (total payload over the configured byte ceiling), or EventTooLarge (an event's \
-                 encoding over the 60 KiB per-event limit)"
+                 encoding over the 60 KiB per-event limit), or Payload Too Large (the request \
+                 body over the request body limit, api-gateway `defaults.body_limit_bytes`)"
                     .to_owned()
             ),
             (
@@ -189,6 +133,220 @@ fn the_batch_route_declares_its_full_response_list() {
                  broker's database or ingest pipeline is unavailable (including a producer-chain \
                  write that exhausted its contention retries), or no ingest instance is \
                  reachable. Nothing is enqueued."
+                    .to_owned()
+            ),
+            (400, "application/problem+json", "Bad Request".to_owned()),
+            (401, "application/problem+json", "Unauthorized".to_owned()),
+            (403, "application/problem+json", "Forbidden".to_owned()),
+            (404, "application/problem+json", "Not Found".to_owned()),
+            (409, "application/problem+json", "Conflict".to_owned()),
+            (
+                429,
+                "application/problem+json",
+                "Too Many Requests".to_owned()
+            ),
+            (
+                500,
+                "application/problem+json",
+                "Internal Server Error".to_owned()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn the_producer_register_route_declares_its_full_response_list() {
+    let registry = RecordingOpenApiRegistry::default();
+    let _router = register_ingest_routes(Router::new(), &registry);
+
+    assert_eq!(
+        declared_responses(&registry, "/event-broker/v1/producers"),
+        vec![
+            (
+                201,
+                "application/json",
+                "Producer registered; id minted".to_owned()
+            ),
+            (
+                413,
+                "application/problem+json",
+                "Payload Too Large - the request body is over the request body limit \
+                 (api-gateway `defaults.body_limit_bytes`)."
+                    .to_owned()
+            ),
+            (
+                415,
+                "application/problem+json",
+                "Unsupported Media Type - the request `Content-Type` is missing or is not a JSON \
+                 media type (`application/json` or an `application/<subtype>+json` type)."
+                    .to_owned()
+            ),
+            (
+                422,
+                "application/problem+json",
+                "Unprocessable Entity - the body is valid JSON but does not fit the request \
+                 shape: a missing, unknown or mistyped field, or an unknown `mode` value."
+                    .to_owned()
+            ),
+            (
+                503,
+                "application/problem+json",
+                "ServiceUnavailable, retryable - the broker's database is unavailable: the \
+                 producer insert."
+                    .to_owned()
+            ),
+            (400, "application/problem+json", "Bad Request".to_owned()),
+            (401, "application/problem+json", "Unauthorized".to_owned()),
+            (403, "application/problem+json", "Forbidden".to_owned()),
+            (404, "application/problem+json", "Not Found".to_owned()),
+            (409, "application/problem+json", "Conflict".to_owned()),
+            (
+                429,
+                "application/problem+json",
+                "Too Many Requests".to_owned()
+            ),
+            (
+                500,
+                "application/problem+json",
+                "Internal Server Error".to_owned()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn the_producer_reset_route_declares_its_full_response_list() {
+    let registry = RecordingOpenApiRegistry::default();
+    let _router = register_ingest_routes(Router::new(), &registry);
+
+    // The handler parses the body itself, so a non-empty body that is not a JSON
+    // `ResetProducerRequest` is a 400 and neither 415 nor 422 is declared.
+    assert_eq!(
+        declared_responses(&registry, "/event-broker/v1/producers/{id}"),
+        vec![
+            (200, "", "Reset applied; audit record emitted".to_owned()),
+            (
+                413,
+                "application/problem+json",
+                "Payload Too Large - the request body is over the request body limit \
+                 (api-gateway `defaults.body_limit_bytes`)."
+                    .to_owned()
+            ),
+            (
+                503,
+                "application/problem+json",
+                "ServiceUnavailable, retryable - the broker's database is unavailable: the \
+                 producer read, or the producer chain delete."
+                    .to_owned()
+            ),
+            (400, "application/problem+json", "Bad Request".to_owned()),
+            (401, "application/problem+json", "Unauthorized".to_owned()),
+            (403, "application/problem+json", "Forbidden".to_owned()),
+            (404, "application/problem+json", "Not Found".to_owned()),
+            (409, "application/problem+json", "Conflict".to_owned()),
+            (
+                429,
+                "application/problem+json",
+                "Too Many Requests".to_owned()
+            ),
+            (
+                500,
+                "application/problem+json",
+                "Internal Server Error".to_owned()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn the_producer_cursors_route_declares_its_full_response_list() {
+    let registry = RecordingOpenApiRegistry::default();
+    let _router = register_ingest_routes(Router::new(), &registry);
+
+    assert_eq!(
+        declared_responses(&registry, "/event-broker/v1/producers/{id}/cursors"),
+        vec![
+            (
+                200,
+                "application/json",
+                "Producer cursors (topics may be empty)".to_owned()
+            ),
+            (
+                503,
+                "application/problem+json",
+                "ServiceUnavailable, retryable - the broker's database is unavailable: the \
+                 producer read, or the producer cursor read."
+                    .to_owned()
+            ),
+            (400, "application/problem+json", "Bad Request".to_owned()),
+            (401, "application/problem+json", "Unauthorized".to_owned()),
+            (403, "application/problem+json", "Forbidden".to_owned()),
+            (404, "application/problem+json", "Not Found".to_owned()),
+            (409, "application/problem+json", "Conflict".to_owned()),
+            (
+                429,
+                "application/problem+json",
+                "Too Many Requests".to_owned()
+            ),
+            (
+                500,
+                "application/problem+json",
+                "Internal Server Error".to_owned()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn the_topic_list_route_declares_its_full_response_list() {
+    let registry = RecordingOpenApiRegistry::default();
+    let _router = register_ingest_routes(Router::new(), &registry);
+
+    assert_eq!(
+        declared_responses(&registry, "/event-broker/v1/topics"),
+        vec![
+            (200, "application/json", "Page of topics".to_owned()),
+            (
+                503,
+                "application/problem+json",
+                "ServiceUnavailable, retryable - the broker's database is unavailable: the \
+                 topic list read, or a topic's event type read."
+                    .to_owned()
+            ),
+            (400, "application/problem+json", "Bad Request".to_owned()),
+            (401, "application/problem+json", "Unauthorized".to_owned()),
+            (403, "application/problem+json", "Forbidden".to_owned()),
+            (404, "application/problem+json", "Not Found".to_owned()),
+            (409, "application/problem+json", "Conflict".to_owned()),
+            (
+                429,
+                "application/problem+json",
+                "Too Many Requests".to_owned()
+            ),
+            (
+                500,
+                "application/problem+json",
+                "Internal Server Error".to_owned()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn the_topic_segments_route_declares_its_full_response_list() {
+    let registry = RecordingOpenApiRegistry::default();
+    let _router = register_ingest_routes(Router::new(), &registry);
+
+    assert_eq!(
+        declared_responses(&registry, "/event-broker/v1/topics/segments"),
+        vec![
+            (200, "application/json", "Segment manifest".to_owned()),
+            (
+                503,
+                "application/problem+json",
+                "ServiceUnavailable, retryable - the broker's database or the topic's storage \
+                 backend is unavailable: the topic's event type read, the topic lookup, or the \
+                 segment read on the backend."
                     .to_owned()
             ),
             (400, "application/problem+json", "Bad Request".to_owned()),

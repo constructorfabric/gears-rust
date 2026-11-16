@@ -1,12 +1,16 @@
-"""Consumer group CRUD scenarios (consumer/groups/1.01-1.09).
+"""Consumer group CRUD scenarios (consumer/groups/1.01-1.10, consumer/subscriptions/1.16-1.17).
 
 Each test creates its own group to avoid cross-test interference.
 ``groups/1.08`` (named group JOIN) is xfail: the gear does not implement
 named consumer groups yet, and a JOIN naming one answers 501.
 ``groups/1.09`` (cross-tenant ownership) tests are xfail: the standalone
 config sets ``auth_disabled: true``, so tenant isolation cannot be exercised.
-``groups/1.06`` validation tests (client_agent length, description encoding)
-run live; the server enforces both rules.
+``groups/1.10`` and ``subscriptions/1.16`` (creator-only DELETE and JOIN) send two
+static tokens and are strict xfail under ``auth_disabled``.
+``subscriptions/1.17`` (JOIN without ``consume`` on the group) needs an
+action-aware policy, which no config of this suite runs, so it is strict xfail.
+``groups/1.06`` validation tests (client_agent length and grammar, description
+encoding) run live; the server enforces each rule.
 """
 
 from __future__ import annotations
@@ -15,7 +19,17 @@ import uuid
 
 import pytest
 
-from .conftest import EVENT_TYPE_STREAM, SUBJECT_TYPE, TOPIC_STREAM, XFAIL_AUTH_DISABLED, TRACE_ID
+from .conftest import (
+    API_BASE,
+    EVENT_TYPE_STREAM,
+    SUBJECT_TYPE,
+    TOKEN_PRINCIPAL_A,
+    TOKEN_PRINCIPAL_B,
+    TOPIC_STREAM,
+    TRACE_ID,
+    XFAIL_AUTH_DISABLED,
+    XFAIL_UNLESS_STATIC_TOKENS,
+)
 
 
 async def test_create_anonymous_group_returns_201(api):
@@ -30,8 +44,8 @@ async def test_create_anonymous_group_returns_201(api):
     assert body == {
         "id": body["id"],
         "kind": "anonymous",
-        "tenant_id": body["tenant_id"],
-        "owner_principal_id": body["owner_principal_id"],
+        "tenant": body["tenant"],
+        "owner_principal": body["owner_principal"],
         "description": "order-fulfilment workers",
         "created_at": body["created_at"],
     }
@@ -122,7 +136,8 @@ async def test_delete_group_with_active_members_returns_409(api):
                 "interests": [
                     {
                         "topic": TOPIC_STREAM,
-                        "tenant_id": tenant_id,
+                        "subject_tenant": tenant_id,
+                        "ownership_filter": "entire_tenant",
                         "types": [EVENT_TYPE_STREAM],
                     }
                 ],
@@ -180,6 +195,44 @@ async def test_client_agent_too_long_returns_400(api):
                     "field": "client_agent",
                     "description": "must be 1-256 bytes, got 257",
                     "reason": "field_too_long",
+                }
+            ],
+            "resource_type": "gts.cf.core.events.request.v1~",
+        },
+    }
+
+
+async def test_client_agent_breaking_the_user_agent_grammar_returns_400(api):
+    """scenario: consumer/groups/1.06-negative-invalid-client-agent.md
+
+    A ``client_agent`` that is printable ASCII within 256 bytes but ends in
+    ``/`` with no version breaks the RFC 9110 User-Agent grammar and is
+    rejected with 400.  The error names the field and the grammar, and
+    carries no part of the submitted value.
+    """
+    async with api() as client:
+        resp = await client.post(
+            "/consumer-groups",
+            json={"client_agent": "agent/"},
+        )
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body == {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": "Request validation failed",
+        "instance": body["instance"],
+        "trace_id": TRACE_ID,
+        "context": {
+            "field_violations": [
+                {
+                    "field": "client_agent",
+                    "description": (
+                        "must follow the RFC 9110 User-Agent grammar: "
+                        "product *( SP ( product / comment ) )"
+                    ),
+                    "reason": "user_agent_grammar",
                 }
             ],
             "resource_type": "gts.cf.core.events.request.v1~",
@@ -268,7 +321,8 @@ async def test_named_group_join_without_create_step(api):
                 "interests": [
                     {
                         "topic": TOPIC_STREAM,
-                        "tenant_id": tenant_id,
+                        "subject_tenant": tenant_id,
+                        "ownership_filter": "entire_tenant",
                         "types": [EVENT_TYPE_STREAM],
                     }
                 ],
@@ -349,3 +403,152 @@ async def test_list_excludes_other_tenant_anonymous_groups(api):
     assert list_resp.status_code == 200
     items = list_resp.json()["items"]
     assert not any(item["id"] == group_id for item in items)
+
+
+@XFAIL_UNLESS_STATIC_TOKENS
+async def test_join_anonymous_group_not_owned(api):
+    """scenario: consumer/subscriptions/1.16-negative-join-anonymous-group-not-owned.md
+
+    Principal A creates a fresh group and JOINs it with one interest on its own
+    tenant (the tenant its group records); principal B, a subject of the same
+    tenant, JOINs A's group and is refused ``ConsumerGroupNotOwned``, and A's
+    subscription stays the group's only one. Under ``auth_disabled`` the
+    gateway ignores both tokens and injects one default identity, so B's JOIN
+    answers 201.
+    """
+    principal_a = {"Authorization": f"Bearer {TOKEN_PRINCIPAL_A}"}
+    principal_b = {"Authorization": f"Bearer {TOKEN_PRINCIPAL_B}"}
+    async with api() as client:
+        group_resp = await client.post("/consumer-groups", headers=principal_a)
+        assert group_resp.status_code == 201, group_resp.text
+        group = group_resp.json()
+        join_body = {
+            "consumer_group": group["id"],
+            "client_agent": "e2e-test",
+            "interests": [
+                {
+                    "topic": TOPIC_STREAM,
+                    "subject_tenant": group["tenant"],
+                    "ownership_filter": "entire_tenant",
+                    "types": [EVENT_TYPE_STREAM],
+                }
+            ],
+        }
+        sub_resp = await client.post("/subscriptions", headers=principal_a, json=join_body)
+        assert sub_resp.status_code == 201, sub_resp.text
+        sub_id = str(sub_resp.json()["id"])
+
+        join_resp = await client.post("/subscriptions", headers=principal_b, json=join_body)
+        list_resp = await client.get(
+            "/subscriptions",
+            headers=principal_a,
+            params={"$filter": f"consumer_group eq '{group['id']}'"},
+        )
+
+    assert join_resp.status_code == 403, join_resp.text
+    assert join_resp.json() == {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~",
+        "title": "Permission Denied",
+        "status": 403,
+        "detail": "You do not have permission to perform this operation",
+        "instance": f"{API_BASE}/subscriptions",
+        "trace_id": TRACE_ID,
+        "context": {
+            "reason": f"consumer group '{group['id']}' was created by another principal",
+            "resource_type": "gts.cf.core.events.consumer_group.v1~",
+        },
+    }
+    assert list_resp.status_code == 200, list_resp.text
+    assert [str(item["id"]) for item in list_resp.json()["items"]] == [sub_id]
+
+
+@XFAIL_AUTH_DISABLED
+async def test_join_consumer_group_not_authorized(api):
+    """scenario: consumer/subscriptions/1.17-negative-join-consumer-group-not-authorized.md
+
+    The creator of a fresh group JOINs it with one interest on its own tenant
+    (the tenant its group records) under a policy that does not grant
+    ``consume`` on consumer groups, and is refused
+    ``ConsumerGroupNotAuthorized`` with no subscription created. Only an
+    action-aware policy refuses it: under the static-authz policy of this
+    suite's config the JOIN answers 201, with or without ``auth_disabled``.
+    The stream and SEEK exchanges need a grant revoked mid-test and are
+    covered in process (``domain/group_check_tests.rs``).
+    """
+    async with api() as client:
+        group_resp = await client.post(
+            "/consumer-groups",
+            json={"client_agent": "e2e-test", "description": f"e2e-1.17-{uuid.uuid4()}"},
+        )
+        assert group_resp.status_code == 201, group_resp.text
+        group = group_resp.json()
+        join_resp = await client.post(
+            "/subscriptions",
+            json={
+                "consumer_group": group["id"],
+                "client_agent": "e2e-test",
+                "interests": [
+                    {
+                        "topic": TOPIC_STREAM,
+                        "subject_tenant": group["tenant"],
+                        "ownership_filter": "entire_tenant",
+                        "types": [EVENT_TYPE_STREAM],
+                    }
+                ],
+            },
+        )
+        list_resp = await client.get(
+            "/subscriptions",
+            params={"$filter": f"consumer_group eq '{group['id']}'"},
+        )
+
+    assert join_resp.status_code == 403, join_resp.text
+    assert join_resp.json() == {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~",
+        "title": "Permission Denied",
+        "status": 403,
+        "detail": "You do not have permission to perform this operation",
+        "instance": f"{API_BASE}/subscriptions",
+        "trace_id": TRACE_ID,
+        "context": {
+            "reason": "access denied by policy",
+            "resource_type": "gts.cf.core.events.consumer_group.v1~",
+        },
+    }
+    assert list_resp.status_code == 200, list_resp.text
+    assert list_resp.json()["items"] == []
+
+
+@XFAIL_UNLESS_STATIC_TOKENS
+async def test_delete_anonymous_group_not_owned(api):
+    """scenario: consumer/groups/1.10-negative-delete-anonymous-group-not-owned.md
+
+    Principal A creates a fresh group; principal B, a subject of the same
+    tenant, DELETEs it and is refused ``ConsumerGroupNotOwned``, and A still
+    reads the group. Under ``auth_disabled`` the gateway ignores both tokens
+    and injects one default identity, so B's DELETE answers 204.
+    """
+    principal_a = {"Authorization": f"Bearer {TOKEN_PRINCIPAL_A}"}
+    principal_b = {"Authorization": f"Bearer {TOKEN_PRINCIPAL_B}"}
+    async with api() as client:
+        group_resp = await client.post("/consumer-groups", headers=principal_a)
+        assert group_resp.status_code == 201, group_resp.text
+        group_id = group_resp.json()["id"]
+
+        del_resp = await client.delete(f"/consumer-groups/{group_id}", headers=principal_b)
+        read_resp = await client.get(f"/consumer-groups/{group_id}", headers=principal_a)
+
+    assert del_resp.status_code == 403, del_resp.text
+    assert del_resp.json() == {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~",
+        "title": "Permission Denied",
+        "status": 403,
+        "detail": "You do not have permission to perform this operation",
+        "instance": f"{API_BASE}/consumer-groups/{group_id}",
+        "trace_id": TRACE_ID,
+        "context": {
+            "reason": f"consumer group '{group_id}' was created by another principal",
+            "resource_type": "gts.cf.core.events.consumer_group.v1~",
+        },
+    }
+    assert read_resp.status_code == 200, read_resp.text

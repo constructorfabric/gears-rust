@@ -57,7 +57,7 @@ Every attempt mints a **log id** and hands it to the backend, which stores it wi
 - ADR-0008 - topic log identity: checks, reactions, moves, reprovisioning
 - DESIGN.md §3.1 "Topic" - ingest as the one writer of shared state
 - `event-broker/src/infra/specification.rs` - `bulk_load`; `event-broker/src/infra/workers/specification_refresh.rs`
-- `gts::GtsId::to_uuid` - the deterministic topic UUID
+- types-registry SDK (`list_instances`) - the topic's Registry Reference (`Instance.uuid`), which the gear reads from types-registry at `bulk_load` and stores on the topic's spec row
 
 ## 2. Log Id and the Binding Record
 
@@ -73,7 +73,7 @@ The specification manager, on ingest instances, is the only writer. The table ru
 
 ```sql
 CREATE TABLE event_broker__topic_binding (
-    topic_uuid  UUID          PRIMARY KEY,   -- GtsId::to_uuid(topic_id), deterministic
+    topic_uuid  UUID          PRIMARY KEY,   -- the topic's Registry Reference
     topic_id    VARCHAR(1024) NOT NULL,      -- GTS topic instance identifier; for operators, not indexed
     log_id      UUID          NOT NULL,      -- UUID v4: the current attempt's, then the provisioned log's
     state       VARCHAR(12)   NOT NULL,      -- 'provisioning' | 'provisioned'
@@ -86,7 +86,7 @@ CREATE TABLE event_broker__topic_binding (
 );
 ```
 
-- The primary key is the topic's deterministic UUID, so the 1024-character identifier never needs an index.
+- The primary key is the topic's Registry Reference (a UUID from types-registry), so the 1024-character identifier never needs an index.
 - The record says which log a topic has, not where it is: every instance resolves the backend from its own routing, and every instance carries the same routing (feature 0005 §2).
 - `state` separates "not created yet" from "created". A `provisioned` topic is provisioned again only when its resolved settings change (its retention) or its record is unconfirmed: the same log id, so the backend adopts the new settings without a new attempt (feature 0007 §2.6).
 - `partitions` is the count every role uses for the topic once it is provisioned (feature 0007 §2.6).
@@ -189,7 +189,7 @@ The specification manager owns each topic's lifecycle: it is the only writer of 
 ```python
 def provision_topic(topic):
     backend = registry[routing(topic)]                     # feature 0005 §2.2
-    spec = TopicSpec(topic, partitions=settings(topic).partitions,
+    spec = TopicSpec(topic, uuid=topic.uuid, partitions=settings(topic).partitions,
                      retention=settings(topic).retention)
     row = binding.get(topic.uuid)
 
@@ -209,7 +209,7 @@ def provision_topic(topic):
                            retention_version=row.retention_version + 1,
                            retention_confirmed=False):    # marked before the call
             return                                         # written since the read: next pass
-        held = TopicSpec(topic, partitions=row.partitions, retention=spec.retention)
+        held = TopicSpec(topic, uuid=spec.uuid, partitions=row.partitions, retention=spec.retention)
         match backend.provision(held, LogClaim(Held, row.log_id)) within call_timeout:
             case Ready(_):
                 if not binding.cas(topic.uuid, (row.log_id, "provisioned", row.retention_version + 1),

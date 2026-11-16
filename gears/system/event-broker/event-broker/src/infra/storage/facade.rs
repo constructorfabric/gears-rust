@@ -1,8 +1,7 @@
 //! `Storage`: the real (gear database + `ClusterCacheV1`) implementation of every
 //! `domain::repo` trait. Topics and events have none - topics go through
-//! `SpecificationManager` only, events straight to the backend
-//! (eb-single-process-implementation D1/D3). One struct implements every
-//! trait, which is safe because their method names are deliberately distinct
+//! `SpecificationManager` only, events straight to the backend. One struct
+//! implements every trait, which is safe because their method names are deliberately distinct
 //! (`domain/repo.rs`'s doc comment: identical names across traits in scope on
 //! one type are ambiguous at the call site).
 //!
@@ -18,6 +17,7 @@
 //! time, since neither has an independent tenant of its own.
 
 use crate::domain::model::Sequence;
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -25,11 +25,13 @@ use async_trait::async_trait;
 use chrono::Utc;
 use cluster_sdk::ClusterCacheV1;
 use cluster_sdk::cache::{PutRequest, Ttl};
-use sea_orm::sea_query::Expr;
+use event_broker_sdk::ConsumerGroupId;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, Set};
 use toolkit_db::DBProvider;
 use toolkit_db::outbox::{Outbox, TraceSubscription};
-use toolkit_db::secure::{SecureDeleteExt, SecureEntityExt, SecureUpdateExt, secure_insert};
+use toolkit_db::secure::{
+    SecureDeleteExt, SecureEntityExt, SecureInsertExt, SecureOnConflict, secure_insert,
+};
 use toolkit_gts::GtsInstanceId;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
@@ -55,16 +57,14 @@ fn subscription_marker_key(id: Uuid) -> String {
     format!("subscription-group/{id}")
 }
 
-/// Consumer group -> the delivery instance that owns it (`DESIGN.md`'s
-/// `evbk.group.endpoint:{consumer_group}` routing cache).
+/// Consumer group -> the delivery instance that owns it: the marker's value
+/// is the owning instance's id (`docs/DESIGN.md` "Subscription Resolution
+/// Cache", Cache 2).
 ///
-/// Keyed by the group's deterministic UUID, not its id: a GTS id's `.` and `~`
-/// are outside the cache's key alphabet.
-fn group_marker_key(group: &GtsInstanceId) -> Result<String, DomainError> {
-    let uuid = gts::GtsId::try_new(group.as_ref())
-        .map_err(|e| DomainError::Internal(format!("consumer group id is not a GTS id: {e}")))?
-        .to_uuid();
-    Ok(format!("group-owner/{uuid}"))
+/// Keyed by the group's own UUID (an anonymous group's id ends in it), not its
+/// id: a GTS id's `.` and `~` are outside the cache's key alphabet.
+fn group_marker_key(group: ConsumerGroupId) -> String {
+    format!("group-owner/{}", group.as_uuid())
 }
 
 fn kind_to_str(kind: ConsumerGroupKind) -> &'static str {
@@ -143,6 +143,18 @@ pub struct Storage {
     /// after them.
     #[cfg(any(test, feature = "test-utils"))]
     chain_pauses: super::producer_chain::ChainPauses,
+    /// Where a test holds a cursor write inside its transaction, to put
+    /// another writer's write of the same cursor there, or to drop the write
+    /// part-way.
+    #[cfg(any(test, feature = "test-utils"))]
+    cursor_pauses: CursorPauses,
+}
+
+/// The point where a test holds a cursor write: inside its transaction, right
+/// before each cursor's upsert.
+#[cfg(any(test, feature = "test-utils"))]
+struct CursorPauses {
+    before_write: crate::test_support::PausePoint,
 }
 
 impl Storage {
@@ -163,6 +175,10 @@ impl Storage {
                 before_head_read: crate::test_support::PausePoint::default(),
                 after_head_read: crate::test_support::PausePoint::default(),
             },
+            #[cfg(any(test, feature = "test-utils"))]
+            cursor_pauses: CursorPauses {
+                before_write: crate::test_support::PausePoint::default(),
+            },
         }
     }
 
@@ -181,6 +197,15 @@ impl Storage {
     #[must_use]
     pub fn after_head_read_pause(&self) -> &crate::test_support::PausePoint {
         &self.chain_pauses.after_head_read
+    }
+
+    /// The point a cursor write passes inside its transaction right before
+    /// each cursor's upsert (on `SQLite` with the default deferred `BEGIN`:
+    /// before the first one, holding no lock yet).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn before_cursor_write_pause(&self) -> &crate::test_support::PausePoint {
+        &self.cursor_pauses.before_write
     }
 
     /// Wires the routing markers' `ClusterCacheV1` in once
@@ -290,9 +315,8 @@ impl ConsumerGroupRepo for Storage {
     /// still fetches every row in one query rather than pushing
     /// `limit`/`cursor` to SQL. A correct pushdown implementation would also
     /// need to move `DeliveryServiceImpl::list_consumer_groups`'s
-    /// anonymous-vs-named tenant-visibility partitioning
-    /// (`eb-tenant-isolation-fix`) into the SQL `WHERE` clause, since that
-    /// logic - not a plain tenant-scoped `AccessScope` - decides which rows
+    /// anonymous-vs-named tenant-visibility partitioning into the SQL `WHERE`
+    /// clause, since that logic - not a plain tenant-scoped `AccessScope` - decides which rows
     /// a caller may see; that's a larger, separate piece of work than this
     /// change's storage-layer scope. What *did* change: this now queries a
     /// real gear-database table instead of an in-memory `HashMap`, resolving the
@@ -316,6 +340,74 @@ impl ConsumerGroupRepo for Storage {
             .exec(&conn)
             .await?;
         Ok(())
+    }
+}
+
+/// A cursor row's primary key, `(consumer_group, topic_id, partition)`, with
+/// its fields in the key's column order so the derived `Ord` compares them in
+/// that order.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CursorKey {
+    consumer_group: String,
+    topic_id: i64,
+    partition: i32,
+}
+
+/// One cursor row to upsert, with its key and the tenant that scopes it.
+#[derive(Debug)]
+struct CursorRow {
+    key: CursorKey,
+    tenant_id: Uuid,
+    model: cursor::ActiveModel,
+}
+
+impl CursorRow {
+    fn new(
+        consumer_group: &str,
+        topic_id: i64,
+        partition: i32,
+        tenant_id: Uuid,
+        offset: Sequence,
+    ) -> Self {
+        Self {
+            key: CursorKey {
+                consumer_group: consumer_group.to_owned(),
+                topic_id,
+                partition,
+            },
+            tenant_id,
+            model: cursor::ActiveModel {
+                consumer_group: Set(consumer_group.to_owned()),
+                topic_id: Set(topic_id),
+                partition: Set(partition),
+                tenant_id: Set(tenant_id),
+                offset: Set(offset.as_i64()),
+                updated_at: Set(Utc::now()),
+            },
+        }
+    }
+}
+
+/// The rows one `put_cursors` call writes, collected in the caller's order.
+#[derive(Debug)]
+struct CursorRows(Vec<CursorRow>);
+
+impl CursorRows {
+    fn with_capacity(capacity: usize) -> Self {
+        Self(Vec::with_capacity(capacity))
+    }
+
+    fn push(&mut self, row: CursorRow) {
+        self.0.push(row);
+    }
+
+    fn in_key_order(mut self) -> Vec<CursorRow> {
+        // Two calls writing overlapping rows take their row locks in the same
+        // order, so neither can hold a lock the other waits on while waiting
+        // on one the other holds. The sort is stable: rows sharing a key keep
+        // the caller's order, and the caller's last one is still written last.
+        self.0.sort_by(|a, b| a.key.cmp(&b.key));
+        self.0
     }
 }
 
@@ -345,71 +437,85 @@ impl CursorRepo for Storage {
         }))
     }
 
-    async fn put_cursor(&self, cursor: &Cursor) -> Result<(), DomainError> {
-        let topic_id = self.spec_manager.resolve_topic_id(&cursor.topic).await?;
-        let conn = self.db.conn()?;
-
-        let update_result = crate::infra::storage::entity::cursor::Entity::update_many()
-            .secure()
-            .scope_with(&AccessScope::allow_all())
-            .filter(
-                Condition::all()
-                    .add(
-                        crate::infra::storage::entity::cursor::Column::ConsumerGroup
-                            .eq(cursor.consumer_group.as_ref()),
-                    )
-                    .add(crate::infra::storage::entity::cursor::Column::TopicId.eq(topic_id))
-                    .add(
-                        crate::infra::storage::entity::cursor::Column::Partition
-                            .eq(cursor.partition),
-                    ),
-            )
-            .col_expr(
-                crate::infra::storage::entity::cursor::Column::Offset,
-                Expr::value(cursor.offset.as_i64()),
-            )
-            .col_expr(
-                crate::infra::storage::entity::cursor::Column::UpdatedAt,
-                Expr::value(Utc::now()),
-            )
-            .exec(&conn)
-            .await?;
-
-        if update_result.rows_affected > 0 {
+    async fn put_cursors(&self, cursors: &[Cursor]) -> Result<(), DomainError> {
+        if cursors.is_empty() {
             return Ok(());
         }
+        // Every read happens before the transaction opens, so it holds only
+        // the writes: resolving a topic id may read the database, and a
+        // connection is refused inside a transaction. Each row denormalizes
+        // its owning group's tenant, read once per group.
+        let mut tenants: HashMap<&str, Uuid> = HashMap::new();
+        let mut rows = CursorRows::with_capacity(cursors.len());
+        for wanted in cursors {
+            let topic_id = self.spec_manager.resolve_topic_id(&wanted.topic).await?;
+            let group_id = wanted.consumer_group.as_ref();
+            let tenant_id = if let Some(tenant_id) = tenants.get(group_id) {
+                *tenant_id
+            } else {
+                let group = consumer_group::Entity::find_by_id(group_id.to_owned())
+                    .secure()
+                    .scope_with(&AccessScope::allow_all())
+                    .one(&self.db.conn()?)
+                    .await?
+                    .ok_or_else(|| DomainError::NotFound {
+                        code: ErrorCode::ConsumerGroupNotFound,
+                        message: format!(
+                            "consumer group '{}' is not registered",
+                            wanted.consumer_group
+                        ),
+                        resource: wanted.consumer_group.to_string(),
+                    })?;
+                tenants.insert(group_id, group.tenant_id);
+                group.tenant_id
+            };
+            rows.push(CursorRow::new(
+                group_id,
+                topic_id,
+                wanted.partition,
+                tenant_id,
+                wanted.offset,
+            ));
+        }
+        let rows = rows.in_key_order();
 
-        // First write for this (consumer_group, topic, partition) - resolve
-        // the owning consumer_group's tenant to denormalize onto the row.
-        let group = consumer_group::Entity::find_by_id(cursor.consumer_group.as_ref().to_owned())
-            .secure()
-            .scope_with(&AccessScope::allow_all())
-            .one(&conn)
-            .await?
-            .ok_or_else(|| DomainError::NotFound {
-                code: ErrorCode::ConsumerGroupNotFound,
-                message: format!(
-                    "consumer group '{}' is not registered",
-                    cursor.consumer_group
-                ),
-                resource: cursor.consumer_group.to_string(),
-            })?;
-
-        let am = crate::infra::storage::entity::cursor::ActiveModel {
-            consumer_group: Set(cursor.consumer_group.as_ref().to_owned()),
-            topic_id: Set(topic_id),
-            partition: Set(cursor.partition),
-            tenant_id: Set(group.tenant_id),
-            offset: Set(cursor.offset.as_i64()),
-            updated_at: Set(Utc::now()),
-        };
-        secure_insert::<crate::infra::storage::entity::cursor::Entity>(
-            am,
-            &AccessScope::for_tenant(group.tenant_id),
-            &conn,
-        )
-        .await?;
-        Ok(())
+        #[cfg(any(test, feature = "test-utils"))]
+        let before_write = self.cursor_pauses.before_write.clone();
+        self.db
+            .db()
+            .transaction_ref_mapped(move |tx| {
+                Box::pin(async move {
+                    for CursorRow {
+                        tenant_id,
+                        model: am,
+                        ..
+                    } in rows
+                    {
+                        #[cfg(any(test, feature = "test-utils"))]
+                        before_write.pass().await;
+                        // A cursor that already exists, including one a
+                        // concurrent first write just created, is overwritten:
+                        // the last writer wins. On `MySQL` a conflict that
+                        // rewrites identical values still counts as one
+                        // affected row, which `exec` requires, because sqlx
+                        // connects with `CLIENT_FOUND_ROWS`.
+                        let on_conflict = SecureOnConflict::<cursor::Entity>::columns([
+                            cursor::Column::ConsumerGroup,
+                            cursor::Column::TopicId,
+                            cursor::Column::Partition,
+                        ])
+                        .update_columns([cursor::Column::Offset, cursor::Column::UpdatedAt])?;
+                        cursor::Entity::insert(am.clone())
+                            .secure()
+                            .scope_with_model(&AccessScope::for_tenant(tenant_id), &am)?
+                            .on_conflict(on_conflict)
+                            .exec(tx)
+                            .await?;
+                    }
+                    Ok::<(), DomainError>(())
+                })
+            })
+            .await
     }
 }
 
@@ -545,6 +651,7 @@ impl ProducerRegistry for Storage {
         row.map(|r| {
             Ok(ProducerRecord {
                 owner: r.owner_id,
+                tenant: r.tenant_id,
                 mode: str_to_producer_mode(&r.mode)?,
             })
         })
@@ -709,10 +816,10 @@ impl RoutingMarkers for Storage {
         Ok(())
     }
 
-    async fn mark_group(&self, group: &GtsInstanceId) -> Result<(), DomainError> {
+    async fn mark_group(&self, group: ConsumerGroupId) -> Result<(), DomainError> {
         self.cache()?
             .put(PutRequest {
-                key: &group_marker_key(group)?,
+                key: &group_marker_key(group),
                 value: self.instance_id.to_string().as_bytes(),
                 ttl: Ttl::Indefinite,
             })
@@ -720,8 +827,8 @@ impl RoutingMarkers for Storage {
         Ok(())
     }
 
-    async fn unmark_group(&self, group: &GtsInstanceId) -> Result<(), DomainError> {
-        self.cache()?.delete(&group_marker_key(group)?).await?;
+    async fn unmark_group(&self, group: ConsumerGroupId) -> Result<(), DomainError> {
+        self.cache()?.delete(&group_marker_key(group)).await?;
         Ok(())
     }
 }
@@ -773,16 +880,20 @@ mod tests {
     use toolkit_db::outbox::{LeasedMessageHandler, MessageResult, OutboxMessage, Partitions};
 
     use super::*;
+    use crate::test_support::gear_db::ScratchSqlite;
     use crate::test_support::type_registry::registry_holding;
 
     const TEST_INSTANCE_ID: Uuid = Uuid::from_u128(0x5eed);
     use crate::domain::idempotency::ProducerChainCheck;
     use crate::domain::model::ConsumerGroupKind;
     use crate::infra::specification::TypesRegistrySpecificationManager;
-    use crate::infra::storage::migrations::Migrator;
 
     const TOPIC_ID: &str =
         toolkit_gts::gts_id!("cf.core.events.topic.v1~example.eb.storage.topic.v1");
+
+    /// How long a test waits for a held write to reach its pause point, or
+    /// for a write to finish.
+    const BOUND: Duration = Duration::from_secs(10);
 
     /// A `LeasedMessageHandler` that always acknowledges - `Storage`'s own
     /// unit tests exercise `check_and_enqueue`'s transactional
@@ -799,47 +910,27 @@ mod tests {
 
     /// A fresh temp-file `SQLite` database, and the DSN that reaches it.
     ///
-    /// The DSN comes back so a test can open its own second connection: the
+    /// The DSN is there so a test can open its own second connection: the
     /// outbox's bookkeeping tables are not reachable through `DBProvider`
     /// (`toolkit-db` deliberately hands out no raw `SeaORM` executor), and a
     /// test that needs to see where a row was routed has to read them.
-    async fn test_db() -> (Arc<DBProvider<toolkit_db::DbError>>, String) {
-        let mut path = std::env::temp_dir();
-        path.push(format!("cf-eb-storage-test-{}.db", Uuid::now_v7().simple()));
-        let mut file = path.to_string_lossy().replace('\\', "/");
-        if !file.starts_with('/') {
-            file.insert(0, '/');
-        }
-        let dsn = format!("sqlite://{file}?mode=rwc");
-        let opts = toolkit_db::ConnectOpts {
-            max_conns: Some(1),
-            min_conns: Some(1),
-            ..Default::default()
-        };
-        let db = toolkit_db::connect_db(&dsn, opts)
-            .await
-            .expect("connect sqlite");
-        toolkit_db::migration_runner::run_migrations_for_testing(
-            &db,
-            <Migrator as sea_orm_migration::MigratorTrait>::migrations(),
-        )
-        .await
-        .expect("migrations");
-        (Arc::new(DBProvider::new(db)), dsn)
+    async fn test_db() -> ScratchSqlite {
+        ScratchSqlite::open("cf-eb-storage-test").await
     }
 
-    /// A `Storage` wired against a fresh temp-file `SQLite` DB and a real
-    /// (`standalone`-provider-backed) `ClusterCacheV1`, with one topic
-    /// (`TOPIC_ID`) already bulk-loaded into `SpecificationManager` so
-    /// `CursorRepo` tests can resolve it.
-    async fn test_storage() -> Storage {
-        test_storage_with_db().await.0
+    /// A `Storage` wired against a fresh temp-file `SQLite` DB, as
+    /// [`storage_on`] wires it; and that database, whose DSN lets a test read
+    /// the outbox's own bookkeeping tables directly.
+    async fn test_storage() -> (Storage, ScratchSqlite) {
+        let scratch = test_db().await;
+        (storage_on(scratch.db()).await, scratch)
     }
 
-    /// As [`test_storage`], but hands back the `DBProvider` too, so a test can
-    /// read the outbox's own bookkeeping tables directly.
-    async fn test_storage_with_db() -> (Storage, String) {
-        let (db, dsn) = test_db().await;
+    /// A `Storage` on `db` with a real (`standalone`-provider-backed)
+    /// `ClusterCacheV1`, with one topic (`TOPIC_ID`) already bulk-loaded into
+    /// `SpecificationManager` so `CursorRepo` tests can resolve it.
+    async fn storage_on(db: &Arc<DBProvider<toolkit_db::DbError>>) -> Storage {
+        let db = Arc::clone(db);
         let client: Arc<dyn types_registry_sdk::PlatformTypesRegistryApi> = registry_holding(
             &[serde_json::json!({
                 "id": TOPIC_ID,
@@ -885,8 +976,7 @@ mod tests {
             .await
             .expect("outbox start");
         storage.set_outbox(Arc::clone(handle.outbox()));
-
-        (storage, dsn)
+        storage
     }
 
     /// How many rows each registered ingest outbox partition holds, ascending
@@ -894,7 +984,7 @@ mod tests {
     ///
     /// Read from the staging table rather than from
     /// the partitions table's `sequence`, because these tests deliberately
-    /// drop the pipeline handle (see [`test_storage_with_db`]) and so the
+    /// drop the pipeline handle (see [`test_storage`]) and so the
     /// sequencer that fills that column never runs. Enqueue's own routing
     /// decision is already final here: the row names its partition the moment
     /// it is staged.
@@ -946,7 +1036,8 @@ mod tests {
     /// sequencer/processor slot carries work.
     #[tokio::test]
     async fn stateless_publishes_reach_every_outbox_partition() {
-        let (storage, dsn) = test_storage_with_db().await;
+        let (storage, scratch) = test_storage().await;
+        let dsn = scratch.dsn().to_owned();
 
         for ingest_partition in [0, 1, 2, 3, 0, 1, 2, 3] {
             let outcome = storage
@@ -974,7 +1065,8 @@ mod tests {
     /// panic the request task. It must be a retryable answer instead.
     #[tokio::test]
     async fn publish_before_the_pipeline_starts_is_reported_as_unavailable() {
-        let (db, _dsn) = test_db().await;
+        let scratch = test_db().await;
+        let db = Arc::clone(scratch.db());
         let spec_manager = TypesRegistrySpecificationManager::new(Arc::clone(&db));
         // No `set_outbox`: exactly the state `Storage` is in between `init()`
         // and `serve()`.
@@ -999,7 +1091,8 @@ mod tests {
     /// can act on, never a panicked request task.
     #[tokio::test]
     async fn marking_a_subscription_before_the_cache_is_wired_is_reported_as_unavailable() {
-        let (db, _dsn) = test_db().await;
+        let scratch = test_db().await;
+        let db = Arc::clone(scratch.db());
         let spec_manager = TypesRegistrySpecificationManager::new(Arc::clone(&db));
         // No `set_cache`: the state `Storage` is in between `init()` and the
         // point `serve()` resolves the cluster.
@@ -1036,7 +1129,7 @@ mod tests {
 
     #[tokio::test]
     async fn consumer_group_create_find_list_delete_round_trip() {
-        let storage = test_storage().await;
+        let (storage, _scratch) = test_storage().await;
         let tenant_id = Uuid::new_v4();
         let group = test_consumer_group(
             toolkit_gts::gts_id!("cf.core.events.consumer_group.v1~example.eb.storage.cg1.v1"),
@@ -1080,7 +1173,7 @@ mod tests {
     /// unmark, and carries no TTL - it lives exactly as long as the member.
     #[tokio::test]
     async fn subscription_marker_round_trip() {
-        let storage = test_storage().await;
+        let (storage, _scratch) = test_storage().await;
         let id = Uuid::new_v4();
         let group = GtsInstanceId::try_new(toolkit_gts::gts_id!(
             "cf.core.events.consumer_group.v1~example.eb.storage.cg2.v1"
@@ -1127,7 +1220,7 @@ mod tests {
 
     #[tokio::test]
     async fn cursor_find_put_round_trip_denormalizes_tenant() {
-        let storage = test_storage().await;
+        let (storage, _scratch) = test_storage().await;
         let tenant_id = Uuid::new_v4();
         let group = test_consumer_group(
             toolkit_gts::gts_id!("cf.core.events.consumer_group.v1~example.eb.storage.cg3.v1"),
@@ -1154,9 +1247,9 @@ mod tests {
             offset: Sequence::assigned(42),
         };
         storage
-            .put_cursor(&cursor)
+            .put_cursors(std::slice::from_ref(&cursor))
             .await
-            .expect("put_cursor must succeed");
+            .expect("put_cursors must succeed");
 
         let found = storage
             .find_cursor(&group.id, &topic, 0)
@@ -1171,9 +1264,9 @@ mod tests {
             ..cursor
         };
         storage
-            .put_cursor(&updated)
+            .put_cursors(std::slice::from_ref(&updated))
             .await
-            .expect("put_cursor update must succeed");
+            .expect("put_cursors update must succeed");
         let found = storage
             .find_cursor(&group.id, &topic, 0)
             .await
@@ -1182,48 +1275,499 @@ mod tests {
         assert_eq!(
             found.offset,
             Sequence::assigned(99),
-            "second put_cursor must update, not duplicate"
+            "second write must update, not duplicate"
+        );
+
+        // One call writing two cursors writes both: partition 0 is updated
+        // and partition 1 is created.
+        storage
+            .put_cursors(&[
+                Cursor {
+                    offset: Sequence::assigned(100),
+                    ..updated.clone()
+                },
+                Cursor {
+                    partition: 1,
+                    offset: Sequence::assigned(101),
+                    ..updated
+                },
+            ])
+            .await
+            .expect("put_cursors of two cursors must succeed");
+        let offsets = (
+            storage
+                .find_cursor(&group.id, &topic, 0)
+                .await
+                .expect("find_cursor must succeed")
+                .map(|found| found.offset),
+            storage
+                .find_cursor(&group.id, &topic, 1)
+                .await
+                .expect("find_cursor must succeed")
+                .map(|found| found.offset),
+        );
+        assert_eq!(
+            offsets,
+            (Some(Sequence::assigned(100)), Some(Sequence::assigned(101)))
+        );
+
+        // Each row carries its group's tenant.
+        let mut tenants: Vec<(i32, Uuid)> = cursor::Entity::find()
+            .filter(cursor::Column::ConsumerGroup.eq(group.id.as_ref()))
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .all(&storage.db.conn().expect("a connection"))
+            .await
+            .expect("reading the cursor rows must succeed")
+            .into_iter()
+            .map(|row| (row.partition, row.tenant_id))
+            .collect();
+        tenants.sort_unstable();
+        assert_eq!(tenants, vec![(0, tenant_id), (1, tenant_id)]);
+    }
+
+    /// One call's rows come out in primary-key order whatever order the
+    /// caller gave, and rows sharing a key keep the caller's order, so the
+    /// caller's last row for a key is still the one written last.
+    #[test]
+    fn cursor_rows_are_written_in_primary_key_order() {
+        const GROUP: &str = "cf.core.events.consumer_group.v1~example.eb.storage.cg9.v1";
+        const TOPIC_A: i64 = 7;
+        const TOPIC_B: i64 = 11;
+        let tenant_id = Uuid::new_v4();
+        let mut rows = CursorRows::with_capacity(5);
+        for (topic_id, partition, offset) in [
+            (TOPIC_B, 1, 10),
+            (TOPIC_A, 1, 20),
+            (TOPIC_B, 0, 30),
+            (TOPIC_A, 0, 40),
+            (TOPIC_A, 0, 50),
+        ] {
+            rows.push(CursorRow::new(
+                GROUP,
+                topic_id,
+                partition,
+                tenant_id,
+                Sequence::assigned(offset),
+            ));
+        }
+
+        let written: Vec<(String, i64, i32, i64)> = rows
+            .in_key_order()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.key.consumer_group,
+                    row.key.topic_id,
+                    row.key.partition,
+                    row.model.offset.unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            written,
+            vec![
+                (GROUP.to_owned(), TOPIC_A, 0, 40),
+                (GROUP.to_owned(), TOPIC_A, 0, 50),
+                (GROUP.to_owned(), TOPIC_A, 1, 20),
+                (GROUP.to_owned(), TOPIC_B, 0, 30),
+                (GROUP.to_owned(), TOPIC_B, 1, 10),
+            ]
         );
     }
 
-    /// A group marker names this instance as the group's owner.
+    /// A cursor write dropped after its first cursor's upsert, as a seek
+    /// dropped by a disconnecting client is, rolls back: neither cursor is
+    /// written.
     #[tokio::test]
-    async fn group_marker_names_this_instance() {
-        let storage = test_storage().await;
-        let group = GtsInstanceId::try_new(toolkit_gts::gts_id!(
-            "cf.core.events.consumer_group.v1~example.eb.storage.cg4.v1"
-        ))
-        .unwrap();
-        let key = group_marker_key(&group).expect("a consumer group id is a GTS id");
+    async fn put_cursors_cancelled_after_its_first_write_leaves_none() {
+        let (storage, _scratch) = test_storage().await;
+        let tenant_id = Uuid::from_u128(0x0190_f1a2_0000_7000_a000_0000_0000_0c04);
+        let group = test_consumer_group(
+            toolkit_gts::gts_id!("cf.core.events.consumer_group.v1~example.eb.storage.dropped.v1"),
+            tenant_id,
+        );
+        storage
+            .create_consumer_group(group.clone())
+            .await
+            .expect("create must succeed");
+        let topic = GtsInstanceId::try_new(TOPIC_ID).unwrap();
+        let cursors = [0, 1].map(|partition| Cursor {
+            topic: topic.clone(),
+            consumer_group: group.id.clone(),
+            partition,
+            offset: Sequence::assigned(5),
+        });
+        let pause = storage.before_cursor_write_pause().clone();
 
-        storage.mark_group(&group).await.expect("mark must succeed");
-        let entry = storage
-            .cache()
-            .expect("the test wired the cache")
-            .get(&key)
+        {
+            let write = storage.put_cursors(&cursors);
+            tokio::pin!(write);
+
+            // Hold the first cursor's upsert.
+            pause.arm();
+            tokio::time::timeout(BOUND, async {
+                tokio::select! {
+                    () = pause.reached() => {}
+                    result = write.as_mut() => panic!(
+                        "the write finished before its first upsert was held: {result:?}"
+                    ),
+                }
+            })
+            .await
+            .expect("the first upsert reaches the pause point");
+
+            // Let it run and hold the second: the held write disarmed the
+            // point on arrival, so arming again targets the next upsert.
+            pause.arm();
+            pause.release();
+            tokio::time::timeout(BOUND, async {
+                tokio::select! {
+                    () = pause.reached() => {}
+                    result = write.as_mut() => panic!(
+                        "the write finished before its second upsert was held: {result:?}"
+                    ),
+                }
+            })
+            .await
+            .expect("the second upsert reaches the pause point");
+            // The write is dropped here, with its first upsert done.
+        }
+
+        for partition in [0, 1] {
+            let found =
+                tokio::time::timeout(BOUND, storage.find_cursor(&group.id, &topic, partition))
+                    .await
+                    .expect("the cursor read answers within the bound")
+                    .expect("find_cursor must succeed");
+            assert!(
+                found.is_none(),
+                "partition {partition}: the dropped write left {found:?}"
+            );
+        }
+    }
+
+    /// Two members seeding the same partition at once: one write is held
+    /// inside its transaction before its upsert while the other creates the
+    /// row and commits. The held write is not refused: it commits later, so
+    /// its offset stands, in the one row the cursor has. The database has a
+    /// production-sized pool, because the held write's transaction keeps its
+    /// connection while the other write runs on a second one.
+    #[tokio::test]
+    async fn two_first_writes_of_one_cursor_both_succeed() {
+        let gear_db = crate::test_support::gear_db::GearDb::Sqlite
+            .migrated()
+            .await;
+        let storage = Arc::new(storage_on(gear_db.db()).await);
+        let tenant_id = Uuid::from_u128(0x0190_f1a2_0000_7000_a000_0000_0000_0c03);
+        let group = test_consumer_group(
+            toolkit_gts::gts_id!("cf.core.events.consumer_group.v1~example.eb.storage.seeders.v1"),
+            tenant_id,
+        );
+        storage
+            .create_consumer_group(group.clone())
+            .await
+            .expect("create must succeed");
+        let topic = GtsInstanceId::try_new(TOPIC_ID).unwrap();
+        let cursor_at = |offset| Cursor {
+            topic: topic.clone(),
+            consumer_group: group.id.clone(),
+            partition: 2,
+            offset: Sequence::assigned(offset),
+        };
+
+        let pause = storage.before_cursor_write_pause().clone();
+        pause.arm();
+        let held = {
+            let storage = Arc::clone(&storage);
+            let cursor = cursor_at(5);
+            tokio::spawn(async move { storage.put_cursors(std::slice::from_ref(&cursor)).await })
+        };
+        tokio::time::timeout(BOUND, pause.reached())
+            .await
+            .expect("the first write reaches the pause point");
+
+        tokio::time::timeout(BOUND, storage.put_cursors(&[cursor_at(7)]))
+            .await
+            .expect("the second write finishes")
+            .expect("the second write succeeds");
+        pause.release();
+        let held = tokio::time::timeout(BOUND, held)
+            .await
+            .expect("the held write finishes")
+            .expect("the held write's task");
+        assert_eq!(held.map_err(|err| format!("{err:?}")), Ok(()));
+
+        let found = storage
+            .find_cursor(&group.id, &topic, 2)
+            .await
+            .expect("find_cursor must succeed")
+            .map(|found| {
+                (
+                    found.topic,
+                    found.consumer_group,
+                    found.partition,
+                    found.offset,
+                )
+            });
+        assert_eq!(
+            found,
+            Some((topic.clone(), group.id.clone(), 2, Sequence::assigned(5)))
+        );
+        let topic_id = storage
+            .spec_manager
+            .resolve_topic_id(&topic)
+            .await
+            .expect("the topic resolves");
+        let rows = cursor::Entity::find()
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .all(&storage.db.conn().expect("a connection"))
+            .await
+            .expect("read the cursor rows");
+        assert_eq!(
+            rows.into_iter()
+                .map(|row| (
+                    row.consumer_group,
+                    row.topic_id,
+                    row.partition,
+                    row.tenant_id,
+                    row.offset
+                ))
+                .collect::<Vec<_>>(),
+            vec![(group.id.as_ref().to_owned(), topic_id, 2, tenant_id, 5)]
+        );
+    }
+
+    /// A group marker is keyed by the group's own UUID, under a key the
+    /// cluster cache admits, and its value names this instance as the owner.
+    #[tokio::test]
+    async fn a_group_marker_is_keyed_by_the_groups_own_uuid() {
+        let (storage, _scratch) = test_storage().await;
+        let group = ConsumerGroupId::new(Uuid::from_u128(0xabc));
+        let cache = storage.cache().expect("the test wired the cache");
+        // Test-only use of `to_uuid`: it returns the UUID an id ends in, so a
+        // key derived from the GTS id equals this key for every anonymous group.
+        assert_eq!(
+            gts::GtsId::try_new(&group.to_gts()).unwrap().to_uuid(),
+            group.as_uuid()
+        );
+
+        storage.mark_group(group).await.expect("mark must succeed");
+        let entry = cache
+            .get("group-owner/00000000-0000-0000-0000-000000000abc")
             .await
             .expect("get")
             .expect("the marker must exist");
         assert_eq!(entry.value, TEST_INSTANCE_ID.to_string().as_bytes());
 
         storage
-            .unmark_group(&group)
+            .unmark_group(group)
             .await
             .expect("unmark must succeed");
         assert!(
-            storage
-                .cache()
-                .expect("the test wired the cache")
-                .get(&key)
+            cache
+                .get("group-owner/00000000-0000-0000-0000-000000000abc")
                 .await
                 .expect("get")
                 .is_none()
         );
     }
 
+    /// A JOIN marks its group's owner under the UUID the group's id ends in:
+    /// the one the broker minted when it created the group.
+    #[tokio::test]
+    async fn a_join_marks_the_group_under_the_uuid_its_id_ends_in() {
+        let harness = crate::test_support::EventBrokerHarness::builder()
+            .build()
+            .await;
+        let ctx = harness.security_context();
+        let group = harness
+            .broker()
+            .create_consumer_group(
+                ctx,
+                event_broker_sdk::models::CreateConsumerGroupRequest {
+                    client_agent: "marker-test".to_owned(),
+                    description: None,
+                },
+            )
+            .await
+            .expect("the group is created")
+            .id;
+
+        harness
+            .broker()
+            .join(
+                ctx,
+                event_broker_sdk::api::JoinRequest {
+                    consumer_group: group,
+                    client_agent: "marker-test".to_owned(),
+                    interests: Vec::new(),
+                    session_timeout: None,
+                },
+            )
+            .await
+            .expect("the join succeeds");
+
+        let cache = harness.repo().cache().expect("the harness wired the cache");
+        let key = format!("group-owner/{}", group.as_uuid());
+        assert_eq!(
+            cache.scan_prefix("group-owner/").await.expect("scan"),
+            vec![key.clone()]
+        );
+        let entry = cache
+            .get(&key)
+            .await
+            .expect("get")
+            .expect("the marker must exist");
+        assert_eq!(
+            entry.value,
+            harness.repo().instance_id.to_string().as_bytes()
+        );
+    }
+
+    /// A JOIN of a group whose id does not end in a UUID is refused before
+    /// any marker is written, and no member is created.
+    #[tokio::test]
+    async fn a_join_of_a_group_id_without_a_uuid_writes_no_marker() {
+        const GROUP: &str = "gts.cf.core.events.consumer_group.v1~x.eb.storage.unmarked.v1";
+        let harness = crate::test_support::EventBrokerHarness::builder()
+            .build()
+            .await;
+        let ctx = harness.security_context();
+        harness
+            .repo()
+            .create_consumer_group(ConsumerGroup {
+                id: GtsInstanceId::try_new(GROUP).unwrap(),
+                kind: ConsumerGroupKind::Anonymous,
+                tenant_id: ctx.subject_tenant_id(),
+                owner_principal_id: ctx.subject_id(),
+                description: None,
+                created_at: DateTime::parse_from_rfc3339("2026-10-01T12:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            })
+            .await
+            .expect("the group is seeded");
+
+        let result = harness
+            .delivery()
+            .join(
+                ctx,
+                crate::domain::delivery::JoinRequest {
+                    consumer_group: GtsInstanceId::try_new(GROUP).unwrap(),
+                    client_agent: "marker-test".to_owned(),
+                    interests: Vec::new(),
+                    session_timeout: Duration::from_secs(30),
+                },
+            )
+            .await;
+
+        let message = match result {
+            Err(DomainError::Internal(message)) => message,
+            Err(other) => panic!("expected Internal, got {other:?}"),
+            Ok(_) => panic!("the JOIN must be refused"),
+        };
+        assert_eq!(
+            message,
+            "consumer group 'gts.cf.core.events.consumer_group.v1~x.eb.storage.unmarked.v1' \
+             has no owner marker: its id does not end in a UUID (named consumer groups are \
+             tracked in #5702)"
+        );
+        let cache = harness.repo().cache().expect("the harness wired the cache");
+        assert_eq!(
+            cache
+                .scan_prefix("subscription-group/")
+                .await
+                .expect("scan"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            cache.scan_prefix("group-owner/").await.expect("scan"),
+            Vec::<String>::new()
+        );
+        let members = harness.groups().list();
+        assert!(members.is_empty(), "expected no member, got {members:?}");
+    }
+
+    /// Clearing the markers of the member that emptied its group removes the
+    /// group's owner marker, found by the UUID the group's id ends in.
+    #[tokio::test]
+    async fn clearing_an_emptied_group_removes_its_owner_marker() {
+        let (storage, _scratch) = test_storage().await;
+        let group = ConsumerGroupId::new(Uuid::from_u128(0xabd));
+        let cache = storage.cache().expect("the test wired the cache");
+        storage.mark_group(group).await.expect("mark must succeed");
+        assert!(
+            cache
+                .get("group-owner/00000000-0000-0000-0000-000000000abd")
+                .await
+                .expect("get")
+                .is_some()
+        );
+
+        crate::domain::consumer_group_coordinator::sweeper::clear_markers(
+            &storage,
+            &crate::domain::consumer_group_coordinator::Removal {
+                subscription_id: Uuid::from_u128(0x5ab),
+                group: GtsInstanceId::try_new(&group.to_gts()).unwrap(),
+                group_emptied: true,
+            },
+        )
+        .await;
+
+        assert!(
+            cache
+                .get("group-owner/00000000-0000-0000-0000-000000000abd")
+                .await
+                .expect("get")
+                .is_none()
+        );
+    }
+
+    /// A group id that does not end in a UUID has no owner marker to clear:
+    /// the clear warns and still removes the member's subscription marker.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn clearing_an_emptied_group_without_a_uuid_warns_and_clears_its_subscription_marker() {
+        let (storage, _scratch) = test_storage().await;
+        let group = GtsInstanceId::try_new(toolkit_gts::gts_id!(
+            "cf.core.events.consumer_group.v1~example.eb.storage.cg4.v1"
+        ))
+        .unwrap();
+        let subscription_id = Uuid::from_u128(0x5ac);
+        let cache = storage.cache().expect("the test wired the cache");
+        storage
+            .mark_subscription(subscription_id, &group)
+            .await
+            .expect("mark must succeed");
+
+        crate::domain::consumer_group_coordinator::sweeper::clear_markers(
+            &storage,
+            &crate::domain::consumer_group_coordinator::Removal {
+                subscription_id,
+                group,
+                group_emptied: true,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            cache
+                .scan_prefix("subscription-group/")
+                .await
+                .expect("scan"),
+            Vec::<String>::new()
+        );
+        assert!(logs_contain(
+            "no group marker to clear: the group id does not end in a UUID"
+        ));
+        assert!(!logs_contain("failed to clear"));
+    }
+
     #[tokio::test]
     async fn producer_register_and_idempotency_round_trip() {
-        let storage = test_storage().await;
+        let (storage, _scratch) = test_storage().await;
         let owner = Uuid::new_v4();
         let tenant_id = Uuid::new_v4();
 
@@ -1237,6 +1781,7 @@ mod tests {
             .expect("find lookup must succeed")
             .expect("registered producer must be found");
         assert_eq!(record.owner, owner);
+        assert_eq!(record.tenant, tenant_id);
         assert_eq!(record.mode, ProducerMode::Chained);
 
         let topic = GtsInstanceId::try_new(TOPIC_ID).unwrap();
@@ -1353,7 +1898,8 @@ mod tests {
     /// gets the same one (feature 0005 §2.5).
     #[tokio::test]
     async fn an_outbox_identity_is_minted_once_and_reused() {
-        let (db, dsn) = test_db().await;
+        let scratch = test_db().await;
+        let (db, dsn) = (Arc::clone(scratch.db()), scratch.dsn().to_owned());
         let storage = Storage::new(
             Arc::clone(&db),
             Arc::new(TypesRegistrySpecificationManager::new(Arc::clone(&db))),
@@ -1402,7 +1948,8 @@ mod tests {
         use sea_orm::ConnectionTrait;
         use sea_orm::sea_query::{Alias, Query};
 
-        let (db, dsn) = test_db().await;
+        let scratch = test_db().await;
+        let (db, dsn) = (Arc::clone(scratch.db()), scratch.dsn().to_owned());
         let conn = sea_orm::Database::connect(&dsn).await.expect("connect");
         conn.execute(
             Query::insert()

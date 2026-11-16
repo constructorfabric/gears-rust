@@ -78,8 +78,9 @@ impl Default for ReclaimPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RetainedWindows {
     /// Ascending and disjoint. Each is `(lower, upper]`: open below because a
-    /// reader has already consumed its own position and will never return to
-    /// it, closed above because the runway ahead is what it is entitled to.
+    /// reader reads past its own position; one that seeks back below it is
+    /// answered `Unknown` and refetches (see `plan`), closed above because the
+    /// runway ahead is what it is entitled to.
     windows: Vec<(Sequence, Sequence)>,
 }
 
@@ -284,9 +285,10 @@ impl SegmentSummaryBuilder {
 /// Which resident segments one pass takes, and why.
 ///
 /// The three reasons carry different prices and are kept apart for that reason
-/// alone. `dead` costs nothing - nobody can ask for those spans again. `gapped`
-/// and `pressured` will both be refetched, so their sum is the predicted
-/// refetch volume, which is the actual price of bounding residency this way.
+/// alone. `dead` lies below every reader and costs nothing unless a reader
+/// seeks back below it; that costs one refetch. `gapped` and `pressured` will
+/// both be refetched, so their sum is the predicted refetch volume, which is
+/// the actual price of bounding residency this way.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReclaimPlan {
     dead: Vec<Sequence>,

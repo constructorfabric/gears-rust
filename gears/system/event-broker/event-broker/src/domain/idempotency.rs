@@ -17,7 +17,7 @@ use crate::domain::error::DomainError;
 use crate::domain::ingest::ProducerMode;
 
 /// Outcome of a producer chain-sequencing check for one incoming event
-/// (`meta.producer_id`, `meta.previous`, `meta.sequence`) against
+/// (`meta.producer`, `meta.previous`, `meta.sequence`) against
 /// `ADR-0004`'s idempotent producer protocol. `SequenceViolation` carries
 /// the run's producer and the broker's current `last_sequence` so the caller
 /// can build the `docs/openapi.yaml` `412` response body without a second
@@ -42,10 +42,9 @@ pub enum ProducerIdempotencyOutcome {
 pub struct ProducerChainCheck {
     pub producer_id: Uuid,
     pub topic: GtsInstanceId,
-    /// The chained-mode link to the prior sequence. Collapsed to `0` when the
-    /// producer omitted it - a monotonic producer never reaches here carrying
-    /// it (the ingest path rejects that shape first), and monotonic checking
-    /// ignores this field entirely.
+    /// The chained-mode link to the prior sequence. The ingest path admits a
+    /// chained publish only with it and a monotonic one only without it, so a
+    /// monotonic check carries `0` here, which monotonic checking ignores.
     pub previous: i64,
     pub sequence: i64,
     /// The producer's registered dedup mode, which decides how `previous`/

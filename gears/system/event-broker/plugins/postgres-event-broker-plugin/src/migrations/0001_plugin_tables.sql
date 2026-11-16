@@ -3,16 +3,17 @@
 
 -- Queries:
 --   provision, once per provision call, in one transaction:
---     INSERT INTO evbk__log (...) VALUES (...) ON CONFLICT (topic_uuid) DO NOTHING
+--     INSERT INTO evbk__log (...) VALUES (...) ON CONFLICT DO NOTHING
 --     SELECT log_id, partitions FROM evbk__log WHERE topic_uuid = $1 FOR UPDATE
 --     UPDATE evbk__log SET log_id = $2, max_age = $3, max_bytes = $4 WHERE topic_uuid = $1
---   topic lookup, once per topic per process (cached), on any operation:
---     SELECT l.topic_id, l.partitions, ARRAY(SELECT p.table_name FROM evbk__partition p
---      WHERE p.topic_uuid = l.topic_uuid ORDER BY p.partition) FROM evbk__log l WHERE l.topic_uuid = $1
+--   topic lookup, once per topic per process (cached), on any operation, by the unique topic_id:
+--     SELECT l.topic_uuid, l.topic_id, l.partitions, ARRAY(SELECT p.table_name FROM evbk__partition p
+--      WHERE p.topic_uuid = l.topic_uuid ORDER BY p.partition) FROM evbk__log l WHERE l.topic_id = $1
+--   the same lookup from the listener, for a notified topic not cached yet: ... WHERE l.topic_uuid = $1
 --   joined by the listener's republish, the sealer, retention and the rescan (see evbk__partition, evbk__segment)
 CREATE TABLE evbk__log (                             -- one row per provisioned topic
-    topic_uuid     UUID          PRIMARY KEY,         -- GtsId::to_uuid(topic)
-    topic_id       VARCHAR(1024) NOT NULL,
+    topic_uuid     UUID          PRIMARY KEY,         -- TopicSpec.uuid (Registry Reference)
+    topic_id       VARCHAR(1024) NOT NULL UNIQUE,     -- the GTS id; one row per topic
     log_id         UUID          NOT NULL,            -- feature 0006
     partitions     INTEGER       NOT NULL,            -- at most 9999 (table naming)
     max_age        INTERVAL,                          -- NULL = unbounded

@@ -12,6 +12,12 @@
 //! with no diagnostic. A single call that advances what it read cannot be
 //! half-performed.
 //!
+//! Around the session's one await, `read_one` overrides the read's own advance
+//! with a pair of seeks: it holds the reader at its pre-read position while
+//! the batch's decisions are awaited, then releases it to the examined
+//! frontier. `the_reader_holds_the_batch_while_its_decisions_are_awaited` pins
+//! the pair.
+//!
 //! Where the file analogy stops: this file is appended to concurrently and has
 //! holes that fill in later, so a short read is not EOF. `NothingNew` means
 //! "caught up for now" and `Unknown` means "not accounted for yet" - both
@@ -44,19 +50,24 @@ pub trait PartitionReader: Send + Sync {
     /// that position to whatever the read accounted for.
     ///
     /// No offset argument and no companion publish call - see the module note.
-    /// The examined frontier *is* the read's `accounted_through`, which the
-    /// cache itself produced, so there is nothing for a caller to report back.
+    /// For a batch decided whole, the examined frontier *is* the read's
+    /// `accounted_through`, which the cache itself produced. The cap belongs on
+    /// the read, which is what `ReadLimit` guarantees; a caller that decides
+    /// less than the whole result corrects the position with a `seek`.
     ///
-    /// This rests on a read being fully consumed, which is what `ReadLimit`
-    /// guarantees: the cap belongs on the read, not on how much of the result a
-    /// caller chooses to look at. Were partial consumption ever allowed, the
-    /// frontier would stop being derivable here and an explicit
-    /// `release_through(frontier)` would have to come back.
+    /// A batch is not always decided whole: the session may cut one whose
+    /// decisions need more than one wait. It then counts the batch examined
+    /// through its last decided event and seeks the reader back there, so the
+    /// rest is read again. The correction is a `seek`, not a separate publish,
+    /// so the position stays one fact held on the cache's side.
     fn read(&self, limit: ReadLimit) -> PartitionRead;
 
-    /// Moves the position, as `lseek` does. Absolute, because every caller -
-    /// SEEK, and seeding at open - knows the sequence it wants rather than a
-    /// delta, and the only position change that may move *backwards*.
+    /// Moves the position, as `lseek` does. Absolute, because every caller
+    /// knows the sequence it wants rather than a delta: seeding at open, which
+    /// is also how a SEEK's position reaches a reader, and the session's batch
+    /// handling, which holds the reader at its pre-read position while a
+    /// batch's decisions are awaited and then moves it to the batch's examined
+    /// frontier. The only position change that may move *backwards*.
     fn seek(&self, offset: Sequence);
 
     /// Publishes the session's scanning classification.

@@ -219,13 +219,19 @@ impl ConsumerHandle {
     }
 
     /// Gracefully stop the consumer and await all subscription slots.
+    ///
+    /// # Errors
+    ///
+    /// None: it always returns `Ok(())`. A slot whose run ended with an error, or
+    /// panicked, is awaited like the others and its result is not returned.
     pub async fn stop(self) -> Result<(), EventBrokerError> {
         self.consumer.shutdown().await
     }
 
-    /// Current subscription ids (one per active parallelism slot).
-    pub fn subscription_ids(&self) -> Vec<SubscriptionId> {
-        self.consumer.subscription_ids()
+    /// The subscription each parallelism slot joined last. A slot that has not joined yet,
+    /// or is recording a new subscription at that moment, is left out.
+    pub fn subscriptions(&self) -> Vec<SubscriptionId> {
+        self.consumer.subscriptions()
     }
 }
 
@@ -266,6 +272,9 @@ impl Consumer {
         Self::new_with_batch_slots_with_cancel(builder, handler, None).await
     }
 
+    /// Starts one subscription slot per parallel worker, each handing batches to
+    /// `handler`. The consumer's group is resolved once, after every step that can
+    /// refuse the start, and all its slots join that group.
     async fn new_with_batch_slots_with_cancel<M, H>(
         builder: ConsumerBuilder<crate::consumer::builder::BrokerOnly<M>>,
         handler: H,
@@ -276,6 +285,7 @@ impl Consumer {
         H: DeliverBatch + 'static,
     {
         let settings = builder.effective_settings()?;
+        builder.require_identity()?;
         let parallelism = builder.parallelism;
         let broker = builder.broker.clone().ok_or_else(|| {
             EventBrokerError::Internal(
@@ -286,15 +296,28 @@ impl Consumer {
         // Resolved once, before any slot starts, so attributing a delivered event
         // to its topic is a local read rather than a call on the delivery path.
         let type_cache = Arc::new(super::type_cache::ConsumerTypeCache::default());
-        let slot_settings =
-            SlotSettings::for_consumer(&builder, &settings, broker.clone(), type_cache.clone());
+        type_cache
+            .prime(&broker, &builder.security_context, &builder.topics)
+            .await?;
+        // Resolved once, so every slot joins the same group and the group splits the
+        // partitions between them. It comes after the last step that can fail, so a
+        // failed start creates no anonymous group.
+        let group = builder
+            .effective_group()
+            .resolve(broker.as_ref(), &builder.security_context)
+            .await?;
+        let slot_settings = SlotSettings::for_consumer(
+            &builder,
+            &settings,
+            broker.clone(),
+            type_cache.clone(),
+            group,
+        );
         let handler = Arc::new(handler);
         let offset_manager = Arc::new(builder.offset_manager.0);
 
         let mut slots = Vec::with_capacity(parallelism as usize);
         let ctx_arc = Arc::new(builder.security_context);
-
-        type_cache.prime(&broker, &ctx_arc, &builder.topics).await?;
 
         for idx in 0..parallelism {
             let sub_id = Arc::new(tokio::sync::Mutex::new(None));
@@ -364,7 +387,9 @@ impl Consumer {
         Self::new_with_tx_deliver_slots(builder, handler).await
     }
 
-    /// Builds a tx-capable runtime that hands each batch to `handler`.
+    /// Builds a tx-capable runtime that hands each batch to `handler`. The consumer's
+    /// group is resolved once, after every step that can refuse the start, and all its
+    /// slots join that group.
     #[cfg(feature = "db")]
     async fn new_with_tx_deliver_slots<M, H>(
         builder: ConsumerBuilder<WithTx<M>>,
@@ -375,6 +400,7 @@ impl Consumer {
         H: DeliverTxBatch<M> + 'static,
     {
         let settings = builder.effective_settings()?;
+        builder.require_identity()?;
         let parallelism = builder.parallelism;
         let broker = builder.broker.clone().ok_or_else(|| {
             EventBrokerError::Internal(
@@ -385,15 +411,28 @@ impl Consumer {
         // Resolved once, before any slot starts, so attributing a delivered event
         // to its topic is a local read rather than a call on the delivery path.
         let type_cache = Arc::new(super::type_cache::ConsumerTypeCache::default());
-        let slot_settings =
-            SlotSettings::for_consumer(&builder, &settings, broker.clone(), type_cache.clone());
+        type_cache
+            .prime(&broker, &builder.security_context, &builder.topics)
+            .await?;
+        // Resolved once, so every slot joins the same group and the group splits the
+        // partitions between them. It comes after the last step that can fail, so a
+        // failed start creates no anonymous group.
+        let group = builder
+            .effective_group()
+            .resolve(broker.as_ref(), &builder.security_context)
+            .await?;
+        let slot_settings = SlotSettings::for_consumer(
+            &builder,
+            &settings,
+            broker.clone(),
+            type_cache.clone(),
+            group,
+        );
         let handler = Arc::new(handler);
         let offset_manager = Arc::new(builder.offset_manager.0);
 
         let mut slots = Vec::with_capacity(parallelism as usize);
         let ctx_arc = Arc::new(builder.security_context);
-
-        type_cache.prime(&broker, &ctx_arc, &builder.topics).await?;
 
         for idx in 0..parallelism {
             let sub_id = Arc::new(tokio::sync::Mutex::new(None));
@@ -446,8 +485,9 @@ impl Consumer {
         Ok(())
     }
 
-    /// Current subscription ids (one per parallelism slot).
-    pub fn subscription_ids(&self) -> Vec<SubscriptionId> {
+    /// The subscription each parallelism slot joined last. A slot that has not joined yet,
+    /// or is recording a new subscription at that moment, is left out.
+    pub fn subscriptions(&self) -> Vec<SubscriptionId> {
         self.slots
             .iter()
             .filter_map(|s| s.subscription_id.try_lock().ok().and_then(|g| *g))

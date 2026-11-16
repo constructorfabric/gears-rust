@@ -10,6 +10,7 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::config::{EventBrokerConfig, RetentionSize, StreamingConfig};
+use crate::domain::model::BarrierMode;
 
 /// The backend types the fixtures name. Written out rather than imported from
 /// the plugins: an operator writes these strings by hand too.
@@ -240,7 +241,7 @@ fn the_removed_default_storage_backend_key_is_refused() {
     .expect_err("the key no longer exists");
     assert_eq!(
         err.to_string(),
-        "unknown field `default_storage_backend`, expected one of `mode`, `batch`, `publish`, `polling`, `subscription`, `streaming`, `loader`, `workers`, `registration`, `provisioning`, `topics`, `backends`, `backend_routing`, `outbox_groups`"
+        "unknown field `default_storage_backend`, expected one of `mode`, `batch`, `publish`, `subscription`, `streaming`, `loader`, `workers`, `registration`, `provisioning`, `topics`, `backends`, `backend_routing`, `outbox_groups`"
     );
 }
 
@@ -256,7 +257,49 @@ fn the_removed_producer_key_is_refused() {
     .expect_err("the key no longer exists");
     assert_eq!(
         err.to_string(),
-        "unknown field `producer`, expected one of `mode`, `batch`, `publish`, `polling`, `subscription`, `streaming`, `loader`, `workers`, `registration`, `provisioning`, `topics`, `backends`, `backend_routing`, `outbox_groups`"
+        "unknown field `producer`, expected one of `mode`, `batch`, `publish`, `subscription`, `streaming`, `loader`, `workers`, `registration`, `provisioning`, `topics`, `backends`, `backend_routing`, `outbox_groups`"
+    );
+}
+
+/// The long-poll the `polling` section tuned is gone, and nothing read the
+/// section, so a configuration still carrying it is refused rather than
+/// silently ignored.
+#[test]
+fn the_removed_polling_section_is_refused() {
+    let err = serde_json::from_value::<EventBrokerConfig>(json!({
+        "mode": "standalone",
+        "polling": {},
+    }))
+    .expect_err("the section no longer exists");
+    assert_eq!(
+        err.to_string(),
+        "unknown field `polling`, expected one of `mode`, `batch`, `publish`, `subscription`, `streaming`, `loader`, `workers`, `registration`, `provisioning`, `topics`, `backends`, `backend_routing`, `outbox_groups`"
+    );
+}
+
+/// A JOIN's `session_timeout` defaults to 30 seconds and accepts any positive
+/// duration, so the operator keys that claimed to set that default and floor
+/// are refused rather than silently ignored.
+#[test]
+fn the_removed_session_timeout_keys_are_refused() {
+    let err = serde_json::from_value::<EventBrokerConfig>(json!({
+        "mode": "standalone",
+        "subscription": { "default_session_timeout": "PT30S" },
+    }))
+    .expect_err("the key no longer exists");
+    assert_eq!(
+        err.to_string(),
+        "unknown field `default_session_timeout`, expected `join_timeout_secs`"
+    );
+
+    let err = serde_json::from_value::<EventBrokerConfig>(json!({
+        "mode": "standalone",
+        "subscription": { "min_session_timeout": "PT1S" },
+    }))
+    .expect_err("the key no longer exists");
+    assert_eq!(
+        err.to_string(),
+        "unknown field `min_session_timeout`, expected `join_timeout_secs`"
     );
 }
 
@@ -315,6 +358,8 @@ fn streaming_json() -> serde_json::Value {
         "read_batch_max_bytes": 1_048_576,
         "progress_drift_threshold": 1000,
         "progress_min_interval_secs": 30,
+        "authz_scope_ttl_secs": 60,
+        "authz_eval_deadline_secs": 10,
     })
 }
 
@@ -340,6 +385,65 @@ fn a_zero_progress_min_interval_is_a_deserialization_error() {
         err.to_string().contains("at least 1"),
         "expected the reason to name the rule, got: {err}"
     );
+}
+
+#[test]
+fn a_zero_authz_eval_deadline_is_a_deserialization_error() {
+    let mut streaming = streaming_json();
+    streaming["authz_eval_deadline_secs"] = json!(0);
+    let err = serde_json::from_value::<StreamingConfig>(streaming)
+        .expect_err("zero would fail every evaluation at once");
+    assert!(
+        err.to_string().contains("at least 1"),
+        "expected the reason to name the rule, got: {err}"
+    );
+}
+
+#[test]
+fn authz_scope_ttl_secs_refuses_zero() {
+    let mut streaming = streaming_json();
+    streaming["authz_scope_ttl_secs"] = json!(0);
+    let err = serde_json::from_value::<StreamingConfig>(streaming)
+        .expect_err("zero would make every scope group due at once");
+    assert_eq!(err.to_string(), "must be at least 1 second");
+}
+
+#[test]
+fn refresh_lead_is_one_deadline_plus_two_seconds_or_two_for_ignore() {
+    for (deadline_secs, respect, ignore) in [(10, 12, 22), (3, 5, 8)] {
+        let cfg = StreamingConfig {
+            authz_eval_deadline_secs: deadline_secs,
+            ..StreamingConfig::default()
+        };
+        assert_eq!(
+            [BarrierMode::Respect, BarrierMode::Ignore].map(|mode| cfg.refresh_lead(mode)),
+            [Duration::from_secs(respect), Duration::from_secs(ignore)],
+            "deadline {deadline_secs}s"
+        );
+    }
+}
+
+#[test]
+fn zero_eval_deadline_is_refused_with_the_plain_message() {
+    let mut streaming = streaming_json();
+    streaming["authz_eval_deadline_secs"] = json!(0);
+    let err = serde_json::from_value::<StreamingConfig>(streaming)
+        .expect_err("zero would fail every evaluation at once");
+    assert_eq!(err.to_string(), "must be at least 1 second");
+}
+
+#[test]
+fn the_authz_eval_deadline_defaults_to_ten_seconds() {
+    let mut streaming = streaming_json();
+    streaming
+        .as_object_mut()
+        .expect("an object")
+        .remove("authz_eval_deadline_secs");
+
+    let cfg: StreamingConfig = serde_json::from_value(streaming).expect("the key is optional");
+
+    assert_eq!(cfg.authz_eval_deadline_secs, 10);
+    assert_eq!(StreamingConfig::default().authz_eval_deadline_secs, 10);
 }
 
 /// An operator overriding one streaming knob writes only that knob; every
@@ -370,7 +474,6 @@ fn an_empty_block_in_every_section_deserializes_to_its_defaults() {
         "backends": { "main": { "type": MEMORY_BACKEND } },
         "backend_routing": { "gts.cf.core.events.topic.v1~": "main" },
         "batch": {},
-        "polling": {},
         "subscription": {},
         "streaming": {},
         "loader": {},

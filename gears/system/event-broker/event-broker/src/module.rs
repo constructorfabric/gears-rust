@@ -1,6 +1,6 @@
 //! `EventBrokerModule`: the `ModKit` gear that wires Ingest/Delivery/
-//! Dispatcher/Reaper per deployment mode (`DESIGN.md:2224`'s Deployment
-//! Modes table; `docs/ADR/0007-service-decomposition.md`).
+//! Dispatcher/Reaper per deployment mode (the Deployment Modes table of
+//! `DESIGN.md` "4.1 Deployment Modes"; `docs/ADR/0007-service-decomposition.md`).
 //!
 //! `init` resolves and stores the configured [`DeploymentMode`], whose
 //! `*_active()` predicates report which services/routes *should* exist for
@@ -78,7 +78,7 @@ const DIRECTORY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 /// set can never disagree with the mode it's derived from
 /// (`docs/ADR/0007-service-decomposition.md` D6).
 impl DeploymentMode {
-    /// `DESIGN.md:2224`'s Deployment Modes table, column by column.
+    /// The Deployment Modes table of `DESIGN.md` "4.1 Deployment Modes", column by column.
     #[must_use]
     pub fn ingest_active(self) -> bool {
         matches!(self, Self::Standalone | Self::ClusterIngest)
@@ -354,8 +354,9 @@ impl RestApiCapability for EventBrokerModule {
     /// (`infra::wiring::build_handler_state`, over the same real `Storage`
     /// both construct their services against).
     ///
-    /// Resolves `EventBrokerCluster` once and attaches it (plus a shared
-    /// upstream client) via `Extension` after registration, matching the
+    /// Attaches the `HandlerState` (and, where the dispatcher runs, the
+    /// `DispatcherState` with its shared upstream client) via `Extension` after
+    /// registration, matching the
     /// "attach service once after all routes are registered" convention
     /// (`docs/toolkit_unified_system/04_rest_operation_builder.md`).
     fn register_rest(
@@ -446,6 +447,8 @@ impl RestApiCapability for EventBrokerModule {
                 // Process-local: a group is owned by one delivery instance, so
                 // stream exclusion needs no storage and no coordination.
                 Arc::new(crate::domain::streaming::lease::InProcessStreamLeases::new()),
+                Arc::new(crate::domain::streaming::scope_memo::ScopeMemo::new()),
+                Arc::new(crate::domain::streaming::scope::TenantSetInterner::new()),
                 batch,
                 self.outbox_partitions
                     .get()

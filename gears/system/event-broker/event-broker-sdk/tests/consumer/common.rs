@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use event_broker::test_support::{EventBrokerHarness, StaticTypesRegistry};
+use event_broker::test_support::{
+    EventBrokerHarness, EventBrokerHarnessBuilder, StaticTypesRegistry,
+};
 use event_broker_sdk::{Ack, EventBrokerApi, EventV1, GtsIdPattern, GtsInstanceId, GtsTypeId};
 use serde_json::json;
 use toolkit_security::SecurityContext;
@@ -36,32 +38,60 @@ pub struct PublishJson<'a> {
 /// payload - which tests do assert - exactly as the caller wrote them.
 const FIXTURE_PARTITION_POINTER: &str = "/source";
 
+/// Partition key of an event published with neither a partition nor a key: one
+/// fixed value, so such events of a fixture share one partition in every run.
+const UNROUTED_PARTITION_KEY: &str = "00000000-0000-0000-0000-000000000000";
+
 /// The subject type every fixture event carries. A real broker validates
 /// `subject_type` as a GTS id and rejects it unless the event type declares it
 /// in `allowed_subject_types`, so the fixtures publish this one and every
 /// catalog entry allows it.
 pub const SHOWCASE_SUBJECT_TYPE: &str = "gts.x.eb.showcase.subject.v1~";
 
-/// Builds a fixture over a real in-process broker seeded from `catalog`. The
-/// fixture publishes and consumes as the anonymous principal, the same
-/// `SecurityContext` a `ConsumerBuilder` defaults to, so a published event and
-/// the consumer that joins for it share a tenant and delivery matches.
+/// Builds a fixture over a real in-process broker seeded from `catalog`. The fixture
+/// publishes and consumes as the harness principal; every consumer built from the
+/// fixture passes `.security_context(fixture.ctx.clone())`,
+/// `.subject_tenant(fixture.ctx.subject_tenant_id())` and, since its events are
+/// unowned, `.ownership_filter(OwnershipFilter::EntireTenant)`, so a published
+/// event and the consumer that joins for it share a tenant.
 pub async fn fixture_from_catalog(catalog: StaticTypesRegistry) -> TopicFixture {
-    let harness = EventBrokerHarness::builder()
-        .with_type_registry(catalog)
-        .build()
-        .await;
+    fixture_from_harness(EventBrokerHarness::builder().with_type_registry(catalog)).await
+}
+
+async fn fixture_from_harness(builder: EventBrokerHarnessBuilder) -> TopicFixture {
+    let harness = builder.build().await;
     let broker = harness.broker();
+    let ctx = harness.security_context().clone();
     TopicFixture {
         broker,
-        ctx: SecurityContext::anonymous(),
+        ctx,
         _harness: harness,
     }
 }
 
 /// One topic with one event type, the type partitioned by `/source`.
 pub async fn topic_fixture(topic: &str, event_type: &str, partitions: u32) -> TopicFixture {
-    fixture_from_catalog(StaticTypesRegistry::of(json!([
+    fixture_from_catalog(topic_catalog(topic, event_type, partitions)).await
+}
+
+/// A [`topic_fixture`] whose broker sends an idle stream a heartbeat every
+/// `heartbeat` instead of every second.
+pub async fn topic_fixture_with_heartbeat(
+    topic: &str,
+    event_type: &str,
+    partitions: u32,
+    heartbeat: Duration,
+) -> TopicFixture {
+    fixture_from_harness(
+        EventBrokerHarness::builder()
+            .with_type_registry(topic_catalog(topic, event_type, partitions))
+            .with_heartbeat(heartbeat),
+    )
+    .await
+}
+
+fn topic_catalog(topic: &str, event_type: &str, partitions: u32) -> StaticTypesRegistry {
+    StaticTypesRegistry::of(json!([
         { "id": topic, "partitions": partitions },
         {
             "id": event_type,
@@ -70,8 +100,7 @@ pub async fn topic_fixture(topic: &str, event_type: &str, partitions: u32) -> To
             "allowed_subject_types": [SHOWCASE_SUBJECT_TYPE],
             "partition_key": FIXTURE_PARTITION_POINTER,
         },
-    ])))
-    .await
+    ]))
 }
 
 pub async fn publish_json(
@@ -107,13 +136,13 @@ pub async fn publish_json_with_partition_key(request: PublishJson<'_>) {
     let resolved_partition_key = partition_key
         .map(str::to_owned)
         .or_else(|| partition.map(partition_key_for_two_partition_fixture))
-        .unwrap_or_else(|| ctx.subject_tenant_id().to_string());
+        .unwrap_or_else(|| UNROUTED_PARTITION_KEY.to_owned());
     let event = EventV1::builder_for(GtsTypeId::new(event_type), data)
-        .tenant_id(ctx.subject_tenant_id())
+        .subject_tenant(ctx.subject_tenant_id())
         // The fixture's types are partitioned by this member.
         .source(resolved_partition_key)
         .subject(subject)
-        .subject_type_id(GtsTypeId::new(SHOWCASE_SUBJECT_TYPE))
+        .subject_type_of(GtsTypeId::new(SHOWCASE_SUBJECT_TYPE))
         .build()
         .expect("a valid event");
     broker
@@ -133,10 +162,10 @@ pub fn two_partition_event(
 ) -> EventV1 {
     EventV1::builder_for(GtsTypeId::new(event_type), json!({}))
         .id(id)
-        .tenant_id(ctx.subject_tenant_id())
+        .subject_tenant(ctx.subject_tenant_id())
         .source(partition_key_for_two_partition_fixture(partition))
         .subject(subject)
-        .subject_type_id(GtsTypeId::new(SHOWCASE_SUBJECT_TYPE))
+        .subject_type_of(GtsTypeId::new(SHOWCASE_SUBJECT_TYPE))
         .build()
         .expect("a valid event")
 }

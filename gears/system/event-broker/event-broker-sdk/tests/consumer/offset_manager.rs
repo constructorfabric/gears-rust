@@ -1,15 +1,19 @@
 //! Unit tests for offset-store built-in implementations.
 use event_broker_sdk::Sequence;
 use event_broker_sdk::{
-    CommitOffset, ConsumerGroupId, Fallback, InMemoryOffsetManager, OffsetStore, Position, TopicId,
+    CommitOffset, ConsumerGroupId, Fallback, GtsInstanceId, InMemoryOffsetManager, OffsetStore,
+    Position, gts_id,
 };
 
 fn group() -> ConsumerGroupId {
     ConsumerGroupId::new(uuid::Uuid::new_v4())
 }
 
-fn topic() -> TopicId {
-    TopicId::from_gts("gts.cf.core.events.topic.v1~example.orders.v1")
+fn topic() -> GtsInstanceId {
+    GtsInstanceId::try_new(gts_id!(
+        "cf.core.events.topic.v1~example.offsets.orders.x.v1"
+    ))
+    .expect("valid topic GTS instance id")
 }
 
 #[tokio::test]
@@ -83,4 +87,33 @@ async fn in_memory_override_miss_falls_back_to_fallback() {
     let t = topic();
     // Partition not in overrides → falls back to Fallback::Latest.
     assert_eq!(om.load_position(&g, &t, 9).await.unwrap(), Position::Latest);
+}
+
+/// Two topics of one group commit the same partition; each load returns that topic's
+/// own offset.
+#[tokio::test]
+async fn offsets_of_two_topics_never_mix() {
+    let om = InMemoryOffsetManager::new(Fallback::Earliest);
+    let g = group();
+    let orders = topic();
+    let payments = GtsInstanceId::try_new(gts_id!(
+        "cf.core.events.topic.v1~example.offsets.payments.x.v1"
+    ))
+    .expect("valid topic GTS instance id");
+
+    om.commit(&g, &orders, 0, Sequence::assigned(5))
+        .await
+        .unwrap();
+    om.commit(&g, &payments, 0, Sequence::assigned(9))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        om.load_position(&g, &orders, 0).await.unwrap(),
+        Position::Exact(Sequence::assigned(5))
+    );
+    assert_eq!(
+        om.load_position(&g, &payments, 0).await.unwrap(),
+        Position::Exact(Sequence::assigned(9))
+    );
 }

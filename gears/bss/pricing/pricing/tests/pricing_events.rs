@@ -273,7 +273,7 @@ async fn quorum_zero_publish_announces_the_normalised_prices_and_the_decision_in
     assert_eq!(envelope["source"], "bss-pricing");
     assert_eq!(envelope["subject"], g.book);
     assert_eq!(envelope["subject_type"], PRICE_BOOK_SUBJECT_TYPE);
-    assert_eq!(envelope["tenant_id"], tenant.to_string());
+    assert_eq!(envelope["subject_tenant"], tenant.to_string());
     assert_eq!(envelope["producer_mode"], "stateless");
     let mut prices = vec![
         json!({"priceId":first["id"],"priceBookEntryId":g.entry["id"],"dimValue":null,

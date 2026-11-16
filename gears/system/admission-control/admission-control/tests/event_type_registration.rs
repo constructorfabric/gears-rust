@@ -59,7 +59,7 @@ async fn the_platform_registry_lists_the_refusal_event_type_from_the_inventory()
         Some(json!({
             "topic": AUDIT_TOPIC_ID,
             "allowed_subject_types": [ADMISSION_CONTROL_RESOURCE],
-            "partition_key": "/tenant_id",
+            "partition_key": "/subject_tenant",
         }))
     );
     assert_eq!(refusal.content, Some(refusal_event_type_schema()));

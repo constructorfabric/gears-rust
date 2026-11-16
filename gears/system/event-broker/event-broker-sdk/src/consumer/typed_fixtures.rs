@@ -53,9 +53,9 @@ pub(super) fn position_at(sequence: i64) -> StoredPosition {
 pub(super) fn order_event(id: u128, sequence: i64, data: serde_json::Value) -> EventV1 {
     EventV1::builder_for(GtsTypeId::new(ORDER_PLACED), data)
         .id(Uuid::from_u128(id))
-        .tenant_id(Uuid::nil())
+        .subject_tenant(Uuid::nil())
         .subject("order-1")
-        .subject_type_id(GtsTypeId::new("gts.x.eb.test.subject.v1~"))
+        .subject_type_of(GtsTypeId::new("gts.x.eb.test.subject.v1~"))
         .occurred_at("2026-01-02T03:04:05Z".parse().unwrap())
         .build()
         .unwrap()

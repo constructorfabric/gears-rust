@@ -262,9 +262,12 @@ impl ReaderHandle {
         read
     }
 
-    /// Moves the position without reading, as `lseek` does - SEEK, and seeding
-    /// at open. The only position change that may go backwards, which is why it
-    /// is not folded into `read`.
+    /// Moves the position without reading, as `lseek` does: seeding at open,
+    /// which is also how a SEEK's position reaches a reader, and the session's
+    /// batch handling, which holds the reader at its pre-read position while a
+    /// batch's decisions are awaited and then moves it to the batch's examined
+    /// frontier. The only position change that may go backwards, which is why
+    /// it is not folded into `read`.
     ///
     /// Clears starvation for the same reason a read does: a repositioned reader
     /// has no history of going unserved where it now stands.
@@ -576,7 +579,8 @@ pub struct ReclaimReport {
 }
 
 impl ReclaimReport {
-    /// Spans nobody can ask for again. Free.
+    /// Spans below every reader: free unless a reader seeks back below them,
+    /// which costs one refetch.
     #[must_use]
     pub fn dead(self) -> Tally {
         self.dead

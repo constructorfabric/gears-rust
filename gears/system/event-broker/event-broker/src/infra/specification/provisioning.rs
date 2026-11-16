@@ -26,14 +26,12 @@
 
 use std::collections::HashMap;
 
-use event_broker_sdk::backend::support::topic_uuid;
 use event_broker_sdk::backend::{
     Backend, BackendError, LogClaim, LogId, Provisioning, Replacing, Retention, TopicSpec,
 };
 use sea_orm::sea_query::{Expr, ExprTrait};
 use sea_orm::{ColumnTrait, Condition, DbBackend, EntityTrait, QueryFilter, Set};
 use toolkit_db::secure::{SecureEntityExt, SecureUpdateExt, secure_insert};
-use toolkit_gts::GtsInstanceId;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
@@ -75,9 +73,9 @@ fn db_clock(backend: DbBackend, seconds_ago: u64) -> Result<String, DomainError>
 impl TypesRegistrySpecificationManager {
     pub(super) async fn read_topic_state(
         &self,
-        id: &GtsInstanceId,
+        topic: &Topic,
     ) -> Result<Option<TopicState>, DomainError> {
-        self.binding(binding_key(id))
+        self.binding(topic.uuid)
             .await?
             .as_ref()
             .map(state_of)
@@ -114,7 +112,7 @@ impl TypesRegistrySpecificationManager {
                 tracing::warn!(topic = %topic.id, %err, "topic provisioning pass failed; retried on the next pass");
             }
             if !matches!(
-                self.read_topic_state(&topic.id).await,
+                self.read_topic_state(&topic).await,
                 Ok(Some(TopicState::Provisioned { .. }))
             ) {
                 pending += 1;
@@ -148,7 +146,7 @@ impl TypesRegistrySpecificationManager {
             backend: backends.resolve(topic),
             retention: StoredRetention::of(&spec.retention),
             spec,
-            key: binding_key(&topic.id),
+            key: topic.uuid,
             limits,
         };
         match self.binding(attempt.key).await? {
@@ -719,10 +717,6 @@ fn log_partition_mismatch(topic: &Topic, configured: u32, provisioned: Option<i6
     );
 }
 
-fn binding_key(id: &GtsInstanceId) -> Uuid {
-    topic_uuid(id)
-}
-
 fn state_of(row: &topic_binding::Model) -> Result<TopicState, DomainError> {
     let log = LogId::from_uuid(row.log_id);
     match (row.state.as_str(), row.partitions) {
@@ -743,6 +737,7 @@ fn topic_spec(topic: &Topic) -> TopicSpec {
     let retention = topic.settings.retention().value();
     TopicSpec {
         topic: topic.id.clone(),
+        uuid: topic.uuid,
         partitions: Ord::max(*topic.settings.partitions().value(), 1).cast_unsigned(),
         retention: Retention {
             max_age: Some(retention.duration),

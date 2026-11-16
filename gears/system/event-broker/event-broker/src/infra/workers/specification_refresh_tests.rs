@@ -23,6 +23,7 @@ use crate::domain::specification::{ProvisioningLimits, SpecificationManager, Top
 use crate::infra::specification::TypesRegistrySpecificationManager;
 use crate::test_support::SingleBackendResolver;
 use crate::test_support::StaticTypesRegistry;
+use crate::test_support::gear_db::ScratchSqlite;
 use crate::test_support::type_registry::registry_holding;
 
 const TOPIC_ID: &str = "gts.cf.core.events.topic.v1~example.eb.refresh.topic.v1";
@@ -31,38 +32,16 @@ fn topic_document() -> serde_json::Value {
     json!({ "id": TOPIC_ID, "description": "a topic registered after startup" })
 }
 
-async fn test_db() -> Arc<toolkit_db::DBProvider<toolkit_db::DbError>> {
-    use sea_orm_migration::MigratorTrait;
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "cf-eb-refresh-test-{}.db",
-        uuid::Uuid::now_v7().simple()
-    ));
-    let dsn = format!("sqlite://{}?mode=rwc", path.to_string_lossy());
-    let db = toolkit_db::connect_db(
-        &dsn,
-        toolkit_db::ConnectOpts {
-            max_conns: Some(1),
-            min_conns: Some(1),
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("connect sqlite");
-    toolkit_db::migration_runner::run_migrations_for_testing(
-        &db,
-        crate::infra::storage::migrations::Migrator::migrations(),
-    )
-    .await
-    .expect("migrations");
-    Arc::new(toolkit_db::DBProvider::new(db))
+async fn test_db() -> ScratchSqlite {
+    ScratchSqlite::open("cf-eb-refresh-test").await
 }
 
 /// The point of the cadence: a topic that did not exist when the process
 /// started is resolvable after a pass, with no restart in between.
 #[tokio::test]
 async fn a_topic_registered_after_the_first_pass_resolves_after_the_next_one() {
-    let db = test_db().await;
+    let scratch = test_db().await;
+    let db = Arc::clone(scratch.db());
     let empty: Arc<dyn PlatformTypesRegistryApi> = Arc::new(MockTypesRegistry::new());
     let config = StaticTypesRegistry::empty_config();
     let manager = TypesRegistrySpecificationManager::new(Arc::clone(&db));
@@ -103,7 +82,8 @@ async fn a_topic_registered_after_the_first_pass_resolves_after_the_next_one() {
 /// silently re-point every cursor.
 #[tokio::test]
 async fn a_second_forced_pass_does_not_renumber_what_it_still_finds() {
-    let db = test_db().await;
+    let scratch = test_db().await;
+    let db = Arc::clone(scratch.db());
     let client: Arc<dyn PlatformTypesRegistryApi> = registry_holding(&[topic_document()], &[]);
     let worker = || {
         SpecificationRefreshWorker::new(
@@ -134,7 +114,8 @@ async fn a_second_forced_pass_does_not_renumber_what_it_still_finds() {
 /// cache: what the last pass found still serves.
 #[tokio::test]
 async fn a_failing_pass_leaves_the_previous_load_in_place() {
-    let db = test_db().await;
+    let scratch = test_db().await;
+    let db = Arc::clone(scratch.db());
     let client: Arc<dyn PlatformTypesRegistryApi> = registry_holding(&[topic_document()], &[]);
     let manager = TypesRegistrySpecificationManager::new(Arc::clone(&db));
     let topic_id = GtsInstanceId::try_new(TOPIC_ID).expect("a valid GTS instance id");
@@ -263,8 +244,8 @@ impl Backend for ScriptedBackend {
     }
 }
 
-/// A worker over one registered topic provisioned on `backend`, and a manager
-/// reading the same database.
+/// A worker over one registered topic provisioned on `backend`, a manager
+/// reading the same database, and that database.
 async fn provisioning_worker(
     backend: &Arc<ScriptedBackend>,
     call_timeout: Duration,
@@ -272,8 +253,10 @@ async fn provisioning_worker(
 ) -> (
     SpecificationRefreshWorker,
     TypesRegistrySpecificationManager,
+    ScratchSqlite,
 ) {
-    let db = test_db().await;
+    let scratch = test_db().await;
+    let db = Arc::clone(scratch.db());
     let client: Arc<dyn PlatformTypesRegistryApi> = registry_holding(&[topic_document()], &[]);
     let worker = SpecificationRefreshWorker::new(
         client,
@@ -291,22 +274,23 @@ async fn provisioning_worker(
             attempt_timeout: Duration::from_mins(5),
         },
     );
-    (worker, TypesRegistrySpecificationManager::new(db))
+    (worker, TypesRegistrySpecificationManager::new(db), scratch)
 }
 
-/// A worker over one registered topic whose backend never provisions it.
-async fn pending_worker() -> SpecificationRefreshWorker {
+/// A worker over one registered topic whose backend never provisions it, and
+/// its database.
+async fn pending_worker() -> (SpecificationRefreshWorker, ScratchSqlite) {
     let backend = Arc::new(ScriptedBackend::answering([Answer::Pending]));
-    provisioning_worker(&backend, Duration::from_millis(100), Duration::from_mins(1))
-        .await
-        .0
+    let (worker, _, scratch) =
+        provisioning_worker(&backend, Duration::from_millis(100), Duration::from_mins(1)).await;
+    (worker, scratch)
 }
 
 /// A stop during the startup wait ends the wait at once instead of after it:
 /// the process exits promptly on a stop right after launch.
 #[tokio::test]
 async fn a_stop_ends_the_startup_provisioning_wait_promptly() {
-    let worker = pending_worker().await;
+    let (worker, _scratch) = pending_worker().await;
     assert_eq!(
         worker.run_once().await,
         1,
@@ -340,7 +324,7 @@ async fn a_stop_ends_the_startup_provisioning_wait_promptly() {
 /// reports what is still pending.
 #[tokio::test]
 async fn the_startup_provisioning_wait_reports_what_is_left_at_its_bound() {
-    let worker = pending_worker().await;
+    let (worker, _scratch) = pending_worker().await;
     worker.run_once().await;
 
     // The first pass, a 250ms backoff, then one retry; the next 500ms backoff
@@ -358,7 +342,7 @@ async fn the_startup_provisioning_wait_reports_what_is_left_at_its_bound() {
 #[tokio::test]
 async fn the_startup_provisioning_wait_is_bounded_while_a_pass_is_in_flight() {
     let backend = Arc::new(ScriptedBackend::answering([Answer::Hang]));
-    let (worker, _) =
+    let (worker, _, _scratch) =
         provisioning_worker(&backend, Duration::from_secs(5), Duration::from_mins(1)).await;
     worker.load_once().await;
 
@@ -380,7 +364,7 @@ async fn the_startup_provisioning_wait_is_bounded_while_a_pass_is_in_flight() {
 #[tokio::test]
 async fn a_shutdown_ends_a_run_pass_in_flight() {
     let backend = Arc::new(ScriptedBackend::answering([Answer::Hang]));
-    let (worker, _) =
+    let (worker, _, _scratch) =
         provisioning_worker(&backend, Duration::from_secs(5), Duration::from_mins(1)).await;
     worker.load_once().await;
 
@@ -405,10 +389,14 @@ async fn run_retries_a_pending_topic_on_the_short_backoff() {
         Answer::Pending,
         Answer::Ready(4),
     ]));
-    let (worker, manager) =
+    let (worker, manager, _scratch) =
         provisioning_worker(&backend, Duration::from_millis(100), Duration::from_mins(1)).await;
     worker.load_once().await;
-    let topic = GtsInstanceId::try_new(TOPIC_ID).expect("a valid GTS instance id");
+    let topic = manager
+        .get_topic(&GtsInstanceId::try_new(TOPIC_ID).expect("a valid GTS instance id"))
+        .await
+        .expect("the topic reads")
+        .expect("the topic is loaded");
 
     let shutdown = CancellationToken::new();
     let handle = worker.spawn(shutdown.clone());
@@ -429,7 +417,8 @@ async fn run_retries_a_pending_topic_on_the_short_backoff() {
     };
     assert_eq!(state, Some(TopicState::Provisioned { log, partitions: 4 }));
     let spec = TopicSpec {
-        topic,
+        topic: topic.id,
+        uuid: topic.uuid,
         partitions: 8,
         retention: Retention {
             max_age: Some(Duration::from_hours(7 * 24)),

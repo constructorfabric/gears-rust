@@ -136,7 +136,7 @@ fn a_span_below_every_reader_is_dead_and_one_above_is_merely_gapped() {
 
     let decided = plan(&summaries, &positions(&[50, 1000]), &windows_only());
 
-    // The distinction is the price: nobody can ask for 10..=40 again, while
+    // The distinction is the price: no reader reads 10..=40 next, while
     // 400..=500 will be refetched by the reader at 50 as it catches up.
     assert_eq!(starts(decided.dead()), [10]);
     assert_eq!(starts(decided.gapped()), [400]);

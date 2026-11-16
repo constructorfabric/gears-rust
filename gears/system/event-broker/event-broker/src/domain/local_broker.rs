@@ -27,13 +27,14 @@ use async_trait::async_trait;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_gts::GtsInstanceId;
 use toolkit_security::SecurityContext;
+use uuid::Uuid;
 
 use event_broker_sdk as sdk;
 use sdk::EventBrokerError;
 use sdk::api::{
     Ack, AssignedPartition, ControlCode, EventBrokerApi, FrameStream, IngestOutcome, JoinRequest,
     PartitionPosition, ProducerCursors, ProducerMode, SeekPosition, SeekResult,
-    SubscriptionAssignment, SubscriptionInterest, TopicCursors, WireFrame,
+    SubscriptionAssignment, SubscriptionInterest, TopicCursors, UnmatchedTypes, WireFrame,
 };
 use sdk::ids::{ConsumerGroupId, ProducerId, SubscriptionId};
 use sdk::models::{
@@ -43,21 +44,21 @@ use sdk::models::{
 use sdk::{EventV1, StoredPosition};
 
 use crate::domain::delivery::{
-    DeliveryService, JoinRequest as DomainJoinRequest, SeekPosition as DomainSeekPosition,
-    SeekTarget as DomainSeekTarget,
+    DeliveryService, JoinOutcome, JoinRequest as DomainJoinRequest,
+    SeekPosition as DomainSeekPosition, SeekTarget as DomainSeekTarget,
 };
 use crate::domain::error::DomainError;
 use crate::domain::id_parse::{parse_consumer_group_id, parse_topic_id, parse_type_id};
 use crate::domain::ingest::{
     BatchAck, IngestService, ProducerCursors as DomainProducerCursors,
     ProducerMode as DomainProducerMode, ProducerRegistrationInput, ProducerTopicCursors,
-    PublishAck, PublishRequest, SyncPublishAck,
+    PublishAck, PublishMeta, PublishRequest, Selection, SyncPublishAck,
 };
 use crate::domain::model::{
     BarrierMode as DomainBarrierMode, ConsumerGroup as DomainConsumerGroup,
     ConsumerGroupCreateInput, ConsumerGroupFilter, ConsumerGroupKind as DomainConsumerGroupKind,
-    Event as DomainEvent, FilterSpec, Interest, Meta, Subscription as DomainSubscription,
-    TenantTraversalDepth as DomainDepth, Topic as DomainTopic, TopicSegmentManifest,
+    Event as DomainEvent, FilterSpec, Interest, OwnershipFilter as DomainOwnershipFilter,
+    Subscription as DomainSubscription, Topic as DomainTopic, TopicSegmentManifest,
 };
 use crate::domain::paging::{PageCursor, PageLimit, PageRequest};
 use crate::domain::producer_reset::ProducerResetScope;
@@ -201,21 +202,22 @@ impl TryFrom<&EventV1> for PublishRequest {
                         detail: "version out of range".to_owned(),
                     }
                 })?;
-                Ok::<_, EventBrokerError>(Meta {
+                Ok::<_, EventBrokerError>(PublishMeta {
                     version,
-                    producer_id: meta.producer_id.unwrap_or_default(),
+                    producer: meta.producer,
                     previous: meta.previous,
-                    sequence: meta.sequence.unwrap_or(0),
+                    sequence: meta.sequence,
                 })
             })
             .transpose()?;
         Ok(PublishRequest {
             id: event.id(),
             r#type,
-            tenant_id: event.tenant_id(),
+            subject_tenant: event.subject_tenant(),
             source: source.to_owned(),
             subject: event.subject().to_owned(),
             subject_type: event.subject_type().clone(),
+            subject_owner: event.subject_owner(),
             occurred_at: event.occurred_at(),
             trace_parent: event.trace_parent().map(str::to_owned),
             data: event.data().cloned().unwrap_or(serde_json::Value::Null),
@@ -224,18 +226,41 @@ impl TryFrom<&EventV1> for PublishRequest {
     }
 }
 
-/// SDK `SubscriptionInterest` -> domain `Interest` (a JOIN input).
-impl TryFrom<&SubscriptionInterest> for Interest {
+/// SDK `OwnershipFilter` -> domain `OwnershipFilter`.
+impl From<sdk::api::OwnershipFilter> for DomainOwnershipFilter {
+    fn from(filter: sdk::api::OwnershipFilter) -> Self {
+        match filter {
+            sdk::api::OwnershipFilter::OnlyMine => Self::OnlyMine,
+            sdk::api::OwnershipFilter::EntireTenant => Self::EntireTenant,
+            sdk::api::OwnershipFilter::TenantSubtreeIncluded => Self::TenantSubtreeIncluded,
+        }
+    }
+}
+
+/// Domain `OwnershipFilter` -> SDK `OwnershipFilter`.
+impl From<DomainOwnershipFilter> for sdk::api::OwnershipFilter {
+    fn from(filter: DomainOwnershipFilter) -> Self {
+        match filter {
+            DomainOwnershipFilter::OnlyMine => Self::OnlyMine,
+            DomainOwnershipFilter::EntireTenant => Self::EntireTenant,
+            DomainOwnershipFilter::TenantSubtreeIncluded => Self::TenantSubtreeIncluded,
+        }
+    }
+}
+
+/// SDK `SubscriptionInterest` -> domain `Interest` (a JOIN input), for a
+/// caller of tenant `caller_tenant`: an interest that names no tenant reads
+/// the caller's own.
+impl TryFrom<(&SubscriptionInterest, Uuid)> for Interest {
     type Error = EventBrokerError;
 
-    fn try_from(interest: &SubscriptionInterest) -> Result<Self, Self::Error> {
+    fn try_from(
+        (interest, caller_tenant): (&SubscriptionInterest, Uuid),
+    ) -> Result<Self, Self::Error> {
         let topic = parse_topic_id(interest.topic()).map_err(to_sdk_err)?;
-        let depth = match interest.tenant_depth() {
-            sdk::api::TenantTraversalDepth::CurrentTenant => DomainDepth::CurrentTenant,
-            sdk::api::TenantTraversalDepth::Descendants(n) => DomainDepth::Descendants(n),
-            sdk::api::TenantTraversalDepth::UnlimitedDescendants => {
-                DomainDepth::UnlimitedDescendants
-            }
+        let interest_tenant = match interest.subject_tenant() {
+            sdk::api::InterestTenant::Caller => caller_tenant,
+            sdk::api::InterestTenant::Tenant(tenant) => tenant,
         };
         let barrier_mode = match interest.barrier_mode() {
             sdk::api::BarrierMode::Respect => DomainBarrierMode::Respect,
@@ -243,10 +268,11 @@ impl TryFrom<&SubscriptionInterest> for Interest {
         };
         Ok(Interest {
             topic,
-            tenant_id: interest.tenant_id(),
-            depth,
+            subject_tenant: interest_tenant,
+            ownership: interest.ownership_filter().into(),
             barrier_mode,
             types: interest.types().to_vec(),
+            subject_types: interest.subject_types().to_vec(),
             filter: interest.filter().map(|f| FilterSpec {
                 engine: f.engine().to_owned(),
                 expression: f.expression().to_owned(),
@@ -255,17 +281,20 @@ impl TryFrom<&SubscriptionInterest> for Interest {
     }
 }
 
-/// SDK `JoinRequest` -> domain `JoinRequest`; the `PT30S` default is resolved
-/// here when the caller names no timeout, matching the REST layer.
-impl TryFrom<JoinRequest> for DomainJoinRequest {
+/// SDK `JoinRequest` -> domain `JoinRequest` for a caller of tenant
+/// `caller_tenant`; the `PT30S` default is resolved here when the caller
+/// names no timeout, and an interest's tenant when it names none, matching
+/// the REST layer.
+impl TryFrom<(JoinRequest, Uuid)> for DomainJoinRequest {
     type Error = EventBrokerError;
 
-    fn try_from(req: JoinRequest) -> Result<Self, Self::Error> {
-        let consumer_group = parse_consumer_group_id(&req.group.to_gts()).map_err(to_sdk_err)?;
+    fn try_from((req, caller_tenant): (JoinRequest, Uuid)) -> Result<Self, Self::Error> {
+        let consumer_group =
+            parse_consumer_group_id(&req.consumer_group.to_gts()).map_err(to_sdk_err)?;
         let interests = req
             .interests
             .iter()
-            .map(Interest::try_from)
+            .map(|interest| Interest::try_from((interest, caller_tenant)))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(DomainJoinRequest {
             consumer_group,
@@ -360,7 +389,7 @@ impl From<ProducerTopicCursors> for TopicCursors {
 impl From<DomainProducerCursors> for ProducerCursors {
     fn from(cursors: DomainProducerCursors) -> Self {
         ProducerCursors {
-            producer_id: ProducerId(cursors.producer_id),
+            id: ProducerId(cursors.producer_id),
             client_agent: cursors.client_agent,
             topics: cursors.topics.into_iter().map(Into::into).collect(),
         }
@@ -373,8 +402,8 @@ impl TryFrom<DomainConsumerGroup> for ConsumerGroup {
     fn try_from(group: DomainConsumerGroup) -> Result<Self, Self::Error> {
         Ok(ConsumerGroup {
             id: consumer_group_id(&group.id)?,
-            tenant_id: group.tenant_id,
-            owner_principal_id: group.owner_principal_id,
+            tenant: group.tenant_id,
+            owner_principal: group.owner_principal_id,
             kind: match group.kind {
                 DomainConsumerGroupKind::Anonymous => ConsumerGroupKind::Anonymous,
                 DomainConsumerGroupKind::Named => ConsumerGroupKind::Named,
@@ -390,23 +419,17 @@ impl TryFrom<Interest> for SubscriptionInterest {
     type Error = EventBrokerError;
 
     fn try_from(interest: Interest) -> Result<Self, Self::Error> {
-        let depth = match interest.depth {
-            DomainDepth::CurrentTenant => sdk::api::TenantTraversalDepth::CurrentTenant,
-            DomainDepth::Descendants(n) => sdk::api::TenantTraversalDepth::Descendants(n),
-            DomainDepth::UnlimitedDescendants => {
-                sdk::api::TenantTraversalDepth::UnlimitedDescendants
-            }
-        };
         let barrier = match interest.barrier_mode {
             DomainBarrierMode::Respect => sdk::api::BarrierMode::Respect,
             DomainBarrierMode::Ignore => sdk::api::BarrierMode::Ignore,
         };
         let mut builder = SubscriptionInterest::builder()
             .topic(interest.topic)
-            .tenant_id(interest.tenant_id)
-            .tenant_depth(depth)
+            .subject_tenant(interest.subject_tenant)
+            .ownership_filter(interest.ownership.into())
             .barrier_mode(barrier)
-            .types(interest.types);
+            .types(interest.types)
+            .subject_types(interest.subject_types);
         if let Some(filter) = interest.filter {
             builder = builder.filter(sdk::api::Filter::new(filter.engine, filter.expression)?);
         }
@@ -441,13 +464,14 @@ impl TryFrom<DomainSubscription> for Subscription {
     }
 }
 
-/// Domain `Subscription` -> the JOIN response. Infallible (unlike the full
+/// The domain JOIN outcome -> the JOIN response. Infallible (unlike the full
 /// `Subscription` conversion): the assignment shape carries no consumer-group
 /// id to reject a named group on.
-impl From<DomainSubscription> for SubscriptionAssignment {
-    fn from(sub: DomainSubscription) -> Self {
+impl From<JoinOutcome> for SubscriptionAssignment {
+    fn from(outcome: JoinOutcome) -> Self {
+        let sub = outcome.subscription;
         SubscriptionAssignment {
-            subscription_id: SubscriptionId(sub.id),
+            id: SubscriptionId(sub.id),
             topology_version: sub.topology_version,
             assigned: sub
                 .assigned
@@ -456,6 +480,11 @@ impl From<DomainSubscription> for SubscriptionAssignment {
                     topic: a.topic,
                     partition: u32::try_from(a.partition).unwrap_or_default(),
                 })
+                .collect(),
+            unmatched_types: outcome
+                .unmatched_types
+                .into_iter()
+                .map(|(interest, types)| UnmatchedTypes { interest, types })
                 .collect(),
         }
     }
@@ -538,7 +567,7 @@ impl TryFrom<Frame> for WireFrame {
 /// `occurred_at`. A `trace_parent` that is not a W3C traceparent is dropped with a
 /// warning: an event stored before ingest checked the field can carry one, and it
 /// is optional telemetry, so it must not stop the consumer. A JSON `null` `data` is
-/// a body-less event.
+/// a body-less event. The ingest stamp is left out: it is never delivered.
 impl TryFrom<DomainEvent> for EventV1 {
     type Error = EventBrokerError;
 
@@ -566,11 +595,15 @@ impl TryFrom<DomainEvent> for EventV1 {
         };
         let builder = builder
             .id(event.id)
-            .tenant_id(event.tenant_id)
+            .subject_tenant(event.subject_tenant)
             .source(event.source)
             .subject(event.subject)
-            .subject_type_id(event.subject_type)
+            .subject_type_of(event.subject_type)
             .occurred_at(event.occurred_at);
+        let builder = match event.subject_owner {
+            Some(owner) => builder.subject_owner(owner),
+            None => builder,
+        };
         let builder = match trace_parent {
             Some(trace_parent) => builder.trace_parent(trace_parent),
             None => builder,
@@ -770,12 +803,15 @@ impl EventBrokerApi for LocalBroker {
         ctx: &SecurityContext,
         req: JoinRequest,
     ) -> Result<SubscriptionAssignment, EventBrokerError> {
-        let sub = self
+        let outcome = self
             .delivery
-            .join(ctx, DomainJoinRequest::try_from(req)?)
+            .join(
+                ctx,
+                DomainJoinRequest::try_from((req, ctx.subject_tenant_id()))?,
+            )
             .await
             .map_err(to_sdk_err)?;
-        Ok(sub.into())
+        Ok(outcome.into())
     }
 
     async fn get_subscription(
@@ -847,7 +883,7 @@ impl EventBrokerApi for LocalBroker {
     async fn list_topics(&self, ctx: &SecurityContext) -> Result<Vec<Topic>, EventBrokerError> {
         Ok(self
             .ingest
-            .list_topics(ctx)
+            .list_topics(ctx, &Selection::all())
             .await
             .map_err(to_sdk_err)?
             .into_iter()
@@ -878,7 +914,10 @@ impl EventBrokerApi for LocalBroker {
         &self,
         ctx: &SecurityContext,
     ) -> Result<Vec<EventType>, EventBrokerError> {
-        self.ingest.list_event_types(ctx).await.map_err(to_sdk_err)
+        self.ingest
+            .list_event_types(ctx, &Selection::all())
+            .await
+            .map_err(to_sdk_err)
     }
 
     async fn get_event_type(
@@ -886,17 +925,19 @@ impl EventBrokerApi for LocalBroker {
         ctx: &SecurityContext,
         id: &str,
     ) -> Result<EventType, EventBrokerError> {
-        // No single-type service method: select from the list, matching the
-        // REST client's own fallback.
+        // A malformed id names no registered type, and a type the caller may
+        // not read answers as a missing one.
+        let unknown = || EventBrokerError::EventTypeUnknown {
+            event_type: id.to_owned(),
+            detail: "no such event type".to_owned(),
+        };
+        let Ok(type_id) = parse_type_id(id) else {
+            return Err(unknown());
+        };
         self.ingest
-            .list_event_types(ctx)
+            .get_event_type(ctx, &type_id)
             .await
             .map_err(to_sdk_err)?
-            .into_iter()
-            .find(|t| t.id.as_ref() == id)
-            .ok_or_else(|| EventBrokerError::EventTypeUnknown {
-                type_id: id.to_owned(),
-                detail: "no such event type".to_owned(),
-            })
+            .ok_or_else(unknown)
     }
 }

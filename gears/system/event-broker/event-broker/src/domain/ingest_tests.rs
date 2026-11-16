@@ -9,6 +9,7 @@
 //! Event size: the broker counts it as the SDK does, and the ingest outbox row
 //! of a largest event fits the outbox.
 
+use event_broker_sdk::gts::EventV1Traits;
 use toolkit_gts::GtsInstanceId;
 use uuid::Uuid;
 
@@ -27,10 +28,11 @@ fn request(tenant: Uuid, subject: &str, data: serde_json::Value) -> PublishReque
     PublishRequest {
         id: Uuid::new_v4(),
         r#type: crate::test_support::event_type_id(EVENT_TYPE),
-        tenant_id: tenant,
+        subject_tenant: tenant,
         source: "partition-test".to_owned(),
         subject: subject.to_owned(),
         subject_type: gts::GtsTypeId::new("gts.x.eb.part.subject.v1~"),
+        subject_owner: None,
         occurred_at: chrono::Utc::now(),
         trace_parent: None,
         data,
@@ -47,8 +49,10 @@ fn the_tenant_pointer_co_locates_a_tenants_events() {
     let first = request(tenant, "order-1", serde_json::json!({ "order_id": "a" }));
     let second = request(tenant, "order-2", serde_json::json!({ "order_id": "b" }));
 
-    let first_input = partition_input(&first, "/tenant_id").expect("the tenant always resolves");
-    let second_input = partition_input(&second, "/tenant_id").expect("the tenant always resolves");
+    let first_input =
+        partition_input(&first, "/subject_tenant").expect("the tenant always resolves");
+    let second_input =
+        partition_input(&second, "/subject_tenant").expect("the tenant always resolves");
 
     assert_eq!(first_input, tenant.to_string());
     assert_eq!(first_input, second_input);
@@ -57,6 +61,32 @@ fn the_tenant_pointer_co_locates_a_tenants_events() {
         outbox_partition_for(&topic(), &second_input, OutboxPartitions::DEFAULT),
         "same input, same partition"
     );
+}
+
+/// The base's default partition-key pointer is `/subject_tenant`, and it resolves
+/// to the tenant's own string.
+#[test]
+fn the_default_partition_key_resolves_to_the_tenants_own_string() {
+    let tenant = Uuid::from_u128(0x5b7_7e4a_0001);
+    let traits = serde_json::to_value(
+        EventV1Traits::builder()
+            .with_topic(topic().as_ref())
+            .with_allowed_subject_types(["gts.x.eb.part.subject.v1~"])
+            .build(),
+    )
+    .expect("the traits serialize");
+    let Some(default_pointer) = traits["partition_key"].as_str() else {
+        panic!("the traits carry a partition key: {traits}");
+    };
+    assert_eq!(default_pointer, "/subject_tenant");
+
+    let input = partition_input(
+        &request(tenant, "order-1", serde_json::json!({ "order_id": "a" })),
+        default_pointer,
+    )
+    .expect("the default pointer resolves");
+
+    assert_eq!(input, tenant.to_string());
 }
 
 /// A pointer may reach into the payload, which is the case a bare field name
@@ -179,7 +209,7 @@ fn parity_bodies() -> Vec<(serde_json::Value, usize)> {
     let base = serde_json::json!({
         "id": "0190f1a2-0000-7000-8000-00000000e101",
         "type": EVENT_TYPE,
-        "tenant_id": "0190f1a2-0000-7000-8000-000000007e01",
+        "subject_tenant": "0190f1a2-0000-7000-8000-000000007e01",
         "source": "order-service",
         "subject": "order-\"1\"\\x",
         "subject_type": "gts.x.eb.part.subject.v1~",
@@ -204,7 +234,7 @@ fn parity_bodies() -> Vec<(serde_json::Value, usize)> {
                 "data": { "order_id": "o-1", "note": "caf\u{e9} \"quoted\"\n", "total": 12.5 },
                 "meta": {
                     "version": 1,
-                    "producer_id": "0190f1a2-0000-7000-8000-000000000d01",
+                    "producer": "0190f1a2-0000-7000-8000-000000000d01",
                     "previous": 4,
                     "sequence": 5,
                 },
@@ -216,7 +246,7 @@ fn parity_bodies() -> Vec<(serde_json::Value, usize)> {
                 "data": [1, 2, 3],
                 "meta": {
                     "version": 1,
-                    "producer_id": "0190f1a2-0000-7000-8000-000000000d01",
+                    "producer": "0190f1a2-0000-7000-8000-000000000d01",
                     "previous": null,
                     "sequence": 7,
                 },
@@ -228,25 +258,24 @@ fn parity_bodies() -> Vec<(serde_json::Value, usize)> {
             with(serde_json::json!({
                 "meta": {
                     "version": 1,
-                    "producer_id": "0190f1a2-0000-7000-8000-000000000d01",
+                    "producer": "0190f1a2-0000-7000-8000-000000000d01",
                     "previous": -1,
                     "sequence": 0,
                 },
             })),
             0,
         ),
-        // No producer id and no sequence: the id counts as `null`, the sequence as
-        // `0`, three bytes fewer than the SDK's `null`.
+        // No producer id and no sequence: each counts as `null`, as the SDK writes it.
         (
             with(serde_json::json!({ "data": "text", "meta": { "version": 1 } })),
-            3,
+            0,
         ),
         // A literal nil producer id counts as `null`: 34 bytes fewer than its uuid.
         (
             with(serde_json::json!({
                 "meta": {
                     "version": 1,
-                    "producer_id": "00000000-0000-0000-0000-000000000000",
+                    "producer": "00000000-0000-0000-0000-000000000000",
                     "sequence": 3,
                 },
             })),
@@ -288,11 +317,14 @@ fn longest_topic() -> GtsInstanceId {
     GtsInstanceId::try_new(&format!("{prefix}{name}{suffix}")).expect("a valid topic id")
 }
 
-/// The ingest outbox row of an event at the per-event limit, with a topic at the
-/// GTS length limit and a partition key at its cap, fits the outbox's row limit:
-/// the row adds the topic twice, the key, the stored event's empty members, a nil
-/// producer id, which the size counts as `null`, and the flag a synchronous publish's
-/// row carries.
+/// The ingest outbox row of an owned event at the per-event limit, with a topic at
+/// the GTS length limit and a partition key at its cap, fits the outbox's row limit:
+/// the row adds the topic twice, the key, the stored event's empty members, the
+/// stored `meta`'s internal `producer_id` key, 3 bytes longer than the wire
+/// `producer` the size counts, the ingest stamp, and the flag a synchronous
+/// publish's row carries. A stored `meta` always names a registered producer, so the
+/// size counts the same id the row holds. An unowned event's row is smaller: it
+/// leaves out the `null` owner the size counts.
 #[test]
 fn an_ingest_row_of_a_largest_event_fits_the_outbox() {
     let topic = longest_topic();
@@ -303,11 +335,13 @@ fn an_ingest_row_of_a_largest_event_fits_the_outbox() {
         serde_json::json!({ "pad": "" }),
     );
     request.source = "o".repeat(256);
-    request.meta = Some(crate::domain::model::Meta {
+    request.subject_owner = Some(Uuid::from_u128(0x0190_f1a2_0000_7000_8000_0000_0000_0d02));
+    let producer_id = Uuid::from_u128(0x0190_f1a2_0000_7000_8000_0000_0000_0d01);
+    request.meta = Some(super::PublishMeta {
         version: i32::MIN,
-        producer_id: Uuid::nil(),
+        producer: Some(producer_id),
         previous: Some(i64::MIN),
-        sequence: 0,
+        sequence: Some(0),
     });
     let unpadded = request.encoded_len().expect("the request measures");
     request.data = serde_json::json!({
@@ -326,14 +360,22 @@ fn an_ingest_row_of_a_largest_event_fits_the_outbox() {
             id: request.id,
             r#type: request.r#type,
             topic,
-            tenant_id: request.tenant_id,
+            subject_tenant: request.subject_tenant,
             source: request.source,
             subject: request.subject,
             subject_type: request.subject_type,
+            subject_owner: request.subject_owner,
             occurred_at: request.occurred_at,
             trace_parent: request.trace_parent,
             data: request.data,
-            meta: request.meta,
+            meta: request.meta.map(|meta| {
+                meta.into_stored(producer_id, super::ProducerMode::Chained)
+                    .expect("a chained producer's shape")
+            }),
+            ingest: Some(crate::domain::model::IngestStamp {
+                tenant: Uuid::from_u128(0x0190_f1a2_0000_7000_8000_0000_0000_0d03),
+                actor: Uuid::from_u128(0x0190_f1a2_0000_7000_8000_0000_0000_0d04),
+            }),
             partition: None,
             sequence: None,
             sequence_time: None,
@@ -344,7 +386,7 @@ fn an_ingest_row_of_a_largest_event_fits_the_outbox() {
 
     assert_eq!(
         payload.len(),
-        event_broker_sdk::EventV1::MAX_ENCODED_BYTES + 3_220
+        event_broker_sdk::EventV1::MAX_ENCODED_BYTES + 3_295
     );
     toolkit_db::outbox::Record::to(crate::domain::outbox::INGEST_QUEUE_NAME, 0)
         .payload(payload, crate::domain::outbox::INGEST_PAYLOAD_TYPE)

@@ -1,4 +1,4 @@
-//! `POST /v1/events`, `POST /v1/events:batch` (`DESIGN.md:584`,
+//! `POST /v1/events`, `POST /v1/events:batch` (`DESIGN.md` "Module Structure",
 //! `docs/schemas/gts.cf.core.events.event.v1~.schema.json`).
 
 use std::time::Duration;
@@ -53,9 +53,10 @@ fn requested_wait(headers: &axum::http::HeaderMap) -> Result<Option<Duration>, D
     Ok(None)
 }
 
-/// The HTTP status a synchronous publish's outcome answers (DESIGN.md:1335):
-/// `201` once stored, `202` when the wait elapsed first (the events are still
-/// enqueued), `200` when every event was a duplicate.
+/// The HTTP status a synchronous publish's outcome answers (`DESIGN.md` "Sync
+/// vs Async Persist Modes"): `201` once stored, `202` when the wait elapsed
+/// first (the events are still enqueued), `200` when every event was a
+/// duplicate.
 fn sync_status(ack: SyncPublishAck) -> StatusCode {
     match ack {
         SyncPublishAck::Stored => StatusCode::CREATED,

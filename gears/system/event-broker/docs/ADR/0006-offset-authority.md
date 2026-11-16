@@ -74,7 +74,7 @@ The broker resolves the timestamp to the offset of the first event whose `sequen
 
 **Removed:**
 - `POST /v1/subscriptions/{id}/ack` endpoint (and all associated broker-side cursor durability logic)
-- `cursor.acked` position (renamed to `cursor.offset` — the ephemeral session cursor set by SEEK)
+- `cursor.acked` position (renamed to `cursor.offset`: the group's cursor per topic and partition, set only by SEEK)
 - `PartitionNotAssigned` error type (was only raised by ACK)
 - `acknowledge()` method from `DeliveryService`
 
@@ -86,11 +86,11 @@ The broker resolves the timestamp to the offset of the first event whose `sequen
   - Malformed timestamp → `400 InvalidTimestamp`
 
 **Unchanged:**
-- `cursor` inside the broker is still tracked during an active subscription session (ephemeral, cache-only), seeded by `POST /v1/subscriptions/{id}:seek` (SEEK). The SEEK position is the broker's reference for "emit from here" during the stream. It is NOT persisted across sessions — on reconnect, the consumer re-SEEKs from its own store.
+- `cursor` inside the broker is still tracked per consumer group, topic and partition (ephemeral, cache-only), set only by `POST /v1/subscriptions/{id}:seek` (SEEK); delivery does not move it. The SEEK position is the broker's reference for "emit from here" when a stream opens; the stream then advances its read position in the session only. The cursor outlives the session (a later stream opens from it), and the SDK consumer still re-SEEKs from its own offset store after every JOIN and re-JOIN, since the consumer's store is the authority for durable progress.
 - The `"earliest"` and `"latest"` sentinels on the SEEK endpoint are unchanged.
 
 **Consumer contract:**
-Every consumer is responsible for persisting the last offset it has successfully processed, using whatever storage is natural for its deployment context. The broker makes this easy: `offset` appears on every delivered event; persisting it is a single field write.
+Every consumer is responsible for persisting the last offset it has successfully processed, using whatever storage is natural for its deployment context. The broker makes this easy: the event's `sequence` (its offset in the partition) appears on every delivered event; persisting it is a single field write.
 
 **Trade-off acknowledged:**
 Consumers that are stateless by design (one-shot scripts, fire-and-forget readers) can use `"latest"` SEEK and simply accept reprocessing on restart — the at-least-once guarantee is preserved by the consumer's own idempotency, not by the broker's cursor.

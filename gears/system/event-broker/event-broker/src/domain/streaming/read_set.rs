@@ -234,7 +234,7 @@ impl ReadSet {
     }
 
     /// Records what a batch achieved, advancing both the cursor and the
-    /// frontier, and publishing the position for the loader.
+    /// frontier that the stream's frames report.
     pub fn record_batch(&mut self, index: usize, outcome: BatchOutcome) {
         if let Some(slot) = self.slots.get_mut(index) {
             // Monotonic. A read that delivered nothing but examined a
@@ -248,11 +248,10 @@ impl ReadSet {
             // populated contiguously, so that distance is not a number of
             // events at all.
             slot.undelivered = slot.undelivered.saturating_add(outcome.skipped());
-            // Nothing is published to the reader: `read` advanced it to the
-            // same frontier as part of the read itself.
-            // Deliberately nothing published here. The reader advanced itself
-            // to the examined frontier as part of `read`, which is what the
-            // loader sizes runway from and what reclamation retains against.
+            // Deliberately nothing published here. The session has already
+            // moved the reader to this same examined frontier, which is what
+            // the loader sizes runway from and what reclamation retains
+            // against.
             //
             // That the reader tracks the *examined* frontier rather than the
             // delivered cursor is the load-bearing part: it will never read

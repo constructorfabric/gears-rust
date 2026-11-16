@@ -119,7 +119,7 @@ async fn get_producer_cursors_empty_topics_case() {
     resp.assert_status(200);
     assert_eq!(
         resp.json(),
-        json!({ "producer_id": id, "client_agent": "a", "topics": [] })
+        json!({ "id": id, "client_agent": "a", "topics": [] })
     );
 }
 
@@ -210,14 +210,14 @@ async fn publish_chained_event(
         .with_body(Json(&json!({
             "id": Uuid::new_v4(),
             "type": type_id,
-            "tenant_id": Uuid::new_v4(),
+            "subject_tenant": Uuid::new_v4(),
             "source": "test-reset_producer",
             "subject": "s-test-reset_producer",
             "subject_type": subject_type,
             "occurred_at": Utc::now().to_rfc3339(),
             "meta": {
                 "version": 1,
-                "producer_id": producer_id,
+                "producer": producer_id,
                 "previous": previous,
                 "sequence": sequence,
             },
@@ -653,12 +653,12 @@ async fn a_failed_reset_emits_no_audit_record() {
     });
 }
 
-// -- client_agent encoding and length -------------------------------------
+// -- client_agent encoding, length and grammar ----------------------------
 //
 // This is the one `client_agent` that persists - into a column documented as
-// printable ASCII within 256 bytes - so the check runs in the handler, ahead
-// of `IngestService::register_producer`. A rejected request therefore never
-// reaches the write at all.
+// printable ASCII within 256 bytes - so the check runs first in
+// `IngestService::register_producer`, on every path in. A rejected request
+// therefore never reaches the write at all.
 
 #[tokio::test]
 async fn register_producer_rejects_a_non_ascii_client_agent() {
@@ -725,5 +725,61 @@ async fn register_producer_rejects_an_over_length_client_agent() {
                 "resource_type": "gts.cf.core.events.request.v1~",
             },
         })
+    );
+}
+
+#[tokio::test]
+async fn register_producer_rejects_a_client_agent_that_breaks_the_user_agent_grammar() {
+    use sea_orm::ConnectionTrait;
+    use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
+
+    let harness = EventBrokerHarness::builder().build().await;
+
+    let resp = harness
+        .api_v1()
+        .post_producers()
+        .with_body(Json(
+            &json!({ "mode": "chained", "client_agent": "agent/" }),
+        ))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "Request validation failed",
+            "instance": "/event-broker/v1/producers",
+            "context": {
+                "field_violations": [{
+                    "field": "client_agent",
+                    "description": "must follow the RFC 9110 User-Agent grammar: \
+                                    product *( SP ( product / comment ) )",
+                    "reason": "user_agent_grammar",
+                }],
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    let conn = sea_orm::Database::connect(harness.dsn())
+        .await
+        .expect("connect");
+    let producer_rows = conn
+        .query_one(
+            Query::select()
+                .expr_as(Expr::col(Alias::new("id")).count(), "n")
+                .from(Alias::new("event_broker_producer")),
+        )
+        .await
+        .expect("count the producer rows")
+        .expect("a count row")
+        .try_get::<i64>("", "n")
+        .expect("a count");
+    assert_eq!(
+        producer_rows, 0,
+        "a refused registration stores no producer"
     );
 }

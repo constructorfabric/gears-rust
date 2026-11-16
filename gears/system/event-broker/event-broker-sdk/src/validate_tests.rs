@@ -15,7 +15,7 @@ fn err(result: Result<(), TextFieldError>) -> TextFieldError {
     }
 }
 
-// -- client_agent: printable ASCII, 1-256 bytes ---------------------------
+// -- client_agent: printable ASCII, 1-256 bytes, RFC 9110 User-Agent ------
 
 #[test]
 fn client_agent_accepts_a_single_byte() {
@@ -102,6 +102,234 @@ fn client_agent_accepts_a_realistic_agent_string() {
         client_agent("cf-gears-event-broker-sdk/0.2.1 (linux)"),
         Ok(())
     );
+}
+
+#[test]
+fn client_agent_rejects_an_empty_product_token() {
+    let error = err(client_agent("/1.0"));
+    assert_eq!(error.field(), "client_agent");
+    assert_eq!(error.rule(), Rule::Grammar);
+    assert_eq!(
+        error.detail(),
+        "must follow the RFC 9110 User-Agent grammar: product *( SP ( product / comment ) )"
+    );
+    assert_eq!(error.rule().as_reason(), "user_agent_grammar");
+}
+
+#[test]
+fn client_agent_rejects_a_slash_without_a_version() {
+    let error = err(client_agent("agent/"));
+    assert_eq!(error.field(), "client_agent");
+    assert_eq!(error.rule(), Rule::Grammar);
+    assert_eq!(
+        error.detail(),
+        "must follow the RFC 9110 User-Agent grammar: product *( SP ( product / comment ) )"
+    );
+    assert_eq!(error.rule().as_reason(), "user_agent_grammar");
+}
+
+#[test]
+fn client_agent_rejects_a_second_slash_in_one_product() {
+    let error = err(client_agent("agent/1.0/2"));
+    assert_eq!(error.field(), "client_agent");
+    assert_eq!(error.rule(), Rule::Grammar);
+    assert_eq!(
+        error.detail(),
+        "must follow the RFC 9110 User-Agent grammar: product *( SP ( product / comment ) )"
+    );
+    assert_eq!(error.rule().as_reason(), "user_agent_grammar");
+}
+
+#[test]
+fn client_agent_rejects_a_trailing_space() {
+    // RWS must be followed by a product or a comment.
+    let error = err(client_agent("agent 1.0 "));
+    assert_eq!(error.field(), "client_agent");
+    assert_eq!(error.rule(), Rule::Grammar);
+    assert_eq!(
+        error.detail(),
+        "must follow the RFC 9110 User-Agent grammar: product *( SP ( product / comment ) )"
+    );
+    assert_eq!(error.rule().as_reason(), "user_agent_grammar");
+}
+
+#[test]
+fn client_agent_rejects_a_leading_space() {
+    let error = err(client_agent(" agent"));
+    assert_eq!(error.field(), "client_agent");
+    assert_eq!(error.rule(), Rule::Grammar);
+    assert_eq!(
+        error.detail(),
+        "must follow the RFC 9110 User-Agent grammar: product *( SP ( product / comment ) )"
+    );
+    assert_eq!(error.rule().as_reason(), "user_agent_grammar");
+}
+
+#[test]
+fn client_agent_rejects_an_unclosed_comment() {
+    // Two spaces are one RWS; the comment never closes.
+    let error = err(client_agent("agent  (x"));
+    assert_eq!(error.field(), "client_agent");
+    assert_eq!(error.rule(), Rule::Grammar);
+    assert_eq!(
+        error.detail(),
+        "must follow the RFC 9110 User-Agent grammar: product *( SP ( product / comment ) )"
+    );
+    assert_eq!(error.rule().as_reason(), "user_agent_grammar");
+}
+
+#[test]
+fn client_agent_rejects_a_closing_parenthesis_outside_a_comment() {
+    let error = err(client_agent("agent x)"));
+    assert_eq!(error.field(), "client_agent");
+    assert_eq!(error.rule(), Rule::Grammar);
+    assert_eq!(
+        error.detail(),
+        "must follow the RFC 9110 User-Agent grammar: product *( SP ( product / comment ) )"
+    );
+    assert_eq!(error.rule().as_reason(), "user_agent_grammar");
+}
+
+#[test]
+fn client_agent_rejects_an_unbalanced_nested_comment() {
+    let error = err(client_agent("agent (a (b)"));
+    assert_eq!(error.field(), "client_agent");
+    assert_eq!(error.rule(), Rule::Grammar);
+    assert_eq!(
+        error.detail(),
+        "must follow the RFC 9110 User-Agent grammar: product *( SP ( product / comment ) )"
+    );
+    assert_eq!(error.rule().as_reason(), "user_agent_grammar");
+}
+
+#[test]
+fn client_agent_rejects_an_at_sign_in_a_token() {
+    let error = err(client_agent("agent@host"));
+    assert_eq!(error.field(), "client_agent");
+    assert_eq!(error.rule(), Rule::Grammar);
+    assert_eq!(
+        error.detail(),
+        "must follow the RFC 9110 User-Agent grammar: product *( SP ( product / comment ) )"
+    );
+    assert_eq!(error.rule().as_reason(), "user_agent_grammar");
+}
+
+#[test]
+fn client_agent_rejects_a_comment_as_the_first_element() {
+    let error = err(client_agent("(comment)"));
+    assert_eq!(error.field(), "client_agent");
+    assert_eq!(error.rule(), Rule::Grammar);
+    assert_eq!(
+        error.detail(),
+        "must follow the RFC 9110 User-Agent grammar: product *( SP ( product / comment ) )"
+    );
+    assert_eq!(error.rule().as_reason(), "user_agent_grammar");
+}
+
+#[test]
+fn client_agent_rejects_a_comma_in_a_token() {
+    let error = err(client_agent("agent,x"));
+    assert_eq!(error.field(), "client_agent");
+    assert_eq!(error.rule(), Rule::Grammar);
+    assert_eq!(
+        error.detail(),
+        "must follow the RFC 9110 User-Agent grammar: product *( SP ( product / comment ) )"
+    );
+    assert_eq!(error.rule().as_reason(), "user_agent_grammar");
+}
+
+#[test]
+fn client_agent_rejects_a_trailing_backslash_in_a_comment() {
+    // A quoted-pair needs a byte after its backslash.
+    let error = err(client_agent("agent (bad\\"));
+    assert_eq!(error.field(), "client_agent");
+    assert_eq!(error.rule(), Rule::Grammar);
+    assert_eq!(
+        error.detail(),
+        "must follow the RFC 9110 User-Agent grammar: product *( SP ( product / comment ) )"
+    );
+    assert_eq!(error.rule().as_reason(), "user_agent_grammar");
+}
+
+#[test]
+fn client_agent_rejects_a_double_quote_in_a_token() {
+    let error = err(client_agent("a\"b"));
+    assert_eq!(error.field(), "client_agent");
+    assert_eq!(error.rule(), Rule::Grammar);
+    assert_eq!(
+        error.detail(),
+        "must follow the RFC 9110 User-Agent grammar: product *( SP ( product / comment ) )"
+    );
+    assert_eq!(error.rule().as_reason(), "user_agent_grammar");
+}
+
+#[test]
+fn client_agent_rejects_a_comment_without_a_space_before_it() {
+    // Elements after the first are each preceded by RWS.
+    let error = err(client_agent("agent(comment)"));
+    assert_eq!(error.field(), "client_agent");
+    assert_eq!(error.rule(), Rule::Grammar);
+    assert_eq!(
+        error.detail(),
+        "must follow the RFC 9110 User-Agent grammar: product *( SP ( product / comment ) )"
+    );
+    assert_eq!(error.rule().as_reason(), "user_agent_grammar");
+}
+
+#[test]
+fn client_agent_rejects_a_comment_closed_only_by_an_escaped_parenthesis() {
+    // The quoted-pair takes the `)`, so the comment never closes.
+    let error = err(client_agent("agent (bad\\)"));
+    assert_eq!(error.field(), "client_agent");
+    assert_eq!(error.rule(), Rule::Grammar);
+    assert_eq!(
+        error.detail(),
+        "must follow the RFC 9110 User-Agent grammar: product *( SP ( product / comment ) )"
+    );
+    assert_eq!(error.rule().as_reason(), "user_agent_grammar");
+}
+
+#[test]
+fn client_agent_accepts_a_product_with_a_version() {
+    assert_eq!(client_agent("event-broker-sdk/0.1.0"), Ok(()));
+}
+
+#[test]
+fn client_agent_accepts_a_browser_style_agent() {
+    assert_eq!(
+        client_agent("Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/120.0"),
+        Ok(())
+    );
+}
+
+#[test]
+fn client_agent_accepts_nested_comments() {
+    assert_eq!(client_agent("agent (a (nested (deep)) comment)"), Ok(()));
+}
+
+#[test]
+fn client_agent_accepts_an_escaped_parenthesis_in_a_comment() {
+    assert_eq!(client_agent("agent (with \\) escaped)"), Ok(()));
+}
+
+#[test]
+fn client_agent_accepts_several_products() {
+    assert_eq!(client_agent("a/1 b/2 c"), Ok(()));
+}
+
+#[test]
+fn client_agent_accepts_every_token_punctuation() {
+    assert_eq!(client_agent("!#$%&'*+-.^_`|~"), Ok(()));
+}
+
+#[test]
+fn client_agent_reports_length_before_grammar() {
+    // 257 opening parentheses break both rules. Length is reported because
+    // the grammar is judged only on a value of an admissible size.
+    let error = err(client_agent(&"(".repeat(257)));
+    assert_eq!(error.field(), "client_agent");
+    assert_eq!(error.rule(), Rule::Length);
+    assert_eq!(error.detail(), "must be 1-256 bytes, got 257");
 }
 
 // -- description: printable ASCII, 0-1024 bytes ---------------------------

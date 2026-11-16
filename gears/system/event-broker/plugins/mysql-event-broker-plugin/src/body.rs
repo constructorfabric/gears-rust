@@ -3,7 +3,7 @@
 
 use chrono::{DateTime, Utc};
 use event_broker_sdk::backend::{BackendError, Partition};
-use event_broker_sdk::models::Event;
+use event_broker_sdk::models::{Event, IngestStamp};
 use event_broker_sdk::{GtsTypeId, Sequence};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -15,19 +15,31 @@ struct BodyV1 {
     v: u8,
     id: Uuid,
     type_id: String,
-    tenant_id: Uuid,
+    subject_tenant: Uuid,
     source: String,
     subject: String,
     subject_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subject_owner: Option<Uuid>,
     occurred_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     trace_parent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     data: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    meta: Option<BodyMeta>,
 }
 
-/// `event` as `body` stores it. Leaves out `meta` (publisher-only) and the
-/// positions (columns).
+/// The broker's internal ingest stamp, under the body's `meta`. Never the
+/// producer's chain metadata.
+#[derive(Serialize, Deserialize)]
+struct BodyMeta {
+    ingest_tenant: Uuid,
+    ingest_actor: Uuid,
+}
+
+/// `event` as `body` stores it. Leaves out the producer's `meta` (publisher-only)
+/// and the positions (columns); keeps the ingest stamp under `meta`.
 ///
 /// # Errors
 /// `Internal` if the payload cannot be serialized.
@@ -35,14 +47,19 @@ pub fn encode(event: &Event) -> Result<Vec<u8>, BackendError> {
     serde_json::to_vec(&BodyV1 {
         v: VERSION,
         id: event.id,
-        type_id: event.type_id.as_ref().to_owned(),
-        tenant_id: event.tenant_id,
+        type_id: event.event_type.as_ref().to_owned(),
+        subject_tenant: event.subject_tenant,
         source: event.source.clone(),
         subject: event.subject.clone(),
         subject_type: event.subject_type.as_ref().to_owned(),
+        subject_owner: event.subject_owner,
         occurred_at: event.occurred_at,
         trace_parent: event.trace_parent.clone(),
         data: event.data.clone(),
+        meta: event.ingest.map(|stamp| BodyMeta {
+            ingest_tenant: stamp.tenant,
+            ingest_actor: stamp.actor,
+        }),
     })
     .map_err(|_| BackendError::Internal("an event payload could not be encoded".to_owned()))
 }
@@ -69,11 +86,12 @@ pub fn decode(
     }
     Ok(Event {
         id: stored.id,
-        type_id: GtsTypeId::new(&stored.type_id),
-        tenant_id: stored.tenant_id,
+        event_type: GtsTypeId::new(&stored.type_id),
+        subject_tenant: stored.subject_tenant,
         source: stored.source,
         subject: stored.subject,
         subject_type: GtsTypeId::new(&stored.subject_type),
+        subject_owner: stored.subject_owner,
         occurred_at: stored.occurred_at,
         trace_parent: stored.trace_parent,
         data: stored.data,
@@ -81,5 +99,9 @@ pub fn decode(
         sequence: Some(Sequence::assigned(sequence)),
         sequence_time: Some(sequence_time),
         meta: None,
+        ingest: stored.meta.map(|meta| IngestStamp {
+            tenant: meta.ingest_tenant,
+            actor: meta.ingest_actor,
+        }),
     })
 }

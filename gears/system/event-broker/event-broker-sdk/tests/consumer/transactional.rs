@@ -15,12 +15,12 @@ use event_broker_sdk::consumer::{
 use event_broker_sdk::{
     Ack, BatchHandlerOutcome, ConsumerBuilder, ConsumerCommitMode, ConsumerError, ConsumerGroupId,
     ConsumerGroupRef, ConsumerRetry, ConsumerRuntimeEvent, Delivery, EventBatch, EventBrokerApi,
-    EventV1, Fallback, GtsInstanceId, GtsTypeId, HandlerOutcome, Sequence, TopicId, WireFrame,
-    gts_id,
+    EventV1, Fallback, GtsInstanceId, GtsTypeId, HandlerOutcome, Sequence, WireFrame, gts_id,
 };
 use gts::GtsSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use super::common::{
@@ -43,7 +43,7 @@ impl OffsetStore for RecordingTxOffsetManager {
     async fn load_position(
         &self,
         _group: &ConsumerGroupId,
-        _topic: &TopicId,
+        _topic: &GtsInstanceId,
         _partition: u32,
     ) -> Result<Position, OffsetManagerError> {
         Ok(Fallback::Earliest.into())
@@ -56,7 +56,7 @@ impl CommitOffsetInTx for RecordingTxOffsetManager {
         &self,
         _txn: &TX,
         _group: &ConsumerGroupId,
-        _topic: &TopicId,
+        _topic: &GtsInstanceId,
         _partition: u32,
         _offset: Sequence,
     ) -> Result<(), OffsetManagerError>
@@ -113,7 +113,7 @@ impl OffsetStore for CountingTxOffsetManager {
     async fn load_position(
         &self,
         _group: &ConsumerGroupId,
-        _topic: &TopicId,
+        _topic: &GtsInstanceId,
         _partition: u32,
     ) -> Result<Position, OffsetManagerError> {
         Ok(Fallback::Earliest.into())
@@ -126,7 +126,7 @@ impl CommitOffsetInTx for CountingTxOffsetManager {
         &self,
         _txn: &TX,
         _group: &ConsumerGroupId,
-        _topic: &TopicId,
+        _topic: &GtsInstanceId,
         _partition: u32,
         _offset: Sequence,
     ) -> Result<(), OffsetManagerError>
@@ -170,6 +170,9 @@ async fn transactional_consumer_start_paths_return_lifecycle_handles() {
     let fx = topic_fixture(TOPIC, EVENT_TYPE, 3).await;
 
     let single = ConsumerBuilder::new(fx.broker.clone())
+        .subject_tenant(fx.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fx.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("tx-single-start"))
         .topics([topic(TOPIC)])
         .parallelism(1)
@@ -179,6 +182,9 @@ async fn transactional_consumer_start_paths_return_lifecycle_handles() {
         .await
         .expect("transactional single consumer starts");
     let batch = ConsumerBuilder::new(fx.broker.clone())
+        .subject_tenant(fx.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fx.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("tx-batch-start"))
         .topics([topic(TOPIC)])
         .parallelism(1)
@@ -188,6 +194,9 @@ async fn transactional_consumer_start_paths_return_lifecycle_handles() {
         .await
         .expect("transactional batch consumer starts");
     let routed = ConsumerBuilder::new(fx.broker.clone())
+        .subject_tenant(fx.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fx.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("tx-routed-start"))
         .topics([topic(TOPIC)])
         .parallelism(1)
@@ -201,17 +210,17 @@ async fn transactional_consumer_start_paths_return_lifecycle_handles() {
         .expect("transactional routed consumer starts");
 
     for _ in 0..200 {
-        if single.subscription_ids().len() == 1
-            && batch.subscription_ids().len() == 1
-            && routed.subscription_ids().len() == 1
+        if single.subscriptions().len() == 1
+            && batch.subscriptions().len() == 1
+            && routed.subscriptions().len() == 1
         {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert_eq!(single.subscription_ids().len(), 1);
-    assert_eq!(batch.subscription_ids().len(), 1);
-    assert_eq!(routed.subscription_ids().len(), 1);
+    assert_eq!(single.subscriptions().len(), 1);
+    assert_eq!(batch.subscriptions().len(), 1);
+    assert_eq!(routed.subscriptions().len(), 1);
 
     single.stop().await.expect("single stops");
     batch.stop().await.expect("batch stops");
@@ -226,6 +235,9 @@ async fn transactional_consumer_does_not_auto_commit_when_handler_omits_commit_i
     let handled = Arc::new(AtomicUsize::new(0));
 
     let handle = ConsumerBuilder::new(fx.broker.clone())
+        .subject_tenant(fx.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fx.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("tx-no-auto-commit"))
         .topics([topic(TOPIC)])
         .commit_mode(ConsumerCommitMode::auto(Duration::from_millis(5)))
@@ -238,7 +250,7 @@ async fn transactional_consumer_does_not_auto_commit_when_handler_omits_commit_i
         .expect("transactional consumer starts");
 
     for _ in 0..100 {
-        if handle.subscription_ids().len() == 1 {
+        if handle.subscriptions().len() == 1 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -344,10 +356,10 @@ async fn a_transactionally_delivered_event_without_a_stamped_position_is_skipped
     let fx = topic_fixture(TOPIC, EVENT_TYPE, 1).await;
     let unstamped = EventV1::builder_for(event_type(EVENT_TYPE), json!({}))
         .id(Uuid::from_u128(1))
-        .tenant_id(Uuid::nil())
+        .subject_tenant(Uuid::nil())
         .source("injected")
         .subject("unstamped")
-        .subject_type_id(GtsTypeId::new(SHOWCASE_SUBJECT_TYPE))
+        .subject_type_of(GtsTypeId::new(SHOWCASE_SUBJECT_TYPE))
         .occurred_at("2026-01-02T03:04:05Z".parse().unwrap())
         .build()
         .unwrap();
@@ -364,6 +376,9 @@ async fn a_transactionally_delivered_event_without_a_stamped_position_is_skipped
     let runtime_events = listener.events.clone();
 
     let handle = ConsumerBuilder::new(broker.clone())
+        .subject_tenant(fx.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fx.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("tx-unstamped"))
         .topics([topic(TOPIC)])
         .register_listener(listener)
@@ -452,6 +467,9 @@ async fn a_retried_transactional_event_is_redelivered_with_the_next_attempt() {
     let runtime_events = listener.events.clone();
 
     let handle = ConsumerBuilder::new(fx.broker.clone())
+        .subject_tenant(fx.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fx.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("tx-retry-attempts"))
         .topics([topic(TOPIC)])
         .register_listener(listener)
@@ -508,6 +526,9 @@ async fn a_transactional_transport_error_on_the_stream_is_logged_before_the_rejo
     let runtime_events = listener.events.clone();
 
     let handle = ConsumerBuilder::new(broker.clone())
+        .subject_tenant(fx.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fx.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("tx-transport-fault"))
         .topics([topic(TOPIC)])
         .register_listener(listener)
@@ -596,6 +617,7 @@ impl TxEventHandler<serde_json::Value, RecordingTxOffsetManager> for PlacementTx
 /// A transactional consumer in `group` handing each event to a `PlacementTxRecorder`.
 struct PlacementTxConsumer<'a> {
     group: &'a str,
+    ctx: &'a SecurityContext,
 }
 
 impl FaultRunConsumer for PlacementTxConsumer<'_> {
@@ -612,6 +634,9 @@ impl FaultRunConsumer for PlacementTxConsumer<'_> {
             handled,
         };
         ConsumerBuilder::new(broker)
+            .subject_tenant(self.ctx.subject_tenant_id())
+            .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+            .security_context(self.ctx.clone())
             .group(ConsumerGroupRef::auto_anonymous(self.group))
             .topics([topic(TOPIC)])
             .register_listener(listener)
@@ -639,11 +664,14 @@ async fn a_transactional_consumer_resumes_delivery_promptly_after_a_transport_fa
         faulty,
         PlacementTxConsumer {
             group: "tx-transport-resume",
+            ctx: &fx.ctx,
         },
     )
     .await;
 
     assert_eq!(run.placements, vec![(FIRST, 0, 1), (SECOND, 1, 1)]);
+    let (rejoin_group, _) = run.rejoin();
+    assert_eq!(rejoin_group, run.group);
 }
 
 /// The transactional twin of
@@ -661,11 +689,14 @@ async fn a_transactional_consumer_resumes_delivery_promptly_after_its_stream_end
         faulty,
         PlacementTxConsumer {
             group: "tx-end-resume",
+            ctx: &fx.ctx,
         },
     )
     .await;
 
     assert_eq!(run.placements, vec![(FIRST, 0, 1), (SECOND, 1, 1)]);
+    let (rejoin_group, _) = run.rejoin();
+    assert_eq!(rejoin_group, run.group);
 }
 
 /// The transactional twin of
@@ -684,12 +715,15 @@ async fn a_transactional_consumer_resumes_delivery_promptly_after_a_failed_strea
         faulty,
         PlacementTxConsumer {
             group: "tx-open-failure-resume",
+            ctx: &fx.ctx,
         },
     )
     .await;
 
     assert_eq!(run.placements, vec![(FIRST, 0, 1), (SECOND, 1, 1)]);
-    assert_eq!(run.leave_calls, vec![run.rejoined_from()]);
+    let (rejoin_group, rejoined_from) = run.rejoin();
+    assert_eq!(rejoin_group, run.group);
+    assert_eq!(run.leave_calls, vec![rejoined_from]);
 }
 
 /// The transactional twin of
@@ -709,12 +743,15 @@ async fn a_transactional_consumer_resumes_delivery_promptly_after_an_error_befor
         faulty,
         PlacementTxConsumer {
             group: "tx-open-error-resume",
+            ctx: &fx.ctx,
         },
     )
     .await;
 
     assert_eq!(run.placements, vec![(FIRST, 0, 1), (SECOND, 1, 1)]);
-    assert_eq!(run.leave_calls, vec![run.rejoined_from()]);
+    let (rejoin_group, rejoined_from) = run.rejoin();
+    assert_eq!(rejoin_group, run.group);
+    assert_eq!(run.leave_calls, vec![rejoined_from]);
 }
 
 /// The transactional twin of the `recovery` test
@@ -733,20 +770,24 @@ async fn a_transactional_consumer_resumes_delivery_promptly_after_a_stream_that_
         faulty,
         PlacementTxConsumer {
             group: "tx-open-end-resume",
+            ctx: &fx.ctx,
         },
     )
     .await;
 
     assert_eq!(run.placements, vec![(FIRST, 0, 1), (SECOND, 1, 1)]);
-    assert_eq!(run.leave_calls, vec![run.rejoined_from()]);
+    let (rejoin_group, rejoined_from) = run.rejoin();
+    assert_eq!(rejoin_group, run.group);
+    assert_eq!(run.leave_calls, vec![rejoined_from]);
 }
 
 /// The transactional twin of
 /// `recovery::positions_not_set_at_open_is_recovered_by_a_fresh_join`.
 #[tokio::test]
 async fn a_transactional_positions_not_set_at_open_is_recovered_by_a_fresh_join() {
-    // Diverges from docs/openapi.yaml:310-313 (seek the unseeded partitions and retry
-    // the same subscription); the code re-JOINs. Pending #5819.
+    // Diverges from docs/openapi.yaml, GET /v1/events:stream 409 PositionsNotSet (seek
+    // the unseeded partitions and retry the same subscription); the code re-JOINs.
+    // Pending #5819.
     let fx = topic_fixture(TOPIC, EVENT_TYPE, 2).await;
     let faulty = SeekFaultBroker::new(fx.broker.clone(), 0, true);
     let stream_calls = faulty.stream_calls.clone();
@@ -757,6 +798,7 @@ async fn a_transactional_positions_not_set_at_open_is_recovered_by_a_fresh_join(
         faulty,
         PlacementTxConsumer {
             group: "tx-pns-open-resume",
+            ctx: &fx.ctx,
         },
     )
     .await;
@@ -764,7 +806,9 @@ async fn a_transactional_positions_not_set_at_open_is_recovered_by_a_fresh_join(
     assert_eq!(run.placements, vec![(FIRST, 0, 1), (SECOND, 1, 1)]);
     // The refused open and the one after the re-join; the second stream stays open.
     assert_eq!(stream_calls.load(Ordering::SeqCst), 2);
-    assert_eq!(run.leave_calls, vec![run.rejoined_from()]);
+    let (rejoin_group, rejoined_from) = run.rejoin();
+    assert_eq!(rejoin_group, run.group);
+    assert_eq!(run.leave_calls, vec![rejoined_from]);
     let Ok(()) = stopped else {
         panic!("expected the consumer to stop cleanly, got {stopped:?}");
     };
@@ -774,8 +818,9 @@ async fn a_transactional_positions_not_set_at_open_is_recovered_by_a_fresh_join(
 /// `recovery::a_positions_not_set_before_the_first_frame_is_recovered_by_a_fresh_join`.
 #[tokio::test]
 async fn a_transactional_positions_not_set_before_the_first_frame_is_recovered_by_a_fresh_join() {
-    // Diverges from docs/openapi.yaml:310-313 (seek the unseeded partitions and retry
-    // the same subscription); the code re-JOINs. Pending #5819.
+    // Diverges from docs/openapi.yaml, GET /v1/events:stream 409 PositionsNotSet (seek
+    // the unseeded partitions and retry the same subscription); the code re-JOINs.
+    // Pending #5819.
     let fx = topic_fixture(TOPIC, EVENT_TYPE, 2).await;
     let faulty = SeekFaultBroker::new(fx.broker.clone(), 0, false).with_open_error(
         ConsumerError::PositionsNotSet {
@@ -790,12 +835,15 @@ async fn a_transactional_positions_not_set_before_the_first_frame_is_recovered_b
         faulty,
         PlacementTxConsumer {
             group: "tx-pns-first-item-resume",
+            ctx: &fx.ctx,
         },
     )
     .await;
 
     assert_eq!(run.placements, vec![(FIRST, 0, 1), (SECOND, 1, 1)]);
-    assert_eq!(run.leave_calls, vec![run.rejoined_from()]);
+    let (rejoin_group, rejoined_from) = run.rejoin();
+    assert_eq!(rejoin_group, run.group);
+    assert_eq!(run.leave_calls, vec![rejoined_from]);
     let Ok(()) = stopped else {
         panic!("expected the consumer to stop cleanly, got {stopped:?}");
     };
@@ -851,6 +899,9 @@ async fn a_transactional_handler_sees_the_topic_of_each_delivery() {
     };
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("tx-delivery-topic"))
         .topics([topic(ORDERS_TOPIC), topic(AUDIT_TOPIC)])
         .offset_manager(RecordingTxOffsetManager)
@@ -862,10 +913,10 @@ async fn a_transactional_handler_sees_the_topic_of_each_delivery() {
     for (id, event_type) in [(ORDER_ID, ORDERS_EVENT), (AUDIT_ID, AUDIT_EVENT)] {
         let event = EventV1::builder_for(GtsTypeId::new(event_type), json!({}))
             .id(id)
-            .tenant_id(fixture.ctx.subject_tenant_id())
+            .subject_tenant(fixture.ctx.subject_tenant_id())
             .source("tx-delivery-topic")
             .subject("subject-1")
-            .subject_type_id(GtsTypeId::new(SHOWCASE_SUBJECT_TYPE))
+            .subject_type_of(GtsTypeId::new(SHOWCASE_SUBJECT_TYPE))
             .build()
             .expect("a valid event");
         fixture
@@ -947,10 +998,10 @@ async fn typed_fixture() -> TopicFixture {
 async fn publish_order(fixture: &TopicFixture, id: Uuid, data: serde_json::Value) {
     let event = EventV1::builder_for(GtsTypeId::new(ORDER_PLACED), data)
         .id(id)
-        .tenant_id(fixture.ctx.subject_tenant_id())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
         .source("tx-typed-route")
         .subject(id.to_string())
-        .subject_type_id(GtsTypeId::new(SHOWCASE_SUBJECT_TYPE))
+        .subject_type_of(GtsTypeId::new(SHOWCASE_SUBJECT_TYPE))
         .build()
         .expect("a valid event");
     fixture
@@ -1109,6 +1160,9 @@ async fn a_typed_transactional_route_hands_the_decoded_payload_and_commits() {
     let runtime_events = listener.events.clone();
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("tx-typed-route-decoded"))
         .topics([topic(TYPED_TOPIC)])
         .register_listener(listener)
@@ -1160,6 +1214,9 @@ async fn an_undecodable_event_on_a_transactional_stall_route_is_retried_and_neve
     let runtime_events = listener.events.clone();
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("tx-typed-route-stall"))
         .topics([topic(TYPED_TOPIC)])
         .register_listener(listener)
@@ -1182,25 +1239,24 @@ async fn an_undecodable_event_on_a_transactional_stall_route_is_retried_and_neve
 
     // In a transactional consumer `RetryScheduled` comes from the handler's `Retry`
     // and from a handler error; no handler here returns an error.
-    let retries = || -> Vec<(TopicId, String, u32, u16, Duration)> {
+    let retries = || -> Vec<(String, u32, u16, Duration)> {
         runtime_events
             .lock()
             .unwrap()
             .iter()
             .filter_map(|event| match event {
                 ConsumerRuntimeEvent::RetryScheduled {
-                    topic_id,
                     topic,
                     partition,
                     attempt,
                     delay,
-                } => Some((*topic_id, topic.to_string(), *partition, *attempt, *delay)),
+                } => Some((topic.to_string(), *partition, *attempt, *delay)),
                 _ => None,
             })
             .collect()
     };
     wait_for("the third retry is scheduled", || {
-        retries().iter().any(|retry| retry.3 >= 3)
+        retries().iter().any(|retry| retry.2 >= 3)
     })
     .await;
     tokio::time::timeout(BOUND, handle.stop())
@@ -1212,15 +1268,7 @@ async fn an_undecodable_event_on_a_transactional_stall_route_is_retried_and_neve
     let [first, second, third, ..] = retries.as_slice() else {
         panic!("expected at least three RetryScheduled, got {retries:?}");
     };
-    let retry = |attempt| {
-        (
-            TopicId::from_gts(TYPED_TOPIC),
-            TYPED_TOPIC.to_owned(),
-            0,
-            attempt,
-            Duration::from_millis(1),
-        )
-    };
+    let retry = |attempt| (TYPED_TOPIC.to_owned(), 0, attempt, Duration::from_millis(1));
     assert_eq!([first, second, third], [&retry(1), &retry(2), &retry(3)]);
     assert_eq!(*typed_calls.lock().unwrap(), vec![]);
     assert_eq!(commits.load(Ordering::SeqCst), 0);
@@ -1265,6 +1313,9 @@ async fn an_undecodable_event_on_a_transactional_fallback_route_goes_to_the_raw_
     let runtime_events = listener.events.clone();
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("tx-typed-route-fallback"))
         .topics([topic(TYPED_TOPIC)])
         .register_listener(listener)
@@ -1324,6 +1375,9 @@ async fn a_typed_transactional_batch_route_hands_decoded_batches_and_commits() {
     let runtime_events = listener.events.clone();
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("tx-typed-batch-route"))
         .topics([topic(TYPED_TOPIC)])
         .register_listener(listener)
@@ -1422,22 +1476,21 @@ impl TxEventHandler<serde_json::Value, RecordingTxOffsetManager> for HeldTxHandl
     }
 }
 
-/// Every `RetryScheduled` recorded so far, as `(topic_id, topic, partition, attempt, delay)`.
+/// Every `RetryScheduled` recorded so far, as `(topic, partition, attempt, delay)`.
 fn retries_scheduled(
     events: &Mutex<Vec<ConsumerRuntimeEvent>>,
-) -> Vec<(TopicId, GtsInstanceId, u32, u16, Duration)> {
+) -> Vec<(GtsInstanceId, u32, u16, Duration)> {
     events
         .lock()
         .unwrap()
         .iter()
         .filter_map(|event| match event {
             ConsumerRuntimeEvent::RetryScheduled {
-                topic_id,
                 topic,
                 partition,
                 attempt,
                 delay,
-            } => Some((*topic_id, topic.clone(), *partition, *attempt, *delay)),
+            } => Some((topic.clone(), *partition, *attempt, *delay)),
             _ => None,
         })
         .collect()
@@ -1473,6 +1526,9 @@ where
     let listener = RecordingRuntimeListener::default();
     let runtime_events = listener.events.clone();
     let handle = ConsumerBuilder::new(fx.broker.clone())
+        .subject_tenant(fx.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fx.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous(group))
         .topics([topic(TOPIC)])
         .register_listener(listener)
@@ -1518,13 +1574,12 @@ async fn a_transactional_consumer_whose_handler_keeps_retrying_stops_promptly() 
     let [first, second, third, ..] = retries.as_slice() else {
         panic!("at least three retries were scheduled: {retries:?}");
     };
-    let topic_id = TopicId::from_gts(TOPIC);
     assert_eq!(
         [first, second, third],
         [
-            &(topic_id, topic(TOPIC), 0, 1, delay),
-            &(topic_id, topic(TOPIC), 0, 2, delay),
-            &(topic_id, topic(TOPIC), 0, 3, delay),
+            &(topic(TOPIC), 0, 1, delay),
+            &(topic(TOPIC), 0, 2, delay),
+            &(topic(TOPIC), 0, 3, delay),
         ]
     );
 }
@@ -1549,7 +1604,7 @@ async fn stop_during_a_long_backoff(group: &str, answer: TxRetryAnswer) {
     );
     assert_eq!(
         retries_scheduled(&runtime_events),
-        vec![(TopicId::from_gts(TOPIC), topic(TOPIC), 0, 1, delay)]
+        vec![(topic(TOPIC), 0, 1, delay)]
     );
 }
 

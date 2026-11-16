@@ -47,8 +47,8 @@ impl AdvertiseAddressResolver for ConfigAdvertiseAddress<'_> {
     }
 }
 
-/// Parses `host[:port]`; `:0` (or an omitted port) means "use the actual
-/// bound port". Mirrors `grpc-hub`'s `parse_advertise_addr` exactly,
+/// Parses `host[:port]`; `:0` (or an omitted port) means "use
+/// `listen_addr`'s port". Mirrors `grpc-hub`'s `parse_advertise_addr` exactly,
 /// including its `rsplit_once(':')` limitation on IPv6 literals.
 fn parse_advertise_addr(advertise_addr: &str) -> anyhow::Result<(String, Option<u16>)> {
     if let Some((host, port_str)) = advertise_addr.rsplit_once(':') {

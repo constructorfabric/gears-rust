@@ -36,6 +36,8 @@ Each test has a directory of its own and inspects the file with a connection of 
 | §3.3 | a recorded migration that no longer matches keeps the backend `Unavailable` | `a_drifted_schema_keeps_the_backend_unavailable` |
 | §3.1 | stopping one instance leaves another over the file serving, and the stopped one answers `Unavailable` | `stopping_one_instance_leaves_another_on_the_file_running` |
 | §4.1 | partition counts 0 and 10000 are refused with the rule | `partition_counts_out_of_range_are_refused` |
+| §2.1, §2.2, §4.1, §4.2 | `provision` stores the `evbk__log` row and the partition row under the spec's Registry Reference (a fixed UUID no derivation yields), with the topic's GTS id, the log id, the count and no bounds; a fresh instance over the file finds the topic by its GTS id, appends sequence 1 under the same reference and reads it | `a_topic_is_stored_and_found_under_its_registry_reference` |
+| §4.1, §7 | provisioning the topic again under another reference is `Internal("provision: database error (SQLite code 2067)")` (the unique `topic_id` index); the `evbk__log` row and the partition rows stay the first reference's | `a_second_reference_for_a_provisioned_topic_is_refused` |
 | §4.2 | three instances over one file appending to one partition at once assign exactly `1..=300`, each writer's events in order | `concurrent_appenders_across_instances_are_gapless` |
 | §4.2, §4.3 | a restart on the same file keeps the events, the head and the fences: the replayed fence is `Duplicate`, the next one continues at 4 | `a_restart_on_the_same_file_keeps_events_heads_and_fences` |
 | §4.2 | an append whose caller gives up while it waits for the write lock stores nothing, its fence included | `an_append_dropped_before_its_commit_stores_nothing` |

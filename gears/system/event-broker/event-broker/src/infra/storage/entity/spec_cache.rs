@@ -26,6 +26,12 @@ pub struct Model {
     /// wide, mostly-nullable column set for two structurally different
     /// entities sharing one cache table.
     pub payload: String,
+    /// An event type's topic; `None` on a topic row.
+    pub topic: Option<String>,
+    /// An event type's allowed subject type patterns as a JSON array, `[]` on
+    /// a topic row; also inside `payload`, kept apart so a topic's candidates
+    /// are read without every type's `data_schema`.
+    pub allowed_subject_types: String,
 }
 
 /// `Model::kind`'s two valid values - a plain enum (not `#[domain_model]`;

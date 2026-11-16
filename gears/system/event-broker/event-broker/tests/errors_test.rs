@@ -94,7 +94,7 @@ async fn a_publish_the_policy_denies_answers_403() {
         .with_body(Json(&json!({
             "id": "0190f1a2-0000-7000-8000-000000000301",
             "type": EVENT_TYPE,
-            "tenant_id": "0190f1a2-0000-7000-8000-0000000003a1",
+            "subject_tenant": "0190f1a2-0000-7000-8000-0000000003a1",
             "source": "errors-test",
             "subject": "s1",
             "subject_type": SUBJECT_TYPE,
@@ -168,7 +168,7 @@ async fn opening_a_stream_before_seek_answers_409_positions_not_set() {
             "client_agent": "errors-test",
             "interests": [{
                 "topic": TOPIC,
-                "tenant_id": "0190f1a2-0000-7000-8000-0000000005a1",
+                "subject_tenant": "0190f1a2-0000-7000-8000-0000000005a1", "ownership_filter": "entire_tenant",
                 "types": [EVENT_TYPE],
             }],
         })))
@@ -233,12 +233,12 @@ async fn a_chained_publish_off_the_head_answers_412() {
         .with_body(Json(&json!({
             "id": "0190f1a2-0000-7000-8000-000000000601",
             "type": EVENT_TYPE,
-            "tenant_id": "0190f1a2-0000-7000-8000-0000000006a1",
+            "subject_tenant": "0190f1a2-0000-7000-8000-0000000006a1",
             "source": "errors-test",
             "subject": "s1",
             "subject_type": SUBJECT_TYPE,
             "occurred_at": "2026-10-01T12:00:00Z",
-            "meta": { "version": 1, "producer_id": producer_id, "previous": 0, "sequence": 1 },
+            "meta": { "version": 1, "producer": producer_id, "previous": 0, "sequence": 1 },
         })))
         .send()
         .await;
@@ -251,12 +251,12 @@ async fn a_chained_publish_off_the_head_answers_412() {
         .with_body(Json(&json!({
             "id": "0190f1a2-0000-7000-8000-000000000602",
             "type": EVENT_TYPE,
-            "tenant_id": "0190f1a2-0000-7000-8000-0000000006a1",
+            "subject_tenant": "0190f1a2-0000-7000-8000-0000000006a1",
             "source": "errors-test",
             "subject": "s1",
             "subject_type": SUBJECT_TYPE,
             "occurred_at": "2026-10-01T12:00:01Z",
-            "meta": { "version": 1, "producer_id": producer_id, "previous": 999, "sequence": 1000 },
+            "meta": { "version": 1, "producer": producer_id, "previous": 999, "sequence": 1000 },
         })))
         .send()
         .await;
@@ -277,7 +277,7 @@ async fn a_chained_publish_off_the_head_answers_412() {
                     "type": "sequence_mismatch",
                     "subject": "(producer)",
                     "description": format!(
-                        "index=0 producer_id={producer_id} topic={TOPIC} last_sequence=1"
+                        "index=0 producer={producer_id} topic={TOPIC} last_sequence=1"
                     ),
                 }],
             },
@@ -300,7 +300,7 @@ async fn an_unreachable_policy_decision_point_answers_500() {
         .with_body(Json(&json!({
             "id": "0190f1a2-0000-7000-8000-000000000801",
             "type": EVENT_TYPE,
-            "tenant_id": "0190f1a2-0000-7000-8000-0000000008a1",
+            "subject_tenant": "0190f1a2-0000-7000-8000-0000000008a1",
             "source": "errors-test",
             "subject": "s1",
             "subject_type": SUBJECT_TYPE,

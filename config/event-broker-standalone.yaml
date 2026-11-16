@@ -65,7 +65,7 @@ gears:
             allowed_subject_types: ["gts.cf.core.demo.subject.v1~"]
             # The base defaults this to the tenant; stated here so the
             # quickstart shows where routing is decided.
-            partition_key: "/tenant_id"
+            partition_key: "/subject_tenant"
           type: object
           allOf:
             - $ref: "gts://gts.cf.core.events.event.v1~"
@@ -78,7 +78,7 @@ gears:
                   type: ["object", "null"]
 
         # A second demo type keyed on `/id` (the event's unique uuid) instead of
-        # `/tenant_id`, so every published event hashes to a different partition
+        # `/subject_tenant`, so every published event hashes to a different partition
         # - the standalone has 8, and a single producer fills them all. This is
         # what makes a multi-consumer group visibly fan out (each member owns a
         # subset of partitions); the tenant-keyed `greeting` type above would put

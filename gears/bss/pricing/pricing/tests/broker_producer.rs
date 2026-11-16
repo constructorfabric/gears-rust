@@ -83,7 +83,7 @@ async fn stored(broker: &EventBrokerHarness) -> Vec<(String, serde_json::Value)>
             .await
             .unwrap();
         for event in events {
-            all.push((event.type_id.to_string(), event.data.unwrap_or_default()));
+            all.push((event.event_type.to_string(), event.data.unwrap_or_default()));
         }
     }
     all
@@ -366,9 +366,9 @@ async fn commit_unwoken(state: &AuthoringState, event: PriceBookEntryReferenceLo
                     let subject = event.price_book_entry_id.to_string();
                     let tenant_id = event.tenant_id;
                     let event = event_broker_sdk::EventV1::builder(event)
-                        .tenant_id(tenant_id)
+                        .subject_tenant(tenant_id)
                         .subject(subject)
-                        .subject_type_id(event_broker_sdk::GtsTypeId::new(
+                        .subject_type_of(event_broker_sdk::GtsTypeId::new(
                             PRICE_BOOK_ENTRY_SUBJECT_TYPE,
                         ))
                         .build()?;

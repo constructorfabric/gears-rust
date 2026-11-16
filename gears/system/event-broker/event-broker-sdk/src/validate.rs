@@ -60,14 +60,16 @@ const SUBJECT: Field = Field {
     bounds: Bounds { min: 1, max: 1024 },
 };
 
-/// Which rule a value broke. Two rules, so a caller can tell a value it must
-/// re-encode from one it must shorten.
+/// Which rule a value broke, so a caller can tell a value it must re-encode
+/// from one it must shorten or one it must reshape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rule {
     /// Carried a byte outside printable ASCII.
     Encoding,
     /// Fell outside the field's byte bounds.
     Length,
+    /// Broke the field's grammar (only `client_agent` has one).
+    Grammar,
 }
 
 impl Rule {
@@ -77,6 +79,7 @@ impl Rule {
         match self {
             Rule::Encoding => reasons::ASCII_ONLY,
             Rule::Length => reasons::FIELD_TOO_LONG,
+            Rule::Grammar => reasons::USER_AGENT_GRAMMAR,
         }
     }
 }
@@ -96,7 +99,7 @@ impl TextFieldError {
         self.field
     }
 
-    /// Which of the two rules the value broke.
+    /// Which rule the value broke.
     #[must_use]
     pub fn rule(&self) -> Rule {
         self.rule
@@ -146,15 +149,130 @@ fn check(field: &Field, value: &str) -> Result<(), TextFieldError> {
     Ok(())
 }
 
+/// The RFC 9110 User-Agent grammar (section 10.1.5, with token from 5.6.2, RWS
+/// from 5.6.3 and comment from 5.6.5):
+///
+/// ```text
+/// User-Agent = product *( RWS ( product / comment ) )
+/// product    = token [ "/" token ]
+/// comment    = "(" *( ctext / quoted-pair / comment ) ")"
+/// ```
+///
+/// It judges only a value [`check`] has already admitted, so every byte is
+/// printable ASCII: HTAB and obs-text cannot occur, RWS is a run of SP, and a
+/// quoted-pair is a backslash and any one byte. A hand-written parser rather
+/// than a pattern, because comments nest.
+struct UserAgentGrammar;
+
+impl UserAgentGrammar {
+    const DETAIL: &str =
+        "must follow the RFC 9110 User-Agent grammar: product *( SP ( product / comment ) )";
+
+    /// Whether `value` is a product followed by any number of products and
+    /// comments, each after at least one SP.
+    fn admits(value: &[u8]) -> bool {
+        let Some(mut at) = Self::product_end(value, 0) else {
+            return false;
+        };
+        while at < value.len() {
+            let element = Self::spaces_end(value, at);
+            if element == at {
+                return false;
+            }
+            let end = if value.get(element) == Some(&b'(') {
+                Self::comment_end(value, element)
+            } else {
+                Self::product_end(value, element)
+            };
+            let Some(end) = end else {
+                return false;
+            };
+            at = end;
+        }
+        true
+    }
+
+    fn spaces_end(value: &[u8], from: usize) -> usize {
+        from + value
+            .get(from..)
+            .map_or(0, |rest| rest.iter().take_while(|&&b| b == b' ').count())
+    }
+
+    /// The end of the run of tchar bytes at `from`; `from` itself when there
+    /// is none.
+    fn token_end(value: &[u8], from: usize) -> usize {
+        from + value.get(from..).map_or(0, |rest| {
+            rest.iter().take_while(|&&b| Self::is_tchar(b)).count()
+        })
+    }
+
+    fn is_tchar(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+    }
+
+    /// The end of the product at `from`: a non-empty token, optionally
+    /// followed by `/` and a non-empty version token.
+    fn product_end(value: &[u8], from: usize) -> Option<usize> {
+        let name_end = Self::token_end(value, from);
+        if name_end == from {
+            return None;
+        }
+        if value.get(name_end) != Some(&b'/') {
+            return Some(name_end);
+        }
+        let version_end = Self::token_end(value, name_end + 1);
+        (version_end > name_end + 1).then_some(version_end)
+    }
+
+    /// The end of the comment opening at `from`, or `None` when it never
+    /// closes. Nesting is tracked by a depth counter rather than recursion, so
+    /// no input can exhaust the stack; depth never exceeds the value's length.
+    fn comment_end(value: &[u8], from: usize) -> Option<usize> {
+        let mut depth = 0_usize;
+        let mut at = from;
+        while let Some(&byte) = value.get(at) {
+            match byte {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(at + 1);
+                    }
+                }
+                // A quoted-pair: the next byte, whatever it is, is taken
+                // literally. A backslash that ends the value leaves the
+                // comment unclosed.
+                b'\\' => at += 1,
+                _ => {}
+            }
+            at += 1;
+        }
+        None
+    }
+}
+
 /// Validates a `client_agent` against the RFC 9110 User-Agent contract the
-/// consumer-group, subscription and producer schemas all declare: printable
-/// ASCII, 1-256 bytes.
+/// consumer-group, subscription and producer schemas all declare. Three rules,
+/// in order: printable ASCII, then 1-256 bytes, then the User-Agent grammar
+/// `product *( SP ( product / comment ) )`. The grammar is judged last, so a
+/// value that also breaks an earlier rule reports that rule.
 ///
 /// # Errors
+///
 /// Returns [`TextFieldError`] naming `client_agent` when the value carries a
-/// byte outside printable ASCII, is empty, or exceeds 256 bytes.
+/// byte outside printable ASCII ([`Rule::Encoding`]), is empty or exceeds 256
+/// bytes ([`Rule::Length`]), or breaks the User-Agent grammar
+/// ([`Rule::Grammar`]).
 pub fn client_agent(value: &str) -> Result<(), TextFieldError> {
-    check(&CLIENT_AGENT, value)
+    check(&CLIENT_AGENT, value)?;
+    if !UserAgentGrammar::admits(value.as_bytes()) {
+        return Err(TextFieldError {
+            field: CLIENT_AGENT.name,
+            rule: Rule::Grammar,
+            detail: UserAgentGrammar::DETAIL.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Validates a resource `description`: printable ASCII, up to 1024 bytes, empty

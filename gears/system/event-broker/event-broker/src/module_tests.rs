@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use super::{BACKEND_STOP_GRACE, EventBrokerModule, start_backends, stop_backends};
 use crate::config::{DeploymentMode, EventBrokerConfig};
+use crate::test_support::gear_db::ScratchSqlite;
 use crate::test_support::module_boot::StaticConfigProvider;
 use event_broker_sdk::backend::{
     AppendRequest, Appended, Backend, BackendError, Dedup, LogClaim, Provisioning, Role,
@@ -48,51 +49,26 @@ impl OpenApiRegistry for NoopOpenApiRegistry {
     }
 }
 
-/// A fresh temp-file `SQLite` DB with this crate's migrations applied -
-/// `init()` now resolves a real `DBProvider` (`ctx.db_required()`) and runs
-/// `SpecificationManager::bulk_load()` against it
-/// (eb-single-process-implementation D1), unlike before this change.
-async fn test_db_provider() -> toolkit_db::DBProvider<toolkit_db::DbError> {
-    test_db_provider_at().await.0
+/// A fresh temp-file `SQLite` gear database with this crate's migrations
+/// applied, for `init()` to resolve (`ctx.db_required()`) and `serve()` to
+/// load the specification cache into.
+async fn test_db() -> ScratchSqlite {
+    ScratchSqlite::open("cf-eb-module-test").await
 }
 
-/// As [`test_db_provider`], with the DSN too, for a test that reads a table
-/// over a connection of its own.
-async fn test_db_provider_at() -> (toolkit_db::DBProvider<toolkit_db::DbError>, String) {
-    let mut path = std::env::temp_dir();
-    path.push(format!("cf-eb-module-test-{}.db", Uuid::now_v7().simple()));
-    let mut file = path.to_string_lossy().replace('\\', "/");
-    if !file.starts_with('/') {
-        file.insert(0, '/');
-    }
-    let dsn = format!("sqlite://{file}?mode=rwc");
-    let opts = toolkit_db::ConnectOpts {
-        max_conns: Some(1),
-        min_conns: Some(1),
-        ..Default::default()
-    };
-    let db = toolkit_db::connect_db(&dsn, opts)
-        .await
-        .expect("connect sqlite");
-    toolkit_db::migration_runner::run_migrations_for_testing(
-        &db,
-        <crate::infra::storage::migrations::Migrator as sea_orm_migration::MigratorTrait>::migrations(),
-    )
-    .await
-    .expect("migrations");
-    (toolkit_db::DBProvider::new(db), dsn)
-}
-
-async fn make_ctx(mode: &str) -> GearCtx {
+async fn make_ctx(mode: &str) -> (GearCtx, ScratchSqlite) {
     make_ctx_with_hub(mode, Arc::new(ClientHub::new())).await
 }
 
 /// A context for `mode` over `hub`, wired as
 /// [`module_ctx`](crate::test_support::module_boot::module_ctx) wires one, with
-/// a freshly-migrated temp-file `SQLite` gear database attached.
-async fn make_ctx_with_hub(mode: &str, hub: Arc<ClientHub>) -> GearCtx {
-    let (db, _dsn) = test_db_provider_at().await;
-    make_ctx_with_hub_and_config(mode, hub, &json!({}), db).await
+/// a freshly-migrated temp-file `SQLite` gear database attached, and that
+/// database.
+async fn make_ctx_with_hub(mode: &str, hub: Arc<ClientHub>) -> (GearCtx, ScratchSqlite) {
+    let scratch = test_db().await;
+    let ctx =
+        make_ctx_with_hub_and_config(mode, hub, &json!({}), scratch.db().as_ref().clone()).await;
+    (ctx, scratch)
 }
 
 /// As [`make_ctx_with_hub`], with `extra` merged into the `event-broker`
@@ -193,7 +169,7 @@ fn cluster_dispatcher_builds_no_backend() {
 #[tokio::test]
 async fn init_fails_for_unknown_mode() {
     let module = EventBrokerModule::default();
-    let ctx = make_ctx("not_a_real_mode").await;
+    let (ctx, _scratch) = make_ctx("not_a_real_mode").await;
 
     let err = module
         .init(&ctx)
@@ -249,7 +225,7 @@ async fn init_fails_on_wildcard_bind_with_no_advertise_addr_in_cluster_mode() {
 /// `serve()` returns promptly on a stop.
 #[tokio::test]
 async fn standalone_turns_ready_once_serve_has_wired_it() {
-    let ctx = make_ctx("standalone").await;
+    let (ctx, _scratch) = make_ctx("standalone").await;
     let module = Arc::new(EventBrokerModule::default());
     module.init(&ctx).await.expect("init must succeed");
     let check = module
@@ -284,13 +260,12 @@ async fn standalone_turns_ready_once_serve_has_wired_it() {
         .expect("serve must return Ok on cancellation");
 }
 
-/// De-risks production route registration itself (`eb-rest-handlers` Group
-/// 10): `register_ingest_routes`/`register_delivery_routes` register 19
+/// De-risks production route registration itself:
+/// `register_ingest_routes`/`register_delivery_routes` register 19
 /// `OperationBuilder` operations, three of them (`GET`/`DELETE`/`POST` on
 /// `/v1/subscriptions/{id}`) sharing one literal path string across
-/// separate `.register()` calls - unlike the `{id}` vs `{seek_id}` case
-/// this change's `test_router` had to avoid, axum's `path_router` merges
-/// method routers registered against the *same* path string
+/// separate `.register()` calls. axum's `path_router` merges method routers
+/// registered against the *same* path string
 /// (`axum::routing::path_router::PathRouter::route`), so this is expected
 /// to succeed; this test proves it does, not just that it type-checks.
 #[tokio::test]
@@ -302,7 +277,7 @@ async fn standalone_register_rest_builds_router_and_serves_a_route_with_no_auth_
     hub.register::<dyn types_registry_sdk::PlatformTypesRegistryApi>(Arc::new(
         types_registry_sdk::testing_platform::MockTypesRegistry::new(),
     ));
-    let ctx = make_ctx_with_hub("standalone", hub).await;
+    let (ctx, _scratch) = make_ctx_with_hub("standalone", hub).await;
     let module = EventBrokerModule::default();
     module.init(&ctx).await.expect("init must succeed");
 
@@ -339,9 +314,11 @@ async fn standalone_register_rest_builds_router_and_serves_a_route_with_no_auth_
 }
 
 /// A context whose `event-broker` config is exactly `config`, with a migrated
-/// database attached, for `init` tests that stop at a startup check.
-async fn ctx_with_config(config: serde_json::Value) -> GearCtx {
-    GearCtx::new(
+/// database attached, for `init` tests that stop at a startup check; and that
+/// database.
+async fn ctx_with_config(config: serde_json::Value) -> (GearCtx, ScratchSqlite) {
+    let scratch = test_db().await;
+    let ctx = GearCtx::new(
         EventBrokerModule::MODULE_NAME,
         Uuid::new_v4(),
         Arc::new(StaticConfigProvider {
@@ -350,14 +327,15 @@ async fn ctx_with_config(config: serde_json::Value) -> GearCtx {
         Arc::new(ClientHub::new()),
         CancellationToken::new(),
     )
-    .with_db(test_db_provider().await)
+    .with_db(scratch.db().as_ref().clone());
+    (ctx, scratch)
 }
 
 /// The startup checks run before anything is wired, and a failing one stops
 /// `init` with its own message (feature 0005 section 2.4, C4).
 #[tokio::test]
 async fn init_fails_on_a_configuration_breaking_a_startup_check() {
-    let ctx = ctx_with_config(json!({
+    let (ctx, _scratch) = ctx_with_config(json!({
         "mode": "standalone",
         "backends": { "main": { "type": "gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~" } },
         "backend_routing": {},
@@ -378,7 +356,7 @@ async fn init_fails_on_a_configuration_breaking_a_startup_check() {
 /// A registry entry no linked provider serves stops `init` (AC-1, C1).
 #[tokio::test]
 async fn init_fails_on_a_backend_type_no_linked_provider_serves() {
-    let ctx = ctx_with_config(json!({
+    let (ctx, _scratch) = ctx_with_config(json!({
         "mode": "standalone",
         "backends": { "main": { "type": "gts.cf.core.events.backend.v1~vendor.eb.unknown.backend.v1~" } },
         "backend_routing": { "gts.cf.core.events.topic.v1~": "main" },
@@ -401,8 +379,9 @@ async fn init_fails_on_a_backend_type_no_linked_provider_serves() {
 #[tokio::test]
 async fn init_refuses_a_sqlite_gear_database_outside_standalone() {
     for mode in ["cluster_ingest", "cluster_delivery", "cluster_dispatcher"] {
+        let (ctx, _scratch) = make_ctx(mode).await;
         let err = EventBrokerModule::default()
-            .init(&make_ctx(mode).await)
+            .init(&ctx)
             .await
             .expect_err("C10 stops the start");
         assert_eq!(
@@ -412,8 +391,9 @@ async fn init_refuses_a_sqlite_gear_database_outside_standalone() {
         );
     }
 
+    let (ctx, _scratch) = make_ctx("standalone").await;
     EventBrokerModule::default()
-        .init(&make_ctx("standalone").await)
+        .init(&ctx)
         .await
         .expect("standalone runs on a SQLite gear database");
 }
@@ -423,12 +403,13 @@ async fn init_refuses_a_sqlite_gear_database_outside_standalone() {
 /// hands the ingest service.
 #[tokio::test]
 async fn serve_registers_the_default_outbox_group_with_its_configured_partitions() {
-    let (db, dsn) = test_db_provider_at().await;
+    let scratch = test_db().await;
+    let dsn = scratch.dsn().to_owned();
     let ctx = make_ctx_with_hub_and_config(
         "standalone",
         Arc::new(ClientHub::new()),
         &json!({ "outbox_groups": { "default": { "partitions": 4 } } }),
-        db,
+        scratch.db().as_ref().clone(),
     )
     .await;
     let module = Arc::new(EventBrokerModule::default());
@@ -484,9 +465,14 @@ async fn an_unreachable_backend_does_not_stop_the_start_and_its_topics_are_unava
             AUDIT_TOPIC: "audit",
         },
     });
-    let (db, _dsn) = test_db_provider_at().await;
-    let ctx =
-        make_ctx_with_hub_and_config("standalone", Arc::new(ClientHub::new()), &sections, db).await;
+    let scratch = test_db().await;
+    let ctx = make_ctx_with_hub_and_config(
+        "standalone",
+        Arc::new(ClientHub::new()),
+        &sections,
+        scratch.db().as_ref().clone(),
+    )
+    .await;
     let module = Arc::new(EventBrokerModule::default());
     module
         .init(&ctx)
@@ -525,6 +511,7 @@ async fn an_unreachable_backend_does_not_stop_the_start_and_its_topics_are_unava
         .expect("resolves");
         let topic = crate::domain::model::Topic {
             id: id.clone(),
+            uuid: Uuid::from_u128(0x7012),
             description: "a topic".to_owned(),
             retention: None,
             settings,
@@ -572,7 +559,7 @@ async fn an_unreachable_backend_does_not_stop_the_start_and_its_topics_are_unava
 #[tokio::test]
 async fn a_stop_during_the_startup_registry_load_ends_the_start_promptly() {
     let hub = Arc::new(ClientHub::new());
-    let ctx = make_ctx_with_hub("standalone", Arc::clone(&hub)).await;
+    let (ctx, _scratch) = make_ctx_with_hub("standalone", Arc::clone(&hub)).await;
     let module = Arc::new(EventBrokerModule::default());
     module.init(&ctx).await.expect("init must succeed");
     // After `init`: `serve()` resolves the registry for the startup load. Its

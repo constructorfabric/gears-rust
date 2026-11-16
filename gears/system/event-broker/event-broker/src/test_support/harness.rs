@@ -265,8 +265,9 @@ impl IngestService for FaultInjectingIngest {
     async fn list_topics(
         &self,
         ctx: &SecurityContext,
+        select: &crate::domain::ingest::Selection<'_, crate::domain::model::Topic>,
     ) -> Result<Vec<crate::domain::model::Topic>, crate::domain::error::DomainError> {
-        self.inner.list_topics(ctx).await
+        self.inner.list_topics(ctx, select).await
     }
 
     async fn list_topic_segments(
@@ -281,12 +282,25 @@ impl IngestService for FaultInjectingIngest {
     async fn list_event_types(
         &self,
         ctx: &SecurityContext,
+        select: &crate::domain::ingest::Selection<'_, event_broker_sdk::models::EventType>,
     ) -> Result<Vec<event_broker_sdk::models::EventType>, crate::domain::error::DomainError> {
-        self.inner.list_event_types(ctx).await
+        self.inner.list_event_types(ctx, select).await
+    }
+
+    async fn get_event_type(
+        &self,
+        ctx: &SecurityContext,
+        id: &gts::GtsTypeId,
+    ) -> Result<Option<event_broker_sdk::models::EventType>, crate::domain::error::DomainError>
+    {
+        self.inner.get_event_type(ctx, id).await
     }
 }
 
 /// Fully-wired test environment for `event-broker` integration tests.
+///
+/// Keep the harness alive while anything taken from it is in use: dropping it
+/// removes its `SQLite` file (best effort; on Unix).
 pub struct EventBrokerHarness {
     ingest: Arc<dyn IngestService>,
     delivery: Arc<dyn DeliveryService>,
@@ -306,11 +320,14 @@ pub struct EventBrokerHarness {
     topics: Arc<crate::infra::loader::topics::TopicManager>,
     /// Stream exclusion, so a test can assert a denied open left no lease held.
     leases: Arc<crate::domain::streaming::lease::InProcessStreamLeases>,
+    /// The consume answers the delivery service memoized, so a test can read
+    /// what a JOIN wrote.
+    scope_memo: Arc<crate::domain::streaming::scope_memo::ScopeMemo>,
     /// The storage the events actually land in, for a test that reads back
     /// what was stored.
     backend: Arc<dyn Backend>,
-    /// Cancels the loader on drop, so a test's loader does not outlive it and
-    /// keep fetching against a closing pool.
+    /// Cancels the loader on drop, so a test's loader stops at its next
+    /// cancellation check instead of fetching on against a closing pool.
     loader_shutdown: tokio_util::sync::CancellationToken,
     _loader_handle: tokio::task::JoinHandle<()>,
     /// Holds this instance's in-process client (`LocalBroker`) under
@@ -324,8 +341,22 @@ pub struct EventBrokerHarness {
     spec_manager: Arc<dyn SpecificationManager>,
     backend_resolver: Arc<dyn BackendResolver>,
     provisioning_limits: ProvisioningLimits,
+    /// Removes the gear's `SQLite` database file when the harness is dropped
+    /// (`None` on a server engine). Declared last, so it is dropped after every
+    /// other field has let go of the pool. Background tasks can still hold the
+    /// pool after that: the outbox workers behind `_outbox_handle`, which is
+    /// never `.stop()`'d, are cancelled and aborted on drop but not awaited,
+    /// and the loader task behind `_loader_handle` is only cancelled. A
+    /// connection that pool opens later reopens the path (`toolkit_db` opens a
+    /// `SQLite` path with `create_if_missing`, as `mode=rwc` in `dsn` does for
+    /// a test's own connection) and can leave a main file, a `-wal` or a
+    /// `-shm` in the temp dir. That happens after a test's last use of the
+    /// harness, so no assertion sees it.
+    _gear_db_file: Option<crate::test_support::gear_db::SqliteFile>,
 }
 
+/// Cancels the loader, which keeps running on its own task until it sees the
+/// cancellation; the fields, the `SQLite` file's guard last, drop after it.
 impl Drop for EventBrokerHarness {
     fn drop(&mut self) {
         self.loader_shutdown.cancel();
@@ -333,6 +364,12 @@ impl Drop for EventBrokerHarness {
 }
 
 impl EventBrokerHarness {
+    /// The gear database's DSN, for a test of where its file lives.
+    #[cfg(all(test, unix))]
+    pub(crate) fn dsn(&self) -> &str {
+        &self.dsn
+    }
+
     /// The partition caches the loader fills.
     #[must_use]
     pub fn topics(&self) -> &Arc<crate::infra::loader::topics::TopicManager> {
@@ -343,6 +380,19 @@ impl EventBrokerHarness {
     #[must_use]
     pub fn leases(&self) -> &Arc<crate::domain::streaming::lease::InProcessStreamLeases> {
         &self.leases
+    }
+
+    /// The specification manager the delivery service reads, behind the
+    /// spec query hook when the test set one.
+    #[cfg(test)]
+    pub(crate) fn spec_manager(&self) -> Arc<dyn SpecificationManager> {
+        Arc::clone(&self.spec_manager)
+    }
+
+    /// The memo of consume answers the delivery service writes.
+    #[must_use]
+    pub fn scope_memo(&self) -> &Arc<crate::domain::streaming::scope_memo::ScopeMemo> {
+        &self.scope_memo
     }
 
     /// The backend behind every topic here, for a test that reads what
@@ -410,6 +460,17 @@ impl EventBrokerHarness {
         &self.groups
     }
 
+    /// The same coordinator as [`groups`](Self::groups), shared, for an action
+    /// that outlives the borrow (a [`SpecQueryHook`] action).
+    ///
+    /// [`SpecQueryHook`]: super::spec_query_hook::SpecQueryHook
+    #[must_use]
+    pub fn shared_groups(
+        &self,
+    ) -> Arc<crate::domain::consumer_group_coordinator::ConsumerGroupCoordinator> {
+        Arc::clone(&self.groups)
+    }
+
     #[must_use]
     pub fn security_context(&self) -> &SecurityContext {
         &self.ctx
@@ -447,14 +508,22 @@ impl EventBrokerHarness {
     }
 
     /// Where `topic` stands on its storage backend, read from its binding
-    /// record.
+    /// record; `None` when `topic` is not a registered topic or no attempt has
+    /// been recorded for it.
     ///
     /// # Panics
     ///
-    /// Panics if `topic` is not a valid topic id or the record does not read.
+    /// Panics if `topic` is not a valid topic id, or the topic or its record
+    /// does not read.
     pub async fn topic_state(&self, topic: &str) -> Option<TopicState> {
+        let id = toolkit_gts::GtsInstanceId::try_new(topic).expect("a valid topic id");
+        let topic = self
+            .spec_manager
+            .get_topic(&id)
+            .await
+            .expect("the topic reads")?;
         self.spec_manager
-            .topic_state(&toolkit_gts::GtsInstanceId::try_new(topic).expect("a valid topic id"))
+            .topic_state(&topic)
             .await
             .expect("the topic binding reads")
     }
@@ -492,11 +561,14 @@ pub struct EventBrokerHarnessBuilder {
     )>,
     policy_enforcer: Option<PolicyEnforcer>,
     heartbeat: Option<std::time::Duration>,
+    authz_timing: Option<(u32, u32)>,
     provisioning: Provisioning,
     provisioning_limits: Option<ProvisioningLimits>,
     outbox_partitions: Option<OutboxPartitions>,
     gear_db: GearDb,
     backend: Option<Arc<dyn Backend>>,
+    security_context: Option<SecurityContext>,
+    spec_query_hook: Option<super::spec_query_hook::SpecQueryHook>,
 }
 
 impl EventBrokerHarnessBuilder {
@@ -575,6 +647,17 @@ impl EventBrokerHarnessBuilder {
         self
     }
 
+    /// The consume scope TTL and the delivery PDP deadline, in whole seconds
+    /// (`streaming.authz_scope_ttl_secs` and `streaming.authz_eval_deadline_secs`;
+    /// default 60 and 10, the production defaults). A test of a stream's scope
+    /// refresh sets a short TTL so a refresh comes due without waiting out a
+    /// production window; production `StreamingConfig` is unchanged.
+    #[must_use]
+    pub fn with_authz_timing(mut self, scope_ttl_secs: u32, eval_deadline_secs: u32) -> Self {
+        self.authz_timing = Some((scope_ttl_secs, eval_deadline_secs));
+        self
+    }
+
     /// Leaves every registered topic unprovisioned until the test calls
     /// [`EventBrokerHarness::provision_topics`]: the window between a topic's
     /// registration and its first provisioning pass.
@@ -600,13 +683,31 @@ impl EventBrokerHarnessBuilder {
         self
     }
 
+    /// The caller every REST request and [`EventBrokerHarness::security_context`]
+    /// carry, in place of the default random subject in a random tenant - for a
+    /// test of what the broker does with a particular caller identity.
+    #[must_use]
+    pub fn with_security_context(mut self, ctx: SecurityContext) -> Self {
+        self.security_context = Some(ctx);
+        self
+    }
+
+    /// Puts `hook` in front of the seeded specification manager, so a test
+    /// can act at each event-type query and count them. Without it the
+    /// harness uses the seeded manager directly.
+    #[must_use]
+    pub fn with_spec_query_hook(mut self, hook: super::spec_query_hook::SpecQueryHook) -> Self {
+        self.spec_query_hook = Some(hook);
+        self
+    }
+
     #[must_use]
     pub async fn build(self) -> EventBrokerHarness {
         let policy_enforcer = self
             .policy_enforcer
             .unwrap_or_else(|| PolicyEnforcer::new(Arc::new(AllowAllAuthZ)));
 
-        let crate::test_support::gear_db::MigratedGearDb { db, dsn } =
+        let crate::test_support::gear_db::MigratedGearDb { db, dsn, file } =
             self.gear_db.migrated().await;
         let spec_manager = seeded_spec_manager(
             Arc::clone(&db),
@@ -614,6 +715,10 @@ impl EventBrokerHarnessBuilder {
             self.types_registry_client,
         )
         .await;
+        let spec_manager = match &self.spec_query_hook {
+            Some(hook) => hook.wrap(spec_manager),
+            None => spec_manager,
+        };
 
         let (_hub, cluster) = crate::test_support::standalone_event_broker_cluster().await;
         let storage = Arc::new(Storage::new(
@@ -684,6 +789,23 @@ impl EventBrokerHarnessBuilder {
             crate::config::PublishConfig::default().max_wait_secs,
         ));
         let attacher: Arc<dyn crate::domain::streaming::source::ReaderAttacher> = topics.clone();
+        let scope_memo = Arc::new(crate::domain::streaming::scope_memo::ScopeMemo::new());
+        // Short cadences so idle behaviour is testable without real waits.
+        // Everything else is the production default, the authz timing too
+        // unless the test set it.
+        let streaming = {
+            let defaults = crate::config::StreamingConfig::default();
+            let (authz_scope_ttl_secs, authz_eval_deadline_secs) = self.authz_timing.unwrap_or((
+                defaults.authz_scope_ttl_secs,
+                defaults.authz_eval_deadline_secs,
+            ));
+            crate::config::StreamingConfig {
+                heartbeat_interval_secs: 1,
+                authz_scope_ttl_secs,
+                authz_eval_deadline_secs,
+                ..defaults
+            }
+        };
         let HandlerState { ingest, delivery } = crate::infra::wiring::build_handler_state(
             Arc::clone(&storage),
             policy_enforcer,
@@ -692,15 +814,12 @@ impl EventBrokerHarnessBuilder {
             attacher,
             Arc::clone(&groups),
             Arc::clone(&leases),
+            Arc::clone(&scope_memo),
+            Arc::new(crate::domain::streaming::scope::TenantSetInterner::new()),
             crate::config::BatchConfig::default(),
             outbox_partitions,
             sync_wait_max,
-            // Short cadences so idle behaviour is testable without real waits.
-            // Everything else is the production default.
-            crate::config::StreamingConfig {
-                heartbeat_interval_secs: 1,
-                ..crate::config::StreamingConfig::default()
-            },
+            streaming,
             // Default matches the whole-second `StreamingConfig` above; a test
             // that needs a fast heartbeat overrides it via `with_heartbeat`.
             self.heartbeat.unwrap_or(std::time::Duration::from_secs(1)),
@@ -714,11 +833,13 @@ impl EventBrokerHarnessBuilder {
             faults: publish_faults.clone(),
         });
 
-        let ctx = SecurityContext::builder()
-            .subject_tenant_id(Uuid::new_v4())
-            .subject_id(Uuid::new_v4())
-            .build()
-            .expect("test security context");
+        let ctx = self.security_context.unwrap_or_else(|| {
+            SecurityContext::builder()
+                .subject_tenant_id(Uuid::new_v4())
+                .subject_id(Uuid::new_v4())
+                .build()
+                .expect("test security context")
+        });
 
         let router = test_router(
             HandlerState {
@@ -748,6 +869,7 @@ impl EventBrokerHarnessBuilder {
             dsn,
             topics,
             leases,
+            scope_memo,
             backend,
             loader_shutdown,
             _loader_handle: loader_handle,
@@ -756,6 +878,7 @@ impl EventBrokerHarnessBuilder {
             spec_manager,
             backend_resolver,
             provisioning_limits,
+            _gear_db_file: file,
         }
     }
 }

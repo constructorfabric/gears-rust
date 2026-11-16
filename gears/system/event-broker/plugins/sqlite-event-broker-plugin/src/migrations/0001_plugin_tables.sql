@@ -8,10 +8,12 @@
 -- Queries:
 --   provision: INSERT ... ON CONFLICT (topic_uuid) DO NOTHING; SELECT log_id, partitions;
 --     UPDATE log_id, max_age_ms, max_bytes - one write transaction
---   topic lookup, once per topic per instance (cached): SELECT partitions WHERE topic_uuid = ?
+--   topic lookup, once per topic per instance (cached):
+--     SELECT topic_uuid, partitions WHERE topic_id = ?   (evbk__log_topic_id)
 --   sweep, every pass: joined from evbk__partition for the bounds
 CREATE TABLE evbk__log (                                   -- one row per provisioned topic
-    topic_uuid     BLOB          NOT NULL PRIMARY KEY CHECK (length(topic_uuid) = 16),  -- GtsId::to_uuid(topic)
+    -- TopicSpec.uuid (Registry Reference)
+    topic_uuid     BLOB          NOT NULL PRIMARY KEY CHECK (length(topic_uuid) = 16),
     topic_id       VARCHAR(1024) NOT NULL CHECK (length(topic_id) <= 1024),          -- gts_id::GTS_ID_MAX_LENGTH
     log_id         BLOB          NOT NULL CHECK (length(log_id) = 16),               -- feature 0006
     partitions     INTEGER       NOT NULL CHECK (partitions > 0),
@@ -19,6 +21,9 @@ CREATE TABLE evbk__log (                                   -- one row per provis
     max_bytes      INTEGER,                                -- per partition, event bodies; NULL = unbounded
     provisioned_at INTEGER       NOT NULL
 ) WITHOUT ROWID;
+
+-- One row per topic: the topic lookup reads by GTS id.
+CREATE UNIQUE INDEX evbk__log_topic_id ON evbk__log (topic_id);
 
 -- Queries:
 --   append, once per partition it touches, under the write lock:
@@ -59,7 +64,7 @@ CREATE TABLE evbk__event (
     partition     INTEGER NOT NULL,
     sequence      INTEGER NOT NULL,                        -- from 1, gapless per partition
     sequence_time INTEGER NOT NULL,                        -- when stored; never falls with sequence
-    tenant_id     BLOB    NOT NULL,
+    subject_tenant BLOB    NOT NULL,
     size          INTEGER NOT NULL,                        -- length(body), what max_bytes counts
     body          BLOB    NOT NULL,                        -- versioned JSON (docs/DESIGN.md §2.3)
     PRIMARY KEY (topic_uuid, partition, sequence)

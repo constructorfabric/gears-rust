@@ -41,16 +41,16 @@ mod sequence_tests;
 #[cfg(test)]
 mod validate_tests;
 
-#[cfg(all(test, any(feature = "db", feature = "rest-client")))]
+#[cfg(test)]
 mod warn_capture;
 
 #[cfg(feature = "rest-client")]
 pub mod rest;
 
 pub use api::{
-    Ack, AssignedPartition, BarrierMode, EventBrokerApi, IngestOutcome, JoinRequest, Position,
-    ProducerCursors, ProducerMode, SeekResult, StorageBackendConfig, SubscriptionAssignment,
-    TenantTraversalDepth, TopicCursors,
+    Ack, AssignedPartition, BarrierMode, EventBrokerApi, IngestOutcome, InterestTenant,
+    JoinRequest, OwnershipFilter, Position, ProducerCursors, ProducerMode, SeekResult,
+    StorageBackendConfig, SubscriptionAssignment, TopicCursors, UnmatchedTypes,
 };
 pub use consumer::{
     BatchHandler, BatchHandlerOutcome, CommitOffset, ConnectionDropReason, Consumer,
@@ -81,7 +81,7 @@ pub use gts::{
 // `::gts` because this crate's own `gts` module shadows the name here) and the
 // `gts_id!` macro, re-exported so callers build typed ids without a direct gts dep.
 pub use ::gts::{GtsIdPattern, GtsInstanceId, GtsTypeId};
-pub use ids::{ConsumerGroupId, EventTypeId, ProducerId, SubscriptionId, TopicId};
+pub use ids::{ConsumerGroupId, EventTypeId, ProducerId, SubscriptionId};
 pub use models::{
     ConsumerGroup, ConsumerGroupKind, ConsumerGroupQuery, CreateConsumerGroupRequest, Page,
     PartitionAssignment, PartitionRange, ResetScope, Subscription, Topic, TopicSegment,

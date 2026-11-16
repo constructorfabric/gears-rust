@@ -75,7 +75,8 @@ def scrape_lag_metrics(topic: str, partition: int) -> dict:
         "newest_event_ts":  env["end_time"],
     }
 
-# AUTHZ: requires `topic:read` permission on T (same scope as GET /v1/topics).
+# AUTHZ: the caller may read T: consume T, or publish one of its event types, in its own tenant
+# (the same rule as GET /v1/topics); otherwise 403 TopicNotAuthorized, before the topic lookup.
 ```
 
 ### 2.2 Replay / Backfill Tooling
@@ -106,18 +107,18 @@ def maybe_skip_to_earliest(topic, partition, cursor_offset):
             "topology_version": topology_version,
             "positions": {topic: [{"partition": partition, "value": env["start_sequence"]}]},
         })
-    # else: keep normal polling
+    # else: keep streaming
 
 # Pairs with the R57 offset-adviser feature (post-MVP). Until R57 lands,
 # consumers can call this endpoint manually before a seek-to-earliest.
-# AUTHZ: same `topic:read` permission as 2.1.
+# AUTHZ: the same read rule as 2.1.
 ```
 
 ### 2.4 Producer Health-Check
 
 ```python
-# Producer cross-checks its chain state against the broker's view, per (producer_id, topic).
-# The producer chain (meta.sequence, per (producer_id, topic)) and the backend sequence
+# Producer cross-checks its chain state against the broker's view, per (producer, topic).
+# The producer chain (meta.sequence, per (producer, topic)) and the backend sequence
 # (end_sequence, per (topic, partition)) are different numbering spaces: the check
 # compares each only with its own kind.
 def check_publish_pipeline(producer_id, topic, partitions):
@@ -140,7 +141,7 @@ def check_publish_pipeline(producer_id, topic, partitions):
         env = http.get(f"/v1/topics/segments?topic={topic}&partition={partition}").json
         observe_progress(topic, partition, env["end_sequence"], env["end_time"])
 
-# AUTHZ: `topic:read` on T + the existing producer-cursor permission.
+# AUTHZ: the read rule on T + the existing producer-cursor checks.
 ```
 
 ## 3. Processes / Business Logic (CDSL)
@@ -154,13 +155,13 @@ The endpoint paginates **segments**, not events. `$orderby` defaults to `start_s
 | Backend state | Endpoint response |
 |---|---|
 | Healthy | 200 OK with full manifest |
-| Backend unreachable | 503 Service Unavailable; `Retry-After` header set |
+| Backend unreachable | 503 Service Unavailable with the generic body (empty `context`, no `Retry-After` header) |
 | Backend partially scanned (e.g., S3 listing in progress) | 200 OK with envelope reflecting whatever is known; `segments[]` may be incomplete (clients should not rely on count); header `X-Manifest-Partial: true` flags the case |
 | Backend reports no segments yet (empty partition) | 200 OK with `start_sequence: 0`, `end_sequence: 0`, empty `segments[]` |
 
 ### Authorization
 
-The endpoint is gated by `topic:read` (same as `GET /v1/topics`). Rationale: segment metadata is not more sensitive than the topic existence itself; if a caller can list the topic, knowing its segment envelope leaks no further information. (Event payloads are protected by the consumer-side authz, not the segment metadata.)
+The endpoint is gated by the metadata read rule (the same as `GET /v1/topics`): the caller may consume the topic, or publish one of its event types, in its own tenant. Producers read specs to validate; consumers may read them too, for example for code generation. Rationale: segment metadata is not more sensitive than the topic existence itself; if a caller can list the topic, knowing its segment envelope leaks no further information. (Event payloads are protected by the consumer-side authz, not the segment metadata.)
 
 ## 4. States (CDSL)
 
@@ -174,9 +175,9 @@ The endpoint is stateless from the broker's perspective. It reflects the backend
 
 - `GET /v1/topics/segments` is implemented per `openapi.yaml`.
 - The backend's `query(at, range)` (feature 0007 §2.1) is wired through the storage-backend plugin trait.
-- Authorization checks `topic:read` permission via the PEP.
+- Authorization checks the read rule via the PEP (`consume` on the topic, else `produce` on one of its event types, in the caller's tenant), before the topic lookup.
 - Pagination over the `segments[]` array works per the documented semantics.
-- Backend-unavailable case returns 503 with `Retry-After`.
+- Backend-unavailable case returns 503 with the generic body (empty `context`, no `Retry-After` header).
 - Partial-scan case sets `X-Manifest-Partial: true`.
 - DESIGN.md §3.3's `GET /v1/topics/segments` entry points at this feature file for use cases.
 
@@ -184,9 +185,9 @@ The endpoint is stateless from the broker's perspective. It reflects the backend
 
 - **AC-1**: A topic with 0 published events returns `start_sequence: 0`, `end_sequence: 0`, empty `segments[]`.
 - **AC-2**: A topic with N segments returns at most 100 segment entries per page; the envelope reflects the full N regardless of pagination.
-- **AC-3**: A caller without `topic:read` on T receives 403 Forbidden.
-- **AC-4**: With the backend simulated as unreachable, the endpoint returns 503 with `Retry-After`.
-- **AC-5**: An operator dashboard built on this endpoint shows lag = `end_sequence - cursor.offset` for each consumer group on a partition.
+- **AC-3**: A caller that may not read T receives `403 TopicNotAuthorized`, before `404` for an unregistered T.
+- **AC-4**: With the backend simulated as unreachable, the endpoint returns 503 with the generic body and no `Retry-After` header.
+- **AC-5**: An operator dashboard computes a consumer group's lag on a partition as this endpoint's `end_sequence` minus the offset the group's consumers last committed in their own offset store.
 
 ## 7. Unit Test Plan
 
@@ -200,5 +201,5 @@ The endpoint is stateless from the broker's perspective. It reflects the backend
 - **S1 — happy path**: publish 1000 events to (T, 0); call segments endpoint; assert end_sequence ≥ 1000 (some may still be pipeline-lagged).
 - **S2 — operator dashboard**: scrape the endpoint every 30s over 5 minutes; assert end_sequence increases monotonically while events are being produced.
 - **S3 — partial scan**: configure S3-style backend with simulated slow LIST; assert `X-Manifest-Partial: true` header on response while scan is in progress; assert envelope is non-decreasing across successive calls.
-- **S4 — backend down**: bring backend offline; assert 503 + `Retry-After`; restore backend; assert next call returns 200.
-- **S5 — authz boundary**: caller A with `topic:read` on T1 calls for T2 (no permission) — gets 403; T1 call succeeds.
+- **S4 - backend down**: bring backend offline; assert 503 with no `Retry-After` header; restore backend; assert next call returns 200.
+- **S5 - authz boundary**: caller A that may read T1 calls for T2 (which it may not read) - gets 403; T1 call succeeds.

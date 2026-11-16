@@ -2,9 +2,9 @@
 //! (`eb-group-rebalance-coordinator` design.md D1–D7)
 //!
 //! A consumer group is owned by exactly one delivery instance.  All open
-//! streams for that group live in the same OS process and are reachable via
-//! in-process `mpsc` channels — no cluster watch or distributed lock is
-//! needed for steady-state operation.
+//! streams for that group live in the same OS process and learn of changes
+//! through in-process `watch` channels - no cluster watch or distributed lock
+//! is needed for steady-state operation.
 //!
 //! It is also the only home a subscription has. A subscription is session
 //! state of the one instance its group lives on, so it is held here, beside
@@ -32,6 +32,7 @@ use uuid::Uuid;
 
 use crate::domain::model::Assignment;
 use crate::domain::streaming::assignment::Generation;
+use member_scope::CachedScope;
 
 /// Topic identity and partition count, passed to `join`.
 #[domain_model]
@@ -95,6 +96,17 @@ pub(crate) struct MemberEntry {
     /// zero receivers, which is what makes `receiver_count()` mean "no stream
     /// open". The coordinator publishes; the session classifies.
     pub(crate) generations: watch::Sender<Generation>,
+    /// The consume scope this member holds, published like `generations` so a
+    /// session waiting on it wakes as soon as it is cleared.
+    ///
+    /// `None` from join until `write_scope` stores one; nothing else writes
+    /// it. It lives and dies with this entry: every removal path drops the
+    /// sender, and each receiver sees the channel close.
+    pub(crate) scope: watch::Sender<Option<Arc<CachedScope>>>,
+    /// The last generation `write_scope` assigned to this member's scope,
+    /// `NONE` before its first store. A clear leaves it as it is, so no
+    /// generation is assigned twice in the member's life.
+    pub(crate) scope_generation: member_scope::ScopeGeneration,
 }
 
 /// Where a member is in its life, and so how long it may stay there.
@@ -194,6 +206,9 @@ impl ConsumerGroupCoordinator {
                 // `rebalance` below sends the real assignment. A sender with
                 // no receivers is exactly the "no stream open" state.
                 generations: watch::Sender::new(Generation::new(version, Vec::new())),
+                // A re-JOIN is a new subscription id, so it starts with none.
+                scope: watch::Sender::new(None),
+                scope_generation: member_scope::ScopeGeneration::NONE,
             },
         );
         index.insert(sub_id, group_id);
@@ -380,6 +395,11 @@ impl ConsumerGroupCoordinator {
             Subscription {
                 id: sub_id,
                 tenant_id: Uuid::nil(),
+                joiner: crate::domain::model::Joiner {
+                    subject: Uuid::nil(),
+                    tenant: Uuid::nil(),
+                    subject_type: None,
+                },
                 consumer_group: group_id.clone(),
                 client_agent: "test".to_owned(),
                 interests: Vec::new(),
@@ -482,10 +502,6 @@ fn compute_assignments(members: &HashMap<Uuid, MemberEntry>) -> HashMap<Uuid, Ve
     result
 }
 
-/// Pushes `Frame::Topology` (loss only) or `Frame::Control { Terminal }`
-/// (gain or lose-all) to members whose assignments changed.
-/// `skip_id` is excluded — used to skip the newly-joined member who has no
-/// open stream yet.
 /// One session's membership in its group, for as long as its stream lives.
 ///
 /// Dropping it reports the stream closed, which moves the member to
@@ -593,6 +609,7 @@ pub fn range_split(n_partitions: u32, members: &[Uuid]) -> Vec<Vec<u32>> {
         .collect()
 }
 
+pub mod member_scope;
 pub mod sweeper;
 
 #[cfg(test)]

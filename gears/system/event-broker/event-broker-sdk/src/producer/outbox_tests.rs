@@ -27,7 +27,7 @@ fn row(producer_mode: &str) -> Value {
         "event_id": "0b3f4c9e-2a41-4f5e-9d3c-6f1f2a7b8c90",
         "type": "gts.cf.core.events.event.v1~acme.orders.order.created.v1~",
         "topic": "gts.cf.core.events.topic.v1~acme.orders.v1",
-        "tenant_id": "5a0e8d1c-7b2f-4c6a-8e3d-9f4b1c2d3e4f",
+        "subject_tenant": "5a0e8d1c-7b2f-4c6a-8e3d-9f4b1c2d3e4f",
         "source": "orders",
         "subject": "order-1",
         "subject_type": "gts.acme.orders.order.entity.v1~",
@@ -64,7 +64,7 @@ fn an_outbox_row_with_an_unknown_producer_mode_is_refused() {
 #[test]
 fn a_rejected_message_stores_the_error_kind_not_its_text() {
     let result = retry_or_reject(&EventBrokerError::EventDataInvalid {
-        type_id: "gts.cf.core.events.event.v1~acme.orders.order.created.v1~".to_owned(),
+        event_type: "gts.cf.core.events.event.v1~acme.orders.order.created.v1~".to_owned(),
         errors: vec!["\"PLANTED-VALUE-7f3a\" is not of type \"integer\"".to_owned()],
         detail: "event payload failed schema validation".to_owned(),
     });
@@ -103,7 +103,7 @@ fn the_v1_envelope_wire_shape_is_pinned() {
         "event_id": "0190a5b2-7c3d-7e4f-8a1b-2c3d4e5f6a7b",
         "type": "gts.cf.core.events.event.v1~cf.bss.pricing.approval_unit_decided.v1~",
         "topic": "gts.cf.core.events.topic.v1~cf.bss.pricing.catalog.v1",
-        "tenant_id": "5a0e8d1c-7b2f-4c6a-8e3d-9f4b1c2d3e4f",
+        "subject_tenant": "5a0e8d1c-7b2f-4c6a-8e3d-9f4b1c2d3e4f",
         "source": "bss-pricing",
         "subject": "6b1f9e2d-8c3a-4d7b-9f4e-0a5c2d3e4f5a",
         "subject_type": "gts.cf.bss.pricing.approval_unit.v1~",
@@ -129,7 +129,7 @@ fn the_v1_envelope_wire_shape_is_pinned() {
             "event_id": "0190a5b2-7c3d-7e4f-8a1b-2c3d4e5f6a7b",
             "type": "gts.cf.core.events.event.v1~cf.bss.pricing.approval_unit_decided.v1~",
             "topic": "gts.cf.core.events.topic.v1~cf.bss.pricing.catalog.v1",
-            "tenant_id": "5a0e8d1c-7b2f-4c6a-8e3d-9f4b1c2d3e4f",
+            "subject_tenant": "5a0e8d1c-7b2f-4c6a-8e3d-9f4b1c2d3e4f",
             "source": "bss-pricing",
             "subject": "6b1f9e2d-8c3a-4d7b-9f4e-0a5c2d3e4f5a",
             "subject_type": "gts.cf.bss.pricing.approval_unit.v1~",
@@ -152,10 +152,11 @@ fn the_v1_envelope_wire_shape_is_pinned() {
         "event_id": "0190a5b2-7c3d-7e4f-8a1b-000000000042",
         "type": "gts.cf.core.events.event.v1~acme.orders.order.created.v1~",
         "topic": "gts.cf.core.events.topic.v1~acme.orders.v1",
-        "tenant_id": "5a0e8d1c-7b2f-4c6a-8e3d-9f4b1c2d3e4f",
+        "subject_tenant": "5a0e8d1c-7b2f-4c6a-8e3d-9f4b1c2d3e4f",
         "source": "orders",
         "subject": "order-1",
         "subject_type": "gts.acme.orders.order.entity.v1~",
+        "subject_owner": "0190a5b2-7c3d-7e4f-8a1b-000000000a01",
         "occurred_at": "2026-11-03T10:15:30.123456789Z",
         "trace_parent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
         "data": { "order_id": "order-1", "total_cents": 1250 },
@@ -179,11 +180,17 @@ const REGISTERED: ProducerId = ProducerId(Uuid::from_u128(1));
 #[derive(Default)]
 struct CountingBroker {
     calls: AtomicUsize,
+    /// The `subject_owner` of each published event, in publish order.
+    owners: std::sync::Mutex<Vec<Option<Uuid>>>,
 }
 
 impl CountingBroker {
     fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    fn owners(&self) -> Vec<Option<Uuid>> {
+        self.owners.lock().expect("the owners lock").clone()
     }
 }
 
@@ -202,10 +209,14 @@ impl BrokerStub for CountingBroker {
     async fn publish(
         &self,
         _ctx: &SecurityContext,
-        _event: &EventV1,
+        event: &EventV1,
         _ack: Ack,
     ) -> Result<IngestOutcome, EventBrokerError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.owners
+            .lock()
+            .expect("the owners lock")
+            .push(event.subject_owner());
         Ok(IngestOutcome::Accepted)
     }
 }
@@ -246,6 +257,35 @@ async fn managed_setup(broker: Arc<CountingBroker>) -> OutboxSetup {
         .build()
         .await
         .expect("the setup builds")
+}
+
+/// The drain publishes an envelope's owner on the event it rebuilds, and an envelope
+/// without one as a tenant-wide event.
+#[tokio::test]
+async fn a_drained_envelope_publishes_its_owner() {
+    let broker = Arc::new(CountingBroker::default());
+    let setup = managed_setup(Arc::clone(&broker)).await;
+    let mut owned = row("monotonic");
+    owned["subject_owner"] = json!("0190a5b2-7c3d-7e4f-8a1b-000000000a01");
+    let unowned = row("monotonic");
+
+    for (seq, payload) in [(1, owned), (2, unowned)] {
+        let result = setup
+            .process_outbox_payload_for_test(
+                serde_json::to_vec(&payload).expect("the row writes"),
+                seq,
+            )
+            .await;
+        assert!(matches!(result, MessageResult::Ok), "{seq}: {result:?}");
+    }
+
+    assert_eq!(
+        broker.owners(),
+        vec![
+            Some(Uuid::from_u128(0x0190_a5b2_7c3d_7e4f_8a1b_0000_0000_0a01)),
+            None
+        ]
+    );
 }
 
 /// An envelope of a version this SDK does not write is refused right after it decodes, with its
@@ -383,10 +423,11 @@ fn a_size_refusal_read_back_from_the_broker_rejects_the_message() {
     );
 }
 
-/// The producer-outbox envelope of a stateless event at the per-event limit, with a
-/// topic at the GTS length limit and a client agent at its cap, fits the outbox's row
-/// limit. A deduplicating producer's event is smaller: it is checked with its largest
-/// `meta`, which the envelope does not carry.
+/// The producer-outbox envelope of a stateless, owned event at the per-event limit,
+/// with a topic at the GTS length limit and a client agent at its cap, fits the
+/// outbox's row limit. A deduplicating producer's event is smaller: it is checked with
+/// its largest `meta`, which the envelope does not carry. So is an unowned one: the
+/// envelope leaves out the `null` owner the size counts.
 #[test]
 fn an_envelope_of_a_largest_event_fits_the_outbox() {
     let topic = format!(
@@ -397,10 +438,11 @@ fn an_envelope_of_a_largest_event_fits_the_outbox() {
     let mut event: EventV1 = serde_json::from_value(json!({
         "id": body["event_id"],
         "type": body["type"],
-        "tenant_id": body["tenant_id"],
+        "subject_tenant": body["subject_tenant"],
         "source": "o".repeat(256),
         "subject": "s".repeat(1024),
         "subject_type": body["subject_type"],
+        "subject_owner": "0190f1a2-0000-7000-8000-000000000a01",
         "occurred_at": body["occurred_at"],
         "trace_parent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
         "data": { "pad": "" },

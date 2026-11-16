@@ -41,8 +41,14 @@ async fn only_the_ingest_role_maintains_the_specification_cache() {
     /// initial load is awaited inside `serve()` before anything else is wired.
     async fn topics_after_serve(matrix: &Matrix, mode: &str, patience: Duration) -> usize {
         let hub = Arc::new(ClientHub::new());
-        let db = migrated_gear_db(&matrix.gear_db()).await;
-        let ctx = module_ctx(mode, Arc::clone(&hub), &json!({}), db).await;
+        let migrated = migrated_gear_db(&matrix.gear_db()).await;
+        let ctx = module_ctx(
+            mode,
+            Arc::clone(&hub),
+            &json!({}),
+            migrated.db().as_ref().clone(),
+        )
+        .await;
         // After `module_ctx`, which registers an empty one of its own.
         hub.register::<dyn types_registry_sdk::PlatformTypesRegistryApi>(registry_holding(
             &[json!({ "id": TOPIC_ID, "description": "a topic the roles test seeds" })],
@@ -98,8 +104,14 @@ async fn cluster_ingest_serve_registers_with_service_discovery() {
     };
     let (hub, _cluster) = standalone_event_broker_cluster().await;
     let directory = test_directory_client(&hub);
-    let db = migrated_gear_db(&matrix.gear_db()).await;
-    let ctx = module_ctx("cluster_ingest", Arc::clone(&hub), &json!({}), db).await;
+    let migrated = migrated_gear_db(&matrix.gear_db()).await;
+    let ctx = module_ctx(
+        "cluster_ingest",
+        Arc::clone(&hub),
+        &json!({}),
+        migrated.db().as_ref().clone(),
+    )
+    .await;
 
     let module = Arc::new(EventBrokerModule::default());
     module.init(&ctx).await.expect("init must succeed");

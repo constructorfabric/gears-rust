@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::ConsumerError;
-use crate::ids::{ConsumerGroupId, TopicId};
+use crate::ids::ConsumerGroupId;
 use crate::sequence::Sequence;
 
 use super::DeadLetterRecord;
@@ -12,8 +12,7 @@ use super::DeadLetterRecord;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DeadLetterEnvelope {
     pub version: u16,
-    pub group_id: Option<ConsumerGroupId>,
-    pub topic_id: Option<TopicId>,
+    pub consumer_group: Option<ConsumerGroupId>,
     pub topic: GtsInstanceId,
     pub event_type: GtsTypeId,
     pub subject: String,
@@ -25,20 +24,19 @@ pub struct DeadLetterEnvelope {
     pub payload: serde_json::Value,
     pub occurred_at: DateTime<Utc>,
     pub parked_at: DateTime<Utc>,
-    pub event_id: Uuid,
+    pub event: Uuid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DeadLetterSourceCoordinates {
-    pub group_id: Option<ConsumerGroupId>,
-    pub topic_id: Option<TopicId>,
+    pub consumer_group: Option<ConsumerGroupId>,
     pub topic: GtsInstanceId,
     pub event_type: GtsTypeId,
     pub subject: String,
     pub subject_type: GtsTypeId,
     pub partition: u32,
     pub offset: Sequence,
-    pub event_id: Uuid,
+    pub event: Uuid,
 }
 
 impl DeadLetterEnvelope {
@@ -53,8 +51,7 @@ impl DeadLetterEnvelope {
     pub fn from_record(record: DeadLetterRecord) -> Self {
         Self {
             version: Self::VERSION,
-            group_id: record.group_id,
-            topic_id: record.topic_id,
+            consumer_group: record.consumer_group,
             topic: record.topic,
             event_type: record.event_type,
             subject: record.subject,
@@ -66,7 +63,7 @@ impl DeadLetterEnvelope {
             payload: record.payload,
             occurred_at: record.occurred_at,
             parked_at: Utc::now(),
-            event_id: record.event_id,
+            event: record.event,
         }
     }
 
@@ -88,15 +85,14 @@ impl DeadLetterEnvelope {
 
     pub fn source_coordinates(&self) -> DeadLetterSourceCoordinates {
         DeadLetterSourceCoordinates {
-            group_id: self.group_id,
-            topic_id: self.topic_id,
+            consumer_group: self.consumer_group,
             topic: self.topic.clone(),
             event_type: self.event_type.clone(),
             subject: self.subject.clone(),
             subject_type: self.subject_type.clone(),
             partition: self.partition,
             offset: self.offset,
-            event_id: self.event_id,
+            event: self.event,
         }
     }
 }

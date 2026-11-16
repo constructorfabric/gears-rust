@@ -416,13 +416,16 @@ fn a_joined_member_with_a_short_session_timeout_survives_until_the_join_timeout(
     );
 }
 
+/// The sweep base is taken after the JOIN returns, so it is no earlier than
+/// the member's `state_since`, and the sweep lands at least 1 ms past the join
+/// timeout.
 #[test]
 fn a_joined_member_that_never_streams_is_reaped_at_the_join_timeout() {
     let coordinator = coordinator();
     let group = group_id("gjt");
     let sub_a = Uuid::new_v4();
-    let joined_at = Instant::now();
     coordinator.join_member(&group, sub_a, &[topic("topic", 2)], Duration::from_secs(30));
+    let joined_at = Instant::now();
 
     assert_eq!(
         coordinator.sweep(joined_at + JOIN_TIMEOUT + Duration::from_millis(1)),
@@ -543,7 +546,14 @@ fn a_reconnect_within_session_timeout_keeps_the_member() {
 }
 
 /// A member's lifetime runs from when it entered its current state, not from
-/// its JOIN: a disconnect long after joining still gets its full timeout.
+/// its JOIN: a disconnect long after joining still gets its full timeout. The
+/// "not reaped" sweep's base is taken before the disconnect and the "reaped"
+/// one's after it, so both bracket the member's `state_since`.
+///
+/// Timing: the 20 ms sleep puts the JOIN and subscribe stamps at least 20 ms
+/// before the "not reaped" base, which is taken after the sleep, so a
+/// lifetime counted from either stamp would end 19 ms or more before that
+/// sweep and reap the member. A slow run only widens the gap.
 #[test]
 fn a_disconnected_members_timeout_runs_from_the_disconnect_not_the_join() {
     let coordinator = coordinator();
@@ -554,17 +564,23 @@ fn a_disconnected_members_timeout_runs_from_the_disconnect_not_the_join() {
     let (_generations, membership) =
         ConsumerGroupCoordinator::subscribe(&coordinator, &group, sub_a)
             .expect("sub_a is a member");
+    std::thread::sleep(Duration::from_millis(20));
+    let before = Instant::now();
     drop(membership);
     let disconnected_at = Instant::now();
 
     assert!(
         coordinator
-            .sweep(disconnected_at + session_timeout - Duration::from_millis(1))
+            .sweep(before + session_timeout - Duration::from_millis(1))
             .is_empty()
     );
     assert_eq!(
-        coordinator.sweep(disconnected_at + session_timeout).len(),
-        1
+        coordinator.sweep(disconnected_at + session_timeout),
+        vec![Removal {
+            subscription_id: sub_a,
+            group,
+            group_emptied: true,
+        }]
     );
 }
 

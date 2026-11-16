@@ -9,7 +9,7 @@ use event_broker_sdk::dlq::{ConsumerDlqOutbox, DeadLetterEnvelope, DeadLetterRec
 use event_broker_sdk::gts_id;
 use event_broker_sdk::{
     CommitOffsetInTx, ConsumerGroupId, Delivery, EventV1, Fallback, GtsInstanceId,
-    LocalDbOffsetManager, OffsetStore, Position, StoredPosition, TopicId,
+    LocalDbOffsetManager, OffsetStore, Position, StoredPosition,
 };
 use sea_orm::{ConnectionTrait, Database, Statement};
 use toolkit_db::outbox::{
@@ -23,7 +23,6 @@ const DLQ_QUEUE: &str = "showcase-consumer-dlq";
 const DLQ_PARTITIONS: u32 = 4;
 const TOPIC_GTS: &str = gts_id!("cf.core.events.topic.v1~example.showcase.outbox.dlq.v1");
 const EVENT_TYPE_GTS: &str = gts_id!("cf.core.events.event.v1~example.showcase.outbox.dlq.v1~");
-const GROUP_GTS: &str = gts_id!("cf.core.events.consumer_group.v1~example.showcase.outbox.dlq.v1");
 
 static DB_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -118,9 +117,9 @@ fn rejected_event(offset: i64) -> EventV1 {
         serde_json::json!({ "reject": true, "offset": offset }),
     )
     .id(Uuid::from_u128(u128::try_from(offset).unwrap()))
-    .tenant_id(Uuid::nil())
+    .subject_tenant(Uuid::nil())
     .subject(format!("dlq-order-{offset}"))
-    .subject_type_id(event_broker_sdk::GtsTypeId::new(
+    .subject_type_of(event_broker_sdk::GtsTypeId::new(
         "gts.x.eb.test.subject.v1~",
     ))
     .occurred_at("2026-01-02T03:04:05Z".parse().unwrap())
@@ -140,23 +139,22 @@ fn delivery() -> Delivery {
 
 fn dead_letter(event: &EventV1, group: ConsumerGroupId) -> DeadLetterRecord {
     DeadLetterRecord::builder(event, &delivery(), "permanent validation failure")
-        .group_id(group)
-        .topic_id(TopicId::from_gts(TOPIC_GTS))
+        .consumer_group(group)
         .attempts(6)
         .build()
 }
 
-fn coordinates() -> (ConsumerGroupId, TopicId) {
+fn coordinates() -> (ConsumerGroupId, GtsInstanceId) {
     (
-        ConsumerGroupId::from_gts(GROUP_GTS),
-        TopicId::from_gts(TOPIC_GTS),
+        ConsumerGroupId::new(Uuid::from_u128(1)),
+        GtsInstanceId::try_new(TOPIC_GTS).unwrap(),
     )
 }
 
 async fn load_position(
     manager: &LocalDbOffsetManager,
     group: &ConsumerGroupId,
-    topic: &TopicId,
+    topic: &GtsInstanceId,
     partition: u32,
 ) -> Position {
     manager
@@ -174,7 +172,7 @@ async fn wait_for_envelope(envelopes: &Arc<Mutex<Vec<DeadLetterEnvelope>>>) -> D
 async fn if_i_want_a_single_queue_dlq_i_enqueue_to_the_consumer_dlq_outbox() {
     let fixture = fixture().await;
     let helper = fixture.helper();
-    let (group, topic) = coordinates();
+    let (group, _) = coordinates();
     let event = rejected_event(10);
     let record = dead_letter(&event, group);
     let conn = fixture.db.conn().expect("db conn");
@@ -186,8 +184,7 @@ async fn if_i_want_a_single_queue_dlq_i_enqueue_to_the_consumer_dlq_outbox() {
     wake.fire();
 
     let envelope = wait_for_envelope(&fixture.envelopes).await;
-    assert_eq!(envelope.group_id, Some(group));
-    assert_eq!(envelope.topic_id, Some(topic));
+    assert_eq!(envelope.consumer_group, Some(group));
     assert_eq!(envelope.topic, TOPIC_GTS);
     assert_eq!(envelope.subject, event.subject().to_owned());
     assert_eq!(envelope.subject_type, *event.subject_type());
@@ -209,6 +206,7 @@ async fn if_i_want_transactional_dlq_i_enqueue_and_commit_offset_in_the_same_tx(
         Fallback::Earliest,
     ));
     let (group, topic) = coordinates();
+    let tx_topic = topic.clone();
     let event = rejected_event(20);
     let record = dead_letter(&event, group);
     let offset = event.sequence().expect("a delivered event is stamped");
@@ -223,7 +221,7 @@ async fn if_i_want_transactional_dlq_i_enqueue_and_commit_offset_in_the_same_tx(
                     .await
                     .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
                 tx_manager
-                    .commit_in_tx(tx, &group, &topic, delivery().partition(), offset)
+                    .commit_in_tx(tx, &group, &tx_topic, delivery().partition(), offset)
                     .await
                     .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
                 Ok(wake)
@@ -255,6 +253,7 @@ async fn if_the_dlq_transaction_rolls_back_neither_handoff_nor_offset_is_durable
         Fallback::Earliest,
     ));
     let (group, topic) = coordinates();
+    let tx_topic = topic.clone();
     let event = rejected_event(30);
     let record = dead_letter(&event, group);
     let offset = event.sequence().expect("a delivered event is stamped");
@@ -275,7 +274,7 @@ async fn if_the_dlq_transaction_rolls_back_neither_handoff_nor_offset_is_durable
                     .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
                 *capture.lock().unwrap() = Some(handle);
                 tx_manager
-                    .commit_in_tx(tx, &group, &topic, delivery().partition(), offset)
+                    .commit_in_tx(tx, &group, &tx_topic, delivery().partition(), offset)
                     .await
                     .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
                 Err(toolkit_db::DbError::InvalidConfig(
@@ -309,6 +308,7 @@ async fn if_the_main_transaction_rolled_back_i_open_a_new_tx_for_dlq_and_offset_
         Fallback::Earliest,
     ));
     let (group, topic) = coordinates();
+    let tx_topic = topic.clone();
     let event = rejected_event(40);
     let record = dead_letter(&event, group);
     let offset = event.sequence().expect("a delivered event is stamped");
@@ -335,7 +335,7 @@ async fn if_the_main_transaction_rolled_back_i_open_a_new_tx_for_dlq_and_offset_
                     .await
                     .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
                 tx_manager
-                    .commit_in_tx(tx, &group, &topic, delivery().partition(), offset)
+                    .commit_in_tx(tx, &group, &tx_topic, delivery().partition(), offset)
                     .await
                     .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
                 Ok(wake)
@@ -370,6 +370,7 @@ async fn if_dlq_handoff_fails_i_do_not_commit_the_source_offset() {
         Fallback::Earliest,
     ));
     let (group, topic) = coordinates();
+    let tx_topic = topic.clone();
     let event = rejected_event(50);
     let record = dead_letter(&event, group);
     let offset = event.sequence().expect("a delivered event is stamped");
@@ -384,7 +385,7 @@ async fn if_dlq_handoff_fails_i_do_not_commit_the_source_offset() {
                     .await
                     .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
                 tx_manager
-                    .commit_in_tx(tx, &group, &topic, delivery().partition(), offset)
+                    .commit_in_tx(tx, &group, &tx_topic, delivery().partition(), offset)
                     .await
                     .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
                 Ok(())

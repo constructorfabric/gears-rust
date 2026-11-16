@@ -1,7 +1,4 @@
-//! `handlers/delivery/streaming.rs` coverage (`eb-rest-handlers` task 11.5):
-//! `:stream`/`:sse` frame shapes and streaming-in-progress lifecycle,
-//! split out from `subscriptions_tests.rs`, which this file was originally
-//! just a section of.
+//! `:stream`/`:sse` coverage: frame shapes and the stream-lease lifecycle.
 //!
 //! These tests bypass `RequestCase::send()` (which eagerly collects the
 //! *entire* response body via `axum::body::to_bytes` - fine for ordinary
@@ -12,7 +9,7 @@
 //! pattern (`idle_timeout_closes_connection_after_silence_but_not_between_heartbeats`).
 
 use axum::body::Body;
-use axum::http::{HeaderValue, Request, StatusCode};
+use axum::http::{HeaderValue, Method, Request, StatusCode};
 use serde_json::json;
 use tokio_stream::StreamExt;
 use tower::ServiceExt;
@@ -33,7 +30,7 @@ use memory_event_broker_plugin::MemoryBackend;
 use toolkit_gts::GtsInstanceId;
 
 use crate::domain::streaming::source::PartitionKey;
-use crate::test_support::{EventBrokerHarness, Json, StaticTypesRegistry};
+use crate::test_support::{EventBrokerHarness, Json, RequestCase, StaticTypesRegistry};
 
 #[tokio::test]
 async fn stream_events_returns_409_positions_not_set_when_unseeded() {
@@ -55,7 +52,7 @@ async fn stream_events_returns_409_positions_not_set_when_unseeded() {
             "client_agent": "a",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -138,7 +135,7 @@ async fn stream_events_happy_path_emits_topology_frame_first() {
             "client_agent": "a",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -160,9 +157,7 @@ async fn stream_events_happy_path_emits_topology_frame_first() {
 
     let request = Request::builder()
         .method("GET")
-        .uri(format!(
-            "/event-broker/v1/events:stream?subscription_id={id}"
-        ))
+        .uri(format!("/event-broker/v1/events:stream?subscription={id}"))
         .body(Body::empty())
         .expect("request must build");
     let response = harness
@@ -225,7 +220,7 @@ async fn stream_events_second_stream_on_same_subscription_returns_409_streaming_
             "client_agent": "a",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -247,13 +242,11 @@ async fn stream_events_second_stream_on_same_subscription_returns_409_streaming_
 
     let request1 = Request::builder()
         .method("GET")
-        .uri(format!(
-            "/event-broker/v1/events:stream?subscription_id={id}"
-        ))
+        .uri(format!("/event-broker/v1/events:stream?subscription={id}"))
         .body(Body::empty())
         .expect("request must build");
     // Held alive (not dropped) for the rest of the test - dropping the
-    // response body would clear the active-stream marker immediately.
+    // response body would release the subscription's stream lease immediately.
     let first_response = harness
         .router()
         .clone()
@@ -277,7 +270,7 @@ async fn stream_events_second_stream_on_same_subscription_returns_409_streaming_
                 "violations": [{
                     "type": "streaming_in_progress",
                     "subject": id,
-                    "description": "one stream per subscription; DELETE is the only permitted concurrent call",
+                    "description": "one stream per subscription; a second stream or a SEEK is refused while it is open",
                 }],
                 "resource_type": "gts.cf.core.events.subscription.v1~",
             },
@@ -307,7 +300,7 @@ async fn seek_while_streaming_returns_409_streaming_in_progress() {
             "client_agent": "a",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -329,9 +322,7 @@ async fn seek_while_streaming_returns_409_streaming_in_progress() {
 
     let request = Request::builder()
         .method("GET")
-        .uri(format!(
-            "/event-broker/v1/events:stream?subscription_id={id}"
-        ))
+        .uri(format!("/event-broker/v1/events:stream?subscription={id}"))
         .body(Body::empty())
         .expect("request must build");
     let stream_response = harness
@@ -364,12 +355,77 @@ async fn seek_while_streaming_returns_409_streaming_in_progress() {
                 "violations": [{
                     "type": "streaming_in_progress",
                     "subject": id,
-                    "description": "one stream per subscription; DELETE is the only permitted concurrent call",
+                    "description": "one stream per subscription; a second stream or a SEEK is refused while it is open",
                 }],
                 "resource_type": "gts.cf.core.events.subscription.v1~",
             },
         })
     );
+
+    drop(stream_response);
+}
+
+/// A GET of the subscription is answered while a stream is open, with the same
+/// body as before the stream opened.
+#[tokio::test]
+async fn a_get_during_an_open_stream_answers_the_subscription() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+        ])))
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let id = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "a",
+            "interests": [{
+                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
+                "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
+            }],
+        })))
+        .send()
+        .await
+        .json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    harness
+        .api_v1()
+        .post_subscription_seek(&id)
+        .with_body(Json(&json!({
+            "topology_version": 1, "positions": { ("gts.cf.core.events.topic.v1~x.eb.t1.topic.v1"): [{ "partition": 0, "value": "earliest" }] }
+        })))
+        .send()
+        .await
+        .assert_status(200);
+    let before = harness.api_v1().get_subscription(&id).send().await;
+    before.assert_status(200);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("/event-broker/v1/events:stream?subscription={id}"))
+        .body(Body::empty())
+        .expect("request must build");
+    let stream_response = harness
+        .router()
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("the service itself must not error");
+    assert_eq!(stream_response.status(), StatusCode::OK);
+
+    let during = harness.api_v1().get_subscription(&id).send().await;
+
+    during.assert_status(200);
+    assert_eq!(during.json(), before.json());
 
     drop(stream_response);
 }
@@ -467,7 +523,7 @@ async fn delivers_a_published_event_on_its_head_change(backend: Arc<dyn Backend>
             "client_agent": "a",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id, "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -489,9 +545,7 @@ async fn delivers_a_published_event_on_its_head_change(backend: Arc<dyn Backend>
 
     let request = Request::builder()
         .method("GET")
-        .uri(format!(
-            "/event-broker/v1/events:stream?subscription_id={id}"
-        ))
+        .uri(format!("/event-broker/v1/events:stream?subscription={id}"))
         .body(Body::empty())
         .expect("request must build");
     let response = harness
@@ -515,7 +569,7 @@ async fn delivers_a_published_event_on_its_head_change(backend: Arc<dyn Backend>
         .with_body(Json(&json!({
             "id": event_id,
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "tenant_id": tenant_id,
+            "subject_tenant": tenant_id,
             "source": "test-delivers_a_published_event_on_its_head_change",
             "subject": "s1",
             "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -545,10 +599,11 @@ async fn delivers_a_published_event_on_its_head_change(backend: Arc<dyn Backend>
         "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"
     );
     assert_eq!(
-        frame["payload"]["topic"],
-        "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1"
+        frame["payload"].get("topic"),
+        None,
+        "the payload names no topic: a consumer knows it from the event's type"
     );
-    assert_eq!(frame["payload"]["tenant_id"], tenant_id.to_string());
+    assert_eq!(frame["payload"]["subject_tenant"], tenant_id.to_string());
     assert_eq!(frame["payload"]["subject"], "s1");
 
     // The head reached the loader through the backend's watch, not only a
@@ -597,6 +652,149 @@ async fn sse_events_returns_404_for_unknown_subscription() {
     );
 }
 
+/// Bounds a refused open: an open that is not refused never ends, and the
+/// request helper collects the whole body.
+const REFUSAL_BOUND: Duration = Duration::from_secs(10);
+
+/// A harness whose REST caller is a subject of `0x3522`, and a subscription
+/// another subject of that tenant joined and seeded in process, so only the
+/// caller decides whether its stream opens. Returns the harness and the
+/// subscription id.
+async fn harness_with_a_seeded_subscription_joined_by_another_principal()
+-> (EventBrokerHarness, Uuid) {
+    let tenant = Uuid::from_u128(0x3522);
+    let topic = GtsInstanceId::try_new("gts.cf.core.events.topic.v1~x.eb.t1.topic.v1").unwrap();
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+        ])))
+        .with_security_context(
+            toolkit_security::SecurityContext::builder()
+                .subject_id(Uuid::from_u128(0x3523))
+                .subject_tenant_id(tenant)
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .await;
+    let joiner = toolkit_security::SecurityContext::builder()
+        .subject_id(Uuid::from_u128(0x3521))
+        .subject_tenant_id(tenant)
+        .build()
+        .unwrap();
+    let group = harness
+        .delivery()
+        .create_consumer_group(
+            &joiner,
+            crate::domain::model::ConsumerGroupCreateInput {
+                client_agent: Some("joiner".to_owned()),
+                description: None,
+            },
+        )
+        .await
+        .expect("the group is created")
+        .id;
+    let id = harness
+        .delivery()
+        .join(
+            &joiner,
+            crate::domain::delivery::JoinRequest {
+                consumer_group: group,
+                client_agent: "joiner".to_owned(),
+                interests: vec![crate::domain::model::Interest {
+                    topic: topic.clone(),
+                    subject_tenant: tenant,
+                    ownership: crate::domain::model::OwnershipFilter::EntireTenant,
+                    barrier_mode: crate::domain::model::BarrierMode::Respect,
+                    types: vec![
+                        gts::GtsIdPattern::try_new("gts.cf.core.events.event.v1~x.eb.t1.foo.v1~")
+                            .unwrap(),
+                    ],
+                    subject_types: Vec::new(),
+                    filter: None,
+                }],
+                session_timeout: Duration::from_secs(30),
+            },
+        )
+        .await
+        .expect("the JOIN is allowed")
+        .subscription
+        .id;
+    harness
+        .delivery()
+        .seek(
+            &joiner,
+            id,
+            1,
+            vec![crate::domain::delivery::SeekTarget {
+                topic,
+                partition: 0,
+                value: crate::domain::delivery::Position::Earliest,
+            }],
+        )
+        .await
+        .expect("the joiner's seek is allowed");
+    (harness, id)
+}
+
+#[tokio::test]
+async fn stream_events_by_another_principal_of_the_tenant_returns_403_subscription_not_owned() {
+    let (harness, id) = harness_with_a_seeded_subscription_joined_by_another_principal().await;
+
+    let resp = tokio::time::timeout(
+        REFUSAL_BOUND,
+        harness.api_v1().get_events_stream(&id.to_string()).send(),
+    )
+    .await
+    .expect("the open is refused within the bound");
+
+    resp.assert_status(403);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~",
+            "title": "Permission Denied",
+            "status": 403,
+            "detail": "You do not have permission to perform this operation",
+            "instance": "/event-broker/v1/events:stream",
+            "context": {
+                "reason": format!("subscription '{id}' was joined by another principal"),
+                "resource_type": "gts.cf.core.events.subscription.v1~",
+            },
+        })
+    );
+    assert_eq!(harness.leases().held_count(), 0);
+}
+
+#[tokio::test]
+async fn sse_events_by_another_principal_of_the_tenant_returns_403_subscription_not_owned() {
+    let (harness, id) = harness_with_a_seeded_subscription_joined_by_another_principal().await;
+
+    let resp = tokio::time::timeout(
+        REFUSAL_BOUND,
+        harness.api_v1().get_events_sse(&id.to_string()).send(),
+    )
+    .await
+    .expect("the open is refused within the bound");
+
+    resp.assert_status(403);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~",
+            "title": "Permission Denied",
+            "status": 403,
+            "detail": "You do not have permission to perform this operation",
+            "instance": "/event-broker/v1/events:sse",
+            "context": {
+                "reason": format!("subscription '{id}' was joined by another principal"),
+                "resource_type": "gts.cf.core.events.subscription.v1~",
+            },
+        })
+    );
+    assert_eq!(harness.leases().held_count(), 0);
+}
+
 #[tokio::test]
 async fn sse_events_happy_path_opens_a_text_event_stream() {
     let harness = EventBrokerHarness::builder()
@@ -617,7 +815,7 @@ async fn sse_events_happy_path_opens_a_text_event_stream() {
             "client_agent": "a",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -639,7 +837,7 @@ async fn sse_events_happy_path_opens_a_text_event_stream() {
 
     let request = Request::builder()
         .method("GET")
-        .uri(format!("/event-broker/v1/events:sse?subscription_id={id}"))
+        .uri(format!("/event-broker/v1/events:sse?subscription={id}"))
         .body(Body::empty())
         .expect("request must build");
     let response = harness
@@ -669,6 +867,156 @@ async fn sse_events_happy_path_opens_a_text_event_stream() {
         "event: topology\ndata: {\"kind\":\"topology\",\"topology_version\":1,\"assigned\":\
          [{\"topic\":\"gts.cf.core.events.topic.v1~x.eb.t1.topic.v1\",\"partition\":0,\"offset\":0,\
          \"last_examined\":0}]}\n\n"
+    );
+}
+
+/// Joins a fresh group to the one-partition topic and seeks it to earliest, so
+/// the returned subscription id opens a stream.
+async fn seeded_subscription(harness: &EventBrokerHarness) -> String {
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let id = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "a",
+            "interests": [{
+                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
+                "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
+            }],
+        })))
+        .send()
+        .await
+        .json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    harness
+        .api_v1()
+        .post_subscription_seek(&id)
+        .with_body(Json(&json!({
+            "topology_version": 1, "positions": { ("gts.cf.core.events.topic.v1~x.eb.t1.topic.v1"): [{ "partition": 0, "value": "earliest" }] }
+        })))
+        .send()
+        .await
+        .assert_status(200);
+    id
+}
+
+/// The stream query parameter is `subscription`: an openable subscription named
+/// under `subscription_id` is refused with `400` (not ignored, not opened) and
+/// takes no lease; the same id under `subscription` opens.
+#[tokio::test]
+async fn stream_events_refuses_the_subscription_id_query_and_opens_under_subscription() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+        ])))
+        .build()
+        .await;
+    let id = seeded_subscription(&harness).await;
+
+    let refused = RequestCase::new(&harness, Method::GET, "/event-broker/v1/events:stream")
+        .with_query("subscription_id", id.as_str())
+        .send()
+        .await;
+
+    refused.assert_status(400);
+    assert_eq!(
+        refused.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "InvalidQuery: unknown field `subscription_id`, expected `subscription`",
+            "instance": "/event-broker/v1/events:stream",
+            "context": {
+                "format": "InvalidQuery: unknown field `subscription_id`, expected `subscription`",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    assert_eq!(harness.leases().held_count(), 0);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("/event-broker/v1/events:stream?subscription={id}"))
+        .body(Body::empty())
+        .expect("request must build");
+    let response = harness
+        .router()
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("the service itself must not error");
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        content_type.starts_with("multipart/mixed; boundary="),
+        "expected a multipart stream, got content type '{content_type}'"
+    );
+}
+
+/// As `stream_events_refuses_the_subscription_id_query_and_opens_under_subscription`,
+/// for `:sse`.
+#[tokio::test]
+async fn sse_events_refuses_the_subscription_id_query_and_opens_under_subscription() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+        ])))
+        .build()
+        .await;
+    let id = seeded_subscription(&harness).await;
+
+    let refused = RequestCase::new(&harness, Method::GET, "/event-broker/v1/events:sse")
+        .with_query("subscription_id", id.as_str())
+        .send()
+        .await;
+
+    refused.assert_status(400);
+    assert_eq!(
+        refused.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "InvalidQuery: unknown field `subscription_id`, expected `subscription`",
+            "instance": "/event-broker/v1/events:sse",
+            "context": {
+                "format": "InvalidQuery: unknown field `subscription_id`, expected `subscription`",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    assert_eq!(harness.leases().held_count(), 0);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("/event-broker/v1/events:sse?subscription={id}"))
+        .body(Body::empty())
+        .expect("request must build");
+    let response = harness
+        .router()
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("the service itself must not error");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap()),
+        Some("text/event-stream")
     );
 }
 
@@ -761,7 +1109,7 @@ async fn second_join_pushes_topology_frame_to_existing_stream() {
             "client_agent": "a",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id, "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -792,7 +1140,7 @@ async fn second_join_pushes_topology_frame_to_existing_stream() {
     let req_a = Request::builder()
         .method("GET")
         .uri(format!(
-            "/event-broker/v1/events:stream?subscription_id={id_a}"
+            "/event-broker/v1/events:stream?subscription={id_a}"
         ))
         .body(Body::empty())
         .unwrap();
@@ -814,7 +1162,7 @@ async fn second_join_pushes_topology_frame_to_existing_stream() {
             "client_agent": "b",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id, "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -866,7 +1214,7 @@ async fn leave_pushes_terminal_frame_to_surviving_stream() {
                     "client_agent": client_agent,
                     "interests": [{
                         "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                        "tenant_id": tenant_id,
+                        "subject_tenant": tenant_id, "ownership_filter": "entire_tenant",
                         "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
                     }],
                 })))
@@ -915,7 +1263,7 @@ async fn leave_pushes_terminal_frame_to_surviving_stream() {
     let req_b = Request::builder()
         .method("GET")
         .uri(format!(
-            "/event-broker/v1/events:stream?subscription_id={id_b}"
+            "/event-broker/v1/events:stream?subscription={id_b}"
         ))
         .body(Body::empty())
         .unwrap();
@@ -1028,7 +1376,7 @@ async fn a_stream_delivers_only_events_matching_its_interests() {
             "client_agent": "a",
             "interests": [{
                 "topic": TOPIC,
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id, "ownership_filter": "entire_tenant",
                 // Only one of the two registered types.
                 "types": [WANTED],
             }],
@@ -1058,7 +1406,7 @@ async fn a_stream_delivers_only_events_matching_its_interests() {
             .with_body(Json(&json!({
                 "id": Uuid::new_v4(),
                 "type": kind,
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id,
                 "source": "test-a_stream_delivers_only_events_matching_its_interests",
                 "subject": subject,
                 "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -1071,9 +1419,7 @@ async fn a_stream_delivers_only_events_matching_its_interests() {
 
     let request = Request::builder()
         .method("GET")
-        .uri(format!(
-            "/event-broker/v1/events:stream?subscription_id={id}"
-        ))
+        .uri(format!("/event-broker/v1/events:stream?subscription={id}"))
         .body(Body::empty())
         .expect("request must build");
     let response = harness

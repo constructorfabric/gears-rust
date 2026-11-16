@@ -53,6 +53,9 @@ async fn if_i_want_a_simple_single_event_handler() {
     let partitions = Arc::new(Mutex::new(Vec::new()));
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("showcase-single"))
         .topics([topic(TOPIC)])
         .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
@@ -91,6 +94,9 @@ async fn if_i_publish_events_partitioned_by_a_payload_member_each_lands_on_its_p
     let partitions = Arc::new(Mutex::new(Vec::new()));
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous(
             "showcase-single-partition-key",
         ))
@@ -164,6 +170,9 @@ async fn events_from_two_topics_are_each_attributed_to_their_own_topic() {
     let seen = Arc::new(Mutex::new(Vec::new()));
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("showcase-two-topics"))
         .topics([topic(ORDERS_TOPIC), topic(AUDIT_TOPIC)])
         .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
@@ -242,10 +251,10 @@ fn order_service_event(tenant: Uuid, event_type: &str, data: Option<serde_json::
     };
     builder
         .id(SEEN_ID)
-        .tenant_id(tenant)
+        .subject_tenant(tenant)
         .source("order-service")
         .subject("order-1")
-        .subject_type_id(GtsTypeId::new(SHOWCASE_SUBJECT_TYPE))
+        .subject_type_of(GtsTypeId::new(SHOWCASE_SUBJECT_TYPE))
         .build()
         .expect("a valid event")
 }
@@ -259,6 +268,9 @@ async fn a_handler_sees_the_published_events_source_and_delivery() {
     let seen = handler.seen.clone();
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("showcase-single-seen"))
         .topics([topic(TOPIC)])
         .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
@@ -330,6 +342,9 @@ async fn a_retried_event_is_redelivered_with_the_next_attempt() {
     let attempts = handler.attempts.clone();
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("showcase-single-retry"))
         .topics([topic(TOPIC)])
         .retry(ConsumerRetry {
@@ -373,6 +388,9 @@ async fn a_retry_override_sets_the_handler_backoff() {
     let runtime_events = listener.events.clone();
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous(
             "showcase-single-retry-override",
         ))
@@ -451,6 +469,9 @@ async fn a_body_less_event_reaches_the_handler_without_data() {
     let seen = handler.seen.clone();
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous(
             "showcase-single-body-less",
         ))

@@ -23,7 +23,7 @@ fn a_schema_violation_names_the_keyword_and_schema_location_but_no_value() {
         topic: GtsInstanceId::try_new(TOPIC).expect("a valid topic id"),
         description: None,
         allowed_subject_types: Vec::new(),
-        partition_key: "/tenant_id".to_owned(),
+        partition_key: "/subject_tenant".to_owned(),
         data_schema: json!({
             "type": "object",
             "properties": { "total_cents": { "type": "integer" } },
@@ -38,7 +38,7 @@ fn a_schema_violation_names_the_keyword_and_schema_location_but_no_value() {
         .expect_err("the payload breaks three keywords");
 
     let EventBrokerError::EventDataInvalid {
-        type_id,
+        event_type: type_id,
         errors,
         detail,
     } = err.clone()
@@ -89,4 +89,40 @@ fn a_schema_violation_names_the_keyword_and_schema_location_but_no_value() {
     let rendered = format!("{canonical:?}");
     assert!(!rendered.contains(PLANTED_VALUE), "{rendered}");
     assert!(!rendered.contains(PLANTED_KEY), "{rendered}");
+}
+
+#[test]
+fn a_base_type_pattern_covers_its_derived_types() {
+    assert!(super::gts_pattern_matches(
+        "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+        "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~x.eb.t1.bar.v1~",
+    ));
+}
+
+#[test]
+fn a_trailing_star_after_tilde_selects_every_type() {
+    assert!(super::gts_pattern_matches(
+        "gts.cf.core.events.event.v1~*",
+        "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+    ));
+}
+
+#[test]
+fn an_unparsable_pattern_matches_nothing() {
+    assert!(!super::gts_pattern_matches(
+        "orders.*",
+        "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+    ));
+}
+
+#[test]
+fn a_prefix_wildcard_still_selects_its_family() {
+    assert!(super::gts_pattern_matches(
+        "gts.cf.core.events.event.v1~x.eb.t1.*",
+        "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+    ));
+    assert!(!super::gts_pattern_matches(
+        "gts.cf.core.events.event.v1~x.eb.t1.*",
+        "gts.cf.core.events.event.v1~x.eb.t2.foo.v1~",
+    ));
 }

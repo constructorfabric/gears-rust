@@ -182,7 +182,6 @@ fn terminal_frame_json(topic: &str, old_partitions: &[i32]) -> Value {
 #[allow(clippy::too_many_arguments)]
 fn event_frame_json(
     event_id: Uuid,
-    topic: &str,
     event_type: &str,
     tenant_id: Uuid,
     subject: &str,
@@ -198,8 +197,7 @@ fn event_frame_json(
         "payload": {
             "id": event_id,
             "type": event_type,
-            "topic": topic,
-            "tenant_id": tenant_id,
+            "subject_tenant": tenant_id,
             "source": "integration-test",
             "subject": subject,
             "subject_type": subject_type,
@@ -269,7 +267,7 @@ async fn join(
     let mut body = json!({
         "consumer_group": group_id,
         "client_agent": client_agent,
-        "interests": [{ "topic": topic, "tenant_id": tenant_id, "types": [event_type] }],
+        "interests": [{ "topic": topic, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [event_type] }],
     });
     if let Some(timeout) = session_timeout {
         body["session_timeout"] = json!(timeout);
@@ -326,7 +324,7 @@ async fn open_stream(
 ) -> SseFrameReader {
     let resp = client
         .get(server.url(&format!(
-            "/event-broker/v1/events:sse?subscription_id={sub_id}"
+            "/event-broker/v1/events:sse?subscription={sub_id}"
         )))
         .send()
         .await
@@ -339,7 +337,6 @@ async fn open_stream(
 async fn drain_events(
     reader: &mut SseFrameReader,
     count: usize,
-    topic: &str,
     event_type: &str,
     tenant_id: Uuid,
     subject_type: &str,
@@ -374,7 +371,6 @@ async fn drain_events(
             data,
             event_frame_json(
                 event_id,
-                topic,
                 event_type,
                 tenant_id,
                 &format!("s-{partition}-{sequence}"),
@@ -518,7 +514,7 @@ async fn two_subscribers_baseline_then_third_joins_mid_stream() {
                 .json(&json!({
                     "id": event_id,
                     "type": event_type,
-                    "tenant_id": tenant_id,
+                    "subject_tenant": tenant_id,
                     "source": "integration-test",
                     "subject": format!("s-{partition}-{seq}"),
                     "subject_type": subject_type,
@@ -544,7 +540,6 @@ async fn two_subscribers_baseline_then_third_joins_mid_stream() {
     let a_seen = drain_events(
         &mut a_reader,
         expected_count,
-        topic,
         event_type,
         tenant_id,
         subject_type,
@@ -556,7 +551,6 @@ async fn two_subscribers_baseline_then_third_joins_mid_stream() {
     let b_seen = drain_events(
         &mut b_reader,
         expected_count,
-        topic,
         event_type,
         tenant_id,
         subject_type,
@@ -760,7 +754,7 @@ async fn setup(test_tag: &str) -> TestFixture {
                 "partition_key": "/data/pk",
             }),
         ],
-        Some(1),
+        1,
     )
     .await;
     let client = reqwest::Client::new();
@@ -1036,7 +1030,7 @@ async fn verify_gap_free_and_final_state(
                 .json(&json!({
                     "id": event_id,
                     "type": f.event_type,
-                    "tenant_id": f.tenant_id,
+                    "subject_tenant": f.tenant_id,
                     "source": "integration-test",
                     "subject": format!("s-{partition}-{seq}"),
                     "subject_type": f.subject_type,
@@ -1060,7 +1054,6 @@ async fn verify_gap_free_and_final_state(
         let seen = drain_events(
             &mut m.reader,
             count,
-            &f.topic,
             &f.event_type,
             f.tenant_id,
             &f.subject_type,
@@ -1134,9 +1127,9 @@ async fn verify_gap_free_and_final_state(
                 "client_agent": m.client_agent,
                 "interests": [{
                     "topic": f.topic,
-                    "tenant_id": f.tenant_id,
+                    "subject_tenant": f.tenant_id,
                     "types": [f.event_type],
-                    "max_depth": 0,
+                    "ownership_filter": "entire_tenant",
                     "barrier_mode": "respect",
                     "filter": null,
                 }],

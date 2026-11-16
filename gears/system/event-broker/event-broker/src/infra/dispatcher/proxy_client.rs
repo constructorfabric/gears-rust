@@ -5,7 +5,7 @@
 //! [`crate::config::MAX_REQUEST_BODY_BYTES`] (`http_body_util::Limited`, not
 //! `BatchConfig::max_payload_bytes` - see that constant's doc comment); the
 //! response body streams back with an idle-timeout on each read (design.md
-//! D9), so long-poll/SSE connections stay open as long as bytes - heartbeat
+//! D9), so streaming and SSE connections stay open as long as bytes - heartbeat
 //! or data - keep arriving.
 
 use axum::body::Body;

@@ -5,8 +5,8 @@ use std::error::Error;
 use event_broker_sdk::backend::BackendError;
 use event_broker_sdk::error::{reasons, resources};
 use event_broker_sdk::{
-    ConsumerError, ConsumerGroupId, EventBrokerError, OffsetManagerError, OutOfRange,
-    PositionViolation, ProducerId, Sequence, SubscriptionId,
+    ConsumerError, EventBrokerError, OffsetManagerError, OutOfRange, PositionViolation, ProducerId,
+    Sequence, SubscriptionId,
 };
 use serde_json::{Value, json};
 use toolkit_canonical_errors::{CanonicalError, Problem};
@@ -15,7 +15,7 @@ use uuid::Uuid;
 #[test]
 fn display_interpolates_fields() {
     let e = EventBrokerError::EventTypeNotDeclared {
-        type_id: "gts.cf.core.events.event.v1~example.foo.v1~".into(),
+        event_type: "gts.cf.core.events.event.v1~example.foo.v1~".into(),
         detail: "d".into(),
     };
     assert!(
@@ -94,7 +94,7 @@ fn assert_problem(err: impl Into<CanonicalError>, expected: Value) {
 
 #[test]
 fn top_level_event_broker_errors_have_full_canonical_representation() {
-    let group_id = ConsumerGroupId(fixed_uuid(1));
+    let group_id = "gts.cf.core.events.consumer_group.v1~00000000-0000-0000-0000-000000000001";
     let subscription_id = SubscriptionId(fixed_uuid(2));
     let producer_id = ProducerId(fixed_uuid(3));
 
@@ -143,7 +143,7 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
         ),
         (
             EventBrokerError::EventTypeNotDeclared {
-                type_id: "gts.cf.core.events.event.v1~example.orders.created.v1~".into(),
+                event_type: "gts.cf.core.events.event.v1~example.orders.created.v1~".into(),
                 detail: "type is not declared".into(),
             },
             json!({
@@ -166,7 +166,7 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
         ),
         (
             EventBrokerError::EventTypeUnknown {
-                type_id: "gts.cf.core.events.event.v1~example.orders.created.v1~".into(),
+                event_type: "gts.cf.core.events.event.v1~example.orders.created.v1~".into(),
                 detail: "event type not found".into(),
             },
             json!({
@@ -184,7 +184,7 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
         ),
         (
             EventBrokerError::TypeNotInDeclaredTopic {
-                type_id: "gts.cf.core.events.event.v1~example.orders.created.v1~".into(),
+                event_type: "gts.cf.core.events.event.v1~example.orders.created.v1~".into(),
                 expected_topic: "orders".into(),
                 detail: "type belongs to another topic".into(),
             },
@@ -208,7 +208,7 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
         ),
         (
             EventBrokerError::SchemaNotPrepared {
-                type_id: "gts.cf.core.events.event.v1~example.orders.created.v1~".into(),
+                event_type: "gts.cf.core.events.event.v1~example.orders.created.v1~".into(),
                 detail: "schema cache missing".into(),
             },
             json!({
@@ -299,7 +299,7 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
         ),
         (
             EventBrokerError::EventDataInvalid {
-                type_id: "gts.cf.core.events.event.v1~example.orders.created.v1~".into(),
+                event_type: "gts.cf.core.events.event.v1~example.orders.created.v1~".into(),
                 errors: vec!["/amount must be >= 0".into()],
                 detail: "payload invalid".into(),
             },
@@ -341,7 +341,7 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
         ),
         (
             EventBrokerError::ConsumerGroupNotFound {
-                group_id,
+                consumer_group: group_id.into(),
                 detail: "consumer group not found".into(),
             },
             json!({
@@ -353,7 +353,10 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
                 "trace_id": "trace-123",
                 "context": {
                     "resource_type": resources::CONSUMER_GROUP,
-                    "resource_name": group_id.to_string()
+                    "resource_name": concat!(
+                        "gts.cf.core.events.consumer_group.v1~",
+                        "00000000-0000-0000-0000-000000000001"
+                    )
                 }
             }),
         ),
@@ -415,7 +418,7 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
         ),
         (
             EventBrokerError::UnknownProducer {
-                producer_id,
+                producer: producer_id,
                 detail: "producer not found".into(),
             },
             json!({

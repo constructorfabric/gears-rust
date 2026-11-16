@@ -53,6 +53,6 @@
     "allowed_subject_types": [
       "gts.fabrikam.shop.orders.order.v1~"
     ],
-    "partition_key": "/tenant_id"
+    "partition_key": "/subject_tenant"
   }
 }

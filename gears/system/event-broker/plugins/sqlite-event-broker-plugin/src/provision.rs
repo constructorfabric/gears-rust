@@ -3,7 +3,6 @@
 //! transaction.
 
 use chrono::Utc;
-use event_broker_sdk::backend::support::topic_uuid;
 use event_broker_sdk::backend::{BackendError, LogClaim, LogId, Provisioning, Stored, TopicSpec};
 use uuid::Uuid;
 
@@ -32,7 +31,7 @@ pub async fn provision(
         )));
     }
     let opened = shared.opened()?;
-    let topic = topic_uuid(&spec.topic);
+    let topic = spec.uuid;
     let max_age_ms = spec
         .retention
         .max_age

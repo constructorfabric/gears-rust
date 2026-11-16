@@ -1,23 +1,14 @@
-//! Tenant-traversal scope on an interest.
-//!
-//! The wire gives `max_depth` three meanings across two JSON forms - absent,
-//! `0`, `n`, and `null` - and the whole reason the domain models it as an enum
-//! rather than an `Option<u32>` is that two of those forms are opposites:
-//! absent means the narrowest scope and `null` means the widest. These tests
-//! pin that mapping in both directions, because getting it backwards would
-//! silently widen a subscription's tenant scope rather than fail.
-
-use std::num::NonZeroU32;
+//! The interest's ownership filter and barrier mode on the stored wire form.
 
 use serde_json::json;
 use uuid::Uuid;
 
-use super::model::{BarrierMode, Interest, TenantTraversalDepth};
+use super::model::{BarrierMode, Interest, OwnershipFilter};
 
 fn interest_json(overrides: &serde_json::Value) -> serde_json::Value {
     let mut base = json!({
         "topic": "gts.cf.core.events.topic.v1~x.eb.orders.acme.v1",
-        "tenant_id": "fec5ff3e-4d0d-416e-95e0-c354028c1b12",
+        "subject_tenant": "fec5ff3e-4d0d-416e-95e0-c354028c1b12",
         "types": ["gts.cf.core.events.event.v1~x.eb.orders.created.v1~"],
     });
     if let (Some(base), Some(overrides)) = (base.as_object_mut(), overrides.as_object()) {
@@ -28,57 +19,34 @@ fn interest_json(overrides: &serde_json::Value) -> serde_json::Value {
     base
 }
 
-fn depth_of(overrides: &serde_json::Value) -> TenantTraversalDepth {
+fn ownership_of(overrides: &serde_json::Value) -> OwnershipFilter {
     serde_json::from_value::<Interest>(interest_json(overrides))
         .expect("interest deserializes")
-        .depth
+        .ownership
 }
 
 #[test]
-fn an_absent_max_depth_is_the_current_tenant_only() {
-    assert_eq!(depth_of(&json!({})), TenantTraversalDepth::CurrentTenant);
+fn an_absent_ownership_filter_is_only_mine() {
+    assert_eq!(ownership_of(&json!({})), OwnershipFilter::OnlyMine);
+    assert_eq!(OwnershipFilter::default(), OwnershipFilter::OnlyMine);
 }
 
 #[test]
-fn a_zero_max_depth_is_the_current_tenant_only() {
-    assert_eq!(
-        depth_of(&json!({ "max_depth": 0 })),
-        TenantTraversalDepth::CurrentTenant
-    );
-}
-
-#[test]
-fn a_positive_max_depth_is_that_many_levels_of_descendants() {
-    assert_eq!(
-        depth_of(&json!({ "max_depth": 3 })),
-        TenantTraversalDepth::Descendants(NonZeroU32::new(3).expect("3 is non-zero"))
-    );
-}
-
-/// The case that makes the enum worth having: an explicit `null` is the
-/// *widest* scope, and an `Option<u32>` would make it indistinguishable from
-/// the absent case above, which is the narrowest.
-#[test]
-fn an_explicit_null_max_depth_is_unlimited_descendants() {
-    assert_eq!(
-        depth_of(&json!({ "max_depth": null })),
-        TenantTraversalDepth::UnlimitedDescendants
-    );
-}
-
-#[test]
-fn every_depth_round_trips_through_the_wire_form() {
-    for depth in [
-        TenantTraversalDepth::CurrentTenant,
-        TenantTraversalDepth::Descendants(NonZeroU32::new(1).expect("1 is non-zero")),
-        TenantTraversalDepth::Descendants(NonZeroU32::new(9).expect("9 is non-zero")),
-        TenantTraversalDepth::UnlimitedDescendants,
+fn ownership_filter_wire_tokens_agree_with_its_serde_renaming() {
+    for (filter, token) in [
+        (OwnershipFilter::OnlyMine, "only_mine"),
+        (OwnershipFilter::EntireTenant, "entire_tenant"),
+        (
+            OwnershipFilter::TenantSubtreeIncluded,
+            "tenant_subtree_included",
+        ),
     ] {
+        assert_eq!(filter.as_wire(), token);
         assert_eq!(
-            TenantTraversalDepth::from_max_depth(depth.max_depth()),
-            depth,
-            "{depth:?} did not survive a round trip through max_depth"
+            serde_json::to_value(filter).expect("filter serializes"),
+            json!(token)
         );
+        assert_eq!(ownership_of(&json!({ "ownership_filter": token })), filter);
     }
 }
 
@@ -91,13 +59,15 @@ fn an_interest_serializes_to_the_full_wire_shape() {
             "gts.cf.core.events.topic.v1~x.eb.orders.acme.v1",
         )
         .expect("static topic id is valid"),
-        tenant_id: Uuid::parse_str("fec5ff3e-4d0d-416e-95e0-c354028c1b12").expect("static uuid"),
-        depth: TenantTraversalDepth::UnlimitedDescendants,
+        subject_tenant: Uuid::parse_str("fec5ff3e-4d0d-416e-95e0-c354028c1b12")
+            .expect("static uuid"),
+        ownership: OwnershipFilter::EntireTenant,
         barrier_mode: BarrierMode::Ignore,
         types: vec![
             gts::GtsIdPattern::try_new("gts.cf.core.events.event.v1~x.eb.orders.created.v1~")
                 .unwrap(),
         ],
+        subject_types: Vec::new(),
         filter: None,
     };
 
@@ -105,8 +75,8 @@ fn an_interest_serializes_to_the_full_wire_shape() {
         serde_json::to_value(&interest).expect("interest serializes"),
         json!({
             "topic": "gts.cf.core.events.topic.v1~x.eb.orders.acme.v1",
-            "tenant_id": "fec5ff3e-4d0d-416e-95e0-c354028c1b12",
-            "max_depth": null,
+            "subject_tenant": "fec5ff3e-4d0d-416e-95e0-c354028c1b12",
+            "ownership_filter": "entire_tenant",
             "barrier_mode": "ignore",
             "types": ["gts.cf.core.events.event.v1~x.eb.orders.created.v1~"],
             "filter": null,
@@ -140,4 +110,51 @@ fn an_unrecognised_barrier_mode_is_rejected_rather_than_defaulted() {
     assert_eq!(BarrierMode::from_wire("traverse"), None);
     assert_eq!(BarrierMode::from_wire("Respect"), None);
     assert_eq!(BarrierMode::from_wire(""), None);
+}
+
+#[test]
+fn an_interest_with_a_subject_type_selector_keeps_it_through_the_cache_shape() {
+    let interest = Interest {
+        topic: toolkit_gts::GtsInstanceId::try_new(
+            "gts.cf.core.events.topic.v1~x.eb.orders.acme.v1",
+        )
+        .expect("static topic id is valid"),
+        subject_tenant: Uuid::parse_str("fec5ff3e-4d0d-416e-95e0-c354028c1b12")
+            .expect("static uuid"),
+        ownership: OwnershipFilter::EntireTenant,
+        barrier_mode: BarrierMode::Respect,
+        types: vec![
+            gts::GtsIdPattern::try_new("gts.cf.core.events.event.v1~x.eb.orders.created.v1~")
+                .unwrap(),
+        ],
+        subject_types: vec![gts::GtsIdPattern::try_new("gts.x.eb.orders.customer.v1~").unwrap()],
+        filter: None,
+    };
+
+    let stored = serde_json::to_value(&interest).expect("interest serializes");
+    assert_eq!(
+        stored,
+        json!({
+            "topic": "gts.cf.core.events.topic.v1~x.eb.orders.acme.v1",
+            "subject_tenant": "fec5ff3e-4d0d-416e-95e0-c354028c1b12",
+            "ownership_filter": "entire_tenant",
+            "barrier_mode": "respect",
+            "types": ["gts.cf.core.events.event.v1~x.eb.orders.created.v1~"],
+            "subject_types": ["gts.x.eb.orders.customer.v1~"],
+            "filter": null,
+        })
+    );
+    let read: Interest = serde_json::from_value(stored).expect("interest deserializes");
+    assert_eq!(
+        read.subject_types,
+        vec![gts::GtsIdPattern::try_new("gts.x.eb.orders.customer.v1~").unwrap()]
+    );
+}
+
+#[test]
+fn a_stored_interest_written_without_subject_types_reads_as_no_selector() {
+    let interest: Interest =
+        serde_json::from_value(interest_json(&json!({}))).expect("interest deserializes");
+
+    assert_eq!(interest.subject_types, Vec::<gts::GtsIdPattern>::new());
 }

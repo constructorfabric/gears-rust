@@ -64,7 +64,7 @@ pub async fn append(
             .iter()
             .map(|keyed| body::encode(&keyed.event))
             .collect::<Result<Vec<_>, _>>()?;
-        let tenants: Vec<Uuid> = events.iter().map(|k| k.event.tenant_id).collect();
+        let tenants: Vec<Uuid> = events.iter().map(|k| k.event.subject_tenant).collect();
         let table = usize::try_from(partition.value())
             .ok()
             .and_then(|i| known.tables.get(i))
@@ -268,7 +268,7 @@ async fn insert(
         }
         let values = vec!["(?, ?, ?, ?, ?)"; end - start].join(", ");
         let mut query = sqlx::query(AssertSqlSafe(format!(
-            "INSERT INTO {table} (seq, seq_time, tenant_id, cum_bytes, body) VALUES {values}"
+            "INSERT INTO {table} (seq, seq_time, subject_tenant, cum_bytes, body) VALUES {values}"
         )));
         for i in start..end {
             cumulative += rows.weights[i];

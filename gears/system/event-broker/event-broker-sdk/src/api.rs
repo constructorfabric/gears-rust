@@ -1,4 +1,3 @@
-use std::num::NonZeroU32;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -22,9 +21,9 @@ use crate::sequence::Sequence;
 pub enum ProducerMode {
     /// No producer id and no broker-side idempotency metadata.
     Stateless,
-    /// Idempotency by `producer_id + sequence`.
+    /// Idempotency by `meta.producer` and `meta.sequence`.
     Monotonic,
-    /// Idempotency by `producer_id + previous + sequence`.
+    /// Idempotency by `meta.producer`, `meta.previous` and `meta.sequence`.
     #[default]
     Chained,
 }
@@ -58,7 +57,7 @@ pub enum Ack {
 }
 
 /// Broker `last_sequence` of a producer's chain on one topic. The chain is
-/// kept per `(producer_id, topic)`: no partition is part of it (ADR-0004
+/// kept per `(producer, topic)`: no partition is part of it (ADR-0004
 /// "Chain Scope").
 #[derive(Debug, Clone)]
 pub struct TopicCursors {
@@ -71,7 +70,7 @@ pub struct TopicCursors {
 /// producer-level fields can be carried and the response stays extensible.
 #[derive(Debug, Clone)]
 pub struct ProducerCursors {
-    pub producer_id: ProducerId,
+    pub id: ProducerId,
     pub client_agent: String,
     pub topics: Vec<TopicCursors>,
 }
@@ -130,20 +129,37 @@ pub struct AssignedPartition {
 /// Response returned from a JOIN.
 #[derive(Debug, Clone)]
 pub struct SubscriptionAssignment {
-    pub subscription_id: SubscriptionId,
+    pub id: SubscriptionId,
     pub topology_version: i64,
     pub assigned: Vec<AssignedPartition>,
+    /// The interests whose `types` name entries that matched no event type
+    /// registered on the topic at JOIN, in interest order; an interest whose
+    /// entries all matched is not listed.
+    pub unmatched_types: Vec<UnmatchedTypes>,
+}
+
+/// The entries of one JOIN interest's `types` that matched no event type
+/// registered on its topic when the broker answered the JOIN. Events of such a
+/// type are delivered once it registers and the consume scope admits it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnmatchedTypes {
+    /// The interest's position in the JOIN request's interests.
+    pub interest: usize,
+    /// The interest's entries that matched no registered type, never empty.
+    pub types: Vec<GtsIdPattern>,
 }
 
 /// Request body for a JOIN.
 #[derive(Debug, Clone)]
 pub struct JoinRequest {
-    pub group: ConsumerGroupId,
+    pub consumer_group: ConsumerGroupId,
     /// RFC 9110 User-Agent grammar; ASCII 1-256 bytes.
     pub client_agent: String,
     /// Per-member interests (topic-anchored typed-filter selections per ADR-0005).
     pub interests: Vec<SubscriptionInterest>,
-    /// Session TTL, refreshed on each poll/seek. Default PT30S.
+    /// How long the subscription survives after its stream closes; it is kept alive while a
+    /// stream is open. Default PT30S. Must be positive: the broker refuses a zero duration with
+    /// `400` (`InvalidSessionTimeout`).
     pub session_timeout: Option<Duration>,
 }
 
@@ -156,7 +172,7 @@ pub struct JoinRequest {
 pub struct PartitionPosition {
     pub topic: GtsInstanceId,
     pub partition: u32,
-    /// Session cursor - last processed offset.
+    /// Last delivered sequence in this stream (not stored by the broker).
     pub offset: Sequence,
     /// Highest offset the broker has scanned for this group/partition.
     pub last_examined: Sequence,
@@ -207,27 +223,29 @@ pub enum BarrierMode {
     Ignore,
 }
 
-/// Tenant hierarchy traversal scope for a subscription interest.
+/// Which of the events the consume scope admits a subscription interest reads.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum TenantTraversalDepth {
+pub enum OwnershipFilter {
+    /// Events of the caller's own tenant whose `subject_owner` is the caller.
+    /// An event with no owner is never delivered.
     #[default]
-    CurrentTenant,
-    Descendants(NonZeroU32),
-    UnlimitedDescendants,
+    OnlyMine,
+    /// Every event of the interest's tenant, owned or not.
+    EntireTenant,
+    /// Every event of the interest's tenant and of the tenants below it, as
+    /// far as the barrier mode and the consume scope reach.
+    TenantSubtreeIncluded,
 }
 
-impl TenantTraversalDepth {
-    pub fn direct_children() -> Self {
-        Self::Descendants(NonZeroU32::new(1).expect("1 is non-zero"))
-    }
-
-    pub fn descendants(depth: NonZeroU32) -> Self {
-        Self::Descendants(depth)
-    }
-
-    pub fn unlimited() -> Self {
-        Self::UnlimitedDescendants
-    }
+/// The tenant a subscription interest reads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InterestTenant {
+    /// The caller's own tenant, resolved by the broker. The JOIN names none.
+    #[default]
+    Caller,
+    /// A named tenant; under [`OwnershipFilter::TenantSubtreeIncluded`] the
+    /// root of the subtree read.
+    Tenant(Uuid),
 }
 
 /// Paired filter engine + expression for a subscription interest.
@@ -270,14 +288,16 @@ impl Filter {
 pub struct SubscriptionInterest {
     /// Topic the interest subscribes to.
     pub(crate) topic: GtsInstanceId,
-    /// Root tenant whose events are of interest.
-    pub(crate) tenant_id: Uuid,
-    /// How far below `tenant_id` the tenant hierarchy is traversed.
-    pub(crate) tenant_depth: TenantTraversalDepth,
+    /// The tenant whose events are of interest.
+    pub(crate) subject_tenant: InterestTenant,
+    /// Which of the tenant's events the interest reads.
+    pub(crate) ownership_filter: OwnershipFilter,
     /// How tenant barriers are treated while traversing descendants.
     pub(crate) barrier_mode: BarrierMode,
     /// Event type patterns to match; empty means all types.
     pub(crate) types: Vec<GtsIdPattern>,
+    /// Subject-type patterns an event's `subject_type` must match; empty means no selector.
+    pub(crate) subject_types: Vec<GtsIdPattern>,
     /// Optional extra content filter applied to matching events.
     pub(crate) filter: Option<Filter>,
 }
@@ -285,10 +305,11 @@ pub struct SubscriptionInterest {
 #[derive(Debug, Default)]
 pub struct SubscriptionInterestBuilder {
     topic: Option<GtsInstanceId>,
-    tenant_id: Option<Uuid>,
-    tenant_depth: TenantTraversalDepth,
+    subject_tenant: InterestTenant,
+    ownership_filter: OwnershipFilter,
     barrier_mode: BarrierMode,
     types: Vec<GtsIdPattern>,
+    subject_types: Vec<GtsIdPattern>,
     filter: Option<Filter>,
 }
 
@@ -301,12 +322,14 @@ impl SubscriptionInterest {
         &self.topic
     }
 
-    pub fn tenant_id(&self) -> Uuid {
-        self.tenant_id
+    /// The tenant the interest reads; [`InterestTenant::Caller`] unless one
+    /// was named.
+    pub fn subject_tenant(&self) -> InterestTenant {
+        self.subject_tenant
     }
 
-    pub fn tenant_depth(&self) -> TenantTraversalDepth {
-        self.tenant_depth
+    pub fn ownership_filter(&self) -> OwnershipFilter {
+        self.ownership_filter
     }
 
     pub fn barrier_mode(&self) -> BarrierMode {
@@ -315,6 +338,11 @@ impl SubscriptionInterest {
 
     pub fn types(&self) -> &[GtsIdPattern] {
         &self.types
+    }
+
+    /// The subject-type selector; empty when the interest has none.
+    pub fn subject_types(&self) -> &[GtsIdPattern] {
+        &self.subject_types
     }
 
     pub fn filter(&self) -> Option<&Filter> {
@@ -328,13 +356,19 @@ impl SubscriptionInterestBuilder {
         self
     }
 
-    pub fn tenant_id(mut self, tenant_id: Uuid) -> Self {
-        self.tenant_id = Some(tenant_id);
+    /// The tenant whose events the interest reads; the caller's own tenant
+    /// when not set. The nil UUID is refused by `build()`. Under
+    /// [`OwnershipFilter::OnlyMine`] the broker refuses a tenant other than the
+    /// caller's.
+    pub fn subject_tenant(mut self, tenant: Uuid) -> Self {
+        self.subject_tenant = InterestTenant::Tenant(tenant);
         self
     }
 
-    pub fn tenant_depth(mut self, tenant_depth: TenantTraversalDepth) -> Self {
-        self.tenant_depth = tenant_depth;
+    /// Which of the tenant's events the interest reads;
+    /// [`OwnershipFilter::OnlyMine`] when not set.
+    pub fn ownership_filter(mut self, filter: OwnershipFilter) -> Self {
+        self.ownership_filter = filter;
         self
     }
 
@@ -351,22 +385,41 @@ impl SubscriptionInterestBuilder {
         self
     }
 
+    /// Delivers only events whose `subject_type` matches one of `patterns`, matched
+    /// like `types`. A delivery filter with no authorization meaning: it never
+    /// widens what the caller may read. At most 32 patterns; none means every
+    /// subject type.
+    pub fn subject_types<I>(mut self, patterns: I) -> Self
+    where
+        I: IntoIterator<Item = GtsIdPattern>,
+    {
+        self.subject_types = patterns.into_iter().collect();
+        self
+    }
+
     pub fn filter(mut self, filter: Filter) -> Self {
         self.filter = Some(filter);
         self
     }
 
+    /// Builds the interest.
+    ///
+    /// # Errors
+    ///
+    /// [`EventBrokerError::InvalidConsumerOptions`] when the topic is missing,
+    /// the named tenant is the nil UUID, the event types are not 1 to 32
+    /// entries, or there are more than 32 subject types.
     pub fn build(self) -> Result<SubscriptionInterest, EventBrokerError> {
         let topic = self
             .topic
             .ok_or_else(|| EventBrokerError::InvalidConsumerOptions {
                 detail: "subscription interest topic is required".to_owned(),
             })?;
-        let tenant_id = self
-            .tenant_id
-            .ok_or_else(|| EventBrokerError::InvalidConsumerOptions {
-                detail: "subscription interest tenant_id is required".to_owned(),
-            })?;
+        if self.subject_tenant == InterestTenant::Tenant(Uuid::nil()) {
+            return Err(EventBrokerError::InvalidConsumerOptions {
+                detail: "subscription interest subject_tenant must not be the nil UUID".to_owned(),
+            });
+        }
         if self.types.is_empty() || self.types.len() > 32 {
             return Err(EventBrokerError::InvalidConsumerOptions {
                 detail: format!(
@@ -375,24 +428,33 @@ impl SubscriptionInterestBuilder {
                 ),
             });
         }
+        if self.subject_types.len() > 32 {
+            return Err(EventBrokerError::InvalidConsumerOptions {
+                detail: format!(
+                    "subscription interest subject types must be at most 32 entries (got {})",
+                    self.subject_types.len()
+                ),
+            });
+        }
 
         Ok(SubscriptionInterest {
             topic,
-            tenant_id,
-            tenant_depth: self.tenant_depth,
+            subject_tenant: self.subject_tenant,
+            ownership_filter: self.ownership_filter,
             barrier_mode: self.barrier_mode,
             types: self.types,
+            subject_types: self.subject_types,
             filter: self.filter,
         })
     }
 }
 
 /// Opaque backend configuration envelope.
-/// `gts_type_id` is a full GTS identifier registered with `types-registry-sdk`.
+/// `backend_type` is a full GTS identifier registered with `types-registry-sdk`.
 /// `config` is JSON validated against the GTS type's schema.
 #[derive(Debug, Clone)]
 pub struct StorageBackendConfig {
-    pub gts_type_id: GtsTypeId,
+    pub backend_type: GtsTypeId,
     pub config: serde_json::Value,
 }
 

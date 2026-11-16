@@ -4,14 +4,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use event_broker_sdk::ConsumerGroupId;
 use tokio_util::sync::CancellationToken;
 
 use super::{ConsumerGroupCoordinator, Removal};
 use crate::domain::repo::RoutingMarkers;
 
 /// How often lifetimes are checked. A constant rather than a knob: it bounds
-/// how late a reap can be, not whether one happens, and one second is well
-/// under the shortest lifetime a member can have (`min_session_timeout`).
+/// how late a reap can be, not whether one happens. A joined member lives at
+/// least `join_timeout_secs`, which is at least one second; a disconnected
+/// member's `session_timeout` may be any positive duration the JOIN gave, so
+/// a sub-second one is reaped up to a second late.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Runs until `cancel` fires.
@@ -50,9 +53,22 @@ pub async fn clear_markers(markers: &dyn RoutingMarkers, removal: &Removal) {
     if let Err(err) = markers.unmark_subscription(removal.subscription_id).await {
         tracing::warn!(%err, subscription_id = %removal.subscription_id, "failed to clear subscription marker");
     }
-    if removal.group_emptied
-        && let Err(err) = markers.unmark_group(&removal.group).await
-    {
+    if removal.group_emptied {
+        clear_group_marker(markers, removal).await;
+    }
+}
+
+/// The owner marker is keyed by the UUID the group's id ends in, so an id
+/// without one has no marker to clear.
+async fn clear_group_marker(markers: &dyn RoutingMarkers, removal: &Removal) {
+    let Some(group) = ConsumerGroupId::try_from_gts(removal.group.as_ref()) else {
+        tracing::warn!(
+            group = %removal.group,
+            "no group marker to clear: the group id does not end in a UUID"
+        );
+        return;
+    };
+    if let Err(err) = markers.unmark_group(group).await {
         tracing::warn!(%err, group = %removal.group, "failed to clear group marker");
     }
 }

@@ -168,7 +168,10 @@ async fn persisted<
     assert_eq!(wire["source"], SOURCE);
     assert_eq!(wire["subject"], expected.subject().as_ref());
     assert_eq!(wire["subject_type"], subject_type);
-    assert_eq!(wire["tenant_id"], expected.tenant_id().unwrap().to_string());
+    assert_eq!(
+        wire["subject_tenant"],
+        expected.tenant_id().unwrap().to_string()
+    );
     assert_eq!(wire["producer_mode"], "stateless");
     assert_eq!(
         serde_json::from_value::<E>(wire["data"].clone()).unwrap(),

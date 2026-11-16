@@ -1,7 +1,7 @@
 //! Ingest-routing proxy handler. Topic-pattern matching, hetero/sharded
-//! modes, and specificity tie-break (`DESIGN.md:1216-1391`) are out of scope
-//! (see `eb-dispatcher-routing` design.md D1; #4438 owns any real
-//! per-instance routing algorithm). `handle` resolves an ingest instance via
+//! modes, and specificity tie-break (`DESIGN.md` "Dispatcher Routing") are out
+//! of scope (see `eb-dispatcher-routing` design.md D1; topic-affinity routing
+//! is tracked in #5701). `handle` resolves an ingest instance via
 //! `DirectoryService` and forwards to it.
 
 use std::sync::Arc;
@@ -24,7 +24,8 @@ impl IngestProxy {
 }
 
 /// Axum handler for every Ingest- and Shared-classified route
-/// (`DESIGN.md:1354-1392`), registered by `register_dispatcher_routes`.
+/// (`DESIGN.md` "Dispatcher Routing Table"), registered by
+/// `register_dispatcher_routes`.
 /// `state` is attached once via `.layer(Extension(...))` in `module.rs`.
 ///
 /// # Errors

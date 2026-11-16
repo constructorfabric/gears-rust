@@ -49,8 +49,11 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use async_trait::async_trait;
+use authz_resolver_sdk::{PolicyEnforcer, TenantMode};
 use chrono::Utc;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use event_broker_sdk::models::EventType;
 use gts::{GtsIdPattern, GtsTypeId};
 use serde_json::json;
 use tokio::runtime::Runtime;
@@ -58,18 +61,36 @@ use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use toolkit_gts::GtsInstanceId;
+use toolkit_security::{
+    AccessScope, ScopeConstraint, ScopeFilter, SecurityContext, pep_properties,
+};
 use uuid::Uuid;
 
-use event_broker::domain::consumer_group_coordinator::{ConsumerGroupCoordinator, TopicInterest};
-use event_broker::domain::model::{
-    Assignment, BarrierMode, Cursor, Event, Interest, Sequence, Subscription, TenantTraversalDepth,
+use event_broker::domain::backend::BackendResolver;
+use event_broker::domain::consumer_group_coordinator::member_scope::{
+    AuthorizedGroup, CachedScope, ScopeGeneration, ScopePrincipal,
 };
-use event_broker::domain::streaming::filter::{EventFilter, InterestFilter};
+use event_broker::domain::consumer_group_coordinator::{ConsumerGroupCoordinator, TopicInterest};
+use event_broker::domain::error::DomainError;
+use event_broker::domain::join_scope::GroupKey;
+use event_broker::domain::model::{
+    Assignment, BarrierMode, Cursor, Event, Interest, Joiner, OwnershipFilter, Sequence,
+    Subscription, Topic,
+};
+use event_broker::domain::specification::{
+    EventTypeCandidates, ProvisioningLimits, SpecificationManager, TopicState,
+};
+use event_broker::domain::streaming::assignment::Generation;
+use event_broker::domain::streaming::filter::{EventFilter, InterestFilter, Prepared};
 use event_broker::domain::streaming::frames::Frame;
 use event_broker::domain::streaming::lease::{InProcessStreamLeases, StreamLeases};
 use event_broker::domain::streaming::progress::ProgressConfig;
-use event_broker::domain::streaming::read::{MaxBytes, MaxEvents, ReadLimit};
+use event_broker::domain::streaming::read::{
+    EventBatch, EventSlice, MaxBytes, MaxEvents, ReadLimit,
+};
 use event_broker::domain::streaming::read_set::ReadSet;
+use event_broker::domain::streaming::scope::{CompiledScope, TenantSetInterner};
+use event_broker::domain::streaming::scoped_filter::{ScopedFilter, SingleTypeAuthorizer};
 use event_broker::domain::streaming::session::{SessionOpening, StreamSession};
 use event_broker::domain::streaming::source::PartitionKey;
 use event_broker::domain::streaming::time::NowFn;
@@ -82,6 +103,7 @@ use event_broker::infra::partition_cache::demand::StarvationWeight;
 use event_broker::infra::partition_cache::reclaim::{
     GapThresholdEvents, ReclaimPolicy, ResidencyLimitBytes,
 };
+use event_broker::test_support::authz_doubles::AllowAllAuthZ;
 
 // ---------------------------------------------------------------------------
 // Profile - the single source of truth for one benchmark
@@ -353,14 +375,16 @@ fn event(key: &PartitionKey, sequence: i64) -> Event {
         id: Uuid::nil(),
         r#type: GtsTypeId::try_new(EVENT_TYPE).expect("static gts type id is valid"),
         topic: key.topic.clone(),
-        tenant_id: Uuid::nil(),
+        subject_tenant: Uuid::nil(),
         source: "delivery".to_owned(),
         subject: "order".to_owned(),
         subject_type: GtsTypeId::new("gts.x.eb.test.subject.v1~"),
+        subject_owner: None,
         occurred_at: Utc::now(),
         trace_parent: None,
         data: json!({ "n": sequence, "body": "a representative payload" }),
         meta: None,
+        ingest: None,
         partition: Some(key.partition),
         sequence: Some(sequence),
         sequence_time: None,
@@ -441,6 +465,11 @@ fn open_session(
         Subscription {
             id: subscription_id,
             tenant_id: Uuid::nil(),
+            joiner: Joiner {
+                subject: Uuid::nil(),
+                tenant: Uuid::nil(),
+                subject_type: None,
+            },
             consumer_group: group.clone(),
             client_agent: "bench".to_owned(),
             interests: Vec::new(),
@@ -496,10 +525,11 @@ fn open_session(
         .into_iter()
         .map(|topic| Interest {
             topic,
-            tenant_id: Uuid::nil(),
-            depth: TenantTraversalDepth::CurrentTenant,
+            subject_tenant: Uuid::nil(),
+            ownership: OwnershipFilter::EntireTenant,
             barrier_mode: BarrierMode::Respect,
             types: vec![GtsIdPattern::try_new(EVENT_TYPE).expect("static gts pattern is valid")],
+            subject_types: Vec::new(),
             filter: None,
         })
         .collect();
@@ -510,6 +540,7 @@ fn open_session(
         .saturating_mul(u64::try_from(keys.len()).unwrap_or(0));
 
     let now: NowFn = Arc::new(Utc::now);
+    let baseline = Generation::new(1, generations.borrow().assigned.clone());
     let session = StreamSession::open(SessionOpening {
         read_set: ReadSet::seed(slots),
         filter,
@@ -519,7 +550,7 @@ fn open_session(
         progress: ProgressConfig::default(),
         heartbeat_interval: Duration::from_mins(5),
         limit: ReadLimit::new(MaxEvents(profile.fetch_max_events), MaxBytes(1024 * 1024)),
-        topology_version: 1,
+        baseline,
         ready,
         started_at: Instant::now(),
         now,
@@ -527,6 +558,7 @@ fn open_session(
         lease,
         generations,
         membership,
+        scope: None,
     });
 
     Session {
@@ -1344,5 +1376,240 @@ fn delivery(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, delivery);
+// ---------------------------------------------------------------------------
+// Ownership filter - the per-event cost of the consume decision
+// ---------------------------------------------------------------------------
+
+/// The topic and the one event type of the ownership-filter benches.
+const OWNERSHIP_TOPIC: &str = "gts.cf.core.events.topic.v1~x.eb.ownership.acme.v1";
+
+/// The caller of the ownership-filter benches and its tenant, the tenant of
+/// every event they decide.
+const OWNERSHIP_CALLER: Uuid = Uuid::from_u128(0x890);
+const OWNERSHIP_TENANT: Uuid = Uuid::from_u128(0x234);
+
+/// Events per decided batch the caller owns; as many more have no owner.
+const OWNERSHIP_OWNED: usize = 512;
+
+/// Events per decided batch: every other one is owned by the caller.
+const OWNERSHIP_BATCH: usize = 2 * OWNERSHIP_OWNED;
+
+/// The ids the compare script reads under `target/criterion/ownership_filter/`.
+const OWNERSHIP_GROUP: &str = "ownership_filter";
+
+/// A specification manager that knows nothing. The benched interests name the
+/// one event type the scope's candidates hold, so deciding never asks it.
+struct NoSpecifications;
+
+#[async_trait]
+impl SpecificationManager for NoSpecifications {
+    async fn get_topic(&self, _id: &GtsInstanceId) -> Result<Option<Topic>, DomainError> {
+        Ok(None)
+    }
+
+    async fn get_event_type(&self, _id: &GtsTypeId) -> Result<Option<EventType>, DomainError> {
+        Ok(None)
+    }
+
+    async fn get_event_type_candidates(
+        &self,
+        _topic: &GtsInstanceId,
+    ) -> Result<EventTypeCandidates, DomainError> {
+        Ok(EventTypeCandidates::Listed(Vec::new()))
+    }
+
+    async fn get_registered_event_types(
+        &self,
+        _topic: &GtsInstanceId,
+        _ids: &[GtsTypeId],
+    ) -> Result<Vec<GtsTypeId>, DomainError> {
+        Ok(Vec::new())
+    }
+
+    async fn validate_event_data(
+        &self,
+        _event_type: &EventType,
+        _data: &serde_json::Value,
+    ) -> Result<(), DomainError> {
+        Ok(())
+    }
+
+    async fn list_topics(&self) -> Result<Vec<Topic>, DomainError> {
+        Ok(Vec::new())
+    }
+
+    async fn list_event_types(&self) -> Result<Vec<EventType>, DomainError> {
+        Ok(Vec::new())
+    }
+
+    async fn resolve_topic_id(&self, _id: &GtsInstanceId) -> Result<i64, DomainError> {
+        Ok(0)
+    }
+
+    async fn resolve_event_type_id(&self, _id: &GtsTypeId) -> Result<i64, DomainError> {
+        Ok(0)
+    }
+
+    async fn topic_state(&self, _topic: &Topic) -> Result<Option<TopicState>, DomainError> {
+        Ok(None)
+    }
+
+    async fn provision_topics(
+        &self,
+        _backends: &dyn BackendResolver,
+        _limits: ProvisioningLimits,
+    ) -> usize {
+        0
+    }
+}
+
+/// The caller every ownership-filter bench decides for.
+fn ownership_caller() -> SecurityContext {
+    SecurityContext::builder()
+        .subject_id(OWNERSHIP_CALLER)
+        .subject_tenant_id(OWNERSHIP_TENANT)
+        .build()
+        .expect("valid security context")
+}
+
+/// One interest on the bench topic in the caller's tenant under `ownership`.
+fn ownership_interest(ownership: OwnershipFilter) -> Interest {
+    Interest {
+        topic: GtsInstanceId::try_new(OWNERSHIP_TOPIC).expect("static topic id is valid"),
+        subject_tenant: OWNERSHIP_TENANT,
+        ownership,
+        barrier_mode: BarrierMode::Respect,
+        types: vec![GtsIdPattern::try_new(EVENT_TYPE).expect("static gts pattern is valid")],
+        subject_types: Vec::new(),
+        filter: None,
+    }
+}
+
+/// A [`ScopedFilter`] over `interest`, holding the scope a tenant-scoped
+/// allow answers: the caller's tenant, with the bench's event type as the
+/// group's candidate, so no event needs a policy call.
+fn ownership_filter_of(interest: &Interest, mode: &TenantMode) -> ScopedFilter {
+    let ctx = ownership_caller();
+    let interner = Arc::new(TenantSetInterner::new());
+    let scope = CompiledScope::compile(
+        &AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::eq(
+            pep_properties::OWNER_TENANT_ID,
+            OWNERSHIP_TENANT,
+        )])),
+        mode,
+        &interner,
+    )
+    .expect("a tenant constraint compiles");
+    let group = AuthorizedGroup {
+        key: GroupKey::new(interest, OWNERSHIP_TENANT),
+        scope: Arc::new(scope),
+        candidates: Arc::new(std::iter::once(GtsTypeId::new(EVENT_TYPE)).collect()),
+        candidates_stale: false,
+        expires_at: Instant::now() + Duration::from_secs(3600),
+    };
+    let held = Arc::new(CachedScope {
+        generation: ScopeGeneration::NONE,
+        principal: ScopePrincipal::from(&ctx),
+        groups: vec![group].into(),
+    });
+    let authorizer = SingleTypeAuthorizer::new(
+        PolicyEnforcer::new(Arc::new(AllowAllAuthZ)),
+        Arc::new(NoSpecifications),
+        interner,
+        ctx,
+        Duration::from_secs(10),
+    );
+    ScopedFilter::new(std::slice::from_ref(interest), held, authorizer)
+        .expect("the scope holds the interest's group")
+}
+
+/// [`OWNERSHIP_BATCH`] events of the caller's tenant on the bench topic, as one
+/// read batch: even sequences owned by the caller, odd ones by nobody.
+fn ownership_batch() -> EventBatch {
+    let key = PartitionKey::new(
+        GtsInstanceId::try_new(OWNERSHIP_TOPIC).expect("static topic id is valid"),
+        0,
+    );
+    let events: Vec<Event> = (0..OWNERSHIP_BATCH)
+        .map(|n| {
+            let sequence = i64::try_from(n).expect("the batch size fits i64");
+            Event {
+                subject_tenant: OWNERSHIP_TENANT,
+                subject_owner: (n % 2 == 0).then_some(OWNERSHIP_CALLER),
+                ..event(&key, sequence)
+            }
+        })
+        .collect();
+    let last = Sequence::assigned(i64::try_from(OWNERSHIP_BATCH - 1).expect("fits i64"));
+    EventBatch::from_runs(vec![
+        EventSlice::builder(events.into())
+            .range(0..OWNERSHIP_BATCH)
+            .frontier(last)
+            .build(),
+    ])
+}
+
+/// Decides every event of `batch` as the session does: one `prepare`, then
+/// `admits` per event, in order. Returns how many are delivered.
+async fn decide_all(filter: &ScopedFilter, batch: &EventBatch) -> usize {
+    let prepared = filter
+        .prepare(batch)
+        .await
+        .expect("no policy call is needed");
+    assert_eq!(prepared, Prepared::All, "one pass decides the whole batch");
+    batch
+        .iter()
+        .map(|event| filter.admits(event).expect("the batch was prepared"))
+        .filter(|delivered| *delivered)
+        .count()
+}
+
+/// The consume decision per event under each ownership filter, against the
+/// same decision with no ownership narrowing (`unfiltered`: a subtree interest,
+/// which delivers whatever the scope admits). `compare_delivery.py` fails a
+/// filtered case whose throughput falls below 90% of `unfiltered`.
+fn ownership_filter(c: &mut Criterion) {
+    let runtime = Runtime::new().expect("tokio runtime");
+    let batch = ownership_batch();
+    let cases = [
+        (
+            "unfiltered",
+            OwnershipFilter::TenantSubtreeIncluded,
+            TenantMode::Subtree,
+            OWNERSHIP_BATCH,
+        ),
+        (
+            "entire_tenant",
+            OwnershipFilter::EntireTenant,
+            TenantMode::RootOnly,
+            OWNERSHIP_BATCH,
+        ),
+        (
+            "only_mine",
+            OwnershipFilter::OnlyMine,
+            TenantMode::RootOnly,
+            OWNERSHIP_OWNED,
+        ),
+    ];
+    let mut group = c.benchmark_group(OWNERSHIP_GROUP);
+    group.throughput(Throughput::Elements(
+        u64::try_from(OWNERSHIP_BATCH).expect("the batch size fits u64"),
+    ));
+    for (id, ownership, mode, delivered) in cases {
+        let filter = ownership_filter_of(&ownership_interest(ownership), &mode);
+        // Verified before it is measured: a case that delivered the wrong
+        // events would be timing the wrong decision.
+        assert_eq!(
+            runtime.block_on(decide_all(&filter, &batch)),
+            delivered,
+            "{id} delivers the wrong events"
+        );
+        group.bench_function(id, |b| {
+            b.iter(|| runtime.block_on(decide_all(&filter, &batch)));
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, delivery, ownership_filter);
 criterion_main!(benches);

@@ -32,11 +32,13 @@ use toolkit_security::pep_properties;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+use crate::domain::error::DomainError;
 use crate::domain::model::{ConsumerGroup, ConsumerGroupKind};
 use crate::domain::repo::{ConsumerGroupRepo, CursorRepo};
 use crate::domain::streaming::lease::StreamLeases;
 use crate::test_support::{
-    DenyingAuthZ, EventBrokerHarness, Json, StaticTypesRegistry, mapping_lines,
+    DenyingAuthZ, EventBrokerHarness, Json, SpecQuery, SpecQueryHook, StaticTypesRegistry,
+    mapping_lines,
 };
 
 // -- JOIN validation matrix --
@@ -63,7 +65,7 @@ async fn join_happy_path_returns_201_with_full_assignment() {
             "client_agent": "test-agent",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id, "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -85,11 +87,12 @@ async fn join_happy_path_returns_201_with_full_assignment() {
             "client_agent": "test-agent",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id,
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
-                "max_depth": 0,
+                "ownership_filter": "entire_tenant",
                 "barrier_mode": "respect",
                 "filter": null,
+                "unmatched_types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
             "assigned": [
                 { "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partition": 0 },
@@ -118,7 +121,7 @@ async fn join_named_group_returns_501_unimplemented() {
             "client_agent": "test-agent",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -145,7 +148,7 @@ async fn join_named_group_returns_501_unimplemented() {
 /// for unlimited descendants got `201` and no widening at all - a silent
 /// mismatch between what was requested and what was stored.
 #[tokio::test]
-async fn join_carries_tenant_traversal_scope_through_to_the_echoed_interest() {
+async fn join_carries_the_ownership_filter_through_to_the_echoed_interest() {
     let harness = EventBrokerHarness::builder()
         .with_type_registry(StaticTypesRegistry::of(json!([
             { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
@@ -166,9 +169,9 @@ async fn join_carries_tenant_traversal_scope_through_to_the_echoed_interest() {
             "client_agent": "test-agent",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id,
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
-                "max_depth": null,
+                "ownership_filter": "tenant_subtree_included",
                 "barrier_mode": "ignore",
             }],
         })))
@@ -190,11 +193,12 @@ async fn join_carries_tenant_traversal_scope_through_to_the_echoed_interest() {
             "client_agent": "test-agent",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id,
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
-                "max_depth": null,
+                "ownership_filter": "tenant_subtree_included",
                 "barrier_mode": "ignore",
                 "filter": null,
+                "unmatched_types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
             "assigned": [
                 { "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partition": 0 },
@@ -205,17 +209,17 @@ async fn join_carries_tenant_traversal_scope_through_to_the_echoed_interest() {
     );
 }
 
-/// An absent `max_depth` and an explicit `null` are opposite ends of the
-/// scope range, so the echo has to distinguish them: this asserts the narrow
-/// end, against the wide end above.
+/// An interest that names no tenant and no ownership filter reads the caller's
+/// mailbox: the JOIN resolves the tenant to the caller's and echoes both.
 #[tokio::test]
-async fn join_echoes_an_absent_max_depth_as_the_current_tenant_not_as_unlimited() {
+async fn a_join_without_a_tenant_or_ownership_filter_echoes_the_callers_tenant_and_only_mine() {
     let harness = EventBrokerHarness::builder()
         .with_type_registry(StaticTypesRegistry::of(json!([
             { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
         ])))
         .build()
         .await;
+    let caller_tenant = harness.security_context().subject_tenant_id();
     let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
         .as_str()
         .unwrap()
@@ -229,7 +233,6 @@ async fn join_echoes_an_absent_max_depth_as_the_current_tenant_not_as_unlimited(
             "client_agent": "test-agent",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -237,14 +240,40 @@ async fn join_echoes_an_absent_max_depth_as_the_current_tenant_not_as_unlimited(
         .await;
 
     resp.assert_status(201);
-    assert_eq!(resp.json()["interests"][0]["max_depth"], json!(0));
+    let body = resp.json();
+    let id = body["id"].as_str().expect("id must be a string").to_owned();
+    let created_at = body["created_at"]
+        .as_str()
+        .expect("created_at must be a string")
+        .to_owned();
+    assert_eq!(
+        body,
+        json!({
+            "id": id,
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [{
+                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                "subject_tenant": caller_tenant,
+                "ownership_filter": "only_mine",
+                "barrier_mode": "respect",
+                "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
+                "filter": null,
+                "unmatched_types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
+            }],
+            "assigned": [
+                { "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partition": 0 },
+            ],
+            "topology_version": 1,
+            "created_at": created_at,
+        })
+    );
 }
 
-/// The third shape through the untagged `max_depth` enum: a positive integer
-/// has to reach the `Levels` variant rather than being swallowed by the `null`
-/// variant that precedes it.
+/// `only_mine` reads the caller's own tenant, so naming another one is a
+/// mistake the JOIN refuses rather than a wider read.
 #[tokio::test]
-async fn join_carries_a_positive_max_depth_through_as_that_many_levels() {
+async fn an_only_mine_interest_on_another_tenant_is_refused_with_invalid_tenant() {
     let harness = EventBrokerHarness::builder()
         .with_type_registry(StaticTypesRegistry::of(json!([
             { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
@@ -264,16 +293,29 @@ async fn join_carries_a_positive_max_depth_through_as_that_many_levels() {
             "client_agent": "test-agent",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::from_u128(0x999),
+                "ownership_filter": "only_mine",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
-                "max_depth": 2,
             }],
         })))
         .send()
         .await;
 
-    resp.assert_status(201);
-    assert_eq!(resp.json()["interests"][0]["max_depth"], json!(2));
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "InvalidTenant: interest 0: only_mine reads the caller's own tenant",
+            "instance": "/event-broker/v1/subscriptions",
+            "context": {
+                "format": "InvalidTenant: interest 0: only_mine reads the caller's own tenant",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
 }
 
 #[tokio::test]
@@ -297,7 +339,7 @@ async fn join_rejects_an_unrecognised_barrier_mode() {
             "client_agent": "test-agent",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
                 "barrier_mode": "traverse",
             }],
@@ -324,8 +366,10 @@ async fn join_rejects_an_unrecognised_barrier_mode() {
     );
 }
 
+/// `max_depth` is gone: a body that still sends it, even as `null`, gets a
+/// `400` naming the field, not the generic `422` of an unknown field.
 #[tokio::test]
-async fn join_rejects_a_negative_max_depth() {
+async fn a_join_that_sends_max_depth_is_refused_naming_it() {
     let harness = EventBrokerHarness::builder()
         .with_type_registry(StaticTypesRegistry::of(json!([
             { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
@@ -337,27 +381,39 @@ async fn join_rejects_a_negative_max_depth() {
         .unwrap()
         .to_owned();
 
-    let resp = harness
-        .api_v1()
-        .post_subscriptions()
-        .with_body(Json(&json!({
-            "consumer_group": group,
-            "client_agent": "test-agent",
-            "interests": [{
-                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
-                "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
-                "max_depth": -1,
-            }],
-        })))
-        .send()
-        .await;
+    for max_depth in [json!(0), json!(null)] {
+        let resp = harness
+            .api_v1()
+            .post_subscriptions()
+            .with_body(Json(&json!({
+                "consumer_group": group,
+                "client_agent": "test-agent",
+                "interests": [{
+                    "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                    "max_depth": max_depth,
+                    "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
+                }],
+            })))
+            .send()
+            .await;
 
-    resp.assert_status(400);
-    assert_eq!(
-        resp.json()["detail"],
-        json!("InvalidBody: 'max_depth' must be >= 0 or null, got -1")
-    );
+        resp.assert_status(400);
+        assert_eq!(
+            resp.json(),
+            json!({
+                "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+                "title": "Invalid Argument",
+                "status": 400,
+                "detail": "InvalidBody: 'max_depth' is not supported; use 'ownership_filter'",
+                "instance": "/event-broker/v1/subscriptions",
+                "context": {
+                    "format": "InvalidBody: 'max_depth' is not supported; use 'ownership_filter'",
+                    "resource_type": "gts.cf.core.events.request.v1~",
+                },
+            }),
+            "max_depth {max_depth}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -408,7 +464,7 @@ async fn join_unregistered_topic_returns_404() {
             "client_agent": "test-agent",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.missing.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -458,7 +514,7 @@ async fn a_join_during_a_spec_cache_fault_answers_503() {
             "client_agent": "test-agent",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": TENANT,
+                "subject_tenant": TENANT, "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -493,7 +549,13 @@ async fn a_join_during_a_spec_cache_fault_answers_503() {
     );
     let listed = harness.api_v1().get_subscriptions().send().await;
     listed.assert_status(200);
-    assert_eq!(listed.json()["items"], json!([]));
+    assert_eq!(
+        listed.json(),
+        json!({
+            "items": [],
+            "page_info": { "next_cursor": null, "prev_cursor": null, "limit": 25 },
+        })
+    );
 }
 
 #[tokio::test]
@@ -519,7 +581,7 @@ async fn join_bad_type_pattern_returns_400() {
             // wildcard segment may appear in a pattern).
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.*.foo.*"],
             }],
         })))
@@ -581,7 +643,7 @@ async fn join_without_session_timeout_defaults_to_30_seconds() {
             "client_agent": "test-agent",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -620,7 +682,7 @@ async fn join_session_timeout_with_hour_designator_is_parsed_correctly() {
             "session_timeout": "PT1H",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -657,7 +719,7 @@ async fn join_malformed_session_timeout_returns_400_not_silently_defaulted() {
             "session_timeout": "garbage",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -703,7 +765,7 @@ async fn join_session_timeout_missing_pt_prefix_returns_400() {
             "session_timeout": "30S",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -739,7 +801,7 @@ async fn join_zero_session_timeout_returns_400() {
             "session_timeout": "PT0S",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -751,6 +813,85 @@ async fn join_zero_session_timeout_returns_400() {
         resp.json()["detail"],
         "InvalidSessionTimeout: session_timeout must be a positive ISO 8601 duration"
     );
+}
+
+#[tokio::test]
+async fn join_fractional_session_timeout_is_stored_exactly() {
+    // A value under one second keeps its fraction, as the SDK REST client sends it.
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+        ])))
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "session_timeout": "PT0.5S",
+            "interests": [{
+                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
+                "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
+            }],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(201);
+    assert_eq!(
+        stored_session_timeout(&harness, &resp.json()),
+        std::time::Duration::from_millis(500),
+        "expected the 500 ms session timeout, not a truncated or default one"
+    );
+}
+
+#[tokio::test]
+async fn join_session_timeout_that_parses_to_zero_returns_400() {
+    // An empty fraction, and one whose only non-zero digit is past the ninth, both
+    // parse to zero, which is refused like `PT0S`.
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+        ])))
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    for session_timeout in ["PT0.S", "PT0.0000000001S"] {
+        let resp = harness
+            .api_v1()
+            .post_subscriptions()
+            .with_body(Json(&json!({
+                "consumer_group": group,
+                "client_agent": "test-agent",
+                "session_timeout": session_timeout,
+                "interests": [{
+                    "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                    "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
+                    "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
+                }],
+            })))
+            .send()
+            .await;
+
+        resp.assert_status(400);
+        assert_eq!(
+            resp.json()["detail"],
+            "InvalidSessionTimeout: session_timeout must be a positive ISO 8601 duration",
+            "session_timeout {session_timeout}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -775,7 +916,7 @@ async fn join_negative_session_timeout_returns_400() {
             "session_timeout": "-PT30S",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -815,7 +956,7 @@ async fn join_session_timeout_overflow_returns_400_not_a_1_second_timeout() {
             "session_timeout": format!("PT{}M", u64::MAX),
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -855,7 +996,7 @@ async fn join_rejected_for_missing_topic_consume_permission_returns_403() {
             "client_agent": "test-agent",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -884,10 +1025,16 @@ async fn join_rejected_for_missing_topic_consume_permission_returns_403() {
     );
 }
 
+/// One interest with an exact and a wildcard pattern costs one consume call,
+/// on the topic itself, naming both patterns and the interest's tenant. The
+/// only other call is the group check, on the caller's anonymous group in the
+/// caller's own tenant.
 #[tokio::test]
-async fn join_checks_consume_on_the_concrete_topic_and_types() {
-    let target_tenant = Uuid::new_v4();
-    let asked = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+async fn join_asks_consume_once_on_the_concrete_topic_with_its_patterns() {
+    const SUBJECT: Uuid = Uuid::from_u128(0x0c0_0456);
+    const CALLER_TENANT: Uuid = Uuid::from_u128(0x0c0_0123);
+    const TARGET_TENANT: Uuid = Uuid::from_u128(0x0c0_0234);
+    let asked = Arc::new(std::sync::Mutex::new(Vec::<EvaluationRequest>::new()));
     let recorder = Arc::clone(&asked);
     let harness = EventBrokerHarness::builder()
         .with_type_registry(StaticTypesRegistry::of(json!([
@@ -895,21 +1042,17 @@ async fn join_checks_consume_on_the_concrete_topic_and_types() {
         ])))
         .with_policy_enforcer(PolicyEnforcer::new(Arc::new(DenyingAuthZ {
             deny_if: move |req: &EvaluationRequest| {
-                if req.resource.properties.contains_key("event_type_id")
-                    || req.resource.properties.contains_key("topic_id")
-                {
-                    assert_eq!(
-                        req.resource.properties.get("owner_tenant_id"),
-                        Some(&json!(target_tenant))
-                    );
-                }
-                recorder
-                    .lock()
-                    .unwrap()
-                    .push((req.action.name.clone(), req.resource.resource_type.clone()));
+                recorder.lock().unwrap().push(req.clone());
                 false
             },
         })))
+        .with_security_context(
+            toolkit_security::SecurityContext::builder()
+                .subject_id(SUBJECT)
+                .subject_tenant_id(CALLER_TENANT)
+                .build()
+                .unwrap(),
+        )
         .build()
         .await;
     let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
@@ -926,7 +1069,7 @@ async fn join_checks_consume_on_the_concrete_topic_and_types() {
             "client_agent": "test-agent",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": target_tenant,
+                "subject_tenant": TARGET_TENANT, "ownership_filter": "entire_tenant",
                 "types": [
                     "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
                     "gts.cf.core.events.event.v1~x.eb.t1.*",
@@ -937,25 +1080,128 @@ async fn join_checks_consume_on_the_concrete_topic_and_types() {
         .await;
 
     resp.assert_status(201);
-    let consume: Vec<String> = asked
+    let asked: Vec<serde_json::Value> = asked
         .lock()
         .unwrap()
         .iter()
-        .filter(|(action, resource)| {
-            action == "consume" && resource != "gts.cf.core.events.request.v1~"
-        })
-        .map(|(_, resource)| resource.clone())
+        .map(|req| serde_json::to_value(req).unwrap())
         .collect();
     assert_eq!(
-        consume,
-        [
-            // The topic itself, then the exact type as itself, then the
-            // wildcard on the event base type (a pattern is not a GTS id).
-            "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-            "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-            "gts.cf.core.events.event.v1~",
+        asked,
+        vec![
+            json!({
+                "subject": { "id": SUBJECT, "properties": { "tenant_id": CALLER_TENANT } },
+                "action": { "name": "consume" },
+                "resource": {
+                    "type": "gts.cf.core.events.consumer_group.v1~",
+                    "properties": {
+                        "consumer_group_id": group,
+                        "owner_tenant_id": CALLER_TENANT,
+                    },
+                },
+                "context": {
+                    "tenant_context": {
+                        "mode": "root_only",
+                        "root_id": CALLER_TENANT,
+                        "barrier_mode": "respect",
+                    },
+                    "token_scopes": [],
+                    "require_constraints": false,
+                    "capabilities": [],
+                    "supported_properties": ["owner_tenant_id"],
+                },
+            }),
+            json!({
+                "subject": { "id": SUBJECT, "properties": { "tenant_id": CALLER_TENANT } },
+                "action": { "name": "consume" },
+                "resource": {
+                    "type": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                    "properties": {
+                        "topic_id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                        "owner_tenant_id": TARGET_TENANT,
+                        "event_type_patterns": [
+                            "gts.cf.core.events.event.v1~x.eb.t1.*",
+                            "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                        ],
+                        "event_types": [],
+                        "event_subject_type_patterns": [],
+                    },
+                },
+                "context": {
+                    "tenant_context": {
+                        "mode": "root_only",
+                        "root_id": TARGET_TENANT,
+                        "barrier_mode": "respect",
+                    },
+                    "token_scopes": [],
+                    "require_constraints": true,
+                    "capabilities": [],
+                    "supported_properties": [
+                        "owner_tenant_id",
+                        "owner_id",
+                        "event_type",
+                        "event_subject_type",
+                    ],
+                },
+            }),
         ]
     );
+}
+
+/// Allows every request. The consume call on a topic (the one resource that
+/// declares `event_type`) gets a scope that admits only `admitted`, as a PDP
+/// that grants one event type on the topic answers; every other allow carries
+/// the tenant constraint tr-authz answers.
+struct GrantsOneEventType {
+    admitted: &'static str,
+}
+
+#[async_trait::async_trait]
+impl authz_resolver_sdk::AuthZResolverApi for GrantsOneEventType {
+    async fn evaluate(
+        &self,
+        _ctx: toolkit_security::PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationResponse, toolkit_canonical_errors::CanonicalError>
+    {
+        use authz_resolver_sdk::{Constraint, InPredicate, Predicate};
+        let root = request
+            .context
+            .tenant_context
+            .as_ref()
+            .and_then(|tenant_context| tenant_context.root_id);
+        let declares = |property: &str| {
+            request
+                .context
+                .supported_properties
+                .iter()
+                .any(|declared| declared == property)
+        };
+        let mut predicates = Vec::new();
+        if let Some(root) = root.filter(|_| declares(pep_properties::OWNER_TENANT_ID)) {
+            predicates.push(Predicate::In(InPredicate::new(
+                pep_properties::OWNER_TENANT_ID,
+                [root],
+            )));
+        }
+        if declares("event_type") {
+            predicates.push(Predicate::In(InPredicate::new(
+                "event_type",
+                [self.admitted],
+            )));
+        }
+        Ok(authz_resolver_sdk::EvaluationResponse {
+            decision: true,
+            context: authz_resolver_sdk::EvaluationResponseContext {
+                constraints: if predicates.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![Constraint { predicates }]
+                },
+                ..Default::default()
+            },
+        })
+    }
 }
 
 #[tokio::test]
@@ -964,12 +1210,13 @@ async fn join_rejected_for_missing_event_type_consume_permission_returns_403_nam
     let harness = EventBrokerHarness::builder()
         .with_type_registry(StaticTypesRegistry::of(json!([
             { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
-        ])))
-        .with_policy_enforcer(PolicyEnforcer::new(Arc::new(DenyingAuthZ {
-            deny_if: |req: &EvaluationRequest| {
-                req.resource.properties.get("event_type_id")
-                    == Some(&json!("gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"))
+            {
+                "id": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
             },
+        ])))
+        .with_policy_enforcer(PolicyEnforcer::new(Arc::new(GrantsOneEventType {
+            admitted: "gts.cf.core.events.event.v1~x.eb.t1.bar.v1~",
         })))
         .build()
         .await;
@@ -986,7 +1233,7 @@ async fn join_rejected_for_missing_event_type_consume_permission_returns_403_nam
             "client_agent": "test-agent",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -1013,18 +1260,18 @@ async fn join_rejected_for_missing_event_type_consume_permission_returns_403_nam
 
 #[tokio::test]
 async fn join_rejected_for_unauthorized_interest_tenant_id_returns_403() {
+    let interest_tenant = Uuid::new_v4();
     let harness = EventBrokerHarness::builder()
         .with_type_registry(StaticTypesRegistry::of(json!([
             { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
         ])))
         .with_policy_enforcer(PolicyEnforcer::new(Arc::new(DenyingAuthZ {
-            // The tenant-scope check is its own `PolicyEnforcer` call
-            // (`domain::authz::TENANT_SCOPE_RESOURCE`), distinguishable by
-            // the `OWNER_TENANT_ID` resource property it alone sets.
-            deny_if: |req: &EvaluationRequest| {
-                req.resource
-                    .properties
-                    .contains_key(pep_properties::OWNER_TENANT_ID)
+            // Denies every request naming the interest's tenant: the consume
+            // call on the topic, then the tenant check that classifies its
+            // denial. The group gate names the caller's own tenant and passes.
+            deny_if: move |req: &EvaluationRequest| {
+                req.resource.properties.get(pep_properties::OWNER_TENANT_ID)
+                    == Some(&json!(interest_tenant))
             },
         })))
         .build()
@@ -1042,7 +1289,7 @@ async fn join_rejected_for_unauthorized_interest_tenant_id_returns_403() {
             "client_agent": "test-agent",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": interest_tenant, "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -1072,7 +1319,7 @@ async fn join_rejected_for_a_caller_not_authorized_for_the_anonymous_groups_tena
     // make is its own group-level one (`eb-tenant-isolation-fix`) against
     // the anonymous group's tenant - distinct from
     // `join_rejected_for_unauthorized_interest_tenant_id_returns_403`,
-    // which denies the *per-interest* tenant check instead.
+    // which denies the interest's tenant instead.
     let harness = EventBrokerHarness::builder()
         .with_policy_enforcer(PolicyEnforcer::new(Arc::new(DenyingAuthZ {
             deny_if: |req: &EvaluationRequest| {
@@ -1186,12 +1433,12 @@ async fn join_a_single_unauthorized_interest_blocks_the_whole_join() {
             "interests": [
                 {
                     "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                    "tenant_id": Uuid::new_v4(),
+                    "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                     "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
                 },
                 {
                     "topic": "gts.cf.core.events.topic.v1~x.eb.t2.topic.v1",
-                    "tenant_id": Uuid::new_v4(),
+                    "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                     "types": ["gts.cf.core.events.event.v1~x.eb.t2.foo.v1~"],
                 },
             ],
@@ -1222,34 +1469,28 @@ async fn join_a_single_unauthorized_interest_blocks_the_whole_join() {
 }
 
 #[tokio::test]
-async fn join_succeeds_when_every_interest_passes_all_three_checks() {
+async fn join_succeeds_when_its_group_passes_the_consume_check() {
     let interest_tenant_id = Uuid::new_v4();
     let harness = EventBrokerHarness::builder()
         .with_type_registry(StaticTypesRegistry::of(json!([
             { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
         ])))
         .with_policy_enforcer(PolicyEnforcer::new(Arc::new(DenyingAuthZ {
-            // Pins the exact topic/event-type this test joins with - proves
-            // the real values get checked, not a hardcoded pass. Any
-            // tenant-scope check is allowed regardless of which tenant it
-            // names: JOIN now makes two of them (the group-level check
-            // against the anonymous group's own tenant, and the
-            // per-interest check against `interest_tenant_id`), and this
-            // test isn't about pinning either specific value.
-            // `create_consumer_group`'s own `consumer_group:define` check
-            // (`eb-tenant-isolation-fix`) has no resource properties at all,
-            // so it's allowed by action name instead.
+            // Allows the consume call only on the exact topic this test joins
+            // and in the interest's tenant, so the real values are checked,
+            // not a hardcoded pass. The group gate names the caller's own
+            // tenant and carries no `topic_id`; it is allowed as the only
+            // other `consume`. `create_consumer_group`'s `define` check has
+            // no resource properties, so it is allowed by action name.
             deny_if: move |req: &EvaluationRequest| {
                 let allowed_topic = req.resource.properties.get("topic_id")
-                    == Some(&json!("gts.cf.core.events.topic.v1~x.eb.t1.topic.v1"));
-                let allowed_type = req.resource.properties.get("event_type_id")
-                    == Some(&json!("gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"));
-                let allowed_tenant = req
-                    .resource
-                    .properties
-                    .contains_key(pep_properties::OWNER_TENANT_ID);
+                    == Some(&json!("gts.cf.core.events.topic.v1~x.eb.t1.topic.v1"))
+                    && req.resource.properties.get(pep_properties::OWNER_TENANT_ID)
+                        == Some(&json!(interest_tenant_id));
+                let allowed_gate = req.action.name == "consume"
+                    && !req.resource.properties.contains_key("topic_id");
                 let allowed_define = req.action.name == "define";
-                !(allowed_topic || allowed_type || allowed_tenant || allowed_define)
+                !(allowed_topic || allowed_gate || allowed_define)
             },
         })))
         .build()
@@ -1267,7 +1508,7 @@ async fn join_succeeds_when_every_interest_passes_all_three_checks() {
             "client_agent": "test-agent",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": interest_tenant_id,
+                "subject_tenant": interest_tenant_id, "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -1289,17 +1530,770 @@ async fn join_succeeds_when_every_interest_passes_all_three_checks() {
             "client_agent": "test-agent",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": interest_tenant_id,
+                "subject_tenant": interest_tenant_id,
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
-                "max_depth": 0,
+                "ownership_filter": "entire_tenant",
                 "barrier_mode": "respect",
                 "filter": null,
+                "unmatched_types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
             "assigned": [
                 { "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partition": 0 },
             ],
             "topology_version": 1,
             "created_at": created_at,
+        })
+    );
+}
+
+// -- Unmatched types at JOIN --
+
+const UNMATCHED_TOPIC: &str = "gts.cf.core.events.topic.v1~x.eb.unmatched.orders.v1";
+const REGISTERED_TYPE: &str = "gts.cf.core.events.event.v1~x.eb.unmatched.placed.v1~";
+const UNREGISTERED_TYPE: &str = "gts.cf.core.events.event.v1~x.eb.unmatched.refunded.v1~";
+const BASE_TYPE: &str = "gts.cf.core.events.event.v1~x.eb.unmatched.base.v1~";
+const DERIVED_TYPE: &str =
+    "gts.cf.core.events.event.v1~x.eb.unmatched.base.v1~x.eb.unmatched.derived.v1~";
+const MATCHING_WILDCARD: &str = "gts.cf.core.events.event.v1~x.eb.unmatched.*";
+const NOTHING_WILDCARD: &str = "gts.cf.core.events.event.v1~x.eb.nothing.*";
+/// Holds `BASE_TYPE`, which a derived type needs registered to resolve.
+const BASE_TOPIC: &str = "gts.cf.core.events.topic.v1~x.eb.unmatched.base_home.v1";
+const UNMATCHED_TENANT: Uuid = Uuid::from_u128(0x0e5a_0001);
+
+/// `UNMATCHED_TOPIC` with `REGISTERED_TYPE` and `DERIVED_TYPE`, well within
+/// the candidate cap. `BASE_TYPE` is registered on `BASE_TOPIC`, not on it.
+fn listed_registry() -> StaticTypesRegistry {
+    StaticTypesRegistry::of(json!([
+        { "id": UNMATCHED_TOPIC, "partitions": 1 },
+        { "id": BASE_TOPIC, "partitions": 1 },
+        { "id": REGISTERED_TYPE, "topic": UNMATCHED_TOPIC },
+        { "id": BASE_TYPE, "topic": BASE_TOPIC },
+        { "id": DERIVED_TYPE, "topic": UNMATCHED_TOPIC },
+    ]))
+}
+
+/// `UNMATCHED_TOPIC` over the candidate cap: 257 filler types, plus
+/// `REGISTERED_TYPE` and `DERIVED_TYPE`. `BASE_TYPE` is registered on
+/// `BASE_TOPIC`, not on it.
+fn over_cap_registry() -> StaticTypesRegistry {
+    let mut spec = vec![
+        json!({ "id": UNMATCHED_TOPIC, "partitions": 1 }),
+        json!({ "id": BASE_TOPIC, "partitions": 1 }),
+        json!({ "id": REGISTERED_TYPE, "topic": UNMATCHED_TOPIC }),
+        json!({ "id": BASE_TYPE, "topic": BASE_TOPIC }),
+        json!({ "id": DERIVED_TYPE, "topic": UNMATCHED_TOPIC }),
+    ];
+    spec.extend((0..257).map(|n| {
+        json!({
+            "id": format!("gts.cf.core.events.event.v1~x.eb.unmatched.filler_{n:03}.v1~"),
+            "topic": UNMATCHED_TOPIC,
+        })
+    }));
+    StaticTypesRegistry::of(serde_json::Value::Array(spec))
+}
+
+/// The second interest names a type the topic has not registered: the JOIN
+/// succeeds and reports it in that interest's `unmatched_types`, after the
+/// echoed interest fields; the first interest reports none.
+#[tokio::test]
+async fn join_reports_an_exact_type_that_is_not_registered() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(listed_registry())
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [
+                { "topic": UNMATCHED_TOPIC, "subject_tenant": UNMATCHED_TENANT, "ownership_filter": "entire_tenant", "types": [REGISTERED_TYPE] },
+                { "topic": UNMATCHED_TOPIC, "subject_tenant": UNMATCHED_TENANT, "ownership_filter": "entire_tenant", "types": [UNREGISTERED_TYPE] },
+            ],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(201);
+    let body = resp.json();
+    let id = body["id"].as_str().expect("id must be a string").to_owned();
+    let created_at = body["created_at"]
+        .as_str()
+        .expect("created_at must be a string")
+        .to_owned();
+    assert_eq!(
+        body,
+        json!({
+            "id": id,
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [
+                {
+                    "topic": UNMATCHED_TOPIC,
+                    "subject_tenant": UNMATCHED_TENANT,
+                    "ownership_filter": "entire_tenant",
+                    "barrier_mode": "respect",
+                    "types": [REGISTERED_TYPE],
+                    "filter": null,
+                    "unmatched_types": [],
+                },
+                {
+                    "topic": UNMATCHED_TOPIC,
+                    "subject_tenant": UNMATCHED_TENANT,
+                    "ownership_filter": "entire_tenant",
+                    "barrier_mode": "respect",
+                    "types": [UNREGISTERED_TYPE],
+                    "filter": null,
+                    "unmatched_types": [UNREGISTERED_TYPE],
+                },
+            ],
+            "assigned": [{ "topic": UNMATCHED_TOPIC, "partition": 0 }],
+            "topology_version": 1,
+            "created_at": created_at,
+        })
+    );
+    assert_eq!(
+        resp.text(),
+        format!(
+            r#"{{"id":"{id}","consumer_group":"{group}","client_agent":"test-agent","interests":[{{"topic":"{UNMATCHED_TOPIC}","subject_tenant":"{UNMATCHED_TENANT}","ownership_filter":"entire_tenant","barrier_mode":"respect","types":["{REGISTERED_TYPE}"],"filter":null,"unmatched_types":[]}},{{"topic":"{UNMATCHED_TOPIC}","subject_tenant":"{UNMATCHED_TENANT}","ownership_filter":"entire_tenant","barrier_mode":"respect","types":["{UNREGISTERED_TYPE}"],"filter":null,"unmatched_types":["{UNREGISTERED_TYPE}"]}}],"assigned":[{{"topic":"{UNMATCHED_TOPIC}","partition":0}}],"topology_version":1,"created_at":"{created_at}"}}"#
+        ),
+        "the wire keeps the echoed interest fields in order, `unmatched_types` last"
+    );
+}
+
+/// A wildcard that matches none of the topic's registered types is reported;
+/// one that matches a registered type is not.
+#[tokio::test]
+async fn join_reports_a_wildcard_that_matches_no_registered_type() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(listed_registry())
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [{
+                "topic": UNMATCHED_TOPIC,
+                "subject_tenant": UNMATCHED_TENANT, "ownership_filter": "entire_tenant",
+                "types": [NOTHING_WILDCARD, MATCHING_WILDCARD],
+            }],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(201);
+    let body = resp.json();
+    let id = body["id"].as_str().expect("id must be a string").to_owned();
+    let created_at = body["created_at"]
+        .as_str()
+        .expect("created_at must be a string")
+        .to_owned();
+    assert_eq!(
+        body,
+        json!({
+            "id": id,
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [{
+                "topic": UNMATCHED_TOPIC,
+                "subject_tenant": UNMATCHED_TENANT,
+                "ownership_filter": "entire_tenant",
+                "barrier_mode": "respect",
+                "types": [NOTHING_WILDCARD, MATCHING_WILDCARD],
+                "filter": null,
+                "unmatched_types": [NOTHING_WILDCARD],
+            }],
+            "assigned": [{ "topic": UNMATCHED_TOPIC, "partition": 0 }],
+            "topology_version": 1,
+            "created_at": created_at,
+        })
+    );
+}
+
+/// A bare type id covers its derived types, so a base type the topic has
+/// registered only as a derived type matches it and is not reported. Over
+/// the candidate cap the same entry is reported, since there only the exact
+/// id is looked up.
+#[tokio::test]
+async fn join_does_not_report_a_base_type_whose_derived_types_are_registered() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(listed_registry())
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [{
+                "topic": UNMATCHED_TOPIC,
+                "subject_tenant": UNMATCHED_TENANT, "ownership_filter": "entire_tenant",
+                "types": [BASE_TYPE],
+            }],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(201);
+    let body = resp.json();
+    let id = body["id"].as_str().expect("id must be a string").to_owned();
+    let created_at = body["created_at"]
+        .as_str()
+        .expect("created_at must be a string")
+        .to_owned();
+    assert_eq!(
+        body,
+        json!({
+            "id": id,
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [{
+                "topic": UNMATCHED_TOPIC,
+                "subject_tenant": UNMATCHED_TENANT,
+                "ownership_filter": "entire_tenant",
+                "barrier_mode": "respect",
+                "types": [BASE_TYPE],
+                "filter": null,
+                "unmatched_types": [],
+            }],
+            "assigned": [{ "topic": UNMATCHED_TOPIC, "partition": 0 }],
+            "topology_version": 1,
+            "created_at": created_at,
+        })
+    );
+}
+
+#[tokio::test]
+async fn join_reports_only_the_unmatched_entries_of_an_interest() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(listed_registry())
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [{
+                "topic": UNMATCHED_TOPIC,
+                "subject_tenant": UNMATCHED_TENANT, "ownership_filter": "entire_tenant",
+                "types": [REGISTERED_TYPE, UNREGISTERED_TYPE],
+            }],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(201);
+    let body = resp.json();
+    let id = body["id"].as_str().expect("id must be a string").to_owned();
+    let created_at = body["created_at"]
+        .as_str()
+        .expect("created_at must be a string")
+        .to_owned();
+    assert_eq!(
+        body,
+        json!({
+            "id": id,
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [{
+                "topic": UNMATCHED_TOPIC,
+                "subject_tenant": UNMATCHED_TENANT,
+                "ownership_filter": "entire_tenant",
+                "barrier_mode": "respect",
+                "types": [REGISTERED_TYPE, UNREGISTERED_TYPE],
+                "filter": null,
+                "unmatched_types": [UNREGISTERED_TYPE],
+            }],
+            "assigned": [{ "topic": UNMATCHED_TOPIC, "partition": 0 }],
+            "topology_version": 1,
+            "created_at": created_at,
+        })
+    );
+}
+
+/// The position in `interests` keys the report, also when interests on
+/// different topics interleave and so fall in different consume groups.
+#[tokio::test]
+async fn join_reports_unmatched_types_by_request_position_across_topics() {
+    const OTHER_TOPIC: &str = "gts.cf.core.events.topic.v1~x.eb.unmatched.other.v1";
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": UNMATCHED_TOPIC, "partitions": 1 },
+            { "id": OTHER_TOPIC, "partitions": 1 },
+            { "id": REGISTERED_TYPE, "topic": UNMATCHED_TOPIC },
+        ])))
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [
+                { "topic": UNMATCHED_TOPIC, "subject_tenant": UNMATCHED_TENANT, "ownership_filter": "entire_tenant", "types": [UNREGISTERED_TYPE] },
+                { "topic": OTHER_TOPIC, "subject_tenant": UNMATCHED_TENANT, "ownership_filter": "entire_tenant", "types": [REGISTERED_TYPE] },
+                { "topic": UNMATCHED_TOPIC, "subject_tenant": UNMATCHED_TENANT, "ownership_filter": "entire_tenant", "types": [REGISTERED_TYPE] },
+            ],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(201);
+    let mut body = resp.json();
+    let id = body["id"].as_str().expect("id must be a string").to_owned();
+    let created_at = body["created_at"]
+        .as_str()
+        .expect("created_at must be a string")
+        .to_owned();
+    // The coordinator assigns topics in hash order.
+    body["assigned"]
+        .as_array_mut()
+        .expect("assigned must be an array")
+        .sort_by_key(|a| a["topic"].as_str().unwrap_or_default().to_owned());
+    assert_eq!(
+        body,
+        json!({
+            "id": id,
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [
+                {
+                    "topic": UNMATCHED_TOPIC,
+                    "subject_tenant": UNMATCHED_TENANT,
+                    "ownership_filter": "entire_tenant",
+                    "barrier_mode": "respect",
+                    "types": [UNREGISTERED_TYPE],
+                    "filter": null,
+                    "unmatched_types": [UNREGISTERED_TYPE],
+                },
+                {
+                    "topic": OTHER_TOPIC,
+                    "subject_tenant": UNMATCHED_TENANT,
+                    "ownership_filter": "entire_tenant",
+                    "barrier_mode": "respect",
+                    "types": [REGISTERED_TYPE],
+                    "filter": null,
+                    "unmatched_types": [REGISTERED_TYPE],
+                },
+                {
+                    "topic": UNMATCHED_TOPIC,
+                    "subject_tenant": UNMATCHED_TENANT,
+                    "ownership_filter": "entire_tenant",
+                    "barrier_mode": "respect",
+                    "types": [REGISTERED_TYPE],
+                    "filter": null,
+                    "unmatched_types": [],
+                },
+            ],
+            "assigned": [
+                { "topic": UNMATCHED_TOPIC, "partition": 0 },
+                { "topic": OTHER_TOPIC, "partition": 0 },
+            ],
+            "topology_version": 1,
+            "created_at": created_at,
+        })
+    );
+}
+
+#[tokio::test]
+async fn an_over_cap_join_reports_an_unregistered_exact_type() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(over_cap_registry())
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [{
+                "topic": UNMATCHED_TOPIC,
+                "subject_tenant": UNMATCHED_TENANT, "ownership_filter": "entire_tenant",
+                "types": [UNREGISTERED_TYPE],
+            }],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(201);
+    let body = resp.json();
+    let id = body["id"].as_str().expect("id must be a string").to_owned();
+    let created_at = body["created_at"]
+        .as_str()
+        .expect("created_at must be a string")
+        .to_owned();
+    assert_eq!(
+        body,
+        json!({
+            "id": id,
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [{
+                "topic": UNMATCHED_TOPIC,
+                "subject_tenant": UNMATCHED_TENANT,
+                "ownership_filter": "entire_tenant",
+                "barrier_mode": "respect",
+                "types": [UNREGISTERED_TYPE],
+                "filter": null,
+                "unmatched_types": [UNREGISTERED_TYPE],
+            }],
+            "assigned": [{ "topic": UNMATCHED_TOPIC, "partition": 0 }],
+            "topology_version": 1,
+            "created_at": created_at,
+        })
+    );
+}
+
+#[tokio::test]
+async fn an_over_cap_join_does_not_report_a_registered_exact_type() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(over_cap_registry())
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [{
+                "topic": UNMATCHED_TOPIC,
+                "subject_tenant": UNMATCHED_TENANT, "ownership_filter": "entire_tenant",
+                "types": [REGISTERED_TYPE],
+            }],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(201);
+    let body = resp.json();
+    let id = body["id"].as_str().expect("id must be a string").to_owned();
+    let created_at = body["created_at"]
+        .as_str()
+        .expect("created_at must be a string")
+        .to_owned();
+    assert_eq!(
+        body,
+        json!({
+            "id": id,
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [{
+                "topic": UNMATCHED_TOPIC,
+                "subject_tenant": UNMATCHED_TENANT,
+                "ownership_filter": "entire_tenant",
+                "barrier_mode": "respect",
+                "types": [REGISTERED_TYPE],
+                "filter": null,
+                "unmatched_types": [],
+            }],
+            "assigned": [{ "topic": UNMATCHED_TOPIC, "partition": 0 }],
+            "topology_version": 1,
+            "created_at": created_at,
+        })
+    );
+}
+
+/// Over the candidate cap the broker cannot tell what a wildcard matches, so
+/// it never reports one, even one that matches no registered type.
+#[tokio::test]
+async fn an_over_cap_join_never_reports_a_wildcard() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(over_cap_registry())
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [{
+                "topic": UNMATCHED_TOPIC,
+                "subject_tenant": UNMATCHED_TENANT, "ownership_filter": "entire_tenant",
+                "types": [NOTHING_WILDCARD],
+            }],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(201);
+    let body = resp.json();
+    let id = body["id"].as_str().expect("id must be a string").to_owned();
+    let created_at = body["created_at"]
+        .as_str()
+        .expect("created_at must be a string")
+        .to_owned();
+    assert_eq!(
+        body,
+        json!({
+            "id": id,
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [{
+                "topic": UNMATCHED_TOPIC,
+                "subject_tenant": UNMATCHED_TENANT,
+                "ownership_filter": "entire_tenant",
+                "barrier_mode": "respect",
+                "types": [NOTHING_WILDCARD],
+                "filter": null,
+                "unmatched_types": [],
+            }],
+            "assigned": [{ "topic": UNMATCHED_TOPIC, "partition": 0 }],
+            "topology_version": 1,
+            "created_at": created_at,
+        })
+    );
+}
+
+/// Over the candidate cap an exact entry is looked up by its id alone, so a
+/// base type registered only as a derived type is reported, where a topic
+/// within the cap matches it against the derived type.
+#[tokio::test]
+async fn an_over_cap_join_reports_a_base_type_registered_only_as_derived_types() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(over_cap_registry())
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [{
+                "topic": UNMATCHED_TOPIC,
+                "subject_tenant": UNMATCHED_TENANT, "ownership_filter": "entire_tenant",
+                "types": [BASE_TYPE, DERIVED_TYPE],
+            }],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(201);
+    let body = resp.json();
+    let id = body["id"].as_str().expect("id must be a string").to_owned();
+    let created_at = body["created_at"]
+        .as_str()
+        .expect("created_at must be a string")
+        .to_owned();
+    assert_eq!(
+        body,
+        json!({
+            "id": id,
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [{
+                "topic": UNMATCHED_TOPIC,
+                "subject_tenant": UNMATCHED_TENANT,
+                "ownership_filter": "entire_tenant",
+                "barrier_mode": "respect",
+                "types": [BASE_TYPE, DERIVED_TYPE],
+                "filter": null,
+                "unmatched_types": [BASE_TYPE],
+            }],
+            "assigned": [{ "topic": UNMATCHED_TOPIC, "partition": 0 }],
+            "topology_version": 1,
+            "created_at": created_at,
+        })
+    );
+}
+
+/// Over the candidate cap JOIN asks the spec cache which exact types are
+/// registered; when that lookup cannot be read the JOIN answers `503`,
+/// retryable, and leaves no subscription behind.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn an_over_cap_join_whose_registered_type_lookup_fails_answers_503() {
+    let hook = SpecQueryHook::new();
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(over_cap_registry())
+        .with_spec_query_hook(hook.clone())
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    hook.arm(|query| match query {
+        SpecQuery::RegisteredEventTypes => Err(DomainError::StorageUnavailable {
+            reason: "the registered-type lookup failed".to_owned(),
+            source: None,
+        }),
+        SpecQuery::EventType | SpecQuery::EventTypeCandidates => Ok(()),
+    });
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [{
+                "topic": UNMATCHED_TOPIC,
+                "subject_tenant": UNMATCHED_TENANT, "ownership_filter": "entire_tenant",
+                "types": [UNREGISTERED_TYPE],
+            }],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(503);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~",
+            "title": "Service Unavailable",
+            "status": 503,
+            "detail": "Service temporarily unavailable",
+            "instance": "/event-broker/v1/subscriptions",
+            "context": {},
+        })
+    );
+    let logged = std::cell::RefCell::new(Vec::new());
+    logs_assert(|lines| {
+        *logged.borrow_mut() = mapping_lines(lines);
+        Ok(())
+    });
+    assert_eq!(
+        logged.into_inner(),
+        vec![
+            "WARN answering 503 with the generic body error=storage backend unavailable: \
+             the registered-type lookup failed"
+                .to_owned()
+        ]
+    );
+    assert_eq!(hook.calls(SpecQuery::RegisteredEventTypes), 1);
+    let listed = harness.api_v1().get_subscriptions().send().await;
+    listed.assert_status(200);
+    assert_eq!(
+        listed.json(),
+        json!({
+            "items": [],
+            "page_info": { "next_cursor": null, "prev_cursor": null, "limit": 25 },
+        })
+    );
+}
+
+/// `unmatched_types` belongs to the JOIN response only: a later read and the
+/// listing echo the subscription without it.
+#[tokio::test]
+async fn get_and_list_do_not_carry_unmatched_types() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(listed_registry())
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let joined = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [
+                { "topic": UNMATCHED_TOPIC, "subject_tenant": UNMATCHED_TENANT, "ownership_filter": "entire_tenant", "types": [REGISTERED_TYPE] },
+                { "topic": UNMATCHED_TOPIC, "subject_tenant": UNMATCHED_TENANT, "ownership_filter": "entire_tenant", "types": [UNREGISTERED_TYPE] },
+            ],
+        })))
+        .send()
+        .await;
+    joined.assert_status(201);
+    let id = joined.json()["id"].as_str().unwrap().to_owned();
+    let created_at = joined.json()["created_at"].as_str().unwrap().to_owned();
+    let subscription = json!({
+        "id": id,
+        "consumer_group": group,
+        "client_agent": "test-agent",
+        "interests": [
+            {
+                "topic": UNMATCHED_TOPIC,
+                "subject_tenant": UNMATCHED_TENANT,
+                "ownership_filter": "entire_tenant",
+                "barrier_mode": "respect",
+                "types": [REGISTERED_TYPE],
+                "filter": null,
+            },
+            {
+                "topic": UNMATCHED_TOPIC,
+                "subject_tenant": UNMATCHED_TENANT,
+                "ownership_filter": "entire_tenant",
+                "barrier_mode": "respect",
+                "types": [UNREGISTERED_TYPE],
+                "filter": null,
+            },
+        ],
+        "assigned": [{ "topic": UNMATCHED_TOPIC, "partition": 0 }],
+        "topology_version": 1,
+        "created_at": created_at,
+    });
+
+    let read = harness.api_v1().get_subscription(&id).send().await;
+    read.assert_status(200);
+    assert_eq!(read.json(), subscription);
+    let listed = harness.api_v1().get_subscriptions().send().await;
+    listed.assert_status(200);
+    assert_eq!(
+        listed.json(),
+        json!({
+            "items": [subscription],
+            "page_info": { "next_cursor": null, "prev_cursor": null, "limit": 25 },
         })
     );
 }
@@ -1313,19 +2307,14 @@ async fn stream_seek_and_leave_each_make_their_own_fresh_tenant_check() {
             { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
         ])))
         .with_policy_enforcer(PolicyEnforcer::new(Arc::new(DenyingAuthZ {
-            // `join()` makes exactly 4 PEP calls here: its own group-level
-            // tenant-scope check against the anonymous group it joins
-            // (`eb-tenant-isolation-fix`'s group-level JOIN authorization),
-            // plus the one interest's `topic:consume`, `event_type:consume`,
-            // and per-interest tenant-scope check. `stream`/`seek`/`leave`
-            // each make one more of their own
-            // (`find_authorized_subscription`) - never zero, and never a
-            // reuse of JOIN's own checks (spec.md "A passed check does not
-            // constrain
-            // later reads" is about not caching JOIN's `AccessScope`, not
-            // about skipping authorization downstream entirely - each call
-            // below is its own fresh tenant-scope check). Never denies, so
-            // every operation still succeeds; only the call count matters.
+            // Group create makes 1 PEP call and `join()` 2 here: its own
+            // group-level tenant-scope check against the anonymous group it
+            // joins, plus one `consume` on the topic for its one group of
+            // interests. `stream`/`seek`/`leave` each make one more of their
+            // own (`find_authorized_subscription`) - never zero, and never a
+            // reuse of JOIN's checks: each is its own fresh tenant-scope
+            // check. Never denies, so every operation still succeeds; only
+            // the call count matters.
             deny_if: move |_: &EvaluationRequest| {
                 calls_for_double.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 false
@@ -1346,7 +2335,7 @@ async fn stream_seek_and_leave_each_make_their_own_fresh_tenant_check() {
             "client_agent": "test-agent",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -1354,7 +2343,7 @@ async fn stream_seek_and_leave_each_make_their_own_fresh_tenant_check() {
         .await;
     join_resp.assert_status(201);
     let id = join_resp.json()["id"].as_str().unwrap().to_owned();
-    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 5);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
 
     harness
         .api_v1()
@@ -1367,15 +2356,13 @@ async fn stream_seek_and_leave_each_make_their_own_fresh_tenant_check() {
         .assert_status(200);
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::SeqCst),
-        6,
+        4,
         "seek must make exactly one additional tenant check"
     );
 
     let request = Request::builder()
         .method("GET")
-        .uri(format!(
-            "/event-broker/v1/events:stream?subscription_id={id}"
-        ))
+        .uri(format!("/event-broker/v1/events:stream?subscription={id}"))
         .body(Body::empty())
         .expect("request must build");
     let response = harness
@@ -1387,7 +2374,7 @@ async fn stream_seek_and_leave_each_make_their_own_fresh_tenant_check() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::SeqCst),
-        7,
+        5,
         "stream must make exactly one additional tenant check"
     );
     let mut stream = response.into_body().into_data_stream();
@@ -1403,7 +2390,7 @@ async fn stream_seek_and_leave_each_make_their_own_fresh_tenant_check() {
 
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::SeqCst),
-        8,
+        6,
         "leave must make exactly one additional tenant check"
     );
 }
@@ -1413,7 +2400,7 @@ async fn stream_seek_and_leave_each_make_their_own_fresh_tenant_check() {
 /// `PolicyEnforcer` that allows exactly the 2 PEP calls setup makes - the
 /// anonymous group's own `consumer_group:define` check
 /// (`create_consumer_group`) and `join`'s group-level tenant-scope check
-/// against that group (empty `interests`, so no per-interest checks) - and
+/// against that group (empty `interests`, so no consume checks) - and
 /// denies every call after. Simulates a caller who was authorized to create
 /// the group and subscription but is not authorized for its tenant on a
 /// later call, the same technique
@@ -1532,6 +2519,150 @@ async fn stream_rejects_a_caller_from_a_different_tenant() {
     );
 }
 
+/// A harness whose REST caller is a subject of `tenant`, and a subscription
+/// another subject of the same tenant joined in process, one interest on the
+/// `x.eb.t1` topic. Returns the harness, the subscription id and its group.
+async fn harness_with_a_subscription_joined_by_another_principal(
+    tenant: Uuid,
+) -> (EventBrokerHarness, Uuid, GtsInstanceId) {
+    let topic = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1";
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": topic, "partitions": 1 },
+        ])))
+        .with_security_context(
+            toolkit_security::SecurityContext::builder()
+                .subject_id(Uuid::from_u128(0x3513))
+                .subject_tenant_id(tenant)
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .await;
+    let joiner = toolkit_security::SecurityContext::builder()
+        .subject_id(Uuid::from_u128(0x3511))
+        .subject_tenant_id(tenant)
+        .build()
+        .unwrap();
+    let group = harness
+        .delivery()
+        .create_consumer_group(
+            &joiner,
+            crate::domain::model::ConsumerGroupCreateInput {
+                client_agent: Some("joiner".to_owned()),
+                description: None,
+            },
+        )
+        .await
+        .expect("the group is created")
+        .id;
+    let id = harness
+        .delivery()
+        .join(
+            &joiner,
+            crate::domain::delivery::JoinRequest {
+                consumer_group: group.clone(),
+                client_agent: "joiner".to_owned(),
+                interests: vec![crate::domain::model::Interest {
+                    topic: GtsInstanceId::try_new(topic).unwrap(),
+                    subject_tenant: tenant,
+                    ownership: crate::domain::model::OwnershipFilter::EntireTenant,
+                    barrier_mode: crate::domain::model::BarrierMode::Respect,
+                    types: vec![
+                        gts::GtsIdPattern::try_new("gts.cf.core.events.event.v1~x.eb.t1.foo.v1~")
+                            .unwrap(),
+                    ],
+                    subject_types: Vec::new(),
+                    filter: None,
+                }],
+                session_timeout: std::time::Duration::from_secs(30),
+            },
+        )
+        .await
+        .expect("the JOIN is allowed")
+        .subscription
+        .id;
+    (harness, id, group)
+}
+
+#[tokio::test]
+async fn leave_by_another_principal_of_the_tenant_returns_403_subscription_not_owned() {
+    let (harness, id, _group) =
+        harness_with_a_subscription_joined_by_another_principal(Uuid::from_u128(0x3512)).await;
+
+    let resp = harness
+        .api_v1()
+        .delete_subscription(&id.to_string())
+        .send()
+        .await;
+
+    resp.assert_status(403);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~",
+            "title": "Permission Denied",
+            "status": 403,
+            "detail": "You do not have permission to perform this operation",
+            "instance": format!("/event-broker/v1/subscriptions/{id}"),
+            "context": {
+                "reason": format!("subscription '{id}' was joined by another principal"),
+                "resource_type": "gts.cf.core.events.subscription.v1~",
+            },
+        })
+    );
+    harness
+        .api_v1()
+        .get_subscription(&id.to_string())
+        .send()
+        .await
+        .assert_status(200);
+}
+
+#[tokio::test]
+async fn seek_by_another_principal_of_the_tenant_returns_403_subscription_not_owned() {
+    let (harness, id, group) =
+        harness_with_a_subscription_joined_by_another_principal(Uuid::from_u128(0x3512)).await;
+    let topic = GtsInstanceId::try_new("gts.cf.core.events.topic.v1~x.eb.t1.topic.v1").unwrap();
+
+    let resp = harness
+        .api_v1()
+        .post_subscription_seek(&id.to_string())
+        .with_body(Json(&json!({
+            "topology_version": 1,
+            "positions": {
+                "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1": [{
+                    "partition": 0,
+                    "value": "earliest",
+                }],
+            },
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(403);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~",
+            "title": "Permission Denied",
+            "status": 403,
+            "detail": "You do not have permission to perform this operation",
+            "instance": format!("/event-broker/v1/subscriptions/{id}:seek"),
+            "context": {
+                "reason": format!("subscription '{id}' was joined by another principal"),
+                "resource_type": "gts.cf.core.events.subscription.v1~",
+            },
+        })
+    );
+    let cursor = harness
+        .repo()
+        .find_cursor(&group, &topic, 0)
+        .await
+        .expect("repo lookup must not fail");
+    assert!(cursor.is_none(), "the refused seek wrote {cursor:?}");
+}
+
 #[tokio::test]
 async fn list_subscriptions_excludes_a_different_tenant() {
     // `AllowAllAuthZ` (the harness default) can't distinguish tenants at
@@ -1570,6 +2701,11 @@ async fn list_subscriptions_excludes_a_different_tenant() {
     let foreign = crate::domain::model::Subscription {
         id: Uuid::new_v4(),
         tenant_id: foreign_tenant_id,
+        joiner: crate::domain::model::Joiner {
+            subject: Uuid::new_v4(),
+            tenant: foreign_tenant_id,
+            subject_type: None,
+        },
         consumer_group: GtsInstanceId::try_new(&group).unwrap(),
         client_agent: "foreign".to_owned(),
         interests: vec![],
@@ -1799,7 +2935,7 @@ async fn seek_exact_offset_returns_200_with_resolved_value() {
             "client_agent": "a",
             "interests": [{
                 "topic": topic,
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id, "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -1847,7 +2983,7 @@ async fn seek_earliest_sentinel_resolves_to_zero_on_empty_partition() {
             "client_agent": "a",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -1899,7 +3035,7 @@ async fn seek_before_the_topic_is_provisioned_resolves_as_an_empty_partition() {
             "client_agent": "a",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -1974,7 +3110,7 @@ async fn seek_invalid_sentinel_returns_400() {
             "client_agent": "a",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -2034,7 +3170,7 @@ async fn seek_unassigned_partition_returns_409() {
             "client_agent": "a",
             "interests": [{
                 "topic": topic,
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -2101,7 +3237,7 @@ async fn seek_stale_topology_version_returns_412() {
             "client_agent": "a",
             "interests": [{
                 "topic": topic,
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -2205,7 +3341,7 @@ async fn seek_unregistered_topic_returns_404() {
             "client_agent": "a",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -2285,7 +3421,7 @@ async fn publish_and_settle(
             .with_body(Json(&json!({
                 "id": Uuid::new_v4(),
                 "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id,
                 "source": "test-seek-range",
                 "subject": format!("s{n}"),
                 "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -2331,7 +3467,7 @@ async fn seek_accepts_the_range_edges_and_rejects_one_step_outside_either() {
             "client_agent": "a",
             "interests": [{
                 "topic": topic,
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id, "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -2454,7 +3590,7 @@ async fn seek_writes_no_cursor_at_all_when_one_partition_is_inadmissible() {
             "client_agent": "a",
             "interests": [{
                 "topic": topic,
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -2541,7 +3677,7 @@ async fn seek_reports_one_violation_per_offending_partition() {
             "client_agent": "a",
             "interests": [{
                 "topic": topic,
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -2595,6 +3731,152 @@ async fn seek_reports_one_violation_per_offending_partition() {
     );
 }
 
+/// A JSON object may repeat a key, and a plain map keeps only its last value,
+/// which would drop the earlier entries for that topic unchecked. The whole
+/// seek is refused instead, and no cursor is written.
+///
+/// The body is a raw string because `json!` cannot express a repeated key.
+#[tokio::test]
+async fn seek_rejects_a_positions_object_that_names_a_topic_twice() {
+    let topic = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1";
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": topic, "partitions": 1 },
+        ])))
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let id = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "a",
+            "interests": [{
+                "topic": topic,
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
+                "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
+            }],
+        })))
+        .send()
+        .await
+        .json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let resp = harness
+        .api_v1()
+        .post_subscription_seek(&id)
+        .with_header(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        )
+        .with_body(
+            r#"{"topology_version":1,"positions":{"gts.cf.core.events.topic.v1~x.eb.t1.topic.v1":[{"partition":0,"value":0}],"gts.cf.core.events.topic.v1~x.eb.t1.topic.v1":[{"partition":0,"value":"earliest"}]}}"#,
+        )
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "InvalidBody: `positions` names the same topic more than once",
+            "instance": format!("/event-broker/v1/subscriptions/{id}:seek"),
+            "context": {
+                "format": "InvalidBody: `positions` names the same topic more than once",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+
+    let topic_id = GtsInstanceId::try_new(topic).unwrap();
+    let group_id = GtsInstanceId::try_new(&group).unwrap();
+    assert!(
+        harness
+            .repo()
+            .find_cursor(&group_id, &topic_id, 0)
+            .await
+            .expect("repo lookup must not fail")
+            .is_none(),
+        "the rejected request must write no cursor",
+    );
+}
+
+/// Distinct topic keys in one body each keep their entries, and the response
+/// lists them in sorted order whatever order the body names them in.
+#[tokio::test]
+async fn seek_accepts_distinct_topic_keys_in_one_request() {
+    let t1 = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1";
+    let t2 = "gts.cf.core.events.topic.v1~x.eb.t2.topic.v1";
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": t1, "partitions": 1 },
+            { "id": t2, "partitions": 1 },
+        ])))
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let tenant_id = Uuid::new_v4();
+    let id = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "a",
+            "interests": [
+                {
+                    "topic": t1,
+                    "subject_tenant": tenant_id, "ownership_filter": "entire_tenant",
+                    "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
+                },
+                {
+                    "topic": t2,
+                    "subject_tenant": tenant_id, "ownership_filter": "entire_tenant",
+                    "types": ["gts.cf.core.events.event.v1~x.eb.t2.foo.v1~"],
+                },
+            ],
+        })))
+        .send()
+        .await
+        .json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // The body names `t2` before `t1`.
+    let resp = harness
+        .api_v1()
+        .post_subscription_seek(&id)
+        .with_header(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        )
+        .with_body(
+            r#"{"topology_version":1,"positions":{"gts.cf.core.events.topic.v1~x.eb.t2.topic.v1":[{"partition":0,"value":"latest"}],"gts.cf.core.events.topic.v1~x.eb.t1.topic.v1":[{"partition":0,"value":0}]}}"#,
+        )
+        .send()
+        .await;
+
+    resp.assert_status(200);
+    assert_eq!(
+        resp.text(),
+        format!(
+            r#"{{"positions":{{"{t1}":[{{"partition":0,"value":0}}],"{t2}":[{{"partition":0,"value":0}}]}}}}"#
+        )
+    );
+}
+
 /// A cursor names a position, not an event, and the position it names may be
 /// one retention has erased.
 ///
@@ -2631,7 +3913,7 @@ async fn a_cursor_may_sit_on_an_erased_position_and_delivery_resumes_above_it() 
             "client_agent": "a",
             "interests": [{
                 "topic": topic,
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id, "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -2650,7 +3932,7 @@ async fn a_cursor_may_sit_on_an_erased_position_and_delivery_resumes_above_it() 
             .with_body(Json(&json!({
                 "id": Uuid::new_v4(),
                 "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id,
                 "source": "test-erased-cursor",
                 "subject": format!("s{n}"),
                 "subject_type": "gts.x.eb.t1.subject.v1~",
@@ -2721,9 +4003,7 @@ async fn a_cursor_may_sit_on_an_erased_position_and_delivery_resumes_above_it() 
     // stored, which is 3 - not at 2, and not at the start.
     let request = Request::builder()
         .method("GET")
-        .uri(format!(
-            "/event-broker/v1/events:stream?subscription_id={id}"
-        ))
+        .uri(format!("/event-broker/v1/events:stream?subscription={id}"))
         .body(Body::empty())
         .expect("request must build");
     let response = harness
@@ -2798,7 +4078,7 @@ async fn an_emptied_partition_admits_only_its_ceiling() {
             "client_agent": "a",
             "interests": [{
                 "topic": topic,
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id, "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -2901,7 +4181,7 @@ async fn second_join_on_same_group_reduces_first_subscription_and_increments_ver
             "client_agent": "a",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id, "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -2920,7 +4200,7 @@ async fn second_join_on_same_group_reduces_first_subscription_and_increments_ver
             "client_agent": "b",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": tenant_id,
+                "subject_tenant": tenant_id, "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -2937,7 +4217,7 @@ async fn second_join_on_same_group_reduces_first_subscription_and_increments_ver
     assert_eq!(get_a.json()["assigned"].as_array().unwrap().len(), 2);
 }
 
-// -- client_agent encoding and length -------------------------------------
+// -- client_agent encoding, length and grammar ----------------------------
 
 #[tokio::test]
 async fn join_rejects_a_non_ascii_client_agent() {
@@ -2960,7 +4240,7 @@ async fn join_rejects_a_non_ascii_client_agent() {
             "client_agent": "agent\u{1}/1.0",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -3012,7 +4292,7 @@ async fn join_rejects_an_over_length_client_agent_before_parsing_session_timeout
             "session_timeout": "garbage",
             "interests": [{
                 "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-                "tenant_id": Uuid::new_v4(),
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
                 "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
             }],
         })))
@@ -3037,5 +4317,1071 @@ async fn join_rejects_an_over_length_client_agent_before_parsing_session_timeout
                 "resource_type": "gts.cf.core.events.request.v1~",
             },
         })
+    );
+}
+
+#[tokio::test]
+async fn join_rejects_a_client_agent_that_breaks_the_user_agent_grammar() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+        ])))
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "agent/",
+            "interests": [{
+                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                "subject_tenant": Uuid::new_v4(), "ownership_filter": "entire_tenant",
+                "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
+            }],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "Request validation failed",
+            "instance": "/event-broker/v1/subscriptions",
+            "context": {
+                "field_violations": [{
+                    "field": "client_agent",
+                    "description": "must follow the RFC 9110 User-Agent grammar: \
+                                    product *( SP ( product / comment ) )",
+                    "reason": "user_agent_grammar",
+                }],
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    let listed = harness.api_v1().get_subscriptions().send().await;
+    listed.assert_status(200);
+    assert_eq!(
+        listed.json(),
+        json!({
+            "items": [],
+            "page_info": { "next_cursor": null, "prev_cursor": null, "limit": 25 },
+        }),
+        "a refused JOIN creates no subscription"
+    );
+}
+
+// -- JOIN guards and limits (#5494) --
+
+const GUARD_TOPIC: &str = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1";
+const GUARD_TYPE: &str = "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~";
+
+type RecordedPdp = Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+
+/// A PDP that allows every request and records each one, so a test reads the
+/// requests a JOIN asked; an empty list means no PDP call was made.
+fn recording_pdp() -> (PolicyEnforcer, RecordedPdp) {
+    let recorded = RecordedPdp::default();
+    let sink = Arc::clone(&recorded);
+    let enforcer = PolicyEnforcer::new(Arc::new(DenyingAuthZ {
+        deny_if: move |req: &EvaluationRequest| {
+            sink.lock()
+                .unwrap()
+                .push(serde_json::to_value(req).unwrap());
+            false
+        },
+    }));
+    (enforcer, recorded)
+}
+
+/// `n` distinct event-type selectors.
+fn type_selectors(n: usize) -> Vec<String> {
+    (0..n)
+        .map(|i| format!("gts.cf.core.events.event.v1~x.eb.t1.limit{i}.v1~"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_join_by_a_caller_with_no_identity_is_refused_before_any_pdp_call_over_rest() {
+    let (enforcer, pdp) = recording_pdp();
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": GUARD_TOPIC, "partitions": 1 },
+        ])))
+        .with_policy_enforcer(enforcer)
+        .with_security_context(
+            toolkit_security::SecurityContext::builder()
+                .subject_id(Uuid::nil())
+                .subject_tenant_id(Uuid::nil())
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .await;
+    // No such group exists: the guard answers before the group lookup, so the
+    // caller learns nothing about which groups exist.
+    let group = event_broker_sdk::ConsumerGroupId(Uuid::from_u128(0x1803)).to_gts();
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [{
+                "topic": GUARD_TOPIC,
+                "subject_tenant": Uuid::from_u128(0x1804), "ownership_filter": "entire_tenant",
+                "types": [GUARD_TYPE],
+            }],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(403);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~",
+            "title": "Permission Denied",
+            "status": 403,
+            "detail": "You do not have permission to perform this operation",
+            "instance": "/event-broker/v1/subscriptions",
+            "context": {
+                "reason": "the caller has no identity: its subject or tenant is the nil UUID",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    assert_eq!(*pdp.lock().unwrap(), Vec::<serde_json::Value>::new());
+    // Read from the coordinator: a listing as this caller is refused too.
+    assert_eq!(
+        harness
+            .groups()
+            .list()
+            .iter()
+            .map(|subscription| subscription.id)
+            .collect::<Vec<_>>(),
+        Vec::<Uuid>::new()
+    );
+}
+
+#[tokio::test]
+async fn a_list_of_subscriptions_by_a_caller_with_no_identity_is_refused_before_any_pdp_call_over_rest()
+ {
+    let (enforcer, pdp) = recording_pdp();
+    let harness = EventBrokerHarness::builder()
+        .with_policy_enforcer(enforcer)
+        .with_security_context(
+            toolkit_security::SecurityContext::builder()
+                .subject_id(Uuid::nil())
+                .subject_tenant_id(Uuid::nil())
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .await;
+
+    let resp = harness.api_v1().get_subscriptions().send().await;
+
+    resp.assert_status(403);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~",
+            "title": "Permission Denied",
+            "status": 403,
+            "detail": "You do not have permission to perform this operation",
+            "instance": "/event-broker/v1/subscriptions",
+            "context": {
+                "reason": "the caller has no identity: its subject or tenant is the nil UUID",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    assert_eq!(*pdp.lock().unwrap(), Vec::<serde_json::Value>::new());
+}
+
+#[tokio::test]
+async fn a_join_with_64_interests_is_accepted() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": GUARD_TOPIC, "partitions": 1 },
+        ])))
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let tenant_id = Uuid::from_u128(0x1805);
+    let interest = json!({ "topic": GUARD_TOPIC, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [GUARD_TYPE] });
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": vec![interest; 64],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(201);
+    let body = resp.json();
+    let id = body["id"].as_str().expect("id must be a string").to_owned();
+    let created_at = body["created_at"]
+        .as_str()
+        .expect("created_at must be a string")
+        .to_owned();
+    let echoed = json!({
+        "topic": GUARD_TOPIC,
+        "subject_tenant": tenant_id,
+        "types": [GUARD_TYPE],
+        "ownership_filter": "entire_tenant",
+        "barrier_mode": "respect",
+        "filter": null,
+        "unmatched_types": [GUARD_TYPE],
+    });
+    assert_eq!(
+        body,
+        json!({
+            "id": id,
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": vec![echoed; 64],
+            "assigned": [{ "topic": GUARD_TOPIC, "partition": 0 }],
+            "topology_version": 1,
+            "created_at": created_at,
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_join_with_65_interests_is_refused_with_too_many_interests() {
+    let (enforcer, pdp) = recording_pdp();
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": GUARD_TOPIC, "partitions": 1 },
+        ])))
+        .with_policy_enforcer(enforcer)
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    pdp.lock().unwrap().clear();
+    let interest = json!({
+        "topic": GUARD_TOPIC,
+        "subject_tenant": Uuid::from_u128(0x1806), "ownership_filter": "entire_tenant",
+        "types": [GUARD_TYPE],
+    });
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": vec![interest; 65],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "TooManyInterests: interests count 65 exceeds the maximum of 64",
+            "instance": "/event-broker/v1/subscriptions",
+            "context": {
+                "format": "TooManyInterests: interests count 65 exceeds the maximum of 64",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    assert_eq!(*pdp.lock().unwrap(), Vec::<serde_json::Value>::new());
+    assert_eq!(
+        harness.api_v1().get_subscriptions().send().await.json(),
+        json!({
+            "items": [],
+            "page_info": { "next_cursor": null, "prev_cursor": null, "limit": 25 },
+        })
+    );
+}
+
+#[tokio::test]
+async fn an_interest_with_32_types_is_accepted() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": GUARD_TOPIC, "partitions": 1 },
+        ])))
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let tenant_id = Uuid::from_u128(0x1807);
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [
+                { "topic": GUARD_TOPIC, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [GUARD_TYPE] },
+                { "topic": GUARD_TOPIC, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": type_selectors(32) },
+            ],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(201);
+    let body = resp.json();
+    let id = body["id"].as_str().expect("id must be a string").to_owned();
+    let created_at = body["created_at"]
+        .as_str()
+        .expect("created_at must be a string")
+        .to_owned();
+    assert_eq!(
+        body,
+        json!({
+            "id": id,
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [
+                {
+                    "topic": GUARD_TOPIC,
+                    "subject_tenant": tenant_id,
+                    "types": [GUARD_TYPE],
+                    "ownership_filter": "entire_tenant",
+                    "barrier_mode": "respect",
+                    "filter": null,
+                    "unmatched_types": [GUARD_TYPE],
+                },
+                {
+                    "topic": GUARD_TOPIC,
+                    "subject_tenant": tenant_id,
+                    "types": type_selectors(32),
+                    "ownership_filter": "entire_tenant",
+                    "barrier_mode": "respect",
+                    "filter": null,
+                    "unmatched_types": type_selectors(32),
+                },
+            ],
+            "assigned": [{ "topic": GUARD_TOPIC, "partition": 0 }],
+            "topology_version": 1,
+            "created_at": created_at,
+        })
+    );
+}
+
+#[tokio::test]
+async fn an_interest_with_33_types_is_refused_with_too_many_types() {
+    let (enforcer, pdp) = recording_pdp();
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": GUARD_TOPIC, "partitions": 1 },
+        ])))
+        .with_policy_enforcer(enforcer)
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    pdp.lock().unwrap().clear();
+    let tenant_id = Uuid::from_u128(0x1808);
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [
+                { "topic": GUARD_TOPIC, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [GUARD_TYPE] },
+                { "topic": GUARD_TOPIC, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": type_selectors(33) },
+            ],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "TooManyTypes: interest 1: types count 33 exceeds the maximum of 32",
+            "instance": "/event-broker/v1/subscriptions",
+            "context": {
+                "format": "TooManyTypes: interest 1: types count 33 exceeds the maximum of 32",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    assert_eq!(*pdp.lock().unwrap(), Vec::<serde_json::Value>::new());
+    assert_eq!(
+        harness.api_v1().get_subscriptions().send().await.json(),
+        json!({
+            "items": [],
+            "page_info": { "next_cursor": null, "prev_cursor": null, "limit": 25 },
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_join_with_a_nil_interest_tenant_is_refused_with_invalid_tenant() {
+    let (enforcer, pdp) = recording_pdp();
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": GUARD_TOPIC, "partitions": 1 },
+        ])))
+        .with_policy_enforcer(enforcer)
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    pdp.lock().unwrap().clear();
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [{
+                "topic": GUARD_TOPIC,
+                "subject_tenant": Uuid::nil(), "ownership_filter": "entire_tenant",
+                "types": [GUARD_TYPE],
+            }],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "InvalidTenant: interest 0: the interest's tenant must not be the nil UUID",
+            "instance": "/event-broker/v1/subscriptions",
+            "context": {
+                "format": "InvalidTenant: interest 0: the interest's tenant must not be the nil UUID",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    assert_eq!(*pdp.lock().unwrap(), Vec::<serde_json::Value>::new());
+    assert_eq!(
+        harness.api_v1().get_subscriptions().send().await.json(),
+        json!({
+            "items": [],
+            "page_info": { "next_cursor": null, "prev_cursor": null, "limit": 25 },
+        })
+    );
+}
+
+// -- The subject-type selector --
+
+const SUBJECT_SELECTOR: &str = "gts.x.eb.t1.customer.v1~";
+
+fn subject_selectors(n: usize) -> Vec<String> {
+    (0..n)
+        .map(|i| format!("gts.x.eb.t1.subject{i}.v1~"))
+        .collect()
+}
+
+#[tokio::test]
+async fn join_echoes_a_subject_type_selector() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": GUARD_TOPIC, "partitions": 1 },
+        ])))
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let tenant_id = Uuid::from_u128(0x1910);
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [{
+                "topic": GUARD_TOPIC,
+                "subject_tenant": tenant_id, "ownership_filter": "entire_tenant",
+                "types": [GUARD_TYPE],
+                "subject_types": [SUBJECT_SELECTOR],
+            }],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(201);
+    let body = resp.json();
+    let id = body["id"].as_str().expect("id must be a string").to_owned();
+    let created_at = body["created_at"]
+        .as_str()
+        .expect("created_at must be a string")
+        .to_owned();
+    assert_eq!(
+        body,
+        json!({
+            "id": id,
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [{
+                "topic": GUARD_TOPIC,
+                "subject_tenant": tenant_id,
+                "types": [GUARD_TYPE],
+                "subject_types": [SUBJECT_SELECTOR],
+                "ownership_filter": "entire_tenant",
+                "barrier_mode": "respect",
+                "filter": null,
+                "unmatched_types": [GUARD_TYPE],
+            }],
+            "assigned": [{ "topic": GUARD_TOPIC, "partition": 0 }],
+            "topology_version": 1,
+            "created_at": created_at,
+        })
+    );
+    let expected = json!({
+        "id": id,
+        "consumer_group": group,
+        "client_agent": "test-agent",
+        "interests": [{
+            "topic": GUARD_TOPIC,
+            "subject_tenant": tenant_id,
+            "types": [GUARD_TYPE],
+            "subject_types": [SUBJECT_SELECTOR],
+            "ownership_filter": "entire_tenant",
+            "barrier_mode": "respect",
+            "filter": null,
+        }],
+        "assigned": [{ "topic": GUARD_TOPIC, "partition": 0 }],
+        "topology_version": 1,
+        "created_at": created_at,
+    });
+    let read = harness.api_v1().get_subscription(&id).send().await;
+    read.assert_status(200);
+    assert_eq!(read.json(), expected);
+}
+
+/// The topic's one type allows only `ORDER_SUBJECT`, and the selector names
+/// another subject type: no event the interest selects can match it. The
+/// JOIN still succeeds, and `unmatched_types` reports `types` entries only,
+/// never a subject-type selector.
+#[tokio::test]
+async fn join_with_a_subject_type_no_registered_type_allows_reports_nothing() {
+    const ORDER_SUBJECT: &str = "gts.x.eb.t1.order.v1~";
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": GUARD_TOPIC, "partitions": 1 },
+            {
+                "id": GUARD_TYPE,
+                "topic": GUARD_TOPIC,
+                "allowed_subject_types": [ORDER_SUBJECT],
+            },
+        ])))
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let tenant_id = Uuid::from_u128(0x1912);
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [{
+                "topic": GUARD_TOPIC,
+                "subject_tenant": tenant_id, "ownership_filter": "entire_tenant",
+                "types": [GUARD_TYPE],
+                "subject_types": [SUBJECT_SELECTOR],
+            }],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(201);
+    let body = resp.json();
+    let id = body["id"].as_str().expect("id must be a string").to_owned();
+    let created_at = body["created_at"]
+        .as_str()
+        .expect("created_at must be a string")
+        .to_owned();
+    assert_eq!(
+        body,
+        json!({
+            "id": id,
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [{
+                "topic": GUARD_TOPIC,
+                "subject_tenant": tenant_id,
+                "types": [GUARD_TYPE],
+                "subject_types": [SUBJECT_SELECTOR],
+                "ownership_filter": "entire_tenant",
+                "barrier_mode": "respect",
+                "filter": null,
+                "unmatched_types": [],
+            }],
+            "assigned": [{ "topic": GUARD_TOPIC, "partition": 0 }],
+            "topology_version": 1,
+            "created_at": created_at,
+        })
+    );
+}
+
+#[tokio::test]
+async fn join_without_a_selector_echoes_no_subject_types_key() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": GUARD_TOPIC, "partitions": 1 },
+        ])))
+        .build()
+        .await;
+    let tenant_id = Uuid::from_u128(0x1911);
+
+    for interest in [
+        json!({ "topic": GUARD_TOPIC, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [GUARD_TYPE] }),
+        json!({
+            "topic": GUARD_TOPIC,
+            "subject_tenant": tenant_id, "ownership_filter": "entire_tenant",
+            "types": [GUARD_TYPE],
+            "subject_types": [],
+        }),
+    ] {
+        let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let resp = harness
+            .api_v1()
+            .post_subscriptions()
+            .with_body(Json(&json!({
+                "consumer_group": group,
+                "client_agent": "test-agent",
+                "interests": [interest],
+            })))
+            .send()
+            .await;
+
+        resp.assert_status(201);
+        let body = resp.json();
+        let id = body["id"].as_str().expect("id must be a string").to_owned();
+        let created_at = body["created_at"]
+            .as_str()
+            .expect("created_at must be a string")
+            .to_owned();
+        assert_eq!(
+            body,
+            json!({
+                "id": id,
+                "consumer_group": group,
+                "client_agent": "test-agent",
+                "interests": [{
+                    "topic": GUARD_TOPIC,
+                    "subject_tenant": tenant_id,
+                    "types": [GUARD_TYPE],
+                    "ownership_filter": "entire_tenant",
+                    "barrier_mode": "respect",
+                    "filter": null,
+                    "unmatched_types": [GUARD_TYPE],
+                }],
+                "assigned": [{ "topic": GUARD_TOPIC, "partition": 0 }],
+                "topology_version": 1,
+                "created_at": created_at,
+            })
+        );
+    }
+}
+
+#[tokio::test]
+async fn join_with_32_subject_types_is_accepted() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": GUARD_TOPIC, "partitions": 1 },
+        ])))
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let tenant_id = Uuid::from_u128(0x1912);
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [
+                { "topic": GUARD_TOPIC, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [GUARD_TYPE] },
+                {
+                    "topic": GUARD_TOPIC,
+                    "subject_tenant": tenant_id, "ownership_filter": "entire_tenant",
+                    "types": [GUARD_TYPE],
+                    "subject_types": subject_selectors(32),
+                },
+            ],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(201);
+    let body = resp.json();
+    let id = body["id"].as_str().expect("id must be a string").to_owned();
+    let created_at = body["created_at"]
+        .as_str()
+        .expect("created_at must be a string")
+        .to_owned();
+    assert_eq!(
+        body,
+        json!({
+            "id": id,
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [
+                {
+                    "topic": GUARD_TOPIC,
+                    "subject_tenant": tenant_id,
+                    "types": [GUARD_TYPE],
+                    "ownership_filter": "entire_tenant",
+                    "barrier_mode": "respect",
+                    "filter": null,
+                    "unmatched_types": [GUARD_TYPE],
+                },
+                {
+                    "topic": GUARD_TOPIC,
+                    "subject_tenant": tenant_id,
+                    "types": [GUARD_TYPE],
+                    "subject_types": subject_selectors(32),
+                    "ownership_filter": "entire_tenant",
+                    "barrier_mode": "respect",
+                    "filter": null,
+                    "unmatched_types": [GUARD_TYPE],
+                },
+            ],
+            "assigned": [{ "topic": GUARD_TOPIC, "partition": 0 }],
+            "topology_version": 1,
+            "created_at": created_at,
+        })
+    );
+}
+
+#[tokio::test]
+async fn join_with_33_subject_types_is_refused_with_too_many_subject_types() {
+    let (enforcer, pdp) = recording_pdp();
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": GUARD_TOPIC, "partitions": 1 },
+        ])))
+        .with_policy_enforcer(enforcer)
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    pdp.lock().unwrap().clear();
+    let tenant_id = Uuid::from_u128(0x1913);
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [
+                { "topic": GUARD_TOPIC, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [GUARD_TYPE] },
+                {
+                    "topic": GUARD_TOPIC,
+                    "subject_tenant": tenant_id, "ownership_filter": "entire_tenant",
+                    "types": [GUARD_TYPE],
+                    "subject_types": subject_selectors(33),
+                },
+            ],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "TooManySubjectTypes: interest 1: subject types count 33 exceeds the maximum of 32",
+            "instance": "/event-broker/v1/subscriptions",
+            "context": {
+                "format": "TooManySubjectTypes: interest 1: subject types count 33 exceeds the maximum of 32",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    assert_eq!(*pdp.lock().unwrap(), Vec::<serde_json::Value>::new());
+    assert_eq!(
+        harness.api_v1().get_subscriptions().send().await.json(),
+        json!({
+            "items": [],
+            "page_info": { "next_cursor": null, "prev_cursor": null, "limit": 25 },
+        })
+    );
+}
+
+#[tokio::test]
+async fn join_with_an_invalid_subject_type_pattern_is_refused() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": GUARD_TOPIC, "partitions": 1 },
+        ])))
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            // Two wildcard segments: a GTS pattern carries at most one.
+            "interests": [{
+                "topic": GUARD_TOPIC,
+                "subject_tenant": Uuid::from_u128(0x1914), "ownership_filter": "entire_tenant",
+                "types": [GUARD_TYPE],
+                "subject_types": ["gts.*.foo.*"],
+            }],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "BadTypePattern: subject type selector must be a valid GTS pattern",
+            "instance": "/event-broker/v1/subscriptions",
+            "context": {
+                "format": "BadTypePattern: subject type selector must be a valid GTS pattern",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    assert_eq!(
+        harness.api_v1().get_subscriptions().send().await.json(),
+        json!({
+            "items": [],
+            "page_info": { "next_cursor": null, "prev_cursor": null, "limit": 25 },
+        })
+    );
+}
+
+#[tokio::test]
+async fn an_interests_type_count_is_checked_before_its_subject_type_count() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": GUARD_TOPIC, "partitions": 1 },
+        ])))
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [{
+                "topic": GUARD_TOPIC,
+                "subject_tenant": Uuid::from_u128(0x1915), "ownership_filter": "entire_tenant",
+                "types": type_selectors(33),
+                "subject_types": subject_selectors(33),
+            }],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "TooManyTypes: interest 0: types count 33 exceeds the maximum of 32",
+            "instance": "/event-broker/v1/subscriptions",
+            "context": {
+                "format": "TooManyTypes: interest 0: types count 33 exceeds the maximum of 32",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    assert_eq!(
+        harness.api_v1().get_subscriptions().send().await.json(),
+        json!({
+            "items": [],
+            "page_info": { "next_cursor": null, "prev_cursor": null, "limit": 25 },
+        })
+    );
+}
+
+#[tokio::test]
+async fn an_interests_subject_type_count_is_checked_before_its_tenant() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": GUARD_TOPIC, "partitions": 1 },
+        ])))
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [{
+                "topic": GUARD_TOPIC,
+                "subject_tenant": Uuid::nil(), "ownership_filter": "entire_tenant",
+                "types": [GUARD_TYPE],
+                "subject_types": subject_selectors(33),
+            }],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "TooManySubjectTypes: interest 0: subject types count 33 exceeds the maximum of 32",
+            "instance": "/event-broker/v1/subscriptions",
+            "context": {
+                "format": "TooManySubjectTypes: interest 0: subject types count 33 exceeds the maximum of 32",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+    assert_eq!(
+        harness.api_v1().get_subscriptions().send().await.json(),
+        json!({
+            "items": [],
+            "page_info": { "next_cursor": null, "prev_cursor": null, "limit": 25 },
+        })
+    );
+}
+
+#[tokio::test]
+async fn join_by_another_principal_of_the_tenant_returns_403_consumer_group_not_owned() {
+    let tenant = Uuid::from_u128(0x3612);
+    let harness = EventBrokerHarness::builder()
+        .with_security_context(
+            toolkit_security::SecurityContext::builder()
+                .subject_id(Uuid::from_u128(0x3613))
+                .subject_tenant_id(tenant)
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .await;
+    let creator = toolkit_security::SecurityContext::builder()
+        .subject_id(Uuid::from_u128(0x3611))
+        .subject_tenant_id(tenant)
+        .build()
+        .unwrap();
+    let group = harness
+        .delivery()
+        .create_consumer_group(
+            &creator,
+            crate::domain::model::ConsumerGroupCreateInput {
+                client_agent: Some("creator".to_owned()),
+                description: None,
+            },
+        )
+        .await
+        .expect("the group is created")
+        .id
+        .to_string();
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(403);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~",
+            "title": "Permission Denied",
+            "status": 403,
+            "detail": "You do not have permission to perform this operation",
+            "instance": "/event-broker/v1/subscriptions",
+            "context": {
+                "reason": format!("consumer group '{group}' was created by another principal"),
+                "resource_type": "gts.cf.core.events.consumer_group.v1~",
+            },
+        })
+    );
+    assert!(
+        harness.groups().list().is_empty(),
+        "the refused JOIN created no subscription"
     );
 }

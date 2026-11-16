@@ -36,6 +36,9 @@ async fn if_i_want_at_least_once_consumption_with_in_memory_offsets() {
     let subjects = Arc::new(Mutex::new(Vec::new()));
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::auto_anonymous("showcase-in-memory"))
         .subscription_interests([SubscriptionInterest::builder()
             .topic(topic(TOPIC))

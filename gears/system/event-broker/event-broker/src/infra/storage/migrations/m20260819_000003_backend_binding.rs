@@ -65,7 +65,8 @@ async fn create_topic_binding(manager: &SchemaManager<'_>) -> Result<(), DbErr> 
             Table::create()
                 .table(T::Table)
                 .if_not_exists()
-                // `GtsId::to_uuid(topic_id)`.
+                // The topic's Registry Reference (`Instance.uuid`, stored on the topic's
+                // spec row at `bulk_load`).
                 .col(ColumnDef::new(T::TopicUuid).uuid().not_null().primary_key())
                 // For operators, not indexed.
                 .col(gts_id(manager, T::TopicId))

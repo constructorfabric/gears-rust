@@ -172,9 +172,9 @@ fn raw_event_for_dead_letter() -> (event_broker_sdk::EventV1, Delivery) {
         serde_json::json!({ "reject": true }),
     )
     .id(Uuid::from_u128(0xd1e_0042))
-    .tenant_id(Uuid::nil())
+    .subject_tenant(Uuid::nil())
     .subject("db-dlq-1")
-    .subject_type_id(event_broker_sdk::GtsTypeId::new(
+    .subject_type_of(event_broker_sdk::GtsTypeId::new(
         "gts.x.eb.test.subject.v1~",
     ))
     .occurred_at("2026-01-02T03:04:05Z".parse().unwrap())
@@ -204,7 +204,7 @@ where
     TX: toolkit_db::secure::DBRunner + Sync,
 {
     dlq_row::Entity::insert(dlq_row::ActiveModel {
-        event_id: Set(record.event_id),
+        event_id: Set(record.event),
         topic: Set(record.topic.as_ref().to_owned()),
         event_type: Set(record.event_type.as_ref().to_owned()),
         partition: Set(record.partition as i32),
@@ -245,11 +245,14 @@ async fn if_i_want_transactional_single_event_handling_i_commit_the_delivered_of
         .await
         .expect("consumer group created")
         .id;
-    let topic_id = event_broker_sdk::TopicId::from_gts(TX_SINGLE_TOPIC);
+    let topic_id = topic(TX_SINGLE_TOPIC);
     let committed_offsets = Arc::new(Mutex::new(Vec::new()));
     let assertion_manager = LocalDbOffsetManager::new(db.clone(), Fallback::Earliest);
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::existing(group))
         .topics([topic(TX_SINGLE_TOPIC)])
         .offset_manager(LocalDbOffsetManager::new(db.clone(), Fallback::Earliest))
@@ -300,11 +303,14 @@ async fn if_i_want_transactional_batch_handling_i_commit_the_last_handled_offset
         .await
         .expect("consumer group created")
         .id;
-    let topic_id = event_broker_sdk::TopicId::from_gts(TX_BATCH_TOPIC);
+    let topic_id = topic(TX_BATCH_TOPIC);
     let committed_offsets = Arc::new(Mutex::new(Vec::new()));
     let assertion_manager = LocalDbOffsetManager::new(db.clone(), Fallback::Earliest);
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
+        .subject_tenant(fixture.ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(fixture.ctx.clone())
         .group(ConsumerGroupRef::existing(group))
         .topics([topic(TX_BATCH_TOPIC)])
         .batching(ConsumerBatching {
@@ -349,8 +355,9 @@ async fn if_i_want_transactional_batch_handling_i_commit_the_last_handled_offset
 async fn if_i_want_db_transactional_progress_i_write_business_rows_and_offset_together() {
     let (_raw, db) = db_with_showcase_tables().await;
     let manager = Arc::new(LocalDbOffsetManager::new(db.clone(), Fallback::Earliest));
-    let group = event_broker_sdk::ConsumerGroupId::from_gts("showcase-db-tx");
-    let topic_id = event_broker_sdk::TopicId::from_gts("showcase-db-tx-topic");
+    let group = event_broker_sdk::ConsumerGroupId::new(Uuid::from_u128(1));
+    let topic_id = topic(gts_id!("cf.core.events.topic.v1~example.showcase.db.tx.v1"));
+    let tx_topic = topic_id.clone();
     let tx_manager = manager.clone();
 
     db.transaction_ref(move |tx| {
@@ -358,7 +365,7 @@ async fn if_i_want_db_transactional_progress_i_write_business_rows_and_offset_to
             // Application business writes should use secure repositories with
             // this same `tx`; the offset save joins that transaction.
             tx_manager
-                .commit_in_tx(tx, &group, &topic_id, 0, Sequence::assigned(41))
+                .commit_in_tx(tx, &group, &tx_topic, 0, Sequence::assigned(41))
                 .await
                 .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
             Ok(())
@@ -377,15 +384,18 @@ async fn if_i_want_db_transactional_progress_i_write_business_rows_and_offset_to
 async fn if_the_business_transaction_rolls_back_the_offset_rolls_back_too() {
     let (_raw, db) = db_with_showcase_tables().await;
     let manager = Arc::new(LocalDbOffsetManager::new(db.clone(), Fallback::Earliest));
-    let group = event_broker_sdk::ConsumerGroupId::from_gts("showcase-db-tx-rollback");
-    let topic_id = event_broker_sdk::TopicId::from_gts("showcase-db-tx-rollback-topic");
+    let group = event_broker_sdk::ConsumerGroupId::new(Uuid::from_u128(2));
+    let topic_id = topic(gts_id!(
+        "cf.core.events.topic.v1~example.showcase.db.tx_rollback.v1"
+    ));
+    let tx_topic = topic_id.clone();
     let tx_manager = manager.clone();
 
     let result: Result<(), toolkit_db::DbError> = db
         .transaction_ref(move |tx| {
             Box::pin(async move {
                 tx_manager
-                    .commit_in_tx(tx, &group, &topic_id, 0, Sequence::assigned(77))
+                    .commit_in_tx(tx, &group, &tx_topic, 0, Sequence::assigned(77))
                     .await
                     .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
                 Err(toolkit_db::DbError::InvalidConfig(
@@ -406,12 +416,15 @@ async fn if_the_business_transaction_rolls_back_the_offset_rolls_back_too() {
 async fn if_i_want_transactional_dlq_i_write_the_record_and_offset_in_one_transaction() {
     let (raw, db) = db_with_showcase_tables().await;
     let manager = Arc::new(LocalDbOffsetManager::new(db.clone(), Fallback::Earliest));
-    let group = event_broker_sdk::ConsumerGroupId::from_gts("showcase-db-dlq");
-    let topic_id = event_broker_sdk::TopicId::from_gts("showcase-db-dlq-topic");
+    let group = event_broker_sdk::ConsumerGroupId::new(Uuid::from_u128(3));
+    let topic_id = topic(gts_id!(
+        "cf.core.events.topic.v1~example.showcase.db.dlq.v1"
+    ));
+    let tx_topic = topic_id.clone();
     let tx_manager = manager.clone();
     let (event, delivery) = raw_event_for_dead_letter();
     let record = DeadLetterRecord::builder(&event, &delivery, "permanent validation failure")
-        .group_id(group)
+        .consumer_group(group)
         .attempts(6)
         .build();
     let partition = delivery.partition();
@@ -421,7 +434,7 @@ async fn if_i_want_transactional_dlq_i_write_the_record_and_offset_in_one_transa
         Box::pin(async move {
             insert_dead_letter(tx, &record).await?;
             tx_manager
-                .commit_in_tx(tx, &group, &topic_id, partition, offset)
+                .commit_in_tx(tx, &group, &tx_topic, partition, offset)
                 .await
                 .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
             Ok(())
@@ -444,12 +457,15 @@ async fn if_i_want_transactional_dlq_i_write_the_record_and_offset_in_one_transa
 async fn if_the_transactional_dlq_rolls_back_neither_parking_nor_offset_is_durable() {
     let (raw, db) = db_with_showcase_tables().await;
     let manager = Arc::new(LocalDbOffsetManager::new(db.clone(), Fallback::Earliest));
-    let group = event_broker_sdk::ConsumerGroupId::from_gts("showcase-db-dlq-rollback");
-    let topic_id = event_broker_sdk::TopicId::from_gts("showcase-db-dlq-rollback-topic");
+    let group = event_broker_sdk::ConsumerGroupId::new(Uuid::from_u128(4));
+    let topic_id = topic(gts_id!(
+        "cf.core.events.topic.v1~example.showcase.db.dlq.v1"
+    ));
+    let tx_topic = topic_id.clone();
     let tx_manager = manager.clone();
     let (event, delivery) = raw_event_for_dead_letter();
     let record = DeadLetterRecord::builder(&event, &delivery, "permanent validation failure")
-        .group_id(group)
+        .consumer_group(group)
         .attempts(6)
         .build();
     let partition = delivery.partition();
@@ -460,7 +476,7 @@ async fn if_the_transactional_dlq_rolls_back_neither_parking_nor_offset_is_durab
             Box::pin(async move {
                 insert_dead_letter(tx, &record).await?;
                 tx_manager
-                    .commit_in_tx(tx, &group, &topic_id, partition, offset)
+                    .commit_in_tx(tx, &group, &tx_topic, partition, offset)
                     .await
                     .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
                 Err(toolkit_db::DbError::InvalidConfig(

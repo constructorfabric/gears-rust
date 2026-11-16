@@ -1,10 +1,12 @@
 //! `DomainError` → `CanonicalError`/`Problem` mapping (`domain/error.rs`'s
-//! reserved path). Category choice matches `docs/DESIGN.md`'s Hard-Error
-//! Catalog (`cpt-cf-evbk-interface-error-codes`). `SequenceViolation`/
-//! `BatchTooLarge` keep their canonical `FailedPrecondition`/`InvalidArgument`
-//! category (dispatch-relevant fields - `type`/`title` - stay put) but carry a
-//! `TransportOverride` so the wire `status` matches `docs/openapi.yaml`'s
-//! literal `412`/`413` instead of the category default of `400`
+//! reserved path). Category choice matches `docs/DESIGN.md` "Error Response
+//! Format" (`cpt-cf-evbk-interface-error-codes`). `SchemaViolation` (`422`),
+//! `SequenceViolation` and `TopologyVersionMismatch` (`412`), `BatchTooLarge`
+//! and `EventTooLarge` (`413`), and `PositionsNotSet`, `StreamingInProgress`,
+//! `ConsumerGroupHasActiveMembers` and `PartitionNotAssigned` (`409`) keep their
+//! canonical category (dispatch-relevant fields - `type`/`title` - stay put) but
+//! carry a `TransportOverride` so the wire `status` matches `docs/openapi.yaml`'s
+//! literal status instead of the category default
 //! (`gears-rust#4465`/`canonical-error-transport-overrides`, which added the
 //! escape hatch this needed).
 
@@ -106,7 +108,7 @@ fn conflict(code: ErrorCode, message: String, resource: String) -> CanonicalErro
         )
         .with_precondition_violation(
             resource,
-            "one stream per subscription; DELETE is the only permitted concurrent call",
+            "one stream per subscription; a second stream or a SEEK is refused while it is open",
             reason,
         ),
         // Minimal body for the topology-version mismatch: the subscription
@@ -241,7 +243,7 @@ impl From<DomainError> for CanonicalError {
                 last_sequence,
             } => {
                 // A precondition violation is a fixed `{type, subject,
-                // description}` shape, so the run's `index`, `producer_id`,
+                // description}` shape, so the run's `index`, `producer`,
                 // `topic` and committed `last_sequence` (feature 0001 §5.2)
                 // ride in `description` as text, `last_sequence` last: the
                 // SDK reads the resync point as the description's last number.
@@ -251,7 +253,7 @@ impl From<DomainError> for CanonicalError {
                     .with_precondition_violation(
                         "(producer)",
                         format!(
-                            "index={index} producer_id={producer_id} topic={topic} \
+                            "index={index} producer={producer_id} topic={topic} \
                              last_sequence={last_sequence}"
                         ),
                         reasons::SEQUENCE_MISMATCH,

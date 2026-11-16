@@ -80,11 +80,11 @@ fn second_batch_meta(mode: ProducerMode) -> EventMeta {
     producer_meta_for_last(mode, producer_id, last).unwrap()
 }
 
-/// `(version, producer_id, previous, sequence)` of one published event.
+/// `(version, producer, previous, sequence)` of one published event.
 type Stamp = (u32, Option<Uuid>, Option<i64>, Option<i64>);
 
 fn stamp(meta: &EventMeta) -> Stamp {
-    (meta.version, meta.producer_id, meta.previous, meta.sequence)
+    (meta.version, meta.producer, meta.previous, meta.sequence)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,9 +129,9 @@ impl GtsSchema for OrderShipped {
 fn order(n: u128) -> EventV1<OrderCreated> {
     let order_id = Uuid::from_u128(n);
     EventV1::builder(OrderCreated { order_id })
-        .tenant_id(TENANT)
+        .subject_tenant(TENANT)
         .subject(order_id.to_string())
-        .subject_type_id(GtsTypeId::new(SUBJECT_TYPE))
+        .subject_type_of(GtsTypeId::new(SUBJECT_TYPE))
         .build()
         .expect("a valid order event")
 }
@@ -139,9 +139,9 @@ fn order(n: u128) -> EventV1<OrderCreated> {
 fn invoice(n: u128) -> EventV1<InvoiceIssued> {
     let invoice_id = Uuid::from_u128(n);
     EventV1::builder(InvoiceIssued { invoice_id })
-        .tenant_id(TENANT)
+        .subject_tenant(TENANT)
         .subject(invoice_id.to_string())
-        .subject_type_id(GtsTypeId::new(SUBJECT_TYPE))
+        .subject_type_of(GtsTypeId::new(SUBJECT_TYPE))
         .build()
         .expect("a valid invoice event")
 }
@@ -149,9 +149,9 @@ fn invoice(n: u128) -> EventV1<InvoiceIssued> {
 fn shipment(n: u128) -> EventV1<OrderShipped> {
     let order_id = Uuid::from_u128(n);
     EventV1::builder(OrderShipped { order_id })
-        .tenant_id(TENANT)
+        .subject_tenant(TENANT)
         .subject(order_id.to_string())
-        .subject_type_id(GtsTypeId::new(SUBJECT_TYPE))
+        .subject_type_of(GtsTypeId::new(SUBJECT_TYPE))
         .build()
         .expect("a valid shipment event")
 }
@@ -167,9 +167,9 @@ fn order_with_id(n: u128) -> EventV1<OrderCreated> {
     let order_id = Uuid::from_u128(n);
     EventV1::builder(OrderCreated { order_id })
         .id(event_id(n))
-        .tenant_id(TENANT)
+        .subject_tenant(TENANT)
         .subject(order_id.to_string())
-        .subject_type_id(GtsTypeId::new(SUBJECT_TYPE))
+        .subject_type_of(GtsTypeId::new(SUBJECT_TYPE))
         .build()
         .expect("a valid order event")
 }
@@ -180,7 +180,7 @@ fn order_body() -> serde_json::Value {
     json!({
         "id": Uuid::from_u128(0x0190_f1a2_0000_7000_8000_0000_0000_e101),
         "type": EVENT_TYPE,
-        "tenant_id": TENANT,
+        "subject_tenant": TENANT,
         "subject": "order-1",
         "subject_type": SUBJECT_TYPE,
         "occurred_at": "2026-11-06T10:00:00Z",
@@ -492,7 +492,7 @@ impl BrokerStub for RecordingBroker {
         }
         let head = *self.head.lock().expect("head lock");
         Ok(ProducerCursors {
-            producer_id,
+            id: producer_id,
             client_agent: "order-service/1.0".to_owned(),
             topics: head
                 .map(|last_sequence| TopicCursors {
@@ -560,7 +560,7 @@ impl BrokerStub for RecordingBroker {
             .into_iter()
             .find(|event_type| event_type.id == id)
             .ok_or_else(|| EventBrokerError::EventTypeUnknown {
-                type_id: id.to_owned(),
+                event_type: id.to_owned(),
                 detail: "not served".to_owned(),
             })
     }
@@ -574,7 +574,7 @@ impl RecordingBroker {
                 topic: GtsInstanceId::try_new(TOPIC).expect("a valid topic id"),
                 description: None,
                 allowed_subject_types: Vec::new(),
-                partition_key: "/tenant_id".to_owned(),
+                partition_key: "/subject_tenant".to_owned(),
                 data_schema: json!({ "type": "object" }),
             },
             EventType {
@@ -590,7 +590,7 @@ impl RecordingBroker {
                 topic: GtsInstanceId::try_new(INVOICE_TOPIC).expect("a valid topic id"),
                 description: None,
                 allowed_subject_types: Vec::new(),
-                partition_key: "/tenant_id".to_owned(),
+                partition_key: "/subject_tenant".to_owned(),
                 data_schema: json!({ "type": "object" }),
             },
         ]
@@ -1438,10 +1438,10 @@ fn prepared_at(sequence: i64) -> PreparedEvent {
         json!({}),
     )
     .id(Uuid::from_u128(0x0190_f1a2_0000_7000_8000_0000_0000_e001))
-    .tenant_id(TENANT)
+    .subject_tenant(TENANT)
     .source("order-service")
     .subject("order-stale")
-    .subject_type_id(GtsTypeId::try_new(SUBJECT_TYPE).expect("a valid subject type id"))
+    .subject_type_of(GtsTypeId::try_new(SUBJECT_TYPE).expect("a valid subject type id"))
     .occurred_at(chrono::DateTime::UNIX_EPOCH)
     .build()
     .expect("a valid event");
@@ -1533,10 +1533,10 @@ async fn a_producer_stamps_its_source_and_refuses_an_event_that_carries_one() {
     let sourced = EventV1::builder(OrderCreated {
         order_id: Uuid::from_u128(2),
     })
-    .tenant_id(TENANT)
+    .subject_tenant(TENANT)
     .source("x")
     .subject("order-2")
-    .subject_type_id(GtsTypeId::new(SUBJECT_TYPE))
+    .subject_type_of(GtsTypeId::new(SUBJECT_TYPE))
     .build()
     .expect("a valid order event");
 
@@ -1580,7 +1580,7 @@ async fn a_producer_refuses_stamped_members_and_meta_before_any_call() {
         ),
         (
             "meta",
-            json!({ "version": 1, "producer_id": null, "previous": null, "sequence": null }),
+            json!({ "version": 1, "producer": null, "previous": null, "sequence": null }),
             "the producer stamps it",
         ),
     ];
@@ -1736,10 +1736,7 @@ async fn a_producer_registers_its_mode_at_build() {
             (ProducerMode::Monotonic, "order-service/1.0".to_owned()),
         ]
     );
-    assert_eq!(
-        (chained.producer_id(), monotonic.producer_id()),
-        (PRODUCER, PRODUCER)
-    );
+    assert_eq!((chained.id(), monotonic.id()), (PRODUCER, PRODUCER));
 }
 
 /// `Debug` prints the producer's mode, id and topics, and of the builder which
@@ -3092,9 +3089,7 @@ async fn a_limit_past_the_semaphore_maximum_is_refused_at_build() {
         "nothing reaches the broker"
     );
     assert_eq!(
-        at_max
-            .expect("a limit of exactly the maximum builds")
-            .producer_id(),
+        at_max.expect("a limit of exactly the maximum builds").id(),
         PRODUCER
     );
 }
@@ -3110,7 +3105,7 @@ async fn an_event_over_the_size_limit_is_refused_before_any_publish() {
     sent_form["data"] = pad.clone();
     sent_form["source"] = json!("order-service");
     let sent_form: EventV1 = serde_json::from_value(sent_form).expect("the body decodes");
-    let expected = sent_form.encoded_len().expect("the event measures") + 124;
+    let expected = sent_form.encoded_len().expect("the event measures") + 121;
 
     let single = producer
         .publish(decoded_order_with("data", pad.clone()), Ack::Accepted)

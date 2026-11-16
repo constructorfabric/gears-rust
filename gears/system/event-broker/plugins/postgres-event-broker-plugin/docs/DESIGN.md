@@ -61,8 +61,8 @@ References:
 
 ```sql
 CREATE TABLE evbk__log (                              -- one row per provisioned topic
-    topic_uuid     UUID          PRIMARY KEY,      -- GtsId::to_uuid(topic)
-    topic_id       VARCHAR(1024) NOT NULL,
+    topic_uuid     UUID          PRIMARY KEY,      -- TopicSpec.uuid (Registry Reference)
+    topic_id       VARCHAR(1024) NOT NULL UNIQUE,  -- the GTS id; one row per topic
     log_id         UUID          NOT NULL,         -- feature 0006
     partitions     INTEGER       NOT NULL,         -- at most 9999 (table naming, §2.2)
     max_age        INTERVAL,                       -- TopicSpec.retention; NULL = unbounded
@@ -137,7 +137,7 @@ evbk__{topic_uuid}_p{partition}                       partitioned table, PARTITI
 evbk__{topic_uuid}_p{partition}_s{first_sequence}     segment, FOR VALUES FROM (first) TO (next first)
 
 evbk            the plugin's db_namespace (docs/arch/database/ADR/0001: <db_namespace>__<local_name>)
-topic_uuid      GtsId::to_uuid(topic) as 32 lowercase hex digits, no dashes
+topic_uuid      the TopicSpec.uuid the topic was provisioned under, as 32 lowercase hex digits, no dashes
 partition       decimal, at most 4 digits (partitions <= 9999)
 first_sequence  the segment's first sequence, 16 lowercase hex digits, zero-padded (covers all of i64)
 length          6 + 32 + 2 + 4 + 2 + 16 = 62 <= 63, PostgreSQL's identifier limit
@@ -149,7 +149,7 @@ Every other object follows the same ADR: indexes `idx_<table>__<purpose>`, e.g. 
 CREATE TABLE evbk__3f2a9c1e0b7d4e21a8c65f0d9e14b7a3_p3 (
     sequence       BIGINT        NOT NULL,         -- from 1 (ADR-0001)
     sequence_time  TIMESTAMPTZ   NOT NULL,         -- when it was appended; retention age and resolve(At)
-    tenant_id      UUID          NOT NULL,         -- tenant scoping
+    subject_tenant UUID          NOT NULL,         -- tenant scoping
     body           BYTEA         NOT NULL,         -- the event, encoded as below; opaque to PostgreSQL
     PRIMARY KEY (sequence)
 ) PARTITION BY RANGE (sequence);
@@ -163,7 +163,7 @@ CREATE TABLE evbk__3f2a9c1e0b7d4e21a8c65f0d9e14b7a3_p3_s0000000000000001
 - Names are derived from `(topic_uuid, partition, first_sequence)` when a table is created, then stored with its catalog row: `evbk__partition.table_name` for the partitioned table, `evbk__segment.table_name` for a segment. Every later use reads the stored name, so a change to these rules leaves existing tables as they are, and a segment's name extends its parent's stored name.
 - Only the fields positions, retention or tenant scoping use are columns; everything else of the event lives in `body`. `type_id` and `subject_type` are not columns: no read filters by them (§4.5), and a filtered read brings the columns it needs.
 - `occurred_at` is not a column: it is the producer's claim, untrusted and unordered within a partition, so it never decides a position or an age. It travels in `body` as event data.
-- `body` is the plugin's own versioned encoding, JSON bytes: `{"v":1, "id", "type_id", "tenant_id", "source", "subject", "subject_type", "occurred_at", "trace_parent", "data"}`. `meta` is not stored (publisher-only, stripped on read); `partition`, `sequence` and `sequence_time` are columns. A reader refuses a `v` it does not know with `Internal`.
+- `body` is the plugin's own versioned encoding, JSON bytes: `{"v":1, "id", "type_id", "subject_tenant", "source", "subject", "subject_type", "occurred_at", "trace_parent", "data"}`. `meta` is not stored (publisher-only, stripped on read); `partition`, `sequence` and `sequence_time` are columns. A reader refuses a `v` it does not know with `Internal`.
 - Sizes are what the tables take on disk, all overhead included: `pg_total_relation_size` of each segment table, heap, TOAST, the primary key and the `brin` index. No event carries a size and no counter adds them up. A segment is measured once, when it is sealed full (§4.9): its table is insert-only, so the figure is final, but for the visibility map and free space map a vacuum may add later. `max_bytes` bounds this size per partition: the sealed segments as measured, and every open segment as it is now, the empty ones made ahead of the head included (a few tens of KB each). The contract leaves the unit to the backend (feature 0007 §2).
 - `sequence_time` rises with `sequence` (barring a clock step back; §4.2), the order a block-range index summarizes best: the `brin` index costs a few bytes per range of blocks and lets `resolve(At)` skip whole ranges (§4.6). PostgreSQL gives every segment its own copy of the parent's indexes.
 - A segment's range is fixed when it is created (§4.9); sizes may differ from segment to segment, and the suffix keeps every name exact.
@@ -251,18 +251,21 @@ None of these waits: each is a try-lock, `SKIP LOCKED` or `NOWAIT`, so the two t
 
 ### 4.1 provision
 
-`provision(TopicSpec { topic, partitions }, LogClaim { replacing, new })`:
+`provision(TopicSpec { topic, uuid, partitions, retention }, LogClaim { replacing, new })`:
 
 ```sql
 BEGIN;
+-- $t is TopicSpec.uuid, the topic's Registry Reference; $topic_id is its GTS id
 -- skipped for replacing = Held, which never creates
 INSERT INTO evbk__log (topic_uuid, topic_id, log_id, partitions, max_age, max_bytes, provisioned_at)
 VALUES ($t, $topic_id, $new, $partitions, $max_age, $max_bytes, now())
-ON CONFLICT (topic_uuid) DO NOTHING;
+ON CONFLICT DO NOTHING;
 SELECT log_id, partitions FROM evbk__log WHERE topic_uuid = $t FOR UPDATE;
 --   log_id = $new                         -> this attempt (fresh, or continued); UPDATE max_age, max_bytes (re-provision with new settings)
 --   log_id = replacing (Log(id))          -> UPDATE evbk__log SET log_id = $new WHERE topic_uuid = $t
 --   no row (replacing = Held)             -> ROLLBACK; NotProvisioned
+--   no row after a creating insert        -> ROLLBACK; Internal("provision: evbk__log holds no row after the insert")
+--                                            (the topic id is held under another reference, which types-registry never hands out)
 --   anything else                         -> ROLLBACK; LogConflict
 SELECT partition, table_name FROM evbk__partition WHERE topic_uuid = $t;   -- names already stored
 -- per partition p in 0..partitions; parent = the stored name, else evbk__{t}_p{p} (§2.2):
@@ -282,6 +285,7 @@ COMMIT;
 
 After the commit, the new partitions' layouts go into the maintenance registry (§4.9).
 
+- The insert names no conflict target, so every unique index on `evbk__log` is an arbiter: the primary key `topic_uuid` and the unique `topic_id`. A second reference for a provisioned topic therefore inserts nothing and finds no row under `$t` (`Internal` above). A unique index added to `evbk__log` later silently becomes an arbiter too.
 - DDL is transactional in PostgreSQL: a failed provisioning leaves nothing behind.
 - A `Held` claim never inserts the `evbk__log` row: over a topic this database holds nothing for, it answers `NotProvisioned` and creates no row and no table.
 - `partitions > 9999` is refused with `InvalidConfig` (naming, §2.2).
@@ -294,7 +298,7 @@ After the commit, the new partitions' layouts go into the maintenance registry (
 `AppendRequest { fence: { key, seq }, topic, events, flush }`, here one event whose key maps to partition 3:
 
 ```sql
--- (1) provisioned?  (cached per topic; a miss reads evbk__log, before the transaction)
+-- (1) provisioned?  (cached per topic; a miss reads evbk__log by topic_id, before the transaction)
 --   no row -> NotProvisioned, whatever the fence holds
 
 BEGIN;                                                        -- READ COMMITTED
@@ -311,7 +315,7 @@ RETURNING hwm, table_name, clock_timestamp();   -- the batch's last; events take
 
 -- (4) the events, sequence_time = that clock_timestamp() (taken after the row lock, so it rises with sequence, barring a clock step back);
 --     into the stored table_name; PostgreSQL routes each row to its segment
-INSERT INTO table_name (sequence, sequence_time, tenant_id, body)
+INSERT INTO table_name (sequence, sequence_time, subject_tenant, body)
 VALUES (...);
 --   no segment for a sequence (23514) -> ROLLBACK; Unavailable, and the extender is offered the partition at once (§4.9)
 
@@ -629,6 +633,7 @@ backends:
 | No segment for a sequence (`23514`) | `Unavailable` |
 | No `evbk__log` row | `NotProvisioned` |
 | Foreign log id at provisioning | `LogConflict` |
+| A second reference for a provisioned topic: no `evbk__log` row after a creating insert (§4.1) | `Internal` |
 | `Exact(n)` outside `[Earliest, Latest]` | `OffsetOutOfRange` |
 | Unknown or invalid setting | `InvalidConfig` |
 | Any other SQLSTATE in `append` | `AppendFailed` |

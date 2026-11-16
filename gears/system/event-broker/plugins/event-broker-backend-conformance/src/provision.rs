@@ -7,6 +7,7 @@ use event_broker_sdk::backend::{
 };
 use event_broker_sdk::{Position, Sequence};
 use futures_util::StreamExt;
+use uuid::Uuid;
 
 use crate::fixture::{KEEP, Writer, event, head_stream, settle, started, topic};
 use crate::harness::Harness;
@@ -17,6 +18,7 @@ pub async fn provision_compare_and_set(harness: &dyn Harness) {
     let backend = started(harness.build().await).await;
     let spec = TopicSpec {
         topic: topic("provision"),
+        uuid: Uuid::new_v4(),
         partitions: 2,
         retention: KEEP,
     };
@@ -70,6 +72,7 @@ pub async fn provision_with_a_held_claim_never_creates(harness: &dyn Harness) {
     let backend = started(harness.build().await).await;
     let spec = TopicSpec {
         topic: topic("held"),
+        uuid: Uuid::new_v4(),
         partitions: 2,
         retention: KEEP,
     };
@@ -132,6 +135,7 @@ pub async fn provision_reports_the_held_partition_count(harness: &dyn Harness) {
     let log = LogId::new_v4();
     let mut spec = TopicSpec {
         topic: topic("held_count"),
+        uuid: Uuid::new_v4(),
         partitions: 4,
         retention: KEEP,
     };

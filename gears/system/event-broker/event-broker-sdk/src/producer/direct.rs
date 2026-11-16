@@ -1,8 +1,8 @@
 //! The direct producer: stamps each event's source and producer metadata, from
-//! a local chain head per `(producer_id, topic)`, and publishes it straight to
+//! a local chain head per `(producer, topic)`, and publishes it straight to
 //! the broker.
 //!
-//! The broker accepts a single writer per `producer_id` (ADR-0004 "Producer
+//! The broker accepts a single writer per producer id (ADR-0004 "Producer
 //! Concurrency"), and a `DirectProducer` is that writer, so it serializes its
 //! own concurrent publishes per topic. Each topic has a `tokio::sync::Mutex`,
 //! held from stamping through the broker's answer to the advance of the head,
@@ -16,7 +16,7 @@
 //! dropped while the broker call is in flight) leaves the topic's head
 //! uncertain, because the broker may have stored the events, and the producer
 //! remembers which events it sent with which numbers. Deduplication is the
-//! broker's, on `(producer_id, sequence)`; the event id is used only locally,
+//! broker's, on `(meta.producer, topic)` and `meta.sequence`; the event id is used only locally,
 //! to recognise a re-publish:
 //! - Re-publishing exactly those events (the same ids, in the same order)
 //!   before any other publish on the topic resends the numbers they carried,
@@ -93,11 +93,11 @@ pub struct Has;
 
 type DirectProducerBuilderState<Broker, Ctx, Source, Topics, Patterns> =
     PhantomData<(Broker, Ctx, Source, Topics, Patterns)>;
-/// A producer's chain is kept per `(producer_id, topic)` (ADR-0004 "Chain Scope").
+/// A producer's chain is kept per `(producer, topic)` (ADR-0004 "Chain Scope").
 type ProducerSequenceKey = (ProducerId, String);
 pub(super) type ProducerSequenceCursor = HashMap<ProducerSequenceKey, i64>;
 type SharedProducerSequenceCursor = Arc<std::sync::RwLock<ProducerSequenceCursor>>;
-/// Keyed by topic alone: a `DirectProducer`'s `producer_id` is fixed, so the
+/// Keyed by topic alone: a `DirectProducer`'s `id` is fixed, so the
 /// topic names its chain.
 type TopicPublishLocks = HashMap<String, TopicPublishLock>;
 
@@ -268,6 +268,10 @@ impl<B, C, S, T, P> DirectProducerBuilder<B, C, S, T, P> {
     }
 
     /// The client agent the producer registers with; the SDK's default unless set.
+    /// It follows the RFC 9110 User-Agent grammar in 1-256 printable-ASCII bytes.
+    /// The broker refuses a value outside it when `build` registers the
+    /// producer (`400`, reason `ascii_only`, `field_too_long` or
+    /// `user_agent_grammar`).
     #[must_use]
     pub fn client_agent(mut self, client_agent: impl Into<String>) -> Self {
         self.client_agent = Some(client_agent.into());
@@ -517,7 +521,7 @@ impl DirectProducer {
 
     /// The broker-registered id stamped on this producer's events.
     #[must_use]
-    pub fn producer_id(&self) -> ProducerId {
+    pub fn id(&self) -> ProducerId {
         self.producer_id
     }
 
@@ -968,7 +972,7 @@ impl DirectProducer {
         let Some(meta) = prepared.event.meta() else {
             return;
         };
-        let (Some(producer_id), Some(sequence)) = (meta.producer_id, meta.sequence) else {
+        let (Some(producer_id), Some(sequence)) = (meta.producer, meta.sequence) else {
             return;
         };
         let mut sequence_state = self
@@ -1031,7 +1035,7 @@ pub(super) fn advance_cursor(
     let Some(meta) = meta else {
         return;
     };
-    let (Some(producer_id), Some(sequence)) = (meta.producer_id, meta.sequence) else {
+    let (Some(producer_id), Some(sequence)) = (meta.producer, meta.sequence) else {
         return;
     };
     cursor.insert((ProducerId(producer_id), topic.to_owned()), sequence);
@@ -1046,13 +1050,13 @@ pub(super) fn producer_meta_for_last(
         ProducerMode::Stateless => None,
         ProducerMode::Monotonic => Some(EventMeta {
             version: 1,
-            producer_id: Some(producer_id.0),
+            producer: Some(producer_id.0),
             previous: None,
             sequence: Some(last + 1),
         }),
         ProducerMode::Chained => Some(EventMeta {
             version: 1,
-            producer_id: Some(producer_id.0),
+            producer: Some(producer_id.0),
             previous: Some(last),
             sequence: Some(last + 1),
         }),

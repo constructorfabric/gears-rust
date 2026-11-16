@@ -7,7 +7,7 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::api::EventBrokerApi;
-use crate::api::{BarrierMode, Filter, TenantTraversalDepth};
+use crate::api::{BarrierMode, Filter, InterestTenant, OwnershipFilter};
 use crate::error::EventBrokerError;
 use crate::sdk::EventBrokerSdk;
 
@@ -67,20 +67,23 @@ impl ConsumerOffsetManager for LocalDbOffsetManager {
 // ---- Builder ----
 
 pub struct ConsumerBuilder<M = ()> {
-    /// Consumer group the subscription joins; required before the consumer can start.
+    /// Consumer group the slots' subscriptions join; `None` joins a new anonymous group.
     pub(crate) group: Option<ConsumerGroupRef>,
     /// Topics to consume; kept in sync with `subscription_interests` when those are set.
     pub(crate) topics: Vec<GtsInstanceId>,
     /// Per-topic interests (tenant scope, type patterns, filter) sent on JOIN.
     pub(crate) subscription_interests: Vec<SubscriptionInterest>,
-    /// Root tenant whose events are consumed; `None` means the nil tenant id.
-    pub(crate) tenant_id: Option<Uuid>,
-    /// How far below `tenant_id` the tenant hierarchy is traversed.
-    pub(crate) tenant_depth: TenantTraversalDepth,
+    /// Tenant whose events are consumed; `Caller` lets the broker use the caller's
+    /// own tenant.
+    pub(crate) subject_tenant: InterestTenant,
+    /// Which of the tenant's events every interest reads.
+    pub(crate) ownership_filter: OwnershipFilter,
     /// Whether traversal stops at self-managed tenant boundaries.
     pub(crate) barrier_mode: BarrierMode,
     /// Event type patterns applied to every topic without an explicit interest.
     pub(crate) event_type_patterns: Vec<GtsIdPattern>,
+    /// Subject-type selector applied to every interest the consumer joins with.
+    pub(crate) subject_types: Vec<GtsIdPattern>,
     /// Number of parallel consumer workers (sessions) the runtime spawns.
     pub(crate) parallelism: u32,
     /// Client agent string reported to the broker on JOIN.
@@ -114,10 +117,11 @@ impl ConsumerBuilder<()> {
             group: None,
             topics: Vec::new(),
             subscription_interests: Vec::new(),
-            tenant_id: None,
-            tenant_depth: TenantTraversalDepth::CurrentTenant,
+            subject_tenant: InterestTenant::Caller,
+            ownership_filter: OwnershipFilter::OnlyMine,
             barrier_mode: BarrierMode::Respect,
             event_type_patterns: Vec::new(),
+            subject_types: Vec::new(),
             parallelism: 1,
             client_agent: EventBrokerSdk::default_client_agent().into(),
             session_timeout: Some(Duration::from_secs(60)),
@@ -138,10 +142,11 @@ impl ConsumerBuilder<()> {
             group: None,
             topics: Vec::new(),
             subscription_interests: Vec::new(),
-            tenant_id: None,
-            tenant_depth: TenantTraversalDepth::CurrentTenant,
+            subject_tenant: InterestTenant::Caller,
+            ownership_filter: OwnershipFilter::OnlyMine,
             barrier_mode: BarrierMode::Respect,
             event_type_patterns: Vec::new(),
+            subject_types: Vec::new(),
             parallelism: 1,
             client_agent: EventBrokerSdk::default_client_agent().into(),
             session_timeout: Some(Duration::from_secs(60)),
@@ -183,18 +188,20 @@ impl<M> ConsumerBuilder<M> {
             .collect();
         self
     }
-    pub fn tenant_id(mut self, id: Uuid) -> Self {
-        self.tenant_id = Some(id);
+    /// Tenant whose events are consumed. Defaults to the caller's own tenant, which
+    /// the broker resolves. A nil tenant is refused when the consumer joins, with
+    /// `InvalidConsumerOptions`, before the JOIN request is sent. Under
+    /// [`OwnershipFilter::OnlyMine`] the broker refuses a tenant other than the
+    /// caller's.
+    pub fn subject_tenant(mut self, id: Uuid) -> Self {
+        self.subject_tenant = InterestTenant::Tenant(id);
         self
     }
-    /// Tenant hierarchy traversal scope. Defaults to current tenant only.
-    pub fn tenant_depth(mut self, depth: TenantTraversalDepth) -> Self {
-        self.tenant_depth = depth;
-        self
-    }
-    /// Backward-compatible alias for tenant hierarchy traversal scope.
-    pub fn max_depth(mut self, depth: TenantTraversalDepth) -> Self {
-        self.tenant_depth = depth;
+    /// Which of the tenant's events the consumer reads. Default:
+    /// [`OwnershipFilter::OnlyMine`], the events addressed to the caller. Set
+    /// [`OwnershipFilter::EntireTenant`] to read unowned events.
+    pub fn ownership_filter(mut self, filter: OwnershipFilter) -> Self {
+        self.ownership_filter = filter;
         self
     }
     /// Whether to stop at self-managed tenant boundaries. Default: `BarrierMode::Respect`.
@@ -209,10 +216,30 @@ impl<M> ConsumerBuilder<M> {
         self.event_type_patterns.extend(pats);
         self
     }
+    /// Delivers only events whose `subject_type` matches one of `patterns`, on every
+    /// interest the consumer joins with. A delivery filter with no authorization
+    /// meaning: it never widens what the caller may read. At most 32 patterns.
+    pub fn subject_types<I>(mut self, patterns: I) -> Self
+    where
+        I: IntoIterator<Item = GtsIdPattern>,
+    {
+        self.subject_types.extend(patterns);
+        self
+    }
+    /// Number of slots the consumer runs, each with its own subscription. The slots
+    /// join the consumer's one group, which splits the topic's partitions between
+    /// them. Default: 1; `start()` refuses 0.
     pub fn parallelism(mut self, n: u32) -> Self {
         self.parallelism = n;
         self
     }
+    /// The client agent the consumer sends on JOIN, and when it creates its
+    /// default anonymous group (no `.group(..)`); the SDK's default unless set.
+    /// It follows the RFC 9110 User-Agent grammar in 1-256 printable-ASCII
+    /// bytes. The broker refuses a value outside it with `400` (reason
+    /// `ascii_only`, `field_too_long` or `user_agent_grammar`) when the consumer
+    /// creates its default anonymous group and on every JOIN; `start()` refuses it first with `InvalidTextField`, before
+    /// any broker call.
     pub fn client_agent(mut self, ua: impl Into<String>) -> Self {
         self.client_agent = ua.into();
         self
@@ -224,6 +251,9 @@ impl<M> ConsumerBuilder<M> {
         self.heartbeat_drop_threshold = k;
         self
     }
+    /// How long the broker keeps each slot's subscription after its stream closes; it is
+    /// kept alive while a stream is open. Default: 60 s. `start()` refuses a zero
+    /// duration with `InvalidConsumerOptions`, before any broker call.
     pub fn session_timeout(mut self, d: Duration) -> Self {
         self.session_timeout = Some(d);
         self
@@ -272,6 +302,9 @@ impl<M> ConsumerBuilder<M> {
         self.commit_mode = mode;
         self
     }
+    /// Sets the identity the consumer joins and reads as; the default is
+    /// `SecurityContext::anonymous()`. `start()` refuses a context with a nil subject
+    /// or a nil tenant unless it carries a bearer token (see `require_identity`).
     pub fn security_context(mut self, ctx: SecurityContext) -> Self {
         self.security_context = ctx;
         self
@@ -279,11 +312,69 @@ impl<M> ConsumerBuilder<M> {
 }
 
 impl<M> ConsumerBuilder<M> {
-    /// Resolves the profile plus overrides into validated settings.
+    /// Resolves the profile plus overrides into validated settings, and checks that
+    /// the consumer runs at least one slot with a valid client agent and a positive
+    /// session timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConsumerOptions` when the resolved settings are invalid, or
+    /// when `parallelism` is 0: a consumer with no slots would never join its group,
+    /// and an anonymous one would be created at start and left without members.
+    ///
+    /// Returns `InvalidTextField` naming `client_agent` when the client agent is
+    /// outside the RFC 9110 User-Agent contract: the broker refuses it on every JOIN,
+    /// and on the create of the default anonymous group (no `.group(..)`), so the
+    /// consumer could never consume.
+    ///
+    /// Returns `InvalidConsumerOptions` when `session_timeout` is zero: the broker refuses
+    /// it on every JOIN, so each slot would end at its first JOIN and an anonymous group
+    /// would be left without members.
     pub(crate) fn effective_settings(&self) -> Result<ConsumerSettings, EventBrokerError> {
         let settings = ConsumerSettings::resolve(self.profile.clone(), self.settings_overrides);
         settings.validate()?;
+        if self.parallelism < 1 {
+            return Err(EventBrokerError::InvalidConsumerOptions {
+                detail: "parallelism must be at least 1".to_owned(),
+            });
+        }
+        crate::validate::client_agent(&self.client_agent)
+            .map_err(|err| EventBrokerError::invalid_text_field(&err))?;
+        if self.session_timeout.is_some_and(|d| d.is_zero()) {
+            return Err(EventBrokerError::InvalidConsumerOptions {
+                detail: "session_timeout must be positive".to_owned(),
+            });
+        }
         Ok(settings)
+    }
+
+    /// The group the consumer joins: the one set with [`Self::group()`], else a new
+    /// anonymous group created with the consumer's client agent.
+    pub(crate) fn effective_group(&self) -> ConsumerGroupRef {
+        self.group
+            .clone()
+            .unwrap_or_else(|| ConsumerGroupRef::auto_anonymous(self.client_agent.clone()))
+    }
+
+    /// Checks that the security context identifies the caller. In process the broker
+    /// reads the subject and tenant ids; over REST a bearer token alone identifies it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConsumerOptions` when the subject or the tenant id is nil and
+    /// the context carries no bearer token.
+    pub fn require_identity(&self) -> Result<(), EventBrokerError> {
+        let ctx = &self.security_context;
+        if (ctx.subject_id().is_nil() || ctx.subject_tenant_id().is_nil())
+            && ctx.bearer_token().is_none()
+        {
+            return Err(EventBrokerError::InvalidConsumerOptions {
+                detail: "the consumer has no identity: set a security context with a subject \
+                         and a tenant, or one with a bearer token"
+                    .to_owned(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -297,10 +388,11 @@ impl ConsumerBuilder<()> {
             group: self.group,
             topics: self.topics,
             subscription_interests: self.subscription_interests,
-            tenant_id: self.tenant_id,
-            tenant_depth: self.tenant_depth,
+            subject_tenant: self.subject_tenant,
+            ownership_filter: self.ownership_filter,
             barrier_mode: self.barrier_mode,
             event_type_patterns: self.event_type_patterns,
+            subject_types: self.subject_types,
             parallelism: self.parallelism,
             client_agent: self.client_agent,
             heartbeat_drop_threshold: self.heartbeat_drop_threshold,
@@ -1050,11 +1142,33 @@ where
     M: CommitOffset + 'static,
     H: EventHandler<serde_json::Value> + 'static,
 {
+    /// Starts the consumer's slots and returns the handle that stops them.
+    ///
+    /// # Errors
+    ///
+    /// - `InvalidConsumerOptions` when the profile and its overrides resolve to invalid
+    ///   settings, when `parallelism` is 0, or when `session_timeout` is zero.
+    /// - `InvalidTextField` when `client_agent` is outside the RFC 9110 User-Agent
+    ///   contract (see [`ConsumerBuilder::client_agent`]).
+    /// - `InvalidConsumerOptions` when the security context does not identify the
+    ///   caller (see [`ConsumerBuilder::require_identity`]).
+    /// - `Internal` when the builder was made with `new_unbound()` and has no broker.
+    /// - The broker's error when it cannot list the event types.
+    /// - `InvalidConsumerOptions` when the group is a [`ConsumerGroupRef::Gts`]
+    ///   reference, and the broker's error when it cannot create the anonymous group.
     pub async fn start(self) -> Result<ConsumerHandle, EventBrokerError> {
         let consumer = Consumer::new_with_slots(self.builder, self.handler).await?;
         Ok(ConsumerHandle::from_consumer(consumer))
     }
 
+    /// Starts the consumer, waits for `cancel`, then stops it.
+    ///
+    /// # Errors
+    ///
+    /// - Every error of `start()` above, returned before the consumer runs.
+    /// - None once it runs: it returns `Ok(())` at `cancel`, since
+    ///   `ConsumerHandle::stop` returns no error and a slot whose run ends with an
+    ///   error does not end the wait.
     pub async fn run_blocking(
         self,
         cancel: tokio_util::sync::CancellationToken,
@@ -1070,11 +1184,33 @@ where
     M: CommitOffset + 'static,
     H: BatchHandler<serde_json::Value> + 'static,
 {
+    /// Starts the consumer's slots and returns the handle that stops them.
+    ///
+    /// # Errors
+    ///
+    /// - `InvalidConsumerOptions` when the profile and its overrides resolve to invalid
+    ///   settings, when `parallelism` is 0, or when `session_timeout` is zero.
+    /// - `InvalidTextField` when `client_agent` is outside the RFC 9110 User-Agent
+    ///   contract (see [`ConsumerBuilder::client_agent`]).
+    /// - `InvalidConsumerOptions` when the security context does not identify the
+    ///   caller (see [`ConsumerBuilder::require_identity`]).
+    /// - `Internal` when the builder was made with `new_unbound()` and has no broker.
+    /// - The broker's error when it cannot list the event types.
+    /// - `InvalidConsumerOptions` when the group is a [`ConsumerGroupRef::Gts`]
+    ///   reference, and the broker's error when it cannot create the anonymous group.
     pub async fn start(self) -> Result<ConsumerHandle, EventBrokerError> {
         let consumer = Consumer::new_with_batch_slots(self.builder, self.handler).await?;
         Ok(ConsumerHandle::from_consumer(consumer))
     }
 
+    /// Starts the consumer, waits for `cancel`, then stops it.
+    ///
+    /// # Errors
+    ///
+    /// - Every error of `start()` above, returned before the consumer runs.
+    /// - None once it runs: it returns `Ok(())` at `cancel`, since
+    ///   `ConsumerHandle::stop` returns no error and a slot whose run ends with an
+    ///   error does not end the wait.
     pub async fn run_blocking(
         self,
         cancel: tokio_util::sync::CancellationToken,
@@ -1091,6 +1227,20 @@ where
     M: CommitOffsetInTx + 'static,
     H: TxBatchHandler<serde_json::Value, M> + 'static,
 {
+    /// Starts the consumer's slots and returns the handle that stops them.
+    ///
+    /// # Errors
+    ///
+    /// - `InvalidConsumerOptions` when the profile and its overrides resolve to invalid
+    ///   settings, when `parallelism` is 0, or when `session_timeout` is zero.
+    /// - `InvalidTextField` when `client_agent` is outside the RFC 9110 User-Agent
+    ///   contract (see [`ConsumerBuilder::client_agent`]).
+    /// - `InvalidConsumerOptions` when the security context does not identify the
+    ///   caller (see [`ConsumerBuilder::require_identity`]).
+    /// - `Internal` when the builder was made with `new_unbound()` and has no broker.
+    /// - The broker's error when it cannot list the event types.
+    /// - `InvalidConsumerOptions` when the group is a [`ConsumerGroupRef::Gts`]
+    ///   reference, and the broker's error when it cannot create the anonymous group.
     pub async fn start(self) -> Result<ConsumerHandle, EventBrokerError> {
         let consumer = Consumer::new_with_tx_batch_slots(self.builder, self.handler).await?;
         Ok(ConsumerHandle::from_consumer(consumer))
@@ -1102,6 +1252,26 @@ where
     M: CommitOffset + 'static,
     H: EventHandler<serde_json::Value> + 'static,
 {
+    /// Starts the consumer's slots and returns the handle that stops them.
+    ///
+    /// # Errors
+    ///
+    /// - `InvalidConsumerOptions` when a route is refused: a typed route whose payload
+    ///   type id is no GTS type id, a consumer with no configured topic, a route on a
+    ///   topic the consumer is not subscribed to, or two routes for one topic and event
+    ///   type.
+    /// - `Internal` when the routes and their handlers differ in number, which only a
+    ///   broken builder invariant causes.
+    /// - `InvalidConsumerOptions` when the profile and its overrides resolve to invalid
+    ///   settings, when `parallelism` is 0, or when `session_timeout` is zero.
+    /// - `InvalidTextField` when `client_agent` is outside the RFC 9110 User-Agent
+    ///   contract (see [`ConsumerBuilder::client_agent`]).
+    /// - `InvalidConsumerOptions` when the security context does not identify the
+    ///   caller (see [`ConsumerBuilder::require_identity`]).
+    /// - `Internal` when the builder was made with `new_unbound()` and has no broker.
+    /// - The broker's error when it cannot list the event types.
+    /// - `InvalidConsumerOptions` when the group is a [`ConsumerGroupRef::Gts`]
+    ///   reference, and the broker's error when it cannot create the anonymous group.
     pub async fn start(self) -> Result<ConsumerHandle, EventBrokerError> {
         self.validate_routes()?;
         let default_handler = EventHandlerAdapter::new(self.default_handler);
@@ -1120,6 +1290,28 @@ impl<M> ConsumerRoutedReady<BrokerOnly<M>, NoDefaultHandler>
 where
     M: CommitOffset + 'static,
 {
+    /// Starts the consumer's slots and returns the handle that stops them.
+    ///
+    /// # Errors
+    ///
+    /// - `InvalidConsumerOptions` when a route is refused: a typed route whose payload
+    ///   type id is no GTS type id, a consumer with no configured topic, a route on a
+    ///   topic the consumer is not subscribed to, or two routes for one topic and event
+    ///   type.
+    /// - `InvalidConsumerOptions` when a configured topic has no catch-all route, since
+    ///   the consumer has no default handler.
+    /// - `Internal` when the routes and their handlers differ in number, which only a
+    ///   broken builder invariant causes.
+    /// - `InvalidConsumerOptions` when the profile and its overrides resolve to invalid
+    ///   settings, when `parallelism` is 0, or when `session_timeout` is zero.
+    /// - `InvalidTextField` when `client_agent` is outside the RFC 9110 User-Agent
+    ///   contract (see [`ConsumerBuilder::client_agent`]).
+    /// - `InvalidConsumerOptions` when the security context does not identify the
+    ///   caller (see [`ConsumerBuilder::require_identity`]).
+    /// - `Internal` when the builder was made with `new_unbound()` and has no broker.
+    /// - The broker's error when it cannot list the event types.
+    /// - `InvalidConsumerOptions` when the group is a [`ConsumerGroupRef::Gts`]
+    ///   reference, and the broker's error when it cannot create the anonymous group.
     pub async fn start(self) -> Result<ConsumerHandle, EventBrokerError> {
         self.validate_routes()?;
         let consumer =
@@ -1136,6 +1328,28 @@ impl<M> TxConsumerRoutedReady<M>
 where
     M: CommitOffsetInTx + 'static,
 {
+    /// Starts the consumer's slots and returns the handle that stops them.
+    ///
+    /// # Errors
+    ///
+    /// - `InvalidConsumerOptions` when a route is refused: a typed route whose payload
+    ///   type id is no GTS type id, a consumer with no configured topic, a route on a
+    ///   topic the consumer is not subscribed to, or two routes for one topic and event
+    ///   type.
+    /// - `InvalidConsumerOptions` when a configured topic has no catch-all route and the
+    ///   consumer has no default handler.
+    /// - `Internal` when the routes and their handlers differ in number, which only a
+    ///   broken builder invariant causes.
+    /// - `InvalidConsumerOptions` when the profile and its overrides resolve to invalid
+    ///   settings, when `parallelism` is 0, or when `session_timeout` is zero.
+    /// - `InvalidTextField` when `client_agent` is outside the RFC 9110 User-Agent
+    ///   contract (see [`ConsumerBuilder::client_agent`]).
+    /// - `InvalidConsumerOptions` when the security context does not identify the
+    ///   caller (see [`ConsumerBuilder::require_identity`]).
+    /// - `Internal` when the builder was made with `new_unbound()` and has no broker.
+    /// - The broker's error when it cannot list the event types.
+    /// - `InvalidConsumerOptions` when the group is a [`ConsumerGroupRef::Gts`]
+    ///   reference, and the broker's error when it cannot create the anonymous group.
     pub async fn start(self) -> Result<ConsumerHandle, EventBrokerError> {
         self.validate_routes()?;
         let consumer = Consumer::new_with_tx_routed_slots(
@@ -1155,11 +1369,33 @@ where
     M: CommitOffsetInTx + 'static,
     H: TxEventHandler<serde_json::Value, M> + 'static,
 {
+    /// Starts the consumer's slots and returns the handle that stops them.
+    ///
+    /// # Errors
+    ///
+    /// - `InvalidConsumerOptions` when the profile and its overrides resolve to invalid
+    ///   settings, when `parallelism` is 0, or when `session_timeout` is zero.
+    /// - `InvalidTextField` when `client_agent` is outside the RFC 9110 User-Agent
+    ///   contract (see [`ConsumerBuilder::client_agent`]).
+    /// - `InvalidConsumerOptions` when the security context does not identify the
+    ///   caller (see [`ConsumerBuilder::require_identity`]).
+    /// - `Internal` when the builder was made with `new_unbound()` and has no broker.
+    /// - The broker's error when it cannot list the event types.
+    /// - `InvalidConsumerOptions` when the group is a [`ConsumerGroupRef::Gts`]
+    ///   reference, and the broker's error when it cannot create the anonymous group.
     pub async fn start(self) -> Result<ConsumerHandle, EventBrokerError> {
         let consumer = Consumer::new_with_tx_slots(self.builder, self.handler).await?;
         Ok(ConsumerHandle::from_consumer(consumer))
     }
 
+    /// Starts the consumer, waits for `cancel`, then stops it.
+    ///
+    /// # Errors
+    ///
+    /// - Every error of `start()` above, returned before the consumer runs.
+    /// - None once it runs: it returns `Ok(())` at `cancel`, since
+    ///   `ConsumerHandle::stop` returns no error and a slot whose run ends with an
+    ///   error does not end the wait.
     pub async fn run_blocking(
         self,
         cancel: tokio_util::sync::CancellationToken,

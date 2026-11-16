@@ -20,7 +20,7 @@ servers:
 
 tags:
   - name: events
-    description: Producer-side event submission (single + batch) and consumer-side long-poll.
+    description: Producer-side event submission (single + batch) and consumer-side streaming (`:stream`, `:sse`).
   - name: producers
     description: Producer registration and idempotent-chain lifecycle.
   - name: topics
@@ -30,7 +30,7 @@ tags:
   - name: consumer-groups
     description: Consumer group registry (anonymous create path + read/list/delete).
   - name: subscriptions
-    description: Consumer subscription lifecycle — JOIN, poll, seek, leave.
+    description: Consumer subscription lifecycle - JOIN, seek, leave.
 
 paths:
 
@@ -95,18 +95,43 @@ paths:
               $ref: "#/components/headers/PreferenceApplied"
         "400":
           description: >-
-            Validation error (read-only/unknown field, malformed `trace_parent`,
-            a chained/monotonic mode invariant violated, etc.), the event's
+            Validation error (read-only/unknown field, `meta.ingest_tenant` and
+            `meta.ingest_actor` included, which only the broker stamps; malformed `trace_parent`,
+            a `meta` block its producer's mode does not admit
+            (`MetaWithoutProducerId`, `ChainModeFieldsMissing`,
+            `MonotonicModeFieldsViolation`) or a `meta.version` newer than the
+            broker supports (`UnknownMetaVersion`), etc.), the event's
             resolved partition key over 1024 bytes in its JSON string form
             (reason `partition_key_too_long`, field `events[0].partition_key`;
-            the key itself is not echoed), or a malformed `Prefer: wait` value
-            (not a non-negative whole number of seconds).
+            the key itself is not echoed), a malformed `Prefer: wait` value
+            (not a non-negative whole number of seconds), or `InvalidTenant`
+            (the event's `subject_tenant` is the nil UUID; refused before any
+            authorization), or `InvalidSubjectOwner` (the event's `subject_owner` is the
+            nil UUID; refused with it). An event type whose partition key is
+            `/subject_owner` refuses an event with no owner (`PartitionKeyUnresolved`),
+            after its `data` is validated (`422` first).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: >-
+            Unauthenticated - the API gateway refuses a missing or rejected bearer token
+            before the broker sees the request.
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
         "403":
-          description: Forbidden
+          description: >-
+            Forbidden. `TenantIdNotAuthorized` - the caller may not publish into
+            the event's `subject_tenant`: the tenant check (`produce` on the tenant
+            scope, rooted at the event's tenant, barriers respected) and the
+            barrier check (`produce_ignore_barrier` on the event type, same
+            root, barriers ignored) are both denied. `NotAuthorizedToProduce` -
+            the type check (`produce` on the event type, rooted at the caller's
+            own tenant) is denied. The body is the generic permission-denied
+            body naming the request resource; it does not carry the code.
           content:
             application/problem+json:
               schema:
@@ -122,7 +147,7 @@ paths:
             SequenceViolation - the event neither advances nor duplicates the
             producer chain's committed `last_sequence`. `context.resource_name`
             names the resolved topic; the `sequence_mismatch` violation's
-            `description` reads `index=0 producer_id=<id> topic=<topic>
+            `description` reads `index=0 producer=<id> topic=<topic>
             last_sequence=<n>`, the committed head last, so the producer can resync
             (re-read `GET /v1/producers/{id}/cursors`).
           content:
@@ -136,6 +161,8 @@ paths:
             `subject`, `trace_parent`, `type`) and before the event type is
             resolved. An `event_too_large` field violation on `events[0]`, whose
             description gives the measured bytes and the limit. Nothing is written.
+            Or Payload Too Large - the request body is over the request body limit
+            (api-gateway `defaults.body_limit_bytes`).
           content:
             application/problem+json:
               schema:
@@ -146,6 +173,15 @@ paths:
             `data_schema`. `context.resource_name` names the resolved topic and the
             `(payload)`/`schema_validation` field violation says what is wrong
             without echoing submitted content.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: >-
+            An internal error, answered with a generic body: for example an authorization
+            evaluation that failed (the PDP could not answer), or a tenant, barrier or
+            type check whose answer does not compile. Nothing is enqueued.
           content:
             application/problem+json:
               schema:
@@ -171,7 +207,7 @@ paths:
         a batch whose event types resolve to more than one topic is rejected.
 
         Events may carry several producer ids, and stateless events. The chained
-        and monotonic events are split into runs, one per `(producer_id, topic)`,
+        and monotonic events are split into runs, one per `(producer, topic)`,
         each keeping request order, and each run is checked against its chain's
         committed `last_sequence`: a chained run advances when its first event
         links to the head, is a duplicate prefix through the event whose
@@ -248,14 +284,42 @@ paths:
             checked before any chain state is read. An event whose resolved
             partition key is over 1024 bytes in its JSON string form is a
             `partition_key_too_long` field violation on
-            `events[<index>].partition_key`. A malformed `Prefer: wait` value
+            `events[<index>].partition_key`. An event whose `subject_tenant` is the nil
+            UUID is an `InvalidTenant` error, and one whose `subject_owner` is the
+            nil UUID an `InvalidSubjectOwner` error, each naming the event as
+            `event <index>: ...` and refused before any event is authorized. A
+            `meta.ingest_tenant` or `meta.ingest_actor` member is an unknown field
+            (`InvalidBody`): only the broker stamps them. An
+            event whose `meta` block breaks its producer's mode, or whose
+            `meta.version` is newer than the broker supports, is a
+            `MetaWithoutProducerId`, `ChainModeFieldsMissing`,
+            `MonotonicModeFieldsViolation` or `UnknownMetaVersion` error; the
+            detail does not name the event. A malformed `Prefer: wait` value
             (not a non-negative whole number of seconds) is also `400`.
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "401":
+          description: >-
+            Unauthenticated - the API gateway refuses a missing or rejected bearer token
+            before the broker sees the request.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
         "403":
-          description: Forbidden
+          description: >-
+            Forbidden. `TenantIdNotAuthorized` - the caller may not publish into
+            the event's `subject_tenant`: the tenant check (`produce` on the tenant
+            scope, rooted at the event's tenant, barriers respected) and the
+            barrier check (`produce_ignore_barrier` on the event type, same
+            root, barriers ignored) are both denied for an event of the batch.
+            `NotAuthorizedToProduce` - the type check (`produce` on the event
+            type, rooted at the caller's own tenant) is denied for an event of
+            the batch. Either refuses the whole batch. The body is the generic
+            permission-denied body naming the request resource; it does not
+            carry the code.
           content:
             application/problem+json:
               schema:
@@ -271,7 +335,7 @@ paths:
             SequenceViolation - atomic batch rejection: a run neither advances nor
             duplicates its chain's committed `last_sequence`. Nothing is enqueued.
             `context.resource_name` names the topic; the `sequence_mismatch`
-            violation's `description` reads `index=<n> producer_id=<id>
+            violation's `description` reads `index=<n> producer=<id>
             topic=<topic> last_sequence=<n>` - the position of the run's first
             event, its producer and topic, and the committed head, last.
           content:
@@ -284,13 +348,23 @@ paths:
             the configured max) or `batch.bytes` (total payload over the
             configured byte ceiling), or an `event_too_large` field violation on
             `events[<index>]` (an event's encoding over the 60 KiB per-event
-            limit). Nothing is enqueued.
+            limit), or Payload Too Large (the request body over the request body
+            limit, api-gateway `defaults.body_limit_bytes`). Nothing is enqueued.
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
         "422":
           description: SchemaViolation - an event's `data` does not satisfy its event type's `data_schema` (atomic batch rejection)
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: >-
+            An internal error, answered with a generic body: for example an authorization
+            evaluation that failed (the PDP could not answer), or a tenant, barrier or
+            type check whose answer does not compile. Nothing is enqueued.
           content:
             application/problem+json:
               schema:
@@ -311,7 +385,8 @@ paths:
       tags: [events]
       summary: Multipart event consumption (default transport)
       description: |
-        The single consumption endpoint for `multipart/mixed`-framed delivery.
+        The default consumption endpoint, framing delivery as `multipart/mixed`;
+        `/v1/events:sse` serves the same frame kinds as Server-Sent Events.
         Long-lived: the response stays open and emits frames as events arrive;
         heartbeat frames keep intermediaries from cutting idle connections.
         Wire format is `multipart/mixed; boundary=<...>` carried over
@@ -320,25 +395,56 @@ paths:
         `topology`, or `control`. See `features/0004-consumption-transport.md`.
 
         Frame shapes:
-        - `{ "kind": "event", "payload": { /* one EventEnvelope */ } }`
+        - `{ "kind": "event", "payload": { /* one event */ } }`: the payload is the event as
+          read (the `gts.cf.core.events.event.v1~` schema with its `readOnly` fields and no
+          `meta`); it carries no `topic`.
         - `{ "kind": "heartbeat", "at": "<iso8601>" }`
         - `{ "kind": "topology", "topology_version": <int>, "assigned": [{ "topic", "partition", "offset": <i64>, "last_examined": <i64> }] }`
           — the full current assignment snapshot; emitted once at open (baseline,
           the first frame) and again mid-stream, non-terminal, on a partition loss
           (subscription retains ≥1) or a `topology_version`-only change.
-        - `{ "kind": "control", "code": "progress" | "terminal", "positions": [{ "topic", "partition", "offset": <i64>, "last_examined": <i64> }] }`
-          — the cursor carrier. `code: "progress"` is a sparse mid-stream cursor
-          update. `code: "terminal"` carries the COMPLETE final positions as the
-          LAST frame on a gain / lose-all, after which the broker closes the stream
-          gracefully; the consumer commits the positions and re-JOINs. A `terminal`
-          frame MAY include an optional `reason` (`rebalanced | lose_all | teardown`).
-          A partition loss is NOT control-carried — it is an in-band `topology` frame.
+        - `{ "kind": "control", "code": "progress" | "terminal", "positions": [{ "topic", "partition", "offset": <i64>, "last_examined": <i64> }], "reason": "rebalanced" | "lose_all" | "teardown" }`
+          is the position carrier. `code: "progress"` is a non-terminal mid-stream report
+          of the partitions whose filter rejected at least the drift threshold of events
+          since they last reported; it carries no `reason`. `code: "terminal"` is the LAST
+          frame of the stream and always carries a `reason`, with the final positions of
+          every partition the stream was reading when it ended: on a gain
+          (`"rebalanced"`), on a lose-all (`"lose_all"`) or when the broker tears the
+          stream down (`"teardown"`, see below). The broker then closes the stream
+          gracefully; a non-transactional SDK consumer records each partition's
+          `last_examined` in its offset store (a transactional one only traces the
+          positions), and every SDK consumer re-JOINs. A partition loss is NOT
+          control-carried - it is an in-band `topology` frame.
 
         Cursor seed/advance is via `POST /v1/subscriptions/{id}:seek` (pre-stream
         only) — this stream endpoint is delivery-only. Browser consumers wanting
         Server-Sent Events use `/v1/events:sse` instead.
+
+        Opening checks, in order: the caller's identity (a caller whose subject or tenant
+        id is the nil UUID answers `403 TenantIdNotAuthorized` before any read or PDP
+        call); the subscription (`404 SubscriptionNotFound` when it is not a group member)
+        and the caller's right to consume as its tenant (`403 TenantIdNotAuthorized`); the
+        joiner (`403 SubscriptionNotOwned` when the caller is not the principal that joined
+        the subscription); the consumer group (`404 ConsumerGroupNotFound` when it is no
+        longer registered) and the policy's `consume` on it (`403 ConsumerGroupNotAuthorized`
+        when refused, `500` when its answer does not compile or its evaluation fails); the
+        cursors (`409 PositionsNotSet`); the stream lease (`409 StreamingInProgress`);
+        then the member's consume scope. The open reuses the scope the member holds when
+        it was evaluated for the same principal and none of its interest groups has
+        expired. Otherwise it evaluates each interest group as JOIN does, one after
+        another, and reuses a barrier-right or consume-scope answer that JOIN or an
+        earlier open got within `streaming.authz_scope_ttl_secs` (default 60): a reused
+        barrier right skips that question, and a reused consume scope skips both the
+        consume scope and the tenant check. No exact-selector check runs at open.
+
+        An open stream ends with a `terminal` control frame whose `reason` is `teardown`
+        when the member's consume scope is cleared (for example, a renewal of an interest
+        group is refused, or the member is gone) or expires (it reaches the end of its
+        window without a renewal), when reads stay unanswerable for longer than the
+        broker's tolerance, or when deciding a batch of events fails (for example, the
+        authorization decision cannot be made).
       parameters:
-        - name: subscription_id
+        - name: subscription
           in: query
           required: true
           schema: { type: string, format: uuid }
@@ -354,15 +460,42 @@ paths:
                 type: string
         "400":
           description: >-
-            Invalid Argument - a missing or invalid `subscription_id`, or an
-            unrecognised query parameter. Only `subscription_id` is recognised; a
+            Invalid Argument - a missing or invalid `subscription`, or an
+            unrecognised query parameter. Only `subscription` is recognised; a
             legacy `timeout`/`collect` parameter is rejected, not ignored.
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "401":
+          description: >-
+            Unauthenticated - the API gateway refuses a missing or rejected bearer token
+            before the broker sees the request.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: |
+            `TenantIdNotAuthorized`: the caller's subject or tenant id is the nil UUID, or
+            the caller may not consume as the subscription's tenant. When the open evaluates
+            an interest group, the codes JOIN answers for a refused barrier right or consume
+            scope: `TenantIdNotAuthorized` or `TopicNotAuthorized`.
+            `SubscriptionNotOwned`: the caller is not the principal that joined the
+            subscription. `ConsumerGroupNotAuthorized`: the policy refuses `consume` on the
+            subscription's consumer group.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
         "404":
-          description: SubscriptionNotFound — consumer must re-JOIN with a new subscription.
+          description: >-
+            SubscriptionNotFound - the subscription is not a group member, or its member
+            left the group while the stream was opening (for example reaped after an open
+            that outlasted the member's `join_timeout`); the consumer must re-JOIN with a
+            new subscription.
+            `ConsumerGroupNotFound` - the subscription's consumer group is no longer
+            registered.
           content:
             application/problem+json:
               schema:
@@ -378,24 +511,49 @@ paths:
         "409":
           description: |
             Two `code`s, distinguished in the body:
-            `PositionsNotSet` — one or more assigned `(topic, partition)` pairs have
+            `PositionsNotSet` - one or more assigned `(topic, partition)` pairs have
             no committed cursor for the subscription's group; the consumer SHALL
             SEEK the listed partitions via `POST /v1/subscriptions/{id}:seek` and
-            retry (`{ unseeded: [{topic, partition}, ...], recovery_hint: "..." }`).
+            retry. The body carries one `positions_not_set` violation per unseeded
+            partition, with `subject` `<topic>:<partition>` and `description` "call POST
+            /v1/subscriptions/<subscription-id>:seek before re-opening the stream".
             A well-behaved SDK seeds positions before opening the stream and should
             not normally observe this.
-            `StreamingInProgress` — a stream is already open on this `subscription_id`
-            (a second `:stream`, or any non-DELETE call on a streaming subscription);
-            the existing stream is unaffected.
+            `StreamingInProgress` - a stream is already open on this subscription:
+            a second `:stream` or `:sse` open is refused, and so is a SEEK; a read or a
+            LEAVE of the subscription is served. The existing stream is unaffected.
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
         "410":
           description: |
-            SubscriptionTerminated — the `subscription_id` has already terminated
+            SubscriptionTerminated - the subscription has already terminated
             (gain, lose-all, LEAVE/DELETE, or lease expiry). Returned on any reuse
-            of a terminated id; the consumer re-JOINs for a new subscription.
+            of a terminated id (not yet answered, tracked in #5977; see
+            "Topology-Change Handling (Rebalance)" in `features/0004-consumption-transport.md`
+            for what a reused id answers today); the consumer re-JOINs for a new
+            subscription.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: >-
+            An internal error, answered with a generic body: for example an authorization
+            evaluation that failed, a tenant-check answer (the caller's right to consume as
+            the subscription's tenant) that does not compile, a group-check answer (the
+            policy's `consume` on the consumer group) that does not compile, or a member scope
+            that another writer replaced twice while the stream was opening.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: >-
+            ServiceUnavailable, retryable - the broker's database is unavailable: the consumer
+            group read, a cursor read, or the event-type candidate query of an interest group the
+            open evaluates.
           content:
             application/problem+json:
               schema:
@@ -404,16 +562,18 @@ paths:
   /v1/events:sse:
     get:
       tags: [events]
-      summary: Server-Sent Events consumption (opt-in)
+      summary: Server-Sent Events consumption
       description: |
         Browser-native `text/event-stream` consumption endpoint. Same frame
         kinds as `/v1/events:stream` (`event | heartbeat | topology | control`),
         but framed as SSE events with the `event:` line carrying the kind and
-        the JSON payload on a `data:` line. Reconnect resume uses `cursor.offset`
-        (not `Last-Event-ID`). Disabled by default in v1; enabled via deployment
-        configuration. See `features/0004-consumption-transport.md`.
+        the JSON payload on a `data:` line. A reopened stream starts each assigned
+        partition at the group cursor the last SEEK set (`POST /v1/subscriptions/{id}:seek`),
+        not at SSE's `Last-Event-ID`. Disabled by default in v1; enabled via deployment
+        configuration (not yet implemented, tracked in #5984). See
+        `features/0004-consumption-transport.md`.
       parameters:
-        - name: subscription_id
+        - name: subscription
           in: query
           required: true
           schema: { type: string, format: uuid }
@@ -424,21 +584,67 @@ paths:
             text/event-stream: {}
         "400":
           description: >-
-            Invalid Argument - a missing or invalid `subscription_id`, or an
-            unrecognised query parameter. Only `subscription_id` is recognised; a
+            Invalid Argument - a missing or invalid `subscription`, or an
+            unrecognised query parameter. Only `subscription` is recognised; a
             legacy `timeout`/`collect` parameter is rejected, not ignored.
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "401":
+          description: As `/v1/events:stream`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: As `/v1/events:stream`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
         "404":
-          description: SubscriptionNotFound (or transport disabled in deployment)
+          description: >-
+            SubscriptionNotFound or ConsumerGroupNotFound, as `/v1/events:stream`; or the
+            transport is disabled in deployment (not yet implemented, tracked in #5984).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "406":
+          description: >-
+            Not Acceptable. The client's `Accept` header excludes `text/event-stream`; the
+            `detail` names the media type this endpoint serves.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "409":
+          description: >-
+            As `/v1/events:stream`: `PositionsNotSet` (an assigned partition has no
+            committed cursor) or `StreamingInProgress` (a stream is already open on this
+            subscription).
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
         "410":
-          description: SubscriptionTerminated — consumer must re-JOIN
+          description: >-
+            SubscriptionTerminated - the consumer must re-JOIN (not yet answered, tracked in
+            #5977; see "Topology-Change Handling (Rebalance)" in
+            `features/0004-consumption-transport.md` for what a reused id answers today).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: As `/v1/events:stream`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: As `/v1/events:stream`.
           content:
             application/problem+json:
               schema:
@@ -447,12 +653,12 @@ paths:
   /v1/producers:
     post:
       tags: [producers]
-      summary: Register a producer and obtain a broker-minted producer_id
+      summary: Register a producer and obtain a broker-minted producer id
       description: |
-        Mints a `producer_id` (UUID) bound to the calling principal. The `mode` field
+        Mints a producer `id` (UUID) bound to the calling principal. The `mode` field
         determines the dedup protocol: `chained` (chain-linked sequence) or `monotonic`
         (monotonically increasing sequence). Stateless producers do not register.
-        Re-registration mints a fresh `producer_id`; the broker does NOT reuse prior ids.
+        Re-registration mints a fresh producer `id`; the broker does NOT reuse prior ids.
         A `client_agent` (RFC 9110 User-Agent grammar) is required and immutable; the broker
         persists it on the producer row and echoes it on registration, cursor, and reset
         responses (per ADR-0004).
@@ -501,13 +707,70 @@ paths:
                     type: string
                     description: Echoed client_agent from the request (immutable).
         "400":
-          description: InvalidMode — mode is not chained or monotonic
+          description: >-
+            Invalid Argument - a `client_agent` that is not printable ASCII, is
+            empty or over 256 bytes, or breaks the RFC 9110 User-Agent grammar
+            (a field violation naming `client_agent`, reason `ascii_only`,
+            `field_too_long` or `user_agent_grammar`). A body that is not valid JSON
+            answers a generic `400` (an `about:blank` problem naming no field). A missing,
+            unknown or mistyped field, an unknown `mode` included, answers `422`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: >-
+            Unauthenticated - the API gateway refuses a missing or rejected bearer token
+            before the broker sees the request.
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
         "403":
-          description: Forbidden
+          description: >-
+            Forbidden. `TenantIdNotAuthorized` - the tenant check (`produce` on the tenant
+            scope, rooted at the caller's own tenant, barriers respected) is denied; asked
+            after the `400` checks and before the producer is written.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "413":
+          description: >-
+            Payload Too Large - the request body is over the request body limit (api-gateway
+            `defaults.body_limit_bytes`).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "415":
+          description: >-
+            Unsupported Media Type - the request `Content-Type` is missing or is not a JSON media
+            type (`application/json` or an `application/<subtype>+json` type).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "422":
+          description: >-
+            Unprocessable Entity - the body is valid JSON but does not fit the request shape:
+            a missing, unknown or mistyped field, or an unknown `mode` value.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: >-
+            An internal error, answered with a generic body: for example the tenant check's
+            evaluation failed (the PDP could not answer) or its answer does not compile.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: >-
+            ServiceUnavailable, retryable - the broker's database is unavailable: the producer
+            insert.
           content:
             application/problem+json:
               schema:
@@ -526,9 +789,9 @@ paths:
       description: |
         Returns the broker's known `last_sequence` of the producer's chain on each topic
         it has published to, for desync recovery. The chain is kept per
-        `(producer_id, topic)`; no partition is part of it (ADR-0004 "Chain Scope"). Principal-bound — only the registering principal may
+        `(producer, topic)`; no partition is part of it (ADR-0004 "Chain Scope"). Principal-bound - only the registering principal may
         call this. `topics` is empty if the producer has not yet published any events. The
-        response is an object (not a bare array) so it carries the echoed `producer_id` /
+        response is an object (not a bare array) so it carries the echoed `id` /
         `client_agent` and stays extensible.
       responses:
         "200":
@@ -537,10 +800,10 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [producer_id, client_agent, topics]
+                required: [id, client_agent, topics]
                 additionalProperties: false
                 properties:
-                  producer_id: { type: string, format: uuid }
+                  id: { type: string, format: uuid }
                   client_agent:
                     type: string
                     description: Echoed producer client_agent (per ADR-0004).
@@ -554,14 +817,42 @@ paths:
                       properties:
                         topic: { type: string }
                         last_sequence: { type: integer, format: int64, minimum: 0 }
+        "401":
+          description: >-
+            Unauthenticated - the API gateway refuses a missing or rejected bearer token
+            before the broker sees the request.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
         "403":
-          description: Forbidden — calling principal does not own this producer_id
+          description: >-
+            Forbidden. After the `404`: `TenantIdNotAuthorized` - the tenant check (`produce`
+            on the tenant scope, rooted at the producer's tenant, barriers respected) is
+            denied; then `ProducerNotOwned` - the calling principal does not own this
+            producer.
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
         "404":
           description: ProducerNotFound
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: >-
+            An internal error, answered with a generic body: for example the tenant check's
+            evaluation failed (the PDP could not answer) or its answer does not compile.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: >-
+            ServiceUnavailable, retryable - the broker's database is unavailable: the producer read,
+            or the producer cursor read.
           content:
             application/problem+json:
               schema:
@@ -594,8 +885,29 @@ paths:
       responses:
         "200":
           description: Reset applied; audit record emitted
+        "400":
+          description: >-
+            Invalid Argument - the path segment is not `<producer-id>:reset` (`InvalidPath`),
+            or a non-empty body that is not valid JSON or does not fit the request shape, an
+            unknown field included (`InvalidBody`). Nothing is reset.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: >-
+            Unauthenticated - the API gateway refuses a missing or rejected bearer token
+            before the broker sees the request.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
         "403":
-          description: Forbidden — calling principal does not own this producer_id
+          description: >-
+            Forbidden. After the `404`: `TenantIdNotAuthorized` - the tenant check (`produce`
+            on the tenant scope, rooted at the producer's tenant, barriers respected) is
+            denied; then `ProducerNotOwned` - the calling principal does not own this
+            producer.
           content:
             application/problem+json:
               schema:
@@ -606,14 +918,42 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "413":
+          description: >-
+            Payload Too Large - the request body is over the request body limit (api-gateway
+            `defaults.body_limit_bytes`).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: >-
+            An internal error, answered with a generic body: for example the tenant check's
+            evaluation failed (the PDP could not answer) or its answer does not compile.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: >-
+            ServiceUnavailable, retryable - the broker's database is unavailable: the producer read,
+            or the producer chain delete.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
 
   /v1/topics:
     get:
       tags: [topics]
       summary: List topics visible to the caller
       description: |
-        Returns a paginated, filterable list of topics. To retrieve a single topic by its
-        GTS identifier use `$filter=id eq '<gts-id>'`. No `GET /v1/topics/{id}` path exists.
+        Returns a paginated, filterable list of the topics the caller may read: it may
+        consume the topic, or publish one of its event types, in its own tenant (producers
+        read specs to validate; consumers may read them too, for example for code
+        generation). `$filter` applies first; a topic the caller may not read is left out,
+        with no error. To retrieve a single topic by its GTS identifier use
+        `$filter=id eq '<gts-id>'`. No `GET /v1/topics/{id}` path exists.
         Items are `Topic` DTOs projected from each topic's registered instance. Topics are
         registered in `types_registry` by their owning gear - no creation path exists in the
         REST API.
@@ -653,6 +993,31 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "401":
+          description: >-
+            Unauthenticated - the API gateway refuses a missing or rejected bearer token
+            before the broker sees the request.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: >-
+            An internal error, answered with a generic body: for example a read check
+            whose evaluation failed (the PDP could not answer). A check that is denied or
+            whose answer does not compile only leaves the item out.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: >-
+            ServiceUnavailable, retryable - the broker's database is unavailable: the topic list
+            read, or a topic's event type read.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
 
   /v1/topics/segments:
     get:
@@ -663,7 +1028,10 @@ paths:
         Backend-specific in shape; consumers treat `segments[]` entries as opaque
         except for the documented envelope. See
         `features/0003-topic-segment-introspection.md` for use cases and pagination
-        semantics.
+        semantics. The caller must be able to read the topic (consume it, or publish one of
+        its event types, in its own tenant); a caller that may not gets `403
+        TopicNotAuthorized` before the topic is looked up, so it cannot tell a registered
+        topic from a missing one.
       parameters:
         - name: topic
           in: query
@@ -707,8 +1075,42 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "401":
+          description: >-
+            Unauthenticated - the API gateway refuses a missing or rejected bearer token
+            before the broker sees the request.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: >-
+            TopicNotAuthorized - the caller may neither consume the topic nor publish any of
+            its event types in its own tenant (a check that is denied or whose answer does
+            not compile). Answered before the topic lookup.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
         "404":
           description: TopicNotFound
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: >-
+            An internal error, answered with a generic body: for example the read check's
+            evaluation failed (the PDP could not answer).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: >-
+            ServiceUnavailable, retryable - the broker's database or the topic's storage backend is
+            unavailable: the topic's event type read, the topic lookup, or the segment read on the
+            backend.
           content:
             application/problem+json:
               schema:
@@ -719,7 +1121,9 @@ paths:
       tags: [event-types]
       summary: List event types visible to the caller
       description: |
-        Returns a paginated, filterable list of event types. Event types are registered
+        Returns a paginated, filterable list of the event types the caller may read: it may
+        consume the type's topic, or publish the type, in its own tenant. `$filter` applies
+        first; a type the caller may not read is left out, with no error. Event types are registered
         via the in-process SDK and types_registry — no creation path exists in the REST API.
         To retrieve a single event type by GTS id use `$filter=id eq '<gts-id>'`. Items are
         `EventType` DTOs projected from each event type's registered type schema, `data_schema`
@@ -760,6 +1164,23 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "401":
+          description: >-
+            Unauthenticated - the API gateway refuses a missing or rejected bearer token
+            before the broker sees the request.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: >-
+            An internal error, answered with a generic body: for example a read check
+            whose evaluation failed (the PDP could not answer). A check that is denied or
+            whose answer does not compile only leaves the item out.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
         "503":
           description: >-
             ServiceUnavailable, retryable - the specification store is unavailable, or
@@ -778,6 +1199,8 @@ paths:
         body MUST NOT carry an `id`. The minted identifier is returned in the
         response body and the `Location` header. Caller distributes it to its
         consumer fleet via its own coordination mechanism (DB, ConfigMap, env var).
+        Only the principal that created the group (its subject, in its tenant) may JOIN it
+        (`403 ConsumerGroupNotOwned`), so the fleet runs as that principal.
       requestBody:
         required: false
         content:
@@ -795,8 +1218,56 @@ paths:
             application/json:
               schema:
                 $ref: "./schemas/gts.cf.core.events.consumer_group.v1~.schema.json"
+        "400":
+          description: >-
+            Invalid Argument - a non-empty body that is not valid JSON or does not fit the
+            request shape, a missing `client_agent` or an unknown or mistyped field included
+            (`InvalidBody`); or a `client_agent` or `description` that is not printable ASCII
+            within its byte length, or a `client_agent` that breaks the RFC 9110 User-Agent
+            grammar (a field violation naming the field). No group is created.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: >-
+            Unauthenticated - the API gateway refuses a missing or rejected bearer token
+            before the broker sees the request.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
         "403":
-          description: Forbidden (caller lacks `consumer_group:define` permission)
+          description: >-
+            `TenantIdNotAuthorized` when the caller's subject or tenant id is the nil UUID,
+            answered after the body checks (`400`) and before the PDP call;
+            `ConsumerGroupNotAuthorized` when the caller lacks `consumer_group:define`
+            permission. No group is created.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "413":
+          description: >-
+            Payload Too Large - the request body is over the request body limit (api-gateway
+            `defaults.body_limit_bytes`).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: >-
+            An internal error, answered with a generic body: for example an authorization
+            evaluation that failed (the PDP could not answer), or a define-check answer (the
+            caller's `consumer_group:define` permission) that does not compile.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: >-
+            ServiceUnavailable, retryable - the broker's database is unavailable: the consumer group
+            insert.
           content:
             application/problem+json:
               schema:
@@ -804,6 +1275,10 @@ paths:
     get:
       tags: [consumer-groups]
       summary: List consumer groups visible to the caller
+      description: >-
+        The list holds only the consumer groups the caller may consume: the anonymous
+        groups of the tenants it may consume as, and the named groups whose group check
+        (the policy's `consume` on the group) allows it.
       parameters:
         - name: $filter
           in: query
@@ -834,6 +1309,39 @@ paths:
                       $ref: "./schemas/gts.cf.core.events.consumer_group.v1~.schema.json"
                   page_info:
                     $ref: "#/components/schemas/PageInfo"
+        "401":
+          description: >-
+            Unauthenticated - the API gateway refuses a missing or rejected bearer token
+            before the broker sees the request.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: >-
+            `TenantIdNotAuthorized` when the caller's subject or tenant id is the nil UUID,
+            answered before any read or PDP call.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: >-
+            An internal error, answered with a generic body: for example an authorization
+            evaluation that failed (the PDP could not answer), or a tenant-check answer (the
+            caller's right to consume as an anonymous group's tenant) that does not compile.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: >-
+            ServiceUnavailable, retryable - the broker's database is unavailable: the consumer group
+            list read.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
 
   /v1/consumer-groups/{id}:
     parameters:
@@ -852,8 +1360,29 @@ paths:
             application/json:
               schema:
                 $ref: "./schemas/gts.cf.core.events.consumer_group.v1~.schema.json"
+        "400":
+          description: >-
+            Invalid Argument - the `id` is not a valid GTS instance identifier: a field
+            violation on `consumer_group` (reason `invalid_event_field`) that carries no part
+            of the value. Answered before the named-group check, the group read and any
+            authorization check.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: >-
+            Unauthenticated - the API gateway refuses a missing or rejected bearer token
+            before the broker sees the request.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
         "403":
-          description: Forbidden
+          description: >-
+            `TenantIdNotAuthorized` when the caller's subject or tenant id is the nil UUID
+            (answered before any read or PDP call), or when the PDP denies the caller
+            `consume` as the group's tenant.
           content:
             application/problem+json:
               schema:
@@ -864,15 +1393,65 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "500":
+          description: >-
+            An internal error, answered with a generic body: for example an authorization
+            evaluation that failed (the PDP could not answer), or a tenant-check answer (the
+            caller's right to consume as the group's tenant) that does not compile.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "501":
+          description: >-
+            Unimplemented - the `id` is a named consumer group (a valid consumer-group id
+            whose suffix is not a UUID); named groups are not yet implemented, tracked in
+            #5702. Answered before the group is read or any authorization check.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: >-
+            ServiceUnavailable, retryable - the broker's database is unavailable: the consumer group
+            read.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
     delete:
       tags: [consumer-groups]
       summary: Remove a consumer group from the registry
-      description: Allowed only when there are no active members (cache state empty for this group).
+      description: >-
+        Allowed only when the group has no active members; a member whose stream closed
+        still counts until its `session_timeout` ends.
       responses:
         "204":
           description: Deleted
+        "400":
+          description: >-
+            Invalid Argument - the `id` is not a valid GTS instance identifier: a field
+            violation on `consumer_group` (reason `invalid_event_field`) that carries no part
+            of the value. Answered before the named-group check, the group read and any
+            authorization check.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: >-
+            Unauthenticated - the API gateway refuses a missing or rejected bearer token
+            before the broker sees the request.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
         "403":
-          description: Forbidden
+          description: >-
+            `TenantIdNotAuthorized` when the caller's subject or tenant id is the nil UUID
+            (answered before any read or PDP call), or when the PDP denies the caller `manage`
+            as the group's tenant; then `ConsumerGroupNotOwned` when the caller is not the
+            principal that created the group (its subject, in its tenant).
           content:
             application/problem+json:
               schema:
@@ -889,6 +1468,32 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "500":
+          description: >-
+            An internal error, answered with a generic body: for example an authorization
+            evaluation that failed (the PDP could not answer), or a tenant-check answer (the
+            caller's right to manage as the group's tenant) that does not compile.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "501":
+          description: >-
+            Unimplemented - the `id` is a named consumer group (a valid consumer-group id
+            whose suffix is not a UUID); named groups are not yet implemented, tracked in
+            #5702. Answered before the group is read or any authorization check.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: >-
+            ServiceUnavailable, retryable - the broker's database is unavailable: the consumer group
+            read, or the consumer group delete.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
 
   /v1/subscriptions:
     get:
@@ -897,6 +1502,7 @@ paths:
       description: >-
         Ordered newest-first by `created_at` descending, with `id` as a stable
         tiebreaker, so a freshly created subscription is on the first page.
+        The list holds only the subscriptions of the tenants the caller may consume as.
       parameters:
         - name: $filter
           in: query
@@ -933,16 +1539,96 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "401":
+          description: >-
+            Unauthenticated - the API gateway refuses a missing or rejected bearer token
+            before the broker sees the request.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: >-
+            `TenantIdNotAuthorized` when the caller's subject or tenant id is the nil UUID,
+            answered before any read or PDP call. A tenant the caller may not consume as
+            does not refuse the list: its subscriptions are left out.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: >-
+            An internal error, answered with a generic body: for example an authorization
+            evaluation that failed (the PDP could not answer), or a tenant-check answer (the
+            caller's right to consume as a subscription's tenant) that does not compile.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
     post:
       tags: [subscriptions]
       summary: JOIN — register a subscription against a consumer group
       description: |
-        Creates a subscription with one or more typed-filter `interests[]` entries. Each
-        interest is topic-anchored, declares event-type patterns scoped to that topic, and
-        optionally carries an engine-typed `filter { engine, expression }` object. See
+        Creates a subscription with one or more typed-filter `interests[]` entries (at
+        least one not yet enforced, tracked in #5978). Each interest is
+        topic-anchored, declares event-type patterns scoped to that topic, and optionally
+        carries an engine-typed `filter { engine, expression }` object. See
         `ADR/0005-subscription-filter-typing.md` and
-        `features/0002-consumer-subscription-lifecycle.md`. Subject to per-tenant rate cap
-        (default 60/min).
+        `features/0002-consumer-subscription-lifecycle.md`.
+
+        An interest may also carry `subject_types`: 1-32 GTS type patterns matched against
+        the event's `subject_type`. It is a delivery filter, not an access grant; absent or
+        `[]` means no selector.
+
+        An interest reads one tenant, `subject_tenant` (optional, the caller's own tenant
+        by default), with an `ownership_filter` (optional, `only_mine` by default; both
+        are echoed):
+        - `only_mine`: events of the caller's own tenant whose `subject_owner` is the
+          caller; an event with no `subject_owner` never matches. The interest's
+          `subject_tenant` must be the caller's tenant (`400 InvalidTenant`), and its
+          `barrier_mode` has no effect.
+        - `entire_tenant`: every event whose `subject_tenant` is the interest's tenant.
+        - `tenant_subtree_included`: the interest's tenant and the tenants below it, as far
+          as the consume scope reaches.
+        Every event is also gated by the caller's consume scope. `max_depth` is no longer
+        accepted (`400 InvalidBody`), and a `tenant_id` field is an unknown field (`422`).
+
+        Checks run in this order; a refused JOIN creates nothing:
+        1. Request parsing, in the handler. A body that is not valid JSON answers `400`; a
+           missing, unknown or mistyped field answers `422` (an unknown `barrier_mode`, and
+           a `filter` object without `engine` or `expression`, included). Then
+           `client_agent`, `session_timeout` and the `consumer_group` id (`400`); a named
+           consumer group answers `501`; then each interest's `max_depth` (refused when
+           present), topic id, `types` and `subject_types` pattern syntax and `filter.engine`
+           id (`400`).
+        2. The caller's identity, in the domain: a caller whose subject or tenant id is the
+           nil UUID answers `403 TenantIdNotAuthorized`. A bearer token does not exempt it.
+        3. The limits, in the domain: the interest count (`400 TooManyInterests`), then per
+           interest its `types` count (`TooManyTypes`), its `subject_types` count
+           (`TooManySubjectTypes`) and its tenant (`InvalidTenant`: the nil UUID, or a
+           tenant other than the caller's under `only_mine`). No read and no PDP call
+           happen before steps 2 and 3.
+        4. The consumer group (`404 ConsumerGroupNotFound`), then the creator check: only the
+           principal that created the anonymous group (its subject, in its tenant) may JOIN
+           it (`403 ConsumerGroupNotOwned`, asked before any PDP call); then the group check,
+           the policy's `consume` on the group (`403 ConsumerGroupNotAuthorized`).
+        5. Each `types` entry can match some event type (`400 BadTypePattern`).
+        6. Per interest group (the interests sharing a topic and a tenant context: the
+           caller's tenant, root only, barriers respected for `only_mine`; the interest's
+           tenant, root only for `entire_tenant` or with its subtree for
+           `tenant_subtree_included`, in the interest's barrier mode), the
+           PDP is asked for the barrier right (`consume_ignore_barrier` on the topic) when the
+           group's `barrier_mode` is `ignore`, then for the consume scope over the topic's
+           registered event types, and, only when that scope is refused, for the tenant check
+           that picks the refusal's code (see `403`). The first refused group ends the JOIN.
+        7. Once every group is allowed, each exact `types` and `subject_types` entry is
+           checked against its group's scope (`403 EventTypeNotAuthorized`,
+           `SubjectTypeNotAuthorized`).
+        8. Each interest's topic is registered (`404 TopicNotFound`).
+
+        A `types` entry that matches no registered event type does not fail the JOIN: the
+        `201` body lists it in that interest's `unmatched_types`. Events of such a type are
+        delivered once the type registers and the caller's consume scope admits it.
       requestBody:
         required: true
         content:
@@ -951,23 +1637,31 @@ paths:
               $ref: "./schemas/gts.cf.core.events.subscription.v1~.schema.json"
       responses:
         "201":
-          description: Subscription created; assignment computed
+          description: >-
+            Subscription created; assignment computed. Each interest carries
+            `unmatched_types`; a read or a listing of the subscription does not.
           content:
             application/json:
               schema:
-                $ref: "./schemas/gts.cf.core.events.subscription.v1~.schema.json"
+                $ref: "#/components/schemas/JoinSubscriptionResponse"
         "400":
           description: |
-            Validation error. Common codes:
-            `BadRequest` (missing required field, or a `filter` object missing `engine` or
-            `expression`),
-            `BadTypePattern` (pattern violates GTS spec §10 wildcard rules — wildcard not at
-            segment boundary, mid-pattern wildcard, multiple wildcards, substring within segment),
-            `NoTypesMatched` (a `types[]` pattern resolved to zero registered types under the
-            declared topic),
+            A body that is not valid JSON, or a validation error; a well-formed body with a
+            missing, unknown or mistyped field answers `422`. Common codes:
+            `InvalidSessionTimeout` (`session_timeout` is not a positive ISO 8601 duration),
+            `InvalidBody` (an interest that sends `max_depth`, or a `filter.engine` that is
+            not a GTS instance id),
+            `BadTypePattern` (a `types[]` or `subject_types[]` pattern violates GTS spec §10
+            wildcard rules: wildcard not at segment boundary, mid-pattern wildcard, multiple
+            wildcards, substring within segment; or a `types[]` pattern cannot match any event
+            type),
             `TypeNotInTopic` (defense-in-depth: resolved type's `parent_topic` differs from
-            `interest.topic`),
+            `interest.topic`) (not yet implemented, tracked in #5978),
             `TooManyInterests` (>64), `TooManyTypes` (>32 per interest),
+            `TooManySubjectTypes` (>32 per interest), `InvalidTenant` (an
+            `interests[].subject_tenant` is the nil UUID, or an `only_mine` interest names
+            a tenant other than the caller's).
+            The filter codes (not yet implemented, tracked in #5978):
             `ExpressionTooLong` (>4096 bytes), `CompiledFilterTooLarge` (>64KiB),
             `InvalidFilterExpression` (engine compile failed; engine diagnostic in body),
             `UnknownFilterEngine` (`filter.engine` GTS does not resolve to a registered
@@ -976,12 +1670,36 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "401":
+          description: >-
+            Unauthenticated - the API gateway refuses a missing or rejected bearer token
+            before the broker sees the request.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
         "403":
           description: |
-            `TopicNotAuthorized` (calling principal lacks `consume` on `interest.topic`),
-            `EventTypeNotAuthorized` (principal lacks `consume` on a resolved event type;
-            the offending type is in the response body),
-            `TenantIdNotAuthorized` (platform tenant resolver denied `interest.tenant_id`).
+            One of six codes. An interest group's barrier-right, consume-scope or
+            tenant-check answer that the broker cannot compile is a refusal here (`403`),
+            never a `500`; the group check (the policy's `consume` on the consumer group)
+            answers `500` for one.
+            `TenantIdNotAuthorized`: the caller's subject or tenant id is the nil UUID; an
+            `ignore` interest group lacks the barrier right (denied, or an answer that does
+            not compile); or the consume scope is refused and the tenant check denies the
+            interest group's tenant context.
+            `ConsumerGroupNotOwned`: the caller is not the principal that created the
+            anonymous group (its subject, in its tenant); asked before any PDP call.
+            `ConsumerGroupNotAuthorized`: the group check refuses `consume` on the consumer
+            group.
+            `TopicNotAuthorized`: the consume scope for an interest group is denied, does not
+            compile or leaves nothing the broker can enforce, and the tenant check reaches the
+            interest group's tenant context (or its answer does not compile).
+            `EventTypeNotAuthorized`: an exact `types[]` entry matches registered event types
+            and the consume scope admits none of them; the message names the entry.
+            `SubjectTypeNotAuthorized`: an exact `subject_types[]` entry overlaps a subject
+            type that a matched event type allows, and no constraint of the consume scope
+            admits it; the message names the entry.
           content:
             application/problem+json:
               schema:
@@ -989,8 +1707,66 @@ paths:
         "404":
           description: |
             `ConsumerGroupNotFound` (anonymous: must POST /v1/consumer-groups first; named:
-            must register via types_registry),
+            must register via types_registry (not yet implemented, tracked in #5702;
+            a named group's JOIN answers `501`)),
             `TopicNotFound` (an `interest.topic` is not a registered topic).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "413":
+          description: >-
+            Payload Too Large - the request body is over the request body limit (api-gateway
+            `defaults.body_limit_bytes`).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "415":
+          description: >-
+            Unsupported Media Type - the request `Content-Type` is missing or is not a JSON media
+            type (`application/json` or an `application/<subtype>+json` type).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "422":
+          description: >-
+            The body is valid JSON but does not fit the request shape: a missing, unknown
+            or mistyped field, an unknown enum value (such as a `barrier_mode` other than
+            `respect` or `ignore`), or a `filter` object without `engine` or `expression`.
+            The body is the generic `Unprocessable Entity` problem; it names neither the
+            field nor its value. No subscription is created.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: >-
+            An internal error, answered with a generic body: for example an authorization
+            evaluation that failed (the PDP could not answer), or a group-check answer (the
+            policy's `consume` on the consumer group) that does not compile. No subscription
+            is created.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "501":
+          description: >-
+            Unimplemented - the `consumer_group` is a named group (a valid consumer-group id
+            whose suffix is not a UUID); only anonymous groups are served (named groups are
+            not yet implemented, tracked in #5702). Answered before any interest is
+            validated. No subscription is created.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: >-
+            ServiceUnavailable, retryable - the broker's database or cluster cache is
+            unavailable: the consumer group read, the event-type candidate query of an
+            interest group, the registered-type lookup on a topic with more than 256 event
+            types, the topic lookup, or a routing-marker write. No subscription is created.
           content:
             application/problem+json:
               schema:
@@ -998,10 +1774,12 @@ paths:
         "429":
           description: |
             Two `code`s, distinguished in the body, both with `Retry-After`:
-            `RateLimitExceeded` — per-tenant JOIN rate cap breached;
-            `GroupAtCapacity` — the group already has as many members as partitions,
-            so this JOIN would receive zero partitions (no standbys). The consumer
-            retries the JOIN later; a slot frees when a member leaves.
+            `RateLimited` - per-tenant JOIN rate cap breached (not yet implemented, tracked
+            in #5697);
+            `GroupAtCapacity` - the group already has as many members as partitions,
+            so this JOIN would receive zero partitions (no standbys) (not yet implemented,
+            tracked in #5978). The consumer retries the JOIN later; a slot frees
+            when a member leaves.
           content:
             application/problem+json:
               schema:
@@ -1023,14 +1801,34 @@ paths:
             application/json:
               schema:
                 $ref: "./schemas/gts.cf.core.events.subscription.v1~.schema.json"
+        "401":
+          description: >-
+            Unauthenticated - the API gateway refuses a missing or rejected bearer token
+            before the broker sees the request.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
         "403":
-          description: Forbidden
+          description: >-
+            `TenantIdNotAuthorized` when the caller's subject or tenant id is the nil UUID
+            (answered before any read or PDP call) or the PDP denies the caller `consume` as
+            the subscription's tenant.
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
         "404":
           description: SubscriptionNotFound
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: >-
+            An internal error, answered with a generic body: for example an authorization
+            evaluation that failed (the PDP could not answer), or a tenant-check answer (the
+            caller's right to consume as the subscription's tenant) that does not compile.
           content:
             application/problem+json:
               schema:
@@ -1041,8 +1839,35 @@ paths:
       responses:
         "204":
           description: Subscription removed; rebalance triggered
+        "401":
+          description: >-
+            Unauthenticated - the API gateway refuses a missing or rejected bearer token
+            before the broker sees the request.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: >-
+            `TenantIdNotAuthorized` when the caller's subject or tenant id is the nil UUID
+            (answered before any read or PDP call) or the PDP denies the caller `consume` as
+            the subscription's tenant; `SubscriptionNotOwned` when the caller is not the
+            principal that joined the subscription.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
         "404":
           description: SubscriptionNotFound
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: >-
+            An internal error, answered with a generic body: for example an authorization
+            evaluation that failed (the PDP could not answer), or a tenant-check answer (the
+            caller's right to consume as the subscription's tenant) that does not compile.
           content:
             application/problem+json:
               schema:
@@ -1068,9 +1893,9 @@ paths:
         accepted, including a backward move for replay — there is no forward-only
         rule.
 
-        While a stream is open on the subscription the session cursor auto-advances
-        with delivery; the consumer does NOT SEEK to record progress. A SEEK issued
-        while `:stream` is open is rejected with `409 StreamingInProgress`.
+        While a stream is open, its read position advances with delivery in the stream
+        session only and is not stored; the stored cursor moves only by SEEK. A SEEK
+        issued while `:stream` is open is rejected with `409 StreamingInProgress`.
 
         Each integer is the **last offset the consumer has processed**; the broker
         emits from the first event with a sequence above it. Sequences increase but
@@ -1104,6 +1929,10 @@ paths:
                     desired starting position. Values are either an integer
                     (last-processed offset), or one of the string sentinels
                     "earliest", "latest", or "at:<ISO-8601>" (e.g., "at:2026-06-14T10:00:00Z").
+                    A partition listed more than once under one topic ends at its last entry's
+                    position: entries for the same partition are written in request order. Each
+                    entry in a topic's array is still checked, and the response lists one resolved
+                    entry for each.
                   additionalProperties:
                     type: array
                     items:
@@ -1166,15 +1995,48 @@ paths:
                     - { partition: 2, value: 57 }
         "400":
           description: |
-            InvalidInitialPosition — offset outside valid range for one or more partitions.
-            InvalidTimestamp — "at:<ISO>" value is not a valid ISO-8601 UTC timestamp.
-            RFC-9457 Problem Details body identifies offending partitions and reasons.
+            Invalid Argument; nothing is written. A path segment that is not
+            `<subscription-id>:seek` (`InvalidPath`); a `positions` key
+            that is not a GTS topic id (a field violation on `topic`); a `positions`
+            object that names the same topic key more than once (`InvalidBody`); a string
+            `value` that is none of `"earliest"`, `"latest"` or `"at:<ISO-8601>"`
+            (`InvalidSeekValue`), or an `at:` value whose timestamp does not parse as
+            RFC 3339 (`InvalidTimestamp`); or an integer `value` outside its partition's
+            valid range (`OffsetOutOfRange`: one `positions` field violation per offending
+            entry, naming its topic and partition, with reason `below_retention_floor` or
+            `above_high_water_mark`). A body that is not valid JSON answers a generic `400`
+            (an `about:blank` problem naming no field).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: >-
+            Unauthenticated - the API gateway refuses a missing or rejected bearer token
+            before the broker sees the request.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: >-
+            Nothing is written. `TenantIdNotAuthorized` when the caller's subject or tenant
+            id is the nil UUID (answered before any read or PDP call) or the PDP denies the
+            caller `consume` as the subscription's tenant; `SubscriptionNotOwned` when the
+            caller is not the principal that joined the subscription;
+            `ConsumerGroupNotAuthorized` when the policy refuses `consume` on the
+            subscription's consumer group (an answer that does not compile, or an evaluation
+            that fails, is a `500`).
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
         "404":
-          description: SubscriptionNotFound
+          description: >-
+            Not Found; nothing is written: the subscription is not found (`SubscriptionNotFound`),
+            its consumer group is no longer registered (`ConsumerGroupNotFound`), a `positions` key
+            names a topic that is not registered (`TopicNotFound`), or the topic's storage backend
+            does not hold an assigned partition (`PartitionNotFound`).
           content:
             application/problem+json:
               schema:
@@ -1184,9 +2046,9 @@ paths:
             `PartitionNotAssigned` — request references a partition not currently
             assigned to this subscription (the versions match, so it is a genuine
             client error, not a stale view).
-            `StreamingInProgress` — a SEEK was issued while a `:stream` is open on
-            this subscription; SEEK is pre-stream-only (the cursor auto-advances
-            with delivery).
+            `StreamingInProgress` - a SEEK was issued while a `:stream` is open on
+            this subscription; SEEK is pre-stream-only (a stream's read position is
+            not stored).
           content:
             application/problem+json:
               schema:
@@ -1200,6 +2062,51 @@ paths:
             topology_version and assignment, then re-seeks. The body is minimal (no
             topology_version, no assignment); the re-read is the single source of the
             fresh state.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "413":
+          description: >-
+            Payload Too Large - the request body is over the request body limit (api-gateway
+            `defaults.body_limit_bytes`).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "415":
+          description: >-
+            Unsupported Media Type - the request `Content-Type` is missing or is not a JSON media
+            type (`application/json` or an `application/<subtype>+json` type).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "422":
+          description: >-
+            Unprocessable Entity - the body is valid JSON but does not fit the request shape: a
+            missing, unknown or mistyped field, for example a `value` that is neither an integer nor
+            a string (such as `true`).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: >-
+            An internal error, answered with a generic body: for example an authorization
+            evaluation that failed (the PDP could not answer), a tenant-check answer (the
+            caller's right to consume as the subscription's tenant) that does not compile, or
+            a group-check answer (the policy's `consume` on the consumer group) that does not
+            compile. No cursor is written.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: >-
+            ServiceUnavailable, retryable - the broker's database or the topic's storage backend is
+            unavailable: the consumer group read, the topic lookup, the resolution of a position on
+            the backend, or a cursor write.
           content:
             application/problem+json:
               schema:
@@ -1262,7 +2169,7 @@ components:
           description: >-
             JSON Pointer naming the event member whose value the partition is derived
             from — a resolved trait of the event type. The base defaults it (to
-            `/tenant_id`), so every event type reports one.
+            `/subject_tenant`), so every event type reports one.
         allowed_subject_types:
           type: array
           items: { type: string }
@@ -1280,6 +2187,81 @@ components:
       $ref: "./schemas/gts.cf.core.events.event.v1~.schema.json"
     Subscription:
       $ref: "./schemas/gts.cf.core.events.subscription.v1~.schema.json"
+    JoinSubscriptionResponse:
+      type: object
+      description: |
+        The JOIN `201` body: the subscription, with each interest's `unmatched_types`.
+        A read or a listing of the subscription answers `Subscription`, without it.
+      required: [id, consumer_group, client_agent, interests, assigned, topology_version, created_at]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          format: uuid
+        consumer_group:
+          type: string
+          x-gts-instance-ref: "gts.cf.core.events.consumer_group.v1~"
+        client_agent:
+          type: string
+        interests:
+          type: array
+          items:
+            type: object
+            required: [topic, subject_tenant, ownership_filter, barrier_mode, types, filter, unmatched_types]
+            additionalProperties: false
+            properties:
+              topic:
+                type: string
+                x-gts-instance-ref: "gts.cf.core.events.topic.v1~"
+              subject_tenant:
+                type: string
+                format: uuid
+                description: The tenant the interest reads; the caller's own tenant when the JOIN omits it.
+              ownership_filter:
+                type: string
+                enum: [only_mine, entire_tenant, tenant_subtree_included]
+                description: Echoed; `only_mine` when the JOIN omits it.
+              barrier_mode:
+                type: string
+                enum: [respect, ignore]
+              types:
+                type: array
+                items: { type: string }
+              subject_types:
+                type: array
+                items: { type: string }
+                description: Present only when the interest carries a subject-type selector.
+              filter:
+                type: ["object", "null"]
+                required: [engine, expression]
+                properties:
+                  engine: { type: string }
+                  expression: { type: string }
+              unmatched_types:
+                type: array
+                items: { type: string }
+                description: >-
+                  The entries of this interest's `types` that match no event type registered
+                  on its topic; `[]` when all matched. On a topic with more than 256
+                  registered event types only exact entries are checked, and a wildcard is
+                  never listed.
+        assigned:
+          type: array
+          items:
+            type: object
+            required: [topic, partition]
+            additionalProperties: false
+            properties:
+              topic:
+                type: string
+                x-gts-instance-ref: "gts.cf.core.events.topic.v1~"
+              partition: { type: integer, minimum: 0 }
+        topology_version:
+          type: integer
+          format: int64
+        created_at:
+          type: string
+          format: date-time
     ConsumerGroup:
       $ref: "./schemas/gts.cf.core.events.consumer_group.v1~.schema.json"
     PageInfo:
@@ -1307,9 +2289,14 @@ components:
             (e.g. `gts://gts.cf.core.errors.err.v1~cf.core.err.<category>.v1~`) — the stable
             broad-category discriminator across all gears.
           * `status` is the HTTP status; `title`/`detail` are human-readable.
-          * `context` is a per-category structured object. Retry timing for 503 is carried as
-            `context.retry_after_seconds`; the wire `Retry-After` header is set by the
-            canonical-errors layer, not by this spec.
+          * `context` is a per-category structured object. A `503` the broker answers carries an
+            empty `context` and no `Retry-After` header. A `503` the API gateway answers carries
+            `context.retry_after_seconds`, from which the canonical-errors layer sets the wire
+            `Retry-After` header: 5 when authentication is unavailable, 1 while the application has
+            not finished starting.
+          * Every authenticated route can also get two server-error answers from the API gateway
+            before the broker sees the request: that `503`, and a `500` when the authentication
+            infrastructure fails.
       properties:
         type:
           type: string
@@ -1330,8 +2317,8 @@ components:
           type: object
           additionalProperties: true
           description: |
-            Per-category structured context. Common fields include
-            `retry_after_seconds` (ServiceUnavailable) and, for a `NotFound` or any
+            Per-category structured context; a `503` the broker answers carries an empty
+            one. Common fields include, for a `NotFound` or any
             resource-scoped error, `resource_type` / `resource_name` naming the
             addressed resource. A publish-path error about the stream names the
             targeted stream (`resource_type: "gts.cf.core.events.topic.v1~"`,
@@ -1340,7 +2327,7 @@ components:
             specific fault lives in the `field_violations` or `violations` entry
             (e.g. SequenceViolation's violation carries `last_sequence=<n>`).
             Error bodies never echo submitted content - payloads or field values;
-            identifiers the broker issued (a `producer_id`, a resolved topic id)
+            identifiers the broker issued (a producer `id`, a resolved topic id)
             and request positions (an event `index`) may appear.
 
   responses:

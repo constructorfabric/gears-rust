@@ -99,6 +99,7 @@ toolkit-utils = { workspace = true, features = ["serde", "schemars"] }
 toolkit-canonical-errors = { workspace = true, features = ["axum", "utoipa"] }
 toolkit-odata = { workspace = true, features = ["with-utoipa"] }
 toolkit-macros = { workspace = true }
+toolkit-taskward = { workspace = true }
 utoipa = { workspace = true }
 # The authorization resolver and the type registry are consumed through their
 # SDK contracts (`#[toolkit::consumes]` in `module.rs`), never linked as gears.
@@ -195,6 +196,14 @@ tempfile = { workspace = true }
 # in-memory `PlatformTypesRegistryApi` test double, reused rather than
 # hand-rolled.
 types-registry-sdk = { workspace = true, features = ["test-util"] }
+# `domain/authz_pdp_tests.rs`: the real tr-authz service, so the publish rows
+# run through the policy the platform ships (design-22 Q20 (a)).
+tr-authz-plugin = { package = "cf-gears-tr-authz-plugin", path = "../../authz-resolver/plugins/tr-authz-plugin" }
+# The tenant tree that tr-authz walks: `authz_pdp_tests.rs` implements the
+# `TenantResolverClient` over an in-memory tree.
+tenant-resolver-sdk = { workspace = true }
+# The lib's PDP tests (`domain/*pdp_tests.rs`) run against the real static-authz service.
+static-authz-plugin = { workspace = true }
 # The full-process integration tests that spawn the server binary live in the
 # `cf-gears-event-broker-server` crate (the only crate defining its
 # `CARGO_BIN_EXE`).

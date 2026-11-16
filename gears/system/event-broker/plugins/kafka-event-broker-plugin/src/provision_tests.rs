@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use event_broker_sdk::GtsInstanceId;
 use event_broker_sdk::backend::{Retention, TopicSpec};
+use uuid::Uuid;
 
 use crate::provision::topic_configs;
 
@@ -10,6 +11,7 @@ fn spec(retention: Retention) -> TopicSpec {
     TopicSpec {
         topic: GtsInstanceId::try_new("gts.cf.core.events.topic.v1~acme.orders.x.topic.v1")
             .expect("valid id"),
+        uuid: Uuid::from_u128(0x7091),
         partitions: 2,
         retention,
     }

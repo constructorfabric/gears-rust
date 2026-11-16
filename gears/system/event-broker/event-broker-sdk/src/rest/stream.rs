@@ -161,7 +161,7 @@ pub(crate) async fn open(
         StreamTransport::Multipart => ("/event-broker/v1/events:stream", "multipart/mixed"),
         StreamTransport::Sse => ("/event-broker/v1/events:sse", "text/event-stream"),
     };
-    let url = client.url(&format!("{path}?subscription_id={id}"));
+    let url = client.url(&format!("{path}?subscription={id}"));
 
     let stream = async_stream::try_stream! {
         let mut reconnects = 0u32;
@@ -258,8 +258,9 @@ pub(crate) async fn open(
                 break;
             }
             // The connection dropped without a terminal frame; reconnect. The
-            // broker resumes from the group's committed cursor, so no re-seek is
-            // needed here.
+            // reconnect reopens the same subscription without a SEEK, so the broker
+            // resumes from the group cursor the last SEEK set (re-reading the
+            // subscription and re-SEEKing is tracked in #5819).
             reconnects += 1;
             if reconnects > MAX_RECONNECTS {
                 break;

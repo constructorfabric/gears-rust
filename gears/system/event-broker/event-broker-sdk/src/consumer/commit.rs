@@ -22,7 +22,7 @@ pub struct TxCommitHandle<OM: super::CommitOffsetInTx> {
     /// Consumer group whose offset is committed.
     pub(crate) group: crate::ids::ConsumerGroupId,
     /// Topic whose offset is committed.
-    pub(crate) topic: crate::ids::TopicId,
+    pub(crate) topic: gts::GtsInstanceId,
     /// Offset successfully written inside the user transaction.
     pub(crate) committed_offset: std::sync::Arc<std::sync::Mutex<Option<Sequence>>>,
 }
@@ -33,7 +33,7 @@ pub(crate) struct TxCommitHandleParts<OM: super::CommitOffsetInTx> {
     pub(crate) offsets: Vec<Sequence>,
     pub(crate) offset_manager: std::sync::Arc<OM>,
     pub(crate) group: crate::ids::ConsumerGroupId,
-    pub(crate) topic: crate::ids::TopicId,
+    pub(crate) topic: gts::GtsInstanceId,
 }
 
 #[cfg(feature = "db")]
@@ -59,7 +59,7 @@ impl<OM: super::CommitOffsetInTx> TxCommitHandle<OM> {
             batch_offsets: offsets,
             offset_manager: std::sync::Arc::clone(&self.offset_manager),
             group: self.group,
-            topic: self.topic,
+            topic: self.topic.clone(),
             committed_offset: std::sync::Arc::clone(&self.committed_offset),
         }
     }
