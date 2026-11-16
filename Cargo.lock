@@ -3283,6 +3283,8 @@ dependencies = [
  "cf-gears-graph-storage-onnx-embedding-plugin",
  "cf-gears-graph-storage-remote-embedding-plugin",
  "cf-gears-graph-storage-sdk",
+ "cf-gears-static-tr-plugin",
+ "cf-gears-tenant-resolver-sdk",
  "cf-gears-test-containers",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
@@ -3293,6 +3295,7 @@ dependencies = [
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-odata",
  "cf-gears-toolkit-security",
+ "cf-gears-tr-authz-plugin",
  "cf-gears-types-registry",
  "cf-gears-types-registry-sdk",
  "gts",
@@ -3311,6 +3314,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "utoipa",
  "uuid",
 ]
@@ -3364,6 +3368,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "time",
+ "tokio",
  "tokio-util",
  "uuid",
 ]
