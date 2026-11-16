@@ -863,7 +863,8 @@ fn slow_intake(
 }
 
 /// The receive window of [`slow_intake`]: short enough to run on the real
-/// clock, long enough beside its phases that the database's own time does
+/// clock. Each test's phases either overrun it whatever the database takes
+/// or leave it at least four fifths of it, so the database's own time does
 /// not decide a test.
 const WINDOW: Duration = Duration::from_secs(3);
 
@@ -914,13 +915,14 @@ async fn an_identity_insert_past_the_receive_window_is_rolled_back_before_the_ha
 
 #[tokio::test]
 async fn the_check_and_the_insert_share_one_receive_window() {
-    // Each phase alone fits in the window, with more than a second to spare
-    // for the database and the policy check; together they do not.
-    let half = WINDOW * 3 / 5;
+    // The insert alone fits in the window, but not after the check, whatever
+    // the database takes, as its time only adds. The check leaves four
+    // fifths of the window to the database to start the insert in time.
+    let (check, insert) = (WINDOW / 5, WINDOW * 9 / 10);
     let db = inmem_db().await;
     let hand_off = Arc::new(crate::test_support::RecordingHandOff::default());
     let inserts = Arc::default();
-    let intake = slow_intake(&db, &hand_off, &inserts, half, half);
+    let intake = slow_intake(&db, &hand_off, &inserts, check, insert);
 
     let err = submit_once(&intake).await.unwrap_err();
 
@@ -936,8 +938,8 @@ async fn the_check_and_the_insert_share_one_receive_window() {
 
 #[tokio::test]
 async fn a_check_and_an_insert_that_fit_in_the_receive_window_together_take_the_record() {
-    // Slow phases short enough that both fit, with room for the database.
-    let half = WINDOW / 5;
+    // Slow phases that leave four fifths of the window to the database.
+    let half = WINDOW / 10;
     let db = inmem_db().await;
     let hand_off = Arc::new(crate::test_support::RecordingHandOff::default());
     let inserts = Arc::default();
