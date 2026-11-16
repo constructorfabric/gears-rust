@@ -59,14 +59,11 @@ struct CredstoreTokens {
 }
 
 impl CredstoreTokens {
-    fn new(
-        ctx: &GearCtx,
-        secrets_repo: Arc<dyn TokenSecretRepository>,
-    ) -> anyhow::Result<Self> {
-        Ok(Self {
+    fn new(ctx: &GearCtx, secrets_repo: Arc<dyn TokenSecretRepository>) -> Self {
+        Self {
             credstore: ctx.client_hub().get::<dyn CredStoreClientV1>().ok(),
             secrets_repo,
-        })
+        }
     }
 }
 
@@ -287,7 +284,7 @@ impl Gear for GithubMirrorGear {
         client.set_token_source(Arc::new(CredstoreTokens::new(
             ctx,
             Arc::clone(&token_secrets),
-        )?))?;
+        )))?;
         let github: Arc<dyn GithubPort> = Arc::new(client);
 
         let authz = ctx

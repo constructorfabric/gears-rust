@@ -958,7 +958,24 @@ async fn cleanup_new_tokens(
     existing: &HashSet<String>,
 ) {
     for fingerprint in fingerprints.difference(existing) {
-        let _ = vault.delete(ctx, fingerprint).await;
+        if let Err(error) = vault.delete(ctx, fingerprint).await {
+            tracing::warn!(%fingerprint, %error, "new token credential cleanup failed");
+        }
+    }
+}
+
+async fn delete_dropped_tokens(
+    vault: &dyn TokenVault,
+    ctx: &SecurityContext,
+    removed: Vec<super::repo::TokenSecretRecord>,
+    kept: &HashSet<String>,
+) {
+    for record in removed {
+        if !kept.contains(&record.fingerprint)
+            && let Err(error) = vault.delete(ctx, &record.fingerprint).await
+        {
+            tracing::warn!(fingerprint = %record.fingerprint, %error, "removed token credential cleanup failed");
+        }
     }
 }
 
@@ -3846,6 +3863,11 @@ impl Service {
             .await
     }
 
+    /// The caller's tenant's tokens: fingerprints, secret names and scope notes,
+    /// never the token values.
+    ///
+    /// # Errors
+    /// `Forbidden` when the caller may not sync; storage failures.
     pub async fn list_tokens(
         &self,
         ctx: &SecurityContext,
@@ -3869,6 +3891,14 @@ impl Service {
         Ok(())
     }
 
+    /// Save `tokens` in the credential store and add them to the caller's
+    /// tenant's pool; a token already there keeps one copy.
+    ///
+    /// # Errors
+    /// `Validation` for an empty list, more than 100 tokens, an empty token, a
+    /// note over 500 characters or a token GitHub answers `401` to;
+    /// `Forbidden` when the caller may not sync; credential-store and storage
+    /// failures.
     pub async fn add_tokens(
         &self,
         ctx: &SecurityContext,
@@ -3918,7 +3948,7 @@ impl Service {
                     .find(|record| record.fingerprint == fingerprint)
                     && note.is_some()
                 {
-                    record.scope_note = note.clone();
+                    record.scope_note.clone_from(note);
                 }
                 continue;
             }
@@ -3947,6 +3977,12 @@ impl Service {
         self.list_tokens(ctx).await
     }
 
+    /// Make the caller's tenant's pool exactly `tokens`; an empty list clears it.
+    ///
+    /// # Errors
+    /// `Validation` for more than 100 tokens, an empty token, a note over 500
+    /// characters or a token GitHub answers `401` to; `Forbidden` when the
+    /// caller may not sync; credential-store and storage failures.
     pub async fn replace_tokens(
         &self,
         ctx: &SecurityContext,
@@ -4013,16 +4049,16 @@ impl Service {
             }
         };
         self.github.reload_tokens(ctx.subject_tenant_id());
-        for record in removed {
-            if !seen.contains(&record.fingerprint)
-                && let Err(error) = self.token_vault.delete(ctx, &record.fingerprint).await
-            {
-                tracing::warn!(fingerprint = %record.fingerprint, %error, "removed token credential cleanup failed");
-            }
-        }
+        delete_dropped_tokens(self.token_vault.as_ref(), ctx, removed, &seen).await;
         self.list_tokens(ctx).await
     }
 
+    /// Take the token with `fingerprint` out of the caller's tenant's pool and
+    /// delete it from the credential store.
+    ///
+    /// # Errors
+    /// `NotFound` when the tenant has no such token; `Forbidden` when the
+    /// caller may not sync; credential-store and storage failures.
     pub async fn remove_token(
         &self,
         ctx: &SecurityContext,

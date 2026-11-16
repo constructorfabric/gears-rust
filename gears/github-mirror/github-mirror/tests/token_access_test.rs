@@ -39,7 +39,10 @@ fn client(server: &MockServer, tokens: &[&str]) -> GithubClient {
 }
 
 fn options() -> FetchOptions {
-    let tenant_id = uuid::Uuid::new_v4();
+    options_for(uuid::Uuid::new_v4())
+}
+
+fn options_for(tenant_id: uuid::Uuid) -> FetchOptions {
     FetchOptions {
         tenant_id,
         access_scope: AccessScope::for_tenant(tenant_id),
@@ -287,14 +290,15 @@ async fn a_classic_token_without_the_repo_scope_is_left_out_on_a_private_repo() 
         })
         .await;
     let client = client(&server, &["tok-a", "tok-b"]);
-    let warm_up = options();
+    let tenant_id = uuid::Uuid::new_v4();
+    let warm_up = options_for(tenant_id);
     for _ in 0..2 {
         client
             .fetch_repository_metadata("acme", "tools", &warm_up)
             .await
             .expect("each token answers once");
     }
-    let options = options();
+    let options = options_for(tenant_id);
     options.public_repo.set(false).unwrap();
 
     client
