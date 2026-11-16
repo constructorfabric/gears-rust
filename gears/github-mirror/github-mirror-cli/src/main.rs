@@ -317,9 +317,11 @@ async fn run(cli: Cli) -> Result<()> {
             "no platform token: pass --platform-token, set CF_PLATFORM_TOKEN or write ~/.github-mirror/platform_token.txt"
         )
     })?;
-    let github_tokens = cli.token;
-    let github_tokens_only = cli.token_only;
-    let token_scope_notes = cli.token_scope_note;
+    let token_flags = TokenFlags {
+        add: cli.token,
+        replace: cli.token_only,
+        scope_notes: cli.token_scope_note,
+    };
     let loaded = config::load(
         &cli.config,
         StorageFlags {
@@ -330,13 +332,12 @@ async fn run(cli: Cli) -> Result<()> {
         },
     )?;
     let format = cli.output_format.unwrap_or(match command {
-        Command::Query { .. } => OutputFormat::Json,
+        Command::Query { .. } | Command::Tokens { .. } => OutputFormat::Json,
         Command::Sync { .. }
         | Command::Resume { .. }
         | Command::Status { .. }
         | Command::CheckRateLimit
         | Command::ClearCache { .. } => OutputFormat::Table,
-        Command::Tokens { .. } => OutputFormat::Json,
     });
 
     let database_file = config::sqlite_file(&loaded.app);
@@ -346,9 +347,7 @@ async fn run(cli: Cli) -> Result<()> {
         command,
         &platform_token,
         loaded.tenant_id,
-        github_tokens,
-        github_tokens_only,
-        token_scope_notes,
+        token_flags,
         database_file.as_deref(),
     )
     .await;
@@ -360,14 +359,18 @@ async fn run(cli: Cli) -> Result<()> {
     output::print(&value, format)
 }
 
+struct TokenFlags {
+    add: Vec<SecretString>,
+    replace: Option<Vec<SecretString>>,
+    scope_notes: Vec<String>,
+}
+
 async fn execute(
     runtime: &Runtime,
     command: Command,
     platform_token: &SecretString,
     tenant_id: Option<Uuid>,
-    github_tokens: Vec<SecretString>,
-    github_tokens_only: Option<Vec<SecretString>>,
-    token_scope_notes: Vec<String>,
+    token_flags: TokenFlags,
     database_file: Option<&Path>,
 ) -> Result<Value> {
     let service = runtime.service().await?;
@@ -380,13 +383,13 @@ async fn execute(
             ctx.subject_tenant_id()
         );
     }
-    if let Some(tokens) = github_tokens_only {
-        let values = token_inputs(tokens, token_scope_notes)?;
+    if let Some(tokens) = token_flags.replace {
+        let values = token_inputs(tokens, &token_flags.scope_notes)?;
         service.replace_tokens(&ctx, &values).await?;
-    } else if !github_tokens.is_empty() {
-        let values = token_inputs(github_tokens, token_scope_notes)?;
+    } else if !token_flags.add.is_empty() {
+        let values = token_inputs(token_flags.add, &token_flags.scope_notes)?;
         service.add_tokens(&ctx, &values).await?;
-    } else if !token_scope_notes.is_empty() {
+    } else if !token_flags.scope_notes.is_empty() {
         bail!("--token-scope-note requires --token or --token-only");
     }
     match command {
@@ -482,7 +485,7 @@ async fn execute(
 
 fn token_inputs(
     tokens: Vec<SecretString>,
-    notes: Vec<String>,
+    notes: &[String],
 ) -> Result<Vec<(SecretString, Option<String>)>> {
     if !notes.is_empty() && notes.len() != tokens.len() {
         bail!("provide exactly one --token-scope-note for each token");
@@ -688,9 +691,11 @@ mod tests {
                 command(args),
                 &token,
                 None,
-                Vec::new(),
-                None,
-                Vec::new(),
+                TokenFlags {
+                    add: Vec::new(),
+                    replace: None,
+                    scope_notes: Vec::new(),
+                },
                 database,
             )
         };
