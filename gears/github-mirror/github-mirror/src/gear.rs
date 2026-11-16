@@ -127,8 +127,8 @@ impl TokenVault for CredstoreVault {
         token: &SecretString,
     ) -> Result<String, DomainError> {
         let credstore = self.credstore()?;
-        let label = TokenFingerprint::of(token.expose()).full().to_owned();
-        let key = SecretRef::new(vault_secret_name(&label))
+        let fingerprint = TokenFingerprint::of(token.expose()).full().to_owned();
+        let key = SecretRef::new(vault_secret_name(&fingerprint))
             .map_err(|e| DomainError::internal(e.to_string()))?;
         let saved = match credstore
             .create(
@@ -157,11 +157,11 @@ impl TokenVault for CredstoreVault {
                 "could not save the GitHub token in the credential store: {e}"
             ))
         })?;
-        Ok(label)
+        Ok(fingerprint)
     }
 
-    async fn delete(&self, ctx: &SecurityContext, label: &str) -> Result<(), DomainError> {
-        let key = SecretRef::new(vault_secret_name(label))
+    async fn delete(&self, ctx: &SecurityContext, fingerprint: &str) -> Result<(), DomainError> {
+        let key = SecretRef::new(vault_secret_name(fingerprint))
             .map_err(|e| DomainError::internal(e.to_string()))?;
         match self
             .credstore()?

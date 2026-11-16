@@ -5,8 +5,8 @@ use toolkit_utils::SecretString;
 use crate::domain::error::DomainError;
 
 #[must_use]
-pub fn vault_secret_name(label: &str) -> String {
-    format!("github-mirror-{label}")
+pub fn vault_secret_name(fingerprint: &str) -> String {
+    format!("github-mirror-{fingerprint}")
 }
 
 #[async_trait]
@@ -17,7 +17,7 @@ pub trait TokenVault: Send + Sync {
         token: &SecretString,
     ) -> Result<String, DomainError>;
 
-    async fn delete(&self, ctx: &SecurityContext, label: &str) -> Result<(), DomainError>;
+    async fn delete(&self, ctx: &SecurityContext, fingerprint: &str) -> Result<(), DomainError>;
 }
 
 pub struct NoTokenVault;
@@ -34,7 +34,7 @@ impl TokenVault for NoTokenVault {
         ))
     }
 
-    async fn delete(&self, _ctx: &SecurityContext, _label: &str) -> Result<(), DomainError> {
+    async fn delete(&self, _ctx: &SecurityContext, _fingerprint: &str) -> Result<(), DomainError> {
         Err(DomainError::internal(
             "no credential store to keep GitHub tokens in",
         ))

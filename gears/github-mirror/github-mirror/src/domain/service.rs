@@ -929,10 +929,7 @@ impl Clone for Service {
     }
 }
 
-fn normalized_token(
-    token: &SecretString,
-    scope_note: Option<&str>,
-) -> Result<SecretString, DomainError> {
+fn normalized_token(token: &SecretString) -> Result<SecretString, DomainError> {
     let token = SecretString::new(token.expose().trim());
     if token.expose().is_empty() {
         return Err(DomainError::Validation {
@@ -940,7 +937,6 @@ fn normalized_token(
             message: "must not be empty".to_owned(),
         });
     }
-    normalized_scope_note(scope_note)?;
     Ok(token)
 }
 
@@ -3889,7 +3885,7 @@ impl Service {
             .iter()
             .map(|(token, note)| {
                 Ok((
-                    normalized_token(token, note.as_deref())?,
+                    normalized_token(token)?,
                     normalized_scope_note(note.as_deref())?,
                 ))
             })
@@ -3947,7 +3943,7 @@ impl Service {
                 .await;
             return Err(error);
         }
-        self.github.reload_tokens(Some(ctx.subject_tenant_id()));
+        self.github.reload_tokens(ctx.subject_tenant_id());
         self.list_tokens(ctx).await
     }
 
@@ -3967,7 +3963,7 @@ impl Service {
             .iter()
             .map(|(token, note)| {
                 Ok((
-                    normalized_token(token, note.as_deref())?,
+                    normalized_token(token)?,
                     normalized_scope_note(note.as_deref())?,
                 ))
             })
@@ -4016,7 +4012,7 @@ impl Service {
                 return Err(error);
             }
         };
-        self.github.reload_tokens(Some(ctx.subject_tenant_id()));
+        self.github.reload_tokens(ctx.subject_tenant_id());
         for record in removed {
             if !seen.contains(&record.fingerprint)
                 && let Err(error) = self.token_vault.delete(ctx, &record.fingerprint).await
@@ -4036,7 +4032,7 @@ impl Service {
         let Some(record) = self.token_secrets.remove(&scope, fingerprint).await? else {
             return Err(DomainError::NotFound);
         };
-        self.github.reload_tokens(Some(ctx.subject_tenant_id()));
+        self.github.reload_tokens(ctx.subject_tenant_id());
         self.token_vault.delete(ctx, &record.fingerprint).await
     }
 

@@ -571,7 +571,7 @@ pub trait GithubPort: Send + Sync {
         self.rate_limit().await
     }
 
-    fn reload_tokens(&self, _tenant_id: Option<uuid::Uuid>) {}
+    fn reload_tokens(&self, _tenant_id: uuid::Uuid) {}
 
     /// Whether GitHub answers `401 Unauthorized` to `token`. A token GitHub
     /// cannot be asked about, because it is down or answers anything else,

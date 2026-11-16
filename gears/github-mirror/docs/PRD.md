@@ -1225,6 +1225,10 @@ The mirror is a replica of personal data: every contributor row is a person, and
 ## 13. Open Questions
 
 - What is the maximum supported number of tokens in a token pool, and how is token rotation prioritized?
+  **Answered** ([gears-rust#5367](https://github.com/constructorfabric/gears-rust/issues/5367)):
+  each request uses the token with the most calls left that is above its reserve and not
+  backing off, and waits for the one ready soonest when none is; one add or replace call
+  takes up to 100 tokens, and a tenant's pool has no total limit.
 - How are write-back operation conflicts resolved when the same entity is modified both locally and on GitHub between synchronization cycles?
 - What is the retention policy for write-back operation history (completed/failed operations)?
 - How is the GitHub-compatible API versioned when GitHub changes their API schema and the mirror's response format must be updated?

@@ -3904,13 +3904,11 @@ impl GithubPort for GithubClient {
         self.cache.expire(scope, tenant_id, fetched_before).await
     }
 
-    fn reload_tokens(&self, tenant_id: Option<uuid::Uuid>) {
-        let mut pools = self.pools.lock().unwrap_or_else(PoisonError::into_inner);
-        if tenant_id.is_some() {
-            pools.remove(&tenant_id);
-        } else {
-            pools.clear();
-        }
+    fn reload_tokens(&self, tenant_id: uuid::Uuid) {
+        self.pools
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&Some(tenant_id));
     }
 
     async fn rejects_token(&self, token: &SecretString) -> Result<bool, DomainError> {
