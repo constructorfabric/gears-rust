@@ -35,40 +35,26 @@
 //! ### 2. `ScopableEntity`
 //!
 //! Entities must implement [`ScopableEntity`](crate::secure::ScopableEntity) to declare
-//! which columns are used for scoping:
+//! which columns are used for scoping. The whole contract is one constant, an
+//! [`EntityScope`](crate::secure::EntityScope): either `Unrestricted`, or `Scoped`
+//! with every dimension written out. Usually `#[derive(Scopable)]` writes it:
 //!
 //! ```rust,ignore
-//! use toolkit_db::secure::ScopableEntity;
+//! use toolkit_db::secure::{Dimensions, EntityScope, ScopableEntity};
 //!
 //! impl ScopableEntity for user::Entity {
-//!     fn tenant_col() -> Option<Self::Column> {
-//!         Some(user::Column::TenantId)  // Multi-tenant entity
-//!     }
-//!     fn resource_col() -> Option<Self::Column> {
-//!         Some(user::Column::Id)
-//!     }
-//!     fn owner_col() -> Option<Self::Column> {
-//!         None
-//!     }
-//!     fn type_col() -> Option<Self::Column> {
-//!         None
-//!     }
+//!     const SCOPE: EntityScope<user::Column> = EntityScope::Scoped(Dimensions {
+//!         tenant: Some(user::Column::TenantId), // Multi-tenant entity
+//!         resource: Some(user::Column::Id),
+//!         owner: None,
+//!         type_col: None,
+//!         custom: &[],
+//!     });
 //! }
 //!
-//! // Global entity (no tenant scoping)
+//! // Global entity (no scoping at all)
 //! impl ScopableEntity for system_config::Entity {
-//!     fn tenant_col() -> Option<Self::Column> {
-//!         None  // Global entity
-//!     }
-//!     fn resource_col() -> Option<Self::Column> {
-//!         Some(system_config::Column::Id)
-//!     }
-//!     fn owner_col() -> Option<Self::Column> {
-//!         None
-//!     }
-//!     fn type_col() -> Option<Self::Column> {
-//!         None
-//!     }
+//!     const SCOPE: EntityScope<system_config::Column> = EntityScope::Unrestricted;
 //! }
 //! ```
 //!

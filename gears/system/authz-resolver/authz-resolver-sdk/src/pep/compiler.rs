@@ -19,14 +19,15 @@
 //! `require_constraints=true`, empty constraints are an error (fail-closed).
 //! If the PDP returns constraints regardless of the flag, they are compiled.
 //!
-//! ## Empty value lists (fail-closed)
+//! ## Empty value lists (valid predicates that match nothing)
 //!
-//! Set-membership predicates (`In`, `InGroup`, `InGroupSubtree`) with an
-//! empty value list are rejected at compile time. An empty list means
-//! "match nothing" which is semantically a deny — but passing it through
-//! to the ORM would generate `WHERE col IN ()`, which is a SQL error on
-//! some engines. Instead the compiler treats this as a PDP contract
-//! violation and fails the constraint (fail-closed).
+//! Empty membership sets are valid and go through the same validation as
+//! other predicates before [`AccessScope`] normalizes them. Invalid branches
+//! are discarded; compilation fails if none remains valid.
+//!
+//! An all-empty scope returns [`ConstraintCompileError::ScopeMatchesNothing`]
+//! by default. [`CompileOptions::allow_empty_scope`] opts into returning it
+//! with its [`original_constraints`](AccessScope::original_constraints).
 //!
 //! `InTenantSubtree` carries a single `root_tenant_id` rather than a list,
 //! so the empty-list case does not arise; a missing or non-UUID root id
@@ -79,6 +80,51 @@ pub enum ConstraintCompileError {
         /// Snake-case capability names missing from the negotiated set.
         missing: Vec<&'static str>,
     },
+    /// No live compiled branches and [`CompileOptions::allow_empty_scope`] is false.
+    ///
+    /// This is a valid empty selection, mapped as an access refusal. Invalid
+    /// siblings follow the usual discard policy.
+    ///
+    /// Not a compilation defect: compilation succeeded, and this is the
+    /// fail-closed refusal of the low-level API's default. Lift it with
+    /// `EnforcerError::from`, which classifies it as
+    /// [`EnforcerError::AccessDenied`](crate::pep::EnforcerError::AccessDenied)
+    /// with [`AccessDenial::ScopeMatchesNothing`](crate::pep::AccessDenial::ScopeMatchesNothing),
+    /// so `EnforcerError::CompileFailed` handlers never see it from the
+    /// enforcer.
+    #[error(
+        "the permitted scope matches nothing: every successfully compiled constraint has an empty set"
+    )]
+    ScopeMatchesNothing,
+}
+
+/// Options for [`compile_to_access_scope_with_options`].
+///
+/// [`Self::default`] (and [`Self::new`]) fail closed on an all-empty scope.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompileOptions {
+    allow_empty_scope: bool,
+}
+
+impl CompileOptions {
+    /// Default options: refuse a scope whose every compiled branch is empty.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            allow_empty_scope: false,
+        }
+    }
+
+    /// Return permitted empty scopes instead of
+    /// [`ConstraintCompileError::ScopeMatchesNothing`] (default: false).
+    ///
+    /// Opt in for scoped queries or catalog gates that handle empty results.
+    /// Validation and `require_constraints` behavior are unchanged.
+    #[must_use]
+    pub const fn allow_empty_scope(mut self, allow: bool) -> Self {
+        self.allow_empty_scope = allow;
+        self
+    }
 }
 
 /// Per-constraint compilation failure.
@@ -146,51 +192,47 @@ impl From<String> for ConstraintFailure {
 /// opted-in [`super::ResourceType::name`]. If ALL constraints fail compilation,
 /// returns `AllConstraintsFailed`.
 ///
+/// Uses [`CompileOptions::default`]: a scope whose every compiled branch has
+/// an empty membership set is refused. See
+/// [`compile_to_access_scope_with_options`] to opt in.
+///
 /// # Errors
 ///
 /// - `ConstraintsRequiredButAbsent` if constraints were required but empty
 /// - `AllConstraintsFailed` if all constraints have unsupported predicates
+/// - `ScopeMatchesNothing` if every successfully compiled constraint has an empty set
 pub fn compile_to_access_scope(
     response: &EvaluationResponse,
     require_constraints: bool,
     supported_properties: &[&str],
 ) -> Result<AccessScope, ConstraintCompileError> {
-    compile_to_access_scope_with_resource_type(
+    compile_to_access_scope_with_options(
         response,
         require_constraints,
         supported_properties,
-        None,
+        CompileOptions::default(),
     )
 }
 
-/// Compile constraints with the canonical resource GTS type required by native
-/// group predicates.
-///
-/// The high-level enforcer derives this value from an explicitly opted-in
-/// `ResourceType::name`. Kept internal so consumers do not establish a second
-/// policy-to-membership type mapping. The public low-level [`compile_to_access_scope`] remains
-/// source-compatible and rejects native group predicates because it has no
-/// resource descriptor.
+/// [`compile_to_access_scope`] with explicit [`CompileOptions`].
 ///
 /// # Errors
 ///
-/// Returns the same errors as [`compile_to_access_scope`]. Native group
-/// predicates additionally fail compilation when `group_membership_type` is
-/// absent or empty, when UUID hierarchy keys are malformed, when the predicate
-/// targets a property other than `id`, or when the same constraint lacks an
-/// `owner_tenant_id` predicate.
-pub(crate) fn compile_to_access_scope_with_resource_type(
+/// Same as [`compile_to_access_scope`]; `ScopeMatchesNothing` only when
+/// `options` does not allow empty scopes.
+pub fn compile_to_access_scope_with_options(
     response: &EvaluationResponse,
     require_constraints: bool,
     supported_properties: &[&str],
-    group_membership_type: Option<&str>,
+    options: CompileOptions,
 ) -> Result<AccessScope, ConstraintCompileError> {
     compile_to_access_scope_impl(
         response,
         require_constraints,
         supported_properties,
-        group_membership_type,
         None,
+        None,
+        options.allow_empty_scope,
     )
 }
 
@@ -200,12 +242,14 @@ pub(crate) fn compile_to_access_scope_with_resource_type(
 /// The high-level enforcer uses this path to reject unsolicited native group
 /// predicates from a PDP. Low-level callers that explicitly provide a group
 /// membership type remain responsible for negotiating their own capabilities.
+/// `allow_empty_scope` has the meaning of [`CompileOptions::allow_empty_scope`].
 pub(crate) fn compile_to_access_scope_with_negotiated_capabilities(
     response: &EvaluationResponse,
     require_constraints: bool,
     supported_properties: &[&str],
     group_membership_type: Option<&str>,
     negotiated_capabilities: &[Capability],
+    allow_empty_scope: bool,
 ) -> Result<AccessScope, ConstraintCompileError> {
     compile_to_access_scope_impl(
         response,
@@ -213,6 +257,7 @@ pub(crate) fn compile_to_access_scope_with_negotiated_capabilities(
         supported_properties,
         group_membership_type,
         Some(negotiated_capabilities),
+        allow_empty_scope,
     )
 }
 
@@ -222,6 +267,7 @@ fn compile_to_access_scope_impl(
     supported_properties: &[&str],
     group_membership_type: Option<&str>,
     negotiated_capabilities: Option<&[Capability]>,
+    allow_empty_scope: bool,
 ) -> Result<AccessScope, ConstraintCompileError> {
     // Step 1: Handle empty constraints based on require_constraints flag.
     if response.context.constraints.is_empty() {
@@ -284,7 +330,12 @@ fn compile_to_access_scope_impl(
     // (DESIGN.md, PEP requirement #7), and each surviving predicate lowers to
     // exactly one filter. Folding empty constraints into `allow_all()` here
     // would turn a degenerate PDP permit into unrestricted access.
-    Ok(AccessScope::from_constraints(constraints))
+    // Distinguish invalid-only responses from valid empty scopes before normalizing.
+    let scope = AccessScope::from_constraints(constraints);
+    if scope.matches_nothing() && !allow_empty_scope {
+        return Err(ConstraintCompileError::ScopeMatchesNothing);
+    }
+    Ok(scope)
 }
 
 /// Compile a single PDP constraint into a `ScopeConstraint`.
@@ -368,25 +419,11 @@ fn compile_constraint(
                         .map(json_to_scope_value)
                         .collect::<Result<_, _>>()?
                 };
-                if values.is_empty() {
-                    return Err(format!(
-                        "In predicate on '{}' has empty value list (fail-closed)",
-                        p.property
-                    )
-                    .into());
-                }
                 (p.property.as_str(), ScopeFilter::r#in(&p.property, values))
             }
             Predicate::InGroup(p) => {
                 require_resource_id_group_property("InGroup", &p.property)?;
                 let group_ids = json_values_to_uuid_scope_values(&p.group_ids, "group_ids")?;
-                if group_ids.is_empty() {
-                    return Err(format!(
-                        "InGroup predicate on '{}' has empty group_ids (fail-closed)",
-                        p.property
-                    )
-                    .into());
-                }
                 let membership_type =
                     required_group_membership_type(group_membership_type, "InGroup", &p.property)?;
                 (
@@ -398,13 +435,6 @@ fn compile_constraint(
                 require_resource_id_group_property("InGroupSubtree", &p.property)?;
                 let ancestor_ids =
                     json_values_to_uuid_scope_values(&p.ancestor_ids, "ancestor_ids")?;
-                if ancestor_ids.is_empty() {
-                    return Err(format!(
-                        "InGroupSubtree predicate on '{}' has empty ancestor_ids (fail-closed)",
-                        p.property
-                    )
-                    .into());
-                }
                 let membership_type = required_group_membership_type(
                     group_membership_type,
                     "InGroupSubtree",

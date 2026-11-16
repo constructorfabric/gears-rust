@@ -108,11 +108,14 @@ pub enum DenialReason {
     /// authored in policy and are unbounded, so they collapse into this one
     /// label rather than opening the label set to arbitrary strings.
     EngineDenied,
+    /// The authorization outcome was of a class this gear does not know: an
+    /// internal failure, counted apart from denials and PDP unavailability.
+    Internal,
 }
 
 impl DenialReason {
     /// Every value, for conformance tests.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::PermissionDenied,
         Self::PdpUnavailable,
         Self::InvalidArgument,
@@ -120,6 +123,7 @@ impl DenialReason {
         Self::QuotaExceeded,
         Self::NoApplicableQuota,
         Self::EngineDenied,
+        Self::Internal,
     ];
 
     /// The label of a decision's closed reason token.
@@ -147,6 +151,7 @@ impl DenialReason {
             Self::QuotaExceeded => "quota_exceeded",
             Self::NoApplicableQuota => "no_applicable_quota",
             Self::EngineDenied => "engine_denied",
+            Self::Internal => "internal",
         }
     }
 }

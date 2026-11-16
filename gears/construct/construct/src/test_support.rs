@@ -1299,10 +1299,11 @@ impl MemoryWriter {
 
 #[async_trait]
 impl crate::domain::planner::processing::PlanWriter for MemoryWriter {
-    async fn write(
+    async fn write_by(
         &self,
         ctx: &SecurityContext,
         plan: &Plan,
+        _deadline: tokio::time::Instant,
     ) -> Result<crate::domain::planner::processing::Written, DomainError> {
         use crate::domain::planner::processing::Written;
         self.plans

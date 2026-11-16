@@ -214,6 +214,7 @@ fn request_body(model: &str, request: &ModelRequest) -> Value {
     let mut body = json!({
         "model": model,
         "messages": request.messages.iter().map(message_json).collect::<Vec<_>>(),
+        "user": request.subject_id.to_string(),
     });
     if !request.tools.is_empty() {
         body["tools"] = request.tools.iter().map(tool_json).collect();

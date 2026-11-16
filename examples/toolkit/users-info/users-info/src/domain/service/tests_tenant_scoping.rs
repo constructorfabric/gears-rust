@@ -259,3 +259,130 @@ async fn put_user_address_creates_then_updates() {
     assert_eq!(updated.street, "Second St");
     assert_eq!(updated.postal_code, "22222");
 }
+
+/// A permitted LIST whose scope matches nothing is an empty page, not a
+/// denial; a live OR branch still lists the caller's tenant. The query is
+/// still validated, and an explicit PDP denial stays a denial.
+#[tokio::test]
+async fn list_with_empty_scope_is_an_empty_page() {
+    use crate::test_support::{DenyAllAuthZResolver, build_services_with_authz};
+    use authz_resolver_sdk::test_support::EmptyScopePdp;
+    use std::sync::Arc;
+    use toolkit_odata::ODataQuery;
+
+    let db = inmem_db().await;
+    let seeder = build_services(db.clone(), ServiceConfig::default());
+    let mut rows = Vec::new();
+    for tenant in [Uuid::new_v4(), Uuid::new_v4()] {
+        let ctx = ctx_allow_tenants(&[tenant]);
+        let user_id = Uuid::new_v4();
+        seed_user(
+            &db.conn().unwrap(),
+            user_id,
+            tenant,
+            &format!("{user_id}@example.com"),
+            "U",
+        )
+        .await;
+        let city = seeder
+            .cities
+            .create_city(
+                &ctx,
+                NewCity {
+                    id: None,
+                    tenant_id: tenant,
+                    name: "C".to_owned(),
+                    country: "K".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let address = seeder
+            .addresses
+            .create_address(
+                &ctx,
+                NewAddress {
+                    id: None,
+                    tenant_id: tenant,
+                    user_id,
+                    city_id: city.id,
+                    street: "Main St".to_owned(),
+                    postal_code: "12345".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        rows.push((tenant, user_id, city.id, address.id));
+    }
+    let (tenant, user_id, city_id, address_id) = rows[0];
+    let ctx = ctx_allow_tenants(&[tenant]);
+    let bad_order =
+        ODataQuery::default().with_order(toolkit::api::odata::parse_orderby("nope asc").unwrap());
+
+    for live in [false, true] {
+        let services = build_services_with_authz(
+            db.clone(),
+            ServiceConfig::default(),
+            Arc::new(EmptyScopePdp { live }),
+        );
+        let expect = |id: Uuid| if live { vec![id] } else { vec![] };
+
+        let users = services
+            .users
+            .list_users_page(&ctx, &ODataQuery::default())
+            .await
+            .expect("a permitted LIST succeeds even when its scope is empty");
+        let ids: Vec<Uuid> = users.items.iter().map(|u| u.id).collect();
+        assert_eq!(ids, expect(user_id), "users, live: {live}");
+
+        let cities = services
+            .cities
+            .list_cities_page(&ctx, &ODataQuery::default())
+            .await
+            .expect("a permitted LIST succeeds even when its scope is empty");
+        let ids: Vec<Uuid> = cities.items.iter().map(|c| c.id).collect();
+        assert_eq!(ids, expect(city_id), "cities, live: {live}");
+
+        let addresses = services
+            .addresses
+            .list_addresses_page(&ctx, &ODataQuery::default())
+            .await
+            .expect("a permitted LIST succeeds even when its scope is empty");
+        let ids: Vec<Uuid> = addresses.items.iter().map(|a| a.id).collect();
+        assert_eq!(ids, expect(address_id), "addresses, live: {live}");
+
+        assert!(
+            services
+                .users
+                .list_users_page(&ctx, &bad_order)
+                .await
+                .is_err()
+        );
+        assert!(
+            services
+                .cities
+                .list_cities_page(&ctx, &bad_order)
+                .await
+                .is_err()
+        );
+        assert!(
+            services
+                .addresses
+                .list_addresses_page(&ctx, &bad_order)
+                .await
+                .is_err()
+        );
+    }
+
+    let denied = build_services_with_authz(
+        db.clone(),
+        ServiceConfig::default(),
+        Arc::new(DenyAllAuthZResolver),
+    );
+    let err = denied
+        .cities
+        .list_cities_page(&ctx, &ODataQuery::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DomainError::Forbidden), "{err:?}");
+}

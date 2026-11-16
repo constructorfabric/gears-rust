@@ -59,10 +59,10 @@ fn defaults_apply_to_every_entry_and_the_entry_wins() {
         "defaults": {
             "timeout": "5s",
             "max_concurrent_requests": 64,
-            "retry": { "max_attempts": 5, "base_delay": "100ms" },
+            "circuit_breaker": { "open_for": "30s", "minimum_calls": 20 },
         },
         "consumes": {
-            "billing": { "timeout": "2s", "retry": { "max_attempts": 2 } },
+            "billing": { "timeout": "2s", "circuit_breaker": { "open_for": "1m" } },
         },
     }));
 
@@ -71,11 +71,11 @@ fn defaults_apply_to_every_entry_and_the_entry_wins() {
         .unwrap();
     assert_eq!(billing.tuning.timeout, Some(Duration::from_secs(2)));
     assert_eq!(billing.tuning.max_concurrent_requests, Some(64));
-    let retry = billing.tuning.retry.unwrap();
-    assert_eq!(retry.max_attempts, Some(2));
+    let breaker = billing.tuning.circuit_breaker.unwrap();
+    assert_eq!(breaker.open_for(), Duration::from_secs(60));
     assert_eq!(
-        retry.base_delay,
-        Some(Duration::from_millis(100)),
+        breaker.minimum_calls(),
+        20,
         "nested keys merge, not replace"
     );
 
@@ -130,13 +130,13 @@ fn unknown_keys_are_rejected_with_their_path() {
 
     let err = error(provided_wiring(
         &clients(
-            &json!({ "provides": { "payment_api": { "transport": "rest", "endpoint": "http://p:1", "endpont": "http://p:2" } } }),
+            &json!({ "provides": { "payment_api": { "transport": "rest", "endpoint": "http://p:1", "grpc_endpoint": "http://p:2" } } }),
         ),
         "orders",
         "payment_api",
     ));
     assert!(
-        err.contains("gears.orders.clients.provides.payment_api.endpont: unknown key"),
+        err.contains("gears.orders.clients.provides.payment_api.grpc_endpoint: unknown key"),
         "{err}"
     );
 }
@@ -156,7 +156,7 @@ fn nested_settings_reject_unknown_keys() {
 
 #[test]
 fn an_endpoint_or_transport_in_defaults_is_rejected() {
-    for key in ["endpoint", "transport"] {
+    for key in ["endpoint", "grpc_endpoint", "transport"] {
         let gear = clients(&json!({ "defaults": { key: "http://x:1" } }));
         let err = error(consumer_wiring(&gear, "orders", "billing"));
         assert!(

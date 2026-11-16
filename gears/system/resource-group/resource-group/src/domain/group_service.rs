@@ -26,7 +26,7 @@
 
 use std::sync::Arc;
 
-use authz_resolver_sdk::pep::{PolicyEnforcer, ResourceType};
+use authz_resolver_sdk::pep::{AccessRequest, PolicyEnforcer, ResourceType};
 use resource_group_sdk::models::{
     CreateGroupRequest, GroupHierarchy, ResourceGroup, ResourceGroupWithDepth, UpdateGroupRequest,
 };
@@ -467,10 +467,15 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait> GroupService<GR, TR> {
         // upstream by the API Gateway; `ctx` carries the resulting subject).
         // @cpt-end:cpt-cf-resource-group-algo-integration-auth-auth-mode-decision:p1:inst-auth-decide-3a
         // @cpt-begin:cpt-cf-resource-group-algo-integration-auth-auth-mode-decision:p1:inst-auth-decide-3b
-        // Run PolicyEnforcer.access_scope() → AccessScope
         let scope = self
             .enforcer
-            .access_scope(ctx, &RG_GROUP_RESOURCE, "list", None)
+            .access_scope_with(
+                ctx,
+                &RG_GROUP_RESOURCE,
+                "list",
+                None,
+                &AccessRequest::new().allow_empty_scope(true),
+            )
             .await
             .map_err(DomainError::from)?;
         // @cpt-end:cpt-cf-resource-group-algo-integration-auth-auth-mode-decision:p1:inst-auth-decide-3b

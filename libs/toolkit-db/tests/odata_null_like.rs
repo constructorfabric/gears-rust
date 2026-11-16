@@ -21,9 +21,7 @@ use sea_orm::{DbBackend, QueryFilter, QueryTrait};
 use toolkit_db::odata::{
     FieldMap, FieldToColumn, ODataFieldMapping, expr_to_condition, filter_node_to_condition,
 };
-use toolkit_db::secure::ScopableEntity;
 use toolkit_odata::filter::{FieldKind, FilterField, FilterNode, parse_odata_filter};
-use toolkit_security::pep_properties;
 
 #[cfg(all(feature = "integration", any(feature = "sqlite", feature = "pg")))]
 mod common;
@@ -32,8 +30,9 @@ mod ent {
     use sea_orm::entity::prelude::*;
     use uuid::Uuid;
 
-    #[derive(Debug, Clone, PartialEq, Eq, DeriveEntityModel)]
+    #[derive(Debug, Clone, PartialEq, Eq, DeriveEntityModel, toolkit_db::secure::Scopable)]
     #[sea_orm(table_name = "odata_null_like")]
+    #[secure(tenant_col = "tenant_id", no_resource, no_owner, no_type)]
     pub struct Model {
         #[sea_orm(primary_key)]
         pub id: i64,
@@ -46,30 +45,6 @@ mod ent {
     pub enum Relation {}
 
     impl ActiveModelBehavior for ActiveModel {}
-}
-
-impl ScopableEntity for ent::Entity {
-    fn tenant_col() -> Option<<Self as EntityTrait>::Column> {
-        Some(ent::Column::TenantId)
-    }
-    fn resource_col() -> Option<<Self as EntityTrait>::Column> {
-        None
-    }
-    fn owner_col() -> Option<<Self as EntityTrait>::Column> {
-        None
-    }
-    fn type_col() -> Option<<Self as EntityTrait>::Column> {
-        None
-    }
-    fn resolve_property(property: &str) -> Option<<Self as EntityTrait>::Column> {
-        match property {
-            p if p == pep_properties::OWNER_TENANT_ID => Self::tenant_col(),
-            _ => None,
-        }
-    }
-    fn scope_columns() -> Vec<<Self as EntityTrait>::Column> {
-        vec![ent::Column::TenantId]
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::IntoStaticStr)]

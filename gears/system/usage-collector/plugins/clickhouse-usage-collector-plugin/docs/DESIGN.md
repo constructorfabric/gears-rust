@@ -81,7 +81,7 @@ Follows the same three-layer shape as the reference plugin (`docs/toolkit_unifie
 - **No `sqlx` driver.** Schema provisioning is a hand-rolled, idempotent DDL-statement runner (steps declared in code and rendered per topology, with the configured TTL; no external migration-tracking framework) plus `ensure_retention_ttl` to reconcile `retention_period_secs` on every `init` — see [§3.2](#32-component-model).
 - **`UPDATE` and `ALTER TABLE ... DELETE` are asynchronous background mutations in ClickHouse**, unsuitable for any request-path operation with a latency budget. No request-path code path issues `ALTER TABLE ... UPDATE`, and every `usage_records` status transition is a new `INSERT`. The one exception is `delete_usage_type`, which removes the catalog row with a synchronous `ALTER TABLE ... DELETE` (`mutations_sync = 1`) on a tiny, unpartitioned table and, only when its re-probe finds records that landed mid-delete, sweeps them the same way ([§3.6](#36-interactions--sequences) Delete Usage Type). No tombstone flag or higher-version marker row is needed to represent "deleted" for the catalog as a result.
 - **Gear dependencies.** The plugin's only gear dependency is `types-registry`.
-- **Dependencies policy** (`guidelines/DEPENDENCIES.md`): any synchronous in-process lock introduced by later phases uses `parking_lot::Mutex`/`RwLock`, not `std::sync`; any YAML use, if introduced, uses `serde-saphyr`.
+- **Dependencies policy** (`guidelines/DEPENDENCIES.md`): any synchronous in-process lock introduced by later phases follows the lock choice in its Concurrency section; any YAML use, if introduced, uses `serde-saphyr`.
 
 **Constraint ID index** (used for cross-artifact traceability):
 

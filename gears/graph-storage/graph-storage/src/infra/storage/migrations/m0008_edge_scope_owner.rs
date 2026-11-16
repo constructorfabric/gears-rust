@@ -1,5 +1,5 @@
 //! Which scope declared a static edge
-//! (`cpt-cf-graph-storage-fr-scope-replacement`).
+//! (`cpt-cf-graph-storage-fr-scope-replace`).
 //!
 //! A scope replacement is a declarative snapshot: what the batch does not name
 //! is gone. Nodes carried that from the first migration, because membership is

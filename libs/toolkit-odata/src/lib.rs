@@ -48,6 +48,16 @@ pub mod ast {
             Expr::And(Box::new(self), Box::new(other))
         }
 
+        /// Build a predicate that never selects a row: `self AND NOT self`.
+        ///
+        /// Use a deterministic predicate valid for the target schema. This keeps
+        /// field/type validation intact on backends that reject bare booleans or
+        /// empty IN lists. SQL NULL may yield UNKNOWN, which also excludes a row.
+        #[must_use]
+        pub fn contradiction(self) -> Expr {
+            self.clone().and(!self)
+        }
+
         /// Combine two expressions with OR: `expr1 or expr2`
         #[must_use]
         pub fn or(self, other: Expr) -> Expr {

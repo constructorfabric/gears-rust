@@ -3279,14 +3279,43 @@ mod private_helpers_tests {
         assert!(matches!(f, Expr::And(..)));
     }
 
+    /// A deny-all (all-empty) scope is not an error on the query path: it
+    /// AND-s an always-false contradiction into the user filter, so the
+    /// backend runs the query and returns its own empty-input result.
     #[test]
-    fn deny_all_scope_short_circuits_to_authorization_error() {
-        let err = compose_query_with_scope(&ODataQuery::new(), &AccessScope::deny_all())
-            .expect_err("deny_all -> PermissionDenied");
-        assert!(
-            matches!(err, UsageCollectorError::PermissionDenied { .. }),
-            "deny_all must surface as PermissionDenied, got {err:?}",
+    fn deny_all_scope_and_merges_a_contradiction_into_the_user_filter() {
+        let nil_tenant = Expr::Compare(
+            Box::new(Expr::Identifier("tenant_id".into())),
+            CompareOperator::Eq,
+            Box::new(Expr::Value(Value::Uuid(Uuid::nil()))),
         );
+        let contradiction = nil_tenant.clone().and(Expr::Not(Box::new(nil_tenant)));
+        let user_filter = Expr::Compare(
+            Box::new(Expr::Identifier("status".into())),
+            CompareOperator::Eq,
+            Box::new(Expr::Value(Value::String("active".into()))),
+        );
+        let mut user_query = ODataQuery::new();
+        user_query.filter = Some(Box::new(user_filter.clone()));
+        let all_empty = AccessScope::for_tenants(vec![]);
+        for scope in [AccessScope::deny_all(), all_empty] {
+            let bare = compose_query_with_scope(&ODataQuery::new(), &scope)
+                .expect("an empty scope composes");
+            assert_eq!(
+                format!("{:?}", bare.filter()),
+                format!("{:?}", Some(&contradiction))
+            );
+            let composed =
+                compose_query_with_scope(&user_query, &scope).expect("an empty scope composes");
+            assert_eq!(
+                format!("{:?}", composed.filter()),
+                format!(
+                    "{:?}",
+                    Some(&user_filter.clone().and(contradiction.clone()))
+                ),
+                "the user filter is AND-ed with the contradiction, never replaced"
+            );
+        }
     }
 }
 
@@ -4065,6 +4094,94 @@ mod aggregate_op_kind_enforcement_tests {
                 spec(op),
             )
             .await
+    }
+
+    #[tokio::test]
+    async fn empty_authorization_set_keeps_backend_aggregate_bucket() {
+        use authz_resolver_sdk::{
+            AuthZResolverApi,
+            constraints::{Constraint, InPredicate, Predicate},
+            models::{EvaluationRequest, EvaluationResponse, EvaluationResponseContext},
+        };
+        use toolkit_canonical_errors::CanonicalError;
+        use toolkit_odata::ast::{CompareOperator, Expr, Value};
+        use toolkit_security::PlatformSecurityContext;
+
+        struct EmptyScopePermit;
+
+        #[async_trait::async_trait]
+        impl AuthZResolverApi for EmptyScopePermit {
+            async fn evaluate(
+                &self,
+                _ctx: PlatformSecurityContext,
+                _request: EvaluationRequest,
+            ) -> Result<EvaluationResponse, CanonicalError> {
+                Ok(EvaluationResponse {
+                    decision: true,
+                    context: EvaluationResponseContext {
+                        constraints: vec![Constraint {
+                            predicates: vec![Predicate::In(InPredicate::new(
+                                pep_properties::OWNER_TENANT_ID,
+                                Vec::<Uuid>::new(),
+                            ))],
+                        }],
+                        ..Default::default()
+                    },
+                })
+            }
+        }
+
+        let plugin = HappyPathPlugin::new();
+        plugin.set_get_usage_type(usage_type(UsageKind::Counter));
+        let expected = AggregationResult {
+            buckets: vec![AggregationBucket {
+                key: vec![],
+                value: Some(0.into()),
+            }],
+        };
+        plugin.set_query_aggregated_usage_records_response(expected.clone());
+        let hub = hub_with_plugin(
+            plugin.clone() as Arc<dyn UsageCollectorPluginV1>,
+            "test.aggregate.empty.scope.v1",
+            "constructorfabric",
+        );
+        let service = Service::new(
+            hub,
+            "constructorfabric".to_owned(),
+            enforcer_for(Arc::new(EmptyScopePermit)),
+        );
+        let actual = service
+            .query_aggregated_usage_records(
+                &authenticated_ctx(),
+                gts_id(),
+                &bounded_window(),
+                &[],
+                spec(AggregationOp::Count),
+            )
+            .await
+            .expect("an allowed empty scope still dispatches to storage");
+        assert_eq!(
+            actual, expected,
+            "preserve the backend's ungrouped zero bucket"
+        );
+        // The storage call must carry the empty scope as a contradiction
+        // AND-ed with the caller's window, not the bare window.
+        let nil_tenant = Expr::Compare(
+            Box::new(Expr::Identifier("tenant_id".to_owned())),
+            CompareOperator::Eq,
+            Box::new(Expr::Value(Value::Uuid(Uuid::nil()))),
+        );
+        let contradiction = nil_tenant.clone().and(Expr::Not(Box::new(nil_tenant)));
+        let window = bounded_window().filter().cloned().expect("window filter");
+        let forwarded = plugin
+            .last_query_aggregated_usage_records_input()
+            .expect("storage was called");
+        // `Expr` has no `PartialEq`; its derived `Debug` is a faithful rendering.
+        assert_eq!(
+            format!("{:?}", forwarded.filter()),
+            format!("{:?}", Some(&window.and(contradiction))),
+            "forwarded filter must AND the empty-scope contradiction"
+        );
     }
 
     fn assert_op_not_allowed(result: Result<AggregationResult, UsageCollectorError>) {

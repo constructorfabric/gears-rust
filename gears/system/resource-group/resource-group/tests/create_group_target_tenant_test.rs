@@ -42,6 +42,7 @@
 
 mod common;
 
+use authz_resolver_sdk::test_support::EmptyScopePdp;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -589,4 +590,332 @@ async fn create_group_unscoped_tenant_typed_with_explicit_tenant_id_rejected() {
         .expect_err("tenant-typed unscoped create with an explicit tenant_id must be rejected");
 
     assert!(matches!(err, DomainError::Validation { .. }));
+}
+
+/// Empty permits must not become writes, including on the own-tenant shortcut.
+#[tokio::test]
+async fn empty_scope_never_authorizes_group_creation() {
+    use resource_group::domain::repo::GroupRepositoryTrait;
+    struct EmptyBranchAuthZ {
+        target: Uuid,
+        live_tenant: Option<Uuid>,
+    }
+    #[async_trait]
+    impl AuthZResolverApi for EmptyBranchAuthZ {
+        async fn evaluate(
+            &self,
+            _ctx: PlatformSecurityContext,
+            _request: EvaluationRequest,
+        ) -> Result<EvaluationResponse, CanonicalError> {
+            let mut constraints = vec![Constraint {
+                predicates: vec![
+                    Predicate::In(InPredicate::new(
+                        pep_properties::OWNER_TENANT_ID,
+                        [self.target],
+                    )),
+                    Predicate::In(InPredicate::new(
+                        pep_properties::RESOURCE_ID,
+                        Vec::<Uuid>::new(),
+                    )),
+                ],
+            }];
+            if let Some(tenant) = self.live_tenant {
+                constraints.push(Constraint {
+                    predicates: vec![Predicate::In(InPredicate::new(
+                        pep_properties::OWNER_TENANT_ID,
+                        [tenant],
+                    ))],
+                });
+            }
+            Ok(EvaluationResponse {
+                decision: true,
+                context: EvaluationResponseContext {
+                    constraints,
+                    deny_reason: None,
+                },
+            })
+        }
+    }
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let root_type = common::create_root_type(&type_svc, "emptyscope").await;
+    let caller = Uuid::from_u128(1);
+    let foreign = Uuid::from_u128(2);
+    let ctx = common::make_ctx(caller);
+    let mut expected_rows = 0;
+    for (target, live_tenant) in [
+        (caller, None),
+        (foreign, None),
+        (foreign, Some(caller)),
+        (caller, Some(caller)),
+        (foreign, Some(foreign)),
+    ] {
+        let svc = make_group_service_with_enforcer(
+            db.clone(),
+            PolicyEnforcer::new(Arc::new(EmptyBranchAuthZ {
+                target,
+                live_tenant,
+            })),
+        );
+        let result = svc
+            .create_group(
+                &ctx,
+                CreateGroupRequest::new(root_type.code.clone(), "EmptyScope".to_owned())
+                    .with_tenant_id(Some(target)),
+                caller,
+            )
+            .await;
+        if live_tenant == Some(target) {
+            let group = result.expect("a live OR alternative authorizes creation");
+            assert_eq!(group.hierarchy.tenant_id, target);
+            expected_rows += 1;
+        } else if live_tenant.is_none() {
+            // All branches empty: the legacy PEP refuses before any tenant gate.
+            assert!(
+                matches!(result, Err(DomainError::AccessDenied { .. })),
+                "{result:?}"
+            );
+        } else {
+            assert!(
+                matches!(result, Err(DomainError::TenantNotFound { .. })),
+                "{result:?}"
+            );
+        }
+        let stored = GroupRepository
+            .list_groups(
+                &db.conn().expect("connection"),
+                &toolkit_security::AccessScope::allow_all(),
+                &toolkit_odata::ODataQuery::new(),
+            )
+            .await
+            .expect("inspect groups after authorization");
+        assert_eq!(
+            stored.items.len(),
+            expected_rows,
+            "a refused create writes no group"
+        );
+    }
+}
+
+#[tokio::test]
+async fn empty_scope_cannot_create_types_or_memberships() {
+    use resource_group::domain::membership_service::MembershipService;
+    use resource_group::domain::repo::TypeRepositoryTrait;
+    use resource_group::domain::type_service::TypeService;
+    use resource_group::infra::storage::membership_repo::MembershipRepository;
+    let db = common::test_db().await;
+    let tenant = Uuid::from_u128(1);
+    let ctx = common::make_ctx(tenant);
+    let seed_types = common::make_type_service(db.clone());
+    let member_type = common::create_root_type(&seed_types, "emptymember").await;
+    let group_type = seed_types
+        .create_type_unscoped(CreateTypeRequest {
+            code: format!(
+                "{}x.test.emptygroup.i{}.v1~",
+                toolkit_gts::gts_id!("cf.core.rg.type.v1~"),
+                Uuid::now_v7().as_simple()
+            ),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![member_type.code.clone()],
+            metadata_schema: None,
+        })
+        .await
+        .expect("seed membership-compatible group type");
+    let group = common::create_root_group(
+        &common::make_group_service(db.clone()),
+        &ctx,
+        &group_type.code,
+        "Seed",
+        tenant,
+    )
+    .await;
+    let seed_memberships = common::make_membership_service(db.clone());
+    seed_memberships
+        .add_membership_unscoped(group.id, &member_type.code, "seed")
+        .await
+        .expect("seed membership");
+    for live in [false, true] {
+        let pep = PolicyEnforcer::new(Arc::new(EmptyScopePdp { live }));
+        let types = TypeService::new(db.clone(), pep.clone(), Arc::new(TypeRepository));
+        let code = format!(
+            "{}x.test.empty.i{}.v1~",
+            TENANT_RG_TYPE_PATH,
+            Uuid::now_v7().as_simple()
+        );
+        let result = types
+            .create_type(
+                &ctx,
+                CreateTypeRequest {
+                    code: code.clone(),
+                    can_be_root: true,
+                    allowed_parent_types: vec![],
+                    allowed_membership_types: vec![],
+                    metadata_schema: None,
+                },
+            )
+            .await;
+        assert_eq!(result.is_ok(), live);
+        let conn = db.conn().expect("connection");
+        assert_eq!(
+            TypeRepository
+                .resolve_id(&conn, &code)
+                .await
+                .expect("inspect type row")
+                .is_some(),
+            live
+        );
+        let memberships = MembershipService::new(
+            db.clone(),
+            pep,
+            Arc::new(GroupRepository),
+            Arc::new(TypeRepository),
+            Arc::new(MembershipRepository),
+        );
+        let added = memberships
+            .add_membership(&ctx, group.id, &member_type.code, "new")
+            .await;
+        assert_eq!(added.is_ok(), live);
+        let removed = memberships
+            .remove_membership(&ctx, group.id, &member_type.code, "seed")
+            .await;
+        assert_eq!(removed.is_ok(), live);
+        if !live {
+            assert!(matches!(added, Err(DomainError::AccessDenied { .. })));
+            assert!(matches!(removed, Err(DomainError::AccessDenied { .. })));
+        }
+        let page = memberships
+            .list_memberships(&ctx, &toolkit_odata::ODataQuery::new())
+            .await
+            .expect("list");
+        assert_eq!(page.items.len(), usize::from(live));
+        let stored = seed_memberships
+            .list_memberships_unscoped(&toolkit_odata::ODataQuery::new())
+            .await
+            .expect("inspect memberships");
+        assert_eq!(stored.items.len(), 1);
+        assert_eq!(
+            stored.items[0].resource_id,
+            if live { "new" } else { "seed" }
+        );
+    }
+}
+
+#[tokio::test]
+async fn empty_scope_lists_succeed_and_still_validate_user_filters() {
+    use resource_group::domain::{
+        membership_service::MembershipService, type_service::TypeService,
+    };
+    use resource_group::infra::storage::membership_repo::MembershipRepository;
+    use toolkit_odata::{ODataQuery, parse_filter_string};
+    let db = common::test_db().await;
+    let tenant = Uuid::from_u128(1);
+    let ctx = common::make_ctx(tenant);
+    let seed_types = common::make_type_service(db.clone());
+    let member_type = common::create_root_type(&seed_types, "emptylist").await;
+    let group_type = seed_types
+        .create_type_unscoped(CreateTypeRequest {
+            code: format!(
+                "{}x.test.emptylistgroup.i{}.v1~",
+                toolkit_gts::gts_id!("cf.core.rg.type.v1~"),
+                Uuid::now_v7().as_simple()
+            ),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![member_type.code.clone()],
+            metadata_schema: None,
+        })
+        .await
+        .expect("seed membership-compatible group type");
+    let group = common::create_root_group(
+        &common::make_group_service(db.clone()),
+        &ctx,
+        &group_type.code,
+        "Seed",
+        tenant,
+    )
+    .await;
+    common::make_membership_service(db.clone())
+        .add_membership_unscoped(group.id, &member_type.code, "seed")
+        .await
+        .expect("seed membership");
+    let query = |raw: &str| {
+        ODataQuery::new().with_filter(parse_filter_string(raw).expect("parse filter").into_expr())
+    };
+    for live in [false, true] {
+        let pep = PolicyEnforcer::new(Arc::new(EmptyScopePdp { live }));
+        let types = TypeService::new(db.clone(), pep.clone(), Arc::new(TypeRepository));
+        let page = types
+            .list_types(&ctx, &ODataQuery::new())
+            .await
+            .expect("allowed LIST");
+        assert_eq!(page.items.is_empty(), !live);
+        // A valid user filter that matches a seeded type must still be
+        // combined with the empty scope, not replace it.
+        let by_code = types
+            .list_types(&ctx, &query(&format!("code eq '{}'", member_type.code)))
+            .await
+            .expect("valid user filter");
+        assert_eq!(by_code.items.len(), usize::from(live), "live={live}");
+        assert!(
+            types
+                .list_types(&ctx, &query("unknown_field eq 'x'"))
+                .await
+                .is_err()
+        );
+        let members = MembershipService::new(
+            db.clone(),
+            pep,
+            Arc::new(GroupRepository),
+            Arc::new(TypeRepository),
+            Arc::new(MembershipRepository),
+        );
+        // The seeded membership matches the user filter, so only the empty
+        // scope can hide it.
+        let seeded = members
+            .list_memberships(&ctx, &query("resource_id eq 'seed'"))
+            .await
+            .expect("valid user filter");
+        assert_eq!(seeded.items.len(), usize::from(live), "live={live}");
+        let unknown_type =
+            query("resource_type eq 'gts.cf.core.rg.type.v1~x.test.empty.unknown.v1~'");
+        assert!(matches!(
+            members.list_memberships(&ctx, &unknown_type).await,
+            Err(DomainError::Validation { .. })
+        ));
+    }
+}
+
+#[tokio::test]
+async fn list_groups_empty_scope_preserves_live_or() {
+    let db = common::test_db().await;
+    let types = common::make_type_service(db.clone());
+    let group_type = common::create_root_type(&types, "emptygrouplist").await;
+    let tenant = Uuid::new_v4();
+    let ctx = common::make_ctx(tenant);
+    let seed = common::make_group_service(db.clone());
+    let own = common::create_root_group(&seed, &ctx, &group_type.code, "Own", tenant).await;
+    let other = Uuid::new_v4();
+    common::create_root_group(
+        &seed,
+        &common::make_ctx(other),
+        &group_type.code,
+        "Other",
+        other,
+    )
+    .await;
+    for live in [false, true] {
+        let svc = make_group_service_with_enforcer(
+            db.clone(),
+            PolicyEnforcer::new(Arc::new(EmptyScopePdp { live })),
+        );
+        let page = svc
+            .list_groups(&ctx, &toolkit_odata::ODataQuery::new())
+            .await
+            .expect("permitted LIST succeeds even when its scope is empty");
+        assert_eq!(page.items.len(), usize::from(live));
+        if live {
+            assert_eq!(page.items[0].id, own.id);
+        }
+    }
 }

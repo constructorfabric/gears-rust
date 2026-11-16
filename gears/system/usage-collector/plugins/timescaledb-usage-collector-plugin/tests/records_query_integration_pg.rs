@@ -917,3 +917,98 @@ async fn pg_aggregate_metadata_filter_narrows_sum() {
         "SUM includes only the us-east-1 rows (2 + 3); eu-west-1's 7 is excluded by the metadata filter"
     );
 }
+
+/// The empty-set projection must select no rows while retaining the engine's
+/// normal empty-input aggregate result, and must not suppress a live OR branch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pg_empty_authorization_set_preserves_list_and_aggregate_semantics() {
+    let (_h, store) = setup_with_type(VCPU_GTS, &[]).await;
+    let allowed = Uuid::from_u128(0x5852_000A);
+    let excluded = Uuid::from_u128(0x5852_000B);
+    let mut expected_ids = Vec::new();
+    for (i, tenant, value) in [(0, allowed, 4), (1, allowed, 6), (2, excluded, 100)] {
+        let mut record = record_at(
+            VCPU_GTS,
+            tenant,
+            0x5852_0000 + u128::try_from(i).unwrap(),
+            i,
+        );
+        record.value = Decimal::new(value, 0);
+        if tenant == allowed {
+            expected_ids.push(record.id);
+        }
+        store.create(record).await.expect("seed both tenants");
+    }
+    let tenant_eq = |id| {
+        Expr::Compare(
+            Box::new(Expr::Identifier("tenant_id".into())),
+            CompareOperator::Eq,
+            Box::new(Expr::Value(Value::Uuid(id))),
+        )
+    };
+    let eq = tenant_eq(Uuid::nil());
+    let empty = tenant_eq(excluded).and(eq.clone().and(Expr::Not(Box::new(eq))));
+    for with_alternative in [false, true] {
+        let filter = if with_alternative {
+            empty.clone().or(tenant_eq(allowed))
+        } else {
+            empty.clone()
+        };
+        let query = ODataQuery::new()
+            .with_filter(filter)
+            .with_order(created_at_id_asc());
+        let page = store
+            .list(common::fixture_gts_id(VCPU_GTS), &query, &[])
+            .await
+            .expect("list with an empty authorization branch");
+        let ids: Vec<_> = page.items.iter().map(|record| record.id).collect();
+        assert_eq!(
+            ids,
+            if with_alternative {
+                expected_ids.clone()
+            } else {
+                vec![]
+            }
+        );
+        assert!(page.page_info.next_cursor.is_none());
+
+        // Compare against an ordinary tenant scope with the same survivor
+        // set, so the assertion preserves each backend's aggregate semantics.
+        let reference = ODataQuery::new().with_filter(tenant_eq(if with_alternative {
+            allowed
+        } else {
+            Uuid::from_u128(0x5852_000C)
+        }));
+        for op in [
+            AggregationOp::Sum,
+            AggregationOp::Count,
+            AggregationOp::Min,
+            AggregationOp::Max,
+            AggregationOp::Avg,
+        ] {
+            for group_by in [vec![], vec![AggregationDimension::TenantId]] {
+                let spec = AggregationSpec { op, group_by };
+                let expected = store
+                    .aggregate(
+                        common::fixture_gts_id(VCPU_GTS),
+                        &reference,
+                        &[],
+                        spec.clone(),
+                    )
+                    .await
+                    .expect("reference aggregate");
+                let actual = store
+                    .aggregate(common::fixture_gts_id(VCPU_GTS), &query, &[], spec)
+                    .await
+                    .expect("aggregate with an empty authorization branch");
+                assert_eq!(
+                    actual, expected,
+                    "OR alternative={with_alternative}, op={op:?}"
+                );
+                if with_alternative && matches!(op, AggregationOp::Sum) {
+                    assert_eq!(actual.buckets[0].value, Some(BigDecimal::from(10)));
+                }
+            }
+        }
+    }
+}

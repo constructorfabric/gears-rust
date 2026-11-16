@@ -1,7 +1,7 @@
 # Out-of-process (loopback) E2E suite — self-managed.
 #
 # This suite verifies the Profile 2 (Host + Workers) OoP wiring on loopback: it
-# boots flight-control (edge + DirectoryService) and three OoP gear processes on
+# boots flight-control (edge + DirectoryService) and four OoP gear processes on
 # loopback, discovered via the directory and fronted by the built-in edge — the
 # same OoP software path a Profile 3 (Kubernetes) deployment shares, minus pods
 # and an external gateway. It then asserts the cross-process seams that no unit
@@ -19,6 +19,12 @@
 #       over REST across the OoP boundary (consumer -> provider, discovered via
 #       the directory) plus how the receiving gear rejects malformed (400) /
 #       incomplete (422) input, not a 500.
+#   - test_grpc_contract_calls.py: the same contract over gRPC (a consumer
+#       declared with `transport = grpc`, the provider's service found in the
+#       directory): unary calls, canonical errors through the Problem trailer,
+#       server streaming (read whole, and relayed as NDJSON with open-time
+#       rejection), the tenant surviving the hop, and REST/gRPC sharing one
+#       provider.
 #   - test_lifecycle.py: dynamic lifecycle driven by stopping/starting gears —
 #       * route (de)registration: a gracefully stopped gear deregisters and the
 #         edge drops its route; a restart re-registers it
@@ -26,6 +32,11 @@
 #         reports /readyz 503 (unresolved_deps), then flips to 200 once resolved
 #       * contract-call resilience (ADR-0005): with its provider down, a consumer
 #         charge degrades to a clean 503 (problem+json) and recovers after restart
+#       * both of the above for the REST and the gRPC consumer
+#       * gRPC only: readiness follows the published gRPC service, not the REST
+#         endpoint; the client follows a provider that moved to another port;
+#         the circuit breaker (set in the consumer's `clients` section) opens on
+#         a provider that stopped answering and closes when it answers again
 #
 # It owns its own lifecycle (multiple distinct binaries), so it is NOT run by the
 # shared `make e2e-local`. Run it directly:

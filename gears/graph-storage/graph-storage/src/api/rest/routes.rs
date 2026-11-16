@@ -17,6 +17,12 @@ use crate::domain::service::GraphServices;
 const API_TAG: &str = "Graph Storage";
 const BASE: &str = "/graph-storage/v1";
 
+/// The `?tenant=` every route but readiness takes (gears-rust #5623).
+const TENANT_PARAM: &str = "The tenant (UUID) the call is about. Absent, the caller's own \
+     tenant. Present, the policy decides whether the caller may act there, and a call it \
+     refuses is answered 404, as for an unknown tenant; a granted call reads and writes that \
+     tenant's rows alone";
+
 pub(crate) struct License;
 
 impl AsRef<str> for License {
@@ -59,6 +65,7 @@ fn ontology_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .authenticated()
         .require_license_features::<License>([])
         .json_request::<dto::GraphRegisterTypesRequest>(openapi, "Types to register")
+        .query_param_typed("tenant", false, TENANT_PARAM, "string")
         .handler(handlers::register_types)
         // An array response is emitted inline: registering `Vec<T>` as a
         // component would name it `Vec`, which every other array resolves to.
@@ -70,6 +77,7 @@ fn ontology_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         )
         .error_400(openapi)
         .error_401(openapi)
+        .error_404(openapi)
         .error_403(openapi)
         .error_409(openapi)
         .error_500(openapi)
@@ -102,6 +110,7 @@ fn ontology_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .authenticated()
         .require_license_features::<License>([])
         .json_request::<dto::GraphRegisterTypesRequest>(openapi, "Candidate definitions")
+        .query_param_typed("tenant", false, TENANT_PARAM, "string")
         .handler(handlers::type_compatibility)
         .json_response_with_schema::<dto::GraphTypeCompatibilityDto>(
             openapi,
@@ -110,6 +119,7 @@ fn ontology_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         )
         .error_400(openapi)
         .error_401(openapi)
+        .error_404(openapi)
         .error_403(openapi)
         .error_500(openapi)
         .error_503(openapi)
@@ -139,6 +149,7 @@ fn ontology_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
             false,
             "Continuation token from a previous page's `next_cursor`",
         )
+        .query_param_typed("tenant", false, TENANT_PARAM, "string")
         .handler(handlers::list_types)
         .json_response_with_schema::<dto::GraphTypeListDto>(
             openapi,
@@ -147,6 +158,7 @@ fn ontology_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         )
         .error_400(openapi)
         .error_401(openapi)
+        .error_404(openapi)
         .error_403(openapi)
         .error_500(openapi)
         .error_503(openapi)
@@ -164,6 +176,7 @@ fn ontology_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .tag(API_TAG)
         .authenticated()
         .require_license_features::<License>([])
+        .query_param_typed("tenant", false, TENANT_PARAM, "string")
         .handler(handlers::list_source_namespaces)
         .json_response_with_schema::<dto::GraphSourceNamespaceListDto>(
             openapi,
@@ -171,6 +184,7 @@ fn ontology_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
             "Claimed namespaces",
         )
         .error_401(openapi)
+        .error_404(openapi)
         .error_403(openapi)
         .error_500(openapi)
         .error_503(openapi)
@@ -190,6 +204,7 @@ fn ontology_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .require_license_features::<License>([])
         .path_param("namespace", "The `source.system` value to transfer")
         .json_request::<dto::GraphTransferNamespaceRequest>(openapi, "The new owner")
+        .query_param_typed("tenant", false, TENANT_PARAM, "string")
         .handler(handlers::transfer_source_namespace)
         .json_response_with_schema::<dto::GraphSourceNamespaceDto>(
             openapi,
@@ -198,6 +213,7 @@ fn ontology_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         )
         .error_400(openapi)
         .error_401(openapi)
+        .error_404(openapi)
         .error_403(openapi)
         .error_500(openapi)
         .error_503(openapi)
@@ -210,6 +226,7 @@ fn ontology_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .authenticated()
         .require_license_features::<License>([])
         .path_param("gts_type_id", "Canonical GTS identifier")
+        .query_param_typed("tenant", false, TENANT_PARAM, "string")
         .handler(handlers::get_type)
         .json_response_with_schema::<dto::GraphTypeDto>(
             openapi,
@@ -240,6 +257,7 @@ fn write_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .authenticated()
         .require_license_features::<License>([])
         .json_request::<dto::GraphIngestRequest>(openapi, "Nodes and edges to apply")
+        .query_param_typed("tenant", false, TENANT_PARAM, "string")
         .handler(handlers::ingest)
         .json_response_with_schema::<dto::GraphIngestResultDto>(
             openapi,
@@ -248,6 +266,7 @@ fn write_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         )
         .error_400(openapi)
         .error_401(openapi)
+        .error_404(openapi)
         .error_403(openapi)
         .error_409(openapi)
         .error_500(openapi)
@@ -270,6 +289,7 @@ fn read_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
             "Maximum incident edges per direction",
             "integer",
         )
+        .query_param_typed("tenant", false, TENANT_PARAM, "string")
         .handler(handlers::get_node)
         .json_response_with_schema::<dto::GraphNodeDto>(openapi, http::StatusCode::OK, "The node")
         .error_400(openapi)
@@ -287,6 +307,7 @@ fn read_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .authenticated()
         .require_license_features::<License>([])
         .path_param("edge_key", "Gear-derived edge key")
+        .query_param_typed("tenant", false, TENANT_PARAM, "string")
         .handler(handlers::get_edge)
         .json_response_with_schema::<dto::GraphEdgeDto>(openapi, http::StatusCode::OK, "The edge")
         .error_400(openapi)
@@ -317,6 +338,7 @@ fn read_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
             false,
             "Comma-separated GTS identifier patterns narrowing the count",
         )
+        .query_param_typed("tenant", false, TENANT_PARAM, "string")
         .handler(handlers::count_nodes)
         .json_response_with_schema::<dto::GraphNodeCountDto>(
             openapi,
@@ -326,6 +348,7 @@ fn read_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .with_odata_filter::<graph_storage_sdk::models::NodeFilterField>()
         .error_400(openapi)
         .error_401(openapi)
+        .error_404(openapi)
         .error_403(openapi)
         .error_500(openapi)
         .error_503(openapi)
@@ -353,6 +376,7 @@ fn read_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
             false,
             "Comma-separated GTS identifier patterns narrowing the projection",
         )
+        .query_param_typed("tenant", false, TENANT_PARAM, "string")
         .handler(handlers::project_nodes)
         .json_response_with_schema::<toolkit_odata::Page<dto::GraphNodeRowDto>>(
             openapi,
@@ -364,6 +388,7 @@ fn read_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .with_odata_select()
         .error_400(openapi)
         .error_401(openapi)
+        .error_404(openapi)
         .error_403(openapi)
         .error_500(openapi)
         .error_503(openapi)
@@ -376,6 +401,7 @@ fn read_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .authenticated()
         .require_license_features::<License>([])
         .path_param("node_key", "Producer-supplied node key")
+        .query_param_typed("tenant", false, TENANT_PARAM, "string")
         .handler(handlers::delete_node)
         .json_response_with_schema::<dto::GraphDeleteResultDto>(
             openapi,
@@ -397,6 +423,7 @@ fn read_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .authenticated()
         .require_license_features::<License>([])
         .path_param("edge_key", "Derived edge key")
+        .query_param_typed("tenant", false, TENANT_PARAM, "string")
         .handler(handlers::delete_edge)
         .json_response_with_schema::<dto::GraphDeleteResultDto>(
             openapi,
@@ -425,6 +452,7 @@ fn query_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .authenticated()
         .require_license_features::<License>([])
         .json_request::<dto::GraphSearchRequest>(openapi, "The search request")
+        .query_param_typed("tenant", false, TENANT_PARAM, "string")
         .handler(handlers::search)
         .json_response_with_schema::<dto::GraphSearchResponseDto>(
             openapi,
@@ -433,6 +461,7 @@ fn query_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         )
         .error_400(openapi)
         .error_401(openapi)
+        .error_404(openapi)
         .error_403(openapi)
         .error_500(openapi)
         .error_503(openapi)
@@ -449,6 +478,7 @@ fn query_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .authenticated()
         .require_license_features::<License>([])
         .json_request::<dto::GraphTraverseRequest>(openapi, "Seeds and bounds")
+        .query_param_typed("tenant", false, TENANT_PARAM, "string")
         .handler(handlers::traverse)
         .json_response_with_schema::<dto::GraphTraversalResponseDto>(
             openapi,
@@ -457,6 +487,7 @@ fn query_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         )
         .error_400(openapi)
         .error_401(openapi)
+        .error_404(openapi)
         .error_403(openapi)
         .error_500(openapi)
         .error_503(openapi)
@@ -469,6 +500,7 @@ fn query_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .authenticated()
         .require_license_features::<License>([])
         .json_request::<dto::GraphNeighborhoodRequest>(openapi, "Root and bounds")
+        .query_param_typed("tenant", false, TENANT_PARAM, "string")
         .handler(handlers::neighborhood)
         .json_response_with_schema::<dto::GraphTraversalResponseDto>(
             openapi,
@@ -477,6 +509,7 @@ fn query_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         )
         .error_400(openapi)
         .error_401(openapi)
+        .error_404(openapi)
         .error_403(openapi)
         .error_500(openapi)
         .error_503(openapi)
@@ -517,6 +550,7 @@ fn query_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .tag(API_TAG)
         .authenticated()
         .require_license_features::<License>([])
+        .query_param_typed("tenant", false, TENANT_PARAM, "string")
         .handler(handlers::revision)
         .json_response_with_schema::<dto::GraphRevisionDto>(
             openapi,
@@ -524,6 +558,7 @@ fn query_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
             "The current revision",
         )
         .error_401(openapi)
+        .error_404(openapi)
         .error_403(openapi)
         .error_500(openapi)
         .error_503(openapi)

@@ -44,6 +44,13 @@ use toolkit_contract::runtime::multipart::{
 };
 use toolkit_contract::runtime::transport_error::TransportError;
 
+/// Config for a plaintext mock server. A FIPS build requires TLS by default
+/// and installs no crypto provider, so opt in to plaintext and install one.
+fn plaintext_config(base_url: impl Into<String>) -> ClientConfig {
+    drop(toolkit_security::tls::configured_provider().install_default());
+    ClientConfig::new(base_url).with_require_tls(false)
+}
+
 /// The boundary the hand-rolled raw-body handlers use, so the test can write
 /// wire bytes the framer would not (an omitted close delimiter).
 const RAW_BOUNDARY: &str = "raw-test-boundary";
@@ -253,7 +260,7 @@ async fn open(url: &str) -> MultipartStream<Frame, ByteStream> {
     // Build with the default config: the default concurrency cap is fine for a
     // roundtrip test (the limiter's permit is released once response headers
     // arrive, so it never bounds the streaming body).
-    let config = ClientConfig::new(url);
+    let config = plaintext_config(url);
     let client = build_default_http_client("multipart-roundtrip-test", &config).unwrap();
     let response = client.get(url).send().await.unwrap();
     assert!(
@@ -793,10 +800,7 @@ trait FrameApiRest: FrameApi {
 }
 
 fn frame_client(base_url: &str) -> FrameApiRestClient {
-    FrameApiRestClient::new(toolkit_contract::runtime::config::ClientConfig::new(
-        base_url,
-    ))
-    .unwrap()
+    FrameApiRestClient::new(plaintext_config(base_url)).unwrap()
 }
 
 fn ctx() -> toolkit_security::SecurityContext {
@@ -975,11 +979,12 @@ async fn immediate_multipart_reopens_under_stream_reconnect() {
 
     const MAX_ATTEMPTS: u32 = 2;
     let (base_url, state) = start_server_with_state(ContractState::default()).await;
-    let cfg = toolkit_contract::runtime::config::ClientConfig::new(&base_url)
-        .with_stream_reconnect(toolkit_contract::runtime::config::ReconnectConfig::enabled(
+    let cfg = plaintext_config(&base_url).with_stream_reconnect(
+        toolkit_contract::runtime::config::ReconnectConfig::enabled(
             MAX_ATTEMPTS,
             Duration::from_millis(1),
-        ));
+        ),
+    );
     let client = FrameApiRestClient::new(cfg).unwrap();
 
     let items: Vec<Result<Frame, FrameError>> =

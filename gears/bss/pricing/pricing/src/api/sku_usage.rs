@@ -40,7 +40,7 @@ impl PricingSkuUsage {
             .await
     }
     /// The scope `read` on `resource` gives the caller; a denial is the port's 403, a PDP outage
-    /// its 503.
+    /// its 503, an internal authorization failure a 500 without its detail.
     async fn read_scope(
         &self,
         ctx: &SecurityContext,
@@ -48,16 +48,22 @@ impl PricingSkuUsage {
     ) -> Result<AccessScope, CanonicalError> {
         authz::access_scope(&self.enforcer, ctx, resource, actions::READ, None, None)
             .await
-            .map_err(|error| match error {
-                authz::AuthzError::Denied(denial) => {
-                    tracing::debug!(reason = %denial.reason, "bss-pricing: SKU usage refused");
-                    sku_usage_denied()
-                }
-                authz::AuthzError::Unavailable(detail) => {
-                    tracing::warn!(detail, "bss-pricing: SKU usage authorization unavailable");
-                    sku_usage_unavailable("pricing authorization is unavailable")
-                }
-            })
+            .map_err(sku_usage_authz_failure)
+    }
+}
+
+fn sku_usage_authz_failure(error: authz::AuthzError) -> CanonicalError {
+    match error {
+        authz::AuthzError::Denied(denial) => {
+            tracing::debug!(reason = %denial.reason, "bss-pricing: SKU usage refused");
+            sku_usage_denied()
+        }
+        authz::AuthzError::Unavailable(detail) => {
+            tracing::warn!(detail, "bss-pricing: SKU usage authorization unavailable");
+            sku_usage_unavailable("pricing authorization is unavailable")
+        }
+        // Logged where it was classified; the detail stays off the wire.
+        authz::AuthzError::Internal(detail) => CanonicalError::internal(detail).create(),
     }
 }
 #[async_trait]

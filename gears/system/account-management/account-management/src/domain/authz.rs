@@ -52,7 +52,7 @@ use crate::domain::error::DomainError;
 ///
 /// * [`DomainError::CrossTenantDenied`] when the PDP denies the
 ///   decision or the returned constraint shape cannot be compiled
-///   (`EnforcerError::Denied` / `EnforcerError::CompileFailed`).
+///   (`EnforcerError::AccessDenied` / `EnforcerError::CompileFailed`).
 /// * [`DomainError::ServiceUnavailable`] when the PDP transport
 ///   fails — DESIGN §4.3 mandates fail-closed; AM does not provide a
 ///   local authorization fallback.

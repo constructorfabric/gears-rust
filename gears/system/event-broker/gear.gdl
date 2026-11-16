@@ -9,20 +9,25 @@ gdl_version = "1.0"
 # event-broker/src/module.rs; deps below is an exact checked mirror:
 #
 #   id             <- name = "event-broker"
-#   runtime_caps   <- capabilities = [rest, stateful]
-#   colocated_deps <- deps = [cluster, types_registry]   (link-time; uncuttable)
+#   runtime_caps   <- capabilities = [db, rest, stateful]
+#   colocated_deps <- deps = []   (the gear links no other gear)
 #   lifecycle      <- lifecycle(entry = "serve", stop_timeout = "30s")
 #
 # Other projected fields are refused by GBX0210; deps drift is GBX0214.
 
 
 AUTHZ_SDK = cargo(crate_name = "cf-gears-authz-resolver-sdk", lib = "authz_resolver_sdk", path = "../authz-resolver/authz-resolver-sdk", features = ["rest-client"])
+TR_SDK = cargo(crate_name = "cf-gears-types-registry-sdk", lib = "types_registry_sdk", path = "../types-registry/types-registry-sdk", features = ["rest-client"])
 
 gear(
-    deps = ["cluster", "types-registry"],
-    # The authorization resolver is consumed, not linked: local when co-located,
-    # REST with the platform token otherwise.
-    consumes = [consume(contract = "AuthZResolverApi", rust = "authz_resolver_sdk::AuthZResolverApi", sdk = AUTHZ_SDK)],
+    deps = [],
+    # Both contracts are consumed, not linked: local when co-located, REST with
+    # the platform token otherwise. Exact mirror of `#[toolkit::consumes]` in
+    # event-broker/src/module.rs.
+    consumes = [
+        consume(contract = "AuthZResolverApi", rust = "authz_resolver_sdk::AuthZResolverApi", sdk = AUTHZ_SDK),
+        consume(contract = "PlatformTypesRegistryApi", rust = "types_registry_sdk::PlatformTypesRegistryApi", sdk = TR_SDK),
+    ],
     source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/system/event-broker"),
     maturity = "preview",
     implementation = "in-progress",
@@ -96,6 +101,10 @@ gear(
     #   serves          -- no bind-address key exists. The gear is `rest`, not
     #                      `rest_host`: its router is composed into api-gateway's.
     #   provides -- no #[toolkit::provides] on this gear.
-    #   cargo_features  -- `cf-gears-event-broker` has no [features] section, and
-    #                      absent is not the same answer as an empty list.
+    #   cargo_features  -- `cf-gears-event-broker`'s only [features] are
+    #                      `test-utils` and `integration`, both test-only
+    #                      (the harness and the Docker-backed engine matrix).
+    #                      Neither is an operator-selectable build knob, so none
+    #                      is projected; absent is the right answer here, not an
+    #                      empty list.
 )

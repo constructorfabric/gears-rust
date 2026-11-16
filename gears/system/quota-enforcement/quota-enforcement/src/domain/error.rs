@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use authz_resolver_sdk::EnforcerError;
+use authz_resolver_sdk::{AccessDenial, EnforcerError};
 use quota_enforcement_sdk::{LeaseToken, PolicyId, PolicyScope, StorageError};
 use toolkit::plugins::ChoosePluginError;
 use toolkit_macros::domain_model;
@@ -443,6 +443,8 @@ pub enum DomainError {
 impl DomainError {
     /// Closed reason token when the PDP permit carried no usable constraints.
     pub const CONSTRAINT_COMPILE_FAILED: &'static str = "CONSTRAINT_COMPILE_FAILED";
+    /// Closed reason token when the PDP permitted a scope that matches nothing.
+    pub const SCOPE_MATCHES_NOTHING: &str = "SCOPE_MATCHES_NOTHING";
     /// Closed reason token when a projection is registered but not configured.
     pub const PROJECTION_NOT_RESOLVABLE: &'static str = "PROJECTION_NOT_RESOLVABLE";
     /// Closed reason token when storage caught a subject outside the scope.
@@ -468,7 +470,8 @@ impl DomainError {
 
 impl DomainError {
     /// Fail-closed lift of the PEP outcome: a denial and a compile failure are
-    /// both denials; only a transport failure is an availability error.
+    /// both denials; only a transport failure is an availability error; an
+    /// unknown outcome class is an internal failure.
     ///
     /// A named constructor rather than `From`: the domain error is `Clone + Eq`
     /// and crosses the layer boundary as a value, so the transport cause is
@@ -476,13 +479,25 @@ impl DomainError {
     #[must_use]
     pub fn from_enforcer(err: EnforcerError) -> Self {
         match err {
-            EnforcerError::Denied { deny_reason } => Self::PdpDenied {
-                reason: deny_reason.map(|r| r.error_code),
+            EnforcerError::AccessDenied(AccessDenial::Pdp { reason }) => Self::PdpDenied {
+                reason: reason.map(|r| r.error_code),
             },
+            EnforcerError::AccessDenied(AccessDenial::ScopeMatchesNothing) => Self::PdpDenied {
+                reason: Some(Self::SCOPE_MATCHES_NOTHING.to_owned()),
+            },
+            // A PEP-local reason this gear has no closed token for yet: still
+            // a denial, and it carries no PDP reason to report.
+            EnforcerError::AccessDenied(_) => Self::PdpDenied { reason: None },
             EnforcerError::CompileFailed(_) => Self::PdpDenied {
                 reason: Some(Self::CONSTRAINT_COMPILE_FAILED.to_owned()),
             },
             EnforcerError::EvaluationFailed(cause) => Self::PdpUnavailable(cause.to_string()),
+            // The cause is logged here; the domain error carries only a
+            // generic message.
+            unknown => {
+                tracing::error!(error = %unknown, "authz failed with an unknown outcome");
+                Self::Internal("authorization failed with an unknown outcome".to_owned())
+            }
         }
     }
 }

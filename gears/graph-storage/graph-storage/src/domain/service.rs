@@ -17,9 +17,10 @@ use graph_storage_sdk::models::{
 use graph_storage_sdk::plugin_api::{GraphEngineV1, GraphStoreV1, StoreCtx};
 use tokio_util::sync::CancellationToken;
 use toolkit_macros::domain_model;
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_security::AccessScope;
 
 use crate::config::{GraphStorageConfig, ValidatedConfig};
+use crate::domain::authz::Call;
 use crate::domain::diagnostics::logged;
 use crate::domain::embedding;
 use crate::domain::embedding::EmbeddingCoordinator;
@@ -84,10 +85,14 @@ impl GraphServices {
 
     async fn authorize(
         &self,
-        ctx: &SecurityContext,
+        call: impl Into<Call<'_>>,
         resource: &authz_resolver_sdk::pep::ResourceType,
         action: &str,
     ) -> Result<Authorized, DomainError> {
+        let Call {
+            ctx,
+            tenant: target,
+        } = call.into();
         // Before the policy call, which is itself work: a request whose
         // deadline is already gone should not spend a PDP round trip either.
         //
@@ -102,9 +107,11 @@ impl GraphServices {
         if budget.is_exhausted() {
             return Err(DomainError::Deadline);
         }
-        let scope = authz::scope_for(&self.enforcer, ctx, resource, action).await?;
+        let scope = authz::scope_for(&self.enforcer, ctx, target, resource, action).await?;
         Ok(Authorized {
-            tenant: ctx.subject_tenant_id(),
+            // Every tenant-keyed path below follows this: rows, namespaces,
+            // receipts, caps and the revision (gears-rust #5623).
+            tenant: target.unwrap_or_else(|| ctx.subject_tenant_id()),
             scope,
             subject: graph_storage_sdk::models::Subject::from_security_context(ctx),
             budget,
@@ -129,11 +136,11 @@ impl GraphServices {
 
     pub async fn register_types(
         &self,
-        ctx: &SecurityContext,
+        call: impl Into<Call<'_>>,
         batch: Vec<TypeRegistration>,
     ) -> Result<Vec<TypeRecord>, DomainError> {
         let registered = self
-            .register_types_with(ctx, batch, TypeRegistrationOptions::default())
+            .register_types_with(call, batch, TypeRegistrationOptions::default())
             .await?;
         Ok(registered.into_iter().map(|item| item.record).collect())
     }
@@ -146,13 +153,13 @@ impl GraphServices {
     /// decision.
     pub async fn type_compatibility(
         &self,
-        ctx: &SecurityContext,
+        call: impl Into<Call<'_>>,
         batch: Vec<TypeRegistration>,
         revalidate: bool,
         migrations: Vec<graph_storage_sdk::models::MigrationSpec>,
     ) -> Result<Vec<RegisteredType>, DomainError> {
         self.register_types_with(
-            ctx,
+            call,
             batch,
             TypeRegistrationOptions {
                 on_existing: OnExisting::Update,
@@ -166,10 +173,11 @@ impl GraphServices {
 
     pub async fn register_types_with(
         &self,
-        ctx: &SecurityContext,
+        call: impl Into<Call<'_>>,
         batch: Vec<TypeRegistration>,
         options: TypeRegistrationOptions,
     ) -> Result<Vec<RegisteredType>, DomainError> {
+        let call: Call<'_> = call.into();
         // A dry run is a read, and asks for read. That is the reason it is its
         // own operation rather than a flag on registration (DESIGN § "Asking
         // what an edit costs is its own operation"): a producer team should be
@@ -186,7 +194,7 @@ impl GraphServices {
             (authz::actions::ADMIN, authz::actions::WRITE)
         };
         let auth = self
-            .authorize(ctx, &authz::type_resource(), type_action)
+            .authorize(call, &authz::type_resource(), type_action)
             .await?;
         admission::admit_registration(&self.config, &batch, &options.migrations)?;
         // Reading the tenant's rows — and a migration *writes* them — is not
@@ -196,7 +204,7 @@ impl GraphServices {
         // scope reach both the catalogue and the rows. A dry run only reads
         // them, even when it previews a migration.
         let auth = if options.revalidate || !options.migrations.is_empty() {
-            self.authorize(ctx, &authz::node_resource(), row_action)
+            self.authorize(call, &authz::node_resource(), row_action)
                 .await?
         } else {
             auth
@@ -437,10 +445,10 @@ impl GraphServices {
     /// it says who may write a namespace, not what is stored under it.
     pub async fn list_source_namespaces(
         &self,
-        ctx: &SecurityContext,
+        call: impl Into<Call<'_>>,
     ) -> Result<Vec<graph_storage_sdk::models::SourceNamespaceOwner>, DomainError> {
         let auth = self
-            .authorize(ctx, &authz::type_resource(), authz::actions::READ)
+            .authorize(call, &authz::type_resource(), authz::actions::READ)
             .await?;
         Ok(self
             .store
@@ -456,7 +464,7 @@ impl GraphServices {
     /// (`fr-source-ownership`, DESIGN § Authorization Model).
     pub async fn transfer_source_namespace(
         &self,
-        ctx: &SecurityContext,
+        call: impl Into<Call<'_>>,
         namespace: &str,
         owner_principal: &str,
     ) -> Result<graph_storage_sdk::models::SourceNamespaceOwner, DomainError> {
@@ -469,7 +477,7 @@ impl GraphServices {
         // spends real care elsewhere on answers that do not vary with what the
         // caller has no business knowing, and this sat one call away from it.
         let auth = self
-            .authorize(ctx, &authz::type_resource(), authz::actions::ADMIN)
+            .authorize(call, &authz::type_resource(), authz::actions::ADMIN)
             .await?;
         admission::admit_identifier(&self.config, "namespace", namespace)?;
         admission::admit_identifier(&self.config, "owner_principal", owner_principal)?;
@@ -518,11 +526,11 @@ impl GraphServices {
 
     pub async fn get_type(
         &self,
-        ctx: &SecurityContext,
+        call: impl Into<Call<'_>>,
         type_id: &GtsTypeId,
     ) -> Result<TypeRecord, DomainError> {
         let auth = self
-            .authorize(ctx, &authz::type_resource(), authz::actions::READ)
+            .authorize(call, &authz::type_resource(), authz::actions::READ)
             .await?;
         admission::admit_identifier(&self.config, "type_id", type_id)?;
         Ok(self
@@ -533,11 +541,11 @@ impl GraphServices {
 
     pub async fn list_types(
         &self,
-        ctx: &SecurityContext,
+        call: impl Into<Call<'_>>,
         query: TypeQuery,
     ) -> Result<Page<TypeRecord>, DomainError> {
         let auth = self
-            .authorize(ctx, &authz::type_resource(), authz::actions::READ)
+            .authorize(call, &authz::type_resource(), authz::actions::READ)
             .await?;
         admission::admit_type_query(&self.config, &query)?;
         Ok(self
@@ -550,11 +558,11 @@ impl GraphServices {
 
     pub async fn ingest(
         &self,
-        ctx: &SecurityContext,
+        call: impl Into<Call<'_>>,
         mut request: IngestRequest,
     ) -> Result<IngestOutcome, DomainError> {
         let auth = self
-            .authorize(ctx, &authz::node_resource(), authz::actions::WRITE)
+            .authorize(call, &authz::node_resource(), authz::actions::WRITE)
             .await?;
         admission::normalize_ingest(&mut request);
         admission::admit_ingest(&self.config, &request)?;
@@ -804,11 +812,11 @@ impl GraphServices {
 
     pub async fn delete_node(
         &self,
-        ctx: &SecurityContext,
+        call: impl Into<Call<'_>>,
         node_key: &NodeKey,
     ) -> Result<DeleteOutcome, DomainError> {
         let auth = self
-            .authorize(ctx, &authz::node_resource(), authz::actions::DELETE)
+            .authorize(call, &authz::node_resource(), authz::actions::DELETE)
             .await?;
         admission::admit_identifier(&self.config, "node_key", node_key)?;
         Ok(self
@@ -822,11 +830,11 @@ impl GraphServices {
 
     pub async fn delete_edge(
         &self,
-        ctx: &SecurityContext,
+        call: impl Into<Call<'_>>,
         edge_key: &EdgeKey,
     ) -> Result<DeleteOutcome, DomainError> {
         let auth = self
-            .authorize(ctx, &authz::node_resource(), authz::actions::DELETE)
+            .authorize(call, &authz::node_resource(), authz::actions::DELETE)
             .await?;
         admission::admit_identifier(&self.config, "edge_key", edge_key)?;
         Ok(self
@@ -842,12 +850,12 @@ impl GraphServices {
 
     pub async fn get_node(
         &self,
-        ctx: &SecurityContext,
+        call: impl Into<Call<'_>>,
         node_key: &NodeKey,
         adjacency_limit: Option<u32>,
     ) -> Result<NodeView, DomainError> {
         let auth = self
-            .authorize(ctx, &authz::node_resource(), authz::actions::READ)
+            .authorize(call, &authz::node_resource(), authz::actions::READ)
             .await?;
         admission::admit_identifier(&self.config, "node_key", node_key)?;
         let limit = admission::admit_adjacency_limit(&self.config, adjacency_limit)?;
@@ -865,11 +873,11 @@ impl GraphServices {
     /// endpoints the scope does not admit.
     pub async fn get_edge(
         &self,
-        ctx: &SecurityContext,
+        call: impl Into<Call<'_>>,
         edge_key: &EdgeKey,
     ) -> Result<EdgeView, DomainError> {
         let auth = self
-            .authorize(ctx, &authz::node_resource(), authz::actions::READ)
+            .authorize(call, &authz::node_resource(), authz::actions::READ)
             .await?;
         admission::admit_identifier(&self.config, "edge_key", edge_key)?;
         Ok(self
@@ -880,12 +888,12 @@ impl GraphServices {
 
     pub async fn project_nodes(
         &self,
-        ctx: &SecurityContext,
+        call: impl Into<Call<'_>>,
         type_patterns: &[String],
         query: toolkit_odata::ODataQuery,
     ) -> Result<toolkit_odata::Page<NodeRow>, DomainError> {
         let auth = self
-            .authorize(ctx, &authz::node_resource(), authz::actions::READ)
+            .authorize(call, &authz::node_resource(), authz::actions::READ)
             .await?;
         admission::admit_projection(&self.config, type_patterns, &query)?;
         let type_set = self.resolve_patterns(&auth, type_patterns).await?;
@@ -922,12 +930,12 @@ impl GraphServices {
     /// `$filter`, across all its pages; exact up to `projection_count_max`.
     pub async fn count_nodes(
         &self,
-        ctx: &SecurityContext,
+        call: impl Into<Call<'_>>,
         type_patterns: &[String],
         query: toolkit_odata::ODataQuery,
     ) -> Result<NodeCount, DomainError> {
         let auth = self
-            .authorize(ctx, &authz::node_resource(), authz::actions::READ)
+            .authorize(call, &authz::node_resource(), authz::actions::READ)
             .await?;
         admission::admit_count(&self.config, type_patterns, &query)?;
         let type_set = self.resolve_patterns(&auth, type_patterns).await?;
@@ -943,11 +951,11 @@ impl GraphServices {
 
     pub async fn search(
         &self,
-        ctx: &SecurityContext,
+        call: impl Into<Call<'_>>,
         request: SearchRequest,
     ) -> Result<SearchResponse, DomainError> {
         let auth = self
-            .authorize(ctx, &authz::node_resource(), authz::actions::READ)
+            .authorize(call, &authz::node_resource(), authz::actions::READ)
             .await?;
         admission::admit_search(&self.config, &request)?;
         let store_ctx = Self::store_ctx(&auth, None);
@@ -991,9 +999,9 @@ impl GraphServices {
         Ok(answer)
     }
 
-    pub async fn revision(&self, ctx: &SecurityContext) -> Result<GraphRevision, DomainError> {
+    pub async fn revision(&self, call: impl Into<Call<'_>>) -> Result<GraphRevision, DomainError> {
         let auth = self
-            .authorize(ctx, &authz::node_resource(), authz::actions::READ)
+            .authorize(call, &authz::node_resource(), authz::actions::READ)
             .await?;
         Ok(self.store.revision(&Self::store_ctx(&auth, None)).await?)
     }
@@ -1002,11 +1010,11 @@ impl GraphServices {
 
     pub async fn traverse(
         &self,
-        ctx: &SecurityContext,
+        call: impl Into<Call<'_>>,
         request: TraverseRequest,
     ) -> Result<TraversalResponse, DomainError> {
         let auth = self
-            .authorize(ctx, &authz::node_resource(), authz::actions::READ)
+            .authorize(call, &authz::node_resource(), authz::actions::READ)
             .await?;
         admission::admit_traverse(&self.config, &request)?;
 
@@ -1035,11 +1043,11 @@ impl GraphServices {
 
     pub async fn neighborhood(
         &self,
-        ctx: &SecurityContext,
+        call: impl Into<Call<'_>>,
         request: NeighborhoodRequest,
     ) -> Result<TraversalResponse, DomainError> {
         let auth = self
-            .authorize(ctx, &authz::node_resource(), authz::actions::READ)
+            .authorize(call, &authz::node_resource(), authz::actions::READ)
             .await?;
         admission::admit_neighborhood(&self.config, &request)?;
 

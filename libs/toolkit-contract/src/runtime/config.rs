@@ -136,12 +136,17 @@ pub struct ClientConfig {
     /// This is *idle*, not *quiet*: any wire chunk resets it, including ones
     /// that dispatch no item (an SSE keepalive comment, a multipart part header
     /// block arriving on its own).
+    ///
+    /// REST only for now: the generated gRPC client does not apply it.
     pub stream_idle_timeout: Duration,
     /// Retry policy applied to methods marked `#[retryable]`.
     pub retry: RetryConfig,
     /// Reconnect policy for streams of any framing. By default
     /// `max_attempts: 0` — stream failures bubble up unchanged. Set explicitly
     /// to opt into transparent re-open on a transient failure.
+    ///
+    /// REST only for now: a generated gRPC client never reconnects a stream,
+    /// and wiring warns when this is set for one.
     ///
     /// Two limits are deliberate rather than accidental:
     ///
@@ -224,6 +229,15 @@ pub struct ClientConfig {
     /// methods (`SecurityContext`) never consult it; they forward the caller's
     /// bearer token from the argument.
     pub internal_token_provider: Option<InternalTokenProvider>,
+
+    /// Circuit breaker guarding every attempt this client sends. `None` (the
+    /// default for [`ClientConfig::new`]) sends every attempt. The wiring
+    /// paths attach one per endpoint from `ClientTuning::circuit_breaker`; see
+    /// [`crate::runtime::breaker`].
+    pub circuit_breaker: Option<Arc<toolkit_resilience::circuit_breaker::CircuitBreaker>>,
+
+    /// Runs after an attempt the breaker classified as a backend failure.
+    pub on_endpoint_failure: Option<crate::runtime::breaker::EndpointFailureHook>,
 }
 
 impl ClientConfig {
@@ -243,6 +257,8 @@ impl ClientConfig {
             pool_idle_timeout: Some(Duration::from_secs(90)),
             max_concurrent_requests: Some(128),
             internal_token_provider: None,
+            circuit_breaker: None,
+            on_endpoint_failure: None,
         }
     }
 
@@ -353,6 +369,27 @@ impl ClientConfig {
     #[must_use]
     pub fn with_max_concurrent_requests(mut self, max: Option<usize>) -> Self {
         self.max_concurrent_requests = max;
+        self
+    }
+
+    /// Guard this client's attempts with `breaker`. See [`Self::circuit_breaker`].
+    #[must_use]
+    pub fn with_circuit_breaker(
+        mut self,
+        breaker: impl Into<Option<Arc<toolkit_resilience::circuit_breaker::CircuitBreaker>>>,
+    ) -> Self {
+        self.circuit_breaker = breaker.into();
+        self
+    }
+
+    /// Run `hook` after each attempt the breaker classified as a backend
+    /// failure. See [`Self::on_endpoint_failure`].
+    #[must_use]
+    pub fn with_on_endpoint_failure(
+        mut self,
+        hook: impl Into<Option<crate::runtime::breaker::EndpointFailureHook>>,
+    ) -> Self {
+        self.on_endpoint_failure = hook.into();
         self
     }
 
@@ -529,7 +566,8 @@ pub(crate) fn default_require_tls() -> bool {
     toolkit_http::TransportSecurity::default() == toolkit_http::TransportSecurity::TlsOnly
 }
 
-fn is_https(url: &str) -> bool {
+/// `url` has an `https` scheme (case-insensitive, leading whitespace ignored).
+pub(crate) fn is_https(url: &str) -> bool {
     url.trim_start()
         .get(..8)
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))

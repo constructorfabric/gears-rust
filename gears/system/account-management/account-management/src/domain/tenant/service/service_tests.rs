@@ -3,6 +3,7 @@
 //! no filesystem.
 
 use account_management_sdk::TenantStatus as PublicTenantStatus;
+use authz_resolver_sdk::test_support::EmptyScopePdp;
 use toolkit_gts::gts_id;
 use toolkit_odata::ODataQuery;
 use toolkit_odata::ast::{CompareOperator, Expr, Value as OdataValue};
@@ -5321,5 +5322,33 @@ mod caller_provenance {
         let tenant = svc.get_tenant(&ctx, root).await.expect("get");
         assert_eq!(tenant.tenant_type, None);
         assert_only_caller(&spy.callers(), &ctx);
+    }
+}
+
+#[tokio::test]
+async fn empty_scope_cannot_provision_a_tenant() {
+    for live in [false, true] {
+        let root = Uuid::from_u128(0x5852);
+        let child = Uuid::from_u128(0x5853);
+        let repo = Arc::new(FakeTenantRepo::with_root(root));
+        let provisioner = Arc::new(FakeIdpProvisioner::new(FakeOutcome::Ok));
+        let mut svc = make_service(repo.clone(), FakeOutcome::Ok);
+        svc.enforcer = authz_resolver_sdk::PolicyEnforcer::new(Arc::new(EmptyScopePdp { live }));
+        svc.idp = provisioner.clone();
+        let result = svc
+            .create_tenant(&ctx_for(root), child_input(child, root))
+            .await;
+        assert_eq!(result.is_ok(), live);
+        if !live {
+            assert!(matches!(result, Err(DomainError::CrossTenantDenied { .. })));
+        }
+        assert_eq!(provisioner.provision_call_count(), usize::from(live));
+        assert_eq!(
+            repo.find_by_id(&AccessScope::allow_all(), child)
+                .await
+                .expect("inspect tenant row")
+                .is_some(),
+            live
+        );
     }
 }

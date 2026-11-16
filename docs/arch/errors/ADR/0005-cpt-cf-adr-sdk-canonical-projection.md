@@ -159,8 +159,13 @@ pub enum ServiceGatewayError {
 impl From<CanonicalError> for ServiceGatewayError {
     fn from(err: CanonicalError) -> Self {
         match &err {
-            CanonicalError::ResourceExhausted { .. } => Self::RateLimited { retry_after_secs: None },
+            CanonicalError::ResourceExhausted { .. } => Self::RateLimited {
+                retry_after_secs: err.retry_after_seconds(),
+            },
             CanonicalError::DeadlineExceeded { .. } => Self::Timeout,
+            CanonicalError::ServiceUnavailable { .. } => Self::Unavailable {
+                retry_after_secs: err.retry_after_seconds(),
+            },
             // … one arm per canonical variant the SDK models, plus
             // `_ => Self::Other { canonical: err.clone() }` catch-all
         }
@@ -324,6 +329,7 @@ The OAGW SDK ships `StreamingError` (in `oagw-sdk/src/error.rs`) for SSE and Web
 6. **Impl crate references the SDK constants** at every site that previously hardcoded a wire literal. The `#[resource_error("…")]` proc-macro literals are the exception; the round-trip tests pin them.
 7. **Round-trip `Problem` tests** in `{sdk}/src/error.rs::tests` pin every wire-string constant to its expected JSON path.
 8. **No transport fields in the projection**: `instance` and `trace_id` belong to the `Problem` envelope.
+   A retry delay is not a transport field: a variant that carries one reads it from `CanonicalError::retry_after_seconds()`, the same value the HTTP `Retry-After` header carries (for `ResourceExhausted`, the largest per-violation hint), never from a context directly, so the SDK and REST callers back off for the same time.
 9. **Document the projection** in the SDK's `error.rs` module rustdoc: state it is an opt-in convenience, show the three consumer integration patterns, include a consumer-dispatch reference table, and link to this ADR.
 
 ## Per-SDK Migration
@@ -342,7 +348,7 @@ Every SDK uses the same trait-contract migration. Whether to **also** ship a pro
 | `credstore-sdk` | **no** | TBD after consumer audit | ~1 day (author canonical boundary first) |
 | `authn-resolver-sdk` | **no** | no | ~1 day |
 | `tenant-resolver-sdk` | **no** | no | ~1 day |
-| `authz-resolver-sdk` | **no** | likely yes (`EnforcerError::Denied { deny_reason }` — typed payload) | ~1–2 days |
+| `authz-resolver-sdk` | **no** | likely yes (`EnforcerError::AccessDenied(AccessDenial::Pdp { reason })` — typed payload) | ~1–2 days |
 
 For the four resolver SDKs at the bottom, the canonical boundary mapping is the real cost. The trait-contract switch is trivial once that lands.
 

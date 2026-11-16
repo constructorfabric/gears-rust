@@ -65,21 +65,16 @@
 //! If you prefer not to use the derive macro:
 //!
 //! ```rust,ignore
-//! use toolkit_db::secure::ScopableEntity;
+//! use toolkit_db::secure::{Dimensions, EntityScope, ScopableEntity};
 //!
 //! impl ScopableEntity for Entity {
-//!     fn tenant_col() -> Option<Self::Column> {
-//!         Some(Column::TenantId)
-//!     }
-//!     fn resource_col() -> Option<Self::Column> {
-//!         Some(Column::Id)
-//!     }
-//!     fn owner_col() -> Option<Self::Column> {
-//!         None
-//!     }
-//!     fn type_col() -> Option<Self::Column> {
-//!         None
-//!     }
+//!     const SCOPE: EntityScope<Column> = EntityScope::Scoped(Dimensions {
+//!         tenant: Some(Column::TenantId),
+//!         resource: Some(Column::Id),
+//!         owner: None,
+//!         type_col: None,
+//!         custom: &[],
+//!     });
 //! }
 //! ```
 //!
@@ -133,7 +128,7 @@ mod tx_error;
 // Public API re-exports
 
 // Core types
-pub use entity_traits::ScopableEntity;
+pub use entity_traits::{Dimensions, EntityScope, ScopableEntity};
 pub use error::{ScopeError, is_foreign_key_violation, is_unique_violation};
 
 // Security types from toolkit-security

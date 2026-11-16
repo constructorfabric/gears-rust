@@ -51,9 +51,10 @@ impl FileService {
         limit: Option<u64>,
         cursor: Option<toolkit_odata::CursorV1>,
     ) -> Result<toolkit_odata::Page<File>, DomainError> {
-        // Authorize, then always tenant-scope the query regardless of the PDP's constraints.
-        self.authorizer
-            .authorize(ctx, actions::READ, "", None)
+        // Nonempty PDP scopes currently enforce only the tenant pin.
+        let scope = self
+            .authorizer
+            .authorize_allow_empty(ctx, actions::READ, "", None)
             .await?;
         // The READ check above is resource-less and `owner` comes from the request, so
         // listing another owner's files requires `ADMIN_POLICY` (else any tenant member
@@ -68,8 +69,14 @@ impl FileService {
             self.cfg.default_page_size,
             self.cfg.max_page_size,
         )?;
+        // Never widen an empty scope to the caller's tenant.
+        let list_scope = if scope.matches_nothing() {
+            AccessScope::deny_all()
+        } else {
+            Self::tenant_scope(ctx)
+        };
         self.store
-            .list_files(&Self::tenant_scope(ctx), owner, limit, cursor)
+            .list_files(&list_scope, owner, limit, cursor)
             .await
     }
 

@@ -129,7 +129,8 @@ pub mod permission {
     /// The policy enforcement point denied the request because the
     /// subject attempted to act outside its own tenant boundary.
     /// Emitted by PEPs that supply structured deny reasons; surfaces
-    /// here through `EnforcerError::Denied.deny_reason.error_code`.
+    /// here through `EnforcerError::AccessDenied(AccessDenial::Pdp { reason })`'s
+    /// `reason.error_code`.
     pub const TENANT_BOUNDARY_VIOLATION: &str = "TENANT_BOUNDARY_VIOLATION";
 
     /// CORS pre-flight or simple request: the request origin is not in

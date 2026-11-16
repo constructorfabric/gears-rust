@@ -183,7 +183,7 @@ async fn enforcer_different_tenants_get_different_scopes() {
     assert!(!scope_b.contains_uuid(pep_properties::OWNER_TENANT_ID, tenant_a));
 }
 
-/// Deny-all plugin returns `EnforcerError::Denied`.
+/// Deny-all plugin returns `EnforcerError::AccessDenied`.
 // Scenario: L2-AuthZ-03 - Deny-all returns denied error
 #[tokio::test]
 async fn enforcer_deny_all_returns_denied_error() {
@@ -197,7 +197,12 @@ async fn enforcer_deny_all_returns_denied_error() {
     assert!(result.is_err(), "should be denied");
     let err = result.unwrap_err();
     assert!(
-        matches!(err, authz_resolver_sdk::EnforcerError::Denied { .. }),
+        matches!(
+            err,
+            authz_resolver_sdk::EnforcerError::AccessDenied(
+                authz_resolver_sdk::AccessDenial::Pdp { .. }
+            )
+        ),
         "expected Denied error, got: {err:?}"
     );
 }
@@ -454,8 +459,10 @@ async fn full_chain_deny_all_blocks_list_groups() {
     assert!(
         matches!(
             result.unwrap_err(),
-            authz_resolver_sdk::EnforcerError::Denied { .. }
+            authz_resolver_sdk::EnforcerError::AccessDenied(
+                authz_resolver_sdk::AccessDenial::Pdp { .. }
+            )
         ),
-        "should be EnforcerError::Denied"
+        "should be EnforcerError::AccessDenied"
     );
 }

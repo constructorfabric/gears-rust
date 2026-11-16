@@ -60,7 +60,7 @@ pub fn require_authenticated(
     Ok(ctx)
 }
 /// A denial is 403 with the PDP's reason (logged where [`authz::access_scope`] made it); an
-/// unreachable PDP is 503.
+/// unreachable PDP is 503; an internal authorization failure is 500 without its detail.
 pub fn authz_failure(error: authz::AuthzError) -> CanonicalError {
     match error {
         authz::AuthzError::Denied(d) => PricingResource::permission_denied()
@@ -70,6 +70,8 @@ pub fn authz_failure(error: authz::AuthzError) -> CanonicalError {
             tracing::error!(detail, "pricing authorization unavailable");
             CanonicalError::service_unavailable().create()
         }
+        // Logged where it was classified; the detail stays off the wire.
+        authz::AuthzError::Internal(detail) => CanonicalError::internal(detail).create(),
     }
 }
 pub fn invalid(field: &str, code: &str) -> CanonicalError {

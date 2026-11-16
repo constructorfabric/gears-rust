@@ -310,6 +310,26 @@ pub fn contract_support_path() -> TokenStream {
     quote!(::toolkit::contract_support)
 }
 
+/// Parse `#[circuit_breaker(skip)]` on a projection method. `skip` is the
+/// only argument: thresholds are deployment config, not contract.
+pub fn parse_circuit_breaker_skip(attr: &syn::Attribute) -> syn::Result<()> {
+    let arg: Ident = attr.parse_args().map_err(|_| {
+        syn::Error::new_spanned(
+            attr,
+            "expected `#[circuit_breaker(skip)]`; breaker thresholds are set in \
+             `clients.consumes.<dep>.circuit_breaker`, not on the contract",
+        )
+    })?;
+    if arg == "skip" {
+        Ok(())
+    } else {
+        Err(syn::Error::new_spanned(
+            arg,
+            "unknown `circuit_breaker` argument; the only one is `skip`",
+        ))
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {

@@ -1171,3 +1171,34 @@ async fn chat_model_for_send_is_authorized_by_send_message_only() {
     // `read` itself is denied by this policy.
     assert!(svc.get_chat(&ctx, created.id).await.is_err());
 }
+
+#[tokio::test]
+async fn list_chats_empty_scope_preserves_live_or() {
+    use authz_resolver_sdk::{PolicyEnforcer, test_support::EmptyScopePdp};
+    let db = inmem_db().await;
+    let seed = build_service(db.clone());
+    let ctx = test_security_ctx(Uuid::new_v4());
+    for caller in [&ctx, &test_security_ctx(Uuid::new_v4())] {
+        seed.create_chat(
+            caller,
+            NewChat {
+                model: Some("gpt-5.2".to_owned()),
+                title: Some("Seed".to_owned()),
+                is_temporary: false,
+            },
+        )
+        .await
+        .expect("seed chat");
+    }
+    for live in [false, true] {
+        let svc = build_service_with_enforcer(
+            db.clone(),
+            PolicyEnforcer::new(Arc::new(EmptyScopePdp { live })),
+        );
+        let page = svc
+            .list_chats(&ctx, &ODataQuery::default())
+            .await
+            .expect("permitted LIST succeeds even when its scope is empty");
+        assert_eq!(page.items.len(), usize::from(live));
+    }
+}

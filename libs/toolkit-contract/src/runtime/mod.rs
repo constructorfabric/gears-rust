@@ -32,5 +32,7 @@ pub mod retry;
 #[cfg(feature = "runtime-client")]
 pub mod sse;
 
-#[cfg(feature = "rest-client")]
+#[cfg(feature = "runtime-client")]
+pub mod breaker;
+#[cfg(feature = "runtime-client")]
 pub mod resolving;

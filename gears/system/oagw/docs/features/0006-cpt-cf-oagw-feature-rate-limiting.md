@@ -68,6 +68,8 @@ Prevents abuse, cost overruns, and protects external service agreements. Maintai
 
 ### Rate-Limited Proxy Request
 
+**Proposed.** When a caller names a credential with a request limit, each replica checks its bucket after the upstream limit and before the route limit. A request or streaming handshake costs one unit. Named admission runs upstream, credential and route limits before CredStore; secret failures retain attempt debits. Changing or reinstating the limit starts a fresh bucket. Cleanup for the previous limit cannot reset the new one. See [ADR-0021](../ADR/0021-upstream-credentials.md#request-limits) for bucket identity, burst capacity and response headers.
+
 - [ ] `p2` - **ID**: `cpt-cf-oagw-flow-rate-limited-proxy`
 
 **Actor**: `cpt-cf-oagw-actor-app-developer`

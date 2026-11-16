@@ -327,3 +327,67 @@ async fn delivery_preserves_evaluation_errors_from_each_gate() {
         );
     }
 }
+
+/// A permitted scope that matches nothing at any gate skips the event like a
+/// denial; it must not fail the batch as an internal error.
+#[tokio::test]
+async fn delivery_skips_an_event_whose_permitted_scope_matches_nothing() {
+    use super::filter::AuthorizedInterestFilter;
+    use authz_resolver_sdk::constraints::{Constraint, InPredicate, Predicate};
+    use authz_resolver_sdk::{
+        AuthZResolverApi, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
+        PolicyEnforcer,
+    };
+    use std::sync::Arc;
+    use toolkit_canonical_errors::CanonicalError;
+    use toolkit_security::PlatformSecurityContext;
+
+    struct EmptyScopeAt(String);
+    #[async_trait::async_trait]
+    impl AuthZResolverApi for EmptyScopeAt {
+        async fn evaluate(
+            &self,
+            _ctx: PlatformSecurityContext,
+            request: EvaluationRequest,
+        ) -> Result<EvaluationResponse, CanonicalError> {
+            let constraints = if request.resource.resource_type == self.0 {
+                vec![Constraint {
+                    predicates: vec![Predicate::In(InPredicate::new(
+                        toolkit_security::pep_properties::OWNER_TENANT_ID,
+                        Vec::<Uuid>::new(),
+                    ))],
+                }]
+            } else {
+                Vec::new()
+            };
+            Ok(EvaluationResponse {
+                decision: true,
+                context: EvaluationResponseContext {
+                    constraints,
+                    deny_reason: None,
+                },
+            })
+        }
+    }
+    for empty in [
+        event_broker_sdk::gts::REQUEST_RESOURCE_TYPE,
+        topic().as_ref(),
+        CREATED,
+    ] {
+        let tenant = Uuid::new_v4();
+        let filter = AuthorizedInterestFilter::new(
+            &[interest(tenant, &[CREATED])],
+            PolicyEnforcer::new(Arc::new(EmptyScopeAt(empty.to_owned()))),
+            toolkit_security::SecurityContext::builder()
+                .subject_tenant_id(tenant)
+                .subject_id(Uuid::new_v4())
+                .build()
+                .unwrap(),
+        );
+        let allowed = filter.allows(&event(tenant, topic(), CREATED)).await;
+        assert!(
+            matches!(allowed, Ok(false)),
+            "empty scope at {empty}: {allowed:?}"
+        );
+    }
+}

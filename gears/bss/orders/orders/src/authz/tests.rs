@@ -507,10 +507,15 @@ async fn service_and_workflow_decisions_require_finite_ids_in_every_path() {
     let a = arrangement(10, 20, 30);
     let bounded = path(vec![is_in(ID, &[u(1), u(2)]), eq(ST, u(20))]);
     let unbounded = path(vec![eq(ST, u(20))]);
+    // An empty ID set grants nothing: it neither fails a bounded alternative nor bounds an
+    // unbounded one.
+    let empty_ids = path(vec![is_in(ID, &[]), eq(ST, u(20))]);
     let cases = vec![
         (vec![bounded.clone()], true),
         (vec![bounded.clone(), unbounded.clone()], false),
         (vec![unbounded.clone()], false),
+        (vec![empty_ids.clone(), bounded.clone()], true),
+        (vec![empty_ids.clone(), unbounded.clone()], false),
     ];
     for (constraints, ok) in cases {
         let response = allow(constraints);
@@ -543,6 +548,13 @@ async fn service_and_workflow_decisions_require_finite_ids_in_every_path() {
     }
     // A deny-all scope names no order IDs, so it is never a finite set.
     assert!(!super::finite_order_ids(&AccessScope::deny_all()));
+    // Nor is a scope whose every path holds an empty ID set: no live path, no vacuous `all`.
+    let all_empty =
+        AccessScope::from_constraints(vec![toolkit_security::access_scope::ScopeConstraint::new(
+            vec![ScopeFilter::in_uuids(ID, vec![])],
+        )]);
+    assert!(all_empty.matches_nothing());
+    assert!(!super::finite_order_ids(&all_empty));
     // A human tenant-scoped read path is valid without an ID restriction.
     let pdp = ScriptedPdp::new(move |_| Some(allow(vec![path(vec![eq(ST, u(20))])])));
     assert!(
@@ -988,4 +1000,21 @@ async fn proposed_side_constraints_must_admit_the_proposal_and_seller_is_fixed()
         Err(AuthzFailure::Integration)
     );
     assert!(pdp.calls().is_empty(), "no proposed-side decision is asked");
+}
+
+#[test]
+fn a_permitted_scope_that_matches_nothing_is_a_denial_not_an_integration_fault() {
+    for requires_finite_ids in [false, true] {
+        let raw = classify(
+            requires_finite_ids,
+            "read",
+            Err(EnforcerError::AccessDenied(
+                AccessDenial::ScopeMatchesNothing,
+            )),
+        );
+        assert!(
+            matches!(raw, Raw::Denied(None)),
+            "finite_ids={requires_finite_ids}: not a plain denial"
+        );
+    }
 }

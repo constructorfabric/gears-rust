@@ -22,7 +22,7 @@ fn make_plugin(trusted_issuer: String) -> OidcAuthNPlugin {
         common::base_jwt_validation_config(),
         issuer_trust,
         common::plugin_config(),
-        reqwest::Client::new(),
+        oidc_authn_plugin::infra::idp_http::IdpHttpClient::insecure_for_tests(),
     )
 }
 
@@ -62,7 +62,7 @@ async fn scoped_plugin_authenticates_valid_jwt() -> anyhow::Result<()> {
         common::base_jwt_validation_config(),
         common::exact_issuer_trust(issuer.clone()).expect("trust config should build"),
         common::plugin_config(),
-        reqwest::Client::new(),
+        oidc_authn_plugin::infra::idp_http::IdpHttpClient::insecure_for_tests(),
     ));
     plugin.register(&hub)?;
 

@@ -178,12 +178,13 @@ impl From<Managed> for ManageFactsResponse {
     }
 }
 
-/// The query of the profile read: the tenant, when the caller reads a subject
-/// of a tenant other than its own login's. The platform must authorize the
-/// caller for it.
+/// The query of the profile read and of manage-facts: the tenant, when the
+/// caller acts for a subject of a tenant other than its own login's. The
+/// platform must authorize the caller for it.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProfileQuery {
+pub struct TenantQuery {
+    /// The subject's tenant; none for the caller's own.
     #[serde(default)]
     pub tenant: Option<Uuid>,
 }

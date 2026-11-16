@@ -2294,6 +2294,38 @@ async fn list_active_messages_owner_returns_history() {
 }
 
 #[tokio::test]
+async fn list_active_messages_empty_scope_preserves_live_or_and_owner_clamp() {
+    use authz_resolver_sdk::test_support::EmptyScopePdp;
+    let db = inmem_db().await;
+    let (tenant, user, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, user).await;
+    harness_seed_pair(&db, sid, tenant, user).await;
+    let ids = |msgs: Vec<Message>| msgs.into_iter().map(|m| m.message_id).collect::<Vec<_>>();
+    let history = ids(build_message_service(&db, enforcer_allow())
+        .list_active_messages(&ctx_for_subject(user, tenant), sid, None)
+        .await
+        .expect("owner list ok"));
+    assert!(!history.is_empty());
+
+    for live in [false, true] {
+        let svc = build_message_service(&db, PolicyEnforcer::new(Arc::new(EmptyScopePdp { live })));
+        let seen = svc
+            .list_active_messages(&ctx_for_subject(user, tenant), sid, None)
+            .await
+            .expect("a permitted LIST succeeds even when its scope is empty");
+        let expected = if live { history.clone() } else { Vec::new() };
+        assert_eq!(ids(seen), expected, "live: {live}");
+
+        // The owner clamp still narrows the live branch.
+        let stranger = svc
+            .list_active_messages(&ctx_for_subject(Uuid::new_v4(), tenant), sid, None)
+            .await
+            .expect("a stranger's permitted LIST is empty, not refused");
+        assert!(stranger.is_empty(), "live: {live}");
+    }
+}
+
+#[tokio::test]
 async fn delete_message_cascade_pdp_denied_is_forbidden() {
     let db = inmem_db().await;
     let (tenant, user, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());

@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9,6 +10,7 @@ use construct_sdk::gts::{HAS_FACT_TYPE, PROFILE_ROOT_TYPE};
 use graph_storage_sdk::GraphStorageClientV1;
 use graph_storage_sdk::models::{EdgeSpec, IngestOptions, IngestOutcome, IngestRequest, NodeSpec};
 use time::OffsetDateTime;
+use tokio::time::{Instant, timeout_at};
 use tokio_retry::strategy::{ExponentialBackoff, jitter};
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
@@ -167,9 +169,20 @@ impl GraphPlanWriter {
     }
 
     /// Remove the facts under `keys`, one after another, within one call
-    /// timeout. The first that fails ends the cleanup: it and the rest stay
-    /// listed on the root, and a later write finishes them.
-    async fn remove(&self, ctx: &SecurityContext, keys: &BTreeSet<NodeKey>) {
+    /// timeout and by `deadline`. The first that fails ends the cleanup: it
+    /// and the rest stay listed on the root, and a later write finishes them.
+    async fn remove(&self, ctx: &SecurityContext, keys: &BTreeSet<NodeKey>, deadline: Instant) {
+        if keys.is_empty() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            tracing::warn!(
+                left = keys.len(),
+                "removed facts stay listed on the root until a later write finishes them: \
+                 the write is out of time"
+            );
+            return;
+        }
         // Outside the cleanup, so the timeout can still tell how far it got.
         let done = AtomicUsize::new(0);
         let cleanup = async {
@@ -181,22 +194,22 @@ impl GraphPlanWriter {
             }
             Ok(())
         };
-        let finished = tokio::time::timeout(self.timeout, cleanup).await;
+        let call_end = Instant::now() + self.timeout;
+        let finished = timeout_at(deadline.min(call_end), cleanup).await;
         let left = keys.len() - done.load(Ordering::Relaxed);
         match finished {
             Ok(Ok(())) => {}
             Ok(Err((key, err))) => unfinished(key, &err, left),
-            Err(_) => tracing::warn!(
-                left,
-                timeout = ?self.timeout,
-                "removed facts stay listed on the root until a later write finishes them"
-            ),
+            Err(_) => cut_short(left, deadline <= call_end, self.timeout),
         }
     }
 
     /// Send the ingest, again with the same idempotency key while its result
-    /// is unknown, with a growing, jittered pause between sends, and at most
-    /// `attempts` sends in all.
+    /// is unknown, with a growing, jittered pause between sends, at most
+    /// `attempts` sends in all, and by `deadline`: no send starts once it
+    /// passed or when the pause before it would pass it, and a send still
+    /// running then is cut. Once a send started, running out leaves the
+    /// result unknown.
     ///
     /// A send without an answer keeps running in graph storage, which cannot
     /// cut off a statement it has started. A later send of the same request
@@ -209,6 +222,7 @@ impl GraphPlanWriter {
         &self,
         ctx: &SecurityContext,
         request: IngestRequest,
+        deadline: Instant,
     ) -> Result<Written, DomainError> {
         let mut attempt = 1;
         let mut pauses = pauses();
@@ -216,15 +230,30 @@ impl GraphPlanWriter {
         let mut replayed = false;
         loop {
             // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-ingest
-            let sent =
-                tokio::time::timeout(self.timeout, self.ports.client.ingest(ctx, request.clone()))
-                    .await;
-            let failed = match classify(sent, self.timeout) {
+            let started = Instant::now();
+            if started >= deadline {
+                return Err(if attempt == 1 {
+                    out_of_time()
+                } else {
+                    DomainError::WriteUnknown(format!(
+                        "graph storage profile write: result unknown after {} sends: out of time",
+                        attempt - 1
+                    ))
+                });
+            }
+            let cut = deadline.min(started + self.timeout);
+            let sent = timeout_at(cut, self.ports.client.ingest(ctx, request.clone())).await;
+            let failed = match classify(sent, cut - started) {
                 Sent::Stored => return Ok(Written::Stored),
+                Sent::Failed(DomainError::Unavailable(failed)) if unknown => {
+                    return Err(DomainError::WriteUnknown(format!(
+                        "graph storage profile write: result unknown after {attempt} sends: {failed}"
+                    )));
+                }
                 Sent::Failed(err) => return Err(err),
                 Sent::Refused if unknown && !replayed => {
                     if attempt >= self.attempts.get() {
-                        return Err(DomainError::Unavailable(format!(
+                        return Err(DomainError::WriteUnknown(format!(
                             "graph storage profile write: result unknown after {attempt} \
                              sends: refused after a send without an answer"
                         )));
@@ -243,8 +272,16 @@ impl GraphPlanWriter {
             };
             unknown = true;
             if attempt >= self.attempts.get() {
-                return Err(DomainError::Unavailable(format!(
+                return Err(DomainError::WriteUnknown(format!(
                     "graph storage profile write: result unknown after {attempt} sends: {failed}"
+                )));
+            }
+            let pause = pauses.next().unwrap_or(Duration::MAX);
+            let pause = pause.saturating_add(jitter(pause));
+            if Instant::now() + pause >= deadline {
+                return Err(DomainError::WriteUnknown(format!(
+                    "graph storage profile write: result unknown after {attempt} sends: {failed}; \
+                     no time is left to send it again"
                 )));
             }
             tracing::warn!(
@@ -253,11 +290,50 @@ impl GraphPlanWriter {
                 error = %failed,
                 "profile write sent again with its idempotency key"
             );
-            let pause = pauses.next().unwrap_or(Duration::MAX);
-            tokio::time::sleep(pause.saturating_add(jitter(pause))).await;
+            tokio::time::sleep(pause).await;
             attempt += 1;
             // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-ingest
         }
+    }
+}
+
+/// A write that ran out of time before graph storage could have received it.
+fn out_of_time() -> DomainError {
+    DomainError::Unavailable(
+        "graph storage profile write ran out of time; nothing was written".to_owned(),
+    )
+}
+
+/// `call`, a step of the write that sends no plan, by `deadline`: not started
+/// once it passed, and cut at it. Running out writes nothing.
+async fn by<T>(
+    deadline: Instant,
+    call: impl Future<Output = Result<T, DomainError>>,
+) -> Result<T, DomainError> {
+    if Instant::now() >= deadline {
+        return Err(out_of_time());
+    }
+    timeout_at(deadline, call)
+        .await
+        .unwrap_or_else(|_| Err(out_of_time()))
+}
+
+/// Log a cleanup cut by the write's deadline (`by_deadline`) or by the call
+/// `timeout`, with `left` removals not done.
+fn cut_short(left: usize, by_deadline: bool, timeout: Duration) {
+    if by_deadline {
+        tracing::warn!(
+            left,
+            "removed facts stay listed on the root until a later write finishes them: \
+             the cleanup ran out of the write's deadline"
+        );
+    } else {
+        tracing::warn!(
+            left,
+            timeout = ?timeout,
+            "removed facts stay listed on the root until a later write finishes them: \
+             the cleanup ran out of the call timeout"
+        );
     }
 }
 
@@ -499,8 +575,15 @@ impl GraphPlanWriter {
 
 #[async_trait]
 impl PlanWriter for GraphPlanWriter {
+    /// Reads the profile, builds the plan's one ingest, sends it and runs the
+    /// cleanup, every graph storage call by `deadline`.
     #[tracing::instrument(skip_all, fields(tenant_id = %plan.tenant_id, subject_id = %plan.subject_id))]
-    async fn write(&self, ctx: &SecurityContext, plan: &Plan) -> Result<Written, DomainError> {
+    async fn write_by(
+        &self,
+        ctx: &SecurityContext,
+        plan: &Plan,
+        deadline: Instant,
+    ) -> Result<Written, DomainError> {
         if plan.steps.is_empty() {
             return Ok(Written::Stored);
         }
@@ -511,10 +594,10 @@ impl PlanWriter for GraphPlanWriter {
                 subject_id: plan.subject_id,
             },
         )?;
-        self.ports.types.ensure(ctx).await?;
+        by(deadline, self.ports.types.ensure(ctx)).await?;
 
         // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-read-root
-        let stored = self.read(ctx, &subject).await?;
+        let stored = by(deadline, self.read(ctx, &subject)).await?;
         let expected = stored.version;
         if expected != plan.profile_version {
             tracing::debug!(
@@ -546,8 +629,8 @@ impl PlanWriter for GraphPlanWriter {
                 if waiting.is_empty() {
                     return Err(DomainError::ProfileFull(full));
                 }
-                self.remove(ctx, &waiting).await;
-                let stored = self.read(ctx, &subject).await?;
+                self.remove(ctx, &waiting, deadline).await;
+                let stored = by(deadline, self.read(ctx, &subject)).await?;
                 if stored.version != expected {
                     return Ok(Written::Conflict);
                 }
@@ -556,16 +639,16 @@ impl PlanWriter for GraphPlanWriter {
             // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-full
             built => built?,
         };
-        match self.ingest(ctx, request).await? {
+        match self.ingest(ctx, request, deadline).await? {
             Written::Stored => {
                 // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-cleanup
                 // Committed: every listed fact is already left out of reads, so
                 // a removal that fails now is finished by a later write.
-                self.remove(ctx, &listed).await;
+                self.remove(ctx, &listed, deadline).await;
                 // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-cleanup
                 Ok(Written::Stored)
             }
-            Written::Conflict => self.refused(ctx, &subject, expected).await,
+            Written::Conflict => by(deadline, self.refused(ctx, &subject, expected)).await,
         }
     }
 }

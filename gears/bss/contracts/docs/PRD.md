@@ -13,8 +13,7 @@ Updated:  2026-08-24 by Virtuozzo International GmbH
 # PRD — Contracts & Agreements
 
 > **Status: first draft (2026-08-17).** Harvested from three sources: (a) the consumer-side
-> obligations already enumerated by Subscriptions in `gears/bss/subscriptions/docs/SEAMS.md`
-> **SUB-C1…C5**, which are today unfulfilled and governed by platform defaults; (b) the upstream
+> commercial lifecycle requirements from Subscriptions; (b) the upstream
 > `PRD-contracts-agreements-202601120119` in vhp-architecture, whose scope tables predate the
 > current gear split; (c) the two asks raised by the Orders Lifecycle PRD. Ownership boundaries
 > below reflect the **current** split (rating owns evaluation and true-up math, pricing owns the
@@ -77,11 +76,15 @@ under a contract, and billing reads payment terms.
 
 The gear does not exist, and its absence is already load-bearing in two places.
 
-**Subscriptions runs on platform defaults.** `SUB-C1` records that renewal terms (`autoRenew`, term
-windows, notice ladder), the grace ladder and regional templates are assumed to be Contracts-owned,
-that the upstream PRD never authored them, and that **until it does, the platform defaults govern** —
-a 7-day grace and a 30/14/7/1 notice ladder. Every release without this gear hardens those defaults
-into the implementation and into customer expectation.
+**Subscriptions runs on versioned platform defaults.** `SUB-C1` records the Contracts ownership
+of renewal terms, grace and regional constraints. The current Subscriptions profile includes a
+7-day grace and requires no renewal, continuation or deletion notice. Notification delivery is
+deferred; terms requiring a notice or assent are refused at acceptance (SUB-D-69).
+
+The historical `SUB-C1`–`SUB-C5` identifiers map to current requirements and deferrals in the
+[Subscriptions requirement crosswalk](../../subscriptions/docs/UPSTREAM_REQS.md). They do not
+establish that a deferred consumer capability is available. Contract-driven renewal requires the
+S-U06 provider contract and joint acceptance cases.
 
 **Orders has an unsatisfiable precondition.** The Orders Lifecycle PRD requires every order to
 reference an active contract and evaluates buyer eligibility "under the referenced contract"; no
@@ -112,8 +115,8 @@ contract by Subscriptions — an event nobody emits.
 |------|------------|
 | **Contract** | The signed agreement between a `sellerTenantId` and a `payerTenantId` governing terms for a bounded period. SoR for terms; not an order, not a quote, not an invoice. |
 | **Contract version** | An immutable revision of contract content. A change to signed terms creates a new version; prior versions are retained for audit and for reproducing a past evaluation. |
-| **Term window** | `[termStart, termEnd)` in UTC. Drives renewal evaluation, notice scheduling and commitment measurement windows. |
-| **Notice ladder** | The ordered set of lead times at which renewal notices fire before `termEnd` (platform default: 30/14/7/1 days). Contract-overridable; regional templates may pin statutory minima. |
+| **Term window** | `[termStart, termEnd)` in UTC. Drives renewal evaluation and commitment measurement windows; notice scheduling is deferred. |
+| **Notice ladder** | An optional definition of renewal-notice lead times before `termEnd`. Delivery is deferred in Subscriptions. A term requiring notice or assent cannot be accepted by the current profile (SUB-D-69). |
 | **Grace ladder** | The post-failure tolerance period and its escalation steps before entitlement is withdrawn (platform default: 7 days). |
 | **Regional template** | A jurisdiction-scoped set of default terms (notice minima, grace, cancellation rights) applied to contracts in a territory unless overridden. |
 | **PriceOverride window** | A contract-scoped, non-overlapping `[effectiveFrom, effectiveTo)` price adjustment for a catalog scope key. Consumed by rating as the step-5 contract overlay (precedence: Contract > Partner overlay > Catalog base). Contracts authors the window; it does **not** evaluate it. |
@@ -206,7 +209,8 @@ No gear-specific deviations — project defaults apply.
 | Feature | Priority | Notes |
 |---------|----------|-------|
 | Contract document, parties, term window, status machine, versioning | `p1` | SoR; content immutable per version |
-| Renewal terms (`autoRenew`, term windows, notice ladder) | `p1` | Replaces the SUB-C1 platform defaults |
+| Renewal terms (`autoRenew`, term windows) | `p1` | SUB-C1; explicit binding under S-U06; current profile requires no notice or assent |
+| Notice-dependent renewal, continuation or deletion terms | `p2` | Deferred consumer profile; refused at acceptance under SUB-D-69 |
 | Grace ladder + regional templates | `p1` | SUB-C1; statutory minima per territory |
 | Contract-scoped `PriceOverride` windows | `p1` | Non-overlapping per scope key; SUB-C5; rating step-5 input |
 | Commitment definition (type, threshold, measurement window, breach policy) | `p1` | SUB-C3; balance and true-up owned downstream |
@@ -268,10 +272,17 @@ termination are commercially different outcomes.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-contracts-fr-renewal-terms`
 
-The contract **MUST** author `autoRenew`, the renewal term window, and the notice ladder. These
-supersede the platform defaults Subscriptions applies today (30/14/7/1 notices) for any subscription
-bound to a contract. Where no contract governs, the platform defaults **MUST** continue to apply —
-the transition **MUST** be explicit, not implicit in the presence of a contract row.
+The contract **MUST** author `autoRenew` and the renewal term window. Subscriptions **MUST** use
+the explicitly bound contract version under the S-U06 provider contract. Changed terms apply at
+the next renewal; the running accepted term stays unchanged. When the Contract ends, the next
+renewal uses an explicitly bound successor, otherwise the versioned platform defaults. A contract
+row alone **MUST NOT** change the binding.
+
+The supported profile **MUST NOT** require a notice or assent for renewal, continuation or deletion
+(SUB-D-69). Contracts **MAY** retain notice-ladder definitions for a future profile, but Subscriptions
+**MUST** refuse such terms at acceptance when notice or assent is required. Enabling that profile
+requires an agreed delivery/assent contract and joint acceptance cases; S-U06 does not waive this
+gate. The current platform defaults have no notice requirement.
 
 **Rationale**: `SUB-C1` is the specific unfulfilled obligation; a silent switch from defaults to
 contract terms would change renewal behaviour for live subscriptions.
@@ -284,7 +295,9 @@ contract terms would change renewal behaviour for live subscriptions.
 
 The contract **MUST** author the grace period and its escalation steps, and **MUST** support
 territory-scoped templates supplying defaults and statutory minima. A contract term **MUST NOT** be
-allowed to fall below a template's statutory minimum for its territory.
+allowed to fall below a template's statutory minimum for its territory. A template requiring notice
+or assent for renewal, continuation or deletion is outside the supported Subscriptions profile;
+acceptance **MUST** refuse it under SUB-D-69, rather than silently omit the requirement.
 
 **Rationale**: Grace is a customer-visible commitment with jurisdictional floors; a per-contract value
 without a floor check would create unenforceable terms.
@@ -434,7 +447,7 @@ TBD — to be derived per FR once §6 is reviewed.
 |---|---|---|
 | SLA definition and monitoring — in this gear, a separate one, or deferred entirely? | Architecture | The upstream PRD scoped it here at moderate complexity; no consumer has requested it. |
 | Acceptance-confirmation flow — who confirms, what evidence is retained? | Product | `SUB-C4` leaves the shape open. |
-| Migration from platform defaults — does binding a contract to a live subscription change its in-flight renewal terms, or only from the next term? | Product | Determines whether §6.2 is additive or behaviour-changing. |
+| Contract migration delivery — how do owners validate explicit binding and source-version recovery? | Contracts / Subscriptions | S-U06: the running accepted term stays unchanged; changed terms apply at next renewal. |
 | Does a contract scope multiple payers (a master agreement with child accounts), or strictly one? | Product | Affects the eligibility predicate and the order's tenant axes. |
 | Ramp authorship vs the Subscriptions deferral (`SUB-D-04`) — reopen jointly? | Architecture | Cross-referenced from the Orders seam `SUB-O6`. |
 
@@ -450,8 +463,9 @@ TBD — to be derived per FR once §6 is reviewed.
 
 | Material | Link | Comments |
 |---|---|---|
-| Subscriptions seam map | `gears/bss/subscriptions/docs/SEAMS.md` | `SUB-C1…C5` are the consumer-side requirement list this draft harvests |
 | Orders Lifecycle PRD + review | vhp-architecture `docs/bss/prd/PRD-orders-lifecycle-202608101404/` | `contractId` precondition and the eligibility predicate; review findings F-11, F-9 |
 | Upstream Contracts PRD | vhp-architecture `docs/bss/prd/PRD-contracts-agreements-202601120119/` | Pre-split scope tables; see §2.2 migration |
 | Pricing PRD | `gears/bss/pricing/docs/PRD.md` | Canonical scope key the override windows bind to |
 | Rating PRD | `gears/bss/rating/docs/PRD.md` | Overlay precedence, true-up ownership |
+| Subscriptions requirement crosswalk | [UPSTREAM_REQS](../../subscriptions/docs/UPSTREAM_REQS.md) | Current meaning of SUB-C1–SUB-C5 and S-U06 delivery gate |
+| Subscriptions lifecycle decisions | [DECISIONS](../../subscriptions/docs/DECISIONS.md) | SUB-D-69: notice-dependent terms refused at acceptance |

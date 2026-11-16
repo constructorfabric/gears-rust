@@ -70,3 +70,31 @@ pub fn scope_admits_tenant(scope: &AccessScope, tenant: Uuid) -> bool {
         .iter()
         .any(|c| constraint_admits_tenant(c, tenant))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_branch_that_matches_nothing_admits_no_tenant() {
+        let dead_tenant = Uuid::from_u128(1);
+        let live_tenant = Uuid::from_u128(2);
+        // The empty set sits on a row property, which the tenant gate
+        // otherwise ignores: the branch still matches nothing.
+        let dead = ScopeConstraint::new(vec![
+            ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, dead_tenant),
+            ScopeFilter::in_uuids(REFERENCE_PROP, vec![]),
+        ]);
+        let live = ScopeConstraint::new(vec![ScopeFilter::eq(
+            pep_properties::OWNER_TENANT_ID,
+            live_tenant,
+        )]);
+
+        let mixed = AccessScope::from_constraints(vec![dead.clone(), live]);
+        assert!(!scope_admits_tenant(&mixed, dead_tenant));
+        assert!(scope_admits_tenant(&mixed, live_tenant));
+
+        let all_dead = AccessScope::from_constraints(vec![dead]);
+        assert!(!scope_admits_tenant(&all_dead, dead_tenant));
+    }
+}

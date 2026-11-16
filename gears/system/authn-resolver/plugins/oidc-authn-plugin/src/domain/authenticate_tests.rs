@@ -4,7 +4,7 @@ use toolkit_gts::gts_id;
 use async_trait::async_trait;
 use authn_resolver_sdk::ClientCredentialsRequest;
 use jsonwebtoken::jwk::JwkSet;
-use reqwest::Url;
+use url::Url;
 
 use super::*;
 use crate::config::INSTANCE_SUFFIX;

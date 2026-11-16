@@ -32,6 +32,13 @@ use toolkit_contract::{contract, rest_contract};
 use toolkit_security::constants::INTERNAL_TOKEN_HEADER;
 use toolkit_security::{PlatformIdentity, PlatformSecurityContext, SecurityContext};
 
+/// Config for a plaintext mock server. A FIPS build requires TLS by default
+/// and installs no crypto provider, so opt in to plaintext and install one.
+fn plaintext_config(base_url: impl Into<String>) -> ClientConfig {
+    drop(toolkit_security::tls::configured_provider().install_default());
+    ClientConfig::new(base_url).with_require_tls(false)
+}
+
 /// Stream item for the platform-plane streaming method.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Tick {
@@ -275,7 +282,7 @@ fn platform_ctx() -> PlatformSecurityContext {
 #[tokio::test]
 async fn platform_call_attaches_internal_token_from_provider() {
     let base_url = start_server().await;
-    let cfg = ClientConfig::new(base_url).with_internal_token_provider(
+    let cfg = plaintext_config(base_url).with_internal_token_provider(
         InternalTokenProvider::from_token(SecretString::from("sa.jwt.token")),
     );
     let client = SysApiRestClient::new(cfg).unwrap();
@@ -301,7 +308,7 @@ async fn platform_call_without_provider_attaches_nothing() {
     // client is permissive and attaches no credential. The requirement is
     // enforced server-side, not by the client.
     let base_url = start_server().await;
-    let client = SysApiRestClient::new(ClientConfig::new(base_url)).unwrap();
+    let client = SysApiRestClient::new(plaintext_config(base_url)).unwrap();
 
     let echo = SysApi::whoami(&client, &platform_ctx(), "abc".to_owned())
         .await
@@ -326,7 +333,7 @@ async fn platform_call_reads_current_token_from_rotating_provider() {
     let base_url = start_server().await;
     let token = Arc::new(Mutex::new(String::from("token-before")));
     let provider_token = Arc::clone(&token);
-    let cfg = ClientConfig::new(base_url).with_internal_token_provider(InternalTokenProvider::new(
+    let cfg = plaintext_config(base_url).with_internal_token_provider(InternalTokenProvider::new(
         move || {
             let current = provider_token.lock().unwrap().clone();
             CredentialState::Available(SecretString::from(current))
@@ -365,7 +372,7 @@ async fn platform_call_reads_current_token_from_rotating_provider() {
 #[tokio::test]
 async fn tenant_call_sends_bearer_and_not_internal_token() {
     let base_url = start_server().await;
-    let cfg = ClientConfig::new(base_url).with_internal_token_provider(
+    let cfg = plaintext_config(base_url).with_internal_token_provider(
         InternalTokenProvider::from_token(SecretString::from("sa.jwt.token")),
     );
     let client = SysApiRestClient::new(cfg).unwrap();
@@ -398,7 +405,7 @@ async fn retryable_platform_call_reresolves_token_each_attempt() {
     // A provider that yields a fresh token on every resolution.
     let counter = Arc::new(AtomicU32::new(0));
     let provider_counter = Arc::clone(&counter);
-    let cfg = ClientConfig::new(base_url).with_internal_token_provider(InternalTokenProvider::new(
+    let cfg = plaintext_config(base_url).with_internal_token_provider(InternalTokenProvider::new(
         move || {
             let n = provider_counter.fetch_add(1, Ordering::SeqCst);
             CredentialState::Available(SecretString::from(format!("token-{n}")))
@@ -438,7 +445,7 @@ async fn streaming_platform_reconnect_attaches_internal_token_each_connection() 
 
     let counter = Arc::new(AtomicU32::new(0));
     let provider_counter = Arc::clone(&counter);
-    let cfg = ClientConfig::new(base_url)
+    let cfg = plaintext_config(base_url)
         .with_stream_reconnect(ReconnectConfig::enabled(
             3,
             std::time::Duration::from_millis(1),

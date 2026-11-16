@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use super::current_otel_trace_id;
 use crate::domain::repos::Wake;
-use authz_resolver_sdk::{EnforcerError, PolicyEnforcer};
+use authz_resolver_sdk::{AccessDenial, EnforcerError, PolicyEnforcer};
 use toolkit_macros::domain_model;
 use toolkit_security::{AccessScope, SecurityContext};
 use tracing::info;
@@ -92,8 +92,12 @@ impl From<EnforcerError> for MutationError {
     #[allow(clippy::cognitive_complexity)]
     fn from(e: EnforcerError) -> Self {
         match e {
-            EnforcerError::Denied { ref deny_reason } => {
-                tracing::warn!(deny_reason = ?deny_reason, "AuthZ denied access");
+            EnforcerError::AccessDenied(AccessDenial::Pdp { ref reason }) => {
+                tracing::warn!(deny_reason = ?reason, "AuthZ denied access");
+                Self::Forbidden
+            }
+            EnforcerError::AccessDenied(ref local) => {
+                tracing::warn!(denial = %local, "AuthZ refused: PEP-local denial");
                 Self::Forbidden
             }
             EnforcerError::CompileFailed(ref err) => {
@@ -104,6 +108,13 @@ impl From<EnforcerError> for MutationError {
             EnforcerError::EvaluationFailed(ref err) => {
                 tracing::error!(error = %err, "AuthZ evaluation failed - request refused");
                 Self::AuthzUnavailable
+            }
+            // An unknown outcome class is an internal failure, never a denial.
+            ref unknown => {
+                tracing::error!(error = %unknown, "AuthZ failed with an unknown outcome");
+                Self::Internal {
+                    message: "authorization failed with an unknown outcome".to_owned(),
+                }
             }
         }
     }

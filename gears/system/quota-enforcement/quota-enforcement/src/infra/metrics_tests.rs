@@ -195,6 +195,10 @@ fn assert_distinct_snake_case(labels: &[&str]) {
 fn every_reason_label_is_a_distinct_snake_case_token() {
     let denial: Vec<&str> = DenialReason::ALL.iter().map(|r| r.as_label()).collect();
     assert_distinct_snake_case(&denial);
+    assert!(
+        denial.contains(&"internal"),
+        "an unknown authorization outcome has its own bounded label: {denial:?}"
+    );
     let surfaces: Vec<&str> = ValidationSurface::ALL
         .iter()
         .map(|s| s.as_label())

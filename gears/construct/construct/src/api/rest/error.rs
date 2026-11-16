@@ -6,6 +6,11 @@ use crate::domain::pagination::QueryError;
 use crate::domain::record_intake::Refusal;
 use crate::domain::settings_scope::SettingsOutOfScope;
 
+/// The detail of the `503` for a write whose result is unknown, so a caller
+/// knows that the write may have been stored before it sends it again.
+pub const WRITE_UNKNOWN_DETAIL: &str = "The write was sent, but its result is unknown: \
+     it may have been stored. Read the profile before you send it again.";
+
 /// Errors about connector records. The resource type is the record base type.
 #[resource_error(gts_id!("cf.connectors.core.record.v1~"))]
 pub struct RecordError;
@@ -116,6 +121,7 @@ pub fn for_settings(e: DomainError) -> CanonicalError {
         // any other error.
         e @ (DomainError::Refused(_)
         | DomainError::Unavailable(_)
+        | DomainError::WriteUnknown(_)
         | DomainError::NoSuchFact(_)
         | DomainError::InvalidQuery(_)
         | DomainError::Internal(_)
@@ -182,6 +188,7 @@ pub fn for_export(e: DomainError) -> CanonicalError {
         }
         e @ (DomainError::Refused(_)
         | DomainError::Unavailable(_)
+        | DomainError::WriteUnknown(_)
         | DomainError::NotConfigured(_)
         | DomainError::NoSuchFact(_)
         | DomainError::InvalidQuery(_)
@@ -240,6 +247,7 @@ pub fn for_facts(e: DomainError, subject_id: Uuid) -> CanonicalError {
         }
         e @ (DomainError::Refused(_)
         | DomainError::Unavailable(_)
+        | DomainError::WriteUnknown(_)
         | DomainError::InvalidQuery(_)
         | DomainError::Internal(_)
         | DomainError::ProfileFull(_)
@@ -311,6 +319,7 @@ pub fn for_reviews(e: DomainError) -> CanonicalError {
         e @ (DomainError::Refused(_)
         | DomainError::OutOfScope(_)
         | DomainError::Unavailable(_)
+        | DomainError::WriteUnknown(_)
         | DomainError::NotVisible(_)
         | DomainError::NoSuchFact(_)
         | DomainError::NoSuchReviewRequest(_)
@@ -369,6 +378,7 @@ pub fn for_admin_facts(e: DomainError, subject_id: Uuid) -> CanonicalError {
         e @ (DomainError::Refused(_)
         | DomainError::OutOfScope(_)
         | DomainError::Unavailable(_)
+        | DomainError::WriteUnknown(_)
         | DomainError::NotVisible(_)
         | DomainError::NoSuchReviewRequest(_)
         | DomainError::ReviewConflict(_)
@@ -440,6 +450,12 @@ impl From<DomainError> for CanonicalError {
             DomainError::Unavailable(msg) => {
                 tracing::warn!(msg = %msg, "construct dependency unavailable");
                 CanonicalError::service_unavailable().create()
+            }
+            DomainError::WriteUnknown(msg) => {
+                tracing::warn!(msg = %msg, "construct write result unknown");
+                CanonicalError::service_unavailable()
+                    .with_detail(WRITE_UNKNOWN_DETAIL)
+                    .create()
             }
             // @cpt-end:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-unavailable-return
             // @cpt-end:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-unavailable

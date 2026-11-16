@@ -30,7 +30,7 @@ use crate::config::ConfigProvider;
 pub const CLIENTS_KEY: &str = "clients";
 
 const SECTION_KEYS: &[&str] = &["defaults", "consumes", "provides"];
-const CONSUMER_KEYS: &[&str] = &["endpoint"];
+const CONSUMER_KEYS: &[&str] = &["endpoint", "grpc_endpoint"];
 const PROVIDED_KEYS: &[&str] = &["transport", "endpoint"];
 
 /// The settings for the client gear `owner` uses to consume `dep`:

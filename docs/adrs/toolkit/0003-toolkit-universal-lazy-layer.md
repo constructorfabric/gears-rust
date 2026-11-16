@@ -745,6 +745,8 @@ This ADR focuses on **client-side** idempotency (generating keys, retry logic). 
 
 #### 3.4 Circuit Breaking and Fallback Strategy
 
+> **Superseded.** The circuit breaker was built differently; see [ADR-0005](./0005-toolkit-client-circuit-breaker.md). The fallback strategy below was not built.
+
 **Location**: `libs/toolkit/src/clients/circuit_breaker.rs`
 
 Circuit breaking prevents cascading failures by temporarily stopping requests to a failing OoP gear, allowing it time to recover.

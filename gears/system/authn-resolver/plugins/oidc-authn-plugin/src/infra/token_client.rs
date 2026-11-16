@@ -17,9 +17,11 @@ use crate::config::{IssuerTrustConfig, RetryPolicyConfig, S2sConfig};
 use crate::domain::error::AuthNError;
 use crate::domain::ports::ClientCredentialsExchanger;
 use crate::infra::circuit_breaker::{HostCircuitBreakers, host_key};
-use crate::infra::http_response::read_json_response_limited;
+use crate::infra::idp_http::ResponseBodyError;
 use crate::infra::oidc::{OidcConfig, OidcDiscovery};
-use crate::infra::retry::{RetriedRequestError, is_retryable_status, send_with_retry};
+use crate::infra::retry::{
+    RetriedRequestError, is_local_client_failure, is_retryable_status, send_with_retry,
+};
 use crate::infra::single_flight::{
     SingleFlightGate, release_single_flight_gate as release_gate,
     single_flight_gate as acquire_gate,
@@ -61,9 +63,9 @@ struct CacheIdentity {
 /// HTTP client for `OAuth2` `client_credentials` token exchange with caching.
 ///
 /// Created once during gear init and shared via `Arc`. Uses the same
-/// `reqwest::Client` and `OidcDiscovery` as the JWT validation path.
+/// `crate::infra::idp_http::IdpHttpClient` and `OidcDiscovery` as the JWT validation path.
 pub struct TokenClient {
-    http_client: reqwest::Client,
+    http_client: crate::infra::idp_http::IdpHttpClient,
     discovery: Arc<OidcDiscovery>,
     cache: TtlCache<CachedToken>,
     in_flight: DashMap<String, Arc<SingleFlightGate>>,
@@ -86,7 +88,7 @@ impl TokenClient {
     /// `discovery` is shared with the JWT validation path so that OIDC
     /// discovery results (including `token_endpoint`) are fetched at most once.
     pub(crate) fn new(
-        http_client: reqwest::Client,
+        http_client: crate::infra::idp_http::IdpHttpClient,
         discovery: Arc<OidcDiscovery>,
         s2s_config: S2sConfig,
         retry_policy: RetryPolicyConfig,
@@ -244,7 +246,7 @@ impl TokenClient {
     async fn resolve_token_endpoint(
         &self,
         issuer_trust: &IssuerTrustConfig,
-    ) -> Result<reqwest::Url, AuthNError> {
+    ) -> Result<url::Url, AuthNError> {
         let oidc_config = self
             .discovery
             .get_config(&self.s2s_config.discovery_url)
@@ -269,10 +271,7 @@ impl TokenClient {
         Err(AuthNError::UntrustedIssuer)
     }
 
-    fn token_endpoint_from_config(
-        &self,
-        oidc_config: &OidcConfig,
-    ) -> Result<reqwest::Url, AuthNError> {
+    fn token_endpoint_from_config(&self, oidc_config: &OidcConfig) -> Result<url::Url, AuthNError> {
         if let Some(endpoint) = oidc_config.token_endpoint_url() {
             let token_endpoint_host = host_key(endpoint);
             debug!(
@@ -294,7 +293,7 @@ impl TokenClient {
     #[allow(clippy::cognitive_complexity)]
     async fn post_client_credentials(
         &self,
-        endpoint: &reqwest::Url,
+        endpoint: &url::Url,
         request: &ClientCredentialsRequest,
         normalized_scopes: &str,
     ) -> Result<TokenResponse, AuthNError> {
@@ -315,7 +314,7 @@ impl TokenClient {
     #[allow(clippy::cognitive_complexity)]
     async fn post_client_credentials_unchecked(
         &self,
-        endpoint: &reqwest::Url,
+        endpoint: &url::Url,
         request: &ClientCredentialsRequest,
         normalized_scopes: &str,
     ) -> Result<TokenResponse, AuthNError> {
@@ -331,10 +330,18 @@ impl TokenClient {
         let token_endpoint_host = host_key(endpoint);
 
         let response = send_with_retry(&self.retry_policy, || {
-            self.http_client.post(endpoint.clone()).form(&form).send()
+            self.http_client.post_form(endpoint, &form)
         })
         .await
         .map_err(|error| match error {
+            RetriedRequestError::Transport(e) if is_local_client_failure(&e) => {
+                warn!(
+                    %token_endpoint_host,
+                    error = %e,
+                    "S2S token request not sent by the local HTTP client"
+                );
+                AuthNError::HttpClientUnavailable(e.to_string())
+            }
             RetriedRequestError::Transport(e) => {
                 warn!(
                     %token_endpoint_host,
@@ -361,14 +368,29 @@ impl TokenClient {
             }
         })?;
 
-        read_json_response_limited(response).await.map_err(|error| {
-            warn!(
-                %token_endpoint_host,
-                %error,
-                "Failed to parse token endpoint response"
-            );
-            AuthNError::TokenResponseParseFailed
-        })
+        self.http_client
+            .read_json(response)
+            .await
+            .map_err(|error| match error {
+                // The body stalled or the connection dropped: the endpoint
+                // failed, as when the headers do not arrive.
+                ResponseBodyError::Timeout(_) | ResponseBodyError::Read(_) => {
+                    warn!(
+                        %token_endpoint_host,
+                        %error,
+                        "S2S token endpoint failed while sending the response body"
+                    );
+                    AuthNError::IdpUnreachable
+                }
+                ResponseBodyError::TooLarge { .. } | ResponseBodyError::Json(_) => {
+                    warn!(
+                        %token_endpoint_host,
+                        %error,
+                        "Failed to parse token endpoint response"
+                    );
+                    AuthNError::TokenResponseParseFailed
+                }
+            })
     }
 }
 

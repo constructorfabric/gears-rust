@@ -20,7 +20,7 @@ struct LedgerResourceError;
 /// Map an [`AuthzError`] from the PEP gate to a [`CanonicalError`].
 /// `Denied` becomes a 403 carrying the deny reason; `Unavailable` becomes a
 /// fail-closed 503 whose diagnostic stays server-side (the wire `Problem` is a
-/// generic 503).
+/// generic 503); `Internal` becomes a 500 whose detail stays server-side.
 pub(crate) fn authz_error_to_canonical(err: AuthzError) -> CanonicalError {
     match err {
         AuthzError::Denied(reason) => LedgerResourceError::permission_denied()
@@ -30,6 +30,8 @@ pub(crate) fn authz_error_to_canonical(err: AuthzError) -> CanonicalError {
             tracing::error!(detail, "Authorization service unavailable");
             CanonicalError::service_unavailable().create()
         }
+        // Logged where it was classified; the detail stays off the wire.
+        AuthzError::Internal(detail) => CanonicalError::internal(detail).create(),
     }
 }
 

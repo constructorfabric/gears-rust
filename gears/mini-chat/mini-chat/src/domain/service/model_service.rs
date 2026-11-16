@@ -50,16 +50,21 @@ impl ModelService {
         &self,
         ctx: &SecurityContext,
     ) -> Result<Vec<ResolvedModel>, DomainError> {
-        // Permission check only — no constraints needed for catalog data.
-        self.enforcer
+        let scope = self
+            .enforcer
             .access_scope_with(
                 ctx,
                 &resources::MODEL,
                 actions::LIST,
                 None,
-                &AccessRequest::new().require_constraints(false),
+                &AccessRequest::new()
+                    .require_constraints(false)
+                    .allow_empty_scope(true),
             )
             .await?;
+        if scope.matches_nothing() {
+            return Ok(Vec::new());
+        }
 
         self.model_resolver
             .list_visible_models(ctx.subject_id())

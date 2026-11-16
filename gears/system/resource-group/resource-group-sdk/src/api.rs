@@ -156,6 +156,9 @@ pub trait ResourceGroupClient: Send + Sync {
     // -- Membership lifecycle --
 
     /// Add a membership link between a resource and a group.
+    ///
+    /// A group outside the caller's scope is reported as not found, exactly
+    /// like a missing one.
     async fn add_membership(
         &self,
         ctx: &SecurityContext,
@@ -165,6 +168,13 @@ pub trait ResourceGroupClient: Send + Sync {
     ) -> Result<ResourceGroupMembership, CanonicalError>;
 
     /// Remove a membership link.
+    ///
+    /// The caller's scope for `delete` on the membership resource type is applied
+    /// through the owning group: a membership whose group is outside that scope is
+    /// reported as not found, exactly like a missing one. A caller that treats not
+    /// found as "already removed" must enumerate groups under a scope no wider
+    /// than its membership `delete` scope, otherwise it reports success while the
+    /// row remains.
     async fn remove_membership(
         &self,
         ctx: &SecurityContext,
@@ -174,6 +184,8 @@ pub trait ResourceGroupClient: Send + Sync {
     ) -> Result<(), CanonicalError>;
 
     /// List memberships with `OData` filtering and cursor-based pagination.
+    ///
+    /// Only memberships of groups inside the caller's scope are returned.
     async fn list_memberships(
         &self,
         ctx: &SecurityContext,

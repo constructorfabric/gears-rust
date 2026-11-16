@@ -55,7 +55,7 @@ use crate::domain::search::{
     Cursor, MAX_QUERY_LENGTH, MessageRef, SearchError, SearchPage, SearchQuery, SearchResult,
     SessionMeta, make_snippet, sanitize_for_tsquery,
 };
-use authz_resolver_sdk::pep::PolicyEnforcer;
+use authz_resolver_sdk::pep::{AccessRequest, PolicyEnforcer};
 use toolkit_security::{AccessScope, SecurityContext, pep_properties};
 
 /// Scope label used by the `search_duration_seconds` metric / structured log.
@@ -260,13 +260,17 @@ fn scope_filter_from_access(
     scope: &AccessScope,
     ctx: &SecurityContext,
     session_id: Option<Uuid>,
-) -> SearchScopeFilter {
+) -> Option<SearchScopeFilter> {
     if scope.is_unconstrained() {
-        return SearchScopeFilter {
+        return Some(SearchScopeFilter {
             tenant_id: ctx.subject_tenant_id().to_string(),
             user_id: ctx.subject_id().to_string(),
             session_id,
-        };
+        });
+    }
+    // Check before projection: caller-ID fallbacks would widen an empty scope.
+    if scope.matches_nothing() {
+        return None;
     }
     let tenant_id = scope
         .all_uuid_values_for(pep_properties::OWNER_TENANT_ID)
@@ -278,11 +282,11 @@ fn scope_filter_from_access(
         .first()
         .map(ToString::to_string)
         .unwrap_or_else(|| ctx.subject_id().to_string());
-    SearchScopeFilter {
+    Some(SearchScopeFilter {
         tenant_id,
         user_id,
         session_id,
-    }
+    })
 }
 
 /// Drop every hit ordered at-or-before `cursor` under the
@@ -368,11 +372,17 @@ impl SearchService {
         // @cpt-cf-chat-engine-constraint-fail-closed-authz
         let access = self
             .enforcer
-            .access_scope(ctx, &resource_types::MESSAGE, actions::LIST, None)
+            .access_scope_with(
+                ctx,
+                &resource_types::MESSAGE,
+                actions::LIST,
+                None,
+                &AccessRequest::new().allow_empty_scope(true),
+            )
             .await?;
         let scope = scope_filter_from_access(&access, ctx, Some(session_id));
         let page = self
-            .run(&scope, &parsed, query, SearchScope::Session)
+            .run(scope.as_ref(), &parsed, query, SearchScope::Session)
             .await?;
         let duration_ms = started.elapsed().as_millis() as u64;
         info!(
@@ -407,13 +417,19 @@ impl SearchService {
         // @cpt-cf-chat-engine-constraint-fail-closed-authz
         let access = self
             .enforcer
-            .access_scope(ctx, &resource_types::SESSION, actions::LIST, None)
+            .access_scope_with(
+                ctx,
+                &resource_types::SESSION,
+                actions::LIST,
+                None,
+                &AccessRequest::new().allow_empty_scope(true),
+            )
             .await?;
         let scope = scope_filter_from_access(&access, ctx, None);
         // For cross-session results we need session titles → look them up
         // in batch after the backend returns the hits. Index by session id.
         let page = self
-            .run(&scope, &parsed, query, SearchScope::CrossSession)
+            .run(scope.as_ref(), &parsed, query, SearchScope::CrossSession)
             .await?;
         let duration_ms = started.elapsed().as_millis() as u64;
         info!(
@@ -429,7 +445,7 @@ impl SearchService {
 
     async fn run(
         &self,
-        scope: &SearchScopeFilter,
+        scope: Option<&SearchScopeFilter>,
         parsed: &ParsedQuery,
         query: &SearchQuery,
         kind: SearchScope,
@@ -445,6 +461,15 @@ impl SearchService {
         let cursor = match query.cursor.as_deref() {
             Some(raw) => Some(Cursor::decode(raw).map_err(ChatEngineError::from)?),
             None => None,
+        };
+
+        let Some(scope) = scope else {
+            return Ok(SearchPage {
+                items: Vec::new(),
+                total_count: 0,
+                next_cursor: None,
+                per_page: limit,
+            });
         };
 
         let (hits, total) = self

@@ -21,9 +21,13 @@ use crate::domain::authz;
 ///
 /// `composed_filter = user_filter AND scope_filter`. The scope always
 /// contributes a narrowing predicate: [`authz::scope_to_odata_filter`]
-/// fails closed on an unconstrained / empty-constraint / deny-all scope
-/// rather than yielding a pass-through, so there is no "filter unchanged"
-/// branch. When the user supplied no filter the scope filter alone becomes
+/// fails closed on an unconstrained scope or a filter-less (allow-all)
+/// constraint rather than yielding a pass-through, so there is no "filter
+/// unchanged" branch. A deny-all scope — a permitted scope whose every branch
+/// was an empty set, normalized to no live constraints — is a normal success:
+/// it contributes an always-false contradiction, so the backend still runs
+/// the query and returns its own empty-input result (e.g. an aggregate's
+/// zero/NULL bucket). When the user supplied no filter the scope filter alone becomes
 /// the composed filter. `gts_id`, the time window, and the order /
 /// limit / cursor / select projections on [`ODataQuery`] flow through
 /// verbatim — the composition only touches the `$filter` AST.
@@ -42,8 +46,9 @@ pub(crate) fn compose_query_with_scope(
     // @cpt-begin:cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2:p2:inst-constraint-composition-parse-pdp
     // @cpt-begin:cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2:p2:inst-constraint-composition-iterate
     // `scope_to_odata_filter` always yields a narrowing predicate or fails
-    // closed: an unconstrained / empty-constraint / deny-all scope is denied,
-    // never passed through as "no row narrowing".
+    // closed: an unconstrained / filter-less-constraint scope is denied, never
+    // passed through as "no row narrowing"; a deny-all (all-empty) scope
+    // yields an always-false contradiction so the backend still runs.
     let scope_expr = authz::scope_to_odata_filter(scope).map_err(UsageCollectorError::from)?;
     // @cpt-end:cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2:p2:inst-constraint-composition-iterate
     // @cpt-end:cpt-cf-usage-collector-algo-usage-query-pdp-constraint-composition-v2:p2:inst-constraint-composition-parse-pdp

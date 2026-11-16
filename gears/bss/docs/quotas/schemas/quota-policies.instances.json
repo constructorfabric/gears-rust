@@ -1,0 +1,19 @@
+[
+  {
+    "id": "gts.cf.bss.products.quota_accounting_policy.v1~cf.bss.products.allocated_vcpu.v1",
+    "quantity_basis": "allocated_capacity",
+    "aggregation": "sum",
+    "description": {
+      "en": "Counts allocated vCPUs, including stopped virtual machines."
+    }
+  },
+  {
+    "id": "gts.cf.bss.products.quota_scope_policy.v1~cf.bss.products.regional_pool.v1",
+    "subject_selector": "resource_owner",
+    "aggregation": "single_verified_scope",
+    "required_dimensions": [
+      "region",
+      "resource_pool"
+    ]
+  }
+]

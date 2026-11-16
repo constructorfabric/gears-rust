@@ -71,8 +71,12 @@ async fn consumer_tuning_concurrency_cap_sheds_second_request() {
     let url = format!("{base_url}/hold");
 
     // The knob a deployment would put under `clients.consumes.<dep>`.
+    // A plaintext mock: FIPS builds require TLS by default and install no
+    // crypto provider.
+    drop(toolkit_security::tls::configured_provider().install_default());
     let tuning = ClientTuning {
         max_concurrent_requests: Some(1),
+        require_tls: Some(false),
         ..ClientTuning::default()
     };
 

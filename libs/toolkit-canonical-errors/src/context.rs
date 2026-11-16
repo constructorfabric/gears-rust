@@ -34,10 +34,10 @@ pub struct QuotaViolationV1 {
     pub description: String,
     /// Per-violation retry hint. Populated for rate-limit-style violations
     /// where the upstream knows when capacity returns; `None` for hard
-    /// exhaustion (memory, quota with no replenishment window). When the
-    /// canonical error crosses an HTTP boundary, this value is what
-    /// downstream callers see — the wire `Retry-After` header is for
-    /// `ServiceUnavailable`, not `ResourceExhausted`.
+    /// exhaustion (memory, quota with no replenishment window). The error-level
+    /// hint is the largest among its violations
+    /// ([`ResourceExhaustedV1::retry_after_seconds`]); over HTTP it is also
+    /// sent as the `Retry-After` header of the `429` response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_seconds: Option<u64>,
 }
@@ -249,6 +249,19 @@ impl ResourceExhaustedV1 {
         Self {
             violations: violations.into(),
         }
+    }
+
+    /// The error's retry hint: the largest `retry_after_seconds` among its
+    /// violations, so a caller that waits this long has waited for every
+    /// violated limit. Violations without a hint do not count; `None` when no
+    /// violation has one (hard exhaustion). The HTTP `Retry-After` header and
+    /// SDK projections use this value.
+    #[must_use]
+    pub fn retry_after_seconds(&self) -> Option<u64> {
+        self.violations
+            .iter()
+            .filter_map(|v| v.retry_after_seconds)
+            .max()
     }
 }
 

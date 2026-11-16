@@ -83,6 +83,10 @@ pub enum AuthzError {
     /// A dependency needed to decide could not answer.
     #[error("authorisation could not be decided: {0}")]
     Unavailable(String),
+    /// The decision failed in a way this gear does not classify (an unknown
+    /// enforcer outcome); an internal failure, never a denial.
+    #[error("authorisation failed internally: {0}")]
+    Internal(String),
 }
 
 /// What an authorisation is about.
@@ -210,8 +214,9 @@ impl ManagementAuthorizer {
 
 fn map_enforcer_error(err: EnforcerError) -> AuthzError {
     match err {
-        EnforcerError::Denied { .. } | EnforcerError::CompileFailed(_) => AuthzError::Denied,
+        EnforcerError::AccessDenied(_) | EnforcerError::CompileFailed(_) => AuthzError::Denied,
         EnforcerError::EvaluationFailed(e) => AuthzError::Unavailable(e.to_string()),
+        unknown => AuthzError::Internal(unknown.to_string()),
     }
 }
 

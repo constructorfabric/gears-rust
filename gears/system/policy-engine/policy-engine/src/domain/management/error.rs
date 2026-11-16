@@ -96,11 +96,12 @@ pub fn internal_logged(detail: impl std::fmt::Display) -> ManagementError {
 
 /// Projects an authorisation failure: `on_denied` for a denial, which each
 /// caller words for what it may reveal; unavailable when the decision could
-/// not be made.
+/// not be made; internal (detail logged) for an unclassified failure.
 pub fn authz(err: AuthzError, on_denied: impl FnOnce() -> ManagementError) -> ManagementError {
     match err {
         AuthzError::Denied => on_denied(),
         AuthzError::Unavailable(detail) => unavailable(detail),
+        AuthzError::Internal(detail) => internal_logged(detail),
     }
 }
 

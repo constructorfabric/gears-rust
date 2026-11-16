@@ -643,6 +643,45 @@ fn constraints_combine_as_or_with_undecidable_below_covered() {
     );
 }
 
+/// A constraint that matches nothing (an empty group set) covers nothing and
+/// is not an undecidable predicate: it neither changes the refusal beside a
+/// non-covering constraint nor blocks a covering one.
+#[test]
+fn a_constraint_that_matches_nothing_is_not_undecidable() {
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+    let key = SubjectKey {
+        tenant_id: tenant,
+        subject_id: subject,
+    };
+    let empty_group = || {
+        vec![
+            filter(pep_properties::OWNER_TENANT_ID, vec![tenant]),
+            ScopeFilter::in_group_typed(
+                pep_properties::OWNER_ID,
+                "gts.cf.core.rg.member.v1~",
+                vec![],
+            ),
+        ]
+    };
+    let elsewhere = || {
+        vec![filter(
+            pep_properties::OWNER_TENANT_ID,
+            vec![Uuid::new_v4()],
+        )]
+    };
+    let own = || vec![filter(pep_properties::OWNER_TENANT_ID, vec![tenant])];
+
+    assert_eq!(
+        coverage(&scope(vec![empty_group(), elsewhere()]), key),
+        Err(ScopeRefusal::NotCovered)
+    );
+    assert_eq!(
+        coverage(&scope(vec![empty_group()]), key),
+        Err(ScopeRefusal::NotCovered)
+    );
+    assert_eq!(coverage(&scope(vec![empty_group(), own()]), key), Ok(()));
+}
+
 /// Every small scope of `Eq`/`In` filters, checked against the secure ORM
 /// itself: the coverage check says "covered" exactly when the scoped select
 /// returns the row, and exactly when the scoped write is accepted. This pins

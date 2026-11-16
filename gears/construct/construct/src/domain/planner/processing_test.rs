@@ -5,7 +5,7 @@ use construct_sdk::gts::ENRICHMENT_FACT_CANDIDATE_TYPE;
 use serde_json::json;
 use tokio::time::Instant;
 
-use super::processing::{Changes, Managed, NothingStored, Written};
+use super::processing::{Changes, ManageDeadlines, Managed, NothingStored, Written};
 use super::test_data::{
     AGENT, Chain, Profiles, SUBJECT, TENANT, Writer, adding_rust, done, node_key, tool_calls,
 };
@@ -310,8 +310,20 @@ async fn an_unreadable_review_store_drops_the_record_at_the_planner() {
     );
 }
 
-fn in_a_while() -> Instant {
-    Instant::now() + Duration::from_secs(20)
+fn in_a_while() -> ManageDeadlines {
+    let now = Instant::now();
+    ManageDeadlines {
+        before_write: now + Duration::from_secs(20),
+        answer: now + Duration::from_secs(27),
+    }
+}
+
+/// Deadlines whose steps before the write end in 50 ms.
+fn soon_before_the_write() -> ManageDeadlines {
+    ManageDeadlines {
+        before_write: Instant::now() + Duration::from_millis(50),
+        ..in_a_while()
+    }
 }
 
 #[tokio::test]
@@ -470,7 +482,7 @@ async fn the_deadline_cuts_off_the_steps_before_the_write() {
     };
 
     let managed = chain
-        .manage(Instant::now() + Duration::from_millis(50))
+        .manage(soon_before_the_write())
         .await
         .expect("an answer");
 
@@ -479,7 +491,7 @@ async fn the_deadline_cuts_off_the_steps_before_the_write() {
 }
 
 #[tokio::test]
-async fn a_write_that_started_is_awaited_past_the_deadline() {
+async fn a_write_that_started_is_awaited_past_the_deadline_before_the_write() {
     let chain = Chain {
         writer: Arc::new(Writer {
             takes: Duration::from_millis(200),
@@ -489,11 +501,21 @@ async fn a_write_that_started_is_awaited_past_the_deadline() {
     };
 
     let managed = chain
-        .manage(Instant::now() + Duration::from_millis(50))
+        .manage(soon_before_the_write())
         .await
         .expect("an answer");
 
     assert!(matches!(managed, Managed::Stored(_)), "{managed:?}");
+}
+
+#[tokio::test]
+async fn the_write_runs_by_the_answer_deadline() {
+    let chain = Chain::new(adding_rust(1), &[Ok(Written::Stored)]);
+    let deadlines = in_a_while();
+
+    chain.manage(deadlines).await.expect("an answer");
+
+    assert_eq!(chain.writer.deadlines(), vec![deadlines.answer]);
 }
 
 #[tokio::test]

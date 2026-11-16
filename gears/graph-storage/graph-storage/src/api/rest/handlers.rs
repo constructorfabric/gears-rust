@@ -135,24 +135,28 @@ fn registration_options(
     })
 }
 
-#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
+#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id(), target_tenant = ?target.tenant))]
 pub async fn register_types(
     Extension(ctx): Extension<SecurityContext>,
     Extension(services): Extension<Arc<GraphServices>>,
+    Query(target): Query<dto::TargetTenantParam>,
     Json(request): Json<dto::GraphRegisterTypesRequest>,
 ) -> ApiResult<Json<Vec<dto::GraphRegisteredTypeDto>>> {
     let mut options = registration_options(request.options)?;
     options.migrations = migrations(request.migrations)?;
     let batch: Vec<m::TypeRegistration> = request.types.into_iter().map(Into::into).collect();
-    let registered = services.register_types_with(&ctx, batch, options).await?;
+    let registered = services
+        .register_types_with(target.call(&ctx), batch, options)
+        .await?;
     Ok(Json(registered.into_iter().map(Into::into).collect()))
 }
 
 /// The dry run: every verdict, no write.
-#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
+#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id(), target_tenant = ?target.tenant))]
 pub async fn type_compatibility(
     Extension(ctx): Extension<SecurityContext>,
     Extension(services): Extension<Arc<GraphServices>>,
+    Query(target): Query<dto::TargetTenantParam>,
     Json(request): Json<dto::GraphRegisterTypesRequest>,
 ) -> ApiResult<Json<dto::GraphTypeCompatibilityDto>> {
     // Re-validation defaults *on* here and off on the write path: the whole
@@ -169,7 +173,7 @@ pub async fn type_compatibility(
     let plans = migrations(request.migrations)?;
     let batch: Vec<m::TypeRegistration> = request.types.into_iter().map(Into::into).collect();
     let items = services
-        .type_compatibility(&ctx, batch, revalidate, plans)
+        .type_compatibility(target.call(&ctx), batch, revalidate, plans)
         .await?;
     Ok(Json(dto::GraphTypeCompatibilityDto {
         items: items.into_iter().map(Into::into).collect(),
@@ -190,26 +194,28 @@ pub async fn readiness(
     Ok(Json(services.readiness().await.into()))
 }
 
-#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
+#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id(), target_tenant = ?target.tenant))]
 pub async fn list_source_namespaces(
     Extension(ctx): Extension<SecurityContext>,
     Extension(services): Extension<Arc<GraphServices>>,
+    Query(target): Query<dto::TargetTenantParam>,
 ) -> ApiResult<Json<dto::GraphSourceNamespaceListDto>> {
-    let items = services.list_source_namespaces(&ctx).await?;
+    let items = services.list_source_namespaces(target.call(&ctx)).await?;
     Ok(Json(dto::GraphSourceNamespaceListDto {
         items: items.into_iter().map(Into::into).collect(),
     }))
 }
 
-#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
+#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id(), target_tenant = ?target.tenant))]
 pub async fn transfer_source_namespace(
     Extension(ctx): Extension<SecurityContext>,
     Extension(services): Extension<Arc<GraphServices>>,
+    Query(target): Query<dto::TargetTenantParam>,
     Path(namespace): Path<String>,
     Json(request): Json<dto::GraphTransferNamespaceRequest>,
 ) -> ApiResult<Json<dto::GraphSourceNamespaceDto>> {
     let row = services
-        .transfer_source_namespace(&ctx, &namespace, &request.owner_principal)
+        .transfer_source_namespace(target.call(&ctx), &namespace, &request.owner_principal)
         .await?;
     Ok(Json(row.into()))
 }
@@ -226,6 +232,10 @@ pub struct ListTypesParams {
     pub limit: Option<u32>,
     /// The `next_cursor` of a previous page, to continue it.
     pub cursor: Option<String>,
+    /// The target tenant (`?tenant=`, gears-rust #5623). Named here rather
+    /// than read by a second extractor: the catch-all below sees the whole
+    /// query string, so a parameter this struct does not name is refused.
+    pub tenant: Option<uuid::Uuid>,
     /// Anything else the caller sent. Collected so it can be refused: a
     /// parameter silently ignored is a filter the caller believes is applied,
     /// which is the failure mode the projection's `OData` binding exists to
@@ -234,7 +244,7 @@ pub struct ListTypesParams {
     pub rest: std::collections::BTreeMap<String, String>,
 }
 
-#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
+#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id(), target_tenant = ?params.tenant))]
 pub async fn list_types(
     Extension(ctx): Extension<SecurityContext>,
     Extension(services): Extension<Arc<GraphServices>>,
@@ -243,10 +253,13 @@ pub async fn list_types(
     if let Some(unknown) = params.rest.keys().next() {
         return Err(DomainError::invalid(format!(
             "`{unknown}` is not an accepted query option; the type catalog takes \
-             `kind`, `pattern`, `limit` and `cursor`"
+             `kind`, `pattern`, `limit`, `cursor` and `tenant`"
         ))
         .into());
     }
+    let target = dto::TargetTenantParam {
+        tenant: params.tenant,
+    };
     // Through the SDK, like every other closed enum on this surface: a match
     // written out here is one a maintainer can give a default arm, and the
     // spelling would be free to drift from the encoder that produced it.
@@ -260,7 +273,7 @@ pub async fn list_types(
         })?;
     let page = services
         .list_types(
-            &ctx,
+            target.call(&ctx),
             m::TypeQuery {
                 kind,
                 pattern: params.pattern,
@@ -276,20 +289,22 @@ pub async fn list_types(
     }))
 }
 
-#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
+#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id(), target_tenant = ?target.tenant))]
 pub async fn get_type(
     Extension(ctx): Extension<SecurityContext>,
     Extension(services): Extension<Arc<GraphServices>>,
+    Query(target): Query<dto::TargetTenantParam>,
     Path(type_id): Path<String>,
 ) -> ApiResult<Json<dto::GraphTypeDto>> {
-    let record = services.get_type(&ctx, &type_id).await?;
+    let record = services.get_type(target.call(&ctx), &type_id).await?;
     Ok(Json(record.into()))
 }
 
-#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
+#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id(), target_tenant = ?target.tenant))]
 pub async fn ingest(
     Extension(ctx): Extension<SecurityContext>,
     Extension(services): Extension<Arc<GraphServices>>,
+    Query(target): Query<dto::TargetTenantParam>,
     headers: HeaderMap,
     Json(request): Json<dto::GraphIngestRequest>,
 ) -> ApiResult<Json<dto::GraphIngestResultDto>> {
@@ -305,7 +320,7 @@ pub async fn ingest(
         replace_scope: request.replace_scope.map(Into::into),
         idempotency_key: key,
     };
-    let outcome = services.ingest(&ctx, ingest).await?;
+    let outcome = services.ingest(target.call(&ctx), ingest).await?;
     Ok(Json(outcome.into()))
 }
 
@@ -314,15 +329,16 @@ pub struct GetNodeParams {
     pub adjacency_limit: Option<u32>,
 }
 
-#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
+#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id(), target_tenant = ?target.tenant))]
 pub async fn get_node(
     Extension(ctx): Extension<SecurityContext>,
     Extension(services): Extension<Arc<GraphServices>>,
+    Query(target): Query<dto::TargetTenantParam>,
     Path(node_key): Path<String>,
     Query(params): Query<GetNodeParams>,
 ) -> ApiResult<Json<dto::GraphNodeDto>> {
     let view = services
-        .get_node(&ctx, &node_key, params.adjacency_limit)
+        .get_node(target.call(&ctx), &node_key, params.adjacency_limit)
         .await?;
     Ok(Json(view.into()))
 }
@@ -332,13 +348,14 @@ pub async fn get_node(
 /// The envelope on the answer is the point of the surface: `fr-audit-envelope`
 /// asks for it on every returned node *and* edge, and until this existed no
 /// read path returned an edge as anything but a topology reference.
-#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
+#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id(), target_tenant = ?target.tenant))]
 pub async fn get_edge(
     Extension(ctx): Extension<SecurityContext>,
     Extension(services): Extension<Arc<GraphServices>>,
+    Query(target): Query<dto::TargetTenantParam>,
     Path(edge_key): Path<String>,
 ) -> ApiResult<Json<dto::GraphEdgeDto>> {
-    let view = services.get_edge(&ctx, &edge_key).await?;
+    let view = services.get_edge(target.call(&ctx), &edge_key).await?;
     Ok(Json(view.into()))
 }
 
@@ -348,15 +365,18 @@ pub async fn get_edge(
 /// five accepted system query options — `cursor` included, as the documented
 /// alias for `$skiptoken` — and refuses anything else, so an option a client
 /// believes is applied can never be quietly dropped.
-#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
+#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id(), target_tenant = ?target.tenant))]
 pub async fn project_nodes(
     Extension(ctx): Extension<SecurityContext>,
     Extension(services): Extension<Arc<GraphServices>>,
+    Query(target): Query<dto::TargetTenantParam>,
     Query(params): Query<ProjectionTypeParams>,
     OData(query): OData,
 ) -> ApiResult<Json<toolkit_odata::Page<dto::GraphNodeRowDto>>> {
     let patterns = params.patterns();
-    let page = services.project_nodes(&ctx, &patterns, query).await?;
+    let page = services
+        .project_nodes(target.call(&ctx), &patterns, query)
+        .await?;
     Ok(Json(page.map_items(dto::GraphNodeRowDto::from)))
 }
 
@@ -364,15 +384,18 @@ pub async fn project_nodes(
 /// `$filter`. The same `OData` extractor binds the query, so a `$filter` means
 /// here what it means on the listing; the options a count has no use for are
 /// refused by the service.
-#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
+#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id(), target_tenant = ?target.tenant))]
 pub async fn count_nodes(
     Extension(ctx): Extension<SecurityContext>,
     Extension(services): Extension<Arc<GraphServices>>,
+    Query(target): Query<dto::TargetTenantParam>,
     Query(params): Query<ProjectionTypeParams>,
     OData(query): OData,
 ) -> ApiResult<Json<dto::GraphNodeCountDto>> {
     let patterns = params.patterns();
-    let count = services.count_nodes(&ctx, &patterns, query).await?;
+    let count = services
+        .count_nodes(target.call(&ctx), &patterns, query)
+        .await?;
     Ok(Json(count.into()))
 }
 
@@ -399,30 +422,33 @@ impl ProjectionTypeParams {
     }
 }
 
-#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
+#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id(), target_tenant = ?target.tenant))]
 pub async fn delete_node(
     Extension(ctx): Extension<SecurityContext>,
     Extension(services): Extension<Arc<GraphServices>>,
+    Query(target): Query<dto::TargetTenantParam>,
     Path(node_key): Path<String>,
 ) -> ApiResult<Json<dto::GraphDeleteResultDto>> {
-    let outcome = services.delete_node(&ctx, &node_key).await?;
+    let outcome = services.delete_node(target.call(&ctx), &node_key).await?;
     Ok(Json(outcome.into()))
 }
 
-#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
+#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id(), target_tenant = ?target.tenant))]
 pub async fn delete_edge(
     Extension(ctx): Extension<SecurityContext>,
     Extension(services): Extension<Arc<GraphServices>>,
+    Query(target): Query<dto::TargetTenantParam>,
     Path(edge_key): Path<String>,
 ) -> ApiResult<Json<dto::GraphDeleteResultDto>> {
-    let outcome = services.delete_edge(&ctx, &edge_key).await?;
+    let outcome = services.delete_edge(target.call(&ctx), &edge_key).await?;
     Ok(Json(outcome.into()))
 }
 
-#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
+#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id(), target_tenant = ?target.tenant))]
 pub async fn search(
     Extension(ctx): Extension<SecurityContext>,
     Extension(services): Extension<Arc<GraphServices>>,
+    Query(target): Query<dto::TargetTenantParam>,
     Json(request): Json<dto::GraphSearchRequest>,
 ) -> ApiResult<Json<dto::GraphSearchResponseDto>> {
     // The SDK owns both directions of this spelling, so a hand-rolled match
@@ -433,7 +459,7 @@ pub async fn search(
     let arm_limit = request.arm_limit.unwrap_or(20);
     let response = services
         .search(
-            &ctx,
+            target.call(&ctx),
             m::SearchRequest {
                 mode,
                 query: request.query,
@@ -456,15 +482,16 @@ fn parse_direction(raw: Option<&str>) -> Result<Option<m::Direction>, DomainErro
     .transpose()
 }
 
-#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
+#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id(), target_tenant = ?target.tenant))]
 pub async fn traverse(
     Extension(ctx): Extension<SecurityContext>,
     Extension(services): Extension<Arc<GraphServices>>,
+    Query(target): Query<dto::TargetTenantParam>,
     Json(request): Json<dto::GraphTraverseRequest>,
 ) -> ApiResult<Json<dto::GraphTraversalResponseDto>> {
     let response = services
         .traverse(
-            &ctx,
+            target.call(&ctx),
             m::TraverseRequest {
                 seeds: request.seeds,
                 depth: request.depth,
@@ -479,15 +506,16 @@ pub async fn traverse(
     Ok(Json(response.into()))
 }
 
-#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
+#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id(), target_tenant = ?target.tenant))]
 pub async fn neighborhood(
     Extension(ctx): Extension<SecurityContext>,
     Extension(services): Extension<Arc<GraphServices>>,
+    Query(target): Query<dto::TargetTenantParam>,
     Json(request): Json<dto::GraphNeighborhoodRequest>,
 ) -> ApiResult<Json<dto::GraphTraversalResponseDto>> {
     let response = services
         .neighborhood(
-            &ctx,
+            target.call(&ctx),
             m::NeighborhoodRequest {
                 root: request.root,
                 depth: request.depth,
@@ -500,12 +528,13 @@ pub async fn neighborhood(
     Ok(Json(response.into()))
 }
 
-#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
+#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id(), target_tenant = ?target.tenant))]
 pub async fn revision(
     Extension(ctx): Extension<SecurityContext>,
     Extension(services): Extension<Arc<GraphServices>>,
+    Query(target): Query<dto::TargetTenantParam>,
 ) -> ApiResult<Json<dto::GraphRevisionDto>> {
-    let revision = services.revision(&ctx).await?;
+    let revision = services.revision(target.call(&ctx)).await?;
     Ok(Json(revision.into()))
 }
 

@@ -567,3 +567,47 @@ fn decode_cursor_rejects_a_malformed_client_token() {
     // Valid base64url, but the decoded bytes are not a `CursorV1` JSON payload.
     assert!(super::super::keyset::decode_cursor("bm90LWpzb24").is_err());
 }
+
+#[test]
+fn empty_authorization_set_preserves_live_or_branch_and_bind_order() {
+    use toolkit_odata::{ast, filter::convert_expr_to_filter_node};
+    let tenant = uuid::Uuid::from_u128(42);
+    let tenant_eq = |id| {
+        ast::Expr::Compare(
+            Box::new(ast::Expr::Identifier("tenant_id".into())),
+            ast::CompareOperator::Eq,
+            Box::new(ast::Expr::Value(ast::Value::Uuid(id))),
+        )
+    };
+    let eq = tenant_eq(uuid::Uuid::nil());
+    let contradiction = eq.clone().and(ast::Expr::Not(Box::new(eq)));
+    for with_alternative in [false, true] {
+        let expr = if with_alternative {
+            contradiction.clone().or(tenant_eq(tenant))
+        } else {
+            contradiction.clone()
+        };
+        let node = convert_expr_to_filter_node::<UsageRecordFilterField>(&expr).unwrap();
+        let mut ctx = SqlCtx::new(5);
+        let sql = translate_record_filter(&node, &mut ctx).unwrap();
+        let expected = if with_alternative {
+            "((tenant_id = $5 AND NOT (tenant_id = $6)) OR tenant_id = $7)"
+        } else {
+            "(tenant_id = $5 AND NOT (tenant_id = $6))"
+        };
+        assert_eq!(sql, expected);
+        let ids: Vec<_> = ctx
+            .binds
+            .iter()
+            .map(|bind| match bind {
+                SqlBind::Uuid(id) => *id,
+                other => panic!("expected UUID bind, got {other:?}"),
+            })
+            .collect();
+        let mut expected_ids = vec![uuid::Uuid::nil(), uuid::Uuid::nil()];
+        if with_alternative {
+            expected_ids.push(tenant);
+        }
+        assert_eq!(ids, expected_ids);
+    }
+}

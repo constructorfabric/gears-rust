@@ -1,13 +1,21 @@
-//! The gear's processing worker: started with the gear, stopped with it.
+//! The gear's processing worker, started with the gear and stopped with it,
+//! and the routes the gear registers.
 
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
-use authz_resolver_sdk::PolicyEnforcer;
+use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
+use axum::body::{Body, to_bytes};
+use axum::http::{Method, Request, StatusCode, header};
+use axum::{Extension, Router};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
-use toolkit::contracts::RunnableCapability;
+use toolkit::api::OpenApiRegistryImpl;
+use toolkit::contracts::{RestApiCapability, RunnableCapability};
+use toolkit::{ClientHub, ConfigProvider, GearCtx};
 use toolkit_security::SecurityContext;
+use tower::ServiceExt;
 use uuid::Uuid;
 
 use super::{ConstructGear, Running};
@@ -18,8 +26,8 @@ use crate::infra::pipeline::assemble;
 use crate::infra::processing_metrics::WorkerLoad;
 use crate::infra::record_queue::record_queue;
 use crate::test_support::{
-    AllowResolver, fake_graph_storage, inmem_db, received_chat_record, settings_service,
-    unchecked_processing,
+    AllowResolver, DenyResolver, IntakeFixture, context_of, fake_graph_storage, inmem_db,
+    received_chat_record, settings_service, unchecked_processing,
 };
 
 /// A model no test record reaches.
@@ -223,4 +231,171 @@ async fn stop_gives_up_on_an_aborted_worker_that_does_not_end_and_says_so() {
         started.elapsed()
     );
     assert!(logs_contain("did not end after it was aborted"));
+}
+
+/// No gear config: `register_rest` reads none.
+struct NoConfig;
+
+impl ConfigProvider for NoConfig {
+    fn get_gear_config(&self, _gear_name: &str) -> Option<&Value> {
+        None
+    }
+}
+
+/// The router the gear registers, with its services built from `cfg` and
+/// `model` as `init` builds them, `caller` authenticated, and `resolver`
+/// answering the gear's permission checks.
+async fn router_of(
+    cfg: ConstructConfig,
+    model: Option<Arc<dyn ModelClient>>,
+    caller: Uuid,
+    resolver: Arc<dyn AuthZResolverApi>,
+) -> Router {
+    let db = inmem_db().await;
+    let settings = Arc::new(settings_service(&db, Arc::new(AllowResolver), true));
+    let pipeline = assemble(
+        &cfg.validated().unwrap(),
+        model,
+        fake_graph_storage(),
+        Arc::clone(&settings) as _,
+        Arc::new(crate::test_support::MemoryReviews::default()),
+        PolicyEnforcer::new(resolver),
+    )
+    .unwrap();
+    let gear = ConstructGear::default();
+    assert!(
+        gear.intake
+            .set(Arc::new(IntakeFixture::default().build(&db)))
+            .is_ok()
+    );
+    assert!(gear.settings.set(settings).is_ok());
+    assert!(gear.profile.set(pipeline.profile).is_ok());
+    assert!(gear.subject_control.set(pipeline.subject_control).is_ok());
+    assert!(gear.review_queue.set(pipeline.review_queue).is_ok());
+    assert!(gear.admin_facts.set(pipeline.admin_facts).is_ok());
+    assert!(gear.manage.set(pipeline.manage).is_ok());
+    let ctx = GearCtx::new(
+        ConstructGear::MODULE_NAME,
+        Uuid::new_v4(),
+        Arc::new(NoConfig),
+        Arc::new(ClientHub::new()),
+        CancellationToken::new(),
+    );
+    gear.register_rest(&ctx, Router::new(), &OpenApiRegistryImpl::new())
+        .unwrap()
+        .layer(Extension(context_of(caller, Uuid::new_v4())))
+}
+
+/// A manage-facts call for `subject_id`, in `tenant` when one is named: the
+/// status and the JSON body, null when there is none.
+async fn manage(router: Router, subject_id: Uuid, tenant: Option<Uuid>) -> (StatusCode, Value) {
+    let query = tenant.map(|tenant| format!("?tenant={tenant}"));
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!(
+            "/construct/v1/subjects/{subject_id}/facts/manage{}",
+            query.unwrap_or_default()
+        ))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({ "message": "I also know Rust.", "conversation": "" }).to_string(),
+        ))
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    // A route that is not registered answers with no body.
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// The subject calling for itself, and an application calling for it in the
+/// subject's tenant: the caller, and the tenant it names.
+fn callers(subject: Uuid) -> [(Uuid, Option<Uuid>); 2] {
+    [(subject, None), (Uuid::new_v4(), Some(Uuid::new_v4()))]
+}
+
+#[tokio::test]
+async fn the_gear_routes_manage_facts_to_the_processing_chain() {
+    let subject = Uuid::new_v4();
+    for (caller, tenant) in callers(subject) {
+        let cfg = ConstructConfig {
+            processing_identity: Some(Uuid::new_v4()),
+            processing: unchecked_processing(),
+            profile_category_check: Some(CategoryCheckConfig::OneCall),
+            ..ConstructConfig::default()
+        };
+
+        let (status, body) = manage(
+            router_of(cfg, Some(Arc::new(Unused)), caller, Arc::new(AllowResolver)).await,
+            subject,
+            tenant,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{tenant:?}: {body}");
+        assert_eq!(
+            (&body["outcome"], &body["reason"]),
+            (&json!("nothing_changed"), &json!("model_failed")),
+            "{tenant:?}: the call reached the planner's model"
+        );
+    }
+}
+
+#[tokio::test]
+async fn without_processing_the_gear_answers_manage_facts_not_configured() {
+    let subject = Uuid::new_v4();
+    for (caller, tenant) in callers(subject) {
+        let (status, body) = manage(
+            router_of(
+                ConstructConfig::default(),
+                None,
+                caller,
+                Arc::new(AllowResolver),
+            )
+            .await,
+            subject,
+            tenant,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{tenant:?}: {body}");
+        assert_eq!(body["status"], 501, "{tenant:?}: {body}");
+        assert!(
+            body["type"]
+                .as_str()
+                .is_some_and(|kind| kind.contains("unimplemented")),
+            "{tenant:?}: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn without_processing_a_caller_who_may_not_act_for_the_subject_gets_not_found() {
+    let subject = Uuid::new_v4();
+    for (caller, tenant) in callers(subject) {
+        let (status, body) = manage(
+            router_of(
+                ConstructConfig::default(),
+                None,
+                caller,
+                Arc::new(DenyResolver),
+            )
+            .await,
+            subject,
+            tenant,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND, "{tenant:?}: {body}");
+        assert_eq!(body["status"], 404, "{tenant:?}: {body}");
+        assert!(
+            body["type"]
+                .as_str()
+                .is_some_and(|kind| kind.contains("not_found")),
+            "{tenant:?}: {body}"
+        );
+    }
 }

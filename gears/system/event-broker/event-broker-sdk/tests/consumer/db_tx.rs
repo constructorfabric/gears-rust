@@ -26,8 +26,9 @@ const TX_BATCH_EVENT: &str = gts_id!("cf.core.events.event.v1~example.mock.showc
 mod dlq_row {
     use sea_orm::entity::prelude::*;
 
-    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, toolkit_db::secure::Scopable)]
     #[sea_orm(table_name = "showcase_dead_letters")]
+    #[secure(unrestricted)]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
         pub event_id: Uuid,
@@ -44,33 +45,6 @@ mod dlq_row {
     pub enum Relation {}
 
     impl ActiveModelBehavior for ActiveModel {}
-
-    impl toolkit_db::secure::ScopableEntity for Entity {
-        const IS_UNRESTRICTED: bool = true;
-
-        fn tenant_col() -> Option<Self::Column> {
-            None
-        }
-
-        fn resource_col() -> Option<Self::Column> {
-            None
-        }
-
-        fn owner_col() -> Option<Self::Column> {
-            None
-        }
-
-        fn type_col() -> Option<Self::Column> {
-            None
-        }
-
-        fn resolve_property(_property: &str) -> Option<Self::Column> {
-            None
-        }
-        fn scope_columns() -> Vec<Self::Column> {
-            Vec::new()
-        }
-    }
 }
 
 struct TxSingleProjector {

@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use resource_group_sdk::models::ResourceGroupMembership;
 use resource_group_sdk::odata::MembershipFilterField;
 use sea_orm::ExprTrait;
-use sea_orm::sea_query::{Expr, Query};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::sea_query::{Expr, Query, SelectStatement};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait, Set};
 use toolkit_db::odata::{LimitCfg, paginate_odata};
 use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt};
 use toolkit_odata::{ODataQuery, Page, SortDir};
@@ -19,8 +19,12 @@ use uuid::Uuid;
 
 use super::odata_filter::prepare_filter;
 use crate::domain::error::DomainError;
+use crate::domain::membership_service::group_scope_for_membership;
 use crate::domain::repo::MembershipRepositoryTrait;
 use crate::infra::storage::FK_RGM_GROUP_ID;
+use crate::infra::storage::entity::resource_group::{
+    self as rg_entity, Entity as ResourceGroupEntity,
+};
 use crate::infra::storage::entity::resource_group_membership::{
     self as membership_entity, Entity as MembershipEntity,
 };
@@ -37,6 +41,35 @@ fn system_scope() -> AccessScope {
     AccessScope::allow_all()
 }
 
+/// Ids of the groups visible under `scope`, as a subquery.
+///
+/// The scope was issued for the membership resource type and is compiled
+/// against the group entity here. A property other than the owner tenant id
+/// would be read in terms of the group (a resource id would be read as the
+/// group id), so the scope is first narrowed by `group_scope_for_membership`,
+/// which fails closed: such a scope matches no group.
+fn groups_in_scope(scope: &AccessScope) -> SelectStatement {
+    ResourceGroupEntity::find()
+        .secure()
+        .scope_with(&group_scope_for_membership(scope))
+        .into_inner()
+        .select_only()
+        .column(rg_entity::Column::Id)
+        .into_query()
+}
+
+/// Membership-side condition that restricts rows to groups visible under
+/// `scope`. `None` for an unconstrained scope: no tenant filtering, and no
+/// semi-join over all groups. A deny-all scope, and any scope that fails
+/// closed in `group_scope_for_membership`, yields a subquery with
+/// `WHERE false`, so no rows match.
+fn membership_group_condition(scope: &AccessScope) -> Option<Expr> {
+    if scope.is_unconstrained() {
+        return None;
+    }
+    Some(membership_entity::Column::GroupId.in_subquery(groups_in_scope(scope)))
+}
+
 /// Repository for membership persistence operations.
 pub struct MembershipRepository;
 
@@ -50,10 +83,17 @@ impl MembershipRepositoryTrait for MembershipRepository {
     async fn list_memberships<C: DBRunner>(
         &self,
         db: &C,
+        scope: &AccessScope,
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupMembership>, DomainError> {
-        let scope = system_scope();
-        let base_query = MembershipEntity::find().secure().scope_with(&scope);
+        // The membership table has no scope columns, so the row itself is
+        // read under the system scope. The caller's tenant scope is applied
+        // through the owning group (see `membership_group_condition`).
+        let row_scope = system_scope();
+        let base_query = MembershipEntity::find()
+            .apply_if(membership_group_condition(scope), QueryFilter::filter)
+            .secure()
+            .scope_with(&row_scope);
         let (base_query, query_no_filter) =
             prepare_filter::<MembershipFilterField, MembershipODataMapper, _>(
                 db,
@@ -175,41 +215,25 @@ impl MembershipRepositoryTrait for MembershipRepository {
     async fn delete<C: DBRunner>(
         &self,
         db: &C,
+        scope: &AccessScope,
         group_id: Uuid,
         gts_type_id: i16,
         resource_id: &str,
     ) -> Result<u64, DomainError> {
-        let scope = system_scope();
+        // No scope columns on the membership row: tenant scope is applied
+        // through the owning group, the row is run under the system scope.
+        let row_scope = system_scope();
         let result = MembershipEntity::delete_many()
             .filter(membership_entity::Column::GroupId.eq(group_id))
             .filter(membership_entity::Column::GtsTypeId.eq(gts_type_id))
             .filter(membership_entity::Column::ResourceId.eq(resource_id))
+            .apply_if(membership_group_condition(scope), QueryFilter::filter)
             .secure()
-            .scope_with(&scope)
+            .scope_with(&row_scope)
             .exec(db)
             .await
             .map_err(|e| DomainError::database(e.to_string()))?;
         Ok(result.rows_affected)
-    }
-
-    /// Find a membership by its composite key.
-    async fn find_by_composite_key<C: DBRunner>(
-        &self,
-        db: &C,
-        group_id: Uuid,
-        gts_type_id: i16,
-        resource_id: &str,
-    ) -> Result<Option<membership_entity::Model>, DomainError> {
-        let scope = system_scope();
-        MembershipEntity::find()
-            .filter(membership_entity::Column::GroupId.eq(group_id))
-            .filter(membership_entity::Column::GtsTypeId.eq(gts_type_id))
-            .filter(membership_entity::Column::ResourceId.eq(resource_id))
-            .secure()
-            .scope_with(&scope)
-            .one(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))
     }
 
     /// Whether the resource already belongs to a tenant other than
@@ -222,11 +246,6 @@ impl MembershipRepositoryTrait for MembershipRepository {
         resource_id: &str,
         tenant_id: Uuid,
     ) -> Result<bool, DomainError> {
-        use crate::infra::storage::entity::resource_group::{
-            self as rg_entity, Entity as ResourceGroupEntity,
-        };
-        use sea_orm::QuerySelect;
-
         let scope = system_scope();
 
         // One statement, two bind parameters: the member group ids are

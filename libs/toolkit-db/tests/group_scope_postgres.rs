@@ -20,7 +20,7 @@ use sea_orm_migration::prelude::Iden;
 use sea_orm_migration::sea_query;
 use sea_orm_migration::sea_query::IntoIden;
 use toolkit_db::migration_runner::run_migrations_for_testing;
-use toolkit_db::secure::{ScopableEntity, SecureEntityExt, secure_insert};
+use toolkit_db::secure::{SecureEntityExt, secure_insert};
 use toolkit_security::{AccessScope, ScopeConstraint, ScopeFilter, ScopeValue, pep_properties};
 use uuid::Uuid;
 
@@ -185,8 +185,9 @@ mod resource {
     use sea_orm::entity::prelude::*;
     use uuid::Uuid;
 
-    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, toolkit_db::secure::Scopable)]
     #[sea_orm(table_name = "group_scope_resource")]
+    #[secure(tenant_col = "tenant_id", resource_col = "id", no_owner, no_type)]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
         pub id: Uuid,
@@ -203,8 +204,9 @@ mod resource {
 mod gts_type {
     use sea_orm::entity::prelude::*;
 
-    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, toolkit_db::secure::Scopable)]
     #[sea_orm(table_name = "gts_type")]
+    #[secure(unrestricted)]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
         pub id: i16,
@@ -221,8 +223,9 @@ mod membership {
     use sea_orm::entity::prelude::*;
     use uuid::Uuid;
 
-    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, toolkit_db::secure::Scopable)]
     #[sea_orm(table_name = "resource_group_membership")]
+    #[secure(unrestricted)]
     // Column names intentionally mirror the canonical RG composite key.
     #[allow(clippy::struct_field_names)]
     pub struct Model {
@@ -244,8 +247,9 @@ mod closure {
     use sea_orm::entity::prelude::*;
     use uuid::Uuid;
 
-    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, toolkit_db::secure::Scopable)]
     #[sea_orm(table_name = "resource_group_closure")]
+    #[secure(unrestricted)]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
         pub ancestor_id: Uuid,
@@ -258,72 +262,6 @@ mod closure {
 
     impl ActiveModelBehavior for ActiveModel {}
 }
-
-impl ScopableEntity for resource::Entity {
-    fn tenant_col() -> Option<resource::Column> {
-        Some(resource::Column::TenantId)
-    }
-
-    fn resource_col() -> Option<resource::Column> {
-        Some(resource::Column::Id)
-    }
-
-    fn owner_col() -> Option<resource::Column> {
-        None
-    }
-
-    fn type_col() -> Option<resource::Column> {
-        None
-    }
-
-    fn resolve_property(property: &str) -> Option<resource::Column> {
-        match property {
-            p if p == pep_properties::OWNER_TENANT_ID => Self::tenant_col(),
-            p if p == pep_properties::RESOURCE_ID => Self::resource_col(),
-            _ => None,
-        }
-    }
-
-    fn scope_columns() -> Vec<resource::Column> {
-        vec![resource::Column::TenantId, resource::Column::Id]
-    }
-}
-
-macro_rules! unrestricted_entity {
-    ($entity:path, $column:path) => {
-        impl ScopableEntity for $entity {
-            const IS_UNRESTRICTED: bool = true;
-
-            fn tenant_col() -> Option<$column> {
-                None
-            }
-
-            fn resource_col() -> Option<$column> {
-                None
-            }
-
-            fn owner_col() -> Option<$column> {
-                None
-            }
-
-            fn type_col() -> Option<$column> {
-                None
-            }
-
-            fn scope_columns() -> Vec<$column> {
-                Vec::new()
-            }
-
-            fn resolve_property(_property: &str) -> Option<$column> {
-                None
-            }
-        }
-    };
-}
-
-unrestricted_entity!(gts_type::Entity, gts_type::Column);
-unrestricted_entity!(membership::Entity, membership::Column);
-unrestricted_entity!(closure::Entity, closure::Column);
 
 async fn setup() -> Result<(common::DbUnderTest, toolkit_db::Db)> {
     let dut = common::bring_up_postgres().await?;

@@ -169,12 +169,14 @@ Plain AuthZEN point-in-time `true/false` decisions are insufficient for LIST que
 
 Constraints **OR** across alternatives, **AND** predicates within each constraint. PEP compiles constraints into `AccessScope` → SecureORM translates to SQL `WHERE` clauses.
 
-**Fail-closed PEP enforcement** — PEP denies access on:
-- Missing or `false` decision
-- Unreachable PDP
-- Missing constraints when `require_constraints: true`
-- Unknown predicates or property names
-- Empty predicate lists, empty `in`/`group_ids` values, or empty `constraints: []`
+**Fail-closed PEP enforcement:**
+
+- Reject a denied decision, unavailable PDP, or response that cannot be decoded (for example an unknown predicate `op` or missing required field).
+- Reject absent/empty outer constraints when `require_constraints: true`.
+- A decoded branch with unsupported properties/capabilities, invalid semantic values, or `predicates: []` fails compilation. Discard that entire branch; reject the response if no branch compiles successfully.
+- Valid empty branches are fully validated, then normalized out of `AccessScope::constraints()` (kept in `original_constraints()`). An all-empty scope is refused by default by both the enforcer and the low-level `compile_to_access_scope`; PEP-local `AccessRequest::allow_empty_scope(true)` (or `CompileOptions::allow_empty_scope(true)`) returns it, as a deny-all-equivalent scope, for queries or catalog gates. Invalid siblings are still discarded (strict rejection: #5958).
+
+Empty value lists inside `in`, `in_group`, and `in_group_subtree` are valid predicates that match nothing, compiled to `FALSE`; they do not invalidate other OR branches. With `decision: true`, absent or empty outer `constraints` permit unrestricted row access only when `require_constraints: false`. See [the full PEP contract](../arch/authorization/DESIGN.md#pep-enforcement).
 
 **Capability negotiation** — PEP sends `capabilities`, `supported_properties`, and `require_constraints` with each evaluation request. The PDP must not emit unsupported property names and must degrade gracefully (expand groups to explicit `in` lists, or deny).
 

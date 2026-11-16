@@ -18,7 +18,7 @@ use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_security::{PlatformSecurityContext, SecurityContext};
 use uuid::Uuid;
 
-use super::pipeline::assemble;
+use super::pipeline::{MANAGE_BUDGET, assemble};
 use crate::config::{CategoryCheckConfig, ConstructConfig};
 use crate::domain::model_client::{
     ModelClient, ModelError, ModelOutput, ModelRequest, ModelResponse, ToolCall, Usage,
@@ -193,6 +193,32 @@ async fn a_record_is_planned_checked_admitted_written_read_back_and_deleted_by_i
 }
 
 /// A model whose call panics; it counts its calls.
+#[tokio::test]
+async fn manage_facts_gets_the_manage_budget() {
+    let db = inmem_db().await;
+    let cfg = ConstructConfig {
+        processing_identity: Some(Uuid::new_v4()),
+        processing: unchecked_processing(),
+        profile_category_check: Some(CategoryCheckConfig::OneCall),
+        ..ConstructConfig::default()
+    }
+    .validated()
+    .unwrap();
+
+    let pipeline = assemble(
+        &cfg,
+        Some(adds_a_skill()),
+        fake_graph_storage(),
+        Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+        Arc::new(crate::test_support::MemoryReviews::default()),
+        PolicyEnforcer::new(Arc::new(AllowResolver)),
+    )
+    .expect("the pipeline assembles");
+
+    assert!(pipeline.worker.is_some(), "processing is wired");
+    assert_eq!(pipeline.manage.budget, MANAGE_BUDGET);
+}
+
 #[derive(Default)]
 struct Panics(std::sync::atomic::AtomicUsize);
 

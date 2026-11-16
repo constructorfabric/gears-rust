@@ -83,8 +83,8 @@ The gear declares the dependencies `authz_resolver` and `types_registry` and the
 6. [x] - `p1` - **RETURN** success - `inst-start-return`
 
 **Capability hooks, called separately by the runtime**:
-1. [x] - `p1` - The database capability hook returns the migration set in order: `initial_001`, `m002_subject_settings`, `m003_record_ids`. - `inst-start-migrations`
-2. [x] - `p1` - The REST capability hook registers the routes on the router. It fails if the service is not initialized. - `inst-start-rest`
+1. [x] - `p1` - The database capability hook returns the migration set in order: `initial_001`, `m002_subject_settings`, `m003_record_ids`, `m004_record_ids_key_only`, `m005_review_requests`. - `inst-start-migrations`
+2. [x] - `p1` - The REST capability hook registers the routes on the router, the manage-facts route included. It fails if the service is not initialized. - `inst-start-rest`
 
 ### Map Domain Errors to Problem Errors
 
@@ -103,7 +103,7 @@ The gear declares the dependencies `authz_resolver` and `types_registry` and the
 4. [x] - `p1` - **IF** the error is forbidden - `inst-map-forbidden`
    1. [x] - `p1` - Log a warning. **RETURN** permission denied (403) with the reason `ACCESS_DENIED`. The internal message is not sent to the caller - `inst-map-forbidden-return`
 5. [x] - `p1` - **IF** the error is unavailable - `inst-map-unavailable`
-   1. [x] - `p1` - Log a warning. **RETURN** service unavailable (503), without the internal message - `inst-map-unavailable-return`
+   1. [x] - `p1` - Log a warning. **RETURN** service unavailable (503), without the internal message. A write whose result is unknown answers 503 too, with a fixed detail that says the write may have been stored - `inst-map-unavailable-return`
 6. [x] - `p1` - **IF** the error is internal or from the database - `inst-map-internal`
    1. [x] - `p1` - Log at error level. **RETURN** internal (500), without the internal text in `detail` - `inst-map-internal-return`
 
@@ -135,7 +135,7 @@ The system **MUST** answer every error as an RFC 9457 Problem with the status in
 **Implements**:
 - `cpt-cf-construct-algo-gear-foundation-map-errors`
 
-**Verified by**: `forbidden_maps_to_403_without_the_internal_message`, `unavailable_maps_to_503_without_leaking_detail`, `internal_maps_to_500_without_leaking_detail`, `database_maps_to_500_without_leaking_detail` (error mapping), and `map_scope_error_maps_each_variant`, `unknown_scope_error_message_is_neutral` (scope errors). No test checks the log output.
+**Verified by**: `forbidden_maps_to_403_without_the_internal_message`, `unavailable_maps_to_503_without_leaking_detail`, `a_write_with_an_unknown_result_maps_to_503_that_says_it_may_have_been_stored`, `internal_maps_to_500_without_leaking_detail`, `database_maps_to_500_without_leaking_detail` (error mapping), and `map_scope_error_maps_each_variant`, `unknown_scope_error_message_is_neutral` (scope errors). No test checks the log output.
 
 ### Placeholder Note Table
 

@@ -49,20 +49,20 @@ pub mod resource {
 
 /// Project an enforcement failure into the gear's error vocabulary.
 ///
-/// Every variant denies. The mapping is exhaustive on purpose: a variant added
-/// upstream breaks this match rather than falling through to a default that
-/// might allow.
+/// Every known outcome denies. `EnforcerError` is `#[non_exhaustive]`: an
+/// outcome class added upstream is an internal failure ([`DomainError::Internal`],
+/// HTTP 500, no detail on the wire), never a default that might allow.
 ///
-/// All three denials produce the **same** [`DomainError::Unauthorized`], which
-/// carries no identifier and no existence hint. A caller cannot learn from the
+/// The three known outcomes produce the **same** [`DomainError::Unauthorized`],
+/// which carries no identifier and no existence hint. A caller cannot learn from the
 /// response whether the policy point was down, whether a policy explicitly
 /// denied them, or whether the resource exists at all — and it should not: each
 /// of those is information about a resource it has not been granted.
 #[must_use]
 pub fn deny(resource: &ResourceType, err: &EnforcerError) -> DomainError {
     match err {
-        // The decision point said no.
-        EnforcerError::Denied { .. }
+        // The decision point said no, or permitted a scope that matches nothing.
+        EnforcerError::AccessDenied(_)
         // The decision point could not be reached. Step 4 of the enforcement
         // algorithm: fail closed rather than proceed on an unknown verdict.
         | EnforcerError::EvaluationFailed { .. }
@@ -71,6 +71,11 @@ pub fn deny(resource: &ResourceType, err: &EnforcerError) -> DomainError {
         // is broader than any decision the policy point could have returned.
         | EnforcerError::CompileFailed { .. } => DomainError::Unauthorized {
             resource: resource_kind(resource),
+        },
+        // An unknown outcome class: stop with an internal failure; its detail
+        // stays in the in-process diagnostic.
+        unknown => DomainError::Internal {
+            diagnostic: format!("authorization failed with an unknown outcome: {unknown}"),
         },
     }
 }
@@ -88,6 +93,34 @@ fn resource_kind(resource: &ResourceType) -> &'static str {
             settings_service_sdk::gts::VALUE_SCHEMA
         }
         _ => settings_service_sdk::gts::DECLARATION_SCHEMA,
+    }
+}
+
+/// Ask an optional decision: the caller's scope, or `None` when the decision
+/// is a known refusal ([`DomainError::Unauthorized`]). Any other failure, such
+/// as the internal failure an unknown enforcer outcome maps to, propagates and
+/// never reads as a refusal.
+///
+/// # Errors
+///
+/// Every [`access_scope`] failure other than [`DomainError::Unauthorized`].
+pub async fn optional_scope(
+    enforcer: &authz_resolver_sdk::PolicyEnforcer,
+    ctx: &toolkit_security::SecurityContext,
+    resource: &ResourceType,
+    action: &str,
+) -> Result<Option<AccessScope>, DomainError> {
+    optional(access_scope(enforcer, ctx, resource, action, None).await)
+}
+
+/// A known refusal is an absent scope; any other failure stays an error.
+fn optional(
+    decision: Result<AccessScope, DomainError>,
+) -> Result<Option<AccessScope>, DomainError> {
+    match decision {
+        Ok(scope) => Ok(Some(scope)),
+        Err(DomainError::Unauthorized { .. }) => Ok(None),
+        Err(err) => Err(err),
     }
 }
 

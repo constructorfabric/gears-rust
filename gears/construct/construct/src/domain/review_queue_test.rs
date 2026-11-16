@@ -950,7 +950,12 @@ struct FailingWriter;
 
 #[async_trait]
 impl PlanWriter for FailingWriter {
-    async fn write(&self, _: &SecurityContext, _: &Plan) -> Result<Written, DomainError> {
+    async fn write_by(
+        &self,
+        _: &SecurityContext,
+        _: &Plan,
+        _: tokio::time::Instant,
+    ) -> Result<Written, DomainError> {
         Err(DomainError::Unavailable("graph storage is down".to_owned()))
     }
 }
@@ -962,7 +967,12 @@ struct LandsThenFails {
 
 #[async_trait]
 impl PlanWriter for LandsThenFails {
-    async fn write(&self, ctx: &SecurityContext, plan: &Plan) -> Result<Written, DomainError> {
+    async fn write_by(
+        &self,
+        ctx: &SecurityContext,
+        plan: &Plan,
+        _: tokio::time::Instant,
+    ) -> Result<Written, DomainError> {
         self.inner.write(ctx, plan).await?;
         Err(DomainError::Unavailable("the answer was lost".to_owned()))
     }

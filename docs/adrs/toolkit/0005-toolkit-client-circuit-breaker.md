@@ -44,8 +44,9 @@ load the moment it comes back.
 `libs/toolkit/src/clients/`. It was never built.
 
 This ADR decides where the breaker lives, what it counts, and where it sits in the client stack.
-How the generated contract clients use it (what counts as a failure for a contract call, a per-method
-opt-out, per-endpoint state, configuration) is decided with that integration.
+How the generated contract clients use it (what counts as a failure for a contract call, the
+`#[circuit_breaker(skip)]` attribute, per-endpoint state, the `clients` config section) is recorded in
+`cpt-cf-binding-adr-client-circuit-breaker`.
 
 ## Decision Drivers
 
@@ -102,7 +103,7 @@ the inner service, polled ready first, so the inner service must be `Clone`, as 
 boxed HTTP stacks are.
 
 `ErrorsAreFailures` is the trivial policy. `on_failure(hook)` runs a hook after every call
-classified as a failure, for example to drop a cached endpoint. A rejected call
+classified as a failure; resolving clients use it to drop their cached endpoint. A rejected call
 fails with `Rejected` inside the layer's `BoxError`, and the client maps it to its own error type.
 
 ### Observability
@@ -143,12 +144,14 @@ metrics takes no OpenTelemetry dependency. The exporter (OTLP) is the applicatio
 
 The breaker sees each attempt, below retry:
 
-* **REST.** An attempt-layer slot in `toolkit-http`, at `Retry → Auth → Attempt → ErrorMapping → Timeout`. It runs after credentials are attached, so a failure to get a token is not taken for a backend failure. It runs above the timeout, so a timed-out attempt reaches it as a timeout.
+* **REST.** `toolkit-http` has an attempt-layer slot, `HttpClientBuilder::with_attempt_layer`, at `Retry → Auth → Attempt → ErrorMapping → Timeout`. It runs after credentials are attached, so a failure to get a token is not taken for a backend failure. It runs above the timeout, so a timed-out attempt reaches it as a timeout.
 * **gRPC.** The layer wraps the tonic channel, under tonic's own call handling.
 
 A caller's own timer around an attempt must not fire before the transport timeout, or the breaker
-sees a dropped permit instead of a timeout. Such a timer needs a small grace over the transport
-timeout.
+sees a dropped permit instead of a timeout. The contract runtime's `send_unary` and stream open
+start their outer timer when the attempt reaches the attempt layer, not when the call starts, and
+give it a 50 ms grace over the transport timeout. Auth and queueing before the transport do not
+eat into the grace.
 
 ### Breaker and Retry
 
@@ -212,6 +215,7 @@ directory again, so a short open period with one probe recovers sooner at little
   * `src/circuit_breaker/tests.rs`: minimum calls, ratio, consecutive failures, window expiry, probe slots, late results, dropped permits, config parsing and validation; observer events and their order, generations, attach/detach on rename, removal and drop, an observer calling back into the breaker.
   * `tests/layer.rs`: the tower layer, the failure hook, bypass, a rejection reaching observers, an open breaker failing a call while the inner service is not ready, a bypassed request after a refusal waiting for the inner service.
   * `src/metrics/otel.rs`: the OpenTelemetry instruments with an in-memory exporter, including state counts under concurrent transitions and a breaker rebuilt under the same name.
+* `libs/toolkit-contract/tests/circuit_breaker_rest.rs`: the breaker in the `toolkit-http` attempt slot opens on gateway errors and then refuses without sending; a timed-out attempt reaches it, also after a slow auth layer.
 
 ## Pros and Cons of the Options
 
@@ -230,14 +234,15 @@ directory again, so a short open period with one probe recovers sooner at little
 
 * Follow-ups:
   * metric names for the next patterns (retry, bulkhead), added with their implementations;
-  * steering calls away from an endpoint whose breaker is open, instead of failing them fast;
-  * the `toolkit-http` attempt slot and the generated contract clients (#5777).
-* Code: `libs/toolkit-resilience` (`README.md`, `src/circuit_breaker/`, `src/metrics/`).
+  * steering calls away from an endpoint whose breaker is open, instead of failing them fast.
+* Code: `libs/toolkit-resilience` (`README.md`, `src/circuit_breaker/`, `src/metrics/`); `libs/toolkit-http/src/builder.rs` (`with_attempt_layer`).
 
 ## Traceability
 
 - **HTTP client**: [ADR-0001](./0001-toolkit-hyper-tower-http-client.md)
 - **Lazy clients**: [ADR-0003](./0003-toolkit-universal-lazy-layer.md) §3.4, which this ADR replaces
+- **Generated contract clients**: [`cpt-cf-binding-adr-client-circuit-breaker`](../../arch/toolkit-contract-binding/ADR/0009-cpt-cf-binding-adr-client-circuit-breaker.md)
+- **Contract binding design**: [DESIGN §7](../../arch/toolkit-contract-binding/DESIGN.md), *Remote Backend Unavailability*
 
 This decision directly addresses:
 

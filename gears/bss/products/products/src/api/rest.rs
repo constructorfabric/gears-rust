@@ -336,7 +336,8 @@ pub(crate) fn read_tx_config(state: &ApiState) -> toolkit_db::secure::TxConfig {
     }
 }
 
-/// Map the PEP denial while keeping PDP outages fail-closed.
+/// Map the PEP denial while keeping PDP outages fail-closed; an internal
+/// authorization failure is a 500 without its detail.
 pub(crate) fn authz_error_to_canonical(
     err: crate::authz::AuthzError,
     denied: impl FnOnce(String) -> CanonicalError,
@@ -347,6 +348,8 @@ pub(crate) fn authz_error_to_canonical(
             tracing::error!(detail, "bss-products: authorization service unavailable");
             CanonicalError::service_unavailable().create()
         }
+        // Logged where it was classified; the detail stays off the wire.
+        crate::authz::AuthzError::Internal(detail) => CanonicalError::internal(detail).create(),
     }
 }
 

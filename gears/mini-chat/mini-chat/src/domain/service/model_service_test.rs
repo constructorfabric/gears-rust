@@ -1,3 +1,4 @@
+use authz_resolver_sdk::test_support::EmptyScopePdp;
 use std::sync::Arc;
 
 use mini_chat_sdk::{ModelCatalogEntry, ModelTier};
@@ -217,4 +218,23 @@ async fn get_model_denied_returns_forbidden() {
         matches!(err, DomainError::Forbidden),
         "expected Forbidden, got: {err:?}"
     );
+}
+
+#[tokio::test]
+async fn empty_scope_hides_models_but_preserves_live_or() {
+    for live in [false, true] {
+        let pep = authz_resolver_sdk::PolicyEnforcer::new(Arc::new(EmptyScopePdp { live }));
+        let svc = build_service_with_enforcer(mock_catalog(), pep).await;
+        let ctx = test_ctx();
+        let models = svc
+            .list_models(&ctx)
+            .await
+            .expect("allowed empty model LIST");
+        assert_eq!(models.is_empty(), !live);
+        let model = svc.get_model(&ctx, "gpt-5.2").await;
+        assert_eq!(model.is_ok(), live);
+        if !live {
+            assert!(matches!(model, Err(DomainError::Forbidden)));
+        }
+    }
 }

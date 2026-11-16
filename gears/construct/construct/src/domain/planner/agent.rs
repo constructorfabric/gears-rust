@@ -160,7 +160,7 @@ impl Planner {
     ) -> Result<Plan, DropReason> {
         let draft = PlanDraft::new(&self.catalog, profile);
         let input = message_input(message, &draft.numbered_profile());
-        match self.converse(ctx, draft, input).await {
+        match self.converse(ctx, message.subject_id, draft, input).await {
             Ok(draft) => Ok(draft.finish(
                 message.tenant_id,
                 message.subject_id,
@@ -189,7 +189,7 @@ impl Planner {
         let subject_id = record.envelope.subject_id.ok_or(Failure::NoSubject)?;
         let draft = PlanDraft::new(&self.catalog, profile);
         let input = record_input(record, &draft.numbered_profile()).map_err(Failure::Unusable)?;
-        let mut plan = self.converse(ctx, draft, input).await?.finish(
+        let mut plan = self.converse(ctx, subject_id, draft, input).await?.finish(
             record.tenant_id,
             subject_id,
             origin(record),
@@ -203,10 +203,11 @@ impl Planner {
     }
 
     /// Talks to the model over `input` in rounds until it answers without tool calls, and gives back the draft its
-    /// tool calls built.
+    /// tool calls built. Every call names `subject_id`, the person the input is about.
     async fn converse<'a>(
         &self,
         ctx: &SecurityContext,
+        subject_id: Uuid,
         mut draft: PlanDraft<'a>,
         input: String,
     ) -> Result<PlanDraft<'a>, Failure> {
@@ -222,6 +223,7 @@ impl Planner {
             tools: draft.tools(),
             answer: AnswerKind::Text,
             max_output_tokens: None,
+            subject_id,
         };
         let mut tokens: u64 = 0;
         for _ in 0..self.caps.max_rounds.get() {

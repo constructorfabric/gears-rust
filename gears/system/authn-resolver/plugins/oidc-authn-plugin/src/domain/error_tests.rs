@@ -158,3 +158,13 @@ fn local_crypto_failure_is_unavailable_not_unauthorized_or_an_idp_failure() {
         AuthNResolverError::ServiceUnavailable(_)
     ));
 }
+
+#[test]
+fn local_http_client_failure_is_unavailable_not_an_idp_failure() {
+    let error = AuthNError::HttpClientUnavailable("overloaded".to_owned());
+    assert!(!error.is_idp_failure());
+    assert!(matches!(
+        AuthNResolverError::from(error),
+        AuthNResolverError::ServiceUnavailable(_)
+    ));
+}

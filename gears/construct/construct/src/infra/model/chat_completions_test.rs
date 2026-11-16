@@ -24,6 +24,7 @@ const TOOL_CALLS: &str = include_str!("fixtures/chat_tool_calls.json");
 const STRUCTURED: &str = include_str!("fixtures/chat_structured.json");
 const CONTENT_FILTER: &str = include_str!("fixtures/chat_content_filter.json");
 const PROMPT_MARKER: &str = "1. work_history: Acme, teacher";
+const SUBJECT: Uuid = Uuid::from_u128(0x5b1e_c7a0_0000_4000_8000_0000_0000_0001);
 
 #[resource_error("gts.cf.core.oagw.proxy.v1~")]
 struct ProxyError;
@@ -216,6 +217,7 @@ fn planner_request() -> ModelRequest {
         }],
         answer: AnswerKind::Text,
         max_output_tokens: Some(512),
+        subject_id: SUBJECT,
     }
 }
 
@@ -233,6 +235,7 @@ fn verdict_request() -> ModelRequest {
             }),
         },
         max_output_tokens: None,
+        subject_id: SUBJECT,
     }
 }
 
@@ -290,6 +293,7 @@ async fn the_request_goes_to_the_upstream_in_chat_completions_form() {
                 },
             }],
             "max_completion_tokens": 512,
+            "user": SUBJECT.to_string(),
         })
     );
 }

@@ -673,9 +673,10 @@ non-production, configuring it later (alert clears), removed overrides, empty qu
 **The auto-void TTL ships provisionally at 90 days, and there is no other fallback.** Neither
 re-entry cap applies — a `draft` is never held, resumed or amended — and the absolute-lifetime
 backstop that once covered this case is withdrawn (D-90), so the auto-void TTL is `draft`'s only
-bound. The migration seeds it at **90 days**, `provisional`, matching the Subscriptions draft
-auto-void platform default (`gears/bss/subscriptions/docs/PRD.md` §15, SUB-D-11 amendment), and
-the policy channel refuses it unset in production (D-181), so baskets in production live at most
+bound. The migration seeds it at **90 days**, `provisional`, as Orders' own policy (D-181).
+Subscriptions separately resolves its draft housekeeping TTL from versioned policy and defines no
+90-day default ([Subscriptions decisions](../../../subscriptions/docs/DECISIONS.md), SUB-D-11).
+The policy channel refuses the Orders TTL unset in production, so baskets in production live at most
 90 days from creation plus scheduler delay. Only a non-production environment may leave it unset,
 and there `draft` is unbounded. The value is seeded data, not a code default (§2.2), and
 [`../DECISIONS.md`](../DECISIONS.md) **Q-07(b)** is where Product confirms or replaces it.

@@ -24,6 +24,13 @@ use toolkit_security::{
     PlatformSecurityContext,
 };
 
+/// Config for a plaintext mock server. A FIPS build requires TLS by default
+/// and installs no crypto provider, so opt in to plaintext and install one.
+fn plaintext_config(base_url: impl Into<String>) -> ClientConfig {
+    drop(toolkit_security::tls::configured_provider().install_default());
+    ClientConfig::new(base_url).with_require_tls(false)
+}
+
 const GOOD_TOKEN: &str = "good-internal-token";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
@@ -138,7 +145,7 @@ async fn start_server() -> (String, serde_json::Value, Arc<AtomicUsize>) {
 }
 
 fn client(base_url: &str, token: Option<&str>) -> SysApiRestClient {
-    let mut cfg = ClientConfig::new(base_url.to_owned());
+    let mut cfg = plaintext_config(base_url.to_owned());
     if let Some(token) = token {
         cfg = cfg.with_internal_token_provider(InternalTokenProvider::from_token(
             SecretString::from(token.to_owned()),
@@ -179,7 +186,11 @@ async fn a_validated_internal_token_reaches_the_service() {
 #[tokio::test]
 async fn a_missing_or_forged_token_is_refused_before_the_service() {
     let (base_url, _, calls) = start_server().await;
-    let http = toolkit_http::HttpClientBuilder::new().build().unwrap();
+    drop(toolkit_security::tls::configured_provider().install_default());
+    let http = toolkit_http::HttpClientBuilder::new()
+        .transport(toolkit_http::TransportSecurity::AllowInsecureHttp)
+        .build()
+        .unwrap();
 
     for path in ["owned", "borrowed"] {
         for (token, reason) in [

@@ -13,6 +13,8 @@ succeed, it closes.
 
 - The caller decides what a failure is: each call takes a `Permit` and records an `Outcome` on it.
   A permit dropped without an outcome counts for nothing.
+  `Permit::is_probe()` tells a half-open probe from an ordinary call, for callers that judge an
+  outcome differently while probing.
 - `CircuitBreakerConfig` defaults: open when at least half of at least 10 calls in the last 30
   seconds failed, stay open 10 seconds, then one probe. `with_consecutive_failures(k)` trips on `k`
   failures in a row instead.
@@ -25,7 +27,10 @@ succeed, it closes.
   for the inner service to become ready. The layer works on a tonic `Channel` and on an HTTP
   client stack alike.
 
-A client adds the breaker with one `.layer(...)`.
+The generated contract clients in `toolkit-contract` put this layer in front of every attempt they
+send, per endpoint, when built through wiring (`#[toolkit::consumes]`, `#[toolkit::provides]`, or a
+resolving client); a client built from `ClientConfig::new()` has none unless given one. Hand-written
+clients can add it with one `.layer(...)`.
 
 ## Observers and metrics
 

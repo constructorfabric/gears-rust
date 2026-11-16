@@ -499,6 +499,25 @@ impl CanonicalError {
         }
     }
 
+    /// How long the caller should wait before retrying, in seconds, for the
+    /// two retryable categories that carry a hint:
+    ///
+    /// - `ServiceUnavailable`: `ctx.retry_after_seconds`;
+    /// - `ResourceExhausted`: the largest per-violation hint
+    ///   ([`ResourceExhausted::retry_after_seconds`](crate::context::ResourceExhaustedV1::retry_after_seconds)).
+    ///
+    /// `None` for every other category and when no hint was attached. This is
+    /// the value the HTTP `Retry-After` header carries, so SDK projections
+    /// that expose a retry delay should use it rather than reading contexts.
+    #[must_use]
+    pub fn retry_after_seconds(&self) -> Option<u64> {
+        match self {
+            Self::ServiceUnavailable { ctx, .. } => ctx.retry_after_seconds,
+            Self::ResourceExhausted { ctx, .. } => ctx.retry_after_seconds(),
+            _ => None,
+        }
+    }
+
     /// Returns the internal diagnostic string for `Internal` and `Unknown`
     /// variants, or `None` for all other categories.
     ///

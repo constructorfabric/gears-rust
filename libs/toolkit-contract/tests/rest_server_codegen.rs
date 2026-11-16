@@ -28,6 +28,13 @@ use toolkit_contract::runtime::transport_error::TransportError;
 use toolkit_contract::{contract, rest_contract};
 use toolkit_security::SecurityContext;
 
+/// Config for a plaintext mock server. A FIPS build requires TLS by default
+/// and installs no crypto provider, so opt in to plaintext and install one.
+fn plaintext_config(base_url: impl Into<String>) -> ClientConfig {
+    drop(toolkit_security::tls::configured_provider().install_default());
+    ClientConfig::new(base_url).with_require_tls(false)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct PairResponse {
     /// Echo of the `{tenant_id}` segment as the server bound it.
@@ -244,7 +251,7 @@ async fn start_generated_server() -> (String, serde_json::Value) {
 #[tokio::test]
 async fn path_params_bind_by_url_position_not_declaration_order() {
     let (base_url, _) = start_generated_server().await;
-    let client = PairApiRestClient::new(ClientConfig::new(base_url)).unwrap();
+    let client = PairApiRestClient::new(plaintext_config(base_url)).unwrap();
 
     let got = PairApi::get_pair(
         &client,
@@ -266,7 +273,7 @@ async fn path_params_bind_by_url_position_not_declaration_order() {
 #[tokio::test]
 async fn query_params_round_trip_through_generated_client_and_server() {
     let (base_url, _) = start_generated_server().await;
-    let client = PairApiRestClient::new(ClientConfig::new(base_url)).unwrap();
+    let client = PairApiRestClient::new(plaintext_config(base_url)).unwrap();
 
     // A `Vec` (repeated keys), a present `Option`, and a scalar — the shapes
     // the old split codec could not carry. The client encoded repeated keys
@@ -289,7 +296,7 @@ async fn query_params_round_trip_through_generated_client_and_server() {
 #[tokio::test]
 async fn query_params_round_trip_when_empty() {
     let (base_url, _) = start_generated_server().await;
-    let client = PairApiRestClient::new(ClientConfig::new(base_url)).unwrap();
+    let client = PairApiRestClient::new(plaintext_config(base_url)).unwrap();
 
     // An empty `Vec` emits no key and a `None` is omitted, so the server sees a
     // query string with only `limit`. Both fields must still decode.

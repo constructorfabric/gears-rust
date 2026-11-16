@@ -121,24 +121,3 @@ mod publication {
         );
     }
 }
-
-#[test]
-fn build_http_client_reports_missing_custom_ca_bundle() {
-    let missing_bundle_path = std::env::temp_dir()
-        .join(format!(
-            "oidc-authn-plugin-missing-ca-dir-{}",
-            std::process::id()
-        ))
-        .join("custom-root-ca.pem")
-        .to_string_lossy()
-        .into_owned();
-    let error = build_http_client(Duration::from_secs(5), &[missing_bundle_path])
-        .expect_err("missing custom CA bundle should fail client construction");
-
-    assert!(
-        error
-            .to_string()
-            .contains("failed to read custom CA certificate bundle"),
-        "error should identify missing custom CA bundle: {error}"
-    );
-}

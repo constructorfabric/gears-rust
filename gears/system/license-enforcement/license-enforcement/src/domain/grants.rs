@@ -875,7 +875,8 @@ impl<R: GrantRepo> GrantService<R> {
 
     /// # Errors
     ///
-    /// A malformed query, or a PDP denial.
+    /// A malformed query, or a PDP denial. A permitted scope that matches
+    /// nothing gives an empty page.
     pub async fn list_grants(
         &self,
         ctx: &SecurityContext,
@@ -883,7 +884,13 @@ impl<R: GrantRepo> GrantService<R> {
     ) -> Result<Page<Grant>, DomainError> {
         let scope = self
             .enforcer
-            .access_scope(ctx, &resources::GRANT, actions::LIST, None)
+            .access_scope_with(
+                ctx,
+                &resources::GRANT,
+                actions::LIST,
+                None,
+                &AccessRequest::new().allow_empty_scope(true),
+            )
             .await?;
         let conn = self.db.conn()?;
         self.store.list_grants(&conn, &scope, query).await

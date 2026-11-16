@@ -18,17 +18,32 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
 
+use uuid::Uuid;
+
+use crate::domain::authz::Call;
 use crate::domain::service::GraphServices;
 
 #[domain_model]
 pub struct GraphStorageLocalClient {
     services: Arc<GraphServices>,
+    /// The tenant every call is about, when `in_tenant` named one.
+    tenant: Option<Uuid>,
 }
 
 impl GraphStorageLocalClient {
     #[must_use]
     pub fn new(services: Arc<GraphServices>) -> Self {
-        Self { services }
+        Self {
+            services,
+            tenant: None,
+        }
+    }
+
+    fn call<'a>(&self, ctx: &'a SecurityContext) -> Call<'a> {
+        Call {
+            ctx,
+            tenant: self.tenant,
+        }
     }
 }
 
@@ -41,7 +56,7 @@ impl GraphStorageClientV1 for GraphStorageLocalClient {
         options: TypeRegistrationOptions,
     ) -> Result<Vec<RegisteredType>, CanonicalError> {
         self.services
-            .register_types_with(ctx, batch, options)
+            .register_types_with(self.call(ctx), batch, options)
             .await
             .map_err(Into::into)
     }
@@ -52,7 +67,7 @@ impl GraphStorageClientV1 for GraphStorageLocalClient {
         type_id: &GtsTypeId,
     ) -> Result<TypeRecord, CanonicalError> {
         self.services
-            .get_type(ctx, type_id)
+            .get_type(self.call(ctx), type_id)
             .await
             .map_err(Into::into)
     }
@@ -63,7 +78,7 @@ impl GraphStorageClientV1 for GraphStorageLocalClient {
         query: TypeQuery,
     ) -> Result<Page<TypeRecord>, CanonicalError> {
         self.services
-            .list_types(ctx, query)
+            .list_types(self.call(ctx), query)
             .await
             .map_err(Into::into)
     }
@@ -73,7 +88,10 @@ impl GraphStorageClientV1 for GraphStorageLocalClient {
         ctx: &SecurityContext,
         request: IngestRequest,
     ) -> Result<IngestOutcome, CanonicalError> {
-        self.services.ingest(ctx, request).await.map_err(Into::into)
+        self.services
+            .ingest(self.call(ctx), request)
+            .await
+            .map_err(Into::into)
     }
 
     async fn delete_node(
@@ -82,7 +100,7 @@ impl GraphStorageClientV1 for GraphStorageLocalClient {
         node_key: &NodeKey,
     ) -> Result<DeleteOutcome, CanonicalError> {
         self.services
-            .delete_node(ctx, node_key)
+            .delete_node(self.call(ctx), node_key)
             .await
             .map_err(Into::into)
     }
@@ -93,7 +111,7 @@ impl GraphStorageClientV1 for GraphStorageLocalClient {
         edge_key: &EdgeKey,
     ) -> Result<DeleteOutcome, CanonicalError> {
         self.services
-            .delete_edge(ctx, edge_key)
+            .delete_edge(self.call(ctx), edge_key)
             .await
             .map_err(Into::into)
     }
@@ -105,7 +123,7 @@ impl GraphStorageClientV1 for GraphStorageLocalClient {
         adjacency_limit: Option<u32>,
     ) -> Result<NodeView, CanonicalError> {
         self.services
-            .get_node(ctx, node_key, adjacency_limit)
+            .get_node(self.call(ctx), node_key, adjacency_limit)
             .await
             .map_err(Into::into)
     }
@@ -117,7 +135,7 @@ impl GraphStorageClientV1 for GraphStorageLocalClient {
         query: toolkit_odata::ODataQuery,
     ) -> Result<toolkit_odata::Page<NodeRow>, CanonicalError> {
         self.services
-            .project_nodes(ctx, type_patterns, query)
+            .project_nodes(self.call(ctx), type_patterns, query)
             .await
             .map_err(Into::into)
     }
@@ -129,7 +147,7 @@ impl GraphStorageClientV1 for GraphStorageLocalClient {
         query: toolkit_odata::ODataQuery,
     ) -> Result<NodeCount, CanonicalError> {
         self.services
-            .count_nodes(ctx, type_patterns, query)
+            .count_nodes(self.call(ctx), type_patterns, query)
             .await
             .map_err(Into::into)
     }
@@ -139,7 +157,10 @@ impl GraphStorageClientV1 for GraphStorageLocalClient {
         ctx: &SecurityContext,
         request: SearchRequest,
     ) -> Result<SearchResponse, CanonicalError> {
-        self.services.search(ctx, request).await.map_err(Into::into)
+        self.services
+            .search(self.call(ctx), request)
+            .await
+            .map_err(Into::into)
     }
 
     async fn traverse(
@@ -148,7 +169,7 @@ impl GraphStorageClientV1 for GraphStorageLocalClient {
         request: TraverseRequest,
     ) -> Result<TraversalResponse, CanonicalError> {
         self.services
-            .traverse(ctx, request)
+            .traverse(self.call(ctx), request)
             .await
             .map_err(Into::into)
     }
@@ -159,12 +180,22 @@ impl GraphStorageClientV1 for GraphStorageLocalClient {
         request: NeighborhoodRequest,
     ) -> Result<TraversalResponse, CanonicalError> {
         self.services
-            .neighborhood(ctx, request)
+            .neighborhood(self.call(ctx), request)
             .await
             .map_err(Into::into)
     }
 
     async fn revision(&self, ctx: &SecurityContext) -> Result<GraphRevision, CanonicalError> {
-        self.services.revision(ctx).await.map_err(Into::into)
+        self.services
+            .revision(self.call(ctx))
+            .await
+            .map_err(Into::into)
+    }
+
+    fn in_tenant(&self, tenant: Uuid) -> Arc<dyn GraphStorageClientV1> {
+        Arc::new(Self {
+            services: Arc::clone(&self.services),
+            tenant: Some(tenant),
+        })
     }
 }

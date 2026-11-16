@@ -124,9 +124,11 @@ impl From<authz_resolver_sdk::EnforcerError> for DomainError {
     fn from(e: authz_resolver_sdk::EnforcerError) -> Self {
         tracing::error!(error = %e, "AuthZ scope resolution failed");
         match e {
-            authz_resolver_sdk::EnforcerError::Denied { .. }
+            authz_resolver_sdk::EnforcerError::AccessDenied(_)
             | authz_resolver_sdk::EnforcerError::CompileFailed(_) => Self::Forbidden,
-            authz_resolver_sdk::EnforcerError::EvaluationFailed(_) => Self::InternalError,
+            // An evaluation failure, or an unknown outcome class: an internal
+            // failure, never a denial.
+            _ => Self::InternalError,
         }
     }
 }

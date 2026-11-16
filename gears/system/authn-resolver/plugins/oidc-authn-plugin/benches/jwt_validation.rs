@@ -119,7 +119,7 @@ fn make_validator() -> JwtValidator {
     let discovery = Arc::new(OidcDiscovery::new_allowing_insecure_http_for_tests(
         3600,
         10,
-        reqwest::Client::new(),
+        oidc_authn_plugin::infra::idp_http::IdpHttpClient::insecure_for_tests(),
         retry_policy.clone(),
     ));
     let metrics = Arc::new(AuthNMetrics::new(&opentelemetry::global::meter(
@@ -135,7 +135,7 @@ fn make_validator() -> JwtValidator {
         },
         JwksFetcherDeps {
             discovery,
-            client: reqwest::Client::new(),
+            client: oidc_authn_plugin::infra::idp_http::IdpHttpClient::insecure_for_tests(),
             metrics: Arc::clone(&metrics),
             retry_policy,
         },
@@ -155,6 +155,8 @@ fn sign_test_jwt(issuer: &str) -> String {
 
 fn benchmark_jwt_validation(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    // `HttpClient::build` spawns its buffer worker and needs a runtime context.
+    let _rt_guard = rt.enter();
     let server = MockOidcServer::spawn();
     let issuer = server.issuer("realms/platform");
     let validator = make_validator();

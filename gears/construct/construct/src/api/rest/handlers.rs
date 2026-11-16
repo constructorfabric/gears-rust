@@ -23,9 +23,9 @@ use crate::domain::review_queue::{Resolution, ReviewText};
 
 use super::dto::{
     AdminFactRequest, FlagFactRequest, ManageFactsRequest, ManageFactsResponse, ProfileDto,
-    ProfileQuery, PutSubjectSettingsRequest, RecordOutcomeDto, RecordQuery, RecordRequest,
-    ResolutionRequest, ReviewRequestDto, ReviewRequestsPageDto, StoredFactDto, SubjectExportDto,
-    SubjectFactDto, SubjectFactsPageDto, SubjectSettingsDto,
+    PutSubjectSettingsRequest, RecordOutcomeDto, RecordQuery, RecordRequest, ResolutionRequest,
+    ReviewRequestDto, ReviewRequestsPageDto, StoredFactDto, SubjectExportDto, SubjectFactDto,
+    SubjectFactsPageDto, SubjectSettingsDto, TenantQuery,
 };
 
 /// The answer's status: 202 for a received record, which is processed later,
@@ -107,15 +107,34 @@ pub async fn manage_facts(
     Extension(ctx): Extension<SecurityContext>,
     Extension(manage): Extension<Arc<ManageFacts>>,
     Path(subject_id): Path<Uuid>,
+    Query(query): Query<TenantQuery>,
     Json(req): Json<ManageFactsRequest>,
 ) -> ApiResult<impl IntoResponse> {
     if let Some((field, limit)) = req.field_past_its_limit() {
         return Err(too_long(field, limit));
     }
-    let managed = manage
-        .manage(&ctx, subject_id, req.message, req.conversation)
-        .await
-        .map_err(|error| for_facts(error, subject_id))?;
+    // The error is mapped, and so logged, inside this span, so the log names
+    // the caller, the subject and the tenant.
+    let span = tracing::info_span!(
+        "manage_facts",
+        %subject_id,
+        caller = %ctx.subject_id(),
+        tenant_id = %ManageFacts::tenant_of(&ctx, query.tenant)
+    );
+    let managed = async {
+        manage
+            .manage(
+                &ctx,
+                query.tenant,
+                subject_id,
+                req.message,
+                req.conversation,
+            )
+            .await
+            .map_err(|error| for_facts(error, subject_id))
+    }
+    .instrument(span)
+    .await?;
     Ok(Json(ManageFactsResponse::from(managed)))
 }
 
@@ -125,7 +144,7 @@ pub async fn get_profile(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteProfile>>,
     Path(subject_id): Path<Uuid>,
-    Query(query): Query<ProfileQuery>,
+    Query(query): Query<TenantQuery>,
     // @cpt-end:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-parse
 ) -> ApiResult<impl IntoResponse> {
     // @cpt-begin:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-serve

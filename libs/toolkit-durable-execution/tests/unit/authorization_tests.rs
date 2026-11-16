@@ -39,6 +39,7 @@ impl Recording {
             Some(AuthorizationErrorKind::Denied) => Err(AuthorizationError::denied()),
             Some(AuthorizationErrorKind::Unavailable) => Err(AuthorizationError::unavailable()
                 .with_source(std::io::Error::other("policy endpoint down"))),
+            Some(_) => Err(AuthorizationError::internal()),
         }
     }
 }
@@ -409,4 +410,17 @@ mod logs {
         );
         assert_eq!(events[0]["reason"], "unconstrained_scope");
     }
+}
+
+#[test]
+fn an_internal_authorization_failure_is_internal_never_unavailable() {
+    let error = AuthorizationError::internal();
+    assert_eq!(error.kind(), AuthorizationErrorKind::Internal);
+    let domain = crate::error::domain::DomainError::from_store(
+        &crate::store::StoreError::Authorization(error),
+    );
+    assert!(
+        matches!(domain, crate::error::domain::DomainError::Internal(_)),
+        "{domain:?}"
+    );
 }

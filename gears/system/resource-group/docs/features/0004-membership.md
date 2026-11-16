@@ -79,7 +79,7 @@ Memberships link resources (users, courses, documents, etc.) to groups in the hi
 - Multiple resource types can coexist in the same group
 
 **Error Scenarios**:
-- Group not found → NotFound
+- Group not found, or outside the caller's scope → NotFound
 - Duplicate membership (same composite key) → Conflict
 - resource_type not in group type's allowed_membership_types → Validation error
 - resource_type GTS path not registered → Validation error
@@ -88,8 +88,8 @@ Memberships link resources (users, courses, documents, etc.) to groups in the hi
 **Steps**:
 1. [x] - `p1` - Actor sends POST /api/resource-group/v1/memberships/{group_id}/{resource_type}/{resource_id} - `inst-add-memb-1`
 2. [x] - `p1` - Validate resource_type is a valid GtsTypePath - `inst-add-memb-2`
-3. [x] - `p1` - DB: SELECT id, gts_type_id, tenant_id FROM resource_group WHERE id = {group_id} — load target group - `inst-add-memb-3`
-4. [x] - `p1` - **IF** group not found → **RETURN** NotFound - `inst-add-memb-4`
+3. [x] - `p1` - DB: SELECT id, gts_type_id, tenant_id FROM resource_group WHERE id = {group_id} AND {caller scope} — load target group visible to the caller - `inst-add-memb-3`
+4. [x] - `p1` - **IF** group not found or outside the caller's scope → **RETURN** NotFound - `inst-add-memb-4`
 5. [x] - `p1` - Resolve resource_type GTS path to surrogate ID; verify type exists in gts_type - `inst-add-memb-5`
 6. [x] - `p1` - **IF** resource_type not registered → **RETURN** Validation error - `inst-add-memb-6`
 7. [x] - `p1` - Load group type's allowed_membership_types from gts_type_allowed_membership junction - `inst-add-memb-7`
@@ -110,13 +110,13 @@ Memberships link resources (users, courses, documents, etc.) to groups in the hi
 - Membership link removed
 
 **Error Scenarios**:
-- Membership not found → NotFound
+- Membership not found, or its group is outside the caller's scope → NotFound
 
 **Steps**:
 1. [x] - `p1` - Actor sends DELETE /api/resource-group/v1/memberships/{group_id}/{resource_type}/{resource_id} - `inst-remove-memb-1`
 2. [x] - `p1` - Resolve resource_type GTS path to surrogate ID - `inst-remove-memb-2`
-3. [x] - `p1` - DB: DELETE FROM resource_group_membership WHERE group_id = {group_id} AND gts_type_id = {type_id} AND resource_id = {resource_id} - `inst-remove-memb-3`
-4. [x] - `p1` - **IF** no rows affected → **RETURN** NotFound: membership does not exist - `inst-remove-memb-4`
+3. [x] - `p1` - DB: DELETE FROM resource_group_membership WHERE group_id = {group_id} AND gts_type_id = {type_id} AND resource_id = {resource_id} AND group_id IN (groups in the caller's scope) - `inst-remove-memb-3`
+4. [x] - `p1` - **IF** no rows affected (missing membership, or group outside the caller's scope) → **RETURN** NotFound: membership does not exist - `inst-remove-memb-4`
 5. [x] - `p1` - **RETURN** success (204 No Content) - `inst-remove-memb-5`
 
 ### List Memberships
@@ -132,7 +132,7 @@ Memberships link resources (users, courses, documents, etc.) to groups in the hi
 1. [x] - `p1` - Actor sends GET /api/resource-group/v1/memberships?$filter={expr}&cursor={token}&limit={n} - `inst-list-memb-1`
 2. [x] - `p1` - Parse OData $filter: supported fields `resource_id` (eq, ne, in), `resource_type` (eq, ne, in), `group_id` (eq, ne, in) - `inst-list-memb-2`
 3. [x] - `p1` - Resolve any GTS type paths in filter values to surrogate IDs at persistence boundary - `inst-list-memb-3`
-4. [x] - `p1` - DB: SELECT group_id, gts_type_id, resource_id FROM resource_group_membership WHERE {filter} ORDER BY {stable} LIMIT {limit+1} - `inst-list-memb-4`
+4. [x] - `p1` - DB: SELECT group_id, gts_type_id, resource_id FROM resource_group_membership WHERE {filter} AND group_id IN (groups in the caller's scope) ORDER BY {stable} LIMIT {limit+1} - `inst-list-memb-4`
 5. [x] - `p1` - Resolve surrogate IDs back to GTS type paths for response - `inst-list-memb-5`
 6. [x] - `p1` - Build Page response with items and cursor tokens - `inst-list-memb-6`
 7. [x] - `p1` - **RETURN** Page<ResourceGroupMembership> - `inst-list-memb-7`

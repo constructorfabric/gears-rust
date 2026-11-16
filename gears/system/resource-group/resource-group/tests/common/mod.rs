@@ -265,6 +265,11 @@ impl AuthZResolverApi for DenyAllAuthZ {
     }
 }
 
+/// Build a `PolicyEnforcer` whose PDP denies every request.
+pub fn make_deny_enforcer() -> PolicyEnforcer {
+    PolicyEnforcer::new(Arc::new(DenyAllAuthZ))
+}
+
 /// Build a `SecurityContext` for anonymous (nil tenant) -- matches `SecurityContext::anonymous()`.
 pub fn make_anon_ctx() -> SecurityContext {
     SecurityContext::anonymous()
@@ -301,7 +306,8 @@ pub fn make_ctx(tenant_id: Uuid) -> SecurityContext {
         .expect("valid SecurityContext")
 }
 
-/// Build an allow-all `PolicyEnforcer` with tenant scoping.
+/// Build a `PolicyEnforcer` whose PDP always permits and scopes to the
+/// subject's tenant.
 pub fn make_enforcer() -> PolicyEnforcer {
     let authz: Arc<dyn AuthZResolverApi> = Arc::new(AllowAllAuthZ);
     PolicyEnforcer::new(authz)
@@ -577,11 +583,7 @@ pub fn make_type_service(db: Arc<DBProvider<DbError>>) -> TypeService<TypeReposi
 /// -- used to pin the `ResourceGroupTypeBootstrap` bypass (see
 /// [`make_group_service_deny`] for the same pattern on the group side).
 pub fn make_type_service_deny(db: Arc<DBProvider<DbError>>) -> TypeService<TypeRepository> {
-    TypeService::new(
-        db,
-        PolicyEnforcer::new(Arc::new(DenyAllAuthZ)),
-        Arc::new(TypeRepository),
-    )
+    TypeService::new(db, make_deny_enforcer(), Arc::new(TypeRepository))
 }
 
 /// In-memory SQLite with migrations applied and a [`QueryRecorder`] attached,
@@ -611,7 +613,8 @@ pub async fn test_db_with_recorder() -> (Arc<DBProvider<DbError>>, QueryRecorder
     (Arc::new(DBProvider::new(db)), recorder)
 }
 
-/// Build a `GroupService` from a DB provider using the allow-all enforcer.
+/// Build a `GroupService` from a DB provider using the permitting,
+/// tenant-scoping enforcer ([`make_enforcer`]).
 pub fn make_group_service(
     db: Arc<DBProvider<DbError>>,
 ) -> GroupService<GroupRepository, TypeRepository> {
@@ -625,7 +628,8 @@ pub fn make_group_service(
     )
 }
 
-/// Build a `MembershipService` from a DB provider using the allow-all enforcer.
+/// Build a `MembershipService` from a DB provider using the permitting,
+/// tenant-scoping enforcer ([`make_enforcer`]).
 pub fn make_membership_service(
     db: Arc<DBProvider<DbError>>,
 ) -> MembershipService<GroupRepository, TypeRepository, MembershipRepository> {
@@ -646,7 +650,7 @@ pub fn make_group_service_deny(
     GroupService::new(
         db,
         QueryProfile::default(),
-        PolicyEnforcer::new(Arc::new(DenyAllAuthZ)),
+        make_deny_enforcer(),
         Arc::new(GroupRepository),
         Arc::new(TypeRepository),
         make_types_registry(),
@@ -660,7 +664,7 @@ pub fn make_membership_service_deny(
 ) -> MembershipService<GroupRepository, TypeRepository, MembershipRepository> {
     MembershipService::new(
         db,
-        PolicyEnforcer::new(Arc::new(DenyAllAuthZ)),
+        make_deny_enforcer(),
         Arc::new(GroupRepository),
         Arc::new(TypeRepository),
         Arc::new(MembershipRepository),

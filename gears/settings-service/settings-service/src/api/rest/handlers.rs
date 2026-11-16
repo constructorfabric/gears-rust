@@ -64,7 +64,8 @@ async fn category_tallies<C: DBRunner>(
 ) -> Result<Option<HashMap<Uuid, CategoryTally>>, DomainError> {
     // @cpt-begin:cpt-cf-settings-service-flow-category-management-list:p1:inst-cat-list-10
     // @cpt-begin:cpt-cf-settings-service-flow-category-management-get:p1:inst-cat-get-9
-    let Ok(scope) = authz::access_scope(enforcer, ctx, &resource::VALUE, READ, None).await else {
+    // A known refusal is an absent count; any other failure is an error.
+    let Some(scope) = authz::optional_scope(enforcer, ctx, &resource::VALUE, READ).await? else {
         return Ok(None);
     };
     let caller_chain = resolver.chain_of(ctx.subject_tenant_id()).await?;

@@ -45,4 +45,7 @@ pub use rest_v2::{PaymentApiV2Rest, payment_api_v2_rest_http_binding};
 pub use rest_v2::{PaymentApiV2RestClient, PaymentApiV2RestResolvingClient};
 
 #[cfg(feature = "grpc-client")]
-pub use grpc::{PaymentApiGrpc, PaymentApiGrpcClient, payment_api_grpc_binding};
+pub use grpc::{
+    PAYMENT_API_GRPC_SERVICE, PaymentApiGrpc, PaymentApiGrpcClient, PaymentApiGrpcResolvingClient,
+    payment_api_grpc_binding,
+};

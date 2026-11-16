@@ -7,12 +7,12 @@
 //! `access_scope` itself needs a live policy decision point, so what is pinned
 //! here is the projection every one of its failures passes through.
 
-use authz_resolver_sdk::EnforcerError;
 use authz_resolver_sdk::pep::ConstraintCompileError;
+use authz_resolver_sdk::{AccessDenial, EnforcerError};
 use serde_json::Value;
 use toolkit_canonical_errors::{CanonicalError, Problem};
 
-use super::{deny, resource};
+use super::{deny, optional, resource};
 use crate::domain::error::DomainError;
 use settings_service_sdk::gts;
 
@@ -20,11 +20,11 @@ fn problem_of(err: DomainError) -> Value {
     serde_json::to_value(Problem::from(CanonicalError::from(err))).expect("serializes")
 }
 
-/// Every shape `EnforcerError` can take. Kept as one list so a variant added
-/// upstream is a compile error here as well as in the mapping.
+/// Every known shape `EnforcerError` can take, kept as one list. An outcome
+/// class added upstream maps to an internal failure, not to this denial.
 fn every_failure() -> Vec<EnforcerError> {
     vec![
-        EnforcerError::Denied { deny_reason: None },
+        EnforcerError::AccessDenied(AccessDenial::Pdp { reason: None }),
         // `EvaluationFailed` carries the canonical error the resolver surfaced;
         // which category it was does not matter to the projection, only that it
         // never becomes an allow.
@@ -82,8 +82,8 @@ fn uncompilable_constraints_deny_rather_than_widen() {
 
 #[test]
 fn all_denials_are_indistinguishable_on_the_wire() {
-    // A caller must not learn *why* it was denied. Told apart, the three cases
-    // reveal whether the policy service is down, whether a policy names them
+    // A caller must not learn *why* it was denied. Told apart, the three known
+    // outcomes reveal whether the policy service is down, whether a policy names them
     // specifically, and — combined with a probe — whether the resource exists.
     let rendered: Vec<Value> = every_failure()
         .into_iter()
@@ -99,7 +99,7 @@ fn all_denials_are_indistinguishable_on_the_wire() {
 fn a_denial_discloses_nothing_about_the_target() {
     let doc = problem_of(deny(
         &resource::CATEGORY,
-        &EnforcerError::Denied { deny_reason: None },
+        &EnforcerError::AccessDenied(AccessDenial::Pdp { reason: None }),
     ));
     let rendered = serde_json::to_string(&doc).expect("serializes");
     assert_eq!(doc["status"], 403);
@@ -143,7 +143,34 @@ fn a_denial_names_the_resource_that_was_enforced() {
         (&resource::VALUE, gts::VALUE_SCHEMA),
         (&resource::DECLARATION, gts::DECLARATION_SCHEMA),
     ] {
-        let doc = problem_of(deny(resource, &EnforcerError::Denied { deny_reason: None }));
+        let doc = problem_of(deny(
+            resource,
+            &EnforcerError::AccessDenied(AccessDenial::Pdp { reason: None }),
+        ));
         assert_eq!(doc["context"]["resource_type"], expected);
     }
+}
+
+/// An optional decision (the `pii` entitlement, the category counts) degrades
+/// only on a known refusal. Any other failure — the internal failure an
+/// unknown enforcer outcome maps to — must stop the request, not read as a
+/// masked or absent answer.
+#[test]
+fn an_optional_decision_degrades_only_on_a_refusal() {
+    let refused = optional(Err(deny(
+        &resource::VALUE,
+        &EnforcerError::AccessDenied(AccessDenial::Pdp { reason: None }),
+    )));
+    assert!(matches!(refused, Ok(None)), "{refused:?}");
+
+    let internal = optional(Err(DomainError::Internal {
+        diagnostic: "authorization failed with an unknown outcome".to_owned(),
+    }));
+    assert!(
+        matches!(internal, Err(DomainError::Internal { .. })),
+        "an internal failure is not a refusal: {internal:?}"
+    );
+
+    let granted = optional(Ok(toolkit_security::AccessScope::allow_all()));
+    assert!(matches!(granted, Ok(Some(_))), "{granted:?}");
 }

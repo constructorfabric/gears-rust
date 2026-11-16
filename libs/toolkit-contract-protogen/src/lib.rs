@@ -31,8 +31,10 @@
 //! See [`generate_proto_file`] for the entry point.
 
 pub mod lockfile;
+pub mod sync;
 
 pub use lockfile::{LockfileError, MessageLock, ProtoLockfile};
+pub use sync::{ProtoSpec, SchemaCollector, check_proto, write_proto};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;

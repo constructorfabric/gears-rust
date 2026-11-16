@@ -167,7 +167,7 @@ sequenceDiagram
     AuthZ->>AuthZ: vendor plugin (PDP) evaluates policies<br/>(+ tenant/RG hierarchy)
     AuthZ-->>PEP: decision + constraints
     alt decision = false (or constraints required but missing)
-        PEP-->>Svc: EnforcerError::Denied → 403 Forbidden (fail-closed)
+        PEP-->>Svc: EnforcerError::AccessDenied → 403 Forbidden (fail-closed)
     else allowed
         PEP->>PEP: compile constraints → AccessScope
         PEP-->>Svc: AccessScope
