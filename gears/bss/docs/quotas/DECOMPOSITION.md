@@ -266,7 +266,7 @@ The Entitlements contracts are pending in [PR #5744](https://github.com/construc
 
 - [ ] `p1` - `cpt-cf-bss-quotas-component-commercial-chain`
 
-**API**: apply_source_state, read_source_state and recover_operation (DESIGN §3.3.4).
+**API**: apply_quota_state, read_quota_state and read_operation_result (DESIGN §3.3.4).
 
 **Sequences**:
 

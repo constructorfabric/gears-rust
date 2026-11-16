@@ -1,0 +1,19 @@
+gdl_version = "1.0"
+
+# Every GDL field: https://github.com/constructorfabric/gearbox/blob/main/docs/gdl.md
+#
+# Gearbox entry for the Entitlements design. There is no crate yet.
+#
+# `implementation = "design"` lists the documents but cannot be used in a
+# product (GBX0321). When the crate exists, move this entry beside it, use
+# `package = cargo(...)` and `maturity`, and remove this file. The crate
+# gets its ID from #[toolkit::gear], so that entry needs no `id` field.
+
+gear(
+    source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/bss/entitlements"),
+    implementation = "design",
+    id = "bss-entitlements",
+    name = "Entitlements",
+    description = "Applies purchased quota, license and resource rights through selected adapters, reports readiness and recovers delivery failures.",
+    category = "bss",
+)

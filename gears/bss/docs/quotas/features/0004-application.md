@@ -274,7 +274,7 @@ The responsible owners must implement this behavior and keep passing evidence fo
 
 **Constraints**: `cpt-cf-bss-quotas-constraint-qualified-profiles`.
 
-**Touches**: apply_source_state, read_source_state and recover_operation (DESIGN §3.3.4). State retention follows `cpt-cf-bss-quotas-db-owner-state` and the evidence entities in `cpt-cf-bss-quotas-entity-evidence-chain`.
+**Touches**: apply_quota_state, read_quota_state and read_operation_result (DESIGN §3.3.4). State retention follows `cpt-cf-bss-quotas-db-owner-state` and the evidence entities in `cpt-cf-bss-quotas-entity-evidence-chain`.
 
 Follow the shared security, error, storage, task-runtime and API rules in DESIGN §2.2 and §3.3.7. This feature adds no exceptions. Check scope on reads, writes, replay and recovery. Test concurrent calls, foreign scopes, response loss and restart wherever the flow has external effects. Owner unit tests cover pure validation and derivation. Contract and integration tests cover persistence, permissions and actual adapter effects. This change defines no new compile-time feature flag.
 
