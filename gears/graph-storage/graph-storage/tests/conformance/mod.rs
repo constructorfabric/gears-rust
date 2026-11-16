@@ -2100,6 +2100,93 @@ pub async fn an_incompatible_change_is_refused_with_its_location(
     assert_eq!(stored.revision, 1);
 }
 
+/// The evolving requirement with a payload property that references the
+/// provenance attribute — a sibling family, never an ancestor.
+fn referencing_revision(
+    with_owner: bool,
+    without_priority: bool,
+    required: &[&str],
+) -> TypeRegistration {
+    let mut properties = requirement_properties(&["proposed", "approved"], with_owner, false);
+    properties["origin"] = serde_json::json!({
+        "$ref": format!("gts://{}", graph_storage_sdk::gts::PROVENANCE_ATTRIBUTE_TYPE)
+    });
+    if without_priority && let Some(map) = properties.as_object_mut() {
+        map.remove("priority");
+    }
+    requirement_revision(&properties, required, &["/payload/status"])
+}
+
+/// A `$ref` to a type outside the chain does not stop the comparison: adding an
+/// optional property to a closed payload is still proved compatible.
+pub async fn a_type_referencing_a_non_ancestor_gains_an_optional_property(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    let mut types = ontology_batch();
+    types.push(referencing_revision(false, false, &["key", "statement"]));
+    store
+        .register_types(&ctx, types)
+        .await
+        .expect("the type registers");
+
+    let registered = store
+        .register_types_with(
+            &ctx,
+            vec![referencing_revision(true, false, &["key", "statement"])],
+            update_options(),
+        )
+        .await
+        .expect("an optional property is admitted on a type with a non-ancestor reference");
+    let updated = registered
+        .iter()
+        .find(|item| item.record.type_id == EVOLVING)
+        .expect("the edited type is reported");
+    assert_eq!(
+        updated.basis,
+        Some(graph_storage_sdk::models::AdmissionBasis::SchemaProved)
+    );
+    assert_eq!(updated.record.revision, 2);
+}
+
+/// The same type still refuses what is not backward compatible: a removed
+/// property and a new required one.
+pub async fn a_type_referencing_a_non_ancestor_still_refuses_a_breaking_change(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    let mut types = ontology_batch();
+    types.push(referencing_revision(true, false, &["key", "statement"]));
+    store
+        .register_types(&ctx, types)
+        .await
+        .expect("the type registers");
+
+    let breaking = [
+        referencing_revision(true, true, &["key", "statement"]),
+        referencing_revision(true, false, &["key", "statement", "owner"]),
+    ];
+    for candidate in breaking {
+        let error = store
+            .register_types_with(&ctx, vec![candidate], update_options())
+            .await
+            .expect_err("a breaking change is refused");
+        assert!(
+            matches!(error, GraphStoreError::Conflict { .. }),
+            "a refused change is a conflict, not {error:?}"
+        );
+    }
+    let stored = store
+        .get_type(&ctx, &EVOLVING.to_owned())
+        .await
+        .expect("the type is untouched");
+    assert_eq!(stored.revision, 1);
+}
+
 /// Without `on_existing: update` the gear answers exactly what it always
 /// answered. A caller that does not ask for the new behaviour does not get it.
 pub async fn a_changed_schema_is_still_a_conflict_by_default(
@@ -7622,6 +7709,161 @@ pub async fn a_count_agrees_with_the_listing(store: &dyn GraphStoreV1, tenant: U
     assert_eq!(count("payload/severity eq 'high'", 100).await.count, 2);
 }
 
+/// The two view reads -- `get_node` and the hydration a traversal ends in --
+/// say whether a vector is stored, for a node that has one and a node that
+/// has none, and return the node as it was written. On the built-in store
+/// both read the presence from the database without fetching the vector.
+pub async fn the_view_reads_report_whether_a_vector_is_stored(
+    store: &impl GraphStoreV1,
+    tenant: Uuid,
+) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    store
+        .register_types(&ctx, ontology_batch())
+        .await
+        .expect("ontology registers");
+    ingest_batch(
+        store,
+        &ctx,
+        batch(
+            vec![summarized(
+                "with-vector",
+                "Embedded",
+                "a text the provider embeds",
+            )],
+            Vec::new(),
+        ),
+    )
+    .await
+    .expect("the embedded batch commits");
+    // A node's name is always embedded, so the node without a vector is the
+    // one written with embedding switched off, and nothing stored before it.
+    let mut plain = batch(vec![node("without-vector", "Plain")], Vec::new());
+    plain.options.embed = Some(false);
+    ingest_batch(store, &ctx, plain)
+        .await
+        .expect("the unembedded batch commits");
+
+    let keys = ["with-vector".to_owned(), "without-vector".to_owned()];
+    let ids: Vec<_> = store
+        .resolve_node_ids(&ctx, &keys)
+        .await
+        .expect("the keys resolve")
+        .into_iter()
+        .map(|(_, id)| id)
+        .collect();
+    let hydrated = store
+        .hydrate_nodes(&ctx, &ids)
+        .await
+        .expect("hydration succeeds");
+    assert_eq!(hydrated.len(), 2, "both nodes hydrate: {hydrated:?}");
+
+    for (key, embedded) in [("with-vector", true), ("without-vector", false)] {
+        let view = store
+            .get_node(&ctx, &key.to_owned(), 10)
+            .await
+            .expect("the node is readable");
+        assert_eq!(view.has_embedding, embedded, "get_node on {key}");
+        let row = hydrated
+            .iter()
+            .find(|row| row.node_key == key)
+            .expect("the node is hydrated");
+        assert_eq!(row.has_embedding, embedded, "hydration of {key}");
+        assert_eq!(row.name, view.name, "both reads agree on {key}");
+        assert_eq!(row.payload, view.payload, "both reads agree on {key}");
+        assert_eq!(row.envelope, view.envelope, "both reads agree on {key}");
+    }
+}
+
+/// A batch may carry one key twice, and each occurrence is written over the
+/// one before it, in request order: for a node and for an edge alike. The
+/// built-in store reads a batch's stored rows up front (gears-rust #5040);
+/// what it read for a key describes the row before the batch, and the
+/// second occurrence must be compared with what the first one wrote. Here
+/// the second occurrence puts back what was stored, which only that
+/// comparison sees as a change.
+pub async fn a_key_carried_twice_is_written_twice_in_request_order(
+    store: &impl GraphStoreV1,
+    tenant: Uuid,
+) {
+    use graph_storage_sdk::models::ItemOutcome;
+
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    store
+        .register_types(&ctx, ontology_batch())
+        .await
+        .expect("ontology registers");
+    ingest_batch(
+        store,
+        &ctx,
+        batch(
+            vec![node("twice", "stored name"), node("other", "other")],
+            vec![edge("twice", "other")],
+        ),
+    )
+    .await
+    .expect("the first batch commits");
+
+    let mut changed = edge("twice", "other");
+    changed.payload = Some(serde_json::json!({ "weight": 1 }));
+    let mut request = batch(
+        vec![
+            node("twice", "changed name"),
+            node("other", "other"),
+            node("twice", "stored name"),
+        ],
+        vec![changed, edge("twice", "other")],
+    );
+    request.options.report_per_item = true;
+    let outcome = ingest_batch(store, &ctx, request)
+        .await
+        .expect("the batch commits");
+
+    assert_eq!(
+        outcome.per_item_nodes,
+        Some(vec![
+            ItemOutcome::Updated,
+            ItemOutcome::Unchanged,
+            ItemOutcome::Updated
+        ]),
+        "the second occurrence changes what the first one wrote back"
+    );
+    assert_eq!(
+        outcome.per_item_edges,
+        Some(vec![ItemOutcome::Updated, ItemOutcome::Updated]),
+        "and the same for an edge"
+    );
+
+    let view = store
+        .get_node(&ctx, &"twice".to_owned(), 10)
+        .await
+        .expect("the node reads");
+    assert_eq!(
+        view.name.as_deref(),
+        Some("stored name"),
+        "the last write wins"
+    );
+    assert_eq!(
+        view.envelope.version,
+        Some(3),
+        "a stored row and two writes, three versions"
+    );
+    assert_eq!(view.adjacency.len(), 1, "one edge, written twice");
+    let stored = store
+        .get_edge(&ctx, &view.adjacency[0].edge_key)
+        .await
+        .expect("the edge reads");
+    // The two stores spell an empty edge payload differently (`{}` and
+    // absent); what matters here is that the first write's weight is gone.
+    assert_eq!(
+        stored.payload.unwrap_or_else(|| serde_json::json!({})),
+        serde_json::json!({}),
+        "the last write wins"
+    );
+}
+
 // --- purge (gears-rust #5194) -------------------------------------------------
 
 /// The ontology plus the analysis edge type the purge cases attach.
@@ -8058,247 +8300,5 @@ pub async fn a_purge_bound_to_a_creation_instant_leaves_a_later_node_alone(
     assert_eq!(
         outcome.purged_nodes, 1,
         "the later node was there all along"
-    );
-}
-
-/// The evolving requirement with a payload property that references the
-/// provenance attribute — a sibling family, never an ancestor.
-fn referencing_revision(
-    with_owner: bool,
-    without_priority: bool,
-    required: &[&str],
-) -> TypeRegistration {
-    let mut properties = requirement_properties(&["proposed", "approved"], with_owner, false);
-    properties["origin"] = serde_json::json!({
-        "$ref": format!("gts://{}", graph_storage_sdk::gts::PROVENANCE_ATTRIBUTE_TYPE)
-    });
-    if without_priority && let Some(map) = properties.as_object_mut() {
-        map.remove("priority");
-    }
-    requirement_revision(&properties, required, &["/payload/status"])
-}
-
-/// A `$ref` to a type outside the chain does not stop the comparison: adding an
-/// optional property to a closed payload is still proved compatible.
-pub async fn a_type_referencing_a_non_ancestor_gains_an_optional_property(
-    store: &dyn GraphStoreV1,
-    tenant: Uuid,
-) {
-    let scope = AccessScope::for_tenant(tenant);
-    let ctx = ctx(tenant, &scope, None);
-    let mut types = ontology_batch();
-    types.push(referencing_revision(false, false, &["key", "statement"]));
-    store
-        .register_types(&ctx, types)
-        .await
-        .expect("the type registers");
-
-    let registered = store
-        .register_types_with(
-            &ctx,
-            vec![referencing_revision(true, false, &["key", "statement"])],
-            update_options(),
-        )
-        .await
-        .expect("an optional property is admitted on a type with a non-ancestor reference");
-    let updated = registered
-        .iter()
-        .find(|item| item.record.type_id == EVOLVING)
-        .expect("the edited type is reported");
-    assert_eq!(
-        updated.basis,
-        Some(graph_storage_sdk::models::AdmissionBasis::SchemaProved)
-    );
-    assert_eq!(updated.record.revision, 2);
-}
-
-/// The same type still refuses what is not backward compatible: a removed
-/// property and a new required one.
-pub async fn a_type_referencing_a_non_ancestor_still_refuses_a_breaking_change(
-    store: &dyn GraphStoreV1,
-    tenant: Uuid,
-) {
-    let scope = AccessScope::for_tenant(tenant);
-    let ctx = ctx(tenant, &scope, None);
-    let mut types = ontology_batch();
-    types.push(referencing_revision(true, false, &["key", "statement"]));
-    store
-        .register_types(&ctx, types)
-        .await
-        .expect("the type registers");
-
-    let breaking = [
-        referencing_revision(true, true, &["key", "statement"]),
-        referencing_revision(true, false, &["key", "statement", "owner"]),
-    ];
-    for candidate in breaking {
-        let error = store
-            .register_types_with(&ctx, vec![candidate], update_options())
-            .await
-            .expect_err("a breaking change is refused");
-        assert!(
-            matches!(error, GraphStoreError::Conflict { .. }),
-            "a refused change is a conflict, not {error:?}"
-        );
-    }
-    let stored = store
-        .get_type(&ctx, &EVOLVING.to_owned())
-        .await
-        .expect("the type is untouched");
-    assert_eq!(stored.revision, 1);
-}
-
-/// The two view reads -- `get_node` and the hydration a traversal ends in --
-/// say whether a vector is stored, for a node that has one and a node that
-/// has none, and return the node as it was written. On the built-in store
-/// both read the presence from the database without fetching the vector.
-pub async fn the_view_reads_report_whether_a_vector_is_stored(
-    store: &impl GraphStoreV1,
-    tenant: Uuid,
-) {
-    let scope = AccessScope::for_tenant(tenant);
-    let ctx = ctx(tenant, &scope, None);
-    store
-        .register_types(&ctx, ontology_batch())
-        .await
-        .expect("ontology registers");
-    ingest_batch(
-        store,
-        &ctx,
-        batch(
-            vec![summarized(
-                "with-vector",
-                "Embedded",
-                "a text the provider embeds",
-            )],
-            Vec::new(),
-        ),
-    )
-    .await
-    .expect("the embedded batch commits");
-    // A node's name is always embedded, so the node without a vector is the
-    // one written with embedding switched off, and nothing stored before it.
-    let mut plain = batch(vec![node("without-vector", "Plain")], Vec::new());
-    plain.options.embed = Some(false);
-    ingest_batch(store, &ctx, plain)
-        .await
-        .expect("the unembedded batch commits");
-
-    let keys = ["with-vector".to_owned(), "without-vector".to_owned()];
-    let ids: Vec<_> = store
-        .resolve_node_ids(&ctx, &keys)
-        .await
-        .expect("the keys resolve")
-        .into_iter()
-        .map(|(_, id)| id)
-        .collect();
-    let hydrated = store
-        .hydrate_nodes(&ctx, &ids)
-        .await
-        .expect("hydration succeeds");
-    assert_eq!(hydrated.len(), 2, "both nodes hydrate: {hydrated:?}");
-
-    for (key, embedded) in [("with-vector", true), ("without-vector", false)] {
-        let view = store
-            .get_node(&ctx, &key.to_owned(), 10)
-            .await
-            .expect("the node is readable");
-        assert_eq!(view.has_embedding, embedded, "get_node on {key}");
-        let row = hydrated
-            .iter()
-            .find(|row| row.node_key == key)
-            .expect("the node is hydrated");
-        assert_eq!(row.has_embedding, embedded, "hydration of {key}");
-        assert_eq!(row.name, view.name, "both reads agree on {key}");
-        assert_eq!(row.payload, view.payload, "both reads agree on {key}");
-        assert_eq!(row.envelope, view.envelope, "both reads agree on {key}");
-    }
-}
-
-/// A batch may carry one key twice, and each occurrence is written over the
-/// one before it, in request order: for a node and for an edge alike. The
-/// built-in store reads a batch's stored rows up front (gears-rust #5040);
-/// what it read for a key describes the row before the batch, and the
-/// second occurrence must be compared with what the first one wrote. Here
-/// the second occurrence puts back what was stored, which only that
-/// comparison sees as a change.
-pub async fn a_key_carried_twice_is_written_twice_in_request_order(
-    store: &impl GraphStoreV1,
-    tenant: Uuid,
-) {
-    use graph_storage_sdk::models::ItemOutcome;
-
-    let scope = AccessScope::for_tenant(tenant);
-    let ctx = ctx(tenant, &scope, None);
-    store
-        .register_types(&ctx, ontology_batch())
-        .await
-        .expect("ontology registers");
-    ingest_batch(
-        store,
-        &ctx,
-        batch(
-            vec![node("twice", "stored name"), node("other", "other")],
-            vec![edge("twice", "other")],
-        ),
-    )
-    .await
-    .expect("the first batch commits");
-
-    let mut changed = edge("twice", "other");
-    changed.payload = Some(serde_json::json!({ "weight": 1 }));
-    let mut request = batch(
-        vec![
-            node("twice", "changed name"),
-            node("other", "other"),
-            node("twice", "stored name"),
-        ],
-        vec![changed, edge("twice", "other")],
-    );
-    request.options.report_per_item = true;
-    let outcome = ingest_batch(store, &ctx, request)
-        .await
-        .expect("the batch commits");
-
-    assert_eq!(
-        outcome.per_item_nodes,
-        Some(vec![
-            ItemOutcome::Updated,
-            ItemOutcome::Unchanged,
-            ItemOutcome::Updated
-        ]),
-        "the second occurrence changes what the first one wrote back"
-    );
-    assert_eq!(
-        outcome.per_item_edges,
-        Some(vec![ItemOutcome::Updated, ItemOutcome::Updated]),
-        "and the same for an edge"
-    );
-
-    let view = store
-        .get_node(&ctx, &"twice".to_owned(), 10)
-        .await
-        .expect("the node reads");
-    assert_eq!(
-        view.name.as_deref(),
-        Some("stored name"),
-        "the last write wins"
-    );
-    assert_eq!(
-        view.envelope.version,
-        Some(3),
-        "a stored row and two writes, three versions"
-    );
-    assert_eq!(view.adjacency.len(), 1, "one edge, written twice");
-    let stored = store
-        .get_edge(&ctx, &view.adjacency[0].edge_key)
-        .await
-        .expect("the edge reads");
-    // The two stores spell an empty edge payload differently (`{}` and
-    // absent); what matters here is that the first write's weight is gone.
-    assert_eq!(
-        stored.payload.unwrap_or_else(|| serde_json::json!({})),
-        serde_json::json!({}),
-        "the last write wins"
     );
 }
