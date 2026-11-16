@@ -34,8 +34,7 @@ use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::odata::LimitCfg;
 use toolkit_db::{ConnectOpts, DBProvider, connect_db};
 use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties};
-use types_registry_sdk::testing::MockTypesRegistryClient;
-use types_registry_sdk::{GtsTypeSchema, TypesRegistryClient};
+use types_registry_sdk::testing_platform::MockTypesRegistry;
 use uuid::Uuid;
 
 use crate::domain::check::CheckService;
@@ -65,63 +64,82 @@ pub fn tenant_subject() -> &'static str {
     <LicenseTenantSubjectV1 as GtsSchema>::TYPE_ID
 }
 
-fn schema(type_id: &str, body: serde_json::Value, parent: Option<&GtsTypeSchema>) -> GtsTypeSchema {
-    GtsTypeSchema::try_new(
-        GtsTypeId::new(type_id),
-        body,
-        None,
-        parent.map(|p| Arc::new(p.clone())),
-    )
-    .unwrap()
+/// A Draft-07 contract `type_id` derived from `parent`, with `extra` keys.
+fn derived(type_id: &str, parent: &str, extra: serde_json::Value) -> serde_json::Value {
+    let mut body = json!({
+        "$id": format!("gts://{type_id}"),
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "allOf": [{ "$ref": format!("gts://{parent}") }]
+    });
+    if let (Some(body), serde_json::Value::Object(extra)) = (body.as_object_mut(), extra) {
+        body.extend(extra);
+    }
+    body
 }
 
-fn registry() -> MockTypesRegistryClient {
-    let subject_base = schema(
-        <LicenseSubjectV1<()> as GtsSchema>::TYPE_ID,
-        <LicenseSubjectV1<()> as GtsSchema>::gts_schema_with_refs(),
-        None,
-    );
-    let resource_base = schema(
-        <LicenseResourceV1<()> as GtsSchema>::TYPE_ID,
-        <LicenseResourceV1<()> as GtsSchema>::gts_schema_with_refs(),
-        None,
-    );
-    let user = schema(USER, json!({}), Some(&subject_base));
-    let admin = schema(ADMIN, json!({}), Some(&user));
-    let service = schema(SERVICE, json!({}), Some(&subject_base));
-    let strict = schema(
-        STRICT,
-        json!({ "properties": { "metadata": { "type": "object", "required": ["plan"] } } }),
-        Some(&user),
-    );
-    let abstract_resource = schema(
-        ABSTRACT,
-        json!({ "x-gts-abstract": true }),
-        Some(&resource_base),
-    );
-    let tenant = schema(tenant_subject(), json!({}), Some(&subject_base));
-    let resource = schema(
-        RESOURCE,
-        json!({ "x-gts-traits": { "admitted_subjects": [USER, tenant_subject()] } }),
-        Some(&resource_base),
-    );
-    let broken = schema(
-        BROKEN,
-        json!({ "x-gts-traits": { "admitted_subjects": USER } }),
-        Some(&resource_base),
-    );
-    MockTypesRegistryClient::new().with_type_schemas([
+/// The registry (both contracts) a grant's types resolve through: the
+/// licensing bases, three subjects, the tenant subject and a resource that
+/// admits `USER` and the tenant subject.
+pub fn registry() -> Arc<MockTypesRegistry> {
+    let subject_base = <LicenseSubjectV1<()> as GtsSchema>::TYPE_ID;
+    let resource_base = <LicenseResourceV1<()> as GtsSchema>::TYPE_ID;
+    let registry = Arc::new(MockTypesRegistry::new());
+    registry.seed(
         subject_base,
+        <LicenseSubjectV1<()> as GtsSchema>::gts_schema_with_refs(),
+    );
+    registry.seed(
         resource_base,
-        user,
-        admin,
-        service,
-        strict,
-        tenant,
-        resource,
-        broken,
-        abstract_resource,
-    ])
+        <LicenseResourceV1<()> as GtsSchema>::gts_schema_with_refs(),
+    );
+    registry.seed(USER, derived(USER, subject_base, json!({})));
+    registry.seed(ADMIN, derived(ADMIN, USER, json!({})));
+    registry.seed(SERVICE, derived(SERVICE, subject_base, json!({})));
+    registry.seed(
+        tenant_subject(),
+        derived(tenant_subject(), subject_base, json!({})),
+    );
+    registry.seed(
+        RESOURCE,
+        derived(
+            RESOURCE,
+            resource_base,
+            json!({ "x-gts-traits": { "admitted_subjects": [USER, tenant_subject()] } }),
+        ),
+    );
+    registry.seed(
+        STRICT,
+        derived(
+            STRICT,
+            USER,
+            json!({ "properties": { "metadata": { "type": "object", "required": ["plan"] } } }),
+        ),
+    );
+    registry.seed(
+        ABSTRACT,
+        derived(ABSTRACT, resource_base, json!({ "x-gts-abstract": true })),
+    );
+    registry
+}
+
+/// Serve [`BROKEN`]: a registry this process disagrees with. The published
+/// resource base types `admitted_subjects`, so only a base weakened here lets
+/// the fake materialize a non-list; the tests that use it exercise the grant
+/// service's validation of a registry response.
+pub fn serve_broken(registry: &MockTypesRegistry) {
+    let resource_base = <LicenseResourceV1<()> as GtsSchema>::TYPE_ID;
+    let mut weakened = <LicenseResourceV1<()> as GtsSchema>::gts_schema_with_refs();
+    weakened["x-gts-traits-schema"] = json!({ "type": "object" });
+    registry.seed(resource_base, weakened);
+    registry.seed(
+        BROKEN,
+        derived(
+            BROKEN,
+            resource_base,
+            json!({ "x-gts-traits": { "admitted_subjects": USER } }),
+        ),
+    );
 }
 
 /// Allows everything. Scopes reads as the platform PDP does for a gear
@@ -355,6 +373,8 @@ pub struct Env {
     pub db: Arc<DBProvider<DomainError>>,
     pub store: Store,
     pub hub: Arc<ClientHub>,
+    /// The registry behind `hub`, for a test to seed.
+    pub registry: Arc<MockTypesRegistry>,
     pub tenants: Arc<Tenants>,
     /// The test database, for a connection of the test's own.
     #[cfg(feature = "integration")]
@@ -440,7 +460,8 @@ async fn env_full(
     .unwrap();
     let db = Arc::new(DBProvider::<DomainError>::new(db));
     let hub = Arc::new(ClientHub::new());
-    hub.register::<dyn TypesRegistryClient>(Arc::new(registry()));
+    let registry = registry();
+    registry.install(&hub);
     let tenants = Arc::clone(&TENANTS);
     hub.register::<dyn TenantResolverClient>(Arc::clone(&tenants) as Arc<dyn TenantResolverClient>);
     let evaluator = linked_evaluator().unwrap();
@@ -473,6 +494,7 @@ async fn env_full(
         db,
         store,
         hub,
+        registry,
         tenants,
         #[cfg(feature = "integration")]
         dsn,

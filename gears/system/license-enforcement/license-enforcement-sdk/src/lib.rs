@@ -20,6 +20,8 @@ pub mod dto;
 pub mod error;
 pub mod evaluator;
 pub mod gts;
+
+toolkit_gts::declare_gts_inventory!();
 pub mod ids;
 pub mod limits;
 mod link;

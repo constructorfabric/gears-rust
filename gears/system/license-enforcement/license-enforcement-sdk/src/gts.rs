@@ -1,6 +1,6 @@
 //! GTS types that license-enforcement registers.
 
-use toolkit_gts::gts_type_schema;
+use toolkit_gts::local::gts_type_schema;
 use uuid::Uuid;
 
 /// Status of a recipient tenant.

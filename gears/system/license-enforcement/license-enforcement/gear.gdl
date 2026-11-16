@@ -5,10 +5,19 @@ gdl_version = "1.0"
 # Gearbox product metadata for License Enforcement.
 #
 # Projected from #[toolkit::gear]: id, runtime_caps (db, rest, stateful), colocated_deps
-# (types-registry, authz-resolver, tenant-resolver).
+# (authz-resolver, tenant-resolver).
+
+TR_SDK = cargo(crate_name = "cf-gears-types-registry-sdk", lib = "types_registry_sdk", path = "../../types-registry/types-registry-sdk", features = ["rest-client"])
 
 gear(
-    deps = ["types-registry", "authz-resolver", "tenant-resolver"],
+    deps = ["authz-resolver", "tenant-resolver"],
+    # The types registry is consumed, not linked: local when co-located, REST
+    # otherwise. The platform API serves the start check; the tenant API serves
+    # grant requests under the caller's context.
+    consumes = [
+        consume(contract = "PlatformTypesRegistryApi", rust = "types_registry_sdk::PlatformTypesRegistryApi", sdk = TR_SDK),
+        consume(contract = "TypesRegistryApi", rust = "types_registry_sdk::TypesRegistryApi", sdk = TR_SDK),
+    ],
     source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/system/license-enforcement/license-enforcement"),
     maturity = "preview",
     implementation = "in-progress",

@@ -6,7 +6,7 @@ use toolkit_canonical_errors::{CanonicalError, FieldViolation, resource_error};
 use toolkit_macros::domain_model;
 
 #[resource_error(gts_id!("cf.core.license_enforcement.grant.v1~"))]
-struct GrantResourceError;
+pub(crate) struct GrantResourceError;
 
 #[resource_error(gts_id!("cf.core.license_enforcement.pack.v1~"))]
 struct PackResourceError;
@@ -87,6 +87,11 @@ pub enum DomainError {
     #[error("dependency unavailable: {0}")]
     DependencyUnavailable(String),
 
+    /// The caller's credential was refused (a dependency's 401 for a
+    /// request's read). Not an outage: a retry does not cure it.
+    #[error("unauthenticated")]
+    Unauthenticated,
+
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -155,6 +160,10 @@ impl From<DomainError> for CanonicalError {
             },
             DomainError::PermissionDenied => GrantResourceError::permission_denied()
                 .with_reason("ACCESS_DENIED")
+                .create(),
+            // The listener's token, never a dependency's text.
+            DomainError::Unauthenticated => CanonicalError::unauthenticated()
+                .with_reason("AUTHN_FAILED")
                 .create(),
             DomainError::InvalidArgument(violations) => {
                 let mut violations = violations.into_iter();

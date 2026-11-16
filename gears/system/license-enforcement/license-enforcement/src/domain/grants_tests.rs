@@ -1602,6 +1602,7 @@ async fn check_explain_requests_conform_to_their_contracts() {
     assert_eq!(v[0].field, "subject/type");
 
     // An unusable registered contract is not the caller's fault.
+    crate::test_support::serve_broken(&env.registry);
     let mut resource = req.resource.clone();
     resource.gts_type = GtsTypeId::new(crate::test_support::BROKEN);
     let err = env
@@ -1657,6 +1658,7 @@ async fn check_explain_refuses_what_the_gateway_refuses() {
 #[tokio::test]
 async fn issue_on_an_unusable_contract_is_internal() {
     let env = env().await;
+    crate::test_support::serve_broken(&env.registry);
     let tenant = Uuid::now_v7();
     let mut t = terms();
     t.resource.gts_type = GtsTypeId::new(crate::test_support::BROKEN);

@@ -43,14 +43,20 @@ pub const INSTANCE_SUFFIX: &str = "cf.builtin.license_enforcement.plugin.v1";
 /// runtime publishes its license-resolver backend instance, built from the
 /// configuration (`gts_publication(entities = ...)`), before `init`, and
 /// `init` binds the backend to the admitted instance. `start` fails when a type that the
-/// evaluator names is not registered: types-registry serves types only after
-/// every gear finished `init`.
+/// evaluator names is not registered. The recipient projection is published
+/// from the SDK's GTS collector before `init`; types are read through the
+/// consumed registry contracts (a grant request's under its caller's context).
+#[toolkit::consumes(contract = types_registry_sdk::PlatformTypesRegistryApi, from = "types-registry")]
+#[toolkit::consumes(contract = types_registry_sdk::TypesRegistryApi, from = "types-registry")]
 #[toolkit::gear(
     name = "license-enforcement",
-    deps = [types_registry, authz_resolver, tenant_resolver],
+    deps = [authz_resolver, tenant_resolver],
     capabilities = [db, rest, stateful],
     lifecycle(entry = "serve", stop_timeout = "30s", await_ready),
-    gts_publication(entities = Self::backend_instance),
+    gts_publication(
+        crates = [license_enforcement_sdk],
+        entities = Self::backend_instance,
+    ),
 )]
 #[derive(Default)]
 pub struct LicenseEnforcement {

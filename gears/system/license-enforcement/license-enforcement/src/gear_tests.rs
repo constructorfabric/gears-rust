@@ -18,10 +18,11 @@ impl ConfigProvider for Config {
     }
 }
 
-/// The runtime publishes this gear's license-resolver backend instance, with
-/// the configured vendor and priority, before `init`.
+/// The runtime publishes the SDK's recipient projection and this gear's
+/// license-resolver backend instance, with the configured vendor and
+/// priority, before `init`.
 #[test]
-fn the_manifest_is_the_configured_backend_instance() {
+fn the_manifest_is_the_recipient_projection_and_the_configured_backend_instance() {
     let config = Config(json!({
         "license-enforcement": { "config": { "vendor": "acme", "priority": 7 } }
     }));
@@ -34,9 +35,18 @@ fn the_manifest_is_the_configured_backend_instance() {
         PluginV1::<LicenseResolverPluginSpecV1>::build_registration(INSTANCE_SUFFIX, "acme", 7)
             .expect("backend instance");
     let documents = manifest.documents();
-    assert_eq!(documents.len(), 1, "{documents:?}");
-    assert_eq!(documents[0].0.as_ref(), expected.as_ref());
-    assert_eq!(documents[0].1, document);
+    let ids: Vec<&str> = documents.iter().map(|(id, _)| id.as_ref()).collect();
+    let mut want = vec![
+        expected.as_ref(),
+        "gts.cf.core.license_enforcement.recipient.v1~",
+    ];
+    want.sort_unstable();
+    assert_eq!(ids, want);
+    let backend = documents
+        .iter()
+        .find(|(id, _)| id.as_ref() == expected.as_ref())
+        .expect("backend instance");
+    assert_eq!(backend.1, document);
     assert_eq!(manifest.publisher_name(), "license-enforcement");
 }
 

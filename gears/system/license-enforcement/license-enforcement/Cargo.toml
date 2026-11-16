@@ -22,7 +22,6 @@ workspace = true
 license-enforcement-sdk = { workspace = true, features = ["rest-server"] }
 license-resolver-sdk = { workspace = true }
 types-registry-sdk = { workspace = true, features = ["rest-client"] }
-types-registry = { workspace = true }
 authz-resolver-sdk = { workspace = true }
 authz-resolver = { workspace = true }
 tenant-resolver-sdk = { workspace = true }
