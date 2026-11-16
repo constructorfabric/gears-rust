@@ -12,14 +12,15 @@ use sea_orm_migration::MigrationTrait;
 use time::Duration;
 use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
-use toolkit::client_hub::ClientScope;
 use toolkit::gts::PluginV1;
+use toolkit::gts_publication::GtsPublicationInputs;
 use toolkit::lifecycle::ReadySignal;
+use toolkit::plugins::bind_plugin_instances;
 use toolkit::{DatabaseCapability, Gear, GearCtx, RestApiCapability};
 use toolkit_db::DBProvider;
 use toolkit_db::odata::LimitCfg;
 use tracing::info;
-use types_registry_sdk::{RegisterResult, TypesRegistryClient};
+use types_registry_sdk::GtsId;
 
 use crate::config::LicenseEnforcementConfig;
 use crate::domain::check::CheckService;
@@ -38,15 +39,18 @@ pub const INSTANCE_SUFFIX: &str = "cf.builtin.license_enforcement.plugin.v1";
 /// License Enforcement gear.
 ///
 /// The binary links exactly one admission plugin and one evaluator; init fails
-/// otherwise. The gear registers its management contract in `ClientHub` and
-/// itself as a license-resolver backend. `start` fails when a type that the
+/// otherwise. The gear registers its management contract in `ClientHub`; the
+/// runtime publishes its license-resolver backend instance, built from the
+/// configuration (`gts_publication(entities = ...)`), before `init`, and
+/// `init` binds the backend to the admitted instance. `start` fails when a type that the
 /// evaluator names is not registered: types-registry serves types only after
 /// every gear finished `init`.
 #[toolkit::gear(
     name = "license-enforcement",
     deps = [types_registry, authz_resolver, tenant_resolver],
     capabilities = [db, rest, stateful],
-    lifecycle(entry = "serve", stop_timeout = "30s", await_ready)
+    lifecycle(entry = "serve", stop_timeout = "30s", await_ready),
+    gts_publication(entities = Self::backend_instance),
 )]
 #[derive(Default)]
 pub struct LicenseEnforcement {
@@ -56,12 +60,33 @@ pub struct LicenseEnforcement {
     named_types: OnceLock<(TypeResolver, Vec<GtsTypeId>)>,
 }
 
+impl LicenseEnforcement {
+    /// The publication's config-only document: this gear's license-resolver
+    /// backend instance.
+    fn backend_instance(
+        inputs: &GtsPublicationInputs<'_>,
+    ) -> anyhow::Result<Vec<(GtsId, serde_json::Value)>> {
+        let cfg: LicenseEnforcementConfig = inputs.config_or_default()?;
+        cfg.validate()
+            .map_err(|e| anyhow::anyhow!("{} config: {e}", Self::MODULE_NAME))?;
+        let (id, document) = PluginV1::<LicenseResolverPluginSpecV1>::build_registration(
+            INSTANCE_SUFFIX,
+            cfg.vendor,
+            cfg.priority,
+        )?;
+        Ok(vec![(GtsId::try_new(id.as_ref())?, document)])
+    }
+}
+
 #[async_trait]
 impl Gear for LicenseEnforcement {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
         let cfg: LicenseEnforcementConfig = ctx.config_or_default()?;
         cfg.validate()
             .map_err(|e| anyhow::anyhow!("{} config: {e}", Self::MODULE_NAME))?;
+        // The backend instance was admitted before `init`; without that
+        // manifest nothing is set up, so a failed `init` leaves the gear as it was.
+        let manifest = ctx.gts_publication_manifest()?;
         let plugin = linked_admission_plugin()
             .map_err(|e| anyhow::anyhow!("license-enforcement admission plugin: {e}"))?;
         let evaluator = linked_evaluator()
@@ -111,23 +136,16 @@ impl Gear for LicenseEnforcement {
             Arc::clone(&check),
         )));
 
-        let (instance_id, instance_json) =
-            PluginV1::<LicenseResolverPluginSpecV1>::build_registration(
-                INSTANCE_SUFFIX,
-                cfg.vendor.clone(),
-                cfg.priority,
-            )?;
-        let registry = hub.get::<dyn TypesRegistryClient>()?;
-        RegisterResult::ensure_all_ok(&registry.register(vec![instance_json]).await?)?;
+        // Bind the adapter to the admitted backend instance the manifest lists.
         let adapter: Arc<dyn LicenseResolverPluginClient> = Arc::new(ResolverAdapter::new(check));
-        hub.register_scoped::<dyn LicenseResolverPluginClient>(
-            ClientScope::gts_id(&instance_id),
-            adapter,
-        );
+        bind_plugin_instances::<LicenseResolverPluginSpecV1, _>(
+            &hub,
+            manifest.documents(),
+            &adapter,
+        )?;
 
         let info = plugin.info();
         info!(
-            %instance_id,
             vendor = %cfg.vendor,
             plugin_id = info.id,
             verifies_evidence = info.verifies_evidence,
@@ -211,3 +229,8 @@ impl RestApiCapability for LicenseEnforcement {
         ))
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "gear_tests.rs"]
+mod gear_tests;

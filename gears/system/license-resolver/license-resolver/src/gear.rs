@@ -16,9 +16,10 @@ use crate::infra::{GtsContractRegistry, metrics};
 
 /// License Resolver gear.
 ///
-/// The licensing base types and the `LicenseResolverPluginSpecV1` schema reach
-/// `types-registry` on their own via the `toolkit-gts` link-time inventory — no
-/// per-init registration is needed here.
+/// The runtime publishes the licensing base types and the
+/// `LicenseResolverPluginSpecV1` schema from the SDK's GTS collector before
+/// `init` (`gts_publication`). Contracts and plugin instances are read through
+/// the platform registry API, a consumed contract.
 ///
 /// Both public contracts are `#[toolkit::contract]`s served by one
 /// [`LicenseResolverLocalClient`]: `provides` wires it into `ClientHub` for each,
@@ -27,10 +28,11 @@ use crate::infra::{GtsContractRegistry, metrics};
 /// `/license-resolver/v1/is-licensed`, exposed to any authenticated principal).
 /// The gear always wires them `Local`: a remote `clients.provides` entry for
 /// either is a boot error ([`refuse_remote_wiring`]).
+#[toolkit::consumes(contract = types_registry_sdk::PlatformTypesRegistryApi, from = "types-registry")]
 #[toolkit::gear(
     name = "license-resolver",
-    deps = [types_registry],
-    capabilities = [rest]
+    capabilities = [rest],
+    gts_publication(crates = [license_resolver_sdk]),
 )]
 #[toolkit::provides(
     contract = license_resolver_sdk::PlatformLicenseResolverApi,

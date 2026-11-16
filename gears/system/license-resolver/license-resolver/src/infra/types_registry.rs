@@ -9,11 +9,16 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use toolkit::client_hub::ClientHub;
 use toolkit_canonical_errors::CanonicalError;
-use types_registry_sdk::{GtsTypeSchema, TypesRegistryClient};
+use toolkit_security::PlatformSecurityContext;
+use types_registry_sdk::{
+    EntityField, FieldSelection, GtsTypeId, LifecycleStatus, PlatformTypesRegistryApi,
+    PlatformTypesRegistryApiExt, Projection, ReadOptions, TypeSchema,
+};
 
 use crate::domain::{ContractRegistry, ContractRegistryError};
 
-/// Resolves licensing contracts through the types-registry client.
+/// Resolves licensing contracts through the platform registry API: the
+/// authored content, the resolved schema and the effective traits.
 pub struct GtsContractRegistry {
     hub: Arc<ClientHub>,
 }
@@ -27,17 +32,24 @@ impl GtsContractRegistry {
 
 #[async_trait]
 impl ContractRegistry for GtsContractRegistry {
-    async fn contract_schema(&self, type_id: &str) -> Result<GtsTypeSchema, ContractRegistryError> {
-        // Resolved per call rather than captured during `init()`: types-registry
-        // commits its catalog after the system-gear init phase, so a client
-        // captured there would be held before any contract is resolvable.
+    async fn contract_schema(&self, type_id: &str) -> Result<TypeSchema, ContractRegistryError> {
+        // Resolved per call rather than captured during `init()`: the platform
+        // registry API is a consumed contract, wired after `init`.
         let registry = self
             .hub
-            .get::<dyn TypesRegistryClient>()
+            .get::<dyn PlatformTypesRegistryApi>()
             .map_err(|e| ContractRegistryError::Unavailable(e.to_string()))?;
+        let id = GtsTypeId::try_new(type_id)
+            .map_err(|e| ContractRegistryError::MalformedTypeId(e.to_string()))?;
+        let options =
+            ReadOptions::default().with_projection(Projection::Select(FieldSelection::with(&[
+                EntityField::Content,
+                EntityField::ResolvedSchema,
+                EntityField::EffectiveTraits,
+            ])));
 
-        registry
-            .get_type_schema(type_id)
+        let contract = registry
+            .get_type_schema(&PlatformSecurityContext::outbound_marker(), &id, options)
             .await
             .map_err(|err| match err {
                 CanonicalError::NotFound { .. } => ContractRegistryError::Unregistered,
@@ -47,7 +59,14 @@ impl ContractRegistry for GtsContractRegistry {
                     ContractRegistryError::MalformedTypeId(detail)
                 }
                 other => ContractRegistryError::Unavailable(other.to_string()),
-            })
+            })?;
+        // A deleted contract is no longer registered. One the registry answered
+        // without a selected artifact is returned as is: validation reports it
+        // unusable, not an outage.
+        if contract.lifecycle_status != LifecycleStatus::Active {
+            return Err(ContractRegistryError::Unregistered);
+        }
+        Ok(contract)
     }
 }
 

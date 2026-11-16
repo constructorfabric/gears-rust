@@ -43,6 +43,8 @@ pub mod api;
 pub mod error;
 pub mod field;
 pub mod gts;
+
+toolkit_gts::declare_gts_inventory!();
 pub mod models;
 pub mod plugin_api;
 pub mod rest;

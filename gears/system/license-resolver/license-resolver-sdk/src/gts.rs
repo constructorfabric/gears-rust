@@ -18,7 +18,8 @@
 //! which Subject contract types it may be checked against.
 
 use schemars::JsonSchema;
-use toolkit_gts::{GtsTraitsSchema, PluginV1, gts_id, gts_type_schema};
+use toolkit_gts::local::gts_type_schema;
+use toolkit_gts::{GtsTraitsSchema, PluginV1, gts_id};
 
 /// GTS type definition for license resolver plugin instances.
 ///

@@ -20,8 +20,8 @@ workspace = true
 [dependencies]
 # Local dependencies
 license-resolver-sdk = { workspace = true }
-types-registry-sdk = { workspace = true }
-types-registry = { workspace = true }
+# `GtsId` of the published plugin instance; `gts_publication` needs the REST client.
+types-registry-sdk = { workspace = true, features = ["rest-client"] }
 
 # ToolKit dependencies
 toolkit = { workspace = true }
@@ -50,6 +50,13 @@ tracing = { workspace = true }
 inventory = { workspace = true }
 
 [dev-dependencies]
+# The real registry behind the managed-admission test.
+types-registry = { workspace = true }
+toolkit-db = { workspace = true, features = ["sqlite"] }
+toolkit-security = { workspace = true }
+sea-orm-migration = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+toolkit = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
 tokio-util = { workspace = true }
 toolkit-gts = { workspace = true }

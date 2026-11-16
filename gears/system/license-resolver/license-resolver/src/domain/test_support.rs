@@ -2,8 +2,8 @@
 //!
 //! The licensing contracts the fakes are exercised against live in
 //! [`crate::test_contracts`]; they are re-exported here so a test file needs one
-//! import. For the plugin-discovery registry, use `MockTypesRegistryClient` and
-//! `make_test_instance` from `types_registry_sdk::testing` directly.
+//! import. For the plugin-discovery registry, use `MockTypesRegistry` from
+//! `types_registry_sdk::testing_platform` directly.
 
 #![allow(clippy::missing_panics_doc)]
 
@@ -20,8 +20,8 @@ use license_resolver_sdk::{
 use serde_json::{Map, Value, json};
 use toolkit::client_hub::{ClientHub, ClientScope};
 use toolkit_macros::domain_model;
-use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
-use types_registry_sdk::{GtsTypeSchema, TypesRegistryClient};
+use types_registry_sdk::TypeSchema;
+use types_registry_sdk::testing_platform::MockTypesRegistry;
 use uuid::Uuid;
 
 use super::ports::{
@@ -31,8 +31,8 @@ pub use crate::test_contracts::{
     ADMIN_SUBJECT, BARE_RESOURCE, MODEL_USAGE_RESOURCE, OPERATOR_PRINCIPAL, PRINCIPAL_BASE,
     RESOURCE_BASE, SEAT_SUBJECT, SUBJECT_BASE, TENANT_SUBJECT, TestModelUsageResourceV1,
     USER_PRINCIPAL, USER_SUBJECT, admin_subject_schema, bare_resource_schema, model_usage_schema,
-    principal_schemas, resource_base_schema, seat_subject_schema, subject_base_schema,
-    tenant_subject_schema, user_subject_schema,
+    model_usage_schema_with, principal_schemas, resource_base_schema, seat_subject_schema,
+    subject_base_schema, tenant_subject_schema, user_subject_schema,
 };
 
 #[must_use]
@@ -110,7 +110,7 @@ pub enum FailureKind {
 #[domain_model]
 #[derive(Default)]
 pub struct FakeContractRegistry {
-    contracts: HashMap<String, GtsTypeSchema>,
+    contracts: HashMap<String, TypeSchema>,
     always_fails: Option<FailureKind>,
     calls: AtomicUsize,
 }
@@ -122,7 +122,7 @@ impl FakeContractRegistry {
     }
 
     #[must_use]
-    pub fn with_contracts(mut self, items: impl IntoIterator<Item = GtsTypeSchema>) -> Self {
+    pub fn with_contracts(mut self, items: impl IntoIterator<Item = TypeSchema>) -> Self {
         for schema in items {
             self.contracts
                 .insert(schema.type_id.as_ref().to_owned(), schema);
@@ -158,7 +158,7 @@ impl FakeContractRegistry {
 
 #[async_trait]
 impl ContractRegistry for FakeContractRegistry {
-    async fn contract_schema(&self, type_id: &str) -> Result<GtsTypeSchema, ContractRegistryError> {
+    async fn contract_schema(&self, type_id: &str) -> Result<TypeSchema, ContractRegistryError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         match self.always_fails {
             Some(FailureKind::Malformed) => {
@@ -329,19 +329,18 @@ pub fn hub_with_registry_and_plugin(
 pub fn counting_hub_with_registry_only(
     instance_id: &str,
     vendor: &str,
-) -> (Arc<ClientHub>, Arc<MockTypesRegistryClient>) {
+) -> (Arc<ClientHub>, Arc<MockTypesRegistry>) {
     let hub = empty_hub();
-    let instance = make_test_instance(instance_id, plugin_content(instance_id, vendor));
-    let registry = Arc::new(MockTypesRegistryClient::new().with_instances([instance]));
-    hub.register::<dyn TypesRegistryClient>(registry.clone() as Arc<dyn TypesRegistryClient>);
+    let registry = Arc::new(MockTypesRegistry::new());
+    registry.seed(instance_id, plugin_content(instance_id, vendor));
+    registry.install(&hub);
     (hub, registry)
 }
 
 #[must_use]
 pub fn hub_without_plugin_instances() -> Arc<ClientHub> {
     let hub = empty_hub();
-    let registry: Arc<dyn TypesRegistryClient> = Arc::new(MockTypesRegistryClient::new());
-    hub.register::<dyn TypesRegistryClient>(registry);
+    Arc::new(MockTypesRegistry::new()).install(&hub);
     hub
 }
 

@@ -12,11 +12,14 @@ use license_resolver_sdk::{
 };
 use serde_json::Map;
 use toolkit::client_hub::{ClientHub, ClientScope};
-use toolkit::plugins::{GtsPluginSelector, choose_plugin_instance};
+use toolkit::plugins::{GtsPluginSelector, choose_registered_plugin_instance};
 use toolkit::telemetry::ThrottledLog;
 use toolkit_macros::domain_model;
+use toolkit_security::PlatformSecurityContext;
 use tracing::info;
-use types_registry_sdk::{InstanceQuery, TypesRegistryClient};
+use types_registry_sdk::{
+    GtsIdPattern, ListEntitiesRequest, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt,
+};
 use uuid::Uuid;
 
 use super::error::DomainError;
@@ -260,19 +263,32 @@ impl Service {
 
         let registry = self
             .hub
-            .get::<dyn TypesRegistryClient>()
+            .get::<dyn PlatformTypesRegistryApi>()
             .map_err(|e| DomainError::TypesRegistryUnavailable(e.to_string()))?;
 
         let plugin_type_id = LicenseResolverPluginSpecV1::gts_type_id().clone();
+        let pattern = GtsIdPattern::try_new(&format!("{plugin_type_id}*"))
+            .map_err(|e| DomainError::Internal(format!("plugin listing pattern: {e}")))?;
 
+        // Every page of the Active instances; only those whose scoped client this
+        // process bound are candidates, so a stale instance never wins.
         let instances = registry
-            .list_instances(InstanceQuery::new().with_pattern(format!("{plugin_type_id}*")))
+            .list_instances(
+                &PlatformSecurityContext::outbound_marker(),
+                ListEntitiesRequest::matching(pattern),
+            )
             .await
             .map_err(|e| DomainError::TypesRegistryUnavailable(e.to_string()))?;
 
-        let gts_id = choose_plugin_instance::<LicenseResolverPluginSpecV1>(
+        let gts_id = choose_registered_plugin_instance::<
+            LicenseResolverPluginSpecV1,
+            dyn LicenseResolverPluginClient,
+        >(
+            &self.hub,
             &self.vendor,
-            instances.iter().map(|e| (e.id.as_ref(), &e.object)),
+            instances
+                .iter()
+                .map(|instance| (instance.id.as_ref(), instance.content.as_ref())),
         )?;
         info!(plugin_gts_id = %gts_id, "Selected license resolver plugin instance");
 

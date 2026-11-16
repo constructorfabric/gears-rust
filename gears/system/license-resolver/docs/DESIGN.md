@@ -535,7 +535,7 @@ read-only, there are no mutation / "not found" write errors.
 
 | Dependency Module   | Interface Used                        | Purpose                                                                                                                                                         |
 |---------------------|---------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `types-registry`    | SDK client (`TypesRegistryClient`)    | Discover and select backend plugin instances by GTS plugin spec (vendor + priority); resolve licensing contract schemas and `admitted_subjects` traits (cached); resolve the ancestors of a principal type |
+| `types-registry`    | SDK `PlatformTypesRegistryApi` (consumed) | Discover and select backend plugin instances by GTS plugin spec (vendor + priority, bound instances only); resolve licensing contract schemas and `admitted_subjects` traits from the materialized artifacts (cached); resolve the ancestors of a principal type |
 | ToolKit `ClientHub` | scoped client registration/resolution | Resolve the selected plugin as a scoped `LicenseResolverPluginClient`                                                                                           |
 
 **Dependency Rules** (per project conventions):

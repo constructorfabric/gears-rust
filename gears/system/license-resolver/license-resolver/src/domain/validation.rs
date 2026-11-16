@@ -13,7 +13,7 @@ use license_resolver_sdk::{FieldViolation, LicenseCheckRequest, field};
 use serde::Serialize;
 use serde_json::Value;
 use toolkit_macros::domain_model;
-use types_registry_sdk::GtsTypeSchema;
+use types_registry_sdk::TypeSchema;
 
 use super::error::DomainError;
 use super::ports::{ContractRegistry, ContractRegistryError};
@@ -125,7 +125,7 @@ impl ContractValidator {
         role: Role,
         type_id: &str,
         violations: &mut Vec<FieldViolation>,
-    ) -> Result<Option<GtsTypeSchema>, DomainError> {
+    ) -> Result<Option<TypeSchema>, DomainError> {
         let contract = match self.registry.contract_schema(type_id).await {
             Ok(contract) => contract,
             Err(ContractRegistryError::Unregistered) => {
@@ -149,9 +149,32 @@ impl ContractValidator {
             }
         };
 
+        // A registry answer without a selected artifact is an unusable
+        // contract, whichever role it plays.
+        let missing = [
+            ("content", contract.content.is_none()),
+            ("resolved schema", contract.resolved_schema.is_none()),
+            ("effective traits", contract.effective_traits.is_none()),
+        ]
+        .into_iter()
+        .find_map(|(field, absent)| absent.then_some(field));
+        if let Some(field) = missing {
+            return Err(DomainError::ContractUnusable {
+                type_id: type_id.to_owned(),
+                reason: format!("the registry returned no {field}"),
+            });
+        }
+
         // `x-gts-abstract` is an own declaration and is never inherited, so this
         // reads the contract's own body rather than the merged chain.
-        if contract.raw_schema.get(X_GTS_ABSTRACT) == Some(&Value::Bool(true)) {
+        let content = contract
+            .content
+            .as_ref()
+            .ok_or_else(|| DomainError::ContractUnusable {
+                type_id: type_id.to_owned(),
+                reason: "the registry returned no content".to_owned(),
+            })?;
+        if content.get(X_GTS_ABSTRACT) == Some(&Value::Bool(true)) {
             violations.push(FieldViolation::new(
                 role.type_field(),
                 format!(
@@ -162,14 +185,10 @@ impl ContractValidator {
             return Ok(None);
         }
 
-        // `ancestors` yields the contract itself first, so skipping it demands a
-        // *proper* descendant — a base presented as its own derivation is not one.
+        // The chain without the contract itself: a *proper* descendant — a base
+        // presented as its own derivation is not one.
         let base = role.base_type_id();
-        if !contract
-            .ancestors()
-            .skip(1)
-            .any(|ancestor| ancestor.type_id.as_ref() == base)
-        {
+        if !ancestors(&contract).iter().any(|ancestor| ancestor == base) {
             violations.push(FieldViolation::new(
                 role.type_field(),
                 format!("licensing contract '{type_id}' does not derive from '{base}'"),
@@ -184,19 +203,26 @@ impl ContractValidator {
 
 fn validate_object<T: Serialize>(
     role: Role,
-    contract: &GtsTypeSchema,
+    contract: &TypeSchema,
     object: &T,
     violations: &mut Vec<FieldViolation>,
 ) -> Result<(), DomainError> {
     let contract_id = contract.type_id.as_ref();
-    let schema = contract.effective_schema();
+    let schema =
+        contract
+            .resolved_schema
+            .as_ref()
+            .ok_or_else(|| DomainError::ContractUnusable {
+                type_id: contract_id.to_owned(),
+                reason: "the registry returned no resolved schema".to_owned(),
+            })?;
 
     // The draft is pinned rather than detected: a GTS chain id can appear in
     // `$schema`, and it is not a registered meta-schema, so autodetection fails
     // the whole compile.
     let validator = jsonschema::options()
         .with_draft(jsonschema::Draft::Draft7)
-        .build(&schema)
+        .build(schema)
         .map_err(|e| DomainError::ContractUnusable {
             type_id: contract_id.to_owned(),
             reason: format!("not a valid JSON Schema: {e}"),
@@ -226,12 +252,17 @@ fn validate_object<T: Serialize>(
 }
 
 fn validate_admitted(
-    resource_contract: &GtsTypeSchema,
+    resource_contract: &TypeSchema,
     subject_type: &str,
     violations: &mut Vec<FieldViolation>,
 ) -> Result<(), DomainError> {
     let contract_id = resource_contract.type_id.as_ref();
-    let traits = resource_contract.effective_traits();
+    let traits = resource_contract.effective_traits.as_ref().ok_or_else(|| {
+        DomainError::ContractUnusable {
+            type_id: contract_id.to_owned(),
+            reason: "the registry returned no effective traits".to_owned(),
+        }
+    })?;
 
     let declared = match traits.get(ADMITTED_SUBJECTS_TRAIT) {
         // Absent or null resolves to the same answer as an empty list: a
@@ -278,6 +309,17 @@ fn validate_admitted(
     }
 
     Ok(())
+}
+
+/// The contract's parent chain, without the contract itself.
+pub(super) fn ancestors(contract: &TypeSchema) -> Vec<String> {
+    GtsId::try_new(contract.type_id.as_ref())
+        .map(|id| {
+            let mut chain = id.chain_ids();
+            chain.pop();
+            chain
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

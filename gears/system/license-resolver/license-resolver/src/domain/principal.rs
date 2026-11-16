@@ -8,6 +8,7 @@ use toolkit_macros::domain_model;
 
 use super::error::DomainError;
 use super::ports::{ContractRegistry, ContractRegistryError};
+use super::validation::ancestors;
 
 #[domain_model]
 pub struct PrincipalMapper {
@@ -51,9 +52,10 @@ impl PrincipalMapper {
             return Ok(None);
         }
         match self.registry.contract_schema(principal_type).await {
-            Ok(schema) => Ok(schema
-                .ancestors()
-                .find_map(|ancestor| self.subject_types.get(ancestor.type_id.as_ref()))
+            Ok(schema) => Ok(ancestors(&schema)
+                .iter()
+                .rev()
+                .find_map(|ancestor| self.subject_types.get(ancestor))
                 .cloned()),
             Err(
                 ContractRegistryError::Unregistered | ContractRegistryError::MalformedTypeId(_),

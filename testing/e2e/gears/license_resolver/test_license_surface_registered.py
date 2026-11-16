@@ -1,14 +1,10 @@
 """E2E tests for the license resolver's GTS surface.
 
-The resolver exposes no REST API — its only operation is the in-process
-``is_licensed`` check — so what an E2E can observe is the surface it publishes
-into types-registry, and the fact that the server boots at all with it linked.
-
-That boot is the point. types-registry commits every linked crate's GTS
-inventory in one all-or-nothing pass during ``post_init``: a licensing type or a
-plugin instance that fails validation stops the whole server from binding, not
-just licensing. These tests fail loudly on that, instead of leaving every other
-suite to fail with an unexplained startup timeout.
+What an E2E observes here is the surface the license resolver and the static
+license plugin publish into types-registry, and the fact that the server boots
+at all with them linked: the runtime admits each gear's GTS publication before
+application ``init``, and a refused publication fails the application group.
+These tests read the admitted entities back through the registry's tenant API.
 
 Grant and denial semantics are covered in-process by the plugin's own tests
 (``cargo test -p cf-gears-static-license-plugin``); they are unreachable from
@@ -25,7 +21,8 @@ STATIC_PLUGIN_INSTANCE = PLUGIN_SPEC + "cf.builtin.static_license_resolver.plugi
 
 async def _get_entity(client, base_url, auth_headers, gts_id):
     response = await client.get(
-        f"{base_url}/types-registry/v1/entities/{gts_id}",
+        f"{base_url}/types-registry/v2/entities/{gts_id}",
+        params={"$select": "content"},
         headers=auth_headers,
     )
     if response.status_code in (401, 403) and not auth_headers:
@@ -44,7 +41,7 @@ async def _get_entity(client, base_url, auth_headers, gts_id):
 @pytest.mark.smoke
 @pytest.mark.asyncio
 async def test_licensing_base_types_are_registered(base_url, auth_headers):
-    """Both licensing bases reach types-registry via the link-time inventory.
+    """Both licensing bases are admitted from the license resolver's publication.
 
     Consuming Gears derive their contracts from these, so an absent base makes
     every derived contract unregisterable.
