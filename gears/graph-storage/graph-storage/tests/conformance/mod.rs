@@ -8053,6 +8053,8 @@ pub async fn the_view_reads_report_whether_a_vector_is_stored(
     }
 }
 
+// --- purge (gears-rust #5194) -------------------------------------------------
+
 /// The ontology plus the analysis edge type the purge cases attach.
 fn ontology_with_analysis() -> Vec<TypeRegistration> {
     let mut types = ontology_batch();
