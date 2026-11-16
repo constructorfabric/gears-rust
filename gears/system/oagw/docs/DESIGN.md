@@ -490,7 +490,7 @@ OAGW processes headers in three categories:
 |---|---|
 | `X-OAGW-Target-Host` | Read during routing, then stripped |
 | `Host` | Replaced by upstream host |
-| `Connection` | Stripped |
+| `Connection` | Stripped, with every header any `Connection` field line names |
 | `Keep-Alive` | Stripped |
 | `Proxy-Authenticate` | Stripped |
 | `Proxy-Authorization` | Stripped |
@@ -498,6 +498,9 @@ OAGW processes headers in three categories:
 | `Trailer` | Stripped |
 | `Transfer-Encoding` | Stripped |
 | `Upgrade` | Stripped |
+| `Forwarded`, `Via`, `X-Forwarded*`, `X-Envoy-*`, `*Client-IP`, `X-Real-IP`, `X-Originating-IP`, `X-Remote-IP`, `X-Remote-Addr`, `X-ProxyUser-Ip`, `CF-Connecting-IP`, `X-Original-Forwarded-For`, `X-Original-URL`, `X-Original-URI`, `X-Rewrite-URL`, `X-Original-Host`, `X-Host`, `X-HTTP-Method-Override`, `X-HTTP-Method`, `X-Method-Override` | Not forwarded under `passthrough: all`; forwarded only when the upstream's `passthrough_allowlist` names the header. The list cannot name every framework-specific header: an upstream that trusts client-identity or override headers should use `allowlist` |
+
+Request-phase guard plugins check the inbound headers as the client sent them, before passthrough filtering and auth injection ([ADR: Required Headers Guard Plugin](./ADR/0017-required-headers-guard-plugin.md)).
 
 Simple header transformations are defined in the upstream `headers` configuration. Complex header transformations can be defined in corresponding upstream/route plugins. Well-known headers (e.g., `Content-Length`, `Content-Type`) must be validated, set or adjusted; invalid headers should result in `400 Bad Request`.
 
@@ -528,8 +531,11 @@ Default validation checks (no configuration required):
 | Check | Rule | Error |
 |---|---|---|
 | Content-Length | Must be valid integer if present; must match actual size | `400 ValidationError` |
-| Max size | Hard limit 100MB; reject before buffering | `413 PayloadTooLarge` |
+| Max size | `max_body_size_bytes`; a larger `Content-Length` is rejected before buffering, a body without one while buffering | `413 PayloadTooLarge` |
+| Body read | Reading the body fails for another reason (for example the client aborts the upload) | `400 BODY_READ_FAILED` |
 | Transfer-Encoding | Reject unsupported encodings (only `chunked` supported) | `400 ValidationError` |
+
+These checks run after the `proxy:invoke` permission check, so a caller without it gets `403` before any body is read.
 
 Additional validation (JSON Schema, content-type checks, custom rules) implemented via guard plugins.
 
@@ -720,7 +726,7 @@ All list endpoints support OData query parameters: `$filter`, `$select`, `$order
 `{METHOD} /api/oagw/v1/proxy/{alias}[/{path_suffix}][?{query_parameters}]`
 
 Request classification uses `upstream.protocol` to determine match strategy:
-- HTTP: method allowlist + longest path prefix match
+- HTTP: method allowlist + longest path prefix match, ending on a segment boundary (`/v1/chat` covers `/v1/chat/x` and `/v1/chat.json`, not `/v1/chatty`; route `/` covers the bare alias). Matching runs on the normalized path: percent-encoded unreserved characters decoded (`/v1/ch%61t` is `/v1/chat`), other escapes uppercased, `.` and `..` resolved; a segment that is a dot-segment once decoded (also through `;` parameters or double encoding) is rejected with 400. An encoded `/` or `\` (`%2F`, `%5C`) ends a segment without starting a new one (`/v1%2Fadmin` is under `/v1`); the candidates are also ranked with `%2F`, `%5C`, `\` and the fullwidth and small solidi `%EF%BC%8F`, `%EF%BC%BC` and `%EF%B9%A8`, which NFKC folds to `/` and `\` read as `/`, and a request for which that picks another route (routes `/v1` and `/v1/admin`, request `/v1%2Fadmin`) is rejected with 400 `INVALID_PROXY_PATH`, so an upstream that decodes them cannot be reached past the narrower route's policy
 - gRPC (planned/Phase 3): `(service, method)` match from gRPC request path (no gRPC proxy code path is currently implemented or reachable)
 
 #### Error Response Format
@@ -906,7 +912,7 @@ See [ADR: Resource Identification](./ADR/0010-resource-identification.md) for th
 |---|---|
 | Find Upstream by Alias | One query for the alias across the tenant chain (`alias = ? AND tenant_id IN (chain)`); the closest enabled, visible upstream wins in application code |
 | List Upstreams for Tenant | The tenant's own upstreams, ordered by id, offset-paginated |
-| Find Matching Route for Request | Match by `(upstream_ids, method, longest path prefix, priority, lowest route ID)` for HTTP, where `upstream_ids` is the selected upstream followed by its ancestor upstreams closest-first (see ADR-0018); `(upstream_id, service, method)` for gRPC (planned/Phase 3 — no gRPC proxy code path is currently implemented or reachable) |
+| Find Matching Route for Request | Match by `(upstream_ids, method, longest whole-segment path prefix, priority, lowest route ID)` for HTTP, where `upstream_ids` is the selected upstream followed by its ancestor upstreams closest-first (see ADR-0018); `(upstream_id, service, method)` for gRPC (planned/Phase 3 — no gRPC proxy code path is currently implemented or reachable) |
 | Resolve Effective Configuration | Walk hierarchy, collect bindings, merge from root to child per sharing modes |
 | List Routes by Upstream | Filter by `upstream_id` with tenant scoping |
 | Track Plugin Usage | Scan `oagw_upstream_plugin`, `oagw_route_plugin`, and `auth_plugin_uuid` columns for references |

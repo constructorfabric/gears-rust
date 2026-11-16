@@ -63,24 +63,32 @@ impl ErrorSource {
 pub trait ServiceGatewayClientV1: Send + Sync {
     // -- Upstream CRUD --
 
+    /// Create an upstream. Needs `create` on `gts.cf.core.oagw.upstream.v1~`
+    /// in the caller's tenant; a refusal is `PermissionDenied` (403).
     async fn create_upstream(
         &self,
         ctx: SecurityContext,
         req: CreateUpstreamRequest,
     ) -> Result<Upstream, CanonicalError>;
 
+    /// Get an upstream of the caller's tenant. Needs `read` on it; a
+    /// refusal is `PermissionDenied` (403).
     async fn get_upstream(
         &self,
         ctx: SecurityContext,
         id: Uuid,
     ) -> Result<Upstream, CanonicalError>;
 
+    /// List the caller's tenant's upstreams. Needs `read` on
+    /// `gts.cf.core.oagw.upstream.v1~`; a refusal is `PermissionDenied` (403).
     async fn list_upstreams(
         &self,
         ctx: SecurityContext,
         query: &ListQuery,
     ) -> Result<Vec<Upstream>, CanonicalError>;
 
+    /// Replace an upstream. Needs `override` on it (not `read`); a refusal is
+    /// `PermissionDenied` (403).
     async fn update_upstream(
         &self,
         ctx: SecurityContext,
@@ -88,18 +96,26 @@ pub trait ServiceGatewayClientV1: Send + Sync {
         req: UpdateUpstreamRequest,
     ) -> Result<Upstream, CanonicalError>;
 
+    /// Delete an upstream and its routes. Needs `delete` on it; a refusal is
+    /// `PermissionDenied` (403).
     async fn delete_upstream(&self, ctx: SecurityContext, id: Uuid) -> Result<(), CanonicalError>;
 
     // -- Route CRUD --
 
+    /// Create a route. Needs `create` on `gts.cf.core.oagw.route.v1~` in the
+    /// caller's tenant; a refusal is `PermissionDenied` (403).
     async fn create_route(
         &self,
         ctx: SecurityContext,
         req: CreateRouteRequest,
     ) -> Result<Route, CanonicalError>;
 
+    /// Get a route of the caller's tenant. Needs `read` on it; a refusal is
+    /// `PermissionDenied` (403).
     async fn get_route(&self, ctx: SecurityContext, id: Uuid) -> Result<Route, CanonicalError>;
 
+    /// List the caller's tenant's routes. Needs `read` on
+    /// `gts.cf.core.oagw.route.v1~`; a refusal is `PermissionDenied` (403).
     async fn list_routes(
         &self,
         ctx: SecurityContext,
@@ -107,6 +123,8 @@ pub trait ServiceGatewayClientV1: Send + Sync {
         query: &ListQuery,
     ) -> Result<Vec<Route>, CanonicalError>;
 
+    /// Replace a route. Needs `override` on it (not `read`); a refusal is
+    /// `PermissionDenied` (403).
     async fn update_route(
         &self,
         ctx: SecurityContext,
@@ -114,6 +132,8 @@ pub trait ServiceGatewayClientV1: Send + Sync {
         req: UpdateRouteRequest,
     ) -> Result<Route, CanonicalError>;
 
+    /// Delete a route. Needs `delete` on it; a refusal is
+    /// `PermissionDenied` (403).
     async fn delete_route(&self, ctx: SecurityContext, id: Uuid) -> Result<(), CanonicalError>;
 
     // -- Resolution --
@@ -122,9 +142,19 @@ pub trait ServiceGatewayClientV1: Send + Sync {
     /// the given alias, HTTP method, and path — without executing the proxy
     /// pipeline (no auth, rate-limiting, or forwarding).
     ///
-    /// Performs a single tenant hierarchy walk, applies alias shadowing, and
-    /// returns the merged configuration. Useful for startup validation,
-    /// diagnostics, and config preview.
+    /// Applies alias shadowing and returns the merged configuration, for
+    /// diagnostics and config preview. The path is matched in the form the
+    /// proxy matches it in.
+    ///
+    /// # Errors
+    ///
+    /// - `PermissionDenied` (403) without `read` on upstreams in the
+    ///   caller's tenant (checked first), on the upstreams of every tenant
+    ///   in its chain (any of them may contribute merged settings), or on
+    ///   the returned route.
+    /// - `InvalidArgument` (400) for a path the proxy would reject: an
+    ///   encoded dot-segment, a `;` path parameter, a stray `%`.
+    /// - `NotFound` when no upstream or route matches.
     async fn resolve_proxy_target(
         &self,
         ctx: SecurityContext,

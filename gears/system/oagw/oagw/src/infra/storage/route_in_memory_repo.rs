@@ -1,6 +1,6 @@
 use crate::domain::model::{HttpMethod, ListQuery, ManagedBy, Route};
 use crate::domain::repo::{RepositoryError, RouteOverlap, RouteRepository, RowKey, Tags};
-use crate::domain::route_matching::{match_rank, parse_method};
+use crate::domain::route_matching::{RouteSelection, parse_method};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use std::collections::HashSet;
@@ -206,19 +206,21 @@ impl RouteRepository for InMemoryRouteRepo {
             .flatten()
             .collect();
         // Rank each candidate in place; clone only a new best.
+        let mut selection = RouteSelection::new(tenant_chain, upstream_ids, method, path);
         let mut best = None;
         for id in route_ids {
             let Some(route) = self.store.get(&id) else {
                 continue;
             };
-            let Some(rank) = match_rank(&route, tenant_chain, upstream_ids, method, path) else {
-                continue;
-            };
-            if best.as_ref().is_none_or(|(best_rank, _)| rank < *best_rank) {
-                best = Some((rank, route.clone()));
+            if selection.offer(&route) {
+                best = Some(route.clone());
             }
         }
-        let (_, mut route) = best.ok_or(not_found)?;
+        let mut route = selection
+            .winner()
+            .map_err(|_| RepositoryError::SeparatorBypass)?
+            .and(best)
+            .ok_or(not_found)?;
         if tags == Tags::Skip {
             route.tags.clear();
         }

@@ -105,22 +105,11 @@ pub async fn update_route(
 ) -> Result<impl IntoResponse, Box<Problem>> {
     let instance = format!("/oagw/v1/routes/{id}");
     let uuid = parse_gts_id(&id, gts::ROUTE_SCHEMA, &instance)?;
-    // Snapshot old rate_limit before update so we can detect changes and
-    // clean up stale rate-limit keys (avoids accumulating orphaned buckets).
-    let old_rate_limit = state
-        .cp
-        .get_route(&ctx, uuid)
-        .await
-        .map_err(|e| domain_error_to_problem(e, &instance))?
-        .rate_limit;
     let route = state
         .cp
         .update_route(&ctx, uuid, req.into())
         .await
         .map_err(|e| domain_error_to_problem(e, &instance))?;
-    if route.rate_limit != old_rate_limit {
-        state.dp.remove_rate_limit_keys_for_route(uuid);
-    }
     Ok(Json(to_response(route)))
 }
 
@@ -136,6 +125,5 @@ pub async fn delete_route(
         .delete_route(&ctx, uuid)
         .await
         .map_err(|e| domain_error_to_problem(e, &instance))?;
-    state.dp.remove_rate_limit_keys_for_route(uuid);
     Ok(StatusCode::NO_CONTENT)
 }

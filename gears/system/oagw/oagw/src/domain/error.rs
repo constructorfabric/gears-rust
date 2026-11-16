@@ -4,6 +4,18 @@ use uuid::Uuid;
 
 use super::repo::RepositoryError;
 
+/// The resource an authorization denial is reported on.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeniedOn {
+    /// The proxy (`proxy:invoke`).
+    Proxy,
+    /// The upstream resource (management and ancestor binds).
+    Upstream,
+    /// The route resource (management).
+    Route,
+}
+
 /// Domain-layer errors for OAGW control-plane and data-plane operations.
 #[domain_model]
 #[derive(Debug, Clone, thiserror::Error)]
@@ -299,6 +311,9 @@ pub enum DomainError {
         reason: String,
         /// Human-readable explanation of the failure.
         detail: String,
+        /// The resource the denial is reported on; selects the wire
+        /// `resource_type`.
+        entity: DeniedOn,
     },
 }
 
@@ -384,6 +399,7 @@ impl DomainError {
         Self::Forbidden {
             reason: reason::permission::AUTHZ_DENIED.into(),
             detail: detail.into(),
+            entity: DeniedOn::Proxy,
         }
     }
 
@@ -394,6 +410,25 @@ impl DomainError {
         Self::Forbidden {
             reason: reason.into(),
             detail: detail.into(),
+            entity: DeniedOn::Proxy,
+        }
+    }
+
+    /// Report a [`DomainError::Forbidden`] on `entity` instead of the proxy.
+    /// Other variants are returned unchanged.
+    #[must_use]
+    pub fn on_entity(self, entity: DeniedOn) -> Self {
+        match self {
+            Self::Forbidden {
+                reason,
+                detail,
+                entity: _,
+            } => Self::Forbidden {
+                reason,
+                detail,
+                entity,
+            },
+            other => other,
         }
     }
 }
@@ -424,6 +459,10 @@ impl From<RepositoryError> for DomainError {
                     overlap.id, overlap.method
                 ),
             },
+            // Callers that know the request path map this one themselves.
+            RepositoryError::SeparatorBypass => {
+                crate::domain::route_matching::SeparatorBypass.into_error("")
+            }
             RepositoryError::Internal(message) => Self::Internal { message },
         }
     }
@@ -448,6 +487,7 @@ impl From<tenant_resolver_sdk::TenantResolverError> for DomainError {
             TenantResolverError::Unauthorized => Self::Forbidden {
                 reason: reason::permission::TENANT_RESOLVER_UNAUTHORIZED.into(),
                 detail: "tenant resolver: unauthorized".to_string(),
+                entity: DeniedOn::Proxy,
             },
             TenantResolverError::NoPluginAvailable => Self::Internal {
                 message: "tenant resolver: no plugin available".to_string(),
@@ -471,7 +511,11 @@ impl From<authz_resolver_sdk::EnforcerError> for DomainError {
     fn from(e: authz_resolver_sdk::EnforcerError) -> Self {
         use authz_resolver_sdk::{AccessDenial, EnforcerError};
 
-        tracing::error!(error = %e, "OAGW authorization check failed");
+        // A denial is the policy working, logged where it is decided; only
+        // a failure to evaluate is an error.
+        if !matches!(e, EnforcerError::AccessDenied(_)) {
+            tracing::error!(error = %e, "OAGW authorization check failed");
+        }
         match e {
             EnforcerError::AccessDenied(AccessDenial::Pdp { reason }) => match reason {
                 Some(r) => Self::Forbidden {
@@ -479,16 +523,19 @@ impl From<authz_resolver_sdk::EnforcerError> for DomainError {
                     detail: r
                         .details
                         .unwrap_or_else(|| "access denied by policy".into()),
+                    entity: DeniedOn::Proxy,
                 },
                 None => Self::Forbidden {
                     reason: reason::permission::AUTHZ_DENIED.into(),
                     detail: "access denied by policy".into(),
+                    entity: DeniedOn::Proxy,
                 },
             },
             // PEP-local access denial after successful compilation.
             EnforcerError::AccessDenied(local) => Self::Forbidden {
                 reason: reason::permission::AUTHZ_DENIED.into(),
                 detail: local.to_string(),
+                entity: DeniedOn::Proxy,
             },
             EnforcerError::CompileFailed(_) => Self::Internal {
                 message: "authorization constraint compilation failed".to_string(),

@@ -38,6 +38,10 @@ pub enum RepositoryError {
     /// rule of [`RouteRepository::create`]); nothing was written.
     #[error("route overlaps route {} on method {:?}", .0.id, .0.method)]
     RouteOverlap(RouteOverlap),
+    /// The request path selects another route with its encoded `/` or `\`
+    /// read as `/` ([`crate::domain::route_matching::SeparatorBypass`]).
+    #[error("encoded separator in the path selects another route")]
+    SeparatorBypass,
     /// Unexpected storage failure.
     #[error("internal: {0}")]
     Internal(String),

@@ -26,7 +26,13 @@ pub fn apply_passthrough(
 ) -> HeaderMap {
     let mut out = match mode {
         PassthroughMode::None => HeaderMap::new(),
-        PassthroughMode::All => inbound.clone(),
+        // `all` forwards what the client sent, but not its forwarding and
+        // override headers: only an allowlist that names one forwards it.
+        PassthroughMode::All => {
+            let mut all = inbound.clone();
+            strip_forwarding_headers(&mut all);
+            all
+        }
         PassthroughMode::Allowlist => {
             let mut h = HeaderMap::new();
             for name in allowlist {
@@ -60,23 +66,74 @@ pub fn apply_passthrough(
 /// Per RFC 7230 Section 6.1, intermediaries MUST remove headers listed in the
 /// `Connection` header value in addition to the static hop-by-hop list.
 pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
-    // First, parse Connection header and remove any headers it names.
-    if let Some(conn_value) = headers.get("connection").and_then(|v| v.to_str().ok()) {
-        let named: Vec<String> = conn_value
-            .split(',')
-            .map(|token| token.trim().to_lowercase())
-            .filter(|token| !token.is_empty())
-            .collect();
-        for name in &named {
-            if let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) {
-                headers.remove(header_name);
-            }
-        }
+    // First, remove the headers every Connection field line names.
+    for name in connection_nominated(headers) {
+        headers.remove(name);
     }
 
     // Then remove the static hop-by-hop list.
     for name in HOP_BY_HOP_HEADERS {
         headers.remove(*name);
+    }
+}
+
+/// The header names nominated by every `Connection` field line (RFC 9110
+/// §7.6.1). A request may repeat the field; reading only the first line
+/// would forward the names the others nominate.
+fn connection_nominated(headers: &HeaderMap) -> Vec<HeaderName> {
+    headers
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .filter_map(|token| HeaderName::from_bytes(token.as_bytes()).ok())
+        .collect()
+}
+
+/// Headers a client could use to spoof its address or origin, or to override
+/// the path, host or method, at the upstream (F0008 SSRF rules): `Forwarded`
+/// (RFC 7239), the `X-Forwarded*` family, every `Client-IP` variant, the
+/// proxy and CDN client-address headers, and the URL, host and method
+/// override headers some frameworks honour after OAGW matched the route.
+fn is_forwarding_header(name: &HeaderName) -> bool {
+    let name = name.as_str();
+    name.starts_with("x-forwarded")
+        || name.starts_with("x-envoy-")
+        || name.ends_with("client-ip")
+        || matches!(
+            name,
+            "forwarded"
+                | "via"
+                | "x-proxyuser-ip"
+                | "x-real-ip"
+                | "x-originating-ip"
+                | "x-remote-ip"
+                | "x-remote-addr"
+                | "cf-connecting-ip"
+                | "x-original-forwarded-for"
+                | "x-original-url"
+                | "x-original-uri"
+                | "x-rewrite-url"
+                | "x-original-host"
+                | "x-host"
+                | "x-http-method-override"
+                | "x-http-method"
+                | "x-method-override"
+        )
+}
+
+/// Remove forwarding headers ([`is_forwarding_header`]) from an outbound
+/// request. Requests only: upstream responses keep them.
+fn strip_forwarding_headers(headers: &mut HeaderMap) {
+    let to_remove: Vec<HeaderName> = headers
+        .keys()
+        .filter(|name| is_forwarding_header(name))
+        .cloned()
+        .collect();
+    for name in to_remove {
+        headers.remove(&name);
     }
 }
 
@@ -145,17 +202,10 @@ pub fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 /// Like [`strip_hop_by_hop`] but preserves `Upgrade` and `Connection` headers,
 /// which are required for WebSocket upgrade negotiation (RFC 6455 §4.1).
 pub fn strip_hop_by_hop_for_upgrade(headers: &mut HeaderMap) {
-    // Parse Connection-nominated headers but skip "upgrade" itself.
-    if let Some(conn_value) = headers.get("connection").and_then(|v| v.to_str().ok()) {
-        let named: Vec<String> = conn_value
-            .split(',')
-            .map(|token| token.trim().to_lowercase())
-            .filter(|token| !token.is_empty() && token != "upgrade")
-            .collect();
-        for name in &named {
-            if let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) {
-                headers.remove(header_name);
-            }
+    // Remove Connection-nominated headers but keep "upgrade" itself.
+    for name in connection_nominated(headers) {
+        if name != http::header::UPGRADE {
+            headers.remove(name);
         }
     }
 
@@ -163,6 +213,18 @@ pub fn strip_hop_by_hop_for_upgrade(headers: &mut HeaderMap) {
     for name in HOP_BY_HOP_HEADERS {
         if *name != "connection" && *name != "upgrade" {
             headers.remove(*name);
+        }
+    }
+}
+
+/// Remove from `outbound` every header the client's `Connection` lines in
+/// `inbound` nominate. Passthrough copies `Connection` only when the mode
+/// forwards it, so stripping `outbound` alone would forward an allowlisted
+/// header the client marked hop-by-hop. An upgrade keeps `Upgrade`.
+pub fn strip_inbound_nominated(outbound: &mut HeaderMap, inbound: &HeaderMap, is_upgrade: bool) {
+    for name in connection_nominated(inbound) {
+        if !(is_upgrade && name == http::header::UPGRADE) {
+            outbound.remove(name);
         }
     }
 }
@@ -546,6 +608,154 @@ mod tests {
             headers.get(http::header::HOST).unwrap(),
             "api.openai.com:8443"
         );
+    }
+
+    /// A request may repeat `Connection`; the names every line nominates go
+    /// (#4862 item 6).
+    #[test]
+    fn hop_by_hop_reads_every_connection_line() {
+        let mut headers = HeaderMap::new();
+        headers.append("connection", "x-first".parse().unwrap());
+        headers.append("connection", "x-second, X-Third".parse().unwrap());
+        headers.insert("x-first", "1".parse().unwrap());
+        headers.insert("x-second", "2".parse().unwrap());
+        headers.insert("x-third", "3".parse().unwrap());
+        headers.insert("x-custom", "keep".parse().unwrap());
+
+        strip_hop_by_hop(&mut headers);
+
+        for name in ["connection", "x-first", "x-second", "x-third"] {
+            assert!(headers.get(name).is_none(), "{name} was forwarded");
+        }
+        assert_eq!(headers.get("x-custom").unwrap(), "keep");
+    }
+
+    #[test]
+    fn upgrade_strip_reads_every_connection_line() {
+        let mut headers = HeaderMap::new();
+        headers.append("connection", "Upgrade".parse().unwrap());
+        headers.append("connection", "x-second".parse().unwrap());
+        headers.insert("upgrade", "websocket".parse().unwrap());
+        headers.insert("x-second", "2".parse().unwrap());
+
+        strip_hop_by_hop_for_upgrade(&mut headers);
+
+        assert!(headers.get("x-second").is_none());
+        assert_eq!(headers.get("upgrade").unwrap(), "websocket");
+        assert_eq!(headers.get_all("connection").iter().count(), 2);
+    }
+
+    /// An allowlist that names a header but not `Connection` still drops
+    /// the header when the client nominates it on any `Connection` line.
+    #[test]
+    fn allowlist_passthrough_drops_connection_nominated_headers() {
+        let mut inbound = HeaderMap::new();
+        inbound.append("connection", "keep-alive".parse().unwrap());
+        inbound.append("connection", "x-hop".parse().unwrap());
+        inbound.insert("x-hop", "1".parse().unwrap());
+        inbound.insert("x-keep", "2".parse().unwrap());
+        let allowlist = vec!["x-hop".to_string(), "x-keep".to_string()];
+
+        let mut out = apply_passthrough(&inbound, &PassthroughMode::Allowlist, &allowlist);
+        strip_inbound_nominated(&mut out, &inbound, false);
+        strip_hop_by_hop(&mut out);
+
+        assert!(out.get("x-hop").is_none(), "nominated header was forwarded");
+        assert_eq!(out.get("x-keep").unwrap(), "2");
+    }
+
+    /// On an upgrade the nominated `Upgrade` header stays.
+    #[test]
+    fn upgrade_keeps_nominated_upgrade_header() {
+        let mut inbound = HeaderMap::new();
+        inbound.insert("connection", "Upgrade, x-hop".parse().unwrap());
+        inbound.insert("upgrade", "websocket".parse().unwrap());
+        inbound.insert("x-hop", "1".parse().unwrap());
+        let allowlist = vec!["upgrade".to_string(), "x-hop".to_string()];
+
+        let mut out = apply_passthrough(&inbound, &PassthroughMode::Allowlist, &allowlist);
+        strip_inbound_nominated(&mut out, &inbound, true);
+        strip_hop_by_hop_for_upgrade(&mut out);
+
+        assert!(out.get("x-hop").is_none());
+        assert_eq!(out.get("upgrade").unwrap(), "websocket");
+    }
+
+    #[test]
+    fn forwarding_headers_stripped_unless_allowlisted() {
+        let build = || {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-forwarded-for", "10.0.0.1".parse().unwrap());
+            headers.insert("x-forwarded-host", "evil.example".parse().unwrap());
+            headers.insert("x-forwarded-proto", "http".parse().unwrap());
+            headers.insert("x-real-ip", "10.0.0.2".parse().unwrap());
+            headers.insert("forwarded", "for=10.0.0.3;host=internal".parse().unwrap());
+            headers.insert("x-forwarded", "for=10.0.0.4".parse().unwrap());
+            headers.insert("x-client-ip", "10.0.0.5".parse().unwrap());
+            headers.insert("true-client-ip", "10.0.0.6".parse().unwrap());
+            headers.insert("cf-connecting-ip", "10.0.0.7".parse().unwrap());
+            headers.insert("fastly-client-ip", "10.0.0.8".parse().unwrap());
+            headers.insert("x-original-url", "/admin".parse().unwrap());
+            headers.insert("x-rewrite-url", "/admin".parse().unwrap());
+            headers.insert("client-ip", "10.0.0.9".parse().unwrap());
+            headers.insert("x-originating-ip", "10.0.0.10".parse().unwrap());
+            headers.insert("x-remote-addr", "10.0.0.11".parse().unwrap());
+            headers.insert("x-original-host", "internal".parse().unwrap());
+            headers.insert("x-http-method-override", "DELETE".parse().unwrap());
+            headers.insert("x-remote-ip", "10.0.0.12".parse().unwrap());
+            headers.insert("x-original-forwarded-for", "10.0.0.13".parse().unwrap());
+            headers.insert("x-original-uri", "/admin".parse().unwrap());
+            headers.insert("x-host", "internal".parse().unwrap());
+            headers.insert("x-http-method", "DELETE".parse().unwrap());
+            headers.insert("x-method-override", "DELETE".parse().unwrap());
+            headers.insert("x-envoy-original-path", "/admin".parse().unwrap());
+            headers.insert("via", "1.1 internal".parse().unwrap());
+            headers.insert("x-proxyuser-ip", "10.0.0.14".parse().unwrap());
+            headers.insert("x-custom", "keep".parse().unwrap());
+            headers
+        };
+
+        let headers = apply_passthrough(&build(), &PassthroughMode::All, &[]);
+        for name in [
+            "x-forwarded-for",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+            "x-real-ip",
+            "forwarded",
+            "x-forwarded",
+            "x-client-ip",
+            "true-client-ip",
+            "cf-connecting-ip",
+            "fastly-client-ip",
+            "x-original-url",
+            "x-rewrite-url",
+            "client-ip",
+            "x-originating-ip",
+            "x-remote-addr",
+            "x-original-host",
+            "x-http-method-override",
+            "x-remote-ip",
+            "x-original-forwarded-for",
+            "x-original-uri",
+            "x-host",
+            "x-http-method",
+            "x-method-override",
+            "x-envoy-original-path",
+            "via",
+            "x-proxyuser-ip",
+        ] {
+            assert!(headers.get(name).is_none(), "{name} was forwarded");
+        }
+        assert_eq!(headers.get("x-custom").unwrap(), "keep");
+
+        let headers = apply_passthrough(
+            &build(),
+            &PassthroughMode::Allowlist,
+            &["X-Forwarded-For".to_owned(), "x-custom".to_owned()],
+        );
+        assert_eq!(headers.get("x-forwarded-for").unwrap(), "10.0.0.1");
+        assert!(headers.get("x-forwarded-host").is_none());
+        assert!(headers.get("x-real-ip").is_none());
     }
 
     #[test]

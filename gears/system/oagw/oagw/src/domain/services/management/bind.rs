@@ -1,15 +1,11 @@
-use crate::domain::error::DomainError;
+use crate::domain::error::{DeniedOn, DomainError};
 use crate::domain::model::Upstream;
 
+use super::authz::BIND_UPSTREAM_RESOURCE;
 use authz_resolver_sdk::PolicyEnforcer;
-use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
+use authz_resolver_sdk::pep::AccessRequest;
 use credstore_sdk::CredStoreClientV1;
-use oagw_sdk::UPSTREAM_SCHEMA;
 use toolkit_security::SecurityContext;
-
-/// Resource type for upstream binding permission checks.
-const UPSTREAM_RESOURCE: ResourceType =
-    ResourceType::from_static(UPSTREAM_SCHEMA, &["owner_tenant_id"]);
 
 /// Permission action names for ancestor bind checks.
 pub(in crate::domain::services) mod bind_actions {
@@ -17,6 +13,35 @@ pub(in crate::domain::services) mod bind_actions {
     pub const OVERRIDE_AUTH: &str = "override_auth";
     pub const OVERRIDE_RATE: &str = "override_rate";
     pub const ADD_PLUGINS: &str = "add_plugins";
+}
+
+/// Report an ancestor bind denial on the upstream resource, logging a
+/// policy denial with who asked for what (`From<EnforcerError>` logs only
+/// evaluation failures).
+fn on_upstream<'a>(
+    ctx: &'a SecurityContext,
+    action: &'static str,
+    ancestor: &'a Upstream,
+) -> impl FnOnce(authz_resolver_sdk::EnforcerError) -> DomainError + 'a {
+    move |e| {
+        if let authz_resolver_sdk::EnforcerError::AccessDenied(
+            authz_resolver_sdk::AccessDenial::Pdp {
+                reason: deny_reason,
+            },
+        ) = &e
+        {
+            tracing::info!(
+                subject_id = %ctx.subject_id(),
+                tenant_id = %ctx.subject_tenant_id(),
+                action,
+                ancestor_upstream_id = %ancestor.id,
+                ancestor_tenant_id = %ancestor.tenant_id,
+                policy_reason = deny_reason.as_ref().map(|r| r.error_code.as_str()),
+                "OAGW ancestor bind denied"
+            );
+        }
+        DomainError::from(e).on_entity(DeniedOn::Upstream)
+    }
 }
 
 /// Describes the override fields a descendant is attempting to set.
@@ -60,12 +85,13 @@ pub(in crate::domain::services) async fn validate_bind_constraints(
     enforcer
         .access_scope_with(
             ctx,
-            &UPSTREAM_RESOURCE,
+            &BIND_UPSTREAM_RESOURCE,
             bind_actions::BIND,
             Some(ancestor.id),
             &access_req,
         )
-        .await?;
+        .await
+        .map_err(on_upstream(ctx, bind_actions::BIND, ancestor))?;
 
     // 2. An enforced credential is applied on every request, and it may go
     //    only to endpoints its owner configured.
@@ -98,12 +124,13 @@ pub(in crate::domain::services) async fn validate_bind_constraints(
                 enforcer
                     .access_scope_with(
                         ctx,
-                        &UPSTREAM_RESOURCE,
+                        &BIND_UPSTREAM_RESOURCE,
                         bind_actions::OVERRIDE_AUTH,
                         Some(ancestor.id),
                         &access_req,
                     )
-                    .await?;
+                    .await
+                    .map_err(on_upstream(ctx, bind_actions::OVERRIDE_AUTH, ancestor))?;
             }
         }
     }
@@ -121,12 +148,13 @@ pub(in crate::domain::services) async fn validate_bind_constraints(
                 enforcer
                     .access_scope_with(
                         ctx,
-                        &UPSTREAM_RESOURCE,
+                        &BIND_UPSTREAM_RESOURCE,
                         bind_actions::OVERRIDE_RATE,
                         Some(ancestor.id),
                         &access_req,
                     )
-                    .await?;
+                    .await
+                    .map_err(on_upstream(ctx, bind_actions::OVERRIDE_RATE, ancestor))?;
             }
         }
     }
@@ -139,12 +167,13 @@ pub(in crate::domain::services) async fn validate_bind_constraints(
                 enforcer
                     .access_scope_with(
                         ctx,
-                        &UPSTREAM_RESOURCE,
+                        &BIND_UPSTREAM_RESOURCE,
                         bind_actions::ADD_PLUGINS,
                         Some(ancestor.id),
                         &access_req,
                     )
-                    .await?;
+                    .await
+                    .map_err(on_upstream(ctx, bind_actions::ADD_PLUGINS, ancestor))?;
             }
         }
     }
@@ -164,6 +193,11 @@ pub(in crate::domain::services) async fn validate_bind_constraints(
     Ok(())
 }
 
+/// Detail of a `secret_ref` that does not resolve. The ref itself is never
+/// put in logs or errors (F0008): the caller already knows which one it sent.
+const SECRET_REF_NOT_ACCESSIBLE: &str =
+    "secret_ref is not accessible to this tenant (not provisioned yet, or not shared)";
+
 /// Validate that a `secret_ref` is accessible to the requesting tenant via
 /// `cred_store`. Per `cpt-cf-oagw-principle-cred-isolation`, if the secret
 /// is not accessible, the request is rejected (fail-closed).
@@ -181,41 +215,58 @@ pub(in crate::domain::services) async fn validate_secret_ref_accessible(
         // provisioning callers can defer-and-retry instead of treating it
         // as a deterministic misconfiguration.
         Ok(None) => Err(DomainError::SecretRefNotAccessible {
-            detail: format!(
-                "secret_ref '{raw_ref}' is not accessible to this tenant \
-                 (not provisioned yet, or not shared)"
-            ),
+            detail: SECRET_REF_NOT_ACCESSIBLE.to_owned(),
             instance: String::new(),
         }),
-        Err(credstore_sdk::CredStoreError::Internal(msg)) => {
-            // Fail-closed: cred_store unavailability → reject.
-            tracing::warn!(secret_ref = raw_ref, error = %msg, "cred_store unavailable during secret_ref validation");
-            Err(DomainError::Internal {
-                message: format!("credential validation unavailable: {msg}"),
-            })
-        }
+        // Fail-closed: cred_store failure → reject.
+        Err(e @ credstore_sdk::CredStoreError::Internal(_)) => Err(credstore_outage(ctx, &e)),
         // Same state as `Ok(None)`, reported as an error by some client
         // implementations (e.g. a metadata row whose value is still being
         // provisioned): not accessible *yet*, so provisioning callers must be
         // able to defer-and-retry rather than fail fast.
         Err(e) if e.is_not_found() => Err(DomainError::SecretRefNotAccessible {
-            detail: format!(
-                "secret_ref '{raw_ref}' is not accessible to this tenant \
-                 (not provisioned yet, or not shared)"
-            ),
+            detail: SECRET_REF_NOT_ACCESSIBLE.to_owned(),
             instance: String::new(),
         }),
         // The credential store is down or absent: nothing about this request
         // is wrong, and every other secret_ref would fail the same way.
-        Err(e) if e.is_unavailable() => {
-            tracing::warn!(secret_ref = raw_ref, error = %e, "cred_store unavailable during secret_ref validation");
-            Err(DomainError::Internal {
-                message: format!("credential validation unavailable: {e}"),
-            })
-        }
+        Err(e) if e.is_unavailable() => Err(credstore_outage(ctx, &e)),
         Err(e) => Err(DomainError::validation(format!(
-            "secret_ref '{raw_ref}' validation failed: {e}"
+            "secret_ref validation failed: {}",
+            credstore_error_kind(&e)
         ))),
+    }
+}
+
+/// A credential store failure while validating a `secret_ref`: logged and
+/// answered as `Internal`.
+fn credstore_outage(ctx: &SecurityContext, e: &credstore_sdk::CredStoreError) -> DomainError {
+    let kind = credstore_error_kind(e);
+    tracing::warn!(
+        tenant_id = %ctx.subject_tenant_id(),
+        subject_id = %ctx.subject_id(),
+        error = kind,
+        "cred_store unavailable during secret_ref validation"
+    );
+    DomainError::Internal {
+        message: format!("credential validation unavailable: {kind}"),
+    }
+}
+
+/// What kind of failure `e` is. The credential store's own text is not used:
+/// it may quote the `secret_ref`, which never goes to logs or errors (F0008).
+fn credstore_error_kind(e: &credstore_sdk::CredStoreError) -> &'static str {
+    use credstore_sdk::CredStoreError as E;
+    match e {
+        E::InvalidSecretRef { .. } => "invalid secret reference",
+        E::AccessDenied => "access denied",
+        E::NotFound => "secret not found",
+        E::Conflict => "secret already exists",
+        E::NoPluginAvailable => "no plugin available",
+        E::ServiceUnavailable { .. } => "service unavailable",
+        E::UnsupportedTransition { .. } => "unsupported sharing transition",
+        E::TypeViolation { .. } => "secret type violation",
+        E::Internal(_) => "internal error",
     }
 }
 
@@ -226,7 +277,7 @@ pub(in crate::domain::services) fn parse_secret_ref(
 ) -> Result<credstore_sdk::SecretRef, DomainError> {
     let bare = raw_ref.strip_prefix("cred://").unwrap_or(raw_ref);
     credstore_sdk::SecretRef::new(bare)
-        .map_err(|e| DomainError::validation(format!("invalid secret_ref '{raw_ref}': {e}")))
+        .map_err(|e| DomainError::validation(format!("invalid secret_ref: {e}")))
 }
 
 /// Validate bind constraints against the **closest** ancestor with a matching

@@ -195,6 +195,9 @@ pub(in crate::domain::services) fn validate_match_fields(
 ) -> Result<(), DomainError> {
     if let Some(http) = &rules.http {
         validate_stored_text("match.http.path", &http.path, MAX_PATH_BYTES)?;
+        // A prefix the proxy would reject in a request path (stray `%`, `;`,
+        // encoded dot-segment, non-UTF-8 escape) could never match.
+        crate::domain::proxy_path::validate_route_prefix(&http.path)?;
         if http.query_allowlist.len() > MAX_QUERY_PARAMS {
             return Err(DomainError::validation(format!(
                 "match.http.query_allowlist allows at most {MAX_QUERY_PARAMS} parameters, got {}",

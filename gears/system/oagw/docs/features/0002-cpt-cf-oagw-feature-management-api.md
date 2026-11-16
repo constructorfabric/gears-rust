@@ -80,7 +80,7 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
 
 ## 2. Actor Flows (CDSL)
 
-> **Authorization note**: the management API authenticates every request and scopes it to the caller's tenant, but does not evaluate the GTS permissions named in the steps below (`gts.cf.core.oagw.upstream.v1~:…`, `gts.cf.core.oagw.route.v1~:…`); no Control Plane operation calls `PolicyEnforcer` for them. Only binding to an ancestor's upstream is authorized. Within a tenant, any authenticated subject can therefore create, update, read and delete upstreams and routes. The permission steps stay unchecked until this is implemented.
+> **Authorization note**: every upstream and route operation of the Management API and the SDK asks the policy engine for the GTS permission named in its steps (`create`, `override`, `read` or `delete` on `gts.cf.core.oagw.upstream.v1~` or `gts.cf.core.oagw.route.v1~`, with the caller's tenant as owner) before it reads or writes, and a denial returns 403 `permission_denied` on the upstream or route resource. An update needs only `override`. The SDK's `resolve_proxy_target`, which returns the resolved upstream and route configuration merged across the tenant hierarchy, needs `read` on upstreams in the caller's tenant (checked first), on the upstreams of every tenant in its chain, and on the returned route; the proxy's own resolution needs a `proxy:invoke` grant instead. A grant the policy engine constrains to less than the caller's tenant is refused, since the repositories filter by tenant only. The registry reconcile writes as the gear itself and asks the policy engine only for ancestor binds (`cpt-cf-oagw-adr-optional-persistence`). A write that changes or removes a rate limit, on any path, drops the rate-limit buckets it made stale.
 
 > **Storage note**: `Repo:` steps run against the repositories selected at startup by `cpt-cf-oagw-algo-domain-storage-selection` — in-memory without a database, the `cpt-cf-oagw-adr-storage-schema` tables with one (`cpt-cf-oagw-adr-optional-persistence`). With a database, each `Repo:` create and update runs in one transaction that covers the parent row and its child rows (tags, match keys, methods, plugin bindings), and a failure rolls the whole write back; each delete is one statement. Get and list read the parent and child rows in one read-only snapshot transaction.
 
@@ -105,7 +105,7 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
 **Steps**:
 1. [x] - `p1` - Actor sends POST /api/oagw/v1/upstreams with server endpoints, protocol, auth config, headers, rate limit config, tags - `inst-create-us-1`
 2. [x] - `p1` - API: Extract SecurityContext (tenant_id, principal_id, permissions) - `inst-create-us-2`
-3. [ ] - `p1` - API: Validate actor has `gts.cf.core.oagw.upstream.v1~:create` permission - `inst-create-us-3`
+3. [x] - `p1` - API: Validate actor has `gts.cf.core.oagw.upstream.v1~:create` permission - `inst-create-us-3`
 4. [x] - `p1` - API: Deserialize and validate DTO structure - `inst-create-us-4`
 5. [x] - `p1` - Domain: Execute upstream validation algorithm (`cpt-cf-oagw-algo-mgmt-validate-upstream`) - `inst-create-us-5`
 6. [x] - `p1` - **IF** validation fails - `inst-create-us-6`
@@ -137,7 +137,7 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
 
 **Steps**:
 1. [x] - `p1` - Actor sends PUT /api/oagw/v1/upstreams/{id} with updated configuration - `inst-update-us-1`
-2. [ ] - `p1` - API: Extract SecurityContext and validate `gts.cf.core.oagw.upstream.v1~:override` permission - `inst-update-us-2`
+2. [x] - `p1` - API: Extract SecurityContext and validate `gts.cf.core.oagw.upstream.v1~:override` permission - `inst-update-us-2`
 3. [x] - `p1` - API: Parse GTS anonymous identifier from path to extract UUID - `inst-update-us-3`
 4. [x] - `p1` - Repo: SELECT upstream WHERE id = :uuid AND tenant_id = :tenant_id - `inst-update-us-4`
 5. [x] - `p1` - **IF** upstream not found - `inst-update-us-5`
@@ -170,7 +170,7 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
 
 **Steps**:
 1. [x] - `p1` - Actor sends DELETE /api/oagw/v1/upstreams/{id} - `inst-delete-us-1`
-2. [ ] - `p1` - API: Extract SecurityContext and validate `gts.cf.core.oagw.upstream.v1~:delete` permission - `inst-delete-us-2`
+2. [x] - `p1` - API: Extract SecurityContext and validate `gts.cf.core.oagw.upstream.v1~:delete` permission - `inst-delete-us-2`
 3. [x] - `p1` - API: Parse GTS anonymous identifier from path to extract UUID - `inst-delete-us-3`
 4. [x] - `p1` - Repo: SELECT upstream WHERE id = :uuid AND tenant_id = :tenant_id, to check its owner - `inst-delete-us-4`
 5. [x] - `p1` - **IF** the upstream is registry-managed (`managed_by = registry`) - `inst-delete-us-4a`
@@ -197,7 +197,7 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
 
 **Steps**:
 1. [x] - `p1` - Actor sends GET /api/oagw/v1/upstreams[?$filter=...&$select=...&$orderby=...&$top=...&$skip=...] or GET /api/oagw/v1/upstreams/{id} - `inst-list-us-1`
-2. [ ] - `p1` - API: Extract SecurityContext and validate `gts.cf.core.oagw.upstream.v1~:read` permission - `inst-list-us-2`
+2. [x] - `p1` - API: Extract SecurityContext and validate `gts.cf.core.oagw.upstream.v1~:read` permission - `inst-list-us-2`
 3. [x] - `p1` - **IF** list request - `inst-list-us-3`
    1. [ ] - `p1` - API: Parse OData query parameters ($filter, $select, $orderby, $top with default 50 / max 100, $skip) - `inst-list-us-3a`
    2. [ ] - `p1` - **IF** OData parse error - `inst-list-us-3b`
@@ -227,7 +227,7 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
 
 **Steps**:
 1. [x] - `p1` - Actor sends POST /api/oagw/v1/routes with upstream_id, match rules (type, path, methods, query allowlist), priority, enabled, rate limit, cors, plugins, tags - `inst-create-rt-1`
-2. [ ] - `p1` - API: Extract SecurityContext and validate `gts.cf.core.oagw.route.v1~:create` permission - `inst-create-rt-2`
+2. [x] - `p1` - API: Extract SecurityContext and validate `gts.cf.core.oagw.route.v1~:create` permission - `inst-create-rt-2`
 3. [x] - `p1` - API: Deserialize and validate DTO structure - `inst-create-rt-3`
 4. [x] - `p1` - Domain: Execute route validation algorithm (`cpt-cf-oagw-algo-mgmt-validate-route`) - `inst-create-rt-4`
 5. [x] - `p1` - **IF** validation fails - `inst-create-rt-5`
@@ -255,7 +255,7 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
 
 **Steps**:
 1. [x] - `p1` - **IF** PUT /api/oagw/v1/routes/{id} - `inst-route-crud-1`
-   1. [ ] - `p1` - API: Extract SecurityContext and validate `gts.cf.core.oagw.route.v1~:override` permission - `inst-route-crud-1a`
+   1. [x] - `p1` - API: Extract SecurityContext and validate `gts.cf.core.oagw.route.v1~:override` permission - `inst-route-crud-1a`
    2. [x] - `p1` - Repo: SELECT route WHERE id = :uuid AND tenant_id = :tenant_id - `inst-route-crud-1b`
    3. [x] - `p1` - **IF** not found, **RETURN** 404 Not Found - `inst-route-crud-1c`
    4. [x] - `p1` - **IF** the route is registry-managed (`managed_by = registry`), **RETURN** 400 `failed_precondition` (`REGISTRY_MANAGED`) - `inst-route-crud-1g`
@@ -263,13 +263,13 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
    6. [x] - `p1` - Repo: UPDATE route row (all fields except `managed_by`; the Management API passes the stored `upstream_id`, so a route never moves through the API: only the registry reconcile moves a registry route to another upstream, ADR-0018) WHERE id = :uuid AND tenant_id = :tenant_id; replace match, method, tag, and plugin binding rows (one transaction) - `inst-route-crud-1e`
    7. [x] - `p1` - **RETURN** 200 OK with updated route - `inst-route-crud-1f`
 2. [x] - `p1` - **IF** DELETE /api/oagw/v1/routes/{id} - `inst-route-crud-2`
-   1. [ ] - `p1` - API: Validate `gts.cf.core.oagw.route.v1~:delete` permission - `inst-route-crud-2a`
+   1. [x] - `p1` - API: Validate `gts.cf.core.oagw.route.v1~:delete` permission - `inst-route-crud-2a`
    2. [x] - `p1` - Repo: SELECT route WHERE id = :uuid AND tenant_id = :tenant_id; **IF** not found, **RETURN** 404 Not Found; **IF** registry-managed, **RETURN** 400 `failed_precondition` (`REGISTRY_MANAGED`) - `inst-route-crud-2b`
    3. [x] - `p1` - Repo: DELETE route WHERE id = :uuid AND tenant_id = :tenant_id (database: cascades to match, method, tag, and plugin binding rows) - `inst-route-crud-2d`
    4. [x] - `p1` - **IF** no route was deleted, **RETURN** 404 Not Found - `inst-route-crud-2c`
    5. [x] - `p1` - **RETURN** 204 No Content - `inst-route-crud-2e`
 3. [x] - `p1` - **IF** GET /api/oagw/v1/routes or GET /api/oagw/v1/routes/{id} - `inst-route-crud-3`
-   1. [ ] - `p1` - API: Validate `gts.cf.core.oagw.route.v1~:read` permission - `inst-route-crud-3a`
+   1. [x] - `p1` - API: Validate `gts.cf.core.oagw.route.v1~:read` permission - `inst-route-crud-3a`
    2. [x] - `p1` - **IF** list: Parse query params; Repo: SELECT with tenant scope, optional upstream filter, and pagination; **RETURN** 200 paginated list - `inst-route-crud-3b`
    3. [x] - `p1` - **IF** get-by-ID: Parse GTS identifier; Repo: SELECT by id+tenant; **RETURN** 200 or 404 - `inst-route-crud-3c`
 
@@ -524,7 +524,7 @@ The system **MUST** return all management API errors in RFC 9457 Problem Details
 - [ ] OData $filter, $select, $orderby, $top (default 50, max 100), $skip supported on list endpoints; invalid syntax returns 400
 - [ ] Enable/disable: disabled upstream causes proxy requests to be rejected (503); disabled route excluded from matching; ancestor-disabled upstream cannot be re-enabled by descendant
 - [x] All error responses use RFC 9457 Problem Details with GTS type identifiers
-- [ ] All operations require appropriate GTS permissions and return 403 on unauthorized access (not implemented: see the authorization note in [Actor Flows](#2-actor-flows-cdsl))
+- [x] All operations require appropriate GTS permissions and return 403 on unauthorized access
 - [x] Path parameters accept GTS anonymous identifiers (`gts.cf.core.oagw.{type}.v1~{uuid}`)
 - [x] DTOs annotated with serde (serialization) and utoipa (OpenAPI schema generation)
 

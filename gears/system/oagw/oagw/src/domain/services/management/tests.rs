@@ -394,7 +394,13 @@ async fn resolve_proxy_target_without_a_matching_route_is_route_not_found() {
 
     for (method, path) in [("GET", "/v1/chat/completions"), ("POST", "/v2/other")] {
         let err = svc
-            .resolve_proxy_target(&ctx, "openai", method, path, Tags::Load)
+            .resolve_proxy_target(
+                &crate::domain::services::ProxyGrant::for_tests(ctx.clone()),
+                "openai",
+                method,
+                path,
+                Tags::Load,
+            )
             .await
             .unwrap_err();
         assert!(
@@ -1995,6 +2001,8 @@ async fn bind_rejects_inaccessible_secret_ref() {
                 detail.contains("not accessible"),
                 "expected 'not accessible' error, got: {detail}"
             );
+            // The ref is a credential name: keep it out of errors (F0008).
+            assert!(!detail.contains("missing-key"), "{detail}");
         }
         _ => panic!("expected SecretRefNotAccessible error, got: {err:?}"),
     }
@@ -2045,15 +2053,23 @@ async fn bind_maps_not_found_error_to_secret_ref_not_accessible() {
 /// `Internal` (500), so the registry reconcile treats it as fatal instead of
 /// skipping every upstream with a `secret_ref`. Any other credential-store
 /// refusal stays a validation error (400).
+///
+/// No path writes the `secret_ref` to a log or an error (F0008), also when
+/// the credential store's error quotes it.
 #[tokio::test]
+#[tracing_test::traced_test]
 async fn secret_ref_check_maps_a_credstore_outage_to_internal() {
     use credstore_sdk::CredStoreError;
     type MakeError = fn() -> CredStoreError;
 
-    let cases: [(MakeError, bool); 4] = [
+    let cases: [(MakeError, bool); 5] = [
+        (
+            || CredStoreError::Internal("store failed reading my-key".into()),
+            true,
+        ),
         (
             || CredStoreError::ServiceUnavailable {
-                detail: "down".into(),
+                detail: "my-key: backend down".into(),
                 retry_after: None,
             },
             true,
@@ -2062,7 +2078,7 @@ async fn secret_ref_check_maps_a_credstore_outage_to_internal() {
         (|| CredStoreError::AccessDenied, false),
         (
             || CredStoreError::InvalidSecretRef {
-                reason: "bad".into(),
+                reason: "my-key is malformed".into(),
             },
             false,
         ),
@@ -2088,7 +2104,15 @@ async fn secret_ref_check_maps_a_credstore_outage_to_internal() {
         } else {
             assert!(matches!(err, DomainError::Validation { .. }), "{err:?}");
         }
+        let text = match &err {
+            DomainError::Internal { message } => message,
+            DomainError::Validation { detail, .. } => detail,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert!(!text.contains("my-key"), "{text}");
     }
+    assert!(logs_contain("cred_store unavailable"));
+    assert!(!logs_contain("my-key"));
 }
 
 /// A malformed `secret_ref` is a pure check: rejected before the credential
@@ -2113,7 +2137,8 @@ async fn malformed_secret_ref_is_rejected_before_the_credstore_is_asked() {
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, DomainError::Validation { detail, .. } if detail.contains("invalid secret_ref")),
+        matches!(&err, DomainError::Validation { detail, .. }
+            if detail.contains("invalid secret_ref") && !detail.contains("has spaces")),
         "{err:?}"
     );
 }
@@ -2471,7 +2496,13 @@ async fn proxy_target_resolves_route_from_ancestor_upstream() {
     // Child resolves proxy target — should find the route defined on
     // the root's upstream ID, not the child's.
     let (effective, route) = svc
-        .resolve_proxy_target(&child_ctx, "api.openai.com", "POST", "/v1/chat", Tags::Load)
+        .resolve_proxy_target(
+            &crate::domain::services::ProxyGrant::for_tests(child_ctx.clone()),
+            "api.openai.com",
+            "POST",
+            "/v1/chat",
+            Tags::Load,
+        )
         .await
         .unwrap();
 
@@ -2551,7 +2582,13 @@ async fn proxy_target_prefers_child_route_over_ancestor() {
 
     // Child resolves — should prefer its own route (child upstream ID checked first).
     let (_effective, route) = svc
-        .resolve_proxy_target(&child_ctx, "api.openai.com", "POST", "/v1/chat", Tags::Load)
+        .resolve_proxy_target(
+            &crate::domain::services::ProxyGrant::for_tests(child_ctx.clone()),
+            "api.openai.com",
+            "POST",
+            "/v1/chat",
+            Tags::Load,
+        )
         .await
         .unwrap();
 
@@ -5342,7 +5379,7 @@ async fn proxy_resolution_storage_failure_is_internal() {
     );
     assert_internal(
         svc.resolve_proxy_target(
-            &ctx,
+            &crate::domain::services::ProxyGrant::for_tests(ctx.clone()),
             "api.openai.com",
             "POST",
             "/v1/chat/completions",
@@ -5361,7 +5398,7 @@ async fn proxy_resolution_storage_failure_is_internal() {
     let svc = make_service_over(upstreams, Arc::new(UnavailableStorage));
     assert_internal(
         svc.resolve_proxy_target(
-            &ctx,
+            &crate::domain::services::ProxyGrant::for_tests(ctx.clone()),
             "api.openai.com",
             "POST",
             "/v1/chat/completions",
@@ -5927,7 +5964,13 @@ async fn resolution_rejects_an_upstream_whose_hostname_was_denied_later() {
         .unwrap();
     let target = (&upstream.alias, "POST", "/v1/chat/completions");
     before
-        .resolve_proxy_target(&ctx, target.0, target.1, target.2, Tags::Load)
+        .resolve_proxy_target(
+            &crate::domain::services::ProxyGrant::for_tests(ctx.clone()),
+            target.0,
+            target.1,
+            target.2,
+            Tags::Load,
+        )
         .await
         .expect("resolves before the policy changes");
 
@@ -5939,7 +5982,13 @@ async fn resolution_rejects_an_upstream_whose_hostname_was_denied_later() {
         .unwrap(),
     );
     let err = after
-        .resolve_proxy_target(&ctx, target.0, target.1, target.2, Tags::Load)
+        .resolve_proxy_target(
+            &crate::domain::services::ProxyGrant::for_tests(ctx.clone()),
+            target.0,
+            target.1,
+            target.2,
+            Tags::Load,
+        )
         .await
         .unwrap_err();
     assert!(
@@ -6510,7 +6559,7 @@ async fn resolution_with_tags_bypasses_the_cache() {
     for _ in 0..2 {
         let (upstream, route) = cached
             .resolve_proxy_target(
-                &ctx,
+                &crate::domain::services::ProxyGrant::for_tests(ctx.clone()),
                 "api.openai.com",
                 "POST",
                 "/v1/chat/completions",
@@ -6952,7 +7001,13 @@ async fn a_cached_upstream_whose_host_is_denied_later_is_rejected() {
         .unwrap();
     let target = (&upstream.alias, "POST", "/v1/chat/completions");
     before
-        .resolve_proxy_target(&ctx, target.0, target.1, target.2, Tags::Skip)
+        .resolve_proxy_target(
+            &crate::domain::services::ProxyGrant::for_tests(ctx.clone()),
+            target.0,
+            target.1,
+            target.2,
+            Tags::Skip,
+        )
         .await
         .expect("resolves before the policy changes");
 
@@ -6962,7 +7017,13 @@ async fn a_cached_upstream_whose_host_is_denied_later_is_rejected() {
     });
     let cached = selects();
     let err = after
-        .resolve_proxy_target(&ctx, target.0, target.1, target.2, Tags::Skip)
+        .resolve_proxy_target(
+            &crate::domain::services::ProxyGrant::for_tests(ctx.clone()),
+            target.0,
+            target.1,
+            target.2,
+            Tags::Skip,
+        )
         .await
         .unwrap_err();
     assert!(
@@ -6971,6 +7032,62 @@ async fn a_cached_upstream_whose_host_is_denied_later_is_rejected() {
         "{err:?}"
     );
     assert_eq!(selects(), cached, "the upstream came from the cache");
+}
+
+/// An encoded separator that selects another route is a 400 on both read
+/// paths: through the proxy cache (`Tags::Skip`) and the repositories.
+#[tokio::test]
+async fn an_encoded_separator_bypass_is_refused_through_the_cache_too() {
+    use crate::infra::proxy_cache::{CachedProxyConfigReader, ProxyConfigCache};
+
+    let stores = Stores::new(Backend::Memory);
+    let reader: Arc<dyn ProxyConfigReader> = Arc::new(CachedProxyConfigReader::new(
+        Arc::new(ProxyConfigCache::new(
+            std::time::Duration::from_secs(60),
+            std::time::Duration::ZERO,
+            100,
+            Arc::new(crate::domain::ports::NoopMetrics),
+        )),
+        stores.upstreams.clone(),
+        stores.routes.clone(),
+    ));
+    let svc = ControlPlaneServiceImpl::new(
+        stores.upstreams.clone(),
+        stores.routes.clone(),
+        Arc::new(MockTenantResolverClient::single_tenant()),
+        allow_all_enforcer(),
+        Arc::new(MockCredStoreClient::empty()),
+        Arc::new(SsrfGuard::disabled()),
+        Some(reader),
+    );
+    let ctx = test_ctx(Uuid::new_v4());
+    let upstream = svc
+        .create_upstream(&ctx, make_create_upstream_hostname())
+        .await
+        .unwrap();
+    let mut narrow_id = None;
+    for path in ["/v1", "/v1/models"] {
+        let mut req = make_create_route(upstream.id);
+        req.match_rules.http.as_mut().unwrap().path = path.into();
+        narrow_id = Some(svc.create_route(&ctx, req).await.unwrap().id);
+    }
+    let grant = crate::domain::services::ProxyGrant::for_tests(ctx.clone());
+    for tags in [Tags::Skip, Tags::Load] {
+        let err = svc
+            .resolve_proxy_target(&grant, &upstream.alias, "POST", "/v1%2Fmodels", tags)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, DomainError::Validation { reason, instance, .. }
+                if *reason == oagw_sdk::field::INVALID_PROXY_PATH && instance == "/v1%2Fmodels"),
+            "{tags:?}: {err:?}"
+        );
+        let (_, route) = svc
+            .resolve_proxy_target(&grant, &upstream.alias, "POST", "/v1/models", tags)
+            .await
+            .unwrap();
+        assert_eq!(Some(route.id), narrow_id, "{tags:?}");
+    }
 }
 
 fn ep(scheme: Scheme, host: &str) -> Endpoint {
@@ -7305,14 +7422,26 @@ async fn withheld_credentials_are_counted_and_warned_once() {
     let (method, path) = ("POST", "/v1/chat/completions");
     for _ in 0..2 {
         let (effective, _) = svc
-            .resolve_proxy_target(&test_ctx(child), "svc", method, path, Tags::Skip)
+            .resolve_proxy_target(
+                &crate::domain::services::ProxyGrant::for_tests(test_ctx(child)),
+                "svc",
+                method,
+                path,
+                Tags::Skip,
+            )
             .await
             .unwrap();
         assert!(effective.auth.is_none());
     }
-    svc.resolve_proxy_target(&test_ctx(child), "svc", method, path, Tags::Load)
-        .await
-        .unwrap();
+    svc.resolve_proxy_target(
+        &crate::domain::services::ProxyGrant::for_tests(test_ctx(child)),
+        "svc",
+        method,
+        path,
+        Tags::Load,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         *metrics.withheld.lock().unwrap(),
@@ -7405,6 +7534,1146 @@ async fn a_disabled_ancestors_enforced_auth_does_not_pin_bindings() {
     svc.create_upstream(&test_ctx(leaf), at("10.0.0.2"))
         .await
         .unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Management permissions (#4972)
+// ---------------------------------------------------------------------------
+
+mod management_permissions {
+    use super::*;
+    use crate::domain::error::DeniedOn;
+    use crate::domain::test_support::{CapturingAuthZResolverClient, DenyingAuthZResolverClient};
+    use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
+    use oagw_sdk::{ROUTE_SCHEMA, UPSTREAM_SCHEMA};
+
+    /// Two services over the same rows: one allowed, one with `authz`.
+    fn services(
+        authz: Arc<dyn AuthZResolverApi>,
+    ) -> (ControlPlaneServiceImpl, ControlPlaneServiceImpl) {
+        let (allowed, other, _) = services_with_rows(authz);
+        (allowed, other)
+    }
+
+    /// [`services`], with the registry rows of the same store.
+    fn services_with_rows(
+        authz: Arc<dyn AuthZResolverApi>,
+    ) -> (
+        ControlPlaneServiceImpl,
+        ControlPlaneServiceImpl,
+        Arc<dyn crate::domain::repo::RegistryRowRepository>,
+    ) {
+        let stores = Stores::new(Backend::Memory);
+        let build = |enforcer| {
+            ControlPlaneServiceImpl::new(
+                stores.upstreams.clone(),
+                stores.routes.clone(),
+                Arc::new(MockTenantResolverClient::single_tenant()),
+                enforcer,
+                Arc::new(MockCredStoreClient::empty()),
+                Arc::new(SsrfGuard::disabled()),
+                None,
+            )
+        };
+        (
+            build(allow_all_enforcer()),
+            build(PolicyEnforcer::new(authz)),
+            stores.rows.clone(),
+        )
+    }
+
+    /// Answers by action: `denied` actions are refused, every other one is
+    /// granted under `constraints`.
+    struct ScriptedAuthZ {
+        denied: Vec<&'static str>,
+        constraints: Vec<authz_resolver_sdk::Constraint>,
+    }
+
+    #[async_trait::async_trait]
+    impl AuthZResolverApi for ScriptedAuthZ {
+        async fn evaluate(
+            &self,
+            _ctx: toolkit_security::PlatformSecurityContext,
+            request: authz_resolver_sdk::EvaluationRequest,
+        ) -> Result<authz_resolver_sdk::EvaluationResponse, toolkit_canonical_errors::CanonicalError>
+        {
+            let decision = !self.denied.contains(&request.action.name.as_str());
+            Ok(authz_resolver_sdk::EvaluationResponse {
+                decision,
+                context: authz_resolver_sdk::EvaluationResponseContext {
+                    constraints: if decision {
+                        self.constraints.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    deny_reason: None,
+                },
+            })
+        }
+    }
+
+    fn checks(client: &CapturingAuthZResolverClient) -> Vec<(String, String, Option<Uuid>)> {
+        client
+            .recorded()
+            .into_iter()
+            .map(|r| (r.action.name, r.resource.resource_type, r.resource.id))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn each_management_call_asks_for_its_permission() {
+        let capturing = Arc::new(CapturingAuthZResolverClient::new());
+        let (_, svc) = services(capturing.clone());
+        let ctx = test_ctx(Uuid::new_v4());
+
+        let up = svc
+            .create_upstream(&ctx, make_create_upstream_hostname())
+            .await
+            .unwrap();
+        svc.get_upstream(&ctx, up.id).await.unwrap();
+        svc.list_upstreams(&ctx, &ListQuery::default())
+            .await
+            .unwrap();
+        svc.update_upstream(&ctx, up.id, make_update_from_upstream(&up))
+            .await
+            .unwrap();
+        let route = svc
+            .create_route(&ctx, make_create_route(up.id))
+            .await
+            .unwrap();
+        svc.get_route(&ctx, route.id).await.unwrap();
+        svc.list_routes(&ctx, None, &ListQuery::default())
+            .await
+            .unwrap();
+        svc.update_route(&ctx, route.id, make_update_from_route(&route))
+            .await
+            .unwrap();
+        svc.delete_route(&ctx, route.id).await.unwrap();
+        svc.delete_upstream(&ctx, up.id).await.unwrap();
+
+        let u = || UPSTREAM_SCHEMA.to_owned();
+        let r = || ROUTE_SCHEMA.to_owned();
+        assert_eq!(
+            checks(&capturing),
+            vec![
+                ("create".into(), u(), None),
+                ("read".into(), u(), Some(up.id)),
+                ("read".into(), u(), None),
+                ("override".into(), u(), Some(up.id)),
+                ("create".into(), r(), None),
+                ("read".into(), r(), Some(route.id)),
+                ("read".into(), r(), None),
+                ("override".into(), r(), Some(route.id)),
+                ("delete".into(), r(), Some(route.id)),
+                ("delete".into(), u(), Some(up.id)),
+            ]
+        );
+        // The caller's tenant is the owner and the context tenant, alone
+        // (no subtree expansion).
+        for request in capturing.recorded() {
+            assert_eq!(
+                request
+                    .context
+                    .tenant_context
+                    .as_ref()
+                    .map(|t| t.mode.clone()),
+                Some(authz_resolver_sdk::TenantMode::RootOnly),
+            );
+            assert_eq!(
+                request.resource.properties.get("owner_tenant_id"),
+                Some(&serde_json::json!(ctx.subject_tenant_id())),
+            );
+            assert!(!request.context.require_constraints);
+            assert_eq!(
+                request
+                    .context
+                    .tenant_context
+                    .as_ref()
+                    .and_then(|t| t.root_id),
+                Some(ctx.subject_tenant_id()),
+            );
+        }
+    }
+
+    fn assert_forbidden_on(result: Result<impl std::fmt::Debug, DomainError>, expected: DeniedOn) {
+        match result {
+            Err(DomainError::Forbidden { entity, .. }) => assert_eq!(entity, expected),
+            other => panic!("expected Forbidden on {expected:?}, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn denied_management_calls_are_forbidden_and_change_nothing() {
+        let (allowed, denied) = services(Arc::new(DenyingAuthZResolverClient));
+        let ctx = test_ctx(Uuid::new_v4());
+        let up = allowed
+            .create_upstream(&ctx, make_create_upstream_hostname())
+            .await
+            .unwrap();
+        let route = allowed
+            .create_route(&ctx, make_create_route(up.id))
+            .await
+            .unwrap();
+
+        assert_forbidden_on(
+            denied
+                .create_upstream(&ctx, make_create_upstream_ip("other"))
+                .await,
+            DeniedOn::Upstream,
+        );
+        assert_forbidden_on(denied.get_upstream(&ctx, up.id).await, DeniedOn::Upstream);
+        assert_forbidden_on(
+            denied.list_upstreams(&ctx, &ListQuery::default()).await,
+            DeniedOn::Upstream,
+        );
+        let mut disable = make_update_from_upstream(&up);
+        disable.enabled = false;
+        assert_forbidden_on(
+            denied.update_upstream(&ctx, up.id, disable).await,
+            DeniedOn::Upstream,
+        );
+        assert_forbidden_on(
+            denied.delete_upstream(&ctx, up.id).await,
+            DeniedOn::Upstream,
+        );
+
+        let mut other_route = make_create_route(up.id);
+        if let Some(http) = other_route.match_rules.http.as_mut() {
+            http.path = "/v2".into();
+        }
+        assert_forbidden_on(
+            denied.create_route(&ctx, other_route).await,
+            DeniedOn::Route,
+        );
+        assert_forbidden_on(denied.get_route(&ctx, route.id).await, DeniedOn::Route);
+        assert_forbidden_on(
+            denied.list_routes(&ctx, None, &ListQuery::default()).await,
+            DeniedOn::Route,
+        );
+        let mut disable = make_update_from_route(&route);
+        disable.enabled = false;
+        assert_forbidden_on(
+            denied.update_route(&ctx, route.id, disable).await,
+            DeniedOn::Route,
+        );
+        assert_forbidden_on(denied.delete_route(&ctx, route.id).await, DeniedOn::Route);
+
+        assert_eq!(
+            allowed
+                .list_upstreams(&ctx, &ListQuery::default())
+                .await
+                .unwrap(),
+            vec![up.clone()]
+        );
+        assert_eq!(
+            allowed
+                .list_routes(&ctx, None, &ListQuery::default())
+                .await
+                .unwrap(),
+            vec![route]
+        );
+        // Each denial is logged with the action and resource type.
+        assert!(logs_contain("OAGW management call denied"));
+        assert!(logs_contain(oagw_sdk::UPSTREAM_SCHEMA));
+        assert!(logs_contain(oagw_sdk::ROUTE_SCHEMA));
+        assert!(logs_contain("override"));
+    }
+
+    /// Registry writes drop the buckets they make stale too: a changed
+    /// limit on update, and an upstream deleted as unused.
+    #[tokio::test]
+    async fn registry_writes_drop_the_buckets_they_make_stale() {
+        use crate::domain::model::{
+            RateLimitAlgorithm, RateLimitConfig, RateLimitScope, RateLimitStrategy, SharingMode,
+            SustainedRate, Window,
+        };
+        use crate::domain::rate_limit::RateLimiter;
+        use crate::domain::repo::DeleteOutcome;
+        use crate::domain::services::RegistryProvisioner;
+        let limit = |rate| RateLimitConfig {
+            sharing: SharingMode::Private,
+            algorithm: RateLimitAlgorithm::TokenBucket,
+            sustained: SustainedRate {
+                rate,
+                window: Window::Minute,
+            },
+            burst: None,
+            scope: RateLimitScope::Tenant,
+            strategy: RateLimitStrategy::Reject,
+            cost: 1,
+            budget: None,
+            response_headers: true,
+            pool_owner_id: None,
+        };
+        let limiter = Arc::new(RateLimiter::new());
+        let (_, svc, rows) = services_with_rows(Arc::new(CapturingAuthZResolverClient::new()));
+        let provisioner =
+            RegistryProvisionerImpl::new(Arc::new(svc.with_rate_limiter(limiter.clone())), rows);
+        let ctx = test_ctx(Uuid::new_v4());
+        let mut create = make_create_upstream_hostname();
+        create.rate_limit = Some(limit(10));
+        let up = provisioner
+            .create_registry_upstream(&ctx, create)
+            .await
+            .unwrap();
+        let mut route_req = make_create_route(up.id);
+        route_req.rate_limit = Some(limit(5));
+        let route = provisioner
+            .create_registry_route(&ctx, route_req, UpstreamCheck::Read)
+            .await
+            .unwrap();
+        let consume = |key: String, rate| limiter.try_consume(&key, &limit(rate), "/").unwrap();
+        consume(format!("oagw:ratelimit:upstream:{}:t", up.id), 10);
+        consume(format!("oagw:ratelimit:route:{}:t", route.id), 5);
+
+        let mut update = make_update_from_route(&route);
+        update.rate_limit = Some(limit(6));
+        provisioner
+            .update_registry_route(&ctx, route.id, up.id, update, UpstreamCheck::Read)
+            .await
+            .unwrap();
+        assert_eq!(limiter.bucket_count(), 1);
+        let mut update = make_update_from_upstream(&up);
+        update.rate_limit = Some(limit(11));
+        provisioner
+            .update_registry_upstream(&ctx, up.id, update)
+            .await
+            .unwrap();
+        assert_eq!(limiter.bucket_count(), 0);
+
+        consume(format!("oagw:ratelimit:upstream:{}:t", up.id), 11);
+        // Still in use: nothing is deleted and the bucket stays.
+        assert_eq!(
+            provisioner
+                .delete_registry_upstream_if_unused(&ctx, up.id)
+                .await
+                .unwrap(),
+            DeleteOutcome::InUse
+        );
+        assert_eq!(limiter.bucket_count(), 1);
+        provisioner
+            .delete_registry_route(&ctx, route.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            provisioner
+                .delete_registry_upstream_if_unused(&ctx, up.id)
+                .await
+                .unwrap(),
+            DeleteOutcome::Deleted
+        );
+        assert_eq!(limiter.bucket_count(), 0);
+    }
+
+    /// Subquery grants (tenant subtree, group membership) need a database to
+    /// decide; the management check does not take them as a tenant grant.
+    #[tokio::test]
+    async fn subquery_grants_fail_closed() {
+        use authz_resolver_sdk::{Constraint, InTenantSubtreePredicate, Predicate};
+        let tenant = Uuid::new_v4();
+        let ctx = test_ctx(tenant);
+        let (_, svc) = services(Arc::new(ScriptedAuthZ {
+            denied: Vec::new(),
+            constraints: vec![Constraint {
+                predicates: vec![Predicate::InTenantSubtree(InTenantSubtreePredicate::new(
+                    "owner_tenant_id",
+                    tenant,
+                ))],
+            }],
+        }));
+        // Without a declared capability the enforcer cannot compile the
+        // subquery: the call fails closed.
+        assert!(matches!(
+            svc.list_upstreams(&ctx, &ListQuery::default()).await,
+            Err(DomainError::Internal { .. })
+        ));
+    }
+
+    /// An ancestor bind refused by the policy is a 403 on the upstream, on
+    /// the API and the registry path alike.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn refused_ancestor_bind_is_forbidden_on_the_upstream() {
+        use crate::domain::model::{AuthConfig, SharingMode};
+        let (root, child) = (Uuid::new_v4(), Uuid::new_v4());
+        let stores = Stores::new(Backend::Memory);
+        let build = |enforcer| {
+            ControlPlaneServiceImpl::new(
+                stores.upstreams.clone(),
+                stores.routes.clone(),
+                Arc::new(MockTenantResolverClient::with_hierarchy(vec![
+                    TenantId(root),
+                    TenantId(child),
+                ])),
+                enforcer,
+                Arc::new(MockCredStoreClient::empty()),
+                Arc::new(SsrfGuard::disabled()),
+                None,
+            )
+        };
+        let allowed = build(allow_all_enforcer());
+        let mut shared = make_create_upstream_hostname();
+        shared.auth = Some(AuthConfig {
+            plugin_type: "noop".into(),
+            sharing: SharingMode::Inherit,
+            config: None,
+        });
+        allowed
+            .create_upstream(&test_ctx(root), shared)
+            .await
+            .unwrap();
+
+        let no_bind = build(PolicyEnforcer::new(Arc::new(ScriptedAuthZ {
+            denied: vec!["bind"],
+            constraints: Vec::new(),
+        })));
+        assert_forbidden_on(
+            no_bind
+                .create_upstream(&test_ctx(child), make_create_upstream_hostname())
+                .await,
+            DeniedOn::Upstream,
+        );
+        assert_forbidden_on(
+            no_bind
+                .create_upstream_as(
+                    &test_ctx(child),
+                    make_create_upstream_hostname(),
+                    ManagedBy::Registry,
+                )
+                .await,
+            DeniedOn::Upstream,
+        );
+        assert!(logs_contain("OAGW ancestor bind denied"));
+        assert!(logs_contain("action=\"bind\""));
+    }
+
+    /// The bind checks take the policy's decision without applying the
+    /// grant's scope: a bind granted only on some upstream `id` fails closed
+    /// instead of allowing a bind to any ancestor upstream.
+    #[tokio::test]
+    async fn row_level_bind_grant_fails_closed() {
+        use authz_resolver_sdk::{Constraint, EqPredicate, Predicate};
+
+        /// Grants every action; `bind` only on one (other) upstream.
+        struct BindOnOneUpstream(Uuid);
+
+        #[async_trait::async_trait]
+        impl AuthZResolverApi for BindOnOneUpstream {
+            async fn evaluate(
+                &self,
+                _ctx: toolkit_security::PlatformSecurityContext,
+                request: authz_resolver_sdk::EvaluationRequest,
+            ) -> Result<
+                authz_resolver_sdk::EvaluationResponse,
+                toolkit_canonical_errors::CanonicalError,
+            > {
+                let constraints = if request.action.name == "bind" {
+                    vec![Constraint {
+                        predicates: vec![Predicate::Eq(EqPredicate::new("id", self.0))],
+                    }]
+                } else {
+                    Vec::new()
+                };
+                Ok(authz_resolver_sdk::EvaluationResponse {
+                    decision: true,
+                    context: authz_resolver_sdk::EvaluationResponseContext {
+                        constraints,
+                        deny_reason: None,
+                    },
+                })
+            }
+        }
+
+        let (root, child) = (Uuid::new_v4(), Uuid::new_v4());
+        let stores = Stores::new(Backend::Memory);
+        let build = |enforcer| {
+            ControlPlaneServiceImpl::new(
+                stores.upstreams.clone(),
+                stores.routes.clone(),
+                Arc::new(MockTenantResolverClient::with_hierarchy(vec![
+                    TenantId(root),
+                    TenantId(child),
+                ])),
+                enforcer,
+                Arc::new(MockCredStoreClient::empty()),
+                Arc::new(SsrfGuard::disabled()),
+                None,
+            )
+        };
+        build(allow_all_enforcer())
+            .create_upstream(&test_ctx(root), make_create_upstream_hostname())
+            .await
+            .unwrap();
+
+        let scoped = build(PolicyEnforcer::new(Arc::new(BindOnOneUpstream(
+            Uuid::new_v4(),
+        ))));
+        assert!(matches!(
+            scoped
+                .create_upstream(&test_ctx(child), make_create_upstream_hostname())
+                .await,
+            Err(DomainError::Internal { .. })
+        ));
+    }
+
+    /// A prefix no request path could match is refused on write.
+    #[tokio::test]
+    async fn unreachable_route_prefix_is_rejected() {
+        let svc = make_service();
+        let ctx = test_ctx(Uuid::new_v4());
+        let up = svc
+            .create_upstream(&ctx, make_create_upstream_hostname())
+            .await
+            .unwrap();
+        for path in [
+            "/v1/a%",
+            "/v1/x;y",
+            "/v1/%2e%2e/admin",
+            "/v1/%ff",
+            "/v1//chat",
+            "/v1/./chat",
+            "/v1/../chat",
+            "items",
+            "",
+            "//",
+            "/v1//",
+        ] {
+            let mut req = make_create_route(up.id);
+            if let Some(http) = req.match_rules.http.as_mut() {
+                http.path = path.into();
+            }
+            let err = svc.create_route(&ctx, req).await.unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    DomainError::Validation {
+                        field: "match.http.path",
+                        ..
+                    }
+                ),
+                "{path}: {err:?}"
+            );
+        }
+        // A trailing `/`, the root and an encoded `/` stay valid.
+        for path in ["/v2/", "/", "/v3/a%2Fb"] {
+            let mut req = make_create_route(up.id);
+            if let Some(http) = req.match_rules.http.as_mut() {
+                http.path = path.into();
+            }
+            svc.create_route(&ctx, req)
+                .await
+                .unwrap_or_else(|e| panic!("{path}: {e:?}"));
+        }
+    }
+
+    /// A tenant-resolver refusal on a management write is reported on the
+    /// upstream, not on the proxy.
+    #[tokio::test]
+    async fn tenant_resolver_refusal_is_forbidden_on_the_upstream() {
+        let svc = ControlPlaneServiceImpl::new(
+            Arc::new(InMemoryUpstreamRepo::new()),
+            Arc::new(InMemoryRouteRepo::new()),
+            Arc::new(crate::domain::test_support::UnauthorizedTenantResolver),
+            allow_all_enforcer(),
+            Arc::new(MockCredStoreClient::empty()),
+            Arc::new(SsrfGuard::disabled()),
+            None,
+        );
+        match svc
+            .create_upstream(&test_ctx(Uuid::new_v4()), make_create_upstream_hostname())
+            .await
+        {
+            Err(DomainError::Forbidden { reason, entity, .. }) => {
+                assert_eq!(
+                    reason,
+                    oagw_sdk::reason::permission::TENANT_RESOLVER_UNAUTHORIZED
+                );
+                assert_eq!(entity, DeniedOn::Upstream);
+            }
+            other => panic!("expected Forbidden on the upstream, got {other:?}"),
+        }
+    }
+
+    /// A prefix is stored in the form requests are matched in, so two
+    /// spellings of one prefix conflict.
+    #[tokio::test]
+    async fn route_prefix_is_stored_in_normal_form() {
+        let svc = make_service();
+        let ctx = test_ctx(Uuid::new_v4());
+        let up = svc
+            .create_upstream(&ctx, make_create_upstream_hostname())
+            .await
+            .unwrap();
+        let with_path = |path: &str| {
+            let mut req = make_create_route(up.id);
+            if let Some(http) = req.match_rules.http.as_mut() {
+                http.path = path.into();
+            }
+            req
+        };
+        let route = svc
+            .create_route(&ctx, with_path("/v1/%7euser/a%2fb"))
+            .await
+            .unwrap();
+        assert_eq!(
+            route.match_rules.http.as_ref().map(|h| h.path.as_str()),
+            Some("/v1/~user/a%2Fb")
+        );
+        let err = svc
+            .create_route(&ctx, with_path("/v1/~user/a%2Fb"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Conflict { .. }), "{err:?}");
+    }
+
+    /// The SDK's `resolve_proxy_target` returns upstream and route
+    /// configuration, so it needs `read` on both.
+    #[tokio::test]
+    async fn client_resolution_needs_read() {
+        let capturing = Arc::new(CapturingAuthZResolverClient::new());
+        let (allowed, checked) = services(capturing.clone());
+        let ctx = test_ctx(Uuid::new_v4());
+        let up = allowed
+            .create_upstream(&ctx, make_create_upstream_hostname())
+            .await
+            .unwrap();
+        allowed
+            .create_route(&ctx, make_create_route(up.id))
+            .await
+            .unwrap();
+
+        let (resolved_up, resolved_route) = checked
+            .resolve_proxy_target_for_client(&ctx, &up.alias, "POST", "/v1/chat/completions")
+            .await
+            .unwrap();
+        // The path is matched in the form the proxy matches it in.
+        let capturing_calls = checks(&capturing).len();
+        checked
+            .resolve_proxy_target_for_client(&ctx, &up.alias, "POST", "/v1/x/../chat/c%6fmpletions")
+            .await
+            .unwrap();
+        assert!(matches!(
+            checked
+                .resolve_proxy_target_for_client(
+                    &ctx,
+                    &up.alias,
+                    "POST",
+                    "/v1/%2e%2e/chat/completions"
+                )
+                .await,
+            Err(DomainError::Validation { .. })
+        ));
+        assert_eq!(capturing_calls, 3);
+        // `read` on the caller's tenant first, then on the rows returned
+        // (single-tenant chain), under their owners.
+        assert_eq!(
+            checks(&capturing)[..3].to_vec(),
+            vec![
+                ("read".into(), UPSTREAM_SCHEMA.to_owned(), None),
+                (
+                    "read".into(),
+                    UPSTREAM_SCHEMA.to_owned(),
+                    Some(resolved_up.id)
+                ),
+                (
+                    "read".into(),
+                    ROUTE_SCHEMA.to_owned(),
+                    Some(resolved_route.id)
+                ),
+            ]
+        );
+
+        let (allowed, denied) = services(Arc::new(ScriptedAuthZ {
+            denied: vec!["read"],
+            constraints: Vec::new(),
+        }));
+        let up = allowed
+            .create_upstream(&ctx, make_create_upstream_hostname())
+            .await
+            .unwrap();
+        allowed
+            .create_route(&ctx, make_create_route(up.id))
+            .await
+            .unwrap();
+        assert_forbidden_on(
+            denied
+                .resolve_proxy_target_for_client(&ctx, &up.alias, "POST", "/v1/chat/completions")
+                .await,
+            DeniedOn::Upstream,
+        );
+    }
+
+    /// A client resolving through a hierarchy is checked against every
+    /// upstream whose configuration is merged in: a grant on its own tenant
+    /// only does not cover an inherited target, but covers its own upstream
+    /// when no ancestor shares with it.
+    #[tokio::test]
+    async fn client_resolution_checks_the_owner_of_an_inherited_target() {
+        use crate::domain::model::{AuthConfig, SharingMode};
+        use authz_resolver_sdk::{Constraint, InPredicate, Predicate};
+        let (root, child) = (Uuid::new_v4(), Uuid::new_v4());
+        let stores = Stores::new(Backend::Memory);
+        let build = |enforcer| {
+            ControlPlaneServiceImpl::new(
+                stores.upstreams.clone(),
+                stores.routes.clone(),
+                Arc::new(MockTenantResolverClient::with_hierarchy(vec![
+                    TenantId(root),
+                    TenantId(child),
+                ])),
+                enforcer,
+                Arc::new(MockCredStoreClient::empty()),
+                Arc::new(SsrfGuard::disabled()),
+                None,
+            )
+        };
+        let allowed = build(allow_all_enforcer());
+        let mut shared = make_create_upstream_hostname();
+        shared.auth = Some(AuthConfig {
+            plugin_type: "noop".into(),
+            sharing: SharingMode::Inherit,
+            config: None,
+        });
+        let up = allowed
+            .create_upstream(&test_ctx(root), shared)
+            .await
+            .unwrap();
+        allowed
+            .create_route(&test_ctx(root), make_create_route(up.id))
+            .await
+            .unwrap();
+
+        // The child may read its own tenant's rows only.
+        let own_tenant_only = build(PolicyEnforcer::new(Arc::new(ScriptedAuthZ {
+            denied: Vec::new(),
+            constraints: vec![Constraint {
+                predicates: vec![Predicate::In(InPredicate::new("owner_tenant_id", [child]))],
+            }],
+        })));
+        assert_forbidden_on(
+            own_tenant_only
+                .resolve_proxy_target_for_client(
+                    &test_ctx(child),
+                    &up.alias,
+                    "POST",
+                    "/v1/chat/completions",
+                )
+                .await,
+            DeniedOn::Upstream,
+        );
+        // The child's own upstream is its own to read, also when the root
+        // has an upstream on the alias that shares nothing with it.
+        for (alias, owners) in [
+            ("quiet-shadowed", &[root, child][..]),
+            ("quiet-own", &[child]),
+        ] {
+            let mut own = None;
+            for &owner in owners {
+                let up = allowed
+                    .create_upstream(&test_ctx(owner), make_create_upstream_ip(alias))
+                    .await
+                    .unwrap();
+                allowed
+                    .create_route(&test_ctx(owner), make_create_route(up.id))
+                    .await
+                    .unwrap();
+                own = Some(up);
+            }
+            let own = own.unwrap();
+            let (resolved, route) = own_tenant_only
+                .resolve_proxy_target_for_client(
+                    &test_ctx(child),
+                    alias,
+                    "POST",
+                    "/v1/chat/completions",
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                (resolved.id, route.upstream_id),
+                (own.id, own.id),
+                "{alias}"
+            );
+        }
+
+        // An unknown alias or path is refused the same way: a 404 would tell
+        // the child which aliases and routes the root shares.
+        for (alias, path) in [
+            ("no-such-alias", "/v1/chat/completions"),
+            (up.alias.as_str(), "/no/such/route"),
+        ] {
+            assert_forbidden_on(
+                own_tenant_only
+                    .resolve_proxy_target_for_client(&test_ctx(child), alias, "POST", path)
+                    .await,
+                DeniedOn::Upstream,
+            );
+        }
+
+        // A grant on the whole chain resolves the inherited target.
+        let whole_chain = build(PolicyEnforcer::new(Arc::new(ScriptedAuthZ {
+            denied: Vec::new(),
+            constraints: vec![Constraint {
+                predicates: vec![Predicate::In(InPredicate::new(
+                    "owner_tenant_id",
+                    [root, child],
+                ))],
+            }],
+        })));
+        whole_chain
+            .resolve_proxy_target_for_client(
+                &test_ctx(child),
+                &up.alias,
+                "POST",
+                "/v1/chat/completions",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            whole_chain
+                .resolve_proxy_target_for_client(
+                    &test_ctx(child),
+                    "no-such-alias",
+                    "POST",
+                    "/v1/chat/completions",
+                )
+                .await,
+            Err(DomainError::NotFound { .. })
+        ));
+
+        // The child's own upstream on the alias merges the root's inherited
+        // auth: still refused without `read` on the root.
+        let mut own = make_create_upstream_hostname();
+        own.auth = None;
+        let child_up = allowed
+            .create_upstream(&test_ctx(child), own)
+            .await
+            .unwrap();
+        allowed
+            .create_route(&test_ctx(child), make_create_route(child_up.id))
+            .await
+            .unwrap();
+        assert_forbidden_on(
+            own_tenant_only
+                .resolve_proxy_target_for_client(
+                    &test_ctx(child),
+                    &up.alias,
+                    "POST",
+                    "/v1/chat/completions",
+                )
+                .await,
+            DeniedOn::Upstream,
+        );
+    }
+
+    /// The `read` check runs before resolution, so a denied caller learns
+    /// nothing about which aliases exist or which paths are valid.
+    #[tokio::test]
+    async fn client_resolution_checks_read_before_resolving() {
+        let (_, denied) = services(Arc::new(ScriptedAuthZ {
+            denied: vec!["read"],
+            constraints: Vec::new(),
+        }));
+        let ctx = test_ctx(Uuid::new_v4());
+        for (alias, path) in [
+            ("no-such-alias", "/v1/chat/completions"),
+            ("no-such-alias", "/v1/%2e%2e/admin"),
+        ] {
+            assert_forbidden_on(
+                denied
+                    .resolve_proxy_target_for_client(&ctx, alias, "POST", path)
+                    .await,
+                DeniedOn::Upstream,
+            );
+        }
+    }
+
+    /// An update needs `override` only: a policy that denies `read` still
+    /// lets the caller replace the resource.
+    #[tokio::test]
+    async fn update_needs_override_not_read() {
+        let (allowed, no_read) = services(Arc::new(ScriptedAuthZ {
+            denied: vec!["read"],
+            constraints: Vec::new(),
+        }));
+        let ctx = test_ctx(Uuid::new_v4());
+        let up = allowed
+            .create_upstream(&ctx, make_create_upstream_hostname())
+            .await
+            .unwrap();
+        let route = allowed
+            .create_route(&ctx, make_create_route(up.id))
+            .await
+            .unwrap();
+
+        assert_forbidden_on(no_read.get_upstream(&ctx, up.id).await, DeniedOn::Upstream);
+        no_read
+            .update_upstream(&ctx, up.id, make_update_from_upstream(&up))
+            .await
+            .unwrap();
+        no_read
+            .update_route(&ctx, route.id, make_update_from_route(&route))
+            .await
+            .unwrap();
+    }
+
+    /// A grant constrained to the caller's tenant (what tr-authz returns) is
+    /// accepted; one narrower than the tenant cannot be applied by the
+    /// tenant-scoped repositories and is refused.
+    #[tokio::test]
+    async fn constrained_grants_must_cover_the_tenant() {
+        use authz_resolver_sdk::{Constraint, EqPredicate, InPredicate, Predicate};
+        let tenant = Uuid::new_v4();
+        let ctx = test_ctx(tenant);
+        let grant = |predicates: Vec<Predicate>| {
+            services(Arc::new(ScriptedAuthZ {
+                denied: Vec::new(),
+                constraints: vec![Constraint { predicates }],
+            }))
+            .1
+        };
+
+        let tenant_and_children = grant(vec![Predicate::In(InPredicate::new(
+            "owner_tenant_id",
+            [tenant, Uuid::new_v4()],
+        ))]);
+        tenant_and_children
+            .list_upstreams(&ctx, &ListQuery::default())
+            .await
+            .unwrap();
+
+        let other_tenant = grant(vec![Predicate::Eq(EqPredicate::new(
+            "owner_tenant_id",
+            Uuid::new_v4(),
+        ))]);
+        // A grant on another tenant only is a plain denial.
+        match other_tenant
+            .list_upstreams(&ctx, &ListQuery::default())
+            .await
+        {
+            Err(DomainError::Forbidden { reason, entity, .. }) => {
+                assert_eq!(reason, oagw_sdk::reason::permission::AUTHZ_DENIED);
+                assert_eq!(entity, DeniedOn::Upstream);
+            }
+            other => panic!("expected a denial, got {other:?}"),
+        }
+
+        // Every predicate of a constraint must admit the tenant.
+        let narrowed = grant(vec![
+            Predicate::In(InPredicate::new(
+                "owner_tenant_id",
+                [tenant, Uuid::new_v4()],
+            )),
+            Predicate::Eq(EqPredicate::new("owner_tenant_id", Uuid::new_v4())),
+        ]);
+        assert_forbidden_on(
+            narrowed.list_upstreams(&ctx, &ListQuery::default()).await,
+            DeniedOn::Upstream,
+        );
+
+        // Constraints are alternatives: one that covers the tenant is enough.
+        let two = services(Arc::new(ScriptedAuthZ {
+            denied: Vec::new(),
+            constraints: vec![
+                Constraint {
+                    predicates: vec![Predicate::Eq(EqPredicate::new(
+                        "owner_tenant_id",
+                        Uuid::new_v4(),
+                    ))],
+                },
+                Constraint {
+                    predicates: vec![Predicate::Eq(EqPredicate::new("owner_tenant_id", tenant))],
+                },
+            ],
+        }))
+        .1;
+        two.list_upstreams(&ctx, &ListQuery::default())
+            .await
+            .unwrap();
+
+        // A grant on the tenant and a second tenant is still whole-tenant.
+        let two_tenants = grant(vec![Predicate::In(InPredicate::new(
+            "owner_tenant_id",
+            [Uuid::new_v4(), tenant],
+        ))]);
+        two_tenants
+            .list_routes(&ctx, None, &ListQuery::default())
+            .await
+            .unwrap();
+
+        // A row-level grant (on `id`) compiles and is refused as unsupported,
+        // not failed as an internal error.
+        let row_level = grant(vec![
+            Predicate::Eq(EqPredicate::new("owner_tenant_id", tenant)),
+            Predicate::Eq(EqPredicate::new("id", Uuid::new_v4())),
+        ]);
+        match row_level
+            .list_routes(&ctx, None, &ListQuery::default())
+            .await
+        {
+            Err(DomainError::Forbidden { reason, entity, .. }) => {
+                assert_eq!(
+                    reason,
+                    oagw_sdk::reason::permission::AUTHZ_SCOPE_NOT_SUPPORTED
+                );
+                assert_eq!(entity, DeniedOn::Route);
+            }
+            other => panic!("expected a scope refusal, got {other:?}"),
+        }
+    }
+
+    /// The registry provisioner reads through the unchecked helpers: a policy
+    /// that denies every management call does not stop the reconcile.
+    #[tokio::test]
+    async fn registry_provisioner_reads_skip_management_permissions() {
+        use crate::domain::services::RegistryProvisioner;
+        let capturing = Arc::new(CapturingAuthZResolverClient::denying());
+        let (_, denied, rows) = services_with_rows(capturing.clone());
+        let ctx = test_ctx(Uuid::new_v4());
+        let up = denied
+            .create_upstream_as(&ctx, make_create_upstream_hostname(), ManagedBy::Registry)
+            .await
+            .unwrap();
+        let route = denied
+            .create_route_as(
+                &ctx,
+                make_create_route(up.id),
+                ManagedBy::Registry,
+                UpstreamCheck::Read,
+            )
+            .await
+            .unwrap();
+        let provisioner = RegistryProvisionerImpl::new(Arc::new(denied), rows);
+
+        assert_eq!(provisioner.get_upstream(&ctx, up.id).await.unwrap(), up);
+        assert_eq!(provisioner.get_route(&ctx, route.id).await.unwrap(), route);
+        assert_eq!(
+            provisioner
+                .list_routes(&ctx, Some(up.id), &ListQuery::default())
+                .await
+                .unwrap(),
+            vec![route]
+        );
+        assert!(capturing.recorded().is_empty());
+    }
+
+    /// The registry reconcile writes as the gear: it asks the policy engine
+    /// only for ancestor binds (ADR-0018), so a policy that denies every
+    /// management call does not stop provisioning.
+    #[tokio::test]
+    async fn registry_writes_and_reads_skip_management_permissions() {
+        use crate::domain::services::RegistryProvisioner;
+        let capturing = Arc::new(CapturingAuthZResolverClient::denying());
+        let (_, svc, rows) = services_with_rows(capturing.clone());
+        let provisioner = RegistryProvisionerImpl::new(Arc::new(svc), rows);
+        let ctx = test_ctx(Uuid::new_v4());
+
+        let up = provisioner
+            .create_registry_upstream(&ctx, make_create_upstream_hostname())
+            .await
+            .unwrap();
+        let route = provisioner
+            .create_registry_route(&ctx, make_create_route(up.id), UpstreamCheck::Read)
+            .await
+            .unwrap();
+        let mut update = make_update_from_upstream(&up);
+        update.enabled = false;
+        provisioner
+            .update_registry_upstream(&ctx, up.id, update)
+            .await
+            .unwrap();
+        let mut update = make_update_from_route(&route);
+        update.priority = 7;
+        provisioner
+            .update_registry_route(&ctx, route.id, up.id, update, UpstreamCheck::Read)
+            .await
+            .unwrap();
+        provisioner
+            .delete_registry_route(&ctx, route.id)
+            .await
+            .unwrap();
+        assert!(capturing.recorded().is_empty());
+    }
+
+    /// A write that changes or removes a rate limit drops its buckets, on
+    /// every write path; one that keeps the limit keeps them.
+    #[tokio::test]
+    async fn writes_drop_the_buckets_they_make_stale() {
+        use crate::domain::model::{
+            RateLimitAlgorithm, RateLimitConfig, RateLimitScope, RateLimitStrategy, SharingMode,
+            SustainedRate, Window,
+        };
+        use crate::domain::rate_limit::RateLimiter;
+        let limit = |rate| RateLimitConfig {
+            sharing: SharingMode::Private,
+            algorithm: RateLimitAlgorithm::TokenBucket,
+            sustained: SustainedRate {
+                rate,
+                window: Window::Minute,
+            },
+            burst: None,
+            scope: RateLimitScope::Tenant,
+            strategy: RateLimitStrategy::Reject,
+            cost: 1,
+            budget: None,
+            response_headers: true,
+            pool_owner_id: None,
+        };
+        let limiter = Arc::new(RateLimiter::new());
+        let svc = make_service().with_rate_limiter(limiter.clone());
+        let ctx = test_ctx(Uuid::new_v4());
+        let mut create = make_create_upstream_hostname();
+        create.rate_limit = Some(limit(10));
+        let up = svc.create_upstream(&ctx, create).await.unwrap();
+        let mut route_req = make_create_route(up.id);
+        route_req.rate_limit = Some(limit(5));
+        let route = svc.create_route(&ctx, route_req).await.unwrap();
+        let fill = || {
+            limiter
+                .try_consume(
+                    &format!("oagw:ratelimit:upstream:{}:t", up.id),
+                    &limit(10),
+                    "/",
+                )
+                .unwrap();
+            limiter
+                .try_consume(
+                    &format!("oagw:ratelimit:route:{}:t", route.id),
+                    &limit(5),
+                    "/",
+                )
+                .unwrap();
+        };
+        fill();
+
+        // Same limits: the buckets stay.
+        svc.update_upstream(&ctx, up.id, make_update_from_upstream(&up))
+            .await
+            .unwrap();
+        svc.update_route(&ctx, route.id, make_update_from_route(&route))
+            .await
+            .unwrap();
+        assert_eq!(limiter.bucket_count(), 2);
+
+        // A changed upstream limit drops the upstream's bucket only.
+        let mut update = make_update_from_upstream(&up);
+        update.rate_limit = Some(limit(20));
+        svc.update_upstream(&ctx, up.id, update).await.unwrap();
+        assert_eq!(limiter.bucket_count(), 1);
+
+        // A removed route limit drops the route's.
+        let mut update = make_update_from_route(&route);
+        update.rate_limit = None;
+        svc.update_route(&ctx, route.id, update).await.unwrap();
+        assert_eq!(limiter.bucket_count(), 0);
+
+        // Deletes drop them too.
+        fill();
+        svc.delete_route(&ctx, route.id).await.unwrap();
+        svc.delete_upstream(&ctx, up.id).await.unwrap();
+        assert_eq!(limiter.bucket_count(), 0);
+    }
 }
 
 #[tokio::test]

@@ -439,6 +439,7 @@ mod sdk_vocabulary_round_trip_tests {
             reason::permission::TENANT_BOUNDARY_VIOLATION,
             reason::permission::CORS_ORIGIN_NOT_ALLOWED,
             reason::permission::CORS_METHOD_NOT_ALLOWED,
+            reason::permission::AUTHZ_SCOPE_NOT_SUPPORTED,
         ] {
             let err = ProxyScope::permission_denied().with_reason(r).create();
             let json = problem(err);
@@ -472,6 +473,7 @@ mod sdk_vocabulary_round_trip_tests {
             field::WS_UPGRADE_BODY_FORBIDDEN,
             field::INVALID_PROXY_PATH,
             field::MISSING_ALIAS,
+            field::BODY_READ_FAILED,
             field::INVALID_CONTENT_LENGTH,
             field::INVALID_REWRITTEN_URI,
             field::QUERY_NOT_ALLOWED,

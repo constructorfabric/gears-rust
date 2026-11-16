@@ -18,3 +18,4 @@ Content-Type: application/json
   - `Content-Type: application/problem+json`
   - `X-OAGW-Error-Source: gateway`
 - `detail` indicates missing proxy invoke permission.
+- The permission is checked before the request is read or validated: an oversized `Content-Length`, a bad `Content-Type`, an aborted upload, or a WebSocket upgrade with a body header from a caller without the permission still gets `403`, not `413` or `400`.

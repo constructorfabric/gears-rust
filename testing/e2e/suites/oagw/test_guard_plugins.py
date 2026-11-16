@@ -4,10 +4,8 @@ Each allow-path test also sends a request without the header to the same
 upstream and expects the guard's 400, which proves the guard is bound: a
 missing binding would let both requests through.
 
-Guards currently check the outbound header map, after passthrough filtering
-and auth injection (PLG-05). Under `passthrough: all` the two maps agree, so
-the `passthrough-all` variants pass today; the `default-passthrough` variants
-are what a client sees with the default config and fail until PLG-05 lands.
+Guards check the headers the client sent, whatever the upstream's
+passthrough mode (ADR-0017, #4982), so both variants behave the same.
 """
 import httpx
 import pytest
@@ -21,15 +19,9 @@ from .helpers import (
     update_upstream,
 )
 
-PLG_05 = pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="PLG-05: request guards see the outbound headers, so under the "
-           "default passthrough a header the client sent is reported missing",
-)
 PASSTHROUGH = [
     pytest.param({"request": {"passthrough": "all"}}, id="passthrough-all"),
-    pytest.param(None, id="default-passthrough", marks=PLG_05),
+    pytest.param(None, id="default-passthrough"),
 ]
 
 
@@ -171,12 +163,6 @@ async def test_required_headers_case_insensitive(
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="PLG-05 (F-3): `authorization` is stripped before guards run, so a "
-           "guard requiring it rejects every client",
-)
 async def test_required_authorization_header_allows_client_that_sends_it(
     oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
 ):

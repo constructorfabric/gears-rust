@@ -1064,9 +1064,15 @@ async fn resolve_served(
     cp: &dyn ControlPlaneService,
     ctx: &SecurityContext,
 ) -> Result<(Uuid, Uuid), DomainError> {
-    cp.resolve_proxy_target(ctx, "api.example.com", "POST", "/v1/things", Tags::Skip)
-        .await
-        .map(|(upstream, route)| (upstream.id, route.id))
+    cp.resolve_proxy_target(
+        &crate::domain::services::ProxyGrant::for_tests(ctx.clone()),
+        "api.example.com",
+        "POST",
+        "/v1/things",
+        Tags::Skip,
+    )
+    .await
+    .map(|(upstream, route)| (upstream.id, route.id))
 }
 
 /// Disable `tenant`'s upstream `id` in `db`, behind the gear's back.
@@ -1104,9 +1110,15 @@ async fn on_a_database_proxy_reads_are_cached_and_writes_evict() {
         .expect("init registers the client");
     let cp = control_plane(&gear);
     let resolve = async |alias: &str| {
-        cp.resolve_proxy_target(&ctx(), alias, "POST", "/v1/things", Tags::Skip)
-            .await
-            .map(|(upstream, route)| (upstream.id, route.id))
+        cp.resolve_proxy_target(
+            &crate::domain::services::ProxyGrant::for_tests(ctx().clone()),
+            alias,
+            "POST",
+            "/v1/things",
+            Tags::Skip,
+        )
+        .await
+        .map(|(upstream, route)| (upstream.id, route.id))
     };
 
     let (upstream, route, server) = served_upstream(&*gw, ctx()).await;
@@ -1881,7 +1893,13 @@ async fn the_cache_takes_its_ttl_and_size_from_the_config() {
     let selects_of = async |alias: &str| {
         recorder.clear();
         let _ = cp
-            .resolve_proxy_target(&sctx(), alias, "POST", "/v1/things", Tags::Skip)
+            .resolve_proxy_target(
+                &crate::domain::services::ProxyGrant::for_tests(sctx().clone()),
+                alias,
+                "POST",
+                "/v1/things",
+                Tags::Skip,
+            )
             .await;
         recorder
             .events()

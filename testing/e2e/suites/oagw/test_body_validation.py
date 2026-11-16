@@ -7,6 +7,7 @@ stays visible and a change in it fails loudly.
 """
 import asyncio
 import json
+import os
 from urllib.parse import urlparse
 
 import httpx
@@ -98,19 +99,12 @@ async def test_invalid_content_length_rejected_by_http_server(
 
 @pytest.mark.scenario("negative-7.4-well-known-header-validation-errors-400", part="B")
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="P-05: a body shorter than its Content-Length is reported as "
-           "413 PAYLOAD_TOO_LARGE ('exceeds maximum')",
-)
 async def test_content_length_mismatch_returns_400(
     oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
 ):
-    """Scenario 7.4-B: a body that ends short of its Content-Length is not labelled "too large".
-
-    P-05 decides only the labelling, so this pins a gateway client error that
-    isn't the size error; scenario 7.4-B's exact 400 is not asserted.
+    """Scenario 7.4-B: a body that ends short of its Content-Length is a 400
+    `BODY_READ_FAILED`, not labelled "too large": only the size limit is a
+    413 (#4981).
     """
     async with httpx.AsyncClient(timeout=10.0) as client:
         alias = await _echo_upstream(
@@ -121,11 +115,13 @@ async def test_content_length_mismatch_returns_400(
     status, headers, body = await _raw_http_request(*_raw_post(
         oagw_base_url, f"/oagw/v1/proxy/{alias}/echo", oagw_headers, "999", '{"a":1}',
     ), half_close=True)
-    assert 400 <= status < 500 and status != 413, (status, body[:300])
+    assert status == 400, (status, body[:300])
     assert headers.get("content-type", "").startswith("application/problem+json")
     assert headers.get("x-oagw-error-source") == "gateway"
-    violations = json.loads(body).get("context", {}).get("field_violations", [])
-    assert all(v.get("reason") != "PAYLOAD_TOO_LARGE" for v in violations), body[:300]
+    problem = json.loads(body)
+    assert problem["status"] == 400, problem
+    reasons = [v["reason"] for v in problem["context"]["field_violations"]]
+    assert reasons == ["BODY_READ_FAILED"], problem
 
 
 @pytest.mark.asyncio
@@ -169,3 +165,59 @@ async def test_body_exceeding_limit_returns_413(
     reasons = [v["reason"] for v in problem["context"]["field_violations"]]
     assert reasons == ["PAYLOAD_TOO_LARGE"]
     assert str(OAGW_MAX_BODY_BYTES) in problem["detail"]
+
+
+@pytest.mark.scenario("negative-5.1-proxy-invoke-permission-required")
+@pytest.mark.asyncio
+async def test_unauthorized_caller_gets_403_before_body_checks(
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
+):
+    """#4981: `proxy:invoke` is checked before OAGW reads or validates the body.
+
+    A caller the policy denies gets 403 for a body over the limit (413 for an
+    allowed caller) and for a WebSocket upgrade with a body (400 for an
+    allowed caller). The deny is static-authz's nil-tenant case. A
+    non-numeric Content-Length never reaches OAGW (the HTTP server refuses
+    it); `denied_caller_gets_403_before_body_checks` covers it.
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        alias = await _echo_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, cleanup, "body-authz",
+        )
+    nil_token = os.getenv("E2E_AUTH_TOKEN_NIL_TENANT", "e2e-token-nil-tenant")
+    denied = {"Authorization": f"Bearer {nil_token}"}
+    path = f"/oagw/v1/proxy/{alias}/echo"
+
+    oversized = str(OAGW_MAX_BODY_BYTES + 1)
+    status, headers, body = await _raw_http_request(*_raw_post(
+        oagw_base_url, path, denied, oversized, "{}",
+    ), half_close=True)
+    assert status == 403, (status, body[:300])
+    assert headers.get("x-oagw-error-source") == "gateway"
+
+    # The same request from an allowed caller is a 413.
+    status, _, body = await _raw_http_request(*_raw_post(
+        oagw_base_url, path, oagw_headers, oversized, "{}",
+    ), half_close=True)
+    assert status == 413, (status, body[:300])
+
+    def ws_with_body(headers: dict) -> tuple[str, int, bytes]:
+        parsed = urlparse(oagw_base_url)
+        host, port = parsed.hostname or "127.0.0.1", parsed.port or 80
+        raw = (
+            f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+            "Connection: Upgrade\r\nUpgrade: websocket\r\n"
+            "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            "Content-Length: 2\r\n"
+            + "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+            + "\r\n{}"
+        ).encode()
+        return host, port, raw
+
+    status, headers, body = await _raw_http_request(*ws_with_body(denied))
+    assert status == 403, (status, body[:300])
+    assert headers.get("x-oagw-error-source") == "gateway"
+    status, _, body = await _raw_http_request(*ws_with_body(oagw_headers))
+    assert status == 400, (status, body[:300])
+    reasons = [v["reason"] for v in json.loads(body)["context"]["field_violations"]]
+    assert reasons == ["WS_UPGRADE_BODY_FORBIDDEN"], body[:300]

@@ -99,6 +99,8 @@ sea-orm-migration = { workspace = true }
 time = { workspace = true }
 # DP deps
 form_urlencoded = "1"
+percent-encoding = { workspace = true }
+unicode-normalization = { workspace = true }
 lru = { workspace = true }
 futures-util = { workspace = true, features = ["sink"] }
 tokio = { workspace = true, features = ["time"] }

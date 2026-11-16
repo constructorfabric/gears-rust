@@ -1145,6 +1145,82 @@ async fn proxy_recorded_request_has_correct_uri_and_body() {
     assert!(body_str.contains("Hello"));
 }
 
+// A route path ending in `/` matches a request that continues its last
+// segment; the upstream gets the path the client sent, without a `/` before
+// the suffix.
+#[tokio::test]
+async fn proxy_trailing_slash_route_forwards_segment_suffix_unchanged() {
+    let mut guard = MockGuard::new();
+    guard.mock(
+        "GET",
+        "/v1/admin.json",
+        MockResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: MockBody::Json(json!({"ok": true})),
+        },
+    );
+
+    let h = AppHarness::builder().build().await;
+    let ctx = h.security_context().clone();
+
+    let upstream = h
+        .facade()
+        .create_upstream(
+            ctx.clone(),
+            CreateUpstreamRequest::builder(
+                Server {
+                    endpoints: vec![Endpoint {
+                        scheme: Scheme::Http,
+                        host: "127.0.0.1".into(),
+                        port: h.mock_port(),
+                    }],
+                },
+                HTTP_PROTOCOL_ID,
+            )
+            .alias("trailing-slash")
+            .build(),
+        )
+        .await
+        .unwrap();
+
+    h.facade()
+        .create_route(
+            ctx.clone(),
+            CreateRouteRequest::builder(
+                upstream.id,
+                MatchRules {
+                    http: Some(HttpMatch {
+                        methods: vec![HttpMethod::Get],
+                        path: guard.path("/v1/admin/"),
+                        query_allowlist: vec![],
+                        path_suffix_mode: PathSuffixMode::Append,
+                    }),
+                    grpc: None,
+                },
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+
+    let req = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("/trailing-slash{}", guard.path("/v1/admin.json")))
+        .body(Body::Empty)
+        .unwrap();
+    let response = h.facade().proxy_request(ctx, req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let recorded = guard.recorded_requests().await;
+    assert_eq!(recorded.len(), 1);
+    assert!(
+        recorded[0].uri.ends_with("/v1/admin.json"),
+        "forwarded {}",
+        recorded[0].uri
+    );
+}
+
 // Response header sanitization: hop-by-hop and x-oagw-* headers stripped from upstream response.
 #[tokio::test]
 async fn proxy_response_headers_sanitized() {
@@ -4999,4 +5075,421 @@ async fn proxy_websocket_handshake_retries_on_early_close() {
 
     proxy_handle.abort();
     server_handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Header boundaries (#4982)
+// ---------------------------------------------------------------------------
+
+/// An upstream on the mock with one POST route at `guard.path(path)`.
+async fn header_boundary_upstream(
+    h: &AppHarness,
+    guard: &MockGuard,
+    alias: &str,
+    path: &str,
+    headers: Option<HeadersConfig>,
+    plugins: Option<PluginsConfig>,
+    auth: Option<oagw_sdk::AuthConfig>,
+) {
+    let ctx = h.security_context().clone();
+    let mut builder = CreateUpstreamRequest::builder(
+        Server {
+            endpoints: vec![Endpoint {
+                scheme: Scheme::Http,
+                host: "127.0.0.1".into(),
+                port: h.mock_port(),
+            }],
+        },
+        HTTP_PROTOCOL_ID,
+    )
+    .alias(alias);
+    if let Some(headers) = headers {
+        builder = builder.headers(headers);
+    }
+    if let Some(plugins) = plugins {
+        builder = builder.plugins(plugins);
+    }
+    if let Some(auth) = auth {
+        builder = builder.auth(auth);
+    }
+    let upstream = h
+        .facade()
+        .create_upstream(ctx.clone(), builder.build())
+        .await
+        .unwrap();
+    h.facade()
+        .create_route(
+            ctx,
+            CreateRouteRequest::builder(
+                upstream.id,
+                MatchRules {
+                    http: Some(HttpMatch {
+                        methods: vec![HttpMethod::Post],
+                        path: guard.path(path),
+                        query_allowlist: vec![],
+                        path_suffix_mode: PathSuffixMode::Disabled,
+                    }),
+                    grpc: None,
+                },
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+}
+
+fn ok_response() -> MockResponse {
+    MockResponse {
+        status: 200,
+        headers: vec![("content-type".into(), "application/json".into())],
+        body: MockBody::Json(json!({"ok": true})),
+    }
+}
+
+/// Assert `err` is the required-headers guard's rejection.
+fn assert_required_header_missing(err: CanonicalError) {
+    match err {
+        CanonicalError::InvalidArgument { ctx, .. } => match ctx {
+            toolkit_canonical_errors::InvalidArgument::FieldViolations { field_violations } => {
+                assert_eq!(
+                    field_violations.first().map(|v| v.reason.as_str()),
+                    Some("REQUIRED_HEADER_MISSING")
+                );
+            }
+            other => panic!("expected FieldViolations, got {other:?}"),
+        },
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    }
+}
+
+fn required_header_guard(header: &str) -> PluginsConfig {
+    PluginsConfig {
+        sharing: SharingMode::Private,
+        items: vec![PluginBinding {
+            plugin_ref: REQUIRED_HEADERS_GUARD_PLUGIN_ID.to_string(),
+            config: [("required_request_headers".into(), header.into())].into(),
+        }],
+    }
+}
+
+/// Guards check the client's headers: under the default `passthrough: none`
+/// the outbound map does not carry `x-correlation-id`, but the client sent it.
+#[tokio::test]
+async fn proxy_guard_checks_client_headers_under_default_passthrough() {
+    let mut guard = MockGuard::new();
+    guard.mock("POST", "/guard-inbound", ok_response());
+    let h = AppHarness::builder().build().await;
+    header_boundary_upstream(
+        &h,
+        &guard,
+        "guard-inbound",
+        "/guard-inbound",
+        None,
+        Some(required_header_guard("x-correlation-id")),
+        None,
+    )
+    .await;
+
+    let req = http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/guard-inbound{}", guard.path("/guard-inbound")))
+        .header("x-correlation-id", "test-123")
+        .body(Body::Empty)
+        .unwrap();
+    let response = h
+        .facade()
+        .proxy_request(h.security_context().clone(), req)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Without the header the guard rejects: it is bound and runs.
+    let req = http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/guard-inbound{}", guard.path("/guard-inbound")))
+        .body(Body::Empty)
+        .unwrap();
+    let err = h
+        .facade()
+        .proxy_request(h.security_context().clone(), req)
+        .await
+        .expect_err("the guard must reject a request without the header");
+    assert_required_header_missing(err);
+}
+
+/// The credential the auth plugin injects does not satisfy a guard that
+/// requires the client to send `authorization`.
+#[tokio::test]
+async fn proxy_guard_does_not_see_injected_credential() {
+    let mut guard = MockGuard::new();
+    guard.mock("POST", "/guard-cred", ok_response());
+    let h = AppHarness::builder()
+        .with_credentials(vec![("cred://guard-key".into(), "sk-guard".into())])
+        .build()
+        .await;
+    header_boundary_upstream(
+        &h,
+        &guard,
+        "guard-cred",
+        "/guard-cred",
+        None,
+        Some(required_header_guard("authorization")),
+        Some(oagw_sdk::AuthConfig {
+            plugin_type: APIKEY_AUTH_PLUGIN_ID.into(),
+            sharing: SharingMode::Private,
+            config: Some(
+                [
+                    ("header".into(), "authorization".into()),
+                    ("prefix".into(), "Bearer ".into()),
+                    ("secret_ref".into(), "cred://guard-key".into()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        }),
+    )
+    .await;
+
+    let req = http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/guard-cred{}", guard.path("/guard-cred")))
+        .body(Body::Empty)
+        .unwrap();
+    let err = h
+        .facade()
+        .proxy_request(h.security_context().clone(), req)
+        .await
+        .expect_err("the guard must reject: the client sent no authorization");
+    assert_required_header_missing(err);
+    assert!(guard.recorded_requests().await.is_empty());
+}
+
+/// Client-sent forwarding headers do not reach the upstream under
+/// `passthrough: all`, but do when the allowlist names them.
+#[tokio::test]
+async fn proxy_strips_client_forwarding_headers() {
+    let mut guard = MockGuard::new();
+    guard.mock("POST", "/fwd-all", ok_response());
+    guard.mock("POST", "/fwd-allow", ok_response());
+    let h = AppHarness::builder().build().await;
+    let passthrough = |passthrough, allowlist: Vec<String>| {
+        Some(HeadersConfig {
+            request: Some(RequestHeaderRules {
+                passthrough,
+                passthrough_allowlist: allowlist,
+                ..Default::default()
+            }),
+            response: None,
+        })
+    };
+    header_boundary_upstream(
+        &h,
+        &guard,
+        "fwd-all",
+        "/fwd-all",
+        passthrough(PassthroughMode::All, vec![]),
+        None,
+        None,
+    )
+    .await;
+    header_boundary_upstream(
+        &h,
+        &guard,
+        "fwd-allow",
+        "/fwd-allow",
+        passthrough(
+            PassthroughMode::Allowlist,
+            vec!["x-forwarded-for".into(), "x-custom".into()],
+        ),
+        None,
+        None,
+    )
+    .await;
+
+    for alias in ["fwd-all", "fwd-allow"] {
+        let req = http::Request::builder()
+            .method(Method::POST)
+            .uri(format!("/{alias}{}", guard.path(&format!("/{alias}"))))
+            .header("x-forwarded-for", "203.0.113.7")
+            .header("x-forwarded-host", "evil.example")
+            .header("x-real-ip", "203.0.113.8")
+            .header("forwarded", "for=203.0.113.9;host=internal")
+            .header("x-client-ip", "203.0.113.10")
+            .header("x-custom", "keep")
+            .body(Body::Empty)
+            .unwrap();
+        let response = h
+            .facade()
+            .proxy_request(h.security_context().clone(), req)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let recorded = guard.recorded_requests().await;
+    let header = |alias: &str, name: &str| {
+        recorded
+            .iter()
+            .find(|r| r.uri.ends_with(alias))
+            .expect("request recorded")
+            .headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
+    };
+    assert_eq!(header("/fwd-all", "x-forwarded-for"), None);
+    assert_eq!(header("/fwd-all", "x-forwarded-host"), None);
+    assert_eq!(header("/fwd-all", "x-real-ip"), None);
+    assert_eq!(header("/fwd-all", "forwarded"), None);
+    assert_eq!(header("/fwd-all", "x-client-ip"), None);
+    assert_eq!(header("/fwd-all", "x-custom").as_deref(), Some("keep"));
+    assert_eq!(
+        header("/fwd-allow", "x-forwarded-for").as_deref(),
+        Some("203.0.113.7")
+    );
+    assert_eq!(header("/fwd-allow", "x-forwarded-host"), None);
+}
+
+/// Hop-by-hop headers an operator header rule sets do not reach the upstream:
+/// OAGW strips them again after the header rules and transforms ran, and does
+/// not rely on the engine for `Trailer` (#4982, scenario 11.3).
+#[tokio::test]
+async fn proxy_drops_hop_by_hop_headers_set_by_header_rules() {
+    let mut guard = MockGuard::new();
+    guard.mock("POST", "/hop-rules", ok_response());
+    let h = AppHarness::builder().build().await;
+    header_boundary_upstream(
+        &h,
+        &guard,
+        "hop-rules",
+        "/hop-rules",
+        Some(HeadersConfig {
+            request: Some(RequestHeaderRules {
+                set: [
+                    ("keep-alive".to_owned(), "timeout=5".to_owned()),
+                    ("proxy-connection".to_owned(), "keep-alive".to_owned()),
+                    ("trailer".to_owned(), "x-checksum".to_owned()),
+                    ("x-kept".to_owned(), "1".to_owned()),
+                ]
+                .into(),
+                ..Default::default()
+            }),
+            response: None,
+        }),
+        None,
+        None,
+    )
+    .await;
+
+    let req = http::Request::builder()
+        .method(Method::POST)
+        .uri(format!("/hop-rules{}", guard.path("/hop-rules")))
+        .body(Body::Empty)
+        .unwrap();
+    let response = h
+        .facade()
+        .proxy_request(h.security_context().clone(), req)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let recorded = guard.recorded_requests().await;
+    let names: Vec<&str> = recorded[0]
+        .headers
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .collect();
+    assert!(!names.contains(&"keep-alive"), "{names:?}");
+    assert!(!names.contains(&"proxy-connection"), "{names:?}");
+    assert!(!names.contains(&"trailer"), "{names:?}");
+    assert!(names.contains(&"x-kept"), "{names:?}");
+}
+
+/// A changed rate limit takes effect at once: the update drops the old
+/// bucket in the limiter the proxy enforces (the Control Plane and the Data
+/// Plane share it), so an exhausted caller is admitted again. Only a field
+/// the limiter does not compare changes, so the limiter's own rebuild on a
+/// capacity change cannot be what admits the request.
+#[tokio::test]
+async fn changing_a_rate_limit_drops_the_exhausted_bucket() {
+    let h = AppHarness::builder().build().await;
+    let ctx = h.security_context().clone();
+    let limit = |response_headers| RateLimitConfig {
+        sharing: SharingMode::Private,
+        algorithm: RateLimitAlgorithm::TokenBucket,
+        sustained: SustainedRate {
+            rate: 1,
+            window: Window::Minute,
+        },
+        burst: Some(BurstConfig { capacity: 1 }),
+        scope: RateLimitScope::Tenant,
+        strategy: RateLimitStrategy::Reject,
+        cost: 1,
+        response_headers,
+        budget: None,
+    };
+    let upstream = h
+        .facade()
+        .create_upstream(
+            ctx.clone(),
+            CreateUpstreamRequest::builder(
+                Server {
+                    endpoints: vec![Endpoint {
+                        scheme: Scheme::Http,
+                        host: "127.0.0.1".into(),
+                        port: h.mock_port(),
+                    }],
+                },
+                HTTP_PROTOCOL_ID,
+            )
+            .alias("rate-raised")
+            .rate_limit(limit(true))
+            .build(),
+        )
+        .await
+        .unwrap();
+    h.facade()
+        .create_route(
+            ctx.clone(),
+            CreateRouteRequest::builder(
+                upstream.id,
+                MatchRules {
+                    http: Some(HttpMatch {
+                        methods: vec![HttpMethod::Get],
+                        path: "/v1/models".into(),
+                        query_allowlist: vec![],
+                        path_suffix_mode: PathSuffixMode::Append,
+                    }),
+                    grpc: None,
+                },
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+    let get = || {
+        http::Request::builder()
+            .method(Method::GET)
+            .uri("/rate-raised/v1/models")
+            .body(Body::Empty)
+            .unwrap()
+    };
+
+    h.facade().proxy_request(ctx.clone(), get()).await.unwrap();
+    assert!(matches!(
+        h.facade().proxy_request(ctx.clone(), get()).await,
+        Err(CanonicalError::ResourceExhausted { .. })
+    ));
+
+    let update =
+        oagw_sdk::UpdateUpstreamRequest::builder(upstream.server.clone(), HTTP_PROTOCOL_ID)
+            .alias(upstream.alias.clone())
+            .rate_limit(limit(false))
+            .build();
+    h.facade()
+        .update_upstream(ctx.clone(), upstream.id, update)
+        .await
+        .unwrap();
+    let response = h.facade().proxy_request(ctx.clone(), get()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }

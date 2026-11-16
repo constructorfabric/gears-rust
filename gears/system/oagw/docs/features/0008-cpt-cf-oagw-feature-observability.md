@@ -259,9 +259,9 @@ Preflight returns a permissive 204 at the handler level (no upstream resolution)
 4. [ ] - `p1` - **IF** resolved IP is in private/reserved ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 169.254.0.0/16, ::1, fc00::/7) - `inst-ssrf-4`
    1. [ ] - `p1` - **IF** IP is not in explicitly configured allowed_internal_segments - `inst-ssrf-4a`
       1. [ ] - `p1` - **RETURN** reject with 400 ValidationError: "Upstream resolves to disallowed IP range" - `inst-ssrf-4a1`
-5. [ ] - `p1` - Strip well-known internal headers from outbound request - `inst-ssrf-5`
-   1. [ ] - `p1` - Remove: `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`, `X-Real-IP` (unless explicitly allowed) - `inst-ssrf-5a`
-6. [ ] - `p1` - Validate request path against route configuration: reject path traversal sequences (`../`, `..\\`, encoded variants) - `inst-ssrf-6`
+5. [x] - `p1` - Strip well-known internal headers from outbound request - `inst-ssrf-5`
+   1. [x] - `p1` - Remove: `Forwarded`, `Via`, `X-Forwarded*`, `X-Envoy-*`, `X-ProxyUser-Ip`, `*Client-IP`, `X-Real-IP`, `X-Originating-IP`, `X-Remote-IP`, `X-Remote-Addr`, `CF-Connecting-IP`, `X-Original-Forwarded-For`, URL/host override (`X-Original-URL`, `X-Original-URI`, `X-Rewrite-URL`, `X-Original-Host`, `X-Host`) and method override (`X-HTTP-Method-Override`, `X-HTTP-Method`, `X-Method-Override`) headers (unless explicitly allowed: the upstream's `passthrough_allowlist` names the header; `passthrough: all` does not count) - `inst-ssrf-5a`
+6. [x] - `p1` - Validate request path against route configuration: resolve literal `.` and `..` segments before route matching, and reject with 400 a segment that is a dot-segment once percent-decoded (`%2e%2e`, `..%2f`, `..\\`, `..;`, double encoding, non-UTF-8 escapes) - `inst-ssrf-6`
 7. [ ] - `p1` - Validate query parameters against route `query_allowlist` if configured - `inst-ssrf-7`
 8. [ ] - `p1` - **RETURN** pass (request is safe to forward) - `inst-ssrf-8`
 

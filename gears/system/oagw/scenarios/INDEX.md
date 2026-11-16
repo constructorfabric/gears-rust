@@ -206,7 +206,7 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 
 #### Hop-by-hop headers stripped
 - **Scenario**: [positive-7.2-hop-hop-headers-stripped.md](proxy-api/request-transforms/positive-7.2-hop-hop-headers-stripped.md)
-- **Mechanism**: `Connection`, `Upgrade`, `Transfer-Encoding`, `TE`, etc. do not reach upstream unless explicitly allowed by protocol handler.
+- **Mechanism**: `Connection`, `Upgrade`, `Transfer-Encoding`, `TE`, etc. do not reach upstream unless explicitly allowed by protocol handler. Under `passthrough: all`, client forwarding and override headers (`Forwarded`, `Via`, `X-Forwarded-*`, `X-Real-IP`, ...) are not forwarded unless the allowlist names them.
 
 #### Host header replaced by upstream host
 - **Scenario**: [positive-7.3-host-header-replaced-upstream-host.md](proxy-api/request-transforms/positive-7.3-host-header-replaced-upstream-host.md)
@@ -291,6 +291,10 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 #### Budget modes (allocated/shared/unlimited)
 - **Scenario**: [positive-18.7-budget-modes-behave-specified.md](rate-limiting/positive-18.7-budget-modes-behave-specified.md)
 - **Mechanism**: `allocated` rejects when sum exceeds `total * overcommit_ratio`. `shared` pools between tenants. `unlimited` skips validation.
+
+#### A changed or removed limit applies at once
+- **Scenario**: *No separate file. Covered by the tests `changing_a_rate_limit_drops_the_exhausted_bucket` and `writes_drop_the_buckets_they_make_stale`.*
+- **Mechanism**: The Control Plane and the Data Plane share one limiter. A write that changes or removes an upstream or route rate limit drops its buckets on every write path (REST, SDK, registry), so a caller exhausted under the old limit is admitted under the new one. A write that keeps the limit keeps the buckets.
 
 ---
 
@@ -532,7 +536,7 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 
 #### Permission gates for upstream/route/plugin CRUD → 403
 - **Scenario**: [negative-1.2-permission-gates-upstream-route-plugin-crud.md](management-api/auth/negative-1.2-permission-gates-upstream-route-plugin-crud.md)
-- **What happens**: Missing permission for resource type returns `403`. With correct permission, same call succeeds.
+- **What happens**: Missing permission for resource type returns `403`. With correct permission, same call succeeds. Each operation asks for its own action (`create`, `read`, `override`, `delete`); a grant on part of the tenant is refused with `AUTHZ_SCOPE_NOT_SUPPORTED`.
 
 #### Tenant scoping in management APIs → cross-tenant blocked
 - **Scenario**: [negative-1.3-tenant-scoping-management-apis.md](management-api/auth/negative-1.3-tenant-scoping-management-apis.md)
@@ -540,7 +544,7 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 
 #### Proxy invoke permission required → 403
 - **Scenario**: [negative-5.1-proxy-invoke-permission-required.md](proxy-api/authz/negative-5.1-proxy-invoke-permission-required.md)
-- **What happens**: Missing `gts.cf.core.oagw.proxy.v1~:invoke` returns `403`.
+- **What happens**: Missing `gts.cf.core.oagw.proxy.v1~:invoke` returns `403`, before the body is read or validated.
 
 #### Proxy cannot access upstream not owned or shared → 403/404
 - **Scenario**: [negative-5.2-proxy-cannot-access-upstream-not-owned-shared.md](proxy-api/authz/negative-5.2-proxy-cannot-access-upstream-not-owned-shared.md)
@@ -618,6 +622,10 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 - **Scenario**: [negative-3.7-disable-route-blocks-proxy-traffic.md](management-api/routes/negative-3.7-disable-route-blocks-proxy-traffic.md)
 - **What happens**: With `route.enabled=false`, request returns `404 ROUTE_NOT_FOUND` or `503`, `ESrc=gateway`.
 
+#### Route prefix matches whole segments (no match inside a segment) → 404
+- **Scenario**: [negative-3.12-route-prefix-matches-whole-segments.md](management-api/routes/negative-3.12-route-prefix-matches-whole-segments.md)
+- **What happens**: `/v1/chat` does not match `/v1/chatty` (`404`); matching uses the normalized path; route `/` matches the bare alias; a prefix no request could match (or not starting with `/`) is rejected on write; a route's trailing `/` is not forwarded before `.json`; an encoded `/` or `\` that would select another route (`/v1%2Fadmin` past `/v1/admin`) returns `400 INVALID_PROXY_PATH`.
+
 #### Overlapping route → 409
 - **Scenario**: [negative-3.11-overlapping-route-rejected-409.md](management-api/routes/negative-3.11-overlapping-route-rejected-409.md)
 - **What happens**: An enabled route on the same upstream with the same path, the same priority and a shared method returns `409 PD` (`already_exists`, `resource_type` = route schema). Another priority does not overlap.
@@ -629,6 +637,10 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 #### SSRF prevention by strict upstream host selection
 - **Scenario**: *Section 26.1 — no separate file.*
 - **What happens**: Client cannot override upstream destination via inbound `Host` header. Absolute-form URLs in request line rejected or normalized.
+
+#### Encoded dot-segments (path traversal) → 400
+- **Scenario**: [negative-7.7-encoded-dot-segments-rejected-400.md](proxy-api/request-transforms/negative-7.7-encoded-dot-segments-rejected-400.md)
+- **What happens**: A path segment that decodes to `.` or `..`, a `;` parameter, a non-UTF-8 escape or a stray `%` returns `400 INVALID_PROXY_PATH`, `ESrc=gateway`. So does an encoded `/` or `\` that would select another route (3.12 Scenario F).
 
 #### Header injection protections
 - **Scenario**: *Section 26.2 — no separate file.*

@@ -122,7 +122,7 @@ All requests go to CP, which calls DP as needed.
 
 At request time, the proxy handler resolves `{alias}` to an upstream first, then uses the upstream's `protocol` to determine which route match keys to apply:
 
-- If `upstream.protocol` is HTTP, match routes using HTTP match keys (method allowlist + longest path prefix).
+- If `upstream.protocol` is HTTP, match routes using HTTP match keys (method allowlist + longest path prefix, matched on a segment boundary: `/v1/chat` does not cover `/v1/chatty`). A request that selects another route when `%2F`, `%5C`, `\` and the fullwidth and small solidi `%EF%BC%8F`, `%EF%BC%BC` and `%EF%B9%A8`, which NFKC folds to `/` and `\` are read as `/` (routes `/v1` and `/v1/admin`, request `/v1%2Fadmin`) is rejected with 400 `INVALID_PROXY_PATH`.
 - If `upstream.protocol` is gRPC, match routes using gRPC match keys (`(service, method)` parsed from the gRPC request path `/{service}/{method}`).
 
 `Content-Type` may be validated as an additional safety check, but is not required for selecting the match strategy.

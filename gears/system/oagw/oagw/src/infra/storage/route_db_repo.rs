@@ -297,7 +297,7 @@ fn still_matches(route: &Route, request: &Request<'_>) -> bool {
         request.method,
         request.path,
     )
-    .is_some()
+    .is_ok_and(|winner| winner.is_some())
 }
 
 /// One selection: the candidates that allow the method, the winner by
@@ -342,7 +342,9 @@ async fn select_and_load(
         .into_iter()
         .map(|c| http_candidate(c, method))
         .collect();
-    let Some(winner) = select_route(&views, tenant_chain, upstream_ids, method, path) else {
+    let Some(winner) = select_route(&views, tenant_chain, upstream_ids, method, path)
+        .map_err(|_| RepositoryError::SeparatorBypass)?
+    else {
         return Ok(Attempt::NoMatch);
     };
     let (winner_id, winner_tenant) = (winner.id, winner.tenant_id);

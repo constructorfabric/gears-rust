@@ -10,7 +10,6 @@ use uuid::Uuid;
 
 use super::{ControlPlaneService, DataPlaneService, EndpointSelector};
 use crate::domain::model;
-use crate::domain::repo::Tags;
 
 /// Facade that implements the public `ServiceGatewayClientV1` trait by
 /// delegating to the internal CP and DP services.
@@ -177,7 +176,7 @@ impl ServiceGatewayClientV1 for ServiceGatewayClientV1Facade {
         path: &str,
     ) -> Result<(oagw_sdk::Upstream, oagw_sdk::Route), CanonicalError> {
         self.cp
-            .resolve_proxy_target(&ctx, alias, method, path, Tags::Load)
+            .resolve_proxy_target_for_client(&ctx, alias, method, path)
             .await
             .map(|(u, r)| (upstream_to_sdk(u), route_to_sdk(r)))
             .map_err(CanonicalError::from)
@@ -996,7 +995,11 @@ mod tests {
         let selector = Arc::new(InvalidateRecorder::default());
         let dp = TestDpBuilder::new()
             .with_backend_selector(selector.clone())
-            .build_and_register(&hub, cp.clone());
+            .build_and_register(
+                &hub,
+                cp.clone(),
+                Arc::new(crate::domain::rate_limit::RateLimiter::new()),
+            );
         let gw = ServiceGatewayClientV1Facade::new(cp, dp, selector.clone());
         let ctx = provisioning_ctx(root).unwrap();
         let upstream_id = upstreams[0].request.id.unwrap();
