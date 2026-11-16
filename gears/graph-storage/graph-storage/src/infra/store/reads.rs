@@ -22,9 +22,9 @@ use toolkit_odata::{Page as OdataPage, SortDir};
 use uuid::Uuid;
 
 use crate::infra::projections::{
-    EdgeHop, EdgePayload, NodeIdent, NodeTyped, NodeViewRow, TypeName, TypeTraits,
-    edge_hop_columns, edge_payload_columns, node_ident_columns, node_typed_columns,
-    node_view_columns, type_name_columns, type_traits_columns,
+    EdgeHop, EdgeId, EdgePayload, NodeIdent, NodeTyped, NodeViewRow, TypeName, TypeTraits,
+    edge_hop_columns, edge_id_columns, edge_payload_columns, node_ident_columns,
+    node_typed_columns, node_view_columns, type_name_columns, type_traits_columns,
 };
 use crate::infra::storage::entity::{edge, graph_meta, gts_type, node};
 use crate::infra::storage::odata_mapper::NodeODataMapper;
@@ -665,7 +665,12 @@ pub async fn list_node_edges(
         Direction::Incoming => &[edge::Column::DstNodeId],
         Direction::Either => &[edge::Column::SrcNodeId, edge::Column::DstNodeId],
     };
-    let mut rows: Vec<edge::Model> = Vec::new();
+    // Ids first, payloads after. Each side reads `limit + 1` rows and the merge
+    // keeps at most `limit`, so reading whole rows here would fetch up to
+    // twice the page's payloads for `either` -- past the
+    // `edge_list_max_page x item_max_bytes` the startup check in `config.rs`
+    // sizes a page at. Only the ids that land on the page are read in full.
+    let mut ids: Vec<i64> = Vec::new();
     for side in sides {
         let mut select = edge::Entity::find()
             .secure()
@@ -685,24 +690,37 @@ pub async fn list_node_edges(
                     .add(edge::Column::Discriminator.is_in(query.discriminators.clone())),
             );
         }
-        rows.extend(
+        ids.extend(
             select
                 .order_by(edge::Column::Id, sea_orm::Order::Asc)
                 .limit(fetch)
-                .all(&conn)
+                .project_all(&conn, |query| edge_id_columns(query).into_model::<EdgeId>())
                 .await
-                .map_err(map_scope_err)?,
+                .map_err(map_scope_err)?
+                .into_iter()
+                .map(|row| row.id),
         );
     }
     // A self-loop is on both sides.
-    rows.sort_unstable_by_key(|row| row.id);
-    rows.dedup_by_key(|row| row.id);
-    let more = rows.len() > limit as usize;
-    rows.truncate(limit as usize);
-    let next_after = if more {
-        rows.last().map(|row| row.id)
+    ids.sort_unstable();
+    ids.dedup();
+    let more = ids.len() > limit as usize;
+    ids.truncate(limit as usize);
+    let next_after = if more { ids.last().copied() } else { None };
+    // An edge tombstoned between the two reads is simply not on the page; the
+    // position still moves past it.
+    let rows: Vec<edge::Model> = if ids.is_empty() {
+        Vec::new()
     } else {
-        None
+        edge::Entity::find()
+            .secure()
+            .scope_with(ctx.scope)
+            .filter(Condition::all().add(edge::Column::Id.is_in(ids)))
+            .filter(Condition::all().add(edge::Column::DeletedAt.is_null()))
+            .order_by(edge::Column::Id, sea_orm::Order::Asc)
+            .all(&conn)
+            .await
+            .map_err(map_scope_err)?
     };
 
     let mut endpoint_ids: Vec<i64> = rows
