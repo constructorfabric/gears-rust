@@ -431,15 +431,26 @@ pub async fn delete_node(
     Path(node_key): Path<String>,
 ) -> ApiResult<axum::response::Response> {
     use axum::response::IntoResponse as _;
-    match params.mode.as_deref() {
-        None | Some("soft") => {
+    match params.mode()? {
+        DeleteMode::Soft => {
+            // A purge precondition on a soft delete would be ignored, and a
+            // caller that sent `expected_created_at` to make sure it removes
+            // one node would be told it succeeded against whichever node
+            // holds the key. Refused rather than dropped.
+            if params.only_tombstoned || params.expected_created_at.is_some() {
+                return Err(DomainError::invalid(
+                    "`only_tombstoned` and `expected_created_at` need `mode=purge`; a soft \
+                     delete takes neither",
+                )
+                .into());
+            }
             let outcome = services.delete_node(target.call(&ctx), &node_key).await?;
             Ok(Json(dto::GraphDeleteResultDto::from(outcome)).into_response())
         }
         // `204` whether or not a node was stored under the key: a purge is
         // idempotent, so a caller retrying after an unknown outcome gets the
         // answer it got the first time (gears-rust #5194).
-        Some("purge") => {
+        DeleteMode::Purge => {
             let expected_created_at = params
                 .expected_created_at
                 .as_deref()
@@ -464,8 +475,29 @@ pub async fn delete_node(
                 .await?;
             Ok(axum::http::StatusCode::NO_CONTENT.into_response())
         }
-        Some(other) => {
-            Err(DomainError::invalid(format!("mode `{other}`; expected soft or purge")).into())
+    }
+}
+
+/// What `DELETE /nodes/{node_key}` does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeleteMode {
+    /// Tombstone the node and its incident edges (the default).
+    Soft,
+    /// Remove the node and every incident edge for good.
+    Purge,
+}
+
+impl DeleteNodeParams {
+    /// The mode named, parsed here rather than by serde so an unknown one is
+    /// refused with the problem document every other refusal of this surface
+    /// uses, not the extractor's plain-text rejection.
+    fn mode(&self) -> Result<DeleteMode, DomainError> {
+        match self.mode.as_deref() {
+            None | Some("soft") => Ok(DeleteMode::Soft),
+            Some("purge") => Ok(DeleteMode::Purge),
+            Some(other) => Err(DomainError::invalid(format!(
+                "mode `{other}`; expected soft or purge"
+            ))),
         }
     }
 }
