@@ -150,7 +150,7 @@ which kind its metric uses and calls the matching operations.
 | Kind          | What it bounds                                                            | How a module charges                                                                                                                  | How capacity comes back                                                                                                                                        |
 |---------------|---------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Rate limiting | The amount in a moving time window, for example 100 requests a minute     | A debit when it admits the work                                                                                                       | By itself, as the window moves; a return fails with an error                                                                                                   |
-| Consumption   | The amount used in a period, for example 1 M tokens a month               | A debit after the work, or a lease before work whose cost is known only afterwards, committed for the actual amount                   | At the period reset. A return gives back a charge for work that failed, in the current period; a released lease and the unused part of a commit charge nothing |
+| Consumption   | The amount used in a period, for example 1 M tokens a month               | A debit before work whose cost is known, or a lease before work whose cost is known only afterwards, held for the most the work can use and committed for the actual amount | At the period reset. A return gives back a charge for work that failed, in the current period; a released lease and the unused part of a commit charge nothing |
 | Allocation    | The amount held at one time, with no period, for example 20 parallel jobs | A lease while the resource is created, committed when it exists, or a debit. Growing a resource charges the added amount the same way | By a return: the whole amount when the resource is deleted, the removed part when it is reduced. A released lease charges nothing                              |
 
 ## 4. Scope
@@ -196,12 +196,14 @@ An allowed decision means the amount is charged; a denied decision means nothing
 
 The system **MUST** acquire a lease on an amount of one metric for a set of subjects for a requested time, and return
 either a lease token and its expiry or a denied decision. The system **MUST** commit a lease for an actual amount not
-above the held amount, and release a lease without a charge. A commit or release that succeeds returns no result; one
-that cannot be applied, for example because the lease has expired or the amount exceeds the held amount, **MUST**
-fail with an error and change nothing.
+above the held amount, and release a lease without a charge. A module holds the most that the work can use, for a time
+that covers the work, so the commit of completed work is never above the held amount. A commit or release that succeeds
+returns no result; one that cannot be applied, for example because the lease has expired or the amount exceeds the held
+amount, **MUST** fail with an error and change nothing.
 
 - **Rationale**: Modules that learn the real cost only after the work (for example, generated tokens) must reserve
-capacity first.
+capacity first. A quota limits work before it starts; it does not record use above its cap. Actual use, including use
+above a cap, is metered outside quotas.
 - **Actors**: `cpt-cf-quota-resolver-actor-consuming-module`
 
 #### Return
@@ -420,8 +422,9 @@ with the same operation name.
 
 **Main Flow**:
 1. The module receives a user request with the user's `SecurityContext`.
-2. It takes the user's principal type, id, and tenant from that context and acquires a lease for the estimated tokens
-   on the platform plane, with the subject in the principal form.
+2. It takes the user's principal type, id, and tenant from that context and acquires a lease for the most tokens
+   that the request can generate (its token limit), for a time that covers the generation, on the platform plane, with
+   the subject in the principal form.
 3. It runs the work and commits the lease on the platform plane for the tokens actually used.
 
 **Postconditions**:
@@ -481,11 +484,14 @@ with the same operation name.
 - The job knows the user's principal type, id, and tenant.
 
 **Main Flow**:
-1. The job debits on the platform plane with the subject in the principal form.
+1. Before the work, the job debits on the platform plane with the subject in the principal form.
 2. The system maps the principal and delegates.
 
 **Postconditions**:
 - The quotas that the backend applies to the user are charged.
+
+**Alternative Flows**:
+- **Denied**: the job does not do the work.
 
 ### Hold and Return Allocated Capacity
 
@@ -547,9 +553,7 @@ rate-limiting quota, fails and changes nothing.
 
 ## 13. Open Questions
 
-* **Charge for work already done.** A debit after the work, or a commit above the held amount, can be denied, and the
-  used amount is then not counted. Options: a debit that is never denied and may take a quota above its cap, or a
-  commit above the held amount.
+None.
 
 ## 14. Traceability
 
