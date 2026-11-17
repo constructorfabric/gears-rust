@@ -158,7 +158,7 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 
 #### Plugin sharing modes merge correctly across tenant hierarchy
 - **Scenario**: [positive-4.6-plugin-sharing-modes-merge-correctly-across-tenant-hierarchy.md](management-api/plugins/positive-4.6-plugin-sharing-modes-merge-correctly-across-tenant-hierarchy.md)
-- **Mechanism**: `sharing=inherit` → chain is parent + child. `sharing=enforce` → child cannot remove parent plugins. `sharing=private` → child does not see parent plugins.
+- **Mechanism**: `sharing=inherit` → chain is parent + child. `sharing=enforce` → no child at any depth, and no route (`private` included), can remove an enforced plugin or replace its config with the same `plugin_ref`. `sharing=private` → child does not see parent plugins. An ancestor route's enforced plugins apply at its owner's level: a child enforcing the same `plugin_ref` on its own upstream does not replace the route's config, whether the child's route shadows the parent's or the parent's is matched (`400 REQUIRED_HEADER_MISSING`); the closest-to-root enforcing level wins.
 
 #### Plugin usage tracking and GC eligibility
 - **Scenario**: [positive-4.7-plugin-usage-tracking-gc-eligibility-behavior.md](management-api/plugins/positive-4.7-plugin-usage-tracking-gc-eligibility-behavior.md)
@@ -194,7 +194,7 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 
 #### Hierarchical auth sharing modes
 - **Scenario**: [positive-9.8-hierarchical-auth-sharing-modes-behave-specified.md](proxy-api/authentication/positive-9.8-hierarchical-auth-sharing-modes-behave-specified.md)
-- **Mechanism**: `auth.sharing=inherit` + child provides auth → child override. `inherit` + child omits → parent auth. `enforce` → child cannot override. `private` → child must provide own.
+- **Mechanism**: `auth.sharing=inherit` + child provides auth → child override. `inherit` + child omits → parent auth. `enforce` → child cannot override. `private` → the parent's credential is never sent for a child, also when the child has no upstream of its own; child must provide own.
 
 ---
 
@@ -230,7 +230,7 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 
 #### Upstream sharing via ancestor hierarchy
 - **Scenario**: [positive-5.3-upstream-sharing-ancestor-hierarchy.md](proxy-api/authz/positive-5.3-upstream-sharing-ancestor-hierarchy.md)
-- **Mechanism**: Ancestor upstream visible to descendant when sharing mode permits. Descendant cannot see ancestor `private` configuration.
+- **Mechanism**: Ancestor upstream visible to descendant when sharing mode permits. Only its shared fields apply; its `private` configuration (upstream and routes) is neither applied nor returned.
 
 ---
 
@@ -286,7 +286,7 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 
 #### Hierarchical min() merge for descendant overrides
 - **Scenario**: [positive-18.6-hierarchical-min-merge-descendant-overrides.md](rate-limiting/positive-18.6-hierarchical-min-merge-descendant-overrides.md)
-- **Mechanism**: Parent `enforce 1000/min`, child `500/min` → effective `500/min`. Parent caps child.
+- **Mechanism**: Parent `enforce 1000/min`, child `500/min` → effective `500/min`, still `enforce`. Parent caps child and every tenant below it.
 
 #### Budget modes (allocated/shared/unlimited)
 - **Scenario**: [positive-18.7-budget-modes-behave-specified.md](rate-limiting/positive-18.7-budget-modes-behave-specified.md)
@@ -622,7 +622,11 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 
 #### Enforced ancestor limits still apply when alias shadowed
 - **Scenario**: [negative-6.2-enforced-ancestor-limits-still-apply-alias-shadowed.md](proxy-api/alias-resolution/negative-6.2-enforced-ancestor-limits-still-apply-alias-shadowed.md)
-- **What happens**: Parent `rate_limit.sharing=enforce` still constrains child effective limit even when alias is shadowed.
+- **What happens**: Parent `rate_limit.sharing=enforce` still constrains child effective limit even when alias is shadowed, and down a chain: top `enforce` → middle `inherit` (stricter) → leaf `private` keeps the middle's limit (`429`). A child's route shadowing the parent's route for the same path keeps the parent route's enforced guard (`400 REQUIRED_HEADER_MISSING`); the parent route's enforced limit is not applied across route shadowing yet.
+
+#### Private ancestor configuration never reaches a descendant
+- **Scenario**: [negative-6.6-private-ancestor-configuration-never-reaches-descendant.md](proxy-api/alias-resolution/negative-6.6-private-ancestor-configuration-never-reaches-descendant.md)
+- **What happens**: An ancestor's `private` auth, rate limit, plugins and route settings are not applied for a descendant, whether it resolves to the ancestor's upstream or binds the alias itself: no credential reaches the upstream, no `429`, no guard `400`. The descendant's requests do not reset the ancestor's private limit either (parent, child, parent under `scope=global`: `200`, `200`, `429`).
 
 #### Alias not found → stable 404
 - **Scenario**: [negative-6.4-alias-not-found-returns-stable-404.md](proxy-api/alias-resolution/negative-6.4-alias-not-found-returns-stable-404.md)
@@ -682,7 +686,7 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 
 #### Descendant override permissions enforced → blocked
 - **Scenario**: [negative-9.9-descendant-override-permissions-enforced.md](proxy-api/authentication/negative-9.9-descendant-override-permissions-enforced.md)
-- **What happens**: Without `oagw:upstream:override_auth`, child cannot override inherited auth. Same for `override_rate` and `add_plugins`.
+- **What happens**: Without `oagw:upstream:override_auth`, child cannot override inherited auth. Same for `override_rate` and `add_plugins`. An auth or CORS override that any ancestor enforces is refused (`400`), even when the closest ancestor shares it with `inherit`. A rate limit is refused only under an enforcing closest ancestor: a leaf allocating from an `inherit` parent's allocated budget under an enforcing grand-ancestor is accepted (`201`) and still held to the grand-ancestor's limit (`429`).
 
 #### Starlark sandbox restrictions → blocked
 - **Scenario**: [negative-11.8-starlark-sandbox-restrictions.md](plugins/transforms/negative-11.8-starlark-sandbox-restrictions.md)

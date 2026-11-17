@@ -37,9 +37,7 @@ use alias::{
 };
 use ancestor::ancestor_upstreams;
 use authz::{Action, Managed};
-use bind::{
-    BindOverrides, enforced_auth_server, validate_ancestor_bind, validate_secret_ref_accessible,
-};
+use bind::{BindOverrides, validate_bind_constraints, validate_secret_ref_accessible};
 use canonical::canonical_tags;
 pub(crate) use canonical::{route_drift, upstream_drift};
 #[cfg(test)]
@@ -310,12 +308,13 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
             }
         };
         // The pair carries settings merged from the upstreams it is built
-        // from (the selected one and the ancestors that share with it): the
-        // client needs `read` on each of them, and on the route it gets back
-        // (the proxy hot path holds a grant and calls
-        // `resolve_proxy_target`). An ancestor's upstream that shares nothing
-        // changes nothing in the answer and is not asked about.
-        for source in &sources {
+        // from (the selected one and the ancestors that share with it) and
+        // the enforced plugins of the ancestor routes the matched one
+        // shadows: the client needs `read` on each of them, and on the route
+        // it gets back (the proxy hot path holds a grant and calls
+        // `resolve_proxy_target`). An ancestor's upstream or route that adds
+        // nothing to the answer is not asked about.
+        for source in &sources.upstreams {
             authz::authorize_owned(
                 enforcer,
                 ctx,
@@ -333,6 +332,16 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
             route.tenant_id,
         )
         .await?;
+        for shadowed in &sources.routes {
+            authz::authorize_owned(
+                enforcer,
+                ctx,
+                Managed::Route,
+                Action::Read(shadowed.id),
+                shadowed.tenant_id,
+            )
+            .await?;
+        }
         Ok((upstream, route))
     }
 
@@ -502,12 +511,10 @@ impl ControlPlaneServiceImpl {
         // Check if an ancestor tenant has an upstream with this alias.
         // If so, this is a "bind" operation requiring ancestor bind validation.
         let ancestors = ancestor_upstreams(&*self.upstreams, &tenant_chain, &alias).await?;
-        let ancestor = ancestors.first().cloned();
-        validate_ancestor_bind(
+        validate_bind_constraints(
             ctx,
             &self.policy_enforcer,
-            ancestor.as_ref(),
-            enforced_auth_server(&ancestors),
+            &ancestors,
             &BindOverrides {
                 server: &req.server,
                 auth: req.auth.as_ref(),
@@ -529,7 +536,7 @@ impl ControlPlaneServiceImpl {
         self.validate_budget_allocation(
             ctx,
             tenant_id,
-            ancestor.as_ref(),
+            ancestors.first(),
             &alias,
             req.rate_limit.as_ref(),
         )
@@ -628,12 +635,10 @@ impl ControlPlaneServiceImpl {
         let tenant_chain = self.build_tenant_chain(ctx).await?;
         let ancestors =
             ancestor_upstreams(&*self.upstreams, &tenant_chain, &existing.alias).await?;
-        let ancestor = ancestors.first().cloned();
-        validate_ancestor_bind(
+        validate_bind_constraints(
             ctx,
             &self.policy_enforcer,
-            ancestor.as_ref(),
-            enforced_auth_server(&ancestors),
+            &ancestors,
             &BindOverrides {
                 server: &existing.server,
                 auth: req.auth.as_ref(),
@@ -655,7 +660,7 @@ impl ControlPlaneServiceImpl {
         self.validate_budget_allocation(
             ctx,
             tenant_id,
-            ancestor.as_ref(),
+            ancestors.first(),
             &existing.alias,
             req.rate_limit.as_ref(),
         )

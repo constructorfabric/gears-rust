@@ -223,6 +223,12 @@ pub struct RateLimitConfig {
     /// when `budget.mode == Shared` — causes all children to share one token
     /// bucket keyed to the pool owner. Not user-facing (never serialized).
     pub pool_owner_id: Option<Uuid>,
+    /// Whose limit this is: the upstream whose level set the effective
+    /// config, or the route when only the route has one. Set by the
+    /// hierarchical merge and never stored; the proxy adds it to the
+    /// upstream bucket key when it is not the selected upstream, so tenants
+    /// resolving different limits on one upstream get separate buckets.
+    pub limit_owner_id: Option<Uuid>,
 }
 
 /// Algorithm used to enforce a rate limit.

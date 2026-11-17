@@ -608,6 +608,7 @@ impl From<RateLimitConfig> for domain::RateLimitConfig {
             cost: v.cost,
             response_headers: v.response_headers,
             pool_owner_id: None,
+            limit_owner_id: None,
         }
     }
 }

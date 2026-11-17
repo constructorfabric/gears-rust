@@ -166,6 +166,7 @@ Prevents abuse, cost overruns, and protects external service agreements. Maintai
      - `ip`: `oagw:ratelimit:{resource_type}:{resource_id}:ip:{client_ip}:{window}` (falls back to `unknown` when no client IP)
      - `global`: `oagw:ratelimit:{resource_type}:{resource_id}:global:{window}` (no scope_id segment)
      - `route`: `oagw:ratelimit:{resource_type}:{resource_id}:route:{window}` (no scope_id segment)
+     - An upstream bucket whose effective limit is not owned by its `{resource_id}` (the selected upstream, or the pool owner for a shared budget) names its owner: `{resource_id}:via:{limit_owner_id}` in place of `{resource_id}`. Tenants resolving one upstream can get different limits (another tenant's `private` limit does not apply to them), and one shared bucket would be reset by the other's config on every request. A shared-budget pool keeps the pool owner as `{resource_id}`; tenants that inherit the owner's limit share its bucket, a tenant whose own limit applies gets its own.
 2. [x] - `p2` - Load or create in-memory `TokenBucket` for key - `inst-tb-2`
 3. [x] - `p2` - Refill tokens: `elapsed = now - last_update`, `new_tokens = elapsed_seconds × refill_rate`, `tokens = min(tokens + new_tokens, capacity)`, `last_update = now` - `inst-tb-3`
 4. [x] - `p2` - **IF** `tokens >= cost` - `inst-tb-4`

@@ -1211,6 +1211,7 @@ fn make_rate_limit(sharing: SharingMode, rate: u32, window: Window) -> RateLimit
         cost: 1,
         response_headers: true,
         pool_owner_id: None,
+        limit_owner_id: None,
     }
 }
 
@@ -1529,11 +1530,15 @@ fn effective_config_three_layer_merge() {
         crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID
     );
 
-    // Rate limit: min(1000, 500, 200) = 200/min.
-    assert_eq!(effective.rate_limit.unwrap().sustained.rate, 200);
+    // Rate limit: min(1000, 500, 200) = 200/min, still enforced.
+    let rate_limit = effective.rate_limit.unwrap();
+    assert_eq!(rate_limit.sustained.rate, 200);
+    assert_eq!(rate_limit.sharing, SharingMode::Enforce);
 
-    // Plugins: enforced audit-log + rate-guard + transform-x.
-    let items = effective.plugins.unwrap().items;
+    // Plugins: enforced audit-log + rate-guard + transform-x, still enforced.
+    let plugins = effective.plugins.unwrap();
+    assert_eq!(plugins.sharing, SharingMode::Enforce);
+    let items = plugins.items;
     assert!(
         items
             .iter()
@@ -1662,10 +1667,10 @@ fn effective_config_route_cors_inherit_unions_with_upstream() {
 #[test]
 fn effective_config_cors_private_ancestor_not_inherited_when_absent() {
     // When ancestor CORS is Private and child has no CORS, effective should be None.
-    let t = Uuid::new_v4();
-    let mut root = make_upstream(t, "api", None, None, None, vec![]);
+    let (root_t, child_t) = (Uuid::new_v4(), Uuid::new_v4());
+    let mut root = make_upstream(root_t, "api", None, None, None, vec![]);
     root.cors = Some(make_cors(SharingMode::Private, vec!["https://root.com"]));
-    let child = make_upstream(t, "api", None, None, None, vec![]);
+    let child = make_upstream(child_t, "api", None, None, None, vec![]);
 
     let effective = compute_effective_config(&[root, child], None).unwrap();
     assert!(
@@ -1677,10 +1682,10 @@ fn effective_config_cors_private_ancestor_not_inherited_when_absent() {
 #[test]
 fn effective_config_cors_inherit_skips_private_ancestor_origins() {
     // When ancestor CORS is Private, its origins should not be unioned into Inherit descendant.
-    let t = Uuid::new_v4();
-    let mut root = make_upstream(t, "api", None, None, None, vec![]);
+    let (root_t, child_t) = (Uuid::new_v4(), Uuid::new_v4());
+    let mut root = make_upstream(root_t, "api", None, None, None, vec![]);
     root.cors = Some(make_cors(SharingMode::Private, vec!["https://root.com"]));
-    let mut child = make_upstream(t, "api", None, None, None, vec![]);
+    let mut child = make_upstream(child_t, "api", None, None, None, vec![]);
     child.cors = Some(make_cors(SharingMode::Inherit, vec!["https://child.com"]));
 
     let effective = compute_effective_config(&[root, child], None).unwrap();
@@ -1790,6 +1795,951 @@ fn effective_config_route_cors_merge_rejects_invalid_union() {
         result.is_err(),
         "Route CORS merge with credentials + wildcard must be rejected"
     );
+}
+
+// -- Private stays with its owner; enforce is sticky (#4975) --
+
+fn noop_auth(sharing: SharingMode) -> AuthConfig {
+    AuthConfig {
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
+        sharing,
+        config: None,
+    }
+}
+
+/// `items` are `(plugin_ref, marker)`; the marker goes to the binding's
+/// config under `"by"`, to tell which level's binding won.
+fn plugins_of(sharing: SharingMode, items: &[(&str, &str)]) -> PluginsConfig {
+    PluginsConfig {
+        sharing,
+        items: items
+            .iter()
+            .map(|(plugin_ref, by)| PluginBinding {
+                plugin_ref: (*plugin_ref).into(),
+                config: HashMap::from([("by".to_owned(), (*by).to_owned())]),
+            })
+            .collect(),
+    }
+}
+
+fn plugin_refs(plugins: Option<&PluginsConfig>) -> Vec<(&str, &str)> {
+    plugins
+        .into_iter()
+        .flat_map(|p| &p.items)
+        .map(|b| {
+            (
+                b.plugin_ref.as_str(),
+                b.config.get("by").map_or("", String::as_str),
+            )
+        })
+        .collect()
+}
+
+fn route_on(upstream: &Upstream, plugins: Option<PluginsConfig>) -> Route {
+    Route {
+        id: Uuid::new_v4(),
+        tenant_id: upstream.tenant_id,
+        upstream_id: upstream.id,
+        match_rules: MatchRules {
+            http: None,
+            grpc: None,
+        },
+        plugins,
+        rate_limit: None,
+        cors: None,
+        tags: vec![],
+        priority: 0,
+        enabled: true,
+        managed_by: ManagedBy::Api,
+    }
+}
+
+const RH: &str = crate::domain::gts_helpers::REQUIRED_HEADERS_GUARD_PLUGIN_ID;
+const RID: &str = crate::domain::gts_helpers::REQUEST_ID_TRANSFORM_PLUGIN_ID;
+const CHAT_PATH: &str = "/v1/chat/completions";
+
+/// A child with no upstream of its own resolves to the ancestor's, and gets
+/// only what the ancestor shares: its private auth is not sent for the
+/// child, through the proxy's resolution and the SDK's.
+#[tokio::test]
+async fn a_private_ancestor_auth_never_reaches_a_child_without_an_upstream() {
+    let (root, child) = (Uuid::new_v4(), Uuid::new_v4());
+    let resolver = MockTenantResolverClient::with_hierarchy(vec![TenantId(root), TenantId(child)]);
+    let svc = make_service_with_resolver(resolver);
+
+    let root_ctx = test_ctx(root);
+    let mut req = make_create_upstream_hostname();
+    req.auth = Some(noop_auth(SharingMode::Private));
+    req.rate_limit = Some(make_rate_limit(SharingMode::Inherit, 100, Window::Minute));
+    let root_up = svc.create_upstream(&root_ctx, req).await.unwrap();
+    svc.create_route(&root_ctx, make_create_route(root_up.id))
+        .await
+        .unwrap();
+
+    let child_ctx = test_ctx(child);
+    let chain = svc.build_tenant_chain(&child_ctx).await.unwrap();
+    for tags in [Tags::Skip, Tags::Load] {
+        let (effective, _) = svc
+            .resolve_alias(
+                &child_ctx,
+                &chain,
+                &root_up.alias,
+                Some(("POST", CHAT_PATH)),
+                tags,
+            )
+            .await
+            .unwrap();
+        assert_eq!(effective.id, root_up.id);
+        assert!(effective.auth.is_none(), "{:?}", effective.auth);
+        assert_eq!(effective.rate_limit.map(|r| r.sustained.rate), Some(100));
+    }
+    let (effective, _) = svc
+        .resolve_proxy_target_for_client(&child_ctx, &root_up.alias, "POST", CHAT_PATH)
+        .await
+        .unwrap();
+    assert!(effective.auth.is_none(), "{:?}", effective.auth);
+
+    // The owner keeps it.
+    let root_chain = svc.build_tenant_chain(&root_ctx).await.unwrap();
+    let (own, _) = svc
+        .resolve_alias(&root_ctx, &root_chain, &root_up.alias, None, Tags::Load)
+        .await
+        .unwrap();
+    assert!(own.auth.is_some());
+}
+
+/// An ancestor's private limit, plugins and CORS take no part in a child's
+/// merge: neither when the child sets the field with `inherit` (no `min`
+/// against the private limit, no concatenation) nor when it leaves it out.
+#[tokio::test]
+async fn private_ancestor_limit_plugins_and_cors_stay_out_of_a_childs_merge() {
+    let (root, child) = (Uuid::new_v4(), Uuid::new_v4());
+    let resolver = MockTenantResolverClient::with_hierarchy(vec![TenantId(root), TenantId(child)]);
+    let svc = make_service_with_resolver(resolver);
+
+    let mut req = make_create_upstream_hostname();
+    req.auth = Some(noop_auth(SharingMode::Inherit));
+    req.rate_limit = Some(make_rate_limit(SharingMode::Private, 10, Window::Minute));
+    req.plugins = Some(plugins_of(SharingMode::Private, &[(RH, "root")]));
+    req.cors = Some(make_cors(SharingMode::Private, vec!["https://root.com"]));
+    svc.create_upstream(&test_ctx(root), req).await.unwrap();
+
+    let child_ctx = test_ctx(child);
+    let chain = svc.build_tenant_chain(&child_ctx).await.unwrap();
+
+    // The child binds without limit, plugins or CORS of its own.
+    let child_up = svc
+        .create_upstream(&child_ctx, make_create_upstream_hostname())
+        .await
+        .unwrap();
+    let (effective, _) = svc
+        .resolve_alias(&child_ctx, &chain, &child_up.alias, None, Tags::Load)
+        .await
+        .unwrap();
+    assert!(effective.auth.is_some(), "the shared auth applies");
+    assert!(effective.rate_limit.is_none(), "{:?}", effective.rate_limit);
+    assert!(effective.plugins.is_none(), "{:?}", effective.plugins);
+    assert!(effective.cors.is_none(), "{:?}", effective.cors);
+
+    // Its own `inherit` limit and plugins are not merged with the private ones.
+    let mut update = make_update_from_upstream(&child_up);
+    update.rate_limit = Some(make_rate_limit(SharingMode::Inherit, 1000, Window::Minute));
+    update.plugins = Some(plugins_of(SharingMode::Inherit, &[(RID, "child")]));
+    update.cors = Some(make_cors(SharingMode::Inherit, vec!["https://child.com"]));
+    svc.update_upstream(&child_ctx, child_up.id, update)
+        .await
+        .unwrap();
+    let (effective, _) = svc
+        .resolve_alias(&child_ctx, &chain, &child_up.alias, None, Tags::Load)
+        .await
+        .unwrap();
+    assert_eq!(effective.rate_limit.map(|r| r.sustained.rate), Some(1000));
+    assert_eq!(
+        plugin_refs(effective.plugins.as_ref()),
+        vec![(RID, "child")]
+    );
+    assert_eq!(
+        effective.cors.map(|c| c.allowed_origins),
+        Some(vec!["https://child.com".to_owned()])
+    );
+}
+
+/// An ancestor's route serves its descendants with its shared settings only:
+/// its private plugins and limit are neither merged nor returned.
+#[tokio::test]
+async fn an_ancestor_routes_private_plugins_and_limit_stay_with_its_owner() {
+    let (root, child) = (Uuid::new_v4(), Uuid::new_v4());
+    let resolver = MockTenantResolverClient::with_hierarchy(vec![TenantId(root), TenantId(child)]);
+    let svc = make_service_with_resolver(resolver);
+
+    let root_ctx = test_ctx(root);
+    let mut req = make_create_upstream_hostname();
+    req.auth = Some(noop_auth(SharingMode::Inherit));
+    let root_up = svc.create_upstream(&root_ctx, req).await.unwrap();
+    let mut route_req = make_create_route(root_up.id);
+    route_req.plugins = Some(plugins_of(SharingMode::Private, &[(RH, "root-route")]));
+    route_req.rate_limit = Some(make_rate_limit(SharingMode::Private, 1, Window::Minute));
+    svc.create_route(&root_ctx, route_req).await.unwrap();
+
+    let root_chain = svc.build_tenant_chain(&root_ctx).await.unwrap();
+    let (own, own_route) = svc
+        .resolve_alias(
+            &root_ctx,
+            &root_chain,
+            &root_up.alias,
+            Some(("POST", CHAT_PATH)),
+            Tags::Load,
+        )
+        .await
+        .unwrap();
+    assert_eq!(plugin_refs(own.plugins.as_ref()), vec![(RH, "root-route")]);
+    assert!(
+        own_route.unwrap().rate_limit.is_some(),
+        "the owner keeps it"
+    );
+
+    let child_ctx = test_ctx(child);
+    let chain = svc.build_tenant_chain(&child_ctx).await.unwrap();
+    let check = |(effective, route): (Upstream, Option<Route>)| {
+        let route = route.unwrap();
+        assert!(effective.plugins.is_none(), "{:?}", effective.plugins);
+        assert!(route.plugins.is_none(), "{:?}", route.plugins);
+        assert!(route.rate_limit.is_none(), "{:?}", route.rate_limit);
+    };
+
+    // Without an upstream of its own, and with one (the merge path).
+    check(
+        svc.resolve_alias(
+            &child_ctx,
+            &chain,
+            &root_up.alias,
+            Some(("POST", CHAT_PATH)),
+            Tags::Skip,
+        )
+        .await
+        .unwrap(),
+    );
+    svc.create_upstream(&child_ctx, make_create_upstream_hostname())
+        .await
+        .unwrap();
+    check(
+        svc.resolve_alias(
+            &child_ctx,
+            &chain,
+            &root_up.alias,
+            Some(("POST", CHAT_PATH)),
+            Tags::Skip,
+        )
+        .await
+        .unwrap(),
+    );
+}
+
+/// `min` takes the winning level's whole config; the limit stays enforced
+/// all the same, so a private leaf below an `inherit` middle level cannot
+/// escape it.
+#[test]
+fn an_enforced_limit_stays_enforced_down_a_chain() {
+    let root = make_upstream(
+        Uuid::new_v4(),
+        "a",
+        None,
+        Some(make_rate_limit(SharingMode::Enforce, 1000, Window::Minute)),
+        None,
+        vec![],
+    );
+    let mid = make_upstream(
+        Uuid::new_v4(),
+        "a",
+        None,
+        Some(make_rate_limit(SharingMode::Inherit, 500, Window::Minute)),
+        None,
+        vec![],
+    );
+    let leaf = make_upstream(
+        Uuid::new_v4(),
+        "a",
+        None,
+        Some(make_rate_limit(SharingMode::Private, 9999, Window::Minute)),
+        None,
+        vec![],
+    );
+
+    let effective = compute_effective_config(&[root.clone(), mid, leaf], None).unwrap();
+    let rate_limit = effective.rate_limit.unwrap();
+    assert_eq!(rate_limit.sustained.rate, 500);
+    assert_eq!(rate_limit.sharing, SharingMode::Enforce);
+
+    // A route below it: min, and still enforced.
+    let mut route = route_on(&root, None);
+    route.rate_limit = Some(make_rate_limit(SharingMode::Inherit, 100, Window::Minute));
+    let effective = compute_effective_config(&[root], Some(&route)).unwrap();
+    let rate_limit = effective.rate_limit.unwrap();
+    assert_eq!(rate_limit.sustained.rate, 100);
+    assert_eq!(rate_limit.sharing, SharingMode::Enforce);
+}
+
+/// An enforced plugin keeps its owner's config: a lower level or a route
+/// naming the same `plugin_ref` adds nothing and replaces nothing.
+#[test]
+fn an_enforced_plugin_cannot_be_replaced_by_the_same_ref() {
+    let root = make_upstream(
+        Uuid::new_v4(),
+        "a",
+        None,
+        None,
+        Some(plugins_of(SharingMode::Enforce, &[(RH, "root")])),
+        vec![],
+    );
+    let child = make_upstream(
+        Uuid::new_v4(),
+        "a",
+        None,
+        None,
+        Some(plugins_of(
+            SharingMode::Inherit,
+            &[(RH, "child"), (RID, "child")],
+        )),
+        vec![],
+    );
+    let route = route_on(
+        &child,
+        Some(plugins_of(SharingMode::Inherit, &[(RH, "route")])),
+    );
+
+    let effective = compute_effective_config(&[root.clone(), child.clone()], None).unwrap();
+    assert_eq!(
+        plugin_refs(effective.plugins.as_ref()),
+        vec![(RH, "root"), (RID, "child")]
+    );
+    let effective = compute_effective_config(&[root, child], Some(&route)).unwrap();
+    assert_eq!(
+        plugin_refs(effective.plugins.as_ref()),
+        vec![(RH, "root"), (RID, "child")]
+    );
+    assert_eq!(effective.plugins.unwrap().sharing, SharingMode::Enforce);
+}
+
+/// A private level drops what it inherits, except the enforced items, also
+/// when an `inherit` level between them made the effective plugins
+/// non-enforced before.
+#[test]
+fn an_enforced_plugin_survives_a_private_level_below_an_inherit_one() {
+    let root = make_upstream(
+        Uuid::new_v4(),
+        "a",
+        None,
+        None,
+        Some(plugins_of(SharingMode::Enforce, &[(RH, "root")])),
+        vec![],
+    );
+    let mid = make_upstream(
+        Uuid::new_v4(),
+        "a",
+        None,
+        None,
+        Some(plugins_of(SharingMode::Inherit, &[(RID, "mid")])),
+        vec![],
+    );
+    let leaf = make_upstream(
+        Uuid::new_v4(),
+        "a",
+        None,
+        None,
+        Some(plugins_of(SharingMode::Private, &[("custom", "leaf")])),
+        vec![],
+    );
+
+    let effective = compute_effective_config(&[root, mid, leaf], None).unwrap();
+    let plugins = effective.plugins.unwrap();
+    assert_eq!(
+        plugin_refs(Some(&plugins)),
+        vec![(RH, "root"), ("custom", "leaf")]
+    );
+    assert_eq!(plugins.sharing, SharingMode::Enforce);
+}
+
+/// A private route keeps the enforced upstream plugins and appends its own;
+/// it still replaces the ones nobody enforces.
+#[test]
+fn a_private_route_keeps_enforced_upstream_plugins() {
+    let t = Uuid::new_v4();
+    let enforced = make_upstream(
+        t,
+        "a",
+        None,
+        None,
+        Some(plugins_of(SharingMode::Enforce, &[(RH, "upstream")])),
+        vec![],
+    );
+    let route = route_on(
+        &enforced,
+        Some(plugins_of(SharingMode::Private, &[(RID, "route")])),
+    );
+    let effective =
+        compute_effective_config(std::slice::from_ref(&enforced), Some(&route)).unwrap();
+    let plugins = effective.plugins.unwrap();
+    assert_eq!(
+        plugin_refs(Some(&plugins)),
+        vec![(RH, "upstream"), (RID, "route")]
+    );
+    assert_eq!(plugins.sharing, SharingMode::Enforce);
+
+    let inherited = make_upstream(
+        t,
+        "a",
+        None,
+        None,
+        Some(plugins_of(SharingMode::Inherit, &[(RH, "upstream")])),
+        vec![],
+    );
+    let route = route_on(
+        &inherited,
+        Some(plugins_of(SharingMode::Private, &[(RID, "route")])),
+    );
+    let effective =
+        compute_effective_config(std::slice::from_ref(&inherited), Some(&route)).unwrap();
+    assert_eq!(
+        plugin_refs(effective.plugins.as_ref()),
+        vec![(RID, "route")]
+    );
+}
+
+/// A child's route shadowing the parent's for the same request keeps the
+/// parent route's enforced plugins (not replaced by the same `plugin_ref`);
+/// what the parent route only shares with `inherit` does not apply. The
+/// parent route's limit, enforced or not, leaves the effective limit as is:
+/// it is not charged across shadowing yet.
+#[test]
+fn a_shadowed_ancestor_route_applies_only_its_enforced_settings() {
+    let root = make_upstream(Uuid::new_v4(), "a", None, None, None, vec![]);
+    let child = make_upstream(Uuid::new_v4(), "a", None, None, None, vec![]);
+    let mut child_route = route_on(
+        &child,
+        Some(plugins_of(
+            SharingMode::Inherit,
+            &[(RH, "child-route"), (RID, "child-route")],
+        )),
+    );
+    child_route.rate_limit = Some(make_rate_limit(SharingMode::Inherit, 100, Window::Minute));
+    let merge = |shadowed: &[Route]| {
+        super::merge::compute_effective_config_reporting(
+            &[root.clone(), child.clone()],
+            Some(&child_route),
+            shadowed,
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .unwrap()
+    };
+    let unshadowed = merge(&[]).rate_limit;
+    assert_eq!(
+        unshadowed.as_ref().map(|r| (r.sustained.rate, r.sharing)),
+        Some((100, SharingMode::Inherit))
+    );
+
+    let mut root_route = route_on(
+        &root,
+        Some(plugins_of(SharingMode::Enforce, &[(RH, "root-route")])),
+    );
+    root_route.rate_limit = Some(make_rate_limit(SharingMode::Enforce, 10, Window::Minute));
+    let effective = merge(std::slice::from_ref(&root_route));
+    let plugins = effective.plugins.unwrap();
+    assert_eq!(
+        plugin_refs(Some(&plugins)),
+        vec![(RH, "root-route"), (RID, "child-route")]
+    );
+    assert_eq!(plugins.sharing, SharingMode::Enforce);
+    assert_eq!(effective.rate_limit, unshadowed);
+
+    root_route.plugins = Some(plugins_of(
+        SharingMode::Inherit,
+        &[("custom", "root-route")],
+    ));
+    root_route.rate_limit = Some(make_rate_limit(SharingMode::Inherit, 1, Window::Minute));
+    let effective = merge(std::slice::from_ref(&root_route));
+    assert_eq!(
+        plugin_refs(effective.plugins.as_ref()),
+        vec![(RH, "child-route"), (RID, "child-route")]
+    );
+    assert_eq!(effective.rate_limit, unshadowed);
+}
+
+/// An ancestor route's enforced plugin applies at its owner's level: a
+/// descendant enforcing the same `plugin_ref` on its own upstream does not
+/// pin its config first, whether the descendant's route shadows the
+/// ancestor's or the ancestor's route is the one matched.
+#[test]
+fn an_ancestor_routes_enforced_plugin_beats_a_descendants_enforce() {
+    let root = make_upstream(Uuid::new_v4(), "a", None, None, None, vec![]);
+    let child = make_upstream(
+        Uuid::new_v4(),
+        "a",
+        None,
+        None,
+        Some(plugins_of(
+            SharingMode::Enforce,
+            &[(RH, "child"), (RID, "child")],
+        )),
+        vec![],
+    );
+    let root_route = route_on(
+        &root,
+        Some(plugins_of(SharingMode::Enforce, &[(RH, "root-route")])),
+    );
+    let child_route = route_on(
+        &child,
+        Some(plugins_of(SharingMode::Inherit, &[(RH, "child-route")])),
+    );
+    let chain = [root, child];
+
+    let shadowing = super::merge::compute_effective_config_reporting(
+        &chain,
+        Some(&child_route),
+        std::slice::from_ref(&root_route),
+        &mut |_| {},
+        &mut |_| {},
+    )
+    .unwrap();
+    let matched = compute_effective_config(&chain, Some(&root_route)).unwrap();
+    for (name, effective) in [("shadowing", shadowing), ("matched", matched)] {
+        let plugins = effective.plugins.unwrap();
+        assert_eq!(
+            plugin_refs(Some(&plugins)),
+            vec![(RH, "root-route"), (RID, "child")],
+            "{name}"
+        );
+        assert_eq!(plugins.sharing, SharingMode::Enforce, "{name}");
+    }
+}
+
+/// For a `plugin_ref` enforced at several levels, the level closest to the
+/// root keeps its config. Levels run root-first; at each tenant its
+/// upstream, then its route. Non-enforcing levels above do not count.
+#[test]
+fn the_enforcing_level_closest_to_the_root_wins() {
+    let upstream = |plugins| make_upstream(Uuid::new_v4(), "a", None, None, plugins, vec![]);
+    let enforce = |by| Some(plugins_of(SharingMode::Enforce, &[(RH, by)]));
+    let merge = |chain: &[Upstream; 3], routes: [Option<PluginsConfig>; 3]| {
+        let [root_route, mid_route, leaf_route] = routes;
+        let shadowed: Vec<Route> = [(&chain[0], root_route), (&chain[1], mid_route)]
+            .into_iter()
+            .filter_map(|(up, plugins)| plugins.map(|p| route_on(up, Some(p))))
+            .collect();
+        let route = route_on(&chain[2], leaf_route);
+        let effective = super::merge::compute_effective_config_reporting(
+            chain,
+            Some(&route),
+            &shadowed,
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .unwrap();
+        plugin_refs(effective.plugins.as_ref())
+            .into_iter()
+            .map(|(r, by)| (r.to_owned(), by.to_owned()))
+            .collect::<Vec<_>>()
+    };
+    let wins = |by: &str| vec![(RH.to_owned(), by.to_owned())];
+    let all_routes = || {
+        [
+            enforce("root-route"),
+            enforce("mid-route"),
+            enforce("leaf-route"),
+        ]
+    };
+
+    let chain = [
+        upstream(Some(plugins_of(SharingMode::Inherit, &[(RH, "root")]))),
+        upstream(enforce("mid")),
+        upstream(enforce("leaf")),
+    ];
+    assert_eq!(merge(&chain, all_routes()), wins("root-route"));
+    assert_eq!(
+        merge(&chain, [None, enforce("mid-route"), enforce("leaf-route")]),
+        wins("mid")
+    );
+
+    let chain = [
+        upstream(enforce("root")),
+        upstream(enforce("mid")),
+        upstream(enforce("leaf")),
+    ];
+    assert_eq!(merge(&chain, all_routes()), wins("root"));
+
+    let chain = [upstream(None), upstream(None), upstream(enforce("leaf"))];
+    assert_eq!(
+        merge(&chain, [None, enforce("mid-route"), enforce("leaf-route")]),
+        wins("mid-route")
+    );
+}
+
+/// Resolution finds the routes a child's route shadows, through the proxy
+/// configuration cache and the repositories alike: the parent route's
+/// enforced plugins apply on the child's path, its `inherit` ones do not, its
+/// limit leaves the child route's in effect, and an encoded separator that
+/// would select the parent's enforced route is refused.
+async fn a_childs_route_does_not_lift_a_shadowed_enforced_route(backend: Backend) {
+    let (root, child) = (Uuid::new_v4(), Uuid::new_v4());
+    let stores = Stores::new(backend);
+    let (cached, uncached, _) = cached_and_uncached(&stores, &[root, child]);
+    let on_path = |upstream_id, path: &str, plugins, rate_limit| {
+        let mut req = make_create_route(upstream_id);
+        if let Some(http) = req.match_rules.http.as_mut() {
+            http.path = path.into();
+        }
+        req.plugins = Some(plugins);
+        req.rate_limit = Some(rate_limit);
+        req
+    };
+
+    let root_ctx = test_ctx(root);
+    let mut req = make_create_upstream_hostname();
+    req.auth = Some(noop_auth(SharingMode::Inherit));
+    let root_up = uncached.create_upstream(&root_ctx, req).await.unwrap();
+    for (path, sharing) in [
+        (CHAT_PATH, SharingMode::Enforce),
+        ("/v1/embeddings", SharingMode::Inherit),
+        ("/v2/admin", SharingMode::Enforce),
+    ] {
+        uncached
+            .create_route(
+                &root_ctx,
+                on_path(
+                    root_up.id,
+                    path,
+                    plugins_of(sharing, &[(RH, "root-route")]),
+                    make_rate_limit(sharing, 10, Window::Minute),
+                ),
+            )
+            .await
+            .unwrap();
+    }
+
+    let child_ctx = test_ctx(child);
+    let child_up = uncached
+        .create_upstream(&child_ctx, make_create_upstream_hostname())
+        .await
+        .unwrap();
+    let mut child_routes = Vec::new();
+    for path in [CHAT_PATH, "/v1/embeddings", "/v2"] {
+        let route = on_path(
+            child_up.id,
+            path,
+            plugins_of(SharingMode::Inherit, &[(RID, "child-route")]),
+            make_rate_limit(SharingMode::Inherit, 100, Window::Minute),
+        );
+        child_routes.push(uncached.create_route(&child_ctx, route).await.unwrap().id);
+    }
+
+    let chain = uncached.build_tenant_chain(&child_ctx).await.unwrap();
+    for (name, svc) in [("cached", &cached), ("uncached", &uncached)] {
+        for tags in [Tags::Skip, Tags::Load] {
+            let resolve = async |path| {
+                svc.resolve_alias(
+                    &child_ctx,
+                    &chain,
+                    &root_up.alias,
+                    Some(("POST", path)),
+                    tags,
+                )
+                .await
+            };
+
+            let (effective, route) = resolve(CHAT_PATH).await.unwrap();
+            assert_eq!(route.map(|r| r.id), Some(child_routes[0]), "{name}");
+            assert_eq!(
+                plugin_refs(effective.plugins.as_ref()),
+                vec![(RH, "root-route"), (RID, "child-route")],
+                "{name} {tags:?}"
+            );
+            let rate_limit = effective.rate_limit.unwrap();
+            assert_eq!(
+                (rate_limit.sustained.rate, rate_limit.sharing),
+                (100, SharingMode::Inherit),
+                "{name} {tags:?}"
+            );
+
+            let (effective, route) = resolve("/v1/embeddings").await.unwrap();
+            assert_eq!(route.map(|r| r.id), Some(child_routes[1]), "{name}");
+            assert_eq!(
+                plugin_refs(effective.plugins.as_ref()),
+                vec![(RID, "child-route")],
+                "{name} {tags:?}"
+            );
+            assert_eq!(
+                effective.rate_limit.map(|r| r.sustained.rate),
+                Some(100),
+                "{name} {tags:?}"
+            );
+
+            let err = resolve("/v2%2Fadmin").await.unwrap_err();
+            assert!(
+                matches!(&err, DomainError::Validation { reason, instance, .. }
+                    if *reason == oagw_sdk::field::INVALID_PROXY_PATH
+                        && instance == "/v2%2Fadmin"),
+                "{name} {tags:?}: {err:?}"
+            );
+            let (_, route) = resolve("/v2/x").await.unwrap();
+            assert_eq!(route.map(|r| r.id), Some(child_routes[2]), "{name}");
+        }
+    }
+}
+
+mod a_childs_route_does_not_lift_a_shadowed_enforced_route {
+    use super::{Backend, a_childs_route_does_not_lift_a_shadowed_enforced_route as case};
+
+    #[tokio::test]
+    async fn in_memory() {
+        case(Backend::Memory).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite() {
+        case(Backend::Db(
+            crate::infra::storage::testing::shared_sqlite().await,
+        ))
+        .await;
+    }
+}
+
+/// A child that enforces the parent route's guard `plugin_ref` on its own
+/// upstream binding does not replace the parent route's config, through the
+/// proxy configuration cache and the repositories alike: neither with a
+/// route of its own on the path (shadowing) nor without one (the parent's
+/// route matched).
+async fn a_childs_enforced_binding_does_not_replace_an_ancestor_routes_guard(backend: Backend) {
+    let (root, child) = (Uuid::new_v4(), Uuid::new_v4());
+    let stores = Stores::new(backend);
+    let (cached, uncached, _) = cached_and_uncached(&stores, &[root, child]);
+    let on_path = |upstream_id, path: &str, plugins| {
+        let mut req = make_create_route(upstream_id);
+        if let Some(http) = req.match_rules.http.as_mut() {
+            http.path = path.into();
+        }
+        req.plugins = Some(plugins);
+        req
+    };
+
+    let root_ctx = test_ctx(root);
+    let mut req = make_create_upstream_hostname();
+    req.auth = Some(noop_auth(SharingMode::Inherit));
+    let root_up = uncached.create_upstream(&root_ctx, req).await.unwrap();
+    for path in [CHAT_PATH, "/v1/embeddings"] {
+        uncached
+            .create_route(
+                &root_ctx,
+                on_path(
+                    root_up.id,
+                    path,
+                    plugins_of(SharingMode::Enforce, &[(RH, "root-route")]),
+                ),
+            )
+            .await
+            .unwrap();
+    }
+
+    let child_ctx = test_ctx(child);
+    let mut binding = make_create_upstream_hostname();
+    binding.plugins = Some(plugins_of(SharingMode::Enforce, &[(RH, "child")]));
+    let child_up = uncached.create_upstream(&child_ctx, binding).await.unwrap();
+    let child_route = uncached
+        .create_route(
+            &child_ctx,
+            on_path(
+                child_up.id,
+                CHAT_PATH,
+                plugins_of(SharingMode::Inherit, &[(RID, "child-route")]),
+            ),
+        )
+        .await
+        .unwrap();
+
+    let chain = uncached.build_tenant_chain(&child_ctx).await.unwrap();
+    for (name, svc) in [("cached", &cached), ("uncached", &uncached)] {
+        for tags in [Tags::Skip, Tags::Load] {
+            let resolve = async |path| {
+                svc.resolve_alias(
+                    &child_ctx,
+                    &chain,
+                    &root_up.alias,
+                    Some(("POST", path)),
+                    tags,
+                )
+                .await
+                .unwrap()
+            };
+
+            let (effective, route) = resolve(CHAT_PATH).await;
+            assert_eq!(route.map(|r| r.id), Some(child_route.id), "{name}");
+            assert_eq!(
+                plugin_refs(effective.plugins.as_ref()),
+                vec![(RH, "root-route"), (RID, "child-route")],
+                "{name} {tags:?}"
+            );
+
+            let (effective, route) = resolve("/v1/embeddings").await;
+            assert_eq!(
+                route.map(|r| r.upstream_id),
+                Some(root_up.id),
+                "{name} {tags:?}"
+            );
+            assert_eq!(
+                plugin_refs(effective.plugins.as_ref()),
+                vec![(RH, "root-route")],
+                "{name} {tags:?}"
+            );
+        }
+    }
+}
+
+mod a_childs_enforced_binding_does_not_replace_an_ancestor_routes_guard {
+    use super::{
+        Backend, a_childs_enforced_binding_does_not_replace_an_ancestor_routes_guard as case,
+    };
+
+    #[tokio::test]
+    async fn in_memory() {
+        case(Backend::Memory).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite() {
+        case(Backend::Db(
+            crate::infra::storage::testing::shared_sqlite().await,
+        ))
+        .await;
+    }
+}
+
+/// An enforcing grand-ancestor refuses a leaf's auth or CORS override
+/// although the closest ancestor shares the field with `inherit`. A rate limit
+/// is refused only under an enforcing closest ancestor: under a farther one
+/// the binding is accepted and the merge caps it.
+#[tokio::test]
+async fn overrides_under_an_enforcing_grand_ancestor() {
+    let (root, mid, leaf) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let resolver = MockTenantResolverClient::with_hierarchy(vec![
+        TenantId(root),
+        TenantId(mid),
+        TenantId(leaf),
+    ]);
+    let svc = make_service_with_resolver(resolver);
+
+    // The middle tenant binds first, so the root's enforce does not refuse it.
+    let mut mid_req = make_create_upstream_ip("svc");
+    mid_req.auth = Some(noop_auth(SharingMode::Inherit));
+    mid_req.rate_limit = Some(make_rate_limit(SharingMode::Private, 50, Window::Minute));
+    mid_req.cors = Some(make_cors(SharingMode::Inherit, vec!["https://mid.com"]));
+    svc.create_upstream(&test_ctx(mid), mid_req).await.unwrap();
+    let mut root_req = make_create_upstream_ip("svc");
+    root_req.auth = Some(noop_auth(SharingMode::Enforce));
+    root_req.rate_limit = Some(make_rate_limit(SharingMode::Enforce, 100, Window::Minute));
+    root_req.cors = Some(make_cors(SharingMode::Enforce, vec!["https://root.com"]));
+    svc.create_upstream(&test_ctx(root), root_req)
+        .await
+        .unwrap();
+
+    let leaf_ctx = test_ctx(leaf);
+    let (mut auth, mut cors) = (
+        make_create_upstream_ip("svc"),
+        make_create_upstream_ip("svc"),
+    );
+    auth.auth = Some(noop_auth(SharingMode::Private));
+    cors.cors = Some(make_cors(SharingMode::Private, vec!["https://leaf.com"]));
+    for (field, req) in [("auth", auth), ("cors", cors)] {
+        let err = svc.create_upstream(&leaf_ctx, req).await.unwrap_err();
+        assert!(
+            matches!(&err, DomainError::Validation { detail, .. }
+            if detail == &format!(
+                "cannot override {field}: ancestor upstream has sharing mode 'enforce'"
+            )),
+            "{field}: {err:?}"
+        );
+    }
+
+    let mut rate_limit = make_create_upstream_ip("svc");
+    rate_limit.rate_limit = Some(make_rate_limit(SharingMode::Private, 9999, Window::Minute));
+    let leaf_up = svc.create_upstream(&leaf_ctx, rate_limit).await.unwrap();
+    let chain = svc.build_tenant_chain(&leaf_ctx).await.unwrap();
+    let (effective, _) = svc
+        .resolve_alias(&leaf_ctx, &chain, &leaf_up.alias, None, Tags::Load)
+        .await
+        .unwrap();
+    let rate_limit = effective.rate_limit.unwrap();
+    assert_eq!(
+        (rate_limit.sustained.rate, rate_limit.sharing),
+        (100, SharingMode::Enforce)
+    );
+}
+
+/// Regression: a leaf allocates from its `inherit` parent's allocated budget
+/// under a root that enforces its limit (the budget check needs an explicit
+/// rate limit, so the leaf has to set one). Create and update are accepted,
+/// the budget still applies, and the root's enforce stays on the result.
+#[tokio::test]
+async fn allocated_budget_child_binds_under_an_enforcing_grand_ancestor() {
+    use crate::domain::model::{BudgetConfig, BudgetMode};
+
+    let (root, mid, leaf) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let resolver = MockTenantResolverClient::with_hierarchy(vec![
+        TenantId(root),
+        TenantId(mid),
+        TenantId(leaf),
+    ]);
+    let svc = make_service_with_resolver(resolver);
+
+    // The middle tenant binds first, so the root's enforce does not refuse it.
+    let mut mid_req = make_create_upstream_ip("svc");
+    let mut mid_limit = make_rate_limit(SharingMode::Inherit, 500, Window::Minute);
+    mid_limit.budget = Some(BudgetConfig {
+        mode: BudgetMode::Allocated,
+        total: Some(500),
+        overcommit_ratio: None,
+    });
+    mid_req.rate_limit = Some(mid_limit);
+    svc.create_upstream(&test_ctx(mid), mid_req).await.unwrap();
+    let mut root_req = make_create_upstream_ip("svc");
+    root_req.rate_limit = Some(make_rate_limit(SharingMode::Enforce, 1000, Window::Minute));
+    svc.create_upstream(&test_ctx(root), root_req)
+        .await
+        .unwrap();
+
+    let leaf_ctx = test_ctx(leaf);
+    let effective_limit = async || {
+        let chain = svc.build_tenant_chain(&leaf_ctx).await.unwrap();
+        let (effective, _) = svc
+            .resolve_alias(&leaf_ctx, &chain, "svc", None, Tags::Load)
+            .await
+            .unwrap();
+        let rate_limit = effective.rate_limit.unwrap();
+        (rate_limit.sustained.rate, rate_limit.sharing)
+    };
+
+    let mut req = make_create_upstream_ip("svc");
+    req.rate_limit = Some(make_rate_limit(SharingMode::Inherit, 100, Window::Minute));
+    let leaf_up = svc.create_upstream(&leaf_ctx, req).await.unwrap();
+    assert_eq!(effective_limit().await, (100, SharingMode::Enforce));
+
+    let mut update = make_update_from_upstream(&leaf_up);
+    update.rate_limit = Some(make_rate_limit(SharingMode::Inherit, 200, Window::Minute));
+    svc.update_upstream(&leaf_ctx, leaf_up.id, update)
+        .await
+        .unwrap();
+    assert_eq!(effective_limit().await, (200, SharingMode::Enforce));
+
+    let mut update = make_update_from_upstream(&leaf_up);
+    update.rate_limit = Some(make_rate_limit(SharingMode::Inherit, 600, Window::Minute));
+    let err = svc
+        .update_upstream(&leaf_ctx, leaf_up.id, update)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, DomainError::Validation { detail, .. }
+            if detail.starts_with("budget allocation exceeded")),
+        "{err:?}"
+    );
+    assert_eq!(effective_limit().await, (200, SharingMode::Enforce));
 }
 
 // -- Ancestor bind validation tests --
@@ -2381,6 +3331,9 @@ async fn update_no_ancestor_match_succeeds() {
     );
 }
 
+/// A full-replacement update is checked against the ancestor whatever it
+/// leaves out: a limit under an enforcing ancestor is refused, and removing
+/// it is accepted.
 #[tokio::test]
 async fn update_removing_rate_limit_still_validates_against_ancestor() {
     let root = Uuid::new_v4();
@@ -2394,32 +3347,45 @@ async fn update_removing_rate_limit_still_validates_against_ancestor() {
     root_req.rate_limit = Some(make_rate_limit(SharingMode::Enforce, 1000, Window::Minute));
     svc.create_upstream(&root_ctx, root_req).await.unwrap();
 
-    // Child creates upstream with rate_limit override.
+    // A child limit under the enforced one is refused on create.
     let child_ctx = test_ctx(child);
     let mut child_req = make_create_upstream_hostname();
     child_req.rate_limit = Some(make_rate_limit(SharingMode::Inherit, 500, Window::Minute));
-    let child_upstream = svc.create_upstream(&child_ctx, child_req).await;
-    // Create may fail due to enforce — that's fine, the point is the update path.
-    // If create succeeds (allow-all enforcer doesn't check sharing at create),
-    // then test the update.
-    if let Ok(child_upstream) = child_upstream {
-        // Update: set rate_limit to None (full-replacement removes it).
-        // This must still be validated — bind check should run even with None fields.
-        let mut update_req = make_update_from_upstream(&child_upstream);
-        update_req.rate_limit = None;
-        // With allow-all enforcer this succeeds, but the key thing is that
-        // validate_ancestor_bind was called (not skipped due to has_overrides guard).
-        let result = svc
-            .update_upstream(&child_ctx, child_upstream.id, update_req)
-            .await;
-        // Should succeed because allow-all enforcer passes bind check,
-        // and rate_limit:None doesn't trigger enforce rejection (no override).
-        assert!(
-            result.is_ok(),
-            "update with None rate_limit should still pass validation: {result:?}"
-        );
-        assert!(result.unwrap().rate_limit.is_none());
-    }
+    let err = svc
+        .create_upstream(&child_ctx, child_req)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, DomainError::Validation { detail, .. } if detail.contains("rate_limit")),
+        "{err:?}"
+    );
+
+    // Bound without a limit of its own.
+    let child_upstream = svc
+        .create_upstream(&child_ctx, make_create_upstream_hostname())
+        .await
+        .unwrap();
+
+    // Setting one on update is refused the same way.
+    let mut update_req = make_update_from_upstream(&child_upstream);
+    update_req.rate_limit = Some(make_rate_limit(SharingMode::Private, 9999, Window::Minute));
+    let err = svc
+        .update_upstream(&child_ctx, child_upstream.id, update_req)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, DomainError::Validation { detail, .. } if detail.contains("rate_limit")),
+        "{err:?}"
+    );
+
+    // Leaving it out passes and stores none.
+    let mut update_req = make_update_from_upstream(&child_upstream);
+    update_req.rate_limit = None;
+    let updated = svc
+        .update_upstream(&child_ctx, child_upstream.id, update_req)
+        .await
+        .unwrap();
+    assert!(updated.rate_limit.is_none());
 }
 
 #[tokio::test]
@@ -2747,6 +3713,118 @@ fn merge_rate_limit_private_cannot_bypass_enforced_ancestor() {
     // Enforced ancestor rate (100/min) must still constrain even though
     // descendant declared Private with a much higher rate.
     assert_eq!(effective.rate_limit.unwrap().sustained.rate, 100);
+}
+
+// -- limit_owner_id: whose limit the effective one is --
+
+fn limit_owner(chain: &[Upstream], route: Option<&Route>) -> Option<Uuid> {
+    compute_effective_config(chain, route)
+        .unwrap()
+        .rate_limit
+        .unwrap()
+        .limit_owner_id
+}
+
+fn rate_limited(sharing: SharingMode, rate: u32) -> Upstream {
+    let rl = make_rate_limit(sharing, rate, Window::Minute);
+    make_upstream(Uuid::new_v4(), "openai", None, Some(rl), None, vec![])
+}
+
+#[test]
+fn limit_owner_is_the_level_that_sets_the_limit() {
+    let root = rate_limited(SharingMode::Inherit, 1000);
+    let parent = rate_limited(SharingMode::Private, 1);
+    assert_eq!(
+        limit_owner(std::slice::from_ref(&root), None),
+        Some(root.id)
+    );
+    assert_eq!(
+        limit_owner(&[root, parent.clone()], None),
+        Some(parent.id),
+        "a private limit replaces the inherited one"
+    );
+}
+
+#[test]
+fn limit_owner_stays_the_ancestor_when_the_limit_is_inherited_unchanged() {
+    let root = rate_limited(SharingMode::Inherit, 1000);
+    let no_limit = make_upstream(Uuid::new_v4(), "openai", None, None, None, vec![]);
+    assert_eq!(
+        limit_owner(&[root.clone(), no_limit.clone()], None),
+        Some(root.id)
+    );
+
+    // The review case: the child resolves the parent's upstream without the
+    // parent's private limit, so the limit in effect is the root's.
+    let parent = rate_limited(SharingMode::Private, 1);
+    let parent_seen_by_child = super::merge::shared_upstream_view(parent.clone());
+    assert_eq!(
+        limit_owner(&[root.clone(), parent_seen_by_child], None),
+        Some(root.id)
+    );
+}
+
+#[test]
+fn limit_owner_is_the_winner_of_the_min() {
+    let loose_root = rate_limited(SharingMode::Inherit, 100);
+    let strict_child = rate_limited(SharingMode::Inherit, 10);
+    assert_eq!(
+        limit_owner(&[loose_root, strict_child.clone()], None),
+        Some(strict_child.id)
+    );
+
+    let strict_root = rate_limited(SharingMode::Inherit, 10);
+    let loose_child = rate_limited(SharingMode::Inherit, 100);
+    assert_eq!(
+        limit_owner(&[strict_root.clone(), loose_child], None),
+        Some(strict_root.id)
+    );
+
+    // Under an enforced ancestor a private limit is min-merged too.
+    let enforcing_root = rate_limited(SharingMode::Enforce, 100);
+    let loose_private = rate_limited(SharingMode::Private, 9999);
+    let strict_private = rate_limited(SharingMode::Private, 10);
+    assert_eq!(
+        limit_owner(&[enforcing_root.clone(), loose_private], None),
+        Some(enforcing_root.id)
+    );
+    assert_eq!(
+        limit_owner(&[enforcing_root, strict_private.clone()], None),
+        Some(strict_private.id)
+    );
+}
+
+#[test]
+fn a_winning_route_limit_keeps_the_upstream_level_owner() {
+    let root = rate_limited(SharingMode::Inherit, 1000);
+    let child = make_upstream(Uuid::new_v4(), "openai", None, None, None, vec![]);
+    let route = |upstream_id, rate_limit| Route {
+        id: Uuid::new_v4(),
+        tenant_id: root.tenant_id,
+        upstream_id,
+        match_rules: MatchRules {
+            http: None,
+            grpc: None,
+        },
+        plugins: None,
+        rate_limit,
+        cors: None,
+        tags: vec![],
+        priority: 0,
+        enabled: true,
+        managed_by: ManagedBy::Api,
+    };
+    let strict = Some(make_rate_limit(SharingMode::Inherit, 1, Window::Minute));
+
+    let r = route(root.id, strict.clone());
+    assert_eq!(
+        limit_owner(&[root.clone(), child.clone()], Some(&r)),
+        Some(root.id)
+    );
+
+    // No upstream-level limit: the route's own ID tells it apart from one.
+    let r = route(child.id, strict);
+    assert_eq!(limit_owner(&[child], Some(&r)), Some(r.id));
 }
 
 #[test]
@@ -4210,6 +5288,7 @@ async fn budget_allocated_rejects_over_allocation() {
         cost: 1,
         response_headers: true,
         pool_owner_id: None,
+        limit_owner_id: None,
     });
     svc.create_upstream(&root_ctx, root_req).await.unwrap();
 
@@ -4272,6 +5351,7 @@ async fn budget_allocated_allows_within_overcommit_ratio() {
         cost: 1,
         response_headers: true,
         pool_owner_id: None,
+        limit_owner_id: None,
     });
     svc.create_upstream(&root_ctx, root_req).await.unwrap();
 
@@ -4322,6 +5402,7 @@ async fn budget_unlimited_skips_allocation_validation() {
         cost: 1,
         response_headers: true,
         pool_owner_id: None,
+        limit_owner_id: None,
     });
     svc.create_upstream(&root_ctx, root_req).await.unwrap();
 
@@ -4362,6 +5443,7 @@ async fn budget_shared_skips_allocation_validation() {
         cost: 1,
         response_headers: true,
         pool_owner_id: None,
+        limit_owner_id: None,
     });
     svc.create_upstream(&root_ctx, root_req).await.unwrap();
 
@@ -4403,6 +5485,7 @@ fn merge_rate_limit_shared_sets_pool_owner_id() {
             cost: 1,
             response_headers: true,
             pool_owner_id: None,
+            limit_owner_id: None,
         }),
         None,
         vec![],
@@ -4457,6 +5540,7 @@ fn merge_rate_limit_shared_pool_owner_pinned_to_defining_ancestor() {
             cost: 1,
             response_headers: true,
             pool_owner_id: None,
+            limit_owner_id: None,
         }),
         None,
         vec![],
@@ -4527,6 +5611,7 @@ fn merge_rate_limit_private_non_enforced_does_not_inherit_pool_owner_id() {
             cost: 1,
             response_headers: true,
             pool_owner_id: None,
+            limit_owner_id: None,
         }),
         None,
         vec![],
@@ -4584,6 +5669,7 @@ fn compute_effective_single_element_shared_sets_pool_owner_id() {
             cost: 1,
             response_headers: true,
             pool_owner_id: None,
+            limit_owner_id: None,
         }),
         None,
         vec![],
@@ -4640,6 +5726,7 @@ async fn budget_allocated_ignores_cross_tree_upstreams() {
         cost: 1,
         response_headers: true,
         pool_owner_id: None,
+        limit_owner_id: None,
     });
     svc.create_upstream(&root_a_ctx, root_a_req).await.unwrap();
 
@@ -4698,6 +5785,7 @@ async fn budget_allocated_rejects_child_without_rate_limit() {
         cost: 1,
         response_headers: true,
         pool_owner_id: None,
+        limit_owner_id: None,
     });
     svc.create_upstream(&root_ctx, root_req).await.unwrap();
 
@@ -4746,6 +5834,7 @@ async fn budget_lowering_total_rejects_when_descendants_exceed() {
         cost: 1,
         response_headers: true,
         pool_owner_id: None,
+        limit_owner_id: None,
     });
     let root_upstream = svc.create_upstream(&root_ctx, root_req).await.unwrap();
 
@@ -4775,6 +5864,7 @@ async fn budget_lowering_total_rejects_when_descendants_exceed() {
         cost: 1,
         response_headers: true,
         pool_owner_id: None,
+        limit_owner_id: None,
     });
     let err = svc
         .update_upstream(&root_ctx, root_upstream.id, update_req)
@@ -4817,6 +5907,7 @@ async fn budget_lowering_total_allows_when_descendants_fit() {
         cost: 1,
         response_headers: true,
         pool_owner_id: None,
+        limit_owner_id: None,
     });
     let root_upstream = svc.create_upstream(&root_ctx, root_req).await.unwrap();
 
@@ -4846,6 +5937,7 @@ async fn budget_lowering_total_allows_when_descendants_fit() {
         cost: 1,
         response_headers: true,
         pool_owner_id: None,
+        limit_owner_id: None,
     });
     svc.update_upstream(&root_ctx, root_upstream.id, update_req)
         .await
@@ -4881,6 +5973,7 @@ fn merge_rate_limit_allocated_does_not_set_pool_owner_id() {
             cost: 1,
             response_headers: true,
             pool_owner_id: None,
+            limit_owner_id: None,
         }),
         None,
         vec![],
@@ -6439,6 +7532,15 @@ async fn cached_resolution_matches_uncached(backend: Backend) {
         )
         .await
         .unwrap();
+    // Shadowed by b's: its enforced guard still applies to b and leaf.
+    let root_embeddings = CreateRouteRequest {
+        plugins: Some(plugins_of(SharingMode::Enforce, &[(RH, "root")])),
+        ..route(root_up.id, vec![HttpMethod::Post], "/v1/embeddings", 0)
+    };
+    uncached
+        .create_route(&test_ctx(root), root_embeddings)
+        .await
+        .unwrap();
 
     let targets = [
         None,
@@ -6482,6 +7584,10 @@ async fn cached_resolution_matches_uncached(backend: Backend) {
         resolved(leaf, embeddings).await,
         (b_up.id, Some(b_embeddings.id))
     );
+    let (effective, _) = resolution(&cached, leaf, "api.openai.com", Some(embeddings))
+        .await
+        .unwrap();
+    assert_eq!(plugin_refs(effective.plugins.as_ref()), vec![(RH, "root")]);
     assert_eq!(
         resolved(a, chat).await.0,
         a_up.id,
@@ -7261,8 +8367,13 @@ fn layer(hosts: &[&str], auth: Option<SharingMode>, headers: Option<&str>) -> Up
 
 fn merged(chain: &[Upstream]) -> (Result<Upstream, DomainError>, Vec<super::merge::Withheld>) {
     let mut withheld = Vec::new();
-    let result =
-        super::merge::compute_effective_config_reporting(chain, None, &mut |w| withheld.push(w));
+    let result = super::merge::compute_effective_config_reporting(
+        chain,
+        None,
+        &[],
+        &mut |w| withheld.push(w),
+        &mut |_| {},
+    );
     (result, withheld)
 }
 
@@ -7899,6 +9010,7 @@ mod management_permissions {
             budget: None,
             response_headers: true,
             pool_owner_id: None,
+            limit_owner_id: None,
         };
         let limiter = Arc::new(RateLimiter::new());
         let (_, svc, rows) = services_with_rows(Arc::new(CapturingAuthZResolverClient::new()));
@@ -8461,6 +9573,228 @@ mod management_permissions {
         );
     }
 
+    /// Denies `read` on the listed resources only.
+    struct DenyReadOn(Vec<Uuid>);
+
+    #[async_trait::async_trait]
+    impl AuthZResolverApi for DenyReadOn {
+        async fn evaluate(
+            &self,
+            _ctx: toolkit_security::PlatformSecurityContext,
+            request: authz_resolver_sdk::EvaluationRequest,
+        ) -> Result<authz_resolver_sdk::EvaluationResponse, toolkit_canonical_errors::CanonicalError>
+        {
+            let denied = request.action.name == "read"
+                && request.resource.id.is_some_and(|id| self.0.contains(&id));
+            Ok(authz_resolver_sdk::EvaluationResponse {
+                decision: !denied,
+                context: authz_resolver_sdk::EvaluationResponseContext {
+                    constraints: Vec::new(),
+                    deny_reason: None,
+                },
+            })
+        }
+    }
+
+    /// The answer carries the enforced plugins of the parent route the
+    /// child's route shadows: a client without `read` on that route is
+    /// refused as for any route it may not read, with nothing in the error
+    /// naming the route. A parent route that adds nothing to the answer is
+    /// not asked about, and the proxy's resolution is unchanged.
+    #[tokio::test]
+    async fn client_resolution_checks_read_on_shadowed_enforcing_routes() {
+        use crate::domain::model::{AuthConfig, PluginBinding, PluginsConfig, SharingMode};
+        use std::collections::HashMap;
+
+        let (root, child) = (Uuid::new_v4(), Uuid::new_v4());
+        let stores = Stores::new(Backend::Memory);
+        let build = |enforcer| {
+            ControlPlaneServiceImpl::new(
+                stores.upstreams.clone(),
+                stores.routes.clone(),
+                Arc::new(MockTenantResolverClient::with_hierarchy(vec![
+                    TenantId(root),
+                    TenantId(child),
+                ])),
+                enforcer,
+                Arc::new(MockCredStoreClient::empty()),
+                Arc::new(SsrfGuard::disabled()),
+                None,
+            )
+        };
+        let guard = |sharing| PluginsConfig {
+            sharing,
+            items: vec![PluginBinding {
+                plugin_ref: crate::domain::gts_helpers::REQUIRED_HEADERS_GUARD_PLUGIN_ID.into(),
+                config: HashMap::from([("by".to_owned(), "root-route".to_owned())]),
+            }],
+        };
+        let on_path = |upstream_id, path: &str, plugins| {
+            let mut req = make_create_route(upstream_id);
+            if let Some(http) = req.match_rules.http.as_mut() {
+                http.path = path.into();
+            }
+            req.plugins = plugins;
+            req
+        };
+        let allowed = build(allow_all_enforcer());
+        let (root_ctx, child_ctx) = (test_ctx(root), test_ctx(child));
+        let mut shared = make_create_upstream_hostname();
+        shared.auth = Some(AuthConfig {
+            plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
+            sharing: SharingMode::Inherit,
+            config: None,
+        });
+        let root_up = allowed.create_upstream(&root_ctx, shared).await.unwrap();
+        let mut root_routes = Vec::new();
+        for (path, sharing) in [
+            ("/v1/chat/completions", SharingMode::Enforce),
+            ("/v1/embeddings", SharingMode::Inherit),
+        ] {
+            let route = on_path(root_up.id, path, Some(guard(sharing)));
+            root_routes.push(allowed.create_route(&root_ctx, route).await.unwrap().id);
+        }
+        let child_up = allowed
+            .create_upstream(&child_ctx, make_create_upstream_hostname())
+            .await
+            .unwrap();
+        for path in ["/v1/chat/completions", "/v1/embeddings"] {
+            allowed
+                .create_route(&child_ctx, on_path(child_up.id, path, None))
+                .await
+                .unwrap();
+        }
+        let has_guard = |upstream: &Upstream| {
+            upstream.plugins.as_ref().is_some_and(|p| {
+                p.items
+                    .iter()
+                    .any(|b| b.config.get("by").is_some_and(|by| by == "root-route"))
+            })
+        };
+
+        // Granted: the answer carries the parent route's guard.
+        let (effective, route) = allowed
+            .resolve_proxy_target_for_client(
+                &child_ctx,
+                &root_up.alias,
+                "POST",
+                "/v1/chat/completions",
+            )
+            .await
+            .unwrap();
+        assert_eq!(route.upstream_id, child_up.id);
+        assert!(has_guard(&effective), "{:?}", effective.plugins);
+
+        let no_root_routes = build(PolicyEnforcer::new(Arc::new(DenyReadOn(
+            root_routes.clone(),
+        ))));
+        let denied = no_root_routes
+            .resolve_proxy_target_for_client(
+                &child_ctx,
+                &root_up.alias,
+                "POST",
+                "/v1/chat/completions",
+            )
+            .await;
+        match &denied {
+            Err(DomainError::Forbidden { detail, .. }) => {
+                assert!(!detail.contains(&root_routes[0].to_string()), "{detail}");
+            }
+            other => panic!("expected Forbidden, got {other:?}"),
+        }
+        assert_forbidden_on(denied, DeniedOn::Route);
+
+        // The parent's `inherit` route adds nothing to the answer.
+        let (effective, _) = no_root_routes
+            .resolve_proxy_target_for_client(&child_ctx, &root_up.alias, "POST", "/v1/embeddings")
+            .await
+            .unwrap();
+        assert!(!has_guard(&effective), "{:?}", effective.plugins);
+
+        // The proxy holds a grant and is not asked for `read`.
+        let (effective, _) = no_root_routes
+            .resolve_proxy_target(
+                &crate::domain::services::ProxyGrant::for_tests(child_ctx.clone()),
+                &root_up.alias,
+                "POST",
+                "/v1/chat/completions",
+                Tags::Skip,
+            )
+            .await
+            .unwrap();
+        assert!(has_guard(&effective), "{:?}", effective.plugins);
+    }
+
+    /// A shadowed parent route whose enforced `plugin_ref` the root upstream
+    /// already enforces adds nothing to the answer: the root's config stays,
+    /// and the client needs no `read` on that route.
+    #[tokio::test]
+    async fn client_resolution_skips_read_on_shadowed_routes_whose_enforce_is_taken() {
+        use crate::domain::model::{PluginBinding, PluginsConfig, SharingMode};
+        use std::collections::HashMap;
+
+        let (root, child) = (Uuid::new_v4(), Uuid::new_v4());
+        let stores = Stores::new(Backend::Memory);
+        let build = |enforcer| {
+            ControlPlaneServiceImpl::new(
+                stores.upstreams.clone(),
+                stores.routes.clone(),
+                Arc::new(MockTenantResolverClient::with_hierarchy(vec![
+                    TenantId(root),
+                    TenantId(child),
+                ])),
+                enforcer,
+                Arc::new(MockCredStoreClient::empty()),
+                Arc::new(SsrfGuard::disabled()),
+                None,
+            )
+        };
+        let guard = |by: &str| PluginsConfig {
+            sharing: SharingMode::Enforce,
+            items: vec![PluginBinding {
+                plugin_ref: crate::domain::gts_helpers::REQUIRED_HEADERS_GUARD_PLUGIN_ID.into(),
+                config: HashMap::from([("by".to_owned(), by.to_owned())]),
+            }],
+        };
+        let allowed = build(allow_all_enforcer());
+        let (root_ctx, child_ctx) = (test_ctx(root), test_ctx(child));
+        let mut root_req = make_create_upstream_hostname();
+        root_req.plugins = Some(guard("root-upstream"));
+        let root_up = allowed.create_upstream(&root_ctx, root_req).await.unwrap();
+        let mut root_route = make_create_route(root_up.id);
+        root_route.plugins = Some(guard("root-route"));
+        let root_route = allowed.create_route(&root_ctx, root_route).await.unwrap();
+        let child_up = allowed
+            .create_upstream(&child_ctx, make_create_upstream_hostname())
+            .await
+            .unwrap();
+        allowed
+            .create_route(&child_ctx, make_create_route(child_up.id))
+            .await
+            .unwrap();
+
+        let no_root_route = build(PolicyEnforcer::new(Arc::new(DenyReadOn(vec![
+            root_route.id,
+        ]))));
+        let (effective, route) = no_root_route
+            .resolve_proxy_target_for_client(
+                &child_ctx,
+                &root_up.alias,
+                "POST",
+                "/v1/chat/completions",
+            )
+            .await
+            .unwrap();
+        assert_eq!(route.upstream_id, child_up.id);
+        let by: Vec<_> = effective
+            .plugins
+            .iter()
+            .flat_map(|p| &p.items)
+            .filter_map(|b| b.config.get("by").map(String::as_str))
+            .collect();
+        assert_eq!(by, vec!["root-upstream"]);
+    }
+
     /// The `read` check runs before resolution, so a denied caller learns
     /// nothing about which aliases exist or which paths are valid.
     #[tokio::test]
@@ -8713,6 +10047,7 @@ mod management_permissions {
             budget: None,
             response_headers: true,
             pool_owner_id: None,
+            limit_owner_id: None,
         };
         let limiter = Arc::new(RateLimiter::new());
         let svc = make_service().with_rate_limiter(limiter.clone());
@@ -8845,8 +10180,7 @@ async fn empty_scope_denies_each_ancestor_permission() {
             let result = super::bind::validate_bind_constraints(
                 &test_ctx(Uuid::from_u128(2)),
                 &pep,
-                &ancestor,
-                None,
+                std::slice::from_ref(&ancestor),
                 &overrides,
             )
             .await;
@@ -8909,6 +10243,7 @@ mod write_validation {
             budget: None,
             response_headers: true,
             pool_owner_id: None,
+            limit_owner_id: None,
         }
     }
 

@@ -736,6 +736,7 @@ mod tests {
             cost: 1,
             response_headers: true,
             pool_owner_id: None,
+            limit_owner_id: None,
         }
     }
 

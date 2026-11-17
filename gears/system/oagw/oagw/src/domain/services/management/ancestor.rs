@@ -11,8 +11,8 @@ use uuid::Uuid;
 ///
 /// `tenant_chain` is `[self, parent, ..., root]`; only `tenant_chain[1..]` is
 /// searched, regardless of enabled flags or sharing modes. Upstream create and
-/// update run this once: the closest goes to both bind validation and budget
-/// allocation validation, the whole list to the enforced-auth check.
+/// update run this once: the whole list goes to bind validation (enforced
+/// fields), the closest to budget allocation validation.
 pub(in crate::domain::services) async fn ancestor_upstreams(
     upstreams: &dyn UpstreamRepository,
     tenant_chain: &[Uuid],

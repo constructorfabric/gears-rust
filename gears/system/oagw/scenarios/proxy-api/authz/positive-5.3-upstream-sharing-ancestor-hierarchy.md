@@ -25,3 +25,4 @@ Content-Type: application/json
 - Alias resolves to ancestor upstream.
 - Descendant request is authorized only if upstream is visible (shared).
 - Effective configuration merges as designed (auth/rate/plugins).
+- Only the fields the ancestor shares apply. A field it keeps `private` (auth, rate limit, plugins, CORS, on the upstream or on its routes) is neither applied to nor returned for the descendant's request (see `negative-6.6`).
