@@ -7,9 +7,9 @@ use llm_gateway_sdk::{
     EmbeddingInput, EmbeddingInputType, EmbeddingRequest, EmbeddingResponse, EncodingFormat,
     InputTokensDetails, ItemStatus, LlmGatewayError, MediaInputMode, OutputTokensDetails,
     PassthroughApi, PassthroughCapability, PassthroughEndpoint, PassthroughEvent,
-    PassthroughJsonResponse, PassthroughRequest, PassthroughResponse, PassthroughUsage,
-    ProviderDetails, ProviderErrorCategory, ProviderFailure, ProviderPluginCapabilities,
-    RESPONSE_ID_HEADER, ResponseError, Usage, WebSearchCallOutput, WebSearchResult, WebSearchTool,
+    PassthroughJsonResponse, PassthroughRequest, PassthroughResponse, ProviderDetails,
+    ProviderErrorCategory, ProviderFailure, ProviderPluginCapabilities, RESPONSE_ID_HEADER,
+    ResponseError, Usage, WebSearchCallOutput, WebSearchResult, WebSearchTool,
 };
 use rust_decimal::Decimal;
 
@@ -225,17 +225,14 @@ fn passthrough_response_builders() {
     let event = PassthroughEvent::new(r#"{"type":"message_delta","usage":{}}"#)
         .with_event("message_delta")
         .with_output_text("Hello")
-        .with_usage(PassthroughUsage::at(Usage::reported(10, 4), "/usage"));
+        .with_usage(Usage::reported(10, 4));
     assert!(event.relay);
     assert_eq!(event.output_text, "Hello");
-    assert_eq!(
-        event.usage.and_then(|u| u.pointer).as_deref(),
-        Some("/usage")
-    );
+    assert_eq!(event.usage.map(|u| u.output_tokens), Some(4));
 
     let hidden = PassthroughEvent::new("{}")
         .not_relayed()
-        .with_usage(PassthroughUsage::detached(Usage::reported(1, 1)));
+        .with_usage(Usage::reported(1, 1));
     assert!(!hidden.relay);
 
     let response = PassthroughResponse::Json(Box::new(json));

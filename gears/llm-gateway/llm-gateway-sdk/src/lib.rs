@@ -46,7 +46,7 @@ pub use models::items::{
 pub use models::passthrough::{
     PassthroughApi, PassthroughCapability, PassthroughEndpoint, PassthroughEvent,
     PassthroughEventStream, PassthroughJsonResponse, PassthroughRequest, PassthroughResponse,
-    PassthroughUsage, PassthroughUsageExtension, RESPONSE_ID_HEADER,
+    RESPONSE_ID_HEADER,
 };
 pub use models::plugin::{MediaInputMode, ProviderCallCtx, ProviderPluginCapabilities};
 pub use models::role::Role;

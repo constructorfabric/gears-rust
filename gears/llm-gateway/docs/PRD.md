@@ -540,7 +540,7 @@ Cross-cutting concern — applies to all operations, no dedicated UC.
 
 The system **MUST** provide pass-through APIs for the OpenAI and Anthropic APIs, so that consumers built for those provider APIs can use the Gateway with the provider's native request and response format.
 
-Pass-through requests go through the same Gateway pipeline as requests to the unified API: authorization, model resolution, capability check, quota enforcement, provider credential selection, streaming supervision, usage tracking and reporting, and request traceability. Only the request and response format differs: the Gateway does not translate them to the unified API. The response **MUST** be enriched with Gateway usage (cost in AI credits and usage completeness), added to the provider's native usage object; in streaming, to the event that carries the final usage.
+Pass-through requests go through the same Gateway pipeline as requests to the unified API: authorization, model resolution, capability check, quota enforcement, provider credential selection, streaming supervision, usage tracking and reporting, and request traceability. Only the request and response format differs: the Gateway does not translate them to the unified API. The system **MUST NOT** add Gateway fields to the provider's native response or stream events (in particular, it does not add cost or usage completeness to the provider's native usage object), so that clients built for the provider API keep parsing them unchanged. The Gateway's usage, cost in AI credits, and usage completeness for the call are available through usage reporting, correlated by the Gateway response `id` returned in a header (below).
 
 The native response body carries only the provider's own id, so every pass-through response, success or error, sync or streaming, **MUST** return the Gateway response `id` (the gateway request identifier, `cpt-cf-llm-gateway-fr-request-traceability-v1`) in a response header, so that the consumer can correlate the call with its usage, cost, and logs.
 
@@ -548,7 +548,7 @@ Gateway errors on pass-through APIs, including `capability_not_supported`, **MUS
 
 Whether a model can be called through a pass-through API is part of the model capabilities in Model Registry: a model declares which pass-through APIs (OpenAI, Anthropic) it supports, and an administrator can disable that capability per model. The system **MUST** send a pass-through request only to a model whose capabilities include the matching pass-through API; otherwise the system **MUST** return a `capability_not_supported` error without calling the provider.
 
-Granting a model a pass-through capability is a trust decision of the administrator. Apart from the model substitution, the usage request, the usage enrichment, and the stateless rules described here, the system **MUST NOT** restrict or modify the native request based on its content; it reads only the fields needed for routing and the quota estimate (`model`, `stream`, output limit, input text) and the fields covered by the stateless and paid-tool rules below. The unified API rules on disabled capabilities, generation parameter policy (model defaults, override and extra-parameter gates), and provider-executed tools do not apply to pass-through requests, except the rule on paid provider tools below. The system still never executes tools and keeps no conversation state itself.
+Granting a model a pass-through capability is a trust decision of the administrator. Apart from the model substitution, the usage request, and the stateless rules described here, the system **MUST NOT** restrict or modify the native request based on its content; it reads only the fields needed for routing and the quota estimate (`model`, `stream`, output limit, input text) and the fields covered by the stateless and paid-tool rules below. The unified API rules on disabled capabilities, generation parameter policy (model defaults, override and extra-parameter gates), and provider-executed tools do not apply to pass-through requests, except the rule on paid provider tools below. The system still never executes tools and keeps no conversation state itself.
 
 Each pass-through API **MUST** also answer the provider's model listing endpoints (`GET /v1/models` and `GET /v1/models/{model_id}`) from Model Registry, without calling the provider, because clients built for the provider API discover models through them. The list **MUST** contain exactly the models available to the caller's tenant whose capabilities include that pass-through API, under the Gateway's model identifiers, in the provider's native format; a model outside that list is reported as not found in the provider's error format. Model listing creates no provider-side state, reserves no quota, and reports no usage.
 
@@ -1219,9 +1219,9 @@ LLM Gateway exposes a REST API (documented in DESIGN.md) and the `llm-gateway-sd
 4. Gateway checks the quota, selects the provider plugin, and calls the plugin (as in UC-001, steps 4–6)
 5. Plugin replaces the `model` field with the provider's model identifier, requests that the provider does not store the request or response, and forwards the native request to the provider via OAGW, naming the model's credential as in UC-001, without translating it to the unified API
 6. Plugin reads usage from the provider's native response and normalizes it into generic usage; Gateway computes the cost in AI credits from the model's cost rates
-7. Gateway reports usage and returns the provider's native response, with the Gateway's model identifier in `model` and enriched with Gateway usage (cost in AI credits, usage completeness); for a streaming request, returns the provider's native event stream with Gateway usage added to the event that carries the final usage
+7. Gateway reports usage (cost in AI credits, usage completeness) and returns the provider's native response, or for a streaming request the provider's native event stream, unchanged except for the Gateway's model identifier in `model`, with the Gateway response `id` in a header
 
-**Postconditions**: Native response returned with Gateway usage, usage reported.
+**Postconditions**: Native response returned, usage reported under the Gateway response `id`.
 
 **Alternative Flows**:
 - **Model does not support the pass-through API**: Gateway returns capability_not_supported without calling the provider.
@@ -1237,7 +1237,7 @@ LLM Gateway exposes a REST API (documented in DESIGN.md) and the `llm-gateway-sd
 - Requests to models without the matching pass-through capability are rejected before the provider is called
 - The model listing of a pass-through API returns exactly the tenant's available models with the matching pass-through capability, under the Gateway's model identifiers
 - Pass-through requests are subject to the same authorization, quota, credential, and usage reporting rules as requests to the unified API
-- The native response carries Gateway usage: cost in AI credits and usage completeness
+- The native response and stream events carry no Gateway fields; the call's cost in AI credits and usage completeness are reported under the Gateway response `id` returned in the response header
 - Gateway errors are parsed by the provider's SDK as ordinary API errors
 - The consumer's credentials are never forwarded to the provider
 - No provider-side state can be created or referenced through a pass-through API: the provider is always asked not to store requests and responses, and stateful fields and endpoints are rejected

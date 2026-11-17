@@ -8,20 +8,19 @@
 //! provider plugin that implements the route's API
 //! ([`crate::plugin_api::LlmGatewayProviderPluginClientV1::forward_passthrough`])
 //! and gets back the native response together with the generic usage read
-//! from it. The core prices that usage and adds the Gateway usage extensions
-//! ([`PassthroughUsageExtension`]) to the provider's native `usage` object.
+//! from it. The core prices that usage for quota settle and usage reporting
+//! but does not change the native body: the consumer gets the provider's
+//! native response as is (apart from `model`) and correlates it with its
+//! usage and cost through [`RESPONSE_ID_HEADER`].
 //!
 //! These are in-process values between the core and a plugin; only
-//! [`PassthroughApi`], the endpoint allowlist, and [`PassthroughUsageExtension`]
-//! have a wire form.
+//! [`PassthroughApi`] and the endpoint allowlist have a wire form.
 
 use std::pin::Pin;
 
-use futures_core::Stream;
-use rust_decimal::Decimal;
-
 use crate::errors::{LlmGatewayError, ProviderErrorCategory, ProviderFailure};
 use crate::models::core::Usage;
+use futures_core::Stream;
 
 /// Response header carrying the Gateway response `id` on every pass-through
 /// response, success or error, JSON or SSE (for SSE, sent with the response
@@ -76,7 +75,7 @@ pub struct PassthroughEndpoint {
     /// from Model Registry without calling the plugin.
     pub path: String,
     /// Whether the endpoint generates output: a metered endpoint gets a quota
-    /// lease, an AI credit cost, and usage enrichment; a non-metered one (for
+    /// lease, an AI credit cost, and a usage record; a non-metered one (for
     /// example Anthropic `/v1/messages/count_tokens`) gets none.
     pub metered: bool,
 }
@@ -187,71 +186,6 @@ impl PassthroughRequest {
     }
 }
 
-/// Generic usage the plugin read from a native response or event, and where
-/// the native usage object is.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct PassthroughUsage {
-    /// Generic usage normalized by the plugin, with `cost` left at 0 for the
-    /// core.
-    pub usage: Usage,
-    /// RFC 6901 JSON pointer, into the native body or event data, of the
-    /// provider's native `usage` object (e.g. `/usage`, `/response/usage`).
-    /// The core adds [`PassthroughUsageExtension`] there. `None` when there is
-    /// nothing to enrich (an event the consumer did not ask for and that is
-    /// not relayed).
-    pub pointer: Option<String>,
-}
-
-impl PassthroughUsage {
-    /// Usage located at `pointer` in the native body or event.
-    #[must_use]
-    pub fn at(usage: Usage, pointer: impl Into<String>) -> Self {
-        Self {
-            usage,
-            pointer: Some(pointer.into()),
-        }
-    }
-
-    /// Usage with no native object to enrich.
-    #[must_use]
-    pub fn detached(usage: Usage) -> Self {
-        Self {
-            usage,
-            pointer: None,
-        }
-    }
-}
-
-/// Gateway usage extensions the core adds to the provider's native `usage`
-/// object on a pass-through response or event: the same fields, with the same
-/// wire form, as the extensions of [`Usage`].
-#[derive(
-    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
-)]
-#[non_exhaustive]
-pub struct PassthroughUsageExtension {
-    /// Call cost in AI credits, computed by the core from the model's cost
-    /// rates. A JSON string (`"0.0125"`).
-    #[serde(with = "rust_decimal::serde::str")]
-    #[schemars(with = "String")]
-    pub cost: Decimal,
-    /// `false` when usage could not be determined reliably.
-    pub complete: bool,
-    /// `true` when the amounts are an estimate.
-    pub estimated: bool,
-}
-
-impl From<&Usage> for PassthroughUsageExtension {
-    fn from(usage: &Usage) -> Self {
-        Self {
-            cost: usage.cost,
-            complete: usage.complete,
-            estimated: usage.estimated,
-        }
-    }
-}
-
 /// A non-streaming pass-through response, or an error response the provider
 /// returned before a stream started.
 #[derive(Debug, Clone, PartialEq)]
@@ -262,9 +196,10 @@ pub struct PassthroughJsonResponse {
     /// The provider-native body, with `model` already replaced back with the
     /// Gateway model identifier.
     pub body: serde_json::Value,
-    /// Usage read from the body; `None` for a non-metered endpoint or an error
-    /// without usage.
-    pub usage: Option<PassthroughUsage>,
+    /// Generic usage the plugin read from the body, with `cost` left at 0 for
+    /// the core; `None` for a non-metered endpoint or an error without usage.
+    /// Used for quota settle and usage reporting; the body is not changed.
+    pub usage: Option<Usage>,
     /// For a provider error response: the normalized category the plugin
     /// mapped it to, which sets `x-should-retry` and the logged code. The
     /// native error body is still relayed unchanged.
@@ -289,7 +224,7 @@ impl PassthroughJsonResponse {
 
     /// Set the usage read from the body.
     #[must_use]
-    pub fn with_usage(mut self, usage: PassthroughUsage) -> Self {
+    pub fn with_usage(mut self, usage: Usage) -> Self {
         self.usage = Some(usage);
         self
     }
@@ -332,8 +267,10 @@ pub struct PassthroughEvent {
     /// provider token counting rules kept in the core for the usage
     /// estimate, as on the unified API.
     pub output_text: String,
-    /// Final usage, on the event that carries it.
-    pub usage: Option<PassthroughUsage>,
+    /// Final generic usage, on the event that carries it, with `cost` left at
+    /// 0 for the core. Used for quota settle and usage reporting; the event
+    /// data is not changed.
+    pub usage: Option<Usage>,
 }
 
 impl PassthroughEvent {
@@ -372,7 +309,7 @@ impl PassthroughEvent {
 
     /// Attach the final usage.
     #[must_use]
-    pub fn with_usage(mut self, usage: PassthroughUsage) -> Self {
+    pub fn with_usage(mut self, usage: Usage) -> Self {
         self.usage = Some(usage);
         self
     }
@@ -447,14 +384,5 @@ mod tests {
         assert!(caps.endpoint("/v1/messages").unwrap().metered);
         assert!(!caps.endpoint("/v1/messages/count_tokens").unwrap().metered);
         assert!(caps.endpoint("/v1/files").is_none());
-    }
-
-    #[test]
-    fn usage_extension_carries_cost_as_string() {
-        let usage = Usage::reported(10, 5).with_cost(Decimal::new(125, 4));
-        assert_eq!(
-            serde_json::to_value(PassthroughUsageExtension::from(&usage)).unwrap(),
-            serde_json::json!({ "cost": "0.0125", "complete": true, "estimated": false })
-        );
     }
 }
