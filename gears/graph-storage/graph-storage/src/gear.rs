@@ -5,6 +5,7 @@ use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use authz_resolver_sdk::pep::PolicyEnforcer;
+use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
 use toolkit::{
     DatabaseCapability, Gear, GearCtx, Healthcheck, HealthcheckResult, RestApiCapability,
@@ -22,17 +23,31 @@ use crate::domain::service::GraphServices;
 use crate::infra::embedding::fake::FakeEmbeddingProvider;
 use crate::infra::engine::PgGraphEngine;
 use crate::infra::store::{PgGraphStore, spaces};
+use crate::infra::tenants::HubTenantDirectory;
 
 /// The graph-storage gear.
-#[toolkit::gear(name = "graph-storage", deps = [authz_resolver], capabilities = [db, rest])]
+/// `stateful` for the offboarding worker: a fenced tenant's rows are removed
+/// in the background, so a deletion that began always finishes, whether or
+/// not anyone keeps asking.
+#[toolkit::gear(
+    name = "graph-storage",
+    deps = [authz_resolver],
+    capabilities = [db, rest, stateful],
+    lifecycle(entry = "serve", stop_timeout = "30s")
+)]
 pub struct GraphStorage {
     services: OnceLock<Arc<GraphServices>>,
+    /// The store, for the offboarding worker: kept here rather than handed
+    /// out by the services, which would make them a way to the store without
+    /// authorization.
+    store: OnceLock<Arc<dyn graph_storage_sdk::plugin_api::GraphStoreV1>>,
 }
 
 impl Default for GraphStorage {
     fn default() -> Self {
         Self {
             services: OnceLock::new(),
+            store: OnceLock::new(),
         }
     }
 }
@@ -72,7 +87,10 @@ impl Gear for GraphStorage {
         let provider = select_embedding_provider(&cfg).await?;
         let embedding = resolve_embedding_space(&db, provider, &cfg).await?;
 
-        let services = Arc::new(GraphServices::new(cfg, store, engine, enforcer, embedding));
+        let services = Arc::new(
+            GraphServices::new(cfg, store, engine, enforcer, embedding)
+                .with_tenant_directory(Arc::new(HubTenantDirectory::new(ctx.client_hub()))),
+        );
         self.services
             .set(Arc::clone(&services))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
@@ -81,6 +99,34 @@ impl Gear for GraphStorage {
             .register::<dyn GraphStorageClientV1>(Arc::new(GraphStorageLocalClient::new(services)));
 
         info!("graph-storage gear initialized");
+        Ok(())
+    }
+}
+
+impl GraphStorage {
+    /// Lifecycle entry: the offboarding worker, until shutdown.
+    ///
+    /// Every replica runs one. Two working on one tenant take turns on its
+    /// record, so they cannot double-count, and a restart resumes from the
+    /// store: the work is the fenced tenants whose deletion has not finished.
+    pub(crate) async fn serve(&self, cancel: CancellationToken) -> anyhow::Result<()> {
+        let services = self
+            .services
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("{}: serve invoked before init", Self::MODULE_NAME))?;
+        let store =
+            self.store.get().cloned().ok_or_else(|| {
+                anyhow::anyhow!("{}: serve invoked before init", Self::MODULE_NAME)
+            })?;
+        let settings = services.config().offboarding_worker()?;
+        info!(
+            batch = settings.batch().get(),
+            interval_secs = settings.interval().as_secs(),
+            step_timeout_secs = settings.step_timeout().as_secs(),
+            "graph-storage: offboarding worker started"
+        );
+        crate::domain::offboarding::run_worker(store, settings, cancel).await;
+        info!("graph-storage: offboarding worker stopped");
         Ok(())
     }
 }

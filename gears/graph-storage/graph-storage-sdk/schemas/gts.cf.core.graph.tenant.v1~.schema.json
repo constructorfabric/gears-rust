@@ -1,0 +1,17 @@
+{
+  "$id": "gts://gts.cf.core.graph.tenant.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "A tenant's graph as a whole: the authorization resource of the tenant_offboard permission. Not part of the graph ontology and never instantiated in the types-registry; it is published so a policy can name tenant offboarding without a wildcard.",
+  "x-gts-abstract": true,
+  "type": "object",
+  "required": [
+    "tenant_id"
+  ],
+  "properties": {
+    "tenant_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "The tenant whose graph the permission covers."
+    }
+  }
+}

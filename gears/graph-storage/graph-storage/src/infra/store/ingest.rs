@@ -330,20 +330,28 @@ pub async fn ingest(
             let subject = subject.clone();
             let producer = producer.clone();
             Box::pin(async move {
-                ingest_in_tx(
-                    Writer {
-                        tenant,
-                        scope: &scope,
-                        subject: &subject,
-                        budget,
-                    },
-                    &producer,
+                // A replay answers from its receipt and writes nothing, so it
+                // does not take the tenant's revision row at the end.
+                let outcome = super::offboarding::fenced_write(
+                    tenant,
+                    &scope,
                     tx,
-                    request,
-                    &embedding,
+                    |outcome: &IngestOutcome| !outcome.replayed,
+                    Box::pin(ingest_in_tx(
+                        Writer {
+                            tenant,
+                            scope: &scope,
+                            subject: &subject,
+                            budget,
+                        },
+                        &producer,
+                        tx,
+                        request,
+                        &embedding,
+                    )),
                 )
-                .await
-                .map_err(TxStoreError::from)
+                .await?;
+                Ok(outcome)
             })
         })
         .await
@@ -2208,213 +2216,247 @@ pub async fn soft_delete(
             let scope = scope.clone();
             let subject = subject.clone();
             Box::pin(async move {
-                let epoch = source_epoch(&scope, tx).await?;
-                let now = OffsetDateTime::now_utc();
-                let (nodes, edges) = match request {
-                    DeleteRequest::Node(key) => {
-                        // Live rows only; a row already tombstoned is settled
-                        // below as a no-op rather than as an absence.
-                        let live = node::Entity::find()
-                            .secure()
-                            .scope_with(&scope)
-                            .filter(Condition::all().add(node::Column::NodeKey.eq(key.clone())))
-                            .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
-                            .limit(1)
-                            .project_all(tx, |query| {
-                                node_ident_columns(query).into_model::<NodeIdent>()
-                            })
-                            .await
-                            .map_err(map_scope_err)?
-                            .into_iter()
-                            .next();
-                        let Some(model) = live else {
-                            return already_tombstoned_node(&scope, tx, &key, epoch).await;
-                        };
-
-                        let removed = node::Entity::update_many()
-                            .col_expr(node::Column::DeletedAt, Expr::value(Some(now)))
-                            .col_expr(
-                                node::Column::DeletedBySubjectId,
-                                Expr::value(Some(subject.subject_id)),
-                            )
-                            .col_expr(
-                                node::Column::DeletedBySubjectType,
-                                Expr::value(subject.subject_type.clone()),
-                            )
-                            .filter(
-                                Condition::all()
-                                    .add(node::Column::Id.eq(model.id))
-                                    .add(node::Column::DeletedAt.is_null()),
-                            )
-                            .secure()
-                            .scope_with(&scope)
-                            .exec(tx)
-                            .await
-                            .map_err(map_scope_err)?
-                            .rows_affected;
-                        // The node first, and its edges only if it was ours to
-                        // delete. The edges used to go first, so a delete that
-                        // then lost the node's compare-and-set had already
-                        // tombstoned them: the transaction committed those
-                        // writes on the no-op path below, and the answer said
-                        // `tombstoned_edges: 0` about edges it had just
-                        // deleted. Losing the node now means writing nothing
-                        // at all, which is what a no-op is.
-                        //
-                        // The row was live when it was read and is not now:
-                        // another delete landed in between, or a scope
-                        // replacement purged it. Either way the caller's
-                        // intent already holds, and rule 3 of the Soft Delete
-                        // Contract says so -- deleting an already-deleted row
-                        // is a no-op, not a failure, because a producer
-                        // retrying a delete whose response was lost cannot
-                        // tell the two apart from outside. The no-op settle
-                        // is the same answer the pre-read takes, and it
-                        // leaves the revision where it was rather than
-                        // bumping it for a write that did not happen.
-                        if removed == 0 {
-                            return already_tombstoned_node(&scope, tx, &key, epoch).await;
-                        }
-
-                        // Incident edges are tombstoned in the same
-                        // transaction: a node never outlives its edges'
-                        // visibility, and never the reverse.
-                        let incident = edge::Entity::find()
-                            .secure()
-                            .scope_with(&scope)
-                            .filter(
-                                sea_orm::Condition::any()
-                                    .add(edge::Column::SrcNodeId.eq(model.id))
-                                    .add(edge::Column::DstNodeId.eq(model.id)),
-                            )
-                            .filter(Condition::all().add(edge::Column::DeletedAt.is_null()))
-                            .project_all(tx, |query| {
-                                edge_state_columns(query).into_model::<EdgeState>()
-                            })
-                            .await
-                            .map_err(map_scope_err)?;
-
-                        // Counted from what the statements matched, not
-                        // from what the scan found: a scope replacement can
-                        // hard-delete a row between the two, and a count the
-                        // caller reconciles against is worth nothing if it
-                        // reports writes that did not land.
-                        let mut edges = 0u64;
-                        for e in incident {
-                            edges += edge::Entity::update_many()
-                                .col_expr(edge::Column::DeletedAt, Expr::value(Some(now)))
-                                .col_expr(
-                                    edge::Column::DeletedBySubjectId,
-                                    Expr::value(Some(subject.subject_id)),
-                                )
-                                .col_expr(
-                                    edge::Column::DeletedBySubjectType,
-                                    Expr::value(subject.subject_type.clone()),
-                                )
-                                .filter(
-                                    Condition::all()
-                                        .add(edge::Column::Id.eq(e.id))
-                                        .add(edge::Column::DeletedAt.is_null()),
-                                )
-                                .secure()
-                                .scope_with(&scope)
-                                .exec(tx)
-                                .await
-                                .map_err(map_scope_err)?
-                                .rows_affected;
-                        }
-
-                        (removed, edges)
-                    }
-                    DeleteRequest::Edge(key) => {
-                        // One read decides whether there is anything to
-                        // delete. A second read of the key, under read
-                        // committed, can see an upsert that revived the edge
-                        // after the first one, and a revived edge is the same
-                        // row, not a key taken by another.
-                        let row = edge::Entity::find()
-                            .secure()
-                            .scope_with(&scope)
-                            .filter(Condition::all().add(edge::Column::EdgeKey.eq(key.clone())))
-                            .limit(1)
-                            .project_all(tx, |query| {
-                                edge_ends_columns(query).into_model::<EdgeEnds>()
-                            })
-                            .await
-                            .map_err(map_scope_err)?
-                            .into_iter()
-                            .next();
-                        let model = match row {
-                            None => {
-                                return settle_no_op(&scope, tx, None, "edge", &key, epoch).await;
-                            }
-                            Some(row) if row.deleted_at.is_some() => {
-                                return settle_no_op(&scope, tx, Some(true), "edge", &key, epoch)
-                                    .await;
-                            }
-                            Some(row) => row,
-                        };
-                        // An edge is a statement about two nodes: tombstoning
-                        // it needs both endpoints visible under the caller's
-                        // scope, the rule the edge read follows. Denied and
-                        // absent answer alike.
-                        let mut endpoints = vec![model.src_node_id, model.dst_node_id];
-                        endpoints.dedup();
-                        let visible = node::Entity::find()
-                            .secure()
-                            .scope_with(&scope)
-                            .filter(Condition::all().add(node::Column::Id.is_in(endpoints.clone())))
-                            .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
-                            .project_all(tx, |query| {
-                                node_ident_columns(query).into_model::<NodeIdent>()
-                            })
-                            .await
-                            .map_err(map_scope_err)?;
-                        if visible.len() != endpoints.len() {
-                            return endpoint_hidden(&scope, tx, &key, epoch).await;
-                        }
-                        let removed = edge::Entity::update_many()
-                            .col_expr(edge::Column::DeletedAt, Expr::value(Some(now)))
-                            .col_expr(
-                                edge::Column::DeletedBySubjectId,
-                                Expr::value(Some(subject.subject_id)),
-                            )
-                            .col_expr(
-                                edge::Column::DeletedBySubjectType,
-                                Expr::value(subject.subject_type.clone()),
-                            )
-                            .filter(
-                                Condition::all()
-                                    .add(edge::Column::Id.eq(model.id))
-                                    .add(edge::Column::DeletedAt.is_null()),
-                            )
-                            .secure()
-                            .scope_with(&scope)
-                            .exec(tx)
-                            .await
-                            .map_err(map_scope_err)?
-                            .rows_affected;
-                        // Same rule as the node above.
-                        if removed == 0 {
-                            return lost_edge_delete(&scope, tx, &key, model.id, epoch).await;
-                        }
-                        (0u64, removed)
-                    }
-                };
-
-                let revision = bump_revision(tenant, &scope, tx).await?;
-                Ok(DeleteOutcome {
-                    revision: GraphRevision {
-                        source_epoch: epoch,
-                        revision,
+                // A delete that found its row already tombstoned wrote nothing
+                // and does not take the tenant's revision row at the end.
+                let deleted = super::offboarding::fenced_write(
+                    tenant,
+                    &scope,
+                    tx,
+                    |outcome: &DeleteOutcome| {
+                        outcome.tombstoned_nodes + outcome.tombstoned_edges > 0
                     },
-                    tombstoned_nodes: nodes,
-                    tombstoned_edges: edges,
-                })
+                    Box::pin(soft_delete_in_tx(tenant, &scope, &subject, tx, request)),
+                )
+                .await?;
+                Ok(deleted)
             })
         })
         .await
         .map_err(|error| error.0)
+}
+
+/// One soft delete inside its transaction, the fence aside.
+async fn soft_delete_in_tx(
+    tenant: Uuid,
+    scope: &AccessScope,
+    subject: &Subject,
+    tx: &impl DBRunner,
+    request: DeleteRequest,
+) -> Result<DeleteOutcome, GraphStoreError> {
+    let epoch = source_epoch(scope, tx).await?;
+    let now = OffsetDateTime::now_utc();
+    let (nodes, edges) = match request {
+        DeleteRequest::Node(key) => {
+            // Live rows only; a row already tombstoned is settled
+            // below as a no-op rather than as an absence.
+            let live = node::Entity::find()
+                .secure()
+                .scope_with(scope)
+                .filter(Condition::all().add(node::Column::NodeKey.eq(key.clone())))
+                .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
+                .limit(1)
+                .project_all(tx, |query| {
+                    node_ident_columns(query).into_model::<NodeIdent>()
+                })
+                .await
+                .map_err(map_scope_err)?
+                .into_iter()
+                .next();
+            let Some(model) = live else {
+                return already_tombstoned_node(scope, tx, &key, epoch)
+                    .await
+                    .map_err(|error| error.0);
+            };
+
+            let removed = node::Entity::update_many()
+                .col_expr(node::Column::DeletedAt, Expr::value(Some(now)))
+                .col_expr(
+                    node::Column::DeletedBySubjectId,
+                    Expr::value(Some(subject.subject_id)),
+                )
+                .col_expr(
+                    node::Column::DeletedBySubjectType,
+                    Expr::value(subject.subject_type.clone()),
+                )
+                .filter(
+                    Condition::all()
+                        .add(node::Column::Id.eq(model.id))
+                        .add(node::Column::DeletedAt.is_null()),
+                )
+                .secure()
+                .scope_with(scope)
+                .exec(tx)
+                .await
+                .map_err(map_scope_err)?
+                .rows_affected;
+            // The node first, and its edges only if it was ours to
+            // delete. The edges used to go first, so a delete that
+            // then lost the node's compare-and-set had already
+            // tombstoned them: the transaction committed those
+            // writes on the no-op path below, and the answer said
+            // `tombstoned_edges: 0` about edges it had just
+            // deleted. Losing the node now means writing nothing
+            // at all, which is what a no-op is.
+            //
+            // The row was live when it was read and is not now:
+            // another delete landed in between, or a scope
+            // replacement purged it. Either way the caller's
+            // intent already holds, and rule 3 of the Soft Delete
+            // Contract says so -- deleting an already-deleted row
+            // is a no-op, not a failure, because a producer
+            // retrying a delete whose response was lost cannot
+            // tell the two apart from outside. The no-op settle
+            // is the same answer the pre-read takes, and it
+            // leaves the revision where it was rather than
+            // bumping it for a write that did not happen.
+            if removed == 0 {
+                return already_tombstoned_node(scope, tx, &key, epoch)
+                    .await
+                    .map_err(|error| error.0);
+            }
+
+            // Incident edges are tombstoned in the same
+            // transaction: a node never outlives its edges'
+            // visibility, and never the reverse.
+            let incident = edge::Entity::find()
+                .secure()
+                .scope_with(scope)
+                .filter(
+                    sea_orm::Condition::any()
+                        .add(edge::Column::SrcNodeId.eq(model.id))
+                        .add(edge::Column::DstNodeId.eq(model.id)),
+                )
+                .filter(Condition::all().add(edge::Column::DeletedAt.is_null()))
+                .project_all(tx, |query| {
+                    edge_state_columns(query).into_model::<EdgeState>()
+                })
+                .await
+                .map_err(map_scope_err)?;
+
+            // Counted from what the statements matched, not
+            // from what the scan found: a scope replacement can
+            // hard-delete a row between the two, and a count the
+            // caller reconciles against is worth nothing if it
+            // reports writes that did not land.
+            let mut edges = 0u64;
+            for e in incident {
+                edges += edge::Entity::update_many()
+                    .col_expr(edge::Column::DeletedAt, Expr::value(Some(now)))
+                    .col_expr(
+                        edge::Column::DeletedBySubjectId,
+                        Expr::value(Some(subject.subject_id)),
+                    )
+                    .col_expr(
+                        edge::Column::DeletedBySubjectType,
+                        Expr::value(subject.subject_type.clone()),
+                    )
+                    .filter(
+                        Condition::all()
+                            .add(edge::Column::Id.eq(e.id))
+                            .add(edge::Column::DeletedAt.is_null()),
+                    )
+                    .secure()
+                    .scope_with(scope)
+                    .exec(tx)
+                    .await
+                    .map_err(map_scope_err)?
+                    .rows_affected;
+            }
+
+            (removed, edges)
+        }
+        DeleteRequest::Edge(key) => {
+            // One read decides whether there is anything to
+            // delete. A second read of the key, under read
+            // committed, can see an upsert that revived the edge
+            // after the first one, and a revived edge is the same
+            // row, not a key taken by another.
+            let row = edge::Entity::find()
+                .secure()
+                .scope_with(scope)
+                .filter(Condition::all().add(edge::Column::EdgeKey.eq(key.clone())))
+                .limit(1)
+                .project_all(tx, |query| {
+                    edge_ends_columns(query).into_model::<EdgeEnds>()
+                })
+                .await
+                .map_err(map_scope_err)?
+                .into_iter()
+                .next();
+            let model = match row {
+                None => {
+                    return settle_no_op(scope, tx, None, "edge", &key, epoch)
+                        .await
+                        .map_err(|error| error.0);
+                }
+                Some(row) if row.deleted_at.is_some() => {
+                    return settle_no_op(scope, tx, Some(true), "edge", &key, epoch)
+                        .await
+                        .map_err(|error| error.0);
+                }
+                Some(row) => row,
+            };
+            // An edge is a statement about two nodes: tombstoning
+            // it needs both endpoints visible under the caller's
+            // scope, the rule the edge read follows. Denied and
+            // absent answer alike.
+            let mut endpoints = vec![model.src_node_id, model.dst_node_id];
+            endpoints.dedup();
+            let visible = node::Entity::find()
+                .secure()
+                .scope_with(scope)
+                .filter(Condition::all().add(node::Column::Id.is_in(endpoints.clone())))
+                .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
+                .project_all(tx, |query| {
+                    node_ident_columns(query).into_model::<NodeIdent>()
+                })
+                .await
+                .map_err(map_scope_err)?;
+            if visible.len() != endpoints.len() {
+                return endpoint_hidden(scope, tx, &key, epoch)
+                    .await
+                    .map_err(|error| error.0);
+            }
+            let removed = edge::Entity::update_many()
+                .col_expr(edge::Column::DeletedAt, Expr::value(Some(now)))
+                .col_expr(
+                    edge::Column::DeletedBySubjectId,
+                    Expr::value(Some(subject.subject_id)),
+                )
+                .col_expr(
+                    edge::Column::DeletedBySubjectType,
+                    Expr::value(subject.subject_type.clone()),
+                )
+                .filter(
+                    Condition::all()
+                        .add(edge::Column::Id.eq(model.id))
+                        .add(edge::Column::DeletedAt.is_null()),
+                )
+                .secure()
+                .scope_with(scope)
+                .exec(tx)
+                .await
+                .map_err(map_scope_err)?
+                .rows_affected;
+            // Same rule as the node above.
+            if removed == 0 {
+                return lost_edge_delete(scope, tx, &key, model.id, epoch)
+                    .await
+                    .map_err(|error| error.0);
+            }
+            (0u64, removed)
+        }
+    };
+
+    let revision = bump_revision(tenant, scope, tx).await?;
+    Ok(DeleteOutcome {
+        revision: GraphRevision {
+            source_epoch: epoch,
+            revision,
+        },
+        tombstoned_nodes: nodes,
+        tombstoned_edges: edges,
+    })
 }
 
 /// Settle a delete that found no live row to tombstone.

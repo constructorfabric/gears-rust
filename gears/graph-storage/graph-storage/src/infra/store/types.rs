@@ -194,7 +194,7 @@ pub async fn register_types(
             let options = options.clone();
             let subject = subject.clone();
             Box::pin(async move {
-                register_in_tx(
+                let register = Box::pin(register_in_tx(
                     Actor {
                         tenant,
                         scope: &scope,
@@ -205,9 +205,27 @@ pub async fn register_types(
                     max_chain_depth,
                     &options,
                     limits,
-                )
-                .await
-                .map_err(TxStoreError::from)
+                ));
+                // A dry run writes nothing, so it has nothing to fence.
+                let registered = if options.dry_run {
+                    register.await?
+                } else {
+                    super::offboarding::fenced_write(
+                        tenant,
+                        &scope,
+                        tx,
+                        // Every type unchanged wrote nothing, and does not
+                        // take the tenant's revision row.
+                        |registered: &Vec<RegisteredType>| {
+                            registered
+                                .iter()
+                                .any(|item| item.outcome != TypeOutcome::Unchanged)
+                        },
+                        register,
+                    )
+                    .await?
+                };
+                Ok(registered)
             })
         })
         .await

@@ -10,9 +10,9 @@ use async_trait::async_trait;
 use graph_storage_sdk::GraphStorageClientV1;
 use graph_storage_sdk::models::{
     DeleteOutcome, EdgeKey, EdgeView, GraphRevision, GtsTypeId, IngestOutcome, IngestRequest,
-    NeighborhoodRequest, NodeCount, NodeEdgesRequest, NodeKey, NodeRow, NodeView, Page,
-    RegisteredType, SearchRequest, SearchResponse, TraversalResponse, TraverseRequest, TypeQuery,
-    TypeRecord, TypeRegistration, TypeRegistrationOptions,
+    NeighborhoodRequest, NodeCount, NodeEdgesRequest, NodeKey, NodeRow, NodeView, OffboardRequest,
+    Page, RegisteredType, SearchRequest, SearchResponse, TenantOffboarding, TraversalResponse,
+    TraverseRequest, TypeQuery, TypeRecord, TypeRegistration, TypeRegistrationOptions,
 };
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_macros::domain_model;
@@ -36,6 +36,18 @@ impl GraphStorageLocalClient {
         Self {
             services,
             tenant: None,
+        }
+    }
+
+    /// An offboarding call on a client scoped with `in_tenant` must be
+    /// about the scoped tenant.
+    fn same_tenant(&self, tenant: Uuid) -> Result<(), CanonicalError> {
+        match self.tenant {
+            Some(scoped) if scoped != tenant => Err(crate::domain::error::DomainError::invalid(
+                "this client is scoped to another tenant than the one named",
+            )
+            .into()),
+            _ => Ok(()),
         }
     }
 
@@ -222,6 +234,33 @@ impl GraphStorageClientV1 for GraphStorageLocalClient {
     ) -> Result<graph_storage_sdk::models::PurgeOutcome, CanonicalError> {
         self.services
             .purge_node(self.call(ctx), node_key, options)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// The tenant is the argument; a client scoped to another tenant
+    /// refuses rather than pick one of the two.
+    async fn offboard_tenant(
+        &self,
+        ctx: &SecurityContext,
+        tenant: Uuid,
+        request: OffboardRequest,
+    ) -> Result<TenantOffboarding, CanonicalError> {
+        self.same_tenant(tenant)?;
+        self.services
+            .offboard_tenant(ctx, tenant, request)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn tenant_offboarding(
+        &self,
+        ctx: &SecurityContext,
+        tenant: Uuid,
+    ) -> Result<TenantOffboarding, CanonicalError> {
+        self.same_tenant(tenant)?;
+        self.services
+            .tenant_offboarding(ctx, tenant)
             .await
             .map_err(Into::into)
     }

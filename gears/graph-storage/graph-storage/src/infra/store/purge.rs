@@ -18,7 +18,7 @@
 use graph_storage_sdk::models::{GraphRevision, NodeKey, PurgeOptions, PurgeOutcome};
 use graph_storage_sdk::plugin_api::{GraphStoreError, StoreCtx};
 use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter};
-use toolkit_db::secure::{SecureDeleteExt, SecureEntityExt};
+use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt};
 
 use crate::infra::projections::{PurgeTarget, purge_target_columns};
 use crate::infra::storage::entity::{edge, node};
@@ -39,96 +39,114 @@ pub async fn purge_node(
             let key = key.clone();
             let scope = scope.clone();
             Box::pin(async move {
-                let epoch = source_epoch(&scope, tx).await?;
-                // Live or tombstoned: both hold the key and the data.
-                let stored = node::Entity::find()
-                    .secure()
-                    .scope_with(&scope)
-                    .filter(Condition::all().add(node::Column::NodeKey.eq(key.clone())))
-                    .limit(1)
-                    .project_all(tx, |query| {
-                        purge_target_columns(query).into_model::<PurgeTarget>()
-                    })
-                    .await
-                    .map_err(map_scope_err)?
-                    .into_iter()
-                    .next();
-                let Some(stored) = stored else {
-                    return Ok(PurgeOutcome {
-                        revision: GraphRevision {
-                            source_epoch: epoch,
-                            revision: current_revision(&scope, tx).await?,
-                        },
-                        purged_nodes: 0,
-                        purged_edges: 0,
-                    });
-                };
-
-                if let Some(expected) = options.expected_created_at
-                    && stored.created_at != expected
-                {
-                    return Err(TxStoreError(another_instance(
-                        &key,
-                        expected,
-                        stored.created_at,
-                    )));
-                }
-                if options.only_tombstoned && stored.deleted_at.is_none() {
-                    return Err(TxStoreError(GraphStoreError::Conflict {
-                        reason: format!(
-                            "node `{key}` is live and the purge asked for a tombstoned one \
-                             only; soft-delete it first, or purge without only_tombstoned"
-                        ),
-                    }));
-                }
-
-                // The node was found under the caller's whole scope; its edges
-                // are deleted in the node's own tenant. The caller's scope
-                // cannot serve: it can name resources by id, and `id` is each
-                // entity's own column, so the node's id applied to `edge.id`
-                // keeps its incident edges; and a scope with no tenant
-                // constraint at all has no tenant part to narrow to. Either
-                // way the edges stay and the foreign key refuses the node.
-                // Erasing a node erases its edges in its tenant, whoever
-                // declared them.
-                let purged_edges = edge::Entity::delete_many()
-                    .filter(
-                        Condition::any()
-                            .add(edge::Column::SrcNodeId.eq(stored.id))
-                            .add(edge::Column::DstNodeId.eq(stored.id)),
-                    )
-                    .secure()
-                    .scope_with(&toolkit_security::AccessScope::for_tenant(stored.tenant_id))
-                    .exec(tx)
-                    .await
-                    .map_err(map_scope_err)?
-                    .rows_affected;
-                let purged_nodes = node::Entity::delete_many()
-                    .filter(Condition::all().add(node::Column::Id.eq(stored.id)))
-                    .secure()
-                    .scope_with(&scope)
-                    .exec(tx)
-                    .await
-                    .map_err(map_scope_err)?
-                    .rows_affected;
-
-                let revision = if purged_nodes + purged_edges > 0 {
-                    bump_revision(tenant, &scope, tx).await?
-                } else {
-                    current_revision(&scope, tx).await?
-                };
-                Ok(PurgeOutcome {
-                    revision: GraphRevision {
-                        source_epoch: epoch,
-                        revision,
-                    },
-                    purged_nodes,
-                    purged_edges,
-                })
+                // A purge of a fenced tenant's node is refused like any other
+                // write: its revision bump would recreate a row the
+                // offboarding already removed.
+                let outcome = super::offboarding::fenced_write(
+                    tenant,
+                    &scope,
+                    tx,
+                    |outcome: &PurgeOutcome| outcome.purged_nodes + outcome.purged_edges > 0,
+                    Box::pin(purge_in_tx(tenant, &scope, tx, &key, options)),
+                )
+                .await?;
+                Ok(outcome)
             })
         })
         .await
         .map_err(|TxStoreError(error)| error)
+}
+
+/// The purge itself, in the caller's transaction.
+async fn purge_in_tx(
+    tenant: uuid::Uuid,
+    scope: &toolkit_security::AccessScope,
+    tx: &impl DBRunner,
+    key: &NodeKey,
+    options: PurgeOptions,
+) -> Result<PurgeOutcome, GraphStoreError> {
+    let epoch = source_epoch(scope, tx).await?;
+    // Live or tombstoned: both hold the key and the data.
+    let stored = node::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(Condition::all().add(node::Column::NodeKey.eq(key.clone())))
+        .limit(1)
+        .project_all(tx, |query| {
+            purge_target_columns(query).into_model::<PurgeTarget>()
+        })
+        .await
+        .map_err(map_scope_err)?
+        .into_iter()
+        .next();
+    let Some(stored) = stored else {
+        return Ok(PurgeOutcome {
+            revision: GraphRevision {
+                source_epoch: epoch,
+                revision: current_revision(scope, tx).await?,
+            },
+            purged_nodes: 0,
+            purged_edges: 0,
+        });
+    };
+
+    if let Some(expected) = options.expected_created_at
+        && stored.created_at != expected
+    {
+        return Err(another_instance(key, expected, stored.created_at));
+    }
+    if options.only_tombstoned && stored.deleted_at.is_none() {
+        return Err(GraphStoreError::Conflict {
+            reason: format!(
+                "node `{key}` is live and the purge asked for a tombstoned one \
+                 only; soft-delete it first, or purge without only_tombstoned"
+            ),
+        });
+    }
+
+    // The node was found under the caller's whole scope; its edges
+    // are deleted in the node's own tenant. The caller's scope
+    // cannot serve: it can name resources by id, and `id` is each
+    // entity's own column, so the node's id applied to `edge.id`
+    // keeps its incident edges; and a scope with no tenant
+    // constraint at all has no tenant part to narrow to. Either
+    // way the edges stay and the foreign key refuses the node.
+    // Erasing a node erases its edges in its tenant, whoever
+    // declared them.
+    let purged_edges = edge::Entity::delete_many()
+        .filter(
+            Condition::any()
+                .add(edge::Column::SrcNodeId.eq(stored.id))
+                .add(edge::Column::DstNodeId.eq(stored.id)),
+        )
+        .secure()
+        .scope_with(&toolkit_security::AccessScope::for_tenant(stored.tenant_id))
+        .exec(tx)
+        .await
+        .map_err(map_scope_err)?
+        .rows_affected;
+    let purged_nodes = node::Entity::delete_many()
+        .filter(Condition::all().add(node::Column::Id.eq(stored.id)))
+        .secure()
+        .scope_with(scope)
+        .exec(tx)
+        .await
+        .map_err(map_scope_err)?
+        .rows_affected;
+
+    let revision = if purged_nodes + purged_edges > 0 {
+        bump_revision(tenant, scope, tx).await?
+    } else {
+        current_revision(scope, tx).await?
+    };
+    Ok(PurgeOutcome {
+        revision: GraphRevision {
+            source_epoch: epoch,
+            revision,
+        },
+        purged_nodes,
+        purged_edges,
+    })
 }
 
 /// The refusal of a purge bound by `expected_created_at` to a node that is

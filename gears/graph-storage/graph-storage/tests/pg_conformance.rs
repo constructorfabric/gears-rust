@@ -381,6 +381,18 @@ macro_rules! pg_case {
 // --- the shared obligations, against the real store -------------------------
 
 pg_case!(a_failed_batch_commits_nothing, conformance::batch_atomicity);
+pg_case!(
+    offboarding_removes_every_row_of_the_tenant_and_no_other,
+    conformance::offboarding_removes_every_row_of_the_tenant_and_no_other
+);
+pg_case!(
+    a_fenced_tenant_takes_no_write,
+    conformance::a_fenced_tenant_takes_no_write
+);
+pg_case!(
+    offboarding_is_idempotent_and_only_for_a_fenced_tenant,
+    conformance::offboarding_is_idempotent_and_only_for_a_fenced_tenant
+);
 
 pg_case!(
     source_generations_are_fenced_monotonically,
@@ -3695,4 +3707,414 @@ async fn a_listed_edge_whose_far_endpoint_is_hidden_is_skipped() {
         vec!["hid-c"]
     );
     assert_eq!(second.next_after, None, "and the listing ends");
+}
+
+// --- the offboarding fence against a write still running ---------------------
+
+/// Wait until `n` sessions wait on a lock.
+async fn waiting_on_locks(raw: &sea_orm::DatabaseConnection, n: i64) {
+    use sea_orm::ConnectionTrait as _;
+    let waiting = sea_orm::Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT count(*)::bigint AS n FROM pg_stat_activity \
+         WHERE wait_event_type = 'Lock' AND datname = current_database()"
+            .to_owned(),
+    );
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let row = raw
+            .query_one_raw(waiting.clone())
+            .await
+            .expect("the activity view reads")
+            .expect("a count is one row");
+        if row.try_get::<i64>("", "n").expect("the count is a number") >= n {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{n} sessions never waited on the held row"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Rows of `tenant` in `table` that also meet `and`, read outside the secure
+/// ORM.
+async fn rows_where(
+    raw: &sea_orm::DatabaseConnection,
+    table: &str,
+    tenant: Uuid,
+    and: &str,
+) -> i64 {
+    use sea_orm::ConnectionTrait as _;
+    raw.query_one_raw(sea_orm::Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        format!("SELECT count(*)::bigint AS n FROM {table} WHERE tenant_id = '{tenant}' {and}"),
+    ))
+    .await
+    .expect("the count reads")
+    .expect("a count is one row")
+    .try_get::<i64>("", "n")
+    .expect("the count is a number")
+}
+
+/// Rows of `tenant` left in `table`.
+async fn rows_of(raw: &sea_orm::DatabaseConnection, table: &str, tenant: Uuid) -> i64 {
+    rows_where(raw, table, tenant, "").await
+}
+
+/// A tenant with a graph, and a plain transaction holding `row` of it, so
+/// the statements that take that row queue on it in the order the test
+/// starts them.
+async fn held(
+    stand: &Stand,
+    row: &str,
+) -> (
+    Uuid,
+    sea_orm::DatabaseConnection,
+    sea_orm::DatabaseTransaction,
+) {
+    use sea_orm::{ConnectionTrait as _, TransactionTrait as _};
+    let (tenant, _) = one_edge(stand).await;
+    let raw = sea_orm::Database::connect(&stand.dsn)
+        .await
+        .expect("a plain connection to hold the row");
+    let holder = raw.begin().await.expect("the holder begins");
+    // Locked, not updated: a waiter on an updated row restarts its search
+    // for the new version and may be overtaken, so only a row that stays the
+    // same version keeps the waiters in the order they came.
+    holder
+        .execute_unprepared(&format!(
+            "SELECT 1 FROM {row} AND tenant_id = '{tenant}' FOR UPDATE"
+        ))
+        .await
+        .expect("the holder takes the row");
+    (tenant, raw, holder)
+}
+
+/// The tenant's revision row, which every write and the fence take.
+const REVISION_ROW: &str = "graph_meta WHERE key = 'graph_revision'";
+
+/// One write of each kind the fence has to stop.
+#[derive(Clone, Copy, Debug)]
+enum LateWrite {
+    Ingest,
+    Delete,
+    Transfer,
+    Types,
+}
+
+impl LateWrite {
+    const ALL: [Self; 4] = [Self::Ingest, Self::Delete, Self::Transfer, Self::Types];
+
+    fn spawn(
+        self,
+        stand: &Stand,
+        tenant: Uuid,
+    ) -> tokio::task::JoinHandle<Result<(), graph_storage_sdk::plugin_api::GraphStoreError>> {
+        let store = Arc::clone(&stand.store);
+        tokio::spawn(async move {
+            let scope = AccessScope::for_tenant(tenant);
+            let ctx = conformance::ctx(tenant, &scope, None);
+            match self {
+                Self::Ingest => conformance::ingest_batch(
+                    store.as_ref(),
+                    &ctx,
+                    conformance::batch(vec![conformance::node("late", "late")], Vec::new()),
+                )
+                .await
+                .map(drop),
+                Self::Delete => store
+                    .soft_delete(
+                        &ctx,
+                        graph_storage_sdk::models::DeleteRequest::Node("edge-a".to_owned()),
+                    )
+                    .await
+                    .map(drop),
+                Self::Transfer => store
+                    .transfer_source_namespace(&ctx, "late-ns", "someone")
+                    .await
+                    .map(drop),
+                Self::Types => store
+                    .register_types(&ctx, vec![conformance::requirement_v1()])
+                    .await
+                    .map(drop),
+            }
+        })
+    }
+
+    /// What the write leaves when it commits: zero before it ran.
+    async fn trace(self, raw: &sea_orm::DatabaseConnection, tenant: Uuid) -> i64 {
+        match self {
+            Self::Ingest => rows_where(raw, "node", tenant, "AND node_key = 'late'").await,
+            Self::Delete => rows_where(raw, "node", tenant, "AND deleted_at IS NOT NULL").await,
+            Self::Transfer => rows_of(raw, "source_namespace_owner", tenant).await,
+            Self::Types => {
+                rows_where(
+                    raw,
+                    "gts_type",
+                    tenant,
+                    &format!("AND gts_type_id = '{}'", conformance::EVOLVING),
+                )
+                .await
+            }
+        }
+    }
+}
+
+fn fence(
+    stand: &Stand,
+    tenant: Uuid,
+) -> tokio::task::JoinHandle<
+    Result<
+        graph_storage_sdk::models::TenantOffboarding,
+        graph_storage_sdk::plugin_api::GraphStoreError,
+    >,
+> {
+    let store = Arc::clone(&stand.store);
+    tokio::spawn(async move { conformance::fence(store.as_ref(), tenant, None).await })
+}
+
+/// The fence takes the revision row first; a write of each kind already
+/// running, waiting on the same row, then sees the committed fence and rolls
+/// back. Nothing of it is left, though it had done its work before it waited.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_still_running_when_the_fence_lands_is_refused() {
+    let Some(stand) = stand().await else {
+        return;
+    };
+    for write in LateWrite::ALL {
+        let (tenant, raw, holder) = held(&stand, REVISION_ROW).await;
+        assert_eq!(write.trace(&raw, tenant).await, 0, "{write:?}");
+
+        let fenced = fence(&stand, tenant);
+        waiting_on_locks(&raw, 1).await;
+        let late = write.spawn(&stand, tenant);
+        waiting_on_locks(&raw, 2).await;
+        holder.commit().await.expect("the holder lets go");
+
+        fenced
+            .await
+            .expect("the fence task does not panic")
+            .expect("the fence commits");
+        let refused = late
+            .await
+            .expect("the write task does not panic")
+            .expect_err("a write that waited behind the fence is refused");
+        assert!(
+            matches!(
+                refused,
+                graph_storage_sdk::plugin_api::GraphStoreError::TenantFenced { tenant: t } if t == tenant
+            ),
+            "{write:?}: {refused:?}"
+        );
+        assert_eq!(
+            write.trace(&raw, tenant).await,
+            0,
+            "{write:?}: the refused write left nothing"
+        );
+    }
+}
+
+/// The write takes the revision row first: the fence waits for it, the
+/// write sees no fence and commits, and the deletion that starts after the
+/// fence removes its rows with the rest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_that_commits_before_the_fence_is_removed_with_the_rest() {
+    let Some(stand) = stand().await else {
+        return;
+    };
+    let (tenant, raw, holder) = held(&stand, REVISION_ROW).await;
+
+    let late = LateWrite::Ingest.spawn(&stand, tenant);
+    waiting_on_locks(&raw, 1).await;
+    let fenced = fence(&stand, tenant);
+    waiting_on_locks(&raw, 2).await;
+    holder.commit().await.expect("the holder lets go");
+
+    late.await
+        .expect("the write task does not panic")
+        .expect("a write ahead of the fence commits");
+    fenced
+        .await
+        .expect("the fence task does not panic")
+        .expect("the fence commits");
+    let finished = graph_storage::domain::offboarding::run_pending(
+        stand.store.as_ref(),
+        graph_storage::domain::offboarding::WorkerSettings::new(
+            std::num::NonZeroU64::new(2).expect("a batch"),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(30),
+        )
+        .expect("valid settings"),
+        &mut graph_storage::domain::offboarding::WorkerState::default(),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(finished, 1, "the worker's pass finishes the deletion");
+
+    for table in [
+        "edge",
+        "node",
+        "gts_type",
+        "graph_meta",
+        "ingest_idempotency",
+        "scope_registry",
+        "source_namespace_owner",
+    ] {
+        assert_eq!(rows_of(&raw, table, tenant).await, 0, "{table} is empty");
+    }
+    assert_eq!(
+        rows_of(&raw, "tenant_offboarding", tenant).await,
+        1,
+        "the record stays"
+    );
+}
+
+/// Two steps for one tenant at once take turns on its record: held while
+/// both queue, then released, they each remove their own rows, and the
+/// counts on the record are every row once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_steps_for_one_tenant_take_turns_and_count_each_row_once() {
+    let Some(stand) = stand().await else {
+        return;
+    };
+    let (tenant, _) = one_edge(&stand).await;
+    let raw = sea_orm::Database::connect(&stand.dsn)
+        .await
+        .expect("a plain connection");
+    let types = rows_of(&raw, "gts_type", tenant).await;
+    let meta = rows_of(&raw, "graph_meta", tenant).await;
+    conformance::fence(stand.store.as_ref(), tenant, None)
+        .await
+        .expect("the fence");
+
+    let holder = {
+        use sea_orm::{ConnectionTrait as _, TransactionTrait as _};
+        let holder = raw.begin().await.expect("the holder begins");
+        holder
+            .execute_unprepared(&format!(
+                "SELECT 1 FROM tenant_offboarding WHERE tenant_id = '{tenant}' FOR UPDATE"
+            ))
+            .await
+            .expect("the holder takes the record");
+        holder
+    };
+    let step = || {
+        let store = Arc::clone(&stand.store);
+        tokio::spawn(async move { store.offboard_step(tenant, std::num::NonZeroU64::MIN).await })
+    };
+    let (one, two) = (step(), step());
+    waiting_on_locks(&raw, 2).await;
+    holder.commit().await.expect("the holder lets go");
+    for task in [one, two] {
+        task.await
+            .expect("the step task does not panic")
+            .expect("a step runs");
+    }
+
+    let (record, _) = conformance::offboard_fully(stand.store.as_ref(), tenant, 1).await;
+    let removed = record.removed;
+    assert_eq!(removed.edges, 1, "{removed:?}");
+    assert_eq!(removed.nodes, 2, "{removed:?}");
+    assert_eq!(i64::try_from(removed.types).unwrap(), types, "{removed:?}");
+    assert_eq!(i64::try_from(removed.meta).unwrap(), meta, "{removed:?}");
+}
+
+/// A parent tenant reading its subtree stops seeing a child the moment the
+/// child is fenced, though the child's rows are still there: the read's
+/// scope loses the tenants whose deletion is running.
+#[tokio::test]
+async fn a_parent_reading_its_subtree_does_not_see_a_fenced_child() {
+    use graph_storage_sdk::GraphStorageClientV1 as _;
+    let Some(stand) = stand().await else {
+        return;
+    };
+    let (parent, child) = (Uuid::now_v7(), Uuid::now_v7());
+    let harness = support::Harness::configured_over_store(
+        Arc::clone(&stand.store) as Arc<dyn GraphStoreV1>,
+        Arc::new(graph_storage::infra::fake_store::FakeGraphStore::new()),
+        Arc::new(support::WithChildren(vec![child])),
+        GraphStorageConfig::default(),
+    );
+    let client = graph_storage::domain::local_client::GraphStorageLocalClient::new(Arc::clone(
+        &harness.services,
+    ));
+    let member = |tenant: Uuid| {
+        toolkit_security::SecurityContext::builder()
+            .subject_id(Uuid::now_v7())
+            .subject_tenant_id(tenant)
+            .build()
+            .expect("a valid security context")
+    };
+    let (in_parent, in_child) = (member(parent), member(child));
+    client
+        .register_types(&in_child, conformance::ontology_batch())
+        .await
+        .expect("the ontology registers");
+    client
+        .ingest(
+            &in_child,
+            conformance::batch(vec![conformance::node("childs", "childs")], Vec::new()),
+        )
+        .await
+        .expect("the child's graph lands");
+    client
+        .get_node(&in_parent, &"childs".to_owned(), None)
+        .await
+        .expect("the parent reads its child before the fence");
+
+    conformance::fence(stand.store.as_ref(), child, None)
+        .await
+        .expect("the fence");
+    let hidden = client
+        .get_node(&in_parent, &"childs".to_owned(), None)
+        .await
+        .expect_err("the fenced child is out of the parent's reads");
+    assert_eq!(hidden.status_code(), 404, "{hidden:?}");
+}
+
+/// A replayed ingest wrote nothing, so it does not take the tenant's
+/// revision row: it answers from its receipt while another transaction
+/// holds that row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replayed_ingest_does_not_wait_on_the_revision_row() {
+    let Some(stand) = stand().await else {
+        return;
+    };
+    let (tenant, _) = one_edge(&stand).await;
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = conformance::ctx(tenant, &scope, None);
+    let keyed = || {
+        let mut request = conformance::batch(vec![conformance::node("keyed", "keyed")], Vec::new());
+        request.idempotency_key = Some("replayed".to_owned());
+        request
+    };
+    conformance::ingest_batch(stand.store.as_ref(), &ctx, keyed())
+        .await
+        .expect("the first ingest records its receipt");
+
+    let raw = sea_orm::Database::connect(&stand.dsn)
+        .await
+        .expect("a plain connection to hold the row");
+    let holder = {
+        use sea_orm::{ConnectionTrait as _, TransactionTrait as _};
+        let holder = raw.begin().await.expect("the holder begins");
+        holder
+            .execute_unprepared(&format!(
+                "SELECT 1 FROM {REVISION_ROW} AND tenant_id = '{tenant}' FOR UPDATE"
+            ))
+            .await
+            .expect("the holder takes the revision row");
+        holder
+    };
+    let replayed = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        conformance::ingest_batch(stand.store.as_ref(), &ctx, keyed()),
+    )
+    .await
+    .expect("a replay does not wait on the held row")
+    .expect("the replay answers");
+    assert!(replayed.replayed);
+    holder.rollback().await.expect("the holder lets go");
 }

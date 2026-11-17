@@ -792,3 +792,20 @@ async fn a_hubs_edges_are_listed_a_page_at_a_time() {
 async fn edge_payloads_are_read_for_live_edges_only() {
     conformance::edge_payloads_are_read_for_live_edges_only(&store(), Uuid::now_v7()).await;
 }
+
+#[tokio::test]
+async fn offboarding_removes_every_row_of_the_tenant_and_no_other() {
+    conformance::offboarding_removes_every_row_of_the_tenant_and_no_other(&store(), Uuid::now_v7())
+        .await;
+}
+
+#[tokio::test]
+async fn a_fenced_tenant_takes_no_write() {
+    conformance::a_fenced_tenant_takes_no_write(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn offboarding_is_idempotent_and_only_for_a_fenced_tenant() {
+    conformance::offboarding_is_idempotent_and_only_for_a_fenced_tenant(&store(), Uuid::now_v7())
+        .await;
+}

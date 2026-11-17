@@ -87,7 +87,7 @@ The gear follows the standard ToolKit gear anatomy: an SDK crate exposing a type
 | `p1` | `cpt-cf-graph-storage-fr-tenant-isolation` | Every entity is tenant-scoped through SecureORM; traversal recursion, search arms, and the analytics topology surface carry the tenant predicate |
 | `p1` | `cpt-cf-graph-storage-fr-access-control` | Shared PolicyEnforcer-backed application service for REST and ClientHub; PDP-checked permissions (ontology admin, ingest, query, delete, label attach/detach) declared as GTS instances; resource-level enforcement per the Authorization Model (induced authorized subgraph, arm-level scoping, anti-enumeration) |
 | `p1` | `cpt-cf-graph-storage-fr-source-ownership` | Source namespaces bound to producer principals in a tenant-scoped registry; `node.source_namespace` / `node.owner_principal` written once and compared on every upsert; transfer is an audited administrative flow (§ Authorization Model) |
-| `p2` | `cpt-cf-graph-storage-fr-tenant-offboarding` | Deletion generation from the control-plane ledger; fence, cancel, delete tenant-keyed state, acknowledge; unreconciled tenants quarantined and readiness withheld (§ Tenant Offboarding and Deletion Monotonicity) |
+| `p2` | `cpt-cf-graph-storage-fr-tenant-offboarding` | Deletion generation from the control-plane ledger; fence, cancel, delete tenant-keyed state, acknowledge; unreconciled tenants quarantined and readiness withheld (§ Tenant Offboarding and Deletion Monotonicity). Built without the ledger: a platform-confirmed fence, a background deletion and a permanent record |
 | `p1` | `cpt-cf-graph-storage-fr-snapshot-identity` | `(source_epoch, graph_revision)` is the snapshot identity in continuation tokens, cache keys, job identity and plugin cursors; epoch rotated before readiness after restore (§ Read Consistency Contract) |
 | `p1` | `cpt-cf-graph-storage-fr-audit-envelope` | Gear-assigned envelope (tenant, key, timestamps, tombstone, acting subject per verb) on every element read, read-only on write and described by the OpenAPI schema rather than by the registered GTS type (§ API element envelope) |
 | `p1` | `cpt-cf-graph-storage-fr-rest-api` | Versioned REST under `/api/graph-storage/v1` with OpenAPI schemas, RFC-9457 problems, documented limits |
@@ -1967,7 +1967,7 @@ Single PostgreSQL schema; all tables tenant-scoped; vector dimension fixed by mi
 
 The gear creates no property graph: `m0002` is a no-op, and `m0010` drops `kb` from a database that an earlier release created on a PostgreSQL 19 beta.
 
-**Found while building the prototype: which tables the migrations create.** `gts_type`, `node`, `edge`, `source_namespace_owner`, `graph_meta`, `ingest_idempotency`, `scope_registry` and `embedding_space`. `chunk`, `label`, `label_assignment` and `ingest_audit` are specified below and not created: chunking, labels and the audit record are deferred (README § Known limitations).
+**Found while building the prototype: which tables the migrations create.** `gts_type`, `node`, `edge`, `source_namespace_owner`, `graph_meta`, `ingest_idempotency`, `scope_registry`, `embedding_space` and `tenant_offboarding`. `chunk`, `label`, `label_assignment` and `ingest_audit` are specified below and not created: chunking, labels and the audit record are deferred (README § Known limitations).
 
 `tenant_id` is the designated partition key and participates in every primary, unique, and foreign-key contract from day one (e.g., nodes are unique on `(tenant_id, node_key)` and edges reference `(tenant_id, node_id)`), so adopting PostgreSQL partitioning at scale is a physical reorganization, not an identity migration (ADR-0001 § scale envelope). `metrics_cache` is written by the analytics gear and its growth is bounded by that gear's retention limits (graph-analytics ADR-0002); this gear reads it for annotation only.
 
@@ -2217,6 +2217,24 @@ reconciliation, never automatic re-execution.
 | updated_at | TIMESTAMPTZ | Last accepted replacement |
 
 Replacement transactions lock this row exclusively. Ordinary ingests do not lock it at all — the platform's secure ORM exposes no row-locking surface, so the shared mode the Concurrent Ingest Protocol describes is not available to them — and what keeps a replacement from undoing a concurrent ordinary write is instead that its removals re-check scope membership in the removing statement (Concurrent Ingest Protocol, point 3).
+
+#### Table: tenant_offboarding
+
+**ID**: `cpt-cf-graph-storage-dbtable-tenant-offboarding`
+
+| Column | Type | Description |
+|--------|------|-------------|
+| tenant_id | UUID | The offboarded tenant; **PK** |
+| deletion_generation | BIGINT | The generation the call carried, if any; recorded, not checked |
+| fenced_at | TIMESTAMPTZ | When the tenant was fenced |
+| completed_at | TIMESTAMPTZ | When its last row was removed; NULL while the deletion runs |
+| removed | JSONB | Rows removed so far, per kind; a kind this build does not know is kept as written, a value that is not a count is corruption |
+| failures | INTEGER | Failed steps in a row; reset by a step that runs |
+| last_failure / last_failure_at | TEXT / TIMESTAMPTZ | The error class of the last failed step, and when |
+
+Its presence fences the tenant (§ Tenant Offboarding and Deletion Monotonicity),
+so it is never deleted. A partial index on `fenced_at WHERE completed_at IS NULL`
+answers the worker's question, which deletions are still running.
 
 #### Table: ingest_audit
 
@@ -2638,7 +2656,7 @@ output-affecting semantics can never serve an old result under new semantics.
 
 ### Tenant Offboarding and Deletion Monotonicity
 
-**Status, found while building the prototype: not built.** No deletion generation is accepted or fenced; readiness reports `TENANT_RECONCILIATION` as `NotImplemented`, and the protocol below is the target (`fr-tenant-offboarding`).
+**Status: built without the ledger.** The fence, the deletion and the record of it are built; the deletion generation is recorded and not checked, and reconciliation after a restore is not built, so readiness still reports `TENANT_RECONCILIATION` as `NotImplemented`. The protocol below is the target (`fr-tenant-offboarding`); [What this build does](#what-this-build-does-without-the-ledger) says step by step how far the build goes.
 
 Every byte this gear owns lives inside its PostgreSQL database, which makes
 deletion the one operation a restore can undo. Offboard a tenant at epoch `E2`,
@@ -2687,6 +2705,121 @@ The ledger itself is a platform dependency (PRD § 10), not something this gear
 defines; what the gear owns is accepting a generation, fencing, deleting,
 acknowledging, and refusing to become ready while a generation is unsatisfied.
 
+#### What this build does, without the ledger
+
+**Who may start it, and what has to be true first.** `POST
+/graph-storage/v1/tenants/{tenant_id}/offboarding`, or
+`GraphStorageClientV1::offboard_tenant`. It needs its own permission,
+`tenant_offboard` on the resource `gts.cf.core.graph.tenant.v1~`, which no
+other permission implies, and the grant must name the tenant: the PDP is asked
+about it as a named tenant in `RootOnly` mode (§ Authorization Model). A refusal
+is `not_found`, as for any named tenant. The permission alone does not start a
+deletion that cannot be undone. Until the ledger exists, the gear asks the
+platform's tenant resolver and goes on only for a tenant whose status is
+`Deleted`. A live tenant is refused with `failed_precondition` /
+`TENANT_NOT_DELETED`; one the resolver does not know -- never created, removed
+for good, or not visible to the caller, which the resolver does not tell apart
+-- with `failed_precondition` / `TENANT_UNKNOWN`, since waiting will not change
+it. The question is bounded by what is left of the request's deadline; a
+deployment with no resolver, or one that is down, refuses with `unavailable`.
+The resolver returns a deleted tenant until account management removes it for
+good, and a named-tenant grant still resolves for it in that window. A tenant
+already fenced answers its record without asking again. A tenant removed for
+good before anyone offboarded it here has no path yet: its graph needs an
+operator.
+
+**Which stores.** A store declares offboarding in its capabilities, and one
+that does implements every offboarding method; the gear refuses to fence on a
+store that does not (`unimplemented`), since it could neither keep the fence nor
+delete the rows. A client scoped to one tenant refuses to offboard another.
+
+**Step 1, in part.** The call takes an optional `deletion_generation`, which
+must be positive (a type that cannot hold anything else), and records it. Nothing checks it: there is no ledger to check
+it against. The first call's value stands.
+
+**Step 2, the fence.** A row in `tenant_offboarding` fences its tenant. Every
+operation for it answers `failed_precondition` / `TENANT_FENCED` once the policy
+has decided, so a caller the policy refuses learns nothing about the tenant. A
+read without a named tenant keeps the policy's scope, a parent's subtree
+included, so it could reach a child being offboarded. When that scope reaches
+beyond the caller's own tenant, the gear asks the store -- under the scope, so
+only for tenants it reaches, and for their ids only -- which are being deleted,
+and the scope loses them before the store serves the read. The hierarchy
+policy lists a subtree's tenants, so it is narrowed exactly; a scope that
+cannot be narrowed in memory and does reach a tenant being deleted is refused
+as `TENANT_FENCED` until the deletion finishes (the policy enforcer refuses
+such scopes before they reach the gear today, so this is a fallback). A
+write that is already running when the fence lands must not commit either, or it
+would recreate rows behind the deleter. The tenant's revision row is the one
+every write already updates when it changes state, so every write transaction
+ends by taking that row and then reading the fence, and the fence takes the same
+row before it writes itself. Whichever comes first, nothing commits for the
+tenant after its fence:
+
+- The write takes the row first. The fence waits, the write sees no fence and
+  commits, and its rows are there for the deletion, which starts only after the
+  fence committed.
+- The fence takes the row first. The write waits, then reads the committed fence
+  (a new statement under read committed, so a new snapshot) and rolls back.
+
+A write also checks the fence when it starts, so one that begins after the fence
+fails as fenced rather than with whatever its first step trips over once the
+tenant's types are gone. Every write transaction -- ingest, soft delete, purge,
+type registration, namespace transfer -- runs inside one wrapper that does both
+checks, and one that wrote nothing, such as a replayed ingest, does not take
+the row. The PostgreSQL conformance lane holds the row open and runs both
+orders for ingest, soft delete, type registration and namespace transfer; a
+purge of a fenced tenant is refused in the conformance suite on both stores.
+
+**Step 3, not as written.** Nothing is cancelled: a write still running when the
+fence lands is refused at its commit instead (step 2), which has the same effect
+on the data. This build has no index builds, backfills, re-embedding or analytics
+jobs to cancel.
+
+**Step 4.** A worker in every replica (the gear's lifecycle task) removes the
+rows of each fenced tenant whose deletion has not finished, oldest fence first,
+in batches of `offboarding_batch` rows (default 1 000) per transaction, with a
+pass every `offboarding_interval_secs` (default 10). It works one kind of row
+per transaction, in an order the foreign keys admit: edges (their endpoints are
+`ON DELETE RESTRICT`), nodes, types, scope registry, idempotency receipts,
+source-namespace ownership, then `graph_meta`. Tombstones and nodes still held
+by analysis edges go too: an erasure outranks a conclusion. `embedding_space`
+holds only nil-tenant rows, and the nil tenant cannot be offboarded. `chunk`,
+`label`, `label_assignment` and `ingest_audit` are not in the schema (§ 3.7).
+Each step takes the record's row first, so two replicas working on one tenant
+run one after the other, and a restart picks the work up again from the store.
+Each step is bounded by `offboarding_step_timeout_secs` (default 60) and stops
+at shutdown, and a tenant gets at most a thousand steps per pass before the
+worker moves on, so one large or stuck tenant does not hold up the others. A
+failed step is noted on the record (a failure count and the error's class,
+never its message); the tenant then waits the interval doubled per failure, up
+to an hour, before it is tried again, and its failures log at `error` from the
+fifth on. The worker also remembers the failures it saw itself, so the backoff
+and the escalation hold when the database is too sick to take the note. A
+record that does not decode is logged at `error` and skipped, never allowed to
+stop the other tenants' deletions. Each pass starts at a random pending tenant
+and passes are spread by up to a tenth of the interval, so replicas drift
+apart; a pass with anything pending logs a summary at `info`. The worker
+acts for no caller, so its statements run under scopes it builds for the tenant
+rather than one a policy returned; giving it the gear's own service identity is
+open.
+
+**Step 5, read rather than pushed.** There is no lifecycle owner to notify. The
+record's `completed_at` is the acknowledgement, with the rows removed per kind,
+and the caller reads it with `GET` on the same path. A non-zero `failures` on it
+tells a stuck deletion from a running one. Construct's retention job,
+the first caller, asks until it reports `completed`.
+
+**Step 6, not built.** Without the ledger, restoring a backup taken before the
+offboarding brings the tenant back, record and all, and nothing notices. That is
+the gap the ledger closes, and why readiness keeps `TENANT_RECONCILIATION` as
+`NotImplemented`.
+
+**What stays.** The record (`tenant_offboarding`): the tenant's id, the
+generation, when it was fenced, when the deletion finished, and the counts. None
+of the tenant's content. It is what keeps the tenant fenced after its rows are
+gone, so a late write cannot recreate it, and what a repeated call answers.
+
 ### Error Model
 
 One authoritative chain classifies every failure: `DomainError -> CanonicalError -> REST Problem` and the same `CanonicalError` on the SDK path. REST and ClientHub never classify the same failure differently; the mapping lives in the domain layer, and adapters only render it.
@@ -2711,6 +2844,8 @@ One authoritative chain classifies every failure: `DomainError -> CanonicalError
 | Filter on an attribute whose index is not `active` | `failed_precondition` | `INDEX_NOT_ACTIVE` | Drop the filter or wait for the build; never retry unchanged in a loop |
 | Write under a source namespace owned by another producer | `permission_denied` | `SOURCE_NAMESPACE_FORBIDDEN` | Never retry; request ownership transfer |
 | Tenant fenced by offboarding or pending deletion reconciliation | `failed_precondition` | `TENANT_FENCED` | Never retry; the tenant is being removed |
+| Offboarding asked for a tenant the platform has not marked deleted | `failed_precondition` | `TENANT_NOT_DELETED` | Never retry unchanged; the platform deletes the tenant first |
+| Offboarding asked for a tenant the platform does not know | `failed_precondition` | `TENANT_UNKNOWN` | Never retry; a tenant removed for good needs an operator |
 | Unauthorized or unknown resource | `not_found` | `NOT_FOUND` | Indistinguishable by contract (anti-enumeration) |
 | Durable corruption detected | `data_loss` | `PROJECTION_CORRUPT`, `STORE_CORRUPT` | Operator action; never retry |
 | Unexpected internal failure | `unknown` | `INTERNAL` | Retry once, then escalate |
@@ -2727,10 +2862,10 @@ receives; the reasons listed for them above (`NOT_FOUND`,
 `CAPABILITY_UNSUPPORTED`, `DEADLINE`, `CANCELLED`, `DEPENDENCY_UNAVAILABLE`,
 `STORE_CORRUPT`, `INTERNAL`) name the meaning and are not a field to match on
 until the platform grows one. Separately, `QUEUE_FULL`, `MEMORY_POOL_BUSY`,
-`TENANT_CONCURRENCY`, `INDEX_NOT_ACTIVE`, `TENANT_FENCED`, `PROJECTION_CORRUPT`
-and `PROJECTION_STALE` belong to features this iteration defers (the admission
-layer, the index-activation lifecycle, tenant offboarding, analytics
-projections) and are produced by nothing yet. One reason reaches callers from
+`TENANT_CONCURRENCY`, `INDEX_NOT_ACTIVE`, `PROJECTION_CORRUPT` and
+`PROJECTION_STALE` belong to features this iteration defers (the admission
+layer, the index-activation lifecycle, analytics projections) and are produced
+by nothing yet. One reason reaches callers from
 the platform rather than this vocabulary: a malformed continuation token on the
 projection answers `invalid_argument` / `INVALID_CURSOR` from the OData
 extractor.
@@ -3121,7 +3256,7 @@ which is not part of the ontology) to the `toolkit-gts` inventory
 ontology is the public contract producers derive from, and a process that links
 only the SDK publishes it too. The gear submits its permission instances (one
 `AuthzPermissionV1` per resource and action the PEP checks: node read, write,
-delete and purge; type read and admin; `src/gts.rs`). Every permission's resource
+delete and purge; type read and admin; tenant offboard; `src/gts.rs`). Every permission's resource
 type is therefore in the registry, which the policy-engine requires of a policy
 naming it without a wildcard. types-registry seeds the inventory at its own startup,
 so producers can derive types and administrators can grant permissions before

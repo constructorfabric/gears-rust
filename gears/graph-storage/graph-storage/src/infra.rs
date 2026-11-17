@@ -17,6 +17,7 @@ pub mod fake_store;
 pub(crate) mod projections;
 pub mod storage;
 pub mod store;
+pub mod tenants;
 
 // `logged` lives in the domain layer (`domain::diagnostics`): the domain and
 // the REST adapter render dependency errors too, and a domain module may not

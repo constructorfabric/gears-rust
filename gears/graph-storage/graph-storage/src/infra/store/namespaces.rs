@@ -171,9 +171,17 @@ pub async fn transfer(
                 let new_owner = new_owner.clone();
                 let subject = subject.clone();
                 Box::pin(async move {
-                    transfer_in_tx(tenant, &scope, tx, &namespace, &new_owner, &subject)
-                        .await
-                        .map_err(crate::infra::store::TxStoreError::from)
+                    let moved = super::offboarding::fenced_write(
+                        tenant,
+                        &scope,
+                        tx,
+                        |_: &SourceNamespaceOwner| true,
+                        Box::pin(transfer_in_tx(
+                            tenant, &scope, tx, &namespace, &new_owner, &subject,
+                        )),
+                    )
+                    .await?;
+                    Ok(moved)
                 })
             },
         )

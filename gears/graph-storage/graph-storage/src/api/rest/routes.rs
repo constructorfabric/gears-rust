@@ -43,7 +43,65 @@ pub fn register_routes(
     let router = write_routes(router, openapi);
     let router = read_routes(router, openapi);
     let router = query_routes(router, openapi);
+    let router = offboarding_routes(router, openapi);
     router.layer(Extension(services))
+}
+
+/// Tenant offboarding: starting it, and asking whether it finished.
+fn offboarding_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
+    let router = OperationBuilder::post(format!("{BASE}/tenants/{{tenant_id}}/offboarding"))
+        .operation_id("graph_storage.offboard_tenant")
+        .summary("Remove everything this gear holds for a deleted tenant")
+        .description(
+            "Accepted only for a tenant the platform has marked deleted, and only \
+             with the `offboard` permission granted for that tenant. The first \
+             call fences the tenant -- every other operation for it answers \
+             `failed_precondition` / `TENANT_FENCED` -- and the gear removes \
+             its rows in the background. Answers the record as it stands; a \
+             repeated call is safe. It cannot be undone",
+        )
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("tenant_id", "The tenant to offboard")
+        .json_request::<dto::GraphOffboardRequest>(openapi, "The deletion generation, if any")
+        .handler(handlers::offboard_tenant)
+        .json_response_with_schema::<dto::GraphTenantOffboardingDto>(
+            openapi,
+            http::StatusCode::ACCEPTED,
+            "The tenant is fenced; its deletion runs or has finished",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_403(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
+    OperationBuilder::get(format!("{BASE}/tenants/{{tenant_id}}/offboarding"))
+        .operation_id("graph_storage.tenant_offboarding")
+        .summary("A tenant's offboarding: whether its deletion has finished")
+        .description(
+            "Same permission as starting it. Not found when the tenant was never \
+             offboarded, exactly as when the caller may not ask",
+        )
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("tenant_id", "The offboarded tenant")
+        .handler(handlers::tenant_offboarding)
+        .json_response_with_schema::<dto::GraphTenantOffboardingDto>(
+            openapi,
+            http::StatusCode::OK,
+            "The offboarding record",
+        )
+        .error_401(openapi)
+        .error_404(openapi)
+        .error_403(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi)
 }
 
 /// Type registration and lookup.

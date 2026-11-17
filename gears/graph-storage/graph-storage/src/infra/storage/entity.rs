@@ -8,3 +8,4 @@ pub mod ingest_idempotency;
 pub mod node;
 pub mod scope_registry;
 pub mod source_namespace_owner;
+pub mod tenant_offboarding;

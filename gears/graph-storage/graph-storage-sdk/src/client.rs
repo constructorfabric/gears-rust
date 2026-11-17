@@ -11,9 +11,10 @@ use toolkit_security::SecurityContext;
 
 use crate::models::{
     DeleteOutcome, EdgeKey, EdgeView, GraphRevision, GtsTypeId, IngestOutcome, IngestRequest,
-    NeighborhoodRequest, NodeCount, NodeEdgesRequest, NodeKey, NodeRow, NodeView, Page,
-    PurgeOptions, PurgeOutcome, RegisteredType, SearchRequest, SearchResponse, TraversalResponse,
-    TraverseRequest, TypeQuery, TypeRecord, TypeRegistration, TypeRegistrationOptions,
+    NeighborhoodRequest, NodeCount, NodeEdgesRequest, NodeKey, NodeRow, NodeView, OffboardRequest,
+    Page, PurgeOptions, PurgeOutcome, RegisteredType, SearchRequest, SearchResponse,
+    TenantOffboarding, TraversalResponse, TraverseRequest, TypeQuery, TypeRecord, TypeRegistration,
+    TypeRegistrationOptions,
 };
 
 /// Object-safe client for in-process consumption by other gears (version 1).
@@ -44,6 +45,11 @@ use crate::models::{
 ///   `SERIALIZATION`, or `IDEMPOTENCY_MISMATCH`. Re-read and retry.
 /// - `failed_precondition` — `STALE_GENERATION`, `IDEMPOTENCY_KEY_EXPIRED`,
 ///   `SCOPE_UNSERVABLE`, `EMBEDDING_SPACE_MISMATCH`. Not retryable unchanged.
+///   `TENANT_FENCED`, from any method: the tenant is being offboarded, or a
+///   read's scope reaches one that is and cannot be narrowed around it;
+///   never retry for that tenant. From offboarding, `TENANT_NOT_DELETED`
+///   (the platform has not deleted the tenant) and `TENANT_UNKNOWN` (the
+///   platform does not know it).
 /// - `unavailable` — a dependency is down: the PDP, the database, the
 ///   embedding provider. Retry later.
 /// - `deadline_exceeded`, `cancelled` — the operation ran out of the budget
@@ -278,6 +284,49 @@ pub trait GraphStorageClientV1: Send + Sync {
     /// The caller-visible `(source_epoch, graph_revision)` identity.
     async fn revision(&self, ctx: &SecurityContext) -> Result<GraphRevision, CanonicalError>;
 
+    // --- tenant offboarding -------------------------------------------------
+
+    /// Start removing everything this gear holds for `tenant`, or continue.
+    ///
+    /// Only a tenant the platform has marked deleted is accepted
+    /// (`failed_precondition` otherwise), and only by a caller granted the
+    /// tenant's `offboard` permission, named for that tenant. The first call
+    /// fences the tenant -- every other operation for it answers
+    /// `failed_precondition` / `TENANT_FENCED` from then on -- and the gear
+    /// deletes its rows in the background. The answer is the record as it
+    /// stands; a repeated call is safe and answers the same record, done or
+    /// not. It cannot be undone.
+    ///
+    /// The tenant is the argument. On a client scoped with
+    /// [`in_tenant`](Self::in_tenant) it must be the scoped tenant, or the
+    /// call is refused as `invalid_argument`: an irreversible deletion does
+    /// not pick between two tenants it was told about.
+    ///
+    /// The provided implementation answers `unimplemented`, so an
+    /// implementation without offboarding -- a test double, say -- keeps
+    /// compiling.
+    async fn offboard_tenant(
+        &self,
+        ctx: &SecurityContext,
+        tenant: uuid::Uuid,
+        request: OffboardRequest,
+    ) -> Result<TenantOffboarding, CanonicalError> {
+        let _ = (ctx, tenant, request);
+        Err(offboarding_unsupported())
+    }
+
+    /// The tenant's offboarding record: `not_found` when it was never
+    /// offboarded or the caller may not ask. Same permission, and the same
+    /// rule for a scoped client, as [`offboard_tenant`](Self::offboard_tenant).
+    async fn tenant_offboarding(
+        &self,
+        ctx: &SecurityContext,
+        tenant: uuid::Uuid,
+    ) -> Result<TenantOffboarding, CanonicalError> {
+        let _ = (ctx, tenant);
+        Err(offboarding_unsupported())
+    }
+
     // --- tenancy ----------------------------------------------------------
 
     /// A client whose every call is about `tenant` rather than the caller's
@@ -301,6 +350,17 @@ pub trait GraphStorageClientV1: Send + Sync {
         let _ = tenant;
         std::sync::Arc::new(no_target::NoTargetTenant)
     }
+}
+
+#[toolkit_canonical_errors::resource_error(gts_id!("cf.core.graph.tenant.v1~"))]
+struct OffboardingError;
+
+/// What the provided offboarding methods answer.
+fn offboarding_unsupported() -> CanonicalError {
+    OffboardingError::unimplemented(
+        "this GraphStorageClientV1 implementation does not support tenant offboarding",
+    )
+    .create()
 }
 
 // In this file rather than its own: the trait's provided `in_tenant` names

@@ -1367,6 +1367,10 @@ pub struct StoreCapabilities {
     pub labels: bool,
     pub chunks: bool,
     pub topology: bool,
+    /// Tenant offboarding: fencing, the background deletion and the record.
+    /// A store that declares it implements every offboarding method of
+    /// `GraphStoreV1`; the gear fences nothing on a store that does not.
+    pub offboarding: bool,
 }
 
 /// What an engine implementation provides beyond one-hop expansion.
@@ -1374,6 +1378,121 @@ pub struct StoreCapabilities {
 pub struct EngineCapabilities {
     pub shortest_path: bool,
     pub match_pattern: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Tenant offboarding
+// ---------------------------------------------------------------------------
+
+/// The platform's deletion generation for a tenant: positive, by
+/// construction, so no path to the store can record one the contract says
+/// cannot exist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DeletionGeneration(i64);
+
+impl DeletionGeneration {
+    /// `None` for zero or a negative value.
+    #[must_use]
+    pub fn new(value: i64) -> Option<Self> {
+        (value > 0).then_some(Self(value))
+    }
+
+    #[must_use]
+    pub fn get(self) -> i64 {
+        self.0
+    }
+}
+
+/// Starting a tenant's offboarding.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OffboardRequest {
+    /// The platform's deletion generation for the tenant, when the caller has
+    /// one. Recorded as given and not checked against a ledger yet: the
+    /// ledger that would issue it does not exist, and accepting it now keeps
+    /// the call unchanged when it does. The first call's value stands; a
+    /// repeated call does not replace it.
+    pub deletion_generation: Option<DeletionGeneration>,
+}
+
+/// Rows offboarding removed, per kind of tenant-keyed state, summed over
+/// every step that ran. Non-exhaustive: chunks, labels and the audit record
+/// are kinds still to come.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OffboardingCounts {
+    pub edges: u64,
+    pub nodes: u64,
+    pub types: u64,
+    /// Scope-replacement registry rows.
+    pub scopes: u64,
+    /// Idempotency receipts.
+    pub receipts: u64,
+    /// Source-namespace ownership rows.
+    pub namespaces: u64,
+    /// Per-tenant metadata rows, the revision counter among them.
+    pub meta: u64,
+}
+
+impl OffboardingCounts {
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.edges
+            + self.nodes
+            + self.types
+            + self.scopes
+            + self.receipts
+            + self.namespaces
+            + self.meta
+    }
+
+    /// Add `other` to these counts.
+    pub fn add(&mut self, other: &Self) {
+        self.edges += other.edges;
+        self.nodes += other.nodes;
+        self.types += other.types;
+        self.scopes += other.scopes;
+        self.receipts += other.receipts;
+        self.namespaces += other.namespaces;
+        self.meta += other.meta;
+    }
+}
+
+/// The last failed deletion step: what kind of failure, and when. The class
+/// is a stable name (`GraphStoreError::class`), never a message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OffboardingFailure {
+    pub class: String,
+    pub at: OffsetDateTime,
+}
+
+/// A tenant's offboarding: the permanent record that it was fenced and,
+/// once every row is gone, when the deletion finished.
+///
+/// The record outlives the tenant's data on purpose. It is what keeps the
+/// tenant fenced after the deletion, so a late write cannot recreate it,
+/// and what lets a repeated call answer "done". It holds the tenant's id and
+/// the dates, nothing of the tenant's content.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TenantOffboarding {
+    pub tenant_id: TenantId,
+    pub deletion_generation: Option<DeletionGeneration>,
+    /// When the tenant was fenced; every operation for it is refused since.
+    pub fenced_at: OffsetDateTime,
+    /// When the last row was removed. `None` while the deletion runs.
+    pub completed_at: Option<OffsetDateTime>,
+    pub removed: OffboardingCounts,
+    /// Deletion steps that failed in a row since the last one that did not.
+    /// Non-zero means the deletion is stuck, not merely running.
+    pub failures: u32,
+    /// The last failed step, while `failures` is not zero.
+    pub last_failure: Option<OffboardingFailure>,
+}
+
+impl TenantOffboarding {
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.completed_at.is_some()
+    }
 }
 
 // ---------------------------------------------------------------------------

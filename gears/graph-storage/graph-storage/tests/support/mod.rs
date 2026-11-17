@@ -364,6 +364,33 @@ impl Harness {
         }
     }
 
+    /// Over a store the case keeps, with the tenant directory offboarding
+    /// asks whether a tenant is deleted.
+    pub fn offboarding(
+        store: Arc<FakeGraphStore>,
+        authz: Arc<dyn AuthZResolverApi>,
+        tenants: Arc<dyn graph_storage::domain::offboarding::TenantDirectory>,
+    ) -> Self {
+        let engine = Arc::new(HopOverStore {
+            store: Arc::clone(&store),
+        });
+        Self {
+            services: Arc::new(
+                GraphServices::new(
+                    GraphStorageConfig::default()
+                        .validated()
+                        .expect("the default configuration is valid"),
+                    store,
+                    engine,
+                    PolicyEnforcer::new(authz),
+                    conformance::coordinator(),
+                )
+                .with_tenant_directory(tenants),
+            ),
+            tenant: Uuid::now_v7(),
+        }
+    }
+
     pub fn configured(authz: Arc<dyn AuthZResolverApi>, config: GraphStorageConfig) -> Self {
         Self::configured_over(Arc::new(FakeGraphStore::new()), authz, config)
     }

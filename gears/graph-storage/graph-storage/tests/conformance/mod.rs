@@ -8579,3 +8579,379 @@ pub async fn edge_payloads_are_read_for_live_edges_only(store: &dyn GraphStoreV1
         "a tombstoned edge has no payload to return"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Tenant offboarding
+// ---------------------------------------------------------------------------
+
+/// Everything a tenant can leave behind: types, nodes and edges, a
+/// tombstone, three idempotency receipts, three replaced scopes and a
+/// claimed source namespace. Three of each multi-column key, so a batch of
+/// two has to delete several rows by key in one statement.
+async fn seed_everything(store: &dyn GraphStoreV1, tenant: Uuid) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    seed_reference_ontology(store, &ctx).await;
+    let mut keyed = batch(
+        vec![node("a", "a"), node("b", "b"), node("c", "c")],
+        vec![edge("a", "b"), edge("b", "c")],
+    );
+    keyed.idempotency_key = Some("offboard-key".to_owned());
+    ingest_batch(store, &ctx, keyed)
+        .await
+        .expect("the graph lands");
+    for key in ["k1", "k2"] {
+        let mut keyed = batch(vec![node(key, key)], Vec::new());
+        keyed.idempotency_key = Some(format!("offboard-{key}"));
+        ingest_batch(store, &ctx, keyed)
+            .await
+            .expect("a keyed batch lands");
+    }
+    for repository in ["acme/infra", "acme/web", "acme/data"] {
+        let mut replacing = batch_replacing(
+            vec![scoped_node(&format!("scoped-{repository}"), repository)],
+            Vec::new(),
+            1,
+        );
+        if let Some(scope) = replacing.replace_scope.as_mut() {
+            repository.clone_into(&mut scope.value);
+        }
+        ingest_batch(store, &ctx, replacing)
+            .await
+            .expect("a replaced scope lands");
+    }
+    ingest_batch(
+        store,
+        &ctx,
+        batch(vec![mirror_node("sys", "42")], Vec::new()),
+    )
+    .await
+    .expect("a namespace is claimed");
+    store
+        .soft_delete(&ctx, DeleteRequest::Node("c".to_owned()))
+        .await
+        .expect("a tombstone stays behind");
+}
+
+/// The nodes `seed_everything` leaves, tombstone included.
+const SEEDED_NODES: [&str; 9] = [
+    "a",
+    "b",
+    "c",
+    "k1",
+    "k2",
+    "scoped-acme/infra",
+    "scoped-acme/web",
+    "scoped-acme/data",
+    "sys:repo:42",
+];
+
+/// Fence `tenant` as the gear does: under the tenant's own scope.
+pub async fn fence(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+    deletion_generation: Option<i64>,
+) -> Result<graph_storage_sdk::models::TenantOffboarding, GraphStoreError> {
+    let scope = AccessScope::for_tenant(tenant);
+    let generation = deletion_generation.map(|value| {
+        graph_storage_sdk::models::DeletionGeneration::new(value).expect("a positive generation")
+    });
+    store
+        .fence_tenant(&ctx(tenant, &scope, None), generation)
+        .await
+}
+
+/// `tenant`'s offboarding record, read under its own scope.
+pub async fn record_of(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) -> Option<graph_storage_sdk::models::TenantOffboarding> {
+    let scope = AccessScope::for_tenant(tenant);
+    store
+        .tenant_offboarding(&ctx(tenant, &scope, None))
+        .await
+        .expect("the record reads")
+}
+
+/// The tenants whose deletion is running.
+pub async fn pending_tenants(store: &dyn GraphStoreV1) -> Vec<Uuid> {
+    store
+        .pending_offboardings()
+        .await
+        .expect("pending lists")
+        .into_iter()
+        .map(|record| record.tenant_id)
+        .collect()
+}
+
+/// Step a fenced tenant's deletion to its end, checking that no step removes
+/// more than `batch` rows; answer the record and how many steps it took.
+pub async fn offboard_fully(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+    batch: u64,
+) -> (graph_storage_sdk::models::TenantOffboarding, usize) {
+    let mut before = record_of(store, tenant)
+        .await
+        .map_or(0, |record| record.removed.total());
+    for steps in 1..=500 {
+        let record = store
+            .offboard_step(tenant, std::num::NonZeroU64::new(batch).expect("a batch"))
+            .await
+            .expect("a step runs");
+        let total = record.removed.total();
+        assert!(
+            total - before <= batch,
+            "step {steps} removed {} rows, more than a batch of {batch}",
+            total - before
+        );
+        before = total;
+        if record.is_complete() {
+            return (record, steps);
+        }
+    }
+    panic!("the deletion never finished");
+}
+
+/// Read at the store, below the gear's fence: nothing of `tenant` is left to
+/// find.
+async fn assert_nothing_left(store: &dyn GraphStoreV1, tenant: Uuid) {
+    let scope = AccessScope::for_tenant(tenant);
+    let gone = ctx(tenant, &scope, None);
+    for key in SEEDED_NODES {
+        assert!(
+            matches!(
+                store.get_node(&gone, &key.to_owned(), 10).await,
+                Err(GraphStoreError::NotFound)
+            ),
+            "`{key}` is gone"
+        );
+    }
+    let types = store
+        .list_types(&gone, graph_storage_sdk::models::TypeQuery::default())
+        .await
+        .expect("types list");
+    assert!(types.items.is_empty(), "no type is left: {:?}", types.items);
+    assert!(
+        store
+            .list_source_namespaces(&gone)
+            .await
+            .expect("namespaces list")
+            .is_empty()
+    );
+}
+
+/// `other` still has every row, and its revision, as before.
+async fn assert_untouched(
+    store: &dyn GraphStoreV1,
+    other: Uuid,
+    before: graph_storage_sdk::models::GraphRevision,
+) {
+    let other_scope = AccessScope::for_tenant(other);
+    let other_ctx = ctx(other, &other_scope, None);
+    for key in SEEDED_NODES.into_iter().filter(|key| *key != "c") {
+        store
+            .get_node(&other_ctx, &key.to_owned(), 10)
+            .await
+            .unwrap_or_else(|error| panic!("the other tenant's `{key}` stays: {error}"));
+    }
+    assert_eq!(
+        store.revision(&other_ctx).await.expect("revision reads"),
+        before
+    );
+    assert_eq!(
+        store
+            .list_source_namespaces(&other_ctx)
+            .await
+            .expect("namespaces list")
+            .len(),
+        1
+    );
+}
+
+/// Offboarding removes every row the tenant has -- tombstones, receipts,
+/// scopes, namespaces and types included -- in steps of at most a batch,
+/// counts each row once, and leaves another tenant exactly as it was.
+pub async fn offboarding_removes_every_row_of_the_tenant_and_no_other(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    let other = Uuid::now_v7();
+    seed_everything(store, tenant).await;
+    seed_everything(store, other).await;
+    let other_scope = AccessScope::for_tenant(other);
+    let other_ctx = ctx(other, &other_scope, None);
+    let other_before = store.revision(&other_ctx).await.expect("revision reads");
+
+    fence(store, tenant, Some(3)).await.expect("the fence");
+    assert_eq!(pending_tenants(store).await, vec![tenant]);
+    let (record, steps) = offboard_fully(store, tenant, 2).await;
+    let removed = record.removed;
+    assert_eq!(removed.edges, 2, "{removed:?}");
+    assert_eq!(removed.nodes, 9, "the tombstone too: {removed:?}");
+    assert_eq!(removed.scopes, 3, "{removed:?}");
+    assert_eq!(removed.receipts, 3, "{removed:?}");
+    assert_eq!(removed.namespaces, 1, "{removed:?}");
+    assert!(removed.types > 0 && removed.meta > 0, "{removed:?}");
+    assert!(
+        steps >= 9,
+        "nine nodes and three scopes and receipts take several batches of two: {steps}"
+    );
+    assert_eq!(
+        record
+            .deletion_generation
+            .map(graph_storage_sdk::models::DeletionGeneration::get),
+        Some(3)
+    );
+    assert!(
+        pending_tenants(store).await.is_empty(),
+        "a finished deletion is not pending"
+    );
+
+    assert_nothing_left(store, tenant).await;
+    assert_untouched(store, other, other_before).await;
+}
+
+/// A fenced tenant takes no write of any kind, and the record stays after
+/// the deletion, so a write after it finished is refused too.
+pub async fn a_fenced_tenant_takes_no_write(store: &dyn GraphStoreV1, tenant: Uuid) {
+    seed_everything(store, tenant).await;
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    fence(store, tenant, None).await.expect("the fence");
+
+    let refused = |result: Result<(), GraphStoreError>, what: &str| match result {
+        Err(GraphStoreError::TenantFenced { tenant: fenced }) => {
+            assert_eq!(fenced, tenant, "{what}");
+        }
+        other => panic!("{what} must be refused as fenced: {other:?}"),
+    };
+    refused(
+        ingest_batch(store, &ctx, batch(vec![node("late", "late")], Vec::new()))
+            .await
+            .map(drop),
+        "an ingest",
+    );
+    refused(
+        store
+            .soft_delete(&ctx, DeleteRequest::Node("a".to_owned()))
+            .await
+            .map(drop),
+        "a delete",
+    );
+    refused(
+        store
+            .register_types(&ctx, vec![requirement_v1()])
+            .await
+            .map(drop),
+        "a type registration",
+    );
+    refused(
+        store
+            .transfer_source_namespace(&ctx, "sys", &producer_b().principal())
+            .await
+            .map(drop),
+        "a namespace transfer",
+    );
+    refused(
+        store
+            .purge_node(&ctx, "a".to_owned(), PurgeOptions::default())
+            .await
+            .map(drop),
+        "a purge",
+    );
+
+    offboard_fully(store, tenant, 100).await;
+    refused(
+        ingest_batch(store, &ctx, batch(vec![node("after", "after")], Vec::new()))
+            .await
+            .map(drop),
+        "an ingest after the deletion finished",
+    );
+    assert!(
+        matches!(
+            store.get_node(&ctx, &"after".to_owned(), 10).await,
+            Err(GraphStoreError::NotFound)
+        ),
+        "nothing recreated the tenant"
+    );
+}
+
+/// A tenant never fenced has no record and no step, and the nil tenant,
+/// which holds the deployment's own rows, cannot be fenced.
+async fn a_tenant_never_fenced_has_no_record_and_the_nil_tenant_none_at_all(
+    store: &dyn GraphStoreV1,
+) {
+    let never = Uuid::now_v7();
+    assert_eq!(record_of(store, never).await, None);
+    assert!(matches!(
+        store
+            .offboard_step(never, std::num::NonZeroU64::new(10).expect("a batch"))
+            .await,
+        Err(GraphStoreError::NotFound)
+    ));
+    assert!(
+        fence(store, Uuid::nil(), None).await.is_err(),
+        "the nil tenant cannot be offboarded"
+    );
+}
+
+/// A failure noted on the record is there for a caller and the worker.
+async fn a_noted_failure_is_on_the_record(store: &dyn GraphStoreV1, tenant: Uuid) {
+    store
+        .record_offboarding_failure(
+            tenant,
+            &GraphStoreError::Unavailable {
+                reason: "down".to_owned(),
+            },
+        )
+        .await
+        .expect("a failure is noted");
+    let noted = record_of(store, tenant).await.expect("the record");
+    assert_eq!(noted.failures, 1);
+    assert_eq!(
+        noted
+            .last_failure
+            .as_ref()
+            .map(|failure| failure.class.as_str()),
+        Some("unavailable")
+    );
+    let pending = store.pending_offboardings().await.expect("pending lists");
+    assert_eq!(pending[0].failures, 1, "the worker sees the failure");
+}
+
+/// Fencing twice keeps the first record; a step after the end answers the
+/// record unchanged; a tenant never fenced has no record and no step; the
+/// nil tenant, which holds the deployment's own rows, is refused; and a
+/// noted failure is on the record until a step runs again.
+pub async fn offboarding_is_idempotent_and_only_for_a_fenced_tenant(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    a_tenant_never_fenced_has_no_record_and_the_nil_tenant_none_at_all(store).await;
+
+    let first = fence(store, tenant, Some(3)).await.expect("the fence");
+    let again = fence(store, tenant, Some(9)).await.expect("a second fence");
+    assert_eq!(again, first, "the first fence's record stands");
+    assert_eq!(record_of(store, tenant).await, Some(first));
+
+    a_noted_failure_is_on_the_record(store, tenant).await;
+
+    let (done, _) = offboard_fully(store, tenant, 100).await;
+    assert_eq!(done.failures, 0, "a step that ran clears the streak");
+    assert_eq!(done.last_failure, None);
+    assert_eq!(
+        store
+            .offboard_step(tenant, std::num::NonZeroU64::new(100).expect("a batch"))
+            .await
+            .expect("a step after the end"),
+        done,
+        "a finished deletion answers its record unchanged"
+    );
+    assert_eq!(
+        fence(store, tenant, None)
+            .await
+            .expect("a fence after the end"),
+        done
+    );
+}
