@@ -191,6 +191,7 @@ mod tests {
     const MID: &str = gts_id!("cf.genai.model.provider.v1~cf.genai._.mid.v1~");
     const LEAF: &str = gts_id!("cf.genai.model.provider.v1~cf.genai._.mid.v1~cf.genai._.leaf.v1~");
 
+    #[toolkit_macros::domain_model]
     #[derive(Debug)]
     #[toolkit_gts::gts_type_schema(
         dir_path = "schemas",
