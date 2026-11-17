@@ -233,6 +233,48 @@ pub trait GraphStoreV1: Send + Sync + 'static {
         req: IngestRequest,
         embedding: EmbeddingPlan,
     ) -> Result<IngestOutcome, GraphStoreError>;
+    /// The payloads of the live edges named, keyed by edge key; an edge the
+    /// scope does not admit, or that is not stored, is absent from the map.
+    ///
+    /// Provided as one edge read per key, so a store that predates it keeps
+    /// working; the built-in store reads them in one statement per thousand.
+    async fn edge_payloads(
+        &self,
+        ctx: &StoreCtx<'_>,
+        keys: &[EdgeKey],
+    ) -> Result<std::collections::BTreeMap<EdgeKey, serde_json::Value>, GraphStoreError> {
+        let mut found = std::collections::BTreeMap::new();
+        for key in keys {
+            match self.get_edge(ctx, key).await {
+                Ok(view) => {
+                    found.insert(
+                        key.clone(),
+                        view.payload.unwrap_or_else(|| serde_json::json!({})),
+                    );
+                }
+                Err(GraphStoreError::NotFound) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(found)
+    }
+
+    /// One page of the live edges incident to the live node `query.node_key`,
+    /// in edge-id order after `query.after`, both endpoints visible under the
+    /// scope. `NotFound` when the node is not visible.
+    ///
+    /// Provided as unsupported, so a store that predates it keeps compiling.
+    async fn list_node_edges(
+        &self,
+        ctx: &StoreCtx<'_>,
+        query: &NodeEdgesQuery,
+    ) -> Result<NodeEdgesPage, GraphStoreError> {
+        let _ = (ctx, query);
+        Err(GraphStoreError::Unsupported {
+            what: "edge listing",
+        })
+    }
+
     /// Tombstone a node with its incident edges, or a single edge.
     async fn soft_delete(
         &self,
@@ -602,6 +644,31 @@ pub struct VectorArm {
     /// and vectors whose input has since changed, are not comparable with the
     /// query and must not appear.
     pub epoch: i64,
+}
+
+/// What a store lists for one page of a node's edges (`list_node_edges`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeEdgesQuery {
+    pub node_key: NodeKey,
+    pub direction: Direction,
+    /// Registered edge types to keep; `None` keeps every type.
+    pub edge_types: Option<TypeIdSet>,
+    pub discriminators: Vec<String>,
+    /// List edges whose storage id is greater than this one.
+    pub after: Option<i64>,
+    pub limit: u32,
+}
+
+/// One page of a node's edges, and the storage id the next page starts after
+/// when there may be more. The page can hold fewer than `limit` edges while
+/// more exist: an edge whose other endpoint is hidden is skipped, and the
+/// position moves past it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeEdgesPage {
+    pub items: Vec<EdgeView>,
+    pub next_after: Option<i64>,
+    /// The revision the page observed.
+    pub revision: GraphRevision,
 }
 
 /// The embedding decisions of one ingest batch.

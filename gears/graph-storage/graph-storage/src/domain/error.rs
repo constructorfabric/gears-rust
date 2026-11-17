@@ -23,6 +23,9 @@ pub mod reasons {
     pub const STALE_GENERATION: &str = "STALE_GENERATION";
     pub const IDEMPOTENCY_MISMATCH: &str = "IDEMPOTENCY_MISMATCH";
     pub const IDEMPOTENCY_KEY_EXPIRED: &str = "IDEMPOTENCY_KEY_EXPIRED";
+    /// A continuation token minted on another `source_epoch` (DESIGN § Read
+    /// Consistency Contract): restart the listing.
+    pub const STALE_CURSOR: &str = "STALE_CURSOR";
     pub const DEADLINE: &str = "DEADLINE";
     pub const CANCELLED: &str = "CANCELLED";
     pub const CAPABILITY_UNSUPPORTED: &str = "CAPABILITY_UNSUPPORTED";
@@ -89,6 +92,12 @@ pub enum DomainError {
     /// Receipt expired or from a previous epoch (`failed_precondition`).
     #[error("idempotency receipt expired; reconcile and issue a new request")]
     IdempotencyExpired,
+
+    /// A continuation token minted on another `source_epoch`
+    /// (`failed_precondition`): its position belongs to an abandoned
+    /// timeline, so the caller restarts the listing.
+    #[error("stale cursor: {message}")]
+    StaleCursor { message: String },
 
     /// Unauthorized or unknown — indistinguishable by contract
     /// (anti-enumeration).

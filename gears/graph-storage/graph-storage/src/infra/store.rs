@@ -427,6 +427,22 @@ impl GraphStoreV1 for PgGraphStore {
         reads::hydrate_nodes(self, ctx, ids).await
     }
 
+    async fn edge_payloads(
+        &self,
+        ctx: &StoreCtx<'_>,
+        keys: &[EdgeKey],
+    ) -> Result<std::collections::BTreeMap<EdgeKey, serde_json::Value>, GraphStoreError> {
+        reads::edge_payloads(self, ctx, keys).await
+    }
+
+    async fn list_node_edges(
+        &self,
+        ctx: &StoreCtx<'_>,
+        query: &graph_storage_sdk::plugin_api::NodeEdgesQuery,
+    ) -> Result<graph_storage_sdk::plugin_api::NodeEdgesPage, GraphStoreError> {
+        reads::list_node_edges(self, ctx, query).await
+    }
+
     async fn node_types(
         &self,
         ctx: &StoreCtx<'_>,

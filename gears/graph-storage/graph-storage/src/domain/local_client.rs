@@ -9,10 +9,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use graph_storage_sdk::GraphStorageClientV1;
 use graph_storage_sdk::models::{
-    DeleteOutcome, EdgeKey, GraphRevision, GtsTypeId, IngestOutcome, IngestRequest,
-    NeighborhoodRequest, NodeCount, NodeKey, NodeRow, NodeView, Page, RegisteredType,
-    SearchRequest, SearchResponse, TraversalResponse, TraverseRequest, TypeQuery, TypeRecord,
-    TypeRegistration, TypeRegistrationOptions,
+    DeleteOutcome, EdgeKey, EdgeView, GraphRevision, GtsTypeId, IngestOutcome, IngestRequest,
+    NeighborhoodRequest, NodeCount, NodeEdgesRequest, NodeKey, NodeRow, NodeView, Page,
+    RegisteredType, SearchRequest, SearchResponse, TraversalResponse, TraverseRequest, TypeQuery,
+    TypeRecord, TypeRegistration, TypeRegistrationOptions,
 };
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_macros::domain_model;
@@ -124,6 +124,28 @@ impl GraphStorageClientV1 for GraphStorageLocalClient {
     ) -> Result<NodeView, CanonicalError> {
         self.services
             .get_node(self.call(ctx), node_key, adjacency_limit)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn get_edge(
+        &self,
+        ctx: &SecurityContext,
+        edge_key: &EdgeKey,
+    ) -> Result<EdgeView, CanonicalError> {
+        self.services
+            .get_edge(self.call(ctx), edge_key)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn list_node_edges(
+        &self,
+        ctx: &SecurityContext,
+        request: NodeEdgesRequest,
+    ) -> Result<Page<EdgeView>, CanonicalError> {
+        self.services
+            .list_node_edges(self.call(ctx), request)
             .await
             .map_err(Into::into)
     }

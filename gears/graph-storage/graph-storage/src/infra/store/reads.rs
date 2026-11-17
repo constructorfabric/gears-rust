@@ -8,10 +8,12 @@ use std::collections::BTreeMap;
 
 use graph_storage_sdk::models::NodeFilterField as Field;
 use graph_storage_sdk::models::{
-    AdjacencyEntry, AdjacencySide, EdgeKey, EdgeView, ElementEnvelope, GraphRevision, NodeId,
-    NodeKey, NodeRow, NodeView, ProjectionRequest, ReadSnapshot, Subject,
+    AdjacencyEntry, AdjacencySide, Direction, EdgeKey, EdgeView, ElementEnvelope, GraphRevision,
+    NodeId, NodeKey, NodeRow, NodeView, ProjectionRequest, ReadSnapshot, Subject,
 };
-use graph_storage_sdk::plugin_api::{EmbeddingState, GraphStoreError, StoreCtx};
+use graph_storage_sdk::plugin_api::{
+    EmbeddingState, GraphStoreError, NodeEdgesPage, NodeEdgesQuery, StoreCtx,
+};
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, ExprTrait, QuerySelect};
 use toolkit_db::odata::{LimitCfg, paginate_odata};
@@ -20,9 +22,9 @@ use toolkit_odata::{Page as OdataPage, SortDir};
 use uuid::Uuid;
 
 use crate::infra::projections::{
-    EdgeHop, NodeIdent, NodeTyped, NodeViewRow, TypeName, TypeTraits, edge_hop_columns,
-    node_ident_columns, node_typed_columns, node_view_columns, type_name_columns,
-    type_traits_columns,
+    EdgeHop, EdgeId, EdgePayload, NodeIdent, NodeTyped, NodeViewRow, TypeName, TypeTraits,
+    edge_hop_columns, edge_id_columns, edge_payload_columns, node_ident_columns,
+    node_typed_columns, node_view_columns, type_name_columns, type_traits_columns,
 };
 use crate::infra::storage::entity::{edge, graph_meta, gts_type, node};
 use crate::infra::storage::odata_mapper::NodeODataMapper;
@@ -567,6 +569,208 @@ pub async fn get_edge(
         discriminator: model.discriminator.clone(),
         payload: Some(model.payload.clone()),
         envelope,
+    })
+}
+
+/// The most edge keys one payload statement carries.
+const EDGE_PAYLOAD_CHUNK: usize = 1000;
+
+/// The payloads of the live edges named, under the scope. The caller -- a
+/// traversal -- already checked both endpoints of each are visible.
+pub async fn edge_payloads(
+    store: &PgGraphStore,
+    ctx: &StoreCtx<'_>,
+    keys: &[EdgeKey],
+) -> Result<BTreeMap<EdgeKey, serde_json::Value>, GraphStoreError> {
+    let mut found = BTreeMap::new();
+    if keys.is_empty() {
+        return Ok(found);
+    }
+    let conn = store.db().conn().map_err(|error| map_db_error(&error))?;
+    for chunk in keys.chunks(EDGE_PAYLOAD_CHUNK) {
+        let rows: Vec<EdgePayload> = edge::Entity::find()
+            .secure()
+            .scope_with(ctx.scope)
+            .filter(Condition::all().add(edge::Column::EdgeKey.is_in(chunk.to_vec())))
+            .filter(Condition::all().add(edge::Column::DeletedAt.is_null()))
+            .project_all(&conn, |query| {
+                edge_payload_columns(query).into_model::<EdgePayload>()
+            })
+            .await
+            .map_err(map_scope_err)?;
+        found.extend(rows.into_iter().map(|row| (row.edge_key, row.payload)));
+    }
+    Ok(found)
+}
+
+/// One page of the live edges incident to a live node, in edge-id order.
+///
+/// The page scans `limit` edges past `after` and returns those whose both
+/// endpoints are visible under the scope, the edge read's rule; one row more
+/// is read to know whether another page exists. A hidden endpoint therefore
+/// shortens a page without ending the listing, and the position moves past
+/// the edge either way.
+pub async fn list_node_edges(
+    store: &PgGraphStore,
+    ctx: &StoreCtx<'_>,
+    query: &NodeEdgesQuery,
+) -> Result<NodeEdgesPage, GraphStoreError> {
+    let conn = store.db().conn().map_err(|error| map_db_error(&error))?;
+    let node = node::Entity::find()
+        .secure()
+        .scope_with(ctx.scope)
+        .filter(Condition::all().add(node::Column::NodeKey.eq(query.node_key.clone())))
+        .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
+        .project_all(&conn, |select| {
+            node_ident_columns(select).into_model::<NodeIdent>()
+        })
+        .await
+        .map_err(map_scope_err)?
+        .into_iter()
+        .next()
+        .ok_or(GraphStoreError::NotFound)?;
+
+    let type_ids = match &query.edge_types {
+        None => None,
+        Some(set) => {
+            let names: Vec<String> = set.0.iter().cloned().collect();
+            let rows = gts_type::Entity::find()
+                .secure()
+                .scope_with(ctx.scope)
+                .filter(Condition::all().add(gts_type::Column::GtsTypeId.is_in(names)))
+                .project_all(&conn, |select| {
+                    type_name_columns(select).into_model::<TypeName>()
+                })
+                .await
+                .map_err(map_scope_err)?;
+            Some(rows.into_iter().map(|row| row.id).collect::<Vec<i32>>())
+        }
+    };
+    if type_ids.as_ref().is_some_and(Vec::is_empty) {
+        return Ok(NodeEdgesPage {
+            items: Vec::new(),
+            next_after: None,
+            revision: observed_revision(ctx, &conn).await?,
+        });
+    }
+
+    // One ordered statement per side, merged by id: an `OR` across the two
+    // endpoint columns cannot use either paging index for the ordering, and
+    // the planner then walks the primary key (m0013). The first `limit + 1`
+    // rows of the union are among the first `limit + 1` of each side.
+    let limit = Ord::max(query.limit, 1);
+    let fetch = u64::from(limit) + 1;
+    let sides: &[edge::Column] = match query.direction {
+        Direction::Outgoing => &[edge::Column::SrcNodeId],
+        Direction::Incoming => &[edge::Column::DstNodeId],
+        Direction::Either => &[edge::Column::SrcNodeId, edge::Column::DstNodeId],
+    };
+    // Ids first, payloads after. Each side reads `limit + 1` rows and the merge
+    // keeps at most `limit`, so reading whole rows here would fetch up to
+    // twice the page's payloads for `either` -- past the
+    // `edge_list_max_page x item_max_bytes` the startup check in `config.rs`
+    // sizes a page at. Only the ids that land on the page are read in full.
+    let mut ids: Vec<i64> = Vec::new();
+    for side in sides {
+        let mut select = edge::Entity::find()
+            .secure()
+            .scope_with(ctx.scope)
+            .filter(Condition::all().add(side.eq(node.id)))
+            .filter(Condition::all().add(edge::Column::DeletedAt.is_null()));
+        if let Some(after) = query.after {
+            select = select.filter(Condition::all().add(edge::Column::Id.gt(after)));
+        }
+        if let Some(ids) = &type_ids {
+            select =
+                select.filter(Condition::all().add(edge::Column::GtsEdgeTypeId.is_in(ids.clone())));
+        }
+        if !query.discriminators.is_empty() {
+            select = select.filter(
+                Condition::all()
+                    .add(edge::Column::Discriminator.is_in(query.discriminators.clone())),
+            );
+        }
+        ids.extend(
+            select
+                .order_by(edge::Column::Id, sea_orm::Order::Asc)
+                .limit(fetch)
+                .project_all(&conn, |query| edge_id_columns(query).into_model::<EdgeId>())
+                .await
+                .map_err(map_scope_err)?
+                .into_iter()
+                .map(|row| row.id),
+        );
+    }
+    // A self-loop is on both sides.
+    ids.sort_unstable();
+    ids.dedup();
+    let more = ids.len() > limit as usize;
+    ids.truncate(limit as usize);
+    let next_after = if more { ids.last().copied() } else { None };
+    // An edge tombstoned between the two reads is simply not on the page; the
+    // position still moves past it.
+    let rows: Vec<edge::Model> = if ids.is_empty() {
+        Vec::new()
+    } else {
+        edge::Entity::find()
+            .secure()
+            .scope_with(ctx.scope)
+            .filter(Condition::all().add(edge::Column::Id.is_in(ids)))
+            .filter(Condition::all().add(edge::Column::DeletedAt.is_null()))
+            .order_by(edge::Column::Id, sea_orm::Order::Asc)
+            .all(&conn)
+            .await
+            .map_err(map_scope_err)?
+    };
+
+    let mut endpoint_ids: Vec<i64> = rows
+        .iter()
+        .flat_map(|row| [row.src_node_id, row.dst_node_id])
+        .collect();
+    endpoint_ids.sort_unstable();
+    endpoint_ids.dedup();
+    let keys: BTreeMap<i64, String> = node::Entity::find()
+        .secure()
+        .scope_with(ctx.scope)
+        .filter(Condition::all().add(node::Column::Id.is_in(endpoint_ids)))
+        .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
+        .project_all(&conn, |select| {
+            node_ident_columns(select).into_model::<NodeIdent>()
+        })
+        .await
+        .map_err(map_scope_err)?
+        .into_iter()
+        .map(|ident| (ident.id, ident.node_key))
+        .collect();
+
+    let mut type_ids: Vec<i32> = rows.iter().map(|row| row.gts_edge_type_id).collect();
+    type_ids.sort_unstable();
+    type_ids.dedup();
+    let names = type_names(ctx, &conn, &type_ids).await?;
+    let revision = observed_revision(ctx, &conn).await?;
+    let items = rows
+        .iter()
+        .filter_map(|row| {
+            let src = keys.get(&row.src_node_id)?;
+            let dst = keys.get(&row.dst_node_id)?;
+            Some(EdgeView {
+                edge_key: row.edge_key.clone(),
+                edge_type_id: names
+                    .get(&row.gts_edge_type_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                src: src.clone(),
+                dst: dst.clone(),
+                discriminator: row.discriminator.clone(),
+                payload: Some(row.payload.clone()),
+                envelope: envelope_of_edge(row, revision),
+            })
+        })
+        .collect();
+    Ok(NodeEdgesPage {
+        items,
+        next_after,
+        revision,
     })
 }
 

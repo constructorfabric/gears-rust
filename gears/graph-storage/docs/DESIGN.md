@@ -1119,10 +1119,11 @@ The public surfaces are defined in the PRD as `cpt-cf-graph-storage-interface-re
 | `GET` | `/api/graph-storage/v1/nodes:count` | How many nodes the projection lists for the same `type_pattern` and `$filter`; exact up to `projection_count_max`, `capped` past it | p1 |
 | `DELETE` | `/api/graph-storage/v1/nodes/{node_key}` | Soft-delete a node and its incident edges | p1 |
 | `GET` | `/api/graph-storage/v1/edges/{edge_key}` | One edge with its payload and audit envelope | p1 |
+| `GET` | `/api/graph-storage/v1/nodes/{node_key}/edges` | A node's edges with payloads and envelopes, a page at a time: `direction`, `edge_type_pattern`, `discriminator` (both repeatable), `limit`, `cursor` -- plain query parameters, as on `/types` | p1 |
 | `DELETE` | `/api/graph-storage/v1/edges/{edge_key}` | Soft-delete one edge | p1 |
 | `POST` | `/api/graph-storage/v1/search` | Lexical, vector or hybrid search | p1 |
-| `POST` | `/api/graph-storage/v1/graph/traverse` | Seeded, depth-bounded traversal | p1 |
-| `POST` | `/api/graph-storage/v1/graph/neighborhood` | Bounded neighborhood projection | p1 |
+| `POST` | `/api/graph-storage/v1/graph/traverse` | Seeded, depth-bounded traversal; `include_edge_payload` returns each edge's payload on its reference | p1 |
+| `POST` | `/api/graph-storage/v1/graph/neighborhood` | Bounded neighborhood projection; `include_edge_payload` as on traversal | p1 |
 | `GET`/`POST` | `/api/graph-storage/v1/labels` | List / create tenant labels | p2 |
 | `PATCH`/`DELETE` | `/api/graph-storage/v1/labels/{label_id}` | Update / delete a label | p2 |
 | `POST`/`DELETE` | `/api/graph-storage/v1/nodes/{node_key}/labels` | Attach / detach labels on a node | p2 |
@@ -1159,7 +1160,30 @@ because each was answerable more than one way:
   A single combined budget would be the wrong instrument here — spent on the
   outgoing side it would hide the incoming one entirely, and the caller could
   not tell a node nothing references from a truncated answer. The startup size
-  invariant is sized for both sides accordingly.
+  invariant is sized for both sides accordingly. The adjacency has no cursor;
+  a hub's full edge set is the edge listing's (below).
+- **A node's edges are listed by keyset over the edge's storage id**
+  (`GET /nodes/{node_key}/edges`, `list_node_edges`). A page scans at most
+  `limit` incident edges past the cursor and returns those whose both
+  endpoints the caller may see -- the edge read's rule -- so a page can be
+  short or empty and still carry a cursor; only a null `next_cursor` ends the
+  listing. The cursor is `<source_epoch>.<id>.<fingerprint>`, the
+  fingerprint an FNV-1a of the node key, the direction and the sorted
+  patterns and discriminators as the caller sent them, and a cursor
+  presented with any of them changed is refused with `invalid_argument`. A
+  cursor from another epoch is refused with `failed_precondition` and reason
+  `STALE_CURSOR` (§ Read Consistency Contract): its id names a row on an
+  abandoned timeline. The revision is not bound, as the projection's is not
+  (below): each page reports the revision it observed. Binding the patterns rather than the
+  resolved type set means a type registered between pages does not void the
+  cursor; its edges appear on the pages still to come. Each side of the node
+  is one ordered statement over `(tenant_id, src_node_id | dst_node_id, id)`
+  partial on `deleted_at IS NULL` (migration m0013), merged by id for
+  `either`: an `OR` across the two columns cannot use either index for the
+  order, and on a stand table of 2 million edges the planner then walked the
+  primary key, 120 to 220 ms a page of a 10 000-edge hub, against 0.1 ms per
+  side with the index. The page size is `edge_list_max_page`, also the
+  default; the listing authorizes as a node read.
 - **Asking what an edit costs is its own operation.** `POST /types/compatibility`
   could have been a `dry_run` flag on `POST /types`, and was not, for two
   reasons: a dry run is a *read* and should not need the permission a write
@@ -1265,7 +1289,16 @@ would have broken no test — a requirement nothing can observe is a requirement
 nothing checks. Topology references stay what they are: `EdgeRef` in a
 traversal and `AdjacencyEntry` in a node read carry a key, a type, two
 endpoints and the discriminator, and the key is the one the edge read
-accepts. The discriminator is on the reference because the key is opaque: a
+accepts. The one addition is the payload, which `EdgeRef` carries when the
+walk was asked for it (`include_edge_payload`): a consumer that weighs or
+labels the edges it draws otherwise read every edge after the walk, one
+request each. The payloads are read after the walk and its endpoint
+filtering, in pieces the remaining `response_max_bytes` is guaranteed to hold
+at `item_max_bytes` apiece -- the pieces node hydration uses -- and charged to
+the same budget, so carrying them can cut the answer and report
+`response_bytes`. An edge whose payload no longer reads by then (tombstoned
+or hidden between the hop and the read) is left out. The envelope stays off
+the reference; an edge's envelope is the edge read's and the listing's. The discriminator is on the reference because the key is opaque: a
 consumer that stores several relations under one edge type (one verb, told
 apart by discriminator) otherwise learns which relation an edge is only by
 reading every edge.
@@ -2928,6 +2961,7 @@ Every bound the gear enforces is a named configuration key with a safe default a
 | Traversal edges scanned | `traversal_max_edges_scanned` | 100,000 | 1 – 10,000,000 | Engine, **per hop** (see below) |
 | Search arm limit | `search_max_arm_limit` | 50 | 1 – 500 | Admission |
 | Projection page size | `projection_max_page` | 200 | 1 – 1,000 | Admission |
+| Edge listing page size, and its default | `edge_list_max_page` | 200 | 1 – 1,000 | Admission; sized against `response_max_bytes` at startup as the projection page is |
 | Rows a listing count counts exactly | `projection_count_max` | 10,000 | 1 – 1,000,000 | Store; past it the count is the ceiling with `capped` |
 | Interactive statement deadline | `deadline_interactive` | 10 s | 1 – 60 s | DB `statement_timeout` + cancellation token |
 | Per-tenant concurrent ingest batches | `tenant_max_ingest` | 4 | 1 – 64 | Admission |
@@ -2966,7 +3000,7 @@ Every rejection carries the limit name, the configured bound, and the requested 
 `ingest_max_nodes`, `ingest_max_edges`, `payload_max_bytes`, `item_max_bytes`,
 `node_read_max_adjacency`, `traversal_max_depth`, `traversal_max_nodes`,
 `traversal_max_frontier`, `traversal_max_edges_scanned`, `search_max_arm_limit`,
-`projection_max_page` and the interactive deadline are configuration keys with
+`projection_max_page`, `edge_list_max_page` and the interactive deadline are configuration keys with
 the defaults above; four hard ranges differ from the table, deliberately —
 `traversal_max_frontier` admits 1 (a test needs a frontier of one),
 `traversal_max_edges_scanned` runs to 10,000,000, `deadline_interactive_secs`

@@ -267,6 +267,7 @@ impl GraphEngineV1 for HopOverStore {
                     src,
                     dst,
                     discriminator: entry.discriminator,
+                    payload: None,
                 });
                 neighbours.push(entry.neighbor_key);
             }

@@ -408,6 +408,7 @@ pub fn admit_traverse(
         max_nodes,
         direction: _,
         edge_discriminators,
+        include_edge_payload: _,
     } = request;
     let depth = *depth;
     if seeds.is_empty() {
@@ -476,6 +477,56 @@ pub fn admit_traverse(
     Ok(())
 }
 
+/// The edge listing's request, held to the bounds traversal holds the same
+/// fields to: every identifier to `identifier_max_bytes`, the discriminator
+/// list to `EDGE_DISCRIMINATORS_MAX` with no empty value, and the page to
+/// `1..=edge_list_max_page`. Every field is named, so one added to the
+/// request is a compile error here until it is admitted.
+pub fn admit_node_edges(
+    cfg: &GraphStorageConfig,
+    request: &graph_storage_sdk::models::NodeEdgesRequest,
+) -> Result<(), DomainError> {
+    let graph_storage_sdk::models::NodeEdgesRequest {
+        node_key,
+        direction: _,
+        edge_type_patterns,
+        discriminators,
+        limit,
+        cursor,
+    } = request;
+    admit_identifier(cfg, "node_key", node_key)?;
+    for (index, pattern) in edge_type_patterns.iter().enumerate() {
+        admit_identifier(cfg, &format!("edge_type_patterns[{index}]"), pattern)?;
+    }
+    if discriminators.len() > EDGE_DISCRIMINATORS_MAX {
+        return Err(exceeded(format!(
+            "discriminators carries {} values; the bound is {EDGE_DISCRIMINATORS_MAX}",
+            discriminators.len()
+        )));
+    }
+    for (index, discriminator) in discriminators.iter().enumerate() {
+        admit_identifier(cfg, &format!("discriminators[{index}]"), discriminator)?;
+        if discriminator.is_empty() {
+            return Err(DomainError::invalid(format!(
+                "discriminators[{index}] is empty; an edge ingested with an empty \
+                 discriminator has none, and no list matches an edge without one"
+            )));
+        }
+    }
+    let max_page = cfg.edge_list_max_page;
+    if let Some(limit) = *limit
+        && (limit == 0 || limit > max_page)
+    {
+        return Err(exceeded(format!(
+            "limit {limit} is outside 1..={max_page} (edge_list_max_page)"
+        )));
+    }
+    if let Some(cursor) = cursor {
+        admit_identifier(cfg, "cursor", cursor)?;
+    }
+    Ok(())
+}
+
 pub fn admit_neighborhood(
     cfg: &GraphStorageConfig,
     request: &NeighborhoodRequest,
@@ -486,6 +537,7 @@ pub fn admit_neighborhood(
         node_budget,
         include_phantoms: _,
         direction: _,
+        include_edge_payload: _,
     } = request;
     let depth = *depth;
     // The same ceiling bounded walks use, and for the same reason: both drive
@@ -568,6 +620,81 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
     bytes.iter().fold(BASIS, |hash, &byte| {
         (hash ^ u64::from(byte)).wrapping_mul(PRIME)
     })
+}
+
+/// What an edge-listing cursor is bound to: the node, the direction and the
+/// filters as the caller spelled them, sorted. A cursor carries the storage
+/// id the previous page ended on, and that position means something only in
+/// the listing that produced it -- replayed under another node or another
+/// filter it would skip edges or start mid-way without saying so.
+///
+/// The patterns are bound, not the types they resolved to, so a type
+/// registered between two pages does not invalidate a cursor; the new type's
+/// edges simply appear on the pages still to come.
+#[must_use]
+pub fn edge_listing_identity(
+    node_key: &str,
+    direction: graph_storage_sdk::models::Direction,
+    edge_type_patterns: &[String],
+    discriminators: &[String],
+) -> String {
+    let mut patterns: Vec<&str> = edge_type_patterns.iter().map(String::as_str).collect();
+    patterns.sort_unstable();
+    patterns.dedup();
+    let mut discriminators: Vec<&str> = discriminators.iter().map(String::as_str).collect();
+    discriminators.sort_unstable();
+    discriminators.dedup();
+    let mut text = format!("{node_key}\n{direction:?}\n");
+    for pattern in patterns {
+        text.push_str(pattern);
+        text.push('\n');
+    }
+    text.push('\n');
+    for discriminator in discriminators {
+        text.push_str(discriminator);
+        text.push('\n');
+    }
+    format!("{:016x}", fnv1a_64(text.as_bytes()))
+}
+
+/// The cursor that continues an edge listing after the edge with storage id
+/// `after`.
+#[must_use]
+pub fn edge_cursor(epoch: i64, after: i64, identity: &str) -> String {
+    format!("{epoch}.{after}.{identity}")
+}
+
+/// The `source_epoch` an edge-listing cursor was minted on and the storage
+/// id it continues after.
+///
+/// The epoch is checked against the page the store answers, not here: a
+/// cursor from an abandoned timeline is a stale cursor, not a malformed one.
+///
+/// # Errors
+///
+/// [`DomainError::InvalidArgument`] when the cursor is not one this listing
+/// minted: malformed, or minted for another node, direction or filter.
+pub fn edge_cursor_position(cursor: &str, identity: &str) -> Result<(i64, i64), DomainError> {
+    let mut parts = cursor.splitn(3, '.');
+    let parsed = match (parts.next(), parts.next(), parts.next()) {
+        (Some(epoch), Some(after), Some(bound)) => epoch
+            .parse::<i64>()
+            .ok()
+            .zip(after.parse::<i64>().ok())
+            .map(|(epoch, after)| (epoch, after, bound)),
+        _ => None,
+    };
+    match parsed {
+        Some((epoch, after, bound)) if bound == identity && after >= 0 => Ok((epoch, after)),
+        Some(_) => Err(DomainError::invalid(
+            "the cursor was minted by another edge listing; send the same node_key, \
+             direction, edge_type_pattern and discriminator it was minted with, or \
+             start again without a cursor",
+        )),
+        None => Err(DomainError::invalid(
+            "the cursor is not an edge-listing cursor",
+        )),
+    }
 }
 
 /// A page is the continuation of the listing that minted its cursor, and
@@ -887,6 +1014,7 @@ mod tests {
             node_budget: None,
             include_phantoms: true,
             direction: None,
+            include_edge_payload: false,
         }
     }
 
@@ -1043,6 +1171,7 @@ mod tests {
             max_nodes: None,
             direction: None,
             edge_discriminators: Vec::new(),
+            include_edge_payload: false,
         };
         for depth in 0..=8u8 {
             assert_eq!(

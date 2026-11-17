@@ -114,6 +114,32 @@ pub fn type_traits_columns(query: Select<gts_type::Entity>) -> Select<gts_type::
         .column(gts_type::Column::EffectiveTraits)
 }
 
+/// An edge's storage id alone: what the edge listing orders and merges its
+/// two sides on before it reads any payload.
+#[derive(Debug, sea_orm::FromQueryResult)]
+pub struct EdgeId {
+    pub id: i64,
+}
+
+pub fn edge_id_columns(query: Select<edge::Entity>) -> Select<edge::Entity> {
+    query.select_only().column(edge::Column::Id)
+}
+
+/// An edge's key and payload: what a traversal that asked for edge payloads
+/// adds to the references the walk already built.
+#[derive(Debug, sea_orm::FromQueryResult)]
+pub struct EdgePayload {
+    pub edge_key: String,
+    pub payload: serde_json::Value,
+}
+
+pub fn edge_payload_columns(query: Select<edge::Entity>) -> Select<edge::Entity> {
+    query
+        .select_only()
+        .column(edge::Column::EdgeKey)
+        .column(edge::Column::Payload)
+}
+
 /// An edge's own id, the two nodes it holds and whether it is tombstoned:
 /// what a delete needs to tombstone it and to check its endpoints are
 /// visible, in one read, so a revive that commits after the read cannot

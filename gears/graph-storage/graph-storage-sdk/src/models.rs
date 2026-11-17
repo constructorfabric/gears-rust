@@ -985,6 +985,29 @@ pub struct NodeRow {
     pub envelope: ElementEnvelope,
 }
 
+/// One page of the edges incident to a node (`list_node_edges`).
+///
+/// The edges a hub carries past `node_read_max_adjacency` are listed here in
+/// full, a page at a time, in the order of their storage id. An edge is listed
+/// only when both its endpoints are visible to the caller, the rule the edge
+/// read follows.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NodeEdgesRequest {
+    pub node_key: NodeKey,
+    /// `Outgoing` lists edges whose source is the node, `Incoming` those whose
+    /// destination is, `Either` (the default) both.
+    pub direction: Option<Direction>,
+    /// GTS patterns the edge type must match; empty matches every type.
+    pub edge_type_patterns: Vec<String>,
+    /// Discriminators the edge must carry one of; empty matches every edge,
+    /// and an edge without a discriminator never matches a non-empty list.
+    pub discriminators: Vec<String>,
+    /// Page size, at most `edge_list_max_page` (the default too).
+    pub limit: Option<u32>,
+    /// The `next_cursor` of the previous page of the same listing.
+    pub cursor: Option<String>,
+}
+
 /// A page of results with an opaque continuation token bound to the observed
 /// revision (Read Consistency Contract).
 #[derive(Clone, Debug, PartialEq)]
@@ -1175,6 +1198,10 @@ pub struct EdgeRef {
     /// derived from it but is opaque, so this is the only way a traversal
     /// caller learns which of several same-typed relations an edge is.
     pub discriminator: Option<String>,
+    /// The edge's payload, when the request asked for it
+    /// (`include_edge_payload`); `None` otherwise. Read in one statement for
+    /// the whole answer and counted against `response_max_bytes`.
+    pub payload: Option<serde_json::Value>,
 }
 
 /// Label filter placeholder (labels are not shipped in this iteration; the
@@ -1207,6 +1234,9 @@ pub struct TraverseRequest {
     /// hop's edge budget nor the walk's node budget. At most 1 000 values;
     /// a longer list is refused as `limit_exceeded`.
     pub edge_discriminators: Vec<String>,
+    /// Return each traversed edge's payload on its `EdgeRef`, in one read for
+    /// the whole answer rather than one edge read per edge.
+    pub include_edge_payload: bool,
 }
 
 /// Bounded neighborhood projection request.
@@ -1219,6 +1249,8 @@ pub struct NeighborhoodRequest {
     /// Which way every hop follows an edge; `None` is `Either`
     /// (see `TraverseRequest::direction`).
     pub direction: Option<Direction>,
+    /// Return each edge's payload on its `EdgeRef`, as on `TraverseRequest`.
+    pub include_edge_payload: bool,
 }
 
 /// Traversal / neighborhood response.

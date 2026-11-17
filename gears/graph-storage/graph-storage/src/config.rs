@@ -146,6 +146,10 @@ pub struct GraphStorageConfig {
     /// reports the cut.
     pub response_max_bytes: u64,
     pub node_read_max_adjacency: u32,
+    /// The largest page `list_node_edges` returns, and its default size. The
+    /// listing is how a caller reads a hub's edges past
+    /// `node_read_max_adjacency`.
+    pub edge_list_max_page: u32,
     pub traversal_max_depth: u8,
     pub traversal_max_nodes: u32,
     pub traversal_max_frontier: u32,
@@ -232,6 +236,7 @@ impl Default for GraphStorageConfig {
             ingest_max_bytes: 64 * 1024 * 1024,
             response_max_bytes: 64 * 1024 * 1024,
             node_read_max_adjacency: 100,
+            edge_list_max_page: 200,
             traversal_max_depth: 5,
             traversal_max_nodes: 1_000,
             traversal_max_frontier: 10_000,
@@ -488,6 +493,9 @@ impl GraphStorageConfig {
         }
         for (what, count) in [
             ("projection_max_page", u64::from(self.projection_max_page)),
+            // An edge in the listing carries its payload, which ingest bounds
+            // by the same item ceiling a node's does.
+            ("edge_list_max_page", u64::from(self.edge_list_max_page)),
             // Both arms of a hybrid search, fused.
             (
                 "search_max_arm_limit x 2",
@@ -509,6 +517,7 @@ impl GraphStorageConfig {
     /// What one request may ask the graph to read.
     fn check_graph_ranges(&self, errors: &mut Vec<String>) {
         check_range!(errors, self, node_read_max_adjacency, 1u32, 1_000u32);
+        check_range!(errors, self, edge_list_max_page, 1u32, 1_000u32);
         check_range!(errors, self, traversal_max_depth, 1u8, 8u8);
         check_range!(errors, self, traversal_max_nodes, 1u32, 10_000u32);
         check_range!(errors, self, traversal_max_frontier, 1u32, 100_000u32);

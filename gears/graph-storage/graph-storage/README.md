@@ -171,10 +171,24 @@ Each is the shipped behaviour, with the contract that fixes it.
 - **Adjacency on a node read is bounded per direction** by
   `node_read_max_adjacency` (100 by default, at most 1 000): outgoing and
   incoming are cut separately, so one read carries up to twice that many
-  entries, with a truncation flag and no cursor. To list every edge of a hub,
-  walk it: `POST /graph/traverse` with the node as the seed and depth 1 returns
-  its edges, up to `traversal_max_nodes` (1 000 by default, at most 10 000)
-  neighbours.
+  entries, with a truncation flag and no cursor. **Every edge of a hub is
+  listed a page at a time** by `GET /nodes/{node_key}/edges`
+  (`list_node_edges` in process): payloads and envelopes included, in storage
+  order, narrowed by `direction`, `edge_type_pattern` and `discriminator`
+  (repeat a key for several values), at most `edge_list_max_page` (200 by
+  default, at most 1 000) a page. An edge is listed only when both its
+  endpoints are visible to the caller, so a page can come back short, or
+  empty, and still carry a `next_cursor`: keep paging until it is null. The
+  cursor is bound to the node, the direction and the filters as sent, and
+  refused under others; it binds the patterns, not the types they match, so a
+  type registered mid-listing does not invalidate it.
+- **A traversal returns edge payloads when asked.** `include_edge_payload:
+  true` on `POST /graph/traverse` or `/graph/neighborhood` puts each edge's
+  payload on its `EdgeRef`, read once per piece of the answer rather than
+  once per edge, and counted against `response_max_bytes` like node payloads
+  -- a walk that fits without them can be cut, with `truncated:
+  response_bytes`, once they are carried. Without the flag `payload` is
+  absent.
 - **`$filter` and `$orderby` reach payload attributes the type declares** in
   its `index` trait (`payload/severity`). Equality on a string, boolean or
   date-time value is served by one GIN over the payload; equality on a number,

@@ -113,6 +113,9 @@ fn client_correctable(error: DomainError) -> Result<CanonicalError, DomainError>
                 reasons::IDEMPOTENCY_KEY_EXPIRED,
             )
             .create(),
+        DomainError::StaleCursor { message } => GraphNodeError::failed_precondition()
+            .with_precondition_violation("cursor", message, reasons::STALE_CURSOR)
+            .create(),
         other => return Err(other),
     })
 }
@@ -280,6 +283,12 @@ mod tests {
             ),
             (DomainError::IdempotencyMismatch, 409),
             (DomainError::IdempotencyExpired, 400),
+            (
+                DomainError::StaleCursor {
+                    message: "minted on epoch 1, the store is on epoch 2".to_owned(),
+                },
+                400,
+            ),
             (DomainError::NotFound, 404),
             // Denied answers exactly as absent does: anti-enumeration.
             (DomainError::AccessDenied, 404),

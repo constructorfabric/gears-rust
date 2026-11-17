@@ -180,6 +180,18 @@ pub struct GraphTypeDto {
     pub revision: i32,
 }
 
+/// One page of a node's edges (`GET /nodes/{node_key}/edges`).
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct GraphEdgeListDto {
+    pub items: Vec<GraphEdgeDto>,
+    /// Null when the listing is complete. A page can hold fewer edges than
+    /// `limit`, or none, and still carry a cursor: an edge whose other
+    /// endpoint the caller cannot see is skipped, not counted.
+    pub next_cursor: Option<String>,
+    pub revision: GraphRevisionDto,
+}
+
 #[derive(Debug)]
 #[toolkit_macros::api_dto(response)]
 pub struct GraphTypeListDto {
@@ -535,6 +547,10 @@ pub struct GraphTraverseRequest {
     /// matches a non-empty list.
     #[serde(default)]
     pub edge_discriminators: Vec<String>,
+    /// Return each edge's payload on its reference. Read in one statement for
+    /// the whole answer and counted against the response byte budget.
+    #[serde(default)]
+    pub include_edge_payload: bool,
 }
 
 #[derive(Debug)]
@@ -547,6 +563,9 @@ pub struct GraphNeighborhoodRequest {
     pub include_phantoms: bool,
     /// `outgoing`, `incoming` or `either` (the default).
     pub direction: Option<String>,
+    /// Return each edge's payload on its reference, as on traversal.
+    #[serde(default)]
+    pub include_edge_payload: bool,
 }
 
 /// How many nodes a listing matches.
@@ -571,6 +590,10 @@ pub struct GraphEdgeRefDto {
     /// Tells parallel edges of one type between one endpoint pair apart.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discriminator: Option<String>,
+    /// The edge's payload, present only when the request set
+    /// `include_edge_payload`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
 }
 
 #[derive(Debug)]
@@ -957,6 +980,7 @@ impl From<m::EdgeRef> for GraphEdgeRefDto {
             src: value.src,
             dst: value.dst,
             discriminator: value.discriminator,
+            payload: value.payload,
         }
     }
 }

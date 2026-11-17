@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query};
+use axum::extract::{Path, Query, RawQuery};
 use axum::http::HeaderMap;
 use axum::{Extension, Json};
 use graph_storage_sdk::models as m;
@@ -359,6 +359,67 @@ pub async fn get_edge(
     Ok(Json(view.into()))
 }
 
+/// The query of `GET /nodes/{node_key}/edges`. Decoded with
+/// `serde_html_form` rather than the axum extractor, because
+/// `edge_type_pattern` and `discriminator` repeat and `serde_urlencoded`
+/// cannot collect a repeated key; unknown keys are refused rather than
+/// ignored, as on the type catalog.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListNodeEdgesParams {
+    pub direction: Option<String>,
+    #[serde(default)]
+    pub edge_type_pattern: Vec<String>,
+    #[serde(default)]
+    pub discriminator: Vec<String>,
+    pub limit: Option<u32>,
+    pub cursor: Option<String>,
+    pub tenant: Option<uuid::Uuid>,
+}
+
+/// One page of a node's edges, payloads and envelopes included: the full
+/// edge set of a hub whose node read stops at `node_read_max_adjacency`.
+#[tracing::instrument(
+    skip_all,
+    fields(user.id = %ctx.subject_id(), target_tenant = tracing::field::Empty)
+)]
+pub async fn list_node_edges(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(services): Extension<Arc<GraphServices>>,
+    Path(node_key): Path<String>,
+    RawQuery(query): RawQuery,
+) -> ApiResult<Json<dto::GraphEdgeListDto>> {
+    let params: ListNodeEdgesParams =
+        serde_html_form::from_str(query.as_deref().unwrap_or_default()).map_err(|error| {
+            DomainError::invalid(format!(
+                "{error}; the edge listing takes `direction`, `edge_type_pattern`, \
+                 `discriminator`, `limit`, `cursor` and `tenant`"
+            ))
+        })?;
+    tracing::Span::current().record("target_tenant", tracing::field::debug(&params.tenant));
+    let target = dto::TargetTenantParam {
+        tenant: params.tenant,
+    };
+    let page = services
+        .list_node_edges(
+            target.call(&ctx),
+            m::NodeEdgesRequest {
+                node_key,
+                direction: parse_direction(params.direction.as_deref())?,
+                edge_type_patterns: params.edge_type_pattern,
+                discriminators: params.discriminator,
+                limit: params.limit,
+                cursor: params.cursor,
+            },
+        )
+        .await?;
+    Ok(Json(dto::GraphEdgeListDto {
+        items: page.items.into_iter().map(Into::into).collect(),
+        next_cursor: page.next_cursor,
+        revision: page.revision.into(),
+    }))
+}
+
 /// Tabular projection.
 ///
 /// The `OData` extractor is the platform binding: it parses and validates the
@@ -585,6 +646,7 @@ pub async fn traverse(
                 max_nodes: request.max_nodes,
                 direction: parse_direction(request.direction.as_deref())?,
                 edge_discriminators: request.edge_discriminators,
+                include_edge_payload: request.include_edge_payload,
             },
         )
         .await?;
@@ -607,6 +669,7 @@ pub async fn neighborhood(
                 node_budget: request.node_budget,
                 include_phantoms: request.include_phantoms,
                 direction: parse_direction(request.direction.as_deref())?,
+                include_edge_payload: request.include_edge_payload,
             },
         )
         .await?;

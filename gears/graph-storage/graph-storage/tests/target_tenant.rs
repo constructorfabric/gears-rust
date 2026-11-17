@@ -861,7 +861,7 @@ mod rest {
             .iter()
             .filter(|spec| spec.params.iter().any(|param| param.name == "tenant"))
             .collect();
-        assert_eq!(targeted.len(), 17, "the routes that take ?tenant=");
+        assert_eq!(targeted.len(), 18, "the routes that take ?tenant=");
         for spec in targeted {
             assert!(
                 spec.responses.iter().any(|response| response.status == 404),

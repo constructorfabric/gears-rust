@@ -308,6 +308,7 @@ async fn live_edges(
             src: src.clone(),
             dst: dst.clone(),
             discriminator: e.discriminator.clone(),
+            payload: None,
         });
     }
     reached.sort_unstable();

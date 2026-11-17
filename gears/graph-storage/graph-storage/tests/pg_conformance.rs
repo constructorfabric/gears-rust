@@ -515,6 +515,16 @@ pg_case!(
 );
 
 pg_case!(
+    a_hubs_edges_are_listed_a_page_at_a_time,
+    conformance::a_hubs_edges_are_listed_a_page_at_a_time
+);
+
+pg_case!(
+    edge_payloads_are_read_for_live_edges_only,
+    conformance::edge_payloads_are_read_for_live_edges_only
+);
+
+pg_case!(
     tombstoned_rows_are_invisible,
     conformance::tombstones_are_invisible
 );
@@ -3593,4 +3603,96 @@ async fn a_purge_under_an_unconstrained_scope_removes_the_nodes_edges() {
         .await
         .expect("the peer stays");
     assert!(peer.adjacency.is_empty(), "the edge went with the node");
+}
+
+/// An edge whose far endpoint the caller cannot see is left out of the
+/// listing, and the listing still moves past it: the page that held it comes
+/// back short and carries a cursor, and the next page goes on from there.
+///
+/// The endpoint is hidden the way `an_edge_whose_endpoint_is_hidden_is_not_found_and_stays_live`
+/// hides one -- tombstoned by hand while its edge stays live -- which is the
+/// shape a scope the caller does not hold also takes.
+#[tokio::test]
+async fn a_listed_edge_whose_far_endpoint_is_hidden_is_skipped() {
+    use sea_orm::ConnectionTrait as _;
+    let Some(stand) = stand().await else {
+        return;
+    };
+    let tenant = tenant_on(&stand).await;
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = conformance::ctx(tenant, &scope, None);
+    stand
+        .store
+        .register_types(&ctx, conformance::ontology_batch())
+        .await
+        .expect("the ontology registers");
+    // One batch per edge, so storage ids follow the order written here.
+    conformance::ingest_batch(
+        stand.store.as_ref(),
+        &ctx,
+        conformance::batch(vec![conformance::node("hid-hub", "hub")], Vec::new()),
+    )
+    .await
+    .expect("the hub commits");
+    for far in ["hid-a", "hid-b", "hid-c"] {
+        conformance::ingest_batch(
+            stand.store.as_ref(),
+            &ctx,
+            conformance::batch(
+                vec![conformance::node(far, far)],
+                vec![conformance::edge("hid-hub", far)],
+            ),
+        )
+        .await
+        .expect("the edge commits");
+    }
+    let raw = sea_orm::Database::connect(&stand.dsn)
+        .await
+        .expect("a plain connection to hide the endpoint");
+    raw.execute_unprepared(&format!(
+        "UPDATE node SET deleted_at = now() \
+         WHERE tenant_id = '{tenant}' AND node_key = 'hid-b'"
+    ))
+    .await
+    .expect("the endpoint is tombstoned alone");
+
+    let query = |after: Option<i64>| graph_storage_sdk::plugin_api::NodeEdgesQuery {
+        node_key: "hid-hub".to_owned(),
+        direction: graph_storage_sdk::models::Direction::Outgoing,
+        edge_types: None,
+        discriminators: Vec::new(),
+        after,
+        limit: 2,
+    };
+    let first = stand
+        .store
+        .list_node_edges(&ctx, &query(None))
+        .await
+        .expect("the first page answers");
+    assert_eq!(
+        first
+            .items
+            .iter()
+            .map(|e| e.dst.as_str())
+            .collect::<Vec<_>>(),
+        vec!["hid-a"],
+        "the edge to the hidden endpoint is skipped"
+    );
+    let after = first
+        .next_after
+        .expect("a short page still carries the position past the skipped edge");
+    let second = stand
+        .store
+        .list_node_edges(&ctx, &query(Some(after)))
+        .await
+        .expect("the second page answers");
+    assert_eq!(
+        second
+            .items
+            .iter()
+            .map(|e| e.dst.as_str())
+            .collect::<Vec<_>>(),
+        vec!["hid-c"]
+    );
+    assert_eq!(second.next_after, None, "and the listing ends");
 }

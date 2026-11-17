@@ -8302,3 +8302,280 @@ pub async fn a_purge_bound_to_a_creation_instant_leaves_a_later_node_alone(
         "the later node was there all along"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Edge listing
+// ---------------------------------------------------------------------------
+
+/// Every page of one listing, followed to its end.
+async fn every_page(
+    store: &dyn GraphStoreV1,
+    ctx: &StoreCtx<'_>,
+    mut query: graph_storage_sdk::plugin_api::NodeEdgesQuery,
+) -> Vec<Vec<graph_storage_sdk::models::EdgeView>> {
+    let mut pages = Vec::new();
+    loop {
+        let page = store
+            .list_node_edges(ctx, &query)
+            .await
+            .expect("the listing answers");
+        pages.push(page.items);
+        match page.next_after {
+            Some(after) => query.after = Some(after),
+            None => return pages,
+        }
+        assert!(pages.len() < 20, "the listing ends");
+    }
+}
+
+fn listing(
+    node_key: &str,
+    direction: Direction,
+    limit: u32,
+) -> graph_storage_sdk::plugin_api::NodeEdgesQuery {
+    graph_storage_sdk::plugin_api::NodeEdgesQuery {
+        node_key: node_key.to_owned(),
+        direction,
+        edge_types: None,
+        discriminators: Vec::new(),
+        after: None,
+        limit,
+    }
+}
+
+fn far_ends(pages: &[Vec<graph_storage_sdk::models::EdgeView>], hub: &str) -> Vec<String> {
+    let mut ends: Vec<String> = pages
+        .iter()
+        .flatten()
+        .map(|edge| {
+            if edge.src == hub {
+                edge.dst.clone()
+            } else {
+                edge.src.clone()
+            }
+        })
+        .collect();
+    ends.sort();
+    ends
+}
+
+/// A hub's edges, a page at a time: every incident edge exactly once across
+/// the pages, in the direction asked, narrowed by type and discriminator, each
+/// with its payload and envelope; a tombstoned neighbour's edge is gone.
+pub async fn a_hubs_edges_are_listed_a_page_at_a_time(store: &dyn GraphStoreV1, tenant: Uuid) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    seed_hub(store, &ctx).await;
+    hub_pages_hold_every_edge_once(store, &ctx, tenant).await;
+    hub_filters_narrow_the_listing(store, &ctx).await;
+
+    assert!(
+        matches!(
+            store
+                .list_node_edges(&ctx, &listing("nobody", Direction::Either, 3))
+                .await,
+            Err(GraphStoreError::NotFound)
+        ),
+        "an unknown node is not found, not an empty listing"
+    );
+
+    store
+        .soft_delete(&ctx, DeleteRequest::Node("out-1".to_owned()))
+        .await
+        .expect("a neighbour is tombstoned");
+    let after_delete = every_page(store, &ctx, listing("hub", Direction::Either, 100)).await;
+    assert_eq!(
+        far_ends(&after_delete, "hub"),
+        vec!["hub", "in-0", "out-0", "out-2", "out-3", "out-4", "typed-0"],
+        "the tombstoned neighbour's edge is no longer listed"
+    );
+}
+
+async fn seed_hub(store: &dyn GraphStoreV1, ctx: &StoreCtx<'_>) {
+    let mut types = ontology_batch();
+    types.push(TypeRegistration {
+        type_id: OWNED_ONLY.to_owned(),
+        schema: serde_json::json!({
+            "$id": format!("gts://{OWNED_ONLY}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "allOf": [
+                { "$ref": "gts://gts.cf.core.graph.edge.v1~cf.core.graph.static_edge.v1~" }
+            ]
+        }),
+    });
+    store
+        .register_types(ctx, types)
+        .await
+        .expect("the ontology registers");
+
+    // Five outgoing links, two discriminators between them, each with a
+    // payload naming it; one incoming link; one outgoing edge of a second
+    // type, and a self-loop. Eight incident edges in all.
+    let mut nodes = vec![node("hub", "hub")];
+    let mut edges = Vec::new();
+    for i in 0..5 {
+        let far = format!("out-{i}");
+        nodes.push(node(&far, &far));
+        edges.push(EdgeSpec {
+            discriminator: Some(format!("d{}", i % 2)),
+            payload: Some(serde_json::json!({ "i": i })),
+            ..edge("hub", &far)
+        });
+    }
+    nodes.push(node("in-0", "in-0"));
+    edges.push(edge("in-0", "hub"));
+    nodes.push(node("typed-0", "typed-0"));
+    edges.push(EdgeSpec {
+        type_id: OWNED_ONLY.to_owned(),
+        ..edge("hub", "typed-0")
+    });
+    // A self-loop is incident on both sides and listed once.
+    edges.push(EdgeSpec {
+        discriminator: Some("self".to_owned()),
+        ..edge("hub", "hub")
+    });
+    ingest_batch(store, ctx, batch(nodes, edges))
+        .await
+        .expect("the hub commits");
+}
+
+async fn hub_pages_hold_every_edge_once(
+    store: &dyn GraphStoreV1,
+    ctx: &StoreCtx<'_>,
+    tenant: Uuid,
+) {
+    let pages = every_page(store, ctx, listing("hub", Direction::Either, 3)).await;
+    assert_eq!(
+        pages.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![3, 3, 2],
+        "eight edges, three a page"
+    );
+    assert_eq!(
+        far_ends(&pages, "hub"),
+        vec![
+            "hub", "in-0", "out-0", "out-1", "out-2", "out-3", "out-4", "typed-0"
+        ],
+        "every incident edge exactly once, the self-loop too"
+    );
+    for edge in pages.iter().flatten() {
+        if let Some(i) = edge.dst.strip_prefix("out-") {
+            let i: i64 = i.parse().expect("an index");
+            assert_eq!(
+                edge.payload,
+                Some(serde_json::json!({ "i": i })),
+                "{} carries its own payload",
+                edge.edge_key
+            );
+            assert_eq!(edge.discriminator, Some(format!("d{}", i % 2)));
+        }
+        assert_eq!(edge.envelope.tenant_id, tenant, "{}", edge.edge_key);
+        assert_eq!(edge.envelope.key, edge.edge_key);
+    }
+
+    let exact = every_page(store, ctx, listing("hub", Direction::Either, 8)).await;
+    assert_eq!(
+        exact.len(),
+        1,
+        "a page that holds the rest ends the listing"
+    );
+
+    let outgoing = every_page(store, ctx, listing("hub", Direction::Outgoing, 100)).await;
+    assert_eq!(far_ends(&outgoing, "hub").len(), 7, "{outgoing:?}");
+    let incoming = every_page(store, ctx, listing("hub", Direction::Incoming, 100)).await;
+    assert_eq!(far_ends(&incoming, "hub"), vec!["hub", "in-0"]);
+}
+
+async fn hub_filters_narrow_the_listing(store: &dyn GraphStoreV1, ctx: &StoreCtx<'_>) {
+    let by_type = every_page(
+        store,
+        ctx,
+        graph_storage_sdk::plugin_api::NodeEdgesQuery {
+            edge_types: Some(graph_storage_sdk::models::TypeIdSet(
+                std::collections::BTreeSet::from([OWNED_ONLY.to_owned()]),
+            )),
+            ..listing("hub", Direction::Either, 100)
+        },
+    )
+    .await;
+    assert_eq!(far_ends(&by_type, "hub"), vec!["typed-0"]);
+
+    let discriminated = every_page(
+        store,
+        ctx,
+        graph_storage_sdk::plugin_api::NodeEdgesQuery {
+            discriminators: vec!["d1".to_owned()],
+            ..listing("hub", Direction::Either, 100)
+        },
+    )
+    .await;
+    assert_eq!(
+        far_ends(&discriminated, "hub"),
+        vec!["out-1", "out-3"],
+        "an edge without a discriminator never matches a non-empty list"
+    );
+}
+
+/// The payloads a traversal adds to its edges: the live edges named, and
+/// nothing for a key that is unknown or tombstoned.
+pub async fn edge_payloads_are_read_for_live_edges_only(store: &dyn GraphStoreV1, tenant: Uuid) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    store
+        .register_types(&ctx, ontology_batch())
+        .await
+        .expect("the ontology registers");
+    let weighted = |src: &str, dst: &str, weight: i64| EdgeSpec {
+        payload: Some(serde_json::json!({ "weight": weight })),
+        ..edge(src, dst)
+    };
+    ingest_batch(
+        store,
+        &ctx,
+        batch(
+            vec![node("p-a", "a"), node("p-b", "b"), node("p-c", "c")],
+            vec![weighted("p-a", "p-b", 1), weighted("p-a", "p-c", 2)],
+        ),
+    )
+    .await
+    .expect("the batch commits");
+    let listed = store
+        .list_node_edges(&ctx, &listing("p-a", Direction::Outgoing, 10))
+        .await
+        .expect("the listing answers")
+        .items;
+    let key_to = |dst: &str| {
+        listed
+            .iter()
+            .find(|edge| edge.dst == dst)
+            .map(|edge| edge.edge_key.clone())
+            .expect("the edge is listed")
+    };
+    let (to_b, to_c) = (key_to("p-b"), key_to("p-c"));
+
+    let found = store
+        .edge_payloads(&ctx, &[to_b.clone(), to_c.clone(), "unknown".to_owned()])
+        .await
+        .expect("the payloads read");
+    assert_eq!(
+        found,
+        BTreeMap::from([
+            (to_b.clone(), serde_json::json!({ "weight": 1 })),
+            (to_c.clone(), serde_json::json!({ "weight": 2 })),
+        ])
+    );
+
+    store
+        .soft_delete(&ctx, DeleteRequest::Edge(to_c.clone()))
+        .await
+        .expect("the edge is tombstoned");
+    let found = store
+        .edge_payloads(&ctx, &[to_b.clone(), to_c])
+        .await
+        .expect("the payloads read");
+    assert_eq!(
+        found.keys().collect::<Vec<_>>(),
+        vec![&to_b],
+        "a tombstoned edge has no payload to return"
+    );
+}

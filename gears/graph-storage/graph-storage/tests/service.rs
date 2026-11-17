@@ -22,8 +22,8 @@ use graph_storage::config::GraphStorageConfig;
 use graph_storage::domain::error::DomainError;
 use graph_storage::infra::fake_store::FakeGraphStore;
 use graph_storage_sdk::models::{
-    NeighborhoodRequest, NodeSpec, SearchMode, SearchRequest, TraverseRequest, TruncationReason,
-    TypeQuery,
+    NeighborhoodRequest, NodeEdgesRequest, NodeSpec, SearchMode, SearchRequest, TraverseRequest,
+    TruncationReason, TypeQuery,
 };
 use support::Harness;
 
@@ -340,6 +340,7 @@ async fn a_traversal_walks_hops_and_a_neighborhood_answers_from_a_root() {
                 max_nodes: Some(10),
                 direction: None,
                 edge_discriminators: Vec::new(),
+                include_edge_payload: false,
             },
         )
         .await
@@ -376,6 +377,7 @@ async fn a_traversal_walks_hops_and_a_neighborhood_answers_from_a_root() {
                 max_nodes: Some(10),
                 direction: None,
                 edge_discriminators: Vec::new(),
+                include_edge_payload: false,
             },
         )
         .await
@@ -396,6 +398,7 @@ async fn a_traversal_walks_hops_and_a_neighborhood_answers_from_a_root() {
                 node_budget: Some(10),
                 include_phantoms: false,
                 direction: None,
+                include_edge_payload: false,
             },
         )
         .await
@@ -425,6 +428,7 @@ async fn a_traversal_outside_its_bounds_is_refused() {
                 max_nodes: None,
                 direction: None,
                 edge_discriminators: Vec::new(),
+                include_edge_payload: false,
             },
             "a traversal with no seed",
         ),
@@ -437,6 +441,7 @@ async fn a_traversal_outside_its_bounds_is_refused() {
                 max_nodes: None,
                 direction: None,
                 edge_discriminators: Vec::new(),
+                include_edge_payload: false,
             },
             "a depth above the ceiling",
         ),
@@ -908,6 +913,7 @@ async fn the_local_client_answers_like_the_service_and_is_bounded_like_it() {
                     max_nodes: Some(10),
                     direction: None,
                     edge_discriminators: Vec::new(),
+                    include_edge_payload: false,
                 },
             )
             .await
@@ -926,6 +932,7 @@ async fn the_local_client_answers_like_the_service_and_is_bounded_like_it() {
                     node_budget: Some(10),
                     include_phantoms: false,
                     direction: None,
+                    include_edge_payload: false,
                 },
             )
             .await
@@ -1040,6 +1047,7 @@ async fn no_new_work_starts_after_the_budget_is_spent() {
                 max_nodes: Some(10),
                 direction: None,
                 edge_discriminators: Vec::new(),
+                include_edge_payload: false,
             },
         )
         .await
@@ -1105,6 +1113,7 @@ async fn no_new_work_starts_after_the_budget_is_spent() {
                         node_budget: Some(10),
                         include_phantoms: false,
                         direction: None,
+                        include_edge_payload: false,
                     },
                 )
                 .await
@@ -1171,6 +1180,7 @@ async fn a_store_without_snapshots_is_not_asked_for_one() {
                 max_nodes: Some(10),
                 direction: None,
                 edge_discriminators: Vec::new(),
+                include_edge_payload: false,
             },
         )
         .await
@@ -1216,6 +1226,7 @@ async fn a_walk_that_spans_a_commit_is_reported_as_inconsistent() {
                 max_nodes: Some(10),
                 direction: None,
                 edge_discriminators: Vec::new(),
+                include_edge_payload: false,
             },
         )
         .await
@@ -1280,6 +1291,7 @@ async fn a_traversal_stops_at_the_byte_budget_and_reports_it() {
                 max_nodes: Some(100),
                 direction: None,
                 edge_discriminators: Vec::new(),
+                include_edge_payload: false,
             },
         )
         .await
@@ -1468,6 +1480,7 @@ async fn the_byte_budget_charges_the_edges_too() {
                 max_nodes: Some(100),
                 direction: None,
                 edge_discriminators: Vec::new(),
+                include_edge_payload: false,
             },
         )
         .await
@@ -1554,6 +1567,7 @@ async fn the_byte_budget_charges_an_edges_discriminator() {
         max_nodes: Some(100),
         direction: None,
         edge_discriminators: Vec::new(),
+        include_edge_payload: false,
     };
     let plain = harness
         .services
@@ -1620,6 +1634,7 @@ async fn seeds_that_cannot_fit_the_budget_are_refused() {
                 max_nodes: Some(10),
                 direction: None,
                 edge_discriminators: Vec::new(),
+                include_edge_payload: false,
             },
         )
         .await
@@ -1685,6 +1700,7 @@ async fn a_seed_is_not_evicted_by_its_own_bytes_counted_twice() {
                 max_nodes: Some(100),
                 direction: None,
                 edge_discriminators: Vec::new(),
+                include_edge_payload: false,
             },
         )
         .await
@@ -1767,6 +1783,7 @@ async fn a_traversal_reads_what_its_budget_can_hold_and_not_the_whole_walk() {
                 max_nodes: Some(1_000),
                 direction: None,
                 edge_discriminators: Vec::new(),
+                include_edge_payload: false,
             },
         )
         .await
@@ -1849,6 +1866,7 @@ async fn a_seed_set_over_the_budget_is_refused_before_it_is_read_in_full() {
                 max_nodes: Some(1_000),
                 direction: None,
                 edge_discriminators: Vec::new(),
+                include_edge_payload: false,
             },
         )
         .await
@@ -1934,6 +1952,7 @@ async fn a_filtered_walk_near_its_budget_does_not_hydrate_row_by_row() {
                 max_nodes: Some(1_000),
                 direction: None,
                 edge_discriminators: Vec::new(),
+                include_edge_payload: false,
             },
         )
         .await
@@ -2005,6 +2024,7 @@ async fn a_type_filter_drops_the_edges_of_the_nodes_it_filters() {
                 max_nodes: Some(1_000),
                 direction: None,
                 edge_discriminators: Vec::new(),
+                include_edge_payload: false,
             },
         )
         .await
@@ -2076,6 +2096,7 @@ async fn a_filtered_walk_survives_a_store_without_node_types_and_not_one_that_fa
                     max_nodes: Some(1_000),
                     direction: None,
                     edge_discriminators: Vec::new(),
+                    include_edge_payload: false,
                 },
             )
             .await?;
@@ -2151,6 +2172,7 @@ async fn a_store_that_inherits_the_default_node_types_is_hydrated_and_filtered()
                 max_nodes: Some(1_000),
                 direction: None,
                 edge_discriminators: Vec::new(),
+                include_edge_payload: false,
             },
         )
         .await
@@ -2209,6 +2231,7 @@ async fn a_store_that_inherits_the_default_node_types_still_excludes_phantoms() 
                 node_budget: None,
                 include_phantoms: false,
                 direction: None,
+                include_edge_payload: false,
             },
         )
         .await
@@ -2503,6 +2526,7 @@ async fn a_budgeted_neighborhood_keeps_the_best_connected_neighbours() {
                 node_budget: Some(4),
                 include_phantoms: false,
                 direction: None,
+                include_edge_payload: false,
             },
         )
         .await
@@ -2537,6 +2561,7 @@ async fn a_budgeted_neighborhood_keeps_the_best_connected_neighbours() {
                 node_budget: Some(50),
                 include_phantoms: false,
                 direction: None,
+                include_edge_payload: false,
             },
         )
         .await
@@ -2577,6 +2602,7 @@ async fn every_caller_supplied_identifier_is_bounded_before_it_reaches_the_store
         max_nodes: Some(10),
         direction: None,
         edge_discriminators: Vec::new(),
+        include_edge_payload: false,
     };
     let neighborhood = |root: &str| NeighborhoodRequest {
         root: root.to_owned(),
@@ -2584,6 +2610,7 @@ async fn every_caller_supplied_identifier_is_bounded_before_it_reaches_the_store
         node_budget: Some(10),
         include_phantoms: false,
         direction: None,
+        include_edge_payload: false,
     };
     let search = |pattern: &str| SearchRequest {
         mode: SearchMode::Lexical,
@@ -3083,4 +3110,331 @@ async fn the_local_client_declares_an_index_path_on_a_registered_type() {
         .count_nodes(&ctx, &patterns, by_priority())
         .await
         .expect_err("a count refuses an ordering it cannot apply");
+}
+
+// ---------------------------------------------------------------------------
+// Edge reads: payloads on traversal, the edge listing
+// ---------------------------------------------------------------------------
+
+/// A star of `count` edges out of `edge-hub`, each with a payload naming its
+/// far end and padded by `pad` bytes.
+async fn seed_weighted_star(harness: &Harness, count: usize, pad: usize) {
+    let ctx = harness.ctx();
+    harness.seed_ontology(&ctx).await;
+    let mut nodes = vec![conformance::node("edge-hub", "hub")];
+    let mut edges = Vec::new();
+    for i in 0..count {
+        let far = format!("edge-far-{i}");
+        nodes.push(conformance::node(&far, &far));
+        edges.push(graph_storage_sdk::models::EdgeSpec {
+            payload: Some(serde_json::json!({ "to": far, "pad": "p".repeat(pad) })),
+            ..conformance::edge("edge-hub", &far)
+        });
+    }
+    harness
+        .services
+        .ingest(&ctx, conformance::batch(nodes, edges))
+        .await
+        .expect("the star commits");
+}
+
+fn star_walk(include_edge_payload: bool) -> TraverseRequest {
+    TraverseRequest {
+        seeds: vec!["edge-hub".to_owned()],
+        depth: 1,
+        edge_type_patterns: Vec::new(),
+        node_type_patterns: Vec::new(),
+        max_nodes: Some(100),
+        direction: None,
+        edge_discriminators: Vec::new(),
+        include_edge_payload,
+    }
+}
+
+/// The payload rides on each traversed edge only when it was asked for, on
+/// traversal and on neighborhood alike.
+#[tokio::test]
+async fn a_traversal_carries_edge_payloads_only_when_asked() {
+    let harness = Harness::allowed();
+    seed_weighted_star(&harness, 4, 0).await;
+    let ctx = harness.ctx();
+
+    let without = harness
+        .services
+        .traverse(&ctx, star_walk(false))
+        .await
+        .expect("the traversal answers");
+    assert_eq!(without.edges.len(), 4);
+    assert!(
+        without.edges.iter().all(|edge| edge.payload.is_none()),
+        "no payload unless asked: {:?}",
+        without.edges
+    );
+
+    let with = harness
+        .services
+        .traverse(&ctx, star_walk(true))
+        .await
+        .expect("the traversal answers");
+    assert_eq!(with.edges.len(), 4);
+    for edge in &with.edges {
+        assert_eq!(
+            edge.payload.as_ref().and_then(|p| p.get("to")),
+            Some(&serde_json::json!(edge.dst)),
+            "each edge carries its own payload"
+        );
+    }
+
+    let around = harness
+        .services
+        .neighborhood(
+            &ctx,
+            NeighborhoodRequest {
+                root: "edge-hub".to_owned(),
+                depth: 1,
+                node_budget: None,
+                include_phantoms: true,
+                direction: None,
+                include_edge_payload: true,
+            },
+        )
+        .await
+        .expect("the neighborhood answers");
+    assert_eq!(around.edges.len(), 4);
+    assert!(around.edges.iter().all(|edge| edge.payload.is_some()));
+}
+
+/// Edge payloads pay into the response budget: the same walk that fits
+/// without them is cut, and says so, once they are carried.
+#[tokio::test]
+async fn edge_payloads_count_against_the_byte_budget() {
+    let small = GraphStorageConfig {
+        response_max_bytes: 4 * 1024,
+        ..GraphStorageConfig::default()
+    };
+    let harness = Harness::configured(Arc::new(support::AllowInOwnTenant), small);
+    // Six edges of ~1.5 KiB payload each: 9 KiB of payload against a 4 KiB
+    // budget that the nodes and bare edges fit inside.
+    seed_weighted_star(&harness, 6, 1_500).await;
+    let ctx = harness.ctx();
+
+    let bare = harness
+        .services
+        .traverse(&ctx, star_walk(false))
+        .await
+        .expect("the traversal answers");
+    assert_eq!((bare.edges.len(), bare.truncated), (6, None), "fits bare");
+
+    let carried = harness
+        .services
+        .traverse(&ctx, star_walk(true))
+        .await
+        .expect("the traversal answers");
+    assert!(
+        carried.edges.len() < 6 && !carried.edges.is_empty(),
+        "the budget cut the edges: {}",
+        carried.edges.len()
+    );
+    assert_eq!(carried.truncated, Some(TruncationReason::ResponseBytes));
+    assert_eq!(carried.nodes.len(), 7, "nodes come first and all fit");
+}
+
+fn hub_edges(limit: Option<u32>, cursor: Option<String>) -> NodeEdgesRequest {
+    NodeEdgesRequest {
+        node_key: "edge-hub".to_owned(),
+        limit,
+        cursor,
+        ..NodeEdgesRequest::default()
+    }
+}
+
+/// The listing pages through a hub with an opaque cursor, and the cursor
+/// belongs to the listing that minted it.
+#[tokio::test]
+async fn a_hubs_edges_page_through_the_service_with_a_bound_cursor() {
+    let harness = Harness::allowed();
+    seed_weighted_star(&harness, 5, 0).await;
+    let ctx = harness.ctx();
+
+    let mut seen = Vec::new();
+    let mut cursor = None;
+    let mut pages = 0;
+    loop {
+        let page = harness
+            .services
+            .list_node_edges(&ctx, hub_edges(Some(2), cursor.take()))
+            .await
+            .expect("the page answers");
+        pages += 1;
+        seen.extend(page.items.into_iter().map(|edge| edge.dst));
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+        assert!(pages < 10, "the listing ends");
+    }
+    seen.sort();
+    assert_eq!(pages, 3, "five edges, two a page");
+    assert_eq!(
+        seen,
+        (0..5).map(|i| format!("edge-far-{i}")).collect::<Vec<_>>(),
+        "every edge exactly once"
+    );
+
+    let first = harness
+        .services
+        .list_node_edges(&ctx, hub_edges(Some(2), None))
+        .await
+        .expect("the page answers");
+    let minted = first.next_cursor.expect("more than one page");
+    let elsewhere = harness
+        .services
+        .list_node_edges(
+            &ctx,
+            NodeEdgesRequest {
+                direction: Some(graph_storage_sdk::models::Direction::Incoming),
+                ..hub_edges(Some(2), Some(minted.clone()))
+            },
+        )
+        .await;
+    assert!(
+        matches!(elsewhere, Err(DomainError::InvalidArgument { .. })),
+        "a cursor replayed under another direction is refused: {elsewhere:?}"
+    );
+    let filtered = harness
+        .services
+        .list_node_edges(
+            &ctx,
+            NodeEdgesRequest {
+                discriminators: vec!["x".to_owned()],
+                ..hub_edges(Some(2), Some(minted))
+            },
+        )
+        .await;
+    assert!(
+        matches!(filtered, Err(DomainError::InvalidArgument { .. })),
+        "and under another filter: {filtered:?}"
+    );
+    let garbage = harness
+        .services
+        .list_node_edges(&ctx, hub_edges(Some(2), Some("not-a-cursor".to_owned())))
+        .await;
+    assert!(
+        matches!(garbage, Err(DomainError::InvalidArgument { .. })),
+        "{garbage:?}"
+    );
+}
+
+/// The page size is bounded by `edge_list_max_page`, which is also the
+/// default, and zero is not a page.
+#[tokio::test]
+async fn the_edge_listing_page_is_bounded_by_configuration() {
+    let config = GraphStorageConfig {
+        edge_list_max_page: 3,
+        ..GraphStorageConfig::default()
+    };
+    let harness = Harness::configured(Arc::new(support::AllowInOwnTenant), config);
+    seed_weighted_star(&harness, 5, 0).await;
+    let ctx = harness.ctx();
+
+    let default = harness
+        .services
+        .list_node_edges(&ctx, hub_edges(None, None))
+        .await
+        .expect("the default page answers");
+    assert_eq!(default.items.len(), 3, "the default is the ceiling");
+    assert!(default.next_cursor.is_some());
+
+    for limit in [0, 4] {
+        let refused = harness
+            .services
+            .list_node_edges(&ctx, hub_edges(Some(limit), None))
+            .await;
+        assert!(
+            matches!(refused, Err(DomainError::LimitExceeded { .. })),
+            "limit {limit}: {refused:?}"
+        );
+    }
+}
+
+/// The listing's filters are held to traversal's bounds: an over-long
+/// pattern, more discriminators than the bound, and an empty discriminator
+/// are refused before the store is asked.
+#[tokio::test]
+async fn the_edge_listing_admits_its_filters_as_traversal_does() {
+    let harness = Harness::allowed();
+    seed_weighted_star(&harness, 2, 0).await;
+    let ctx = harness.ctx();
+    let long = "p".repeat(GraphStorageConfig::default().identifier_max_bytes as usize + 1);
+    let cases = [
+        (
+            "an over-long pattern",
+            NodeEdgesRequest {
+                edge_type_patterns: vec![long],
+                ..hub_edges(None, None)
+            },
+        ),
+        (
+            "too many discriminators",
+            NodeEdgesRequest {
+                discriminators: (0..=graph_storage::domain::admission::EDGE_DISCRIMINATORS_MAX)
+                    .map(|i| format!("d{i}"))
+                    .collect(),
+                ..hub_edges(None, None)
+            },
+        ),
+        (
+            "an empty discriminator",
+            NodeEdgesRequest {
+                discriminators: vec![String::new()],
+                ..hub_edges(None, None)
+            },
+        ),
+    ];
+    for (what, request) in cases {
+        let refused = harness.services.list_node_edges(&ctx, request).await;
+        assert!(
+            matches!(
+                refused,
+                Err(DomainError::LimitExceeded { .. } | DomainError::InvalidArgument { .. })
+            ),
+            "{what} is refused: {refused:?}"
+        );
+    }
+}
+
+/// A cursor carries the source epoch it was minted on; one from another
+/// epoch -- a timeline a restore abandoned -- is refused as stale rather than
+/// resumed at an id the restored store may have given to another edge.
+#[tokio::test]
+async fn an_edge_cursor_from_another_epoch_is_stale() {
+    let harness = Harness::allowed();
+    seed_weighted_star(&harness, 3, 0).await;
+    let ctx = harness.ctx();
+    let first = harness
+        .services
+        .list_node_edges(&ctx, hub_edges(Some(1), None))
+        .await
+        .expect("the page answers");
+    let minted = first.next_cursor.expect("more than one page");
+    let (epoch, rest) = minted.split_once('.').expect("an epoch first");
+    let epoch: i64 = epoch.parse().expect("a number");
+    assert_eq!(
+        epoch, first.revision.source_epoch,
+        "the epoch it was minted on"
+    );
+    let elsewhere = format!("{}.{rest}", epoch + 1);
+    let refused = harness
+        .services
+        .list_node_edges(&ctx, hub_edges(Some(1), Some(elsewhere)))
+        .await;
+    assert!(
+        matches!(refused, Err(DomainError::StaleCursor { .. })),
+        "{refused:?}"
+    );
+    harness
+        .services
+        .list_node_edges(&ctx, hub_edges(Some(1), Some(minted)))
+        .await
+        .expect("the cursor from this epoch continues");
 }

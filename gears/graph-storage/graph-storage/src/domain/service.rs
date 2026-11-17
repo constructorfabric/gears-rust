@@ -9,12 +9,13 @@ use std::sync::Arc;
 use authz_resolver_sdk::pep::PolicyEnforcer;
 use graph_storage_sdk::models::{
     DeleteOutcome, DeleteRequest, Direction, EdgeKey, EdgeView, GraphRevision, GtsTypeId,
-    IngestOutcome, IngestRequest, ItemError, ItemFamily, NeighborhoodRequest, NodeCount, NodeKey,
-    NodeRow, NodeView, OnExisting, Page, ProjectionRequest, RegisteredType, RemainingBudget,
-    SearchMode, SearchRequest, SearchResponse, TraversalResponse, TraverseRequest, TypeIdSet,
-    TypeKind, TypeQuery, TypeRecord, TypeRegistration, TypeRegistrationOptions,
+    IngestOutcome, IngestRequest, ItemError, ItemFamily, NeighborhoodRequest, NodeCount,
+    NodeEdgesRequest, NodeKey, NodeRow, NodeView, OnExisting, Page, ProjectionRequest,
+    RegisteredType, RemainingBudget, SearchMode, SearchRequest, SearchResponse, TraversalResponse,
+    TraverseRequest, TypeIdSet, TypeKind, TypeQuery, TypeRecord, TypeRegistration,
+    TypeRegistrationOptions,
 };
-use graph_storage_sdk::plugin_api::{GraphEngineV1, GraphStoreV1, StoreCtx};
+use graph_storage_sdk::plugin_api::{GraphEngineV1, GraphStoreV1, NodeEdgesQuery, StoreCtx};
 use tokio_util::sync::CancellationToken;
 use toolkit_macros::domain_model;
 use toolkit_security::AccessScope;
@@ -904,6 +905,78 @@ impl GraphServices {
             .await?)
     }
 
+    /// One page of the edges incident to a node, both endpoints visible.
+    ///
+    /// The page is `request.limit` edges at most, by default and at most
+    /// `edge_list_max_page`; the cursor is bound to the node, the direction
+    /// and the filters, and refused under any other.
+    pub async fn list_node_edges(
+        &self,
+        call: impl Into<Call<'_>>,
+        request: NodeEdgesRequest,
+    ) -> Result<Page<EdgeView>, DomainError> {
+        let auth = self
+            .authorize(call, &authz::node_resource(), authz::actions::READ)
+            .await?;
+        admission::admit_node_edges(&self.config, &request)?;
+        let limit = request.limit.unwrap_or(self.config.edge_list_max_page);
+        let direction = request.direction.unwrap_or(Direction::Either);
+        let identity = admission::edge_listing_identity(
+            &request.node_key,
+            direction,
+            &request.edge_type_patterns,
+            &request.discriminators,
+        );
+        let position = request
+            .cursor
+            .as_deref()
+            .map(|cursor| admission::edge_cursor_position(cursor, &identity))
+            .transpose()?;
+        let after = position.map(|(_, after)| after);
+        let edge_types = self
+            .resolve_patterns(&auth, &request.edge_type_patterns)
+            .await?;
+        let page = self
+            .store
+            .list_node_edges(
+                &Self::store_ctx(&auth, None),
+                &NodeEdgesQuery {
+                    node_key: request.node_key,
+                    direction,
+                    edge_types,
+                    discriminators: request.discriminators,
+                    after,
+                    limit,
+                },
+            )
+            .await?;
+        // A cursor carries the epoch it was minted on (DESIGN § Read
+        // Consistency Contract): a position on an abandoned timeline names an
+        // id the restored store may have given to another edge. The revision
+        // is not bound -- the built-in store cannot serve an older one, and a
+        // listing that failed on every write would never finish under ingest
+        // -- so each page reports the revision it observed instead.
+        if let Some((epoch, _)) = position
+            && epoch != page.revision.source_epoch
+        {
+            return Err(DomainError::StaleCursor {
+                message: format!(
+                    "the cursor was minted on source epoch {epoch} and the store is on epoch {}; \
+                     start the listing again without a cursor",
+                    page.revision.source_epoch
+                ),
+            });
+        }
+        let epoch = page.revision.source_epoch;
+        Ok(Page {
+            items: page.items,
+            next_cursor: page
+                .next_after
+                .map(|after| admission::edge_cursor(epoch, after, &identity)),
+            revision: page.revision,
+        })
+    }
+
     pub async fn project_nodes(
         &self,
         call: impl Into<Call<'_>>,
@@ -1055,7 +1128,12 @@ impl GraphServices {
             .resolve_patterns(&auth, &request.node_type_patterns)
             .await?;
 
-        self.walk_and_hydrate(&auth, &request.seeds, plan, node_types, true)
+        let output = WalkOutput {
+            node_types,
+            include_phantoms: true,
+            edge_payloads: request.include_edge_payload,
+        };
+        self.walk_and_hydrate(&auth, &request.seeds, plan, output)
             .await
     }
 
@@ -1085,8 +1163,12 @@ impl GraphServices {
             retention: Retention::Degree,
         };
         let seeds = vec![request.root.clone()];
-        self.walk_and_hydrate(&auth, &seeds, plan, None, request.include_phantoms)
-            .await
+        let output = WalkOutput {
+            node_types: None,
+            include_phantoms: request.include_phantoms,
+            edge_payloads: request.include_edge_payload,
+        };
+        self.walk_and_hydrate(&auth, &seeds, plan, output).await
     }
 
     /// Resolve GTS patterns to a registered-type set (never SQL text).
@@ -1110,8 +1192,7 @@ impl GraphServices {
         auth: &Authorized,
         seeds: &[NodeKey],
         plan: WalkPlan,
-        node_types: Option<TypeIdSet>,
-        include_phantoms: bool,
+        output: WalkOutput,
     ) -> Result<TraversalResponse, DomainError> {
         // Two paths, chosen by what the store declares.
         //
@@ -1132,7 +1213,7 @@ impl GraphServices {
         if !self.store.capabilities().snapshots {
             let before = self.store.revision(&snapshot_ctx).await?;
             let mut result = self
-                .walk_without_snapshot(auth, seeds, plan, node_types, include_phantoms)
+                .walk_without_snapshot(auth, seeds, plan, output)
                 .await?;
             let after = self.store.revision(&snapshot_ctx).await?;
             result.consistent_snapshot = before == after;
@@ -1142,7 +1223,7 @@ impl GraphServices {
 
         let snapshot = self.store.begin_read(&snapshot_ctx).await?;
         let result = self
-            .walk_under_snapshot(auth, seeds, plan, node_types, include_phantoms, &snapshot)
+            .walk_under_snapshot(auth, seeds, plan, output, &snapshot)
             .await;
         // Releasing the snapshot must never mask the walk's own outcome, so a
         // failure to close is logged rather than returned.
@@ -1162,15 +1243,14 @@ impl GraphServices {
         auth: &Authorized,
         seeds: &[NodeKey],
         plan: WalkPlan,
-        node_types: Option<TypeIdSet>,
-        include_phantoms: bool,
+        output: WalkOutput,
     ) -> Result<TraversalResponse, DomainError> {
         let revision = self.store.revision(&Self::store_ctx(auth, None)).await?;
         let standin = graph_storage_sdk::models::ReadSnapshot {
             id: uuid::Uuid::now_v7(),
             revision,
         };
-        self.walk_under_snapshot(auth, seeds, plan, node_types, include_phantoms, &standin)
+        self.walk_under_snapshot(auth, seeds, plan, output, &standin)
             .await
     }
 
@@ -1179,10 +1259,14 @@ impl GraphServices {
         auth: &Authorized,
         seeds: &[NodeKey],
         plan: WalkPlan,
-        node_types: Option<TypeIdSet>,
-        include_phantoms: bool,
+        output: WalkOutput,
         snapshot: &graph_storage_sdk::models::ReadSnapshot,
     ) -> Result<TraversalResponse, DomainError> {
+        let WalkOutput {
+            node_types,
+            include_phantoms,
+            edge_payloads,
+        } = output;
         let ctx = Self::store_ctx(auth, Some(snapshot));
 
         let resolved = self.store.resolve_node_ids(&ctx, seeds).await?;
@@ -1355,7 +1439,7 @@ impl GraphServices {
         // nodes, and it is returned when both are visible.
         let surviving: std::collections::BTreeSet<&str> =
             nodes.iter().map(|view| view.node_key.as_str()).collect();
-        let mut edges: Vec<_> = result
+        let edges: Vec<_> = result
             .edges
             .iter()
             .filter(|edge| {
@@ -1373,17 +1457,9 @@ impl GraphServices {
         // that way: an edge without its endpoints is a line drawn to nothing,
         // while a node without some of its edges is simply a node with fewer
         // edges.
-        edges.retain(|edge| {
-            if over_bytes {
-                return false;
-            }
-            spent = spent.saturating_add(edge_bytes(edge));
-            if spent > budget {
-                over_bytes = true;
-                return false;
-            }
-            true
-        });
+        let (edges, over_bytes) = self
+            .charge_edges(&ctx, edges, edge_payloads, &mut spent, over_bytes)
+            .await?;
 
         let truncated = if over_bytes {
             Some(graph_storage_sdk::models::TruncationReason::ResponseBytes)
@@ -1400,6 +1476,66 @@ impl GraphServices {
             truncated,
             revision: snapshot.revision,
         })
+    }
+
+    /// Charge the walk's edges to the response budget after its nodes, and
+    /// carry their payloads when asked. Returns the edges kept and whether
+    /// the budget was crossed (already crossed by the nodes, or here).
+    async fn charge_edges(
+        &self,
+        ctx: &StoreCtx<'_>,
+        mut edges: Vec<graph_storage_sdk::models::EdgeRef>,
+        edge_payloads: bool,
+        spent: &mut u64,
+        mut over_bytes: bool,
+    ) -> Result<(Vec<graph_storage_sdk::models::EdgeRef>, bool), DomainError> {
+        let budget = self.config.response_max_bytes;
+        let item_ceiling = u64::from(self.config.item_max_bytes).max(1);
+        // Payloads, when asked for, are read the way node rows are: in
+        // pieces the remaining budget is guaranteed to hold, so an answer
+        // that runs out of bytes stops reading at the first piece that
+        // crosses it rather than after every payload of the walk. An edge
+        // whose payload the store no longer returns -- removed or hidden
+        // between the hop that found it and this read -- is left out, as a
+        // node that vanished before hydration is.
+        if edge_payloads && !over_bytes {
+            let mut kept = Vec::with_capacity(edges.len());
+            let mut pending = std::collections::VecDeque::from(edges);
+            'pieces: while !pending.is_empty() {
+                let take =
+                    budgeted_piece(budget.saturating_sub(*spent), item_ceiling).min(pending.len());
+                let piece: Vec<_> = pending.drain(..take).collect();
+                let keys: Vec<EdgeKey> = piece.iter().map(|edge| edge.edge_key.clone()).collect();
+                let mut payloads = self.store.edge_payloads(ctx, &keys).await?;
+                for mut edge in piece {
+                    let Some(payload) = payloads.remove(&edge.edge_key) else {
+                        continue;
+                    };
+                    edge.payload = Some(payload);
+                    *spent = spent.saturating_add(edge_bytes(&edge));
+                    if *spent > budget {
+                        over_bytes = true;
+                        break 'pieces;
+                    }
+                    kept.push(edge);
+                }
+            }
+            edges = kept;
+        } else {
+            edges.retain(|edge| {
+                if over_bytes {
+                    return false;
+                }
+                *spent = spent.saturating_add(edge_bytes(edge));
+                if *spent > budget {
+                    over_bytes = true;
+                    return false;
+                }
+                true
+            });
+        }
+
+        Ok((edges, over_bytes))
     }
 
     /// Which of the result's types are phantom-family.
@@ -1432,6 +1568,16 @@ impl GraphServices {
         }
         phantom
     }
+}
+
+/// What a walk's answer keeps and carries, as opposed to how far it walks
+/// (`WalkPlan`).
+struct WalkOutput {
+    /// Past the seeds, only nodes of these types; `None` keeps every type.
+    node_types: Option<TypeIdSet>,
+    include_phantoms: bool,
+    /// Read each returned edge's payload onto its reference.
+    edge_payloads: bool,
 }
 
 /// The most rows one traversal hydration piece asks for, whatever the budget
@@ -1540,7 +1686,8 @@ fn row_bytes(row: &NodeRow) -> u64 {
         .saturating_add(name.as_ref().map_or(0, |name| name.len() as u64))
 }
 
-/// What one traversed edge costs to carry: five caller-controlled strings.
+/// What one traversed edge costs to carry: five caller-controlled strings,
+/// and the payload when the request asked for it.
 fn edge_bytes(edge: &graph_storage_sdk::models::EdgeRef) -> u64 {
     let graph_storage_sdk::models::EdgeRef {
         edge_key,
@@ -1548,10 +1695,16 @@ fn edge_bytes(edge: &graph_storage_sdk::models::EdgeRef) -> u64 {
         src,
         dst,
         discriminator,
+        payload,
     } = edge;
-    (edge_key.len()
-        + edge_type_id.len()
-        + src.len()
-        + dst.len()
-        + discriminator.as_ref().map_or(0, String::len)) as u64
+    let payload = payload.as_ref().map_or(0, |value| {
+        serde_json::to_vec(value).map_or(u64::MAX, |bytes| bytes.len() as u64)
+    });
+    payload.saturating_add(
+        (edge_key.len()
+            + edge_type_id.len()
+            + src.len()
+            + dst.len()
+            + discriminator.as_ref().map_or(0, String::len)) as u64,
+    )
 }

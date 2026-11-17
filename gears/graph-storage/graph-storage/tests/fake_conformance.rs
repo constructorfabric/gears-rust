@@ -782,3 +782,13 @@ async fn a_purge_bound_to_a_creation_instant_leaves_a_later_node_alone() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn a_hubs_edges_are_listed_a_page_at_a_time() {
+    conformance::a_hubs_edges_are_listed_a_page_at_a_time(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn edge_payloads_are_read_for_live_edges_only() {
+    conformance::edge_payloads_are_read_for_live_edges_only(&store(), Uuid::now_v7()).await;
+}

@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use graph_storage_sdk::models::Direction;
 use graph_storage_sdk::models::{
     AdjacencyEntry, AdjacencySide, AdmissionBasis, ComponentReadiness, DeleteOutcome,
     DeleteRequest, EdgeKey, EdgeView, ElementEnvelope, GraphRevision, GtsTypeId, IngestOutcome,
@@ -20,7 +21,8 @@ use graph_storage_sdk::models::{
     TypeRecord, TypeRegistration, TypeRegistrationOptions,
 };
 use graph_storage_sdk::plugin_api::{
-    EmbeddingPlan, EmbeddingState, GraphStoreError, GraphStoreV1, StoreCtx, VectorArm,
+    EmbeddingPlan, EmbeddingState, GraphStoreError, GraphStoreV1, NodeEdgesPage, NodeEdgesQuery,
+    StoreCtx, VectorArm,
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -60,6 +62,10 @@ struct FakeNode {
 
 #[derive(Clone)]
 struct FakeEdge {
+    /// Allocated from the counter node ids come from, so edges are ordered
+    /// by insertion as the built-in store's `bigserial` orders them -- the
+    /// order the edge listing pages in.
+    id: i64,
     key: String,
     type_id: String,
     src: i64,
@@ -1084,6 +1090,86 @@ impl GraphStoreV1 for FakeGraphStore {
         ))
     }
 
+    async fn list_node_edges(
+        &self,
+        ctx: &StoreCtx<'_>,
+        query: &NodeEdgesQuery,
+    ) -> Result<NodeEdgesPage, GraphStoreError> {
+        if !scope_admits(ctx.scope, ctx.tenant) {
+            return Err(GraphStoreError::NotFound);
+        }
+        let tenants = self.tenants.lock().map_err(|_| poisoned())?;
+        let tenant = tenants.get(&ctx.tenant).ok_or(GraphStoreError::NotFound)?;
+        let (nodes, edges, revision) = visible(tenant, ctx);
+        let live: BTreeMap<i64, &FakeNode> = nodes
+            .iter()
+            .filter(|n| !n.deleted)
+            .map(|n| (n.id, n))
+            .collect();
+        let node = live
+            .values()
+            .find(|n| n.key == query.node_key)
+            .ok_or(GraphStoreError::NotFound)?;
+        let mut scanned: Vec<&FakeEdge> = edges
+            .iter()
+            .filter(|e| !e.deleted)
+            .filter(|e| match query.direction {
+                Direction::Outgoing => e.src == node.id,
+                Direction::Incoming => e.dst == node.id,
+                Direction::Either => e.src == node.id || e.dst == node.id,
+            })
+            .filter(|e| query.after.is_none_or(|after| e.id > after))
+            .filter(|e| {
+                query
+                    .edge_types
+                    .as_ref()
+                    .is_none_or(|set| set.contains(&e.type_id))
+            })
+            .filter(|e| {
+                query.discriminators.is_empty()
+                    || e.discriminator
+                        .as_ref()
+                        .is_some_and(|d| query.discriminators.contains(d))
+            })
+            .collect();
+        scanned.sort_by_key(|e| e.id);
+        let limit = query.limit.max(1) as usize;
+        let more = scanned.len() > limit;
+        scanned.truncate(limit);
+        let next_after = if more {
+            scanned.last().map(|e| e.id)
+        } else {
+            None
+        };
+        let observed = GraphRevision {
+            source_epoch: self.epoch,
+            revision,
+        };
+        let items = scanned
+            .into_iter()
+            .filter_map(|edge| {
+                let src = live.get(&edge.src)?;
+                let dst = live.get(&edge.dst)?;
+                Some(EdgeView {
+                    edge_key: edge.key.clone(),
+                    edge_type_id: edge.type_id.clone(),
+                    src: src.key.clone(),
+                    dst: dst.key.clone(),
+                    discriminator: edge.discriminator.clone(),
+                    payload: edge.payload.clone(),
+                    envelope: edge
+                        .audit
+                        .envelope(edge.key.clone(), ctx.tenant, None, observed),
+                })
+            })
+            .collect();
+        Ok(NodeEdgesPage {
+            items,
+            next_after,
+            revision: observed,
+        })
+    }
+
     async fn get_edge(
         &self,
         ctx: &StoreCtx<'_>,
@@ -1582,6 +1668,7 @@ impl graph_storage_sdk::plugin_api::GraphEngineV1 for FakeGraphEngine {
                 src: src.key.clone(),
                 dst: dst.key.clone(),
                 discriminator: edge.discriminator.clone(),
+                payload: None,
             });
         }
         reached.sort_unstable();
@@ -2626,7 +2713,9 @@ fn apply_edge(
             ItemOutcome::Updated
         }
         None => {
+            *state.next_id += 1;
             edges.push(FakeEdge {
+                id: *state.next_id,
                 key: edge_key,
                 type_id: spec.type_id.clone(),
                 src,

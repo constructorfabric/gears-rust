@@ -852,3 +852,98 @@ async fn a_purge_precondition_without_mode_purge_is_refused() {
         "an unknown mode: {problem}"
     );
 }
+
+/// A node's edges over REST: repeated filter keys are honoured, the cursor
+/// continues the listing, an unknown option is refused rather than ignored,
+/// and a traversal returns edge payloads only when asked.
+#[tokio::test]
+async fn a_nodes_edges_are_listed_over_rest_and_a_walk_can_carry_their_payloads() {
+    let stand = Stand::new(Harness::allowed());
+    seed(&stand).await;
+    let (status, body) = stand
+        .post(
+            "/ingest",
+            &serde_json::json!({
+                "nodes": [
+                    {"node_key": "le-hub", "type_id": conformance::OWNED},
+                    {"node_key": "le-a", "type_id": conformance::OWNED},
+                    {"node_key": "le-b", "type_id": conformance::OWNED},
+                    {"node_key": "le-c", "type_id": conformance::OWNED}
+                ],
+                "edges": [
+                    {"type_id": conformance::LINK, "src_node_key": "le-hub",
+                     "dst_node_key": "le-a", "discriminator": "uses",
+                     "payload": {"weight": 1}},
+                    {"type_id": conformance::LINK, "src_node_key": "le-hub",
+                     "dst_node_key": "le-b", "discriminator": "advances",
+                     "payload": {"weight": 2}},
+                    {"type_id": conformance::LINK, "src_node_key": "le-hub",
+                     "dst_node_key": "le-c", "discriminator": "blocks",
+                     "payload": {"weight": 3}}
+                ]
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, both) = stand
+        .get("/nodes/le-hub/edges?discriminator=uses&discriminator=blocks")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{both}");
+    let mut weights: Vec<i64> = both["items"]
+        .as_array()
+        .expect("items is a list")
+        .iter()
+        .filter_map(|edge| edge["payload"]["weight"].as_i64())
+        .collect();
+    weights.sort_unstable();
+    assert_eq!(weights, vec![1, 3], "both repeated values apply: {both}");
+    assert!(both["next_cursor"].is_null(), "{both}");
+    assert!(both["items"][0]["envelope"].is_object(), "{both}");
+
+    let (status, first) = stand.get("/nodes/le-hub/edges?limit=2").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["items"].as_array().map(Vec::len), Some(2), "{first}");
+    let cursor = first["next_cursor"].as_str().expect("a second page");
+    let (status, second) = stand
+        .get(&format!("/nodes/le-hub/edges?limit=2&cursor={cursor}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(
+        second["items"].as_array().map(Vec::len),
+        Some(1),
+        "{second}"
+    );
+    assert!(second["next_cursor"].is_null(), "{second}");
+
+    let (status, problem) = stand.get("/nodes/le-hub/edges?sort=weight").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unknown option is refused: {problem}"
+    );
+    let (status, missing) = stand.get("/nodes/le-nobody/edges").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+
+    let walk = |include: bool| {
+        serde_json::json!({
+            "seeds": ["le-hub"], "depth": 1, "include_edge_payload": include
+        })
+    };
+    let (status, bare) = stand.post("/graph/traverse", &walk(false)).await;
+    assert_eq!(status, StatusCode::OK, "{bare}");
+    assert!(
+        bare["edges"][0].get("payload").is_none(),
+        "no payload member unless asked: {bare}"
+    );
+    let (status, carried) = stand.post("/graph/traverse", &walk(true)).await;
+    assert_eq!(status, StatusCode::OK, "{carried}");
+    assert!(
+        carried["edges"]
+            .as_array()
+            .expect("edges is a list")
+            .iter()
+            .all(|edge| edge["payload"]["weight"].is_i64()),
+        "{carried}"
+    );
+}
