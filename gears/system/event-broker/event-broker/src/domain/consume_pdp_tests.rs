@@ -18,6 +18,7 @@
 //! groups. Every PDP creates and lets it JOIN its own anonymous group: the
 //! group check asks for the group's tenant, which is the caller's.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -58,7 +59,7 @@ const SUBJECT_TYPE: &str = "gts.x.eb.consumepdp.order.v1~";
 const OVER_CAP_TOPIC: &str = "gts.cf.core.events.topic.v1~x.eb.consumepdp.audit.v1";
 const NOTED: &str = "gts.cf.core.events.event.v1~x.eb.consumepdp.noted.v1~";
 
-/// Bounds every stream open and every frame read.
+/// Bounds each stream open and each complete event batch.
 const BOUND: Duration = Duration::from_secs(5);
 
 /// Bounds the wait that shows a stream still open after its events. It spans
@@ -258,21 +259,75 @@ async fn publish_delivery_events(harness: &EventBrokerHarness) {
     publish(harness, 0x10_04, PLACED, T234).await;
 }
 
-/// The topic and id of the first `count` events the stream delivers, in
-/// delivery order, each frame read within [`BOUND`].
-async fn read_events(stream: &mut FrameStream, count: usize) -> Vec<(String, Uuid)> {
-    let mut delivered = Vec::new();
-    while delivered.len() < count {
-        match tokio::time::timeout(BOUND, stream.next())
-            .await
-            .expect("each frame arrives within the bound")
-        {
-            Some(Frame::Event(event)) => delivered.push((event.topic.to_string(), event.id)),
-            Some(_) => {}
-            None => panic!("the stream ended after {delivered:?}"),
+/// The first `count` event topics and ids in delivery order, all within [`BOUND`].
+/// Heartbeats cannot extend the batch deadline.
+async fn read_events(
+    stream: &mut (impl tokio_stream::Stream<Item = Frame> + Unpin),
+    count: usize,
+) -> Vec<(String, Uuid)> {
+    tokio::time::timeout(BOUND, async {
+        let mut delivered = Vec::new();
+        while delivered.len() < count {
+            match stream.next().await {
+                Some(Frame::Event(event)) => delivered.push((event.topic.to_string(), event.id)),
+                Some(_) => {}
+                None => panic!("the stream ended after {delivered:?}"),
+            }
         }
+        delivered
+    })
+    .await
+    .expect("the events arrive within the bound")
+}
+
+/// A one-second heartbeat keeps a per-frame deadline alive. Paused Tokio time
+/// separates the five-second read deadline from the ten-second watchdog exactly.
+#[tokio::test(start_paused = true)]
+async fn heartbeats_do_not_extend_the_event_read_deadline() {
+    const WATCHDOG: Duration = Duration::from_secs(10);
+    let heartbeats = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&heartbeats);
+    let started = tokio::time::Instant::now();
+    let mut task = tokio::spawn(async move {
+        let stream = tokio_stream::iter(std::iter::repeat(())).then(move |()| {
+            let observed = Arc::clone(&observed);
+            async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                observed.fetch_add(1, Ordering::Relaxed);
+                Frame::Heartbeat {
+                    at: Utc.with_ymd_and_hms(2026, 11, 13, 10, 0, 0).unwrap(),
+                }
+            }
+        });
+        tokio::pin!(stream);
+        read_events(&mut stream, 1).await
+    });
+    let outcome = tokio::time::timeout(WATCHDOG, &mut task).await;
+    if outcome.is_err() {
+        task.abort();
+        let cancelled = tokio::time::timeout(BOUND, task)
+            .await
+            .expect("the aborted event read joins within the bound")
+            .expect_err("the event read is cancelled");
+        assert!(cancelled.is_cancelled());
+        panic!("the event read exceeds its deadline and reaches the watchdog");
     }
-    delivered
+    let failure = outcome
+        .unwrap()
+        .expect_err("a heartbeat-only stream cannot deliver an event");
+    assert!(
+        failure.is_panic(),
+        "the event read fails through its deadline"
+    );
+    let payload = failure.into_panic();
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .expect("the deadline panic carries a message");
+    assert!(message.contains("the events arrive within the bound"));
+    assert!(heartbeats.load(Ordering::Relaxed) >= 2);
+    assert_eq!(started.elapsed(), BOUND);
 }
 
 /// The first frame other than a heartbeat, a topology report or a progress
@@ -1312,11 +1367,8 @@ async fn delivered_then_quiet(harness: &EventBrokerHarness, id: &str, count: usi
     .await
     .expect("the open answers within the bound")
     .expect("the open is allowed");
-    // Bounded as a whole: heartbeats would keep a per-frame bound from ever
-    // ending a read that waits for an event that never comes.
-    let delivered = tokio::time::timeout(BOUND, read_events(&mut stream, count))
+    let delivered = read_events(&mut stream, count)
         .await
-        .expect("the events arrive within the bound")
         .into_iter()
         .map(|(_, event)| event)
         .collect();

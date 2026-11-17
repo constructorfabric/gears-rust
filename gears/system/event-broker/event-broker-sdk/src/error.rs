@@ -1681,7 +1681,7 @@ mod canonical_roundtrip_tests {
                             "status": 404,
                             "detail": "consumer group is not registered",
                             "context": {
-                                "resource_type": "gts.cf.core.events.consumer_group.v1~",
+                                "resource_type": crate::gts::CONSUMER_GROUP_RESOURCE_TYPE,
                             },
                         }),
                     )

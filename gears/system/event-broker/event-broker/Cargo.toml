@@ -196,14 +196,13 @@ tempfile = { workspace = true }
 # in-memory `PlatformTypesRegistryApi` test double, reused rather than
 # hand-rolled.
 types-registry-sdk = { workspace = true, features = ["test-util"] }
-# `domain/authz_pdp_tests.rs`: the real tr-authz service, so the publish rows
-# run through the policy the platform ships (design-22 Q20 (a)).
+# The publish and consume PDP tests use the real tr-authz service.
 tr-authz-plugin = { package = "cf-gears-tr-authz-plugin", path = "../../authz-resolver/plugins/tr-authz-plugin" }
-# The tenant tree that tr-authz walks: `authz_pdp_tests.rs` implements the
-# `TenantResolverClient` over an in-memory tree.
+# `domain/pdp_fixtures.rs` implements `TenantResolverClient` over an
+# in-memory tenant tree for tr-authz.
 tenant-resolver-sdk = { workspace = true }
 # The lib's PDP tests (`domain/*pdp_tests.rs`) run against the real static-authz service.
-static-authz-plugin = { workspace = true }
+static-authz-plugin = { package = "cf-gears-static-authz-plugin", path = "../../authz-resolver/plugins/static-authz-plugin" }
 # The full-process integration tests that spawn the server binary live in the
 # `cf-gears-event-broker-server` crate (the only crate defining its
 # `CARGO_BIN_EXE`).

@@ -543,6 +543,7 @@ pub(crate) struct ConsumeEvaluator {
 }
 
 impl ConsumeEvaluator {
+    /// Builds an evaluator from the shared policy, specification, memo and tenant-set services.
     pub(crate) fn new(
         policy_enforcer: PolicyEnforcer,
         spec_manager: Arc<dyn crate::domain::specification::SpecificationManager>,
@@ -892,6 +893,7 @@ impl ConsumeEvaluator {
 }
 
 /// Which memo entries an evaluation reuses instead of asking the PDP.
+#[domain_model]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum MemoUse {
     /// Every live entry: a stream open reuses what JOIN or an earlier open
@@ -917,12 +919,15 @@ impl MemoUse {
 }
 
 /// What re-evaluating one group for its scope's refresh worker found.
+#[domain_model]
 #[derive(Debug)]
 pub(crate) enum Renewal {
     /// The group's new scope, and until when the memo answers it reused
     /// serve.
     Renewed {
+        /// The renewed consume scope for the group.
         scope: Arc<CompiledScope>,
+        /// Whether renewal reuses memo answers and when the earliest reused answer expires.
         remembered: Remembered,
     },
     /// I or E denied, or answered with nothing that compiles or can be
@@ -952,6 +957,7 @@ struct ScopeExpiry {
 }
 
 /// Until when the memo answers that a group reused keep serving.
+#[domain_model]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Remembered {
     /// Every answer was asked.

@@ -1630,7 +1630,8 @@ mod tests {
     /// any marker is written, and no member is created.
     #[tokio::test]
     async fn a_join_of_a_group_id_without_a_uuid_writes_no_marker() {
-        const GROUP: &str = "gts.cf.core.events.consumer_group.v1~x.eb.storage.unmarked.v1";
+        const GROUP: &str =
+            toolkit_gts::gts_id!("cf.core.events.consumer_group.v1~example.eb.storage.unmarked.v1");
         let harness = crate::test_support::EventBrokerHarness::builder()
             .build()
             .await;
@@ -1670,9 +1671,10 @@ mod tests {
         };
         assert_eq!(
             message,
-            "consumer group 'gts.cf.core.events.consumer_group.v1~x.eb.storage.unmarked.v1' \
-             has no owner marker: its id does not end in a UUID (named consumer groups are \
-             tracked in #5702)"
+            format!(
+                "consumer group '{GROUP}' has no owner marker: its id does not end in a UUID \
+                 (named consumer groups are tracked in #5702)"
+            )
         );
         let cache = harness.repo().cache().expect("the harness wired the cache");
         assert_eq!(
