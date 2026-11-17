@@ -58,7 +58,7 @@ Chosen option: (a). Each plane is its own contract with its own base path, as in
 
 | Plane    | Contract                   | Base path                     | Operations                                          | Subject and tenant    | Edge          |
 |----------|----------------------------|-------------------------------|-----------------------------------------------------|-----------------------|---------------|
-| Platform | `PlatformQuotaResolverApi` | `/quota-resolver/v1/platform` | debit, acquire, commit, release lease; quota state  | from the request      | not published |
+| Platform | `PlatformQuotaResolverApi` | `/quota-resolver/v1/platform` | debit, acquire, commit, release lease; return; quota state | from the request      | not published |
 | Tenant   | `QuotaResolverApi`         | `/quota-resolver/v1`          | quota state                                         | from the context only | published     |
 
 `PlatformQuotaResolverApi` takes `PlatformSecurityContext`; `QuotaResolverApi` takes `SecurityContext`, and its

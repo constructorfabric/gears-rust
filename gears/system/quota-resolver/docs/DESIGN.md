@@ -1,5 +1,5 @@
 ---
-description: "Technical design of the quota resolver gear: debit, lease, and quota state on a platform plane, quota state on a tenant plane, principal-to-subject-type mapping, and delegation to a quota backend plugin."
+description: "Technical design of the quota resolver gear: debit, lease, return, and quota state on a platform plane, quota state on a tenant plane, principal-to-subject-type mapping, and delegation to a quota backend plugin."
 ---
 
 # Technical Design — Quota Resolver
@@ -36,11 +36,11 @@ description: "Technical design of the quota resolver gear: debit, lease, and quo
 
 ### 1.1 Architectural Vision
 
-Quota Resolver is a stateless gateway with no store. It offers five operations (debit, lease acquisition, lease
-commit, lease release, and quota state) on two planes, each its own contract, as types-registry does with
+Quota Resolver is a stateless gateway with no store. It offers six operations (debit, lease acquisition, lease
+commit, lease release, return, and quota state) on two planes, each its own contract, as types-registry does with
 `PlatformTypesRegistryApi` and `TypesRegistryApi`:
 
-* **platform plane**, `PlatformQuotaResolverApi`: all five operations. A trusted platform service names the tenant and
+* **platform plane**, `PlatformQuotaResolverApi`: all six operations. A trusted platform service names the tenant and
   the subjects. A module that charges the user of its request takes the user's principal and tenant from the incoming
   `SecurityContext` and passes them as request data; the user's context is neither forwarded nor synthesized;
 * **tenant plane**, `QuotaResolverApi`: quota state only. The subject is the caller's principal and the tenant is the
@@ -73,6 +73,9 @@ The design keeps the resolver thin:
 |----------------------------------------------|--------------------------------------------------------------------------------------------------------------|
 | `cpt-cf-quota-resolver-fr-debit`             | `PlatformQuotaResolverApi.debit` delegates to the plugin and returns `QuotaDecision`.                        |
 | `cpt-cf-quota-resolver-fr-lease`             | `acquire_lease`, `commit_lease`, `release_lease` on `PlatformQuotaResolverApi`; the plugin holds the lease and its expiry. |
+| `cpt-cf-quota-resolver-fr-return`            | `PlatformQuotaResolverApi.return_amount` delegates to the plugin; the request names the charge by its key; the backend keeps a charge returnable until all of it is returned (allocation) or its period ends (consumption), applies the return to each quota by its kind, and rejects it on a rate-limiting quota or above what remains of the charge. |
+| `cpt-cf-quota-resolver-fr-lease-extension`   | Deferred: `extend_lease` on `PlatformQuotaResolverApi` once the backend supports it; the plugin receives the platform request. |
+| `cpt-cf-quota-resolver-fr-multi-metric`      | Deferred: the request shape is settled together with the backend's batch operations; the resolver passes the set to the plugin as one call. |
 | `cpt-cf-quota-resolver-fr-quota-state`       | `quota_state` on both contracts returns a page of `QuotaState`.                                              |
 | `cpt-cf-quota-resolver-fr-idempotency`       | Every write request carries an idempotency key; the gateway passes it unchanged; the plugin replays.         |
 | `cpt-cf-quota-resolver-fr-subject-forms`     | `SubjectInput` is a quota subject or a principal (§3.1).                                                     |
@@ -194,12 +197,13 @@ The table states what each entity must carry. Exact field names and shapes are s
 | `PlatformAcquireLeaseRequest` | What a debit carries, plus the requested lease duration.                                                                                                                                            |
 | `PlatformCommitLeaseRequest`  | The tenant, the lease token, the actual amount (absent means the full held amount), and an idempotency key.                                                                                       |
 | `PlatformReleaseLeaseRequest` | The tenant, the lease token, and an idempotency key.                                                                                                                                               |
+| `PlatformReturnRequest`       | The tenant, the idempotency key of the charge, the amount to return of each metric of the charge, and the return's own idempotency key.                                                                                                               |
 | `PlatformQuotaStateRequest`   | The tenant, one subject, the metrics to read, and paging.                                                                                                                                          |
 | `QuotaStateRequest`           | The tenant-plane read: the metrics and paging only. It has no subject and no tenant, so the caller cannot name either.                                                                           |
 | `QuotaDecision`               | The verdict of a debit or a lease acquisition: allowed or denied, a stable reason for a denial (for example `quota_exceeded`, `principal_not_mapped`), and a map of non-authoritative diagnostics.  |
 | `LeaseOutcome`                | An acquired lease (its token and expiry) or a denial with its `QuotaDecision`.                                                                                                                     |
-| `QuotaState`                  | The state of one quota: its id, its `QuotaSubject`, the metric, the cap or none, the consumed and remaining amounts, and the current period with its reset time.                                  |
-| Plugin requests               | `PluginDebitRequest`, `PluginAcquireLeaseRequest`, `PluginQuotaStateRequest`: the platform request with every subject a `QuotaSubject`. Commit and release need no conversion; the plugin receives their platform requests. |
+| `QuotaState`                  | The state of one quota: its id, its `QuotaSubject`, the metric, the cap or none, the consumed and remaining amounts, and, for a quota with a period, the current period with its reset time.                                  |
+| Plugin requests               | `PluginDebitRequest`, `PluginAcquireLeaseRequest`, `PluginQuotaStateRequest`: the platform request with every subject a `QuotaSubject`. Commit, release, and return need no conversion; the plugin receives their platform requests. |
 
 **Quota subject types**: the SDK registers the abstract base `gts.cf.core.quota.subj.v1~` and the tenant subject type
 `gts.cf.core.quota.subj.v1~cf.core.quota.tenant.v1~`, which names a tenant quota in `QuotaState`. Every other quota
@@ -224,7 +228,7 @@ tenant (`subject_tenant_id`) for a platform request. It reads the context; it do
 - A platform request becomes a plugin request after every `SubjectInput` becomes a `QuotaSubject`. The plugin never
   receives a principal.
 - `QuotaDecision`, `LeaseOutcome`, pages of `QuotaState`, and plugin errors come back from the plugin unchanged. A
-  commit or release returns no result; a settlement the backend cannot apply is a plugin error.
+  commit, release, or return returns no result; a settlement or return the backend cannot apply is a plugin error.
 
 **Envelope evolution**: two unknown-field policies, as in license-resolver.
 
@@ -344,14 +348,15 @@ subjects and no caller identity.
 
 **Endpoints Overview**: all `POST`; the paths are kebab-case method names under each contract's base path.
 
-| Contract                   | Base path                     | Context                   | Method          | Path             | Visibility  | Result             |
-|----------------------------|-------------------------------|---------------------------|-----------------|------------------|-------------|--------------------|
-| `PlatformQuotaResolverApi` | `/quota-resolver/v1/platform` | `PlatformSecurityContext` | `debit`         | `/debit`         | internal    | `QuotaDecision`    |
-| `PlatformQuotaResolverApi` | `/quota-resolver/v1/platform` | `PlatformSecurityContext` | `acquire_lease` | `/acquire-lease` | internal    | `LeaseOutcome`     |
-| `PlatformQuotaResolverApi` | `/quota-resolver/v1/platform` | `PlatformSecurityContext` | `commit_lease`  | `/commit-lease`  | internal    | none               |
-| `PlatformQuotaResolverApi` | `/quota-resolver/v1/platform` | `PlatformSecurityContext` | `release_lease` | `/release-lease` | internal    | none               |
-| `PlatformQuotaResolverApi` | `/quota-resolver/v1/platform` | `PlatformSecurityContext` | `quota_state`   | `/quota-state`   | internal    | `Page<QuotaState>` |
-| `QuotaResolverApi`         | `/quota-resolver/v1`          | `SecurityContext`         | `quota_state`   | `/quota-state`   | **exposed** | `Page<QuotaState>` |
+| Contract                   | Base path                     | Context                   | Method              | Path                 | Visibility  | Result             |
+|----------------------------|-------------------------------|---------------------------|---------------------|----------------------|-------------|--------------------|
+| `PlatformQuotaResolverApi` | `/quota-resolver/v1/platform` | `PlatformSecurityContext` | `debit`             | `/debit`             | internal    | `QuotaDecision`    |
+| `PlatformQuotaResolverApi` | `/quota-resolver/v1/platform` | `PlatformSecurityContext` | `acquire_lease`     | `/acquire-lease`     | internal    | `LeaseOutcome`     |
+| `PlatformQuotaResolverApi` | `/quota-resolver/v1/platform` | `PlatformSecurityContext` | `commit_lease`      | `/commit-lease`      | internal    | none               |
+| `PlatformQuotaResolverApi` | `/quota-resolver/v1/platform` | `PlatformSecurityContext` | `release_lease`     | `/release-lease`     | internal    | none               |
+| `PlatformQuotaResolverApi` | `/quota-resolver/v1/platform` | `PlatformSecurityContext` | `return_amount`     | `/return-amount`     | internal    | none               |
+| `PlatformQuotaResolverApi` | `/quota-resolver/v1/platform` | `PlatformSecurityContext` | `quota_state`       | `/quota-state`       | internal    | `Page<QuotaState>` |
+| `QuotaResolverApi`         | `/quota-resolver/v1`          | `SecurityContext`         | `quota_state`       | `/quota-state`       | **exposed** | `Page<QuotaState>` |
 
 Platform routes are `.platform_authenticated()`, tenant routes `.authenticated()`. Writes are `IdempotentWrite` and
 reads are `SafeRead`.

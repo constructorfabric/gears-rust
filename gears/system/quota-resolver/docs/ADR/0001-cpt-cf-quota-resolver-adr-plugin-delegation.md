@@ -58,7 +58,7 @@ receives the tenant and quota subjects only; principal mapping happens before de
   tenant types, and the plugin GTS type.
 * A backend registers a plugin in its process. The plugin converts the resolver requests to backend operations and
   backend results to resolver results.
-* The operations exposed are the subset consumers need: debit, lease, and quota state. The backend's other
+* The operations exposed are the subset consumers need: debit, lease, return, and quota state. The backend's other
   operations, such as quota and policy management, stay in its own API and can be added to the resolver later without
   breaking it.
 * With no plugin, every operation fails with an error; nothing is allowed by default.
