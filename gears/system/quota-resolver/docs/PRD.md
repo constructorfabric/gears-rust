@@ -377,11 +377,41 @@ on the tenant plane.
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-resolver-nfr-overhead`
 
-The time the resolver adds to an operation, excluding the plugin call, **MUST** be at most 5 ms at p95 with warm
-caches.
+With warm caches, the time the resolver adds to a call, excluding the plugin call, **MUST** be at most 5 ms at p95
+while calls arrive at the backend's throughput threshold.
 
-- **Threshold**: ≤ 5 ms p95 at the resolver boundary, plugin time excluded.
+- **Threshold**: ≤ 5 ms p95 at the resolver boundary, plugin time excluded, at the backend's throughput threshold.
 - **Rationale**: Debit and lease sit on the request path of the consuming module.
+
+#### Throughput and Latency
+
+- [ ] `p1` - **ID**: `cpt-cf-quota-resolver-nfr-throughput`
+
+Calls through the resolver **MUST** sustain the backend's throughput threshold. With warm caches and at that load, their
+p95 latency **MUST** be at most the backend's p95 latency threshold plus 5 ms.
+
+- **Threshold**: for a backend that states p95 ≤ B at N ops/s, calls through the resolver sustain N ops/s with
+  p95 ≤ B + 5 ms, measured at the resolver boundary. For the quota-enforcement backend: 10 000 ops/s, p95 ≤ 105 ms.
+- **Rationale**: Each backend states its own capacity and latency; the resolver must not lower either.
+
+#### Availability
+
+- [ ] `p1` - **ID**: `cpt-cf-quota-resolver-nfr-availability`
+
+Once the principal type and the plugin of a call are resolved, the call **MUST** depend on the plugin only, so calls
+through the resolver meet the backend's availability target. At start the resolver needs no other gear: it checks only
+the form of its configuration. types-registry is needed only to resolve the plugin on the first call after start and,
+once, for a principal type without its own configuration entry; a failed or timed-out lookup fails the call with
+`ServiceUnavailable`.
+
+A calling module **MUST** limit each call by its own deadline. It **MAY** retry a call that failed with
+`ServiceUnavailable` or ran past its deadline; a retried write **MUST** reuse its idempotency key. If charging stays
+unavailable, the module decides whether to do the work without a charge.
+
+- **Threshold**: availability of calls through the resolver is at least the backend's target, over the backend's
+  measurement period (for the quota-enforcement backend: 99.95% per calendar month); 0 failed calls for resolved
+  principal types during a types-registry outage.
+- **Rationale**: The resolver fails closed, so a dependency it adds to a call would stop charged work on its outage.
 
 ### 6.2 NFR Exclusions
 
