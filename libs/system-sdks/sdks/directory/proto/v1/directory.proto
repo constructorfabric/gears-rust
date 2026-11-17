@@ -13,14 +13,6 @@ service DirectoryService {
   // Resolve a REST endpoint (HTTP base URL) for a gear by its name
   rpc ResolveRestService(ResolveRestServiceRequest) returns (ResolveRestServiceResponse);
 
-  // DEPRECATED (ADR-0011, "OpenAPI document"). The directory no longer stores
-  // OpenAPI documents; the edge fetches each gear's document directly from the
-  // instance at `/.well-known/openapi.json` and verifies it against
-  // `InstanceInfo.openapi_spec_hash`. Kept for one release so old callers do
-  // not break: it still works against the in-memory store (a document an old
-  // worker pushed via the deprecated `RegisterInstanceRequest.openapi_spec`)
-  // and returns NOT_FOUND against a shared backend.
-  rpc GetOpenApiSpec(GetOpenApiSpecRequest) returns (GetOpenApiSpecResponse);
 
   // List all instances of a specific gear
   rpc ListInstances(ListInstancesRequest) returns (ListInstancesResponse);
@@ -59,16 +51,6 @@ message ResolveRestServiceRequest {
 
 message ResolveRestServiceResponse {
   string endpoint_uri = 1;
-}
-
-// DEPRECATED (ADR-0011, "OpenAPI document"): see the `GetOpenApiSpec` RPC.
-message GetOpenApiSpecRequest {
-  string gear_name = 1;
-}
-
-// DEPRECATED (ADR-0011, "OpenAPI document"): see the `GetOpenApiSpec` RPC.
-message GetOpenApiSpecResponse {
-  string openapi_spec = 1;
 }
 
 message ListInstancesRequest {
@@ -128,17 +110,15 @@ message GrpcServiceEndpoint {
 }
 
 message RegisterInstanceRequest {
+  // Field 6 (`optional string openapi_spec`) was removed: the directory no
+  // longer stores OpenAPI documents, only `openapi_spec_hash` (ADR-0011).
+  reserved 6;
+  reserved "openapi_spec";
   string gear_name = 1;
   string instance_id = 2;
   repeated GrpcServiceEndpoint grpc_services = 3;
   string version = 4;
   optional string rest_endpoint_uri = 5;
-  // DEPRECATED (ADR-0011, "OpenAPI document"): the full OpenAPI document. New
-  // workers send only `openapi_spec_hash` and serve the document themselves at
-  // `/.well-known/openapi.json`. Accepted for one release from old workers: the
-  // directory hashes it into `openapi_spec_hash` (and keeps it in the in-memory
-  // store only, so the deprecated `GetOpenApiSpec` still answers there).
-  optional string openapi_spec = 6;
   map<string, string> labels = 7;
   // State the registrant reports about itself. Unset/UNSPECIFIED is
   // read as STARTING on a new record; on a re-registration it leaves the stored
@@ -147,8 +127,7 @@ message RegisterInstanceRequest {
   // Lowercase-hex SHA-256 of the OpenAPI document the instance serves at
   // `/.well-known/openapi.json`. The directory stores only this hash and
   // returns it in `InstanceInfo.openapi_spec_hash`; the edge fetches and
-  // verifies the document against it. When unset but `openapi_spec` is present
-  // (an old worker), the directory derives the hash from that document.
+  // verifies the document against it. Unset when the gear publishes no document.
   optional string openapi_spec_hash = 9;
 }
 

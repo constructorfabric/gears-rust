@@ -34,11 +34,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use cf_system_sdks::directory::{
-    DeregisterInstanceRequest, DirectoryService, DirectoryServiceServer, GetOpenApiSpecRequest,
-    GetOpenApiSpecResponse, HeartbeatRequest, ListAllInstancesRequest, ListAllInstancesResponse,
-    ListInstancesRequest, ListInstancesResponse, RegisterInstanceRequest, RegisterInstanceResponse,
-    ResolveGrpcServiceRequest, ResolveGrpcServiceResponse, ResolveRestServiceRequest,
-    ResolveRestServiceResponse,
+    DeregisterInstanceRequest, DirectoryService, DirectoryServiceServer, HeartbeatRequest,
+    ListAllInstancesRequest, ListAllInstancesResponse, ListInstancesRequest, ListInstancesResponse,
+    RegisterInstanceRequest, RegisterInstanceResponse, ResolveGrpcServiceRequest,
+    ResolveGrpcServiceResponse, ResolveRestServiceRequest, ResolveRestServiceResponse,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tonic::{Request, Response, Status};
@@ -69,13 +68,6 @@ impl DirectoryService for StubDirectory {
         &self,
         _request: Request<ResolveRestServiceRequest>,
     ) -> Result<Response<ResolveRestServiceResponse>, Status> {
-        Err(Status::not_found("stub directory resolves nothing"))
-    }
-
-    async fn get_open_api_spec(
-        &self,
-        _request: Request<GetOpenApiSpecRequest>,
-    ) -> Result<Response<GetOpenApiSpecResponse>, Status> {
         Err(Status::not_found("stub directory resolves nothing"))
     }
 

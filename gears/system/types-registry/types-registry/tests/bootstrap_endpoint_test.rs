@@ -106,9 +106,6 @@ impl DirectoryClient for RecordingDirectory {
     async fn resolve_rest_service(&self, gear: &str) -> anyhow::Result<ServiceEndpoint> {
         anyhow::bail!("no provider of {gear}")
     }
-    async fn get_openapi_spec(&self, gear: &str) -> anyhow::Result<String> {
-        anyhow::bail!("no provider of {gear}")
-    }
     async fn list_instances(&self, _gear: &str) -> anyhow::Result<Vec<ServiceInstanceInfo>> {
         Ok(vec![])
     }

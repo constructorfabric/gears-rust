@@ -136,12 +136,6 @@ impl DirectoryClient for LocalDirectoryClient {
         Err(DirectoryNotFound::new(format!("gear {gear_name}")).into())
     }
 
-    async fn get_openapi_spec(&self, gear_name: &str) -> Result<String> {
-        self.mgr.openapi_spec_of(gear_name).ok_or_else(|| {
-            DirectoryNotFound::new(format!("openapi spec for gear {gear_name}")).into()
-        })
-    }
-
     async fn list_instances(&self, gear: &str) -> Result<Vec<ServiceInstanceInfo>> {
         // Base label-targeting enumeration: project every instance, including
         // endpoint-less ones (no-endpoint contract; see `project_instance`).
@@ -232,19 +226,11 @@ impl DirectoryClient for LocalDirectoryClient {
             instance = instance.with_rest_endpoint(Endpoint::from_uri(rest.uri));
         }
 
-        // OpenAPI: the directory stores only the spec *hash* (ADR-0011). A new
-        // worker sends the hash directly; an old worker still pushes the whole
-        // document via the deprecated `openapi_spec`, so derive the hash from it
-        // when none was sent. The document itself is retained in this in-memory
-        // store only so the deprecated `get_openapi_spec` keeps answering there.
+        // OpenAPI: the directory stores only the spec *hash* (ADR-0011); the
+        // worker serves the document itself and the edge fetches it from the
+        // instance's `/.well-known/openapi.json`.
         if let Some(hash) = info.openapi_spec_hash {
             instance = instance.with_openapi_spec_hash(hash);
-        }
-        if let Some(spec) = info.openapi_spec {
-            if instance.openapi_spec_hash.is_none() {
-                instance = instance.with_openapi_spec_hash(openapi_spec_hash(spec.as_bytes()));
-            }
-            instance = instance.with_openapi_spec(spec);
         }
 
         // Apply stable addressing labels if provided
@@ -380,9 +366,10 @@ mod tests {
             let api = LocalDirectoryClient::new(Arc::new(GearManager::new()));
             let id = Uuid::new_v4().to_string();
             // What `OopServer`'s presence loop sends.
+            let spec_hash = openapi_spec_hash(br#"{"openapi":"3.1.0"}"#);
             let presence = RegisterInstanceInfo::new("worker", &id)
                 .with_rest_endpoint(ServiceEndpoint::http("127.0.0.1", 8080))
-                .with_openapi_spec(r#"{"openapi":"3.1.0"}"#);
+                .with_openapi_spec_hash(spec_hash.clone());
             // What grpc-hub sends.
             let hub = RegisterInstanceInfo::new("worker", &id)
                 .with_grpc_services(vec![(
@@ -403,9 +390,9 @@ mod tests {
             assert_eq!(instances[0].grpc_services.len(), 1, "gRPC services kept");
             assert!(instances[0].rest_endpoint.is_some(), "REST endpoint kept");
             assert_eq!(
-                api.get_openapi_spec("worker").await.unwrap(),
-                r#"{"openapi":"3.1.0"}"#,
-                "OpenAPI spec kept"
+                instances[0].openapi_spec_hash.as_deref(),
+                Some(spec_hash.as_str()),
+                "OpenAPI spec hash kept"
             );
         }
     }
@@ -442,10 +429,11 @@ mod tests {
         let api = LocalDirectoryClient::new(dir.clone());
 
         let instance_id = Uuid::new_v4();
+        let spec_hash = openapi_spec_hash(b"{\"openapi\":\"3.1.0\"}");
         let register_info = RegisterInstanceInfo::new("billing", instance_id.to_string())
             .with_version("1.0.0")
             .with_rest_endpoint(ServiceEndpoint::http("billing", 8080))
-            .with_openapi_spec("{\"openapi\":\"3.1.0\"}");
+            .with_openapi_spec_hash(spec_hash.clone());
 
         api.register_instance(register_info).await.unwrap();
 
@@ -453,13 +441,16 @@ mod tests {
         let resolved = api.resolve_rest_service("billing").await.unwrap();
         assert_eq!(resolved.uri, concat!("http", "://billing:8080"));
 
-        // OpenAPI spec can be retrieved.
-        let spec = api.get_openapi_spec("billing").await.unwrap();
-        assert!(spec.contains("openapi"));
+        // The OpenAPI spec hash is carried on the instance projection.
+        let listed = api.list_instances("billing").await.unwrap();
+        assert_eq!(
+            listed[0].openapi_spec_hash.as_deref(),
+            Some(spec_hash.as_str())
+        );
     }
 
     #[tokio::test]
-    async fn test_resolve_rest_and_openapi_not_found() {
+    async fn test_resolve_rest_not_found() {
         let dir = Arc::new(GearManager::new());
         let api = LocalDirectoryClient::new(dir);
 
@@ -469,12 +460,6 @@ mod tests {
         assert!(
             rest_err.downcast_ref::<DirectoryNotFound>().is_some(),
             "expected the typed not-found sentinel, got: {rest_err:?}"
-        );
-
-        let spec_err = api.get_openapi_spec("missing").await.unwrap_err();
-        assert!(
-            spec_err.downcast_ref::<DirectoryNotFound>().is_some(),
-            "expected the typed not-found sentinel, got: {spec_err:?}"
         );
     }
 
@@ -533,11 +518,13 @@ mod tests {
 
         // Two REST-only OoP gears (no gRPC services) + one gRPC-only gear.
         for (gear, port) in [("billing", 8080u16), ("catalog", 8081u16)] {
+            let hash =
+                openapi_spec_hash(format!("{{\"openapi\":\"3.1.0\",\"x\":\"{gear}\"}}").as_bytes());
             api.register_instance(
                 RegisterInstanceInfo::new(gear, Uuid::new_v4().to_string())
                     .with_version("1.0.0")
                     .with_rest_endpoint(ServiceEndpoint::http(gear, port))
-                    .with_openapi_spec(format!("{{\"openapi\":\"3.1.0\",\"x\":\"{gear}\"}}")),
+                    .with_openapi_spec_hash(hash),
             )
             .await
             .unwrap();
@@ -569,12 +556,6 @@ mod tests {
         // only the hash, and consumers fetch the document from the instance's
         // `/.well-known/openapi.json`.
         assert!(billing.openapi_spec_hash.is_some());
-        assert!(
-            api.get_openapi_spec("billing")
-                .await
-                .expect("billing spec")
-                .contains("billing")
-        );
 
         // The gRPC-only gear resolves its primary endpoint from gRPC metadata and
         // carries no REST endpoint or OpenAPI spec.
@@ -732,7 +713,7 @@ mod tests {
         api.register_instance(
             RegisterInstanceInfo::new("worker", Uuid::new_v4().to_string())
                 .with_rest_endpoint(ServiceEndpoint::new("http://worker:8080"))
-                .with_openapi_spec("{\"openapi\":\"3.1.0\"}")
+                .with_openapi_spec_hash(openapi_spec_hash(b"{\"openapi\":\"3.1.0\"}"))
                 .with_labels(labels(&[("shard", "7")])),
         )
         .await
@@ -759,37 +740,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn old_worker_openapi_spec_derives_hash_and_keeps_document_in_memory() {
-        // Compatibility: an old worker still pushes the full document and no
-        // hash. The directory derives the lowercase-hex SHA-256 and keeps the
-        // document in the in-memory store so `get_openapi_spec` still answers.
-        let dir = Arc::new(GearManager::new());
-        let api = LocalDirectoryClient::new(Arc::clone(&dir));
-
-        let doc = "{\"openapi\":\"3.1.0\"}";
-        api.register_instance(
-            RegisterInstanceInfo::new("billing", Uuid::new_v4().to_string())
-                .with_rest_endpoint(ServiceEndpoint::new("http://billing:8080"))
-                .with_openapi_spec(doc),
-        )
-        .await
-        .unwrap();
-
-        let listed = api.list_instances("billing").await.unwrap();
-        assert_eq!(
-            listed[0].openapi_spec_hash.as_deref(),
-            Some(openapi_spec_hash(doc.as_bytes()).as_str()),
-            "the directory derives the SHA-256 hash from the pushed document",
-        );
-        // The deprecated getter still answers from the in-memory store.
-        assert_eq!(api.get_openapi_spec("billing").await.unwrap(), doc);
-    }
-
-    #[tokio::test]
-    async fn new_worker_hash_only_stores_no_document() {
-        // A new worker advertises only the hash and serves the document itself.
-        // The directory stores the hash verbatim and keeps no document, so the
-        // deprecated `get_openapi_spec` returns the typed not-found sentinel.
+    async fn register_stores_only_the_openapi_spec_hash() {
+        // The worker advertises only the hash and serves the document itself;
+        // the directory stores the hash verbatim and keeps no document.
         let dir = Arc::new(GearManager::new());
         let api = LocalDirectoryClient::new(Arc::clone(&dir));
 
@@ -804,12 +757,6 @@ mod tests {
 
         let listed = api.list_instances("billing").await.unwrap();
         assert_eq!(listed[0].openapi_spec_hash.as_deref(), Some(hash.as_str()));
-
-        let err = api.get_openapi_spec("billing").await.unwrap_err();
-        assert!(
-            err.downcast_ref::<DirectoryNotFound>().is_some(),
-            "no document is stored for a hash-only registration, got: {err:?}"
-        );
     }
 
     #[tokio::test]

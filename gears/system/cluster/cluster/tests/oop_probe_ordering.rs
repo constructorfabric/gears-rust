@@ -182,9 +182,6 @@ impl DirectoryClient for StubDirectory {
     async fn resolve_rest_service(&self, gear: &str) -> anyhow::Result<ServiceEndpoint> {
         anyhow::bail!("no REST endpoint for {gear} in the stub directory")
     }
-    async fn get_openapi_spec(&self, gear: &str) -> anyhow::Result<String> {
-        anyhow::bail!("no OpenAPI spec for {gear} in the stub directory")
-    }
     async fn list_instances(&self, _gear: &str) -> anyhow::Result<Vec<ServiceInstanceInfo>> {
         Ok(vec![])
     }

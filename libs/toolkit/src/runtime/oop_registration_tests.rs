@@ -106,10 +106,6 @@ impl DirectoryClient for StubDirectory {
         Ok(ServiceEndpoint::new(format!("http://{gear}:8080")))
     }
 
-    async fn get_openapi_spec(&self, _gear: &str) -> anyhow::Result<String> {
-        Ok(String::new())
-    }
-
     async fn list_instances(&self, _gear: &str) -> anyhow::Result<Vec<ServiceInstanceInfo>> {
         Ok(vec![])
     }
@@ -166,7 +162,7 @@ fn info() -> RegisterInstanceInfo {
     RegisterInstanceInfo::new("billing", "i-1")
         .with_version("1.0.0")
         .with_rest_endpoint(ServiceEndpoint::new("http://billing:8080"))
-        .with_openapi_spec("{}")
+        .with_openapi_spec_hash("a".repeat(64))
 }
 
 #[test]
@@ -291,7 +287,7 @@ async fn an_openapi_update_re_registers_through_the_manager() {
         tokio::task::yield_now().await;
     }
 
-    updates.send_replace(info().with_openapi_spec(r#"{"paths":{"/full":{}}}"#));
+    updates.send_replace(info().with_openapi_spec_hash("b".repeat(64)));
     while stub.register_ok.load(Ordering::SeqCst) < 2 {
         tokio::task::yield_now().await;
     }

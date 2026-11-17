@@ -335,9 +335,6 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(ServiceEndpoint::new(format!("http://{gear}.local")))
         }
-        async fn get_openapi_spec(&self, _: &str) -> anyhow::Result<String> {
-            unimplemented!()
-        }
         async fn list_instances(&self, _: &str) -> anyhow::Result<Vec<ServiceInstanceInfo>> {
             unimplemented!()
         }
@@ -493,9 +490,6 @@ mod tests {
         }
         async fn resolve_rest_service(&self, gear: &str) -> anyhow::Result<ServiceEndpoint> {
             Err((self.make_error)(gear))
-        }
-        async fn get_openapi_spec(&self, _: &str) -> anyhow::Result<String> {
-            unimplemented!()
         }
         async fn list_instances(&self, _: &str) -> anyhow::Result<Vec<ServiceInstanceInfo>> {
             unimplemented!()

@@ -24,11 +24,10 @@ pub use directory::directory_service_server::{DirectoryService, DirectoryService
 pub use directory::InstanceState as ProtoInstanceState;
 pub use directory::ReportedState as ProtoReportedState;
 pub use directory::{
-    DeregisterInstanceRequest, GetOpenApiSpecRequest, GetOpenApiSpecResponse, GrpcServiceEndpoint,
-    HeartbeatRequest, InstanceInfo, ListAllInstancesRequest, ListAllInstancesResponse,
-    ListInstancesRequest, ListInstancesResponse, RegisterInstanceRequest, RegisterInstanceResponse,
-    ResolveGrpcServiceRequest, ResolveGrpcServiceResponse, ResolveRestServiceRequest,
-    ResolveRestServiceResponse,
+    DeregisterInstanceRequest, GrpcServiceEndpoint, HeartbeatRequest, InstanceInfo,
+    ListAllInstancesRequest, ListAllInstancesResponse, ListInstancesRequest, ListInstancesResponse,
+    RegisterInstanceRequest, RegisterInstanceResponse, ResolveGrpcServiceRequest,
+    ResolveGrpcServiceResponse, ResolveRestServiceRequest, ResolveRestServiceResponse,
 };
 
 // Re-export the gRPC client implementation

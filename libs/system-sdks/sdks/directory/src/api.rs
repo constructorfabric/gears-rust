@@ -164,9 +164,10 @@ pub struct ServiceInstanceInfo {
     /// Stable content token for the published `OpenAPI` spec, if any.
     ///
     /// Enumeration is deliberately spec-free: only this hash rides along, never
-    /// the full document (fetched out-of-band via
-    /// [`DirectoryClient::get_openapi_spec`]). The hash lets a consumer detect a
-    /// spec change without inlining N copies of the document.
+    /// the full document (the edge fetches it from the instance's
+    /// `/.well-known/openapi.json` and verifies it against this hash). The hash
+    /// lets a consumer detect a spec change without inlining N copies of the
+    /// document.
     pub openapi_spec_hash: Option<String>,
     /// Published gRPC services as `(service name, endpoint)` pairs.
     ///
@@ -278,15 +279,6 @@ pub struct RegisterInstanceInfo {
     pub version: Option<String>,
     /// Optional REST endpoint (HTTP base URL) exposed by the gear.
     pub rest_endpoint: Option<ServiceEndpoint>,
-    /// **Deprecated** full `OpenAPI` document (JSON) published by the gear.
-    ///
-    /// New workers leave this `None` and set [`openapi_spec_hash`] instead,
-    /// serving the document themselves at `/.well-known/openapi.json`
-    /// (ADR-0011). The directory accepts it for one release from old workers
-    /// and derives the hash from it.
-    ///
-    /// [`openapi_spec_hash`]: Self::openapi_spec_hash
-    pub openapi_spec: Option<String>,
     /// Lowercase-hex SHA-256 of the `OpenAPI` document the instance serves, or
     /// `None` if the gear publishes no document. This is what the directory
     /// stores and returns in [`ServiceInstanceInfo::openapi_spec_hash`]; the
@@ -331,16 +323,6 @@ impl RegisterInstanceInfo {
     #[must_use]
     pub fn with_rest_endpoint(mut self, rest_endpoint: ServiceEndpoint) -> Self {
         self.rest_endpoint = Some(rest_endpoint);
-        self
-    }
-
-    /// Set the published `OpenAPI` spec (JSON).
-    ///
-    /// **Deprecated** in favour of [`with_openapi_spec_hash`](Self::with_openapi_spec_hash);
-    /// new workers send only the hash (ADR-0011).
-    #[must_use]
-    pub fn with_openapi_spec(mut self, openapi_spec: impl Into<String>) -> Self {
-        self.openapi_spec = Some(openapi_spec.into());
         self
     }
 
@@ -529,16 +511,6 @@ pub trait DirectoryClient: Send + Sync {
     /// make REST requests to the resolved gear.
     async fn resolve_rest_service(&self, gear_name: &str) -> Result<ServiceEndpoint>;
 
-    /// Retrieve the `OpenAPI` spec (JSON) published by a gear.
-    ///
-    /// **Deprecated** (ADR-0011, "`OpenAPI` document"). The directory no longer
-    /// stores documents as its source of truth; the edge fetches each gear's
-    /// document from the instance at `/.well-known/openapi.json` and verifies
-    /// it against [`ServiceInstanceInfo::openapi_spec_hash`]. This still works
-    /// against the in-memory store for a document an old worker pushed via the
-    /// deprecated `openapi_spec`, and fails with a shared backend.
-    async fn get_openapi_spec(&self, gear_name: &str) -> Result<String>;
-
     /// List all service instances for a given gear.
     ///
     /// Entries are **spec-free**: only the `openapi_spec_hash` is carried, never
@@ -696,7 +668,7 @@ mod tests {
         assert_eq!(info.instance_id, "instance1");
         assert_eq!(info.grpc_services.len(), 1);
         assert!(info.rest_endpoint.is_none());
-        assert!(info.openapi_spec.is_none());
+        assert!(info.openapi_spec_hash.is_none());
         assert!(info.labels.is_empty());
     }
 
@@ -709,8 +681,7 @@ mod tests {
             version: Some("2.0.0".to_owned()),
             labels: BTreeMap::new(),
             rest_endpoint: Some(ServiceEndpoint::http("billing", 8080)),
-            openapi_spec: Some("{\"openapi\":\"3.1.0\"}".to_owned()),
-            openapi_spec_hash: None,
+            openapi_spec_hash: Some("a".repeat(64)),
             reported_state: None,
         };
 
@@ -719,7 +690,7 @@ mod tests {
             info.rest_endpoint.as_ref().unwrap().uri,
             concat!("http", "://billing:8080")
         );
-        assert!(info.openapi_spec.is_some());
+        assert!(info.openapi_spec_hash.is_some());
     }
 
     fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -766,9 +737,6 @@ mod tests {
         }
         async fn resolve_rest_service(&self, gear_name: &str) -> Result<ServiceEndpoint> {
             Err(DirectoryNotFound::new(format!("gear {gear_name}")).into())
-        }
-        async fn get_openapi_spec(&self, gear_name: &str) -> Result<String> {
-            Err(DirectoryNotFound::new(format!("spec {gear_name}")).into())
         }
         async fn list_instances(&self, gear: &str) -> Result<Vec<ServiceInstanceInfo>> {
             Ok(self

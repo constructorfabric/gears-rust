@@ -62,6 +62,7 @@ utoipa = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
 bytes = { workspace = true }
+futures-util = { workspace = true }
 rust-embed = { workspace = true }
 
 [dev-dependencies]

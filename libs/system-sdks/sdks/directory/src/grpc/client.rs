@@ -20,9 +20,9 @@ use toolkit_transport_grpc::InternalAuthInterceptor;
 use toolkit_transport_grpc::client::{GrpcClientConfig, connect_lazy, connect_with_retry};
 
 use crate::{
-    DeregisterInstanceRequest, DirectoryServiceClient, GetOpenApiSpecRequest, GrpcServiceEndpoint,
-    HeartbeatRequest, InstanceInfo, ListAllInstancesRequest, ListInstancesRequest,
-    RegisterInstanceRequest, ResolveGrpcServiceRequest, ResolveRestServiceRequest,
+    DeregisterInstanceRequest, DirectoryServiceClient, GrpcServiceEndpoint, HeartbeatRequest,
+    InstanceInfo, ListAllInstancesRequest, ListInstancesRequest, RegisterInstanceRequest,
+    ResolveGrpcServiceRequest, ResolveRestServiceRequest,
 };
 
 /// Map a domain [`ReportedState`] onto the proto discriminant for the wire.
@@ -284,20 +284,6 @@ impl DirectoryClient for DirectoryGrpcClient {
         Ok(ServiceEndpoint::new(proto_response.endpoint_uri))
     }
 
-    async fn get_openapi_spec(&self, gear_name: &str) -> Result<String> {
-        let mut client = self.inner.clone();
-        let request = tonic::Request::new(GetOpenApiSpecRequest {
-            gear_name: gear_name.to_owned(),
-        });
-
-        let response = client
-            .get_open_api_spec(request)
-            .await
-            .map_err(|e| lookup_error(&format!("openapi spec for gear {gear_name}"), &e))?;
-
-        Ok(response.into_inner().openapi_spec)
-    }
-
     async fn list_instances(&self, gear: &str) -> Result<Vec<ServiceInstanceInfo>> {
         let mut client = self.inner.clone();
         let request = tonic::Request::new(ListInstancesRequest {
@@ -401,7 +387,6 @@ impl DirectoryClient for DirectoryGrpcClient {
             grpc_services,
             version: info.version.unwrap_or_default(),
             rest_endpoint_uri: info.rest_endpoint.map(|ep| ep.uri),
-            openapi_spec: info.openapi_spec,
             labels: info.labels.into_iter().collect(),
             reported_state: info.reported_state.map(reported_to_proto),
             openapi_spec_hash: info.openapi_spec_hash,

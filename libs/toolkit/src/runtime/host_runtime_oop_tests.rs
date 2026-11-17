@@ -85,9 +85,6 @@ impl DirectoryClient for RecordingDirectory {
     async fn resolve_rest_service(&self, gear: &str) -> anyhow::Result<ServiceEndpoint> {
         Ok(ServiceEndpoint::new(format!("http://{gear}:8080")))
     }
-    async fn get_openapi_spec(&self, _gear: &str) -> anyhow::Result<String> {
-        Ok(String::new())
-    }
     async fn list_instances(&self, _gear: &str) -> anyhow::Result<Vec<ServiceInstanceInfo>> {
         Ok(vec![])
     }
@@ -939,16 +936,8 @@ async fn a_system_root_serves_and_is_present_while_the_application_group_waits()
     // The process-wide readiness still reports the pending group.
     assert_eq!(http_get(addr, "/readyz").await.map(|r| r.0), Some(503));
 
-    held.release.notify_one();
-    assert!(poll_status(addr, "/published", 200, Duration::from_secs(5)).await);
-    assert_eq!(
-        http_status(addr, "/platform", &[("X-ToolKit-Internal-Token", AXIS_SA)]).await,
-        Some(200),
-        "the same listener keeps the platform routes"
-    );
-    assert!(poll_status(addr, "/readyz", 200, Duration::from_secs(5)).await);
-    // A new worker advertises only the hash, so the directory sees the hash of
-    // the bootstrap document first.
+    // The bootstrap document is served and matches the hash initially advertised
+    // by this worker.
     let first = {
         directory
             .registered_openapi_hash
@@ -961,10 +950,29 @@ async fn a_system_root_serves_and_is_present_while_the_application_group_waits()
         first.is_some(),
         "registered first with the bootstrap document's hash"
     );
+    let (status, bootstrap_doc) = http_get(addr, "/.well-known/openapi.json")
+        .await
+        .expect("bootstrap OpenAPI document is served");
+    assert_eq!(status, 200);
+    let bootstrap_hash = crate::directory::openapi_spec_hash(bootstrap_doc.as_bytes());
+    assert_eq!(
+        first.as_deref(),
+        Some(bootstrap_hash.as_str()),
+        "the first registered hash matches the bootstrap document served by the worker"
+    );
+
+    held.release.notify_one();
+    assert!(poll_status(addr, "/published", 200, Duration::from_secs(5)).await);
+    assert_eq!(
+        http_status(addr, "/platform", &[("X-ToolKit-Internal-Token", AXIS_SA)]).await,
+        Some(200),
+        "the same listener keeps the platform routes"
+    );
+    assert!(poll_status(addr, "/readyz", 200, Duration::from_secs(5)).await);
     // Once the application group attaches, the served document changes, so the
     // worker re-registers with a different hash.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
+    let last = loop {
         let last = {
             directory
                 .registered_openapi_hash
@@ -974,14 +982,24 @@ async fn a_system_root_serves_and_is_present_while_the_application_group_waits()
                 .flatten()
         };
         if last.is_some() && last != first {
-            break;
+            break last;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
             "the directory gets the full document's hash once the application group attached"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    };
+    let (status, served_doc) = http_get(addr, "/.well-known/openapi.json")
+        .await
+        .expect("updated OpenAPI document is served");
+    assert_eq!(status, 200);
+    let served_hash = crate::directory::openapi_spec_hash(served_doc.as_bytes());
+    assert_eq!(
+        last.as_deref(),
+        Some(served_hash.as_str()),
+        "the final registered hash matches the OpenAPI document served by the worker"
+    );
 
     cancel.cancel();
     tokio::time::timeout(Duration::from_secs(5), server)

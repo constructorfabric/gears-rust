@@ -232,7 +232,7 @@ token). `encode_bin` / `decode_bin` (which exclude `bearer_token`) remain in use
 | DeploymentProfile        | Enum: `Embedded`, `SelfHosted`, `K8sNative`. Determines bootstrap behavior.                      |
 | OopWorkerConfig          | Configuration for an OoP gear: gear list, listen address, DirectoryService endpoint, profile. |
 | ServiceEndpoint          | Extended with `rest_url` field. Represents a discovered gear's HTTP endpoint.                   |
-| RegisterInstanceInfo     | Extended with `rest_endpoint` and `openapi_spec` fields for REST service registration.            |
+| RegisterInstanceInfo     | Extended with `rest_endpoint` and `openapi_spec_hash` fields for REST service registration.        |
 | GatewayRouteRegistration | Struct carrying gear name, OpenAPI spec, and target endpoint for gateway registration.          |
 | SecurityContextHeaders   | Helper for single-header tenant-plane propagation (`Authorization: Bearer <jwt>`), re-validated per hop (cpt-cf-adr-two-plane-auth). |
 
@@ -456,10 +456,11 @@ The existing `DirectoryClient` trait (`libs/system-sdks/sdks/directory/src/api.r
 ##### Responsibility scope
 
 - Extend `RegisterInstanceInfo` with `rest_endpoint: Option<ServiceEndpoint>` (the gear's HTTP base URL) and
-  `openapi_spec: Option<String>` (the gear's OpenAPI JSON).
+  `openapi_spec_hash: Option<String>` (the lowercase-hex SHA-256 of the gear's OpenAPI document).
 - Add `resolve_rest_service(gear_name) -> Result<ServiceEndpoint>` to the `DirectoryClient` trait for REST URL
   resolution.
-- Store and serve per-gear OpenAPI specs for aggregation by api-gateway.
+- Store only the per-gear OpenAPI document hash; the edge fetches the document from each instance's
+  `/.well-known/openapi.json` and verifies it against the hash (ADR-0011).
 
 ##### Responsibility boundaries
 
@@ -1009,10 +1010,11 @@ Key design decisions:
 
 | Method               | Request                           | Response                            | Description                                  |
 |----------------------|-----------------------------------|-------------------------------------|----------------------------------------------|
-| `RegisterInstance`   | `RegisterInstanceInfo` (extended) | `RegisterResult`                    | Register gear with REST endpoint + OpenAPI |
+| `RegisterInstance`   | `RegisterInstanceInfo` (extended) | `RegisterResult`                    | Register gear with REST endpoint + `openapi_spec_hash` |
 | `ResolveRestService` | `ResolveRequest { gear_name }`  | `ServiceEndpoint` (with `rest_url`) | Resolve a gear's REST base URL             |
-| `GetOpenApiSpec`     | `SpecRequest { gear_name }`     | `SpecResponse { openapi_json }`     | **Deprecated** (ADR-0011): the directory no longer stores documents. The edge fetches each gear's document from the instance and verifies it against `openapi_spec_hash`. Kept one release: still answers from the in-memory store, `NOT_FOUND` with a shared backend |
 | `ListAllInstances`   | `ListAllInstancesRequest {}`      | `ListAllInstancesResponse { instances[] }` | Enumerate every registered instance (stable `instance_id` + gear + REST endpoint + `openapi_spec_hash`) for edge discovery — a spec-less snapshot; the OpenAPI document is fetched from the instance's `/.well-known/openapi.json` |
+
+`GetOpenApiSpec` and `RegisterInstanceRequest.openapi_spec` were removed (ADR-0011): the directory never stores OpenAPI documents, only the `openapi_spec_hash`.
 
 #### GatewayProvider Trait
 

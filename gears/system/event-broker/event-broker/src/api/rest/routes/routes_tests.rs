@@ -690,10 +690,6 @@ impl DirectoryClient for AlwaysErroringDirectory {
         anyhow::bail!("directory backend timed out")
     }
 
-    async fn get_openapi_spec(&self, _gear_name: &str) -> anyhow::Result<String> {
-        anyhow::bail!("directory backend unavailable")
-    }
-
     async fn list_instances(&self, _gear: &str) -> anyhow::Result<Vec<ServiceInstanceInfo>> {
         anyhow::bail!("directory backend unavailable")
     }

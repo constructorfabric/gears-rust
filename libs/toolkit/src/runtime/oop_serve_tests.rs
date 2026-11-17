@@ -290,9 +290,6 @@ impl DirectoryClient for E2eDirectory {
         }
         Ok(ServiceEndpoint::new(format!("http://{gear}:8080")))
     }
-    async fn get_openapi_spec(&self, _g: &str) -> anyhow::Result<String> {
-        Ok(String::new())
-    }
     async fn list_instances(&self, _g: &str) -> anyhow::Result<Vec<ServiceInstanceInfo>> {
         Ok(vec![])
     }

@@ -653,6 +653,11 @@ For the implementing change (reconcile against the landed edge directory rework 
     `openapi_spec` **hash**, not the document: the edge detects a spec change from the hash and fetches the
     document out-of-band via `GetOpenApiSpec`, keeping the polled payload bounded. Labels stay on the paths that
     consume them (`list_instances` / `resolve_by_labels`), so this omission loses no capability.
+  * **Amended by [ADR-0011](0011-cpt-cf-adr-directory-persistence-and-replication.md):** the directory no longer
+    stores OpenAPI documents and `GetOpenApiSpec` is removed (`RegisterInstanceRequest.openapi_spec` / field 6 too).
+    Every enumeration path still carries only the `openapi_spec_hash`; the edge and other consumers now fetch each
+    gear's document from the instance's `/.well-known/openapi.json` and verify it against that hash, rather than
+    calling `GetOpenApiSpec`.
 
 ## Traceability
 

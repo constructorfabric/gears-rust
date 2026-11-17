@@ -212,7 +212,9 @@ plugin's rules.
 
 ### Protocol changes
 
-All changes to `libs/system-sdks/sdks/directory/proto/v1/directory.proto` are additive:
+Most changes to `libs/system-sdks/sdks/directory/proto/v1/directory.proto` are additive; the exception is the removal
+of `GetOpenApiSpec` and `RegisterInstanceRequest.openapi_spec` (field 6 reserved), covered under
+[OpenAPI document](#openapi-document):
 
 * `HeartbeatRequest` gains `optional ReportedState reported_state`. A heartbeat without it counts as `Serving`, which
   keeps today's `Registered → Healthy` behaviour for old workers.
@@ -277,10 +279,9 @@ already serves the document unauthenticated at `/.well-known/openapi.json`
   SHA-256 against the advertised hash, and caches it by hash. In Profile 3 the endpoint is a Service VIP, so during a
   rolling upgrade the fetch may land on a pod with a different document; on mismatch the edge keeps the gear's
   previous routes and retries on the next pass.
-* `RegisterInstanceRequest.openapi_spec` and `GetOpenApiSpec` are deprecated. For one release the directory still
-  accepts `openapi_spec` from old workers, hashes it and drops it. `GetOpenApiSpec` keeps working with `memory` and
-  returns `NOT_FOUND` with a shared backend. The edge and the directory ship in the same Flight Control binary, so they
-  upgrade together.
+* `RegisterInstanceRequest.openapi_spec` and the `GetOpenApiSpec` RPC are removed: the directory never stores a
+  document, only the hash. No one-release transition was needed because there are no existing OoP deployments to keep
+  compatible. (Field 6 of `RegisterInstanceRequest` is reserved against reuse.)
 * Registration-time OpenAPI validation (`cpt-cf-binding-fr-openapi-validation`, deferred) belongs to the edge's fetch
   step when it is implemented.
 
@@ -383,7 +384,7 @@ retries, push updates) is a separate edge decision.
   one heartbeat interval.
 * `service-discovery` gains the `stateful` capability and a `storage` setting.
 * The directory proto gains fields and one response message; `GetOpenApiSpec` and `RegisterInstanceRequest.openapi_spec`
-  become deprecated.
+  are removed (field 6 reserved against reuse).
 * `GearManager`'s public API changes: the `mark_*` methods and `evict_stale` go away and writes go through
   `DirectoryBackend` when one is installed. This is a breaking change to the `toolkit` crate surface.
 * event-broker's own presence code is replaced by `PresenceManager`.
@@ -399,8 +400,7 @@ retries, push updates) is a separate edge decision.
   reports `Draining` until deregistration; in-process registrations in Flight Control keep a valid lease; a worker
   heartbeats at `lease_ttl_ms / 3`.
 * **Edge tests:** routes come from a document fetched from the instance; a changed hash triggers one fetch and an
-  unchanged hash none; a hash mismatch keeps the previous routes; an old worker that sends `openapi_spec` is still
-  proxied.
+  unchanged hash none; a hash mismatch keeps the previous routes.
 * **Backend tests** against the standalone plugin and, in CI, the Kubernetes (kind or envtest), Postgres and Redis
   plugins: register, renew, state change, deregister and expiry are reflected in the snapshot of a second
   `service-discovery` instance; a heartbeat causes no `get`; the janitor removes orphaned keys.
@@ -465,7 +465,9 @@ retries, push updates) is a separate edge decision.
 - **Amends**: [ADR-0001 (Deployment Profiles)](0001-cpt-cf-adr-deployment-profiles.md) — storage per profile and
   replicated Flight Control in Profile 3.
 - **Amends**: [ADR-0009 (Instance-Addressable Discovery)](0009-cpt-cf-adr-instance-addressable-discovery.md) —
-  `Quarantined` means an expired lease; a failing readiness check reads as `Registered`.
+  `Quarantined` means an expired lease; a failing readiness check reads as `Registered`; and the edge fetches each
+  gear's OpenAPI document from the instance's `/.well-known/openapi.json` (verified against `openapi_spec_hash`)
+  instead of the removed `GetOpenApiSpec`.
 - **Related**: [ADR-0005 (Eventual Readiness)](0005-cpt-cf-adr-eventual-readiness.md) — the reported state is taken
   from the readiness state it defines.
 - **Related**: [ADR-0010 (Optional Service Discovery)](0010-cpt-cf-adr-optional-service-discovery.md) — explicit mode
