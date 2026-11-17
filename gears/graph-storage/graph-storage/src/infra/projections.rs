@@ -19,6 +19,25 @@ use sea_orm::{EntityTrait, ExprTrait as _, QuerySelect, Select};
 
 use crate::infra::storage::entity::{edge, gts_type, node};
 
+/// What a purge needs of the node it removes: its id, the tenant its edges
+/// are deleted in, and whether it is already tombstoned.
+#[derive(Debug, sea_orm::FromQueryResult)]
+pub struct PurgeTarget {
+    pub id: i64,
+    pub tenant_id: uuid::Uuid,
+    pub created_at: time::OffsetDateTime,
+    pub deleted_at: Option<time::OffsetDateTime>,
+}
+
+pub fn purge_target_columns(query: Select<node::Entity>) -> Select<node::Entity> {
+    query
+        .select_only()
+        .column(node::Column::Id)
+        .column(node::Column::TenantId)
+        .column(node::Column::CreatedAt)
+        .column(node::Column::DeletedAt)
+}
+
 /// A node's identity: the key a producer addresses it by, and the id
 /// everything internal joins on.
 #[derive(Debug, sea_orm::FromQueryResult)]

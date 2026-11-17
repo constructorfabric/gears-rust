@@ -854,6 +854,49 @@ pub struct DeleteOutcome {
     pub tombstoned_edges: u64,
 }
 
+/// How a purge treats the node it finds (gears-rust #5906).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PurgeOptions {
+    /// Purge only a node that is already soft-deleted, and refuse a live one
+    /// with a conflict: a purge that must never take a live node, such as a
+    /// sweep of the tombstones deletes left. On its own it does not make a
+    /// retry safe where a key can be written again: it tells a live node from
+    /// a tombstone, not one node from another, so a retry still removes a
+    /// later node under the key that was itself soft-deleted. Bind the purge
+    /// to its node with `expected_created_at` for that.
+    pub only_tombstoned: bool,
+    /// Purge only the node created at this instant -- its envelope's
+    /// `created_at`, which is set at insert and never changes -- and refuse
+    /// any other with a conflict. This binds a purge to one node rather than
+    /// to whatever holds the key: a retry after an unknown outcome then meets
+    /// either nothing (it landed) or a different node it must not touch,
+    /// live or tombstoned, which `only_tombstoned` alone cannot tell apart.
+    /// Read it from any read of the node before deleting it.
+    ///
+    /// The comparison is of two timestamps at the store's precision
+    /// (microseconds in the built-in store), taken from the clock of the
+    /// process that inserted each node; it is not a unique instance
+    /// identity. A later node under the key is created after the purge of
+    /// the earlier one, so the two differ unless a clock ran backwards
+    /// between them by exactly their distance. An identity that cannot
+    /// repeat is tracked in gears-rust #5944.
+    pub expected_created_at: Option<time::OffsetDateTime>,
+}
+
+/// Outcome of a purge: what was removed for good (gears-rust #5194).
+///
+/// `purged_nodes` is 0 when no node, live or tombstoned, was stored under
+/// the key: a purge is idempotent, and purging what is not there is not an
+/// error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PurgeOutcome {
+    pub revision: GraphRevision,
+    pub purged_nodes: u64,
+    /// Every edge incident to the node, live, tombstoned and analysis edges
+    /// alike: an erasure outranks a conclusion drawn about what it erases.
+    pub purged_edges: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Node read / projection
 // ---------------------------------------------------------------------------

@@ -747,3 +747,38 @@ async fn a_key_carried_twice_is_written_twice_in_request_order() {
     conformance::a_key_carried_twice_is_written_twice_in_request_order(&store(), Uuid::now_v7())
         .await;
 }
+
+#[tokio::test]
+async fn a_purge_removes_a_node_and_every_edge_and_frees_its_key() {
+    conformance::a_purge_removes_a_node_and_every_edge_and_frees_its_key(&store(), Uuid::now_v7())
+        .await;
+}
+
+#[tokio::test]
+async fn a_purge_takes_a_tombstone_and_repeats_as_no_change() {
+    conformance::a_purge_takes_a_tombstone_and_repeats_as_no_change(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn a_scope_erasure_removes_its_tombstoned_members() {
+    conformance::a_scope_erasure_removes_its_tombstoned_members(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn a_tombstoned_edge_a_replacement_removes_is_counted() {
+    conformance::a_tombstoned_edge_a_replacement_removes_is_counted(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn a_purge_of_tombstones_only_refuses_a_live_node() {
+    conformance::a_purge_of_tombstones_only_refuses_a_live_node(&store(), Uuid::now_v7()).await;
+}
+
+#[tokio::test]
+async fn a_purge_bound_to_a_creation_instant_leaves_a_later_node_alone() {
+    conformance::a_purge_bound_to_a_creation_instant_leaves_a_later_node_alone(
+        &store(),
+        Uuid::now_v7(),
+    )
+    .await;
+}

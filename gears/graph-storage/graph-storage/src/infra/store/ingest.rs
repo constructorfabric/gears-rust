@@ -222,7 +222,7 @@ fn outcome_from_json(value: &serde_json::Value) -> Result<IngestOutcome, GraphSt
 }
 
 /// Read the tenant's revision inside the write transaction.
-async fn current_revision(
+pub(crate) async fn current_revision(
     scope: &AccessScope,
     runner: &impl DBRunner,
 ) -> Result<i64, GraphStoreError> {
@@ -236,7 +236,10 @@ async fn current_revision(
     Ok(row.and_then(|r| r.value.as_i64()).unwrap_or(0))
 }
 
-async fn source_epoch(scope: &AccessScope, runner: &impl DBRunner) -> Result<i64, GraphStoreError> {
+pub(crate) async fn source_epoch(
+    scope: &AccessScope,
+    runner: &impl DBRunner,
+) -> Result<i64, GraphStoreError> {
     let row = graph_meta::Entity::find()
         .secure()
         .scope_with(scope)

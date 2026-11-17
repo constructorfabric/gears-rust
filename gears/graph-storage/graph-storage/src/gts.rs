@@ -60,6 +60,14 @@ gts_instance! {
 }
 gts_instance! {
     AuthzPermissionV1 {
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.core.graph.node_purge.v1"),
+        resource_type: NODE_RESOURCE.to_owned(),
+        action: actions::PURGE.to_owned(),
+        display_name: "Purge graph nodes and their edges for good".to_owned(),
+    }
+}
+gts_instance! {
+    AuthzPermissionV1 {
         id: gts_id!("cf.toolkit.authz.permission.v1~cf.core.graph.type_read.v1"),
         resource_type: TYPE_RESOURCE.to_owned(),
         action: actions::READ.to_owned(),

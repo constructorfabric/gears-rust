@@ -192,6 +192,18 @@ impl GraphStorageClientV1 for GraphStorageLocalClient {
             .map_err(Into::into)
     }
 
+    async fn purge_node(
+        &self,
+        ctx: &SecurityContext,
+        node_key: &NodeKey,
+        options: graph_storage_sdk::models::PurgeOptions,
+    ) -> Result<graph_storage_sdk::models::PurgeOutcome, CanonicalError> {
+        self.services
+            .purge_node(self.call(ctx), node_key, options)
+            .await
+            .map_err(Into::into)
+    }
+
     fn in_tenant(&self, tenant: Uuid) -> Arc<dyn GraphStorageClientV1> {
         Arc::new(Self {
             services: Arc::clone(&self.services),

@@ -758,3 +758,97 @@ async fn a_node_keyed_count_is_read_and_deleted_by_its_path() {
     let (status, gone) = stand.get("/nodes/count").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{gone}");
 }
+
+/// Purge over REST: `only_tombstoned` answers `409` for a live node and
+/// purges it once soft-deleted; a purge answers `204` with no body.
+#[tokio::test]
+async fn a_purge_of_tombstones_only_is_refused_for_a_live_node_over_rest() {
+    let stand = Stand::new(Harness::allowed());
+    seed(&stand).await;
+    let (status, body) = stand
+        .post(
+            "/ingest",
+            &serde_json::json!({
+                "nodes": [{"node_key": "rest-purged", "type_id": conformance::OWNED}]
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, problem) = stand
+        .delete("/nodes/rest-purged?mode=purge&only_tombstoned=true")
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "a live node: {problem}");
+    let (status, _) = stand.get("/nodes/rest-purged").await;
+    assert_eq!(status, StatusCode::OK, "and it is still there");
+
+    let (status, body) = stand.delete("/nodes/rest-purged").await;
+    assert_eq!(status, StatusCode::OK, "soft delete: {body}");
+    let (status, body) = stand
+        .delete("/nodes/rest-purged?mode=purge&only_tombstoned=true")
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, body) = stand
+        .post(
+            "/ingest",
+            &serde_json::json!({
+                "nodes": [{"node_key": "rest-purged", "type_id": conformance::OWNED}]
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "the key is free again: {body}");
+
+    // Bound to a creation instant: another instant is refused, this one
+    // purges.
+    let (status, node) = stand.get("/nodes/rest-purged").await;
+    assert_eq!(status, StatusCode::OK, "{node}");
+    let created_at = node["envelope"]["created_at"]
+        .as_str()
+        .expect("the envelope names its creation")
+        .to_owned();
+    let (status, problem) = stand
+        .delete("/nodes/rest-purged?mode=purge&expected_created_at=2000-01-01T00:00:00Z")
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "another instant: {problem}");
+    let (status, body) = stand
+        .delete(&format!(
+            "/nodes/rest-purged?mode=purge&expected_created_at={}",
+            created_at.replace('+', "%2B")
+        ))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "its own instant: {body}");
+}
+
+/// A purge precondition on a soft delete is refused, not ignored: the caller
+/// that sent it meant to bind the delete to one node, and a soft delete would
+/// have taken whichever node holds the key.
+#[tokio::test]
+async fn a_purge_precondition_without_mode_purge_is_refused() {
+    let stand = Stand::new(Harness::allowed());
+    seed(&stand).await;
+    let (status, body) = stand
+        .post(
+            "/ingest",
+            &serde_json::json!({
+                "nodes": [{"node_key": "rest-soft", "type_id": conformance::OWNED}]
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for query in [
+        "only_tombstoned=true",
+        "expected_created_at=2026-11-01T10:00:00Z",
+        "mode=soft&only_tombstoned=true",
+    ] {
+        let (status, problem) = stand.delete(&format!("/nodes/rest-soft?{query}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {problem}");
+    }
+    let (status, node) = stand.get("/nodes/rest-soft").await;
+    assert_eq!(status, StatusCode::OK, "the node is still live: {node}");
+    let (status, problem) = stand.delete("/nodes/rest-soft?mode=sideways").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unknown mode: {problem}"
+    );
+}

@@ -687,7 +687,7 @@ mod rest {
     use graph_storage::api::rest::routes::register_routes;
     use tower::ServiceExt;
 
-    struct NoopRegistry;
+    pub struct NoopRegistry;
 
     impl toolkit::api::OpenApiRegistry for NoopRegistry {
         fn register_operation(&self, _spec: &toolkit::api::OperationSpec) {}
@@ -923,5 +923,141 @@ mod rest {
 
         let (bad, _) = send(&router, get("/nodes/rest-fact?tenant=not-a-uuid")).await;
         assert_eq!(bad, StatusCode::BAD_REQUEST);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Purge (gears-rust #5194)
+// ---------------------------------------------------------------------------
+
+mod purge {
+    use super::*;
+
+    /// A PDP that grants everything in the caller's own tenant but `purge`.
+    struct NoPurge;
+
+    #[async_trait]
+    impl AuthZResolverApi for NoPurge {
+        async fn evaluate(
+            &self,
+            ctx: PlatformSecurityContext,
+            request: EvaluationRequest,
+        ) -> Result<EvaluationResponse, CanonicalError> {
+            if request.action.name == "purge" {
+                return Ok(EvaluationResponse {
+                    decision: false,
+                    context: EvaluationResponseContext {
+                        constraints: Vec::new(),
+                        deny_reason: None,
+                    },
+                });
+            }
+            support::AllowInOwnTenant.evaluate(ctx, request).await
+        }
+    }
+
+    /// Purge is its own action: a caller allowed to delete but not to purge
+    /// tombstones, and its purge is not found.
+    #[tokio::test]
+    async fn purge_needs_its_own_permission() {
+        let harness = Harness::with(Arc::new(NoPurge));
+        let client: Arc<dyn GraphStorageClientV1> =
+            Arc::new(GraphStorageLocalClient::new(Arc::clone(&harness.services)));
+        let ctx = harness.ctx();
+        seed(client.as_ref(), &ctx, &["kept"]).await;
+
+        let refused = client
+            .purge_node(
+                &ctx,
+                &"kept".to_owned(),
+                graph_storage_sdk::models::PurgeOptions::default(),
+            )
+            .await
+            .expect_err("purge is not delete");
+        assert_eq!(refused.status_code(), 404, "{refused:?}");
+        client
+            .delete_node(&ctx, &"kept".to_owned())
+            .await
+            .expect("the soft delete is allowed");
+    }
+
+    /// A service purges in a tenant it names, as Construct removes a fact:
+    /// the target's node goes, a node under the same key in the caller's own
+    /// tenant stays.
+    #[tokio::test]
+    async fn a_purge_in_a_target_tenant_removes_only_the_targets_node() {
+        let (root, target) = (Uuid::now_v7(), Uuid::now_v7());
+        let (_harness, client) = client_with(Answer::Exact, vec![target]);
+        let service = service_identity(root);
+        seed(client.in_tenant(target).as_ref(), &service, &["fact"]).await;
+        seed(client.as_ref(), &service, &["fact"]).await;
+
+        let outcome = client
+            .in_tenant(target)
+            .purge_node(
+                &service,
+                &"fact".to_owned(),
+                graph_storage_sdk::models::PurgeOptions::default(),
+            )
+            .await
+            .expect("the target's node is purged");
+        assert_eq!(outcome.purged_nodes, 1);
+        client
+            .in_tenant(target)
+            .get_node(&service, &"fact".to_owned(), None)
+            .await
+            .expect_err("gone in the target");
+        client
+            .get_node(&service, &"fact".to_owned(), None)
+            .await
+            .expect("kept in the caller's own tenant");
+    }
+
+    /// `DELETE /nodes/{key}?mode=purge` answers 204 whether or not a node was
+    /// stored, so a retry gets the first answer; an unknown mode is refused.
+    #[tokio::test]
+    async fn the_purge_mode_over_rest_is_idempotent() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use graph_storage::api::rest::routes::register_routes;
+        use tower::ServiceExt;
+
+        let harness = Harness::allowed();
+        let client: Arc<dyn GraphStorageClientV1> =
+            Arc::new(GraphStorageLocalClient::new(Arc::clone(&harness.services)));
+        let ctx = harness.ctx();
+        seed(client.as_ref(), &ctx, &["rest-purged"]).await;
+        let router = register_routes(
+            Router::new(),
+            &super::rest::NoopRegistry,
+            Arc::clone(&harness.services),
+        )
+        .layer(axum::Extension(ctx.clone()));
+        let call = |method: &'static str, path: &str| {
+            let router = router.clone();
+            let request = Request::builder()
+                .method(method)
+                .uri(format!("/graph-storage/v1{path}"))
+                .body(Body::empty())
+                .expect("a request");
+            async move { router.oneshot(request).await.expect("answers").status() }
+        };
+
+        for attempt in ["first", "repeat"] {
+            assert_eq!(
+                call("DELETE", "/nodes/rest-purged?mode=purge").await,
+                StatusCode::NO_CONTENT,
+                "{attempt}"
+            );
+        }
+        assert_eq!(
+            call("GET", "/nodes/rest-purged").await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            call("DELETE", "/nodes/rest-purged?mode=erase").await,
+            StatusCode::BAD_REQUEST
+        );
     }
 }
