@@ -272,11 +272,16 @@ backend decides which quotas apply, including quotas of the tenant; the resolver
 - [ ] `p1` - **ID**: `cpt-cf-quota-resolver-fr-idempotency`
 
 Debit, lease acquisition, lease extension, commit, release, and return **MUST** require an idempotency key and pass it
-to the backend unchanged. A repeated call with the same key that reaches the backend **MUST** return the first result
-and charge nothing again. The outcome for a principal that is not mapped is decided again on every call and charges
-nothing.
+to the backend unchanged. A repeated call with the same key and the same request **MUST** return the first result and
+charge nothing again. A call that reuses a key with a different request is a caller error; the backend decides its
+outcome. The outcome for a principal that is not mapped is decided again on every call and charges nothing.
 
-- **Rationale**: Callers retry after timeouts; a retry must not charge twice.
+A calling module **MUST** reuse a key only to retry the same call. No other call in the same tenant and operation, of
+this module or another one, may use it. A module **MUST NOT** pass as a key, as is, a value that other modules also see,
+such as a request id (it may build the key from that value, for example by adding its own name).
+
+- **Rationale**: Callers retry after timeouts; a retry must not charge twice. The resolver passes no caller identity to
+the backend, so the keys of all modules share one space in a tenant and operation.
 - **Actors**: `cpt-cf-quota-resolver-actor-consuming-module`
 
 ### 5.2 Subjects and Planes
