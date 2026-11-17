@@ -107,6 +107,8 @@ Design constraints enforced: `cpt-cf-oagw-constraint-https-only`.
     1. [x] - `p1` - **RETURN** 502 StreamAborted with `X-OAGW-Error-Source: gateway` - `inst-sse-11a`
 12. [x] - `p1` - **IF** idle timeout exceeded (no events received within configured timeout) - `inst-sse-12`
     1. [x] - `p1` - **RETURN** 504 IdleTimeout with `X-OAGW-Error-Source: gateway` - `inst-sse-12a`
+13. [x] - `p1` - **IF** the server starts shutting down or the gear stops, including when the signal came before the stream began waiting or a start followed at once - `inst-sse-13`
+    1. [x] - `p1` - Abort the stream to the caller (the body ends with an error, not a clean end, so a cut answer cannot pass for a complete one; SDK consumers get `StreamingError::ClosedByGateway`) and release the upstream connection at once; open WebSocket relays get Close 1001 on the same signal - `inst-sse-13a`
 
 ### WebSocket Proxy Flow
 
@@ -256,7 +258,7 @@ Not applicable. Streaming connections are transient request-scoped sessions — 
 
 - [x] `p1` - **ID**: `cpt-cf-oagw-dod-sse-streaming`
 
-The system **MUST** detect SSE responses (`Content-Type: text/event-stream`) from upstream and forward events to the caller in real time without buffering the full response. SSE fields (`data:`, `event:`, `id:`, `retry:`) **MUST** be preserved as-is. Individual SSE events are forwarded without size validation (pass-through; upstream controls event granularity). The system **MUST** handle connection lifecycle: upstream close (clean EOF), caller disconnect (abort upstream), unexpected drop (502 StreamAborted), and idle timeout (504 IdleTimeout). Non-SSE responses from an upstream expected to return SSE **MUST** return 502 ProtocolError with `X-OAGW-Error-Source: gateway`. Error source distinction per `cpt-cf-oagw-principle-error-source` applies to all streaming error scenarios.
+The system **MUST** detect SSE responses (`Content-Type: text/event-stream`) from upstream and forward events to the caller in real time without buffering the full response. SSE fields (`data:`, `event:`, `id:`, `retry:`) **MUST** be preserved as-is. Individual SSE events are forwarded without size validation (pass-through; upstream controls event granularity). The system **MUST** handle connection lifecycle: upstream close (clean EOF), caller disconnect (abort upstream), unexpected drop (502 StreamAborted), idle timeout (504 IdleTimeout), and shutdown, which aborts every open stream at once (also one opened after the signal), as soon as the server starts shutting down rather than at the end of its HTTP drain. Non-SSE responses from an upstream expected to return SSE **MUST** return 502 ProtocolError with `X-OAGW-Error-Source: gateway`. Error source distinction per `cpt-cf-oagw-principle-error-source` applies to all streaming error scenarios.
 
 **Implements**:
 - `cpt-cf-oagw-flow-streaming-sse`
@@ -311,6 +313,7 @@ The system **MUST** implement adaptive per-host HTTP version detection using ALP
 - [x] Caller disconnect during SSE streaming aborts the upstream connection and releases resources
 - [x] Unexpected upstream drop during SSE streaming returns 502 StreamAborted with `X-OAGW-Error-Source: gateway`
 - [x] Idle timeout during SSE streaming (no events within configured timeout) returns 504 IdleTimeout with `X-OAGW-Error-Source: gateway`
+- [x] Server shutdown or gear stop aborts every open SSE stream at once with an error, not a clean end, and releases its upstream; this includes streams opened before the gear's first start and streams that start waiting after the signal, and the server's HTTP drain does not wait for them
 - [ ] Non-SSE upstream response when SSE was expected returns 502 ProtocolError with `X-OAGW-Error-Source: gateway`
 - [x] WebSocket upgrade requests (`Upgrade: websocket`) are negotiated with both caller and upstream
 - [x] WebSocket text and binary messages are forwarded bidirectionally with opcode preservation

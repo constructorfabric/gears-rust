@@ -194,13 +194,23 @@ fn database_section() -> Value {
 /// crypto provider the runtime bootstrap would have (`init` builds the
 /// upstream engine, whose TLS config fails closed without one under `fips`).
 fn context(section: Value, db: Option<Db>, hub: Arc<ClientHub>) -> GearCtx {
+    context_under(section, db, hub, Default::default())
+}
+
+/// [`context`] with `root` as the runtime's root token.
+fn context_under(
+    section: Value,
+    db: Option<Db>,
+    hub: Arc<ClientHub>,
+    root: tokio_util::sync::CancellationToken,
+) -> GearCtx {
     crate::domain::test_support::ensure_crypto_provider();
     let ctx = GearCtx::new(
         OutboundApiGatewayGear::MODULE_NAME,
         Uuid::new_v4(),
         Arc::new(FixedConfig(section)),
         hub,
-        Default::default(),
+        root,
     );
     match db {
         Some(db) => ctx.with_db(DBProvider::new(db)),
@@ -548,6 +558,158 @@ async fn in_memory_post_init_reconciles_and_start_spawns_nothing() {
         .await
         .expect("start");
     assert!(gear.registry_task.lock().is_none());
+}
+
+/// An SSE stream on a silent upstream, watching the gear's stream signal.
+fn open_stream(gear: &OutboundApiGatewayGear) -> oagw_sdk::body::BodyStream {
+    let streams = gear.stream_shutdown.get().expect("init sets the signal");
+    crate::infra::proxy::streaming::streaming_body_with_lifecycle(
+        Box::pin(futures_util::stream::pending::<
+            Result<bytes::Bytes, oagw_sdk::body::BoxError>,
+        >()),
+        std::time::Duration::from_secs(300),
+        streams.subscribe(),
+    )
+}
+
+/// The stream ends with the shutdown error within a second, then ends.
+async fn assert_cut(mut stream: oagw_sdk::body::BodyStream, case: &str) {
+    use futures_util::StreamExt as _;
+    let next = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+        .await
+        .unwrap_or_else(|_| panic!("{case}: the stream is still open"));
+    crate::infra::proxy::streaming::tests::assert_shutdown_error(next);
+    assert!(stream.next().await.is_none(), "{case}: the stream goes on");
+}
+
+/// A gear after `init` and `post_init`, on a context whose root token is
+/// `root`; not started.
+async fn initialized_gear(root: tokio_util::sync::CancellationToken) -> OutboundApiGatewayGear {
+    let hub = hub_over(
+        MockTenantResolverClient::with_siblings(TenantId(Uuid::new_v4()), vec![]),
+        one_upstream_registry(Uuid::new_v4(), Uuid::new_v4()),
+    );
+    let ctx = context_under(json!({ "config": {} }), None, hub, root);
+    let gear = init(&ctx).await.expect("init");
+    gear.post_init(&post_init_ctx()).await.expect("post_init");
+    gear
+}
+
+/// [`initialized_gear`], started with `root` as the runtime does.
+async fn started_gear(root: tokio_util::sync::CancellationToken) -> OutboundApiGatewayGear {
+    let gear = initialized_gear(root.clone()).await;
+    gear.start(root).await.expect("start");
+    gear
+}
+
+/// `stop` ends the open SSE streams (and WebSocket relays, which watch the
+/// same signal), also one waiting on its upstream; a later `start` lets new
+/// streams run (#4987).
+#[tokio::test]
+async fn stop_ends_open_streams_and_a_later_start_lets_new_ones_run() {
+    use crate::infra::proxy::streaming::wake_flag::WakeFlag;
+    use futures_util::StreamExt as _;
+    let gear = started_gear(tokio_util::sync::CancellationToken::new()).await;
+
+    let mut waiting = open_stream(&gear);
+    let flag = Arc::new(WakeFlag::default());
+    flag.park(std::pin::pin!(waiting.next()));
+    gear.stop(tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("stop");
+    assert!(flag.woken(), "stop wakes a waiting stream");
+    assert_cut(waiting, "waiting when the stop came").await;
+
+    // Opened while stopped, polled only after the restart.
+    let unpolled = open_stream(&gear);
+    gear.start(tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("start again");
+    let restarted = open_stream(&gear);
+    gear.stop(tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("stop");
+    gear.start(tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("start again");
+    assert_cut(unpolled, "opened while stopped, polled after a restart").await;
+    assert_cut(restarted, "polled only after a stop and a start").await;
+
+    let mut fresh = open_stream(&gear);
+    let still_open = tokio::time::timeout(std::time::Duration::from_millis(50), fresh.next()).await;
+    assert!(still_open.is_err(), "a stream opened after start runs");
+}
+
+/// After a stop, the earlier start's shutdown watcher is gone: cancelling
+/// that start's token does not cut the streams of the next start.
+#[tokio::test]
+async fn an_earlier_starts_token_does_not_cut_later_streams() {
+    use futures_util::StreamExt as _;
+    let gear = initialized_gear(tokio_util::sync::CancellationToken::new()).await;
+    let first = tokio_util::sync::CancellationToken::new();
+    gear.start(first.clone()).await.expect("start");
+    gear.stop(tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("stop");
+    let second = tokio_util::sync::CancellationToken::new();
+    gear.start(second.clone()).await.expect("start again");
+    let mut open = open_stream(&gear);
+    first.cancel();
+    let still_open = tokio::time::timeout(std::time::Duration::from_millis(100), open.next()).await;
+    assert!(still_open.is_err(), "the stream must stay open");
+    // Its own start's token does reach it.
+    second.cancel();
+    assert_cut(open, "the current start's cancellation").await;
+}
+
+/// A start after a start without a stop (an anomaly the gear warns about)
+/// stops what the earlier start began, open streams included, on every
+/// storage backend.
+#[tokio::test]
+async fn a_start_without_a_stop_ends_the_open_streams() {
+    let gear = started_gear(tokio_util::sync::CancellationToken::new()).await;
+    let open = open_stream(&gear);
+    gear.start(tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("start again");
+    assert_cut(open, "a repeated start").await;
+}
+
+/// The runtime drains HTTP before it calls `stop`: the open streams end as
+/// soon as its cancellation fires, not at the drain deadline.
+#[tokio::test]
+async fn runtime_shutdown_ends_open_streams_before_stop() {
+    let root = tokio_util::sync::CancellationToken::new();
+    let gear = started_gear(root.clone()).await;
+    let open = open_stream(&gear);
+    root.cancel();
+    assert_cut(open, "runtime cancellation").await;
+}
+
+/// The runtime serves the REST surface before it starts the app gears, so a
+/// stream can open before the first `start`. Runtime shutdown ends it too.
+#[tokio::test]
+async fn runtime_shutdown_ends_a_stream_opened_before_the_first_start() {
+    let root = tokio_util::sync::CancellationToken::new();
+    let gear = initialized_gear(root.clone()).await;
+    let open = open_stream(&gear);
+    gear.start(root.clone()).await.expect("start");
+    root.cancel();
+    assert_cut(open, "runtime cancellation").await;
+}
+
+/// A stream opened before the first `start` is ended by the next `stop`,
+/// though the start gave later streams another token.
+#[tokio::test]
+async fn stop_ends_a_stream_opened_before_the_first_start() {
+    let root = tokio_util::sync::CancellationToken::new();
+    let gear = initialized_gear(root.clone()).await;
+    let open = open_stream(&gear);
+    gear.start(root).await.expect("start");
+    gear.stop(tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("stop");
+    assert_cut(open, "gear stop").await;
 }
 
 // ---------------------------------------------------------------------------

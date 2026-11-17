@@ -10,6 +10,7 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::api::rest::routes::test_router;
+use crate::infra::proxy::streaming::StreamShutdown;
 
 use super::api_v1::ApiV1;
 use super::mock::shared_mock;
@@ -20,6 +21,7 @@ pub struct AppHarness {
     facade: Arc<dyn ServiceGatewayClientV1>,
     ctx: SecurityContext,
     router: axum::Router,
+    stream_shutdown: StreamShutdown,
 }
 
 impl AppHarness {
@@ -46,6 +48,12 @@ impl AppHarness {
 
     pub fn router(&self) -> &axum::Router {
         &self.router
+    }
+
+    /// End the open SSE streams and WebSocket relays, and the ones opened
+    /// from now on, as the gear's `stop` does.
+    pub fn end_streams(&self) {
+        self.stream_shutdown.end_streams();
     }
 }
 
@@ -144,6 +152,7 @@ impl AppHarnessBuilder {
             facade: app_state.facade,
             ctx,
             router,
+            stream_shutdown: app_state.stream_shutdown,
         }
     }
 }

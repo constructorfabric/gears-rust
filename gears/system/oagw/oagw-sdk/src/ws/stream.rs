@@ -217,7 +217,7 @@ impl WebSocketSender {
                     };
                     self.sink.send(msg).await?;
                 }
-                Err(e) => return Err(StreamingError::Stream(e)),
+                Err(e) => return Err(StreamingError::from(e)),
             }
         }
         Ok(())
