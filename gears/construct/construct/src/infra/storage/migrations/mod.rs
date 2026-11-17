@@ -5,6 +5,7 @@ pub mod m002_subject_settings;
 pub mod m003_record_ids;
 pub mod m004_record_ids_key_only;
 pub mod m005_review_requests;
+pub mod m006_erasure_retention;
 
 pub struct Migrator;
 
@@ -20,6 +21,7 @@ impl MigratorTrait for Migrator {
             Box::new(m003_record_ids::Migration),
             Box::new(m004_record_ids_key_only::Migration),
             Box::new(m005_review_requests::Migration),
+            Box::new(m006_erasure_retention::Migration),
         ]
     }
 }

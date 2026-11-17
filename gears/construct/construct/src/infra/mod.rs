@@ -4,10 +4,13 @@ pub mod admission_events;
 mod admission_events_test;
 pub mod admission_rules;
 pub mod connector_switch;
+pub mod deletion_events;
+pub mod deletion_job;
 #[cfg(test)]
 mod hand_off_test;
 pub mod intake_events;
 pub mod model;
+pub(crate) mod panics;
 pub mod pipeline;
 #[cfg(test)]
 mod pipeline_test;
@@ -21,6 +24,7 @@ mod record_queue_test;
 pub mod record_types;
 #[cfg(test)]
 mod record_types_test;
+pub mod retention_periods;
 pub mod review_queue_events;
 pub mod storage;
 pub mod subject_control_events;

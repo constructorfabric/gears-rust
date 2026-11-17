@@ -83,8 +83,8 @@ The gear declares the dependencies `authz_resolver` and `types_registry` and the
 6. [x] - `p1` - **RETURN** success - `inst-start-return`
 
 **Capability hooks, called separately by the runtime**:
-1. [x] - `p1` - The database capability hook returns the migration set in order: `initial_001`, `m002_subject_settings`, `m003_record_ids`, `m004_record_ids_key_only`, `m005_review_requests`. - `inst-start-migrations`
-2. [x] - `p1` - The REST capability hook registers the routes on the router, the manage-facts route included. It fails if the service is not initialized. - `inst-start-rest`
+1. [x] - `p1` - The database capability hook returns the migration set in order: `initial_001`, `m002_subject_settings`, `m003_record_ids`, `m004_record_ids_key_only`, `m005_review_requests`, `m006_erasure_retention`. - `inst-start-migrations`
+2. [x] - `p1` - The REST capability hook registers the routes on the router, the manage-facts route included. It fails if the service is not initialized. The host keeps one OpenAPI description for every gear it runs and refuses two different schemas under one name at start, so no schema name of Construct's may be one the types registry uses - `inst-start-rest`
 
 ### Map Domain Errors to Problem Errors
 
@@ -119,12 +119,12 @@ None.
 
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-gear-foundation-anatomy`
 
-The system **MUST** be built as two crates with separated layers: the SDK crate `cf-gears-construct-sdk` (client trait, models and the record types, with no infrastructure types) and the gear crate `cf-gears-construct` (API, domain and infrastructure layers). The gear **MUST** declare its dependencies and the capabilities `rest` and `db`, and **MUST** hold no raw database connection. It **MUST** start as in `cpt-cf-construct-algo-gear-foundation-start-gear`.
+The system **MUST** be built as two crates with separated layers: the SDK crate `cf-gears-construct-sdk` (client trait, models and the record types, with no infrastructure types) and the gear crate `cf-gears-construct` (API, domain and infrastructure layers). The gear **MUST** declare its dependencies and the capabilities `rest` and `db`, and **MUST** hold no raw database connection. It **MUST** start as in `cpt-cf-construct-algo-gear-foundation-start-gear`, also in one host with the types registry.
 
 **Implements**:
 - `cpt-cf-construct-algo-gear-foundation-start-gear`
 
-**Verified by**: the config unit tests `an_empty_config_takes_the_defaults`, `both_keys_are_read`, `unknown_keys_are_rejected`, `a_connector_that_is_not_a_uuid_is_rejected` and `a_connector_in_another_spelling_is_the_same_connector`. `init` is not run in tests. The startup order itself, the declared dependencies, the capabilities, the two-crate layout and the absence of a raw database connection are verified by review and compilation only.
+**Verified by**: the config unit tests `an_empty_config_takes_the_defaults`, `both_keys_are_read`, `unknown_keys_are_rejected`, `a_connector_that_is_not_a_uuid_is_rejected` and `a_connector_in_another_spelling_is_the_same_connector`, and `the_routes_register_beside_the_types_registrys_in_one_host`, which registers every route of the gear in one OpenAPI registry after the types registry's. `init` is not run in tests. The startup order itself, the declared dependencies, the capabilities, the two-crate layout and the absence of a raw database connection are verified by review and compilation only.
 
 ### RFC 9457 Error Behavior
 

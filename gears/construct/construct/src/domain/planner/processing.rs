@@ -6,14 +6,15 @@ use toolkit_macros::domain_model;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Instant, timeout, timeout_at};
 
 use super::agent::{AgentMessage, Planner};
 use crate::domain::admission::{Admission, AdmissionOutcome};
+use crate::domain::deletion::ProfileGenerations;
 use crate::domain::error::DomainError;
 use crate::domain::plan::{Change, Plan};
 use crate::domain::profile::Profile;
-use crate::domain::profile_writes::WRITER_LIMIT;
+use crate::domain::profile_writes::{WRITE_BUDGET, WRITER_LIMIT};
 use crate::domain::record_intake::{
     DropEvent, DropReason, DropStage, IntakeEvents, ReceivedRecord,
 };
@@ -107,6 +108,9 @@ pub struct ProcessingPorts {
     pub writer: Arc<dyn PlanWriter>,
     pub events: Arc<dyn IntakeEvents>,
     pub reviews: Arc<dyn FactsUnderReview>,
+    /// The subjects' profile generations, against which a record's own is
+    /// checked.
+    pub generations: Arc<dyn ProfileGenerations>,
 }
 
 /// Takes one received record through the planner, the sensitive-data checks, Admission and the writer. A write
@@ -127,6 +131,7 @@ enum Failure {
     ProfileRead,
     ReviewRead,
     AdmissionRead,
+    ErasedSinceTaken,
     Write,
     RerunLimit,
 }
@@ -137,7 +142,7 @@ impl Failure {
             Self::NotPlanned | Self::NoContext | Self::ProfileRead | Self::ReviewRead => {
                 DropStage::Planner
             }
-            Self::AdmissionRead => DropStage::Admission,
+            Self::AdmissionRead | Self::ErasedSinceTaken => DropStage::Admission,
             Self::Write | Self::RerunLimit => DropStage::Writer,
         }
     }
@@ -146,13 +151,14 @@ impl Failure {
         match self {
             Self::RerunLimit => DropReason::RerunLimit,
             Self::NotPlanned => DropReason::NotPlanned,
+            Self::ErasedSinceTaken => DropReason::ErasedSinceTaken,
             _ => DropReason::ProcessingFailed,
         }
     }
 
     fn kind(self) -> &'static str {
         match self {
-            Self::NotPlanned | Self::RerunLimit => self.reason().name(),
+            Self::NotPlanned | Self::RerunLimit | Self::ErasedSinceTaken => self.reason().name(),
             Self::NoContext => "no_context",
             Self::ProfileRead => "profile_read_failed",
             Self::ReviewRead => "review_read_failed",
@@ -347,8 +353,26 @@ impl Processing {
         let Checked::Verdicts(verdicts) = self.checks.run(&plan).await else {
             return Ok(Run::Done);
         };
+        // @cpt-begin:cpt-cf-construct-algo-erasure-generation:p1:inst-generation-admit
+        // A record taken before an erasure is never stored after it: once the
+        // erasure moved the subject's generation on, the record is dropped,
+        // also when the subject turned personalization on again. An erasure
+        // marked after this read stops the write at Admission's settings read
+        // or waits it out.
+        let current = self
+            .ports
+            .generations
+            .generation(SubjectKey {
+                tenant_id: record.tenant_id,
+                subject_id,
+            })
+            .await
+            .map_err(|_| Failure::AdmissionRead)?;
+        if current > record.generation {
+            return Err(Failure::ErasedSinceTaken);
+        }
+        // @cpt-end:cpt-cf-construct-algo-erasure-generation:p1:inst-generation-admit
         let admitted = match self
-            .admission
             .admit(ctx, scope, plan, &verdicts)
             .await
             .map_err(|_| Failure::AdmissionRead)?
@@ -360,8 +384,6 @@ impl Processing {
             return Ok(Run::Done);
         }
         match self
-            .ports
-            .writer
             .write(ctx, &admitted)
             .await
             .map_err(|_| Failure::Write)?
@@ -447,7 +469,7 @@ impl Processing {
                 DropReason::CheckFailed,
             )));
         };
-        let admitted = match self.admission.admit(ctx, scope, plan, &verdicts).await? {
+        let admitted = match self.admit(ctx, scope, plan, &verdicts).await? {
             AdmissionOutcome::Admitted(admitted) => admitted.plan,
             AdmissionOutcome::Dropped(reason) => {
                 return Ok(Prepared::Nothing(NothingStored::Dropped(reason)));
@@ -461,6 +483,44 @@ impl Processing {
 }
 
 impl Processing {
+    /// Admission, answered within [`WRITE_BUDGET`]. The write follows at
+    /// once, so a plan admitted on the subject's settings starts its write
+    /// within the budget of that read, as an erasure's wait counts on: a read
+    /// that answers later, possibly from before the erasure's mark, admits
+    /// nothing.
+    async fn admit(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        plan: Plan,
+        verdicts: &[crate::domain::sensitive_data::Verdict],
+    ) -> Result<AdmissionOutcome, DomainError> {
+        timeout(
+            WRITE_BUDGET,
+            self.admission.admit(ctx, scope, plan, verdicts),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(DomainError::Unavailable(format!(
+                "Admission did not answer within {WRITE_BUDGET:?}; nothing is written"
+            )))
+        })
+    }
+
+    /// Write `plan`, awaiting the writer for at most [`WRITER_LIMIT`], so an
+    /// erasure that waits out every write admitted before its mark waits out
+    /// this one too. Past the limit the write may still land; the record is
+    /// dropped as unwritten, which the erasure's second removal covers.
+    async fn write(&self, ctx: &SecurityContext, plan: &Plan) -> Result<Written, DomainError> {
+        timeout(WRITER_LIMIT, self.ports.writer.write(ctx, plan))
+            .await
+            .unwrap_or_else(|_| {
+                Err(DomainError::Unavailable(format!(
+                    "the profile write did not end within {WRITER_LIMIT:?}; it may have landed"
+                )))
+            })
+    }
+
     /// Drops every step of `plan` that would change or remove a fact under an
     /// open review request, or add a property to it. The planner still sees
     /// the fact, so the model does not add it again. `construct` is

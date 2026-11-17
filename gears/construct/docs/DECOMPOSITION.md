@@ -897,7 +897,7 @@ The DESIGN's largest component, subject control, is split across four features. 
 
 - **Data**:
 
-  - None. Erasure removes rows from tables that other features own.
+  - `construct__tenants`, the tenants Construct has held a row for, which retention keeps sweeping. Erasure also removes rows from tables that other features own, and adds to the subject settings table the profile generation, which gives a profile after an erasure a new root key, and the time of the erasure's mark.
 
 ### 2.15 Retention and Tenant Exit - MEDIUM
 

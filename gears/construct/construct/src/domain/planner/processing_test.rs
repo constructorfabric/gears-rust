@@ -49,6 +49,38 @@ async fn an_admitted_plan_is_written_once() {
     assert!(chain.events.taken().is_empty());
 }
 
+/// A record taken before an erasure and processed after it is dropped at
+/// Admission, though personalization is on again, and a record taken in the
+/// current generation is written.
+#[tokio::test]
+async fn a_record_taken_before_an_erasure_is_dropped_after_it_though_personalization_is_on() {
+    let chain = Chain::new(adding_rust(1), &[Ok(Written::Stored)]);
+    chain.generations.erase();
+
+    chain.process(&record()).await;
+
+    assert!(chain.writer.plans().is_empty(), "nothing is written");
+    assert_eq!(
+        chain.events.taken(),
+        dropped(DropStage::Admission, DropReason::ErasedSinceTaken)
+    );
+
+    let chain = Chain::new(adding_rust(1), &[Ok(Written::Stored)]);
+    chain.generations.erase();
+    let taken_after = ReceivedRecord {
+        generation: 1,
+        ..record()
+    };
+
+    chain.process(&taken_after).await;
+
+    assert_eq!(
+        chain.writer.plans().len(),
+        1,
+        "a record of the new generation is written"
+    );
+}
+
 #[tokio::test]
 async fn a_write_conflict_plans_again_on_a_new_read_of_the_profile() {
     let chain = Chain::new(
@@ -506,6 +538,73 @@ async fn a_write_that_started_is_awaited_past_the_deadline_before_the_write() {
         .expect("an answer");
 
     assert!(matches!(managed, Managed::Stored(_)), "{managed:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_record_admitted_on_a_settings_read_past_the_budget_is_not_written() {
+    use crate::domain::profile_writes::WRITE_BUDGET;
+
+    // An erasure waits out every write admitted before its mark, counting the
+    // budget from Admission's read; a read answered later admits nothing.
+    let chain = Chain {
+        settings_delay: WRITE_BUDGET + Duration::from_secs(1),
+        ..Chain::new(adding_rust(1), &[Ok(Written::Stored)])
+    };
+    let started = Instant::now();
+
+    chain.process(&record()).await;
+
+    assert_eq!(started.elapsed(), WRITE_BUDGET);
+    assert!(chain.writer.plans().is_empty(), "nothing is written");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_agents_plan_admitted_on_a_settings_read_past_the_budget_is_not_written() {
+    use crate::domain::profile_writes::WRITE_BUDGET;
+
+    let chain = Chain {
+        settings_delay: WRITE_BUDGET + Duration::from_secs(1),
+        ..Chain::new(adding_rust(1), &[Ok(Written::Stored)])
+    };
+
+    let now = Instant::now();
+    let answered = chain
+        .manage(ManageDeadlines {
+            before_write: now + WRITE_BUDGET * 3,
+            answer: now + WRITE_BUDGET * 4,
+        })
+        .await;
+
+    assert!(
+        matches!(answered, Err(DomainError::Unavailable(_))),
+        "{answered:?}"
+    );
+    assert!(chain.writer.plans().is_empty(), "nothing is written");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_records_write_that_never_ends_is_dropped_at_the_writer_limit() {
+    let chain = Chain {
+        writer: Arc::new(Writer {
+            takes: crate::domain::profile_writes::WRITER_LIMIT * 2,
+            ..Arc::into_inner(Writer::answering(&[Ok(Written::Stored)])).expect("one owner")
+        }),
+        ..Chain::new(adding_rust(1), &[Ok(Written::Stored)])
+    };
+    let started = Instant::now();
+
+    chain.process(&record()).await;
+
+    // An erasure waits out every write admitted before its mark; a write
+    // that ran on would outlast that wait.
+    assert_eq!(
+        started.elapsed(),
+        crate::domain::profile_writes::WRITER_LIMIT
+    );
+    assert_eq!(
+        chain.events.taken(),
+        dropped(DropStage::Writer, DropReason::ProcessingFailed)
+    );
 }
 
 #[tokio::test]

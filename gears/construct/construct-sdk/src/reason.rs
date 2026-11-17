@@ -21,3 +21,5 @@ pub const CONNECTOR_OFF: &str = "CONNECTOR_OFF";
 pub const PERSONALIZATION_OFF: &str = "PERSONALIZATION_OFF";
 /// An erasure of the record's subject is under way.
 pub const ERASURE_IN_PROGRESS: &str = "ERASURE_IN_PROGRESS";
+/// The record was observed before the tenant's retention period began.
+pub const PAST_RETENTION: &str = "PAST_RETENTION";

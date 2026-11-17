@@ -16,6 +16,7 @@ use toolkit_canonical_errors::CanonicalError;
 use crate::domain::error::{DomainError, is_retryable};
 
 mod context;
+pub mod directory;
 pub mod fact;
 pub mod reader;
 pub mod root;
@@ -24,6 +25,8 @@ pub mod writer;
 
 pub(crate) use context::{ContextSubject, subject_in_context};
 
+#[cfg(test)]
+mod erasure_test;
 #[cfg(test)]
 mod fact_test;
 #[cfg(test)]

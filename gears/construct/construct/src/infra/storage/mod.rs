@@ -1,3 +1,6 @@
+pub mod deletion_repo;
+#[cfg(test)]
+mod deletion_repo_test;
 pub mod graph;
 pub mod mapper;
 pub mod migrations;
@@ -16,3 +19,4 @@ pub mod subject_settings_entity;
 pub mod subject_settings_repo;
 #[cfg(test)]
 mod subject_settings_repo_test;
+pub mod tenants_entity;

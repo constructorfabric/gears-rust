@@ -19,6 +19,11 @@ name = "construct"
 [lints]
 workspace = true
 
+[features]
+# The PostgreSQL suite of erasure's storage (tests/pg_erasure_test.rs),
+# Docker required: `make test-integration LANE=construct-pg`.
+integration = ["toolkit-db/pg"]
+
 [dependencies]
 construct-sdk = { package = "cf-gears-construct-sdk", version = "0.2.2", path = "../construct-sdk" }
 
@@ -38,6 +43,9 @@ bytes = { workspace = true }
 graph-storage-sdk = { workspace = true }
 graph-storage = { workspace = true }
 opentelemetry = { workspace = true }
+# The deletion job's leader election on the platform cluster gear. The SDK
+# only: no `deps = [cluster]` edge and no cluster gear dependency.
+cluster-sdk = { workspace = true }
 
 # Record types: the types registry resolves a record's type and base types
 types-registry-sdk = { workspace = true }
@@ -85,6 +93,7 @@ toolkit-odata-macros = { workspace = true }
 # needs no release of graph storage that has it.
 graph-storage = { package = "cf-gears-graph-storage", path = "../../graph-storage/graph-storage", features = ["test-support"] }
 types-registry-sdk = { workspace = true, features = ["test-util"] }
+cluster-sdk = { workspace = true, features = ["test-util"] }
 toolkit-db = { workspace = true, features = ["sqlite", "test-support"] }
 tower = { workspace = true, features = ["util"] }
 proptest = { workspace = true }
@@ -92,3 +101,7 @@ opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tracing-test = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 reqwest = { workspace = true }
+# The PostgreSQL suite behind `integration`: a real PostgreSQL in a container.
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+test-containers = { workspace = true }

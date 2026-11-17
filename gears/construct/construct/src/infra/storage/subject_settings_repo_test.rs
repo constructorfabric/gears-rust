@@ -754,6 +754,9 @@ async fn coverage_agrees_with_the_secure_orm_on_every_small_scope() {
             subject_id: ActiveValue::Set(subject),
             personalization_enabled: ActiveValue::Set(false),
             erasure_in_progress: ActiveValue::NotSet,
+            profile_generation: ActiveValue::NotSet,
+            erasure_marked_at: ActiveValue::NotSet,
+            erasure_attempted_at: ActiveValue::NotSet,
         };
         let orm_write = Entity::insert(row.clone())
             .secure()

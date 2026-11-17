@@ -1053,3 +1053,99 @@ async fn per_category_an_allow_that_does_not_reach_the_category_hides_it() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_fact_stored_before_the_tenants_retention_period_is_not_served() {
+    use std::num::NonZeroU32;
+
+    use crate::config::RetentionConfig;
+    use crate::infra::retention_periods::ConfigRetentionPeriods;
+
+    let db = inmem_db().await;
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+    let now = OffsetDateTime::now_utc();
+    let mut old = fact(Category::Skill, "skills", json!({ "name": "COBOL" }));
+    old.stored_at = now - time::Duration::days(31);
+    let mut new = fact(Category::Skill, "skills", json!({ "name": "Rust" }));
+    new.stored_at = now - time::Duration::days(29);
+    let service = profile_service(
+        &db,
+        Arc::new(AllowResolver),
+        vec![old, new.clone()],
+        Arc::default(),
+        CategoryCheck::OneCall,
+    )
+    .with_retention(Arc::new(ConfigRetentionPeriods::new(RetentionConfig {
+        default_days: None,
+        tenants: [(tenant, NonZeroU32::new(30).unwrap())].into(),
+    })));
+
+    let view = service
+        .read(&caller_in(tenant), None, subject)
+        .await
+        .unwrap();
+
+    let [skills] = view.categories.as_slice() else {
+        panic!("one category, got {view:?}");
+    };
+    assert_eq!(
+        skills.facts.iter().map(|f| &f.node_key).collect::<Vec<_>>(),
+        [&new.node_key],
+        "the fact past the period is not served, also before retention removes it"
+    );
+
+    let elsewhere = service
+        .read(&caller_in(Uuid::new_v4()), None, subject)
+        .await
+        .unwrap();
+    assert_eq!(
+        elsewhere
+            .categories
+            .iter()
+            .map(|g| g.facts.len())
+            .sum::<usize>(),
+        2,
+        "a tenant without a period keeps everything"
+    );
+}
+
+/// Retention periods that give every tenant `.0`.
+struct EveryTenant(std::time::Duration);
+
+#[async_trait]
+impl crate::domain::deletion::RetentionPeriods for EveryTenant {
+    async fn period(&self, _tenant_id: Uuid) -> Result<Option<std::time::Duration>, DomainError> {
+        Ok(Some(self.0))
+    }
+
+    fn listed(&self) -> std::collections::BTreeSet<Uuid> {
+        std::collections::BTreeSet::new()
+    }
+
+    fn has_default(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn a_period_reaching_before_the_earliest_time_hides_nothing() {
+    let db = inmem_db().await;
+    let service = profile_service(
+        &db,
+        Arc::new(AllowResolver),
+        facts(),
+        Arc::default(),
+        CategoryCheck::OneCall,
+    )
+    .with_retention(Arc::new(EveryTenant(std::time::Duration::MAX)));
+
+    let view = service
+        .read(&caller_in(Uuid::new_v4()), None, Uuid::new_v4())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        view.categories.iter().map(|g| g.facts.len()).sum::<usize>(),
+        facts().len()
+    );
+}

@@ -949,7 +949,7 @@ sequenceDiagram
     SC-->>SU: erasure accepted
 ```
 
-**Description**: The subject asks to erase everything. Deletion first sets personalization off and marks the erasure as under way, so nothing is served and records received before it store nothing, even if personalization is turned on again before the erasure is done. It then removes the subject's entities and the root node from graph storage, and the subject's review requests and record IDs from Construct's tables. It writes an erasure audit event without content. It does not remove audit events; the Audit gear's retention period does. Retention runs the same code by age, as a job on the cluster leader. Removal from all storage within 30 days needs graph storage's purge (see Risks).
+**Description**: The subject asks to erase everything. Deletion first sets personalization off and marks the erasure as under way, so Profile reader serves nothing and records received before it store nothing, even if personalization is turned on again before the erasure is done. It then removes the subject's entities and the root node from graph storage, and the subject's review requests and record IDs from Construct's tables. It writes an erasure audit event without content. It does not remove audit events; the Audit gear's retention period does. Retention runs the same code by age, as a job on the cluster leader. Removal from all storage within 30 days needs graph storage's purge (see Risks).
 
 ### 3.7 Database schemas & tables
 

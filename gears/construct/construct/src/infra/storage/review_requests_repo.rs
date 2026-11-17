@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use sea_orm::sea_query::Expr;
-use sea_orm::{ActiveValue, ColumnTrait, Condition, EntityTrait, QuerySelect, SqlErr};
+use sea_orm::{ActiveValue, ColumnTrait, Condition, EntityTrait, QuerySelect};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use toolkit_db::DBProvider;
@@ -13,7 +13,7 @@ use toolkit_db::odata::LimitCfg;
 use toolkit_db::odata::sea_orm_filter::{
     FieldToColumn, ODataFieldMapping, PaginateOdataTryError, paginate_odata_try,
 };
-use toolkit_db::secure::{DBRunner, ScopeError, SecureEntityExt, SecureInsertExt, SecureUpdateExt};
+use toolkit_db::secure::{DBRunner, SecureEntityExt, SecureInsertExt, SecureUpdateExt};
 use toolkit_odata::{Error as ODataError, ODataQuery, Page, SortDir};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
@@ -42,13 +42,6 @@ const PAGE_LIMITS: LimitCfg = LimitCfg {
     default: DEFAULT_LIMIT,
     max: MAX_LIMIT,
 };
-
-fn is_unique_violation(err: &ScopeError) -> bool {
-    matches!(
-        err,
-        ScopeError::Db(db) if matches!(db.sql_err(), Some(SqlErr::UniqueConstraintViolation(_)))
-    )
-}
 
 /// What a claim is about to write, as the `pending` column holds it.
 #[derive(Debug, Serialize, Deserialize)]
@@ -275,7 +268,7 @@ impl SeaOrmReviewRequestRepository {
             .await;
         match inserted {
             Ok(_) => {}
-            Err(err) if is_unique_violation(&err) => return Ok(Opened::AlreadyOpen),
+            Err(err) if err.is_unique_violation() => return Ok(Opened::AlreadyOpen),
             Err(err) => return Err(map_scope_error(err)),
         }
         Ok(Opened::Opened(Box::new(ReviewRequest {

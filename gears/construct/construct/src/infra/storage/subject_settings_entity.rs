@@ -1,4 +1,5 @@
 use sea_orm::entity::prelude::*;
+use time::OffsetDateTime;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
@@ -21,6 +22,13 @@ pub struct Model {
     pub subject_id: Uuid,
     pub personalization_enabled: bool,
     pub erasure_in_progress: bool,
+    /// The generation of the subject's profile root; an erasure moves it on.
+    pub profile_generation: i64,
+    /// When the erasure under way was marked; none without one.
+    pub erasure_marked_at: Option<OffsetDateTime>,
+    /// When the leader's job last tried the erasure under way; none when it
+    /// has not.
+    pub erasure_attempted_at: Option<OffsetDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

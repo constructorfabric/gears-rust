@@ -11,6 +11,8 @@ pub(crate) type DbProvider = toolkit_db::DBProvider<toolkit_db::DbError>;
 
 pub mod admin_facts;
 pub mod admission;
+pub mod deletion;
+pub mod erasure;
 pub mod error;
 pub mod local_client;
 pub mod model_client;
@@ -35,6 +37,10 @@ pub mod subject_settings;
 mod admin_facts_test;
 #[cfg(test)]
 mod admission_test;
+#[cfg(test)]
+mod deletion_test;
+#[cfg(test)]
+mod erasure_test;
 #[cfg(test)]
 mod local_client_test;
 #[cfg(test)]

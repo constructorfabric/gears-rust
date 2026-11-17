@@ -57,10 +57,15 @@ pub enum Origin {
     Reviewer { reviewer: Uuid },
     /// A tenant administrator's added or edited fact.
     Administrator { administrator: Uuid },
-    /// The subject's own delete of one of its facts. Subject Control builds
-    /// the only such plan, with one removal; it never reaches Admission, and
-    /// the writer refuses to store a fact from it.
+    /// The subject's own delete of one of its facts, or of all of them in an
+    /// erasure. Subject Control and Deletion build the only such plans, of
+    /// removals alone; they never reach Admission, and the writer refuses to
+    /// store a fact from one.
     Subject { subject: Uuid },
+    /// Construct's removal of facts past the tenant's retention period. Only
+    /// Deletion builds such a plan, of removals alone, and the writer refuses
+    /// to store a fact from one.
+    Retention,
 }
 
 impl Origin {
@@ -80,6 +85,7 @@ impl Origin {
             Self::Reviewer { .. } => "reviewer",
             Self::Administrator { .. } => "administrator",
             Self::Subject { .. } => "subject",
+            Self::Retention => "retention",
         }
     }
 
@@ -92,6 +98,7 @@ impl Origin {
             | Self::Reviewer { reviewer: id }
             | Self::Administrator { administrator: id }
             | Self::Subject { subject: id } => id.to_string(),
+            Self::Retention => "construct".to_owned(),
         }
     }
 }

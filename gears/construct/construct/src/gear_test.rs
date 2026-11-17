@@ -18,10 +18,11 @@ use toolkit_security::SecurityContext;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use super::{ConstructGear, Running};
+use super::{ConstructGear, DeletionTasks, Running};
 use crate::config::{CategoryCheckConfig, ConstructConfig};
 use crate::domain::model_client::{ModelClient, ModelError, ModelRequest, ModelResponse};
 use crate::domain::record_intake::RecordHandOff;
+use crate::infra::deletion_job::{DeletionJob, Leadership};
 use crate::infra::pipeline::assemble;
 use crate::infra::processing_metrics::WorkerLoad;
 use crate::infra::record_queue::record_queue;
@@ -62,6 +63,7 @@ async fn gear_with_worker() -> (ConstructGear, Arc<dyn RecordHandOff>) {
         fake_graph_storage(),
         Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
         Arc::new(crate::test_support::MemoryReviews::default()),
+        crate::test_support::deletion_tables(&db),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
     )
     .unwrap();
@@ -259,6 +261,7 @@ async fn router_of(
         fake_graph_storage(),
         Arc::clone(&settings) as _,
         Arc::new(crate::test_support::MemoryReviews::default()),
+        crate::test_support::deletion_tables(&db),
         PolicyEnforcer::new(resolver),
     )
     .unwrap();
@@ -274,6 +277,7 @@ async fn router_of(
     assert!(gear.review_queue.set(pipeline.review_queue).is_ok());
     assert!(gear.admin_facts.set(pipeline.admin_facts).is_ok());
     assert!(gear.manage.set(pipeline.manage).is_ok());
+    assert!(gear.erasure.set(pipeline.erasure).is_ok());
     let ctx = GearCtx::new(
         ConstructGear::MODULE_NAME,
         Uuid::new_v4(),
@@ -398,4 +402,128 @@ async fn without_processing_a_caller_who_may_not_act_for_the_subject_gets_not_fo
             "{tenant:?}: {body}"
         );
     }
+}
+
+/// How the fake leadership behaves once it leads.
+#[derive(Clone, Copy)]
+enum Leads {
+    /// Until it is told to stop.
+    UntilStopped,
+    /// Forever, whatever it is told.
+    Forever,
+    /// It panics.
+    Panics,
+}
+
+/// A [`Leadership`] that says when it was entered and when it was told to
+/// stop, and otherwise behaves as told.
+struct FakeLeadership {
+    leads: Leads,
+    entered: tokio::sync::Notify,
+    stopped: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl Leadership for FakeLeadership {
+    async fn lead(&self, _job: Arc<DeletionJob>, cancel: CancellationToken) {
+        self.entered.notify_one();
+        match self.leads {
+            Leads::UntilStopped => {
+                cancel.cancelled().await;
+                self.stopped
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Leads::Forever => std::future::pending().await,
+            Leads::Panics => panic!("the leadership failed"),
+        }
+    }
+}
+
+/// A gear holding only the deletion tasks, with a leadership that `leads`.
+struct DeletingGear {
+    gear: ConstructGear,
+    leadership: Arc<FakeLeadership>,
+}
+
+fn gear_deleting(leads: Leads) -> DeletingGear {
+    let store = Arc::new(crate::test_support::MemoryDeletionStore::default());
+    let deletion = crate::test_support::deletion_over(Arc::clone(&store));
+    let leadership = Arc::new(FakeLeadership {
+        leads,
+        entered: tokio::sync::Notify::new(),
+        stopped: std::sync::atomic::AtomicBool::new(false),
+    });
+    let gear = ConstructGear::default();
+    *gear.deletion.lock() = Some(DeletionTasks {
+        job: Arc::new(DeletionJob {
+            deletion,
+            store,
+            periods: Arc::new(
+                crate::infra::retention_periods::ConfigRetentionPeriods::new(
+                    crate::config::RetentionConfig::default(),
+                ),
+            ),
+            interval: std::time::Duration::from_secs(60),
+            retention_interval: std::time::Duration::from_secs(60),
+        }),
+        leadership: Arc::clone(&leadership) as _,
+    });
+    DeletingGear { gear, leadership }
+}
+
+#[tokio::test]
+async fn start_runs_the_leaders_job_and_stop_ends_it() {
+    let DeletingGear { gear, leadership } = gear_deleting(Leads::UntilStopped);
+
+    gear.start(CancellationToken::new()).await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        leadership.entered.notified(),
+    )
+    .await
+    .expect("the leadership is entered");
+    assert!(gear.deletion.lock().is_none(), "taken by start");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        gear.stop(CancellationToken::new()),
+    )
+    .await
+    .expect("stop returns")
+    .unwrap();
+    assert!(
+        leadership.stopped.load(std::sync::atomic::Ordering::SeqCst),
+        "the leadership saw the cancel and ended on its own"
+    );
+}
+
+#[tokio::test]
+async fn a_deletion_task_that_ignores_stop_is_aborted_at_the_deadline() {
+    let DeletingGear { gear, leadership } = gear_deleting(Leads::Forever);
+    gear.start(CancellationToken::new()).await.unwrap();
+    leadership.entered.notified().await;
+    let deadline = CancellationToken::new();
+    deadline.cancel();
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), gear.stop(deadline))
+        .await
+        .expect("stop returns")
+        .unwrap();
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_deletion_task_that_panicked_makes_stop_fail() {
+    let DeletingGear { gear, leadership } = gear_deleting(Leads::Panics);
+    gear.start(CancellationToken::new()).await.unwrap();
+    leadership.entered.notified().await;
+    tokio::task::yield_now().await;
+
+    let err = gear.stop(CancellationToken::new()).await.unwrap_err();
+
+    assert!(err.to_string().contains("deletion job"), "{err:#}");
+    assert!(
+        logs_contain("a deletion task ended with an error"),
+        "logged where it happened, so a failing processing stop does not hide it"
+    );
 }

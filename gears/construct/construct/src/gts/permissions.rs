@@ -7,7 +7,7 @@
 //! The permissions are the separate ones the PRD's access control names:
 //! connectors send records; applications and agents read profiles and manage
 //! facts for the tenant's subjects; a subject controls its own settings and
-//! facts and flags a fact as incorrect; a reviewer resolves review requests;
+//! facts, flags a fact as incorrect and erases everything; a reviewer resolves review requests;
 //! the data protection officer exports a subject's data; a tenant
 //! administrator administers the facts of the tenant's subjects. The tenant
 //! grants each to whom it chooses, in the policy engine.
@@ -19,6 +19,7 @@
 use toolkit_gts::{AuthzPermissionV1, gts_instance};
 
 use crate::domain::admin_facts;
+use crate::domain::erasure;
 
 use crate::domain::planner::manage::{self, SUBJECT_FACTS_RESOURCE};
 use crate::domain::profile_read::{self, PROFILE_RESOURCE};
@@ -123,5 +124,14 @@ gts_instance! {
         resource_type: SUBJECT_FACTS_RESOURCE.name().to_owned(),
         action: admin_facts::actions::ADMINISTER.to_owned(),
         display_name: "Administer a subject's facts".to_owned(),
+    }
+}
+
+gts_instance! {
+    AuthzPermissionV1 {
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.construct._.subject_erase.v1"),
+        resource_type: SUBJECT_FACTS_RESOURCE.name().to_owned(),
+        action: erasure::actions::ERASE.to_owned(),
+        display_name: "Erase own data".to_owned(),
     }
 }

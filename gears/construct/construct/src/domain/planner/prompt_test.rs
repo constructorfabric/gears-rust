@@ -31,6 +31,7 @@ fn received(record: Value) -> ReceivedRecord {
             .expect("an observation time"),
         },
         record,
+        generation: 0,
     }
 }
 

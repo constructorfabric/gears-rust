@@ -35,7 +35,11 @@ fn key_value(column: entity::Column, key: SubjectKey) -> Option<uuid::Uuid> {
     match column {
         entity::Column::TenantId => Some(key.tenant_id),
         entity::Column::SubjectId => Some(key.subject_id),
-        entity::Column::PersonalizationEnabled | entity::Column::ErasureInProgress => None,
+        entity::Column::PersonalizationEnabled
+        | entity::Column::ErasureInProgress
+        | entity::Column::ProfileGeneration
+        | entity::Column::ErasureMarkedAt
+        | entity::Column::ErasureAttemptedAt => None,
     }
 }
 
@@ -160,14 +164,17 @@ impl SubjectSettingsRepository for SeaOrmSubjectSettingsRepository {
             return Ok(SettingsWrite::OutOfScope(refusal));
         }
 
-        // The erasure flag is left out of the insert, so a new row takes the
-        // column default (no erasure under way), and out of the update, so an
-        // existing row keeps it.
+        // The erasure flag and the generation are left out of the insert, so a
+        // new row takes the column defaults (no erasure under way, generation
+        // 0), and out of the update, so an existing row keeps them.
         let row = entity::ActiveModel {
             tenant_id: ActiveValue::Set(key.tenant_id),
             subject_id: ActiveValue::Set(key.subject_id),
             personalization_enabled: ActiveValue::Set(personalization_enabled),
             erasure_in_progress: ActiveValue::NotSet,
+            profile_generation: ActiveValue::NotSet,
+            erasure_marked_at: ActiveValue::NotSet,
+            erasure_attempted_at: ActiveValue::NotSet,
         };
         let on_conflict = SecureOnConflict::<SubjectSettingsEntity>::columns([
             entity::Column::TenantId,

@@ -145,7 +145,11 @@ fn ensure_owner(ctx: &SecurityContext, subject_id: Uuid) -> Result<(), DomainErr
 }
 
 /// The refusal of a read or a write whose scope leaves the key out.
-fn out_of_scope(ctx: &SecurityContext, key: SubjectKey, refusal: ScopeRefusal) -> DomainError {
+pub(crate) fn out_of_scope(
+    ctx: &SecurityContext,
+    key: SubjectKey,
+    refusal: ScopeRefusal,
+) -> DomainError {
     DomainError::OutOfScope(SettingsOutOfScope {
         caller: ctx.subject_id(),
         caller_tenant: ctx.subject_tenant_id(),

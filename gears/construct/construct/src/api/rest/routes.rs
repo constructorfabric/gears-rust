@@ -1,6 +1,6 @@
 use crate::api::rest::types::{
-    ConcreteAdminFacts, ConcreteIntake, ConcreteProfile, ConcreteReviewQueue, ConcreteSettings,
-    ConcreteSubjectControl,
+    ConcreteAdminFacts, ConcreteErasure, ConcreteIntake, ConcreteProfile, ConcreteReviewQueue,
+    ConcreteSettings, ConcreteSubjectControl,
 };
 use crate::api::rest::{dto, handlers};
 use crate::domain::planner::manage::ManageFacts;
@@ -20,6 +20,8 @@ const PROFILE_PATH: &str = "/construct/v1/subjects/{subject_id}/profile";
 const SUBJECT_FACTS_PATH: &str = "/construct/v1/subjects/{subject_id}/facts";
 const SUBJECT_FACT_PATH: &str = "/construct/v1/subjects/{subject_id}/facts/{fact_id}";
 const SUBJECT_EXPORT_PATH: &str = "/construct/v1/subjects/{subject_id}/export";
+const ERASURE_PATH: &str = "/construct/v1/subjects/{subject_id}/erasure";
+const ERASURE_TAG: &str = "Subject erasure";
 const SUBJECT_REVIEWS_PATH: &str = "/construct/v1/subjects/{subject_id}/review-requests";
 const OPEN_REVIEWS_PATH: &str = "/construct/v1/admin/review-requests";
 const RESOLUTION_PATH: &str = "/construct/v1/admin/review-requests/{request_id}/resolution";
@@ -307,6 +309,47 @@ pub fn register_subject_control_routes(
     // @cpt-end:cpt-cf-construct-flow-subject-control-export:p1:inst-export-send
 
     router.merge(not_stored(subject)).layer(Extension(svc))
+}
+
+/// The erasure route: the subject erases everything Construct holds about
+/// it.
+pub fn register_erasure_routes(
+    router: Router,
+    openapi: &dyn OpenApiRegistry,
+    svc: Arc<ConcreteErasure>,
+) -> Router {
+    // @cpt-begin:cpt-cf-construct-flow-erasure-request:p1:inst-request-send
+    let erasure = OperationBuilder::post(ERASURE_PATH)
+        .operation_id("construct.request_erasure")
+        .summary("Erase everything about the subject")
+        .description(
+            "Erases everything Construct holds about the caller: its facts, its review \
+             requests and the identities of its records. Personalization is turned off and \
+             stays off, and from this answer on the profile read serves nothing about the \
+             subject and no record or agent stores anything for it. The subject's own list \
+             and export, and an administrator's read, still show its facts until the erasure \
+             removes them. The erasure runs in the background; the \
+             answer, 202, gives the settings with `erasure_in_progress`, and `GET .../settings` \
+             shows it false once every step is done. A request while one is under way changes \
+             nothing. Owner only: another subject answers 404. Audit events are not erased; \
+             the Audit gear's retention period removes them.",
+        )
+        .tag(ERASURE_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("subject_id", "The caller's own subject id")
+        .handler(handlers::request_erasure)
+        .json_response_with_schema::<dto::SubjectSettingsDto>(
+            openapi,
+            StatusCode::ACCEPTED,
+            "The erasure is under way",
+        )
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .register(Router::new(), openapi);
+    // @cpt-end:cpt-cf-construct-flow-erasure-request:p1:inst-request-send
+
+    router.merge(not_stored(erasure)).layer(Extension(svc))
 }
 
 /// The Review Queue's routes: the subject's flag and list, and the

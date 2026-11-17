@@ -24,6 +24,8 @@ pub enum RefusalReason {
     PersonalizationOff,
     /// An erasure of the record's subject is under way.
     ErasureInProgress,
+    /// The record was observed before the tenant's retention period began.
+    PastRetention,
 }
 
 impl RefusalReason {
@@ -39,6 +41,7 @@ impl RefusalReason {
             Self::ConnectorOff => reason::CONNECTOR_OFF,
             Self::PersonalizationOff => reason::PERSONALIZATION_OFF,
             Self::ErasureInProgress => reason::ERASURE_IN_PROGRESS,
+            Self::PastRetention => reason::PAST_RETENTION,
         }
     }
 }

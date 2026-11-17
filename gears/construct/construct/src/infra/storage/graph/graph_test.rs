@@ -35,7 +35,7 @@ use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties}
 use uuid::Uuid;
 
 use super::reader::{GraphProfileSource, MAX_FACTS, MAX_PROFILE_NODES};
-use super::root::{PayloadCounter, Root, root_key};
+use super::root::{FirstGeneration, PayloadCounter, Root, root_key};
 use super::types::GraphTypes;
 use super::writer::{
     DEFAULT_ATTEMPTS, FactRemoval, GraphPlanWriter, SoftDelete, WriterPorts, pauses, resendable,
@@ -184,6 +184,12 @@ struct Scripted {
     registrations: AtomicU32,
     fail_next_registration: AtomicBool,
     conflict_next_registration: AtomicBool,
+    /// Every node listing asked for.
+    listings: Mutex<Vec<toolkit_odata::ODataQuery>>,
+    /// Rows added to every node listing.
+    extra_rows: Mutex<Vec<NodeRow>>,
+    /// The cursor every node listing names for its next page.
+    next_cursor: Mutex<Option<String>>,
 }
 
 impl Scripted {
@@ -203,6 +209,9 @@ impl Scripted {
             registrations: AtomicU32::new(0),
             fail_next_registration: AtomicBool::new(false),
             conflict_next_registration: AtomicBool::new(false),
+            listings: Mutex::default(),
+            extra_rows: Mutex::default(),
+            next_cursor: Mutex::default(),
         })
     }
 
@@ -333,7 +342,26 @@ impl GraphStorageClientV1 for Scripted {
         type_patterns: &[String],
         query: toolkit_odata::ODataQuery,
     ) -> Result<toolkit_odata::Page<NodeRow>, CanonicalError> {
-        self.inner.project_nodes(ctx, type_patterns, query).await
+        self.listings.lock().unwrap().push(query.clone());
+        let scripted_next = self.next_cursor.lock().unwrap().is_some();
+        if scripted_next && query.cursor.is_some() {
+            // The page after a scripted cursor: the last, and empty.
+            return Ok(toolkit_odata::Page {
+                items: Vec::new(),
+                page_info: toolkit_odata::PageInfo {
+                    next_cursor: None,
+                    prev_cursor: None,
+                    limit: query.limit.unwrap_or_default(),
+                },
+            });
+        }
+        let mut page = self.inner.project_nodes(ctx, type_patterns, query).await?;
+        page.items
+            .extend(self.extra_rows.lock().unwrap().iter().cloned());
+        if let Some(next) = self.next_cursor.lock().unwrap().clone() {
+            page.page_info.next_cursor = Some(next);
+        }
+        Ok(page)
     }
     async fn search(
         &self,
@@ -420,6 +448,8 @@ impl Profiles {
             types: Arc::new(GraphTypes::new(client)),
             version: Arc::new(PayloadCounter),
             removal,
+            generations: Arc::new(FirstGeneration),
+            tenants: Arc::new(crate::test_support::MemoryDeletionStore::default()),
         })
     }
 
@@ -439,7 +469,12 @@ impl Profiles {
     }
 
     fn reader(&self) -> GraphProfileSource {
-        GraphProfileSource::new(Arc::clone(&self.client), Arc::new(PayloadCounter))
+        GraphProfileSource::new(
+            Arc::clone(&self.client),
+            Arc::new(PayloadCounter),
+            Arc::new(FirstGeneration),
+            crate::test_support::no_retention(),
+        )
     }
 
     async fn read(&self) -> Profile {
@@ -1153,6 +1188,8 @@ async fn a_node_reached_by_an_edge_of_another_type_is_not_read_as_a_fact() {
     let profile = GraphProfileSource::new(
         Arc::clone(&scripted) as Arc<dyn GraphStorageClientV1>,
         Arc::new(PayloadCounter),
+        Arc::new(FirstGeneration),
+        crate::test_support::no_retention(),
     )
     .read(&profiles.ctx, profiles.tenant, profiles.subject)
     .await
@@ -1318,6 +1355,8 @@ async fn a_profile_cut_short_by_the_read_limit_is_full_not_partial() {
     let read = GraphProfileSource::new(
         Arc::clone(&scripted) as Arc<dyn GraphStorageClientV1>,
         Arc::new(PayloadCounter),
+        Arc::new(FirstGeneration),
+        crate::test_support::no_retention(),
     )
     .read(&profiles.ctx, profiles.tenant, profiles.subject)
     .await;
@@ -1344,6 +1383,8 @@ async fn a_profile_read_cut_short_for_another_reason_is_internal() {
     let reader = GraphProfileSource::new(
         Arc::clone(&scripted) as Arc<dyn GraphStorageClientV1>,
         Arc::new(PayloadCounter),
+        Arc::new(FirstGeneration),
+        crate::test_support::no_retention(),
     );
 
     for reason in [
@@ -1372,6 +1413,8 @@ async fn a_read_that_saw_more_than_one_graph_state_is_sent_again() {
     let read = GraphProfileSource::new(
         Arc::clone(&scripted) as Arc<dyn GraphStorageClientV1>,
         Arc::new(PayloadCounter),
+        Arc::new(FirstGeneration),
+        crate::test_support::no_retention(),
     )
     .read(&profiles.ctx, profiles.tenant, profiles.subject)
     .await
@@ -1412,6 +1455,8 @@ async fn a_profile_read_asks_for_the_root_and_at_most_its_facts() {
     GraphProfileSource::new(
         Arc::clone(&scripted) as Arc<dyn GraphStorageClientV1>,
         Arc::new(PayloadCounter),
+        Arc::new(FirstGeneration),
+        crate::test_support::no_retention(),
     )
     .read(&profiles.ctx, profiles.tenant, profiles.subject)
     .await
@@ -2031,6 +2076,8 @@ async fn a_read_without_an_answer_in_time_is_unavailable() {
     let read = GraphProfileSource::new(
         Arc::clone(&scripted) as Arc<dyn GraphStorageClientV1>,
         Arc::new(PayloadCounter),
+        Arc::new(FirstGeneration),
+        crate::test_support::no_retention(),
     )
     .read(&profiles.ctx, profiles.tenant, profiles.subject)
     .await;
@@ -2375,4 +2422,114 @@ async fn the_stored_facts_leave_out_one_listed_for_removal_and_a_subject_without
     let stored = profiles.stored().await;
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].value, skills("Go"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_root_whose_listed_deletes_never_end_stays_and_its_removal_is_unavailable_in_time() {
+    use crate::domain::deletion::ProfileRoots;
+
+    let profiles = Profiles::new();
+    let rust = add_skill("Rust");
+    let key = key_of(&rust);
+    profiles.given(None, vec![rust]).await;
+    let timeout = Duration::from_secs(1);
+    let writer = Profiles::writer_with(Arc::clone(&profiles.client), Arc::new(HangingRemoval))
+        .with_timeout(timeout);
+    // The removal is written; its delete never ends, so the root lists it.
+    assert_eq!(
+        writer
+            .write(&profiles.ctx, &profiles.plan(Some(1), vec![remove(&key)]))
+            .await
+            .unwrap(),
+        Written::Stored
+    );
+    let started = tokio::time::Instant::now();
+
+    let err = writer
+        .remove_root(&profiles.ctx, profiles.subject_key(), 0)
+        .await;
+
+    assert!(
+        matches!(&err, Err(DomainError::Unavailable(message)) if message.contains("not deleted within")),
+        "{err:?}"
+    );
+    let waited = started.elapsed();
+    assert!(waited >= timeout * 6 && waited < timeout * 7, "{waited:?}");
+    assert!(
+        profiles.root().await.is_some(),
+        "the root stays for the next run"
+    );
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn the_directory_hands_on_graph_storages_cursor_and_leaves_out_a_root_it_cannot_read() {
+    use super::directory::GraphProfileDirectory;
+    use crate::domain::deletion::ProfileDirectory;
+
+    let profiles = Profiles::new();
+    profiles.given(None, vec![add_skill("Rust")]).await;
+    let scripted = Scripted::over(Arc::clone(&profiles.client));
+    let listed = profiles
+        .client
+        .project_nodes(
+            &profiles.ctx,
+            &[construct_sdk::gts::PROFILE_ROOT_TYPE.to_owned()],
+            toolkit_odata::ODataQuery::new(),
+        )
+        .await
+        .unwrap();
+    let [root] = listed.items.as_slice() else {
+        panic!("one root, got {listed:?}");
+    };
+    // A root without a payload, and one whose key is another tenant's.
+    let foreign_key = format!("construct:{}:root:{}", Uuid::new_v4(), profiles.subject);
+    *scripted.extra_rows.lock().unwrap() = vec![
+        NodeRow {
+            payload: None,
+            ..root.clone()
+        },
+        NodeRow {
+            node_key: foreign_key,
+            ..root.clone()
+        },
+    ];
+    let cursor = toolkit_odata::CursorV1 {
+        k: vec!["next".to_owned()],
+        o: toolkit_odata::SortDir::Asc,
+        s: "+node_key".to_owned(),
+        f: None,
+        d: "fwd".to_owned(),
+    }
+    .encode()
+    .unwrap();
+    *scripted.next_cursor.lock().unwrap() = Some(cursor.clone());
+    let directory = GraphProfileDirectory::new(Arc::clone(&scripted) as _);
+
+    let page = directory.subjects(&profiles.ctx, None).await.unwrap();
+    directory
+        .subjects(&profiles.ctx, page.next.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        page.subjects,
+        [profiles.subject],
+        "the bad roots are left out"
+    );
+    assert_eq!(page.next.as_deref(), Some(cursor.as_str()));
+    let asked: Vec<Option<String>> = scripted
+        .listings
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|query| query.cursor.as_ref().map(|cursor| cursor.encode().unwrap()))
+        .collect();
+    assert_eq!(
+        asked,
+        [None, Some(cursor)],
+        "the next page starts at the cursor"
+    );
+    assert!(logs_contain("has no payload"));
+    assert!(logs_contain("is not the root of subject"));
 }

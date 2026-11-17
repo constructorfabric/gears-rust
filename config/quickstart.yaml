@@ -219,6 +219,10 @@ gears:
       profiles:
         quota-enforcement:
           cache: { provider: standalone }
+        # Construct's deletion job elects its leader in this profile; a host
+        # without it runs no job and says so.
+        construct:
+          cache: { provider: standalone }
 
   quota-enforcement-storage-plugin:
     database:

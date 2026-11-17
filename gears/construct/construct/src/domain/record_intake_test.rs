@@ -66,6 +66,35 @@ async fn a_valid_record_is_received_handed_off_and_its_identity_kept() {
     assert_eq!(stored_record_ids(&db).await, 1);
 }
 
+/// A taken record carries its subject's profile generation, so processing
+/// can drop it once an erasure moved the generation on.
+#[tokio::test]
+async fn a_taken_record_carries_its_subjects_generation() {
+    let db = inmem_db().await;
+    let fixture = IntakeFixture::default();
+    fixture.generations.erase();
+    fixture.generations.erase();
+    let intake = fixture.build(&db);
+
+    intake
+        .submit(
+            &connector(),
+            Uuid::new_v4(),
+            chat_record(Uuid::new_v4(), "chat/t/1", "v1"),
+        )
+        .await
+        .expect("submit");
+
+    let received = fixture.received();
+    assert_eq!(
+        received
+            .iter()
+            .map(|record| record.generation)
+            .collect::<Vec<_>>(),
+        [2]
+    );
+}
+
 #[tokio::test]
 async fn the_same_identity_again_is_a_repeat_and_changes_nothing() {
     let db = inmem_db().await;
@@ -562,6 +591,8 @@ async fn a_hand_off_that_refuses_leaves_no_identity_so_the_record_can_be_sent_ag
                 [],
             )),
             hand_off: Arc::new(RefusingHandOff),
+            retention: crate::test_support::no_retention(),
+            generations: crate::test_support::no_erasure(),
         },
         authz_resolver_sdk::PolicyEnforcer::new(Arc::new(crate::test_support::AllowResolver)),
     );
@@ -624,6 +655,7 @@ fn every_refusal_reason_has_its_wire_code() {
         (RefusalReason::ConnectorOff, "CONNECTOR_OFF"),
         (RefusalReason::PersonalizationOff, "PERSONALIZATION_OFF"),
         (RefusalReason::ErasureInProgress, "ERASURE_IN_PROGRESS"),
+        (RefusalReason::PastRetention, "PAST_RETENTION"),
     ];
     for (reason, code) in expected {
         assert_eq!(reason.code(), code, "{reason:?}");
@@ -726,4 +758,290 @@ async fn a_record_that_breaks_its_types_rules_beyond_the_schema_is_refused() {
     );
     assert!(fixture.received().is_empty());
     assert_eq!(stored_record_ids(&db).await, 0);
+}
+
+#[tokio::test]
+async fn a_record_not_taken_within_the_receive_window_is_unavailable_and_keeps_nothing() {
+    let db = inmem_db().await;
+    // On the real clock: a paused one can jump past the pool's timeouts while
+    // the database works on its own thread, and the pool's next in-memory
+    // connection is an empty database.
+    let fixture = IntakeFixture {
+        tenant_default_delay: WINDOW + Duration::from_secs(1),
+        ..IntakeFixture::default()
+    };
+    let intake = fixture.build(&db).with_receive_window(WINDOW);
+
+    let err = intake
+        .submit(
+            &crate::test_support::context_in(Uuid::new_v4()),
+            Uuid::new_v4(),
+            chat_record(Uuid::new_v4(), "chat/t/1", "v1"),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, DomainError::Unavailable(_)), "{err:?}");
+    assert_eq!(stored_record_ids(&db).await, 0, "no identity is kept");
+    assert!(fixture.received().is_empty(), "nothing is handed off");
+}
+
+/// The identity store, with each insert taking `takes` after its row is
+/// written, so only a rollback leaves nothing. `inserts` counts the inserts
+/// that started.
+struct SlowIds {
+    takes: Duration,
+    inserts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl crate::domain::record_intake::RecordIdRepository for SlowIds {
+    async fn insert<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &toolkit_security::AccessScope,
+        id: crate::domain::record_intake::RecordId,
+    ) -> Result<crate::domain::record_intake::IdInsert, DomainError> {
+        self.inserts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let inserted = crate::infra::storage::record_ids_repo::SeaOrmRecordIdRepository::new()
+            .insert(conn, scope, id)
+            .await;
+        tokio::time::sleep(self.takes).await;
+        inserted
+    }
+}
+
+type SlowIntake = crate::domain::record_intake::RecordIntakeService<
+    SlowIds,
+    crate::infra::storage::subject_settings_repo::SeaOrmSubjectSettingsRepository,
+>;
+
+/// Intake whose tenant default takes `check` to read and whose identity
+/// insert takes `insert`, handing records to `hand_off` and counting the
+/// inserts that started in `inserts`.
+fn slow_intake(
+    db: &toolkit_db::Db,
+    hand_off: &Arc<crate::test_support::RecordingHandOff>,
+    inserts: &Arc<std::sync::atomic::AtomicUsize>,
+    check: Duration,
+    insert: Duration,
+) -> SlowIntake {
+    use crate::domain::record_intake::{IntakePorts, RecordIntakeService};
+    use crate::domain::subject_settings::SubjectSettingsService;
+    use crate::infra::connector_switch::ConfigConnectorSwitch;
+    use crate::infra::record_types::RegistryRecordTypes;
+    use crate::infra::storage::subject_settings_repo::SeaOrmSubjectSettingsRepository;
+
+    let provider = Arc::new(toolkit_db::DBProvider::new(db.clone()));
+    let enforcer =
+        authz_resolver_sdk::PolicyEnforcer::new(Arc::new(crate::test_support::AllowResolver));
+    RecordIntakeService::new(
+        Arc::clone(&provider),
+        Arc::new(SlowIds {
+            takes: insert,
+            inserts: Arc::clone(inserts),
+        }),
+        Arc::new(SubjectSettingsService::new(
+            provider,
+            Arc::new(SeaOrmSubjectSettingsRepository::new()),
+            Arc::new(crate::test_support::DelayedDefaults(true, check)),
+            enforcer.clone(),
+        )),
+        IntakePorts {
+            types: Arc::new(
+                RegistryRecordTypes::new(crate::test_support::hub_with_record_types()).unwrap(),
+            ),
+            switch: Arc::new(ConfigConnectorSwitch::new(Vec::new())),
+            hand_off: Arc::clone(hand_off) as _,
+            retention: crate::test_support::no_retention(),
+            generations: crate::test_support::no_erasure(),
+        },
+        enforcer,
+    )
+    .with_receive_window(WINDOW)
+}
+
+/// The receive window of [`slow_intake`]: short enough to run on the real
+/// clock. Each test's phases either overrun it whatever the database takes
+/// or leave it at least four fifths of it, so the database's own time does
+/// not decide a test.
+const WINDOW: Duration = Duration::from_secs(3);
+
+/// Submit one record on the real clock. A paused clock would jump to the
+/// receive window's deadline while the database works on its own thread,
+/// before the phase under test began.
+async fn submit_once(intake: &SlowIntake) -> Result<IntakeOutcome, DomainError> {
+    intake
+        .submit(
+            &crate::test_support::context_in(Uuid::new_v4()),
+            Uuid::new_v4(),
+            chat_record(Uuid::new_v4(), "chat/t/1", "v1"),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn an_identity_insert_past_the_receive_window_is_rolled_back_before_the_hand_off() {
+    let db = inmem_db().await;
+    let hand_off = Arc::new(crate::test_support::RecordingHandOff::default());
+    let inserts = Arc::default();
+    let intake = slow_intake(
+        &db,
+        &hand_off,
+        &inserts,
+        Duration::ZERO,
+        WINDOW + Duration::from_secs(1),
+    );
+
+    let err = submit_once(&intake).await.unwrap_err();
+
+    assert!(matches!(err, DomainError::Unavailable(_)), "{err:?}");
+    assert_eq!(
+        inserts.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the identity was written before the window ran out"
+    );
+    assert_eq!(
+        stored_record_ids(&db).await,
+        0,
+        "the written identity is rolled back"
+    );
+    assert!(
+        hand_off.received.lock().unwrap().is_empty(),
+        "nothing is handed off"
+    );
+}
+
+#[tokio::test]
+async fn the_check_and_the_insert_share_one_receive_window() {
+    // The insert alone fits in the window, but not after the check, whatever
+    // the database takes, as its time only adds. The check leaves four
+    // fifths of the window to the database to start the insert in time.
+    let (check, insert) = (WINDOW / 5, WINDOW * 9 / 10);
+    let db = inmem_db().await;
+    let hand_off = Arc::new(crate::test_support::RecordingHandOff::default());
+    let inserts = Arc::default();
+    let intake = slow_intake(&db, &hand_off, &inserts, check, insert);
+
+    let err = submit_once(&intake).await.unwrap_err();
+
+    assert!(matches!(err, DomainError::Unavailable(_)), "{err:?}");
+    assert_eq!(
+        inserts.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the check ended in time and the insert ran out of what it left"
+    );
+    assert_eq!(stored_record_ids(&db).await, 0, "nothing is kept");
+    assert!(hand_off.received.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_check_and_an_insert_that_fit_in_the_receive_window_together_take_the_record() {
+    // Slow phases that leave four fifths of the window to the database.
+    let half = WINDOW / 10;
+    let db = inmem_db().await;
+    let hand_off = Arc::new(crate::test_support::RecordingHandOff::default());
+    let inserts = Arc::default();
+    let intake = slow_intake(&db, &hand_off, &inserts, half, half);
+
+    let taken = submit_once(&intake).await.unwrap();
+
+    assert_eq!(taken, IntakeOutcome::Received);
+    assert_eq!(stored_record_ids(&db).await, 1);
+    assert_eq!(hand_off.received.lock().unwrap().len(), 1);
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_record_taken_after_its_receive_window_is_named_in_a_warning_and_a_late_repeat_is_not() {
+    use crate::domain::record_intake::{IdentityParts, RecordKey, warn_if_committed_late};
+
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+    let key = RecordKey::of(IdentityParts {
+        connector: "connector",
+        provenance: "chat/t/1",
+        version: "v1",
+    });
+    let now = tokio::time::Instant::now();
+    let (passed, ahead) = (now - Duration::from_secs(1), now + Duration::from_secs(60));
+
+    warn_if_committed_late(
+        passed,
+        &Ok(IntakeOutcome::Repeat),
+        tenant,
+        Some(subject),
+        &key,
+    );
+    warn_if_committed_late(
+        ahead,
+        &Ok(IntakeOutcome::Received),
+        tenant,
+        Some(subject),
+        &key,
+    );
+    assert!(
+        !logs_contain("committed after its receive window"),
+        "a repeat stored nothing, and a commit in time is not late"
+    );
+
+    warn_if_committed_late(
+        passed,
+        &Ok(IntakeOutcome::Received),
+        tenant,
+        Some(subject),
+        &key,
+    );
+    assert!(logs_contain("committed after its receive window"));
+    assert!(logs_contain(&subject.to_string()));
+    assert!(logs_contain(key.as_str()));
+    assert!(logs_contain("late_ms="));
+}
+
+#[tokio::test]
+async fn a_record_observed_before_the_tenants_retention_period_is_refused_and_one_within_it_taken()
+{
+    let db = inmem_db().await;
+    let tenant = Uuid::new_v4();
+    let intake = IntakeFixture {
+        retention: crate::config::RetentionConfig {
+            default_days: None,
+            tenants: [(tenant, std::num::NonZeroU32::new(30).unwrap())].into(),
+        },
+        ..IntakeFixture::default()
+    }
+    .build(&db);
+    let subject = Uuid::new_v4();
+    let observed = |days: i64| {
+        json!(
+            (time::OffsetDateTime::now_utc() - time::Duration::days(days))
+                .format(&Rfc3339)
+                .unwrap()
+        )
+    };
+
+    let mut old = chat_record(subject, "chat/t/1", "v1");
+    old["observed_at"] = observed(31);
+    let result = intake.submit(&connector(), tenant, old.clone()).await;
+    assert_eq!(refusal_reason(&result), Some(RefusalReason::PastRetention));
+    let Err(DomainError::Refused(refusal)) = result else {
+        unreachable!("refused above");
+    };
+    assert_eq!(refusal.place, Place::pointer("/observed_at"));
+    assert_eq!(stored_record_ids(&db).await, 0, "nothing is kept");
+
+    let mut recent = chat_record(subject, "chat/t/2", "v1");
+    recent["observed_at"] = observed(29);
+    assert_eq!(
+        intake.submit(&connector(), tenant, recent).await.unwrap(),
+        IntakeOutcome::Received
+    );
+    assert_eq!(
+        intake
+            .submit(&connector(), Uuid::new_v4(), old)
+            .await
+            .unwrap(),
+        IntakeOutcome::Received,
+        "a tenant without a period keeps everything"
+    );
 }

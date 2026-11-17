@@ -287,6 +287,11 @@ gears:
         oagw:
           cache:
             provider: standalone
+        # Construct's deletion job elects its leader in this profile; a host
+        # without it runs no job and says so.
+        construct:
+          cache:
+            provider: standalone
 
   users-info:
     # Gear-specific database configuration

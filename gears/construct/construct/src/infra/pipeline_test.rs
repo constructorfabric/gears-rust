@@ -98,6 +98,7 @@ async fn a_record_is_planned_checked_admitted_written_read_back_and_deleted_by_i
         fake_graph_storage(),
         Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
         Arc::new(crate::test_support::MemoryReviews::default()),
+        crate::test_support::deletion_tables(&db),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
     )
     .expect("the pipeline assembles");
@@ -211,6 +212,7 @@ async fn manage_facts_gets_the_manage_budget() {
         fake_graph_storage(),
         Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
         Arc::new(crate::test_support::MemoryReviews::default()),
+        crate::test_support::deletion_tables(&db),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
     )
     .expect("the pipeline assembles");
@@ -253,6 +255,7 @@ async fn a_record_whose_processing_panics_is_dropped_and_the_worker_goes_on() {
         fake_graph_storage(),
         Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
         Arc::new(crate::test_support::MemoryReviews::default()),
+        crate::test_support::deletion_tables(&db),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
     )
     .expect("the pipeline assembles");
@@ -325,6 +328,7 @@ async fn without_a_model_records_are_dropped_with_an_event_and_no_worker_runs() 
         fake_graph_storage(),
         Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
         Arc::new(crate::test_support::MemoryReviews::default()),
+        crate::test_support::deletion_tables(&db),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
     )
     .unwrap();
@@ -363,6 +367,7 @@ async fn without_a_processing_identity_the_profile_read_is_not_configured() {
         fake_graph_storage(),
         Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
         Arc::new(crate::test_support::MemoryReviews::default()),
+        crate::test_support::deletion_tables(&db),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
     )
     .unwrap();
@@ -433,6 +438,7 @@ async fn the_configured_category_check_reaches_the_profile_read() {
             fake_graph_storage(),
             Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
             Arc::new(crate::test_support::MemoryReviews::default()),
+            crate::test_support::deletion_tables(&db),
             PolicyEnforcer::new(Arc::clone(&asked) as Arc<dyn AuthZResolverApi>),
         )
         .unwrap();
@@ -462,6 +468,7 @@ async fn without_a_processing_identity_even_an_empty_profile_is_not_configured()
         // Personalization off by default: the read would serve nothing.
         Arc::new(settings_service(&db, Arc::new(AllowResolver), false)),
         Arc::new(crate::test_support::MemoryReviews::default()),
+        crate::test_support::deletion_tables(&db),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
     )
     .unwrap();
@@ -498,6 +505,7 @@ async fn without_the_opt_in_to_run_unchecked_no_worker_runs_and_it_warns() {
         fake_graph_storage(),
         Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
         Arc::new(crate::test_support::MemoryReviews::default()),
+        crate::test_support::deletion_tables(&db),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
     )
     .unwrap();
@@ -533,6 +541,7 @@ async fn without_a_model_the_subject_still_deletes_its_facts() {
         Arc::clone(&graph),
         Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
         Arc::new(crate::test_support::MemoryReviews::default()),
+        crate::test_support::deletion_tables(&db),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
     )
     .unwrap();
@@ -556,6 +565,8 @@ async fn without_a_model_the_subject_still_deletes_its_facts() {
         types: Arc::new(GraphTypes::new(Arc::clone(&graph))),
         version: Arc::new(PayloadCounter),
         removal: Arc::new(SoftDelete::new(Arc::clone(&graph))),
+        generations: Arc::new(crate::infra::storage::graph::root::FirstGeneration),
+        tenants: Arc::new(crate::test_support::MemoryDeletionStore::default()),
     });
     assert_eq!(
         writer.write(&construct, &plan).await.unwrap(),
@@ -629,6 +640,7 @@ async fn a_correction_needs_the_opt_in_to_store_values_unchecked() {
                 fake_graph_storage(),
                 Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
                 reviews,
+                crate::test_support::deletion_tables(&db),
                 PolicyEnforcer::new(Arc::new(AllowResolver)),
             )
             .unwrap();
@@ -685,6 +697,7 @@ async fn an_administrators_add_needs_the_opt_in_to_store_values_unchecked() {
                 fake_graph_storage(),
                 Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
                 Arc::new(crate::test_support::MemoryReviews::default()),
+                crate::test_support::deletion_tables(&db),
                 PolicyEnforcer::new(Arc::new(AllowResolver)),
             )
             .unwrap();
@@ -711,4 +724,177 @@ async fn an_administrators_add_needs_the_opt_in_to_store_values_unchecked() {
         !matches!(with, Err(DomainError::NotConfigured(_))),
         "with the opt-in the add runs: {with:?}"
     );
+}
+
+/// The model adds one skill and completes the plan, for each of two records.
+fn adds_a_skill_twice() -> Arc<Scripted> {
+    let once = adds_a_skill();
+    let answers: Vec<ModelResponse> = once.0.lock().unwrap().iter().cloned().collect();
+    Arc::new(Scripted(Mutex::new(
+        answers.iter().chain(answers.iter()).cloned().collect(),
+    )))
+}
+
+#[tokio::test]
+async fn an_erased_subject_is_served_nothing_at_once_keeps_only_its_setting_and_later_starts_anew()
+{
+    use crate::domain::deletion::DeletionStore;
+    use crate::domain::subject_settings::{SubjectKey, SubjectSettings};
+
+    let db = inmem_db().await;
+    let cfg = ConstructConfig {
+        processing_identity: Some(Uuid::new_v4()),
+        processing: unchecked_processing(),
+        profile_category_check: Some(CategoryCheckConfig::OneCall),
+        ..ConstructConfig::default()
+    }
+    .validated()
+    .unwrap();
+    let settings = Arc::new(settings_service(&db, Arc::new(AllowResolver), true));
+    let graph = fake_graph_storage();
+    let pipeline = assemble(
+        &cfg,
+        Some(adds_a_skill_twice()),
+        Arc::clone(&graph),
+        Arc::clone(&settings) as _,
+        Arc::new(crate::test_support::MemoryReviews::default()),
+        crate::test_support::deletion_tables(&db),
+        PolicyEnforcer::new(Arc::new(AllowResolver)),
+    )
+    .expect("the pipeline assembles");
+    let worker = pipeline.worker.expect("processing is wired");
+    let intake = IntakeFixture {
+        hand_off_to: Some(Arc::clone(&pipeline.hand_off)),
+        generations_from: Some(Arc::clone(&pipeline.generations)),
+        ..IntakeFixture::default()
+    }
+    .build(&db);
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+    let key = SubjectKey {
+        tenant_id: tenant,
+        subject_id: subject,
+    };
+    let (connector, reader, owner) = (
+        in_tenant(Uuid::new_v4()),
+        in_tenant(tenant),
+        crate::test_support::context_of(subject, tenant),
+    );
+    let cancel = CancellationToken::new();
+    let running = tokio::spawn(worker.run(cancel.clone()));
+    let served = |provenance: &'static str| {
+        let (intake, connector, reader, profile) =
+            (&intake, &connector, &reader, &pipeline.profile);
+        async move {
+            let outcome = intake
+                .submit(connector, tenant, chat_record(subject, provenance, "v1"))
+                .await
+                .expect("intake answers");
+            assert_eq!(outcome, IntakeOutcome::Received);
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let view = profile.read(reader, None, subject).await.unwrap();
+                    if !view.categories.is_empty() {
+                        return view;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the record is processed")
+        }
+    };
+    served("chat/t/1").await;
+    let before = pipeline
+        .subject_control
+        .view(&owner, subject, &toolkit_odata::ODataQuery::new())
+        .await
+        .unwrap();
+    let old_facts: Vec<String> = before
+        .page
+        .items
+        .iter()
+        .map(|item| item.fact.node_key.0.clone())
+        .collect();
+    assert_eq!(old_facts.len(), 1, "{before:?}");
+    let first_root = crate::infra::storage::graph::root::generation_root(&key, 0);
+    assert!(
+        graph.get_node(&reader, &first_root.0, None).await.is_ok(),
+        "the first profile has its root"
+    );
+
+    // The subject asked an hour ago, and that run stopped; it asks again.
+    crate::test_support::deletion_tables(&db)
+        .mark(
+            &toolkit_security::AccessScope::for_tenant(tenant),
+            key,
+            OffsetDateTime::now_utc() - time::Duration::hours(1),
+        )
+        .await
+        .unwrap();
+    let marked = pipeline.erasure.request(&owner, subject).await.unwrap();
+    assert_eq!(
+        marked,
+        SubjectSettings {
+            personalization_enabled: false,
+            erasure_in_progress: true,
+        }
+    );
+    let at_once = pipeline.profile.read(&reader, None, subject).await.unwrap();
+    assert!(at_once.categories.is_empty(), "nothing is served at once");
+    let refused = intake
+        .submit(&connector, tenant, chat_record(subject, "chat/t/2", "v1"))
+        .await;
+    let Err(crate::domain::error::DomainError::Refused(refusal)) = refused else {
+        panic!("a record is refused meanwhile: {refused:?}");
+    };
+    assert_eq!(
+        refusal.reason,
+        crate::domain::refusal::RefusalReason::ErasureInProgress
+    );
+
+    // The leader's job runs the stopped erasure to its end.
+    pipeline.deletion_job.run_once().await;
+    let own = pipeline
+        .subject_control
+        .view(&owner, subject, &toolkit_odata::ODataQuery::new())
+        .await
+        .unwrap();
+    assert!(own.page.items.is_empty(), "no fact is left: {own:?}");
+    assert_eq!(own.version, None, "nor a profile root");
+    // The view reads the new generation; graph storage shows the old one is
+    // gone too.
+    for node_key in old_facts.iter().chain([&first_root.0]) {
+        let gone = graph.get_node(&reader, node_key, None).await;
+        assert!(
+            matches!(gone, Err(CanonicalError::NotFound { .. })),
+            "{node_key} is removed from graph storage: {gone:?}"
+        );
+    }
+    assert_eq!(
+        settings.owner_settings(&owner, subject).await.unwrap(),
+        SubjectSettings {
+            personalization_enabled: false,
+            erasure_in_progress: false,
+        },
+        "only the setting, off, is kept"
+    );
+    assert_eq!(
+        crate::test_support::stored_record_ids(&db).await,
+        0,
+        "no record identity is left"
+    );
+
+    // The subject turns personalization on again; a new record starts a new
+    // profile, under a root of its own.
+    settings
+        .set_personalization(&owner, subject, true)
+        .await
+        .unwrap();
+    let anew = served("chat/t/3").await;
+    let [skills] = anew.categories.as_slice() else {
+        panic!("one category, got {anew:?}");
+    };
+    assert_eq!(skills.facts.len(), 1);
+    cancel.cancel();
+    running.await.unwrap();
 }

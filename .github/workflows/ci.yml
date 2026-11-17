@@ -503,6 +503,14 @@ jobs:
           CREDSTORE_PG_REQUIRE_DOCKER: "1"
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=credstore-pg
 
+      - name: Test construct (pg erasure storage, integration)
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
+        # Same shape as credstore above: Docker is on this runner, so a skip
+        # here would be a broken daemon passing green.
+        env:
+          CONSTRUCT_PG_REQUIRE_DOCKER: "1"
+        run: tools/scripts/with_rust_annotations.sh make test-integration LANE=construct-pg
+
       - name: Test github-mirror (PostgreSQL and MariaDB, integration)
         if: >-
           needs.changes.result != 'success'

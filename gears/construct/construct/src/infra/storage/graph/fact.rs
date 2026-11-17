@@ -67,10 +67,11 @@ fn origin(plan: &Plan, step: &Step, now: OffsetDateTime) -> Result<Value, Domain
         Origin::Administrator { administrator } => {
             (administrator.to_string(), METHOD_ADMIN, None, now)
         }
-        // A subject's plan only removes facts, so it never stores one.
-        Origin::Subject { .. } => {
+        // A subject's plan and retention's only remove facts, so they never
+        // store one.
+        Origin::Subject { .. } | Origin::Retention => {
             return Err(DomainError::internal(
-                "a subject's own plan stores no fact; it only removes",
+                "a subject's own plan or retention's stores no fact; it only removes",
             ));
         }
     };

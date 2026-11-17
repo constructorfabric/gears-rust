@@ -147,6 +147,7 @@ fn received(case: &Case) -> ReceivedRecord {
             "subject_id": SUBJECT,
             "payload": payload,
         }),
+        generation: 0,
     }
 }
 

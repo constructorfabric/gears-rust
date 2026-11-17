@@ -32,17 +32,30 @@ pub const WRITE_BUDGET: Duration = Duration::from_secs(20);
 /// their sum.
 pub const WRITER_LIMIT: Duration = Duration::from_secs(90);
 
+/// How long graph storage may still run a statement whose call the writer
+/// gave up on.
+pub const IN_FLIGHT: Duration = Duration::from_secs(30);
+
+/// The longest a write can still land after the check that let it start:
+/// the budget before the write, the longest the writer is awaited, and a
+/// statement graph storage still runs after that. Processing awaits its
+/// writer for at most [`WRITER_LIMIT`] too, so this bounds every write.
+pub const WRITE_LANDED: Duration =
+    Duration::from_secs(WRITE_BUDGET.as_secs() + WRITER_LIMIT.as_secs() + IN_FLIGHT.as_secs());
+
 /// How long a read after a failed write may take, to see whether the write
 /// landed.
 const LANDED_CHECK: Duration = Duration::from_secs(5);
 
 /// A subject's live facts, and the version of its profile they belong to;
-/// none for a subject without a profile.
+/// none for a subject without a profile. `generation` is the profile
+/// generation the read was in.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubjectFacts {
     pub version: Option<u64>,
     pub facts: Vec<StoredFact>,
+    pub generation: u64,
 }
 
 /// Reads a subject's live facts with its profile's version, as Construct.
@@ -315,18 +328,32 @@ impl ProfileWrites {
 /// written against `version`. The subject's own delete is the only plan with
 /// the subject as origin, and it stores nothing.
 fn removal(key: SubjectKey, version: Option<u64>, fact: &StoredFact, origin: Origin) -> Plan {
+    removals(key, version, std::slice::from_ref(fact), origin)
+}
+
+/// The delete of `facts` as one plan, a step that removes each, as `origin`,
+/// written against `version`.
+pub(crate) fn removals(
+    key: SubjectKey,
+    version: Option<u64>,
+    facts: &[StoredFact],
+    origin: Origin,
+) -> Plan {
     Plan {
         tenant_id: key.tenant_id,
         subject_id: key.subject_id,
         origin,
         profile_version: version,
-        steps: vec![Step {
-            entity_kind: fact.category.name().to_owned(),
-            change: Change::RemoveEntity {
-                entity: fact.node_key.clone(),
-            },
-            confidence: None,
-        }],
+        steps: facts
+            .iter()
+            .map(|fact| Step {
+                entity_kind: fact.category.name().to_owned(),
+                change: Change::RemoveEntity {
+                    entity: fact.node_key.clone(),
+                },
+                confidence: None,
+            })
+            .collect(),
     }
 }
 

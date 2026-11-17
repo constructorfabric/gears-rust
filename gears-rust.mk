@@ -512,7 +512,7 @@ test-eb-kafka: install-tools
 
 TOOLKIT_DB_LANES := toolkit-db-sqlite toolkit-db-pg toolkit-db-pgq toolkit-db-mysql
 INTEGRATION_LANES := $(TOOLKIT_DB_LANES) users-info-pg usage-collector-pg usage-collector-ch \
-	types-registry-db oagw-db oagw-cluster cluster-pg cluster-redis rg-pg settings-service-pg credstore-pg \
+	types-registry-db oagw-db oagw-cluster cluster-pg cluster-redis rg-pg settings-service-pg credstore-pg construct-pg \
 	pricing-pg coord-pg products-pg ledger-pg orders-pg eb-gear-db quota-enforcement-pg
 
 ## toolkit-db on SQLite; the examples must still build after the tests.
@@ -632,6 +632,15 @@ lane_args_settings-service-pg = -p cf-gears-settings-service --features integrat
 ## otherwise the test skips silently.
 lane_args_credstore-pg = -p cf-gears-credstore-v2 --features integration --test pg_migrations_test
 lane_env_credstore-pg = CREDSTORE_PG_REQUIRE_DOCKER=1
+
+## Construct's erasure storage on PostgreSQL (Docker required; spins up its own
+## postgres container via testcontainers -- see
+## gears/construct/construct/tests/pg_erasure_test.rs): the `m006` migration,
+## whose column and index look-ups differ by backend, and the erasure's mark,
+## which `finish` matches by a timestamp PostgreSQL keeps to the microsecond.
+## CONSTRUCT_PG_REQUIRE_DOCKER=1 turns an unreachable Docker into a failure.
+lane_args_construct-pg = -p cf-gears-construct --features integration --test pg_erasure_test
+lane_env_construct-pg = CONSTRUCT_PG_REQUIRE_DOCKER=1
 
 ## bss-pricing's Postgres tier (Docker required; each suite spins up its own
 ## postgres container via testcontainers).

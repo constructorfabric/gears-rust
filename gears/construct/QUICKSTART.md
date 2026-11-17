@@ -19,7 +19,9 @@ Record intake for connectors and the profile read for applications and agents. A
 - `POST` and `GET /construct/v1/subjects/{subject_id}/review-requests`: the subject flags one of its facts as incorrect (`{fact_id, comment}`) and lists its requests; a fact under an open request is not served to applications and agents, and no record or agent changes it
 - `GET /construct/v1/admin/review-requests` and `POST …/admin/review-requests/{request_id}/resolution`: a reviewer lists the tenant's open requests and resolves one as `rejected` (with a `reason`), `deleted`, or `corrected` (with `property` and `value`); a correction needs `processing.run_without_sensitive_data_checks`, like record processing
 - `GET` and `POST /construct/v1/admin/subjects/{subject_id}/facts`, `PUT` and `DELETE …/facts/{fact_id}`: a tenant administrator reads a subject's facts and adds (`{property, value}`), edits (`{property, value}`, the fact's own property) or deletes one; an edit or a delete of a fact under review closes its request; an add and an edit need `processing.run_without_sensitive_data_checks`, like a correction
-- Construct declares its permissions as GTS permission instances: send records, read profiles, manage facts, read or change one's own personalization settings, read, delete or flag one's own facts, resolve review requests, and export a subject's data. The tenant grants each in its policy engine
+- `POST /construct/v1/subjects/{subject_id}/erasure`: the subject erases everything Construct holds about it; `202` with personalization off and `erasure_in_progress`, which `GET …/settings` shows false once the erasure is done. Graph storage keeps tombstones until it ships a hard delete
+- Facts, review requests and record identities older than a tenant's retention period (`retention`, default: kept until deleted) are not served and are removed by a job on the cluster leader
+- Construct declares its permissions as GTS permission instances: send records, read profiles, manage facts, read or change one's own personalization settings, read, delete or flag one's own facts, erase one's own data, resolve review requests, and export a subject's data. The tenant grants each in its policy engine
 
 Full API documentation: <http://127.0.0.1:8087/cf/docs>
 
@@ -77,11 +79,19 @@ gears:
         # trusted_connectors: [...]  # connector identities as UUIDs; absent: every connector is trusted
         # entity_kinds: [...]        # absent: every entity kind is allowed
       profile_category_check: per_category   # required with processing_identity; one_call only for a policy plugin that answers with category constraints
+      retention: {}                  # all optional; empty: data is kept until it is deleted
+        # default_days: 365          # the retention period of every tenant not listed
+        # tenants: { "<tenant id>": 30 }  # a tenant's own period, in days
+      deletion:                      # all optional
+        job_interval_secs: 300       # how often the cluster leader runs the marked erasures
+        retention_interval_secs: 3600  # how often the cluster leader removes what is past the retention periods
 ```
+
+Erasures that stopped, and retention, run on the cluster leader, elected through the platform cluster gear with the cluster profile `construct` (linearizable). `config/quickstart.yaml` and `config/e2e-local.yaml` bind it with the standalone provider. A deployment without that profile runs neither and says so in a warning, and resolves no election, so the host's readiness does not wait for the profile; an erasure is still marked at once, so the profile read serves nothing about the subject, but one that stopped is not finished.
 
 The model is called through OAGW, so a server with a `model` needs OAGW too: in the example server, add `oagw` to the features: `make run GEAR=construct GEAR_SERVER_EXTRA_FEATURES_construct=oagw`. Without it every model call fails as unavailable (`no OAGW client in ClientHub`), and no record is processed.
 
-An unknown key, a value in `connectors_off`, `processing_identity` or `trusted_connectors` that is not a UUID, a zero queue capacity, worker count, model round count or token count in `processing` (zero reruns is allowed), a queue capacity above 100000, more than 256 workers, more than 10 reruns, more than 64 model rounds, more than 1000000 tokens per record, a model call timeout under 1 second or above 600 seconds, the nil UUID as `processing_identity`, a processing identity without `profile_category_check` or `profile_category_check` without a processing identity, an entity kind that is not one of identity, role, skill or preference, a confidence floor outside 0 to 1, a step cap outside 1 to 10000, a value cap outside 1 to 100000, a model upstream alias that is not 1 to 63 letters, digits, `-` or `_`, starting with a letter or digit, or a model name that is not 1 to 128 printable characters with no space, stops the gear from starting. The processing identity needs graph storage's read, write, delete and type registration permissions, and the settings read, in every tenant.
+An unknown key, a value in `connectors_off`, `processing_identity` or `trusted_connectors` that is not a UUID, a zero queue capacity, worker count, model round count or token count in `processing` (zero reruns is allowed), a queue capacity above 100000, more than 256 workers, more than 10 reruns, more than 64 model rounds, more than 1000000 tokens per record, a model call timeout under 1 second or above 600 seconds, the nil UUID as `processing_identity`, a processing identity without `profile_category_check` or `profile_category_check` without a processing identity, an entity kind that is not one of identity, role, skill or preference, a confidence floor outside 0 to 1, a step cap outside 1 to 10000, a value cap outside 1 to 100000, a model upstream alias that is not 1 to 63 letters, digits, `-` or `_`, starting with a letter or digit, a model name that is not 1 to 128 printable characters with no space, a retention period outside 1 to 36500 days, a tenant in `retention.tenants` that is not a UUID, or a job or retention interval outside 10 to 86400 seconds stops the gear from starting. The processing identity needs graph storage's read, write, delete and type registration permissions, and the settings read, in every tenant.
 
 ## Examples
 
@@ -124,6 +134,7 @@ All errors are `application/problem+json`. A refused record is `422`; its field 
 | The record carries an `id` | `422`, reason `ID_IN_PUSH` |
 | The connector is listed in `connectors_off` | `422`, reason `CONNECTOR_OFF` |
 | Personalization is off, or an erasure is under way, for the subject | `422`, reason `PERSONALIZATION_OFF` or `ERASURE_IN_PROGRESS` |
+| The record was observed before the tenant's retention period began | `422`, reason `PAST_RETENTION` |
 | No `tenant` query parameter, or not a UUID | `400`, reason `invalid_query_string` |
 | A body that is not valid JSON | `400` |
 | No `Content-Type: application/json` header | `415` |

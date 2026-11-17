@@ -50,7 +50,7 @@ The subject reads and changes its personalization setting through `GET` and `PUT
 
 - The settings in the subject's view and in the export, which belong to Subject Control.
 - SDK client methods for settings.
-- Marking and clearing the erasure. Erasure owns that; the column exists so that it can.
+- Marking and clearing the erasure. Erasure owns that; the column exists so that it can. Erasure also adds the columns `profile_generation`, `erasure_marked_at` and `erasure_attempted_at` (`cpt-cf-construct-dod-erasure-storage`).
 - Declaring the personalization default in the settings service. Nothing declares Construct's settings there yet, and whether the settings service runs in Construct's host is not decided. Until it does, the config key `personalization_default` (default on) stands in for the tenant setting.
 - Retiring the foundation's placeholder route, client operations and table. Record Intake does that.
 - Refusing records, dropping plans and hiding facts when personalization is off or an erasure is under way. Record Intake, Admission and the Profile Reader do that.

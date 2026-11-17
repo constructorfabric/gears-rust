@@ -75,6 +75,11 @@ fn every_enforced_permission_is_declared_once_on_its_resource_and_action() {
             "resolve",
         ),
         (
+            "cf.construct._.subject_erase.v1",
+            "gts.cf.construct.subject.fact.v1~",
+            "erase",
+        ),
+        (
             "cf.construct._.subject_export.v1",
             "gts.cf.construct.subject.fact.v1~",
             "export",

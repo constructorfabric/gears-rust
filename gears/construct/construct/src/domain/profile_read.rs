@@ -15,6 +15,7 @@ use toolkit_macros::domain_model;
 use toolkit_security::{AccessScope, ScopeConstraint, ScopeValue, SecurityContext, pep_properties};
 use uuid::Uuid;
 
+use super::deletion::{RetentionPeriods, period_start};
 use super::error::DomainError;
 use super::plan::NodeKey;
 use super::planner::processing::ProcessingContexts;
@@ -157,6 +158,11 @@ pub struct ProfileReadPorts {
     pub contexts: Arc<dyn ProcessingContexts>,
     pub events: Arc<dyn ProfileEvents>,
     pub reviews: Arc<dyn FactsUnderReview>,
+    /// The tenants' retention periods: no fact stored before the tenant's
+    /// period began is served, also before the retention job removes it.
+    ///
+    /// @cpt-dod:cpt-cf-construct-dod-retention-hide:p2
+    pub retention: Arc<dyn RetentionPeriods>,
 }
 
 /// @cpt-dod:cpt-cf-construct-dod-profile-reader-read:p1
@@ -391,6 +397,14 @@ impl ProfileReadService {
         }
     }
 
+    /// The same read with other retention periods.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_retention(mut self, retention: Arc<dyn RetentionPeriods>) -> Self {
+        self.ports.retention = retention;
+        self
+    }
+
     /// The tenant a read is about: the one named, or else the caller's own.
     #[must_use]
     pub fn tenant_of(ctx: &SecurityContext, tenant: Option<Uuid>) -> Uuid {
@@ -574,6 +588,11 @@ impl ProfileReadService {
             .into_iter()
             .filter(|fact| !under_review.contains(&fact.node_key));
         // @cpt-end:cpt-cf-construct-algo-review-queue-hide:p1:inst-hide-filter
+        // @cpt-begin:cpt-cf-construct-algo-retention-hide:p2:inst-hide-expired
+        let period = self.ports.retention.period(key.tenant_id).await?;
+        let kept_since = period.and_then(|period| period_start(OffsetDateTime::now_utc(), period));
+        let stored = stored.filter(|fact| kept_since.is_none_or(|since| fact.stored_at >= since));
+        // @cpt-end:cpt-cf-construct-algo-retention-hide:p2:inst-hide-expired
         // @cpt-begin:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-facts
         let mut groups: Vec<CategoryFacts> = Category::ALL
             .into_iter()

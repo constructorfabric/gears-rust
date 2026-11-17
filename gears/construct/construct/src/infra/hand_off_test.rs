@@ -31,6 +31,7 @@ fn received(subject_id: Option<Uuid>) -> ReceivedRecord {
             .unwrap(),
         },
         record: json!({ "payload": { "text": SECRET } }),
+        generation: 0,
     }
 }
 

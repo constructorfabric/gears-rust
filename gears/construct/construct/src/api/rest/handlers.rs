@@ -13,8 +13,8 @@ use crate::api::rest::error::{
     for_reviews, for_settings, no_such_fact, too_long,
 };
 use crate::api::rest::types::{
-    ConcreteAdminFacts, ConcreteIntake, ConcreteProfile, ConcreteReviewQueue, ConcreteSettings,
-    ConcreteSubjectControl,
+    ConcreteAdminFacts, ConcreteErasure, ConcreteIntake, ConcreteProfile, ConcreteReviewQueue,
+    ConcreteSettings, ConcreteSubjectControl,
 };
 use crate::domain::plan::NodeKey;
 use crate::domain::planner::manage::ManageFacts;
@@ -495,4 +495,32 @@ pub async fn admin_delete_fact(
     .instrument(operation_span("admin_facts", "delete", &ctx, subject_id))
     .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// @cpt-dod:cpt-cf-construct-dod-erasure-request:p1
+pub async fn request_erasure(
+    // @cpt-begin:cpt-cf-construct-flow-erasure-request:p1:inst-request-parse
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteErasure>>,
+    Path(subject_id): Path<Uuid>,
+    // @cpt-end:cpt-cf-construct-flow-erasure-request:p1:inst-request-parse
+) -> ApiResult<impl IntoResponse> {
+    let settings = async {
+        svc.request(&ctx, subject_id)
+            .await
+            .map_err(|e| for_facts(e, subject_id))
+    }
+    .instrument(operation_span(
+        "erasure",
+        "request_erasure",
+        &ctx,
+        subject_id,
+    ))
+    .await?;
+    // @cpt-begin:cpt-cf-construct-flow-erasure-request:p1:inst-request-return
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SubjectSettingsDto::new(subject_id, settings)),
+    ))
+    // @cpt-end:cpt-cf-construct-flow-erasure-request:p1:inst-request-return
 }

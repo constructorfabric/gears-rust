@@ -24,9 +24,7 @@ pub use super::one_step::NotStored;
 use super::one_step::{Gone, NewFact, OneStepDone, OneStepPath};
 use super::plan::{NodeKey, Origin};
 use super::profile::Category;
-use super::profile_writes::{
-    ProfileWrites, Removed, SubjectFacts, WRITE_BUDGET, WRITER_LIMIT, WriteError,
-};
+use super::profile_writes::{ProfileWrites, Removed, SubjectFacts, WRITE_LANDED, WriteError};
 use super::subject_access;
 use super::subject_settings::SubjectKey;
 
@@ -60,12 +58,7 @@ pub const MAX_TEXT_CHARS: usize = 1000;
 /// graph storage still runs after that. So a resolution under way is never
 /// taken from its reviewer; a claim left behind by a reviewer that went away
 /// frees itself.
-pub const CLAIM_HOLD: Duration =
-    Duration::from_secs(WRITE_BUDGET.as_secs() + WRITER_LIMIT.as_secs() + IN_FLIGHT.as_secs());
-
-/// How long graph storage may still run a statement whose call the writer
-/// gave up on.
-const IN_FLIGHT: Duration = Duration::from_secs(30);
+pub const CLAIM_HOLD: Duration = WRITE_LANDED;
 
 /// Why a text is not a [`ReviewText`].
 #[domain_model]
