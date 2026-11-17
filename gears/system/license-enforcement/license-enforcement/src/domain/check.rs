@@ -343,7 +343,7 @@ impl<R: GrantRepo> CheckService<R> {
                 Some(f) => f.gts_type == subject.gts_type && f.id == subject.id,
                 None => terms.permissions.may_bind,
             };
-            if fields.holder_tenant_id != request.context.tenant_id
+            if fields.holder_tenant_id != request.tenant_id
                 || !covers(&terms.subject_type, &subject.gts_type)
                 || !bound
             {
@@ -494,7 +494,7 @@ async fn read_snapshot<R: GrantRepo>(
     filters: &[BindingFilter],
     instant: OffsetDateTime,
 ) -> Result<Snapshot, DomainError> {
-    let tenant = request.context.tenant_id;
+    let tenant = request.tenant_id;
     let resource_type = &request.resource.gts_type;
     let resource_id = request.resource.id.as_deref();
     let candidates = store
@@ -656,7 +656,7 @@ async fn fallback<R: GrantRepo>(
     filters: &[BindingFilter],
     instant: OffsetDateTime,
 ) -> Result<Decision, DomainError> {
-    let tenant = request.context.tenant_id;
+    let tenant = request.tenant_id;
     let resource_type = &request.resource.gts_type;
     let resource_id = request.resource.id.as_deref();
     if store

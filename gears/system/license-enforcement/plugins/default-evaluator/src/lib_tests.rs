@@ -16,6 +16,7 @@ const TENANT: &str = "gts.cf.core.lic.subj.v1~cf.core.lic.tenant.v1~";
 
 fn request(subject_type: &str, subject_id: Option<&str>, tenant: Uuid) -> LicenseCheckRequest {
     LicenseCheckRequest::new(
+        tenant,
         Subject {
             gts_type: GtsTypeId::new(subject_type),
             id: subject_id.map(str::to_owned),
@@ -26,10 +27,7 @@ fn request(subject_type: &str, subject_id: Option<&str>, tenant: Uuid) -> Licens
             id: None,
             metadata: serde_json::Map::new(),
         },
-        LicenseCheckContext::builder()
-            .tenant_id(tenant)
-            .build()
-            .unwrap(),
+        LicenseCheckContext::default(),
     )
 }
 

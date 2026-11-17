@@ -29,7 +29,7 @@ impl PrincipalMapper {
 
     /// The Subject contract type for `principal_type`: its own entry, else the
     /// entry of its nearest ancestor. `None` when the principal is not mapped,
-    /// including an absent, malformed or unregistered principal type.
+    /// including an empty (absent), malformed or unregistered principal type.
     ///
     /// # Errors
     ///
@@ -37,11 +37,11 @@ impl PrincipalMapper {
     /// resolved.
     pub async fn subject_type(
         &self,
-        principal_type: Option<&str>,
+        principal_type: &str,
     ) -> Result<Option<GtsTypeId>, DomainError> {
-        let Some(principal_type) = principal_type else {
+        if principal_type.is_empty() {
             return Ok(None);
-        };
+        }
         if let Some(subject_type) = self.subject_types.get(principal_type) {
             return Ok(Some(subject_type.clone()));
         }

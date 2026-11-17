@@ -105,7 +105,7 @@ of its parent.
 | NFR ID | NFR Summary | Allocated To | Design Response | Verification Approach |
 |--------|-------------|--------------|-----------------|-----------------------|
 | `cpt-cf-license-enforcement-nfr-fail-closed` | No fault gives `granted: true`. The module refuses issuance without the PDP. | Check service, grant service, admission, linked plugin | Infrastructure faults are errors (`ServiceUnavailable`), never decisions. The resolver fails closed on errors. Management paths refuse when the PDP, registry, or tenant-resolver cannot answer. A verification failure is a typed denial. | Fault injection on store, registry, PDP, and the linked plugin. Expected: 0 grants, 0 unverified imports. |
-| `cpt-cf-license-enforcement-nfr-tenant-isolation` | A management operation is scoped to the tenant of `SecurityContext`. A check is scoped to the tenant of `request.context`. | Store, management API | Check queries filter on `holder_tenant_id = request.context.tenant`. Management queries run under the PDP `AccessScope` in `SecureConn`. The module takes a holder or a recipient from a payload only after the hierarchy check (`cpt-cf-license-enforcement-constraint-tenant-scope-from-context`). The queries that cross tenants are listed in `cpt-cf-license-enforcement-component-store`: the named grantor query, the chain read of the check, and the tree work of a verb after its grant, pack, or delegation is authorized. | Isolation tests: 0 cross-tenant rows or matches. |
+| `cpt-cf-license-enforcement-nfr-tenant-isolation` | A management operation is scoped to the tenant of `SecurityContext`. A check is scoped to `request.tenant_id`. | Store, management API | Check queries filter on `holder_tenant_id = request.tenant_id`. Management queries run under the PDP `AccessScope` in `SecureConn`. The module takes a holder or a recipient from a payload only after the hierarchy check (`cpt-cf-license-enforcement-constraint-tenant-scope-from-context`). The queries that cross tenants are listed in `cpt-cf-license-enforcement-component-store`: the named grantor query, the chain read of the check, and the tree work of a verb after its grant, pack, or delegation is authorized. | Isolation tests: 0 cross-tenant rows or matches. |
 | `cpt-cf-license-enforcement-nfr-conservation` | At most one binding and one live (not terminated) child per grant under concurrency | Store | Partial unique index on `parent_grant_id` where state is not terminated (I3 in the database). Every mutation locks the row of each grant whose binding changes and reads it again in the same transaction (I2). `version` rejects stale writers. | 100 concurrent mutations per grant. Expected: 0 violations in committed state. |
 | `cpt-cf-license-enforcement-nfr-check-latency` | 40ms p95 at 1 000 checks/s per node, 50 000 grants per tenant | Check service, evaluator, store, linked plugin | Budget below. Indexed reads get the candidates and their roots. `verify` of the linked plugin runs for the selected candidate only and has its own budget line. The only network call is to the store. | Benchmark at 1 000/s against a 50 000-grant tenant, with each shipped plugin. One subject holds 100 terminated or expired grants on the checked resource. Its checks, granted and denied, meet the same p95. |
 | `cpt-cf-license-enforcement-nfr-signature-strength` | Asymmetric, ≥128-bit, strict, closed allow-list that includes at least one FIPS 140-3 approved algorithm | Plugin that verifies signed evidence | Realized by that plugin. | Algorithm-confusion and Wycheproof vectors in that plugin. |
@@ -266,7 +266,7 @@ state. The evaluation of both calls none of these:
 
 - [ ] `p1` - **ID**: `cpt-cf-license-enforcement-constraint-tenant-scope-from-context`
 
-The tenant of a check is `request.context`. The tenant of a management operation is `SecurityContext`. A payload
+The tenant of a check is `request.tenant_id`. The tenant of a management operation is `SecurityContext`. A payload
 carries a tenant id only as a delegation recipient or as the holder of a root. The admission plugin returns the holder
 of each root: for `issue` from the request parameters, for `import` from the evidence. The module accepts a holder only
 when `tenant-resolver` reports it as the tenant of `SecurityContext` or its descendant, and a recipient only as a
@@ -481,7 +481,7 @@ A terminated root stays terminated when new evidence names it again.
 the reported reason comes from the candidate that reached the latest step. Candidate order breaks ties.
 
 1. Candidates: the evaluator gives a candidate filter for the request (§3.3). The check service reads the grants that
-   are not terminated and whose window has not ended in `request.context.tenant` on the requested `resource_type` that
+   are not terminated and whose window has not ended in `request.tenant_id` on the requested `resource_type` that
    match the filter, with their roots. A grant covers the resource when its `resource_id` is null or equals the
    requested id. A whole-type check matches only grants without an id. If there is no candidate, the check service
    selects the reason in this order: `subject_not_bound` if the tenant holds a grant on the resource that is not
@@ -502,7 +502,7 @@ the reported reason comes from the candidate that reached the latest step. Candi
    service calls `verify` of the linked plugin with the id and the evidence of the root. A denial reason denies the
    candidate. A revocation state denies it as
    `suspended` or `terminated`. If `verify` returns root fields and the candidate is the root, the check service checks
-   that their resource covers the request, that their holder is `request.context.tenant`, and that the type of the
+   that their resource covers the request, that their holder is `request.tenant_id`, and that the type of the
    stored binding is their subject type or derives from it → `chain_invalid`. The evaluator evaluates it again on these
    fields. If the root binds a subject, these fields must fix this binding or permit bind → `chain_invalid`. 
    If the candidate is a sub-grant, the check service checks that it is a subset of these fields, that
@@ -524,7 +524,7 @@ selects, and the answer of `verify` decides.
 binding in this order:
 
 1. The binding names the request subject. Its type is the type of the request subject or one of its base types.
-2. The type of the binding is the tenant Subject type or derives from it. Its id is `request.context.tenant`.
+2. The type of the binding is the tenant Subject type or derives from it. Its id is `request.tenant_id`.
 
 A GTS id of a derived type contains the ids of its base types. Thus the filter needs no registry call at check time.
 At start, the gear checks that each type that the evaluator names is registered. A missing type stops the start.
@@ -838,7 +838,7 @@ idempotency token and may carry `expected_version`. Verb availability per actor 
 | `api-gateway`      | `RestApiCapability`                                                                | Hosts the management REST API                                                                                                                                                         |
 | ToolKit            | `ClientHub`, `SecureConn`, `OperationBuilder`, `toolkit-canonical-errors`          | Client registration, scoped persistence, routes, problems                                                                                                                             |
 
-Every management call propagates `SecurityContext`. The check path carries `LicenseCheckContext` instead and calls no
+Every management call propagates `SecurityContext`. The check path carries the tenant in `LicenseCheckRequest.tenant_id` instead and calls no
 gear.
 
 ### 3.5 External Dependencies

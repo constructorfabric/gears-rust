@@ -7,7 +7,7 @@ use crate::models::{LicenseCheckRequest, LicenseDecision};
 
 /// Plugin API trait for license resolver backends.
 ///
-/// Answers the check behind [`LicenseResolverApi`](crate::api::LicenseResolverApi)
+/// Answers the check behind both public contracts
 /// with a single `is_licensed` method, in process only. The subject is always a
 /// Subject contract object: the gateway maps a principal before delegating.
 /// Each plugin registers this trait as a
@@ -22,7 +22,7 @@ use crate::models::{LicenseCheckRequest, LicenseDecision};
 #[async_trait]
 pub trait LicenseResolverPluginClient: Send + Sync {
     /// Answer the delegated license check for the given subject within the
-    /// tenant scope carried in `request.context`.
+    /// tenant `request.tenant_id`.
     ///
     /// # Errors
     ///

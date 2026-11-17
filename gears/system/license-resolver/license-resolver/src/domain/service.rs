@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use license_resolver_sdk::{
     LicenseCheckContext, LicenseCheckRequest, LicenseDecision, LicenseResolverPluginClient,
-    LicenseResolverPluginSpecV1, Resource, Subject, field,
+    LicenseResolverPluginSpecV1, PrincipalSubject, Resource, Subject, field,
 };
 use serde_json::Map;
 use toolkit::client_hub::{ClientHub, ClientScope};
@@ -98,7 +98,7 @@ impl Service {
     #[tracing::instrument(
         skip_all,
         fields(
-            tenant_id = %request.context.tenant_id,
+            tenant_id = %request.tenant_id,
             resource_contract = %request.resource.gts_type,
         )
     )]
@@ -166,16 +166,20 @@ impl Service {
     /// determined, otherwise as [`is_licensed`](Self::is_licensed).
     pub async fn is_principal_licensed(
         &self,
-        principal_type: Option<&str>,
-        principal_id: Uuid,
+        tenant_id: Uuid,
+        principal: PrincipalSubject,
         resource: Resource,
         context: LicenseCheckContext,
     ) -> Result<LicenseDecision, DomainError> {
         let started = Instant::now();
-        let subject_type = if principal_id.is_nil() || context.tenant_id.is_nil() {
+        let PrincipalSubject {
+            principal_type,
+            id: principal_id,
+        } = principal;
+        let subject_type = if principal_id.is_nil() || tenant_id.is_nil() {
             Ok(None)
         } else {
-            self.principals.subject_type(principal_type).await
+            self.principals.subject_type(&principal_type).await
         };
         if !matches!(subject_type, Ok(Some(_))) {
             self.metrics
@@ -194,7 +198,7 @@ impl Service {
         };
         let result = self
             .check(
-                LicenseCheckRequest::new(subject, resource, context),
+                LicenseCheckRequest::new(tenant_id, subject, resource, context),
                 started,
             )
             .await;
@@ -211,7 +215,7 @@ impl Service {
             && self.mapping_log_throttle.should_log()
         {
             tracing::warn!(
-                principal_type = principal_type.unwrap_or_default(),
+                principal_type = %principal_type,
                 subject_type = %gts_type,
                 "principal_subject_types maps to a Subject contract type that the mapped subject does not conform to"
             );

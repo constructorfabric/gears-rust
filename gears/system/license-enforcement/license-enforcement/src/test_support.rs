@@ -556,6 +556,7 @@ pub fn input(subject: SubjectRef) -> SubjectRefInput {
 
 pub fn request(subject_type: &str, subject_id: &str, tenant: Uuid) -> LicenseCheckRequest {
     LicenseCheckRequest::new(
+        tenant,
         Subject {
             gts_type: GtsTypeId::new(subject_type),
             id: Some(subject_id.to_owned()),
@@ -566,10 +567,7 @@ pub fn request(subject_type: &str, subject_id: &str, tenant: Uuid) -> LicenseChe
             id: None,
             metadata: serde_json::Map::new(),
         },
-        LicenseCheckContext::builder()
-            .tenant_id(tenant)
-            .build()
-            .unwrap(),
+        LicenseCheckContext::default(),
     )
 }
 

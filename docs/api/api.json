@@ -7350,25 +7350,19 @@
         "type": "object"
       },
       "IsLicensedRequest": {
-        "description": "The input of [`LicenseResolverApi::is_licensed`](crate::LicenseResolverApi::is_licensed)\n— the contract's growth surface.\n\nNew inputs are added as fields here, never as new method parameters. Because\nthat growth is expected, the type is `#[non_exhaustive]` and is built through\n[`new`](Self::new), so adding an input stays additive instead of breaking\nevery caller's struct literal. Contextual inputs belong on\n[`LicenseCheckContext`].\n\nUnknown fields are **ignored** here too, under the same rule as\n[`LicenseCheckContext`].",
+        "description": "The input of [`LicenseResolverApi::is_licensed`](crate::LicenseResolverApi::is_licensed).\n\nNo subject and no tenant: both come from the caller's `SecurityContext`, so\nthe caller cannot name either. Unknown fields are **ignored**.",
         "properties": {
           "context": {
             "$ref": "#/components/schemas/LicenseCheckContext",
-            "description": "The tenant isolation scope (caller-derived from its `SecurityContext`)."
+            "description": "The operation context."
           },
           "resource": {
             "$ref": "#/components/schemas/LicenseResource",
             "description": "The licensable thing being checked."
-          },
-          "subject": {
-            "$ref": "#/components/schemas/SubjectInput",
-            "description": "Whom the license is checked for."
           }
         },
         "required": [
-          "subject",
-          "resource",
-          "context"
+          "resource"
         ],
         "type": "object"
       },
@@ -7707,17 +7701,7 @@
         "type": "object"
       },
       "LicenseCheckContext": {
-        "description": "The request's tenant context — the isolation scope of a check.\n\nBuilt from the caller's `SecurityContext` with\n[`from_security_context`](Self::from_security_context). Minimal today\n(tenant scope only); the extension point for future contextual evaluation\nsemantics. Every resolution is scoped to this tenant.\n\nUnknown fields are ignored, so a contextual input can be added without\nbreaking callers or older readers — but only one that satisfies **absence\nmust not grant more than presence**. An input that cannot is a new version of\nthe licensing contract, not an optional field (see \"Envelope evolution\" in\nthe module's DESIGN doc).",
-        "properties": {
-          "tenant_id": {
-            "description": "The tenant the check is scoped to. No cross-tenant resolution.",
-            "format": "uuid",
-            "type": "string"
-          }
-        },
-        "required": [
-          "tenant_id"
-        ],
+        "description": "The operation context of a check: inputs that describe the operation being\nchecked, beyond its subject and resource.\n\nEmpty today; the extension point for contextual evaluation inputs. The\ncaller fills it from its own knowledge of the operation: it is not derived\nfrom a `SecurityContext`, so both planes carry it in the request. Optional on\nthe wire.\n\nUnknown fields are ignored, so a contextual input can be added without\nbreaking callers or older readers — but only one that satisfies **absence\nmust not grant more than presence**. An input that cannot is a new version of\nthe licensing contract, not an optional field (see \"Envelope evolution\" in\nthe module's DESIGN doc).",
         "type": "object"
       },
       "LicenseDecision": {
@@ -7769,7 +7753,7 @@
         ],
         "type": "object"
       },
-      "LicenseSubject": {
+      "LicenseSubjectInput": {
         "additionalProperties": false,
         "description": "The subject of a check — whom the license is checked for.\n\nAn instance of a derived Subject contract type (base\n`gts.cf.core.lic.subj.v1~`). Polymorphic: a tenant, a user, or any future\nsubject type — the resolver never assumes the subject is a tenant. Its wire\nshape is pinned by [`LicenseSubjectV1`](crate::gts::LicenseSubjectV1).",
         "properties": {
@@ -7782,6 +7766,12 @@
               "null"
             ]
           },
+          "kind": {
+            "enum": [
+              "license"
+            ],
+            "type": "string"
+          },
           "metadata": {
             "description": "Licensing-relevant properties conforming to the derived contract's\nmetadata schema. Semantically opaque to the resolver; shape-validated\nthen forwarded to the plugin unchanged.\n\nRequired on the wire, so an omitted `metadata` is non-conforming and\n**must not** be defaulted to `{}` here. Pass an empty map when the\ncontract declares no metadata.",
             "type": "object"
@@ -7792,6 +7782,7 @@
           }
         },
         "required": [
+          "kind",
           "type",
           "metadata"
         ],
@@ -10737,6 +10728,34 @@
       },
       "PingData": {
         "description": "Payload of the `ping` event: an empty JSON object (a unit struct would\nbe documented as `null`).",
+        "type": "object"
+      },
+      "PlatformIsLicensedRequest": {
+        "description": "The input of\n[`PlatformLicenseResolverApi::is_licensed`](crate::PlatformLicenseResolverApi::is_licensed)\n— the contract's growth surface.\n\nNew inputs are added as fields here, never as new method parameters. Because\nthat growth is expected, the type is `#[non_exhaustive]` and is built through\n[`new`](Self::new), so adding an input stays additive instead of breaking\nevery caller's struct literal. Contextual inputs belong on\n[`LicenseCheckContext`].\n\nUnknown fields are **ignored** here too, under the same rule as\n[`LicenseCheckContext`].",
+        "properties": {
+          "context": {
+            "$ref": "#/components/schemas/LicenseCheckContext",
+            "description": "The operation context."
+          },
+          "resource": {
+            "$ref": "#/components/schemas/LicenseResource",
+            "description": "The licensable thing being checked."
+          },
+          "subject": {
+            "$ref": "#/components/schemas/SubjectInput",
+            "description": "Whom the license is checked for."
+          },
+          "tenant_id": {
+            "description": "The tenant the check is scoped to. No cross-tenant resolution.",
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "subject",
+          "resource"
+        ],
         "type": "object"
       },
       "PluginBinding": {
@@ -14906,7 +14925,7 @@
         ],
         "type": "object"
       },
-      "PrincipalSubject": {
+      "PrincipalSubjectInput": {
         "additionalProperties": false,
         "description": "The subject of a check given as a principal — whoever authenticated.\n\nThe resolver maps `principal_type` to the Subject contract type configured\nfor it and checks a [`Subject`] of that type, with `id` and empty\n`metadata`. A principal type without a mapping is not granted.",
         "properties": {
@@ -14915,12 +14934,19 @@
             "format": "uuid",
             "type": "string"
           },
+          "kind": {
+            "enum": [
+              "principal"
+            ],
+            "type": "string"
+          },
           "type": {
             "description": "The principal type, as in `SecurityContext::subject_type`. Wire key `type`.",
             "type": "string"
           }
         },
         "required": [
+          "kind",
           "type",
           "id"
         ],
@@ -19279,19 +19305,6 @@
         ],
         "type": "object"
       },
-      "SelfLicenseCheckRequest": {
-        "description": "The input of\n[`LicenseResolverApi::is_self_licensed`](crate::LicenseResolverApi::is_self_licensed).\n\nOnly the resource: the subject and the tenant scope come from the caller's\n`SecurityContext`. Unknown fields are **ignored**.",
-        "properties": {
-          "resource": {
-            "$ref": "#/components/schemas/LicenseResource",
-            "description": "The licensable thing being checked."
-          }
-        },
-        "required": [
-          "resource"
-        ],
-        "type": "object"
-      },
       "Server": {
         "properties": {
           "endpoints": {
@@ -20753,49 +20766,20 @@
         "type": "object"
       },
       "SubjectInput": {
-        "description": "The subject of an [`IsLicensedRequest`]: a Subject contract object or a\nprincipal. Wire tag `kind`: `license` or `principal`.",
+        "description": "A Subject contract object or a principal. Wire tag `kind`: `license` or `principal`.",
+        "discriminator": {
+          "mapping": {
+            "license": "#/components/schemas/LicenseSubjectInput",
+            "principal": "#/components/schemas/PrincipalSubjectInput"
+          },
+          "propertyName": "kind"
+        },
         "oneOf": [
           {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/LicenseSubject"
-              },
-              {
-                "properties": {
-                  "kind": {
-                    "enum": [
-                      "license"
-                    ],
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "kind"
-                ],
-                "type": "object"
-              }
-            ]
+            "$ref": "#/components/schemas/LicenseSubjectInput"
           },
           {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/PrincipalSubject"
-              },
-              {
-                "properties": {
-                  "kind": {
-                    "enum": [
-                      "principal"
-                    ],
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "kind"
-                ],
-                "type": "object"
-              }
-            ]
+            "$ref": "#/components/schemas/PrincipalSubjectInput"
           }
         ]
       },
@@ -54349,19 +54333,20 @@
         },
         "security": [
           {
-            "internalToken": []
+            "bearerAuth": []
           }
-        ]
+        ],
+        "x-toolkit-visibility": "exposed"
       }
     },
-    "/license-resolver/v1/is-self-licensed": {
+    "/license-resolver/v1/platform/is-licensed": {
       "post": {
-        "operationId": "license_resolver_api_rest_is_self_licensed",
+        "operationId": "platform_license_resolver_api_rest_is_licensed",
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/SelfLicenseCheckRequest"
+                "$ref": "#/components/schemas/PlatformIsLicensedRequest"
               }
             }
           },
@@ -54452,10 +54437,9 @@
         },
         "security": [
           {
-            "bearerAuth": []
+            "internalToken": []
           }
-        ],
-        "x-toolkit-visibility": "exposed"
+        ]
       }
     },
     "/mini-chat/v1/chats": {

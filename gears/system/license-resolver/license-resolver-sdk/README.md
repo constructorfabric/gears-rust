@@ -6,26 +6,29 @@ read-only, plugin-delegating resolver that answers a single question:
 
 ## What this crate provides
 
-- `LicenseResolverApi` — the public API contract, one check in two forms,
-  errors as `CanonicalError`:
-  - `is_licensed(PlatformSecurityContext, IsLicensedRequest) -> LicenseDecision`;
-    the subject is a `Subject` contract object or a `PrincipalSubject`
-    (principal type + id) that the resolver maps to a Subject contract type;
-  - `is_self_licensed(SecurityContext, SelfLicenseCheckRequest) -> LicenseDecision`;
+- Two public API contracts, one check each, errors as `CanonicalError`:
+  - `PlatformLicenseResolverApi::is_licensed(PlatformSecurityContext, PlatformIsLicensedRequest) -> LicenseDecision`;
+    a platform service names the tenant and the subject: a `Subject` contract
+    object or a `PrincipalSubject` (principal type + id) that the resolver maps
+    to a Subject contract type. `PlatformIsLicensedRequest::for_caller(&ctx, resource)`
+    builds the check of the user of a request from its `SecurityContext`;
+  - `LicenseResolverApi::is_licensed(SecurityContext, IsLicensedRequest) -> LicenseDecision`;
     the subject is the principal of the context, the tenant its tenant.
 
-  `LicenseResolverApiRest` projects them to `POST /license-resolver/v1/is-licensed`
-  and `POST /license-resolver/v1/is-self-licensed`; feature `rest-client`
-  emits the client, `rest-server` the routes for the gear.
+  Both requests carry the resource and the operation context
+  (`LicenseCheckContext`, empty today, optional on the wire). The REST
+  projections are `POST /license-resolver/v1/platform/is-licensed` (internal)
+  and `POST /license-resolver/v1/is-licensed` (exposed); feature `rest-client`
+  emits the clients, `rest-server` the routes for the gear.
 - `LicenseResolverPluginClient` — the in-process backend plugin trait:
   `is_licensed(LicenseCheckRequest) -> LicenseDecision`, errors as
   `LicenseResolverError`.
-- `IsLicensedRequest` / `SelfLicenseCheckRequest` / `LicenseCheckRequest` /
+- `PlatformIsLicensedRequest` / `IsLicensedRequest` / `LicenseCheckRequest` /
   `LicenseDecision`, `SubjectInput` (wire tag `kind`: `license` | `principal`),
   `PrincipalSubject`, and the `Subject` / `Resource` / `LicenseCheckContext`
   contract objects.
 - `LicenseResolverError` — the typed error enum of the plugin trait, with the
-  mapping to `CanonicalError` that `LicenseResolverApi` returns. A not-granted answer
+  mapping to `CanonicalError` that both contracts return. A not-granted answer
   is **not** an error (`LicenseDecision { granted: false }`).
 - `LicenseResolverPluginSpecV1` — the GTS plugin spec used for discovery.
 - The licensing base types `gts.cf.core.lic.subj.v1~` / `gts.cf.core.lic.res.v1~`
@@ -126,12 +129,14 @@ answer.
 ### A conforming check
 
 ```json
-{ "subject":  { "type": "gts.cf.core.lic.subj.v1~cf.genai.llm_gateway.user.v1~",
+{ "tenant_id": "8f1b2c34-5d6e-4f70-8a91-b2c3d4e5f607",
+  "subject":  { "kind": "license",
+                "type": "gts.cf.core.lic.subj.v1~cf.genai.llm_gateway.user.v1~",
                 "id": "acme-admin", "metadata": { "category": "internal" } },
   "resource": { "type": "gts.cf.core.lic.res.v1~cf.genai.llm_gateway.model_usage.v1~",
                 "id": "gpt-4o",
                 "metadata": { "model_vendor": "openai", "model_name": "gpt-4o" } },
-  "context":  { "tenant_id": "8f1b2c34-5d6e-4f70-8a91-b2c3d4e5f607" } }
+  "context":  {} }
 ```
 
 Resolve the Resource contract by `resource.type` → validate `metadata` against

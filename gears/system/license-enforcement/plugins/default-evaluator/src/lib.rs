@@ -73,8 +73,7 @@ impl GrantEvaluatorV1 for DefaultEvaluator {
                 .collect(),
             None => Vec::new(),
         };
-        let tenant =
-            BindingFilter::new(tenant_subject_type(), request.context.tenant_id.to_string());
+        let tenant = BindingFilter::new(tenant_subject_type(), request.tenant_id.to_string());
         // The tenant filter covers an exact one on the same type and id.
         filters
             .retain(|f| f.type_pattern != tenant.type_pattern || f.binding_id != tenant.binding_id);

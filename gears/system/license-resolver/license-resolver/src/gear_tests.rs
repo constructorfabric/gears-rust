@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use license_resolver_sdk::LicenseResolverApi;
+use license_resolver_sdk::{LicenseResolverApi, PlatformLicenseResolverApi};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use toolkit::api::{OpenApiRegistry, OpenApiRegistryImpl};
@@ -9,7 +9,7 @@ use toolkit::config::ConfigProvider;
 use toolkit::{ClientHub, Gear, GearCtx, RestApiCapability};
 use uuid::Uuid;
 
-use super::LicenseResolver;
+use super::{LicenseResolver, refuse_remote_wiring};
 
 struct StaticConfigProvider {
     root: serde_json::Value,
@@ -33,14 +33,33 @@ fn make_ctx() -> GearCtx {
 }
 
 #[tokio::test]
-async fn init_registers_the_api_and_register_rest_mounts_it() {
+async fn init_registers_both_apis_and_register_rest_mounts_them() {
     let ctx = make_ctx();
     let gear = LicenseResolver;
 
     gear.init(&ctx).await.expect("init must succeed");
     ctx.client_hub()
+        .get::<dyn PlatformLicenseResolverApi>()
+        .expect("platform api must be registered in the hub");
+    let platform = ctx
+        .client_hub()
+        .get::<dyn PlatformLicenseResolverApi>()
+        .unwrap();
+    let tenant = ctx
+        .client_hub()
         .get::<dyn LicenseResolverApi>()
-        .expect("resolver api must be registered in the hub");
+        .expect("tenant api must be registered in the hub");
+    assert_eq!(
+        Arc::as_ptr(&platform).cast::<()>(),
+        Arc::as_ptr(&tenant).cast::<()>(),
+        "both contracts are served by one local client"
+    );
+    assert!(
+        ctx.client_hub()
+            .try_get::<crate::domain::LicenseResolverLocalClient>()
+            .is_none(),
+        "the client is held in the hub only while wiring"
+    );
 
     let openapi: &dyn OpenApiRegistry = &OpenApiRegistryImpl::new();
     let _router = gear
@@ -61,4 +80,42 @@ fn register_rest_fails_before_init() {
         ),
         "got: {err:?}"
     );
+}
+
+fn provider(gear_config: serde_json::Value) -> StaticConfigProvider {
+    StaticConfigProvider {
+        root: serde_json::Value::Object(
+            [("license-resolver".to_owned(), gear_config)]
+                .into_iter()
+                .collect(),
+        ),
+    }
+}
+
+#[test]
+fn a_remote_binding_for_a_provided_contract_is_refused() {
+    for key in ["platform_license_resolver_api", "license_resolver_api"] {
+        let cfg = provider(json!({
+            "clients": { "provides": { key: { "transport": "rest", "endpoint": "http://r:1" } } }
+        }));
+        let err = refuse_remote_wiring(&cfg, "license-resolver")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!("clients.provides.{key}")),
+            "names the entry: {err}"
+        );
+    }
+}
+
+#[test]
+fn local_or_absent_wiring_is_accepted() {
+    for cfg in [
+        provider(json!({ "vendor": "acme" })),
+        provider(json!({
+            "clients": { "provides": { "license_resolver_api": { "transport": "local" } } }
+        })),
+    ] {
+        refuse_remote_wiring(&cfg, "license-resolver").unwrap();
+    }
 }

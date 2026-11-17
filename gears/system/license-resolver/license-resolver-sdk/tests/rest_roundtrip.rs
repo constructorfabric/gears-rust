@@ -1,5 +1,5 @@
-//! REST round trip of the `LicenseResolverApi` projection: the generated server
-//! routes on an ephemeral axum server, driven by the generated client.
+//! REST round trip of both projections: the generated server routes on an
+//! ephemeral axum server, driven by the generated clients.
 
 #![cfg(all(feature = "rest-client", feature = "rest-server"))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -8,10 +8,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::Router;
-use license_resolver_sdk::rest::register_license_resolver_api_rest_routes;
+use license_resolver_sdk::rest::{
+    register_license_resolver_api_rest_routes, register_platform_license_resolver_api_rest_routes,
+};
 use license_resolver_sdk::{
-    IsLicensedRequest, LicenseCheckContext, LicenseDecision, LicenseResolverApi,
-    LicenseResolverApiRestClient, PrincipalSubject, SelfLicenseCheckRequest, SubjectInput,
+    IsLicensedRequest, LicenseDecision, LicenseResolverApi, LicenseResolverApiRestClient,
+    PlatformIsLicensedRequest, PlatformLicenseResolverApi, PlatformLicenseResolverApiRestClient,
+    PrincipalSubject, SubjectInput,
 };
 use toolkit::api::OpenApiRegistryImpl;
 use toolkit_canonical_errors::CanonicalError;
@@ -24,11 +27,11 @@ use uuid::Uuid;
 struct GrantsGpt4o;
 
 #[async_trait]
-impl LicenseResolverApi for GrantsGpt4o {
+impl PlatformLicenseResolverApi for GrantsGpt4o {
     async fn is_licensed(
         &self,
         _ctx: PlatformSecurityContext,
-        request: IsLicensedRequest,
+        request: PlatformIsLicensedRequest,
     ) -> Result<LicenseDecision, CanonicalError> {
         let kind = match request.subject {
             SubjectInput::License(_) => "license",
@@ -36,15 +39,18 @@ impl LicenseResolverApi for GrantsGpt4o {
         };
         Ok(
             LicenseDecision::new(request.resource.id.as_deref() == Some("gpt-4o"))
-                .with_diagnostic("tenant", request.context.tenant_id.to_string())
+                .with_diagnostic("tenant", request.tenant_id.to_string())
                 .with_diagnostic("kind", kind),
         )
     }
+}
 
-    async fn is_self_licensed(
+#[async_trait]
+impl LicenseResolverApi for GrantsGpt4o {
+    async fn is_licensed(
         &self,
         ctx: SecurityContext,
-        request: SelfLicenseCheckRequest,
+        request: IsLicensedRequest,
     ) -> Result<LicenseDecision, CanonicalError> {
         Ok(
             LicenseDecision::new(request.resource.id.as_deref() == Some("gpt-4o"))
@@ -56,21 +62,24 @@ impl LicenseResolverApi for GrantsGpt4o {
 struct Unavailable;
 
 #[async_trait]
-impl LicenseResolverApi for Unavailable {
+impl PlatformLicenseResolverApi for Unavailable {
     async fn is_licensed(
         &self,
         _ctx: PlatformSecurityContext,
-        _request: IsLicensedRequest,
+        _request: PlatformIsLicensedRequest,
     ) -> Result<LicenseDecision, CanonicalError> {
         Err(CanonicalError::service_unavailable()
             .with_detail("License service temporarily unavailable")
             .create())
     }
+}
 
-    async fn is_self_licensed(
+#[async_trait]
+impl LicenseResolverApi for Unavailable {
+    async fn is_licensed(
         &self,
         _ctx: SecurityContext,
-        _request: SelfLicenseCheckRequest,
+        _request: IsLicensedRequest,
     ) -> Result<LicenseDecision, CanonicalError> {
         unreachable!("not exercised")
     }
@@ -95,21 +104,25 @@ fn resource(resource_id: &str) -> license_resolver_sdk::Resource {
     .unwrap()
 }
 
-fn request(resource_id: &str) -> IsLicensedRequest {
+fn request(resource_id: &str) -> PlatformIsLicensedRequest {
     let subject: license_resolver_sdk::Subject = serde_json::from_value(serde_json::json!({
         "type": gts_id!("cf.core.lic.subj.v1~cf.core.lic.tenant.v1~"),
         "id": "u1",
         "metadata": {},
     }))
     .unwrap();
-    let context = LicenseCheckContext::builder()
-        .tenant_id(Uuid::from_u128(42))
-        .build()
-        .unwrap();
-    IsLicensedRequest::new(subject, resource(resource_id), context)
+    PlatformIsLicensedRequest::new(Uuid::from_u128(42), subject, resource(resource_id))
 }
 
-async fn client_for(service: Arc<dyn LicenseResolverApi>) -> LicenseResolverApiRestClient {
+struct Clients {
+    platform: PlatformLicenseResolverApiRestClient,
+    tenant: LicenseResolverApiRestClient,
+}
+
+async fn client_for<S>(service: Arc<S>) -> Clients
+where
+    S: PlatformLicenseResolverApi + LicenseResolverApi + 'static,
+{
     // The auth middlewares normally build both contexts from the credentials;
     // here every request gets a marker and the `caller()` context.
     let secctx = axum::middleware::from_fn(
@@ -120,23 +133,29 @@ async fn client_for(service: Arc<dyn LicenseResolverApi>) -> LicenseResolverApiR
             next.run(req).await
         },
     );
-    let app: Router = register_license_resolver_api_rest_routes(
+    let openapi = OpenApiRegistryImpl::new();
+    let app = register_platform_license_resolver_api_rest_routes(
         Router::new(),
-        &OpenApiRegistryImpl::new(),
-        service,
-    )
-    .layer(secctx);
+        &openapi,
+        service.clone(),
+    );
+    let app: Router =
+        register_license_resolver_api_rest_routes(app, &openapi, service).layer(secctx);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-    LicenseResolverApiRestClient::new(ClientConfig::new(format!("http://{addr}"))).unwrap()
+    let config = || ClientConfig::new(format!("http://{addr}"));
+    Clients {
+        platform: PlatformLicenseResolverApiRestClient::new(config()).unwrap(),
+        tenant: LicenseResolverApiRestClient::new(config()).unwrap(),
+    }
 }
 
 #[tokio::test]
 async fn the_decision_and_tenant_scope_cross_the_rest_boundary() {
-    let client = client_for(Arc::new(GrantsGpt4o)).await;
+    let client = client_for(Arc::new(GrantsGpt4o)).await.platform;
     let marker = PlatformSecurityContext::outbound_marker;
 
     let granted = client
@@ -158,15 +177,11 @@ async fn the_decision_and_tenant_scope_cross_the_rest_boundary() {
 
 #[tokio::test]
 async fn a_principal_subject_crosses_the_rest_boundary() {
-    let client = client_for(Arc::new(GrantsGpt4o)).await;
-    let context = LicenseCheckContext::builder()
-        .tenant_id(Uuid::from_u128(42))
-        .build()
-        .unwrap();
-    let request = IsLicensedRequest::new(
+    let client = client_for(Arc::new(GrantsGpt4o)).await.platform;
+    let request = PlatformIsLicensedRequest::new(
+        Uuid::from_u128(42),
         PrincipalSubject::new("user", Uuid::from_u128(7)),
         resource("gpt-4o"),
-        context,
     );
 
     let decision = client
@@ -180,11 +195,11 @@ async fn a_principal_subject_crosses_the_rest_boundary() {
 }
 
 #[tokio::test]
-async fn the_self_check_crosses_the_rest_boundary() {
-    let client = client_for(Arc::new(GrantsGpt4o)).await;
+async fn the_tenant_plane_check_crosses_the_rest_boundary() {
+    let client = client_for(Arc::new(GrantsGpt4o)).await.tenant;
 
     let decision = client
-        .is_self_licensed(caller(), SelfLicenseCheckRequest::new(resource("gpt-4o")))
+        .is_licensed(caller(), IsLicensedRequest::new(resource("gpt-4o")))
         .await
         .unwrap();
     assert!(decision.granted);
@@ -196,7 +211,7 @@ async fn the_self_check_crosses_the_rest_boundary() {
 
 #[tokio::test]
 async fn an_error_keeps_its_canonical_category_over_rest() {
-    let client = client_for(Arc::new(Unavailable)).await;
+    let client = client_for(Arc::new(Unavailable)).await.platform;
 
     let err = client
         .is_licensed(

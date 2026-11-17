@@ -67,11 +67,12 @@ pub fn resource(type_id: &str, id: Option<&str>, meta: Value) -> Resource {
 
 #[must_use]
 pub fn request(subject: Subject, resource: Resource) -> LicenseCheckRequest {
-    let context = LicenseCheckContext::builder()
-        .tenant_id(test_tenant())
-        .build()
-        .expect("tenant is set");
-    LicenseCheckRequest::new(subject, resource, context)
+    LicenseCheckRequest::new(
+        test_tenant(),
+        subject,
+        resource,
+        LicenseCheckContext::default(),
+    )
 }
 
 /// A request that conforms to both test contracts.
@@ -361,12 +362,4 @@ pub fn model_usage() -> Resource {
         Some("gpt-4o"),
         json!({ "model_vendor": "openai", "model_name": "gpt-4o" }),
     )
-}
-
-#[must_use]
-pub fn test_context() -> LicenseCheckContext {
-    LicenseCheckContext::builder()
-        .tenant_id(test_tenant())
-        .build()
-        .expect("tenant is set")
 }

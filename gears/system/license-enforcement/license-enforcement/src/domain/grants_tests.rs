@@ -1565,7 +1565,7 @@ async fn check_explain_requests_conform_to_their_contracts() {
         )
         .await
         .unwrap();
-    assert_eq!(built.context.tenant_id, tenant);
+    assert_eq!(built.tenant_id, tenant);
 
     let mut subject = req.subject.clone();
     subject.gts_type = GtsTypeId::new(SERVICE);

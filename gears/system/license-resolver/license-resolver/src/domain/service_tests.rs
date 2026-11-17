@@ -12,7 +12,7 @@ use crate::domain::test_support::{
     RecordingMetrics, SEAT_SUBJECT, USER_PRINCIPAL, USER_SUBJECT, conforming_request,
     counting_hub_with_registry_only, empty_hub, hub_with_registry_and_plugin,
     hub_without_plugin_instances, model_usage, principal_mapping, request, resource, subject,
-    test_context, test_instance_id, test_tenant,
+    test_instance_id, test_tenant,
 };
 use crate::domain::validation::ContractValidator;
 use uuid::Uuid;
@@ -93,7 +93,7 @@ async fn conforming_request_reaches_the_plugin_unchanged() {
     let seen = plugin.seen();
     assert_eq!(seen.len(), 1, "the plugin must be called exactly once");
     assert_eq!(seen[0], sent, "the request must be forwarded unchanged");
-    assert_eq!(seen[0].context.tenant_id, test_tenant());
+    assert_eq!(seen[0].tenant_id, test_tenant());
 }
 
 #[tokio::test]
@@ -413,10 +413,10 @@ async fn a_mapped_principal_reaches_the_plugin_as_a_subject() {
 
     let decision = svc
         .is_principal_licensed(
-            Some(OPERATOR_PRINCIPAL),
-            principal_id,
+            test_tenant(),
+            PrincipalSubject::new(OPERATOR_PRINCIPAL, principal_id),
             model_usage(),
-            test_context(),
+            LicenseCheckContext::default(),
         )
         .await
         .expect("mapped principal check succeeds");
@@ -429,7 +429,7 @@ async fn a_mapped_principal_reaches_the_plugin_as_a_subject() {
         subject(SEAT_SUBJECT, Some(&principal_id.to_string()), json!({}))
     );
     assert_eq!(seen[0].resource, model_usage());
-    assert_eq!(seen[0].context.tenant_id, test_tenant());
+    assert_eq!(seen[0].tenant_id, test_tenant());
     assert_eq!(metrics.latency_count(), 1);
 }
 
@@ -440,10 +440,10 @@ async fn an_unmapped_principal_is_not_granted_without_the_plugin() {
 
     let decision = svc
         .is_principal_licensed(
-            Some("app"),
-            Uuid::from_u128(7),
+            test_tenant(),
+            PrincipalSubject::new("app", Uuid::from_u128(7)),
             model_usage(),
-            test_context(),
+            LicenseCheckContext::default(),
         )
         .await
         .expect("an unmapped principal is a decision");
@@ -466,23 +466,19 @@ async fn an_unmapped_principal_is_not_granted_without_the_plugin() {
 
 #[tokio::test]
 async fn an_anonymous_principal_is_not_mapped() {
-    let nil_tenant = LicenseCheckContext::builder()
-        .tenant_id(Uuid::nil())
-        .build()
-        .expect("tenant is set");
-    for (principal_id, context) in [
-        (Uuid::nil(), test_context()),
-        (Uuid::from_u128(7), nil_tenant),
+    for (principal_id, tenant_id) in [
+        (Uuid::nil(), test_tenant()),
+        (Uuid::from_u128(7), Uuid::nil()),
     ] {
         let plugin = MockPlugin::granting();
         let (svc, metrics) = wired_service(plugin.clone());
 
         let decision = svc
             .is_principal_licensed(
-                Some(OPERATOR_PRINCIPAL),
-                principal_id,
+                tenant_id,
+                PrincipalSubject::new(OPERATOR_PRINCIPAL, principal_id),
                 model_usage(),
-                context,
+                LicenseCheckContext::default(),
             )
             .await
             .expect("an anonymous principal is a decision");
@@ -513,10 +509,10 @@ async fn a_backend_rejection_of_a_mapped_subject_is_not_logged_as_misconfigurati
 
     let err = svc
         .is_principal_licensed(
-            Some(OPERATOR_PRINCIPAL),
-            Uuid::from_u128(7),
+            test_tenant(),
+            PrincipalSubject::new(OPERATOR_PRINCIPAL, Uuid::from_u128(7)),
             model_usage(),
-            test_context(),
+            LicenseCheckContext::default(),
         )
         .await
         .expect_err("the backend rejects the subject");
@@ -536,10 +532,10 @@ async fn a_mapped_type_that_requires_metadata_is_an_invalid_request() {
 
     let err = svc
         .is_principal_licensed(
-            Some(METADATA_PRINCIPAL),
-            Uuid::from_u128(7),
+            test_tenant(),
+            PrincipalSubject::new(METADATA_PRINCIPAL, Uuid::from_u128(7)),
             model_usage(),
-            test_context(),
+            LicenseCheckContext::default(),
         )
         .await
         .expect_err("empty metadata does not conform");
@@ -569,10 +565,10 @@ async fn an_unresolvable_principal_mapping_fails_closed() {
 
     let err = svc
         .is_principal_licensed(
-            Some(OPERATOR_PRINCIPAL),
-            Uuid::from_u128(7),
+            test_tenant(),
+            PrincipalSubject::new(OPERATOR_PRINCIPAL, Uuid::from_u128(7)),
             model_usage(),
-            test_context(),
+            LicenseCheckContext::default(),
         )
         .await
         .expect_err("the mapping cannot be determined");

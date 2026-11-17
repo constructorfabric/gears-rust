@@ -20,7 +20,7 @@ fn mapper(
 async fn an_exact_entry_maps_without_the_registry() {
     let (mapper, registry) = mapper(&[("user", SEAT_SUBJECT)], FakeContractRegistry::new());
 
-    let subject_type = mapper.subject_type(Some("user")).await.unwrap();
+    let subject_type = mapper.subject_type("user").await.unwrap();
 
     assert_eq!(subject_type.as_ref().map(AsRef::as_ref), Some(SEAT_SUBJECT));
     assert_eq!(registry.calls(), 0);
@@ -36,7 +36,7 @@ async fn a_subtype_takes_the_nearest_mapped_ancestor() {
         FakeContractRegistry::with_test_contracts(),
     );
 
-    let subject_type = mapper.subject_type(Some(OPERATOR_PRINCIPAL)).await.unwrap();
+    let subject_type = mapper.subject_type(OPERATOR_PRINCIPAL).await.unwrap();
 
     assert_eq!(subject_type.as_ref().map(AsRef::as_ref), Some(SEAT_SUBJECT));
 }
@@ -48,17 +48,18 @@ async fn an_unmapped_chain_is_not_mapped() {
         FakeContractRegistry::with_test_contracts(),
     );
 
-    assert_eq!(
-        mapper.subject_type(Some(OPERATOR_PRINCIPAL)).await.unwrap(),
-        None
-    );
+    assert_eq!(mapper.subject_type(OPERATOR_PRINCIPAL).await.unwrap(), None);
 }
 
 #[tokio::test]
-async fn an_absent_principal_type_is_not_mapped() {
-    let (mapper, _) = mapper(&[("user", SEAT_SUBJECT)], FakeContractRegistry::new());
+async fn an_absent_principal_type_is_not_mapped_without_the_registry() {
+    let (mapper, registry) = mapper(
+        &[("user", SEAT_SUBJECT), ("", SEAT_SUBJECT)],
+        FakeContractRegistry::failing(FailureKind::Unavailable),
+    );
 
-    assert_eq!(mapper.subject_type(None).await.unwrap(), None);
+    assert_eq!(mapper.subject_type("").await.unwrap(), None);
+    assert_eq!(registry.calls(), 0);
 }
 
 #[tokio::test]
@@ -69,18 +70,15 @@ async fn an_unregistered_or_malformed_principal_type_is_not_mapped() {
         FakeContractRegistry::failing(FailureKind::Malformed),
     );
 
-    assert_eq!(unregistered.subject_type(Some("app")).await.unwrap(), None);
-    assert_eq!(malformed.subject_type(Some("app")).await.unwrap(), None);
+    assert_eq!(unregistered.subject_type("app").await.unwrap(), None);
+    assert_eq!(malformed.subject_type("app").await.unwrap(), None);
 }
 
 #[tokio::test]
 async fn without_entries_the_registry_is_not_asked() {
     let (mapper, registry) = mapper(&[], FakeContractRegistry::with_test_contracts());
 
-    assert_eq!(
-        mapper.subject_type(Some(USER_PRINCIPAL)).await.unwrap(),
-        None
-    );
+    assert_eq!(mapper.subject_type(USER_PRINCIPAL).await.unwrap(), None);
     assert_eq!(registry.calls(), 0);
 }
 
@@ -92,7 +90,7 @@ async fn an_unavailable_registry_is_an_error() {
     );
 
     let err = mapper
-        .subject_type(Some(OPERATOR_PRINCIPAL))
+        .subject_type(OPERATOR_PRINCIPAL)
         .await
         .expect_err("cannot determine the mapping");
     assert!(

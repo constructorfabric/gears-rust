@@ -1,24 +1,26 @@
-//! Public API contract for the license resolver.
+//! Public API contracts for the license resolver, one per plane, as in
+//! types-registry.
 //!
-//! `LicenseResolverApi` is a transport-agnostic `#[toolkit::contract]`: the
-//! gear registers a local impl in `ClientHub` for in-process consumers, and the
-//! [`rest`](crate::rest) projection generates a REST client for out-of-process
+//! Both are transport-agnostic `#[toolkit::contract]`s: the gear registers a
+//! local impl of each in `ClientHub` for in-process consumers, and the
+//! [`rest`](crate::rest) projections generate REST clients for out-of-process
 //! ones. Consumers do not branch on the binding.
 
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::{PlatformSecurityContext, SecurityContext};
 
-use crate::models::{IsLicensedRequest, LicenseDecision, SelfLicenseCheckRequest};
+use crate::models::{IsLicensedRequest, LicenseDecision, PlatformIsLicensedRequest};
 
-/// Public API contract for the license resolver gateway.
+/// The platform plane: a trusted platform service names the subject and the
+/// tenant of the check.
 #[toolkit::contract(gear = "license-resolver", version = "v1")]
-pub trait LicenseResolverApi: Send + Sync {
+pub trait PlatformLicenseResolverApi: Send + Sync {
     /// Point-in-time check of whether a resource is licensed to a subject.
     ///
-    /// A platform-plane method: `ctx` marks the plane and carries no identity.
-    /// Over REST the transport authenticates the calling workload; the tenant
-    /// scope of the check rides in `request.context`, which the caller derives
-    /// from its own `SecurityContext`. Callers without a
+    /// `ctx` marks the plane and carries no identity. Over REST the transport
+    /// authenticates the calling workload. A module that checks the user of its
+    /// request passes the user's principal and tenant, read from its own
+    /// `SecurityContext`, as request data. Callers without a
     /// [`PlatformSecurityContext`] pass [`PlatformSecurityContext::outbound_marker`].
     ///
     /// A principal subject is first mapped to the Subject contract type the
@@ -37,20 +39,25 @@ pub trait LicenseResolverApi: Send + Sync {
     async fn is_licensed(
         &self,
         ctx: PlatformSecurityContext,
-        request: IsLicensedRequest,
+        request: PlatformIsLicensedRequest,
     ) -> Result<LicenseDecision, CanonicalError>;
+}
 
-    /// [`is_licensed`](Self::is_licensed) for the principal of `ctx`, scoped to
-    /// its tenant: the subject is `ctx.subject_type()` / `ctx.subject_id()`, the
-    /// tenant is `ctx.subject_tenant_id()`.
+/// The tenant plane: the check for the caller itself.
+#[toolkit::contract(gear = "license-resolver", version = "v1")]
+pub trait LicenseResolverApi: Send + Sync {
+    /// [`PlatformLicenseResolverApi::is_licensed`] for the principal of `ctx`,
+    /// scoped to its tenant: the subject is `ctx.subject_type()` /
+    /// `ctx.subject_id()`, the tenant is `ctx.subject_tenant_id()`. The request
+    /// carries the resource and the operation context.
     ///
     /// # Errors
     ///
-    /// As [`is_licensed`](Self::is_licensed).
+    /// As [`PlatformLicenseResolverApi::is_licensed`].
     #[idempotency(SafeRead)]
-    async fn is_self_licensed(
+    async fn is_licensed(
         &self,
         ctx: SecurityContext,
-        request: SelfLicenseCheckRequest,
+        request: IsLicensedRequest,
     ) -> Result<LicenseDecision, CanonicalError>;
 }

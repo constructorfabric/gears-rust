@@ -11,7 +11,7 @@ The `cf-gears-license-resolver` gear provides:
 - **Plugin discovery** — Finds license-resolver plugins via GTS types-registry
 - **Vendor-based selection** — Selects a plugin by vendor and priority, memoized after the first resolution
 - **Fail-closed semantics** — A non-conforming request, a missing plugin and an unreachable backend all yield an error; none of them can produce a granted decision
-- **ClientHub and REST** — Registers `LicenseResolverApi` in ClientHub and hosts it at `POST /license-resolver/v1/is-licensed` (service credential, platform services only) and `POST /license-resolver/v1/is-self-licensed` (bearer token, any authenticated principal, answers only about that principal)
+- **ClientHub and REST** — Registers `PlatformLicenseResolverApi` and `LicenseResolverApi` in ClientHub and hosts them at `POST /license-resolver/v1/platform/is-licensed` (service credential, platform services only) and `POST /license-resolver/v1/is-licensed` (bearer token, any authenticated principal, answers only about that principal)
 
 This is a **main gear** — it holds no grant store and decides no licensing question. It validates *shape and compatibility* and routes; what the contract properties mean, and whether the pair is licensed, belong to the plugin.
 
@@ -21,7 +21,7 @@ This is a **main gear** — it holds no grant store and decides no licensing que
 Consumer Gear
     │  projects its domain objects into registered contract types
     ▼
-LicenseResolverApi  (SDK contract: ClientHub in process, REST from another process)
+PlatformLicenseResolverApi / LicenseResolverApi  (SDK contracts: ClientHub in process, REST from another process)
     │
     ▼
 license-resolver gateway  (this crate — validates, then routes)
@@ -38,28 +38,28 @@ Plugin implementation  (holds the grant facts)
 
 ```rust
 use license_resolver_sdk::{
-    SelfLicenseCheckRequest, IsLicensedRequest, LicenseCheckContext, LicenseResolverApi,
+    IsLicensedRequest, LicenseResolverApi, PlatformIsLicensedRequest, PlatformLicenseResolverApi,
 };
 use toolkit_security::PlatformSecurityContext;
 
-let resolver = hub.get::<dyn LicenseResolverApi>()?;
+// A platform service names the tenant and the subject; here, the user of its request.
+let platform = hub.get::<dyn PlatformLicenseResolverApi>()?;
+// `PlatformIsLicensedRequest::new(tenant_id, subject, resource)` names any other subject.
+let request = PlatformIsLicensedRequest::for_caller(&ctx, resource.clone());
 
-let request = IsLicensedRequest::new(
-    subject,   // instance of your derived `gts.cf.core.lic.subj.v1~…` contract, or a PrincipalSubject
-    resource.clone(),  // instance of your derived `gts.cf.core.lic.res.v1~…` contract
-    LicenseCheckContext::from_security_context(&ctx),
-);
-
-if resolver
+if platform
     .is_licensed(PlatformSecurityContext::outbound_marker(), request)
     .await?
     .granted {
     // allow
 }
 
-// Is the authenticated principal itself licensed?
-let decision = resolver
-    .is_self_licensed(ctx, SelfLicenseCheckRequest::new(resource))
+// End-user form: the caller asks about itself, for example to show or hide a feature.
+// The subject and the tenant come from `ctx`. A module that enforces a license checks
+// the user of its request on the platform plane, as above.
+let decision = hub
+    .get::<dyn LicenseResolverApi>()?
+    .is_licensed(ctx, IsLicensedRequest::new(resource))
     .await?;
 ```
 

@@ -49,9 +49,10 @@ system: cf
 ### 1.1 Purpose
 
 License Resolver is a read-only CF/Gears system module that answers a single question: *is a specific resource
-licensed (granted) to a specific subject right now?* Callers ask `is_licensed(request)` — a single `IsLicensedRequest`
-carrying the subject (a contract object or a principal), the resource contract object and the tenant context — and
-receive a yes/no decision plus structured, non-authoritative diagnostics (debug information about how the decision was
+licensed (granted) to a specific subject right now?* Callers ask `is_licensed(request)` — a single request carrying
+the tenant, the subject (a contract object or a principal), the resource contract object and the operation context
+(inputs that describe the operation being checked beyond its subject and resource, set by the caller) — and receive
+a yes/no decision plus structured, non-authoritative diagnostics (debug information about how the decision was
 reached). It is the authoritative point-in-time license check used by other modules to gate access.
 
 License Resolver owns no grant data; it delegates the lookup to a pluggable backend selected at runtime, mirroring
@@ -69,8 +70,9 @@ for it, no common GTS-typed identity, and no fail-closed guarantee to rely on wh
 A dedicated resolver consolidates the check behind one contract with consistent GTS-typed subject and resource
 identity and consistent deny semantics. Because grant facts live in heterogeneous backends owned by
 different vendors, the resolver must delegate the lookup rather than own a store — matching the proven authz-resolver /
-tenant-resolver delegation model. (Tenancy enters only as the isolation scope, carried in the request context that the
-caller derives from its `SecurityContext`.)
+tenant-resolver delegation model. (Tenancy enters only as the isolation scope: the tenant a trusted platform service — a
+CF module that calls with its own service credential rather than a user's token — names in the request, or the tenant
+of the calling principal.)
 
 Licensing is also split across levels: the Gear performing enforcement knows *where* a check belongs, while only the
 platform vendor — who composes a concrete platform out of Gears and a licensing backend — knows *what* must be
@@ -93,7 +95,7 @@ checks exist, which Subject/Resource pairs they involve, and which properties ar
 
 | Term                  | Definition                                                                                                                                                                                                                                                                                                                                           |
 |-----------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `IsLicensedRequest`   | A single object bundling the inputs of one check: the subject (a Subject contract object or a principal), the resource contract object and the tenant context. The contract's growth surface (new inputs are added as request fields).                                                                                                              |
+| Check request         | A single object bundling the inputs of one check: the tenant, the subject (a Subject contract object or a principal), the resource contract object and the operation context (inputs that describe the operation being checked, set by the caller). The contract's growth surface (new inputs are added as request fields). A check for the calling principal itself omits the tenant and the subject. |
 | Principal             | Whoever authenticated: a person, a service account, a system actor. Its principal type (a GTS type) and id are in the caller's `SecurityContext`.                                                                                                                                                                                                    |
 | Licensing Contract    | A registered, versioned GTS type derived from the licensing base types, describing a Subject or Resource shape: identity fields plus the schema of its `metadata`; a Resource contract also declares which Subject types it admits. The set of a Gear's derived contract types is its published licensing surface.                                   |
 | Subject               | The "someone" a license is checked for — an instance of a derived Subject contract type, carrying its licensing contract type (required), an optional id (well-known name or UUID), and `metadata` conforming to the contract schema. Polymorphic — e.g. a tenant, a user, or any future subject type (the licensee is not restricted to tenants). |
@@ -148,7 +150,7 @@ patterns are inherited from the project-wide architecture in
 
 - Point-in-time check of whether a resource — a specific instance or a whole resource type — is licensed to a single
   subject.
-- Tenant-scoped resolution via the request's tenant context (derived from the caller's `SecurityContext`).
+- Tenant-scoped resolution: the tenant named by a trusted platform service, or the tenant of the calling principal.
 - Typed licensing contracts: base Subject/Resource GTS types owned by this module, derived contract types registered by
   consuming Gears, and validation of every check request against the registered contracts before delegation.
 - GTS-typed identity inside the contracts (whole-type, named/well-known, and opaque).
@@ -177,15 +179,15 @@ patterns are inherited from the project-wide architecture in
 
 - [ ] `p1` - **ID**: `cpt-cf-license-resolver-fr-is-licensed-check`
 
-The system **MUST** provide a single check operation `is_licensed(request)` taking an `IsLicensedRequest` — which
+The system **MUST** provide a single check operation `is_licensed(request)` taking a check request — which
 bundles the subject (whom), given as a Subject contract object or as a principal (see
 `cpt-cf-license-resolver-fr-principal-subject`), the resource (what) contract object — each contract object carrying its
-schematized `metadata` — and the tenant context (the caller derives it from its `SecurityContext`) — and returning a
+schematized `metadata` — the tenant, and the operation context — and returning a
 decision indicating whether the
 resource is licensed to the subject at the time of the call, together with structured, non-authoritative
 **diagnostics** (a string-keyed map of debug information about how the decision was reached — e.g. which backend
-answered, matched grant, denial cause). A second form of the same check takes the caller's `SecurityContext` instead
-of the subject and tenant context (see `cpt-cf-license-resolver-fr-principal-subject`).
+answered, matched grant, denial cause). The same check for the calling principal itself takes the caller's
+`SecurityContext` instead of the subject and the tenant (see `cpt-cf-license-resolver-fr-principal-subject`).
 Diagnostics are advisory only and **MUST NOT** be required for the caller to interpret the boolean outcome. The single
 request object is the contract's growth surface — new inputs are added as request fields, not as new parameters or
 method-signature changes. (See `cpt-cf-license-resolver-fr-evaluation-metadata` for the `metadata` field.)
@@ -241,8 +243,9 @@ configuration, which the platform vendor sets: an entry for the principal type i
 in the GTS type hierarchy. The mapped subject carries the principal id and empty `metadata`, and is then validated and
 delegated as any other subject. A principal type without a mapping **MUST** yield a not-granted decision.
 
-The system **MUST** also provide a check that takes the caller's `SecurityContext` and the resource only: the subject is
-the principal of that context and the tenant scope is the principal's tenant.
+The system **MUST** also provide a check that takes the caller's `SecurityContext`, the resource and the operation
+context: the subject is the principal of that context and the tenant is the principal's tenant. The operation context
+comes from the caller, not from `SecurityContext`, which fixes only the subject and the tenant.
 
 - **Rationale**: The calling module knows the principal but not the platform vendor's Subject contract types; one
   mapping in the resolver serves every caller, and backends keep receiving Subject contract types only.
@@ -402,11 +405,12 @@ non-granted decision or an error, and **MUST NOT** grant by default — in 100% 
 
 - [ ] `p1` - **ID**: `cpt-cf-license-resolver-nfr-tenant-scoping`
 
-Every resolution **MUST** be scoped to the tenant carried by the request context (which the caller derives from its
-`SecurityContext`), with 0 cross-tenant grant leaks tolerated. Regardless of subject type, the subject is treated as
+Every resolution **MUST** be scoped to one tenant — the tenant a trusted platform service names in the request, or the
+tenant of the calling principal — with 0 cross-tenant grant leaks tolerated. Regardless of subject type, the subject is treated as
 bounded within that tenant (the current tenant-bounded model — see §11).
 
-- **Threshold**: 0 cross-tenant resolutions; tenant scope derived solely from the request context.
+- **Threshold**: 0 cross-tenant resolutions; the tenant is taken solely from the request (platform service) or from
+  the caller's `SecurityContext` (calling principal).
 - **Rationale**: Under the current model every license is tenant-bounded (a user belongs to a tenant), so the resolver
   enforces tenant isolation like other CF modules; a cross-tenant grant would expose another tenant's entitlements.
 - **Architecture Allocation**: See DESIGN.md § NFR Allocation for how this is realized.
@@ -423,20 +427,21 @@ bounded within that tenant (the current tenant-bounded model — see §11).
 
 - [ ] `p1` - **ID**: `cpt-cf-license-resolver-interface-client`
 
-- **Type**: Rust trait (`LicenseResolverApi`), available in process and over REST
+- **Type**: Rust traits (`PlatformLicenseResolverApi`, `LicenseResolverApi`), available in process and over REST
 - **Stability**: stable
 - **Description**: The public client contract exposing the point-in-time check of whether a resource is licensed to a
-  subject, in two forms: `is_licensed(request: IsLicensedRequest) -> LicenseDecision`, and
-  `is_self_licensed(SecurityContext, resource) -> LicenseDecision`, whose subject and tenant scope come from the
-  context. A consumer in the same process calls it directly; a consumer in another process calls the same method over
-  REST. Over REST, `is_licensed` is reachable only by platform services; `is_self_licensed` is reachable by any
-  authenticated principal and answers only about that principal in its own tenant. `IsLicensedRequest`
-  bundles the subject — a Subject contract object or a principal — the Resource contract object (instances of
-  registered derived licensing types, each carrying its contract type + optional id + schematized `metadata`) and the
-  tenant context (caller-derived from `SecurityContext`). A request that does not conform to its registered contracts
+  subject, on two contracts: `PlatformLicenseResolverApi::is_licensed`, where a platform service names the tenant and
+  the subject, and `LicenseResolverApi::is_licensed`, whose subject and tenant come from the caller's
+  `SecurityContext`. A consumer in the same process calls them directly; a consumer in another process calls the same
+  methods over REST. Over REST, the platform contract is reachable only by platform services; the other is reachable
+  by any authenticated principal and answers only about that principal in its own tenant. The platform request
+  bundles the tenant, the subject — a Subject contract object or a principal — the Resource contract object
+  (instances of registered derived licensing types, each carrying its contract type + optional id + schematized
+  `metadata`) and the operation context; the other request carries the Resource contract object and the operation
+  context. A request that does not conform to its registered contracts
   is rejected with a validation error, distinct from a not-granted decision. There is no listing or enumeration
   method.
-- **Breaking Change Policy**: Major version bump required to change the `IsLicensedRequest`/`LicenseDecision` shape (a
+- **Breaking Change Policy**: Major version bump required to change the request/`LicenseDecision` shape (a
   backward-compatible new optional request field is not breaking), the identity model (contract GTS type + optional
   instance id), or the decision/error semantics. Individual licensing contracts evolve under
   `cpt-cf-license-resolver-fr-contract-compatibility` (additive optional properties are non-breaking).
@@ -473,9 +478,10 @@ bounded within that tenant (the current tenant-bounded model — see §11).
    projecting the licensing-relevant fields from the data it has at hand (e.g. the resource from its domain objects,
    the subject from `SecurityContext`): each carries its contract GTS type (required), an optional id (a well-known
    name or UUID; omitted to check a whole resource type), and `metadata` conforming to the contract schema.
-2. Module assembles an `IsLicensedRequest` with the two contract objects and the tenant context derived from its
-   `SecurityContext`, and calls `is_licensed(request)`. To check the authenticated principal itself, the module passes
-   the principal instead of a Subject contract object, or calls the `SecurityContext` form with the resource only.
+2. Module assembles a check request with the tenant, the two contract objects and the operation context, and calls
+   `is_licensed(request)`. To check the user of its request, the module passes the user's principal and tenant, read
+   from its `SecurityContext`, instead of a Subject contract object; an end user calls the `SecurityContext` form with
+   the resource and the operation context.
 3. Resolver maps a principal to its Subject contract type and validates the request against the registered contracts
    (schemas + admitted subject types).
 4. Resolver selects the backend plugin via the GTS registry and delegates the check, forwarding the request unchanged.
@@ -506,8 +512,8 @@ bounded within that tenant (the current tenant-bounded model — see §11).
   licensing base types), with per-contract property schemas and admitted subject types.
 - [ ] No listing or enumeration capability exists in the public contract.
 - [ ] When no backend plugin is available, the resolver never grants by default.
-- [ ] All resolutions are tenant-scoped via the request context (derived from `SecurityContext`) with no cross-tenant
-  leakage.
+- [ ] All resolutions are scoped to one tenant (named by a platform service or taken from the caller's
+  `SecurityContext`) with no cross-tenant leakage.
 - [ ] Backend selection is performed by GTS registry discovery (vendor + priority) with no resolver-owned grant store.
 
 ## 10. Dependencies
@@ -515,7 +521,7 @@ bounded within that tenant (the current tenant-bounded model — see §11).
 | Dependency                            | Description                                                                                              | Criticality |
 |---------------------------------------|----------------------------------------------------------------------------------------------------------|-------------|
 | GTS types registry (`types-registry`) | Backend plugin discovery (by GTS plugin spec); registration and schema resolution of licensing contracts | p1          |
-| `SecurityContext`                     | Source of the request's tenant context and of the principal (built by the caller)                        | p1          |
+| `SecurityContext`                     | Source of the principal and its tenant: read by the calling module, or by the resolver for a check of the calling principal | p1          |
 | Backend license plugin                | Holds grant facts and answers the delegated check                                                        | p1          |
 
 ## 11. Assumptions
@@ -532,7 +538,7 @@ bounded within that tenant (the current tenant-bounded model — see §11).
   schema reads are not on the per-check hot path (cached).
 - **Tenant-bounded grants (current model)**: at this stage, every license is assumed to be bounded within a single
   tenant — regardless of subject type, the subject (e.g. a user) belongs to a tenant — and the resolver enforces tenant
-  isolation via the request's tenant context (derived from `SecurityContext`) as other CF modules do. Cross-tenant or
+  isolation via the tenant of each check as other CF modules do. Cross-tenant or
   tenant-independent licensing is not
   modeled yet; lifting this assumption would be a future, explicitly-versioned contract change.
 

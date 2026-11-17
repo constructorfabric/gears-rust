@@ -3,8 +3,8 @@
 use toolkit_gts::gts_id;
 
 use super::{
-    IsLicensedRequest, LicenseCheckContext, LicenseCheckRequest, LicenseDecision, PrincipalSubject,
-    Resource, Subject, SubjectInput,
+    IsLicensedRequest, LicenseCheckContext, LicenseCheckRequest, LicenseDecision,
+    PlatformIsLicensedRequest, PrincipalSubject, Resource, Subject, SubjectInput,
 };
 
 const SUBJECT_CONTRACT: &str = gts_id!("cf.core.lic.subj.v1~cf.genai.llm_gateway.user.v1~");
@@ -76,6 +76,7 @@ fn decision_defaults_to_not_granted_with_empty_diagnostics() {
 #[test]
 fn request_round_trips() {
     let request = LicenseCheckRequest::new(
+        uuid::Uuid::from_u128(42),
         serde_json::from_str(&format!(
             r#"{{"type":"{SUBJECT_CONTRACT}","metadata":{{}}}}"#
         ))
@@ -84,10 +85,7 @@ fn request_round_trips() {
             r#"{{"type":"{RESOURCE_CONTRACT}","metadata":{{}}}}"#
         ))
         .unwrap(),
-        LicenseCheckContext::builder()
-            .tenant_id(uuid::Uuid::nil())
-            .build()
-            .expect("tenant set"),
+        LicenseCheckContext::default(),
     );
     let back: LicenseCheckRequest =
         serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
@@ -199,9 +197,10 @@ fn envelope_ignores_unknown_fields() {
     let tenant = uuid::Uuid::from_u128(0x1d2f_6e3a);
     let raw = format!(
         concat!(
-            r#"{{"subject":{{"kind":"license","type":"{subject}","metadata":{{}}}},"#,
+            r#"{{"tenant_id":"{tenant}","#,
+            r#""subject":{{"kind":"license","type":"{subject}","metadata":{{}}}},"#,
             r#""resource":{{"type":"{resource}","metadata":{{}}}},"#,
-            r#""context":{{"tenant_id":"{tenant}","future_contextual_input":true}},"#,
+            r#""context":{{"future_contextual_input":true}},"#,
             r#""future_request_input":1}}"#
         ),
         subject = SUBJECT_CONTRACT,
@@ -209,12 +208,61 @@ fn envelope_ignores_unknown_fields() {
         tenant = tenant
     );
 
-    let request: IsLicensedRequest = serde_json::from_str(&raw)
+    let request: PlatformIsLicensedRequest = serde_json::from_str(&raw)
         .expect("a newer producer's request must stay readable by an older reader");
-    assert_eq!(request.context.tenant_id, tenant);
+    assert_eq!(request.tenant_id, tenant);
     assert!(
         matches!(&request.subject, SubjectInput::License(s) if s.gts_type.as_ref() == SUBJECT_CONTRACT)
     );
+}
+
+#[test]
+fn context_is_optional_on_the_wire() {
+    let raw = format!(r#"{{"resource":{{"type":"{RESOURCE_CONTRACT}","metadata":{{}}}}}}"#);
+    let request: IsLicensedRequest = serde_json::from_str(&raw).expect("context may be omitted");
+    assert_eq!(request.context, LicenseCheckContext::default());
+}
+
+#[test]
+fn subject_input_schema_is_a_discriminated_union_of_closed_branches() {
+    use utoipa::openapi::RefOr;
+    use utoipa::openapi::schema::Schema;
+    use utoipa::{PartialSchema, ToSchema};
+
+    let RefOr::T(Schema::OneOf(one_of)) = SubjectInput::schema() else {
+        panic!("SubjectInput is a oneOf");
+    };
+    let mapping = one_of.discriminator.expect("tagged by kind").mapping;
+    assert_eq!(
+        mapping.get("license").map(String::as_str),
+        Some("#/components/schemas/LicenseSubjectInput")
+    );
+    assert_eq!(
+        mapping.get("principal").map(String::as_str),
+        Some("#/components/schemas/PrincipalSubjectInput")
+    );
+
+    let mut components = Vec::new();
+    SubjectInput::schemas(&mut components);
+    for ((name, branch), (expected, fields)) in components.iter().zip([
+        (
+            "LicenseSubjectInput",
+            ["kind", "type", "id", "metadata"].as_slice(),
+        ),
+        ("PrincipalSubjectInput", ["kind", "type", "id"].as_slice()),
+    ]) {
+        assert_eq!(name, expected);
+        let RefOr::T(Schema::Object(object)) = branch else {
+            panic!("`{name}` is one closed object, not an allOf");
+        };
+        for field in fields {
+            assert!(
+                object.properties.contains_key(*field),
+                "`{name}` must declare `{field}`"
+            );
+        }
+        assert!(object.required.iter().any(|r| r == "kind"));
+    }
 }
 
 #[test]
@@ -223,31 +271,4 @@ fn decision_ignores_unknown_fields() {
         serde_json::from_str(r#"{"granted":true,"diagnostics":{},"grant_status":"active"}"#)
             .expect("granted is authoritative on its own");
     assert!(decision.granted);
-}
-
-#[test]
-fn context_derives_tenant_from_security_context() {
-    let tenant = uuid::Uuid::from_u128(0x1d2f_6e3a);
-    let ctx = toolkit_security::SecurityContext::builder()
-        .subject_id(uuid::Uuid::from_u128(7))
-        .subject_tenant_id(tenant)
-        .build()
-        .expect("valid security context");
-
-    let derived = LicenseCheckContext::from_security_context(&ctx);
-    assert_eq!(derived.tenant_id, tenant);
-    assert_ne!(derived.tenant_id, uuid::Uuid::nil());
-
-    let request = LicenseCheckRequest::new(
-        serde_json::from_str(&format!(
-            r#"{{"type":"{SUBJECT_CONTRACT}","metadata":{{}}}}"#
-        ))
-        .unwrap(),
-        serde_json::from_str(&format!(
-            r#"{{"type":"{RESOURCE_CONTRACT}","metadata":{{}}}}"#
-        ))
-        .unwrap(),
-        LicenseCheckContext::from_security_context(&ctx),
-    );
-    assert_eq!(request.context, derived);
 }

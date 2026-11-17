@@ -51,8 +51,7 @@ within them, not around them:
   never an error; every error path means fail-closed. The gateway validates requests
   against registered GTS licensing contracts (schemas + `admitted_subjects`) before
   delegation, so the plugin only receives conforming requests.
-- **Tenant-bounded grants.** `LicenseCheckContext` carries only `tenant_id`, derived from
-  `SecurityContext` — never from payloads. Every resolution is scoped to one tenant;
+- **Tenant-bounded grants.** Every resolution is scoped to one tenant;
   lifting this is an explicitly-versioned contract change (license-resolver PRD §11).
 - **The evaluation-engine precedent exists.** Quota-enforcement defines the reusable
   pattern: a Policy (scope → engine_id + opaque `engine_config` + timeout, immutably

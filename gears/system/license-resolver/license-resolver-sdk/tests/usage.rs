@@ -3,14 +3,14 @@
 //! Integration tests demonstrating how a consuming Gear builds a license check.
 //!
 //! They compile from outside the crate, which carries a guarantee no unit test
-//! can: `LicenseCheckContext`, `IsLicensedRequest` and `LicenseDecision` are
+//! can: `LicenseCheckContext`, the requests and `LicenseDecision` are
 //! `#[non_exhaustive]` so a future contextual input stays additive, which puts
 //! struct literals out of reach for consumers and makes the constructors the
 //! whole public surface. If a growth-surface field ever becomes unreachable
 //! through a constructor, this stops compiling.
 
 use license_resolver_sdk::{
-    IsLicensedRequest, LicenseCheckContext, LicenseCheckContextBuildError, LicenseDecision,
+    IsLicensedRequest, LicenseCheckContext, LicenseDecision, PlatformIsLicensedRequest,
     PrincipalSubject, Resource, Subject, SubjectInput,
 };
 use toolkit_gts::gts_id;
@@ -35,60 +35,38 @@ fn resource() -> Resource {
 }
 
 #[test]
-fn a_consumer_can_build_a_request_from_its_security_context() {
-    let tenant = Uuid::from_u128(0x1d2f_6e3a);
+fn a_consumer_can_check_its_user_on_the_platform_plane() {
     let ctx = SecurityContext::builder()
         .subject_id(Uuid::from_u128(7))
-        .subject_tenant_id(tenant)
+        .subject_tenant_id(Uuid::from_u128(42))
+        .subject_type("user")
         .build()
         .expect("valid security context");
 
-    let request = IsLicensedRequest::new(
-        subject(),
-        resource(),
-        LicenseCheckContext::from_security_context(&ctx),
-    );
+    let request = PlatformIsLicensedRequest::for_caller(&ctx, resource());
 
-    assert_eq!(request.context.tenant_id, tenant);
+    assert_eq!(request.tenant_id, Uuid::from_u128(42));
+    assert_eq!(
+        request.subject,
+        SubjectInput::Principal(PrincipalSubject::new("user", Uuid::from_u128(7)))
+    );
+    assert_eq!(request.context, LicenseCheckContext::default());
+}
+
+#[test]
+fn a_consumer_can_name_a_subject_contract_object() {
+    let request = PlatformIsLicensedRequest::new(Uuid::from_u128(42), subject(), resource());
+
+    assert!(matches!(request.subject, SubjectInput::License(_)));
     assert_eq!(request.resource.id.as_deref(), Some("gpt-4o"));
 }
 
 #[test]
-fn a_consumer_without_a_security_context_can_build_one_field_by_field() {
-    let tenant = Uuid::from_u128(42);
-    let context = LicenseCheckContext::builder()
-        .tenant_id(tenant)
-        .build()
-        .expect("tenant scope set");
+fn a_tenant_plane_request_names_only_the_resource_and_context() {
+    let request = IsLicensedRequest::new(resource());
 
-    let request = IsLicensedRequest::new(subject(), resource(), context);
-
-    assert_eq!(request.context.tenant_id, tenant);
-}
-
-#[test]
-fn a_consumer_can_name_its_principal_as_the_subject() {
-    let principal = PrincipalSubject::new("user", Uuid::from_u128(7));
-    let context = LicenseCheckContext::builder()
-        .tenant_id(Uuid::from_u128(42))
-        .build()
-        .expect("tenant scope set");
-
-    let request = IsLicensedRequest::new(principal.clone(), resource(), context);
-
-    assert_eq!(request.subject, SubjectInput::Principal(principal));
-}
-
-#[test]
-fn building_a_context_without_a_tenant_is_an_error() {
-    let err = LicenseCheckContext::builder()
-        .build()
-        .expect_err("a check is always tenant-scoped");
-
-    assert!(matches!(
-        err,
-        LicenseCheckContextBuildError::MissingTenantId
-    ));
+    assert_eq!(request.resource.id.as_deref(), Some("gpt-4o"));
+    assert_eq!(request.context, LicenseCheckContext::default());
 }
 
 #[test]

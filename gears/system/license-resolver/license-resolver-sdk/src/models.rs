@@ -70,15 +70,89 @@ impl PrincipalSubject {
             id,
         }
     }
+
+    /// The principal of `ctx`. An absent principal type becomes empty, which
+    /// the resolver never maps.
+    #[must_use]
+    pub fn from_security_context(ctx: &SecurityContext) -> Self {
+        Self::new(ctx.subject_type().unwrap_or_default(), ctx.subject_id())
+    }
 }
 
-/// The subject of an [`IsLicensedRequest`]: a Subject contract object or a
+/// The subject of a [`PlatformIsLicensedRequest`]: a Subject contract object or a
 /// principal. Wire tag `kind`: `license` or `principal`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SubjectInput {
     License(Subject),
     Principal(PrincipalSubject),
+}
+
+/// Each branch is a named component: one closed object holding `kind` and the
+/// subject's fields, selected by the `kind` discriminator. The derived `allOf`
+/// of the closed subject schema and `{kind}` admits no document: the subject
+/// schema forbids `kind`, the other part requires it.
+impl SubjectInput {
+    const BRANCHES: [(&'static str, &'static str); 2] = [
+        ("license", "LicenseSubjectInput"),
+        ("principal", "PrincipalSubjectInput"),
+    ];
+
+    fn branch(kind: &str) -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::PartialSchema;
+        use utoipa::openapi::RefOr;
+        use utoipa::openapi::schema::{ObjectBuilder, Schema, Type};
+
+        let mut schema = if kind == "license" {
+            Subject::schema()
+        } else {
+            PrincipalSubject::schema()
+        };
+        if let RefOr::T(Schema::Object(object)) = &mut schema {
+            object.properties.insert(
+                "kind".to_owned(),
+                ObjectBuilder::new()
+                    .schema_type(Type::String)
+                    .enum_values(Some([kind]))
+                    .into(),
+            );
+            object.required.insert(0, "kind".to_owned());
+        }
+        schema
+    }
+}
+
+impl utoipa::PartialSchema for SubjectInput {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::Ref;
+        use utoipa::openapi::schema::{Discriminator, OneOfBuilder};
+
+        let mut one_of = OneOfBuilder::new().description(Some(
+            "A Subject contract object or a principal. Wire tag `kind`: `license` or `principal`.",
+        ));
+        for (_, name) in Self::BRANCHES {
+            one_of = one_of.item(Ref::from_schema_name(name));
+        }
+        one_of
+            .discriminator(Some(Discriminator::with_mapping(
+                "kind",
+                Self::BRANCHES.map(|(kind, name)| (kind, format!("#/components/schemas/{name}"))),
+            )))
+            .into()
+    }
+}
+
+impl ToSchema for SubjectInput {
+    fn schemas(
+        schemas: &mut Vec<(
+            String,
+            utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
+        )>,
+    ) {
+        for (kind, name) in Self::BRANCHES {
+            schemas.push((name.to_owned(), Self::branch(kind)));
+        }
+    }
 }
 
 impl From<Subject> for SubjectInput {
@@ -127,97 +201,29 @@ pub struct Resource {
     pub metadata: Map<String, Value>,
 }
 
-/// The request's tenant context — the isolation scope of a check.
+/// The operation context of a check: inputs that describe the operation being
+/// checked, beyond its subject and resource.
 ///
-/// Built from the caller's `SecurityContext` with
-/// [`from_security_context`](Self::from_security_context). Minimal today
-/// (tenant scope only); the extension point for future contextual evaluation
-/// semantics. Every resolution is scoped to this tenant.
+/// Empty today; the extension point for contextual evaluation inputs. The
+/// caller fills it from its own knowledge of the operation: it is not derived
+/// from a `SecurityContext`, so both planes carry it in the request. Optional on
+/// the wire.
 ///
 /// Unknown fields are ignored, so a contextual input can be added without
 /// breaking callers or older readers — but only one that satisfies **absence
 /// must not grant more than presence**. An input that cannot is a new version of
 /// the licensing contract, not an optional field (see "Envelope evolution" in
 /// the module's DESIGN doc).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[non_exhaustive]
-pub struct LicenseCheckContext {
-    /// The tenant the check is scoped to. No cross-tenant resolution.
-    pub tenant_id: Uuid,
-}
+#[expect(
+    clippy::empty_structs_with_brackets,
+    reason = "serde writes a unit struct as null; the context is a JSON object"
+)]
+pub struct LicenseCheckContext {}
 
-impl LicenseCheckContext {
-    /// Derive the check's tenant scope from the caller's authenticated context.
-    ///
-    /// Takes the **subject's** tenant — the tenant the authenticated principal
-    /// belongs to — so the scope of a check follows the caller rather than being
-    /// asserted independently. This is the intended constructor: a hand-assembled
-    /// context is not verified by the resolver, which receives no
-    /// `SecurityContext` of its own.
-    #[must_use]
-    pub fn from_security_context(ctx: &SecurityContext) -> Self {
-        Self {
-            tenant_id: ctx.subject_tenant_id(),
-        }
-    }
-
-    /// Assemble a context field by field.
-    ///
-    /// Prefer [`from_security_context`](Self::from_security_context); reach for
-    /// the builder only where no `SecurityContext` exists (tests, fixtures, a
-    /// caller that has already derived the tenant itself).
-    #[must_use]
-    pub fn builder() -> LicenseCheckContextBuilder {
-        LicenseCheckContextBuilder::default()
-    }
-}
-
-/// Error returned when [`LicenseCheckContextBuilder::build`] is called without
-/// required fields.
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum LicenseCheckContextBuildError {
-    /// No tenant scope was set, and a check is always tenant-scoped.
-    #[error(
-        "tenant_id is required - derive it from the caller's authenticated context with \
-         LicenseCheckContext::from_security_context"
-    )]
-    MissingTenantId,
-}
-
-/// Builder for [`LicenseCheckContext`].
-///
-/// Fields are private so that adding a contextual input stays additive: new
-/// inputs become new methods here rather than breaking existing call sites.
-#[derive(Debug, Default)]
-pub struct LicenseCheckContextBuilder {
-    tenant_id: Option<Uuid>,
-}
-
-impl LicenseCheckContextBuilder {
-    /// Scope the check to an explicit tenant.
-    #[must_use]
-    pub fn tenant_id(mut self, tenant_id: Uuid) -> Self {
-        self.tenant_id = Some(tenant_id);
-        self
-    }
-
-    /// Build the context.
-    ///
-    /// # Errors
-    ///
-    /// [`LicenseCheckContextBuildError::MissingTenantId`] if no tenant scope
-    /// was set.
-    pub fn build(self) -> Result<LicenseCheckContext, LicenseCheckContextBuildError> {
-        Ok(LicenseCheckContext {
-            tenant_id: self
-                .tenant_id
-                .ok_or(LicenseCheckContextBuildError::MissingTenantId)?,
-        })
-    }
-}
-
-/// The input of [`LicenseResolverApi::is_licensed`](crate::LicenseResolverApi::is_licensed)
+/// The input of
+/// [`PlatformLicenseResolverApi::is_licensed`](crate::PlatformLicenseResolverApi::is_licensed)
 /// — the contract's growth surface.
 ///
 /// New inputs are added as fields here, never as new method parameters. Because
@@ -230,71 +236,96 @@ impl LicenseCheckContextBuilder {
 /// [`LicenseCheckContext`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[non_exhaustive]
-pub struct IsLicensedRequest {
+pub struct PlatformIsLicensedRequest {
+    /// The tenant the check is scoped to. No cross-tenant resolution.
+    pub tenant_id: Uuid,
     /// Whom the license is checked for.
     pub subject: SubjectInput,
     /// The licensable thing being checked.
     pub resource: Resource,
-    /// The tenant isolation scope (caller-derived from its `SecurityContext`).
+    /// The operation context.
+    #[serde(default)]
+    pub context: LicenseCheckContext,
+}
+
+impl PlatformIsLicensedRequest {
+    /// A check with an empty [`context`](Self::context).
+    #[must_use]
+    pub fn new(tenant_id: Uuid, subject: impl Into<SubjectInput>, resource: Resource) -> Self {
+        Self {
+            tenant_id,
+            subject: subject.into(),
+            resource,
+            context: LicenseCheckContext::default(),
+        }
+    }
+
+    /// A check of the user of a request: the principal and the tenant of `ctx`,
+    /// passed as request data. `ctx` is read, not forwarded.
+    #[must_use]
+    pub fn for_caller(ctx: &SecurityContext, resource: Resource) -> Self {
+        Self::new(
+            ctx.subject_tenant_id(),
+            PrincipalSubject::from_security_context(ctx),
+            resource,
+        )
+    }
+}
+
+/// The input of [`LicenseResolverApi::is_licensed`](crate::LicenseResolverApi::is_licensed).
+///
+/// No subject and no tenant: both come from the caller's `SecurityContext`, so
+/// the caller cannot name either. Unknown fields are **ignored**.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[non_exhaustive]
+pub struct IsLicensedRequest {
+    /// The licensable thing being checked.
+    pub resource: Resource,
+    /// The operation context.
+    #[serde(default)]
     pub context: LicenseCheckContext,
 }
 
 impl IsLicensedRequest {
-    /// Build `context` with [`LicenseCheckContext::from_security_context`] so the
-    /// tenant scope follows the authenticated caller.
+    /// A check with an empty [`context`](Self::context).
     #[must_use]
-    pub fn new(
-        subject: impl Into<SubjectInput>,
-        resource: Resource,
-        context: LicenseCheckContext,
-    ) -> Self {
+    pub fn new(resource: Resource) -> Self {
         Self {
-            subject: subject.into(),
             resource,
-            context,
+            context: LicenseCheckContext::default(),
         }
     }
 }
 
-/// The input of
-/// [`LicenseResolverApi::is_self_licensed`](crate::LicenseResolverApi::is_self_licensed).
-///
-/// Only the resource: the subject and the tenant scope come from the caller's
-/// `SecurityContext`. Unknown fields are **ignored**.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[non_exhaustive]
-pub struct SelfLicenseCheckRequest {
-    /// The licensable thing being checked.
-    pub resource: Resource,
-}
-
-impl SelfLicenseCheckRequest {
-    #[must_use]
-    pub fn new(resource: Resource) -> Self {
-        Self { resource }
-    }
-}
-
-/// The check a backend plugin receives: an [`IsLicensedRequest`] whose subject
-/// is a [`Subject`] contract object, a principal already mapped.
+/// The check a backend plugin receives: a [`PlatformIsLicensedRequest`] whose
+/// subject is a [`Subject`] contract object, a principal already mapped.
 ///
 /// Unknown fields are **ignored**, under the same rule as
 /// [`LicenseCheckContext`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[non_exhaustive]
 pub struct LicenseCheckRequest {
+    /// The tenant the check is scoped to.
+    pub tenant_id: Uuid,
     /// Whom the license is checked for.
     pub subject: Subject,
     /// The licensable thing being checked.
     pub resource: Resource,
-    /// The tenant isolation scope (caller-derived from its `SecurityContext`).
+    /// The operation context.
+    #[serde(default)]
     pub context: LicenseCheckContext,
 }
 
 impl LicenseCheckRequest {
     #[must_use]
-    pub fn new(subject: Subject, resource: Resource, context: LicenseCheckContext) -> Self {
+    pub fn new(
+        tenant_id: Uuid,
+        subject: Subject,
+        resource: Resource,
+        context: LicenseCheckContext,
+    ) -> Self {
         Self {
+            tenant_id,
             subject,
             resource,
             context,
@@ -343,8 +374,8 @@ impl LicenseDecision {
 mod _api_dto_markers {
     use toolkit::api::api_dto::{RequestApiDto, ResponseApiDto};
 
+    impl RequestApiDto for super::PlatformIsLicensedRequest {}
     impl RequestApiDto for super::IsLicensedRequest {}
-    impl RequestApiDto for super::SelfLicenseCheckRequest {}
     impl ResponseApiDto for super::LicenseDecision {}
 }
 

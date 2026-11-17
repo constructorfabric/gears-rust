@@ -1,10 +1,12 @@
 ---
+description: "Why the license resolver, from its own configuration, maps a principal type to a Subject contract type."
 status: proposed
 date: 2026-11-11
-description: "Why the license resolver, from its own configuration, decides which licensing subject type an authenticated principal is checked as."
 ---
 
-# ADR-0004: The Resolver Maps Principals to Subject Contract Types
+# ADR-0004: The Resolver Maps Principal Types to Subject Contract Types
+
+**ID**: `cpt-cf-license-resolver-adr-principal-subject-mapping`
 
 <!-- toc -->
 
@@ -16,104 +18,94 @@ description: "Why the license resolver, from its own configuration, decides whic
   - [Confirmation](#confirmation)
 - [Pros and Cons of the Options](#pros-and-cons-of-the-options)
   - [(a) Mapping in the resolver configuration](#a-mapping-in-the-resolver-configuration)
-  - [(b) Platform principal projector](#b-platform-principal-projector)
-  - [(c) Mapping in every caller](#c-mapping-in-every-caller)
+  - [(b) Mapping in every caller](#b-mapping-in-every-caller)
+  - [(c) Platform principal projector](#c-platform-principal-projector)
   - [(d) Trait on the Subject contract type](#d-trait-on-the-subject-contract-type)
 - [More Information](#more-information)
 - [Traceability](#traceability)
 
 <!-- /toc -->
 
-**ID**: `cpt-cf-license-resolver-adr-principal-subject-mapping`
-
 ## Context and Problem Statement
 
-A **principal** is whoever authenticated: a person, a service account, a system actor. AuthN puts its kind, the
-**principal type**, into `SecurityContext.subject_type` and its UUID into `subject_id`. Principal types form a GTS
-hierarchy shared by the platform (for example `gts.cf.core.identity.principal.v1~cf.core.identity.user.v1~`), and
-operators derive their own types from it.
+A **principal** is whoever authenticated. AuthN puts its type, a GTS type id, into `SecurityContext.subject_type` and
+its UUID into `subject_id`. Principal types form a GTS hierarchy, and operators derive their own types from it.
 
-The Subject of a check is an instance of a Subject contract type derived from `gts.cf.core.lic.subj.v1~`. These are
-different hierarchies: a GTS type has one parent, and the operator decides which principals take part in licensing and
-under which Subject contract type. The most common check is about the principal itself, but the calling module does
-not know the operator's Subject contract types. Who maps a principal type to a Subject contract type, and where is the
-mapping stored?
+The Subject of a check is an instance of a Subject contract type derived from `gts.cf.core.lic.subj.v1~`. Principal
+types and Subject contract types are different hierarchies: a GTS type has one parent, and the operator decides which
+principals take part in licensing and under which Subject contract type. The most common check is about the principal
+itself, but the calling module does not know the operator's Subject contract types. Who maps a principal type to a
+Subject contract type, and where is the mapping stored?
 
 ## Decision Drivers
 
-* The mapping is operator data: the same module runs under different operators with different Subject contract types.
-* The mapping must be stated in one place, not repeated in every calling module.
-* An operator subtype of a principal type must be covered by the mapping of its ancestor without a separate entry.
-* Backend plugins must keep receiving Subject contract types only.
-* A principal that the operator did not map must not be licensed.
+* The mapping is operator data: the same module runs under operators with different Subject contract types.
+* The mapping is stated once, not in every calling module.
+* An operator subtype of a principal type is covered by the entry of its ancestor.
+* The plugin receives Subject contract objects only.
+* A principal that the operator did not map is not licensed.
 
 ## Considered Options
 
-* (a) The resolver maps principal types to Subject contract types from its own configuration; a check names its
-  subject either as a Subject contract object or as a principal.
-* (b) A platform projector: mapping instances registered in types-registry, resolved by a shared library in each caller.
-* (c) Each calling module maps principal types from its own configuration.
+* (a) The resolver maps principal types to Subject contract types from its own configuration.
+* (b) Each calling module maps principal types from its own configuration.
+* (c) A platform principal projector: mapping instances in types-registry, resolved by a shared library in each
+  caller.
 * (d) A trait on each Subject contract type that lists the principal types it represents.
 
 ## Decision Outcome
 
-Chosen option: (a), because the resolver is the single owner of licensing subjects, so one configuration serves every
-caller, and the plugins see no change. Option (b) was rejected at the current stage: the mapping stays with the owner
-of the domain subject.
+Chosen option: (a), because the resolver is the single entry point for license checks, so one configuration serves
+every caller and the plugin sees no principals.
 
-The public check accepts the subject in one of two forms:
+A subject in a platform request, the request that a module authenticated by its own service credential sends on the
+platform plane (`cpt-cf-license-resolver-adr-two-planes`), has one of two forms, tagged by `kind`:
 
-* **license subject**: a Subject contract object (`type`, optional `id`, `metadata`), as before;
+* **license**: a Subject contract object `{type, id, metadata}`;
 * **principal**: a principal type and a principal id. The resolver replaces it with a Subject contract object of the
-  mapped type, the same id and empty `metadata`, and then validates and delegates as for a license subject.
+  mapped type, the same id and empty `metadata`, then validates and delegates it as any other subject.
 
-A second method takes the caller's `SecurityContext` and the Resource only. It builds the principal from the context
-(`subject_type`, `subject_id`) and the tenant scope from `subject_tenant_id`, so the request has no subject or context
-fields that the caller could set differently.
+Mapping lookup for a principal type `P`, from the configuration `principal_subject_types`:
 
-Mapping lookup for a principal type `P`:
+1. an entry with key `P` wins, without a registry lookup;
+2. otherwise the resolver resolves `P` in types-registry and takes the nearest ancestor of `P` that has an entry;
+3. otherwise, or when `P` is absent, malformed, or not registered, the principal is **not mapped**.
 
-1. an entry with key `P` wins;
-2. otherwise the resolver resolves `P` in types-registry and takes the first ancestor of `P`, nearest first, that has
-   an entry;
-3. otherwise, or when `P` is absent, malformed or not registered, the principal is **not mapped**.
-
-A principal that is not mapped yields `LicenseDecision { granted: false }`; the request is well formed, the operator
-only has not licensed that kind of principal. A registry failure during the lookup is `ServiceUnavailable`.
+A principal with a nil id or a nil tenant is not mapped either. A principal that is not mapped yields
+`LicenseDecision { granted: false }` with the reason `principal_not_mapped`; the Resource is not validated and the
+plugin is not called. A registry failure during the lookup is `ServiceUnavailable`.
 
 ### Consequences
 
-* The public request type differs from the plugin request type: the plugin keeps receiving a request whose subject is a
-  Subject contract object. The public request shape changes incompatibly; there are no external callers yet.
-* The mapped Subject contract type gets empty `metadata`. A type whose schema requires metadata fails validation with
-  `InvalidRequest`, which surfaces the misconfiguration.
-* A principal that is not mapped is denied without validating the Resource.
 * A mapping change needs a configuration change and a restart.
+* The mapped Subject contract type gets empty `metadata`. A type whose schema requires metadata fails validation with
+  `InvalidRequest`; the resolver logs it as a likely misconfiguration, throttled.
+* The public subject differs from the plugin subject: the plugin keeps receiving a Subject contract object.
 
 ### Confirmation
 
-Tests for exact match, ancestor match, nearest ancestor wins, no mapping, absent principal type, unregistered
-principal type, registry failure, a mapped type that requires metadata, and the self-check method.
+Tests for exact match, nearest ancestor, no entry, absent or unregistered principal type, nil id or tenant, registry
+failure, and a mapped type that requires metadata.
 
 ## Pros and Cons of the Options
 
 ### (a) Mapping in the resolver configuration
 
-* Good, because one configuration serves every caller and no caller knows the operator's types.
-* Good, because plugins and stored grants see Subject contract types only.
-* Bad, because another module that needs the same mapping (for example to bind a grant to a user) has to go through the
-  resolver or repeat the configuration.
+* Good, because one configuration serves every caller.
+* Good, because the plugin and the stored grants see Subject contract types only.
+* Bad, because another module that needs the same mapping, for example to bind a grant to a user, repeats the
+  configuration.
 
-### (b) Platform principal projector
-
-* Good, because the mapping is discoverable in types-registry.
-* Bad, because it adds a platform mechanism that knows nothing about any domain and needs a snapshot and refresh in
-  every caller.
-
-### (c) Mapping in every caller
+### (b) Mapping in every caller
 
 * Good, because the resolver stays unchanged.
 * Bad, because the operator repeats the mapping in every calling module.
+
+### (c) Platform principal projector
+
+* Good, because the mapping is discoverable in types-registry for every domain.
+* Bad, because it adds a platform mechanism with a snapshot and a refresh task in every caller, before any second
+  domain needs it.
 
 ### (d) Trait on the Subject contract type
 
@@ -135,4 +127,4 @@ This decision directly addresses the following requirements or design elements:
 
 * `cpt-cf-license-resolver-fr-principal-subject` — the principal form of the subject and its mapping.
 * `cpt-cf-license-resolver-fr-subject-identity` — a mapped principal becomes a Subject contract object.
-* `cpt-cf-license-resolver-nfr-tenant-scoping` — the self-check method takes the tenant from the context.
+* `cpt-cf-license-resolver-nfr-fail-closed` — a principal that is not mapped is never licensed.
