@@ -606,7 +606,7 @@ impl From<RateLimitConfig> for domain::RateLimitConfig {
             strategy: v.strategy.into(),
             cost: v.cost,
             response_headers: v.response_headers,
-            pool_owner_id: None,
+            shared_pool: None,
             limit_owner_id: None,
         }
     }

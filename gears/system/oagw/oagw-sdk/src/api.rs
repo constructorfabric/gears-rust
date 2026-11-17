@@ -146,6 +146,13 @@ pub trait ServiceGatewayClientV1: Send + Sync {
     /// diagnostics and config preview. The path is matched in the form the
     /// proxy matches it in.
     ///
+    /// The upstream's `rate_limit` is the tenant-merged upstream limit; the
+    /// route's is the route's own. The proxy checks each on its own bucket.
+    /// When the route shadows an ancestor's route for the same request, the
+    /// proxy also checks that route's enforced rate limit on that route's
+    /// bucket; it is not part of the answer. The enforced plugins of such a
+    /// route are in the upstream's `plugins`.
+    ///
     /// # Errors
     ///
     /// - `PermissionDenied` (403) without `read` on upstreams in the

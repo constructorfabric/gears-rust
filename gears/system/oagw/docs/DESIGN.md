@@ -849,6 +849,8 @@ sequenceDiagram
 
 With a database, `resolve_proxy_target` reads the upstream candidates and routes through the per-replica proxy configuration cache; a hit runs no query (§4.1).
 
+**Rate limits** (after endpoint selection, before the request is sent; [ADR-0004](./ADR/0004-rate-limiting.md)): buckets are checked narrowest first: the route's own limit on the route's bucket, then the enforced limit of each ancestor's route the matched route shadows on that route's own bucket (closest ancestor first), then the upstream's tenant-merged limit on the upstream's bucket, then a shared budget's pool bucket when the limit draws on one. A bucket that admitted the request stays charged when a later one rejects it, so a request a route limit rejects is not charged to the upstream bucket or to the pool other tenants draw on. Route limits are not merged into the upstream's, so whichever route matches the upstream bucket keeps one config. A rejection reports the rejecting bucket's numbers and `Retry-After`. `scope: ip` keys on the client address the API gateway resolved and passes as the `toolkit::http::ClientIp` request extension: the connection's peer address, or with the gateway's `trusted_proxy_hops` ≥ 1 the `X-Forwarded-For` entry the outermost trusted proxy wrote. OAGW does not read `X-Forwarded-For` or `X-Real-IP` itself; a request without the extension (an in-process SDK call, or a gear behind the edge's reverse proxy, which strips both headers) uses the shared `unknown` bucket.
+
 #### Management Operation Flow
 
 ```text

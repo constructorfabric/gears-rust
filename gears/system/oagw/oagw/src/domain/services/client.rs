@@ -389,7 +389,7 @@ fn rate_limit_config_to_domain(v: oagw_sdk::RateLimitConfig) -> model::RateLimit
         },
         cost: v.cost,
         response_headers: v.response_headers,
-        pool_owner_id: None,
+        shared_pool: None,
         limit_owner_id: None,
     }
 }

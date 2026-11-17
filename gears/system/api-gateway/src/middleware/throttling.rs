@@ -21,14 +21,13 @@
 //! `zone`/`kind`) and logged at `warn`.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use axum::extract::{ConnectInfo, Request};
+use axum::extract::Request;
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -922,57 +921,12 @@ fn missing_context_response(key: &ThrottleKey, zone: &str, auth: RouteAuth) -> R
         .into_response()
 }
 
-/// Resolve the client IP used as the throttling bucket key.
-///
-/// Client-supplied forwarding headers (`X-Forwarded-For` / `X-Real-IP`) are
-/// only honored when the gateway sits behind a known number of trusted reverse
-/// proxies, given by `trusted_proxy_hops`:
-///
-/// - `0` (the default): the headers are fully client-controlled and are
-///   ignored. The peer address from `ConnectInfo` is used (else `"unknown"`),
-///   so a caller cannot spoof or rotate the bucket key to bypass IP limits.
-/// - `n >= 1`: the client IP is taken from the `X-Forwarded-For` entry `n`
-///   positions from the right — the value appended by the outermost trusted
-///   proxy, which an untrusted client cannot forge (any spoofed entries it
-///   prepends only shift this index further right). When `X-Forwarded-For` is
-///   absent or too short, the immediate (trusted) proxy's `X-Real-IP` is used,
-///   then the peer address, then `"unknown"`.
+/// Resolve the client IP used as the throttling bucket key: the address of
+/// [`client_ip::resolve`](crate::middleware::client_ip::resolve), else
+/// `"unknown"`.
 fn client_ip(req: &Request, trusted_proxy_hops: usize) -> String {
-    if trusted_proxy_hops == 0 {
-        return peer_ip(req);
-    }
-    let headers = req.headers();
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        let entries: Vec<&str> = xff
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect();
-        if let Some(idx) = entries.len().checked_sub(trusted_proxy_hops)
-            && let Some(candidate) = entries.get(idx)
-            && let Ok(ip) = candidate.parse::<IpAddr>()
-        {
-            return ip.to_string();
-        }
-    }
-    // The immediate peer is a trusted proxy, so its `X-Real-IP` is trustworthy.
-    if let Some(ip) = headers
-        .get("x-real-ip")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .and_then(|s| s.parse::<IpAddr>().ok())
-    {
-        return ip.to_string();
-    }
-    peer_ip(req)
-}
-
-/// The immediate peer address from `ConnectInfo`, or `"unknown"` when absent.
-fn peer_ip(req: &Request) -> String {
-    req.extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map_or_else(|| "unknown".to_owned(), |ci| ci.0.ip().to_string())
+    crate::middleware::client_ip::resolve(req, trusted_proxy_hops)
+        .map_or_else(|| "unknown".to_owned(), |ip| ip.to_string())
 }
 
 /// Build a throttling rejection response.

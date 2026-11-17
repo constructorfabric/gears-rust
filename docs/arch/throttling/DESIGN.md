@@ -444,8 +444,10 @@ zone in production shows churn.
 ### [Risk] Proxy-header trust is a deployment contract, not a runtime check
 
 With `trusted_proxy_hops >= 1` the gateway derives the client IP from
-`X-Forwarded-For` by position, with `X-Real-IP` as the fallback under the same
-trust assumption, and never verifies that the immediate peer is a trusted
+`X-Forwarded-For` by position, counting entries across all field lines in
+order (a proxy may add its own line instead of appending to the client's),
+with a single `X-Real-IP` line as the fallback under the same trust assumption
+(several lines are ambiguous and ignored), and never verifies that the immediate peer is a trusted
 proxy. A gateway that is reachable directly therefore lets a client choose or
 rotate its IP throttling key. The requirement is documented on
 `trusted_proxy_hops`: only trusted proxies may reach the gateway, and they must

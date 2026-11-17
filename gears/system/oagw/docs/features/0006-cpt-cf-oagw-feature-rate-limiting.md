@@ -130,15 +130,18 @@ Prevents abuse, cost overruns, and protects external service agreements. Maintai
 **Error Scenarios**:
 - Budget allocation exceeds parent's available capacity (400 ValidationError)
 - Child rate limit exceeds enforced ancestor limit (400 ValidationError)
+- Upstream's effective cost exceeds the `budget.total` of the shared pool it draws on (400 ValidationError)
 - Invalid configuration values (400 ValidationError)
 
 **Steps**:
 1. [x] - `p2` - Actor sends PUT /api/oagw/v1/upstreams/{id} or PUT /api/oagw/v1/routes/{id} with `rate_limit`, `circuit_breaker`, or `concurrency_limit` in request body - `inst-cfg-1`
-2. [x] - `p2` - Validate rate limit config, on upstreams and routes alike: `sustained.rate` ≥ 1, `burst.capacity` ≥ 1, `cost` ≥ 1, `scope` is valid enum, `strategy` is valid enum. `cost` is not compared with `capacity` - `inst-cfg-2`
+2. [x] - `p2` - Validate rate limit config, on upstreams and routes alike: `sustained.rate` ≥ 1, `burst.capacity` ≥ 1, `cost` ≥ 1, `scope` is valid enum, `strategy` is valid enum, and `cost` ≤ the bucket capacity (`burst.capacity` for a token bucket with a burst, else `sustained.rate`; a sliding window ignores `burst`), since a costlier request could never pass - `inst-cfg-2`
+   1. [x] - `p2` - On an upstream, the effective limit's `cost` ≤ `budget.total` of the shared pool it draws on (its own shared budget or the one an ancestor defines, from the merge `cpt-cf-oagw-algo-hierarchical-rate-limit-merge` over the ancestors already found by `cpt-cf-oagw-algo-tenant-closest-ancestor`, disabled ones included): the pool is charged the upstream's effective cost, so a costlier request would be refused by it every time. A route's cost goes to the route's bucket only and is not checked against the pool. A shortfall the ancestors' effective limit already has (a pool lowered under a descendant's cost, which is not re-checked) does not block the write - `inst-cfg-2a`
 3. [x] - `p2` - **IF** `budget.mode` = `allocated` - `inst-cfg-3`
    1. [x] - `p2` - Use the closest ancestor upstream already found by `cpt-cf-oagw-algo-tenant-closest-ancestor` for this request (no separate ancestor walk) - `inst-cfg-3-anc`
-   2. [x] - `p2` - Validate sum of child allocations ≤ parent budget × `overcommit_ratio`; descendant allocations are loaded with one `list_by_alias_for_tenants` call over the ancestor's descendant tree - `inst-cfg-3a`
-   3. [x] - `p2` - **IF** validation fails - `inst-cfg-3b`
+   2. [x] - `p2` - Validate sum of child allocations ≤ parent budget × `overcommit_ratio`; descendant allocations are loaded with one `list_by_alias_for_tenants` call over the ancestor's descendant tree, and only direct allocations count: an upstream whose path up to the parent passes another tenant with the alias allocates from that tenant instead - `inst-cfg-3a`
+   3. [x] - `p2` - When a parent's update changes its budget or its `sustained.window` (the window `budget.total` is counted in), its direct allocations are checked against the proposed budget - `inst-cfg-3a-own`
+   4. [x] - `p2` - **IF** validation fails - `inst-cfg-3b`
       1. [x] - `p2` - **RETURN** 400 ValidationError with budget allocation details - `inst-cfg-3b1`
 4. [x] - `p2` - **IF** ancestor has `sharing: enforce` on rate limit - `inst-cfg-4`
    1. [x] - `p2` - Validate descendant's limit does not exceed ancestor's enforced limit - `inst-cfg-4a`
@@ -155,7 +158,7 @@ Prevents abuse, cost overruns, and protects external service agreements. Maintai
 
 - [x] `p2` - **ID**: `cpt-cf-oagw-algo-token-bucket-check`
 
-**Input**: Rate limit config (algorithm, sustained rate, burst capacity, scope, cost), request context (tenant_id, user_id, IP, route_id)
+**Input**: Rate limit config (algorithm, sustained rate, burst capacity, scope, cost), request context (tenant_id, user_id, client IP, route_id)
 
 **Output**: Allow (with remaining tokens) or deny (with retry-after estimate)
 
@@ -163,11 +166,13 @@ Prevents abuse, cost overruns, and protects external service agreements. Maintai
 1. [x] - `p2` - Determine counter key from scope (format varies by scope): - `inst-tb-1`
      - `tenant`: `oagw:ratelimit:{resource_type}:{resource_id}:tenant:{tenant_id}:{window}`
      - `user`: `oagw:ratelimit:{resource_type}:{resource_id}:user:{subject_id}:{window}`
-     - `ip`: `oagw:ratelimit:{resource_type}:{resource_id}:ip:{client_ip}:{window}` (falls back to `unknown` when no client IP)
+     - `ip`: `oagw:ratelimit:{resource_type}:{resource_id}:ip:{client_ip}:{window}`. The client IP is the address the API gateway resolved (`ClientIp` request extension): the peer address, or with `trusted_proxy_hops` ≥ 1 the `X-Forwarded-For` entry the outermost trusted proxy wrote. OAGW never reads forwarding headers itself. Without the extension (in-process SDK calls) all requests share the `unknown` bucket
      - `global`: `oagw:ratelimit:{resource_type}:{resource_id}:global:{window}` (no scope_id segment)
-     - `route`: `oagw:ratelimit:{resource_type}:{resource_id}:route:{window}` (no scope_id segment)
-     - An upstream bucket whose effective limit is not owned by its `{resource_id}` (the selected upstream, or the pool owner for a shared budget) names its owner: `{resource_id}:via:{limit_owner_id}` in place of `{resource_id}`. Tenants resolving one upstream can get different limits (another tenant's `private` limit does not apply to them), and one shared bucket would be reset by the other's config on every request. A shared-budget pool keeps the pool owner as `{resource_id}`; tenants that inherit the owner's limit share its bucket, a tenant whose own limit applies gets its own.
-2. [x] - `p2` - Load or create in-memory `TokenBucket` for key - `inst-tb-2`
+     - `route`: `oagw:ratelimit:{resource_type}:{resource_id}:route:{route_id}:{window}` (one bucket per matched route, also for an upstream limit)
+     - The upstream's scoped bucket uses the shared-budget owner's id as `{resource_id}` when the limit draws on a shared pool
+     - An upstream's scoped bucket whose effective limit is not owned by its `{resource_id}` (the selected upstream, or the pool owner for a shared budget) names its owner: `{resource_id}:via:{limit_owner_id}` in place of `{resource_id}`. Tenants resolving one upstream can get different limits (another tenant's `private` limit does not apply to them), and in one bucket one tenant's requests would use up the other's limit. Tenants that inherit a pool owner's limit share its scoped bucket without `via`; a tenant whose own limit applies gets its own; route and pool buckets never carry it
+     - Shared pool: `oagw:ratelimit:upstream:{owner_id}:pool:{window}`, checked last (after the route buckets and the upstream's scoped bucket, so a request one of them rejects does not draw on the pool other tenants share), with capacity and refill `budget.total` per the owner's window and the request's `cost`
+2. [x] - `p2` - Load or create in-memory `TokenBucket` for key. A key reached with another config (a merged limit that differs by tenant chain, a write made on another replica) keeps what was consumed: the old bucket refills to now, then the new one starts with `tokens = new_capacity - (old_capacity - old_tokens)`, possibly negative, so switching configs never gains a request (a sliding window on the same window takes the new limit in place). A write through this replica drops the resource's keys instead, so the next request starts a full bucket - `inst-tb-2`
 3. [x] - `p2` - Refill tokens: `elapsed = now - last_update`, `new_tokens = elapsed_seconds × refill_rate`, `tokens = min(tokens + new_tokens, capacity)`, `last_update = now` - `inst-tb-3`
 4. [x] - `p2` - **IF** `tokens >= cost` - `inst-tb-4`
    1. [x] - `p2` - Deduct: `tokens -= cost` - `inst-tb-4a`
@@ -194,8 +199,11 @@ Prevents abuse, cost overruns, and protects external service agreements. Maintai
 3. [x] - `p2` - Compute effective sustained rate: `min(own_rate, all_enforced_ancestor_rates)` - `inst-merge-3`
 4. [x] - `p2` - Compute effective burst capacity: `min(own_burst, all_enforced_ancestor_bursts)` - `inst-merge-4`
 5. [x] - `p2` - **IF** route has own rate limit config - `inst-merge-5`
-   1. [x] - `p2` - Apply route-level override: `effective = min(upstream_effective, route_config)` - `inst-merge-5a`
-6. [x] - `p2` - **RETURN** effective rate limit config - `inst-merge-6`
+   1. [x] - `p2` - Enforce it on the route's own bucket next to the upstream's, so the effective limit is `min(upstream_effective, route_config)`; it is not merged into the upstream's config, which stays the same whichever route matched - `inst-merge-5a`
+   2. [x] - `p2` - **IF** the matched route shadows ancestors' routes with an enforced rate limit (`cpt-cf-oagw-algo-tenant-config-merge` `inst-merge-2a`), enforce each on that route's own bucket too, keyed by its id and its own scope as if it had matched; none is merged into the upstream's config - `inst-merge-5c`
+6. [x] - `p2` - **IF** an upstream in the chain has `budget.mode = shared` and the descendant did not opt out with a non-enforced `private` limit - `inst-merge-5b`
+   1. [x] - `p2` - Record the pool (owner upstream, `budget.total`, owner's window and algorithm) with the effective config; the first defining ancestor owns it - `inst-merge-5b1`
+7. [x] - `p2` - **RETURN** effective rate limit config - `inst-merge-6`
 
 ### Circuit Breaker State Evaluation
 
@@ -359,7 +367,7 @@ The system **MUST** include `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X
 
 - [x] `p2` - **ID**: `cpt-cf-oagw-dod-hierarchical-rate-merge`
 
-The system **MUST** compute effective rate limits by walking the tenant hierarchy and applying `min(ancestor.enforced, descendant)` per `cpt-cf-oagw-adr-rate-limiting`. When ancestor sharing = `enforce`, descendant **MUST NOT** exceed ancestor's limit. When sharing = `inherit` and descendant has no config, ancestor's config **MUST** be used. Budget allocation **MUST** validate that sum of child allocations ≤ parent budget × `overcommit_ratio`. Route-level rate limits **MUST** apply as `min(upstream_effective, route_config)`.
+The system **MUST** compute effective rate limits by walking the tenant hierarchy and applying `min(ancestor.enforced, descendant)` per `cpt-cf-oagw-adr-rate-limiting`. When ancestor sharing = `enforce`, descendant **MUST NOT** exceed ancestor's limit. When sharing = `inherit` and descendant has no config, ancestor's config **MUST** be used. Budget allocation **MUST** validate that sum of direct child allocations ≤ parent budget × `overcommit_ratio`. A shared budget **MUST** limit every tenant drawing on it to `budget.total` per window together. Route-level rate limits **MUST** apply as `min(upstream_effective, route_config)`, each on its own bucket.
 
 **Implements**:
 - `cpt-cf-oagw-algo-hierarchical-rate-limit-merge`
@@ -421,8 +429,11 @@ The system **MUST** implement `reject` and `queue` strategies for handling overl
 - [x] Hierarchical rate limit merge computes `effective = min(ancestor.enforced, descendant)` across tenant hierarchy
 - [x] Ancestor with `sharing: enforce` prevents descendant from exceeding enforced limit
 - [x] Ancestor with `sharing: inherit` provides default config when descendant has none
-- [x] Budget allocation validates sum of child allocations ≤ parent budget × `overcommit_ratio`; rejects if exceeded
-- [x] Route-level rate limit applies as `min(upstream_effective, route_config)`
+- [x] Budget allocation validates sum of direct child allocations ≤ parent budget × `overcommit_ratio`; rejects if exceeded, also when the parent changes its window
+- [x] Shared budget: every tenant drawing on it shares one pool of `budget.total` requests per window
+- [x] An upstream whose effective cost exceeds the `budget.total` of the shared pool it draws on is rejected on write
+- [x] Route-level rate limit applies as `min(upstream_effective, route_config)`; calling routes in turn does not refill the upstream bucket
+- [x] `scope: ip` keys on the address the API gateway resolved; forwarding headers a client sends do not change it
 - [ ] Circuit breaker transitions CLOSED → OPEN when consecutive failures ≥ `failure_threshold`
 - [ ] Circuit breaker transitions OPEN → HALF_OPEN after `timeout_seconds` elapsed
 - [ ] Circuit breaker transitions HALF_OPEN → CLOSED after `success_threshold` consecutive probe successes
@@ -455,7 +466,7 @@ Rate limiting and concurrency control are on the hot path for every proxy reques
 
 ### Distributed State
 
-MVP uses per-instance rate limiting and concurrency control (no distributed coordination). Distributed rate limiting via Redis (hybrid local + periodic sync per `cpt-cf-oagw-adr-rate-limiting`) and distributed circuit breaker state (Redis-backed per `cpt-cf-oagw-adr-circuit-breaker`) are production-grade capabilities. Redis key structure: `oagw:ratelimit:{resource_type}:{resource_id}:{scope}:{scope_id}:{window}` for rate limits, `oagw:cb:{tenant_id}:{upstream_id}:*` for circuit breaker.
+MVP uses per-instance rate limiting and concurrency control (no distributed coordination). Distributed rate limiting via Redis (hybrid local + periodic sync per `cpt-cf-oagw-adr-rate-limiting`) and distributed circuit breaker state (Redis-backed per `cpt-cf-oagw-adr-circuit-breaker`) are production-grade capabilities. Redis key structure: `oagw:ratelimit:{resource_type}:{resource_id}:{scope}:{scope_id}:{window}` for rate limits (`route` scope: `{scope_id}` is the route id; shared pools: `oagw:ratelimit:upstream:{owner_id}:pool:{window}`), `oagw:cb:{tenant_id}:{upstream_id}:*` for circuit breaker.
 
 ### Deliberate Omissions
 

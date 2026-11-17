@@ -1,5 +1,5 @@
 //! Tenants that resolve different limits on one upstream must not share its
-//! bucket: one tenant's requests would reset the other's.
+//! bucket: one tenant's requests would use up the other's limit.
 //!
 //! root -> parent -> child, one alias `svc`. The root's limit is `inherit`,
 //! 1000/min; the parent's own is `private`, 1/min, and its noop auth is
@@ -80,7 +80,7 @@ async fn call(
 }
 
 #[tokio::test]
-async fn a_descendants_requests_do_not_reset_a_private_limit() {
+async fn a_descendants_requests_do_not_use_up_a_private_limit() {
     let port = server().await;
     let (root, parent, child) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
     let hub = ClientHub::new();
@@ -137,8 +137,9 @@ async fn a_descendants_requests_do_not_reset_a_private_limit() {
     .await
     .unwrap();
 
-    assert_eq!(call(&gw, &parent).await.unwrap().status(), 200);
+    // In one bucket the child's request would use up the parent's 1/min.
     assert_eq!(call(&gw, &child).await.unwrap().status(), 200);
+    assert_eq!(call(&gw, &parent).await.unwrap().status(), 200);
     let err = call(&gw, &parent).await.unwrap_err();
     assert!(
         matches!(err, CanonicalError::ResourceExhausted { .. }),

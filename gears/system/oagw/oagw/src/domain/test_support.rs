@@ -534,6 +534,24 @@ impl MockTenantResolverClient {
         }
         Self { tenants }
     }
+
+    /// Add `child` under `parent`, which must already be known.
+    pub fn add_child(&mut self, parent: TenantId, child: TenantId) {
+        let Some((parent_info, parent_ancestors)) = self.tenants.get(&parent).cloned() else {
+            panic!("add_child: unknown parent {parent}");
+        };
+        let mut ancestors = vec![TenantRef::from(parent_info)];
+        ancestors.extend(parent_ancestors);
+        let info = TenantInfo {
+            id: child,
+            name: format!("tenant-{}", &child.to_string()[..8]),
+            status: TenantStatus::Active,
+            tenant_type: None,
+            parent_id: Some(parent),
+            self_managed: false,
+        };
+        self.tenants.insert(child, (info, ancestors));
+    }
 }
 
 #[async_trait]
@@ -623,7 +641,7 @@ impl TenantResolverClient for MockTenantResolverClient {
         &self,
         _ctx: &SecurityContext,
         id: TenantId,
-        _options: &GetDescendantsOptions,
+        options: &GetDescendantsOptions,
     ) -> Result<GetDescendantsResponse, TenantResolverError> {
         let tenant_ref = if let Some((info, _)) = self.tenants.get(&id) {
             TenantRef::from(info.clone())
@@ -636,13 +654,21 @@ impl TenantResolverClient for MockTenantResolverClient {
                 self_managed: false,
             }
         };
-        // Collect children from the hierarchy map.
-        let descendants: Vec<TenantRef> = self
-            .tenants
-            .values()
-            .filter(|(info, _)| info.parent_id == Some(id))
-            .map(|(info, _)| TenantRef::from(info.clone()))
-            .collect();
+        // The whole subtree, as the real resolver returns it (pre-order,
+        // children unordered), down to `max_depth`.
+        let mut descendants: Vec<TenantRef> = Vec::new();
+        let mut stack: Vec<(TenantId, u32)> = vec![(id, 0)];
+        while let Some((parent, depth)) = stack.pop() {
+            if options.max_depth.is_some_and(|max| depth >= max) {
+                continue;
+            }
+            for (info, _) in self.tenants.values() {
+                if info.parent_id == Some(parent) {
+                    descendants.push(TenantRef::from(info.clone()));
+                    stack.push((info.id, depth + 1));
+                }
+            }
+        }
         Ok(GetDescendantsResponse {
             tenant: tenant_ref,
             descendants,

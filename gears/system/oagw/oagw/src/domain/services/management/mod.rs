@@ -17,8 +17,8 @@ use crate::domain::ssrf::SsrfGuard;
 
 use crate::domain::error::{DeniedOn, DomainError};
 use crate::domain::model::{
-    CreateRouteRequest, CreateUpstreamRequest, ListQuery, ManagedBy, Route, UpdateRouteRequest,
-    UpdateUpstreamRequest, Upstream,
+    CreateRouteRequest, CreateUpstreamRequest, ListQuery, ManagedBy, ProxyTarget, Route,
+    UpdateRouteRequest, UpdateUpstreamRequest, Upstream,
 };
 use crate::domain::ports::OagwMetricsPort;
 use crate::domain::rate_limit::RateLimiter;
@@ -38,6 +38,7 @@ use alias::{
 use ancestor::ancestor_upstreams;
 use authz::{Action, Managed};
 use bind::{BindOverrides, validate_bind_constraints, validate_secret_ref_accessible};
+use budget::validate_shared_pool_cost;
 use canonical::canonical_tags;
 pub(crate) use canonical::{route_drift, upstream_drift};
 #[cfg(test)]
@@ -45,6 +46,7 @@ use merge::compute_effective_config;
 #[cfg(test)]
 use merge::merge_rate_limit;
 pub(crate) use registry::RegistryProvisionerImpl;
+use resolution::ResolvedAlias;
 pub(in crate::domain::services) use validation::validate_route_request;
 #[cfg(test)]
 pub(crate) use validation::{MAX_GRPC_NAME_BYTES, MAX_PATH_BYTES, MAX_REF_BYTES, MAX_TAG_BYTES};
@@ -281,8 +283,13 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
             .resolve_alias_sourced(ctx, &tenant_chain, alias, Some((method, &path)), Tags::Load)
             .await;
         let (upstream, route, sources) = match resolved {
-            Ok((upstream, Some(route), sources)) => (upstream, route, sources),
-            Ok((_, None, _)) => {
+            Ok(ResolvedAlias {
+                effective,
+                route: Some(route),
+                sources,
+                ..
+            }) => (effective, route, sources),
+            Ok(ResolvedAlias { route: None, .. }) => {
                 return Err(DomainError::Internal {
                     message: "resolve_alias returned None route for method+path request".into(),
                 });
@@ -352,7 +359,7 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
         method: &str,
         path: &str,
         tags: Tags,
-    ) -> Result<(Upstream, Route), DomainError> {
+    ) -> Result<ProxyTarget, DomainError> {
         self.resolve_target(grant.ctx(), alias, method, path, tags)
             .await
     }
@@ -369,7 +376,7 @@ impl ControlPlaneServiceImpl {
         method: &str,
         path: &str,
         tags: Tags,
-    ) -> Result<(Upstream, Route), DomainError> {
+    ) -> Result<ProxyTarget, DomainError> {
         let tenant_chain = self.build_tenant_chain(ctx).await?;
         self.resolve_in_chain(ctx, &tenant_chain, alias, method, path, tags)
             .await
@@ -384,16 +391,17 @@ impl ControlPlaneServiceImpl {
         method: &str,
         path: &str,
         tags: Tags,
-    ) -> Result<(Upstream, Route), DomainError> {
-        let (effective, route) = self
-            .resolve_alias(ctx, tenant_chain, alias, Some((method, path)), tags)
+    ) -> Result<ProxyTarget, DomainError> {
+        let resolved = self
+            .resolve_alias_sourced(ctx, tenant_chain, alias, Some((method, path)), tags)
             .await?;
-        Ok((
-            effective,
-            route.ok_or_else(|| DomainError::Internal {
+        Ok(ProxyTarget {
+            upstream: resolved.effective,
+            route: resolved.route.ok_or_else(|| DomainError::Internal {
                 message: "resolve_alias returned None route for method+path request".into(),
             })?,
-        ))
+            shadowed_route_limits: resolved.shadowed_route_limits,
+        })
     }
 }
 
@@ -557,6 +565,7 @@ impl ControlPlaneServiceImpl {
             tags: canonical_tags(req.tags),
             managed_by,
         };
+        validate_shared_pool_cost(&ancestors, &upstream)?;
 
         self.upstreams
             .create(upstream)
@@ -666,15 +675,16 @@ impl ControlPlaneServiceImpl {
         )
         .await?;
 
-        // If this upstream's budget is being tightened (lower total, lower
-        // overcommit_ratio, or mode changed to allocated), verify that existing
-        // descendant allocations still fit within the proposed budget.
+        // If this upstream's budget may be tightened (lower total, lower
+        // overcommit_ratio, mode changed to allocated, or a longer window the
+        // total is counted in), verify that existing descendant allocations
+        // still fit within the proposed budget.
         if let Some(ref new_rl) = req.rate_limit {
             let old_budget = existing
                 .rate_limit
                 .as_ref()
-                .and_then(|rl| rl.budget.as_ref());
-            let new_budget = new_rl.budget.as_ref();
+                .map(|rl| (rl.budget.as_ref(), rl.sustained.window));
+            let new_budget = Some((new_rl.budget.as_ref(), new_rl.sustained.window));
             let budget_changed = old_budget != new_budget;
             if budget_changed {
                 self.validate_descendants_within_budget(ctx, &existing.alias, new_rl)
@@ -690,6 +700,7 @@ impl ControlPlaneServiceImpl {
         existing.cors = req.cors;
         existing.tags = canonical_tags(req.tags);
         existing.enabled = req.enabled;
+        validate_shared_pool_cost(&ancestors, &existing)?;
 
         let current = self
             .upstreams

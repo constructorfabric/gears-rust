@@ -312,6 +312,18 @@ Parent allocates budget to children. Effective limit = `min(own_limit, parent_ef
 | `allocated` | Parent allocates fixed budget to children                |
 | `shared`    | Children share parent's budget (first-come-first-served) |
 
+An `allocated` budget counts its **direct** allocations: the upstreams of
+descendant tenants whose closest ancestor with the alias is the budget's
+owner. An upstream below another tenant that binds the alias allocates from
+that tenant's limit, so each level is checked against its own children. A
+parent's update re-checks its allocations when the budget or the window
+`budget.total` is counted in changes.
+
+A `shared` budget adds one pool bucket, `budget.total` requests per the
+owner's window, that every tenant whose limit is merged from the owner draws
+on (unless it opted out with a non-enforced `private` limit). Each tenant
+also keeps its own scoped bucket, sized from `sustained` / `burst`.
+
 **Inheritance rules**:
 
 | Parent Sharing | Child Specifies | Effective Limit                             |
@@ -365,7 +377,29 @@ Rate limiting executes in **Data Plane (DP)**. Configuration is resolved from Co
 ```text
 oagw:ratelimit:{resource_type}:{resource_id}:{scope}:{scope_id}:{window} = {count}
 oagw:ratelimit:upstream:uuid-upstream:tenant:uuid-tenant:minute:202601301530 = 4523
+oagw:ratelimit:upstream:uuid-upstream:route:uuid-route:minute:202601301530 = 12
+oagw:ratelimit:upstream:uuid-owner:pool:minute:202601301530 = 830
 ```
+
+`{scope_id}` is the tenant, subject, client IP or matched route id; `global`
+has none. The client IP is the address the API gateway resolved (the peer
+address, or behind `trusted_proxy_hops` trusted proxies the address they
+recorded); client-sent `X-Forwarded-For` / `X-Real-IP` never choose it. A
+shared budget's pool sits under its owner's prefix, and the scoped buckets
+of the tenants drawing on it use the owner's id as `{resource_id}`.
+
+An upstream limit and a route limit are separate buckets, both enforced.
+They are checked narrowest first (route buckets, the upstream's scoped
+bucket, the shared pool): a rejection does not refund the buckets already
+charged, so a request a route limit rejects does not draw on the upstream
+bucket or on the pool other tenants share.
+When the matched route shadows an ancestor's route for the same request
+(a descendant's route on the same path), that route's enforced limit is
+checked too, on that route's own bucket (`route:{its id}`, its own scope),
+the one a request matching it directly uses; it does not change the upstream
+bucket's config. A bucket reached with a different config (a merged limit that differs by
+tenant chain) keeps what it consumed, so switching configs never refills it;
+a write that changes the resource's own limit drops its buckets.
 
 The `{resource_type}:{resource_id}` prefix ensures all keys for a given
 upstream or route share a common prefix, enabling efficient prefix-based
@@ -590,7 +624,7 @@ Integration tests verify: (1) token bucket allows bursts up to capacity, (2) hie
 }
 ```
 
-Tenants A, B, C share 5000/min pool. First-come-first-served. No individual guarantees.
+Tenants A, B, C share 5000/min pool (one pool bucket under the partner's upstream). First-come-first-served. No individual guarantees; each tenant's own 5000/min scoped bucket still applies.
 
 ### Example 3: Cost-Based Rate Limiting
 

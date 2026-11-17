@@ -459,6 +459,71 @@ async def test_encoded_separator_cannot_reach_an_enforcing_parent_route(
         assert resp.headers.get("x-oagw-error-source") == "upstream", resp.text[:500]
 
 
+@pytest.mark.scenario(_ENFORCED_LIMIT, part="C")
+@pytest.mark.scenario(_MIN_MERGE, part="C")
+@pytest.mark.asyncio
+async def test_child_route_shadowing_the_parents_keeps_its_enforced_limit(
+    oagw_base_url, hierarchy_root_headers, hierarchy_l1a_headers,
+    mock_upstream_url, mock_upstream, cleanup,
+):
+    """The parent route's enforced 2/min limits the child's requests on the
+    child's own `POST /echo` route, on the parent route's bucket: neither
+    upstream nor the child's route has a limit, and the 429 carries the
+    parent route's numbers."""
+    _ = mock_upstream
+    alias = unique_alias("iso-route-rl")
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        parent = cleanup.upstream(hierarchy_root_headers, await create_upstream(
+            client, oagw_base_url, hierarchy_root_headers, mock_upstream_url, alias=alias,
+            auth=_noop_auth("inherit"),
+        ))
+        await create_route(
+            client, oagw_base_url, hierarchy_root_headers, parent["id"], ["POST"], "/echo",
+            rate_limit=_rl(2, "enforce"),
+        )
+        child = cleanup.upstream(hierarchy_l1a_headers, await create_upstream(
+            client, oagw_base_url, hierarchy_l1a_headers, mock_upstream_url, alias=alias,
+        ))
+        await create_route(
+            client, oagw_base_url, hierarchy_l1a_headers, child["id"], ["POST"], "/echo",
+        )
+
+        leaf = traced(hierarchy_l1a_headers)
+        for remaining in ("1", "0"):
+            resp = await _post_echo(client, oagw_base_url, leaf, alias)
+            _assert_passed(resp)
+            assert resp.headers.get("x-ratelimit-limit") == "2", resp.headers
+            assert resp.headers.get("x-ratelimit-remaining") == remaining, resp.headers
+
+        resp = await _post_echo(client, oagw_base_url, leaf, alias)
+        assert_problem(resp, 429, category="resource_exhausted")
+        assert resp.headers.get("x-ratelimit-limit") == "2", resp.headers
+        assert resp.headers.get("x-ratelimit-remaining") == "0", resp.headers
+        retry_after = int(resp.headers["retry-after"])
+        assert 25 <= retry_after <= 30, retry_after
+        body = resp.json()
+        trace_id = body.pop("trace_id", None)
+        assert isinstance(trace_id, str) and re.fullmatch(r"[0-9a-f]{32}", trace_id), resp.text
+        assert body == {
+            "type": err_type("resource_exhausted"),
+            "title": "Resource Exhausted",
+            "status": 429,
+            "detail": (
+                "Rate limit exceeded. Retry after the duration indicated by the "
+                "Retry-After header."
+            ),
+            "instance": f"/oagw/v1/proxy/{alias}/echo",
+            "context": {
+                "violations": [{
+                    "subject": "rate_limit",
+                    "description": "rate limit exceeded",
+                    "retry_after_seconds": retry_after,
+                }],
+                "resource_type": PROXY_SCHEMA,
+            },
+        }, resp.text
+
+
 @pytest.mark.scenario(_OVERRIDES, part="D")
 @pytest.mark.asyncio
 @pytest.mark.parametrize(

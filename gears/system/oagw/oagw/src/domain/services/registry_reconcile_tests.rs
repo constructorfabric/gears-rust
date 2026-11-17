@@ -1127,7 +1127,7 @@ async fn every_kind_of_bad_content_is_skipped_and_keeps_its_row(b: Backend) {
         strategy: RateLimitStrategy::Reject,
         cost: 1,
         response_headers: false,
-        pool_owner_id: None,
+        shared_pool: None,
         limit_owner_id: None,
     });
     secret.request.auth = Some(AuthConfig {
@@ -1164,7 +1164,7 @@ async fn every_kind_of_bad_content_is_skipped_and_keeps_its_row(b: Backend) {
         strategy: RateLimitStrategy::Reject,
         cost: 1,
         response_headers: false,
-        pool_owner_id: None,
+        shared_pool: None,
         limit_owner_id: None,
     });
     tag.request.tags = vec!["LLM".into()];

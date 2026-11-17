@@ -128,15 +128,19 @@ pub struct ApiGatewayConfig {
 
     /// Number of trusted reverse-proxy hops in front of the gateway.
     ///
-    /// Controls how the client IP is derived for IP-keyed throttling. When `0`
+    /// Controls how the client IP is derived for IP-keyed throttling and for
+    /// the `toolkit::http::ClientIp` extension handed to handlers. When `0`
     /// (the default) the immediate peer address from `ConnectInfo` is used and
     /// the client-supplied `X-Forwarded-For` / `X-Real-IP` headers are ignored,
     /// preventing a caller from spoofing or rotating the throttling bucket key
     /// to bypass pre-auth IP limits. When set to `n >= 1`, the client IP is
     /// taken from the `X-Forwarded-For` entry `n` positions from the right (the
     /// value written by the outermost trusted proxy), which an untrusted client
-    /// cannot forge. When `X-Forwarded-For` is absent or too short, the
-    /// immediate peer's `X-Real-IP` is used under the same trust assumption.
+    /// cannot forge. Entries are counted across all `X-Forwarded-For` field
+    /// lines in order, so a proxy may append to the client's line or add its
+    /// own. When `X-Forwarded-For` is absent or too short, the immediate
+    /// peer's `X-Real-IP` is used under the same trust assumption, unless it
+    /// appears more than once (then the peer address is used).
     ///
     /// Deployment requirement for `n >= 1`: the gateway must not be reachable
     /// except through the trusted proxies, and those proxies must overwrite or

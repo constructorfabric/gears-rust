@@ -5,7 +5,7 @@
 //! [`toolkit_http::HttpClient`], and returns the upstream response. The
 //! `Authorization: Bearer <jwt>` header is propagated as-is for per-hop
 //! re-validation (ADR-0008); hop-by-hop headers are dropped, and platform-plane
-//! (`x-toolkit-internal-token`) and client-supplied `x-forwarded-*` headers are
+//! (`x-toolkit-internal-token`) and client-supplied `x-forwarded-*` / `x-real-ip` headers are
 //! stripped so an external caller cannot spoof the system plane or the
 //! forwarding chain.
 
@@ -190,8 +190,8 @@ fn upstream_status(err: &HttpError) -> StatusCode {
 ///   credential the edge must never accept from an external client, otherwise a
 ///   caller could forge it and reach the `internal_auth_middleware` on the
 ///   proxied gear (ADR-0008). It is stripped unconditionally.
-/// - `x-forwarded-*` proxy metadata: dropped so a client cannot spoof the
-///   forwarding chain seen by upstream gears.
+/// - `x-forwarded-*` and `x-real-ip` proxy metadata: dropped so a client
+///   cannot spoof the forwarding chain or its address seen by upstream gears.
 fn strip_from_request(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
@@ -208,6 +208,7 @@ fn strip_from_request(name: &HeaderName) -> bool {
             | "x-forwarded-for"
             | "x-forwarded-proto"
             | "x-forwarded-host"
+            | "x-real-ip"
     ) || name.as_str().eq_ignore_ascii_case(INTERNAL_TOKEN_HEADER)
 }
 
@@ -363,6 +364,7 @@ mod tests {
         assert!(strip_from_request(
             &"x-forwarded-host".parse().expect("name")
         ));
+        assert!(strip_from_request(&"x-real-ip".parse().expect("name")));
         // A regular application header is preserved.
         assert!(!strip_from_request(&"authorization".parse().expect("name")));
         assert!(!strip_from_request(&"content-type".parse().expect("name")));

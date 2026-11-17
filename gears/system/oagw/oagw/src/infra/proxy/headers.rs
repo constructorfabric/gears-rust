@@ -413,33 +413,6 @@ pub fn set_host_header(headers: &mut HeaderMap, endpoint: &Endpoint) {
     }
 }
 
-/// Extract client IP from request headers for IP-scoped rate limiting.
-///
-/// Checks `X-Forwarded-For` (first IP in the chain) then `X-Real-IP`.
-/// Returns `None` if neither header is present or parseable.
-pub fn extract_client_ip(headers: &HeaderMap) -> Option<String> {
-    // Parse and validate as a real IP address to prevent arbitrary token injection.
-    // Only trusted when headers originate from a trusted proxy.
-    if let Some(xff) = headers.get("x-forwarded-for")
-        && let Ok(val) = xff.to_str()
-        && let Some(candidate) = val
-            .split(',')
-            .next()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        && let Ok(ip) = candidate.parse::<std::net::IpAddr>()
-    {
-        return Some(ip.to_string());
-    }
-    headers
-        .get("x-real-ip")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .and_then(|s| s.parse::<std::net::IpAddr>().ok())
-        .map(|ip| ip.to_string())
-}
-
 /// Convert an HTTP `HeaderMap` to a `Vec<(String, String)>` preserving multi-valued headers.
 ///
 /// Values that are not visible ASCII (obs-text, non-UTF-8) are left out: they
@@ -1273,41 +1246,6 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
-    }
-
-    #[test]
-    fn extract_client_ip_from_xff() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "1.2.3.4, 5.6.7.8".parse().unwrap());
-        assert_eq!(extract_client_ip(&headers), Some("1.2.3.4".to_string()));
-    }
-
-    #[test]
-    fn extract_client_ip_from_xff_single() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "10.0.0.1".parse().unwrap());
-        assert_eq!(extract_client_ip(&headers), Some("10.0.0.1".to_string()));
-    }
-
-    #[test]
-    fn extract_client_ip_from_real_ip() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-real-ip", "192.168.1.1".parse().unwrap());
-        assert_eq!(extract_client_ip(&headers), Some("192.168.1.1".to_string()));
-    }
-
-    #[test]
-    fn extract_client_ip_xff_takes_precedence() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
-        headers.insert("x-real-ip", "5.6.7.8".parse().unwrap());
-        assert_eq!(extract_client_ip(&headers), Some("1.2.3.4".to_string()));
-    }
-
-    #[test]
-    fn extract_client_ip_none() {
-        let headers = HeaderMap::new();
-        assert_eq!(extract_client_ip(&headers), None);
     }
 
     // -- validate_smuggling_headers tests --
