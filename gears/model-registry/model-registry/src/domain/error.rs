@@ -220,8 +220,8 @@ impl DomainError {
     #[must_use]
     pub fn from_enforcer(err: EnforcerError, operation: &'static str) -> Self {
         match err {
-            EnforcerError::Denied { deny_reason } => {
-                tracing::debug!(operation, ?deny_reason, "pdp denied");
+            EnforcerError::AccessDenied(denial) => {
+                tracing::debug!(operation, ?denial, "access denied");
                 Self::not_permitted(operation)
             }
             EnforcerError::CompileFailed(e) => {
@@ -229,6 +229,8 @@ impl DomainError {
                 Self::not_permitted(operation)
             }
             EnforcerError::EvaluationFailed(e) => Self::unavailable(Dependency::Pdp, e),
+            // An unknown outcome class is an internal failure, never a denial.
+            unknown => Self::internal(format!("{operation}: unknown enforcer outcome: {unknown}")),
         }
     }
 
@@ -440,6 +442,7 @@ impl From<DomainError> for CanonicalError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use authz_resolver_sdk::AccessDenial;
     use model_registry_sdk::gts::{MODEL_RESOURCE_TYPE, PROVIDER_RESOURCE_TYPE};
     use model_registry_sdk::{ModelRegistryError, gts::Resource as SdkResource};
     use toolkit_canonical_errors::Problem;
@@ -625,7 +628,15 @@ mod tests {
 
     #[test]
     fn enforcer_mapping() {
-        let e = DomainError::from_enforcer(EnforcerError::Denied { deny_reason: None }, "op");
+        let e = DomainError::from_enforcer(
+            EnforcerError::AccessDenied(AccessDenial::Pdp { reason: None }),
+            "op",
+        );
+        assert!(matches!(e, DomainError::NotPermitted { .. }));
+        let e = DomainError::from_enforcer(
+            EnforcerError::AccessDenied(AccessDenial::ScopeMatchesNothing),
+            "op",
+        );
         assert!(matches!(e, DomainError::NotPermitted { .. }));
         let e = DomainError::from_enforcer(
             EnforcerError::EvaluationFailed(CanonicalError::service_unavailable().create()),
