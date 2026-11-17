@@ -1,6 +1,44 @@
 //! Operator-facing configuration schema for the service-discovery gear.
 
 use std::collections::HashMap;
+use std::time::Duration;
+
+/// Default lease TTL and grace: a crashed instance stops being
+/// preferred within `ttl` and becomes unobservable within `ttl + grace`.
+const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(30);
+const DEFAULT_LEASE_GRACE: Duration = Duration::from_secs(30);
+
+const fn default_lease_ttl() -> Duration {
+    DEFAULT_LEASE_TTL
+}
+const fn default_lease_grace() -> Duration {
+    DEFAULT_LEASE_GRACE
+}
+
+/// Instance-lease policy (`gears.service-discovery.config.lease`,
+/// `cpt-cf-adr-directory-persistence-and-replication`).
+///
+/// Durations are humantime strings (e.g. `30s`). Both default to 30s.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeaseConfig {
+    /// How long a registration or heartbeat keeps an instance observable.
+    #[serde(default = "default_lease_ttl", with = "humantime_serde")]
+    pub ttl: Duration,
+    /// Extra window after `ttl` during which the instance reads as
+    /// `Quarantined` before it becomes unobservable.
+    #[serde(default = "default_lease_grace", with = "humantime_serde")]
+    pub grace: Duration,
+}
+
+impl Default for LeaseConfig {
+    fn default() -> Self {
+        Self {
+            ttl: DEFAULT_LEASE_TTL,
+            grace: DEFAULT_LEASE_GRACE,
+        }
+    }
+}
 
 /// The gear's config section (`gears.service-discovery.config`).
 ///
@@ -37,4 +75,7 @@ pub struct ServiceDiscoveryConfig {
     /// caller authorization is checked separately.
     #[serde(default)]
     pub grpc_service_owners: HashMap<String, String>,
+    /// Instance-lease policy. Both `ttl` and `grace` default to 30s.
+    #[serde(default)]
+    pub lease: LeaseConfig,
 }

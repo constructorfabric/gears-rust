@@ -3,12 +3,14 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
+use tokio_util::sync::CancellationToken;
 use toolkit::DirectoryClient;
 use toolkit::context::GearCtx;
 use toolkit::contracts::{
     GrpcServiceCapability, OpenApiRegistry, RegisterGrpcServiceFn, RestApiCapability,
-    SystemCapability,
+    RunnableCapability, SystemCapability,
 };
 use toolkit::directory::LocalDirectoryClient;
 use toolkit::registry::GearRegistry;
@@ -45,7 +47,7 @@ use crate::server;
 // stated here rather than merely known.
 #[toolkit::gear(
     name = "service-discovery",
-    capabilities = [grpc, system, rest],
+    capabilities = [grpc, system, rest, stateful],
     client = cf_system_sdks::directory::DirectoryClient,
     one_per_installation = true
 )]
@@ -54,6 +56,9 @@ pub struct ServiceDiscoveryGear {
     gear_manager: OnceLock<Arc<GearManager>>,
     gears_service: OnceLock<Arc<GearsService>>,
     policy: OnceLock<RegistrationPolicy>,
+    /// How often the memory-mode sweeper reclaims records whose lease expired
+    /// past grace. Set from the configured `lease.grace` in `init`.
+    sweep_interval: OnceLock<Duration>,
 }
 
 impl Default for ServiceDiscoveryGear {
@@ -63,6 +68,7 @@ impl Default for ServiceDiscoveryGear {
             gear_manager: OnceLock::new(),
             gears_service: OnceLock::new(),
             policy: OnceLock::new(),
+            sweep_interval: OnceLock::new(),
         }
     }
 }
@@ -105,6 +111,13 @@ impl toolkit::Gear for ServiceDiscoveryGear {
             self.gear_manager.get().cloned().ok_or_else(|| {
                 anyhow::anyhow!("GearManager not wired into ServiceDiscoveryGear")
             })?;
+
+        // Apply the configured instance-lease policy onto the
+        // host-owned manager, and record the grace as the sweeper cadence.
+        manager.set_lease_policy(cfg.lease.ttl, cfg.lease.grace);
+        self.sweep_interval
+            .set(cfg.lease.grace)
+            .map_err(|_| anyhow::anyhow!("sweep interval already set (init called twice?)"))?;
 
         // Pin gRPC-service-name ownership from config so a name can only be
         // advertised by its configured owner, regardless of registration order.
@@ -196,6 +209,57 @@ impl GrpcServiceCapability for ServiceDiscoveryGear {
     }
 }
 
+/// Default sweeper cadence if `init` has not recorded one (it always does in
+/// practice); bounded below so a misconfigured zero grace cannot hot-loop.
+const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+const MIN_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The memory-mode lease sweeper.
+///
+/// Reads already hide records whose lease expired past grace, so this task only
+/// reclaims their memory (and frees the gRPC service names and round-robin
+/// counters of a gear whose last instance expired). It runs until `cancel`.
+async fn sweeper_loop(manager: Arc<GearManager>, interval: Duration, cancel: CancellationToken) {
+    let mut tick = tokio::time::interval(interval.max(MIN_SWEEP_INTERVAL));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tick.tick().await; // consume the immediate first tick
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => break,
+            _ = tick.tick() => manager.sweep_expired(Instant::now()),
+        }
+    }
+    tracing::debug!("service-discovery lease sweeper stopped");
+}
+
+#[async_trait]
+impl RunnableCapability for ServiceDiscoveryGear {
+    /// Start the memory-mode lease sweeper. The task self-stops when `cancel`
+    /// (a child of the runtime root token) fires, so [`Self::stop`] is a no-op.
+    async fn start(&self, cancel: CancellationToken) -> anyhow::Result<()> {
+        let manager = self.gear_manager.get().cloned().ok_or_else(|| {
+            anyhow::anyhow!("GearManager not wired; init() must run before start()")
+        })?;
+        let interval = self
+            .sweep_interval
+            .get()
+            .copied()
+            .unwrap_or(DEFAULT_SWEEP_INTERVAL);
+        tokio::spawn(sweeper_loop(manager, interval, cancel));
+        tracing::info!(
+            sweep_interval_secs = interval.as_secs(),
+            "service-discovery lease sweeper started"
+        );
+        Ok(())
+    }
+
+    async fn stop(&self, _deadline_token: CancellationToken) -> anyhow::Result<()> {
+        // The sweeper stops on the root cancellation token propagated to the
+        // task's `cancel`; there is nothing to drain.
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -279,6 +343,43 @@ mod tests {
             policy.trust_domains,
             string_set(&["example.org"]),
             "the configured trust domain must reach the policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn init_applies_configured_lease_policy() {
+        let gear = init_with_config(serde_json::json!({
+            "lease": { "ttl": "5s", "grace": "7s" }
+        }))
+        .await
+        .expect("init with a lease config section must succeed");
+
+        let manager = gear
+            .gear_manager
+            .get()
+            .expect("init must wire the GearManager");
+        assert_eq!(
+            manager.lease_ttl(),
+            Duration::from_secs(5),
+            "configured lease ttl must reach the GearManager"
+        );
+        assert_eq!(
+            gear.sweep_interval.get().copied(),
+            Some(Duration::from_secs(7)),
+            "configured lease grace must drive the sweeper cadence"
+        );
+    }
+
+    #[tokio::test]
+    async fn init_defaults_lease_policy_to_thirty_seconds() {
+        let gear = init_with_config(serde_json::json!({}))
+            .await
+            .expect("init with no lease config must use the default lease policy");
+        let manager = gear.gear_manager.get().expect("GearManager wired");
+        assert_eq!(manager.lease_ttl(), Duration::from_secs(30));
+        assert_eq!(
+            gear.sweep_interval.get().copied(),
+            Some(Duration::from_secs(30))
         );
     }
 

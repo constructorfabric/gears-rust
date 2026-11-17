@@ -361,8 +361,11 @@ contract, are:
   signal ([ADR-0005](0005-cpt-cf-adr-eventual-readiness.md)), not a second health system (it is *not* the same
   enum as ADR-0005's readiness-probe `state`). Mapping to ADR-0005:
   `Ready`/`Healthy` correspond to ADR-0005 `Ready`/`Degraded` (serving / `200`); `Registered` to `Starting`
-  (registered, deps not yet resolved); `Quarantined` to a failing readiness probe (`Unhealthy`->`Starting`); and
-  `Draining` to `Draining`. `Unknown` is the **safe default** for a state that could not be determined: the proto
+  (registered, deps not yet resolved); and `Draining` to `Draining`.
+  **Amended by [ADR-0011](0011-cpt-cf-adr-directory-persistence-and-replication.md):** state is now derived from the
+  instance's **lease** plus the state it reports, not written by a background task. `Quarantined` now means **the
+  lease expired** (missed heartbeats), not a failing readiness probe; a failing readiness check is reported as
+  `Starting` (ADR-0005 forces `Starting` on `Unhealthy`) and therefore reads as `Registered`. `Unknown` is the **safe default** for a state that could not be determined: the proto
   `UNSPECIFIED` discriminant and any unrecognised (forward-compat) wire value decode to `Unknown` rather than
   silently reading as `Registered`. It is **non-serving** and carries no ADR-0005 mapping; it exists only so an
   undeterminable state can never be mistaken for a known one. **`resolve_by_labels`**, by contrast, does **not** filter on health: it returns

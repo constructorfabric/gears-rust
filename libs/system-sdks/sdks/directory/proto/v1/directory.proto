@@ -29,7 +29,7 @@ service DirectoryService {
   rpc ListAllInstances(ListAllInstancesRequest) returns (ListAllInstancesResponse);
 
   // Register a new gear instance with the directory
-  rpc RegisterInstance(RegisterInstanceRequest) returns (google.protobuf.Empty);
+  rpc RegisterInstance(RegisterInstanceRequest) returns (RegisterInstanceResponse);
 
   // Deregister a gear instance (for graceful shutdown)
   rpc DeregisterInstance(DeregisterInstanceRequest) returns (google.protobuf.Empty);
@@ -76,6 +76,19 @@ enum InstanceState {
   INSTANCE_STATE_DRAINING = 5;
 }
 
+// What an instance declares about itself in RegisterInstance / Heartbeat. The
+// directory derives the observable InstanceState from this plus the instance
+// lease; it never writes it from a background task.
+enum ReportedState {
+  // Unset: an older worker that does not report its state. On RegisterInstance
+  // this is read as STARTING; on Heartbeat it is read as SERVING, so a worker
+  // that only ever heartbeats keeps today's Registered -> Healthy behaviour.
+  REPORTED_STATE_UNSPECIFIED = 0;
+  REPORTED_STATE_STARTING = 1;
+  REPORTED_STATE_SERVING = 2;
+  REPORTED_STATE_DRAINING = 3;
+}
+
 message InstanceInfo {
   reserved 6;
   reserved "openapi_spec";
@@ -113,6 +126,20 @@ message RegisterInstanceRequest {
   optional string rest_endpoint_uri = 5;
   optional string openapi_spec = 6;
   map<string, string> labels = 7;
+  // State the registrant reports about itself. Unset/UNSPECIFIED is
+  // read as STARTING on a new record; on a re-registration it leaves the stored
+  // state unchanged, so a self-heal re-register never resets a serving instance.
+  optional ReportedState reported_state = 8;
+}
+
+// Response to RegisterInstance. Replaces google.protobuf.Empty; an empty
+// message and one carrying an unknown field decode the same way, so old clients
+// that expected Empty are unaffected.
+message RegisterInstanceResponse {
+  // The lease TTL the directory granted, in milliseconds. New workers heartbeat
+  // every lease_ttl_ms / 3; 0 means the directory returned no TTL and the
+  // worker falls back to its configured heartbeat interval.
+  uint64 lease_ttl_ms = 1;
 }
 
 message DeregisterInstanceRequest {
@@ -123,4 +150,8 @@ message DeregisterInstanceRequest {
 message HeartbeatRequest {
   string gear_name = 1;
   string instance_id = 2;
+  // State the instance reports about itself. Unset/UNSPECIFIED is
+  // read as SERVING, preserving today's behaviour for workers that only
+  // heartbeat. A draining worker sends DRAINING here.
+  optional ReportedState reported_state = 3;
 }

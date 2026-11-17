@@ -10,7 +10,7 @@ use toolkit::{
     context::GearCtx,
     contracts::{Gear, SystemCapability},
     lifecycle::ReadySignal,
-    runtime::{GearInstallers, GrpcInstallerData, GrpcInstallerStore},
+    runtime::{GearInstallers, GrpcInstallerData, GrpcInstallerStore, PresenceManager},
 };
 
 use crate::dynamic_routes::DynamicRoutes;
@@ -799,7 +799,13 @@ impl GrpcHub {
             )
         })?;
 
+        let presence = self.resolve_presence_manager();
         for gear_data in &gears {
+            // Stop the presence manager renewing this record before removing it,
+            // so its renewal loop cannot re-register it after deregistration.
+            if let Some(pm) = &presence {
+                pm.untrack(&gear_data.gear_name, instance_id);
+            }
             if let Err(e) = directory
                 .deregister_instance(&gear_data.gear_name, instance_id)
                 .await
@@ -1172,6 +1178,16 @@ impl GrpcHub {
         }
     }
 
+    /// Resolve the per-process presence manager, if the host has published one.
+    /// Registration goes through it so it owns the record's lease renewal;
+    /// absent one (e.g. unit tests), fall back to registering
+    /// directly against the directory.
+    fn resolve_presence_manager(&self) -> Option<Arc<PresenceManager>> {
+        self.client_hub
+            .get()
+            .and_then(|hub| hub.get::<PresenceManager>().ok())
+    }
+
     /// Register one gear's gRPC services, bounded by `attempt_timeout`.
     /// Returns whether the gear is settled: accepted, or refused for good.
     async fn register_one(
@@ -1182,7 +1198,15 @@ impl GrpcHub {
         endpoint: &str,
     ) -> bool {
         let info = Self::registration_info(gear_data, instance_id, endpoint);
-        let outcome = tokio::time::timeout(self.attempt_timeout, directory.register_instance(info))
+        // Prefer the presence manager so it tracks and renews this record; only
+        // fall back to a bare directory register when no manager is published.
+        let register = async {
+            match self.resolve_presence_manager() {
+                Some(pm) => pm.register(info).await,
+                None => directory.register_instance(info).await,
+            }
+        };
+        let outcome = tokio::time::timeout(self.attempt_timeout, register)
             .await
             .ok();
         let gear = gear_data.gear_name.as_str();

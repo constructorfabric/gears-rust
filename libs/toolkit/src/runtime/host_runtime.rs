@@ -63,7 +63,8 @@ use crate::registry::{
     RestApiCap, RunnableCap, SystemCap,
 };
 use crate::runtime::{
-    GearManager, GrpcInstallerStore, OopSpawnOptions, PREPARATION_GATE, SystemContext,
+    GearManager, GrpcInstallerStore, OopSpawnOptions, PREPARATION_GATE, PresenceManager,
+    ReportedStateSource, SystemContext,
 };
 
 #[cfg(feature = "db")]
@@ -221,6 +222,11 @@ pub struct HostRuntime {
     /// In-process REST provider advertisement. In `OoP` serving, presence +
     /// deregister is owned by `oop_serve`, so it stays unused.
     advertiser: Arc<RestAdvertiser>,
+    /// Per-process lease renewal for every in-process directory record.
+    /// Created lazily once a `DirectoryClient` is available (it is
+    /// published by `service-discovery`'s init), published in `client_hub` so
+    /// every in-process registrar renews through one manager.
+    presence: parking_lot::Mutex<Option<Arc<PresenceManager>>>,
     /// Gears whose `start` the runtime called: the ones the stop phase stops,
     /// on shutdown and after a failed startup alike.
     start_called: parking_lot::Mutex<HashSet<&'static str>>,
@@ -305,6 +311,7 @@ impl HostRuntime {
             dep_checker,
             gts_admitted,
             advertiser: Arc::new(RestAdvertiser::new(instance_id, &owned)),
+            presence: parking_lot::Mutex::new(None),
             start_called: parking_lot::Mutex::new(HashSet::new()),
             wired: parking_lot::Mutex::new(HashSet::new()),
             pending_targets: PendingTargets::default(),
@@ -1910,7 +1917,8 @@ impl HostRuntime {
                 return Ok(());
             };
 
-            self.advertiser.enable(dir, endpoint);
+            let presence = self.ensure_presence(&dir);
+            self.advertiser.enable(presence, dir, endpoint);
         }
         for gear in rest_gears {
             self.advertiser.advertise(gear).await;
@@ -1934,6 +1942,34 @@ impl HostRuntime {
             })
             .map(|e| e.name)
             .collect()
+    }
+
+    /// The process [`PresenceManager`], created on first use once a
+    /// `DirectoryClient` is available.
+    ///
+    /// Spawns its renewal loop on a child of `owned` (so it stops when the
+    /// runtime shuts down, before deregistration) and publishes it in
+    /// `client_hub`, so every in-process registrar — the REST advertiser,
+    /// grpc-hub's registrar and event-broker's role registration — renews
+    /// through one manager and no in-process record's lease silently lapses.
+    fn ensure_presence(&self, dir: &Arc<dyn crate::DirectoryClient>) -> Arc<PresenceManager> {
+        let mut slot = self.presence.lock();
+        if let Some(pm) = slot.as_ref() {
+            return Arc::clone(pm);
+        }
+        // Fallback heartbeat interval when a directory returns no lease TTL;
+        // once a registration learns the TTL the manager renews at ttl/3. The
+        // in-process host has no aggregate readiness object, so the reported
+        // state comes from its dependency/drain checker.
+        let pm = PresenceManager::new(
+            Arc::clone(dir),
+            ReportedStateSource::Dependencies(Arc::clone(&self.dep_checker)),
+            std::time::Duration::from_secs(5),
+        );
+        tokio::spawn(Arc::clone(&pm).run(self.owned.child_token()));
+        self.client_hub.register::<PresenceManager>(Arc::clone(&pm));
+        *slot = Some(Arc::clone(&pm));
+        pm
     }
 
     /// Deregister this process's REST providers from the directory on shutdown,
@@ -2062,6 +2098,16 @@ impl HostRuntime {
         self.run_init_phase_for(&system).await?;
         self.wire_system_clients(&regs)?;
         self.run_post_init_phase_for(&system).await?;
+
+        // Bring up the per-process presence manager now the directory client is
+        // in the ClientHub (published by service-discovery's init), so every
+        // in-process registrar that starts next — grpc-hub's registrar below,
+        // then the REST advertiser — renews its lease through one manager.
+        // Without a directory (e.g. Profile 1 with discovery off)
+        // there is nothing to renew.
+        if let Ok(dir) = self.client_hub.get::<dyn crate::DirectoryClient>() {
+            let _ = self.ensure_presence(&dir);
+        }
 
         // Serve system routes on the listener already hosting probes.
         let mut grpc_seen = HashSet::new();
@@ -2255,6 +2301,13 @@ impl HostRuntime {
             self.cancel.clone(),
         )
         .await?;
+
+        // Publish the server's presence manager so every in-process registrar
+        // that runs during the startup phases below — grpc-hub's registrar,
+        // event-broker's role registration — renews its lease through one
+        // manager instead of registering without a renewer.
+        self.client_hub
+            .register::<PresenceManager>(server.presence_manager());
 
         self.spawn_drain_watcher();
         let mut composition = OopComposition::default();

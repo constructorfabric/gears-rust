@@ -12,9 +12,9 @@ use cf_system_sdks::directory::{
     DirectoryService, DirectoryServiceNameConflict, DirectoryServiceServer, GetOpenApiSpecRequest,
     GetOpenApiSpecResponse, HeartbeatRequest, InstanceInfo, InstanceState, LabelSelector,
     ListAllInstancesRequest, ListAllInstancesResponse, ListInstancesRequest, ListInstancesResponse,
-    ProtoInstanceState, RegisterInstanceInfo, RegisterInstanceRequest, ResolveGrpcServiceRequest,
-    ResolveGrpcServiceResponse, ResolveRestServiceRequest, ResolveRestServiceResponse,
-    ServiceEndpoint, ServiceInstanceInfo,
+    ProtoInstanceState, ProtoReportedState, RegisterInstanceInfo, RegisterInstanceRequest,
+    RegisterInstanceResponse, ReportedState, ResolveGrpcServiceRequest, ResolveGrpcServiceResponse,
+    ResolveRestServiceRequest, ResolveRestServiceResponse, ServiceEndpoint, ServiceInstanceInfo,
 };
 use std::collections::BTreeMap;
 use toolkit_security::{PlatformAuthEnforced, PlatformSecurityContext};
@@ -301,7 +301,7 @@ impl DirectoryService for DirectoryServiceImpl {
     async fn register_instance(
         &self,
         request: Request<RegisterInstanceRequest>,
-    ) -> Result<Response<()>, Status> {
+    ) -> Result<Response<RegisterInstanceResponse>, Status> {
         let (_metadata, extensions, req) = request.into_parts();
 
         validate_identity(&req.gear_name, &req.instance_id)?;
@@ -351,16 +351,27 @@ impl DirectoryService for DirectoryServiceImpl {
         if let Some(spec) = req.openapi_spec {
             info = info.with_openapi_spec(spec);
         }
+        // An unset/UNSPECIFIED reported state leaves `info.reported_state` None,
+        // which the store reads as Starting on a new record.
+        if let Some(reported) = proto_reported_to_domain(req.reported_state) {
+            info = info.with_reported_state(reported);
+        }
 
         // The store enforces single-gear gRPC service-name ownership atomically;
         // a conflict maps to a static status whose code reflects whether it is
-        // recoverable (see `register_status`).
-        self.api
-            .register_instance(info)
+        // recoverable (see `register_status`). The granted lease TTL is returned
+        // so new workers can pace their heartbeats at `lease_ttl_ms / 3`.
+        let ack = self
+            .api
+            .register_with_lease(info)
             .await
             .map_err(|e| Self::register_status(&gear_name, &e))?;
 
-        Ok(Response::new(()))
+        let lease_ttl_ms = ack
+            .lease_ttl
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or_default();
+        Ok(Response::new(RegisterInstanceResponse { lease_ttl_ms }))
     }
 
     async fn deregister_instance(
@@ -384,12 +395,30 @@ impl DirectoryService for DirectoryServiceImpl {
 
         validate_identity(&req.gear_name, &req.instance_id)?;
         self.authorize_registration(&extensions, &req.gear_name, RegistrationOp::Heartbeat)?;
+        // An unset/UNSPECIFIED reported state is read as Serving, so
+        // a worker that only heartbeats keeps today's behaviour. A heartbeat for
+        // an unknown instance maps to NOT_FOUND via `lookup_status`
+        // (`DirectoryNotFound`), so the worker re-registers after one heartbeat.
+        let reported = proto_reported_to_domain(req.reported_state);
         self.api
-            .send_heartbeat(&req.gear_name, &req.instance_id)
+            .heartbeat(&req.gear_name, &req.instance_id, reported)
             .await
             .map_err(|e| lookup_status(&e))?;
 
         Ok(Response::new(()))
+    }
+}
+
+/// Map the proto `reported_state` (an `optional ReportedState` carried as
+/// `Option<i32>`) onto the domain [`ReportedState`]. `None` or `UNSPECIFIED`
+/// (and any unrecognised discriminant) read as `None`, which the store then
+/// defaults per operation (Starting on register, Serving on heartbeat).
+fn proto_reported_to_domain(reported: Option<i32>) -> Option<ReportedState> {
+    match reported.and_then(|r| ProtoReportedState::try_from(r).ok()) {
+        Some(ProtoReportedState::Starting) => Some(ReportedState::Starting),
+        Some(ProtoReportedState::Serving) => Some(ReportedState::Serving),
+        Some(ProtoReportedState::Draining) => Some(ReportedState::Draining),
+        Some(ProtoReportedState::Unspecified) | None => None,
     }
 }
 
@@ -1323,6 +1352,7 @@ mod tests {
         svc.heartbeat(Request::new(HeartbeatRequest {
             gear_name: "billing".to_owned(),
             instance_id,
+            reported_state: None,
         }))
         .await
         .unwrap();
@@ -1770,6 +1800,7 @@ mod tests {
                 Request::new(HeartbeatRequest {
                     gear_name: "billing".to_owned(),
                     instance_id: owner_instance.clone(),
+                    reported_state: None,
                 }),
                 sa_identity("catalog"),
             ))
@@ -1868,6 +1899,7 @@ mod tests {
             Request::new(HeartbeatRequest {
                 gear_name: "billing".to_owned(),
                 instance_id: instance_id.clone(),
+                reported_state: None,
             }),
             sa_identity("billing"),
         ))
@@ -1917,6 +1949,7 @@ mod tests {
             Request::new(HeartbeatRequest {
                 gear_name: "billing".to_owned(),
                 instance_id: instance_id.clone(),
+                reported_state: None,
             }),
             sa_identity("flight-control"),
         ))

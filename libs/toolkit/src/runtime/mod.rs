@@ -5,6 +5,7 @@ mod host_runtime;
 mod oop_registration;
 #[cfg(feature = "bootstrap")]
 mod oop_serve;
+mod presence_manager;
 mod readiness;
 mod runner;
 mod system_context;
@@ -16,7 +17,7 @@ pub mod shutdown;
 mod tests;
 
 pub use gear_manager::{
-    Endpoint, GearInstance, GearManager, GrpcServiceNameConflict, InstanceState,
+    Endpoint, GearInstance, GearManager, GrpcServiceNameConflict, InstanceState, ReportedState,
 };
 pub use grpc_installers::{GearInstallers, GrpcInstallerData, GrpcInstallerStore, LateBatch};
 pub use host_runtime::{
@@ -28,6 +29,7 @@ pub use host_runtime::{
 // there rather than through this re-export.
 #[cfg(feature = "bootstrap")]
 pub use oop_serve::OopServeOptions;
+pub use presence_manager::{PresenceManager, ReportedStateSource};
 /// Stays unresolved until the application group's migrations, GTS admission,
 /// initialization and startup complete. The system group serves while it waits.
 pub const PREPARATION_GATE: &str = "application/preparation";

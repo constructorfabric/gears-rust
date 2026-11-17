@@ -120,6 +120,31 @@ impl InstanceState {
     }
 }
 
+/// What an instance declares about itself in `RegisterInstance` / `Heartbeat`
+/// (`cpt-cf-adr-directory-persistence-and-replication`). The directory derives
+/// the observable [`InstanceState`] from this
+/// plus the instance's lease; this is the only liveness signal an instance
+/// writes. Distinct from [`InstanceState`], which is the *observed* projection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReportedState {
+    /// Not yet serving (starting up, or failing a readiness check).
+    #[default]
+    Starting,
+    /// Serving and heartbeating.
+    Serving,
+    /// Gracefully draining; upstreams should stop routing new work.
+    Draining,
+}
+
+/// Acknowledgement returned by a successful registration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RegisterAck {
+    /// Lease TTL the directory granted, if it returned one. A new worker
+    /// heartbeats every `lease_ttl / 3`; `None` means the directory returned no
+    /// TTL and the worker falls back to its configured heartbeat interval.
+    pub lease_ttl: Option<std::time::Duration>,
+}
+
 /// Information about a service instance
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
@@ -257,6 +282,10 @@ pub struct RegisterInstanceInfo {
     pub openapi_spec: Option<String>,
     /// Stable addressing labels for this instance (k8s `matchLabels` style).
     pub labels: BTreeMap<String, String>,
+    /// State the registrant declares about itself, or `None` when
+    /// unspecified. On a new record `None` means [`ReportedState::Starting`];
+    /// on a re-registration `None` leaves the stored state unchanged.
+    pub reported_state: Option<ReportedState>,
 }
 
 impl RegisterInstanceInfo {
@@ -313,6 +342,13 @@ impl RegisterInstanceInfo {
     #[must_use]
     pub fn with_labels(mut self, labels: BTreeMap<String, String>) -> Self {
         self.labels = labels;
+        self
+    }
+
+    /// Set the state the registrant declares about itself.
+    #[must_use]
+    pub fn with_reported_state(mut self, reported: ReportedState) -> Self {
+        self.reported_state = Some(reported);
         self
     }
 }
@@ -557,11 +593,43 @@ pub trait DirectoryClient: Send + Sync {
     /// Register a new gear instance with the directory
     async fn register_instance(&self, info: RegisterInstanceInfo) -> Result<()>;
 
+    /// Register a new gear instance and learn the lease TTL the directory
+    /// granted.
+    ///
+    /// The default delegates to [`register_instance`](Self::register_instance)
+    /// and reports no TTL, so existing implementations keep working unchanged;
+    /// the real clients (in-process and gRPC) override it to surface
+    /// `lease_ttl_ms`. Callers that need the lease to pace their heartbeats
+    /// (the presence loop) use this instead of `register_instance`.
+    async fn register_with_lease(&self, info: RegisterInstanceInfo) -> Result<RegisterAck> {
+        self.register_instance(info)
+            .await
+            .map(|()| RegisterAck::default())
+    }
+
     /// Deregister a gear instance (for graceful shutdown)
     async fn deregister_instance(&self, gear: &str, instance_id: &str) -> Result<()>;
 
     /// Send a heartbeat for a gear instance to indicate it's still alive
     async fn send_heartbeat(&self, gear: &str, instance_id: &str) -> Result<()>;
+
+    /// Send a heartbeat carrying the state the instance reports about itself:
+    /// `Serving` in steady state, `Draining` while shutting down.
+    ///
+    /// The default ignores `reported` and delegates to
+    /// [`send_heartbeat`](Self::send_heartbeat), so existing implementations
+    /// keep working; the real clients override it to carry the state (and to
+    /// map an unknown instance onto [`DirectoryNotFound`]). `None` means the
+    /// caller does not report a state, which the directory reads as `Serving`.
+    async fn heartbeat(
+        &self,
+        gear: &str,
+        instance_id: &str,
+        reported: Option<ReportedState>,
+    ) -> Result<()> {
+        let _ = reported;
+        self.send_heartbeat(gear, instance_id).await
+    }
 }
 
 #[cfg(test)]
@@ -612,6 +680,7 @@ mod tests {
             labels: BTreeMap::new(),
             rest_endpoint: Some(ServiceEndpoint::http("billing", 8080)),
             openapi_spec: Some("{\"openapi\":\"3.1.0\"}".to_owned()),
+            reported_state: None,
         };
 
         assert_eq!(info.gear, "billing");
