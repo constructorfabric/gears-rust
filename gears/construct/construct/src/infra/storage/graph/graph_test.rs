@@ -2246,9 +2246,15 @@ async fn schemas_of_an_earlier_version_are_upgraded_on_registration() {
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn registering_unchanged_schemas_logs_no_upgrade() {
-    let types = GraphTypes::new(graph_storage());
+    let client = graph_storage();
+    let ctx = construct_in(Uuid::new_v4());
+    // The tenant already holds the current schemas, as after a restart.
+    GraphTypes::new(Arc::clone(&client))
+        .ensure(&ctx)
+        .await
+        .unwrap();
 
-    types.ensure(&construct_in(Uuid::new_v4())).await.unwrap();
+    GraphTypes::new(client).ensure(&ctx).await.unwrap();
 
     assert!(!logs_contain("graph types upgraded in the tenant"));
 }
@@ -2315,6 +2321,29 @@ async fn a_tenant_whose_schema_is_newer_than_the_release_is_refused_and_not_reme
     // batch twice, and the second call asks again: the refusal is not
     // remembered.
     assert_eq!(scripted.registrations.load(Ordering::SeqCst), 4);
+    // The refused change left the newer schemas in place, on every type that
+    // has payload properties to add one to.
+    for graph_type in construct_sdk::profile_types::graph_types() {
+        let current: Value = serde_json::from_str(graph_type.schema).unwrap();
+        if current
+            .pointer("/allOf/1/properties/payload/properties")
+            .is_none()
+        {
+            continue;
+        }
+        let stored = client
+            .get_type(&ctx, &graph_type.type_id.parse().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            stored
+                .schema
+                .pointer("/allOf/1/properties/payload/properties/added_by_a_later_release")
+                .is_some(),
+            "{}",
+            graph_type.type_id
+        );
+    }
 }
 
 #[tokio::test]
