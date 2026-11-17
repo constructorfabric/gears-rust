@@ -27,7 +27,11 @@ use super::doubles::{
 
 /// A harness with a 10ms heartbeat, so slow-detection and idle cadence run fast
 /// instead of waiting out the production 1s tick.
-async fn fast_harness(topic_id: &str, event_type: &str, partitions: u32) -> EventBrokerHarness {
+pub(super) async fn fast_harness(
+    topic_id: &str,
+    event_type: &str,
+    partitions: u32,
+) -> EventBrokerHarness {
     EventBrokerHarness::builder()
         .with_type_registry(StaticTypesRegistry::of(json!([
             { "id": topic_id, "partitions": partitions },
@@ -872,5 +876,88 @@ async fn parallelism_creates_independent_slots_with_shared_group_and_interests()
     assert_eq!(
         held, halves,
         "the two slots' current subscriptions {current:?} should own disjoint halves"
+    );
+}
+
+/// The distinct partitions each JOIN's seek loaded a position for, in JOIN order: the
+/// run's first JOIN, then one entry per `SubscriptionRejoining`. The last entry is
+/// left out, as the stop may have cut its seek short.
+pub(super) fn partitions_sought_per_join(events: &[ConsumerRuntimeEvent]) -> Vec<BTreeSet<u32>> {
+    let mut joins = vec![BTreeSet::new()];
+    for event in events {
+        match event {
+            ConsumerRuntimeEvent::SubscriptionRejoining { .. } => joins.push(BTreeSet::new()),
+            ConsumerRuntimeEvent::OffsetLoaded { partition, .. } => {
+                joins
+                    .last_mut()
+                    .expect("starts with one entry")
+                    .insert(*partition);
+            }
+            _ => {}
+        }
+    }
+    joins.pop();
+    joins
+}
+
+/// The voluntary disconnect on the Nth idle heartbeat re-JOINs a consumer that is
+/// alone in its group. The old stream is closed before the JOIN, so the broker evicts
+/// the old member and hands the new one every partition; were it still open, the
+/// broker would split the partitions with it and leave half of them unread until the
+/// next re-JOIN.
+#[tokio::test]
+async fn a_rejoin_after_idle_heartbeats_takes_every_partition_back() {
+    const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.idlerejoin.v1");
+    const EVENT_TYPE: &str =
+        gts_id!("cf.core.events.event.v1~example.mock.showcase.idlerejoin.v1~");
+
+    let fx = fast_harness(TOPIC, EVENT_TYPE, 2).await;
+    let recorder = RecordingRuntimeListener::default();
+    let recorded = recorder.events.clone();
+    let ctx = fx.security_context().clone();
+
+    let handle = ConsumerBuilder::new(fx.broker())
+        .subject_tenant(ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(ctx)
+        .group(ConsumerGroupRef::auto_anonymous("idle-rejoin"))
+        .topics([topic(TOPIC)])
+        // Three 10 ms heartbeats without data end every stream.
+        .heartbeat_drop_threshold(3)
+        .register_listener(recorder)
+        .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
+        .batch_handler(AckAllBatchHandler {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        })
+        .start()
+        .await
+        .expect("consumer starts");
+
+    let rejoins = || {
+        recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event, ConsumerRuntimeEvent::SubscriptionRejoining { .. }))
+            .count()
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while rejoins() < 4 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the idle consumer re-joins");
+    handle.stop().await.expect("consumer stops cleanly");
+
+    let joins = partitions_sought_per_join(&recorded.lock().unwrap());
+    let every_partition = BTreeSet::from([0, 1]);
+    assert!(
+        joins.len() >= 4,
+        "expected at least four JOINs, saw {joins:?}"
+    );
+    assert!(
+        joins.iter().all(|sought| *sought == every_partition),
+        "every JOIN should take both partitions, saw {joins:?}"
     );
 }

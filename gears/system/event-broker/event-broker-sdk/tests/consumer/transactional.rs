@@ -1695,3 +1695,63 @@ async fn a_transactional_consumer_stopped_while_its_handler_fails_schedules_no_r
         .collect();
     assert_eq!(failed, vec!["internal: handler failed".to_owned()]);
 }
+
+/// The transactional twin of
+/// `runtime_behaviour::a_rejoin_after_idle_heartbeats_takes_every_partition_back`.
+#[tokio::test]
+async fn a_transactional_rejoin_after_idle_heartbeats_takes_every_partition_back() {
+    const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.txidlerejoin.v1");
+    const EVENT_TYPE: &str =
+        gts_id!("cf.core.events.event.v1~example.mock.showcase.txidlerejoin.v1~");
+
+    let fx = super::runtime_behaviour::fast_harness(TOPIC, EVENT_TYPE, 2).await;
+    let recorder = RecordingRuntimeListener::default();
+    let recorded = recorder.events.clone();
+    let ctx = fx.security_context().clone();
+
+    let handle = ConsumerBuilder::new(fx.broker())
+        .subject_tenant(ctx.subject_tenant_id())
+        .ownership_filter(event_broker_sdk::OwnershipFilter::EntireTenant)
+        .security_context(ctx)
+        .group(ConsumerGroupRef::auto_anonymous("tx-idle-rejoin"))
+        .topics([topic(TOPIC)])
+        // Three 10 ms heartbeats without data end every stream.
+        .heartbeat_drop_threshold(3)
+        .register_listener(recorder)
+        .offset_manager(RecordingTxOffsetManager)
+        .handler(PlacementTxRecorder {
+            db: transaction_db("tx_idle_rejoin").await,
+            handled: SharedPlacements::default(),
+        })
+        .start()
+        .await
+        .expect("transactional consumer starts");
+
+    let rejoins = || {
+        recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event, ConsumerRuntimeEvent::SubscriptionRejoining { .. }))
+            .count()
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while rejoins() < 4 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the idle consumer re-joins");
+    handle.stop().await.expect("consumer stops cleanly");
+
+    let joins = super::runtime_behaviour::partitions_sought_per_join(&recorded.lock().unwrap());
+    let every_partition = std::collections::BTreeSet::from([0, 1]);
+    assert!(
+        joins.len() >= 4,
+        "expected at least four JOINs, saw {joins:?}"
+    );
+    assert!(
+        joins.iter().all(|sought| *sought == every_partition),
+        "every JOIN should take both partitions, saw {joins:?}"
+    );
+}

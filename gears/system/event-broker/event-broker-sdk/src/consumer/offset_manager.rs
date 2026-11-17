@@ -97,6 +97,13 @@ CREATE TABLE IF NOT EXISTS evbk_consumer_offsets (
 /// store or a configured per-partition override) or a sentinel for the broker to
 /// resolve. Read-only - persistence is [`CommitOffset`] / [`CommitOffsetInTx`].
 ///
+/// A sentinel is resolved by the broker only at the consumer's first seek of the
+/// partition. The consumer remembers where it resolved and seeks there again on
+/// every re-JOIN, for as long as this store returns a sentinel, so an event
+/// appended between two seeks is not skipped. A store that never returns an exact
+/// offset therefore replays everything since that first seek on each re-JOIN; it
+/// does not follow the head as `Latest` would.
+///
 /// `topic` is the topic's GTS id; the built-in stores key a position by it as given.
 #[async_trait]
 pub trait OffsetStore: Send + Sync {

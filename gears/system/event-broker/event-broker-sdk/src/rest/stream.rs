@@ -19,6 +19,7 @@ use crate::ids::SubscriptionId;
 use crate::rest::client::{RestBroker, StreamTransport};
 use crate::rest::wire::FrameWire;
 
+/// Consecutive reconnects, none of which delivered a frame, before the stream ends.
 const MAX_RECONNECTS: u32 = 5;
 const RECONNECT_BACKOFF: Duration = Duration::from_millis(250);
 
@@ -156,6 +157,7 @@ pub(crate) async fn open(
     let http = client.http().clone();
     let framing = client.framing();
     let debug = client.debug();
+    let idle_timeout = client.stream_idle_timeout();
     let ctx = ctx.clone();
     let (path, accept) = match framing {
         StreamTransport::Multipart => ("/event-broker/v1/events:stream", "multipart/mixed"),
@@ -221,7 +223,21 @@ pub(crate) async fn open(
 
             let mut body = resp.into_body();
             let mut terminated = false;
-            while let Some(frame) = body.frame().await {
+            // A healthy stream carries a heartbeat at least every interval; one that
+            // stays silent past the idle timeout is a half-open connection (no FIN,
+            // no RST) and is dropped like a closed one.
+            loop {
+                let Ok(next) = tokio::time::timeout(idle_timeout, body.frame()).await else {
+                    tracing::warn!(
+                        target: "event_broker_sdk::rest",
+                        idle_timeout_ms = u64::try_from(idle_timeout.as_millis()).unwrap_or(u64::MAX),
+                        "delivery stream silent past the idle timeout; reconnecting",
+                    );
+                    break;
+                };
+                let Some(frame) = next else {
+                    break;
+                };
                 let frame = frame.map_err(|e| EventBrokerError::Transport(e.to_string()))?;
                 if let Some(data) = frame.data_ref() {
                     decoder.push(data);
@@ -238,6 +254,9 @@ pub(crate) async fn open(
                             );
                         }
                         let wf = wire_frame.into_frame()?;
+                        // A connection that delivers is a working one: the budget
+                        // counts only consecutive connections that deliver nothing.
+                        reconnects = 0;
                         let is_terminal = matches!(
                             &wf,
                             WireFrame::Control { code: ControlCode::Terminal, .. }

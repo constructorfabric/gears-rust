@@ -95,7 +95,16 @@ pub struct RestBroker {
     /// ceiling, so a client asking for more than the broker allows simply gets the
     /// broker's maximum.
     sync_wait: std::time::Duration,
+    /// The longest a delivery stream may go without a byte before it is treated as
+    /// a dropped connection ([`DEFAULT_STREAM_IDLE_TIMEOUT`]).
+    stream_idle_timeout: std::time::Duration,
 }
+
+/// The default [`RestBroker::with_stream_idle_timeout`]: six of the broker's default
+/// 5 s heartbeats. A healthy stream carries at least a heartbeat per interval, so
+/// only a connection that has gone half-open (no FIN, no RST, no bytes) stays
+/// silent this long.
+pub const DEFAULT_STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl RestBroker {
     /// Builds a client against `base_url` (for example `https://host:8080`),
@@ -114,6 +123,7 @@ impl RestBroker {
             framing: StreamTransport::default(),
             debug: false,
             sync_wait,
+            stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
         })
     }
 
@@ -138,6 +148,16 @@ impl RestBroker {
         self
     }
 
+    /// Sets how long a delivery stream may go without receiving a byte before the
+    /// client treats the connection as dropped and reconnects
+    /// ([`DEFAULT_STREAM_IDLE_TIMEOUT`] unless set). Keep it well above the broker's
+    /// heartbeat interval, or a healthy idle stream is cut.
+    #[must_use]
+    pub fn with_stream_idle_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.stream_idle_timeout = timeout;
+        self
+    }
+
     /// Turns on wire logging: every request and response is emitted at debug
     /// level on the `event_broker_sdk::rest` target (the bearer token is never
     /// logged). A dev/demo aid; off by default.
@@ -145,6 +165,11 @@ impl RestBroker {
     pub fn with_debug(mut self, on: bool) -> Self {
         self.debug = on;
         self
+    }
+
+    /// How long a delivery stream may stay silent before it counts as dropped.
+    pub(crate) fn stream_idle_timeout(&self) -> std::time::Duration {
+        self.stream_idle_timeout
     }
 
     /// Whether wire logging is on for this client.

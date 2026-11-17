@@ -828,6 +828,7 @@ fn slot_settings(broker: Arc<dyn EventBrokerApi>) -> SlotSettings {
         listener_timeout: Duration::from_secs(1),
         max_rejoin_attempts: 2,
         subscription_id: Arc::new(tokio::sync::Mutex::new(None)),
+        resolved_starts: super::dispatcher::ResolvedStarts::default(),
     }
 }
 
@@ -3527,4 +3528,496 @@ async fn a_rejoin_budget_spent_after_a_drain_leaves_the_drained_subscription_onc
     );
     let warn = "WARN re-JOIN failed; trying again slot_idx=0 error=transport: injected";
     assert_eq!(capture.lines(), vec![warn, warn]);
+}
+
+/// A broker that assigns `partitions` of the orders topic (partition 0 unless set)
+/// on every JOIN and appends one event to each at each JOIN, so an event always
+/// lands between two seeks and is never streamed: each stream yields one heartbeat
+/// and ends. It resolves a seek as the storage plugins do - `Latest` to the head,
+/// `Earliest` to the floor, and an `Exact` outside [floor, head] refused with every
+/// offender named - and records every seek it is sent. The `cancel_at_join`th JOIN
+/// cancels the run.
+struct AppendsBetweenSeeksBroker {
+    joins: Mutex<u128>,
+    partitions: Vec<u32>,
+    head: Mutex<i64>,
+    floor: Mutex<HashMap<u32, i64>>,
+    /// Raises the floor of `.2` (every partition when empty) to `.1` at the `.0`th
+    /// JOIN, as retention would.
+    floor_at_join: Option<(u128, i64, Vec<u32>)>,
+    /// Empties the partitions at this JOIN, as a recreated topic would: the head
+    /// falls back to zero.
+    reset_at_join: Option<u128>,
+    seeks: Mutex<Vec<Vec<crate::api::Position>>>,
+    cancel_at_join: u128,
+    cancel: CancellationToken,
+}
+
+impl AppendsBetweenSeeksBroker {
+    fn cancelling_at_join(cancel_at_join: u128, cancel: CancellationToken) -> Self {
+        Self {
+            joins: Mutex::new(0),
+            partitions: vec![0],
+            head: Mutex::new(0),
+            floor: Mutex::new(HashMap::new()),
+            floor_at_join: None,
+            reset_at_join: None,
+            seeks: Mutex::new(Vec::new()),
+            cancel_at_join,
+            cancel,
+        }
+    }
+
+    fn seeks(&self) -> Vec<Vec<crate::api::Position>> {
+        self.seeks.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl BrokerStub for AppendsBetweenSeeksBroker {
+    async fn join(
+        &self,
+        _ctx: &SecurityContext,
+        _req: JoinRequest,
+    ) -> Result<SubscriptionAssignment, EventBrokerError> {
+        let mut joins = self.joins.lock().unwrap();
+        *joins += 1;
+        *self.head.lock().unwrap() += 1;
+        if let Some((at, floor, trimmed)) = &self.floor_at_join
+            && *at == *joins
+        {
+            let mut floors = self.floor.lock().unwrap();
+            for partition in &self.partitions {
+                if trimmed.is_empty() || trimmed.contains(partition) {
+                    floors.insert(*partition, *floor);
+                }
+            }
+        }
+        if self.reset_at_join == Some(*joins) {
+            *self.head.lock().unwrap() = 0;
+        }
+        if *joins == self.cancel_at_join {
+            self.cancel.cancel();
+        }
+        Ok(SubscriptionAssignment {
+            id: joined_subscription(*joins),
+            topology_version: 1,
+            assigned: self
+                .partitions
+                .iter()
+                .map(|partition| crate::api::AssignedPartition {
+                    topic: ginst(ORDERS_TOPIC),
+                    partition: *partition,
+                })
+                .collect(),
+            unmatched_types: Vec::new(),
+        })
+    }
+
+    async fn leave(
+        &self,
+        _ctx: &SecurityContext,
+        _id: SubscriptionId,
+    ) -> Result<(), EventBrokerError> {
+        Ok(())
+    }
+
+    async fn seek(
+        &self,
+        _ctx: &SecurityContext,
+        _id: SubscriptionId,
+        _topology_version: i64,
+        positions: &[crate::api::SeekPosition],
+    ) -> Result<Vec<crate::api::SeekResult>, EventBrokerError> {
+        use crate::api::Position as P;
+        self.seeks
+            .lock()
+            .unwrap()
+            .push(positions.iter().map(|p| p.value.clone()).collect());
+        let head = *self.head.lock().unwrap();
+        let floors = self.floor.lock().unwrap().clone();
+        let mut results = Vec::new();
+        let mut violations = Vec::new();
+        for p in positions {
+            let floor = floors.get(&p.partition).copied().unwrap_or(0);
+            let offset = match &p.value {
+                P::Latest => head,
+                P::Earliest | P::At(_) => floor,
+                P::Exact(at) => at.as_i64(),
+            };
+            let breached = if offset < floor {
+                Some(crate::error::OutOfRange::BelowFloor)
+            } else if offset > head {
+                Some(crate::error::OutOfRange::AboveCeiling)
+            } else {
+                None
+            };
+            if let Some(breached) = breached {
+                violations.push(
+                    crate::error::PositionViolation::builder(
+                        p.topic.to_string(),
+                        i32::try_from(p.partition).unwrap(),
+                    )
+                    .floor(Sequence::assigned(floor))
+                    .ceiling(Sequence::assigned(head))
+                    .breached(breached)
+                    .build(),
+                );
+            }
+            results.push(crate::api::SeekResult {
+                topic: p.topic.clone(),
+                partition: p.partition,
+                offset: Sequence::assigned(offset),
+            });
+        }
+        if violations.is_empty() {
+            Ok(results)
+        } else {
+            Err(EventBrokerError::InvalidInitialPosition {
+                violations,
+                detail: "injected: outside the admissible range".to_owned(),
+            })
+        }
+    }
+
+    async fn stream(
+        &self,
+        _ctx: &SecurityContext,
+        _id: SubscriptionId,
+    ) -> Result<FrameStream, EventBrokerError> {
+        Ok(Box::pin(futures_util::stream::iter([Ok(
+            WireFrame::Heartbeat {
+                at: "2026-11-16T00:00:00Z".to_owned(),
+            },
+        )])))
+    }
+}
+
+fn exact(offset: i64) -> crate::api::Position {
+    crate::api::Position::Exact(Sequence::assigned(offset))
+}
+
+/// A slot on `broker` whose offset store holds no offset and falls back to `fallback`.
+fn uncommitted_slot_dispatcher(
+    broker: Arc<dyn EventBrokerApi>,
+    fallback: Fallback,
+) -> SlotDispatcher<BatchHandlerAdapter<AckAllBatchHandler>, InMemoryOffsetManager> {
+    SlotDispatcher {
+        offset_manager: Arc::new(InMemoryOffsetManager::new(fallback)),
+        ..slot_dispatcher(broker)
+    }
+}
+
+/// A partition with no committed offset starts where `Latest` resolved at the first
+/// seek, and every re-JOIN goes back there instead of resolving `Latest` again: a
+/// second `Latest` would land on the new head and skip the event appended between
+/// the two seeks, which the consumer never received.
+#[tokio::test]
+async fn a_rejoin_seeks_the_first_resolved_latest_position_while_nothing_is_committed() {
+    let cancel = CancellationToken::new();
+    let broker = Arc::new(AppendsBetweenSeeksBroker::cancelling_at_join(
+        3,
+        cancel.clone(),
+    ));
+    let dispatcher = uncommitted_slot_dispatcher(broker.clone(), Fallback::Latest);
+
+    let result = tokio::time::timeout(
+        BOUND,
+        dispatcher.run(Arc::new(SecurityContext::anonymous()), cancel),
+    )
+    .await
+    .expect("the run ends within the bound");
+
+    assert!(result.is_ok(), "expected a clean end, got {result:?}");
+    assert_eq!(
+        broker.seeks(),
+        vec![
+            vec![crate::api::Position::Latest],
+            vec![exact(1)],
+            vec![exact(1)],
+        ]
+    );
+}
+
+/// A remembered start that retention has since trimmed below the partition's floor
+/// is refused by the broker. The slot seeks the new floor, the closest position the
+/// partition still admits, and remembers where that resolved, instead of ending the
+/// run or seeking the `Latest` fallback past the events still retained.
+#[tokio::test]
+async fn a_remembered_start_below_the_floor_seeks_the_floor_and_is_remembered_afresh() {
+    let cancel = CancellationToken::new();
+    let broker = Arc::new(AppendsBetweenSeeksBroker {
+        floor_at_join: Some((2, 2, Vec::new())),
+        ..AppendsBetweenSeeksBroker::cancelling_at_join(3, cancel.clone())
+    });
+    let dispatcher = uncommitted_slot_dispatcher(broker.clone(), Fallback::Latest);
+
+    let result = tokio::time::timeout(
+        BOUND,
+        dispatcher.run(Arc::new(SecurityContext::anonymous()), cancel),
+    )
+    .await
+    .expect("the run ends within the bound");
+
+    assert!(result.is_ok(), "expected a clean end, got {result:?}");
+    assert_eq!(
+        broker.seeks(),
+        vec![
+            vec![crate::api::Position::Latest],
+            vec![exact(1)],
+            vec![crate::api::Position::Earliest],
+            vec![exact(2)],
+        ]
+    );
+}
+
+/// The remembered start belongs to the consumer, not to one slot: a partition that
+/// moves to another slot of the same consumer before anything is committed is
+/// sought where it first resolved, not at the head it has since moved to.
+#[tokio::test]
+async fn another_slot_of_the_consumer_seeks_the_start_the_first_slot_resolved() {
+    let first_cancel = CancellationToken::new();
+    let first_broker = Arc::new(AppendsBetweenSeeksBroker::cancelling_at_join(
+        1,
+        first_cancel.clone(),
+    ));
+    let first = uncommitted_slot_dispatcher(first_broker.clone(), Fallback::Latest);
+    tokio::time::timeout(
+        BOUND,
+        first.run(Arc::new(SecurityContext::anonymous()), first_cancel),
+    )
+    .await
+    .expect("the first slot ends within the bound")
+    .expect("the first slot ends cleanly");
+
+    // The second slot reaches the broker after one more event was appended.
+    let second_cancel = CancellationToken::new();
+    let second_broker = Arc::new(AppendsBetweenSeeksBroker::cancelling_at_join(
+        1,
+        second_cancel.clone(),
+    ));
+    *second_broker.head.lock().unwrap() = 1;
+    let second = SlotDispatcher {
+        settings: SlotSettings {
+            broker: second_broker.clone(),
+            ..first
+                .settings
+                .for_slot(1, Arc::new(tokio::sync::Mutex::new(None)))
+        },
+        offset_manager: first.offset_manager.clone(),
+        handler: first.handler.clone(),
+        commit_mode: ConsumerCommitMode::Manual,
+    };
+    tokio::time::timeout(
+        BOUND,
+        second.run(Arc::new(SecurityContext::anonymous()), second_cancel),
+    )
+    .await
+    .expect("the second slot ends within the bound")
+    .expect("the second slot ends cleanly");
+
+    assert_eq!(
+        first_broker.seeks(),
+        vec![vec![crate::api::Position::Latest]]
+    );
+    assert_eq!(second_broker.seeks(), vec![vec![exact(1)]]);
+}
+
+/// The transactional twin of
+/// `a_rejoin_seeks_the_first_resolved_latest_position_while_nothing_is_committed`;
+/// its offset store falls back to `Earliest`.
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn a_transactional_rejoin_seeks_the_first_resolved_position_while_nothing_is_committed() {
+    let cancel = CancellationToken::new();
+    let broker = Arc::new(AppendsBetweenSeeksBroker {
+        floor_at_join: Some((1, 1, Vec::new())),
+        ..AppendsBetweenSeeksBroker::cancelling_at_join(3, cancel.clone())
+    });
+    let dispatcher = tx_slot_dispatcher(broker.clone());
+
+    let result = tokio::time::timeout(
+        BOUND,
+        dispatcher.run(Arc::new(SecurityContext::anonymous()), cancel),
+    )
+    .await
+    .expect("the run ends within the bound");
+
+    assert!(result.is_ok(), "expected a clean end, got {result:?}");
+    assert_eq!(
+        broker.seeks(),
+        vec![
+            vec![crate::api::Position::Earliest],
+            vec![exact(1)],
+            vec![exact(1)],
+        ]
+    );
+}
+
+/// Only the refused start is replaced: a remembered start the broker admits is
+/// sought again as it was. Seeking the fallback for it as well would skip the
+/// events appended to that partition since its first seek.
+#[tokio::test]
+async fn only_the_refused_remembered_start_is_replaced() {
+    let cancel = CancellationToken::new();
+    let broker = Arc::new(AppendsBetweenSeeksBroker {
+        partitions: vec![0, 1],
+        floor_at_join: Some((2, 2, vec![1])),
+        ..AppendsBetweenSeeksBroker::cancelling_at_join(2, cancel.clone())
+    });
+    let dispatcher = uncommitted_slot_dispatcher(broker.clone(), Fallback::Latest);
+
+    let result = tokio::time::timeout(
+        BOUND,
+        dispatcher.run(Arc::new(SecurityContext::anonymous()), cancel),
+    )
+    .await
+    .expect("the run ends within the bound");
+
+    assert!(result.is_ok(), "expected a clean end, got {result:?}");
+    assert_eq!(
+        broker.seeks(),
+        vec![
+            vec![crate::api::Position::Latest, crate::api::Position::Latest],
+            vec![exact(1), exact(1)],
+            vec![exact(1), crate::api::Position::Earliest],
+        ]
+    );
+}
+
+/// A refusal that names no remembered start - here a committed offset below the
+/// floor - is the store's to answer, not the slot's: the seek is not retried and
+/// the remembered start of the other partition is kept.
+#[tokio::test]
+async fn a_refusal_of_no_remembered_start_is_not_retried() {
+    let cancel = CancellationToken::new();
+    let broker = Arc::new(AppendsBetweenSeeksBroker {
+        partitions: vec![0, 1],
+        floor_at_join: Some((1, 2, vec![1])),
+        ..AppendsBetweenSeeksBroker::cancelling_at_join(1, cancel.clone())
+    });
+    let dispatcher = SlotDispatcher {
+        offset_manager: Arc::new(
+            InMemoryOffsetManager::new(Fallback::Latest)
+                .with_overrides([((ginst(ORDERS_TOPIC), 1), Sequence::assigned(1))]),
+        ),
+        ..slot_dispatcher(broker.clone())
+    };
+    dispatcher
+        .settings
+        .resolved_starts
+        .remember((ginst(ORDERS_TOPIC), 0), Sequence::assigned(1));
+
+    let _ = tokio::time::timeout(
+        BOUND,
+        dispatcher.run(Arc::new(SecurityContext::anonymous()), cancel),
+    )
+    .await
+    .expect("the run ends within the bound");
+
+    assert_eq!(broker.seeks(), vec![vec![exact(1), exact(1)]]);
+    assert_eq!(
+        dispatcher
+            .settings
+            .resolved_starts
+            .get(&(ginst(ORDERS_TOPIC), 0)),
+        Some(Sequence::assigned(1))
+    );
+}
+
+/// A remembered start above the partition's head - the topic was recreated, or an
+/// in-memory backend restarted - points into a log that no longer exists. The slot
+/// seeks the store's fallback, as for a partition it never saw.
+#[tokio::test]
+async fn a_remembered_start_above_the_head_seeks_the_fallback() {
+    let cancel = CancellationToken::new();
+    let broker = Arc::new(AppendsBetweenSeeksBroker {
+        reset_at_join: Some(2),
+        ..AppendsBetweenSeeksBroker::cancelling_at_join(3, cancel.clone())
+    });
+    let dispatcher = uncommitted_slot_dispatcher(broker.clone(), Fallback::Latest);
+
+    let result = tokio::time::timeout(
+        BOUND,
+        dispatcher.run(Arc::new(SecurityContext::anonymous()), cancel),
+    )
+    .await
+    .expect("the run ends within the bound");
+
+    assert!(result.is_ok(), "expected a clean end, got {result:?}");
+    assert_eq!(
+        broker.seeks(),
+        vec![
+            vec![crate::api::Position::Latest],
+            vec![exact(1)],
+            vec![crate::api::Position::Latest],
+            vec![exact(0)],
+        ]
+    );
+}
+
+/// Once the store holds an offset for a partition, the start remembered for it is
+/// forgotten: should the offset be deleted later (an operator resets the group),
+/// the next JOIN seeks the store's fallback, not the stale start.
+#[tokio::test]
+async fn a_committed_offset_forgets_the_remembered_start() {
+    let settings = slot_dispatcher(Arc::new(AppendsBetweenSeeksBroker::cancelling_at_join(
+        1,
+        CancellationToken::new(),
+    )))
+    .settings;
+    settings
+        .resolved_starts
+        .remember((ginst(ORDERS_TOPIC), 0), Sequence::assigned(1));
+
+    let committed_cancel = CancellationToken::new();
+    let committed_broker = Arc::new(AppendsBetweenSeeksBroker::cancelling_at_join(
+        1,
+        committed_cancel.clone(),
+    ));
+    *committed_broker.head.lock().unwrap() = 5;
+    let committed = SlotDispatcher {
+        settings: SlotSettings {
+            broker: committed_broker.clone(),
+            ..settings.clone()
+        },
+        offset_manager: Arc::new(
+            InMemoryOffsetManager::new(Fallback::Latest)
+                .with_overrides([((ginst(ORDERS_TOPIC), 0), Sequence::assigned(5))]),
+        ),
+        ..slot_dispatcher(committed_broker.clone())
+    };
+    tokio::time::timeout(
+        BOUND,
+        committed.run(Arc::new(SecurityContext::anonymous()), committed_cancel),
+    )
+    .await
+    .expect("the committed slot ends within the bound")
+    .expect("the committed slot ends cleanly");
+
+    let reset_cancel = CancellationToken::new();
+    let reset_broker = Arc::new(AppendsBetweenSeeksBroker::cancelling_at_join(
+        1,
+        reset_cancel.clone(),
+    ));
+    let reset = SlotDispatcher {
+        settings: SlotSettings {
+            broker: reset_broker.clone(),
+            ..settings.clone()
+        },
+        ..uncommitted_slot_dispatcher(reset_broker.clone(), Fallback::Latest)
+    };
+    tokio::time::timeout(
+        BOUND,
+        reset.run(Arc::new(SecurityContext::anonymous()), reset_cancel),
+    )
+    .await
+    .expect("the reset slot ends within the bound")
+    .expect("the reset slot ends cleanly");
+
+    assert_eq!(committed_broker.seeks(), vec![vec![exact(5)]]);
+    assert_eq!(
+        reset_broker.seeks(),
+        vec![vec![crate::api::Position::Latest]]
+    );
 }

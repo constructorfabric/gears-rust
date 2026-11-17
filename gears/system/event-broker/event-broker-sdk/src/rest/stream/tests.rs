@@ -100,3 +100,118 @@ fn an_undecodable_sse_frame_is_refused_without_quoting_its_content() {
     };
     assert_eq!(message, "undecodable stream frame (data)");
 }
+
+/// Serves an SSE delivery stream that neither sends nor closes once it has sent its
+/// heartbeat, as a half-open connection looks from the client: no FIN, no RST, no
+/// bytes. The first stream opened sends one heartbeat, and every later one too when
+/// `heartbeat_on_every_open`; the others send nothing. Returns the base URL and the
+/// count of streams opened.
+async fn half_open_server(
+    heartbeat_on_every_open: bool,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use futures_util::StreamExt as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let opened = std::sync::Arc::new(AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&opened);
+    let handler = move || {
+        let counter = std::sync::Arc::clone(&counter);
+        async move {
+            let first = counter.fetch_add(1, Ordering::SeqCst) == 0;
+            let heartbeat = (first || heartbeat_on_every_open)
+                .then(|| format!("event: heartbeat\ndata: {HEARTBEAT}\n\n"));
+            let body = futures_util::stream::iter(heartbeat)
+                .map(|heartbeat| {
+                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(heartbeat))
+                })
+                .chain(futures_util::stream::pending());
+            (
+                [("content-type", "text/event-stream")],
+                axum::body::Body::from_stream(body),
+            )
+        }
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("resolve the bound address");
+    let router =
+        axum::Router::new().route("/event-broker/v1/events:sse", axum::routing::get(handler));
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("serve");
+    });
+    (format!("http://{addr}"), opened)
+}
+
+fn idle_timing_out_broker(base_url: String) -> RestBroker {
+    RestBroker::new(base_url)
+        .expect("the client builds")
+        .with_stream_transport(StreamTransport::Sse)
+        .with_stream_idle_timeout(Duration::from_millis(200))
+}
+
+/// A stream that goes silent past the idle timeout is treated like a dropped
+/// connection: the client reconnects, and once the reconnect budget is spent on
+/// connections that deliver nothing the stream ends, so the consumer re-JOINs
+/// instead of waiting on it forever.
+#[tokio::test]
+async fn a_stream_silent_past_the_idle_timeout_reconnects_then_ends() {
+    use futures_util::StreamExt as _;
+
+    let (base_url, opened) = half_open_server(false).await;
+    let stream = open(
+        &idle_timing_out_broker(base_url),
+        &SecurityContext::anonymous(),
+        SubscriptionId(uuid::Uuid::from_u128(0x5e)),
+    )
+    .await
+    .expect("the stream opens");
+    let frames = tokio::time::timeout(Duration::from_secs(10), stream.collect::<Vec<_>>())
+        .await
+        .expect("the silent stream ends instead of hanging");
+
+    assert!(
+        matches!(frames.as_slice(), [Ok(WireFrame::Heartbeat { .. })]),
+        "only the first connection delivers: {frames:?}"
+    );
+    assert_eq!(
+        opened.load(std::sync::atomic::Ordering::SeqCst),
+        MAX_RECONNECTS as usize + 1
+    );
+}
+
+/// The reconnect budget counts consecutive connections that deliver nothing: a
+/// connection that delivers a frame before it stalls starts the count afresh, so a
+/// long-lived stream is not ended by stalls spread over its life.
+#[tokio::test]
+async fn a_connection_that_delivers_before_stalling_restarts_the_reconnect_budget() {
+    use futures_util::StreamExt as _;
+
+    let (base_url, opened) = half_open_server(true).await;
+    let stream = open(
+        &idle_timing_out_broker(base_url),
+        &SecurityContext::anonymous(),
+        SubscriptionId(uuid::Uuid::from_u128(0x5f)),
+    )
+    .await
+    .expect("the stream opens");
+    let past_the_budget = MAX_RECONNECTS as usize + 3;
+    let frames = tokio::time::timeout(
+        Duration::from_secs(10),
+        stream.take(past_the_budget).collect::<Vec<_>>(),
+    )
+    .await
+    .expect("the frames arrive within the bound");
+
+    assert_eq!(frames.len(), past_the_budget, "{frames:?}");
+    assert!(
+        frames
+            .iter()
+            .all(|frame| matches!(frame, Ok(WireFrame::Heartbeat { .. }))),
+        "{frames:?}"
+    );
+    assert_eq!(
+        opened.load(std::sync::atomic::Ordering::SeqCst),
+        past_the_budget
+    );
+}

@@ -8,4 +8,4 @@ mod client;
 mod stream;
 mod wire;
 
-pub use client::{RestBroker, StreamTransport};
+pub use client::{DEFAULT_STREAM_IDLE_TIMEOUT, RestBroker, StreamTransport};

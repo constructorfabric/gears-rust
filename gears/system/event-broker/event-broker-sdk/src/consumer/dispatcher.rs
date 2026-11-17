@@ -14,7 +14,8 @@ use toolkit_gts::gts_id;
 #[cfg(feature = "db")]
 use super::commit::TxCommitHandleParts;
 use crate::api::{
-    AssignedPartition, EventBrokerApi, FrameStream, JoinRequest, Position, SubscriptionAssignment,
+    AssignedPartition, EventBrokerApi, FrameStream, JoinRequest, Position, SeekResult,
+    SubscriptionAssignment,
 };
 use crate::api::{
     BarrierMode, ControlCode, Filter, InterestTenant, OwnershipFilter, PartitionPosition,
@@ -34,7 +35,7 @@ use crate::consumer::{
 };
 #[cfg(feature = "db")]
 use crate::consumer::{CommitOffsetInTx, TxCommitHandle};
-use crate::error::EventBrokerError;
+use crate::error::{EventBrokerError, OutOfRange, PositionViolation};
 use crate::gts::{EventV1, StoredPosition};
 use crate::ids::{ConsumerGroupId, SubscriptionId};
 use crate::sequence::Sequence;
@@ -147,6 +148,40 @@ pub(crate) struct PartitionSlowState {
 type PartitionCursors = Arc<RwLock<HashMap<TopicPartitionKey, PartitionCursor>>>;
 type PartitionBuffers = Arc<RwLock<HashMap<TopicPartitionKey, PartitionEventBuffer>>>;
 type PartitionSlowStates = Arc<RwLock<HashMap<TopicPartitionKey, PartitionSlowState>>>;
+
+/// Where each partition without a committed offset first resolved, shared by every
+/// slot of one consumer. A re-JOIN seeks there instead of resolving the offset
+/// store's fallback again: `Latest` resolved again would land on the new head and
+/// skip every event appended since the first seek that was not yet delivered.
+///
+/// Every access is a short synchronous section, so a blocking mutex guards it.
+#[derive(Clone, Default)]
+pub(crate) struct ResolvedStarts(Arc<std::sync::Mutex<HashMap<PartitionRef, Sequence>>>);
+
+/// A partition of a topic, as the consumer is assigned it.
+type PartitionRef = (GtsInstanceId, u32);
+
+impl ResolvedStarts {
+    /// A poisoned lock still holds a consistent map: every write is one insert or
+    /// remove.
+    fn starts(&self) -> std::sync::MutexGuard<'_, HashMap<PartitionRef, Sequence>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn get(&self, key: &PartitionRef) -> Option<Sequence> {
+        self.starts().get(key).copied()
+    }
+
+    pub(crate) fn remember(&self, key: PartitionRef, start: Sequence) {
+        self.starts().insert(key, start);
+    }
+
+    fn forget(&self, key: &PartitionRef) {
+        self.starts().remove(key);
+    }
+}
 
 #[derive(Clone, Copy)]
 struct DispatchState<'a> {
@@ -386,6 +421,8 @@ pub(crate) struct SlotSettings {
     pub listener_timeout: Duration,
     pub max_rejoin_attempts: u32,
     pub subscription_id: Arc<tokio::sync::Mutex<Option<SubscriptionId>>>,
+    /// Shared across slots: a partition can move between the consumer's slots.
+    pub resolved_starts: ResolvedStarts,
 }
 
 impl SlotSettings {
@@ -428,6 +465,7 @@ impl SlotSettings {
             listener_timeout: settings.listener.timeout,
             max_rejoin_attempts: 16,
             subscription_id: Arc::new(tokio::sync::Mutex::new(None)),
+            resolved_starts: ResolvedStarts::default(),
         }
     }
 
@@ -1224,6 +1262,15 @@ trait SlotFlavour: Sync {
     /// Resolve a starting position for each assigned partition via
     /// `OffsetStore::load_position` and SEEK the broker. Used after JOIN (initial
     /// seed) and after every re-JOIN.
+    ///
+    /// A partition the store has no offset for is sought at the store's fallback
+    /// only the first time; where the broker resolved it is remembered in
+    /// [`SlotSettings::resolved_starts`] and sought as `Exact` from then on, until
+    /// the store holds an offset for it. A remembered start the broker refuses is
+    /// forgotten: one below the floor (retention trimmed past it) is sought at
+    /// `Earliest`, the closest position still admitted, so the retained events
+    /// after it are not skipped; one above the head (the topic was recreated) is
+    /// sought at the store's fallback, as for a partition never seen.
     async fn resolve_and_seek(
         &self,
         ctx: &SecurityContext,
@@ -1243,23 +1290,43 @@ trait SlotFlavour: Sync {
         let mut version = assignment.topology_version;
         let mut slots: Vec<AssignedPartition> = assignment.assigned.clone();
         let mut attempts = 0u32;
+        // Where this call seeks a remembered start the broker refused, in its place.
+        let mut replaced: HashMap<PartitionRef, Option<Position>> = HashMap::new();
         loop {
             if slots.is_empty() {
                 return Ok(());
             }
             let mut positions: Vec<SeekPosition> = Vec::with_capacity(slots.len());
+            let mut remembered: Vec<PartitionRef> = Vec::new();
             for assigned in &slots {
                 let topic = assigned.topic.clone();
-                let value = self
+                let loaded = self
                     .offsets()
                     .load_position(group_id, &topic, assigned.partition)
                     .await?;
                 slot.emit_runtime_event(ConsumerRuntimeEvent::OffsetLoaded {
                     topic: topic.clone(),
                     partition: assigned.partition,
-                    position: value.clone(),
+                    position: loaded.clone(),
                 })
                 .await;
+                let key = (topic.clone(), assigned.partition);
+                let value = match loaded {
+                    // The store's offset wins from now on; a start remembered
+                    // before it would be stale should the offset be deleted.
+                    Position::Exact(_) => {
+                        slot.resolved_starts.forget(&key);
+                        loaded
+                    }
+                    fallback => match (replaced.get(&key), slot.resolved_starts.get(&key)) {
+                        (Some(replacement), _) => replacement.clone().unwrap_or(fallback),
+                        (None, Some(start)) => {
+                            remembered.push(key);
+                            Position::Exact(start)
+                        }
+                        (None, None) => fallback,
+                    },
+                };
                 positions.push(SeekPosition {
                     topic,
                     partition: assigned.partition,
@@ -1271,7 +1338,35 @@ trait SlotFlavour: Sync {
                 .seek(ctx, subscription_id, version, &positions)
                 .await
             {
-                Ok(_) => return Ok(()),
+                Ok(results) => {
+                    slot.remember_resolved_starts(&positions, &results);
+                    return Ok(());
+                }
+                // Each retry forgets at least one remembered start, so it ends.
+                Err(EventBrokerError::InvalidInitialPosition { violations, detail }) => {
+                    let refused = refused_remembered_starts(&remembered, &violations);
+                    if refused.is_empty() {
+                        return Err(EventBrokerError::InvalidInitialPosition {
+                            violations,
+                            detail,
+                        });
+                    }
+                    for (key, breached) in refused {
+                        warn!(
+                            slot_idx = slot.slot_idx,
+                            topic = %key.0,
+                            partition = key.1,
+                            breached = ?breached,
+                            "remembered start outside the partition's admissible range; seeking past it"
+                        );
+                        slot.resolved_starts.forget(&key);
+                        let replacement = match breached {
+                            Some(OutOfRange::AboveCeiling) => None,
+                            Some(OutOfRange::BelowFloor) | None => Some(Position::Earliest),
+                        };
+                        replaced.insert(key, replacement);
+                    }
+                }
                 Err(EventBrokerError::TopologyVersionMismatch { .. })
                     if attempts < RESEEK_ON_TOPOLOGY_MISMATCH_ATTEMPTS =>
                 {
@@ -1386,7 +1481,47 @@ trait SlotFlavour: Sync {
     }
 }
 
+/// The remembered starts among `remembered` that a seek refusal names, with the
+/// end each crossed. A refusal that names no offender (a transport that does not
+/// carry them) is taken to refuse every remembered start, with the end unknown.
+fn refused_remembered_starts(
+    remembered: &[PartitionRef],
+    violations: &[PositionViolation],
+) -> Vec<(PartitionRef, Option<OutOfRange>)> {
+    if violations.is_empty() {
+        return remembered.iter().map(|key| (key.clone(), None)).collect();
+    }
+    remembered
+        .iter()
+        .filter_map(|key| {
+            violations
+                .iter()
+                .find(|violation| {
+                    violation.topic() == key.0.as_ref()
+                        && u32::try_from(violation.partition()) == Ok(key.1)
+                })
+                .map(|violation| (key.clone(), Some(violation.breached())))
+        })
+        .collect()
+}
+
 impl SlotSettings {
+    /// Remembers where the broker resolved each position of a successful seek that
+    /// was not already `Exact`, the store's fallback for a partition with no offset.
+    fn remember_resolved_starts(&self, positions: &[SeekPosition], results: &[SeekResult]) {
+        for result in results {
+            let sought_fallback = positions.iter().any(|p| {
+                p.partition == result.partition
+                    && p.topic == result.topic
+                    && !matches!(p.value, Position::Exact(_))
+            });
+            if sought_fallback {
+                self.resolved_starts
+                    .remember((result.topic.clone(), result.partition), result.offset);
+            }
+        }
+    }
+
     /// Opens the subscription's stream and reads its first frame. The stream is open
     /// only at its first frame: a transport that opens lazily (REST) reports a
     /// refused open as the first item, and a stream that ends before any frame never

@@ -184,6 +184,18 @@ impl PositionViolation {
         }
     }
 
+    /// The `positions` topic key of the refused entry.
+    #[must_use]
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+
+    /// The partition of the refused entry.
+    #[must_use]
+    pub const fn partition(&self) -> i32 {
+        self.partition
+    }
+
     #[must_use]
     pub const fn breached(&self) -> OutOfRange {
         self.breached
@@ -209,6 +221,31 @@ impl PositionViolation {
                 self.ceiling
             ),
             self.breached.reason(),
+        )
+    }
+
+    /// Reads back an entry [`Self::as_field_violation`] wrote, or `None` for any
+    /// other field violation.
+    fn from_field_violation(violation: &FieldViolation) -> Option<Self> {
+        let breached = match violation.reason.as_str() {
+            reasons::BELOW_RETENTION_FLOOR => OutOfRange::BelowFloor,
+            reasons::ABOVE_HIGH_WATER_MARK => OutOfRange::AboveCeiling,
+            _ => return None,
+        };
+        let entry = violation.description.strip_prefix("topic ")?;
+        let (topic, rest) = entry.split_once(" partition ")?;
+        let (partition, rest) = rest.split_once(": the seek position is ")?;
+        let range = rest
+            .strip_prefix(breached.phrase())?
+            .strip_prefix(" the valid range [")?
+            .strip_suffix(']')?;
+        let (floor, ceiling) = range.split_once(", ")?;
+        Some(
+            Self::builder(topic, partition.parse().ok()?)
+                .floor(Sequence::assigned(floor.parse().ok()?))
+                .ceiling(Sequence::assigned(ceiling.parse().ok()?))
+                .breached(breached)
+                .build(),
         )
     }
 }
@@ -975,6 +1012,20 @@ impl From<EventBrokerError> for CanonicalError {
 
 /// First field-violation reason on an `InvalidArgument`/`OutOfRange` context, if
 /// the context carries field violations at all.
+impl EventBrokerError {
+    /// Every field violation of an `InvalidArgument` context.
+    fn field_violations(
+        ctx: &toolkit_canonical_errors::context::InvalidArgument,
+    ) -> &[FieldViolation] {
+        match ctx {
+            toolkit_canonical_errors::context::InvalidArgumentV1::FieldViolations {
+                field_violations,
+            } => field_violations,
+            _ => &[],
+        }
+    }
+}
+
 fn first_invalid_argument_reason(
     ctx: &toolkit_canonical_errors::context::InvalidArgument,
 ) -> Option<&str> {
@@ -1256,11 +1307,14 @@ impl From<CanonicalError> for EventBrokerError {
                     }
                     // A seek position outside the admissible range renders as an
                     // `InvalidArgument` on the request resource (not `OutOfRange`,
-                    // which the storage backend uses); the offender list is not
-                    // carried on the wire.
+                    // which the storage backend uses); each offender is read back
+                    // from the field violation it was written as.
                     Some(reasons::BELOW_RETENTION_FLOOR | reasons::ABOVE_HIGH_WATER_MARK) => {
                         Self::InvalidInitialPosition {
-                            violations: Vec::new(),
+                            violations: Self::field_violations(ctx)
+                                .iter()
+                                .filter_map(PositionViolation::from_field_violation)
+                                .collect(),
                             detail,
                         }
                     }
@@ -1637,6 +1691,37 @@ mod canonical_roundtrip_tests {
                 "variant changed across the wire round-trip: {original:?} -> {recovered:?}"
             );
         }
+    }
+
+    /// Every offender of a refused seek reads back across the wire: the consumer
+    /// replaces only the starts the broker names.
+    #[test]
+    fn a_refused_seeks_offenders_read_back_across_the_wire() {
+        let violations = vec![
+            PositionViolation::builder("gts.cf.core.events.topic.v1~acme.orders.stream.v1", 0)
+                .floor(Sequence::assigned(10))
+                .ceiling(Sequence::assigned(20))
+                .breached(OutOfRange::BelowFloor)
+                .build(),
+            PositionViolation::builder("gts.cf.core.events.topic.v1~acme.orders.stream.v1", 3)
+                .floor(Sequence::NONE)
+                .ceiling(Sequence::assigned(4))
+                .breached(OutOfRange::AboveCeiling)
+                .build(),
+        ];
+        let canonical = CanonicalError::from(EventBrokerError::InvalidInitialPosition {
+            violations: violations.clone(),
+            detail: "out of range".to_owned(),
+        });
+
+        let EventBrokerError::InvalidInitialPosition {
+            violations: read, ..
+        } = EventBrokerError::from(canonical)
+        else {
+            panic!("expected InvalidInitialPosition");
+        };
+
+        assert_eq!(read, violations);
     }
 
     /// A missing consumer group reads back with the `resource_name` the broker sent,

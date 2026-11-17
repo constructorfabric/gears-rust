@@ -109,6 +109,12 @@ async fn migrations_apply_once_and_rerun_cleanly_on_mysql() {
     migrations_apply_once_and_rerun_cleanly(Engine::Mysql).await;
 }
 
+/// The SDK's producer registration migrations, in the order the runner applies them.
+const REGISTRATION_MIGRATIONS: [&str; 2] = [
+    "m001_create_event_broker_producer_registrations",
+    "m002_converge_event_broker_producer_registrations",
+];
+
 /// One row of the SDK's `event_broker_producer_registrations` table, read back
 /// with the types its entity binds.
 #[derive(Debug, PartialEq, Eq, FromQueryResult)]
@@ -179,11 +185,7 @@ async fn the_sdk_registration_migration_applies_once_and_round_trips_its_rows(en
     .expect("the producer registration migration applies to an empty database");
     assert_eq!(
         (first.applied, first.skipped, first.applied_names),
-        (
-            1,
-            0,
-            vec!["m001_create_event_broker_producer_registrations".to_owned()]
-        )
+        (2, 0, REGISTRATION_MIGRATIONS.map(str::to_owned).to_vec())
     );
 
     let again = run_migrations_for_gear(
@@ -195,7 +197,7 @@ async fn the_sdk_registration_migration_applies_once_and_round_trips_its_rows(en
     .expect("a second run under the same history succeeds");
     assert_eq!(
         (again.applied, again.skipped, again.applied_names),
-        (0, 1, Vec::<String>::new())
+        (0, 2, Vec::<String>::new())
     );
 
     let conn = sea_orm::Database::connect(gear_db.dsn.as_str())
@@ -400,4 +402,296 @@ async fn the_spec_cache_returns_which_of_the_given_ids_are_registered_on_the_top
 #[tokio::test]
 async fn the_spec_cache_returns_which_of_the_given_ids_are_registered_on_the_topic_on_mysql() {
     the_spec_cache_returns_which_of_the_given_ids_are_registered_on_the_topic(Engine::Mysql).await;
+}
+
+/// A shape `m001_create_event_broker_producer_registrations` had in an earlier
+/// release. The migration was rewritten in place under the same name, so a
+/// producing gear's database that ran an earlier release still holds that shape.
+#[derive(Debug, Clone, Copy)]
+enum EarlierM001 {
+    /// v0.1 to v0.3: one row per registration key. Never applied on `MySQL`, whose
+    /// `utf8mb4` `VARCHAR(1024)` primary key is past its 3072-byte key limit, so there
+    /// is no `MySQL` database of this shape to upgrade.
+    KeyedByRegistration,
+    /// v0.4: keyed per outbox partition, with `mode` as `VARCHAR(32)`, and on `MySQL`
+    /// `producer_id` as `CHAR(36)`, timestamps as `TIMESTAMP(6)` and keys in the
+    /// default collation.
+    KeyedByPartition,
+}
+
+impl EarlierM001 {
+    fn ddl(self, backend: DatabaseBackend) -> &'static str {
+        match (self, backend) {
+            (Self::KeyedByRegistration, DatabaseBackend::Postgres) => {
+                "CREATE TABLE IF NOT EXISTS event_broker_producer_registrations (
+                    registration_key VARCHAR(1024) PRIMARY KEY,
+                    producer_id UUID NOT NULL,
+                    mode VARCHAR(32) NOT NULL,
+                    client_agent VARCHAR(256) NOT NULL,
+                    generation BIGINT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )"
+            }
+            (Self::KeyedByRegistration, DatabaseBackend::Sqlite) => {
+                "CREATE TABLE IF NOT EXISTS event_broker_producer_registrations (
+                    registration_key TEXT PRIMARY KEY,
+                    producer_id TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    client_agent TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )"
+            }
+            (Self::KeyedByRegistration, other) => {
+                unreachable!("the v0.3 m001 never applied on {other:?}")
+            }
+            (Self::KeyedByPartition, DatabaseBackend::Postgres) => {
+                "CREATE TABLE IF NOT EXISTS event_broker_producer_registrations (
+                    registration_key VARCHAR(255) NOT NULL,
+                    queue VARCHAR(255) NOT NULL,
+                    outbox_partition BIGINT NOT NULL,
+                    producer_id UUID NOT NULL,
+                    mode VARCHAR(32) NOT NULL,
+                    client_agent VARCHAR(256) NOT NULL,
+                    generation BIGINT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (registration_key, queue, outbox_partition)
+                )"
+            }
+            (Self::KeyedByPartition, DatabaseBackend::Sqlite) => {
+                "CREATE TABLE IF NOT EXISTS event_broker_producer_registrations (
+                    registration_key TEXT NOT NULL,
+                    queue TEXT NOT NULL,
+                    outbox_partition INTEGER NOT NULL,
+                    producer_id TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    client_agent TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (registration_key, queue, outbox_partition)
+                )"
+            }
+            (Self::KeyedByPartition, _) => {
+                "CREATE TABLE IF NOT EXISTS event_broker_producer_registrations (
+                    registration_key VARCHAR(255) NOT NULL,
+                    queue VARCHAR(255) NOT NULL,
+                    outbox_partition BIGINT NOT NULL,
+                    producer_id CHAR(36) NOT NULL,
+                    mode VARCHAR(32) NOT NULL,
+                    client_agent VARCHAR(256) NOT NULL,
+                    generation BIGINT NOT NULL,
+                    created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                    updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                    PRIMARY KEY (registration_key, queue, outbox_partition)
+                )"
+            }
+        }
+    }
+
+    /// A row of this shape, written as SQL literals. The producer id is written as
+    /// the release bound it: on `SQLite` as its 16 bytes.
+    fn insert_row(self, backend: DatabaseBackend) -> String {
+        let producer_id = if backend == DatabaseBackend::Sqlite {
+            "X'019200000000700080000000000000aa'"
+        } else {
+            "'01920000-0000-7000-8000-0000000000aa'"
+        };
+        match self {
+            Self::KeyedByRegistration => format!(
+                "INSERT INTO event_broker_producer_registrations
+                    (registration_key, producer_id, mode, client_agent, generation)
+                 VALUES ('earlier', {producer_id}, 'monotonic', 'orders/0.3', 7)"
+            ),
+            Self::KeyedByPartition => format!(
+                "INSERT INTO event_broker_producer_registrations
+                    (registration_key, queue, outbox_partition, producer_id, mode, client_agent, generation)
+                 VALUES ('earlier', 'billing', 0, {producer_id}, 'monotonic', 'orders/0.4', 7)"
+            ),
+        }
+    }
+}
+
+/// The earlier `m001`, under the name the runner recorded it by.
+struct EarlierM001Migration(EarlierM001);
+
+impl sea_orm_migration::MigrationName for EarlierM001Migration {
+    fn name(&self) -> &'static str {
+        REGISTRATION_MIGRATIONS[0]
+    }
+}
+
+#[async_trait::async_trait]
+impl sea_orm_migration::MigrationTrait for EarlierM001Migration {
+    // Signature must mirror `MigrationTrait`; spelling `SchemaManager<'_>` changes lifetime binding.
+    #[allow(elided_lifetimes_in_paths)]
+    async fn up(&self, manager: &sea_orm_migration::SchemaManager) -> Result<(), sea_orm::DbErr> {
+        let conn = manager.get_connection();
+        let backend = conn.get_database_backend();
+        conn.execute_raw(Statement::from_string(backend, self.0.ddl(backend)))
+            .await?;
+        Ok(())
+    }
+}
+
+/// A producing gear's database that ran an earlier release's `m001` upgrades to the
+/// current registration table: the runner applies only `m002`, which brings the
+/// table to the shape the SDK reads and writes. A row the earlier shape stored is
+/// kept where the current SDK can still read it (`kept`), and dropped where it
+/// cannot: a row per registration key names no queue or outbox partition, and
+/// v0.4 bound a producer id to `MySQL`'s `CHAR(36)` as its 16 raw bytes, so no
+/// such column holds an id the SDK can read back.
+async fn an_earlier_registration_table_upgrades(engine: Engine, earlier: EarlierM001, kept: bool) {
+    let Some(matrix) = Matrix::start(engine, "sdk-registrations-upgrade").await else {
+        return;
+    };
+    let gear_db = matrix.gear_db().open().await;
+    run_migrations_for_gear(
+        &gear_db.db,
+        "event-broker-sdk-producer",
+        vec![Box::new(EarlierM001Migration(earlier))],
+    )
+    .await
+    .expect("the earlier m001 applies");
+    let conn = sea_orm::Database::connect(gear_db.dsn.as_str())
+        .await
+        .expect("connect to the gear database");
+    conn.execute_raw(Statement::from_string(
+        conn.get_database_backend(),
+        earlier.insert_row(conn.get_database_backend()),
+    ))
+    .await
+    .expect("insert a row of the earlier shape");
+
+    let upgrade = run_migrations_for_gear(
+        &gear_db.db,
+        "event-broker-sdk-producer",
+        producer_registration_migrations(),
+    )
+    .await
+    .expect("the registration migrations upgrade the earlier table");
+    assert_eq!(
+        (upgrade.applied, upgrade.skipped, upgrade.applied_names),
+        (1, 1, vec![REGISTRATION_MIGRATIONS[1].to_owned()])
+    );
+
+    let at = Utc.with_ymd_and_hms(2026, 11, 16, 9, 0, 0).unwrap()
+        + chrono::Duration::microseconds(654_321);
+    let current = RegistrationRow {
+        registration_key: "Orders".to_owned(),
+        queue: "billing".to_owned(),
+        outbox_partition: 1,
+        producer_id: Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_00bb),
+        mode: "monotonic".to_owned(),
+        client_agent: "orders-service/1.5.0".to_owned(),
+        generation: 8,
+        created_at: at,
+        updated_at: at,
+    };
+    insert_registration(&conn, &current).await;
+
+    let keys: Vec<(String, i64)> = conn
+        .query_all_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT registration_key, generation FROM event_broker_producer_registrations
+             ORDER BY generation",
+        ))
+        .await
+        .expect("read the registration keys")
+        .iter()
+        .map(|row| {
+            (
+                row.try_get_by_index(0).expect("registration_key"),
+                row.try_get_by_index(1).expect("generation"),
+            )
+        })
+        .collect();
+    let mut expected = Vec::new();
+    if kept {
+        expected.push(("earlier".to_owned(), 7));
+    }
+    expected.push(("Orders".to_owned(), 8));
+    assert_eq!(keys, expected);
+
+    let rows = RegistrationRow::find_by_statement(Statement::from_string(
+        conn.get_database_backend(),
+        "SELECT registration_key, queue, outbox_partition, producer_id, mode,
+                client_agent, generation, created_at, updated_at
+         FROM event_broker_producer_registrations
+         WHERE registration_key = 'Orders'",
+    ))
+    .all(&conn)
+    .await
+    .expect("read the current row back");
+    assert_eq!(rows, vec![current]);
+
+    if kept {
+        let earlier_ids: Vec<(Uuid, String)> =
+            RegistrationRow::find_by_statement(Statement::from_string(
+                conn.get_database_backend(),
+                "SELECT registration_key, queue, outbox_partition, producer_id, mode,
+                        client_agent, generation, created_at, updated_at
+                 FROM event_broker_producer_registrations
+                 WHERE registration_key = 'earlier'",
+            ))
+            .all(&conn)
+            .await
+            .expect("read the kept row back")
+            .into_iter()
+            .map(|row| (row.producer_id, row.mode))
+            .collect();
+        assert_eq!(
+            earlier_ids,
+            vec![(
+                Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_00aa),
+                "monotonic".to_owned()
+            )]
+        );
+    }
+
+    let again = run_migrations_for_gear(
+        &gear_db.db,
+        "event-broker-sdk-producer",
+        producer_registration_migrations(),
+    )
+    .await
+    .expect("a second run under the same history succeeds");
+    assert_eq!((again.applied, again.skipped), (0, 2));
+}
+
+#[tokio::test]
+async fn a_registration_table_keyed_by_registration_upgrades_on_sqlite() {
+    an_earlier_registration_table_upgrades(Engine::Sqlite, EarlierM001::KeyedByRegistration, false)
+        .await;
+}
+
+#[tokio::test]
+async fn a_registration_table_keyed_by_registration_upgrades_on_postgres() {
+    an_earlier_registration_table_upgrades(
+        Engine::Postgres,
+        EarlierM001::KeyedByRegistration,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_registration_table_keyed_by_partition_upgrades_keeping_its_rows_on_sqlite() {
+    an_earlier_registration_table_upgrades(Engine::Sqlite, EarlierM001::KeyedByPartition, true)
+        .await;
+}
+
+#[tokio::test]
+async fn a_registration_table_keyed_by_partition_upgrades_keeping_its_rows_on_postgres() {
+    an_earlier_registration_table_upgrades(Engine::Postgres, EarlierM001::KeyedByPartition, true)
+        .await;
+}
+
+#[tokio::test]
+async fn a_registration_table_keyed_by_partition_with_char_producer_ids_upgrades_on_mysql() {
+    an_earlier_registration_table_upgrades(Engine::Mysql, EarlierM001::KeyedByPartition, false)
+        .await;
 }
