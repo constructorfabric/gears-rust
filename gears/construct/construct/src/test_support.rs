@@ -2000,6 +2000,14 @@ pub struct MemoryDeletionStore {
     pub under_way_down: std::sync::atomic::AtomicBool,
     /// Fail every note of an attempt.
     pub attempts_down: std::sync::atomic::AtomicBool,
+    /// The tenants tenant exit emptied, in order.
+    pub emptied: std::sync::Mutex<Vec<Uuid>>,
+    /// What each emptying of a tenant reports it removed.
+    pub tenant_rows: std::sync::Mutex<crate::domain::tenant_exit::TenantRows>,
+    /// Fail every emptying of a tenant.
+    pub emptying_down: std::sync::atomic::AtomicBool,
+    /// The tenants tenant exit stopped keeping, in order.
+    pub forgotten: std::sync::Mutex<Vec<Uuid>>,
 }
 
 impl MemoryDeletionStore {
@@ -2163,6 +2171,164 @@ impl crate::domain::deletion::DeletionStore for MemoryDeletionStore {
         }
         Ok(self.tenants.lock().unwrap().clone())
     }
+}
+
+#[async_trait]
+impl crate::domain::tenant_exit::TenantTables for MemoryDeletionStore {
+    async fn remove_tenant(
+        &self,
+        _scope: &AccessScope,
+        tenant_id: Uuid,
+    ) -> Result<crate::domain::tenant_exit::TenantRows, DomainError> {
+        if self.emptying_down.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(DomainError::Unavailable("the database is down".to_owned()));
+        }
+        self.emptied.lock().unwrap().push(tenant_id);
+        Ok(*self.tenant_rows.lock().unwrap())
+    }
+
+    async fn forget_tenant(&self, tenant_id: Uuid) -> Result<(), DomainError> {
+        self.tenants.lock().unwrap().remove(&tenant_id);
+        self.forgotten.lock().unwrap().push(tenant_id);
+        Ok(())
+    }
+}
+
+/// [`TenantStatuses`](crate::domain::tenant_exit::TenantStatuses) with a
+/// status per tenant, `Present` for any other, or a resolver that is down
+/// for a tenant; it keeps the tenants asked about, as whom.
+#[derive(Default)]
+pub struct ScriptedStatuses {
+    pub statuses: std::sync::Mutex<
+        std::collections::BTreeMap<Uuid, crate::domain::tenant_exit::TenantStatus>,
+    >,
+    /// The tenants the resolver fails for, with the error it gives.
+    pub down: std::sync::Mutex<std::collections::BTreeMap<Uuid, String>>,
+    pub asked: std::sync::Mutex<Vec<(Uuid, Uuid)>>,
+}
+
+impl ScriptedStatuses {
+    /// Answer `status` for `tenant_id`.
+    pub fn set(&self, tenant_id: Uuid, status: crate::domain::tenant_exit::TenantStatus) {
+        self.statuses.lock().unwrap().insert(tenant_id, status);
+    }
+
+    /// Fail every question about `tenant_id` as unavailable.
+    pub fn fail(&self, tenant_id: Uuid) {
+        self.down
+            .lock()
+            .unwrap()
+            .insert(tenant_id, "the tenant resolver is down".to_owned());
+    }
+
+    /// The tenants asked about, each with the tenant of the context that asked.
+    pub fn asked(&self) -> Vec<(Uuid, Uuid)> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl crate::domain::tenant_exit::TenantStatuses for ScriptedStatuses {
+    async fn status(
+        &self,
+        ctx: &SecurityContext,
+        tenant_id: Uuid,
+    ) -> Result<crate::domain::tenant_exit::TenantStatus, DomainError> {
+        self.asked
+            .lock()
+            .unwrap()
+            .push((tenant_id, ctx.subject_tenant_id()));
+        if let Some(error) = self.down.lock().unwrap().get(&tenant_id) {
+            return Err(DomainError::Unavailable(error.clone()));
+        }
+        Ok(self
+            .statuses
+            .lock()
+            .unwrap()
+            .get(&tenant_id)
+            .copied()
+            .unwrap_or(crate::domain::tenant_exit::TenantStatus::Present))
+    }
+}
+
+/// No tenant resolver: every status is not configured, so no tenant exits.
+pub struct NoTenantResolver;
+
+#[async_trait]
+impl crate::domain::tenant_exit::TenantStatuses for NoTenantResolver {
+    async fn status(
+        &self,
+        _ctx: &SecurityContext,
+        _tenant_id: Uuid,
+    ) -> Result<crate::domain::tenant_exit::TenantStatus, DomainError> {
+        Err(DomainError::NotConfigured(
+            "no tenant resolver is registered".to_owned(),
+        ))
+    }
+}
+
+/// [`GraphOffboarding`](crate::domain::tenant_exit::GraphOffboarding) that
+/// answers from a script, then `Done`, and keeps each tenant asked for, with
+/// the tenant of the context that asked.
+#[derive(Default)]
+pub struct ScriptedOffboarding {
+    pub answers: std::sync::Mutex<
+        std::collections::VecDeque<Result<crate::domain::tenant_exit::GraphExit, DomainError>>,
+    >,
+    pub asked: std::sync::Mutex<Vec<(Uuid, Uuid)>>,
+}
+
+impl ScriptedOffboarding {
+    pub fn answer(&self, answer: Result<crate::domain::tenant_exit::GraphExit, DomainError>) {
+        self.answers.lock().unwrap().push_back(answer);
+    }
+
+    pub fn asked(&self) -> Vec<(Uuid, Uuid)> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl crate::domain::tenant_exit::GraphOffboarding for ScriptedOffboarding {
+    async fn offboard(
+        &self,
+        ctx: &SecurityContext,
+        tenant_id: Uuid,
+    ) -> Result<crate::domain::tenant_exit::GraphExit, DomainError> {
+        self.asked
+            .lock()
+            .unwrap()
+            .push((tenant_id, ctx.subject_tenant_id()));
+        self.answers
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(crate::domain::tenant_exit::GraphExit::Done))
+    }
+}
+
+/// Tenant exit as the processing identity `identity`, over `store`,
+/// `statuses` and `graph`, with its events in `events`.
+pub fn tenant_exit_over(
+    identity: Option<Uuid>,
+    store: Arc<MemoryDeletionStore>,
+    statuses: Arc<dyn crate::domain::tenant_exit::TenantStatuses>,
+    graph: Arc<ScriptedOffboarding>,
+    events: Arc<RecordingDeletionEvents>,
+) -> crate::domain::tenant_exit::TenantExit {
+    let contexts: Arc<dyn crate::domain::planner::processing::ProcessingContexts> = match identity {
+        Some(identity) => Arc::new(crate::infra::processing_contexts::ServiceIdentity::new(
+            identity,
+        )),
+        None => Arc::new(NoProcessingIdentity),
+    };
+    crate::domain::tenant_exit::TenantExit::new(crate::domain::tenant_exit::TenantExitPorts {
+        contexts,
+        statuses,
+        graph,
+        tables: store,
+        events,
+    })
 }
 
 /// [`ProfileRoots`](crate::domain::deletion::ProfileRoots) that answers from

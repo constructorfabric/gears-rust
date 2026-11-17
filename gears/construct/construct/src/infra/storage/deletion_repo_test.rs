@@ -623,3 +623,100 @@ async fn a_noted_tenant_is_among_the_tenants_and_noting_it_again_changes_nothing
 
     assert_eq!(t.store.tenants().await.unwrap(), [tenant].into());
 }
+
+#[tokio::test]
+async fn a_tenants_exit_removes_every_row_of_it_in_every_table_and_no_other() {
+    use crate::domain::tenant_exit::{TenantRows, TenantTables as _};
+
+    let t = tables().await;
+    let (key, neighbour) = (subject(), subject());
+    let same_tenant = SubjectKey {
+        tenant_id: key.tenant_id,
+        subject_id: Uuid::new_v4(),
+    };
+    let now = OffsetDateTime::now_utc();
+    for subject in [key, same_tenant, neighbour] {
+        t.store
+            .mark(&tenant_scope(subject), subject, now)
+            .await
+            .unwrap();
+        t.add_request(subject, now).await;
+        t.add_identity(subject).await;
+    }
+    t.add_closed_request(key, now).await;
+
+    let removed = t
+        .store
+        .remove_tenant(&tenant_scope(key), key.tenant_id)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        removed,
+        TenantRows {
+            subject_settings: 2,
+            review_requests: 3,
+            record_ids: 2,
+        },
+        "open and closed requests alike"
+    );
+    for gone in [key, same_tenant] {
+        assert!(t.settings(gone).await.is_none());
+        assert_eq!(t.requests(gone).await, 0);
+    }
+    assert!(t.settings(neighbour).await.is_some());
+    assert_eq!(t.requests(neighbour).await, 1);
+    assert_eq!(
+        t.identities().await,
+        1,
+        "another tenant keeps its identities"
+    );
+
+    let again = t
+        .store
+        .remove_tenant(&tenant_scope(key), key.tenant_id)
+        .await
+        .unwrap();
+    assert_eq!(again, TenantRows::default(), "removing again is safe");
+}
+
+#[tokio::test]
+async fn a_tenants_exit_removes_more_identities_than_one_batch_holds() {
+    use crate::domain::tenant_exit::TenantTables as _;
+
+    let t = tables().await;
+    let key = subject();
+    let count = crate::infra::storage::deletion_repo::EXPIRE_BATCH * 2 + 1;
+    for _ in 0..count {
+        t.add_identity(key).await;
+    }
+
+    let removed = t
+        .store
+        .remove_tenant(&tenant_scope(key), key.tenant_id)
+        .await
+        .unwrap();
+
+    assert_eq!(removed.record_ids, count);
+    assert_eq!(t.identities().await, 0);
+}
+
+#[tokio::test]
+async fn a_forgotten_tenant_is_no_longer_kept_and_a_later_write_notes_it_again() {
+    use crate::domain::deletion::KnownTenants as _;
+    use crate::domain::tenant_exit::TenantTables as _;
+
+    let t = tables().await;
+    let (tenant, other) = (Uuid::new_v4(), Uuid::new_v4());
+    t.store.note(tenant).await.unwrap();
+    t.store.note(other).await.unwrap();
+
+    t.store.forget_tenant(tenant).await.unwrap();
+    assert_eq!(t.store.tenants().await.unwrap(), [other].into());
+
+    t.store.note(tenant).await.unwrap();
+    assert!(
+        t.store.tenants().await.unwrap().contains(&tenant),
+        "the next run checks it again"
+    );
+}

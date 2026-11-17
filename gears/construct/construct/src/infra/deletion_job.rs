@@ -21,6 +21,7 @@ use crate::config::DeletionConfig;
 use crate::domain::deletion::{Deletion, DeletionStore, ERASURE_WAIT, Erasure, RetentionPeriods};
 use crate::domain::error::DomainError;
 use crate::domain::subject_settings::SubjectKey;
+use crate::domain::tenant_exit::{Exit, TenantExit};
 use crate::infra::panics::panic_message;
 
 /// How many marked erasures one run of the job takes.
@@ -103,6 +104,45 @@ fn log_retention(
     }
 }
 
+/// Log how one run of a deleted tenant's exit ended. A failed run leaves the
+/// tenant kept, so the next run goes on. A store or graph storage that did
+/// not answer is a warning; a refusal, such as graph storage's when the
+/// deployment did not grant Construct the offboarding, is an error, as the
+/// tenant stays until someone fixes it.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "six log lines; the tracing macros count toward the complexity"
+)]
+fn log_exit(tenant_id: Uuid, ended: Result<Result<Exit, DomainError>, String>) {
+    match ended {
+        Ok(Ok(Exit::Done)) => tracing::info!(%tenant_id, "construct: tenant exit done"),
+        Ok(Ok(Exit::UnderWay)) => tracing::info!(
+            %tenant_id,
+            "construct: the deleted tenant's rows are removed; graph storage is still removing              its graph, and the next run asks again"
+        ),
+        Ok(Err(DomainError::NotConfigured(_))) => tracing::debug!(
+            %tenant_id,
+            "construct: tenant exit waits for a processing identity"
+        ),
+        Ok(Err(err @ (DomainError::Unavailable(_) | DomainError::Database(_)))) => tracing::warn!(
+            %tenant_id,
+            error = %err,
+            "construct: tenant exit stopped for the tenant; the next run goes on"
+        ),
+        Ok(Err(err)) => tracing::error!(
+            %tenant_id,
+            error = %err,
+            "construct: tenant exit failed in a way a rerun does not cure; the tenant stays and \
+             the leader keeps trying"
+        ),
+        Err(panic) => tracing::error!(
+            %tenant_id,
+            panic = %panic,
+            "construct: tenant exit panicked for the tenant; the next run goes on"
+        ),
+    }
+}
+
 /// The leader's job: the marked erasures, and retention.
 ///
 /// @cpt-dod:cpt-cf-construct-dod-retention-job:p2
@@ -115,6 +155,9 @@ pub struct DeletionJob {
     /// How often retention runs; periods are counted in days, so far less
     /// often than the erasures.
     pub retention_interval: Duration,
+    /// Tenant exit, which each retention run checks every kept tenant for;
+    /// none leaves every tenant to retention alone.
+    pub exit: Option<Arc<TenantExit>>,
 }
 
 impl DeletionJob {
@@ -124,6 +167,7 @@ impl DeletionJob {
         deletion: Arc<Deletion>,
         store: Arc<dyn DeletionStore>,
         periods: Arc<dyn RetentionPeriods>,
+        exit: Option<Arc<TenantExit>>,
         config: &DeletionConfig,
     ) -> Self {
         Self {
@@ -132,6 +176,7 @@ impl DeletionJob {
             periods,
             interval: Duration::from_secs(config.job_interval_secs.get()),
             retention_interval: Duration::from_secs(config.retention_interval_secs.get()),
+            exit,
         }
     }
 
@@ -191,10 +236,20 @@ impl DeletionJob {
         }
     }
 
-    /// Retention, tenant by tenant, for each tenant with a period.
+    /// Each kept tenant: a deleted one exits; any other with a period is
+    /// swept for retention.
     async fn run_retention(&self) {
         // @cpt-begin:cpt-cf-construct-algo-retention-expire:p2:inst-expire-tenants
-        for tenant_id in self.tenants().await {
+        let (swept, checked) = self.tenants().await;
+        for tenant_id in checked {
+            // A deleted tenant leaves rather than being swept: its data goes
+            // whatever its period.
+            if self.exit_if_deleted(tenant_id).await {
+                continue;
+            }
+            if !swept.contains(&tenant_id) {
+                continue;
+            }
             match self.periods.period(tenant_id).await {
                 // A panic ends this tenant's sweep only; the job goes on to
                 // the next tenant.
@@ -215,20 +270,70 @@ impl DeletionJob {
         // @cpt-end:cpt-cf-construct-algo-retention-expire:p2:inst-expire-tenants
     }
 
-    /// The tenants given a period of their own and, with a default period,
-    /// every tenant Construct holds a row for.
-    async fn tenants(&self) -> BTreeSet<Uuid> {
-        let mut tenants = self.periods.listed();
-        if self.periods.has_default() {
+    /// Run the tenant's exit when the platform has deleted it; whether it
+    /// has, so retention leaves it alone. A tenant whose status cannot be
+    /// read is not taken as deleted: retention sweeps it as before.
+    async fn exit_if_deleted(&self, tenant_id: Uuid) -> bool {
+        // @cpt-begin:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-status
+        let Some(exit) = &self.exit else {
+            return false;
+        };
+        // A panic ends this tenant's exit only; the job goes on to the next.
+        let deleted = AssertUnwindSafe(exit.deleted(tenant_id))
+            .catch_unwind()
+            .await;
+        match deleted {
+            Ok(Ok(true)) => {}
+            // Not deleted; or no resolver or no identity, so no tenant exits.
+            // Each is said once, not for every tenant on every run.
+            Ok(Ok(false) | Err(DomainError::NotConfigured(_))) => return false,
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    %tenant_id,
+                    error = %err,
+                    "construct: whether the tenant is deleted could not be read; the next run \
+                     asks again"
+                );
+                return false;
+            }
+            Err(panic) => {
+                log_exit(tenant_id, Err(panic_message(panic.as_ref()).to_owned()));
+                return false;
+            }
+        }
+        // @cpt-end:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-status
+        log_exit(
+            tenant_id,
+            AssertUnwindSafe(exit.exit(tenant_id))
+                .catch_unwind()
+                .await
+                .map_err(|panic| panic_message(panic.as_ref()).to_owned()),
+        );
+        true
+    }
+
+    /// The tenants retention sweeps: those given a period of their own and,
+    /// with a default period, every tenant Construct keeps; and the tenants
+    /// tenant exit checks: those, and every tenant Construct keeps.
+    async fn tenants(&self) -> (BTreeSet<Uuid>, BTreeSet<Uuid>) {
+        let mut swept = self.periods.listed();
+        let mut checked = swept.clone();
+        if self.periods.has_default() || self.exit.is_some() {
             match self.store.tenants().await {
-                Ok(held) => tenants.extend(held),
+                Ok(kept) => {
+                    if self.periods.has_default() {
+                        swept.extend(kept.iter().copied());
+                    }
+                    checked.extend(kept);
+                }
                 Err(err) => tracing::warn!(
                     error = %err,
-                    "construct: the tenants could not be listed; only the listed ones are swept"
+                    "construct: the tenants could not be listed; only the listed ones are swept \
+                     or checked for an exit"
                 ),
             }
         }
-        tenants
+        (swept, checked)
     }
 
     /// Run the job until `cancel` fires: the marked erasures every `interval`
@@ -518,6 +623,7 @@ mod tests {
             periods: periods(RetentionConfig::default()),
             interval: Duration::from_secs(60),
             retention_interval: Duration::from_secs(60),
+            exit: None,
         };
 
         runner.run_once().await;
@@ -546,6 +652,7 @@ mod tests {
             }),
             interval: Duration::from_secs(60),
             retention_interval: Duration::from_secs(60),
+            exit: None,
         };
         listed_only.run_once().await;
         let swept: Vec<Uuid> = job
@@ -589,6 +696,7 @@ mod tests {
             periods: periods(RetentionConfig::default()),
             interval: Duration::from_secs(60),
             retention_interval: Duration::from_secs(60),
+            exit: None,
         };
 
         runner.run_once().await;
@@ -631,6 +739,7 @@ mod tests {
             }),
             interval: Duration::from_secs(60),
             retention_interval: Duration::from_secs(60),
+            exit: None,
         };
 
         runner.run_once().await;
@@ -664,6 +773,7 @@ mod tests {
             }),
             interval: Duration::from_secs(60),
             retention_interval: Duration::from_secs(60),
+            exit: None,
         };
 
         runner.run_once().await;
@@ -703,6 +813,7 @@ mod tests {
             periods: periods(RetentionConfig::default()),
             interval: Duration::from_secs(60),
             retention_interval: Duration::from_secs(60),
+            exit: None,
         };
 
         runner.run_once().await;
@@ -773,6 +884,7 @@ mod tests {
             }),
             interval: Duration::from_secs(60),
             retention_interval: Duration::from_secs(60),
+            exit: None,
         };
 
         runner.run_once().await;
@@ -798,6 +910,7 @@ mod tests {
             periods: periods(retention),
             interval: Duration::from_secs(60),
             retention_interval: Duration::from_secs(60),
+            exit: None,
         }
     }
 
@@ -825,6 +938,7 @@ mod tests {
             Arc::clone(&job.deletion),
             Arc::clone(&job.store) as _,
             periods(RetentionConfig::default()),
+            None,
             &config,
         );
 
@@ -962,6 +1076,7 @@ mod tests {
             periods: Arc::clone(&periods) as _,
             interval: Duration::from_secs(60),
             retention_interval: Duration::from_secs(60),
+            exit: None,
         });
         let reads = || periods.reads.load(std::sync::atomic::Ordering::SeqCst);
         let cancel = CancellationToken::new();
@@ -990,6 +1105,7 @@ mod tests {
             }),
             interval: Duration::from_secs(60),
             retention_interval: Duration::from_secs(60),
+            exit: None,
         });
         let runs = || job.store.expired.lock().unwrap().len();
         let cancel = CancellationToken::new();
@@ -1023,6 +1139,7 @@ mod tests {
             }),
             interval: Duration::from_secs(60),
             retention_interval: Duration::from_secs(600),
+            exit: None,
         });
         let sweeps = || job.store.expired.lock().unwrap().len();
         let cancel = CancellationToken::new();
@@ -1068,6 +1185,7 @@ mod tests {
             periods: Arc::new(Hanging(job.key.tenant_id)),
             interval: Duration::from_secs(60),
             retention_interval: Duration::from_secs(60),
+            exit: None,
         });
         let cancel = CancellationToken::new();
         let running = tokio::spawn(Arc::clone(&runner).run(cancel.clone()));
@@ -1100,6 +1218,7 @@ mod tests {
                 periods: periods(RetentionConfig::default()),
                 interval: Duration::from_secs(60),
                 retention_interval: Duration::from_secs(60),
+                exit: None,
             });
 
             tokio::time::timeout(
@@ -1131,6 +1250,7 @@ mod tests {
             periods: periods(RetentionConfig::default()),
             interval: Duration::from_secs(60),
             retention_interval: Duration::from_secs(60),
+            exit: None,
         });
         let hub = ClientHub::new();
         cluster_sdk::test_support::StubClusterClient::for_profile("construct")
@@ -1223,6 +1343,7 @@ mod tests {
             periods: periods(RetentionConfig::default()),
             interval: Duration::from_secs(60),
             retention_interval: Duration::from_secs(60),
+            exit: None,
         });
         let election = Arc::new(DrivenElection::default());
         let hub = ClientHub::new();
@@ -1283,6 +1404,7 @@ mod tests {
             periods: periods(RetentionConfig::default()),
             interval: Duration::from_secs(60),
             retention_interval: Duration::from_secs(60),
+            exit: None,
         };
 
         runner.run_once().await;
@@ -1311,5 +1433,216 @@ mod tests {
 
         assert_eq!(job.store.finished(), [done, failing]);
         assert!(job.store.is_marked(later));
+    }
+
+    // --- tenant exit --------------------------------------------------------
+
+    use crate::domain::tenant_exit::{GraphExit, TenantStatus};
+    use crate::test_support::{ScriptedOffboarding, ScriptedStatuses, tenant_exit_over};
+
+    /// The job over `job`'s stores with `retention`, and tenant exit over
+    /// `statuses` and `graph`, as a processing identity.
+    fn exiting(
+        job: &Job,
+        retention: RetentionConfig,
+        statuses: &Arc<ScriptedStatuses>,
+        graph: &Arc<ScriptedOffboarding>,
+    ) -> DeletionJob {
+        DeletionJob {
+            exit: Some(Arc::new(tenant_exit_over(
+                Some(Uuid::new_v4()),
+                Arc::clone(&job.store),
+                Arc::clone(statuses) as _,
+                Arc::clone(graph),
+                Arc::default(),
+            ))),
+            ..runner(job, retention)
+        }
+    }
+
+    fn every_tenant(days: u32) -> RetentionConfig {
+        RetentionConfig {
+            default_days: Some(NonZeroU32::new(days).unwrap()),
+            tenants: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_deleted_tenant_exits_and_is_not_swept_while_another_is_swept_as_before() {
+        let job = job();
+        let deleted = Uuid::new_v4();
+        job.store
+            .tenants
+            .lock()
+            .unwrap()
+            .extend([job.key.tenant_id, deleted]);
+        let statuses = Arc::new(ScriptedStatuses::default());
+        statuses.set(deleted, TenantStatus::Deleted);
+        let graph = Arc::new(ScriptedOffboarding::default());
+
+        exiting(&job, every_tenant(30), &statuses, &graph)
+            .run_once()
+            .await;
+
+        assert_eq!(*job.store.emptied.lock().unwrap(), [deleted]);
+        assert_eq!(graph.asked(), [(deleted, deleted)]);
+        assert_eq!(*job.store.forgotten.lock().unwrap(), [deleted]);
+        assert_eq!(
+            swept(&job),
+            [job.key.tenant_id],
+            "only the present tenant is swept"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deleted_tenant_exits_also_where_no_retention_period_is_set() {
+        let job = job();
+        let deleted = Uuid::new_v4();
+        job.store.tenants.lock().unwrap().insert(deleted);
+        let statuses = Arc::new(ScriptedStatuses::default());
+        statuses.set(deleted, TenantStatus::Deleted);
+        let graph = Arc::new(ScriptedOffboarding::default());
+
+        exiting(&job, RetentionConfig::default(), &statuses, &graph)
+            .run_once()
+            .await;
+
+        assert_eq!(*job.store.forgotten.lock().unwrap(), [deleted]);
+        assert!(swept(&job).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_tenant_that_is_present_or_unknown_is_left_untouched() {
+        let job = job();
+        let unknown = Uuid::new_v4();
+        job.store
+            .tenants
+            .lock()
+            .unwrap()
+            .extend([job.key.tenant_id, unknown]);
+        let statuses = Arc::new(ScriptedStatuses::default());
+        statuses.set(unknown, TenantStatus::Unknown);
+        let graph = Arc::new(ScriptedOffboarding::default());
+
+        exiting(&job, RetentionConfig::default(), &statuses, &graph)
+            .run_once()
+            .await;
+
+        let asked: BTreeSet<Uuid> = statuses.asked().into_iter().map(|(t, _)| t).collect();
+        assert_eq!(asked, BTreeSet::from([job.key.tenant_id, unknown]));
+        assert!(job.store.emptied.lock().unwrap().is_empty());
+        assert!(graph.asked().is_empty());
+        assert_eq!(job.profile.live().len(), 1, "nothing is removed");
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_tenant_whose_status_cannot_be_read_is_swept_as_before_and_asked_again() {
+        let job = job();
+        job.store.tenants.lock().unwrap().insert(job.key.tenant_id);
+        let statuses = Arc::new(ScriptedStatuses::default());
+        statuses.fail(job.key.tenant_id);
+        let graph = Arc::new(ScriptedOffboarding::default());
+        let runner = exiting(&job, every_tenant(30), &statuses, &graph);
+
+        runner.run_once().await;
+        assert_eq!(swept(&job), [job.key.tenant_id]);
+        assert!(job.store.emptied.lock().unwrap().is_empty());
+        assert!(logs_contain(
+            "whether the tenant is deleted could not be read"
+        ));
+
+        statuses.down.lock().unwrap().clear();
+        statuses.set(job.key.tenant_id, TenantStatus::Deleted);
+        runner.run_once().await;
+        assert_eq!(*job.store.forgotten.lock().unwrap(), [job.key.tenant_id]);
+    }
+
+    #[tokio::test]
+    async fn an_exit_that_graph_storage_has_not_finished_is_finished_by_a_later_run() {
+        let job = job();
+        let deleted = job.key.tenant_id;
+        job.store.tenants.lock().unwrap().insert(deleted);
+        let statuses = Arc::new(ScriptedStatuses::default());
+        statuses.set(deleted, TenantStatus::Deleted);
+        let graph = Arc::new(ScriptedOffboarding::default());
+        graph.answer(Ok(GraphExit::UnderWay));
+        graph.answer(Err(DomainError::Unavailable(
+            "graph storage is down".to_owned(),
+        )));
+        let runner = exiting(&job, every_tenant(30), &statuses, &graph);
+
+        runner.run_once().await;
+        runner.run_once().await;
+        assert!(job.store.forgotten.lock().unwrap().is_empty());
+        assert!(job.store.tenants.lock().unwrap().contains(&deleted));
+        assert!(swept(&job).is_empty(), "a deleted tenant is never swept");
+
+        runner.run_once().await;
+        assert_eq!(*job.store.forgotten.lock().unwrap(), [deleted]);
+        assert_eq!(job.store.emptied.lock().unwrap().len(), 3);
+
+        runner.run_once().await;
+        assert_eq!(
+            graph.asked().len(),
+            3,
+            "a forgotten tenant is not checked again"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn without_a_tenant_resolver_every_tenant_is_left_to_retention() {
+        let job = job();
+        job.store.tenants.lock().unwrap().insert(job.key.tenant_id);
+        let runner = DeletionJob {
+            exit: Some(Arc::new(tenant_exit_over(
+                Some(Uuid::new_v4()),
+                Arc::clone(&job.store),
+                Arc::new(crate::test_support::NoTenantResolver),
+                Arc::default(),
+                Arc::default(),
+            ))),
+            ..runner(&job, every_tenant(30))
+        };
+
+        runner.run_once().await;
+
+        assert_eq!(swept(&job), [job.key.tenant_id]);
+        assert!(job.store.emptied.lock().unwrap().is_empty());
+        assert!(
+            !logs_contain("could not be read"),
+            "said once at start, not per tenant"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_failed_exit_is_logged_and_the_next_tenant_still_exits() {
+        let job = job();
+        let (refused, next) = (Uuid::new_v4(), Uuid::new_v4());
+        // The tenants are taken in order, so the refused one comes first.
+        let (refused, next) = if refused < next {
+            (refused, next)
+        } else {
+            (next, refused)
+        };
+        job.store.tenants.lock().unwrap().extend([refused, next]);
+        let statuses = Arc::new(ScriptedStatuses::default());
+        statuses.set(refused, TenantStatus::Deleted);
+        statuses.set(next, TenantStatus::Deleted);
+        let graph = Arc::new(ScriptedOffboarding::default());
+        graph.answer(Err(DomainError::internal(
+            "graph storage refused Construct's offboarding of the tenant",
+        )));
+
+        exiting(&job, RetentionConfig::default(), &statuses, &graph)
+            .run_once()
+            .await;
+
+        assert_eq!(*job.store.forgotten.lock().unwrap(), [next]);
+        assert!(logs_contain(
+            "tenant exit failed in a way a rerun does not cure"
+        ));
     }
 }

@@ -46,6 +46,10 @@ opentelemetry = { workspace = true }
 # The deletion job's leader election on the platform cluster gear. The SDK
 # only: no `deps = [cluster]` edge and no cluster gear dependency.
 cluster-sdk = { workspace = true }
+# Tenant exit asks the platform's tenant resolver whether a tenant is
+# deleted. The SDK only, looked up in the client hub when asked: no `deps`
+# edge, so the gear starts without a resolver.
+tenant-resolver-sdk = { workspace = true }
 
 # Record types: the types registry resolves a record's type and base types
 types-registry-sdk = { workspace = true }

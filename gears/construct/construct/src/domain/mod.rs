@@ -32,6 +32,7 @@ pub mod subject_access;
 pub mod subject_control;
 pub(crate) mod subject_reach;
 pub mod subject_settings;
+pub mod tenant_exit;
 
 #[cfg(test)]
 mod admin_facts_test;
@@ -59,3 +60,5 @@ mod sensitive_data_test;
 mod subject_control_test;
 #[cfg(test)]
 mod subject_settings_test;
+#[cfg(test)]
+mod tenant_exit_test;

@@ -2614,6 +2614,7 @@ dependencies = [
  "cf-gears-graph-storage-sdk",
  "cf-gears-oagw-sdk",
  "cf-gears-settings-service-sdk",
+ "cf-gears-tenant-resolver-sdk",
  "cf-gears-test-containers",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",

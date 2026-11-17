@@ -65,6 +65,7 @@ async fn gear_with_worker() -> (ConstructGear, Arc<dyn RecordHandOff>) {
         Arc::new(crate::test_support::MemoryReviews::default()),
         crate::test_support::deletion_tables(&db),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
+        Arc::new(crate::test_support::NoTenantResolver),
     )
     .unwrap();
     let gear = ConstructGear::default();
@@ -263,6 +264,7 @@ async fn router_of(
         Arc::new(crate::test_support::MemoryReviews::default()),
         crate::test_support::deletion_tables(&db),
         PolicyEnforcer::new(resolver),
+        Arc::new(crate::test_support::NoTenantResolver),
     )
     .unwrap();
     let gear = ConstructGear::default();
@@ -465,6 +467,7 @@ fn gear_deleting(leads: Leads) -> DeletingGear {
             ),
             interval: std::time::Duration::from_secs(60),
             retention_interval: std::time::Duration::from_secs(60),
+            exit: None,
         }),
         leadership: Arc::clone(&leadership) as _,
     });

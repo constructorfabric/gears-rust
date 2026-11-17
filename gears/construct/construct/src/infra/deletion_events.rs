@@ -10,7 +10,7 @@ pub struct LogDeletionEvents;
 impl DeletionEvents for LogDeletionEvents {
     #[expect(
         clippy::cognitive_complexity,
-        reason = "four log lines; the tracing macros count toward the complexity"
+        reason = "six log lines; the tracing macros count toward the complexity"
     )]
     fn record(&self, event: DeletionEvent) {
         // @cpt-begin:cpt-cf-construct-algo-erasure-log:p1:inst-log-event
@@ -60,6 +60,28 @@ impl DeletionEvents for LogDeletionEvents {
                 record_ids,
                 "review requests and record identities past the retention period removed"
             ),
+            // @cpt-begin:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-log
+            DeletionEvent::TenantRowsRemoved {
+                tenant_id,
+                subject_settings,
+                review_requests,
+                record_ids,
+            } => tracing::info!(
+                target: "construct::audit",
+                event = "tenant_rows_removed",
+                %tenant_id,
+                subject_settings,
+                review_requests,
+                record_ids,
+                "a deleted tenant's rows removed from Construct's tables"
+            ),
+            DeletionEvent::TenantExited { tenant_id } => tracing::info!(
+                target: "construct::audit",
+                event = "tenant_exited",
+                %tenant_id,
+                "a deleted tenant is gone from Construct and from graph storage"
+            ),
+            // @cpt-end:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-log
         }
         // @cpt-end:cpt-cf-construct-algo-erasure-log:p1:inst-log-event
     }
@@ -114,6 +136,13 @@ mod tests {
             review_requests: 2,
             record_ids: 3,
         });
+        events.record(DeletionEvent::TenantRowsRemoved {
+            tenant_id,
+            subject_settings: 4,
+            review_requests: 5,
+            record_ids: 6,
+        });
+        events.record(DeletionEvent::TenantExited { tenant_id });
 
         let (tenant, subject) = (
             format!("tenant_id={tenant_id}"),
@@ -143,7 +172,18 @@ mod tests {
                     "review_requests=2".to_owned(),
                     "record_ids=3".to_owned(),
                 ],
-            )
+            )?;
+            assert_line(
+                lines,
+                "tenant_rows_removed",
+                &[
+                    tenant.clone(),
+                    "subject_settings=4".to_owned(),
+                    "review_requests=5".to_owned(),
+                    "record_ids=6".to_owned(),
+                ],
+            )?;
+            assert_line(lines, "tenant_exited", std::slice::from_ref(&tenant))
         });
     }
 }
