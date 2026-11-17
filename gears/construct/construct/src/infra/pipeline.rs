@@ -234,7 +234,7 @@ pub fn build(
 /// # Errors
 ///
 /// When the person types cannot be read, a defect in the gear.
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "the gear's collaborators, each given once; a test replaces any of them"
 )]
@@ -396,7 +396,7 @@ pub fn assemble(
         runner,
         Arc::clone(&deletion) as _,
         Arc::clone(&periods) as _,
-        Some(exit),
+        exit,
         &cfg.config().deletion,
     ));
     // @cpt-end:cpt-cf-construct-algo-erasure-wire:p1:inst-wire-deletion

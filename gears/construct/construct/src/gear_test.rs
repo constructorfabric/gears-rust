@@ -456,6 +456,7 @@ fn gear_deleting(leads: Leads) -> DeletingGear {
         stopped: std::sync::atomic::AtomicBool::new(false),
     });
     let gear = ConstructGear::default();
+    let exit = crate::test_support::tenant_exit_without_resolver(Arc::clone(&store));
     *gear.deletion.lock() = Some(DeletionTasks {
         job: Arc::new(DeletionJob {
             deletion,
@@ -467,7 +468,7 @@ fn gear_deleting(leads: Leads) -> DeletingGear {
             ),
             interval: std::time::Duration::from_secs(60),
             retention_interval: std::time::Duration::from_secs(60),
-            exit: None,
+            exit,
         }),
         leadership: Arc::clone(&leadership) as _,
     });

@@ -152,11 +152,8 @@ async fn each_answer_of_the_resolver_is_a_status_or_an_error() {
             | (Err(DomainError::Internal(_)), Err("internal")) => {}
             (status, expected) => panic!("{shown}: got {status:?}, expected {expected:?}"),
         }
-        assert_eq!(
-            *resolver.asked_as.lock().unwrap(),
-            [tenant],
-            "asked as Construct in the tenant"
-        );
+        let asked_as = resolver.asked_as.lock().unwrap().clone();
+        assert_eq!(asked_as, [tenant], "asked as Construct in the tenant");
     }
 }
 
@@ -202,4 +199,28 @@ async fn a_resolver_that_does_not_answer_in_time_is_unavailable() {
         statuses.status(&construct_in(tenant), tenant).await,
         Err(DomainError::Unavailable(_))
     ));
+}
+
+#[tokio::test]
+async fn a_resolver_registered_after_the_first_question_is_found() {
+    let hub = Arc::new(ClientHub::new());
+    let statuses = HubTenantStatuses::new(Arc::clone(&hub));
+    let tenant = Uuid::new_v4();
+    assert!(matches!(
+        statuses.status(&construct_in(tenant), tenant).await,
+        Err(DomainError::NotConfigured(_))
+    ));
+
+    hub.register::<dyn TenantResolverClient>(Resolver::answering(Ok(info(
+        tenant,
+        tenant_resolver_sdk::TenantStatus::Deleted,
+    ))));
+
+    assert_eq!(
+        statuses
+            .status(&construct_in(tenant), tenant)
+            .await
+            .unwrap(),
+        TenantStatus::Deleted
+    );
 }

@@ -101,26 +101,33 @@ pub trait TenantTables: Send + Sync {
     ) -> Result<TenantRows, DomainError>;
 
     /// Stop keeping `tenant_id` among the tenants Construct holds data for,
-    /// so the job no longer checks it. A write that lands later notes it
-    /// again, and the next run removes that too.
+    /// so the job no longer checks it. A record that lands later leaves a
+    /// row the job finds the tenant by again; a profile write leaves none,
+    /// as graph storage refuses every write of an offboarded tenant.
     ///
     /// # Errors
     ///
     /// When the store cannot be reached.
-    async fn forget_tenant(&self, tenant_id: Uuid) -> Result<(), DomainError>;
+    async fn forget_tenant(&self, scope: &AccessScope, tenant_id: Uuid) -> Result<(), DomainError>;
 }
 
-/// How one run of a deleted tenant's exit ended.
+/// How one run of tenant exit for a tenant ended.
 #[domain_model]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Exit {
-    /// Construct's rows are gone; graph storage is still removing the graph.
+    /// The tenant is not deleted: present, or unknown to the resolver.
+    /// Nothing is removed.
+    Kept(TenantStatus),
+    /// Graph storage is removing the graph and Construct's rows are gone.
     /// The next run asks again.
     UnderWay,
     /// Everything is gone, and the tenant is no longer kept.
     Done,
+    /// The tenant is deleted, but this run stopped: graph storage or the
+    /// store failed. Nothing that failed is left half done for good, as every
+    /// step can run again.
+    Stopped(DomainError),
 }
-
 /// The collaborators of tenant exit.
 #[domain_model]
 pub struct TenantExitPorts {
@@ -145,37 +152,52 @@ impl TenantExit {
         Self { ports }
     }
 
-    /// Whether the platform has deleted `tenant_id`.
-    ///
-    /// # Errors
-    ///
-    /// Not configured without a processing identity or a tenant resolver;
-    /// the resolver's errors otherwise.
-    pub async fn deleted(&self, tenant_id: Uuid) -> Result<bool, DomainError> {
-        // @cpt-begin:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-status
-        let (construct, _) = self.ports.contexts.for_tenant(tenant_id).await?;
-        let status = self.ports.statuses.status(&construct, tenant_id).await?;
-        Ok(status == TenantStatus::Deleted)
-        // @cpt-end:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-status
-    }
-
-    /// Remove what Construct holds for `tenant_id`, which the platform has
-    /// deleted: its rows in Construct's tables, then its graph through graph
-    /// storage's offboarding. Once graph storage reports the graph gone, the
-    /// tenant is no longer kept.
+    /// Ask the platform about `tenant_id` and, when it has deleted the
+    /// tenant, remove what Construct holds for it: graph storage is asked to
+    /// offboard the tenant first, and only once it has, so the graph is
+    /// fenced, are Construct's rows removed; once graph storage reports the
+    /// graph gone, the tenant is no longer kept. A tenant that is not deleted
+    /// is left untouched.
     ///
     /// NOT cancel-safe: the next run does what a dropped one left.
     ///
     /// # Errors
     ///
-    /// Not configured without a processing identity; the store's and graph
-    /// storage's errors otherwise. Nothing that failed is left half done for
-    /// good, as every step can run again.
+    /// The tenant's status could not be read: not configured without a
+    /// processing identity or a tenant resolver, the resolver's errors
+    /// otherwise. A failure after the tenant is known to be deleted is
+    /// [`Exit::Stopped`].
     #[tracing::instrument(skip_all, fields(%tenant_id))]
-    pub async fn exit(&self, tenant_id: Uuid) -> Result<Exit, DomainError> {
+    pub async fn run(&self, tenant_id: Uuid) -> Result<Exit, DomainError> {
+        // @cpt-begin:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-status
         let (construct, scope) = self.ports.contexts.for_tenant(tenant_id).await?;
+        let status = self.ports.statuses.status(&construct, tenant_id).await?;
+        if status != TenantStatus::Deleted {
+            return Ok(Exit::Kept(status));
+        }
+        // @cpt-end:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-status
+        Ok(self
+            .exit(&construct, &scope, tenant_id)
+            .await
+            .unwrap_or_else(Exit::Stopped))
+    }
+
+    /// The exit of a tenant the platform has deleted.
+    async fn exit(
+        &self,
+        construct: &SecurityContext,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+    ) -> Result<Exit, DomainError> {
+        // @cpt-begin:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-graph
+        // Graph storage first: until it has fenced the tenant its graph stays
+        // readable and writable, so the subjects' settings, their opt-outs
+        // and erasure marks, must stay too. A refusal leaves everything as it
+        // was.
+        let graph = self.ports.graph.offboard(construct, tenant_id).await?;
+        // @cpt-end:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-graph
         // @cpt-begin:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-rows
-        let rows = self.ports.tables.remove_tenant(&scope, tenant_id).await?;
+        let rows = self.ports.tables.remove_tenant(scope, tenant_id).await?;
         if rows != TenantRows::default() {
             self.ports.events.record(DeletionEvent::TenantRowsRemoved {
                 tenant_id,
@@ -185,13 +207,11 @@ impl TenantExit {
             });
         }
         // @cpt-end:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-rows
-        // @cpt-begin:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-graph
-        if self.ports.graph.offboard(&construct, tenant_id).await? == GraphExit::UnderWay {
+        if graph == GraphExit::UnderWay {
             return Ok(Exit::UnderWay);
         }
-        // @cpt-end:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-graph
         // @cpt-begin:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-forget
-        self.ports.tables.forget_tenant(tenant_id).await?;
+        self.ports.tables.forget_tenant(scope, tenant_id).await?;
         self.ports
             .events
             .record(DeletionEvent::TenantExited { tenant_id });

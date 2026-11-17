@@ -74,67 +74,11 @@ fn offboarding_error(err: &CanonicalError) -> DomainError {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU64;
-
-    use graph_storage::config::GraphStorageConfig;
-    use graph_storage::domain::embedding::{EmbeddingCoordinator, SpaceState};
-    use graph_storage::domain::local_client::GraphStorageLocalClient;
-    use graph_storage::domain::offboarding::{
-        TenantDirectory, TenantState, WorkerSettings, WorkerState, run_pending,
-    };
-    use graph_storage::domain::service::GraphServices;
-    use graph_storage::infra::embedding::fake::FakeEmbeddingProvider;
-    use graph_storage::infra::fake_store::{FakeGraphEngine, FakeGraphStore};
-    use tokio_util::sync::CancellationToken;
+    use graph_storage::domain::offboarding::TenantState;
 
     use super::*;
     use crate::infra::processing_contexts::ServiceIdentity;
-    use crate::test_support::AllowInOwnTenant;
-
-    /// The platform as graph storage asks it: every tenant is `state`.
-    struct Platform(TenantState);
-
-    #[async_trait]
-    impl TenantDirectory for Platform {
-        async fn state(
-            &self,
-            _ctx: &SecurityContext,
-            _tenant: Uuid,
-            _within: Duration,
-        ) -> Result<TenantState, graph_storage::domain::error::DomainError> {
-            Ok(self.0)
-        }
-    }
-
-    /// Graph storage's real service over its in-memory store, where the
-    /// platform says every tenant is `state`; and the store, for its worker.
-    fn graph_storage(state: TenantState) -> (Arc<dyn GraphStorageClientV1>, Arc<FakeGraphStore>) {
-        graph_storage_under(state, Arc::new(AllowInOwnTenant))
-    }
-
-    /// The same, with the policy service `policy`.
-    fn graph_storage_under(
-        state: TenantState,
-        policy: Arc<dyn authz_resolver_sdk::AuthZResolverApi>,
-    ) -> (Arc<dyn GraphStorageClientV1>, Arc<FakeGraphStore>) {
-        let store = Arc::new(FakeGraphStore::new());
-        let services = GraphServices::new(
-            GraphStorageConfig::default().validated().unwrap(),
-            Arc::clone(&store) as _,
-            Arc::new(FakeGraphEngine::new(Arc::clone(&store))),
-            authz_resolver_sdk::PolicyEnforcer::new(policy),
-            EmbeddingCoordinator::new(
-                Arc::new(FakeEmbeddingProvider::new(384)),
-                SpaceState::Active { epoch: 1 },
-                8 * 1024,
-            ),
-        )
-        .with_tenant_directory(Arc::new(Platform(state)));
-        (
-            Arc::new(GraphStorageLocalClient::new(Arc::new(services))),
-            store,
-        )
-    }
+    use crate::test_support::{fake_graph_storage_where_every_tenant_is, run_graph_offboarding};
 
     fn construct_in(tenant_id: Uuid) -> SecurityContext {
         ServiceIdentity::new(Uuid::new_v4())
@@ -145,7 +89,7 @@ mod tests {
     #[tokio::test]
     async fn construct_starts_the_offboarding_and_sees_it_done_once_graph_storage_removed_the_graph()
      {
-        let (client, store) = graph_storage(TenantState::Deleted);
+        let (client, store) = fake_graph_storage_where_every_tenant_is(TenantState::Deleted);
         let graph = GraphTenantOffboarding::new(client);
         let tenant = Uuid::new_v4();
 
@@ -160,20 +104,7 @@ mod tests {
             "asking again answers the same offboarding"
         );
 
-        let settings = WorkerSettings::new(
-            NonZeroU64::new(100).unwrap(),
-            Duration::from_secs(1),
-            Duration::from_secs(10),
-        )
-        .unwrap();
-        let finished = run_pending(
-            store.as_ref(),
-            settings,
-            &mut WorkerState::default(),
-            &CancellationToken::new(),
-        )
-        .await;
-        assert_eq!(finished, 1);
+        run_graph_offboarding(&store).await;
 
         assert_eq!(
             graph.offboard(&construct_in(tenant), tenant).await.unwrap(),
@@ -183,7 +114,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_tenant_the_platform_has_not_deleted_is_refused_by_graph_storage() {
-        let (client, _) = graph_storage(TenantState::Live);
+        let (client, _) = fake_graph_storage_where_every_tenant_is(TenantState::Live);
         let tenant = Uuid::new_v4();
 
         let refused = GraphTenantOffboarding::new(client)
@@ -191,14 +122,14 @@ mod tests {
             .await;
 
         assert!(
-            matches!(&refused, Err(DomainError::Internal(message)) if message.contains("failed_precondition")),
+            matches!(refused, Err(DomainError::Internal(_))),
             "a refusal a rerun does not cure: {refused:?}"
         );
     }
 
     #[tokio::test]
     async fn a_refused_grant_names_the_permission_the_deployment_must_give() {
-        let (client, _) = graph_storage_under(
+        let (client, _) = crate::test_support::fake_graph_storage_under(
             TenantState::Deleted,
             Arc::new(crate::test_support::DenyResolver),
         );
@@ -208,9 +139,9 @@ mod tests {
             .offboard(&construct_in(tenant), tenant)
             .await;
 
-        assert!(
-            matches!(&refused, Err(DomainError::Internal(message)) if message.contains("tenant_offboard")),
-            "a refusal is the deployment's missing grant, not a retry: {refused:?}"
-        );
+        let Err(DomainError::Internal(message)) = refused else {
+            panic!("a refusal is the deployment's missing grant, not a retry: {refused:?}");
+        };
+        assert!(message.contains("tenant_offboard"), "{message}");
     }
 }

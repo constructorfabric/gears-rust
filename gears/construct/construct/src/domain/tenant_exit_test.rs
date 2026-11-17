@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::deletion::DeletionEvent;
@@ -28,7 +29,7 @@ struct Fixture {
 fn deleted_tenant() -> Fixture {
     let tenant = Uuid::new_v4();
     let store = Arc::new(MemoryDeletionStore::default());
-    store.tenants.lock().unwrap().insert(tenant);
+    store.keep([tenant]);
     *store.tenant_rows.lock().unwrap() = TenantRows {
         subject_settings: 2,
         review_requests: 3,
@@ -55,11 +56,21 @@ fn deleted_tenant() -> Fixture {
     }
 }
 
+impl Fixture {
+    /// Nothing of the tenant's was removed, offboarded or forgotten.
+    fn untouched(&self) -> bool {
+        self.store.emptied().is_empty()
+            && self.store.forgotten().is_empty()
+            && self.store.keeps(self.tenant)
+            && self.events.taken().is_empty()
+    }
+}
+
 #[tokio::test]
 async fn a_deleted_tenant_is_asked_about_as_construct_in_that_tenant() {
     let f = deleted_tenant();
 
-    assert!(f.exit.deleted(f.tenant).await.unwrap());
+    assert!(matches!(f.exit.run(f.tenant).await, Ok(Exit::Done)));
     assert_eq!(
         f.statuses.asked(),
         [(f.tenant, f.tenant)],
@@ -68,16 +79,24 @@ async fn a_deleted_tenant_is_asked_about_as_construct_in_that_tenant() {
 }
 
 #[tokio::test]
-async fn a_present_or_unknown_tenant_is_not_deleted() {
-    let f = deleted_tenant();
+async fn a_present_or_unknown_tenant_is_left_untouched() {
     for status in [TenantStatus::Present, TenantStatus::Unknown] {
+        let f = deleted_tenant();
         f.statuses.set(f.tenant, status);
-        assert!(!f.exit.deleted(f.tenant).await.unwrap(), "{status:?}");
+
+        let ended = f.exit.run(f.tenant).await;
+
+        assert!(
+            matches!(ended, Ok(Exit::Kept(kept)) if kept == status),
+            "{status:?}: {ended:?}"
+        );
+        assert!(f.graph.asked().is_empty(), "{status:?}");
+        assert!(f.untouched(), "{status:?}");
     }
 }
 
 #[tokio::test]
-async fn without_a_resolver_or_an_identity_the_question_is_not_configured() {
+async fn without_a_resolver_or_an_identity_nothing_is_touched() {
     let f = deleted_tenant();
     let without_resolver = tenant_exit_over(
         Some(Uuid::new_v4()),
@@ -96,26 +115,48 @@ async fn without_a_resolver_or_an_identity_the_question_is_not_configured() {
 
     for exit in [without_resolver, without_identity] {
         assert!(matches!(
-            exit.deleted(f.tenant).await,
+            exit.run(f.tenant).await,
             Err(DomainError::NotConfigured(_))
         ));
     }
+    assert!(f.graph.asked().is_empty());
+    assert!(f.untouched());
 }
 
 #[tokio::test]
-async fn an_exit_removes_the_rows_offboards_the_graph_and_forgets_the_tenant() {
+async fn a_resolver_that_fails_leaves_the_tenant_untouched() {
+    let f = deleted_tenant();
+    f.statuses.fail(f.tenant);
+
+    assert!(matches!(
+        f.exit.run(f.tenant).await,
+        Err(DomainError::Unavailable(_))
+    ));
+    assert!(f.graph.asked().is_empty());
+    assert!(f.untouched());
+}
+
+#[tokio::test]
+async fn an_exit_offboards_the_graph_removes_the_rows_in_the_tenants_scope_and_forgets_it() {
     let f = deleted_tenant();
 
-    assert_eq!(f.exit.exit(f.tenant).await.unwrap(), Exit::Done);
+    assert!(matches!(f.exit.run(f.tenant).await, Ok(Exit::Done)));
 
-    assert_eq!(*f.store.emptied.lock().unwrap(), [f.tenant]);
     assert_eq!(
         f.graph.asked(),
         [(f.tenant, f.tenant)],
         "graph storage is asked as Construct in the tenant"
     );
-    assert_eq!(*f.store.forgotten.lock().unwrap(), [f.tenant]);
-    assert!(!f.store.tenants.lock().unwrap().contains(&f.tenant));
+    let own = AccessScope::for_tenant(f.tenant);
+    let emptied = f.store.emptied.lock().unwrap().clone();
+    assert_eq!(
+        emptied,
+        [(f.tenant, own.clone())],
+        "in the tenant's own scope"
+    );
+    let forgotten = f.store.forgotten.lock().unwrap().clone();
+    assert_eq!(forgotten, [(f.tenant, own)]);
+    assert!(!f.store.keeps(f.tenant));
     assert_eq!(
         f.events.taken(),
         [
@@ -133,19 +174,24 @@ async fn an_exit_removes_the_rows_offboards_the_graph_and_forgets_the_tenant() {
 }
 
 #[tokio::test]
-async fn while_graph_storage_is_removing_the_graph_the_tenant_is_kept_for_the_next_run() {
+async fn while_graph_storage_is_removing_the_graph_the_rows_go_and_the_tenant_is_kept() {
     let f = deleted_tenant();
     f.graph.answer(Ok(GraphExit::UnderWay));
 
-    assert_eq!(f.exit.exit(f.tenant).await.unwrap(), Exit::UnderWay);
-    assert!(f.store.forgotten.lock().unwrap().is_empty());
-    assert!(f.store.tenants.lock().unwrap().contains(&f.tenant));
+    assert!(matches!(f.exit.run(f.tenant).await, Ok(Exit::UnderWay)));
+    assert_eq!(
+        f.store.emptied(),
+        [f.tenant],
+        "the graph is fenced, so the rows go"
+    );
+    assert!(f.store.forgotten().is_empty());
+    assert!(f.store.keeps(f.tenant));
 
     // The next run finds nothing left in the tables, and the graph done.
     *f.store.tenant_rows.lock().unwrap() = TenantRows::default();
-    assert_eq!(f.exit.exit(f.tenant).await.unwrap(), Exit::Done);
-    assert_eq!(*f.store.emptied.lock().unwrap(), [f.tenant, f.tenant]);
-    assert_eq!(*f.store.forgotten.lock().unwrap(), [f.tenant]);
+    assert!(matches!(f.exit.run(f.tenant).await, Ok(Exit::Done)));
+    assert_eq!(f.store.emptied(), [f.tenant, f.tenant]);
+    assert_eq!(f.store.forgotten(), [f.tenant]);
     assert_eq!(
         f.events
             .taken()
@@ -158,33 +204,57 @@ async fn while_graph_storage_is_removing_the_graph_the_tenant_is_kept_for_the_ne
 }
 
 #[tokio::test]
-async fn a_graph_storage_failure_keeps_the_tenant_for_the_next_run() {
+async fn a_refused_offboarding_leaves_every_row_in_place() {
+    let f = deleted_tenant();
+    f.graph.answer(Err(DomainError::internal(
+        "graph storage refused Construct's offboarding of the tenant",
+    )));
+
+    let ended = f.exit.run(f.tenant).await;
+
+    assert!(
+        matches!(ended, Ok(Exit::Stopped(DomainError::Internal(_)))),
+        "{ended:?}"
+    );
+    assert!(
+        f.untouched(),
+        "the graph is not fenced, so the subjects' settings, their opt-outs and erasure \
+         marks, stay"
+    );
+}
+
+#[tokio::test]
+async fn a_graph_storage_that_does_not_answer_is_asked_again_by_the_next_run() {
     let f = deleted_tenant();
     f.graph.answer(Err(DomainError::Unavailable(
         "graph storage is down".to_owned(),
     )));
 
     assert!(matches!(
-        f.exit.exit(f.tenant).await,
-        Err(DomainError::Unavailable(_))
+        f.exit.run(f.tenant).await,
+        Ok(Exit::Stopped(DomainError::Unavailable(_)))
     ));
-    assert_eq!(*f.store.emptied.lock().unwrap(), [f.tenant]);
-    assert!(f.store.forgotten.lock().unwrap().is_empty());
+    assert!(f.untouched());
 
-    assert_eq!(f.exit.exit(f.tenant).await.unwrap(), Exit::Done);
-    assert_eq!(*f.store.forgotten.lock().unwrap(), [f.tenant]);
+    assert!(matches!(f.exit.run(f.tenant).await, Ok(Exit::Done)));
+    assert_eq!(f.store.forgotten(), [f.tenant]);
 }
 
 #[tokio::test]
-async fn a_table_failure_stops_before_graph_storage_is_asked() {
+async fn a_table_failure_after_the_offboarding_keeps_the_tenant_for_the_next_run() {
     let f = deleted_tenant();
     f.store.emptying_down.store(true, Ordering::SeqCst);
 
     assert!(matches!(
-        f.exit.exit(f.tenant).await,
-        Err(DomainError::Unavailable(_))
+        f.exit.run(f.tenant).await,
+        Ok(Exit::Stopped(DomainError::Unavailable(_)))
     ));
-    assert!(f.graph.asked().is_empty());
-    assert!(f.store.forgotten.lock().unwrap().is_empty());
+    assert_eq!(f.graph.asked().len(), 1);
+    assert!(f.store.forgotten().is_empty());
+    assert!(f.store.keeps(f.tenant));
     assert!(f.events.taken().is_empty());
+
+    f.store.emptying_down.store(false, Ordering::SeqCst);
+    assert!(matches!(f.exit.run(f.tenant).await, Ok(Exit::Done)));
+    assert_eq!(f.store.forgotten(), [f.tenant]);
 }

@@ -544,18 +544,21 @@ impl TenantTables for DeletionTables {
         // @cpt-end:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-rows
     }
 
-    async fn forget_tenant(&self, tenant_id: Uuid) -> Result<(), DomainError> {
+    async fn forget_tenant(&self, scope: &AccessScope, tenant_id: Uuid) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-forget
         let conn = self.db.conn().map_err(DomainError::from)?;
         TenantEntity::delete_many()
             .secure()
-            .scope_with(&AccessScope::for_tenant(tenant_id))
+            .scope_with(scope)
             .filter(Condition::all().add(tenants::Column::TenantId.eq(tenant_id)))
             .exec(&conn)
             .await
             .map_err(map_scope_error)?;
-        // A write that lands later notes the tenant again here, so the next
-        // run checks it and removes what the write left.
+        // Only this instance's cache: another instance that noted the tenant
+        // does not note it again. Nothing needs it to: a record that lands
+        // later leaves a row the job finds the tenant by, and graph storage
+        // refuses every profile write of an offboarded tenant. Forgetting it
+        // here keeps this instance's cache true to the table.
         self.noted
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

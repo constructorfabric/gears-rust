@@ -1111,6 +1111,91 @@ pub fn fake_graph_storage() -> Arc<dyn graph_storage_sdk::GraphStorageClientV1> 
     Arc::new(GraphStorageLocalClient::new(services))
 }
 
+/// The platform as graph storage asks it: every tenant is `state`.
+pub struct EveryTenant(pub graph_storage::domain::offboarding::TenantState);
+
+#[async_trait]
+impl graph_storage::domain::offboarding::TenantDirectory for EveryTenant {
+    async fn state(
+        &self,
+        _ctx: &SecurityContext,
+        _tenant: Uuid,
+        _within: std::time::Duration,
+    ) -> Result<
+        graph_storage::domain::offboarding::TenantState,
+        graph_storage::domain::error::DomainError,
+    > {
+        Ok(self.0)
+    }
+}
+
+/// Graph storage's real service over its in-memory store, as
+/// [`fake_graph_storage`], where the platform says every tenant is `state`;
+/// and the store, for graph storage's offboarding worker.
+pub fn fake_graph_storage_where_every_tenant_is(
+    state: graph_storage::domain::offboarding::TenantState,
+) -> (
+    Arc<dyn graph_storage_sdk::GraphStorageClientV1>,
+    Arc<graph_storage::infra::fake_store::FakeGraphStore>,
+) {
+    fake_graph_storage_under(state, Arc::new(AllowInOwnTenant))
+}
+
+/// The same, with the policy service `policy`.
+pub fn fake_graph_storage_under(
+    state: graph_storage::domain::offboarding::TenantState,
+    policy: Arc<dyn AuthZResolverApi>,
+) -> (
+    Arc<dyn graph_storage_sdk::GraphStorageClientV1>,
+    Arc<graph_storage::infra::fake_store::FakeGraphStore>,
+) {
+    use graph_storage::config::GraphStorageConfig;
+    use graph_storage::domain::embedding::{EmbeddingCoordinator, SpaceState};
+    use graph_storage::domain::local_client::GraphStorageLocalClient;
+    use graph_storage::domain::service::GraphServices;
+    use graph_storage::infra::embedding::fake::FakeEmbeddingProvider;
+    use graph_storage::infra::fake_store::{FakeGraphEngine, FakeGraphStore};
+
+    let store = Arc::new(FakeGraphStore::new());
+    let services = GraphServices::new(
+        GraphStorageConfig::default()
+            .validated()
+            .expect("the default configuration is valid"),
+        Arc::clone(&store) as _,
+        Arc::new(FakeGraphEngine::new(Arc::clone(&store))),
+        PolicyEnforcer::new(policy),
+        EmbeddingCoordinator::new(
+            Arc::new(FakeEmbeddingProvider::new(384)),
+            SpaceState::Active { epoch: 1 },
+            8 * 1024,
+        ),
+    )
+    .with_tenant_directory(Arc::new(EveryTenant(state)));
+    (
+        Arc::new(GraphStorageLocalClient::new(Arc::new(services))),
+        store,
+    )
+}
+
+/// Run graph storage's offboarding worker once over `store`: every fenced
+/// tenant's graph is removed.
+pub async fn run_graph_offboarding(store: &graph_storage::infra::fake_store::FakeGraphStore) {
+    use graph_storage::domain::offboarding::{WorkerSettings, WorkerState, run_pending};
+    let settings = WorkerSettings::new(
+        std::num::NonZeroU64::new(100).unwrap(),
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(10),
+    )
+    .unwrap();
+    run_pending(
+        store,
+        settings,
+        &mut WorkerState::default(),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+}
+
 /// Processing that runs without sensitive-data checks, as a deployment that
 /// opted in.
 pub fn unchecked_processing() -> crate::config::ProcessingConfig {
@@ -2000,14 +2085,16 @@ pub struct MemoryDeletionStore {
     pub under_way_down: std::sync::atomic::AtomicBool,
     /// Fail every note of an attempt.
     pub attempts_down: std::sync::atomic::AtomicBool,
-    /// The tenants tenant exit emptied, in order.
-    pub emptied: std::sync::Mutex<Vec<Uuid>>,
+    /// The tenants tenant exit emptied, in order, each with the scope it
+    /// was emptied under.
+    pub emptied: std::sync::Mutex<Vec<(Uuid, AccessScope)>>,
     /// What each emptying of a tenant reports it removed.
     pub tenant_rows: std::sync::Mutex<crate::domain::tenant_exit::TenantRows>,
     /// Fail every emptying of a tenant.
     pub emptying_down: std::sync::atomic::AtomicBool,
-    /// The tenants tenant exit stopped keeping, in order.
-    pub forgotten: std::sync::Mutex<Vec<Uuid>>,
+    /// The tenants tenant exit stopped keeping, in order, each with the
+    /// scope it was forgotten under.
+    pub forgotten: std::sync::Mutex<Vec<(Uuid, AccessScope)>>,
 }
 
 impl MemoryDeletionStore {
@@ -2028,6 +2115,29 @@ impl MemoryDeletionStore {
 
     pub fn finished(&self) -> Vec<SubjectKey> {
         self.finished.lock().unwrap().clone()
+    }
+
+    /// The tenants tenant exit emptied, in order.
+    pub fn emptied(&self) -> Vec<Uuid> {
+        let emptied = self.emptied.lock().unwrap();
+        emptied.iter().map(|(tenant, _)| *tenant).collect()
+    }
+
+    /// The tenants tenant exit stopped keeping, in order.
+    pub fn forgotten(&self) -> Vec<Uuid> {
+        let forgotten = self.forgotten.lock().unwrap();
+        forgotten.iter().map(|(tenant, _)| *tenant).collect()
+    }
+
+    /// Whether `tenant_id` is among the tenants kept.
+    pub fn keeps(&self, tenant_id: Uuid) -> bool {
+        let tenants = self.tenants.lock().unwrap();
+        tenants.contains(&tenant_id)
+    }
+
+    /// Keep `tenants`, as their rows or a write would.
+    pub fn keep(&self, tenants: impl IntoIterator<Item = Uuid>) {
+        self.tenants.lock().unwrap().extend(tenants);
     }
 }
 
@@ -2177,19 +2287,25 @@ impl crate::domain::deletion::DeletionStore for MemoryDeletionStore {
 impl crate::domain::tenant_exit::TenantTables for MemoryDeletionStore {
     async fn remove_tenant(
         &self,
-        _scope: &AccessScope,
+        scope: &AccessScope,
         tenant_id: Uuid,
     ) -> Result<crate::domain::tenant_exit::TenantRows, DomainError> {
         if self.emptying_down.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(DomainError::Unavailable("the database is down".to_owned()));
         }
-        self.emptied.lock().unwrap().push(tenant_id);
+        self.emptied
+            .lock()
+            .unwrap()
+            .push((tenant_id, scope.clone()));
         Ok(*self.tenant_rows.lock().unwrap())
     }
 
-    async fn forget_tenant(&self, tenant_id: Uuid) -> Result<(), DomainError> {
+    async fn forget_tenant(&self, scope: &AccessScope, tenant_id: Uuid) -> Result<(), DomainError> {
         self.tenants.lock().unwrap().remove(&tenant_id);
-        self.forgotten.lock().unwrap().push(tenant_id);
+        self.forgotten
+            .lock()
+            .unwrap()
+            .push((tenant_id, scope.clone()));
         Ok(())
     }
 }
@@ -2204,6 +2320,10 @@ pub struct ScriptedStatuses {
     >,
     /// The tenants the resolver fails for, with the error it gives.
     pub down: std::sync::Mutex<std::collections::BTreeMap<Uuid, String>>,
+    /// The tenants whose failure a rerun does not cure.
+    pub refused: std::sync::Mutex<std::collections::BTreeSet<Uuid>>,
+    /// Panic when asked about this tenant.
+    pub panic_for: std::sync::Mutex<Option<Uuid>>,
     pub asked: std::sync::Mutex<Vec<(Uuid, Uuid)>>,
 }
 
@@ -2238,8 +2358,15 @@ impl crate::domain::tenant_exit::TenantStatuses for ScriptedStatuses {
             .lock()
             .unwrap()
             .push((tenant_id, ctx.subject_tenant_id()));
+        let panics = *self.panic_for.lock().unwrap() == Some(tenant_id);
+        assert!(!panics, "the tenant resolver panicked");
         if let Some(error) = self.down.lock().unwrap().get(&tenant_id) {
             return Err(DomainError::Unavailable(error.clone()));
+        }
+        if self.refused.lock().unwrap().contains(&tenant_id) {
+            return Err(DomainError::internal(
+                "the tenant resolver refused Construct",
+            ));
         }
         Ok(self
             .statuses
@@ -2275,6 +2402,8 @@ pub struct ScriptedOffboarding {
     pub answers: std::sync::Mutex<
         std::collections::VecDeque<Result<crate::domain::tenant_exit::GraphExit, DomainError>>,
     >,
+    /// Panic when asked to offboard this tenant.
+    pub panic_for: std::sync::Mutex<Option<Uuid>>,
     pub asked: std::sync::Mutex<Vec<(Uuid, Uuid)>>,
 }
 
@@ -2299,6 +2428,8 @@ impl crate::domain::tenant_exit::GraphOffboarding for ScriptedOffboarding {
             .lock()
             .unwrap()
             .push((tenant_id, ctx.subject_tenant_id()));
+        let panics = *self.panic_for.lock().unwrap() == Some(tenant_id);
+        assert!(!panics, "graph storage's offboarding panicked");
         self.answers
             .lock()
             .unwrap()
@@ -2329,6 +2460,19 @@ pub fn tenant_exit_over(
         tables: store,
         events,
     })
+}
+
+/// Tenant exit over `store` with no tenant resolver: no tenant exits.
+pub fn tenant_exit_without_resolver(
+    store: Arc<MemoryDeletionStore>,
+) -> Arc<crate::domain::tenant_exit::TenantExit> {
+    Arc::new(tenant_exit_over(
+        Some(Uuid::new_v4()),
+        store,
+        Arc::new(NoTenantResolver),
+        Arc::new(ScriptedOffboarding::default()),
+        Arc::new(RecordingDeletionEvents::default()),
+    ))
 }
 
 /// [`ProfileRoots`](crate::domain::deletion::ProfileRoots) that answers from

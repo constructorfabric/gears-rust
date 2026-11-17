@@ -711,7 +711,10 @@ async fn a_forgotten_tenant_is_no_longer_kept_and_a_later_write_notes_it_again()
     t.store.note(tenant).await.unwrap();
     t.store.note(other).await.unwrap();
 
-    t.store.forget_tenant(tenant).await.unwrap();
+    t.store
+        .forget_tenant(&AccessScope::for_tenant(tenant), tenant)
+        .await
+        .unwrap();
     assert_eq!(t.store.tenants().await.unwrap(), [other].into());
 
     t.store.note(tenant).await.unwrap();

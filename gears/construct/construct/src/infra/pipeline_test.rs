@@ -910,3 +910,92 @@ async fn an_erased_subject_is_served_nothing_at_once_keeps_only_its_setting_and_
     cancel.cancel();
     running.await.unwrap();
 }
+
+#[tokio::test]
+async fn a_tenant_the_platform_deleted_leaves_construct_and_graph_storage_through_the_assembled_job()
+ {
+    use crate::domain::deletion::DeletionStore;
+    use crate::domain::subject_settings::SubjectKey;
+    use crate::domain::tenant_exit::TenantStatus;
+    use graph_storage::domain::offboarding::TenantState;
+
+    let db = inmem_db().await;
+    let cfg = ConstructConfig {
+        processing_identity: Some(Uuid::new_v4()),
+        profile_category_check: Some(CategoryCheckConfig::OneCall),
+        ..ConstructConfig::default()
+    }
+    .validated()
+    .unwrap();
+    let (graph, graph_store) =
+        crate::test_support::fake_graph_storage_where_every_tenant_is(TenantState::Deleted);
+    let statuses = Arc::new(crate::test_support::ScriptedStatuses::default());
+    let tables = crate::test_support::deletion_tables(&db);
+    let pipeline = assemble(
+        &cfg,
+        None,
+        graph,
+        Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+        Arc::new(crate::test_support::MemoryReviews::default()),
+        Arc::clone(&tables),
+        PolicyEnforcer::new(Arc::new(AllowResolver)),
+        Arc::clone(&statuses) as _,
+    )
+    .expect("the pipeline assembles");
+    let (leaving, staying) = (
+        SubjectKey {
+            tenant_id: Uuid::new_v4(),
+            subject_id: Uuid::new_v4(),
+        },
+        SubjectKey {
+            tenant_id: Uuid::new_v4(),
+            subject_id: Uuid::new_v4(),
+        },
+    );
+    statuses.set(leaving.tenant_id, TenantStatus::Deleted);
+    for key in [leaving, staying] {
+        tables
+            .mark(
+                &toolkit_security::AccessScope::for_tenant(key.tenant_id),
+                key,
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap();
+    }
+    let marked = |key: SubjectKey| {
+        let tables = Arc::clone(&tables);
+        async move {
+            tables
+                .marked(
+                    &toolkit_security::AccessScope::for_tenant(key.tenant_id),
+                    key,
+                )
+                .await
+                .unwrap()
+        }
+    };
+
+    // Graph storage fences the tenant and starts removing its graph; the
+    // tenant's rows here go, and it stays kept until the graph is gone.
+    pipeline.deletion_job.run_once().await;
+    assert_eq!(
+        marked(leaving).await,
+        None,
+        "the leaving tenant's rows are gone"
+    );
+    assert!(
+        marked(staying).await.is_some(),
+        "another tenant keeps its rows"
+    );
+    assert!(tables.tenants().await.unwrap().contains(&leaving.tenant_id));
+
+    crate::test_support::run_graph_offboarding(&graph_store).await;
+    pipeline.deletion_job.run_once().await;
+    let kept = tables.tenants().await.unwrap();
+    assert!(
+        !kept.contains(&leaving.tenant_id),
+        "the tenant is no longer kept"
+    );
+    assert!(kept.contains(&staying.tenant_id));
+}
