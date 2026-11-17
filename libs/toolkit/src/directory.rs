@@ -2,7 +2,6 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -10,26 +9,23 @@ use crate::runtime::{
     Endpoint, GearInstance, GearManager, GrpcServiceNameConflict, ReportedState as RtReportedState,
 };
 
-/// Compute a content token for an `OpenAPI` document, used to detect changes.
+/// Compute the lowercase-hex SHA-256 of an `OpenAPI` document.
 ///
-/// This is a change-detection token (like a k8s `resourceVersion`), **not** a
-/// security digest: the edge only ever compares it against the token from the
-/// previous poll of the *same* directory to decide whether the document
-/// changed. A non-cryptographic `std` hash is therefore sufficient and avoids a
-/// dependency.
-///
-/// Determinism is scoped to a single binary: `DefaultHasher::new()` uses fixed
-/// keys, so identical input yields the same token for the lifetime of one
-/// directory process. `std` does **not** guarantee the algorithm across Rust
-/// toolchain versions, so a rebuilt/upgraded directory may emit a different
-/// token for the same spec — which is benign here, because tokens are only ever
-/// compared within one directory's poll stream (at worst an upgrade triggers a
-/// single spurious refresh). The token must therefore not be persisted or
-/// compared across binaries.
-fn openapi_spec_hash(spec: &str) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    spec.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+/// This is the stable content hash the worker advertises and the edge verifies
+/// (ADR-0011, "`OpenAPI` document"). Unlike the former `DefaultHasher` token, it
+/// is stable across binaries, so a worker and the edge compute the same value
+/// for the same document, and the edge can check a document it fetched directly
+/// from the instance against the advertised hash.
+#[must_use]
+pub fn openapi_spec_hash(spec: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = toolkit_security::crypto::hash::Sha256::digest(spec);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        hex.push(HEX[(byte >> 4) as usize] as char);
+        hex.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    hex
 }
 
 // Re-export all types from contracts - this is the single source of truth
@@ -68,8 +64,8 @@ fn runtime_state_to_domain(state: crate::runtime::InstanceState) -> InstanceStat
 /// `endpoint` prefers gRPC and falls back to REST; an instance advertising
 /// neither yields `endpoint: None` (never an empty-URI sentinel), which the
 /// label paths surface as *no-endpoint, not an error*. Always **spec-free**:
-/// only the `OpenAPI` spec *hash* rides along, never the document (fetched via
-/// `get_openapi_spec`).
+/// only the `OpenAPI` spec *hash* rides along, never the document (which the
+/// edge fetches from the instance's `/.well-known/openapi.json`).
 fn project_instance(gear: &str, inst: &GearInstance) -> ServiceInstanceInfo {
     let endpoint = inst
         .grpc_services
@@ -86,7 +82,7 @@ fn project_instance(gear: &str, inst: &GearInstance) -> ServiceInstanceInfo {
                 .as_ref()
                 .map(|ep| ServiceEndpoint::new(ep.uri.clone())),
         )
-        .with_openapi_spec_hash(inst.openapi_spec.as_deref().map(openapi_spec_hash))
+        .with_openapi_spec_hash(inst.openapi_spec_hash.clone())
         // Carry every published gRPC service back so the directory-register
         // phase can augment (not clobber) this instance when it adds a REST
         // endpoint.
@@ -236,8 +232,18 @@ impl DirectoryClient for LocalDirectoryClient {
             instance = instance.with_rest_endpoint(Endpoint::from_uri(rest.uri));
         }
 
-        // Apply OpenAPI spec if provided
+        // OpenAPI: the directory stores only the spec *hash* (ADR-0011). A new
+        // worker sends the hash directly; an old worker still pushes the whole
+        // document via the deprecated `openapi_spec`, so derive the hash from it
+        // when none was sent. The document itself is retained in this in-memory
+        // store only so the deprecated `get_openapi_spec` keeps answering there.
+        if let Some(hash) = info.openapi_spec_hash {
+            instance = instance.with_openapi_spec_hash(hash);
+        }
         if let Some(spec) = info.openapi_spec {
+            if instance.openapi_spec_hash.is_none() {
+                instance = instance.with_openapi_spec_hash(openapi_spec_hash(spec.as_bytes()));
+            }
             instance = instance.with_openapi_spec(spec);
         }
 
@@ -560,8 +566,8 @@ mod tests {
             Some("http://billing:8080")
         );
         // The cross-gear snapshot never inlines the OpenAPI document; it carries
-        // only the hash, and consumers fetch the document per gear via
-        // `get_openapi_spec`.
+        // only the hash, and consumers fetch the document from the instance's
+        // `/.well-known/openapi.json`.
         assert!(billing.openapi_spec_hash.is_some());
         assert!(
             api.get_openapi_spec("billing")
@@ -744,11 +750,65 @@ mod tests {
         );
 
         // The plain enumeration path is spec-free too: only the hash rides
-        // along, the document is fetched via `get_openapi_spec`.
+        // along, the document is fetched from the instance.
         let listed = api.list_instances("worker").await.unwrap();
         assert!(
             listed[0].openapi_spec_hash.is_some(),
             "list_instances must carry the spec hash, never the document"
+        );
+    }
+
+    #[tokio::test]
+    async fn old_worker_openapi_spec_derives_hash_and_keeps_document_in_memory() {
+        // Compatibility: an old worker still pushes the full document and no
+        // hash. The directory derives the lowercase-hex SHA-256 and keeps the
+        // document in the in-memory store so `get_openapi_spec` still answers.
+        let dir = Arc::new(GearManager::new());
+        let api = LocalDirectoryClient::new(Arc::clone(&dir));
+
+        let doc = "{\"openapi\":\"3.1.0\"}";
+        api.register_instance(
+            RegisterInstanceInfo::new("billing", Uuid::new_v4().to_string())
+                .with_rest_endpoint(ServiceEndpoint::new("http://billing:8080"))
+                .with_openapi_spec(doc),
+        )
+        .await
+        .unwrap();
+
+        let listed = api.list_instances("billing").await.unwrap();
+        assert_eq!(
+            listed[0].openapi_spec_hash.as_deref(),
+            Some(openapi_spec_hash(doc.as_bytes()).as_str()),
+            "the directory derives the SHA-256 hash from the pushed document",
+        );
+        // The deprecated getter still answers from the in-memory store.
+        assert_eq!(api.get_openapi_spec("billing").await.unwrap(), doc);
+    }
+
+    #[tokio::test]
+    async fn new_worker_hash_only_stores_no_document() {
+        // A new worker advertises only the hash and serves the document itself.
+        // The directory stores the hash verbatim and keeps no document, so the
+        // deprecated `get_openapi_spec` returns the typed not-found sentinel.
+        let dir = Arc::new(GearManager::new());
+        let api = LocalDirectoryClient::new(Arc::clone(&dir));
+
+        let hash = openapi_spec_hash(b"{\"openapi\":\"3.1.0\"}");
+        api.register_instance(
+            RegisterInstanceInfo::new("billing", Uuid::new_v4().to_string())
+                .with_rest_endpoint(ServiceEndpoint::new("http://billing:8080"))
+                .with_openapi_spec_hash(hash.clone()),
+        )
+        .await
+        .unwrap();
+
+        let listed = api.list_instances("billing").await.unwrap();
+        assert_eq!(listed[0].openapi_spec_hash.as_deref(), Some(hash.as_str()));
+
+        let err = api.get_openapi_spec("billing").await.unwrap_err();
+        assert!(
+            err.downcast_ref::<DirectoryNotFound>().is_some(),
+            "no document is stored for a hash-only registration, got: {err:?}"
         );
     }
 

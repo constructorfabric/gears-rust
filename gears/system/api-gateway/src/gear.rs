@@ -1055,8 +1055,25 @@ impl ApiGateway {
             // the `Forwarder` reads.
             let provider: Arc<dyn toolkit_gateway::GatewayProvider> =
                 Arc::new(toolkit_gateway::ToolKitGatewayProvider::new(registry));
-            crate::proxy::spawn_directory_sync(provider, directory, interval, cancel);
+            // The edge fetches each gear's OpenAPI document directly from the
+            // instance (ADR-0011); build the dedicated fetch client once.
+            let Some(fetcher) = Self::build_spec_fetcher() else {
+                return;
+            };
+            crate::proxy::spawn_directory_sync(provider, directory, fetcher, interval, cancel);
             tracing::info!("reverse-proxy directory-sync started");
+        }
+    }
+
+    /// Build the edge's `OpenAPI` spec fetcher, logging and returning `None` on
+    /// failure (the reverse proxy then stays inactive rather than panicking).
+    fn build_spec_fetcher() -> Option<Arc<dyn crate::proxy::SpecFetcher>> {
+        match crate::proxy::HttpSpecFetcher::new() {
+            Ok(fetcher) => Some(Arc::new(fetcher)),
+            Err(err) => {
+                tracing::error!(error = %err, "reverse proxy inactive: could not build the OpenAPI spec-fetch client");
+                None
+            }
         }
     }
 

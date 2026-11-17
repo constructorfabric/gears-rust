@@ -252,10 +252,11 @@ impl DirectoryService for DirectoryServiceImpl {
 
         // Enumerate once and filter by the selector (an empty selector matches
         // all). The response is always spec-free: only the `openapi_spec_hash`
-        // rides along, and the full document is fetched out-of-band via
-        // `GetOpenApiSpec`. This bounds every multi-instance response regardless
-        // of spec size, matching `resolve_by_labels` / `list_all_instances`
-        // (ADR-0009); the hash still lets a consumer detect a spec change.
+        // rides along, and the full document is fetched by the consumer from the
+        // instance's `/.well-known/openapi.json`. This bounds every
+        // multi-instance response regardless of spec size, matching
+        // `resolve_by_labels` / `list_all_instances` (ADR-0009); the hash still
+        // lets a consumer detect a spec change.
         let mut instances = self
             .api
             .list_instances(&gear_name)
@@ -328,6 +329,9 @@ impl DirectoryService for DirectoryServiceImpl {
         if let Some(spec) = &req.openapi_spec {
             validate_openapi_spec(spec)?;
         }
+        if let Some(hash) = &req.openapi_spec_hash {
+            validate_openapi_spec_hash(hash)?;
+        }
 
         // Parse endpoints from GrpcServiceEndpoint messages
         let grpc_services = req
@@ -350,6 +354,9 @@ impl DirectoryService for DirectoryServiceImpl {
         }
         if let Some(spec) = req.openapi_spec {
             info = info.with_openapi_spec(spec);
+        }
+        if let Some(hash) = req.openapi_spec_hash {
+            info = info.with_openapi_spec_hash(hash);
         }
         // An unset/UNSPECIFIED reported state leaves `info.reported_state` None,
         // which the store reads as Starting on a new record.
@@ -548,6 +555,19 @@ fn validate_openapi_spec(spec: &str) -> Result<(), Status> {
             "openapi spec too long: {} bytes (max {MAX_OPENAPI_SPEC_LEN})",
             spec.len()
         )));
+    }
+    Ok(())
+}
+
+/// Reject a malformed `openapi_spec_hash`. It must be a lowercase-hex SHA-256
+/// digest (exactly 64 hex characters), the shape every worker and the edge
+/// agree on (ADR-0011). The value is echoed to every discovery consumer in
+/// `InstanceInfo.openapi_spec_hash`, so it is screened at the trust boundary.
+fn validate_openapi_spec_hash(hash: &str) -> Result<(), Status> {
+    if hash.len() != 64 || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(Status::invalid_argument(
+            "openapi_spec_hash must be a lowercase-hex SHA-256 digest (64 hex chars)",
+        ));
     }
     Ok(())
 }

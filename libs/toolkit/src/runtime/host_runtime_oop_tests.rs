@@ -72,8 +72,9 @@ struct RecordingDirectory {
     deregister_calls: AtomicUsize,
     registered_endpoint: Mutex<Option<String>>,
     registered_gears: Mutex<Vec<String>>,
-    /// The `OpenAPI` document of each registration, in order.
-    registered_openapi: Mutex<Vec<Option<String>>>,
+    /// The `OpenAPI` document *hash* of each registration, in order (a new
+    /// worker advertises only the hash, not the document).
+    registered_openapi_hash: Mutex<Vec<Option<String>>>,
 }
 
 #[async_trait]
@@ -97,9 +98,9 @@ impl DirectoryClient for RecordingDirectory {
         if let Some(ep) = &info.rest_endpoint {
             *self.registered_endpoint.lock() = Some(ep.uri.clone());
         }
-        self.registered_openapi
+        self.registered_openapi_hash
             .lock()
-            .push(info.openapi_spec.clone());
+            .push(info.openapi_spec_hash.clone());
         self.registered_gears.lock().push(info.gear);
         self.register_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -946,34 +947,38 @@ async fn a_system_root_serves_and_is_present_while_the_application_group_waits()
         "the same listener keeps the platform routes"
     );
     assert!(poll_status(addr, "/readyz", 200, Duration::from_secs(5)).await);
+    // A new worker advertises only the hash, so the directory sees the hash of
+    // the bootstrap document first.
     let first = {
         directory
-            .registered_openapi
+            .registered_openapi_hash
             .lock()
             .first()
             .cloned()
             .flatten()
     };
     assert!(
-        first.is_some_and(|spec| spec.contains("/anon") && !spec.contains("/app-doc")),
-        "registered first with the bootstrap document"
+        first.is_some(),
+        "registered first with the bootstrap document's hash"
     );
+    // Once the application group attaches, the served document changes, so the
+    // worker re-registers with a different hash.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let last = {
             directory
-                .registered_openapi
+                .registered_openapi_hash
                 .lock()
                 .last()
                 .cloned()
                 .flatten()
         };
-        if last.is_some_and(|spec| spec.contains("/anon") && spec.contains("/app-doc")) {
+        if last.is_some() && last != first {
             break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the directory gets the full document once the application group attached"
+            "the directory gets the full document's hash once the application group attached"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

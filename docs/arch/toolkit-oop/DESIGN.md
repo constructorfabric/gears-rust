@@ -553,7 +553,7 @@ gears, the gateway needs to reverse-proxy requests to remote OoP gears.
 
 - `cpt-cf-component-oop-bootstrap` — self-registers REST endpoint + OpenAPI spec with `DirectoryService` (the
   built-in edge then drives `register_routes` / `deregister_routes` from that; external adapters may call them directly)
-- `cpt-cf-component-directory-rest` — enumerates gear endpoints (`ListAllInstances`) for edge discovery; the OpenAPI document is fetched per gear via `GetOpenApiSpec`
+- `cpt-cf-component-directory-rest` — enumerates gear endpoints (`ListAllInstances`) for edge discovery; the OpenAPI document is fetched by the edge from each instance's `/.well-known/openapi.json` and verified against `openapi_spec_hash` (ADR-0011)
 
 #### REST Client Codegen
 
@@ -1011,8 +1011,8 @@ Key design decisions:
 |----------------------|-----------------------------------|-------------------------------------|----------------------------------------------|
 | `RegisterInstance`   | `RegisterInstanceInfo` (extended) | `RegisterResult`                    | Register gear with REST endpoint + OpenAPI |
 | `ResolveRestService` | `ResolveRequest { gear_name }`  | `ServiceEndpoint` (with `rest_url`) | Resolve a gear's REST base URL             |
-| `GetOpenApiSpec`     | `SpecRequest { gear_name }`     | `SpecResponse { openapi_json }`     | Retrieve a gear's OpenAPI spec             |
-| `ListAllInstances`   | `ListAllInstancesRequest {}`      | `ListAllInstancesResponse { instances[] }` | Enumerate every registered instance (stable `instance_id` + gear + REST endpoint) for edge discovery — a spec-less snapshot; the OpenAPI document is fetched per gear via `GetOpenApiSpec` |
+| `GetOpenApiSpec`     | `SpecRequest { gear_name }`     | `SpecResponse { openapi_json }`     | **Deprecated** (ADR-0011): the directory no longer stores documents. The edge fetches each gear's document from the instance and verifies it against `openapi_spec_hash`. Kept one release: still answers from the in-memory store, `NOT_FOUND` with a shared backend |
+| `ListAllInstances`   | `ListAllInstancesRequest {}`      | `ListAllInstancesResponse { instances[] }` | Enumerate every registered instance (stable `instance_id` + gear + REST endpoint + `openapi_spec_hash`) for edge discovery — a spec-less snapshot; the OpenAPI document is fetched from the instance's `/.well-known/openapi.json` |
 
 #### GatewayProvider Trait
 
@@ -1067,11 +1067,13 @@ and no bespoke gateway admin API is needed. Notes:
   selection reduces to that one VIP.
 - **Gated + disabled by default** (`gateway_proxy.enabled`), so the Profile 1 in-process monolith is unaffected.
 - **Spec-less discovery snapshot**: `ListAllInstances` returns only instance identity (stable `instance_id` + gear) +
-  REST endpoint, not the full
-  OpenAPI document, so the poll response stays small and bounded regardless of gear count or spec size. Within a single
-  poll the edge fetches a gear's document at most once via `GetOpenApiSpec` (cached for the pass and reused across that
-  gear's instances); each poll reconciles the full snapshot, so a spec change is picked up on the next poll after the
-  gear re-publishes.
+  REST endpoint + the `openapi_spec_hash`, not the full OpenAPI document, so the poll response stays small and bounded
+  regardless of gear count or spec size. When the edge sees a hash it has not cached, it fetches the document directly
+  from the instance's `/.well-known/openapi.json`, verifies the fetched document's SHA-256 against the advertised hash,
+  and caches it by hash (so an unchanged hash is never re-fetched and co-located instances sharing a hash share one
+  copy). Cached documents no instance advertises anymore are dropped. On a hash mismatch — a Service VIP answering from
+  a pod with a different document mid-rollout — the edge keeps the gear's previous routes and retries on the next poll.
+  The edge no longer calls `GetOpenApiSpec` (ADR-0011).
 
 ### 3.4 Internal Dependencies
 
@@ -1191,7 +1193,7 @@ sequenceDiagram
 
     par Background: self-registration (retry with backoff)
         loop Until registered
-            Worker->>Dir: RegisterInstance(name, instance_id, rest_endpoint, openapi_spec)
+            Worker->>Dir: RegisterInstance(name, instance_id, rest_endpoint, openapi_spec_hash)
             alt Flight Control not yet available
                 Dir-->>Worker: connection refused
                 Worker->>Worker: backoff, retry
@@ -1220,9 +1222,12 @@ sequenceDiagram
     Note over Edge: Directory-sync (every sync_interval)
     loop Periodic
         Edge->>Dir: ListAllInstances()
-        Dir-->>Edge: instances[] (instance_id, gear, rest_endpoint) — spec-less snapshot
-        Edge->>Dir: GetOpenApiSpec(gear) [once per gear per poll, deduped across a gear's instances]
-        Dir-->>Edge: openapi_spec
+        Dir-->>Edge: instances[] (instance_id, gear, rest_endpoint, openapi_spec_hash) — spec-less snapshot
+        opt Hash not in the edge's by-hash cache
+            Edge->>Worker: GET {rest_endpoint}/.well-known/openapi.json
+            Worker-->>Edge: openapi document
+            Edge->>Edge: verify SHA-256 == openapi_spec_hash; on mismatch keep old routes and retry next poll; else cache by hash
+        end
         Edge->>Edge: register_routes(gear, instance_id) / prune by instance_id on ProxyRegistry
     end
 

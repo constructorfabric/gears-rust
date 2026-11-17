@@ -20,6 +20,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use cf_system_sdks::directory::{DirectoryClient, InstanceState, ServiceInstanceInfo};
 use tokio_util::sync::CancellationToken;
@@ -27,13 +28,58 @@ use toolkit_gateway::{
     Endpoint, GatewayProvider, GearInstance, GearName, InstanceSpec, OpenApiSpec,
 };
 
+/// Fetches a gear's `OpenAPI` document directly from the instance that serves
+/// it, so the directory never has to carry the document (ADR-0011).
+///
+/// Behind a trait so the directory-sync loop can be driven with a fake fetcher
+/// in tests (the real one makes an outbound HTTP request).
+#[async_trait]
+pub trait SpecFetcher: Send + Sync {
+    /// Fetch the document served at `{rest_endpoint_uri}/.well-known/openapi.json`.
+    async fn fetch(&self, rest_endpoint_uri: &str) -> anyhow::Result<Bytes>;
+}
+
+/// [`SpecFetcher`] backed by a [`toolkit_http::HttpClient`].
+pub struct HttpSpecFetcher {
+    client: toolkit_http::HttpClient,
+}
+
+impl HttpSpecFetcher {
+    /// Build a fetcher with a dedicated client: a short per-request timeout and
+    /// a 1 MiB body cap (the `OpenAPI` document bound) and no retries — a failed
+    /// fetch is simply retried on the next directory poll.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying HTTP client cannot be built.
+    pub fn new() -> anyhow::Result<Self> {
+        let client =
+            toolkit_http::HttpClientBuilder::with_config(toolkit_http::HttpClientConfig::minimal())
+                .build()?;
+        Ok(Self { client })
+    }
+}
+
+#[async_trait]
+impl SpecFetcher for HttpSpecFetcher {
+    async fn fetch(&self, rest_endpoint_uri: &str) -> anyhow::Result<Bytes> {
+        let base = rest_endpoint_uri.trim_end_matches('/');
+        let url = format!("{base}/.well-known/openapi.json");
+        let resp = self.client.get(&url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("fetching {url}: upstream returned HTTP {status}");
+        }
+        Ok(resp.bytes().await?)
+    }
+}
+
 /// Lower bound on the directory poll cadence (`tokio::time::interval` panics on
 /// a zero period; also avoids a hot loop on a misconfigured interval).
 const MIN_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Upper bound on a single reconcile pass. A hung `list_all_instances` or
-/// `get_openapi_spec` call is abandoned after this so it can neither block
-/// subsequent ticks nor stall shutdown.
+/// Upper bound on a single reconcile pass. A hung `list_all_instances` call or
+/// a slow spec fetch is abandoned after this so it can neither block subsequent
+/// ticks nor stall shutdown.
 const SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Spawn the background directory-sync loop. Returns immediately; the task runs
@@ -45,10 +91,13 @@ const SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 pub fn spawn_directory_sync(
     provider: Arc<dyn GatewayProvider>,
     directory: Arc<dyn DirectoryClient>,
+    fetcher: Arc<dyn SpecFetcher>,
     interval: Duration,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(directory_sync_loop(provider, directory, interval, cancel))
+    tokio::spawn(directory_sync_loop(
+        provider, directory, fetcher, interval, cancel,
+    ))
 }
 
 /// Poll the directory on a fixed cadence, reconciling the proxy route table,
@@ -56,6 +105,7 @@ pub fn spawn_directory_sync(
 async fn directory_sync_loop(
     provider: Arc<dyn GatewayProvider>,
     directory: Arc<dyn DirectoryClient>,
+    fetcher: Arc<dyn SpecFetcher>,
     interval: Duration,
     cancel: CancellationToken,
 ) {
@@ -68,7 +118,13 @@ async fn directory_sync_loop(
         tokio::select! {
             () = cancel.cancelled() => break,
             _ = ticker.tick() => {
-                if reconcile_pass(provider.as_ref(), directory.as_ref(), &mut state, &cancel)
+                if reconcile_pass(
+                    provider.as_ref(),
+                    directory.as_ref(),
+                    fetcher.as_ref(),
+                    &mut state,
+                    &cancel,
+                )
                     .await
                     .is_break()
                 {
@@ -82,19 +138,20 @@ async fn directory_sync_loop(
 
 /// Run a single reconcile pass, bounded by `SYNC_TIMEOUT` and cancel-aware.
 ///
-/// A hung `list_all_instances`/`get_openapi_spec` call is abandoned after the
+/// A hung `list_all_instances` call or a slow spec fetch is abandoned after the
 /// timeout so it can neither block the next tick nor stall shutdown; a fired
 /// `cancel` short-circuits the pass immediately. Returns
 /// [`ControlFlow::Break`] when the loop should stop.
 async fn reconcile_pass(
     provider: &dyn GatewayProvider,
     directory: &dyn DirectoryClient,
+    fetcher: &dyn SpecFetcher,
     state: &mut SyncState,
     cancel: &CancellationToken,
 ) -> std::ops::ControlFlow<()> {
     tokio::select! {
         () = cancel.cancelled() => std::ops::ControlFlow::Break(()),
-        result = tokio::time::timeout(SYNC_TIMEOUT, reconcile(provider, directory, state)) => {
+        result = tokio::time::timeout(SYNC_TIMEOUT, reconcile(provider, directory, fetcher, state)) => {
             if result.is_err() {
                 tracing::warn!(
                     timeout_secs = SYNC_TIMEOUT.as_secs(),
@@ -111,9 +168,10 @@ async fn reconcile_pass(
 async fn reconcile(
     provider: &dyn GatewayProvider,
     directory: &dyn DirectoryClient,
+    fetcher: &dyn SpecFetcher,
     state: &mut SyncState,
 ) {
-    if let Err(err) = sync_once_stateful(provider, directory, state).await {
+    if let Err(err) = sync_once_stateful(provider, directory, fetcher, state).await {
         tracing::warn!(error = %err, "gateway directory-sync poll failed");
     }
 }
@@ -124,10 +182,11 @@ async fn reconcile(
 async fn sync_once_stateful(
     provider: &dyn GatewayProvider,
     directory: &dyn DirectoryClient,
+    fetcher: &dyn SpecFetcher,
     state: &mut SyncState,
 ) -> anyhow::Result<()> {
     let instances = directory.list_all_instances().await?;
-    reconcile_snapshot(provider, directory, instances, state).await;
+    reconcile_snapshot(provider, fetcher, instances, state).await;
     Ok(())
 }
 
@@ -137,8 +196,9 @@ async fn sync_once_stateful(
 async fn sync_once(
     provider: &dyn GatewayProvider,
     directory: &dyn DirectoryClient,
+    fetcher: &dyn SpecFetcher,
 ) -> anyhow::Result<()> {
-    sync_once_stateful(provider, directory, &mut SyncState::default()).await
+    sync_once_stateful(provider, directory, fetcher, &mut SyncState::default()).await
 }
 
 /// How many consecutive empty directory snapshots the empty-snapshot valve
@@ -165,6 +225,11 @@ struct SyncState {
     /// Consecutive polls where the directory returned an empty snapshot, used to
     /// bound the empty-snapshot valve (see [`MAX_EMPTY_POLLS_PRESERVING_ROUTES`]).
     consecutive_empty_polls: u32,
+    /// `OpenAPI` documents cached by their lowercase-hex SHA-256, so a hash the
+    /// edge has already fetched and verified is never fetched again. Pruned each
+    /// pass to the set of hashes still advertised, so documents no instance
+    /// advertises anymore are dropped.
+    spec_cache: HashMap<String, Bytes>,
 }
 
 /// Prefer serving instances per gear for edge routing.
@@ -224,7 +289,7 @@ fn snapshot_fingerprint(instances: &[ServiceInstanceInfo]) -> u64 {
 /// snapshot is unchanged since the last full apply.
 async fn reconcile_snapshot(
     provider: &dyn GatewayProvider,
-    directory: &dyn DirectoryClient,
+    fetcher: &dyn SpecFetcher,
     instances: Vec<ServiceInstanceInfo>,
     state: &mut SyncState,
 ) {
@@ -264,7 +329,7 @@ async fn reconcile_snapshot(
         desired,
         to_register,
         complete,
-    } = resolve_snapshot(directory, instances).await;
+    } = resolve_snapshot(fetcher, instances, &mut state.spec_cache).await;
 
     let (removals, empty_snapshot_valve) = compute_removals(
         provider.registered_instances(),
@@ -295,29 +360,39 @@ struct Resolved {
     complete: bool,
 }
 
-/// Resolve every instance in a snapshot into routes, fetching each gear's spec
-/// at most once per pass (`Bytes` is ref-counted, so co-located instances of a
-/// gear share one copy).
+/// Resolve every instance in a snapshot into routes, fetching each distinct
+/// `OpenAPI` document from its instance at most once and caching it by hash in
+/// `cache` across passes (`Bytes` is ref-counted, so instances that share a
+/// hash share one copy). `cache` is pruned to the set of hashes still
+/// advertised so documents no instance advertises anymore are dropped.
 async fn resolve_snapshot(
-    directory: &dyn DirectoryClient,
+    fetcher: &dyn SpecFetcher,
     instances: Vec<ServiceInstanceInfo>,
+    cache: &mut HashMap<String, Bytes>,
 ) -> Resolved {
     let mut desired: HashSet<GearInstance> = HashSet::new();
-    let mut specs: HashMap<GearName, Bytes> = HashMap::new();
     let mut to_register: Vec<InstanceSpec<'static>> = Vec::with_capacity(instances.len());
     let mut complete = true;
+    // Every spec hash advertised this pass; the cache is pruned to it below.
+    let mut advertised: HashSet<String> = HashSet::new();
 
     for inst in instances {
         let gear = GearName::from(inst.gear.as_str());
         desired.insert(GearInstance::new(gear.clone(), &inst.instance_id));
 
+        if let Some(hash) = &inst.openapi_spec_hash {
+            advertised.insert(hash.clone());
+        }
         let proxyable = is_proxyable(&inst);
-        match resolve_instance_spec(directory, &inst, &gear, &mut specs).await {
+        match resolve_instance_spec(fetcher, &inst, &gear, cache).await {
             Some(spec) => to_register.push(spec),
             None if proxyable => complete = false,
             None => {}
         }
     }
+
+    // Drop cached documents for hashes no instance advertises anymore.
+    cache.retain(|hash, _| advertised.contains(hash));
 
     Resolved {
         desired,
@@ -358,8 +433,9 @@ fn compute_removals(
 
 /// Resolve one instance into an [`InstanceSpec`] ready for registration, or
 /// `None` if it is not proxyable (no REST endpoint, unparseable URI, or no
-/// published `OpenAPI` document). Skips are logged by the helpers so one bad
-/// gear cannot stall discovery of the rest.
+/// advertised `OpenAPI` hash) or its document could not be fetched/verified.
+/// Skips are logged by the helpers so one bad gear cannot stall discovery of
+/// the rest.
 ///
 /// Multiple instances of the same gear can be registered side-by-side; the
 /// instance-keyed [`ProxyRegistry`] retains every instance. Profile 3 selects a
@@ -368,17 +444,19 @@ fn compute_removals(
 /// multi-worker selection.
 ///
 /// The discovery snapshot ([`DirectoryClient::list_all_instances`]) is
-/// deliberately spec-less: the full `OpenAPI` document is fetched **once per gear**
-/// within a single sync pass and reused for all instances of that gear.
+/// deliberately spec-less: the full `OpenAPI` document is fetched from the
+/// instance and cached by hash, so a hash the edge has already verified is
+/// reused across instances and across passes.
 async fn resolve_instance_spec(
-    directory: &dyn DirectoryClient,
+    fetcher: &dyn SpecFetcher,
     inst: &ServiceInstanceInfo,
     gear: &GearName,
-    specs: &mut HashMap<GearName, Bytes>,
+    cache: &mut HashMap<String, Bytes>,
 ) -> Option<InstanceSpec<'static>> {
     let rest = inst.rest_endpoint.as_ref()?;
     let endpoint = parse_endpoint(gear.as_str(), &rest.uri)?;
-    let spec = fetch_or_get_spec(directory, gear, specs).await?;
+    let hash = inst.openapi_spec_hash.as_deref()?;
+    let spec = resolve_spec_by_hash(fetcher, gear.as_str(), &rest.uri, hash, cache).await?;
 
     Some(InstanceSpec {
         gear: gear.clone(),
@@ -388,19 +466,49 @@ async fn resolve_instance_spec(
     })
 }
 
-/// Fetch the `OpenAPI` spec for `gear` once per sync pass, returning a cheap
-/// (ref-counted) clone of the cached [`Bytes`] if already fetched this pass.
-async fn fetch_or_get_spec(
-    directory: &dyn DirectoryClient,
-    gear: &GearName,
-    specs: &mut HashMap<GearName, Bytes>,
+/// Return the `OpenAPI` document for `hash`, fetching it from the instance's
+/// `/.well-known/openapi.json` on a cache miss and verifying its SHA-256
+/// against the advertised `hash` before caching it.
+///
+/// Returns `None` (so the gear keeps its previous routes and is retried on the
+/// next poll) when the fetch fails or the fetched document's hash does not
+/// match — the latter happens when a Service VIP answers from a different pod
+/// mid-rollout.
+async fn resolve_spec_by_hash(
+    fetcher: &dyn SpecFetcher,
+    gear: &str,
+    rest_uri: &str,
+    hash: &str,
+    cache: &mut HashMap<String, Bytes>,
 ) -> Option<Bytes> {
-    if let Some(spec) = specs.get(gear) {
-        return Some(spec.clone());
+    if let Some(doc) = cache.get(hash) {
+        return Some(doc.clone());
     }
-    let spec = Bytes::from(fetch_spec(directory, gear.as_str()).await?);
-    specs.insert(gear.clone(), spec.clone());
-    Some(spec)
+    let doc = match fetcher.fetch(rest_uri).await {
+        Ok(doc) => doc,
+        Err(err) => {
+            tracing::warn!(
+                gear = %gear,
+                rest = %rest_uri,
+                error = %err,
+                "skipping gear: could not fetch OpenAPI document from instance",
+            );
+            return None;
+        }
+    };
+    let actual = toolkit::directory::openapi_spec_hash(&doc);
+    if actual != hash {
+        tracing::warn!(
+            gear = %gear,
+            rest = %rest_uri,
+            advertised = %hash,
+            actual = %actual,
+            "fetched OpenAPI document hash mismatch; keeping previous routes and retrying next poll",
+        );
+        return None;
+    }
+    cache.insert(hash.to_owned(), doc.clone());
+    Some(doc)
 }
 
 /// Parse a gear's advertised REST endpoint, logging and returning `None` on a
@@ -420,25 +528,15 @@ fn parse_endpoint(gear: &str, uri: &str) -> Option<Endpoint> {
     }
 }
 
-/// Fetch a gear's `OpenAPI` document from the directory, logging and returning
-/// `None` on failure (e.g. the gear published no spec) so the caller can skip it.
-async fn fetch_spec(directory: &dyn DirectoryClient, gear: &str) -> Option<String> {
-    match directory.get_openapi_spec(gear).await {
-        Ok(spec) => Some(spec),
-        Err(err) => {
-            tracing::warn!(gear = %gear, error = %err, "skipping gear: could not fetch OpenAPI spec");
-            None
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_EMPTY_POLLS_PRESERVING_ROUTES, SyncState, prefer_serving_per_gear,
+        MAX_EMPTY_POLLS_PRESERVING_ROUTES, SpecFetcher, SyncState, prefer_serving_per_gear,
         snapshot_fingerprint, spawn_directory_sync, sync_once, sync_once_stateful,
     };
+    use bytes::Bytes;
     use cf_system_sdks::directory::InstanceState;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -629,6 +727,83 @@ mod tests {
         instance_id
     }
 
+    /// A [`SpecFetcher`] that serves each instance's `OpenAPI` document straight
+    /// from the in-memory [`GearManager`] store (which, for `with_openapi_spec`
+    /// registrations, holds the document the worker would serve). It returns the
+    /// document advertised at a given REST endpoint, so the fetched bytes hash to
+    /// the advertised `openapi_spec_hash`, and counts every fetch so tests can
+    /// assert a hash is fetched at most once.
+    struct DirectoryFetcher {
+        mgr: Arc<GearManager>,
+        fetches: AtomicUsize,
+    }
+
+    impl DirectoryFetcher {
+        fn new(mgr: &Arc<GearManager>) -> Arc<Self> {
+            Arc::new(Self {
+                mgr: Arc::clone(mgr),
+                fetches: AtomicUsize::new(0),
+            })
+        }
+
+        fn fetch_count(&self) -> usize {
+            self.fetches.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SpecFetcher for DirectoryFetcher {
+        async fn fetch(&self, rest_endpoint_uri: &str) -> anyhow::Result<Bytes> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            let doc = self.mgr.all_instances().into_iter().find_map(|inst| {
+                let matches = inst
+                    .rest_endpoint
+                    .as_ref()
+                    .is_some_and(|e| e.uri == rest_endpoint_uri);
+                matches.then(|| inst.openapi_spec.clone()).flatten()
+            });
+            doc.map(Bytes::from)
+                .ok_or_else(|| anyhow::anyhow!("no document served at {rest_endpoint_uri}"))
+        }
+    }
+
+    /// A [`SpecFetcher`] over an explicit `rest-uri -> document` map, so a test
+    /// can serve a document whose hash deliberately differs from the advertised
+    /// one (the hash-mismatch path) and count fetches precisely.
+    #[derive(Default)]
+    struct MapFetcher {
+        docs: parking_lot::Mutex<HashMap<String, Bytes>>,
+        fetches: AtomicUsize,
+    }
+
+    impl MapFetcher {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        fn set(&self, rest_endpoint_uri: &str, doc: &str) {
+            self.docs
+                .lock()
+                .insert(rest_endpoint_uri.to_owned(), Bytes::from(doc.to_owned()));
+        }
+
+        fn fetch_count(&self) -> usize {
+            self.fetches.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SpecFetcher for MapFetcher {
+        async fn fetch(&self, rest_endpoint_uri: &str) -> anyhow::Result<Bytes> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            self.docs
+                .lock()
+                .get(rest_endpoint_uri)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("no document served at {rest_endpoint_uri}"))
+        }
+    }
+
     #[tokio::test]
     async fn sync_registers_public_routes_then_prunes_removed_gears() {
         let mgr = Arc::new(GearManager::new());
@@ -652,7 +827,13 @@ mod tests {
         let registry = Arc::new(ProxyRegistry::new());
         let provider = ToolKitGatewayProvider::new(Arc::clone(&registry));
 
-        sync_once(&provider, dir.as_ref()).await.unwrap();
+        sync_once(
+            &provider,
+            dir.as_ref(),
+            DirectoryFetcher::new(&mgr).as_ref(),
+        )
+        .await
+        .unwrap();
 
         assert!(registry.match_path("/calc/v1/add").is_some());
         assert!(registry.match_path("/billing/v1/pay").is_some());
@@ -663,7 +844,13 @@ mod tests {
         dir.deregister_instance("calc", &calc_instance)
             .await
             .unwrap();
-        sync_once(&provider, dir.as_ref()).await.unwrap();
+        sync_once(
+            &provider,
+            dir.as_ref(),
+            DirectoryFetcher::new(&mgr).as_ref(),
+        )
+        .await
+        .unwrap();
 
         assert!(registry.match_path("/calc/v1/add").is_none());
         assert!(registry.match_path("/billing/v1/pay").is_some());
@@ -686,7 +873,13 @@ mod tests {
 
         let registry = Arc::new(ProxyRegistry::new());
         let provider = ToolKitGatewayProvider::new(Arc::clone(&registry));
-        sync_once(&provider, dir.as_ref()).await.unwrap();
+        sync_once(
+            &provider,
+            dir.as_ref(),
+            DirectoryFetcher::new(&mgr).as_ref(),
+        )
+        .await
+        .unwrap();
         assert!(registry.match_path("/calc/v1/add").is_some());
         assert!(registry.match_path("/calc/v1/sub").is_none());
 
@@ -701,7 +894,13 @@ mod tests {
         .await
         .unwrap();
 
-        sync_once(&provider, dir.as_ref()).await.unwrap();
+        sync_once(
+            &provider,
+            dir.as_ref(),
+            DirectoryFetcher::new(&mgr).as_ref(),
+        )
+        .await
+        .unwrap();
 
         assert!(registry.match_path("/calc/v1/sub").is_some());
         assert!(registry.match_path("/calc/v1/add").is_none());
@@ -723,7 +922,13 @@ mod tests {
 
         let registry = Arc::new(ProxyRegistry::new());
         let provider = ToolKitGatewayProvider::new(Arc::clone(&registry));
-        sync_once(&provider, dir.as_ref()).await.unwrap();
+        sync_once(
+            &provider,
+            dir.as_ref(),
+            DirectoryFetcher::new(&mgr).as_ref(),
+        )
+        .await
+        .unwrap();
         assert!(registry.match_path("/calc/v1/add").is_some());
         assert!(registry.contains_instance(&GearName::from("calc"), &good));
 
@@ -737,7 +942,13 @@ mod tests {
             public_spec("calc", "/calc/v1/add"),
         )
         .await;
-        sync_once(&provider, dir.as_ref()).await.unwrap();
+        sync_once(
+            &provider,
+            dir.as_ref(),
+            DirectoryFetcher::new(&mgr).as_ref(),
+        )
+        .await
+        .unwrap();
 
         assert!(registry.match_path("/calc/v1/add").is_some());
         assert!(registry.contains_gear(&GearName::from("calc")));
@@ -762,7 +973,13 @@ mod tests {
 
         let registry = Arc::new(ProxyRegistry::new());
         let provider = ToolKitGatewayProvider::new(Arc::clone(&registry));
-        sync_once(&provider, dir.as_ref()).await.unwrap();
+        sync_once(
+            &provider,
+            dir.as_ref(),
+            DirectoryFetcher::new(&mgr).as_ref(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(registry.instance_count(), 0);
     }
@@ -773,8 +990,8 @@ mod tests {
         let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
 
         // The gear advertises a REST endpoint but never published an OpenAPI
-        // document. Since the slim discovery snapshot carries no spec, the edge
-        // tries to fetch it via `get_openapi_spec`, which fails -> not proxied.
+        // document, so it carries no spec hash and is not proxyable: the edge
+        // never even tries to fetch a document for it -> not proxied.
         dir.register_instance(
             RegisterInstanceInfo::new("specless", uuid::Uuid::new_v4().to_string())
                 .with_rest_endpoint(ServiceEndpoint::new("http://specless:8080")),
@@ -784,7 +1001,13 @@ mod tests {
 
         let registry = Arc::new(ProxyRegistry::new());
         let provider = ToolKitGatewayProvider::new(Arc::clone(&registry));
-        sync_once(&provider, dir.as_ref()).await.unwrap();
+        sync_once(
+            &provider,
+            dir.as_ref(),
+            DirectoryFetcher::new(&mgr).as_ref(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(registry.instance_count(), 0);
     }
@@ -792,8 +1015,9 @@ mod tests {
     #[tokio::test]
     async fn sync_fetches_spec_lazily_from_slim_snapshot() {
         // The discovery snapshot never inlines the spec, yet the edge still
-        // registers public routes by fetching the document via `get_openapi_spec`
-        // on first discovery.
+        // registers public routes by fetching the document from the instance's
+        // `/.well-known/openapi.json` and verifying it against the advertised
+        // hash on first discovery.
         let mgr = Arc::new(GearManager::new());
         let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
 
@@ -812,7 +1036,13 @@ mod tests {
 
         let registry = Arc::new(ProxyRegistry::new());
         let provider = ToolKitGatewayProvider::new(Arc::clone(&registry));
-        sync_once(&provider, dir.as_ref()).await.unwrap();
+        sync_once(
+            &provider,
+            dir.as_ref(),
+            DirectoryFetcher::new(&mgr).as_ref(),
+        )
+        .await
+        .unwrap();
 
         assert!(registry.match_path("/calc/v1/add").is_some());
     }
@@ -846,7 +1076,13 @@ mod tests {
 
         let registry = Arc::new(ProxyRegistry::new());
         let provider = ToolKitGatewayProvider::new(Arc::clone(&registry));
-        sync_once(&provider, dir.as_ref()).await.unwrap();
+        sync_once(
+            &provider,
+            dir.as_ref(),
+            DirectoryFetcher::new(&mgr).as_ref(),
+        )
+        .await
+        .unwrap();
 
         assert!(registry.contains_instance(&GearName::from("calc"), &calc_a));
         assert!(registry.contains_instance(&GearName::from("calc"), &calc_b));
@@ -866,7 +1102,13 @@ mod tests {
         // Remove one calc instance; the gear stays routable via the surviving
         // instance and billing is untouched.
         dir.deregister_instance("calc", &calc_a).await.unwrap();
-        sync_once(&provider, dir.as_ref()).await.unwrap();
+        sync_once(
+            &provider,
+            dir.as_ref(),
+            DirectoryFetcher::new(&mgr).as_ref(),
+        )
+        .await
+        .unwrap();
 
         assert!(!registry.contains_instance(&GearName::from("calc"), &calc_a));
         assert!(registry.contains_instance(&GearName::from("calc"), &calc_b));
@@ -898,7 +1140,13 @@ mod tests {
 
         let registry = Arc::new(ProxyRegistry::new());
         let provider = ToolKitGatewayProvider::new(Arc::clone(&registry));
-        sync_once(&provider, dir.as_ref()).await.unwrap();
+        sync_once(
+            &provider,
+            dir.as_ref(),
+            DirectoryFetcher::new(&mgr).as_ref(),
+        )
+        .await
+        .unwrap();
         assert!(registry.match_path("/calc/v1/add").is_some());
         assert_eq!(registry.instance_count(), 1);
 
@@ -906,7 +1154,13 @@ mod tests {
         // retained rather than flushed.
         dir.deregister_instance("calc", &calc).await.unwrap();
         assert!(dir.list_all_instances().await.unwrap().is_empty());
-        sync_once(&provider, dir.as_ref()).await.unwrap();
+        sync_once(
+            &provider,
+            dir.as_ref(),
+            DirectoryFetcher::new(&mgr).as_ref(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(registry.instance_count(), 1);
         assert!(registry.match_path("/calc/v1/add").is_some());
@@ -933,9 +1187,14 @@ mod tests {
         let registry = Arc::new(ProxyRegistry::new());
         let provider = ToolKitGatewayProvider::new(Arc::clone(&registry));
         let mut state = SyncState::default();
-        sync_once_stateful(&provider, dir.as_ref(), &mut state)
-            .await
-            .unwrap();
+        sync_once_stateful(
+            &provider,
+            dir.as_ref(),
+            DirectoryFetcher::new(&mgr).as_ref(),
+            &mut state,
+        )
+        .await
+        .unwrap();
         assert_eq!(registry.instance_count(), 1);
 
         // The instance disappears; the directory reports empty from now on.
@@ -944,9 +1203,14 @@ mod tests {
 
         // Within the bound the valve preserves the route across empty polls.
         for _ in 0..MAX_EMPTY_POLLS_PRESERVING_ROUTES {
-            sync_once_stateful(&provider, dir.as_ref(), &mut state)
-                .await
-                .unwrap();
+            sync_once_stateful(
+                &provider,
+                dir.as_ref(),
+                DirectoryFetcher::new(&mgr).as_ref(),
+                &mut state,
+            )
+            .await
+            .unwrap();
             assert_eq!(
                 registry.instance_count(),
                 1,
@@ -955,9 +1219,14 @@ mod tests {
         }
 
         // One empty poll past the bound finally withdraws the dead route.
-        sync_once_stateful(&provider, dir.as_ref(), &mut state)
-            .await
-            .unwrap();
+        sync_once_stateful(
+            &provider,
+            dir.as_ref(),
+            DirectoryFetcher::new(&mgr).as_ref(),
+            &mut state,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             registry.instance_count(),
             0,
@@ -985,14 +1254,26 @@ mod tests {
 
         let registry = Arc::new(ProxyRegistry::new());
         let provider = ToolKitGatewayProvider::new(Arc::clone(&registry));
-        sync_once(&provider, dir.as_ref()).await.unwrap();
+        sync_once(
+            &provider,
+            dir.as_ref(),
+            DirectoryFetcher::new(&mgr).as_ref(),
+        )
+        .await
+        .unwrap();
         assert_eq!(registry.instance_count(), 1);
 
         // The only instance flips to Draining (still observable in the snapshot).
         dir.heartbeat("calc", &calc, Some(ReportedState::Draining))
             .await
             .unwrap();
-        sync_once(&provider, dir.as_ref()).await.unwrap();
+        sync_once(
+            &provider,
+            dir.as_ref(),
+            DirectoryFetcher::new(&mgr).as_ref(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             registry.instance_count(),
@@ -1027,13 +1308,25 @@ mod tests {
 
         let registry = Arc::new(ProxyRegistry::new());
         let provider = ToolKitGatewayProvider::new(Arc::clone(&registry));
-        sync_once(&provider, dir.as_ref()).await.unwrap();
+        sync_once(
+            &provider,
+            dir.as_ref(),
+            DirectoryFetcher::new(&mgr).as_ref(),
+        )
+        .await
+        .unwrap();
         assert_eq!(registry.instance_count(), 2);
 
         // calc disappears but billing remains: the snapshot is non-empty, so
         // calc is pruned as usual.
         dir.deregister_instance("calc", &calc).await.unwrap();
-        sync_once(&provider, dir.as_ref()).await.unwrap();
+        sync_once(
+            &provider,
+            dir.as_ref(),
+            DirectoryFetcher::new(&mgr).as_ref(),
+        )
+        .await
+        .unwrap();
 
         assert!(!registry.contains_gear(&GearName::from("calc")));
         assert!(registry.match_path("/billing/v1/pay").is_some());
@@ -1062,6 +1355,7 @@ mod tests {
         let handle = spawn_directory_sync(
             provider,
             Arc::clone(&dir),
+            DirectoryFetcher::new(&mgr),
             Duration::from_secs(1),
             cancel.clone(),
         );
@@ -1100,15 +1394,25 @@ mod tests {
         let (provider, applies) = CountingProvider::new(Arc::clone(&registry));
         let mut state = SyncState::default();
 
-        sync_once_stateful(&provider, dir.as_ref(), &mut state)
-            .await
-            .unwrap();
+        sync_once_stateful(
+            &provider,
+            dir.as_ref(),
+            DirectoryFetcher::new(&mgr).as_ref(),
+            &mut state,
+        )
+        .await
+        .unwrap();
         assert_eq!(applies.load(Ordering::SeqCst), 1, "first poll reconciles");
         assert!(registry.match_path("/calc/v1/add").is_some());
 
-        sync_once_stateful(&provider, dir.as_ref(), &mut state)
-            .await
-            .unwrap();
+        sync_once_stateful(
+            &provider,
+            dir.as_ref(),
+            DirectoryFetcher::new(&mgr).as_ref(),
+            &mut state,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             applies.load(Ordering::SeqCst),
             1,
@@ -1135,9 +1439,14 @@ mod tests {
         let (provider, applies) = CountingProvider::new(Arc::clone(&registry));
         let mut state = SyncState::default();
 
-        sync_once_stateful(&provider, dir.as_ref(), &mut state)
-            .await
-            .unwrap();
+        sync_once_stateful(
+            &provider,
+            dir.as_ref(),
+            DirectoryFetcher::new(&mgr).as_ref(),
+            &mut state,
+        )
+        .await
+        .unwrap();
         assert_eq!(applies.load(Ordering::SeqCst), 1);
 
         // Re-publish a changed document for the same instance.
@@ -1149,9 +1458,14 @@ mod tests {
         .await
         .unwrap();
 
-        sync_once_stateful(&provider, dir.as_ref(), &mut state)
-            .await
-            .unwrap();
+        sync_once_stateful(
+            &provider,
+            dir.as_ref(),
+            DirectoryFetcher::new(&mgr).as_ref(),
+            &mut state,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             applies.load(Ordering::SeqCst),
             2,
@@ -1180,18 +1494,28 @@ mod tests {
         let (provider, applies) = CountingProvider::new(Arc::clone(&registry));
         let mut state = SyncState::default();
 
-        sync_once_stateful(&provider, dir.as_ref(), &mut state)
-            .await
-            .unwrap();
+        sync_once_stateful(
+            &provider,
+            dir.as_ref(),
+            DirectoryFetcher::new(&mgr).as_ref(),
+            &mut state,
+        )
+        .await
+        .unwrap();
         assert_eq!(applies.load(Ordering::SeqCst), 1);
         assert!(
             state.last_applied.is_none(),
             "incomplete pass is not cached"
         );
 
-        sync_once_stateful(&provider, dir.as_ref(), &mut state)
-            .await
-            .unwrap();
+        sync_once_stateful(
+            &provider,
+            dir.as_ref(),
+            DirectoryFetcher::new(&mgr).as_ref(),
+            &mut state,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             applies.load(Ordering::SeqCst),
             2,
@@ -1222,5 +1546,196 @@ mod tests {
             snapshot_fingerprint(&changed),
             "a changed spec hash changes the fingerprint"
         );
+    }
+
+    /// Register an instance that advertises only a spec hash (as a new worker
+    /// does), serving the matching document from `fetcher`.
+    async fn register_with_hash(
+        dir: &dyn DirectoryClient,
+        fetcher: &MapFetcher,
+        gear: &str,
+        uri: &str,
+        spec: &str,
+    ) -> String {
+        let hash = toolkit::directory::openapi_spec_hash(spec.as_bytes());
+        fetcher.set(uri, spec);
+        let instance_id = uuid::Uuid::new_v4().to_string();
+        dir.register_instance(
+            RegisterInstanceInfo::new(gear, instance_id.clone())
+                .with_rest_endpoint(ServiceEndpoint::new(uri))
+                .with_openapi_spec_hash(hash),
+        )
+        .await
+        .unwrap();
+        instance_id
+    }
+
+    #[tokio::test]
+    async fn edge_builds_routes_from_document_fetched_from_instance() {
+        // A new worker advertises only the hash; the edge fetches the document
+        // from the instance, verifies it, and builds the gear's public routes.
+        let mgr = Arc::new(GearManager::new());
+        let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
+        let fetcher = MapFetcher::new();
+        register_with_hash(
+            dir.as_ref(),
+            &fetcher,
+            "calc",
+            "http://calc:8080",
+            &public_spec("calc", "/calc/v1/add"),
+        )
+        .await;
+
+        // The snapshot carries only the hash, never the document.
+        let snapshot = dir.list_all_instances().await.unwrap();
+        assert!(snapshot.iter().all(|i| i.openapi_spec_hash.is_some()));
+
+        let registry = Arc::new(ProxyRegistry::new());
+        let provider = ToolKitGatewayProvider::new(Arc::clone(&registry));
+        sync_once(&provider, dir.as_ref(), fetcher.as_ref())
+            .await
+            .unwrap();
+
+        assert!(registry.match_path("/calc/v1/add").is_some());
+        assert_eq!(fetcher.fetch_count(), 1, "the document is fetched once");
+    }
+
+    #[tokio::test]
+    async fn new_hash_fetched_once_unchanged_hash_never_refetched() {
+        // One persistent fetcher + state across polls: a newly-seen hash is
+        // fetched exactly once; an unchanged hash is never fetched again.
+        let mgr = Arc::new(GearManager::new());
+        let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
+        let fetcher = DirectoryFetcher::new(&mgr);
+
+        register(
+            dir.as_ref(),
+            "calc",
+            "http://calc:8080",
+            public_spec("calc", "/calc/v1/add"),
+        )
+        .await;
+
+        let registry = Arc::new(ProxyRegistry::new());
+        let provider = ToolKitGatewayProvider::new(Arc::clone(&registry));
+        let mut state = SyncState::default();
+
+        sync_once_stateful(&provider, dir.as_ref(), fetcher.as_ref(), &mut state)
+            .await
+            .unwrap();
+        assert_eq!(fetcher.fetch_count(), 1, "calc's document fetched once");
+
+        // A second gear changes the snapshot, forcing a full pass. calc's hash
+        // is already cached, so only billing's document is fetched.
+        register(
+            dir.as_ref(),
+            "billing",
+            "http://billing:9090",
+            public_spec("billing", "/billing/v1/pay"),
+        )
+        .await;
+        sync_once_stateful(&provider, dir.as_ref(), fetcher.as_ref(), &mut state)
+            .await
+            .unwrap();
+        assert_eq!(
+            fetcher.fetch_count(),
+            2,
+            "only the new hash is fetched; calc's cached hash is not re-fetched"
+        );
+
+        // An unchanged snapshot is skipped entirely: no fetch at all.
+        sync_once_stateful(&provider, dir.as_ref(), fetcher.as_ref(), &mut state)
+            .await
+            .unwrap();
+        assert_eq!(
+            fetcher.fetch_count(),
+            2,
+            "an unchanged snapshot triggers no fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn hash_mismatch_keeps_previous_routes() {
+        // During a rolling upgrade a Service VIP can answer the fetch from a pod
+        // serving a different document than the advertised hash. On mismatch the
+        // edge keeps the gear's previous routes and retries next poll.
+        let mgr = Arc::new(GearManager::new());
+        let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
+        let fetcher = MapFetcher::new();
+
+        let old_doc = public_spec("calc", "/calc/v1/add");
+        let instance_id =
+            register_with_hash(dir.as_ref(), &fetcher, "calc", "http://calc:8080", &old_doc).await;
+
+        let registry = Arc::new(ProxyRegistry::new());
+        let provider = ToolKitGatewayProvider::new(Arc::clone(&registry));
+        let mut state = SyncState::default();
+        sync_once_stateful(&provider, dir.as_ref(), fetcher.as_ref(), &mut state)
+            .await
+            .unwrap();
+        assert!(registry.match_path("/calc/v1/add").is_some());
+
+        // The instance now advertises the hash of a *new* document, but the
+        // fetch still returns the old one (a stale pod) — a hash mismatch.
+        let new_doc = public_spec("calc", "/calc/v1/sub");
+        let new_hash = toolkit::directory::openapi_spec_hash(new_doc.as_bytes());
+        dir.register_instance(
+            RegisterInstanceInfo::new("calc", instance_id)
+                .with_rest_endpoint(ServiceEndpoint::new("http://calc:8080"))
+                .with_openapi_spec_hash(new_hash),
+        )
+        .await
+        .unwrap();
+
+        sync_once_stateful(&provider, dir.as_ref(), fetcher.as_ref(), &mut state)
+            .await
+            .unwrap();
+
+        // The old routes stay; the new (unverified) routes are not built.
+        assert!(
+            registry.match_path("/calc/v1/add").is_some(),
+            "previous routes are kept on a hash mismatch"
+        );
+        assert!(
+            registry.match_path("/calc/v1/sub").is_none(),
+            "unverified routes are not built on a hash mismatch"
+        );
+        assert!(
+            state.last_applied.is_none(),
+            "a mismatch leaves the pass incomplete so it retries next poll"
+        );
+    }
+
+    #[tokio::test]
+    async fn old_worker_openapi_spec_without_hash_is_still_proxied() {
+        // Compatibility: an old worker still pushes the full document and no
+        // hash. The directory derives the hash; the edge fetches the document
+        // and proxies the gear as usual.
+        let mgr = Arc::new(GearManager::new());
+        let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
+
+        register(
+            dir.as_ref(),
+            "calc",
+            "http://calc:8080",
+            public_spec("calc", "/calc/v1/add"),
+        )
+        .await;
+
+        // The directory derived a hash from the pushed document.
+        let snapshot = dir.list_all_instances().await.unwrap();
+        assert!(snapshot.iter().all(|i| i.openapi_spec_hash.is_some()));
+
+        let registry = Arc::new(ProxyRegistry::new());
+        let provider = ToolKitGatewayProvider::new(Arc::clone(&registry));
+        sync_once(
+            &provider,
+            dir.as_ref(),
+            DirectoryFetcher::new(&mgr).as_ref(),
+        )
+        .await
+        .unwrap();
+
+        assert!(registry.match_path("/calc/v1/add").is_some());
     }
 }

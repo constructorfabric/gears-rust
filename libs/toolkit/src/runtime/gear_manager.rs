@@ -142,7 +142,13 @@ pub struct GearInstance {
     pub grpc_services: HashMap<String, Endpoint>,
     pub version: Option<String>,
     pub rest_endpoint: Option<Endpoint>,
+    /// **Deprecated** full `OpenAPI` document, retained in this in-memory store
+    /// only when an old worker pushed one, so the deprecated `get_openapi_spec`
+    /// keeps answering (ADR-0011). New workers send only `openapi_spec_hash`.
     pub openapi_spec: Option<String>,
+    /// Lowercase-hex SHA-256 of the gear's `OpenAPI` document, advertised to the
+    /// edge so it can fetch and verify the document directly from the instance.
+    pub openapi_spec_hash: Option<String>,
     /// Stable addressing labels (k8s `matchLabels` style) advertised by this
     /// instance, used for label-based instance selection.
     pub labels: BTreeMap<String, String>,
@@ -165,6 +171,7 @@ impl Clone for GearInstance {
             version: self.version.clone(),
             rest_endpoint: self.rest_endpoint.clone(),
             openapi_spec: self.openapi_spec.clone(),
+            openapi_spec_hash: self.openapi_spec_hash.clone(),
             labels: self.labels.clone(),
             reported_state: self.reported_state,
             inner: Arc::clone(&self.inner),
@@ -201,6 +208,10 @@ impl GearInstance {
                 .openapi_spec
                 .clone()
                 .or_else(|| self.openapi_spec.clone()),
+            openapi_spec_hash: other
+                .openapi_spec_hash
+                .clone()
+                .or_else(|| self.openapi_spec_hash.clone()),
             // Empty incoming labels mean "keep the stored set", not "clear"; a
             // non-empty set replaces it. See `RegisterInstanceInfo::with_labels`
             // for why (self-heal / REST-augmentation re-registers omit labels).
@@ -228,6 +239,7 @@ impl GearInstance {
             version: None,
             rest_endpoint: None,
             openapi_spec: None,
+            openapi_spec_hash: None,
             labels: BTreeMap::new(),
             reported_state: None,
             // Placeholder lease: already expired, so an instance that is never
@@ -263,6 +275,11 @@ impl GearInstance {
 
     pub fn with_openapi_spec(mut self, spec: impl Into<String>) -> Self {
         self.openapi_spec = Some(spec.into());
+        self
+    }
+
+    pub fn with_openapi_spec_hash(mut self, hash: impl Into<String>) -> Self {
+        self.openapi_spec_hash = Some(hash.into());
         self
     }
 

@@ -327,9 +327,9 @@ impl DirectoryClient for DirectoryGrpcClient {
     ) -> Result<Vec<ServiceInstanceInfo>> {
         // Push the selector server-side so the directory returns only matching
         // instances. Every `list_instances` response is spec-free (only the
-        // `openapi_spec_hash` rides along; the document is fetched via
-        // `GetOpenApiSpec`), so an empty (match-all) selector never leaks a full
-        // OpenAPI document over the wire.
+        // `openapi_spec_hash` rides along; the document is fetched from the
+        // instance's `/.well-known/openapi.json`), so an empty (match-all)
+        // selector never leaks a full OpenAPI document over the wire.
         //
         // cancel-safe: the single await is the unary `list_instances` RPC, which
         // precedes any local state change; cancelling it just drops the in-flight
@@ -404,6 +404,7 @@ impl DirectoryClient for DirectoryGrpcClient {
             openapi_spec: info.openapi_spec,
             labels: info.labels.into_iter().collect(),
             reported_state: info.reported_state.map(reported_to_proto),
+            openapi_spec_hash: info.openapi_spec_hash,
         };
 
         let gear_for_log = req.gear_name.clone();
