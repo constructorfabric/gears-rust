@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::domain::deletion::DeletionEvent;
 use crate::domain::error::DomainError;
-use crate::domain::tenant_exit::{Exit, GraphExit, TenantExit, TenantRows, TenantStatus};
+use crate::domain::tenant_exit::{Exit, GraphExit, Kept, TenantExit, TenantRows, TenantStatus};
 use crate::test_support::{
     MemoryDeletionStore, NoTenantResolver, RecordingDeletionEvents, ScriptedOffboarding,
     ScriptedStatuses, tenant_exit_over,
@@ -80,16 +80,20 @@ async fn a_deleted_tenant_is_asked_about_as_construct_in_that_tenant() {
 
 #[tokio::test]
 async fn a_present_or_unknown_tenant_is_left_untouched() {
-    for status in [TenantStatus::Present, TenantStatus::Unknown] {
+    for (status, kept) in [
+        (TenantStatus::Present, Kept::Present),
+        (TenantStatus::Unknown, Kept::Unknown),
+    ] {
         let f = deleted_tenant();
         f.statuses.set(f.tenant, status);
 
         let ended = f.exit.run(f.tenant).await;
 
         assert!(
-            matches!(ended, Ok(Exit::Kept(kept)) if kept == status),
+            matches!(&ended, Ok(Exit::Kept(why)) if *why == kept),
             "{status:?}: {ended:?}"
         );
+        assert!(!ended.unwrap().tenant_deleted());
         assert!(f.graph.asked().is_empty(), "{status:?}");
         assert!(f.untouched(), "{status:?}");
     }
@@ -257,4 +261,55 @@ async fn a_table_failure_after_the_offboarding_keeps_the_tenant_for_the_next_run
     f.store.emptying_down.store(false, Ordering::SeqCst);
     assert!(matches!(f.exit.run(f.tenant).await, Ok(Exit::Done)));
     assert_eq!(f.store.forgotten(), [f.tenant]);
+}
+
+#[tokio::test]
+async fn a_forget_that_fails_keeps_the_tenant_and_records_no_exit_until_the_next_run() {
+    let f = deleted_tenant();
+    f.store.forgetting_down.store(true, Ordering::SeqCst);
+
+    let ended = f.exit.run(f.tenant).await;
+
+    assert!(
+        matches!(ended, Ok(Exit::Stopped(DomainError::Unavailable(_)))),
+        "{ended:?}"
+    );
+    assert!(f.store.keeps(f.tenant));
+    assert!(
+        matches!(
+            f.events.taken()[..],
+            [DeletionEvent::TenantRowsRemoved { .. }]
+        ),
+        "the rows went, the exit is not recorded"
+    );
+
+    f.store.forgetting_down.store(false, Ordering::SeqCst);
+    *f.store.tenant_rows.lock().unwrap() = TenantRows::default();
+    assert!(matches!(f.exit.run(f.tenant).await, Ok(Exit::Done)));
+    assert!(!f.store.keeps(f.tenant));
+    assert!(matches!(
+        f.events.taken()[..],
+        [
+            DeletionEvent::TenantRowsRemoved { .. },
+            DeletionEvent::TenantExited { .. }
+        ]
+    ));
+}
+
+#[tokio::test]
+async fn a_tenant_that_exited_before_finds_nothing_and_records_nothing() {
+    let f = deleted_tenant();
+    assert!(matches!(f.exit.run(f.tenant).await, Ok(Exit::Done)));
+    *f.store.tenant_rows.lock().unwrap() = TenantRows::default();
+    let recorded = f.events.taken().len();
+
+    let again = f.exit.run(f.tenant).await;
+
+    assert!(matches!(again, Ok(Exit::Gone)), "{again:?}");
+    assert!(again.unwrap().tenant_deleted(), "retention still leaves it");
+    assert_eq!(
+        f.events.taken().len(),
+        recorded,
+        "no second exit is recorded"
+    );
 }

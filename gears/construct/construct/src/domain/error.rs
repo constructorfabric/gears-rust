@@ -96,6 +96,13 @@ impl DomainError {
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())
     }
+
+    /// Whether a later try may succeed: a dependency or the database did not
+    /// answer. Anything else stays as it is until someone fixes it.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Unavailable(_) | Self::Database(_))
+    }
 }
 
 /// Whether retrying the failed call can help: the error answers with one of the

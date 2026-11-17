@@ -723,3 +723,54 @@ async fn a_forgotten_tenant_is_no_longer_kept_and_a_later_write_notes_it_again()
         "the next run checks it again"
     );
 }
+
+#[tokio::test]
+async fn a_tenants_exit_under_a_scope_that_leaves_the_tenant_out_removes_nothing() {
+    use crate::domain::tenant_exit::{TenantRows, TenantTables as _};
+
+    let t = tables().await;
+    let key = subject();
+    t.store
+        .mark(&tenant_scope(key), key, OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    t.add_request(key, OffsetDateTime::now_utc()).await;
+    t.add_identity(key).await;
+
+    let removed = t
+        .store
+        .remove_tenant(&AccessScope::for_tenant(Uuid::new_v4()), key.tenant_id)
+        .await
+        .unwrap();
+
+    assert_eq!(removed, TenantRows::default());
+    assert!(t.settings(key).await.is_some());
+    assert_eq!(t.requests(key).await, 1);
+    assert_eq!(t.identities().await, 1);
+}
+
+#[tokio::test]
+async fn forgetting_a_tenant_under_a_scope_that_leaves_it_out_keeps_it() {
+    use crate::domain::deletion::KnownTenants as _;
+    use crate::domain::tenant_exit::TenantTables as _;
+
+    let t = tables().await;
+    let tenant = Uuid::new_v4();
+    t.store.note(tenant).await.unwrap();
+
+    let forgotten = t
+        .store
+        .forget_tenant(&AccessScope::for_tenant(Uuid::new_v4()), tenant)
+        .await
+        .unwrap();
+
+    assert!(!forgotten);
+    assert!(t.store.tenants().await.unwrap().contains(&tenant));
+    assert!(
+        t.store
+            .forget_tenant(&AccessScope::for_tenant(tenant), tenant)
+            .await
+            .unwrap(),
+        "in its own scope it is forgotten, and says so"
+    );
+}

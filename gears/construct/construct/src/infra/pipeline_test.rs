@@ -917,7 +917,6 @@ async fn a_tenant_the_platform_deleted_leaves_construct_and_graph_storage_throug
     use crate::domain::deletion::DeletionStore;
     use crate::domain::subject_settings::SubjectKey;
     use crate::domain::tenant_exit::TenantStatus;
-    use graph_storage::domain::offboarding::TenantState;
 
     let db = inmem_db().await;
     let cfg = ConstructConfig {
@@ -927,8 +926,7 @@ async fn a_tenant_the_platform_deleted_leaves_construct_and_graph_storage_throug
     }
     .validated()
     .unwrap();
-    let (graph, graph_store) =
-        crate::test_support::fake_graph_storage_where_every_tenant_is(TenantState::Deleted);
+    let (graph, graph_store) = crate::test_support::fake_graph_storage_where_every_tenant_is(true);
     let statuses = Arc::new(crate::test_support::ScriptedStatuses::default());
     let tables = crate::test_support::deletion_tables(&db);
     let pipeline = assemble(

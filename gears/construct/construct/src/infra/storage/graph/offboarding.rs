@@ -74,8 +74,6 @@ fn offboarding_error(err: &CanonicalError) -> DomainError {
 
 #[cfg(test)]
 mod tests {
-    use graph_storage::domain::offboarding::TenantState;
-
     use super::*;
     use crate::infra::processing_contexts::ServiceIdentity;
     use crate::test_support::{fake_graph_storage_where_every_tenant_is, run_graph_offboarding};
@@ -89,7 +87,7 @@ mod tests {
     #[tokio::test]
     async fn construct_starts_the_offboarding_and_sees_it_done_once_graph_storage_removed_the_graph()
      {
-        let (client, store) = fake_graph_storage_where_every_tenant_is(TenantState::Deleted);
+        let (client, store) = fake_graph_storage_where_every_tenant_is(true);
         let graph = GraphTenantOffboarding::new(client);
         let tenant = Uuid::new_v4();
 
@@ -114,7 +112,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_tenant_the_platform_has_not_deleted_is_refused_by_graph_storage() {
-        let (client, _) = fake_graph_storage_where_every_tenant_is(TenantState::Live);
+        let (client, _) = fake_graph_storage_where_every_tenant_is(false);
         let tenant = Uuid::new_v4();
 
         let refused = GraphTenantOffboarding::new(client)
@@ -130,7 +128,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_grant_names_the_permission_the_deployment_must_give() {
         let (client, _) = crate::test_support::fake_graph_storage_under(
-            TenantState::Deleted,
+            true,
             Arc::new(crate::test_support::DenyResolver),
         );
         let tenant = Uuid::new_v4();

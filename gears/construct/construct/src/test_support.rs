@@ -1112,7 +1112,7 @@ pub fn fake_graph_storage() -> Arc<dyn graph_storage_sdk::GraphStorageClientV1> 
 }
 
 /// The platform as graph storage asks it: every tenant is `state`.
-pub struct EveryTenant(pub graph_storage::domain::offboarding::TenantState);
+struct EveryTenant(graph_storage::domain::offboarding::TenantState);
 
 #[async_trait]
 impl graph_storage::domain::offboarding::TenantDirectory for EveryTenant {
@@ -1130,20 +1130,21 @@ impl graph_storage::domain::offboarding::TenantDirectory for EveryTenant {
 }
 
 /// Graph storage's real service over its in-memory store, as
-/// [`fake_graph_storage`], where the platform says every tenant is `state`;
-/// and the store, for graph storage's offboarding worker.
+/// [`fake_graph_storage`], where the platform says every tenant is deleted,
+/// or every tenant is live; and the store, for graph storage's offboarding
+/// worker. Only this module sees graph storage's own offboarding types.
 pub fn fake_graph_storage_where_every_tenant_is(
-    state: graph_storage::domain::offboarding::TenantState,
+    deleted: bool,
 ) -> (
     Arc<dyn graph_storage_sdk::GraphStorageClientV1>,
     Arc<graph_storage::infra::fake_store::FakeGraphStore>,
 ) {
-    fake_graph_storage_under(state, Arc::new(AllowInOwnTenant))
+    fake_graph_storage_under(deleted, Arc::new(AllowInOwnTenant))
 }
 
 /// The same, with the policy service `policy`.
 pub fn fake_graph_storage_under(
-    state: graph_storage::domain::offboarding::TenantState,
+    deleted: bool,
     policy: Arc<dyn AuthZResolverApi>,
 ) -> (
     Arc<dyn graph_storage_sdk::GraphStorageClientV1>,
@@ -1170,7 +1171,11 @@ pub fn fake_graph_storage_under(
             8 * 1024,
         ),
     )
-    .with_tenant_directory(Arc::new(EveryTenant(state)));
+    .with_tenant_directory(Arc::new(EveryTenant(if deleted {
+        graph_storage::domain::offboarding::TenantState::Deleted
+    } else {
+        graph_storage::domain::offboarding::TenantState::Live
+    })));
     (
         Arc::new(GraphStorageLocalClient::new(Arc::new(services))),
         store,
@@ -2092,6 +2097,8 @@ pub struct MemoryDeletionStore {
     pub tenant_rows: std::sync::Mutex<crate::domain::tenant_exit::TenantRows>,
     /// Fail every emptying of a tenant.
     pub emptying_down: std::sync::atomic::AtomicBool,
+    /// Fail every forgetting of a tenant.
+    pub forgetting_down: std::sync::atomic::AtomicBool,
     /// The tenants tenant exit stopped keeping, in order, each with the
     /// scope it was forgotten under.
     pub forgotten: std::sync::Mutex<Vec<(Uuid, AccessScope)>>,
@@ -2300,13 +2307,25 @@ impl crate::domain::tenant_exit::TenantTables for MemoryDeletionStore {
         Ok(*self.tenant_rows.lock().unwrap())
     }
 
-    async fn forget_tenant(&self, scope: &AccessScope, tenant_id: Uuid) -> Result<(), DomainError> {
-        self.tenants.lock().unwrap().remove(&tenant_id);
-        self.forgotten
-            .lock()
-            .unwrap()
-            .push((tenant_id, scope.clone()));
-        Ok(())
+    async fn forget_tenant(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+    ) -> Result<bool, DomainError> {
+        if self
+            .forgetting_down
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(DomainError::Unavailable("the database is down".to_owned()));
+        }
+        let kept = self.tenants.lock().unwrap().remove(&tenant_id);
+        if kept {
+            self.forgotten
+                .lock()
+                .unwrap()
+                .push((tenant_id, scope.clone()));
+        }
+        Ok(kept)
     }
 }
 

@@ -544,16 +544,21 @@ impl TenantTables for DeletionTables {
         // @cpt-end:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-rows
     }
 
-    async fn forget_tenant(&self, scope: &AccessScope, tenant_id: Uuid) -> Result<(), DomainError> {
+    async fn forget_tenant(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+    ) -> Result<bool, DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-forget
         let conn = self.db.conn().map_err(DomainError::from)?;
-        TenantEntity::delete_many()
+        let forgotten = TenantEntity::delete_many()
             .secure()
             .scope_with(scope)
             .filter(Condition::all().add(tenants::Column::TenantId.eq(tenant_id)))
             .exec(&conn)
             .await
-            .map_err(map_scope_error)?;
+            .map_err(map_scope_error)?
+            .rows_affected;
         // Only this instance's cache: another instance that noted the tenant
         // does not note it again. Nothing needs it to: a record that lands
         // later leaves a row the job finds the tenant by, and graph storage
@@ -563,7 +568,7 @@ impl TenantTables for DeletionTables {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&tenant_id);
-        Ok(())
+        Ok(forgotten > 0)
         // @cpt-end:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-forget
     }
 }

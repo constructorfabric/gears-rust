@@ -101,32 +101,62 @@ pub trait TenantTables: Send + Sync {
     ) -> Result<TenantRows, DomainError>;
 
     /// Stop keeping `tenant_id` among the tenants Construct holds data for,
-    /// so the job no longer checks it. A record that lands later leaves a
-    /// row the job finds the tenant by again; a profile write leaves none,
-    /// as graph storage refuses every write of an offboarded tenant.
+    /// so the job no longer checks it; whether it was kept. A record that
+    /// lands later leaves a row the job finds the tenant by again; a profile
+    /// write leaves none, as graph storage refuses every write of an
+    /// offboarded tenant.
     ///
     /// # Errors
     ///
     /// When the store cannot be reached.
-    async fn forget_tenant(&self, scope: &AccessScope, tenant_id: Uuid) -> Result<(), DomainError>;
+    async fn forget_tenant(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+    ) -> Result<bool, DomainError>;
+}
+
+/// Why tenant exit left a tenant alone.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kept {
+    /// The tenant exists and is not deleted.
+    Present,
+    /// The resolver does not know the tenant: nothing says it was deleted.
+    Unknown,
 }
 
 /// How one run of tenant exit for a tenant ended.
 #[domain_model]
 #[derive(Debug)]
 pub enum Exit {
-    /// The tenant is not deleted: present, or unknown to the resolver.
-    /// Nothing is removed.
-    Kept(TenantStatus),
+    /// The tenant is not deleted, or the resolver does not know it. Nothing
+    /// is removed.
+    Kept(Kept),
     /// Graph storage is removing the graph and Construct's rows are gone.
     /// The next run asks again.
     UnderWay,
     /// Everything is gone, and the tenant is no longer kept.
     Done,
+    /// The tenant had exited before: nothing was left to remove. A tenant
+    /// the deployment's config names stays checked after its exit.
+    Gone,
     /// The tenant is deleted, but this run stopped: graph storage or the
     /// store failed. Nothing that failed is left half done for good, as every
     /// step can run again.
     Stopped(DomainError),
+}
+
+impl Exit {
+    /// Whether the platform has deleted the tenant, so retention leaves it
+    /// alone. Every outcome is named, so a new one has to say.
+    #[must_use]
+    pub fn tenant_deleted(&self) -> bool {
+        match self {
+            Self::Kept(_) => false,
+            Self::UnderWay | Self::Done | Self::Gone | Self::Stopped(_) => true,
+        }
+    }
 }
 /// The collaborators of tenant exit.
 #[domain_model]
@@ -171,9 +201,10 @@ impl TenantExit {
     pub async fn run(&self, tenant_id: Uuid) -> Result<Exit, DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-status
         let (construct, scope) = self.ports.contexts.for_tenant(tenant_id).await?;
-        let status = self.ports.statuses.status(&construct, tenant_id).await?;
-        if status != TenantStatus::Deleted {
-            return Ok(Exit::Kept(status));
+        match self.ports.statuses.status(&construct, tenant_id).await? {
+            TenantStatus::Deleted => {}
+            TenantStatus::Present => return Ok(Exit::Kept(Kept::Present)),
+            TenantStatus::Unknown => return Ok(Exit::Kept(Kept::Unknown)),
         }
         // @cpt-end:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-status
         Ok(self
@@ -211,11 +242,20 @@ impl TenantExit {
             return Ok(Exit::UnderWay);
         }
         // @cpt-begin:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-forget
-        self.ports.tables.forget_tenant(scope, tenant_id).await?;
-        self.ports
-            .events
-            .record(DeletionEvent::TenantExited { tenant_id });
-        Ok(Exit::Done)
+        // The exit is recorded once, by the run that stops keeping the
+        // tenant; a tenant the config names is checked again after it, and
+        // finds nothing left.
+        if self.ports.tables.forget_tenant(scope, tenant_id).await? {
+            self.ports
+                .events
+                .record(DeletionEvent::TenantExited { tenant_id });
+            return Ok(Exit::Done);
+        }
+        Ok(if rows == TenantRows::default() {
+            Exit::Gone
+        } else {
+            Exit::Done
+        })
         // @cpt-end:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-forget
     }
 }

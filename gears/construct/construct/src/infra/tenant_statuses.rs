@@ -96,10 +96,13 @@ fn status_of(
     answer: Result<tenant_resolver_sdk::TenantInfo, TenantResolverError>,
 ) -> Result<TenantStatus, DomainError> {
     match answer {
-        Ok(info) if info.status == tenant_resolver_sdk::TenantStatus::Deleted => {
-            Ok(TenantStatus::Deleted)
-        }
-        Ok(_) => Ok(TenantStatus::Present),
+        // Every status is named, so one the platform adds has to say whether
+        // it starts an exit.
+        Ok(info) => Ok(match info.status {
+            tenant_resolver_sdk::TenantStatus::Deleted => TenantStatus::Deleted,
+            tenant_resolver_sdk::TenantStatus::Active
+            | tenant_resolver_sdk::TenantStatus::Suspended => TenantStatus::Present,
+        }),
         // Never existed, removed for good, or not shown to Construct: the
         // resolver does not say which, so nothing says it was deleted.
         Err(TenantResolverError::TenantNotFound { .. }) => Ok(TenantStatus::Unknown),
