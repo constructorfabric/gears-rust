@@ -71,7 +71,9 @@ impl PassthroughApi {
 #[non_exhaustive]
 pub struct PassthroughEndpoint {
     /// Provider path, relative to the route (e.g. `/v1/responses`). Only
-    /// `POST` is forwarded.
+    /// `POST` is forwarded. The model listing (`GET /v1/models`,
+    /// `GET /v1/models/{model_id}`) is not declared here: the core answers it
+    /// from Model Registry without calling the plugin.
     pub path: String,
     /// Whether the endpoint generates output: a metered endpoint gets a quota
     /// lease, an AI credit cost, and usage enrichment; a non-metered one (for
