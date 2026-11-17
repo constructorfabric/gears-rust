@@ -28,7 +28,7 @@ pub fn build_upstream_url(
         }
     };
 
-    let host_port = if is_default_port(scheme, endpoint.port) {
+    let host_port = if endpoint.is_standard_port() {
         endpoint.host.clone()
     } else {
         format!("{}:{}", endpoint.host, endpoint.port)
@@ -56,10 +56,6 @@ pub fn build_upstream_url(
     }
 
     Ok(url)
-}
-
-fn is_default_port(scheme: &str, port: u16) -> bool {
-    matches!((scheme, port), ("https" | "wss", 443) | ("http" | "ws", 80))
 }
 
 #[cfg(test)]
@@ -167,6 +163,24 @@ mod tests {
         };
         let url = build_upstream_url(&ep, "/api", "", &[]).unwrap();
         assert_eq!(url, "http://example.com/api");
+    }
+
+    /// A port is dropped only when it is the default for the endpoint's
+    /// scheme; `wt` defaults to 443 like `https`.
+    #[test]
+    fn port_kept_unless_scheme_default() {
+        let url = |scheme, port| {
+            let ep = Endpoint {
+                scheme,
+                host: "example.com".into(),
+                port,
+            };
+            build_upstream_url(&ep, "/api", "", &[]).unwrap()
+        };
+        assert_eq!(url(Scheme::Http, 443), "http://example.com:443/api");
+        assert_eq!(url(Scheme::Https, 80), "https://example.com:80/api");
+        assert_eq!(url(Scheme::Wss, 443), "wss://example.com/api");
+        assert_eq!(url(Scheme::Wt, 443), "https://example.com/api");
     }
 
     #[test]

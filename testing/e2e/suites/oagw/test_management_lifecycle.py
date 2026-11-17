@@ -77,6 +77,37 @@ async def test_create_minimal_upstream_returns_201(
         assert stored["enabled"] is True
 
 
+@pytest.mark.scenario("positive-2.1-create-minimal-http-upstream")
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("scheme", "port"), [("http", 80), ("https", 443)])
+async def test_omitted_port_defaults_per_scheme(
+    scheme, port, oagw_base_url, oagw_headers, mock_upstream, cleanup,
+):
+    """An endpoint without a port gets its scheme's default, 80 for `http`
+    and 443 for `https`, and is stored with it (#4979). The e2e config
+    allows `http` upstreams.
+    """
+    _ = mock_upstream
+    host = _unique_host()
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(
+            f"{oagw_base_url}/oagw/v1/upstreams",
+            headers=oagw_headers,
+            json={
+                "server": {"endpoints": [{"scheme": scheme, "host": host}]},
+                "protocol": HTTP_PROTOCOL_ID,
+            },
+        )
+        assert resp.status_code == 201, resp.text[:500]
+        created = cleanup.upstream(oagw_headers, resp.json())
+        expected = [{"scheme": scheme, "host": host, "port": port}]
+        assert created["server"]["endpoints"] == expected
+        assert created["alias"] == host
+
+        stored = (await _get(client, oagw_base_url, oagw_headers, "upstreams", created["id"])).json()
+        assert stored["server"]["endpoints"] == expected
+
+
 @pytest.mark.asyncio
 async def test_get_upstream_by_id(
     oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,

@@ -38,3 +38,13 @@ Content-Type: application/json
   "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1"
 }
 ```
+
+## Port omitted
+
+`port` may be left out; the endpoint gets its scheme's default, 80 for `http` and 443 for `https`, `wss`, `wt` and `grpc`. The response, and a later `GET`, carry the port:
+
+```json
+{ "server": { "endpoints": [ { "scheme": "http", "host": "plain.example.com" } ] }, "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1" }
+```
+
+returns `"endpoints": [ { "scheme": "http", "host": "plain.example.com", "port": 80 } ]` and `alias: "plain.example.com"` (`http` requires the gear option `allow_http_upstream`).

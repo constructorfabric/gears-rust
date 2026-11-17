@@ -491,7 +491,7 @@ OAGW processes headers in three categories:
 | Inbound Header | Rule |
 |---|---|
 | `X-OAGW-Target-Host` | Read during routing, then stripped |
-| `Host` | Replaced by upstream host |
+| `Host` | Replaced by upstream host, with `:port` unless the port is the scheme's default (`http` 80, others 443) |
 | `Connection` | Stripped, with every header any `Connection` field line names |
 | `Keep-Alive` | Stripped |
 | `Proxy-Authenticate` | Stripped |
@@ -571,7 +571,7 @@ Auth configuration references secrets via `secret_ref` (e.g., `cred://partner-op
 1. OAGW resolves `secret_ref` via `cred_store` API
 2. `cred_store` checks if secret is accessible to current tenant (own or shared by ancestor)
 3. If accessible → return secret material
-4. If not → return error, OAGW returns 401 Unauthorized
+4. If not → return error, OAGW returns 401 Unauthorized (500 `SecretNotFound` when the secret does not exist); the error and the logs name the auth config key, never the `secret_ref`
 
 Ancestor can share a secret with descendants via `cred_store` policies. Descendant can also use own secret with different `secret_ref`.
 

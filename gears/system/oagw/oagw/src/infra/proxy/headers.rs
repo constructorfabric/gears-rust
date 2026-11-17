@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::domain::error::DomainError;
-use crate::domain::model::{PassthroughMode, RequestHeaderRules, ResponseHeaderRules};
+use crate::domain::model::{Endpoint, PassthroughMode, RequestHeaderRules, ResponseHeaderRules};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use oagw_sdk::api::ErrorSource;
 use oagw_sdk::field;
@@ -399,12 +399,14 @@ pub fn validate_smuggling_headers(headers: &HeaderMap) -> Result<(), DomainError
     Ok(())
 }
 
-/// Set the Host header to match the upstream endpoint.
-pub fn set_host_header(headers: &mut HeaderMap, host: &str, port: u16) {
-    let host_value = if port == 443 || port == 80 {
-        host.to_string()
+/// Set the Host header to match the upstream endpoint. The port is left out
+/// only when it is the default for the endpoint's scheme (RFC 9110 §7.2):
+/// `http` on 443 or `https` on 80 keeps it.
+pub fn set_host_header(headers: &mut HeaderMap, endpoint: &Endpoint) {
+    let host_value = if endpoint.is_standard_port() {
+        endpoint.host.clone()
     } else {
-        format!("{host}:{port}")
+        format!("{}:{}", endpoint.host, endpoint.port)
     };
     if let Ok(v) = HeaderValue::from_str(&host_value) {
         headers.insert(http::header::HOST, v);
@@ -438,25 +440,10 @@ pub fn extract_client_ip(headers: &HeaderMap) -> Option<String> {
         .map(|ip| ip.to_string())
 }
 
-/// Convert an HTTP `HeaderMap` to a `HashMap<String, String>` for plugin contexts.
-///
-/// Non-UTF-8 header values are silently dropped (they cannot be represented as
-/// `String` and are rare in practice).
-pub fn header_map_to_hash_map(headers: &HeaderMap) -> HashMap<String, String> {
-    headers
-        .iter()
-        .filter_map(|(k, v)| {
-            v.to_str()
-                .ok()
-                .map(|s| (k.as_str().to_string(), s.to_string()))
-        })
-        .collect()
-}
-
 /// Convert an HTTP `HeaderMap` to a `Vec<(String, String)>` preserving multi-valued headers.
 ///
-/// Non-UTF-8 header values are silently dropped (they cannot be represented as
-/// `String` and are rare in practice).
+/// Values that are not visible ASCII (obs-text, non-UTF-8) are left out: they
+/// cannot be represented as `String`. Plugins do not see them.
 pub fn header_map_to_vec(headers: &HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()
@@ -468,54 +455,68 @@ pub fn header_map_to_vec(headers: &HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Convert a `Vec<(String, String)>` back to an HTTP `HeaderMap`, preserving multi-values.
+/// Apply a plugin's edit of the string view of `headers` to `headers`.
 ///
-/// Entries with invalid header names or values are logged at `debug` level and
-/// dropped — this can happen when a plugin injects malformed headers.
-pub fn vec_to_header_map(headers: &[(String, String)]) -> HeaderMap {
-    let mut out = HeaderMap::new();
-    for (k, v) in headers {
-        match (
-            HeaderName::from_bytes(k.as_bytes()),
-            HeaderValue::from_str(v),
-        ) {
-            (Ok(name), Ok(val)) => {
-                out.append(name, val);
+/// `before` is [`header_map_to_vec`] of `headers`, `after` is the view the
+/// plugin left. Only names whose lines differ between the two change: all
+/// their lines, including ones the plugin could not see, are replaced by the
+/// new ones (none: the header is removed), keeping the sensitive flag if any
+/// old line had it. Every other line keeps its bytes, its position among the
+/// lines of its name and its sensitive flag, so a value that is not visible
+/// ASCII survives a plugin that does not touch its name. A name or value from
+/// the plugin that is not a valid header is dropped.
+///
+/// Order across names is not kept (`HeaderMap::remove` moves another name into
+/// the freed slot; HTTP gives that order no meaning). Replaced names are
+/// re-added in the order they first appear in `after`, then removed names are
+/// processed in `before` order, so the result does not vary between runs.
+pub fn apply_header_edits(
+    headers: &mut HeaderMap,
+    before: &[(String, String)],
+    after: &[(String, String)],
+) {
+    /// Lines grouped by lowercased name; names in order of first appearance.
+    fn by_name(lines: &[(String, String)]) -> (Vec<String>, HashMap<String, Vec<&str>>) {
+        let mut order = Vec::new();
+        let mut out: HashMap<String, Vec<&str>> = HashMap::new();
+        for (name, value) in lines {
+            let name = name.to_ascii_lowercase();
+            if !out.contains_key(&name) {
+                order.push(name.clone());
             }
-            _ => {
-                tracing::debug!(
-                    header_name = %k,
-                    "plugin-mutated header dropped: invalid name or value"
-                );
-            }
+            out.entry(name).or_default().push(value.as_str());
+        }
+        (order, out)
+    }
+    let (before_order, before) = by_name(before);
+    let (after_order, after) = by_name(after);
+    let removed = before_order
+        .iter()
+        .filter(|name| !after.contains_key(*name));
+    for name in after_order.iter().chain(removed) {
+        let old = before.get(name).map_or(&[][..], Vec::as_slice);
+        let new = after.get(name).map_or(&[][..], Vec::as_slice);
+        if old == new {
+            continue;
+        }
+        let Ok(header) = HeaderName::from_bytes(name.as_bytes()) else {
+            tracing::debug!(header_name = %name, "plugin header dropped: invalid name");
+            continue;
+        };
+        let sensitive = headers
+            .get_all(&header)
+            .iter()
+            .any(HeaderValue::is_sensitive);
+        headers.remove(&header);
+        for value in new {
+            let Ok(mut value) = HeaderValue::from_str(value) else {
+                tracing::debug!(header_name = %header, "plugin header dropped: invalid value");
+                continue;
+            };
+            value.set_sensitive(sensitive);
+            headers.append(&header, value);
         }
     }
-    out
-}
-
-/// Convert a `HashMap<String, String>` back to an HTTP `HeaderMap`.
-///
-/// Entries with invalid header names or values are logged at `debug` level and
-/// dropped — this can happen when a plugin injects malformed headers.
-pub fn hash_map_to_header_map(headers: &HashMap<String, String>) -> HeaderMap {
-    let mut out = HeaderMap::new();
-    for (k, v) in headers {
-        match (
-            HeaderName::from_bytes(k.as_bytes()),
-            HeaderValue::from_str(v),
-        ) {
-            (Ok(name), Ok(val)) => {
-                out.insert(name, val);
-            }
-            _ => {
-                tracing::debug!(
-                    header_name = %k,
-                    "plugin-mutated header dropped: invalid name or value"
-                );
-            }
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -589,12 +590,77 @@ mod tests {
         assert_eq!(headers.get("x-custom").unwrap(), "keep-me");
     }
 
+    /// An unchanged view leaves the map as it was; a changed name keeps the
+    /// sensitive flag; a name or value that is not a valid header is dropped.
+    #[test]
+    fn header_edits_apply_only_changed_names() {
+        let raw = HeaderValue::from_bytes(b"caf\xe9").unwrap();
+        let mut secret = HeaderValue::from_static("Bearer a");
+        secret.set_sensitive(true);
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", secret);
+        headers.append("x-multi", HeaderValue::from_static("a"));
+        headers.append("x-multi", raw.clone());
+        let before = header_map_to_vec(&headers);
+        assert_eq!(before.len(), 2, "{before:?}");
+
+        // Same lines, other order across names: nothing changes.
+        let mut after = before.clone();
+        after.reverse();
+        apply_header_edits(&mut headers, &before, &after);
+        let multi: Vec<_> = headers.get_all("x-multi").iter().collect();
+        assert_eq!(multi, [&HeaderValue::from_static("a"), &raw]);
+
+        let after = vec![
+            ("Authorization".to_owned(), "Bearer b".to_owned()),
+            ("x-multi".to_owned(), "a".to_owned()),
+            ("x-multi".to_owned(), "bad\r\nvalue".to_owned()),
+            ("bad name".to_owned(), "v".to_owned()),
+        ];
+        apply_header_edits(&mut headers, &before, &after);
+        assert_eq!(headers["authorization"], "Bearer b");
+        assert!(headers["authorization"].is_sensitive());
+        let multi: Vec<_> = headers.get_all("x-multi").iter().collect();
+        assert_eq!(multi, ["a"]);
+        assert_eq!(headers.len(), 2, "{headers:?}");
+    }
+
+    /// Replaced and added names go out in the order the plugin listed them,
+    /// not in hash order.
+    #[test]
+    fn header_edits_follow_plugin_order() {
+        let names = ["x-e", "x-a", "x-d", "x-b", "x-c", "x-f", "x-h", "x-g"];
+        let mut headers = HeaderMap::new();
+        headers.insert("x-keep", HeaderValue::from_static("k"));
+        let before = header_map_to_vec(&headers);
+        let mut after = before.clone();
+        after.extend(names.iter().map(|n| ((*n).to_owned(), "v".to_owned())));
+
+        apply_header_edits(&mut headers, &before, &after);
+
+        let out: Vec<_> = headers.keys().map(HeaderName::as_str).collect();
+        let mut expected = vec!["x-keep"];
+        expected.extend(names);
+        assert_eq!(out, expected);
+    }
+
+    fn endpoint(scheme: crate::domain::model::Scheme, port: u16) -> Endpoint {
+        Endpoint {
+            scheme,
+            host: "api.openai.com".into(),
+            port,
+        }
+    }
+
     #[test]
     fn host_replaced() {
         let mut headers = HeaderMap::new();
         headers.insert(http::header::HOST, "original.com".parse().unwrap());
 
-        set_host_header(&mut headers, "api.openai.com", 443);
+        set_host_header(
+            &mut headers,
+            &endpoint(crate::domain::model::Scheme::Https, 443),
+        );
 
         assert_eq!(headers.get(http::header::HOST).unwrap(), "api.openai.com");
     }
@@ -602,12 +668,41 @@ mod tests {
     #[test]
     fn host_nonstandard_port() {
         let mut headers = HeaderMap::new();
-        set_host_header(&mut headers, "api.openai.com", 8443);
+        set_host_header(
+            &mut headers,
+            &endpoint(crate::domain::model::Scheme::Https, 8443),
+        );
 
         assert_eq!(
             headers.get(http::header::HOST).unwrap(),
             "api.openai.com:8443"
         );
+    }
+
+    /// The port is left out only when it is the default for the scheme:
+    /// `http` on 443 and `https` on 80 keep it (#4979).
+    #[test]
+    fn host_port_is_the_scheme_default_only() {
+        use crate::domain::model::Scheme;
+        let cases = [
+            (Scheme::Http, 80, "api.openai.com"),
+            (Scheme::Http, 443, "api.openai.com:443"),
+            (Scheme::Https, 443, "api.openai.com"),
+            (Scheme::Https, 80, "api.openai.com:80"),
+            (Scheme::Wss, 443, "api.openai.com"),
+            (Scheme::Wss, 80, "api.openai.com:80"),
+            (Scheme::Grpc, 443, "api.openai.com"),
+            (Scheme::Grpc, 80, "api.openai.com:80"),
+        ];
+        for (scheme, port, expected) in cases {
+            let mut headers = HeaderMap::new();
+            set_host_header(&mut headers, &endpoint(scheme, port));
+            assert_eq!(
+                headers.get(http::header::HOST).unwrap(),
+                expected,
+                "{scheme:?}:{port}"
+            );
+        }
     }
 
     /// A request may repeat `Connection`; the names every line nominates go

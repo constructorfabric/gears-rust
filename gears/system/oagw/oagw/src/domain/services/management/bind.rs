@@ -1,6 +1,6 @@
 use crate::domain::error::{DeniedOn, DomainError};
 use crate::domain::model::Upstream;
-use crate::domain::plugin::credentials::CredentialRef;
+use crate::domain::plugin::credentials::{CredentialRef, credstore_error_kind};
 
 use super::authz::BIND_UPSTREAM_RESOURCE;
 use authz_resolver_sdk::PolicyEnforcer;
@@ -282,23 +282,6 @@ fn credstore_outage(ctx: &SecurityContext, e: &credstore_sdk::CredStoreError) ->
     );
     DomainError::Internal {
         message: format!("credential validation unavailable: {kind}"),
-    }
-}
-
-/// What kind of failure `e` is. The credential store's own text is not used:
-/// it may quote the `secret_ref`, which never goes to logs or errors (F0008).
-fn credstore_error_kind(e: &credstore_sdk::CredStoreError) -> &'static str {
-    use credstore_sdk::CredStoreError as E;
-    match e {
-        E::InvalidSecretRef { .. } => "invalid secret reference",
-        E::AccessDenied => "access denied",
-        E::NotFound => "secret not found",
-        E::Conflict => "secret already exists",
-        E::NoPluginAvailable => "no plugin available",
-        E::ServiceUnavailable { .. } => "service unavailable",
-        E::UnsupportedTransition { .. } => "unsupported sharing transition",
-        E::TypeViolation { .. } => "secret type violation",
-        E::Internal(_) => "internal error",
     }
 }
 

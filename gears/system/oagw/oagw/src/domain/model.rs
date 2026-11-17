@@ -43,6 +43,18 @@ pub enum Scheme {
     Grpc,
 }
 
+impl Scheme {
+    /// The port an endpoint of this scheme uses when none is given:
+    /// 80 for `http`, 443 for the TLS schemes.
+    #[must_use]
+    pub fn default_port(self) -> u16 {
+        match self {
+            Self::Http => 80,
+            Self::Https | Self::Wss | Self::Wt | Self::Grpc => 443,
+        }
+    }
+}
+
 /// A single upstream endpoint (scheme + host + port).
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,10 +75,7 @@ impl Endpoint {
     /// - HTTPS / WSS / WT / gRPC: 443
     #[must_use]
     pub fn is_standard_port(&self) -> bool {
-        match self.scheme {
-            Scheme::Http => self.port == 80,
-            Scheme::Https | Scheme::Wss | Scheme::Wt | Scheme::Grpc => self.port == 443,
-        }
+        self.port == self.scheme.default_port()
     }
 
     /// The normalized host: brackets stripped (IPv6), lowercased, trailing dots stripped.

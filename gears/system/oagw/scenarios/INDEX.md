@@ -30,7 +30,7 @@ To proxy requests to an external service through OAGW, follow these steps in ord
 
 Create an upstream pointing to your external service.
 
-- [Create minimal HTTP upstream](management-api/upstreams/positive-2.1-create-minimal-http-upstream.md) — `POST /upstreams` with host, scheme, port. Auto-generates alias from hostname.
+- [Create minimal HTTP upstream](management-api/upstreams/positive-2.1-create-minimal-http-upstream.md) — `POST /upstreams` with host, scheme, port (omitted: 80 for `http`, 443 otherwise). Auto-generates alias from hostname.
 - For non-standard ports: [Alias auto-generation](management-api/upstreams/positive-2.2-alias-auto-generation-non-standard-port.md)
 - For multiple endpoints: [Multi-endpoint load balancing](management-api/upstreams/positive-2.10-multi-endpoint-load-balancing-distributes-requests.md)
 - See → [Upstream management](#upstream-management)
@@ -78,7 +78,7 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 
 #### Create a minimal HTTP upstream (single endpoint)
 - **Scenario**: [positive-2.1-create-minimal-http-upstream.md](management-api/upstreams/positive-2.1-create-minimal-http-upstream.md)
-- **Mechanism**: `POST /upstreams` with server endpoints and protocol. Returns `201` with auto-generated alias and `enabled=true` default. Alias follows hostname rules for standard ports.
+- **Mechanism**: `POST /upstreams` with server endpoints and protocol. Returns `201` with auto-generated alias and `enabled=true` default. Alias follows hostname rules for standard ports. An omitted port is the scheme's default (80 for `http`, 443 otherwise) and is stored and returned.
 
 #### Alias auto-generation for non-standard port
 - **Scenario**: [positive-2.2-alias-auto-generation-non-standard-port.md](management-api/upstreams/positive-2.2-alias-auto-generation-non-standard-port.md)
@@ -206,11 +206,11 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 
 #### Hop-by-hop headers stripped
 - **Scenario**: [positive-7.2-hop-hop-headers-stripped.md](proxy-api/request-transforms/positive-7.2-hop-hop-headers-stripped.md)
-- **Mechanism**: `Connection`, `Upgrade`, `Transfer-Encoding`, `TE`, etc. do not reach upstream unless explicitly allowed by protocol handler. Under `passthrough: all`, client forwarding and override headers (`Forwarded`, `Via`, `X-Forwarded-*`, `X-Real-IP`, ...) are not forwarded unless the allowlist names them.
+- **Mechanism**: `Connection`, `Upgrade`, `Transfer-Encoding`, `TE`, etc. do not reach upstream unless explicitly allowed by protocol handler. Under `passthrough: all`, client forwarding and override headers (`Forwarded`, `Via`, `X-Forwarded-*`, `X-Real-IP`, ...) are not forwarded unless the allowlist names them. With an auth plugin, repeated and non-UTF-8 client headers reach the upstream unchanged; only the plugin's header is replaced. A transform plugin rewrites only the header names it changes; the credential and other lines keep their bytes and sensitive flag, request and response.
 
 #### Host header replaced by upstream host
 - **Scenario**: [positive-7.3-host-header-replaced-upstream-host.md](proxy-api/request-transforms/positive-7.3-host-header-replaced-upstream-host.md)
-- **Mechanism**: Upstream sees correct `Host` header. Prevents host header injection.
+- **Mechanism**: Upstream sees correct `Host` header. Prevents host header injection. The port is added unless it is the scheme's default (`http` 80, others 443), so `http:443` and `https:80` keep it.
 
 #### Upstream headers config applies simple transformations
 - **Scenario**: [positive-7.5-upstream-headers-config-applies-simple-transformations.md](proxy-api/request-transforms/positive-7.5-upstream-headers-config-applies-simple-transformations.md)
@@ -678,7 +678,7 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 
 #### Secret access control via cred_store → 401/500
 - **Scenario**: [negative-9.7-secret-access-control-cred-store.md](proxy-api/authentication/negative-9.7-secret-access-control-cred-store.md)
-- **What happens**: If `cred_store` denies access, proxy returns `401 AuthenticationFailed`. A missing secret is rejected when the upstream is written (`400 failed_precondition` naming the key); one deleted after the write returns `500 SecretNotFound`.
+- **What happens**: If `cred_store` denies access, proxy returns `401 AuthenticationFailed`. A missing secret is rejected when the upstream is written (`400 failed_precondition` naming the key); one deleted after the write returns `500 SecretNotFound`. Neither the response nor the server log contains the reference; they name the auth config key.
 
 #### Descendant override permissions enforced → blocked
 - **Scenario**: [negative-9.9-descendant-override-permissions-enforced.md](proxy-api/authentication/negative-9.9-descendant-override-permissions-enforced.md)

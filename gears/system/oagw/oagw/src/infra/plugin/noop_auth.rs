@@ -21,25 +21,19 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn noop_leaves_headers_unchanged() {
+    async fn noop_sets_no_headers() {
         let plugin = NoopAuthPlugin;
-        let mut headers = HashMap::new();
-        headers.insert("x-existing".to_string(), "value".to_string());
-
-        let mut ctx = AuthContext {
-            headers: headers.clone(),
-            config: HashMap::new(),
-            security_context: SecurityContext::builder()
+        let mut ctx = AuthContext::new(
+            HashMap::new(),
+            SecurityContext::builder()
                 .subject_tenant_id(Uuid::nil())
                 .subject_id(Uuid::nil())
                 .build()
                 .unwrap(),
-        };
+        );
 
         plugin.authenticate(&mut ctx).await.unwrap();
 
-        // Headers should be identical.
-        assert_eq!(ctx.headers.len(), 1);
-        assert_eq!(ctx.headers.get("x-existing").unwrap(), "value");
+        assert!(ctx.set_headers.is_empty());
     }
 }

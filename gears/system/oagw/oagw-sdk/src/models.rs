@@ -44,21 +44,36 @@ pub struct Endpoint {
     pub port: u16,
 }
 
+impl Scheme {
+    /// The port an endpoint of this scheme uses when none is given:
+    /// 80 for `http`, 443 for the TLS schemes.
+    #[must_use]
+    pub fn default_port(self) -> u16 {
+        match self {
+            Self::Http => 80,
+            Self::Https | Self::Wss | Self::Wt | Self::Grpc => 443,
+        }
+    }
+}
+
 impl Endpoint {
     /// Generate the alias contribution for this endpoint.
-    /// Standard ports (80, 443) are omitted; non-standard ports are appended as `:port`.
+    /// The scheme's default port is omitted; any other port is appended as
+    /// `:port` (`https` on 80 keeps it).
     #[must_use]
     pub fn alias_contribution(&self) -> String {
-        if is_standard_port(self.port) {
+        if self.is_standard_port() {
             self.host.clone()
         } else {
             format!("{}:{}", self.host, self.port)
         }
     }
-}
 
-fn is_standard_port(port: u16) -> bool {
-    port == 80 || port == 443
+    /// Whether the port is the default for the scheme.
+    #[must_use]
+    pub fn is_standard_port(&self) -> bool {
+        self.port == self.scheme.default_port()
+    }
 }
 
 /// Container for upstream server endpoints.
@@ -841,13 +856,38 @@ mod tests {
     }
 
     #[test]
-    fn alias_port_80_omitted() {
+    fn alias_http_port_80_omitted() {
         let ep = Endpoint {
-            scheme: Scheme::Https,
+            scheme: Scheme::Http,
             host: "example.com".into(),
             port: 80,
         };
         assert_eq!(ep.alias_contribution(), "example.com");
+    }
+
+    /// Only the scheme's own default port is dropped (#4979).
+    #[test]
+    fn alias_keeps_the_other_schemes_default_port() {
+        let https_80 = Endpoint {
+            scheme: Scheme::Https,
+            host: "example.com".into(),
+            port: 80,
+        };
+        assert_eq!(https_80.alias_contribution(), "example.com:80");
+        let http_443 = Endpoint {
+            scheme: Scheme::Http,
+            host: "example.com".into(),
+            port: 443,
+        };
+        assert_eq!(http_443.alias_contribution(), "example.com:443");
+    }
+
+    #[test]
+    fn default_port_per_scheme() {
+        assert_eq!(Scheme::Http.default_port(), 80);
+        for scheme in [Scheme::Https, Scheme::Wss, Scheme::Wt, Scheme::Grpc] {
+            assert_eq!(scheme.default_port(), 443, "{scheme:?}");
+        }
     }
 
     #[test]

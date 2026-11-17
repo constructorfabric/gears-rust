@@ -21,6 +21,15 @@ import logging
 # Request/response helpers
 # ---------------------------------------------------------------------------
 
+class _Headers(dict):
+    """Request headers by lowercase name (the last line wins), plus every
+    line in arrival order in ``lines`` so a repeated header can be seen."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lines: list[tuple[str, str]] = []
+
+
 async def _read_request(reader: asyncio.StreamReader) -> tuple[str, str, dict, bytes]:
     """Parse a minimal HTTP/1.1 request from the stream."""
     header_data = b""
@@ -37,11 +46,12 @@ async def _read_request(reader: asyncio.StreamReader) -> tuple[str, str, dict, b
     method = parts[0] if len(parts) > 0 else "GET"
     path = parts[1] if len(parts) > 1 else "/"
 
-    headers: dict[str, str] = {}
+    headers = _Headers()
     for line in lines[1:]:
         if ":" in line:
             k, _, v = line.partition(":")
             headers[k.strip().lower()] = v.strip()
+            headers.lines.append((k.strip().lower(), v.strip()))
 
     if "chunked" in headers.get("transfer-encoding", "").lower():
         return method, path, headers, await _read_chunked(reader, body_start)
@@ -342,6 +352,12 @@ async def _handle(method: str, target: str, headers: dict, body: bytes, writer: 
             "query": query,
             "headers": headers,
             "body": body.decode("utf-8", errors="replace"),
+        }))
+
+    # POST /echo-lines — every request header line, repeated ones included
+    elif method == "POST" and path == "/echo-lines":
+        writer.write(_json_response({
+            "header_lines": [[k, v] for k, v in getattr(headers, "lines", headers.items())],
         }))
 
     # POST /sse/events — spaced events carrying every SSE field

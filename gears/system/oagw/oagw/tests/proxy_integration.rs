@@ -210,6 +210,295 @@ async fn proxy_injects_auth_header() {
     assert_eq!(auth_header, "Bearer sk-test123");
 }
 
+// 7.2: with an auth plugin, a header the client repeats reaches the upstream
+// once per line, and the client's own line of the plugin's header is
+// replaced (#4982).
+#[tokio::test]
+async fn proxy_auth_plugin_keeps_repeated_headers() {
+    let mut guard = MockGuard::new();
+    guard.mock(
+        "GET",
+        "/v1/multi",
+        MockResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: MockBody::Json(json!({"ok": true})),
+        },
+    );
+
+    let h = AppHarness::builder()
+        .with_credentials(vec![("cred://openai-key".into(), "sk-test123".into())])
+        .build()
+        .await;
+    let ctx = h.security_context().clone();
+
+    let upstream = h
+        .facade()
+        .create_upstream(
+            ctx.clone(),
+            CreateUpstreamRequest::builder(
+                Server {
+                    endpoints: vec![Endpoint {
+                        scheme: Scheme::Http,
+                        host: "127.0.0.1".into(),
+                        port: h.mock_port(),
+                    }],
+                },
+                HTTP_PROTOCOL_ID,
+            )
+            .alias("auth-multi-test")
+            .headers(HeadersConfig {
+                request: Some(RequestHeaderRules {
+                    passthrough: PassthroughMode::All,
+                    ..Default::default()
+                }),
+                response: None,
+            })
+            .auth(oagw_sdk::AuthConfig {
+                plugin_type: APIKEY_AUTH_PLUGIN_ID.into(),
+                sharing: SharingMode::Private,
+                config: Some(
+                    [
+                        ("header".into(), "authorization".into()),
+                        ("prefix".into(), "Bearer ".into()),
+                        ("secret_ref".into(), "cred://openai-key".into()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+            })
+            .build(),
+        )
+        .await
+        .unwrap();
+
+    h.facade()
+        .create_route(
+            ctx.clone(),
+            CreateRouteRequest::builder(
+                upstream.id,
+                MatchRules {
+                    http: Some(HttpMatch {
+                        methods: vec![HttpMethod::Get],
+                        path: guard.path("/v1/multi"),
+                        query_allowlist: vec![],
+                        path_suffix_mode: PathSuffixMode::Disabled,
+                    }),
+                    grpc: None,
+                },
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+
+    let req = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("/auth-multi-test{}", guard.path("/v1/multi")))
+        .header("x-multi", "a")
+        .header("x-multi", "b")
+        .header(http::header::AUTHORIZATION, "Bearer client-token")
+        .body(Body::Empty)
+        .unwrap();
+    let response = h.facade().proxy_request(ctx, req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let recorded = guard.recorded_requests().await;
+    assert_eq!(recorded.len(), 1);
+    let values = |name: &str| -> Vec<&str> {
+        recorded[0]
+            .headers
+            .iter()
+            .filter(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+            .collect()
+    };
+    assert_eq!(values("x-multi"), ["a", "b"]);
+    assert_eq!(values("authorization"), ["Bearer sk-test123"]);
+}
+
+/// An upstream on the mock with apikey auth reading `cred://openai-key`,
+/// passthrough of all request headers and the request_id transform bound,
+/// and a `GET` route on `path`.
+async fn setup_auth_and_transform(h: &AppHarness, guard: &MockGuard, alias: &str, path: &str) {
+    let ctx = h.security_context().clone();
+    let upstream = h
+        .facade()
+        .create_upstream(
+            ctx.clone(),
+            CreateUpstreamRequest::builder(
+                Server {
+                    endpoints: vec![Endpoint {
+                        scheme: Scheme::Http,
+                        host: "127.0.0.1".into(),
+                        port: h.mock_port(),
+                    }],
+                },
+                HTTP_PROTOCOL_ID,
+            )
+            .alias(alias)
+            .headers(HeadersConfig {
+                request: Some(RequestHeaderRules {
+                    passthrough: PassthroughMode::All,
+                    ..Default::default()
+                }),
+                response: None,
+            })
+            .auth(oagw_sdk::AuthConfig {
+                plugin_type: APIKEY_AUTH_PLUGIN_ID.into(),
+                sharing: SharingMode::Private,
+                config: Some(
+                    [
+                        ("header".into(), "authorization".into()),
+                        ("prefix".into(), "Bearer ".into()),
+                        ("secret_ref".into(), "cred://openai-key".into()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+            })
+            .plugins(PluginsConfig {
+                sharing: SharingMode::Private,
+                items: vec![PluginBinding {
+                    plugin_ref: REQUEST_ID_TRANSFORM_PLUGIN_ID.to_string(),
+                    config: Default::default(),
+                }],
+            })
+            .build(),
+        )
+        .await
+        .unwrap();
+
+    h.facade()
+        .create_route(
+            ctx,
+            CreateRouteRequest::builder(
+                upstream.id,
+                MatchRules {
+                    http: Some(HttpMatch {
+                        methods: vec![HttpMethod::Get],
+                        path: guard.path(path),
+                        query_allowlist: vec![],
+                        path_suffix_mode: PathSuffixMode::Disabled,
+                    }),
+                    grpc: None,
+                },
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+}
+
+// 7.2: a request transform applies only its own change. The credential the
+// auth plugin set (an obs-text value here), repeated client headers and a
+// non-UTF-8 client value reach the upstream as before the transform.
+#[tokio::test]
+async fn proxy_transform_keeps_auth_and_client_headers() {
+    let mut guard = MockGuard::new();
+    guard.mock(
+        "GET",
+        "/v1/transform-multi",
+        MockResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: MockBody::Json(json!({"ok": true})),
+        },
+    );
+    let h = AppHarness::builder()
+        .with_credentials(vec![("cred://openai-key".into(), "sk-café".into())])
+        .build()
+        .await;
+    setup_auth_and_transform(&h, &guard, "auth-transform-test", "/v1/transform-multi").await;
+
+    let req = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!(
+            "/auth-transform-test{}",
+            guard.path("/v1/transform-multi")
+        ))
+        .header("x-multi", "a")
+        .header("x-multi", "b")
+        .header("x-raw", http::HeaderValue::from_bytes(b"caf\xe9").unwrap())
+        .header(http::header::AUTHORIZATION, "Bearer client-token")
+        .body(Body::Empty)
+        .unwrap();
+    let response = h
+        .facade()
+        .proxy_request(h.security_context().clone(), req)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let recorded = guard.recorded_requests().await;
+    assert_eq!(recorded.len(), 1);
+    let values = |name: &str| -> Vec<&str> {
+        recorded[0]
+            .headers
+            .iter()
+            .filter(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+            .collect()
+    };
+    assert_eq!(values("authorization"), ["Bearer sk-café"]);
+    assert_eq!(values("x-multi"), ["a", "b"]);
+    // The mock records values lossily: 0xE9 alone is not UTF-8.
+    assert_eq!(values("x-raw"), ["caf\u{FFFD}"]);
+    let request_id = values("x-request-id");
+    assert_eq!(request_id.len(), 1, "{request_id:?}");
+    assert!(
+        uuid::Uuid::parse_str(request_id[0]).is_ok(),
+        "{request_id:?}"
+    );
+}
+
+// 7.2: with a transform bound, repeated and obs-text response headers reach
+// the client as the upstream sent them.
+#[tokio::test]
+async fn proxy_transform_keeps_response_headers() {
+    let mut guard = MockGuard::new();
+    guard.mock(
+        "GET",
+        "/v1/transform-resp",
+        MockResponse {
+            status: 200,
+            headers: vec![
+                ("content-type".into(), "application/json".into()),
+                ("x-multi".into(), "a".into()),
+                ("x-multi".into(), "b".into()),
+                ("x-raw".into(), "café".into()),
+            ],
+            body: MockBody::Json(json!({"ok": true})),
+        },
+    );
+    let h = AppHarness::builder()
+        .with_credentials(vec![("cred://openai-key".into(), "sk-test123".into())])
+        .build()
+        .await;
+    setup_auth_and_transform(&h, &guard, "transform-resp-test", "/v1/transform-resp").await;
+
+    let req = http::Request::builder()
+        .method(Method::GET)
+        .uri(format!(
+            "/transform-resp-test{}",
+            guard.path("/v1/transform-resp")
+        ))
+        .body(Body::Empty)
+        .unwrap();
+    let response = h
+        .facade()
+        .proxy_request(h.security_context().clone(), req)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let multi: Vec<_> = response.headers().get_all("x-multi").iter().collect();
+    assert_eq!(multi, ["a", "b"]);
+    assert_eq!(
+        response.headers().get("x-raw").map(|v| v.as_bytes()),
+        Some("café".as_bytes())
+    );
+}
+
 // 6.14: SSE streaming — proxy to dynamic SSE mock via MockGuard.
 #[tokio::test]
 async fn proxy_sse_streaming() {

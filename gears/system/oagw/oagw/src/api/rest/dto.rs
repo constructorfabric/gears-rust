@@ -43,12 +43,10 @@ pub struct Endpoint {
     #[serde(default)]
     pub scheme: Scheme,
     pub host: String,
-    #[serde(default = "default_port")]
-    pub port: u16,
-}
-
-fn default_port() -> u16 {
-    443
+    /// TCP port. Defaults to the scheme's port when omitted: 80 for `http`,
+    /// 443 otherwise. Responses always carry the stored port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -469,10 +467,11 @@ impl From<Scheme> for domain::Scheme {
 
 impl From<Endpoint> for domain::Endpoint {
     fn from(v: Endpoint) -> Self {
+        let scheme = domain::Scheme::from(v.scheme);
         Self {
-            scheme: v.scheme.into(),
+            scheme,
             host: v.host,
-            port: v.port,
+            port: v.port.unwrap_or_else(|| scheme.default_port()),
         }
     }
 }
@@ -758,7 +757,7 @@ impl From<domain::Endpoint> for Endpoint {
         Self {
             scheme: v.scheme.into(),
             host: v.host,
-            port: v.port,
+            port: Some(v.port),
         }
     }
 }

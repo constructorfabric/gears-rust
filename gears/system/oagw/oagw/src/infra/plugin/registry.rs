@@ -147,6 +147,13 @@ impl TransformPluginRegistry {
             .ok_or_else(|| PluginError::Internal(format!("unknown transform plugin: {plugin_id}")))
     }
 
+    /// Register `plugin` under `plugin_id`, for tests that need a transform
+    /// the built-ins do not provide.
+    #[cfg(test)]
+    pub(crate) fn insert(&mut self, plugin_id: &str, plugin: Arc<dyn TransformPlugin>) {
+        self.plugins.insert(plugin_id.to_owned(), plugin);
+    }
+
     /// Check if a GTS identifier belongs to the transform plugin schema.
     #[must_use]
     pub fn is_transform_plugin(gts_id: &str) -> bool {
@@ -362,11 +369,7 @@ mod implemented_ids_tests {
             let plugin = auth.resolve(plugin_id).unwrap();
             // With every listed key the config is complete: the plugin gets
             // as far as the (empty) credential store, or needs none at all.
-            let mut auth_ctx = AuthContext {
-                headers: Default::default(),
-                config: full(keys),
-                security_context: ctx.clone(),
-            };
+            let mut auth_ctx = AuthContext::new(full(keys), ctx.clone());
             let complete = plugin.authenticate(&mut auth_ctx).await;
             if keys.is_empty() {
                 assert!(complete.is_ok(), "{plugin_id}: {complete:?}");
@@ -381,7 +384,7 @@ mod implemented_ids_tests {
             }
             // Each listed key holds a credential reference: with a distinct
             // ref per key and a store holding all but one, the lookup fails
-            // on that one's ref.
+            // on that one's key, and the error does not quote the ref.
             for absent in *keys {
                 let store = credstore_sdk::test_util::MockCredStoreClient::with_secrets(
                     keys.iter()
@@ -400,17 +403,16 @@ mod implemented_ids_tests {
                 for key in *keys {
                     config.insert(key.key.to_owned(), format!("cred://ref-{}", key.key));
                 }
-                let mut auth_ctx = AuthContext {
-                    headers: Default::default(),
-                    config,
-                    security_context: ctx.clone(),
-                };
+                let mut auth_ctx = AuthContext::new(config, ctx.clone());
                 match plugin.authenticate(&mut auth_ctx).await {
-                    Err(crate::domain::plugin::PluginError::SecretNotFound(r)) => assert!(
-                        r.contains(&format!("ref-{}", absent.key)),
-                        "{plugin_id} without the secret of {}: {r}",
-                        absent.key
-                    ),
+                    Err(e @ crate::domain::plugin::PluginError::SecretNotFound(key)) => {
+                        assert_eq!(key, absent.key, "{plugin_id}");
+                        assert!(
+                            !e.to_string().contains("ref-"),
+                            "{plugin_id} without the secret of {}: {e}",
+                            absent.key
+                        );
+                    }
                     other => panic!(
                         "{plugin_id} without the secret of {}: {other:?}",
                         absent.key
@@ -420,11 +422,7 @@ mod implemented_ids_tests {
             for missing in *keys {
                 let mut config = full(keys);
                 config.remove(missing.key);
-                let mut auth_ctx = AuthContext {
-                    headers: Default::default(),
-                    config,
-                    security_context: ctx.clone(),
-                };
+                let mut auth_ctx = AuthContext::new(config, ctx.clone());
                 // The plugin refuses its config and names the key (the
                 // error kind is the plugin's own).
                 match plugin.authenticate(&mut auth_ctx).await {
