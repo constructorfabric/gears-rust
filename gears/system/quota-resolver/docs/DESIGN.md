@@ -46,7 +46,7 @@ commit, lease release, return, and quota state) on two planes, each its own cont
 * **tenant plane**, `QuotaResolverApi`: quota state only. The subject is the caller's principal and the tenant is the
   caller's tenant, both taken from `SecurityContext`.
 
-The subject forms and the principal mapping are those of license-resolver.
+The subject forms are defined in §3.1, the principal mapping in §3.2.
 
 For each call the gateway:
 
@@ -184,7 +184,8 @@ Problem responses.
 
 - [ ] `p2` - **ID**: `cpt-cf-quota-resolver-entity-request-model`
 
-The table states what each entity must carry. Exact field names and shapes are settled at implementation.
+The table states what each entity must carry. Exact field names and shapes are settled at implementation, except the
+subject forms, whose wire shape is fixed below the table.
 
 **Core Entities**:
 
@@ -192,7 +193,7 @@ The table states what each entity must carry. Exact field names and shapes are s
 |-------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `QuotaSubject`                | Whom a quota applies to: a quota subject type (a GTS type id derived from `gts.cf.core.quota.subj.v1~`) and an opaque, non-empty id. The only subject form the plugin receives.                    |
 | `PrincipalSubject`            | A subject given as a principal: the principal type (`SecurityContext.subject_type`) and the principal UUID. Replaced by a `QuotaSubject` of the mapped type and the same id before delegation.     |
-| `SubjectInput`                | A subject in a platform request: a `QuotaSubject` or a `PrincipalSubject`, told apart by a tag. The wire form is that of license-resolver, so a module passes a principal to both resolvers the same way. |
+| `SubjectInput`                | A subject in a platform request: a `QuotaSubject` or a `PrincipalSubject`, told apart by the `kind` tag. Wire form below the table. |
 | `PlatformDebitRequest`        | The tenant, the metric, the subjects, the amount, the operation metadata that the backend's policies evaluate, and an idempotency key.                                                          |
 | `PlatformAcquireLeaseRequest` | What a debit carries, plus the requested lease duration.                                                                                                                                            |
 | `PlatformCommitLeaseRequest`  | The tenant, the lease token, the actual amount (absent means the full held amount), and an idempotency key.                                                                                       |
@@ -204,6 +205,19 @@ The table states what each entity must carry. Exact field names and shapes are s
 | `LeaseOutcome`                | An acquired lease (its token and expiry) or a denial with its `QuotaDecision`.                                                                                                                     |
 | `QuotaState`                  | The state of one quota: its id, its `QuotaSubject`, the metric, the cap or none, the consumed and remaining amounts, and, for a quota with a period, the current period with its reset time.                                  |
 | Plugin requests               | `PluginDebitRequest`, `PluginAcquireLeaseRequest`, `PluginQuotaStateRequest`: the platform request with every subject a `QuotaSubject`. Commit, release, and return need no conversion; the plugin receives their platform requests. |
+
+**Subject wire forms**: each subject of a platform request is one JSON object. Its `kind` selects the form, and the
+fields of the form sit beside `kind` in the same object.
+
+| Form          | `kind`      | Fields                                                                                  |
+|---------------|-------------|-----------------------------------------------------------------------------------------|
+| Quota subject | `quota`     | `type`: the quota subject type, a GTS type id; `id`: an opaque, non-empty string        |
+| Principal     | `principal` | `type`: the principal type, as `SecurityContext.subject_type`; `id`: the principal UUID |
+
+A `QuotaSubject` outside a platform request, in a plugin request or in `QuotaState`, is the object `{type, id}` without
+`kind`. A subject without `kind` or with an unknown `kind`, without a field of its form, with a field of a wrong type,
+with an empty quota subject `id`, or with a field its form does not have is `InvalidArgument` (§3.3, Errors). A
+well-formed principal with a nil id or a type that is not mapped is not an error: it is not mapped (§3.2, Gateway).
 
 **Quota subject types**: the SDK registers the abstract base `gts.cf.core.quota.subj.v1~` and the tenant subject type
 `gts.cf.core.quota.subj.v1~cf.core.quota.tenant.v1~`, which names a tenant quota in `QuotaState`. Every other quota
@@ -230,7 +244,7 @@ tenant (`subject_tenant_id`) for a platform request. It reads the context; it do
 - `QuotaDecision`, `LeaseOutcome`, pages of `QuotaState`, and plugin errors come back from the plugin unchanged. A
   commit, release, or return returns no result; a settlement or return the backend cannot apply is a plugin error.
 
-**Envelope evolution**: two unknown-field policies, as in license-resolver.
+**Envelope evolution**: two unknown-field policies.
 
 - `QuotaSubject` and `PrincipalSubject` **reject** unknown fields. Their shape is closed (for `QuotaSubject`, by the
   published base schema), so a key the resolver does not know is a caller error, not a silent drop.

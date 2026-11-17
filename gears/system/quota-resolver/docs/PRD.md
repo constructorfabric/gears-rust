@@ -67,8 +67,7 @@ A subject is either a quota subject or a principal. The resolver maps a principa
 configuration, so no calling module needs to know the operator's quota subject types.
 
 The resolver owns no counters, quotas, or leases. It delegates every operation to a quota backend plugin that it
-selects at runtime. Subject forms and principal mapping follow license-resolver, so a module that checks licenses and
-charges quotas passes a principal to both in the same way.
+selects at runtime.
 
 ### 1.2 Background / Problem Statement
 

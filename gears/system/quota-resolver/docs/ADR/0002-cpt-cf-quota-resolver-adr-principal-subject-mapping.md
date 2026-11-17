@@ -1,5 +1,5 @@
 ---
-description: "Why the quota resolver, from its own configuration, maps a principal type to a quota subject type, as license-resolver does."
+description: "Why the quota resolver, from its own configuration, maps a principal type to a quota subject type."
 status: proposed
 date: 2026-11-11
 ---
@@ -44,7 +44,7 @@ operator's quota subject types. Who maps a principal type to a quota subject typ
 * An operator subtype of a principal type is covered by the entry of its ancestor.
 * The plugin receives quota subjects only.
 * A principal that the operator did not map is not charged and gets no lease.
-* A module that calls both license-resolver and quota-resolver passes a principal to both in the same way.
+* The principal form does not depend on the backend, so other resolvers can accept the same form.
 
 ## Considered Options
 
@@ -57,7 +57,7 @@ operator's quota subject types. Who maps a principal type to a quota subject typ
 ## Decision Outcome
 
 Chosen option: (a), because the resolver is the single entry point for quota operations, so one configuration serves
-every caller, the plugin sees no principals, and the model is the one license-resolver uses.
+every caller, and the plugin sees no principals.
 
 A subject in a platform request has one of two forms, tagged by `kind`:
 
@@ -96,7 +96,7 @@ and a mapped type the backend rejects.
 
 * Good, because one configuration serves every caller.
 * Good, because the plugin and the stored quotas see quota subject types only.
-* Good, because the public subject model matches license-resolver.
+* Good, because the public subject model does not depend on the backend.
 * Bad, because another module that needs the same mapping, for example to create a quota for a user, repeats the
   configuration.
 
@@ -115,11 +115,11 @@ and a mapped type the backend rejects.
 
 * Good, because a backend that keys quotas by scope needs no translation in its plugin.
 * Bad, because the public contract then carries one backend's subject model.
-* Bad, because a module passes a principal to license-resolver and to quota-resolver in different forms.
+* Bad, because the principal form then depends on the backend, so other resolvers cannot accept the same form.
 
 ## More Information
 
-Principal types and their hierarchy: issue #5446. License-resolver uses the same subject forms and mapping.
+Principal types and their hierarchy: issue #5446.
 
 ## Traceability
 
