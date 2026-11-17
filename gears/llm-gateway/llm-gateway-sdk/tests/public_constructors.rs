@@ -224,9 +224,10 @@ fn passthrough_response_builders() {
 
     let event = PassthroughEvent::new(r#"{"type":"message_delta","usage":{}}"#)
         .with_event("message_delta")
-        .with_output_tokens(4)
+        .with_output_text("Hello")
         .with_usage(PassthroughUsage::at(Usage::reported(10, 4), "/usage"));
     assert!(event.relay);
+    assert_eq!(event.output_text, "Hello");
     assert_eq!(
         event.usage.and_then(|u| u.pointer).as_deref(),
         Some("/usage")
