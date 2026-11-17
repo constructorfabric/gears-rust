@@ -656,8 +656,10 @@ pub struct ContextWindow {
     pub max_input_tokens: u32,
     /// Maximum output tokens. `None` for embedding models that produce
     /// vectors instead of token sequences.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
     /// Output vector dimensionality for embedding models.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_vector_size: Option<u32>,
 }
 
@@ -693,8 +695,10 @@ impl ContextWindow {
 #[non_exhaustive]
 pub struct ModelPerformance {
     /// Expected response latency in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub response_latency_ms: Option<u32>,
     /// Expected generation speed in tokens per second.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_per_second: Option<u32>,
 }
 

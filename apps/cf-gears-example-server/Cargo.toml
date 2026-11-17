@@ -59,6 +59,7 @@ bss-rate-provider = [
     "dep:bss_rate_provider_http_json_plugin",
 ]
 bss-ledger = ["dep:bss_ledger"]
+model-registry = ["dep:model_registry"]
 usage-collector = ["dep:usage_collector"]
 timescaledb-usage-collector = ["dep:timescaledb_usage_collector_plugin"]
 clickhouse-usage-collector = ["dep:clickhouse_usage_collector_plugin"]
@@ -187,6 +188,9 @@ admission-control = { package = "cf-gears-admission-control", path = "../../gear
 
 # Optional Policy Engine gear (an admission-control engine plugin)
 policy-engine = { package = "cf-gears-policy-engine", path = "../../gears/system/policy-engine/policy-engine", optional = true }
+
+# Optional Model Registry gear
+model_registry = { package = "cf-gears-model-registry", path = "../../gears/model-registry/model-registry", optional = true }
 
 # Optional example module
 users-info = { path = "../../examples/toolkit/users-info/users-info", optional = true }

@@ -116,7 +116,9 @@ pub enum TextFormatKind {
     /// Schema-constrained JSON output.
     JsonSchema {
         name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
         description: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         schema: Option<serde_json::Value>,
         strict: bool,
     },

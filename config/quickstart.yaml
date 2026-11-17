@@ -406,6 +406,15 @@ gears:
       #       prefix: ""
       #       secret_ref: "azure-openai-key-tenant-b"
 
+  # Model Registry gear — gated by the `model-registry` cargo feature.
+  model-registry:
+    database:
+      server: "sqlite_users"
+      file: "model_registry.db"
+      params:
+        transaction_mode: "immediate"
+    config: {}
+
   resource-group:
     database:
       server: "sqlite_users"

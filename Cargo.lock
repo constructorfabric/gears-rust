@@ -2977,6 +2977,7 @@ dependencies = [
  "cf-gears-grpc-hub",
  "cf-gears-license-resolver",
  "cf-gears-mini-chat",
+ "cf-gears-model-registry",
  "cf-gears-nodes-registry",
  "cf-gears-oagw",
  "cf-gears-policy-engine",
@@ -3734,6 +3735,50 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "time",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-model-registry"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "cf-gears-authz-resolver",
+ "cf-gears-authz-resolver-sdk",
+ "cf-gears-credstore-v2-sdk",
+ "cf-gears-model-registry",
+ "cf-gears-model-registry-sdk",
+ "cf-gears-tenant-resolver",
+ "cf-gears-tenant-resolver-sdk",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-db",
+ "cf-gears-toolkit-db-macros",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-odata",
+ "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
+ "cf-gears-types-registry-sdk",
+ "chrono",
+ "gts",
+ "lru",
+ "proptest",
+ "rand 0.10.3",
+ "schemars 1.2.3",
+ "sea-orm",
+ "sea-orm-migration",
+ "serde",
+ "serde_ignored",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tower",
+ "tracing",
+ "url",
  "utoipa",
  "uuid",
 ]
@@ -12235,6 +12280,16 @@ dependencies = [
  "itoa",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_ignored"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "115dffd5f3853e06e746965a20dcbae6ee747ae30b543d91b0e089668bb07798"
+dependencies = [
+ "serde",
+ "serde_core",
 ]
 
 [[package]]

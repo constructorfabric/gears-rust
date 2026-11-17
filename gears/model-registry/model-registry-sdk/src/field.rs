@@ -1,5 +1,5 @@
 // Created: 2026-10-26 by Constructor Tech
-// Updated: 2026-11-10 by Constructor Tech
+// Updated: 2026-11-12 by Constructor Tech
 //! Field-violation reason codes of `InvalidArgument` errors
 //! (`context.field_violations[].reason`, DESIGN §4 Error Handling).
 
@@ -17,10 +17,9 @@ pub const NOT_A_PROVIDER_TYPE: &str = "NOT_A_PROVIDER_TYPE";
 /// Types Registry has no active schema for the provider type.
 pub const GTS_TYPE_NOT_REGISTERED: &str = "GTS_TYPE_NOT_REGISTERED";
 /// `provider_settings` violates the provider type schema. On a model write
-/// the field is `provider_settings` plus the JSON pointer of the offending
-/// value within the `provider_settings` document; on a provider type
-/// migration the field is `gts_type` and the description names the model and
-/// the pointer.
+/// the field is `provider_settings`; on a provider type migration the field
+/// is `gts_type` and the description names the model. The description
+/// carries the validator messages.
 pub const SCHEMA_MISMATCH: &str = "SCHEMA_MISMATCH";
 /// `CredStore` has no record under `secret_ref`.
 pub const SECRET_REF_NOT_FOUND: &str = "SECRET_REF_NOT_FOUND";

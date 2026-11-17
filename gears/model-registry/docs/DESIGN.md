@@ -175,7 +175,7 @@ graph TB
 | Domain | Local client; catalog service (operation flow, authorization calls, validation order, transactions, audit columns); effective-catalog algorithm, approval and sharing rules, PDP scope gate, GTS type and settings checks | Rust in `domain/` (local client included), `#[domain_model]` types, toolkit `PolicyEnforcer` (`cpt-cf-model-registry-tech-toolkit-gear`); settings validated with the workspace JSON Schema validator (`jsonschema`) against schemas from Types Registry (`cpt-cf-model-registry-tech-json-schema-validation`) |
 | Infrastructure | SeaORM entities with `Scopable`, repositories over `DBRunner`, migrations, OData field-to-column mapping, chain cache | SeaORM through `toolkit-db` `SecureConn`; PostgreSQL in production, SQLite in dev/test (`cpt-cf-model-registry-tech-relational-storage`) |
 
-Domain components call dependency SDK traits (`TenantResolverClient`, `AuthZResolverClient` through `PolicyEnforcer`, `TypesRegistryClient`, `CredStoreClientV2`) obtained from ClientHub, and storage through repository traits. These traits are the seams where tests inject mocks.
+Domain components call dependency SDK traits (`TenantResolverClient`, `AuthZResolverClient` through `PolicyEnforcer`, `TypesRegistryApi`, `CredStoreClientV2`) obtained from ClientHub, and storage through repository traits. These traits are the seams where tests inject mocks.
 
 Layer rules follow the [platform gear layout](../../../docs/toolkit_unified_system/02_gear_layout_and_sdk_pattern.md): serde and `ToSchema` derives appear only in `api/rest/` DTOs and in SDK models; domain types carry `#[domain_model]`; all endpoints are versioned. `unsafe` is forbidden and `unwrap`/`expect` are denied in non-test code.
 
@@ -290,7 +290,7 @@ The ancestor-chain cache is an in-process map per replica ([ADR-0003](./ADR/0003
 | Approval | The owning tenant's latest decision on a model | [models/](../model-registry-sdk/src/models/) (`ApprovalV1`) |
 | Effective Catalog | The computed view of providers and models one tenant sees | Computed per request; not stored |
 
-Type notation in the field tables: `?` marks an optional field; `uuid`, `string`, `bool`, `u32`, `u64`, `i32`, `f64`, `timestamp` (UTC, ISO-8601), `enum`, `json` (any JSON value), `object` (a nested structure described below the table). Enum values are lowercase on the wire; the PRD's `Tenant`/`Shared` and Pending/Approved/Rejected/Revoked are the same values. Strings without a stated limit are bounded by their column length in §3.7, and JSON values by `max_json_document_bytes`; a value over a bound is rejected with `TOO_LARGE`.
+Type notation in the field tables: `?` marks an optional field; `uuid`, `string`, `bool`, `u32`, `u64`, `i32`, `f64`, `timestamp` (UTC, ISO-8601), `enum`, `json` (any JSON value), `object` (a nested structure described below the table). Enum values are lowercase on the wire; the PRD's `Tenant`/`Shared` and Pending/Approved/Rejected/Revoked are the same values. Strings without a stated limit are bounded by their column length in §3.7, and JSON values by `max_json_document_bytes`; a value over a bound is rejected with `TOO_LARGE`. A string, or a string or key inside a JSON value, that contains U+0000 is rejected with `INVALID_FORMAT`.
 
 #### Provider
 
@@ -369,7 +369,7 @@ Type notation in the field tables: `?` marks an optional field; `uuid`, `string`
 | `allow_extra_params` | list of string | Names of extra request parameters callers may pass to the provider, up to 64 names of up to 128 characters. Default empty. |
 | `provider_settings` | json | Provider-specific settings. Shape defined by the provider type schema. Opaque to the registry beyond validation. |
 
-**Capabilities** (`capabilities`). A media capability has two fields: `enabled` (bool) and `supported_mime_types` (list of up to 64 strings). MIME types follow RFC 6838 in lowercase. `disabled_mime_types` has the same bound.
+**Capabilities** (`capabilities`). A media capability has two fields: `enabled` (bool) and `supported_mime_types` (list of up to 64 strings of at most 255 characters each). MIME types follow RFC 6838 in lowercase. `disabled_mime_types` has the same bound.
 
 | Field | Type | Meaning |
 |-------|------|---------|
@@ -641,7 +641,7 @@ Provider types and provider settings come from plugins the gear does not know at
 
 ##### Responsibility scope
 
-Checks provider GTS types on provider create and on type migration (§4 GTS Checks). Fetches the resolved schema of a provider type from Types Registry and validates `provider_settings` against it on model create, on settings update, and for every model of a provider on type migration. Publishes nothing itself.
+Checks provider GTS types on provider create and on type migration (§4 GTS Checks). Fetches the provider type schema from Types Registry, compiles its payload validator with the Types Registry SDK, and validates `provider_settings` with it on model create, on settings update, and for every model of a provider on type migration. Publishes nothing itself.
 
 ##### Responsibility boundaries
 
@@ -665,7 +665,7 @@ An in-process map from tenant id to that tenant's ordered ancestor chain (parent
 
 1. TTL is `chain_cache_ttl_seconds`, default 30, maximum 300 (checked at gear start). Value 0 disables caching; every request calls Tenant Resolver. Each stored entry gets a TTL reduced by a random jitter of up to 10%, so entries stored together do not expire together. Expiry counts from the start of the Tenant Resolver call, so a slow call does not extend the bound of rule 5; a result already expired on arrival serves its request and is not stored.
 2. An empty chain (the root tenant or a self-managed tenant) is a cached value, not a miss.
-3. Failures are not cached. A failed call fails the request with dependency unavailable; no entry is stored.
+3. Failures are not cached. A failed call fails the request with dependency unavailable; no entry is stored. The callers that were waiting on that call (rule 6) get the same failure without calling again; the next caller makes a new call.
 4. The map is a bounded concurrent LRU cache of `chain_cache_max_entries` (default 100,000) entries. Inserting into a full map evicts the least recently used entry in constant time.
 5. There is no invalidation API. A stale entry is used for at most one TTL plus the duration of the request that read it. A stale chain can narrow or widen visibility. A tenant moved under a new parent keeps its former ancestors' shared catalog and does not yet see the new ancestors' shared providers, including ones that would shadow an inherited slug. A detached tenant keeps its former ancestors' shared catalog. A tenant whose `self_managed` flag changes keeps its previous chain, and so does each tenant below it. Deployments that need hierarchy changes to apply on the next request set the TTL to 0.
 6. Concurrent misses for the same tenant share one Tenant Resolver call (single flight per tenant). At TTL 0 every request makes its own call, so a request never receives a chain fetched by a call that started before it.
@@ -802,8 +802,9 @@ REST conventions:
 
 - Every route is registered with `OperationBuilder`, `.authenticated()`, the platform license check with no gear-specific feature, `.standard_errors()` plus the 503 response, and operation id `model_registry.<sdk_method>`. List routes add `.with_odata_filter`, `.with_odata_orderby`, and `.with_odata_select` for their field enums.
 - JSON field names are snake_case. REST DTOs flatten the entry types: provider or model fields plus the flags at the top level.
+- REST request bodies reject unknown fields: an update body with `invalid_argument` on field `body`, reason `INVALID_FORMAT`; a create body as the toolkit's invalid JSON body. An unknown key inside a nested object (`cost`, `performance`, `additional_info`, `capabilities`, `disabled_capabilities`, `context_window`, `default_parameters`) is a field violation on its JSON pointer, for example `cost/input_per_1M_micro`, reason `INVALID_FORMAT`; keys inside the tagged variants of `default_parameters` (`text.format`, `tool_choice`) are not checked. The SDK types themselves ignore unknown keys, so a reader stays compatible with records written by another version.
 - REST update DTOs reject the immutable fields of `cpt-cf-model-registry-constraint-immutable-identity`, `canonical_id`, `version`, the model `gts_type`, and audit fields with `invalid_argument` and field reason `IMMUTABLE_FIELD`. The provider `gts_type` is accepted on `PATCH /providers/{id}` as a type migration.
-- Optimistic concurrency: responses that return one entry (`POST`, `GET /{id}`, `PATCH`) carry the strong `ETag` `"<version>"`. `PATCH` requires `If-Match`: a validator maps to `expected_version`, `*` to an unconditional update, and a missing header is rejected as `invalid_argument` with a field violation on `If-Match`, reason `IF_MATCH_REQUIRED`. `DELETE` accepts an optional `If-Match`. A stale validator is `aborted` (409) with reason `OPTIMISTIC_LOCK_FAILURE` (§4 Error Handling; reason for 409 instead of 412 in [ADR-0004](./ADR/0004-cpt-cf-model-registry-adr-update-semantics.md)). `PATCH` takes `Content-Type: application/json` with top-level whole-field replacement semantics and is not advertised as `application/merge-patch+json`.
+- Optimistic concurrency: responses that return one entry (`POST`, `GET /{id}`, `PATCH`) carry the strong `ETag` `"<version>"`. `PATCH` requires `If-Match`: one validator is compared with the locked row's `ETag` as a string, without parsing it; `*` is an unconditional update; a missing header is rejected as `invalid_argument` with a field violation on `If-Match`, reason `IF_MATCH_REQUIRED`, and more than one validator with reason `INVALID_FORMAT`. `DELETE` accepts an optional `If-Match`. A validator that is not the current `ETag`, including a weak or differently spelled one such as `W/"3"` or `"03"`, is `aborted` (409) with reason `OPTIMISTIC_LOCK_FAILURE` (§4 Error Handling; reason for 409 instead of 412 in [ADR-0004](./ADR/0004-cpt-cf-model-registry-adr-update-semantics.md)). `PATCH` takes `Content-Type: application/json` with top-level whole-field replacement semantics and is not advertised as `application/merge-patch+json`.
 - Errors are canonical Problem documents (RFC 9457) produced by `toolkit-canonical-errors`. The wire carries category, title, detail, resource type and name, and the category context (reason, field violations). Internal diagnostics, SQL text, stored JSON documents, and the ids of rows the caller cannot see are never put on the wire. The error table is in §4 Error Handling.
 - Versioning follows the [platform versioning guideline](../../../guidelines/DNA/REST/VERSIONING.md). Breaking REST changes require `/v2/`. A breaking SDK change adds `ModelRegistryClientV2` next to `ModelRegistryClientV1`, and V1 is deprecated per that guideline. The first SDK release that a gear implements publishes `ModelRegistryClientV1` as defined in this document, and the V2 rule applies from then on. Additions of optional fields, endpoints, filter fields, and `supported_api` values are non-breaking. SDK structs with public fields are `#[non_exhaustive]`: they are built through `new`, `Default`, or the builder and then by field assignment, so an added field breaks no caller. Record fields with a documented default deserialize to that default when absent.
 
@@ -837,7 +838,7 @@ What LLM Gateway and its provider plugins rely on:
 |-------------------|----------------|----------|
 | `tenant-resolver` | `TenantResolverClient::get_ancestors` via ClientHub, once with the default `BarrierMode::Respect` per cache miss | Ancestor chain for inheritance and shadowing |
 | `authz-resolver` | `AuthZResolverClient` wrapped in `PolicyEnforcer` (`authz-resolver-sdk`) | PDP decisions for every operation |
-| `types-registry` | `TypesRegistryClient::get_type_schema` (the effective schema, parent chain inlined) under the caller's context; platform GTS publication (provider base type and permission instances) | Provider type checks and settings validation on writes |
+| `types-registry` | `TypesRegistryApi::get_type_schema` (authored content and resolved schema selected) under the caller's context; platform GTS publication (provider base type and permission instances) | Provider type checks and settings validation on writes |
 | `credstore` | `CredStoreClientV2::get_record` via ClientHub, under the caller's context | Ownership check of `secret_ref` on model create and on an update that changes it to a non-null value (§4 Credential Binding) |
 | `llm-gateway` (consumer) | Calls `ModelRegistryClientV1` | Resolves models on every inference request; its provider plugins publish provider types derived from `gts.cf.genai.model.provider.v1~` (§3.3 Consumer Contract) |
 
@@ -868,9 +869,9 @@ The gear uses the parent-first, root-last order that Tenant Resolver returns, as
 
 | Dependency Gear | Interface Used | Purpose |
 |-------------------|---------------|---------|
-| `types-registry` (schemas registered by LLM Gateway provider plugins) | `TypesRegistryClient::get_type_schema`, taking the effective schema (the type's schema with its parent chain inlined) | Source of the JSON Schema for `provider_settings` of each provider type |
+| `types-registry` (schemas registered by LLM Gateway provider plugins) | `TypesRegistryApi::get_type_schema` with `Content` and `ResolvedSchema` selected; `TypeSchema::compile_payload_validator` | Payload validator of each provider type |
 
-Schema reads go through the Types Registry client registered in ClientHub and take the effective schema, the type's schema with its parent chain inlined. The read runs under the caller's context, which needs the Types Registry read grant.
+Schema reads go through the `TypesRegistryApi` client registered in ClientHub and select the authored content and the resolved schema, in which Types Registry has inlined every `#/` and `gts://` reference. A schema that is not active counts as not registered. The read runs under the caller's context, which needs the Types Registry read grant.
 
 #### Credential Ownership
 
@@ -1079,13 +1080,13 @@ sequenceDiagram
 
 - **Create**: format checks, PDP `create`, the GTS checks of §4 GTS Checks, a check of any PDP row constraints in memory against the built record, then insert with `tenant_id = T0`, `created_by` and `updated_by` set to the subject. A duplicate slug in the tenant yields `already_exists`. A new provider with an inherited slug immediately shadows the inherited provider as described in `cpt-cf-model-registry-seq-effective-catalog`.
 - **Update and type migration**: an update whose request carries a `gts_type` different from the stored one is a type migration; an equal `gts_type` is a plain update. Guarantees:
-  - PDP `update` with the provider id precedes any write.
+  - PDP `update` with the provider id precedes any write. Its row constraints are checked in memory against the stored row and, under the lock, against the updated row, so a type migration cannot move a provider to a `gts_type` the constraints do not admit.
   - Every write runs in one transaction scoped to `tenant_id = T0`. No database connection is held during the Types Registry call.
   - The transaction of an update, a type migration, and a delete locks the provider row exclusively (a PostgreSQL row lock; SQLite serializes writers); a type migration also locks the provider's model rows. Concurrent writes of the same provider are serialized by the lock.
   - `expected_version`, when given, is compared against the locked row and must equal its `version`; otherwise the request fails with `OPTIMISTIC_LOCK_FAILURE` and nothing is written. Every successful write increments `version`.
   - A request `gts_type` equal to the value read before the transaction is compared again with the locked row; a difference fails with `aborted` and reason `OPTIMISTIC_LOCK_FAILURE` and writes nothing, including for an unconditional update.
   - Fields present in the request are applied to the locked row, including those equal to the stored value. Changes to `enabled` or `sharing_mode` apply to the next request.
-  - A type migration runs the provider GTS checks of §4 GTS Checks on the new type and validates every model's `provider_settings` against the `provider_settings` subschemas of the new type (§4 GTS Checks). Each violation is one field violation with field `gts_type`, reason `SCHEMA_MISMATCH`, and a description naming the model's canonical id and the JSON pointer; one failing model fails the request and nothing is written.
+  - A type migration runs the provider GTS checks of §4 GTS Checks on the new type and validates every model's `provider_settings` against the new type (§4 GTS Checks). Each failing model is one field violation with field `gts_type`, reason `SCHEMA_MISMATCH`, and a description naming the model's canonical id and the validator messages; one failing model fails the request and nothing is written.
   - A type migration is atomic across the provider and all its models: it fails with `OPTIMISTIC_LOCK_FAILURE` if the locked provider row or model rows differ from the validated state (the provider version, the model set, or any model version changed), and otherwise sets `gts_type` on the provider and every model, increments every row's `version`, and sets `updated_at` and `updated_by` on every row. Readers see the old or the new type atomically; the next resolution selects the plugin of the new type. The provider row and its model rows are updated in place and never deleted and recreated, so the provider keeps its id and stays the candidate for its slug throughout; an inherited provider it shadows is never exposed.
   - Validation cost grows with the provider's model count and is bounded by `max_json_document_bytes` per model and by the Types Registry deadline for the single schema read.
   - A write on an inherited provider fails with `INHERITED_READ_ONLY`; an invisible provider is not found.
@@ -1117,8 +1118,8 @@ sequenceDiagram
     Note over MR: inherited provider gives INHERITED_READ_ONLY, unknown gives not found
     MR->>TY: get_type_schema(provider.gts_type, resolved)
     TY-->>MR: resolved schema or failure
-    MR->>MR: validate provider_settings against the provider_settings part of the schema
-    Note over MR: violations give invalid_argument with one field violation each
+    MR->>MR: validate the gts_type and provider_settings envelope with the type's payload validator
+    Note over MR: a mismatch gives invalid_argument with one field violation
     opt secret_ref set
         MR->>CR: get_record(ctx, secret_ref)
         CR-->>MR: own row status, none, denied, or failure
@@ -1394,13 +1395,14 @@ On provider create, and on a provider update whose `gts_type` differs from the s
 
 1. `gts_type` parses as a GTS type id (schema id ending with `~`). Failure: `invalid_argument`, field `gts_type`, reason `INVALID_GTS_TYPE`.
 2. The chain starts with the base type `gts.cf.genai.model.provider.v1~` and has at least one derived segment. Failure: reason `NOT_A_PROVIDER_TYPE`.
-3. Types Registry returns an active type schema for the id (`TypesRegistryClient::get_type_schema` under the caller's context). Not found: reason `GTS_TYPE_NOT_REGISTERED`. Read denied: `NOT_PERMITTED`. Types Registry failure: dependency unavailable.
+3. Types Registry returns an active type schema for the id (`TypesRegistryApi::get_type_schema` under the caller's context). Not found: reason `GTS_TYPE_NOT_REGISTERED`. Read denied: `NOT_PERMITTED`. Types Registry failure: dependency unavailable.
+4. The type compiles a payload validator (`TypeSchema::compile_payload_validator`). An abstract type (`x-gts-abstract`): reason `NOT_A_PROVIDER_TYPE`. A schema that does not compile: internal error.
 
 On model create, on model update when the request's `provider_settings` differs from the stored value, and for every model of the provider on type migration (against the new type):
 
-1. Read the resolved schema of the provider's `gts_type` from Types Registry (read options in §3.5). Not found: `invalid_argument`, field `provider_settings`, reason `GTS_TYPE_NOT_REGISTERED`. Read denied: `NOT_PERMITTED`. Failure: dependency unavailable.
-2. Take every `provider_settings` subschema of the resolved schema: `properties.provider_settings` at the root and inside each `allOf` branch, where a derived type inlines its parent chain. The root `definitions` and `$defs` travel with them. Validate the bare `provider_settings` document against all of them with the workspace JSON Schema validator as JSON Schema Draft-07, the GTS dialect ([GTS guideline](../../../guidelines/GTS.md)). Schema-only `x-gts-*` keywords do not affect validation. A provider type that does not constrain `provider_settings` accepts any JSON object.
-3. Report every violation as one field violation: field `provider_settings` plus the JSON pointer of the offending value within the `provider_settings` document, reason `SCHEMA_MISMATCH`, and the validator message as description.
+1. Read the provider's `gts_type` from Types Registry (read options in §3.5) and compile its payload validator. Not found: `invalid_argument`, field `provider_settings`, reason `GTS_TYPE_NOT_REGISTERED`. Abstract type: field `provider_settings`, reason `NOT_A_PROVIDER_TYPE`. Read denied: `NOT_PERMITTED`. Failure: dependency unavailable.
+2. `provider_settings` must be a JSON object. Validate the envelope `{"gts_type": <type>, "provider_settings": <document>}`, an instance of the provider type, with the payload validator: the GTS dialect of JSON Schema Draft-07 ([GTS guideline](../../../guidelines/GTS.md)). GTS reference keywords are checked for syntax only. A provider type that does not constrain `provider_settings` accepts any JSON object.
+3. Report a mismatch as one field violation: field `provider_settings`, reason `SCHEMA_MISMATCH`, and the validator messages as description.
 
 Schemas are fetched on these writes only. They are not cached and not fetched on resolution or listing. Stored settings are not re-validated when a plugin publishes a new schema; plugins keep schemas backward compatible or publish a new type version, to which administrators move providers by type migration.
 
@@ -1516,16 +1518,16 @@ Catalog rows are never cached, and every read runs its row queries in one read-o
 | `chain_cache_max_entries` | 100000 | Chain cache capacity |
 | `default_page_size` | 20 | Page size when the request has no limit |
 | `max_page_size` | 100 | Largest accepted page size |
-| `max_json_document_bytes` | 65536 | Size limit for each of `provider_settings`, `metadata`, `additional_info`, `default_parameters` (`TOO_LARGE` when exceeded) |
+| `max_json_document_bytes` | 65536 | Size limit for each of `provider_settings`, `metadata`, `additional_info`, `default_parameters`, `capabilities`, `disabled_capabilities` (`TOO_LARGE` when exceeded) |
 | `pdp_deadline_ms` | 1000 | Deadline for one PDP decision, passed to `PolicyEnforcer::with_deadline` |
 | `tenant_resolver_deadline_ms` | 1000 | Deadline for one `get_ancestors` call |
 | `types_registry_deadline_ms` | 3000 | Deadline for one Types Registry schema read on writes |
 | `credstore_deadline_ms` | 1000 | Deadline for one CredStore read in the `secret_ref` ownership check |
 | `max_pdp_constraint_values` | 1000 | Largest value list in one PDP row-constraint filter; a larger list denies |
 
-The keys live in the gear's `config` section of the platform YAML configuration, with the platform's environment-variable overrides; every key has a default, and absent keys take the defaults listed above. The gear checks the values at start and refuses to start when a check fails: `chain_cache_ttl_seconds` is between 0 and 300; `chain_cache_max_entries`, the page sizes, the document size, the deadlines, and `max_pdp_constraint_values` are greater than 0; `default_page_size` is at most `max_page_size`.
+The keys live in the gear's `config` section of the platform YAML configuration, with the platform's environment-variable overrides; every key has a default, and absent keys take the defaults listed above. The gear checks the values at start and refuses to start when a check fails: an unknown key is present; `chain_cache_ttl_seconds` is between 0 and 300; `chain_cache_max_entries`, the page sizes, the document size, the deadlines, and `max_pdp_constraint_values` are greater than 0; `default_page_size` is at most `max_page_size`.
 
-Database waits are bounded by the gear's `database` section of the platform configuration: the pool `acquire_timeout` (toolkit-db default 30 s) and, on PostgreSQL, the `statement_timeout` runtime parameter, which has no platform default. Deployments of the gear set both to 2 s.
+Database waits are bounded by the gear's `database` section of the platform configuration: the pool `acquire_timeout` (toolkit-db default 30 s) and, on PostgreSQL, the `statement_timeout` runtime parameter, which has no platform default. Deployments of the gear set both to 2 s. On SQLite the `database` section sets `transaction_mode: immediate`, so a write transaction takes the write lock when it begins and waits for it under `busy_timeout`; this is what serializes writers there.
 
 ### Testability
 
@@ -1611,6 +1613,7 @@ Platform baselines apply ([ARCHITECTURE_MANIFEST.md](../../../docs/ARCHITECTURE_
 | Update replaces present top-level fields as a whole, including nested objects; it does not merge nested objects. | [REST guideline](../../../guidelines/DNA/REST/API.md): PATCH with JSON Merge Patch | Gives SDK and REST identical update semantics and makes "settings changed" a comparison of the sent object with the stored one. [ADR-0004](./ADR/0004-cpt-cf-model-registry-adr-update-semantics.md) | Platform Architecture |
 | A stale `If-Match` is reported as `aborted` (409), not 412. | [REST guideline](../../../guidelines/DNA/REST/API.md): `If-Match` mismatch is 412 | The canonical error categories have no 412; CredStore reports the same condition as 409. [ADR-0004](./ADR/0004-cpt-cf-model-registry-adr-update-semantics.md) | Platform Architecture |
 | `gts_type` is stored as text on both tables, not as the GTS UUID. | [GTS guideline](../../../guidelines/GTS.md) §5.1: GTS types stored as UUIDs | The value is an OData filter field and a PDP property in its string form and is passed to Types Registry by id; no join or foreign key uses it | Model Registry team |
+| Until the CredStore v2 switch, `credstore` is not in the gear's `deps` and `CredStoreClientV2` is looked up on use; while it is absent, a write that binds a new `secret_ref` fails with `service_unavailable` (503). | §3.4 Internal Dependencies: `credstore` is a declared dependency | CredStore v2 is not yet registered in ClientHub (`gears/credstore/v2/plan.md`); failing closed keeps the ownership check of §4 Credential Binding mandatory | Model Registry team |
 | `cpt-cf-model-registry-fr-change-audit` (p2) is covered by per-row audit columns only; deletes and change history are not recorded. | `cpt-cf-model-registry-fr-change-audit` | p2 scope; the change log is designed with the p2 scope (§4 Change Audit Follow-up) | Model Registry team |
 
 ### Limitations

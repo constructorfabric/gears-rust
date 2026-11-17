@@ -1,5 +1,5 @@
 // Created: 2026-10-26 by Constructor Tech
-// Updated: 2026-11-10 by Constructor Tech
+// Updated: 2026-11-12 by Constructor Tech
 //! [`ProviderTypeV1`] — the provider base type `gts.cf.genai.model.provider.v1~`
 //! (DESIGN §3.3 Provider Base Type).
 
@@ -29,11 +29,10 @@ use toolkit_gts::gts_type_schema;
 ///
 /// The derived struct's fields are the `provider_settings` object. A
 /// provider's `gts_type` must be such a derived type: the base type is
-/// abstract. On write, the registry validates the bare `provider_settings`
-/// value of each model against every `provider_settings` subschema of the
-/// resolved provider type schema: at the root and inside each `allOf`
-/// branch, where the derived type inlines its parents. A violation's field is
-/// `provider_settings` plus the JSON pointer within that value.
+/// abstract. On write, the registry validates
+/// `{"gts_type": …, "provider_settings": …}` as an instance of the provider
+/// type, with the Types Registry SDK payload validator of the type. A
+/// violation's field is `provider_settings`.
 ///
 /// Schema carrier only; the registry never constructs this type. The
 /// `gts_type` discriminator field is required by the GTS macro on a base

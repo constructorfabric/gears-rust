@@ -43,50 +43,65 @@ pub struct ModelInfoV1 {
     /// scheme on the wire is the upstream's (HTTPS only). When absent, the
     /// plugin uses its provider's default URL; the registry stores no
     /// default.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     /// `CredStore` secret reference for the provider credential: 1–255
     /// characters from `[a-zA-Z0-9_-]`, the `SecretRef` format of
     /// `credstore-sdk`. Must name a secret the model's tenant owns; the
     /// registry checks this on create and on an update that changes it to a
     /// non-null value, and stores no secret material.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub secret_ref: Option<String>,
     /// Name shown to users, 1–255 characters.
     pub display_name: String,
     /// Free-text description, up to 4,096 characters.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Model family label, for example `gpt-4` or `llama`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub family: Option<String>,
     /// Organization that produced the model weights. Independent of the
     /// provider that serves the model.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vendor: Option<String>,
     /// Whether the platform can load and unload this model on a managed
     /// runtime. Informational. Default false.
     #[serde(default)]
     pub managed: bool,
     /// Architecture class, for example `llama` or `mistral`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub architecture: Option<String>,
     /// On-disk size of locally hosted weights, at most 2^63 − 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
     /// Weight or serving format, for example `gguf` or `safetensors`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
     /// Deployment region, for example `eu-west-1`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
     /// Infrastructure host, for example `Azure` or `self-hosted`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hosted_by: Option<String>,
     /// When the vendor last released this model version.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_release_at: Option<DateTime<Utc>>,
     /// Display-only reasoning level label.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_level: Option<String>,
     /// The model's release version as published by the vendor. Not the row
     /// `version` of [`ModelV1`](crate::models::ModelV1).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model_version: Option<String>,
     /// Position in model pickers; lower first. Default 0.
     #[serde(default)]
     pub sort_order: i32,
     /// Absolute `http` or `https` URL of the model icon, up to 2,048
     /// characters.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
     /// Display label for the relative cost, for example `3x`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub multiplier_display: Option<String>,
     /// Cost in AI credits.
     #[serde(default)]

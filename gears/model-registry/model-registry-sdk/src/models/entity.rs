@@ -48,6 +48,7 @@ pub struct ProviderV1 {
     #[serde(default)]
     pub managed: bool,
     /// Opaque provider metadata, stored and returned unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
     /// Row version: 1 on create, incremented by every update. The `ETag` on
     /// REST; updates and deletes are conditional on it through
@@ -366,7 +367,7 @@ mod tests {
         assert_eq!(json["version"], 1);
         assert_eq!(json["sharing_mode"], "tenant");
         assert_eq!(json["approval"]["state"], "approved");
-        assert_eq!(json["info"]["model_version"], serde_json::Value::Null);
+        assert!(json["info"].get("model_version").is_none());
         assert!(json["info"].get("version").is_none());
         assert_eq!(json["info"]["cost"], serde_json::json!({}));
         assert_eq!(json["info"]["base_url"], "https://api.openai.com/v1");
