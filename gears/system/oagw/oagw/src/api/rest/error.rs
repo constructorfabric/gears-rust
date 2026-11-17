@@ -277,13 +277,9 @@ impl From<DomainError> for CanonicalError {
             // `Validation`/`invalid_argument` so in-process provisioning
             // callers can classify it as retryable (HTTP status is 400 for
             // both, but the canonical category differs).
-            DomainError::SecretRefNotAccessible { detail, .. } => {
+            DomainError::SecretRefNotAccessible { field, detail, .. } => {
                 OagwUpstreamError::failed_precondition()
-                    .with_precondition_violation(
-                        "auth.config.secret_ref",
-                        detail,
-                        precondition::STATE,
-                    )
+                    .with_precondition_violation(field, detail, precondition::STATE)
                     .create()
             }
 
@@ -1024,6 +1020,7 @@ mod tests {
                 instance: "/test".into(),
             },
             DomainError::SecretRefNotAccessible {
+                field: "auth.config.secret_ref",
                 detail: "test".into(),
                 instance: "/test".into(),
             },
@@ -1237,6 +1234,7 @@ mod tests {
         // invalid_argument: in-process provisioning callers rely on the
         // canonical category to classify the failure as retryable.
         let err = DomainError::SecretRefNotAccessible {
+            field: "auth.config.secret_ref",
             detail: "secret_ref 'cred://missing' is not accessible to this tenant".into(),
             instance: "/test".into(),
         };

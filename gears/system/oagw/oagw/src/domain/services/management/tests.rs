@@ -812,7 +812,7 @@ async fn resolve_alias_walks_tenant_chain_to_ancestor() {
     let root_ctx = test_ctx(root);
     let mut req = make_create_upstream_hostname();
     req.auth = Some(AuthConfig {
-        plugin_type: "noop".into(),
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -842,7 +842,7 @@ async fn resolve_alias_child_shadows_ancestor() {
     let root_ctx = test_ctx(root);
     let mut req = make_create_upstream_hostname();
     req.auth = Some(AuthConfig {
-        plugin_type: "noop".into(),
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -889,7 +889,7 @@ async fn alias_shadowing_over_four_levels(backend: Backend) {
     );
     let shared = |enabled| CreateUpstreamRequest {
         auth: Some(AuthConfig {
-            plugin_type: "noop".into(),
+            plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
             sharing: SharingMode::Inherit,
             config: None,
         }),
@@ -1047,7 +1047,7 @@ async fn resolve_alias_disabled_ancestor_falls_through() {
     let mut req = make_create_upstream_hostname();
     req.enabled = false;
     req.auth = Some(AuthConfig {
-        plugin_type: "noop".into(),
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -1057,7 +1057,7 @@ async fn resolve_alias_disabled_ancestor_falls_through() {
     let root_ctx = test_ctx(root);
     let mut req2 = make_create_upstream_hostname();
     req2.auth = Some(AuthConfig {
-        plugin_type: "noop".into(),
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -1087,7 +1087,7 @@ async fn resolve_alias_all_disabled_returns_upstream_disabled() {
     let mut req = make_create_upstream_hostname();
     req.enabled = false;
     req.auth = Some(AuthConfig {
-        plugin_type: "noop".into(),
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -1116,7 +1116,7 @@ async fn resolve_alias_disabled_child_falls_through_to_ancestor() {
     let root_ctx = test_ctx(root);
     let mut root_req = make_create_upstream_hostname();
     root_req.auth = Some(AuthConfig {
-        plugin_type: "noop".into(),
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -1127,7 +1127,7 @@ async fn resolve_alias_disabled_child_falls_through_to_ancestor() {
     let mut child_req = make_create_upstream_hostname();
     child_req.enabled = false;
     child_req.auth = Some(AuthConfig {
-        plugin_type: "noop".into(),
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -1244,12 +1244,12 @@ fn effective_config_auth_inherit_descendant_overrides() {
     let child_id = Uuid::new_v4();
 
     let root_auth = AuthConfig {
-        plugin_type: "apikey".into(),
+        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     };
     let child_auth = AuthConfig {
-        plugin_type: "oauth2".into(),
+        plugin_type: crate::domain::gts_helpers::OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     };
@@ -1265,7 +1265,10 @@ fn effective_config_auth_inherit_descendant_overrides() {
     );
 
     let effective = compute_effective_config(&[root, child], None).unwrap();
-    assert_eq!(effective.auth.unwrap().plugin_type, "oauth2");
+    assert_eq!(
+        effective.auth.unwrap().plugin_type,
+        crate::domain::gts_helpers::OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID
+    );
 }
 
 #[test]
@@ -1274,12 +1277,12 @@ fn effective_config_auth_enforce_ancestor_wins() {
     let child_id = Uuid::new_v4();
 
     let root_auth = AuthConfig {
-        plugin_type: "apikey".into(),
+        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Enforce,
         config: None,
     };
     let child_auth = AuthConfig {
-        plugin_type: "oauth2".into(),
+        plugin_type: crate::domain::gts_helpers::OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     };
@@ -1289,7 +1292,10 @@ fn effective_config_auth_enforce_ancestor_wins() {
 
     let effective = compute_effective_config(&[root, child], None).unwrap();
     // Ancestor enforce wins — apikey stays.
-    assert_eq!(effective.auth.unwrap().plugin_type, "apikey");
+    assert_eq!(
+        effective.auth.unwrap().plugin_type,
+        crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID
+    );
 }
 
 #[test]
@@ -1467,7 +1473,7 @@ fn effective_config_three_layer_merge() {
         root_id,
         "openai",
         Some(AuthConfig {
-            plugin_type: "apikey".into(),
+            plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
             sharing: SharingMode::Enforce,
             config: None,
         }),
@@ -1475,7 +1481,7 @@ fn effective_config_three_layer_merge() {
         Some(PluginsConfig {
             sharing: SharingMode::Enforce,
             items: vec![PluginBinding {
-                plugin_ref: "audit-log".into(),
+                plugin_ref: crate::domain::gts_helpers::REQUIRED_HEADERS_GUARD_PLUGIN_ID.into(),
                 config: HashMap::new(),
             }],
         }),
@@ -1485,7 +1491,7 @@ fn effective_config_three_layer_merge() {
         parent_id,
         "openai",
         Some(AuthConfig {
-            plugin_type: "oauth2".into(),
+            plugin_type: crate::domain::gts_helpers::OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID.into(),
             sharing: SharingMode::Inherit,
             config: None,
         }),
@@ -1493,7 +1499,7 @@ fn effective_config_three_layer_merge() {
         Some(PluginsConfig {
             sharing: SharingMode::Inherit,
             items: vec![PluginBinding {
-                plugin_ref: "rate-guard".into(),
+                plugin_ref: crate::domain::gts_helpers::REQUEST_ID_TRANSFORM_PLUGIN_ID.into(),
                 config: HashMap::new(),
             }],
         }),
@@ -1518,15 +1524,26 @@ fn effective_config_three_layer_merge() {
     let effective = compute_effective_config(&[root, parent, child], None).unwrap();
 
     // Auth: root enforced → apikey wins even though parent set oauth2.
-    assert_eq!(effective.auth.unwrap().plugin_type, "apikey");
+    assert_eq!(
+        effective.auth.unwrap().plugin_type,
+        crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID
+    );
 
     // Rate limit: min(1000, 500, 200) = 200/min.
     assert_eq!(effective.rate_limit.unwrap().sustained.rate, 200);
 
     // Plugins: enforced audit-log + rate-guard + transform-x.
     let items = effective.plugins.unwrap().items;
-    assert!(items.iter().any(|b| b.plugin_ref == "audit-log"));
-    assert!(items.iter().any(|b| b.plugin_ref == "rate-guard"));
+    assert!(
+        items
+            .iter()
+            .any(|b| b.plugin_ref == crate::domain::gts_helpers::REQUIRED_HEADERS_GUARD_PLUGIN_ID)
+    );
+    assert!(
+        items
+            .iter()
+            .any(|b| b.plugin_ref == crate::domain::gts_helpers::REQUEST_ID_TRANSFORM_PLUGIN_ID)
+    );
     assert!(items.iter().any(|b| b.plugin_ref == "transform-x"));
 
     // Tags: union of all three.
@@ -1821,7 +1838,7 @@ async fn bind_allows_cors_override_on_private() {
     req.cors = Some(make_cors(SharingMode::Private, vec!["https://private.com"]));
     req.auth = Some(AuthConfig {
         sharing: SharingMode::Inherit,
-        plugin_type: "passthrough".into(),
+        plugin_type: crate::domain::gts_helpers::OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID.into(),
         config: None,
     });
     svc.create_upstream(&root_ctx, req).await.unwrap();
@@ -1848,7 +1865,7 @@ async fn bind_rejects_auth_override_on_enforce() {
     let root_ctx = test_ctx(root);
     let mut root_req = make_create_upstream_hostname();
     root_req.auth = Some(AuthConfig {
-        plugin_type: "apikey".into(),
+        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Enforce,
         config: None,
     });
@@ -1858,7 +1875,7 @@ async fn bind_rejects_auth_override_on_enforce() {
     let child_ctx = test_ctx(child);
     let mut child_req = make_create_upstream_hostname();
     child_req.auth = Some(AuthConfig {
-        plugin_type: "oauth2".into(),
+        plugin_type: crate::domain::gts_helpers::OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -1890,7 +1907,7 @@ async fn bind_allows_rate_limit_override_on_private() {
     root_req.rate_limit = Some(make_rate_limit(SharingMode::Private, 100, Window::Minute));
     // Need at least one non-private field so root upstream is visible.
     root_req.auth = Some(AuthConfig {
-        plugin_type: "noop".into(),
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -1918,7 +1935,7 @@ async fn bind_allows_inherit_override_with_permissions() {
     let root_ctx = test_ctx(root);
     let mut root_req = make_create_upstream_hostname();
     root_req.auth = Some(AuthConfig {
-        plugin_type: "apikey".into(),
+        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -1929,13 +1946,16 @@ async fn bind_allows_inherit_override_with_permissions() {
     let child_ctx = test_ctx(child);
     let mut child_req = make_create_upstream_hostname();
     child_req.auth = Some(AuthConfig {
-        plugin_type: "oauth2".into(),
+        plugin_type: crate::domain::gts_helpers::OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
     let child_upstream = svc.create_upstream(&child_ctx, child_req).await.unwrap();
     assert_eq!(child_upstream.alias, "api.openai.com");
-    assert_eq!(child_upstream.auth.unwrap().plugin_type, "oauth2");
+    assert_eq!(
+        child_upstream.auth.unwrap().plugin_type,
+        crate::domain::gts_helpers::OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID
+    );
 }
 
 #[tokio::test]
@@ -1961,7 +1981,7 @@ fn auth_with_secret_ref(secret_ref: &str) -> AuthConfig {
     config.insert("header".into(), "authorization".into());
     config.insert("secret_ref".into(), secret_ref.into());
     AuthConfig {
-        plugin_type: "apikey".into(),
+        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: Some(config),
     }
@@ -1979,7 +1999,7 @@ async fn bind_rejects_inaccessible_secret_ref() {
     let root_ctx = test_ctx(root);
     let mut root_req = make_create_upstream_hostname();
     root_req.auth = Some(AuthConfig {
-        plugin_type: "apikey".into(),
+        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -2030,7 +2050,7 @@ async fn bind_maps_not_found_error_to_secret_ref_not_accessible() {
     let root_ctx = test_ctx(root);
     let mut root_req = make_create_upstream_hostname();
     root_req.auth = Some(AuthConfig {
-        plugin_type: "apikey".into(),
+        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -2102,7 +2122,13 @@ async fn secret_ref_check_maps_a_credstore_outage_to_internal() {
         if outage {
             assert!(matches!(err, DomainError::Internal { .. }), "{err:?}");
         } else {
-            assert!(matches!(err, DomainError::Validation { .. }), "{err:?}");
+            match &err {
+                DomainError::Validation { field, reason, .. } => {
+                    assert_eq!(*field, "auth.config.secret_ref");
+                    assert_eq!(*reason, oagw_sdk::field::VALIDATION);
+                }
+                other => panic!("expected a validation error, got {other:?}"),
+            }
         }
         let text = match &err {
             DomainError::Internal { message } => message,
@@ -2138,7 +2164,7 @@ async fn malformed_secret_ref_is_rejected_before_the_credstore_is_asked() {
         .unwrap_err();
     assert!(
         matches!(&err, DomainError::Validation { detail, .. }
-            if detail.contains("invalid secret_ref") && !detail.contains("has spaces")),
+            if detail.contains("invalid credential reference") && !detail.contains("has spaces")),
         "{err:?}"
     );
 }
@@ -2157,7 +2183,7 @@ async fn bind_allows_accessible_secret_ref() {
     let root_ctx = test_ctx(root);
     let mut root_req = make_create_upstream_hostname();
     root_req.auth = Some(AuthConfig {
-        plugin_type: "apikey".into(),
+        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -2184,7 +2210,7 @@ async fn bind_allows_plugins_override_on_enforce() {
     req.plugins = Some(PluginsConfig {
         sharing: SharingMode::Enforce,
         items: vec![PluginBinding {
-            plugin_ref: "audit-log".into(),
+            plugin_ref: crate::domain::gts_helpers::REQUIRED_HEADERS_GUARD_PLUGIN_ID.into(),
             config: HashMap::new(),
         }],
     });
@@ -2197,7 +2223,7 @@ async fn bind_allows_plugins_override_on_enforce() {
     child_req.plugins = Some(PluginsConfig {
         sharing: SharingMode::Inherit,
         items: vec![PluginBinding {
-            plugin_ref: "rate-guard".into(),
+            plugin_ref: crate::domain::gts_helpers::REQUEST_ID_TRANSFORM_PLUGIN_ID.into(),
             config: HashMap::new(),
         }],
     });
@@ -2221,7 +2247,7 @@ async fn update_rejects_auth_override_on_enforce() {
     let root_ctx = test_ctx(root);
     let mut root_req = make_create_upstream_hostname();
     root_req.auth = Some(AuthConfig {
-        plugin_type: "apikey".into(),
+        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Enforce,
         config: None,
     });
@@ -2237,7 +2263,7 @@ async fn update_rejects_auth_override_on_enforce() {
     // Child tries to update auth — should fail because ancestor is enforce.
     let mut update_req = make_update_from_upstream(&child_upstream);
     update_req.auth = Some(AuthConfig {
-        plugin_type: "oauth2".into(),
+        plugin_type: crate::domain::gts_helpers::OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -2267,7 +2293,7 @@ async fn create_alias_matching_ancestor_requires_bind() {
     let root_ctx = test_ctx(root);
     let mut root_req = make_create_upstream_ip("openai");
     root_req.auth = Some(AuthConfig {
-        plugin_type: "apikey".into(),
+        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -2294,7 +2320,7 @@ async fn create_alias_matching_ancestor_enforce_rejects_incompatible_auth() {
     let root_ctx = test_ctx(root);
     let mut root_req = make_create_upstream_ip("openai");
     root_req.auth = Some(AuthConfig {
-        plugin_type: "apikey".into(),
+        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Enforce,
         config: None,
     });
@@ -2305,7 +2331,7 @@ async fn create_alias_matching_ancestor_enforce_rejects_incompatible_auth() {
     let child_ctx = test_ctx(child);
     let mut child_req = make_create_upstream_ip("openai");
     child_req.auth = Some(AuthConfig {
-        plugin_type: "oauth2".into(),
+        plugin_type: crate::domain::gts_helpers::OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -2341,7 +2367,7 @@ async fn update_no_ancestor_match_succeeds() {
     // Update auth — no ancestor match, should succeed without permission checks.
     let mut update_req = make_update_from_upstream(&child_upstream);
     update_req.auth = Some(AuthConfig {
-        plugin_type: "oauth2".into(),
+        plugin_type: crate::domain::gts_helpers::OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -2349,7 +2375,10 @@ async fn update_no_ancestor_match_succeeds() {
         .update_upstream(&child_ctx, child_upstream.id, update_req)
         .await
         .unwrap();
-    assert_eq!(updated.auth.unwrap().plugin_type, "oauth2");
+    assert_eq!(
+        updated.auth.unwrap().plugin_type,
+        crate::domain::gts_helpers::OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID
+    );
 }
 
 #[tokio::test]
@@ -2404,7 +2433,7 @@ async fn update_with_no_overrides_still_validates_ancestor_auth_enforce() {
     let root_ctx = test_ctx(root);
     let mut root_req = make_create_upstream_hostname();
     root_req.auth = Some(AuthConfig {
-        plugin_type: "apikey".into(),
+        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Enforce,
         config: None,
     });
@@ -2421,7 +2450,7 @@ async fn update_with_no_overrides_still_validates_ancestor_auth_enforce() {
     // This verifies bind validation runs even when other fields are None.
     let mut update_req = make_update_from_upstream(&child_upstream);
     update_req.auth = Some(AuthConfig {
-        plugin_type: "oauth2".into(),
+        plugin_type: crate::domain::gts_helpers::OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -2458,7 +2487,7 @@ async fn proxy_target_resolves_route_from_ancestor_upstream() {
     let root_ctx = test_ctx(root);
     let mut root_req = make_create_upstream_hostname();
     root_req.auth = Some(AuthConfig {
-        plugin_type: "apikey".into(),
+        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -2523,7 +2552,7 @@ async fn proxy_target_prefers_child_route_over_ancestor() {
     let root_ctx = test_ctx(root);
     let mut root_req = make_create_upstream_hostname();
     root_req.auth = Some(AuthConfig {
-        plugin_type: "apikey".into(),
+        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -2603,12 +2632,12 @@ fn merge_auth_private_replaces_when_ancestor_not_enforced() {
     let child_id = Uuid::new_v4();
 
     let root_auth = AuthConfig {
-        plugin_type: "apikey".into(),
+        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     };
     let child_auth = AuthConfig {
-        plugin_type: "oauth2".into(),
+        plugin_type: crate::domain::gts_helpers::OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Private,
         config: None,
     };
@@ -2619,7 +2648,10 @@ fn merge_auth_private_replaces_when_ancestor_not_enforced() {
     let effective = compute_effective_config(&[root, child], None).unwrap();
     // Ancestor is Inherit (not Enforce) — Private descendant replaces.
     let auth = effective.auth.unwrap();
-    assert_eq!(auth.plugin_type, "oauth2");
+    assert_eq!(
+        auth.plugin_type,
+        crate::domain::gts_helpers::OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID
+    );
     assert_eq!(auth.sharing, SharingMode::Private);
 }
 
@@ -2723,12 +2755,12 @@ fn merge_auth_private_cannot_bypass_enforced_ancestor() {
     let child_id = Uuid::new_v4();
 
     let root_auth = AuthConfig {
-        plugin_type: "apikey".into(),
+        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Enforce,
         config: None,
     };
     let child_auth = AuthConfig {
-        plugin_type: "oauth2".into(),
+        plugin_type: crate::domain::gts_helpers::OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Private,
         config: None,
     };
@@ -2739,7 +2771,10 @@ fn merge_auth_private_cannot_bypass_enforced_ancestor() {
     let effective = compute_effective_config(&[root, child], None).unwrap();
     // Enforced ancestor auth (apikey) must survive even though
     // descendant declared Private with oauth2.
-    assert_eq!(effective.auth.unwrap().plugin_type, "apikey");
+    assert_eq!(
+        effective.auth.unwrap().plugin_type,
+        crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID
+    );
 }
 
 #[test]
@@ -2750,7 +2785,7 @@ fn merge_plugins_private_cannot_drop_enforced_ancestor_plugins() {
     let root_plugins = PluginsConfig {
         sharing: SharingMode::Enforce,
         items: vec![PluginBinding {
-            plugin_ref: "audit-log".into(),
+            plugin_ref: crate::domain::gts_helpers::REQUIRED_HEADERS_GUARD_PLUGIN_ID.into(),
             config: HashMap::new(),
         }],
     };
@@ -2767,8 +2802,12 @@ fn merge_plugins_private_cannot_drop_enforced_ancestor_plugins() {
 
     let effective = compute_effective_config(&[root, child], None).unwrap();
     let items = effective.plugins.unwrap().items;
-    // Enforced "audit-log" must survive even though descendant set Private.
-    assert!(items.iter().any(|b| b.plugin_ref == "audit-log"));
+    // Enforced crate::domain::gts_helpers::REQUIRED_HEADERS_GUARD_PLUGIN_ID must survive even though descendant set Private.
+    assert!(
+        items
+            .iter()
+            .any(|b| b.plugin_ref == crate::domain::gts_helpers::REQUIRED_HEADERS_GUARD_PLUGIN_ID)
+    );
     assert!(items.iter().any(|b| b.plugin_ref == "my-plugin"));
 }
 
@@ -2780,14 +2819,14 @@ fn merge_plugins_enforced_ancestor_config_wins_on_ref_conflict() {
     let root_plugins = PluginsConfig {
         sharing: SharingMode::Enforce,
         items: vec![PluginBinding {
-            plugin_ref: "audit-log".into(),
+            plugin_ref: crate::domain::gts_helpers::REQUIRED_HEADERS_GUARD_PLUGIN_ID.into(),
             config: HashMap::from([("level".into(), "full".into())]),
         }],
     };
     let child_plugins = PluginsConfig {
         sharing: SharingMode::Private,
         items: vec![PluginBinding {
-            plugin_ref: "audit-log".into(),
+            plugin_ref: crate::domain::gts_helpers::REQUIRED_HEADERS_GUARD_PLUGIN_ID.into(),
             config: HashMap::from([("level".into(), "minimal".into())]),
         }],
     };
@@ -2800,7 +2839,7 @@ fn merge_plugins_enforced_ancestor_config_wins_on_ref_conflict() {
     // Should have exactly one audit-log, with ancestor (enforced) config.
     let audit = items
         .iter()
-        .filter(|b| b.plugin_ref == "audit-log")
+        .filter(|b| b.plugin_ref == crate::domain::gts_helpers::REQUIRED_HEADERS_GUARD_PLUGIN_ID)
         .collect::<Vec<_>>();
     assert_eq!(audit.len(), 1, "should dedup by plugin_ref");
     assert_eq!(
@@ -2818,14 +2857,14 @@ fn merge_plugins_inherit_descendant_config_wins_on_ref_conflict() {
     let root_plugins = PluginsConfig {
         sharing: SharingMode::Inherit,
         items: vec![PluginBinding {
-            plugin_ref: "audit-log".into(),
+            plugin_ref: crate::domain::gts_helpers::REQUIRED_HEADERS_GUARD_PLUGIN_ID.into(),
             config: HashMap::from([("level".into(), "full".into())]),
         }],
     };
     let child_plugins = PluginsConfig {
         sharing: SharingMode::Inherit,
         items: vec![PluginBinding {
-            plugin_ref: "audit-log".into(),
+            plugin_ref: crate::domain::gts_helpers::REQUIRED_HEADERS_GUARD_PLUGIN_ID.into(),
             config: HashMap::from([("level".into(), "minimal".into())]),
         }],
     };
@@ -2837,7 +2876,7 @@ fn merge_plugins_inherit_descendant_config_wins_on_ref_conflict() {
     let items = effective.plugins.unwrap().items;
     let audit = items
         .iter()
-        .filter(|b| b.plugin_ref == "audit-log")
+        .filter(|b| b.plugin_ref == crate::domain::gts_helpers::REQUIRED_HEADERS_GUARD_PLUGIN_ID)
         .collect::<Vec<_>>();
     assert_eq!(audit.len(), 1, "should dedup by plugin_ref");
     assert_eq!(
@@ -5421,6 +5460,22 @@ fn assert_validation<T: std::fmt::Debug>(result: Result<T, DomainError>, case: &
     );
 }
 
+/// A validation error whose detail contains `needle`: a limit case must
+/// fail on the limit, not on another check of the same value.
+#[track_caller]
+fn assert_validation_detail<T: std::fmt::Debug>(
+    result: Result<T, DomainError>,
+    needle: &str,
+    case: &str,
+) {
+    match result {
+        Err(DomainError::Validation { detail, .. }) => {
+            assert!(detail.contains(needle), "{case}: {detail}");
+        }
+        other => panic!("{case}: expected a validation error, got {other:?}"),
+    }
+}
+
 fn tags(count: usize, bytes: usize) -> Vec<String> {
     (0..count).map(|i| format!("{i:0>bytes$}")).collect()
 }
@@ -5569,17 +5624,20 @@ async fn upstream_refs_are_limited_on_create_and_update() {
             &ctx,
             CreateUpstreamRequest {
                 protocol: at_limit.clone(),
-                auth: auth(&at_limit),
-                plugins: plugins(&at_limit),
+                // Plugin references are checked against the implemented
+                // plugins as well, so the at-limit case uses real IDs.
+                auth: auth(crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID),
+                plugins: plugins(crate::domain::gts_helpers::REQUIRED_HEADERS_GUARD_PLUGIN_ID),
                 ..make_create_upstream_ip("limits")
             },
         )
         .await
-        .expect("256-byte references are accepted");
+        .expect("a 256-byte protocol is accepted");
     let base = make_create_upstream_ip("limits");
     let cases = [
         (
             "a 257-byte protocol",
+            "protocol must not exceed 256 bytes",
             CreateUpstreamRequest {
                 protocol: over.clone(),
                 ..base.clone()
@@ -5587,6 +5645,7 @@ async fn upstream_refs_are_limited_on_create_and_update() {
         ),
         (
             "a NUL in the protocol",
+            "protocol must not contain control characters",
             CreateUpstreamRequest {
                 protocol: "http\0".into(),
                 ..base.clone()
@@ -5594,6 +5653,7 @@ async fn upstream_refs_are_limited_on_create_and_update() {
         ),
         (
             "a 257-byte auth plugin type",
+            "auth.type must not exceed 256 bytes",
             CreateUpstreamRequest {
                 auth: auth(&over),
                 ..base.clone()
@@ -5601,6 +5661,7 @@ async fn upstream_refs_are_limited_on_create_and_update() {
         ),
         (
             "a NUL in the auth plugin type",
+            "auth.type must not contain control characters",
             CreateUpstreamRequest {
                 auth: auth("a\0"),
                 ..base.clone()
@@ -5608,6 +5669,7 @@ async fn upstream_refs_are_limited_on_create_and_update() {
         ),
         (
             "a 257-byte plugin ref",
+            "plugins.items[0].plugin_ref must not exceed 256 bytes",
             CreateUpstreamRequest {
                 plugins: plugins(&over),
                 ..base.clone()
@@ -5615,21 +5677,26 @@ async fn upstream_refs_are_limited_on_create_and_update() {
         ),
         (
             "a NUL in a plugin ref",
+            "plugins.items[0].plugin_ref must not contain control characters",
             CreateUpstreamRequest {
                 plugins: plugins("p\0"),
                 ..base.clone()
             },
         ),
     ];
-    for (case, bad) in cases {
+    for (case, needle, bad) in cases {
         let mut alias_free = bad.clone();
         alias_free.alias = Some("limits-bad".into());
-        assert_validation(svc.create_upstream(&ctx, alias_free).await, case);
+        assert_validation_detail(svc.create_upstream(&ctx, alias_free).await, needle, case);
         let mut update = make_update_from_upstream(&upstream);
         update.protocol = bad.protocol;
         update.auth = bad.auth;
         update.plugins = bad.plugins;
-        assert_validation(svc.update_upstream(&ctx, upstream.id, update).await, case);
+        assert_validation_detail(
+            svc.update_upstream(&ctx, upstream.id, update).await,
+            needle,
+            case,
+        );
     }
 }
 
@@ -5649,22 +5716,49 @@ async fn route_plugin_refs_and_query_allowlist_are_limited_on_create_and_update(
     };
 
     let route = svc
-        .create_route(&ctx, with(tags(64, 128), &"r".repeat(256)))
+        .create_route(
+            &ctx,
+            with(
+                tags(64, 128),
+                crate::domain::gts_helpers::REQUEST_ID_TRANSFORM_PLUGIN_ID,
+            ),
+        )
         .await
-        .expect("64 query parameters of 128 bytes and a 256-byte plugin ref are accepted");
+        .expect("64 query parameters of 128 bytes are accepted");
+    let ok = crate::domain::gts_helpers::REQUEST_ID_TRANSFORM_PLUGIN_ID;
     let cases = [
-        ("65 query parameters", with(tags(65, 1), "p")),
-        ("a 129-byte query parameter", with(tags(1, 129), "p")),
-        ("a NUL in a query parameter", with(vec!["a\0".into()], "p")),
-        ("a 257-byte plugin ref", with(vec![], &"r".repeat(257))),
-        ("a NUL in a plugin ref", with(vec![], "p\0")),
+        (
+            "65 query parameters",
+            "allows at most 64 parameters, got 65",
+            with(tags(65, 1), ok),
+        ),
+        (
+            "a 129-byte query parameter",
+            "query_allowlist[0] must not exceed 128 bytes",
+            with(tags(1, 129), ok),
+        ),
+        (
+            "a NUL in a query parameter",
+            "query_allowlist[0] must not contain control characters",
+            with(vec!["a\0".into()], ok),
+        ),
+        (
+            "a 257-byte plugin ref",
+            "plugins.items[0].plugin_ref must not exceed 256 bytes",
+            with(vec![], &"r".repeat(257)),
+        ),
+        (
+            "a NUL in a plugin ref",
+            "plugins.items[0].plugin_ref must not contain control characters",
+            with(vec![], "p\0"),
+        ),
     ];
-    for (case, bad) in cases {
-        assert_validation(svc.create_route(&ctx, bad.clone()).await, case);
+    for (case, needle, bad) in cases {
+        assert_validation_detail(svc.create_route(&ctx, bad.clone()).await, needle, case);
         let mut update = make_update_from_route(&route);
         update.match_rules = bad.match_rules;
         update.plugins = bad.plugins;
-        assert_validation(svc.update_route(&ctx, route.id, update).await, case);
+        assert_validation_detail(svc.update_route(&ctx, route.id, update).await, needle, case);
     }
 }
 
@@ -5672,8 +5766,8 @@ fn plugin_chain(count: usize) -> Option<crate::domain::model::PluginsConfig> {
     Some(crate::domain::model::PluginsConfig {
         sharing: crate::domain::model::SharingMode::Private,
         items: (0..count)
-            .map(|i| crate::domain::model::PluginBinding {
-                plugin_ref: format!("p{i}"),
+            .map(|_| crate::domain::model::PluginBinding {
+                plugin_ref: crate::domain::gts_helpers::REQUIRED_HEADERS_GUARD_PLUGIN_ID.into(),
                 config: Default::default(),
             })
             .collect(),
@@ -5745,7 +5839,7 @@ async fn nul_in_strings_stored_as_json_is_rejected_on_create_and_update() {
     let map = |key: &str, value: &str| HashMap::from([(key.to_owned(), value.to_owned())]);
     let auth = |config| {
         Some(AuthConfig {
-            plugin_type: "apikey".into(),
+            plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
             sharing: SharingMode::Private,
             config: Some(config),
         })
@@ -5766,7 +5860,7 @@ async fn nul_in_strings_stored_as_json_is_rejected_on_create_and_update() {
         Some(PluginsConfig {
             sharing: SharingMode::Private,
             items: vec![PluginBinding {
-                plugin_ref: "p".into(),
+                plugin_ref: crate::domain::gts_helpers::REQUIRED_HEADERS_GUARD_PLUGIN_ID.into(),
                 config,
             }],
         })
@@ -6281,7 +6375,7 @@ async fn cached_resolution_matches_uncached(backend: Backend) {
     let (cached, uncached, reader) = cached_and_uncached(&stores, &[root, a, b, leaf]);
     let shared = |rate| CreateUpstreamRequest {
         auth: Some(AuthConfig {
-            plugin_type: "noop".into(),
+            plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
             sharing: SharingMode::Inherit,
             config: None,
         }),
@@ -6441,7 +6535,7 @@ async fn cached_resolution_answers_not_found_and_disabled_as_uncached() {
     let (cached, uncached, reader) = cached_and_uncached(&stores, &[root, child]);
     let disabled = CreateUpstreamRequest {
         auth: Some(AuthConfig {
-            plugin_type: "noop".into(),
+            plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
             sharing: SharingMode::Inherit,
             config: None,
         }),
@@ -6826,7 +6920,7 @@ async fn an_ancestor_write_is_seen_by_a_descendant() {
     ];
     let auth = |sharing| {
         Some(AuthConfig {
-            plugin_type: "noop".into(),
+            plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
             sharing,
             config: None,
         })
@@ -6912,7 +7006,7 @@ async fn a_changed_tenant_chain_resolves_under_a_new_key() {
     let f = CachedPlanes::new(Arc::new(MockTenantResolverClient::single_tenant())).await;
     let shared = CreateUpstreamRequest {
         auth: Some(AuthConfig {
-            plugin_type: "noop".into(),
+            plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
             sharing: SharingMode::Inherit,
             config: None,
         }),
@@ -7146,7 +7240,7 @@ fn layer(hosts: &[&str], auth: Option<SharingMode>, headers: Option<&str>) -> Up
         Uuid::new_v4(),
         "svc",
         auth.map(|sharing| AuthConfig {
-            plugin_type: "apikey".into(),
+            plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
             sharing,
             config: None,
         }),
@@ -7269,7 +7363,7 @@ async fn an_auth_enforced_above_the_closest_ancestor_still_pins_the_server() {
 
     let mut root_req = make_create_upstream_ip("svc");
     root_req.auth = Some(AuthConfig {
-        plugin_type: "noop".into(),
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Enforce,
         config: None,
     });
@@ -7310,7 +7404,7 @@ async fn an_enforced_auth_pins_bindings_to_the_enforcing_ancestors_server() {
     ]);
     let svc = make_service_with_resolver(resolver);
     let auth = |sharing| AuthConfig {
-        plugin_type: "noop".into(),
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
         sharing,
         config: None,
     };
@@ -7368,7 +7462,7 @@ async fn an_enforced_auth_allows_bindings_on_part_of_its_endpoints() {
     };
     let mut root_req = two(&["10.0.0.1", "10.0.0.2"]);
     root_req.auth = Some(AuthConfig {
-        plugin_type: "noop".into(),
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Enforce,
         config: None,
     });
@@ -7402,7 +7496,7 @@ async fn withheld_credentials_are_counted_and_warned_once() {
 
     let mut root_req = make_create_upstream_ip("svc");
     root_req.auth = Some(AuthConfig {
-        plugin_type: "noop".into(),
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -7499,7 +7593,7 @@ async fn a_disabled_ancestors_enforced_auth_does_not_pin_bindings() {
     ]);
     let svc = make_service_with_resolver(resolver);
     let auth = |sharing| AuthConfig {
-        plugin_type: "noop".into(),
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
         sharing,
         config: None,
     };
@@ -7915,7 +8009,7 @@ mod management_permissions {
         let allowed = build(allow_all_enforcer());
         let mut shared = make_create_upstream_hostname();
         shared.auth = Some(AuthConfig {
-            plugin_type: "noop".into(),
+            plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
             sharing: SharingMode::Inherit,
             config: None,
         });
@@ -8231,7 +8325,7 @@ mod management_permissions {
         let allowed = build(allow_all_enforcer());
         let mut shared = make_create_upstream_hostname();
         shared.auth = Some(AuthConfig {
-            plugin_type: "noop".into(),
+            plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
             sharing: SharingMode::Inherit,
             config: None,
         });
@@ -8760,6 +8854,678 @@ async fn empty_scope_denies_each_ancestor_permission() {
             if !live {
                 assert!(matches!(result, Err(DomainError::Forbidden { .. })));
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Write-time validation (#4974)
+// ---------------------------------------------------------------------------
+
+mod write_validation {
+    use super::*;
+    use crate::domain::gts_helpers::{
+        APIKEY_AUTH_PLUGIN_ID, BASIC_AUTH_PLUGIN_ID, NOOP_AUTH_PLUGIN_ID,
+        OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID, REQUIRED_HEADERS_GUARD_PLUGIN_ID,
+        TIMEOUT_GUARD_PLUGIN_ID,
+    };
+    use crate::domain::model::{
+        AuthConfig, BurstConfig, PluginBinding, PluginsConfig, RateLimitAlgorithm, RateLimitConfig,
+        RateLimitScope, RateLimitStrategy, SharingMode, SustainedRate, Window,
+    };
+
+    /// A validation error on `field` with `reason`.
+    #[track_caller]
+    fn assert_violation<T: std::fmt::Debug>(
+        result: Result<T, DomainError>,
+        field: &str,
+        reason: &str,
+        case: &str,
+    ) {
+        match result {
+            Err(DomainError::Validation {
+                field: f,
+                reason: r,
+                ..
+            }) => {
+                assert_eq!((f, r), (field, reason), "{case}");
+            }
+            other => panic!("{case}: expected a {reason} violation on {field}, got {other:?}"),
+        }
+    }
+
+    fn limit(rate: u32, capacity: Option<u32>, cost: u32) -> RateLimitConfig {
+        RateLimitConfig {
+            sharing: SharingMode::Private,
+            algorithm: RateLimitAlgorithm::TokenBucket,
+            sustained: SustainedRate {
+                rate,
+                window: Window::Minute,
+            },
+            burst: capacity.map(|capacity| BurstConfig { capacity }),
+            scope: RateLimitScope::Tenant,
+            strategy: RateLimitStrategy::Reject,
+            cost,
+            budget: None,
+            response_headers: true,
+            pool_owner_id: None,
+        }
+    }
+
+    fn binding(plugin_ref: &str) -> Option<PluginsConfig> {
+        Some(PluginsConfig {
+            sharing: SharingMode::Private,
+            items: vec![PluginBinding {
+                plugin_ref: plugin_ref.into(),
+                config: Default::default(),
+            }],
+        })
+    }
+
+    async fn upstream(svc: &ControlPlaneServiceImpl, ctx: &SecurityContext) -> Upstream {
+        svc.create_upstream(ctx, make_create_upstream_hostname())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn route_paths_and_methods_are_required() {
+        let svc = make_service();
+        let ctx = test_ctx(Uuid::new_v4());
+        let up = upstream(&svc, &ctx).await;
+        let stored = svc
+            .create_route(&ctx, make_create_route(up.id))
+            .await
+            .unwrap();
+        for (case, path, methods, needle) in [
+            (
+                "an empty path",
+                "",
+                vec![HttpMethod::Post],
+                "route path must start with `/`",
+            ),
+            (
+                "a path without a leading /",
+                "v1/chat",
+                vec![HttpMethod::Post],
+                "route path must start with `/`",
+            ),
+            (
+                "no methods",
+                "/v1/chat",
+                vec![],
+                "match.http.methods must list at least one method",
+            ),
+        ] {
+            let mut req = make_create_route(up.id);
+            let http = req.match_rules.http.as_mut().unwrap();
+            http.path = path.into();
+            http.methods = methods.clone();
+            assert_validation_detail(svc.create_route(&ctx, req).await, needle, case);
+
+            let mut update = make_update_from_route(&stored);
+            let http = update.match_rules.http.as_mut().unwrap();
+            http.path = path.into();
+            http.methods = methods;
+            assert_validation_detail(
+                svc.update_route(&ctx, stored.id, update).await,
+                needle,
+                &format!("update: {case}"),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_port_zero_is_rejected() {
+        let svc = make_service();
+        let ctx = test_ctx(Uuid::new_v4());
+        let needle = "endpoint[0] port must be between 1 and 65535";
+        let mut req = make_create_upstream_hostname();
+        req.server.endpoints[0].port = 0;
+        assert_validation_detail(svc.create_upstream(&ctx, req).await, needle, "port 0");
+
+        let stored = upstream(&svc, &ctx).await;
+        let mut update = make_update_from_upstream(&stored);
+        update.server.endpoints[0].port = 0;
+        assert_validation_detail(
+            svc.update_upstream(&ctx, stored.id, update).await,
+            needle,
+            "update: port 0",
+        );
+    }
+
+    #[tokio::test]
+    async fn tags_follow_the_tag_pattern() {
+        let svc = make_service();
+        let ctx = test_ctx(Uuid::new_v4());
+        let needle = "tags[0] must match ^[a-z0-9_-]+$";
+        let stored = upstream(&svc, &ctx).await;
+        let up = upstream_ip(&svc, &ctx, "tag-routes").await;
+        let route = svc
+            .create_route(&ctx, make_create_route(up.id))
+            .await
+            .unwrap();
+        for tag in ["UPPER", "with space", "dot.ted", "", "é"] {
+            let mut req = make_create_upstream_hostname();
+            req.tags = vec![tag.into()];
+            assert_validation_detail(svc.create_upstream(&ctx, req).await, needle, tag);
+
+            let mut update = make_update_from_upstream(&stored);
+            update.tags = vec![tag.into()];
+            assert_validation_detail(
+                svc.update_upstream(&ctx, stored.id, update).await,
+                needle,
+                &format!("upstream update: {tag}"),
+            );
+
+            let mut req = make_create_route(up.id);
+            req.tags = vec![tag.into()];
+            assert_validation_detail(
+                svc.create_route(&ctx, req).await,
+                needle,
+                &format!("route: {tag}"),
+            );
+
+            let mut update = make_update_from_route(&route);
+            update.tags = vec![tag.into()];
+            assert_validation_detail(
+                svc.update_route(&ctx, route.id, update).await,
+                needle,
+                &format!("route update: {tag}"),
+            );
+        }
+        let mut update = make_update_from_upstream(&stored);
+        update.tags = vec!["team_a-1".into()];
+        svc.update_upstream(&ctx, stored.id, update).await.unwrap();
+    }
+
+    /// The edge rule is a create rule: an update cannot change the alias
+    /// (`aliases_stored_before_the_edge_rule_keep_resolving` covers the
+    /// update of a stored one).
+    #[tokio::test]
+    async fn alias_does_not_start_or_end_with_punctuation() {
+        let svc = make_service();
+        let ctx = test_ctx(Uuid::new_v4());
+        for alias in ["-svc", "svc-", ":svc", "svc:", ".svc"] {
+            assert_validation_detail(
+                svc.create_upstream(&ctx, make_create_upstream_ip(alias))
+                    .await,
+                "alias must not start or end with '.', '-' or ':'",
+                alias,
+            );
+        }
+        for alias in ["_svc", "svc_", "my-svc.v1"] {
+            svc.create_upstream(&ctx, make_create_upstream_ip(alias))
+                .await
+                .unwrap_or_else(|e| panic!("{alias}: {e:?}"));
+        }
+        // Trailing dots are stripped before the check (FQDN form).
+        let stored = svc
+            .create_upstream(&ctx, make_create_upstream_ip("dotted."))
+            .await
+            .unwrap();
+        assert_eq!(stored.alias, "dotted");
+    }
+
+    async fn upstream_ip(
+        svc: &ControlPlaneServiceImpl,
+        ctx: &SecurityContext,
+        alias: &str,
+    ) -> Upstream {
+        svc.create_upstream(ctx, make_create_upstream_ip(alias))
+            .await
+            .unwrap()
+    }
+
+    /// The edge rule runs on create only: an upstream stored before it,
+    /// with such an alias, keeps resolving at proxy time.
+    #[tokio::test]
+    async fn aliases_stored_before_the_edge_rule_keep_resolving() {
+        let upstreams = Arc::new(InMemoryUpstreamRepo::new());
+        let svc = make_service_over(upstreams.clone(), Arc::new(InMemoryRouteRepo::new()));
+        let tenant = Uuid::new_v4();
+        let ctx = test_ctx(tenant);
+        upstreams
+            .create(make_upstream(tenant, "svc-", None, None, None, vec![]))
+            .await
+            .unwrap();
+        let chain = svc.build_tenant_chain(&ctx).await.unwrap();
+        let found = svc
+            .resolve_alias(&ctx, &chain, "svc-", None, Tags::Load)
+            .await
+            .unwrap();
+        assert_eq!(found.0.alias, "svc-");
+
+        // An API update that keeps the alias goes through: the alias is not
+        // re-checked.
+        let stored = found.0;
+        let mut update = make_update_from_upstream(&stored);
+        update.alias = None;
+        let updated = svc.update_upstream(&ctx, stored.id, update).await.unwrap();
+        assert_eq!(updated.alias, "svc-");
+        // Nor when the client echoes the stored alias back (a PUT of a GET).
+        let echoed = make_update_from_upstream(&updated);
+        assert_eq!(echoed.alias.as_deref(), Some("svc-"));
+        let updated = svc.update_upstream(&ctx, stored.id, echoed).await.unwrap();
+        assert_eq!(updated.alias, "svc-");
+
+        // The registry re-applies the create rules on every update, so its
+        // instance has to be fixed first (the row is kept meanwhile).
+        let mut registry_row = make_upstream(tenant, "reg-", None, None, None, vec![]);
+        registry_row.server.endpoints[0].host = "10.0.0.1".into();
+        registry_row.managed_by = ManagedBy::Registry;
+        let registry_row = upstreams.create(registry_row).await.unwrap();
+        // An IP-based legacy row (the usual kind) keeps its alias when its
+        // endpoints change, with or without the alias echoed back.
+        let mut ip_row = make_upstream(tenant, "ip-", None, None, None, vec![]);
+        ip_row.server.endpoints[0].host = "10.0.0.2".into();
+        let ip_row = upstreams.create(ip_row).await.unwrap();
+        for (case, alias) in [("alias omitted", None), ("alias echoed", Some("ip-"))] {
+            let mut update = make_update_from_upstream(&ip_row);
+            update.server.endpoints[0].host = "10.0.0.3".into();
+            update.alias = alias.map(Into::into);
+            let updated = svc
+                .update_upstream(&ctx, ip_row.id, update)
+                .await
+                .unwrap_or_else(|e| panic!("{case}: {e:?}"));
+            assert_eq!(updated.alias, "ip-", "{case}");
+        }
+
+        // The registry's create rules refuse such an instance, so the
+        // reconcile skips it and keeps the row, as for any invalid instance.
+        let mut instance = make_create_upstream_ip("reg-");
+        instance.alias = Some("reg-".into());
+        assert_validation_detail(
+            svc.create_upstream_as(&ctx, instance, ManagedBy::Registry)
+                .await,
+            "must not start or end with",
+            "registry create of a legacy alias",
+        );
+        let mut update = make_update_from_upstream(&registry_row);
+        update.alias = Some("reg-".into());
+        assert_validation_detail(
+            svc.update_upstream_as(&ctx, registry_row.id, update, ManagedBy::Registry)
+                .await,
+            "must not start or end with",
+            "registry update of a legacy alias",
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_rate_limit_values_are_rejected_on_upstreams_and_routes() {
+        let svc = make_service();
+        let ctx = test_ctx(Uuid::new_v4());
+        let up = upstream(&svc, &ctx).await;
+        for (case, rl) in [
+            ("rate 0", limit(0, None, 1)),
+            ("capacity 0", limit(10, Some(0), 1)),
+            ("cost 0", limit(10, None, 0)),
+        ] {
+            let mut req = make_create_upstream_ip("rl-up");
+            req.rate_limit = Some(rl.clone());
+            assert_validation(svc.create_upstream(&ctx, req).await, case);
+            let mut route = make_create_route(up.id);
+            route.rate_limit = Some(rl);
+            assert_validation(svc.create_route(&ctx, route).await, case);
+        }
+        let mut route = make_create_route(up.id);
+        route.rate_limit = Some(limit(10, Some(20), 4));
+        let route = svc.create_route(&ctx, route).await.unwrap();
+
+        // Updates are checked the same way.
+        for (case, field, rl) in [
+            ("rate 0", "rate_limit.sustained.rate", limit(0, None, 1)),
+            (
+                "capacity 0",
+                "rate_limit.burst.capacity",
+                limit(10, Some(0), 1),
+            ),
+            ("cost 0", "rate_limit.cost", limit(10, None, 0)),
+        ] {
+            let mut update = make_update_from_upstream(&up);
+            update.rate_limit = Some(rl.clone());
+            assert_validation_detail(svc.update_upstream(&ctx, up.id, update).await, field, case);
+            let mut update = make_update_from_route(&route);
+            update.rate_limit = Some(rl);
+            assert_validation_detail(svc.update_route(&ctx, route.id, update).await, field, case);
+        }
+    }
+
+    #[tokio::test]
+    async fn http_endpoints_need_allow_http_upstream() {
+        let ctx = test_ctx(Uuid::new_v4());
+        let http = || {
+            let mut req = make_create_upstream_hostname();
+            req.server.endpoints[0].scheme = Scheme::Http;
+            req.server.endpoints[0].port = 80;
+            req
+        };
+        assert_violation(
+            make_service().create_upstream(&ctx, http()).await,
+            "server.endpoints.scheme",
+            oagw_sdk::field::HTTP_UPSTREAM_FORBIDDEN,
+            "http without the flag",
+        );
+        make_service()
+            .with_allow_http_upstream(true)
+            .create_upstream(&ctx, http())
+            .await
+            .unwrap();
+
+        // An update cannot switch a stored upstream to plain HTTP either.
+        for allow in [false, true] {
+            let svc = make_service().with_allow_http_upstream(allow);
+            let up = upstream(&svc, &ctx).await;
+            let mut update = make_update_from_upstream(&up);
+            update.server = http().server;
+            let result = svc.update_upstream(&ctx, up.id, update).await;
+            if allow {
+                result.unwrap();
+            } else {
+                match result {
+                    Err(DomainError::Validation { field, reason, .. }) => {
+                        assert_eq!(field, "server.endpoints.scheme");
+                        assert_eq!(reason, oagw_sdk::field::HTTP_UPSTREAM_FORBIDDEN);
+                    }
+                    other => panic!("expected HTTP_UPSTREAM_FORBIDDEN, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_ids_must_be_implemented_and_of_the_right_kind() {
+        let svc = make_service();
+        let ctx = test_ctx(Uuid::new_v4());
+        let not_implemented = oagw_sdk::field::NOT_IMPLEMENTED;
+        for (case, auth_type, reason) in [
+            ("a short id", "noop", not_implemented),
+            (
+                "a catalog-only auth plugin",
+                BASIC_AUTH_PLUGIN_ID,
+                not_implemented,
+            ),
+            // Implemented, but not an auth plugin: the wrong kind.
+            (
+                "a guard as auth",
+                REQUIRED_HEADERS_GUARD_PLUGIN_ID,
+                oagw_sdk::field::VALIDATION,
+            ),
+            (
+                "a transform as auth",
+                crate::domain::gts_helpers::REQUEST_ID_TRANSFORM_PLUGIN_ID,
+                oagw_sdk::field::VALIDATION,
+            ),
+        ] {
+            let mut req = make_create_upstream_hostname();
+            req.auth = Some(AuthConfig {
+                plugin_type: auth_type.into(),
+                sharing: SharingMode::Private,
+                config: None,
+            });
+            assert_violation(
+                svc.create_upstream(&ctx, req).await,
+                "auth.type",
+                reason,
+                case,
+            );
+        }
+        for (case, plugin_ref) in [
+            ("an unknown plugin", "audit-log"),
+            ("a catalog-only guard", TIMEOUT_GUARD_PLUGIN_ID),
+            (
+                "a custom plugin UUID",
+                "gts.cf.core.oagw.guard_plugin.v1~5e0a1900-0000-4000-8000-000000000001",
+            ),
+        ] {
+            let mut req = make_create_upstream_hostname();
+            req.plugins = binding(plugin_ref);
+            assert_violation(
+                svc.create_upstream(&ctx, req).await,
+                "plugins.items.plugin_ref",
+                not_implemented,
+                case,
+            );
+        }
+        // An auth plugin bound in the wrong place, implemented or not: a
+        // plain validation error.
+        for plugin_ref in [
+            APIKEY_AUTH_PLUGIN_ID,
+            BASIC_AUTH_PLUGIN_ID,
+            "gts.cf.core.oagw.auth_plugin.v1~5e0a1900-0000-4000-8000-000000000002",
+        ] {
+            let mut req = make_create_upstream_hostname();
+            req.plugins = binding(plugin_ref);
+            assert_violation(
+                svc.create_upstream(&ctx, req).await,
+                "plugins.items.plugin_ref",
+                oagw_sdk::field::VALIDATION,
+                plugin_ref,
+            );
+        }
+        let mut req = make_create_upstream_hostname();
+        req.auth = Some(AuthConfig {
+            plugin_type: NOOP_AUTH_PLUGIN_ID.into(),
+            sharing: SharingMode::Private,
+            config: None,
+        });
+        req.plugins = binding(REQUIRED_HEADERS_GUARD_PLUGIN_ID);
+        svc.create_upstream(&ctx, req).await.unwrap();
+    }
+
+    /// Every credential key an auth plugin reads is resolved on write, and
+    /// the error names the key.
+    #[tokio::test]
+    async fn every_credential_ref_is_checked_on_write() {
+        let svc = make_service_with_resolver_and_creds(
+            MockTenantResolverClient::single_tenant(),
+            vec![
+                ("cred://client-id".into(), "id".into()),
+                ("cred://client-secret".into(), "secret".into()),
+            ],
+        );
+        let ctx = test_ctx(Uuid::new_v4());
+        let oauth2 = |refs: &[(&str, &str)]| {
+            let mut config: std::collections::HashMap<String, String> = [(
+                "token_endpoint".to_owned(),
+                "https://idp.example.com/token".to_owned(),
+            )]
+            .into_iter()
+            .collect();
+            config.extend(refs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())));
+            Some(AuthConfig {
+                plugin_type: OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID.into(),
+                sharing: SharingMode::Private,
+                config: Some(config),
+            })
+        };
+        let missing_secret = [
+            ("client_id_ref", "cred://client-id"),
+            ("client_secret_ref", "cred://missing-secret"),
+        ];
+
+        let mut req = make_create_upstream_hostname();
+        req.auth = oauth2(&missing_secret);
+        assert_ref_not_accessible(
+            svc.create_upstream(&ctx, req).await,
+            "auth.config.client_secret_ref",
+        );
+
+        // The basic-auth variant reads the same references.
+        let mut req = make_create_upstream_hostname();
+        let mut basic = oauth2(&missing_secret).unwrap();
+        basic.plugin_type =
+            crate::domain::gts_helpers::OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID.into();
+        req.auth = Some(basic);
+        assert_ref_not_accessible(
+            svc.create_upstream(&ctx, req).await,
+            "auth.config.client_secret_ref",
+        );
+
+        // Only the credential keys are resolved: `other_ref` is not.
+        let mut req = make_create_upstream_hostname();
+        req.auth = oauth2(&[
+            ("client_id_ref", "cred://client-id"),
+            ("client_secret_ref", "cred://client-secret"),
+            ("other_ref", "cred://missing-other"),
+        ]);
+        let upstream = svc.create_upstream(&ctx, req).await.unwrap();
+
+        // The update path checks them too.
+        let mut update = make_update_from_upstream(&upstream);
+        update.auth = oauth2(&missing_secret);
+        assert_ref_not_accessible(
+            svc.update_upstream(&ctx, upstream.id, update).await,
+            "auth.config.client_secret_ref",
+        );
+
+        // A malformed reference names its key too.
+        let mut req = make_create_upstream_hostname();
+        req.auth = oauth2(&[
+            ("client_id_ref", "cred://not a ref"),
+            ("client_secret_ref", "cred://client-secret"),
+        ]);
+        match svc.create_upstream(&ctx, req).await {
+            Err(DomainError::Validation { field, detail, .. }) => {
+                assert_eq!(field, "auth.config.client_id_ref");
+                assert!(!detail.contains("not a ref"), "the ref is echoed: {detail}");
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+    }
+
+    /// A credential store that never answers fails the write after a
+    /// bounded wait instead of holding it (an SDK write has no deadline).
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_credential_store_fails_the_write() {
+        let svc = ControlPlaneServiceImpl::new(
+            Arc::new(InMemoryUpstreamRepo::new()),
+            Arc::new(InMemoryRouteRepo::new()),
+            Arc::new(MockTenantResolverClient::single_tenant()),
+            allow_all_enforcer(),
+            Arc::new(crate::domain::test_support::StalledCredStore),
+            Arc::new(SsrfGuard::disabled()),
+            None,
+        );
+        let mut req = make_create_upstream_hostname();
+        req.auth = Some(auth_with_secret_ref("cred://my-key"));
+        let started = tokio::time::Instant::now();
+        match svc.create_upstream(&test_ctx(Uuid::new_v4()), req).await {
+            Err(DomainError::Internal { message }) => {
+                assert!(message.contains("did not answer"), "{message}");
+            }
+            other => panic!("expected an internal error, got {other:?}"),
+        }
+        // The documented bound (the clock is paused, so this is exact).
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(5));
+    }
+
+    /// A credential key is resolved whatever the configured plugin: an
+    /// `apikey` config with an OAuth2 key, and a noop or OAuth2 config with a
+    /// `secret_ref`, are checked like the plugin that reads the key. A stored
+    /// value then stays valid if the upstream switches to that plugin.
+    #[tokio::test]
+    async fn credential_keys_are_resolved_whatever_the_plugin() {
+        let svc = make_service_with_resolver_and_creds(
+            MockTenantResolverClient::single_tenant(),
+            vec![
+                ("cred://my-key".into(), "k".into()),
+                ("cred://client-id".into(), "id".into()),
+                ("cred://client-secret".into(), "secret".into()),
+            ],
+        );
+        let ctx = test_ctx(Uuid::new_v4());
+        let auth = |plugin_type: &str, refs: &[(&str, &str)]| {
+            Some(AuthConfig {
+                plugin_type: plugin_type.into(),
+                sharing: SharingMode::Private,
+                config: Some(
+                    refs.iter()
+                        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                        .collect(),
+                ),
+            })
+        };
+        let oauth2_refs = [
+            ("token_endpoint", "https://idp.example.com/token"),
+            ("client_id_ref", "cred://client-id"),
+            ("client_secret_ref", "cred://client-secret"),
+        ];
+
+        let mut req = make_create_upstream_hostname();
+        req.auth = auth(
+            APIKEY_AUTH_PLUGIN_ID,
+            &[
+                ("secret_ref", "cred://my-key"),
+                ("client_id_ref", "cred://missing-secret"),
+            ],
+        );
+        assert_ref_not_accessible(
+            svc.create_upstream(&ctx, req).await,
+            "auth.config.client_id_ref",
+        );
+
+        let mut req = make_create_upstream_hostname();
+        req.auth = auth(
+            NOOP_AUTH_PLUGIN_ID,
+            &[("secret_ref", "cred://missing-secret")],
+        );
+        assert_ref_not_accessible(
+            svc.create_upstream(&ctx, req).await,
+            "auth.config.secret_ref",
+        );
+
+        let mut with_secret_ref = oauth2_refs.to_vec();
+        with_secret_ref.push(("secret_ref", "cred://missing-secret"));
+        let mut req = make_create_upstream_hostname();
+        req.auth = auth(OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID, &with_secret_ref);
+        assert_ref_not_accessible(
+            svc.create_upstream(&ctx, req).await,
+            "auth.config.secret_ref",
+        );
+
+        // A malformed one is refused too, on create and update.
+        let mut req = make_create_upstream_hostname();
+        req.auth = auth(NOOP_AUTH_PLUGIN_ID, &[("secret_ref", "cred://not a ref")]);
+        assert_validation_on(
+            svc.create_upstream(&ctx, req).await,
+            "auth.config.secret_ref",
+        );
+        let mut req = make_create_upstream_hostname();
+        req.auth = auth(OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID, &oauth2_refs);
+        let upstream = svc.create_upstream(&ctx, req).await.unwrap();
+        let mut with_secret_ref = oauth2_refs.to_vec();
+        with_secret_ref.push(("secret_ref", "cred://not a ref"));
+        let mut update = make_update_from_upstream(&upstream);
+        update.auth = auth(OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID, &with_secret_ref);
+        assert_validation_on(
+            svc.update_upstream(&ctx, upstream.id, update).await,
+            "auth.config.secret_ref",
+        );
+    }
+
+    #[track_caller]
+    fn assert_validation_on<T: std::fmt::Debug>(result: Result<T, DomainError>, expected: &str) {
+        match result {
+            Err(DomainError::Validation { field, detail, .. }) => {
+                assert_eq!(field, expected);
+                assert!(!detail.contains("not a ref"), "the ref is echoed: {detail}");
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+    }
+
+    #[track_caller]
+    fn assert_ref_not_accessible<T: std::fmt::Debug>(
+        result: Result<T, DomainError>,
+        expected: &str,
+    ) {
+        match result {
+            Err(DomainError::SecretRefNotAccessible { field, detail, .. }) => {
+                assert_eq!(field, expected);
+                assert!(!detail.contains("missing-secret"), "the ref is echoed");
+            }
+            other => panic!("expected SecretRefNotAccessible, got {other:?}"),
         }
     }
 }

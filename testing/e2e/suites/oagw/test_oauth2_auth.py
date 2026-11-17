@@ -12,10 +12,14 @@ import pytest
 from .helpers import (
     OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID,
     OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID,
+    UPSTREAM_SCHEMA,
     assert_problem,
+    assert_problem_body,
     create_route,
     create_upstream,
     create_upstream_raw,
+    err_type,
+    traced,
     unique_alias,
 )
 
@@ -82,12 +86,6 @@ async def test_oauth2_client_cred_injects_bearer(
 
 @pytest.mark.scenario("negative-9.7-secret-access-control-cred-store", part="B")
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="M-10: OAuth2 *_ref keys are not resolved at write time "
-           "(today the create succeeds and the proxy call fails with 500)",
-)
 async def test_oauth2_client_cred_missing_secret_rejected_at_write(
     oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
 ):
@@ -100,11 +98,30 @@ async def test_oauth2_client_cred_missing_secret_rejected_at_write(
     )
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await create_upstream_raw(
-            client, oagw_base_url, oagw_headers, mock_upstream_url, alias=alias, auth=auth,
+            client, oagw_base_url, traced(oagw_headers), mock_upstream_url, alias=alias, auth=auth,
         )
         if resp.status_code == 201:
             cleanup.upstream(oagw_headers, resp.json())
-        assert_problem(resp, 400, esrc=None, category="failed_precondition")
+        # The refs are checked in key order; the violation names the first one
+        # and does not quote it.
+        assert_problem_body(resp, {
+            "type": err_type("failed_precondition"),
+            "title": "Failed Precondition",
+            "status": 400,
+            "detail": "Operation precondition not met",
+            "instance": "/oagw/v1/upstreams",
+            "context": {
+                "violations": [{
+                    "type": "STATE",
+                    "subject": "auth.config.client_id_ref",
+                    "description": (
+                        "credential reference is not accessible to this tenant "
+                        "(not provisioned yet, or not shared)"
+                    ),
+                }],
+                "resource_type": UPSTREAM_SCHEMA,
+            },
+        })
 
 
 @pytest.mark.scenario("negative-9.7-secret-access-control-cred-store", part="B")

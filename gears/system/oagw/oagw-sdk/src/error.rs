@@ -185,7 +185,10 @@ pub enum ServiceGatewayError {
         /// impl grows new precondition categories.
         precondition_type: String,
         /// `subject` from the canonical `PreconditionViolation`: the guard
-        /// plugin's `error_code`, `auth.config.secret_ref`, or
+        /// plugin's `error_code`, a credential key
+        /// ([`crate::precondition::SECRET_REF`],
+        /// [`crate::precondition::CLIENT_ID_REF`],
+        /// [`crate::precondition::CLIENT_SECRET_REF`]), or
         /// [`crate::precondition::MANAGED_BY`].
         subject: String,
         detail: String,
@@ -480,6 +483,8 @@ mod sdk_vocabulary_round_trip_tests {
             field::PATH_SUFFIX_NOT_ALLOWED,
             field::UNSUPPORTED_SCHEME,
             field::HTTP_UPSTREAM_FORBIDDEN,
+            field::NOT_IMPLEMENTED,
+            field::UNSUPPORTED_QUERY_PARAM,
         ];
 
         for code in cases {

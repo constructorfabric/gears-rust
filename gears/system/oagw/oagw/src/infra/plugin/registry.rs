@@ -256,3 +256,186 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod implemented_ids_tests {
+    use super::*;
+    use crate::domain::gts_helpers::{
+        IMPLEMENTED_AUTH_PLUGIN_IDS, IMPLEMENTED_GUARD_PLUGIN_IDS, IMPLEMENTED_TRANSFORM_PLUGIN_IDS,
+    };
+
+    fn sorted<'a>(ids: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+        let mut ids: Vec<&str> = ids.into_iter().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Write-time validation accepts exactly the plugins the registries run.
+    #[test]
+    fn implemented_ids_match_the_registries() {
+        let auth = AuthPluginRegistry::with_builtins(
+            Arc::new(credstore_sdk::test_util::MockCredStoreClient::empty()),
+            None,
+            TokenCacheConfig::default(),
+        );
+        assert_eq!(
+            sorted(auth.plugins.keys().map(String::as_str)),
+            sorted(IMPLEMENTED_AUTH_PLUGIN_IDS.iter().copied())
+        );
+        assert_eq!(
+            sorted(
+                GuardPluginRegistry::with_builtins()
+                    .plugins
+                    .keys()
+                    .map(String::as_str)
+            ),
+            sorted(IMPLEMENTED_GUARD_PLUGIN_IDS.iter().copied())
+        );
+        assert_eq!(
+            sorted(
+                TransformPluginRegistry::with_builtins()
+                    .plugins
+                    .keys()
+                    .map(String::as_str)
+            ),
+            sorted(IMPLEMENTED_TRANSFORM_PLUGIN_IDS.iter().copied())
+        );
+        // Every implemented auth plugin says which credential references
+        // it reads, so writes check them.
+        assert_eq!(
+            sorted(
+                crate::domain::plugin::credentials::AUTH_PLUGIN_CREDENTIAL_KEYS
+                    .iter()
+                    .map(|(plugin, _)| *plugin)
+            ),
+            sorted(IMPLEMENTED_AUTH_PLUGIN_IDS.iter().copied())
+        );
+        // Writes check `CREDENTIAL_KEYS`: it holds exactly the keys the
+        // plugins read.
+        let mut read: Vec<&str> = crate::domain::plugin::credentials::AUTH_PLUGIN_CREDENTIAL_KEYS
+            .iter()
+            .flat_map(|(_, keys)| keys.iter().map(|k| k.key))
+            .collect();
+        read.sort_unstable();
+        read.dedup();
+        assert_eq!(
+            read,
+            sorted(
+                crate::domain::plugin::credentials::CREDENTIAL_KEYS
+                    .iter()
+                    .map(|k| k.key)
+            )
+        );
+    }
+
+    /// Each implemented auth plugin needs exactly the credential keys the
+    /// table lists: without any one of them it refuses its config.
+    #[tokio::test]
+    async fn credential_keys_are_the_ones_each_plugin_needs() {
+        use crate::domain::plugin::AuthContext;
+        use crate::domain::plugin::credentials::AUTH_PLUGIN_CREDENTIAL_KEYS;
+
+        let auth = AuthPluginRegistry::with_builtins(
+            Arc::new(credstore_sdk::test_util::MockCredStoreClient::empty()),
+            None,
+            TokenCacheConfig::default(),
+        );
+        let ctx = toolkit_security::SecurityContext::builder()
+            .subject_tenant_id(uuid::Uuid::new_v4())
+            .subject_id(uuid::Uuid::new_v4())
+            .build()
+            .unwrap();
+        let full = |keys: &[crate::domain::plugin::credentials::CredentialKey]| {
+            let mut config: std::collections::HashMap<String, String> = [
+                ("header", "authorization"),
+                ("token_endpoint", "https://idp.example.com/token"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+            for key in keys {
+                config.insert(key.key.to_owned(), "cred://k".to_owned());
+            }
+            config
+        };
+        for (plugin_id, keys) in AUTH_PLUGIN_CREDENTIAL_KEYS {
+            let plugin = auth.resolve(plugin_id).unwrap();
+            // With every listed key the config is complete: the plugin gets
+            // as far as the (empty) credential store, or needs none at all.
+            let mut auth_ctx = AuthContext {
+                headers: Default::default(),
+                config: full(keys),
+                security_context: ctx.clone(),
+            };
+            let complete = plugin.authenticate(&mut auth_ctx).await;
+            if keys.is_empty() {
+                assert!(complete.is_ok(), "{plugin_id}: {complete:?}");
+            } else {
+                assert!(
+                    matches!(
+                        complete,
+                        Err(crate::domain::plugin::PluginError::SecretNotFound(_))
+                    ),
+                    "{plugin_id} with every listed key: {complete:?}"
+                );
+            }
+            // Each listed key holds a credential reference: with a distinct
+            // ref per key and a store holding all but one, the lookup fails
+            // on that one's ref.
+            for absent in *keys {
+                let store = credstore_sdk::test_util::MockCredStoreClient::with_secrets(
+                    keys.iter()
+                        .filter(|k| k.key != absent.key)
+                        .map(|k| (format!("ref-{}", k.key), "v".to_owned()))
+                        .collect(),
+                );
+                let plugin = AuthPluginRegistry::with_builtins(
+                    Arc::new(store),
+                    None,
+                    TokenCacheConfig::default(),
+                )
+                .resolve(plugin_id)
+                .unwrap();
+                let mut config = full(keys);
+                for key in *keys {
+                    config.insert(key.key.to_owned(), format!("cred://ref-{}", key.key));
+                }
+                let mut auth_ctx = AuthContext {
+                    headers: Default::default(),
+                    config,
+                    security_context: ctx.clone(),
+                };
+                match plugin.authenticate(&mut auth_ctx).await {
+                    Err(crate::domain::plugin::PluginError::SecretNotFound(r)) => assert!(
+                        r.contains(&format!("ref-{}", absent.key)),
+                        "{plugin_id} without the secret of {}: {r}",
+                        absent.key
+                    ),
+                    other => panic!(
+                        "{plugin_id} without the secret of {}: {other:?}",
+                        absent.key
+                    ),
+                }
+            }
+            for missing in *keys {
+                let mut config = full(keys);
+                config.remove(missing.key);
+                let mut auth_ctx = AuthContext {
+                    headers: Default::default(),
+                    config,
+                    security_context: ctx.clone(),
+                };
+                // The plugin refuses its config and names the key (the
+                // error kind is the plugin's own).
+                match plugin.authenticate(&mut auth_ctx).await {
+                    Err(e) => assert!(
+                        e.to_string().contains(missing.key),
+                        "{plugin_id} without {}: {e}",
+                        missing.key
+                    ),
+                    Ok(()) => panic!("{plugin_id} ran without {}", missing.key),
+                }
+            }
+        }
+    }
+}

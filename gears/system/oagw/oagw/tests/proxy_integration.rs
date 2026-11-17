@@ -1001,16 +1001,33 @@ async fn proxy_query_allowlist_unknown_param_rejected() {
     }
 }
 
-// 13.5: Non-existent auth plugin ID returns error through proxy pipeline.
-#[tokio::test]
-async fn proxy_nonexistent_auth_plugin_returns_error() {
-    let h = AppHarness::builder().build().await;
-    let ctx = h.security_context().clone();
+/// Assert `err` is a 400 field violation with `reason`.
+fn assert_invalid_argument(err: CanonicalError, field: &str, reason: &str) {
+    match err {
+        CanonicalError::InvalidArgument { ctx, .. } => match ctx {
+            toolkit_canonical_errors::InvalidArgument::FieldViolations { field_violations } => {
+                assert!(
+                    field_violations
+                        .iter()
+                        .any(|v| v.field == field && v.reason == reason),
+                    "{field_violations:?}"
+                );
+            }
+            other => panic!("expected FieldViolations, got {other:?}"),
+        },
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    }
+}
 
-    let upstream = h
+// 13.5: an auth plugin OAGW does not implement is refused on write (#4974),
+// not left to fail every proxied request.
+#[tokio::test]
+async fn create_with_unknown_auth_plugin_is_rejected() {
+    let h = AppHarness::builder().build().await;
+    let err = h
         .facade()
         .create_upstream(
-            ctx.clone(),
+            h.security_context().clone(),
             CreateUpstreamRequest::builder(
                 Server {
                     endpoints: vec![Endpoint {
@@ -1031,37 +1048,8 @@ async fn proxy_nonexistent_auth_plugin_returns_error() {
             .build(),
         )
         .await
-        .unwrap();
-
-    h.facade()
-        .create_route(
-            ctx.clone(),
-            CreateRouteRequest::builder(
-                upstream.id,
-                MatchRules {
-                    http: Some(HttpMatch {
-                        methods: vec![HttpMethod::Get],
-                        path: "/v1/test".into(),
-                        query_allowlist: vec![],
-                        path_suffix_mode: PathSuffixMode::Append,
-                    }),
-                    grpc: None,
-                },
-            )
-            .build(),
-        )
-        .await
-        .unwrap();
-
-    let req = http::Request::builder()
-        .method(Method::GET)
-        .uri("/bad-auth/v1/test")
-        .body(Body::Empty)
-        .unwrap();
-    match h.facade().proxy_request(ctx.clone(), req).await {
-        Err(err) => assert!(matches!(err, CanonicalError::Unauthenticated { .. })),
-        Ok(_) => panic!("expected authentication error for non-existent plugin"),
-    }
+        .expect_err("an unknown auth plugin must be refused");
+    assert_invalid_argument(err, "auth.type", "NOT_IMPLEMENTED");
 }
 
 // 13.6: Assert on recorded_requests() URI and body content.
@@ -2977,28 +2965,16 @@ async fn proxy_oauth2_client_cred_injects_bearer_token() {
     assert_eq!(auth_header, "Bearer tok-oauth2-test");
 }
 
-/// 9.5: OAuth2 CC with missing credentials — credstore returns not found.
+/// 9.5: OAuth2 CC refs that the credential store does not hold are refused
+/// on write (#4974), naming the key, instead of failing every request.
 #[tokio::test]
-async fn proxy_oauth2_missing_credentials_returns_error() {
-    let mut guard = MockGuard::new();
-    guard.mock(
-        "GET",
-        "/api/resource",
-        MockResponse {
-            status: 200,
-            headers: vec![],
-            body: MockBody::Json(json!({"status":"ok"})),
-        },
-    );
-
+async fn oauth2_refs_are_checked_on_write() {
     // No credentials loaded for the OAuth2 refs.
     let h = AppHarness::builder().build().await;
-    let ctx = h.security_context().clone();
-
-    let upstream = h
+    let err = h
         .facade()
         .create_upstream(
-            ctx.clone(),
+            h.security_context().clone(),
             CreateUpstreamRequest::builder(
                 Server {
                     endpoints: vec![Endpoint {
@@ -3017,11 +2993,7 @@ async fn proxy_oauth2_missing_credentials_returns_error() {
                     [
                         (
                             "token_endpoint".into(),
-                            format!(
-                                "http://127.0.0.1:{}{}",
-                                h.mock_port(),
-                                guard.path("/oauth/token")
-                            ),
+                            format!("http://127.0.0.1:{}/oauth/token", h.mock_port()),
                         ),
                         ("client_id_ref".into(), "cred://missing-id".into()),
                         ("client_secret_ref".into(), "cred://missing-secret".into()),
@@ -3033,40 +3005,23 @@ async fn proxy_oauth2_missing_credentials_returns_error() {
             .build(),
         )
         .await
-        .unwrap();
-
-    h.facade()
-        .create_route(
-            ctx.clone(),
-            CreateRouteRequest::builder(
-                upstream.id,
-                MatchRules {
-                    http: Some(HttpMatch {
-                        methods: vec![HttpMethod::Get],
-                        path: guard.path("/api/resource"),
-                        query_allowlist: vec![],
-                        path_suffix_mode: PathSuffixMode::Disabled,
-                    }),
-                    grpc: None,
-                },
-            )
-            .build(),
-        )
-        .await
-        .unwrap();
-
-    let req = http::Request::builder()
-        .method(Method::GET)
-        .uri(format!(
-            "/oauth2-missing-creds{}",
-            guard.path("/api/resource")
-        ))
-        .body(Body::Empty)
-        .unwrap();
-    let response = h.facade().proxy_request(ctx, req).await;
-
-    // Should fail with a secret-not-found error.
-    assert!(response.is_err());
+        .expect_err("refs the credential store does not hold must be refused");
+    match err {
+        CanonicalError::FailedPrecondition { ctx, detail, .. } => {
+            let subjects: Vec<&str> = ctx.violations.iter().map(|v| v.subject.as_str()).collect();
+            assert_eq!(subjects, ["auth.config.client_id_ref"]);
+            // The reference itself is not echoed.
+            assert!(!detail.contains("missing-id"), "{detail}");
+            assert!(
+                ctx.violations
+                    .iter()
+                    .all(|v| !v.description.contains("missing-id")),
+                "{:?}",
+                ctx.violations
+            );
+        }
+        other => panic!("expected FailedPrecondition, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3549,29 +3504,14 @@ async fn proxy_transform_preserves_request_id() {
     );
 }
 
-/// Verify that a failing transform plugin (unknown GTS ID) does not block the
-/// proxy pipeline — the request still succeeds (log-and-continue).
+/// A transform plugin OAGW does not implement is refused on write (#4974).
 #[tokio::test]
-async fn proxy_transform_error_continues_pipeline() {
-    let mut guard = MockGuard::new();
-    guard.mock(
-        "POST",
-        "/transform-error",
-        MockResponse {
-            status: 200,
-            headers: vec![("content-type".into(), "application/json".into())],
-            body: MockBody::Json(json!({"ok": true})),
-        },
-    );
-
+async fn create_with_unknown_transform_plugin_is_rejected() {
     let h = AppHarness::builder().build().await;
-    let ctx = h.security_context().clone();
-
-    // Bind a non-existent transform plugin — resolution will fail.
-    let upstream = h
+    let err = h
         .facade()
         .create_upstream(
-            ctx.clone(),
+            h.security_context().clone(),
             CreateUpstreamRequest::builder(
                 Server {
                     endpoints: vec![Endpoint {
@@ -3596,45 +3536,8 @@ async fn proxy_transform_error_continues_pipeline() {
             .build(),
         )
         .await
-        .unwrap();
-
-    h.facade()
-        .create_route(
-            ctx.clone(),
-            CreateRouteRequest::builder(
-                upstream.id,
-                MatchRules {
-                    http: Some(HttpMatch {
-                        methods: vec![HttpMethod::Post],
-                        path: guard.path("/transform-error"),
-                        query_allowlist: vec![],
-                        path_suffix_mode: PathSuffixMode::Disabled,
-                    }),
-                    grpc: None,
-                },
-            )
-            .build(),
-        )
-        .await
-        .unwrap();
-
-    // Request should succeed despite the broken transform plugin.
-    let req = http::Request::builder()
-        .method(Method::POST)
-        .uri(format!(
-            "/transform-error{}",
-            guard.path("/transform-error")
-        ))
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"test": true}"#))
-        .unwrap();
-
-    let response = h.facade().proxy_request(ctx.clone(), req).await.unwrap();
-    assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "pipeline should continue despite transform resolution failure"
-    );
+        .expect_err("an unknown transform plugin must be refused");
+    assert_invalid_argument(err, "plugins.items.plugin_ref", "NOT_IMPLEMENTED");
 }
 
 // ---------------------------------------------------------------------------

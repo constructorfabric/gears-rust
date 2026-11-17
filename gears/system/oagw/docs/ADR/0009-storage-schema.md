@@ -132,9 +132,9 @@ Chosen option: "Portable relational baseline + JSON blobs", because it keeps hot
   - `plugin_ref` must represent the same UUID (exact format is an application concern; comparisons must be done on the parsed UUID).
   - The referenced row must exist in `oagw_plugin` within scope.
 - If `plugin_uuid` is NULL on a binding row:
-  - `plugin_ref` must resolve to a built-in plugin in the registry. (Planned, with custom plugin support.)
-- `auth_plugin_ref/auth_plugin_uuid` (when present) must resolve to an **auth** plugin. (Planned, with custom plugin support.)
-- `oagw_upstream_plugin` / `oagw_route_plugin` bindings must not reference auth plugins (auth is configured only via `auth_plugin_*`). (Planned, with custom plugin support.)
+  - `plugin_ref` must resolve to a built-in guard or transform plugin in the registry. (Enforced on write: anything else is a 400 `NOT_IMPLEMENTED`.)
+- `auth_plugin_ref/auth_plugin_uuid` (when present) must resolve to an **auth** plugin. (Enforced on write for named plugins; custom UUID plugins are rejected until they are implemented.)
+- `oagw_upstream_plugin` / `oagw_route_plugin` bindings must not reference auth plugins (auth is configured only via `auth_plugin_*`). (Enforced on write.)
 - Binding ordering:
   - `position` is unique per `(upstream_id)` / `(route_id)` by PK.
   - Positions start at 0 and are contiguous (no gaps): the repositories assign them from the list order on write.

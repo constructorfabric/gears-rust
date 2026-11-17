@@ -19,7 +19,7 @@ Authorization: Bearer <tenant-token>
 
 ## Post-conditions
 
-- `GET /api/oagw/v1/routes?$filter=upstream_id eq '<uuid>'` returns empty (or routes are deleted).
+- `GET /api/oagw/v1/routes?upstream_id=<upstream GTS id>` returns an empty list. (`$filter=upstream_id eq '<uuid>'` is planned; today it returns `400 UNSUPPORTED_QUERY_PARAM`.)
 - Proxy invocation:
 
 ```http

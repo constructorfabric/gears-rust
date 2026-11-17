@@ -80,7 +80,7 @@ impl RegistryProvisioner for RegistryProvisionerImpl {
     }
 
     fn check_registry_upstream(&self, req: &CreateUpstreamRequest) -> Result<String, DomainError> {
-        validate_upstream_request(&self.cp.ssrf_guard, req)
+        validate_upstream_request(&self.cp.ssrf_guard, self.cp.allow_http_upstream, req)
     }
 
     async fn create_registry_route(

@@ -67,6 +67,7 @@ impl AuthPlugin for ApiKeyAuthPlugin {
 
 #[cfg(test)]
 mod tests {
+    use crate::domain::plugin::credentials::SECRET_REF_KEY;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -82,7 +83,7 @@ mod tests {
         HashMap::from([
             ("header".into(), header.into()),
             ("prefix".into(), prefix.into()),
-            ("secret_ref".into(), secret_ref.into()),
+            (SECRET_REF_KEY.into(), secret_ref.into()),
         ])
     }
 

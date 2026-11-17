@@ -70,6 +70,17 @@ proxy_timeout_secs = 30
 "my-api-key" = "sk-..."
 ```
 
+OAGW checks these values at startup and does not start if one is out of range:
+
+| Key | Allowed | Default |
+|---|---|---|
+| `proxy_timeout_secs` | 1 to 86400 (a day) | 30 |
+| `streaming_idle_timeout_secs` | 1 to 86400 | 300 |
+| `websocket_idle_timeout_secs` | 1 to 86400 | 300 |
+| `websocket_close_timeout_secs` | 1 to 86400 | 5 |
+| `max_body_size_bytes` | 1 to 104857600 (100 MiB, the DESIGN hard limit) | 104857600 |
+| `token_cache_capacity` | at least 1 | 10000 |
+
 ## Persistence
 
 Upstreams and routes are kept in memory unless the gear has a database. To persist them across restarts, add a `database` section to `gears.oagw`:

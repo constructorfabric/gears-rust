@@ -1,5 +1,5 @@
 use axum::Json;
-use axum::extract::{Extension, Path, Query};
+use axum::extract::{Extension, Path};
 use axum::response::IntoResponse;
 use http::StatusCode;
 use toolkit_canonical_errors::Problem;
@@ -7,7 +7,7 @@ use toolkit_security::SecurityContext;
 
 use crate::api::rest::dto::{CreateUpstreamRequest, UpdateUpstreamRequest, UpstreamResponse};
 use crate::api::rest::error::domain_error_to_problem;
-use crate::api::rest::extractors::{PaginationQuery, parse_gts_id};
+use crate::api::rest::extractors::{PaginationQuery, parse_gts_id, parse_list_query};
 use crate::domain::gts_helpers as gts;
 use crate::domain::model::Upstream;
 use crate::gear::AppState;
@@ -62,8 +62,9 @@ pub async fn get_upstream(
 pub async fn list_upstreams(
     Extension(state): Extension<AppState>,
     Extension(ctx): Extension<SecurityContext>,
-    Query(pagination): Query<PaginationQuery>,
+    uri: http::Uri,
 ) -> Result<impl IntoResponse, Box<Problem>> {
+    let pagination: PaginationQuery = parse_list_query(&uri, "/oagw/v1/upstreams")?;
     let query = pagination.to_list_query();
     let upstreams = state
         .cp
