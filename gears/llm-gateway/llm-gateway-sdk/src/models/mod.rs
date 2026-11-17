@@ -10,11 +10,15 @@
 //! - [`tools`] — tool definitions.
 //! - [`streaming`] — server-sent streaming events.
 //! - [`plugin`] — provider-plugin call context and capabilities.
+//! - [`passthrough`] — pass-through requests, native responses and events,
+//!   and the endpoint allowlist; the in-process request and response types
+//!   carry streams and are not serializable.
 
 pub mod content;
 pub mod core;
 pub mod extension;
 pub mod items;
+pub mod passthrough;
 pub mod plugin;
 pub mod role;
 pub mod streaming;

@@ -150,10 +150,15 @@ pub enum LlmGatewayError {
     /// `capability_not_supported` — the model or the provider integration
     /// lacks a capability the request needs (streaming, image or file input,
     /// tool calling, web search, a reasoning option, structured output,
-    /// embeddings).
+    /// embeddings, a pass-through API), or a pass-through request carries a
+    /// stateful field or a paid provider tool. `param` is the JSON path of the
+    /// offending field when known.
     #[error("capability not supported: {capability}")]
     #[non_exhaustive]
-    CapabilityNotSupported { capability: String },
+    CapabilityNotSupported {
+        capability: String,
+        param: Option<String>,
+    },
 
     /// `unsupported_parameter` — a generic parameter the model does not
     /// support, and `drop_unsupported_params` is not set (or the parameter is
@@ -184,8 +189,11 @@ pub enum LlmGatewayError {
     #[non_exhaustive]
     MediaNotFound { param: Option<String> },
 
-    /// `credentials_unavailable` — the provider API key referenced by the
-    /// model cannot be fetched from `CredStore`.
+    /// `credentials_unavailable` — OAGW cannot use the credential named by the
+    /// model's `secret_ref` (secret missing, inaccessible to the caller, or
+    /// `CredStore` unavailable), so it forwards nothing. The provider plugin
+    /// returns it when OAGW refuses the call for that reason; it never falls
+    /// back to another credential.
     #[error("credentials unavailable")]
     CredentialsUnavailable,
 
@@ -302,7 +310,9 @@ impl LlmGatewayError {
             ..ResponseError::default()
         };
         match self {
-            Self::Validation { param, .. } | Self::MediaNotFound { param } => {
+            Self::Validation { param, .. }
+            | Self::MediaNotFound { param }
+            | Self::CapabilityNotSupported { param, .. } => {
                 error.param.clone_from(param);
             }
             Self::UnsupportedParameter { param } => error.param = Some(param.clone()),
@@ -385,6 +395,21 @@ impl LlmGatewayError {
     pub fn capability_not_supported(capability: impl Into<String>) -> Self {
         Self::CapabilityNotSupported {
             capability: capability.into(),
+            param: None,
+        }
+    }
+
+    /// `capability_not_supported` for the request field at `param` (for
+    /// example a denylisted pass-through field such as
+    /// `input[0].content[1].file_id`).
+    #[must_use]
+    pub fn capability_not_supported_param(
+        capability: impl Into<String>,
+        param: impl Into<String>,
+    ) -> Self {
+        Self::CapabilityNotSupported {
+            capability: capability.into(),
+            param: Some(param.into()),
         }
     }
 
