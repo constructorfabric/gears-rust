@@ -662,6 +662,7 @@ pub struct SessionOpening {
 /// of it and, for a stream open, the guard of the worker that refreshes it.
 /// Dropping the feed, which the session does when the stream is dropped,
 /// cancels that worker.
+#[domain_model]
 #[derive(Debug)]
 pub struct ScopeFeed {
     receiver: watch::Receiver<Option<Arc<CachedScope>>>,

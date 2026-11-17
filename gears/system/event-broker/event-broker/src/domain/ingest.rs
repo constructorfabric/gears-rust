@@ -441,6 +441,7 @@ pub struct ProducerCursors {
 /// before it authorizes each item, so an item the caller did not ask for
 /// costs no PDP call: REST passes its `$filter`, in-process callers pass
 /// [`Selection::all`].
+#[domain_model]
 pub struct Selection<'a, T> {
     keep: Option<Keep<'a, T>>,
 }

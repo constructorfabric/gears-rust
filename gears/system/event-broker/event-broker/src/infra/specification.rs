@@ -1456,7 +1456,10 @@ mod tests {
     #[tokio::test]
     async fn a_topic_with_256_event_types_lists_them_and_one_with_257_is_over_the_cap() {
         let type_id = |name: &str, n: usize| {
-            format!("gts.cf.core.events.event.v1~x.eb.cand.{name}_{n:03}.v1~")
+            format!(
+                "{}example.eb.cand.{name}_{n:03}.v1~",
+                toolkit_gts::gts_id!("cf.core.events.event.v1~")
+            )
         };
         let mut event_types: Vec<(String, &str, Vec<&str>)> = (0..256)
             .map(|n| (type_id("at_cap", n), TOPIC_AT_CAP, vec![SUBJECT_S1]))
@@ -1658,8 +1661,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_stored_event_type_id_that_does_not_parse_is_an_internal_error_without_it() {
-        const PLANTED: &str = "gts.PLANTED.event~";
-        let raw = GtsTypeId::try_new(PLANTED)
+        let planted = format!("{}PLANTED.event~", toolkit_gts::GTS_ID_PREFIX);
+        let raw = GtsTypeId::try_new(&planted)
             .expect_err("the planted id does not parse")
             .to_string();
         assert!(raw.contains("PLANTED"), "{raw}");
@@ -1671,7 +1674,7 @@ mod tests {
             &[(TYPE_A1.to_owned(), TOPIC_A, vec![SUBJECT_S1])],
         )
         .await;
-        plant(&db, TYPE_A1, super::SpecCacheColumn::GtsId, PLANTED).await;
+        plant(&db, TYPE_A1, super::SpecCacheColumn::GtsId, &planted).await;
         let manager = super::TypesRegistrySpecificationManager::new(db);
 
         let err = manager

@@ -38,6 +38,7 @@ pub struct ProvisioningLimits {
 }
 
 /// A topic's registered event type with the subject types it allows.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq)]
 pub struct EventTypeCandidate {
     pub id: GtsTypeId,
@@ -46,6 +47,7 @@ pub struct EventTypeCandidate {
 
 /// A topic's registered event types, or the fact that it has more than
 /// [`Self::CAP`].
+#[domain_model]
 #[derive(Debug, Clone, PartialEq)]
 pub enum EventTypeCandidates {
     /// Every registered event type of the topic, in the order the database
