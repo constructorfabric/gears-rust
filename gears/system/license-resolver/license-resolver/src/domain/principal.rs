@@ -28,8 +28,10 @@ impl PrincipalMapper {
     }
 
     /// The Subject contract type for `principal_type`: its own entry, else the
-    /// entry of its nearest ancestor. `None` when the principal is not mapped,
-    /// including an empty (absent), malformed or unregistered principal type.
+    /// entry of its nearest ancestor. `None` when the principal is not mapped:
+    /// an empty principal type, or one without an entry that is malformed,
+    /// unregistered or has no mapped ancestor. An exact entry applies without
+    /// the registry, registered or not.
     ///
     /// # Errors
     ///

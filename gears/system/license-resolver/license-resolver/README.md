@@ -94,9 +94,11 @@ gears:
       vendor: "constructorfabric"   # selects the backend plugin
       principal_subject_types:      # principal type -> Subject contract type
         "gts.cf.core.identity.principal.v1~cf.core.identity.user.v1~": "gts.cf.core.lic.subj.v1~acme.lic.licensing.user.v1~"
+        # legacy `subject_type` value, until the platform principal types are registered
+        "user": "gts.cf.core.lic.subj.v1~acme.lic.licensing.user.v1~"
 ```
 
-A principal type without an entry takes the entry of its nearest ancestor in types-registry. A principal that is not mapped — no entry, no `subject_type` in the `SecurityContext`, or a type types-registry does not know — gets `granted: false` with the diagnostic `reason: principal_not_mapped`, without validating the resource or calling the plugin. The mapped subject carries the principal id and empty `metadata`, so the target Subject contract must accept empty metadata.
+A principal type without an entry takes the entry of its nearest ancestor in types-registry. An exact entry applies to any value, including legacy ones such as `user` that types-registry does not know. A principal that is not mapped — no entry for its type or any ancestor, or no `subject_type` in the `SecurityContext` — gets `granted: false` with the diagnostic `reason: principal_not_mapped`, without validating the resource or calling the plugin. The mapped subject carries the principal id and empty `metadata`, so the target Subject contract must accept empty metadata.
 
 ## Telemetry
 

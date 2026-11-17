@@ -69,7 +69,10 @@ Mapping lookup for a principal type `P`, from the configuration `principal_subje
 
 1. an entry with key `P` wins, without a registry lookup;
 2. otherwise the resolver resolves `P` in types-registry and takes the nearest ancestor of `P` that has an entry;
-3. otherwise, or when `P` is absent, malformed, or not registered, the principal is **not mapped**.
+3. otherwise the principal is **not mapped**: `P` is absent, or `P` has no entry and is malformed, not registered,
+   or has no ancestor with an entry.
+
+An exact entry (step 1) applies to any `P`, registered or not; this is how legacy values such as `user` are mapped.
 
 A principal with a nil id or a nil tenant is not mapped either. A principal that is not mapped yields
 `LicenseDecision { granted: false }` with the reason `principal_not_mapped`; the Resource is not validated and the
