@@ -202,7 +202,6 @@ impl<R: GrantRepo> GrantService<R> {
         let delegation = DelegationId(Uuid::now_v7());
         self.commit(ctx, token, hash, move |tx, store| {
             Box::pin(async move {
-                let now = OffsetDateTime::now_utc();
                 let grant_ids = &req.grant_ids;
                 // Access first: no row of another tenant is locked for a
                 // grant that the caller cannot reach.
@@ -245,6 +244,8 @@ impl<R: GrantRepo> GrantService<R> {
                     })
                     .collect();
                 let subtrees = store.live_subtrees(tx, &children, true).await?;
+                // After the lock waits, as in `commit`: `refusal` checks windows at `now`.
+                let now = OffsetDateTime::now_utc();
                 let mut roots = Vec::with_capacity(parents.len());
                 for g in &parents {
                     let chain = chains.remove(&g.id).unwrap_or_default();

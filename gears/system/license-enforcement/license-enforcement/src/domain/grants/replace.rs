@@ -370,7 +370,6 @@ impl<R: GrantRepo> GrantService<R> {
         let expected_version = req.expected_version;
         self.commit(ctx, token, hash, move |tx, store| {
             Box::pin(async move {
-                let now = OffsetDateTime::now_utc();
                 // The pack version is written last, after the subtree rows,
                 // as every writer of a pack (DESIGN §3.7, Packs).
                 let (mut old, pack_version) = match target {
@@ -395,6 +394,8 @@ impl<R: GrantRepo> GrantService<R> {
                 old.retain(|g| g.state != GrantState::Terminated);
 
                 let subtrees = delegated_subtrees(tx, store, &mut old).await?;
+                // After the lock waits, as in `commit`: `fits` checks windows at `now`.
+                let now = OffsetDateTime::now_utc();
 
                 // Each binding needs the successor that names its grant.
                 let mut admitted = admitted;
