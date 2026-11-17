@@ -9,6 +9,10 @@ pub const MAX_ID_LEN: usize = 256;
 pub const MAX_TYPE_ID_LEN: usize = 1024;
 /// Grants in one issue request.
 pub const MAX_GRANTS_PER_ISSUE: usize = 1000;
+/// Levels of delegation below a root (`permissions.max_depth`).
+pub const MAX_DELEGATION_DEPTH: usize = 16;
+/// Grants in one delegation.
+pub const MAX_GRANTS_PER_DELEGATION: usize = 1000;
 /// Bytes of serialized conditions or recipient rules.
 pub const MAX_RULES_LEN: usize = 16 * 1024;
 /// Bytes of imported evidence.

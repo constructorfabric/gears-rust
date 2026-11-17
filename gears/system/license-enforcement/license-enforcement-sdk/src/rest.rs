@@ -12,7 +12,10 @@
 //! [`ListQuery`], which that extractor binds.
 //!
 //! Every method is retryable: reads are safe, and every write carries an
-//! idempotency token, so a repeated write returns the first result.
+//! idempotency token, so a repeated write returns the first result. The client
+//! retries transport faults and the statuses that its retry policy names; it
+//! does not retry `Aborted`. The caller retries `ADMISSION_CONFLICT` and
+//! `TREE_MOVED` with the same idempotency token.
 
 use toolkit::Page;
 use toolkit_canonical_errors::CanonicalError;
@@ -209,6 +212,26 @@ pub trait LicenseEnforcementApiRest: LicenseEnforcementApi {
         id: GrantId,
         req: ReplaceRequest,
     ) -> Result<IssueResult, CanonicalError>;
+
+    /// `POST /packs/{id}/accept`
+    #[post("/packs/{id}/accept")]
+    #[retryable]
+    async fn accept_pack(
+        &self,
+        ctx: SecurityContext,
+        id: PackId,
+        req: VerbRequest,
+    ) -> Result<Pack, CanonicalError>;
+
+    /// `POST /packs/{id}/reject`
+    #[post("/packs/{id}/reject")]
+    #[retryable]
+    async fn reject_pack(
+        &self,
+        ctx: SecurityContext,
+        id: PackId,
+        req: VerbRequest,
+    ) -> Result<Pack, CanonicalError>;
 
     /// `POST /packs/{id}/suspend`
     #[post("/packs/{id}/suspend")]

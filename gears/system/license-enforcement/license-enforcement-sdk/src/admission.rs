@@ -92,24 +92,71 @@ pub struct CallerIdentity {
 #[non_exhaustive]
 pub enum AdmissionInput {
     /// The `issue` intake.
+    #[non_exhaustive]
     Issue {
         /// Tenant that will hold the roots.
         holder_tenant_id: Uuid,
-        /// One entry per root.
-        grants: Vec<GrantTerms>,
+        /// One entry per root. The plugin admits each root under its id; the
+        /// gear finds the roots by these ids.
+        grants: Vec<RequestedRoot>,
         /// The roots form one pack.
         as_pack: bool,
         /// The caller.
         caller: CallerIdentity,
-        /// Idempotency token of the request. With the caller's tenant it is the
-        /// replay key of the evidence.
+        /// Idempotency token of the request. With the caller's tenant and
+        /// subject it is the replay key of the evidence.
         idempotency_token: String,
     },
     /// The `import` intake.
+    #[non_exhaustive]
     Import {
         /// Evidence bytes.
         bytes: Vec<u8>,
     },
+}
+
+impl AdmissionInput {
+    /// The input of the `import` intake.
+    #[must_use]
+    pub fn import(bytes: Vec<u8>) -> Self {
+        Self::Import { bytes }
+    }
+
+    /// The input of the `issue` intake.
+    #[must_use]
+    pub fn issue(
+        holder_tenant_id: Uuid,
+        grants: Vec<RequestedRoot>,
+        as_pack: bool,
+        caller: CallerIdentity,
+        idempotency_token: impl Into<String>,
+    ) -> Self {
+        Self::Issue {
+            holder_tenant_id,
+            grants,
+            as_pack,
+            caller,
+            idempotency_token: idempotency_token.into(),
+        }
+    }
+}
+
+/// A root that `issue` asks for: its id and its terms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RequestedRoot {
+    /// The id that the root gets.
+    pub id: GrantId,
+    /// Terms of the root.
+    pub terms: GrantTerms,
+}
+
+impl RequestedRoot {
+    /// A root with its id and terms.
+    #[must_use]
+    pub fn new(id: GrantId, terms: GrantTerms) -> Self {
+        Self { id, terms }
+    }
 }
 
 impl fmt::Debug for AdmissionInput {

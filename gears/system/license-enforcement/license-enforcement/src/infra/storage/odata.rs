@@ -1,12 +1,13 @@
-//! `OData` field mapping of `GET /grants`.
+//! `OData` field mapping of `GET /grants` and `GET /packs`.
 
-use license_enforcement_sdk::dto::GrantFilterField;
+use license_enforcement_sdk::dto::{GrantFilterField, PackFilterField};
 use toolkit_db::odata::sea_orm_filter::{FieldToColumn, ODataFieldMapping};
 use toolkit_odata::ast::Value as ODataValue;
 use toolkit_odata::filter::FilterOp;
 
 use super::entity::grant::{Column, Entity, Model};
-use crate::domain::types::type_key;
+use super::entity::pack;
+use crate::domain::types::{PackOrderField, type_key};
 
 pub struct GrantODataMapper;
 
@@ -20,6 +21,9 @@ impl FieldToColumn<GrantFilterField> for GrantODataMapper {
             GrantFilterField::State => Column::State,
             GrantFilterField::BindingSubjectType => Column::BindingSubjectTypeKey,
             GrantFilterField::BindingSubjectId => Column::BindingSubjectId,
+            GrantFilterField::BindingKind => Column::BindingKind,
+            GrantFilterField::HolderTenantId => Column::HolderTenantId,
+            GrantFilterField::BindingTenantId => Column::BindingTenantId,
             GrantFilterField::PackId => Column::PackId,
             GrantFilterField::ParentGrantId => Column::ParentGrantId,
         }
@@ -73,8 +77,53 @@ impl ODataFieldMapping<GrantFilterField> for GrantODataMapper {
             GrantFilterField::BindingSubjectId => {
                 sea_orm::Value::String(model.binding_subject_id.clone())
             }
+            GrantFilterField::BindingKind => {
+                sea_orm::Value::String(Some(model.binding_kind.clone()))
+            }
+            GrantFilterField::HolderTenantId => sea_orm::Value::Uuid(Some(model.holder_tenant_id)),
+            GrantFilterField::BindingTenantId => sea_orm::Value::Uuid(model.binding_tenant_id),
             GrantFilterField::PackId => sea_orm::Value::Uuid(model.pack_id),
             GrantFilterField::ParentGrantId => sea_orm::Value::Uuid(model.parent_grant_id),
         }
+    }
+}
+
+pub struct PackODataMapper;
+
+impl FieldToColumn<PackOrderField> for PackODataMapper {
+    type Column = pack::Column;
+
+    fn map_field(_field: PackOrderField) -> pack::Column {
+        pack::Column::Id
+    }
+}
+
+impl ODataFieldMapping<PackOrderField> for PackODataMapper {
+    type Entity = pack::Entity;
+
+    fn extract_cursor_value(model: &pack::Model, _field: PackOrderField) -> sea_orm::Value {
+        sea_orm::Value::Uuid(Some(model.id))
+    }
+}
+
+/// `$filter` of `GET /packs` over the member grants: a pack matches when a
+/// member does.
+pub struct PackMemberMapper;
+
+impl FieldToColumn<PackFilterField> for PackMemberMapper {
+    type Column = Column;
+
+    fn map_field(field: PackFilterField) -> Column {
+        match field {
+            PackFilterField::ResourceType => Column::ResourceTypeKey,
+        }
+    }
+
+    fn map_value(
+        _field: PackFilterField,
+        op: FilterOp,
+        value: &ODataValue,
+    ) -> Result<ODataValue, String> {
+        GrantODataMapper::map_value(GrantFilterField::ResourceType, op, value)
     }
 }

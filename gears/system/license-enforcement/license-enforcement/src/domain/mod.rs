@@ -6,3 +6,4 @@ pub mod grants;
 pub mod local_client;
 pub mod repo;
 pub mod types;
+pub mod window;

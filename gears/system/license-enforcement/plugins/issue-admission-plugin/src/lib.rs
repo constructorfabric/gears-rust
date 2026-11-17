@@ -65,6 +65,7 @@ impl GrantAdmissionPluginV1 for IssueAdmissionPlugin {
             as_pack,
             caller,
             idempotency_token,
+            ..
         } = input
         else {
             return Err(
@@ -72,31 +73,35 @@ impl GrantAdmissionPluginV1 for IssueAdmissionPlugin {
             );
         };
 
-        let ids: Vec<GrantId> = grants.iter().map(|_| GrantId(Uuid::now_v7())).collect();
         let bytes = serde_json::to_vec(&IssueEvidence {
             caller_subject_id: caller.subject_id,
             caller_subject_type: caller.subject_type.as_deref(),
             caller_tenant_id: caller.tenant_id,
             holder_tenant_id,
             as_pack,
-            roots: ids
+            roots: grants
                 .iter()
-                .zip(&grants)
-                .map(|(id, terms)| IssuedRoot { id: *id, terms })
+                .map(|r| IssuedRoot {
+                    id: r.id,
+                    terms: &r.terms,
+                })
                 .collect(),
         })
         .map_err(|e| PluginFault(format!("cannot serialize evidence: {e}")))?;
 
         let mut evidence = NewEvidence::new(bytes);
-        evidence.replay_key = Some(format!("{}:{idempotency_token}", caller.tenant_id));
+        // The key of the idempotency record: tenant, subject, and token.
+        evidence.replay_key = Some(format!(
+            "{}:{}:{idempotency_token}",
+            caller.tenant_id, caller.subject_id
+        ));
 
         let mut admission = Admission::default();
         admission.evidence = Some(evidence);
         admission.as_pack = as_pack;
-        admission.roots = ids
+        admission.roots = grants
             .into_iter()
-            .zip(grants)
-            .map(|(id, terms)| AdmittedRoot::new(id, RootFields::new(holder_tenant_id, terms)))
+            .map(|r| AdmittedRoot::new(r.id, RootFields::new(holder_tenant_id, r.terms)))
             .collect();
         Ok(admission)
     }

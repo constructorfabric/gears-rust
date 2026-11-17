@@ -23,7 +23,7 @@ use toolkit_security::SecurityContext;
 
 use super::check::CheckService;
 use super::error::DomainError;
-use super::grants::{BindingChange, GrantService};
+use super::grants::{BindingChange, GrantService, Target, Verb};
 use super::repo::GrantRepo;
 
 /// The `ListQuery` of the contract as the `ODataQuery` that the REST extractor
@@ -83,12 +83,13 @@ fn later(op: &'static str) -> CanonicalError {
 #[domain_model]
 pub struct LocalClient<R: GrantRepo> {
     grants: Arc<GrantService<R>>,
+    check: Arc<CheckService<R>>,
 }
 
 impl<R: GrantRepo> LocalClient<R> {
     #[must_use]
-    pub fn new(grants: Arc<GrantService<R>>) -> Self {
-        Self { grants }
+    pub fn new(grants: Arc<GrantService<R>>, check: Arc<CheckService<R>>) -> Self {
+        Self { grants, check }
     }
 }
 
@@ -146,10 +147,12 @@ impl<R: GrantRepo> LicenseEnforcementApi for LocalClient<R> {
 
     async fn list_packs(
         &self,
-        _ctx: SecurityContext,
-        _query: ListQuery,
+        ctx: SecurityContext,
+        query: ListQuery,
     ) -> Result<Page<Pack>, CanonicalError> {
-        Err(later("list_packs"))
+        let subtree = query.include_subtree;
+        let query = odata_query(&query)?;
+        Ok(self.grants.list_packs(&ctx, &query, subtree).await?)
     }
 
     async fn get_grant(&self, ctx: SecurityContext, id: GrantId) -> Result<Grant, CanonicalError> {
@@ -161,70 +164,125 @@ impl<R: GrantRepo> LicenseEnforcementApi for LocalClient<R> {
         ctx: SecurityContext,
         query: ListQuery,
     ) -> Result<Page<Grant>, CanonicalError> {
+        let subtree = query.include_subtree;
         let query = odata_query(&query)?;
-        Ok(self.grants.list_grants(&ctx, &query).await?)
+        Ok(self.grants.list_grants(&ctx, &query, subtree).await?)
     }
 
     async fn get_delegation(
         &self,
-        _ctx: SecurityContext,
-        _id: DelegationId,
+        ctx: SecurityContext,
+        id: DelegationId,
     ) -> Result<Delegation, CanonicalError> {
-        Err(later("get_delegation"))
+        Ok(self.grants.get_delegation(&ctx, id).await?)
     }
 
     async fn accept_grant(
         &self,
-        _ctx: SecurityContext,
-        _id: GrantId,
-        _req: VerbRequest,
+        ctx: SecurityContext,
+        id: GrantId,
+        req: VerbRequest,
     ) -> Result<Grant, CanonicalError> {
-        Err(later("accept_grant"))
+        Ok(self
+            .grants
+            .grant_verb(
+                &ctx,
+                id,
+                Verb::Accept,
+                req.idempotency_token,
+                req.expected_version,
+            )
+            .await?)
     }
 
     async fn reject_grant(
         &self,
-        _ctx: SecurityContext,
-        _id: GrantId,
-        _req: VerbRequest,
+        ctx: SecurityContext,
+        id: GrantId,
+        req: VerbRequest,
     ) -> Result<Grant, CanonicalError> {
-        Err(later("reject_grant"))
+        Ok(self
+            .grants
+            .grant_verb(
+                &ctx,
+                id,
+                Verb::Reject,
+                req.idempotency_token,
+                req.expected_version,
+            )
+            .await?)
     }
 
     async fn suspend_grant(
         &self,
-        _ctx: SecurityContext,
-        _id: GrantId,
-        _req: VerbRequest,
+        ctx: SecurityContext,
+        id: GrantId,
+        req: VerbRequest,
     ) -> Result<Grant, CanonicalError> {
-        Err(later("suspend_grant"))
+        Ok(self
+            .grants
+            .grant_verb(
+                &ctx,
+                id,
+                Verb::Suspend,
+                req.idempotency_token,
+                req.expected_version,
+            )
+            .await?)
     }
 
     async fn reinstate_grant(
         &self,
-        _ctx: SecurityContext,
-        _id: GrantId,
-        _req: VerbRequest,
+        ctx: SecurityContext,
+        id: GrantId,
+        req: VerbRequest,
     ) -> Result<Grant, CanonicalError> {
-        Err(later("reinstate_grant"))
+        Ok(self
+            .grants
+            .grant_verb(
+                &ctx,
+                id,
+                Verb::Reinstate,
+                req.idempotency_token,
+                req.expected_version,
+            )
+            .await?)
     }
 
     async fn revoke_grant(
         &self,
-        _ctx: SecurityContext,
-        _id: GrantId,
-        _req: VerbRequest,
+        ctx: SecurityContext,
+        id: GrantId,
+        req: VerbRequest,
     ) -> Result<Grant, CanonicalError> {
-        Err(later("revoke_grant"))
+        Ok(self
+            .grants
+            .grant_verb(
+                &ctx,
+                id,
+                Verb::Revoke,
+                req.idempotency_token,
+                req.expected_version,
+            )
+            .await?)
     }
 
     async fn renew_grant(
         &self,
-        _ctx: SecurityContext,
-        _id: GrantId,
-        _req: RenewRequest,
+        ctx: SecurityContext,
+        id: GrantId,
+        req: RenewRequest,
     ) -> Result<Grant, CanonicalError> {
-        Err(later("renew_grant"))
+        Ok(self
+            .grants
+            .renew_grant(
+                &ctx,
+                id,
+                req.window,
+                req.idempotency_token,
+                req.expected_version,
+            )
+            .await?)
     }
 
     async fn bind_grant(
@@ -265,126 +323,263 @@ impl<R: GrantRepo> LicenseEnforcementApi for LocalClient<R> {
 
     async fn return_grant(
         &self,
-        _ctx: SecurityContext,
-        _id: GrantId,
-        _req: VerbRequest,
+        ctx: SecurityContext,
+        id: GrantId,
+        req: VerbRequest,
     ) -> Result<Grant, CanonicalError> {
-        Err(later("return_grant"))
+        Ok(self
+            .grants
+            .grant_verb(
+                &ctx,
+                id,
+                Verb::Return,
+                req.idempotency_token,
+                req.expected_version,
+            )
+            .await?)
     }
 
     async fn recall_grant(
         &self,
-        _ctx: SecurityContext,
-        _id: GrantId,
-        _req: VerbRequest,
+        ctx: SecurityContext,
+        id: GrantId,
+        req: VerbRequest,
     ) -> Result<Grant, CanonicalError> {
-        Err(later("recall_grant"))
+        Ok(self
+            .grants
+            .grant_verb(
+                &ctx,
+                id,
+                Verb::Recall,
+                req.idempotency_token,
+                req.expected_version,
+            )
+            .await?)
     }
 
     async fn replace_grant(
         &self,
-        _ctx: SecurityContext,
-        _id: GrantId,
-        _req: ReplaceRequest,
+        ctx: SecurityContext,
+        id: GrantId,
+        req: ReplaceRequest,
     ) -> Result<IssueResult, CanonicalError> {
-        Err(later("replace_grant"))
+        Ok(self.grants.replace(&ctx, Target::Grant(id), req).await?)
+    }
+
+    async fn accept_pack(
+        &self,
+        ctx: SecurityContext,
+        id: PackId,
+        req: VerbRequest,
+    ) -> Result<Pack, CanonicalError> {
+        Ok(self
+            .grants
+            .pack_verb(
+                &ctx,
+                id,
+                Verb::Accept,
+                req.idempotency_token,
+                req.expected_version,
+            )
+            .await?)
+    }
+
+    async fn reject_pack(
+        &self,
+        ctx: SecurityContext,
+        id: PackId,
+        req: VerbRequest,
+    ) -> Result<Pack, CanonicalError> {
+        Ok(self
+            .grants
+            .pack_verb(
+                &ctx,
+                id,
+                Verb::Reject,
+                req.idempotency_token,
+                req.expected_version,
+            )
+            .await?)
     }
 
     async fn suspend_pack(
         &self,
-        _ctx: SecurityContext,
-        _id: PackId,
-        _req: VerbRequest,
+        ctx: SecurityContext,
+        id: PackId,
+        req: VerbRequest,
     ) -> Result<Pack, CanonicalError> {
-        Err(later("suspend_pack"))
+        Ok(self
+            .grants
+            .pack_verb(
+                &ctx,
+                id,
+                Verb::Suspend,
+                req.idempotency_token,
+                req.expected_version,
+            )
+            .await?)
     }
 
     async fn reinstate_pack(
         &self,
-        _ctx: SecurityContext,
-        _id: PackId,
-        _req: VerbRequest,
+        ctx: SecurityContext,
+        id: PackId,
+        req: VerbRequest,
     ) -> Result<Pack, CanonicalError> {
-        Err(later("reinstate_pack"))
+        Ok(self
+            .grants
+            .pack_verb(
+                &ctx,
+                id,
+                Verb::Reinstate,
+                req.idempotency_token,
+                req.expected_version,
+            )
+            .await?)
     }
 
     async fn revoke_pack(
         &self,
-        _ctx: SecurityContext,
-        _id: PackId,
-        _req: VerbRequest,
+        ctx: SecurityContext,
+        id: PackId,
+        req: VerbRequest,
     ) -> Result<Pack, CanonicalError> {
-        Err(later("revoke_pack"))
+        Ok(self
+            .grants
+            .pack_verb(
+                &ctx,
+                id,
+                Verb::Revoke,
+                req.idempotency_token,
+                req.expected_version,
+            )
+            .await?)
     }
 
     async fn renew_pack(
         &self,
-        _ctx: SecurityContext,
-        _id: PackId,
-        _req: RenewRequest,
+        ctx: SecurityContext,
+        id: PackId,
+        req: RenewRequest,
     ) -> Result<Pack, CanonicalError> {
-        Err(later("renew_pack"))
+        Ok(self
+            .grants
+            .renew_pack(
+                &ctx,
+                id,
+                req.window,
+                req.idempotency_token,
+                req.expected_version,
+            )
+            .await?)
     }
 
     async fn replace_pack(
         &self,
-        _ctx: SecurityContext,
-        _id: PackId,
-        _req: ReplaceRequest,
+        ctx: SecurityContext,
+        id: PackId,
+        req: ReplaceRequest,
     ) -> Result<IssueResult, CanonicalError> {
-        Err(later("replace_pack"))
+        Ok(self.grants.replace(&ctx, Target::Pack(id), req).await?)
     }
 
     async fn delegate(
         &self,
-        _ctx: SecurityContext,
-        _req: DelegateRequest,
+        ctx: SecurityContext,
+        req: DelegateRequest,
     ) -> Result<Delegation, CanonicalError> {
-        Err(later("delegate"))
+        Ok(self.grants.delegate(&ctx, req).await?)
     }
 
     async fn accept_delegation(
         &self,
-        _ctx: SecurityContext,
-        _id: DelegationId,
-        _req: DelegationVerbRequest,
+        ctx: SecurityContext,
+        id: DelegationId,
+        req: DelegationVerbRequest,
     ) -> Result<Delegation, CanonicalError> {
-        Err(later("accept_delegation"))
+        Ok(self
+            .grants
+            .delegation_verb(
+                &ctx,
+                id,
+                Verb::Accept,
+                req.idempotency_token,
+                req.expected_version,
+            )
+            .await?)
     }
 
     async fn reject_delegation(
         &self,
-        _ctx: SecurityContext,
-        _id: DelegationId,
-        _req: DelegationVerbRequest,
+        ctx: SecurityContext,
+        id: DelegationId,
+        req: DelegationVerbRequest,
     ) -> Result<Delegation, CanonicalError> {
-        Err(later("reject_delegation"))
+        Ok(self
+            .grants
+            .delegation_verb(
+                &ctx,
+                id,
+                Verb::Reject,
+                req.idempotency_token,
+                req.expected_version,
+            )
+            .await?)
     }
 
     async fn return_delegation(
         &self,
-        _ctx: SecurityContext,
-        _id: DelegationId,
-        _req: DelegationVerbRequest,
+        ctx: SecurityContext,
+        id: DelegationId,
+        req: DelegationVerbRequest,
     ) -> Result<Delegation, CanonicalError> {
-        Err(later("return_delegation"))
+        Ok(self
+            .grants
+            .delegation_verb(
+                &ctx,
+                id,
+                Verb::Return,
+                req.idempotency_token,
+                req.expected_version,
+            )
+            .await?)
     }
 
     async fn recall_delegation(
         &self,
-        _ctx: SecurityContext,
-        _id: DelegationId,
-        _req: DelegationVerbRequest,
+        ctx: SecurityContext,
+        id: DelegationId,
+        req: DelegationVerbRequest,
     ) -> Result<Delegation, CanonicalError> {
-        Err(later("recall_delegation"))
+        Ok(self
+            .grants
+            .delegation_verb(
+                &ctx,
+                id,
+                Verb::Recall,
+                req.idempotency_token,
+                req.expected_version,
+            )
+            .await?)
     }
 
     async fn check_explain(
         &self,
-        _ctx: SecurityContext,
-        _req: CheckExplainRequest,
+        ctx: SecurityContext,
+        req: CheckExplainRequest,
     ) -> Result<CheckExplanation, CanonicalError> {
-        Err(later("check_explain"))
+        let request = self.grants.explain_request(&ctx, req).await?;
+        let d = self
+            .check
+            .check(&request, OffsetDateTime::now_utc())
+            .await?;
+        match (d.grant_id, d.reason.clone()) {
+            (Some(id), None) if d.granted => Ok(CheckExplanation::granted(id, d.grace)),
+            (None, Some(reason)) if !d.granted => {
+                Ok(CheckExplanation::denied(reason, d.termination_reason))
+            }
+            _ => Err(DomainError::Internal(format!("an inconsistent decision: {d:?}")).into()),
+        }
     }
 }
 
@@ -420,3 +615,8 @@ impl<R: GrantRepo> LicenseResolverPluginClient for ResolverAdapter<R> {
         }
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "local_client_tests.rs"]
+mod local_client_tests;
