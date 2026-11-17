@@ -2165,13 +2165,10 @@ async fn registration_is_remembered_per_tenant_and_a_failed_one_is_not() {
     assert_eq!(scripted.registrations.load(Ordering::SeqCst), 4);
 }
 
-#[tokio::test]
-async fn schemas_of_an_earlier_version_are_upgraded_on_registration() {
-    let client = graph_storage();
-    let ctx = construct_in(Uuid::new_v4());
-    // The registry as an earlier release left it: the person types without
-    // the properties added since.
-    let earlier: Vec<TypeRegistration> = construct_sdk::profile_types::graph_types()
+/// The registry as an earlier release left it: the person types without the
+/// properties added since.
+fn earlier_person_types() -> Vec<TypeRegistration> {
+    construct_sdk::profile_types::graph_types()
         .into_iter()
         .map(|graph_type| {
             let mut schema: Value = serde_json::from_str(graph_type.schema).unwrap();
@@ -2194,7 +2191,35 @@ async fn schemas_of_an_earlier_version_are_upgraded_on_registration() {
                 schema,
             }
         })
-        .collect();
+        .collect()
+}
+
+/// Every type is stored as the current release defines it.
+async fn assert_current_types_stored(
+    client: &Arc<dyn GraphStorageClientV1>,
+    ctx: &SecurityContext,
+) {
+    for graph_type in construct_sdk::profile_types::graph_types() {
+        let stored = client
+            .get_type(ctx, &graph_type.type_id.parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            stored.schema,
+            serde_json::from_str::<Value>(graph_type.schema).unwrap(),
+            "{}",
+            graph_type.type_id
+        );
+    }
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn schemas_of_an_earlier_version_are_upgraded_on_registration() {
+    let client = graph_storage();
+    let tenant = Uuid::new_v4();
+    let ctx = construct_in(tenant);
+    let earlier = earlier_person_types();
     client.register_types(&ctx, earlier.clone()).await.unwrap();
     let changed = earlier
         .iter()
@@ -2212,6 +2237,84 @@ async fn schemas_of_an_earlier_version_are_upgraded_on_registration() {
         .ensure(&ctx)
         .await
         .unwrap();
+
+    assert_current_types_stored(&client, &ctx).await;
+    assert!(logs_contain(&tenant.to_string()));
+    assert!(logs_contain("graph types upgraded in the tenant"));
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn registering_unchanged_schemas_logs_no_upgrade() {
+    let types = GraphTypes::new(graph_storage());
+
+    types.ensure(&construct_in(Uuid::new_v4())).await.unwrap();
+
+    assert!(!logs_contain("graph types upgraded in the tenant"));
+}
+
+#[tokio::test]
+async fn a_registration_sent_again_after_a_lost_race_still_upgrades() {
+    let client = graph_storage();
+    let ctx = construct_in(Uuid::new_v4());
+    client
+        .register_types(&ctx, earlier_person_types())
+        .await
+        .unwrap();
+    let scripted = Scripted::over(Arc::clone(&client));
+    scripted
+        .conflict_next_registration
+        .store(true, Ordering::SeqCst);
+
+    GraphTypes::new(Arc::clone(&scripted) as Arc<dyn GraphStorageClientV1>)
+        .ensure(&ctx)
+        .await
+        .unwrap();
+
+    assert_eq!(scripted.registrations.load(Ordering::SeqCst), 2);
+    assert_current_types_stored(&client, &ctx).await;
+}
+
+#[tokio::test]
+async fn a_tenant_whose_schema_is_newer_than_the_release_is_refused_and_not_remembered() {
+    let client = graph_storage();
+    let ctx = construct_in(Uuid::new_v4());
+    // A newer release registered a property this one does not know, so this
+    // release's schema would remove it.
+    let newer: Vec<TypeRegistration> = construct_sdk::profile_types::graph_types()
+        .into_iter()
+        .map(|graph_type| {
+            let mut schema: Value = serde_json::from_str(graph_type.schema).unwrap();
+            if let Some(Value::Object(properties)) =
+                schema.pointer_mut("/allOf/1/properties/payload/properties")
+            {
+                properties.insert(
+                    "added_by_a_later_release".to_owned(),
+                    json!({ "type": "string" }),
+                );
+            }
+            TypeRegistration {
+                type_id: graph_type.type_id.to_owned(),
+                schema,
+            }
+        })
+        .collect();
+    client.register_types(&ctx, newer).await.unwrap();
+    let scripted = Scripted::over(Arc::clone(&client));
+    let types = GraphTypes::new(Arc::clone(&scripted) as Arc<dyn GraphStorageClientV1>);
+
+    let first = types.ensure(&ctx).await;
+    let second = types.ensure(&ctx).await;
+
+    assert!(matches!(first, Err(DomainError::Internal(_))), "{first:?}");
+    assert!(
+        matches!(second, Err(DomainError::Internal(_))),
+        "{second:?}"
+    );
+    // Graph storage refuses the change as a conflict, so each call sends the
+    // batch twice, and the second call asks again: the refusal is not
+    // remembered.
+    assert_eq!(scripted.registrations.load(Ordering::SeqCst), 4);
 }
 
 #[tokio::test]
