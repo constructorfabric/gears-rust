@@ -8992,7 +8992,17 @@ pub async fn the_fenced_tenants_are_listed_for_the_read_path(
         not_reached.is_empty(),
         "a scope that does not reach it lists nothing"
     );
-    let every = store.fenced_tenant_ids().await.expect("the fences read");
+    // The scope the gear asks with when it cannot narrow a read in memory
+    // at all: one without constraints reaches every tenant.
+    let reached = store
+        .fenced_tenants(&ctx(other, &AccessScope::allow_all(), None))
+        .await
+        .expect("the listing reads");
+    assert!(reached.contains(&tenant), "{reached:?}");
+    let every = store
+        .all_fenced_tenant_ids()
+        .await
+        .expect("the fences read");
     assert!(
         every.contains(&tenant) && !every.contains(&other),
         "{every:?}"
@@ -9009,7 +9019,7 @@ pub async fn the_fenced_tenants_are_listed_for_the_read_path(
     );
     assert!(
         store
-            .fenced_tenant_ids()
+            .all_fenced_tenant_ids()
             .await
             .expect("the fences read")
             .contains(&tenant),

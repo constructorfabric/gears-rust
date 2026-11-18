@@ -228,13 +228,36 @@ pub struct FakeGraphStore {
     /// What `node_types` answers: the types, `Unsupported` as a store that
     /// never implemented the optional method would, or a failure.
     node_types_answer: NodeTypesAnswer,
-    /// A tenant whose deletion steps fail, and how many were attempted: the
-    /// one failure the worker's handling of a stuck deletion needs.
-    failing_offboarding: Mutex<Option<(Uuid, u64)>>,
-    /// The steps of a failing tenant that still run before it fails.
-    succeeding_offboarding: Mutex<Option<(Uuid, u64)>>,
-    /// What `capabilities().offboarding` declares.
+    /// A tenant whose deletion steps fail: the one failure the worker's
+    /// handling of a stuck deletion needs.
+    failing_offboarding: Mutex<Option<FailingOffboarding>>,
+    /// What `capabilities().offboarding` declares; without it, every
+    /// offboarding method refuses, as the trait's defaults do.
     offboarding: bool,
+    /// Offboarding calls refused for want of the capability: the gear asks
+    /// such a store none.
+    refused_offboarding: std::sync::atomic::AtomicU64,
+    /// Reads of every fenced tenant, and how they go: the in-memory set's
+    /// cases need a store that is slow or fails.
+    fence_reads: FenceReads,
+}
+
+/// How [`FakeGraphStore`] answers `all_fenced_tenant_ids`.
+#[derive(Debug, Default)]
+struct FenceReads {
+    count: std::sync::atomic::AtomicU64,
+    failing: std::sync::atomic::AtomicBool,
+    delay: Mutex<std::time::Duration>,
+}
+
+/// A tenant whose deletion steps fail once its first `succeed_first` have run.
+#[derive(Clone, Copy, Debug)]
+struct FailingOffboarding {
+    tenant: Uuid,
+    /// Steps that still run before the failures start.
+    succeed_first: u64,
+    /// Steps that failed.
+    attempts: u64,
 }
 
 /// Every tenant's data, and the offboarding records that outlive it, under
@@ -290,8 +313,9 @@ impl FakeGraphStore {
             hydrate_calls: std::sync::atomic::AtomicU64::new(0),
             node_types_answer: NodeTypesAnswer::Typed,
             failing_offboarding: Mutex::new(None),
-            succeeding_offboarding: Mutex::new(None),
             offboarding: true,
+            refused_offboarding: std::sync::atomic::AtomicU64::new(0),
+            fence_reads: FenceReads::default(),
         }
     }
 
@@ -327,28 +351,72 @@ impl FakeGraphStore {
 
     /// Make every deletion step for `tenant` fail as `Unavailable`.
     pub fn fail_offboarding_of(&self, tenant: Uuid) {
-        if let Ok(mut failing) = self.failing_offboarding.lock() {
-            *failing = Some((tenant, 0));
-        }
+        self.fail_offboarding_of_after(tenant, 0);
     }
 
     /// Let `steps` deletion steps of `tenant` run, then fail every later
     /// one, as [`Self::fail_offboarding_of`] does.
     pub fn fail_offboarding_of_after(&self, tenant: Uuid, steps: u64) {
-        if let Ok(mut succeeding) = self.succeeding_offboarding.lock() {
-            *succeeding = Some((tenant, steps));
+        if let Ok(mut failing) = self.failing_offboarding.lock() {
+            *failing = Some(FailingOffboarding {
+                tenant,
+                succeed_first: steps,
+                attempts: 0,
+            });
         }
-        self.fail_offboarding_of(tenant);
     }
 
-    /// How many deletion steps were attempted for the failing tenant.
+    /// How many deletion steps failed for the failing tenant.
     #[must_use]
     pub fn failed_offboarding_attempts(&self) -> u64 {
         self.failing_offboarding
             .lock()
             .ok()
-            .and_then(|failing| failing.map(|(_, attempts)| attempts))
+            .and_then(|failing| failing.map(|failing| failing.attempts))
             .unwrap_or(0)
+    }
+
+    /// How many times every fenced tenant was read.
+    #[must_use]
+    pub fn fence_reads(&self) -> u64 {
+        self.fence_reads
+            .count
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Make every read of the fenced tenants fail, or answer again.
+    pub fn fail_fence_reads(&self, failing: bool) {
+        self.fence_reads
+            .failing
+            .store(failing, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Make every read of the fenced tenants take `delay` first.
+    pub fn delay_fence_reads(&self, delay: std::time::Duration) {
+        if let Ok(mut held) = self.fence_reads.delay.lock() {
+            *held = delay;
+        }
+    }
+
+    /// How many offboarding calls this store refused because it does not
+    /// declare offboarding.
+    #[must_use]
+    pub fn refused_offboarding_calls(&self) -> u64 {
+        self.refused_offboarding
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Refuse an offboarding call when the store does not declare it.
+    fn offboards(&self) -> Result<(), GraphStoreError> {
+        if self.offboarding {
+            Ok(())
+        } else {
+            self.refused_offboarding
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(GraphStoreError::Unsupported {
+                what: "tenant offboarding",
+            })
+        }
     }
 
     /// How many times `hydrate_nodes` has been called so far.
@@ -1607,6 +1675,7 @@ impl GraphStoreV1 for FakeGraphStore {
         ctx: &StoreCtx<'_>,
         deletion_generation: Option<DeletionGeneration>,
     ) -> Result<TenantOffboarding, GraphStoreError> {
+        self.offboards()?;
         let tenant = ctx.tenant;
         if tenant.is_nil() {
             return Err(GraphStoreError::InvalidQuery {
@@ -1634,6 +1703,7 @@ impl GraphStoreV1 for FakeGraphStore {
         &self,
         ctx: &StoreCtx<'_>,
     ) -> Result<Option<TenantOffboarding>, GraphStoreError> {
+        self.offboards()?;
         Ok(self
             .tenants
             .lock()
@@ -1644,6 +1714,7 @@ impl GraphStoreV1 for FakeGraphStore {
     }
 
     async fn fenced_tenants(&self, ctx: &StoreCtx<'_>) -> Result<Vec<TenantId>, GraphStoreError> {
+        self.offboards()?;
         Ok(self
             .tenants
             .lock()
@@ -1655,7 +1726,24 @@ impl GraphStoreV1 for FakeGraphStore {
             .collect())
     }
 
-    async fn fenced_tenant_ids(&self) -> Result<Vec<TenantId>, GraphStoreError> {
+    async fn all_fenced_tenant_ids(&self) -> Result<Vec<TenantId>, GraphStoreError> {
+        self.offboards()?;
+        self.fence_reads
+            .count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let delay = *self.fence_reads.delay.lock().map_err(|_| poisoned())?;
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        if self
+            .fence_reads
+            .failing
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(GraphStoreError::Unavailable {
+                reason: "a failure the test asked for".to_owned(),
+            });
+        }
         Ok(self
             .tenants
             .lock()
@@ -1671,30 +1759,22 @@ impl GraphStoreV1 for FakeGraphStore {
         tenant: TenantId,
         batch: std::num::NonZeroU64,
     ) -> Result<TenantOffboarding, GraphStoreError> {
-        let still_runs = match self
-            .succeeding_offboarding
+        self.offboards()?;
+        if let Some(failing) = self
+            .failing_offboarding
             .lock()
             .map_err(|_| poisoned())?
             .as_mut()
+            .filter(|failing| failing.tenant == tenant)
         {
-            Some((succeeding, left)) if *succeeding == tenant && *left > 0 => {
-                *left -= 1;
-                true
+            if failing.succeed_first > 0 {
+                failing.succeed_first -= 1;
+            } else {
+                failing.attempts += 1;
+                return Err(GraphStoreError::Unavailable {
+                    reason: "a failure the test asked for".to_owned(),
+                });
             }
-            _ => false,
-        };
-        if !still_runs
-            && let Some((failing, attempts)) = self
-                .failing_offboarding
-                .lock()
-                .map_err(|_| poisoned())?
-                .as_mut()
-            && *failing == tenant
-        {
-            *attempts += 1;
-            return Err(GraphStoreError::Unavailable {
-                reason: "a failure the test asked for".to_owned(),
-            });
         }
         let batch = usize::try_from(batch.get()).unwrap_or(usize::MAX);
         let mut guard = self.tenants.lock().map_err(|_| poisoned())?;
@@ -1768,6 +1848,7 @@ impl GraphStoreV1 for FakeGraphStore {
         tenant: TenantId,
         error: &GraphStoreError,
     ) -> Result<TenantOffboarding, GraphStoreError> {
+        self.offboards()?;
         let mut tenants = self.tenants.lock().map_err(|_| poisoned())?;
         let record = tenants
             .offboardings
@@ -1782,6 +1863,7 @@ impl GraphStoreV1 for FakeGraphStore {
     }
 
     async fn pending_offboardings(&self) -> Result<Vec<TenantOffboarding>, GraphStoreError> {
+        self.offboards()?;
         let tenants = self.tenants.lock().map_err(|_| poisoned())?;
         let mut pending: Vec<TenantOffboarding> = tenants
             .offboardings

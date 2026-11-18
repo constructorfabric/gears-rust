@@ -18,9 +18,9 @@
 //!   the fence -- a new statement under read committed, so a new snapshot --
 //!   sees the committed fence, and the write rolls back.
 //!
-//! Either way nothing commits for the tenant after its fence. [`fenced_write`]
-//! also checks the fence when the write starts, so one that begins after the
-//! fence fails as fenced before it does anything else.
+//! Either way nothing commits for the tenant after its fence. A write that
+//! changed nothing takes no lock but still reads the fence, so a replica
+//! whose fenced tenants are stale does not answer it as a success.
 //!
 //! **The deletion.** [`step`] removes up to a batch of one kind of row per
 //! transaction, in an order the foreign keys admit: edges (their endpoints
@@ -60,8 +60,8 @@ use crate::infra::store::{PgGraphStore, TxStoreError, map_db_error, map_scope_er
 /// What a write transaction's body wrote, as the fence needs to know it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wrote {
-    /// Nothing: a replayed ingest, a delete of a row already gone. The body
-    /// takes no lock and needs no check.
+    /// Nothing: a replayed ingest, a delete of a row already gone. No lock is
+    /// taken; the fence is read.
     Nothing,
     /// Rows, and the tenant's revision with them: the body's revision bump
     /// took the revision row already and holds it to the commit, so only the
@@ -78,7 +78,9 @@ pub enum Wrote {
 /// and reading the fence again, so the lock is held only to the commit right
 /// after. The fence takes the same row first, so whichever gets it first,
 /// nothing commits for the tenant after its fence. A body that wrote nothing
-/// takes no lock, so it does not queue behind the tenant's other writes.
+/// takes no lock, so it does not queue behind the tenant's other writes, but
+/// still reads the fence: a fenced tenant gets no success, not even a
+/// replay's.
 /// Every write transaction goes through here: a write path that skipped the
 /// check would be a write the fence cannot stop.
 ///
@@ -112,15 +114,10 @@ where
             });
         }
     };
-    let check = match wrote(&outcome) {
-        Wrote::Nothing => false,
-        Wrote::Revision => true,
-        Wrote::Rows => {
-            lock_revision_row(tenant, scope, tx).await?;
-            true
-        }
-    };
-    if check && fence_of(tenant, scope, tx).await?.is_some() {
+    if wrote(&outcome) == Wrote::Rows {
+        lock_revision_row(tenant, scope, tx).await?;
+    }
+    if fence_of(tenant, scope, tx).await?.is_some() {
         return Err(GraphStoreError::TenantFenced { tenant });
     }
     Ok(outcome)
@@ -388,12 +385,11 @@ struct TenantRowId {
 /// Every tenant ever fenced, finished or not, for the gear's in-memory set:
 /// the id column only. The deployment's own bookkeeping across tenants, as
 /// the worker's listing.
-pub async fn all_fenced_ids(store: &PgGraphStore) -> Result<Vec<TenantId>, GraphStoreError> {
-    let conn = store.db().conn().map_err(|error| map_db_error(&error))?;
+pub async fn all_fenced_ids(runner: &impl DBRunner) -> Result<Vec<TenantId>, GraphStoreError> {
     let rows = tenant_offboarding::Entity::find()
         .secure()
         .scope_with(&AccessScope::allow_all())
-        .project_all(&conn, |query| {
+        .project_all(runner, |query| {
             query
                 .select_only()
                 .column(tenant_offboarding::Column::TenantId)
@@ -838,9 +834,11 @@ pub async fn step(
                 // The row as stored: the database keeps microseconds, and
                 // answering the clock's own value would differ from every
                 // later read of the same record.
-                let stored = fence_of(tenant, &scope, tx)
-                    .await?
-                    .ok_or(GraphStoreError::NotFound)?;
+                let stored = fence_of(tenant, &scope, tx).await?.ok_or_else(|| {
+                    GraphStoreError::Internal(
+                        "the offboarding record just updated is not there".to_owned(),
+                    )
+                })?;
                 Ok(to_record(&stored)?)
             })
         })

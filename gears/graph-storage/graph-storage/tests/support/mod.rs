@@ -387,6 +387,33 @@ impl Harness {
         tenants: Arc<dyn graph_storage::domain::offboarding::TenantDirectory>,
         fenced: Arc<graph_storage::domain::offboarding::FencedTenants>,
     ) -> Self {
+        Self::offboarding_enforced(store, PolicyEnforcer::new(authz), tenants, fenced)
+    }
+
+    /// The same, with a policy enforcer that accepts tenant subtrees, which
+    /// the gear cannot narrow in memory: the store is asked which deletions
+    /// under way a read reaches.
+    pub fn offboarding_with_subtrees(
+        store: Arc<FakeGraphStore>,
+        authz: Arc<dyn AuthZResolverApi>,
+        tenants: Arc<dyn graph_storage::domain::offboarding::TenantDirectory>,
+    ) -> Self {
+        Self::offboarding_enforced(
+            store,
+            PolicyEnforcer::new(authz).with_capabilities(vec![
+                authz_resolver_sdk::models::Capability::TenantHierarchy,
+            ]),
+            tenants,
+            Arc::new(graph_storage::domain::offboarding::FencedTenants::default()),
+        )
+    }
+
+    fn offboarding_enforced(
+        store: Arc<FakeGraphStore>,
+        enforcer: PolicyEnforcer,
+        tenants: Arc<dyn graph_storage::domain::offboarding::TenantDirectory>,
+        fenced: Arc<graph_storage::domain::offboarding::FencedTenants>,
+    ) -> Self {
         let engine = Arc::new(HopOverStore {
             store: Arc::clone(&store),
         });
@@ -398,7 +425,7 @@ impl Harness {
                         .expect("the default configuration is valid"),
                     store,
                     engine,
-                    PolicyEnforcer::new(authz),
+                    enforcer,
                     conformance::coordinator(),
                 )
                 .with_tenant_directory(tenants)

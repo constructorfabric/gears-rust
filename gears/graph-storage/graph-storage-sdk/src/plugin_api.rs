@@ -518,7 +518,7 @@ pub trait GraphStoreV1: Send + Sync + 'static {
     /// Every tenant ever fenced, finished or not: their ids only, for the
     /// gear's in-memory set, which the request path checks instead of the
     /// store. Acts for no caller, as the worker's methods below.
-    async fn fenced_tenant_ids(&self) -> Result<Vec<TenantId>, GraphStoreError> {
+    async fn all_fenced_tenant_ids(&self) -> Result<Vec<TenantId>, GraphStoreError> {
         Err(GraphStoreError::Unsupported {
             what: "tenant offboarding",
         })

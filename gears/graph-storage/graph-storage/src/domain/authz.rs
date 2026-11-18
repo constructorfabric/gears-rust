@@ -293,7 +293,10 @@ pub fn only(scope: &AccessScope, tenant: Uuid) -> bool {
 /// the caller fails closed rather than serve a scope that may still reach a
 /// tenant in `gone`.
 #[must_use]
-pub fn without_tenants(scope: &AccessScope, gone: &[Uuid]) -> Option<AccessScope> {
+pub fn without_tenants<S: std::hash::BuildHasher>(
+    scope: &AccessScope,
+    gone: &std::collections::HashSet<Uuid, S>,
+) -> Option<AccessScope> {
     if scope.is_deny_all() {
         return Some(scope.clone());
     }
@@ -399,32 +402,36 @@ mod tests {
     /// A subtree loses the tenants being offboarded and keeps the rest; a
     /// scope that names no tenant, or names none it can list, cannot be
     /// narrowed and is refused rather than served.
+    fn set(tenant: Uuid) -> std::collections::HashSet<Uuid> {
+        std::collections::HashSet::from([tenant])
+    }
+
     #[test]
     fn a_scope_loses_the_tenants_being_offboarded_or_is_refused() {
         let (parent, child, other) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
         let subtree = AccessScope::for_tenants(vec![parent, child]);
-        let narrowed = without_tenants(&subtree, &[child]).expect("a listed subtree narrows");
+        let narrowed = without_tenants(&subtree, &set(child)).expect("a listed subtree narrows");
         assert!(reaches(&narrowed, parent));
         assert!(!reaches(&narrowed, child));
         assert_eq!(
-            without_tenants(&subtree, &[other]).expect("narrows"),
+            without_tenants(&subtree, &set(other)).expect("narrows"),
             AccessScope::from_constraints(vec![ScopeConstraint::new(vec![ScopeFilter::r#in(
                 pep_properties::OWNER_TENANT_ID,
                 vec![ScopeValue::Uuid(parent), ScopeValue::Uuid(child)],
             )])]),
         );
         assert!(
-            without_tenants(&AccessScope::for_tenant(child), &[child])
+            without_tenants(&AccessScope::for_tenant(child), &set(child))
                 .expect("narrows")
                 .is_deny_all(),
             "a scope of only the tenant being offboarded admits nothing"
         );
-        assert!(without_tenants(&AccessScope::allow_all(), &[child]).is_none());
+        assert!(without_tenants(&AccessScope::allow_all(), &set(child)).is_none());
         let no_tenant =
             AccessScope::from_constraints(vec![ScopeConstraint::new(vec![ScopeFilter::eq(
                 "owner_id", child,
             )])]);
-        assert!(without_tenants(&no_tenant, &[child]).is_none());
+        assert!(without_tenants(&no_tenant, &set(child)).is_none());
         let not_a_tenant_id =
             AccessScope::from_constraints(vec![ScopeConstraint::new(vec![ScopeFilter::r#in(
                 pep_properties::OWNER_TENANT_ID,
@@ -434,7 +441,7 @@ mod tests {
                 ],
             )])]);
         assert!(
-            without_tenants(&not_a_tenant_id, &[child]).is_none(),
+            without_tenants(&not_a_tenant_id, &set(child)).is_none(),
             "a value that may be the tenant being offboarded is refused, as `only` refuses it"
         );
         assert!(!only(&not_a_tenant_id, parent));
@@ -447,7 +454,7 @@ mod tests {
                     Vec::new(),
                 ),
             ])]);
-        assert!(without_tenants(&resolved_in_the_database, &[child]).is_none());
+        assert!(without_tenants(&resolved_in_the_database, &set(child)).is_none());
 
         // A filter on another property stays as it was; a constraint left
         // with no tenant goes, and the other one stays.
@@ -457,7 +464,7 @@ mod tests {
             ScopeFilter::eq("owner_id", owner),
         ])]);
         assert_eq!(
-            without_tenants(&mixed, &[child]).expect("narrows"),
+            without_tenants(&mixed, &set(child)).expect("narrows"),
             AccessScope::from_constraints(vec![ScopeConstraint::new(vec![
                 ScopeFilter::r#in(
                     pep_properties::OWNER_TENANT_ID,
@@ -476,7 +483,7 @@ mod tests {
                 parent,
             )]),
         ]);
-        let narrowed = without_tenants(&two, &[child]).expect("narrows");
+        let narrowed = without_tenants(&two, &set(child)).expect("narrows");
         assert_eq!(narrowed.constraints().len(), 1, "{narrowed:?}");
         assert!(reaches(&narrowed, parent) && !reaches(&narrowed, child));
     }

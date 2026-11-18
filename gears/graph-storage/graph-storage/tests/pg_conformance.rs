@@ -3806,10 +3806,19 @@ enum LateWrite {
     Delete,
     Transfer,
     Types,
+    /// Takes the revision row in its own body, as an ingest does, and skips
+    /// the fence's lock on it.
+    Purge,
 }
 
 impl LateWrite {
-    const ALL: [Self; 4] = [Self::Ingest, Self::Delete, Self::Transfer, Self::Types];
+    const ALL: [Self; 5] = [
+        Self::Ingest,
+        Self::Delete,
+        Self::Transfer,
+        Self::Types,
+        Self::Purge,
+    ];
 
     fn spawn(
         self,
@@ -3843,6 +3852,14 @@ impl LateWrite {
                     .register_types(&ctx, vec![conformance::requirement_v1()])
                     .await
                     .map(drop),
+                Self::Purge => store
+                    .purge_node(
+                        &ctx,
+                        "edge-b".to_owned(),
+                        graph_storage_sdk::models::PurgeOptions::default(),
+                    )
+                    .await
+                    .map(drop),
             }
         })
     }
@@ -3862,6 +3879,7 @@ impl LateWrite {
                 )
                 .await
             }
+            Self::Purge => 1 - rows_where(raw, "node", tenant, "AND node_key = 'edge-b'").await,
         }
     }
 }
@@ -4079,6 +4097,64 @@ async fn a_parent_reading_its_subtree_does_not_see_a_fenced_child() {
         .await
         .expect_err("the fenced child is out of the parent's reads");
     assert_eq!(hidden.status_code(), 404, "{hidden:?}");
+}
+
+/// Two first fences of one tenant at once: one writes the record, the other
+/// waits on the revision row, reads again and answers the same record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_first_fences_at_once_answer_one_record() {
+    let Some(stand) = stand().await else {
+        return;
+    };
+    let (tenant, raw, holder) = held(&stand, REVISION_ROW).await;
+    let (first, second) = (fence(&stand, tenant), fence(&stand, tenant));
+    waiting_on_locks(&raw, 2).await;
+    holder.commit().await.expect("the holder lets go");
+
+    let first = first.await.expect("no panic").expect("the first fence");
+    let second = second.await.expect("no panic").expect("the second fence");
+    assert_eq!(first, second, "one record, the first fence's");
+    assert_eq!(rows_of(&raw, "tenant_offboarding", tenant).await, 1);
+}
+
+/// A fence asked again while the worker deletes the tenant answers from
+/// the record and takes no revision row, so it never holds the row a step
+/// deletes while waiting on the record the step holds: neither is aborted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_asked_again_during_the_deletion_does_not_deadlock_with_it() {
+    let Some(stand) = stand().await else {
+        return;
+    };
+    let (tenant, _) = one_edge(&stand).await;
+    conformance::fence(stand.store.as_ref(), tenant, None)
+        .await
+        .expect("the fence");
+    let steps = {
+        let store = Arc::clone(&stand.store);
+        tokio::spawn(async move {
+            for _ in 0..100 {
+                let record = store
+                    .offboard_step(tenant, std::num::NonZeroU64::MIN)
+                    .await?;
+                if record.is_complete() {
+                    return Ok(record);
+                }
+            }
+            panic!("the deletion did not finish in a hundred steps")
+        })
+    };
+    let again: Vec<_> = (0..20).map(|_| fence(&stand, tenant)).collect();
+    for fence in again {
+        fence
+            .await
+            .expect("no panic")
+            .expect("a fence asked again answers its record");
+    }
+    let done: Result<
+        graph_storage_sdk::models::TenantOffboarding,
+        graph_storage_sdk::plugin_api::GraphStoreError,
+    > = steps.await.expect("no panic");
+    assert!(done.expect("no step is aborted").is_complete());
 }
 
 /// A replayed ingest wrote nothing, so it does not take the tenant's

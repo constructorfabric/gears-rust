@@ -353,6 +353,79 @@ async fn another_replica_honours_a_fence_at_its_next_read_and_refuses_a_write_at
     assert_eq!(reason_of(&read), "TENANT_FENCED");
 }
 
+/// A PDP that grants every action over the subtree under one tenant,
+/// resolved in the database: a scope the gear cannot narrow in memory.
+struct Subtree(Uuid);
+
+#[async_trait]
+impl AuthZResolverApi for Subtree {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        _request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![Constraint {
+                    predicates: vec![Predicate::InTenantSubtree(
+                        authz_resolver_sdk::constraints::InTenantSubtreePredicate::new(
+                            pep_properties::OWNER_TENANT_ID,
+                            self.0,
+                        ),
+                    )],
+                }],
+                deny_reason: None,
+            },
+        })
+    }
+}
+
+/// A read whose scope the gear cannot narrow in memory -- a subtree resolved
+/// in the database, under the tenant that leaves -- asks the store which
+/// deletions under way it reaches, and is refused while it reaches one;
+/// once the deletion finished it is served, though the fence stays.
+#[tokio::test]
+async fn a_scope_that_cannot_be_narrowed_is_refused_while_it_reaches_a_deletion() {
+    let (reader, leaving) = (Uuid::now_v7(), Uuid::now_v7());
+    let store = Arc::new(FakeGraphStore::new());
+    let harness = Harness::offboarding_with_subtrees(
+        Arc::clone(&store),
+        Arc::new(Subtree(leaving)),
+        Arc::new(Platform {
+            deleted: Vec::new(),
+            unknown: Vec::new(),
+            asked: AtomicUsize::new(0),
+        }),
+    );
+    let client = GraphStorageLocalClient::new(Arc::clone(&harness.services));
+    let in_reader = SecurityContext::builder()
+        .subject_id(Uuid::now_v7())
+        .subject_tenant_id(reader)
+        .build()
+        .expect("a valid security context");
+    conformance::fence(store.as_ref(), leaving, None)
+        .await
+        .expect("the fence");
+
+    let refused = client
+        .get_node(&in_reader, &"a".to_owned(), None)
+        .await
+        .expect_err("a scope that reaches a deletion under way is refused");
+    assert_eq!(reason_of(&refused), "TENANT_FENCED");
+
+    one_pass(store.as_ref(), 100).await;
+    let served = client
+        .get_node(&in_reader, &"a".to_owned(), None)
+        .await
+        .expect_err("no such node");
+    assert_eq!(
+        served.status_code(),
+        404,
+        "served once the deletion finished: {served:?}"
+    );
+}
+
 /// A step that makes progress clears the failures the pass started with: a
 /// failure right after it is the first, for the backoff as on the record --
 /// not one more on the count from before, which would hold the tenant back
@@ -672,7 +745,31 @@ async fn a_store_without_offboarding_fences_nothing() {
         .await
         .expect_err("refused");
     assert_eq!(refused.status_code(), 501, "{refused:?}");
-    assert_eq!(conformance::record_of(store.as_ref(), tenant).await, None);
+    client
+        .in_tenant(tenant)
+        .revision(&service)
+        .await
+        .expect("a read is served, with no fence to check");
+    assert_eq!(
+        store.refused_offboarding_calls(),
+        0,
+        "the gear asks a store that does not offboard nothing about fences"
+    );
+
+    // Nor does its background: it ends at once rather than list the pending
+    // deletions and read the fences every pass.
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        graph_storage::domain::offboarding::run_background(
+            Arc::clone(&store) as Arc<dyn GraphStoreV1>,
+            &graph_storage::domain::offboarding::FencedTenants::default(),
+            settings(1),
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("the background of a store without offboarding ends at once");
+    assert_eq!(store.refused_offboarding_calls(), 0);
 }
 
 /// A tenant whose deletion fails is noted on its record and skipped, the

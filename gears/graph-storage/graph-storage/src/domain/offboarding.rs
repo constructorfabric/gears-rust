@@ -11,7 +11,7 @@
 //! finishes it, so a deletion that began always ends, whether or not anyone
 //! keeps asking, and a restart picks it up again from the store.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::time::Duration;
 
@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use graph_storage_sdk::models::TenantOffboarding;
 use graph_storage_sdk::plugin_api::{GraphStoreError, GraphStoreV1};
 use time::OffsetDateTime;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -345,11 +346,19 @@ async fn finish(
                 latest = done;
             }
             Ok(Err(error)) => {
-                note_failure(store, &latest, state, &error).await;
+                note_failure(store, &latest, settings, state, cancel, &error).await;
                 return Finish::Failed;
             }
             Err(_) => {
-                note_failure(store, &latest, state, &GraphStoreError::Deadline).await;
+                note_failure(
+                    store,
+                    &latest,
+                    settings,
+                    state,
+                    cancel,
+                    &GraphStoreError::Deadline,
+                )
+                .await;
                 return Finish::Failed;
             }
         }
@@ -359,10 +368,17 @@ async fn finish(
 
 /// Put a failed step on the record, in this worker's memory and in the log,
 /// louder once it keeps happening.
+///
+/// The note on the record is bounded by the step timeout and raced against
+/// `cancel`: a step that timed out may still hold the record's row, and the
+/// note must not hold up the worker behind it. A note that does not land
+/// leaves the count in this worker's memory.
 async fn note_failure(
     store: &dyn GraphStoreV1,
     record: &TenantOffboarding,
+    settings: WorkerSettings,
     state: &mut WorkerState,
+    cancel: &CancellationToken,
     error: &GraphStoreError,
 ) {
     let tenant = record.tenant_id;
@@ -375,7 +391,17 @@ async fn note_failure(
             last: OffsetDateTime::now_utc(),
         },
     );
-    let failures = match store.record_offboarding_failure(tenant, error).await {
+    let noted = tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(GraphStoreError::Unavailable {
+            reason: "the worker is stopping".to_owned(),
+        }),
+        noted = tokio::time::timeout(
+            settings.step_timeout,
+            store.record_offboarding_failure(tenant, error),
+        ) => noted.unwrap_or(Err(GraphStoreError::Deadline)),
+    };
+    let failures = match noted {
         Ok(noted) => noted.failures.max(seen),
         Err(noted) => {
             tracing::warn!(
@@ -447,36 +473,90 @@ pub async fn run_worker(
     }
 }
 
+/// The gear's offboarding background, until `cancel` fires: the worker, and
+/// the fenced tenants read again every refresh. A store that does not
+/// offboard needs neither, and is asked nothing.
+pub async fn run_background(
+    store: std::sync::Arc<dyn GraphStoreV1>,
+    fenced: &FencedTenants,
+    settings: WorkerSettings,
+    cancel: CancellationToken,
+) {
+    if !store.capabilities().offboarding {
+        tracing::info!("offboarding: the store does not offboard; no worker runs");
+        return;
+    }
+    log_started(settings);
+    tokio::join!(
+        run_worker(std::sync::Arc::clone(&store), settings, cancel.clone()),
+        fenced.keep_fresh(store.as_ref(), &cancel),
+    );
+    tracing::info!("offboarding: the worker stopped");
+}
+
+fn log_started(settings: WorkerSettings) {
+    tracing::info!(
+        batch = settings.batch().get(),
+        interval_secs = settings.interval().as_secs(),
+        step_timeout_secs = settings.step_timeout().as_secs(),
+        "offboarding: the worker started"
+    );
+}
+
 // --- the fenced tenants, in memory ------------------------------------------
 
-/// How often the fenced tenants are read again from the store. A fence this
-/// replica did not make is honoured on the read path at most this long
-/// after it committed; writes check the fence at commit whatever this holds.
+/// How often the gear's background task reads the fenced tenants again. A
+/// fence this replica did not make is honoured on the read path about this
+/// long after it committed; writes check the fence at commit whatever the
+/// set holds.
 pub const FENCE_REFRESH: Duration = Duration::from_secs(10);
+
+/// Refreshes the set may miss before a request stops trusting it.
+const TRUSTED_FOR_REFRESHES: u32 = 3;
+
+/// The longest one read of the fenced tenants may take.
+const FENCE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The tenants ever fenced, held in memory for the request path.
 ///
 /// A fence is permanent and only ever added, so the set never holds a tenant
-/// it should not: it can only miss one fenced since it was read. The request
-/// path checks this set instead of the store; a write's own transaction
-/// checks the fence at commit, so a miss here never lets a write through,
-/// and a read may be served at most [`FENCE_REFRESH`] after a fence made on
-/// another replica. A fence made here is in the set at once.
+/// it should not: it can only miss one fenced since it was read. The gear's
+/// background task reads it again every refresh ([`FencedTenants::keep_fresh`])
+/// and the request path reads memory only. A fence made here is in the set
+/// at once. A set not read for three refreshes -- the store keeps failing, or
+/// no background read has run yet -- is not trusted: the request reads the
+/// store itself, bounded, and is refused when that fails.
+///
+/// A write's own transaction checks the fence at commit, so a miss here
+/// never lets a write through.
 #[domain_model]
 #[derive(Debug)]
 pub struct FencedTenants {
     known: std::sync::RwLock<Known>,
-    /// One read of the store at a time: requests that find the set stale
-    /// wait for the one reading it rather than each reading it again.
-    reading: tokio::sync::Mutex<()>,
+    /// One read of the store at a time; callers that find the set stale wait
+    /// for the one reading it rather than each reading it again.
+    reading: tokio::sync::Mutex<Reading>,
+    /// Reads of the store finished so far, so a caller can tell a read that
+    /// finished while it waited.
+    reads: std::sync::atomic::AtomicU64,
     refresh: Duration,
 }
 
 #[derive(Debug, Default)]
 struct Known {
-    tenants: std::sync::Arc<std::collections::HashSet<Uuid>>,
-    /// When the store was last asked; none before the first read.
-    read_at: Option<std::time::Instant>,
+    tenants: std::sync::Arc<HashSet<Uuid>>,
+    /// The last successful read; none before the first.
+    read_at: Option<Instant>,
+}
+
+#[derive(Debug, Default)]
+struct Reading {
+    /// Failed reads in a row.
+    failures: u32,
+    /// The read that last failed, by its number, so callers that waited for
+    /// it fail with it rather than queue a read each on a store that does
+    /// not answer.
+    failed: Option<u64>,
 }
 
 impl Default for FencedTenants {
@@ -490,72 +570,135 @@ impl FencedTenants {
     pub fn refreshed_every(refresh: Duration) -> Self {
         Self {
             known: std::sync::RwLock::new(Known::default()),
-            reading: tokio::sync::Mutex::new(()),
+            reading: tokio::sync::Mutex::new(Reading::default()),
+            reads: std::sync::atomic::AtomicU64::new(0),
             refresh,
         }
     }
 
-    /// The fenced tenants, read from `store` when the set is older than its
-    /// refresh. A read that fails keeps the set as it was, logged, and is
-    /// tried again after the refresh; only the first read, with nothing to
-    /// fall back on, fails the request.
+    /// How long after its last successful read the set serves a request.
+    fn trusted_for(&self) -> Duration {
+        self.refresh.saturating_mul(TRUSTED_FOR_REFRESHES)
+    }
+
+    /// The fenced tenants, for a request: the set in memory while it was read
+    /// within three refreshes; otherwise read from `store` now.
+    ///
+    /// Cancel-safe: the set is replaced only after the read returned, in one
+    /// step, so a call dropped while it waits or reads leaves it as it was.
     ///
     /// # Errors
     ///
-    /// The store's, when it has never answered.
+    /// The store's, or `Deadline`, when the set is not trusted and cannot be
+    /// read; `Unavailable` when a read this call waited for failed.
     pub async fn current(
         &self,
         store: &dyn GraphStoreV1,
-    ) -> Result<std::sync::Arc<std::collections::HashSet<Uuid>>, GraphStoreError> {
-        if let Some(fresh) = self.fresh() {
-            return Ok(fresh);
+    ) -> Result<std::sync::Arc<HashSet<Uuid>>, GraphStoreError> {
+        let trusted = self.trusted_for();
+        if let Some(set) = self.read_within(trusted) {
+            return Ok(set);
         }
-        let _reading = self.reading.lock().await;
-        if let Some(fresh) = self.fresh() {
-            return Ok(fresh);
+        self.read(store, trusted).await
+    }
+
+    /// Read the set again every refresh until `cancel` fires, so requests
+    /// read memory only. A failed read is logged, at `error` once it keeps
+    /// failing, and leaves the set as it was.
+    //
+    // cancel-safe: as `current`.
+    pub async fn keep_fresh(&self, store: &dyn GraphStoreV1, cancel: &CancellationToken) {
+        loop {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => return,
+                _ = self.read(store, self.refresh) => {}
+            }
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                () = tokio::time::sleep(self.refresh.max(Duration::from_secs(1))) => {}
+            }
         }
-        let read = store.fenced_tenant_ids().await;
+    }
+
+    /// Read the set from `store` unless it was read within `fresh_for`,
+    /// one caller at a time.
+    async fn read(
+        &self,
+        store: &dyn GraphStoreV1,
+        fresh_for: Duration,
+    ) -> Result<std::sync::Arc<HashSet<Uuid>>, GraphStoreError> {
+        let asked = self.reads.load(std::sync::atomic::Ordering::SeqCst);
+        let mut reading = self.reading.lock().await;
+        // Another caller may have read it while this one waited.
+        if let Some(set) = self.read_within(fresh_for) {
+            return Ok(set);
+        }
+        if reading.failed.is_some_and(|read| read > asked) {
+            return Err(GraphStoreError::Unavailable {
+                reason: "the fenced tenants cannot be read".to_owned(),
+            });
+        }
+        let read = tokio::time::timeout(FENCE_READ_TIMEOUT, store.all_fenced_tenant_ids())
+            .await
+            .unwrap_or(Err(GraphStoreError::Deadline));
+        let number = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        match read {
+            Ok(ids) => {
+                *reading = Reading::default();
+                Ok(self.replace(ids))
+            }
+            Err(error) => {
+                reading.failures = reading.failures.saturating_add(1);
+                reading.failed = Some(number);
+                if reading.failures >= ESCALATE_AFTER {
+                    tracing::error!(
+                        failures = reading.failures,
+                        error = %logged(&error),
+                        "offboarding: the fenced tenants keep failing to read; requests are \
+                         refused once the last read is too old"
+                    );
+                } else {
+                    tracing::warn!(
+                        failures = reading.failures,
+                        error = %logged(&error),
+                        "offboarding: the fenced tenants could not be read"
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Take `ids` as the set, keeping the fences this replica made while the
+    /// store was read.
+    fn replace(&self, ids: Vec<Uuid>) -> std::sync::Arc<HashSet<Uuid>> {
         let mut known = self
             .known
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match read {
-            Ok(ids) => {
-                // A fence this replica made while the store was read is kept.
-                let mut tenants: std::collections::HashSet<Uuid> = ids.into_iter().collect();
-                tenants.extend(known.tenants.iter().copied());
-                known.tenants = std::sync::Arc::new(tenants);
-                known.read_at = Some(std::time::Instant::now());
-                Ok(std::sync::Arc::clone(&known.tenants))
-            }
-            Err(error) if known.read_at.is_some() => {
-                tracing::warn!(
-                    error = %logged(&error),
-                    "offboarding: the fenced tenants could not be read again; the last read \
-                     stands until the next try"
-                );
-                known.read_at = Some(std::time::Instant::now());
-                Ok(std::sync::Arc::clone(&known.tenants))
-            }
-            Err(error) => Err(error),
-        }
+        let mut tenants: HashSet<Uuid> = ids.into_iter().collect();
+        tenants.extend(known.tenants.iter().copied());
+        known.tenants = std::sync::Arc::new(tenants);
+        known.read_at = Some(Instant::now());
+        std::sync::Arc::clone(&known.tenants)
     }
 
-    /// The set, when it was read within its refresh.
-    fn fresh(&self) -> Option<std::sync::Arc<std::collections::HashSet<Uuid>>> {
+    /// The set, when it was read within `within`.
+    fn read_within(&self, within: Duration) -> Option<std::sync::Arc<HashSet<Uuid>>> {
         let known = self
             .known
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         known
             .read_at
-            .is_some_and(|at| at.elapsed() < self.refresh)
+            .is_some_and(|at| at.elapsed() < within)
             .then(|| std::sync::Arc::clone(&known.tenants))
     }
 
     /// Add a tenant this replica fenced, so its requests see the fence at
     /// once rather than at the next read.
-    pub fn add(&self, tenant: Uuid) {
+    pub(crate) fn add(&self, tenant: Uuid) {
         let mut known = self
             .known
             .write()
@@ -599,6 +742,167 @@ mod tests {
         assert!(due(1, Some(last), interval, last + wait + wait));
         assert!(due(0, Some(last), interval, last));
         assert!(due(3, None, interval, last));
+    }
+
+    // --- the fenced tenants ------------------------------------------------
+
+    use std::sync::Arc;
+
+    use crate::infra::fake_store::FakeGraphStore;
+
+    async fn fence(store: &FakeGraphStore, tenant: Uuid) {
+        let scope = toolkit_security::AccessScope::for_tenant(tenant);
+        let ctx = graph_storage_sdk::plugin_api::StoreCtx {
+            tenant,
+            scope: &scope,
+            subject: graph_storage_sdk::models::Subject {
+                subject_id: Uuid::now_v7(),
+                subject_type: None,
+            },
+            snapshot: None,
+            budget: graph_storage_sdk::models::RemainingBudget::starting_now(Duration::from_secs(
+                30,
+            )),
+            cancel: CancellationToken::new(),
+        };
+        store.fence_tenant(&ctx, None).await.expect("the fence");
+    }
+
+    /// The set is read every ten seconds, and a request trusts it for three
+    /// refreshes: within them it is served from memory, past them the
+    /// request reads it again.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_reads_memory_for_three_refreshes_then_the_store() {
+        assert_eq!(
+            FENCE_REFRESH,
+            Duration::from_secs(10),
+            "DESIGN promises 10 s"
+        );
+        let store = FakeGraphStore::new();
+        let fenced = FencedTenants::default();
+        let tenant = Uuid::now_v7();
+
+        assert!(fenced.current(&store).await.expect("read").is_empty());
+        assert_eq!(store.fence_reads(), 1);
+        fence(&store, tenant).await;
+
+        tokio::time::advance(Duration::from_secs(29)).await;
+        assert!(
+            !fenced
+                .current(&store)
+                .await
+                .expect("memory")
+                .contains(&tenant)
+        );
+        assert_eq!(store.fence_reads(), 1, "served from memory");
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(
+            fenced
+                .current(&store)
+                .await
+                .expect("read")
+                .contains(&tenant)
+        );
+        assert_eq!(store.fence_reads(), 2);
+    }
+
+    /// The background task reads the set every refresh, so requests find
+    /// another replica's fence within one refresh without reading the store.
+    #[tokio::test(start_paused = true)]
+    async fn the_background_reads_the_set_every_refresh_off_the_request_path() {
+        let store = Arc::new(FakeGraphStore::new());
+        let fenced = Arc::new(FencedTenants::default());
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn({
+            let (store, fenced, cancel) = (Arc::clone(&store), Arc::clone(&fenced), cancel.clone());
+            async move { fenced.keep_fresh(store.as_ref(), &cancel).await }
+        });
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(store.fence_reads(), 1);
+
+        let tenant = Uuid::now_v7();
+        fence(&store, tenant).await;
+        tokio::time::advance(FENCE_REFRESH + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(store.fence_reads(), 2);
+        assert!(
+            fenced
+                .current(store.as_ref())
+                .await
+                .expect("memory")
+                .contains(&tenant)
+        );
+        assert_eq!(store.fence_reads(), 2, "the request read memory");
+
+        cancel.cancel();
+        task.await.expect("the background stops");
+    }
+
+    /// A store that does not answer: the first read fails the request; a
+    /// failed re-read leaves the set serving while it is trusted, and once
+    /// it is too old the request is refused rather than served from it.
+    #[tokio::test(start_paused = true)]
+    async fn a_set_that_cannot_be_read_fails_closed_once_it_is_too_old() {
+        let store = FakeGraphStore::new();
+        let fenced = FencedTenants::default();
+        store.fail_fence_reads(true);
+        assert!(
+            fenced.current(&store).await.is_err(),
+            "nothing to fall back on"
+        );
+
+        store.fail_fence_reads(false);
+        fenced
+            .current(&store)
+            .await
+            .expect("the store answers again");
+        store.fail_fence_reads(true);
+        tokio::time::advance(FENCE_REFRESH).await;
+        assert!(
+            fenced.read(&store, fenced.refresh).await.is_err(),
+            "the background read fails"
+        );
+        fenced.current(&store).await.expect("still trusted");
+
+        tokio::time::advance(FENCE_REFRESH * 3).await;
+        assert!(fenced.current(&store).await.is_err(), "too old to trust");
+        store.fail_fence_reads(false);
+        fenced
+            .current(&store)
+            .await
+            .expect("served once the store answers");
+    }
+
+    /// Callers that find the set stale share one read; when it fails, they
+    /// fail with it rather than each read a store that does not answer. A
+    /// fence this replica made during the read is kept.
+    #[tokio::test(start_paused = true)]
+    async fn callers_share_one_read_and_keep_a_fence_made_during_it() {
+        let store = Arc::new(FakeGraphStore::new());
+        let fenced = Arc::new(FencedTenants::default());
+        store.delay_fence_reads(Duration::from_secs(1));
+        let reading = |store: &Arc<FakeGraphStore>, fenced: &Arc<FencedTenants>| {
+            let (store, fenced) = (Arc::clone(store), Arc::clone(fenced));
+            tokio::spawn(async move { fenced.current(store.as_ref()).await })
+        };
+
+        let (first, second) = (reading(&store, &fenced), reading(&store, &fenced));
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let mine = Uuid::now_v7();
+        fenced.add(mine);
+        for read in [first, second] {
+            assert!(read.await.expect("joins").expect("read").contains(&mine));
+        }
+        assert_eq!(store.fence_reads(), 1, "one read for both");
+
+        tokio::time::advance(FENCE_REFRESH * 3).await;
+        store.fail_fence_reads(true);
+        let (first, second) = (reading(&store, &fenced), reading(&store, &fenced));
+        for read in [first, second] {
+            assert!(read.await.expect("joins").is_err());
+        }
+        assert_eq!(store.fence_reads(), 2, "the waiter failed with the read");
     }
 
     #[test]

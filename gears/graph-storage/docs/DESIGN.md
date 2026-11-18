@@ -2746,12 +2746,17 @@ operation for it answers `failed_precondition` / `TENANT_FENCED` once the policy
 has decided, so a caller the policy refuses learns nothing about the tenant.
 
 The request path does not ask the store. A fence is permanent and only ever
-added, so each replica holds the set of fenced tenants in memory and reads it
-again from the store every ten seconds; a fence made on a replica is in its
-own set at once. A fence made on another replica is therefore honoured on the
-read path at most ten seconds after it committed; a write is refused at its
-commit whatever the set holds (below). A failed read of the set keeps the last
-one and is tried again after the interval.
+added, so each replica holds the set of fenced tenants in memory, and the
+gear's background task reads it again from the store every ten seconds, with a
+timeout; a fence made on a replica is in its own set at once. A fence made on
+another replica is therefore honoured on the read path about ten seconds after
+it committed; a write is refused at its commit whatever the set holds (below).
+A failed background read keeps the last set, and is logged at `error` once it
+keeps failing. A set not read successfully for thirty seconds -- the store
+keeps failing, or no background read has run yet -- is not trusted: a request
+reads it itself, with the same timeout, and is refused when that fails, so a
+stale set never serves for long. A store that does not offboard runs neither
+the background read nor the worker.
 
 A read without a named tenant keeps the policy's scope, a parent's subtree
 included, so it could reach a child being offboarded. When that scope reaches
@@ -2781,8 +2786,9 @@ takes the row first. A write that fails for a tenant fenced since it started,
 on a type the deletion already removed, say, answers `TENANT_FENCED` rather
 than what it tripped over. Every write transaction -- ingest, soft delete,
 purge, type registration, namespace transfer -- runs inside one wrapper that
-does this, and one that wrote nothing, such as a replayed ingest, does not take
-the row.
+does this. One that wrote nothing, such as a replayed ingest, does not take
+the row but still reads the fence, so a replica whose set is stale does not
+answer it as a success.
 
 The fence itself first reads whether the tenant is fenced already and answers
 that record without taking the row: a deletion step holds the record's row
@@ -2790,8 +2796,9 @@ while it removes `graph_meta`, the revision row among it, so a second fence
 must not take the two in the opposite order. A tenant not fenced yet has no
 step running; the fence takes the row, reads again in case another fence
 committed meanwhile, and only then writes. The PostgreSQL conformance lane holds the row open and runs both
-orders for ingest, soft delete, type registration and namespace transfer; a
-purge of a fenced tenant is refused in the conformance suite on both stores.
+orders for ingest, soft delete, purge, type registration and namespace
+transfer, races two first fences, and asks for the fence again while the
+deletion runs.
 
 **Step 3, not as written.** Nothing is cancelled: a write still running when the
 fence lands is refused at its commit instead (step 2), which has the same effect
@@ -2815,15 +2822,17 @@ worker moves on, so one large or stuck tenant does not hold up the others. A
 failed step is noted on the record (a failure count and the error's class,
 never its message); the tenant then waits the interval doubled per failure, up
 to an hour, before it is tried again, and its failures log at `error` from the
-fifth on. The worker also remembers the failures it saw itself, so the backoff
-and the escalation hold when the database is too sick to take the note. A
+fifth on. The note is bounded by the step timeout and stops at shutdown, as a
+timed-out step may still hold the record's row. The worker also remembers the
+failures it saw itself, so the backoff and the escalation hold when the
+database is too sick to take the note. A
 record that does not decode is logged at `error` and skipped, never allowed to
 stop the other tenants' deletions. Each pass starts at a random pending tenant
 and passes are spread by up to a tenth of the interval, so replicas drift
 apart; a pass with anything pending logs a summary at `info`. The worker
 acts for no caller, so its statements run under scopes it builds for the tenant
-rather than one a policy returned; giving it the gear's own service identity is
-open.
+rather than one a policy returned; so does the background read of the fenced
+tenants, across tenants. Giving both the gear's own service identity is open.
 
 **Step 5, read rather than pushed.** There is no lifecycle owner to notify. The
 record's `completed_at` is the acknowledgement, with the rows removed per kind,

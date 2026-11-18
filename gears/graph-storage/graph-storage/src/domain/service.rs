@@ -114,9 +114,10 @@ impl GraphServices {
     /// about the tenant, fenced or not.
     ///
     /// The fenced tenants come from memory ([`FencedTenants`]), not from the
-    /// store: a fence made on another replica is honoured here at most the
+    /// store: a fence made on another replica is honoured here about the
     /// set's refresh after it committed, and a write's own transaction checks
-    /// the fence at commit whatever the set holds.
+    /// the fence at commit whatever the set holds. A set too old to trust is
+    /// read again here, and the call refused when that fails.
     ///
     /// A read without a named tenant keeps the policy's scope, a subtree
     /// included, so it could reach a child tenant that is being offboarded.
@@ -148,8 +149,7 @@ impl GraphServices {
             });
         }
         if !named && action == authz::actions::READ && !authz::only(&auth.scope, auth.tenant) {
-            let gone: Vec<uuid::Uuid> = fenced.iter().copied().collect();
-            if let Some(narrowed) = authz::without_tenants(&auth.scope, &gone) {
+            if let Some(narrowed) = authz::without_tenants(&auth.scope, &fenced) {
                 auth.scope = narrowed;
             } else {
                 // A scope this gear cannot narrow in memory: the store says
