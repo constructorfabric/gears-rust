@@ -56,7 +56,14 @@ pub fn register_routes(
              key that is visible but not flagged is absent from it. The flagged rows of \
              the target's subtree are `GET /settings-service/v1/settings/review`. `q` \
              narrows the page to the settings whose declaration text or shown value \
-             contains it; a value masked for the caller never matches. Under `q`, a \
+             contains it; a value masked for the caller never matches. Each item `q` \
+             matched carries `matched_field`, present only under `q`: `key`, \
+             `display_name`, `description`, `category_name`, `default_value` or `value`, \
+             the vocabulary and the order of `GET /settings-service/v1/search`, the first \
+             of them that matched being named; `value` covers the effective value and the fallback \
+             value as shown, and is never reported for a masked one. An item kept by \
+             its declaration text carries no `matched_field` when no field can be \
+             named for the match. Under `q`, a \
              dependency that is unavailable for a setting whose value the caller could \
              have matched answers 503, since the narrowing cannot be decided; a page \
              already full still answers, with a cursor. A cursor continues only the \
@@ -78,8 +85,8 @@ pub fn register_routes(
              characters after trimming; keeps the settings whose key, display name, \
              description, category name, Schema Default, effective value or fallback value \
              contains it, case-insensitively; combines with $filter; the cursor is bound \
-             to it beside the $filter and the target, and a page it narrows carries no \
-             total_count",
+             to it beside the $filter and the target, a page it narrows carries no \
+             total_count, and each item it matched names the field in matched_field",
         )
         .query_param_typed("limit", false, "Page size", "integer")
         .query_param("cursor", false, "Cursor for pagination")

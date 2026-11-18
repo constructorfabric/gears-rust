@@ -84,6 +84,24 @@ impl Dialect {
     // @cpt-end:cpt-cf-settings-service-algo-search-discoverability-needle:p2:inst-sd-needle-3
 }
 
+/// The categories whose name a text match may reach: those in the domains the
+/// caller may see, as a category listing shows them.
+///
+/// Stated once for the name predicate of [`TextMatch::declaration_text_matches`]
+/// and for the read of the names a match is attributed with, so a match is
+/// never attributed to a name the predicate could not have matched.
+pub fn matchable_categories(visibility: &DomainVisibility) -> sea_orm::Select<CategoryEntity> {
+    let categories = CategoryEntity::find();
+    match visibility {
+        DomainVisibility::Unrestricted => categories,
+        DomainVisibility::Restricted(domains) => categories.filter(
+            category::Column::DomainAffinity
+                .is_null()
+                .or(category::Column::DomainAffinity.is_in(domains.clone())),
+        ),
+    }
+}
+
 /// The text match for one dialect: the substring predicate with its pattern
 /// bound as a parameter, the text projection of a JSON column, and the
 /// declaration-text half of a match.
@@ -134,17 +152,10 @@ impl TextMatch {
 
         // Categories whose name matches. Domain visibility applies to them as
         // it applies to a category listing.
-        let mut categories = CategoryEntity::find()
+        let categories = matchable_categories(visibility)
             .select_only()
             .column(category::Column::Id)
             .filter(self.contains("categories.name", &pattern));
-        if let DomainVisibility::Restricted(domains) = visibility {
-            categories = categories.filter(
-                category::Column::DomainAffinity
-                    .is_null()
-                    .or(category::Column::DomainAffinity.is_in(domains.clone())),
-            );
-        }
 
         // @cpt-begin:cpt-cf-settings-service-algo-search-discoverability-corpus:p2:inst-sd-corpus-3
         // @cpt-begin:cpt-cf-settings-service-algo-search-discoverability-corpus:p2:inst-sd-corpus-4

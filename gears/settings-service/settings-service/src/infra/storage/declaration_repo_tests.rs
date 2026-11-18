@@ -105,6 +105,86 @@ async fn the_last_position_of_a_batch_is_the_cursor_the_toolkit_mints_for_the_sa
 }
 
 #[tokio::test]
+async fn a_batch_brings_the_category_name_of_a_text_match_only_where_the_caller_may_see_it() {
+    use crate::domain::category::{CategoryDraft, CategoryKey, CategoryRepository as _};
+    use crate::infra::storage::category_repo::CategoryRepo;
+
+    let h = ResolutionHarness::new().await;
+    let conn = h.db.conn().expect("connection");
+    let scope = AccessScope::allow_all();
+    let guarded = CategoryRepo
+        .insert(
+            &conn,
+            &scope,
+            CategoryDraft {
+                key: CategoryKey::parse("lanterns").expect("slug"),
+                name: "Lantern room".to_owned(),
+                description: None,
+                domain_affinity: Some("storage".to_owned()),
+                sort_order: 0,
+                icon: None,
+            },
+        )
+        .await
+        .expect("category")
+        .id;
+    // In the guarded category: one the category name alone matches, one whose
+    // Schema Default matches too.
+    for (name, default) in [("by_name", "plain"), ("by_both", "lantern-default")] {
+        h.declare_in(
+            guarded,
+            name,
+            "cascading",
+            json!(default),
+            crate::test_support::BOOL,
+            "public",
+        )
+        .await;
+    }
+    h.declare("unmatched", "cascading", json!("plain")).await;
+
+    let needle = Needle::parse("lantern").expect("needle");
+    let narrowing = BrowseNarrowing {
+        needle: &needle,
+        corpus: Corpus::Public,
+        postgres: false,
+    };
+    let query = ODataQuery {
+        limit: Some(10),
+        ..ODataQuery::default()
+    };
+    let batch = |visibility: DomainVisibility| {
+        let (conn, scope, query, narrowing) = (&conn, &scope, &query, &narrowing);
+        async move {
+            DeclarationRepo
+                .list_candidates(conn, scope, &visibility, &[], None, query, narrowing)
+                .await
+                .expect("batch")
+                .items
+                .into_iter()
+                .map(|c| (c.declaration.leaf_slug, (c.text_matched, c.category_name)))
+                .collect::<std::collections::HashMap<_, _>>()
+        }
+    };
+
+    // Every category visible: the name comes with each text match, and with
+    // no other candidate.
+    let seen = batch(DomainVisibility::Unrestricted).await;
+    let name = Some("Lantern room".to_owned());
+    assert_eq!(seen["by_name"], (true, name.clone()));
+    assert_eq!(seen["by_both"], (true, name.clone()));
+    assert_eq!(seen["unmatched"], (false, None));
+    let seen = batch(DomainVisibility::Restricted(vec!["storage".to_owned()])).await;
+    assert_eq!(seen["by_name"], (true, name));
+
+    // The category outside the caller's domains: its name neither matches nor
+    // travels, so a match on the Schema Default cannot be attributed to it.
+    let seen = batch(DomainVisibility::Restricted(vec!["network".to_owned()])).await;
+    assert_eq!(seen["by_name"], (false, None));
+    assert_eq!(seen["by_both"], (true, None));
+}
+
+#[tokio::test]
 async fn a_delete_at_a_stale_version_is_refused_and_removes_nothing() {
     let h = ResolutionHarness::new().await;
     let id = h.declare("one", scope_class::LOCAL, json!(true)).await;

@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::resolution::{EffectiveValue, MASK_TOKEN, TrailEntry, scope_path};
+use crate::domain::search::MatchedField;
 use crate::domain::value::StoredValue;
 use crate::domain::writes::value_state_tag;
 
@@ -544,9 +545,27 @@ pub struct SettingItemDto {
     /// from the key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// Which field the text `q` matched: `key`, `display_name`,
+    /// `description`, `category_name`, `default_value` or `value` — the
+    /// search's vocabulary, attributed in that order when several match.
+    /// `value` covers the effective value and the fallback value, both as
+    /// shown; a masked value is never named. Present only under `q`; absent
+    /// without `q`, on an entry `q` did not match — a named key reported
+    /// `not_found`, a setting kept only for its own failure — and on an item
+    /// kept by its declaration text when no field can be named for the
+    /// match.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_field: Option<String>,
 }
 
 impl SettingItemDto {
+    /// The same entry, naming the field the text `q` matched, if any did.
+    #[must_use]
+    pub fn with_matched_field(mut self, matched: Option<MatchedField>) -> Self {
+        self.matched_field = matched.map(|field| field.as_str().to_owned());
+        self
+    }
+
     /// The same entry, tagged with its declaration's mode.
     #[must_use]
     pub fn with_mode(mut self, mode: &str) -> Self {
@@ -571,6 +590,7 @@ impl SettingItemDto {
             detail: None,
             mode: None,
             display_name: None,
+            matched_field: None,
         }
     }
 
@@ -591,6 +611,7 @@ impl SettingItemDto {
             detail: Some(err.wire_message()),
             mode: None,
             display_name: None,
+            matched_field: None,
         }
     }
 

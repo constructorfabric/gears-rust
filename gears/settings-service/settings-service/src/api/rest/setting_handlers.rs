@@ -29,7 +29,8 @@ use crate::domain::declaration::{BrowseNarrowing, Declaration};
 use crate::domain::error::DomainError;
 use crate::domain::ports::SecurityMetrics;
 use crate::domain::resolution::{EffectiveValue, SUBTREE_BUDGET, ScopeTarget, subtree_too_large};
-use crate::domain::search::{Corpus, Needle};
+use crate::domain::search::service::declaration_match;
+use crate::domain::search::{Corpus, MatchedField, Needle};
 use crate::domain::value::{ReviewRequest, review_binding};
 use crate::field;
 use crate::gear::ConcreteResolver;
@@ -314,6 +315,36 @@ struct NarrowedBrowse<'a> {
     postgres: bool,
 }
 
+/// What the database's match on a candidate's own text comes to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextMatch {
+    /// The declaration's text did not match.
+    No,
+    /// It matched, and no field can be named: the database folds letter case
+    /// its own way, so a match it finds is not always found again in any one
+    /// field here. The candidate is kept and no field is guessed for it.
+    Unnamed,
+    /// It matched in this field.
+    In(MatchedField),
+}
+
+impl TextMatch {
+    const fn matched(self) -> bool {
+        !matches!(self, Self::No)
+    }
+
+    const fn field(self) -> Option<MatchedField> {
+        match self {
+            Self::In(field) => Some(field),
+            Self::No | Self::Unnamed => None,
+        }
+    }
+}
+
+/// What a candidate carries beside its declaration: what its text match came
+/// to, and its place in the listing.
+type CandidateMark = (TextMatch, CursorV1);
+
 /// A row the narrowing kept, with its place in the listing.
 struct KeptRow {
     item: SettingItemDto,
@@ -321,22 +352,27 @@ struct KeptRow {
     position: CursorV1,
 }
 
-/// Whether a candidate qualifies, and if so its entry.
+/// Whether a candidate qualifies, and if so its entry, naming the field that
+/// matched.
 ///
-/// By its declaration text, or by the value or fallback the caller receives
-/// unmasked. A `retired` candidate qualifies by its text alone. A candidate
-/// whose value could not be read because a dependency is unavailable, and
-/// whose value the caller would have seen unmasked, cannot be decided: the
-/// whole request is refused with that failure rather than paged through. One
-/// that fails on its own keeps its `error` entry under the same condition, so
-/// a defect is never hidden behind the narrowing; a value the caller could
-/// never match leaves the decision to the text.
+/// By its declaration text — `text`, with the field that match is attributed
+/// to when one can be named — or by the value or fallback the caller receives
+/// unmasked, reported as `value`; the text comes first, as in the search's
+/// order. A text match no field names keeps the candidate and reports `value`
+/// when the shown value matches too, else no field at all. A `retired` candidate qualifies by its text alone. A
+/// candidate whose value could not be read because a dependency is
+/// unavailable, and whose value the caller would have seen unmasked, cannot
+/// be decided: the whole request is refused with that failure rather than
+/// paged through. One that fails on its own keeps its `error` entry under the
+/// same condition, so a defect is never hidden behind the narrowing — an entry
+/// nothing matched, which names no field; a value the caller could never
+/// match leaves the decision to the text.
 ///
 /// # Errors
 /// The `Unavailable` failure of an undecidable candidate.
 fn qualify(
     declaration: &Declaration,
-    text_matched: bool,
+    text: TextMatch,
     outcome: Result<Arc<EffectiveValue>, DomainError>,
     needle: &Needle,
     pii: bool,
@@ -349,21 +385,30 @@ fn qualify(
         Ok(effective) => {
             // Rendered once: the entry is this rendering, kept or not.
             let dto = render(&effective, pii, reader, chain);
-            let qualifies =
-                text_matched || value_part_matches(&dto, effective.secret_backed, needle);
-            Ok(qualifies.then(|| {
+            // `value` is named only through `value_part_matches`, which a
+            // masked value never passes: the field never tells of content the
+            // caller is not shown.
+            let field = text.field().or_else(|| {
+                value_part_matches(&dto, effective.secret_backed, needle)
+                    .then_some(MatchedField::Value)
+            });
+            Ok((text.matched() || field.is_some()).then(|| {
                 (
                     SettingItemDto::resolved(dto)
                         .with_mode(&declaration.mode)
-                        .with_display_name(declaration.display_name.as_deref()),
+                        .with_display_name(declaration.display_name.as_deref())
+                        .with_matched_field(field),
                     None,
                 )
             }))
         }
-        Err(err @ DomainError::Unavailable { .. }) if !text_matched && readable => Err(err),
+        Err(err @ DomainError::Unavailable { .. }) if !text.matched() && readable => Err(err),
         Err(err) => {
-            let keep = text_matched || (readable && matches!(err, DomainError::Internal { .. }));
-            Ok(keep.then(|| browse_entry(declaration, Err(err), pii, reader, chain)))
+            let keep = text.matched() || (readable && matches!(err, DomainError::Internal { .. }));
+            Ok(keep.then(|| {
+                let (item, diagnostic) = browse_entry(declaration, Err(err), pii, reader, chain);
+                (item.with_matched_field(text.field()), diagnostic)
+            }))
         }
     }
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-11
@@ -425,10 +470,27 @@ async fn narrowed_page<C: toolkit_db::secure::DBRunner>(
             batch.page_info.next_cursor.clone()
         };
         // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-12-match
-        let (declarations, marks): (Vec<Declaration>, Vec<(bool, CursorV1)>) = batch
+        // A candidate whose text matched is attributed here, by the search's
+        // own attribution and in its order, from the category names the batch
+        // read brought with it. Where that names no field the candidate is
+        // kept without one: the search's fallback attribution is not applied.
+        let (declarations, marks): (Vec<Declaration>, Vec<CandidateMark>) = batch
             .items
             .into_iter()
-            .map(|c| (c.declaration, (c.text_matched, c.position)))
+            .map(|c| {
+                let text = if c.text_matched {
+                    declaration_match(
+                        &c.declaration,
+                        c.category_name.as_deref(),
+                        ctx.needle,
+                        narrowing.corpus,
+                    )
+                    .map_or(TextMatch::Unnamed, TextMatch::In)
+                } else {
+                    TextMatch::No
+                };
+                (c.declaration, (text, c.position))
+            })
             .unzip();
         let outcomes = resolver
             .resolve_declarations(conn, &declarations, ctx.target)
@@ -437,10 +499,10 @@ async fn narrowed_page<C: toolkit_db::secure::DBRunner>(
         if backward {
             rows.reverse();
         }
-        for ((declaration, (text_matched, position)), outcome) in rows {
+        for ((declaration, (text, position)), outcome) in rows {
             let qualified = match qualify(
                 declaration,
-                text_matched,
+                text,
                 outcome,
                 ctx.needle,
                 ctx.pii,

@@ -34,6 +34,17 @@ fn has(items: &[Value], needle: &str) -> bool {
         .any(|i| i["key"].as_str().is_some_and(|k| k.contains(needle)))
 }
 
+/// The `matched_field` of the item whose key names the leaf `name`; JSON
+/// `null` when the item carries none.
+fn matched(items: &[Value], name: &str) -> Value {
+    let leaf = format!(".{name}.");
+    items
+        .iter()
+        .find(|i| i["key"].as_str().is_some_and(|k| k.contains(&leaf)))
+        .unwrap_or_else(|| panic!("no item for `{name}`: {items:?}"))["matched_field"]
+        .clone()
+}
+
 /// Walk every page from `first`, as the root administrator.
 async fn every_page(h: &RestHarness, first: &str) -> (Vec<Value>, usize) {
     let mut items = Vec::new();
@@ -137,9 +148,294 @@ async fn q_narrows_the_browse_to_the_settings_whose_text_or_shown_values_contain
     for item in &items {
         assert_eq!(item["outcome"], json!("resolved"), "{item}");
         assert!(item["effective"].get("value").is_some(), "{item}");
-        assert!(item.get("matched_field").is_none(), "{item}");
         assert!(item.get("matches").is_none(), "{item}");
     }
+    // Every item says which field matched, in the search's vocabulary: one
+    // setting per entry of it, and the fallback reported as the value it is
+    // shown as.
+    for (name, field) in [
+        ("lantern_key", "key"),
+        ("by_label", "display_name"),
+        ("by_description", "description"),
+        ("by_category", "category_name"),
+        ("by_default", "default_value"),
+        ("by_value", "value"),
+        ("by_fallback", "value"),
+    ] {
+        assert_eq!(matched(&items, name), json!(field), "{name}: {items:?}");
+    }
+}
+
+#[tokio::test]
+async fn matched_field_is_on_every_item_under_q_and_on_none_without_it() {
+    let h = RestHarness::new().await;
+    let root = h.inner.tree.root;
+    h.inner
+        .declare("lantern_one", "cascading", json!("plain"))
+        .await;
+    let other = h.inner.declare("other", "cascading", json!("plain")).await;
+    h.inner.set(other, root, json!("lantern-set")).await;
+
+    let (status, body) = h.get(&format!("{BROWSE}?q=lantern"), root).await;
+    assert_eq!(status, 200, "{body}");
+    let narrowed = body["items"].as_array().expect("items");
+    assert_eq!(narrowed.len(), 2, "{body}");
+    for item in narrowed {
+        let object = item.as_object().expect("an object");
+        assert!(object.contains_key("matched_field"), "{item}");
+        assert!(item["matched_field"].is_string(), "{item}");
+    }
+
+    let (status, body) = h.get(BROWSE, root).await;
+    assert_eq!(status, 200, "{body}");
+    let plain = body["items"].as_array().expect("items");
+    assert_eq!(plain.len(), 2, "{body}");
+    for item in plain {
+        let object = item.as_object().expect("an object");
+        assert!(!object.contains_key("matched_field"), "{item}");
+    }
+}
+
+#[tokio::test]
+async fn a_text_match_no_field_can_be_named_for_keeps_the_item_without_a_field() {
+    // The database decides the text match and folds letter case its own way.
+    // It finds `ΑΣ` in the label `ΑΣΑ` as spelled; lower-cased here the
+    // needle ends in a final sigma and the label holds a medial one, so no
+    // field is found to hold it. The setting stays on the page, its text
+    // having matched, and names no field rather than one that did not match.
+    let h = RestHarness::new().await;
+    let root = h.inner.tree.root;
+    h.inner
+        .declare_labelled(
+            "folded",
+            "cascading",
+            json!("plain"),
+            "\u{391}\u{3a3}\u{391}",
+        )
+        .await;
+
+    // `ΑΣ`, percent-encoded as UTF-8.
+    let items = h.items(&format!("{BROWSE}?q=%CE%91%CE%A3"), root).await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(matched(&items, "folded"), Value::Null, "{items:?}");
+    assert!(
+        items[0].get("matched_field").is_none(),
+        "the field is omitted, not null: {items:?}"
+    );
+}
+
+#[tokio::test]
+async fn several_matches_are_attributed_in_the_searchs_order() {
+    let h = RestHarness::new().await;
+    let root = h.inner.tree.root;
+    let beacons = h.inner.add_category("beacons").await;
+
+    // Each setting matches in the field its name says and in every later one
+    // of the order: the earlier field is the one reported.
+    let key_first = h
+        .inner
+        .declare_labelled("beacon_key", "cascading", json!("beacon-d"), "Beacon")
+        .await;
+    h.inner.set(key_first, root, json!("beacon-set")).await;
+    let label_first = h
+        .inner
+        .declare_labelled("label_first", "cascading", json!("beacon-d"), "Beacon")
+        .await;
+    h.inner.set(label_first, root, json!("beacon-set")).await;
+    let description_first = h
+        .inner
+        .declare_described(
+            "description_first",
+            "cascading",
+            json!("beacon-d"),
+            "Lights the beacon",
+        )
+        .await;
+    h.inner
+        .set(description_first, root, json!("beacon-set"))
+        .await;
+    let category_first = h
+        .inner
+        .declare_in(
+            beacons,
+            "category_first",
+            "cascading",
+            json!("beacon-d"),
+            crate::test_support::BOOL,
+            "public",
+        )
+        .await;
+    h.inner.set(category_first, root, json!("beacon-set")).await;
+    let default_first = h
+        .inner
+        .declare("default_first", "cascading", json!("beacon-d"))
+        .await;
+    h.inner.set(default_first, root, json!("beacon-set")).await;
+
+    let items = h.items(&format!("{BROWSE}?q=beacon"), root).await;
+    assert_eq!(items.len(), 5, "{items:?}");
+    for (name, field) in [
+        ("beacon_key", "key"),
+        ("label_first", "display_name"),
+        ("description_first", "description"),
+        ("category_first", "category_name"),
+        ("default_first", "default_value"),
+    ] {
+        assert_eq!(matched(&items, name), json!(field), "{name}: {items:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_fallback_match_is_reported_as_value_and_a_schema_default_as_default_value() {
+    let h = RestHarness::new().await;
+    let (root, a) = (h.inner.tree.root, h.inner.tree.a);
+    // The fallback is an ancestor's override: shown as a value, reported as one.
+    let inherited = h
+        .inner
+        .declare("inherited", "cascading", json!("plain"))
+        .await;
+    h.inner.set(inherited, root, json!("lantern-up")).await;
+    h.inner.set(inherited, a, json!("noon")).await;
+    // The fallback is the Schema Default: the declaration's own text, which
+    // comes first in the order.
+    let defaulted = h
+        .inner
+        .declare("defaulted", "cascading", json!("lantern-default"))
+        .await;
+    h.inner.set(defaulted, a, json!("noon")).await;
+    // The effective value itself is the Schema Default: the same.
+    h.inner
+        .declare("untouched", "cascading", json!("lantern-default"))
+        .await;
+
+    let items = h
+        .items(&format!("{BROWSE}?tenant={a}&q=lantern"), root)
+        .await;
+    assert_eq!(items.len(), 3, "{items:?}");
+    let fallback_of = |name: &str| {
+        let leaf = format!(".{name}.");
+        items
+            .iter()
+            .find(|i| i["key"].as_str().is_some_and(|k| k.contains(&leaf)))
+            .expect("the item")["effective"]["fallback"]
+            .clone()
+    };
+    assert_eq!(fallback_of("inherited"), json!("lantern-up"), "{items:?}");
+    assert_eq!(matched(&items, "inherited"), json!("value"), "{items:?}");
+    assert_eq!(
+        fallback_of("defaulted"),
+        json!("lantern-default"),
+        "{items:?}"
+    );
+    assert_eq!(
+        matched(&items, "defaulted"),
+        json!("default_value"),
+        "{items:?}"
+    );
+    assert_eq!(
+        matched(&items, "untouched"),
+        json!("default_value"),
+        "{items:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_masked_value_is_never_reported_as_the_matched_field() {
+    let entitled = RestHarness::new().await;
+    let masked = RestHarness::without_pii_entitlement().await;
+    for h in [&entitled, &masked] {
+        let root = h.inner.tree.root;
+        // The key, the Schema Default and the override all contain the text.
+        let pii = h
+            .inner
+            .declare_typed(
+                "lantern_contact",
+                "cascading",
+                json!("lantern@d"),
+                TEXT,
+                "pii",
+            )
+            .await;
+        h.inner
+            .set_classified(pii, root, json!("lantern@example.test"), "pii")
+            .await;
+        // Only the Schema Default and the override do.
+        let quiet = h
+            .inner
+            .declare_typed(
+                "quiet_contact",
+                "cascading",
+                json!("lantern@d"),
+                TEXT,
+                "pii",
+            )
+            .await;
+        h.inner
+            .set_classified(quiet, root, json!("lantern@example.test"), "pii")
+            .await;
+        let secret = h
+            .inner
+            .declare_typed(
+                "lantern_vault",
+                "cascading",
+                json!("lantern"),
+                SECRET,
+                "secret",
+            )
+            .await;
+        h.inner.set_secret(secret, root, "lantern-ref").await;
+    }
+
+    // Without the entitlement the masked rows are on the page by their key
+    // alone, and say so: neither `value` nor `default_value` is ever named
+    // for content the caller is not shown.
+    let items = masked
+        .items(&format!("{BROWSE}?q=lantern"), masked.inner.tree.root)
+        .await;
+    assert_eq!(items.len(), 2, "{items:?}");
+    assert!(!has(&items, "quiet_contact"), "{items:?}");
+    for name in ["lantern_contact", "lantern_vault"] {
+        assert_eq!(matched(&items, name), json!("key"), "{name}: {items:?}");
+    }
+    for item in &items {
+        assert_eq!(item["effective"]["masked"], json!(true), "{item}");
+    }
+
+    // With it the `pii` content is in the corpus and attributed as any other;
+    // a secret stays out of it for everyone.
+    let items = entitled
+        .items(&format!("{BROWSE}?q=lantern"), entitled.inner.tree.root)
+        .await;
+    assert_eq!(items.len(), 3, "{items:?}");
+    assert_eq!(
+        matched(&items, "lantern_contact"),
+        json!("key"),
+        "{items:?}"
+    );
+    assert_eq!(
+        matched(&items, "quiet_contact"),
+        json!("default_value"),
+        "{items:?}"
+    );
+    assert_eq!(matched(&items, "lantern_vault"), json!("key"), "{items:?}");
+    // Past the declaration text, a value the entitled caller is shown.
+    let items = entitled
+        .items(
+            &format!("{BROWSE}?q={}", urlencoding("@example")),
+            entitled.inner.tree.root,
+        )
+        .await;
+    assert_eq!(items.len(), 2, "{items:?}");
+    for name in ["lantern_contact", "quiet_contact"] {
+        assert_eq!(matched(&items, name), json!("value"), "{name}: {items:?}");
+    }
+    let items = masked
+        .items(
+            &format!("{BROWSE}?q={}", urlencoding("@example")),
+            masked.inner.tree.root,
+        )
+        .await;
+    assert_eq!(items, Vec::<Value>::new());
 }
 
 #[tokio::test]
@@ -228,6 +524,11 @@ async fn q_never_matches_a_flagged_override_a_shadowed_ancestor_or_a_descendant(
             present,
             "tenant {tenant} q={q}: {items:?}"
         );
+        // What qualifies does so by a value the row shows: past the flagged
+        // override, the fallthrough.
+        if present {
+            assert_eq!(matched(&items, needle), json!("value"), "{items:?}");
+        }
     }
 }
 
@@ -345,6 +646,16 @@ async fn under_q_a_named_key_the_text_does_not_match_is_absent_while_hidden_and_
         "{items:?}"
     );
     assert_eq!(items.len(), 3, "{items:?}");
+    // The match is attributed; an entry for a key the caller may not see or
+    // that is not declared matched nothing, and names no field.
+    assert_eq!(
+        matched(&items, "match"),
+        json!("default_value"),
+        "{items:?}"
+    );
+    for name in ["concealed", "never_declared"] {
+        assert_eq!(matched(&items, name), Value::Null, "{name}: {items:?}");
+    }
 }
 
 #[tokio::test]
@@ -366,6 +677,7 @@ async fn a_setting_that_did_not_resolve_qualifies_by_its_text_alone_under_q() {
     assert_eq!(items.len(), 1, "{items:?}");
     assert!(has(&items, "gone_beacon"), "{items:?}");
     assert_eq!(items[0]["outcome"], json!("retired"), "{}", items[0]);
+    assert_eq!(items[0]["matched_field"], json!("key"), "{}", items[0]);
 }
 
 #[tokio::test]
@@ -543,6 +855,10 @@ async fn q_with_needs_review_keeps_only_the_flagged_settings_the_text_matches() 
         vec![h.inner.key("lantern_flagged").to_string()],
         "{items:?}"
     );
+    // A flagged row is attributed as any other: by its text here, the flagged
+    // override itself being no part of the match.
+    assert_eq!(items[0]["matched_field"], json!("key"), "{items:?}");
+    assert_eq!(items[0]["effective"]["needs_review"], json!(true));
 }
 
 #[tokio::test]

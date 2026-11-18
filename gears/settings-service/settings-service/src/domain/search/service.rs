@@ -19,6 +19,7 @@ use super::{
     Corpus, MatchedField, Needle, SearchRepository, SearchRequest, text_projection, too_many_hits,
 };
 use crate::domain::category::Category;
+use crate::domain::category::visibility::is_visible;
 use crate::domain::declaration::Declaration;
 use crate::domain::error::DomainError;
 use crate::domain::value::StoredValue;
@@ -127,29 +128,24 @@ impl<R: SearchRepository> SearchService<R> {
             let category = categories.get(&declaration.category_id).cloned();
             let own_rows: Vec<&StoredValue> =
                 by_declaration.remove(&declaration.id).unwrap_or_default();
-            let matched = declaration_match(
-                &declaration,
-                category.as_deref(),
-                request.needle,
-                request.corpus,
-            );
+            // The breadcrumb shows the category whatever its domain; a match
+            // is attributed to its name only where the database could have
+            // matched that name: in the domains the caller may see.
+            let attributable = category
+                .as_deref()
+                .filter(|c| is_visible(request.visibility, c.domain_affinity.as_deref()))
+                .map(|c| c.name.as_str());
+            let matched =
+                declaration_match(&declaration, attributable, request.needle, request.corpus);
             // @cpt-begin:cpt-cf-settings-service-algo-search-discoverability-attribution:p2:inst-sd-attr-3
             // The database returned this declaration, so something matched.
             // If neither a field nor an override names it in Rust — a JSON
             // projection spelled with different whitespace, a case fold the
-            // engines disagree on — attribute it rather than drop it: to the
-            // default when that is in the corpus, since its projection is the
-            // one that can differ, else to the key.
+            // engines disagree on — attribute it rather than drop it.
             let matched = matched.or_else(|| {
-                own_rows.is_empty().then(|| {
-                    if request.corpus.admits(&declaration.data_classification)
-                        && !declaration.default_value.is_null()
-                    {
-                        MatchedField::DefaultValue
-                    } else {
-                        MatchedField::Key
-                    }
-                })
+                own_rows
+                    .is_empty()
+                    .then(|| unnamed_match(&declaration, request.corpus))
             });
             // @cpt-end:cpt-cf-settings-service-algo-search-discoverability-attribution:p2:inst-sd-attr-3
             if let Some(matched) = matched {
@@ -184,12 +180,16 @@ impl<R: SearchRepository> SearchService<R> {
 /// category name, Schema Default. `None` when none does, which is the case
 /// for a declaration on the page only because an override matched.
 ///
+/// `category_name` is the name of the declaration's category as the database
+/// could match it; `None` when it could not — the row is gone, or outside the
+/// domains the caller may see.
+///
 /// The Schema Default counts only within the corpus and only when it is not
 /// JSON `null` — the same terms the database admitted it on.
 #[must_use]
 pub fn declaration_match(
     declaration: &Declaration,
-    category: Option<&Category>,
+    category_name: Option<&str>,
     needle: &Needle,
     corpus: Corpus,
 ) -> Option<MatchedField> {
@@ -211,7 +211,7 @@ pub fn declaration_match(
     {
         return Some(MatchedField::Description);
     }
-    if category.is_some_and(|c| needle.matches(&c.name)) {
+    if category_name.is_some_and(|name| needle.matches(name)) {
         return Some(MatchedField::CategoryName);
     }
     let default_in_corpus =
@@ -221,6 +221,18 @@ pub fn declaration_match(
     }
     None
     // @cpt-end:cpt-cf-settings-service-algo-search-discoverability-attribution:p2:inst-sd-attr-1
+}
+
+/// The field a search hit is attributed to when the database matched the
+/// declaration's text and no field names the match in Rust: the Schema Default when that is
+/// in the corpus, since its projection is the one that can differ, else the
+/// key — never a field the corpus leaves out.
+fn unnamed_match(declaration: &Declaration, corpus: Corpus) -> MatchedField {
+    if corpus.admits(&declaration.data_classification) && !declaration.default_value.is_null() {
+        MatchedField::DefaultValue
+    } else {
+        MatchedField::Key
+    }
 }
 
 #[cfg(test)]

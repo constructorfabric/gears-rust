@@ -582,3 +582,35 @@ fn the_collapsed_entry_carries_its_two_facts_and_nothing_else() {
     assert!(entry.scope.is_none() && entry.tenant_id.is_none());
     assert!(entry.set_by.is_none() && entry.last_change_at.is_none());
 }
+
+#[test]
+fn the_matched_field_is_the_searchs_wire_spelling_and_absent_when_nothing_matched() {
+    use crate::domain::search::MatchedField;
+
+    for (field, spelling) in [
+        (MatchedField::Key, "key"),
+        (MatchedField::DisplayName, "display_name"),
+        (MatchedField::Description, "description"),
+        (MatchedField::CategoryName, "category_name"),
+        (MatchedField::DefaultValue, "default_value"),
+        (MatchedField::Value, "value"),
+    ] {
+        let item = super::SettingItemDto::not_found("k").with_matched_field(Some(field));
+        let wire = serde_json::to_value(&item).expect("serializes");
+        assert_eq!(wire["matched_field"], json!(spelling));
+    }
+    for item in [
+        super::SettingItemDto::not_found("k"),
+        super::SettingItemDto::not_found("k").with_matched_field(None),
+        super::SettingItemDto::resolved(render(&effective("public"), false, Reader::Platform, &[])),
+    ] {
+        let wire = serde_json::to_value(&item).expect("serializes");
+        assert!(
+            !wire
+                .as_object()
+                .expect("an object")
+                .contains_key("matched_field"),
+            "{wire}"
+        );
+    }
+}

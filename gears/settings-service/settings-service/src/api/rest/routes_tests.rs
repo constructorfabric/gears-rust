@@ -137,3 +137,66 @@ fn the_browse_description_no_longer_says_the_filter_lists_the_flagged_rows() {
     );
     assert!(browse.contains("needs_review eq true"), "{browse}");
 }
+
+/// Every field a match is attributed to, in the order a client is told about
+/// them. A variant added to the enum stops this compiling until it is named
+/// here.
+fn every_matched_field() -> Vec<crate::domain::search::MatchedField> {
+    use crate::domain::search::MatchedField as Field;
+    let all = [
+        Field::Key,
+        Field::DisplayName,
+        Field::Description,
+        Field::CategoryName,
+        Field::DefaultValue,
+        Field::Value,
+    ];
+    for field in all {
+        match field {
+            Field::Key
+            | Field::DisplayName
+            | Field::Description
+            | Field::CategoryName
+            | Field::DefaultValue
+            | Field::Value => {}
+        }
+    }
+    all.to_vec()
+}
+
+#[tokio::test]
+async fn the_browse_description_states_the_matched_field_vocabulary() {
+    // The description is the one the gear registers, read from the registry
+    // the routes were registered in, and the vocabulary is the enum's own
+    // spelling in the enum's order: a field renamed or added has to be said
+    // here too, and a reworded sentence around the list does not matter.
+    let h = crate::test_support::RestHarness::new().await;
+    let browse = h
+        .openapi
+        .operation_specs
+        .get("GET:/settings-service/v1/settings")
+        .expect("the browse is registered");
+    let description = browse
+        .description
+        .as_deref()
+        .expect("the browse is described")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let mut names: Vec<String> = every_matched_field()
+        .into_iter()
+        .map(|field| format!("`{}`", field.as_str()))
+        .collect();
+    let last = names.pop().expect("the vocabulary is not empty");
+    let vocabulary = format!("{} or {last}", names.join(", "));
+
+    assert!(
+        description.contains("`matched_field`"),
+        "must name the field: {description}"
+    );
+    assert!(
+        description.contains(&vocabulary),
+        "must say {vocabulary}: {description}"
+    );
+}
