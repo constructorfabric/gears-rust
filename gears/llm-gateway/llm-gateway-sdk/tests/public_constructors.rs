@@ -224,10 +224,8 @@ fn passthrough_response_builders() {
 
     let event = PassthroughEvent::new(r#"{"type":"message_delta","usage":{}}"#)
         .with_event("message_delta")
-        .with_output_text("Hello")
         .with_usage(Usage::reported(10, 4));
     assert!(event.relay);
-    assert_eq!(event.output_text, "Hello");
     assert_eq!(event.usage.map(|u| u.output_tokens), Some(4));
 
     let hidden = PassthroughEvent::new("{}")

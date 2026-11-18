@@ -259,14 +259,6 @@ pub struct PassthroughEvent {
     /// event the plugin produced only for the Gateway, such as the `OpenAI`
     /// Chat Completions usage chunk the consumer did not ask for.
     pub relay: bool,
-    /// Generated text this event delivers (text, reasoning, refusal, and
-    /// tool-call argument deltas), extracted by the plugin from the native
-    /// event; empty when the event delivers none. The plugin does not count
-    /// tokens: the core accumulates this text as the output relayed so far
-    /// and, when the stream ends without final usage, counts it with the
-    /// provider token counting rules kept in the core for the usage
-    /// estimate, as on the unified API.
-    pub output_text: String,
     /// Final generic usage, on the event that carries it, with `cost` left at
     /// 0 for the core. Used for quota settle and usage reporting; the event
     /// data is not changed.
@@ -281,7 +273,6 @@ impl PassthroughEvent {
             event: None,
             data: data.into(),
             relay: true,
-            output_text: String::new(),
             usage: None,
         }
     }
@@ -297,13 +288,6 @@ impl PassthroughEvent {
     #[must_use]
     pub fn not_relayed(mut self) -> Self {
         self.relay = false;
-        self
-    }
-
-    /// Set the generated text this event delivers.
-    #[must_use]
-    pub fn with_output_text(mut self, text: impl Into<String>) -> Self {
-        self.output_text = text.into();
         self
     }
 
