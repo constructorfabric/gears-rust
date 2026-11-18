@@ -993,11 +993,15 @@
             "type": "boolean"
           },
           "actor_name": {
-            "description": "The actor's name as the Actor Name Resolver reads it: a user's current\nname, `\"System\"` for the nil id, or `null` when the actor is masked or\nwithheld, a module, or no name could be had.",
+            "description": "The actor's name as the Actor Name Resolver reads it: a user's current\nname, or `\"System\"` for the nil id. Absent unless `actor_name_status`\nis `resolved` or `system`.",
             "type": [
               "string",
               "null"
             ]
+          },
+          "actor_name_status": {
+            "description": "Why the record has, or has not, an actor name: `resolved` (a user's\ncurrent name), `system` (the platform's system context), `masked` (the\nactor is masked or withheld), `module` (the actor is a module, named by\n`actor` itself), `not_recorded` (the record names no tenant the actor\nacted from, so none was asked), `unavailable` (the name could not be\nlooked up this time; a later read may have it) or `unknown` (the lookup\nanswered and gave no name to this caller). `actor_name` is present with\n`resolved` and `system` only. The list may grow; treat an unknown value\nas no name.",
+            "type": "string"
           },
           "actor_withheld": {
             "description": "Whether `actor` is withheld by the upward disclosure boundary, whatever\nthe entitlement: its tenant is not on the path from the reader tenant to\nthe record's.",
@@ -1039,7 +1043,7 @@
             "type": "string"
           },
           "tenant_id": {
-            "description": "The scope the record is about, or `null` for a record about the\nsetting's definition — the declaration created, changed, retired —\nwhich belongs to no tenant and appears in every scope's history.",
+            "description": "The scope the record is about. Absent for a record about the setting's\ndefinition — the declaration created, changed, retired — which belongs\nto no tenant and appears in every scope's history.",
             "format": "uuid",
             "type": [
               "string",
@@ -1053,11 +1057,10 @@
         },
         "required": [
           "id",
-          "tenant_id",
           "operation",
           "actor",
           "actor_masked",
-          "actor_name",
+          "actor_name_status",
           "values_masked",
           "outcome",
           "request_id",

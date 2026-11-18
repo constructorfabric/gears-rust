@@ -22,7 +22,7 @@ use tracing_test::traced_test;
 use uuid::Uuid;
 
 use super::{
-    ActorDirectory, ActorNameResolver, ActorRef, LOOKUP_BUDGET, LOOKUP_CONCURRENCY,
+    ActorDirectory, ActorName, ActorNameResolver, ActorRef, LOOKUP_BUDGET, LOOKUP_CONCURRENCY,
     NAME_CACHE_CAPACITY, NAME_TTL,
 };
 use crate::domain::ports::ActorNameMetrics;
@@ -65,6 +65,7 @@ struct Rec {
     actor: String,
     actor_masked: bool,
     actor_name: Option<String>,
+    actor_name_status: &'static str,
 }
 
 /// The resolver over [`Rec`]s: the names of the page, set on each record.
@@ -86,6 +87,7 @@ impl FillExt for ActorNameResolver {
         assert_eq!(names.len(), records.len());
         for (record, name) in records.iter_mut().zip(names) {
             record.actor_name = name.as_str().map(str::to_owned);
+            record.actor_name_status = name.status();
         }
     }
 }
@@ -97,6 +99,7 @@ fn record(actor: &str, tenant: Option<Uuid>) -> Rec {
         actor: actor.to_owned(),
         actor_masked: false,
         actor_name: None,
+        actor_name_status: "",
     }
 }
 
@@ -114,6 +117,10 @@ fn masked(mut r: Rec) -> Rec {
 
 fn names_of(records: &[Rec]) -> Vec<Option<&str>> {
     records.iter().map(|r| r.actor_name.as_deref()).collect()
+}
+
+fn statuses_of(records: &[Rec]) -> Vec<&'static str> {
+    records.iter().map(|r| r.actor_name_status).collect()
 }
 
 /// The ids of an id-set query, or a failure for any other shape.
@@ -378,7 +385,7 @@ async fn each_actor_is_asked_for_in_the_tenant_it_acted_from() {
 }
 
 #[tokio::test]
-async fn an_actor_its_tenant_does_not_list_reads_null_and_is_asked_nowhere_else() {
+async fn an_actor_its_tenant_does_not_list_reads_no_name_and_is_asked_nowhere_else() {
     // An ancestor administrator is listed in its own tenant, which the record names.
     let d = Arc::new(Directory::default());
     let child = id(0xc1);
@@ -396,7 +403,7 @@ async fn an_actor_its_tenant_does_not_list_reads_null_and_is_asked_nowhere_else(
 }
 
 #[tokio::test]
-async fn a_record_without_an_actor_tenant_reads_null_and_is_never_looked_up() {
+async fn a_record_without_an_actor_tenant_reads_no_name_and_is_never_looked_up() {
     let d = Arc::new(Directory::default());
     d.lists(home(), 1, "Ann");
     d.lists(home(), 2, "Bob");
@@ -418,7 +425,7 @@ async fn a_record_without_an_actor_tenant_reads_null_and_is_never_looked_up() {
 
 #[tokio::test]
 #[traced_test]
-async fn a_refused_or_absent_actor_reads_null_and_is_an_answer() {
+async fn a_refused_or_absent_actor_reads_no_name_and_is_an_answer() {
     let d = Arc::new(Directory::default());
     d.refused.lock().unwrap().insert(home());
     let (service, metrics) = resolver(&d);
@@ -439,18 +446,76 @@ async fn a_refused_or_absent_actor_reads_null_and_is_an_answer() {
 
 #[tokio::test]
 #[traced_test]
-async fn a_failed_chunk_reads_null_warns_once_and_degrades_the_pass() {
+async fn a_failed_chunk_reads_no_name_warns_once_and_degrades_the_pass() {
     let d = Arc::new(Directory::default());
     d.failing.lock().unwrap().insert(home());
     let (service, metrics) = resolver(&d);
     let mut records = vec![by(1), by(2)];
     service.fill(&ctx(), &mut records).await;
+    assert_eq!(statuses_of(&records), ["unavailable", "unavailable"]);
     assert_eq!(names_of(&records), [None, None]);
     assert_eq!(metrics.results(), ["degraded"]);
-    assert!(logs_contain("reason=\"directory\" ids=2"));
+    assert!(logs_contain(
+        "budget=0 directory=1 pagination=0 query=0 ids=2"
+    ));
+    // The line names the tenant the directory failed in and the kind of
+    // its error; never an actor, and never the error's own text.
+    assert!(logs_contain(&format!("tenant={}", home())));
+    assert!(logs_contain("Internal"));
     assert!(!logs_contain(&id(1).to_string()));
     assert!(!logs_contain(&id(2).to_string()));
     assert!(!logs_contain("provider detail text"));
+}
+
+/// The warn lines the resolver wrote in this test.
+fn degraded_lines(lines: &[&str]) -> Vec<String> {
+    lines
+        .iter()
+        .filter(|line| line.contains("WARN") && line.contains("actor names"))
+        .map(|line| (*line).to_owned())
+        .collect()
+}
+
+#[tokio::test]
+#[traced_test]
+async fn a_pass_whose_chunks_fail_in_many_tenants_warns_once_with_their_count() {
+    // A page over a subtree holds actors of many tenants, a chunk for each;
+    // a directory that is down fails them all. That is one fact about the
+    // pass, and one line: the chunks by reason and the ids, nothing per chunk.
+    let tenants: Vec<Uuid> = (0..7).map(|n| id(0xd0 + n)).collect();
+    let d = Arc::new(Directory::default());
+    d.failing.lock().unwrap().extend(tenants.iter().copied());
+    let (service, metrics) = resolver(&d);
+    // One answering tenant beside them: its chunk is not counted.
+    d.lists(home(), 1, "Ann");
+    let mut records: Vec<Rec> = tenants
+        .iter()
+        .zip(100..)
+        .map(|(tenant, n)| record(&id(n).to_string(), Some(*tenant)))
+        .chain([by(1)])
+        .collect();
+    service.fill(&ctx(), &mut records).await;
+
+    assert_eq!(d.calls().len(), 8, "every tenant was asked");
+    assert_eq!(records[7].actor_name.as_deref(), Some("Ann"));
+    assert!(records[..7].iter().all(|r| r.actor_name.is_none()));
+    assert_eq!(metrics.results(), ["degraded"]);
+    logs_assert(|lines: &[&str]| {
+        let warned = degraded_lines(lines);
+        match warned.as_slice() {
+            [line]
+                if line.contains("budget=0 directory=7 pagination=0 query=0 ids=7")
+                    && tenants
+                        .iter()
+                        .any(|tenant| line.contains(&format!("tenant={tenant}"))) =>
+            {
+                Ok(())
+            }
+            other => Err(format!(
+                "expected one line counting 7 chunks, got {other:?}"
+            )),
+        }
+    });
 }
 
 #[tokio::test]
@@ -500,7 +565,7 @@ impl ActorDirectory for HungDirectory {
 
 #[tokio::test(start_paused = true)]
 #[traced_test]
-async fn a_hung_directory_leaves_the_names_null_within_one_second() {
+async fn a_hung_directory_leaves_the_actors_unnamed_within_one_second() {
     assert_eq!(LOOKUP_BUDGET, Duration::from_secs(1));
     let d = Arc::new(HungDirectory::default());
     let metrics = Arc::new(Metrics::default());
@@ -514,7 +579,16 @@ async fn a_hung_directory_leaves_the_names_null_within_one_second() {
     // Both tenants' chunks were started, and neither answered in time.
     assert_eq!(d.started.load(Ordering::SeqCst), 2);
     assert_eq!(metrics.results(), ["degraded"]);
-    assert!(logs_contain("reason=\"budget\""));
+    // Two chunks ran out of the budget: one line says so.
+    logs_assert(|lines: &[&str]| {
+        let warned = degraded_lines(lines);
+        match warned.as_slice() {
+            [line] if line.contains("budget=2 directory=0 pagination=0 query=0 ids=2") => Ok(()),
+            other => Err(format!(
+                "expected one line counting 2 chunks, got {other:?}"
+            )),
+        }
+    });
 }
 
 #[tokio::test(start_paused = true)]
@@ -828,7 +902,9 @@ async fn a_page_with_an_unrequested_id_is_discarded_and_degrades() {
     service.fill(&ctx(), &mut records).await;
     assert_eq!(names_of(&records), [None, None]);
     assert_eq!(metrics.results(), ["degraded"]);
-    assert!(logs_contain("reason=\"pagination\" ids=2"));
+    assert!(logs_contain(
+        "budget=0 directory=0 pagination=1 query=0 ids=2"
+    ));
     assert!(!logs_contain("Foreign"));
 }
 
@@ -841,7 +917,9 @@ async fn a_page_with_a_duplicated_id_degrades() {
     service.fill(&ctx(), &mut records).await;
     assert_eq!(names_of(&records), [None, None]);
     assert_eq!(metrics.results(), ["degraded"]);
-    assert!(logs_contain("reason=\"pagination\" ids=2"));
+    assert!(logs_contain(
+        "budget=0 directory=0 pagination=1 query=0 ids=2"
+    ));
 }
 
 #[tokio::test]
@@ -857,7 +935,9 @@ async fn an_empty_page_with_a_cursor_makes_no_progress_and_degrades() {
     assert_eq!(names_of(&records), [None]);
     assert_eq!(metrics.results(), ["degraded"]);
     assert_eq!(d.calls().len(), 1, "the chunk stops at the empty page");
-    assert!(logs_contain("reason=\"pagination\" ids=1"));
+    assert!(logs_contain(
+        "budget=0 directory=0 pagination=1 query=0 ids=1"
+    ));
 }
 
 #[tokio::test]
@@ -875,12 +955,14 @@ async fn a_cursor_returned_twice_degrades_without_looping() {
     assert_eq!(d.calls().len(), 2, "the repeated cursor ends the chunk");
     assert_eq!(names_of(&records), [Some("Ann"), Some("Bob"), None, None]);
     assert_eq!(metrics.results(), ["degraded"]);
-    assert!(logs_contain("reason=\"pagination\" ids=2"));
+    assert!(logs_contain(
+        "budget=0 directory=0 pagination=1 query=0 ids=2"
+    ));
 }
 
 #[tokio::test]
 #[traced_test]
-async fn a_refusal_of_any_kind_reads_null_is_an_answer_and_is_not_cached() {
+async fn a_refusal_of_any_kind_reads_no_name_is_an_answer_and_is_not_cached() {
     let kinds: [fn() -> CanonicalError; 3] = [
         || {
             UserResource::permission_denied()
@@ -935,9 +1017,13 @@ async fn a_cache_hit_and_a_miss_ask_directory_for_the_miss_only() {
 
 #[test]
 fn a_poisoned_cache_lock_still_lets_a_later_read_and_write_proceed() {
-    use super::NameCache;
+    use super::{Asked, NameCache};
     let cache = Arc::new(NameCache::default());
     let caller = (home(), id(0x5b));
+    let ann = Asked {
+        tenant: home(),
+        actor: id(1),
+    };
     let held = cache.clone();
     let poisoned = std::thread::spawn(move || {
         let _guard = held.entries.lock().unwrap();
@@ -947,19 +1033,16 @@ fn a_poisoned_cache_lock_still_lets_a_later_read_and_write_proceed() {
     assert!(poisoned.is_err());
     assert!(cache.entries.is_poisoned());
     let now = tokio::time::Instant::now();
-    let ids = BTreeSet::from([id(1)]);
+    let ids = BTreeSet::from([ann]);
     assert!(cache.fresh(caller, &ids, now).is_empty());
     cache.keep(
         caller,
-        &BTreeMap::from([(id(1), "Ann".to_owned())]),
+        &BTreeMap::from([(ann, "Ann".to_owned())]),
         now,
         NAME_TTL,
     );
     assert_eq!(
-        cache
-            .fresh(caller, &ids, now)
-            .get(&id(1))
-            .map(String::as_str),
+        cache.fresh(caller, &ids, now).get(&ann).map(String::as_str),
         Some("Ann")
     );
 }
@@ -1084,7 +1167,7 @@ async fn the_hub_binding_caches_names_for_the_caller() {
 }
 
 #[tokio::test]
-async fn a_hub_without_account_management_reads_every_user_name_null() {
+async fn a_hub_without_account_management_names_no_user() {
     let metrics = Arc::new(Metrics::default());
     let service = ActorNameResolver::from_hub(Arc::new(ClientHub::new()), metrics.clone());
     let mut records = vec![
@@ -1108,4 +1191,263 @@ async fn the_am_is_looked_up_at_each_call_so_registration_order_cannot_turn_name
     let mut after = vec![by(1)];
     service.fill(&ctx(), &mut after).await;
     assert_eq!(names_of(&after), [Some("from am")]);
+}
+
+// ── The status of each name ──────────────────────────────────────────────────
+
+#[test]
+fn a_status_carries_a_name_only_when_resolved_or_system() {
+    let all = [
+        (
+            ActorName::Resolved("Ann".to_owned()),
+            "resolved",
+            Some("Ann"),
+        ),
+        (ActorName::System, "system", Some("System")),
+        (ActorName::Masked, "masked", None),
+        (ActorName::Module, "module", None),
+        (ActorName::NotRecorded, "not_recorded", None),
+        (ActorName::Unavailable, "unavailable", None),
+        (ActorName::Unknown, "unknown", None),
+    ];
+    for (name, status, shown) in all {
+        assert_eq!(name.status(), status);
+        assert_eq!(name.as_str(), shown, "{status}");
+    }
+}
+
+#[tokio::test]
+async fn the_nil_actor_is_system_with_or_without_a_recorded_tenant() {
+    let d = Arc::new(Directory::default());
+    let (service, _) = resolver(&d);
+    let nil = Uuid::nil().to_string();
+    let mut records = vec![record(&nil, Some(home())), record(&nil, None)];
+    service.fill(&ctx(), &mut records).await;
+    assert_eq!(statuses_of(&records), ["system", "system"]);
+    assert_eq!(names_of(&records), [Some("System"), Some("System")]);
+    assert!(d.calls().is_empty());
+}
+
+#[tokio::test]
+async fn a_masked_actor_is_masked_whatever_it_would_have_resolved_to() {
+    // Every kind of actor behind the flag: a listed user, the nil id, a module,
+    // a user without a recorded tenant. None reads a name, none is looked up.
+    let d = Arc::new(Directory::default());
+    d.lists(home(), 1, "Ann");
+    let (service, _) = cached(&d);
+    // The name is in the cache for this caller, and still not shown.
+    service.fill(&ctx(), &mut [by(1)]).await;
+    let mut records = vec![
+        masked(by(1)),
+        masked(record(&Uuid::nil().to_string(), None)),
+        masked(record("gears.billing", None)),
+        masked(record(&id(2).to_string(), None)),
+    ];
+    // The flag decides, whatever the actor text is.
+    records[0].actor = id(1).to_string();
+    records[1].actor = Uuid::nil().to_string();
+    service.fill(&ctx(), &mut records).await;
+    assert_eq!(statuses_of(&records), ["masked"; 4]);
+    assert_eq!(names_of(&records), [None; 4]);
+    assert_eq!(d.calls().len(), 1, "only the warming read asked");
+}
+
+#[tokio::test]
+async fn an_actor_that_is_not_a_user_id_is_a_module() {
+    let d = Arc::new(Directory::default());
+    let (service, _) = resolver(&d);
+    let mut records = vec![
+        record("gears.billing", Some(home())),
+        record("not-a-uuid", None),
+    ];
+    service.fill(&ctx(), &mut records).await;
+    assert_eq!(statuses_of(&records), ["module", "module"]);
+    assert_eq!(names_of(&records), [None, None]);
+    assert!(d.calls().is_empty());
+}
+
+#[tokio::test]
+async fn a_user_without_a_recorded_actor_tenant_is_not_recorded() {
+    let d = Arc::new(Directory::default());
+    d.lists(home(), 2, "Bob");
+    let (service, _) = resolver(&d);
+    let mut records = vec![record(&id(2).to_string(), None)];
+    service.fill(&ctx(), &mut records).await;
+    assert_eq!(statuses_of(&records), ["not_recorded"]);
+    assert_eq!(names_of(&records), [None]);
+    assert!(d.calls().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_chunk_the_budget_cut_reads_unavailable_and_a_finished_one_unknown() {
+    let d = Arc::new(HungDirectory {
+        fast: Some(id(1)),
+        ..Default::default()
+    });
+    let service = ActorNameResolver::with_directory(d, Arc::new(Metrics::default()));
+    // Chunk 1 answers the fast id and lists none of its 199 others; chunk 2
+    // holds the 51 remaining ids and never answers.
+    let mut records: Vec<_> = std::iter::once(by(1)).chain((1000..1250).map(by)).collect();
+    service.fill(&ctx(), &mut records).await;
+    assert_eq!(records[0].actor_name_status, "resolved");
+    assert!(
+        records[1..200]
+            .iter()
+            .all(|r| r.actor_name_status == "unknown"),
+        "a finished chunk that does not list an id answered for it"
+    );
+    assert!(
+        records[200..]
+            .iter()
+            .all(|r| r.actor_name_status == "unavailable"),
+        "an unfinished chunk answered for none of its ids"
+    );
+    assert!(records[1..].iter().all(|r| r.actor_name.is_none()));
+}
+
+#[tokio::test]
+async fn a_chunk_that_drifts_keeps_its_answered_ids_and_the_rest_read_unavailable() {
+    let d = Scripted::with(vec![
+        Ok(page_at(vec![user(1, "Ann")], "c1")),
+        Ok(page_at(
+            vec![IdpUser::new(id(2), " ").with_display_name(" ")],
+            "c1",
+        )),
+    ]);
+    let (service, _) = scripted_resolver(&d);
+    let mut records = vec![by(1), by(2), by(3)];
+    service.fill(&ctx(), &mut records).await;
+    // The second id was answered with a blank profile: an answer without a
+    // name. The third was never answered.
+    assert_eq!(
+        statuses_of(&records),
+        ["resolved", "unknown", "unavailable"]
+    );
+    assert_eq!(names_of(&records), [Some("Ann"), None, None]);
+}
+
+#[tokio::test]
+async fn an_absent_directory_reads_unavailable() {
+    let metrics = Arc::new(Metrics::default());
+    let service = ActorNameResolver::with_directory(
+        Arc::new(crate::test_support::UnavailableDirectory),
+        metrics.clone(),
+    );
+    let mut records = vec![by(1), record("module", None)];
+    service.fill(&ctx(), &mut records).await;
+    assert_eq!(statuses_of(&records), ["unavailable", "module"]);
+    assert_eq!(names_of(&records), [None, None]);
+    assert_eq!(metrics.results(), ["skipped"]);
+}
+
+#[tokio::test]
+async fn a_user_a_finished_chunk_does_not_list_is_unknown() {
+    let d = Arc::new(Directory::default());
+    d.lists(home(), 1, "Ann");
+    let (service, metrics) = resolver(&d);
+    let mut records = vec![by(1), by(2)];
+    service.fill(&ctx(), &mut records).await;
+    assert_eq!(statuses_of(&records), ["resolved", "unknown"]);
+    assert_eq!(names_of(&records), [Some("Ann"), None]);
+    assert_eq!(metrics.results(), ["ok"]);
+}
+
+#[tokio::test]
+async fn a_refusal_of_any_kind_reads_unknown() {
+    let kinds: [fn() -> CanonicalError; 3] = [
+        || {
+            UserResource::permission_denied()
+                .with_reason("DENIED")
+                .create()
+        },
+        || {
+            CanonicalError::unauthenticated()
+                .with_reason("EXPIRED")
+                .create()
+        },
+        || {
+            UserResource::not_found("no such user")
+                .with_resource("user")
+                .create()
+        },
+    ];
+    for kind in kinds {
+        let d = Scripted::with(vec![Err(kind())]);
+        let (service, metrics) = scripted_resolver(&d);
+        let mut records = vec![by(1), by(2)];
+        service.fill(&ctx(), &mut records).await;
+        assert_eq!(statuses_of(&records), ["unknown", "unknown"]);
+        assert_eq!(names_of(&records), [None, None]);
+        assert_eq!(metrics.results(), ["ok"]);
+    }
+}
+
+#[tokio::test]
+async fn a_context_without_a_subject_reads_unknown() {
+    let d = Arc::new(Directory::default());
+    d.lists(home(), 1, "Ann");
+    let (service, _) = resolver(&d);
+    let mut records = vec![by(1)];
+    service
+        .fill(&SecurityContext::anonymous(), &mut records)
+        .await;
+    assert_eq!(statuses_of(&records), ["unknown"]);
+    assert_eq!(names_of(&records), [None]);
+    assert!(d.calls().is_empty());
+}
+
+#[tokio::test]
+async fn an_outcome_belongs_to_the_tenant_the_actor_acted_from() {
+    // One id recorded under two tenants: only the tenant that lists it names it.
+    let d = Arc::new(Directory::default());
+    let child = id(0xc1);
+    d.lists(home(), 1, "Ann");
+    let (service, _) = resolver(&d);
+    let mut records = vec![by(1), record(&id(1).to_string(), Some(child))];
+    service.fill(&ctx(), &mut records).await;
+    assert_eq!(statuses_of(&records), ["resolved", "unknown"]);
+    assert_eq!(names_of(&records), [Some("Ann"), None]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cached_name_answers_only_for_the_tenant_it_was_resolved_in() {
+    let d = Arc::new(Directory::default());
+    let child = id(0xc1);
+    d.lists(home(), 1, "Ann");
+    let (service, _) = cached(&d);
+    service.fill(&ctx(), &mut [by(1)]).await;
+    let mut records = vec![record(&id(1).to_string(), Some(child))];
+    service.fill(&ctx(), &mut records).await;
+    assert_eq!(statuses_of(&records), ["unknown"]);
+    assert_eq!(
+        d.calls(),
+        [(home(), vec![id(1)]), (child, vec![id(1)])],
+        "the other tenant is asked itself"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failure_is_never_cached_and_a_later_read_resolves() {
+    let d = Arc::new(Directory::default());
+    d.fail_first.lock().unwrap().insert(home());
+    d.lists(home(), 1, "Ann");
+    let (service, _) = cached(&d);
+    let mut failed = vec![by(1), by(2)];
+    service.fill(&ctx(), &mut failed).await;
+    assert_eq!(statuses_of(&failed), ["unavailable", "unavailable"]);
+
+    // The directory answers now: the name resolves, and the id it does not
+    // list is an answer, not a failure.
+    let mut again = vec![by(1), by(2)];
+    service.fill(&ctx(), &mut again).await;
+    assert_eq!(statuses_of(&again), ["resolved", "unknown"]);
+    assert_eq!(names_of(&again), [Some("Ann"), None]);
+    assert_eq!(d.calls().len(), 2);
+
+    // Only the resolved name was kept: the unknown id is asked again.
+    let mut third = vec![by(1), by(2)];
+    service.fill(&ctx(), &mut third).await;
+    assert_eq!(statuses_of(&third), ["resolved", "unknown"]);
+    assert_eq!(d.calls().last(), Some(&(home(), vec![id(2)])));
+    assert_eq!(d.calls().len(), 3);
 }

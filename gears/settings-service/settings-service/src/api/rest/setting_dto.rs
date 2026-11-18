@@ -10,6 +10,7 @@ use crate::domain::resolution::{EffectiveValue, MASK_TOKEN, TrailEntry, scope_pa
 use crate::domain::search::MatchedField;
 use crate::domain::value::StoredValue;
 use crate::domain::writes::value_state_tag;
+use crate::infra::actor_names::ActorName;
 
 /// The value state tag of a scope that holds no row yet — the write path's
 /// absent-state tag, which the read returns for the same state.
@@ -641,10 +642,10 @@ mod setting_dto_tests;
 pub struct AuditRecordDto {
     /// Record identity.
     pub id: Uuid,
-    /// The scope the record is about, or `null` for a record about the
-    /// setting's definition — the declaration created, changed, retired —
-    /// which belongs to no tenant and appears in every scope's history.
-    #[schema(required)]
+    /// The scope the record is about. Absent for a record about the setting's
+    /// definition — the declaration created, changed, retired — which belongs
+    /// to no tenant and appears in every scope's history.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<Uuid>,
     /// `create`, `change`, `revert`, `remove`, `clone`, `secret_use` or `stage`.
     pub operation: String,
@@ -659,10 +660,20 @@ pub struct AuditRecordDto {
     /// the record's.
     #[serde(default, skip_serializing_if = "is_false")]
     pub actor_withheld: bool,
+    /// Why the record has, or has not, an actor name: `resolved` (a user's
+    /// current name), `system` (the platform's system context), `masked` (the
+    /// actor is masked or withheld), `module` (the actor is a module, named by
+    /// `actor` itself), `not_recorded` (the record names no tenant the actor
+    /// acted from, so none was asked), `unavailable` (the name could not be
+    /// looked up this time; a later read may have it) or `unknown` (the lookup
+    /// answered and gave no name to this caller). `actor_name` is present with
+    /// `resolved` and `system` only. The list may grow; treat an unknown value
+    /// as no name.
+    pub actor_name_status: String,
     /// The actor's name as the Actor Name Resolver reads it: a user's current
-    /// name, `"System"` for the nil id, or `null` when the actor is masked or
-    /// withheld, a module, or no name could be had.
-    #[schema(required)]
+    /// name, or `"System"` for the nil id. Absent unless `actor_name_status`
+    /// is `resolved` or `system`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub actor_name: Option<String>,
     /// The value before, as recorded; a secret was recorded masked.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -681,6 +692,25 @@ pub struct AuditRecordDto {
     pub change_set_id: Option<Uuid>,
     /// When it happened.
     pub occurred_at: String,
+}
+
+impl AuditRecordDto {
+    /// Set the resolver's answer for this record's actor: the status, and the
+    /// name with it when the answer has one.
+    ///
+    /// A record whose actor is masked keeps `masked` and takes no name, whatever
+    /// the answer: the mask is decided when the record is rendered, and a name
+    /// must never get past it.
+    pub fn name_actor(&mut self, name: ActorName) {
+        if self.actor_masked {
+            return;
+        }
+        name.status().clone_into(&mut self.actor_name_status);
+        self.actor_name = match name {
+            ActorName::Resolved(resolved) => Some(resolved),
+            other => other.as_str().map(str::to_owned),
+        };
+    }
 }
 
 /// One image as a reader is shown it. A secret was recorded as its mask. A
@@ -729,6 +759,13 @@ pub fn render_record(
     let actor_masked = actor_withheld
         || (record.actor_classification == crate::audit::ActorClassification::Pii && !may_read_pii);
     let values_masked = (values_are_pii || record.has_pii_image()) && !may_read_pii;
+    // No name yet: a masked actor never gets one, and any other has none until
+    // the resolver's answer is set.
+    let unnamed = if actor_masked {
+        ActorName::Masked
+    } else {
+        ActorName::Unavailable
+    };
     AuditRecordDto {
         id: record.id,
         tenant_id: record.tenant_id,
@@ -740,6 +777,7 @@ pub fn render_record(
         },
         actor_masked,
         actor_withheld,
+        actor_name_status: unnamed.status().to_owned(),
         actor_name: None,
         pre_value: recorded(record.pre_image.as_ref(), values_are_pii, may_read_pii),
         post_value: recorded(record.post_image.as_ref(), values_are_pii, may_read_pii),
