@@ -167,9 +167,9 @@ Operators need full visibility into outbound API traffic patterns, errors, and p
 5. [ ] - `p2` - **TRY** - `inst-mc-4`
    1. [ ] - `p2` - Execute proxy pipeline (auth → guards → transform → upstream call → response transform) - `inst-mc-4a`
 6. [ ] - `p2` - **CATCH** any error - `inst-mc-5`
-   1. [ ] - `p2` - Increment `oagw_errors_total{host, path, error_type}` counter - `inst-mc-5a`
+   1. [ ] - `p2` - Increment `oagw_errors_total{host, path, error_type, credential_mode}` counter (`credential_mode`: `config`, `request_ref`, or `unknown` before the upstream resolves) - `inst-mc-5a`
 7. [ ] - `p2` - Decrement `oagw_requests_in_flight{host}` gauge at request end - `inst-mc-6`
-8. [ ] - `p2` - Increment `oagw_requests_total{host, http.request.method, http.route, http.response.status_code}` counter (label keys per OTel HTTP semconv; method normalized) - `inst-mc-7`
+8. [ ] - `p2` - Increment `oagw_requests_total{host, http.request.method, http.route, http.response.status_code, credential_mode}` counter (label keys per OTel HTTP semconv; method normalized; `credential_mode` per ADR-0022) - `inst-mc-7`
 9. [ ] - `p2` - Observe request duration in `oagw_request_duration_seconds{host, path, phase}` histogram using configured buckets (`phase`: `total`, `resolve` for the upstream and route lookup with the proxy configuration cache on or off, `auth`) - `inst-mc-8`
 10. [ ] - `p2` - **IF** rate limit was evaluated - `inst-mc-9`
     1. [ ] - `p2` - Update `oagw_rate_limit_usage_ratio{host, path}` gauge with current token ratio (0.0–1.0) - `inst-mc-9a`
