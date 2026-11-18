@@ -41,6 +41,34 @@ async fn create_upstream_success() {
     assert_eq!(json["alias"].as_str().unwrap(), "api.openai.com");
 }
 
+// 2.1: an endpoint without a port gets its scheme's default, 80 for `http`
+// and 443 for `https`, and the response carries it (#4979).
+#[tokio::test]
+async fn create_upstream_omitted_port_defaults_per_scheme() {
+    let h = AppHarness::builder().build().await;
+
+    for (scheme, host, port) in [
+        ("http", "plain.example.com", 80),
+        ("https", "tls.example.com", 443),
+    ] {
+        let resp = h
+            .api_v1()
+            .post_upstream()
+            .with_body(serde_json::json!({
+                "server": {"endpoints": [{"host": host, "scheme": scheme}]},
+                "protocol": HTTP_PROTOCOL_ID,
+            }))
+            .expect_status(201)
+            .await;
+        let json = resp.json();
+        assert_eq!(
+            json["server"]["endpoints"][0],
+            serde_json::json!({"scheme": scheme, "host": host, "port": port})
+        );
+        assert_eq!(json["alias"], host);
+    }
+}
+
 // 7.8: POST with missing server -> 422 (serde deserialization error).
 #[tokio::test]
 async fn create_upstream_missing_server_returns_422() {

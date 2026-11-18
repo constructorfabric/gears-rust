@@ -30,10 +30,6 @@ fn default_true() -> bool {
     true
 }
 
-fn default_port() -> u16 {
-    443
-}
-
 fn default_cost() -> u32 {
     1
 }
@@ -54,8 +50,9 @@ struct Endpoint {
     #[serde(default)]
     scheme: Scheme,
     host: String,
-    #[serde(default = "default_port")]
-    port: u16,
+    /// Defaults to the scheme's port (80 for `http`, 443 otherwise).
+    #[serde(default)]
+    port: Option<u16>,
 }
 
 #[derive(Deserialize)]
@@ -363,10 +360,11 @@ impl From<Scheme> for domain::Scheme {
 
 impl From<Endpoint> for domain::Endpoint {
     fn from(v: Endpoint) -> Self {
+        let scheme = domain::Scheme::from(v.scheme);
         Self {
-            scheme: v.scheme.into(),
+            scheme,
             host: v.host,
-            port: v.port,
+            port: v.port.unwrap_or_else(|| scheme.default_port()),
         }
     }
 }
@@ -1005,6 +1003,33 @@ mod tests {
     // -----------------------------------------------------------------------
     // Payload deserialization tests
     // -----------------------------------------------------------------------
+
+    /// An omitted port is the scheme's default: 80 for `http`, 443 for the
+    /// others (#4979).
+    #[test]
+    fn omitted_port_defaults_per_scheme() {
+        let json = serde_json::json!({
+            "server": {
+                "endpoints": [
+                    {"scheme": "http", "host": "a.example.com"},
+                    {"scheme": "https", "host": "b.example.com"},
+                    {"scheme": "wss", "host": "c.example.com"},
+                    {"host": "d.example.com"}
+                ]
+            },
+            "protocol": HTTP_PROTOCOL_ID,
+        });
+        let payload: UpstreamPayload = serde_json::from_value(json).unwrap();
+        let ports: Vec<u16> = payload
+            .into_provisioned(None)
+            .request
+            .server
+            .endpoints
+            .iter()
+            .map(|e| e.port)
+            .collect();
+        assert_eq!(ports, [80, 443, 443, 443]);
+    }
 
     #[test]
     fn deserialize_valid_upstream_payload() {

@@ -14,9 +14,10 @@ use toolkit_security::SecurityContext;
 #[domain_model]
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {
-    /// The referenced secret does not exist in the credential store.
-    #[error("secret not found: {0}")]
-    SecretNotFound(String),
+    /// The secret referenced by the named auth config key does not exist in
+    /// the credential store. Carries the key, never the reference (F0008).
+    #[error("secret referenced by auth.config.{0} not found")]
+    SecretNotFound(&'static str),
     /// The plugin could not authenticate the outbound request.
     #[error("authentication failed: {0}")]
     #[allow(dead_code)] // Part of plugin trait API; no current plugin constructs this.
@@ -38,20 +39,48 @@ pub enum PluginError {
 // ---------------------------------------------------------------------------
 
 /// Request context passed to an auth plugin for header injection.
+///
+/// The plugin does not see the outbound headers: it only lists the ones to
+/// set, and the proxy applies them to the outbound request, so repeated or
+/// non-UTF-8 client headers pass through unchanged.
 #[domain_model]
 pub struct AuthContext {
-    /// Outbound request headers (modified in-place by the plugin).
-    pub headers: HashMap<String, String>,
+    /// Headers to set on the outbound request, as `(name, value)`. Each
+    /// replaces any header of that name the request already carries; an
+    /// invalid name or value fails the request.
+    pub set_headers: Vec<(String, String)>,
     /// Plugin-specific configuration key/value pairs.
     pub config: HashMap<String, String>,
     /// Security context of the calling subject.
     pub security_context: SecurityContext,
 }
 
+impl AuthContext {
+    /// A context with no headers set yet.
+    #[must_use]
+    pub fn new(config: HashMap<String, String>, security_context: SecurityContext) -> Self {
+        Self {
+            set_headers: Vec::new(),
+            config,
+            security_context,
+        }
+    }
+
+    /// Value of the last header named `name` (case-insensitive) the plugin set.
+    #[cfg(test)]
+    pub fn header_value(&self, name: &str) -> Option<&str> {
+        self.set_headers
+            .iter()
+            .rev()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
 /// Trait for outbound authentication plugins.
 ///
-/// Implementations mutate [`AuthContext`] to inject authentication material
-/// (e.g., API keys, bearer tokens) into the outbound request headers.
+/// Implementations add authentication material (e.g., API keys, bearer
+/// tokens) to [`AuthContext::set_headers`].
 #[async_trait]
 pub trait AuthPlugin: Send + Sync {
     /// Apply authentication to the outbound request context.
@@ -148,6 +177,11 @@ pub struct TransformRequestContext {
     /// Query parameters. Mutable — plugins can add/remove/modify query params.
     pub query: Vec<(String, String)>,
     /// Request headers. Mutable — plugins can set/add/remove headers.
+    ///
+    /// Holds only values that are visible ASCII; other lines (obs-text,
+    /// non-UTF-8) pass through unseen. Lines of a name the plugin leaves as
+    /// it found them keep their exact bytes and sensitive flag; changing a
+    /// name replaces all its lines, unseen ones included.
     pub headers: Vec<(String, String)>,
     /// Plugin-specific configuration key/value pairs
     /// (from the plugin binding on the upstream or route).
@@ -163,6 +197,7 @@ pub struct TransformResponseContext {
     /// HTTP status code from the upstream response.
     pub status: u16,
     /// Response headers. Mutable — plugins can set/add/remove headers.
+    /// Same view and write-back as [`TransformRequestContext::headers`].
     pub headers: Vec<(String, String)>,
     /// Plugin-specific configuration key/value pairs.
     pub config: HashMap<String, String>,

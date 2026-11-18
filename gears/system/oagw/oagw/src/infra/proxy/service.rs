@@ -17,8 +17,8 @@ use crate::config::TokenCacheConfig;
 use crate::domain::error::DomainError;
 use crate::domain::model::{PassthroughMode, PathSuffixMode, ResponseHeaderRules, Upstream};
 use crate::domain::plugin::{
-    AuthContext, GuardContext, GuardDecision, TransformErrorContext, TransformRequestContext,
-    TransformResponseContext,
+    AuthContext, GuardContext, GuardDecision, PluginError, TransformErrorContext,
+    TransformRequestContext, TransformResponseContext,
 };
 use crate::domain::ports::OagwMetricsPort;
 use crate::domain::ports::metric_labels::{self, phase};
@@ -854,7 +854,7 @@ impl DataPlaneServiceImpl {
             let auth_result = execute_auth_plugin(
                 &self.auth_registry,
                 auth,
-                &outbound_headers,
+                &mut outbound_headers,
                 ctx,
                 &instance_uri,
             )
@@ -865,7 +865,7 @@ impl DataPlaneServiceImpl {
                 phase::AUTH,
                 auth_start.elapsed().as_secs_f64(),
             );
-            outbound_headers = auth_result?;
+            auth_result?;
         }
 
         // 5b. Execute guard plugins (upstream then route).
@@ -944,7 +944,7 @@ impl DataPlaneServiceImpl {
         })??;
         let endpoint = &selected.endpoint;
 
-        headers::set_host_header(&mut outbound_headers, &endpoint.host, endpoint.port);
+        headers::set_host_header(&mut outbound_headers, endpoint);
 
         // 7. Check rate limits (upstream then route) with scope-aware keying.
         let rate_limit_outcome = check_rate_limits(
@@ -1358,17 +1358,18 @@ fn limit_body_stream(
     })
 }
 
-/// Execute the auth plugin for the upstream, mutating outbound headers with
-/// injected credentials (e.g. Bearer token, API key).
+/// Execute the auth plugin for the upstream and set the headers it asks for
+/// (e.g. Bearer token, API key) on the outbound request.
 ///
-/// Returns the updated header map. No-op if the upstream has no auth config.
+/// Only the named headers change: other lines, repeated ones and non-UTF-8
+/// values included, pass through as the client sent them.
 async fn execute_auth_plugin(
     auth_registry: &AuthPluginRegistry,
     auth: &crate::domain::model::AuthConfig,
-    outbound_headers: &HeaderMap,
+    outbound_headers: &mut HeaderMap,
     ctx: &SecurityContext,
     instance_uri: &str,
-) -> Result<HeaderMap, DomainError> {
+) -> Result<(), DomainError> {
     tracing::debug!(plugin = %auth.plugin_type, "executing auth plugin");
     let plugin = auth_registry.resolve(&auth.plugin_type).map_err(|e| {
         DomainError::AuthenticationFailed {
@@ -1377,45 +1378,60 @@ async fn execute_auth_plugin(
             instance: instance_uri.to_string(),
         }
     })?;
-    let mut auth_ctx = AuthContext {
-        headers: headers::header_map_to_hash_map(outbound_headers),
-        config: auth.config.clone().unwrap_or_default(),
-        security_context: ctx.clone(),
-    };
+    let mut auth_ctx = AuthContext::new(auth.config.clone().unwrap_or_default(), ctx.clone());
     plugin
         .authenticate(&mut auth_ctx)
         .await
-        .map_err(|e| match e {
-            crate::domain::plugin::PluginError::SecretNotFound(ref s) => {
-                DomainError::SecretNotFound {
-                    detail: s.clone(),
-                    instance: instance_uri.to_string(),
-                }
-            }
-            crate::domain::plugin::PluginError::Rejected(ref msg)
-            | crate::domain::plugin::PluginError::InvalidConfig(ref msg) => {
-                DomainError::Validation {
-                    field: "plugin",
-                    reason: field::INVALID_PLUGIN_CONFIG,
-                    detail: msg.clone(),
-                    instance: instance_uri.to_string(),
-                }
-            }
-            crate::domain::plugin::PluginError::AuthFailed(_) => {
-                DomainError::AuthenticationFailed {
-                    reason: reason::auth::PLUGIN_FAILED,
-                    detail: e.to_string(),
-                    instance: instance_uri.to_string(),
-                }
-            }
-            crate::domain::plugin::PluginError::Internal(_) => DomainError::AuthenticationFailed {
-                reason: reason::auth::PLUGIN_INTERNAL,
-                detail: e.to_string(),
-                instance: instance_uri.to_string(),
-            },
-        })?;
+        .and_then(|()| set_auth_headers(outbound_headers, auth_ctx.set_headers))
+        .map_err(|e| auth_plugin_error(e, instance_uri))?;
     tracing::debug!(plugin = %auth.plugin_type, "auth plugin succeeded");
-    Ok(headers::hash_map_to_header_map(&auth_ctx.headers))
+    Ok(())
+}
+
+/// Set the headers an auth plugin asked for, each replacing any line of the
+/// same name, marked sensitive. A name or value that is not a valid header
+/// fails the request: dropping it would send the request unauthenticated.
+/// The error names the header, never the value (it carries the credential).
+fn set_auth_headers(
+    outbound_headers: &mut HeaderMap,
+    set_headers: Vec<(String, String)>,
+) -> Result<(), PluginError> {
+    for (name, value) in set_headers {
+        let header = http::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+            PluginError::InvalidConfig(format!("auth plugin header name {name:?} is invalid"))
+        })?;
+        let mut value = HeaderValue::from_str(&value).map_err(|_| {
+            PluginError::InvalidConfig(format!("auth plugin value for header {header} is invalid"))
+        })?;
+        value.set_sensitive(true);
+        outbound_headers.insert(header, value);
+    }
+    Ok(())
+}
+
+fn auth_plugin_error(e: PluginError, instance_uri: &str) -> DomainError {
+    match e {
+        PluginError::SecretNotFound(_) => DomainError::SecretNotFound {
+            detail: e.to_string(),
+            instance: instance_uri.to_string(),
+        },
+        PluginError::Rejected(msg) | PluginError::InvalidConfig(msg) => DomainError::Validation {
+            field: "plugin",
+            reason: field::INVALID_PLUGIN_CONFIG,
+            detail: msg,
+            instance: instance_uri.to_string(),
+        },
+        PluginError::AuthFailed(_) => DomainError::AuthenticationFailed {
+            reason: reason::auth::PLUGIN_FAILED,
+            detail: e.to_string(),
+            instance: instance_uri.to_string(),
+        },
+        PluginError::Internal(_) => DomainError::AuthenticationFailed {
+            reason: reason::auth::PLUGIN_INTERNAL,
+            detail: e.to_string(),
+            instance: instance_uri.to_string(),
+        },
+    }
 }
 
 /// Execute guard plugins on the request, returning the first rejection.
@@ -1496,7 +1512,8 @@ async fn execute_transform_requests(
         return;
     }
 
-    let mut transform_headers = headers::header_map_to_vec(outbound_headers);
+    let original_headers = headers::header_map_to_vec(outbound_headers);
+    let mut transform_headers = original_headers.clone();
     let mut transform_query: Vec<(String, String)> = query_params.clone();
 
     for binding in transform_bindings {
@@ -1533,8 +1550,9 @@ async fn execute_transform_requests(
         }
     }
 
-    // Write mutated headers and query params back.
-    *outbound_headers = headers::vec_to_header_map(&transform_headers);
+    // Apply only what the transforms changed: other lines, credentials set by
+    // the auth plugin included, keep their bytes and sensitive flag.
+    headers::apply_header_edits(outbound_headers, &original_headers, &transform_headers);
     *query_params = transform_query;
 }
 
@@ -1755,7 +1773,8 @@ async fn execute_transform_responses(
         return;
     }
 
-    let mut header_map = headers::header_map_to_vec(resp_headers);
+    let original_headers = headers::header_map_to_vec(resp_headers);
+    let mut header_map = original_headers.clone();
 
     for binding in transform_bindings {
         let mut transform_ctx = TransformResponseContext {
@@ -1789,8 +1808,7 @@ async fn execute_transform_responses(
         }
     }
 
-    // Write mutated headers back.
-    *resp_headers = headers::vec_to_header_map(&header_map);
+    headers::apply_header_edits(resp_headers, &original_headers, &header_map);
 }
 
 /// Per-request plugin pipeline state shared across the streaming and buffered
@@ -2267,11 +2285,28 @@ mod tests {
         resolved: Option<(Upstream, crate::domain::model::Route)>,
         allow: bool,
     ) -> DataPlaneServiceImpl {
+        build_svc_with_credstore(
+            selector,
+            metrics,
+            resolved,
+            allow,
+            Arc::new(credstore_sdk::test_util::MockCredStoreClient::empty()),
+        )
+    }
+
+    /// Like [`build_svc_with_decision`], with the credential store the auth
+    /// plugins read from.
+    fn build_svc_with_credstore(
+        selector: Arc<dyn EndpointSelector>,
+        metrics: Arc<dyn OagwMetricsPort>,
+        resolved: Option<(Upstream, crate::domain::model::Route)>,
+        allow: bool,
+        credstore: Arc<dyn credstore_sdk::CredStoreClientV1>,
+    ) -> DataPlaneServiceImpl {
         use authz_resolver_sdk::{
             AuthZResolverApi, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
             PolicyEnforcer,
         };
-        use credstore_sdk::CredStoreClientV1;
         use toolkit_canonical_errors::CanonicalError;
         use toolkit_security::{PlatformSecurityContext, SecurityContext};
 
@@ -2293,8 +2328,6 @@ mod tests {
             }
         }
 
-        let credstore: Arc<dyn CredStoreClientV1> =
-            Arc::new(credstore_sdk::test_util::MockCredStoreClient::empty());
         let policy_enforcer = PolicyEnforcer::new(Arc::new(FixedAuthZ(allow)));
 
         // Minimal CP — only the proxy lookup is implemented.
@@ -2995,6 +3028,294 @@ mod tests {
         }
     }
 
+    /// An HTTPS upstream with apikey auth reading `secret_ref`, and a
+    /// `GET /v1` route on it.
+    fn apikey_target(secret_ref: &str) -> (Upstream, crate::domain::model::Route) {
+        use crate::domain::model::{
+            AuthConfig, HttpMatch, HttpMethod, MatchRules, Route, SharingMode,
+        };
+        let mut upstream = upstream_with(vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "127.0.0.1".into(),
+            port: 1,
+        }]);
+        upstream.auth = Some(AuthConfig {
+            plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
+            sharing: SharingMode::Private,
+            config: Some(
+                [
+                    ("header".to_owned(), "authorization".to_owned()),
+                    ("prefix".to_owned(), "Bearer ".to_owned()),
+                    ("secret_ref".to_owned(), secret_ref.to_owned()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        });
+        let route = Route {
+            id: Uuid::new_v4(),
+            tenant_id: upstream.tenant_id,
+            upstream_id: upstream.id,
+            match_rules: MatchRules {
+                http: Some(HttpMatch {
+                    methods: vec![HttpMethod::Get],
+                    path: "/v1".into(),
+                    query_allowlist: vec![],
+                    path_suffix_mode: PathSuffixMode::Append,
+                }),
+                grpc: None,
+            },
+            plugins: None,
+            rate_limit: None,
+            cors: None,
+            tags: vec![],
+            priority: 0,
+            enabled: true,
+            managed_by: ManagedBy::Api,
+        };
+        (upstream, route)
+    }
+
+    /// A secret that is gone at proxy time, or a credential store failure,
+    /// names the auth config key. The reference reaches neither the error
+    /// returned to the caller nor the logs; that includes the canonical
+    /// diagnostic, which the canonical error middleware logs at ERROR
+    /// (#4989).
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn proxy_time_secret_failures_do_not_reveal_the_ref() {
+        use crate::domain::test_support::ErroringCredStore;
+        use credstore_sdk::{CredStoreClientV1, CredStoreError};
+        use toolkit_canonical_errors::CanonicalError;
+
+        let stores: [Arc<dyn CredStoreClientV1>; 3] = [
+            Arc::new(credstore_sdk::test_util::MockCredStoreClient::empty()),
+            Arc::new(ErroringCredStore(|| {
+                CredStoreError::Internal("failed reading leaked-ref-77".into())
+            })),
+            Arc::new(ErroringCredStore(|| CredStoreError::ServiceUnavailable {
+                detail: "leaked-ref-77: backend down".into(),
+                retry_after: None,
+            })),
+        ];
+        for (i, store) in stores.into_iter().enumerate() {
+            let svc = build_svc_with_credstore(
+                Arc::new(MockSelector::new()),
+                Arc::new(crate::domain::ports::NoopMetrics),
+                Some(apikey_target("cred://leaked-ref-77")),
+                true,
+                store,
+            );
+            let err = svc
+                .proxy_request(test_ctx(), proxy_get("/test/v1"))
+                .await
+                .unwrap_err();
+            let text = format!("{err:?}");
+            assert!(text.contains("auth.config.secret_ref"), "{text}");
+            assert!(!text.contains("leaked-ref-77"), "{text}");
+            if i == 0 {
+                assert!(matches!(err, DomainError::SecretNotFound { .. }), "{err:?}");
+            }
+
+            let canonical = CanonicalError::from(err);
+            let text = format!("{canonical:?}");
+            assert!(!text.contains("leaked-ref-77"), "{text}");
+            if i == 0 {
+                let diagnostic = canonical.diagnostic().unwrap_or_default();
+                assert!(
+                    diagnostic.contains("auth.config.secret_ref"),
+                    "{diagnostic}"
+                );
+            }
+        }
+        assert!(logs_contain("executing auth plugin"));
+        assert!(!logs_contain("leaked-ref-77"));
+    }
+
+    /// The auth plugin sets only its own header. Repeated client headers and
+    /// non-UTF-8 values reach the upstream as sent, and the client's own
+    /// line of the plugin's header is replaced, not kept next to it (#4982).
+    #[tokio::test]
+    async fn auth_plugin_keeps_repeated_and_non_utf8_headers() {
+        let svc = build_svc_with_credstore(
+            Arc::new(MockSelector::new()),
+            Arc::new(crate::domain::ports::NoopMetrics),
+            None,
+            true,
+            Arc::new(credstore_sdk::test_util::MockCredStoreClient::with_secrets(
+                vec![("cred://k".into(), "sk-1".into())],
+            )),
+        );
+        let (upstream, _) = apikey_target("cred://k");
+        let auth = upstream.auth.unwrap();
+
+        let raw = HeaderValue::from_bytes(b"caf\xe9").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.append("x-multi", HeaderValue::from_static("a"));
+        headers.append("x-multi", HeaderValue::from_static("b"));
+        headers.insert("x-raw", raw.clone());
+        headers.append("authorization", HeaderValue::from_static("Bearer client-1"));
+        headers.append("authorization", HeaderValue::from_static("Bearer client-2"));
+
+        execute_auth_plugin(&svc.auth_registry, &auth, &mut headers, &test_ctx(), "/i")
+            .await
+            .unwrap();
+
+        let multi: Vec<_> = headers.get_all("x-multi").iter().collect();
+        assert_eq!(multi, ["a", "b"]);
+        assert_eq!(headers.get("x-raw"), Some(&raw));
+        let auth_lines: Vec<_> = headers.get_all("authorization").iter().collect();
+        assert_eq!(auth_lines, ["Bearer sk-1"]);
+        assert!(auth_lines[0].is_sensitive());
+    }
+
+    /// A header the plugin cannot set fails the request instead of sending
+    /// it without credentials; the error names the header, not the value.
+    #[tokio::test]
+    async fn auth_plugin_invalid_header_fails_the_request() {
+        let mut headers = HeaderMap::new();
+        let err =
+            set_auth_headers(&mut headers, vec![("bad header".into(), "sk-1".into())]).unwrap_err();
+        assert!(matches!(err, PluginError::InvalidConfig(_)), "{err:?}");
+
+        let err = set_auth_headers(
+            &mut headers,
+            vec![("authorization".into(), "Bearer sk-1\r\nx: y".into())],
+        )
+        .unwrap_err();
+        let PluginError::InvalidConfig(msg) = &err else {
+            panic!("expected InvalidConfig, got {err:?}");
+        };
+        assert!(msg.contains("authorization"), "{msg}");
+        assert!(!msg.contains("sk-1"), "{msg}");
+        assert!(headers.is_empty(), "{headers:?}");
+
+        match auth_plugin_error(err, "/i") {
+            DomainError::Validation {
+                field: f, reason, ..
+            } => {
+                assert_eq!(f, "plugin");
+                assert_eq!(reason, field::INVALID_PLUGIN_CONFIG);
+            }
+            other => panic!("expected a plugin config error, got {other:?}"),
+        }
+    }
+
+    /// A request transform running after the auth plugin applies only its
+    /// own change: the credential keeps its bytes (obs-text here, which the
+    /// transform's string view cannot hold) and its sensitive flag, and
+    /// repeated and non-UTF-8 client lines survive.
+    #[tokio::test]
+    async fn transform_after_auth_keeps_credential_and_client_headers() {
+        let svc = build_svc_with_credstore(
+            Arc::new(MockSelector::new()),
+            Arc::new(crate::domain::ports::NoopMetrics),
+            None,
+            true,
+            Arc::new(credstore_sdk::test_util::MockCredStoreClient::with_secrets(
+                vec![("cred://k".into(), "sk-café".into())],
+            )),
+        );
+        let (upstream, _) = apikey_target("cred://k");
+        let auth = upstream.auth.unwrap();
+
+        let raw = HeaderValue::from_bytes(b"caf\xe9").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.append("x-multi", HeaderValue::from_static("a"));
+        headers.append("x-multi", HeaderValue::from_static("b"));
+        headers.insert("x-raw", raw.clone());
+        execute_auth_plugin(&svc.auth_registry, &auth, &mut headers, &test_ctx(), "/i")
+            .await
+            .unwrap();
+
+        let request_id = crate::domain::model::PluginBinding {
+            plugin_ref: crate::domain::gts_helpers::REQUEST_ID_TRANSFORM_PLUGIN_ID.into(),
+            config: Default::default(),
+        };
+        let mut query = Vec::new();
+        execute_transform_requests(
+            &svc.transform_registry,
+            &[&request_id],
+            &mut headers,
+            &mut query,
+            "GET",
+            "/",
+            &test_ctx(),
+        )
+        .await;
+
+        let auth_lines: Vec<_> = headers.get_all("authorization").iter().collect();
+        assert_eq!(auth_lines.len(), 1, "{headers:?}");
+        assert_eq!(auth_lines[0].as_bytes(), "Bearer sk-café".as_bytes());
+        assert!(auth_lines[0].is_sensitive());
+        let multi: Vec<_> = headers.get_all("x-multi").iter().collect();
+        assert_eq!(multi, ["a", "b"]);
+        assert_eq!(headers.get("x-raw"), Some(&raw));
+        assert_eq!(headers.get_all("x-request-id").iter().count(), 1);
+    }
+
+    /// A response transform's set, append and remove apply; names it does
+    /// not touch keep their lines, bytes and sensitive flag.
+    #[tokio::test]
+    async fn response_transform_applies_only_its_changes() {
+        use crate::domain::plugin::{TransformPlugin, TransformResponseContext};
+
+        struct EditHeaders;
+        #[async_trait]
+        impl TransformPlugin for EditHeaders {
+            async fn on_response(
+                &self,
+                ctx: &mut TransformResponseContext,
+            ) -> Result<(), PluginError> {
+                ctx.headers.retain(|(k, _)| k != "x-gone" && k != "x-set");
+                ctx.headers.push(("X-Set".into(), "new".into()));
+                ctx.headers.push(("x-added".into(), "1".into()));
+                ctx.headers.push(("x-added".into(), "2".into()));
+                Ok(())
+            }
+        }
+        let plugin_ref =
+            toolkit_gts::gts_id!("cf.core.oagw.transform_plugin.v1~cf.core.oagw.edit_test.v1");
+        let mut registry = TransformPluginRegistry::with_builtins();
+        registry.insert(plugin_ref, Arc::new(EditHeaders));
+        let binding = crate::domain::model::PluginBinding {
+            plugin_ref: plugin_ref.into(),
+            config: Default::default(),
+        };
+
+        let raw = HeaderValue::from_bytes(b"caf\xe9").unwrap();
+        let mut secret = HeaderValue::from_static("token");
+        secret.set_sensitive(true);
+        let mut headers = HeaderMap::new();
+        headers.append("x-multi", HeaderValue::from_static("a"));
+        headers.append("x-multi", HeaderValue::from_static("b"));
+        headers.insert("x-raw", raw.clone());
+        headers.insert("x-secret", secret);
+        headers.insert("x-gone", HeaderValue::from_static("1"));
+        headers.append("x-set", HeaderValue::from_static("old"));
+        headers.append("x-set", raw.clone());
+
+        execute_transform_responses(
+            &registry,
+            &[&binding],
+            http::StatusCode::OK,
+            &mut headers,
+            &test_ctx(),
+        )
+        .await;
+
+        let multi: Vec<_> = headers.get_all("x-multi").iter().collect();
+        assert_eq!(multi, ["a", "b"]);
+        assert_eq!(headers.get("x-raw"), Some(&raw));
+        assert!(headers["x-secret"].is_sensitive());
+        assert!(!headers.contains_key("x-gone"));
+        // A changed name is replaced whole, its unseen non-UTF-8 line too.
+        let set: Vec<_> = headers.get_all("x-set").iter().collect();
+        assert_eq!(set, ["new"]);
+        let added: Vec<_> = headers.get_all("x-added").iter().collect();
+        assert_eq!(added, ["1", "2"]);
+    }
+
     /// The handle the gear stops streams with is the one this service
     /// subscribes its SSE bodies and WebSocket relays to.
     #[tokio::test]
@@ -3032,7 +3353,9 @@ mod tests {
             sharing: SharingMode::Private,
             config: None,
         };
-        match execute_auth_plugin(&svc.auth_registry, &auth, &HeaderMap::new(), &ctx, "/i").await {
+        match execute_auth_plugin(&svc.auth_registry, &auth, &mut HeaderMap::new(), &ctx, "/i")
+            .await
+        {
             Err(DomainError::AuthenticationFailed { reason: r, .. }) => {
                 assert_eq!(r, reason::auth::PLUGIN_NOT_FOUND);
             }

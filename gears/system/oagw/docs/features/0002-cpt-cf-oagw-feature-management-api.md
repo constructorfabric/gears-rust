@@ -294,7 +294,7 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
       1. [x] - `p1` - Add error: "Unsupported scheme: {scheme}" - `inst-val-us-3a1`
    2. [x] - `p1` - **IF** host is empty or not a valid hostname/IP - `inst-val-us-3b`
       1. [x] - `p1` - Add error: "Invalid host: {host}" - `inst-val-us-3b1`
-   3. [x] - `p1` - **IF** port is out of range (1-65535): 0 is a 400 validation error, a value above 65535 fails request decoding with 422 - `inst-val-us-3c`
+   3. [x] - `p1` - **IF** port is out of range (1-65535): 0 is a 400 validation error, a value above 65535 fails request decoding with 422. An omitted port is the scheme's default: 80 for `http`, 443 for `https`, `wss`, `wt` and `grpc`; the stored and returned endpoint carries it - `inst-val-us-3c`
       1. [x] - `p1` - Add error: "Invalid port: {port}" - `inst-val-us-3c1`
    4. [x] - `p1` - **IF** scheme is `http` and the gear option `allow_http_upstream` is off - `inst-val-us-3d`
       1. [x] - `p1` - Add error on `server.endpoints.scheme`, reason `HTTP_UPSTREAM_FORBIDDEN` - `inst-val-us-3d1`

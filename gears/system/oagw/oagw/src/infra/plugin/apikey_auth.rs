@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use credstore_sdk::{CredStoreClientV1, SecretRef};
 use serde::Deserialize;
 
+use crate::domain::plugin::credentials::{SECRET_REF_KEY, credstore_error_kind};
 use crate::domain::plugin::{AuthContext, AuthPlugin, PluginError};
 
 /// Configuration for the API key auth plugin.
@@ -44,22 +45,33 @@ impl AuthPlugin for ApiKeyAuthPlugin {
             .secret_ref
             .strip_prefix("cred://")
             .unwrap_or(&config.secret_ref);
-        let key = SecretRef::new(raw_ref)
-            .map_err(|e| PluginError::Internal(format!("invalid secret ref '{raw_ref}': {e}")))?;
+        // Errors name the config key: the reference and the store's own text
+        // (which may quote it) stay out of errors and logs (F0008).
+        let key = SecretRef::new(raw_ref).map_err(|e| {
+            PluginError::Internal(format!(
+                "auth.config.{SECRET_REF_KEY}: {}",
+                credstore_error_kind(&e)
+            ))
+        })?;
 
         let response = self
             .credstore
             .get(&ctx.security_context, &key)
             .await
-            .map_err(|e| PluginError::Internal(format!("credstore error: {e}")))?
-            .ok_or_else(|| PluginError::SecretNotFound(config.secret_ref.clone()))?;
+            .map_err(|e| {
+                PluginError::Internal(format!(
+                    "credential store error for auth.config.{SECRET_REF_KEY}: {}",
+                    credstore_error_kind(&e)
+                ))
+            })?
+            .ok_or(PluginError::SecretNotFound(SECRET_REF_KEY))?;
 
         let secret_str = std::str::from_utf8(response.value.as_bytes())
             .map_err(|_| PluginError::Internal("secret value is not valid UTF-8".into()))?
             .to_string();
 
         let value = format!("{}{}", config.prefix, secret_str);
-        ctx.headers.insert(config.header.to_lowercase(), value);
+        ctx.set_headers.push((config.header, value));
 
         Ok(())
     }
@@ -67,7 +79,6 @@ impl AuthPlugin for ApiKeyAuthPlugin {
 
 #[cfg(test)]
 mod tests {
-    use crate::domain::plugin::credentials::SECRET_REF_KEY;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -96,11 +107,7 @@ mod tests {
     }
 
     fn make_auth_ctx(config: HashMap<String, String>) -> AuthContext {
-        AuthContext {
-            headers: HashMap::new(),
-            config,
-            security_context: test_security_context(),
-        }
+        AuthContext::new(config, test_security_context())
     }
 
     #[tokio::test]
@@ -115,7 +122,7 @@ mod tests {
 
         plugin.authenticate(&mut ctx).await.unwrap();
         assert_eq!(
-            ctx.headers.get("authorization").unwrap(),
+            ctx.header_value("authorization").unwrap(),
             "Bearer sk-abc123"
         );
     }
@@ -131,7 +138,7 @@ mod tests {
         let mut ctx = make_auth_ctx(make_config("x-api-key", "", "cred://custom-key"));
 
         plugin.authenticate(&mut ctx).await.unwrap();
-        assert_eq!(ctx.headers.get("x-api-key").unwrap(), "my-secret-key");
+        assert_eq!(ctx.header_value("x-api-key").unwrap(), "my-secret-key");
     }
 
     #[tokio::test]
@@ -145,7 +152,7 @@ mod tests {
         // With cred:// prefix
         let mut ctx = make_auth_ctx(make_config("x-api-key", "", "cred://my-key"));
         plugin.authenticate(&mut ctx).await.unwrap();
-        assert_eq!(ctx.headers.get("x-api-key").unwrap(), "secret-value");
+        assert_eq!(ctx.header_value("x-api-key").unwrap(), "secret-value");
     }
 
     #[tokio::test]
@@ -159,27 +166,59 @@ mod tests {
         // Without cred:// prefix
         let mut ctx = make_auth_ctx(make_config("x-api-key", "", "plain-key"));
         plugin.authenticate(&mut ctx).await.unwrap();
-        assert_eq!(ctx.headers.get("x-api-key").unwrap(), "plain-value");
+        assert_eq!(ctx.header_value("x-api-key").unwrap(), "plain-value");
     }
 
+    /// A missing secret names the config key, not the reference.
     #[tokio::test]
-    async fn secret_not_found_returns_error() {
+    async fn secret_not_found_names_the_key() {
         let credstore = Arc::new(MockCredStoreClient::empty());
         let plugin = ApiKeyAuthPlugin::new(credstore);
 
         let mut ctx = make_auth_ctx(make_config("authorization", "Bearer ", "cred://missing"));
 
         let err = plugin.authenticate(&mut ctx).await.unwrap_err();
-        assert!(matches!(err, PluginError::SecretNotFound(_)));
+        assert!(matches!(err, PluginError::SecretNotFound(SECRET_REF_KEY)));
+        let text = err.to_string();
+        assert!(text.contains("auth.config.secret_ref"), "{text}");
+        assert!(!text.contains("missing"), "{text}");
     }
 
+    /// A credential store failure, or a malformed reference, names the
+    /// config key; neither the reference nor the store's text (which may
+    /// quote it) is in the error.
     #[tokio::test]
-    async fn credstore_error_maps_to_internal() {
-        let plugin = ApiKeyAuthPlugin::new(Arc::new(MockCredStoreClient::always_failing()));
-        let mut ctx = make_auth_ctx(make_config("authorization", "Bearer ", "cred://some-key"));
+    async fn credstore_error_maps_to_internal_without_the_ref() {
+        use crate::domain::test_support::ErroringCredStore;
+        use credstore_sdk::CredStoreError;
+        type MakeError = fn() -> CredStoreError;
 
+        let errors: [MakeError; 2] = [
+            || CredStoreError::Internal("store failed reading some-key".into()),
+            || CredStoreError::ServiceUnavailable {
+                detail: "some-key: backend down".into(),
+                retry_after: None,
+            },
+        ];
+        for error in errors {
+            let plugin = ApiKeyAuthPlugin::new(Arc::new(ErroringCredStore(error)));
+            let mut ctx = make_auth_ctx(make_config("authorization", "Bearer ", "cred://some-key"));
+            let err = plugin.authenticate(&mut ctx).await.unwrap_err();
+            let PluginError::Internal(text) = &err else {
+                panic!("expected Internal, got {err:?}");
+            };
+            assert!(text.contains("auth.config.secret_ref"), "{text}");
+            assert!(!text.contains("some-key"), "{text}");
+        }
+
+        let plugin = ApiKeyAuthPlugin::new(Arc::new(MockCredStoreClient::empty()));
+        let mut ctx = make_auth_ctx(make_config("authorization", "", "cred://bad ref!"));
         let err = plugin.authenticate(&mut ctx).await.unwrap_err();
-        assert!(matches!(err, PluginError::Internal(_)));
+        let PluginError::Internal(text) = &err else {
+            panic!("expected Internal, got {err:?}");
+        };
+        assert!(text.contains("auth.config.secret_ref"), "{text}");
+        assert!(!text.contains("bad ref"), "{text}");
     }
 
     #[tokio::test]

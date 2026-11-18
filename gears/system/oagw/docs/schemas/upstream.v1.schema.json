@@ -52,7 +52,7 @@
               },
               "port": {
                 "type": "integer",
-                "default": 443,
+                "description": "TCP port. When omitted, the scheme's default: 443 for https, wss, wt and grpc (80 for http where plaintext upstreams are allowed). No static default: it depends on the scheme.",
                 "minimum": 1,
                 "maximum": 65535
               }

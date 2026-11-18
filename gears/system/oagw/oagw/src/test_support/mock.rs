@@ -158,7 +158,14 @@ impl SharedState {
     async fn record(&self, method: &str, uri: &str, headers: &HeaderMap, body: &[u8]) {
         let hdrs = headers
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+            // Lossy rather than `to_str`, so obs-text and non-UTF-8 values
+            // stay visible to assertions.
+            .map(|(k, v)| {
+                (
+                    k.to_string(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
             .collect();
         let entry = RecordedRequest {
             method: method.to_string(),

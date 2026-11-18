@@ -1,4 +1,6 @@
-use crate::domain::plugin::credentials::{CLIENT_ID_REF_KEY, CLIENT_SECRET_REF_KEY};
+use crate::domain::plugin::credentials::{
+    CLIENT_ID_REF_KEY, CLIENT_SECRET_REF_KEY, credstore_error_kind,
+};
 use credstore_sdk::{CredStoreClientV1, SecretRef};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -170,24 +172,38 @@ impl OAuth2ClientCredAuthPlugin {
         self
     }
 
-    /// Resolve a `cred://` reference to its plaintext UTF-8 value.
+    /// Resolve a `cred://` reference to its plaintext UTF-8 value. Errors
+    /// name the config `key` the reference came from: the reference and the
+    /// store's own text (which may quote it) stay out of errors and logs
+    /// (F0008).
     async fn resolve_secret(
         &self,
         security_context: &toolkit_security::SecurityContext,
+        key: &'static str,
         cred_ref: &str,
     ) -> Result<String, PluginError> {
         let raw = cred_ref.strip_prefix("cred://").unwrap_or(cred_ref);
-        let secret_ref = SecretRef::new(raw)
-            .map_err(|e| PluginError::Internal(format!("invalid secret ref '{raw}': {e}")))?;
+        let secret_ref = SecretRef::new(raw).map_err(|e| {
+            PluginError::Internal(format!("auth.config.{key}: {}", credstore_error_kind(&e)))
+        })?;
         let response = self
             .credstore
             .get(security_context, &secret_ref)
             .await
-            .map_err(|e| PluginError::Internal(format!("credstore error: {e}")))?
-            .ok_or_else(|| PluginError::SecretNotFound(cred_ref.to_owned()))?;
+            .map_err(|e| {
+                PluginError::Internal(format!(
+                    "credential store error for auth.config.{key}: {}",
+                    credstore_error_kind(&e)
+                ))
+            })?
+            .ok_or(PluginError::SecretNotFound(key))?;
         std::str::from_utf8(response.value.as_bytes())
             .map(str::to_owned)
-            .map_err(|_| PluginError::Internal(format!("secret '{cred_ref}' is not valid UTF-8")))
+            .map_err(|_| {
+                PluginError::Internal(format!(
+                    "secret referenced by auth.config.{key} is not valid UTF-8"
+                ))
+            })
     }
 }
 
@@ -198,19 +214,27 @@ impl AuthPlugin for OAuth2ClientCredAuthPlugin {
         let key = build_cache_key(ctx, self.auth_method);
 
         if let Some(entry) = self.cache.get(&key) {
-            ctx.headers.insert(
+            ctx.set_headers.push((
                 "authorization".into(),
                 format!("Bearer {}", entry.token.expose()),
-            );
+            ));
             return Ok(());
         }
 
         // Cache miss — resolve credentials and fetch token.
         let client_id_str = self
-            .resolve_secret(&ctx.security_context, &config.client_id_ref)
+            .resolve_secret(
+                &ctx.security_context,
+                CLIENT_ID_REF_KEY,
+                &config.client_id_ref,
+            )
             .await?;
         let client_secret_str = self
-            .resolve_secret(&ctx.security_context, &config.client_secret_ref)
+            .resolve_secret(
+                &ctx.security_context,
+                CLIENT_SECRET_REF_KEY,
+                &config.client_secret_ref,
+            )
             .await?;
 
         let oauth_config = OAuthClientConfig {
@@ -245,10 +269,10 @@ impl AuthPlugin for OAuth2ClientCredAuthPlugin {
             Some(ttl),
         );
 
-        ctx.headers.insert(
+        ctx.set_headers.push((
             "authorization".into(),
             format!("Bearer {}", fetched.bearer.expose()),
-        );
+        ));
 
         Ok(())
     }
@@ -318,11 +342,7 @@ mod tests {
     }
 
     fn make_auth_ctx(config: HashMap<String, String>) -> AuthContext {
-        AuthContext {
-            headers: HashMap::new(),
-            config,
-            security_context: test_security_context(),
-        }
+        AuthContext::new(config, test_security_context())
     }
 
     fn make_plugin(credstore: Arc<dyn CredStoreClientV1>) -> OAuth2ClientCredAuthPlugin {
@@ -451,7 +471,13 @@ mod tests {
         let mut ctx = make_auth_ctx(make_config(&server));
 
         let err = plugin.authenticate(&mut ctx).await.unwrap_err();
-        assert!(matches!(err, PluginError::SecretNotFound(ref s) if s.contains("test-client-id")));
+        assert!(matches!(
+            err,
+            PluginError::SecretNotFound(CLIENT_ID_REF_KEY)
+        ));
+        let text = err.to_string();
+        assert!(text.contains("auth.config.client_id_ref"), "{text}");
+        assert!(!text.contains("test-client-id"), "{text}");
     }
 
     #[tokio::test]
@@ -465,19 +491,36 @@ mod tests {
         let mut ctx = make_auth_ctx(make_config(&server));
 
         let err = plugin.authenticate(&mut ctx).await.unwrap_err();
-        assert!(
-            matches!(err, PluginError::SecretNotFound(ref s) if s.contains("test-client-secret"))
-        );
+        assert!(matches!(
+            err,
+            PluginError::SecretNotFound(CLIENT_SECRET_REF_KEY)
+        ));
+        let text = err.to_string();
+        assert!(text.contains("auth.config.client_secret_ref"), "{text}");
+        assert!(!text.contains("test-client-secret"), "{text}");
     }
 
+    /// A credential store failure names the config key; neither the
+    /// reference nor the store's text (which may quote it) is in the error.
     #[tokio::test]
-    async fn credstore_error_maps_to_internal() {
+    async fn credstore_error_maps_to_internal_without_the_ref() {
         let server = MockServer::start();
-        let plugin = make_plugin(Arc::new(MockCredStoreClient::always_failing()));
+        let plugin = make_plugin(Arc::new(crate::domain::test_support::ErroringCredStore(
+            || {
+                credstore_sdk::CredStoreError::Internal(
+                    "store failed reading test-client-id".into(),
+                )
+            },
+        )));
         let mut ctx = make_auth_ctx(make_config(&server));
 
         let err = plugin.authenticate(&mut ctx).await.unwrap_err();
-        assert!(matches!(err, PluginError::Internal(ref msg) if msg.contains("credstore error")));
+        let PluginError::Internal(msg) = &err else {
+            panic!("expected Internal, got {err:?}");
+        };
+        assert!(msg.contains("credential store error"), "{msg}");
+        assert!(msg.contains("auth.config.client_id_ref"), "{msg}");
+        assert!(!msg.contains("test-client-id"), "{msg}");
     }
 
     #[tokio::test]
@@ -490,7 +533,12 @@ mod tests {
         let mut ctx = make_auth_ctx(make_config(&server));
 
         let err = plugin.authenticate(&mut ctx).await.unwrap_err();
-        assert!(matches!(err, PluginError::Internal(ref msg) if msg.contains("not valid UTF-8")));
+        let PluginError::Internal(msg) = &err else {
+            panic!("expected Internal, got {err:?}");
+        };
+        assert!(msg.contains("not valid UTF-8"), "{msg}");
+        assert!(msg.contains("auth.config.client_id_ref"), "{msg}");
+        assert!(!msg.contains("test-client-id"), "{msg}");
     }
 
     // -----------------------------------------------------------------------
@@ -531,7 +579,7 @@ mod tests {
 
         plugin.authenticate(&mut ctx).await.unwrap();
         assert_eq!(
-            ctx.headers.get("authorization").unwrap(),
+            ctx.header_value("authorization").unwrap(),
             "Bearer test-access-token"
         );
     }
@@ -557,7 +605,7 @@ mod tests {
 
         plugin.authenticate(&mut ctx).await.unwrap();
         assert_eq!(
-            ctx.headers.get("authorization").unwrap(),
+            ctx.header_value("authorization").unwrap(),
             "Bearer tok-prefixed"
         );
     }
@@ -585,7 +633,10 @@ mod tests {
         ]));
 
         plugin.authenticate(&mut ctx).await.unwrap();
-        assert_eq!(ctx.headers.get("authorization").unwrap(), "Bearer tok-bare");
+        assert_eq!(
+            ctx.header_value("authorization").unwrap(),
+            "Bearer tok-bare"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -631,7 +682,7 @@ mod tests {
 
         plugin.authenticate(&mut ctx).await.unwrap();
         assert_eq!(
-            ctx.headers.get("authorization").unwrap(),
+            ctx.header_value("authorization").unwrap(),
             "Bearer tok-no-scope"
         );
     }
@@ -668,7 +719,7 @@ mod tests {
         plugin.authenticate(&mut ctx).await.unwrap();
         mock.assert();
         assert_eq!(
-            ctx.headers.get("authorization").unwrap(),
+            ctx.header_value("authorization").unwrap(),
             "Bearer tok-basic"
         );
     }
@@ -700,7 +751,10 @@ mod tests {
         plugin.authenticate(&mut ctx).await.unwrap();
         mock.assert();
         assert_eq!(header_mock.calls(), 0, "Form must not send a Basic header");
-        assert_eq!(ctx.headers.get("authorization").unwrap(), "Bearer tok-form");
+        assert_eq!(
+            ctx.header_value("authorization").unwrap(),
+            "Bearer tok-form"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -709,11 +763,7 @@ mod tests {
 
     /// Helper that creates an `AuthContext` with an explicit `SecurityContext`.
     fn make_auth_ctx_with_sc(config: HashMap<String, String>, sc: SecurityContext) -> AuthContext {
-        AuthContext {
-            headers: HashMap::new(),
-            config,
-            security_context: sc,
-        }
+        AuthContext::new(config, sc)
     }
 
     #[tokio::test]
@@ -735,7 +785,7 @@ mod tests {
         let mut ctx1 = make_auth_ctx_with_sc(config.clone(), sc.clone());
         plugin.authenticate(&mut ctx1).await.unwrap();
         assert_eq!(
-            ctx1.headers.get("authorization").unwrap(),
+            ctx1.header_value("authorization").unwrap(),
             "Bearer cached-token"
         );
 
@@ -743,7 +793,7 @@ mod tests {
         let mut ctx2 = make_auth_ctx_with_sc(config, sc);
         plugin.authenticate(&mut ctx2).await.unwrap();
         assert_eq!(
-            ctx2.headers.get("authorization").unwrap(),
+            ctx2.header_value("authorization").unwrap(),
             "Bearer cached-token"
         );
 
@@ -878,7 +928,7 @@ mod tests {
         let mut ctx_a = make_auth_ctx_with_sc(config.clone(), sc_a);
         plugin.authenticate(&mut ctx_a).await.unwrap();
         assert_eq!(
-            ctx_a.headers.get("authorization").unwrap(),
+            ctx_a.header_value("authorization").unwrap(),
             "Bearer token-A"
         );
 
@@ -901,7 +951,7 @@ mod tests {
         let mut ctx_b = make_auth_ctx_with_sc(config, sc_b);
         plugin.authenticate(&mut ctx_b).await.unwrap();
         assert_eq!(
-            ctx_b.headers.get("authorization").unwrap(),
+            ctx_b.header_value("authorization").unwrap(),
             "Bearer token-B"
         );
     }
@@ -939,7 +989,7 @@ mod tests {
         let mut ctx2 = make_auth_ctx_with_sc(config, sc);
         plugin.authenticate(&mut ctx2).await.unwrap();
         assert_eq!(
-            ctx2.headers.get("authorization").unwrap(),
+            ctx2.header_value("authorization").unwrap(),
             "Bearer retry-token"
         );
         ok_mock.assert_calls(1);
@@ -969,7 +1019,7 @@ mod tests {
         let mut ctx1 = make_auth_ctx_with_sc(config.clone(), sc.clone());
         plugin.authenticate(&mut ctx1).await.unwrap();
         assert_eq!(
-            ctx1.headers.get("authorization").unwrap(),
+            ctx1.header_value("authorization").unwrap(),
             "Bearer tok-short"
         );
 
@@ -977,7 +1027,7 @@ mod tests {
         let mut ctx2 = make_auth_ctx_with_sc(config, sc);
         plugin.authenticate(&mut ctx2).await.unwrap();
         assert_eq!(
-            ctx2.headers.get("authorization").unwrap(),
+            ctx2.header_value("authorization").unwrap(),
             "Bearer tok-short"
         );
 
@@ -1005,7 +1055,7 @@ mod tests {
         let mut ctx1 = make_auth_ctx_with_sc(config.clone(), sc.clone());
         plugin.authenticate(&mut ctx1).await.unwrap();
         assert_eq!(
-            ctx1.headers.get("authorization").unwrap(),
+            ctx1.header_value("authorization").unwrap(),
             "Bearer tok-ephemeral"
         );
 
@@ -1036,7 +1086,7 @@ mod tests {
         let mut ctx1 = make_auth_ctx_with_sc(config.clone(), sc.clone());
         plugin.authenticate(&mut ctx1).await.unwrap();
         assert_eq!(
-            ctx1.headers.get("authorization").unwrap(),
+            ctx1.header_value("authorization").unwrap(),
             "Bearer tok-long"
         );
 
@@ -1044,7 +1094,7 @@ mod tests {
         let mut ctx2 = make_auth_ctx_with_sc(config, sc);
         plugin.authenticate(&mut ctx2).await.unwrap();
         assert_eq!(
-            ctx2.headers.get("authorization").unwrap(),
+            ctx2.header_value("authorization").unwrap(),
             "Bearer tok-long"
         );
 

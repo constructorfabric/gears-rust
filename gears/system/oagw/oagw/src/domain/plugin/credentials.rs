@@ -65,6 +65,23 @@ pub const AUTH_PLUGIN_CREDENTIAL_KEYS: &[(&str, &[CredentialKey])] = &[
     ),
 ];
 
+/// What kind of failure `e` is. The credential store's own text is not used:
+/// it may quote the reference, which never goes to logs or errors (F0008).
+pub(crate) fn credstore_error_kind(e: &credstore_sdk::CredStoreError) -> &'static str {
+    use credstore_sdk::CredStoreError as E;
+    match e {
+        E::InvalidSecretRef { .. } => "invalid secret reference",
+        E::AccessDenied => "access denied",
+        E::NotFound => "secret not found",
+        E::Conflict => "secret already exists",
+        E::NoPluginAvailable => "no plugin available",
+        E::ServiceUnavailable { .. } => "service unavailable",
+        E::UnsupportedTransition { .. } => "unsupported sharing transition",
+        E::TypeViolation { .. } => "secret type violation",
+        E::Internal(_) => "internal error",
+    }
+}
+
 /// An auth config entry that references a secret in the credential store.
 #[domain_model]
 #[derive(Debug, Clone, Copy)]

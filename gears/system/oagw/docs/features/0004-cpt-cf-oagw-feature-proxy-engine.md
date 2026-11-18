@@ -125,7 +125,7 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
     1. [x] - `p1` - **RETURN** 400 `invalid_argument`, field violation on `server.endpoints.scheme` with reason `HTTP_UPSTREAM_FORBIDDEN` and `X-OAGW-Error-Source: gateway`, before any auth plugin runs, so no credential is prepared for a plaintext upstream - `inst-proxy-13b1`
 15. [x] - `p1` - Execute auth plugin: inject credentials into outbound request - `inst-proxy-14`
 16. [x] - `p1` - **IF** auth plugin fails (secret not found, credential error) - `inst-proxy-15`
-    1. [x] - `p1` - **RETURN** 401 AuthenticationFailed or 500 SecretNotFound with `X-OAGW-Error-Source: gateway` - `inst-proxy-15a`
+    1. [x] - `p1` - **RETURN** 401 AuthenticationFailed or 500 SecretNotFound with `X-OAGW-Error-Source: gateway`. The error and the server log name the auth config key (`auth.config.secret_ref`, `auth.config.client_id_ref`, `auth.config.client_secret_ref`), never the reference or the credential store's own text, which may quote it - `inst-proxy-15a`
 17. [x] - `p1` - Execute guard plugins: validate method, query params, path suffix, CORS origin (actual requests only; preflight returns permissive 204 at handler level; see [ADR: CORS](../ADR/0006-cors.md)) - `inst-proxy-16`
 18. [x] - `p1` - **IF** any guard rejects - `inst-proxy-17`
     1. [x] - `p1` - **RETURN** guard-specific error code with `X-OAGW-Error-Source: gateway` - `inst-proxy-17a`
@@ -245,15 +245,15 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
    4. [x] - `p1` - **IF** plugin not found - `inst-chain-4d`
       1. [x] - `p1` - **RETURN** 503 PluginNotFound with `X-OAGW-Error-Source: gateway` - `inst-chain-4d1`
 5. [x] - `p1` - Resolve upstream auth plugin from the upstream's auth configuration (`auth_plugin_ref` / `auth_plugin_uuid` when a database is configured) - `inst-chain-5`
-6. [x] - `p1` - Execute auth plugin: resolve credentials from `cred_store` via secret_ref, inject into request - `inst-chain-6`
+6. [x] - `p1` - Execute auth plugin: resolve credentials from `cred_store` via secret_ref; the plugin lists the headers to set, and each replaces the request's lines of that name, marked sensitive. Other headers, repeated or non-UTF-8 ones included, pass unchanged. A header name or value that is not valid fails the request with 400 (invalid plugin config) instead of sending it without credentials - `inst-chain-6`
 7. [x] - `p1` - **IF** secret not found or credential resolution fails - `inst-chain-7`
-   1. [x] - `p1` - **RETURN** 401 AuthenticationFailed or 500 SecretNotFound - `inst-chain-7a`
+   1. [x] - `p1` - **RETURN** 401 AuthenticationFailed or 500 SecretNotFound, naming the auth config key, not the reference - `inst-chain-7a`
 8. [x] - `p1` - **FOR EACH** guard plugin in chain (type = guard) - `inst-chain-8`
    1. [x] - `p1` - Execute guard: validate request against guard rules (method allowlist, query allowlist, path suffix, timeout) - `inst-chain-8a`
    2. [x] - `p1` - **IF** guard rejects - `inst-chain-8b`
       1. [x] - `p1` - **RETURN** guard-specific rejection error - `inst-chain-8b1`
 9. [x] - `p1` - **FOR EACH** transform plugin in chain (type = transform, phase = on_request) - `inst-chain-9`
-   1. [x] - `p1` - Execute transform: mutate request headers, body, query as configured - `inst-chain-9a`
+   1. [x] - `p1` - Execute transform: mutate request headers, body, query as configured. The transform sees the headers whose values are visible ASCII; lines that are not (obs-text, non-UTF-8) pass through unseen. Only the names whose lines the transform changed are rewritten: all their lines, unseen ones included, are replaced by the transform's (none: removed), keeping the sensitive flag. Every other line, the credential set by the auth plugin included, keeps its bytes, order and sensitive flag. The same applies to response headers in `on_response` - `inst-chain-9a`
 10. [x] - `p1` - **RETURN** processed request ready for upstream forwarding - `inst-chain-10`
 
 ### Header Transformation
@@ -267,7 +267,7 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
 **Steps**:
 1. [x] - `p1` - Strip hop-by-hop headers: Connection, Keep-Alive, Proxy-Authenticate, Proxy-Authorization, TE, Trailer, Transfer-Encoding, Upgrade - `inst-header-1`
 2. [x] - `p1` - Strip routing header: consume `X-OAGW-Target-Host` value for endpoint selection, then remove - `inst-header-2`
-3. [x] - `p1` - Replace `Host` header with upstream endpoint host (HTTP/1.1) or `:authority` pseudo-header with upstream authority (HTTP/2) - `inst-header-3`
+3. [x] - `p1` - Replace `Host` header with upstream endpoint host (HTTP/1.1) or `:authority` pseudo-header with upstream authority (HTTP/2). The port is appended unless it is the default for the endpoint's scheme (80 for `http`, 443 for the others), so `http` on 443 sends `host:443` and `https` on 80 sends `host:80` - `inst-header-3`
 4. [x] - `p1` - Apply upstream `headers` config: execute set/add/remove operations in declared order - `inst-header-4`
 5. [x] - `p1` - Apply route `headers` config (if any): execute set/add/remove operations in declared order - `inst-header-5`
 6. [x] - `p1` - Validate well-known headers: Content-Length (valid integer), Content-Type (recognized format) — reject with 400 if invalid - `inst-header-6`

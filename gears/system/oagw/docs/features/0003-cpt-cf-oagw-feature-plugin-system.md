@@ -433,7 +433,9 @@ The system **MUST** mark unlinked custom plugins with `gc_eligible_at = NOW() + 
 
 ### Auth Plugin Credential Resolution
 
-Auth plugins do not store credentials directly. At proxy request time, the auth plugin reads the `secret_ref` from `auth_config` (e.g., `cred://partner-openai-key`) and resolves it via `cred_store`. The `cred_store` gear enforces tenant visibility — OAGW receives secret material only if the current tenant has access. If resolution fails, OAGW returns `401 AuthenticationFailed`.
+Auth plugins do not store credentials directly. At proxy request time, the auth plugin reads the `secret_ref` from `auth_config` (e.g., `cred://partner-openai-key`) and resolves it via `cred_store`. The `cred_store` gear enforces tenant visibility — OAGW receives secret material only if the current tenant has access. If resolution fails, OAGW returns `401 AuthenticationFailed`, or `500 SecretNotFound` when the secret does not exist. Errors and logs name the auth config key, never the reference.
+
+An auth plugin does not see the outbound headers: it returns the headers to set, and the proxy sets them on the request, each replacing the lines of that name. The client's other headers reach the upstream as sent, repeated and non-UTF-8 ones included. A header the plugin returns that is not a valid name or value fails the request.
 
 ### Scope Boundaries
 
