@@ -512,6 +512,7 @@ async fn reverse_of_a_vanished_entry_fails_closed() {
             &ctx,
             &scope,
             &ApprovalIntent::Reverse(ReverseIntent {
+                tenant_id: tenant,
                 entry_id: Uuid::now_v7(),
                 into_period_id: None,
                 effective_at: None,

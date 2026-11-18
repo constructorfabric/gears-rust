@@ -65,6 +65,7 @@ fn credit_grant_intent_roundtrips() {
 fn reverse_intent_roundtrips_and_has_no_carried_amount() {
     let entry_id = Uuid::now_v7();
     let intent = ApprovalIntent::Reverse(ReverseIntent {
+        tenant_id: Uuid::now_v7(),
         entry_id,
         into_period_id: Some("202606".to_owned()),
         effective_at: None,
@@ -455,6 +456,43 @@ fn debit_note_intent_rebuilds_into_an_identical_request_with_recognition() {
     assert_eq!(
         req, rebuilt,
         "debit-note replay must reproduce the request (incl. recognition) exactly"
+    );
+}
+
+#[test]
+fn ledger_tenant_is_the_posting_target_not_the_caller() {
+    // Regression for the dual-control cross-tenant bypass: `ledger_tenant()` is
+    // what keys the D2 threshold, the facts and the pending-approval record, so
+    // it must be the tenant whose ledger the intent posts to — never the actor.
+    let target = Uuid::now_v7();
+    assert_eq!(
+        ApprovalIntent::Reverse(ReverseIntent {
+            tenant_id: target,
+            entry_id: Uuid::now_v7(),
+            into_period_id: None,
+            effective_at: None,
+            reason: "r".into(),
+        })
+        .ledger_tenant(),
+        target,
+    );
+    assert_eq!(
+        ApprovalIntent::CreditGrant(CreditGrantIntent {
+            tenant_id: target,
+            payer_tenant_id: Uuid::from_u128(1),
+            credit_application_id: "app".into(),
+            amount: money(1, "USD"),
+            credit_grant_event_type: None,
+        })
+        .ledger_tenant(),
+        target,
+    );
+    // A backdated invoice posts to its seller's ledger.
+    let snap = sample_snapshot();
+    let seller = snap.seller_tenant_id;
+    assert_eq!(
+        ApprovalIntent::MaterialBackdating(BackdatedPost::Invoice(snap)).ledger_tenant(),
+        seller,
     );
 }
 

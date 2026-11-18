@@ -68,6 +68,8 @@ pub struct PeriodReopenIntent {
 #[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReverseIntent {
+    /// The tenant whose ledger the reversal posts to (the reversed entry's owner).
+    pub tenant_id: Uuid,
     pub entry_id: Uuid,
     pub into_period_id: Option<String>,
     pub effective_at: Option<NaiveDate>,
@@ -886,6 +888,29 @@ impl ApprovalIntent {
             Self::ManualAdjustment(_) => ApprovalKind::ManualAdjustment,
             Self::CreditNote(_) => ApprovalKind::CreditNote,
             Self::DebitNote(_) => ApprovalKind::DebitNote,
+        }
+    }
+
+    /// The tenant whose ledger this intent posts to (the governed-write target),
+    /// used to key the dual-control gate — the threshold, the functional-currency
+    /// facts, and the pending-approval record — so a cross-tenant post (an MSP
+    /// parent into a child seller's ledger) is governed by the TARGET tenant's
+    /// configured D2 threshold and the target's approvers, not the caller's.
+    #[must_use]
+    pub fn ledger_tenant(&self) -> Uuid {
+        match self {
+            Self::Reverse(i) => i.tenant_id,
+            Self::CreditGrant(i) => i.tenant_id,
+            Self::ChargebackLoss(i) => i.tenant_id,
+            Self::PayerClosure(i) => i.tenant_id,
+            Self::PeriodReopen(i) => i.tenant_id,
+            Self::MaterialBackdating(BackdatedPost::Invoice(s)) => s.seller_tenant_id,
+            Self::RecognitionScheduleChange(i) => i.tenant_id,
+            Self::Refund(i) => i.tenant_id,
+            Self::ManualAdjustment(i) => i.tenant_id,
+            Self::CreditNote(i) => i.tenant_id,
+            Self::DebitNote(i) => i.tenant_id,
+            Self::RefundWithCreditNote(i) => i.refund.tenant_id,
         }
     }
 

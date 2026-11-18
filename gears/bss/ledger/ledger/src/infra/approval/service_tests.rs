@@ -788,6 +788,7 @@ async fn reverse_and_recognition_keep_transaction_basis_without_current_fx() {
     functional(&s, &preparer, &scope, "JPY").await;
     for intent in [
         ApprovalIntent::Reverse(ReverseIntent {
+            tenant_id: preparer.subject_tenant_id(),
             entry_id: Uuid::now_v7(),
             into_period_id: None,
             effective_at: None,

@@ -628,6 +628,7 @@ async fn reverse_entry(
         let reverse_amount = reverse_governed_amount(&original).map_err(CanonicalError::from)?;
         let intent = crate::domain::approval::intent::ApprovalIntent::Reverse(
             crate::domain::approval::intent::ReverseIntent {
+                tenant_id: original.tenant_id,
                 entry_id: original.entry_id,
                 into_period_id: body.period_id.clone(),
                 effective_at: body.effective_at,

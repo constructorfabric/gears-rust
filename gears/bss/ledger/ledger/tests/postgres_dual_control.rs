@@ -169,6 +169,7 @@ async fn seed_pending(
 ) -> (Uuid, ApprovalIntent) {
     let approval_id = Uuid::now_v7();
     let intent = ApprovalIntent::Reverse(ReverseIntent {
+        tenant_id: tenant,
         entry_id: Uuid::now_v7(),
         into_period_id: None,
         effective_at: None,
@@ -556,8 +557,9 @@ fn credit_grant_intent(app_id: &str, amount: i64) -> ApprovalIntent {
 
 /// A fresh `Reverse` intent (same kind as `seed_pending`'s) — resubmit requires
 /// the edited intent's kind to match the stored row.
-fn reverse_intent() -> ApprovalIntent {
+fn reverse_intent(tenant: Uuid) -> ApprovalIntent {
     ApprovalIntent::Reverse(ReverseIntent {
+        tenant_id: tenant,
         entry_id: Uuid::now_v7(),
         into_period_id: None,
         effective_at: None,
@@ -735,7 +737,12 @@ async fn resubmit_with_swapped_target_is_rejected() {
     // `reverse_intent()` is the SAME kind (Reverse) but a fresh `entry_id` — a
     // swapped target. The kind guard passes; the identity-pin must reject it.
     let err = svc
-        .resubmit(&ctx_for(preparer, tenant), &scope, id, reverse_intent())
+        .resubmit(
+            &ctx_for(preparer, tenant),
+            &scope,
+            id,
+            reverse_intent(tenant),
+        )
         .await
         .expect_err("a swapped-target resubmit must be rejected");
     assert!(
@@ -794,7 +801,7 @@ async fn resubmit_by_non_preparer_is_rejected() {
             &ctx_for(Uuid::now_v7(), tenant),
             &scope,
             id,
-            reverse_intent(),
+            reverse_intent(tenant),
         )
         .await
         .unwrap_err();

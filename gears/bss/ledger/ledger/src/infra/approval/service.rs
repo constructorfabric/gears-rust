@@ -152,7 +152,7 @@ impl ApprovalService {
             serde_json::to_value(check_threshold_snapshot(threshold_snapshot)?).map_err(|e| {
                 DomainError::Internal(format!("encode approval policy snapshot: {e}"))
             })?;
-        let tenant = ctx.subject_tenant_id();
+        let tenant = intent.ledger_tenant();
         let kind = intent.kind();
         let business_key = intent.business_key();
 
@@ -255,7 +255,7 @@ impl ApprovalService {
     ) -> Result<Option<Uuid>, DomainError> {
         let versions = self
             .repo
-            .read_policy_versions(scope, ctx.subject_tenant_id())
+            .read_policy_versions(scope, intent.ledger_tenant())
             .await?;
         let now = OffsetDateTime::now_utc();
         let policy = resolve_policy(&versions, now);
@@ -280,7 +280,7 @@ impl ApprovalService {
         }
         let original_currency = facts.amount.as_ref().map(|v| v.currency().clone());
         let facts = self
-            .to_functional_facts(scope, ctx.subject_tenant_id(), facts, &intent, now)
+            .to_functional_facts(scope, intent.ledger_tenant(), facts, &intent, now)
             .await?;
         if !requires_dual_control(&facts, &policy, to_naive_date(now))
             .map_err(policy_config_to_domain)?
