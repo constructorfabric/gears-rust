@@ -65036,7 +65036,7 @@
     },
     "/settings-service/v1/settings/{key}/history": {
       "get": {
-        "description": "The mutation history of one setting at one scope, newest first and cursor-paginated, served from the gear's own audit store. `tenant` follows the read surface: omitted, the caller's own tenant; a tenant outside the caller's subtree or a standalone descendant answers 403. A `pii` actor, and `pii` values, are masked for a caller without the PII entitlement; a secret was never recorded in plaintext. A retired declaration keeps its history. An empty history is an empty page. `$filter`, `$orderby` and `$select` are refused.",
+        "description": "The mutation history of one setting at one scope, newest first and cursor-paginated, served from the gear's own audit store. `tenant` follows the read surface: omitted, the caller's own tenant; a tenant outside the caller's subtree or a standalone descendant answers 403. A `pii` actor, and `pii` values, are masked for a caller without the PII entitlement; a secret was never recorded in plaintext. A retired declaration keeps its history. An empty history is an empty page. `$filter`, `$orderby` and `$select` are refused.\n\nWith `descendants=true` the page holds the records of the target tenant and of every tenant below it, in one list ordered by `occurred_at` descending and then `id` descending, with the setting's definition records listed once. A standalone descendant and everything below it are left out. Every record is masked and its actor shown or withheld exactly as the single-scope history of the record's own `tenant_id` does for the same caller. A setting hidden from the caller answers 404; one hidden at a descendant keeps that descendant's records in the list of a caller it is not hidden from. `page_info.total_count` is not reported in this mode. A target whose subtree holds more than 5000 tenants answers 400 `subtree_too_large`. A cursor continues only the listing it was issued by: the same setting, the same `tenant` and the same `descendants`; any other answers 400.",
         "operationId": "settings_service.get_setting_history",
         "parameters": [
           {
@@ -65055,6 +65055,15 @@
             "required": false,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "description": "`true` to list the records of the target tenant and of every tenant below it, standalone descendants excluded; `false` or omitted, the target tenant's own scope only",
+            "in": "query",
+            "name": "descendants",
+            "required": false,
+            "schema": {
+              "type": "boolean"
             }
           },
           {
@@ -65085,7 +65094,7 @@
                 }
               }
             },
-            "description": "A page of audit records, newest first, with its pagination cursors and the total"
+            "description": "A page of audit records, newest first, with its pagination cursors and, without `descendants=true`, the total"
           },
           "400": {
             "content": {
@@ -65153,7 +65162,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Read a setting's history at a scope",
+        "summary": "Read a setting's history at a scope or across a subtree",
         "tags": [
           "settings-values"
         ]

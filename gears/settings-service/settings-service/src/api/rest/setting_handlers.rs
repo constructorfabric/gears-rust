@@ -57,6 +57,68 @@ pub struct BrowseParams {
     pub q: Option<String>,
 }
 
+/// The query parameters of the history read: the target tenant and whether
+/// the tenants below it are read with it.
+#[derive(Debug, Default, Deserialize)]
+pub struct HistoryParams {
+    /// The target tenant's id, a UUID, as [`TenantParam::tenant`].
+    #[serde(default)]
+    pub tenant: Option<String>,
+    /// `true` for the history of the target and of every tenant below it that
+    /// administration from the target reaches, in one list; `false` or
+    /// omitted, the target's own scope alone.
+    #[serde(default)]
+    pub descendants: Option<String>,
+}
+
+/// Parses the optional `descendants` query parameter: `true` or `false`,
+/// omitted meaning `false`. Anything else is refused rather than read as one
+/// of the two — the modes answer different sets, and a caller whose spelling
+/// was guessed at would page the wrong one without a sign.
+fn parse_descendants(raw: Option<&str>) -> Result<bool, DomainError> {
+    match raw {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(raw) => Err(DomainError::Validation {
+            field: "descendants".to_owned(),
+            code: field::VALIDATION,
+            message: format!("`{raw}` is not a boolean; `descendants` takes `true` or `false`"),
+        }),
+    }
+}
+
+/// The path from the reader tenant down to one history record's tenant, which
+/// the identity rule reads.
+///
+/// `to_target` is the path from the reader down to the target. A record at
+/// the target is on that path; a record below it extends the path by the
+/// walk's parent links from the target down to the record's tenant. A
+/// definition record has no tenant and is on no path. A tenant that is
+/// neither the target nor one the walk reached is on no path either: the page
+/// query lists only the walk's tenants, so this does not happen, and if it
+/// did the actor would be withheld rather than shown on the target's path.
+fn record_path(
+    to_target: &[Uuid],
+    target: Uuid,
+    walk: Option<&crate::domain::resolution::Subtree>,
+    record_tenant: Option<Uuid>,
+) -> Vec<Uuid> {
+    let Some(tenant) = record_tenant else {
+        return Vec::new();
+    };
+    if tenant == target {
+        return to_target.to_vec();
+    }
+    match walk {
+        Some(walk) if walk.contains(tenant) => {
+            let mut path = to_target.to_vec();
+            path.extend(walk.path_from(target, tenant).into_iter().skip(1));
+            path
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Parses the optional `tenant` query parameter; absent or empty means "not given".
 pub(crate) fn parse_tenant(raw: Option<&str>) -> Result<Option<Uuid>, DomainError> {
     match raw {
@@ -974,14 +1036,24 @@ mod setting_handlers_tests;
 
 // @cpt-dod:cpt-cf-settings-service-dod-audit-store-history-read:p1
 /// `GET /settings-service/v1/settings/{key}/history?tenant={tenant_id}` with
-/// `limit` and `cursor`.
+/// `limit`, `cursor` and `descendants`.
+///
+/// Without `descendants` the history of the one `(setting, tenant)` scope.
+/// With `descendants=true` the records of the target and of every tenant
+/// below it that administration from the target reaches — standalone
+/// subtrees left out — in one list, newest first; the target is gated and
+/// each record rendered exactly as in the single-scope read, and no total is
+/// reported.
 ///
 /// # Errors
-/// 400 on a malformed key or `tenant`, or on `$filter`, `$orderby` or `$select`,
-/// which the history does not take; 403 when the caller may not read values or
-/// the target is outside its subtree or standalone; 404 when no declaration
-/// exists at the key or it is outside the caller's administrative domain; 503
-/// when the store cannot answer.
+/// 400 on a malformed key, `tenant` or `descendants`, on `$filter`, `$orderby`
+/// or `$select`, which the history does not take, on a cursor minted for
+/// another history or the other mode, or, with `descendants=true`, on a
+/// subtree past the budget; 403 when the caller may not read values or the
+/// target is outside its subtree or standalone; 404 when no declaration exists
+/// at the key, it is outside the caller's administrative domain or it is
+/// hidden from the caller; 500 when the database fails the history's page
+/// read; 503 when the tenant hierarchy or another dependency cannot answer.
 #[allow(
     clippy::too_many_arguments,
     reason = "one extractor per extension the handler reads"
@@ -994,12 +1066,13 @@ pub async fn get_history(
     Extension(names): Extension<Arc<crate::infra::actor_names::ActorNameResolver>>,
     Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Path(key): Path<String>,
-    Query(params): Query<TenantParam>,
+    Query(params): Query<HistoryParams>,
     OData(query): OData,
 ) -> ApiResult<impl IntoResponse> {
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-1
     let key = parse_key(&key)?;
     let requested = parse_tenant(params.tenant.as_deref())?;
+    let with_descendants = parse_descendants(params.descendants.as_deref())?;
     if query.filter.is_some() || !query.order.0.is_empty() || query.select.is_some() {
         return Err(unsupported(
             "history takes `limit` and `cursor` only; it is always newest first",
@@ -1038,7 +1111,7 @@ pub async fn get_history(
         })?;
     // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-5
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-6
-    // Hidden from the target tenant: 404 rather than 403, so a hidden setting's
+    // Hidden from the caller: 404 rather than 403, so a hidden setting's
     // existence is not disclosed through its history either.
     let caller = ScopeTarget::Tenant(ctx.subject_tenant_id()).normalize(root);
     if resolver
@@ -1052,51 +1125,89 @@ pub async fn get_history(
         .into());
     }
     // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-6
-    let page = crate::infra::storage::audit_store::AuditStore::history(
-        &conn,
-        &scope,
-        key.as_str(),
-        target.tenant_id(root),
-        &query,
-    )
-    .await?;
+    let target_tenant = target.tenant_id(root);
+    // One scope, or the target with the tenants below it. The second is asked
+    // for only after the checks above, so a setting the caller may not see
+    // answers 404 whatever the size of the subtree.
+    let (records, page_info, walk) = if with_descendants {
+        // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-7
+        // The tenants administration from the target reaches, standalone
+        // subtrees left out by the hierarchy, and at most the subtree budget
+        // of them: a list the budget cut would leave records out silently, so
+        // the request is refused with the bound named, as the review listing
+        // refuses it. The walk's parent links are kept: they are the path from
+        // the target down to each record's tenant, which the identity rule
+        // reads.
+        let walk = resolver
+            .hierarchy()
+            .subtree(target_tenant, SUBTREE_BUDGET)
+            .await?;
+        if walk.truncated {
+            return Err(subtree_too_large("tenant", "target's").into());
+        }
+        // No total: counting would read every record of the subtree.
+        let page = crate::infra::storage::audit_store::AuditStore::history_subtree(
+            &conn,
+            &scope,
+            key.as_str(),
+            target_tenant,
+            &walk.order,
+            &query,
+        )
+        .await?;
+        // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-7
+        (
+            page.items,
+            PageInfoDto::of(page.page_info, None),
+            Some(walk),
+        )
+    } else {
+        let page = crate::infra::storage::audit_store::AuditStore::history(
+            &conn,
+            &scope,
+            key.as_str(),
+            target_tenant,
+            &query,
+        )
+        .await?;
+        (
+            page.items,
+            PageInfoDto::of(page.page_info, Some(page.total_count)),
+            None,
+        )
+    };
     let values_are_pii = declaration.data_classification == "pii";
     // A `pii` image keeps its class after the setting is declassified, so it
     // asks for the entitlement as much as a `pii` setting or actor does.
     let needs_entitlement = values_are_pii
-        || page.items.iter().any(|r| {
+        || records.iter().any(|r| {
             r.actor_classification == crate::audit::ActorClassification::Pii || r.has_pii_image()
         });
     let pii = needs_entitlement && may_read_pii(&enforcer, &ctx).await?;
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-9
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-10
     // The path from the reader tenant down to the record's tenant is the
-    // target's chain from the reader. A definition record has no tenant, so
-    // its actor is on no path.
+    // target's chain from the reader, extended below the target by the walk's
+    // parent links when the record sits at a descendant. A definition record
+    // has no tenant, so its actor is on no path.
     let reader = Reader::new(ctx.subject_tenant_id(), root);
-    let target_chain = target_chain(&resolver, reader, target.tenant_id(root)).await?;
+    let target_chain = target_chain(&resolver, reader, target_tenant).await?;
     let to_target = reader.path_in(&target_chain);
     // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-10
-    let mut items: Vec<AuditRecordDto> = page
-        .items
+    let mut items: Vec<AuditRecordDto> = records
         .iter()
         .map(|r| {
-            let path: &[Uuid] = if r.tenant_id.is_some() {
-                to_target
-            } else {
-                &[]
-            };
+            let path = record_path(to_target, target_tenant, walk.as_ref(), r.tenant_id);
             render_record(
                 r,
                 values_are_pii,
                 pii,
-                reader.is_shown(r.actor_tenant_id, path),
+                reader.is_shown(r.actor_tenant_id, &path),
             )
         })
         .collect();
     // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-9
-    let actors: Vec<crate::infra::actor_names::ActorRef> = page
-        .items
+    let actors: Vec<crate::infra::actor_names::ActorRef> = records
         .iter()
         .zip(&items)
         .map(|(record, item)| crate::infra::actor_names::ActorRef {
@@ -1110,9 +1221,6 @@ pub async fn get_history(
         item.name_actor(name);
     }
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-9
-    Ok(Json(PageDto {
-        items,
-        page_info: PageInfoDto::of(page.page_info, Some(page.total_count)),
-    }))
+    Ok(Json(PageDto { items, page_info }))
     // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-9
 }

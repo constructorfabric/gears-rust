@@ -411,3 +411,93 @@ async fn a_masked_value_qualifies_by_its_text_alone_and_is_never_named_as_value(
     assert_eq!(item.matched_field, None);
     assert!(item.effective.as_ref().is_some_and(|e| e.masked));
 }
+
+// ── The path of one history record ───────────────────────────────────────────
+
+mod record_path {
+    use std::collections::HashMap;
+
+    use uuid::Uuid;
+
+    use super::super::record_path;
+    use crate::api::rest::setting_dto::Reader;
+    use crate::domain::resolution::Subtree;
+
+    /// `reader -> target -> child -> grandchild`, with `stray` on no link.
+    struct Fixture {
+        reader: Uuid,
+        target: Uuid,
+        child: Uuid,
+        grandchild: Uuid,
+        stray: Uuid,
+        walk: Subtree,
+    }
+
+    fn fixture() -> Fixture {
+        let ids: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
+        let (reader, target, child, grandchild, stray) = (ids[0], ids[1], ids[2], ids[3], ids[4]);
+        Fixture {
+            reader,
+            target,
+            child,
+            grandchild,
+            stray,
+            walk: Subtree {
+                order: vec![child, grandchild],
+                parent: HashMap::from([(child, target), (grandchild, child)]),
+                truncated: false,
+            },
+        }
+    }
+
+    #[test]
+    fn a_record_below_the_target_extends_the_path_by_the_walks_links() {
+        let f = fixture();
+        let to_target = [f.reader, f.target];
+        assert_eq!(
+            record_path(&to_target, f.target, Some(&f.walk), Some(f.target)),
+            vec![f.reader, f.target]
+        );
+        assert_eq!(
+            record_path(&to_target, f.target, Some(&f.walk), Some(f.child)),
+            vec![f.reader, f.target, f.child]
+        );
+        assert_eq!(
+            record_path(&to_target, f.target, Some(&f.walk), Some(f.grandchild)),
+            vec![f.reader, f.target, f.child, f.grandchild]
+        );
+    }
+
+    #[test]
+    fn a_record_at_the_target_is_on_the_targets_path_in_either_mode() {
+        let f = fixture();
+        let to_target = [f.reader, f.target];
+        assert_eq!(
+            record_path(&to_target, f.target, None, Some(f.target)),
+            vec![f.reader, f.target]
+        );
+    }
+
+    #[test]
+    fn a_definition_record_and_a_tenant_the_walk_did_not_reach_are_on_no_path() {
+        // Neither is ever shown to a tenant reader: an empty path holds no
+        // actor tenant. The second cannot come out of the page query, which
+        // lists the walk's tenants only; were it to, the actor is withheld
+        // rather than judged on the target's path.
+        let f = fixture();
+        let to_target = [f.reader, f.target];
+        for (walk, tenant) in [
+            (Some(&f.walk), None),
+            (None, None),
+            (Some(&f.walk), Some(f.stray)),
+            (None, Some(f.child)),
+        ] {
+            let path = record_path(&to_target, f.target, walk, tenant);
+            assert!(path.is_empty(), "{path:?}");
+            assert!(
+                !Reader::Tenant(f.reader).is_shown(Some(f.reader), &path),
+                "an actor at the reader tenant itself is withheld on no path"
+            );
+        }
+    }
+}

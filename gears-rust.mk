@@ -614,13 +614,14 @@ lane_args_cluster-redis = -p cf-redis-cluster-plugin --features integration --re
 lane_args_rg-pg = -p cf-gears-resource-group --features integration
 
 ## The settings-service gear's PostgreSQL suites: the migration chain, the
-## refused category delete and the declaration purge (Docker required; each
+## refused category delete, the declaration purge and the history read over a
+## subtree (Docker required; each
 ## spins up its own postgres container via testcontainers -- see
 ## gears/settings-service/settings-service/tests/pg_*_test.rs). The
 ## suites beside the gear's migrations run on SQLite, where a statement
 ## PostgreSQL refuses can still pass; this lane runs the chain a stand's startup
 ## runs, on the backend it runs it on.
-lane_args_settings-service-pg = -p cf-gears-settings-service --features integration --test pg_migrations_test --test pg_category_delete_test --test pg_declaration_purge_test
+lane_args_settings-service-pg = -p cf-gears-settings-service --features integration --test pg_migrations_test --test pg_category_delete_test --test pg_declaration_purge_test --test pg_audit_history_test
 
 ## The credstore v2 gear's PostgreSQL migration suite (Docker required; spins up
 ## its own postgres container via testcontainers -- see

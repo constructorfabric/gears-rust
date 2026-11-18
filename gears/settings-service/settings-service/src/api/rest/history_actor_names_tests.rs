@@ -18,20 +18,20 @@ use crate::test_support::{RestHarness, TEXT, UnavailableDirectory};
 /// A directory that gives every asked user one name, and records each query as
 /// `(tenant, ids)`. With no name it lists nobody.
 #[derive(Default)]
-struct FakeAm {
+pub(super) struct FakeAm {
     name: Option<String>,
     calls: Mutex<Vec<(Uuid, Vec<Uuid>)>>,
 }
 
 impl FakeAm {
-    fn naming_everyone(name: &str) -> Arc<Self> {
+    pub(super) fn naming_everyone(name: &str) -> Arc<Self> {
         Arc::new(Self {
             name: Some(name.to_owned()),
             ..Self::default()
         })
     }
 
-    fn calls(&self) -> Vec<(Uuid, Vec<Uuid>)> {
+    pub(super) fn calls(&self) -> Vec<(Uuid, Vec<Uuid>)> {
         self.calls.lock().unwrap().clone()
     }
 }
@@ -79,7 +79,7 @@ impl ActorDirectory for FakeAm {
 }
 
 /// The id the harness gives the administrator of `tenant`.
-fn admin_of(tenant: Uuid) -> Uuid {
+pub(super) fn admin_of(tenant: Uuid) -> Uuid {
     Uuid::new_v5(&Uuid::NAMESPACE_OID, tenant.as_bytes())
 }
 

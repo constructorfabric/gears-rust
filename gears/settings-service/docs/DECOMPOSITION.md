@@ -402,7 +402,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
   - The canonical resource id `cf.settings:{key}@{tenant_id}` — the root tenant's id for platform scope — produced by one formatter shared by the write and the history read, so the two cannot drift
   - Writing the record as the last step before commit of the mutation's transaction, through the same `AccessScope`-scoped path as every other write; a failed write rolls the mutation back and rejects it `503`
   - Masking before the record is built: a `secret`-classified value is never written in plaintext, and the actor identity carries its `public`/`pii` classification for the read side to honour
-  - `GET /settings-service/v1/settings/{key}/history` querying `(declaration_key, tenant_id)` on `idx_audit_scoped`, paginated, newest first, with no second masking implementation and no reveal path
+  - `GET /settings-service/v1/settings/{key}/history` querying `(declaration_key, tenant_id)` on `idx_audit_scoped`, paginated, newest first, with no second masking implementation and no reveal path; with `descendants=true` the same read over the target's subtree, walked within the node budget, through `idx_audit_key_recent`, keyset-paginated and not counted
   - `idx_audit_retention` on `retain_until` for pruning; `retain_until` carried on every record from the start, the store's configured default applying when absent
   - Retiring the `TracingAuditEmitter` and closing the audit DoDs 2.1 and 2.2 left open
   - Metrics: `settings_audit_events_total`
@@ -433,7 +433,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
   - GET /settings-service/v1/settings/{key}/history?tenant={tenant_id}
 
 - **Data**:
-  - `audit_records` table with `idx_audit_scoped` and the partial `idx_audit_retention`
+  - `audit_records` table with `idx_audit_scoped`, `idx_audit_key_recent`, and the partial `idx_audit_retention` and `idx_audit_default_horizon`
 
 ### 2.7 Tenant Access Restrictions &mdash; HIGH
 

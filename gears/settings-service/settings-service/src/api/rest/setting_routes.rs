@@ -195,9 +195,21 @@ pub fn register_routes(
         .error_503(openapi)
         .register(router, openapi);
 
-    let router = OperationBuilder::get("/settings-service/v1/settings/{key}/history")
+    let router = register_history(router, openapi);
+
+    router
+        .layer(axum::Extension(resolver))
+        .layer(axum::Extension(db))
+        .layer(axum::Extension(enforcer))
+        .layer(axum::Extension(names))
+}
+
+/// Register the history read: one scope, or a tenant with the tenants below
+/// it.
+fn register_history(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
+    OperationBuilder::get("/settings-service/v1/settings/{key}/history")
         .operation_id("settings_service.get_setting_history")
-        .summary("Read a setting's history at a scope")
+        .summary("Read a setting's history at a scope or across a subtree")
         .description(
             "The mutation history of one setting at one scope, newest first and \
              cursor-paginated, served from the gear's own audit store. `tenant` follows the \
@@ -205,7 +217,19 @@ pub fn register_routes(
              subtree or a standalone descendant answers 403. A `pii` actor, and `pii` values, \
              are masked for a caller without the PII entitlement; a secret was never recorded \
              in plaintext. A retired declaration keeps its history. An empty history is an \
-             empty page. `$filter`, `$orderby` and `$select` are refused.",
+             empty page. `$filter`, `$orderby` and `$select` are refused.\n\n\
+             With `descendants=true` the page holds the records of the target tenant and of \
+             every tenant below it, in one list ordered by `occurred_at` descending and then \
+             `id` descending, with the setting's definition records listed once. A standalone \
+             descendant and everything below it are left out. Every record is masked and its \
+             actor shown or withheld exactly as the single-scope history of the record's own \
+             `tenant_id` does for the same caller. A setting hidden from the caller answers \
+             404; one hidden at a descendant keeps that descendant's records in the list of \
+             a caller it is not hidden from. `page_info.total_count` is not reported in this \
+             mode. A target whose subtree holds more than 5000 tenants answers 400 \
+             `subtree_too_large`. A cursor continues only the listing it was issued by: the \
+             same setting, the same `tenant` and the same `descendants`; any other answers \
+             400.",
         )
         .tag(TAG)
         .authenticated()
@@ -216,14 +240,22 @@ pub fn register_routes(
             false,
             "Target tenant id; omitted, the caller's own tenant",
         )
+        .query_param_typed(
+            "descendants",
+            false,
+            "`true` to list the records of the target tenant and of every tenant below it, \
+             standalone descendants excluded; `false` or omitted, the target tenant's own \
+             scope only",
+            "boolean",
+        )
         .query_param_typed("limit", false, "Page size", "integer")
         .query_param("cursor", false, "Cursor for pagination")
         .handler(handlers::get_history)
         .json_response_with_schema::<crate::api::rest::page_dto::PageDto<AuditRecordDto>>(
             openapi,
             StatusCode::OK,
-            "A page of audit records, newest first, with its pagination cursors and the \
-             total",
+            "A page of audit records, newest first, with its pagination cursors and, \
+             without `descendants=true`, the total",
         )
         .error_400(openapi)
         .error_401(openapi)
@@ -231,11 +263,5 @@ pub fn register_routes(
         .error_404(openapi)
         .error_500(openapi)
         .error_503(openapi)
-        .register(router, openapi);
-
-    router
-        .layer(axum::Extension(resolver))
-        .layer(axum::Extension(db))
-        .layer(axum::Extension(enforcer))
-        .layer(axum::Extension(names))
+        .register(router, openapi)
 }
