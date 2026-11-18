@@ -2,7 +2,9 @@
 
 use serde_json::json;
 
-use super::{FieldViolation, MalformedTrait, TraitSet, ValidationResult};
+use super::{
+    FieldViolation, MalformedTrait, TraitSet, ValidationResult, is_gear_type_outside_catalogue,
+};
 use crate::domain::error::DomainError;
 use crate::field;
 
@@ -143,4 +145,25 @@ fn a_well_formed_trait_beside_an_absent_one_reads_as_before() {
     assert!(!traits.regex, "absent is false");
     assert_eq!(traits.cron_dialect.as_deref(), Some("standard"));
     assert_eq!(traits.entity_reference, None, "absent is None");
+}
+
+#[test]
+fn only_the_catalogue_is_a_value_type_among_the_gears_own_types() {
+    for id in [
+        "gts.cf.core.settings.setting_type.v1~",
+        "gts.cf.core.settings.setting_type.v1~acme.settings.network.proxy.v1~",
+        "gts.cf.core.settings.declaration.v1~",
+        "gts.cf.core.settings.typed.v1~",
+    ] {
+        assert!(is_gear_type_outside_catalogue(id), "{id}");
+    }
+    for id in [
+        "gts.cf.core.settings.type_bool_flag.v1~",
+        "gts.cf.core.settings.type_plain_text.v1~acme.demo.values.short_text.v1~",
+        "gts.acme.demo.values.retry_policy.v1~",
+        // Another gear's namespace that merely begins the same way.
+        "gts.cf.core.settings_demo.setting_type.v1~",
+    ] {
+        assert!(!is_gear_type_outside_catalogue(id), "{id}");
+    }
 }

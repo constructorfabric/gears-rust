@@ -228,9 +228,83 @@ impl TraitSet {
     }
 }
 
+/// The namespace this gear registers its own types under: the value-type
+/// catalogue, the abstract base every setting key derives from — and so every
+/// declared setting — and the gear's resource types.
+fn gear_namespace() -> String {
+    format!("{}cf.core.settings.", toolkit_gts::GTS_ID_PREFIX)
+}
+
+/// Whether `type_id` is one of this gear's own types that is not a value
+/// type: under the gear's namespace, and outside the catalogue prefix
+/// `type_`. The setting base and every setting key are such ids; a catalogue
+/// type, a type derived from one, and any type of another namespace are not.
+///
+/// Decided on the identifier alone, so the answer needs no registry.
+#[must_use]
+pub(crate) fn is_gear_type_outside_catalogue(type_id: &str) -> bool {
+    type_id.starts_with(&gear_namespace())
+        && !type_id.starts_with(&settings_service_sdk::catalogue::value_type_prefix())
+}
+
+/// Why a named type cannot be the value type of a declaration.
+///
+/// A refusal is an answer about the type, never a failure of the lookup: the
+/// port returns it beside its error, so a caller tells the three apart by
+/// variant. Each carries the detail the caller is shown. On the REST surface
+/// a refusal is a validation fault of `value_type_id` (the `From` below); the
+/// contribution reconciler refuses the one item that named the type.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValueTypeRefusal {
+    /// A type that describes no value: one of this gear's own types outside
+    /// the catalogue (see `is_gear_type_outside_catalogue`), or a type whose
+    /// own schema is marked `x-gts-abstract`.
+    NotAValueType(String),
+    /// No type is registered under the id.
+    Unknown(String),
+    /// The type is registered, but its schema does not build into a
+    /// validator, so no value of it could be checked.
+    Unsupported(String),
+}
+
+impl From<ValueTypeRefusal> for DomainError {
+    fn from(refusal: ValueTypeRefusal) -> Self {
+        let (code, message) = match refusal {
+            ValueTypeRefusal::NotAValueType(message) => (crate::field::NOT_A_VALUE_TYPE, message),
+            ValueTypeRefusal::Unknown(message) => (crate::field::VALUE_TYPE_UNKNOWN, message),
+            ValueTypeRefusal::Unsupported(message) => {
+                (crate::field::VALUE_TYPE_UNSUPPORTED, message)
+            }
+        };
+        Self::Validation {
+            field: "value_type_id".to_owned(),
+            code,
+            message,
+        }
+    }
+}
+
 /// Validation of values against GTS types, and resolution of a type's traits.
 #[async_trait]
 pub trait TypeValidator: Send + Sync {
+    /// Whether `value_type_id` names a value type — a type a declaration may
+    /// take the shape of its values from. Asked wherever a declaration is
+    /// accepted, before its traits are resolved or its default is validated.
+    ///
+    /// A value type is a catalogue type, or one a module registered in its
+    /// own namespace. `Ok(Err(_))` says why the named type is not one (see
+    /// [`ValueTypeRefusal`]); `Ok(Ok(()))` that it is.
+    ///
+    /// # Errors
+    /// [`DomainError::Unavailable`] when the registry cannot be reached;
+    /// [`DomainError::Internal`] when the registry holds the type and cannot
+    /// build it — a parent it no longer has, a stored schema it refuses.
+    async fn ensure_value_type(
+        &self,
+        value_type_id: &str,
+    ) -> Result<Result<(), ValueTypeRefusal>, DomainError>;
+
     /// Validate `value` against the type `value_type_id` names.
     ///
     /// Every rule is a hard check, and every fault of the rules that ran is

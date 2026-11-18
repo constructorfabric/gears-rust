@@ -3084,7 +3084,7 @@
             "type": "string"
           },
           "value_type_id": {
-            "description": "The value type the default and every override validate against: one of\nthe catalogue under `gts.cf.core.settings.type_*~`, or a registered\nmodule-owned one.",
+            "description": "The value type the default and every override validate against: one of\nthe catalogue under `gts.cf.core.settings.type_*~`, or a registered\nmodule-owned one. Any other type under `gts.cf.core.settings.` — the\nsetting base, a declared setting's key — and any abstract type is not\na value type and is refused `400` with the code `not_a_value_type`.",
             "type": "string"
           },
           "vendor": {

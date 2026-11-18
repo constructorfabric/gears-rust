@@ -39,7 +39,9 @@ use cf_gears_settings_service::domain::resolution::EffectiveCache;
 use cf_gears_settings_service::domain::stepup::{
     StepUpRefusal, StepUpRequirement, StepUpSubject, StepUpVerifier, USER_SUBJECT_TYPE,
 };
-use cf_gears_settings_service::domain::validation::{TraitSet, TypeValidator, ValidationResult};
+use cf_gears_settings_service::domain::validation::{
+    TraitSet, TypeValidator, ValidationResult, ValueTypeRefusal,
+};
 use cf_gears_settings_service::domain::writes::WriteActor;
 use cf_gears_settings_service::infra::storage::category_repo::CategoryRepo;
 use cf_gears_settings_service::infra::storage::declaration_repo::DeclarationRepo;
@@ -126,6 +128,13 @@ struct PlainValidator;
 
 #[async_trait]
 impl TypeValidator for PlainValidator {
+    async fn ensure_value_type(
+        &self,
+        _value_type_id: &str,
+    ) -> Result<Result<(), ValueTypeRefusal>, DomainError> {
+        Ok(Ok(()))
+    }
+
     async fn validate_value(
         &self,
         _value_type_id: &str,

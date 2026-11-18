@@ -28,8 +28,8 @@ use crate::infra::storage::pending_secret_repo::PendingSecretRepo;
 use crate::infra::storage::value_repo::ValueRepo;
 use crate::infra::type_validator::GtsTypeValidator;
 use crate::test_support::{
-    BOOL, FixedStepUp, RecordingAudit, RecordingRegistrar, RecordingSecrets, RecordingWriteMetrics,
-    ResolutionHarness, SECRET, TEXT, resolution_catalogue,
+    BOOL, DECLARED_SETTING, FixedStepUp, MODULE_TYPE, RecordingAudit, RecordingRegistrar,
+    RecordingSecrets, RecordingWriteMetrics, ResolutionHarness, SECRET, TEXT, resolution_catalogue,
 };
 
 type Admin = DeclarationAdmin<
@@ -63,6 +63,17 @@ impl Harness {
     }
 
     async fn with_step_up(step_up: Arc<dyn StepUpVerifier>) -> Self {
+        Self::with_validator(
+            step_up,
+            Arc::new(GtsTypeValidator::new(resolution_catalogue())),
+        )
+        .await
+    }
+
+    async fn with_validator(
+        step_up: Arc<dyn StepUpVerifier>,
+        validator: Arc<dyn crate::domain::validation::TypeValidator>,
+    ) -> Self {
         let base = ResolutionHarness::new().await;
         let audit = Arc::new(RecordingAudit::default());
         let registrar = Arc::new(RecordingRegistrar::default());
@@ -72,7 +83,7 @@ impl Harness {
             DeclarationRepo,
             CategoryRepo,
             ValueRepo,
-            Arc::new(GtsTypeValidator::new(resolution_catalogue())),
+            validator,
             Arc::clone(&registrar) as Arc<dyn crate::domain::contribution::SettingTypeRegistrar>,
             step_up,
             Arc::clone(&audit),
@@ -1383,6 +1394,211 @@ async fn a_secret_placeholder_must_be_an_instance_of_the_type_as_well_as_empty()
         .expect("the empty string is both empty and a string");
 }
 
+// ── A value type that is not one ─────────────────────────────────────────────
+
+fn assert_not_a_value_type(err: DomainError, what: &str) {
+    match err {
+        DomainError::Validation { field, code, .. } => {
+            assert_eq!(field, "value_type_id", "{what}");
+            assert_eq!(code, crate::field::NOT_A_VALUE_TYPE, "{what}");
+        }
+        other => panic!("{what}: expected the value-type refusal, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_value_type_id_that_is_no_type_id_is_refused_as_an_unknown_type() {
+    // Over the registry's own test client, which refuses such an id as an
+    // invalid argument: the create answers for the declaration's mistake,
+    // not as if the registry were down.
+    let h = Harness::with_validator(
+        Arc::new(FixedStepUp::verified()),
+        Arc::new(GtsTypeValidator::new(crate::test_support::registry_client())),
+    )
+    .await;
+    for id in crate::test_support::NOT_TYPE_IDS {
+        let mut request = h.request("retry_policy");
+        request.value_type_id = id.to_owned();
+        match h.create(request, &admin_actor()).await {
+            Err(DomainError::Validation { field, code, .. }) => {
+                assert_eq!(field, "value_type_id", "{id}");
+                assert_eq!(code, crate::field::VALUE_TYPE_UNKNOWN, "{id}");
+            }
+            other => panic!("{id}: expected the refusal, got {other:?}"),
+        }
+    }
+    assert!(h.registrar.registered.lock().expect("lock").is_empty());
+    assert!(h.audit.records().is_empty(), "nothing audited");
+}
+
+#[tokio::test]
+async fn a_value_type_whose_schema_does_not_build_is_refused_before_its_default_is_validated() {
+    use crate::test_support::{REFERRING_TYPE, referring_type_schema};
+    let h = Harness::with_validator(
+        Arc::new(FixedStepUp::verified()),
+        Arc::new(GtsTypeValidator::new(
+            resolution_catalogue().with_type(REFERRING_TYPE, referring_type_schema()),
+        )),
+    )
+    .await;
+    let mut request = h.request("retry_policy");
+    request.value_type_id = REFERRING_TYPE.to_owned();
+    request.default_value = json!({ "inner": 3 });
+    match h.create(request, &admin_actor()).await {
+        Err(DomainError::Validation { field, code, .. }) => {
+            assert_eq!(field, "value_type_id");
+            assert_eq!(code, crate::field::VALUE_TYPE_UNSUPPORTED);
+        }
+        other => panic!("expected the refusal, got {other:?}"),
+    }
+    assert!(h.registrar.registered.lock().expect("lock").is_empty());
+    assert!(h.audit.records().is_empty(), "nothing audited");
+}
+
+/// The ids the registry knows that are not value types, each with a
+/// default the type itself would not turn away.
+fn requests_naming_no_value_type(
+    h: &Harness,
+    name: &str,
+) -> Vec<(&'static str, CreateDeclaration)> {
+    let mut declared = h.request(name);
+    declared.value_type_id = DECLARED_SETTING.to_owned();
+    declared.default_value = json!(true);
+    let mut base = h.request(name);
+    base.value_type_id = settings_service_sdk::gts::SETTING_TYPE_BASE.to_owned();
+    base.default_value = json!({ "payload": true });
+    vec![
+        ("a declared setting", declared),
+        ("the abstract base", base),
+    ]
+}
+
+/// An admin-authored row whose value type is the abstract base, written
+/// straight to the store: what a create admitted before the check existed.
+async fn stored_with_the_base_as_its_type(h: &Harness, name: &str) -> Uuid {
+    let key = SettingKey::compose("acme", "network", name).expect("admin key");
+    let conn = h.base.db.conn().expect("connection");
+    DeclarationRepo
+        .insert(
+            &conn,
+            &AccessScope::allow_all(),
+            DeclarationDraft {
+                key: key.to_string(),
+                leaf_slug: name.to_owned(),
+                value_type_id: settings_service_sdk::gts::SETTING_TYPE_BASE.to_owned(),
+                category_id: h.base.category_id(),
+                default_value: json!({ "payload": true }),
+                scope_class: "cascading".to_owned(),
+                mode: "standard".to_owned(),
+                requires_step_up: true,
+                anonymous_exposable: false,
+                domain_affinity: None,
+                has_secret_trait: false,
+                data_classification: "public".to_owned(),
+                source: "admin_authored".to_owned(),
+                owner_module: None,
+                licence_feature: None,
+                display_name: None,
+                description: Some("a demo setting".to_owned()),
+                created_by: "admin".to_owned(),
+            },
+        )
+        .await
+        .expect("stored")
+        .id
+}
+
+#[tokio::test]
+async fn a_create_naming_a_setting_or_the_abstract_base_as_its_value_type_is_refused() {
+    let h = Harness::verified().await;
+    for (what, request) in requests_naming_no_value_type(&h, "retry_policy") {
+        let err = h.create(request, &admin_actor()).await.expect_err(what);
+        assert_not_a_value_type(err, what);
+    }
+    assert_eq!(
+        h.versions_of(
+            "gts.cf.core.settings.setting_type.v1~acme.settings.network.retry_policy.v1~"
+        )
+        .await,
+        0,
+        "no row"
+    );
+    assert!(
+        h.registrar.registered.lock().expect("lock").is_empty(),
+        "no setting type registered"
+    );
+    assert!(h.audit.records().is_empty(), "nothing audited");
+}
+
+#[tokio::test]
+async fn a_create_with_a_modules_own_value_type_is_accepted() {
+    let h = Harness::verified().await;
+    let mut request = h.request("retry_limit");
+    request.value_type_id = MODULE_TYPE.to_owned();
+    request.default_value = json!(3);
+    let created = h.create(request, &admin_actor()).await.expect("created");
+    assert_eq!(created.declaration.value_type_id, MODULE_TYPE);
+    assert_eq!(created.declaration.status, DeclarationStatus::Active);
+}
+
+#[tokio::test]
+async fn a_revive_of_a_row_stored_with_a_non_value_type_is_refused_and_the_row_stays_retired() {
+    // The request repeats the stored type, so nothing a revive may not change
+    // is changed: the refusal is the type's own.
+    let h = Harness::verified().await;
+    let id = stored_with_the_base_as_its_type(&h, "retry_policy").await;
+    h.base.retire(id).await;
+
+    let (_, request) = requests_naming_no_value_type(&h, "retry_policy").remove(1);
+    let err = h
+        .create(request.clone(), &admin_actor())
+        .await
+        .expect_err("revive");
+    assert_not_a_value_type(err, "revive");
+    assert_eq!(h.load(id).await.status, DeclarationStatus::Retired);
+    assert!(h.registrar.registered.lock().expect("lock").is_empty());
+    assert!(h.audit.records().is_empty(), "nothing audited");
+
+    // The revival report runs the create's checks and answers the same.
+    let conn = h.base.db.conn().expect("connection");
+    let scope = AccessScope::allow_all();
+    let plan = h
+        .admin
+        .plan_revival(&conn, &scope, &request, &OpenGate)
+        .await
+        .expect("a retired declaration sits at the key");
+    let err = h
+        .admin
+        .revival_report(&conn, &scope, plan, &request, 10, || async {
+            Ok(super::Walk {
+                tenants: Vec::new(),
+                truncated: false,
+            })
+        })
+        .await
+        .expect_err("report");
+    assert_not_a_value_type(err, "revival report");
+}
+
+#[tokio::test]
+async fn an_evolution_to_a_non_value_type_is_refused_and_the_active_major_is_untouched() {
+    let h = Harness::verified().await;
+    let v1 = h
+        .create(h.request("retry_policy"), &admin_actor())
+        .await
+        .expect("created")
+        .declaration;
+    let audited = h.audit.records().len();
+
+    for (what, request) in requests_naming_no_value_type(&h, "retry_policy") {
+        let err = h.create(request, &admin_actor()).await.expect_err(what);
+        assert_not_a_value_type(err, what);
+    }
+    assert_eq!(h.load(v1.id).await.status, DeclarationStatus::Active);
+    assert_eq!(h.versions_of(&v1.key).await, 1, "no successor");
+    assert_eq!(h.audit.records().len(), audited, "nothing audited");
+}
+
 // ── Evolve by re-declaring ───────────────────────────────────────────────────
 
 impl Harness {
@@ -2102,6 +2318,13 @@ struct FailsOnOneValue {
 
 #[async_trait::async_trait]
 impl crate::domain::validation::TypeValidator for FailsOnOneValue {
+    async fn ensure_value_type(
+        &self,
+        value_type_id: &str,
+    ) -> Result<Result<(), crate::domain::validation::ValueTypeRefusal>, DomainError> {
+        self.inner.ensure_value_type(value_type_id).await
+    }
+
     async fn validate_value(
         &self,
         value_type_id: &str,
@@ -2285,6 +2508,13 @@ struct CountingValidator {
 
 #[async_trait::async_trait]
 impl crate::domain::validation::TypeValidator for CountingValidator {
+    async fn ensure_value_type(
+        &self,
+        value_type_id: &str,
+    ) -> Result<Result<(), crate::domain::validation::ValueTypeRefusal>, DomainError> {
+        self.inner.ensure_value_type(value_type_id).await
+    }
+
     async fn validate_value(
         &self,
         value_type_id: &str,

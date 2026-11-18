@@ -1,12 +1,25 @@
 //! Tests for the registry-backed Type Validator, against a hand-built source.
 
-use serde_json::json;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use serde_json::{Value, json};
+use toolkit_canonical_errors::CanonicalError;
+use types_registry_sdk::{
+    GtsInstance, GtsTypeSchema, InstanceQuery, RegisterResult, TypeSchemaQuery,
+    TypesRegistryClient, testing,
+};
+use uuid::Uuid;
 
 use super::GtsTypeValidator;
 use crate::domain::error::DomainError;
-use crate::domain::validation::TypeValidator;
+use crate::domain::validation::{TypeValidator, ValueTypeRefusal};
 use crate::field;
-use crate::test_support::FakeSource;
+use crate::test_support::{
+    BOOL, DECLARED_SETTING, FakeSource, MODULE_TYPE, NOT_TYPE_IDS, REFERRING_TYPE, TEXT,
+    referring_type_schema, registry_client, resolution_catalogue,
+};
+use settings_service_sdk::gts::SETTING_TYPE_BASE;
 
 const PORT_TYPE: &str = "gts.cf.core.settings.type_port.v1~";
 const IP_TYPE: &str = "gts.cf.core.settings.type_ipv4.v1~";
@@ -721,4 +734,449 @@ async fn dynamic_enum_members_are_resolved_in_one_lookup_whatever_their_number()
         1,
         "fifty leaves, one lookup"
     );
+}
+
+// ── A type that is not a value type ──────────────────────────────────────────
+
+#[tokio::test]
+async fn a_declared_setting_named_as_a_type_does_not_compile_into_a_validator() {
+    // What a declaration naming a setting key as its value type ran into
+    // before the value-type check stood in front: the setting's own type
+    // narrows `payload` by a `gts://` reference to its value type, the
+    // effective schema inlines the parent chain and nothing else, and a
+    // reference left unresolved does not build. The port reports that as an
+    // internal fault — a `500` on the wire.
+    let v = GtsTypeValidator::new(resolution_catalogue());
+    assert!(
+        v.resolve_traits(DECLARED_SETTING).await.is_ok(),
+        "the traits resolve: nothing refuses the id before the schema is compiled"
+    );
+    match v.validate_value(DECLARED_SETTING, &json!(true)).await {
+        Err(DomainError::Internal { diagnostic }) => {
+            assert!(
+                diagnostic.contains("is not a valid JSON Schema"),
+                "{diagnostic}"
+            );
+        }
+        other => panic!("expected the internal fault, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_abstract_base_named_as_a_type_validates_any_object_with_a_payload() {
+    // The other half: the base constrains nothing but the presence of
+    // `payload`, so as a value type it accepts a default of that shape, and
+    // only the value-type check keeps a declaration from adopting it.
+    let v = GtsTypeValidator::new(resolution_catalogue());
+    let result = v
+        .validate_value(SETTING_TYPE_BASE, &json!({ "payload": 1 }))
+        .await
+        .expect("validated");
+    assert!(result.is_accepted(), "{result:?}");
+}
+
+/// What the port answered about a type, a failure of the lookup being the
+/// test's to fail on.
+async fn judged<S: super::SchemaSource>(
+    v: &GtsTypeValidator<S>,
+    id: &str,
+) -> Result<(), ValueTypeRefusal> {
+    v.ensure_value_type(id)
+        .await
+        .unwrap_or_else(|err| panic!("{id}: the lookup failed: {err:?}"))
+}
+
+fn refused_as_not_a_value_type(outcome: &Result<(), ValueTypeRefusal>, what: &str) {
+    assert!(
+        matches!(outcome, Err(ValueTypeRefusal::NotAValueType(_))),
+        "{what}: expected the refusal, got {outcome:?}"
+    );
+}
+
+#[test]
+fn a_refusal_reads_on_the_rest_surface_as_a_fault_of_value_type_id_under_its_own_code() {
+    // The one place a refusal becomes the validation fault a client is
+    // shown: the field is the same for all three, the code tells them apart.
+    for (refusal, code) in [
+        (
+            ValueTypeRefusal::NotAValueType("not one".to_owned()),
+            field::NOT_A_VALUE_TYPE,
+        ),
+        (
+            ValueTypeRefusal::Unknown("not registered".to_owned()),
+            field::VALUE_TYPE_UNKNOWN,
+        ),
+        (
+            ValueTypeRefusal::Unsupported("does not build".to_owned()),
+            field::VALUE_TYPE_UNSUPPORTED,
+        ),
+    ] {
+        let detail = match &refusal {
+            ValueTypeRefusal::NotAValueType(m)
+            | ValueTypeRefusal::Unknown(m)
+            | ValueTypeRefusal::Unsupported(m) => m.clone(),
+        };
+        match DomainError::from(refusal) {
+            DomainError::Validation {
+                field,
+                code: got,
+                message,
+            } => {
+                assert_eq!(field, "value_type_id");
+                assert_eq!(got, code);
+                assert_eq!(message, detail);
+            }
+            other => panic!("expected a validation fault, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_type_of_the_gears_namespace_outside_the_catalogue_is_not_a_value_type() {
+    // The setting base, a declared setting and a resource type of the gear:
+    // refused on the identifier, registered or not, without asking the
+    // registry.
+    let v = GtsTypeValidator::new(resolution_catalogue());
+    for id in [
+        SETTING_TYPE_BASE,
+        DECLARED_SETTING,
+        "gts.cf.core.settings.setting_type.v1~acme.settings.network.never_declared.v1~",
+        "gts.cf.core.settings.declaration.v1~",
+    ] {
+        refused_as_not_a_value_type(&judged(&v, id).await, id);
+    }
+    assert_eq!(
+        v.source()
+            .schema_lookups
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the identifier decides"
+    );
+}
+
+#[tokio::test]
+async fn an_abstract_type_of_any_namespace_is_not_a_value_type() {
+    const ENVELOPE: &str = "gts.acme.demo.values.envelope.v1~";
+    const CONCRETE: &str = "gts.acme.demo.values.envelope.v1~acme.demo.values.retry.v1~";
+    let source = resolution_catalogue()
+        .with_type(
+            ENVELOPE,
+            json!({
+                "$id": format!("gts://{ENVELOPE}"),
+                "type": "object",
+                "x-gts-abstract": true
+            }),
+        )
+        .with_derived_type(
+            CONCRETE,
+            json!({
+                "$id": format!("gts://{CONCRETE}"),
+                "allOf": [{ "$ref": format!("gts://{ENVELOPE}") }],
+                "properties": { "attempts": { "type": "integer" } }
+            }),
+        );
+    let v = GtsTypeValidator::new(source);
+    refused_as_not_a_value_type(&judged(&v, ENVELOPE).await, ENVELOPE);
+    // The keyword marks the type that carries it: a concrete type derived
+    // from an abstract one is a value type.
+    judged(&v, CONCRETE).await.expect("a concrete derived type");
+}
+
+#[tokio::test]
+async fn a_catalogue_type_a_type_derived_from_one_and_a_module_type_are_value_types() {
+    const SHORT_TEXT: &str =
+        "gts.cf.core.settings.type_plain_text.v1~acme.demo.values.short_text.v1~";
+    let source = resolution_catalogue().with_derived_type(
+        SHORT_TEXT,
+        json!({
+            "$id": format!("gts://{SHORT_TEXT}"),
+            "allOf": [{ "$ref": format!("gts://{TEXT}") }],
+            "maxLength": 16
+        }),
+    );
+    let v = GtsTypeValidator::new(source);
+    for id in [BOOL, SHORT_TEXT, MODULE_TYPE] {
+        judged(&v, id)
+            .await
+            .unwrap_or_else(|refusal| panic!("{id}: {refusal:?}"));
+    }
+}
+
+#[tokio::test]
+async fn an_unregistered_or_unreachable_type_is_never_taken_for_a_value_type() {
+    let v = GtsTypeValidator::new(resolution_catalogue());
+    for id in [
+        "gts.cf.core.settings.type_missing.v1~",
+        "gts.acme.demo.values.missing.v1~",
+    ] {
+        let outcome = judged(&v, id).await;
+        assert!(
+            matches!(outcome, Err(ValueTypeRefusal::Unknown(_))),
+            "{id}: {outcome:?}"
+        );
+    }
+    let down = GtsTypeValidator::new(FakeSource {
+        unavailable: true,
+        ..resolution_catalogue()
+    });
+    assert!(matches!(
+        down.ensure_value_type(BOOL).await,
+        Err(DomainError::Unavailable { .. })
+    ));
+}
+
+#[tokio::test]
+async fn an_id_that_is_no_type_id_is_an_unknown_type_and_the_registry_is_not_asked() {
+    // A bare word, an instance id, a text with the trailing `~` that is no
+    // GTS id: nothing is registered under such an id, and the registry would
+    // refuse it as an argument. To a declaration that is the same fact as an
+    // absent type, so the adapter answers it itself — over a registry that
+    // fails every call, the answer is still "unknown", never the failure.
+    let refusing: Arc<dyn TypesRegistryClient> = Arc::new(RefusingRegistry {
+        error: testing::internal("the registry must not be asked"),
+    });
+    let v = GtsTypeValidator::new(refusing);
+    for id in NOT_TYPE_IDS.into_iter().chain(["not a gts id~"]) {
+        let outcome = judged(&v, id).await;
+        assert!(
+            matches!(outcome, Err(ValueTypeRefusal::Unknown(_))),
+            "{id}: {outcome:?}"
+        );
+    }
+
+    // And over the registry's own test client the three ports agree.
+    let v = GtsTypeValidator::new(registry_client());
+    for id in NOT_TYPE_IDS {
+        let outcome = judged(&v, id).await;
+        assert!(
+            matches!(outcome, Err(ValueTypeRefusal::Unknown(_))),
+            "{id}: {outcome:?}"
+        );
+        match v.resolve_traits(id).await {
+            Err(DomainError::Validation { code, .. }) => {
+                assert_eq!(code, field::VALUE_TYPE_UNKNOWN, "{id}");
+            }
+            other => panic!("{id}: {other:?}"),
+        }
+        let result = v.validate_value(id, &json!(true)).await.expect("judged");
+        assert_eq!(codes(&result), vec![field::VALUE_TYPE_UNKNOWN], "{id}");
+    }
+    judged(&v, BOOL)
+        .await
+        .expect("the registered type is still one");
+}
+
+/// A types registry whose `get_type_schema` answers every id with one error.
+/// The adapter's type lookup calls nothing else.
+struct RefusingRegistry {
+    error: CanonicalError,
+}
+
+#[async_trait::async_trait]
+impl TypesRegistryClient for RefusingRegistry {
+    async fn get_type_schema(&self, _type_id: &str) -> Result<GtsTypeSchema, CanonicalError> {
+        Err(self.error.clone())
+    }
+
+    async fn register(&self, _entities: Vec<Value>) -> Result<Vec<RegisterResult>, CanonicalError> {
+        unreachable!("the type lookup registers nothing")
+    }
+    async fn register_type_schemas(
+        &self,
+        _type_schemas: Vec<Value>,
+    ) -> Result<Vec<RegisterResult>, CanonicalError> {
+        unreachable!("the type lookup registers nothing")
+    }
+    async fn get_type_schema_by_uuid(
+        &self,
+        _type_uuid: Uuid,
+    ) -> Result<GtsTypeSchema, CanonicalError> {
+        unreachable!("the type lookup reads by id")
+    }
+    async fn get_type_schemas(
+        &self,
+        _type_ids: Vec<String>,
+    ) -> HashMap<String, Result<GtsTypeSchema, CanonicalError>> {
+        unreachable!("the type lookup reads one type")
+    }
+    async fn get_type_schemas_by_uuid(
+        &self,
+        _type_uuids: Vec<Uuid>,
+    ) -> HashMap<Uuid, Result<GtsTypeSchema, CanonicalError>> {
+        unreachable!("the type lookup reads by id")
+    }
+    async fn list_type_schemas(
+        &self,
+        _query: TypeSchemaQuery,
+    ) -> Result<Vec<GtsTypeSchema>, CanonicalError> {
+        unreachable!("the type lookup lists nothing")
+    }
+    async fn register_instances(
+        &self,
+        _instances: Vec<Value>,
+    ) -> Result<Vec<RegisterResult>, CanonicalError> {
+        unreachable!("the type lookup registers nothing")
+    }
+    async fn get_instance(&self, _id: &str) -> Result<GtsInstance, CanonicalError> {
+        unreachable!("the type lookup reads no instance")
+    }
+    async fn get_instance_by_uuid(&self, _uuid: Uuid) -> Result<GtsInstance, CanonicalError> {
+        unreachable!("the type lookup reads no instance")
+    }
+    async fn get_instances(
+        &self,
+        _ids: Vec<String>,
+    ) -> HashMap<String, Result<GtsInstance, CanonicalError>> {
+        unreachable!("the type lookup reads no instance")
+    }
+    async fn get_instances_by_uuid(
+        &self,
+        _uuids: Vec<Uuid>,
+    ) -> HashMap<Uuid, Result<GtsInstance, CanonicalError>> {
+        unreachable!("the type lookup reads no instance")
+    }
+    async fn list_instances(
+        &self,
+        _query: InstanceQuery,
+    ) -> Result<Vec<GtsInstance>, CanonicalError> {
+        unreachable!("the type lookup lists nothing")
+    }
+}
+
+#[tokio::test]
+async fn a_registered_type_the_registry_cannot_build_is_a_fault_not_an_unknown_type() {
+    // The registry answers a type id with a refusal of the argument when it
+    // holds the type and cannot build it: its parent is gone, or the stored
+    // schema is one it does not accept. Read as "unknown", that would tell
+    // an administrator to register a type that is registered. It is a fault
+    // of the registered data, carried with the registry's own words — on
+    // every port, and never as a refusal of the declaration.
+    let broken: Arc<dyn TypesRegistryClient> = Arc::new(RefusingRegistry {
+        error: testing::invalid_gts_id(format!(
+            "type-schema {MODULE_TYPE} references missing parent gts.acme.demo.values.base.v1~"
+        )),
+    });
+    let v = GtsTypeValidator::new(broken);
+    let faults = [
+        v.ensure_value_type(MODULE_TYPE).await.map(|_| ()),
+        v.resolve_traits(MODULE_TYPE).await.map(|_| ()),
+        v.validate_value(MODULE_TYPE, &json!(3)).await.map(|_| ()),
+    ];
+    for fault in faults {
+        match fault {
+            Err(DomainError::Internal { diagnostic }) => {
+                assert!(diagnostic.contains(MODULE_TYPE), "{diagnostic}");
+                assert!(
+                    diagnostic.contains("references missing parent"),
+                    "the registry's reason is kept: {diagnostic}"
+                );
+            }
+            other => panic!("expected the internal fault, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_type_whose_schema_refers_outside_its_parent_chain_is_refused_as_unsupported() {
+    // A module's concrete type that takes a property's shape from another
+    // type by `gts://`. The effective schema keeps the reference, which does
+    // not build: the declaration is told so, on the type it named.
+    let v = GtsTypeValidator::new(
+        resolution_catalogue().with_type(REFERRING_TYPE, referring_type_schema()),
+    );
+    match judged(&v, REFERRING_TYPE).await {
+        Err(ValueTypeRefusal::Unsupported(message)) => {
+            assert!(message.contains(REFERRING_TYPE), "{message}");
+            // The builder's own reason is in the refusal: here, the
+            // reference it could not follow.
+            assert!(
+                message.contains(&format!("gts://{MODULE_TYPE}")),
+                "the refusal names what did not build: {message}"
+            );
+        }
+        other => panic!("expected the refusal, got {other:?}"),
+    }
+    // A value of a row already stored with such a type is not re-labelled:
+    // validating it is the internal fault it was.
+    assert!(matches!(
+        v.validate_value(REFERRING_TYPE, &json!({ "inner": 3 }))
+            .await,
+        Err(DomainError::Internal { .. })
+    ));
+}
+
+#[tokio::test]
+async fn an_id_longer_than_any_gts_id_is_refused_without_being_repeated() {
+    // A multi-kilobyte id, in the gear's namespace and outside it: both are
+    // refused as unknown types in a refusal of fixed length that does not
+    // repeat what was sent, and the registry is not asked.
+    let v = GtsTypeValidator::new(resolution_catalogue());
+    let filler = "z".repeat(8 * 1024);
+    for id in [
+        format!("gts.cf.core.settings.{filler}.v1~"),
+        format!("gts.acme.demo.values.{filler}.v1~"),
+    ] {
+        match judged(&v, &id).await {
+            Err(ValueTypeRefusal::Unknown(message)) => {
+                assert!(message.len() < 200, "a bounded refusal: {message}");
+                assert!(!message.contains(&filler[..64]), "{message}");
+                assert!(message.contains(&id.len().to_string()), "{message}");
+            }
+            other => panic!("expected an unknown type, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        v.source()
+            .schema_lookups
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the length decides"
+    );
+
+    // At the bound the id is judged, and repeated, as any other.
+    let at_bound = format!(
+        "gts.acme.demo.values.{}.v1~",
+        "z".repeat(gts::GTS_ID_MAX_LENGTH - "gts.acme.demo.values..v1~".len())
+    );
+    assert_eq!(at_bound.len(), gts::GTS_ID_MAX_LENGTH);
+    match judged(&v, &at_bound).await {
+        Err(ValueTypeRefusal::Unknown(message)) => {
+            assert!(message.contains(&at_bound), "{message}");
+        }
+        other => panic!("expected an unknown type, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_unsupported_refusal_repeats_at_most_the_bound_of_the_builders_reason() {
+    // A reference long enough that the builder's reason, which quotes it,
+    // runs past the bound: the refusal carries the bound's worth of it and
+    // no more.
+    const LONG_REF_TYPE: &str = "gts.acme.demo.values.long_wrapper.v1~";
+    let target = format!("gts://gts.acme.demo.values.{}.v1~", "z".repeat(2_000));
+    let v = GtsTypeValidator::new(resolution_catalogue().with_type(
+        LONG_REF_TYPE,
+        json!({
+            "$id": format!("gts://{LONG_REF_TYPE}"),
+            "type": "object",
+            "properties": { "inner": { "$ref": target } }
+        }),
+    ));
+    match judged(&v, LONG_REF_TYPE).await {
+        Err(ValueTypeRefusal::Unsupported(message)) => {
+            let (_, after) = message
+                .split_once("could be checked: ")
+                .unwrap_or_else(|| panic!("the reason's lead-in: {message}"));
+            let (reason, _) = after
+                .split_once(" (a schema that refers")
+                .unwrap_or_else(|| panic!("the reason's end: {message}"));
+            assert_eq!(
+                reason.chars().count(),
+                super::BUILD_REASON_MAX_CHARS,
+                "the reason is cut at the bound: {reason}"
+            );
+            assert!(!message.contains(&target), "{message}");
+        }
+        other => panic!("expected the refusal, got {other:?}"),
+    }
 }

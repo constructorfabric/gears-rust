@@ -23,7 +23,7 @@ use crate::domain::declaration::{
     Declaration, DeclarationDraft, DeclarationMetadata, DeclarationRepository, DeclarationStatus,
 };
 use crate::domain::error::DomainError;
-use crate::domain::validation::TypeValidator;
+use crate::domain::validation::{TypeValidator, ValueTypeRefusal};
 use crate::domain::value::{ValueDraft, ValueRepository};
 
 /// What one declaration's reconcile did.
@@ -72,6 +72,16 @@ fn refused(code: &'static str, message: impl Into<String>) -> ItemError {
     ItemError::Refused {
         code,
         message: message.into(),
+    }
+}
+
+/// The refusal of an item whose value type is not one, under the reason the
+/// reconcile report names it by.
+fn value_type_refused(refusal: ValueTypeRefusal) -> ItemError {
+    match refusal {
+        ValueTypeRefusal::NotAValueType(message) => refused(reason::NOT_A_VALUE_TYPE, message),
+        ValueTypeRefusal::Unknown(message) => refused(reason::VALUE_TYPE_UNKNOWN, message),
+        ValueTypeRefusal::Unsupported(message) => refused(reason::VALUE_TYPE_UNSUPPORTED, message),
     }
 }
 
@@ -460,6 +470,18 @@ where
     /// Classification, secret handling and the flags, derived from the value
     /// type's traits and what the caller supplied.
     async fn derive(&self, contributed: &ContributedDeclaration) -> Result<Derived, ItemError> {
+        // The value type has to be one before anything is derived from it,
+        // on every reconcile — a first registration, a same-major update, a
+        // reactivation and an upgrade all derive first.
+        // A refusal of the type refuses this item; a failure of the lookup
+        // keeps its own name and fails the item as it is.
+        if let Err(refusal) = self
+            .validator
+            .ensure_value_type(&contributed.value_type_id)
+            .await?
+        {
+            return Err(value_type_refused(refusal));
+        }
         let traits = match self
             .validator
             .resolve_traits(&contributed.value_type_id)

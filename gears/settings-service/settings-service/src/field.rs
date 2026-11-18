@@ -60,6 +60,16 @@ pub const ODATA_UNSORTABLE_FIELD: &str = "odata_unsortable_field";
 /// The named value type is not registered in the types registry.
 pub const VALUE_TYPE_UNKNOWN: &str = "value_type_unknown";
 
+/// The named type is not a value type: a type of this gear's own namespace
+/// outside the catalogue — the setting base, a declared setting's key — or a
+/// type marked abstract. It says nothing about the shape of a value.
+pub const NOT_A_VALUE_TYPE: &str = "not_a_value_type";
+
+/// The named type is registered, but its schema does not build into a
+/// validator in this service — as when it refers to another type outside its
+/// own parent chain — so no value of it could be checked.
+pub const VALUE_TYPE_UNSUPPORTED: &str = "value_type_unsupported";
+
 /// The named value type is registered but its `x-gts-traits` spells a trait
 /// with the wrong type, so this service cannot classify values of it.
 pub const VALUE_TYPE_MALFORMED: &str = "value_type_malformed";

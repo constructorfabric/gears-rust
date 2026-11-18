@@ -136,7 +136,9 @@ impl From<RenderedDeclaration> for DeclarationDto {
 pub struct CreateDeclarationRequest {
     /// The value type the default and every override validate against: one of
     /// the catalogue under `gts.cf.core.settings.type_*~`, or a registered
-    /// module-owned one.
+    /// module-owned one. Any other type under `gts.cf.core.settings.` — the
+    /// setting base, a declared setting's key — and any abstract type is not
+    /// a value type and is refused `400` with the code `not_a_value_type`.
     pub value_type_id: String,
     /// The vendor segment of the composed key.
     pub vendor: String,

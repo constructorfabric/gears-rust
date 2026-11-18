@@ -86,6 +86,22 @@ impl FakeSource {
         self
     }
 
+    /// A type derived from one this source already holds: the parent is the
+    /// id minus its last segment, as the registry chains a derived type.
+    pub fn with_derived_type(mut self, id: &str, schema: Value) -> Self {
+        let parent = GtsTypeSchema::derive_parent_type_id(id).expect("a derived type id");
+        let parent = self
+            .schemas
+            .get(parent.as_ref())
+            .cloned()
+            .expect("the parent is registered first");
+        let schema =
+            GtsTypeSchema::try_new(GtsTypeId::new(id), schema, None, Some(Arc::new(parent)))
+                .expect("fixture schema is a valid derived type");
+        self.schemas.insert(id.to_owned(), schema);
+        self
+    }
+
     pub fn with_instance(mut self, id: &str) -> Self {
         self.instances.insert(id.to_owned());
         self
@@ -612,8 +628,67 @@ pub const SECRET: &str = "gts.cf.core.settings.type_secret_string.v1~";
 /// credentials: classified `pii`, held inline, masked without the entitlement.
 pub const TEXT: &str = "gts.cf.core.settings.type_plain_text.v1~";
 
+/// A setting some administrator already declared: a GTS type of its own,
+/// derived from the abstract base, and not a value type.
+pub const DECLARED_SETTING: &str =
+    "gts.cf.core.settings.setting_type.v1~acme.settings.network.already_declared.v1~";
+/// A value type a module registered in its own namespace.
+pub const MODULE_TYPE: &str = "gts.acme.demo.values.retry_limit.v1~";
+
+/// A module's type whose schema refers to another type by `gts://` outside
+/// its own parent chain: registered, and not buildable into a validator.
+pub const REFERRING_TYPE: &str = "gts.acme.demo.values.wrapper.v1~";
+
+/// The schema of [`REFERRING_TYPE`].
+pub fn referring_type_schema() -> Value {
+    json!({
+        "$id": format!("gts://{REFERRING_TYPE}"),
+        "type": "object",
+        "properties": { "inner": { "$ref": format!("gts://{MODULE_TYPE}") } }
+    })
+}
+
+/// Ids that are not GTS type ids: a bare word, and an instance id — a type id
+/// names its type up to a trailing `~`, and neither ends in one.
+pub const NOT_TYPE_IDS: [&str; 2] = [
+    "string",
+    "gts.acme.demo.values.retry_limit.v1~acme.demo.values.default.v1",
+];
+
+/// The types registry's own test client, holding the boolean catalogue type.
+/// It answers an id that is not a type id as the registry does — a refusal of
+/// the argument, where [`FakeSource`] only knows presence and absence.
+pub fn registry_client() -> Arc<dyn types_registry_sdk::TypesRegistryClient> {
+    let boolean = GtsTypeSchema::try_new(
+        GtsTypeId::new(BOOL),
+        json!({ "$id": format!("gts://{BOOL}"), "type": "boolean" }),
+        None,
+        None,
+    )
+    .expect("fixture schema is a valid root type");
+    Arc::new(
+        types_registry_sdk::testing::MockTypesRegistryClient::new().with_type_schemas([boolean]),
+    )
+}
+
+/// The catalogue the resolution tests run over, and beside it what the real
+/// registry also holds: the abstract base every setting derives from, one
+/// declared setting as the registrar registers it, and a module's value type.
 pub fn resolution_catalogue() -> FakeSource {
+    let declared = SettingKey::parse(DECLARED_SETTING).expect("a setting key");
     FakeSource::default()
+        .with_type(
+            settings_service_sdk::gts::SETTING_TYPE_BASE,
+            settings_service_sdk::gts::setting_type_base_schema(),
+        )
+        .with_derived_type(
+            DECLARED_SETTING,
+            crate::infra::setting_type_registrar::setting_type_schema(&declared, BOOL),
+        )
+        .with_type(
+            MODULE_TYPE,
+            json!({ "$id": format!("gts://{MODULE_TYPE}"), "type": "integer", "minimum": 0 }),
+        )
         .with_type(
             BOOL,
             json!({ "$id": format!("gts://{BOOL}"), "type": "boolean" }),
@@ -1866,6 +1941,19 @@ impl RestHarness {
         .await
     }
 
+    /// The same surface whose declaration admin asks a types registry client
+    /// about a value type, so the adapter over the registry is part of what a
+    /// request exercises — as it is in the gear — and not the hand-built
+    /// catalogue standing in for both.
+    pub async fn with_registry(registry: Arc<dyn types_registry_sdk::TypesRegistryClient>) -> Self {
+        Self::build_with(
+            Arc::new(AllowAll),
+            Arc::new(FixedStepUp::verified()),
+            registry,
+        )
+        .await
+    }
+
     /// The same surface with every authorization decision denied, for the
     /// tests that assert the gate rather than what is behind it.
     pub async fn denying() -> Self {
@@ -1952,7 +2040,7 @@ impl RestHarness {
     async fn build_with(
         pdp: Arc<dyn authz_resolver_sdk::AuthZResolverApi>,
         step_up: Arc<dyn crate::domain::stepup::StepUpVerifier>,
-        admin_catalogue: FakeSource,
+        admin_catalogue: impl SchemaSource + 'static,
     ) -> Self {
         Self::build_over(
             ResolutionHarness::new().await,
@@ -2012,7 +2100,7 @@ impl RestHarness {
         probe: Option<Probe>,
         pdp: Arc<dyn authz_resolver_sdk::AuthZResolverApi>,
         step_up: Arc<dyn crate::domain::stepup::StepUpVerifier>,
-        admin_catalogue: FakeSource,
+        admin_catalogue: impl SchemaSource + 'static,
         directory: Arc<dyn crate::infra::actor_names::ActorDirectory>,
     ) -> Self {
         *inner.hierarchy.connection_guard.lock().expect("lock") = Some(Arc::clone(&inner.db));

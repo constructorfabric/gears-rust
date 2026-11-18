@@ -1074,7 +1074,8 @@ where
 
     /// The create's second phase, which the revival report shares: everything
     /// the create judges before it would ask for step-up — a retired
-    /// `module_contributed` declaration, the value type's traits and the
+    /// `module_contributed` declaration, whether the named value type is one,
+    /// the value type's traits and the
     /// derived classification, a revive's own refusals, the Schema Default and
     /// the remaining body fields.
     ///
@@ -1096,6 +1097,14 @@ where
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-8
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-9
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-10
+        // What the request names as its value type has to be one, before its
+        // traits or the default are asked about: a setting key and the
+        // abstract setting base are registered types too, and neither says
+        // what shape a value has. A create, a revive, an evolution and the
+        // revival report all pass here.
+        self.validator
+            .ensure_value_type(&request.value_type_id)
+            .await??;
         let traits = self
             .validator
             .resolve_traits(&request.value_type_id)
