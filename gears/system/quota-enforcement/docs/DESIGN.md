@@ -2265,6 +2265,14 @@ reading the current snapshot and wait only for the very first load. A failed rel
 snapshot, logs a warning with its age, and is retried after one more interval. Callers queued behind a failed first
 load get an unavailable error instead of retrying it one after another.
 
+**Operator edits apply per replica.** Replicas reload on their own schedules, so after an edit they can disagree for
+up to one interval, and longer on a replica whose reloads fail (its warning shows the snapshot age). Lowering a lease
+cap is the case to know: a replica that has not reloaded yet keeps admitting until the live leases of that
+`(tenant, metric)` reach the old cap. The live count comes from the database, so the overshoot is bounded by the old
+cap, not by the old cap times the number of replicas. The contention timeout and the idempotency retention lag the same
+way. There is no config API yet: operators edit these tables in SQL. When one exists, it should invalidate the
+snapshot on write, and the interval becomes a fallback.
+
 **Cross-table invariants** (enforced by the storage plugin under I1):
 
 - Every `lease_holds.lease_id` references an existing `leases.lease_id` (FK, ON DELETE CASCADE).
