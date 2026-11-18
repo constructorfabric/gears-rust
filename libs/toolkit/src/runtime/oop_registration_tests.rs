@@ -5,8 +5,24 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use cf_system_sdks::directory::{
-    DirectoryInvalidArgument, DirectoryPermissionDenied, ServiceEndpoint, ServiceInstanceInfo,
+    DirectoryClient, DirectoryInvalidArgument, DirectoryPermissionDenied, ServiceEndpoint,
+    ServiceInstanceInfo,
 };
+
+use crate::runtime::{DependencyChecker, PresenceManager, ReportedStateSource};
+
+/// Wrap a stub directory in a per-process presence manager (a fresh, ready
+/// `DependencyChecker` so registrations report `Serving`). The manager's
+/// renewal loop is not spawned here, so these tests exercise the *writer*
+/// (register + re-register on update); heartbeat/renewal is covered by
+/// `presence_manager_tests`.
+fn manager(stub: Arc<StubDirectory>) -> Arc<PresenceManager> {
+    PresenceManager::new(
+        stub as Arc<dyn DirectoryClient>,
+        ReportedStateSource::Dependencies(Arc::new(DependencyChecker::new())),
+        Duration::from_secs(5),
+    )
+}
 
 /// The rejection a [`StubDirectory`] returns from `register`.
 #[derive(Clone, Copy)]
@@ -169,9 +185,13 @@ fn backoff_doubles_and_caps() {
 
 #[tokio::test]
 async fn registration_retries_until_success() {
-    let directory: Arc<dyn DirectoryClient> = Arc::new(StubDirectory::new(2, 0));
     let cancel = CancellationToken::new();
-    let ok = register_once_with_backoff(&directory, &info(), &cancel).await;
+    let ok = register_once_with_backoff(
+        &manager(Arc::new(StubDirectory::new(2, 0))),
+        &info(),
+        &cancel,
+    )
+    .await;
     assert!(ok);
 }
 
@@ -181,9 +201,8 @@ async fn registration_keeps_loop_alive_on_permanent_rejection() {
     // after a single attempt rather than retrying a request that can never
     // succeed, yet still return `true` so the presence loop keeps running.
     let stub = Arc::new(StubDirectory::rejecting(Rejection::InvalidArgument));
-    let directory: Arc<dyn DirectoryClient> = stub.clone();
     let cancel = CancellationToken::new();
-    let ok = register_once_with_backoff(&directory, &info(), &cancel).await;
+    let ok = register_once_with_backoff(&manager(Arc::clone(&stub)), &info(), &cancel).await;
     assert!(ok, "a permanent rejection must not stop the presence loop");
     assert_eq!(
         stub.register_calls.load(Ordering::SeqCst),
@@ -200,9 +219,8 @@ async fn registration_does_not_retry_permission_denied() {
     // (regression: it previously fell into the generic transient branch and
     // retried forever at `warn!`), yet still keep the presence loop alive.
     let stub = Arc::new(StubDirectory::rejecting(Rejection::PermissionDenied));
-    let directory: Arc<dyn DirectoryClient> = stub.clone();
     let cancel = CancellationToken::new();
-    let ok = register_once_with_backoff(&directory, &info(), &cancel).await;
+    let ok = register_once_with_backoff(&manager(Arc::clone(&stub)), &info(), &cancel).await;
     assert!(ok, "a permanent rejection must not stop the presence loop");
     assert_eq!(
         stub.register_calls.load(Ordering::SeqCst),
@@ -213,122 +231,80 @@ async fn registration_does_not_retry_permission_denied() {
 
 #[tokio::test]
 async fn registration_returns_false_when_cancelled() {
-    let directory: Arc<dyn DirectoryClient> = Arc::new(StubDirectory::new(1000, 0));
     let cancel = CancellationToken::new();
     cancel.cancel();
-    let ok = register_once_with_backoff(&directory, &info(), &cancel).await;
+    let ok = register_once_with_backoff(
+        &manager(Arc::new(StubDirectory::new(1000, 0))),
+        &info(),
+        &cancel,
+    )
+    .await;
     assert!(!ok, "cancelled registration must return false");
 }
 
 #[tokio::test]
-async fn presence_loop_registers_once_then_heartbeats_until_cancel() {
+async fn presence_loop_registers_once_and_waits_for_cancel() {
     let stub = Arc::new(StubDirectory::new(0, 0));
-    let directory: Arc<dyn DirectoryClient> = stub.clone();
     let cancel = CancellationToken::new();
 
-    // 1s is the minimum interval presence_loop clamps to; wait past one tick so
-    // at least one heartbeat fires.
     let task = tokio::spawn(presence_loop(
-        Arc::clone(&directory),
+        manager(Arc::clone(&stub)),
         info(),
-        Duration::from_secs(1),
         cancel.clone(),
     ));
-
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    while stub.register_ok.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
 
     assert_eq!(
         stub.register_calls.load(Ordering::SeqCst),
         1,
-        "steady state registers exactly once (self-heal re-register is 30s, not fired here)"
+        "the writer registers exactly once"
+    );
+    assert_eq!(
+        stub.heartbeats.load(Ordering::SeqCst),
+        0,
+        "the writer never heartbeats; the presence manager owns renewal"
     );
     assert!(
-        stub.heartbeats.load(Ordering::SeqCst) >= 1,
-        "the single presence task must send heartbeats"
+        !task.is_finished(),
+        "the writer stays alive (for OpenAPI updates) until cancel"
     );
 
     cancel.cancel();
     task.await.unwrap();
 }
 
-/// The heartbeats keep their schedule while an info update's registration
-/// is in flight.
-#[tokio::test(start_paused = true)]
-async fn an_info_update_in_flight_does_not_hold_the_heartbeats() {
+/// An `OpenAPI`-document update re-registers through the manager (which then
+/// renews the record carrying the new document); the writer sends no heartbeats.
+#[tokio::test]
+async fn an_openapi_update_re_registers_through_the_manager() {
     let stub = Arc::new(StubDirectory::new(0, 0));
-    let directory: Arc<dyn DirectoryClient> = stub.clone();
     let cancel = CancellationToken::new();
-    let (updates, presence) = tokio::sync::watch::channel(info());
+    let (updates, rx) = tokio::sync::watch::channel(info());
     let task = tokio::spawn(presence_loop_with_updates(
-        Arc::clone(&directory),
-        presence,
-        Duration::from_secs(1),
+        manager(Arc::clone(&stub)),
+        rx,
         cancel.clone(),
     ));
     while stub.register_ok.load(Ordering::SeqCst) == 0 {
         tokio::task::yield_now().await;
     }
 
-    stub.holding.store(true, Ordering::SeqCst);
     updates.send_replace(info().with_openapi_spec(r#"{"paths":{"/full":{}}}"#));
-    let heartbeats = stub.heartbeats.load(Ordering::SeqCst);
-    // Past the periodic re-registration too.
-    tokio::time::sleep(RE_REGISTER_INTERVAL + Duration::from_millis(5500)).await;
-
-    assert_eq!(
-        stub.register_calls.load(Ordering::SeqCst),
-        2,
-        "in flight, with no periodic registration beside it"
-    );
-    assert_eq!(stub.register_ok.load(Ordering::SeqCst), 1, "not finished");
-    assert!(
-        stub.heartbeats.load(Ordering::SeqCst) - heartbeats >= 35,
-        "a heartbeat every second meanwhile"
-    );
-    stub.holding.store(false, Ordering::SeqCst);
-    stub.released.notify_waiters();
     while stub.register_ok.load(Ordering::SeqCst) < 2 {
         tokio::task::yield_now().await;
     }
 
-    cancel.cancel();
-    task.await.unwrap();
-}
-
-/// An info update is registered at once and the heartbeats keep their
-/// schedule, even while that registration fails.
-#[tokio::test(start_paused = true)]
-async fn an_info_update_keeps_the_heartbeats_though_its_registration_fails() {
-    let stub = Arc::new(StubDirectory {
-        reject_kind: Some(Rejection::Conflict),
-        ..StubDirectory::new(0, 0)
-    });
-    let directory: Arc<dyn DirectoryClient> = stub.clone();
-    let cancel = CancellationToken::new();
-    let (updates, presence) = tokio::sync::watch::channel(info());
-    let task = tokio::spawn(presence_loop_with_updates(
-        Arc::clone(&directory),
-        presence,
-        Duration::from_secs(1),
-        cancel.clone(),
-    ));
-    while stub.register_ok.load(Ordering::SeqCst) == 0 {
-        tokio::task::yield_now().await;
-    }
-
-    stub.rejecting.store(true, Ordering::SeqCst);
-    updates.send_replace(info().with_openapi_spec(r#"{"paths":{"/full":{}}}"#));
-    let heartbeats = stub.heartbeats.load(Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(5500)).await;
-
     assert_eq!(
         stub.register_calls.load(Ordering::SeqCst),
         2,
-        "the update is registered once at once, not retried in a backoff loop"
+        "the document update re-registers exactly once"
     );
-    assert!(
-        stub.heartbeats.load(Ordering::SeqCst) - heartbeats >= 5,
-        "a heartbeat every second meanwhile"
+    assert_eq!(
+        stub.heartbeats.load(Ordering::SeqCst),
+        0,
+        "renewal (heartbeats) is the manager's job, not the writer's"
     );
 
     cancel.cancel();
@@ -337,29 +313,34 @@ async fn an_info_update_keeps_the_heartbeats_though_its_registration_fails() {
 
 #[tokio::test]
 async fn presence_loop_survives_permanent_rejection() {
-    // A permanent DirectoryInvalidArgument must NOT tear the presence loop down:
-    // it keeps heartbeating and periodically retrying re-registration. Only
-    // cancellation stops it.
+    // A permanent DirectoryInvalidArgument must NOT tear the writer down: it
+    // stays alive (so OpenAPI updates can still re-register) while the manager
+    // keeps renewing any registration that landed. Only cancellation stops it.
     let stub = Arc::new(StubDirectory::rejecting(Rejection::InvalidArgument));
-    let directory: Arc<dyn DirectoryClient> = stub.clone();
     let cancel = CancellationToken::new();
 
     let task = tokio::spawn(presence_loop(
-        Arc::clone(&directory),
+        manager(Arc::clone(&stub)),
         info(),
-        Duration::from_secs(1),
         cancel.clone(),
     ));
 
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // Let the single (permanent) registration attempt happen.
+    for _ in 0..10 {
+        if stub.register_calls.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
 
     assert!(
         !task.is_finished(),
-        "a permanent rejection must not stop the presence loop"
+        "a permanent rejection must not stop the writer"
     );
-    assert!(
-        stub.heartbeats.load(Ordering::SeqCst) >= 1,
-        "the loop must keep heartbeating despite a permanent rejection"
+    assert_eq!(
+        stub.register_calls.load(Ordering::SeqCst),
+        1,
+        "a permanent rejection is not retried"
     );
 
     cancel.cancel();
@@ -375,13 +356,11 @@ async fn presence_loop_recovers_when_conflict_clears() {
     // retry succeeds, so the instance becomes discoverable without a restart.
     // Driven on virtual time so the backoff costs no wall clock.
     let stub = Arc::new(StubDirectory::rejecting(Rejection::Conflict));
-    let directory: Arc<dyn DirectoryClient> = stub.clone();
     let cancel = CancellationToken::new();
 
     let task = tokio::spawn(presence_loop(
-        Arc::clone(&directory),
+        manager(Arc::clone(&stub)),
         info(),
-        Duration::from_secs(1),
         cancel.clone(),
     ));
 

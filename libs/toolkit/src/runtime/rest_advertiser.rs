@@ -3,8 +3,14 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::runtime::PresenceManager;
+
 /// Advertise each embedded REST provider with one bounded retry loop.
 /// Routes become discoverable per startup group. `OoP` serving owns its own presence.
+///
+/// Registration goes through the process [`PresenceManager`], which then owns
+/// lease renewal for each advertised record: this advertiser writes
+/// the record and deregisters it on shutdown, but never heartbeats.
 pub(super) struct RestAdvertiser {
     instance_id: String,
     cancel: CancellationToken,
@@ -13,9 +19,19 @@ pub(super) struct RestAdvertiser {
 
 #[derive(Default)]
 struct AdvertiserState {
-    target: Option<(Arc<dyn crate::DirectoryClient>, String)>,
+    target: Option<Target>,
     providers: Vec<&'static str>,
     tasks: Vec<tokio_util::task::AbortOnDropHandle<()>>,
+}
+
+/// Where this advertiser registers: the presence manager that renews the
+/// records, the directory (for reading existing metadata and for deregister),
+/// and the REST endpoint to advertise.
+#[derive(Clone)]
+struct Target {
+    presence: Arc<PresenceManager>,
+    directory: Arc<dyn crate::DirectoryClient>,
+    endpoint: String,
 }
 
 impl RestAdvertiser {
@@ -29,9 +45,18 @@ impl RestAdvertiser {
         }
     }
 
-    pub(super) fn enable(&self, dir: Arc<dyn crate::DirectoryClient>, endpoint: String) {
+    pub(super) fn enable(
+        &self,
+        presence: Arc<PresenceManager>,
+        directory: Arc<dyn crate::DirectoryClient>,
+        endpoint: String,
+    ) {
         if !self.cancel.is_cancelled() {
-            self.state.lock().target = Some((dir, endpoint));
+            self.state.lock().target = Some(Target {
+                presence,
+                directory,
+                endpoint,
+            });
         }
     }
 
@@ -43,7 +68,7 @@ impl RestAdvertiser {
     pub(super) async fn advertise(&self, gear: &'static str) {
         let first = {
             let mut state = self.state.lock();
-            let Some((dir, endpoint)) = state.target.clone() else {
+            let Some(target) = state.target.clone() else {
                 return;
             };
             if self.cancel.is_cancelled() || state.providers.contains(&gear) {
@@ -55,8 +80,7 @@ impl RestAdvertiser {
             let instance_id = self.instance_id.clone();
             let cancel = self.cancel.clone();
             let task = tokio::spawn(Self::register_until_accepted(
-                dir,
-                endpoint,
+                target,
                 instance_id,
                 gear,
                 cancel,
@@ -72,8 +96,7 @@ impl RestAdvertiser {
     }
 
     async fn register_until_accepted(
-        dir: Arc<dyn crate::DirectoryClient>,
-        endpoint: String,
+        target: Target,
         instance_id: String,
         gear: &'static str,
         cancel: CancellationToken,
@@ -85,7 +108,7 @@ impl RestAdvertiser {
             // Finish the bounded write before deregistration to prevent late re-registration.
             let result = tokio::time::timeout(
                 Self::ATTEMPT_TIMEOUT,
-                Self::register_once(&dir, &endpoint, &instance_id, gear, &cancel),
+                Self::register_once(&target, &instance_id, gear, &cancel),
             )
             .await
             .map_err(anyhow::Error::from)
@@ -115,12 +138,13 @@ impl RestAdvertiser {
     }
 
     async fn register_once(
-        dir: &Arc<dyn crate::DirectoryClient>,
-        endpoint: &str,
+        target: &Target,
         instance_id: &str,
         gear: &'static str,
         cancel: &CancellationToken,
     ) -> anyhow::Result<()> {
+        let dir = &target.directory;
+        let endpoint = &target.endpoint;
         // Preserve gRPC metadata for the same (gear, instance_id).
         // Empty labels preserve stored labels atomically; read-modify-write
         // could overwrite concurrent label changes.
@@ -147,12 +171,18 @@ impl RestAdvertiser {
         }
         let mut info = crate::RegisterInstanceInfo::new(gear, instance_id)
             .with_grpc_services(grpc_services)
-            .with_rest_endpoint(crate::ServiceEndpoint::new(endpoint));
+            .with_rest_endpoint(crate::ServiceEndpoint::new(endpoint.clone()));
         if let Some(version) = version {
             info = info.with_version(version);
         }
-        dir.register_instance(info).await?;
-        tracing::info!(gear, endpoint, "registered REST provider in directory");
+        // Register through the presence manager, which tracks the record and
+        // owns its lease renewal from here on; this advertiser never heartbeats.
+        target.presence.register(info).await?;
+        tracing::info!(
+            gear,
+            endpoint,
+            "registered REST provider via presence manager"
+        );
         Ok(())
     }
 
@@ -172,13 +202,18 @@ impl RestAdvertiser {
                 tracing::warn!(%error, "directory-register: registration task failed during shutdown");
             }
         }
-        let Some((dir, _)) = target else {
+        let Some(target) = target else {
             return;
         };
         for gear in gears {
+            // Stop the presence manager renewing this record before removing it,
+            // so its renewal loop cannot re-register it after deregistration.
+            target.presence.untrack(gear, &self.instance_id);
             match tokio::time::timeout(
                 Self::ATTEMPT_TIMEOUT,
-                dir.deregister_instance(gear, &self.instance_id),
+                target
+                    .directory
+                    .deregister_instance(gear, &self.instance_id),
             )
             .await
             {

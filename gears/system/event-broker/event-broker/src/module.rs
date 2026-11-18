@@ -26,7 +26,10 @@ use event_broker_sdk::backend::{Provider, Role};
 use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
 use toolkit::client_hub::ClientHub;
-use toolkit::directory::{DirectoryClient, RegisterInstanceInfo, ServiceEndpoint};
+use toolkit::directory::{
+    DirectoryClient, DirectoryNotFound, RegisterInstanceInfo, ServiceEndpoint,
+};
+use toolkit::runtime::PresenceManager;
 use toolkit::{DatabaseCapability, Gear, GearCtx, Healthcheck, RestApiCapability};
 use toolkit_db::outbox::{Outbox, Partitions};
 use uuid::Uuid;
@@ -545,10 +548,10 @@ impl EventBrokerModule {
     ///
     /// Directory presence is just another worker: in `cluster_ingest`/
     /// `cluster_delivery` it registers with `DirectoryService` (register-on-start
-    /// awaited so a failure is fatal), heartbeats until cancelled, and
-    /// deregisters on shutdown (`DirectoryClient` has no TTL-lease semantics);
-    /// in `standalone`/`cluster_dispatcher` it is a bare cancel-gate that keeps
-    /// the set non-empty so `serve()` blocks until cancellation.
+    /// awaited so a failure is fatal), keeps its registration renewed until
+    /// cancelled, and deregisters on shutdown; in `standalone`/`cluster_dispatcher`
+    /// it is a bare cancel-gate that keeps the set non-empty so `serve()` blocks
+    /// until cancellation.
     pub(crate) async fn serve(&self, cancel: CancellationToken) -> anyhow::Result<()> {
         let mode = *self
             .mode
@@ -650,10 +653,19 @@ impl EventBrokerModule {
             }
         };
 
-        let (directory, info) = self.register_self(gear_name).await?;
+        let (directory, presence, info) = self.register_self(gear_name).await?;
         let token = sup.cancel().clone();
         sup.spawn("directory-presence", async move {
-            presence_loop(&directory, &info, &token).await;
+            match presence {
+                // The presence manager owns renewal; here we just wait for
+                // shutdown, stop its renewal of this record, then deregister.
+                Some(pm) => {
+                    token.cancelled().await;
+                    pm.untrack(&info.gear, &info.instance_id);
+                }
+                // No manager (standalone OoP): run the local heartbeat loop.
+                None => presence_loop(&directory, &info, &token).await,
+            }
             if let Err(e) = directory
                 .deregister_instance(&info.gear, &info.instance_id)
                 .await
@@ -932,7 +944,11 @@ impl EventBrokerModule {
     async fn register_self(
         &self,
         gear_name: &str,
-    ) -> anyhow::Result<(Arc<dyn DirectoryClient>, RegisterInstanceInfo)> {
+    ) -> anyhow::Result<(
+        Arc<dyn DirectoryClient>,
+        Option<Arc<PresenceManager>>,
+        RegisterInstanceInfo,
+    )> {
         let hub = self
             .client_hub
             .get()
@@ -956,22 +972,34 @@ impl EventBrokerModule {
         let directory: Arc<dyn DirectoryClient> = hub.get::<dyn DirectoryClient>()?;
         let info = RegisterInstanceInfo::new(gear_name.to_owned(), Uuid::new_v4().to_string())
             .with_rest_endpoint(ServiceEndpoint::new(address));
-        directory.register_instance(info.clone()).await?;
+        // Register through the per-process presence manager when one is
+        // published (in-process host), so it owns this role record's lease
+        // renewal. Without one (e.g. standalone OoP), register
+        // directly and keep the local heartbeat loop below.
+        let presence = hub.get::<PresenceManager>().ok();
+        match &presence {
+            Some(pm) => pm.register(info.clone()).await?,
+            None => directory.register_instance(info.clone()).await?,
+        }
         tracing::info!(
             module = Self::MODULE_NAME,
             gear = gear_name,
             instance_id = %info.instance_id,
             "registered with DirectoryService"
         );
-        Ok((directory, info))
+        Ok((directory, presence, info))
     }
 }
 
 /// Sends a heartbeat every [`DIRECTORY_HEARTBEAT_INTERVAL`] until `cancel`
-/// fires. Unlike `toolkit::runtime`'s own (private) `presence_loop`, this
-/// doesn't self-heal by re-registering on heartbeat failure - a simplification
-/// acceptable for this gear's intra-role registration, revisit if
-/// `DirectoryService` restarts turn out to be disruptive in practice.
+/// fires, re-registering if the directory reports the record missing.
+///
+/// Under the lease model an unknown instance answers `NOT_FOUND`, so a
+/// `DirectoryService` restart (or an eviction) must be met with a
+/// re-registration — otherwise this standalone role would stay missing until
+/// the process restarts (#5872). This mirrors the self-heal that
+/// `toolkit::runtime`'s `PresenceManager` performs for co-hosted registrars; the
+/// standalone role gets the same recovery without needing a full manager.
 ///
 /// A free function, not a method, because the directory-presence worker owns
 /// `directory`/`info` and runs on the `'static` `JoinSet` - it borrows nothing
@@ -988,17 +1016,58 @@ async fn presence_loop(
     loop {
         tokio::select! {
             () = cancel.cancelled() => return,
-            _ = heartbeat.tick() => {
-                if let Err(e) = directory.send_heartbeat(&info.gear, &info.instance_id).await {
-                    tracing::warn!(
-                        module = EventBrokerModule::MODULE_NAME,
-                        gear = %info.gear,
-                        error = %e,
-                        "heartbeat failed"
-                    );
-                }
-            }
+            _ = heartbeat.tick() => heartbeat_or_reregister(directory, info).await,
         }
+    }
+}
+
+/// One presence beat: renew the lease, re-registering if the directory has
+/// forgotten the record. An unknown instance answers `NOT_FOUND` under the
+/// lease model, so a `DirectoryService` restart (or eviction) is recovered in
+/// the next beat rather than leaving the role missing until the process
+/// restarts (#5872).
+async fn heartbeat_or_reregister(
+    directory: &Arc<dyn DirectoryClient>,
+    info: &RegisterInstanceInfo,
+) {
+    let Err(e) = directory
+        .send_heartbeat(&info.gear, &info.instance_id)
+        .await
+    else {
+        return;
+    };
+    // Only a forgotten record (`NOT_FOUND`) is recoverable here; any other
+    // failure is transient and retried on the next beat.
+    if e.downcast_ref::<DirectoryNotFound>().is_some() {
+        reregister_after_not_found(directory, info).await;
+    } else {
+        tracing::warn!(
+            module = EventBrokerModule::MODULE_NAME,
+            gear = %info.gear,
+            error = %e,
+            "heartbeat failed"
+        );
+    }
+}
+
+/// Re-register a record the directory answered `NOT_FOUND` for, so the role
+/// becomes routable again after a directory restart or eviction.
+async fn reregister_after_not_found(
+    directory: &Arc<dyn DirectoryClient>,
+    info: &RegisterInstanceInfo,
+) {
+    match directory.register_instance(info.clone()).await {
+        Ok(()) => tracing::info!(
+            module = EventBrokerModule::MODULE_NAME,
+            gear = %info.gear,
+            "re-registered after the directory reported the record missing"
+        ),
+        Err(e) => tracing::warn!(
+            module = EventBrokerModule::MODULE_NAME,
+            gear = %info.gear,
+            error = %e,
+            "re-registration after NOT_FOUND failed; will retry next beat"
+        ),
     }
 }
 

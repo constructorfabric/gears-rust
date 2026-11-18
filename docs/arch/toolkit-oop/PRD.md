@@ -380,11 +380,36 @@ backends of it, so swapping does not change gear code.
 OoP Workers MUST register their REST endpoint and OpenAPI spec with DirectoryService on startup and deregister on
 graceful shutdown.
 
-Active heartbeat-timeout reaping of unresponsive workers by Flight Control is **Profile 2 (Self-Hosted)** and is
-**deferred to P2**; in **Profile 3 (K8s)** k8s readiness probes + the Endpoints controller handle dead-pod removal.
+Heartbeat-timeout reaping of unresponsive workers is enforced by the directory's instance lease (see
+`cpt-cf-fr-directory-liveness`) and is **no longer deferred** (amended by ADR-0011): a crashed worker's lease expires
+and it stops receiving traffic within a bounded time, in every profile, without relying on k8s probes.
 
 - **Rationale**: Stale service entries cause routing failures. Clean lifecycle management ensures the directory reflects
   the actual cluster state.
+- **Actors**: `cpt-cf-actor-oop-worker`, `cpt-cf-actor-flight-control`
+
+#### Directory Instance Liveness
+
+- [ ] `p1` - **ID**: `cpt-cf-fr-directory-liveness`
+
+Every registered instance MUST carry a **lease** that is renewed on registration and on every heartbeat. The directory
+MUST derive each instance's observable state from its lease and the state the instance reports about itself
+(`Starting` / `Serving` / `Draining`), computed at read time:
+
+- a valid lease reads as `Registered` (reported `Starting`), `Healthy` (reported `Serving`) or `Draining`;
+- a lease expired less than `grace` reads as `Quarantined` (missed heartbeats): not in the serving set, so not
+  *preferred* for new traffic — routing falls back to it only when no instance is serving, rather than failing closed;
+- a lease expired `grace` or longer is not returned and MUST be reclaimed.
+
+A heartbeat for an unknown instance MUST return `NOT_FOUND` so the worker re-registers within one heartbeat. A single
+per-process renewer (the `PresenceManager`) MUST renew the lease for every record the process registered — the OoP
+presence writer, grpc-hub's registrar, the REST advertiser and event-broker's role registration — and, during graceful
+drain, MUST report `Draining` for the whole drain window before deregistering. Lease `ttl` and `grace` are configurable
+and default to 30 s.
+
+- **Rationale**: In-memory registrations that never heartbeat, and crashed workers that never deregister, otherwise keep
+  receiving traffic indefinitely. A lease makes liveness self-correcting and bounds the time a dead instance is routable
+  without depending on k8s probes.
 - **Actors**: `cpt-cf-actor-oop-worker`, `cpt-cf-actor-flight-control`
 
 #### Public vs. Internal API Distinction
