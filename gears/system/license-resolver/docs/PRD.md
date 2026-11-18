@@ -382,12 +382,44 @@ systems (e.g. issuance or billing); how a backend sources or maintains grants is
 
 - [ ] `p1` - **ID**: `cpt-cf-license-resolver-nfr-read-latency`
 
-The `is_licensed` check **MUST** complete within 50ms at p95, measured at the resolver boundary excluding backend plugin
-processing time, under normal load.
+Once the plugin is resolved and the contract schemas are cached, the time the resolver adds to a check, excluding the
+plugin call, **MUST** be at most 50 ms at p95 while checks arrive at the backend's throughput threshold.
 
-- **Threshold**: 50ms p95 at the resolver boundary (excludes plugin compute), normal load.
+- **Threshold**: ≤ 50 ms p95 at the resolver boundary, plugin time excluded, at the backend's throughput threshold.
 - **Rationale**: The check sits on the access-granting path of consuming modules, so added latency directly impacts
   every gated request.
+- **Architecture Allocation**: See DESIGN.md § NFR Allocation for how this is realized.
+
+#### Throughput and Latency
+
+- [ ] `p1` - **ID**: `cpt-cf-license-resolver-nfr-throughput`
+
+Checks through the resolver **MUST** sustain the backend's throughput threshold. Once the plugin is resolved and the
+contract schemas are cached, and at that load, their p95 latency **MUST** be at most the backend's p95 latency
+threshold plus 50 ms.
+
+- **Threshold**: for a backend that states p95 ≤ B at N checks/s, checks through the resolver sustain N checks/s with
+  p95 ≤ B + 50 ms, measured at the resolver boundary. For the license-enforcement backend: 1 000 checks/s per node,
+  p95 ≤ 90 ms.
+- **Rationale**: Each backend states its own capacity and latency; the resolver must not lower either.
+- **Architecture Allocation**: See DESIGN.md § NFR Allocation for how this is realized.
+
+#### Availability
+
+- [ ] `p1` - **ID**: `cpt-cf-license-resolver-nfr-availability`
+
+Once the plugin of a check is resolved, the check **MUST** depend only on the plugin and on types-registry, which runs
+in the same process and answers from memory, so checks through the resolver meet the backend's availability target. At
+start the resolver calls no other gear: it checks only the form of its configuration. The plugin is resolved on the
+first check after start; a failed plugin resolution or registry lookup fails the check with `ServiceUnavailable`.
+
+A calling module **MUST** limit each check by its own deadline. It **MAY** retry a check that failed with
+`ServiceUnavailable` or ran past its deadline; a check changes nothing, so a retry is safe. If the check stays
+unavailable, the module treats it as not granted.
+
+- **Threshold**: availability of checks through the resolver is at least the backend's target, over the backend's
+  measurement period.
+- **Rationale**: The resolver fails closed, so a dependency it adds to a check would deny licensed access on its outage.
 - **Architecture Allocation**: See DESIGN.md § NFR Allocation for how this is realized.
 
 #### Fail-Closed on No Plugin
@@ -534,8 +566,8 @@ bounded within that tenant (the current tenant-bounded model — see §11).
 - Principal types form a GTS hierarchy registered in the types registry; until it is registered, a principal type is
   mapped only by an exact configuration entry.
 - At least one backend plugin is registered in environments where license checks are expected to grant.
-- Contract schemas are resolvable from the types registry and cacheable; the registry is available at bootstrap and its
-  schema reads are not on the per-check hot path (cached).
+- Contract schemas are resolvable from the types registry, which runs in the same process as the resolver and serves
+  them from its cache over an in-memory store, so a schema read on each check adds no network call.
 - **Tenant-bounded grants (current model)**: at this stage, every license is assumed to be bounded within a single
   tenant — regardless of subject type, the subject (e.g. a user) belongs to a tenant — and the resolver enforces tenant
   isolation via the tenant of each check as other CF modules do. Cross-tenant or
@@ -544,13 +576,15 @@ bounded within that tenant (the current tenant-bounded model — see §11).
 
 ## 12. Risks
 
-| Risk                                            | Impact                                                  | Mitigation                                                                                                                                    |
-|-------------------------------------------------|---------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------|
-| No backend plugin registered in an environment  | All checks deny, blocking legitimate access             | Fail-closed by design; surface a clear `NoPluginAvailable` signal for operability.                                                            |
-| Backend latency degrades the check              | Slows every gated request in consuming modules          | Boundary p95 NFR; consuming modules may apply their own timeouts/fallbacks.                                                                   |
-| Misreferenced contract type path                | Check resolves against the wrong contract               | Engine validates the request against the registered contract; the backend licensing service validates licensability and denies unknown types. |
-| Contract drift (Gear code vs registered schema) | Checks start failing validation after a Gear change     | Engine-side validation surfaces drift immediately and fail-closed; additive-optional evolution is non-breaking by rule.                       |
-| Contract governance overhead                    | New licensable surfaces require registration and review | The review point is the feature; per-Gear contract count is small and bounded by its distinct licensable surfaces.                            |
+| Risk                                             | Impact                                                       | Mitigation                                                                                                                                    |
+|--------------------------------------------------|--------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------|
+| No backend plugin registered in an environment   | All checks deny, blocking legitimate access                  | Fail-closed by design; surface a clear `NoPluginAvailable` signal for operability.                                                            |
+| Backend latency degrades the check               | Slows every gated request in consuming modules               | Boundary p95 NFR; consuming modules may apply their own timeouts/fallbacks.                                                                   |
+| Misreferenced contract type path                 | Check resolves against the wrong contract                    | Engine validates the request against the registered contract; the backend licensing service validates licensability and denies unknown types. |
+| Contract drift (Gear code vs registered schema)  | Checks start failing validation after a Gear change          | Engine-side validation surfaces drift immediately and fail-closed; additive-optional evolution is non-breaking by rule.                       |
+| Contract governance overhead                     | New licensable surfaces require registration and review      | The review point is the feature; per-Gear contract count is small and bounded by its distinct licensable surfaces.                            |
+| A platform service checks the wrong subject      | Access is granted or denied on another subject's license     | Only platform services can name a subject; the principal of a user request comes from its `SecurityContext` (SDK helper).                     |
+| A platform service checks subjects in any tenant | Another tenant's license status is disclosed to that service | The platform contract is reachable only by platform services; authorization of the calling service when the platform supports it.             |
 
 ## 13. Open Questions
 

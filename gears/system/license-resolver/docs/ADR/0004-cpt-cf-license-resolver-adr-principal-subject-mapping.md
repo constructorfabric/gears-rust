@@ -81,6 +81,12 @@ plugin is not called. A registry failure during the lookup is `ServiceUnavailabl
 ### Consequences
 
 * A mapping change needs a configuration change and a restart.
+* A mapping change takes effect on each replica as it restarts, so during the restart two checks of the same principal
+  can be mapped differently. After a change of the type, the backend matches the principal as the new Subject
+  contract type, so grants bound to the old type can stop applying; after the removal of the entry, the principal is not
+  mapped and not licensed. An operator therefore adds entries for new principal types freely, and changes or removes an
+  existing entry as a migration of its grants: the grants for the new type exist before the change, and the grants for
+  the old type are revoked after it.
 * The mapped Subject contract type gets empty `metadata`. A type whose schema requires metadata fails validation with
   `InvalidRequest`; the resolver logs it as a likely misconfiguration, throttled.
 * The public subject differs from the plugin subject: the plugin keeps receiving a Subject contract object.

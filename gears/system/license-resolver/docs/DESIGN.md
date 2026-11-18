@@ -97,11 +97,13 @@ Requirements from PRD that significantly influence architecture decisions.
 
 #### NFR Allocation
 
-| NFR ID                                       | NFR Summary                                                 | Allocated To                                                        | Design Response                                                                                                                                                                                                                                                                                                                                                                  | Verification Approach                                                                      |
-|----------------------------------------------|-------------------------------------------------------------|---------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------|
-| `cpt-cf-license-resolver-nfr-read-latency`   | `is_licensed` ≤ 50ms p95 at the resolver boundary           | Gateway/selector (`cpt-cf-license-resolver-component-main-gateway`) | Plugin instance selection is memoized after first resolution and contract schemas are resolved from the registry once and cached, so the hot path is a cached-schema validation, a scoped ClientHub lookup, and one delegated call; boundary excludes plugin compute.                                                                                                            | Boundary latency benchmark at p95 excluding plugin processing.                             |
-| `cpt-cf-license-resolver-nfr-fail-closed`    | Never grant by default when no plugin / backend unreachable | Gateway/selector + `LicenseResolverError` mapping                   | No matching plugin yields `NoPluginAvailable`; an unreachable backend yields `ServiceUnavailable`; neither path can produce a granted decision (principle `cpt-cf-license-resolver-principle-fail-closed-no-plugin`).                                                                                                                                                            | Tests asserting 0 grant-by-default outcomes across all no-plugin / unavailable conditions. |
-| `cpt-cf-license-resolver-nfr-tenant-scoping` | Every resolution scoped to one tenant                       | All components                                                      | Current model: every license is tenant-bounded — regardless of subject type the subject belongs to a tenant. Platform plane: the `tenant_id` of the request. Tenant plane: `subject_tenant_id` of the caller's `SecurityContext`. The gateway forwards that tenant unchanged to the plugin in `LicenseCheckRequest.tenant_id` (no cross-tenant resolution). | Tests asserting 0 cross-tenant resolutions.                                                |
+| NFR ID                                       | NFR Summary                                                 | Allocated To                                                        | Design Response                                                                                                                                                                                                                                                                                                                                                                                           | Verification Approach                                                                                                                                 |
+|----------------------------------------------|-------------------------------------------------------------|---------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `cpt-cf-license-resolver-nfr-read-latency`   | ≤ 50 ms p95 added at backend load                           | Gateway/selector (`cpt-cf-license-resolver-component-main-gateway`) | Plugin instance selection is memoized after first resolution. Contract schemas and principal-type ancestors come from types-registry in the same process, which serves them from its bounded cache with a TTL over its in-memory store. The hot path is a cached-schema validation, a scoped ClientHub lookup, and one delegated call, with no network call of its own; boundary excludes plugin compute. | Boundary latency benchmark at p95 excluding plugin processing, with a no-op plugin at the backend's throughput threshold.                             |
+| `cpt-cf-license-resolver-nfr-throughput`     | Backend's checks/s, its p95 + 50 ms                         | Gateway/selector                                                    | Stateless apart from the memoized plugin, so it scales with the processes that host it; per-check cost bounded by the read-latency budget.                                                                                                                                                                                                                                                                | Load test through the resolver at the backend's throughput threshold; p95 compared with the backend's p95 threshold plus 50 ms.                       |
+| `cpt-cf-license-resolver-nfr-availability`   | Backend's target, plugin only                               | Gateway/selector, principal mapping                                 | No other gear called at start; the plugin resolved on the first check and memoized; types-registry called in process and served from memory.                                                                                                                                                                                                                                                              | Fault tests: plugin resolution fails, registry lookup fails → `ServiceUnavailable`, never granted; availability tracked against the backend's target. |
+| `cpt-cf-license-resolver-nfr-fail-closed`    | Never grant by default when no plugin / backend unreachable | Gateway/selector + `LicenseResolverError` mapping                   | No matching plugin yields `NoPluginAvailable`; an unreachable backend yields `ServiceUnavailable`; neither path can produce a granted decision (principle `cpt-cf-license-resolver-principle-fail-closed-no-plugin`).                                                                                                                                                                                     | Tests asserting 0 grant-by-default outcomes across all no-plugin / unavailable conditions.                                                            |
+| `cpt-cf-license-resolver-nfr-tenant-scoping` | Every resolution scoped to one tenant                       | All components                                                      | Current model: every license is tenant-bounded — regardless of subject type the subject belongs to a tenant. Platform plane: the `tenant_id` of the request. Tenant plane: `subject_tenant_id` of the caller's `SecurityContext`. The gateway forwards that tenant unchanged to the plugin in `LicenseCheckRequest.tenant_id` (no cross-tenant resolution).                                               | Tests asserting 0 cross-tenant resolutions.                                                                                                           |
 
 #### Key ADRs
 
@@ -264,6 +266,19 @@ Rust **value objects** (the SDK models passed in and out of a check).
 | `LicenseCheckContext` | The operation context: inputs that describe the operation being checked beyond its subject and resource. Empty today; the extension point for future contextual evaluation inputs (e.g. whether hierarchy traversal is allowed), mirroring how authz models such cases. The caller fills it, so both planes carry it in the request; it is not derived from `SecurityContext`, which fixes only the subject and the tenant. Optional on the wire. |
 | `LicenseDecision`     | The check result: a `granted` boolean plus a `diagnostics` map (string → JSON) of non-authoritative debug info about how the decision was reached (e.g. backend id, matched grant, denial cause). Carrying minimal grant metadata (e.g. status) is a possible future enrichment (PRD §13 open question; DESIGN §4), not part of the current decision. |
 
+**Subject wire forms**: the `subject` of a `PlatformIsLicensedRequest` is one JSON object. Its `kind` selects the form,
+and the fields of the form sit beside `kind` in the same object.
+
+| Form      | `kind`      | Fields                                                                                                                              |
+|-----------|-------------|-------------------------------------------------------------------------------------------------------------------------------------|
+| Subject   | `license`   | `type`: the Subject contract type, a GTS type id; `id`: optional, a well-known name or a UUID; `metadata`: an object, possibly empty |
+| Principal | `principal` | `type`: the principal type, as `SecurityContext.subject_type`; `id`: the principal UUID                                             |
+
+A `Subject` outside a platform request, in a `LicenseCheckRequest`, is the object `{type, id, metadata}` without
+`kind`. A subject without `kind` or with an unknown `kind`, without a required field of its form, with a field of a
+wrong type, or with a field its form does not have is `InvalidRequest` (§3.3). A well-formed principal with an empty
+type or a nil id is not an error: it is not mapped (*Principal mapping* below).
+
 **Licensing base types** (owned by this module, under `gts.cf.core.lic.*`):
 
 `gts.cf.core.lic.subj.v1~` — base Subject type:
@@ -422,7 +437,9 @@ the plugin called. An operator subtype of a mapped principal type needs no entry
 - **Responsibility boundaries**: Never consumed directly by other modules — only through the main module's public
   contract; does not define the domain types (owned by their modules) or the derived contract types (registered by the
   consuming Gears); MUST ignore contract properties it does not use (additive compatibility); exposes no listing
-  method.
+  method. Reachable only in process, through the plugin contract, which carries no caller identity: the plugin runs no
+  policy check, the backend's own check covers only the backend's API, and the backend cannot record which module made
+  a check.
 - **Related components**: `cpt-cf-license-resolver-component-sdk-contract` — depends on (implements its plugin trait);
   `cpt-cf-license-resolver-component-main-gateway` — called-by (receives delegated checks).
 
@@ -461,10 +478,11 @@ generates the clients and the server routes from the contracts.
 | `LicenseResolverApi`         | `/license-resolver/v1/is-licensed`           | `SecurityContext`         | **exposed** |
 
 The platform route accepts only a service credential, which external clients do not hold, so only platform services
-reach it; the resolver trusts its `tenant_id` and `subject` as the in-process call does. The tenant
-route takes the caller's bearer token: any authenticated principal can call it, and it answers only about that
-principal in its own tenant. Like account-management's `GET /me`, it asks the authorization service nothing: the
-caller cannot name another subject or tenant.
+reach it; the resolver trusts its `tenant_id` and `subject` as the in-process call does. No component checks which
+platform service may check which tenant: this is an exception to the toolkit's two-plane rule
+([ADR-0008](../../../../docs/arch/toolkit-oop/ADR/0008-cpt-cf-adr-two-plane-auth.md)) until the toolkit authorizes
+platform-plane callers (`cpt-cf-license-resolver-adr-two-planes`). The tenant route takes the caller's bearer token:
+any authenticated principal can call it, and it answers only about that principal in its own tenant.
 
 **Plugin client — `LicenseResolverPluginClient`** (realizes PRD `cpt-cf-license-resolver-contract-plugin`): a single
 `is_licensed` method over `LicenseCheckRequest` (the subject already a Subject contract object) and `LicenseDecision`,
@@ -630,3 +648,5 @@ such change follows the breaking-change policy on the public contract.
 | `cpt-cf-license-resolver-nfr-read-latency`            | NFR  | §1.2, §3.2, §4               | `cpt-cf-license-resolver-adr-plugin-delegation`         |
 | `cpt-cf-license-resolver-nfr-fail-closed`             | NFR  | §1.2, §2.1, §3.3             | `cpt-cf-license-resolver-adr-plugin-delegation`         |
 | `cpt-cf-license-resolver-nfr-tenant-scoping`          | NFR  | §1.2, §3.2, §3.6             | `cpt-cf-license-resolver-adr-two-planes`                |
+| `cpt-cf-license-resolver-nfr-throughput`              | NFR  | §1.2, §3.2                   | `cpt-cf-license-resolver-adr-plugin-delegation`         |
+| `cpt-cf-license-resolver-nfr-availability`            | NFR  | §1.2, §3.2, §3.3             | `cpt-cf-license-resolver-adr-plugin-delegation`         |
