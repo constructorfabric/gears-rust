@@ -161,14 +161,13 @@ async fn close_payer(
     let tenant_id = ctx.subject_tenant_id();
     // Closer needs data-plane write authority. MVP reuses the entry-post
     // permission; a dedicated payer-close permission is a follow-up.
-    let scope = crate::authz::access_scope(
+    let scope = crate::authz::own_tenant_scope(
         &enforcer,
         &ctx,
         &crate::authz::resource_types::ENTRY,
         crate::authz::actions::POST,
         Some(tenant_id),
         None,
-        /* require_constraints */ true,
     )
     .await
     .map_err(authz_error_to_canonical)?;

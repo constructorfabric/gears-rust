@@ -63,7 +63,6 @@ impl TryFrom<StoredPeriodReopenIntent> for domain::PeriodReopenIntent {
 /// Explicit durable mirror of [`domain::ReverseIntent`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredReverseIntent {
-    pub tenant_id: Uuid,
     pub entry_id: Uuid,
     pub into_period_id: Option<String>,
     pub effective_at: Option<NaiveDate>,
@@ -72,7 +71,6 @@ pub struct StoredReverseIntent {
 impl From<&domain::ReverseIntent> for StoredReverseIntent {
     fn from(v: &domain::ReverseIntent) -> Self {
         Self {
-            tenant_id: v.tenant_id,
             entry_id: v.entry_id,
             into_period_id: v.into_period_id.clone(),
             effective_at: v.effective_at,
@@ -84,7 +82,6 @@ impl TryFrom<StoredReverseIntent> for domain::ReverseIntent {
     type Error = DomainError;
     fn try_from(v: StoredReverseIntent) -> Result<Self, Self::Error> {
         Ok(Self {
-            tenant_id: v.tenant_id,
             entry_id: v.entry_id,
             into_period_id: v.into_period_id,
             effective_at: v.effective_at,

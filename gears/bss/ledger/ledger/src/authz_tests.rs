@@ -2,12 +2,12 @@
 
 #![allow(clippy::expect_used)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use authz_resolver_sdk::constraints::{Constraint, InPredicate, Predicate};
 use authz_resolver_sdk::models::{
-    EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
+    EvaluationRequest, EvaluationResponse, EvaluationResponseContext, TenantMode,
 };
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use toolkit::api::canonical_prelude::CanonicalError;
@@ -15,7 +15,10 @@ use toolkit_gts::gts_id;
 use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties};
 use uuid::Uuid;
 
-use super::{AuthzError, access_scope, actions, authz_label_type_schemas, labels, resource_types};
+use super::{
+    AuthzError, access_scope, actions, authz_label_type_schemas, labels, own_tenant_scope,
+    resource_types,
+};
 
 #[test]
 fn resource_types_carry_their_labels() {
@@ -375,4 +378,146 @@ async fn payment_read_returns_pdp_scope_for_sql_filter() {
         scope.contains_uuid(pep_properties::OWNER_TENANT_ID, tenant),
         "the payment read scope must carry the tenant filter"
     );
+}
+
+/// A tenant-hierarchy PDP fake shaped like tr-authz for a request with no
+/// `resource_id`: `Subtree` (the default) answers `In([subject, child])` — the
+/// subject's tenant and its one descendant — and `RootOnly` answers
+/// `In([subject])`. It records the tenant mode of every request it is asked.
+struct HierarchyResolver {
+    child: Uuid,
+    modes: Mutex<Vec<Option<TenantMode>>>,
+}
+
+#[async_trait]
+impl AuthZResolverApi for HierarchyResolver {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        req: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        let mode = req.context.tenant_context.map(|tc| tc.mode);
+        self.modes.lock().expect("modes lock").push(mode.clone());
+        let subject = req.subject.properties["tenant_id"]
+            .as_str()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .expect("subject tenant_id property");
+        let tenants = if mode == Some(TenantMode::RootOnly) {
+            vec![subject]
+        } else {
+            vec![subject, self.child]
+        };
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![Constraint {
+                    predicates: vec![Predicate::In(InPredicate::new(
+                        pep_properties::OWNER_TENANT_ID,
+                        tenants,
+                    ))],
+                }],
+                deny_reason: None,
+            },
+        })
+    }
+}
+
+fn hierarchy(child: Uuid) -> (Arc<HierarchyResolver>, PolicyEnforcer) {
+    let resolver = Arc::new(HierarchyResolver {
+        child,
+        modes: Mutex::new(Vec::new()),
+    });
+    let enforcer = PolicyEnforcer::new(resolver.clone());
+    (resolver, enforcer)
+}
+
+/// The governed-write gate asks the PDP for the caller's tenant only; the read and
+/// audit-elevation gate keeps the PDP's default tenant mode (`Subtree`).
+#[tokio::test]
+async fn own_tenant_scope_asks_root_only_and_access_scope_keeps_the_default() {
+    let tenant = Uuid::now_v7();
+    let (resolver, enforcer) = hierarchy(Uuid::now_v7());
+    let ctx = ctx_for(tenant);
+
+    own_tenant_scope(
+        &enforcer,
+        &ctx,
+        &resource_types::ENTRY,
+        actions::POST,
+        Some(tenant),
+        None,
+    )
+    .await
+    .expect("a write into the caller's own book is allowed");
+    own_tenant_scope(
+        &enforcer,
+        &ctx,
+        &resource_types::ENTRY,
+        actions::APPROVE,
+        Some(tenant),
+        None,
+    )
+    .await
+    .expect("an approval verb in the caller's own tenant is allowed");
+    access_scope(
+        &enforcer,
+        &ctx,
+        &resource_types::ENTRY,
+        actions::READ,
+        None,
+        None,
+        true,
+    )
+    .await
+    .expect("the read is allowed");
+
+    assert_eq!(
+        *resolver.modes.lock().expect("modes lock"),
+        vec![Some(TenantMode::RootOnly), Some(TenantMode::RootOnly), None],
+        "governed writes and approval verbs ask RootOnly; reads keep the PDP default"
+    );
+}
+
+/// A parent user posting into a child's book is denied at the PEP gate: the
+/// `RootOnly` scope holds only the parent's tenant, so the child target fails the
+/// membership assertion before any dual-control threshold is read.
+#[tokio::test]
+async fn own_tenant_scope_denies_a_parent_write_into_a_child_book() {
+    let parent = Uuid::now_v7();
+    let child = Uuid::now_v7();
+    let (_, enforcer) = hierarchy(child);
+
+    let err = own_tenant_scope(
+        &enforcer,
+        &ctx_for(parent),
+        &resource_types::ENTRY,
+        actions::POST,
+        Some(child),
+        None,
+    )
+    .await
+    .expect_err("a parent write into a child's book must be denied");
+    assert!(matches!(err, AuthzError::Denied(_)), "got {err:?}");
+}
+
+/// The audit elevation check (`audit::cross_tenant_role_authorized`) asks the
+/// write-shaped question with the target as `owner_tenant_id`; it stays on the
+/// subtree scope, so an elevation into an authorized child still passes.
+#[tokio::test]
+async fn access_scope_still_admits_an_authorized_child_for_audit_elevation() {
+    let parent = Uuid::now_v7();
+    let child = Uuid::now_v7();
+    let (_, enforcer) = hierarchy(child);
+
+    access_scope(
+        &enforcer,
+        &ctx_for(parent),
+        &resource_types::ENTRY,
+        actions::AUDIT_READ,
+        Some(child),
+        None,
+        true,
+    )
+    .await
+    .expect("the audit elevation into an authorized child is allowed");
 }

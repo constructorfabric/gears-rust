@@ -30,6 +30,8 @@
 //!   → 400 `MANUAL_ADJUSTMENT_NOT_ALLOWED`;
 //! - a manual adjustment shaped as a disguised write-off (DR CONTRA_REVENUE / CR AR)
 //!   → 400 `MANUAL_ADJUSTMENT_NOT_ALLOWED`.
+//! - a parent user posting a manual adjustment into its child's book → 403 (the
+//!   write gate asks `RootOnly`), while the child posting into its own → 201.
 //!
 //! The over-D2 dual-control gate (→ 409) + the manual-adjustment foreign-tenant 403
 //! are not re-exercised here: the gate path needs the `ApprovalService` wired (it is
@@ -55,7 +57,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use authz_resolver_sdk::constraints::{Constraint, InPredicate, Predicate};
 use authz_resolver_sdk::models::{
-    EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
+    EvaluationRequest, EvaluationResponse, EvaluationResponseContext, TenantMode,
 };
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use axum::Router;
@@ -176,6 +178,54 @@ impl AuthZResolverApi for DenyResolver {
             },
         })
     }
+}
+
+/// The parent of `SUBJECT_TENANT` in [`HierarchyResolver`]'s tenant tree.
+const PARENT_TENANT: Uuid = uuid::uuid!("99999999-8888-7777-6666-555555555555");
+
+/// A tenant-hierarchy fake shaped like tr-authz for a request with no
+/// `resource_id`, where `PARENT_TENANT` is the parent of `SUBJECT_TENANT`:
+/// `Subtree` (the default) answers `In(subject + its descendants)`, `RootOnly`
+/// answers `In([subject])`.
+struct HierarchyResolver;
+
+#[async_trait]
+impl AuthZResolverApi for HierarchyResolver {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        req: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        let subject = req.subject.properties["tenant_id"]
+            .as_str()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .expect("subject tenant_id property");
+        let root_only = req
+            .context
+            .tenant_context
+            .is_some_and(|tc| tc.mode == TenantMode::RootOnly);
+        let tenants = if subject == PARENT_TENANT && !root_only {
+            vec![PARENT_TENANT, SUBJECT_TENANT]
+        } else {
+            vec![subject]
+        };
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![Constraint {
+                    predicates: vec![Predicate::In(InPredicate::new(
+                        toolkit_security::pep_properties::OWNER_TENANT_ID,
+                        tenants,
+                    ))],
+                }],
+                deny_reason: None,
+            },
+        })
+    }
+}
+
+fn hierarchy_enforcer() -> PolicyEnforcer {
+    PolicyEnforcer::new(Arc::new(HierarchyResolver))
 }
 
 fn allow_enforcer() -> PolicyEnforcer {
@@ -458,6 +508,16 @@ fn authed_context() -> SecurityContext {
     SecurityContext::builder()
         .subject_id(SUBJECT_ID)
         .subject_tenant_id(SUBJECT_TENANT)
+        .subject_type(gts_id!("cf.core.security.subject_user.v1~"))
+        .token_scopes(vec!["*".to_owned()])
+        .build()
+        .expect("authed SecurityContext must build")
+}
+
+fn parent_context() -> SecurityContext {
+    SecurityContext::builder()
+        .subject_id(Uuid::now_v7())
+        .subject_tenant_id(PARENT_TENANT)
         .subject_type(gts_id!("cf.core.security.subject_user.v1~"))
         .token_scopes(vec!["*".to_owned()])
         .build()
@@ -881,6 +941,60 @@ async fn manual_adjustment_posts_201_then_replays_200() {
     .await;
     assert_eq!(status, StatusCode::OK, "replay 200: {body}");
     assert_eq!(body["replayed"], serde_json::json!(true));
+}
+
+/// A parent user posting a manual adjustment into its child's book → 403. The
+/// write gate asks the PDP for the caller's tenant only (`RootOnly`), so the
+/// child target is outside the scope even though the PDP's default subtree scope
+/// would hold it; nothing posts and no dual-control threshold is read. The child
+/// posting into its own book under the same PDP → 201.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn manual_adjustment_by_a_parent_into_a_child_book_denied_403() {
+    let (_c, _raw, provider, s) = boot().await;
+    let legs = [
+        (AccountClass::CashClearing, Side::Debit, 1),
+        (AccountClass::Suspense, Side::Credit, 1),
+    ];
+    let app = router_with(provider.clone(), hierarchy_enforcer())
+        .layer(axum::Extension(parent_context()));
+    let (status, body) = send(
+        app,
+        "POST",
+        "/bss-ledger/v1/manual-adjustments",
+        Some(manual_body(
+            &s,
+            "ADJ-PARENT-1",
+            "ROUNDING_CORRECTION",
+            &legs,
+        )),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a parent posted into its child's book: {body}"
+    );
+
+    let app = router_with(provider, hierarchy_enforcer()).layer(axum::Extension(authed_context()));
+    let (status, body) = send(
+        app,
+        "POST",
+        "/bss-ledger/v1/manual-adjustments",
+        Some(manual_body(
+            &s,
+            "ADJ-PARENT-1",
+            "ROUNDING_CORRECTION",
+            &legs,
+        )),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "the child posts into its own book: {body}"
+    );
+    assert_eq!(body["replayed"], serde_json::json!(false));
 }
 
 /// A balanced adjustment with a leg OUTSIDE the action's allow-list (DR SUSPENSE 5 /

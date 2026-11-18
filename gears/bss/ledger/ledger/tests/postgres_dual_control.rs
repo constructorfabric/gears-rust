@@ -169,7 +169,6 @@ async fn seed_pending(
 ) -> (Uuid, ApprovalIntent) {
     let approval_id = Uuid::now_v7();
     let intent = ApprovalIntent::Reverse(ReverseIntent {
-        tenant_id: tenant,
         entry_id: Uuid::now_v7(),
         into_period_id: None,
         effective_at: None,
@@ -543,11 +542,12 @@ async fn an_expired_pending_is_not_actionable() {
 
 // ─── service lifecycle: gate / list / request-changes / resubmit / cancel / comments ───
 
-/// A `CreditGrant` intent keyed by `app_id`, sized at `amount` cents (the
-/// amount-gated kind the `gate` threshold check reads).
-fn credit_grant_intent(app_id: &str, amount: i64) -> ApprovalIntent {
+/// A `CreditGrant` intent into `tenant`'s book keyed by `app_id`, sized at
+/// `amount` cents (the amount-gated kind the `gate` threshold check reads). The
+/// gate refuses an intent for a book other than the caller's tenant.
+fn credit_grant_intent(tenant: Uuid, app_id: &str, amount: i64) -> ApprovalIntent {
     ApprovalIntent::CreditGrant(CreditGrantIntent {
-        tenant_id: Uuid::now_v7(),
+        tenant_id: tenant,
         payer_tenant_id: Uuid::now_v7(),
         credit_application_id: app_id.to_owned(),
         amount: usd(amount),
@@ -557,9 +557,8 @@ fn credit_grant_intent(app_id: &str, amount: i64) -> ApprovalIntent {
 
 /// A fresh `Reverse` intent (same kind as `seed_pending`'s) — resubmit requires
 /// the edited intent's kind to match the stored row.
-fn reverse_intent(tenant: Uuid) -> ApprovalIntent {
+fn reverse_intent() -> ApprovalIntent {
     ApprovalIntent::Reverse(ReverseIntent {
-        tenant_id: tenant,
         entry_id: Uuid::now_v7(),
         into_period_id: None,
         effective_at: None,
@@ -591,7 +590,7 @@ async fn gate_over_threshold_creates_pending_and_is_idempotent() {
     let svc = service(&provider, &exec);
     let ctx = ctx_for(Uuid::now_v7(), tenant);
 
-    let intent = credit_grant_intent("CA-DC13", 120_000);
+    let intent = credit_grant_intent(tenant, "CA-DC13", 120_000);
     let facts = OperationFacts {
         kind: ApprovalKind::CreditGrant,
         amount: Some(usd(120_000)),
@@ -642,7 +641,7 @@ async fn gate_below_threshold_creates_no_approval() {
         .gate(
             &ctx,
             &scope,
-            credit_grant_intent("CA-SMALL", 50_000),
+            credit_grant_intent(tenant, "CA-SMALL", 50_000),
             OperationFacts {
                 kind: ApprovalKind::CreditGrant,
                 amount: Some(usd(50_000)),
@@ -737,12 +736,7 @@ async fn resubmit_with_swapped_target_is_rejected() {
     // `reverse_intent()` is the SAME kind (Reverse) but a fresh `entry_id` — a
     // swapped target. The kind guard passes; the identity-pin must reject it.
     let err = svc
-        .resubmit(
-            &ctx_for(preparer, tenant),
-            &scope,
-            id,
-            reverse_intent(tenant),
-        )
+        .resubmit(&ctx_for(preparer, tenant), &scope, id, reverse_intent())
         .await
         .expect_err("a swapped-target resubmit must be rejected");
     assert!(
@@ -801,7 +795,7 @@ async fn resubmit_by_non_preparer_is_rejected() {
             &ctx_for(Uuid::now_v7(), tenant),
             &scope,
             id,
-            reverse_intent(tenant),
+            reverse_intent(),
         )
         .await
         .unwrap_err();

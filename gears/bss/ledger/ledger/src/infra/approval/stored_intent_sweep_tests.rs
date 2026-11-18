@@ -160,7 +160,6 @@ fn generate(rng: &mut Lcg, spec: &CurrencySpec) -> Vec<ApprovalIntent> {
             }),
         }),
         ApprovalIntent::Reverse(ReverseIntent {
-            tenant_id: rng.uuid(),
             entry_id: rng.uuid(),
             into_period_id: rng.opt_text("p"),
             effective_at: rng

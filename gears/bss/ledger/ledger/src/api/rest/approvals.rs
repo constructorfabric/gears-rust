@@ -464,14 +464,13 @@ async fn approve_scope(
     enforcer: &authz_resolver_sdk::PolicyEnforcer,
     ctx: &SecurityContext,
 ) -> Result<AccessScope, CanonicalError> {
-    crate::authz::access_scope(
+    crate::authz::own_tenant_scope(
         enforcer,
         ctx,
         &crate::authz::resource_types::ENTRY,
         crate::authz::actions::APPROVE,
         Some(ctx.subject_tenant_id()),
         None,
-        /* require_constraints */ true,
     )
     .await
     .map_err(authz_error_to_canonical)
@@ -490,27 +489,25 @@ async fn approval_access(
     ctx: &SecurityContext,
 ) -> Result<(AccessScope, bool), CanonicalError> {
     let tenant = ctx.subject_tenant_id();
-    match crate::authz::access_scope(
+    match crate::authz::own_tenant_scope(
         enforcer,
         ctx,
         &crate::authz::resource_types::ENTRY,
         crate::authz::actions::APPROVE,
         Some(tenant),
         None,
-        /* require_constraints */ true,
     )
     .await
     {
         Ok(scope) => Ok((scope, true)),
         Err(crate::authz::AuthzError::Denied(_)) => {
-            let scope = crate::authz::access_scope(
+            let scope = crate::authz::own_tenant_scope(
                 enforcer,
                 ctx,
                 &crate::authz::resource_types::ENTRY,
                 crate::authz::actions::READ,
                 Some(tenant),
                 None,
-                /* require_constraints */ true,
             )
             .await
             .map_err(authz_error_to_canonical)?;
@@ -562,14 +559,13 @@ async fn policy_scope(
     enforcer: &authz_resolver_sdk::PolicyEnforcer,
     ctx: &SecurityContext,
 ) -> Result<AccessScope, CanonicalError> {
-    crate::authz::access_scope(
+    crate::authz::own_tenant_scope(
         enforcer,
         ctx,
         &crate::authz::resource_types::DUAL_CONTROL_POLICY,
         crate::authz::actions::WRITE,
         Some(ctx.subject_tenant_id()),
         None,
-        /* require_constraints */ true,
     )
     .await
     .map_err(authz_error_to_canonical)

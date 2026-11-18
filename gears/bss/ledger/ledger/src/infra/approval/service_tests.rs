@@ -788,7 +788,6 @@ async fn reverse_and_recognition_keep_transaction_basis_without_current_fx() {
     functional(&s, &preparer, &scope, "JPY").await;
     for intent in [
         ApprovalIntent::Reverse(ReverseIntent {
-            tenant_id: preparer.subject_tenant_id(),
             entry_id: Uuid::now_v7(),
             into_period_id: None,
             effective_at: None,
@@ -1023,6 +1022,29 @@ async fn gate_rejects_a_monetary_intent_without_amount_facts() {
     assert!(matches!(
         s.gate(&preparer, &scope, intent, f, "gate".into()).await,
         Err(DomainError::InvalidRequest(_))
+    ));
+    assert!(
+        s.list(&preparer, &scope, None, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// The gate keys the policy, the facts and the pending row to the caller's
+/// tenant, so it refuses an intent for another tenant's book instead of
+/// governing it by the caller's threshold and approvers; no row is created.
+#[tokio::test]
+async fn gate_refuses_an_intent_for_another_tenants_book() {
+    let (s, _, preparer, _, scope) = setup().await;
+    let mut intent = grant(&preparer, money("5000", "EUR", 2));
+    if let ApprovalIntent::CreditGrant(i) = &mut intent {
+        i.tenant_id = Uuid::now_v7();
+    }
+    let f = facts(&intent);
+    assert!(matches!(
+        s.gate(&preparer, &scope, intent, f, "gate".into()).await,
+        Err(DomainError::CrossTenantAccessDenied(_))
     ));
     assert!(
         s.list(&preparer, &scope, None, None)

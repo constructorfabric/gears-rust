@@ -470,18 +470,17 @@ async fn post_invoice(
     // point-in-time invoice that mints none), and the invoice id to filter by.
     let has_recognition = body.items.iter().any(|it| it.recognition.is_some());
     let invoice_id = body.invoice_id.clone();
-    // (entry, post) PEP gate against the TARGET tenant: a parent posts into a
-    // seller in its authorized subtree; a target outside the caller's scope is a
-    // cross-tenant write and is denied. The returned scope threads into the
+    // (entry, post) PEP gate against the TARGET tenant, in the caller's own
+    // tenant only (`RootOnly`): a target in any other tenant, a descendant's
+    // included, is a cross-tenant write and is denied. The returned scope threads into the
     // scoped post (the SQL-level BOLA filter).
-    let scope = crate::authz::access_scope(
+    let scope = crate::authz::own_tenant_scope(
         &enforcer,
         &ctx,
         &crate::authz::resource_types::ENTRY,
         crate::authz::actions::POST,
         Some(tenant_id),
         None,
-        /* require_constraints */ true,
     )
     .await
     .map_err(authz_error_to_canonical)?;
@@ -609,14 +608,13 @@ async fn reverse_entry(
         .ok_or_else(|| entry_not_found(entry_id))?;
 
     // (entry, reverse) gate against the original's owning tenant.
-    let scope = crate::authz::access_scope(
+    let scope = crate::authz::own_tenant_scope(
         &enforcer,
         &ctx,
         &crate::authz::resource_types::ENTRY,
         crate::authz::actions::REVERSE,
         Some(original.tenant_id),
         None,
-        true,
     )
     .await
     .map_err(authz_error_to_canonical)?;
@@ -628,7 +626,6 @@ async fn reverse_entry(
         let reverse_amount = reverse_governed_amount(&original).map_err(CanonicalError::from)?;
         let intent = crate::domain::approval::intent::ApprovalIntent::Reverse(
             crate::domain::approval::intent::ReverseIntent {
-                tenant_id: original.tenant_id,
                 entry_id: original.entry_id,
                 into_period_id: body.period_id.clone(),
                 effective_at: body.effective_at,

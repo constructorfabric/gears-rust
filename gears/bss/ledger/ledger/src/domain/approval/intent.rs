@@ -68,8 +68,6 @@ pub struct PeriodReopenIntent {
 #[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReverseIntent {
-    /// The tenant whose ledger the reversal posts to (the reversed entry's owner).
-    pub tenant_id: Uuid,
     pub entry_id: Uuid,
     pub into_period_id: Option<String>,
     pub effective_at: Option<NaiveDate>,
@@ -891,26 +889,30 @@ impl ApprovalIntent {
         }
     }
 
-    /// The tenant whose ledger this intent posts to (the governed-write target),
-    /// used to key the dual-control gate — the threshold, the functional-currency
-    /// facts, and the pending-approval record — so a cross-tenant post (an MSP
-    /// parent into a child seller's ledger) is governed by the TARGET tenant's
-    /// configured D2 threshold and the target's approvers, not the caller's.
+    /// The tenant whose ledger this intent posts to, when the intent names it.
+    /// `None` for [`Self::Reverse`]: the reversed entry is read under the caller's
+    /// tenant, so its book is the caller's by construction.
+    ///
+    /// The dual-control gate keys the threshold, the functional-currency facts and
+    /// the pending approval to the caller's tenant, which is the book's tenant on
+    /// every user path because those paths authorize the write `RootOnly`
+    /// ([`crate::authz::own_tenant_scope`]). The gate refuses an intent whose
+    /// book is another tenant's rather than govern it by the caller's policy.
     #[must_use]
-    pub fn ledger_tenant(&self) -> Uuid {
+    pub fn ledger_tenant(&self) -> Option<Uuid> {
         match self {
-            Self::Reverse(i) => i.tenant_id,
-            Self::CreditGrant(i) => i.tenant_id,
-            Self::ChargebackLoss(i) => i.tenant_id,
-            Self::PayerClosure(i) => i.tenant_id,
-            Self::PeriodReopen(i) => i.tenant_id,
-            Self::MaterialBackdating(BackdatedPost::Invoice(s)) => s.seller_tenant_id,
-            Self::RecognitionScheduleChange(i) => i.tenant_id,
-            Self::Refund(i) => i.tenant_id,
-            Self::ManualAdjustment(i) => i.tenant_id,
-            Self::CreditNote(i) => i.tenant_id,
-            Self::DebitNote(i) => i.tenant_id,
-            Self::RefundWithCreditNote(i) => i.refund.tenant_id,
+            Self::Reverse(_) => None,
+            Self::CreditGrant(i) => Some(i.tenant_id),
+            Self::ChargebackLoss(i) => Some(i.tenant_id),
+            Self::PayerClosure(i) => Some(i.tenant_id),
+            Self::PeriodReopen(i) => Some(i.tenant_id),
+            Self::MaterialBackdating(BackdatedPost::Invoice(s)) => Some(s.seller_tenant_id),
+            Self::RecognitionScheduleChange(i) => Some(i.tenant_id),
+            Self::Refund(i) => Some(i.tenant_id),
+            Self::ManualAdjustment(i) => Some(i.tenant_id),
+            Self::CreditNote(i) => Some(i.tenant_id),
+            Self::DebitNote(i) => Some(i.tenant_id),
+            Self::RefundWithCreditNote(i) => Some(i.refund.tenant_id),
         }
     }
 

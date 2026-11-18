@@ -152,7 +152,7 @@ impl ApprovalService {
             serde_json::to_value(check_threshold_snapshot(threshold_snapshot)?).map_err(|e| {
                 DomainError::Internal(format!("encode approval policy snapshot: {e}"))
             })?;
-        let tenant = intent.ledger_tenant();
+        let tenant = ctx.subject_tenant_id();
         let kind = intent.kind();
         let business_key = intent.business_key();
 
@@ -244,7 +244,8 @@ impl ApprovalService {
     /// proceeds single-actor, unchanged).
     ///
     /// # Errors
-    /// [`DomainError::Internal`] on a storage failure.
+    /// [`DomainError::CrossTenantAccessDenied`] when the intent's book is not the
+    /// caller's tenant; [`DomainError::Internal`] on a storage failure.
     pub async fn gate(
         &self,
         ctx: &SecurityContext,
@@ -253,9 +254,20 @@ impl ApprovalService {
         facts: OperationFacts,
         reason_code: String,
     ) -> Result<Option<Uuid>, DomainError> {
+        // The policy, the facts and the pending row below are the caller's tenant.
+        // User paths authorize the write `RootOnly`, so the book is the caller's;
+        // an intent for another tenant's book would be governed by the wrong
+        // tenant's threshold and approvers, so refuse it instead.
+        if let Some(book) = intent.ledger_tenant()
+            && book != ctx.subject_tenant_id()
+        {
+            return Err(DomainError::CrossTenantAccessDenied(format!(
+                "dual-control gate for tenant {book} requested by a caller of another tenant"
+            )));
+        }
         let versions = self
             .repo
-            .read_policy_versions(scope, intent.ledger_tenant())
+            .read_policy_versions(scope, ctx.subject_tenant_id())
             .await?;
         let now = OffsetDateTime::now_utc();
         let policy = resolve_policy(&versions, now);
@@ -280,7 +292,7 @@ impl ApprovalService {
         }
         let original_currency = facts.amount.as_ref().map(|v| v.currency().clone());
         let facts = self
-            .to_functional_facts(scope, intent.ledger_tenant(), facts, &intent, now)
+            .to_functional_facts(scope, ctx.subject_tenant_id(), facts, &intent, now)
             .await?;
         if !requires_dual_control(&facts, &policy, to_naive_date(now))
             .map_err(policy_config_to_domain)?

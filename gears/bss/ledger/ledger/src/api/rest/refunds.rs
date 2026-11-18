@@ -309,14 +309,13 @@ async fn post_refund(
     // balanced journal entry into the seller's ledger). A target outside the
     // caller's scope is a cross-tenant write and is denied; the returned scope
     // threads into the scoped post (the SQL-level BOLA filter).
-    let scope = crate::authz::access_scope(
+    let scope = crate::authz::own_tenant_scope(
         &enforcer,
         &ctx,
         &crate::authz::resource_types::ENTRY,
         crate::authz::actions::POST,
         Some(tenant_id),
         None,
-        /* require_constraints */ true,
     )
     .await
     .map_err(authz_error_to_canonical)?;
@@ -345,14 +344,13 @@ async fn post_refund_with_credit_note(
     // same seller (the composite is one tenant's books); the (entry, post) gate is
     // on the refund's tenant.
     let tenant_id = body.refund.tenant_id;
-    let scope = crate::authz::access_scope(
+    let scope = crate::authz::own_tenant_scope(
         &enforcer,
         &ctx,
         &crate::authz::resource_types::ENTRY,
         crate::authz::actions::POST,
         Some(tenant_id),
         None,
-        /* require_constraints */ true,
     )
     .await
     .map_err(authz_error_to_canonical)?;
