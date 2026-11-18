@@ -54,7 +54,7 @@ pub fn register_routes(
     router: Router,
     openapi: &dyn OpenApiRegistry,
     writes: Arc<WriteCoordinator>,
-    enforcer: Arc<authz_resolver_sdk::PolicyEnforcer>,
+    enforcer: Arc<crate::api::authz::PermissionEnforcer>,
 ) -> Router {
     let router = OperationBuilder::put("/settings-service/v1/settings/{key}/value")
         .operation_id("settings_service.set_value")

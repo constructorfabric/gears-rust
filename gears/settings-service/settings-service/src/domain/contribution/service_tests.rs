@@ -1834,6 +1834,60 @@ async fn a_display_name_with_a_control_character_refuses_that_item_and_names_the
     assert!(h.stored(&key("network", "after", 1)).await.is_some());
 }
 
+/// [`flag`] with a description of `chars` characters.
+fn described_flag(category: &str, name: &str, chars: usize) -> ContributedDeclaration {
+    let mut declaration = flag(category, name);
+    declaration.description = Some("d".repeat(chars));
+    declaration
+}
+
+#[tokio::test]
+async fn a_description_over_the_bound_refuses_that_item_and_the_rest_reconcile() {
+    // The bound the administrator's create and update apply, 4096
+    // characters: one over it refuses the item with its own reason, one at
+    // it registers, and the neighbours still register.
+    let h = Harness::new().await;
+    let result = h
+        .register(vec![
+            flag("network", "before"),
+            described_flag("network", "refused", 4097),
+            described_flag("network", "at_bound", 4096),
+            flag("network", "after"),
+        ])
+        .await;
+
+    assert_eq!(
+        codes(&result),
+        vec![reason::DESCRIPTION_TOO_LONG],
+        "{result:?}"
+    );
+    assert_eq!(result.registered, 3, "{result:?}");
+    let error = &result.errors[0];
+    assert_eq!(error.key, key("network", "refused", 1).to_string());
+    assert!(!error.message.contains(&"d".repeat(64)), "{error:?}");
+    assert!(h.stored(&key("network", "refused", 1)).await.is_none());
+    let at_bound = h
+        .stored(&key("network", "at_bound", 1))
+        .await
+        .expect("registered");
+    assert_eq!(at_bound.description.map(|d| d.chars().count()), Some(4096));
+
+    // An update in place is refused alike, and the stored row is kept.
+    let result = h
+        .register(vec![described_flag("network", "at_bound", 4097)])
+        .await;
+    assert_eq!(
+        codes(&result),
+        vec![reason::DESCRIPTION_TOO_LONG],
+        "{result:?}"
+    );
+    let kept = h
+        .stored(&key("network", "at_bound", 1))
+        .await
+        .expect("still there");
+    assert_eq!(kept.description.map(|d| d.chars().count()), Some(4096));
+}
+
 #[tokio::test]
 async fn the_in_place_update_record_carries_the_old_and_new_display_name() {
     // The audit record is the only trace of a label edit by a module.

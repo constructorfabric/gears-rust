@@ -22,7 +22,7 @@ pub fn register_routes(
     search: Arc<ConcreteSearchService>,
     resolver: Arc<ConcreteResolver>,
     db: Arc<DBProvider<DbError>>,
-    enforcer: Arc<authz_resolver_sdk::PolicyEnforcer>,
+    enforcer: Arc<crate::api::authz::PermissionEnforcer>,
 ) -> Router {
     let router = OperationBuilder::get("/settings-service/v1/search")
         .operation_id("settings_service.search_settings")

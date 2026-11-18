@@ -27,6 +27,8 @@ pub mod reason {
     /// A supplied `display_name` is empty after trimming, over 256 characters,
     /// or contains a control character.
     pub const DISPLAY_NAME_INVALID: &str = "display_name_invalid";
+    /// A supplied `description` is over 4096 characters.
+    pub const DESCRIPTION_TOO_LONG: &str = "description_too_long";
     /// A secret-trait type was given a non-empty default.
     pub const SECRET_DEFAULT_NOT_EMPTY: &str = "secret_default_not_empty";
     /// The caller's classification contradicts the value type's trait.

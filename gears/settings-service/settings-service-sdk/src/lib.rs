@@ -31,6 +31,39 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
+// The gear publishes this crate's GTS declarations through its
+// `gts_publication(...)`: this collector, `gts_declarations()`, is what it
+// reads. Every declaration below reaches it and the process-wide inventory.
+toolkit_gts::declare_gts_inventory!();
+
+/// Submit a hand-written type schema to the process-wide inventory and to this
+/// crate's collector: what `toolkit_gts::local::gts_type_schema` does for a
+/// derived one. The two records are built from the same two expressions.
+///
+/// There is no public `toolkit-gts` macro for a hand-written schema, so this
+/// names the `#[doc(hidden)]` collector module that `declare_gts_inventory!()`
+/// generates (`crate::__toolkit_gts_inventory::TypeSchema`): a change to that
+/// internal shape breaks the macro. A schema submitted the plain way (only to
+/// the global inventory) is silently missing from the published manifest; the
+/// test `every_settings_schema_in_the_inventory_is_in_the_collector` catches it
+/// for the `gts.cf.core.settings.` namespace.
+macro_rules! submit_type_schema {
+    ($type_id:expr, $schema_fn:expr) => {
+        toolkit_gts::inventory::submit! {
+            toolkit_gts::InventoryTypeSchema {
+                type_id: $type_id,
+                schema_fn: $schema_fn,
+            }
+        }
+        toolkit_gts::inventory::submit! {
+            crate::__toolkit_gts_inventory::TypeSchema(toolkit_gts::InventoryTypeSchema {
+                type_id: $type_id,
+                schema_fn: $schema_fn,
+            })
+        }
+    };
+}
+
 pub mod activation;
 pub mod api;
 pub mod catalogue;

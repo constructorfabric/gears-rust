@@ -29,6 +29,9 @@ pub const CATEGORY_NAME_LENGTH: &str = "category_name_length";
 /// A category description exceeds the 4096 character bound.
 pub const CATEGORY_DESCRIPTION_LENGTH: &str = "category_description_length";
 
+/// A declaration description exceeds the 4096 character bound.
+pub const DECLARATION_DESCRIPTION_LENGTH: &str = "declaration_description_length";
+
 /// A caller tried to change a category `key`, which is immutable.
 pub const CATEGORY_KEY_IMMUTABLE: &str = "category_key_immutable";
 

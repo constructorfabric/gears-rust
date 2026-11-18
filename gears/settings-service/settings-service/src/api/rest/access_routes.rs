@@ -40,7 +40,7 @@ pub fn register_routes(
     openapi: &dyn OpenApiRegistry,
     service: Arc<ConcreteAccessService>,
     db: Arc<DBProvider<DbError>>,
-    enforcer: Arc<authz_resolver_sdk::PolicyEnforcer>,
+    enforcer: Arc<crate::api::authz::PermissionEnforcer>,
 ) -> Router {
     let router = OperationBuilder::get("/settings-service/v1/settings/{key}/permissions")
         .operation_id("settings_service.read_tenant_access")

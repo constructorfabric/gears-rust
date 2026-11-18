@@ -29,15 +29,19 @@ pub struct RenderedDeclaration {
     pub declaration: Declaration,
     /// The value type's effective traits, merged across its inheritance chain.
     ///
-    /// An empty object when the registry could not answer for this type. A read
-    /// is not failed over it: the declaration is real and its key and value type
-    /// are already known, and refusing the whole page because a rendering hint
-    /// is unavailable would make the catalogue unreadable whenever the registry
-    /// is slow.
+    /// Always a JSON object. It is empty in two cases: the type declares no
+    /// traits (the registry's merge answers `null` for such a type, which is
+    /// normalized here), and the registry could not answer for this type. A
+    /// read is not failed over the second: the declaration is real and its key
+    /// and value type are already known, and refusing the whole page because a
+    /// rendering hint is unavailable would make the catalogue unreadable
+    /// whenever the registry is slow.
     pub traits: Value,
 }
 
-/// Pair a declaration with its type's traits, defaulting to an empty object.
+/// Pair a declaration with its type's traits, defaulting to an empty object
+/// for a type that has no entry: one without traits, or one the registry
+/// could not answer for.
 fn pair(declaration: Declaration, traits: &HashMap<String, Value>) -> RenderedDeclaration {
     let traits = traits
         .get(&declaration.value_type_id)
@@ -68,6 +72,10 @@ impl<R: DeclarationRepository> DeclarationService<R> {
     /// types is three lookups, not fifty. `get_type_schemas` collapses
     /// duplicates and reports per-item failures, so one unknown type costs its
     /// own traits and nothing else.
+    ///
+    /// Only a type that has traits gets an entry. `effective_traits()` answers
+    /// `null`, not an empty object, for a type that declares none; kept, that
+    /// `null` would be served as the declaration's `traits`.
     // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-read:p1:inst-decl-read-8
     async fn traits_for(&self, declarations: &[Declaration]) -> HashMap<String, Value> {
         let mut wanted: Vec<String> = declarations
@@ -84,7 +92,10 @@ impl<R: DeclarationRepository> DeclarationService<R> {
             .get_type_schemas(wanted)
             .await
             .into_iter()
-            .filter_map(|(id, schema)| schema.ok().map(|s| (id, s.effective_traits())))
+            .filter_map(|(id, schema)| {
+                let traits = schema.ok()?.effective_traits();
+                traits.is_object().then_some((id, traits))
+            })
             .collect()
     }
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-read:p1:inst-decl-read-8
@@ -164,3 +175,8 @@ impl<R: DeclarationRepository> DeclarationService<R> {
         })
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "service_tests.rs"]
+mod service_tests;

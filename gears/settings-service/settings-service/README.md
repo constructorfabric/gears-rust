@@ -87,12 +87,16 @@ it, and it would refuse every step-up-gated write with no sign at boot.
 
 ## Dependencies and capabilities
 
-`deps = [types_registry]` — the one gear this service calls during its own
-init, to register the settings GTS schemas. The authorization resolver, the
-AuthN resolver, the tenant resolver and the Credential Store are fetched from
-`ClientHub` at first use on the request path, so they add no ordering edge: a
-gear that reads settings during *its* init names `settings-service` in its own
-`deps` and cannot close a cycle through this one.
+`deps = [types_registry, credstore]` — the gears whose clients this service
+resolves during its own init: the types registry client that the type validator
+and the setting-type registrar call, and the Credential Store client the Secret
+Manager is built over. The gear's own GTS declarations are not registered
+there: the runtime publishes them with the gear's manifest before any `init`.
+The authorization resolver, the AuthN resolver and the tenant resolver are
+fetched from `ClientHub` at first use on the request path, so they add no
+ordering edge: a gear that reads settings during *its* init names
+`settings-service` in its own `deps` and cannot close a cycle through a
+consumed gear.
 
 Capabilities are `db`, `rest` and `stateful`; the managed lifecycle runs three
 passes: the minute sweep that releases staged secrets nobody claimed, the

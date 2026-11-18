@@ -1694,6 +1694,91 @@ fn a_display_name_of_the_wrong_shape_or_length_is_a_validation_error_naming_it()
     }
 }
 
+/// Whether a refusal is the validation error a too-long description gets.
+fn is_description_length(err: &DomainError) -> bool {
+    matches!(
+        err,
+        DomainError::Validation { field, code, .. }
+            if field == "description" && *code == crate::field::DECLARATION_DESCRIPTION_LENGTH
+    )
+}
+
+#[test]
+fn a_description_is_bounded_in_characters_not_bytes() {
+    // The column is `varchar(4096)`, which Postgres counts in characters:
+    // 4096 `ё` are 8192 bytes and fit, 4097 characters of anything do not.
+    use super::check_description;
+    for fits in [String::new(), "x".repeat(4096), "\u{451}".repeat(4096)] {
+        assert!(
+            check_description(&fits).is_ok(),
+            "{} chars",
+            fits.chars().count()
+        );
+    }
+    for too_long in ["x".repeat(4097), "\u{451}".repeat(4097)] {
+        let err = check_description(&too_long).expect_err("refused");
+        assert!(is_description_length(&err), "{err:?}");
+    }
+}
+
+#[test]
+fn a_description_edit_is_bounded_and_null_clears_it() {
+    let declaration = classified_declaration();
+    for value in [
+        json!(null),
+        json!(""),
+        json!("x".repeat(4096)),
+        json!("\u{451}".repeat(4096)),
+    ] {
+        assert_eq!(
+            classify_field("description", &value, &declaration).expect("classified"),
+            FieldClass::Immediate
+        );
+    }
+    for value in [json!("x".repeat(4097)), json!("\u{451}".repeat(4097))] {
+        let err = classify_field("description", &value, &declaration).expect_err("refused");
+        assert!(is_description_length(&err), "{err:?}");
+    }
+    let err = classify_field("description", &json!(7), &declaration).expect_err("refused");
+    assert!(
+        matches!(&err, DomainError::Validation { field, code, .. }
+            if field == "description" && *code == crate::field::VALIDATION),
+        "a wrong shape keeps its own code: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_create_refuses_an_over_long_description_and_stores_one_at_the_bound() {
+    // Refused in the domain, on either backend, before any row is written: the
+    // caller gets a validation error naming the field, not a storage failure.
+    let h = Harness::new().await;
+
+    let mut request = h.request("too_long");
+    request.description = Some("x".repeat(4097));
+    let err = h
+        .create(request, &admin_actor())
+        .await
+        .expect_err("refused");
+    assert!(is_description_length(&err), "{err:?}");
+
+    let mut request = h.request("at_the_bound");
+    request.description = Some("\u{451}".repeat(4096));
+    let created = h.create(request, &admin_actor()).await.expect("created");
+    assert_eq!(
+        created
+            .declaration
+            .description
+            .as_deref()
+            .map(|d| d.chars().count()),
+        Some(4096)
+    );
+
+    let mut request = h.request("absent");
+    request.description = None;
+    let created = h.create(request, &admin_actor()).await.expect("created");
+    assert_eq!(created.declaration.description, None);
+}
+
 #[tokio::test]
 async fn a_created_display_name_is_stored_trimmed_and_an_absent_one_stays_null() {
     // The trimmed value is what is stored and what search matches. Nothing is

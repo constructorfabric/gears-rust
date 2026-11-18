@@ -1647,23 +1647,78 @@ impl authz_resolver_sdk::AuthZResolverApi for UncompilablePdp {
 }
 
 /// An enforcer over a policy decision point that denies everything.
-pub fn denying_enforcer() -> authz_resolver_sdk::PolicyEnforcer {
-    authz_resolver_sdk::PolicyEnforcer::new(Arc::new(DenyAll))
+pub fn denying_enforcer() -> crate::api::authz::PermissionEnforcer {
+    crate::api::authz::PermissionEnforcer::over(authz_resolver_sdk::PolicyEnforcer::new(Arc::new(
+        DenyAll,
+    )))
 }
 
 /// An enforcer over a policy decision point that allows everything.
-pub fn allowing_enforcer() -> authz_resolver_sdk::PolicyEnforcer {
-    authz_resolver_sdk::PolicyEnforcer::new(Arc::new(AllowAll))
+pub fn allowing_enforcer() -> crate::api::authz::PermissionEnforcer {
+    crate::api::authz::PermissionEnforcer::over(authz_resolver_sdk::PolicyEnforcer::new(Arc::new(
+        AllowAll,
+    )))
+}
+
+/// A policy decision point that allows everything, with no constraint, and
+/// keeps every request it was asked: what a caller asked the enforcer, as the
+/// decision point received it.
+#[derive(Default)]
+pub struct RecordingPdp {
+    asked: Mutex<Vec<authz_resolver_sdk::models::EvaluationRequest>>,
+}
+
+impl RecordingPdp {
+    /// The requests asked since the last call, in the order they were asked.
+    pub fn take(&self) -> Vec<authz_resolver_sdk::models::EvaluationRequest> {
+        std::mem::take(
+            &mut *self
+                .asked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+}
+
+#[async_trait]
+impl authz_resolver_sdk::AuthZResolverApi for RecordingPdp {
+    async fn evaluate(
+        &self,
+        _ctx: toolkit_security::PlatformSecurityContext,
+        request: authz_resolver_sdk::models::EvaluationRequest,
+    ) -> Result<
+        authz_resolver_sdk::models::EvaluationResponse,
+        toolkit::api::canonical_prelude::CanonicalError,
+    > {
+        self.asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(request);
+        Ok(authz_resolver_sdk::models::EvaluationResponse {
+            decision: true,
+            context: authz_resolver_sdk::models::EvaluationResponseContext::default(),
+        })
+    }
+}
+
+/// An enforcer over `pdp`.
+pub fn enforcer_over(pdp: &Arc<RecordingPdp>) -> crate::api::authz::PermissionEnforcer {
+    let pdp: Arc<dyn authz_resolver_sdk::AuthZResolverApi> = pdp.clone();
+    crate::api::authz::PermissionEnforcer::over(authz_resolver_sdk::PolicyEnforcer::new(pdp))
 }
 
 /// An enforcer over a policy decision point that cannot be reached.
-pub fn unreachable_enforcer() -> authz_resolver_sdk::PolicyEnforcer {
-    authz_resolver_sdk::PolicyEnforcer::new(Arc::new(UnreachablePdp))
+pub fn unreachable_enforcer() -> crate::api::authz::PermissionEnforcer {
+    crate::api::authz::PermissionEnforcer::over(authz_resolver_sdk::PolicyEnforcer::new(Arc::new(
+        UnreachablePdp,
+    )))
 }
 
 /// An enforcer whose decision arrives with constraints that cannot be compiled.
-pub fn uncompilable_enforcer() -> authz_resolver_sdk::PolicyEnforcer {
-    authz_resolver_sdk::PolicyEnforcer::new(Arc::new(UncompilablePdp))
+pub fn uncompilable_enforcer() -> crate::api::authz::PermissionEnforcer {
+    crate::api::authz::PermissionEnforcer::over(authz_resolver_sdk::PolicyEnforcer::new(Arc::new(
+        UncompilablePdp,
+    )))
 }
 
 /// What a request answered with: the status, the decoded body, and the two
@@ -1760,6 +1815,9 @@ pub struct RestHarness {
     /// What the enforcement points counted, for the tests that assert a
     /// refusal is — or is not — an authorization denial.
     pub security: Arc<RecordingSecurityMetrics>,
+    /// The operations the surface registered, for the tests that read a
+    /// route's declaration rather than its answer.
+    pub openapi: toolkit::api::OpenApiRegistryImpl,
     router: axum::Router,
 }
 
@@ -1958,7 +2016,9 @@ impl RestHarness {
         directory: Arc<dyn crate::infra::actor_names::ActorDirectory>,
     ) -> Self {
         *inner.hierarchy.connection_guard.lock().expect("lock") = Some(Arc::clone(&inner.db));
-        let enforcer = Arc::new(authz_resolver_sdk::PolicyEnforcer::new(pdp));
+        let enforcer = Arc::new(crate::api::authz::PermissionEnforcer::over(
+            authz_resolver_sdk::PolicyEnforcer::new(pdp),
+        ));
         let openapi = toolkit::api::OpenApiRegistryImpl::new();
         let search = Arc::new(crate::domain::search::service::SearchService::new(
             crate::infra::storage::search_repo::SearchRepo::new(inner.db.db().backend()),
@@ -2077,6 +2137,7 @@ impl RestHarness {
             registrar,
             probe,
             security,
+            openapi,
             router,
         }
     }

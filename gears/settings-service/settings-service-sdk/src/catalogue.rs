@@ -9,9 +9,9 @@
 //! is the Settings gear's, under the gear's own namespace and beside the
 //! control-plane types it already owns: it ships from this SDK, and an
 //! identifier that said `toolkit` would name an owner that never held it.
-//! Declared the way every other platform base type is — submitted to the
-//! link-time schema inventory that the types registry drains when it
-//! initializes.
+//! Declared the way every other platform base type is — submitted at link time
+//! to this crate's collector, which the gear publishes with its manifest, and to
+//! the process-wide inventory an embedded types registry drains.
 //!
 //! # Why hand-written JSON rather than `#[gts_type_schema]`
 //!
@@ -29,7 +29,6 @@
 //! That is a registry-side check on the schema diff, not a keyword here.
 
 use serde_json::{Value, json};
-use toolkit_gts::InventoryTypeSchema;
 
 /// The prefix every catalogue value type shares.
 ///
@@ -93,7 +92,7 @@ fn value_type(id: &str, description: &str, mut body: serde_json::Map<String, Val
 }
 
 /// Declare one catalogue type: its id constant, its schema function, and its
-/// inventory submission.
+/// submission to the collector and the inventory.
 macro_rules! catalogue_type {
     ($(#[$doc:meta])* $const_name:ident, $type_name:literal, $fn_name:ident, $description:literal, $body:tt) => {
         $(#[$doc])*
@@ -106,12 +105,7 @@ macro_rules! catalogue_type {
             value_type($const_name, $description, body)
         }
 
-        toolkit_gts::inventory::submit! {
-            InventoryTypeSchema {
-                type_id: $const_name,
-                schema_fn: || $fn_name().to_string(),
-            }
-        }
+        submit_type_schema!($const_name, || $fn_name().to_string());
     };
 }
 

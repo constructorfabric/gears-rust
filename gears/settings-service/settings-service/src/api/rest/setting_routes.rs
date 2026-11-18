@@ -34,7 +34,7 @@ pub fn register_routes(
     openapi: &dyn OpenApiRegistry,
     resolver: Arc<ConcreteResolver>,
     db: Arc<DBProvider<DbError>>,
-    enforcer: Arc<authz_resolver_sdk::PolicyEnforcer>,
+    enforcer: Arc<crate::api::authz::PermissionEnforcer>,
     names: Arc<crate::infra::actor_names::ActorNameResolver>,
 ) -> Router {
     let router = OperationBuilder::get("/settings-service/v1/settings")

@@ -16,7 +16,9 @@ use uuid::Uuid;
 use super::{SettingTypeRegistrar, reason};
 use crate::audit::{ActorTenant, AuditOperation, AuditRecord, AuditSink, AuditValue};
 use crate::domain::category::{CategoryDraft, CategoryKey, CategoryRepository};
-use crate::domain::declaration::admin::{is_empty_placeholder, normalise_display_name};
+use crate::domain::declaration::admin::{
+    check_description, is_empty_placeholder, normalise_display_name,
+};
 use crate::domain::declaration::{
     Declaration, DeclarationDraft, DeclarationMetadata, DeclarationRepository, DeclarationStatus,
 };
@@ -150,6 +152,22 @@ fn check_display_name(contributed: &ContributedDeclaration) -> Result<(), ItemEr
     }
 }
 
+/// Refuse a supplied description longer than a declaration's description may
+/// be, as the administrator's create and update refuse it: the column would
+/// refuse it on `PostgreSQL` as a storage failure and `SQLite` would store it.
+/// The other items of the batch continue.
+fn check_contributed_description(contributed: &ContributedDeclaration) -> Result<(), ItemError> {
+    match contributed.description.as_deref().map(check_description) {
+        None | Some(Ok(())) => Ok(()),
+        Some(Err(DomainError::Validation { message, .. })) => {
+            Err(refused(reason::DESCRIPTION_TOO_LONG, message))
+        }
+        // Whatever else the bound may one day refuse, it refuses the supplied
+        // value: the item is turned away, never failed as a batch.
+        Some(Err(other)) => Err(refused(reason::DESCRIPTION_TOO_LONG, other.wire_message())),
+    }
+}
+
 fn scope_class_name(class: ScopeClass) -> &'static str {
     match class {
         ScopeClass::Global => "global",
@@ -273,6 +291,7 @@ where
         // @cpt-end:cpt-cf-settings-service-algo-module-contributions-reconcile:p1:inst-mc-rec-1
         // @cpt-begin:cpt-cf-settings-service-algo-module-contributions-reconcile:p1:inst-mc-rec-2
         check_display_name(contributed)?;
+        check_contributed_description(contributed)?;
         self.check_default(contributed).await?;
         // @cpt-end:cpt-cf-settings-service-algo-module-contributions-reconcile:p1:inst-mc-rec-2
 

@@ -324,6 +324,37 @@ pub fn normalise_display_name(raw: &str) -> Result<String, DomainError> {
     Ok(trimmed.to_owned())
 }
 
+/// The longest description, in Unicode characters: the width of the
+/// `varchar(4096)` column, which Postgres counts in characters too.
+const DESCRIPTION_MAX_CHARS: usize = 4096;
+
+/// Check a description against its bound. An empty one is fine: the bound is
+/// an upper one only, and the value is stored as supplied.
+///
+/// Without this check the two backends disagree: Postgres refuses the row at
+/// the column, which reaches the caller as a storage failure for a mistake
+/// that is theirs to fix, and `SQLite`, whose column is unbounded, stores it.
+/// The same rule a category's description follows
+/// (`crate::domain::category::bounds`).
+///
+/// # Errors
+/// [`DomainError::Validation`] naming `description`, with the code
+/// [`field::DECLARATION_DESCRIPTION_LENGTH`], when it is longer than the bound.
+pub fn check_description(description: &str) -> Result<(), DomainError> {
+    let length = description.chars().count();
+    if length > DESCRIPTION_MAX_CHARS {
+        return Err(validation(
+            "description",
+            field::DECLARATION_DESCRIPTION_LENGTH,
+            format!(
+                "a declaration description is at most {DESCRIPTION_MAX_CHARS} characters; \
+                 this one is {length}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn validation(field: &str, code: &'static str, message: impl Into<String>) -> DomainError {
     DomainError::Validation {
         field: field.to_owned(),
@@ -505,7 +536,16 @@ pub fn classify_field(
     };
     let class = match name {
         // @cpt-begin:cpt-cf-settings-service-algo-setting-declarations-mutation-class:p1:inst-decl-mutcls-2
-        "description" | "domain_affinity" | "licence_feature" => {
+        "description" => {
+            if !value.is_null() {
+                let Some(raw) = value.as_str() else {
+                    return Err(wrong_shape("a string or null"));
+                };
+                check_description(raw)?;
+            }
+            FieldClass::Immediate
+        }
+        "domain_affinity" | "licence_feature" => {
             if !(value.is_string() || value.is_null()) {
                 return Err(wrong_shape("a string or null"));
             }
@@ -973,6 +1013,11 @@ where
             .as_deref()
             .map(normalise_display_name)
             .transpose()?;
+        // Before the path is looked up, so a create, a revive and an evolution
+        // all refuse an over-long description the same way.
+        if let Some(description) = request.description.as_deref() {
+            check_description(description)?;
+        }
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-7
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-6
         if !matches!(

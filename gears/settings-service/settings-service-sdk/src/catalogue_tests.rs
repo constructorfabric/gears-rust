@@ -74,8 +74,9 @@ fn traits_are_declared_where_the_validator_and_reader_need_them() {
 
 #[test]
 fn the_catalogue_is_submitted_to_the_inventory() {
-    // What the types registry drains at its init: absent from the inventory,
-    // no declaration could name the type and validate against it.
+    // What an embedded types registry drains at its init (the production path is
+    // the crate collector): absent from the inventory, no declaration could name
+    // the type and validate against it.
     let ids: HashSet<String> = toolkit_gts::all_inventory_type_schemas()
         .expect("inventory renders")
         .into_iter()

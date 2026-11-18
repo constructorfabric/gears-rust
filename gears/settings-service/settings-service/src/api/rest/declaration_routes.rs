@@ -138,7 +138,7 @@ pub fn register_routes(
     admin: Arc<handlers::ConcreteDeclarationAdmin>,
     resolver: Arc<crate::gear::ConcreteResolver>,
     db: Arc<DBProvider<DbError>>,
-    enforcer: Arc<authz_resolver_sdk::PolicyEnforcer>,
+    enforcer: Arc<crate::api::authz::PermissionEnforcer>,
 ) -> Router {
     // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-read:p1:inst-decl-read-1
     let router = OperationBuilder::get("/settings-service/v1/declarations")
