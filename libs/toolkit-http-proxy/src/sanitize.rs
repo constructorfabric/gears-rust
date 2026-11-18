@@ -9,7 +9,8 @@
 //!   close-delimited (CVE-2026-2835 class: `identity, chunked`, HTTP/1.0 +
 //!   TE, CL/TE disagreement).
 //! - **Hop-by-hop headers, including every `Connection`-nominated one, are
-//!   dropped** (RFC 9110 §7.6.1).
+//!   dropped** (RFC 9110 §7.6.1), except `Trailer`, which is end-to-end
+//!   (§6.6.2) and is kept filtered, as below.
 //! - **`Expect` is dropped**: the engine sends complete bodies, and a
 //!   forwarded `Expect` is the lever for 0.CL / early-response desyncs.
 //! - **Protocol switches are allowlisted.** Only `GET` + `Upgrade: websocket`
@@ -18,8 +19,12 @@
 //!   `HTTP2-Settings` never reach the upstream.
 //! - `TE` survives only as `TE: trailers` (needed by gRPC over HTTP/2).
 //! - **Trailers keep every field except framing, connection-scoped fields and
-//!   `Host`** (RFC 9110 §6.5.1). A response keeps its `Trailer` declaration,
-//!   minus those names, so an HTTP/1.1 recipient knows what follows.
+//!   `Host`** (RFC 9110 §6.5.1). Request trailers also lose credential,
+//!   routing and representation fields and request modifiers
+//!   ([`sanitize_request_trailers`]). Requests and responses keep their
+//!   `Trailer` declaration, minus the names their trailers lose: an HTTP/1.1
+//!   recipient learns from it what follows, and hyper sends only the request
+//!   trailers it declares.
 
 use std::sync::Arc;
 
@@ -28,7 +33,9 @@ use http::{Method, StatusCode};
 
 use crate::error::{ErrorKind, ProxyError};
 
-/// Hop-by-hop headers (RFC 9110 §7.6.1, plus legacy `proxy-connection`).
+/// Hop-by-hop headers: the RFC 2616 §13.5.1 / RFC 7230 §6.1 set, plus legacy
+/// `proxy-connection`. Not the list the engine drops: requests and responses
+/// keep `Trailer`, filtered (RFC 9110 §6.6.2; see the module docs).
 pub const HOP_BY_HOP_HEADERS: &[&str] = &[
     "connection",
     "keep-alive",
@@ -55,15 +62,17 @@ const HOP_BY_HOP: [HeaderName; 9] = [
     header::UPGRADE,
 ];
 
-/// Request headers dropped: the hop-by-hop set plus framing and control.
-const REQUEST_DROPPED: [HeaderName; 12] = [
+/// Request headers dropped: the hop-by-hop set plus framing and control,
+/// except `Trailer`, which is end-to-end (RFC 9110 §6.6.2) and is filtered
+/// instead. It does not frame the message: hyper derives the framing from
+/// the body and uses the declaration only to choose which trailers to send.
+const REQUEST_DROPPED: [HeaderName; 11] = [
     header::CONNECTION,
     HeaderName::from_static("keep-alive"),
     header::PROXY_AUTHENTICATE,
     header::PROXY_AUTHORIZATION,
     HeaderName::from_static("proxy-connection"),
     header::TE,
-    header::TRAILER,
     header::TRANSFER_ENCODING,
     header::UPGRADE,
     header::CONTENT_LENGTH,
@@ -103,6 +112,43 @@ const TRAILER_DROPPED: [HeaderName; 12] = [
     HeaderName::from_static("proxy-authentication-info"),
 ];
 
+/// Fields a request's trailers (and its `Trailer` declaration) lose on top of
+/// [`TRAILER_DROPPED`]: credentials, routing, representation metadata and
+/// request modifiers (controls and conditionals, RFC 9110 §6.5.1), plus any
+/// `X-Forwarded-*`, and the `Expect` and `HTTP2-Settings` fields the engine
+/// strips from request heads. An upstream that merges trailers into the
+/// header section would otherwise take them as head fields the caller's own
+/// proxy stripped or overrode (CVE-2013-5704 class), or turn the request
+/// into a conditional or range request. hyper refuses only a subset of
+/// these in the trailers it encodes, and h2 none.
+const REQUEST_TRAILER_DROPPED: [HeaderName; 20] = [
+    header::AUTHORIZATION,
+    header::COOKIE,
+    header::SET_COOKIE,
+    header::CACHE_CONTROL,
+    header::CONTENT_ENCODING,
+    header::CONTENT_RANGE,
+    header::CONTENT_TYPE,
+    header::MAX_FORWARDS,
+    header::FORWARDED,
+    header::VIA,
+    HeaderName::from_static("x-real-ip"),
+    header::IF_MATCH,
+    header::IF_NONE_MATCH,
+    header::IF_MODIFIED_SINCE,
+    header::IF_UNMODIFIED_SINCE,
+    header::IF_RANGE,
+    header::RANGE,
+    header::PRAGMA,
+    header::EXPECT,
+    HeaderName::from_static("http2-settings"),
+];
+
+/// Whether a request's trailers drop `name` (beyond [`TRAILER_DROPPED`]).
+fn request_trailer_dropped(name: &HeaderName) -> bool {
+    REQUEST_TRAILER_DROPPED.contains(name) || name.as_str().starts_with("x-forwarded-")
+}
+
 /// The fields a message's `Connection` header nominated. They are hop-by-hop
 /// in the trailers too (RFC 9110 §7.6.1), so they travel with the request
 /// (as this extension) or the response body to where the trailers are
@@ -134,16 +180,30 @@ pub enum RequestKind {
 
 /// Sanitize outbound request headers in place.
 ///
-/// For [`RequestKind::WebSocketUpgrade`] the `Connection: Upgrade` /
-/// `Upgrade: websocket` pair is re-emitted canonically after stripping.
+/// `Trailer` is filtered like the trailers themselves
+/// ([`sanitize_request_trailers`]), also losing the fields `Connection`
+/// nominated.
+/// For [`RequestKind::WebSocketUpgrade`] it is dropped (the handshake has
+/// no body), and the `Connection: Upgrade` / `Upgrade: websocket` pair is
+/// re-emitted canonically after stripping.
 pub fn sanitize_request_headers(headers: &mut HeaderMap, kind: RequestKind) {
     let te_trailers = headers
         .get_all(header::TE)
         .iter()
         .any(|v| v.as_bytes().eq_ignore_ascii_case(b"trailers"));
 
-    strip_connection_nominated(headers, &[]);
+    let nominated = connection_nominated(headers);
+    for name in &nominated {
+        headers.remove(name);
+    }
     remove_all(headers, &REQUEST_DROPPED);
+    if headers.contains_key(header::TRAILER) {
+        if kind == RequestKind::Regular {
+            filter_trailer_declaration(headers, &nominated, request_trailer_dropped);
+        } else {
+            headers.remove(header::TRAILER);
+        }
+    }
 
     if te_trailers {
         headers.insert(header::TE, HeaderValue::from_static("trailers"));
@@ -197,15 +257,16 @@ pub(crate) fn sanitize_response_head(
     }
     remove_all(headers, &RESPONSE_DROPPED);
     if headers.contains_key(header::TRAILER) {
-        filter_trailer_declaration(headers, &nominated);
+        filter_trailer_declaration(headers, &nominated, |_| false);
     }
     nominated
 }
 
-/// Sanitize trailers in place, in either direction: drop framing,
-/// connection- and proxy-hop-scoped fields (including any a `Connection`
-/// field in the trailers nominates) and `Host`; keep everything else
-/// (`grpc-status`, checksums, timing, custom fields).
+/// Sanitize response trailers in place: drop framing, connection- and
+/// proxy-hop-scoped fields (including any a `Connection` field in the
+/// trailers nominates) and `Host`; keep everything else (`grpc-status`,
+/// checksums, timing, custom fields). Request trailers lose more: use
+/// [`sanitize_request_trailers`].
 pub fn sanitize_trailers(trailers: &mut HeaderMap) {
     sanitize_trailers_without(trailers, &[]);
 }
@@ -220,9 +281,47 @@ pub(crate) fn sanitize_trailers_without(trailers: &mut HeaderMap, hop: &[HeaderN
     }
 }
 
-/// Rewrite `Trailer` without the names [`sanitize_trailers_without`] drops;
-/// remove it when nothing is left.
-fn filter_trailer_declaration(headers: &mut HeaderMap, hop: &[HeaderName]) {
+/// Sanitize a request's trailers in place: what [`sanitize_trailers`] drops,
+/// plus credential, routing and representation fields (`Authorization`,
+/// `Cookie`, `Set-Cookie`, `Cache-Control`, `Content-Encoding`,
+/// `Content-Range`, `Content-Type`, `Max-Forwards`, `Forwarded`, `Via`,
+/// `X-Real-IP`, `X-Forwarded-*`), request modifiers (`If-Match`,
+/// `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`, `If-Range`,
+/// `Range`, `Pragma`) and `Expect` / `HTTP2-Settings`. An upstream that
+/// merges trailers into the header section would otherwise take them as head
+/// fields.
+///
+/// This is a denylist. Whether any other field may be sent in trailers is
+/// the caller's decision: RFC 9110 §6.5.1 leaves that check to the sender.
+pub fn sanitize_request_trailers(trailers: &mut HeaderMap) {
+    sanitize_request_trailers_without(trailers, &[]);
+}
+
+/// [`sanitize_request_trailers`], also dropping `hop`: the fields the request
+/// head's `Connection` header nominated.
+pub(crate) fn sanitize_request_trailers_without(trailers: &mut HeaderMap, hop: &[HeaderName]) {
+    sanitize_trailers_without(trailers, hop);
+    let dropped: Vec<HeaderName> = trailers
+        .keys()
+        .filter(|name| request_trailer_dropped(name))
+        .cloned()
+        .collect();
+    for name in dropped {
+        trailers.remove(name);
+    }
+}
+
+/// Rewrite `Trailer` without the names [`sanitize_trailers_without`] drops,
+/// the names in `hop` and those `also_dropped` selects; remove it when
+/// nothing is left.
+fn filter_trailer_declaration(
+    headers: &mut HeaderMap,
+    hop: &[HeaderName],
+    also_dropped: fn(&HeaderName) -> bool,
+) {
+    // `hop` comes from the caller's `Connection` field and is not bounded:
+    // look names up in a set, so the cost stays linear in both lists.
+    let hop: std::collections::HashSet<&HeaderName> = hop.iter().collect();
     let kept: Vec<&str> = headers
         .get_all(header::TRAILER)
         .iter()
@@ -231,8 +330,9 @@ fn filter_trailer_declaration(headers: &mut HeaderMap, hop: &[HeaderName]) {
         .map(str::trim)
         .filter(|t| {
             !t.is_empty()
-                && HeaderName::from_bytes(t.as_bytes())
-                    .is_ok_and(|n| !TRAILER_DROPPED.contains(&n) && !hop.contains(&n))
+                && HeaderName::from_bytes(t.as_bytes()).is_ok_and(|n| {
+                    !TRAILER_DROPPED.contains(&n) && !hop.contains(&n) && !also_dropped(&n)
+                })
         })
         .collect();
     let value = (!kept.is_empty())

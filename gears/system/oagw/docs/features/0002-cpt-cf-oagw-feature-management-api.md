@@ -97,10 +97,11 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
 - Response contains the created upstream with GTS anonymous identifier
 
 **Error Scenarios**:
-- Validation fails (invalid endpoint format, missing required fields)
+- Validation fails (invalid endpoint format, missing required fields, a value the gateway cannot serve: see [Upstream Validation Algorithm](#upstream-validation-algorithm))
 - Alias conflict: `(tenant_id, alias)` uniqueness violation
-- Credential reference invalid (malformed `secret_ref` format)
-- Credential store unavailable while checking that the `secret_ref` is accessible (500 Internal, fail-closed; any other credential-store refusal is a 400 validation error)
+- Credential reference invalid: a malformed `secret_ref`, `client_id_ref` or `client_secret_ref` (400 `invalid_argument` on `auth.config.{key}`)
+- Credential reference not found in the credential store (400 `failed_precondition` on `auth.config.{key}`)
+- Credential store unavailable while checking that a reference is accessible (500 Internal, fail-closed; any other credential-store refusal, such as access denied, is a 400 `invalid_argument` on `auth.config.{key}`)
 
 **Steps**:
 1. [x] - `p1` - Actor sends POST /api/oagw/v1/upstreams with server endpoints, protocol, auth config, headers, rate limit config, tags - `inst-create-us-1`
@@ -196,14 +197,15 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
 - Upstream not found (get by ID)
 
 **Steps**:
-1. [x] - `p1` - Actor sends GET /api/oagw/v1/upstreams[?$filter=...&$select=...&$orderby=...&$top=...&$skip=...] or GET /api/oagw/v1/upstreams/{id} - `inst-list-us-1`
+1. [x] - `p1` - Actor sends GET /api/oagw/v1/upstreams[?limit=...&offset=...] or GET /api/oagw/v1/upstreams/{id} (OData parameters are planned, see `inst-list-us-3a`) - `inst-list-us-1`
 2. [x] - `p1` - API: Extract SecurityContext and validate `gts.cf.core.oagw.upstream.v1~:read` permission - `inst-list-us-2`
 3. [x] - `p1` - **IF** list request - `inst-list-us-3`
    1. [ ] - `p1` - API: Parse OData query parameters ($filter, $select, $orderby, $top with default 50 / max 100, $skip) - `inst-list-us-3a`
-   2. [ ] - `p1` - **IF** OData parse error - `inst-list-us-3b`
-      1. [ ] - `p1` - **RETURN** 400 ValidationError with parse error details - `inst-list-us-3b1`
+   2. [x] - `p1` - **IF** a query parameter value does not parse (today `limit` or `offset`; OData expressions once `inst-list-us-3a` is implemented) - `inst-list-us-3b`
+      1. [x] - `p1` - **RETURN** 400 ValidationError with parse error details (field `query`, reason `VALIDATION`) - `inst-list-us-3b1`
    3. [x] - `p1` - Repo: SELECT upstreams WHERE tenant_id = :tenant_id with pagination applied - `inst-list-us-3c`
    4. [x] - `p1` - **RETURN** 200 OK with paginated upstream list - `inst-list-us-3d`
+   5. [x] - `p1` - API: before the query runs, reject any parameter other than `limit` and `offset` (route lists: also `upstream_id`), OData `$…` parameters included, with 400 `invalid_argument`, reason `UNSUPPORTED_QUERY_PARAM` - `inst-list-us-3e`
 4. [x] - `p1` - **IF** get-by-ID request - `inst-list-us-4`
    1. [x] - `p1` - API: Parse GTS anonymous identifier from path - `inst-list-us-4a`
    2. [x] - `p1` - Repo: SELECT upstream WHERE id = :uuid AND tenant_id = :tenant_id - `inst-list-us-4b`
@@ -292,19 +294,32 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
       1. [x] - `p1` - Add error: "Unsupported scheme: {scheme}" - `inst-val-us-3a1`
    2. [x] - `p1` - **IF** host is empty or not a valid hostname/IP - `inst-val-us-3b`
       1. [x] - `p1` - Add error: "Invalid host: {host}" - `inst-val-us-3b1`
-   3. [x] - `p1` - **IF** port is out of range (1-65535) - `inst-val-us-3c`
+   3. [x] - `p1` - **IF** port is out of range (1-65535): 0 is a 400 validation error, a value above 65535 fails request decoding with 422 - `inst-val-us-3c`
       1. [x] - `p1` - Add error: "Invalid port: {port}" - `inst-val-us-3c1`
+   4. [x] - `p1` - **IF** scheme is `http` and the gear option `allow_http_upstream` is off - `inst-val-us-3d`
+      1. [x] - `p1` - Add error on `server.endpoints.scheme`, reason `HTTP_UPSTREAM_FORBIDDEN` - `inst-val-us-3d1`
 4. [x] - `p1` - **IF** multiple endpoints exist - `inst-val-us-4`
    1. [x] - `p1` - **IF** endpoints have mixed protocols, schemes, or ports - `inst-val-us-4a`
       1. [x] - `p1` - Add error: "All endpoints in a pool must share the same protocol, scheme, and port" - `inst-val-us-4a1`
-5. [x] - `p1` - **IF** auth config contains secret_ref - `inst-val-us-5`
-   1. [x] - `p1` - **IF** secret_ref does not match `cred://` URI format - `inst-val-us-5a`
-      1. [x] - `p1` - Add error: "Invalid secret_ref format; expected cred:// URI" - `inst-val-us-5a1`
+5. [x] - `p1` - **FOR EACH** credential reference in the auth config: `secret_ref`, `client_id_ref` and `client_secret_ref`, the keys the auth plugins read (`apikey`: `secret_ref`; OAuth2: `client_id_ref`, `client_secret_ref`), whatever the configured plugin; other keys are not resolved - `inst-val-us-5`
+   1. [x] - `p1` - **IF** the value is not a valid secret reference (the `cred://` prefix is optional) - `inst-val-us-5a`
+      1. [x] - `p1` - Add error on `auth.config.{key}`: "auth.config.{key}: invalid credential reference: {reason}" - `inst-val-us-5a1`
+   2. [x] - `p1` - **IF** the credential store has no such secret for the caller (not provisioned yet, or not shared: the store answers "not found") - `inst-val-us-5b`
+      1. [x] - `p1` - **RETURN** 400 `failed_precondition` with the violation subject `auth.config.{key}`; the value is not echoed - `inst-val-us-5b1`
+   3. [x] - `p1` - **IF** the credential store refuses the reference for another reason (for example access denied) - `inst-val-us-5d`
+      1. [x] - `p1` - **RETURN** 400 `invalid_argument`, field violation on `auth.config.{key}` with reason `VALIDATION` - `inst-val-us-5d1`
+   4. [x] - `p1` - The check is best effort and runs with the writer's security context; the proxy resolves the secret again with the caller's context on every request. A secret deleted or made unreadable after the write, or one the writer can read but a caller cannot, still fails at proxy time. A credential store that does not answer within 5 s fails the write with 500 - `inst-val-us-5c`
 6. [ ] - `p1` - **IF** protocol not in [http, grpc] - `inst-val-us-6`
    1. [ ] - `p1` - Add error: "Unsupported protocol: {protocol}" - `inst-val-us-6a`
 7. [x] - `p1` - **IF** tags, the protocol, the auth type, or a plugin reference exceed the stored field limits (see [Route Validation Algorithm](#route-validation-algorithm)) - `inst-val-us-tags`
    1. [x] - `p1` - Add error naming the limit - `inst-val-us-tags-a`
-8. [x] - `p1` - **RETURN** { valid: errors.length == 0, errors } - `inst-val-us-7`
+   2. [x] - `p1` - **IF** a tag does not match `^[a-z0-9_-]+$` - `inst-val-us-tags-b`
+      1. [x] - `p1` - Add error: "tags[{i}] must match ^[a-z0-9_-]+$" - `inst-val-us-tags-b1`
+8. [x] - `p1` - **IF** a rate limit has `sustained.rate`, `burst.capacity` or `cost` of 0 - `inst-val-us-rl`
+   1. [x] - `p1` - Add error: "rate_limit.{field} must be at least 1" - `inst-val-us-rl-a`
+9. [x] - `p1` - **IF** `auth.type` is not an implemented auth plugin, or a `plugins.items[].plugin_ref` is not an implemented guard or transform plugin (catalog-only, custom UUID and unknown ids alike) - `inst-val-us-plugins`
+   1. [x] - `p1` - Add error with reason `NOT_IMPLEMENTED`; a plugin of the wrong kind (an auth plugin in `plugins.items`, a guard or transform in `auth.type`) is a `VALIDATION` error - `inst-val-us-plugins-a`
+10. [x] - `p1` - **RETURN** { valid: errors.length == 0, errors } - `inst-val-us-7`
 
 ### Alias Enforcement Algorithm
 
@@ -327,7 +342,7 @@ The update and alias-only paths below apply to Management API and SDK writes. A 
 3. [x] - `p1` - **IF** not derivable (IP-based or no common suffix) - `inst-alias-3`
    1. [x] - `p1` - **IF** no explicit alias provided - `inst-alias-3a`
       1. [x] - `p1` - **RETURN** 400 Validation: "explicit alias is required for IP-based or heterogeneous-host endpoints" - `inst-alias-3a1`
-   2. [x] - `p1` - Normalize and validate explicit alias (charset, length) - `inst-alias-3b`
+   2. [x] - `p1` - Normalize and validate explicit alias (charset, length; `_` allowed anywhere; trailing dots are stripped first, then a leading or trailing `.`, `-` or `:` is rejected) - `inst-alias-3b`
    3. [x] - `p1` - **RETURN** normalized alias - `inst-alias-3c`
 
 **Update path** (`enforce_alias_update_with` / `enforce_alias_update_derived` — when endpoints change):
@@ -372,24 +387,25 @@ The update and alias-only paths below apply to Management API and SDK writes. A 
 3. [x] - `p1` - **IF** upstream not found - `inst-val-rt-3`
    1. [x] - `p1` - Add error: "Referenced upstream does not exist or is not accessible" - `inst-val-rt-3a`
 4. [x] - `p1` - **IF** match_type == "http" - `inst-val-rt-4`
-   1. [x] - `p1` - **IF** match.http.path is empty - `inst-val-rt-4a`
-      1. [x] - `p1` - Add error: "HTTP match path is required" - `inst-val-rt-4a1`
-   2. [x] - `p1` - **IF** match.http.methods contains invalid HTTP method - `inst-val-rt-4b`
+   1. [x] - `p1` - **IF** match.http.path is empty or does not start with `/`, or no request path could match it (an empty, `.` or `..` segment, a stray `%` or `;`, an encoded dot-segment) - `inst-val-rt-4a`
+      1. [x] - `p1` - Add error on `match.http.path` with reason `INVALID_PROXY_PATH`, for example "route path must start with `/`" - `inst-val-rt-4a1`
+   2. [x] - `p1` - **IF** match.http.methods is empty - `inst-val-rt-4e`
+      1. [x] - `p1` - Add error: "match.http.methods must list at least one method" - `inst-val-rt-4e1`
+   3. [x] - `p1` - **IF** match.http.methods contains invalid HTTP method - `inst-val-rt-4b`
       1. [x] - `p1` - Add error: "Invalid HTTP method: {method}" - `inst-val-rt-4b1`
-   3. [x] - `p1` - **IF** match.http.path or match.http.query_allowlist exceeds the stored field limits - `inst-val-rt-4c`
+   4. [x] - `p1` - **IF** match.http.path or match.http.query_allowlist exceeds the stored field limits - `inst-val-rt-4c`
       1. [x] - `p1` - Add error naming the limit - `inst-val-rt-4c1`
 5. [x] - `p1` - **IF** match_type == "grpc" - `inst-val-rt-5`
    1. [ ] - `p1` - **IF** match.grpc.service is empty (not enforced yet) - `inst-val-rt-5a`
       1. [ ] - `p1` - Add error: "gRPC service name is required" - `inst-val-rt-5a1`
    2. [x] - `p1` - **IF** match.grpc.service or match.grpc.method exceeds the stored field limits - `inst-val-rt-5b`
       1. [x] - `p1` - Add error naming the limit - `inst-val-rt-5b1`
-6. [x] - `p1` - **IF** priority is not a positive integer - `inst-val-rt-6`
-   1. [x] - `p1` - Add error: "Priority must be a positive integer" - `inst-val-rt-6a`
+6. [x] - `p1` - Priority is any 32-bit signed integer; it is not validated - `inst-val-rt-6`
 7. [x] - `p1` - **IF** the route is an enabled HTTP route: Repo, inside the create or update transaction: lock the upstream row the route is written to (`FOR UPDATE`), then read the tenant's enabled HTTP routes on that upstream that share the path_prefix, the priority, and at least one method (one query), so concurrent writes on any replica serialize and the later one sees the earlier - `inst-val-rt-7`
 8. [x] - `p1` - **IF** one of them remains after excluding self on update (report the lowest route ID, then the first shared method) - `inst-val-rt-8`
    1. [x] - `p1` - **RETURN** 409 Conflict: "route overlap: an enabled route already exists on upstream {upstream_id} with path {path}, priority {priority}, method {method}" - `inst-val-rt-8a`
-9. [x] - `p1` - **IF** tags or a plugin reference exceed the stored field limits - `inst-val-rt-tags`
-   1. [x] - `p1` - Add error naming the limit - `inst-val-rt-tags-a`
+9. [x] - `p1` - **IF** tags or a plugin reference exceed the stored field limits, a tag does not match `^[a-z0-9_-]+$`, a rate limit value is 0, or a plugin reference is not an implemented guard or transform plugin (same rules as [Upstream Validation Algorithm](#upstream-validation-algorithm)) - `inst-val-rt-tags`
+   1. [x] - `p1` - Add error naming the field - `inst-val-rt-tags-a`
 10. [x] - `p1` - **RETURN** { valid: errors.length == 0, errors } - `inst-val-rt-9`
 
 **Stored field limits**: an upstream or route carries at most 64 tags, each at most 128 bytes; an HTTP path prefix is at most 2048 bytes; an HTTP match allows at most 64 query parameters, each at most 128 bytes; a gRPC service and a gRPC method are at most 256 bytes each; an upstream's protocol and auth type, and every plugin reference of an upstream or route, are at most 256 bytes each; an upstream or route carries at most 32 plugin bindings. None of these may contain control characters, NUL included. Strings stored inside JSON (auth and plugin config, header rules, CORS lists) may not contain NUL, which PostgreSQL's `jsonb` cannot store; other control characters are allowed there. They apply on create and update, through the Management API, the SDK, and types-registry provisioning alike, and a violation is a 400 validation error. Each is stored in a `VARCHAR` sized to its limit (query parameters inside the route's JSON), and PostgreSQL rejects any text containing NUL, so without the limits such input would fail as a 500 on PostgreSQL and MySQL while SQLite and the in-memory repositories accepted it. The protocol is not checked against the known protocol identifiers.
@@ -484,7 +500,7 @@ The system **MUST** support an `enabled` boolean field (default: `true`) on upst
 
 - [ ] `p1` - **ID**: `cpt-cf-oagw-dod-mgmt-odata-query`
 
-The system **MUST** support OData query parameters on upstream and route list endpoints: `$filter`, `$select`, `$orderby`, `$top` (default: 50, max: 100), and `$skip`. Invalid OData syntax **MUST** return 400 ValidationError.
+The system **MUST** support OData query parameters on upstream and route list endpoints: `$filter`, `$select`, `$orderby`, `$top` (default: 50, max: 100), and `$skip`. Invalid OData syntax **MUST** return 400 ValidationError. Until then, any parameter other than `limit`, `offset` and (routes) `upstream_id` is rejected with 400 `UNSUPPORTED_QUERY_PARAM` rather than ignored.
 
 **Implements**:
 - `cpt-cf-oagw-flow-mgmt-list-upstreams`
@@ -522,6 +538,9 @@ The system **MUST** return all management API errors in RFC 9457 Problem Details
 - [x] Tags, HTTP path prefixes and gRPC service and method names within the stored field limits are accepted on create and update; longer values or values with control characters are rejected with 400 on every storage backend
 - [x] Tags and HTTP methods are de-duplicated and returned in canonical order (tags ascending; methods `GET, POST, PUT, DELETE, PATCH`) on both storage backends
 - [ ] OData $filter, $select, $orderby, $top (default 50, max 100), $skip supported on list endpoints; invalid syntax returns 400
+- [x] List endpoints reject unsupported query parameters, OData `$…` included, with 400 `UNSUPPORTED_QUERY_PARAM`
+- [x] Create and update reject, with 400 on every write path (Management API, SDK, types-registry provisioning): port 0; tags outside `^[a-z0-9_-]+$`; an alias starting or ending with `.`, `-` or `:`; an HTTP route path that is empty or does not start with `/`; an empty method list; a rate limit `rate`, `capacity` or `cost` of 0; an auth type or plugin reference that is not an implemented plugin; an `http` endpoint while `allow_http_upstream` is off. Rows stored before these checks keep serving; updating one requires fixing it
+- [x] Every credential reference of the auth config (`secret_ref`, `client_id_ref`, `client_secret_ref`, whatever the configured plugin) is checked on write (format and access); a malformed one is a 400 `invalid_argument`, one the credential store does not find a 400 `failed_precondition`, both naming the key
 - [ ] Enable/disable: disabled upstream causes proxy requests to be rejected (503); disabled route excluded from matching; ancestor-disabled upstream cannot be re-enabled by descendant
 - [x] All error responses use RFC 9457 Problem Details with GTS type identifiers
 - [x] All operations require appropriate GTS permissions and return 403 on unauthorized access
@@ -536,7 +555,7 @@ Not applicable. Management API operations are CRUD against the selected reposito
 
 ### Security Considerations
 
-Management operations authenticate callers via `toolkit-auth` and use secure ORM to scope access by tenant. When an upstream write supplies an auth `secret_ref`, management checks its format and asks CredStore whether the caller can access it. The proxy reads the secret again when handling a request. For proposed [named credentials](../ADR/0021-upstream-credentials.md), OAGW also pins and verifies the record ID. The credential resource uses create/read/override/delete/use actions. Operational suspend/resume remain available when CRUD is disabled, in REST and the new SDK; suspension needs no secret read. OAGW never stores secret values.
+Management operations authenticate callers via `toolkit-auth` and use secure ORM to scope access by tenant. When an upstream write supplies a credential reference (`secret_ref`, `client_id_ref` or `client_secret_ref`), management checks its format and asks CredStore, with the writer's context, whether it can be read. The proxy reads the secret again when handling a request. For proposed [named credentials](../ADR/0021-upstream-credentials.md), OAGW also pins and verifies the record ID. The credential resource uses create/read/override/delete/use actions. Operational suspend/resume remain available when CRUD is disabled, in REST and the new SDK; suspension needs no secret read. OAGW never stores secret values.
 
 ### Observability Considerations
 

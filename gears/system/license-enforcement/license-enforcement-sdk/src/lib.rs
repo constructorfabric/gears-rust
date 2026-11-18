@@ -31,7 +31,7 @@ pub use admission::{
     Admission, AdmissionError, AdmissionInput, AdmissionPluginRegistration, AdmittedRoot,
     CallerIdentity, Expect, GrantAdmissionPluginV1, Intake, Intakes, MaterialError, MaterialWrite,
     NewEvidence, PluginDenial, PluginFault, PluginInfo, PluginMaterial, RejectionReason,
-    RevocationState, RootFields, StoredEvidence, Verification, VerifyOutcome,
+    RequestedRoot, RevocationState, RootFields, StoredEvidence, Verification, VerifyOutcome,
     linked_admission_plugin,
 };
 pub use contract::{LicenseEnforcementApi, license_enforcement_api_ir};

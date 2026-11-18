@@ -59,7 +59,9 @@ Authorization: Bearer <tenant-token>
   - `api.disabled.com` with `enabled: false`
 - Each resource includes `enabled` field explicitly
 
-## Step 4: Filter to enabled only (optional OData)
+## Step 4: Filter to enabled only (planned)
+
+**Planned.** OData filtering is not implemented: today this request returns `400 UNSUPPORTED_QUERY_PARAM` (see [2.9](positive-2.9-tags-support-discovery-filtering.md)).
 
 ```http
 GET /api/oagw/v1/upstreams?$filter=enabled%20eq%20true HTTP/1.1
@@ -67,7 +69,7 @@ Host: oagw.example.com
 Authorization: Bearer <tenant-token>
 ```
 
-## Expected response
+## Expected response (once implemented)
 
 - `200 OK`
 - Response contains only `api.enabled.com`

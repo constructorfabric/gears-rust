@@ -181,7 +181,6 @@ def _plugins(plugin_ref: str) -> dict:
 @pytest.mark.scenario("positive-4.5-plugin-resolution-supports-builtin-named-ids-custom-uuid", part="B")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("plugin_ref", UNKNOWN_PLUGINS)
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="M-11: unknown plugin ids are accepted on write")
 async def test_unknown_plugin_rejected_at_write(
     plugin_ref, oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
 ):
@@ -195,40 +194,3 @@ async def test_unknown_plugin_rejected_at_write(
         if resp.status_code == 201:
             cleanup.upstream(oagw_headers, resp.json())
         assert_problem(resp, 400, esrc=None)
-
-
-@pytest.mark.scenario("positive-4.5-plugin-resolution-supports-builtin-named-ids-custom-uuid", part="B")
-@pytest.mark.asyncio
-@pytest.mark.parametrize("plugin_ref", UNKNOWN_PLUGINS)
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="PLG-03: an unknown transform is skipped (200) and an unknown guard "
-           "gives 500; the decision is 503 plugin_not_found",
-)
-async def test_unknown_plugin_fails_closed_at_proxy(
-    plugin_ref, oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
-):
-    """Scenario 4.5-B at proxy time: a binding that doesn't resolve blocks the request.
-
-    Once M-11 rejects these ids on write, the setup's create fails with an
-    HTTP error, which `raises=AssertionError` turns into a real failure: the
-    check must then move to a unit test of the proxy pipeline.
-    """
-    _ = mock_upstream
-    alias = unique_alias("plugin-unknown-p")
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        upstream = cleanup.upstream(oagw_headers, await create_upstream(
-            client, oagw_base_url, oagw_headers, mock_upstream_url,
-            alias=alias, plugins=_plugins(plugin_ref),
-        ))
-        await create_route(
-            client, oagw_base_url, oagw_headers, upstream["id"], ["POST"], "/echo",
-        )
-
-        resp = await client.post(
-            f"{oagw_base_url}/oagw/v1/proxy/{alias}/echo",
-            headers={**oagw_headers, "content-type": "application/json"},
-            json={"transform": "unknown-plugin"},
-        )
-        assert_problem(resp, 503)

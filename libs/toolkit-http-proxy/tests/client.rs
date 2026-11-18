@@ -254,6 +254,210 @@ async fn h2_request_trailers_lose_hop_fields() {
     assert_eq!(names, "grpc-status");
 }
 
+/// A body of known length that ends with trailers.
+struct SizedWithTrailers {
+    data: Option<Bytes>,
+    trailers: Option<http::HeaderMap>,
+    len: u64,
+}
+
+impl hyper::body::Body for SizedWithTrailers {
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        let frame = match self.data.take() {
+            Some(data) => Some(Ok(Frame::data(data))),
+            None => self.trailers.take().map(|t| Ok(Frame::trailers(t))),
+        };
+        std::task::Poll::Ready(frame)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.data.is_none() && self.trailers.is_none()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        hyper::body::SizeHint::with_exact(self.len)
+    }
+}
+
+/// What the upstream received: `body;content-length;trailer
+/// declaration;trailer names`.
+async fn request_trailers_as_received(wire: Wire) -> Vec<(&'static str, String)> {
+    let up = upstream(wire, |req: Request<Incoming>| async move {
+        let header = |name: &str| {
+            req.headers()
+                .get(name)
+                .map_or("none".to_owned(), |v| v.to_str().unwrap().to_owned())
+        };
+        let (len, declared) = (header("content-length"), header("trailer"));
+        let collected = req.into_body().collect().await.unwrap();
+        let mut names: Vec<String> = collected
+            .trailers()
+            .map(|t| t.keys().map(|k| k.as_str().to_owned()).collect())
+            .unwrap_or_default();
+        names.sort_unstable();
+        let data = String::from_utf8(collected.to_bytes().to_vec()).unwrap();
+        text(format!("{data};{len};{declared};{}", names.join(",")))
+    })
+    .await;
+    let trailers = |pairs: &[(&'static str, &'static str)]| {
+        let mut trailers = http::HeaderMap::new();
+        for (name, value) in pairs {
+            trailers.insert(*name, http::HeaderValue::from_static(value));
+        }
+        trailers
+    };
+    let streamed = |pairs: &[(&'static str, &'static str)]| {
+        let frames = stream::iter([
+            Frame::data(Bytes::from_static(b"payload")),
+            Frame::trailers(trailers(pairs)),
+        ])
+        .map(Ok::<_, Box<dyn std::error::Error + Send + Sync>>);
+        BodyExt::boxed_unsync(StreamBody::new(frames))
+    };
+    let sent = [
+        ("x-checksum", "abc"),
+        ("x-undeclared", "1"),
+        ("x-hop", "1"),
+        ("content-length", "7"),
+        ("authorization", "Bearer smuggled"),
+        ("cookie", "s=1"),
+        ("x-forwarded-for", "203.0.113.7"),
+    ];
+    let c = client();
+    let t = up.target(wire);
+    let mut seen = Vec::new();
+    for (case, req) in [
+        (
+            "declared",
+            Request::post("/")
+                .header(
+                    "trailer",
+                    "x-checksum, x-hop, content-length, authorization, cookie, x-forwarded-for",
+                )
+                .header("connection", "x-hop")
+                .body(streamed(&sent)),
+        ),
+        ("undeclared", Request::post("/").body(streamed(&sent))),
+        (
+            "trailers' own connection",
+            Request::post("/")
+                .header("trailer", "x-checksum, x-other")
+                .body(streamed(&[
+                    ("connection", "x-checksum"),
+                    ("x-checksum", "abc"),
+                    ("x-other", "1"),
+                ])),
+        ),
+        (
+            "buffered",
+            Request::post("/")
+                .header("trailer", "x-checksum")
+                .body(full_body(Bytes::from_static(b"hello"))),
+        ),
+        (
+            "known length with trailers",
+            Request::post("/")
+                .header("trailer", "x-checksum")
+                .body(BodyExt::boxed_unsync(SizedWithTrailers {
+                    data: Some(Bytes::from_static(b"payload")),
+                    trailers: Some(trailers(&[("x-checksum", "abc")])),
+                    len: 7,
+                })),
+        ),
+        (
+            "known length, undeclared",
+            Request::post("/").body(BodyExt::boxed_unsync(SizedWithTrailers {
+                data: Some(Bytes::from_static(b"payload")),
+                trailers: Some(trailers(&[("x-checksum", "abc")])),
+                len: 7,
+            })),
+        ),
+        (
+            "empty GET",
+            Request::get("/")
+                .header("trailer", "x-checksum")
+                .body(empty_body()),
+        ),
+        (
+            "empty POST",
+            Request::post("/")
+                .header("trailer", "x-checksum")
+                .body(empty_body()),
+        ),
+    ] {
+        let resp = c.send(&t, req.unwrap()).await.unwrap();
+        seen.push((case, body_string(resp).await));
+    }
+    seen
+}
+
+#[tokio::test]
+async fn http1_request_trailers_follow_the_declaration() {
+    // hyper sends only the declared trailers, and the declaration has lost
+    // framing, hop, credential and forwarding names. A body that declares
+    // trailers is chunked even when its length is known, so they go out; an
+    // undeclared body of known length keeps `Content-Length` and carries none.
+    assert_eq!(
+        request_trailers_as_received(Wire::Plain).await,
+        [
+            ("declared", "payload;none;x-checksum;x-checksum".to_owned()),
+            ("undeclared", "payload;none;none;".to_owned()),
+            (
+                "trailers' own connection",
+                "payload;none;x-checksum, x-other;x-other".to_owned()
+            ),
+            ("buffered", "hello;none;x-checksum;".to_owned()),
+            (
+                "known length with trailers",
+                "payload;none;x-checksum;x-checksum".to_owned()
+            ),
+            ("known length, undeclared", "payload;7;none;".to_owned()),
+            ("empty GET", ";none;x-checksum;".to_owned()),
+            ("empty POST", ";0;x-checksum;".to_owned()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn h2_request_trailers_are_sanitized_and_keep_the_declaration() {
+    // HTTP/2 sends every trailer, sanitized: undeclared ones arrive too. A
+    // body that declares trailers states no length, as on HTTP/1.1.
+    assert_eq!(
+        request_trailers_as_received(Wire::TlsH2).await,
+        [
+            (
+                "declared",
+                "payload;none;x-checksum;x-checksum,x-undeclared".to_owned()
+            ),
+            (
+                "undeclared",
+                "payload;none;none;x-checksum,x-hop,x-undeclared".to_owned()
+            ),
+            (
+                "trailers' own connection",
+                "payload;none;x-checksum, x-other;x-other".to_owned()
+            ),
+            ("buffered", "hello;none;x-checksum;".to_owned()),
+            (
+                "known length with trailers",
+                "payload;none;x-checksum;x-checksum".to_owned()
+            ),
+            (
+                "known length, undeclared",
+                "payload;7;none;x-checksum".to_owned()
+            ),
+            ("empty GET", ";none;x-checksum;".to_owned()),
+            ("empty POST", ";0;x-checksum;".to_owned()),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn h2_requests_state_a_known_body_length() {
     // The upstream answers with the `content-length` it received.
@@ -962,6 +1166,32 @@ async fn http_1_1_required_never_resends_a_streamed_body() {
     assert_eq!(c.cached_protocol(&target), Some(CachedProtocol::Http1Only));
     let resp = c.send(&target, get("/")).await.unwrap();
     assert_eq!(body_string(resp).await, "h1");
+}
+
+#[tokio::test]
+async fn http_1_1_required_never_resends_a_request_declaring_trailers() {
+    // The replayable copy holds the data only, and the resend would switch
+    // to HTTP/1.1. That holds even when sanitizing leaves no declaration:
+    // every name filtered out, or `Trailer` nominated by `Connection`.
+    let heads: [&[(&str, &str)]; 3] = [
+        &[("trailer", "x-checksum")],
+        &[("trailer", "authorization")],
+        &[("connection", "trailer"), ("trailer", "x-checksum")],
+    ];
+    for head in heads {
+        let (addr, streams) = h2_requires_h1().await;
+        let c = client();
+        let target = Target::new(addr, "localhost", Transport::Tls);
+        let mut post = replayable_post(b"payload");
+        for &(name, value) in head {
+            post.headers_mut()
+                .append(name, http::HeaderValue::from_static(value));
+        }
+        assert!(c.send(&target, post).await.is_err(), "{head:?}");
+        assert_eq!(streams.load(Ordering::SeqCst), 1, "{head:?}");
+        // The host still moves to HTTP/1.1 for the next request.
+        assert_eq!(c.cached_protocol(&target), Some(CachedProtocol::Http1Only));
+    }
 }
 
 #[tokio::test]

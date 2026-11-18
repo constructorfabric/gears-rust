@@ -219,6 +219,7 @@ pub const METADATA_CHECK_CONCURRENCY: usize = 5;
 /// and bss-products read metadata at start (#5955, #5956), and a guard would
 /// refuse them even under a PDP that allows them. The shipped PDPs refuse a
 /// nil tenant on their own.
+#[toolkit::domain_model]
 #[derive(Clone)]
 pub struct MetadataAccess {
     ctx: SecurityContext,

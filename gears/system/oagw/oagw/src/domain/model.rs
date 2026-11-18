@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
+use crate::domain::plugin::credentials::{CREDENTIAL_KEYS, CredentialRef};
+
 // ---------------------------------------------------------------------------
 // Shared enums
 // ---------------------------------------------------------------------------
@@ -118,6 +120,22 @@ pub struct AuthConfig {
     pub sharing: SharingMode,
     /// Plugin-specific configuration (flat key-value pairs; schema varies by plugin).
     pub config: Option<HashMap<String, String>>,
+}
+
+impl AuthConfig {
+    /// The credential references this config holds: the value of every
+    /// [`CREDENTIAL_KEYS`] key present, in that order, whatever the plugin.
+    /// Other keys are not references and are not resolved.
+    pub fn credential_refs(&self) -> impl Iterator<Item = CredentialRef<'_>> {
+        let config = self.config.as_ref();
+        CREDENTIAL_KEYS.iter().filter_map(move |key| {
+            let value = config?.get(key.key)?;
+            Some(CredentialRef {
+                field: key.field,
+                value,
+            })
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

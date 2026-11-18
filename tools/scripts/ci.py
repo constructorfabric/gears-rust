@@ -664,6 +664,10 @@ def cmd_e2e(args):
         step("Running pytest")
         env = os.environ.copy()
         env["E2E_BASE_URL"] = base_url
+        # Tests that start a private server reuse the shared server's config,
+        # which only lists the suite's gears.
+        if not args.docker and getattr(args, "config", None):
+            env.setdefault("E2E_SERVER_CONFIG", os.path.abspath(args.config))
 
         if release_bin is not None:
             env.setdefault("FS_E2E_BINARY", release_bin)

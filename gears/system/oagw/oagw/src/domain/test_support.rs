@@ -11,6 +11,7 @@ use crate::domain::services::{
 };
 use crate::domain::ssrf::SsrfGuard;
 use crate::infra::proxy::DataPlaneServiceImpl;
+use crate::infra::proxy::streaming::StreamShutdown;
 use crate::infra::storage::{InMemoryRouteRepo, InMemoryUpstreamRepo};
 use async_trait::async_trait;
 use authz_resolver_sdk::{
@@ -298,6 +299,51 @@ impl CredStoreClientV1 for ErroringCredStore {
         _precondition: credstore_sdk::WritePrecondition,
     ) -> Result<(), credstore_sdk::CredStoreError> {
         Err((self.0)())
+    }
+}
+
+#[cfg(test)]
+/// A credential store that never answers.
+pub struct StalledCredStore;
+
+#[cfg(test)]
+#[async_trait]
+impl CredStoreClientV1 for StalledCredStore {
+    async fn get(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &credstore_sdk::SecretRef,
+    ) -> Result<Option<credstore_sdk::GetSecretResponse>, credstore_sdk::CredStoreError> {
+        std::future::pending().await
+    }
+    async fn put_opts(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &credstore_sdk::SecretRef,
+        _value: credstore_sdk::SecretValue,
+        _sharing: credstore_sdk::SharingMode,
+        _precondition: credstore_sdk::WritePrecondition,
+        _opts: credstore_sdk::WriteOptions,
+    ) -> Result<(), credstore_sdk::CredStoreError> {
+        std::future::pending().await
+    }
+    async fn create_opts(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &credstore_sdk::SecretRef,
+        _value: credstore_sdk::SecretValue,
+        _sharing: credstore_sdk::SharingMode,
+        _opts: credstore_sdk::WriteOptions,
+    ) -> Result<(), credstore_sdk::CredStoreError> {
+        std::future::pending().await
+    }
+    async fn delete(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &credstore_sdk::SecretRef,
+        _precondition: credstore_sdk::WritePrecondition,
+    ) -> Result<(), credstore_sdk::CredStoreError> {
+        std::future::pending().await
     }
 }
 
@@ -682,7 +728,9 @@ impl TestCpBuilder {
                 Arc::new(SsrfGuard::disabled()),
                 None,
             )
-            .with_rate_limiter(rate_limiter),
+            .with_rate_limiter(rate_limiter)
+            // The harness proxies to plaintext mocks, as its Data Plane allows.
+            .with_allow_http_upstream(true),
         );
 
         cp
@@ -800,6 +848,18 @@ impl TestDpBuilder {
         cp: Arc<dyn ControlPlaneService>,
         rate_limiter: Arc<crate::domain::rate_limit::RateLimiter>,
     ) -> Arc<dyn DataPlaneService> {
+        self.build_and_register_with_streams(hub, cp, rate_limiter)
+            .0
+    }
+
+    /// [`Self::build_and_register`], plus the handle the gear stops the
+    /// service's SSE streams and WebSocket relays with.
+    pub(crate) fn build_and_register_with_streams(
+        self,
+        hub: &ClientHub,
+        cp: Arc<dyn ControlPlaneService>,
+        rate_limiter: Arc<crate::domain::rate_limit::RateLimiter>,
+    ) -> (Arc<dyn DataPlaneService>, StreamShutdown) {
         let credstore = hub
             .get::<dyn CredStoreClientV1>()
             .expect("CredStoreClientV1 must be registered before building DP");
@@ -858,7 +918,8 @@ impl TestDpBuilder {
             svc = svc.with_websocket_close_timeout(timeout);
         }
 
-        Arc::new(svc)
+        let streams = svc.stream_shutdown();
+        (Arc::new(svc), streams)
     }
 }
 
@@ -873,6 +934,8 @@ impl Default for TestDpBuilder {
 pub struct TestAppState {
     pub state: crate::gear::AppState,
     pub facade: Arc<dyn ServiceGatewayClientV1>,
+    /// What the gear's `stop` ends the Data Plane's open streams with.
+    pub(crate) stream_shutdown: StreamShutdown,
 }
 
 /// Build an `AppState` and facade for integration tests.
@@ -897,9 +960,9 @@ pub fn build_test_app_state(
     // buckets the Data Plane enforces.
     let rate_limiter = Arc::new(crate::domain::rate_limit::RateLimiter::new());
     let cp = cp_builder.build_and_register(hub, rate_limiter.clone());
-    let dp = dp_builder
+    let (dp, stream_shutdown) = dp_builder
         .with_backend_selector(backend_selector.clone())
-        .build_and_register(hub, cp.clone(), rate_limiter);
+        .build_and_register_with_streams(hub, cp.clone(), rate_limiter);
     let facade: Arc<dyn ServiceGatewayClientV1> = Arc::new(ServiceGatewayClientV1Facade::new(
         cp.clone(),
         dp.clone(),
@@ -920,6 +983,7 @@ pub fn build_test_app_state(
             },
         },
         facade,
+        stream_shutdown,
     }
 }
 

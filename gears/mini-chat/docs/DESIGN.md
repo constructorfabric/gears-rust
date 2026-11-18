@@ -6838,7 +6838,7 @@ The gear configuration rejects unknown keys at the top level and in these sectio
 | `kind` | enum | — (required) | `openai_responses` \| `openai_chat_completions` \| `vllm_responses` \| `anthropic_messages` |
 | `host` | `string` | — (required) | Must be non-empty; supports `${VAR}` expansion. After expansion only letters, digits, `.`, `-`, `_`, `:`, `[`, `]` are allowed (the host is the OAGW alias in `/{alias}/...`, so `/`, `?`, `#`, `@` would change the proxied path) |
 | `port` | `u16` | `443` (`80` when `use_http = true`) | Must not be 0 |
-| `use_http` | `bool` | `false` | Effective only when OAGW `allow_http_upstream` is on |
+| `use_http` | `bool` | `false` | Needs OAGW `allow_http_upstream`; without it OAGW rejects the upstream and startup fails (misconfigured provider) |
 | `upstream_alias` | `string` | `host` | Filled with `host` at gear init when not set; always passed to OAGW, which creates or reuses the upstream under it. |
 | `api_path` | `string` | `/v1/responses` | Chat endpoint path; `{model}` is replaced by `provider_model_id` |
 | `auth_plugin_type`, `auth_config` | `string`, map | — | OAGW auth plugin and its config (`header`, `prefix`, `secret_ref`, ...) |

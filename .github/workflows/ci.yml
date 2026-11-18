@@ -519,6 +519,10 @@ jobs:
           MODEL_REGISTRY_PG_REQUIRE_DOCKER: "1"
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=model-registry-pg
 
+      - name: Test license-enforcement (pg, integration)
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-integration LANE=license-enforcement-pg
+
       - name: Test github-mirror (PostgreSQL and MariaDB, integration)
         if: >-
           needs.changes.result != 'success'

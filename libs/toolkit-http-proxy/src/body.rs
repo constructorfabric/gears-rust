@@ -46,6 +46,60 @@ pub fn full_body(bytes: Bytes) -> ProxyBody {
         .boxed_unsync()
 }
 
+/// `body` with its trailers sanitized as request trailers
+/// ([`sanitize::sanitize_request_trailers`]), also losing `hop`: the fields
+/// the request head's `Connection` nominated (empty when it nominated none).
+///
+/// For a request that declares trailers. The size of a body that has not
+/// ended is reported as unknown, so it is chunked on HTTP/1.1 and its
+/// trailers are sent: hyper frames a body of exact size with
+/// `Content-Length`, which carries no trailers. The request then has no
+/// `Content-Length` on either protocol, and whether a declared trailer
+/// arrives does not depend on the negotiated protocol.
+pub fn with_sanitized_trailers(body: ProxyBody, hop: Arc<[HeaderName]>) -> ProxyBody {
+    SanitizedTrailers { inner: body, hop }.boxed_unsync()
+}
+
+/// See [`with_sanitized_trailers`].
+struct SanitizedTrailers {
+    inner: ProxyBody,
+    hop: Arc<[HeaderName]>,
+}
+
+impl Body for SanitizedTrailers {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        let this = &mut *self;
+        let mut frame = ready!(Pin::new(&mut this.inner).poll_frame(cx));
+        if let Some(Ok(frame)) = &mut frame
+            && let Some(trailers) = frame.trailers_mut()
+        {
+            sanitize::sanitize_request_trailers_without(trailers, &this.hop);
+        }
+        Poll::Ready(frame)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    /// Unknown until the body has ended (see [`with_sanitized_trailers`]);
+    /// the lower bound is kept.
+    fn size_hint(&self) -> SizeHint {
+        if self.inner.is_end_stream() {
+            return self.inner.size_hint();
+        }
+        let mut hint = SizeHint::new();
+        hint.set_lower(self.inner.size_hint().lower());
+        hint
+    }
+}
+
 /// A streaming request body of unknown length (chunked on HTTP/1.1, plain
 /// DATA frames on HTTP/2).
 pub fn stream_body<S, E>(stream: S) -> ProxyBody
@@ -62,6 +116,10 @@ where
 /// upstream processed it (see [`crate::ProxyClient::send`]). The bytes must
 /// be exactly the request's body; cloning [`Bytes`] does not copy data.
 /// Requests with an empty body are resendable without it.
+///
+/// The copy holds data only. Do not attach it to a body that ends with
+/// trailers: a resend would go out without them. A request that declares
+/// trailers (`Trailer`) is never resent from the copy.
 #[derive(Debug, Clone)]
 pub struct ReplayableBody(pub Bytes);
 

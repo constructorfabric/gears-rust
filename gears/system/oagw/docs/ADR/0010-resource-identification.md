@@ -489,7 +489,7 @@ Content-Type: application/json
 }
 ```
 
-**Discovery**:
+**Discovery** (planned; today the upstream list accepts only `limit` and `offset`, and these requests return `400 UNSUPPORTED_QUERY_PARAM`):
 
 ```http
 GET /api/oagw/v1/upstreams?tags=openai,llm

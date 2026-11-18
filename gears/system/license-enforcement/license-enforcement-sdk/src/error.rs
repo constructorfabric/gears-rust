@@ -11,9 +11,11 @@
 //! - `AlreadyExists` → `resource` is `idempotency_token` for a token reused
 //!   with another payload, else the id of a root grant that the evidence names
 //!   and the gear already stores;
-//! - `Unimplemented` → the linked plugin does not serve the intake that the
-//!   operation needs (`issue` or `import`). The binary cannot serve it at all,
-//!   so no discriminator is needed.
+//! - `Unimplemented` → the binary cannot serve the operation at all, so no
+//!   discriminator is needed: the linked plugin does not serve the intake that
+//!   it needs (`issue` or `import`), `renew` meets a plugin that verifies
+//!   evidence, or the operation is not implemented yet (the gear README lists
+//!   these).
 
 /// `violations[].type` of every `FailedPrecondition` of this module.
 pub const PRECONDITION_TYPE: &str = "STATE";
@@ -26,6 +28,10 @@ pub mod aborted {
     /// A concurrent admission changed the plugin material that `admit` read.
     /// Retry the request with the same idempotency token.
     pub const ADMISSION_CONFLICT: &str = "ADMISSION_CONFLICT";
+    /// A concurrent replacement moved a tree under a new root while the
+    /// request waited for it. Retry the request with the same idempotency
+    /// token.
+    pub const TREE_MOVED: &str = "TREE_MOVED";
 }
 
 /// `violations[].subject` values of `FailedPrecondition`.
@@ -49,6 +55,9 @@ pub mod reason {
     pub const TYPE_NOT_REGISTERED: &str = "TYPE_NOT_REGISTERED";
     /// The type does not derive from the licensing base type.
     pub const TYPE_NOT_DERIVED: &str = "TYPE_NOT_DERIVED";
+    /// The resource type is abstract: no check names it, so a grant on it
+    /// would cover nothing.
+    pub const TYPE_ABSTRACT: &str = "TYPE_ABSTRACT";
     /// The subject type is not in `admitted_subjects` of the Resource contract.
     pub const SUBJECT_NOT_ADMITTED: &str = "SUBJECT_NOT_ADMITTED";
     /// Conditions or recipient rules fail the evaluator's validation.
@@ -73,8 +82,6 @@ pub mod reason {
     pub const EVIDENCE_REPLAY: &str = "EVIDENCE_REPLAY";
     /// See [`EVIDENCE_MALFORMED`].
     pub const EVIDENCE_VERSION_REGRESSION: &str = "EVIDENCE_VERSION_REGRESSION";
-    /// The check-explain request does not conform to its contracts.
-    pub const REQUEST_NONCONFORMING: &str = "REQUEST_NONCONFORMING";
     /// A required field is empty, for example no grant to issue.
     pub const REQUIRED: &str = "REQUIRED";
     /// The window does not satisfy `not_before < expires_at <= grace_until`,
@@ -84,6 +91,15 @@ pub mod reason {
     pub const HOLDER_NOT_IN_SUBTREE: &str = "HOLDER_NOT_IN_SUBTREE";
     /// An id or a token contains a NUL character.
     pub const INVALID_CHARACTER: &str = "INVALID_CHARACTER";
+    /// A request names a grant outside the grants that it acts on: a key of
+    /// `expected_versions` outside `grant_ids`, or a successor that names a
+    /// grant the replacement does not replace.
+    pub const NOT_IN_REQUEST: &str = "NOT_IN_REQUEST";
+    /// The members of a pack differ in `requires_acceptance`: a pack is
+    /// accepted or rejected as a whole.
+    pub const MIXED_ACCEPTANCE: &str = "MIXED_ACCEPTANCE";
+    /// A list names the same item twice.
+    pub const DUPLICATE: &str = "DUPLICATE";
     /// A field is over its limit in [`limits`](crate::limits).
     pub const TOO_LARGE: &str = "TOO_LARGE";
     /// The idempotency token already issued grants, and its idempotency window

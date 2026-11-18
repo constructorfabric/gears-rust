@@ -33,6 +33,11 @@ pub mod grant {
         pub binding_subject_type_key: Option<String>,
         pub binding_subject_id: Option<String>,
         pub binding_grant_id: Option<Uuid>,
+        pub binding_tenant_id: Option<Uuid>,
+        /// The subject that a termination unbound: the check names the end of
+        /// the grant to that subject (DESIGN §3.1). Not a field of the grant.
+        pub ended_subject_type_key: Option<String>,
+        pub ended_subject_id: Option<String>,
         pub binding_fixed: bool,
         pub validity_kind: String,
         pub not_before: OffsetDateTime,
@@ -48,12 +53,16 @@ pub mod grant {
         pub requires_acceptance: bool,
         pub root_grant_id: Uuid,
         pub parent_grant_id: Option<Uuid>,
+        pub grantor_tenant_id: Option<Uuid>,
         pub delegation_id: Option<Uuid>,
         pub pack_id: Option<Uuid>,
         pub evidence_id: Uuid,
         pub state: String,
         pub termination_reason: Option<String>,
         pub version: i64,
+        /// The version of the delegation of a sub-grant, the same in every row
+        /// of the delegation: only delegation verbs raise it.
+        pub delegation_version: i64,
         pub created_at: OffsetDateTime,
         pub updated_at: OffsetDateTime,
     }
@@ -85,6 +94,9 @@ pub mod pack {
         pub id: Uuid,
         pub holder_tenant_id: Uuid,
         pub version: i64,
+        /// `BindingCounts` of the live members, kept with every member write.
+        #[sea_orm(column_type = "Json")]
+        pub counts: Json,
         pub created_at: OffsetDateTime,
     }
 
@@ -144,6 +156,8 @@ pub mod idempotency {
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
         pub tenant_id: Uuid,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub subject_id: Uuid,
         #[sea_orm(primary_key, auto_increment = false)]
         pub token: String,
         pub payload_hash: String,

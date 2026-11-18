@@ -9,16 +9,13 @@ use futures_util::StreamExt;
 use http::{HeaderMap, HeaderValue};
 use oagw_sdk::body::{Body, BodyStream};
 use oagw_sdk::{field, reason};
-use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use toolkit_http_proxy::{ReplayableBody, UpgradeOutcome, empty_body, full_body, stream_body};
 use toolkit_security::SecurityContext;
 
 use crate::config::TokenCacheConfig;
 use crate::domain::error::DomainError;
-use crate::domain::model::{
-    PassthroughMode, PathSuffixMode, ResponseHeaderRules, Scheme, Upstream,
-};
+use crate::domain::model::{PassthroughMode, PathSuffixMode, ResponseHeaderRules, Upstream};
 use crate::domain::plugin::{
     AuthContext, GuardContext, GuardDecision, TransformErrorContext, TransformRequestContext,
     TransformResponseContext,
@@ -31,6 +28,7 @@ use crate::domain::rate_limit::{
 };
 use crate::domain::repo::Tags;
 use crate::domain::route_matching::path_after_route_prefix;
+use crate::domain::services::management::forbid_http_endpoints;
 use crate::domain::services::{
     ControlPlaneService, DataPlaneService, EndpointSelector, ProxyGrant, SelectedEndpoint,
 };
@@ -38,6 +36,7 @@ use crate::infra::plugin::{AuthPluginRegistry, GuardPluginRegistry, TransformPlu
 
 use super::engine::{ProxyEngine, into_body_stream, map_proxy_error};
 use super::headers;
+use super::streaming::StreamShutdown;
 use super::{request_builder, streaming};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -51,9 +50,9 @@ pub struct DataPlaneServiceImpl {
     cp: Arc<dyn ControlPlaneService>,
     backend_selector: Arc<dyn EndpointSelector>,
     engine: Arc<ProxyEngine>,
-    /// Sender kept alive so receivers see `false` (not shutting down) until drop.
-    _shutdown_tx: watch::Sender<bool>,
-    shutdown_rx: watch::Receiver<bool>,
+    /// Ends open SSE streams and WebSocket relays at gear stop and runtime
+    /// shutdown ([`Self::stream_shutdown`]).
+    stream_shutdown: StreamShutdown,
     auth_registry: AuthPluginRegistry,
     guard_registry: GuardPluginRegistry,
     transform_registry: TransformPluginRegistry,
@@ -93,14 +92,12 @@ impl DataPlaneServiceImpl {
             AuthPluginRegistry::with_builtins(credstore, token_http_config, token_cache_config);
         let guard_registry = GuardPluginRegistry::with_builtins();
         let transform_registry = TransformPluginRegistry::with_builtins();
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         Self {
             cp,
             backend_selector,
             engine,
-            _shutdown_tx: shutdown_tx,
-            shutdown_rx,
+            stream_shutdown: StreamShutdown::new(),
             auth_registry,
             guard_registry,
             transform_registry,
@@ -118,13 +115,12 @@ impl DataPlaneServiceImpl {
 
     /// Start evicting idle rate-limit buckets every
     /// [`RATE_LIMIT_SWEEP_INTERVAL`]. The task ends when `cancel` fires or
-    /// this service is dropped.
+    /// the limiter, shared with the Control Plane, is dropped.
     pub fn spawn_rate_limit_sweeper(&self, cancel: CancellationToken) {
         tokio::spawn(sweep_rate_limits(
             Arc::downgrade(&self.rate_limiter),
             Arc::clone(&self.metrics),
             RATE_LIMIT_SWEEP_INTERVAL,
-            self.shutdown_rx.clone(),
             cancel,
         ));
     }
@@ -140,6 +136,21 @@ impl DataPlaneServiceImpl {
     #[must_use]
     pub fn with_max_body_size(mut self, size: usize) -> Self {
         self.max_body_size = size;
+        self
+    }
+
+    /// The signal the gear ends open SSE streams and WebSocket relays with.
+    pub(crate) fn stream_shutdown(&self) -> StreamShutdown {
+        self.stream_shutdown.clone()
+    }
+
+    /// End open SSE streams and WebSocket relays also when `parent` (the
+    /// runtime's root token) is cancelled, the ones opened before the gear's
+    /// first start included. Call it before [`Self::stream_shutdown`]: it
+    /// replaces the signal.
+    #[must_use]
+    pub(crate) fn with_streams_under(mut self, parent: &CancellationToken) -> Self {
+        self.stream_shutdown = StreamShutdown::under(parent);
         self
     }
 
@@ -260,7 +271,7 @@ impl DataPlaneServiceImpl {
             streaming::streaming_body_with_lifecycle(
                 resp_body_stream,
                 self.streaming_idle_timeout,
-                self.shutdown_rx.clone(),
+                self.stream_shutdown.subscribe(),
             )
         } else {
             resp_body_stream
@@ -782,6 +793,16 @@ impl DataPlaneServiceImpl {
             }
         }
 
+        // 3c. Enforce HTTPS-only before the auth plugin runs, so no credential
+        //     is prepared for a plaintext upstream. Writes refuse such
+        //     endpoints too; this covers rows stored before the flag was off.
+        //     All endpoints of a pool share one scheme.
+        forbid_http_endpoints(
+            &upstream.server.endpoints,
+            self.allow_http_upstream,
+            &instance_uri,
+        )?;
+
         // 4. Prepare outbound headers (passthrough + strip).
         let mode = upstream
             .headers
@@ -923,16 +944,6 @@ impl DataPlaneServiceImpl {
         })??;
         let endpoint = &selected.endpoint;
 
-        // 6b. Enforce HTTPS-only upstream constraint.
-        if !self.allow_http_upstream && matches!(endpoint.scheme, Scheme::Http) {
-            return Err(DomainError::Validation {
-                field: "endpoint.scheme",
-                reason: field::HTTP_UPSTREAM_FORBIDDEN,
-                detail: "upstream endpoint uses HTTP; only HTTPS endpoints are permitted".into(),
-                instance: instance_uri,
-            });
-        }
-
         headers::set_host_header(&mut outbound_headers, &endpoint.host, endpoint.port);
 
         // 7. Check rate limits (upstream then route) with scope-aware keying.
@@ -1052,13 +1063,13 @@ impl DataPlaneServiceImpl {
     }
 }
 
-/// Evict idle rate-limit buckets every `interval` until the service is
-/// dropped: its shutdown sender closes, or the limiter is gone.
+/// Evict idle rate-limit buckets every `interval` until `cancel` fires or the
+/// limiter is gone. The stream shutdown signal does not stop it: a gear stop
+/// and a later start keep the same limiter.
 async fn sweep_rate_limits(
     limiter: Weak<RateLimiter>,
     metrics: Arc<dyn OagwMetricsPort>,
     interval: Duration,
-    mut shutdown: watch::Receiver<bool>,
     cancel: CancellationToken,
 ) {
     let mut ticker = tokio::time::interval(interval);
@@ -1067,7 +1078,6 @@ async fn sweep_rate_limits(
     loop {
         tokio::select! {
             () = cancel.cancelled() => return,
-            _ = shutdown.changed() => return,
             _ = ticker.tick() => {
                 let Some(limiter) = limiter.upgrade() else {
                     return;
@@ -1173,7 +1183,7 @@ impl DataPlaneServiceImpl {
                     leftover: Bytes::new(),
                     idle_timeout: self.websocket_idle_timeout,
                     close_timeout: self.websocket_close_timeout,
-                    shutdown_rx: self.shutdown_rx.clone(),
+                    stopped: self.stream_shutdown.subscribe(),
                     metrics: Some(self.metrics.clone()),
                     host: pipeline.host.to_string(),
                 },
@@ -2649,12 +2659,10 @@ mod tests {
         limiter
             .try_consume("key", &fast_refill_config(), "/test")
             .unwrap();
-        let (_tx, rx) = watch::channel(false);
         let sweep = tokio::spawn(sweep_rate_limits(
             Arc::downgrade(&limiter),
             Arc::new(crate::domain::ports::NoopMetrics),
             Duration::from_millis(5),
-            rx,
             CancellationToken::new(),
         ));
 
@@ -2666,25 +2674,6 @@ mod tests {
         .await
         .expect("the sweep evicts the refilled bucket");
         sweep.abort();
-    }
-
-    #[tokio::test]
-    async fn sweep_ends_when_the_service_drops_its_shutdown_sender() {
-        let limiter = Arc::new(RateLimiter::new());
-        let (tx, rx) = watch::channel(false);
-        let sweep = tokio::spawn(sweep_rate_limits(
-            Arc::downgrade(&limiter),
-            Arc::new(crate::domain::ports::NoopMetrics),
-            Duration::from_secs(3600),
-            rx,
-            CancellationToken::new(),
-        ));
-
-        drop(tx);
-        tokio::time::timeout(Duration::from_secs(5), sweep)
-            .await
-            .expect("the sweep ends")
-            .unwrap();
     }
 
     /// Keeps only the request-duration observations.
@@ -2946,6 +2935,175 @@ mod tests {
         );
     }
 
+    /// A plaintext upstream is refused before the auth plugin runs, so no
+    /// credential is prepared for it (#4974).
+    #[tokio::test]
+    async fn http_upstream_is_refused_before_auth() {
+        use crate::domain::model::{
+            AuthConfig, HttpMatch, HttpMethod, MatchRules, Route, SharingMode,
+        };
+        use toolkit_gts::gts_id;
+        let mut upstream = upstream_with(vec![Endpoint {
+            scheme: Scheme::Http,
+            host: "127.0.0.1".into(),
+            port: 80,
+        }]);
+        // An auth plugin that would fail if it ran.
+        upstream.auth = Some(AuthConfig {
+            plugin_type: gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.missing.v1").into(),
+            sharing: SharingMode::Private,
+            config: None,
+        });
+        let route = Route {
+            id: Uuid::new_v4(),
+            tenant_id: upstream.tenant_id,
+            upstream_id: upstream.id,
+            match_rules: MatchRules {
+                http: Some(HttpMatch {
+                    methods: vec![HttpMethod::Get],
+                    path: "/v1".into(),
+                    query_allowlist: vec![],
+                    path_suffix_mode: PathSuffixMode::Append,
+                }),
+                grpc: None,
+            },
+            plugins: None,
+            rate_limit: None,
+            cors: None,
+            tags: vec![],
+            priority: 0,
+            enabled: true,
+            managed_by: ManagedBy::Api,
+        };
+        let svc = build_svc_resolving(
+            Arc::new(MockSelector::new()),
+            Arc::new(crate::domain::ports::NoopMetrics),
+            Some((upstream, route)),
+        );
+        match svc.proxy_request(test_ctx(), proxy_get("/test/v1")).await {
+            Err(DomainError::Validation {
+                field: f,
+                reason,
+                instance,
+                ..
+            }) => {
+                assert_eq!(f, "server.endpoints.scheme");
+                assert_eq!(reason, field::HTTP_UPSTREAM_FORBIDDEN);
+                assert!(instance.ends_with("/test/v1"), "{instance}");
+            }
+            other => panic!("expected HTTP_UPSTREAM_FORBIDDEN, got {other:?}"),
+        }
+    }
+
+    /// The handle the gear stops streams with is the one this service
+    /// subscribes its SSE bodies and WebSocket relays to.
+    #[tokio::test]
+    async fn the_stream_shutdown_handle_is_the_one_streams_watch() {
+        let svc = build_svc_resolving(
+            Arc::new(MockSelector::new()),
+            Arc::new(crate::domain::ports::NoopMetrics),
+            None,
+        );
+        let watched = svc.stream_shutdown.subscribe();
+        svc.stream_shutdown().end_streams();
+        tokio::time::timeout(Duration::from_secs(1), watched.stopped())
+            .await
+            .expect("a stop through the handed-out handle reaches the streams");
+    }
+
+    /// Rows stored before plugin ids were checked on write (#4974) may still
+    /// name a plugin that does not resolve. Pins what the proxy does with
+    /// them today: an auth plugin fails the request with
+    /// `AUTH_PLUGIN_NOT_FOUND`, a guard with an internal error, and a
+    /// transform is skipped, as is a short id with no schema prefix. #4985
+    /// owns the target behavior (scenario 4.5-B).
+    #[tokio::test]
+    async fn unresolvable_plugins_on_stored_rows() {
+        use crate::domain::model::{AuthConfig, PluginBinding, SharingMode};
+        use toolkit_gts::gts_id;
+        let svc = build_svc_resolving(
+            Arc::new(MockSelector::new()),
+            Arc::new(crate::domain::ports::NoopMetrics),
+            None,
+        );
+        let ctx = test_ctx();
+        let auth = AuthConfig {
+            plugin_type: gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.missing.v1").into(),
+            sharing: SharingMode::Private,
+            config: None,
+        };
+        match execute_auth_plugin(&svc.auth_registry, &auth, &HeaderMap::new(), &ctx, "/i").await {
+            Err(DomainError::AuthenticationFailed { reason: r, .. }) => {
+                assert_eq!(r, reason::auth::PLUGIN_NOT_FOUND);
+            }
+            other => panic!("expected AUTH_PLUGIN_NOT_FOUND, got {other:?}"),
+        }
+
+        let binding = |plugin_ref: &str| PluginBinding {
+            plugin_ref: plugin_ref.into(),
+            config: Default::default(),
+        };
+        let guard = binding(gts_id!(
+            "cf.core.oagw.guard_plugin.v1~cf.core.oagw.missing.v1"
+        ));
+        let refused = execute_guard_requests(
+            &svc.guard_registry,
+            &[&guard],
+            &HeaderMap::new(),
+            "GET",
+            "/",
+            &ctx,
+            "/i",
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(DomainError::Internal { .. })),
+            "{refused:?}"
+        );
+
+        let transform = binding(gts_id!(
+            "cf.core.oagw.transform_plugin.v1~cf.core.oagw.missing.v1"
+        ));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-a", HeaderValue::from_static("1"));
+        let mut query = vec![("q".to_owned(), "1".to_owned())];
+        execute_transform_requests(
+            &svc.transform_registry,
+            &[&transform],
+            &mut headers,
+            &mut query,
+            "GET",
+            "/",
+            &ctx,
+        )
+        .await;
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers["x-a"], "1");
+        assert_eq!(query, [("q".to_owned(), "1".to_owned())]);
+
+        // A short id with no schema prefix (`audit-log`, accepted before the
+        // write check) is neither a guard nor a transform: it is skipped.
+        let mut upstream = upstream_with(vec![]);
+        upstream.plugins = Some(crate::domain::model::PluginsConfig {
+            sharing: SharingMode::Private,
+            items: vec![
+                binding("audit-log"),
+                binding(crate::domain::gts_helpers::REQUEST_ID_TRANSFORM_PLUGIN_ID),
+            ],
+        });
+        assert!(
+            collect_plugin_bindings(&upstream, GuardPluginRegistry::is_guard_plugin).is_empty()
+        );
+        let transforms =
+            collect_plugin_bindings(&upstream, TransformPluginRegistry::is_transform_plugin);
+        let refs: Vec<&str> = transforms.iter().map(|b| b.plugin_ref.as_str()).collect();
+        assert_eq!(
+            refs,
+            [crate::domain::gts_helpers::REQUEST_ID_TRANSFORM_PLUGIN_ID],
+            "the real binding still runs"
+        );
+    }
+
     /// A `proxy:invoke` check dropped before the policy engine answers (the
     /// gateway's request timeout) is counted as a cancelled request.
     #[tokio::test]
@@ -3087,12 +3245,10 @@ mod tests {
     #[tokio::test]
     async fn sweep_ends_when_the_limiter_is_dropped() {
         let limiter = Arc::new(RateLimiter::new());
-        let (_tx, rx) = watch::channel(false);
         let sweep = tokio::spawn(sweep_rate_limits(
             Arc::downgrade(&limiter),
             Arc::new(crate::domain::ports::NoopMetrics),
             Duration::from_millis(5),
-            rx,
             CancellationToken::new(),
         ));
 

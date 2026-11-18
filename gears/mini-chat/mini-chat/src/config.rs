@@ -131,7 +131,8 @@ pub struct ProviderEntry {
     #[serde(default)]
     pub port: Option<u16>,
     /// Use plain HTTP instead of HTTPS for this upstream. Defaults to `false`.
-    /// Only effective when the oagw `allow_http_upstream` option is also enabled.
+    /// Needs the oagw `allow_http_upstream` option: without it OAGW rejects
+    /// the upstream and the provider fails startup as misconfigured.
     #[serde(default)]
     pub use_http: bool,
     /// API path template for the responses endpoint.

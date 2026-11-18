@@ -134,7 +134,7 @@ Prevents abuse, cost overruns, and protects external service agreements. Maintai
 
 **Steps**:
 1. [x] - `p2` - Actor sends PUT /api/oagw/v1/upstreams/{id} or PUT /api/oagw/v1/routes/{id} with `rate_limit`, `circuit_breaker`, or `concurrency_limit` in request body - `inst-cfg-1`
-2. [x] - `p2` - Validate rate limit config: `sustained.rate` > 0, `burst.capacity` ≥ 1, `scope` is valid enum, `strategy` is valid enum - `inst-cfg-2`
+2. [x] - `p2` - Validate rate limit config, on upstreams and routes alike: `sustained.rate` ≥ 1, `burst.capacity` ≥ 1, `cost` ≥ 1, `scope` is valid enum, `strategy` is valid enum. `cost` is not compared with `capacity` - `inst-cfg-2`
 3. [x] - `p2` - **IF** `budget.mode` = `allocated` - `inst-cfg-3`
    1. [x] - `p2` - Use the closest ancestor upstream already found by `cpt-cf-oagw-algo-tenant-closest-ancestor` for this request (no separate ancestor walk) - `inst-cfg-3-anc`
    2. [x] - `p2` - Validate sum of child allocations ≤ parent budget × `overcommit_ratio`; descendant allocations are loaded with one `list_by_alias_for_tenants` call over the ancestor's descendant tree - `inst-cfg-3a`

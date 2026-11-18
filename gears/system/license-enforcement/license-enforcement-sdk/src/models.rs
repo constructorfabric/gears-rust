@@ -89,19 +89,41 @@ pub enum Binding {
     /// Unbound.
     None,
     /// Bound to a subject.
+    #[non_exhaustive]
     Subject {
         /// The bound subject.
         subject: SubjectRef,
     },
-    /// Bound to the live sub-grant that delegation created from this grant.
+    /// Delegated to another tenant: bound to the live sub-grant that
+    /// delegation created from this grant.
+    #[non_exhaustive]
     Delegated {
         /// The sub-grant.
         grant_id: GrantId,
+        /// Tenant that holds the sub-grant.
+        tenant_id: Uuid,
     },
     /// A kind that this version of the SDK does not know. The server never
     /// sends it.
     #[serde(other, skip_serializing)]
     Unknown,
+}
+
+impl Binding {
+    /// Bound to `subject`.
+    #[must_use]
+    pub fn subject(subject: SubjectRef) -> Self {
+        Self::Subject { subject }
+    }
+
+    /// Delegated to the sub-grant `grant_id` that `tenant_id` holds.
+    #[must_use]
+    pub fn delegated(grant_id: GrantId, tenant_id: Uuid) -> Self {
+        Self::Delegated {
+            grant_id,
+            tenant_id,
+        }
+    }
 }
 
 /// A validity window. `grace_until`, when present, ends a grace period that
@@ -150,18 +172,19 @@ impl From<WindowInput> for Window {
     }
 }
 
-/// Validity of a grant: its own window, or the window of its parent.
+/// Validity of a grant: the own window of a root, or the window of the parent
+/// of a sub-grant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Validity {
-    /// Own window.
+    /// Own window (roots only).
     Own {
         /// The window.
         window: Window,
     },
     /// The window of the parent (sub-grants only). The gear copies it at
-    /// `delegate` and keeps it equal at `renew` and supersession.
+    /// `delegate` and keeps it equal at `renew`, `replace`, and supersession.
     Inherited {
         /// The effective window of the parent.
         window: Window,
@@ -215,11 +238,33 @@ impl From<PermissionsInput> for Permissions {
 /// gear sets `max_depth` to one less than the parent's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct DelegatedPermissions {
     /// The holder may `bind` and `unbind`. Not wider than the parent.
     pub may_bind: bool,
-    /// The sub-grant awaits the acceptance of its holder.
+    /// The sub-grant awaits the acceptance of its holder. Required when the
+    /// parent requires acceptance.
     pub requires_acceptance: bool,
+}
+
+impl DelegatedPermissions {
+    /// The permissions of a sub-grant that does not await acceptance.
+    #[must_use]
+    pub fn new(may_bind: bool) -> Self {
+        Self {
+            may_bind,
+            requires_acceptance: false,
+        }
+    }
+
+    /// The same permissions; the sub-grant awaits the acceptance of its holder.
+    #[must_use]
+    pub fn requiring_acceptance(self) -> Self {
+        Self {
+            requires_acceptance: true,
+            ..self
+        }
+    }
 }
 
 /// Stored lifecycle state of a grant.
@@ -291,13 +336,15 @@ pub struct GrantTerms {
     pub conditions: Option<Conditions>,
     /// Holder permissions.
     pub permissions: PermissionsInput,
-    /// Recipient rules evaluated at `delegate`.
+    /// Recipient rules evaluated at `delegate`. Not supported yet: a grant
+    /// with rules is refused with `unimplemented`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recipient_rules: Option<RecipientRules>,
 }
 
 /// A grant: a root or a sub-grant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[non_exhaustive]
 pub struct Grant {
     /// Grant id.
     pub id: GrantId,
@@ -325,6 +372,10 @@ pub struct Grant {
     /// Parent grant; absent for a root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_grant_id: Option<GrantId>,
+    /// Tenant that delegated the sub-grant: the holder of its parent; absent
+    /// for a root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grantor_tenant_id: Option<Uuid>,
     /// Delegation that created this sub-grant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation_id: Option<DelegationId>,
@@ -342,8 +393,45 @@ pub struct Grant {
     pub version: u64,
 }
 
+impl Grant {
+    /// An active root without binding, conditions, recipient rules, or pack,
+    /// at version 1. Set the other fields on the result.
+    #[must_use]
+    pub fn new(
+        id: GrantId,
+        holder_tenant_id: Uuid,
+        resource: ResourceRef,
+        subject_type: GtsTypeId,
+        validity: Validity,
+        permissions: Permissions,
+        evidence_id: EvidenceId,
+    ) -> Self {
+        Self {
+            id,
+            holder_tenant_id,
+            resource,
+            subject_type,
+            binding: Binding::None,
+            binding_fixed: false,
+            validity,
+            conditions: None,
+            permissions,
+            recipient_rules: None,
+            parent_grant_id: None,
+            grantor_tenant_id: None,
+            delegation_id: None,
+            pack_id: None,
+            evidence_id,
+            state: GrantState::Active,
+            termination_reason: None,
+            version: 1,
+        }
+    }
+}
+
 /// Subject-grant counts of one resource.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[non_exhaustive]
 pub struct BindingCounts {
     /// The licensed resource.
     pub resource: ResourceRef,
@@ -355,8 +443,22 @@ pub struct BindingCounts {
     pub delegated: u64,
 }
 
+impl BindingCounts {
+    /// No live grants of `resource` yet.
+    #[must_use]
+    pub fn new(resource: ResourceRef) -> Self {
+        Self {
+            resource,
+            unbound: 0,
+            bound: 0,
+            delegated: 0,
+        }
+    }
+}
+
 /// A set of grants issued together. Its members never change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[non_exhaustive]
 pub struct Pack {
     /// Pack id.
     pub id: PackId,
@@ -364,8 +466,27 @@ pub struct Pack {
     pub holder_tenant_id: Uuid,
     /// Subject-grant counts per resource.
     pub counts: Vec<BindingCounts>,
-    /// Increases at every change.
+    /// Increases at every pack verb and at `replace` of the pack. A write of
+    /// one member, such as `bind`, changes `counts` and not the version.
     pub version: u64,
+}
+
+impl Pack {
+    /// A pack of `holder_tenant_id` with `counts`.
+    #[must_use]
+    pub fn new(
+        id: PackId,
+        holder_tenant_id: Uuid,
+        counts: Vec<BindingCounts>,
+        version: u64,
+    ) -> Self {
+        Self {
+            id,
+            holder_tenant_id,
+            counts,
+            version,
+        }
+    }
 }
 
 #[cfg(test)]

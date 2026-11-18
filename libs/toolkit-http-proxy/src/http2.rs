@@ -413,7 +413,7 @@ async fn upload(
                 }
                 Err(frame) => {
                     if let Ok(mut trailers) = frame.into_trailers() {
-                        crate::sanitize::sanitize_trailers_without(&mut trailers, hop);
+                        crate::sanitize::sanitize_request_trailers_without(&mut trailers, hop);
                         let _sent = out.send_trailers(trailers);
                         return Ok(());
                     }

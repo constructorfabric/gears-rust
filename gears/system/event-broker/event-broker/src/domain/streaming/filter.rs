@@ -71,6 +71,7 @@ pub trait EventFilter: Send + Sync {
 }
 
 /// Which events of a batch [`EventFilter::prepare`] made decidable.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Prepared {
     /// Every event of the batch.
@@ -82,6 +83,7 @@ pub enum Prepared {
 }
 
 /// One interest, compiled.
+#[domain_model]
 #[derive(Debug)]
 pub(crate) struct CompiledInterest {
     /// The interest's tenant, which only [`InterestFilter`] compares: the

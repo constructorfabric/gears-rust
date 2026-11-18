@@ -47,6 +47,7 @@ pub struct CompiledScope {
 }
 
 /// One kept constraint: the tenant check AND every predicate in `rest`.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompiledConstraint {
     tenant: TenantCheck,
@@ -79,6 +80,7 @@ enum EventPredicate {
 
 /// What delivery does with the events of one type under one group's scope,
 /// from [`CompiledScope::plan_for`] or from a single-type evaluation.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TypePlan {
     /// No constraint can admit an event of the type: each is skipped.

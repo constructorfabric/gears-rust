@@ -1396,13 +1396,24 @@ type MakeRequest = fn() -> Request<ProxyBody>;
 #[tokio::test]
 async fn stale_keep_alive_connection_never_resends_unsafe_requests() {
     let c = client();
-    let cases: [(&str, MakeRequest); 2] = [
+    let cases: [(&str, MakeRequest); 3] = [
         // Not idempotent.
         ("POST", || Request::post("/").body(empty_body()).unwrap()),
         // Idempotent, but the streamed body cannot be sent again.
         ("PUT", || {
             let chunks = stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"data"))]);
             Request::put("/").body(stream_body(chunks)).unwrap()
+        }),
+        // A replayable copy holds the data only: a request that declares
+        // trailers would be resent without them.
+        ("PUT declaring trailers", || {
+            let data = Bytes::from_static(b"data");
+            let mut put = Request::put("/")
+                .header("trailer", "x-checksum")
+                .body(full_body(data.clone()))
+                .unwrap();
+            put.extensions_mut().insert(ReplayableBody(data));
+            put
         }),
     ];
     for (name, request) in cases {
@@ -1479,6 +1490,28 @@ async fn refused_h2_stream_is_resent_for_any_method() {
     post.extensions_mut().insert(ReplayableBody(data));
     assert_eq!(send_ok(&c, &h2_target(addr), post).await, "ok");
     assert_eq!(streams.load(Ordering::SeqCst), 2);
+
+    // A request that declares trailers is not resent from its data-only
+    // copy, even when sanitizing leaves no declaration: every name filtered
+    // out, or `Trailer` nominated by `Connection`.
+    let heads: [&[(&str, &str)]; 3] = [
+        &[("trailer", "x-checksum")],
+        &[("trailer", "authorization")],
+        &[("connection", "trailer"), ("trailer", "x-checksum")],
+    ];
+    for head in heads {
+        let (addr, streams) = h2_refusing(h2::Reason::REFUSED_STREAM, 1).await;
+        let data = Bytes::from_static(b"data");
+        let mut post = Request::post("/").body(full_body(data.clone())).unwrap();
+        for &(name, value) in head {
+            post.headers_mut()
+                .append(name, http::HeaderValue::from_static(value));
+        }
+        post.extensions_mut().insert(ReplayableBody(data));
+        let res = within(Duration::from_secs(2), c.send(&h2_target(addr), post)).await;
+        assert!(res.is_err(), "{head:?}");
+        assert_eq!(streams.load(Ordering::SeqCst), 1, "{head:?}");
+    }
 
     // Without a replayable body the refusal is the answer.
     let (addr, streams) = h2_refusing(h2::Reason::REFUSED_STREAM, 1).await;

@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use construct_sdk::profile_types::graph_types;
 use graph_storage_sdk::GraphStorageClientV1;
-use graph_storage_sdk::models::TypeRegistration;
+use graph_storage_sdk::models::{
+    OnExisting, RegisteredType, TypeOutcome, TypeRegistration, TypeRegistrationOptions,
+};
 use parking_lot::Mutex;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -16,15 +18,43 @@ use crate::domain::error::DomainError;
 
 /// Registers Construct's graph types in a tenant before the first write there.
 /// Graph storage keeps types per tenant. Registering the same schemas again
-/// converges, so a restart, or two instances registering at once, is safe; the
-/// tenants already done are remembered for the life of the process only, and a
-/// registration that failed is not remembered.
+/// converges, so a restart, or two instances registering at once, is safe. A
+/// tenant that holds an earlier version of a schema gets the new one when the
+/// change is backward compatible, as adding a property to a person type is;
+/// any other change is refused. The tenants already done are remembered for the
+/// life of the process only, and a registration that failed is not remembered.
+///
+/// The upgrade goes one way. A tenant that a newer release upgraded holds a
+/// schema the earlier release does not have, so after a rollback the earlier
+/// release's schema would remove a property: that is refused, and every
+/// profile write in the tenant fails until the newer release runs again.
 ///
 /// @cpt-dod:cpt-cf-construct-dod-profile-writer-registration:p1
 pub struct GraphTypes {
     client: Arc<dyn GraphStorageClientV1>,
     timeout: Duration,
     registered: Mutex<HashSet<Uuid>>,
+}
+
+/// A changed schema of a registered type is admitted when graph storage proves
+/// it backward compatible.
+fn update_existing() -> TypeRegistrationOptions {
+    TypeRegistrationOptions {
+        on_existing: OnExisting::Update,
+        ..TypeRegistrationOptions::default()
+    }
+}
+
+/// Rewriting a tenant's stored schema is rare and worth a trace.
+fn log_upgrades(tenant_id: Uuid, registered: &[RegisteredType]) {
+    let upgraded: Vec<_> = registered
+        .iter()
+        .filter(|registered| registered.outcome == TypeOutcome::Updated)
+        .map(|registered| registered.record.type_id.clone())
+        .collect();
+    if !upgraded.is_empty() {
+        tracing::info!(%tenant_id, types = ?upgraded, "graph types upgraded in the tenant");
+    }
 }
 
 impl GraphTypes {
@@ -76,23 +106,28 @@ impl GraphTypes {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let first =
-            tokio::time::timeout(self.timeout, self.client.register_types(ctx, batch.clone()))
-                .await;
+        let first = tokio::time::timeout(
+            self.timeout,
+            self.client
+                .register_types_with(ctx, batch.clone(), update_existing()),
+        )
+        .await;
         match first {
-            Ok(Ok(_)) => {}
+            Ok(Ok(registered)) => log_upgrades(tenant_id, &registered),
             // Two first registrations in a tenant race, and the one that
             // loses is refused as a conflict. The same schemas registered
             // again converge, so it is sent once more.
             Ok(Err(CanonicalError::Aborted { ctx: aborted, .. }))
                 if aborted.reason == CAS_CONFLICT =>
             {
-                bounded(
+                let registered = bounded(
                     self.timeout,
                     "type registration",
-                    self.client.register_types(ctx, batch),
+                    self.client
+                        .register_types_with(ctx, batch, update_existing()),
                 )
                 .await?;
+                log_upgrades(tenant_id, &registered);
             }
             Ok(Err(err)) => return Err(graph_error("type registration", &err)),
             Err(_) => return Err(unanswered("type registration", self.timeout)),

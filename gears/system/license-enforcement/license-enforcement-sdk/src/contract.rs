@@ -49,7 +49,8 @@ pub trait LicenseEnforcementApi: Send + Sync {
     #[idempotency(SafeRead)]
     async fn get_pack(&self, ctx: SecurityContext, id: PackId) -> Result<Pack, CanonicalError>;
 
-    /// List packs of the caller's tenant.
+    /// List packs in the scope that the PDP gives the caller: its own tenant,
+    /// or with `include_subtree` the tenants below it too.
     #[idempotency(SafeRead)]
     async fn list_packs(
         &self,
@@ -57,11 +58,13 @@ pub trait LicenseEnforcementApi: Send + Sync {
         query: ListQuery,
     ) -> Result<Page<Pack>, CanonicalError>;
 
-    /// Read a grant.
+    /// Read a grant of the caller's tenant, or of a tenant below it when the
+    /// PDP allows the caller `read_subtree`.
     #[idempotency(SafeRead)]
     async fn get_grant(&self, ctx: SecurityContext, id: GrantId) -> Result<Grant, CanonicalError>;
 
-    /// List grants in the scope that the PDP gives the caller. `$filter` only
+    /// List grants in the scope that the PDP gives the caller: its own tenant,
+    /// or with `include_subtree` the tenants below it too. `$filter` only
     /// narrows the list.
     #[idempotency(SafeRead)]
     async fn list_grants(
@@ -78,7 +81,8 @@ pub trait LicenseEnforcementApi: Send + Sync {
         id: DelegationId,
     ) -> Result<Delegation, CanonicalError>;
 
-    /// Holder accepts a grant that awaits acceptance.
+    /// Holder accepts a grant that awaits acceptance; a pack member only
+    /// with its pack.
     #[idempotency(IdempotentWrite)]
     async fn accept_grant(
         &self,
@@ -87,7 +91,8 @@ pub trait LicenseEnforcementApi: Send + Sync {
         req: VerbRequest,
     ) -> Result<Grant, CanonicalError>;
 
-    /// Holder rejects a grant that awaits acceptance.
+    /// Holder rejects a grant that awaits acceptance; a pack member only
+    /// with its pack.
     #[idempotency(IdempotentWrite)]
     async fn reject_grant(
         &self,
@@ -123,7 +128,9 @@ pub trait LicenseEnforcementApi: Send + Sync {
         req: VerbRequest,
     ) -> Result<Grant, CanonicalError>;
 
-    /// Extend the validity in place.
+    /// Extend the validity of a root in place; its sub-grants follow.
+    /// `Unimplemented` when the linked plugin verifies evidence: the evidence
+    /// fixes the window there, so a renewal needs new evidence.
     #[idempotency(IdempotentWrite)]
     async fn renew_grant(
         &self,
@@ -159,7 +166,10 @@ pub trait LicenseEnforcementApi: Send + Sync {
         req: VerbRequest,
     ) -> Result<Grant, CanonicalError>;
 
-    /// Grantor recalls a sub-grant and every descendant.
+    /// Grantor recalls a sub-grant and every descendant. `id` is the sub-grant
+    /// that the binding of the grantor's grant names. The grantor does not read
+    /// the rows of the recipient, so the answer is the grantor's grant, and
+    /// `expected_version` is the version of that grant.
     #[idempotency(IdempotentWrite)]
     async fn recall_grant(
         &self,
@@ -168,7 +178,13 @@ pub trait LicenseEnforcementApi: Send + Sync {
         req: VerbRequest,
     ) -> Result<Grant, CanonicalError>;
 
-    /// Vendor replaces the grant through the `issue` intake.
+    /// Vendor replaces the grant through the `issue` intake. The grant is a root
+    /// and not a pack member; a pack member is replaced through its pack. Each
+    /// replaced grant with a binding is named in `replaces` by one successor: an
+    /// unbound active grant, or one that admission fixed on the same subject,
+    /// on the same resource whose window has started and that admits the
+    /// binding. A grant that awaits acceptance is neither
+    /// replaced nor a successor.
     #[idempotency(IdempotentWrite)]
     async fn replace_grant(
         &self,
@@ -176,6 +192,26 @@ pub trait LicenseEnforcementApi: Send + Sync {
         id: GrantId,
         req: ReplaceRequest,
     ) -> Result<IssueResult, CanonicalError>;
+
+    /// Holder accepts every member of a pack that awaits acceptance, in one
+    /// transaction. A member is not accepted alone.
+    #[idempotency(IdempotentWrite)]
+    async fn accept_pack(
+        &self,
+        ctx: SecurityContext,
+        id: PackId,
+        req: VerbRequest,
+    ) -> Result<Pack, CanonicalError>;
+
+    /// Holder rejects every member of a pack that awaits acceptance, in one
+    /// transaction. A member is not rejected alone.
+    #[idempotency(IdempotentWrite)]
+    async fn reject_pack(
+        &self,
+        ctx: SecurityContext,
+        id: PackId,
+        req: VerbRequest,
+    ) -> Result<Pack, CanonicalError>;
 
     /// Suspend every member of a pack in one transaction.
     #[idempotency(IdempotentWrite)]
@@ -205,6 +241,8 @@ pub trait LicenseEnforcementApi: Send + Sync {
     ) -> Result<Pack, CanonicalError>;
 
     /// Extend the validity of every member of a pack in one transaction.
+    /// `Unimplemented` when the linked plugin verifies evidence, as
+    /// `renew_grant`.
     #[idempotency(IdempotentWrite)]
     async fn renew_pack(
         &self,
@@ -213,7 +251,9 @@ pub trait LicenseEnforcementApi: Send + Sync {
         req: RenewRequest,
     ) -> Result<Pack, CanonicalError>;
 
-    /// Replace the pack through the `issue` intake.
+    /// Replace the pack through the `issue` intake, under the rules of
+    /// `replace_grant`. The successors form the new pack, so they share
+    /// `requires_acceptance`.
     #[idempotency(IdempotentWrite)]
     async fn replace_pack(
         &self,

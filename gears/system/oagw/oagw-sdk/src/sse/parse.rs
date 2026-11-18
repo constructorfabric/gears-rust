@@ -207,7 +207,7 @@ pub fn parse_server_events_stream(
                     }
                     Some(Err(e)) => {
                         state.done = true;
-                        return Some((Err(StreamingError::Stream(e)), state));
+                        return Some((Err(StreamingError::from(e)), state));
                     }
                     None => {
                         state.done = true;
@@ -233,6 +233,21 @@ mod tests {
             .map(|s| Ok(Bytes::from(s.to_owned())))
             .collect();
         Box::pin(futures_util::stream::iter(owned))
+    }
+
+    /// A stream the gateway cut ends with `ClosedByGateway` for SDK readers.
+    #[tokio::test]
+    async fn a_stream_cut_by_the_gateway_ends_with_closed_by_gateway() {
+        let items: Vec<Result<Bytes, BoxError>> = vec![
+            Ok(Bytes::from("data: one\n\n")),
+            Err(Box::new(crate::StreamClosedByGateway::new())),
+        ];
+        let mut events = parse_server_events_stream(Box::pin(futures_util::stream::iter(items)));
+        assert_eq!(events.next().await.unwrap().unwrap().data, "one");
+        assert!(matches!(
+            events.next().await,
+            Some(Err(StreamingError::ClosedByGateway))
+        ));
     }
 
     #[tokio::test]

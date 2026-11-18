@@ -24,8 +24,9 @@ use graph_storage::infra::fake_store::{FakeGraphEngine, FakeGraphStore};
 use graph_storage_sdk::GraphStorageClientV1;
 use graph_storage_sdk::models::{
     DeleteOutcome, EdgeKey, EdgeSpec, GraphRevision, GtsTypeId, IngestOutcome, IngestRequest,
-    NeighborhoodRequest, NodeKey, NodeRow, NodeSpec, NodeView, Page, SearchRequest, SearchResponse,
-    TraversalResponse, TraverseRequest, TruncationReason, TypeQuery, TypeRecord, TypeRegistration,
+    NeighborhoodRequest, NodeKey, NodeRow, NodeSpec, NodeView, Page, RegisteredType, SearchRequest,
+    SearchResponse, TraversalResponse, TraverseRequest, TruncationReason, TypeQuery, TypeRecord,
+    TypeRegistration, TypeRegistrationOptions,
 };
 use serde_json::{Value, json};
 use tokio::sync::Barrier;
@@ -226,11 +227,12 @@ impl Scripted {
 
 #[async_trait]
 impl GraphStorageClientV1 for Scripted {
-    async fn register_types(
+    async fn register_types_with(
         &self,
         ctx: &SecurityContext,
         batch: Vec<TypeRegistration>,
-    ) -> Result<Vec<TypeRecord>, CanonicalError> {
+        options: TypeRegistrationOptions,
+    ) -> Result<Vec<RegisteredType>, CanonicalError> {
         self.registrations.fetch_add(1, Ordering::SeqCst);
         if self.fail_next_registration.swap(false, Ordering::SeqCst) {
             return Err(unavailable());
@@ -241,14 +243,6 @@ impl GraphStorageClientV1 for Scripted {
         {
             return Err(cas_conflict());
         }
-        self.inner.register_types(ctx, batch).await
-    }
-    async fn register_types_with(
-        &self,
-        ctx: &SecurityContext,
-        batch: Vec<TypeRegistration>,
-        options: graph_storage_sdk::models::TypeRegistrationOptions,
-    ) -> Result<Vec<graph_storage_sdk::models::RegisteredType>, CanonicalError> {
         self.inner.register_types_with(ctx, batch, options).await
     }
     async fn count_nodes(
@@ -2216,6 +2210,187 @@ async fn registration_is_remembered_per_tenant_and_a_failed_one_is_not() {
         "{failed:?}"
     );
     assert_eq!(scripted.registrations.load(Ordering::SeqCst), 4);
+}
+
+/// The registry as an earlier release left it: the person types without the
+/// properties added since.
+fn earlier_person_types() -> Vec<TypeRegistration> {
+    construct_sdk::profile_types::graph_types()
+        .into_iter()
+        .map(|graph_type| {
+            let mut schema: Value = serde_json::from_str(graph_type.schema).unwrap();
+            if let Some(Value::Object(properties)) =
+                schema.pointer_mut("/allOf/1/properties/payload/properties")
+            {
+                for added in [
+                    "projects",
+                    "repositories",
+                    "programming_languages",
+                    "tools_and_frameworks",
+                    "development_environment",
+                    "coding_conventions",
+                ] {
+                    properties.remove(added);
+                }
+            }
+            TypeRegistration {
+                type_id: graph_type.type_id.to_owned(),
+                schema,
+            }
+        })
+        .collect()
+}
+
+/// Every type is stored as the current release defines it.
+async fn assert_current_types_stored(
+    client: &Arc<dyn GraphStorageClientV1>,
+    ctx: &SecurityContext,
+) {
+    for graph_type in construct_sdk::profile_types::graph_types() {
+        let stored = client
+            .get_type(ctx, &graph_type.type_id.parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            stored.schema,
+            serde_json::from_str::<Value>(graph_type.schema).unwrap(),
+            "{}",
+            graph_type.type_id
+        );
+    }
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn schemas_of_an_earlier_version_are_upgraded_on_registration() {
+    let client = graph_storage();
+    let tenant = Uuid::new_v4();
+    let ctx = construct_in(tenant);
+    let earlier = earlier_person_types();
+    client.register_types(&ctx, earlier.clone()).await.unwrap();
+    let changed = earlier
+        .iter()
+        .filter(|registered| {
+            let current = construct_sdk::profile_types::graph_types()
+                .into_iter()
+                .find(|graph_type| graph_type.type_id == registered.type_id)
+                .unwrap();
+            serde_json::from_str::<Value>(current.schema).unwrap() != registered.schema
+        })
+        .count();
+    assert_eq!(changed, 3, "the role, skill and preference types differ");
+
+    GraphTypes::new(Arc::clone(&client))
+        .ensure(&ctx)
+        .await
+        .unwrap();
+
+    assert_current_types_stored(&client, &ctx).await;
+    assert!(logs_contain(&tenant.to_string()));
+    assert!(logs_contain("graph types upgraded in the tenant"));
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn registering_unchanged_schemas_logs_no_upgrade() {
+    let client = graph_storage();
+    let ctx = construct_in(Uuid::new_v4());
+    // The tenant already holds the current schemas, as after a restart.
+    GraphTypes::new(Arc::clone(&client))
+        .ensure(&ctx)
+        .await
+        .unwrap();
+
+    GraphTypes::new(client).ensure(&ctx).await.unwrap();
+
+    assert!(!logs_contain("graph types upgraded in the tenant"));
+}
+
+#[tokio::test]
+async fn a_registration_sent_again_after_a_lost_race_still_upgrades() {
+    let client = graph_storage();
+    let ctx = construct_in(Uuid::new_v4());
+    client
+        .register_types(&ctx, earlier_person_types())
+        .await
+        .unwrap();
+    let scripted = Scripted::over(Arc::clone(&client));
+    scripted
+        .conflict_next_registration
+        .store(true, Ordering::SeqCst);
+
+    GraphTypes::new(Arc::clone(&scripted) as Arc<dyn GraphStorageClientV1>)
+        .ensure(&ctx)
+        .await
+        .unwrap();
+
+    assert_eq!(scripted.registrations.load(Ordering::SeqCst), 2);
+    assert_current_types_stored(&client, &ctx).await;
+}
+
+#[tokio::test]
+async fn a_tenant_whose_schema_is_newer_than_the_release_is_refused_and_not_remembered() {
+    let client = graph_storage();
+    let ctx = construct_in(Uuid::new_v4());
+    // A newer release registered a property this one does not know, so this
+    // release's schema would remove it.
+    let newer: Vec<TypeRegistration> = construct_sdk::profile_types::graph_types()
+        .into_iter()
+        .map(|graph_type| {
+            let mut schema: Value = serde_json::from_str(graph_type.schema).unwrap();
+            if let Some(Value::Object(properties)) =
+                schema.pointer_mut("/allOf/1/properties/payload/properties")
+            {
+                properties.insert(
+                    "added_by_a_later_release".to_owned(),
+                    json!({ "type": "string" }),
+                );
+            }
+            TypeRegistration {
+                type_id: graph_type.type_id.to_owned(),
+                schema,
+            }
+        })
+        .collect();
+    client.register_types(&ctx, newer).await.unwrap();
+    let scripted = Scripted::over(Arc::clone(&client));
+    let types = GraphTypes::new(Arc::clone(&scripted) as Arc<dyn GraphStorageClientV1>);
+
+    let first = types.ensure(&ctx).await;
+    let second = types.ensure(&ctx).await;
+
+    assert!(matches!(first, Err(DomainError::Internal(_))), "{first:?}");
+    assert!(
+        matches!(second, Err(DomainError::Internal(_))),
+        "{second:?}"
+    );
+    // Graph storage refuses the change as a conflict, so each call sends the
+    // batch twice, and the second call asks again: the refusal is not
+    // remembered.
+    assert_eq!(scripted.registrations.load(Ordering::SeqCst), 4);
+    // The refused change left the newer schemas in place, on every type that
+    // has payload properties to add one to.
+    for graph_type in construct_sdk::profile_types::graph_types() {
+        let current: Value = serde_json::from_str(graph_type.schema).unwrap();
+        if current
+            .pointer("/allOf/1/properties/payload/properties")
+            .is_none()
+        {
+            continue;
+        }
+        let stored = client
+            .get_type(&ctx, &graph_type.type_id.parse().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            stored
+                .schema
+                .pointer("/allOf/1/properties/payload/properties/added_by_a_later_release")
+                .is_some(),
+            "{}",
+            graph_type.type_id
+        );
+    }
 }
 
 #[tokio::test]

@@ -1,3 +1,4 @@
+use crate::domain::plugin::credentials::{CLIENT_ID_REF_KEY, CLIENT_SECRET_REF_KEY};
 use credstore_sdk::{CredStoreClientV1, SecretRef};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -58,12 +59,12 @@ impl OAuth2PluginConfig {
         };
 
         let client_id_ref = config
-            .get("client_id_ref")
+            .get(CLIENT_ID_REF_KEY)
             .ok_or_else(|| PluginError::InvalidConfig("missing client_id_ref".into()))?
             .clone();
 
         let client_secret_ref = config
-            .get("client_secret_ref")
+            .get(CLIENT_SECRET_REF_KEY)
             .ok_or_else(|| PluginError::InvalidConfig("missing client_secret_ref".into()))?
             .clone();
 

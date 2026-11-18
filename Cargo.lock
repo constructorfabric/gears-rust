@@ -3535,6 +3535,7 @@ dependencies = [
  "hex",
  "http",
  "inventory",
+ "jsonschema 0.60.2",
  "sea-orm",
  "sea-orm-migration",
  "serde",

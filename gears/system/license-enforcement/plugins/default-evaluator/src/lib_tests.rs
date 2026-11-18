@@ -34,43 +34,34 @@ fn request(subject_type: &str, subject_id: Option<&str>, tenant: Uuid) -> Licens
 }
 
 fn grant(state: GrantState, grace_until: Option<OffsetDateTime>) -> Grant {
-    Grant {
-        id: GrantId(Uuid::nil()),
-        holder_tenant_id: Uuid::nil(),
-        resource: ResourceRef {
+    let mut g = Grant::new(
+        GrantId(Uuid::nil()),
+        Uuid::nil(),
+        ResourceRef {
             gts_type: GtsTypeId::new("gts.cf.core.lic.res.v1~acme.app.seat.v1~"),
             id: None,
         },
-        subject_type: GtsTypeId::new(USER),
-        binding: Binding::Subject {
-            subject: SubjectRef {
-                gts_type: GtsTypeId::new(USER),
-                id: "alice".to_owned(),
-            },
-        },
-        binding_fixed: false,
-        validity: Validity::Own {
+        GtsTypeId::new(USER),
+        Validity::Own {
             window: Window {
                 not_before: datetime!(2026-01-01 00:00 UTC),
                 expires_at: datetime!(2027-01-01 00:00 UTC),
                 grace_until,
             },
         },
-        conditions: None,
-        permissions: Permissions {
+        Permissions {
             may_bind: true,
             max_depth: 0,
             requires_acceptance: false,
         },
-        recipient_rules: None,
-        parent_grant_id: None,
-        delegation_id: None,
-        pack_id: None,
-        evidence_id: EvidenceId(Uuid::nil()),
-        state,
-        termination_reason: None,
-        version: 1,
-    }
+        EvidenceId(Uuid::nil()),
+    );
+    g.binding = Binding::subject(SubjectRef {
+        gts_type: GtsTypeId::new(USER),
+        id: "alice".to_owned(),
+    });
+    g.state = state;
+    g
 }
 
 #[test]

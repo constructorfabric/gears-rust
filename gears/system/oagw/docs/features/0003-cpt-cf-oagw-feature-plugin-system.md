@@ -188,7 +188,7 @@ Adheres to `cpt-cf-oagw-principle-plugin-immutable` (plugins immutable after cre
 - Auth plugin bound as scalar on upstream (`auth_plugin_ref`, `auth_plugin_uuid`)
 
 **Error Scenarios**:
-- Plugin reference does not resolve (named not in registry, UUID not in `oagw_plugin`)
+- Plugin reference does not resolve (named not in registry, UUID not in `oagw_plugin`). On upstream and route writes, any id that is not an implemented built-in plugin, custom UUID ids included, is rejected with 400 `NOT_IMPLEMENTED`; an auth plugin in `plugins.items` with 400 `VALIDATION`
 - Plugin type mismatch (e.g., auth plugin in guard/transform binding)
 - Position not contiguous from 0
 - Auth on routes is unsupported: the proxy uses upstream auth and ignores route auth references today; rejecting this configuration is planned in [#4974](https://github.com/constructorfabric/gears-rust/issues/4974). The upstream chooses the plugin, header name and prefix. [ADR-0021](../ADR/0021-upstream-credentials.md) proposes letting the caller name a credential on that upstream to specify which API key the plugin should use.
@@ -473,7 +473,7 @@ Plugin operations emit the following observability signals:
 ### Fault Tolerance
 
 - **Database failures**: Standard ToolKit error propagation applies. Plugin CRUD operations are short-lived transactions with no external side effects beyond DB writes. Transient DB failures return `503 Service Unavailable`.
-- **cred_store unavailability**: Not applicable for plugin CRUD. Auth plugin credential resolution happens at proxy request time (Feature 4: `cpt-cf-oagw-feature-proxy-engine`), not during plugin management. Plugin binding validation checks ref format only — it does not resolve secrets.
+- **cred_store unavailability**: Not applicable for plugin CRUD. Auth plugin credential resolution happens at proxy request time (Feature 4: `cpt-cf-oagw-feature-proxy-engine`), not during plugin management. Plugin binding validation does not resolve secrets. Upstream writes do check that the credential references of the auth config (`secret_ref`, `client_id_ref`, `client_secret_ref`) are readable in the credential store (best effort, see Feature 2).
 - **Starlark sandbox failures**: Timeout or memory exhaustion during source validation returns a `400 ValidationError` at creation time. Sandbox execution failures at proxy time are addressed by Feature 4.
 - **GC job failures**: GC cleanup is idempotent. If the periodic job fails mid-run, the next invocation picks up remaining candidates. The double-check (re-verify in-use before delete) guards against race conditions.
 

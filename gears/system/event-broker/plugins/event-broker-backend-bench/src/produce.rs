@@ -275,7 +275,7 @@ impl Writer {
             self.plan
                 .until
                 .budget
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
                     (left > 0).then(|| left.saturating_sub(wanted))
                 });
         if let Ok(before) = claimed {

@@ -94,7 +94,7 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 
 #### Tags support discovery and filtering
 - **Scenario**: [positive-2.9-tags-support-discovery-filtering.md](management-api/upstreams/positive-2.9-tags-support-discovery-filtering.md)
-- **Mechanism**: Create upstream with `tags` array. Listing/filtering returns expected upstreams by tag.
+- **Mechanism**: Create upstream with `tags` array. Listing/filtering returns expected upstreams by tag. Filtering is not implemented yet: `$filter`, `$orderby` or any other unsupported list parameter returns `400 UNSUPPORTED_QUERY_PARAM`.
 
 #### Multi-endpoint load balancing distributes requests
 - **Scenario**: [positive-2.10-multi-endpoint-load-balancing-distributes-requests.md](management-api/upstreams/positive-2.10-multi-endpoint-load-balancing-distributes-requests.md)
@@ -106,7 +106,7 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 
 #### List upstreams includes disabled resources
 - **Scenario**: [positive-2.12-list-upstreams-includes-disabled-resources.md](management-api/upstreams/positive-2.12-list-upstreams-includes-disabled-resources.md)
-- **Mechanism**: `GET /upstreams` returns both enabled and disabled upstreams with `enabled` field. Optional `$filter=enabled eq true` for active only.
+- **Mechanism**: `GET /upstreams` returns both enabled and disabled upstreams with `enabled` field. Filtering to active only (`$filter=enabled eq true`) is planned; today it returns `400 UNSUPPORTED_QUERY_PARAM`.
 
 #### CRUD endpoint update invalidates load balancer
 - **Scenario**: [positive-2.13-crud-endpoint-update-invalidates-load-balancer.md](management-api/upstreams/positive-2.13-crud-endpoint-update-invalidates-load-balancer.md)
@@ -154,7 +154,7 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 
 #### Plugin resolution supports builtin named ids and custom UUID ids
 - **Scenario**: [positive-4.5-plugin-resolution-supports-builtin-named-ids-custom-uuid.md](management-api/plugins/positive-4.5-plugin-resolution-supports-builtin-named-ids-custom-uuid.md)
-- **Mechanism**: Builtin plugin id works without DB row. UUID plugin id requires DB row; missing yields `503 PLUGIN_NOT_FOUND`.
+- **Mechanism**: Builtin plugin id works without DB row. A custom UUID id, a catalog-only id or an unknown id is rejected on write (`400 NOT_IMPLEMENTED`); a binding stored before that check fails at proxy time with 401 (auth), 500 (guard) or is skipped (transform); #4985 tracks `503 PLUGIN_NOT_FOUND`.
 
 #### Plugin sharing modes merge correctly across tenant hierarchy
 - **Scenario**: [positive-4.6-plugin-sharing-modes-merge-correctly-across-tenant-hierarchy.md](management-api/plugins/positive-4.6-plugin-sharing-modes-merge-correctly-across-tenant-hierarchy.md)
@@ -330,6 +330,10 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 - **Scenario**: [positive-13.2-client-disconnect-aborts-upstream-stream.md](protocols/sse/positive-13.2-client-disconnect-aborts-upstream-stream.md)
 - **Mechanism**: Disconnect client mid-stream. Upstream stream closed. No leaked in-flight metrics.
 
+#### SSE stream ends when the gear stops
+- **Scenario**: [positive-13.3-sse-stream-ends-on-gear-stop.md](protocols/sse/positive-13.3-sse-stream-ends-on-gear-stop.md)
+- **Mechanism**: Server shutdown or gear stop ends open SSE streams (and sends Close 1001 on WebSocket relays) before the HTTP drain, also a stream opened before the first start or one that starts waiting after the stop was signalled. A later start lets new streams run.
+
 ---
 
 ### WebSocket
@@ -474,6 +478,8 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 
 ### OData query support
 
+> **Planned.** None of the scenarios below is implemented yet. Today the list endpoints accept `limit` and `offset` (routes also `upstream_id`) and refuse any other parameter with `400 UNSUPPORTED_QUERY_PARAM`; see [positive-2.9-tags-support-discovery-filtering.md](management-api/upstreams/positive-2.9-tags-support-discovery-filtering.md).
+
 #### $select projects fields for upstream list
 - **Scenario**: *Section 25.1 — no separate file.*
 - **Mechanism**: `GET /upstreams?$select=id,alias` returns only those fields.
@@ -565,6 +571,14 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 #### Path suffix mode = disabled → rejected
 - **Scenario**: [negative-3.4-path-suffix-mode-disabled.md](management-api/routes/negative-3.4-path-suffix-mode-disabled.md)
 - **What happens**: Supplying any suffix returns a gateway validation error.
+
+#### Unsupported list parameters → 400
+- **Scenario**: [positive-2.9-tags-support-discovery-filtering.md](management-api/upstreams/positive-2.9-tags-support-discovery-filtering.md)
+- **What happens**: `GET /upstreams?$filter=...` (or `$orderby`, `tags`, any key other than `limit`, `offset` and, for routes, `upstream_id`) returns `400 PD` with one `UNSUPPORTED_QUERY_PARAM` violation per key instead of an unfiltered list.
+
+#### Write-time validation → 400
+- **Scenario**: [negative-2.15-write-validation-rejected-400.md](management-api/upstreams/negative-2.15-write-validation-rejected-400.md)
+- **What happens**: Port 0, a tag outside `^[a-z0-9_-]+$`, an alias starting or ending with `.`, `-` or `:`, an empty or relative HTTP route path, an empty method list, a rate limit value of 0, a plugin id that is not implemented, or an `http` endpoint while `allow_http_upstream` is off returns `400 PD` (`invalid_argument`). Nothing is stored.
 
 #### Stored field limits → 400
 - **Scenario**: [negative-2.14-field-limits-rejected-400.md](management-api/upstreams/negative-2.14-field-limits-rejected-400.md)
@@ -664,7 +678,7 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 
 #### Secret access control via cred_store → 401/500
 - **Scenario**: [negative-9.7-secret-access-control-cred-store.md](proxy-api/authentication/negative-9.7-secret-access-control-cred-store.md)
-- **What happens**: If `cred_store` denies access, proxy returns `401 AuthenticationFailed`. If secret missing, returns `500 SecretNotFound`.
+- **What happens**: If `cred_store` denies access, proxy returns `401 AuthenticationFailed`. A missing secret is rejected when the upstream is written (`400 failed_precondition` naming the key); one deleted after the write returns `500 SecretNotFound`.
 
 #### Descendant override permissions enforced → blocked
 - **Scenario**: [negative-9.9-descendant-override-permissions-enforced.md](proxy-api/authentication/negative-9.9-descendant-override-permissions-enforced.md)

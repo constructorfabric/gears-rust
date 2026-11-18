@@ -361,14 +361,13 @@ be inside the signed payload. Adding a resource or subject type **MUST** require
 
 A grant **MUST** carry an immutable server-assigned id, the target resource (a registered Resource contract type and an
 optional instance id), the holder tenant, the subject scope, a validity window (`not_before`, `expires_at`, optional
-`grace_until` closing a grace window; a sub-grant may instead inherit its parent's window), optional conditions,
-holder permissions (whether the holder may `bind`, the maximum chain depth below this grant — zero means it may
-not `delegate` — and whether the grant requires acceptance when it is created), optional recipient rules, for a
-sub-grant its parent grant reference and delegation id, an optional pack reference, a reference to the
-evidence it descends from, a monotonic version, its lifecycle state, and — for a root grant admitted from an
-artifact — its signature envelope. A subject grant additionally carries its binding: none (the grant is
-unbound), a subject id, or the sub-grant delegated from it; it **MUST** have at most one binding at any time, and
-at most one **live** child sub-grant (one not terminated).
+`grace_until` closing a grace window; a sub-grant always has its parent's window), optional conditions, holder
+permissions (whether the holder may `bind`, the maximum chain depth below this grant — zero means it may not `delegate`
+— and whether the grant requires acceptance when it is created), optional recipient rules, for a sub-grant its parent
+grant reference and delegation id, an optional pack reference, a reference to the evidence it descends from, a monotonic
+version, its lifecycle state, and — for a root grant admitted from an artifact — its signature envelope. A subject grant
+additionally carries its binding: none (the grant is unbound), a subject id, or the sub-grant delegated from it; it
+**MUST** have at most one binding at any time, and at most one **live** child sub-grant (one not terminated).
 
 - **Rationale**: One grant shape covers every commercial form: a site license is a tenant-wide grant, N named-subject
   licenses are N grants, and conservation is a property of the binding rather than an invariant to defend.
@@ -403,16 +402,16 @@ holder's acceptance; suspended; terminated, which no verb reverses and which rec
 recalled, returned, rejected, or replaced); and expired beyond grace. Only a usable grant satisfies a check. Transitions
 **MUST** be explicit verbs: `issue` (usable at once or awaiting acceptance, per the grant's acceptance requirement),
 `accept` and `reject` by the holder (a rejected grant is terminated), `suspend`, `reinstate`, `revoke`, and `renew`, and
-for sub-grants `recall` by the grantor and `return` by a holder whose chain ends unbound; both terminate the sub-grant
-and everything below it, unbind any subject at the end of the chain, and return the parent's binding to none. `renew`
-extends a grant's validity window, the grant keeping its identity; any grant not terminated can be renewed, and
-sub-grants that inherit its validity follow. In an untrusted build a root grant is renewed only by a renewed artifact
-from the vendor. Expiry **MUST** be derived from time, not from a stored transition: past `expires_at` a grant with a
-`grace_until` still satisfies a check, with a grace diagnostic, until that date and then denies as grace expired;
-without one it denies as expired. Suspension, termination, expiry, and the end of grace of a grant **MUST** apply to
-every grant below it in the parent grant chain; a check derives this from the chain. Revocation also terminates every
-grant below it in the same operation. Only a verb terminates a grant. An expired grant keeps its stored state and can be
-renewed at any time. Terminated grants **MUST** be retained for audit.
+for sub-grants `recall` by the grantor, which terminates the sub-grant and everything below it and unbinds any subject
+at the end of the chain, and `return` by a holder whose sub-grant is unbound, which terminates that sub-grant; both
+return the parent's binding to none. `renew` extends a grant's validity window, the grant keeping its identity; any root
+not terminated can be renewed, and its sub-grants follow. In an untrusted build a root grant is renewed only by a
+renewed artifact from the vendor. Expiry **MUST** be derived from time, not from a stored transition: past `expires_at`
+a grant with a `grace_until` still satisfies a check, with a grace diagnostic, until that date and then denies as grace
+expired; without one it denies as expired. Suspension, termination, expiry, and the end of grace of a grant **MUST**
+apply to every grant below it in the parent grant chain; a check derives this from the chain. Revocation also terminates
+every grant below it in the same operation. Only a verb terminates a grant. An expired grant keeps its stored state and
+can be renewed at any time. Terminated grants **MUST** be retained for audit.
 
 - **Rationale**: Distinct situations and explicit verbs let consumers and operators tell *why* a grant does not apply;
   a state the check derives cannot be flipped by editing a row.
@@ -438,18 +437,17 @@ admission and id shape.
 
 - [ ] `p1` - **ID**: `cpt-cf-license-enforcement-fr-delegation`
 
-The holder of subject grants whose maximum depth is above zero (delegable grants) **MUST** be able to `delegate` any
-number of its unbound ones to a recipient tenant, atomically creating one sub-grant per grant in the recipient's scope,
-awaiting acceptance or usable at once per the grant's acceptance requirement, and setting each parent's binding to its
-sub-grant; the delegating holder is the sub-grants' **grantor**. The sub-grants of one `delegate` **MUST** share a
-**delegation id**, and `accept`, `reject`, `return`, and `recall` addressed to a delegation **MUST** apply to all its
+The holder of subject grants whose maximum depth is above zero (delegable grants) **MUST** be able to `delegate` any set
+of its unbound ones, named by id, to a recipient tenant, atomically creating one sub-grant per grant in the recipient's
+scope, awaiting acceptance or usable at once per the grant's acceptance requirement, and setting each parent's binding
+to its sub-grant; the delegating holder is the sub-grants' **grantor**. The sub-grants of one `delegate` **MUST** share
+a **delegation id**, and `accept`, `reject`, `return`, and `recall` addressed to a delegation **MUST** apply to all its
 sub-grants atomically. The recipient **MUST** be a descendant of the holder in the tenant hierarchy as `tenant-resolver`
 reports it at that moment, and **MUST** satisfy the grant's recipient rules, if any. A sub-grant **MUST** be a subset of
-its parent: same resource, subject scope, and evidence; validity inheriting or within the parent's; conditions the
-parent's plus optionally its own; holder permissions no wider than the parent's with a maximum depth one less; depth
-within the root's maximum. A sub-grant is itself a subject grant and may be bound or delegated on under the same rules,
-so one root grant is a chain with one binding at its end. Reject, return, and recall **MUST** return the parent's
-binding to none. A sub-grant whose window ended does not block its parent: binding or delegating the parent recalls it.
+its parent: same resource, subject scope, and evidence; validity equal to the parent's; conditions the parent's plus
+optionally its own; holder permissions no wider than the parent's with a maximum depth one less; depth within the root's
+maximum. A sub-grant is itself a subject grant and may be bound or delegated on under the same rules, so one root grant
+is a chain with one binding at its end. Reject, return, and recall **MUST** return the parent's binding to none.
 
 - **Rationale**: One binding per grant, at every link, conserves the count without arithmetic; subset rules keep a
   sub-grant from ever widening the license it descends from.
@@ -473,11 +471,11 @@ rejected with a typed error.
 - [ ] `p1` - **ID**: `cpt-cf-license-enforcement-fr-precedence`
 
 The vendor **MUST** be able to replace a grant or Pack by a new issuance in one operation: the replaced grants are
-terminated, and each binding they carried moves to an unbound grant of the replacement on the same resource that admits
-the subject or the delegation; a delegated binding moves with every sub-grant below it, which then descend from the
-replacement's evidence and stay usable throughout, so a plan change never opens a denial window. A replacement that
-cannot carry over every binding **MUST** be rejected as a whole, naming the bindings without a successor; the holder
-unbinds first or the vendor replaces with grants that can carry them.
+terminated, and each binding they carried moves to the grant of the replacement that names the replaced grant, an
+unbound grant on the same resource that admits the subject or the delegation; a delegated binding moves with every
+sub-grant below it, which then descend from the replacement's evidence and stay usable throughout, so a plan change
+never opens a denial window. A replacement that cannot carry over every binding **MUST** be rejected as a whole, naming
+the bindings without a successor; the holder unbinds first or the vendor replaces with grants that can carry them.
 
 - **Rationale**: Bindings belong to the holder, so only a single vendor operation can move them together with the
   grants they sit on.
@@ -508,7 +506,9 @@ addressed to a Pack **MUST** apply to all its grants atomically; binding and del
 The system **MUST** expose management operations for Packs, grants, and sub-grants — create / read / list plus the
 lifecycle verbs of §5.3 and §5.4 as explicit sub-operations, not status patches — together with a read-only
 check-explain operation returning the decision and reason the check path would produce for a given subject
-and resource. Lists **MUST** be scoped to the caller's tenant, support filtering by resource type, state, and subject,
+and resource. Lists **MUST** be scoped to the caller's tenant, support filtering by resource type, state, subject, holder,
+binding kind, and the tenant a grant is delegated to, so that a holder finds the unbound grants it can delegate and
+what it gave to each tenant,
 and report unbound, bound, and delegated subject-grant counts per pack and resource. Creating a root grant
 **MUST** go through the admission plugin (`cpt-cf-license-enforcement-fr-admission-plugin`), which also decides
 whether a parameter-based create exists in this build at all. The API **MUST** be mounted into `api-gateway` and
@@ -539,11 +539,12 @@ Every managed resource **MUST** carry a monotonic version, and callers **MUST** 
 Every management operation **MUST** be authorized through the PDP before execution, with tenant scope taken from
 `SecurityContext` and the PDP's constraints applied in the same transaction as the mutation. A holder or recipient
 tenant in the payload **MUST** be accepted only inside that scope. A tenant administrator **MUST** be limited to grants
-their tenant holds (accept, reject, bind, unbind, delegate, return; and recall and renew of the sub-grants it delegated,
-within its own window) and **MUST NOT** be able to issue, suspend, reinstate, revoke, or renew a root grant; those verbs
-and Pack issuance are vendor operations. A grantor **MUST** be able to read the state and binding of the sub-grants it
-delegated across the tenant boundary, and nothing else about the recipient tenant; the vendor **MUST** be able to read
-the full delegation tree of every grant it issued.
+their tenant holds (accept, reject, bind, unbind, delegate, return; and recall of the sub-grants it delegated) and
+**MUST NOT** be able to issue, suspend, reinstate, revoke, or renew a root grant; those verbs and Pack issuance are
+vendor operations. A grantor **MUST** see on each grant it holds whom the grant is given to: a subject, or the tenant it
+is delegated to. This **MUST** hold after the recipient tenant leaves the grantor's subtree. A grantor **MUST NOT** read
+the sub-grants or anything else of the recipient tenant; the vendor **MUST** be able to read the full delegation tree of
+every grant it issued.
 
 - **Rationale**: The management API is where a licensing service can be turned into a minting service; PDP gating with
   in-transaction constraints is the platform's defense in depth.
@@ -679,8 +680,10 @@ No failure of storage, types registry, PDP, trust-bundle loading, or clock sanit
 - [ ] `p1` - **ID**: `cpt-cf-license-enforcement-nfr-tenant-isolation`
 
 Every check and every management read or write **MUST** be scoped to the tenant derived from `SecurityContext` (or the
-resolver's request context) and, as the PDP constraints allow, its descendants, with the single documented exception of
-a grantor reading the sub-grants it delegated.
+resolver's request context) and, as the PDP constraints allow, its descendants. The exceptions are the rows of another
+tenant in the chain of a grant that an authorized operation on that grant reaches: a grantor recalling the sub-grants it
+delegated, the sub-grant created in the recipient's scope, the parent released when a sub-grant ends, the sub-grants
+moved at replacement, and a check reading the chain above a candidate.
 
 - **Threshold**: 0 cross-tenant reads or grant matches in isolation tests; a tenant id from a payload (holder or
   recipient) is accepted only inside that scope, as `tenant-resolver` reports it.
@@ -830,8 +833,9 @@ freshness TTL of each artifact and indefinitely for one without.
   30 are bound. Tenant S is a child of T, S2 a child of S.
 
 **Main Flow**:
-1. T's administrator delegates 40 grants to S; the PDP authorizes and `tenant-resolver` confirms S descends from T.
-2. The system picks 40 unbound grants, sets their binding to the new sub-grants, and creates 40 sub-grants in S's
+1. T's administrator lists T's unbound grants on F and delegates 40 of them, named by id, to S; the PDP authorizes
+   and `tenant-resolver` confirms S descends from T.
+2. The system sets the binding of the 40 named grants to the new sub-grants, and creates 40 sub-grants in S's
    scope (awaiting acceptance, validity inherited, depth 1) under one delegation id; T has 30 unbound grants left.
 3. S's administrator accepts the delegation; the sub-grants become usable. S binds one to user U and delegates 10 to
    S2, which accepts and binds them to its own users.
@@ -848,7 +852,7 @@ freshness TTL of each artifact and indefinitely for one without.
 - **S rejects**: the sub-grants are terminated and all 40 parent grants return to binding none immediately.
 - **S returns 5 unbound grants**: their sub-grants are terminated, T has 35 unbound grants.
 - **S tries to return a grant it has bound**: rejected; S unbinds first or T recalls.
-- **T tries to delegate 80 before step 1**: rejected, only 70 grants are unbound.
+- **T names a grant that is bound or already delegated**: the whole delegation is rejected; no grant changes.
 - **Vendor suspends T's pack**: every check down the chain denies as suspended; no stored state below changes.
 - **The same user U checks in T's context**: denied as not bound; T holds grants on F but none bound to U.
 
@@ -922,7 +926,7 @@ freshness TTL of each artifact and indefinitely for one without.
   atomically.
 - [ ] Every management mutation is idempotent by client token, versioned, and PDP-authorized with tenant scope from
   `SecurityContext`; a tenant administrator cannot issue, suspend, revoke, or renew a root grant.
-- [ ] Return moves only unbound grants; renewing a root grant extends every sub-grant that inherits its validity.
+- [ ] Return moves only unbound grants; renewing a root grant extends every sub-grant below it.
 - [ ] Replacing a grant terminates it with the reason replaced and carries its bindings over in one operation; no
   check in between denies.
 - [ ] Registering a new resource or subject contract type requires no code change in this module.

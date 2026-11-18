@@ -185,7 +185,10 @@ pub enum ServiceGatewayError {
         /// impl grows new precondition categories.
         precondition_type: String,
         /// `subject` from the canonical `PreconditionViolation`: the guard
-        /// plugin's `error_code`, `auth.config.secret_ref`, or
+        /// plugin's `error_code`, a credential key
+        /// ([`crate::precondition::SECRET_REF`],
+        /// [`crate::precondition::CLIENT_ID_REF`],
+        /// [`crate::precondition::CLIENT_SECRET_REF`]), or
         /// [`crate::precondition::MANAGED_BY`].
         subject: String,
         detail: String,
@@ -380,7 +383,13 @@ pub enum StreamingError {
 
     /// Underlying byte stream produced an error.
     #[error("stream error: {0}")]
-    Stream(#[from] Box<dyn std::error::Error + Send + Sync>),
+    Stream(Box<dyn std::error::Error + Send + Sync>),
+
+    /// The gateway cut the stream because it is stopping (a gear stop or a
+    /// server shutdown). The response is incomplete; a retry is safe where
+    /// the request is, ideally on another replica.
+    #[error("the gateway closed the stream because it is stopping")]
+    ClosedByGateway,
 
     /// WebSocket connection to upstream failed.
     #[error("WebSocket connect error: {detail}")]
@@ -389,6 +398,32 @@ pub enum StreamingError {
     /// WebSocket bridge error during forwarding.
     #[error("WebSocket bridge error: {detail}")]
     WebSocketBridge { detail: String },
+}
+
+/// The body error the gateway ends a streamed (SSE) response with when it
+/// stops. SDK readers see it as [`StreamingError::ClosedByGateway`]; a raw
+/// body consumer can `downcast_ref` it.
+#[derive(Debug, Clone, Default, thiserror::Error)]
+#[error("the gateway closed the stream because it is stopping")]
+#[non_exhaustive]
+pub struct StreamClosedByGateway;
+
+impl StreamClosedByGateway {
+    /// The error for a stream the gateway cut.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl From<Box<dyn std::error::Error + Send + Sync>> for StreamingError {
+    fn from(e: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        if e.is::<StreamClosedByGateway>() {
+            Self::ClosedByGateway
+        } else {
+            Self::Stream(e)
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -480,6 +515,8 @@ mod sdk_vocabulary_round_trip_tests {
             field::PATH_SUFFIX_NOT_ALLOWED,
             field::UNSUPPORTED_SCHEME,
             field::HTTP_UPSTREAM_FORBIDDEN,
+            field::NOT_IMPLEMENTED,
+            field::UNSUPPORTED_QUERY_PARAM,
         ];
 
         for code in cases {
@@ -953,5 +990,20 @@ mod projection_tests {
             }
             other => panic!("expected Other, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_gateway_stop_is_its_own_streaming_error() {
+        let stopped: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(StreamClosedByGateway::new());
+        assert!(matches!(
+            StreamingError::from(stopped),
+            StreamingError::ClosedByGateway
+        ));
+        let other: Box<dyn std::error::Error + Send + Sync> = "connection reset".into();
+        assert!(matches!(
+            StreamingError::from(other),
+            StreamingError::Stream(_)
+        ));
     }
 }

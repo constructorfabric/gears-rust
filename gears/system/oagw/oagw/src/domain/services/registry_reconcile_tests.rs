@@ -948,7 +948,7 @@ async fn a_hierarchy_rejection_skips_and_the_old_config_serves(b: Backend) {
     );
     let mut ancestor = upstream_at(root, "api.example.com").request;
     ancestor.auth = Some(AuthConfig {
-        plugin_type: "apikey".into(),
+        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Enforce,
         config: None,
     });
@@ -962,7 +962,7 @@ async fn a_hierarchy_rejection_skips_and_the_old_config_serves(b: Backend) {
     );
 
     upstreams[0].request.auth = Some(AuthConfig {
-        plugin_type: "apikey".into(),
+        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -1062,8 +1062,8 @@ async fn the_content_check_skips_bad_instances_and_keeps_their_rows(b: Backend) 
 /// ADR-0018: PERS-PROV-002.
 async fn every_kind_of_bad_content_is_skipped_and_keeps_its_row(b: Backend) {
     use crate::domain::model::{
-        BudgetConfig, BudgetMode, CorsConfig, RateLimitAlgorithm, RateLimitConfig, RateLimitScope,
-        RateLimitStrategy, SustainedRate, Window,
+        BudgetConfig, BudgetMode, CorsConfig, PluginBinding, PluginsConfig, RateLimitAlgorithm,
+        RateLimitConfig, RateLimitScope, RateLimitStrategy, SustainedRate, Window,
     };
     use crate::domain::ssrf::SsrfPolicy;
 
@@ -1075,7 +1075,17 @@ async fn every_kind_of_bad_content_is_skipped_and_keeps_its_row(b: Backend) {
     let f = Fixture::guarded(b, ssrf);
     let root = Uuid::new_v4();
     let good = upstream_at(root, "good.example.com");
-    let hosts = ["ssrf", "cors", "budget", "secret"].map(|h| format!("{h}.example.com"));
+    let hosts = [
+        "ssrf",
+        "cors",
+        "budget",
+        "secret",
+        "plain",
+        "plugin",
+        "zero-rate",
+        "tag",
+    ]
+    .map(|h| format!("{h}.example.com"));
     let mut bad = hosts.map(|host| upstream_at(root, &host));
     let mut bad_cors_route = route_on(&good, "/cors");
     let mut upstreams = vec![good.clone()];
@@ -1097,7 +1107,7 @@ async fn every_kind_of_bad_content_is_skipped_and_keeps_its_row(b: Backend) {
         expose_headers: vec![],
         allow_credentials: true,
     };
-    let [ssrf, cors, budget, secret] = &mut bad;
+    let [ssrf, cors, budget, secret, plain, plugin, zero_rate, tag] = &mut bad;
     set_host(ssrf, "denied.example.com");
     cors.request.cors = Some(wildcard_with_credentials.clone());
     budget.request.rate_limit = Some(RateLimitConfig {
@@ -1120,7 +1130,7 @@ async fn every_kind_of_bad_content_is_skipped_and_keeps_its_row(b: Backend) {
         pool_owner_id: None,
     });
     secret.request.auth = Some(AuthConfig {
-        plugin_type: "apikey".into(),
+        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Private,
         config: Some(
             [
@@ -1130,6 +1140,32 @@ async fn every_kind_of_bad_content_is_skipped_and_keeps_its_row(b: Backend) {
             .into(),
         ),
     });
+    // The checks of #4974: plain HTTP while the gear does not allow it, an
+    // unimplemented plugin, a zero rate, a tag outside the pattern.
+    plain.request.server.endpoints[0].scheme = Scheme::Http;
+    plugin.request.plugins = Some(PluginsConfig {
+        sharing: SharingMode::Private,
+        items: vec![PluginBinding {
+            plugin_ref: crate::domain::gts_helpers::TIMEOUT_GUARD_PLUGIN_ID.into(),
+            config: Default::default(),
+        }],
+    });
+    zero_rate.request.rate_limit = Some(RateLimitConfig {
+        sharing: SharingMode::Private,
+        algorithm: RateLimitAlgorithm::TokenBucket,
+        sustained: SustainedRate {
+            rate: 0,
+            window: Window::Second,
+        },
+        burst: None,
+        budget: None,
+        scope: RateLimitScope::Tenant,
+        strategy: RateLimitStrategy::Reject,
+        cost: 1,
+        response_headers: false,
+        pool_owner_id: None,
+    });
+    tag.request.tags = vec!["LLM".into()];
     bad_cors_route.request.cors = Some(wildcard_with_credentials);
     let mut no_id = route_on(&good, "/no-id");
     no_id.request.id = None;
@@ -1139,7 +1175,11 @@ async fn every_kind_of_bad_content_is_skipped_and_keeps_its_row(b: Backend) {
         "blocked by SSRF protection",
         "allow_credentials",
         "budget.total is required",
-        "invalid secret_ref",
+        "invalid credential reference",
+        "only HTTPS endpoints are permitted",
+        "is not implemented",
+        "rate_limit.sustained.rate must be at least 1",
+        "must match ^[a-z0-9_-]+$",
     ]) {
         let e = f
             .provisioner
@@ -1159,7 +1199,7 @@ async fn every_kind_of_bad_content_is_skipped_and_keeps_its_row(b: Backend) {
         (
             Tally {
                 unchanged: 1,
-                failed: 4,
+                failed: 8,
                 ..NONE
             },
             Tally {
@@ -1174,6 +1214,10 @@ async fn every_kind_of_bad_content_is_skipped_and_keeps_its_row(b: Backend) {
         vec![
             failure("route", why::INVALID_INSTANCE),
             failure("route", why::INVALID_REQUEST),
+            failure("upstream", why::INVALID_REQUEST),
+            failure("upstream", why::INVALID_REQUEST),
+            failure("upstream", why::INVALID_REQUEST),
+            failure("upstream", why::INVALID_REQUEST),
             failure("upstream", why::INVALID_REQUEST),
             failure("upstream", why::INVALID_REQUEST),
             failure("upstream", why::INVALID_REQUEST),
@@ -1603,7 +1647,7 @@ fn with_secret(root: Uuid) -> ProvisionedUpstream {
     config.insert("header".into(), "authorization".into());
     config.insert("secret_ref".into(), "cred://key".into());
     u.request.auth = Some(AuthConfig {
-        plugin_type: "apikey".into(),
+        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Private,
         config: Some(config),
     });
@@ -2049,6 +2093,7 @@ fn every_domain_error_is_fatal_or_has_a_reason() {
         ),
         (
             DomainError::SecretRefNotAccessible {
+                field: "auth.config.secret_ref",
                 detail: d(),
                 instance: i(),
             },

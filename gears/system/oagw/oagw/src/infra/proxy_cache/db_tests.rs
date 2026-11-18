@@ -82,7 +82,7 @@ fn unchanged(upstream: &Upstream) -> UpdateUpstreamRequest {
 /// Auth that descendants inherit, which shares the upstream with them.
 fn shared_auth() -> Option<AuthConfig> {
     Some(AuthConfig {
-        plugin_type: "noop".into(),
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     })
