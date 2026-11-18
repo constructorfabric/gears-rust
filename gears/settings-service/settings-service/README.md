@@ -96,7 +96,7 @@ gear that reads settings during *its* init names `settings-service` in its own
 
 Capabilities are `db`, `rest` and `stateful`; the managed lifecycle runs three
 passes: the minute sweep that releases staged secrets nobody claimed, the
-minute refresh of the `settings_needs_review_total` gauge, and a daily audit
+minute refresh of the `settings_needs_review` gauge, and a daily audit
 retention pass that prunes records past their horizon.
 
 ## REST surface

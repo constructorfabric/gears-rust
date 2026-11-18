@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::secrets::pending::{PendingSecret, PendingSecretDraft, PendingSecretRepository};
+use crate::infra::storage::db_error::db_error;
 use crate::infra::storage::entity::pending_secret::{self, Entity as PendingEntity};
 
 /// How many references one `IN` list carries.
@@ -19,12 +20,6 @@ const REFERENCE_CHUNK: usize = 500;
 /// The repository. Stateless: every operation takes its connection.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PendingSecretRepo;
-
-fn db_error(err: impl std::fmt::Display) -> DomainError {
-    DomainError::Internal {
-        diagnostic: err.to_string(),
-    }
-}
 
 fn to_domain(model: pending_secret::Model) -> PendingSecret {
     PendingSecret {

@@ -267,7 +267,7 @@ The system **MUST** carry a non-null `needs_review` boolean with an optional hum
 
 - [x] `p2` - **ID**: `cpt-cf-settings-service-dod-typed-value-validation-needs-review-gauge`
 
-The system **MUST** publish `settings_needs_review_total`, the count of subject-less overrides flagged `needs_review`, by declaration source (`admin_authored`, `module_contributed`), refreshed from the store by the gear's lifecycle once a minute. Every source **MUST** be published on every refresh, zero included, so a backlog that has been fixed reads zero rather than its last count, and a failed refresh **MUST** leave the gauge as it was until the next one. A flagged override falls through on read without an error; this gauge is the signal an operator alerts on, and the review listing shows which settings and scopes are affected.
+The system **MUST** publish `settings_needs_review`, the count of subject-less overrides flagged `needs_review`, by declaration source (`admin_authored`, `module_contributed`), refreshed from the store by the gear's lifecycle once a minute. Every source **MUST** be published on every refresh, zero included, so a backlog that has been fixed reads zero rather than its last count, and a failed refresh **MUST** leave the gauge as it was until the next one. A flagged override falls through on read without an error; this gauge is the signal an operator alerts on, and the review listing shows which settings and scopes are affected.
 
 **Implements**:
 - `cpt-cf-settings-service-state-typed-value-validation-review`

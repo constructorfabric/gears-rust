@@ -72,8 +72,18 @@ pub struct Model {
     pub set_by_tenant: Option<Uuid>,
 }
 
-/// Relations of the `setting_value` entity (none).
+/// Relations of the `setting_value` entity.
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {}
+pub enum Relation {
+    /// The declaration the value belongs to; `ON DELETE CASCADE`. Joined, not
+    /// navigated: the inventory gauge reads the declaration's scope class.
+    #[sea_orm(
+        belongs_to = "super::declaration::Entity",
+        from = "Column::DeclarationId",
+        to = "super::declaration::Column::Id",
+        on_delete = "Cascade"
+    )]
+    Declaration,
+}
 
 impl ActiveModelBehavior for ActiveModel {}

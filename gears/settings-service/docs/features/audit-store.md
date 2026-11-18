@@ -120,6 +120,7 @@ Two things about the record itself are fixed before it is written. Masking happe
 6. [x] - `p1` - DB: INSERT INTO audit_records inside the caller's transaction as its last step before commit, on the same `AccessScope`-scoped path as every other write, so a record is never visible outside its tenant - `inst-as-append-5`
 7. [x] - `p1` - **IF** the insert fails → the transaction is rolled back and the mutation is rejected as unavailable, `503`; the platform never applies a change it could not record - `inst-as-append-6`
 8. [x] - `p1` - **RETURN** with nothing further to do: the record commits with the change or rolls back with it, and no delivery state is tracked here, since shipping belongs to the R2 outbox - `inst-as-append-7`
+9. [x] - `p1` - On the exit of step 8, count `settings_audit_events_total` by `kind` — `secret_use` for a `secret_use` record, `mutation` for every other operation, a staged record included — once the insert of step 6 succeeded; an append that fails counts nothing, and since a mutation's append is its transaction's last step, a commit that fails after it overcounts by one, which a capacity signal tolerates - `inst-as-append-9`
 
 ### Canonical Audit Resource Id
 
@@ -204,7 +205,7 @@ The vocabularies of `operation`, `outcome` and `actor_classification` carry a co
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-audit-store-transactional-sink`
 
-The system **MUST** bind the `AuditSink` port — `append(txn, scope, record)` — to the `audit_records` table so that every mutation commits its record in its own transaction, as the last step before commit, and is rejected as unavailable when the record cannot be written. Category and declaration mutations **MUST** be moved onto this sink and the tracing stand-in retired. The port **MUST** stay the only way a record is written, so the R2 outbox binding can be added behind it without touching a call site. Each record's `actor_tenant_id` **MUST** be stamped once at insert from the security context's subject tenant — none for a machine act with no security context, such as a gear's reconcile or upgrade — and never rewritten.
+The system **MUST** bind the `AuditSink` port — `append(txn, scope, record)` — to the `audit_records` table so that every mutation commits its record in its own transaction, as the last step before commit, and is rejected as unavailable when the record cannot be written. Category and declaration mutations **MUST** be moved onto this sink and the tracing stand-in retired. The port **MUST** stay the only way a record is written, so the R2 outbox binding can be added behind it without touching a call site. Each record's `actor_tenant_id` **MUST** be stamped once at insert from the security context's subject tenant — none for a machine act with no security context, such as a gear's reconcile or upgrade — and never rewritten. A successful append **MUST** be counted on `settings_audit_events_total` by `kind`, taken from the record's operation; a failed append counts nothing, and a commit that fails after the append may overcount by one.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-audit-store-append`
@@ -343,3 +344,5 @@ The system **MUST** return `actor_name: string | null` beside `actor` on every h
 - [ ] A degraded chunk logs one warn line with the reason kind and the id count only, with no id and no profile text
 - [ ] An actor AM refuses or does not list, including a whole chunk AM refuses, reads `null`, records `result=ok` and writes no warn line
 - [ ] History p95 is at most 2 s with a healthy AM and with a slow AM whose mock client outlasts the budget; names degrade to `null` and the lookup stays within its budget (`cpt-cf-settings-service-nfr-scale-growth`)
+- [x] A mutation record counts one `mutation` on `settings_audit_events_total` and a secret-use record one `secret_use`, a staged record `mutation`
+- [x] A failed append counts nothing on `settings_audit_events_total`

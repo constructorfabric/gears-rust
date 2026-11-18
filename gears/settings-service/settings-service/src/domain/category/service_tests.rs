@@ -133,7 +133,7 @@ mod transactional {
     async fn a_category_mutation_leaves_exactly_one_record_in_the_same_commit() {
         let db = sqlite_provider().await;
         let root = Uuid::new_v4();
-        let svc = Arc::new(CategoryService::new(CategoryRepo, AuditStore));
+        let svc = Arc::new(CategoryService::new(CategoryRepo, AuditStore::default()));
         let ctx = SecurityContext::anonymous();
         let created = db
             .db()
@@ -157,16 +157,15 @@ mod transactional {
             .expect("creates");
 
         let conn = db.conn().expect("connection");
-        let page = AuditStore
-            .history(
-                &conn,
-                &AccessScope::allow_all(),
-                created.key.as_str(),
-                root,
-                &ODataQuery::default(),
-            )
-            .await
-            .expect("history");
+        let page = AuditStore::history(
+            &conn,
+            &AccessScope::allow_all(),
+            created.key.as_str(),
+            root,
+            &ODataQuery::default(),
+        )
+        .await
+        .expect("history");
         assert_eq!(page.items.len(), 1);
         let record = &page.items[0];
         assert_eq!(record.operation, AuditOperation::Create);

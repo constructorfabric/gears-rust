@@ -11,17 +11,12 @@ use crate::domain::access::{AccessRepository, Restriction, RestrictionDraft, Ten
 use crate::domain::error::DomainError;
 use crate::domain::precondition;
 use crate::infra::storage::clock::stamp_after;
+use crate::infra::storage::db_error::db_error;
 use crate::infra::storage::entity::tenant_permission::{self, Entity as PermissionEntity};
 
 /// The repository. Stateless: every operation takes its connection.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AccessRepo;
-
-fn db_error(err: impl std::fmt::Display) -> DomainError {
-    DomainError::Internal {
-        diagnostic: err.to_string(),
-    }
-}
 
 fn to_domain(model: tenant_permission::Model) -> Result<Restriction, DomainError> {
     let access = TenantAccess::parse(&model.access).ok_or_else(|| DomainError::Internal {

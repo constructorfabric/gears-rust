@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::api::authz::{self, resource};
 use crate::api::rest::if_match;
 use crate::api::rest::setting_dto::{Reader, render};
-use crate::api::rest::setting_handlers::{TenantParam, target_chain};
+use crate::api::rest::setting_handlers::{TenantParam, may_read_pii, target_chain};
 use crate::api::rest::value_dto::{
     BatchChangeRequest, BatchRequest, BatchResultDto, CloneRequest, FallbackResultDto,
     ImpactRequest, SetValueRequest, StageSecretRequest, ValidateRequest, render_batch_item,
@@ -27,7 +27,7 @@ use crate::api::rest::value_dto::{
 };
 use crate::domain::category::{DomainVisibility, domain_visibility};
 use crate::domain::error::DomainError;
-use crate::domain::ports::StepUpOperation;
+use crate::domain::ports::{SecurityMetrics, StepUpOperation};
 use crate::domain::validation::guards;
 use crate::domain::writes::{Change, ImpactPage, WriteActor};
 use crate::field;
@@ -35,9 +35,8 @@ use crate::infra::value_writes::{
     BATCH_LIMIT, BatchChange, RefusedEntry, WriteCoordinator, batch_too_large,
 };
 
-const READ: &str = "read";
-const WRITE: &str = "write";
-const READ_UNMASKED: &str = "read_unmasked";
+const READ: authz::Operation = authz::Operation::Read;
+const WRITE: authz::Operation = authz::Operation::Write;
 
 /// The header a fresh step-up token travels in. Absent, the bearer token
 /// itself is the assertion: a session re-authenticated just now carries a
@@ -140,18 +139,6 @@ fn respond<T: IntoResponse>(outcome: Result<T, DomainError>) -> ApiResult<Respon
     }
 }
 
-async fn may_read_pii(
-    enforcer: &authz_resolver_sdk::PolicyEnforcer,
-    ctx: &SecurityContext,
-) -> Result<bool, DomainError> {
-    // A known refusal masks; any other failure is an error, never a mask.
-    Ok(
-        authz::optional_scope(enforcer, ctx, &resource::VALUE, READ_UNMASKED)
-            .await?
-            .is_some(),
-    )
-}
-
 /// `PUT /settings-service/v1/settings/{key}/value?tenant={tenant_id}`
 ///
 /// # Errors
@@ -162,10 +149,15 @@ async fn may_read_pii(
 /// declaration is absent or hidden; 409 for a tenant-scoped write to a global
 /// setting; 410 when retired; 412 or 428 on the tag; 503 when a dependency
 /// cannot answer.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one extractor per extension the handler reads"
+)]
 pub async fn set_value(
     Extension(ctx): Extension<SecurityContext>,
     Extension(writes): Extension<Arc<WriteCoordinator>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Path(key): Path<String>,
     Query(params): Query<TenantParam>,
     headers: HeaderMap,
@@ -176,7 +168,15 @@ pub async fn set_value(
     // @cpt-begin:cpt-cf-settings-service-algo-value-writes-gates:p1:inst-vw-gate-1
     // Authorization first, and alone: an unauthorized caller never has its
     // step-up token looked at.
-    let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, WRITE, None).await?;
+    let scope = authz::access_scope(
+        &enforcer,
+        security.as_ref(),
+        &ctx,
+        &resource::VALUE,
+        WRITE,
+        None,
+    )
+    .await?;
     // @cpt-end:cpt-cf-settings-service-algo-value-writes-gates:p1:inst-vw-gate-1
     let actor = actor(&ctx, &headers, domain_visibility(&scope));
     let value = checked_value(&body.value)?;
@@ -206,6 +206,7 @@ async fn fall_back(
     ctx: &SecurityContext,
     writes: &WriteCoordinator,
     enforcer: &authz_resolver_sdk::PolicyEnforcer,
+    security: &dyn SecurityMetrics,
     key: String,
     params: TenantParam,
     headers: HeaderMap,
@@ -214,7 +215,7 @@ async fn fall_back(
 ) -> ApiResult<Response> {
     let key = parse_key(&key)?;
     let tenant = parse_tenant(params.tenant.as_deref())?;
-    let scope = authz::access_scope(enforcer, ctx, &resource::VALUE, WRITE, None).await?;
+    let scope = authz::access_scope(enforcer, security, ctx, &resource::VALUE, WRITE, None).await?;
     let actor = actor(ctx, &headers, domain_visibility(&scope));
     // Asked before the write: a failure to decide must not follow a committed
     // change. A known refusal masks; any other failure stops here.
@@ -265,6 +266,7 @@ pub async fn revert_value(
     Extension(ctx): Extension<SecurityContext>,
     Extension(writes): Extension<Arc<WriteCoordinator>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Path(key): Path<String>,
     Query(params): Query<TenantParam>,
     headers: HeaderMap,
@@ -276,6 +278,7 @@ pub async fn revert_value(
         &ctx,
         &writes,
         &enforcer,
+        security.as_ref(),
         key,
         params,
         headers,
@@ -296,6 +299,7 @@ pub async fn remove_value(
     Extension(ctx): Extension<SecurityContext>,
     Extension(writes): Extension<Arc<WriteCoordinator>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Path(key): Path<String>,
     Query(params): Query<TenantParam>,
     headers: HeaderMap,
@@ -307,6 +311,7 @@ pub async fn remove_value(
         &ctx,
         &writes,
         &enforcer,
+        security.as_ref(),
         key,
         params,
         headers,
@@ -324,10 +329,15 @@ pub async fn remove_value(
 /// # Errors
 /// As [`set_value`], plus 403 when the caller may not read the source and 400
 /// with `secret_not_cloneable` for a secret setting.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one extractor per extension the handler reads"
+)]
 pub async fn clone_value(
     Extension(ctx): Extension<SecurityContext>,
     Extension(writes): Extension<Arc<WriteCoordinator>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Path(key): Path<String>,
     Query(params): Query<TenantParam>,
     headers: HeaderMap,
@@ -339,8 +349,24 @@ pub async fn clone_value(
     // @cpt-end:cpt-cf-settings-service-flow-value-writes-clone:p1:inst-vw-clone-1
     // Both ends authorized: `read` for the source, `write` for the target,
     // and the declaration visible under both answers.
-    let readable = authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
-    let writable = authz::access_scope(&enforcer, &ctx, &resource::VALUE, WRITE, None).await?;
+    let readable = authz::access_scope(
+        &enforcer,
+        security.as_ref(),
+        &ctx,
+        &resource::VALUE,
+        READ,
+        None,
+    )
+    .await?;
+    let writable = authz::access_scope(
+        &enforcer,
+        security.as_ref(),
+        &ctx,
+        &resource::VALUE,
+        WRITE,
+        None,
+    )
+    .await?;
     let visibility = domain_visibility(&readable).narrowed(domain_visibility(&writable));
     let actor = actor(&ctx, &headers, visibility);
     // Asked before the write: a failure to decide must not follow a committed
@@ -369,11 +395,20 @@ pub async fn batch_set(
     Extension(ctx): Extension<SecurityContext>,
     Extension(writes): Extension<Arc<WriteCoordinator>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     headers: HeaderMap,
     Json(body): Json<BatchRequest>,
 ) -> ApiResult<Response> {
     // @cpt-begin:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-1
-    let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, WRITE, None).await?;
+    let scope = authz::access_scope(
+        &enforcer,
+        security.as_ref(),
+        &ctx,
+        &resource::VALUE,
+        WRITE,
+        None,
+    )
+    .await?;
     // The size first, on the deserialized list, before a key is cloned or
     // parsed; the coordinator's own check stays as the backstop for callers
     // that do not come through REST.
@@ -439,10 +474,15 @@ pub async fn batch_set(
 /// service principal targets a step-up declaration; 404 when the declaration
 /// is absent or hidden; 410 when retired; 503 when the store or the database
 /// cannot answer.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one extractor per extension the handler reads"
+)]
 pub async fn stage_secret(
     Extension(ctx): Extension<SecurityContext>,
     Extension(writes): Extension<Arc<WriteCoordinator>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Path(key): Path<String>,
     Query(params): Query<TenantParam>,
     headers: HeaderMap,
@@ -452,7 +492,15 @@ pub async fn stage_secret(
     let tenant = parse_tenant(params.tenant.as_deref())?;
     // @cpt-begin:cpt-cf-settings-service-flow-secret-values-stage:p1:inst-sv-stage-1
     // The same `write` a set needs, decided first and alone.
-    let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, WRITE, None).await?;
+    let scope = authz::access_scope(
+        &enforcer,
+        security.as_ref(),
+        &ctx,
+        &resource::VALUE,
+        WRITE,
+        None,
+    )
+    .await?;
     let actor = actor(&ctx, &headers, domain_visibility(&scope));
     let pending = writes
         .stage_secret(&actor, &key, tenant, checked_value(&body.value)?)
@@ -469,10 +517,15 @@ pub async fn stage_secret(
 /// 400 for a malformed key or `tenant`; 403 when the caller may not read or
 /// the target is outside the subtree; 404 when the declaration is absent or
 /// hidden; 410 when retired; 503 when a dependency cannot answer.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one extractor per extension the handler reads"
+)]
 pub async fn validate_value(
     Extension(ctx): Extension<SecurityContext>,
     Extension(writes): Extension<Arc<WriteCoordinator>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Path(key): Path<String>,
     Query(params): Query<TenantParam>,
     headers: HeaderMap,
@@ -484,7 +537,15 @@ pub async fn validate_value(
     // @cpt-end:cpt-cf-settings-service-flow-value-writes-validate:p1:inst-vw-val-1
     // @cpt-begin:cpt-cf-settings-service-flow-value-writes-validate:p1:inst-vw-val-2
     // `read`, and no step-up: nothing is written.
-    let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
+    let scope = authz::access_scope(
+        &enforcer,
+        security.as_ref(),
+        &ctx,
+        &resource::VALUE,
+        READ,
+        None,
+    )
+    .await?;
     // @cpt-end:cpt-cf-settings-service-flow-value-writes-validate:p1:inst-vw-val-2
     let actor = actor(&ctx, &headers, domain_visibility(&scope));
     let page = if body.impact == Some(false) {
@@ -525,10 +586,15 @@ pub async fn validate_value(
 /// 400 for a malformed key or `tenant`; 403 when the caller may not read or
 /// the target is outside the subtree; 404 when the declaration is absent or
 /// hidden; 410 when retired.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one extractor per extension the handler reads"
+)]
 pub async fn impact(
     Extension(ctx): Extension<SecurityContext>,
     Extension(writes): Extension<Arc<WriteCoordinator>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Path(key): Path<String>,
     Query(params): Query<TenantParam>,
     headers: HeaderMap,
@@ -538,7 +604,15 @@ pub async fn impact(
     let key = parse_key(&key)?;
     let tenant = parse_tenant(params.tenant.as_deref())?;
     // @cpt-end:cpt-cf-settings-service-flow-value-writes-impact:p1:inst-vw-imp-1
-    let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
+    let scope = authz::access_scope(
+        &enforcer,
+        security.as_ref(),
+        &ctx,
+        &resource::VALUE,
+        READ,
+        None,
+    )
+    .await?;
     let actor = actor(&ctx, &headers, domain_visibility(&scope));
     let outcome = writes
         .impact(

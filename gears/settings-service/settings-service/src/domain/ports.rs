@@ -7,7 +7,13 @@ use serde_json::Value;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
+use crate::domain::declaration::DeclarationStatus;
 use crate::domain::error::DomainError;
+use crate::domain::metric_labels::{
+    AuditKind, AuthzReason, ChangeType, DeclarationSource, LookupResult, Operation, Outcome,
+    ReadSource, ResolveFailure, RetentionResult, ScopeClass, ScopeKind, SecretUseResult,
+    StepUpResult,
+};
 
 /// Holds `secret`-trait plaintext outside this service and hands back a
 /// reference. The real binding is the Credential Store; with nothing bound a
@@ -258,27 +264,38 @@ impl StepUpOperation {
 /// Counters the write path reports.
 pub trait WriteMetrics: Send + Sync {
     /// `settings_value_writes_total` by result.
-    fn value_write(&self, result: &'static str);
+    fn value_write(&self, outcome: Outcome);
     /// `settings_step_up_total` by operation and result.
-    fn step_up(&self, operation: StepUpOperation, result: &'static str);
+    fn step_up(&self, operation: StepUpOperation, result: StepUpResult);
     /// `settings_declaration_purge_secret_releases_total{result=ok}`: one
     /// Credential Store entry released after a declaration purge.
     fn purge_released(&self);
     /// `settings_declaration_purge_secret_releases_total{result=failed}`: one
     /// Credential Store entry a purge could not release.
     fn purge_release_failed(&self);
+    /// `settings_changes_total` by change type and outcome: the
+    /// per-type breakdown of [`Self::value_write`], one call per change whose
+    /// kind is known.
+    fn change(&self, change_type: ChangeType, outcome: Outcome);
 }
 
 /// What the managed lifecycle's passes report.
 pub trait LifecycleMetrics: Send + Sync {
-    /// `settings_needs_review_total` for one declaration source: the overrides
+    /// `settings_needs_review` for one declaration source: the overrides
     /// flagged `needs_review` and awaiting an administrator's fix.
-    fn needs_review(&self, source: &'static str, count: u64);
+    fn needs_review(&self, source: DeclarationSource, count: u64);
     /// One audit retention pass: `settings_audit_retention_passes_total` by
     /// `result` (`ok` or `failed`) and `settings_audit_records_pruned_total` by
     /// `pruned`. A failed pass and one with nothing to prune both delete
     /// nothing; this is what tells them apart.
-    fn retention_pass(&self, result: &'static str, pruned: u64);
+    fn retention_pass(&self, result: RetentionResult, pruned: u64);
+    /// `settings_service_ready`: 1 while the lifecycle runs, 0 once it is told to
+    /// stop.
+    fn service_up(&self, up: bool);
+    /// `settings_declarations` for one `source` and `status`.
+    fn declarations(&self, source: DeclarationSource, status: DeclarationStatus, count: u64);
+    /// `settings_values` for one `scope_class` and `scope_kind`.
+    fn values(&self, scope_class: ScopeClass, scope_kind: ScopeKind, count: u64);
 }
 
 /// What the actor name lookup of a history page reports.
@@ -297,13 +314,60 @@ impl ActorNameMetrics for NoActorNameMetrics {
     fn pass(&self, _result: &'static str, _duration: std::time::Duration) {}
 }
 
-/// Counts nothing; the test binding.
+/// What the reader boundary reports about an effective-value read.
+pub trait ReadMetrics: Send + Sync {
+    /// `settings_cache_lookups_total` by `result` and `scope_class`, for a
+    /// lookup that resolved to a value.
+    fn lookup(&self, result: LookupResult, scope_class: ScopeClass);
+    /// `settings_effective_read_duration_seconds` by `source` and
+    /// `scope_class`.
+    fn read(&self, source: ReadSource, scope_class: ScopeClass, seconds: f64);
+    /// `settings_resolve_failures_total` by `reason`.
+    fn resolve_failure(&self, reason: ResolveFailure);
+}
+
+/// What the enforcement points, the Secret Manager and the audit sink report.
+pub trait SecurityMetrics: Send + Sync {
+    /// `settings_authz_denial_total` by `operation` and `reason`.
+    fn authz_denial(&self, operation: Operation, reason: AuthzReason);
+    /// `settings_secret_use_total` by `result`.
+    fn secret_use(&self, result: SecretUseResult);
+    /// `settings_audit_events_total` by `kind`.
+    fn audit_event(&self, kind: AuditKind);
+}
+
+/// Counts nothing; the test binding of every metrics port.
 #[domain_model]
 pub struct NoMetrics;
 
 impl WriteMetrics for NoMetrics {
-    fn value_write(&self, _result: &'static str) {}
-    fn step_up(&self, _operation: StepUpOperation, _result: &'static str) {}
+    fn value_write(&self, _outcome: Outcome) {}
+    fn step_up(&self, _operation: StepUpOperation, _result: StepUpResult) {}
     fn purge_released(&self) {}
     fn purge_release_failed(&self) {}
+    fn change(&self, _change_type: ChangeType, _outcome: Outcome) {}
 }
+
+impl LifecycleMetrics for NoMetrics {
+    fn needs_review(&self, _source: DeclarationSource, _count: u64) {}
+    fn retention_pass(&self, _result: RetentionResult, _pruned: u64) {}
+    fn service_up(&self, _up: bool) {}
+    fn declarations(&self, _source: DeclarationSource, _status: DeclarationStatus, _count: u64) {}
+    fn values(&self, _scope_class: ScopeClass, _scope_kind: ScopeKind, _count: u64) {}
+}
+
+impl ReadMetrics for NoMetrics {
+    fn lookup(&self, _result: LookupResult, _scope_class: ScopeClass) {}
+    fn read(&self, _source: ReadSource, _scope_class: ScopeClass, _seconds: f64) {}
+    fn resolve_failure(&self, _reason: ResolveFailure) {}
+}
+
+impl SecurityMetrics for NoMetrics {
+    fn authz_denial(&self, _operation: Operation, _reason: AuthzReason) {}
+    fn secret_use(&self, _result: SecretUseResult) {}
+    fn audit_event(&self, _kind: AuditKind) {}
+}
+
+#[cfg(test)]
+#[path = "ports_tests.rs"]
+mod ports_tests;

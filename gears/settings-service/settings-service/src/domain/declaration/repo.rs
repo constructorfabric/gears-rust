@@ -519,4 +519,16 @@ pub trait DeclarationRepository: Send + Sync {
         hidden_for: &[Uuid],
         category_ids: &[Uuid],
     ) -> Result<HashMap<Uuid, CategoryTally>, DomainError>;
+
+    /// How many declarations there are per `(source, status)` — what the
+    /// declarations gauge reports. A pair with none is absent; the caller
+    /// reads that as zero.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    async fn count_by_source_status<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+    ) -> Result<HashMap<(String, String), u64>, DomainError>;
 }

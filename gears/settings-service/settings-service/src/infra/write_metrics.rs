@@ -4,25 +4,33 @@
 
 use async_trait::async_trait;
 use opentelemetry::KeyValue;
-use opentelemetry::metrics::Counter;
+use opentelemetry::metrics::{Counter, Meter};
 use tracing::info;
 
+use crate::domain::metric_labels::{ChangeType, Outcome, StepUpResult};
 use crate::domain::ports::{ChangePublisher, StepUpOperation, ValueEvent, WriteMetrics};
 use crate::log_text::LogSafe;
 
-/// `settings_value_writes_total` and `settings_step_up_total` on the
-/// process's meter. The failure ratio is a dashboard derivation of the first.
+/// `settings_value_writes_total`, `settings_step_up_total` and
+/// `settings_changes_total` on the process's meter. The failure ratio
+/// is a dashboard derivation of the first; the third is its per-type breakdown.
 pub struct OtelWriteMetrics {
     writes: Counter<u64>,
     step_ups: Counter<u64>,
     purge_releases: Counter<u64>,
+    changes: Counter<u64>,
 }
 
 impl OtelWriteMetrics {
     /// On the gear's meter.
     #[must_use]
     pub fn new() -> Self {
-        let meter = opentelemetry::global::meter("settings-service");
+        Self::on(&opentelemetry::global::meter("settings-service"))
+    }
+
+    /// On `meter`: the gear's in production, a test's own provider in tests.
+    #[must_use]
+    pub fn on(meter: &Meter) -> Self {
         Self {
             writes: meter
                 .u64_counter("settings_value_writes_total")
@@ -36,6 +44,10 @@ impl OtelWriteMetrics {
                 .u64_counter("settings_declaration_purge_secret_releases_total")
                 .with_description("Credential Store releases after a declaration purge, by result")
                 .build(),
+            changes: meter
+                .u64_counter("settings_changes_total")
+                .with_description("Value changes by change type and outcome")
+                .build(),
         }
     }
 }
@@ -47,16 +59,17 @@ impl Default for OtelWriteMetrics {
 }
 
 impl WriteMetrics for OtelWriteMetrics {
-    fn value_write(&self, result: &'static str) {
-        self.writes.add(1, &[KeyValue::new("result", result)]);
+    fn value_write(&self, outcome: Outcome) {
+        self.writes
+            .add(1, &[KeyValue::new("result", outcome.as_str())]);
     }
 
-    fn step_up(&self, operation: StepUpOperation, result: &'static str) {
+    fn step_up(&self, operation: StepUpOperation, result: StepUpResult) {
         self.step_ups.add(
             1,
             &[
                 KeyValue::new("operation", operation.label()),
-                KeyValue::new("result", result),
+                KeyValue::new("result", result.as_str()),
             ],
         );
     }
@@ -68,6 +81,16 @@ impl WriteMetrics for OtelWriteMetrics {
     fn purge_release_failed(&self) {
         self.purge_releases
             .add(1, &[KeyValue::new("result", "failed")]);
+    }
+
+    fn change(&self, change_type: ChangeType, outcome: Outcome) {
+        self.changes.add(
+            1,
+            &[
+                KeyValue::new("change_type", change_type.as_str()),
+                KeyValue::new("outcome", outcome.as_str()),
+            ],
+        );
     }
 }
 
@@ -136,3 +159,7 @@ impl ChangePublisher for LoggingPublisher {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "write_metrics_tests.rs"]
+mod write_metrics_tests;

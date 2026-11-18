@@ -174,3 +174,148 @@ fn an_optional_decision_degrades_only_on_a_refusal() {
     let granted = optional(Ok(toolkit_security::AccessScope::allow_all()));
     assert!(matches!(granted, Ok(Some(_))), "{granted:?}");
 }
+
+// ---- `settings_authz_denial_total`: counted at the enforcement point, before
+// the refusal is folded into the one `Unauthorized`.
+
+mod counted {
+    use authz_resolver_sdk::{AccessRequest, PolicyEnforcer};
+    use uuid::Uuid;
+
+    use super::{DomainError, EnforcerError, problem_of, resource};
+    use crate::api::authz::{Operation, access_scope, may_read_unmasked, optional_scope};
+    use crate::test_support::{
+        RecordingSecurityMetrics, context_for, denying_enforcer, uncompilable_enforcer,
+        unreachable_enforcer,
+    };
+
+    async fn refused(
+        enforcer: &PolicyEnforcer,
+        metrics: &RecordingSecurityMetrics,
+        operation: Operation,
+    ) -> DomainError {
+        access_scope(
+            enforcer,
+            metrics,
+            &context_for(Uuid::new_v4()),
+            &resource::VALUE,
+            operation,
+            None,
+        )
+        .await
+        .expect_err("refused")
+    }
+
+    #[tokio::test]
+    async fn a_deny_counts_one_denied_under_the_operation_asked() {
+        let metrics = RecordingSecurityMetrics::default();
+        let err = refused(&denying_enforcer(), &metrics, Operation::Write).await;
+        assert!(matches!(err, DomainError::Unauthorized { .. }), "{err:?}");
+        assert_eq!(metrics.denials(), vec![("write", "denied")]);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_decision_point_counts_one_unavailable() {
+        let metrics = RecordingSecurityMetrics::default();
+        let err = refused(&unreachable_enforcer(), &metrics, Operation::Read).await;
+        assert!(matches!(err, DomainError::Unauthorized { .. }), "{err:?}");
+        assert_eq!(metrics.denials(), vec![("read", "unavailable")]);
+    }
+
+    #[tokio::test]
+    async fn uncompilable_constraints_count_one_constraints_refusal() {
+        // The double really is one the enforcer cannot compile.
+        let direct = uncompilable_enforcer()
+            .access_scope_with(
+                &context_for(Uuid::new_v4()),
+                &resource::VALUE,
+                "delete",
+                None,
+                &AccessRequest::new().require_constraints(false),
+            )
+            .await;
+        assert!(
+            matches!(direct, Err(EnforcerError::CompileFailed(_))),
+            "{direct:?}"
+        );
+
+        let metrics = RecordingSecurityMetrics::default();
+        let err = refused(&uncompilable_enforcer(), &metrics, Operation::Delete).await;
+        assert!(matches!(err, DomainError::Unauthorized { .. }), "{err:?}");
+        assert_eq!(metrics.denials(), vec![("delete", "constraints")]);
+    }
+
+    #[tokio::test]
+    async fn the_response_is_the_same_unauthorized_for_all_three_reasons() {
+        let metrics = RecordingSecurityMetrics::default();
+        let bodies = [
+            problem_of(refused(&denying_enforcer(), &metrics, Operation::Read).await),
+            problem_of(refused(&unreachable_enforcer(), &metrics, Operation::Read).await),
+            problem_of(refused(&uncompilable_enforcer(), &metrics, Operation::Read).await),
+        ];
+        assert_eq!(bodies[0], bodies[1]);
+        assert_eq!(bodies[1], bodies[2]);
+        assert_eq!(
+            metrics.denials(),
+            vec![
+                ("read", "denied"),
+                ("read", "unavailable"),
+                ("read", "constraints"),
+            ],
+            "the metric is the operator's view; the response tells the caller nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_probe_and_the_enforcement_point_refuse_alike_and_only_the_latter_counts() {
+        let ctx = context_for(Uuid::new_v4());
+        let enforcers = [
+            ("deny", denying_enforcer()),
+            ("unreachable", unreachable_enforcer()),
+            ("uncompilable", uncompilable_enforcer()),
+        ];
+        for (kind, enforcer) in &enforcers {
+            let probed = optional_scope(enforcer, &ctx, &resource::VALUE, Operation::Read)
+                .await
+                .expect("a known refusal is not an error");
+            let metrics = RecordingSecurityMetrics::default();
+            let counted = refused(enforcer, &metrics, Operation::Read).await;
+            // The probe reads the refusal as an absent scope; the enforcement
+            // point fails the request with the one `Unauthorized`.
+            assert!(probed.is_none(), "{kind}: {probed:?}");
+            assert!(
+                matches!(counted, DomainError::Unauthorized { .. }),
+                "{kind}: {counted:?}"
+            );
+            // The enforcement point counts the refusal once; nothing else moves.
+            assert_eq!(
+                metrics.denials().len(),
+                1,
+                "{kind}: {:?}",
+                metrics.denials()
+            );
+            assert!(metrics.secret_uses().is_empty(), "{kind}");
+            assert!(metrics.audit_events().is_empty(), "{kind}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_unmasked_entitlement_is_a_probe_answered_by_masking() {
+        // Refused three ways, the answer is the same `false` — mask — and
+        // there is no metrics port to count on: the entitlement never
+        // reaches the enforcement point.
+        let ctx = context_for(Uuid::new_v4());
+        for (kind, enforcer) in [
+            ("deny", denying_enforcer()),
+            ("unreachable", unreachable_enforcer()),
+            ("uncompilable", uncompilable_enforcer()),
+        ] {
+            assert!(
+                !may_read_unmasked(&enforcer, &ctx)
+                    .await
+                    .expect("a known refusal masks, it is not an error"),
+                "{kind}"
+            );
+        }
+    }
+}

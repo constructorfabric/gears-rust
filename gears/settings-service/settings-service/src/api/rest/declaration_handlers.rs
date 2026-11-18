@@ -20,13 +20,14 @@ use crate::api::rest::declaration_dto::DeclarationDto;
 use crate::api::rest::page_dto::PageDto;
 use crate::domain::declaration::{DeclarationRepository, DeclarationService};
 use crate::domain::error::DomainError;
+use crate::domain::ports::SecurityMetrics;
 
 /// The concrete service the routes carry.
 pub type ConcreteDeclarationService =
     DeclarationService<crate::infra::storage::declaration_repo::DeclarationRepo>;
 
-/// The action every read is authorized as.
-const READ: &str = "read";
+/// The operation every read is authorized as.
+const READ: authz::Operation = authz::Operation::Read;
 
 /// `GET /settings-service/v1/declarations/{id}`
 ///
@@ -39,12 +40,20 @@ pub async fn get_declaration<R: DeclarationRepository>(
     Extension(svc): Extension<Arc<DeclarationService<R>>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<impl IntoResponse> {
     // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-read:p1:inst-decl-read-2
     // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-read:p1:inst-decl-read-3
-    let scope =
-        authz::access_scope(&enforcer, &ctx, &resource::DECLARATION, READ, Some(id)).await?;
+    let scope = authz::access_scope(
+        &enforcer,
+        security.as_ref(),
+        &ctx,
+        &resource::DECLARATION,
+        READ,
+        Some(id),
+    )
+    .await?;
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-read:p1:inst-decl-read-3
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-read:p1:inst-decl-read-2
 
@@ -81,11 +90,20 @@ pub async fn list_declarations<R: DeclarationRepository>(
     Extension(svc): Extension<Arc<DeclarationService<R>>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     OData(query): OData,
 ) -> ApiResult<impl IntoResponse> {
     // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-read:p1:inst-decl-read-2
     // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-read:p1:inst-decl-read-3
-    let scope = authz::access_scope(&enforcer, &ctx, &resource::DECLARATION, READ, None).await?;
+    let scope = authz::access_scope(
+        &enforcer,
+        security.as_ref(),
+        &ctx,
+        &resource::DECLARATION,
+        READ,
+        None,
+    )
+    .await?;
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-read:p1:inst-decl-read-3
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-read:p1:inst-decl-read-2
 
@@ -116,12 +134,12 @@ pub type ConcreteDeclarationAdmin = crate::domain::declaration::DeclarationAdmin
     crate::infra::storage::pending_secret_repo::PendingSecretRepo,
 >;
 
-/// The action a create is authorized as.
-const CREATE: &str = "create";
-/// The action a metadata edit is authorized as.
-const UPDATE: &str = "update";
-/// The action a retire is authorized as.
-const DELETE: &str = "delete";
+/// The operation a create is authorized as.
+const CREATE: authz::Operation = authz::Operation::Create;
+/// The operation a metadata edit is authorized as.
+const UPDATE: authz::Operation = authz::Operation::Update;
+/// The operation a retire is authorized as.
+const DELETE: authz::Operation = authz::Operation::Delete;
 
 /// `POST /settings-service/v1/declarations`
 ///
@@ -131,12 +149,17 @@ const DELETE: &str = "delete";
 /// default or scope class the rules refuse, `409` on an active declaration at
 /// the key, a leaf name held in the category, or a revive that changes what a
 /// revive may not, `401` with a challenge when step-up is required.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one extractor per extension the handler reads"
+)]
 pub async fn create_declaration(
     Extension(ctx): Extension<SecurityContext>,
     Extension(admin): Extension<Arc<ConcreteDeclarationAdmin>>,
     Extension(svc): Extension<Arc<ConcreteDeclarationService>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     headers: axum::http::HeaderMap,
     Json(body): Json<crate::api::rest::declaration_dto::CreateDeclarationRequest>,
 ) -> ApiResult<Response> {
@@ -146,7 +169,15 @@ pub async fn create_declaration(
     // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-1
     // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-2
     // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-3
-    let scope = authz::access_scope(&enforcer, &ctx, &resource::DECLARATION, CREATE, None).await?;
+    let scope = authz::access_scope(
+        &enforcer,
+        security.as_ref(),
+        &ctx,
+        &resource::DECLARATION,
+        CREATE,
+        None,
+    )
+    .await?;
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-3
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-2
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-1
@@ -230,6 +261,7 @@ pub async fn update_declaration(
     Extension(svc): Extension<Arc<ConcreteDeclarationService>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Path(id): Path<Uuid>,
     headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Map<String, serde_json::Value>>,
@@ -237,8 +269,15 @@ pub async fn update_declaration(
     // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-1
     // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-2
     // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-3
-    let scope =
-        authz::access_scope(&enforcer, &ctx, &resource::DECLARATION, UPDATE, Some(id)).await?;
+    let scope = authz::access_scope(
+        &enforcer,
+        security.as_ref(),
+        &ctx,
+        &resource::DECLARATION,
+        UPDATE,
+        Some(id),
+    )
+    .await?;
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-3
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-2
     let actor = crate::api::rest::value_handlers::actor(
@@ -295,14 +334,22 @@ pub async fn retire_declaration(
     Extension(svc): Extension<Arc<ConcreteDeclarationService>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Path(id): Path<Uuid>,
     headers: axum::http::HeaderMap,
 ) -> ApiResult<Response> {
     // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-1
     // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-2
     // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-3
-    let scope =
-        authz::access_scope(&enforcer, &ctx, &resource::DECLARATION, DELETE, Some(id)).await?;
+    let scope = authz::access_scope(
+        &enforcer,
+        security.as_ref(),
+        &ctx,
+        &resource::DECLARATION,
+        DELETE,
+        Some(id),
+    )
+    .await?;
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-3
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-2
     let actor = crate::api::rest::value_handlers::actor(
@@ -363,14 +410,22 @@ pub async fn purge_declaration(
     Extension(admin): Extension<Arc<ConcreteDeclarationAdmin>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Path(id): Path<Uuid>,
     headers: axum::http::HeaderMap,
 ) -> ApiResult<Response> {
     // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-1
     // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-2
     // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-3
-    let scope =
-        authz::access_scope(&enforcer, &ctx, &resource::DECLARATION, DELETE, Some(id)).await?;
+    let scope = authz::access_scope(
+        &enforcer,
+        security.as_ref(),
+        &ctx,
+        &resource::DECLARATION,
+        DELETE,
+        Some(id),
+    )
+    .await?;
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-3
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-2
     let actor = crate::api::rest::value_handlers::actor(

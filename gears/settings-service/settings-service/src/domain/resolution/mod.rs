@@ -9,6 +9,8 @@ pub mod cache;
 pub mod resolver;
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 use toolkit_macros::domain_model;
 
 use async_trait::async_trait;
@@ -18,6 +20,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
+use crate::domain::metric_labels::{ReadSource, ScopeClass};
 
 pub use cache::EffectiveCache;
 pub use resolver::ValueResolver;
@@ -33,6 +36,15 @@ pub mod scope_class {
     pub const CASCADING: &str = "cascading";
     /// One value per tenant, never inherited.
     pub const LOCAL: &str = "local";
+}
+
+/// Whether an override sits at the platform (the root tenant) or at a tenant:
+/// the `scope_kind` label of the values gauge.
+pub mod scope_kind {
+    /// A row at the root tenant.
+    pub const PLATFORM: &str = "platform";
+    /// A row at any other tenant.
+    pub const TENANT: &str = "tenant";
 }
 
 /// Where a read is resolved for: the platform, or one tenant.
@@ -255,6 +267,21 @@ pub struct OwnRow {
     pub updated_at: OffsetDateTime,
 }
 
+/// What a reader-boundary resolve reports beside the value: where it was
+/// answered from and how long the answer took, for the reader to record. The
+/// resolver itself records nothing.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub struct ReaderRead {
+    /// The resolved value.
+    pub value: Arc<EffectiveValue>,
+    /// Where the read was answered from: the cache, or a lookup that had to resolve.
+    pub source: ReadSource,
+    /// From the cache lookup to the outcome, the chain walk included; the
+    /// platform-scope read that precedes the lookup is outside it.
+    pub elapsed: Duration,
+}
+
 /// A resolved effective value with its trace — computed, never persisted.
 // @cpt-dod:cpt-cf-settings-service-dod-value-resolution-shape:p1
 #[domain_model]
@@ -292,6 +319,10 @@ pub struct EffectiveValue {
     pub traits: Value,
     /// The scopes inspected, root to self — the caller's own chain only.
     pub trail: Vec<TrailEntry>,
+    /// The declaration's scope class (`global`, `cascading` or `local`), carried
+    /// through the cache entry so a read can be labelled without loading the
+    /// declaration again.
+    pub scope_class: ScopeClass,
     /// The declaration's classification.
     pub data_classification: String,
     /// The declaration's administrative domain, for the visibility rule the

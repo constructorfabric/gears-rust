@@ -297,7 +297,7 @@ impl WriteHarness {
                 return Err(err);
             }
         };
-        self.writer.after_commit(&committed, actor).await;
+        self.writer.after_commit(&committed, actor, None).await;
         Ok(committed)
     }
 
@@ -1687,6 +1687,7 @@ async fn a_rejection_event_carries_the_wire_message_and_the_diagnostic_stays_in_
             &actor(h.base.tree.root),
             &internal,
             change_set,
+            None,
         )
         .await;
     let events = h.published.events.lock().expect("lock");
@@ -1723,6 +1724,7 @@ async fn a_rejection_event_names_the_field_and_code_of_a_validation_failure_and_
             &actor(h.base.tree.root),
             &refused,
             Uuid::new_v4(),
+            None,
         )
         .await;
     let events = h.published.events.lock().expect("lock");

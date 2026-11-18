@@ -19,6 +19,7 @@ use crate::domain::odata::Listing;
 use crate::domain::precondition;
 use crate::domain::precondition::ETag;
 use crate::infra::storage::clock::{now, stamp_after};
+use crate::infra::storage::db_error::db_error;
 use crate::infra::storage::entity::category::{self, Entity as CategoryEntity};
 use crate::infra::storage::entity::declaration::{self, Entity as DeclarationEntity};
 use crate::infra::storage::listing::list_counted;
@@ -82,9 +83,7 @@ fn map_write_error(err: &toolkit_db::secure::ScopeError) -> DomainError {
             detail: "a category with this key or name already exists".to_owned(),
         }
     } else {
-        DomainError::Internal {
-            diagnostic: err.to_string(),
-        }
+        db_error(err)
     }
 }
 
@@ -171,9 +170,7 @@ impl CategoryRepository for CategoryRepo {
             .scope_with(scope)
             .one(conn)
             .await
-            .map_err(|err| DomainError::Internal {
-                diagnostic: err.to_string(),
-            })?;
+            .map_err(db_error)?;
         found.map(to_domain).transpose()
     }
 
@@ -189,9 +186,7 @@ impl CategoryRepository for CategoryRepo {
             .scope_with(scope)
             .one(conn)
             .await
-            .map_err(|err| DomainError::Internal {
-                diagnostic: err.to_string(),
-            })?;
+            .map_err(db_error)?;
         found.map(to_domain).transpose()
     }
 
@@ -442,9 +437,7 @@ impl CategoryRepository for CategoryRepo {
             .scope_with(&AccessScope::allow_all())
             .count(conn)
             .await
-            .map_err(|err| DomainError::Internal {
-                diagnostic: err.to_string(),
-            })
+            .map_err(db_error)
         // @cpt-end:cpt-cf-settings-service-algo-category-management-no-orphan-guard:p1:inst-cat-orphan-2
         // @cpt-end:cpt-cf-settings-service-algo-category-management-no-orphan-guard:p1:inst-cat-orphan-1
     }

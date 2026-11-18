@@ -6,6 +6,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{ABSENT_STATE_TAG, Reader, mask, render};
+use crate::domain::metric_labels::ScopeClass;
 use crate::domain::resolution::cache::tests_entry;
 use crate::domain::resolution::{EffectiveValue, MASK_TOKEN, OwnRow, TrailEntry};
 
@@ -31,6 +32,7 @@ fn effective(classification: &str) -> EffectiveValue {
             set_by_tenant: None,
             last_change_at: Some(at(200)),
         }],
+        scope_class: ScopeClass::Cascading,
         data_classification: classification.to_owned(),
         declaration_last_change_at: at(100),
         resolved_row_last_change_at: Some(at(200)),

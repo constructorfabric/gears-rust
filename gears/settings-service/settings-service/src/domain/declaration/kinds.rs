@@ -73,6 +73,9 @@ pub enum DeclarationStatus {
 }
 
 impl DeclarationStatus {
+    /// Every status, in the order the gauges report them.
+    pub const ALL: &[Self] = &[Self::Active, Self::Retired];
+
     /// The wire and storage string.
     #[must_use]
     pub const fn as_str(self) -> &'static str {

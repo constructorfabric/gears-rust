@@ -13,6 +13,7 @@ use super::{
 use crate::api::rest::setting_dto::Reader;
 use crate::audit::AuditOperation;
 use crate::domain::error::DomainError;
+use crate::domain::metric_labels::ScopeClass;
 use crate::domain::resolution::{EffectiveValue, MASK_TOKEN};
 use crate::domain::secrets::PendingSecret;
 use crate::domain::validation::FieldViolation;
@@ -53,6 +54,7 @@ fn effective(classification: &str) -> EffectiveValue {
         fallback_scope: None,
         traits: json!({}),
         trail: Vec::new(),
+        scope_class: ScopeClass::Cascading,
         data_classification: classification.to_owned(),
         domain_affinity: None,
         secret_backed: false,
