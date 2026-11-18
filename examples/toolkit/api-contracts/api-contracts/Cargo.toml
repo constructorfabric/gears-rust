@@ -1,6 +1,6 @@
 [package]
 name = "cf-api-contracts"
-version = "0.1.5"
+version = "0.1.6"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -76,7 +76,7 @@ axum.workspace = true
 tonic = { workspace = true, features = ["transport"], optional = true }
 toolkit-transport-grpc = { workspace = true, optional = true }
 grpc_hub = { workspace = true, optional = true }
-authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.41", path = "../../../../gears/system/authn-resolver/authn-resolver-sdk", optional = true }
+authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.44", path = "../../../../gears/system/authn-resolver/authn-resolver-sdk", optional = true }
 
 # OoP-only, gated behind `oop_module`.
 tokio = { workspace = true, optional = true }

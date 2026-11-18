@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-construct"
-version = "0.1.6"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -25,10 +25,10 @@ workspace = true
 integration = ["toolkit-db/pg"]
 
 [dependencies]
-construct-sdk = { package = "cf-gears-construct-sdk", version = "0.2.2", path = "../construct-sdk" }
+construct-sdk = { package = "cf-gears-construct-sdk", version = "0.2.3", path = "../construct-sdk" }
 
 # AuthZ resolver for authorization (PEP flow)
-authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.6.5", path = "../../../gears/system/authz-resolver/authz-resolver-sdk" }
+authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.7.0", path = "../../../gears/system/authz-resolver/authz-resolver-sdk" }
 authz-resolver = { workspace = true }
 
 # Tenant settings (the personalization default for new subjects)

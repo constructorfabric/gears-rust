@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-file-storage"
-version = "0.4.6"
+version = "0.5.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -32,7 +32,7 @@ default = []
 
 [dependencies]
 # SDK - public API, models, and errors
-cf-gears-file-storage-sdk = { version = "0.3.2", path = "../file-storage-sdk" }
+cf-gears-file-storage-sdk = { version = "0.3.3", path = "../file-storage-sdk" }
 
 # Authorization Service (PEP) — per-type access decisions
 authz-resolver-sdk = { workspace = true }
