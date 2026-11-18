@@ -8,6 +8,7 @@ use credstore_sdk::{
 use uuid::Uuid;
 
 use super::*;
+use crate::domain::secret::etag::weak_etag;
 
 fn sref(s: &str) -> SecretRef {
     SecretRef::new(s).expect("valid ref")

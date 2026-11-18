@@ -24,8 +24,8 @@ pub use gts::{CREDENTIAL_RESOURCE_TYPE, CredStorePluginSpecV2, CredentialV1, Sec
 pub use models::{
     Credential, CredentialListItem, CredentialPatch, CredentialStatus, CredentialWrite, Fallback,
     InheritanceStatus, OwnRow, OwnerId, PatchField, PutOutcome, PutPrecondition, Secret, SecretRef,
-    SecretValue, SecretWrite, SharingMode, StoreKey, TenantId, Validator, ValueVersion,
-    WritePrecondition,
+    SecretValidator, SecretValue, SecretWrite, SharingMode, StoreKey, TenantId, Validator,
+    ValueVersion, WeakValidator, WritePrecondition,
 };
 pub use plugin_api::{
     BoxError, CredStorePluginClientV2, CredStorePluginDestroyerV2, CredStorePluginError,

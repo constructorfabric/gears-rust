@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 use authz_resolver_sdk::PolicyEnforcer;
 use credstore_sdk::{
     CredStorePluginClientV2, Credential, CredentialPatch, CredentialWrite, OwnerId, PatchField,
-    PutOutcome, Secret, SecretRef, SecretValue, SecretWrite, SharingMode, StoreKey, TenantId,
-    Validator, ValueVersion,
+    PutOutcome, Secret, SecretRef, SecretValidator, SecretValue, SecretWrite, SharingMode,
+    StoreKey, TenantId, Validator, ValueVersion, WeakValidator,
 };
 use toolkit_macros::domain_model;
 use toolkit_security::{AccessScope, SecurityContext};
@@ -39,6 +39,7 @@ use crate::domain::ports::plugin::PluginSelector;
 use crate::domain::resolver::TenantDirectory;
 use time::OffsetDateTime;
 
+use crate::domain::secret::etag::weak_etag;
 use crate::domain::secret::list_filter;
 use crate::domain::secret::model::{
     CleanupDebt, CleanupTask, DeleteVerification, Fallback, IntentCommit, NewDeclaredSecret,
@@ -105,18 +106,13 @@ struct AuditTarget {
 /// Selection-aware answer to the point read (`Service::get_item`, ADR-0004,
 /// "Read actions follow the projection"): the resolved [`Credential`], its decrypted value when the
 /// projection named `secret` and the winner had one to serve, that value's
-/// own validator (the row it was actually served from — a concurrent switch
-/// can make this momentarily different from `credential.validator`), and the
-/// weak-`ETag` source the REST layer needs whenever the caller holds no own
-/// row.
+/// weak-`ETag` source (the winning row's id and version) the REST layer and
+/// the in-process `Secret` need whenever the caller holds no own row.
 #[domain_model]
 #[derive(Debug)]
 pub struct CredentialItem {
     pub credential: Credential,
     pub value: Option<SecretValue>,
-    /// The validator of the row `value` was served from; `Some` iff `value`
-    /// is.
-    pub value_validator: Option<Validator>,
     pub weak_validator_source: Option<(Uuid, i64)>,
 }
 
@@ -368,7 +364,31 @@ impl Service {
         key: &SecretRef,
         fields: Option<&[String]>,
     ) -> Result<Option<CredentialItem>, DomainError> {
-        let result = self.read_item(ctx, key, fields).await;
+        self.get_item_within(ctx, key, fields, None).await
+    }
+
+    /// [`Self::get_item`] with an optional upper bound for the value read
+    /// (`get_secret_within`). With `Some(bound)`, after the PDP decision and
+    /// the chain lookup: a `bound` outside the part of the caller's chain
+    /// visible across isolation barriers is
+    /// [`DomainError::BoundNotOnChain`]; after the reduction and the PDP
+    /// constraints, a value whose row belongs to a tenant above `bound` is
+    /// [`DomainError::OwnerAboveBound`] (nothing is read from the store, the
+    /// read is audited as a failure), and only then does the expiry test
+    /// run. A read with no value to serve is the usual `Ok(None)`: the bound
+    /// is not looked at. `None` changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::get_item`], plus the two bound errors above.
+    pub async fn get_item_within(
+        &self,
+        ctx: &SecurityContext,
+        key: &SecretRef,
+        fields: Option<&[String]>,
+        bound: Option<TenantId>,
+    ) -> Result<Option<CredentialItem>, DomainError> {
+        let result = self.read_item(ctx, key, fields, bound).await;
         // Heal on access: a point read of a reference also heals the failed
         // creates of that reference (expired intents whose record has no
         // row), best effort and after the answer is known.
@@ -383,6 +403,7 @@ impl Service {
         ctx: &SecurityContext,
         key: &SecretRef,
         fields: Option<&[String]>,
+        bound: Option<TenantId>,
     ) -> Result<Option<CredentialItem>, DomainError> {
         if let Some(f) = fields {
             list_filter::validate_select(f)?;
@@ -419,7 +440,17 @@ impl Service {
         let scope = self.authorize_actions(ctx, req, &required).await?;
         let clamp = authz::row_clamp(&scope, req.0);
 
-        let chain = self.dir.ancestor_chain(ctx, req).await?;
+        let resolved_chain = self.dir.ancestor_chain(ctx, req).await?;
+        // A bound the caller cannot see on its chain (barriers respected) is
+        // one answer for an unrelated id and for an ancestor above a barrier;
+        // it comes after the PDP decision, so a denied caller learns nothing.
+        if let Some(b) = bound
+            && !resolved_chain.visible().contains(&b.0)
+        {
+            return Err(DomainError::BoundNotOnChain);
+        }
+        // Inheritance walks the whole chain, barriers ignored.
+        let chain = resolved_chain.ids;
 
         let candidates = self
             .repo
@@ -485,6 +516,25 @@ impl Service {
         // authorization and the type rule were not evaluated on.
         let secret = if need_read_secret {
             if let Some(row) = value_row {
+                // The bound applies to a value that exists: the row the value
+                // comes from (not the caller's own `effective` row) must not
+                // sit above `bound`, judged on the full chain. Before the
+                // expiry test and before anything is read from the store.
+                if let Some(b) = bound
+                    && row.value_version.is_some()
+                    && Self::chain_pos(&chain, row.tenant_id.0) > Self::chain_pos(&chain, b.0)
+                {
+                    self.metrics.read_outcome(ReadOutcome::OwnerAboveBound);
+                    self.audit_event(
+                        ctx,
+                        key,
+                        &credential.secret_type,
+                        AuditOperation::Read,
+                        AuditOutcome::Failure,
+                    )
+                    .await;
+                    return Err(DomainError::OwnerAboveBound);
+                }
                 self.read_secret_audited(
                     ctx,
                     req,
@@ -514,14 +564,19 @@ impl Service {
             return Ok(None);
         }
 
-        let value_validator = secret.as_ref().map(|s| s.validator);
-        let value = secret.map(|s| s.secret);
         Ok(Some(CredentialItem {
             credential,
-            value,
-            value_validator,
+            value: secret,
             weak_validator_source,
         }))
+    }
+
+    /// Position of `tenant` in `chain` (`usize::MAX` when absent).
+    fn chain_pos(chain: &[Uuid], tenant: Uuid) -> usize {
+        chain
+            .iter()
+            .position(|c| *c == tenant)
+            .unwrap_or(usize::MAX)
     }
 
     /// The authorized value read of a point read: re-resolve the winning
@@ -545,7 +600,7 @@ impl Service {
         chain: &[Uuid],
         secret_type: &str,
         expected_id: Uuid,
-    ) -> Result<Option<Secret>, DomainError> {
+    ) -> Result<Option<SecretValue>, DomainError> {
         let mut debts_of = None;
         let read = async {
             let value_row = self.repo.resolve_for_get(req, subject, key, chain).await?;
@@ -574,17 +629,8 @@ impl Service {
             match &value_row {
                 Some(row) if row.value_version.is_some() => {
                     let plugin = self.plugins.resolve().await?;
-                    self.read_value_for_row(
-                        &plugin,
-                        ctx,
-                        req,
-                        subject,
-                        key,
-                        chain,
-                        row,
-                        secret_type,
-                    )
-                    .await
+                    self.read_value_for_row(&plugin, ctx, req, subject, key, chain, row)
+                        .await
                 }
                 _ => {
                     // No winning row, or a value-less (declared/suppressed)
@@ -644,21 +690,69 @@ impl Service {
         ctx: &SecurityContext,
         key: &SecretRef,
     ) -> Result<Option<Secret>, DomainError> {
+        self.get_secret_bounded(ctx, key, None).await
+    }
+
+    /// [`Self::get_secret`] with an upper bound: the value is served only
+    /// when its row belongs to `bound` or to a tenant below it in the
+    /// caller's chain (see [`Self::get_item_within`] for the order of the
+    /// checks).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::get_secret`], plus [`DomainError::BoundNotOnChain`] and
+    /// [`DomainError::OwnerAboveBound`].
+    pub async fn get_secret_within(
+        &self,
+        ctx: &SecurityContext,
+        key: &SecretRef,
+        bound: TenantId,
+    ) -> Result<Option<Secret>, DomainError> {
+        self.get_secret_bounded(ctx, key, Some(bound)).await
+    }
+
+    async fn get_secret_bounded(
+        &self,
+        ctx: &SecurityContext,
+        key: &SecretRef,
+        bound: Option<TenantId>,
+    ) -> Result<Option<Secret>, DomainError> {
         let fields = [
             "reference".to_owned(),
             "type".to_owned(),
             "expires_at".to_owned(),
             "secret".to_owned(),
         ];
-        let Some(item) = self.get_item(ctx, key, Some(&fields)).await? else {
+        let Some(item) = self.get_item_within(ctx, key, Some(&fields), bound).await? else {
             return Ok(None);
         };
         // `get_item` already applied the value-only miss rule above, so
-        // reaching here with either absent is structurally unreachable
-        // (`value_validator` is `Some` iff `value` is); guard rather than
-        // unwrap.
-        let (Some(value), Some(validator)) = (item.value, item.value_validator) else {
+        // reaching here without a value is structurally unreachable; guard
+        // rather than unwrap.
+        let Some(value) = item.value else {
             return Ok(None);
+        };
+        // The validator the REST `ETag` carries for the same read (ADR-0009):
+        // the caller's own row's strong one, else the opaque weak tag of the
+        // winning row; never the id or version of another tenant's row.
+        let validator = match (item.credential.own.as_ref(), item.weak_validator_source) {
+            (Some(own), _) => SecretValidator::Strong(own.validator),
+            (None, Some((winner_id, winner_version))) => {
+                SecretValidator::Weak(WeakValidator::new(weak_etag(
+                    ctx.subject_tenant_id(),
+                    key.as_ref(),
+                    winner_id,
+                    winner_version,
+                )))
+            }
+            // Structurally unreachable: a value is served only from a
+            // winner, and a winner is the weak source whenever there is no
+            // own row.
+            (None, None) => {
+                return Err(DomainError::internal(
+                    "a value was served with neither a strong nor a weak validator source",
+                ));
+            }
         };
         Ok(Some(Secret {
             reference: key.clone(),
@@ -690,8 +784,8 @@ impl Service {
     /// value-less generation.
     #[allow(
         clippy::too_many_arguments,
-        reason = "carries every field the retry protocol needs: identity, the row being read, \
-                  and the type name for the returned Secret"
+        reason = "carries every field the retry protocol needs: identity, the chain and the row \
+                  being read"
     )]
     async fn read_value_for_row(
         &self,
@@ -702,8 +796,7 @@ impl Service {
         key: &SecretRef,
         chain: &[Uuid],
         row: &SecretRow,
-        resolved_gts_id: &str,
-    ) -> Result<Option<Secret>, DomainError> {
+    ) -> Result<Option<SecretValue>, DomainError> {
         if row.value_version.is_none() {
             // Defensive: callers already filter out a value-less row before
             // calling this (nothing to authorize or read for it).
@@ -731,16 +824,7 @@ impl Service {
             ReadOutcome::HitOwn
         });
 
-        Ok(Some(Secret {
-            reference: key.clone(),
-            secret_type: resolved_gts_id.to_owned(),
-            expires_at: served_row.expires_at,
-            secret: value,
-            validator: Validator {
-                id: served_row.id,
-                version: served_row.version,
-            },
-        }))
+        Ok(Some(value))
     }
 
     /// Read the store value for `row`'s `value_version`, re-reading the row
@@ -1268,7 +1352,7 @@ impl Service {
             // records (the nearest ancestor's `shared` one), to a record of a
             // different type, creating here would silently diverge from what a
             // value read already serves.
-            let chain = self.dir.ancestor_chain(ctx, tenant).await?;
+            let chain = self.dir.ancestor_chain(ctx, tenant).await?.ids;
             if let Some(inherited) = self.repo.resolve_non_private(tenant, key, &chain).await?
                 && inherited.secret_type_uuid != type_uuid
             {
@@ -2442,3 +2526,7 @@ mod audit_tests;
 #[cfg(test)]
 #[path = "write_intent_tests.rs"]
 mod write_intent_tests;
+
+#[cfg(test)]
+#[path = "service_bound_tests.rs"]
+mod service_bound_tests;

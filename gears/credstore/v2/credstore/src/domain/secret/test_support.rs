@@ -28,7 +28,7 @@ use crate::domain::ports::metrics::{
     VerifyOutcome,
 };
 use crate::domain::ports::plugin::PluginSelector;
-use crate::domain::resolver::TenantDirectory;
+use crate::domain::resolver::{AncestorChain, TenantDirectory};
 use crate::domain::secret::cleanup::{DeadContent, cleanup_tasks};
 use crate::domain::secret::model::{
     CleanupDebt, CleanupTask, DeleteVerification, HealFlags, HealedCreates, IntentCommit,
@@ -534,6 +534,9 @@ pub struct FakeDir {
     descendants: Vec<Uuid>,
     /// Every `is_ancestor` fails as a tenant-resolver outage.
     is_ancestor_fails: bool,
+    /// Length of the barrier-respecting prefix of the chain; `None` = the
+    /// whole chain (no isolation barrier).
+    visible_len: Option<usize>,
 }
 
 impl FakeDir {
@@ -543,7 +546,17 @@ impl FakeDir {
             chain,
             descendants: Vec::new(),
             is_ancestor_fails: false,
+            visible_len: None,
         }
+    }
+
+    /// Only the first `visible_len` tenants of the chain are visible with
+    /// barriers respected (an isolation barrier at index `visible_len - 1`
+    /// or a self-managed caller when `1`).
+    #[must_use]
+    pub fn with_visible_len(mut self, visible_len: usize) -> Self {
+        self.visible_len = Some(visible_len);
+        self
     }
 
     /// Single-tenant chain (only self).
@@ -574,8 +587,11 @@ impl TenantDirectory for FakeDir {
         &self,
         _ctx: &SecurityContext,
         _req: TenantId,
-    ) -> Result<Vec<Uuid>, DomainError> {
-        Ok(self.chain.clone())
+    ) -> Result<AncestorChain, DomainError> {
+        Ok(AncestorChain {
+            ids: self.chain.clone(),
+            visible_len: self.visible_len.unwrap_or(self.chain.len()),
+        })
     }
 
     async fn is_ancestor(

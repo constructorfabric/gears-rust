@@ -29,7 +29,7 @@ use credstore_sdk::{
 };
 
 use super::register_routes;
-use crate::api::rest::dto::weak_etag;
+use crate::domain::secret::etag::weak_etag;
 
 const MERGE_PATCH: &str = "application/merge-patch+json";
 

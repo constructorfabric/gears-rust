@@ -7,15 +7,42 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 
+/// A tenant's ancestor chain with the visibility of its isolation barriers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AncestorChain {
+    /// `[req, parent, …, root]`, isolation barriers ignored (what inheritance walks).
+    pub ids: Vec<Uuid>,
+    /// Length of the prefix of `ids` the caller sees with barriers respected:
+    /// `req` itself, plus ancestors up to and including the first
+    /// self-managed one; just `req` when `req` is self-managed.
+    pub visible_len: usize,
+}
+
+impl AncestorChain {
+    /// A chain with no isolation barrier: everything is visible.
+    #[must_use]
+    pub fn unbarriered(ids: Vec<Uuid>) -> Self {
+        let visible_len = ids.len();
+        Self { ids, visible_len }
+    }
+
+    /// The part of the chain the caller sees with barriers respected.
+    #[must_use]
+    pub fn visible(&self) -> &[Uuid] {
+        &self.ids[..self.visible_len.min(self.ids.len())]
+    }
+}
+
 /// Resolves a tenant's ancestor chain (self first, root last).
 #[async_trait]
 pub trait TenantDirectory: Send + Sync {
-    /// Returns `[req, parent, …, root]` (req first), self included.
+    /// Returns `[req, parent, …, root]` (req first), self included, with the
+    /// length of the part visible across isolation barriers.
     async fn ancestor_chain(
         &self,
         ctx: &SecurityContext,
         req: TenantId,
-    ) -> Result<Vec<Uuid>, DomainError>;
+    ) -> Result<AncestorChain, DomainError>;
 
     /// True iff `ancestor` is a strict ancestor of `descendant` in the
     /// tenant hierarchy, isolation barriers ignored (the hierarchy

@@ -29,11 +29,13 @@ use toolkit_odata::{ODataQuery, Page, PageInfo};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
+use crate::field::BOUND_NOT_ON_CHAIN;
 use crate::reason::failed_precondition::SECRET_EXPIRED;
 use crate::{
     CredStoreClientV2, Credential, CredentialListItem, CredentialPatch, CredentialStatus,
     CredentialWrite, Fallback, InheritanceStatus, OwnRow, OwnerId, PutOutcome, PutPrecondition,
-    Secret, SecretRef, SecretType, SecretValue, SharingMode, Validator, WritePrecondition,
+    Secret, SecretRef, SecretType, SecretValidator, SecretValue, SharingMode, TenantId, Validator,
+    WritePrecondition,
 };
 
 #[resource_error(gts_id!("cf.core.credstore.credential.v1~"))]
@@ -46,6 +48,16 @@ fn backend_failure() -> CanonicalError {
 fn not_found() -> CanonicalError {
     CredentialScope::not_found("credential not found")
         .with_resource("credential")
+        .create()
+}
+
+fn bound_not_on_chain() -> CanonicalError {
+    CredentialScope::invalid_argument()
+        .with_field_violation(
+            "bound",
+            "the bound is not on the caller's chain",
+            BOUND_NOT_ON_CHAIN,
+        )
         .create()
 }
 
@@ -174,7 +186,7 @@ impl MockCredStoreClient {
             secret_type: SecretType::generic().gts_id().to_owned(),
             expires_at: None,
             secret: SecretValue::new(value),
-            validator: Self::validator(),
+            validator: SecretValidator::Strong(Self::validator()),
         }
     }
 
@@ -228,6 +240,21 @@ impl CredStoreClientV2 for MockCredStoreClient {
             Behavior::NotFound => Err(not_found()),
             Behavior::SecretExpired => Err(secret_expired()),
         }
+    }
+
+    /// The mock models no hierarchy: the caller's chain is its own tenant, so
+    /// `bound` equal to the caller's tenant reads like `get_secret` and any
+    /// other `bound` is `BOUND_NOT_ON_CHAIN`.
+    async fn get_secret_within(
+        &self,
+        ctx: &SecurityContext,
+        key: &SecretRef,
+        bound: TenantId,
+    ) -> Result<Option<Secret>, CanonicalError> {
+        if bound.0 != ctx.subject_tenant_id() {
+            return Err(bound_not_on_chain());
+        }
+        self.get_secret(ctx, key).await
     }
 
     async fn put(

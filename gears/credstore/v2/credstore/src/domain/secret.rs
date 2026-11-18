@@ -5,6 +5,7 @@
 //! lookup, crash-safe writes (immutable value versions) and expiry.
 
 pub mod cleanup;
+pub mod etag;
 pub mod list_filter;
 pub mod model;
 pub mod reduce;

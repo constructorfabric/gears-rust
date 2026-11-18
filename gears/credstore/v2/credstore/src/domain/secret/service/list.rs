@@ -15,7 +15,8 @@ use std::sync::Arc;
 
 use credstore_sdk::field;
 use credstore_sdk::{
-    CredStorePluginClientV2, Credential, CredentialListItem, OwnerId, Secret, SecretRef, TenantId,
+    CredStorePluginClientV2, Credential, CredentialListItem, OwnerId, SecretRef, SecretValue,
+    TenantId,
 };
 use futures::stream::{self, StreamExt};
 use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, OrderKey, Page, PageInfo, SortDir};
@@ -112,7 +113,7 @@ struct SecretReadJob {
 
 /// One finished secret read: the credential, its reference and GTS type
 /// (for the audit record), and the secret if the read found one.
-type ReadResult = (Credential, SecretRef, String, Option<Secret>);
+type ReadResult = (Credential, SecretRef, String, Option<SecretValue>);
 
 /// One result slot of a `secret` selection, in reference order: an item already complete
 /// (an expired record: metadata only, no secret) or the index of a value read
@@ -193,7 +194,7 @@ impl Service {
 
         let req = TenantId(ctx.subject_tenant_id());
         let subject = OwnerId(ctx.subject_id());
-        let chain = self.dir.ancestor_chain(ctx, req).await?;
+        let chain = self.dir.ancestor_chain(ctx, req).await?.ids;
 
         // Selecting `secret` requires `read_secret` alone (the collection
         // admits no record-only field beside it, validated above); any other
@@ -511,16 +512,7 @@ impl Service {
         let job_count = jobs.len();
         let mut reads = stream::iter(jobs.into_iter().enumerate().map(|(index, job)| async move {
             let outcome = self
-                .read_value_for_row(
-                    plugin,
-                    ctx,
-                    req,
-                    subject,
-                    &job.key,
-                    chain,
-                    &job.winner,
-                    &job.gts_id,
-                )
+                .read_value_for_row(plugin, ctx, req, subject, &job.key, chain, &job.winner)
                 .await;
             (index, job.credential, job.key, job.gts_id, outcome)
         }))
@@ -586,7 +578,7 @@ impl Service {
             returned.push((key, gts_id));
             items.push(CredentialListItem {
                 credential,
-                secret: Some(secret.secret),
+                secret: Some(secret),
             });
         }
 

@@ -47,6 +47,8 @@ struct FakeTenantResolverClient {
     calls: AtomicU32,
     last_barrier: Mutex<Option<BarrierMode>>,
     is_ancestor_last_barrier: Mutex<Option<BarrierMode>>,
+    /// Tenants the fake reports as `self_managed` (isolation barriers).
+    self_managed: Vec<Uuid>,
 }
 
 impl FakeTenantResolverClient {
@@ -58,6 +60,19 @@ impl FakeTenantResolverClient {
             calls: AtomicU32::new(0),
             last_barrier: Mutex::new(None),
             is_ancestor_last_barrier: Mutex::new(None),
+            self_managed: Vec::new(),
+        }
+    }
+
+    fn with_self_managed(mut self, ids: &[Uuid]) -> Self {
+        self.self_managed = ids.to_vec();
+        self
+    }
+
+    fn tenant_ref(&self, id: Uuid) -> TenantRef {
+        TenantRef {
+            self_managed: self.self_managed.contains(&id),
+            ..tenant_ref(id)
         }
     }
 
@@ -106,8 +121,8 @@ impl TenantResolverClient for FakeTenantResolverClient {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if id.0 == self.child {
             Ok(GetAncestorsResponse {
-                tenant: tenant_ref(self.child),
-                ancestors: vec![tenant_ref(self.parent), tenant_ref(self.root)],
+                tenant: self.tenant_ref(self.child),
+                ancestors: vec![self.tenant_ref(self.parent), self.tenant_ref(self.root)],
             })
         } else {
             Err(TenantResolverError::TenantNotFound { tenant_id: id })
@@ -164,7 +179,11 @@ async fn chain_includes_self_then_ancestors() {
         .await
         .expect("ancestor_chain");
 
-    assert_eq!(chain, vec![child, parent, root]);
+    assert_eq!(chain.ids, vec![child, parent, root]);
+    assert_eq!(
+        chain.visible_len, 3,
+        "no barrier: the whole chain is visible"
+    );
 }
 
 #[tokio::test]
@@ -268,4 +287,55 @@ async fn is_ancestor_other_failures_are_service_unavailable() {
         err,
         crate::domain::error::DomainError::ServiceUnavailable { .. }
     ));
+}
+
+/// `visible_len` is the barrier-respecting prefix of the chain (the examples of
+/// the tenant-resolver README), computed from the one barrier-ignoring answer.
+async fn visible_len_with_barriers(
+    self_managed: impl FnOnce(Uuid, Uuid, Uuid) -> Vec<Uuid>,
+) -> (usize, usize) {
+    let (child, parent, root) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let fake = Arc::new(
+        FakeTenantResolverClient::new(child, parent, root)
+            .with_self_managed(&self_managed(child, parent, root)),
+    );
+    let client: Arc<dyn TenantResolverClient> = Arc::clone(&fake) as _;
+    let dir = TenantResolverDir::new(client, Arc::new(NoopMetrics));
+    let chain = dir
+        .ancestor_chain(&make_ctx(), DomainTenantId(child))
+        .await
+        .expect("ancestor_chain");
+    assert_eq!(
+        chain.ids,
+        vec![child, parent, root],
+        "the walk is never cut"
+    );
+    assert_eq!(fake.call_count(), 1, "one call serves both views");
+    (chain.visible_len, chain.ids.len())
+}
+
+#[tokio::test]
+async fn visible_len_is_one_for_a_self_managed_caller() {
+    let (visible, total) = visible_len_with_barriers(|child, _, _| vec![child]).await;
+    assert_eq!((visible, total), (1, 3));
+}
+
+#[tokio::test]
+async fn visible_len_includes_the_first_barrier_and_stops() {
+    // The parent is a barrier: the caller sees itself and the barrier, not
+    // what lies above it. A barrier higher up changes nothing.
+    let (visible, total) = visible_len_with_barriers(|_, parent, root| vec![parent, root]).await;
+    assert_eq!((visible, total), (2, 3));
+}
+
+#[tokio::test]
+async fn visible_len_with_a_barrier_at_the_root_is_the_whole_chain() {
+    let (visible, total) = visible_len_with_barriers(|_, _, root| vec![root]).await;
+    assert_eq!((visible, total), (3, 3));
+}
+
+#[tokio::test]
+async fn visible_len_without_barriers_is_the_whole_chain() {
+    let (visible, total) = visible_len_with_barriers(|_, _, _| Vec::new()).await;
+    assert_eq!((visible, total), (3, 3));
 }

@@ -46,6 +46,25 @@ impl From<DomainError> for CanonicalError {
                 )
                 .with_override(Http::status_code(409))
                 .create(),
+            // A bounded read (in-process only, no REST route): the value
+            // exists, but its row is above the bound the caller named. Same
+            // canonical shape and 409 pin as `SECRET_EXPIRED`; the answer
+            // names no tenant (ADR-0009).
+            DomainError::OwnerAboveBound => CredentialResource::failed_precondition()
+                .with_precondition_violation(
+                    "secret",
+                    "the value comes from a tenant above the requested bound",
+                    failed_precondition::OWNER_ABOVE_BOUND,
+                )
+                .with_override(Http::status_code(409))
+                .create(),
+            DomainError::BoundNotOnChain => CredentialResource::invalid_argument()
+                .with_field_violation(
+                    "bound",
+                    "the bound is not on the caller's chain",
+                    field::BOUND_NOT_ON_CHAIN,
+                )
+                .create(),
             DomainError::Conflict => {
                 CredentialResource::already_exists("credential already exists")
                     .with_resource("credential")
@@ -144,6 +163,8 @@ mod tests {
         assert_eq!(status_of(DomainError::NotFound), 404);
         assert_eq!(status_of(DomainError::Conflict), 409);
         assert_eq!(status_of(DomainError::SecretExpired), 409);
+        assert_eq!(status_of(DomainError::OwnerAboveBound), 409);
+        assert_eq!(status_of(DomainError::BoundNotOnChain), 400);
         assert_eq!(
             status_of(DomainError::InvalidSecretRef {
                 detail: "bad".to_owned()

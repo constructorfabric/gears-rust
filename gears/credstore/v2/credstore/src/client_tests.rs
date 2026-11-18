@@ -86,6 +86,17 @@ fn domain_error_maps_to_canonical_and_projects() {
         CredStoreError::SecretExpired
     ));
     assert!(matches!(
+        projected(DomainError::OwnerAboveBound),
+        CredStoreError::OwnerAboveBound
+    ));
+    assert!(matches!(
+        projected(DomainError::BoundNotOnChain),
+        CredStoreError::Invalid {
+            reason: credstore_sdk::field::Reason::BoundNotOnChain,
+            ..
+        }
+    ));
+    assert!(matches!(
         projected(DomainError::InvalidSecretRef {
             detail: "x".to_owned()
         }),
@@ -355,4 +366,43 @@ async fn patch_precondition_maps_sdk_matches_to_domain_version() {
         .expect("matching put precondition");
     assert!(!out.created);
     assert_eq!(out.validator.version, v.version + 1);
+}
+
+#[tokio::test]
+async fn get_secret_within_goes_through_the_service_and_the_shared_projection() {
+    let tenant = Uuid::new_v4();
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    let k = SecretRef::new("bounded-key").expect("ref");
+    let client = build_client(
+        Arc::new(FakeSecretRepo::new()),
+        Arc::new(FakeDir::single(tenant)),
+    );
+    client
+        .put(&ctx, &k, generic_write("v1"), PutPrecondition::CreateOnly)
+        .await
+        .expect("create");
+
+    let secret = client
+        .get_secret_within(&ctx, &k, credstore_sdk::TenantId(tenant))
+        .await
+        .expect("within the caller's own bound")
+        .expect("a value");
+    assert_eq!(secret.secret.as_bytes(), b"v1");
+    assert!(matches!(
+        secret.validator,
+        credstore_sdk::SecretValidator::Strong(_)
+    ));
+
+    let err = client
+        .get_secret_within(&ctx, &k, credstore_sdk::TenantId(Uuid::new_v4()))
+        .await
+        .map(|_| ())
+        .expect_err("not on the chain");
+    assert!(matches!(
+        CredStoreError::from(err),
+        CredStoreError::Invalid {
+            reason: credstore_sdk::field::Reason::BoundNotOnChain,
+            ..
+        }
+    ));
 }

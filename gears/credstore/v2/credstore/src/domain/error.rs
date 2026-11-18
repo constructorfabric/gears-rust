@@ -26,6 +26,16 @@ pub enum DomainError {
     /// resolution does not continue to an ancestor's value.
     #[error("secret expired")]
     SecretExpired,
+    /// A bounded read (`get_secret_within`) found a value, but the row it
+    /// comes from belongs to a tenant above the caller-named bound. The value
+    /// is not read. Never produced by the REST layer.
+    #[error("secret owner above the bound")]
+    OwnerAboveBound,
+    /// The `bound` of a bounded read is not on the caller's chain as the
+    /// caller sees it (isolation barriers respected): an unrelated id and an
+    /// ancestor above a barrier are the same answer.
+    #[error("bound is not on the caller's chain")]
+    BoundNotOnChain,
     #[error("version precondition failed")]
     VersionConflict,
     #[error("invalid precondition: {detail}")]

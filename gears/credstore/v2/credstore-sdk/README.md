@@ -11,9 +11,10 @@ SDK crate for the `CredStore` gear, providing public API contracts for credentia
 This crate defines the transport-agnostic interface for the `CredStore` gear:
 
 - **`CredStoreClientV2`** — consumer-facing trait
-  (`get_record`/`get_secret`/`put`/`patch`/`list`/`delete`); `get_record`
-  returns the record's metadata (`Credential`, never the value) and
-  `get_secret` the value with its usage envelope (`Secret`)
+  (`get_record`/`get_secret`/`get_secret_within`/`put`/`patch`/`list`/`delete`);
+  `get_record` returns the record's metadata (`Credential`, never the value),
+  `get_secret` the value with its usage envelope (`Secret`) and
+  `get_secret_within` the same with an upper bound on the value's owner
 - **`CredStorePluginClientV2`** — backend trait: a versioned value store keyed
   by `StoreKey { tenant_id, record_id }`. Required: `put` (returns the
   provider's `ValueVersion`), `get` (by version), `delete_key`. Optional:
@@ -30,7 +31,7 @@ This crate defines the transport-agnostic interface for the `CredStore` gear:
 
 ## `CredStoreClientV2`
 
-The consumer trait has six methods over one item shape shared by the record
+The consumer trait has seven methods over one item shape shared by the record
 and its optional secret (ADR-0004, ADR-0007):
 
 - `get_record` — point read of one credential's metadata (`Credential`, never the
@@ -41,7 +42,22 @@ and its optional secret (ADR-0004, ADR-0007):
 - `get_secret` — the secret with its usage envelope (`Secret`: reference,
   type, expiry, secret; `read_secret`). Over REST both are one item shape at
   `/credentials/{ref}`, where `$select=secret` decides whether the secret is
-  included; the in-process trait keeps two typed methods instead
+  included; the in-process trait keeps two typed methods instead. The
+  `Secret` also carries a `validator` (`SecretValidator`) equal to the REST
+  `ETag` of the same read: `Strong` (the caller's own row's validator, usable
+  in `WritePrecondition::Matches`) when the caller's tenant holds a row under
+  the reference, otherwise `Weak`, an opaque text that changes when the
+  winning row changes and never carries another tenant's row id or version
+  (ADR-0009)
+- `get_secret_within`: `get_secret` with a `bound: TenantId`: the value is
+  served only when its row belongs to `bound` or to a tenant below it on the
+  caller's chain (`read_secret`). In-process only, no REST counterpart. The
+  answer names no tenant: a value from above the bound is
+  `FailedPrecondition` (`OWNER_ABOVE_BOUND`), a `bound` that is not on the
+  caller's chain as seen with isolation barriers respected is
+  `InvalidArgument` (`BOUND_NOT_ON_CHAIN`, field `bound`), checked after the
+  PDP decision. Both are checked before the expiry test (ADR-0009, "Bounded
+  read")
 - `put` — precondition-guarded create-or-replace of the record together with a
   **tri-state** `secret` (`SecretWrite`): `Set` writes it, `Null` creates the
   record without one or removes the stored value on a replace. Under the create-only precondition it is how
@@ -79,7 +95,7 @@ reason or field code where there is one.
 dispatch. The conversion `From<CanonicalError>` is infallible; its variants are
 `NotFound`, `AlreadyExists`, `PreconditionFailed` (an `Aborted` with
 `OPTIMISTIC_LOCK_FAILURE`), `TypeConflict` (an `Aborted` with one of the three
-`TYPE_*` codes), `SecretExpired`, `UnsupportedTransition`, `Invalid` (the first
+`TYPE_*` codes), `SecretExpired`, `OwnerAboveBound`, `UnsupportedTransition`, `Invalid` (the first
 field violation: `field`, a typed `field::Reason`, `detail`), `PermissionDenied`,
 `Unavailable` (with an optional `retry_after`; also "no storage plugin
 registered" and "the store refused the plugin's credentials"), `Internal` and

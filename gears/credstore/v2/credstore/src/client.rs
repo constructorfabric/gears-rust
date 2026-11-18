@@ -12,7 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use credstore_sdk::{
     CredStoreClientV2, Credential, CredentialListItem, CredentialPatch, CredentialWrite,
-    PutOutcome, PutPrecondition, Secret, SecretRef, Validator,
+    PutOutcome, PutPrecondition, Secret, SecretRef, TenantId, Validator,
 };
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_odata::{ODataQuery, Page};
@@ -46,6 +46,21 @@ fn to_domain_put_precondition(p: PutPrecondition) -> DomainPutPrecondition {
     }
 }
 
+/// The SDK `get_secret` contract is a single 404 surface: `Ok(None)` covers
+/// "does not exist", "inaccessible", and "suppressed" alike. The service's
+/// `NotFound` (a resolved row whose backend value is missing even after the
+/// read protocol's one re-read of its current `value_version` — ADR-0006) is
+/// the same surface, so fold it rather than leak an error the contract does
+/// not admit.
+fn fold_not_found(
+    result: Result<Option<Secret>, DomainError>,
+) -> Result<Option<Secret>, CanonicalError> {
+    match result {
+        Err(DomainError::NotFound) => Ok(None),
+        other => other.map_err(Into::into),
+    }
+}
+
 /// In-process [`CredStoreClientV2`] that delegates to the domain [`Service`].
 pub struct CredStoreLocalClient {
     svc: Arc<Service>,
@@ -73,17 +88,16 @@ impl CredStoreClientV2 for CredStoreLocalClient {
         ctx: &SecurityContext,
         key: &SecretRef,
     ) -> Result<Option<Secret>, CanonicalError> {
-        match self.svc.get_secret(ctx, key).await {
-            // The SDK `get_secret` contract is a single 404 surface:
-            // `Ok(None)` covers "does not exist", "inaccessible", and
-            // "suppressed" alike. The service's `NotFound` (a resolved row
-            // whose backend value is missing even after the read protocol's
-            // one re-read of its current `value_version` — ADR-0006) is the
-            // same surface, so fold it rather than leak an error the
-            // contract does not admit.
-            Err(DomainError::NotFound) => Ok(None),
-            other => other.map_err(Into::into),
-        }
+        fold_not_found(self.svc.get_secret(ctx, key).await)
+    }
+
+    async fn get_secret_within(
+        &self,
+        ctx: &SecurityContext,
+        key: &SecretRef,
+        bound: TenantId,
+    ) -> Result<Option<Secret>, CanonicalError> {
+        fold_not_found(self.svc.get_secret_within(ctx, key, bound).await)
     }
 
     async fn put(

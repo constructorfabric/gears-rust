@@ -14,8 +14,9 @@ use toolkit::api::canonical_prelude::*;
 use toolkit::api::page_to_projected_json;
 use toolkit_security::SecurityContext;
 
-use super::dto::{CredentialDto, CredentialPatchDto, PutCredentialRequestDto, weak_etag};
+use super::dto::{CredentialDto, CredentialPatchDto, PutCredentialRequestDto};
 use crate::domain::error::DomainError;
+use crate::domain::secret::etag::weak_etag;
 use crate::domain::secret::model::{
     PutPrecondition as DomainPutPrecondition, WritePrecondition as DomainWritePrecondition,
 };

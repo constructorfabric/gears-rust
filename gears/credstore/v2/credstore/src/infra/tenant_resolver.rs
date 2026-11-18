@@ -8,11 +8,10 @@ use tenant_resolver_sdk::{
     BarrierMode, GetAncestorsOptions, IsAncestorOptions, TenantResolverClient, TenantResolverError,
 };
 use toolkit_security::SecurityContext;
-use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::ports::metrics::{CredStoreMetricsPort, Dep, DepOp, Outcome};
-use crate::domain::resolver::TenantDirectory;
+use crate::domain::resolver::{AncestorChain, TenantDirectory};
 use credstore_sdk::TenantId;
 
 /// Infra implementation of [`TenantDirectory`] backed by [`TenantResolverClient`].
@@ -43,7 +42,7 @@ impl TenantDirectory for TenantResolverDir {
         &self,
         ctx: &SecurityContext,
         req: TenantId,
-    ) -> Result<Vec<Uuid>, DomainError> {
+    ) -> Result<AncestorChain, DomainError> {
         let t0 = Instant::now();
         // Walk the full ancestry: `shared` secrets inherit through self-managed
         // (isolation-barrier) boundaries by design — a partner key stays
@@ -80,11 +79,21 @@ impl TenantDirectory for TenantResolverDir {
             }
         };
 
-        let mut chain = Vec::with_capacity(1 + resp.ancestors.len());
-        chain.push(req.0);
-        chain.extend(resp.ancestors.iter().map(|a| a.id.0));
+        let mut ids = Vec::with_capacity(1 + resp.ancestors.len());
+        ids.push(req.0);
+        ids.extend(resp.ancestors.iter().map(|a| a.id.0));
 
-        Ok(chain)
+        // What the caller sees with barriers respected, from the same answer
+        // (no second call): `req`, then ancestors up to and including the
+        // first self-managed one; a self-managed `req` sees only itself.
+        let visible_len = if resp.tenant.self_managed {
+            1
+        } else {
+            let barrier = resp.ancestors.iter().position(|a| a.self_managed);
+            1 + barrier.map_or(resp.ancestors.len(), |i| i + 1)
+        };
+
+        Ok(AncestorChain { ids, visible_len })
     }
 
     async fn is_ancestor(

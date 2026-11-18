@@ -13,7 +13,7 @@ use uuid::Uuid;
 use super::MockCredStoreClient;
 use crate::{
     CredStoreClientV2, CredStoreError, CredentialPatch, CredentialWrite, Fallback, PutPrecondition,
-    SecretRef, SecretValue, SecretWrite, SharingMode, Validator, WritePrecondition,
+    SecretRef, SecretValue, SecretWrite, SharingMode, TenantId, Validator, WritePrecondition,
 };
 
 /// The validator every successful write of the mock reports.
@@ -356,4 +356,33 @@ async fn mock_always_failing_list_returns_internal() {
         matches!(projected, Some(CredStoreError::Internal { .. })),
         "expected Internal, got: {projected:?}"
     );
+}
+
+/// The mock models no hierarchy: a bound equal to the caller's tenant reads
+/// like `get_secret`, any other bound is `BOUND_NOT_ON_CHAIN`.
+#[tokio::test]
+async fn mock_get_secret_within_accepts_only_the_callers_own_tenant() {
+    let client = seeded(&[("existing-ref", "v")]);
+    let key = reference("existing-ref");
+    let context = ctx();
+
+    let served = client
+        .get_secret_within(&context, &key, TenantId(context.subject_tenant_id()))
+        .await
+        .expect("own tenant is on the chain")
+        .expect("value is present");
+    assert_eq!(served.reference, key);
+
+    let projected = projection(
+        client
+            .get_secret_within(&context, &key, TenantId(Uuid::from_u128(7)))
+            .await,
+    );
+    match projected {
+        Some(CredStoreError::Invalid { field, reason, .. }) => {
+            assert_eq!(field, "bound");
+            assert_eq!(reason, crate::field::Reason::BoundNotOnChain);
+        }
+        other => panic!("expected BOUND_NOT_ON_CHAIN, got {other:?}"),
+    }
 }

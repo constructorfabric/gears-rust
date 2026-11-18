@@ -28,6 +28,7 @@ fn global_meter_records_all_instruments() {
         ReadOutcome::HitInherited,
         ReadOutcome::Miss,
         ReadOutcome::Expired,
+        ReadOutcome::OwnerAboveBound,
     ] {
         m.read_outcome(outcome);
     }
