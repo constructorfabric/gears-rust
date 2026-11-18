@@ -580,11 +580,13 @@ rate-limiting quota, fails and changes nothing.
 
 ## 12. Risks
 
-| Risk                                                   | Impact                                    | Mitigation                                                                                                  |
-|--------------------------------------------------------|-------------------------------------------|-------------------------------------------------------------------------------------------------------------|
-| A platform service charges the wrong subject           | Wrong quota charged                       | Platform plane only for platform services; the principal of a user request comes from its `SecurityContext` |
-| The mapping points to a type the metric does not admit | Every debit for that principal type fails | The backend rejects it as an invalid request; the resolver logs the misconfiguration                        |
-| A resource is deleted without a return                 | Its allocation capacity stays held        | The module reconciles its resources; the operator corrects the quota through the backend's own API          |
+| Risk                                                      | Impact                                           | Mitigation                                                                                                                         |
+|-----------------------------------------------------------|--------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------|
+| A platform service charges the wrong subject              | Wrong quota charged                              | Platform plane only for platform services; the principal of a user request comes from its `SecurityContext`                        |
+| The mapping points to a type the metric does not admit    | Every debit for that principal type fails        | The backend rejects it as an invalid request; the resolver logs the misconfiguration                                               |
+| A resource is deleted without a return                    | Its allocation capacity stays held               | The module reconciles its resources; the operator corrects the quota through the backend's own API                                 |
+| A platform service charges or returns quota in any tenant | Another tenant's quota is used up or freed       | Platform routes are internal and need a platform credential; authorization of platform-plane callers when the platform supports it |
+| A module returns another module's charge                  | Capacity is freed that this module never charged | Keys are unique across modules (`cpt-cf-quota-resolver-fr-idempotency`)                                                            |
 
 ## 13. Open Questions
 

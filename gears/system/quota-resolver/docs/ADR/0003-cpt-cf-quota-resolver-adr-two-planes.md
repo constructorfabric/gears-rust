@@ -75,13 +75,24 @@ On the tenant plane the subject is the caller's principal, mapped the same way, 
 The resolver performs no policy check and passes no caller identity to the plugin. It trusts platform-plane callers
 for the target data they provide and trusts the backend to decide which quotas apply to the fixed tenant and subjects.
 
+This is an exception to the toolkit's two-plane rule (`cpt-cf-adr-two-plane-auth`, "Which plane?"), which puts
+operations within a tenant, writes included, on the tenant plane with a policy check. The toolkit has no way to
+authorize a trusted service that charges many tenants: a tenant `SecurityContext` binds one tenant, and the policy
+decision point does not evaluate `PlatformSecurityContext`. The exception ends when the toolkit evaluates policies for
+platform-plane callers, keyed on the calling service and set at platform level, so the charged tenant cannot deny its
+own charge. The resolver then adopts that check without changing its contracts.
+
 ### Consequences
 
 * Only platform services can charge. A module charges the user of a request with the same call it uses for any other
   subject; the SDK offers a helper that builds the principal subject and the tenant from a `SecurityContext`.
 * The resolver cannot check that a principal passed as data is the user of the module's request; it trusts the
   platform-plane caller, as for any other subject.
-* A backend that also has its own API gains a second entry into its operations: the in-process plugin.
+* Until the exception ends, any service with a platform credential can charge, return, or read quotas of any subject
+  in any tenant. No component checks which service may do so, and the backend cannot record which service made a
+  charge.
+* A backend that also has its own API gains a second entry into its operations: the in-process plugin. The backend's
+  own policy check covers only its API; the plugin is reachable only through the resolver and is not authorized.
 * An authenticated user receives the state of the quotas that the backend applies to the mapped subject and requested
   metrics, including quotas of the tenant. The resolver returns the backend's page unchanged.
 
@@ -99,7 +110,7 @@ the resolver returns the plugin's quota-state page unchanged.
 * Good, because every charge is authenticated the same way, by the platform credential of the calling module.
 * Good, because the tenant plane is read-only and safe to publish at the edge.
 * Bad, because the resolver trusts the module to pass the right principal.
-* Bad, because the backend secures its plugin entry point itself.
+* Bad, because no component authorizes the calling service, which is an exception to `cpt-cf-adr-two-plane-auth`.
 
 ### (b) Writes on both planes, user context forwarded
 
@@ -118,6 +129,8 @@ the resolver returns the plugin's quota-state page unchanged.
 ## More Information
 
 Principal types and their hierarchy: issue #5446.
+
+Two-plane authentication: [ADR-0008](../../../../../docs/arch/toolkit-oop/ADR/0008-cpt-cf-adr-two-plane-auth.md).
 
 ## Traceability
 

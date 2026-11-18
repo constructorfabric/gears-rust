@@ -349,7 +349,8 @@ amounts, idempotency, and the tenant of the lease token.
 ##### Responsibility boundaries
 
 The plugin is reachable only in process through the plugin contract, which carries the fixed tenant and quota
-subjects and no caller identity.
+subjects and no caller identity. The plugin runs no policy check: the backend's own check covers only the backend's
+API, and the backend cannot record which module made a charge.
 
 ##### Related components (by ID)
 
@@ -530,6 +531,7 @@ mapping to a subject type that the metric does not admit.
 * The tenant plane has no write operation; its only route, `quota-state`, is exposed.
 * No policy check runs in the resolver. Platform callers are trusted by the resolver, also for the principal they pass
   as data; on the tenant plane the context fixes the subject and the tenant (`cpt-cf-quota-resolver-adr-two-planes`).
+  This is an exception to `cpt-cf-adr-two-plane-auth` until the toolkit authorizes platform-plane callers.
 * The backend decides which quotas a quota state read returns; the resolver returns the backend's page unchanged.
 * A charge never carries a user's `SecurityContext`, and the resolver never synthesizes one. A module that reads its
   user's quota state passes that user's context to the tenant plane, which limits the read to that user.
