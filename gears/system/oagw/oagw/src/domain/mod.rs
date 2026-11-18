@@ -1,6 +1,8 @@
 pub(crate) mod cors;
 /// Domain error types returned by services and mapped to API errors.
 pub(crate) mod error;
+/// Header names the gateway sets or strips on outbound requests.
+pub(crate) mod gateway_headers;
 pub(crate) mod gts_helpers;
 /// Domain model: upstreams, routes, endpoints and request/query types.
 pub(crate) mod model;
@@ -18,6 +20,8 @@ pub(crate) mod route_matching;
 pub(crate) mod services;
 /// SSRF guard that filters outbound IP addresses.
 pub(crate) mod ssrf;
+/// Rules over a caller's tenant chain.
+pub(crate) mod tenant_chain;
 pub(crate) mod type_catalog;
 pub(crate) mod type_provisioning;
 

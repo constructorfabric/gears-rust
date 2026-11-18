@@ -27,6 +27,9 @@ pub mod key {
     pub const STATUS_CODE: &str = "http.response.status_code";
     /// `DomainError` variant name.
     pub const ERROR_TYPE: &str = "error_type";
+    /// Where the injected API key came from (`config`, `request_ref`;
+    /// ADR-0022). `unknown` before the upstream resolves.
+    pub const CREDENTIAL_MODE: &str = "credential_mode";
     /// Pipeline phase for duration histogram (`total`, `resolve`, `auth`; future: `guard`, `upstream`, …).
     pub const PHASE: &str = "phase";
     /// Registry instance kind (`upstream`, `route`).

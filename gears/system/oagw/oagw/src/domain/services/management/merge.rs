@@ -138,6 +138,20 @@ pub(crate) fn compute_effective_config_reporting(
     withheld: &mut dyn FnMut(Withheld),
     applied: &mut dyn FnMut(&Route),
 ) -> Result<Upstream, DomainError> {
+    compute_effective_config_owned(ancestor_chain, route, shadowed, withheld, applied)
+        .map(|(effective, _)| effective)
+}
+
+/// [`compute_effective_config_reporting`], with the tenant of the upstream
+/// whose auth is in effect (the auth owner, `inst-merge-3a0`). The
+/// per-request secret guards (ADR-0022) bound a secret's owner by it.
+pub(crate) fn compute_effective_config_owned(
+    ancestor_chain: &[Upstream],
+    route: Option<&Route>,
+    shadowed: &[Route],
+    withheld: &mut dyn FnMut(Withheld),
+    applied: &mut dyn FnMut(&Route),
+) -> Result<(Upstream, Uuid), DomainError> {
     use crate::domain::model::{SharedPool, SharingMode};
 
     if ancestor_chain.is_empty() {
@@ -321,7 +335,8 @@ pub(crate) fn compute_effective_config_reporting(
         }
     }
 
-    Ok(effective)
+    let auth_owner_tenant_id = auth_owner.tenant_id;
+    Ok((effective, auth_owner_tenant_id))
 }
 
 /// The enforced rate limits of the `shadowed` routes (as given to

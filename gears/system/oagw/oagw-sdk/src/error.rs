@@ -21,6 +21,7 @@
 //! | permission denied — inspect reason | [`ServiceGatewayError::PermissionDenied`] |
 //! | request body too large | [`ServiceGatewayError::PayloadTooLarge`] |
 //! | `x-target-host` header issue | [`ServiceGatewayError::InvalidTargetHost`] |
+//! | `x-oagw-secret-ref` header issue | [`ServiceGatewayError::InvalidSecretRef`] |
 //! | other field validation | [`ServiceGatewayError::Validation`] |
 //! | resource missing | [`ServiceGatewayError::NotFound`] |
 //! | resource conflict | [`ServiceGatewayError::AlreadyExists`] |
@@ -72,7 +73,7 @@
 use thiserror::Error;
 use toolkit_canonical_errors::{CanonicalError, InvalidArgument};
 
-use crate::field::TargetHostCode;
+use crate::field::{SecretRefCode, TargetHostCode};
 use crate::gts::Resource;
 use crate::reason::auth::FailureReason as AuthFailureReason;
 use crate::reason::permission::DenialReason as PermissionDenialReason;
@@ -136,6 +137,17 @@ pub enum ServiceGatewayError {
     #[error("target host header [{code:?}]: {detail}")]
     InvalidTargetHost {
         code: TargetHostCode,
+        detail: String,
+    },
+
+    /// The [`crate::SECRET_REF_HEADER`] header was malformed, sent to an
+    /// upstream that does not accept it, or missing where the upstream has
+    /// no default secret.
+    #[error("secret reference header [{code:?}]: {detail}")]
+    InvalidSecretRef {
+        /// Which of the three secret-reference violations it is.
+        code: SecretRefCode,
+        /// Human-readable explanation; never contains the reference.
         detail: String,
     },
 
@@ -351,6 +363,14 @@ fn project_invalid_argument(ctx: &InvalidArgument, detail: String) -> ServiceGat
         };
     }
 
+    // Secret-reference reasons get their own typed variant.
+    if let Some(code) = SecretRefCode::from_wire(v.reason.as_str()) {
+        return ServiceGatewayError::InvalidSecretRef {
+            code,
+            detail: v.description.clone(),
+        };
+    }
+
     // Body-size reason collapses to PayloadTooLarge alongside the
     // canonical `OutOfRange` arm above.
     if v.reason == crate::field::PAYLOAD_TOO_LARGE {
@@ -475,6 +495,8 @@ mod sdk_vocabulary_round_trip_tests {
             reason::permission::CORS_ORIGIN_NOT_ALLOWED,
             reason::permission::CORS_METHOD_NOT_ALLOWED,
             reason::permission::AUTHZ_SCOPE_NOT_SUPPORTED,
+            reason::permission::SECRET_REF_NOT_ACCESSIBLE,
+            reason::permission::SECRET_REF_POLICY_DENIED,
         ] {
             let err = ProxyScope::permission_denied().with_reason(r).create();
             let json = problem(err);
@@ -517,6 +539,9 @@ mod sdk_vocabulary_round_trip_tests {
             field::HTTP_UPSTREAM_FORBIDDEN,
             field::NOT_IMPLEMENTED,
             field::UNSUPPORTED_QUERY_PARAM,
+            field::INVALID_SECRET_REF,
+            field::SECRET_REF_NOT_ALLOWED,
+            field::SECRET_REF_REQUIRED,
         ];
 
         for code in cases {
@@ -778,6 +803,54 @@ mod projection_tests {
         }
     }
 
+    /// SREF-SDK-006: each 400 secret-reference reason projects to
+    /// `InvalidSecretRef` with its code.
+    #[test]
+    fn invalid_argument_with_secret_ref_codes_projects_to_invalid_secret_ref() {
+        for code in [
+            SecretRefCode::Invalid,
+            SecretRefCode::NotAllowed,
+            SecretRefCode::Required,
+        ] {
+            let canonical = ProxyScope::invalid_argument()
+                .with_field_violation(crate::SECRET_REF_HEADER, "header issue", code.as_wire())
+                .create();
+            match ServiceGatewayError::from(canonical) {
+                ServiceGatewayError::InvalidSecretRef { code: got, detail } => {
+                    assert_eq!(got, code);
+                    assert_eq!(detail, "header issue");
+                }
+                other => panic!("expected InvalidSecretRef for {code:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// SREF-SDK-006: each 403 secret-reference reason projects to
+    /// `PermissionDenied` with its typed reason, and round-trips.
+    #[test]
+    fn permission_denied_projects_secret_ref_reasons() {
+        for (wire, expected) in [
+            (
+                reason::permission::SECRET_REF_NOT_ACCESSIBLE,
+                PermissionDenialReason::SecretRefNotAccessible,
+            ),
+            (
+                reason::permission::SECRET_REF_POLICY_DENIED,
+                PermissionDenialReason::SecretRefPolicyDenied,
+            ),
+        ] {
+            assert_eq!(PermissionDenialReason::from_wire(wire), expected);
+            assert_eq!(expected.as_wire(), wire);
+            let canonical = ProxyScope::permission_denied().with_reason(wire).create();
+            match ServiceGatewayError::from(canonical) {
+                ServiceGatewayError::PermissionDenied { reason, .. } => {
+                    assert_eq!(reason, expected);
+                }
+                other => panic!("expected PermissionDenied for {wire}, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn invalid_argument_with_payload_too_large_field_projects_to_payload_too_large() {
         // The body-size validator emits InvalidArgument + PAYLOAD_TOO_LARGE
@@ -792,6 +865,8 @@ mod projection_tests {
         ));
     }
 
+    /// SREF-SDK-006: other field reasons, on the secret-reference field too,
+    /// still project to `Validation`.
     #[test]
     fn invalid_argument_with_unmodeled_field_falls_through_to_validation() {
         let canonical = ProxyScope::invalid_argument()
@@ -809,6 +884,13 @@ mod projection_tests {
             }
             other => panic!("expected Validation, got {other:?}"),
         }
+        let canonical = ProxyScope::invalid_argument()
+            .with_field_violation(crate::SECRET_REF_HEADER, "bad", field::INVALID_VALUE)
+            .create();
+        assert!(matches!(
+            ServiceGatewayError::from(canonical),
+            ServiceGatewayError::Validation { .. }
+        ));
     }
 
     #[test]

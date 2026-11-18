@@ -536,6 +536,50 @@ async fn an_oagw_failure_maps_by_its_kind_and_names_only_the_kind() {
     }
 }
 
+/// SREF-SDK-008: an `X-OAGW-Secret-Ref` rejection (`InvalidSecretRef`, each
+/// code) maps to a refusal that names only the kind.
+#[tokio::test]
+async fn an_invalid_secret_ref_is_a_refusal() {
+    let failures: [Failure; 3] = [
+        || {
+            ProxyError::invalid_argument()
+                .with_field_violation(
+                    oagw_sdk::SECRET_REF_HEADER,
+                    "bad",
+                    oagw_sdk::field::INVALID_SECRET_REF,
+                )
+                .create()
+        },
+        || {
+            ProxyError::invalid_argument()
+                .with_field_violation(
+                    oagw_sdk::SECRET_REF_HEADER,
+                    "not here",
+                    oagw_sdk::field::SECRET_REF_NOT_ALLOWED,
+                )
+                .create()
+        },
+        || {
+            ProxyError::invalid_argument()
+                .with_field_violation(
+                    oagw_sdk::SECRET_REF_HEADER,
+                    "send one",
+                    oagw_sdk::field::SECRET_REF_REQUIRED,
+                )
+                .create()
+        },
+    ];
+    for failure in failures {
+        let got = model_behind(FakeGateway::failing(failure))
+            .complete(&context(), &planner_request())
+            .await;
+        assert_eq!(
+            got,
+            Err(ModelError::Refused("OAGW InvalidSecretRef".to_owned()))
+        );
+    }
+}
+
 #[tokio::test]
 async fn an_empty_refusal_is_no_refusal() {
     let body = answer(&json!({ "content": "Done.", "refusal": "" }), "stop");

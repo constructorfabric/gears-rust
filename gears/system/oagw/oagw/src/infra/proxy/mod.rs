@@ -1,15 +1,10 @@
 /// Hop-by-hop headers that must not be forwarded by proxies (RFC 7230 §6.1).
-pub(crate) const HOP_BY_HOP_HEADERS: &[&str] = &[
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-];
+/// Defined in the domain so the write-time auth header check reads the same
+/// list.
+pub(crate) use crate::domain::gateway_headers::HOP_BY_HOP_HEADERS;
 
+#[cfg(test)]
+pub(crate) mod credstore_spy;
 /// Health-checked, DNS-refreshed endpoint selection.
 pub(crate) mod endpoint_selector;
 /// Adapter over the `toolkit-http-proxy` upstream engine.
@@ -18,6 +13,10 @@ pub(crate) mod engine;
 pub(crate) mod headers;
 /// Builder for outbound upstream requests.
 pub(crate) mod request_builder;
+/// Per-request secret references (ADR-0022).
+pub(crate) mod secret_ref;
+#[cfg(test)]
+mod secret_ref_tests;
 /// Data-plane service implementation.
 pub(crate) mod service;
 /// Lifecycle management for streamed (SSE) response bodies.

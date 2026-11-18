@@ -315,11 +315,7 @@ fn credstore_outage(ctx: &SecurityContext, e: &credstore_sdk::CredStoreError) ->
 pub(in crate::domain::services) fn parse_secret_ref(
     credential: CredentialRef<'_>,
 ) -> Result<credstore_sdk::SecretRef, DomainError> {
-    let bare = credential
-        .value
-        .strip_prefix("cred://")
-        .unwrap_or(credential.value);
-    credstore_sdk::SecretRef::new(bare).map_err(|e| {
+    crate::domain::plugin::credentials::parse_credential_ref(credential.value).map_err(|e| {
         let reason = match &e {
             credstore_sdk::CredStoreError::InvalidSecretRef { reason } => reason.as_str(),
             other => credstore_error_kind(other),

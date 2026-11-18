@@ -136,6 +136,14 @@ impl TransformPluginRegistry {
         Self { plugins }
     }
 
+    /// Register `plugin` under `plugin_id`, for tests of the pipeline.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub(crate) fn with_plugin(mut self, plugin_id: &str, plugin: Arc<dyn TransformPlugin>) -> Self {
+        self.plugins.insert(plugin_id.to_owned(), plugin);
+        self
+    }
+
     /// Resolve a transform plugin by its GTS identifier.
     ///
     /// # Errors

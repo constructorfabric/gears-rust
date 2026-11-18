@@ -283,6 +283,25 @@ impl From<DomainError> for CanonicalError {
                     .create()
             }
 
+            // The canonical context carries only a retry hint: a consumer
+            // sees an ordinary 503; the log names the credential store.
+            DomainError::CredentialStoreUnavailable {
+                detail,
+                retry_after,
+                ..
+            } => {
+                // `secret_ref::resolve` already warned with the request's
+                // identifiers; this is only the mapping step.
+                tracing::debug!(reason = %detail, "OAGW credential store unavailable");
+                // CredStore's hint, rounded up to whole seconds (at least 1).
+                let retry_after_secs = retry_after.map_or(RETRY_AFTER_TRANSIENT_SECS, |d| {
+                    (d.as_secs() + u64::from(d.subsec_nanos() > 0)).max(1)
+                });
+                CanonicalError::service_unavailable()
+                    .with_retry_after_seconds(retry_after_secs)
+                    .create()
+            }
+
             DomainError::DownstreamError { detail, .. } => {
                 tracing::warn!(reason = %detail, "OAGW downstream error");
                 CanonicalError::service_unavailable()
@@ -906,6 +925,36 @@ mod tests {
             RETRY_AFTER_GUARD_SECS,
             "GuardRejected 503",
         );
+        assert_retry(
+            DomainError::CredentialStoreUnavailable {
+                detail: "x".into(),
+                retry_after: None,
+                instance: i(),
+            },
+            503,
+            RETRY_AFTER_TRANSIENT_SECS,
+            "CredentialStoreUnavailable without a hint",
+        );
+        assert_retry(
+            DomainError::CredentialStoreUnavailable {
+                detail: "x".into(),
+                retry_after: Some(std::time::Duration::from_secs(9)),
+                instance: i(),
+            },
+            503,
+            9,
+            "CredentialStoreUnavailable with a hint",
+        );
+        assert_retry(
+            DomainError::CredentialStoreUnavailable {
+                detail: "x".into(),
+                retry_after: Some(std::time::Duration::from_millis(1)),
+                instance: i(),
+            },
+            503,
+            1,
+            "CredentialStoreUnavailable with a sub-second hint",
+        );
     }
 
     #[test]
@@ -1089,6 +1138,11 @@ mod tests {
                 reason: reason::permission::AUTHZ_DENIED.into(),
                 detail: "test".into(),
                 entity: DeniedOn::Proxy,
+            },
+            DomainError::CredentialStoreUnavailable {
+                detail: "test".into(),
+                retry_after: None,
+                instance: "/test".into(),
             },
         ];
         for err in errors {

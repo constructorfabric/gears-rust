@@ -593,6 +593,20 @@ pub struct ProxyTarget {
     /// The enforced rate limits of the ancestor routes `route` shadows,
     /// root-first (`inst-merge-2a`).
     pub shadowed_route_limits: Vec<ShadowedRouteLimit>,
+    /// The caller's tenant chain, `[self, parent, ..., root]`, for the
+    /// per-request secret owner-chain guard (ADR-0022).
+    pub tenant_chain: Vec<Uuid>,
+    /// The tenant of the upstream whose auth config is in effect after the
+    /// hierarchical merge (`inst-merge-3a0`).
+    pub auth_owner_tenant_id: Uuid,
+}
+
+#[cfg(test)]
+impl ProxyTarget {
+    /// The upstream and route, for tests that need only those.
+    pub fn into_parts(self) -> (Upstream, Route) {
+        (self.upstream, self.route)
+    }
 }
 
 /// The enforced rate limit of an ancestor's route that a descendant's route
