@@ -165,14 +165,13 @@ async fn period_closure(
         ACTION_REOPEN => {
             // Reopen authority = `(fiscal_period, close)` (the preparer must be able
             // to close); the compiled scope is the dual-control gate's BOLA filter.
-            let scope = crate::authz::access_scope(
+            let scope = crate::authz::own_tenant_scope(
                 &enforcer,
                 &ctx,
                 &crate::authz::resource_types::FISCAL_PERIOD,
                 crate::authz::actions::CLOSE,
                 Some(tenant_id),
                 None,
-                /* require_constraints */ true,
             )
             .await
             .map_err(authz_error_to_canonical)?;

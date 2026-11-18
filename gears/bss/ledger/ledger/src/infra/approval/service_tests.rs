@@ -1031,6 +1031,29 @@ async fn gate_rejects_a_monetary_intent_without_amount_facts() {
     );
 }
 
+/// The gate keys the policy, the facts and the pending row to the caller's
+/// tenant, so it refuses an intent for another tenant's book instead of
+/// governing it by the caller's threshold and approvers; no row is created.
+#[tokio::test]
+async fn gate_refuses_an_intent_for_another_tenants_book() {
+    let (s, _, preparer, _, scope) = setup().await;
+    let mut intent = grant(&preparer, money("5000", "EUR", 2));
+    if let ApprovalIntent::CreditGrant(i) = &mut intent {
+        i.tenant_id = Uuid::now_v7();
+    }
+    let f = facts(&intent);
+    assert!(matches!(
+        s.gate(&preparer, &scope, intent, f, "gate".into()).await,
+        Err(DomainError::CrossTenantAccessDenied(_))
+    ));
+    assert!(
+        s.list(&preparer, &scope, None, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 /// With a functional currency set and no locked rate snapshot for the
 /// operation, a functional-basis kind is valued through the current reference
 /// quote at the functional currency's registry scale; an unknown functional

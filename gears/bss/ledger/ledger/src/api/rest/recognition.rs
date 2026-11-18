@@ -633,14 +633,13 @@ async fn change_recognition_schedule(
     // post action as the run trigger). A target outside the caller's scope is a
     // cross-tenant write and is denied. The in-process client gates again
     // (defence-in-depth, matching the run / dispute surfaces).
-    let scope = crate::authz::access_scope(
+    let scope = crate::authz::own_tenant_scope(
         &enforcer,
         &ctx,
         &crate::authz::resource_types::RECOGNITION,
         crate::authz::actions::WRITE,
         Some(tenant_id),
         None,
-        /* require_constraints */ true,
     )
     .await
     .map_err(authz_error_to_canonical)?;

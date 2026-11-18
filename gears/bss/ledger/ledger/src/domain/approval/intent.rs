@@ -889,6 +889,33 @@ impl ApprovalIntent {
         }
     }
 
+    /// The tenant whose ledger this intent posts to, when the intent names it.
+    /// `None` for [`Self::Reverse`]: the reversed entry is read under the caller's
+    /// tenant, so its book is the caller's by construction.
+    ///
+    /// The dual-control gate keys the threshold, the functional-currency facts and
+    /// the pending approval to the caller's tenant, which is the book's tenant on
+    /// every user path because those paths authorize the write `RootOnly`
+    /// ([`crate::authz::own_tenant_scope`]). The gate refuses an intent whose
+    /// book is another tenant's rather than govern it by the caller's policy.
+    #[must_use]
+    pub fn ledger_tenant(&self) -> Option<Uuid> {
+        match self {
+            Self::Reverse(_) => None,
+            Self::CreditGrant(i) => Some(i.tenant_id),
+            Self::ChargebackLoss(i) => Some(i.tenant_id),
+            Self::PayerClosure(i) => Some(i.tenant_id),
+            Self::PeriodReopen(i) => Some(i.tenant_id),
+            Self::MaterialBackdating(BackdatedPost::Invoice(s)) => Some(s.seller_tenant_id),
+            Self::RecognitionScheduleChange(i) => Some(i.tenant_id),
+            Self::Refund(i) => Some(i.tenant_id),
+            Self::ManualAdjustment(i) => Some(i.tenant_id),
+            Self::CreditNote(i) => Some(i.tenant_id),
+            Self::DebitNote(i) => Some(i.tenant_id),
+            Self::RefundWithCreditNote(i) => Some(i.refund.tenant_id),
+        }
+    }
+
     /// The idempotency/business key for the active-uniqueness guard (DC13): one
     /// active approval per `(tenant, kind, business_key)`.
     #[must_use]

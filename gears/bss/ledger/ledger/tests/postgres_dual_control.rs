@@ -542,11 +542,12 @@ async fn an_expired_pending_is_not_actionable() {
 
 // ─── service lifecycle: gate / list / request-changes / resubmit / cancel / comments ───
 
-/// A `CreditGrant` intent keyed by `app_id`, sized at `amount` cents (the
-/// amount-gated kind the `gate` threshold check reads).
-fn credit_grant_intent(app_id: &str, amount: i64) -> ApprovalIntent {
+/// A `CreditGrant` intent into `tenant`'s book keyed by `app_id`, sized at
+/// `amount` cents (the amount-gated kind the `gate` threshold check reads). The
+/// gate refuses an intent for a book other than the caller's tenant.
+fn credit_grant_intent(tenant: Uuid, app_id: &str, amount: i64) -> ApprovalIntent {
     ApprovalIntent::CreditGrant(CreditGrantIntent {
-        tenant_id: Uuid::now_v7(),
+        tenant_id: tenant,
         payer_tenant_id: Uuid::now_v7(),
         credit_application_id: app_id.to_owned(),
         amount: usd(amount),
@@ -589,7 +590,7 @@ async fn gate_over_threshold_creates_pending_and_is_idempotent() {
     let svc = service(&provider, &exec);
     let ctx = ctx_for(Uuid::now_v7(), tenant);
 
-    let intent = credit_grant_intent("CA-DC13", 120_000);
+    let intent = credit_grant_intent(tenant, "CA-DC13", 120_000);
     let facts = OperationFacts {
         kind: ApprovalKind::CreditGrant,
         amount: Some(usd(120_000)),
@@ -640,7 +641,7 @@ async fn gate_below_threshold_creates_no_approval() {
         .gate(
             &ctx,
             &scope,
-            credit_grant_intent("CA-SMALL", 50_000),
+            credit_grant_intent(tenant, "CA-SMALL", 50_000),
             OperationFacts {
                 kind: ApprovalKind::CreditGrant,
                 amount: Some(usd(50_000)),

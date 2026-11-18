@@ -248,14 +248,13 @@ async fn record_dispute_phase(
     // (dispute, write) PEP gate against the TARGET tenant: a target outside the
     // caller's scope is a cross-tenant write and is denied. The in-process client
     // gates again (defence-in-depth, matching the payment surface).
-    crate::authz::access_scope(
+    crate::authz::own_tenant_scope(
         &enforcer,
         &ctx,
         &crate::authz::resource_types::DISPUTE,
         crate::authz::actions::WRITE,
         Some(tenant_id),
         None,
-        /* require_constraints */ true,
     )
     .await
     .map_err(authz_error_to_canonical)?;
@@ -288,14 +287,13 @@ async fn record_dispute_phase(
             effective_at: None,
             has_outstanding_balance: false,
         };
-        let scope = crate::authz::access_scope(
+        let scope = crate::authz::own_tenant_scope(
             &enforcer,
             &ctx,
             &crate::authz::resource_types::DISPUTE,
             crate::authz::actions::WRITE,
             Some(tenant_id),
             None,
-            true,
         )
         .await
         .map_err(authz_error_to_canonical)?;

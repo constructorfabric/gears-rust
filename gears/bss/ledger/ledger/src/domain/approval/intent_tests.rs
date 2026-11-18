@@ -458,6 +458,42 @@ fn debit_note_intent_rebuilds_into_an_identical_request_with_recognition() {
     );
 }
 
+#[test]
+fn ledger_tenant_is_the_book_the_intent_posts_to() {
+    // The dual-control gate refuses an intent whose book is not the caller's
+    // tenant, so `ledger_tenant()` must name the book the intent posts to.
+    let target = Uuid::now_v7();
+    // A reversal names no tenant: the reversed entry is read under the caller's.
+    assert_eq!(
+        ApprovalIntent::Reverse(ReverseIntent {
+            entry_id: Uuid::now_v7(),
+            into_period_id: None,
+            effective_at: None,
+            reason: "r".into(),
+        })
+        .ledger_tenant(),
+        None,
+    );
+    assert_eq!(
+        ApprovalIntent::CreditGrant(CreditGrantIntent {
+            tenant_id: target,
+            payer_tenant_id: Uuid::from_u128(1),
+            credit_application_id: "app".into(),
+            amount: money(1, "USD"),
+            credit_grant_event_type: None,
+        })
+        .ledger_tenant(),
+        Some(target),
+    );
+    // A backdated invoice posts to its seller's ledger.
+    let snap = sample_snapshot();
+    let seller = snap.seller_tenant_id;
+    assert_eq!(
+        ApprovalIntent::MaterialBackdating(BackdatedPost::Invoice(snap)).ledger_tenant(),
+        Some(seller),
+    );
+}
+
 fn sample_snapshot() -> BackdatedInvoiceSnapshot {
     BackdatedInvoiceSnapshot {
         invoice_id: "inv-backdated-1".to_owned(),

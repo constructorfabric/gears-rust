@@ -39,6 +39,7 @@
 //! `AccessScope::In([...])` that SecureORM binds to the `tenant_id` column.
 
 use authz_resolver_sdk::PolicyEnforcer;
+use authz_resolver_sdk::models::TenantMode;
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
 use toolkit_security::{AccessScope, SecurityContext, pep_properties};
 use uuid::Uuid;
@@ -290,6 +291,10 @@ pub fn authz_label_type_schemas() -> Vec<serde_json::Value> {
 /// assertion above has a constraint to test). Pass `false` only for a pure
 /// allow/deny gate with no tenant anchor; no ledger path currently does.
 ///
+/// The PDP is asked in its default tenant mode (`Subtree`): the scope spans the
+/// caller's tenant and its descendants. That is for reads and the audit elevation
+/// check; a write a user makes into a book goes through [`own_tenant_scope`].
+///
 /// # Errors
 ///
 /// [`AuthzError::Denied`] when the PDP denies or returns uncompilable
@@ -303,7 +308,72 @@ pub async fn access_scope(
     resource_id: Option<Uuid>,
     require_constraints: bool,
 ) -> Result<AccessScope, AuthzError> {
+    scope_in_mode(
+        enforcer,
+        ctx,
+        rt,
+        action,
+        owner_tenant_id,
+        resource_id,
+        require_constraints,
+        None,
+    )
+    .await
+}
+
+/// [`access_scope`] for the caller's tenant only: the PDP is asked with
+/// [`TenantMode::RootOnly`], so it answers `EQ(owner_tenant_id, subject tenant)`
+/// and never expands the subject's subtree. A write into any other tenant's book,
+/// a descendant's included, is denied before the handler reads anything.
+///
+/// Every user write governed by dual-control and every approval verb goes through
+/// here. A user operation needs the permission in the user's own tenant; ancestry
+/// is not action permission (BSS ADR-0002). The dual-control gate keys the
+/// threshold, the approvers and the pending approval to the caller's tenant, which
+/// is the book's tenant only because of this gate.
+///
+/// # Errors
+///
+/// As [`access_scope`].
+pub async fn own_tenant_scope(
+    enforcer: &PolicyEnforcer,
+    ctx: &SecurityContext,
+    rt: &ResourceType,
+    action: &str,
+    owner_tenant_id: Option<Uuid>,
+    resource_id: Option<Uuid>,
+) -> Result<AccessScope, AuthzError> {
+    scope_in_mode(
+        enforcer,
+        ctx,
+        rt,
+        action,
+        owner_tenant_id,
+        resource_id,
+        true,
+        Some(TenantMode::RootOnly),
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the shared body of access_scope and own_tenant_scope"
+)]
+async fn scope_in_mode(
+    enforcer: &PolicyEnforcer,
+    ctx: &SecurityContext,
+    rt: &ResourceType,
+    action: &str,
+    owner_tenant_id: Option<Uuid>,
+    resource_id: Option<Uuid>,
+    require_constraints: bool,
+    tenant_mode: Option<TenantMode>,
+) -> Result<AccessScope, AuthzError> {
     let mut request = AccessRequest::new().require_constraints(require_constraints);
+    if let Some(mode) = tenant_mode {
+        request = request.tenant_mode(mode);
+    }
     if let Some(tenant) = owner_tenant_id {
         request = request.resource_property(pep_properties::OWNER_TENANT_ID, tenant);
     }

@@ -466,14 +466,13 @@ async fn post_credit_note(
     // action as the run trigger / invoice post). A target outside the caller's
     // scope is a cross-tenant write and is denied. The returned scope threads into
     // the scoped post (the SQL-level BOLA filter); the handler re-gates nothing.
-    let scope = crate::authz::access_scope(
+    let scope = crate::authz::own_tenant_scope(
         &enforcer,
         &ctx,
         &crate::authz::resource_types::ENTRY,
         crate::authz::actions::POST,
         Some(tenant_id),
         None,
-        /* require_constraints */ true,
     )
     .await
     .map_err(authz_error_to_canonical)?;
@@ -500,14 +499,13 @@ async fn post_debit_note(
     let ctx = require_authenticated(extension_ctx)?;
     let tenant_id = body.tenant_id;
     // (entry, post) PEP gate against the TARGET tenant — same as the credit note.
-    let scope = crate::authz::access_scope(
+    let scope = crate::authz::own_tenant_scope(
         &enforcer,
         &ctx,
         &crate::authz::resource_types::ENTRY,
         crate::authz::actions::POST,
         Some(tenant_id),
         None,
-        /* require_constraints */ true,
     )
     .await
     .map_err(authz_error_to_canonical)?;
@@ -540,14 +538,13 @@ async fn post_manual_adjustment(
     // seller's ledger. A target outside the caller's scope is a cross-tenant write
     // and is denied. The returned scope threads into the scoped post (the SQL-level
     // BOLA filter); the handler re-gates nothing.
-    let scope = crate::authz::access_scope(
+    let scope = crate::authz::own_tenant_scope(
         &enforcer,
         &ctx,
         &crate::authz::resource_types::ENTRY,
         crate::authz::actions::POST,
         Some(tenant_id),
         None,
-        /* require_constraints */ true,
     )
     .await
     .map_err(authz_error_to_canonical)?;

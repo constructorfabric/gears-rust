@@ -109,20 +109,19 @@ async fn post_credit_application(
     let ctx = require_authenticated(extension_ctx)?;
     // The target seller is the body's `tenant_id` (tenant in body, not path).
     let tenant_id = body.tenant_id;
-    // (credit_application, write) PEP gate against the TARGET tenant: a parent
-    // operates a wallet in a seller in its authorized subtree; a target outside
-    // the caller's scope is a cross-tenant write and is denied. The in-process
+    // (credit_application, write) PEP gate against the TARGET tenant, in the
+    // caller's own tenant only (`RootOnly`): a target in any other tenant, a
+    // descendant's included, is a cross-tenant write and is denied. The in-process
     // client gates again (defence-in-depth, matching the payment surface). The
     // gate runs on the body's `tenant_id` BEFORE `into_sdk()` — which may itself
     // return a 400 for a malformed `kind` / missing field.
-    crate::authz::access_scope(
+    crate::authz::own_tenant_scope(
         &enforcer,
         &ctx,
         &resource_types::CREDIT_APPLICATION,
         actions::WRITE,
         Some(tenant_id),
         None,
-        /* require_constraints */ true,
     )
     .await
     .map_err(authz_error_to_canonical)?;
@@ -154,14 +153,13 @@ async fn post_credit_application(
             effective_at: None,
             has_outstanding_balance: false,
         };
-        let scope = crate::authz::access_scope(
+        let scope = crate::authz::own_tenant_scope(
             &enforcer,
             &ctx,
             &resource_types::CREDIT_APPLICATION,
             actions::WRITE,
             Some(tenant_id),
             None,
-            true,
         )
         .await
         .map_err(authz_error_to_canonical)?;
