@@ -22,7 +22,7 @@ workspace = true
 test-support = []
 
 [dependencies]
-model-registry-sdk = { package = "cf-gears-model-registry-sdk", version = "0.2.0", path = "../model-registry-sdk" }
+model-registry-sdk = { package = "cf-gears-model-registry-sdk", version = "0.2.1", path = "../model-registry-sdk" }
 
 # System SDKs and the gears `deps` names
 tenant-resolver-sdk = { workspace = true }
