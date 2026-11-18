@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use cf_system_sdks::directory::{DirectoryClient, ServiceInstanceInfo};
+use cf_system_sdks::directory::{DirectoryClient, InstanceState, ServiceInstanceInfo};
 use tokio_util::sync::CancellationToken;
 use toolkit_gateway::{
     Endpoint, GatewayProvider, GearInstance, GearName, InstanceSpec, OpenApiSpec,
@@ -141,6 +141,19 @@ async fn sync_once(
     sync_once_stateful(provider, directory, &mut SyncState::default()).await
 }
 
+/// How many consecutive empty directory snapshots the empty-snapshot valve
+/// preserves existing routes across before giving up and pruning. Tolerates a
+/// brief directory hiccup without pinning routes to crashed instances forever
+/// (at the default 10s poll cadence this is a ~30s grace window).
+const MAX_EMPTY_POLLS_PRESERVING_ROUTES: u32 = 3;
+
+/// Whether the edge can route to an instance: it advertises a REST endpoint and
+/// a published spec. gRPC-only instances are not routable here — the edge
+/// proxies HTTP — so they neither become routes nor decide serving/fallback.
+fn is_proxyable(instance: &ServiceInstanceInfo) -> bool {
+    instance.rest_endpoint.is_some() && instance.openapi_spec_hash.is_some()
+}
+
 /// Lets each poll skip the spec re-fetch and router rebuild when the snapshot
 /// is unchanged — a k8s `resourceVersion` / xDS `version_info` analogue.
 #[derive(Default)]
@@ -149,6 +162,38 @@ struct SyncState {
     /// next poll to reconcile (startup, a partial pass, or the empty-snapshot
     /// safety valve), so pending work is always retried.
     last_applied: Option<u64>,
+    /// Consecutive polls where the directory returned an empty snapshot, used to
+    /// bound the empty-snapshot valve (see [`MAX_EMPTY_POLLS_PRESERVING_ROUTES`]).
+    consecutive_empty_polls: u32,
+}
+
+/// Prefer serving instances per gear for edge routing.
+///
+/// If a gear has any serving (`Ready`/`Healthy`) instance, keep only its
+/// serving instances; otherwise keep its not-yet-serving instances, so a gear
+/// still coming up is not dropped from the edge (the same fallback as directory
+/// name round-robin). A `Draining` instance is never kept — draining means
+/// "stop routing new work," so a gear whose only instances are draining leaves
+/// the edge entirely rather than serving new requests a `503` drain response.
+/// Instances past their lease grace window are already absent from the snapshot.
+///
+/// "Serving" is decided only among [`is_proxyable`] instances: the edge routes
+/// HTTP, so a serving gRPC-only replica carries no route that could stand in for
+/// a starting REST replica of the same gear. Counting it would drop that REST
+/// replica and leave the gear with no usable HTTP endpoint.
+fn prefer_serving_per_gear(instances: Vec<ServiceInstanceInfo>) -> Vec<ServiceInstanceInfo> {
+    let gears_with_serving: HashSet<String> = instances
+        .iter()
+        .filter(|i| is_proxyable(i) && i.state.is_serving())
+        .map(|i| i.gear.clone())
+        .collect();
+    instances
+        .into_iter()
+        // A draining instance is shutting down: never route new work to it, even
+        // as a fallback, so a draining-only gear is dropped from the route table.
+        .filter(|i| i.state != InstanceState::Draining)
+        .filter(|i| i.state.is_serving() || !gears_with_serving.contains(&i.gear))
+        .collect()
 }
 
 /// Order-independent fingerprint over the proxyable instances (those with a
@@ -183,6 +228,27 @@ async fn reconcile_snapshot(
     instances: Vec<ServiceInstanceInfo>,
     state: &mut SyncState,
 ) {
+    // Whether the directory itself returned nothing, captured before the
+    // draining filter below can empty the set. An empty *directory* snapshot is
+    // a transient hiccup (keep the routes); a snapshot emptied only because
+    // every instance is draining must still prune (withdraw those routes).
+    let directory_reported_nothing = instances.is_empty();
+
+    // Bound the empty-snapshot valve (see `MAX_EMPTY_POLLS_PRESERVING_ROUTES`):
+    // preserve routes across a few empty polls, then let the prune run.
+    let preserve_empty_routes = if directory_reported_nothing {
+        state.consecutive_empty_polls = state.consecutive_empty_polls.saturating_add(1);
+        state.consecutive_empty_polls <= MAX_EMPTY_POLLS_PRESERVING_ROUTES
+    } else {
+        state.consecutive_empty_polls = 0;
+        false
+    };
+
+    // Route to serving instances only, per gear: the edge no longer
+    // proxies to a non-serving instance when a serving one exists. Instances
+    // whose lease expired past grace are already absent from the snapshot.
+    let instances = prefer_serving_per_gear(instances);
+
     // Fast path: if the proxyable snapshot is byte-for-byte the same as the one
     // we last applied in full, there is nothing to fetch or rebuild.
     let fingerprint = snapshot_fingerprint(&instances);
@@ -200,8 +266,11 @@ async fn reconcile_snapshot(
         complete,
     } = resolve_snapshot(directory, instances).await;
 
-    let (removals, empty_snapshot_valve) =
-        compute_removals(provider.registered_instances(), &desired);
+    let (removals, empty_snapshot_valve) = compute_removals(
+        provider.registered_instances(),
+        &desired,
+        preserve_empty_routes,
+    );
 
     provider.apply_snapshot(to_register, &removals).await;
 
@@ -242,7 +311,7 @@ async fn resolve_snapshot(
         let gear = GearName::from(inst.gear.as_str());
         desired.insert(GearInstance::new(gear.clone(), &inst.instance_id));
 
-        let proxyable = inst.rest_endpoint.is_some() && inst.openapi_spec_hash.is_some();
+        let proxyable = is_proxyable(&inst);
         match resolve_instance_spec(directory, &inst, &gear, &mut specs).await {
             Some(spec) => to_register.push(spec),
             None if proxyable => complete = false,
@@ -258,14 +327,21 @@ async fn resolve_snapshot(
 }
 
 /// Which registered instances to deregister given the desired set, plus whether
-/// the empty-snapshot safety valve fired: an empty snapshot while instances are
-/// still registered is treated as a transient directory hiccup (skip the prune
-/// this poll) rather than every gear vanishing at once.
+/// the empty-snapshot safety valve fired: a *directory* snapshot that is empty
+/// while instances are still registered is treated as a transient hiccup (skip
+/// the prune this poll) rather than every gear vanishing at once.
+///
+/// `preserve_empty_routes` (set by [`reconcile_snapshot`]) means the directory
+/// returned nothing and is still within [`MAX_EMPTY_POLLS_PRESERVING_ROUTES`].
+/// It is deliberately not keyed off `desired.is_empty()`: a `desired` set
+/// emptied because every instance is draining is a deliberate exclusion, so it
+/// must still prune and withdraw those draining routes.
 fn compute_removals(
     registered: Vec<GearInstance>,
     desired: &HashSet<GearInstance>,
+    preserve_empty_routes: bool,
 ) -> (Vec<GearInstance>, bool) {
-    if desired.is_empty() && !registered.is_empty() {
+    if preserve_empty_routes && !registered.is_empty() {
         tracing::warn!(
             registered = registered.len(),
             "directory snapshot is empty while instances are registered; \
@@ -359,8 +435,10 @@ async fn fetch_spec(directory: &dyn DirectoryClient, gear: &str) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::{
-        SyncState, snapshot_fingerprint, spawn_directory_sync, sync_once, sync_once_stateful,
+        MAX_EMPTY_POLLS_PRESERVING_ROUTES, SyncState, prefer_serving_per_gear,
+        snapshot_fingerprint, spawn_directory_sync, sync_once, sync_once_stateful,
     };
+    use cf_system_sdks::directory::InstanceState;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -370,11 +448,110 @@ mod tests {
     };
 
     use cf_system_sdks::directory::{
-        DirectoryClient, RegisterInstanceInfo, ServiceEndpoint, ServiceInstanceInfo,
+        DirectoryClient, RegisterInstanceInfo, ReportedState, ServiceEndpoint, ServiceInstanceInfo,
     };
     use tokio_util::sync::CancellationToken;
     use toolkit::directory::LocalDirectoryClient;
     use toolkit::runtime::GearManager;
+
+    /// A REST-proxyable instance (a REST endpoint and a published spec hash),
+    /// as the directory reports for a REST gear — the only kind the edge routes,
+    /// and so the only kind that decides serving vs fallback.
+    fn instance(gear: &str, id: &str, state: InstanceState) -> ServiceInstanceInfo {
+        ServiceInstanceInfo::new(gear, id)
+            .with_state(state)
+            .with_rest_endpoint(Some(ServiceEndpoint::new(format!(
+                "http://{gear}-{id}:8080"
+            ))))
+            .with_openapi_spec_hash(Some(format!("hash-{gear}")))
+    }
+
+    /// A gRPC-only instance (no REST endpoint, no spec hash): the edge cannot
+    /// route it, so it must not influence REST serving/fallback selection.
+    fn grpc_only_instance(gear: &str, id: &str, state: InstanceState) -> ServiceInstanceInfo {
+        ServiceInstanceInfo::new(gear, id).with_state(state)
+    }
+
+    #[test]
+    fn prefer_serving_keeps_only_serving_when_any_serves() {
+        let picked = prefer_serving_per_gear(vec![
+            instance("billing", "a", InstanceState::Healthy),
+            instance("billing", "b", InstanceState::Draining),
+            instance("billing", "c", InstanceState::Quarantined),
+        ]);
+        let ids: Vec<_> = picked.iter().map(|i| i.instance_id.as_str()).collect();
+        assert_eq!(ids, ["a"], "only the serving instance is routed to");
+    }
+
+    #[test]
+    fn prefer_serving_falls_back_to_all_when_none_serve() {
+        let mut picked = prefer_serving_per_gear(vec![
+            instance("billing", "a", InstanceState::Registered),
+            instance("billing", "b", InstanceState::Quarantined),
+        ]);
+        picked.sort_by(|x, y| x.instance_id.cmp(&y.instance_id));
+        let ids: Vec<_> = picked.iter().map(|i| i.instance_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["a", "b"],
+            "with no serving instance, every visible instance is kept"
+        );
+    }
+
+    #[test]
+    fn prefer_serving_is_per_gear() {
+        // One gear serving, another with none serving: each decided on its own.
+        let picked = prefer_serving_per_gear(vec![
+            instance("billing", "a", InstanceState::Healthy),
+            instance("billing", "b", InstanceState::Registered),
+            instance("catalog", "c", InstanceState::Registered),
+        ]);
+        let mut kept: Vec<_> = picked.iter().map(|i| i.instance_id.as_str()).collect();
+        kept.sort_unstable();
+        assert_eq!(
+            kept,
+            ["a", "c"],
+            "serving-only for billing, fallback for catalog"
+        );
+    }
+
+    #[test]
+    fn prefer_serving_ignores_a_grpc_only_serving_replica() {
+        // A serving gRPC-only replica carries no HTTP route, so it must not mark
+        // its gear as "serving" and suppress a starting REST replica — otherwise
+        // the gear would lose its only usable REST endpoint from the edge.
+        let picked = prefer_serving_per_gear(vec![
+            grpc_only_instance("billing", "grpc", InstanceState::Healthy),
+            instance("billing", "rest", InstanceState::Registered),
+        ]);
+        let ids: Vec<_> = picked.iter().map(|i| i.instance_id.as_str()).collect();
+        assert!(
+            ids.contains(&"rest"),
+            "a starting REST replica must survive a serving gRPC-only replica, got {ids:?}"
+        );
+    }
+
+    #[test]
+    fn prefer_serving_drops_draining_even_as_fallback() {
+        // A gear whose only instance is draining leaves the edge entirely: a
+        // draining instance must never be a routing target, not even a fallback
+        // (otherwise a gracefully-stopping gear keeps its route and answers new
+        // requests a 503 drain response instead of the route being withdrawn).
+        let picked =
+            prefer_serving_per_gear(vec![instance("billing", "a", InstanceState::Draining)]);
+        assert!(
+            picked.is_empty(),
+            "a draining-only gear must be dropped from the edge, got {picked:?}"
+        );
+
+        // Draining is dropped while a co-located not-yet-serving instance stays.
+        let picked = prefer_serving_per_gear(vec![
+            instance("billing", "a", InstanceState::Draining),
+            instance("billing", "b", InstanceState::Registered),
+        ]);
+        let ids: Vec<_> = picked.iter().map(|i| i.instance_id.as_str()).collect();
+        assert_eq!(ids, ["b"], "draining dropped, starting kept");
+    }
 
     /// Wraps a [`ToolKitGatewayProvider`] and counts how many times
     /// [`GatewayProvider::apply_snapshot`] actually runs, so tests can assert
@@ -733,6 +910,96 @@ mod tests {
 
         assert_eq!(registry.instance_count(), 1);
         assert!(registry.match_path("/calc/v1/add").is_some());
+    }
+
+    #[tokio::test]
+    async fn sync_prunes_dead_routes_after_repeated_empty_snapshots() {
+        // The empty-snapshot valve tolerates a brief hiccup, but a directory
+        // that stays empty (the last instance crashed and its lease was swept)
+        // must eventually prune — otherwise the edge proxies a dead endpoint
+        // forever. Uses a persistent `SyncState` so the empty-poll count carries
+        // across polls as it does in the real loop.
+        let mgr = Arc::new(GearManager::new());
+        let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
+
+        let calc = register(
+            dir.as_ref(),
+            "calc",
+            "http://calc:8080",
+            public_spec("calc", "/calc/v1/add"),
+        )
+        .await;
+
+        let registry = Arc::new(ProxyRegistry::new());
+        let provider = ToolKitGatewayProvider::new(Arc::clone(&registry));
+        let mut state = SyncState::default();
+        sync_once_stateful(&provider, dir.as_ref(), &mut state)
+            .await
+            .unwrap();
+        assert_eq!(registry.instance_count(), 1);
+
+        // The instance disappears; the directory reports empty from now on.
+        dir.deregister_instance("calc", &calc).await.unwrap();
+        assert!(dir.list_all_instances().await.unwrap().is_empty());
+
+        // Within the bound the valve preserves the route across empty polls.
+        for _ in 0..MAX_EMPTY_POLLS_PRESERVING_ROUTES {
+            sync_once_stateful(&provider, dir.as_ref(), &mut state)
+                .await
+                .unwrap();
+            assert_eq!(
+                registry.instance_count(),
+                1,
+                "the route is preserved while within the empty-poll bound",
+            );
+        }
+
+        // One empty poll past the bound finally withdraws the dead route.
+        sync_once_stateful(&provider, dir.as_ref(), &mut state)
+            .await
+            .unwrap();
+        assert_eq!(
+            registry.instance_count(),
+            0,
+            "a persistently empty directory must eventually withdraw dead routes",
+        );
+        assert!(registry.match_path("/calc/v1/add").is_none());
+    }
+
+    #[tokio::test]
+    async fn sync_withdraws_routes_when_all_instances_are_draining() {
+        // A non-empty directory snapshot whose only instance is draining must
+        // withdraw the route. The draining filter empties the desired set, but
+        // the directory did report an instance, so the empty-snapshot safety
+        // valve must NOT fire and preserve a route to a draining instance.
+        let mgr = Arc::new(GearManager::new());
+        let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
+
+        let calc = register(
+            dir.as_ref(),
+            "calc",
+            "http://calc:8080",
+            public_spec("calc", "/calc/v1/add"),
+        )
+        .await;
+
+        let registry = Arc::new(ProxyRegistry::new());
+        let provider = ToolKitGatewayProvider::new(Arc::clone(&registry));
+        sync_once(&provider, dir.as_ref()).await.unwrap();
+        assert_eq!(registry.instance_count(), 1);
+
+        // The only instance flips to Draining (still observable in the snapshot).
+        dir.heartbeat("calc", &calc, Some(ReportedState::Draining))
+            .await
+            .unwrap();
+        sync_once(&provider, dir.as_ref()).await.unwrap();
+
+        assert_eq!(
+            registry.instance_count(),
+            0,
+            "a draining-only snapshot must withdraw its routes, not preserve them via the empty-snapshot valve",
+        );
+        assert!(registry.match_path("/calc/v1/add").is_none());
     }
 
     #[tokio::test]

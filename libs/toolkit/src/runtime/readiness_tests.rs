@@ -106,6 +106,31 @@ async fn unhealthy_check_forces_not_ready() {
 }
 
 #[tokio::test]
+async fn reported_state_follows_full_readiness_not_just_deps() {
+    use crate::runtime::ReportedStateSource;
+    use cf_system_sdks::directory::ReportedState;
+
+    let reported = |state| async { ReportedStateSource::Readiness(state).reported_state().await };
+
+    // Deps resolved but a healthcheck is Unhealthy: the directory-reported state
+    // MUST be Starting (not Serving), so the edge does not route to a gear that
+    // is failing its readiness check (the amended state mapping).
+    let unhealthy = ReadinessState::new(
+        Vec::<String>::new(),
+        registry_with("cache", "cache-warm", HealthcheckResult::unhealthy("cold")),
+    );
+    unhealthy.mark_startup_complete();
+    assert_eq!(reported(unhealthy).await, ReportedState::Starting);
+
+    // All green -> Serving; then draining wins.
+    let healthy = ReadinessState::new(Vec::<String>::new(), empty_registry());
+    healthy.mark_startup_complete();
+    assert_eq!(reported(Arc::clone(&healthy)).await, ReportedState::Serving);
+    healthy.set_draining(true);
+    assert_eq!(reported(healthy).await, ReportedState::Draining);
+}
+
+#[tokio::test]
 async fn degraded_check_stays_ready_but_reported() {
     let state = ReadinessState::new(
         Vec::<String>::new(),

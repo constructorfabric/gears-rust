@@ -36,7 +36,7 @@ use std::time::Duration;
 use cf_system_sdks::directory::{
     DeregisterInstanceRequest, DirectoryService, DirectoryServiceServer, GetOpenApiSpecRequest,
     GetOpenApiSpecResponse, HeartbeatRequest, ListAllInstancesRequest, ListAllInstancesResponse,
-    ListInstancesRequest, ListInstancesResponse, RegisterInstanceRequest,
+    ListInstancesRequest, ListInstancesResponse, RegisterInstanceRequest, RegisterInstanceResponse,
     ResolveGrpcServiceRequest, ResolveGrpcServiceResponse, ResolveRestServiceRequest,
     ResolveRestServiceResponse,
 };
@@ -98,8 +98,8 @@ impl DirectoryService for StubDirectory {
     async fn register_instance(
         &self,
         _request: Request<RegisterInstanceRequest>,
-    ) -> Result<Response<()>, Status> {
-        Ok(Response::new(()))
+    ) -> Result<Response<RegisterInstanceResponse>, Status> {
+        Ok(Response::new(RegisterInstanceResponse::default()))
     }
 
     async fn deregister_instance(

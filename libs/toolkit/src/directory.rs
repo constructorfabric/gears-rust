@@ -6,7 +6,9 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::runtime::{Endpoint, GearInstance, GearManager, GrpcServiceNameConflict};
+use crate::runtime::{
+    Endpoint, GearInstance, GearManager, GrpcServiceNameConflict, ReportedState as RtReportedState,
+};
 
 /// Compute a content token for an `OpenAPI` document, used to detect changes.
 ///
@@ -33,9 +35,19 @@ fn openapi_spec_hash(spec: &str) -> String {
 // Re-export all types from contracts - this is the single source of truth
 pub use cf_system_sdks::directory::{
     DirectoryClient, DirectoryInvalidArgument, DirectoryNotFound, DirectoryPermissionDenied,
-    DirectoryServiceNameConflict, GrpcServiceInfo, InstanceState, LabelSelector,
-    RegisterInstanceInfo, ServiceEndpoint, ServiceInstanceInfo,
+    DirectoryServiceNameConflict, GrpcServiceInfo, InstanceState, LabelSelector, RegisterAck,
+    RegisterInstanceInfo, ReportedState, ServiceEndpoint, ServiceInstanceInfo,
 };
+
+/// Map the SDK's domain [`ReportedState`] onto the runtime one carried on a
+/// [`GearInstance`]'s lease.
+fn domain_reported_to_runtime(reported: ReportedState) -> RtReportedState {
+    match reported {
+        ReportedState::Starting => RtReportedState::Starting,
+        ReportedState::Serving => RtReportedState::Serving,
+        ReportedState::Draining => RtReportedState::Draining,
+    }
+}
 
 /// Project the live runtime [`crate::runtime::InstanceState`] onto the domain
 /// [`InstanceState`] carried on `ServiceInstanceInfo`, so `resolve_by_labels`
@@ -234,6 +246,12 @@ impl DirectoryClient for LocalDirectoryClient {
             instance = instance.with_labels(info.labels);
         }
 
+        // Carry the declared reported state onto the record, so
+        // registration sets the lease's reported state accordingly.
+        if let Some(reported) = info.reported_state {
+            instance = instance.with_reported_state(domain_reported_to_runtime(reported));
+        }
+
         // Register the instance, enforcing single-gear ownership of every gRPC
         // service name it advertises atomically (check + insert under one lock)
         // so two gears cannot race to claim the same name. A conflict is a typed
@@ -256,6 +274,16 @@ impl DirectoryClient for LocalDirectoryClient {
         Ok(())
     }
 
+    async fn register_with_lease(&self, info: RegisterInstanceInfo) -> Result<RegisterAck> {
+        self.register_instance(info).await?;
+        // In-process registration always gets the directory's configured lease
+        // TTL, so an in-process registrar (e.g. Flight Control's own gears) can
+        // pace its renewals the same way an OoP worker does.
+        Ok(RegisterAck {
+            lease_ttl: Some(self.mgr.lease_ttl()),
+        })
+    }
+
     async fn deregister_instance(&self, gear: &str, instance_id: &str) -> Result<()> {
         let instance_id = Uuid::parse_str(instance_id)
             .map_err(|e| anyhow::anyhow!("Invalid instance_id '{instance_id}': {e}"))?;
@@ -264,11 +292,28 @@ impl DirectoryClient for LocalDirectoryClient {
     }
 
     async fn send_heartbeat(&self, gear: &str, instance_id: &str) -> Result<()> {
-        let instance_id = Uuid::parse_str(instance_id)
+        self.heartbeat(gear, instance_id, None).await
+    }
+
+    async fn heartbeat(
+        &self,
+        gear: &str,
+        instance_id: &str,
+        reported: Option<ReportedState>,
+    ) -> Result<()> {
+        let id = Uuid::parse_str(instance_id)
             .map_err(|e| anyhow::anyhow!("Invalid instance_id '{instance_id}': {e}"))?;
-        self.mgr
-            .update_heartbeat(gear, instance_id, std::time::Instant::now());
-        Ok(())
+        // A heartbeat for an instance the directory does not know returns
+        // NOT_FOUND, so the presence loop re-registers after one
+        // heartbeat instead of waiting on a self-heal timer. A `None` reported
+        // state counts as Serving, preserving today's behaviour for callers
+        // that only heartbeat.
+        let reported = reported.map(domain_reported_to_runtime);
+        if self.mgr.heartbeat(gear, id, reported) {
+            Ok(())
+        } else {
+            Err(DirectoryNotFound::new(format!("instance {gear}/{instance_id}")).into())
+        }
     }
 }
 
@@ -664,7 +709,7 @@ mod tests {
 
         // A heartbeat transitions it to Healthy; the state must be projected
         // onto the resolve result so a caller can filter on it.
-        dir.update_heartbeat("worker", instance_id, std::time::Instant::now());
+        assert!(dir.heartbeat("worker", instance_id, None));
         let matched = api
             .resolve_by_labels("worker", &LabelSelector::new().with("shard", "7"))
             .await

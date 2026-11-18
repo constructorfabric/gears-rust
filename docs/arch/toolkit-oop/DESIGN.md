@@ -370,10 +370,13 @@ What is **missing** and needs to be added:
   phase; sets `PeerAuthenticated` for workload policy (cpt-cf-adr-platform-plane-auth).
 - Attach `security_context_middleware` (tenant plane) that delegates forwarded-JWT validation to the AuthN Resolver and reconstructs
   `SecurityContext` from the resolver result; it does not perform validation itself.
-- Maintain DirectoryService presence via a **single** background task (`oop_registration::presence_loop`) that owns
-  registration, periodic heartbeats, and idempotent self-heal re-registration — one writer per instance record, so
-  heartbeat and re-registration can never race to conflicting liveness state.
-- Deregister from DirectoryService on graceful shutdown.
+- Maintain DirectoryService presence via a per-process **`PresenceManager`** (`runtime::presence_manager`, ADR-0011)
+  that owns **lease renewal** for every record the process registered, whoever wrote it (the OoP presence writer,
+  grpc-hub's registrar, `RestAdvertiser`, event-broker roles). Each record carries a *lease* (renewed on register and
+  every heartbeat, at `lease_ttl/3`) and a *reported state* (`Starting`/`Serving`/`Draining`) from the process
+  readiness signal; the directory derives the observable `InstanceState` from both at read time. A heartbeat for an
+  unknown instance returns `NOT_FOUND`, so the writer re-registers within one heartbeat.
+- Deregister from DirectoryService on graceful shutdown (owned by the `PresenceManager`, after the drain window).
 - The OoP gear does **not** call `GatewayProvider` itself; edge registration is directory-driven. The built-in edge
   discovers instances via `ListAllInstances` and invokes `GatewayProvider::register_routes()` on their behalf. (An
   external-provider adapter may instead call `GatewayProvider` directly to register/deregister public routes.)
@@ -385,7 +388,9 @@ mirrors `HostRuntime`'s in-process behavior (`libs/toolkit/src/runtime/host_runt
 extended for the cross-process case:
 
 1. **Readiness flip** — set `/readyz` to `503` immediately so kubernetes / gateway upstream pulls the instance out of
-   the load-balancer pool. Do NOT close the HTTP listener yet — in-flight requests must finish.
+   the load-balancer pool. Do NOT close the HTTP listener yet — in-flight requests must finish. The `PresenceManager`
+   reports `Draining` immediately and keeps renewing through the drain, so the directory and edge see `Draining`
+   rather than a record that vanishes at deregister.
 2. **Stop accepting new work** — refuse new requests with `503 Service Unavailable + Retry-After`. Background tasks
    (queue consumers, schedulers) stop pulling new work but keep processing what they hold.
 3. **Drain in-flight requests** — wait up to `drain_timeout` (config, default 30s) for active handlers to complete.
@@ -398,8 +403,9 @@ extended for the cross-process case:
    process this is the in-process `HostRuntime` topo order; across processes it relies on (4) — the orchestrator /
    k8s preStop hook is responsible for ordering pod termination via dependency-aware shutdown, NOT via simultaneous
    `SIGTERM` blasts.
-6. **Stop runtime services** — the presence task (heartbeat + registration/self-heal, stopped when the root token is
-   cancelled) and the internal-auth refresh task.
+6. **Stop runtime services** — the internal-auth refresh task. (The `PresenceManager`'s renewal loop runs on its own
+   token so step 1's `Draining` stays visible for the whole drain; `OopHttpServer::join` quiesces that loop *immediately
+   before* the step-4 deregistration, not after, so an in-flight renewal cannot re-register a record once it is removed.)
 7. **Close HTTP listener and exit.**
 
 In Profile 1 (in-process), steps 1-3 are no-ops (no LB to flip); the reverse-topo STOP loop in `HostRuntime` handles
@@ -1899,7 +1905,7 @@ Flight Control itself.** OoP gears register with Flight Control's directory and 
 
 | Component | Role | State | Notes |
 |-----------|------|-------|-------|
-| service-discovery (DirectoryService) | Service registration + discovery | No DB; in-memory registry. Gears re-register on heartbeat, so restart recovery is handled. | Serves gRPC via grpc-hub; its REST surface (co-hosted on api-gateway) enables k8s-native discovery. **One per installation** — see below. |
+| service-discovery (DirectoryService) | Service registration + discovery | No DB; in-memory, lease-based registry (ADR-0011). Each record carries a lease renewed by register/heartbeat and a reported state; the observable state is derived at read time and a `stateful` sweeper drops records past `ttl + grace`. A heartbeat for an unknown instance returns `NOT_FOUND`, so a worker re-registers within one heartbeat after a restart. `lease.ttl`/`lease.grace` default to 30s. | Serves gRPC via grpc-hub; its REST surface (co-hosted on api-gateway) enables k8s-native discovery. **One per installation** — see below. |
 | grpc-hub | gRPC transport for the directory + platform-plane RPCs | Stateless. | Hosts the DirectoryService gRPC endpoint. |
 | api-gateway | Edge + REST host: reverse-proxies exposed OoP routes and co-hosts the other control-plane gears' REST routes (directory, types-registry) on one HTTP server | No DB; in-memory route table populated from directory registrations. | Built-in edge in Profile 2 and Profile 3 Mode A; in Mode B an external gateway (Kong/Tyk) replaces the edge. |
 | types-registry | GTS catalogue | Database-backed admission and reads; the legacy in-memory catalogue remains during migration. | System startup prepares registry seeds; application GTS publication waits for admission before application `init`. Legacy finalization runs after application `init`. |

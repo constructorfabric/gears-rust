@@ -63,7 +63,8 @@ use crate::registry::{
     RestApiCap, RunnableCap, SystemCap,
 };
 use crate::runtime::{
-    GearManager, GrpcInstallerStore, OopSpawnOptions, PREPARATION_GATE, SystemContext,
+    GearManager, GrpcInstallerStore, OopSpawnOptions, PREPARATION_GATE, PresenceManager,
+    ReportedStateSource, SystemContext,
 };
 
 #[cfg(feature = "db")]
@@ -221,6 +222,11 @@ pub struct HostRuntime {
     /// In-process REST provider advertisement. In `OoP` serving, presence +
     /// deregister is owned by `oop_serve`, so it stays unused.
     advertiser: Arc<RestAdvertiser>,
+    /// Per-process lease renewal for every in-process directory record.
+    /// Created lazily once a `DirectoryClient` is available (it is
+    /// published by `service-discovery`'s init), published in `client_hub` so
+    /// every in-process registrar renews through one manager.
+    presence: parking_lot::Mutex<Option<Arc<PresenceManager>>>,
     /// Gears whose `start` the runtime called: the ones the stop phase stops,
     /// on shutdown and after a failed startup alike.
     start_called: parking_lot::Mutex<HashSet<&'static str>>,
@@ -242,6 +248,15 @@ pub struct HostRuntime {
     /// Cancels `owned` when the runtime is dropped — the lifecycle future
     /// abandoned.
     _owned_on_drop: tokio_util::sync::DropGuard,
+    /// Drives the process [`PresenceManager`]'s renewal loop. **Independent of
+    /// `owned`/`cancel`** (both cancel the instant shutdown begins), so renewal
+    /// keeps reporting `Draining` through the whole drain window; it is stopped
+    /// only at the end of [`shut_down`](Self::shut_down), after the stop phase,
+    /// so no record is left `Healthy` while HTTP drains. Cancelled on drop too.
+    presence_cancel: CancellationToken,
+    /// Cancels `presence_cancel` when the runtime is dropped without a clean
+    /// shutdown, so the renewal loop never outlives the runtime.
+    _presence_on_drop: tokio_util::sync::DropGuard,
     #[allow(dead_code)]
     db_options: DbOptions,
     /// `OoP` gear spawn configuration and backend
@@ -278,6 +293,10 @@ impl HostRuntime {
 
         let owned = cancel.child_token();
         let owned_on_drop = owned.clone().drop_guard();
+        // Independent of `cancel`/`owned` so the presence loop can keep renewing
+        // through the shutdown drain; see the field doc.
+        let presence_cancel = CancellationToken::new();
+        let presence_on_drop = presence_cancel.clone().drop_guard();
         dep_checker.register_dep(PREPARATION_GATE);
 
         // Build the context builder that will resolve per-gear DbHandles
@@ -305,6 +324,7 @@ impl HostRuntime {
             dep_checker,
             gts_admitted,
             advertiser: Arc::new(RestAdvertiser::new(instance_id, &owned)),
+            presence: parking_lot::Mutex::new(None),
             start_called: parking_lot::Mutex::new(HashSet::new()),
             wired: parking_lot::Mutex::new(HashSet::new()),
             pending_targets: PendingTargets::default(),
@@ -312,6 +332,8 @@ impl HostRuntime {
             consumer_registrations: None,
             owned,
             _owned_on_drop: owned_on_drop,
+            presence_cancel,
+            _presence_on_drop: presence_on_drop,
             cancel,
             db_options,
             oop_options,
@@ -1712,6 +1734,14 @@ impl HostRuntime {
     /// it never cancels the caller's token.
     async fn shut_down(&self) -> Result<(), RegistryError> {
         self.dep_checker.set_draining(true);
+        // Push an immediate `Draining` heartbeat before the drain window below,
+        // so a stopping instance stops getting new work right away instead of
+        // reading `Healthy` until its lease lapses. The loop runs on
+        // `presence_cancel` (not `owned`), so it survives to report it;
+        // `shutdown_presence` stops it after the stop phase.
+        if let Some(pm) = self.presence.lock().clone() {
+            pm.begin_drain();
+        }
         self.owned.cancel();
         // Stop discovery traffic before joining a potentially slow HTTP drain.
         if tokio::time::timeout(self.shutdown_deadline, self.deregister_rest_providers())
@@ -1745,7 +1775,27 @@ impl HostRuntime {
                 );
             }
         }
-        self.run_stop_phase_guarded().await
+        let stopped = self.run_stop_phase_guarded().await;
+        // Stop presence last: the loop reported `Draining` through the whole
+        // drain above (its records were untracked by the REST advertiser and
+        // grpc-hub as each deregistered). Stopping it only now — after the stop
+        // phase — keeps it the single writer and clears any record still left.
+        self.shutdown_presence().await;
+        stopped
+    }
+
+    /// Stop the presence renewal loop and deregister any record still tracked.
+    ///
+    /// Called at the very end of [`shut_down`](Self::shut_down): by now the REST
+    /// advertiser and grpc-hub have each deregistered (and untracked) their own
+    /// records, so this usually finds nothing left, but it guarantees no record
+    /// outlives the runtime still reporting `Draining`.
+    async fn shutdown_presence(&self) {
+        let pm = self.presence.lock().clone();
+        self.presence_cancel.cancel();
+        if let Some(pm) = pm {
+            pm.deregister_all().await;
+        }
     }
 
     /// `OoP` SPAWN phase: spawn configured children after parent preparation,
@@ -1910,7 +1960,8 @@ impl HostRuntime {
                 return Ok(());
             };
 
-            self.advertiser.enable(dir, endpoint);
+            let presence = self.ensure_presence(&dir);
+            self.advertiser.enable(presence, dir, endpoint);
         }
         for gear in rest_gears {
             self.advertiser.advertise(gear).await;
@@ -1934,6 +1985,36 @@ impl HostRuntime {
             })
             .map(|e| e.name)
             .collect()
+    }
+
+    /// The process [`PresenceManager`], created on first use once a
+    /// `DirectoryClient` is available.
+    ///
+    /// Spawns its renewal loop on `presence_cancel` (independent of `owned`, so
+    /// it keeps renewing — and reporting `Draining` — through the whole shutdown
+    /// drain; [`shut_down`](Self::shut_down) stops it only after the stop phase)
+    /// and publishes it in `client_hub`, so every in-process registrar — the
+    /// REST advertiser, grpc-hub's registrar and event-broker's role
+    /// registration — renews through one manager and no in-process record's
+    /// lease silently lapses.
+    fn ensure_presence(&self, dir: &Arc<dyn crate::DirectoryClient>) -> Arc<PresenceManager> {
+        let mut slot = self.presence.lock();
+        if let Some(pm) = slot.as_ref() {
+            return Arc::clone(pm);
+        }
+        // Fallback heartbeat interval when a directory returns no lease TTL;
+        // once a registration learns the TTL the manager renews at ttl/3. The
+        // in-process host has no aggregate readiness object, so the reported
+        // state comes from its dependency/drain checker.
+        let pm = PresenceManager::new(
+            Arc::clone(dir),
+            ReportedStateSource::Dependencies(Arc::clone(&self.dep_checker)),
+            std::time::Duration::from_secs(5),
+        );
+        tokio::spawn(Arc::clone(&pm).run(self.presence_cancel.child_token()));
+        self.client_hub.register::<PresenceManager>(Arc::clone(&pm));
+        *slot = Some(Arc::clone(&pm));
+        pm
     }
 
     /// Deregister this process's REST providers from the directory on shutdown,
@@ -2062,6 +2143,16 @@ impl HostRuntime {
         self.run_init_phase_for(&system).await?;
         self.wire_system_clients(&regs)?;
         self.run_post_init_phase_for(&system).await?;
+
+        // Bring up the per-process presence manager now the directory client is
+        // in the ClientHub (published by service-discovery's init), so every
+        // in-process registrar that starts next — grpc-hub's registrar below,
+        // then the REST advertiser — renews its lease through one manager.
+        // Without a directory (e.g. Profile 1 with discovery off)
+        // there is nothing to renew.
+        if let Ok(dir) = self.client_hub.get::<dyn crate::DirectoryClient>() {
+            let _ = self.ensure_presence(&dir);
+        }
 
         // Serve system routes on the listener already hosting probes.
         let mut grpc_seen = HashSet::new();
@@ -2255,6 +2346,13 @@ impl HostRuntime {
             self.cancel.clone(),
         )
         .await?;
+
+        // Publish the server's presence manager so every in-process registrar
+        // that runs during the startup phases below — grpc-hub's registrar,
+        // event-broker's role registration — renews its lease through one
+        // manager instead of registering without a renewer.
+        self.client_hub
+            .register::<PresenceManager>(server.presence_manager());
 
         self.spawn_drain_watcher();
         let mut composition = OopComposition::default();

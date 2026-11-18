@@ -9,6 +9,7 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 use super::RestAdvertiser;
+use crate::runtime::{DependencyChecker, PresenceManager, ReportedStateSource};
 use crate::{DirectoryClient, RegisterInstanceInfo, ServiceEndpoint, ServiceInstanceInfo};
 
 #[derive(Default)]
@@ -85,7 +86,19 @@ fn setup(mut directory: Directory) -> (Arc<RestAdvertiser>, Arc<Directory>) {
         instance,
         &tokio_util::sync::CancellationToken::new(),
     ));
-    advertiser.enable(directory.clone(), "http://registry:8080".to_owned());
+    // A presence manager that renews through the same directory. Its renewal
+    // loop is not spawned here, so these tests exercise registration/deregister
+    // only (the directory mock panics if anyone heartbeats).
+    let presence = PresenceManager::new(
+        directory.clone(),
+        ReportedStateSource::Dependencies(Arc::new(DependencyChecker::new())),
+        Duration::from_secs(5),
+    );
+    advertiser.enable(
+        presence,
+        directory.clone(),
+        "http://registry:8080".to_owned(),
+    );
     (advertiser, directory)
 }
 

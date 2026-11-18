@@ -19,13 +19,14 @@ pub mod directory {
 // Re-export common types for DirectoryService
 pub use directory::directory_service_client::DirectoryServiceClient;
 pub use directory::directory_service_server::{DirectoryService, DirectoryServiceServer};
-// The generated `InstanceState` enum is re-exported under an alias so it does
-// not collide with the domain `api::InstanceState` at the crate root.
+// The generated `InstanceState` / `ReportedState` enums are re-exported under
+// aliases so they do not collide with the domain `api` types at the crate root.
 pub use directory::InstanceState as ProtoInstanceState;
+pub use directory::ReportedState as ProtoReportedState;
 pub use directory::{
     DeregisterInstanceRequest, GetOpenApiSpecRequest, GetOpenApiSpecResponse, GrpcServiceEndpoint,
     HeartbeatRequest, InstanceInfo, ListAllInstancesRequest, ListAllInstancesResponse,
-    ListInstancesRequest, ListInstancesResponse, RegisterInstanceRequest,
+    ListInstancesRequest, ListInstancesResponse, RegisterInstanceRequest, RegisterInstanceResponse,
     ResolveGrpcServiceRequest, ResolveGrpcServiceResponse, ResolveRestServiceRequest,
     ResolveRestServiceResponse,
 };

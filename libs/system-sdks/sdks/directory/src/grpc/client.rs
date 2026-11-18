@@ -7,11 +7,14 @@ use async_trait::async_trait;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
-use crate::ProtoInstanceState;
+use std::time::Duration;
+
 use crate::api::{
     DirectoryClient, DirectoryInvalidArgument, DirectoryNotFound, DirectoryPermissionDenied,
-    InstanceState, LabelSelector, RegisterInstanceInfo, ServiceEndpoint, ServiceInstanceInfo,
+    InstanceState, LabelSelector, RegisterAck, RegisterInstanceInfo, ReportedState,
+    ServiceEndpoint, ServiceInstanceInfo,
 };
+use crate::{ProtoInstanceState, ProtoReportedState};
 use std::collections::BTreeMap;
 use toolkit_transport_grpc::InternalAuthInterceptor;
 use toolkit_transport_grpc::client::{GrpcClientConfig, connect_lazy, connect_with_retry};
@@ -21,6 +24,15 @@ use crate::{
     HeartbeatRequest, InstanceInfo, ListAllInstancesRequest, ListInstancesRequest,
     RegisterInstanceRequest, ResolveGrpcServiceRequest, ResolveRestServiceRequest,
 };
+
+/// Map a domain [`ReportedState`] onto the proto discriminant for the wire.
+fn reported_to_proto(reported: ReportedState) -> i32 {
+    match reported {
+        ReportedState::Starting => ProtoReportedState::Starting as i32,
+        ReportedState::Serving => ProtoReportedState::Serving as i32,
+        ReportedState::Draining => ProtoReportedState::Draining as i32,
+    }
+}
 
 /// The directory channel wrapped with the platform-plane
 /// [`InternalAuthInterceptor`], which attaches the gear's internal token
@@ -367,6 +379,10 @@ impl DirectoryClient for DirectoryGrpcClient {
     }
 
     async fn register_instance(&self, info: RegisterInstanceInfo) -> Result<()> {
+        self.register_with_lease(info).await.map(|_| ())
+    }
+
+    async fn register_with_lease(&self, info: RegisterInstanceInfo) -> Result<RegisterAck> {
         let mut client = self.inner.clone();
 
         // Convert gRPC service endpoints
@@ -387,14 +403,31 @@ impl DirectoryClient for DirectoryGrpcClient {
             rest_endpoint_uri: info.rest_endpoint.map(|ep| ep.uri),
             openapi_spec: info.openapi_spec,
             labels: info.labels.into_iter().collect(),
+            reported_state: info.reported_state.map(reported_to_proto),
         };
 
-        client
+        let gear_for_log = req.gear_name.clone();
+        let response = client
             .register_instance(tonic::Request::new(req))
             .await
             .map_err(|e| call_error("register_instance", &e))?;
 
-        Ok(())
+        // A zero TTL means the directory returned none (e.g. an older server
+        // that answered Empty, which decodes as lease_ttl_ms = 0): the caller
+        // falls back to its configured heartbeat interval.
+        let lease_ttl_ms = response.into_inner().lease_ttl_ms;
+        if lease_ttl_ms == 0 {
+            // Unexpected in a co-versioned deployment; flag it rather than
+            // silently flapping on the fallback cadence.
+            tracing::warn!(
+                gear = %gear_for_log,
+                "directory granted no lease TTL on registration; using the fallback \
+                 heartbeat interval (expected only against a pre-lease DirectoryService)"
+            );
+        }
+        Ok(RegisterAck {
+            lease_ttl: (lease_ttl_ms > 0).then(|| Duration::from_millis(lease_ttl_ms)),
+        })
     }
 
     async fn deregister_instance(&self, gear: &str, instance_id: &str) -> Result<()> {
@@ -414,20 +447,43 @@ impl DirectoryClient for DirectoryGrpcClient {
     }
 
     async fn send_heartbeat(&self, gear: &str, instance_id: &str) -> Result<()> {
+        self.heartbeat(gear, instance_id, None).await
+    }
+
+    async fn heartbeat(
+        &self,
+        gear: &str,
+        instance_id: &str,
+        reported: Option<ReportedState>,
+    ) -> Result<()> {
         let mut client = self.inner.clone();
 
         let req = HeartbeatRequest {
             gear_name: gear.to_owned(),
             instance_id: instance_id.to_owned(),
+            reported_state: reported.map(reported_to_proto),
         };
 
         client
             .heartbeat(tonic::Request::new(req))
             .await
-            .map_err(|e| call_error("heartbeat", &e))?;
+            .map_err(|e| heartbeat_error(gear, instance_id, &e))?;
 
         Ok(())
     }
+}
+
+/// Map a `Heartbeat` RPC's `tonic::Status` onto the typed sentinels.
+///
+/// A heartbeat for an instance the directory does not know returns `NotFound`;
+/// the client surfaces it as [`DirectoryNotFound`] so the presence
+/// loop re-registers after one heartbeat instead of waiting on a self-heal
+/// timer. Every other status falls through to [`call_error`].
+fn heartbeat_error(gear: &str, instance_id: &str, status: &tonic::Status) -> anyhow::Error {
+    if status.code() == tonic::Code::NotFound {
+        return DirectoryNotFound::new(format!("instance {gear}/{instance_id}")).into();
+    }
+    call_error("heartbeat", status)
 }
 
 /// Convert a proto `InstanceInfo` into the domain [`ServiceInstanceInfo`].

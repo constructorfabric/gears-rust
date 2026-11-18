@@ -68,20 +68,68 @@ impl Endpoint {
     }
 }
 
+/// Observable state of an instance, *derived* from its lease and reported
+/// state at read time (`cpt-cf-adr-directory-persistence-and-replication`).
+/// The directory never writes this; it is computed by
+/// [`GearInstance::observed_state_at`] from the
+/// [`ReportedState`] the instance last declared and whether its lease is still
+/// valid.
+///
+/// Only [`Healthy`](Self::Healthy) (and the deprecated [`Ready`](Self::Ready),
+/// kept for wire compatibility and still read as serving) are **serving**.
+/// [`Quarantined`](Self::Quarantined) now means *the lease expired* (missed
+/// heartbeats), not a failing readiness check — a failing readiness check is
+/// reported as `Starting` and reads as [`Registered`](Self::Registered). A
+/// record whose lease expired more than `grace` ago is not observable at all
+/// (see [`observed_state_at`](GearInstance::observed_state_at)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InstanceState {
     Registered,
+    /// Deprecated: no longer produced by the directory, kept in the enum for
+    /// wire compatibility and still treated as serving when read.
     Ready,
     Healthy,
     Quarantined,
     Draining,
 }
 
-/// Runtime state of an instance (guarded by `RwLock` for safe mutation)
+/// What an instance declares about itself in `RegisterInstance` / `Heartbeat`.
+/// The directory derives the observable [`InstanceState`] from this
+/// plus the lease; it is the only liveness signal an instance writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ReportedState {
+    /// Not yet serving (starting up, or failing its readiness check).
+    #[default]
+    Starting,
+    /// Serving and heartbeating.
+    Serving,
+    /// Gracefully draining; upstreams should stop routing new work.
+    Draining,
+}
+
+/// The directory's lease policy: how long a registration/heartbeat keeps an
+/// instance observable (`ttl`), and the extra window it reads as
+/// [`InstanceState::Quarantined`] before becoming unobservable (`grace`).
+#[derive(Clone, Copy, Debug)]
+struct LeasePolicy {
+    ttl: Duration,
+    grace: Duration,
+}
+
+/// Runtime liveness of an instance (guarded by `RwLock` for safe mutation).
+///
+/// Holds the instance's **lease**: `lease_expires_at` is set to `now + ttl` by
+/// every registration and heartbeat, and the observable state is computed from
+/// it at read time rather than written by a background task.
 #[derive(Clone, Debug)]
-pub struct InstanceRuntimeState {
-    pub last_heartbeat: Instant,
-    pub state: InstanceState,
+struct InstanceRuntimeState {
+    /// Instant the lease expires: last registration/heartbeat `+ ttl`.
+    lease_expires_at: Instant,
+    /// Window after `lease_expires_at` during which the record reads as
+    /// [`InstanceState::Quarantined`] before becoming unobservable.
+    grace: Duration,
+    /// The state the instance last reported about itself.
+    reported: ReportedState,
 }
 
 /// Represents a single instance of a gear
@@ -98,6 +146,12 @@ pub struct GearInstance {
     /// Stable addressing labels (k8s `matchLabels` style) advertised by this
     /// instance, used for label-based instance selection.
     pub labels: BTreeMap<String, String>,
+    /// State the registrant declares about itself, or `None` when unspecified
+    /// (`optional reported_state`). On a *new* registration `None`
+    /// means [`ReportedState::Starting`]; on a *re-registration* `None` means
+    /// "keep whatever the record already reports", so a periodic self-heal that
+    /// omits the field never knocks a serving instance back to `Starting`.
+    pub reported_state: Option<ReportedState>,
     inner: Arc<parking_lot::RwLock<InstanceRuntimeState>>,
 }
 
@@ -112,6 +166,7 @@ impl Clone for GearInstance {
             rest_endpoint: self.rest_endpoint.clone(),
             openapi_spec: self.openapi_spec.clone(),
             labels: self.labels.clone(),
+            reported_state: self.reported_state,
             inner: Arc::clone(&self.inner),
         }
     }
@@ -120,8 +175,8 @@ impl Clone for GearInstance {
 impl GearInstance {
     /// Build a new instance record using `other`'s metadata but preserving
     /// `self`'s `inner` runtime-state lock. This makes re-registration atomic:
-    /// concurrent `update_heartbeat` calls continue to write to the same state
-    /// object instead of racing with a copied/swapped `InstanceRuntimeState`.
+    /// a concurrent `heartbeat` keeps writing the same state object instead of
+    /// racing with a copied/swapped `InstanceRuntimeState`.
     ///
     /// One process registers an instance from two places: the gRPC hub with
     /// its services, the host with its REST endpoint and `OpenAPI` spec. Each
@@ -154,6 +209,10 @@ impl GearInstance {
             } else {
                 other.labels.clone()
             },
+            // The declared state rides on the merged record so
+            // `register_instance` can apply it (or preserve the stored one when
+            // `None`) after rebuilding the instance.
+            reported_state: other.reported_state,
             inner: Arc::clone(&self.inner),
         }
     }
@@ -170,9 +229,14 @@ impl GearInstance {
             rest_endpoint: None,
             openapi_spec: None,
             labels: BTreeMap::new(),
+            reported_state: None,
+            // Placeholder lease: already expired, so an instance that is never
+            // registered is never observable. `register_instance` stamps the
+            // real lease (`now + ttl`) and grace from the manager policy.
             inner: Arc::new(parking_lot::RwLock::new(InstanceRuntimeState {
-                last_heartbeat: Instant::now(),
-                state: InstanceState::Registered,
+                lease_expires_at: Instant::now(),
+                grace: Duration::ZERO,
+                reported: ReportedState::Starting,
             })),
         }
     }
@@ -207,16 +271,49 @@ impl GearInstance {
         self
     }
 
-    /// Get the current state of this instance
-    #[must_use]
-    pub fn state(&self) -> InstanceState {
-        self.inner.read().state
+    /// Set the state the registrant declares about itself.
+    pub fn with_reported_state(mut self, reported: ReportedState) -> Self {
+        self.reported_state = Some(reported);
+        self
     }
 
-    /// Get the last heartbeat timestamp
+    /// The observable [`InstanceState`] derived from the lease and reported
+    /// state at `now`, or `None` when the record has expired more than `grace`
+    /// past its lease and is therefore no longer observable (the sweeper will
+    /// remove it; reads hide it in the meantime).
+    ///
+    /// | Condition | Returns |
+    /// |---|---|
+    /// | lease valid, reported `Starting` | `Registered` |
+    /// | lease valid, reported `Serving` | `Healthy` |
+    /// | lease valid, reported `Draining` | `Draining` |
+    /// | lease expired, less than `grace` ago | `Quarantined` |
+    /// | lease expired `grace` ago or more | `None` |
     #[must_use]
-    pub fn last_heartbeat(&self) -> Instant {
-        self.inner.read().last_heartbeat
+    pub fn observed_state_at(&self, now: Instant) -> Option<InstanceState> {
+        let s = self.inner.read();
+        if now <= s.lease_expires_at {
+            Some(match s.reported {
+                ReportedState::Starting => InstanceState::Registered,
+                ReportedState::Serving => InstanceState::Healthy,
+                ReportedState::Draining => InstanceState::Draining,
+            })
+        } else if now <= s.lease_expires_at + s.grace {
+            Some(InstanceState::Quarantined)
+        } else {
+            None
+        }
+    }
+
+    /// The current observable state (evaluated against the wall clock now).
+    ///
+    /// A record past its grace window is no longer observable; callers that
+    /// enumerate instances filter those out, so this collapses the
+    /// unobservable case onto `Quarantined` for the rare direct caller.
+    #[must_use]
+    pub fn state(&self) -> InstanceState {
+        self.observed_state_at(Instant::now())
+            .unwrap_or(InstanceState::Quarantined)
     }
 }
 
@@ -230,8 +327,10 @@ impl GearInstance {
 pub struct GearManager {
     inner: DashMap<String, Vec<Arc<GearInstance>>>,
     rr_counters: DashMap<String, usize>,
-    hb_ttl: Duration,
-    hb_grace: Duration,
+    /// Lease policy (ttl + grace), behind a lock so the `service-discovery`
+    /// gear can apply its configured `lease` settings onto the
+    /// host-owned manager after it is constructed and shared.
+    lease: parking_lot::RwLock<LeasePolicy>,
     /// Serializes gRPC-service-name ownership check + insert in
     /// [`register_instance`](Self::register_instance) so two
     /// gears cannot both pass an "unowned" check and then both commit the same
@@ -241,10 +340,10 @@ pub struct GearManager {
     ///
     /// Contract: every operation that *creates* a name→gear binding must hold
     /// this lock — today `register_instance`, `set_grpc_service_owners`, and
-    /// `merge_authoritative_grpc_service_owners`. `deregister` / `evict_stale`
-    /// only *free* names and `mark_*` / `update_heartbeat` only touch instance
-    /// state, so they cannot create a second owner and need not take it. Any
-    /// future mutator that can bind a name must.
+    /// `merge_authoritative_grpc_service_owners`. `deregister` / `sweep_expired`
+    /// only *free* names and `heartbeat` only renews a lease, so they cannot
+    /// create a second owner and need not take it. Any future mutator that can
+    /// bind a name must.
     reg_lock: parking_lot::Mutex<()>,
     /// Authoritative gRPC-service-name -> owning-gear map. When a name appears
     /// here, ownership is fixed to the named gear: only that gear may advertise
@@ -290,11 +389,12 @@ impl std::error::Error for GrpcServiceNameConflict {}
 impl std::fmt::Debug for GearManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let gears: Vec<String> = self.inner.iter().map(|e| e.key().clone()).collect();
+        let lease = *self.lease.read();
         f.debug_struct("GearManager")
             .field("instances_count", &self.inner.len())
             .field("gears", &gears)
-            .field("heartbeat_ttl", &self.hb_ttl)
-            .field("heartbeat_grace", &self.hb_grace)
+            .field("lease_ttl", &lease.ttl)
+            .field("lease_grace", &lease.grace)
             .finish_non_exhaustive()
     }
 }
@@ -304,17 +404,39 @@ impl GearManager {
         Self {
             inner: DashMap::new(),
             rr_counters: DashMap::new(),
-            hb_ttl: Duration::from_secs(15),
-            hb_grace: Duration::from_secs(30),
+            // Lease defaults (`cpt-cf-adr-directory-persistence-and-replication`):
+            // a crashed instance stops being preferred within `ttl` and becomes
+            // unobservable within `ttl + grace`.
+            lease: parking_lot::RwLock::new(LeasePolicy {
+                ttl: Duration::from_secs(30),
+                grace: Duration::from_secs(30),
+            }),
             reg_lock: parking_lot::Mutex::new(()),
             service_owners: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 
-    pub fn with_heartbeat_policy(mut self, ttl: Duration, grace: Duration) -> Self {
-        self.hb_ttl = ttl;
-        self.hb_grace = grace;
+    /// Set the lease policy, builder-style. Equivalent to
+    /// [`set_lease_policy`](Self::set_lease_policy) before the manager is shared.
+    pub fn with_lease_policy(self, ttl: Duration, grace: Duration) -> Self {
+        self.set_lease_policy(ttl, grace);
         self
+    }
+
+    /// Set the lease policy at runtime. Used by the
+    /// `service-discovery` gear to apply its configured `lease` settings onto
+    /// the host-owned manager after construction. Only affects leases stamped
+    /// by registrations/heartbeats after this call; already-stamped records
+    /// keep the grace they were given.
+    pub fn set_lease_policy(&self, ttl: Duration, grace: Duration) {
+        *self.lease.write() = LeasePolicy { ttl, grace };
+    }
+
+    /// The lease TTL this directory grants, so `RegisterInstance` can return
+    /// `lease_ttl_ms` and a worker can heartbeat at `ttl / 3`.
+    #[must_use]
+    pub fn lease_ttl(&self) -> Duration {
+        self.lease.read().ttl
     }
 
     /// Install the authoritative gRPC-service-name -> owning-gear map.
@@ -373,14 +495,18 @@ impl GearManager {
     /// check-then-write race the per-entry `DashMap` locks do not prevent. On a
     /// conflict the store is left untouched.
     ///
-    /// Re-registering an existing `instance_id` is an idempotent endpoint /
-    /// metadata refresh, NOT a liveness reset: the existing runtime state
-    /// (`last_heartbeat` + [`InstanceState`]) is carried over onto the new
-    /// record by preserving the same `Arc<RwLock<InstanceRuntimeState>>`.
-    /// Without this, a periodic self-heal re-registration (see
-    /// `oop_registration::presence_loop`) would knock a `Healthy` instance back
-    /// to `Registered`, dropping it out of gRPC round-robin until the next
-    /// heartbeat. It would also race with concurrent `update_heartbeat` calls.
+    /// Registration **renews the lease**: `lease_expires_at` is set
+    /// to `now + ttl`, including on re-registration of an existing record.
+    ///
+    /// Re-registering an existing `instance_id` is otherwise an idempotent
+    /// endpoint / metadata refresh that preserves the same
+    /// `Arc<RwLock<InstanceRuntimeState>>`, so a concurrent `heartbeat` keeps
+    /// writing the same lease. The declared [`ReportedState`]
+    /// ([`GearInstance::reported_state`]) is applied when present; when `None`
+    /// (a self-heal re-register that omits the field) the record *keeps* the
+    /// state it already reports, so a serving instance is never knocked back to
+    /// `Starting`. On a brand-new record `None` defaults to
+    /// [`ReportedState::Starting`].
     ///
     /// # Errors
     /// Returns [`GrpcServiceNameConflict`] if an advertised gRPC service name is
@@ -392,16 +518,44 @@ impl GearManager {
         let _gate = self.reg_lock.lock();
         self.check_grpc_service_ownership(&instance)?;
 
+        let now = Instant::now();
+        let declared = instance.reported_state;
         let gear = instance.gear.clone();
         let mut vec = self.inner.entry(gear).or_default();
         // replace by instance_id if it already exists
-        if let Some(pos) = vec
+        let record = if let Some(pos) = vec
             .iter()
             .position(|i| i.instance_id == instance.instance_id)
         {
-            vec[pos] = Arc::new(vec[pos].with_metadata_of(&instance));
+            // A record whose lease has lapsed past its grace window is
+            // unobservable and may already have had its gRPC service names
+            // reclaimed by another gear (`check_grpc_service_ownership` skips
+            // dead records). Merging would restore those names from the stored
+            // half — names the ownership check above never saw, as it only
+            // validates `instance`'s own services — and revive the dead lease,
+            // leaving two gears advertising one name. Treat it as a fresh
+            // registration so only the just-validated half survives.
+            if vec[pos].observed_state_at(now).is_none() {
+                vec[pos] = Arc::clone(&instance);
+                instance
+            } else {
+                let merged = Arc::new(vec[pos].with_metadata_of(&instance));
+                vec[pos] = Arc::clone(&merged);
+                merged
+            }
         } else {
-            vec.push(instance);
+            vec.push(Arc::clone(&instance));
+            instance
+        };
+
+        // Renew the lease and apply the declared state. On a re-register that
+        // omits the state, keep the stored one (see the doc above).
+        let policy = *self.lease.read();
+        let mut s = record.inner.write();
+        s.lease_expires_at = now + policy.ttl;
+        s.grace = policy.grace;
+        if let Some(reported) = declared {
+            s.reported = reported;
         }
         Ok(())
     }
@@ -459,12 +613,19 @@ impl GearManager {
 
         // Tier 2: one pass over the directory, checking every candidate name per
         // instance visited rather than re-scanning once per name. A name already
-        // held by a *different* gear conflicts.
+        // held by a *different* gear conflicts. An instance whose lease expired
+        // past its grace window is unobservable and no longer holds
+        // its names, so it is skipped — a successor can claim the name even
+        // before the sweeper removes the dead record.
+        let now = Instant::now();
         for entry in &self.inner {
             if entry.key() == &instance.gear {
                 continue; // same gear: re-register / additional instance is fine
             }
             for existing in entry.value() {
+                if existing.observed_state_at(now).is_none() {
+                    continue; // dead record: releases its gRPC names
+                }
                 if let Some(&name) = to_scan
                     .iter()
                     .find(|&&n| existing.grpc_services.contains_key(n))
@@ -482,156 +643,203 @@ impl GearManager {
         Ok(())
     }
 
-    /// Mark an instance as ready
-    pub fn mark_ready(&self, gear: &str, instance_id: Uuid) {
-        if let Some(mut vec) = self.inner.get_mut(gear)
-            && let Some(inst) = vec.iter_mut().find(|i| i.instance_id == instance_id)
+    /// Renew an instance's lease and apply the state it reports.
+    ///
+    /// Called for every heartbeat. `reported` is `None` when the heartbeat
+    /// omits a state, which counts as [`ReportedState::Serving`] (so an old
+    /// worker that only ever heartbeats reads as `Healthy`). Returns `false`
+    /// when no such `(gear, instance_id)` is registered, letting the caller
+    /// answer `NOT_FOUND`.
+    ///
+    /// A record whose lease expired past its grace window is treated as absent:
+    /// it is no longer observable, and a successor gear may already have claimed
+    /// the gRPC service names it used to hold (ownership scans skip it, see
+    /// [`check_grpc_service_ownership`](Self::check_grpc_service_ownership)).
+    /// Renewing it here would revive a second advertiser of the same name, so a
+    /// heartbeat for such a record returns `false`. The caller re-registers,
+    /// which runs the ownership check in
+    /// [`register_instance`](Self::register_instance) and rejects the revival if
+    /// the name moved on.
+    #[must_use]
+    pub fn heartbeat(
+        &self,
+        gear: &str,
+        instance_id: Uuid,
+        reported: Option<ReportedState>,
+    ) -> bool {
+        if let Some(vec) = self.inner.get(gear)
+            && let Some(inst) = vec.iter().find(|i| i.instance_id == instance_id)
         {
-            let mut state = inst.inner.write();
-            state.state = InstanceState::Ready;
-        }
-    }
-
-    /// Update the heartbeat timestamp for an instance
-    pub fn update_heartbeat(&self, gear: &str, instance_id: Uuid, at: Instant) {
-        if let Some(mut vec) = self.inner.get_mut(gear)
-            && let Some(inst) = vec.iter_mut().find(|i| i.instance_id == instance_id)
-        {
-            let mut state = inst.inner.write();
-            state.last_heartbeat = at;
-            // Transition Registered -> Healthy on first heartbeat
-            if state.state == InstanceState::Registered {
-                state.state = InstanceState::Healthy;
+            let policy = *self.lease.read();
+            // Read the expiry and renew under the *same* write lock, with a
+            // timestamp taken after acquiring it: the "is it still observable"
+            // decision and the renewing write must be one critical section.
+            // Checking against a `now` captured before the lock would let the
+            // grace boundary pass in between, reviving a record a concurrent
+            // `register_instance` may already have handed its gRPC name to a
+            // successor. Past the grace window the record is unobservable, so
+            // return `false` and force the caller onto the re-registration path
+            // (which re-checks ownership).
+            let mut s = inst.inner.write();
+            let now = Instant::now();
+            if now > s.lease_expires_at + s.grace {
+                return false;
             }
+            s.lease_expires_at = now + policy.ttl;
+            s.grace = policy.grace;
+            s.reported = reported.unwrap_or(ReportedState::Serving);
+            return true;
         }
-    }
-
-    /// Mark an instance as quarantined
-    pub fn mark_quarantined(&self, gear: &str, instance_id: Uuid) {
-        if let Some(mut vec) = self.inner.get_mut(gear)
-            && let Some(inst) = vec.iter_mut().find(|i| i.instance_id == instance_id)
-        {
-            inst.inner.write().state = InstanceState::Quarantined;
-        }
-    }
-
-    /// Mark an instance as draining (graceful shutdown in progress)
-    pub fn mark_draining(&self, gear: &str, instance_id: Uuid) {
-        if let Some(mut vec) = self.inner.get_mut(gear)
-            && let Some(inst) = vec.iter_mut().find(|i| i.instance_id == instance_id)
-        {
-            inst.inner.write().state = InstanceState::Draining;
-        }
+        false
     }
 
     /// Remove an instance from the directory
     pub fn deregister(&self, gear: &str, instance_id: Uuid) {
-        let mut remove_gear = false;
-        {
-            if let Some(mut vec) = self.inner.get_mut(gear) {
-                let list = vec.value_mut();
-                list.retain(|inst| inst.instance_id != instance_id);
-                if list.is_empty() {
-                    remove_gear = true;
-                }
-            }
+        if let Some(mut vec) = self.inner.get_mut(gear) {
+            vec.value_mut()
+                .retain(|inst| inst.instance_id != instance_id);
         }
 
-        if remove_gear {
-            self.inner.remove(gear);
+        // Drop the gear entry only if it is *still* empty: a concurrent
+        // `register_instance` can insert a fresh instance between the retain
+        // above and this removal, and an unconditional `remove` would delete it.
+        // `remove_if` re-checks under the entry lock (same pattern as
+        // `sweep_expired`).
+        if self
+            .inner
+            .remove_if(gear, |_, vec| vec.is_empty())
+            .is_some()
+        {
             self.rr_counters.remove(gear);
             self.rr_counters.remove(&format!("rest:{gear}"));
         }
     }
 
-    /// Get all instances of a specific gear
+    /// Get all currently-observable instances of a specific gear.
+    ///
+    /// A record whose lease expired past its grace window is filtered out: it
+    /// is no longer observable, so callers never see it even before
+    /// [`sweep_expired`](Self::sweep_expired) removes it.
     #[must_use]
     pub fn instances_of(&self, gear: &str) -> Vec<Arc<GearInstance>> {
-        self.inner.get(gear).map(|v| v.clone()).unwrap_or_default()
+        let now = Instant::now();
+        self.inner
+            .get(gear)
+            .map(|v| {
+                v.iter()
+                    .filter(|i| i.observed_state_at(now).is_some())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
-    /// Get all instances across all gears
+    /// Get all currently-observable instances across all gears.
     #[must_use]
     pub fn all_instances(&self) -> Vec<Arc<GearInstance>> {
+        let now = Instant::now();
         self.inner
             .iter()
-            .flat_map(|entry| entry.value().clone())
+            .flat_map(|entry| {
+                entry
+                    .value()
+                    .iter()
+                    .filter(|i| i.observed_state_at(now).is_some())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
             .collect()
     }
 
-    /// Quarantine or evict stale instances based on heartbeat policy
-    pub fn evict_stale(&self, now: Instant) {
-        use InstanceState::{Draining, Quarantined};
+    /// Remove records whose lease expired more than `grace` ago.
+    ///
+    /// This is the `memory`-mode sweeper: a record is no longer observable once
+    /// its lease lapses past the grace window, so this only garbage-collects —
+    /// reads already hide such records. Removing a gear's last instance also
+    /// frees its round-robin counters and the gRPC service names it held.
+    pub fn sweep_expired(&self, now: Instant) {
         let mut empty_gears = Vec::new();
 
         for mut entry in self.inner.iter_mut() {
             let gear = entry.key().clone();
             let vec = entry.value_mut();
-            vec.retain(|inst| {
-                let state = inst.inner.read();
-                let age = now.saturating_duration_since(state.last_heartbeat);
-
-                // Quarantine instances that have exceeded TTL
-                if age >= self.hb_ttl && !matches!(state.state, Quarantined | Draining) {
-                    drop(state); // Release read lock before write
-                    inst.inner.write().state = Quarantined;
-                    return true; // Keep quarantined instances for now
-                }
-
-                // Evict quarantined instances that exceed grace period
-                if state.state == Quarantined && age >= self.hb_ttl + self.hb_grace {
-                    return false; // Remove from directory
-                }
-
-                true
-            });
-
+            vec.retain(|inst| inst.observed_state_at(now).is_some());
             if vec.is_empty() {
                 empty_gears.push(gear);
             }
         }
 
+        // Remove each emptied gear only if it is *still* empty: a
+        // `register_instance` can insert a fresh instance between the retain
+        // above and this removal, and an unconditional `remove` would delete it.
+        // `remove_if` re-checks under the entry lock, atomically with any
+        // concurrent registration on the same entry.
         for gear in empty_gears {
-            self.inner.remove(&gear);
-            self.rr_counters.remove(&gear);
-            self.rr_counters.remove(&format!("rest:{gear}"));
+            if self
+                .inner
+                .remove_if(&gear, |_, vec| vec.is_empty())
+                .is_some()
+            {
+                self.rr_counters.remove(&gear);
+                self.rr_counters.remove(&format!("rest:{gear}"));
+            }
         }
     }
 
     /// From a candidate set, return the serving subset (`Healthy`/`Ready`); if
-    /// none are serving, return the whole set so resolution falls back to the
-    /// not-ready instances (`Registered`/`Quarantined`/`Draining`) rather than
-    /// failing closed. `context` names the pool for the cold-path `debug!`.
+    /// none are serving, fall back to the not-yet-serving instances
+    /// (`Registered`/`Quarantined`) rather than failing closed. A `Draining`
+    /// instance is never a routing target, even as a fallback — draining means
+    /// "stop routing new work" — so a gear whose only instances are draining
+    /// resolves to nothing. `context` names the pool for the cold-path `debug!`.
     fn prefer_serving(candidates: Vec<Arc<GearInstance>>, context: &str) -> Vec<Arc<GearInstance>> {
-        let serving: Vec<Arc<GearInstance>> = candidates
+        let now = Instant::now();
+        // Keep only routable instances: a fully-lapsed lease is unobservable and
+        // a `Draining` instance is shutting down — neither may be routed to, even
+        // as a fallback.
+        let routable: Vec<Arc<GearInstance>> = candidates
+            .into_iter()
+            .filter(|inst| {
+                !matches!(
+                    inst.observed_state_at(now),
+                    None | Some(InstanceState::Draining)
+                )
+            })
+            .collect();
+        let serving: Vec<Arc<GearInstance>> = routable
             .iter()
-            .filter(|inst| matches!(inst.state(), InstanceState::Healthy | InstanceState::Ready))
+            .filter(|inst| {
+                matches!(
+                    inst.observed_state_at(now),
+                    Some(InstanceState::Healthy | InstanceState::Ready)
+                )
+            })
             .cloned()
             .collect();
         if serving.is_empty() {
-            tracing::debug!(
-                context,
-                "no serving (Ready/Healthy) instance available; round-robining over the \
-                 not-ready set instead of returning None"
-            );
-            candidates
+            if !routable.is_empty() {
+                tracing::debug!(
+                    context,
+                    "no serving (Ready/Healthy) instance available; round-robining over the \
+                     not-serving set instead of returning None"
+                );
+            }
+            routable
         } else {
             serving
         }
     }
 
-    /// Pick an instance using round-robin selection, preferring healthy instances
+    /// Pick an instance using round-robin selection, preferring serving instances
     #[must_use]
     pub fn pick_instance_round_robin(&self, gear: &str) -> Option<Arc<GearInstance>> {
         let instances_entry = self.inner.get(gear)?;
         let instances = instances_entry.value();
 
-        if instances.is_empty() {
+        let candidates = Self::prefer_serving(instances.clone(), gear);
+        if candidates.is_empty() {
             return None;
         }
-
-        // Non-empty in => non-empty out, so `candidates` is guaranteed non-empty.
-        let candidates = Self::prefer_serving(instances.clone(), gear);
 
         let len = candidates.len();
         let mut counter = self.rr_counters.entry(gear.to_owned()).or_insert(0);
@@ -667,6 +875,9 @@ impl GearManager {
         }
 
         let mut candidates = Self::prefer_serving(providing, service_name);
+        if candidates.is_empty() {
+            return None;
+        }
 
         // Use a counter keyed by service name for round-robin
         let len = candidates.len();
@@ -700,6 +911,9 @@ impl GearManager {
         }
 
         let candidates = Self::prefer_serving(with_rest, gear);
+        if candidates.is_empty() {
+            return None;
+        }
 
         let len = candidates.len();
         let rr_key = format!("rest:{gear}");
@@ -722,12 +936,12 @@ impl GearManager {
     #[cfg(test)]
     #[must_use]
     fn grpc_service_owner(&self, service_name: &str) -> Option<String> {
+        let now = Instant::now();
         for entry in &self.inner {
-            if entry
-                .value()
-                .iter()
-                .any(|inst| inst.grpc_services.contains_key(service_name))
-            {
+            if entry.value().iter().any(|inst| {
+                inst.observed_state_at(now).is_some()
+                    && inst.grpc_services.contains_key(service_name)
+            }) {
                 return Some(entry.key().clone());
             }
         }
@@ -756,7 +970,6 @@ impl Default for GearManager {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-    use std::thread::sleep;
     use std::time::Duration;
 
     #[test]
@@ -785,6 +998,18 @@ mod tests {
     fn seed(mgr: &GearManager, instance: Arc<GearInstance>) {
         mgr.register_instance(instance)
             .expect("test fixture must not create a gRPC service-name conflict");
+    }
+
+    /// Force a seeded instance's lease to have expired `ago` before now, with
+    /// the given grace window. Registration stamps a fresh lease, so this is
+    /// called *after* seeding to simulate a worker that stopped heartbeating.
+    #[track_caller]
+    fn expire_lease(inst: &GearInstance, ago: Duration, grace: Duration) {
+        let mut s = inst.inner.write();
+        s.lease_expires_at = Instant::now()
+            .checked_sub(ago)
+            .expect("test lease subtraction should not underflow");
+        s.grace = grace;
     }
 
     fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -963,15 +1188,15 @@ mod tests {
             &dir,
             Arc::new(GearInstance::new("test_gear", instance_id).with_version("1.0.0")),
         );
-        dir.update_heartbeat("test_gear", instance_id, Instant::now());
+        assert!(dir.heartbeat("test_gear", instance_id, None));
         assert!(matches!(
             dir.instances_of("test_gear")[0].state(),
             InstanceState::Healthy
         ));
 
-        // A periodic self-heal re-registration must NOT reset liveness back to
-        // Registered — otherwise the instance drops out of gRPC round-robin
-        // until the next heartbeat (the "split-brain" flap).
+        // A self-heal re-registration that omits the reported state must NOT
+        // reset liveness back to Registered — otherwise the instance drops out
+        // of gRPC round-robin until the next heartbeat (the "split-brain" flap).
         seed(
             &dir,
             Arc::new(GearInstance::new("test_gear", instance_id).with_version("2.0.0")),
@@ -997,18 +1222,17 @@ mod tests {
 
         let initial = Arc::new(GearInstance::new("test_gear", instance_id).with_version("1.0.0"));
         seed(&dir, initial);
-        dir.update_heartbeat("test_gear", instance_id, Instant::now());
+        assert!(dir.heartbeat("test_gear", instance_id, None));
         assert!(matches!(
             dir.instances_of("test_gear")[0].state(),
             InstanceState::Healthy
         ));
 
-        let start = Instant::now();
-
         std::thread::scope(|s| {
             s.spawn(|| {
                 for _ in 0..1000 {
-                    dir.update_heartbeat("test_gear", instance_id, Instant::now());
+                    // The record always exists here, so each heartbeat renews it.
+                    assert!(dir.heartbeat("test_gear", instance_id, None));
                 }
             });
             s.spawn(|| {
@@ -1033,45 +1257,150 @@ mod tests {
             matches!(instances[0].state(), InstanceState::Healthy),
             "concurrent re-registration must not reset Healthy state"
         );
+    }
+
+    #[test]
+    fn register_with_reported_serving_reads_healthy() {
+        let dir = GearManager::new();
+        let instance_id = Uuid::new_v4();
+        // A registrant that already reports Serving is immediately Healthy,
+        // without waiting for a heartbeat.
+        seed(
+            &dir,
+            Arc::new(
+                GearInstance::new("test_gear", instance_id)
+                    .with_reported_state(ReportedState::Serving),
+            ),
+        );
+
+        let instances = dir.instances_of("test_gear");
+        assert_eq!(instances.len(), 1);
+        assert!(matches!(instances[0].state(), InstanceState::Healthy));
+    }
+
+    #[test]
+    fn heartbeat_renews_lease_and_reads_serving() {
+        let dir = GearManager::new();
+        let instance_id = Uuid::new_v4();
+        seed(&dir, Arc::new(GearInstance::new("test_gear", instance_id)));
+
+        // No heartbeat yet: reported Starting reads as Registered.
+        assert!(matches!(
+            dir.instances_of("test_gear")[0].state(),
+            InstanceState::Registered
+        ));
+
+        // A heartbeat with no reported state counts as Serving -> Healthy.
+        assert!(dir.heartbeat("test_gear", instance_id, None));
+        assert!(matches!(
+            dir.instances_of("test_gear")[0].state(),
+            InstanceState::Healthy
+        ));
+
+        // A heartbeat for an unknown instance returns false (NOT_FOUND).
+        assert!(!dir.heartbeat("test_gear", Uuid::new_v4(), None));
+    }
+
+    #[test]
+    fn heartbeat_on_a_lapsed_lease_returns_not_found() {
+        let grace = Duration::from_millis(50);
+        let dir = GearManager::new().with_lease_policy(Duration::from_millis(50), grace);
+
+        let instance = Arc::new(GearInstance::new("test_gear", Uuid::new_v4()));
+        seed(&dir, Arc::clone(&instance));
+
+        // Within grace the record is still observable, so a heartbeat renews it.
+        expire_lease(&instance, Duration::from_millis(10), grace);
+        assert!(dir.heartbeat("test_gear", instance.instance_id, None));
+
+        // Past grace the record is unobservable: a heartbeat must return false
+        // (NOT_FOUND) instead of reviving it, so the caller re-registers and
+        // ownership is re-checked.
+        expire_lease(&instance, grace + Duration::from_millis(10), grace);
         assert!(
-            instances[0].last_heartbeat() >= start,
-            "concurrent re-registration must not lose heartbeat updates"
+            !dir.heartbeat("test_gear", instance.instance_id, None),
+            "a heartbeat for a record whose lease lapsed past grace must not renew it"
         );
     }
 
     #[test]
-    fn test_mark_ready() {
-        let dir = GearManager::new();
-        let instance_id = Uuid::new_v4();
-        let instance = Arc::new(GearInstance::new("test_gear", instance_id));
+    fn a_lapsed_owner_cannot_reclaim_its_grpc_name_by_heartbeat() {
+        // gear X owns a gRPC service name, then its lease lapses past grace.
+        let grace = Duration::from_millis(50);
+        let dir = GearManager::new().with_lease_policy(Duration::from_millis(50), grace);
+        let service = "pkg.Svc";
 
-        seed(&dir, instance);
+        let x = Arc::new(
+            GearInstance::new("x", Uuid::new_v4())
+                .with_grpc_service(service, Endpoint::http("127.0.0.1", 9000)),
+        );
+        seed(&dir, Arc::clone(&x));
+        expire_lease(&x, grace + Duration::from_millis(10), grace);
 
-        dir.mark_ready("test_gear", instance_id);
+        // A successor gear claims the now-free name.
+        let y = Arc::new(
+            GearInstance::new("y", Uuid::new_v4())
+                .with_grpc_service(service, Endpoint::http("127.0.0.1", 9001)),
+        );
+        dir.register_instance(y)
+            .expect("the lapsed owner's gRPC name must be claimable by a successor");
 
-        let instances = dir.instances_of("test_gear");
-        assert_eq!(instances.len(), 1);
-        assert!(matches!(instances[0].state(), InstanceState::Ready));
+        // X's heartbeat must NOT revive it: that would leave two gears
+        // advertising the same gRPC name.
+        assert!(
+            !dir.heartbeat("x", x.instance_id, None),
+            "a lapsed owner must not reclaim its name via a bare heartbeat"
+        );
+        assert_eq!(
+            dir.grpc_service_owner(service).as_deref(),
+            Some("y"),
+            "the successor keeps sole ownership of the name"
+        );
     }
 
     #[test]
-    fn test_update_heartbeat() {
-        let dir = GearManager::new();
-        let instance_id = Uuid::new_v4();
-        let instance = Arc::new(GearInstance::new("test_gear", instance_id));
-        let initial_heartbeat = instance.last_heartbeat();
+    fn a_lapsed_owner_rest_reregister_does_not_restore_its_grpc_name() {
+        // gear X owns a gRPC name, then its lease lapses past grace.
+        let grace = Duration::from_millis(50);
+        let dir = GearManager::new().with_lease_policy(Duration::from_millis(50), grace);
+        let service = "pkg.Svc";
 
-        seed(&dir, instance);
+        let x_id = Uuid::new_v4();
+        let x = Arc::new(
+            GearInstance::new("x", x_id)
+                .with_grpc_service(service, Endpoint::http("127.0.0.1", 9000)),
+        );
+        seed(&dir, Arc::clone(&x));
+        expire_lease(&x, grace + Duration::from_millis(10), grace);
 
-        // Sleep to ensure time difference
-        sleep(Duration::from_millis(10));
+        // A successor gear claims the now-free name.
+        let y = Arc::new(
+            GearInstance::new("y", Uuid::new_v4())
+                .with_grpc_service(service, Endpoint::http("127.0.0.1", 9001)),
+        );
+        dir.register_instance(y)
+            .expect("the lapsed owner's gRPC name must be claimable by a successor");
 
-        let new_heartbeat = Instant::now();
-        dir.update_heartbeat("test_gear", instance_id, new_heartbeat);
+        // X re-registers a REST-only half (empty gRPC map), which passes the
+        // ownership check. The merge must NOT restore X's old gRPC name from
+        // the lapsed record — that would leave two gears advertising one name.
+        dir.register_instance(Arc::new(
+            GearInstance::new("x", x_id)
+                .with_rest_endpoint(Endpoint::from_uri("http://127.0.0.1:8080")),
+        ))
+        .expect("a REST-only re-registration carries no conflicting gRPC name");
 
-        let instances = dir.instances_of("test_gear");
-        assert!(instances[0].last_heartbeat() > initial_heartbeat);
-        assert!(matches!(instances[0].state(), InstanceState::Healthy));
+        let registered = dir.instances_of("x");
+        assert_eq!(registered.len(), 1);
+        assert!(
+            !registered[0].grpc_services.contains_key(service),
+            "a lapsed owner's REST-only re-register must not restore its gRPC name"
+        );
+        assert_eq!(
+            dir.grpc_service_owner(service).as_deref(),
+            Some("y"),
+            "the successor keeps sole ownership of the name"
+        );
     }
 
     #[test]
@@ -1203,35 +1532,32 @@ mod tests {
         assert_eq!(instance.grpc_services.len(), 2);
         assert!(instance.grpc_services.contains_key("service1"));
         assert!(instance.grpc_services.contains_key("service2"));
-        assert!(matches!(instance.state(), InstanceState::Registered));
+        // The builder declares no reported state until a registration supplies
+        // one; the observable state only exists once the directory stamps a
+        // lease in `register_instance`.
+        assert_eq!(instance.reported_state, None);
     }
 
     #[test]
-    fn test_quarantine_and_evict() {
-        let ttl = Duration::from_millis(50);
+    fn test_quarantine_and_sweep() {
         let grace = Duration::from_millis(50);
-        let dir = GearManager::new().with_heartbeat_policy(ttl, grace);
+        let dir = GearManager::new().with_lease_policy(Duration::from_millis(50), grace);
 
-        let now = Instant::now();
-        let instance = GearInstance::new("test_gear", Uuid::new_v4());
-        // Set the last heartbeat to be stale
-        instance.inner.write().last_heartbeat = now
-            .checked_sub(ttl)
-            .and_then(|t| t.checked_sub(Duration::from_millis(10)))
-            .expect("test duration subtraction should not underflow");
+        let instance = Arc::new(GearInstance::new("test_gear", Uuid::new_v4()));
+        seed(&dir, Arc::clone(&instance));
 
-        seed(&dir, Arc::new(instance));
-
-        dir.evict_stale(now);
+        // Lease expired 10ms ago, still within the 50ms grace -> Quarantined,
+        // observable, so the sweeper keeps it.
+        expire_lease(&instance, Duration::from_millis(10), grace);
+        dir.sweep_expired(Instant::now());
         let instances = dir.instances_of("test_gear");
         assert_eq!(instances.len(), 1);
         assert!(matches!(instances[0].state(), InstanceState::Quarantined));
 
-        let later = now + grace + Duration::from_millis(10);
-        dir.evict_stale(later);
-
-        let instances_after = dir.instances_of("test_gear");
-        assert!(instances_after.is_empty());
+        // Past grace: no longer observable, so the sweeper removes it.
+        expire_lease(&instance, grace + Duration::from_millis(10), grace);
+        dir.sweep_expired(Instant::now());
+        assert!(dir.instances_of("test_gear").is_empty());
     }
 
     #[test]
@@ -1249,12 +1575,17 @@ mod tests {
         let healthy_id = Uuid::new_v4();
         let healthy = Arc::new(GearInstance::new("test_gear", healthy_id));
         seed(&dir, healthy);
-        dir.update_heartbeat("test_gear", healthy_id, Instant::now());
+        assert!(dir.heartbeat("test_gear", healthy_id, None));
 
         let quarantined_id = Uuid::new_v4();
         let quarantined = Arc::new(GearInstance::new("test_gear", quarantined_id));
-        seed(&dir, quarantined);
-        dir.mark_quarantined("test_gear", quarantined_id);
+        seed(&dir, Arc::clone(&quarantined));
+        // Lease expired but still within grace -> Quarantined (not serving).
+        expire_lease(
+            &quarantined,
+            Duration::from_millis(10),
+            Duration::from_secs(30),
+        );
 
         // RR should only pick the healthy instance
         for _ in 0..5 {
@@ -1310,8 +1641,8 @@ mod tests {
         );
         seed(&dir, inst1);
         seed(&dir, inst2);
-        dir.update_heartbeat("web", id1, Instant::now());
-        dir.update_heartbeat("web", id2, Instant::now());
+        assert!(dir.heartbeat("web", id1, None));
+        assert!(dir.heartbeat("web", id2, None));
 
         let ep1 = dir.pick_rest_endpoint_round_robin("web").unwrap();
         let ep2 = dir.pick_rest_endpoint_round_robin("web").unwrap();
@@ -1341,8 +1672,8 @@ mod tests {
         seed(&dir, inst2);
 
         // Mark both as healthy
-        dir.update_heartbeat("test_gear", id1, Instant::now());
-        dir.update_heartbeat("test_gear", id2, Instant::now());
+        assert!(dir.heartbeat("test_gear", id1, None));
+        assert!(dir.heartbeat("test_gear", id2, None));
 
         // Pick should rotate between instances
         let pick1 = dir.pick_service_round_robin("test.Service");
@@ -1393,6 +1724,31 @@ mod tests {
         let (gear, _, ep) = picked.unwrap();
         assert_eq!(gear, "worker");
         assert_eq!(ep, Endpoint::http("127.0.0.1", 9000));
+    }
+
+    #[test]
+    fn pick_service_never_falls_back_to_a_draining_instance() {
+        // A gear whose only instance is draining resolves to nothing: draining
+        // means "stop routing new work", so it is not a fallback target.
+        let dir = GearManager::new();
+        let id = Uuid::new_v4();
+        seed(
+            &dir,
+            Arc::new(
+                GearInstance::new("worker", id)
+                    .with_grpc_service("worker.Svc", Endpoint::http("127.0.0.1", 9000)),
+            ),
+        );
+        assert!(dir.heartbeat("worker", id, Some(ReportedState::Draining)));
+        assert!(matches!(
+            dir.instances_of("worker")[0].state(),
+            InstanceState::Draining
+        ));
+
+        assert!(
+            dir.pick_service_round_robin("worker.Svc").is_none(),
+            "a draining-only gear must not be resolved, even as a fallback"
+        );
     }
 
     #[test]
@@ -1496,27 +1852,21 @@ mod tests {
     }
 
     #[test]
-    fn eviction_releases_grpc_service_name_only_after_full_evict() {
-        let ttl = Duration::from_millis(50);
+    fn lease_releases_grpc_service_name_only_after_grace() {
         let grace = Duration::from_millis(50);
-        let dir = GearManager::new().with_heartbeat_policy(ttl, grace);
+        let dir = GearManager::new().with_lease_policy(Duration::from_millis(50), grace);
         let service = "cf.authz.v1.AuthzService";
 
-        let now = Instant::now();
-        let owner = GearInstance::new("authz-resolver", Uuid::new_v4())
-            .with_grpc_service(service, Endpoint::http("127.0.0.1", 9000));
-        // Stale from the start so the first eviction pass quarantines it.
-        owner.inner.write().last_heartbeat = now
-            .checked_sub(ttl)
-            .and_then(|t| t.checked_sub(Duration::from_millis(10)))
-            .expect("test duration subtraction should not underflow");
-        seed(&dir, Arc::new(owner));
+        let owner = Arc::new(
+            GearInstance::new("authz-resolver", Uuid::new_v4())
+                .with_grpc_service(service, Endpoint::http("127.0.0.1", 9000)),
+        );
+        seed(&dir, Arc::clone(&owner));
+        // Expired but still within grace: the owner reads as Quarantined.
+        expire_lease(&owner, Duration::from_millis(10), grace);
 
-        // First pass only *quarantines* the dead gear — it is not yet evicted,
-        // so it still owns the name and a successor is rejected. A dead gear
-        // keeps blocking its gRPC name (regardless of health) until fully
-        // evicted, i.e. for hb_ttl + hb_grace.
-        dir.evict_stale(now);
+        // A quarantined-but-still-observable owner keeps blocking its gRPC name,
+        // so a successor is rejected (recoverable conflict).
         assert!(matches!(
             dir.instances_of("authz-resolver")[0].state(),
             InstanceState::Quarantined
@@ -1529,21 +1879,21 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             conflict.owner, "authz-resolver",
-            "a quarantined-but-not-evicted owner still holds the name"
+            "a quarantined-but-observable owner still holds the name"
         );
 
-        // Second pass past the grace period fully evicts it, releasing the name
-        // so another gear may take it over.
-        dir.evict_stale(now + grace + Duration::from_millis(10));
+        // Past the grace window the owner is unobservable and releases the name,
+        // so another gear may take it over — even before the sweeper runs.
+        expire_lease(&owner, grace + Duration::from_millis(10), grace);
         assert!(
             dir.grpc_service_owner(service).is_none(),
-            "eviction hands the name back once the grace period lapses"
+            "an expired owner hands the name back once the grace period lapses"
         );
         dir.register_instance(Arc::new(
             GearInstance::new("successor", Uuid::new_v4())
                 .with_grpc_service(service, Endpoint::http("127.0.0.1", 9002)),
         ))
-        .expect("an evicted owner's gRPC name must be claimable by another gear");
+        .expect("an expired owner's gRPC name must be claimable by another gear");
         assert_eq!(
             dir.grpc_service_owner(service).as_deref(),
             Some("successor")
@@ -1558,7 +1908,7 @@ mod tests {
             GearInstance::new("web", id).with_rest_endpoint(Endpoint::http("127.0.0.1", 8001)),
         );
         seed(&dir, instance);
-        dir.update_heartbeat("web", id, Instant::now());
+        assert!(dir.heartbeat("web", id, None));
 
         // Exercise both round-robin counters so the keys are created.
         assert!(dir.pick_instance_round_robin("web").is_some());
@@ -1574,36 +1924,28 @@ mod tests {
     }
 
     #[test]
-    fn test_evict_stale_clears_rr_counters() {
-        let ttl = Duration::from_millis(50);
+    fn test_sweep_expired_clears_rr_counters() {
         let grace = Duration::from_millis(50);
-        let dir = GearManager::new().with_heartbeat_policy(ttl, grace);
+        let dir = GearManager::new().with_lease_policy(Duration::from_millis(50), grace);
 
-        let now = Instant::now();
         let id = Uuid::new_v4();
         let instance = Arc::new(
             GearInstance::new("web", id).with_rest_endpoint(Endpoint::http("127.0.0.1", 8001)),
         );
-        // Set the last heartbeat to be stale so the instance is quarantined then evicted.
-        instance.inner.write().last_heartbeat = now
-            .checked_sub(ttl)
-            .and_then(|t| t.checked_sub(Duration::from_millis(10)))
-            .expect("test duration subtraction should not underflow");
-
-        seed(&dir, instance);
+        seed(&dir, Arc::clone(&instance));
         assert!(dir.pick_rest_endpoint_round_robin("web").is_some());
-
         assert!(dir.rr_counters.contains_key("rest:web"));
 
-        // First eviction pass quarantines the stale instance.
-        dir.evict_stale(now);
+        // Expired but within grace: still observable, sweep keeps it.
+        expire_lease(&instance, Duration::from_millis(10), grace);
+        dir.sweep_expired(Instant::now());
         let instances = dir.instances_of("web");
         assert_eq!(instances.len(), 1);
         assert!(matches!(instances[0].state(), InstanceState::Quarantined));
 
-        // Second pass evicts quarantined instances that exceeded the grace period.
-        let later = now + grace + Duration::from_millis(10);
-        dir.evict_stale(later);
+        // Past grace: sweep removes it and frees the round-robin counters.
+        expire_lease(&instance, grace + Duration::from_millis(10), grace);
+        dir.sweep_expired(Instant::now());
 
         assert!(dir.instances_of("web").is_empty());
         assert!(!dir.rr_counters.contains_key("web"));

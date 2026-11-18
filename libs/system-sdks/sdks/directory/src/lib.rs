@@ -12,8 +12,8 @@ pub mod labels;
 
 pub use api::{
     DirectoryClient, DirectoryInvalidArgument, DirectoryNotFound, DirectoryPermissionDenied,
-    DirectoryServiceNameConflict, GrpcServiceInfo, InstanceState, LabelSelector,
-    RegisterInstanceInfo, ServiceEndpoint, ServiceInstanceInfo,
+    DirectoryServiceNameConflict, GrpcServiceInfo, InstanceState, LabelSelector, RegisterAck,
+    RegisterInstanceInfo, ReportedState, ServiceEndpoint, ServiceInstanceInfo,
 };
 #[cfg(feature = "grpc")]
 pub use grpc::*;

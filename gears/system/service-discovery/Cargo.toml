@@ -23,12 +23,14 @@ toolkit = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-security = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tonic = { workspace = true, features = ["transport"] }
 http = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
+humantime-serde = { workspace = true }
 utoipa = { workspace = true }
 axum = { workspace = true }
 uuid = { workspace = true }
