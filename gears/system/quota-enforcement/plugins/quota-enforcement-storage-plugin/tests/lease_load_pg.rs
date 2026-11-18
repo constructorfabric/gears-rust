@@ -48,7 +48,7 @@ use sea_orm::ActiveValue::Set;
 use sea_orm_migration::MigratorTrait;
 use testcontainers::core::ExecCommand;
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, ContainerRequest, ImageExt};
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 use time::OffsetDateTime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
@@ -194,9 +194,10 @@ struct Harness {
 
 impl Harness {
     async fn up(config: Config) -> Self {
-        // The helper's tmpfs data directory would make fsync free.
+        // The helper mounts a tmpfs on /var/lib/postgresql, where fsync costs
+        // nothing. An fsync-on run moves PGDATA off it, onto the container's disk.
         let request = if config.fsync {
-            ContainerRequest::from(Postgres::default()).with_tag(test_containers::postgres_tag())
+            test_containers::postgres().with_env_var("PGDATA", "/var/lib/pgdata")
         } else {
             test_containers::postgres()
         };
