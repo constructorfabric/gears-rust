@@ -62,17 +62,60 @@ impl PassthroughApi {
     }
 }
 
+/// HTTP method of a pass-through endpoint.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "UPPERCASE")]
+#[non_exhaustive]
+pub enum PassthroughMethod {
+    /// `GET`.
+    Get,
+    /// `POST`.
+    Post,
+    /// `PUT`.
+    Put,
+    /// `PATCH`.
+    Patch,
+    /// `DELETE`.
+    Delete,
+}
+
+impl PassthroughMethod {
+    /// Uppercase method name, as on the wire.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+            Self::Put => "PUT",
+            Self::Patch => "PATCH",
+            Self::Delete => "DELETE",
+        }
+    }
+}
+
 /// One stateless provider endpoint a plugin forwards on its pass-through
-/// route.
+/// route: a method and a path.
 #[derive(
     Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
 )]
 #[non_exhaustive]
 pub struct PassthroughEndpoint {
-    /// Provider path, relative to the route (e.g. `/v1/responses`). Only
-    /// `POST` is forwarded. The model listing (`GET /v1/models`,
-    /// `GET /v1/models/{model_id}`) is not declared here: the core answers it
-    /// from Model Registry without calling the plugin.
+    /// HTTP method the endpoint accepts.
+    pub method: PassthroughMethod,
+    /// Provider path, relative to the route (e.g. `/v1/responses`). The model
+    /// listing (`GET /v1/models`, `GET /v1/models/{model_id}`) is not declared
+    /// here: the core answers it from Model Registry without calling the
+    /// plugin.
     pub path: String,
     /// Whether the endpoint generates output: a metered endpoint gets a quota
     /// lease, an AI credit cost, and a usage record; a non-metered one (for
@@ -81,19 +124,21 @@ pub struct PassthroughEndpoint {
 }
 
 impl PassthroughEndpoint {
-    /// A metered endpoint at `path`.
+    /// A metered endpoint: `method` on `path`.
     #[must_use]
-    pub fn metered(path: impl Into<String>) -> Self {
+    pub fn metered(method: PassthroughMethod, path: impl Into<String>) -> Self {
         Self {
+            method,
             path: path.into(),
             metered: true,
         }
     }
 
-    /// A non-metered endpoint at `path`.
+    /// A non-metered endpoint: `method` on `path`.
     #[must_use]
-    pub fn not_metered(path: impl Into<String>) -> Self {
+    pub fn not_metered(method: PassthroughMethod, path: impl Into<String>) -> Self {
         Self {
+            method,
             path: path.into(),
             metered: false,
         }
@@ -103,8 +148,8 @@ impl PassthroughEndpoint {
 /// Pass-through support a plugin reports in its integration capabilities.
 ///
 /// The endpoint list is the route's allowlist: the core checks the request
-/// path against it before the capability check and quota admission, and
-/// answers an undeclared path with a provider-format 404 without a provider
+/// method and path against it before the capability check and quota admission, and
+/// answers an undeclared method and path with a provider-format 404 without a provider
 /// call. A plugin declares only stateless endpoints.
 #[derive(
     Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
@@ -124,17 +169,20 @@ impl PassthroughCapability {
         Self { api, endpoints }
     }
 
-    /// The declared endpoint at `path`, if any.
+    /// The declared endpoint for `method` on `path`, if any.
     #[must_use]
-    pub fn endpoint(&self, path: &str) -> Option<&PassthroughEndpoint> {
-        self.endpoints.iter().find(|e| e.path == path)
+    pub fn endpoint(&self, method: PassthroughMethod, path: &str) -> Option<&PassthroughEndpoint> {
+        self.endpoints
+            .iter()
+            .find(|e| e.method == method && e.path == path)
     }
 }
 
 /// A pass-through request the core hands to the plugin.
 ///
-/// The body is the consumer's native body as received: `model` still holds
-/// the Gateway model identifier, and nothing has been removed. The plugin
+/// The body, when the request has one, is the consumer's native body as
+/// received: `model` still holds the Gateway model identifier, and nothing
+/// has been removed. The plugin
 /// first checks it against its denylists of stateful fields and paid provider
 /// tools, then replaces `model` with `provider_model_id`, forces no-store, and
 /// builds the provider request headers itself.
@@ -143,9 +191,15 @@ impl PassthroughCapability {
 pub struct PassthroughRequest {
     /// The route's provider API.
     pub api: PassthroughApi,
+    /// The request method, already checked with `path` against the plugin's
+    /// allowlist.
+    pub method: PassthroughMethod,
     /// The declared endpoint path (e.g. `/v1/messages`), already checked
     /// against the plugin's allowlist.
     pub path: String,
+    /// The raw query string, without the leading `?`; `None` when the
+    /// request has none.
+    pub query: Option<String>,
     /// Whether the native request asks for streaming, as read by the core
     /// from the body. Selects [`PassthroughResponse::Stream`].
     pub stream: bool,
@@ -154,21 +208,39 @@ pub struct PassthroughRequest {
     /// filtered by the core's allowlist. The consumer's `Authorization` and
     /// `x-api-key` are never among them.
     pub headers: Vec<(String, String)>,
-    /// The provider-native JSON body.
-    pub body: serde_json::Value,
+    /// The provider-native JSON body; `None` when the request has no body
+    /// (e.g. a `GET`).
+    pub body: Option<serde_json::Value>,
 }
 
 impl PassthroughRequest {
-    /// A non-streaming request to `path` with no protocol headers.
+    /// A non-streaming `method` request to `path` with no query, protocol
+    /// headers, or body.
     #[must_use]
-    pub fn new(api: PassthroughApi, path: impl Into<String>, body: serde_json::Value) -> Self {
+    pub fn new(api: PassthroughApi, method: PassthroughMethod, path: impl Into<String>) -> Self {
         Self {
             api,
+            method,
             path: path.into(),
+            query: None,
             stream: false,
             headers: Vec::new(),
-            body,
+            body: None,
         }
+    }
+
+    /// Set the raw query string (without the leading `?`).
+    #[must_use]
+    pub fn with_query(mut self, query: impl Into<String>) -> Self {
+        self.query = Some(query.into());
+        self
+    }
+
+    /// Set the provider-native JSON body.
+    #[must_use]
+    pub fn with_body(mut self, body: serde_json::Value) -> Self {
+        self.body = Some(body);
+        self
     }
 
     /// Mark the request as streaming.
@@ -361,12 +433,34 @@ mod tests {
         let caps = PassthroughCapability::new(
             PassthroughApi::Anthropic,
             vec![
-                PassthroughEndpoint::metered("/v1/messages"),
-                PassthroughEndpoint::not_metered("/v1/messages/count_tokens"),
+                PassthroughEndpoint::metered(PassthroughMethod::Post, "/v1/messages"),
+                PassthroughEndpoint::not_metered(
+                    PassthroughMethod::Post,
+                    "/v1/messages/count_tokens",
+                ),
             ],
         );
-        assert!(caps.endpoint("/v1/messages").unwrap().metered);
-        assert!(!caps.endpoint("/v1/messages/count_tokens").unwrap().metered);
-        assert!(caps.endpoint("/v1/files").is_none());
+        let post = PassthroughMethod::Post;
+        assert!(caps.endpoint(post, "/v1/messages").unwrap().metered);
+        assert!(
+            !caps
+                .endpoint(post, "/v1/messages/count_tokens")
+                .unwrap()
+                .metered
+        );
+        assert!(
+            caps.endpoint(PassthroughMethod::Get, "/v1/messages")
+                .is_none()
+        );
+        assert!(caps.endpoint(post, "/v1/files").is_none());
+    }
+
+    #[test]
+    fn method_wire_names() {
+        assert_eq!(
+            serde_json::to_value(PassthroughMethod::Delete).unwrap(),
+            serde_json::json!("DELETE")
+        );
+        assert_eq!(PassthroughMethod::Get.as_str(), "GET");
     }
 }

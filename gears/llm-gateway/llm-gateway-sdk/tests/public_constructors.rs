@@ -7,9 +7,9 @@ use llm_gateway_sdk::{
     EmbeddingInput, EmbeddingInputType, EmbeddingRequest, EmbeddingResponse, EncodingFormat,
     InputTokensDetails, ItemStatus, LlmGatewayError, MediaInputMode, OutputTokensDetails,
     PassthroughApi, PassthroughCapability, PassthroughEndpoint, PassthroughEvent,
-    PassthroughJsonResponse, PassthroughRequest, PassthroughResponse, ProviderDetails,
-    ProviderErrorCategory, ProviderFailure, ProviderPluginCapabilities, RESPONSE_ID_HEADER,
-    ResponseError, Usage, WebSearchCallOutput, WebSearchResult, WebSearchTool,
+    PassthroughJsonResponse, PassthroughMethod, PassthroughRequest, PassthroughResponse,
+    ProviderDetails, ProviderErrorCategory, ProviderFailure, ProviderPluginCapabilities,
+    RESPONSE_ID_HEADER, ResponseError, Usage, WebSearchCallOutput, WebSearchResult, WebSearchTool,
 };
 use rust_decimal::Decimal;
 
@@ -185,14 +185,18 @@ fn passthrough_capability_and_request_builders() {
         PassthroughCapability::new(
             PassthroughApi::OpenAi,
             vec![
-                PassthroughEndpoint::metered("/v1/responses"),
-                PassthroughEndpoint::metered("/v1/chat/completions"),
+                PassthroughEndpoint::metered(PassthroughMethod::Post, "/v1/responses"),
+                PassthroughEndpoint::metered(PassthroughMethod::Post, "/v1/chat/completions"),
             ],
         ),
     );
     let passthrough = caps.passthrough.expect("declared");
     assert_eq!(passthrough.api, PassthroughApi::OpenAi);
-    assert!(passthrough.endpoint("/v1/responses").is_some());
+    assert!(
+        passthrough
+            .endpoint(PassthroughMethod::Post, "/v1/responses")
+            .is_some()
+    );
     assert!(
         ProviderPluginCapabilities::new(MediaInputMode::UrlForward)
             .passthrough
@@ -201,13 +205,20 @@ fn passthrough_capability_and_request_builders() {
 
     let req = PassthroughRequest::new(
         PassthroughApi::Anthropic,
+        PassthroughMethod::Post,
         "/v1/messages",
-        serde_json::json!({ "model": "anthropic::claude", "stream": true }),
     )
+    .with_body(serde_json::json!({ "model": "anthropic::claude", "stream": true }))
     .with_stream(true)
     .with_header("anthropic-version", "2023-06-01");
     assert!(req.stream);
     assert_eq!(req.headers.len(), 1);
+    assert!(req.body.is_some());
+
+    let get = PassthroughRequest::new(PassthroughApi::OpenAi, PassthroughMethod::Get, "/v1/x")
+        .with_query("limit=10");
+    assert!(get.body.is_none());
+    assert_eq!(get.query.as_deref(), Some("limit=10"));
 }
 
 #[test]
