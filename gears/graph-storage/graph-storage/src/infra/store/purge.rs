@@ -46,7 +46,14 @@ pub async fn purge_node(
                     tenant,
                     &scope,
                     tx,
-                    |outcome: &PurgeOutcome| outcome.purged_nodes + outcome.purged_edges > 0,
+                    |outcome: &PurgeOutcome| {
+                        // A purge that removed anything bumped the revision.
+                        if outcome.purged_nodes + outcome.purged_edges > 0 {
+                            super::offboarding::Wrote::Revision
+                        } else {
+                            super::offboarding::Wrote::Nothing
+                        }
+                    },
                     Box::pin(purge_in_tx(tenant, &scope, tx, &key, options)),
                 )
                 .await?;

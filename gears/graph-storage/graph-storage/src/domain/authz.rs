@@ -288,9 +288,10 @@ pub fn only(scope: &AccessScope, tenant: Uuid) -> bool {
 /// Each constraint's tenant filter loses the tenants in `gone`; a constraint
 /// left with no tenant admits nothing and is dropped. `None` when the scope
 /// cannot be narrowed in memory -- unconstrained, a constraint without a
-/// tenant filter, or a tenant filter this build cannot enumerate, such as a
-/// subtree resolved in the database -- so the caller fails closed rather
-/// than serve a scope that may still reach a tenant in `gone`.
+/// tenant filter, a tenant filter this build cannot enumerate, such as a
+/// subtree resolved in the database, or a tenant value that is no UUID -- so
+/// the caller fails closed rather than serve a scope that may still reach a
+/// tenant in `gone`.
 #[must_use]
 pub fn without_tenants(scope: &AccessScope, gone: &[Uuid]) -> Option<AccessScope> {
     if scope.is_deny_all() {
@@ -313,12 +314,15 @@ pub fn without_tenants(scope: &AccessScope, gone: &[Uuid]) -> Option<AccessScope
                 return None;
             }
             names_a_tenant = true;
-            let left: Vec<ScopeValue> = filter
-                .values()
-                .iter()
-                .filter(|value| value.as_uuid().is_none_or(|tenant| !gone.contains(&tenant)))
-                .cloned()
-                .collect();
+            // A value that is no tenant id cannot be told apart from a tenant
+            // in `gone`, so the scope is refused, as `only` refuses it.
+            let mut left: Vec<ScopeValue> = Vec::new();
+            for value in filter.values() {
+                let tenant = value.as_uuid()?;
+                if !gone.contains(&tenant) {
+                    left.push(value.clone());
+                }
+            }
             if left.is_empty() {
                 admits_none = true;
                 break;
@@ -421,6 +425,19 @@ mod tests {
                 "owner_id", child,
             )])]);
         assert!(without_tenants(&no_tenant, &[child]).is_none());
+        let not_a_tenant_id =
+            AccessScope::from_constraints(vec![ScopeConstraint::new(vec![ScopeFilter::r#in(
+                pep_properties::OWNER_TENANT_ID,
+                vec![
+                    ScopeValue::Uuid(parent),
+                    ScopeValue::String("not-a-uuid".to_owned()),
+                ],
+            )])]);
+        assert!(
+            without_tenants(&not_a_tenant_id, &[child]).is_none(),
+            "a value that may be the tenant being offboarded is refused, as `only` refuses it"
+        );
+        assert!(!only(&not_a_tenant_id, parent));
         let resolved_in_the_database =
             AccessScope::from_constraints(vec![ScopeConstraint::new(vec![
                 ScopeFilter::in_tenant_subtree(

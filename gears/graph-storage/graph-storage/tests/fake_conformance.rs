@@ -809,3 +809,8 @@ async fn offboarding_is_idempotent_and_only_for_a_fenced_tenant() {
     conformance::offboarding_is_idempotent_and_only_for_a_fenced_tenant(&store(), Uuid::now_v7())
         .await;
 }
+
+#[tokio::test]
+async fn the_fenced_tenants_are_listed_for_the_read_path() {
+    conformance::the_fenced_tenants_are_listed_for_the_read_path(&store(), Uuid::now_v7()).await;
+}

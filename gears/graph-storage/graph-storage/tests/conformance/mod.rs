@@ -8588,7 +8588,7 @@ pub async fn edge_payloads_are_read_for_live_edges_only(store: &dyn GraphStoreV1
 /// tombstone, three idempotency receipts, three replaced scopes and a
 /// claimed source namespace. Three of each multi-column key, so a batch of
 /// two has to delete several rows by key in one statement.
-async fn seed_everything(store: &dyn GraphStoreV1, tenant: Uuid) {
+pub async fn seed_everything(store: &dyn GraphStoreV1, tenant: Uuid) {
     let scope = AccessScope::for_tenant(tenant);
     let ctx = ctx(tenant, &scope, None);
     seed_reference_ontology(store, &ctx).await;
@@ -8953,5 +8953,66 @@ pub async fn offboarding_is_idempotent_and_only_for_a_fenced_tenant(
             .await
             .expect("a fence after the end"),
         done
+    );
+}
+
+/// The read path's listings: a deletion under way is listed under a scope
+/// that reaches it and under no other, and every fence is listed for the
+/// gear's in-memory set, finished or not. A store that declares offboarding
+/// and leaves either out would serve a tenant under deletion.
+pub async fn the_fenced_tenants_are_listed_for_the_read_path(
+    store: &dyn GraphStoreV1,
+    tenant: Uuid,
+) {
+    use toolkit_security::{ScopeConstraint, ScopeFilter, ScopeValue, pep_properties};
+
+    let other = Uuid::now_v7();
+    seed_everything(store, tenant).await;
+    fence(store, tenant, None).await.expect("the fence");
+    let both = AccessScope::from_constraints(vec![ScopeConstraint::new(vec![ScopeFilter::r#in(
+        pep_properties::OWNER_TENANT_ID,
+        vec![ScopeValue::Uuid(other), ScopeValue::Uuid(tenant)],
+    )])]);
+    let other_only = AccessScope::for_tenant(other);
+
+    let reached = store
+        .fenced_tenants(&ctx(other, &both, None))
+        .await
+        .expect("the listing reads");
+    assert_eq!(
+        reached,
+        [tenant],
+        "a scope that reaches the tenant lists it"
+    );
+    let not_reached = store
+        .fenced_tenants(&ctx(other, &other_only, None))
+        .await
+        .expect("the listing reads");
+    assert!(
+        not_reached.is_empty(),
+        "a scope that does not reach it lists nothing"
+    );
+    let every = store.fenced_tenant_ids().await.expect("the fences read");
+    assert!(
+        every.contains(&tenant) && !every.contains(&other),
+        "{every:?}"
+    );
+
+    offboard_fully(store, tenant, 100).await;
+    let running = store
+        .fenced_tenants(&ctx(other, &both, None))
+        .await
+        .expect("the listing reads");
+    assert!(
+        running.is_empty(),
+        "a finished deletion is no longer under way"
+    );
+    assert!(
+        store
+            .fenced_tenant_ids()
+            .await
+            .expect("the fences read")
+            .contains(&tenant),
+        "the fence stays: no write may recreate the tenant"
     );
 }

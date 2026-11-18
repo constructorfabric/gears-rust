@@ -414,6 +414,12 @@ impl GraphStoreV1 for PgGraphStore {
         offboarding::fenced_ids(self, ctx).await
     }
 
+    async fn fenced_tenant_ids(
+        &self,
+    ) -> Result<Vec<graph_storage_sdk::models::TenantId>, GraphStoreError> {
+        offboarding::all_fenced_ids(self).await
+    }
+
     async fn offboard_step(
         &self,
         tenant: graph_storage_sdk::models::TenantId,

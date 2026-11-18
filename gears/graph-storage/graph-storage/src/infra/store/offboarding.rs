@@ -57,15 +57,35 @@ use crate::infra::storage::entity::{
 };
 use crate::infra::store::{PgGraphStore, TxStoreError, map_db_error, map_scope_err};
 
+/// What a write transaction's body wrote, as the fence needs to know it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wrote {
+    /// Nothing: a replayed ingest, a delete of a row already gone. The body
+    /// takes no lock and needs no check.
+    Nothing,
+    /// Rows, and the tenant's revision with them: the body's revision bump
+    /// took the revision row already and holds it to the commit, so only the
+    /// fence is read again.
+    Revision,
+    /// Rows without the revision: the revision row is taken here, then the
+    /// fence read again.
+    Rows,
+}
+
 /// Run one write transaction's work for `tenant` inside the fence.
 ///
-/// Refuses at once when the tenant is already fenced, runs `body`, and, when
-/// `wrote` says the body changed something, ends by taking the tenant's
-/// revision row and reading the fence again, so the lock is held only to the
-/// commit right after. A body that wrote nothing -- a replayed ingest -- does
-/// not take the row, so it does not queue behind the tenant's other writes.
-/// Every write transaction goes through here: a write path that skipped
-/// either check would be a write the fence cannot stop.
+/// Runs `body`, and when it wrote, ends holding the tenant's revision row
+/// and reading the fence again, so the lock is held only to the commit right
+/// after. The fence takes the same row first, so whichever gets it first,
+/// nothing commits for the tenant after its fence. A body that wrote nothing
+/// takes no lock, so it does not queue behind the tenant's other writes.
+/// Every write transaction goes through here: a write path that skipped the
+/// check would be a write the fence cannot stop.
+///
+/// The request path refuses a fenced tenant before the transaction starts;
+/// a body that fails for a tenant fenced since -- on a type the deletion
+/// already removed, say -- answers `TenantFenced` rather than what it
+/// tripped over.
 ///
 /// # Errors
 ///
@@ -75,21 +95,33 @@ pub async fn fenced_write<T, F>(
     tenant: TenantId,
     scope: &AccessScope,
     tx: &impl DBRunner,
-    wrote: impl FnOnce(&T) -> bool,
+    wrote: impl FnOnce(&T) -> Wrote,
     body: F,
 ) -> Result<T, GraphStoreError>
 where
     F: Future<Output = Result<T, GraphStoreError>>,
 {
-    if fence_of(tenant, scope, tx).await?.is_some() {
-        return Err(GraphStoreError::TenantFenced { tenant });
-    }
-    let outcome = body.await?;
-    if wrote(&outcome) {
-        lock_revision_row(tenant, scope, tx).await?;
-        if fence_of(tenant, scope, tx).await?.is_some() {
-            return Err(GraphStoreError::TenantFenced { tenant });
+    let outcome = match body.await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // A failed statement aborts the transaction, so the read fails
+            // too; the body's own error stands then.
+            return Err(match fence_of(tenant, scope, tx).await {
+                Ok(Some(_)) => GraphStoreError::TenantFenced { tenant },
+                Ok(None) | Err(_) => error,
+            });
         }
+    };
+    let check = match wrote(&outcome) {
+        Wrote::Nothing => false,
+        Wrote::Revision => true,
+        Wrote::Rows => {
+            lock_revision_row(tenant, scope, tx).await?;
+            true
+        }
+    };
+    if check && fence_of(tenant, scope, tx).await?.is_some() {
+        return Err(GraphStoreError::TenantFenced { tenant });
     }
     Ok(outcome)
 }
@@ -253,9 +285,21 @@ pub async fn fence(
         .transaction_ref_mapped::<_, TenantOffboarding, TxStoreError>(move |tx| {
             let scope = scope.clone();
             Box::pin(async move {
+                // A tenant fenced already answers its record without taking
+                // the revision row: a step may be deleting it under the
+                // record's lock, and the fence must not wait on that record
+                // while holding the row the step deletes next.
+                if let Some(row) = fence_of(tenant, &scope, tx).await? {
+                    return Ok(to_record(&row)?);
+                }
                 // The revision row first, as every write takes it: this is
                 // what orders the fence against a write still running.
                 lock_revision_row(tenant, &scope, tx).await?;
+                // Another fence may have committed while this one waited for
+                // the row; read again, now that a new statement sees it.
+                if let Some(row) = fence_of(tenant, &scope, tx).await? {
+                    return Ok(to_record(&row)?);
+                }
                 let active = tenant_offboarding::ActiveModel {
                     tenant_id: ActiveValue::Set(tenant),
                     deletion_generation: ActiveValue::Set(
@@ -339,6 +383,25 @@ pub async fn fenced_ids(
 #[derive(Debug, sea_orm::FromQueryResult)]
 struct TenantRowId {
     tenant_id: TenantId,
+}
+
+/// Every tenant ever fenced, finished or not, for the gear's in-memory set:
+/// the id column only. The deployment's own bookkeeping across tenants, as
+/// the worker's listing.
+pub async fn all_fenced_ids(store: &PgGraphStore) -> Result<Vec<TenantId>, GraphStoreError> {
+    let conn = store.db().conn().map_err(|error| map_db_error(&error))?;
+    let rows = tenant_offboarding::Entity::find()
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .project_all(&conn, |query| {
+            query
+                .select_only()
+                .column(tenant_offboarding::Column::TenantId)
+                .into_model::<TenantRowId>()
+        })
+        .await
+        .map_err(map_scope_err)?;
+    Ok(rows.into_iter().map(|row| row.tenant_id).collect())
 }
 
 /// The records of fenced tenants whose deletion has not finished, oldest
@@ -426,6 +489,24 @@ enum Kind {
 /// The order the deletion takes the kinds in. The test below checks it
 /// names every kind once, so a kind added to the enum and left out here
 /// fails it rather than leave its rows behind a finished record.
+impl Kind {
+    /// The entity module whose rows this kind removes, as named under
+    /// `infra/storage/entity`. The test below holds it to the schema: every
+    /// entity with a tenant column is some kind's, or a named exception.
+    #[cfg(test)]
+    const fn entity(self) -> &'static str {
+        match self {
+            Self::Edges => "edge",
+            Self::Nodes => "node",
+            Self::Types => "gts_type",
+            Self::Scopes => "scope_registry",
+            Self::Receipts => "ingest_idempotency",
+            Self::Namespaces => "source_namespace_owner",
+            Self::Meta => "graph_meta",
+        }
+    }
+}
+
 const ORDER: [Kind; 7] = [
     Kind::Edges,
     Kind::Nodes,
@@ -754,13 +835,13 @@ pub async fn step(
                     .exec(tx)
                     .await
                     .map_err(map_scope_err)?;
-                Ok(TenantOffboarding {
-                    completed_at,
-                    removed: counts.counts(),
-                    failures: 0,
-                    last_failure: None,
-                    ..to_record(&row)?
-                })
+                // The row as stored: the database keeps microseconds, and
+                // answering the clock's own value would differ from every
+                // later read of the same record.
+                let stored = fence_of(tenant, &scope, tx)
+                    .await?
+                    .ok_or(GraphStoreError::NotFound)?;
+                Ok(to_record(&stored)?)
             })
         })
         .await
@@ -785,6 +866,34 @@ mod tests {
                 "{kind:?}"
             );
         }
+    }
+
+    /// Every entity with a tenant column is removed by some kind, but the
+    /// embedding spaces, which hold only the deployment's own rows under the
+    /// nil tenant, and the record, which stays. A tenant-keyed table added to
+    /// the schema and not to the deletion fails here rather than leave its
+    /// rows behind a finished record.
+    #[test]
+    fn the_kinds_cover_every_tenant_keyed_entity() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/infra/storage/entity");
+        let mut keyed = std::collections::BTreeSet::new();
+        for file in std::fs::read_dir(&dir).expect("the entity directory") {
+            let path = file.expect("an entity file").path();
+            let source = std::fs::read_to_string(&path).expect("an entity's source");
+            if source.contains("tenant_col") {
+                let name = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .expect("a name");
+                keyed.insert(name.to_owned());
+            }
+        }
+        for kept in ["embedding_space", "tenant_offboarding"] {
+            assert!(keyed.remove(kept), "{kept} is no longer tenant-keyed");
+        }
+        let removed: std::collections::BTreeSet<String> =
+            Kind::iter().map(|kind| kind.entity().to_owned()).collect();
+        assert_eq!(keyed, removed);
     }
 
     /// A key this build does not know survives a write back; a known key

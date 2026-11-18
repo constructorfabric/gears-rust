@@ -473,10 +473,10 @@ pub trait GraphStoreV1: Send + Sync + 'static {
 
     // --- tenant offboarding -----------------------------------------------
     // A store that declares `capabilities().offboarding` implements all of
-    // these; the gear fences nothing on one that does not. The provided
-    // defaults are what a store without offboarding answers: it has fenced
-    // nobody, so there is no record and nothing pending, and anything that
-    // would have to do work is `Unsupported`.
+    // these, and the gear calls none of them on a store that does not. The
+    // provided defaults refuse with `Unsupported`: a store that declares the
+    // capability and misses one fails loudly rather than answer "nobody is
+    // fenced" and serve a tenant under deletion.
 
     /// Fence `ctx.tenant`, once: from this call on, every write for it fails
     /// with `TenantFenced`, including one already in flight that has not
@@ -501,17 +501,30 @@ pub trait GraphStoreV1: Send + Sync + 'static {
         ctx: &StoreCtx<'_>,
     ) -> Result<Option<TenantOffboarding>, GraphStoreError> {
         let _ = ctx;
-        Ok(None)
+        Err(GraphStoreError::Unsupported {
+            what: "tenant offboarding",
+        })
     }
 
     /// The tenants under `ctx.scope` whose deletion is running: their ids
-    /// only, for the read path, which drops them from a read's scope.
+    /// only, for a read whose scope the gear cannot narrow in memory.
     async fn fenced_tenants(&self, ctx: &StoreCtx<'_>) -> Result<Vec<TenantId>, GraphStoreError> {
         let _ = ctx;
-        Ok(Vec::new())
+        Err(GraphStoreError::Unsupported {
+            what: "tenant offboarding",
+        })
     }
 
-    // The three below serve the gear's worker, which acts for no caller:
+    /// Every tenant ever fenced, finished or not: their ids only, for the
+    /// gear's in-memory set, which the request path checks instead of the
+    /// store. Acts for no caller, as the worker's methods below.
+    async fn fenced_tenant_ids(&self) -> Result<Vec<TenantId>, GraphStoreError> {
+        Err(GraphStoreError::Unsupported {
+            what: "tenant offboarding",
+        })
+    }
+
+    // The ones below serve the gear's worker, which acts for no caller:
     // they take the tenant rather than a `StoreCtx`.
 
     /// Remove up to `batch` more of a fenced tenant's rows, in an order the
@@ -549,7 +562,9 @@ pub trait GraphStoreV1: Send + Sync + 'static {
     /// fence first. A record the store cannot read is left out (and the
     /// store says so), rather than failing the list for every tenant.
     async fn pending_offboardings(&self) -> Result<Vec<TenantOffboarding>, GraphStoreError> {
-        Ok(Vec::new())
+        Err(GraphStoreError::Unsupported {
+            what: "tenant offboarding",
+        })
     }
 }
 

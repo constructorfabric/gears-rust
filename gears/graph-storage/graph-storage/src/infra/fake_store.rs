@@ -231,6 +231,8 @@ pub struct FakeGraphStore {
     /// A tenant whose deletion steps fail, and how many were attempted: the
     /// one failure the worker's handling of a stuck deletion needs.
     failing_offboarding: Mutex<Option<(Uuid, u64)>>,
+    /// The steps of a failing tenant that still run before it fails.
+    succeeding_offboarding: Mutex<Option<(Uuid, u64)>>,
     /// What `capabilities().offboarding` declares.
     offboarding: bool,
 }
@@ -288,6 +290,7 @@ impl FakeGraphStore {
             hydrate_calls: std::sync::atomic::AtomicU64::new(0),
             node_types_answer: NodeTypesAnswer::Typed,
             failing_offboarding: Mutex::new(None),
+            succeeding_offboarding: Mutex::new(None),
             offboarding: true,
         }
     }
@@ -327,6 +330,15 @@ impl FakeGraphStore {
         if let Ok(mut failing) = self.failing_offboarding.lock() {
             *failing = Some((tenant, 0));
         }
+    }
+
+    /// Let `steps` deletion steps of `tenant` run, then fail every later
+    /// one, as [`Self::fail_offboarding_of`] does.
+    pub fn fail_offboarding_of_after(&self, tenant: Uuid, steps: u64) {
+        if let Ok(mut succeeding) = self.succeeding_offboarding.lock() {
+            *succeeding = Some((tenant, steps));
+        }
+        self.fail_offboarding_of(tenant);
     }
 
     /// How many deletion steps were attempted for the failing tenant.
@@ -1643,16 +1655,40 @@ impl GraphStoreV1 for FakeGraphStore {
             .collect())
     }
 
+    async fn fenced_tenant_ids(&self) -> Result<Vec<TenantId>, GraphStoreError> {
+        Ok(self
+            .tenants
+            .lock()
+            .map_err(|_| poisoned())?
+            .offboardings
+            .keys()
+            .copied()
+            .collect())
+    }
+
     async fn offboard_step(
         &self,
         tenant: TenantId,
         batch: std::num::NonZeroU64,
     ) -> Result<TenantOffboarding, GraphStoreError> {
-        if let Some((failing, attempts)) = self
-            .failing_offboarding
+        let still_runs = match self
+            .succeeding_offboarding
             .lock()
             .map_err(|_| poisoned())?
             .as_mut()
+        {
+            Some((succeeding, left)) if *succeeding == tenant && *left > 0 => {
+                *left -= 1;
+                true
+            }
+            _ => false,
+        };
+        if !still_runs
+            && let Some((failing, attempts)) = self
+                .failing_offboarding
+                .lock()
+                .map_err(|_| poisoned())?
+                .as_mut()
             && *failing == tenant
         {
             *attempts += 1;

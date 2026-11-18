@@ -2539,7 +2539,7 @@ A constraint that cannot be represented in SQL for the target entity fails close
 
 **GTS pattern resolution is shared, and never text matching.** Two pattern filters meet over the same type column on one request: the caller's type-family filter and the `resource_type` of the permission that authorized them, which may itself be a GTS wildcard pattern. Both resolve through `GtsIdPattern` — the platform's single definition of the semantics, including the implicit derived-type coverage a bare base identifier already carries — to a set of interned type ids, and the request's effective type set is the intersection of the two sets. No pattern is compiled into SQL text, so there is no `LIKE` escaping surface to get wrong and no second wildcard dialect to drift from the first (`guidelines/GTS.md` §5.1). Admission is the one deliberate exception and is enforced as such: a permission over a pattern must authorize registering a type that does not exist yet, so type registration and ingest match the pattern against the requested identifier directly rather than against the resolved set.
 
-**No path is exempt, and nothing is short-circuited by local state.** The decision for `(caller, ResourceType, action)` is resolved from the PDP on every request — `GET` as well as `POST`, the in-process ClientHub path as well as REST, and again when search or traversal rows are hydrated rather than only when the candidate set is produced. The caches the gear keeps hold schemas, effective traits and interned type ids; none of them holds an authorization decision, and a `(tenant, GTS type)` row already existing locally confers nothing on the caller who asks for it next.
+**No path is exempt, and nothing is short-circuited by local state.** The decision for `(caller, ResourceType, action)` is resolved from the PDP on every request — `GET` as well as `POST`, the in-process ClientHub path as well as REST, and again when search or traversal rows are hydrated rather than only when the candidate set is produced. The caches the gear keeps hold schemas, effective traits and interned type ids; none of them holds an authorization decision, and a `(tenant, GTS type)` row already existing locally confers nothing on the caller who asks for it next. The in-memory set of fenced tenants (§ Tenant Offboarding) is local state too, and it only refuses: it is consulted after the PDP decided and never admits what the PDP did not.
 
 **Decision caching.** The gear caches no PDP decision across requests in v1. One decision is resolved per request per `(ResourceType, action)` and reused across that request's own stages — search arms, folding, hydration — so the staleness window is a single request and a revoked grant stops applying on the caller's next call. Cross-request caching is postponed on a dependency, not on effort: a TTL alone buys throughput at the price of a window in which a revoked permission still works, and the platform PEP publishes no invalidation signal to close it. When it is introduced it requires a revocation epoch or decision version from the authorization side, keyed per principal, and its window becomes part of this contract rather than an implementation detail.
 
@@ -2731,7 +2731,11 @@ operator.
 **Which stores.** A store declares offboarding in its capabilities, and one
 that does implements every offboarding method; the gear refuses to fence on a
 store that does not (`unimplemented`), since it could neither keep the fence nor
-delete the rows. A client scoped to one tenant refuses to offboard another.
+delete the rows, and asks such a store nothing about fences. The trait's
+defaults refuse with `Unsupported`, so a store that declares the capability and
+misses a method fails loudly instead of answering that nobody is fenced. The
+conformance suite holds every store to the read path's listings as well as to
+the deletion. A client scoped to one tenant refuses to offboard another.
 
 **Step 1, in part.** The call takes an optional `deletion_generation`, which
 must be positive (a type that cannot hold anything else), and records it. Nothing checks it: there is no ledger to check
@@ -2739,18 +2743,27 @@ it against. The first call's value stands.
 
 **Step 2, the fence.** A row in `tenant_offboarding` fences its tenant. Every
 operation for it answers `failed_precondition` / `TENANT_FENCED` once the policy
-has decided, so a caller the policy refuses learns nothing about the tenant. A
-read without a named tenant keeps the policy's scope, a parent's subtree
+has decided, so a caller the policy refuses learns nothing about the tenant.
+
+The request path does not ask the store. A fence is permanent and only ever
+added, so each replica holds the set of fenced tenants in memory and reads it
+again from the store every ten seconds; a fence made on a replica is in its
+own set at once. A fence made on another replica is therefore honoured on the
+read path at most ten seconds after it committed; a write is refused at its
+commit whatever the set holds (below). A failed read of the set keeps the last
+one and is tried again after the interval.
+
+A read without a named tenant keeps the policy's scope, a parent's subtree
 included, so it could reach a child being offboarded. When that scope reaches
-beyond the caller's own tenant, the gear asks the store -- under the scope, so
-only for tenants it reaches, and for their ids only -- which are being deleted,
-and the scope loses them before the store serves the read. The hierarchy
-policy lists a subtree's tenants, so it is narrowed exactly; a scope that
-cannot be narrowed in memory and does reach a tenant being deleted is refused
-as `TENANT_FENCED` until the deletion finishes (the policy enforcer refuses
-such scopes before they reach the gear today, so this is a fallback). A
-write that is already running when the fence lands must not commit either, or it
-would recreate rows behind the deleter. The tenant's revision row is the one
+beyond the caller's own tenant, it loses the fenced tenants before the store
+serves the read. The hierarchy policy lists a subtree's tenants, so it is
+narrowed exactly. A scope that cannot be narrowed in memory -- unconstrained,
+a subtree resolved in the database, a tenant value that is no UUID -- is
+checked against the store under that scope, and refused as `TENANT_FENCED`
+while it reaches a deletion under way (the policy enforcer refuses such scopes
+before they reach the gear today, so this is a fallback). A write that is
+already running when the fence lands must not commit either, or it would
+recreate rows behind the deleter. The tenant's revision row is the one
 every write already updates when it changes state, so every write transaction
 ends by taking that row and then reading the fence, and the fence takes the same
 row before it writes itself. Whichever comes first, nothing commits for the
@@ -2762,12 +2775,21 @@ tenant after its fence:
 - The fence takes the row first. The write waits, then reads the committed fence
   (a new statement under read committed, so a new snapshot) and rolls back.
 
-A write also checks the fence when it starts, so one that begins after the fence
-fails as fenced rather than with whatever its first step trips over once the
-tenant's types are gone. Every write transaction -- ingest, soft delete, purge,
-type registration, namespace transfer -- runs inside one wrapper that does both
-checks, and one that wrote nothing, such as a replayed ingest, does not take
-the row. The PostgreSQL conformance lane holds the row open and runs both
+A write whose own revision bump took the row already -- an ingest that changed
+state, a soft delete, a purge -- only reads the fence again; any other write
+takes the row first. A write that fails for a tenant fenced since it started,
+on a type the deletion already removed, say, answers `TENANT_FENCED` rather
+than what it tripped over. Every write transaction -- ingest, soft delete,
+purge, type registration, namespace transfer -- runs inside one wrapper that
+does this, and one that wrote nothing, such as a replayed ingest, does not take
+the row.
+
+The fence itself first reads whether the tenant is fenced already and answers
+that record without taking the row: a deletion step holds the record's row
+while it removes `graph_meta`, the revision row among it, so a second fence
+must not take the two in the opposite order. A tenant not fenced yet has no
+step running; the fence takes the row, reads again in case another fence
+committed meanwhile, and only then writes. The PostgreSQL conformance lane holds the row open and runs both
 orders for ingest, soft delete, type registration and namespace transfer; a
 purge of a fenced tenant is refused in the conformance suite on both stores.
 
@@ -2777,8 +2799,7 @@ on the data. This build has no index builds, backfills, re-embedding or analytic
 jobs to cancel.
 
 **Step 4.** A worker in every replica (the gear's lifecycle task) removes the
-rows of each fenced tenant whose deletion has not finished, oldest fence first,
-in batches of `offboarding_batch` rows (default 1 000) per transaction, with a
+rows of each fenced tenant whose deletion has not finished, in batches of `offboarding_batch` rows (default 1 000) per transaction, with a
 pass every `offboarding_interval_secs` (default 10). It works one kind of row
 per transaction, in an order the foreign keys admit: edges (their endpoints are
 `ON DELETE RESTRICT`), nodes, types, scope registry, idempotency receipts,

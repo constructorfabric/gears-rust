@@ -371,6 +371,22 @@ impl Harness {
         authz: Arc<dyn AuthZResolverApi>,
         tenants: Arc<dyn graph_storage::domain::offboarding::TenantDirectory>,
     ) -> Self {
+        Self::offboarding_replica(
+            store,
+            authz,
+            tenants,
+            Arc::new(graph_storage::domain::offboarding::FencedTenants::default()),
+        )
+    }
+
+    /// The same, as one replica of several over one store: its fenced
+    /// tenants are its own, read again as `fenced` says.
+    pub fn offboarding_replica(
+        store: Arc<FakeGraphStore>,
+        authz: Arc<dyn AuthZResolverApi>,
+        tenants: Arc<dyn graph_storage::domain::offboarding::TenantDirectory>,
+        fenced: Arc<graph_storage::domain::offboarding::FencedTenants>,
+    ) -> Self {
         let engine = Arc::new(HopOverStore {
             store: Arc::clone(&store),
         });
@@ -385,7 +401,8 @@ impl Harness {
                     PolicyEnforcer::new(authz),
                     conformance::coordinator(),
                 )
-                .with_tenant_directory(tenants),
+                .with_tenant_directory(tenants)
+                .with_fenced_tenants(fenced),
             ),
             tenant: Uuid::now_v7(),
         }
@@ -437,6 +454,35 @@ impl Harness {
                 PolicyEnforcer::new(authz),
                 conformance::coordinator(),
             )),
+            tenant: Uuid::now_v7(),
+        }
+    }
+
+    /// The same, reading the fenced tenants again on every request, as if
+    /// each one came after the refresh: a fence made in the store, as on
+    /// another replica, is seen by the next request.
+    pub fn over_store_seeing_every_fence(
+        store: Arc<dyn GraphStoreV1>,
+        fake: Arc<FakeGraphStore>,
+        authz: Arc<dyn AuthZResolverApi>,
+        config: GraphStorageConfig,
+    ) -> Self {
+        let engine = Arc::new(HopOverStore { store: fake });
+        Self {
+            services: Arc::new(
+                GraphServices::new(
+                    ValidatedConfig::unchecked(config),
+                    store,
+                    engine,
+                    PolicyEnforcer::new(authz),
+                    conformance::coordinator(),
+                )
+                .with_fenced_tenants(Arc::new(
+                    graph_storage::domain::offboarding::FencedTenants::refreshed_every(
+                        std::time::Duration::ZERO,
+                    ),
+                )),
+            ),
             tenant: Uuid::now_v7(),
         }
     }
@@ -509,7 +555,13 @@ pub mod without_node_types {
     #[async_trait]
     impl GraphStoreV1 for StoreWithoutNodeTypes {
         fn capabilities(&self) -> StoreCapabilities {
-            self.0.capabilities()
+            // The optional methods keep their defaults, offboarding's among
+            // them, so the store does not declare it: a store that declared it
+            // and kept the defaults would refuse every call.
+            StoreCapabilities {
+                offboarding: false,
+                ..self.0.capabilities()
+            }
         }
 
         async fn register_types_with(

@@ -87,10 +87,18 @@ impl Gear for GraphStorage {
         let provider = select_embedding_provider(&cfg).await?;
         let embedding = resolve_embedding_space(&db, provider, &cfg).await?;
 
+        let worker_store: Arc<dyn graph_storage_sdk::plugin_api::GraphStoreV1> =
+            Arc::clone(&store) as _;
         let services = Arc::new(
             GraphServices::new(cfg, store, engine, enforcer, embedding)
                 .with_tenant_directory(Arc::new(HubTenantDirectory::new(ctx.client_hub()))),
         );
+        // Both before anything is registered: `serve` needs the two, and a
+        // gear that came up with one of them would serve requests while its
+        // worker failed at boot.
+        self.store
+            .set(worker_store)
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
         self.services
             .set(Arc::clone(&services))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;

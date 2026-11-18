@@ -175,7 +175,7 @@ pub async fn transfer(
                         tenant,
                         &scope,
                         tx,
-                        |_: &SourceNamespaceOwner| true,
+                        |_: &SourceNamespaceOwner| super::offboarding::Wrote::Rows,
                         Box::pin(transfer_in_tx(
                             tenant, &scope, tx, &namespace, &new_owner, &subject,
                         )),

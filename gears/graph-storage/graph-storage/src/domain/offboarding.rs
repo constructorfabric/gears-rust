@@ -23,10 +23,13 @@ use tokio_util::sync::CancellationToken;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
+use toolkit_macros::domain_model;
+
 use crate::domain::diagnostics::logged;
 use crate::domain::error::DomainError;
 
 /// What the platform says about a tenant, as far as offboarding needs it.
+#[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TenantState {
     /// Marked deleted: offboarding may start.
@@ -59,6 +62,7 @@ pub trait TenantDirectory: Send + Sync {
 /// No directory at all: every offboarding is refused as a dependency outage.
 /// What the services run with until one is wired, so a deployment that
 /// cannot ask the platform never fences a tenant on a permission alone.
+#[domain_model]
 pub struct NoTenantDirectory;
 
 #[async_trait]
@@ -77,6 +81,7 @@ impl TenantDirectory for NoTenantDirectory {
 
 /// How the worker deletes. Built through [`WorkerSettings::new`], so the
 /// worker can neither spin nor take nothing.
+#[domain_model]
 #[derive(Clone, Copy, Debug)]
 pub struct WorkerSettings {
     batch: NonZeroU64,
@@ -157,6 +162,7 @@ fn due(
 /// itself. The record keeps them too, but in a database outage the note on
 /// the record fails with the step, and the backoff and the escalation must
 /// not depend on the store being healthy enough not to need them.
+#[domain_model]
 #[derive(Debug, Default)]
 pub struct WorkerState {
     streaks: HashMap<Uuid, Streak>,
@@ -201,6 +207,18 @@ pub async fn run_pending(
     state: &mut WorkerState,
     cancel: &CancellationToken,
 ) -> usize {
+    run_pending_at(store, settings, state, cancel, OffsetDateTime::now_utc()).await
+}
+
+/// [`run_pending`] as if it were `now`: which tenants are due is decided
+/// against it. The seam a test uses to run a pass after a backoff.
+pub async fn run_pending_at(
+    store: &dyn GraphStoreV1,
+    settings: WorkerSettings,
+    state: &mut WorkerState,
+    cancel: &CancellationToken,
+    now: OffsetDateTime,
+) -> usize {
     let Some(mut pending) = list_pending(store, state).await else {
         return 0;
     };
@@ -212,7 +230,6 @@ pub async fn run_pending(
     state
         .streaks
         .retain(|tenant, _| pending.iter().any(|record| record.tenant_id == *tenant));
-    let now = OffsetDateTime::now_utc();
     let mut pass = Pass::default();
     for record in &pending {
         let (failures, last) = state.failures_of(record);
@@ -304,6 +321,10 @@ async fn finish(
     cancel: &CancellationToken,
 ) -> Finish {
     let tenant = record.tenant_id;
+    // The record as the last step left it: a step that made progress cleared
+    // the failures the pass started with, and a failure after it counts from
+    // there, as the store does.
+    let mut latest = record.clone();
     for _ in 0..MAX_STEPS_PER_PASS {
         let step = tokio::select! {
             biased;
@@ -321,13 +342,14 @@ async fn finish(
                     log_completed(&done);
                     return Finish::Done;
                 }
+                latest = done;
             }
             Ok(Err(error)) => {
-                note_failure(store, record, state, &error).await;
+                note_failure(store, &latest, state, &error).await;
                 return Finish::Failed;
             }
             Err(_) => {
-                note_failure(store, record, state, &GraphStoreError::Deadline).await;
+                note_failure(store, &latest, state, &GraphStoreError::Deadline).await;
                 return Finish::Failed;
             }
         }
@@ -421,6 +443,127 @@ pub async fn run_worker(
         tokio::select! {
             () = cancel.cancelled() => return,
             () = tokio::time::sleep(settings.interval + jitter) => {}
+        }
+    }
+}
+
+// --- the fenced tenants, in memory ------------------------------------------
+
+/// How often the fenced tenants are read again from the store. A fence this
+/// replica did not make is honoured on the read path at most this long
+/// after it committed; writes check the fence at commit whatever this holds.
+pub const FENCE_REFRESH: Duration = Duration::from_secs(10);
+
+/// The tenants ever fenced, held in memory for the request path.
+///
+/// A fence is permanent and only ever added, so the set never holds a tenant
+/// it should not: it can only miss one fenced since it was read. The request
+/// path checks this set instead of the store; a write's own transaction
+/// checks the fence at commit, so a miss here never lets a write through,
+/// and a read may be served at most [`FENCE_REFRESH`] after a fence made on
+/// another replica. A fence made here is in the set at once.
+#[domain_model]
+#[derive(Debug)]
+pub struct FencedTenants {
+    known: std::sync::RwLock<Known>,
+    /// One read of the store at a time: requests that find the set stale
+    /// wait for the one reading it rather than each reading it again.
+    reading: tokio::sync::Mutex<()>,
+    refresh: Duration,
+}
+
+#[derive(Debug, Default)]
+struct Known {
+    tenants: std::sync::Arc<std::collections::HashSet<Uuid>>,
+    /// When the store was last asked; none before the first read.
+    read_at: Option<std::time::Instant>,
+}
+
+impl Default for FencedTenants {
+    fn default() -> Self {
+        Self::refreshed_every(FENCE_REFRESH)
+    }
+}
+
+impl FencedTenants {
+    #[must_use]
+    pub fn refreshed_every(refresh: Duration) -> Self {
+        Self {
+            known: std::sync::RwLock::new(Known::default()),
+            reading: tokio::sync::Mutex::new(()),
+            refresh,
+        }
+    }
+
+    /// The fenced tenants, read from `store` when the set is older than its
+    /// refresh. A read that fails keeps the set as it was, logged, and is
+    /// tried again after the refresh; only the first read, with nothing to
+    /// fall back on, fails the request.
+    ///
+    /// # Errors
+    ///
+    /// The store's, when it has never answered.
+    pub async fn current(
+        &self,
+        store: &dyn GraphStoreV1,
+    ) -> Result<std::sync::Arc<std::collections::HashSet<Uuid>>, GraphStoreError> {
+        if let Some(fresh) = self.fresh() {
+            return Ok(fresh);
+        }
+        let _reading = self.reading.lock().await;
+        if let Some(fresh) = self.fresh() {
+            return Ok(fresh);
+        }
+        let read = store.fenced_tenant_ids().await;
+        let mut known = self
+            .known
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match read {
+            Ok(ids) => {
+                // A fence this replica made while the store was read is kept.
+                let mut tenants: std::collections::HashSet<Uuid> = ids.into_iter().collect();
+                tenants.extend(known.tenants.iter().copied());
+                known.tenants = std::sync::Arc::new(tenants);
+                known.read_at = Some(std::time::Instant::now());
+                Ok(std::sync::Arc::clone(&known.tenants))
+            }
+            Err(error) if known.read_at.is_some() => {
+                tracing::warn!(
+                    error = %logged(&error),
+                    "offboarding: the fenced tenants could not be read again; the last read \
+                     stands until the next try"
+                );
+                known.read_at = Some(std::time::Instant::now());
+                Ok(std::sync::Arc::clone(&known.tenants))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The set, when it was read within its refresh.
+    fn fresh(&self) -> Option<std::sync::Arc<std::collections::HashSet<Uuid>>> {
+        let known = self
+            .known
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        known
+            .read_at
+            .is_some_and(|at| at.elapsed() < self.refresh)
+            .then(|| std::sync::Arc::clone(&known.tenants))
+    }
+
+    /// Add a tenant this replica fenced, so its requests see the fence at
+    /// once rather than at the next read.
+    pub fn add(&self, tenant: Uuid) {
+        let mut known = self
+            .known
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !known.tenants.contains(&tenant) {
+            let mut tenants = (*known.tenants).clone();
+            tenants.insert(tenant);
+            known.tenants = std::sync::Arc::new(tenants);
         }
     }
 }

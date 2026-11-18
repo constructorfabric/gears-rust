@@ -37,6 +37,7 @@ use crate::infra::projections::{
     node_ident_columns, node_state_columns, node_typed_columns, type_meta_columns,
 };
 use crate::infra::storage::entity::{edge, graph_meta, ingest_idempotency, node, scope_registry};
+use crate::infra::store::offboarding::Wrote;
 use crate::infra::store::types::interned_ids;
 use crate::infra::store::{PgGraphStore, TxStoreError, map_db_error, map_scope_err};
 
@@ -332,11 +333,11 @@ pub async fn ingest(
             Box::pin(async move {
                 // A replay answers from its receipt and writes nothing, so it
                 // does not take the tenant's revision row at the end.
-                let outcome = super::offboarding::fenced_write(
+                let (outcome, _) = super::offboarding::fenced_write(
                     tenant,
                     &scope,
                     tx,
-                    |outcome: &IngestOutcome| !outcome.replayed,
+                    |(_, wrote): &(IngestOutcome, Wrote)| *wrote,
                     Box::pin(ingest_in_tx(
                         Writer {
                             tenant,
@@ -385,7 +386,7 @@ async fn ingest_in_tx(
     tx: &impl DBRunner,
     request: IngestRequest,
     embedding: &EmbeddingPlan,
-) -> Result<IngestOutcome, GraphStoreError> {
+) -> Result<(IngestOutcome, Wrote), GraphStoreError> {
     let (tenant, scope) = (w.tenant, w.scope);
     let epoch = source_epoch(scope, tx).await?;
     let request_hash = identity::ingest_request_hash(&request);
@@ -395,7 +396,7 @@ async fn ingest_in_tx(
         && let Some(replayed) =
             replay_receipt(scope, producer, tx, key, &request_hash, epoch).await?
     {
-        return Ok(replayed);
+        return Ok((replayed, Wrote::Nothing));
     }
 
     // --- scope replacement, part one: fence before anything else ----------
@@ -499,7 +500,17 @@ async fn ingest_in_tx(
             .map_err(map_scope_err)?;
     }
 
-    Ok(outcome)
+    // A batch that changed state bumped the revision, which holds the row the
+    // fence needs; one that changed nothing may still have stored a receipt
+    // or claimed a namespace, so the row is taken for it.
+    Ok((
+        outcome,
+        if changed {
+            Wrote::Revision
+        } else {
+            Wrote::Rows
+        },
+    ))
 }
 
 /// Lock the scope's fence row, apply generation fencing, and tombstone the
@@ -2222,8 +2233,14 @@ pub async fn soft_delete(
                     tenant,
                     &scope,
                     tx,
+                    // A tombstone bumped the revision; a row already gone
+                    // wrote nothing.
                     |outcome: &DeleteOutcome| {
-                        outcome.tombstoned_nodes + outcome.tombstoned_edges > 0
+                        if outcome.tombstoned_nodes + outcome.tombstoned_edges > 0 {
+                            Wrote::Revision
+                        } else {
+                            Wrote::Nothing
+                        }
                     },
                     Box::pin(soft_delete_in_tx(tenant, &scope, &subject, tx, request)),
                 )

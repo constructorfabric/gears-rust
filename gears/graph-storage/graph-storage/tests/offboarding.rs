@@ -303,6 +303,119 @@ async fn a_deleted_tenant_is_fenced_and_the_worker_removes_its_graph() {
     );
 }
 
+/// Replicas hold the fenced tenants in memory. The replica that fenced sees
+/// it at once; another sees it when it reads the fenced tenants again, and
+/// until then may still serve a read -- but never a write, which checks the
+/// fence at commit.
+#[tokio::test]
+async fn another_replica_honours_a_fence_at_its_next_read_and_refuses_a_write_at_once() {
+    use graph_storage::domain::offboarding::FencedTenants;
+
+    let tenant = Uuid::now_v7();
+    let stand = stand(vec![tenant], vec![tenant]);
+    stand.seed(tenant).await;
+    let replica = |refresh: Duration| -> Arc<dyn GraphStorageClientV1> {
+        let harness = Harness::offboarding_replica(
+            Arc::clone(&stand.store),
+            Arc::clone(&stand.pdp) as Arc<dyn AuthZResolverApi>,
+            Arc::clone(&stand.platform) as Arc<dyn TenantDirectory>,
+            Arc::new(FencedTenants::refreshed_every(refresh)),
+        );
+        Arc::new(GraphStorageLocalClient::new(Arc::clone(&harness.services))).in_tenant(tenant)
+    };
+    let slow = replica(Duration::from_secs(3_600));
+    slow.revision(&stand.service)
+        .await
+        .expect("the slow replica read the fenced tenants: none");
+
+    stand
+        .client
+        .offboard_tenant(&stand.service, tenant, OffboardRequest::default())
+        .await
+        .expect("the tenant is fenced on another replica");
+
+    slow.revision(&stand.service)
+        .await
+        .expect("until its next read, the slow replica still serves a read");
+    let write = slow
+        .ingest(
+            &stand.service,
+            conformance::batch(vec![conformance::node("late", "late")], Vec::new()),
+        )
+        .await
+        .expect_err("a write is refused at commit whatever the replica holds");
+    assert_eq!(reason_of(&write), "TENANT_FENCED");
+    let fresh = replica(Duration::ZERO);
+    let read = fresh
+        .revision(&stand.service)
+        .await
+        .expect_err("a replica that read the fenced tenants again refuses the read");
+    assert_eq!(reason_of(&read), "TENANT_FENCED");
+}
+
+/// A step that makes progress clears the failures the pass started with: a
+/// failure right after it is the first, for the backoff as on the record --
+/// not one more on the count from before, which would hold the tenant back
+/// for five doublings of the interval.
+#[tokio::test]
+async fn a_failure_after_progress_counts_from_the_progress() {
+    let tenant = Uuid::now_v7();
+    let stand = stand(vec![tenant], vec![tenant]);
+    stand.seed(tenant).await;
+    stand
+        .client
+        .offboard_tenant(&stand.service, tenant, OffboardRequest::default())
+        .await
+        .expect("the tenant is fenced");
+    let earlier = graph_storage_sdk::plugin_api::GraphStoreError::Unavailable {
+        reason: "an earlier outage".to_owned(),
+    };
+    for _ in 0..4 {
+        stand
+            .store
+            .record_offboarding_failure(tenant, &earlier)
+            .await
+            .expect("the failure is noted");
+    }
+    stand.store.fail_offboarding_of_after(tenant, 1);
+    let mut state = WorkerState::default();
+    let now = time::OffsetDateTime::now_utc();
+
+    // Once the backoff of the four failures is over: a step runs, the next
+    // fails.
+    graph_storage::domain::offboarding::run_pending_at(
+        stand.store.as_ref(),
+        settings(1),
+        &mut state,
+        &CancellationToken::new(),
+        now + time::Duration::hours(2),
+    )
+    .await;
+    let record = stand
+        .client
+        .tenant_offboarding(&stand.service, tenant)
+        .await
+        .expect("the record reads");
+    assert_eq!(record.failures, 1, "{record:?}");
+    assert_eq!(stand.store.failed_offboarding_attempts(), 1);
+
+    // One failure backs off for twice the interval of ten seconds, so a pass
+    // a minute later tries again.
+    graph_storage::domain::offboarding::run_pending_at(
+        stand.store.as_ref(),
+        settings(1),
+        &mut state,
+        &CancellationToken::new(),
+        time::OffsetDateTime::now_utc() + time::Duration::minutes(1),
+    )
+    .await;
+    assert_eq!(
+        stand.store.failed_offboarding_attempts(),
+        2,
+        "the tenant is due after one failure's backoff"
+    );
+}
+
 /// The permission alone starts nothing: a tenant the platform has not
 /// marked deleted is refused, and nothing is fenced.
 #[tokio::test]

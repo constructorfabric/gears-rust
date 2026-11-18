@@ -393,6 +393,10 @@ pg_case!(
     offboarding_is_idempotent_and_only_for_a_fenced_tenant,
     conformance::offboarding_is_idempotent_and_only_for_a_fenced_tenant
 );
+pg_case!(
+    the_fenced_tenants_are_listed_for_the_read_path,
+    conformance::the_fenced_tenants_are_listed_for_the_read_path
+);
 
 pg_case!(
     source_generations_are_fenced_monotonically,
@@ -4031,7 +4035,10 @@ async fn a_parent_reading_its_subtree_does_not_see_a_fenced_child() {
         return;
     };
     let (parent, child) = (Uuid::now_v7(), Uuid::now_v7());
-    let harness = support::Harness::configured_over_store(
+    // The fence below is made in the store, as on another replica; this
+    // service reads the fenced tenants again on every request, as it would
+    // once their refresh is over.
+    let harness = support::Harness::over_store_seeing_every_fence(
         Arc::clone(&stand.store) as Arc<dyn GraphStoreV1>,
         Arc::new(graph_storage::infra::fake_store::FakeGraphStore::new()),
         Arc::new(support::WithChildren(vec![child])),
@@ -4117,4 +4124,72 @@ async fn a_replayed_ingest_does_not_wait_on_the_revision_row() {
     .expect("the replay answers");
     assert!(replayed.replayed);
     holder.rollback().await.expect("the holder lets go");
+}
+
+// --- the gear itself: init, then its lifecycle entry ---------------------------
+
+/// The gear's configuration, as a deployment hands it.
+struct GearConfig(serde_json::Value);
+
+impl toolkit::config::ConfigProvider for GearConfig {
+    fn get_gear_config(&self, gear_name: &str) -> Option<&serde_json::Value> {
+        (gear_name == "graph-storage").then_some(&self.0)
+    }
+}
+
+/// The gear as the platform starts it -- `init`, then its lifecycle entry --
+/// finishes a deletion fenced before it started: the worker is wired, not
+/// only the function it runs.
+#[tokio::test]
+async fn the_started_gear_removes_a_fenced_tenants_graph() {
+    use toolkit::Gear as _;
+    use toolkit::lifecycle::Runnable as _;
+
+    let Some(stand) = stand().await else { return };
+    let tenant = tenant_on(&stand).await;
+    conformance::seed_everything(stand.store.as_ref(), tenant).await;
+    conformance::fence(stand.store.as_ref(), tenant, None)
+        .await
+        .expect("the fence");
+
+    let hub = Arc::new(toolkit::client_hub::ClientHub::new());
+    hub.register::<dyn authz_resolver_sdk::AuthZResolverApi>(Arc::new(support::AllowInOwnTenant));
+    let ctx = toolkit::GearCtx::new(
+        "graph-storage",
+        Uuid::new_v4(),
+        Arc::new(GearConfig(serde_json::json!({
+            "config": {
+                "embedding_provider": "fake",
+                "offboarding_interval_secs": 1,
+            }
+        }))),
+        hub,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .with_db(toolkit_db::DBProvider::new((*stand.db).clone()));
+    let gear = Arc::new(graph_storage::gear::GraphStorage::default());
+    gear.init(&ctx).await.expect("the gear starts");
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let running = tokio::spawn(Arc::clone(&gear).run(cancel.clone()));
+    let finished = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let record = conformance::record_of(stand.store.as_ref(), tenant)
+                .await
+                .expect("the record stays");
+            if record.is_complete() {
+                return record;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the gear's worker finishes the deletion");
+    cancel.cancel();
+    running
+        .await
+        .expect("the worker task ends")
+        .expect("the worker ends cleanly when cancelled");
+
+    assert!(finished.removed.total() > 0, "{finished:?}");
 }

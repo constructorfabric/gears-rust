@@ -217,9 +217,14 @@ pub async fn register_types(
                         // Every type unchanged wrote nothing, and does not
                         // take the tenant's revision row.
                         |registered: &Vec<RegisteredType>| {
-                            registered
+                            if registered
                                 .iter()
                                 .any(|item| item.outcome != TypeOutcome::Unchanged)
+                            {
+                                super::offboarding::Wrote::Rows
+                            } else {
+                                super::offboarding::Wrote::Nothing
+                            }
                         },
                         register,
                     )
