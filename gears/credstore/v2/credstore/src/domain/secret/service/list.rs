@@ -598,3 +598,7 @@ impl Service {
         Ok(items)
     }
 }
+
+#[cfg(test)]
+#[path = "list_tests.rs"]
+mod tests;

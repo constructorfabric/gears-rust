@@ -2514,3 +2514,15 @@ struct NewRecordParams<'a> {
 /// crate-visible beyond this file's own module subtree.
 #[path = "service/list.rs"]
 mod list;
+
+#[cfg(test)]
+#[path = "service_tests.rs"]
+mod service_tests;
+
+#[cfg(test)]
+#[path = "write_intent_tests.rs"]
+mod write_intent_tests;
+
+#[cfg(test)]
+#[path = "service_bound_tests.rs"]
+mod service_bound_tests;

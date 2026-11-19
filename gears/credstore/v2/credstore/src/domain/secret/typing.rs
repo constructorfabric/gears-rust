@@ -199,3 +199,7 @@ fn validate_value_schema(
 fn redact_schema_error(err: &jsonschema::ValidationError<'_>) -> String {
     format!("violated `{}`", err.schema_path())
 }
+
+#[cfg(test)]
+#[path = "typing_tests.rs"]
+mod typing_tests;

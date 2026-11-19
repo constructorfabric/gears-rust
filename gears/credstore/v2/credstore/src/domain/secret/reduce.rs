@@ -184,3 +184,7 @@ pub(crate) fn reduce_reference<'a>(
         inheritance,
     })
 }
+
+#[cfg(test)]
+#[path = "reduce_tests.rs"]
+mod tests;
