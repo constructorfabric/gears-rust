@@ -192,6 +192,10 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 - **Scenario**: [positive-9.6-oauth2-client-credentials.md](proxy-api/authentication/positive-9.6-oauth2-client-credentials.md)
 - **Mechanism**: Some token endpoints require `client_id/client_secret` via basic auth. Token request uses correct client authentication.
 
+#### Per-request secret references (`X-OAGW-Secret-Ref`)
+- **Scenario**: [positive-31.1-inject-requested-secret.md](request-secret-refs/positive-31.1-inject-requested-secret.md)
+- **Mechanism**: API-key auth with `credential_mode` = `request_ref`. The caller names a CredStore secret per request; OAGW reads it as the caller and injects it when its owner and type pass the upstream's guards. See [Per-request secret references](#per-request-secret-references).
+
 #### Hierarchical auth sharing modes
 - **Scenario**: [positive-9.8-hierarchical-auth-sharing-modes-behave-specified.md](proxy-api/authentication/positive-9.8-hierarchical-auth-sharing-modes-behave-specified.md)
 - **Mechanism**: `auth.sharing=inherit` + child provides auth → child override. `inherit` + child omits → parent auth. `enforce` → child cannot override. `private` → the parent's credential is never sent for a child, also when the child has no upstream of its own; child must provide own.
@@ -547,6 +551,10 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 #### Tenant scoping in management APIs → cross-tenant blocked
 - **Scenario**: [negative-1.3-tenant-scoping-management-apis.md](management-api/auth/negative-1.3-tenant-scoping-management-apis.md)
 - **What happens**: Tenant A cannot `GET /upstreams/{id}` created by tenant B. Listing returns only tenant-visible resources.
+
+#### Per-request secret reference rejected → 400/403/503
+- **Scenarios**: [Per-request secret references](#per-request-secret-references)
+- **What happens**: A malformed header, a header on an upstream that does not accept it, or no header without a default is `400` on `x-oagw-secret-ref`. A secret that is missing, invisible, owned above the auth owner, or of a disallowed type is `403`. A header rule or transform that sets the auth header is a gateway misconfiguration and is `500`. A CredStore outage is `503`. OAGW never falls back to another key.
 
 #### Proxy invoke permission required → 403
 - **Scenario**: [negative-5.1-proxy-invoke-permission-required.md](proxy-api/authz/negative-5.1-proxy-invoke-permission-required.md)
@@ -923,3 +931,20 @@ Phase 1 specifications for [ADR-0021](../docs/ADR/0021-upstream-credentials.md).
 - [Keep approvals on replace](upstream-credentials/positive-30.21-preserve-endpoint-approval.md)
 - [Read a complete credential resource](upstream-credentials/positive-30.22-resource-and-list.md)
 - [Keep wrong-account forwarding out of rollout](upstream-credentials/positive-30.23-rollout-and-audit.md)
+
+## Per-request secret references
+
+Specifications for [ADR-0022](../docs/ADR/0022-request-secret-refs.md). Use the [shared fixture](request-secret-refs/README.md#shared-setup).
+
+- [Inject the requested secret](request-secret-refs/positive-31.1-inject-requested-secret.md)
+- [Use the configured default without a header](request-secret-refs/positive-31.2-default-secret.md)
+- [Use an ancestor's request_ref auth](request-secret-refs/positive-31.3-inherited-mode-and-owner-chain.md)
+- [Reject the header on an upstream that does not accept it](request-secret-refs/negative-31.4-header-not-allowed.md)
+- [Require a reference when there is no default](request-secret-refs/negative-31.5-secret-ref-required.md)
+- [Reject an empty, malformed, repeated or comma-separated header](request-secret-refs/negative-31.6-invalid-header.md)
+- [Answer missing and invisible secrets the same](request-secret-refs/negative-31.7-secret-not-accessible.md)
+- [Refuse a secret owned above the auth owner](request-secret-refs/negative-31.8-owner-outside-chain.md)
+- [Refuse a secret of a type the upstream does not allow](request-secret-refs/negative-31.9-type-not-allowed.md)
+- [Refuse a request whose auth header a rule or transform set](request-secret-refs/negative-31.10-auth-header-changed.md)
+- [Keep the debit on a CredStore outage](request-secret-refs/negative-31.11-credstore-outage.md)
+- [Reject an invalid credential mode on write](request-secret-refs/negative-31.12-invalid-mode-config.md)

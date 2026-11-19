@@ -19,6 +19,7 @@ use crate::domain::model::{
     PassthroughMode, PathSuffixMode, ProxyTarget, RateLimitConfig, ResponseHeaderRules,
     ShadowedRouteLimit, Upstream,
 };
+use crate::domain::plugin::credentials::CredentialMode;
 use crate::domain::plugin::{
     AuthContext, GuardContext, GuardDecision, PluginError, TransformErrorContext,
     TransformRequestContext, TransformResponseContext,
@@ -41,7 +42,7 @@ use crate::infra::plugin::{AuthPluginRegistry, GuardPluginRegistry, TransformPlu
 use super::engine::{ProxyEngine, into_body_stream, map_proxy_error};
 use super::headers;
 use super::streaming::StreamShutdown;
-use super::{request_builder, streaming};
+use super::{request_builder, secret_ref, streaming};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default maximum request body size: 100 MB.
@@ -52,6 +53,8 @@ const RATE_LIMIT_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// Data Plane service implementation: proxy orchestration and plugin execution.
 pub struct DataPlaneServiceImpl {
     cp: Arc<dyn ControlPlaneService>,
+    /// Reads `request_ref` secrets under the caller's context (ADR-0022).
+    credstore: Arc<dyn CredStoreClientV1>,
     backend_selector: Arc<dyn EndpointSelector>,
     engine: Arc<ProxyEngine>,
     /// Ends open SSE streams and WebSocket relays at gear stop and runtime
@@ -92,13 +95,17 @@ impl DataPlaneServiceImpl {
         metrics: Arc<dyn OagwMetricsPort>,
         rate_limiter: Arc<RateLimiter>,
     ) -> Self {
-        let auth_registry =
-            AuthPluginRegistry::with_builtins(credstore, token_http_config, token_cache_config);
+        let auth_registry = AuthPluginRegistry::with_builtins(
+            Arc::clone(&credstore),
+            token_http_config,
+            token_cache_config,
+        );
         let guard_registry = GuardPluginRegistry::with_builtins();
         let transform_registry = TransformPluginRegistry::with_builtins();
 
         Self {
             cp,
+            credstore,
             backend_selector,
             engine,
             stream_shutdown: StreamShutdown::new(),
@@ -183,6 +190,23 @@ impl DataPlaneServiceImpl {
     #[must_use]
     pub fn with_streaming_idle_timeout(mut self, timeout: Duration) -> Self {
         self.streaming_idle_timeout = timeout;
+        self
+    }
+
+    /// Register a transform plugin next to the built-ins, for pipeline
+    /// tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub(crate) fn with_transform_plugin(
+        mut self,
+        plugin_id: &str,
+        plugin: Arc<dyn crate::domain::plugin::TransformPlugin>,
+    ) -> Self {
+        let registry = std::mem::replace(
+            &mut self.transform_registry,
+            TransformPluginRegistry::with_builtins(),
+        );
+        self.transform_registry = registry.with_plugin(plugin_id, plugin);
         self
     }
 
@@ -526,8 +550,12 @@ impl Drop for AuthorizeMetricsGuard {
             phase::TOTAL,
             self.start.elapsed().as_secs_f64(),
         );
-        self.metrics
-            .record_error(metric_labels::UNKNOWN, metric_labels::UNKNOWN, variant);
+        self.metrics.record_error(
+            metric_labels::UNKNOWN,
+            metric_labels::UNKNOWN,
+            variant,
+            None,
+        );
     }
 }
 
@@ -574,6 +602,9 @@ struct RequestMetricsGuard {
     method: &'static str,
     host: String,
     path: String,
+    /// `credential_mode` label: `None` (`unknown`) until the upstream
+    /// resolves.
+    credential_mode: Option<CredentialMode>,
     in_flight: bool,
     outcome: RequestOutcome,
 }
@@ -586,14 +617,16 @@ impl RequestMetricsGuard {
             method,
             host: metric_labels::UNKNOWN.to_owned(),
             path: metric_labels::UNKNOWN.to_owned(),
+            credential_mode: None,
             in_flight: false,
             outcome: RequestOutcome::Pending,
         }
     }
 
-    fn mark_resolved(&mut self, host: String, path: String) {
+    fn mark_resolved(&mut self, host: String, path: String, credential_mode: CredentialMode) {
         self.host = host;
         self.path = path;
+        self.credential_mode = Some(credential_mode);
         self.metrics.increment_in_flight(&self.host);
         self.in_flight = true;
     }
@@ -620,14 +653,21 @@ impl Drop for RequestMetricsGuard {
         );
         match self.outcome {
             RequestOutcome::Success(status) => {
-                self.metrics
-                    .record_request(&self.host, &self.path, self.method, status);
+                self.metrics.record_request(
+                    &self.host,
+                    &self.path,
+                    self.method,
+                    status,
+                    self.credential_mode,
+                );
             }
             RequestOutcome::Error(variant) => {
-                self.metrics.record_error(&self.host, &self.path, variant);
+                self.metrics
+                    .record_error(&self.host, &self.path, variant, self.credential_mode);
             }
             RequestOutcome::Pending => {
-                self.metrics.record_error(&self.host, &self.path, CANCELLED);
+                self.metrics
+                    .record_error(&self.host, &self.path, CANCELLED, self.credential_mode);
             }
         }
     }
@@ -726,6 +766,8 @@ impl DataPlaneServiceImpl {
                 upstream,
                 route,
                 shadowed_route_limits,
+                tenant_chain,
+                auth_owner_tenant_id,
             } = match resolved {
                 Ok(target) => target,
                 Err(e) => {
@@ -749,13 +791,25 @@ impl DataPlaneServiceImpl {
                 .as_ref()
                 .map_or("/", |h| h.path.as_str())
                 .to_owned();
-            guard.mark_resolved(host_label.clone(), path_label.clone());
+            let credential_mode = CredentialMode::of(upstream.auth.as_ref());
+            guard.mark_resolved(host_label.clone(), path_label.clone(), credential_mode);
             self.metrics.record_request_duration_seconds(
                 &host_label,
                 &path_label,
                 phase::RESOLVE,
                 resolve_seconds,
             );
+
+        // 1b. Per-request secret reference (ADR-0022): the header's syntax,
+        //     then the upstream's mode. Both before any capacity is taken or
+        //     CredStore read.
+        let requested_ref = secret_ref::requested_ref(&req_headers, &instance_uri)?;
+        let request_ref = secret_ref::select(
+            credential_mode,
+            upstream.auth.as_ref(),
+            requested_ref,
+            &instance_uri,
+        )?;
 
         // 2. CORS origin enforcement for actual cross-origin requests.
         // Preflight is handled permissively at the handler level (no upstream resolution).
@@ -866,7 +920,28 @@ impl DataPlaneServiceImpl {
         // visible in the latency histogram. We intentionally only observe
         // when an auth plugin is configured — observing on every request
         // would skew the bucket distribution with zero-cost "no auth" rows.
-        if let Some(ref auth) = upstream.auth {
+        //
+        // In `request_ref` mode the proxy reads the secret itself (ADR-0022):
+        // rate admission here, so an exhausted limit does not load the
+        // credential store; the read under the caller's context and the
+        // owner-chain and type guards run after the guard plugins (5b'), so a
+        // guard rejection does not load it either. `config` mode keeps its
+        // order.
+        let mut early_rate_limit = None;
+        if request_ref.is_some() {
+            early_rate_limit = Some(check_rate_limits(
+                &self.rate_limiter,
+                &upstream,
+                &route,
+                &shadowed_route_limits,
+                client_ip,
+                ctx,
+                &instance_uri,
+                self.metrics.as_ref(),
+                &host_label,
+                &path_label,
+            )?);
+        } else if let Some(ref auth) = upstream.auth {
             let auth_start = std::time::Instant::now();
             let auth_result = execute_auth_plugin(
                 &self.auth_registry,
@@ -895,7 +970,8 @@ impl DataPlaneServiceImpl {
             collect_plugin_bindings(&upstream, GuardPluginRegistry::is_guard_plugin);
 
         // Guards check what the client sent (ADR-0017), not the outbound
-        // map: that starts filtered and already carries the credential.
+        // map: that starts filtered and, in `config` mode, already carries
+        // the credential.
         execute_guard_requests(
             &self.guard_registry,
             &guard_bindings,
@@ -906,6 +982,55 @@ impl DataPlaneServiceImpl {
             &instance_uri,
         )
         .await?;
+
+        // 5b'. `request_ref` CredStore read and owner-chain and type guards
+        //      (ADR-0022), after the guard plugins, which need no secret.
+        //      The admission (step 5), the key and the deadline exist together
+        //      or not at all: one `RequestRefState`.
+        let request_ref_state = if let Some((plan, rate_limit)) =
+            request_ref.as_ref().zip(early_rate_limit)
+        {
+            let auth_start = std::time::Instant::now();
+            // The request timeout starts at the CredStore read, which shares
+            // it with selection and the exchange.
+            let deadline = tokio::time::Instant::now() + self.request_timeout;
+            let scope = secret_ref::ResolveScope {
+                tenant_chain: &tenant_chain,
+                auth_owner_tenant_id,
+                upstream_id: upstream.id,
+                route_id: route.id,
+                request_id: req_headers
+                    .get("x-request-id")
+                    .and_then(|v| v.to_str().ok()),
+            };
+            let resolved = secret_ref::resolve(
+                self.credstore.as_ref(),
+                ctx,
+                plan,
+                &scope,
+                deadline,
+                &instance_uri,
+            )
+            .await;
+            self.metrics.record_request_duration_seconds(
+                &host_label,
+                &path_label,
+                phase::AUTH,
+                auth_start.elapsed().as_secs_f64(),
+            );
+            let secret = resolved?;
+            // Guard 6: header rules and transforms never see the key. Strip
+            // the auth header now; the key goes in after the final header
+            // setup (step 6b).
+            secret.strip(&mut outbound_headers);
+            Some(RequestRefState {
+                rate_limit,
+                secret,
+                deadline,
+            })
+        } else {
+            None
+        };
 
         // 5c. Collect transform plugin bindings (upstream then route).
         let transform_bindings =
@@ -943,10 +1068,26 @@ impl DataPlaneServiceImpl {
             headers::strip_hop_by_hop(&mut outbound_headers);
         }
 
+        // 5f. ADR-0022 guard 6: the auth header was stripped before header
+        //     rules and transforms; refuse a request where one of them set it
+        //     (a gateway misconfiguration: 500).
+        if let Some(ref state) = request_ref_state {
+            secret_ref::check_auth_header_unset(
+                &outbound_headers,
+                &state.secret,
+                upstream.id,
+                route.id,
+            )?;
+        }
+
         // 6. Endpoint selection (two-tier: target-host header or round-robin).
         // The request timeout covers selection (a first selection resolves
-        // the endpoints), target resolution and the exchange together.
-        let deadline = tokio::time::Instant::now() + self.request_timeout;
+        // the endpoints), target resolution and the exchange together, and in
+        // `request_ref` mode the CredStore read before them.
+        let deadline = request_ref_state.as_ref().map_or_else(
+            || tokio::time::Instant::now() + self.request_timeout,
+            |state| state.deadline,
+        );
         let selected = tokio::time::timeout_at(
             deadline,
             self.select_endpoint(&upstream, &req_headers, &instance_uri),
@@ -963,20 +1104,31 @@ impl DataPlaneServiceImpl {
 
         headers::set_host_header(&mut outbound_headers, endpoint);
 
+        // 6b. Inject the `request_ref` key last, once the outbound headers are
+        //     final (ADR-0022 guard 6). Writes refuse auth header names the
+        //     gateway sets itself, such as `Host`.
+        if let Some(ref state) = request_ref_state {
+            state.secret.apply(&mut outbound_headers);
+        }
+
         // 7. Check rate limits (upstream, shadowed routes, route) with
         //    scope-aware keying.
-        let rate_limit_outcome = check_rate_limits(
-            &self.rate_limiter,
-            &upstream,
-            &route,
-            &shadowed_route_limits,
-            client_ip,
-            ctx,
-            &instance_uri,
-            self.metrics.as_ref(),
-            &host_label,
-            &path_label,
-        )?;
+        //    A `request_ref` request was admitted before its CredStore read.
+        let rate_limit_outcome = match request_ref_state {
+            Some(state) => state.rate_limit,
+            None => check_rate_limits(
+                &self.rate_limiter,
+                &upstream,
+                &route,
+                &shadowed_route_limits,
+                client_ip,
+                ctx,
+                &instance_uri,
+                self.metrics.as_ref(),
+                &host_label,
+                &path_label,
+            )?,
+        };
 
         // 8. Build upstream URL.
         // Strip the route prefix from the full path so we get:
@@ -1605,6 +1757,19 @@ fn enforce_cors_origin(
     Ok(())
 }
 
+/// What a `request_ref` request carries through the pipeline (ADR-0022): the
+/// rate admission taken before its CredStore read, the resolved key, and the
+/// deadline that started at the read. Built together after the read, absent
+/// in `config` mode, so the three cannot get out of step.
+struct RequestRefState {
+    /// The upstream and route admission from step 5.
+    rate_limit: Option<(RateLimitOutcome, bool)>,
+    /// The resolved key, checked at step 5f and injected at step 6b.
+    secret: secret_ref::InjectedSecret,
+    /// The request deadline, started at the CredStore read.
+    deadline: tokio::time::Instant,
+}
+
 /// Check rate limits for both upstream and route, returning the tightest outcome.
 ///
 /// Buckets are checked narrowest first: the route's bucket (the route's own
@@ -1951,6 +2116,7 @@ fn domain_error_type_name(err: &DomainError) -> &'static str {
         DomainError::RateLimitExceeded { .. } => "RateLimitExceeded",
         DomainError::SecretNotFound { .. } => "SecretNotFound",
         DomainError::SecretRefNotAccessible { .. } => "SecretRefNotAccessible",
+        DomainError::CredentialStoreUnavailable { .. } => "CredentialStoreUnavailable",
         DomainError::DownstreamError { .. } => "DownstreamError",
         DomainError::ProtocolError { .. } => "ProtocolError",
         DomainError::UpstreamDisabled { .. } => "UpstreamDisabled",
@@ -2465,7 +2631,7 @@ mod tests {
             }
             async fn resolve_proxy_target(
                 &self,
-                _: &ProxyGrant,
+                grant: &ProxyGrant,
                 _: &str,
                 _: &str,
                 _: &str,
@@ -2476,6 +2642,8 @@ mod tests {
                     .clone()
                     .ok_or_else(|| DomainError::not_found("upstream", Uuid::nil()))?;
                 Ok(ProxyTarget {
+                    auth_owner_tenant_id: upstream.tenant_id,
+                    tenant_chain: vec![grant.ctx().subject_tenant_id()],
                     upstream,
                     route,
                     shadowed_route_limits: Vec::new(),
@@ -3136,8 +3304,23 @@ mod tests {
     }
 
     impl OagwMetricsPort for DurationRecorder {
-        fn record_request(&self, _: &str, _: &str, _: &str, _: u16) {}
-        fn record_error(&self, _: &str, _: &str, _: &str) {}
+        fn record_request(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: u16,
+            _: Option<crate::domain::plugin::credentials::CredentialMode>,
+        ) {
+        }
+        fn record_error(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: Option<crate::domain::plugin::credentials::CredentialMode>,
+        ) {
+        }
         fn record_request_duration_seconds(&self, host: &str, path: &str, phase: &str, _: f64) {
             self.0
                 .lock()
@@ -3293,10 +3476,23 @@ mod tests {
     }
 
     impl OagwMetricsPort for RequestRecorder {
-        fn record_request(&self, _: &str, _: &str, _: &str, status: u16) {
+        fn record_request(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            status: u16,
+            _: Option<crate::domain::plugin::credentials::CredentialMode>,
+        ) {
             self.push(format!("request {status}"));
         }
-        fn record_error(&self, _: &str, _: &str, variant: &str) {
+        fn record_error(
+            &self,
+            _: &str,
+            _: &str,
+            variant: &str,
+            _: Option<crate::domain::plugin::credentials::CredentialMode>,
+        ) {
             self.push(format!("error {variant}"));
         }
         fn record_request_duration_seconds(&self, _: &str, _: &str, phase: &str, _: f64) {
@@ -3894,8 +4090,23 @@ mod tests {
     struct SweepRecorder(std::sync::Mutex<Vec<(u64, u64)>>);
 
     impl OagwMetricsPort for SweepRecorder {
-        fn record_request(&self, _: &str, _: &str, _: &str, _: u16) {}
-        fn record_error(&self, _: &str, _: &str, _: &str) {}
+        fn record_request(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: u16,
+            _: Option<crate::domain::plugin::credentials::CredentialMode>,
+        ) {
+        }
+        fn record_error(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: Option<crate::domain::plugin::credentials::CredentialMode>,
+        ) {
+        }
         fn record_request_duration_seconds(&self, _: &str, _: &str, _: &str, _: f64) {}
         fn increment_in_flight(&self, _: &str) {}
         fn decrement_in_flight(&self, _: &str) {}

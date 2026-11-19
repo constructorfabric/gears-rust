@@ -208,6 +208,12 @@ The system **MUST** provide CRUD operations for upstream configurations. Each up
 
 **Proposed.** A tenant **MUST** be able to use one of several named API keys for the same upstream and route. The consumer chooses the account and owns usage accounting, spend and retries. OAGW checks that the caller can use the key and applies its optional request limit alongside the destination limits. If OAGW cannot use the requested key, it returns an error. If the caller omits the selector, OAGW uses the upstream's existing auth configuration. See [ADR-0021](ADR/0021-upstream-credentials.md).
 
+#### Per-Request Secret References
+
+- [ ] `p1` - **ID**: `cpt-cf-oagw-fr-request-secret-refs`
+
+**Proposed.** When an upstream opts in, a caller **MUST** be able to pass a CredStore secret reference with a proxy request. OAGW reads the secret under the caller's context, injects it with the upstream's auth header and prefix, and never returns the value. OAGW rejects a secret owned above the tenant whose auth config is in effect, or of a type the upstream does not allow, and returns an error instead of using another key. Upstreams that do not opt in keep their configured secret. See [ADR-0022](ADR/0022-request-secret-refs.md).
+
 #### Route Management
 
 - [ ] `p1` - **ID**: `cpt-cf-oagw-fr-route-mgmt`

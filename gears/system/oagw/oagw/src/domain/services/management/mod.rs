@@ -360,47 +360,22 @@ impl ControlPlaneService for ControlPlaneServiceImpl {
         path: &str,
         tags: Tags,
     ) -> Result<ProxyTarget, DomainError> {
-        self.resolve_target(grant.ctx(), alias, method, path, tags)
-            .await
-    }
-}
-
-impl ControlPlaneServiceImpl {
-    /// Resolve the proxy target for `ctx`, without a permission check: the
-    /// callers ([`ControlPlaneService::resolve_proxy_target`] and
-    /// [`ControlPlaneService::resolve_proxy_target_for_client`]) authorize.
-    async fn resolve_target(
-        &self,
-        ctx: &SecurityContext,
-        alias: &str,
-        method: &str,
-        path: &str,
-        tags: Tags,
-    ) -> Result<ProxyTarget, DomainError> {
+        let ctx = grant.ctx();
+        // One `get_ancestors` call: the chain serves alias resolution and
+        // the per-request secret owner-chain guard (ADR-0022).
         let tenant_chain = self.build_tenant_chain(ctx).await?;
-        self.resolve_in_chain(ctx, &tenant_chain, alias, method, path, tags)
-            .await
-    }
-
-    /// [`Self::resolve_target`] over a tenant chain the caller built.
-    async fn resolve_in_chain(
-        &self,
-        ctx: &SecurityContext,
-        tenant_chain: &[Uuid],
-        alias: &str,
-        method: &str,
-        path: &str,
-        tags: Tags,
-    ) -> Result<ProxyTarget, DomainError> {
         let resolved = self
-            .resolve_alias_sourced(ctx, tenant_chain, alias, Some((method, path)), tags)
+            .resolve_alias_sourced(ctx, &tenant_chain, alias, Some((method, path)), tags)
             .await?;
+        let route = resolved.route.ok_or_else(|| DomainError::Internal {
+            message: "resolve_alias returned None route for method+path request".into(),
+        })?;
         Ok(ProxyTarget {
             upstream: resolved.effective,
-            route: resolved.route.ok_or_else(|| DomainError::Internal {
-                message: "resolve_alias returned None route for method+path request".into(),
-            })?,
+            route,
             shadowed_route_limits: resolved.shadowed_route_limits,
+            tenant_chain,
+            auth_owner_tenant_id: resolved.auth_owner_tenant_id,
         })
     }
 }

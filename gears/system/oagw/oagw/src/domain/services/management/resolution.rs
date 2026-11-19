@@ -1,6 +1,6 @@
 use super::alias::{normalize_alias, validate_alias};
 use super::merge::{
-    compute_effective_config, compute_effective_config_reporting, is_visible_to_descendant,
+    compute_effective_config, compute_effective_config_owned, is_visible_to_descendant,
     shadowed_route_limits, shared_route_view, shared_upstream_view,
 };
 use super::validation::validate_endpoint_hostnames_ssrf;
@@ -34,6 +34,8 @@ pub(super) struct ResolvedAlias {
     pub(super) shadowed_route_limits: Vec<ShadowedRouteLimit>,
     /// The rows the answer is built from.
     pub(super) sources: Contributors,
+    /// The tenant of the upstream whose auth is in effect (`inst-merge-3a0`).
+    pub(super) auth_owner_tenant_id: Uuid,
 }
 
 /// Where resolution reads the configuration from.
@@ -209,6 +211,8 @@ impl ControlPlaneServiceImpl {
         // the selected one.
         if merge_chain.is_empty() {
             // Single upstream → apply route overrides directly if present.
+            // It owns its own auth.
+            let auth_owner_tenant_id = selected_upstream.tenant_id;
             let effective = match route {
                 Some(ref route) => {
                     compute_effective_config(std::slice::from_ref(&selected_upstream), Some(route))?
@@ -220,6 +224,7 @@ impl ControlPlaneServiceImpl {
                 route,
                 shadowed_route_limits: Vec::new(),
                 sources,
+                auth_owner_tenant_id,
             });
         }
 
@@ -230,7 +235,7 @@ impl ControlPlaneServiceImpl {
         // Reported on the proxy path only: the SDK's resolve (`Tags::Load`)
         // sends nothing.
         let report = matches!(tags, Tags::Skip);
-        let effective = compute_effective_config_reporting(
+        let (effective, auth_owner_tenant_id) = compute_effective_config_owned(
             &merge_vec,
             route.as_ref(),
             &shadowed,
@@ -251,6 +256,7 @@ impl ControlPlaneServiceImpl {
             route,
             shadowed_route_limits: shadowed_route_limits(&shadowed),
             sources,
+            auth_owner_tenant_id,
         })
     }
 

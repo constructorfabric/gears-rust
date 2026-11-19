@@ -948,7 +948,7 @@ async fn a_hierarchy_rejection_skips_and_the_old_config_serves(b: Backend) {
     );
     let mut ancestor = upstream_at(root, "api.example.com").request;
     ancestor.auth = Some(AuthConfig {
-        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Enforce,
         config: None,
     });
@@ -962,7 +962,7 @@ async fn a_hierarchy_rejection_skips_and_the_old_config_serves(b: Backend) {
     );
 
     upstreams[0].request.auth = Some(AuthConfig {
-        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });

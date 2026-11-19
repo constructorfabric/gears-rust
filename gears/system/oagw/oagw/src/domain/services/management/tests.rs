@@ -2839,7 +2839,7 @@ async fn bind_rejects_auth_override_on_enforce() {
     let root_ctx = test_ctx(root);
     let mut root_req = make_create_upstream_hostname();
     root_req.auth = Some(AuthConfig {
-        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Enforce,
         config: None,
     });
@@ -2909,7 +2909,7 @@ async fn bind_allows_inherit_override_with_permissions() {
     let root_ctx = test_ctx(root);
     let mut root_req = make_create_upstream_hostname();
     root_req.auth = Some(AuthConfig {
-        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -2973,7 +2973,7 @@ async fn bind_rejects_inaccessible_secret_ref() {
     let root_ctx = test_ctx(root);
     let mut root_req = make_create_upstream_hostname();
     root_req.auth = Some(AuthConfig {
-        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -3024,7 +3024,7 @@ async fn bind_maps_not_found_error_to_secret_ref_not_accessible() {
     let root_ctx = test_ctx(root);
     let mut root_req = make_create_upstream_hostname();
     root_req.auth = Some(AuthConfig {
-        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -3157,7 +3157,7 @@ async fn bind_allows_accessible_secret_ref() {
     let root_ctx = test_ctx(root);
     let mut root_req = make_create_upstream_hostname();
     root_req.auth = Some(AuthConfig {
-        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -3221,7 +3221,7 @@ async fn update_rejects_auth_override_on_enforce() {
     let root_ctx = test_ctx(root);
     let mut root_req = make_create_upstream_hostname();
     root_req.auth = Some(AuthConfig {
-        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Enforce,
         config: None,
     });
@@ -3267,7 +3267,7 @@ async fn create_alias_matching_ancestor_requires_bind() {
     let root_ctx = test_ctx(root);
     let mut root_req = make_create_upstream_ip("openai");
     root_req.auth = Some(AuthConfig {
-        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -3294,7 +3294,7 @@ async fn create_alias_matching_ancestor_enforce_rejects_incompatible_auth() {
     let root_ctx = test_ctx(root);
     let mut root_req = make_create_upstream_ip("openai");
     root_req.auth = Some(AuthConfig {
-        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Enforce,
         config: None,
     });
@@ -3423,7 +3423,7 @@ async fn update_with_no_overrides_still_validates_ancestor_auth_enforce() {
     let root_ctx = test_ctx(root);
     let mut root_req = make_create_upstream_hostname();
     root_req.auth = Some(AuthConfig {
-        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Enforce,
         config: None,
     });
@@ -3477,7 +3477,7 @@ async fn proxy_target_resolves_route_from_ancestor_upstream() {
     let root_ctx = test_ctx(root);
     let mut root_req = make_create_upstream_hostname();
     root_req.auth = Some(AuthConfig {
-        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -3546,7 +3546,7 @@ async fn proxy_target_prefers_child_route_over_ancestor() {
     let root_ctx = test_ctx(root);
     let mut root_req = make_create_upstream_hostname();
     root_req.auth = Some(AuthConfig {
-        plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
+        plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
         sharing: SharingMode::Inherit,
         config: None,
     });
@@ -7425,7 +7425,7 @@ async fn nul_in_strings_stored_as_json_is_rejected_on_create_and_update() {
     let map = |key: &str, value: &str| HashMap::from([(key.to_owned(), value.to_owned())]);
     let auth = |config| {
         Some(AuthConfig {
-            plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
+            plugin_type: crate::domain::gts_helpers::NOOP_AUTH_PLUGIN_ID.into(),
             sharing: SharingMode::Private,
             config: Some(config),
         })
@@ -7652,6 +7652,7 @@ async fn resolution_rejects_an_upstream_whose_hostname_was_denied_later() {
             Tags::Load,
         )
         .await
+        .map(crate::domain::model::ProxyTarget::into_parts)
         .expect("resolves before the policy changes");
 
     let after = service(
@@ -8704,6 +8705,7 @@ async fn a_cached_upstream_whose_host_is_denied_later_is_rejected() {
             Tags::Skip,
         )
         .await
+        .map(crate::domain::model::ProxyTarget::into_parts)
         .expect("resolves before the policy changes");
 
     let after = service(SsrfPolicy {
@@ -9144,10 +9146,13 @@ async fn withheld_credentials_are_counted_and_warned_once() {
         Tags::Load,
     )
     .await
+    .map(crate::domain::model::ProxyTarget::into_parts)
     .unwrap();
 
+    // Copy out of the lock before asserting, so no guard lives in the macro.
+    let withheld = metrics.withheld.lock().unwrap().clone();
     assert_eq!(
-        *metrics.withheld.lock().unwrap(),
+        withheld,
         vec![
             ("svc".to_owned(), withheld_outcome::DROPPED_AUTH),
             ("svc".to_owned(), withheld_outcome::DROPPED_AUTH),
@@ -11361,6 +11366,7 @@ mod write_validation {
         req.auth = auth(
             APIKEY_AUTH_PLUGIN_ID,
             &[
+                ("header", "authorization"),
                 ("secret_ref", "cred://my-key"),
                 ("client_id_ref", "cred://missing-secret"),
             ],

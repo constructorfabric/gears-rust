@@ -4,10 +4,10 @@
 //! operator needs the server side: a counter per request and a warning per
 //! binding, at most once a minute.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
@@ -29,7 +29,10 @@ type Key = (Uuid, Uuid, WithheldKind);
 #[domain_model]
 #[derive(Default)]
 pub(super) struct WithheldLog {
-    last_warned: Mutex<HashMap<Key, Instant>>,
+    /// When each binding last warned. Sharded, so a report on the request
+    /// path (a `private` ancestor auth is reported per request in the default
+    /// setup) locks only its own binding's shard, not one global lock.
+    last_warned: DashMap<Key, Instant>,
 }
 
 impl WithheldLog {
@@ -63,25 +66,32 @@ impl WithheldLog {
     pub(super) fn warns(&self, withheld: &Withheld) -> bool {
         let key: Key = (withheld.owner_id, withheld.upstream_id, withheld.kind);
         let now = Instant::now();
-        let mut last = self
-            .last_warned
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if last
-            .get(&key)
-            .is_some_and(|at| now.duration_since(*at) < WARN_EVERY)
-        {
+        let quiet = |at: &Instant| now.duration_since(*at) < WARN_EVERY;
+        // The common case, a binding inside its quiet minute: a read of one
+        // shard, no write.
+        if self.last_warned.get(&key).is_some_and(|at| quiet(&at)) {
             return false;
         }
-        if last.len() >= MAX_REMEMBERED {
-            last.retain(|_, at| now.duration_since(*at) < WARN_EVERY);
-            if last.len() >= MAX_REMEMBERED {
+        if !self.last_warned.contains_key(&key) && self.last_warned.len() >= MAX_REMEMBERED {
+            self.last_warned.retain(|_, at| quiet(at));
+            if self.last_warned.len() >= MAX_REMEMBERED {
                 // Every remembered binding is still quiet; a new one waits
                 // for a free slot. The counter still counts it.
                 return false;
             }
         }
-        last.insert(key, now);
-        true
+        // Decide under the binding's shard lock, so two concurrent reports of
+        // one binding warn once.
+        match self.last_warned.entry(key) {
+            Entry::Occupied(mut at) if !quiet(at.get()) => {
+                at.insert(now);
+                true
+            }
+            Entry::Occupied(_) => false,
+            Entry::Vacant(slot) => {
+                slot.insert(now);
+                true
+            }
+        }
     }
 }

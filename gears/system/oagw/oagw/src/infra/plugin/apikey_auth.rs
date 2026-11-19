@@ -1,23 +1,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use credstore_sdk::{CredStoreClientV1, SecretRef};
-use serde::Deserialize;
+use credstore_sdk::CredStoreClientV1;
 
-use crate::domain::plugin::credentials::{SECRET_REF_KEY, credstore_error_kind};
+use crate::domain::plugin::credentials::{
+    ApiKeyAuthConfig, CREDENTIAL_MODE_FIELD, CredentialMode, SECRET_REF_KEY, credstore_error_kind,
+};
 use crate::domain::plugin::{AuthContext, AuthPlugin, PluginError};
-
-/// Configuration for the API key auth plugin.
-#[derive(Debug, Deserialize)]
-struct ApiKeyConfig {
-    /// Header name to set (e.g. "Authorization", "X-API-Key").
-    header: String,
-    /// Prefix prepended to the secret value (e.g. "Bearer ").
-    #[serde(default)]
-    prefix: String,
-    /// Secret reference to resolve (e.g. "cred://openai-key").
-    secret_ref: String,
-}
 
 /// Auth plugin that resolves a secret reference and injects it as a header value.
 pub struct ApiKeyAuthPlugin {
@@ -35,23 +24,29 @@ impl ApiKeyAuthPlugin {
 #[async_trait]
 impl AuthPlugin for ApiKeyAuthPlugin {
     async fn authenticate(&self, ctx: &mut AuthContext) -> Result<(), PluginError> {
-        let config: ApiKeyConfig = serde_json::from_value(
-            serde_json::to_value(&ctx.config)
-                .map_err(|e| PluginError::Internal(format!("invalid apikey auth config: {e}")))?,
-        )
-        .map_err(|e| PluginError::Internal(format!("invalid apikey auth config: {e}")))?;
-
-        let raw_ref = config
-            .secret_ref
-            .strip_prefix("cred://")
-            .unwrap_or(&config.secret_ref);
-        // Errors name the config key: the reference and the store's own text
-        // (which may quote it) stay out of errors and logs (F0008).
-        let key = SecretRef::new(raw_ref).map_err(|e| {
-            PluginError::Internal(format!(
-                "auth.config.{SECRET_REF_KEY}: {}",
-                credstore_error_kind(&e)
-            ))
+        // Parsed by the shared parser the write check and the proxy use.
+        // `request_ref` mode is the proxy's (ADR-0022): it reads the secret
+        // under the guards. Any mode but `config` (an unknown one included)
+        // is refused here, before anything is read, so the plugin never
+        // injects a default without the guards. Errors name the config key:
+        // the reference and the store's own text stay out of errors and logs
+        // (F0008).
+        const ONLY_CONFIG: &str = "apikey auth plugin runs only in credential_mode 'config'";
+        let config = match ApiKeyAuthConfig::parse(Some(&ctx.config)) {
+            Ok(config) if config.mode == CredentialMode::Config => config,
+            Ok(_) => return Err(PluginError::Internal(ONLY_CONFIG.into())),
+            Err(e) if e.field == CREDENTIAL_MODE_FIELD => {
+                return Err(PluginError::Internal(ONLY_CONFIG.into()));
+            }
+            Err(e) => {
+                return Err(PluginError::Internal(format!(
+                    "invalid apikey auth config: {}",
+                    e.detail
+                )));
+            }
+        };
+        let key = config.secret_ref.ok_or_else(|| {
+            PluginError::Internal(format!("invalid apikey auth config: no {SECRET_REF_KEY}"))
         })?;
 
         let response = self
@@ -108,6 +103,58 @@ mod tests {
 
     fn make_auth_ctx(config: HashMap<String, String>) -> AuthContext {
         AuthContext::new(config, test_security_context())
+    }
+
+    /// ADR-0022: `request_ref` mode belongs to the proxy, which reads the
+    /// secret under the owner-chain and type guards. The plugin refuses any
+    /// mode but `config` (here `request_ref` and an unknown value) before it
+    /// reads anything, so a `request_ref` config that reaches it never gets
+    /// its default `secret_ref` injected without the guards. The secret is
+    /// readable, so without the refusal it would be read and injected.
+    #[tokio::test]
+    async fn refuses_every_mode_but_config_before_reading() {
+        use crate::domain::plugin::credentials::CREDENTIAL_MODE_KEY;
+        use crate::infra::proxy::credstore_spy::{CredStoreSpy, SpySecret};
+
+        for mode in ["request_ref", "header_ref"] {
+            let spy = Arc::new(CredStoreSpy::empty());
+            spy.add_secret(SpySecret::new("default-key", "sk-default"));
+            let plugin = ApiKeyAuthPlugin::new(spy.clone());
+
+            let mut config = make_config("authorization", "Bearer ", "cred://default-key");
+            config.insert(CREDENTIAL_MODE_KEY.into(), mode.into());
+            let mut ctx = make_auth_ctx(config);
+
+            let err = plugin.authenticate(&mut ctx).await.unwrap_err();
+            assert!(
+                matches!(&err, PluginError::Internal(msg) if msg.contains("credential_mode 'config'")),
+                "{mode}: {err:?}"
+            );
+            assert!(ctx.set_headers.is_empty(), "{mode}: no header is set");
+            assert!(spy.gets().is_empty(), "{mode}: nothing is read");
+        }
+    }
+
+    /// An explicit `credential_mode: config` runs as an absent one does.
+    #[tokio::test]
+    async fn explicit_config_mode_injects() {
+        use crate::domain::plugin::credentials::CREDENTIAL_MODE_KEY;
+
+        let credstore = Arc::new(MockCredStoreClient::with_secrets(vec![(
+            "openai-key".into(),
+            "sk-abc123".into(),
+        )]));
+        let plugin = ApiKeyAuthPlugin::new(credstore);
+
+        let mut config = make_config("authorization", "Bearer ", "cred://openai-key");
+        config.insert(CREDENTIAL_MODE_KEY.into(), "config".into());
+        let mut ctx = make_auth_ctx(config);
+
+        plugin.authenticate(&mut ctx).await.unwrap();
+        assert_eq!(
+            ctx.header_value("authorization").unwrap(),
+            "Bearer sk-abc123"
+        );
     }
 
     #[tokio::test]

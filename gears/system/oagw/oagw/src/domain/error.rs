@@ -174,6 +174,20 @@ pub enum DomainError {
         instance: String,
     },
 
+    /// The credential store failed or timed out while a `request_ref`
+    /// request read its secret (ADR-0022). Canonical `service_unavailable`.
+    #[error("{detail}")]
+    CredentialStoreUnavailable {
+        /// Human-readable explanation of the failure; never names the
+        /// reference.
+        detail: String,
+        /// The credential store's own retry hint, when it gave one; the
+        /// REST mapping falls back to its transient default.
+        retry_after: Option<std::time::Duration>,
+        /// Request instance URI the error relates to (used as the problem `instance`).
+        instance: String,
+    },
+
     /// The upstream returned an invalid or failing response.
     #[error("{detail}")]
     DownstreamError {

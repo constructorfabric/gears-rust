@@ -12,6 +12,9 @@ use crate::domain::model::{
     HttpMatch, HttpMethod, MatchRules, PluginsConfig, RateLimitAlgorithm, RateLimitConfig, Route,
     Scheme, UpdateRouteRequest, UpdateUpstreamRequest,
 };
+use crate::domain::plugin::credentials::{
+    ApiKeyAuthConfig, AuthConfigError, parse_credential_mode, parse_request_secret_types,
+};
 use crate::domain::repo::RowKey;
 use crate::domain::ssrf::SsrfGuard;
 
@@ -100,8 +103,31 @@ fn validate_upstream_content(
         for credential in auth.credential_refs() {
             parse_secret_ref(credential)?;
         }
+        validate_credential_mode(auth)?;
     }
     Ok(())
+}
+
+/// `credential_mode` and `request_secret_types` (ADR-0022), and the API-key
+/// plugin's own keys. The API-key plugin's config goes through
+/// [`ApiKeyAuthConfig::parse`], the parser the plugin and the proxy use,
+/// plus the write-only [`ApiKeyAuthConfig::check_write_policy`]. Another
+/// plugin may carry `credential_mode` and `request_secret_types` (they mean
+/// nothing there), but they must still be well-formed. A `request_ref`
+/// default `secret_ref` is a credential reference like any other and gets
+/// the same checks.
+fn validate_credential_mode(auth: &AuthConfig) -> Result<(), DomainError> {
+    let to_domain = |e: AuthConfigError| DomainError::validation_for(e.field, e.reason, e.detail);
+    let config = auth.config.as_ref();
+    if auth.plugin_type == crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID {
+        return ApiKeyAuthConfig::parse(config)
+            .and_then(|parsed| parsed.check_write_policy())
+            .map_err(to_domain);
+    }
+    let mode = parse_credential_mode(config).map_err(to_domain)?;
+    parse_request_secret_types(config, mode)
+        .map(drop)
+        .map_err(to_domain)
 }
 
 /// The checks of a route create that read nothing. Returns the canonical

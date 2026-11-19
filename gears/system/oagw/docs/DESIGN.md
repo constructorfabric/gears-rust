@@ -56,6 +56,7 @@ This design satisfies the requirements for centralized outbound traffic manageme
 | Alias resolution | `cpt-cf-oagw-fr-alias-resolution` | Path-based routing with alias shadowing |
 | Credential isolation | `cpt-cf-oagw-nfr-credential-isolation` | Auth via `cred_store` references, no direct secret storage |
 | Named upstream credentials (proposed) | `cpt-cf-oagw-fr-upstream-credentials` | Authorize and limit the requested key under the destination's existing policies |
+| Per-request secret references (proposed) | `cpt-cf-oagw-fr-request-secret-refs` | Read the requested secret as the caller and inject it only when its owner and type pass the upstream's guards |
 | Optional persistence | `cpt-cf-oagw-fr-config-persistence` | Database repositories when configured, in-memory otherwise; fail-fast on an unusable database |
 | ToolKit integration | Gears middleware | Single-executable deployment, trait-based DI, secure ORM |
 
@@ -82,6 +83,7 @@ This design satisfies the requirements for centralized outbound traffic manageme
 - `cpt-cf-oagw-adr-upstream-proxy-engine` — Upstream forwarding through the in-house `toolkit-http-proxy` engine instead of the Pingora bridge
 - `cpt-cf-oagw-adr-proxy-config-cache` — Per-replica cache of the proxy lookup with a database; each write evicts only the entries it affects, on every replica through a cluster change log, with a TTL backstop (proposed until its benchmark)
 - `cpt-cf-oagw-adr-upstream-credentials` — [Proposed tenant-local named API keys](ADR/0021-upstream-credentials.md)
+- `cpt-cf-oagw-adr-request-secret-refs` — [Proposed per-request CredStore references with guards](ADR/0022-request-secret-refs.md)
 
 ### 1.3 Architecture Layers
 
@@ -946,10 +948,10 @@ The endpoint selector (`PoolEndpointSelector`) caches each upstream's endpoint p
 
 Prometheus metrics at `/metrics` (admin-only):
 
-- `oagw_requests_total{host, http.request.method, http.route, http.response.status_code}` — counter (label keys follow OTel HTTP semantic conventions; numeric status; method normalized to a standard verb or `_OTHER`; aligned with the inbound API Gateway)
+- `oagw_requests_total{host, http.request.method, http.route, http.response.status_code, credential_mode}` — counter (label keys follow OTel HTTP semantic conventions; numeric status; method normalized to a standard verb or `_OTHER`; aligned with the inbound API Gateway; `credential_mode` is `config` or `request_ref`, see [ADR-0022](ADR/0022-request-secret-refs.md))
 - `oagw_request_duration_seconds{host, http.route, phase}` — histogram (`phase`: `total` for the whole request, `resolve` for the upstream and route lookup, `auth` for the auth plugin; a request that does not resolve records `resolve` with `host` and `http.route` set to `unknown`)
 - `oagw_requests_in_flight{host}` — gauge
-- `oagw_errors_total{host, http.route, error_type}` — counter
+- `oagw_errors_total{host, http.route, error_type, credential_mode}` — counter (`credential_mode` is `unknown` before the upstream resolves)
 - `oagw_circuit_breaker_state{host}` — gauge
 - `oagw_rate_limit_exceeded_total{host, path}` — counter
 
@@ -1083,3 +1085,4 @@ Structured JSON logs to stdout, ingested by centralized logging system (e.g., EL
 | [0019 Upstream Proxy Engine](./ADR/0019-upstream-proxy-engine.md) | `cpt-cf-oagw-tech-dependencies`, `cpt-cf-oagw-seq-proxy-flow` |
 | [0020 Proxy Configuration Cache](./ADR/0020-proxy-config-cache.md) | `cpt-cf-oagw-tech-dependencies`, `cpt-cf-oagw-seq-proxy-flow` |
 | [0021 Named Upstream Credentials](./ADR/0021-upstream-credentials.md) (proposed) | `cpt-cf-oagw-fr-upstream-credentials`, `cpt-cf-oagw-seq-proxy-flow` |
+| [0022 Per-Request Secret References](./ADR/0022-request-secret-refs.md) (proposed) | `cpt-cf-oagw-fr-request-secret-refs`, `cpt-cf-oagw-seq-proxy-flow` |

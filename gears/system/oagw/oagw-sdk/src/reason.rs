@@ -153,6 +153,18 @@ pub mod permission {
     /// the call is refused. Projects to [`DenialReason::Unknown`].
     pub const AUTHZ_SCOPE_NOT_SUPPORTED: &str = "AUTHZ_SCOPE_NOT_SUPPORTED";
 
+    /// The secret a request names in [`crate::SECRET_REF_HEADER`] (or the
+    /// upstream's default in `request_ref` mode) is missing or not visible
+    /// to the caller. Missing and invisible secrets answer the same.
+    pub const SECRET_REF_NOT_ACCESSIBLE: &str = "SECRET_REF_NOT_ACCESSIBLE";
+
+    /// The requested secret resolved, but OAGW refused to send it: its owner
+    /// is above the tenant whose auth config is in effect, or its type is not
+    /// in the upstream's `request_secret_types`. (A header rule or transform
+    /// that sets the auth header is a gateway misconfiguration and returns
+    /// an internal error instead.)
+    pub const SECRET_REF_POLICY_DENIED: &str = "SECRET_REF_POLICY_DENIED";
+
     use core::fmt;
 
     /// Typed view of the wire `reason` strings emitted alongside
@@ -174,6 +186,10 @@ pub mod permission {
         CorsOriginNotAllowed,
         /// See [`CORS_METHOD_NOT_ALLOWED`].
         CorsMethodNotAllowed,
+        /// See [`SECRET_REF_NOT_ACCESSIBLE`].
+        SecretRefNotAccessible,
+        /// See [`SECRET_REF_POLICY_DENIED`].
+        SecretRefPolicyDenied,
         /// Plugin-supplied or unmodeled reason — preserves the raw wire string.
         Unknown(String),
     }
@@ -189,6 +205,8 @@ pub mod permission {
                 TENANT_BOUNDARY_VIOLATION => Self::TenantBoundaryViolation,
                 CORS_ORIGIN_NOT_ALLOWED => Self::CorsOriginNotAllowed,
                 CORS_METHOD_NOT_ALLOWED => Self::CorsMethodNotAllowed,
+                SECRET_REF_NOT_ACCESSIBLE => Self::SecretRefNotAccessible,
+                SECRET_REF_POLICY_DENIED => Self::SecretRefPolicyDenied,
                 other => Self::Unknown(other.to_owned()),
             }
         }
@@ -202,6 +220,8 @@ pub mod permission {
                 Self::TenantBoundaryViolation => TENANT_BOUNDARY_VIOLATION,
                 Self::CorsOriginNotAllowed => CORS_ORIGIN_NOT_ALLOWED,
                 Self::CorsMethodNotAllowed => CORS_METHOD_NOT_ALLOWED,
+                Self::SecretRefNotAccessible => SECRET_REF_NOT_ACCESSIBLE,
+                Self::SecretRefPolicyDenied => SECRET_REF_POLICY_DENIED,
                 Self::Unknown(s) => s.as_str(),
             }
         }

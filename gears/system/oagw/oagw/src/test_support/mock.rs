@@ -423,6 +423,12 @@ impl MockGuard {
         self
     }
 
+    /// Every recorded request on the shared mock, this test's or not (e.g.
+    /// the fixed `/ws/echo` handler); filter by a marker header.
+    pub async fn all_recorded_requests(&self) -> Vec<RecordedRequest> {
+        self.state.recorded.lock().await.iter().cloned().collect()
+    }
+
     /// Get recorded requests matching this test's prefix.
     pub async fn recorded_requests(&self) -> Vec<RecordedRequest> {
         self.state

@@ -109,6 +109,8 @@ async fn proxy_chat_completion_round_trip() {
 }
 
 // 6.13 (auth): Verify the mock received the Authorization header.
+/// SREF-REG-001: API-key auth in `config` mode (no `credential_mode`) is
+/// unchanged by per-request secret references.
 #[tokio::test]
 async fn proxy_injects_auth_header() {
     let mut guard = MockGuard::new();
@@ -2217,6 +2219,8 @@ async fn proxy_with_mock_guard_custom_response() {
 }
 
 // WebSocket upgrade request returns 101 Switching Protocols when upstream accepts.
+/// SREF-REG-001: an upstream with no auth is unchanged by per-request
+/// secret references.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_websocket_upgrade_returns_101() {
     let h = AppHarness::builder().build().await;
@@ -3247,6 +3251,8 @@ async fn proxy_streaming_body_error_mid_stream_does_not_send_terminator() {
 // ---------------------------------------------------------------------------
 
 /// 9.5: OAuth2 CC happy path — token fetched from mock IdP, injected as Bearer.
+///
+/// SREF-REG-001: OAuth2 auth is unchanged by per-request secret references.
 #[tokio::test]
 async fn proxy_oauth2_client_cred_injects_bearer_token() {
     let mut guard = MockGuard::new();

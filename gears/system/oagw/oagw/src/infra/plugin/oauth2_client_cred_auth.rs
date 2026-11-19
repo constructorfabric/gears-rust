@@ -1,7 +1,7 @@
 use crate::domain::plugin::credentials::{
-    CLIENT_ID_REF_KEY, CLIENT_SECRET_REF_KEY, credstore_error_kind,
+    CLIENT_ID_REF_KEY, CLIENT_SECRET_REF_KEY, credstore_error_kind, parse_credential_ref,
 };
-use credstore_sdk::{CredStoreClientV1, SecretRef};
+use credstore_sdk::CredStoreClientV1;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -182,8 +182,9 @@ impl OAuth2ClientCredAuthPlugin {
         key: &'static str,
         cred_ref: &str,
     ) -> Result<String, PluginError> {
-        let raw = cred_ref.strip_prefix("cred://").unwrap_or(cred_ref);
-        let secret_ref = SecretRef::new(raw).map_err(|e| {
+        // The shared reference parser; the error names the config key, never
+        // the reference or the store's text.
+        let secret_ref = parse_credential_ref(cred_ref).map_err(|e| {
             PluginError::Internal(format!("auth.config.{key}: {}", credstore_error_kind(&e)))
         })?;
         let response = self

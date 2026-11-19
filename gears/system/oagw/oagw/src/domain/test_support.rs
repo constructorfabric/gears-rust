@@ -204,8 +204,23 @@ impl ProvisioningMetrics {
 
 #[cfg(test)]
 impl crate::domain::ports::OagwMetricsPort for ProvisioningMetrics {
-    fn record_request(&self, _: &str, _: &str, _: &str, _: u16) {}
-    fn record_error(&self, _: &str, _: &str, _: &str) {}
+    fn record_request(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: u16,
+        _: Option<crate::domain::plugin::credentials::CredentialMode>,
+    ) {
+    }
+    fn record_error(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: Option<crate::domain::plugin::credentials::CredentialMode>,
+    ) {
+    }
     fn record_request_duration_seconds(&self, _: &str, _: &str, _: &str, _: f64) {}
     fn increment_in_flight(&self, _: &str) {}
     fn decrement_in_flight(&self, _: &str) {}
@@ -411,15 +426,51 @@ impl TenantResolverClient for UnauthorizedTenantResolver {
 pub struct MockTenantResolverClient {
     /// Map from tenant_id → (TenantInfo, ordered ancestors [parent..root]).
     tenants: HashMap<TenantId, (TenantInfo, Vec<TenantRef>)>,
+    /// How many calls it answered, of any method.
+    calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl MockTenantResolverClient {
     /// Create a single-tenant resolver: any tenant_id is treated as a root
     /// tenant with no ancestors.
     pub fn single_tenant() -> Self {
+        Self::from_tenants(HashMap::new())
+    }
+
+    fn from_tenants(tenants: HashMap<TenantId, (TenantInfo, Vec<TenantRef>)>) -> Self {
         Self {
-            tenants: HashMap::new(),
+            tenants,
+            calls: Arc::default(),
         }
+    }
+
+    /// A counter of the calls this resolver answers, of any method; take it
+    /// before handing the resolver over.
+    pub fn calls(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        Arc::clone(&self.calls)
+    }
+
+    /// Add `child` under `parent`, which must already be configured. Its
+    /// ancestors are `parent` and the parent's ancestors.
+    #[must_use]
+    pub fn with_child(mut self, child: TenantId, parent: TenantId) -> Self {
+        let (parent_info, parent_ancestors) = self
+            .tenants
+            .get(&parent)
+            .cloned()
+            .unwrap_or_else(|| panic!("with_child: parent {parent} is not configured"));
+        let info = TenantInfo {
+            id: child,
+            name: format!("tenant-{}", &child.to_string()[..8]),
+            status: TenantStatus::Active,
+            tenant_type: None,
+            parent_id: Some(parent),
+            self_managed: false,
+        };
+        let mut ancestors = vec![TenantRef::from(parent_info)];
+        ancestors.extend(parent_ancestors);
+        self.tenants.insert(child, (info, ancestors));
+        self
     }
 
     /// Create a resolver where `parent` has multiple direct `children`.
@@ -455,7 +506,7 @@ impl MockTenantResolverClient {
             }];
             tenants.insert(child, (info, ancestors));
         }
-        Self { tenants }
+        Self::from_tenants(tenants)
     }
 
     /// Create a resolver with two independent trees (separate roots).
@@ -532,7 +583,7 @@ impl MockTenantResolverClient {
                 .collect();
             tenants.insert(id, (info, ancestors));
         }
-        Self { tenants }
+        Self::from_tenants(tenants)
     }
 
     /// Add `child` under `parent`, which must already be known.
@@ -561,6 +612,7 @@ impl TenantResolverClient for MockTenantResolverClient {
         _ctx: &SecurityContext,
         id: TenantId,
     ) -> Result<TenantInfo, TenantResolverError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Some((info, _)) = self.tenants.get(&id) {
             return Ok(info.clone());
         }
@@ -579,6 +631,7 @@ impl TenantResolverClient for MockTenantResolverClient {
         &self,
         _ctx: &SecurityContext,
     ) -> Result<TenantInfo, TenantResolverError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // The SDK contract says `get_root_tenant` MUST return a tenant with
         // `parent_id == None`. If no configured tenant has `parent_id == None`
         // we surface an Internal error instead of silently synthesizing one,
@@ -605,6 +658,7 @@ impl TenantResolverClient for MockTenantResolverClient {
         ids: &[TenantId],
         _options: &GetTenantsOptions,
     ) -> Result<Vec<TenantInfo>, TenantResolverError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut result = Vec::new();
         for &id in ids {
             result.push(self.get_tenant(ctx, id).await?);
@@ -618,6 +672,7 @@ impl TenantResolverClient for MockTenantResolverClient {
         id: TenantId,
         _options: &GetAncestorsOptions,
     ) -> Result<GetAncestorsResponse, TenantResolverError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Some((info, ancestors)) = self.tenants.get(&id) {
             return Ok(GetAncestorsResponse {
                 tenant: TenantRef::from(info.clone()),
@@ -643,6 +698,7 @@ impl TenantResolverClient for MockTenantResolverClient {
         id: TenantId,
         options: &GetDescendantsOptions,
     ) -> Result<GetDescendantsResponse, TenantResolverError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let tenant_ref = if let Some((info, _)) = self.tenants.get(&id) {
             TenantRef::from(info.clone())
         } else {
@@ -682,6 +738,7 @@ impl TenantResolverClient for MockTenantResolverClient {
         descendant_id: TenantId,
         _options: &IsAncestorOptions,
     ) -> Result<bool, TenantResolverError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if ancestor_id == descendant_id {
             return Ok(false);
         }
@@ -701,6 +758,7 @@ pub use crate::domain::gts_helpers::{
 /// Builder for a fully-wired Control Plane test environment.
 pub struct TestCpBuilder {
     credentials: Vec<(String, String)>,
+    credstore: Option<Arc<dyn CredStoreClientV1>>,
     tenant_resolver: Option<MockTenantResolverClient>,
 }
 
@@ -709,8 +767,18 @@ impl TestCpBuilder {
     pub fn new() -> Self {
         Self {
             credentials: Vec::new(),
+            credstore: None,
             tenant_resolver: None,
         }
+    }
+
+    /// Use `credstore` instead of a mock built from
+    /// [`Self::with_credentials`] (e.g. a `MockCredStoreClient` the test
+    /// keeps to seed secrets and read back the recorded `get`s).
+    #[must_use]
+    pub fn with_credstore(mut self, credstore: Arc<dyn CredStoreClientV1>) -> Self {
+        self.credstore = Some(credstore);
+        self
     }
 
     /// Pre-load credentials into the mock credstore client.
@@ -740,8 +808,9 @@ impl TestCpBuilder {
             self.tenant_resolver
                 .unwrap_or_else(MockTenantResolverClient::single_tenant),
         );
-        let credstore: Arc<dyn CredStoreClientV1> =
-            Arc::new(MockCredStoreClient::with_secrets(self.credentials));
+        let credstore: Arc<dyn CredStoreClientV1> = self
+            .credstore
+            .unwrap_or_else(|| Arc::new(MockCredStoreClient::with_secrets(self.credentials)));
         hub.register::<dyn CredStoreClientV1>(credstore.clone());
 
         let cp: Arc<dyn ControlPlaneService> = Arc::new(
@@ -783,6 +852,8 @@ pub struct TestDpBuilder {
     token_cache_config: TokenCacheConfig,
     websocket_idle_timeout: Option<Duration>,
     websocket_close_timeout: Option<Duration>,
+    metrics: Option<Arc<dyn crate::domain::ports::OagwMetricsPort>>,
+    transform_plugins: Vec<(String, Arc<dyn crate::domain::plugin::TransformPlugin>)>,
 }
 
 impl TestDpBuilder {
@@ -798,6 +869,8 @@ impl TestDpBuilder {
             token_cache_config: TokenCacheConfig::default(),
             websocket_idle_timeout: None,
             websocket_close_timeout: None,
+            metrics: None,
+            transform_plugins: Vec::new(),
         }
     }
 
@@ -805,6 +878,27 @@ impl TestDpBuilder {
     #[must_use]
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = Some(timeout);
+        self
+    }
+
+    /// Register a transform plugin next to the built-ins.
+    #[must_use]
+    pub(crate) fn with_transform_plugin(
+        mut self,
+        plugin_id: &str,
+        plugin: Arc<dyn crate::domain::plugin::TransformPlugin>,
+    ) -> Self {
+        self.transform_plugins.push((plugin_id.to_owned(), plugin));
+        self
+    }
+
+    /// Record the Data Plane's metrics in `metrics` instead of dropping them.
+    #[must_use]
+    pub(crate) fn with_metrics(
+        mut self,
+        metrics: Arc<dyn crate::domain::ports::OagwMetricsPort>,
+    ) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 
@@ -927,7 +1021,8 @@ impl TestDpBuilder {
             self.token_cache_config,
             backend_selector,
             engine,
-            std::sync::Arc::new(crate::domain::ports::NoopMetrics),
+            self.metrics
+                .unwrap_or_else(|| std::sync::Arc::new(crate::domain::ports::NoopMetrics)),
             rate_limiter,
         )
         .with_allow_http_upstream(true);
@@ -942,6 +1037,9 @@ impl TestDpBuilder {
         }
         if let Some(timeout) = self.websocket_close_timeout {
             svc = svc.with_websocket_close_timeout(timeout);
+        }
+        for (plugin_id, plugin) in self.transform_plugins {
+            svc = svc.with_transform_plugin(&plugin_id, plugin);
         }
 
         let streams = svc.stream_shutdown();

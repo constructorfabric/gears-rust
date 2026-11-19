@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::domain::error::DomainError;
+use crate::domain::gateway_headers;
 use crate::domain::model::{Endpoint, PassthroughMode, RequestHeaderRules, ResponseHeaderRules};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use oagw_sdk::api::ErrorSource;
@@ -92,36 +93,10 @@ fn connection_nominated(headers: &HeaderMap) -> Vec<HeaderName> {
         .collect()
 }
 
-/// Headers a client could use to spoof its address or origin, or to override
-/// the path, host or method, at the upstream (F0008 SSRF rules): `Forwarded`
-/// (RFC 7239), the `X-Forwarded*` family, every `Client-IP` variant, the
-/// proxy and CDN client-address headers, and the URL, host and method
-/// override headers some frameworks honour after OAGW matched the route.
+/// Whether `name` is a forwarding header (see
+/// [`gateway_headers::is_forwarding_header`]).
 fn is_forwarding_header(name: &HeaderName) -> bool {
-    let name = name.as_str();
-    name.starts_with("x-forwarded")
-        || name.starts_with("x-envoy-")
-        || name.ends_with("client-ip")
-        || matches!(
-            name,
-            "forwarded"
-                | "via"
-                | "x-proxyuser-ip"
-                | "x-real-ip"
-                | "x-originating-ip"
-                | "x-remote-ip"
-                | "x-remote-addr"
-                | "cf-connecting-ip"
-                | "x-original-forwarded-for"
-                | "x-original-url"
-                | "x-original-uri"
-                | "x-rewrite-url"
-                | "x-original-host"
-                | "x-host"
-                | "x-http-method-override"
-                | "x-http-method"
-                | "x-method-override"
-        )
+    gateway_headers::is_forwarding_header(name.as_str())
 }
 
 /// Remove forwarding headers ([`is_forwarding_header`]) from an outbound
@@ -141,7 +116,10 @@ fn strip_forwarding_headers(headers: &mut HeaderMap) {
 pub fn strip_internal_headers(headers: &mut HeaderMap) {
     let to_remove: Vec<HeaderName> = headers
         .keys()
-        .filter(|k| k.as_str().starts_with("x-oagw-"))
+        .filter(|k| {
+            k.as_str()
+                .starts_with(gateway_headers::INTERNAL_HEADER_PREFIX)
+        })
         .cloned()
         .collect();
     for name in to_remove {

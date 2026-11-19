@@ -60,8 +60,23 @@ impl CacheMetrics {
 }
 
 impl OagwMetricsPort for CacheMetrics {
-    fn record_request(&self, _: &str, _: &str, _: &str, _: u16) {}
-    fn record_error(&self, _: &str, _: &str, _: &str) {}
+    fn record_request(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: u16,
+        _: Option<crate::domain::plugin::credentials::CredentialMode>,
+    ) {
+    }
+    fn record_error(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: Option<crate::domain::plugin::credentials::CredentialMode>,
+    ) {
+    }
     fn record_request_duration_seconds(&self, _: &str, _: &str, _: &str, _: f64) {}
     fn increment_in_flight(&self, _: &str) {}
     fn decrement_in_flight(&self, _: &str) {}

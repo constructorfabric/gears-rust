@@ -35,14 +35,32 @@ pub trait OagwMetricsPort: Send + Sync {
     /// 4xx/5xx). Pre-resolution failures (e.g. policy denial before
     /// upstream lookup) are NOT counted here; they go to
     /// [`Self::record_error`] only.
-    fn record_request(&self, host: &str, path: &str, method: &str, status_code: u16);
+    /// `credential_mode` labels `config` or `request_ref` (ADR-0022);
+    /// `None` labels `unknown`.
+    fn record_request(
+        &self,
+        host: &str,
+        path: &str,
+        method: &str,
+        status_code: u16,
+        credential_mode: Option<crate::domain::plugin::credentials::CredentialMode>,
+    );
 
     /// `{prefix}_errors_total` — counter
     ///
     /// Incremented on every `DomainError` returned from the proxy pipeline.
     /// `host`/`path` may be `"unknown"` when the failure occurred before
     /// upstream/route resolution.
-    fn record_error(&self, host: &str, path: &str, error_type: &str);
+    /// `credential_mode` labels `config` or `request_ref`; `None` (before
+    /// the upstream resolves) labels `unknown` (ADR-0022). Typed, so it
+    /// cannot be swapped with the string labels beside it.
+    fn record_error(
+        &self,
+        host: &str,
+        path: &str,
+        error_type: &str,
+        credential_mode: Option<crate::domain::plugin::credentials::CredentialMode>,
+    );
 
     /// `{prefix}_request_duration_seconds` — histogram
     ///
@@ -182,8 +200,23 @@ pub trait OagwMetricsPort: Send + Sync {
 pub struct NoopMetrics;
 
 impl OagwMetricsPort for NoopMetrics {
-    fn record_request(&self, _: &str, _: &str, _: &str, _: u16) {}
-    fn record_error(&self, _: &str, _: &str, _: &str) {}
+    fn record_request(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: u16,
+        _: Option<crate::domain::plugin::credentials::CredentialMode>,
+    ) {
+    }
+    fn record_error(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: Option<crate::domain::plugin::credentials::CredentialMode>,
+    ) {
+    }
     fn record_request_duration_seconds(&self, _: &str, _: &str, _: &str, _: f64) {}
     fn increment_in_flight(&self, _: &str) {}
     fn decrement_in_flight(&self, _: &str) {}

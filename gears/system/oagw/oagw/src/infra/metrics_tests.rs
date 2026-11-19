@@ -4,6 +4,7 @@ use opentelemetry_sdk::metrics::{
     InMemoryMetricExporter, Instrument, PeriodicReader, SdkMeterProvider, Stream,
 };
 
+use crate::domain::plugin::credentials::CredentialMode;
 use crate::domain::ports::OagwMetricsPort;
 use crate::domain::ports::metric_labels::phase;
 
@@ -122,9 +123,27 @@ fn requests_counter_increments() {
     let (provider, exporter) = local_provider();
     let m = make_meter(&provider, "oagw");
 
-    m.record_request("openai", "/v1/chat", "POST", 200);
-    m.record_request("openai", "/v1/chat", "POST", 200);
-    m.record_request("openai", "/v1/chat", "POST", 503);
+    m.record_request(
+        "openai",
+        "/v1/chat",
+        "POST",
+        200,
+        Some(CredentialMode::Config),
+    );
+    m.record_request(
+        "openai",
+        "/v1/chat",
+        "POST",
+        200,
+        Some(CredentialMode::Config),
+    );
+    m.record_request(
+        "openai",
+        "/v1/chat",
+        "POST",
+        503,
+        Some(CredentialMode::Config),
+    );
 
     provider.force_flush().unwrap();
 
@@ -136,8 +155,18 @@ fn errors_counter_increments() {
     let (provider, exporter) = local_provider();
     let m = make_meter(&provider, "oagw");
 
-    m.record_error("openai", "/v1/chat", "DownstreamError");
-    m.record_error("anthropic", "/v1/messages", "RequestTimeout");
+    m.record_error(
+        "openai",
+        "/v1/chat",
+        "DownstreamError",
+        Some(CredentialMode::Config),
+    );
+    m.record_error(
+        "anthropic",
+        "/v1/messages",
+        "RequestTimeout",
+        Some(CredentialMode::Config),
+    );
 
     provider.force_flush().unwrap();
 
@@ -283,7 +312,13 @@ fn configurable_prefix_changes_all_instrument_names() {
     let (provider, exporter) = local_provider();
     let m = make_meter(&provider, "my_oagw");
 
-    m.record_request("openai", "/v1/chat", "GET", 200);
+    m.record_request(
+        "openai",
+        "/v1/chat",
+        "GET",
+        200,
+        Some(CredentialMode::Config),
+    );
 
     provider.force_flush().unwrap();
 
@@ -435,7 +470,13 @@ fn requests_counter_uses_otel_semconv_label_keys() {
     let (provider, exporter) = local_provider();
     let m = make_meter(&provider, "oagw");
 
-    m.record_request("openai", "/v1/chat", "POST", 204);
+    m.record_request(
+        "openai",
+        "/v1/chat",
+        "POST",
+        204,
+        Some(CredentialMode::Config),
+    );
 
     provider.force_flush().unwrap();
 
@@ -462,6 +503,41 @@ fn requests_counter_uses_otel_semconv_label_keys() {
         lookup("method").is_none() && lookup("path").is_none(),
         "legacy short label keys should not appear on the requests counter"
     );
+}
+
+/// SREF-OBS-003: the requests and errors counters export the
+/// `credential_mode` attribute as passed.
+#[test]
+fn counters_carry_the_credential_mode_label() {
+    use opentelemetry::Value;
+
+    for (name, typed, mode) in [
+        (
+            "oagw_requests",
+            Some(CredentialMode::RequestRef),
+            "request_ref",
+        ),
+        ("oagw_errors", None, "unknown"),
+    ] {
+        let (provider, exporter) = local_provider();
+        let m = make_meter(&provider, "oagw");
+        if name == "oagw_requests" {
+            m.record_request("openai", "/v1/chat", "POST", 200, typed);
+        } else {
+            m.record_error("openai", "/v1/chat", "DownstreamError", typed);
+        }
+        provider.force_flush().unwrap();
+
+        let attrs = single_counter_attrs(&exporter, name);
+        let value = attrs
+            .iter()
+            .find(|(k, _)| k == "credential_mode")
+            .map(|(_, v)| v.clone());
+        assert!(
+            matches!(&value, Some(Value::String(s)) if s.as_str() == mode),
+            "{name}: expected credential_mode={mode:?}, got {value:?}"
+        );
+    }
 }
 
 #[test]

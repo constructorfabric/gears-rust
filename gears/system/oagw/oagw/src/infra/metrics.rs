@@ -194,8 +194,23 @@ impl OagwMetricsMeter {
     }
 }
 
+/// The `credential_mode` label value: the mode's stored name, or `unknown`
+/// before the upstream resolves.
+fn credential_mode_label(
+    mode: Option<crate::domain::plugin::credentials::CredentialMode>,
+) -> &'static str {
+    mode.map_or(crate::domain::ports::metric_labels::UNKNOWN, |m| m.as_str())
+}
+
 impl OagwMetricsPort for OagwMetricsMeter {
-    fn record_request(&self, host: &str, path: &str, method: &str, status_code: u16) {
+    fn record_request(
+        &self,
+        host: &str,
+        path: &str,
+        method: &str,
+        status_code: u16,
+        credential_mode: Option<crate::domain::plugin::credentials::CredentialMode>,
+    ) {
         self.requests.add(
             1,
             &[
@@ -203,17 +218,25 @@ impl OagwMetricsPort for OagwMetricsMeter {
                 KeyValue::new(key::PATH, path.to_owned()),
                 KeyValue::new(key::METHOD, method.to_owned()),
                 KeyValue::new(key::STATUS_CODE, i64::from(status_code)),
+                KeyValue::new(key::CREDENTIAL_MODE, credential_mode_label(credential_mode)),
             ],
         );
     }
 
-    fn record_error(&self, host: &str, path: &str, error_type: &str) {
+    fn record_error(
+        &self,
+        host: &str,
+        path: &str,
+        error_type: &str,
+        credential_mode: Option<crate::domain::plugin::credentials::CredentialMode>,
+    ) {
         self.errors.add(
             1,
             &[
                 KeyValue::new(key::HOST, host.to_owned()),
                 KeyValue::new(key::PATH, path.to_owned()),
                 KeyValue::new(key::ERROR_TYPE, error_type.to_owned()),
+                KeyValue::new(key::CREDENTIAL_MODE, credential_mode_label(credential_mode)),
             ],
         );
     }

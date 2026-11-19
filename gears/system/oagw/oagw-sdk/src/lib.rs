@@ -13,6 +13,13 @@ pub mod ws;
 
 pub mod models;
 
+/// Request header that names the CredStore secret OAGW injects for this
+/// request (ADR-0022), for example `cred://tenant-a-openai`. Accepted only by
+/// upstreams whose effective API-key auth is in `request_ref` mode; OAGW
+/// strips it before forwarding. Set it on the `http::Request` passed to
+/// [`ServiceGatewayClientV1::proxy_request`] or on a REST proxy call.
+pub const SECRET_REF_HEADER: &str = "x-oagw-secret-ref";
+
 pub use models::{
     AuthConfig, BudgetConfig, BudgetMode, BurstConfig, CorsConfig, CorsHttpMethod,
     CreateRouteRequest, CreateRouteRequestBuilder, CreateUpstreamRequest,

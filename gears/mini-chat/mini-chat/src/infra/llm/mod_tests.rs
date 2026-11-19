@@ -83,6 +83,31 @@ fn gateway_rate_limit_maps_to_rate_limited() {
     ));
 }
 
+/// SREF-SDK-008: `InvalidSecretRef` (each code) goes through the catch-all to
+/// a sanitized `ProviderError`.
+#[test]
+fn gateway_invalid_secret_ref_maps_through_catch_all() {
+    use oagw_sdk::field::SecretRefCode;
+    for code in [
+        SecretRefCode::Invalid,
+        SecretRefCode::NotAllowed,
+        SecretRefCode::Required,
+    ] {
+        let mapped: LlmProviderError = ServiceGatewayError::InvalidSecretRef {
+            code,
+            detail: "secret reference header issue".into(),
+        }
+        .into();
+        assert!(
+            matches!(
+                mapped,
+                LlmProviderError::ProviderError { ref code, .. } if code == "gateway_error"
+            ),
+            "{mapped:?}"
+        );
+    }
+}
+
 #[test]
 fn gateway_rate_limit_forwards_retry_hint() {
     let err = ServiceGatewayError::RateLimited {
