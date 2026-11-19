@@ -146,3 +146,7 @@ impl CredStoreClientV2 for CredStoreLocalClient {
         self.svc.list(ctx, query).await.map_err(Into::into)
     }
 }
+
+#[cfg(test)]
+#[path = "client_tests.rs"]
+mod client_tests;

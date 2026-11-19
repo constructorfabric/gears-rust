@@ -321,3 +321,7 @@ pub mod test_harness {
         }) && actual.len() == expected.len()
     }
 }
+
+#[cfg(test)]
+#[path = "metrics_tests.rs"]
+mod tests;

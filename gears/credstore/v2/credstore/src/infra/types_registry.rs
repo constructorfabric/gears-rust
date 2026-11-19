@@ -228,3 +228,7 @@ impl SecretTypeResolver for GtsSecretTypeResolver {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "types_registry_tests.rs"]
+mod tests;

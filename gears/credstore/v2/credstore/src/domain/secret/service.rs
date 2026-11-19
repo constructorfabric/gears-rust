@@ -2520,6 +2520,10 @@ mod list;
 mod service_tests;
 
 #[cfg(test)]
+#[path = "audit_tests.rs"]
+mod audit_tests;
+
+#[cfg(test)]
 #[path = "write_intent_tests.rs"]
 mod write_intent_tests;
 

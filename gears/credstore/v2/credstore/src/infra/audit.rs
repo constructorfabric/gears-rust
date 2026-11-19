@@ -211,3 +211,7 @@ pub struct SecretAuditEventV1 {
     #[schemars(with = "String", extend("enum" = ["success", "failure"]))]
     pub outcome: String,
 }
+
+#[cfg(test)]
+#[path = "audit_tests.rs"]
+pub mod tests;
