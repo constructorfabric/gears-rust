@@ -457,8 +457,8 @@ pub struct Credential {
 /// `inheritance`, `status` stay on [`Credential`]. The SDK-side convenience
 /// envelope [`CredStoreClientV2::get_secret`](crate::CredStoreClientV2::get_secret)
 /// wraps, projecting `GET /credentials/{ref}?$select=reference,type,expires_at,secret`
-/// to these four wire fields plus the row's validator (ADR-0004, "Read actions
-/// follow the projection") — the shape the
+/// to these four wire fields plus the validator the REST `ETag` carries
+/// (ADR-0004, "Read actions follow the projection"; ADR-0009) — the shape the
 /// withdrawn `GET /credentials/{ref}/secret` used to return.
 #[derive(Debug)]
 #[allow(
@@ -477,9 +477,49 @@ pub struct Secret {
     pub expires_at: Option<OffsetDateTime>,
     /// The decrypted value.
     pub secret: SecretValue,
-    /// The winning row's validator — travels with the value so a caller that
-    /// reads and rotates its own credential never needs the record address.
-    pub validator: Validator,
+    /// The validator served with the value, the same one the REST `ETag`
+    /// carries (ADR-0009): the caller's own row's strong validator when the
+    /// caller holds one, otherwise an opaque weak tag. It never carries the
+    /// id or version of another tenant's row.
+    pub validator: SecretValidator,
+}
+
+/// The validator served with a value (ADR-0009), the same one the REST
+/// `ETag` carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretValidator {
+    /// The caller's tenant holds its own row under the reference: that
+    /// row's validator, usable in `WritePrecondition::Matches`. Also when
+    /// the value itself is inherited (own `declared` row).
+    Strong(Validator),
+    /// No own row: an opaque tag derived from the winning row. It changes
+    /// when that row changes, never carries another tenant's row id or
+    /// version, and can never be used for a write.
+    Weak(WeakValidator),
+}
+
+/// Opaque weak validator, the text of the REST weak `ETag` (`W/"…"`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeakValidator(String);
+
+impl WeakValidator {
+    /// Wraps the weak `ETag` text.
+    #[must_use]
+    pub fn new(v: impl Into<String>) -> Self {
+        Self(v.into())
+    }
+
+    /// The weak `ETag` text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for WeakValidator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// The secret part of a [`CredentialWrite`], tri-state once past the REST

@@ -119,6 +119,12 @@ pub mod failed_precondition {
     /// (`patch` of `expires_at` or a new `secret`) to restore the secret.
     pub const SECRET_EXPIRED: &str = "SECRET_EXPIRED";
 
+    /// A bounded read (`get_secret_within`) found a value, but the row it
+    /// comes from belongs to a tenant above the caller-named bound in the
+    /// caller's chain. The value is not read. Read without a bound, or name a
+    /// higher bound.
+    pub const OWNER_ABOVE_BOUND: &str = "OWNER_ABOVE_BOUND";
+
     /// A `sharing` change would move the record across the private /
     /// tenant-shared boundary.
     pub const UNSUPPORTED_TRANSITION: &str = "UNSUPPORTED_TRANSITION";
@@ -131,6 +137,8 @@ pub mod failed_precondition {
     pub enum Reason {
         /// See [`SECRET_EXPIRED`].
         SecretExpired,
+        /// See [`OWNER_ABOVE_BOUND`].
+        OwnerAboveBound,
         /// See [`UNSUPPORTED_TRANSITION`].
         UnsupportedTransition,
         /// Unmodeled reason; preserves the raw wire string.
@@ -144,6 +152,7 @@ pub mod failed_precondition {
         pub fn from_wire(s: &str) -> Self {
             match s {
                 SECRET_EXPIRED => Self::SecretExpired,
+                OWNER_ABOVE_BOUND => Self::OwnerAboveBound,
                 UNSUPPORTED_TRANSITION => Self::UnsupportedTransition,
                 other => Self::Unknown(other.to_owned()),
             }
@@ -154,6 +163,7 @@ pub mod failed_precondition {
         pub fn as_wire(&self) -> &str {
             match self {
                 Self::SecretExpired => SECRET_EXPIRED,
+                Self::OwnerAboveBound => OWNER_ABOVE_BOUND,
                 Self::UnsupportedTransition => UNSUPPORTED_TRANSITION,
                 Self::Unknown(s) => s.as_str(),
             }
@@ -244,6 +254,7 @@ mod tests {
     fn failed_precondition_reasons_round_trip() {
         for wire in [
             failed_precondition::SECRET_EXPIRED,
+            failed_precondition::OWNER_ABOVE_BOUND,
             failed_precondition::UNSUPPORTED_TRANSITION,
         ] {
             let typed = failed_precondition::Reason::from_wire(wire);

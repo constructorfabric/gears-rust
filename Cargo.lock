@@ -2767,6 +2767,7 @@ dependencies = [
  "cf-gears-toolkit-gts",
  "cf-gears-toolkit-odata",
  "cf-gears-toolkit-security",
+ "futures-util",
  "gts",
  "gts-macros",
  "schemars 1.2.3",
@@ -2775,6 +2776,7 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
  "tokio",
+ "tracing",
  "uuid",
  "zeroize",
 ]

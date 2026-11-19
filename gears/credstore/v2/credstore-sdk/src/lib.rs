@@ -1,13 +1,20 @@
 // Updated: 2026-10-06 by Constructor Tech
 #![doc = include_str!("../README.md")]
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+// `credstore-v2` publishes this crate's GTS declarations itself; see `gts`.
+toolkit_gts::declare_gts_inventory!();
+
 pub mod api;
+#[cfg(feature = "conformance")]
+pub mod conformance;
 pub mod error;
 pub mod field;
 pub mod gts;
 pub mod models;
 pub mod plugin_api;
 pub mod reason;
+#[cfg(feature = "test-util")]
+pub mod test_util;
 pub mod types;
 
 pub use ::gts::GtsId;
@@ -17,8 +24,8 @@ pub use gts::{CREDENTIAL_RESOURCE_TYPE, CredStorePluginSpecV2, CredentialV1, Sec
 pub use models::{
     Credential, CredentialListItem, CredentialPatch, CredentialStatus, CredentialWrite, Fallback,
     InheritanceStatus, OwnRow, OwnerId, PatchField, PutOutcome, PutPrecondition, Secret, SecretRef,
-    SecretValue, SecretWrite, SharingMode, StoreKey, TenantId, Validator, ValueVersion,
-    WritePrecondition,
+    SecretValidator, SecretValue, SecretWrite, SharingMode, StoreKey, TenantId, Validator,
+    ValueVersion, WeakValidator, WritePrecondition,
 };
 pub use plugin_api::{
     BoxError, CredStorePluginClientV2, CredStorePluginDestroyerV2, CredStorePluginError,
