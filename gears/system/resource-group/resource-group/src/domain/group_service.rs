@@ -569,17 +569,20 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
                 .ok_or_else(|| DomainError::group_not_found(group_id))?
         };
 
-        // The definition is needed for new metadata and for a parent change;
-        // a plain rename does not consult the registry. An existing group's
-        // type applies as defined, deleted included (its content is retained).
-        let rg_type = if req.metadata.is_some() || existing.parent_id != req.parent_id {
+        // Replacing or removing metadata needs the definition, including when
+        // the replacement is absent: a derived schema may require metadata.
+        // A rename with metadata absent before and after needs no registry.
+        let rg_type = if req.metadata.is_some()
+            || existing.metadata.is_some()
+            || existing.parent_id != req.parent_id
+        {
             Some(self.existing_group_type(ctx, &existing.code).await?)
         } else {
             None
         };
-        if let (Some(metadata), Some(t)) = (req.metadata.as_ref(), rg_type.as_ref()) {
+        if let Some(t) = rg_type.as_ref() {
             let validation_started = std::time::Instant::now();
-            let validated = t.validate_metadata(Some(metadata));
+            let validated = t.validate_metadata(req.metadata.as_ref());
             self.metrics.metadata_validation_duration(
                 Operation::Update,
                 validation_started.elapsed().as_secs_f64(),
@@ -1292,6 +1295,16 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
             )));
         }
         let existing_type_path = existing.code.clone();
+
+        // A concurrent update may have added metadata after the pre-read
+        // skipped the registry. Never clear that value without validating
+        // its removal; the caller can retry to load the definition outside
+        // the transaction. The row lock keeps this check and write atomic.
+        if rg_type.is_none() && existing.metadata.is_some() {
+            return Err(DomainError::conflict(format!(
+                "Group {group_id} metadata changed while it was being updated; retry the update"
+            )));
+        }
 
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4e
         // Already validated against this same type before `BEGIN` -- the type

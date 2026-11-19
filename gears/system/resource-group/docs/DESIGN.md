@@ -503,11 +503,14 @@ sequenceDiagram
 
 The public update path authorizes the caller and reads the existing group under
 that scope before returning any type-shaped error. An update supplying non-null
-metadata or changing the parent obtains the group's exact type definition before
-the transaction. Deleted definitions remain usable because the registry retains
-their content. Supplied metadata is validated with the SDK. With an unchanged
-parent, renaming or clearing metadata to `null` takes the row-only path and does
-not request a type definition.
+metadata, removing existing metadata, or changing the parent obtains the group's
+exact type definition before the transaction. Deleted definitions remain usable
+because the registry retains their content. The replacement metadata envelope,
+including `{}` for removal, is validated with the SDK. With an unchanged parent
+and metadata absent both before and after the update, a rename takes the
+row-only path without requesting a type definition. If metadata appears between
+the pre-read and the locked transaction read, that path returns a conflict
+rather than clearing it without validation.
 
 The transaction re-reads the group and compares its type with the snapshot.
 A mismatched type is a conflict. A parent change checks the actual new parent,
@@ -547,8 +550,8 @@ create dictionary keys nor consult type definitions.
 | --- | --- |
 | Create group | Active RG type; validate payload and placement |
 | Add membership | Active group type and active concrete member resource type; validate allowed memberships |
-| Non-null metadata replacement / reparent existing group | Exact RG type definition, deleted included; unknown type is refused |
-| Rename or clear metadata with unchanged parent | No registry lookup |
+| Non-null metadata replacement / removal of existing metadata / reparent existing group | Exact RG type definition, deleted included; unknown type is refused |
+| Rename with unchanged parent and metadata remaining absent | No registry lookup |
 | Group/membership reads and filters | No registry lookup |
 | Membership removal / group deletion, including force | No registry lookup |
 

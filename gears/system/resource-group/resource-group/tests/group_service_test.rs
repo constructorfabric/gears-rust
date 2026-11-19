@@ -3144,6 +3144,9 @@ struct ParentFlippingGroupRepo {
     /// parent regardless of what the row now holds -- the stale snapshot
     /// described above. `None` disables the simulation entirely.
     stale_unlocked_parent: Option<Uuid>,
+    /// Simulate an absent pre-read value followed by metadata appearing
+    /// before the locked read, without changing the persisted metadata.
+    stale_absent_metadata: bool,
     fired: AtomicBool,
 }
 
@@ -3154,6 +3157,7 @@ impl ParentFlippingGroupRepo {
             watched_group_id,
             new_parent_id,
             stale_unlocked_parent: None,
+            stale_absent_metadata: false,
             fired: AtomicBool::new(false),
         }
     }
@@ -3171,6 +3175,7 @@ impl ParentFlippingGroupRepo {
             watched_group_id,
             new_parent_id,
             stale_unlocked_parent: Some(stale_parent_id),
+            stale_absent_metadata: false,
             fired: AtomicBool::new(false),
         }
     }
@@ -3233,7 +3238,7 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
             }
             return Ok(result);
         }
-        let result = self.inner.find_model_by_id(db, id).await?;
+        let mut result = self.inner.find_model_by_id(db, id).await?;
         if id == self.watched_group_id
             && !self.fired.swap(true, Ordering::SeqCst)
             && let Some(model) = &result
@@ -3250,6 +3255,12 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
                     model.metadata.as_ref(),
                 )
                 .await?;
+        }
+        if self.stale_absent_metadata
+            && id == self.watched_group_id
+            && let Some(model) = &mut result
+        {
+            model.metadata = None;
         }
         Ok(result)
     }
@@ -3486,6 +3497,57 @@ impl RgMetricsPort for EscalationRecorder {
         self.isolation_escalations.fetch_add(1, Ordering::SeqCst);
     }
     fn metadata_validation_duration(&self, _operation: Operation, _seconds: f64) {}
+}
+
+#[tokio::test]
+async fn group_update_does_not_clear_metadata_that_appeared_after_the_pre_read() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let groups = common::make_group_service(db.clone());
+    let tenant = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant);
+    let root_type = common::create_root_type(&type_svc, "metadata_race").await;
+    let parent = common::create_root_group(&groups, &ctx, &root_type.code, "parent", tenant).await;
+    let child_type =
+        common::create_child_type(&type_svc, "metadata_child", &[&root_type.code], &[]).await;
+    let metadata = json!({ "tier": "gold" });
+    let group = groups
+        .create_group(
+            &ctx,
+            CreateGroupRequest::new(child_type.code, "original".to_owned())
+                .with_parent_id(Some(parent.id))
+                .with_metadata(Some(metadata.clone())),
+            tenant,
+        )
+        .await
+        .unwrap();
+    // The decorator writes the same parent and preserves metadata, but its
+    // pre-read reports metadata absent. The locked read sees the real value.
+    let mut repo = ParentFlippingGroupRepo::new(group.id, parent.id);
+    repo.stale_absent_metadata = true;
+    let racing = GroupService::new(
+        db,
+        QueryProfile::default(),
+        common::make_enforcer(),
+        Arc::new(repo),
+        common::make_unavailable_types_catalog(),
+    );
+    let error = racing
+        .update_group(
+            &ctx,
+            group.id,
+            UpdateGroupRequest {
+                name: "changed".to_owned(),
+                parent_id: Some(parent.id),
+                metadata: None,
+            },
+        )
+        .await
+        .expect_err("unvalidated concurrent metadata must not be cleared");
+    assert!(matches!(error, DomainError::Conflict { .. }), "{error:?}");
+    let stored = groups.get_group(&ctx, group.id).await.unwrap();
+    assert_eq!(stored.metadata, Some(metadata));
+    assert_eq!(stored.name, "original");
 }
 
 /// The lost-update half of the same race, and the one the pre-transaction

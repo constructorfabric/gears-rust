@@ -146,7 +146,7 @@ transaction opens. Type and tenant identifiers are immutable after creation.
 **Error Scenarios**:
 - Group not found → NotFound
 - Parent change violates the stored type's placement rules → InvalidParentType
-- Non-null replacement metadata violates the type schema → Validation
+- Replacement metadata, including removal, violates the type schema → Validation
 
 **Steps**:
 1. [x] - `p1` - Actor sends PUT /api/resource-group/v1/groups/{group_id} with {name, parent_id, metadata}; nullable replacement fields must be explicit - `inst-update-group-1`
@@ -157,7 +157,7 @@ transaction opens. Type and tenant identifiers are immutable after creation.
    2. [x] - `p1` - Determine whether the current row requires a structural parent change - `inst-update-group-4b`
    3. [x] - `p1` - Escalate an unexpected parent change to a serializable retry before any write - `inst-update-group-4c`
    4. [x] - `p1` - Validate the move with the current parent snapshot, placement traits and closure rules - `inst-update-group-4d`
-5. [x] - `p1` - Validate non-null replacement metadata through the SDK snapshot before the transaction; use the same immutable type inside the write - `inst-update-group-4e`
+5. [x] - `p1` - Validate replacement or removal of metadata through the SDK snapshot before the transaction; reject a concurrent unvalidated removal and use the same immutable type inside the write - `inst-update-group-4e`
 6. [x] - `p1` - DB: UPDATE resource_group SET name, parent_id, metadata, updated_at — preserve type and tenant identifiers - `inst-update-group-5`
 7. [x] - `p1` - **RETURN** updated ResourceGroup - `inst-update-group-6`
 

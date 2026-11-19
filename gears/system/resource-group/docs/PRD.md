@@ -361,8 +361,8 @@ reads and payload validation **MUST** precede database write transactions.
 Type deletion is owned by Types Registry; RG does not enforce its former
 local delete-if-unused policy. Group creation and membership additions require
 active types. Existing groups and memberships **MUST** remain readable and
-removable using their stored identifiers. Reparenting or replacing non-null
-metadata uses the retained exact definition, including a
+removable using their stored identifiers. Reparenting, replacing metadata, or
+removing existing metadata uses the retained exact definition, including a
 deleted one; an absent definition **MUST NOT** silently bypass validation.
 
 ### 5.2 RG Entity Management

@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use resource_group::domain::error::DomainError;
 use resource_group::domain::type_catalog::{RgType, RgTypeCatalog, TypeUse};
 use resource_group_sdk::{CreateGroupRequest, UpdateGroupRequest};
+use serde_json::json;
 use toolkit_odata::ODataQuery;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -287,7 +288,105 @@ async fn groups_of_a_deleted_type_stay_readable_updatable_and_deletable() {
         .expect("cleanup");
 }
 
-// -------- portable membership key bounds --------
+// -------- replacement metadata and portable membership key bounds --------
+
+#[tokio::test]
+async fn required_metadata_cannot_be_cleared_by_a_replacement_update() {
+    let db = common::test_db().await;
+    let groups = common::make_group_service(db);
+    let tenant = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant);
+    let root = code("required_metadata");
+    common::types_registry().seed(
+        &root,
+        json!({
+            "$id": format!("gts://{root}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "allOf": [
+                { "$ref": "gts://gts.cf.core.rg.type.v1~" },
+                {
+                    "required": ["metadata"],
+                    "properties": { "metadata": { "type": "object" } }
+                }
+            ],
+            "x-gts-traits": {
+                "can_be_root": true,
+                "allowed_parent_types": [],
+                "allowed_membership_types": []
+            },
+        }),
+    );
+    let metadata = json!({ "tier": "gold" });
+    let group = groups
+        .create_group(
+            &ctx,
+            CreateGroupRequest::new(root, "original".to_owned())
+                .with_metadata(Some(metadata.clone())),
+            tenant,
+        )
+        .await
+        .expect("required metadata is present");
+
+    let error = groups
+        .update_group(
+            &ctx,
+            group.id,
+            UpdateGroupRequest {
+                name: "changed".to_owned(),
+                parent_id: None,
+                metadata: None,
+            },
+        )
+        .await
+        .expect_err("PUT must validate removal of required metadata");
+    assert!(matches!(error, DomainError::Validation { .. }), "{error:?}");
+    let stored = groups.get_group(&ctx, group.id).await.unwrap();
+    assert_eq!(stored.metadata, Some(metadata));
+    assert_eq!(stored.name, "original");
+}
+
+#[tokio::test]
+async fn optional_metadata_can_be_cleared_but_requires_a_definition() {
+    let db = common::test_db().await;
+    let groups = common::make_group_service(db.clone());
+    let tenant = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant);
+    let (_, root, _) = publish_family();
+    let group = groups
+        .create_group(
+            &ctx,
+            CreateGroupRequest::new(root, "original".to_owned())
+                .with_metadata(Some(json!({ "tier": "gold" }))),
+            tenant,
+        )
+        .await
+        .unwrap();
+    let replacement = UpdateGroupRequest {
+        name: "changed".to_owned(),
+        parent_id: None,
+        metadata: None,
+    };
+    let offline = common::make_group_service_with(db, common::make_unavailable_types_catalog());
+    let error = offline
+        .update_group(&ctx, group.id, replacement.clone())
+        .await
+        .expect_err("metadata removal must not bypass an unavailable definition");
+    assert!(matches!(error, DomainError::InternalError), "{error:?}");
+    assert!(
+        groups
+            .get_group(&ctx, group.id)
+            .await
+            .unwrap()
+            .metadata
+            .is_some()
+    );
+    let updated = groups
+        .update_group(&ctx, group.id, replacement)
+        .await
+        .expect("the schema permits absent metadata");
+    assert!(updated.metadata.is_none());
+}
 
 #[tokio::test]
 async fn membership_resource_ids_are_bounded_by_utf8_bytes() {
