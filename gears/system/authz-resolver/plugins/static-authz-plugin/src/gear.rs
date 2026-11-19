@@ -1,3 +1,4 @@
+// Updated: 2026-10-06 by Constructor Tech
 //! Static `AuthZ` resolver plugin gear.
 
 use std::sync::{Arc, OnceLock};
@@ -13,7 +14,7 @@ use tracing::info;
 use types_registry_sdk::GtsId;
 
 use crate::config::StaticAuthZPluginConfig;
-use crate::domain::Service;
+use crate::domain::{PropertyGrant, Service};
 
 /// The GTS segment of this plugin's instance.
 const INSTANCE_SEGMENT: &str = "cf.builtin.static_authz_resolver.plugin.v1";
@@ -56,7 +57,13 @@ impl Gear for StaticAuthZPlugin {
             priority = cfg.priority,
             "Loaded plugin configuration"
         );
-        let service: Arc<dyn AuthZResolverPluginClient> = Arc::new(Service::new());
+        // Grant values are parsed once, here; a bad value fails the init.
+        let grants = cfg
+            .property_grants
+            .iter()
+            .map(PropertyGrant::try_from_config)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let service: Arc<dyn AuthZResolverPluginClient> = Arc::new(Service::with_grants(grants));
         self.service
             .set(Arc::clone(&service))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
