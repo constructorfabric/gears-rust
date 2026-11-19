@@ -48,8 +48,6 @@ impl RgType {
     pub fn from_schema(schema: &TypeSchema) -> Result<Self, DomainError> {
         let group_payload = compile(schema)?;
         let code = schema.type_id.as_ref().to_owned();
-        // Owners lock the trait with const. Revision checks for that lock are tracked in
-        // https://github.com/constructorfabric/gears-rust/issues/6064.
         let membership_type = schema
             .effective_traits
             .as_ref()

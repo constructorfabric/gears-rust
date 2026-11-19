@@ -68,8 +68,8 @@ rules. Widening placement or membership constraints can take effect for
 existing groups. The [schema revision E2E tests](../../../../testing/e2e/suites/resource_group/test_type_revisions.py)
 publish revisions through Types Registry and verify that existing groups can
 move or accept members under the widened rules. They also check that the
-registry refuses incompatible payload revisions. Same-ID compatibility of the
-effective traits schema is tracked in [#6064](https://github.com/constructorfabric/gears-rust/issues/6064).
+registry refuses incompatible payload revisions and rejects a same-ID revision
+that replaces the `membership_type` constant with a different schema ID.
 
 Publish group and membership schemas for existing GTS identifiers before
 upgrading deployments that use custom types. Adding a member to any group

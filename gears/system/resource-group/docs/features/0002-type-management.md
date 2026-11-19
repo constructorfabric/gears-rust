@@ -149,8 +149,9 @@ and type in the transaction before inserting the link.
 
 Types Registry checks same-ID revisions against the previous schema. The
 placement and membership schemas can widen through ordinary publication,
-while incompatible payload revisions are refused. Checking the effective traits schema
-on same-ID revisions is tracked in [#6064](https://github.com/constructorfabric/gears-rust/issues/6064). The admission tests verify
+while incompatible payload revisions are refused. The registry also checks backward compatibility of the effective
+traits schema. Replacing the `membership_type` constant in a same-ID revision
+is rejected with `incompatible_with_baseline`. The admission tests verify
 widening an inherited placement `anyOf` with GTS 0.17.2. Indirect changes
 from mutable references remain subject to the existing dependent refresh
 behavior.

@@ -102,21 +102,22 @@ async def test_derived_group_inherits_the_locked_membership_trait(registry, crea
     await register_schema(registry, child, schema, version=1, refusal_reasons=("invalid_schema",))
 
 
-@pytest.mark.skip(
-    reason="Types Registry must check effective trait schema compatibility: "
-           "https://github.com/constructorfabric/gears-rust/issues/6064",
-)
 async def test_group_type_revision_cannot_replace_its_membership_binding(registry, create_type):
     team = await create_type("team")
     other = await create_type("other")
+    projection = "origin,effective_traits,effective_traits_schema"
+    baseline = await get_entity(registry, PLATFORM_API, team, select=projection)
+    assert baseline.status_code == 200, baseline.text
+    assert baseline.json()["origin"]["resource_version"] == 1
+    assert baseline.json()["effective_traits"]["membership_type"] == membership_schema_id(team)
+
     rebound = rg_type_schema(team, membership_type=membership_schema_id(other))
     await register_schema(
         registry, team, rebound, version=1, refusal_reasons=("incompatible_with_baseline",),
     )
-    current = await get_entity(registry, PLATFORM_API, team, select="origin,effective_traits")
+    current = await get_entity(registry, PLATFORM_API, team, select=projection)
     assert current.status_code == 200, current.text
-    assert current.json()["origin"]["resource_version"] == 1
-    assert current.json()["effective_traits"]["membership_type"] == membership_schema_id(team)
+    assert current.json() == baseline.json()
 
 
 async def test_existing_group_uses_widened_membership_schema(
