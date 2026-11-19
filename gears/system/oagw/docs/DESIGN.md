@@ -597,9 +597,29 @@ Without appropriate permissions, descendant must use ancestor's configuration as
 #### Security Considerations
 
 **Server-Side Request Forgery (SSRF)**:
-- DNS: IP pinning rules, allowed segments matching.
+- Endpoints: an endpoint IP address in a denied range, or a denied hostname, is rejected on create, update and registry reconcile with 400 naming the reason. The hostname check runs again on every alias resolution.
+- DNS: every address an endpoint host resolves to is checked on every resolution (DNS rebinding); a refused address is never connected to. With every address refused the request fails with 503 (single endpoint) or 502 (pool).
 - Headers: Well-known headers stripping and validation.
 - Request Validation: Path, query parameters validation against route configuration.
+
+The gear option `ssrf_policy` configures it (on by default):
+
+| Field | Effect |
+|---|---|
+| `enabled` | `false` skips every SSRF check. |
+| `extra_deny_cidrs` | Denies these ranges in addition to the built-in list. |
+| `allow_cidrs` | Exempts these ranges from both deny lists, for IP endpoints and resolved addresses alike. |
+| `extra_deny_hostnames` | Denies these hostnames in addition to `localhost` and `localhost.localdomain`; an entry starting with `.` also matches subdomains. |
+| `allow_hostnames` | Exempts these hostnames from both hostname deny lists, and their resolved addresses from the range deny lists, except loopback, unspecified, link-local, multicast, broadcast and cloud metadata addresses (only `allow_cidrs` admits those). |
+
+An IPv6 CIDR matches only IPv6 addresses, by their bits: `::/3` does not cover public IPv4, and `::/0` does not allow it. An IPv4-mapped address (`::ffff:a.b.c.d`) is matched as its IPv4 address, and an IPv6 CIDR inside `::ffff:0:0/96` (prefix 96 or longer) as the IPv4 CIDR it maps. An IPv4 CIDR in `extra_deny_cidrs` also denies the IPv6 addresses that carry an IPv4 address it covers (the forms listed below; IPv4-compatible ones the built-in list denies anyway): `8.8.8.0/24` denies `64:ff9b::808:808` and `2002:808:808::1`. An IPv4 CIDR in `allow_cidrs` exempts only the IPv4 address and its mapped form, so allowing `10.0.0.0/8` does not admit `64:ff9b::a00:1`; such an address needs an IPv6 entry.
+
+An IPv6 entry that contains `::ffff:0:0/96` (`::/0`, `::/80`) covers no IPv4 address. Earlier releases matched every IPv4 address with it, so the gear logs a warning at startup for each such entry in either list; covering IPv4 takes an IPv4 CIDR (`0.0.0.0/0`).
+
+Built-in denied ranges:
+- IPv4: `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`, `192.0.0.0/24` (except `192.0.0.9` and `192.0.0.10`), `192.0.2.0/24`, `192.88.99.0/24`, `192.168.0.0/16`, `198.18.0.0/15`, `198.51.100.0/24`, `203.0.113.0/24`, `224.0.0.0/4`, `240.0.0.0/4` (with `255.255.255.255`).
+- IPv6: every block of the IANA IPv6 Special-Purpose Address Registry (2025-10-09) that is not globally reachable: `::1/128`, `::/128`, `64:ff9b:1::/48`, `100::/64`, `100:0:0:1::/64`, `2001::/23` except its globally reachable entries (`2001:1::1`, `2001:1::2`, `2001:1::3`, `2001:3::/32`, `2001:4:112::/48`, `2001:20::/28`, `2001:30::/28`), so with `2001:2::/48` and `2001:10::/28`, Teredo `2001::/32`, `2001:db8::/32`, `3fff::/20`, `5f00::/16`, `fc00::/7`, `fe80::/10`; plus the deprecated site-local `fec0::/10`, the deprecated IPv4-compatible `::/96` whatever IPv4 address it carries (a Linux host with `sit0` up tunnels it to that IPv4 address, other stacks send it as IPv6 outside `2000::/3`), multicast `ff00::/8`, and every other address outside `2000::/3`, the only space allocated for global unicast. A block IANA assigns outside `2000::/3` later is therefore denied already.
+- IPv6 addresses that carry an IPv4 address are judged by it: IPv4-mapped `::ffff:0:0/96`, IPv4-translated `::ffff:0:0:0/96`, NAT64 `64:ff9b::/96` and 6to4 `2002::/16`.
 
 **Cross-Origin Resource Sharing (CORS)**: Built-in, configured per upstream/route. Preflight OPTIONS requests return a permissive 204 at the handler level (no upstream resolution or tenant context required). Origin validation happens on actual requests after upstream resolution, before forwarding. See [ADR: CORS](./ADR/0006-cors.md).
 
@@ -1013,7 +1033,7 @@ Structured JSON logs to stdout, ingested by centralized logging system (e.g., EL
 
 ### 4.4 Security Considerations
 
-- **SSRF**: IP pinning rules, allowed segments, scheme allowlist (HTTPS-only for MVP)
+- **SSRF**: endpoint IP and hostname deny lists checked on write, resolved addresses checked on connect, scheme allowlist (HTTPS-only unless `allow_http_upstream`); see [Security Considerations](#security-considerations)
 - **CORS**: Built-in handler per upstream/route, secure defaults (disabled unless configured)
 - **HTTP smuggling**: Strict header parsing, reject CR/LF, validate CL/TE combinations
 - **HTTP/2**: Adaptive per-host version detection with cached capability (1h TTL)

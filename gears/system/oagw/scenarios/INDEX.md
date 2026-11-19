@@ -676,6 +676,14 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 - **Scenario**: *Section 26.3 — no separate file.*
 - **What happens**: Using HTTP route against `protocol=grpc` upstream fails with `502 ProtocolError` (`PD`).
 
+#### Non-public IPv6 address refused at write and at connect → 400
+- **Scenario**: [negative-26.4-non-public-ipv6-address-refused.md](proxy-api/ssrf/negative-26.4-non-public-ipv6-address-refused.md)
+- **What happens**: An IP endpoint in a non-public IPv6 range (IANA special-purpose blocks not globally reachable, `fec0::/10`, `ff00::/8`, anything else outside `2000::/3`) is refused on write with `400` naming the range. A hostname resolving into one is never connected to (Rust tests only).
+
+#### IPv6 deny CIDR does not refuse an IPv4 destination → allowed
+- **Scenario**: [positive-26.5-ipv6-deny-cidr-does-not-refuse-ipv4.md](proxy-api/ssrf/positive-26.5-ipv6-deny-cidr-does-not-refuse-ipv4.md)
+- **What happens**: `extra_deny_cidrs: ["::/3"]` does not refuse `8.8.8.8` or `::ffff:8.8.8.8`; `allow_cidrs: ["::/0"]` does not admit `10.0.0.1`. CIDRs match addresses of their own family only (Rust tests only).
+
 ---
 
 ### Plugin enforcement

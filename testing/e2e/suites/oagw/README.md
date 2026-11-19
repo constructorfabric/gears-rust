@@ -29,8 +29,9 @@ says so with the scenario file's stem:
   (hyper answers a bad Content-Length before OAGW runs).
 - Some scenarios have no e2e test because the suite cannot reach them, so
   the uncovered-scenario report lists them: 2.15-D (the suite turns
-  `allow_http_upstream` on for its plain-HTTP mock upstream; Rust tests in
-  the gear cover it).
+  `allow_http_upstream` on for its plain-HTTP mock upstream), 26.4-B (no
+  hostname resolves into a denied IPv6 range) and 26.5 (it needs a public
+  IPv4 destination). Rust tests in the gear cover them.
 - Collection fails on an unknown stem or part, so the links can't go stale.
   The marker follows the `scenario` convention of
   [`types_registry`](../types_registry/README.md). Links are also written to
