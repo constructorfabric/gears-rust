@@ -18,6 +18,9 @@ pub enum ReadOutcome {
     Miss,
     /// The decisive record's secret has expired (`SecretExpired`).
     Expired,
+    /// A bounded read found a value above the caller-named bound
+    /// (`OwnerAboveBound`).
+    OwnerAboveBound,
 }
 impl ReadOutcome {
     #[must_use]
@@ -27,6 +30,7 @@ impl ReadOutcome {
             Self::HitInherited => "hit_inherited",
             Self::Miss => "miss",
             Self::Expired => "expired",
+            Self::OwnerAboveBound => "owner_above_bound",
         }
     }
 }
@@ -235,6 +239,12 @@ mod tests {
         assert_eq!(Dep::TenantResolver.as_str(), "tenant_resolver");
         assert_eq!(DepOp::PluginGet.as_str(), "plugin_get");
         assert_eq!(Outcome::NotFound.as_str(), "not_found");
+    }
+
+    #[test]
+    fn read_outcome_labels_for_refused_reads() {
+        assert_eq!(ReadOutcome::Expired.as_str(), "expired");
+        assert_eq!(ReadOutcome::OwnerAboveBound.as_str(), "owner_above_bound");
     }
 
     #[test]
