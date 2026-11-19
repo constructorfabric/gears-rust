@@ -259,3 +259,8 @@ fn validate_path(key: &str, value: &str) -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "config_tests.rs"]
+mod config_tests;

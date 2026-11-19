@@ -61,3 +61,8 @@ pub fn client_from_config(
     let (service, _token_source) = build_service(cfg)?;
     Ok(service)
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "factory_tests.rs"]
+mod factory_tests;

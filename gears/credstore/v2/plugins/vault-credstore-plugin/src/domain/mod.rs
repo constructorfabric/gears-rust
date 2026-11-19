@@ -12,3 +12,21 @@ pub mod transport;
 mod wire;
 
 pub use service::Service;
+
+#[cfg(test)]
+pub(crate) mod test_ext {
+    /// Test-only predicates on the plugin error.
+    pub trait PluginErrorExt {
+        fn is_unavailable(&self) -> bool;
+        fn is_credentials_rejected(&self) -> bool;
+    }
+
+    impl PluginErrorExt for credstore_sdk::CredStorePluginError {
+        fn is_unavailable(&self) -> bool {
+            matches!(self, Self::Unavailable { .. })
+        }
+        fn is_credentials_rejected(&self) -> bool {
+            matches!(self, Self::CredentialsRejected { .. })
+        }
+    }
+}

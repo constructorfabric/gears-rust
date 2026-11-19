@@ -59,3 +59,8 @@ impl CredStorePluginDestroyerV2 for Service {
         self.destroy_value(key, &selector).await
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "client_tests.rs"]
+mod client_tests;

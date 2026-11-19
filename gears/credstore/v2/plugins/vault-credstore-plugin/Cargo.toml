@@ -59,6 +59,8 @@ inventory = { workspace = true }
 # The same SDK as above, plus the plugin conformance suite
 credstore-sdk = { package = "cf-gears-credstore-v2-sdk", version = "0.1.0", path = "../../credstore-sdk", features = ["conformance"] }
 tokio = { workspace = true, features = ["rt", "macros", "time", "fs", "sync"] }
+tokio-util = { workspace = true }
+toolkit = { workspace = true, features = ["test-support"] }
 serde-saphyr = { workspace = true }
 httpmock = { workspace = true }
 temp-env = { workspace = true }
