@@ -90,7 +90,7 @@ Memberships link resources (users, courses, documents, etc.) to groups in the hi
 4. [x] - `p1` - **IF** group not found or outside the caller's scope → **RETURN** NotFound - `inst-add-memb-4`
 5. [x] - `p1` - Read active group/member type snapshots through Types Registry with the caller context, before the write transaction - `inst-add-memb-5`
 6. [x] - `p1` - **IF** resource_type not registered → **RETURN** Validation error - `inst-add-memb-6`
-7. [x] - `p1` - Load the group's bound membership schema - `inst-add-memb-7`
+7. [x] - `p1` - Load the membership schema selected by the group's current type - `inst-add-memb-7`
 8. [x] - `p1` - **IF** the membership schema rejects resource_type → **RETURN** Validation error from the membership schema - `inst-add-memb-8`
 9. [x] - `p1` - Invoke tenant compatibility check for resource across existing memberships - `inst-add-memb-9`
 10. [x] - `p1` - **IF** tenant incompatible → **RETURN** TenantIncompatibility - `inst-add-memb-10`

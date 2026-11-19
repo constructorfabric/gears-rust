@@ -36,6 +36,8 @@ pub struct RgType {
     membership_type: Option<String>,
     /// Compiled validator for the group's payload.
     group_payload: PayloadValidator,
+    /// Unconditional constraints on the parent, used to attribute a rejected payload.
+    placement: Option<PayloadValidator>,
 }
 
 impl RgType {
@@ -59,10 +61,11 @@ impl RgType {
             code,
             membership_type,
             group_payload,
+            placement: placement_validator(schema),
         })
     }
 
-    /// Resolve the binding for a new group or a row predating the binding column.
+    /// The concrete membership schema selected by this group type.
     pub(crate) fn membership_type(&self) -> Result<&str, DomainError> {
         self.membership_type.as_deref().ok_or_else(|| {
             DomainError::validation(format!(
@@ -81,8 +84,67 @@ impl RgType {
         if let Some(metadata) = metadata {
             payload["metadata"] = metadata.clone();
         }
-        validate(&self.group_payload, &payload, &self.code)
+        self.group_payload.validate(&payload).map_err(|error| {
+            let message = format!("Payload does not match type '{}': {error}", self.code);
+            let rejects_parent = match &error {
+                types_registry_sdk::PayloadValidationError::References(issues) => issues
+                    .iter()
+                    .any(|issue| issue.field_path == "/parent_type"),
+                _ => self
+                    .placement
+                    .as_ref()
+                    .is_some_and(|rule| !rule.is_valid(&payload["parent_type"])),
+            };
+            if rejects_parent {
+                DomainError::invalid_parent_type(message)
+            } else {
+                DomainError::validation(message)
+            }
+        })
     }
+}
+
+/// GTS 0.17 reports ordinary JSON Schema violations without their instance paths.
+/// Check only parent rules that necessarily apply (properties at the root and in
+/// `allOf`). Conditional constraints involving other fields remain payload errors.
+fn placement_validator(schema: &TypeSchema) -> Option<PayloadValidator> {
+    fn parent_rules(node: &Value, path: &str, rules: &mut Vec<Value>) {
+        if node.get("$ref").is_some() {
+            return;
+        }
+        if node.pointer("/properties/parent_type").is_some() {
+            rules.push(json!({"$ref": format!("{path}/properties/parent_type")}));
+        }
+        if let Some(branches) = node.get("allOf").and_then(Value::as_array) {
+            for (index, branch) in branches.iter().enumerate() {
+                parent_rules(branch, &format!("{path}/allOf/{index}"), rules);
+            }
+        }
+    }
+    let resolved = schema.resolved_schema.as_ref()?;
+    let id = resolved
+        .get("$id")
+        .and_then(Value::as_str)
+        .map_or_else(|| format!("gts://{}", schema.type_id), str::to_owned);
+    let mut rules = Vec::new();
+    parent_rules(resolved, &format!("{id}#"), &mut rules);
+    if rules.is_empty() {
+        return None;
+    }
+
+    // Keep the original resource intact so references from parent rules still
+    // resolve against their original paths, definitions and dialect.
+    let mut snapshot = schema.clone();
+    let mut source = snapshot.resolved_schema.take()?;
+    source["$id"] = Value::String(id);
+    let mut diagnostic = json!({"definitions": {"group": source}, "allOf": rules});
+    if let Some(dialect) = resolved.get("$schema") {
+        diagnostic["$schema"] = dialect.clone();
+    }
+    snapshot.resolved_schema = Some(diagnostic);
+    snapshot.compile_payload_validator().inspect_err(|error| {
+        tracing::warn!(code = %schema.type_id, %error, "cannot attribute placement errors for group schema");
+    }).ok()
 }
 
 /// A concrete membership schema: a valid GTS type strictly derived from
@@ -190,22 +252,17 @@ pub trait RgTypeCatalog: Send + Sync {
         membership_type: &str,
     ) -> Result<MembershipSchema, DomainError>;
 
-    /// The rule for a new membership in a group of `group_type`: the group
-    /// type must be Active, `resource_type` must be an Active registered
-    /// type, and the result is the group's membership schema — the stored
-    /// `binding`, or the one the group type fixes for a row predating the
-    /// stored binding. Checks the member type in the same registry read; with
-    /// a stored binding, the group type too.
+    /// Resolve the active group type's current membership schema and check
+    /// that the candidate member type is registered, active and concrete.
     ///
     /// # Errors
     /// As [`Self::get_type`] for the group type (checked first), then
-    /// [`DomainError::Validation`] for an unknown or deleted member type,
+    /// [`DomainError::Validation`] for an unknown, deleted or abstract member type,
     /// then as [`Self::get_membership_schema`].
     async fn get_membership_rule(
         &self,
         ctx: &SecurityContext,
         group_type: &str,
-        binding: Option<&str>,
         resource_type: &str,
     ) -> Result<MembershipSchema, DomainError>;
 }

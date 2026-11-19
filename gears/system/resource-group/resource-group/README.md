@@ -56,10 +56,10 @@ Several group types can share a membership schema.
   family, use a string branch with `x-gts-type-ref`.
 - The group type sets `x-gts-traits.membership_type` and locks it with
   `const` in `x-gts-traits-schema.properties.membership_type`. RG reads the
-  value from `effective_traits`, checks that the target is active and concrete, and binds
-  the new group to it using a dictionary key. Group creation takes the usual
-  group request.
-- When adding a member, RG uses that binding to validate `{resource_type}`
+  value from `effective_traits` and checks that the selected schema is active
+  and concrete before creating the group.
+- When adding a member, RG reads the group's current type declaration and
+  batches the membership schema and member type lookup. It validates `{resource_type}`
   against the active membership schema. Use `anyOf` with `x-gts-type-ref` to
   allow type families, or `enum` to allow exact type IDs.
 
@@ -71,10 +71,9 @@ move or accept members under the widened rules. They also check that the
 registry refuses incompatible payload revisions. Same-ID compatibility of the
 effective traits schema is tracked in [#6064](https://github.com/constructorfabric/gears-rust/issues/6064).
 
-The upgrade adds a nullable binding column for pre-existing database rows.
-Those groups resolve their binding from the published type until they have
-one in storage. Publish group and membership schemas for their existing GTS
-identifiers before they need type-dependent writes.
+Publish group and membership schemas for existing GTS identifiers before
+upgrading deployments that use custom types. Adding a member to any group
+uses the current membership rule published for that group type.
 
 Registries that already admitted the earlier v1 schema with a required
 `membership_type` payload field need a schema migration. Moving that field

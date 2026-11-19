@@ -21,6 +21,7 @@ pub(super) fn prepare_filter<F, M, E>(
     mut select: SecureSelect<E, Scoped>,
     query: &ODataQuery,
     type_field: F,
+    bind_budget: usize,
 ) -> Result<(SecureSelect<E, Scoped>, ODataQuery), DomainError>
 where
     F: FilterField,
@@ -29,12 +30,30 @@ where
 {
     if let Some(ast) = query.filter.as_deref() {
         let validated = validate_filter::<F>(ast)?;
+        // Reject an oversized filter before allocating its SQL subqueries.
+        if filter_bind_count(&validated) > bind_budget {
+            return Err(DomainError::validation(format!(
+                "filter exceeds the {bind_budget} bind parameter budget"
+            )));
+        }
         let condition = filter_to_condition::<F, M>(&validated, type_field)?;
         select = select.filter(condition);
     }
     let mut query = query.clone();
     query.filter = None;
     Ok((select, query))
+}
+
+fn filter_bind_count<F>(node: &FilterNode<F>) -> usize
+where
+    F: FilterField,
+{
+    match node {
+        FilterNode::Binary { .. } => 1,
+        FilterNode::InList { values, .. } => values.len(),
+        FilterNode::Not(child) => filter_bind_count(child),
+        FilterNode::Composite { children, .. } => children.iter().map(filter_bind_count).sum(),
+    }
 }
 
 /// Accept quoted UUIDs only for UUID fields. Keep the caller's AST and filter

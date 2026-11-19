@@ -19,7 +19,7 @@ use common::{
 };
 use resource_group::domain::error::DomainError;
 use resource_group::domain::membership_service::MembershipService;
-use resource_group::domain::repo::MembershipRepositoryTrait;
+use resource_group::domain::repo::{MemberTypes, MembershipRepositoryTrait};
 use resource_group::infra::storage::group_repo::GroupRepository;
 use resource_group::infra::storage::membership_repo::MembershipRepository;
 use toolkit_db::{DBProvider, DbError};
@@ -451,7 +451,7 @@ async fn repo_delete_under_deny_all_scope_deletes_nothing() {
             &conn,
             &AccessScope::deny_all(),
             f.group_a,
-            &type_id(&f),
+            MemberTypes::Exact(&type_id(&f)),
             "res-a",
         )
         .await
@@ -479,7 +479,13 @@ async fn repo_resource_id_scope_fails_closed() {
     assert!(page.items.is_empty());
 
     let deleted = MembershipRepository
-        .delete(&conn, &scope, f.group_a, &type_id(&f), "res-a")
+        .delete(
+            &conn,
+            &scope,
+            f.group_a,
+            MemberTypes::Exact(&type_id(&f)),
+            "res-a",
+        )
         .await
         .expect("delete");
     assert_eq!(deleted, 0);
@@ -514,7 +520,13 @@ async fn repo_mixed_scope_fails_closed() {
     assert!(page.items.is_empty(), "whole scope must be closed");
 
     let deleted = MembershipRepository
-        .delete(&conn, &scope, f.group_b, &type_id(&f), "res-b")
+        .delete(
+            &conn,
+            &scope,
+            f.group_b,
+            MemberTypes::Exact(&type_id(&f)),
+            "res-b",
+        )
         .await
         .expect("delete");
     assert_eq!(deleted, 0, "whole scope must be closed");
@@ -560,7 +572,7 @@ async fn repo_delete_respects_tenant_scopes() {
             &conn,
             &AccessScope::for_tenant(f.tenant_b),
             f.group_a,
-            &type_id,
+            MemberTypes::Exact(&type_id),
             "res-a",
         )
         .await
@@ -577,7 +589,7 @@ async fn repo_delete_respects_tenant_scopes() {
             &conn,
             &AccessScope::for_tenant(f.tenant_a),
             f.group_a,
-            &type_id,
+            MemberTypes::Exact(&type_id),
             "res-a",
         )
         .await

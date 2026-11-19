@@ -16,7 +16,7 @@ use types_registry_sdk::{
 
 use crate::domain::error::DomainError;
 use crate::domain::type_catalog::{
-    MembershipSchema, RgType, RgTypeCatalog, TypeUse, compile, concrete_membership_type,
+    MembershipSchema, RgType, RgTypeCatalog, TypeUse, concrete_membership_type,
 };
 
 /// Production [`RgTypeCatalog`].
@@ -95,88 +95,43 @@ impl RgTypeCatalog for RegistryTypeCatalog {
         ctx: &SecurityContext,
         membership_type: &str,
     ) -> Result<MembershipSchema, DomainError> {
-        self.read_membership(ctx, membership_type, None, None).await
+        self.read_membership(ctx, membership_type, None).await
     }
 
     async fn get_membership_rule(
         &self,
         ctx: &SecurityContext,
         group_type: &str,
-        binding: Option<&str>,
         resource_type: &str,
     ) -> Result<MembershipSchema, DomainError> {
-        if let Some(binding) = binding {
-            return self
-                .read_membership(ctx, binding, Some(resource_type), Some(group_type))
-                .await;
-        }
-        // A row predating the stored binding: the group type names it.
-        let definition = self.get_type(ctx, group_type, TypeUse::NewLink).await?;
-        self.read_membership(
-            ctx,
-            definition.membership_type()?,
-            Some(resource_type),
-            None,
-        )
-        .await
+        let group = self.get_type(ctx, group_type, TypeUse::NewLink).await?;
+        self.read_membership(ctx, group.membership_type()?, Some(resource_type))
+            .await
     }
 }
 
 impl RegistryTypeCatalog {
-    /// One registry read of the membership schema, plus the member type and
-    /// the group type when given. Errors follow the group type, then the
-    /// membership schema's identifier, then the member type, then the
-    /// membership schema itself — the order of a group-type read followed by
-    /// a membership read.
+    /// Read the membership schema and, for an addition, the candidate member together.
     async fn read_membership(
         &self,
         ctx: &SecurityContext,
         membership_type: &str,
         resource_type: Option<&str>,
-        group_type: Option<&str>,
     ) -> Result<MembershipSchema, DomainError> {
-        let group_id = group_type
-            .map(|code| {
-                GtsTypeId::try_new(code)
-                    .map_err(|e| DomainError::validation(format!("Invalid GTS type '{code}': {e}")))
-            })
-            .transpose()?;
         let membership_id = concrete_membership_type(membership_type).ok_or_else(|| {
             DomainError::validation(format!(
                 "'{membership_type}' is not a concrete RG membership schema"
             ))
-        });
-        let resource_id = resource_type.map(|code| {
-            GtsTypeId::try_new(code)
-                .map_err(|error| DomainError::validation(format!("Invalid resource type: {error}")))
-        });
-        // Without a group type nothing precedes these: refuse without a read.
-        let (membership_id, resource_id) = if group_id.is_none() {
-            (Ok(membership_id?), resource_id.transpose()?.map(Ok))
-        } else {
-            (membership_id, resource_id)
-        };
-
-        // With a malformed identifier only the group type is read: its
-        // answer precedes the local refusal, and nothing else is needed.
-        let well_formed = membership_id.is_ok() && resource_id.as_ref().is_none_or(Result::is_ok);
-        let mut ids: Vec<GtsTypeId> = Vec::new();
-        let wanted = group_id.iter().chain(
-            well_formed
-                .then(|| {
-                    membership_id
-                        .as_ref()
-                        .ok()
-                        .into_iter()
-                        .chain(resource_id.as_ref().and_then(|id| id.as_ref().ok()))
-                })
-                .into_iter()
-                .flatten(),
-        );
-        for id in wanted {
-            if !ids.contains(id) {
-                ids.push(id.clone());
-            }
+        })?;
+        let resource_id = resource_type
+            .map(GtsTypeId::try_new)
+            .transpose()
+            .map_err(|error| DomainError::validation(format!("Invalid resource type: {error}")))?;
+        let mut ids = vec![membership_id.clone()];
+        if let Some(id) = &resource_id
+            && *id != membership_id
+        {
+            ids.push(id.clone());
         }
         let schemas = self
             .registry
@@ -188,7 +143,7 @@ impl RegistryTypeCatalog {
                 ))),
             )
             .await
-            .map_err(|error| registry_failure(error, group_type.unwrap_or(membership_type)))?;
+            .map_err(|error| registry_failure(error, membership_type))?;
         let active = |id: &GtsTypeId| -> Result<Option<&TypeSchema>, DomainError> {
             let Some(schema) = schemas.get(id).and_then(Option::as_ref) else {
                 return Ok(None);
@@ -200,18 +155,24 @@ impl RegistryTypeCatalog {
             Ok((schema.lifecycle_status == LifecycleStatus::Active).then_some(schema))
         };
 
-        if let Some(id) = &group_id {
-            let group = active(id)?.ok_or_else(|| DomainError::type_not_found(id.as_ref()))?;
-            // The same compile check `get_type` makes for a new link.
-            compile(group)?;
-        }
-        let membership_id = membership_id?;
-        if let Some(id) = resource_id.transpose()?
-            && active(&id)?.is_none()
-        {
-            return Err(DomainError::validation(format!(
-                "Unknown resource type: {id}"
-            )));
+        if let Some(id) = resource_id {
+            let member = active(&id)?
+                .ok_or_else(|| DomainError::validation(format!("Unknown resource type: {id}")))?;
+            // Abstractness belongs to the authored leaf, not its resolved base.
+            let content = member
+                .content
+                .as_ref()
+                .and_then(serde_json::Value::as_object)
+                .ok_or(DomainError::InternalError)?;
+            if content
+                .get("x-gts-abstract")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                return Err(DomainError::validation(format!(
+                    "Member type '{id}' is abstract"
+                )));
+            }
         }
         active(&membership_id)?
             .ok_or_else(|| DomainError::type_not_found(membership_type))

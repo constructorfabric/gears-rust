@@ -137,16 +137,15 @@ Publish both concrete definitions through Types Registry before creating
 groups that use them.
 
 Before creation RG reads the group schema, resolves `membership_type` from
-`effective_traits` and verifies that the membership definition is active. The group write transaction validates the actual parent's type
-(or `null` at the root) and metadata, and stores the binding as a key in
-`gts_type`. Group updates validate the resulting payload in the write
-transaction and retain the stored binding. The parent group still has to pass RG's tenant and hierarchy checks.
+`effective_traits` and verifies that the membership definition is active.
+The group write transaction validates the actual parent's type (or `null` at the root)
+and metadata. The parent group must also pass RG's tenant and hierarchy checks.
 
-A membership addition verifies the group type, the bound membership schema and
-the resource type are active. The membership schema validates only
-`resource_type`. RG validates that `resource_id` is nonempty and checks the
-group type and binding again before inserting the link. For rows created before
-the binding column existed, RG uses the binding from the published group schema.
+For each membership addition RG reads the active group type to select the current
+membership schema, then fetches that schema and the candidate resource type together.
+The resource type must be active and concrete. The membership schema validates
+`resource_type`. RG validates the resource identifier and rechecks the group's scope
+and type in the transaction before inserting the link.
 
 Types Registry checks same-ID revisions against the previous schema. The
 placement and membership schemas can widen through ordinary publication,
@@ -222,7 +221,7 @@ internal database details out of response bodies.
 
 ## 7. Verification
 
-- `managed_types_test.rs`: inherited schemas and stored membership bindings with the registry SDK mock.
+- `managed_types_test.rs`: inherited schemas and membership rule resolution for existing and new groups with the registry SDK mock.
 - `registry_types_test.rs`: registry definition policies exercised by group and membership services.
 - `infra/types_registry_tests.rs`: context/projection forwarding and error classification.
 - SQLite/PostgreSQL type-identifier migration tests: preserved rows, indexes, constraints and rollback on refusal.

@@ -183,7 +183,7 @@ async fn group_create_incompatible_parent_type() {
         .unwrap_err();
 
     assert!(
-        matches!(err, DomainError::Validation { .. }),
+        matches!(err, DomainError::InvalidParentType { .. }),
         "Expected parent schema validation error, got: {err:?}"
     );
 }
@@ -191,6 +191,8 @@ async fn group_create_incompatible_parent_type() {
 /// TC-GRP-04: Create root when can_be_root=false.
 #[tokio::test]
 async fn group_create_root_when_cannot_be_root() {
+    use resource_group_sdk::{ResourceGroupError, field};
+
     let db = common::test_db().await;
     let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db.clone());
@@ -209,9 +211,11 @@ async fn group_create_root_when_cannot_be_root() {
         .await
         .unwrap_err();
 
+    let projected = ResourceGroupError::from(toolkit_canonical_errors::CanonicalError::from(err));
     assert!(
-        matches!(err, DomainError::Validation { ref message } if message.contains("null")),
-        "Expected the parent schema to reject null, got: {err:?}"
+        matches!(projected, ResourceGroupError::InvalidArgument { field: ref name, ref reason, .. }
+        if name == field::PARENT_TYPE_FIELD && reason == field::INVALID_PARENT_TYPE),
+        "{projected:?}"
     );
 }
 
@@ -737,7 +741,7 @@ async fn group_move_incompatible_parent_type() {
         .unwrap_err();
 
     assert!(
-        matches!(err, DomainError::Validation { .. }),
+        matches!(err, DomainError::InvalidParentType { .. }),
         "Expected parent schema validation error, got: {err:?}"
     );
 }
@@ -819,7 +823,7 @@ async fn group_move_to_root_cannot_be_root() {
         .unwrap_err();
 
     assert!(
-        matches!(err, DomainError::Validation { ref message } if message.contains("null")),
+        matches!(err, DomainError::InvalidParentType { ref message } if message.contains("null")),
         "Expected the parent schema to reject null, got: {err:?}"
     );
 }
@@ -2182,7 +2186,7 @@ async fn adr_department_cannot_be_root() {
         .unwrap_err();
 
     assert!(
-        matches!(err, DomainError::Validation { .. }),
+        matches!(err, DomainError::InvalidParentType { .. }),
         "Expected parent schema validation error, got {err:?}"
     );
 }
@@ -2211,7 +2215,7 @@ async fn adr_branch_only_under_department() {
         .unwrap_err();
 
     assert!(
-        matches!(err, DomainError::Validation { .. }),
+        matches!(err, DomainError::InvalidParentType { .. }),
         "Expected parent schema validation error, got {err:?}"
     );
 }
@@ -3120,7 +3124,7 @@ async fn list_groups_leaves_a_filter_without_a_type_alone() {
 // =========================================================================
 
 /// A `GroupRepositoryTrait` decorator that delegates everything to the real
-/// [`GroupRepository`], except that the *first* call to `find_model_by_id`
+/// [`GroupRepository`], except that the *first* call to `find_model_by_id_scoped`
 /// for one watched group also reparents that group in the database, as a
 /// side effect, before returning.
 ///
@@ -3246,7 +3250,19 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
             }
             return Ok(result);
         }
-        let mut result = self.inner.find_model_by_id(db, id).await?;
+        self.inner.find_model_by_id(db, id).await
+    }
+
+    async fn find_model_by_id_scoped<C: DBRunner>(
+        &self,
+        db: &C,
+        scope: &AccessScope,
+        id: Uuid,
+    ) -> Result<Option<GroupRecord>, DomainError> {
+        let mut result = self.inner.find_model_by_id_scoped(db, scope, id).await?;
+        if self.stale_unlocked_parent.is_some() {
+            return Ok(result);
+        }
         if id == self.watched_group_id
             && !self.fired.swap(true, Ordering::SeqCst)
             && let Some(model) = &result
@@ -3271,15 +3287,6 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
             model.metadata = None;
         }
         Ok(result)
-    }
-
-    async fn find_model_by_id_scoped<C: DBRunner>(
-        &self,
-        db: &C,
-        scope: &AccessScope,
-        id: Uuid,
-    ) -> Result<Option<GroupRecord>, DomainError> {
-        self.inner.find_model_by_id_scoped(db, scope, id).await
     }
 
     async fn find_model_by_id_for_update<C: DBRunner>(
@@ -3343,22 +3350,12 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
         id: Uuid,
         parent_id: Option<Uuid>,
         type_key: GtsTypeKey,
-        membership_type_key: Option<GtsTypeKey>,
         name: &str,
         metadata: Option<&serde_json::Value>,
         tenant_id: Uuid,
     ) -> Result<(), DomainError> {
         self.inner
-            .insert(
-                db,
-                id,
-                parent_id,
-                type_key,
-                membership_type_key,
-                name,
-                metadata,
-                tenant_id,
-            )
+            .insert(db, id, parent_id, type_key, name, metadata, tenant_id)
             .await
     }
 

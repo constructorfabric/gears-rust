@@ -185,6 +185,10 @@ const RG_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Matches `CASCADE_PAGE_SIZE` in `domain::user_groups::cascade`.
 const RG_CLEANUP_PAGE_SIZE: u64 = 100;
 
+/// RG stored this exact member type before AM published its own user schema.
+const LEGACY_USER_MEMBERSHIP_TYPE: &str =
+    toolkit_gts::gts_id!("cf.core.rg.type.v1~cf.core.am.user.v1~");
+
 /// Overall cleanup budget. Tighter than `CASCADE_BUDGET` because
 /// cleanup runs on the synchronous `delete_user` request path
 /// (user-visible response), not on a background retention tick.
@@ -1006,8 +1010,8 @@ impl UserService {
     ///    `ResourceGroupMembership` does not, so a membership-keyed
     ///    listing cannot express a tenant filter without joining
     ///    through `group_id`.
-    /// 2. For each group: `remove_membership(group_id, USER_RESOURCE_TYPE,
-    ///    user_id.to_string())`. `NotFound` is idempotent success —
+    /// 2. Remove links for the user family and the exact legacy alias in each
+    ///    group. `NotFound` is idempotent success —
     ///    the user simply isn't a member of that group, or a peer
     ///    cleanup tick has already removed the row.
     ///
@@ -1068,7 +1072,7 @@ impl UserService {
 /// future.
 ///
 /// Lists every user-group in the tenant, then issues one
-/// `remove_membership(group_id, USER_RESOURCE_TYPE, user_id)` per
+/// `remove_resource_memberships` for the user family and legacy alias per
 /// listed group. `NotFound` on remove is idempotent (the user
 /// wasn't a member of that group); transport errors surface as
 /// [`DomainError::ServiceUnavailable`] so the caller's retry path
@@ -1090,7 +1094,13 @@ async fn cleanup_inner(
         // idempotent arm dispatches as before.
         let outcome = tokio::time::timeout(
             RG_CLEANUP_TIMEOUT,
-            rg.remove_membership(sys_ctx, *group_id, USER_RESOURCE_TYPE, &user_id_str),
+            rg.remove_resource_memberships(
+                sys_ctx,
+                *group_id,
+                USER_RESOURCE_TYPE,
+                &user_id_str,
+                Some(LEGACY_USER_MEMBERSHIP_TYPE),
+            ),
         )
         .await
         .map(|r| r.map_err(ResourceGroupError::from));

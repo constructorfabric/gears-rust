@@ -203,7 +203,7 @@ async fn the_sdk_validator_applies_inherited_metadata_through_a_nested_ref() {
 }
 
 #[tokio::test]
-async fn imported_groups_resolve_the_schema_and_new_groups_keep_their_stored_binding() {
+async fn existing_and_new_groups_resolve_the_current_membership_schema() {
     use resource_group::domain::error::DomainError;
     use resource_group::domain::repo::GroupRepositoryTrait;
     use resource_group::infra::storage::group_repo::GroupRepository;
@@ -248,18 +248,9 @@ async fn imported_groups_resolve_the_schema_and_new_groups_keep_their_stored_bin
             .await
             .expect("imported group type");
         GroupRepository
-            .insert(
-                &conn,
-                imported_id,
-                None,
-                type_key,
-                None,
-                "Imported",
-                None,
-                tenant,
-            )
+            .insert(&conn, imported_id, None, type_key, "Imported", None, tenant)
             .await
-            .expect("pre-existing group without a binding column value");
+            .expect("imported group");
     }
     members
         .add_membership(&ctx, imported_id, USER, "imported-user")
@@ -279,14 +270,6 @@ async fn imported_groups_resolve_the_schema_and_new_groups_keep_their_stored_bin
         )
         .await
         .expect("team root");
-    let binding = GroupRepository
-        .find_model_by_id(&db.conn().expect("RG database"), team.id)
-        .await
-        .expect("read group")
-        .expect("stored group")
-        .membership_type;
-    assert_eq!(binding.as_deref(), Some(TEAM_MEMBER));
-
     let replacement = gts_id!("cf.core.rg.membership.v1~cf.test.rg.groups_only.v1~");
     registry.seed(
         replacement,
@@ -300,7 +283,7 @@ async fn imported_groups_resolve_the_schema_and_new_groups_keep_their_stored_bin
             ]
         }),
     );
-    // Inject a different registry snapshot to exercise the stored binding independently of admission.
+    // Inject a different registry snapshot to exercise rule resolution independently of admission.
     team_schema["x-gts-traits"]["membership_type"] = json!(replacement);
     team_schema["x-gts-traits-schema"]["properties"]["membership_type"]["const"] =
         json!(replacement);
@@ -309,14 +292,16 @@ async fn imported_groups_resolve_the_schema_and_new_groups_keep_their_stored_bin
         .create_group(&ctx, CreateGroupRequest::new(TEAM_SCHEMA, "New"), tenant)
         .await
         .expect("new group uses the replacement binding");
-    assert!(matches!(
+    for group_id in [imported_id, team.id, new_team.id] {
+        assert!(matches!(
+            members
+                .add_membership(&ctx, group_id, USER, "user-43")
+                .await,
+            Err(DomainError::Validation { .. })
+        ));
         members
-            .add_membership(&ctx, new_team.id, USER, "user-43")
-            .await,
-        Err(DomainError::Validation { .. })
-    ));
-    members
-        .add_membership(&ctx, team.id, USER, "user-43")
-        .await
-        .expect("the group keeps its persisted binding");
+            .add_membership(&ctx, group_id, TEAM_SCHEMA, "team-43")
+            .await
+            .expect("every group uses the current rule for its type");
+    }
 }

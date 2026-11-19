@@ -40,7 +40,7 @@ use uuid::Uuid;
 use crate::domain::DbProvider;
 use crate::domain::error::DomainError;
 use crate::domain::metrics::{NoopMetrics, Operation, Outcome, RgMetricsPort};
-use crate::domain::repo::GroupRepositoryTrait;
+use crate::domain::repo::{GroupRecord, GroupRepositoryTrait};
 use crate::domain::type_catalog::{RgType, RgTypeCatalog, TypeUse};
 use crate::domain::validation;
 
@@ -550,19 +550,9 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
             let conn = db
                 .conn()
                 .map_err(|e| DomainError::database(e.to_string()))?;
-            // Scoped read first, before anything whose *shape* the caller can
-            // observe. `find_model_by_id` builds `system_scope()`, so on its
-            // own it answers for a group in any tenant -- and the metadata
-            // validation right below returns a schema-shaped 400, which a
-            // cross-tenant id must not be able to tell apart from the 404 an
-            // unknown id gets. Same rule the delete path states: a foreign id
-            // and a non-existent one look identical from outside.
+            // A foreign ID must yield the same 404 as a missing group before any registry lookup.
             group_repo
-                .find_by_id(&conn, &scope, group_id)
-                .await?
-                .ok_or_else(|| DomainError::group_not_found(group_id))?;
-            group_repo
-                .find_model_by_id(&conn, group_id)
+                .find_model_by_id_scoped(&conn, &scope, group_id)
                 .await?
                 .ok_or_else(|| DomainError::group_not_found(group_id))?
         };
@@ -714,10 +704,15 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
         let started = std::time::Instant::now();
         // The group's type definition, read before the transaction (see
         // `update_group`); the transaction rechecks the group's type.
+        let scope = self
+            .enforcer
+            .access_scope(ctx, &RG_GROUP_RESOURCE, "update", Some(group_id))
+            .await
+            .map_err(DomainError::from)?;
         let existing = {
             let conn = self.db.conn()?;
             self.group_repo
-                .find_model_by_id(&conn, group_id)
+                .find_model_by_id_scoped(&conn, &scope, group_id)
                 .await?
                 .ok_or_else(|| DomainError::group_not_found(group_id))?
         };
@@ -740,12 +735,17 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
                 let tenant_types = tenant_types.clone();
                 let group_repo = group_repo.clone();
                 let rg_type = rg_type.clone();
+                let scope = scope.clone();
                 Box::pin(async move {
+                    let existing = group_repo
+                        .find_model_by_id_scoped(tx, &scope, group_id)
+                        .await?
+                        .ok_or_else(|| DomainError::group_not_found(group_id))?;
                     Self::move_group_inner(
                         &*group_repo,
                         &rg_type,
                         tx,
-                        group_id,
+                        existing,
                         new_parent_id,
                         &profile,
                         &tenant_types,
@@ -1016,7 +1016,6 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
             return Err(DomainError::group_already_exists(group_id));
         }
 
-        let binding = rg_type.membership_type()?;
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4
         if let Some(parent_id) = req.parent_id {
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4a
@@ -1100,14 +1099,12 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
             // dictionary row is not an admission: the registry check ran
             // before `BEGIN`.
             let type_key = group_repo.ensure_type_key(tx, &rg_type.code).await?;
-            let membership_type_key = group_repo.ensure_type_key(tx, binding).await?;
             group_repo
                 .insert(
                     tx,
                     group_id,
                     Some(parent_id),
                     type_key,
-                    Some(membership_type_key),
                     &req.name,
                     req.metadata.as_ref(),
                     effective_tenant_id,
@@ -1167,14 +1164,12 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
 
             // Insert group; the type key is taken last, as in the child branch.
             let type_key = group_repo.ensure_type_key(tx, &rg_type.code).await?;
-            let membership_type_key = group_repo.ensure_type_key(tx, binding).await?;
             group_repo
                 .insert(
                     tx,
                     group_id,
                     None,
                     type_key,
-                    Some(membership_type_key),
                     &req.name,
                     req.metadata.as_ref(),
                     effective_tenant_id,
@@ -1436,17 +1431,13 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
         group_repo: &GR,
         rg_type: &RgType,
         tx: &impl DBRunner,
-        group_id: Uuid,
+        existing: GroupRecord,
         new_parent_id: Option<Uuid>,
         profile: &QueryProfile,
         tenant_types: &TenantTypes,
     ) -> Result<(ResourceGroup, u64), DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-3
-        // Load group and new parent in transaction
-        let existing = group_repo
-            .find_model_by_id(tx, group_id)
-            .await?
-            .ok_or_else(|| DomainError::group_not_found(group_id))?;
+        let group_id = existing.id;
 
         // The definition was read before `BEGIN` for the type the caller saw;
         // this in-transaction row decides.
@@ -1866,7 +1857,7 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
     async fn existing_group_type(
         &self,
         ctx: &SecurityContext,
-        existing: &crate::domain::repo::GroupRecord,
+        existing: &GroupRecord,
     ) -> Result<RgType, DomainError> {
         self.types
             .get_type(ctx, &existing.code, TypeUse::ExistingGroup)

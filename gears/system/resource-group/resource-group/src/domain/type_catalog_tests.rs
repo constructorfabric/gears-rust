@@ -95,3 +95,46 @@ fn a_payload_const_cannot_supply_a_missing_trait() {
         assert!(binding(traits).is_err());
     }
 }
+
+#[test]
+fn placement_attribution_preserves_local_refs_and_required_metadata() {
+    let schema = snapshot(
+        json!({}),
+        json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "definitions": { "parent": { "const": GROUP } },
+            "allOf": [{ "properties": { "parent_type": { "$ref": "#/definitions/parent" } } }],
+            "required": ["metadata"]
+        }),
+    );
+    let group = RgType::from_schema(&schema).unwrap();
+    assert!(matches!(
+        group.validate_group(None, Some(&json!({}))),
+        Err(DomainError::InvalidParentType { .. })
+    ));
+    assert!(matches!(
+        group.validate_group(Some(GROUP), None),
+        Err(DomainError::Validation { .. })
+    ));
+    group.validate_group(Some(GROUP), Some(&json!({}))).unwrap();
+}
+
+#[test]
+fn conditional_metadata_rule_is_a_payload_error() {
+    let schema = snapshot(
+        json!({}),
+        json!({
+            "properties": { "parent_type": { "enum": [null, GROUP] } },
+            "oneOf": [
+                { "properties": { "parent_type": { "const": GROUP }, "metadata": { "const": "team" } } },
+                { "properties": { "parent_type": { "type": "null" }, "metadata": { "const": "root" } } }
+            ]
+        }),
+    );
+    let group = RgType::from_schema(&schema).unwrap();
+    assert!(group.placement.is_some());
+    assert!(matches!(
+        group.validate_group(Some(GROUP), Some(&json!("bad"))),
+        Err(DomainError::Validation { .. })
+    ));
+}

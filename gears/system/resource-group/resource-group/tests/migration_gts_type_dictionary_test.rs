@@ -304,6 +304,12 @@ async fn an_existing_hierarchy_keeps_every_row_and_dictionary_key() {
     seed_hierarchy(&f.raw).await;
     let before = snapshot(&f.raw).await;
     upgrade(&f.db).await.expect("upgrade");
+    assert!(
+        !columns(&f.raw, "resource_group")
+            .await
+            .iter()
+            .any(|name| name == "membership_type_id")
+    );
 
     assert_eq!(
         snapshot(&f.raw).await,
@@ -413,10 +419,6 @@ async fn constraints_hold_after_the_upgrade() {
                 "INSERT INTO resource_group (id, parent_id, gts_type_id, name, tenant_id) \
                  VALUES (X'00000000000000000000000000000098', NULL, 999, 'x', X'{ROOT}')"
             ),
-        ),
-        (
-            "group membership type",
-            format!("UPDATE resource_group SET membership_type_id = 999 WHERE id = X'{ROOT}'"),
         ),
         (
             "dictionary row in use",

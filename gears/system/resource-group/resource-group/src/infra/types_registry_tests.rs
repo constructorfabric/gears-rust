@@ -165,6 +165,19 @@ async fn reads_are_made_for_the_caller() {
     );
 }
 
+#[tokio::test]
+async fn membership_rule_rejects_an_active_abstract_member() {
+    let registry = registry();
+    let mut content = registry.content(USER).expect("member schema");
+    content["x-gts-abstract"] = json!(true);
+    registry.seed(USER, content);
+    let error = catalog(registry)
+        .get_membership_rule(&caller(1), TENANT, USER)
+        .await
+        .expect_err("abstract member under an otherwise admitting rule");
+    assert!(matches!(error, DomainError::Validation { message } if message.contains("abstract")));
+}
+
 // -------- lifecycle --------
 
 #[tokio::test]
@@ -383,7 +396,7 @@ async fn validation_follows_the_registry_resolved_schema_not_the_authored_conten
 const EXTERNAL: &str = gts_id!("cf.test.lms.course.v1~");
 
 #[tokio::test]
-async fn a_membership_rule_is_one_read_of_group_member_and_membership_types() {
+async fn a_membership_rule_reads_the_group_then_batches_the_schema_and_member_for_the_caller() {
     let registry = registry();
     registry.seed(
         EXTERNAL,
@@ -394,21 +407,23 @@ async fn a_membership_rule_is_one_read_of_group_member_and_membership_types() {
         }),
     );
     let rule = catalog(registry.clone())
-        .get_membership_rule(&caller(4), TENANT, Some(MEMBERSHIP), EXTERNAL)
+        .get_membership_rule(&caller(4), TENANT, EXTERNAL)
         .await
         .expect("a non-RG member type can be looked up");
     assert_eq!(rule.code, MEMBERSHIP);
     rule.validate_member(USER).expect("user allowed");
     rule.validate_member(EXTERNAL)
         .expect_err("external type excluded");
-    assert_eq!(registry.calls(Call::BatchGet), 1, "one registry read");
     let contexts = registry.caller_contexts(Call::BatchGet);
-    assert_eq!(contexts.len(), 1);
-    assert_eq!(contexts[0].subject_id(), caller(4).subject_id());
     assert_eq!(
-        contexts[0].subject_tenant_id(),
-        caller(4).subject_tenant_id()
+        contexts.len(),
+        2,
+        "group type, then membership schema and member"
     );
+    for ctx in contexts {
+        assert_eq!(ctx.subject_id(), caller(4).subject_id());
+        assert_eq!(ctx.subject_tenant_id(), caller(4).subject_tenant_id());
+    }
     assert_eq!(
         registry.platform_calls(Call::BatchGet),
         0,
@@ -417,10 +432,10 @@ async fn a_membership_rule_is_one_read_of_group_member_and_membership_types() {
 }
 
 #[tokio::test]
-async fn a_row_without_a_stored_binding_uses_the_group_types_binding() {
+async fn a_membership_rule_uses_the_inherited_group_type_trait() {
     let registry = registry();
     let rule = catalog(registry.clone())
-        .get_membership_rule(&caller(1), DEPT, None, USER)
+        .get_membership_rule(&caller(1), DEPT, USER)
         .await
         .expect("the binding the department type inherits");
     assert_eq!(rule.code, MEMBERSHIP);
@@ -433,24 +448,18 @@ async fn a_row_without_a_stored_binding_uses_the_group_types_binding() {
 
 #[tokio::test]
 async fn a_membership_rule_checks_the_group_type_first() {
-    for binding in [
-        Some(MEMBERSHIP),
-        Some("gts.cf.core.rg.membership.v1~not an id"),
-        None,
-    ] {
-        for resource_type in [USER, "not an id"] {
-            let registry = registry();
-            delete(&registry, TENANT);
-            delete(&registry, USER);
-            let err = catalog(registry)
-                .get_membership_rule(&caller(1), TENANT, binding, resource_type)
-                .await
-                .expect_err("deleted group type");
-            assert!(
-                matches!(&err, DomainError::TypeNotFound { code } if code == TENANT),
-                "{binding:?}/{resource_type}: {err:?}"
-            );
-        }
+    for resource_type in [USER, "not an id"] {
+        let registry = registry();
+        delete(&registry, TENANT);
+        delete(&registry, USER);
+        let err = catalog(registry)
+            .get_membership_rule(&caller(1), TENANT, resource_type)
+            .await
+            .expect_err("deleted group type");
+        assert!(
+            matches!(&err, DomainError::TypeNotFound { code } if code == TENANT),
+            "{resource_type}: {err:?}"
+        );
     }
 }
 
@@ -471,14 +480,6 @@ async fn only_a_concrete_membership_schema_is_read() {
             "{membership_type}: {err:?}"
         );
         assert_eq!(registry.calls(Call::BatchGet), 0, "refused before the read");
-        let err = catalog(registry)
-            .get_membership_rule(&caller(1), TENANT, Some(membership_type), USER)
-            .await
-            .expect_err("not a concrete membership schema");
-        assert!(
-            matches!(err, DomainError::Validation { .. }),
-            "{membership_type}: {err:?}"
-        );
     }
 }
 
@@ -486,26 +487,21 @@ async fn only_a_concrete_membership_schema_is_read() {
 /// type is read, and nothing else is read for it.
 #[tokio::test]
 async fn a_malformed_identifier_reads_only_the_group_type() {
-    for (binding, resource_type) in [
-        (MEMBERSHIP, "not an id"),
-        ("gts.cf.core.rg.membership.v1~not an id", USER),
-    ] {
-        let registry = registry();
-        let err = catalog(registry.clone())
-            .get_membership_rule(&caller(1), TENANT, Some(binding), resource_type)
-            .await
-            .expect_err("malformed identifier");
-        assert!(matches!(err, DomainError::Validation { .. }), "{err:?}");
-        let read: Vec<String> = registry
-            .reads()
-            .iter()
-            .map(|key| match key {
-                types_registry_sdk::EntityKey::GtsId(id) => id.as_ref().to_owned(),
-                other @ types_registry_sdk::EntityKey::GtsUuid(_) => panic!("{other:?}"),
-            })
-            .collect();
-        assert_eq!(read, [TENANT], "{binding}/{resource_type}");
-    }
+    let registry = registry();
+    let err = catalog(registry.clone())
+        .get_membership_rule(&caller(1), TENANT, "not an id")
+        .await
+        .expect_err("malformed identifier");
+    assert!(matches!(err, DomainError::Validation { .. }), "{err:?}");
+    let read: Vec<String> = registry
+        .reads()
+        .iter()
+        .map(|key| match key {
+            types_registry_sdk::EntityKey::GtsId(id) => id.as_ref().to_owned(),
+            other @ types_registry_sdk::EntityKey::GtsUuid(_) => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(read, [TENANT]);
 }
 
 #[tokio::test]
@@ -576,7 +572,7 @@ async fn an_answer_for_another_type_is_internal() {
     assert!(matches!(err, DomainError::InternalError), "{err:?}");
     for (from, to) in [(TENANT, DEPT), (MEMBERSHIP, USER), (USER, TENANT)] {
         let err = misaddressed(from, to)
-            .get_membership_rule(&caller(1), TENANT, Some(MEMBERSHIP), USER)
+            .get_membership_rule(&caller(1), TENANT, USER)
             .await
             .expect_err("a lookup answered as another type");
         assert!(matches!(err, DomainError::InternalError), "{from}: {err:?}");
@@ -586,12 +582,7 @@ async fn an_answer_for_another_type_is_internal() {
 #[tokio::test]
 async fn an_unknown_or_deleted_member_type_refuses_a_new_membership() {
     let unknown = catalog(registry())
-        .get_membership_rule(
-            &caller(1),
-            TENANT,
-            Some(MEMBERSHIP),
-            gts_id!("cf.test.rg.ghost.v1~"),
-        )
+        .get_membership_rule(&caller(1), TENANT, gts_id!("cf.test.rg.ghost.v1~"))
         .await
         .expect_err("unknown member type");
     assert!(
@@ -602,7 +593,7 @@ async fn an_unknown_or_deleted_member_type_refuses_a_new_membership() {
     let registry = registry();
     delete(&registry, USER);
     let deleted = catalog(registry)
-        .get_membership_rule(&caller(1), TENANT, Some(MEMBERSHIP), USER)
+        .get_membership_rule(&caller(1), TENANT, USER)
         .await
         .expect_err("deleted member type");
     assert!(
@@ -616,7 +607,7 @@ async fn a_deleted_or_unknown_membership_schema_refuses_a_new_link() {
     let deleted = registry();
     delete(&deleted, MEMBERSHIP);
     let err = catalog(deleted.clone())
-        .get_membership_rule(&caller(1), TENANT, Some(MEMBERSHIP), USER)
+        .get_membership_rule(&caller(1), TENANT, USER)
         .await
         .expect_err("deleted membership schema");
     assert!(matches!(err, DomainError::TypeNotFound { .. }), "{err:?}");

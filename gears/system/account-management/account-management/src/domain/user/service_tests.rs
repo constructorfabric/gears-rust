@@ -1340,12 +1340,12 @@ async fn create_user_rejects_oversized_profile_fields_no_idp_call() {
 //
 //   1. `list_groups($filter = tenant_id eq T AND type eq
 //      USER_GROUP_RG_TYPE_CODE)` — drain all pages.
-//   2. For each group: `remove_membership(group_id, USER_RESOURCE_TYPE,
-//      user_id)`. `NotFound` is idempotent success.
+//   2. Remove the user family and exact legacy alias in each group.
+//      `NotFound` is idempotent success.
 //
 // The cleanup short-circuits when the service is constructed without
 // `with_rg_membership_cleanup`; the tests below wire a minimal fake
-// RG client around `list_groups` + `remove_membership`.
+// RG client around `list_groups` + `remove_resource_memberships`.
 
 mod cleanup {
     use super::*;
@@ -1375,7 +1375,7 @@ mod cleanup {
             .create()
     }
 
-    // -- minimal RG fake focused on list_groups + remove_membership --
+    // -- minimal RG fake focused on list_groups + remove_resource_memberships --
 
     enum ListBehaviour {
         Pages(Vec<Page<ResourceGroup>>),
@@ -1475,10 +1475,25 @@ mod cleanup {
         async fn remove_membership(
             &self,
             _ctx: &SecurityContext,
+            _group_id: Uuid,
+            _resource_type: &str,
+            _resource_id: &str,
+        ) -> Result<(), CanonicalError> {
+            unreachable!("deprovision uses the stored type family and legacy alias");
+        }
+
+        async fn remove_resource_memberships(
+            &self,
+            _ctx: &SecurityContext,
             group_id: Uuid,
             resource_type: &str,
             resource_id: &str,
+            exact_alias: Option<&str>,
         ) -> Result<(), CanonicalError> {
+            assert_eq!(
+                exact_alias,
+                Some("gts.cf.core.rg.type.v1~cf.core.am.user.v1~")
+            );
             self.removed.lock().expect("lock").push((
                 group_id,
                 resource_type.to_owned(),
@@ -1625,6 +1640,101 @@ mod cleanup {
         assert!(
             group_ids.contains(&group_a) && group_ids.contains(&group_b),
             "both listed groups received a remove call"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "seed the historical RG schema before upgrade"
+    )]
+    async fn deprovision_removes_a_membership_created_before_the_rg_upgrade() {
+        use resource_group::domain::{
+            group_service::{GroupService, QueryProfile},
+            membership_service::MembershipService,
+            rg_service::RgService,
+        };
+        use resource_group::infra::{
+            storage::{
+                group_repo::GroupRepository, membership_repo::MembershipRepository,
+                migrations::Migrator,
+            },
+            types_registry::RegistryTypeCatalog,
+        };
+        use sea_orm::ConnectionTrait;
+        use sea_orm_migration::MigratorTrait;
+        use toolkit_db::migration_runner::run_migrations_for_testing;
+
+        let tenant_id = ctx_subject_root();
+        let user_id = Uuid::now_v7();
+        let group = Uuid::now_v7().simple().to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let dsn = format!("sqlite://{}?mode=rwc", dir.path().join("rg.db").display());
+        let db = toolkit_db::connect_db(&dsn, toolkit_db::ConnectOpts::default())
+            .await
+            .unwrap();
+        run_migrations_for_testing(&db, Migrator::migrations().into_iter().take(1).collect())
+            .await
+            .unwrap();
+        let raw = sea_orm::Database::connect(&dsn).await.unwrap();
+        raw.execute_unprepared(&format!(
+            "INSERT INTO gts_type (id, schema_id) VALUES (1, '{USER_GROUP_RG_TYPE_CODE}'), (2, 'gts.cf.core.rg.type.v1~cf.core.am.user.v1~');
+             INSERT INTO resource_group (id, gts_type_id, name, tenant_id) VALUES (X'{group}', 1, 'admins', X'{}');
+             INSERT INTO resource_group_closure (ancestor_id, descendant_id, depth) VALUES (X'{group}', X'{group}', 0);
+             INSERT INTO resource_group_membership (group_id, gts_type_id, resource_id) VALUES (X'{group}', 2, '{user_id}');",
+            tenant_id.simple()
+        )).await.unwrap();
+        run_migrations_for_testing(&db, Migrator::migrations())
+            .await
+            .unwrap();
+
+        let db = Arc::new(toolkit_db::DBProvider::new(db));
+        let policy = authz_resolver_sdk::PolicyEnforcer::new(Arc::new(
+            authz_resolver_sdk::test_support::EmptyScopePdp { live: true },
+        ));
+        let catalog = Arc::new(RegistryTypeCatalog::new(Arc::new(MockTypesRegistry::new())));
+        let groups = Arc::new(GroupService::new(
+            db.clone(),
+            QueryProfile::default(),
+            policy.clone(),
+            Arc::new(GroupRepository),
+            catalog.clone(),
+        ));
+        let memberships = Arc::new(MembershipService::new(
+            db,
+            policy,
+            Arc::new(GroupRepository),
+            catalog,
+            Arc::new(MembershipRepository),
+        ));
+        let rg = Arc::new(RgService::new(groups, memberships));
+        let listed = rg
+            .list_memberships(&ctx(), &ODataQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(listed.items.len(), 1, "upgrade retained the original link");
+
+        let tenants = Arc::new(FakeTenantRepo::new());
+        seed_tenant(
+            &tenants,
+            tenant_id,
+            None,
+            TenantStatus::Active,
+            "old tenant",
+        );
+        let idp = Arc::new(FakeIdpUserProvisioner::new());
+        idp.set_delete_outcome(FakeUserOutcome::Ok);
+        let service = make_service(tenants, idp).with_rg_membership_cleanup(rg.clone());
+        service
+            .delete_user(&ctx(), tenant_id, user_id)
+            .await
+            .unwrap();
+        assert!(
+            rg.list_memberships(&ctx(), &ODataQuery::default())
+                .await
+                .unwrap()
+                .items
+                .is_empty()
         );
     }
 

@@ -154,6 +154,23 @@ pub trait ResourceGroupClient: Send + Sync {
         resource_id: &str,
     ) -> Result<(), CanonicalError>;
 
+    /// Remove links for one resource in one group under the membership delete scope.
+    /// Matches the GTS type family (base and descendants) and, when supplied, one
+    /// exact historical type alias. Returns `NotFound` if no visible link matches.
+    /// Implementations without family-aware deletion report `Unimplemented`.
+    async fn remove_resource_memberships(
+        &self,
+        _ctx: &SecurityContext,
+        _group_id: Uuid,
+        _type_family: &str,
+        _resource_id: &str,
+        _exact_alias: Option<&str>,
+    ) -> Result<(), CanonicalError> {
+        #[toolkit_canonical_errors::resource_error(toolkit_gts::gts_id!("cf.core.rg.group_membership.v1~"))]
+        struct Membership;
+        Err(Membership::unimplemented("resource membership cleanup is unavailable").create())
+    }
+
     /// List memberships with `OData` filtering and cursor-based pagination.
     ///
     /// Only memberships of groups inside the caller's scope are returned.

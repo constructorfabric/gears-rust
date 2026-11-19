@@ -172,6 +172,20 @@ impl<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> ResourceGroupClien
             .map_err(CanonicalError::from)
     }
 
+    async fn remove_resource_memberships(
+        &self,
+        ctx: &SecurityContext,
+        group_id: Uuid,
+        type_family: &str,
+        resource_id: &str,
+        exact_alias: Option<&str>,
+    ) -> Result<(), CanonicalError> {
+        self.membership_service
+            .remove_resource_memberships(ctx, group_id, type_family, resource_id, exact_alias)
+            .await
+            .map_err(CanonicalError::from)
+    }
+
     async fn list_memberships(
         &self,
         ctx: &SecurityContext,

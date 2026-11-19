@@ -183,18 +183,14 @@ def _seed_root_tenants():
         tid_a = uuid_to_blob(TENANT_A_ID)
         tid_b = uuid_to_blob(TENANT_B_ID)
 
-        # 1. Resolve the published identifiers into RG's numeric dictionary.
-        def type_key(code: str) -> int:
-            conn.execute("INSERT OR IGNORE INTO gts_type (schema_id) VALUES (?)", (code,))
-            return conn.execute("SELECT id FROM gts_type WHERE schema_id = ?", (code,)).fetchone()[0]
-
-        type_id = type_key(TENANT_TYPE_CODE)
-        binding_id = type_key(membership_schema_id(TENANT_TYPE_CODE))
+        # 1. Resolve the group type into RG's numeric dictionary.
+        conn.execute("INSERT OR IGNORE INTO gts_type (schema_id) VALUES (?)", (TENANT_TYPE_CODE,))
+        type_id = conn.execute("SELECT id FROM gts_type WHERE schema_id = ?", (TENANT_TYPE_CODE,)).fetchone()[0]
 
         # 2. Root tenant A (UUIDs as BLOB to match SeaORM format)
         conn.execute(
-            "INSERT OR IGNORE INTO resource_group (id, gts_type_id, membership_type_id, name, tenant_id) VALUES (?, ?, ?, ?, ?)",
-            (tid_a, type_id, binding_id, "e2e-root-tenant-a", tid_a),
+            "INSERT OR IGNORE INTO resource_group (id, gts_type_id, name, tenant_id) VALUES (?, ?, ?, ?)",
+            (tid_a, type_id, "e2e-root-tenant-a", tid_a),
         )
         conn.execute(
             "INSERT OR IGNORE INTO resource_group_closure (ancestor_id, descendant_id, depth) VALUES (?, ?, 0)",
@@ -203,8 +199,8 @@ def _seed_root_tenants():
 
         # 3. Root tenant B
         conn.execute(
-            "INSERT OR IGNORE INTO resource_group (id, gts_type_id, membership_type_id, name, tenant_id) VALUES (?, ?, ?, ?, ?)",
-            (tid_b, type_id, binding_id, "e2e-root-tenant-b", tid_b),
+            "INSERT OR IGNORE INTO resource_group (id, gts_type_id, name, tenant_id) VALUES (?, ?, ?, ?)",
+            (tid_b, type_id, "e2e-root-tenant-b", tid_b),
         )
         conn.execute(
             "INSERT OR IGNORE INTO resource_group_closure (ancestor_id, descendant_id, depth) VALUES (?, ?, 0)",

@@ -356,8 +356,9 @@ tenant ownership. This interface has no separate unscoped HTTP route.
 
 `RgTypeCatalog` is a domain port. `RegistryTypeCatalog` implements it over
 `TypesRegistryApi`, forwarding the caller's `SecurityContext`. Group type
-reads select `Content`, `ResolvedSchema` and `EffectiveTraits`. Adding a membership batches the
-lookup of the bound membership schema and member resource type.
+reads select `Content`, `ResolvedSchema` and `EffectiveTraits`. Each membership addition
+uses the current group type to select its membership schema, then fetches that
+schema and the member resource type in a batch.
 
 `GroupRepositoryTrait` and `MembershipRepositoryTrait` are injected into services.
 Their SecureORM implementations operate on `DBRunner` connections/transactions;
@@ -530,7 +531,7 @@ type lookup occurs between transaction attempts.
 
 The caller is authorized for membership creation. RG first reads the group under
 the membership-derived group scope, then reads the active group type and the
-active membership schema bound to that group. RG checks that the resource type
+membership schema selected by its current `membership_type` trait. RG checks that the resource type
 is active and validates it against the membership schema.
 
 A retryable serializable transaction rechecks the group's scope and type, checks

@@ -236,7 +236,7 @@ async fn trace_create_root_group() {
     // The type definition comes from the types registry before `BEGIN`
     // (RG-09, T38b): the database holds no type catalogue to read. The only
     // type table touched is the identity dictionary, inside the transaction:
-    // the first group adds keys for its type and its membership schema.
+    // the first group adds one key for its type.
     let tables: std::collections::BTreeSet<String> =
         rec.stats().keys().map(|(_, table)| table.clone()).collect();
     assert!(
@@ -246,14 +246,14 @@ async fn trace_create_root_group() {
         "RG type definitions are not read from RG's database: {tables:?}\n{}",
         rec.dump()
     );
-    assert_eq!(count_in(&rec.stats(), QueryKind::Select, "gts_type"), 2);
-    assert_eq!(count_in(&rec.stats(), QueryKind::Insert, "gts_type"), 2);
+    assert_eq!(count_in(&rec.stats(), QueryKind::Select, "gts_type"), 1);
+    assert_eq!(count_in(&rec.stats(), QueryKind::Insert, "gts_type"), 1);
 
-    // Later groups read the two existing keys without inserting dictionary rows.
+    // Later groups read the existing key without inserting dictionary rows.
     rec.clear();
     common::create_root_group(&group_svc, &ctx, &root_type.code, "Root 2", tenant_id).await;
     assert!(rec.writes_outside_tx().is_empty(), "{}", rec.dump());
-    assert_eq!(count_in(&rec.stats(), QueryKind::Select, "gts_type"), 2);
+    assert_eq!(count_in(&rec.stats(), QueryKind::Select, "gts_type"), 1);
     assert_eq!(
         count_in(&rec.stats(), QueryKind::Insert, "gts_type"),
         0,
@@ -318,6 +318,18 @@ async fn trace_update_group() {
     assert_eq!(updated.name, "Root Renamed");
 
     snapshot_trace("update_group", &rec);
+    let preflight_reads = rec
+        .events()
+        .into_iter()
+        .take_while(|event| !event.in_tx)
+        .filter(|event| event.kind == QueryKind::Select)
+        .count();
+    assert_eq!(
+        preflight_reads,
+        2,
+        "one scoped group read and one dictionary read:\n{}",
+        rec.dump()
+    );
     assert!(
         rec.writes_outside_tx().is_empty(),
         "update_group must run its writes inside a transaction:\n{}",

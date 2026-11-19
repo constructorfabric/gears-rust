@@ -15,8 +15,6 @@ pub struct Model {
     pub parent_id: Option<Uuid>,
     /// Key of the group's GTS type in the `gts_type` dictionary (immutable).
     pub gts_type_id: i16,
-    /// Immutable bound membership schema, absent on rows predating the binding.
-    pub membership_type_id: Option<i16>,
     pub name: String,
     #[sea_orm(column_type = "JsonBinary", nullable)]
     pub metadata: Option<serde_json::Value>,

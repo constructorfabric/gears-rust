@@ -201,6 +201,22 @@ async fn a_member_type_must_be_a_concrete_type_identifier() {
     }
 }
 
+#[tokio::test]
+async fn move_checks_group_visibility_before_reading_its_type() {
+    let db = common::test_db().await;
+    let groups = common::make_group_service(db.clone());
+    let owner = Uuid::now_v7();
+    let (_, root, _) = publish_family();
+    let group =
+        common::create_root_group(&groups, &common::make_ctx(owner), &root, "root", owner).await;
+    let unavailable = common::make_group_service_with(db, common::make_unavailable_types_catalog());
+    let error = unavailable
+        .move_group(&common::make_ctx(Uuid::now_v7()), group.id, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, DomainError::GroupNotFound { id } if id == group.id));
+}
+
 // -------- reads and cleanup never consult the registry --------
 
 #[tokio::test]
@@ -320,7 +336,10 @@ async fn groups_of_a_deleted_type_stay_readable_updatable_and_deletable() {
         .move_group(&ctx, c.id, None)
         .await
         .expect_err("the retained schema does not allow a root child");
-    assert!(matches!(err, DomainError::Validation { .. }), "{err:?}");
+    assert!(
+        matches!(err, DomainError::InvalidParentType { .. }),
+        "{err:?}"
+    );
     let unmoved = groups.get_group(&ctx, c.id).await.expect("read");
     assert_eq!(
         unmoved.hierarchy.parent_id,
@@ -549,11 +568,10 @@ impl RgTypeCatalog for WrongType {
         &self,
         ctx: &SecurityContext,
         group_type: &str,
-        binding: Option<&str>,
         resource_type: &str,
     ) -> Result<MembershipSchema, DomainError> {
         self.inner
-            .get_membership_rule(ctx, group_type, binding, resource_type)
+            .get_membership_rule(ctx, group_type, resource_type)
             .await
     }
 }
@@ -592,7 +610,7 @@ async fn a_definition_read_for_another_type_is_refused_inside_the_transaction() 
         .await
         .expect_err("the in-transaction row has another type");
     assert!(matches!(err, DomainError::Conflict { .. }), "{err:?}");
-    // A membership rule is read for the pre-read row's own type and binding,
+    // A membership rule is read for the pre-read row's own type,
     // so no catalog answer names another type; the transaction compares its
     // row with that pre-read row.
 }
@@ -628,7 +646,6 @@ impl RgTypeCatalog for ChangeRowDuringRuleRead {
         &self,
         ctx: &SecurityContext,
         group_type: &str,
-        binding: Option<&str>,
         resource_type: &str,
     ) -> Result<MembershipSchema, DomainError> {
         use sea_orm::ConnectionTrait;
@@ -637,7 +654,7 @@ impl RgTypeCatalog for ChangeRowDuringRuleRead {
             .await
             .expect("rewrite the group row");
         self.inner
-            .get_membership_rule(ctx, group_type, binding, resource_type)
+            .get_membership_rule(ctx, group_type, resource_type)
             .await
     }
 }
@@ -683,7 +700,7 @@ async fn file_db() -> (
 }
 
 /// A membership is checked against the group row it read before the
-/// transaction: a row whose type or bound membership schema changed by the
+/// transaction: a row whose group type changed by the
 /// time the transaction reads it is a conflict, and nothing is written.
 #[tokio::test]
 async fn a_group_row_changed_after_the_rule_read_refuses_the_membership() {
@@ -691,44 +708,32 @@ async fn a_group_row_changed_after_the_rule_read_refuses_the_membership() {
     let ctx = common::make_ctx(tenant);
     let (member, root, _) = publish_family();
     let (_, other_root, _) = publish_family();
-    let other_binding = {
-        let suffix = other_root.trim_end_matches('~').rsplit_once('~').unwrap().1;
-        format!("{}{suffix}~", resource_group_sdk::gts::MEMBERSHIP_TYPE_V1)
-    };
-    for (column, value) in [
-        ("gts_type_id", &other_root),
-        ("membership_type_id", &other_binding),
-    ] {
-        let (db, raw, _dir) = file_db().await;
-        let groups = common::make_group_service(db.clone());
-        // Keys both of the other root's identifiers in the dictionary.
-        common::create_root_group(&groups, &ctx, &other_root, "other", tenant).await;
-        let g = common::create_root_group(&groups, &ctx, &root, "g", tenant).await;
-        let catalog: Arc<dyn RgTypeCatalog> = Arc::new(ChangeRowDuringRuleRead {
-            inner: common::make_types_catalog(),
-            raw,
-            sql: format!(
-                "UPDATE resource_group SET {column} = \
-                 (SELECT id FROM gts_type WHERE schema_id = '{value}') \
-                 WHERE id = X'{}'",
-                g.id.as_simple()
-            ),
-        });
-        let members = common::make_membership_service_with(db, catalog);
-        let err = members
-            .add_membership(&ctx, g.id, &member, "r1")
-            .await
-            .expect_err("the row changed under the rule");
-        assert!(
-            matches!(err, DomainError::Conflict { .. }),
-            "{column}: {err:?}"
-        );
-        let stored = members
-            .list_memberships(&ctx, &ODataQuery::default())
-            .await
-            .unwrap();
-        assert!(stored.items.is_empty(), "{column}: nothing written");
-    }
+    let (db, raw, _dir) = file_db().await;
+    let groups = common::make_group_service(db.clone());
+    // Keys the other group's type in the dictionary.
+    common::create_root_group(&groups, &ctx, &other_root, "other", tenant).await;
+    let g = common::create_root_group(&groups, &ctx, &root, "g", tenant).await;
+    let catalog: Arc<dyn RgTypeCatalog> = Arc::new(ChangeRowDuringRuleRead {
+        inner: common::make_types_catalog(),
+        raw,
+        sql: format!(
+            "UPDATE resource_group SET gts_type_id = \
+             (SELECT id FROM gts_type WHERE schema_id = '{other_root}') \
+             WHERE id = X'{}'",
+            g.id.as_simple()
+        ),
+    });
+    let members = common::make_membership_service_with(db, catalog);
+    let err = members
+        .add_membership(&ctx, g.id, &member, "r1")
+        .await
+        .expect_err("the row changed under the rule");
+    assert!(matches!(err, DomainError::Conflict { .. }), "{err:?}");
+    let stored = members
+        .list_memberships(&ctx, &ODataQuery::default())
+        .await
+        .unwrap();
+    assert!(stored.items.is_empty(), "nothing written");
 }
 
 /// A membership insert keys its member type in the same transaction, so an
@@ -871,4 +876,34 @@ async fn reads_filters_and_removals_create_no_dictionary_keys() {
     );
 
     assert_eq!(dictionary_rows(&db).await, before);
+}
+
+#[tokio::test]
+async fn stored_user_memberships_are_removed_across_schema_versions() {
+    common::assert_stored_membership_cleanup(common::test_db().await).await;
+}
+
+#[tokio::test]
+async fn in_process_type_filter_rejects_lists_over_the_bind_budget() {
+    use toolkit_odata::ast::{Expr, Value};
+    let db = common::test_db().await;
+    let max = toolkit_db::secure::max_bind_params_for(&db.conn().unwrap());
+    let groups = common::make_group_service(db.clone());
+    let members = common::make_membership_service(db);
+    let ctx = common::make_ctx(Uuid::now_v7());
+    for field in ["type", "resource_type"] {
+        let query = ODataQuery::default().with_filter(Expr::In(
+            Box::new(Expr::Identifier(field.into())),
+            vec![Expr::Value(Value::String("unknown".into())); max + 1],
+        ));
+        let err = if field == "type" {
+            groups.list_groups(&ctx, &query).await.unwrap_err()
+        } else {
+            members.list_memberships(&ctx, &query).await.unwrap_err()
+        };
+        assert!(
+            matches!(err, DomainError::Validation { ref message } if message.contains("bind")),
+            "{err:?}"
+        );
+    }
 }

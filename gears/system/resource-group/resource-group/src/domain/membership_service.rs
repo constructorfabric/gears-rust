@@ -22,7 +22,7 @@ use tracing::debug;
 
 use crate::domain::DbProvider;
 use crate::domain::error::DomainError;
-use crate::domain::repo::{GroupRepositoryTrait, MembershipRepositoryTrait};
+use crate::domain::repo::{GroupRepositoryTrait, MemberTypes, MembershipRepositoryTrait};
 use crate::domain::type_catalog::RgTypeCatalog;
 
 /// `AuthZ` resource type descriptor for group memberships.
@@ -171,7 +171,7 @@ impl<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> MembershipService<
         // group's type is immutable, so it is read first -- under the caller's
         // scope, so a group outside it is "not found" before any type-shaped
         // answer -- and the transaction re-reads the group and confirms it
-        // still has that type and schema binding.
+        // still has that type.
         let db = self.db.db();
         let group_scope = group_scope_for_membership(scope);
         let group = {
@@ -192,21 +192,16 @@ impl<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> MembershipService<
                 "Membership resource_id must not be empty".to_owned(),
             ));
         }
-        self.types
-            .get_membership_rule(
-                ctx,
-                &group.code,
-                group.membership_type.as_deref(),
-                resource_type,
-            )
-            .await?
-            .validate_member(resource_type)?;
+        let rule = self
+            .types
+            .get_membership_rule(ctx, &group.code, resource_type)
+            .await?;
         let group_type = group.code;
         // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-7
         // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-6
         // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-5
         // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-8
-        let membership_type = group.membership_type;
+        rule.validate_member(resource_type)?;
         // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-8
         let group_repo = self.group_repo.clone();
         let membership_repo = self.membership_repo.clone();
@@ -218,7 +213,6 @@ impl<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> MembershipService<
             let membership_repo = membership_repo.clone();
             let group_scope = group_scope.clone();
             let group_type = group_type.clone();
-            let membership_type = membership_type.clone();
             let resource_type = resource_type_owned.clone();
             let resource_id = resource_id_owned.clone();
             Box::pin(async move {
@@ -240,8 +234,7 @@ impl<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> MembershipService<
                 // The rule above was read for this type; a group deleted
                 // and re-created under the same id with another type does
                 // not inherit it.
-                if group_model.code != group_type || group_model.membership_type != membership_type
-                {
+                if group_model.code != group_type {
                     return Err(DomainError::conflict(format!(
                         "Group {group_id} changed while the membership was being added"
                     )));
@@ -340,6 +333,45 @@ impl<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> MembershipService<
         resource_type: &str,
         resource_id: &str,
     ) -> Result<(), DomainError> {
+        self.remove_matching(
+            ctx,
+            group_id,
+            resource_id,
+            MemberTypes::Exact(resource_type),
+        )
+        .await
+    }
+
+    /// Remove all stored spellings of one resource under the same delete scope.
+    pub async fn remove_resource_memberships(
+        &self,
+        ctx: &SecurityContext,
+        group_id: Uuid,
+        type_family: &str,
+        resource_id: &str,
+        exact_alias: Option<&str>,
+    ) -> Result<(), DomainError> {
+        let root = types_registry_sdk::GtsTypeId::try_new(type_family)
+            .map_err(|e| DomainError::validation(format!("Invalid member type family: {e}")))?;
+        self.remove_matching(
+            ctx,
+            group_id,
+            resource_id,
+            MemberTypes::Family {
+                root: &root,
+                exact_alias,
+            },
+        )
+        .await
+    }
+
+    async fn remove_matching(
+        &self,
+        ctx: &SecurityContext,
+        group_id: Uuid,
+        resource_id: &str,
+        types: MemberTypes<'_>,
+    ) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-membership-remove:p1:inst-remove-memb-1
         // Actor sends DELETE /api/resource-group/v1/memberships/{group_id}/{resource_type}/{resource_id}
         // AuthZ gate: verify the caller can delete memberships
@@ -360,7 +392,7 @@ impl<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> MembershipService<
 
         // @cpt-begin:cpt-cf-resource-group-flow-membership-remove:p1:inst-remove-memb-3
         // Delete the membership. There is no prior read: this is a single
-        // statement by primary key, restricted to groups visible under the
+        // statement matching stored member types, restricted to groups visible under the
         // caller's scope. Nothing is decided from a read, and with tenant
         // ownership derived from the memberships themselves there is no
         // second piece of state to keep in step, so this needs neither its
@@ -371,7 +403,7 @@ impl<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> MembershipService<
         // both outcomes correct.
         let deleted = self
             .membership_repo
-            .delete(&conn, &scope, group_id, resource_type, resource_id)
+            .delete(&conn, &scope, group_id, types, resource_id)
             .await?;
         // @cpt-end:cpt-cf-resource-group-flow-membership-remove:p1:inst-remove-memb-3
 
@@ -380,7 +412,11 @@ impl<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> MembershipService<
         // group outside the caller's scope, so the two are indistinguishable.
         if deleted == 0 {
             return Err(DomainError::membership_not_found(format!(
-                "({group_id}, {resource_type}, {resource_id})"
+                "({group_id}, {}, {resource_id})",
+                match types {
+                    MemberTypes::Exact(code) => code,
+                    MemberTypes::Family { root, .. } => root.as_ref(),
+                }
             )));
         }
         // @cpt-end:cpt-cf-resource-group-flow-membership-remove:p1:inst-remove-memb-4

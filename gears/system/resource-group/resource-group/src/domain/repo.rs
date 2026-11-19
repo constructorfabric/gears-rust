@@ -10,6 +10,17 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 
+/// Stored resource types selected for removal of a membership.
+#[derive(Debug, Clone, Copy)]
+#[domain_model]
+pub enum MemberTypes<'a> {
+    Exact(&'a str),
+    Family {
+        root: &'a types_registry_sdk::GtsTypeId,
+        exact_alias: Option<&'a str>,
+    },
+}
+
 /// Storage key of a GTS type in RG's local identity dictionary (`gts_type`).
 ///
 /// Opaque to the domain: it only travels from
@@ -28,7 +39,6 @@ pub struct GroupRecord {
     pub parent_id: Option<Uuid>,
     /// The group's GTS type identifier (immutable).
     pub code: String,
-    pub membership_type: Option<String>,
     pub name: String,
     pub metadata: Option<serde_json::Value>,
     pub tenant_id: Uuid,
@@ -140,7 +150,6 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         id: Uuid,
         parent_id: Option<Uuid>,
         type_key: GtsTypeKey,
-        membership_type_key: Option<GtsTypeKey>,
         name: &str,
         metadata: Option<&serde_json::Value>,
         tenant_id: Uuid,
@@ -299,9 +308,9 @@ pub trait MembershipRepositoryTrait: Send + Sync + 'static {
         resource_id: &str,
     ) -> Result<(), DomainError>;
 
-    /// Delete a membership. `scope` is the caller's scope and is applied
+    /// Delete matching memberships. `scope` is the caller's scope and is applied
     /// through the owning group; an unconstrained scope means no tenant
-    /// filtering. `resource_type` is matched through the dictionary without
+    /// filtering. Stored types are matched through the dictionary without
     /// creating a key or consulting the registry: an unknown type deletes
     /// nothing.
     async fn delete<C: DBRunner>(
@@ -309,7 +318,7 @@ pub trait MembershipRepositoryTrait: Send + Sync + 'static {
         db: &C,
         scope: &AccessScope,
         group_id: Uuid,
-        resource_type: &str,
+        types: MemberTypes<'_>,
         resource_id: &str,
     ) -> Result<u64, DomainError>;
 

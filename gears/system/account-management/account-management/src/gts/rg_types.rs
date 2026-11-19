@@ -26,8 +26,10 @@ struct UserGroupTraits {
     traits_schema = inline(UserGroupTraits),
     traits = UserGroupTraits { membership_type: USER_MEMBERSHIP_SCHEMA },
     overrides(ResourceGroupTypeV1 = {
-        #[schemars(extend("enum" = [null, USER_GROUP_RG_TYPE_CODE]))]
-        parent_type: Option<String>,
+        // A root carries an explicit null. The property itself remains required.
+        #[schemars(extend("type" = ["string", "null"], "enum" = [null, USER_GROUP_RG_TYPE_CODE],
+            "x-gts-type-ref" = resource_group_sdk::gts::TYPE_RESOURCE_TYPE))]
+        parent_type: serde_json::Value,
     })
 )]
 pub struct UserGroupTypeV1;

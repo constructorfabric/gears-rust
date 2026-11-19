@@ -62,9 +62,12 @@ pub(super) fn register_membership_routes(
         "Membership created",
     )
     .error_400(openapi)
+    .error_401(openapi)
+    .error_403(openapi)
     .error_404(openapi)
     .error_409(openapi)
     .error_500(openapi)
+    .error_503(openapi)
     .register(router, openapi);
 
     // DELETE /resource-group/v1/memberships/{group_id}/{resource_type}/{resource_id} - Remove membership

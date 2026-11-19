@@ -22,7 +22,7 @@ use uuid::Uuid;
 use super::odata_filter::prepare_filter;
 use crate::domain::error::DomainError;
 use crate::domain::membership_service::group_scope_for_membership;
-use crate::domain::repo::{GtsTypeKey, MembershipRepositoryTrait};
+use crate::domain::repo::{GtsTypeKey, MemberTypes, MembershipRepositoryTrait};
 use crate::infra::storage::FK_RGM_GROUP_ID;
 use crate::infra::storage::entity::resource_group::{
     self as rg_entity, Entity as ResourceGroupEntity,
@@ -102,6 +102,7 @@ impl MembershipRepositoryTrait for MembershipRepository {
                 base_query,
                 query,
                 MembershipFilterField::ResourceType,
+                toolkit_db::secure::max_bind_params_for(db),
             )?;
 
         let page = paginate_odata::<MembershipFilterField, MembershipODataMapper, _, _, _, _>(
@@ -191,26 +192,29 @@ impl MembershipRepositoryTrait for MembershipRepository {
         Ok(())
     }
 
-    /// Delete a membership by its composite key. Returns the number of affected rows.
+    /// Delete matching membership keys. Returns the number of affected rows.
     async fn delete<C: DBRunner>(
         &self,
         db: &C,
         scope: &AccessScope,
         group_id: Uuid,
-        resource_type: &str,
+        types: MemberTypes<'_>,
         resource_id: &str,
     ) -> Result<u64, DomainError> {
         // No scope columns on the membership row: tenant scope is applied
         // through the owning group, the row is run under the system scope.
         // The type is matched through the dictionary in the same statement,
         // never creating a key: an unknown type deletes nothing.
+        let keys = match types {
+            MemberTypes::Exact(code) => gts_type_dict::keys_subquery([code]),
+            MemberTypes::Family { root, exact_alias } => {
+                gts_type_dict::family_keys(root.as_ref(), exact_alias)
+            }
+        };
         let row_scope = system_scope();
         let result = MembershipEntity::delete_many()
             .filter(membership_entity::Column::GroupId.eq(group_id))
-            .filter(
-                membership_entity::Column::GtsTypeId
-                    .in_subquery(gts_type_dict::keys_subquery([resource_type])),
-            )
+            .filter(membership_entity::Column::GtsTypeId.in_subquery(keys))
             .filter(membership_entity::Column::ResourceId.eq(resource_id))
             .apply_if(membership_group_condition(scope), QueryFilter::filter)
             .secure()

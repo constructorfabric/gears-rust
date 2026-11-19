@@ -764,3 +764,58 @@ pub fn make_membership_service_with(
         Arc::new(MembershipRepository),
     )
 }
+
+/// Exercise the stored type matcher and its tenant scope on either supported backend.
+pub async fn assert_stored_membership_cleanup(db: Arc<DBProvider<DbError>>) {
+    use resource_group::domain::error::DomainError;
+    use toolkit_odata::ODataQuery;
+    let groups = make_group_service(db.clone());
+    let members = make_membership_service(db.clone());
+    let tenant = Uuid::now_v7();
+    let ctx = make_ctx(tenant);
+    let root = create_root_type(&make_type_service(db.clone()), "users").await;
+    let group = create_root_group(&groups, &ctx, &root.code, "users", tenant).await;
+    let user = Uuid::now_v7().to_string();
+    let family = "gts.cf.core.am.user.v1~";
+    let legacy = "gts.cf.core.rg.type.v1~cf.core.am.user.v1~";
+    let child = "gts.cf.core.am.user.v1~cf.test.am.staff.v1~";
+    let unrelated = "gts.cf.core.am.device.v1~";
+    for kind in [legacy, family, child, unrelated] {
+        insert_membership_directly(&db, group.id, kind, &user)
+            .await
+            .expect("membership cleanup fixture");
+    }
+    insert_membership_directly(&db, group.id, child, "other")
+        .await
+        .expect("membership cleanup fixture");
+    let foreign = make_ctx(Uuid::now_v7());
+    let err = members
+        .remove_resource_memberships(&foreign, group.id, family, &user, Some(legacy))
+        .await
+        .expect_err("foreign group must be invisible to cleanup");
+    assert!(
+        matches!(err, DomainError::MembershipNotFound { .. }),
+        "{err:?}"
+    );
+    members
+        .remove_resource_memberships(&ctx, group.id, family, &user, Some(legacy))
+        .await
+        .expect("membership cleanup fixture");
+    let remaining = members
+        .list_memberships(&ctx, &ODataQuery::default())
+        .await
+        .expect("membership cleanup fixture");
+    assert_eq!(remaining.items.len(), 2);
+    assert!(
+        remaining
+            .items
+            .iter()
+            .any(|m| m.resource_type == unrelated && m.resource_id == user)
+    );
+    assert!(
+        remaining
+            .items
+            .iter()
+            .any(|m| m.resource_type == child && m.resource_id == "other")
+    );
+}

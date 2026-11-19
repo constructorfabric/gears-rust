@@ -70,26 +70,16 @@ impl GroupRepository {
         db: &impl DBRunner,
         model: Option<rg_entity::Model>,
     ) -> Result<Option<GroupRecord>, DomainError> {
-        let Some(model) = model else { return Ok(None) };
-        let paths = gts_type_dict::find_paths(
-            db,
-            std::iter::once(model.gts_type_id)
-                .chain(model.membership_type_id)
-                .map(GtsTypeKey),
-        )
-        .await?;
-        Ok(Some(GroupRecord {
-            id: model.id,
-            parent_id: model.parent_id,
-            code: paths.code(GtsTypeKey(model.gts_type_id))?,
-            membership_type: model
-                .membership_type_id
-                .map(|key| paths.code(GtsTypeKey(key)))
-                .transpose()?,
-            name: model.name,
-            metadata: model.metadata,
-            tenant_id: model.tenant_id,
-        }))
+        Ok(Self::with_code(db, model)
+            .await?
+            .map(|(model, code)| GroupRecord {
+                id: model.id,
+                parent_id: model.parent_id,
+                code,
+                name: model.name,
+                metadata: model.metadata,
+                tenant_id: model.tenant_id,
+            }))
     }
 
     /// Resolve one optional row's type key (one dictionary read).
@@ -483,6 +473,7 @@ impl GroupRepositoryTrait for GroupRepository {
             base_query,
             query,
             GroupFilterField::Type,
+            toolkit_db::secure::max_bind_params_for(db),
         )?;
 
         let page = paginate_odata::<GroupFilterField, GroupODataMapper, _, _, _, _>(
@@ -615,7 +606,6 @@ impl GroupRepositoryTrait for GroupRepository {
         id: Uuid,
         parent_id: Option<Uuid>,
         type_key: GtsTypeKey,
-        membership_type_key: Option<GtsTypeKey>,
         name: &str,
         metadata: Option<&serde_json::Value>,
         tenant_id: Uuid,
@@ -626,7 +616,6 @@ impl GroupRepositoryTrait for GroupRepository {
             id: Set(id),
             parent_id: Set(parent_id),
             gts_type_id: Set(type_key.0),
-            membership_type_id: Set(membership_type_key.map(|key| key.0)),
             name: Set(name.to_owned()),
             metadata: Set(metadata.cloned()),
             tenant_id: Set(tenant_id),

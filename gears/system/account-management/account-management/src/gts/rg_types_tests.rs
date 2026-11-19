@@ -175,16 +175,9 @@ async fn resource_group_resolves_the_user_group_binding() {
         .get_type(&caller, USER_GROUP_RG_TYPE_CODE, TypeUse::NewLink)
         .await
         .expect("an Active RG type");
-    for binding in [None, Some(USER_MEMBERSHIP_SCHEMA)] {
-        let rule = catalog
-            .get_membership_rule(
-                &caller,
-                USER_GROUP_RG_TYPE_CODE,
-                binding,
-                USER_RESOURCE_TYPE,
-            )
-            .await
-            .expect("the user-group membership rule");
-        assert_eq!(rule.code, USER_MEMBERSHIP_SCHEMA, "{binding:?}");
-    }
+    let rule = catalog
+        .get_membership_rule(&caller, USER_GROUP_RG_TYPE_CODE, USER_RESOURCE_TYPE)
+        .await
+        .expect("the user-group membership rule");
+    assert_eq!(rule.code, USER_MEMBERSHIP_SCHEMA);
 }
