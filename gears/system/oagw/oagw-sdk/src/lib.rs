@@ -21,8 +21,8 @@ pub mod models;
 pub const SECRET_REF_HEADER: &str = "x-oagw-secret-ref";
 
 pub use models::{
-    AuthConfig, BudgetConfig, BudgetMode, BurstConfig, CorsConfig, CorsHttpMethod,
-    CreateRouteRequest, CreateRouteRequestBuilder, CreateUpstreamRequest,
+    AuthConfig, BudgetConfig, BudgetMode, BurstConfig, CircuitBreakerConfig, CorsConfig,
+    CorsHttpMethod, CreateRouteRequest, CreateRouteRequestBuilder, CreateUpstreamRequest,
     CreateUpstreamRequestBuilder, Endpoint, GrpcMatch, HeadersConfig, HttpMatch, HttpMethod,
     ListQuery, MatchRules, PassthroughMode, PathSuffixMode, PluginBinding, PluginsConfig,
     RateLimitAlgorithm, RateLimitConfig, RateLimitScope, RateLimitStrategy, RequestHeaderRules,

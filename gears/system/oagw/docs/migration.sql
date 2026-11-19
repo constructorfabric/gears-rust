@@ -1,5 +1,7 @@
--- PostgreSQL DDL created by `m20261005_000001_create_upstreams_and_routes` and
--- `m20261012_000001_create_registry_state`. `oagw_plugin` is not created yet.
+-- PostgreSQL DDL created by `m20261005_000001_create_upstreams_and_routes`,
+-- `m20261012_000001_create_registry_state` and
+-- `m20261119_000001_add_upstream_circuit_breaker` (the two `circuit_breaker`
+-- columns, added with ALTER TABLE). `oagw_plugin` is not created yet.
 --
 -- Query frequency:
 --  * per miss    — a proxied request that misses the proxy configuration cache
@@ -36,6 +38,8 @@ CREATE TABLE oagw_upstream (
     plugins_sharing     VARCHAR(16),              -- NULL = no plugins configuration
     created_at          TIMESTAMPTZ   NOT NULL,
     updated_at          TIMESTAMPTZ   NOT NULL,
+    circuit_breaker     JSONB,                    -- NULL = no circuit breaker
+    circuit_breaker_sharing VARCHAR(16) NOT NULL DEFAULT 'private',
 
     PRIMARY KEY (id)                              -- get / update / delete (per call)
 );

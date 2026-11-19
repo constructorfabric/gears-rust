@@ -6470,3 +6470,549 @@ async fn alternating_routes_do_not_refill_the_upstream_bucket() {
     }
     assert_eq!(admitted, [true, true, false]);
 }
+
+// -- Circuit breaker (#4974) --
+
+/// A breaker that opens after two failures, stays open `timeout_seconds` and
+/// closes on one successful probe.
+fn breaker(timeout_seconds: u32) -> serde_json::Value {
+    json!({
+        "failure_threshold": 2,
+        "timeout_seconds": timeout_seconds,
+        "success_threshold": 1
+    })
+}
+
+/// An upstream at `endpoint` with `circuit_breaker`, and `GET /status` and
+/// `GET /ws/echo` routes. `alias` only for an IP endpoint: a host name is
+/// its own. Returns the upstream's JSON body.
+async fn breaker_upstream_at(
+    h: &AppHarness,
+    alias: Option<&str>,
+    endpoint: serde_json::Value,
+    circuit_breaker: serde_json::Value,
+) -> serde_json::Value {
+    let mut body = json!({
+        "server": {"endpoints": [endpoint]},
+        "protocol": HTTP_PROTOCOL_ID,
+        "circuit_breaker": circuit_breaker
+    });
+    if let Some(alias) = alias {
+        body["alias"] = json!(alias);
+    }
+    let upstream = h
+        .api_v1()
+        .post_upstream()
+        .with_body(body)
+        .expect_status(201)
+        .await
+        .json();
+    for path in ["/status", "/ws/echo"] {
+        h.api_v1()
+            .post_route()
+            .with_body(json!({
+                "upstream_id": upstream["id"],
+                "match": {"http": {"methods": ["GET"], "path": path}}
+            }))
+            .expect_status(201)
+            .await;
+    }
+    upstream
+}
+
+/// [`breaker_upstream_at`] the mock, with [`breaker`].
+async fn circuit_breaker_upstream(
+    h: &AppHarness,
+    alias: &str,
+    timeout_seconds: u32,
+) -> serde_json::Value {
+    breaker_upstream_at(
+        h,
+        Some(alias),
+        json!({"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}),
+        breaker(timeout_seconds),
+    )
+    .await
+}
+
+/// The answer of the upstream, not of the gateway.
+fn assert_from_upstream(resp: &oagw::test_support::TestResponse, status: u16) {
+    resp.assert_status(status);
+    assert_eq!(resp.headers()["x-oagw-error-source"], "upstream");
+}
+
+/// The gateway's error with its own retry hint, not the breaker's.
+fn assert_gateway_error(resp: &oagw::test_support::TestResponse, status: u16, retry_after: &str) {
+    resp.assert_status(status);
+    assert_eq!(resp.headers()["x-oagw-error-source"], "gateway");
+    assert_eq!(resp.headers()["retry-after"], retry_after);
+}
+
+/// The gateway's fail-fast answer while the circuit is open, `retry_after`
+/// seconds before a probe.
+fn assert_circuit_open(resp: &oagw::test_support::TestResponse, retry_after: &str) {
+    resp.assert_status(503);
+    assert_eq!(resp.headers()["x-oagw-error-source"], "gateway");
+    assert_eq!(resp.headers()["retry-after"], retry_after);
+    let body = resp.json();
+    assert_eq!(body["status"], 503, "{body}");
+    assert!(
+        body["type"]
+            .as_str()
+            .is_some_and(|t| t.contains("service_unavailable")),
+        "{body}"
+    );
+}
+
+/// Consecutive upstream 503s open the circuit: the next request fails fast
+/// with 503 and `Retry-After` without reaching the upstream. After the
+/// timeout one probe goes through; its success closes the circuit, and a
+/// single failure no longer opens it.
+#[tokio::test]
+async fn circuit_breaker_opens_then_a_probe_closes_it() {
+    let h = AppHarness::builder().build().await;
+    let upstream = circuit_breaker_upstream(&h, "cb-open", 1).await;
+    assert_eq!(
+        upstream["circuit_breaker"],
+        json!({
+            "sharing": "private",
+            "enabled": true,
+            "failure_threshold": 2,
+            "timeout_seconds": 1,
+            "success_threshold": 1
+        })
+    );
+    let get = |code: u16| {
+        h.api_v1()
+            .proxy_get("cb-open", &format!("status/{code}"))
+            .send()
+    };
+
+    // A success in between resets the count.
+    assert_from_upstream(&get(503).await, 503);
+    get(200).await.assert_status(200);
+    assert_from_upstream(&get(502).await, 502);
+    assert_from_upstream(&get(504).await, 504);
+    assert_circuit_open(&get(200).await, "1");
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    get(200).await.assert_status(200);
+    assert_from_upstream(&get(503).await, 503);
+    get(200).await.assert_status(200);
+}
+
+/// A failed probe opens the circuit again for another timeout.
+#[tokio::test]
+async fn circuit_breaker_failed_probe_reopens() {
+    let h = AppHarness::builder().build().await;
+    circuit_breaker_upstream(&h, "cb-reopen", 1).await;
+    let get = |code: u16| {
+        h.api_v1()
+            .proxy_get("cb-reopen", &format!("status/{code}"))
+            .send()
+    };
+    assert_from_upstream(&get(503).await, 503);
+    assert_from_upstream(&get(503).await, 503);
+    assert_circuit_open(&get(200).await, "1");
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert_from_upstream(&get(503).await, 503);
+    assert_circuit_open(&get(200).await, "1");
+}
+
+/// A write that changes the breaker or only the endpoints resets it at
+/// once; an unchanged write does not. Nothing here relies on the Control
+/// Plane dropping the breaker: the Data Plane rebuilds it on the next
+/// request, as another replica, which saw no write, does.
+#[tokio::test]
+async fn circuit_breaker_resets_on_config_or_endpoint_change() {
+    let h = AppHarness::builder().build().await;
+    let upstream = circuit_breaker_upstream(&h, "cb-reset", 60).await;
+    let id = upstream["id"].as_str().unwrap().to_owned();
+    let other = MockUpstream::start().await;
+    let get = |code: u16| {
+        h.api_v1()
+            .proxy_get("cb-reset", &format!("status/{code}"))
+            .send()
+    };
+    let put = |port: u16, failure_threshold: u32| {
+        h.api_v1()
+            .put_upstream(&id)
+            .with_body(json!({
+                "server": {
+                    "endpoints": [{"host": "127.0.0.1", "port": port, "scheme": "http"}]
+                },
+                "protocol": HTTP_PROTOCOL_ID,
+                "alias": "cb-reset",
+                "tags": [],
+                "enabled": true,
+                "circuit_breaker": {
+                    "failure_threshold": failure_threshold,
+                    "timeout_seconds": 60,
+                    "success_threshold": 1
+                }
+            }))
+            .expect_status(200)
+    };
+    let open = async || {
+        assert_from_upstream(&get(503).await, 503);
+        assert_from_upstream(&get(503).await, 503);
+        assert_circuit_open(&get(200).await, "60");
+    };
+
+    open().await;
+    put(h.mock_port(), 2).await;
+    assert_circuit_open(&get(200).await, "60");
+
+    // Same breaker, another endpoint.
+    put(other.addr().port(), 2).await;
+    get(200).await.assert_status(200);
+
+    open().await;
+    let updated = put(other.addr().port(), 3).await.json();
+    assert_eq!(updated["circuit_breaker"]["failure_threshold"], 3);
+    get(200).await.assert_status(200);
+}
+
+/// An omitted field takes the ADR-0005 default.
+#[tokio::test]
+async fn circuit_breaker_defaults() {
+    let h = AppHarness::builder().build().await;
+    let upstream = breaker_upstream_at(
+        &h,
+        Some("cb-defaults"),
+        json!({"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}),
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        upstream["circuit_breaker"],
+        json!({
+            "sharing": "private",
+            "enabled": true,
+            "failure_threshold": 5,
+            "timeout_seconds": 30,
+            "success_threshold": 3
+        })
+    );
+}
+
+/// A misspelled field is refused like any other body that does not
+/// deserialize (422), and a value above its maximum is a 400: not a silent
+/// default or a breaker that stays open for months.
+#[tokio::test]
+async fn circuit_breaker_rejects_unknown_fields_and_values_too_large() {
+    let h = AppHarness::builder().build().await;
+    let post = |circuit_breaker: serde_json::Value| {
+        h.api_v1().post_upstream().with_body(json!({
+            "server": {
+                "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
+            },
+            "protocol": HTTP_PROTOCOL_ID,
+            "circuit_breaker": circuit_breaker
+        }))
+    };
+    post(json!({"failure_treshold": 1}))
+        .expect_status(422)
+        .await;
+    for (circuit_breaker, detail) in [
+        (
+            json!({"failure_threshold": 1001}),
+            "circuit_breaker.failure_threshold must be at most 1000",
+        ),
+        (
+            json!({"timeout_seconds": 86_401}),
+            "circuit_breaker.timeout_seconds must be at most 86400",
+        ),
+        (
+            json!({"success_threshold": 101}),
+            "circuit_breaker.success_threshold must be at most 100",
+        ),
+    ] {
+        let body = post(circuit_breaker.clone())
+            .expect_status(400)
+            .await
+            .text();
+        assert!(body.contains(detail), "{circuit_breaker}: {body}");
+    }
+}
+
+/// A free local port nothing listens on.
+fn closed_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+/// An upstream that refuses connections opens the circuit.
+#[tokio::test]
+async fn circuit_breaker_opens_on_refused_connections() {
+    let h = AppHarness::builder().build().await;
+    breaker_upstream_at(
+        &h,
+        Some("cb-refused"),
+        json!({"host": "127.0.0.1", "port": closed_port(), "scheme": "http"}),
+        breaker(60),
+    )
+    .await;
+    // Refused: 502 with the transient hint.
+    let get = || h.api_v1().proxy_get("cb-refused", "status/200").send();
+    assert_gateway_error(&get().await, 502, "5");
+    assert_gateway_error(&get().await, 502, "5");
+    assert_circuit_open(&get().await, "60");
+}
+
+/// A host that does not resolve opens the circuit.
+#[tokio::test]
+async fn circuit_breaker_opens_on_dns_failures() {
+    let h = AppHarness::builder().build().await;
+    breaker_upstream_at(
+        &h,
+        None,
+        json!({"host": "oagw-cb-test.invalid", "port": 80, "scheme": "http"}),
+        breaker(60),
+    )
+    .await;
+    // Link unavailable: 503 with the link hint.
+    let get = || {
+        h.api_v1()
+            .proxy_get("oagw-cb-test.invalid", "status/200")
+            .send()
+    };
+    assert_gateway_error(&get().await, 503, "10");
+    assert_gateway_error(&get().await, 503, "10");
+    assert_circuit_open(&get().await, "60");
+}
+
+/// The SSRF policy refusing the upstream's addresses is the gateway's
+/// decision, not an upstream failure: the circuit stays closed.
+#[tokio::test]
+async fn circuit_breaker_ignores_ssrf_refusals() {
+    let h = AppHarness::builder()
+        .with_upstream_ssrf_policy()
+        .build()
+        .await;
+    let upstream = breaker_upstream_at(
+        &h,
+        None,
+        json!({"host": "localhost", "port": h.mock_port(), "scheme": "http"}),
+        json!({"failure_threshold": 1, "timeout_seconds": 60, "success_threshold": 1}),
+    )
+    .await;
+    let alias = upstream["alias"].as_str().unwrap();
+    for _ in 0..3 {
+        let resp = h.api_v1().proxy_get(alias, "status/200").send().await;
+        assert_gateway_error(&resp, 503, "10");
+    }
+}
+
+/// A client that trickles its body until the deadline is not an upstream
+/// failure: the circuit stays closed for everyone else.
+#[tokio::test]
+async fn circuit_breaker_ignores_a_slow_upload() {
+    use futures_util::StreamExt as _;
+    let h = AppHarness::builder()
+        .with_request_timeout(std::time::Duration::from_millis(300))
+        .build()
+        .await;
+    let ctx = h.security_context().clone();
+    let upstream = breaker_upstream_at(
+        &h,
+        Some("cb-slow-upload"),
+        json!({"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}),
+        json!({"failure_threshold": 1, "timeout_seconds": 60, "success_threshold": 1}),
+    )
+    .await;
+    h.api_v1()
+        .post_route()
+        .with_body(json!({
+            "upstream_id": upstream["id"],
+            "match": {"http": {"methods": ["POST"], "path": "/echo"}}
+        }))
+        .expect_status(201)
+        .await;
+    for _ in 0..2 {
+        // One chunk, then nothing until the deadline.
+        let chunk: Result<bytes::Bytes, oagw_sdk::body::BoxError> =
+            Ok(bytes::Bytes::from_static(b"part"));
+        let stream: oagw_sdk::body::BodyStream =
+            Box::pin(futures_util::stream::iter([chunk]).chain(futures_util::stream::pending()));
+        let req = http::Request::builder()
+            .method(Method::POST)
+            .uri("/cb-slow-upload/echo")
+            .header(http::header::CONTENT_TYPE, "application/octet-stream")
+            .body(Body::Stream(stream))
+            .unwrap();
+        h.facade()
+            .proxy_request(ctx.clone(), req)
+            .await
+            .expect_err("the upload never ends");
+    }
+    h.api_v1()
+        .proxy_get("cb-slow-upload", "status/200")
+        .send()
+        .await
+        .assert_status(200);
+}
+
+/// A request pinned with `X-OAGW-Target-Host` to one endpoint of several
+/// says nothing about the others: failures on a dead endpoint leave the
+/// circuit closed (an open one would answer every request with its own
+/// 60 s hint).
+#[tokio::test]
+async fn circuit_breaker_ignores_requests_pinned_to_one_endpoint() {
+    let h = AppHarness::builder().build().await;
+    let upstream = h
+        .api_v1()
+        .post_upstream()
+        .with_body(json!({
+            "alias": "cb-pinned",
+            "server": {"endpoints": [
+                {"host": "localhost", "port": h.mock_port(), "scheme": "http"},
+                {"host": "oagw-cb-pinned.invalid", "port": h.mock_port(), "scheme": "http"}
+            ]},
+            "protocol": HTTP_PROTOCOL_ID,
+            "circuit_breaker": {"failure_threshold": 1, "timeout_seconds": 60, "success_threshold": 1}
+        }))
+        .expect_status(201)
+        .await
+        .json();
+    h.api_v1()
+        .post_route()
+        .with_body(json!({
+            "upstream_id": upstream["id"],
+            "match": {"http": {"methods": ["GET"], "path": "/status"}}
+        }))
+        .expect_status(201)
+        .await;
+    let pinned = |host: &'static str| {
+        h.api_v1()
+            .proxy_get("cb-pinned", "status/200")
+            .with_header(
+                http::HeaderName::from_static("x-oagw-target-host"),
+                http::HeaderValue::from_static(host),
+            )
+            .send()
+    };
+    for _ in 0..3 {
+        // Link unavailable, not the open circuit.
+        assert_gateway_error(&pinned("oagw-cb-pinned.invalid").await, 503, "10");
+    }
+}
+
+/// Requests the open circuit rejects take no rate-limit tokens: once a
+/// config change closes it, the whole budget is left.
+#[tokio::test]
+async fn circuit_breaker_rejections_take_no_rate_limit_tokens() {
+    let h = AppHarness::builder().build().await;
+    let body = |failure_threshold: u32| {
+        json!({
+            "server": {
+                "endpoints": [{"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}]
+            },
+            "protocol": HTTP_PROTOCOL_ID,
+            "alias": "cb-rate",
+            "tags": [],
+            "enabled": true,
+            "rate_limit": {
+                "algorithm": "token_bucket",
+                "sustained": {"rate": 3, "window": "minute"},
+                "burst": {"capacity": 3},
+                "scope": "tenant",
+                "strategy": "reject"
+            },
+            "circuit_breaker": {
+                "failure_threshold": failure_threshold,
+                "timeout_seconds": 60,
+                "success_threshold": 1
+            }
+        })
+    };
+    let upstream = h
+        .api_v1()
+        .post_upstream()
+        .with_body(body(1))
+        .expect_status(201)
+        .await
+        .json();
+    let id = upstream["id"].as_str().unwrap().to_owned();
+    h.api_v1()
+        .post_route()
+        .with_body(json!({
+            "upstream_id": upstream["id"],
+            "match": {"http": {"methods": ["GET"], "path": "/status"}}
+        }))
+        .expect_status(201)
+        .await;
+    let get = |code: u16| {
+        h.api_v1()
+            .proxy_get("cb-rate", &format!("status/{code}"))
+            .send()
+    };
+
+    assert_from_upstream(&get(503).await, 503);
+    for _ in 0..5 {
+        assert_circuit_open(&get(200).await, "60");
+    }
+    h.api_v1()
+        .put_upstream(&id)
+        .with_body(body(2))
+        .expect_status(200)
+        .await;
+    get(200).await.assert_status(200);
+    get(200).await.assert_status(200);
+    get(200).await.assert_status(429);
+}
+
+/// A WebSocket upgrade request for `path` on `alias`.
+fn ws_upgrade(alias: &str, path: &str) -> http::Request<Body> {
+    http::Request::builder()
+        .method(Method::GET)
+        .uri(format!("/{alias}/{path}"))
+        .header("upgrade", "websocket")
+        .header("connection", "Upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .body(Body::Empty)
+        .unwrap()
+}
+
+/// A WebSocket handshake counts like a request: the upstream refusing it
+/// with 503 is a failure, so two of them open the circuit and the next
+/// upgrade fails fast. After the timeout a 101 is a successful probe that
+/// closes the circuit. What happens on an open tunnel is not counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn circuit_breaker_counts_websocket_handshakes() {
+    let h = AppHarness::builder().build().await;
+    let ctx = h.security_context().clone();
+    circuit_breaker_upstream(&h, "cb-ws", 1).await;
+    let refused = || ws_upgrade("cb-ws", "status/503");
+    let echo = || ws_upgrade("cb-ws", "ws/echo");
+    // The refused handshake is a 502 with the transient hint; the open
+    // circuit a plain 503 with the breaker's.
+    let retry_after = |err: CanonicalError| {
+        let status = err.http_status_override();
+        match err {
+            CanonicalError::ServiceUnavailable { ctx, .. } => (status, ctx.retry_after_seconds),
+            other => panic!("expected ServiceUnavailable, got {other:?}"),
+        }
+    };
+    let proxy = |req| h.facade().proxy_request(ctx.clone(), req);
+    for _ in 0..2 {
+        let err = proxy(refused()).await.expect_err("the upstream refuses");
+        assert_eq!(retry_after(err), (Some(502), Some(5)));
+    }
+    let err = proxy(echo()).await.expect_err("the circuit is open");
+    assert_eq!(retry_after(err), (None, Some(1)));
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let tunnel = proxy(echo()).await.expect("the probe switches protocols");
+    assert_eq!(tunnel.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+    // Closed: one refusal does not open it, and a tunnel cut off after it
+    // does not count as the second failure.
+    let err = proxy(refused()).await.expect_err("the upstream refuses");
+    assert_eq!(retry_after(err), (Some(502), Some(5)));
+    drop(tunnel);
+    let tunnel = proxy(echo()).await.expect("the circuit is closed");
+    assert_eq!(tunnel.status(), StatusCode::SWITCHING_PROTOCOLS);
+}

@@ -473,7 +473,7 @@ fn schema_version<T: IntoIden>(col: T) -> ColumnDef {
 /// A JSON document column: `jsonb` on `PostgreSQL`, `json` on `MySQL`, and
 /// text on `SQLite`. The database validates the document but never queries
 /// into it.
-fn json<T: IntoIden>(col: T) -> ColumnDef {
+pub(super) fn json<T: IntoIden>(col: T) -> ColumnDef {
     ColumnDef::new(col).json_binary().to_owned()
 }
 

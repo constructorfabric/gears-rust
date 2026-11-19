@@ -296,6 +296,14 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 - **Scenario**: [positive-18.7-budget-modes-behave-specified.md](rate-limiting/positive-18.7-budget-modes-behave-specified.md)
 - **Mechanism**: `allocated` rejects when the sum of direct allocations exceeds `total * overcommit_ratio`; a parent's change of budget or window is re-checked. `shared` adds one pool bucket of `total` per the owner's window that every tenant drawing on it shares, next to each tenant's own bucket. An upstream whose effective `cost` exceeds the pool's `total` is rejected on write. `unlimited` skips validation.
 
+#### Half-open probes close the circuit on recovery
+- **Scenario**: [positive-18.10-half-open-probe-closes-circuit.md](rate-limiting/positive-18.10-half-open-probe-closes-circuit.md)
+- **Mechanism**: After `timeout_seconds` an open circuit lets `success_threshold` probes through. All succeed → closed, and failures count from 0 again. One fails → open for another `timeout_seconds`.
+
+#### A changed breaker or a deleted upstream resets the circuit
+- **Scenario**: [positive-18.11-config-change-or-delete-resets-circuit.md](rate-limiting/positive-18.11-config-change-or-delete-resets-circuit.md)
+- **Mechanism**: A changed effective `circuit_breaker`, alias or endpoint list starts a closed breaker on the next request, on every replica; a write that changes or removes `circuit_breaker`, and a delete, discard the breaker on the replica that handles it, and idle breakers are evicted elsewhere. A removed and re-added breaker starts closed. An unchanged write keeps an open circuit open.
+
 #### A changed or removed limit applies at once
 - **Scenario**: *No separate file. Covered by the tests `changing_a_rate_limit_drops_the_exhausted_bucket` and `writes_drop_the_buckets_they_make_stale`.*
 - **Mechanism**: The Control Plane and the Data Plane share one limiter. A write that changes or removes an upstream or route rate limit drops its buckets on every write path (REST, SDK, registry), so a caller exhausted under the old limit is admitted under the new one. A write that keeps the limit keeps the buckets. A bucket reached with another config without such a write (a merged limit that differs by tenant chain, a write on another replica) keeps what it consumed (`token_bucket_config_change_keeps_what_was_consumed`).
@@ -594,7 +602,7 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 
 #### Write-time validation → 400
 - **Scenario**: [negative-2.15-write-validation-rejected-400.md](management-api/upstreams/negative-2.15-write-validation-rejected-400.md)
-- **What happens**: Port 0, a tag outside `^[a-z0-9_-]+$`, an alias starting or ending with `.`, `-` or `:`, an empty or relative HTTP route path, an empty method list, a rate limit value of 0, a rate limit `cost` above the bucket capacity or above the `budget.total` of the shared pool the upstream draws on, a plugin id that is not implemented, or an `http` endpoint while `allow_http_upstream` is off returns `400 PD` (`invalid_argument`). Nothing is stored.
+- **What happens**: Port 0, a tag outside `^[a-z0-9_-]+$`, an alias starting or ending with `.`, `-` or `:`, an empty or relative HTTP route path, an empty method list, a rate limit value of 0, a circuit breaker `failure_threshold`, `timeout_seconds` or `success_threshold` of 0 or above its maximum (1000, 86400, 100), a rate limit `cost` above the bucket capacity or above the `budget.total` of the shared pool the upstream draws on, a plugin id that is not implemented, or an `http` endpoint while `allow_http_upstream` is off returns `400 PD` (`invalid_argument`). Nothing is stored.
 
 #### Stored field limits → 400
 - **Scenario**: [negative-2.14-field-limits-rejected-400.md](management-api/upstreams/negative-2.14-field-limits-rejected-400.md)
@@ -724,6 +732,10 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 - **Scenario**: [negative-18.2-sliding-window-strictness.md](rate-limiting/negative-18.2-sliding-window-strictness.md)
 - **What happens**: Requests across a window boundary do not allow 2x burst.
 
+#### Circuit opens after consecutive failures → 503
+- **Scenario**: [negative-18.9-circuit-opens-after-consecutive-failures.md](rate-limiting/negative-18.9-circuit-opens-after-consecutive-failures.md)
+- **What happens**: After `failure_threshold` failures in a row (upstream `502`/`503`/`504`, connect, TLS or DNS errors, a timeout the upstream had its full budget for), requests fail fast with `503 PD` (`service_unavailable`), `ESrc=gateway` and `Retry-After` = time left until a probe, without reaching the upstream. Per replica, shared by every tenant on the upstream: SSRF refusals, gateway errors, client cancellations and timeouts after a slow CredStore read do not count.
+
 #### Spoofed forwarding headers → same IP bucket
 - **Scenario**: [negative-18.8-spoofed-forwarding-headers-keep-the-ip-bucket.md](rate-limiting/negative-18.8-spoofed-forwarding-headers-keep-the-ip-bucket.md)
 - **What happens**: A new `X-Forwarded-For` or `X-Real-IP` value does not open a fresh `scope: ip` bucket: OAGW keys on the address the API gateway resolved, so the request is `429`.
@@ -852,7 +864,9 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 
 ---
 
-### Concurrency & circuit breaker (future-facing)
+### Concurrency & per-endpoint circuit scope (future-facing)
+
+Upstream circuit breakers are implemented: [18.9](rate-limiting/negative-18.9-circuit-opens-after-consecutive-failures.md), [18.10](rate-limiting/positive-18.10-half-open-probe-closes-circuit.md), [18.11](rate-limiting/positive-18.11-config-change-or-delete-resets-circuit.md).
 
 #### Concurrency limit rejects when max in-flight reached → 503
 - *No scenario file (future-facing).*
@@ -866,17 +880,9 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 - *No scenario file (future-facing).*
 - **What happens**: SSE and WS hold concurrency permit until closed.
 
-#### Circuit opens after consecutive failures → 503
-- *No scenario file (future-facing).*
-- **What happens**: After threshold, requests fail fast with `503 circuit_breaker.open` + `Retry-After`.
-
-#### Half-open probing closes circuit on recovery
-- *No scenario file (future-facing).*
-- **What happens**: After open timeout, limited probes allowed. Success threshold closes circuit.
-
 #### Per-endpoint circuit scope
 - *No scenario file (future-facing).*
-- **What happens**: With `scope=per_endpoint`, failures isolate to single endpoint.
+- **What happens**: With `scope=per_endpoint`, failures isolate to single endpoint. Today one breaker covers all endpoints of an upstream.
 
 ---
 

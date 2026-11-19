@@ -10,10 +10,10 @@ use crate::domain::model::{PluginsConfig, RateLimitConfig, Route, Server, Upstre
 ///
 /// Per `cpt-cf-oagw-algo-tenant-alias-shadow` step 2b, an ancestor upstream is
 /// visible if its own tenant matches the requester OR any per-field sharing flag
-/// (`auth`, `rate_limit`, `plugins`, `cors`) is not `private`.
+/// (`auth`, `rate_limit`, `circuit_breaker`, `plugins`, `cors`) is not `private`.
 ///
 /// Returns `false` when all shareable fields are `None` — this is intentional.
-/// An upstream with no auth, rate_limit, plugins, or cors has no configuration
+/// An upstream with no auth, rate_limit, circuit_breaker, plugins, or cors has no configuration
 /// to share with descendants, so it is treated as invisible. Fields without a
 /// sharing mode (e.g. `headers`) do not contribute to visibility.
 pub(crate) fn is_visible_to_descendant(upstream: &Upstream) -> bool {
@@ -27,6 +27,10 @@ pub(crate) fn is_visible_to_descendant(upstream: &Upstream) -> bool {
         .rate_limit
         .as_ref()
         .is_some_and(|r| r.sharing != SharingMode::Private);
+    let breaker_shared = upstream
+        .circuit_breaker
+        .as_ref()
+        .is_some_and(|c| c.sharing != SharingMode::Private);
     let plugins_shared = upstream
         .plugins
         .as_ref()
@@ -36,11 +40,11 @@ pub(crate) fn is_visible_to_descendant(upstream: &Upstream) -> bool {
         .as_ref()
         .is_some_and(|c| c.sharing != SharingMode::Private);
 
-    auth_shared || rate_shared || plugins_shared || cors_shared
+    auth_shared || rate_shared || breaker_shared || plugins_shared || cors_shared
 }
 
 /// What a descendant tenant sees of an ancestor's `upstream`: the `private`
-/// auth, rate limit, plugins and CORS stay with their owner
+/// auth, rate limit, circuit breaker, plugins and CORS stay with their owner
 /// (`inst-merge-1`). Headers have no sharing mode and are kept.
 pub(super) fn shared_upstream_view(mut upstream: Upstream) -> Upstream {
     use crate::domain::model::SharingMode::Private;
@@ -54,6 +58,13 @@ pub(super) fn shared_upstream_view(mut upstream: Upstream) -> Upstream {
         .is_some_and(|r| r.sharing == Private)
     {
         upstream.rate_limit = None;
+    }
+    if upstream
+        .circuit_breaker
+        .as_ref()
+        .is_some_and(|c| c.sharing == Private)
+    {
+        upstream.circuit_breaker = None;
     }
     if upstream
         .plugins
@@ -95,6 +106,7 @@ pub(super) fn shared_route_view(mut route: Route) -> Route {
 /// Per `cpt-cf-oagw-algo-tenant-config-merge`:
 /// - Auth:       `private` → local-only (blocked by ancestor `enforce`); `inherit` → override; `enforce` → sticky
 /// - Rate limit: `private` → local-only (constrained by ancestor `enforce` via `min()`); else `min(ancestor, descendant)`
+/// - Circuit breaker: as auth; `enforce` is sticky, otherwise the closest level's config wins
 /// - Plugins:    `private` → local-only (ancestor `enforce` items preserved); else concatenate `ancestor + descendant`
 /// - Tags:       union (add-only)
 ///
@@ -165,6 +177,9 @@ pub(crate) fn compute_effective_config_owned(
     if let Some(rl) = &mut effective.rate_limit {
         rl.limit_owner_id = Some(effective.id);
     }
+    if let Some(cb) = &mut effective.circuit_breaker {
+        cb.owner_id = Some(effective.id);
+    }
     // Per `inst-merge-3a0`: the upstreams whose auth and headers are in
     // effect. They go only to endpoints their owner configured.
     let mut auth_owner = &ancestor_chain[0];
@@ -230,6 +245,8 @@ pub(crate) fn compute_effective_config_owned(
 
         // Rate limit merge
         merge_rate_limit(&mut effective, layer);
+
+        merge_circuit_breaker(&mut effective, layer);
 
         // Plugins merge
         if let Some(plugins) = &layer.plugins {
@@ -444,6 +461,32 @@ fn merge_auth(effective: &mut Upstream, layer: &Upstream) {
         Some(descendant_auth) => {
             // Private → local-only replace; Inherit → override; Enforce → becomes sticky.
             effective.auth = Some(descendant_auth.clone());
+        }
+    }
+}
+
+/// Merge circuit breaker config: the closest level's replaces the ancestor's
+/// unless an ancestor enforces its own, which then stays for every level
+/// below (as [`merge_auth`]). `owner_id` names the level whose config is in
+/// effect.
+///
+/// No `min()` as for rate limits: thresholds and the timeout pull in
+/// different directions, so there is no one stricter config.
+fn merge_circuit_breaker(effective: &mut Upstream, layer: &Upstream) {
+    use crate::domain::model::{CircuitBreakerConfig, SharingMode};
+
+    let effective_is_enforced = effective
+        .circuit_breaker
+        .as_ref()
+        .is_some_and(|c| c.sharing == SharingMode::Enforce);
+    match &layer.circuit_breaker {
+        None => {}
+        Some(_) if effective_is_enforced => {}
+        Some(cb) => {
+            effective.circuit_breaker = Some(CircuitBreakerConfig {
+                owner_id: Some(layer.id),
+                ..cb.clone()
+            });
         }
     }
 }

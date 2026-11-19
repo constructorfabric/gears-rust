@@ -217,6 +217,10 @@ fn sdk_create_upstream_to_domain(
         headers: req.headers().cloned().map(headers_config_to_domain),
         plugins: req.plugins().cloned().map(plugins_config_to_domain),
         rate_limit: req.rate_limit().cloned().map(rate_limit_config_to_domain),
+        circuit_breaker: req
+            .circuit_breaker()
+            .cloned()
+            .map(circuit_breaker_config_to_domain),
         cors: req.cors().cloned().map(cors_config_to_domain),
         tags: req.tags().to_vec(),
         enabled: req.enabled(),
@@ -234,6 +238,10 @@ fn sdk_update_upstream_to_domain(
         headers: req.headers().cloned().map(headers_config_to_domain),
         plugins: req.plugins().cloned().map(plugins_config_to_domain),
         rate_limit: req.rate_limit().cloned().map(rate_limit_config_to_domain),
+        circuit_breaker: req
+            .circuit_breaker()
+            .cloned()
+            .map(circuit_breaker_config_to_domain),
         cors: req.cors().cloned().map(cors_config_to_domain),
         tags: req.tags().to_vec(),
         enabled: req.enabled(),
@@ -349,6 +357,19 @@ fn window_to_domain(v: oagw_sdk::Window) -> model::Window {
         oagw_sdk::Window::Minute => model::Window::Minute,
         oagw_sdk::Window::Hour => model::Window::Hour,
         oagw_sdk::Window::Day => model::Window::Day,
+    }
+}
+
+fn circuit_breaker_config_to_domain(
+    v: oagw_sdk::CircuitBreakerConfig,
+) -> model::CircuitBreakerConfig {
+    model::CircuitBreakerConfig {
+        sharing: sharing_mode_to_domain(v.sharing),
+        enabled: v.enabled,
+        failure_threshold: v.failure_threshold,
+        timeout_seconds: v.timeout_seconds,
+        success_threshold: v.success_threshold,
+        owner_id: None,
     }
 }
 
@@ -547,6 +568,7 @@ fn upstream_to_sdk(u: model::Upstream) -> oagw_sdk::Upstream {
                 .collect(),
         }),
         rate_limit: u.rate_limit.map(rate_limit_config_to_sdk),
+        circuit_breaker: u.circuit_breaker.map(circuit_breaker_config_to_sdk),
         cors: u.cors.map(cors_config_to_sdk),
         tags: u.tags,
     }
@@ -625,6 +647,16 @@ fn cors_config_to_sdk(v: model::CorsConfig) -> oagw_sdk::CorsConfig {
             .collect(),
         expose_headers: v.expose_headers,
         allow_credentials: v.allow_credentials,
+    }
+}
+
+fn circuit_breaker_config_to_sdk(v: model::CircuitBreakerConfig) -> oagw_sdk::CircuitBreakerConfig {
+    oagw_sdk::CircuitBreakerConfig {
+        sharing: sharing_mode_to_sdk(v.sharing),
+        enabled: v.enabled,
+        failure_threshold: v.failure_threshold,
+        timeout_seconds: v.timeout_seconds,
+        success_threshold: v.success_threshold,
     }
 }
 
@@ -734,6 +766,7 @@ mod tests {
             headers: None,
             plugins: None,
             rate_limit: None,
+            circuit_breaker: None,
             cors: None,
             tags: vec![],
             managed_by: model::ManagedBy::Api,

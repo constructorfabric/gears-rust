@@ -1,3 +1,5 @@
+/// Upstream circuit breakers, one registry per replica.
+pub(crate) mod circuit_breaker;
 pub(crate) mod cors;
 /// Domain error types returned by services and mapped to API errors.
 pub(crate) mod error;

@@ -86,6 +86,8 @@ fn upstream_row(id: Uuid, tenant_id: Uuid, alias: &str) -> upstream::ActiveModel
         cors_sharing: Set("private".to_owned()),
         rate_limit: Set(None),
         rate_limit_sharing: Set("private".to_owned()),
+        circuit_breaker: Set(None),
+        circuit_breaker_sharing: Set("private".to_owned()),
         plugins_sharing: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
@@ -779,6 +781,43 @@ mod sqlite {
     #[tokio::test]
     async fn migrating_twice_is_a_no_op() {
         case_migrating_twice_is_a_no_op(&sqlite().await).await;
+    }
+
+    /// An upstream stored before the circuit-breaker columns reads back
+    /// without a breaker, as the mapper writes an absent one.
+    #[tokio::test]
+    async fn upstreams_stored_before_the_circuit_breaker_have_none() {
+        use sea_orm::ConnectionTrait;
+
+        let file = crate::infra::storage::testing::SqliteFile::new();
+        let mut older = Migrator::migrations();
+        older.retain(|m| m.name() != "m20261119_000001_add_upstream_circuit_breaker");
+        assert_eq!(older.len() + 1, Migrator::migrations().len());
+        drop(file.open_with(older).await);
+
+        let (tenant, id) = (Uuid::new_v4(), Uuid::new_v4());
+        let raw = sea_orm::Database::connect(file.dsn())
+            .await
+            .expect("raw connection");
+        raw.execute_unprepared(&format!(
+            "INSERT INTO oagw_upstream (id, tenant_id, alias, protocol, enabled, managed_by, \
+             schema_version, server, auth_sharing, cors_sharing, rate_limit_sharing, \
+             created_at, updated_at) VALUES (X'{}', X'{}', 'old', 'http', 1, 'api', 1, \
+             '{{\"endpoints\":[]}}', 'private', 'private', 'private', \
+             '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            // `SQLite` stores UUIDs as 16-byte blobs.
+            id.simple(),
+            tenant.simple(),
+        ))
+        .await
+        .expect("insert a row of the older schema");
+        drop(raw);
+
+        let db = file.open().await;
+        let stored = rows::<upstream::Entity>(&db, tenant).await;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].circuit_breaker, None);
+        assert_eq!(stored[0].circuit_breaker_sharing, "private");
     }
 }
 

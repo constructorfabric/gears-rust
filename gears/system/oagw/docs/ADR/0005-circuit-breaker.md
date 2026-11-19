@@ -6,6 +6,8 @@ decision-makers: Constructor Fabric Steering Committee
 
 # Circuit Breaker — Core Gateway Functionality with Redis-Based Distributed State
 
+> **Implementation status:** the circuit breaker is implemented as core functionality, without Redis: each replica keeps its breakers in memory (`toolkit-resilience`), one per upstream (and config owner) shared by every tenant, and opens on the failures it sees. The upstream field has `sharing`, `enabled`, `failure_threshold` (1–1000), `timeout_seconds` (1–86400) and `success_threshold` (1–100, which also bounds the concurrent half-open probes); failures are fixed and limited to those the upstream caused (see [Breaker Scope and Failure Classification](#breaker-scope-and-failure-classification), which amends the per-tenant state keys below). `half_open_max_requests`, `failure_conditions`, `scope: per_endpoint`, fallback strategies, the `X-Circuit-State` header and the `oagw_circuit_breaker_*` metrics below are not implemented; the metrics are the toolkit's `resilience.circuit_breaker.*`. See F0006 `cpt-cf-oagw-algo-circuit-breaker-evaluation` and DESIGN *Circuit Breaker*.
+
 
 <!-- toc -->
 
@@ -14,6 +16,7 @@ decision-makers: Constructor Fabric Steering Committee
 - [Considered Options](#considered-options)
 - [Decision Outcome](#decision-outcome)
   - [State Machine](#state-machine)
+  - [Breaker Scope and Failure Classification](#breaker-scope-and-failure-classification)
   - [Configuration](#configuration)
   - [Distributed State (Redis)](#distributed-state-redis)
   - [Fallback Strategies](#fallback-strategies)
@@ -78,6 +81,55 @@ Chosen option: "Circuit breaker as core gateway functionality with Redis-based d
 - **OPEN**: All requests rejected immediately with `503 CircuitBreakerOpen`
 - **HALF-OPEN**: Limited probe requests test recovery; success → CLOSED, failure → OPEN
 
+### Breaker Scope and Failure Classification
+
+*Amended 2026-11-20 with the implementation (#4974). It replaces the per-tenant state keys of [Distributed State (Redis)](#distributed-state-redis).*
+
+#### One breaker per upstream, shared by every tenant
+
+A breaker belongs to an upstream (and to the upstream whose level set the effective config, so a tenant that resolves a different `private` or inherited config on the same upstream gets its own). The requesting tenant is not part of the key: every tenant that resolves to the upstream shares its breaker on a replica.
+
+- The breaker answers one question, whether the upstream can serve now, and the answer is the same for every caller. Per-tenant breakers would make each tenant find an outage on its own, `failure_threshold` failed requests each, and keep sending traffic to an upstream that is down.
+- Established proxies key the same way. [Envoy outlier detection](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/outlier) tracks the upstream host, shared by all downstream callers; `consecutive_gateway_failure` counts `502`/`503`/`504`; with `split_external_local_origin_errors` the locally originated errors (connect failure, timeout, reset) are tracked apart so the detector can ignore them; `max_ejection_percent` limits the impact. [Istio `DestinationRule` `outlierDetection`](https://istio.io/latest/docs/reference/config/networking/destination-rule/#OutlierDetection) is per host: `consecutiveGatewayErrors` counts `502`/`503`/`504` only, `consecutive5xxErrors` every `5xx`, and `4xx` never counts. [resilience4j](https://resilience4j.readme.io/docs/circuitbreaker), [Hystrix](https://github.com/Netflix/Hystrix/wiki/How-it-Works) and [Polly](https://www.pollydocs.org/strategies/circuit-breaker.html) keep one breaker per downstream dependency (a named instance), and the application decides which outcomes count (`recordExceptions` / `ignoreExceptions`).
+- Per-caller breakers fit only when each caller has a dependency of its own. On a shared dependency, keeping one tenant from crowding out the others is the job of rate limits and bulkheads; OAGW has per-tenant rate limits ([ADR-0004](./0004-rate-limiting.md)).
+
+#### Only failures the upstream caused count
+
+A shared breaker must not open because of what one caller did. So, like Envoy with `split_external_local_origin_errors`, OAGW tells what the upstream did apart from what happened on the gateway's side, and counts only the former:
+
+| Outcome | Breaker |
+|---|---|
+| Upstream `502`, `503`, `504` | failure |
+| Any other upstream status (`500`, `4xx`, `101` included) | success |
+| DNS failure or no address, connection refused, no route, connect error or timeout, TLS handshake or certificate error, peer closed, invalid response, HTTP/2 or stream error before the response head, the engine's own read or write timeout | failure |
+| Request deadline hit during target resolution or the exchange, which started with at least 90 % of the request timeout left | failure |
+| The same, when the gateway's own steps before them used more than 10 % of it | not counted |
+| A timeout or a broken exchange while the client is still sending a streamed request body (a failure to connect still counts) | not counted |
+| Any outcome of a request pinned with `X-OAGW-Target-Host` to one endpoint of an upstream with several | not counted |
+| The SSRF policy refuses every resolved address | not counted |
+| Gateway policy, validation, CORS, auth plugin, guard, rate-limit, CredStore, body-limit or internal errors | not counted |
+| The client cancels before the response head | not counted |
+| Anything after the response head (SSE or long body, WebSocket tunnel) | not counted |
+
+*Full budget.* The gateway's request timeout (`proxy_timeout_secs`) covers the `request_ref` CredStore read ([ADR-0022](./0022-request-secret-refs.md)), endpoint selection, target resolution and the exchange together. The permit that counts the outcome is taken just before target resolution and notes how much of the timeout is left. A deadline hit counts only when the gateway's steps before it used at most a tenth: a slow CredStore read must not open the breakers of healthy upstreams. A separate deadline for the exchange was rejected because ADR-0022 bounds a `request_ref` request by one timeout.
+
+*Client uploads.* Until the client has sent its whole streamed body, the exchange runs at the client's pace: a client that trickles its upload hits the gateway's deadline or the engine's read timeout, or makes the upstream give up on it. Counted, that would let any caller open the circuit for every tenant with a few slow uploads. While the body is still coming, only a failure to connect (refused, no route, connect or TLS timeout, TLS or certificate error) counts; nothing of the request was sent then, so the client's pace played no part.
+
+*Pinned endpoints.* `X-OAGW-Target-Host` lets the caller pick one endpoint of several, and the breaker covers the whole upstream. A caller pinning a dead endpoint would open the circuit for every tenant while the other endpoints serve, so a pinned request on a multi-endpoint upstream counts as nothing; it is still rejected while the circuit is open. On a single-endpoint upstream the header picks the only endpoint and changes nothing. Per-endpoint breakers (below) would count these requests against their endpoint.
+
+*What a caller can still do.* The table keeps a caller's own errors out, not the upstream's answers to what the caller asks for. A path that answers `503`, or a request the upstream takes longer than the timeout to answer (a large non-streaming LLM completion), counts against the upstream, so a tenant with access to a shared upstream can open its breaker with `failure_threshold` such requests in a row. Envoy, Istio and resilience4j behave the same; they assume callers that do not attack each other. Mitigations: keep `failure_threshold` above what one caller sends in a burst, keep the rate limit per tenant, and use the failure rate over a window with a minimum number of calls (future work below), which one tenant's burst moves less while others succeed.
+
+*Client cancellation.* A request the client abandons before the response head records nothing and frees its half-open slot, also when the upstream was slow: when to give up is the caller's choice. A client that cancels before the gateway's timeout therefore never adds a timeout failure; the gateway's own timeout does.
+
+*Admission.* A check before the auth plugin, the rate limits and the CredStore read fails fast while the circuit is open, so an open circuit costs no credential or token; it keeps no probe slot. The permit, which holds a half-open probe slot, is taken just before target resolution, so the gateway's own steps never hold one. The cost is at the open → half-open edge: requests that pass the check before the first probe takes its slot do the gateway's steps and get `503` when they ask for the permit. This lasts at most the time between the check and the permit of the first request after `timeout_seconds`, once per open period; once a probe holds the slot, the check rejects.
+
+*Resets.* Each replica rebuilds a breaker closed on the next request when the effective config, the alias or the endpoints differ from those it was built for. A request that resolves no config leaves the breaker alone: under a `private` config the owner and a descendant resolving to the same upstream see different configs, and a descendant's request must not drop the owner's breaker. So the write path drops the upstream's breakers when the stored `circuit_breaker` changes, removal included, and on a delete, on the replica that takes the write; an idle sweep removes breakers no request uses. Another replica does not see a removal: an identical config re-added there before the sweep continues the old state, which is open for at most `timeout_seconds`. While two snapshots of one upstream are both in use (proxy config cache lag, a write in progress), each switch between them rebuilds the breaker closed, so it may not open until the snapshots converge; this is transient.
+
+#### Future work
+
+- **Per-endpoint scope** (`scope: per_endpoint` in the schema below): one breaker per endpoint of a pool, like Envoy's host ejection, so a failing endpoint is taken out while the others serve, with a cap like `max_ejection_percent`.
+- **Failure rate over a sliding window with a minimum number of calls** (resilience4j `failureRateThreshold`, `slidingWindowSize`, `minimumNumberOfCalls`) instead of consecutive failures, which a busy upstream with occasional errors trips less readily, and which one tenant's burst of failing requests moves less while the others succeed. `toolkit-resilience` already supports it (`failure_ratio`, `minimum_calls`, `window`).
+
 ### Configuration
 
 Circuit breaker is a first-class field in upstream definitions (not a plugin).
@@ -97,18 +149,21 @@ Circuit breaker is a first-class field in upstream definitions (not a plugin).
       "failure_threshold": {
         "type": "integer",
         "minimum": 1,
+        "maximum": 1000,
         "default": 5,
         "description": "Consecutive failures before opening circuit"
       },
       "success_threshold": {
         "type": "integer",
         "minimum": 1,
+        "maximum": 100,
         "default": 3,
         "description": "Consecutive successes in half-open before closing circuit"
       },
       "timeout_seconds": {
         "type": "integer",
         "minimum": 1,
+        "maximum": 86400,
         "default": 30,
         "description": "Seconds circuit stays open before entering half-open"
       },
@@ -124,7 +179,7 @@ Circuit breaker is a first-class field in upstream definitions (not a plugin).
           "status_codes": {
             "type": "array",
             "items": { "type": "integer" },
-            "default": [ 500, 502, 503, 504 ],
+            "default": [ 502, 503, 504 ],
             "description": "HTTP status codes counted as failures"
           },
           "timeout": {
@@ -178,7 +233,7 @@ Circuit breaker is a first-class field in upstream definitions (not a plugin).
     "timeout_seconds": 30,
     "half_open_max_requests": 3,
     "failure_conditions": {
-      "status_codes": [500, 502, 503, 504],
+      "status_codes": [502, 503, 504],
       "timeout": true,
       "connection_error": true
     },
@@ -190,13 +245,13 @@ Circuit breaker is a first-class field in upstream definitions (not a plugin).
 
 ### Distributed State (Redis)
 
-State keys:
+State keys (per upstream and config owner, shared by every tenant; see [Breaker Scope and Failure Classification](#breaker-scope-and-failure-classification)):
 
 ```text
-oagw:cb:{tenant_id}:{upstream_id}:state        → "CLOSED" | "OPEN" | "HALF_OPEN"
-oagw:cb:{tenant_id}:{upstream_id}:failures     → counter (TTL: rolling window)
-oagw:cb:{tenant_id}:{upstream_id}:opened_at    → timestamp
-oagw:cb:{tenant_id}:{upstream_id}:half_open_count → counter for concurrent half-open requests
+oagw:cb:{upstream_id}:{owner_id}:state        → "CLOSED" | "OPEN" | "HALF_OPEN"
+oagw:cb:{upstream_id}:{owner_id}:failures     → counter (TTL: rolling window)
+oagw:cb:{upstream_id}:{owner_id}:opened_at    → timestamp
+oagw:cb:{upstream_id}:{owner_id}:half_open_count → counter for concurrent half-open requests
 ```
 
 Atomic state checking via Lua script:
@@ -263,7 +318,7 @@ When circuit is **OPEN**, OAGW can respond in different ways:
 
 ### Integration with Error Handling
 
-Circuit breaker evaluates responses and updates state:
+Circuit breaker evaluates responses and updates state (the original sketch; the implemented classification, which counts only failures the upstream caused, is in [Breaker Scope and Failure Classification](#breaker-scope-and-failure-classification)):
 
 ```rust
 async fn handle_upstream_response(
@@ -326,7 +381,7 @@ X-Circuit-State: OPEN
 * Bad, because dependency on Redis for distributed state
 * Bad, because false positives possible during upstream maintenance
 * Bad, because additional monitoring/alerting needed
-* Neutral, circuit breaker state is shared globally per upstream (not per-route)
+* Neutral, circuit breaker state is shared per upstream by every tenant and route; tenant isolation comes from rate limits
 * Neutral, manual intervention needed to override automatic behavior
 * Neutral, requires careful tuning of thresholds per upstream
 
@@ -385,13 +440,15 @@ Circuit breaker configuration follows same inheritance rules as rate limits:
 ### Observability and Metrics
 
 ```promql
-oagw_circuit_breaker_state{upstream_id, tenant_id} → 0=CLOSED, 1=HALF_OPEN, 2=OPEN
-oagw_circuit_breaker_failures_total{upstream_id, tenant_id}
-oagw_circuit_breaker_state_changes_total{upstream_id, tenant_id, from_state, to_state}
-oagw_circuit_breaker_rejected_requests_total{upstream_id, tenant_id}
-oagw_circuit_breaker_half_open_successes_total{upstream_id, tenant_id}
-oagw_circuit_breaker_half_open_failures_total{upstream_id, tenant_id}
+oagw_circuit_breaker_state{upstream_id} → 0=CLOSED, 1=HALF_OPEN, 2=OPEN
+oagw_circuit_breaker_failures_total{upstream_id}
+oagw_circuit_breaker_state_changes_total{upstream_id, from_state, to_state}
+oagw_circuit_breaker_rejected_requests_total{upstream_id}
+oagw_circuit_breaker_half_open_successes_total{upstream_id}
+oagw_circuit_breaker_half_open_failures_total{upstream_id}
 ```
+
+Implemented instead: `resilience.circuit_breaker.{calls,state,transitions}` with `resilience.name` = `{alias}/{upstream_id}` (and `/{owner_id}` when the config is another upstream's).
 
 ### Implementation Notes
 
@@ -410,6 +467,10 @@ oagw_circuit_breaker_half_open_failures_total{upstream_id, tenant_id}
 - [Martin Fowler: Circuit Breaker](https://martinfowler.com/bliki/CircuitBreaker.html)
 - [AWS: Circuit Breaker Pattern](https://aws.amazon.com/builders-library/using-circuit-breakers-to-protect-services/)
 - [Envoy Circuit Breaking](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/circuit_breaking)
+- [Envoy Outlier Detection](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/outlier)
+- [Istio DestinationRule: OutlierDetection](https://istio.io/latest/docs/reference/config/networking/destination-rule/#OutlierDetection)
+- [resilience4j CircuitBreaker](https://resilience4j.readme.io/docs/circuitbreaker)
+- [Polly circuit breaker](https://www.pollydocs.org/strategies/circuit-breaker.html)
 
 ## Traceability
 

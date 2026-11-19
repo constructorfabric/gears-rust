@@ -50,6 +50,7 @@ pub(crate) fn upstream_drift(
         headers,
         plugins,
         rate_limit,
+        circuit_breaker,
         cors,
         tags,
     } = stored;
@@ -62,6 +63,7 @@ pub(crate) fn upstream_drift(
         ("headers", *headers == req.headers),
         ("plugins", *plugins == req.plugins),
         ("rate_limit", *rate_limit == req.rate_limit),
+        ("circuit_breaker", *circuit_breaker == req.circuit_breaker),
         ("cors", *cors == req.cors),
         ("tags", *tags == canonical_tags(req.tags.clone())),
     ]
@@ -160,6 +162,7 @@ mod tests {
             headers: None,
             plugins: None,
             rate_limit: None,
+            circuit_breaker: None,
             cors: None,
             tags: vec!["b".into(), "a".into(), "b".into()],
             enabled: true,
@@ -175,6 +178,7 @@ mod tests {
             headers: None,
             plugins: None,
             rate_limit: None,
+            circuit_breaker: None,
             cors: None,
             tags: vec!["a".into(), "b".into()],
             managed_by: ManagedBy::Api,

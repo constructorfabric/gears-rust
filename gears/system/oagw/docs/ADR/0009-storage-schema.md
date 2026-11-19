@@ -225,6 +225,8 @@ Notes:
 | `cors_sharing` | VARCHAR(16) | No | `private\|inherit\|enforce` |
 | `rate_limit` | JSON | Yes | |
 | `rate_limit_sharing` | VARCHAR(16) | No | `private\|inherit\|enforce` |
+| `circuit_breaker` | JSON | Yes | `enabled`, `failure_threshold`, `timeout_seconds`, `success_threshold` (no `sharing`); NULL when the upstream has no circuit breaker |
+| `circuit_breaker_sharing` | VARCHAR(16) | No | `private\|inherit\|enforce`; default `private` for rows written before the column |
 | `plugins_sharing` | VARCHAR(16) | Yes | `private\|inherit\|enforce`; NULL when no plugins configuration (distinguishes absent from empty list) |
 | `created_at` | TIMESTAMP | No | |
 | `updated_at` | TIMESTAMP | No | |
@@ -587,7 +589,6 @@ INSERT INTO oagw_upstream_plugin (upstream_id, tenant_id, position, plugin_ref, 
 
 Deferred / future work:
 - Concurrency limiting / backpressure queueing: add nullable JSON config fields (upstream and/or route)
-- Circuit breaker: add nullable JSON config fields (upstream)
 - Backend-specific indexes (e.g. JSON indexes) may be added for performance, but must not change semantics
 
 - [ADR: Optional Persistence](./0018-optional-persistence.md) — opt-in persistence implementing this schema (except `oagw_plugin`)

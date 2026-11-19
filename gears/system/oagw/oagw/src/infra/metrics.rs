@@ -1,9 +1,10 @@
 //! OpenTelemetry-backed implementation of [`OagwMetricsPort`].
 //!
 //! Holds the active P0 instruments listed on the domain port. Deferred
-//! instruments from feature 0008 (circuit breaker, multi-endpoint routing,
-//! upstream availability) are NOT declared here yet — they are introduced
-//! when their owning feature lands. The proxy configuration cache's
+//! instruments from feature 0008 (multi-endpoint routing, upstream
+//! availability) are NOT declared here yet — they are introduced when their
+//! owning feature lands. Circuit breakers report through `toolkit-resilience`'s
+//! own observer (`resilience.circuit_breaker.*`, wired in `gear.rs`). The proxy configuration cache's
 //! `oagw_proxy_cache_*` instruments follow ADR-0020 (feature 0008, *Proxy
 //! Configuration Cache*).
 use opentelemetry::KeyValue;

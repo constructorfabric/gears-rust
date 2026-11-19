@@ -11,6 +11,7 @@ use sea_orm_migration::prelude::*;
 
 mod m20261005_000001_create_upstreams_and_routes;
 mod m20261012_000001_create_registry_state;
+mod m20261119_000001_add_upstream_circuit_breaker;
 
 /// The gear's migrations, oldest first.
 pub(crate) struct Migrator;
@@ -21,6 +22,7 @@ impl MigratorTrait for Migrator {
         vec![
             Box::new(m20261005_000001_create_upstreams_and_routes::Migration),
             Box::new(m20261012_000001_create_registry_state::Migration),
+            Box::new(m20261119_000001_add_upstream_circuit_breaker::Migration),
         ]
     }
 }

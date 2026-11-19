@@ -73,6 +73,7 @@ pub(crate) fn upstream_at(tenant_id: Uuid, host: &str) -> ProvisionedUpstream {
             headers: None,
             plugins: None,
             rate_limit: None,
+            circuit_breaker: None,
             cors: None,
             tags: vec![],
             enabled: true,
@@ -2016,6 +2017,7 @@ fn every_domain_error_is_fatal_or_has_a_reason() {
             DomainError::CircuitBreakerOpen {
                 detail: d(),
                 instance: i(),
+                retry_after: std::time::Duration::from_secs(1),
             },
             None,
         ),

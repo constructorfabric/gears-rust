@@ -194,13 +194,30 @@ async fn resolve_fallback_applies_ssrf_policy() {
     };
     let err = guarded.target(&selected, "/i").await.unwrap_err();
     assert!(
-        matches!(err, DomainError::LinkUnavailable { .. }),
+        matches!(
+            err,
+            TargetError::Refused(DomainError::LinkUnavailable { .. })
+        ),
         "{err:?}"
     );
 
     let open = ProxyEngine::new(&settings, Arc::new(SsrfGuard::disabled())).unwrap();
     let t = open.target(&selected, "/i").await.unwrap();
     assert!(t.addr().ip().is_loopback());
+
+    // A name that does not resolve is the upstream's problem, not the policy's.
+    let unresolvable = SelectedEndpoint {
+        endpoint: ep("oagw-test.invalid", 443, Scheme::Https),
+        resolved_addr: None,
+    };
+    let err = guarded.target(&unresolvable, "/i").await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            TargetError::Unreachable(DomainError::LinkUnavailable { .. })
+        ),
+        "{err:?}"
+    );
 }
 
 type Check = fn(&DomainError) -> bool;
@@ -241,4 +258,33 @@ fn error_mapping_matches_the_previous_engine() {
 
 fn test_error(kind: toolkit_http_proxy::ErrorKind) -> ProxyError {
     toolkit_http_proxy::ProxyError::new(kind, "test")
+}
+
+/// Connect and TLS failures happen before any of the request is sent; the
+/// rest can follow a client's slow upload.
+#[test]
+fn connect_failures_are_told_from_exchange_failures() {
+    use toolkit_http_proxy::ErrorKind as K;
+    for kind in [
+        K::ConnectTimeout,
+        K::ConnectRefused,
+        K::ConnectNoRoute,
+        K::Connect,
+        K::TlsHandshakeTimeout,
+        K::TlsHandshake,
+        K::InvalidCertificate,
+    ] {
+        assert!(is_connect_failure(&test_error(kind)), "{kind:?}");
+    }
+    for kind in [
+        K::ReadTimeout,
+        K::WriteTimeout,
+        K::ConnectionClosed,
+        K::Read,
+        K::Write,
+        K::Http2,
+        K::Protocol,
+    ] {
+        assert!(!is_connect_failure(&test_error(kind)), "{kind:?}");
+    }
 }

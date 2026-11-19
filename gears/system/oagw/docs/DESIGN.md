@@ -66,7 +66,7 @@ This design satisfies the requirements for centralized outbound traffic manageme
 - `cpt-cf-oagw-adr-request-routing` — Path-based routing with alias resolution
 - `cpt-cf-oagw-adr-plugin-system` — Three plugin types with deterministic execution order
 - `cpt-cf-oagw-adr-rate-limiting` — Token bucket algorithm with hierarchical merge
-- `cpt-cf-oagw-adr-circuit-breaker` — State machine with configurable thresholds and fallback
+- `cpt-cf-oagw-adr-circuit-breaker` — Per-upstream state machine with configurable thresholds, kept in memory on each replica (fallback strategies planned)
 - `cpt-cf-oagw-adr-cors` — Built-in CORS handler with per-upstream/route config
 - `cpt-cf-oagw-adr-data-plane-caching` — Control plane caching strategies (superseded by `cpt-cf-oagw-adr-proxy-config-cache`)
 - `cpt-cf-oagw-adr-state-management` — CP/DP state structures; its Data Plane L1 cache is replaced by `cpt-cf-oagw-adr-proxy-config-cache`, its rate-limiter ownership stays
@@ -202,6 +202,7 @@ classDiagram
         +AuthConfig auth
         +HeadersConfig headers
         +RateLimitConfig rate_limit
+        +CircuitBreakerConfig circuit_breaker
         +CorsConfig cors
         +PluginsConfig plugins
         +List~String~ tags
@@ -248,7 +249,7 @@ classDiagram
 
 **Key Domain Entities**:
 
-- **Upstream** (`gts.cf.core.oagw.upstream.v1~`): Tenant-scoped root configuration object representing an external service. Unique per `(tenant_id, alias)`. Contains server endpoints, auth config, rate limits, CORS, headers, and plugin bindings.
+- **Upstream** (`gts.cf.core.oagw.upstream.v1~`): Tenant-scoped root configuration object representing an external service. Unique per `(tenant_id, alias)`. Contains server endpoints, auth config, rate limits, circuit breaker, CORS, headers, and plugin bindings.
 - **Route** (`gts.cf.core.oagw.route.v1~`): Belongs to an upstream. Defines match rules (HTTP path/method; gRPC service/method matching is planned for Phase 3 — no gRPC proxy code path is currently implemented or reachable), priority, and route-level overrides for rate limits, CORS, and plugins.
 - **Upstream credential** (proposed, `gts.cf.core.oagw.credential.v1~`): A tenant-owned child of one local upstream. Its UUID identifies a named API-key reference and its optional per-replica request limit. The upstream supplies the auth plugin and injection policy. See [ADR-0021](ADR/0021-upstream-credentials.md) and the [schema](schemas/credential.v1.schema.json).
 - **Plugin** (`gts.cf.core.oagw.{type}_plugin.v1~`): Custom tenant-defined Starlark plugins stored in `oagw_plugin`. Named (built-in) plugins are resolved via in-process registry and not persisted.
@@ -414,6 +415,40 @@ Plugin chain composition: upstream plugins execute before route plugins (`[U1, U
 
 **Write-time check**: on create and update (Management API, SDK and types-registry provisioning), `auth.type` must be an implemented auth plugin and every `plugins.items[].plugin_ref` an implemented guard or transform plugin. Catalog-only ids, custom (UUID) ids, which are not implemented yet, and unknown ids are rejected with 400 `invalid_argument`, field violation reason `NOT_IMPLEMENTED`. A plugin of the wrong kind (an auth plugin in `plugins.items`, a guard or transform plugin in `auth.type`) is rejected with reason `VALIDATION`. Bindings stored before this check are not rewritten; the proxy still has to handle an unresolvable one.
 
+#### Circuit Breaker
+
+`circuit_breaker` on an upstream (optional; absent = no breaker) per [ADR: Circuit Breaker](./ADR/0005-circuit-breaker.md):
+
+| Field | Default | Meaning |
+|---|---|---|
+| `sharing` | `private` | Sharing mode, as for the other upstream fields |
+| `enabled` | `true` | `false` keeps the config and sends every request through |
+| `failure_threshold` | `5` | Failures in a row that open the circuit; 1 to 1000 |
+| `timeout_seconds` | `30` | Seconds the circuit stays open before probes go through; 1 to 86400 (a day, as `proxy_timeout_secs`) |
+| `success_threshold` | `3` | Probes let through at once after the timeout; all must succeed to close the circuit, one failure opens it again; 1 to 100 |
+
+Each value is checked whether or not `enabled`: below 1 is a 400 `invalid_argument` `circuit_breaker.<field> must be at least 1`, above the maximum `circuit_breaker.<field> must be at most N`. An unknown field is refused like any body that does not deserialize (422); the REST API and types-registry provisioning apply the defaults above to omitted fields (`oagw_sdk::CircuitBreakerConfig::default()`). Routes have no circuit breaker.
+
+The breaker is shared by every tenant that resolves to the upstream: it describes the upstream's health, as Envoy's outlier detection and resilience4j's per-dependency breakers do (ADR-0005, *Breaker Scope and Failure Classification*). Isolation between tenants is the rate limits' job. So that no caller can open it with its own errors, only failures the upstream caused count. A caller can still make the upstream fail with what it asks for (a path that answers `503`, a request slower than the timeout); ADR-0005 lists the mitigations.
+
+| Outcome | Breaker |
+|---|---|
+| Upstream `502`, `503`, `504` | failure |
+| Any other upstream status (`500`, `4xx`, `101` included) | success |
+| DNS failure or no address where the engine resolves the host (a single-endpoint upstream; a multi-endpoint upstream resolves in endpoint selection, whose errors are not counted), connection refused, no route, connect error or timeout, TLS handshake or certificate error, peer closed, invalid response, HTTP/2 or stream error before the response head, the engine's read or write timeout | failure |
+| Request deadline hit during target resolution or the exchange, which started with at least 90 % of the request timeout left | failure |
+| The same, when the gateway's own steps before them (the `request_ref` CredStore read, endpoint selection) used more than 10 % | not counted |
+| A timeout or a broken exchange while the client is still sending a streamed request body (a failure to connect still counts) | not counted |
+| Any outcome of a request pinned with `X-OAGW-Target-Host` to one endpoint of an upstream with several (still rejected while open) | not counted |
+| The SSRF policy refuses every resolved address | not counted |
+| Any gateway error before the upstream (validation, CORS, auth plugin, guards, rate limit, CredStore, body limit, internal) | not counted |
+| The client cancels before the response head | not counted |
+| Anything after the response head (SSE or long body, WebSocket tunnel) | not counted |
+
+While the circuit is open, a check before the auth plugin, the rate limits and the CredStore read answers `503` (`service_unavailable`, `X-OAGW-Error-Source: gateway`) with `Retry-After` = the time left until a probe, without calling the upstream; that check keeps no half-open probe slot. The permit that counts the outcome (and holds a probe slot) is taken just before target resolution, so a slow auth plugin or CredStore read does not keep a probe slot. The cost is at the open → half-open edge: requests that pass the check before the first probe takes its slot do the gateway's steps and get `503` at the permit; this lasts at most the time between the check and the permit of the first request after `timeout_seconds`, once per open period, and once a probe holds the slot the check rejects. The outcome is taken at the response head (for a WebSocket upgrade, at the handshake).
+
+State is kept in memory on each replica (`toolkit-resilience`), one breaker per resolved upstream and the upstream whose config is in effect; nothing is shared between replicas. A breaker is rebuilt closed on the next request, on every replica, when the effective config, the alias or the endpoints differ from those it was built for; disabling it removes it. A request that resolves no config leaves the breaker alone (under a `private` config a descendant sees none while the owner sees it). A write that changes or removes the stored `circuit_breaker`, and a delete, drop the upstream's breakers on the replica that handles the write; the idle sweep that evicts rate-limit buckets (every 60 s) evicts breakers unused for 10 minutes past their `timeout_seconds`, e.g. those of upstreams another replica deleted. Another replica does not see a removal, so an identical config re-added there before the sweep continues the old state, open for at most `timeout_seconds`. While two snapshots of one upstream are both in use (proxy config cache lag), each switch rebuilds the breaker closed, so it may not open until they converge.
+
 **Custom Plugins**: Starlark scripts with sandboxed execution (no network/file I/O, timeout/memory limits enforced). Immutable after creation; GC for unlinked plugins after configurable TTL.
 
 #### Hierarchical Configuration
@@ -424,12 +459,13 @@ Multi-tenant hierarchy with sharing modes (`private`/`inherit`/`enforce`) per co
 |---|---|
 | Auth | Override if `inherit`; forced if `enforce`; never sent to endpoints its owner did not configure |
 | Rate Limits | `min(ancestor, descendant)` — stricter always wins; an enforced limit stays `enforce` down the chain, whichever level's value wins, so a `private` level below cannot replace it |
+| Circuit Breaker | Closest level's config wins (no `min()`: thresholds and timeout have no one stricter order); forced if `enforce` on any ancestor, down the chain |
 | Plugins | Concatenate: `ancestor.plugins + descendant.plugins`; a `private` level (upstream or route) keeps only the enforced items and appends its own; an enforced item is never dropped, and a level or route naming the same `plugin_ref` does not replace it |
 | CORS | Union origins if `inherit`; forced if `enforce` |
 
-`private` means the field stays with its owner: an upstream or route of another tenant takes part in a descendant's resolution only with its shared fields. Its `private` auth, rate limit, plugins and CORS are neither merged nor returned, also when the descendant has no upstream of its own and the alias resolves to the ancestor's. Headers have no sharing mode and follow the endpoint rule below.
+`private` means the field stays with its owner: an upstream or route of another tenant takes part in a descendant's resolution only with its shared fields. Any shared field makes the ancestor's upstream visible to descendants, a circuit breaker with `sharing: inherit` or `enforce` included: a descendant without an upstream of its own can then proxy through it, without the `private` fields. Its `private` auth, rate limit, circuit breaker, plugins and CORS are neither merged nor returned, also when the descendant has no upstream of its own and the alias resolves to the ancestor's. Headers have no sharing mode and follow the endpoint rule below.
 
-A descendant cannot override auth or CORS that any ancestor upstream with the alias enforces, not only the closest one (`400`). A rate limit is refused only when the closest ancestor enforces it: a farther enforcing ancestor's limit stays the floor in the merge, so the descendant's limit cannot exceed it, and a child of an `inherit` parent with an allocated budget must set a limit to allocate. The override permissions are checked on the closest ancestor.
+A descendant cannot override auth, circuit breaker or CORS that any ancestor upstream with the alias enforces, not only the closest one (`400`); a circuit breaker override needs no permission of its own. A rate limit is refused only when the closest ancestor enforces it: a farther enforcing ancestor's limit stays the floor in the merge, so the descendant's limit cannot exceed it, and a child of an `inherit` parent with an allocated budget must set a limit to allocate. The override permissions are checked on the closest ancestor.
 
 Tags do not have a sharing mode — they always use add-only union semantics: `effective_tags = union(ancestor_tags, descendant_tags)`. Descendants cannot remove inherited tags.
 
@@ -780,7 +816,7 @@ All gateway errors follow RFC 9457 Problem Details (`application/problem+json`) 
 | DownstreamError | 502 | `gts.cf.core.errors.err.v1~cf.oagw.downstream.error.v1` | Depends | Upstream service error |
 | StreamAborted | 502 | `gts.cf.core.errors.err.v1~cf.oagw.stream.aborted.v1` | No | Stream connection aborted |
 | LinkUnavailable | 503 | `gts.cf.core.errors.err.v1~cf.oagw.link.unavailable.v1` | Yes | Upstream link unavailable |
-| CircuitBreakerOpen | 503 | `gts.cf.core.errors.err.v1~cf.oagw.circuit_breaker.open.v1` | Yes | Circuit breaker open |
+| CircuitBreakerOpen | 503 | `gts.cf.core.errors.err.v1~cf.oagw.circuit_breaker.open.v1` | Yes | The upstream's circuit breaker is open (or half-open with every probe slot taken); `Retry-After` is the time left until a probe |
 | PluginNotFound | 503 | `gts.cf.core.errors.err.v1~cf.oagw.plugin.not_found.v1` | No | Plugin not found |
 | ConnectionTimeout | 504 | `gts.cf.core.errors.err.v1~cf.oagw.timeout.connection.v1` | Yes | Connection timeout |
 | RequestTimeout | 504 | `gts.cf.core.errors.err.v1~cf.oagw.timeout.request.v1` | Yes | Request timeout |
@@ -973,12 +1009,13 @@ Prometheus metrics at `/metrics` (admin-only):
 - `oagw_stream_duration_seconds{host, http.route, outcome}` — histogram, request start to the end of the response body (`outcome`: `completed` at the end of the body or once its `Content-Length` went through, `error` for an upstream failure or idle timeout, `shutdown` for a gateway stop, `cancelled` when the client went away); every upstream body, SSE or not; none for a response without a body
 - `oagw_requests_in_flight{host}` — gauge, from the start of the Data Plane pipeline until the response body ends, fails or is dropped (`host` `unknown` until the upstream is resolved)
 - `oagw_errors_total{host, http.route, error_type, credential_mode}` — counter (gateway errors, and `Cancelled`; upstream error responses are not errors here; `credential_mode` is `unknown` before the upstream resolves)
-- `oagw_circuit_breaker_state{host}` — gauge
 - `oagw_rate_limit_exceeded_total{host, http.route, bucket}` — counter (`bucket`: `route`, `shadowed_route`, `upstream`, `pool`)
 - `oagw_active_websocket_sessions{host}` — gauge; `oagw_websocket_session_duration_seconds{host, outcome}` — histogram, recorded at session teardown (`completed` when the tunnel closed, from either side; `error` on an idle timeout or an IO error; `shutdown` for a gateway stop; `cancelled` when the bridge task was dropped or panicked)
 
-**Circuit Breaker Metrics**:
-- `oagw_circuit_breaker_transitions_total{host, from_state, to_state}` — counter
+**Circuit Breaker Metrics** (the shared `toolkit-resilience` names, without `metrics.prefix`; `resilience.name` is `{alias}/{upstream_id}`, or `{alias}/{upstream_id}/{owner_id}` when the effective config is another upstream's; aliases alone repeat across tenants). Unlike `host`, this label is per upstream: one set of series for each upstream (and config owner) with an enabled breaker that served a request, which tenants create. The series of an evicted breaker stay in the exporter until restart; a deployment with many tenant upstreams should drop or aggregate `resilience.name` in the collector:
+- `resilience.circuit_breaker.calls{resilience.name, resilience.outcome}` — counter (`success`, `failure`, `ignored`, `rejected`)
+- `resilience.circuit_breaker.state{resilience.name, resilience.state}` — up-down counter, breakers in each state (`closed`, `open`, `half_open`)
+- `resilience.circuit_breaker.transitions{resilience.name, resilience.previous_state, resilience.state}` — counter
 
 **Rate Limit Metrics**:
 - `oagw_rate_limit_usage_ratio{host, http.route, bucket}` — gauge (0.0 to 1.0), one series per bucket checked (`route`, `shadowed_route`, `upstream`, `pool`); the shadowed ancestor routes of one route share the `shadowed_route` series, written once per request with the highest ratio among them
@@ -1029,7 +1066,7 @@ Structured JSON logs to stdout, ingested by centralized logging system (e.g., EL
 
 **Log Levels**:
 - `INFO`: Successful requests, normal operations
-- `WARN`: Rate limit exceeded, circuit breaker open, retry guidance emitted (`Retry-After`)
+- `WARN`: Rate limit exceeded, circuit breaker opened (once per transition; a rejected request logs at `DEBUG`), retry guidance emitted (`Retry-After`)
 - `ERROR`: Upstream failures, timeouts, auth failures
 - `DEBUG`: Detailed plugin execution (disabled in production)
 

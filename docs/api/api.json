@@ -2036,6 +2036,44 @@
         ],
         "type": "object"
       },
+      "CircuitBreakerConfig": {
+        "additionalProperties": false,
+        "description": "Upstream circuit breaker. Omitted fields take the ADR-0005 defaults;\nunknown fields are rejected.",
+        "properties": {
+          "enabled": {
+            "default": true,
+            "type": "boolean"
+          },
+          "failure_threshold": {
+            "default": 5,
+            "description": "Consecutive failures that open the circuit.",
+            "format": "int32",
+            "maximum": 1000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "sharing": {
+            "$ref": "#/components/schemas/SharingMode"
+          },
+          "success_threshold": {
+            "default": 3,
+            "description": "Probes let through at once after the timeout; all must succeed to\nclose the circuit.",
+            "format": "int32",
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "timeout_seconds": {
+            "default": 30,
+            "description": "Seconds the circuit stays open before probes go through.",
+            "format": "int32",
+            "maximum": 86400,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
       "Citation": {
         "description": "A citation extracted from provider annotations.",
         "properties": {
@@ -3376,6 +3414,16 @@
               },
               {
                 "$ref": "#/components/schemas/AuthConfig"
+              }
+            ]
+          },
+          "circuit_breaker": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CircuitBreakerConfig"
               }
             ]
           },
@@ -22310,6 +22358,16 @@
               }
             ]
           },
+          "circuit_breaker": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CircuitBreakerConfig"
+              }
+            ]
+          },
           "cors": {
             "oneOf": [
               {
@@ -22440,6 +22498,16 @@
               },
               {
                 "$ref": "#/components/schemas/AuthConfig"
+              }
+            ]
+          },
+          "circuit_breaker": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CircuitBreakerConfig"
               }
             ]
           },

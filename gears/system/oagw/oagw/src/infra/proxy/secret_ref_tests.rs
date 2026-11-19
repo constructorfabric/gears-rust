@@ -18,12 +18,13 @@ use credstore_sdk::{
 use http::{Method, StatusCode};
 use oagw_sdk::reason::permission::DenialReason;
 use oagw_sdk::{
-    AuthConfig, Body, BurstConfig, CorsConfig, CorsHttpMethod, CreateRouteRequest,
-    CreateUpstreamRequest, CreateUpstreamRequestBuilder, Endpoint, HTTP_PROTOCOL_ID, HeadersConfig,
-    HttpMatch, HttpMethod, MatchRules, PassthroughMode, PathSuffixMode, PluginBinding,
-    PluginsConfig, RateLimitAlgorithm, RateLimitConfig, RateLimitScope, RateLimitStrategy,
-    RequestHeaderRules, SECRET_REF_HEADER, Scheme, Server, ServiceGatewayError, SharingMode,
-    SustainedRate, UpdateUpstreamRequest, Window, field::SecretRefCode,
+    AuthConfig, Body, BurstConfig, CircuitBreakerConfig, CorsConfig, CorsHttpMethod,
+    CreateRouteRequest, CreateUpstreamRequest, CreateUpstreamRequestBuilder, Endpoint,
+    HTTP_PROTOCOL_ID, HeadersConfig, HttpMatch, HttpMethod, MatchRules, PassthroughMode,
+    PathSuffixMode, PluginBinding, PluginsConfig, RateLimitAlgorithm, RateLimitConfig,
+    RateLimitScope, RateLimitStrategy, RequestHeaderRules, SECRET_REF_HEADER, Scheme, Server,
+    ServiceGatewayError, SharingMode, SustainedRate, UpdateUpstreamRequest, Window,
+    field::SecretRefCode,
 };
 use serde_json::Value;
 use tenant_resolver_sdk::TenantId;
@@ -1021,6 +1022,7 @@ async fn hier_004_mode_switch_needs_override_auth() {
         headers: None,
         plugins: None,
         rate_limit: None,
+        circuit_breaker: None,
         cors: None,
         tags: vec![],
         enabled: true,
@@ -2337,6 +2339,114 @@ async fn err_004_read_shares_the_request_deadline() {
     // One TIMEOUT budget, not READ plus TIMEOUT after it.
     let bound = TIMEOUT + READ / 2;
     assert!(elapsed < bound, "{elapsed:?} >= {bound:?}");
+}
+
+/// A circuit breaker that opens on the first failure and stays open a
+/// minute.
+fn open_on_first_failure() -> CircuitBreakerConfig {
+    CircuitBreakerConfig {
+        failure_threshold: 1,
+        timeout_seconds: 60,
+        ..CircuitBreakerConfig::default()
+    }
+}
+
+/// A provider that holds its answer to `POST /v1/chat` until the sender is
+/// dropped, for the next request.
+fn hold_chat(fx: &mut Fx) -> tokio::sync::oneshot::Sender<()> {
+    fx.guard.mock_gated(
+        "POST",
+        CHAT,
+        MockResponse {
+            status: 200,
+            headers: vec![],
+            body: MockBody::Json(serde_json::json!({})),
+        },
+    )
+}
+
+/// A deadline hit after the CredStore read used up most of the shared
+/// request timeout is the read's doing, not the upstream's: the circuit
+/// stays closed.
+#[tokio::test]
+async fn circuit_breaker_ignores_a_deadline_the_credstore_read_used_up() {
+    const READ: Duration = Duration::from_millis(600);
+    const TIMEOUT: Duration = Duration::from_millis(1000);
+    let mut fx = Fx::build(CredStoreSpy::empty().answering_after(READ), |b| {
+        b.with_request_timeout(TIMEOUT)
+    })
+    .await;
+    fx.secret("k", "sk-k", fx.t.tenant, &[fx.t.tenant]);
+    fx.upstream_with(
+        fx.t.tenant,
+        fx.builder(Some(request_ref(SharingMode::Private, None, None)))
+            .circuit_breaker(open_on_first_failure()),
+    )
+    .await;
+    for i in 0..2 {
+        let _hold = hold_chat(&mut fx);
+        let err = fx.sdk(fx.t.tenant, fx.post(&["k"])).await.unwrap_err();
+        assert_eq!(err.status_code(), 504, "request {i}");
+    }
+    assert_eq!(fx.recorded().await.len(), 2, "both reached the provider");
+}
+
+/// A deadline hit with the whole request timeout left for the exchange is
+/// the upstream's: the next request fails fast.
+#[tokio::test]
+async fn circuit_breaker_counts_a_deadline_with_the_full_budget() {
+    let mut fx = Fx::build(CredStoreSpy::empty(), |b| {
+        b.with_request_timeout(Duration::from_millis(300))
+    })
+    .await;
+    fx.upstream_with(
+        fx.t.tenant,
+        fx.builder(None).circuit_breaker(open_on_first_failure()),
+    )
+    .await;
+    let _hold = hold_chat(&mut fx);
+    let err = fx.sdk(fx.t.tenant, fx.post(&[])).await.unwrap_err();
+    assert_eq!(err.status_code(), 504);
+    let o = fx.sdk_outcome(fx.t.tenant, fx.post(&[])).await;
+    assert_eq!(o.status, 503);
+    assert_eq!(fx.recorded().await.len(), 1, "the second failed fast");
+}
+
+/// An open circuit rejects a `request_ref` request before its CredStore
+/// read.
+#[tokio::test]
+async fn open_circuit_reads_no_secret() {
+    let mut fx = Fx::new().await;
+    fx.secret("k", "sk-k", fx.t.tenant, &[fx.t.tenant]);
+    fx.guard.mock(
+        "POST",
+        CHAT,
+        MockResponse {
+            status: 503,
+            headers: vec![],
+            body: MockBody::Json(serde_json::json!({})),
+        },
+    );
+    fx.upstream_with(
+        fx.t.tenant,
+        fx.builder(Some(request_ref(SharingMode::Private, None, None)))
+            .circuit_breaker(open_on_first_failure()),
+    )
+    .await;
+    assert_eq!(
+        fx.sdk_outcome(fx.t.tenant, fx.post(&["k"])).await.status,
+        503
+    );
+    assert_eq!(fx.gets(), ["k"]);
+    for _ in 0..3 {
+        let err = fx.sdk(fx.t.tenant, fx.post(&["k"])).await.unwrap_err();
+        assert!(
+            matches!(err, CanonicalError::ServiceUnavailable { ref ctx, .. }
+                if ctx.retry_after_seconds == Some(60)),
+            "{err:?}"
+        );
+    }
+    assert_eq!(fx.gets(), ["k"], "no read while open");
 }
 
 /// Failures the error table does not list keep the API-key plugin's mapping

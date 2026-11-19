@@ -132,7 +132,7 @@ impl RegistryProvisioner for RegistryProvisionerImpl {
             .await
             .map_err(DomainError::from)?;
         if outcome == DeleteOutcome::Deleted {
-            self.cp.drop_upstream_buckets(id);
+            self.cp.drop_upstream_state(id);
         }
         Ok(outcome)
     }

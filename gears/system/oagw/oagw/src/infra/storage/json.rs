@@ -7,18 +7,19 @@
 //!
 //! Sharing modes are not part of these shapes where the table has a sharing
 //! column (the column is the source of truth). Route CORS has no column, so
-//! [`StoredCors::sharing`] carries it. `RateLimitConfig::shared_pool` and
-//! `RateLimitConfig::limit_owner_id` are computed at merge time and never stored.
+//! [`StoredCors::sharing`] carries it. `RateLimitConfig::shared_pool`,
+//! `RateLimitConfig::limit_owner_id` and `CircuitBreakerConfig::owner_id` are
+//! computed at merge time and never stored.
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
 use crate::domain::model::{
-    BudgetConfig, BudgetMode, BurstConfig, CorsConfig, CorsHttpMethod, Endpoint, HeadersConfig,
-    HttpMatch, PassthroughMode, PathSuffixMode, RateLimitAlgorithm, RateLimitConfig,
-    RateLimitScope, RateLimitStrategy, RequestHeaderRules, ResponseHeaderRules, Scheme, Server,
-    SharingMode, SustainedRate, Window,
+    BudgetConfig, BudgetMode, BurstConfig, CircuitBreakerConfig, CorsConfig, CorsHttpMethod,
+    Endpoint, HeadersConfig, HttpMatch, PassthroughMode, PathSuffixMode, RateLimitAlgorithm,
+    RateLimitConfig, RateLimitScope, RateLimitStrategy, RequestHeaderRules, ResponseHeaderRules,
+    Scheme, Server, SharingMode, SustainedRate, Window,
 };
 
 /// A stored enum mirroring a domain enum variant by variant. The conversions
@@ -347,6 +348,48 @@ impl StoredRateLimit {
             response_headers: self.response_headers,
             shared_pool: None,
             limit_owner_id: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// oagw_upstream.circuit_breaker
+// ---------------------------------------------------------------------------
+
+#[allow(
+    unknown_lints,
+    de0309_must_have_domain_model,
+    reason = "storage JSON shape, not a domain entity"
+)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) struct StoredCircuitBreaker {
+    pub(super) enabled: bool,
+    pub(super) failure_threshold: u32,
+    pub(super) timeout_seconds: u32,
+    pub(super) success_threshold: u32,
+}
+
+impl From<&CircuitBreakerConfig> for StoredCircuitBreaker {
+    fn from(cb: &CircuitBreakerConfig) -> Self {
+        Self {
+            enabled: cb.enabled,
+            failure_threshold: cb.failure_threshold,
+            timeout_seconds: cb.timeout_seconds,
+            success_threshold: cb.success_threshold,
+        }
+    }
+}
+
+impl StoredCircuitBreaker {
+    pub(super) fn into_domain(self, sharing: SharingMode) -> CircuitBreakerConfig {
+        CircuitBreakerConfig {
+            sharing,
+            enabled: self.enabled,
+            failure_threshold: self.failure_threshold,
+            timeout_seconds: self.timeout_seconds,
+            success_threshold: self.success_threshold,
+            owner_id: None,
         }
     }
 }

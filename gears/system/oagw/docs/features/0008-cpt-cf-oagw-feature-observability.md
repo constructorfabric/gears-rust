@@ -175,9 +175,10 @@ Operators need full visibility into outbound API traffic patterns, errors, and p
 11. [ ] - `p2` - **IF** rate limit was evaluated - `inst-mc-9`
     1. [ ] - `p2` - Update `oagw_rate_limit_usage_ratio{host, http.route, bucket}` gauge with the token ratio (0.0–1.0) of each bucket checked (`bucket`: `route`, `shadowed_route`, `upstream`, `pool`; the shadowed ancestor routes of one route share the `shadowed_route` series, written once per request with the highest ratio among them) - `inst-mc-9a`
     2. [ ] - `p2` - **IF** rate limit exceeded, increment `oagw_rate_limit_exceeded_total{host, http.route, bucket}` counter for the rejecting bucket - `inst-mc-9b`
-12. [ ] - `p2` - **IF** circuit breaker state changed - `inst-mc-10`
-    1. [ ] - `p2` - Update `oagw_circuit_breaker_state{host}` gauge (0=CLOSED, 1=HALF_OPEN, 2=OPEN) - `inst-mc-10a`
-    2. [ ] - `p2` - Increment `oagw_circuit_breaker_transitions_total{host, from_state, to_state}` counter - `inst-mc-10b`
+12. [x] - `p2` - **IF** circuit breaker state changed - `inst-mc-10`
+    1. [x] - `p2` - Move one unit of `resilience.circuit_breaker.state{resilience.name, resilience.state}` (up-down counter, `closed` / `open` / `half_open`) from the old state to the new one; `resilience.name` is `{alias}/{upstream_id}`, with `/{owner_id}` when the effective config is another upstream's (aliases alone repeat across tenants) - `inst-mc-10a`
+    2. [x] - `p2` - Increment `resilience.circuit_breaker.transitions{resilience.name, resilience.previous_state, resilience.state}` - `inst-mc-10b`
+    3. [x] - `p2` - Every call and refusal increments `resilience.circuit_breaker.calls{resilience.name, resilience.outcome}` (`success`, `failure`, `ignored`, `rejected`) - `inst-mc-10c`
 13. [ ] - `p2` - **IF** multi-endpoint upstream - `inst-mc-11`
     1. [ ] - `p2` - Increment `oagw_routing_endpoint_selected{upstream_id, endpoint_host, selection_method}` counter - `inst-mc-11a`
     2. [ ] - `p2` - **IF** X-OAGW-Target-Host header was used, increment `oagw_routing_target_host_used{upstream_id, endpoint_host}` counter - `inst-mc-11b`
@@ -353,9 +354,9 @@ Not applicable — this feature implements pipeline-integrated cross-cutting con
 - [ ] `p2` - **ID**: `cpt-cf-oagw-dod-obs-prometheus-metrics`
 
 The system **MUST** expose these OAGW Prometheus metrics at the admin `/metrics` endpoint:
-- Counters: `oagw_requests_total`, `oagw_errors_total`, `oagw_rate_limit_exceeded_total`, `oagw_rate_limit_buckets_evicted_total`, `oagw_circuit_breaker_transitions_total`, `oagw_routing_target_host_used`, `oagw_routing_endpoint_selected`, `oagw_registry_provisioning_failures_total{kind, reason}`, `oagw_registry_provisioning_runs_total{outcome}`, `oagw_credentials_withheld_total{host, outcome}`
+- Counters: `oagw_requests_total`, `oagw_errors_total`, `oagw_rate_limit_exceeded_total`, `oagw_rate_limit_buckets_evicted_total`, `resilience.circuit_breaker.transitions`, `resilience.circuit_breaker.calls`, `oagw_routing_target_host_used`, `oagw_routing_endpoint_selected`, `oagw_registry_provisioning_failures_total{kind, reason}`, `oagw_registry_provisioning_runs_total{outcome}`, `oagw_credentials_withheld_total{host, outcome}`
 - Histograms: `oagw_request_duration_seconds` with buckets `[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]`, `oagw_stream_duration_seconds{host, http.route, outcome}`, `oagw_websocket_session_duration_seconds{host, outcome}`
-- Gauges: `oagw_requests_in_flight`, `oagw_circuit_breaker_state`, `oagw_rate_limit_usage_ratio`, `oagw_rate_limit_buckets`, `oagw_upstream_available`, `oagw_upstream_connections`, `oagw_active_websocket_sessions{host}`
+- Gauges: `oagw_requests_in_flight`, `resilience.circuit_breaker.state` (up-down counter), `oagw_rate_limit_usage_ratio`, `oagw_rate_limit_buckets`, `oagw_upstream_available`, `oagw_upstream_connections`, `oagw_active_websocket_sessions{host}`
 
 `oagw_requests_total` counts every proxy request with a response under its status: the upstream's status, or for a gateway error (401, 403, 429, 502, ...) the status the client gets, so a 5xx-rate query covers gateway 5xx too. `oagw_errors_total` counts the gateway errors again by `error_type`, plus `Cancelled` for a request the client dropped before its response head; such a request has no status and is not in `oagw_requests_total`. Rejections the REST handler makes after `proxy:invoke` is granted and before the Data Plane runs (proxy path, WebSocket upgrade, body size and body read checks) are counted the same way, under `host` and `http.route` `unknown`; a granted request dropped before the Data Plane runs (the client gone mid-upload, the handler dropped by the request timeout) counts as `Cancelled`. Their `phase="total"` is the `proxy:invoke` check, as for a proxied request: the client's upload is not included. A response the REST handler fails to send after the Data Plane returned it (a 101 without its tunnel, a client connection that cannot upgrade) stays counted with the Data Plane's status.
 
@@ -369,7 +370,7 @@ With a database, the system **MUST** also expose the 8 proxy configuration cache
 - Counters: `oagw_proxy_cache_lookups_total{map, result}`, `oagw_proxy_cache_evictions_total{map, reason}`, `oagw_proxy_cache_changes_total{source}`, `oagw_proxy_cache_flushes_total{cause}`, `oagw_proxy_cache_loads_discarded_total{map}`, `oagw_proxy_cache_stale_served_total{map, cause}`, `oagw_proxy_cache_publish_failures_total{reason}`
 - Gauges: `oagw_proxy_cache_entries{map}`
 
-Cardinality **MUST** be controlled: no tenant labels; `http.route` is the normalized route match pattern from route config; `http.request.method` is normalized to a standard verb or `_OTHER`; `http.response.status_code` is the numeric upstream status (OTel HTTP semconv) — status-class queries (e.g. `5xx` rate) are expressed at query time over the numeric code. Label-key vocabulary matches the inbound API Gateway so both gateways share dashboards.
+Cardinality **MUST** be controlled: no tenant labels; the circuit breaker's `resilience.name` is the one per-upstream label (one set of series per upstream with an enabled breaker, kept until restart), which a deployment with many tenant upstreams drops or aggregates in the collector; `http.route` is the normalized route match pattern from route config; `http.request.method` is normalized to a standard verb or `_OTHER`; `http.response.status_code` is the numeric upstream status (OTel HTTP semconv) — status-class queries (e.g. `5xx` rate) are expressed at query time over the numeric code. Label-key vocabulary matches the inbound API Gateway so both gateways share dashboards.
 
 **Implements**:
 - `cpt-cf-oagw-algo-obs-metrics-collection`

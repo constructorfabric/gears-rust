@@ -52,6 +52,11 @@ pub struct Model {
     pub rate_limit: Option<Json>,
     /// Sharing mode of the rate limit (`private`, `inherit` or `enforce`).
     pub rate_limit_sharing: String,
+    /// JSON: circuit breaker config without `sharing`.
+    #[sea_orm(column_type = "JsonBinary", nullable)]
+    pub circuit_breaker: Option<Json>,
+    /// Sharing mode of the circuit breaker (`private`, `inherit` or `enforce`).
+    pub circuit_breaker_sharing: String,
     /// `NULL` when no plugins configuration exists (absent, not empty).
     pub plugins_sharing: Option<String>,
     /// When the row was created.
