@@ -79,14 +79,14 @@ fn the_content_hash_is_canonical() {
     upstreams.push(upstream_at(root, "other.example.com"));
     upstreams[0].request.headers = Some(headers(&[("a", "1"), ("b", "2"), ("c", "3")]));
     upstreams[0].request.rate_limit = Some(rate_limit(1.5));
-    let base = content_hash(&upstreams, &routes, root);
+    let base = content_hash(&upstreams, &routes, Some(root)).unwrap();
     assert_eq!(base.len(), 64);
     assert!(base.bytes().all(|b| b.is_ascii_hexdigit()));
 
     let mut reordered = upstreams.clone();
     reordered.reverse();
     reordered[1].request.headers = Some(headers(&[("c", "3"), ("a", "1"), ("b", "2")]));
-    assert_eq!(content_hash(&reordered, &routes, root), base);
+    assert_eq!(content_hash(&reordered, &routes, Some(root)).unwrap(), base);
 
     let mut owned = upstreams.clone();
     owned[0].request.rate_limit.as_mut().unwrap().shared_pool =
@@ -97,23 +97,35 @@ fn the_content_hash_is_canonical() {
             algorithm: crate::domain::model::RateLimitAlgorithm::TokenBucket,
         });
     owned[0].request.rate_limit.as_mut().unwrap().limit_owner_id = Some(Uuid::new_v4());
-    assert_eq!(content_hash(&owned, &routes, root), base);
+    assert_eq!(content_hash(&owned, &routes, Some(root)).unwrap(), base);
 
     // The root tenant fills in instances that name none, as the writes do.
     let mut named = upstreams.clone();
     named[0].tenant_id = None;
-    assert_eq!(content_hash(&named, &routes, root), base);
+    assert_eq!(content_hash(&named, &routes, Some(root)).unwrap(), base);
     let mut unnamed = routes.clone();
     unnamed[0].tenant_id = None;
-    assert_eq!(content_hash(&upstreams, &unnamed, root), base);
+    assert_eq!(
+        content_hash(&upstreams, &unnamed, Some(root)).unwrap(),
+        base
+    );
     // ...so another root tenant changes them.
     let other_root = Uuid::new_v4();
-    assert_ne!(content_hash(&named, &routes, other_root), base, "upstream");
     assert_ne!(
-        content_hash(&upstreams, &unnamed, other_root),
+        content_hash(&named, &routes, Some(other_root)).unwrap(),
+        base,
+        "upstream"
+    );
+    assert_ne!(
+        content_hash(&upstreams, &unnamed, Some(other_root)).unwrap(),
         base,
         "route"
     );
+    // Instances that all name their tenant need no root; one that names none
+    // cannot be hashed without it.
+    assert_eq!(content_hash(&upstreams, &routes, None).unwrap(), base);
+    assert!(content_hash(&named, &routes, None).is_err(), "upstream");
+    assert!(content_hash(&upstreams, &unnamed, None).is_err(), "route");
 
     type Change = Box<dyn Fn(&mut Vec<ProvisionedUpstream>, &mut Vec<ProvisionedRoute>)>;
     let changes: Vec<Change> = vec![
@@ -139,7 +151,11 @@ fn the_content_hash_is_canonical() {
     for (i, change) in changes.iter().enumerate() {
         let (mut u, mut r) = (upstreams.clone(), routes.clone());
         change(&mut u, &mut r);
-        assert_ne!(content_hash(&u, &r, root), base, "change {i}");
+        assert_ne!(
+            content_hash(&u, &r, Some(root)).unwrap(),
+            base,
+            "change {i}"
+        );
     }
 }
 
@@ -486,6 +502,28 @@ fn grpc_route_mutations() -> Vec<Mutation<CreateRouteRequest>> {
     ]
 }
 
+/// The encoding is stable: fixed content hashes to the digest OAGW 0.9.0
+/// stored, whether its instances name the root tenant or leave it to the
+/// default. A changed encoding makes every stored state row look changed.
+///
+/// ADR-0018: PERS-GATE-013.
+#[test]
+fn the_content_hash_of_fixed_content_is_pinned() {
+    const PINNED: &str = "ba788717e7bf0fde34c7b0240c6a3eaac21ebce58bdd524eaf5023ee24b636d5";
+    let root = Uuid::from_u128(0x42);
+    let (mut upstreams, mut routes) = full_instances(root, false);
+    assert_eq!(
+        content_hash_of("0.9.0", &upstreams, &routes, None).unwrap(),
+        PINNED
+    );
+    upstreams[0].tenant_id = None;
+    routes[0].tenant_id = None;
+    assert_eq!(
+        content_hash_of("0.9.0", &upstreams, &routes, Some(root)).unwrap(),
+        PINNED
+    );
+}
+
 /// Every hashed field changes the hash, in both requests and in every
 /// nested config; equal content with its maps filled in another order
 /// hashes the same.
@@ -495,10 +533,10 @@ fn grpc_route_mutations() -> Vec<Mutation<CreateRouteRequest>> {
 fn every_hashed_field_changes_the_content_hash() {
     let root = Uuid::new_v4();
     let (upstreams, routes) = full_instances(root, false);
-    let base = content_hash(&upstreams, &routes, root);
+    let base = content_hash(&upstreams, &routes, Some(root)).unwrap();
 
     let (u, r) = full_instances(root, true);
-    assert_eq!(content_hash(&u, &r, root), base, "map order");
+    assert_eq!(content_hash(&u, &r, Some(root)).unwrap(), base, "map order");
 
     let mut cases: Vec<Case> = Vec::new();
     for (name, f) in upstream_mutations() {
@@ -554,7 +592,7 @@ fn every_hashed_field_changes_the_content_hash() {
     for (name, change) in &cases {
         let (mut u, mut r) = (upstreams.clone(), routes.clone());
         change(&mut u, &mut r);
-        let hash = content_hash(&u, &r, root);
+        let hash = content_hash(&u, &r, Some(root)).unwrap();
         assert_ne!(hash, base, "{name} left the hash unchanged");
         // Each mutation is distinct content, so no two may collide either.
         if let Some(other) = seen.insert(hash, name.clone()) {
@@ -611,7 +649,7 @@ impl Pod {
             &CancellationToken::new(),
             upstreams,
             routes,
-            root,
+            Some(root),
         )
         .await
         .expect("a gated run")
@@ -634,7 +672,7 @@ impl Pod {
                 &cancel,
                 &upstreams,
                 &routes,
-                root,
+                Some(root),
             )
             .await
         })
@@ -798,7 +836,7 @@ async fn an_unchanged_registry_is_not_reconciled_again(state: Arc<dyn RegistrySt
     assert!(reconciled_clean(&pod.run(&upstreams, &routes, root).await));
     assert_eq!(
         state.read().await.unwrap().content_hash,
-        Some(content_hash(&upstreams, &routes, root))
+        Some(content_hash(&upstreams, &routes, Some(root)).unwrap())
     );
     assert_eq!(
         pod.run(&upstreams, &routes, root).await,
@@ -831,7 +869,7 @@ async fn a_waiting_pod_finishes_on_the_holders_hash(state: Arc<dyn RegistryState
     wait.notified().await;
     assert!(!task.is_finished(), "a held lease is waited on");
 
-    let hash = content_hash(&upstreams, &routes, root);
+    let hash = content_hash(&upstreams, &routes, Some(root)).unwrap();
     assert!(state.finish(holder, Some(&hash)).await.unwrap());
     let outcome = task.await.unwrap().unwrap();
     assert_eq!(outcome, RunOutcome::UpToDate { waited: true });
@@ -909,7 +947,7 @@ async fn a_rollback_after_an_unclean_run_reconciles(state: Arc<dyn RegistryState
         state.read().await.unwrap(),
         RegistryState {
             generation: Some(3),
-            content_hash: Some(content_hash(&upstreams, &routes, root)),
+            content_hash: Some(content_hash(&upstreams, &routes, Some(root)).unwrap()),
         }
     );
 }
@@ -980,7 +1018,7 @@ async fn the_stored_generation_never_decreases(state: Arc<dyn RegistryStateStore
     assert_eq!(stored.generation, Some(3));
     assert_eq!(
         stored.content_hash,
-        Some(content_hash(&upstreams, &routes, root))
+        Some(content_hash(&upstreams, &routes, Some(root)).unwrap())
     );
 }
 
@@ -1071,7 +1109,7 @@ async fn a_failed_run_releases_the_lease_at_once(state: Arc<dyn RegistryStateSto
         &CancellationToken::new(),
         &upstreams,
         &routes,
-        root,
+        Some(root),
     )
     .await;
     assert!(result.is_err(), "{result:?}");
@@ -1145,7 +1183,7 @@ async fn gated_run_of(
         &CancellationToken::new(),
         upstreams,
         routes,
-        root,
+        Some(root),
     )
     .await
 }
@@ -1251,7 +1289,7 @@ async fn a_hung_state_statement_fails_the_run_after_the_call_timeout() {
             // A claim needs the content recorded and a newer generation.
             let owner = Uuid::new_v4();
             assert!(inner.try_acquire(owner, LEASE_TTL, None).await.unwrap());
-            let hash = content_hash(&upstreams, &routes, root);
+            let hash = content_hash(&upstreams, &routes, Some(root)).unwrap();
             assert!(inner.finish(owner, Some(&hash)).await.unwrap());
         }
         let state: Arc<dyn RegistryStateStore> = Arc::new(HangsOn(inner, hung));

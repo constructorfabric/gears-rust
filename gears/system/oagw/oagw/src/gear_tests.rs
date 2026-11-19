@@ -172,8 +172,16 @@ fn hub_over(
     tenants: MockTenantResolverClient,
     registry: MockTypesRegistryClient,
 ) -> Arc<ClientHub> {
+    hub_with(Arc::new(tenants), registry)
+}
+
+/// [`hub_over`] with any tenant resolver.
+fn hub_with(
+    tenants: Arc<dyn TenantResolverClient>,
+    registry: MockTypesRegistryClient,
+) -> Arc<ClientHub> {
     let hub = Arc::new(ClientHub::new());
-    hub.register::<dyn TenantResolverClient>(Arc::new(tenants));
+    hub.register::<dyn TenantResolverClient>(tenants);
     hub.register::<dyn CredStoreClientV1>(Arc::new(MockCredStoreClient::empty()));
     hub.register::<dyn AuthZResolverApi>(Arc::new(CapturingAuthZResolverClient::new()));
     hub.register::<dyn TypesRegistryClient>(Arc::new(AcceptingTypesRegistry(registry)));
@@ -536,28 +544,281 @@ async fn a_held_lease_delays_neither_startup_nor_shutdown() {
     cluster.stop().await;
 }
 
-/// In memory there is nothing to wait for: `post_init` reconciles before
-/// the pod serves, the healthcheck is Healthy at once, and `start` spawns
-/// nothing.
+/// `start` after an in-memory `post_init` run that did not fail: the task
+/// waits for the re-check interval (±20%) before its first run, runs once
+/// it has passed, and `stop` ends it.
+async fn assert_in_memory_start_rechecks_after_the_interval(
+    registry: MockTypesRegistryClient,
+    after_post_init: toolkit::HealthcheckStatus,
+) {
+    const RECHECK: std::time::Duration = std::time::Duration::from_mins(1);
+    let tenants = MockTenantResolverClient::with_siblings(TenantId(Uuid::new_v4()), vec![]);
+    let calls = tenants.calls();
+    let calls = || calls.load(std::sync::atomic::Ordering::SeqCst);
+    let hub = hub_over(tenants, registry);
+    let ctx = context(
+        json!({ "config": { "registry_provisioning": { "recheck_interval": "1m" } } }),
+        None,
+        hub,
+    );
+    let gear = init(&ctx).await.expect("init");
+    gear.post_init(&post_init_ctx()).await.expect("post_init");
+    assert_eq!(health(&gear, &ctx).await, after_post_init);
+    let post_init_calls = calls();
+    assert!(
+        post_init_calls > 0,
+        "post_init's run asks for the root tenant"
+    );
+
+    gear.start(tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("start");
+    assert!(gear.registry_task.lock().is_some(), "the task runs");
+    tokio::time::sleep(RECHECK.mul_f64(0.79)).await;
+    assert_eq!(calls(), post_init_calls, "no run before the re-check");
+    tokio::time::sleep(RECHECK.mul_f64(0.42)).await;
+    assert!(calls() > post_init_calls, "a run after the re-check");
+    assert_eq!(health(&gear, &ctx).await, after_post_init);
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        gear.stop(tokio_util::sync::CancellationToken::new()),
+    )
+    .await
+    .expect("stop ends the task")
+    .expect("stop");
+    assert!(gear.registry_task.lock().is_none());
+}
+
+/// In memory `post_init` reconciles before the pod serves, and the
+/// healthcheck is Healthy at once; `start` spawns the re-check task, which
+/// waits for the re-check interval first, and `stop` ends it.
 ///
-/// ADR-0018: PERS-BOOT-001.
-#[tokio::test]
-async fn in_memory_post_init_reconciles_and_start_spawns_nothing() {
+/// ADR-0018: PERS-BOOT-001, PERS-LOOP-011.
+#[tokio::test(start_paused = true)]
+async fn in_memory_post_init_reconciles_and_start_rechecks_in_the_background() {
+    assert_in_memory_start_rechecks_after_the_interval(
+        one_upstream_registry(Uuid::new_v4(), Uuid::new_v4()),
+        toolkit::HealthcheckStatus::Healthy,
+    )
+    .await;
+}
+
+/// A `post_init` run that skipped an instance (a route on an unknown
+/// upstream) did not fail either: the first run also waits for the re-check.
+///
+/// ADR-0018: PERS-LOOP-011.
+#[tokio::test(start_paused = true)]
+async fn in_memory_start_after_a_not_clean_run_waits_for_the_recheck() {
+    let route_id = Uuid::new_v4();
+    let registry = MockTypesRegistryClient::new().with_instances([make_test_instance(
+        &format!("{}{route_id}", oagw_sdk::gts::ROUTE_SCHEMA),
+        json!({
+            "upstream_id": Uuid::new_v4(),
+            "match": { "http": { "methods": ["GET"], "path": "/v1" } },
+            "enabled": true,
+            "tags": [],
+            "priority": 0,
+        }),
+    )]);
+    assert_in_memory_start_rechecks_after_the_interval(
+        registry,
+        toolkit::HealthcheckStatus::Degraded,
+    )
+    .await;
+}
+
+/// A tenant resolver whose root tenant does not exist until `create_root`,
+/// as before account-management's bootstrap; every other call answers.
+struct LateRoot {
+    inner: MockTenantResolverClient,
+    root: TenantId,
+    created: std::sync::atomic::AtomicBool,
+    root_calls: std::sync::atomic::AtomicUsize,
+}
+
+impl LateRoot {
+    fn new(root: Uuid) -> Self {
+        Self {
+            inner: MockTenantResolverClient::with_siblings(TenantId(root), vec![]),
+            root: TenantId(root),
+            created: std::sync::atomic::AtomicBool::new(false),
+            root_calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn create_root(&self) {
+        self.created
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn root_calls(&self) -> usize {
+        self.root_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl TenantResolverClient for LateRoot {
+    async fn get_tenant(
+        &self,
+        ctx: &SecurityContext,
+        id: TenantId,
+    ) -> Result<tenant_resolver_sdk::TenantInfo, tenant_resolver_sdk::TenantResolverError> {
+        self.inner.get_tenant(ctx, id).await
+    }
+    async fn get_root_tenant(
+        &self,
+        ctx: &SecurityContext,
+    ) -> Result<tenant_resolver_sdk::TenantInfo, tenant_resolver_sdk::TenantResolverError> {
+        self.root_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if !self.created.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(tenant_resolver_sdk::TenantResolverError::TenantNotFound {
+                tenant_id: self.root,
+            });
+        }
+        self.inner.get_root_tenant(ctx).await
+    }
+    async fn get_tenants(
+        &self,
+        ctx: &SecurityContext,
+        ids: &[TenantId],
+        options: &tenant_resolver_sdk::GetTenantsOptions,
+    ) -> Result<Vec<tenant_resolver_sdk::TenantInfo>, tenant_resolver_sdk::TenantResolverError>
+    {
+        self.inner.get_tenants(ctx, ids, options).await
+    }
+    async fn get_ancestors(
+        &self,
+        ctx: &SecurityContext,
+        id: TenantId,
+        options: &tenant_resolver_sdk::GetAncestorsOptions,
+    ) -> Result<tenant_resolver_sdk::GetAncestorsResponse, tenant_resolver_sdk::TenantResolverError>
+    {
+        self.inner.get_ancestors(ctx, id, options).await
+    }
+    async fn get_descendants(
+        &self,
+        ctx: &SecurityContext,
+        id: TenantId,
+        options: &tenant_resolver_sdk::GetDescendantsOptions,
+    ) -> Result<tenant_resolver_sdk::GetDescendantsResponse, tenant_resolver_sdk::TenantResolverError>
+    {
+        self.inner.get_descendants(ctx, id, options).await
+    }
+    async fn is_ancestor(
+        &self,
+        ctx: &SecurityContext,
+        ancestor_id: TenantId,
+        descendant_id: TenantId,
+        options: &tenant_resolver_sdk::IsAncestorOptions,
+    ) -> Result<bool, tenant_resolver_sdk::TenantResolverError> {
+        self.inner
+            .is_ancestor(ctx, ancestor_id, descendant_id, options)
+            .await
+    }
+}
+
+/// In memory, a root tenant that does not exist yet (the tr-authz binary
+/// before account-management's bootstrap, #4568) does not fail startup:
+/// `post_init` succeeds with the healthcheck Degraded `failed`, `start`
+/// retries with backoff, and once the root exists the registry rows appear
+/// and the healthcheck turns Healthy. `stop` ends the task.
+///
+/// ADR-0018: PERS-LOOP-011.
+#[tokio::test(start_paused = true)]
+#[traced_test]
+async fn in_memory_startup_survives_a_missing_root_tenant_and_provisions_later() {
     use toolkit::HealthcheckStatus;
 
     let root = Uuid::new_v4();
-    let hub = hub_over(
-        MockTenantResolverClient::with_siblings(TenantId(root), vec![]),
-        one_upstream_registry(Uuid::new_v4(), Uuid::new_v4()),
+    let (upstream_id, route_id) = (Uuid::new_v4(), Uuid::new_v4());
+    let tenants = Arc::new(LateRoot::new(root));
+    let hub = hub_with(
+        tenants.clone(),
+        one_upstream_registry(upstream_id, route_id),
     );
+    let ctx = context(json!({ "config": {} }), None, hub);
+    let gear = init(&ctx).await.expect("init");
+    gear.post_init(&post_init_ctx())
+        .await
+        .expect("a missing root tenant does not fail startup");
+    assert!(logs_contain(
+        "Registry provisioning failed at startup; retrying in the background"
+    ));
+    let result = health_result(&gear, &ctx).await;
+    assert_eq!(
+        (result.status, result.code.as_deref()),
+        (
+            HealthcheckStatus::Degraded,
+            Some("registry_provisioning_failed")
+        )
+    );
+    let cp = control_plane(&gear);
+    let pctx = provisioning_ctx(root).unwrap();
+    assert!(cp.get_upstream(&pctx, upstream_id).await.is_err());
+
+    gear.start(tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("start");
+    // The task runs at once, then backs off 1 s, 2 s (±20%).
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    assert!(
+        tenants.root_calls() >= 4,
+        "post_init's run and at least three retries, got {}",
+        tenants.root_calls()
+    );
+    assert_eq!(gear.provisioning.get(), ProvisioningStatus::Failed);
+    // Retries below the backoff cap are expected at startup: warnings only.
+    logs_assert(|lines: &[&str]| {
+        let retries: Vec<_> = lines
+            .iter()
+            .filter(|l| l.contains("Registry provisioning run failed; retrying"))
+            .collect();
+        match retries.iter().find(|l| !l.contains(" WARN ")) {
+            _ if retries.is_empty() => Err("no retry was logged".to_owned()),
+            Some(l) => Err(format!("a retry below the cap logged above WARN: {l}")),
+            None => Ok(()),
+        }
+    });
+
+    tenants.create_root();
+    // The next backoff is at most 8 s (±20%).
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    assert_eq!(health(&gear, &ctx).await, HealthcheckStatus::Healthy);
+    let upstream = cp
+        .get_upstream(&pctx, upstream_id)
+        .await
+        .expect("the upstream is provisioned once the root exists");
+    assert_eq!(upstream.managed_by, ManagedBy::Registry);
+    cp.get_route(&pctx, route_id)
+        .await
+        .expect("the route is provisioned too");
+
+    gear.stop(tokio_util::sync::CancellationToken::new())
+        .await
+        .expect("stop");
+    assert!(gear.registry_task.lock().is_none(), "stop ends the task");
+    let calls = tenants.root_calls();
+    tokio::time::sleep(std::time::Duration::from_mins(10)).await;
+    assert_eq!(tenants.root_calls(), calls, "no run after stop");
+}
+
+/// An empty registry needs no root tenant: startup never asks the tenant
+/// resolver, and the healthcheck is Healthy at once.
+///
+/// ADR-0018: PERS-PROV-019.
+#[tokio::test]
+async fn an_empty_registry_never_calls_the_tenant_resolver() {
+    use toolkit::HealthcheckStatus;
+
+    let tenants = Arc::new(LateRoot::new(Uuid::new_v4()));
+    let hub = hub_with(tenants.clone(), MockTypesRegistryClient::new());
     let ctx = context(json!({ "config": {} }), None, hub);
     let gear = init(&ctx).await.expect("init");
     gear.post_init(&post_init_ctx()).await.expect("post_init");
     assert_eq!(health(&gear, &ctx).await, HealthcheckStatus::Healthy);
-    gear.start(tokio_util::sync::CancellationToken::new())
-        .await
-        .expect("start");
-    assert!(gear.registry_task.lock().is_none());
+    assert_eq!(tenants.root_calls(), 0);
 }
 
 /// An SSE stream on a silent upstream, watching the gear's stream signal.
@@ -997,7 +1258,7 @@ async fn reconcile(
         &Unattended,
         upstreams,
         routes,
-        root,
+        Some(root),
     )
     .await
 }

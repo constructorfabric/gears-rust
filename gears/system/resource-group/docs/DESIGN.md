@@ -455,6 +455,25 @@ A bearer-authenticated request reaches the typed REST handler, then the public
 service, authorization and a scoped database operation. A type-dependent write
 also reads Types Registry with that caller's SecurityContext before its transaction.
 
+Operations on one existing group (get, update, delete, descendants, ancestors)
+follow the prefetch pattern of `AUTHZ_USAGE_SCENARIOS.md` S09-S11, since RG has
+no `tenant_closure`. `GroupService` reads the group's `tenant_id` with a
+system-scoped read that never decides access, sends it to the PDP as
+`resource.properties.owner_tenant_id` with `resource.id`, reads the group under
+the returned scope and runs the operation under it. An unknown id answers 404
+before the PDP is asked. A denial of any kind (PDP `decision: false`, a scope
+that matches nothing or excludes the group, an unadvertised predicate) answers
+404 when the caller may not `get` the group, so a hidden group looks like an
+unknown id, and 403 when it may `get` the group but not perform the operation
+(for example a same-tenant user without update or delete). The denial reason is
+logged at `debug` only; PDP evaluation failures stay internal errors.
+
+An unknown id answers without a PDP call, while a hidden group costs one (two
+for update, delete and hierarchy reads, which also ask about `get`), so response
+time can tell a hidden group from an unknown one. Generated group ids are UUIDv7
+with 74 random bits, so this mostly confirms an id the caller already knows; an
+id chosen by the creator (`id` in the create request) may be guessable.
+
 **ID**: `cpt-cf-resource-group-seq-authz-rg-sql-split`
 
 The PDP reads hierarchy or memberships through ResourceGroupReadHierarchy,
@@ -465,9 +484,10 @@ constraints; RG's domain services generate neither policy decisions nor SQL scop
 
 The resource-group integration suite publishes types through the platform API,
 then exercises group and membership requests with a tenant bearer. The tr-authz
-launcher profile reuses the deployment registry and seeds stable root tenants;
-its current reduced feature set and deferred full chain are documented in
-`testing/e2e/suites/resource_group/e2e.yaml`.
+launcher profile builds the full AuthZ -> TenantResolver -> RG chain
+(`tr-authz`, `tenant-resolver-rg`) on its own home, seeds stable root tenants of
+the suite's tenant type and lists that type in `rg-tr-plugin`'s `tenant_types`;
+see `testing/e2e/suites/resource_group/e2e.yaml`.
 
 **ID**: `cpt-cf-resource-group-seq-mtls-authz-read`
 

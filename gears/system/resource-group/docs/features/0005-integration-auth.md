@@ -85,7 +85,8 @@ This feature bridges RG with the AuthZ ecosystem. The integration read port prov
 
 **Error Scenarios**:
 - Invalid JWT → 401 Unauthorized
-- Insufficient permissions → 403 Forbidden
+- Insufficient permissions → 403 Forbidden; on one existing group (get, update, delete, hierarchy) only when the caller may `get` that group, see below
+- Any denial on one existing group the caller may not `get` (foreign or outside its visible tenants) → 404 Not Found, the same as an unknown id (S4)
 - AuthZ service unavailable → 503
 
 **Steps**:
@@ -99,6 +100,8 @@ This feature bridges RG with the AuthZ ecosystem. The integration read port prov
 8. [x] - `p1` - RG Gateway: apply AccessScope via SecureORM (WHERE tenant_id IN (...)) to query - `inst-jwt-8`
 9. [x] - `p1` - RG Service: execute query with SQL predicates, return results - `inst-jwt-9`
 10. [x] - `p1` - **RETURN** response to actor - `inst-jwt-10`
+
+**Single-group operations** (get, update, delete, hierarchy of one group): RG has no `tenant_closure`, so before step 3 the service prefetches the group's `tenant_id` (system-scoped, never an access decision) and sends it as `resource.properties.owner_tenant_id` (`AUTHZ_USAGE_SCENARIOS.md` S09-S11, rules R1-R4). An unknown id answers 404 without asking the PDP. The group is then read under the returned scope. A denial of any kind (PDP deny, a scope that matches nothing or excludes the group, an unadvertised predicate) answers 404 when the caller may not `get` the group and 403 when it may `get` it but not perform the action; the denial reason is logged at `debug` only.
 
 ### In-Process Hierarchy Read by AuthZ Plugin
 

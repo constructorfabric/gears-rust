@@ -89,7 +89,7 @@ pub struct OutboundApiGatewayGear {
     /// This process: the registry lease owner, and the origin of the proxy
     /// configuration changes it publishes.
     owner: uuid::Uuid,
-    /// The registry run `start` drives on a database backend.
+    /// The registry run `start` drives in the background.
     registry_job: OnceLock<RegistryJob>,
     /// The running registry task, from `start` to `stop`.
     registry_task: parking_lot::Mutex<Option<(CancellationToken, tokio::task::JoinHandle<()>)>>,
@@ -496,8 +496,8 @@ impl Gear for OutboundApiGatewayGear {
 
 impl OutboundApiGatewayGear {
     /// `post_init`: prepare the registry provisioning once every gear of the
-    /// group initialized — reconciled now in memory, by `start`'s background
-    /// task on a database.
+    /// group initialized, for `start`'s background task; in memory, also
+    /// reconcile once now.
     async fn prepare_registry_provisioning(&self) -> anyhow::Result<()> {
         let registry = self
             .registry_client
@@ -533,24 +533,29 @@ impl OutboundApiGatewayGear {
             gate: self.registry_gate()?,
             jitter,
         };
-        if job.gate.is_some() {
-            // A database: the background task (`start`) reconciles, so a
-            // held lease or a failing dependency never delays startup; the
-            // pod serves what the database holds meanwhile.
-            self.registry_job
-                .set(job)
-                .map_err(|_| anyhow::anyhow!("registry job already set"))?;
-        } else {
-            // In memory: the store starts empty and no other process shares
-            // it, so fill it before serving; an infrastructure error fails
-            // startup.
+        // The background task (`start`) reconciles, so a held lease or a
+        // failing dependency never fails startup; the pod serves what the
+        // store holds meanwhile.
+        if job.gate.is_none() {
+            // In memory the store starts empty, so try to fill it before
+            // serving (each call bounded by the call timeout). A dependency
+            // may not answer yet (the root tenant before account-management
+            // creates it): the task retries.
             let outcome = job
                 .run_once(&CancellationToken::new())
                 .instrument(info_span!("oagw_registry_provisioning"))
                 .await;
+            if let Err(e) = &outcome {
+                warn!(
+                    error = %format!("{e:#}"),
+                    "Registry provisioning failed at startup; retrying in the background"
+                );
+            }
             self.provisioning.record(&outcome);
-            outcome?;
         }
+        self.registry_job
+            .set(job)
+            .map_err(|_| anyhow::anyhow!("registry job already set"))?;
 
         self.type_provisioning
             .set(provisioning)
@@ -583,10 +588,10 @@ impl OutboundApiGatewayGear {
     }
 }
 
-/// On a database backend: the proxy configuration change feed, with the
-/// cache enabled (ADR-0020 *Cluster Setup*), and the registry reconcile's background task (ADR-0018
-/// *Provisioning from the Types Registry*). Pattern of the cluster gear: its
-/// own child token and join handle per `start`.
+/// The registry reconcile's background task (ADR-0018 *Provisioning from
+/// the Types Registry*), and on a database backend with the cache enabled
+/// the proxy configuration change feed (ADR-0020 *Cluster Setup*). Pattern
+/// of the cluster gear: its own child token and join handle per `start`.
 #[async_trait]
 impl RunnableCapability for OutboundApiGatewayGear {
     async fn start(&self, cancel: CancellationToken) -> anyhow::Result<()> {
@@ -597,7 +602,7 @@ impl RunnableCapability for OutboundApiGatewayGear {
             self.stop(deadline_after(RESTART_STOP_GRACE)).await?;
         }
         // What can fail comes first, so a failing `start` leaves nothing
-        // running. In memory, `post_init` already reconciled.
+        // running.
         let registry = match self.registry_job.get() {
             Some(job) => Some((
                 job,
@@ -645,6 +650,18 @@ impl RunnableCapability for OutboundApiGatewayGear {
         // start), and `stop` cancels only this `start`'s child, so a
         // stop→start cycle gets a live one.
         let token = cancel.child_token();
+        // In memory the last run (`post_init`'s, or the task's before a
+        // stop) already reconciled: unless it failed or was cut off
+        // (`Pending`), the first run waits for the re-check, as after any run.
+        let first_wait = if job.gate.is_none()
+            && matches!(
+                self.provisioning.get(),
+                ProvisioningStatus::Settled | ProvisioningStatus::NotClean
+            ) {
+            (job.jitter)(config.recheck_interval)
+        } else {
+            Duration::ZERO
+        };
         let span = info_span!(
             "oagw_registry_provisioning",
             owner = %self.owner,
@@ -653,6 +670,7 @@ impl RunnableCapability for OutboundApiGatewayGear {
         let handle = tokio::spawn(
             run_registry_loop(
                 job.clone(),
+                first_wait,
                 config.recheck_interval,
                 self.provisioning.clone(),
                 token.clone(),
@@ -725,7 +743,7 @@ async fn stop_registry_task(
     mut handle: tokio::task::JoinHandle<()>,
     deadline: CancellationToken,
 ) {
-    // The run stops between writes and releases its lease.
+    // The run stops between writes and, on a database, releases its lease.
     token.cancel();
     tokio::select! {
         joined = &mut handle => log_registry_task_end(joined),

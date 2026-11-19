@@ -85,7 +85,7 @@ Foundation layer that all other OAGW features depend on. Provides the shared dom
 
 **Success Scenarios**:
 - Gear starts with a configured database: migrations run, database repositories selected, GTS types provisioned, local client registered, gear ready to serve; `start` then spawns the registry reconcile's background task (`cpt-cf-oagw-flow-domain-registry-provisioning`) and returns at once
-- Gear starts without a configured database: in-memory repositories selected with a warning, GTS types provisioned, local client registered, gear ready to serve
+- Gear starts without a configured database: in-memory repositories selected with a warning, GTS types provisioned, local client registered, gear ready to serve; `post_init` reconciles the registry once, and `start` spawns the same background task as on a database
 
 **Error Scenarios**:
 - Database configured but unusable (connection error, backend not compiled in, malformed configuration, migration failure)
@@ -146,7 +146,7 @@ Foundation layer that all other OAGW features depend on. Provides the shared dom
 **Actor**: `cpt-cf-oagw-actor-types-registry`
 
 **Success Scenarios**:
-- Upstream and route instances registered in types_registry by other gears are created in OAGW storage, owned by the registry (`managed_by = registry`): in memory during `post_init`; on a database by a background task that `start` spawns
+- Upstream and route instances registered in types_registry by other gears are created in OAGW storage, owned by the registry (`managed_by = registry`), by a background task that `start` spawns; in memory also once during `post_init`, so a normal start serves them at once
 - On a database, unchanged registry content costs one read of the registry-state row and no write; changed instances are updated and instances the registry no longer has are removed
 - An upstream instance whose endpoints or explicit alias now give another alias keeps its ID and routes and takes the new alias in place; alias and path hand-overs apply in one run whatever the listing order
 - A route instance that names another upstream moves to it in place
@@ -161,10 +161,10 @@ Foundation layer that all other OAGW features depend on. Provides the shared dom
 - A route instance names an upstream created through the Management API, or an upstream that was skipped and has no row
 - Two registry upstreams swap aliases, or two registry routes swap paths, or the alias or path is held by another registry row whose write this run also rejected (skipped as `alias_cycle` / `path_cycle`)
 
-**Infrastructure errors** (database, tenant resolver unavailable or refusing OAGW, policy engine, credential store unavailable, listing the types registry or an instance in it that cannot be read, any call of the run taking longer than 20 s, a panic) abort the run (after a timed-out call the lease is kept until its TTL lapses, since the call may still complete on the database): on a database the background task retries it with backoff from 1 s to 5 min (±20% jitter) while the pod serves; in memory startup fails.
+**Infrastructure errors** (database, tenant resolver unavailable or refusing OAGW, policy engine, credential store unavailable, listing the types registry or an instance in it that cannot be read, any call of the run taking longer than 20 s, a panic) abort the run (after a timed-out call the lease is kept until its TTL lapses, since the call may still complete on the database): the background task retries it with backoff from 1 s to 5 min (±20% jitter) while the pod serves what its store holds, on either backend. In memory a failed `post_init` run does not fail startup: it is logged, the healthcheck reports Degraded, and the task retries it (a root tenant that account-management creates after OAGW starts, for example).
 
 **Steps**:
-1. [x] - `p1` - List `gts.cf.core.oagw.upstream.v1~*` and `gts.cf.core.oagw.route.v1~*` instances from types_registry and resolve the root tenant; **IF** either fails, or an instance cannot be read (no UUID in its `$id`, a payload that does not parse), **RETURN** run failure - `inst-prov-1`
+1. [x] - `p1` - List `gts.cf.core.oagw.upstream.v1~*` and `gts.cf.core.oagw.route.v1~*` instances from types_registry, then, only **IF** an instance names no tenant, resolve the root tenant (their default); **IF** either fails, or an instance cannot be read (no UUID in its `$id`, a payload that does not parse), **RETURN** run failure - `inst-prov-1`
 2. [x] - `p1` - **IF** a database is configured, apply the gate: **IF** the stored generation is newer than this pod's, **RETURN** stale, no writes; **IF** the stored content hash equals this content's, claim this pod's newer generation if any and **RETURN** up to date; otherwise take the lease, clear the recorded hash and claim the generation in one statement, or poll until the hash matches, a newer generation appears or the lease frees - `inst-prov-1a`
 3. [x] - `p1` - Load every stored registry-managed upstream and route, in any tenant, in full; check every instance without reading anything (ID, request checks, duplicate aliases, unknown upstreams, registry routes overlapping each other) and skip those that fail; the rows to keep come from every instance, checked or not - `inst-prov-2`
    1. [x] - `p1` - **FOR EACH** dropped registry upstream, list its routes: **IF** a route this run neither deletes nor writes again uses it (a Management API route, a skipped registry route), it stays - `inst-prov-2b`

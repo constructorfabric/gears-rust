@@ -151,7 +151,7 @@ const PROXY_CACHE_MAX_STALE_MAX: Duration = Duration::from_hours(24);
 /// million entries can hold gigabytes, so a larger value is a typo.
 const PROXY_CACHE_MAX_ENTRIES_MAX: usize = 1_000_000;
 
-/// The registry reconcile on a database backend.
+/// The registry reconcile's background task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RegistryProvisioningConfig {
@@ -165,8 +165,9 @@ pub struct RegistryProvisioningConfig {
     pub generation: Option<u64>,
     /// How often every pod re-checks the registry state after a run, whatever
     /// its outcome (an unchanged state costs one query), with ±20% jitter.
-    /// Humantime (`5m`). From 1 second to 24 hours. Default: 5 minutes.
-    /// Ignored on the in-memory backend, which reconciles once at startup.
+    /// Humantime (`5m`). From 1 second to 24 hours. Default: 5 minutes. On
+    /// the in-memory backend, which has no state row, every re-check
+    /// reconciles, writing only what changed.
     #[serde(
         default = "default_recheck_interval",
         with = "toolkit_utils::humantime_serde"

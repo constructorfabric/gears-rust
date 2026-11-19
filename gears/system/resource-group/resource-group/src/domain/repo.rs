@@ -62,6 +62,16 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         id: Uuid,
     ) -> Result<Option<GroupRecord>, DomainError>;
 
+    /// The tenant that owns a group, read under the system scope.
+    ///
+    /// Fills the PDP request of a single-group operation; never use it as an
+    /// authorization gate.
+    async fn find_tenant_id<C: DBRunner>(
+        &self,
+        db: &C,
+        id: Uuid,
+    ) -> Result<Option<Uuid>, DomainError>;
+
     /// Find the stored group by ID, visible under `scope`.
     async fn find_model_by_id_scoped<C: DBRunner>(
         &self,
