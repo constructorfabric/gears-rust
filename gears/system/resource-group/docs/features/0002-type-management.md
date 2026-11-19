@@ -127,7 +127,7 @@ availability failures retain their intended error classifications.
 
 The SDK publishes the abstract group base `gts.cf.core.rg.type.v1~` with required
 payload field `parent_type` and required trait `membership_type`, and the abstract membership base
-`gts.cf.core.rg.membership.v1~`.
+`gts.cf.core.rg.group_membership.v1~`.
 The base `parent_type` accepts `null` or a string matching the fixed
 `x-gts-type-ref` for the RG type family.
 A concrete group schema constrains the actual `parent_type` and supplies the membership schema ID

@@ -2,7 +2,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, reason = "test assertions")]
 
-use resource_group_sdk::gts::MEMBERSHIP_TYPE_V1;
+use resource_group_sdk::gts::GROUP_MEMBERSHIP_RESOURCE_TYPE;
 use serde_json::{Value, json};
 use toolkit_gts::gts_id;
 use types_registry_sdk::{GtsId, GtsTypeId, LifecycleStatus, TypeSchema};
@@ -11,7 +11,7 @@ use super::{RgType, compile, concrete_membership_type};
 use crate::domain::error::DomainError;
 
 const GROUP: &str = gts_id!("cf.core.rg.type.v1~cf.test.rg.team.v1~");
-const MEMBERSHIP: &str = gts_id!("cf.core.rg.membership.v1~cf.test.rg.member.v1~");
+const MEMBERSHIP: &str = gts_id!("cf.core.rg.group_membership.v1~cf.test.rg.member.v1~");
 
 fn snapshot(content: Value, resolved_schema: Value) -> TypeSchema {
     TypeSchema {
@@ -65,9 +65,9 @@ fn the_binding_comes_from_effective_trait_values() {
 #[test]
 fn only_a_concrete_membership_schema_binds() {
     for id in [
-        MEMBERSHIP_TYPE_V1,
+        GROUP_MEMBERSHIP_RESOURCE_TYPE,
         gts_id!("cf.test.rg.member.v1~"),
-        "gts.cf.core.rg.membership.v1~not an id",
+        "gts.cf.core.rg.group_membership.v1~not an id",
     ] {
         assert!(concrete_membership_type(id).is_none(), "{id}");
         let err = binding(json!({"membership_type": id})).unwrap_err();

@@ -189,12 +189,12 @@ pub fn publish_type(req: CreateTypeRequest) -> ResourceGroupType {
 
 /// Publish a group schema and the membership policy bound to it.
 fn seed_into(registry: &MockTypesRegistry, req: &CreateTypeRequest) {
-    use resource_group_sdk::gts::MEMBERSHIP_TYPE_V1;
+    use resource_group_sdk::gts::GROUP_MEMBERSHIP_RESOURCE_TYPE;
     use serde_json::{Value, json};
 
     let trimmed = req.code.trim_end_matches('~');
     let (parent, suffix) = trimmed.rsplit_once('~').expect("a derived RG type code");
-    let membership_type = format!("{MEMBERSHIP_TYPE_V1}{suffix}~");
+    let membership_type = format!("{GROUP_MEMBERSHIP_RESOURCE_TYPE}{suffix}~");
     let mut resource_type = json!({"type": "string", "x-gts-type-ref": "gts.*"});
     if req.allowed_membership_types.is_empty() {
         resource_type["maxLength"] = json!(0);
@@ -208,7 +208,7 @@ fn seed_into(registry: &MockTypesRegistry, req: &CreateTypeRequest) {
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
             "allOf": [
-                { "$ref": format!("gts://{MEMBERSHIP_TYPE_V1}") },
+                { "$ref": format!("gts://{GROUP_MEMBERSHIP_RESOURCE_TYPE}") },
                 { "properties": { "resource_type": resource_type } }
             ],
         }),

@@ -38,7 +38,7 @@ pub struct UserGroupTypeV1;
 #[gts_type_schema(
     dir_path = "schemas",
     base = ResourceGroupMembershipV1,
-    type_id = gts_id!("cf.core.rg.membership.v1~cf.core.am.user_group_member.v1~"),
+    type_id = gts_id!("cf.core.rg.group_membership.v1~cf.core.am.user_group_member.v1~"),
     description = "Allowed resource types for Account Management user groups",
     properties = "",
     overrides(ResourceGroupMembershipV1 = {

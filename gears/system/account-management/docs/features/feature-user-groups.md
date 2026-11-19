@@ -123,7 +123,7 @@ The existing `rg-type-registration` / `rg-type-schema-registration` traceability
 |-------------|----------------|---------------------------------|
 | `UserGroupTypeV1` | `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` | `parent_type` accepts roots and parents of the exact AM user-group type. The `membership_type` trait binds the user membership schema. `metadata` may be omitted or empty. |
 | `UserV1` | `gts.cf.core.am.user.v1~` | AM user resource type used as the membership's `resource_type`. |
-| [User membership schema](../schemas/user_group_member.v1.schema.json) | `gts.cf.core.rg.membership.v1~cf.core.am.user_group_member.v1~` | Accepts the AM user resource type and its derived types as `resource_type` through `x-gts-type-ref`. |
+| [User membership schema](../schemas/user_group_member.v1.schema.json) | `gts.cf.core.rg.group_membership.v1~cf.core.am.user_group_member.v1~` | Accepts the AM user resource type and its derived types as `resource_type` through `x-gts-type-ref`. |
 
 **Output**: Successful publication (`UpToDate`, or `Reconciled` with every desired identifier `Admitted`), or a publication failure that stops startup.
 

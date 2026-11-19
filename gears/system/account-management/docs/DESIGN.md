@@ -407,7 +407,7 @@ When strict-mode enforcement is active, AM validates the chained schema identifi
 | Schema field | Value | Meaning |
 |-------|-------|---------|
 | `parent_type` | `enum` containing `null` and the exact AM user-group type ID | Allows roots and nesting under the exact AM user-group type. |
-| `x-gts-traits.membership_type` | `gts.cf.core.rg.membership.v1~cf.core.am.user_group_member.v1~` | Binds the schema that allows the AM user resource type and its derivatives. |
+| `x-gts-traits.membership_type` | `gts.cf.core.rg.group_membership.v1~cf.core.am.user_group_member.v1~` | Binds the schema that allows the AM user resource type and its derivatives. |
 
 Resource Group's ownership-graph profile enforces tenant compatibility and scope isolation at write time. The schema governs type topology, metadata, and membership type constraints.
 

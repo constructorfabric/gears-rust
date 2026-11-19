@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use resource_group_sdk::gts::MEMBERSHIP_TYPE_V1;
+use resource_group_sdk::gts::GROUP_MEMBERSHIP_RESOURCE_TYPE;
 use serde_json::{Value, json};
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_gts::{gts_id, gts_uri};
@@ -28,7 +28,7 @@ struct Catalogue;
 const USER: &str = gts_id!("cf.test.rg.user.v1~");
 const TENANT: &str = gts_id!("cf.core.rg.type.v1~cf.test.rg.tenant.v1~");
 const DEPT: &str = gts_id!("cf.core.rg.type.v1~cf.test.rg.tenant.v1~cf.test.rg.dept.v1~");
-const MEMBERSHIP: &str = gts_id!("cf.core.rg.membership.v1~cf.test.rg.member.v1~");
+const MEMBERSHIP: &str = gts_id!("cf.core.rg.group_membership.v1~cf.test.rg.member.v1~");
 
 fn registry() -> Arc<MockTypesRegistry> {
     let registry = Arc::new(MockTypesRegistry::new());
@@ -45,7 +45,7 @@ fn registry() -> Arc<MockTypesRegistry> {
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
             "allOf": [
-                { "$ref": format!("gts://{MEMBERSHIP_TYPE_V1}") },
+                { "$ref": format!("gts://{GROUP_MEMBERSHIP_RESOURCE_TYPE}") },
                 { "properties": { "resource_type": { "const": USER } } }
             ]
         }),
@@ -466,9 +466,9 @@ async fn a_membership_rule_checks_the_group_type_first() {
 #[tokio::test]
 async fn only_a_concrete_membership_schema_is_read() {
     for membership_type in [
-        MEMBERSHIP_TYPE_V1,
+        GROUP_MEMBERSHIP_RESOURCE_TYPE,
         gts_id!("cf.test.rg.member.v1~"),
-        "gts.cf.core.rg.membership.v1~not an id",
+        "gts.cf.core.rg.group_membership.v1~not an id",
     ] {
         let registry = registry();
         let err = catalog(registry.clone())
@@ -619,7 +619,7 @@ async fn a_deleted_or_unknown_membership_schema_refuses_a_new_link() {
     let err = catalog(registry())
         .get_membership_schema(
             &caller(1),
-            gts_id!("cf.core.rg.membership.v1~cf.test.rg.nope.v1~"),
+            gts_id!("cf.core.rg.group_membership.v1~cf.test.rg.nope.v1~"),
         )
         .await
         .expect_err("unknown membership schema");

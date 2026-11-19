@@ -6,7 +6,7 @@ use gts::GtsSchema;
 use serde_json::json;
 use toolkit_gts::gts_id;
 
-use super::{MEMBERSHIP_TYPE_V1, ResourceGroupMembershipV1, ResourceGroupTypeV1};
+use super::{GROUP_MEMBERSHIP_RESOURCE_TYPE, ResourceGroupMembershipV1, ResourceGroupTypeV1};
 
 const BASE: &str = gts_id!("cf.core.rg.type.v1~");
 
@@ -16,7 +16,7 @@ fn the_base_types_are_this_crates_declarations() {
         .into_iter()
         .map(|(id, _)| id)
         .collect();
-    assert_eq!(ids, [MEMBERSHIP_TYPE_V1, BASE]);
+    assert_eq!(ids, [gts_id!("cf.core.rg.group_membership.v1~"), BASE]);
 }
 
 #[test]
@@ -26,7 +26,7 @@ fn the_group_envelope_carries_an_optional_metadata_object() {
     assert_eq!(traits["required"], json!(["membership_type"]));
     assert_eq!(
         traits["properties"]["membership_type"]["x-gts-type-ref"],
-        MEMBERSHIP_TYPE_V1
+        GROUP_MEMBERSHIP_RESOURCE_TYPE
     );
     assert!(schema["properties"].get("membership_type").is_none());
     assert!(schema.get("x-gts-traits").is_none());

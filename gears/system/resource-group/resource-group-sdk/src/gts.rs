@@ -8,7 +8,7 @@ use toolkit_gts::local::gts_type_schema;
 #[derive(schemars::JsonSchema, serde::Serialize, toolkit_gts::GtsTraitsSchema)]
 pub struct ResourceGroupTypeTraitsV1 {
     /// GTS ID of a concrete membership schema.
-    #[schemars(extend("x-gts-type-ref" = MEMBERSHIP_TYPE_V1))]
+    #[schemars(extend("x-gts-type-ref" = GROUP_MEMBERSHIP_RESOURCE_TYPE))]
     pub membership_type: String,
 }
 
@@ -49,13 +49,10 @@ pub struct ResourceGroupTypeV1<M> {
     pub parent_type: Option<String>,
 }
 
-/// Base of schemas constraining the type of a group member.
-pub const MEMBERSHIP_TYPE_V1: &str = gts_id!("cf.core.rg.membership.v1~");
-
 /// Resource type checked against the schema bound to the target group.
 #[gts_type_schema(
     dir_path = "schemas",
-    type_id = gts_id!("cf.core.rg.membership.v1~"),
+    type_id = gts_id!("cf.core.rg.group_membership.v1~"),
     description = "Allowed resource types for group membership",
     properties = "gts_type",
     base = true,
@@ -89,8 +86,9 @@ pub struct ResourceGroupMembershipV1 {
 // create groups, AM's ownership probe on tenant delete failed closed).
 pub const GROUP_RESOURCE_TYPE: &str = gts_id!("cf.core.rg.group.v1~");
 
-/// Canonical GTS resource type for a resource-group membership link.
-pub const GROUP_MEMBERSHIP_RESOURCE_TYPE: &str = gts_id!("cf.core.rg.group_membership.v1~");
+/// GTS resource type for membership authorization and base for concrete membership schemas.
+pub const GROUP_MEMBERSHIP_RESOURCE_TYPE: &str =
+    <ResourceGroupMembershipV1 as gts::GtsSchema>::TYPE_ID;
 
 /// GTS identifier of the RG base type (`gts.cf.core.rg.type.v1~`): the
 /// prefix every RG type identifier starts with.

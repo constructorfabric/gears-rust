@@ -48,7 +48,7 @@ Dynamic publishers use Types Registry's platform API. See the
 
 Group types derive from `gts.cf.core.rg.type.v1~`, which requires
 a `parent_type` payload field and a `membership_type` trait on concrete types. Publish a concrete membership schema
-under `gts.cf.core.rg.membership.v1~` and the group schema that binds to it.
+under `gts.cf.core.rg.group_membership.v1~` and the group schema that binds to it.
 Several group types can share a membership schema.
 
 - The group schema constrains `parent_type` in its body. At write time RG

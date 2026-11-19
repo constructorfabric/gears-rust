@@ -33,7 +33,7 @@
     "properties": {
       "membership_type": {
         "type": "string",
-        "const": "gts.cf.core.rg.membership.v1~cf.core.am.user_group_member.v1~"
+        "const": "gts.cf.core.rg.group_membership.v1~cf.core.am.user_group_member.v1~"
       }
     },
     "required": [
@@ -41,6 +41,6 @@
     ]
   },
   "x-gts-traits": {
-    "membership_type": "gts.cf.core.rg.membership.v1~cf.core.am.user_group_member.v1~"
+    "membership_type": "gts.cf.core.rg.group_membership.v1~cf.core.am.user_group_member.v1~"
   }
 }

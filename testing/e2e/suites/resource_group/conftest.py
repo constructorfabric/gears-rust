@@ -67,7 +67,7 @@ TENANT_B_ID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 TENANT_TYPE_CODE = "gts.cf.core.rg.type.v1~x.e2etest._.tenant.v1~"
 
 
-RG_MEMBERSHIP_BASE = "gts.cf.core.rg.membership.v1~"
+RG_MEMBERSHIP_BASE = "gts.cf.core.rg.group_membership.v1~"
 
 
 def membership_schema_id(group_code: str) -> str:

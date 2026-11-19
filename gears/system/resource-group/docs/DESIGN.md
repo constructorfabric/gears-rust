@@ -422,7 +422,7 @@ RG publish their own derived types through their own collectors.
 
 Account Management owns the user-group container
 `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` and the membership schema
-`gts.cf.core.rg.membership.v1~cf.core.am.user_group_member.v1~`. AM also publishes
+`gts.cf.core.rg.group_membership.v1~cf.core.am.user_group_member.v1~`. AM also publishes
 `gts.cf.core.am.user.v1~` as the user resource type for membership links.
 Application initialization depends on successful admission of the declarations.
 The same declarations are available to the runtime's `publish-gts` deployment

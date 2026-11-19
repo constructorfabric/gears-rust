@@ -300,7 +300,7 @@ async def test_create_tenant_validates_tenant_type_via_types_registry(
 
 async def test_published_user_group_membership_trait_rejects_rebinding(am_base_url, platform_headers):
     group = "gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~"
-    member = "gts.cf.core.rg.membership.v1~cf.core.am.user_group_member.v1~"
+    member = "gts.cf.core.rg.group_membership.v1~cf.core.am.user_group_member.v1~"
     async with httpx.AsyncClient(
         base_url=am_base_url.rstrip("/") + "/", headers=platform_headers, timeout=REQUEST_TIMEOUT,
     ) as registry:

@@ -7,7 +7,7 @@
 //! and cleanup of existing rows never consult it.
 
 use async_trait::async_trait;
-use resource_group_sdk::gts::MEMBERSHIP_TYPE_V1;
+use resource_group_sdk::gts::GROUP_MEMBERSHIP_RESOURCE_TYPE;
 use serde_json::{Value, json};
 use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
@@ -146,9 +146,9 @@ fn placement_validator(schema: &TypeSchema) -> Option<PayloadValidator> {
 }
 
 /// A concrete membership schema: a valid GTS type strictly derived from
-/// [`MEMBERSHIP_TYPE_V1`]. The base itself selects no member types.
+/// [`GROUP_MEMBERSHIP_RESOURCE_TYPE`]. The base itself selects no member types.
 pub(crate) fn concrete_membership_type(id: &str) -> Option<GtsTypeId> {
-    if id.starts_with(MEMBERSHIP_TYPE_V1) && id != MEMBERSHIP_TYPE_V1 {
+    if id.starts_with(GROUP_MEMBERSHIP_RESOURCE_TYPE) && id != GROUP_MEMBERSHIP_RESOURCE_TYPE {
         GtsTypeId::try_new(id).ok()
     } else {
         None

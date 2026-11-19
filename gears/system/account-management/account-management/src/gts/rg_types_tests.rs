@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use resource_group_sdk::gts::MEMBERSHIP_TYPE_V1;
+use resource_group_sdk::gts::GROUP_MEMBERSHIP_RESOURCE_TYPE;
 use serde_json::json;
 use toolkit_security::PlatformSecurityContext;
 use types_registry_sdk::testing_platform::MockTypesRegistry;
@@ -40,8 +40,11 @@ async fn admitted_registry() -> Arc<MockTypesRegistry> {
             declaration(resource_group_sdk::gts_declarations(), RG_BASE),
         ),
         (
-            MEMBERSHIP_TYPE_V1,
-            declaration(resource_group_sdk::gts_declarations(), MEMBERSHIP_TYPE_V1),
+            GROUP_MEMBERSHIP_RESOURCE_TYPE,
+            declaration(
+                resource_group_sdk::gts_declarations(),
+                GROUP_MEMBERSHIP_RESOURCE_TYPE,
+            ),
         ),
         (
             USER_RESOURCE_TYPE,
@@ -117,7 +120,7 @@ async fn user_groups_nest_and_accept_only_user_memberships() {
     group
         .validate(&json!({
             "parent_type": null,
-            "membership_type": "gts.cf.core.rg.membership.v1~cf.test.am.other_member.v1~"
+            "membership_type": "gts.cf.core.rg.group_membership.v1~cf.test.am.other_member.v1~"
         }))
         .expect_err("membership_type is not a group payload field");
     group

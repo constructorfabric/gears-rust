@@ -709,7 +709,7 @@ mod no_seed_startup_tests {
         // rely on (the seeded inventory would mask an omission).
         for id in [
             USER_GROUP_RG_TYPE_CODE,
-            toolkit_gts::gts_id!("cf.core.rg.membership.v1~cf.core.am.user_group_member.v1~"),
+            toolkit_gts::gts_id!("cf.core.rg.group_membership.v1~cf.core.am.user_group_member.v1~"),
         ] {
             assert!(
                 manifest

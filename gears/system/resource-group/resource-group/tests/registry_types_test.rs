@@ -120,7 +120,10 @@ async fn creating_a_group_needs_its_bound_membership_schema() {
         .rsplit_once('~')
         .expect("a derived RG type code")
         .1;
-    let bound = format!("{}{suffix}~", resource_group_sdk::gts::MEMBERSHIP_TYPE_V1);
+    let bound = format!(
+        "{}{suffix}~",
+        resource_group_sdk::gts::GROUP_MEMBERSHIP_RESOURCE_TYPE
+    );
     common::delete_published_type(&bound);
     let before = dictionary_rows(&db).await;
 

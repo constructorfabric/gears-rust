@@ -19,9 +19,9 @@ use types_registry_sdk::{
 
 mod common;
 
-const MEMBER_V1: &str = gts_id!("cf.core.rg.membership.v1~");
+const MEMBER_V1: &str = gts_id!("cf.core.rg.group_membership.v1~");
 const TEAM_SCHEMA: &str = gts_id!("cf.core.rg.type.v1~cf.test.rg.team.v1~");
-const TEAM_MEMBER: &str = gts_id!("cf.core.rg.membership.v1~cf.test.rg.team_member.v1~");
+const TEAM_MEMBER: &str = gts_id!("cf.core.rg.group_membership.v1~cf.test.rg.team_member.v1~");
 const BASE: &str = gts_id!("cf.core.rg.type.v1~");
 const USER: &str = gts_id!("cf.test.rg.user.v1~");
 const TENANT: &str = gts_id!("cf.core.rg.type.v1~cf.test.rg.tenant.v1~");
@@ -270,7 +270,7 @@ async fn existing_and_new_groups_resolve_the_current_membership_schema() {
         )
         .await
         .expect("team root");
-    let replacement = gts_id!("cf.core.rg.membership.v1~cf.test.rg.groups_only.v1~");
+    let replacement = gts_id!("cf.core.rg.group_membership.v1~cf.test.rg.groups_only.v1~");
     registry.seed(
         replacement,
         json!({
