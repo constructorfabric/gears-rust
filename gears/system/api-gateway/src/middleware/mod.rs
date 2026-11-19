@@ -1,5 +1,6 @@
 pub mod access_log;
 pub mod auth;
+pub mod client_ip;
 pub mod common;
 pub mod errors;
 pub mod http_metrics;

@@ -4,7 +4,9 @@ use super::*;
 use crate::config::{KeyConfig, RateSpec};
 use axum::Router;
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::routing::get;
+use std::net::SocketAddr;
 use std::time::Duration;
 use tower::ServiceExt;
 

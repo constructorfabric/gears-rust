@@ -15,7 +15,10 @@ use toolkit_security::SecurityContext;
 
 use crate::config::TokenCacheConfig;
 use crate::domain::error::DomainError;
-use crate::domain::model::{PassthroughMode, PathSuffixMode, ResponseHeaderRules, Upstream};
+use crate::domain::model::{
+    PassthroughMode, PathSuffixMode, ProxyTarget, RateLimitConfig, ResponseHeaderRules,
+    ShadowedRouteLimit, Upstream,
+};
 use crate::domain::plugin::{
     AuthContext, GuardContext, GuardDecision, PluginError, TransformErrorContext,
     TransformRequestContext, TransformResponseContext,
@@ -24,7 +27,8 @@ use crate::domain::ports::OagwMetricsPort;
 use crate::domain::ports::metric_labels::{self, phase};
 use crate::domain::proxy_path::canonical_path;
 use crate::domain::rate_limit::{
-    RateLimitKeyContext, RateLimitOutcome, RateLimitResource, RateLimiter, build_rate_limit_key,
+    RateLimitKeyContext, RateLimitOutcome, RateLimitResource, RateLimiter, build_pool_key,
+    build_rate_limit_key, pool_config,
 };
 use crate::domain::repo::Tags;
 use crate::domain::route_matching::path_after_route_prefix;
@@ -376,6 +380,9 @@ struct ParsedRequest {
     is_upgrade: bool,
     body_bytes: Bytes,
     body_stream: Option<BodyStream>,
+    /// Client address from the API gateway's `ClientIp` extension; `None`
+    /// for requests that did not come through it (in-process SDK calls).
+    client_ip: Option<std::net::IpAddr>,
 }
 
 /// Decompose and validate an inbound proxy request.
@@ -420,6 +427,10 @@ fn parse_proxy_request(
     let (parts, body) = req.into_parts();
     let method = parts.method;
     let req_headers = parts.headers;
+    let client_ip = parts
+        .extensions
+        .get::<toolkit::http::ClientIp>()
+        .map(|ip| ip.0);
 
     let is_upgrade = headers::is_websocket_upgrade(&req_headers);
 
@@ -458,6 +469,7 @@ fn parse_proxy_request(
         is_upgrade,
         body_bytes,
         body_stream,
+        client_ip,
     })
 }
 
@@ -694,6 +706,7 @@ impl DataPlaneServiceImpl {
                 is_upgrade,
                 body_bytes,
                 body_stream,
+                client_ip,
             } = parse_proxy_request(req, self.max_body_size)?;
 
             let max_body = self.max_body_size;
@@ -709,7 +722,11 @@ impl DataPlaneServiceImpl {
                 .resolve_proxy_target(&grant, &alias, method.as_ref(), &path_suffix, Tags::Skip)
                 .await;
             let resolve_seconds = resolve_start.elapsed().as_secs_f64();
-            let (upstream, route) = match resolved {
+            let ProxyTarget {
+                upstream,
+                route,
+                shadowed_route_limits,
+            } = match resolved {
                 Ok(target) => target,
                 Err(e) => {
                     self.metrics.record_request_duration_seconds(
@@ -946,12 +963,14 @@ impl DataPlaneServiceImpl {
 
         headers::set_host_header(&mut outbound_headers, endpoint);
 
-        // 7. Check rate limits (upstream then route) with scope-aware keying.
+        // 7. Check rate limits (upstream, shadowed routes, route) with
+        //    scope-aware keying.
         let rate_limit_outcome = check_rate_limits(
             &self.rate_limiter,
             &upstream,
             &route,
-            &req_headers,
+            &shadowed_route_limits,
+            client_ip,
             ctx,
             &instance_uri,
             self.metrics.as_ref(),
@@ -1588,8 +1607,19 @@ fn enforce_cors_origin(
 
 /// Check rate limits for both upstream and route, returning the tightest outcome.
 ///
-/// Both upstream and route buckets are decremented unconditionally — an upstream
-/// token is spent even when a stricter route-level bucket later causes rejection.
+/// Buckets are checked narrowest first: the route's bucket (the route's own
+/// limit), the bucket of each shadowed ancestor route with an enforced limit
+/// (`shadowed` is root-first and is walked closest-first; keyed and scoped as
+/// if that route had matched), the upstream's scoped bucket (the
+/// tenant-merged upstream limit), then the shared budget's pool bucket when
+/// the limit draws on one. Each passed bucket stays decremented, as there is
+/// no refund, so a wider bucket is charged only once every narrower one
+/// admitted the request: a tenant calling a route it has used up does not
+/// drain its upstream bucket or the pool its sibling tenants draw on. A
+/// rejection reports the rejecting bucket's numbers and `Retry-After`.
+///
+/// `client_ip` is the address the API gateway resolved (`ClientIp`); `None`
+/// keys `scope: ip` limits on the shared `unknown` bucket.
 ///
 /// Side effect: updates `rate_limit_usage_ratio` and (on rejection)
 /// `rate_limit_exceeded_total` metrics via the injected port.
@@ -1598,7 +1628,8 @@ fn check_rate_limits(
     rate_limiter: &RateLimiter,
     upstream: &Upstream,
     route: &crate::domain::model::Route,
-    req_headers: &HeaderMap,
+    shadowed: &[ShadowedRouteLimit],
+    client_ip: Option<std::net::IpAddr>,
     ctx: &SecurityContext,
     instance_uri: &str,
     metrics: &dyn OagwMetricsPort,
@@ -1606,82 +1637,91 @@ fn check_rate_limits(
     path_label: &str,
 ) -> Result<Option<(RateLimitOutcome, bool)>, DomainError> {
     let mut outcome: Option<(RateLimitOutcome, bool)> = None;
-    let client_ip = headers::extract_client_ip(req_headers);
-    let client_ip_ref = client_ip.as_deref();
     let tenant_id = ctx.subject_tenant_id();
     let subject_id = ctx.subject_id();
 
-    let record_consume_result = |result: &Result<RateLimitOutcome, DomainError>| match result {
-        Ok(outcome) if outcome.limit > 0 => {
-            let used = outcome.limit.saturating_sub(outcome.remaining) as f64;
-            let ratio = used / outcome.limit as f64;
-            metrics.record_rate_limit_usage_ratio(host_label, path_label, ratio);
+    let mut consume = |key: &str, rl: &RateLimitConfig| -> Result<(), DomainError> {
+        let raw = rate_limiter.try_consume(key, rl, instance_uri);
+        match &raw {
+            Ok(o) if o.limit > 0 => {
+                let used = o.limit.saturating_sub(o.remaining) as f64;
+                let ratio = used / o.limit as f64;
+                metrics.record_rate_limit_usage_ratio(host_label, path_label, ratio);
+            }
+            Ok(_) => {}
+            Err(DomainError::RateLimitExceeded { .. }) => {
+                metrics.record_rate_limit_exceeded(host_label, path_label);
+                metrics.record_rate_limit_usage_ratio(host_label, path_label, 1.0);
+            }
+            Err(_) => {}
         }
-        Ok(_) => {}
-        Err(DomainError::RateLimitExceeded { .. }) => {
-            metrics.record_rate_limit_exceeded(host_label, path_label);
-            metrics.record_rate_limit_usage_ratio(host_label, path_label, 1.0);
-        }
-        Err(_) => {}
+        let result = raw?;
+        // The tighter bucket's numbers are reported; on a tie the earlier
+        // one stays. Headers are sent if any checked limit enables them.
+        outcome = match outcome {
+            Some((existing, shown)) if existing.remaining <= result.remaining => {
+                Some((existing, shown || rl.response_headers))
+            }
+            previous => Some((
+                result,
+                rl.response_headers || previous.is_some_and(|(_, shown)| shown),
+            )),
+        };
+        Ok(())
     };
 
-    if let Some(ref rl) = upstream.rate_limit {
-        // For shared-pool budgets, use the pool owner's ID so all children
-        // sharing the pool consume from the same token bucket.
-        let effective_resource_id = rl.pool_owner_id.as_ref().unwrap_or(&upstream.id);
-        // Tenants on one upstream (or one shared pool) can resolve different
-        // limits (another tenant's `private` one is not theirs): the bucket
-        // names whose limit it is when that is not the key's resource, else
-        // one tenant's requests would reset the other's bucket. Tenants that
-        // inherit the pool owner's limit keep sharing its bucket.
-        let limit_owner = rl
-            .limit_owner_id
-            .as_ref()
-            .filter(|owner| *owner != effective_resource_id);
-        let key = build_rate_limit_key(&RateLimitKeyContext {
-            resource: RateLimitResource::Upstream,
-            resource_id: effective_resource_id,
-            limit_owner,
-            scope: &rl.scope,
-            tenant_id: &tenant_id,
-            subject_id: &subject_id,
-            client_ip: client_ip_ref,
-            window: &rl.sustained.window,
-        });
-        let raw = rate_limiter.try_consume(&key, rl, instance_uri);
-        record_consume_result(&raw);
-        let result = raw?;
-        outcome = Some((result, rl.response_headers));
-    }
-
-    if let Some(ref rl) = route.rate_limit {
+    let route_limits = route
+        .rate_limit
+        .as_ref()
+        .map(|rl| (&route.id, rl))
+        .into_iter()
+        .chain(shadowed.iter().rev().map(|s| (&s.route_id, &s.rate_limit)));
+    for (route_id, rl) in route_limits {
         let key = build_rate_limit_key(&RateLimitKeyContext {
             resource: RateLimitResource::Route,
-            resource_id: &route.id,
+            resource_id: route_id,
             limit_owner: None,
             scope: &rl.scope,
             tenant_id: &tenant_id,
             subject_id: &subject_id,
-            client_ip: client_ip_ref,
+            route_id,
+            client_ip,
             window: &rl.sustained.window,
         });
-        let raw = rate_limiter.try_consume(&key, rl, instance_uri);
-        record_consume_result(&raw);
-        let result = raw?;
-        match &outcome {
-            Some((existing, show_headers)) if existing.remaining <= result.remaining => {
-                // Tighter (or equal) bucket wins for enforcement; on ties
-                // upstream wins — both remaining counts are identical so the
-                // allow/reject decision is the same either way. OR the header
-                // flags so headers are emitted if either scope enables them.
-                if rl.response_headers && !show_headers {
-                    outcome = outcome.map(|(o, _)| (o, true));
-                }
-            }
-            _ => {
-                let prev_headers = outcome.as_ref().is_some_and(|(_, h)| *h);
-                outcome = Some((result, rl.response_headers || prev_headers));
-            }
+        consume(&key, rl)?;
+    }
+
+    if let Some(ref rl) = upstream.rate_limit {
+        // A shared budget keys the scoped bucket on the pool owner, so
+        // children binding the alias themselves count as one upstream.
+        let resource_id = rl
+            .shared_pool
+            .as_ref()
+            .map_or(&upstream.id, |p| &p.owner_id);
+        // Tenants on one upstream (or one shared pool) can resolve different
+        // limits (another tenant's `private` one is not theirs): the bucket
+        // names whose limit it is when that is not the key's resource, else
+        // one tenant's requests would consume another limit's bucket. Tenants
+        // that inherit the pool owner's limit keep sharing its bucket.
+        let limit_owner = rl
+            .limit_owner_id
+            .as_ref()
+            .filter(|owner| *owner != resource_id);
+        let key = build_rate_limit_key(&RateLimitKeyContext {
+            resource: RateLimitResource::Upstream,
+            resource_id,
+            limit_owner,
+            scope: &rl.scope,
+            tenant_id: &tenant_id,
+            subject_id: &subject_id,
+            route_id: &route.id,
+            client_ip,
+            window: &rl.sustained.window,
+        });
+        consume(&key, rl)?;
+
+        if let Some(ref pool) = rl.shared_pool {
+            consume(&build_pool_key(pool), &pool_config(pool, rl))?;
         }
     }
 
@@ -2430,10 +2470,16 @@ mod tests {
                 _: &str,
                 _: &str,
                 _: Tags,
-            ) -> Result<(Upstream, Route), DomainError> {
-                self.0
+            ) -> Result<ProxyTarget, DomainError> {
+                let (upstream, route) = self
+                    .0
                     .clone()
-                    .ok_or_else(|| DomainError::not_found("upstream", Uuid::nil()))
+                    .ok_or_else(|| DomainError::not_found("upstream", Uuid::nil()))?;
+                Ok(ProxyTarget {
+                    upstream,
+                    route,
+                    shadowed_route_limits: Vec::new(),
+                })
             }
         }
 
@@ -2693,7 +2739,7 @@ mod tests {
             strategy: RateLimitStrategy::Reject,
             cost: 1,
             response_headers: false,
-            pool_owner_id: None,
+            shared_pool: None,
             limit_owner_id: None,
         }
     }
@@ -2719,6 +2765,358 @@ mod tests {
         .await
         .expect("the sweep evicts the refilled bucket");
         sweep.abort();
+    }
+
+    // -- check_rate_limits --
+
+    fn limit(
+        rate: u32,
+        window: crate::domain::model::Window,
+        scope: crate::domain::model::RateLimitScope,
+    ) -> RateLimitConfig {
+        use crate::domain::model::{RateLimitAlgorithm, RateLimitStrategy, SustainedRate};
+        RateLimitConfig {
+            sharing: Default::default(),
+            algorithm: RateLimitAlgorithm::TokenBucket,
+            sustained: SustainedRate { rate, window },
+            burst: None,
+            budget: None,
+            scope,
+            strategy: RateLimitStrategy::Reject,
+            cost: 1,
+            response_headers: true,
+            shared_pool: None,
+            limit_owner_id: None,
+        }
+    }
+
+    fn route_on(
+        upstream: &Upstream,
+        rate_limit: Option<RateLimitConfig>,
+    ) -> crate::domain::model::Route {
+        use crate::domain::model::{MatchRules, Route};
+        Route {
+            id: Uuid::new_v4(),
+            tenant_id: upstream.tenant_id,
+            upstream_id: upstream.id,
+            match_rules: MatchRules {
+                http: None,
+                grpc: None,
+            },
+            plugins: None,
+            rate_limit,
+            cors: None,
+            tags: vec![],
+            priority: 0,
+            enabled: true,
+            managed_by: ManagedBy::Api,
+        }
+    }
+
+    /// Whether each request passes, in order.
+    fn admitted<'a>(
+        limiter: &RateLimiter,
+        upstream: &Upstream,
+        requests: impl IntoIterator<
+            Item = (
+                &'a crate::domain::model::Route,
+                Option<std::net::IpAddr>,
+                &'a SecurityContext,
+            ),
+        >,
+    ) -> Vec<bool> {
+        requests
+            .into_iter()
+            .map(
+                |(route, ip, ctx)| match check(limiter, upstream, route, &[], ip, ctx) {
+                    Ok(_) => true,
+                    Err(DomainError::RateLimitExceeded { .. }) => false,
+                    Err(other) => panic!("unexpected error: {other:?}"),
+                },
+            )
+            .collect()
+    }
+
+    fn check(
+        limiter: &RateLimiter,
+        upstream: &Upstream,
+        route: &crate::domain::model::Route,
+        shadowed: &[ShadowedRouteLimit],
+        ip: Option<std::net::IpAddr>,
+        ctx: &SecurityContext,
+    ) -> Result<Option<(RateLimitOutcome, bool)>, DomainError> {
+        check_rate_limits(
+            limiter,
+            upstream,
+            route,
+            shadowed,
+            ip,
+            ctx,
+            "/t",
+            &crate::domain::ports::NoopMetrics,
+            "h",
+            "/p",
+        )
+    }
+
+    /// The address comes from the gateway's `ClientIp` extension only:
+    /// forwarding headers the client sent are not read.
+    #[test]
+    fn the_client_ip_comes_from_the_gateway_extension() {
+        let mut req = http::Request::builder()
+            .uri("/alias/v1")
+            .header("x-forwarded-for", "203.0.113.7")
+            .header("x-real-ip", "198.51.100.9")
+            .body(Body::Empty)
+            .unwrap();
+        let parsed = parse_proxy_request(req, 1024).unwrap();
+        assert_eq!(parsed.client_ip, None);
+
+        req = http::Request::builder()
+            .uri("/alias/v1")
+            .header("x-forwarded-for", "203.0.113.7")
+            .body(Body::Empty)
+            .unwrap();
+        let ip: std::net::IpAddr = "192.0.2.10".parse().unwrap();
+        req.extensions_mut().insert(toolkit::http::ClientIp(ip));
+        assert_eq!(parse_proxy_request(req, 1024).unwrap().client_ip, Some(ip));
+    }
+
+    #[test]
+    fn ip_scope_keys_on_the_resolved_address() {
+        use crate::domain::model::{RateLimitScope, Window};
+        let mut upstream = upstream_with(vec![]);
+        upstream.rate_limit = Some(limit(1, Window::Minute, RateLimitScope::Ip));
+        let route = route_on(&upstream, None);
+        let ctx = test_ctx();
+        let (a, b) = ("192.0.2.1".parse().ok(), "192.0.2.2".parse().ok());
+        let limiter = RateLimiter::new();
+        let requests = [a, a, b, None, None].map(|ip| (&route, ip, &ctx));
+        assert_eq!(
+            admitted(&limiter, &upstream, requests),
+            [true, false, true, true, false]
+        );
+    }
+
+    /// `scope: route` on an upstream limit gives every route its own bucket.
+    #[test]
+    fn upstream_scope_route_is_per_route() {
+        use crate::domain::model::{RateLimitScope, Window};
+        let mut upstream = upstream_with(vec![]);
+        upstream.rate_limit = Some(limit(1, Window::Minute, RateLimitScope::Route));
+        let (first, second) = (route_on(&upstream, None), route_on(&upstream, None));
+        let ctx = test_ctx();
+        let limiter = RateLimiter::new();
+        let requests = [&first, &second, &first, &second].map(|r| (r, None, &ctx));
+        assert_eq!(
+            admitted(&limiter, &upstream, requests),
+            [true, true, false, false]
+        );
+    }
+
+    /// Route limits are checked on the route buckets; the upstream bucket
+    /// keeps its own limit whichever route is called, so alternating routes
+    /// does not refill it.
+    #[test]
+    fn alternating_routes_do_not_refill_the_upstream_bucket() {
+        use crate::domain::model::{RateLimitScope, Window};
+        let mut upstream = upstream_with(vec![]);
+        upstream.rate_limit = Some(limit(2, Window::Minute, RateLimitScope::Tenant));
+        let first = route_on(
+            &upstream,
+            Some(limit(10, Window::Hour, RateLimitScope::Tenant)),
+        );
+        let second = route_on(
+            &upstream,
+            Some(limit(20, Window::Hour, RateLimitScope::Tenant)),
+        );
+        let ctx = test_ctx();
+        let limiter = RateLimiter::new();
+        let requests = [&first, &second, &first, &second].map(|r| (r, None, &ctx));
+        assert_eq!(
+            admitted(&limiter, &upstream, requests),
+            [true, true, false, false]
+        );
+    }
+
+    /// A child's route that shadows the parent's route is limited by the
+    /// parent route's enforced limit on the parent route's own bucket, the
+    /// one a request matching the parent route uses. The upstream bucket
+    /// keeps the upstream's limit.
+    #[test]
+    fn a_shadowed_enforced_route_limit_uses_its_own_bucket() {
+        use crate::domain::model::{RateLimitScope, SharingMode, Window};
+        let mut upstream = upstream_with(vec![]);
+        upstream.rate_limit = Some(limit(100, Window::Minute, RateLimitScope::Tenant));
+        let child_route = route_on(
+            &upstream,
+            Some(limit(50, Window::Minute, RateLimitScope::Tenant)),
+        );
+        let other_route = route_on(&upstream, None);
+        let mut enforced = limit(2, Window::Minute, RateLimitScope::Tenant);
+        enforced.sharing = SharingMode::Enforce;
+        let parent_upstream = upstream_with(vec![]);
+        let parent_route = route_on(&parent_upstream, Some(enforced.clone()));
+        let shadowed = [ShadowedRouteLimit {
+            route_id: parent_route.id,
+            rate_limit: enforced,
+        }];
+        let ctx = test_ctx();
+        let limiter = RateLimiter::new();
+
+        for remaining in [1, 0] {
+            let (outcome, shown) = check(&limiter, &upstream, &child_route, &shadowed, None, &ctx)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (outcome.limit, outcome.remaining, shown),
+                (2, remaining, true)
+            );
+        }
+        match check(&limiter, &upstream, &child_route, &shadowed, None, &ctx) {
+            Err(DomainError::RateLimitExceeded {
+                limit,
+                remaining,
+                retry_after_secs,
+                ..
+            }) => {
+                assert_eq!((limit, remaining), (Some(2), Some(0)));
+                assert!(retry_after_secs.is_some_and(|s| s > 0));
+            }
+            other => panic!("expected RateLimitExceeded, got {other:?}"),
+        }
+
+        // The parent route's bucket is the one its own requests use.
+        assert!(matches!(
+            check(&limiter, &upstream, &parent_route, &[], None, &ctx),
+            Err(DomainError::RateLimitExceeded { .. })
+        ));
+
+        // The upstream bucket kept its limit of 100, drawn on only by the
+        // three admitted requests: route buckets are checked first.
+        let (outcome, _) = check(&limiter, &upstream, &other_route, &[], None, &ctx)
+            .unwrap()
+            .unwrap();
+        assert_eq!((outcome.limit, outcome.remaining), (100, 97));
+    }
+
+    /// A request a route limit rejects is not charged to the upstream bucket
+    /// or the shared pool: a tenant calling a route it has used up leaves the
+    /// pool to its siblings.
+    #[test]
+    fn a_route_rejection_does_not_charge_the_upstream_or_the_pool() {
+        use crate::domain::model::{RateLimitAlgorithm, RateLimitScope, SharedPool, Window};
+        let mut upstream = upstream_with(vec![]);
+        let mut rl = limit(3, Window::Minute, RateLimitScope::Tenant);
+        rl.shared_pool = Some(SharedPool {
+            owner_id: Uuid::new_v4(),
+            total: 3,
+            window: Window::Minute,
+            algorithm: RateLimitAlgorithm::TokenBucket,
+        });
+        upstream.rate_limit = Some(rl);
+        let used_up = route_on(
+            &upstream,
+            Some(limit(1, Window::Minute, RateLimitScope::Tenant)),
+        );
+        let open = route_on(&upstream, None);
+        let (a, b) = (test_ctx(), test_ctx());
+        let limiter = RateLimiter::new();
+        let requests = [
+            (&used_up, None, &a),
+            (&used_up, None, &a),
+            (&used_up, None, &a),
+            (&open, None, &a),
+            (&open, None, &b),
+            (&open, None, &b),
+        ];
+        assert_eq!(
+            admitted(&limiter, &upstream, requests),
+            [true, false, false, true, true, false]
+        );
+    }
+
+    /// A shared budget adds one pool bucket of `total` per window for every
+    /// tenant drawing on it, next to each tenant's own bucket.
+    #[test]
+    fn a_shared_pool_is_drawn_on_by_every_tenant() {
+        use crate::domain::model::{RateLimitAlgorithm, RateLimitScope, SharedPool, Window};
+        let mut upstream = upstream_with(vec![]);
+        let mut rl = limit(100, Window::Minute, RateLimitScope::Tenant);
+        rl.shared_pool = Some(SharedPool {
+            owner_id: Uuid::new_v4(),
+            total: 3,
+            window: Window::Minute,
+            algorithm: RateLimitAlgorithm::TokenBucket,
+        });
+        upstream.rate_limit = Some(rl);
+        let route = route_on(&upstream, None);
+        let (a, b) = (test_ctx(), test_ctx());
+        let limiter = RateLimiter::new();
+        let requests = [&a, &b, &a, &b].map(|ctx| (&route, None, ctx));
+        assert_eq!(
+            admitted(&limiter, &upstream, requests),
+            [true, true, true, false]
+        );
+
+        // Without the pool each tenant has its own 100.
+        let limiter = RateLimiter::new();
+        upstream.rate_limit.as_mut().unwrap().shared_pool = None;
+        let requests = [&a, &b, &a, &b].map(|ctx| (&route, None, ctx));
+        assert_eq!(admitted(&limiter, &upstream, requests), [true; 4]);
+    }
+
+    /// A tenant held to another upstream's limit on this upstream uses a
+    /// bucket of its own (`via:{owner}`), not the one the upstream's own limit
+    /// fills. Under a shared pool the scoped bucket is keyed on the pool
+    /// owner: tenants that inherit the owner's limit share it, a tenant whose
+    /// own limit applies gets its own.
+    #[test]
+    fn a_borrowed_limit_does_not_use_the_owners_bucket() {
+        use crate::domain::model::{RateLimitAlgorithm, RateLimitScope, SharedPool, Window};
+        let mut own = upstream_with(vec![]);
+        let mut rl = limit(1, Window::Minute, RateLimitScope::Global);
+        rl.limit_owner_id = Some(own.id);
+        own.rate_limit = Some(rl);
+        let mut borrowed = own.clone();
+        let mut rl = limit(100, Window::Minute, RateLimitScope::Global);
+        rl.limit_owner_id = Some(Uuid::new_v4());
+        borrowed.rate_limit = Some(rl);
+        let route = route_on(&own, None);
+        let ctx = test_ctx();
+        let limiter = RateLimiter::new();
+        // In one bucket the borrowed request would use up the owner's 1/min.
+        let calls = [&borrowed, &own, &own, &borrowed]
+            .map(|u| check(&limiter, u, &route, &[], None, &ctx).is_ok());
+        assert_eq!(calls, [true, true, false, true]);
+
+        let pool_owner = Uuid::new_v4();
+        let pool = Some(SharedPool {
+            owner_id: pool_owner,
+            total: 100,
+            window: Window::Minute,
+            algorithm: RateLimitAlgorithm::TokenBucket,
+        });
+        // Two tenants inheriting the pool owner's 1/min share its bucket.
+        let mut first = own.clone();
+        let mut second = own.clone();
+        second.id = Uuid::new_v4();
+        // A tenant whose own 1/min applies keys `via` itself.
+        let mut private = own.clone();
+        for (u, owner) in [
+            (&mut first, pool_owner),
+            (&mut second, pool_owner),
+            (&mut private, Uuid::new_v4()),
+        ] {
+            let rl = u.rate_limit.as_mut().unwrap();
+            rl.sustained.rate = 1;
+            rl.shared_pool = pool;
+            rl.limit_owner_id = Some(owner);
+        }
+        let limiter = RateLimiter::new();
+        let calls = [&first, &second, &private]
+            .map(|u| check(&limiter, u, &route, &[], None, &ctx).is_ok());
+        assert_eq!(calls, [true, false, true]);
     }
 
     /// Keeps only the request-duration observations.

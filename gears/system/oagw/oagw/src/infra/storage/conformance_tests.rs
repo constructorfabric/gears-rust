@@ -261,7 +261,7 @@ fn rate_limit() -> RateLimitConfig {
         cost: 2,
         response_headers: false,
         // Merge-time only, never stored.
-        pool_owner_id: None,
+        shared_pool: None,
         limit_owner_id: None,
     }
 }

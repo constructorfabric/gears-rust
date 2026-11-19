@@ -447,7 +447,7 @@ Sub:  alias "api.openai.com" (shadows root)
 Effective for sub: min(root.enforced:10000, sub:500) = 500
 ```
 
-The same holds for routes: when a descendant's route matches a request that an ancestor's route on the shadowed upstream would also match, the ancestor route's enforced plugins still apply, ahead of anything the descendant sets: a descendant that enforces the same plugin on its own upstream does not replace the ancestor route's config. The ancestor route's enforced rate limit is not yet applied across route shadowing.
+The same holds for routes: when a descendant's route matches a request that an ancestor's route on the shadowed upstream would also match, the ancestor route's enforced plugins still apply, ahead of anything the descendant sets: a descendant that enforces the same plugin on its own upstream does not replace the ancestor route's config. The ancestor route's enforced rate limit is checked on that route's own bucket, as if the request had matched it.
 
 - **Rationale**: Provides human-readable proxy URLs while supporting multi-tenant isolation and override semantics.
 - **Actors**: `cpt-cf-oagw-actor-app-developer`, `cpt-cf-oagw-actor-platform-operator`

@@ -22,8 +22,8 @@ use std::net::SocketAddr;
 
 use crate::domain::error::DomainError;
 use crate::domain::model::{
-    CreateRouteRequest, CreateUpstreamRequest, Endpoint, ListQuery, Route, UpdateRouteRequest,
-    UpdateUpstreamRequest, Upstream,
+    CreateRouteRequest, CreateUpstreamRequest, Endpoint, ListQuery, ProxyTarget, Route,
+    UpdateRouteRequest, UpdateUpstreamRequest, Upstream,
 };
 use crate::domain::repo::{DeleteOutcome, Tags};
 
@@ -103,10 +103,13 @@ pub(crate) trait ControlPlaneService: Send + Sync {
         method: &str,
         path: &str,
         tags: Tags,
-    ) -> Result<(Upstream, Route), DomainError>;
+    ) -> Result<ProxyTarget, DomainError>;
 
     /// [`Self::resolve_proxy_target`] for an SDK client, which gets the
     /// configuration back: checks `read` on upstreams and routes first.
+    /// Returns [`ProxyTarget::upstream`] and [`ProxyTarget::route`] only:
+    /// the enforced rate limits of the ancestor routes the route shadows,
+    /// which the proxy also checks, are not part of the answer.
     async fn resolve_proxy_target_for_client(
         &self,
         ctx: &SecurityContext,

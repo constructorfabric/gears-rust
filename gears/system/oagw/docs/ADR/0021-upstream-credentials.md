@@ -207,7 +207,7 @@ Keep the distinction between a gateway 429 and a provider 429. Preserve the prov
 
 An optional `rate_limit.requests_per_minute` is a positive u32. Without it, existing upstream and route limits still apply. Each replica shares the credential's bucket across its callers, as in [ADR-0004](0004-rate-limiting.md). A rate of 60 starts with capacity 60 and refills at one token per second. One admitted request costs one token.
 
-After authorization, eligibility and preflight handling, check the effective upstream bucket (including shared `pool_owner_id`), then credential, then route, before CredStore. Stop at the first rejection. Earlier buckets retain their debits, even if a later limiter or secret read fails. This intentionally counts attempts and prevents exhausted keys from loading CredStore.
+After authorization, eligibility and preflight handling, check the buckets narrowest first, as in [ADR-0004](0004-rate-limiting.md): route, then credential, then the effective upstream bucket, then the shared pool bucket (`shared_pool`), before CredStore. Stop at the first rejection. Earlier buckets retain their debits, even if a later limiter or secret read fails. This intentionally counts attempts and prevents exhausted keys from loading CredStore.
 
 On success report the smallest remaining count; the first bucket wins ties. Send rate headers if any participating policy enables them; the credential limit enables them. On rejection the rejecting bucket supplies its retry and rate headers.
 

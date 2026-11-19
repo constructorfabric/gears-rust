@@ -735,7 +735,7 @@ mod tests {
             strategy: RateLimitStrategy::Reject,
             cost: 1,
             response_headers: true,
-            pool_owner_id: None,
+            shared_pool: None,
             limit_owner_id: None,
         }
     }

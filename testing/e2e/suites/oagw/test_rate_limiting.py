@@ -296,12 +296,6 @@ async def test_route_level_limits_are_per_route(
 
 @pytest.mark.scenario("positive-18.3-rate-limit-scope-variants")
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="R-08: scope=route on an upstream-level limit acts as one bucket "
-           "for every route",
-)
 async def test_scope_route_on_upstream_limit(
     oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
 ):
@@ -317,6 +311,71 @@ async def test_scope_route_on_upstream_limit(
             for path in ("/v1/models", "/health", "/v1/models")
         ]
         assert statuses == [200, 200, 429]
+
+
+@pytest.mark.scenario("negative-18.8-spoofed-forwarding-headers-keep-the-ip-bucket")
+@pytest.mark.asyncio
+async def test_spoofed_forwarding_headers_keep_the_ip_bucket(
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
+):
+    """Scenario N18.8: `scope: ip` keys on the address the API gateway resolved.
+
+    The suite runs with `trusted_proxy_hops: 0`, so that is the connection's
+    peer address: a new `X-Forwarded-For` or `X-Real-IP` value on each
+    request does not open a fresh bucket.
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        alias, _ = await _limited_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, cleanup,
+            "rl-ip-spoof", _rl(1, scope="ip"),
+        )
+
+        first = await _get(
+            client, oagw_base_url, alias, {**oagw_headers, "x-forwarded-for": "198.51.100.1"},
+        )
+        assert first.status_code == 200, first.text[:300]
+        for spoofed in (
+            {"x-forwarded-for": "198.51.100.2"},
+            {"x-forwarded-for": "203.0.113.9, 198.51.100.3"},
+            {"x-real-ip": "198.51.100.4"},
+        ):
+            resp = await _get(client, oagw_base_url, alias, {**oagw_headers, **spoofed})
+            assert 55 <= _assert_rate_limited(resp) <= 60, spoofed
+            assert resp.headers.get(RL_LIMIT) == "1"
+            assert resp.headers.get(RL_REMAINING) == "0"
+
+
+@pytest.mark.scenario("positive-18.6-hierarchical-min-merge-descendant-overrides", part="B")
+@pytest.mark.asyncio
+async def test_alternating_routes_do_not_refill_the_upstream_bucket(
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
+):
+    """Scenario 18.6-B: route limits are checked on route buckets.
+
+    The two route limits are stricter per second than the upstream's 2/min
+    but differ in capacity. The upstream bucket keeps 2/min whichever route
+    is called, so the third request is refused by it (`limit` 2), not
+    admitted by a bucket rebuilt for the other route.
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        alias = unique_alias("rl-alt")
+        upstream = cleanup.upstream(oagw_headers, await create_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, alias=alias,
+            rate_limit=_rl(2),
+        ))
+        for path, rate in (("/v1/models", 10), ("/health", 20)):
+            await create_route(
+                client, oagw_base_url, oagw_headers, upstream["id"], ["GET"], path,
+                rate_limit=_rl(rate, window="hour", sharing="inherit"),
+            )
+
+        for path in ("/v1/models", "/health"):
+            resp = await _get(client, oagw_base_url, alias, oagw_headers, path)
+            assert resp.status_code == 200, f"{path}: {resp.text[:300]}"
+        resp = await _get(client, oagw_base_url, alias, oagw_headers, "/v1/models")
+        assert 25 <= _assert_rate_limited(resp) <= 30
+        assert resp.headers.get(RL_LIMIT) == "2"
+        assert resp.headers.get(RL_REMAINING) == "0"
 
 
 @pytest.mark.scenario("positive-18.4-weighted-cost-per-route")

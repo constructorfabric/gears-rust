@@ -51,6 +51,9 @@ def _rl(rate: int = 10, capacity: int = 10, **extra) -> dict:
     }
 
 
+_COST_OVER_BURST = "rate_limit.cost (6) must not exceed rate_limit.burst.capacity (5)"
+
+
 def _plugins(plugin_ref: str) -> dict:
     return {"items": [{"plugin_ref": plugin_ref}]}
 
@@ -125,6 +128,21 @@ def _case(case_id, part, body, expected):
             _format("rate_limit.burst.capacity must be at least 1"),
         ),
         _case("cost-0", "A", {"rate_limit": _rl(cost=0)}, _format("rate_limit.cost must be at least 1")),
+        _case(
+            "cost-over-burst", "A", {"rate_limit": _rl(capacity=5, cost=6)},
+            _format(_COST_OVER_BURST),
+        ),
+        _case(
+            "cost-over-rate", "A",
+            {"rate_limit": {k: v for k, v in _rl(rate=5, cost=6).items() if k != "burst"}},
+            _format("rate_limit.cost (6) must not exceed rate_limit.sustained.rate (5)"),
+        ),
+        _case(
+            "sliding-cost-over-rate", "A",
+            # A sliding window ignores `burst`.
+            {"rate_limit": _rl(rate=5, capacity=50, cost=6, algorithm="sliding_window")},
+            _format("rate_limit.cost (6) must not exceed rate_limit.sustained.rate (5)"),
+        ),
         _case(
             "unknown-auth-type", "C",
             {"auth": {"type": "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.nonexistent.v1"}},
@@ -231,6 +249,14 @@ async def test_alias_may_start_and_end_with_underscore(
             _format("rate_limit.sustained.rate must be at least 1"),
         ),
         _case(
+            "route-cost-over-burst", "B",
+            {
+                "match": {"http": {"methods": ["GET"], "path": "/v1"}},
+                "rate_limit": _rl(capacity=5, cost=6),
+            },
+            _format(_COST_OVER_BURST),
+        ),
+        _case(
             "unknown-route-transform", "C",
             {"match": {"http": {"methods": ["GET"], "path": "/v1"}}, "plugins": _plugins(_UNKNOWN_TRANSFORM)},
             _violation("plugins.items.plugin_ref", "NOT_IMPLEMENTED", "is not implemented"),
@@ -301,6 +327,15 @@ def _invalid_argument(context: dict, detail: str = "Request validation failed") 
                 detail="endpoint[0] port must be between 1 and 65535",
             ),
             id="format-error",
+            marks=pytest.mark.scenario(_SCENARIO, part="A"),
+        ),
+        pytest.param(
+            {"rate_limit": _rl(capacity=5, cost=6)},
+            _invalid_argument(
+                {"format": _COST_OVER_BURST, "resource_type": PROXY_SCHEMA},
+                detail=_COST_OVER_BURST,
+            ),
+            id="cost-over-capacity",
             marks=pytest.mark.scenario(_SCENARIO, part="A"),
         ),
         pytest.param(

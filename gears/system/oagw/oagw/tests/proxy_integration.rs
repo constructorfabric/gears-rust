@@ -5802,3 +5802,94 @@ async fn changing_a_rate_limit_drops_the_exhausted_bucket() {
     let response = h.facade().proxy_request(ctx.clone(), get()).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+/// Calling two routes in turn does not refill the upstream's bucket: each
+/// route's limit is checked on the route's bucket, and the upstream bucket
+/// keeps the upstream's limit whichever route matched.
+#[tokio::test]
+async fn alternating_routes_do_not_refill_the_upstream_bucket() {
+    let mut guard = MockGuard::new();
+    guard.mock(
+        "GET",
+        "/v1/embeddings",
+        MockResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: MockBody::Json(json!({"object": "list", "data": []})),
+        },
+    );
+    let h = AppHarness::builder().build().await;
+    let ctx = h.security_context().clone();
+    let limit = |rate, window| RateLimitConfig {
+        sharing: SharingMode::Inherit,
+        algorithm: RateLimitAlgorithm::TokenBucket,
+        sustained: SustainedRate { rate, window },
+        burst: None,
+        scope: RateLimitScope::Tenant,
+        strategy: RateLimitStrategy::Reject,
+        cost: 1,
+        response_headers: true,
+        budget: None,
+    };
+    let upstream = h
+        .facade()
+        .create_upstream(
+            ctx.clone(),
+            CreateUpstreamRequest::builder(
+                Server {
+                    endpoints: vec![Endpoint {
+                        scheme: Scheme::Http,
+                        host: "127.0.0.1".into(),
+                        port: h.mock_port(),
+                    }],
+                },
+                HTTP_PROTOCOL_ID,
+            )
+            .alias("rl-alternate")
+            .rate_limit(limit(2, Window::Minute))
+            .build(),
+        )
+        .await
+        .unwrap();
+    // Two route limits stricter per second than the upstream's, with
+    // different capacities: merged into the upstream's limit they used to
+    // reconfigure (and refill) its bucket on every switch.
+    let second_path = guard.path("/v1/embeddings");
+    for (path, rate) in [("/v1/models".to_owned(), 10), (second_path.clone(), 20)] {
+        h.facade()
+            .create_route(
+                ctx.clone(),
+                CreateRouteRequest::builder(
+                    upstream.id,
+                    MatchRules {
+                        http: Some(HttpMatch {
+                            methods: vec![HttpMethod::Get],
+                            path,
+                            query_allowlist: vec![],
+                            path_suffix_mode: PathSuffixMode::Append,
+                        }),
+                        grpc: None,
+                    },
+                )
+                .rate_limit(limit(rate, Window::Hour))
+                .build(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let mut admitted = Vec::new();
+    for path in ["/v1/models", second_path.as_str(), "/v1/models"] {
+        let req = http::Request::builder()
+            .method(Method::GET)
+            .uri(format!("/rl-alternate{path}"))
+            .body(Body::Empty)
+            .unwrap();
+        admitted.push(match h.facade().proxy_request(ctx.clone(), req).await {
+            Ok(resp) => resp.status() == StatusCode::OK,
+            Err(CanonicalError::ResourceExhausted { .. }) => false,
+            Err(err) => panic!("unexpected error: {err:?}"),
+        });
+    }
+    assert_eq!(admitted, [true, true, false]);
+}

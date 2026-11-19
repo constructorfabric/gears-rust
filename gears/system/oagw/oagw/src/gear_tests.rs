@@ -1234,7 +1234,7 @@ async fn resolve_served(
         Tags::Skip,
     )
     .await
-    .map(|(upstream, route)| (upstream.id, route.id))
+    .map(|target| (target.upstream.id, target.route.id))
 }
 
 /// Disable `tenant`'s upstream `id` in `db`, behind the gear's back.
@@ -1280,7 +1280,7 @@ async fn on_a_database_proxy_reads_are_cached_and_writes_evict() {
             Tags::Skip,
         )
         .await
-        .map(|(upstream, route)| (upstream.id, route.id))
+        .map(|target| (target.upstream.id, target.route.id))
     };
 
     let (upstream, route, server) = served_upstream(&*gw, ctx()).await;

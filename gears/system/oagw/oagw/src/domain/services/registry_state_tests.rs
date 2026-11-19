@@ -47,7 +47,7 @@ fn rate_limit(ratio: f64) -> RateLimitConfig {
         strategy: RateLimitStrategy::default(),
         cost: 1,
         response_headers: false,
-        pool_owner_id: None,
+        shared_pool: None,
         limit_owner_id: None,
     }
 }
@@ -69,7 +69,7 @@ fn headers(pairs: &[(&str, &str)]) -> HeadersConfig {
 }
 
 /// Listing order and `HashMap` order do not change the hash; content,
-/// tenant and ID do; `pool_owner_id` and `limit_owner_id` are not content.
+/// tenant and ID do; `shared_pool` and `limit_owner_id` are not content.
 ///
 /// ADR-0018: PERS-GATE-013.
 #[test]
@@ -89,7 +89,13 @@ fn the_content_hash_is_canonical() {
     assert_eq!(content_hash(&reordered, &routes, root), base);
 
     let mut owned = upstreams.clone();
-    owned[0].request.rate_limit.as_mut().unwrap().pool_owner_id = Some(Uuid::new_v4());
+    owned[0].request.rate_limit.as_mut().unwrap().shared_pool =
+        Some(crate::domain::model::SharedPool {
+            owner_id: Uuid::new_v4(),
+            total: 10,
+            window: crate::domain::model::Window::Minute,
+            algorithm: crate::domain::model::RateLimitAlgorithm::TokenBucket,
+        });
     owned[0].request.rate_limit.as_mut().unwrap().limit_owner_id = Some(Uuid::new_v4());
     assert_eq!(content_hash(&owned, &routes, root), base);
 
@@ -187,7 +193,7 @@ fn full_rate_limit() -> RateLimitConfig {
         strategy: RateLimitStrategy::Reject,
         cost: 1,
         response_headers: true,
-        pool_owner_id: None,
+        shared_pool: None,
         limit_owner_id: None,
     }
 }

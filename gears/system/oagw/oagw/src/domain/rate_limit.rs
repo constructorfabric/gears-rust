@@ -1,7 +1,10 @@
+use std::net::IpAddr;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::domain::error::DomainError;
-use crate::domain::model::{RateLimitAlgorithm, RateLimitConfig, RateLimitScope, Window};
+use crate::domain::model::{
+    RateLimitAlgorithm, RateLimitConfig, RateLimitScope, SharedPool, SustainedRate, Window,
+};
 use dashmap::DashMap;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
@@ -90,6 +93,12 @@ impl TokenBucket {
     fn is_at_rest(&mut self) -> bool {
         self.refill();
         self.tokens >= self.capacity
+    }
+
+    /// Tokens missing from a full bucket, now.
+    fn used(&mut self) -> f64 {
+        self.refill();
+        (self.capacity - self.tokens).max(0.0)
     }
 
     fn retry_after_secs(&self, cost: f64) -> u64 {
@@ -218,6 +227,19 @@ impl SlidingWindowBucket {
         self.total_count == 0
     }
 
+    /// Requests counted in the window, now.
+    fn used(&mut self) -> u32 {
+        self.advance();
+        self.total_count
+    }
+
+    /// Whether `config` keeps this bucket's sub-window grid.
+    fn same_window(&self, config: &RateLimitConfig) -> bool {
+        let n = sub_windows_for(&config.sustained.window);
+        self.num_sub_windows == n
+            && self.sub_window_nanos == window_to_nanos(&config.sustained.window) / n as u64
+    }
+
     /// Seconds until enough sub-windows expire to free `cost` capacity.
     fn retry_after_secs(&self, cost: u32) -> u64 {
         let needed = (self.total_count + cost).saturating_sub(self.limit);
@@ -269,6 +291,43 @@ impl Bucket {
         }
     }
 
+    /// Adopt `config` without giving back what was consumed: a sliding
+    /// window on the same grid takes the new limit in place; otherwise the
+    /// new bucket starts with the old one's usage (tokens missing from a
+    /// full token bucket, requests counted in a window) already taken.
+    ///
+    /// Usage above the new capacity is kept as a debt (negative tokens, a
+    /// count above the limit) rather than forgiven, so switching back and
+    /// forth between two configs never gains a request.
+    ///
+    /// Usage carried into a new sliding window (from a token bucket or
+    /// another window) is counted in the current sub-window, so it ages out
+    /// a full window from now, not on the old bucket's schedule.
+    fn reconfigure(&mut self, config: &RateLimitConfig, grid_anchor: Instant) {
+        if let (Bucket::Sliding(sw), RateLimitAlgorithm::SlidingWindow) =
+            (&mut *self, config.algorithm)
+            && sw.same_window(config)
+        {
+            sw.limit = config.sustained.rate;
+            return;
+        }
+        let used = match self {
+            Bucket::Token(tb) => tb.used(),
+            Bucket::Sliding(sw) => f64::from(sw.used()),
+        };
+        let mut fresh = Bucket::new(config, grid_anchor);
+        match &mut fresh {
+            Bucket::Token(tb) => tb.tokens = tb.capacity - used,
+            Bucket::Sliding(sw) => {
+                // `used` is at most an old capacity or count, both `u32`.
+                let count = used.ceil() as u32;
+                sw.counters[sw.current_index] = count;
+                sw.total_count = count;
+            }
+        }
+        *self = fresh;
+    }
+
     /// Returns `true` if this bucket's algorithm and parameters match `config`.
     fn matches_config(&self, config: &RateLimitConfig) -> bool {
         match (self, &config.algorithm) {
@@ -311,9 +370,8 @@ pub struct RateLimitKeyContext<'a> {
     pub resource: RateLimitResource,
     /// ID of the owning upstream or route.
     pub resource_id: &'a Uuid,
-    /// Upstream (or route) whose limit is in effect, when not `resource_id`:
-    /// keeps apart the buckets of tenants that resolve different limits on
-    /// one upstream.
+    /// Upstream whose limit is in effect, when not `resource_id`: keeps apart
+    /// the buckets of tenants that resolve different limits on one upstream.
     pub limit_owner: Option<&'a Uuid>,
     /// Configured rate-limit scope, which decides which identity parts form the key.
     pub scope: &'a RateLimitScope,
@@ -321,8 +379,10 @@ pub struct RateLimitKeyContext<'a> {
     pub tenant_id: &'a Uuid,
     /// Calling subject, used for per-user scoped keys.
     pub subject_id: &'a Uuid,
-    /// Client IP address, used for per-IP scoped keys when known.
-    pub client_ip: Option<&'a str>,
+    /// Matched route, used for per-route scoped keys.
+    pub route_id: &'a Uuid,
+    /// Client address the API gateway resolved, used for per-IP scoped keys.
+    pub client_ip: Option<IpAddr>,
     /// Rate-limit window length; part of the key so different windows do not share buckets.
     pub window: &'a Window,
 }
@@ -342,10 +402,10 @@ pub struct RateLimitKeyContext<'a> {
 /// (e.g. `minute:202601301530`).
 ///
 /// **IP scope fallback:** When `scope` is `Ip` and `client_ip` is `None`
-/// (i.e. neither `X-Forwarded-For` nor `X-Real-IP` headers are present), the
-/// key uses the literal `"unknown"` as the scope identifier. This causes all
-/// such requests to share a single bucket, effectively degrading to global
-/// scope for the resource.
+/// (the request did not come through the API gateway, e.g. an in-process SDK
+/// call), the key uses the literal `"unknown"` as the scope identifier. This
+/// causes all such requests to share a single bucket, effectively degrading
+/// to global scope for the resource.
 pub fn build_rate_limit_key(ctx: &RateLimitKeyContext<'_>) -> String {
     let res = match ctx.resource {
         RateLimitResource::Upstream => "upstream",
@@ -364,13 +424,48 @@ pub fn build_rate_limit_key(ctx: &RateLimitKeyContext<'_>) -> String {
         RateLimitScope::User => {
             format!("oagw:ratelimit:{res}:{id}:user:{}:{w}", ctx.subject_id)
         }
-        // When client_ip is None (no X-Forwarded-For / X-Real-IP), falls back to
-        // "unknown" — all such requests share one bucket (effectively global scope).
-        RateLimitScope::Ip => format!(
-            "oagw:ratelimit:{res}:{id}:ip:{}:{w}",
-            ctx.client_ip.unwrap_or("unknown")
-        ),
-        RateLimitScope::Route => format!("oagw:ratelimit:{res}:{id}:route:{w}"),
+        // Without a client address all requests share one "unknown" bucket
+        // (effectively global scope).
+        RateLimitScope::Ip => match ctx.client_ip {
+            Some(ip) => format!("oagw:ratelimit:{res}:{id}:ip:{ip}:{w}"),
+            None => format!("oagw:ratelimit:{res}:{id}:ip:unknown:{w}"),
+        },
+        RateLimitScope::Route => {
+            format!("oagw:ratelimit:{res}:{id}:route:{}:{w}", ctx.route_id)
+        }
+    }
+}
+
+/// Key of a shared budget's pool bucket. It sits under the owner's prefix,
+/// so the owner's writes and deletion drop it with its other buckets.
+pub fn build_pool_key(pool: &SharedPool) -> String {
+    format!(
+        "oagw:ratelimit:upstream:{}:pool:{}",
+        pool.owner_id,
+        window_label(&pool.window)
+    )
+}
+
+/// The limit a shared budget's pool bucket enforces: `total` per the
+/// owner's window, at the owner's algorithm, with no burst above `total`.
+/// `cost` and `response_headers` are the request's effective ones.
+#[must_use]
+pub fn pool_config(pool: &SharedPool, effective: &RateLimitConfig) -> RateLimitConfig {
+    RateLimitConfig {
+        sharing: effective.sharing,
+        algorithm: pool.algorithm,
+        sustained: SustainedRate {
+            rate: pool.total,
+            window: pool.window,
+        },
+        burst: None,
+        budget: None,
+        scope: RateLimitScope::Global,
+        strategy: effective.strategy,
+        cost: effective.cost,
+        response_headers: effective.response_headers,
+        shared_pool: None,
+        limit_owner_id: None,
     }
 }
 
@@ -456,8 +551,13 @@ impl RateLimiter {
             .buckets
             .entry(key.to_string())
             .and_modify(|bucket| {
+                // A key can be reached with another config (a merged limit
+                // that differs by tenant chain, a write another replica made):
+                // switching between them must not refill the bucket. Writes
+                // through this replica drop the key instead
+                // (`remove_keys_for_*`), which starts a full bucket.
                 if !bucket.matches_config(config) {
-                    *bucket = Bucket::new(config, self.grid_anchor);
+                    bucket.reconfigure(config, self.grid_anchor);
                 }
             })
             .or_insert_with(|| Bucket::new(config, self.grid_anchor));
@@ -582,7 +682,7 @@ mod tests {
             strategy: RateLimitStrategy::Reject,
             cost: 1,
             response_headers: true,
-            pool_owner_id: None,
+            shared_pool: None,
             limit_owner_id: None,
         }
     }
@@ -986,7 +1086,7 @@ mod tests {
         scope: &'a RateLimitScope,
         tenant_id: &'a Uuid,
         subject_id: &'a Uuid,
-        client_ip: Option<&'a str>,
+        client_ip: Option<IpAddr>,
         window: &'a Window,
     ) -> RateLimitKeyContext<'a> {
         RateLimitKeyContext {
@@ -996,17 +1096,21 @@ mod tests {
             scope,
             tenant_id,
             subject_id,
+            route_id: &ROUTE_ID,
             client_ip,
             window,
         }
     }
+
+    /// The matched route of the `upstream_ctx` keys.
+    const ROUTE_ID: Uuid = Uuid::from_u128(0x5);
 
     fn route_ctx<'a>(
         id: &'a Uuid,
         scope: &'a RateLimitScope,
         tenant_id: &'a Uuid,
         subject_id: &'a Uuid,
-        client_ip: Option<&'a str>,
+        client_ip: Option<IpAddr>,
         window: &'a Window,
     ) -> RateLimitKeyContext<'a> {
         RateLimitKeyContext {
@@ -1016,6 +1120,7 @@ mod tests {
             scope,
             tenant_id,
             subject_id,
+            route_id: id,
             client_ip,
             window,
         }
@@ -1112,7 +1217,7 @@ mod tests {
             &RateLimitScope::Ip,
             &zero,
             &zero,
-            Some("192.168.1.1"),
+            Some("192.168.1.1".parse().unwrap()),
             &Window::Day,
         ));
         assert_eq!(
@@ -1170,7 +1275,113 @@ mod tests {
             None,
             &Window::Second,
         ));
-        assert_eq!(key, format!("oagw:ratelimit:route:{rid}:route:second"));
+        assert_eq!(
+            key,
+            format!("oagw:ratelimit:route:{rid}:route:{rid}:second")
+        );
+    }
+
+    /// `scope: route` on an upstream limit gives each matched route its own
+    /// bucket under the upstream.
+    #[test]
+    fn build_key_upstream_scope_route_names_the_route() {
+        let uid = Uuid::from_u128(1);
+        let zero = Uuid::nil();
+        let ctx = upstream_ctx(
+            &uid,
+            &RateLimitScope::Route,
+            &zero,
+            &zero,
+            None,
+            &Window::Second,
+        );
+        assert_eq!(
+            build_rate_limit_key(&ctx),
+            format!("oagw:ratelimit:upstream:{uid}:route:{ROUTE_ID}:second")
+        );
+        let other = Uuid::from_u128(6);
+        let ctx = RateLimitKeyContext {
+            route_id: &other,
+            ..ctx
+        };
+        assert_eq!(
+            build_rate_limit_key(&ctx),
+            format!("oagw:ratelimit:upstream:{uid}:route:{other}:second")
+        );
+    }
+
+    #[test]
+    fn build_key_ipv6() {
+        let uid = Uuid::from_u128(1);
+        let zero = Uuid::nil();
+        let key = build_rate_limit_key(&upstream_ctx(
+            &uid,
+            &RateLimitScope::Ip,
+            &zero,
+            &zero,
+            Some("2001:db8::1".parse().unwrap()),
+            &Window::Second,
+        ));
+        assert_eq!(
+            key,
+            format!("oagw:ratelimit:upstream:{uid}:ip:2001:db8::1:second")
+        );
+    }
+
+    fn pool(total: u32, window: Window) -> SharedPool {
+        SharedPool {
+            owner_id: Uuid::from_u128(7),
+            total,
+            window,
+            algorithm: RateLimitAlgorithm::TokenBucket,
+        }
+    }
+
+    /// The pool bucket sits under the owner's prefix, so dropping the
+    /// owner's keys drops it too.
+    #[test]
+    fn pool_key_is_under_the_owner_prefix() {
+        let _clock = FrozenClock::new();
+        let pool = pool(3, Window::Minute);
+        let key = build_pool_key(&pool);
+        assert_eq!(
+            key,
+            format!("oagw:ratelimit:upstream:{}:pool:minute", pool.owner_id)
+        );
+        let limiter = RateLimiter::new();
+        let effective = make_config(100, Window::Minute, Some(100));
+        limiter
+            .try_consume(&key, &pool_config(&pool, &effective), "/t")
+            .unwrap();
+        limiter.remove_keys_for_upstream(pool.owner_id);
+        assert_eq!(limiter.bucket_count(), 0);
+    }
+
+    /// The pool admits `total` requests per window whatever the effective
+    /// burst, at the effective cost.
+    #[test]
+    fn pool_config_admits_total_per_window_at_the_effective_cost() {
+        let _clock = FrozenClock::new();
+        let limiter = RateLimiter::new();
+        let mut effective = make_config(100, Window::Second, Some(500));
+        effective.cost = 2;
+        let config = pool_config(&pool(5, Window::Minute), &effective);
+        let remaining: Vec<u64> = (0..2)
+            .map(|_| {
+                limiter
+                    .try_consume("pool", &config, "/t")
+                    .unwrap()
+                    .remaining
+            })
+            .collect();
+        assert_eq!(remaining, [3, 1]);
+        match limiter.try_consume("pool", &config, "/t") {
+            // One token is back after 12 s (5 per minute).
+            Err(DomainError::RateLimitExceeded {
+                retry_after_secs, ..
+            }) => assert_eq!(retry_after_secs, Some(12)),
+            other => panic!("expected RateLimitExceeded, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1263,7 +1474,7 @@ mod tests {
             strategy: RateLimitStrategy::Reject,
             cost: 1,
             response_headers: true,
-            pool_owner_id: None,
+            shared_pool: None,
             limit_owner_id: None,
         }
     }
@@ -1538,19 +1749,93 @@ mod tests {
         assert!(!bucket.matches_config(&changed));
     }
 
+    /// Two configs alternating on one key (e.g. two routes' limits merged
+    /// into one bucket) must not refill it: what was consumed stays consumed.
     #[test]
-    fn bucket_reinitializes_on_config_change() {
+    fn token_bucket_config_change_keeps_what_was_consumed() {
         let _clock = FrozenClock::new();
         let limiter = RateLimiter::new();
-        let config = make_config(2, Window::Second, None);
+        let small = make_config(2, Window::Minute, None);
+        let large = make_config(3, Window::Minute, None);
 
-        // Exhaust the bucket.
-        assert!(limiter.try_consume("key", &config, "/test").is_ok());
-        assert!(limiter.try_consume("key", &config, "/test").is_ok());
-        assert!(limiter.try_consume("key", &config, "/test").is_err());
+        limiter.try_consume("key", &small, "/t").unwrap();
+        limiter.try_consume("key", &small, "/t").unwrap();
+        // 2 of 3 used under the larger capacity: one left.
+        assert_eq!(
+            limiter.try_consume("key", &large, "/t").unwrap().remaining,
+            0
+        );
+        // Usage 3 is owed under capacity 2 and still counted back at 3.
+        assert!(limiter.try_consume("key", &small, "/t").is_err());
+        assert!(limiter.try_consume("key", &large, "/t").is_err());
+    }
 
-        // Change config: higher capacity. Bucket should be reinitialized.
-        let new_config = make_config(10, Window::Second, None);
-        assert!(limiter.try_consume("key", &new_config, "/test").is_ok());
+    /// The old bucket refills at its own rate up to the switch; usage beyond
+    /// a smaller new capacity is still owed after switching back.
+    #[test]
+    fn token_bucket_config_change_refills_first_and_keeps_usage_above_capacity() {
+        let mut clock = FrozenClock::new();
+        let limiter = RateLimiter::new();
+        let fast = make_config(10, Window::Second, None);
+        for _ in 0..10 {
+            limiter.try_consume("key", &fast, "/t").unwrap();
+        }
+        // 0.5 s at 10/s: 5 tokens back, 5 used.
+        clock.advance(Duration::from_millis(500));
+        let small = make_config(4, Window::Minute, None);
+        assert!(limiter.try_consume("key", &small, "/t").is_err());
+
+        let large = make_config(8, Window::Minute, None);
+        let outcome = limiter.try_consume("key", &large, "/t").unwrap();
+        assert_eq!((outcome.limit, outcome.remaining), (8, 2));
+    }
+
+    #[test]
+    fn sliding_window_config_change_keeps_the_count() {
+        let mut clock = FrozenClock::new();
+        let limiter = RateLimiter::new();
+        let two = make_sliding_config(2, Window::Second);
+        let three = make_sliding_config(3, Window::Second);
+        limiter.try_consume("sw", &two, "/t").unwrap();
+        clock.advance(Duration::from_millis(500));
+        limiter.try_consume("sw", &two, "/t").unwrap();
+
+        assert_eq!(
+            limiter.try_consume("sw", &three, "/t").unwrap().remaining,
+            0
+        );
+        assert!(limiter.try_consume("sw", &two, "/t").is_err());
+        // The new limit kept the sub-windows: the first request expires on
+        // schedule.
+        clock.advance(Duration::from_millis(500));
+        assert!(limiter.try_consume("sw", &three, "/t").is_ok());
+    }
+
+    /// A change of window or algorithm starts the new bucket with the old
+    /// one's usage taken.
+    #[test]
+    fn window_or_algorithm_change_carries_usage() {
+        let _clock = FrozenClock::new();
+        let limiter = RateLimiter::new();
+        let per_second = make_sliding_config(5, Window::Second);
+        for _ in 0..3 {
+            limiter.try_consume("k", &per_second, "/t").unwrap();
+        }
+        let per_minute = make_sliding_config(5, Window::Minute);
+        assert_eq!(
+            limiter
+                .try_consume("k", &per_minute, "/t")
+                .unwrap()
+                .remaining,
+            1
+        );
+
+        let token = make_config(6, Window::Minute, None);
+        assert_eq!(limiter.try_consume("k", &token, "/t").unwrap().remaining, 1);
+        let sliding = make_sliding_config(6, Window::Minute);
+        assert_eq!(
+            limiter.try_consume("k", &sliding, "/t").unwrap().remaining,
+            0
+        );
     }
 }

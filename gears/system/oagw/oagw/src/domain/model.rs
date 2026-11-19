@@ -228,16 +228,50 @@ pub struct RateLimitConfig {
     pub cost: u32,
     /// Whether to emit `X-RateLimit-*` response headers.
     pub response_headers: bool,
-    /// Upstream ID of the shared-pool owner. Populated during hierarchical merge
-    /// when `budget.mode == Shared` — causes all children to share one token
-    /// bucket keyed to the pool owner. Not user-facing (never serialized).
-    pub pool_owner_id: Option<Uuid>,
+    /// The shared budget this limit draws on, set by the hierarchical merge
+    /// when an upstream in the chain has `budget.mode == Shared`. Not
+    /// user-facing (never serialized).
+    pub shared_pool: Option<SharedPool>,
     /// Whose limit this is: the upstream whose level set the effective
-    /// config, or the route when only the route has one. Set by the
-    /// hierarchical merge and never stored; the proxy adds it to the
-    /// upstream bucket key when it is not the selected upstream, so tenants
-    /// resolving different limits on one upstream get separate buckets.
+    /// config. Set by the hierarchical merge and never stored; the proxy adds
+    /// it to the upstream bucket key when it is not the selected upstream, so
+    /// tenants resolving different limits on one upstream get separate
+    /// buckets.
     pub limit_owner_id: Option<Uuid>,
+}
+
+/// A `budget.mode = shared` pool: every tenant whose limit is merged from the
+/// owner draws on one bucket of `total` requests per `window`, next to its
+/// own scoped bucket.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedPool {
+    /// Upstream that defines the budget.
+    pub owner_id: Uuid,
+    /// `budget.total` of the owner.
+    pub total: u32,
+    /// The owner's `sustained.window`.
+    pub window: Window,
+    /// The owner's algorithm.
+    pub algorithm: RateLimitAlgorithm,
+}
+
+impl SharedPool {
+    /// The pool `rate_limit` defines, owned by `owner_id`, if its budget is
+    /// shared.
+    #[must_use]
+    pub fn defined_by(owner_id: Uuid, rate_limit: &RateLimitConfig) -> Option<Self> {
+        let budget = rate_limit.budget.as_ref()?;
+        if budget.mode != BudgetMode::Shared {
+            return None;
+        }
+        Some(Self {
+            owner_id,
+            total: budget.total?,
+            window: rate_limit.sustained.window,
+            algorithm: rate_limit.algorithm,
+        })
+    }
 }
 
 /// Algorithm used to enforce a rate limit.
@@ -544,6 +578,34 @@ pub struct Upstream {
     pub tags: Vec<String>,
     /// Who owns the upstream (API or types registry).
     pub managed_by: ManagedBy,
+}
+
+/// What the proxy resolves a request to.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub struct ProxyTarget {
+    /// The effective upstream: the tenant merge, with the route's and the
+    /// shadowed routes' plugins, CORS and tags. Its rate limit is the
+    /// upstreams' only.
+    pub upstream: Upstream,
+    /// The matched route. Its rate limit is checked on its own bucket.
+    pub route: Route,
+    /// The enforced rate limits of the ancestor routes `route` shadows,
+    /// root-first (`inst-merge-2a`).
+    pub shadowed_route_limits: Vec<ShadowedRouteLimit>,
+}
+
+/// The enforced rate limit of an ancestor's route that a descendant's route
+/// shadows: on each upstream above the matched route's, the route its owner
+/// would select for the request. The proxy checks it on that route's own
+/// bucket, as if it had matched, so it does not change the upstream bucket.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShadowedRouteLimit {
+    /// The shadowed route.
+    pub route_id: Uuid,
+    /// Its rate limit, `sharing: enforce`.
+    pub rate_limit: RateLimitConfig,
 }
 
 // ---------------------------------------------------------------------------

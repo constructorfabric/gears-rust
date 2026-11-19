@@ -1,22 +1,40 @@
 use super::alias::{normalize_alias, validate_alias};
 use super::merge::{
     compute_effective_config, compute_effective_config_reporting, is_visible_to_descendant,
-    shared_route_view, shared_upstream_view,
+    shadowed_route_limits, shared_route_view, shared_upstream_view,
 };
 use super::validation::validate_endpoint_hostnames_ssrf;
 
 use std::collections::HashSet;
 
+use toolkit_macros::domain_model;
+
 use crate::domain::error::DomainError;
-use crate::domain::model::{HttpMethod, Route, Upstream};
+use crate::domain::model::{HttpMethod, Route, ShadowedRouteLimit, Upstream};
 use crate::domain::repo::{ProxyConfigReader, RepositoryError, RowKey, Tags};
 use crate::domain::route_matching::{SeparatorBypass, parse_method, select_route};
 
 use super::ControlPlaneServiceImpl;
 
-use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
+
+/// What [`ControlPlaneServiceImpl::resolve_alias_sourced`] resolves to: a
+/// [`ProxyTarget`] whose route may be absent, with its sources.
+///
+/// [`ProxyTarget`]: crate::domain::model::ProxyTarget
+#[domain_model]
+#[derive(Debug)]
+pub(super) struct ResolvedAlias {
+    /// The effective upstream.
+    pub(super) effective: Upstream,
+    /// The matched route, when a method and path were given.
+    pub(super) route: Option<Route>,
+    /// The enforced rate limits of the routes `route` shadows.
+    pub(super) shadowed_route_limits: Vec<ShadowedRouteLimit>,
+    /// The rows the answer is built from.
+    pub(super) sources: Contributors,
+}
 
 /// Where resolution reads the configuration from.
 #[derive(Clone, Copy)]
@@ -30,13 +48,15 @@ enum Source<'a> {
 
 /// The rows a resolved answer carries settings of.
 #[domain_model]
+#[derive(Debug)]
 pub(super) struct Contributors {
     /// The selected upstream, then the merge chain closest-first. Ancestor
     /// upstreams outside the merge chain share nothing and change nothing in
     /// the answer.
     pub(super) upstreams: Vec<RowKey>,
     /// The shadowed ancestor routes at least one of whose enforced plugins
-    /// the answer carries. The matched route is not one of them.
+    /// the answer carries. The matched route is not one of them, nor is a
+    /// route that enforces only a rate limit: that limit is not in the answer.
     pub(super) routes: Vec<RowKey>,
 }
 
@@ -67,19 +87,8 @@ impl ControlPlaneServiceImpl {
         Ok(chain)
     }
 
-    /// Alias resolution (`cpt-cf-oagw-algo-alias-resolution`): the alias's
-    /// upstreams across the tenant chain are loaded in one read; the closest
-    /// enabled upstream wins, and the visible enabled ancestors above it form
-    /// the merge chain. With `method_path`, the route is selected over the
-    /// selected and ancestor upstreams. Returns the effective config; with
-    /// [`Tags::Skip`] it carries no tags.
-    ///
-    /// With a [`ProxyConfigReader`] and [`Tags::Skip`] both reads go through
-    /// the reader (ADR-0020); otherwise they go to the repositories.
-    ///
-    /// An alias that breaks the alias rules (`validate_alias`) is not found
-    /// without a read: no stored upstream can have it, and a request cannot
-    /// fill the cache with it.
+    /// [`Self::resolve_alias_sourced`]'s effective config and route.
+    #[cfg(test)]
     pub(crate) async fn resolve_alias(
         &self,
         ctx: &SecurityContext,
@@ -88,13 +97,26 @@ impl ControlPlaneServiceImpl {
         method_path: Option<(&str, &str)>,
         tags: Tags,
     ) -> Result<(Upstream, Option<Route>), DomainError> {
-        let (effective, route, _) = self
+        let resolved = self
             .resolve_alias_sourced(ctx, tenant_chain, alias, method_path, tags)
             .await?;
-        Ok((effective, route))
+        Ok((resolved.effective, resolved.route))
     }
 
-    /// [`Self::resolve_alias`], with the rows the answer is built from.
+    /// Alias resolution (`cpt-cf-oagw-algo-alias-resolution`): the alias's
+    /// upstreams across the tenant chain are loaded in one read; the closest
+    /// enabled upstream wins, and the visible enabled ancestors above it form
+    /// the merge chain. With `method_path`, the route is selected over the
+    /// selected and ancestor upstreams, with the enforced rate limits of the
+    /// routes it shadows. Returns the effective config and the rows it is
+    /// built from; with [`Tags::Skip`] it carries no tags.
+    ///
+    /// With a [`ProxyConfigReader`] and [`Tags::Skip`] both reads go through
+    /// the reader (ADR-0020); otherwise they go to the repositories.
+    ///
+    /// An alias that breaks the alias rules (`validate_alias`) is not found
+    /// without a read: no stored upstream can have it, and a request cannot
+    /// fill the cache with it.
     ///
     /// Of an upstream or route another tenant owns, only the shared fields
     /// are used and returned: its `private` ones stay with their owner, also
@@ -106,7 +128,7 @@ impl ControlPlaneServiceImpl {
         alias: &str,
         method_path: Option<(&str, &str)>,
         tags: Tags,
-    ) -> Result<(Upstream, Option<Route>, Contributors), DomainError> {
+    ) -> Result<ResolvedAlias, DomainError> {
         // Normalize the incoming alias for case-insensitive matching.
         let alias = normalize_alias(alias);
         if validate_alias(&alias).is_err() {
@@ -187,14 +209,18 @@ impl ControlPlaneServiceImpl {
         // the selected one.
         if merge_chain.is_empty() {
             // Single upstream → apply route overrides directly if present.
-            if let Some(ref route) = route {
-                let effective = compute_effective_config(
-                    std::slice::from_ref(&selected_upstream),
-                    Some(route),
-                )?;
-                return Ok((effective, Some(route.clone()), sources));
-            }
-            return Ok((selected_upstream, None, sources));
+            let effective = match route {
+                Some(ref route) => {
+                    compute_effective_config(std::slice::from_ref(&selected_upstream), Some(route))?
+                }
+                None => selected_upstream,
+            };
+            return Ok(ResolvedAlias {
+                effective,
+                route,
+                shadowed_route_limits: Vec::new(),
+                sources,
+            });
         }
 
         // Root-first order for merge: reverse ancestors, append selected.
@@ -220,7 +246,12 @@ impl ControlPlaneServiceImpl {
                 });
             },
         )?;
-        Ok((effective, route, sources))
+        Ok(ResolvedAlias {
+            effective,
+            route,
+            shadowed_route_limits: shadowed_route_limits(&shadowed),
+            sources,
+        })
     }
 
     /// The best enabled HTTP route for `method` and `path` over `upstreams`
@@ -319,8 +350,9 @@ impl ControlPlaneServiceImpl {
 /// the request on that upstream, when it enforces its plugins or rate limit:
 /// what a route the request matched closer to the requester must not bypass.
 /// The others apply nothing and are left out. The merge applies only the
-/// enforced plugins; the enforced limit is to be charged on the route's own
-/// bucket by the proxy (stacked change), so these routes are kept here.
+/// enforced plugins; the enforced limit is returned apart
+/// ([`shadowed_route_limits`]), for the proxy to check on the route's own
+/// bucket.
 ///
 /// An encoded separator that selects another route on one of these upstreams
 /// is refused as on the winner's ([`SeparatorBypass`]) when a route there

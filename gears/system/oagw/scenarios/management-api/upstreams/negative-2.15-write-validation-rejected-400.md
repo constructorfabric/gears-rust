@@ -50,6 +50,11 @@ Each is a format error like the one above, with this text in `detail` and `conte
 | `"tags": ["LLM"]` or `["a.b"]` | `tags[0] must match ^[a-z0-9_-]+$` |
 | `"alias": "-api"` or `"api:"` | `alias must not start or end with '.', '-' or ':'` |
 | `"rate_limit"` with `sustained.rate`, `burst.capacity` or `cost` of `0` | `rate_limit.sustained.rate must be at least 1` (`burst.capacity`, `cost` likewise) |
+| `"rate_limit"` whose `cost` exceeds the bucket capacity: `burst.capacity` for a token bucket with a burst, else `sustained.rate` (a sliding window ignores `burst`) | `rate_limit.cost (6) must not exceed rate_limit.burst.capacity (5)` (or `rate_limit.sustained.rate (5)`) |
+| `"rate_limit"` with a shared budget whose `total` is below `cost`: `{"cost": 4, "sustained": {"rate": 10, ...}, "budget": {"mode": "shared", "total": 3}}` | `rate_limit.cost (4) must not exceed rate_limit.budget.total (3)` |
+| a child's `"rate_limit"` that wins the merge (`{"cost": 4, "sustained": {"rate": 10, "window": "minute"}}`) under an ancestor's shared budget of `total: 3` (`rate: 100`) | `rate_limit.cost (4) must not exceed budget.total (3) of the shared budget an ancestor's upstream defines for this alias` |
+
+The shared pool is charged the upstream's effective cost (see [18.7](../../rate-limiting/positive-18.7-budget-modes-behave-specified.md) scenario B), so the check uses the merged limit: a child limit that loses the merge to the ancestor's, or a non-enforced `private` one, is not charged to the pool and is accepted. A route's `cost` goes to the route's bucket only.
 
 `_` may start or end an alias (`_api_` is accepted). Trailing dots are stripped first: `api.` is stored as `api`. A port above 65535 does not fit the field and fails request decoding with `422`.
 
@@ -81,6 +86,7 @@ A format error, as in scenario A: `400 Bad Request`, `type` = `...invalid_argume
 |---|---|
 | `"path": ""` or `"path": "v1/chat"` | a field violation (shape as in scenario C): `field` = `match.http.path`, `reason` = `INVALID_PROXY_PATH`, `description` = ``route path must start with `/` `` |
 | `"rate_limit"` with a `0` rate, capacity or cost | a format error: `rate_limit.<field> must be at least 1` |
+| `"rate_limit"` whose `cost` exceeds the bucket capacity | a format error, as for upstreams: `rate_limit.cost (6) must not exceed rate_limit.burst.capacity (5)` |
 
 ## Scenario C: plugin references
 

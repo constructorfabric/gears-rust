@@ -130,7 +130,7 @@ One more table gates the registry reconcile (see [Provisioning from the Types Re
 
 The four tables with a `schema_version` column (`oagw_upstream`, `oagw_upstream_plugin`, `oagw_route`, `oagw_route_plugin`) start it at 1; the tag, method and match tables have none. Sharing columns for absent fields store `private`. `created_at` and `updated_at` are maintained by the database repositories.
 
-Where a sharing column exists (`auth_sharing`, `cors_sharing`, `rate_limit_sharing`, `plugins_sharing`), the column is the source of truth and the JSON column omits `sharing`. `oagw_route` has no CORS sharing column in ADR-0009, so `Route.cors` stores its `sharing` inside the `cors` JSON. `RateLimitConfig.pool_owner_id` is computed at merge time and is never stored.
+Where a sharing column exists (`auth_sharing`, `cors_sharing`, `rate_limit_sharing`, `plugins_sharing`), the column is the source of truth and the JSON column omits `sharing`. `oagw_route` has no CORS sharing column in ADR-0009, so `Route.cors` stores its `sharing` inside the `cors` JSON. `RateLimitConfig.shared_pool` is computed at merge time and is never stored.
 
 ### Repository Behavior
 

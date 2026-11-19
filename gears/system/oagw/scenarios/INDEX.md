@@ -278,7 +278,7 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 
 #### Rate limit scope variants
 - **Scenario**: [positive-18.3-rate-limit-scope-variants.md](rate-limiting/positive-18.3-rate-limit-scope-variants.md)
-- **Mechanism**: One scenario each for `scope=global`, `tenant`, `user`, `ip`, `route`.
+- **Mechanism**: One scenario each for `scope=global`, `tenant`, `user`, `ip`, `route`. `ip` keys on the client address the API gateway resolved (`ClientIp` extension; the peer address unless `trusted_proxy_hops` ≥ 1), `unknown` without it. `route` is one bucket per matched route, on upstream limits too.
 
 #### Weighted cost per route
 - **Scenario**: [positive-18.4-weighted-cost-per-route.md](rate-limiting/positive-18.4-weighted-cost-per-route.md)
@@ -286,15 +286,15 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 
 #### Hierarchical min() merge for descendant overrides
 - **Scenario**: [positive-18.6-hierarchical-min-merge-descendant-overrides.md](rate-limiting/positive-18.6-hierarchical-min-merge-descendant-overrides.md)
-- **Mechanism**: Parent `enforce 1000/min`, child `500/min` → effective `500/min`, still `enforce`. Parent caps child and every tenant below it.
+- **Mechanism**: Parent `enforce 1000/min`, child `500/min` → effective `500/min`, still `enforce`. Parent caps child and every tenant below it. Route limits are checked on route buckets next to the upstream's (`min(upstream, route)`) and are not merged into it, so calling routes in turn does not refill the upstream bucket. The enforced limit of an ancestor's route that the matched route shadows is checked on that route's own bucket too.
 
 #### Budget modes (allocated/shared/unlimited)
 - **Scenario**: [positive-18.7-budget-modes-behave-specified.md](rate-limiting/positive-18.7-budget-modes-behave-specified.md)
-- **Mechanism**: `allocated` rejects when sum exceeds `total * overcommit_ratio`. `shared` pools between tenants. `unlimited` skips validation.
+- **Mechanism**: `allocated` rejects when the sum of direct allocations exceeds `total * overcommit_ratio`; a parent's change of budget or window is re-checked. `shared` adds one pool bucket of `total` per the owner's window that every tenant drawing on it shares, next to each tenant's own bucket. An upstream whose effective `cost` exceeds the pool's `total` is rejected on write. `unlimited` skips validation.
 
 #### A changed or removed limit applies at once
 - **Scenario**: *No separate file. Covered by the tests `changing_a_rate_limit_drops_the_exhausted_bucket` and `writes_drop_the_buckets_they_make_stale`.*
-- **Mechanism**: The Control Plane and the Data Plane share one limiter. A write that changes or removes an upstream or route rate limit drops its buckets on every write path (REST, SDK, registry), so a caller exhausted under the old limit is admitted under the new one. A write that keeps the limit keeps the buckets.
+- **Mechanism**: The Control Plane and the Data Plane share one limiter. A write that changes or removes an upstream or route rate limit drops its buckets on every write path (REST, SDK, registry), so a caller exhausted under the old limit is admitted under the new one. A write that keeps the limit keeps the buckets. A bucket reached with another config without such a write (a merged limit that differs by tenant chain, a write on another replica) keeps what it consumed (`token_bucket_config_change_keeps_what_was_consumed`).
 
 ---
 
@@ -578,7 +578,7 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 
 #### Write-time validation → 400
 - **Scenario**: [negative-2.15-write-validation-rejected-400.md](management-api/upstreams/negative-2.15-write-validation-rejected-400.md)
-- **What happens**: Port 0, a tag outside `^[a-z0-9_-]+$`, an alias starting or ending with `.`, `-` or `:`, an empty or relative HTTP route path, an empty method list, a rate limit value of 0, a plugin id that is not implemented, or an `http` endpoint while `allow_http_upstream` is off returns `400 PD` (`invalid_argument`). Nothing is stored.
+- **What happens**: Port 0, a tag outside `^[a-z0-9_-]+$`, an alias starting or ending with `.`, `-` or `:`, an empty or relative HTTP route path, an empty method list, a rate limit value of 0, a rate limit `cost` above the bucket capacity or above the `budget.total` of the shared pool the upstream draws on, a plugin id that is not implemented, or an `http` endpoint while `allow_http_upstream` is off returns `400 PD` (`invalid_argument`). Nothing is stored.
 
 #### Stored field limits → 400
 - **Scenario**: [negative-2.14-field-limits-rejected-400.md](management-api/upstreams/negative-2.14-field-limits-rejected-400.md)
@@ -622,7 +622,7 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 
 #### Enforced ancestor limits still apply when alias shadowed
 - **Scenario**: [negative-6.2-enforced-ancestor-limits-still-apply-alias-shadowed.md](proxy-api/alias-resolution/negative-6.2-enforced-ancestor-limits-still-apply-alias-shadowed.md)
-- **What happens**: Parent `rate_limit.sharing=enforce` still constrains child effective limit even when alias is shadowed, and down a chain: top `enforce` → middle `inherit` (stricter) → leaf `private` keeps the middle's limit (`429`). A child's route shadowing the parent's route for the same path keeps the parent route's enforced guard (`400 REQUIRED_HEADER_MISSING`); the parent route's enforced limit is not applied across route shadowing yet.
+- **What happens**: Parent `rate_limit.sharing=enforce` still constrains child effective limit even when alias is shadowed, and down a chain: top `enforce` → middle `inherit` (stricter) → leaf `private` keeps the middle's limit (`429`). A child's route shadowing the parent's route for the same path keeps the parent route's enforced guard (`400 REQUIRED_HEADER_MISSING`) and enforced limit, checked on the parent route's own bucket (`429` with the parent route's `X-RateLimit-Limit`).
 
 #### Private ancestor configuration never reaches a descendant
 - **Scenario**: [negative-6.6-private-ancestor-configuration-never-reaches-descendant.md](proxy-api/alias-resolution/negative-6.6-private-ancestor-configuration-never-reaches-descendant.md)
@@ -699,6 +699,10 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 #### Sliding window strictness → no boundary bursts
 - **Scenario**: [negative-18.2-sliding-window-strictness.md](rate-limiting/negative-18.2-sliding-window-strictness.md)
 - **What happens**: Requests across a window boundary do not allow 2x burst.
+
+#### Spoofed forwarding headers → same IP bucket
+- **Scenario**: [negative-18.8-spoofed-forwarding-headers-keep-the-ip-bucket.md](rate-limiting/negative-18.8-spoofed-forwarding-headers-keep-the-ip-bucket.md)
+- **What happens**: A new `X-Forwarded-For` or `X-Real-IP` value does not open a fresh `scope: ip` bucket: OAGW keys on the address the API gateway resolved, so the request is `429`.
 
 #### Strategy variants when limit exceeded → 429/503
 - **Scenario**: [negative-18.5-strategy-variants-limit-exceeded.md](rate-limiting/negative-18.5-strategy-variants-limit-exceeded.md)

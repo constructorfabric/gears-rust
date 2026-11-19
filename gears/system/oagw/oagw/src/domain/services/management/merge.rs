@@ -118,7 +118,9 @@ pub(crate) fn compute_effective_config(
 /// `shadowed` are the routes `route` shadows: on each upstream of the chain
 /// above `route`'s, the route its owner would select for the same request.
 /// Only their enforced plugins apply, so shadowing a path does not bypass
-/// them. Their enforced rate limit is not applied here.
+/// them. Their enforced rate limits are [`shadowed_route_limits`], checked
+/// apart: the effective rate limit is the upstreams' only, whatever route
+/// matched.
 ///
 /// A route's enforced plugins apply at its owner's level, right after its
 /// upstream in the root-first walk: an ancestor's enforce beats anything a
@@ -136,7 +138,7 @@ pub(crate) fn compute_effective_config_reporting(
     withheld: &mut dyn FnMut(Withheld),
     applied: &mut dyn FnMut(&Route),
 ) -> Result<Upstream, DomainError> {
-    use crate::domain::model::{BudgetMode, SharingMode};
+    use crate::domain::model::{SharedPool, SharingMode};
 
     if ancestor_chain.is_empty() {
         return Err(DomainError::Internal {
@@ -247,22 +249,18 @@ pub(crate) fn compute_effective_config_reporting(
     }
 
     // Defense-in-depth: if the effective config has a shared budget but
-    // pool_owner_id was never set (single-element chain or all layers were
-    // no-ops), initialize it to the effective upstream's ID.
+    // no pool was set (single-element chain or all layers were no-ops), the
+    // effective upstream owns it.
     if let Some(ref mut rl) = effective.rate_limit
-        && rl.pool_owner_id.is_none()
-        && rl
-            .budget
-            .as_ref()
-            .is_some_and(|b| b.mode == BudgetMode::Shared)
+        && rl.shared_pool.is_none()
     {
-        rl.pool_owner_id = Some(effective.id);
+        rl.shared_pool = SharedPool::defined_by(effective.id, rl);
     }
 
-    // A shadowed route's enforced rate limit is not merged here: min-merged
-    // into the upstream limit it would be charged per selected upstream, not
-    // on the route's own bucket shared by all descendants. A shadowed route
-    // on no upstream of the chain still applies (fail closed).
+    // A shadowed route's enforced rate limit is not merged here: the proxy
+    // checks it on the route's own bucket (`shadowed_route_limits`). A
+    // shadowed route on no upstream of the chain still applies its enforced
+    // plugins (fail closed).
     for r in shadowed
         .iter()
         .filter(|r| !ancestor_chain.iter().any(|u| u.id == r.upstream_id))
@@ -282,29 +280,9 @@ pub(crate) fn compute_effective_config_reporting(
             merge_plugins(&mut effective.plugins, route_plugins, &mut enforced_plugins);
         }
 
-        // Route rate limit: min(effective, route). A `private` one is
-        // applied on its own by the proxy.
-        if let Some(ref route_rl) = route.rate_limit
-            && route_rl.sharing != SharingMode::Private
-        {
-            let enforced = effective
-                .rate_limit
-                .as_ref()
-                .is_some_and(|r| r.sharing == SharingMode::Enforce);
-            // The route's limit winning keeps the upstream-level owner: the
-            // same route over different upstream-level limits must not share
-            // a bucket.
-            let owner = effective
-                .rate_limit
-                .as_ref()
-                .and_then(|r| r.limit_owner_id)
-                .unwrap_or(route.id);
-            let mut merged = min_rate_limit(effective.rate_limit.as_ref(), route_rl, owner);
-            if enforced {
-                merged.sharing = SharingMode::Enforce;
-            }
-            effective.rate_limit = Some(merged);
-        }
+        // The route's rate limit is not merged in: the proxy checks it on the
+        // route's own bucket next to the upstream's (`inst-merge-5a`), so
+        // routes with different limits do not reconfigure the upstream bucket.
 
         // Route CORS: follows same sharing semantics as upstream-level merge.
         // Per inst-merge-3a5: private → skip; inherit → union origins;
@@ -344,6 +322,28 @@ pub(crate) fn compute_effective_config_reporting(
     }
 
     Ok(effective)
+}
+
+/// The enforced rate limits of the `shadowed` routes (as given to
+/// [`compute_effective_config_reporting`]), in their order. The proxy checks
+/// each on its route's own bucket, as if that route had matched
+/// (`inst-merge-2a`); merged into the upstream limit, they would give the
+/// upstream bucket a config that depends on the request path.
+pub(crate) fn shadowed_route_limits(
+    shadowed: &[Route],
+) -> Vec<crate::domain::model::ShadowedRouteLimit> {
+    use crate::domain::model::{ShadowedRouteLimit, SharingMode};
+
+    shadowed
+        .iter()
+        .filter_map(|route| {
+            let rate_limit = route.rate_limit.as_ref()?;
+            (rate_limit.sharing == SharingMode::Enforce).then(|| ShadowedRouteLimit {
+                route_id: route.id,
+                rate_limit: rate_limit.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Whether every endpoint of `server` is one of `owner`'s, so a credential
@@ -441,23 +441,21 @@ fn merge_auth(effective: &mut Upstream, layer: &Upstream) {
 /// refuses an override only under an enforcing closest ancestor, so this is
 /// the only guard against a farther one.
 ///
-/// When the effective rate limit has `budget.mode == Shared`, the
-/// `pool_owner_id` is set to the effective upstream's ID so all
-/// descendants share one token bucket at runtime.
+/// When the effective rate limit has `budget.mode == Shared`, its pool
+/// (owned by the effective upstream) is recorded in `shared_pool` so all
+/// descendants draw on one pool bucket at runtime.
 ///
 /// `limit_owner_id` becomes `layer`'s ID when its limit replaces the
 /// effective one or wins the `min`, and stays the ancestor's otherwise.
 pub(super) fn merge_rate_limit(effective: &mut Upstream, layer: &Upstream) {
-    use crate::domain::model::{BudgetMode, SharingMode};
+    use crate::domain::model::{SharedPool, SharingMode};
 
-    // Capture shared-pool owner before merging (the ancestor that defines
-    // the shared budget is the pool owner).
-    let pool_owner = effective
+    // Capture the shared pool before merging (the ancestor that defines the
+    // shared budget owns it).
+    let pool = effective
         .rate_limit
         .as_ref()
-        .and_then(|rl| rl.budget.as_ref())
-        .filter(|b| b.mode == BudgetMode::Shared)
-        .map(|_| effective.id);
+        .and_then(|rl| SharedPool::defined_by(effective.id, rl));
 
     let effective_is_enforced = effective
         .rate_limit
@@ -486,10 +484,10 @@ pub(super) fn merge_rate_limit(effective: &mut Upstream, layer: &Upstream) {
         }
     }
 
-    // Propagate shared-pool owner to descendants so the proxy uses
-    // the defining ancestor's rate limit key.  Only set once: the first
-    // ancestor that defines BudgetMode::Shared pins the owner; later
-    // merges must not overwrite it.
+    // Propagate the shared pool to descendants so the proxy draws on the
+    // defining ancestor's pool bucket. Only set once: the first ancestor
+    // that defines BudgetMode::Shared pins the pool; later merges must not
+    // overwrite it.
     //
     // Skip for non-enforced Private: the descendant opted out of the
     // shared pool and should use its own independent bucket.
@@ -500,12 +498,36 @@ pub(super) fn merge_rate_limit(effective: &mut Upstream, layer: &Upstream) {
         && !effective_is_enforced;
 
     if !is_private_override
-        && let Some(owner_id) = pool_owner
+        && let Some(pool) = pool
         && let Some(ref mut rl) = effective.rate_limit
-        && rl.pool_owner_id.is_none()
+        && rl.shared_pool.is_none()
     {
-        rl.pool_owner_id = Some(owner_id);
+        rl.shared_pool = Some(pool);
     }
+}
+
+/// The rate limit [`compute_effective_config`] gives `chain` (root-first,
+/// the selected upstream last), shared pool and limit owner included,
+/// without merging the other fields.
+pub(super) fn effective_rate_limit(
+    chain: &[Upstream],
+) -> Option<crate::domain::model::RateLimitConfig> {
+    use crate::domain::model::SharedPool;
+
+    let (root, rest) = chain.split_first()?;
+    let mut effective = root.clone();
+    if let Some(rl) = &mut effective.rate_limit {
+        rl.limit_owner_id = Some(effective.id);
+    }
+    for layer in rest {
+        merge_rate_limit(&mut effective, layer);
+        effective.id = layer.id;
+    }
+    let mut rate_limit = effective.rate_limit?;
+    if rate_limit.shared_pool.is_none() {
+        rate_limit.shared_pool = SharedPool::defined_by(effective.id, &rate_limit);
+    }
+    Some(rate_limit)
 }
 
 /// Merge CORS config from a descendant layer onto the effective config.
@@ -588,10 +610,10 @@ fn min_rate_limit(
             if b_rate < a_rate {
                 let mut winner = b.clone();
                 winner.limit_owner_id = Some(b_owner);
-                // Preserve pool_owner_id from the existing effective config so
-                // shared-pool keying is not lost when a stricter route wins.
-                if winner.pool_owner_id.is_none() {
-                    winner.pool_owner_id = a.pool_owner_id;
+                // Keep the shared pool of the existing effective config when
+                // a stricter descendant wins.
+                if winner.shared_pool.is_none() {
+                    winner.shared_pool = a.shared_pool;
                 }
                 winner
             } else {

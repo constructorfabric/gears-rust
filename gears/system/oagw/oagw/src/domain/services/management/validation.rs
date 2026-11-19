@@ -9,8 +9,8 @@ use crate::domain::gts_helpers::{
 };
 use crate::domain::model::{
     AuthConfig, CorsConfig, CreateRouteRequest, CreateUpstreamRequest, Endpoint, HeadersConfig,
-    HttpMatch, HttpMethod, MatchRules, PluginsConfig, RateLimitConfig, Route, Scheme,
-    UpdateRouteRequest, UpdateUpstreamRequest,
+    HttpMatch, HttpMethod, MatchRules, PluginsConfig, RateLimitAlgorithm, RateLimitConfig, Route,
+    Scheme, UpdateRouteRequest, UpdateUpstreamRequest,
 };
 use crate::domain::repo::RowKey;
 use crate::domain::ssrf::SsrfGuard;
@@ -218,8 +218,8 @@ pub(in crate::domain::services) fn validate_tags(tags: &[String]) -> Result<(), 
 }
 
 /// A rate limit that can admit a request: `rate`, `capacity` and `cost` are
-/// at least 1. Zero would admit everything (`cost`) or nothing with a fixed
-/// retry hint (`rate`, `capacity`).
+/// at least 1, and `cost` fits the bucket. Zero would admit everything
+/// (`cost`) or nothing with a fixed retry hint (`rate`, `capacity`).
 fn validate_rate_limit_values(rate_limit: &RateLimitConfig) -> Result<(), DomainError> {
     if rate_limit.sustained.rate == 0 {
         return Err(DomainError::validation(
@@ -235,6 +235,18 @@ fn validate_rate_limit_values(rate_limit: &RateLimitConfig) -> Result<(), Domain
         return Err(DomainError::validation(
             "rate_limit.cost must be at least 1",
         ));
+    }
+    // A request costing more than a full bucket is never admitted. A sliding
+    // window ignores `burst`.
+    let (capacity, field) = match (rate_limit.algorithm, &rate_limit.burst) {
+        (RateLimitAlgorithm::TokenBucket, Some(burst)) => (burst.capacity, "burst.capacity"),
+        _ => (rate_limit.sustained.rate, "sustained.rate"),
+    };
+    if rate_limit.cost > capacity {
+        return Err(DomainError::validation(format!(
+            "rate_limit.cost ({}) must not exceed rate_limit.{field} ({capacity})",
+            rate_limit.cost
+        )));
     }
     Ok(())
 }

@@ -16,13 +16,19 @@ import httpx
 from typing import Optional
 
 from .helpers import (
+    PROXY_SCHEMA,
     assert_problem,
+    assert_problem_body,
     create_route,
     create_upstream,
     create_upstream_raw,
+    err_type,
+    traced,
     unique_alias,
     update_upstream_raw,
 )
+
+_WRITE_VALIDATION = "negative-2.15-write-validation-rejected-400"
 
 
 # ---------------------------------------------------------------------------
@@ -403,12 +409,6 @@ async def test_allocated_rejects_child_without_rate_limit(
 
 @pytest.mark.scenario("positive-18.7-budget-modes-behave-specified", part="A")
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="F-1 (review finding, no decision yet): changing a parent's "
-           "sustained.window with the same budget skips the budget re-check",
-)
 async def test_allocated_parent_window_change_revalidates(
     oagw_base_url, hierarchy_root_headers, hierarchy_l1a_headers,
     mock_upstream_url, mock_upstream, cleanup,
@@ -433,12 +433,6 @@ async def test_allocated_parent_window_change_revalidates(
 
 @pytest.mark.scenario("positive-18.7-budget-modes-behave-specified", part="A")
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="R-15: allocated-budget checks count grandchildren against the top "
-           "parent, so an unchanged PUT of a middle tenant is rejected",
-)
 async def test_allocated_three_levels_counts_direct_children_only(
     oagw_base_url, oagw_headers, hierarchy_root_headers, hierarchy_l1a_headers,
     mock_upstream_url, mock_upstream, cleanup,
@@ -491,8 +485,8 @@ async def test_shared_budget_pools_child_bindings(
 ):
     """Scenario 18.7-B: children that bind the alias themselves share the parent's pool.
 
-    With `scope: global` the pool is keyed on the pool owner alone; the
-    tenant-scoped case is R-09 (`test_shared_budget_pool_is_shared`).
+    With `scope: global` the scoped bucket is keyed on the pool owner alone;
+    `test_shared_budget_pool_is_shared` covers a tenant-scoped limit.
     """
     rate_limit = _rl(2, sharing="inherit", scope="global", budget=budget)
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -515,12 +509,6 @@ async def test_shared_budget_pools_child_bindings(
 
 @pytest.mark.scenario("positive-18.7-budget-modes-behave-specified", part="B")
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="R-09: a shared budget is not shared at runtime (one bucket per "
-           "tenant) and budget.total is ignored",
-)
 async def test_shared_budget_pool_is_shared(
     oagw_base_url, hierarchy_root_headers, hierarchy_l1a_headers,
     hierarchy_l1b_headers, mock_upstream_url, mock_upstream, cleanup,
@@ -547,6 +535,99 @@ async def test_shared_budget_pool_is_shared(
             for h in (hierarchy_l1a_headers, hierarchy_l1b_headers, hierarchy_l1a_headers, hierarchy_l1b_headers)
         ]
         assert statuses == [200, 200, 200, 429]
+
+
+def _format_error(detail: str, instance: str) -> dict:
+    """The whole body of a rule without a field."""
+    return {
+        "type": err_type("invalid_argument"),
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": detail,
+        "instance": instance,
+        "context": {"format": detail, "resource_type": PROXY_SCHEMA},
+    }
+
+
+@pytest.mark.scenario(_WRITE_VALIDATION, part="A")
+@pytest.mark.asyncio
+async def test_shared_budget_cost_over_own_total_rejected(
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
+):
+    """Scenario 2.15-A: a cost above the upstream's own shared `total` never fits the pool.
+
+    The cost fits the burst (10), so only the pool check can refuse it;
+    `cost == total` is the accepted boundary.
+    """
+    budget = {"mode": "shared", "total": 3}
+    detail = "rate_limit.cost (4) must not exceed rate_limit.budget.total (3)"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await _child_raw(
+            client, oagw_base_url, traced(oagw_headers), mock_upstream_url, cleanup,
+            unique_alias("ba-c2"), _rl(10, budget=budget, cost=4),
+        )
+        assert_problem_body(resp, _format_error(detail, "/oagw/v1/upstreams"))
+
+        resp = await _child_raw(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, cleanup,
+            unique_alias("ba-c2"), _rl(10, budget=budget, cost=3),
+        )
+        assert resp.status_code == 201, resp.text[:500]
+
+
+@pytest.mark.scenario("positive-18.7-budget-modes-behave-specified", part="B")
+@pytest.mark.scenario(_WRITE_VALIDATION, part="A")
+@pytest.mark.asyncio
+async def test_shared_budget_cost_over_inherited_total_rejected(
+    oagw_base_url, hierarchy_root_headers, hierarchy_l1a_headers,
+    mock_upstream_url, mock_upstream, cleanup,
+):
+    """Scenario 18.7-B: the pool is charged the child's effective cost, so it must fit `total`.
+
+    The child's `inherit` 10/min is stricter than the parent's 100/min and
+    wins the merge (a `private` child limit would replace the parent's and
+    not draw on its pool), so its cost 4 would be refused by the parent's pool of 3 on every
+    request. Cost 3 is accepted and admits exactly one request per window.
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        alias, parent = await _parent(
+            client, oagw_base_url, hierarchy_root_headers, mock_upstream_url, cleanup, "ba-c3",
+            _rl(100, sharing="inherit", budget={"mode": "shared", "total": 3}),
+        )
+        detail = (
+            "rate_limit.cost (4) must not exceed budget.total (3) of the shared budget "
+            "an ancestor's upstream defines for this alias"
+        )
+        resp = await _child_raw(
+            client, oagw_base_url, traced(hierarchy_l1a_headers), mock_upstream_url, cleanup,
+            alias, _rl(10, cost=4, sharing="inherit"),
+        )
+        assert_problem_body(resp, _format_error(detail, "/oagw/v1/upstreams"))
+
+        child = await _child(
+            client, oagw_base_url, hierarchy_l1a_headers, mock_upstream_url, cleanup,
+            alias, _rl(10, cost=3, sharing="inherit"),
+        )
+        resp = await update_upstream_raw(
+            client, oagw_base_url, traced(hierarchy_l1a_headers), child["id"], mock_upstream_url,
+            alias=alias, rate_limit=_rl(10, cost=4, sharing="inherit"),
+        )
+        assert_problem_body(resp, _format_error(detail, f"/oagw/v1/upstreams/{child['id']}"))
+        stored = (await client.get(
+            f"{oagw_base_url}/oagw/v1/upstreams/{child['id']}", headers=hierarchy_l1a_headers,
+        )).json()
+        assert stored["rate_limit"]["cost"] == 3
+
+        await create_route(
+            client, oagw_base_url, hierarchy_root_headers, parent["id"], ["GET"], "/v1/models",
+        )
+        statuses = [
+            (await client.get(
+                f"{oagw_base_url}/oagw/v1/proxy/{alias}/v1/models", headers=hierarchy_l1a_headers,
+            )).status_code
+            for _ in range(2)
+        ]
+        assert statuses == [200, 429]
 
 
 # ===================================================================

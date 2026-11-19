@@ -20,7 +20,7 @@ use super::upstream_db_repo::DbUpstreamRepo;
 use crate::domain::gts_helpers::{HTTP_PROTOCOL_ID, REQUIRED_HEADERS_GUARD_PLUGIN_ID};
 use crate::domain::model::{
     CreateUpstreamRequest, Endpoint, HttpMatch, HttpMethod, ListQuery, ManagedBy, MatchRules,
-    PathSuffixMode, PluginBinding, PluginsConfig, Route, Scheme, Server, SharingMode,
+    PathSuffixMode, PluginBinding, PluginsConfig, ProxyTarget, Route, Scheme, Server, SharingMode,
     UpdateUpstreamRequest, Upstream,
 };
 use crate::domain::repo::{
@@ -302,7 +302,11 @@ async fn service_resolution(tags: Tags) -> (usize, usize, Vec<String>, Vec<Strin
         .expect("security context");
     r.recorder.clear();
 
-    let (effective, route) = cp
+    let ProxyTarget {
+        upstream: effective,
+        route,
+        ..
+    } = cp
         .resolve_proxy_target(
             &crate::domain::services::ProxyGrant::for_tests(ctx.clone()),
             "api",
