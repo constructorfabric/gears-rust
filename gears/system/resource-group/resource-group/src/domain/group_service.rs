@@ -1059,7 +1059,7 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
             // @cpt-end:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1:inst-tenant-enforce-6
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4c
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4d
-            rg_type.validate_group(Some(&parent.code), Some(binding), req.metadata.as_ref())?;
+            rg_type.validate_group(Some(&parent.code), req.metadata.as_ref())?;
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4d
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4c
 
@@ -1143,7 +1143,7 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
         } else {
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5a
-            rg_type.validate_group(None, Some(binding), req.metadata.as_ref())?;
+            rg_type.validate_group(None, req.metadata.as_ref())?;
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5a
 
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5c
@@ -1293,7 +1293,7 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
 
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4e
         // The schema was compiled before `BEGIN`. The validator uses the
-        // actual parent, membership binding and replacement metadata below.
+        // actual parent and replacement metadata below.
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4e
 
         // Cross-tenant parent change is forbidden. `tenant_id` is established
@@ -1356,7 +1356,6 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
                 new_parent_snapshot
                     .as_ref()
                     .map(|parent| parent.code.as_str()),
-                existing.membership_type.as_deref(),
                 req.metadata.as_ref(),
             )?;
         }
@@ -1486,7 +1485,6 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
             new_parent_snapshot
                 .as_ref()
                 .map(|parent| parent.code.as_str()),
-            existing.membership_type.as_deref(),
             existing.metadata.as_ref(),
         )?;
 

@@ -121,9 +121,9 @@ The existing `rg-type-registration` / `rg-type-schema-registration` traceability
 
 | Declaration | GTS identifier | Placement and membership |
 |-------------|----------------|---------------------------------|
-| `UserGroupTypeV1` | `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` | `parent_type` accepts roots and parent types in the user-group family. `membership_type` binds the user membership schema. `metadata` may be omitted or empty. |
+| `UserGroupTypeV1` | `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` | `parent_type` accepts roots and parents of the exact AM user-group type. The `membership_type` trait binds the user membership schema. `metadata` may be omitted or empty. |
 | `UserV1` | `gts.cf.core.am.user.v1~` | AM user resource type used as the membership's `resource_type`. |
-| [User membership schema](../schemas/user_group_member.v1.schema.json) | `gts.cf.core.rg.membership.v1~cf.core.am.user_group_member.v1~` | Accepts the AM user resource type and its derived types as `resource_type` through `anyOf` with `x-gts-type-ref`. |
+| [User membership schema](../schemas/user_group_member.v1.schema.json) | `gts.cf.core.rg.membership.v1~cf.core.am.user_group_member.v1~` | Accepts the AM user resource type and its derived types as `resource_type` through `x-gts-type-ref`. |
 
 **Output**: Successful publication (`UpToDate`, or `Reconciled` with every desired identifier `Admitted`), or a publication failure that stops startup.
 
@@ -209,13 +209,13 @@ Membership-write callers **MUST** combine AM's `GET /tenants/{tenant_id}/users` 
 
 ## 6. Acceptance Criteria
 
-- [ ] On startup with no AM user-group definitions in Types Registry, AM's manifest publishes the declarations from §3 and awaits their admission before application `init`. RG accepts root groups and groups nested under the user-group type or its derivatives. It accepts AM-user memberships and rejects unknown metadata fields. Fingerprints `dod-user-groups-rg-type-schema-idempotent-registration`.
+- [ ] On startup with no AM user-group definitions in Types Registry, AM's manifest publishes the declarations from §3 and awaits their admission before application `init`. RG accepts root groups and groups nested under the exact AM user-group type. It accepts AM-user memberships and rejects unknown metadata fields. Fingerprints `dod-user-groups-rg-type-schema-idempotent-registration`.
 - [ ] On an identical restart, publication succeeds without changing either type's revision. A differing document follows the registry's revision and admission rules. Fingerprints `dod-user-groups-rg-type-schema-idempotent-registration`.
 - [ ] If publication is rejected, cancelled or cannot complete within its startup budget, application `init` does not run; diagnostics identify the publisher, affected identifiers and underlying cause. No RG type-management API or RG-local type table is used. Fingerprints `dod-user-groups-rg-type-schema-idempotent-registration`.
 - [ ] During tenant hard-deletion invoked by the retention job in `feature-tenant-hierarchy-management`, AM calls `ResourceGroupClient` to delete the tenant's user-group subtree before the `tenants` row is removed; if the RG cleanup call fails transport-level, the hard-delete flow aborts with `code=service_unavailable` via the `feature-errors-observability` envelope and the `tenants` row is NOT removed. On the next retry, the hard-delete flow re-attempts cleanup. Fingerprints `dod-user-groups-cascade-cleanup-trigger`.
 - [ ] The AM OpenAPI spec contains NO `/user-groups` family of endpoints and NO `/memberships` family — user-group CRUD, membership add/remove, and nested-group operations are not part of AM's REST surface. The AM gear contains no `user_group_*` or `user_group_membership_*` tables, no adapter tables, and no in-memory group-hierarchy cache; RG is the single storage owner. Fingerprints `dod-user-groups-delegation-boundary`.
 - [ ] A membership-write consumer checks `GET /tenants/{tenant_id}/users?user_id=<id>` before adding the AM user via `ResourceGroupClient`. RG validates the member's type against the bound membership schema. Fingerprints `dod-user-groups-membership-user-existence-pattern`, `dod-user-groups-delegation-boundary`.
-- [ ] Resource Group forest invariants reject nested user-group cycles at the `ResourceGroupClient` boundary, including when the parents belong to different types in the user-group family. Fingerprints `dod-user-groups-delegation-boundary`.
+- [ ] Resource Group forest invariants reject nested user-group cycles at the `ResourceGroupClient` boundary, including cycles between groups of the same AM user-group type. Fingerprints `dod-user-groups-delegation-boundary`.
 
 ## 7. Deliberate Omissions
 

@@ -11,12 +11,8 @@
       "type": "object",
       "properties": {
         "resource_type": {
-          "anyOf": [
-            {
-              "type": "string",
-              "x-gts-type-ref": "gts.cf.core.am.user.v1~"
-            }
-          ]
+          "type": "string",
+          "x-gts-type-ref": "gts.cf.core.am.user.v1~"
         }
       },
       "required": [

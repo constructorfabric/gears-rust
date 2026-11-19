@@ -39,24 +39,20 @@ pub struct RgType {
 }
 
 impl RgType {
-    /// Compile a registry snapshot selected with `Content` and `ResolvedSchema`.
+    /// Compile a registry snapshot selected with `Content`, `ResolvedSchema` and `EffectiveTraits`.
     ///
     /// # Errors
     /// Returns an error for a schema that cannot validate group payloads.
     pub fn from_schema(schema: &TypeSchema) -> Result<Self, DomainError> {
-        fn binding(schema: &Value) -> Option<&str> {
-            schema
-                .pointer("/properties/membership_type/const")
-                .and_then(Value::as_str)
-                .or_else(|| schema.get("allOf")?.as_array()?.iter().find_map(binding))
-        }
-
         let group_payload = compile(schema)?;
         let code = schema.type_id.as_ref().to_owned();
+        // Owners lock the trait with const. Revision checks for that lock are tracked in
+        // https://github.com/constructorfabric/gears-rust/issues/6064.
         let membership_type = schema
-            .resolved_schema
+            .effective_traits
             .as_ref()
-            .and_then(binding)
+            .and_then(|values| values.get("membership_type"))
+            .and_then(Value::as_str)
             .filter(|id| concrete_membership_type(id).is_some())
             .map(str::to_owned);
         Ok(Self {
@@ -70,7 +66,7 @@ impl RgType {
     pub(crate) fn membership_type(&self) -> Result<&str, DomainError> {
         self.membership_type.as_deref().ok_or_else(|| {
             DomainError::validation(format!(
-                "Group type '{}' must fix membership_type to a concrete membership type with const",
+                "Group type '{}' must declare a concrete membership_type trait",
                 self.code
             ))
         })
@@ -79,14 +75,9 @@ impl RgType {
     pub(crate) fn validate_group(
         &self,
         parent_type: Option<&str>,
-        membership_type: Option<&str>,
         metadata: Option<&Value>,
     ) -> Result<(), DomainError> {
-        let binding = match membership_type {
-            Some(stored) => stored,
-            None => self.membership_type()?,
-        };
-        let mut payload = json!({ "parent_type": parent_type, "membership_type": binding });
+        let mut payload = json!({ "parent_type": parent_type });
         if let Some(metadata) = metadata {
             payload["metadata"] = metadata.clone();
         }

@@ -380,15 +380,15 @@ async fn cascade_error_returns_retryable() {
     assert!(matches!(result, Err(HookError::Retryable { .. })));
 }
 
-/// A listed parent covers its children. A parent of a derived type is
-/// outside the exact-type listing, so its listed child needs its own cascade.
+/// A listed parent covers its children. A child whose parent is absent from
+/// the listing needs its own cascade.
 #[tokio::test]
 async fn groups_without_a_listed_parent_are_cascaded() {
     let root = make_group(1);
     let child = make_child_group(2, root.id);
-    let child_of_derived = make_child_group(3, Uuid::from_u128(4));
+    let child_of_unlisted_parent = make_child_group(3, Uuid::from_u128(4));
     let root_id = root.id;
-    let child_of_derived_id = child_of_derived.id;
+    let child_of_unlisted_parent_id = child_of_unlisted_parent.id;
 
     let called: Arc<parking_lot::Mutex<Vec<Uuid>>> = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let called_clone = Arc::clone(&called);
@@ -398,7 +398,7 @@ async fn groups_without_a_listed_parent_are_cascaded() {
             Ok(groups_page(vec![
                 root.clone(),
                 child.clone(),
-                child_of_derived.clone(),
+                child_of_unlisted_parent.clone(),
             ]))
         }),
         delete_cascade_fn: Box::new(move |id| {
@@ -416,7 +416,7 @@ async fn groups_without_a_listed_parent_are_cascaded() {
     assert!(result.is_ok());
     assert_eq!(
         called.lock().as_slice(),
-        [root_id, child_of_derived_id],
+        [root_id, child_of_unlisted_parent_id],
         "cascade starts at each group without a listed parent"
     );
 }

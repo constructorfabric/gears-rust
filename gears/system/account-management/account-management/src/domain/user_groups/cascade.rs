@@ -249,9 +249,8 @@ async fn cascade_one(
 
 /// Fetch the tenant's AM user groups that need their own cascade.
 ///
-/// The listing filters on the exact AM type. A group with a derived parent
-/// still needs cleanup because the parent is outside that listing. Drain all
-/// pages before pruning groups covered by a listed parent's cascade.
+/// Drain all pages of the exact-type listing before pruning groups covered by
+/// a listed parent's cascade.
 async fn fetch_tenant_groups(
     client: &Arc<dyn ResourceGroupClient + Send + Sync>,
     ctx: &SecurityContext,

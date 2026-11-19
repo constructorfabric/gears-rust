@@ -51,6 +51,8 @@ fn tenant_type() -> Value {
         "$id": gts_uri!("cf.core.rg.type.v1~cf.test.rg.tenant.v1~"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
+        "x-gts-traits": {"membership_type": TEAM_MEMBER},
+        "x-gts-traits-schema": {"properties": {"membership_type": {"const": TEAM_MEMBER}}},
         "$defs": {
             "tenant_meta": {
                 "type": "object",
@@ -62,7 +64,6 @@ fn tenant_type() -> Value {
             { "$ref": gts_uri!("cf.core.rg.type.v1~") },
             { "properties": {
                 "parent_type": {"type": ["string", "null"], "enum": [null, TENANT]},
-                "membership_type": {"type": "string", "const": TEAM_MEMBER},
                 "metadata": { "$ref": "#/$defs/tenant_meta" }
             } }
         ]
@@ -114,10 +115,9 @@ async fn the_abstract_group_base_constrains_parent_types_of_concrete_groups() {
         "$id": format!("gts://{TEAM_SCHEMA}"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
-        "allOf": [
-            {"$ref": format!("gts://{BASE}")},
-            {"properties": {"membership_type": {"type": "string", "const": TEAM_MEMBER}}}
-        ]
+        "x-gts-traits": {"membership_type": TEAM_MEMBER},
+        "x-gts-traits-schema": {"properties": {"membership_type": {"const": TEAM_MEMBER}}},
+        "allOf": [{"$ref": format!("gts://{BASE}")}]
     });
     registry.seed(TEAM_SCHEMA, concrete);
     assert!(matches!(
@@ -134,26 +134,26 @@ async fn the_abstract_group_base_constrains_parent_types_of_concrete_groups() {
 
     for parent_type in [Value::Null, json!(TENANT), json!(DEPT)] {
         validator
-            .validate(&json!({"parent_type": parent_type, "membership_type": TEAM_MEMBER}))
+            .validate(&json!({"parent_type": parent_type}))
             .expect("root or a type in the resource-group family");
     }
     validator
-        .validate(&json!({"membership_type": TEAM_MEMBER}))
+        .validate(&json!({}))
         .expect_err("parent_type is required");
     validator
-        .validate(&json!({"parent_type": USER, "membership_type": TEAM_MEMBER}))
+        .validate(&json!({"parent_type": USER}))
         .expect_err("a type outside the resource-group family cannot be a parent");
 }
 
 #[tokio::test]
-async fn the_group_payload_requires_parent_type_and_membership_type() {
+async fn the_group_payload_requires_parent_type_and_excludes_the_binding() {
     let registry = registry_with_derived_types();
     let validator = read(&registry, TENANT)
         .await
         .compile_payload_validator()
         .expect("tenant schema");
     let mut root = json!({
-        "parent_type": null, "membership_type": TEAM_MEMBER, "metadata": {"tier": "gold"}
+        "parent_type": null, "metadata": {"tier": "gold"}
     });
     validator
         .validate(&root)
@@ -168,12 +168,10 @@ async fn the_group_payload_requires_parent_type_and_membership_type() {
     validator
         .validate(&root)
         .expect("nests under the same type");
-    root.as_object_mut()
-        .expect("group document")
-        .remove("membership_type");
+    root["membership_type"] = json!(TEAM_MEMBER);
     validator
         .validate(&root)
-        .expect_err("membership_type is required");
+        .expect_err("the binding belongs to the type's traits");
 }
 
 #[tokio::test]
@@ -186,7 +184,7 @@ async fn the_sdk_validator_applies_inherited_metadata_through_a_nested_ref() {
 
     let payload = |metadata| {
         json!({
-            "parent_type": null, "membership_type": TEAM_MEMBER, "metadata": metadata
+            "parent_type": null, "metadata": metadata
         })
     };
     validator
@@ -230,10 +228,9 @@ async fn imported_groups_resolve_the_schema_and_new_groups_keep_their_stored_bin
         "$id": format!("gts://{TEAM_SCHEMA}"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
-        "allOf": [
-            {"$ref": format!("gts://{BASE}")},
-            {"properties": {"membership_type": {"type": "string", "const": TEAM_MEMBER}}}
-        ]
+        "x-gts-traits": {"membership_type": TEAM_MEMBER},
+        "x-gts-traits-schema": {"properties": {"membership_type": {"const": TEAM_MEMBER}}},
+        "allOf": [{"$ref": format!("gts://{BASE}")}]
     });
     registry.seed(TEAM_SCHEMA, team_schema.clone());
 
@@ -290,18 +287,31 @@ async fn imported_groups_resolve_the_schema_and_new_groups_keep_their_stored_bin
         .membership_type;
     assert_eq!(binding.as_deref(), Some(TEAM_MEMBER));
 
-    team_schema["allOf"][1]["properties"]
-        .as_object_mut()
-        .expect("group properties")
-        .remove("membership_type");
+    let replacement = gts_id!("cf.core.rg.membership.v1~cf.test.rg.groups_only.v1~");
+    registry.seed(
+        replacement,
+        json!({
+            "$id": format!("gts://{replacement}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "allOf": [
+                {"$ref": format!("gts://{MEMBER_V1}")},
+                {"properties": {"resource_type": {"const": TEAM_SCHEMA}}}
+            ]
+        }),
+    );
+    // Inject a different registry snapshot to exercise the stored binding independently of admission.
+    team_schema["x-gts-traits"]["membership_type"] = json!(replacement);
+    team_schema["x-gts-traits-schema"]["properties"]["membership_type"]["const"] =
+        json!(replacement);
     registry.seed(TEAM_SCHEMA, team_schema);
+    let new_team = groups
+        .create_group(&ctx, CreateGroupRequest::new(TEAM_SCHEMA, "New"), tenant)
+        .await
+        .expect("new group uses the replacement binding");
     assert!(matches!(
-        groups
-            .create_group(
-                &ctx,
-                CreateGroupRequest::new(TEAM_SCHEMA, "Unbound"),
-                tenant
-            )
+        members
+            .add_membership(&ctx, new_team.id, USER, "user-43")
             .await,
         Err(DomainError::Validation { .. })
     ));

@@ -64,6 +64,8 @@ fn registry() -> Arc<MockTypesRegistry> {
             "$id": gts_uri!("cf.core.rg.type.v1~cf.test.rg.tenant.v1~"),
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
+            "x-gts-traits": {"membership_type": MEMBERSHIP},
+            "x-gts-traits-schema": {"properties": {"membership_type": {"const": MEMBERSHIP}}},
             "$defs": { "tenant_meta": {
                 "type": "object",
                 "required": ["tier"],
@@ -73,8 +75,7 @@ fn registry() -> Arc<MockTypesRegistry> {
                 { "$ref": gts_uri!("cf.core.rg.type.v1~") },
                 { "properties": {
                     "metadata": { "$ref": "#/$defs/tenant_meta" },
-                    "parent_type": { "enum": [null, TENANT] },
-                    "membership_type": { "const": MEMBERSHIP }
+                    "parent_type": { "enum": [null, TENANT] }
                 } }
             ]
         }),
@@ -130,22 +131,20 @@ async fn reads_the_inherited_membership_binding_and_validates_placement() {
         dept.membership_type().expect("membership binding"),
         MEMBERSHIP
     );
-    dept.validate_group(Some(TENANT), None, None)
+    dept.validate_group(Some(TENANT), None)
         .expect("tenant parent");
-    dept.validate_group(Some(DEPT), None, None)
+    dept.validate_group(Some(DEPT), None)
         .expect_err("department parent");
-    dept.validate_group(None, None, None)
+    dept.validate_group(None, None)
         .expect_err("department as root");
 
     let tenant = catalog(registry())
         .get_type(&caller(1), TENANT, TypeUse::NewLink)
         .await
         .expect("active group type");
+    tenant.validate_group(None, None).expect("tenant as root");
     tenant
-        .validate_group(None, None, None)
-        .expect("tenant as root");
-    tenant
-        .validate_group(Some(TENANT), None, None)
+        .validate_group(Some(TENANT), None)
         .expect("self nesting");
 }
 
@@ -198,7 +197,7 @@ async fn a_deleted_type_takes_no_new_link_but_still_defines_its_groups() {
         .await
         .expect("a deleted type's definition is retained");
     retained
-        .validate_group(None, None, Some(&json!({ "tier": "gold" })))
+        .validate_group(None, Some(&json!({ "tier": "gold" })))
         .expect("its schema still applies");
 }
 
@@ -300,13 +299,9 @@ async fn metadata_is_validated_by_the_sdk_against_the_inherited_resolved_schema(
         .get_type(&caller(1), DEPT, TypeUse::NewLink)
         .await
         .expect("active type");
-    dept.validate_group(
-        Some(TENANT),
-        None,
-        Some(&json!({ "tier": "gold", "code": "ab" })),
-    )
-    .expect("conforms");
-    dept.validate_group(Some(TENANT), None, None)
+    dept.validate_group(Some(TENANT), Some(&json!({ "tier": "gold", "code": "ab" })))
+        .expect("conforms");
+    dept.validate_group(Some(TENANT), None)
         .expect("metadata is optional");
     for invalid in [
         json!({ "code": "ab" }),
@@ -315,7 +310,7 @@ async fn metadata_is_validated_by_the_sdk_against_the_inherited_resolved_schema(
         json!("not an object"),
     ] {
         let err = dept
-            .validate_group(Some(TENANT), None, Some(&invalid))
+            .validate_group(Some(TENANT), Some(&invalid))
             .expect_err("the inherited ($defs-referenced) and own constraints apply");
         assert!(
             matches!(err, DomainError::Validation { .. }),
@@ -365,8 +360,7 @@ async fn validation_follows_the_registry_resolved_schema_not_the_authored_conten
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {
-            "metadata": { "type": "object", "required": ["only_in_resolved"] },
-            "membership_type": { "const": MEMBERSHIP }
+            "metadata": { "type": "object", "required": ["only_in_resolved"] }
         }
     });
     let dept = catalog(Arc::new(ResolvedOverride {
@@ -377,10 +371,10 @@ async fn validation_follows_the_registry_resolved_schema_not_the_authored_conten
     .await
     .expect("active type");
     let err = dept
-        .validate_group(Some(TENANT), None, Some(&json!({ "tier": "gold" })))
+        .validate_group(Some(TENANT), Some(&json!({ "tier": "gold" })))
         .expect_err("the materialized resolved schema is the one enforced");
     assert!(matches!(err, DomainError::Validation { .. }), "{err:?}");
-    dept.validate_group(Some(TENANT), None, Some(&json!({ "only_in_resolved": 1 })))
+    dept.validate_group(Some(TENANT), Some(&json!({ "only_in_resolved": 1 })))
         .expect("the authored content's constraints are not re-derived");
 }
 

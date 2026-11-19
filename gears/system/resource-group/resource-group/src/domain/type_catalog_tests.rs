@@ -27,15 +27,13 @@ fn snapshot(content: Value, resolved_schema: Value) -> TypeSchema {
     }
 }
 
-fn binding(resolved_schema: Value) -> Result<String, DomainError> {
-    RgType::from_schema(&snapshot(json!({}), resolved_schema))
+fn binding(traits: Value) -> Result<String, DomainError> {
+    let mut schema = snapshot(json!({}), json!({}));
+    schema.effective_traits = Some(traits);
+    RgType::from_schema(&schema)
         .expect("group schema compiles")
         .membership_type()
         .map(str::to_owned)
-}
-
-fn fixed(id: &str) -> Value {
-    json!({ "properties": { "membership_type": { "const": id } } })
 }
 
 #[test]
@@ -57,10 +55,9 @@ fn a_schema_gts_cannot_compile_is_internal() {
 }
 
 #[test]
-fn the_binding_is_a_const_on_the_schema_or_its_all_of_branches() {
-    assert_eq!(binding(fixed(MEMBERSHIP)).unwrap(), MEMBERSHIP);
+fn the_binding_comes_from_effective_trait_values() {
     assert_eq!(
-        binding(json!({ "allOf": [{}, { "allOf": [fixed(MEMBERSHIP)] }] })).unwrap(),
+        binding(json!({"membership_type": MEMBERSHIP})).unwrap(),
         MEMBERSHIP
     );
 }
@@ -73,7 +70,7 @@ fn only_a_concrete_membership_schema_binds() {
         "gts.cf.core.rg.membership.v1~not an id",
     ] {
         assert!(concrete_membership_type(id).is_none(), "{id}");
-        let err = binding(fixed(id)).unwrap_err();
+        let err = binding(json!({"membership_type": id})).unwrap_err();
         assert!(
             matches!(err, DomainError::Validation { .. }),
             "{id}: {err:?}"
@@ -83,13 +80,18 @@ fn only_a_concrete_membership_schema_binds() {
 }
 
 #[test]
-fn a_conditional_const_does_not_bind() {
-    for resolved in [
-        json!({ "anyOf": [fixed(MEMBERSHIP)] }),
-        json!({ "oneOf": [fixed(MEMBERSHIP)] }),
-        json!({ "if": {}, "then": fixed(MEMBERSHIP) }),
-        json!({ "properties": { "membership_type": { "enum": [MEMBERSHIP] } } }),
-    ] {
-        binding(resolved.clone()).expect_err(&resolved.to_string());
+fn a_payload_const_cannot_supply_a_missing_trait() {
+    let group = snapshot(
+        json!({}),
+        json!({"properties": {"membership_type": {"const": MEMBERSHIP}}}),
+    );
+    assert!(
+        RgType::from_schema(&group)
+            .unwrap()
+            .membership_type()
+            .is_err()
+    );
+    for traits in [Value::Null, json!({}), json!({"membership_type": 42})] {
+        assert!(binding(traits).is_err());
     }
 }

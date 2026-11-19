@@ -16,7 +16,7 @@ use types_registry_sdk::{
 
 use crate::domain::error::DomainError;
 use crate::domain::type_catalog::{
-    MembershipSchema, RgType, RgTypeCatalog, TypeUse, concrete_membership_type,
+    MembershipSchema, RgType, RgTypeCatalog, TypeUse, compile, concrete_membership_type,
 };
 
 /// Production [`RgTypeCatalog`].
@@ -71,7 +71,11 @@ impl RgTypeCatalog for RegistryTypeCatalog {
                 ctx,
                 &type_id,
                 ReadOptions::default().with_projection(Projection::Select(FieldSelection::with(
-                    &[EntityField::Content, EntityField::ResolvedSchema],
+                    &[
+                        EntityField::Content,
+                        EntityField::ResolvedSchema,
+                        EntityField::EffectiveTraits,
+                    ],
                 ))),
             )
             .await
@@ -199,7 +203,7 @@ impl RegistryTypeCatalog {
         if let Some(id) = &group_id {
             let group = active(id)?.ok_or_else(|| DomainError::type_not_found(id.as_ref()))?;
             // The same compile check `get_type` makes for a new link.
-            RgType::from_schema(group)?;
+            compile(group)?;
         }
         let membership_id = membership_id?;
         if let Some(id) = resource_id.transpose()?

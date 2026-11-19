@@ -198,9 +198,10 @@ constraints. A caller-supplied target does not confer permission to write there.
 - [x] `p1` - **ID**: `cpt-cf-resource-group-principle-dynamic-types`
 
 An RG type is a GTS Type Schema derived from the abstract
-`gts.cf.core.rg.type.v1~`. RG reads its `content` and `resolved_schema` from
-Types Registry. The group schema validates `parent_type` and `metadata` and
-sets an unconditional `membership_type` constant. A root supplies
+`gts.cf.core.rg.type.v1~`. RG reads its `content`, `resolved_schema` and `effective_traits` from
+Types Registry. The group schema validates `parent_type` and `metadata`.
+A concrete type fixes the required `membership_type` trait with `const` in
+`x-gts-traits-schema` and supplies its value in `x-gts-traits`. A root supplies
 `parent_type: null`. The active membership schema selected by that binding
 validates the candidate's `resource_type`.
 
@@ -230,8 +231,7 @@ There is no distributed transaction between registry publication and an RG write
 
 Type-specific group data is stored in `resource_group.metadata` and returned as
 `metadata` in SDK and REST models. Derived GTS schemas constrain that field.
-RG validates a payload with the actual `parent_type`, the bound `membership_type`,
-and `metadata` when present. It compiles the resolved registry snapshot using
+RG validates a payload with the actual `parent_type` and `metadata` when present. It compiles the resolved registry snapshot using
 `TypeSchema::compile_payload_validator()` from `types-registry-sdk`.
 
 This keeps inherited constraints, references and GTS validation semantics in the
@@ -355,8 +355,8 @@ tenant ownership. This interface has no separate unscoped HTTP route.
 - [x] `p1` - **ID**: `cpt-cf-resource-group-component-persistence-adapter`
 
 `RgTypeCatalog` is a domain port. `RegistryTypeCatalog` implements it over
-`TypesRegistryApi`, forwarding the caller's `SecurityContext`. Group payload
-reads select `Content` and `ResolvedSchema`. Adding a membership batches the
+`TypesRegistryApi`, forwarding the caller's `SecurityContext`. Group type
+reads select `Content`, `ResolvedSchema` and `EffectiveTraits`. Adding a membership batches the
 lookup of the bound membership schema and member resource type.
 
 `GroupRepositoryTrait` and `MembershipRepositoryTrait` are injected into services.

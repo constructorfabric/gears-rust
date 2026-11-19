@@ -98,37 +98,30 @@ async fn user_groups_nest_and_accept_only_user_memberships() {
     let registry = admitted_registry().await;
     let group = validator(registry.as_ref(), USER_GROUP_RG_TYPE_CODE).await;
     group
-        .validate(&json!({"parent_type":null,"membership_type":USER_MEMBERSHIP_SCHEMA}))
+        .validate(&json!({"parent_type":null}))
         .expect("root and absent metadata");
     group
         .validate(&json!({
             "parent_type": USER_GROUP_RG_TYPE_CODE,
-            "membership_type": USER_MEMBERSHIP_SCHEMA,
             "metadata": {}
         }))
         .expect("same-type parent and empty metadata");
     group
         .validate(&json!({
-            "parent_type": DERIVED_USER_GROUP,
-            "membership_type": USER_MEMBERSHIP_SCHEMA
+            "parent_type": DERIVED_USER_GROUP
         }))
-        .expect("a derived user-group type can be a parent");
+        .expect_err("a parent must have the exact AM user-group type");
     group
-        .validate(
-            &json!({"parent_type":USER_RESOURCE_TYPE,"membership_type":USER_MEMBERSHIP_SCHEMA}),
-        )
+        .validate(&json!({"parent_type":USER_RESOURCE_TYPE}))
         .expect_err("users cannot parent groups");
     group
         .validate(&json!({
             "parent_type": null,
             "membership_type": "gts.cf.core.rg.membership.v1~cf.test.am.other_member.v1~"
         }))
-        .expect_err("a user group binds only AM's membership schema");
+        .expect_err("membership_type is not a group payload field");
     group
-        .validate(&json!({"parent_type": null}))
-        .expect_err("membership_type is required");
-    group
-        .validate(&json!({"membership_type": USER_MEMBERSHIP_SCHEMA}))
+        .validate(&json!({}))
         .expect_err("parent_type is required");
 
     let membership = validator(registry.as_ref(), USER_MEMBERSHIP_SCHEMA).await;
@@ -153,7 +146,6 @@ async fn user_group_metadata_rejects_unknown_fields() {
     group
         .validate(&json!({
             "parent_type": null,
-            "membership_type": USER_MEMBERSHIP_SCHEMA,
             "metadata": {"extra": 1}
         }))
         .expect_err("v1 user groups declare no metadata fields");
@@ -166,6 +158,12 @@ async fn resource_group_resolves_the_user_group_binding() {
     use resource_group::domain::type_catalog::{RgTypeCatalog, TypeUse};
     use resource_group::infra::types_registry::RegistryTypeCatalog;
 
+    let group_schema = declaration(crate::gts_declarations(), USER_GROUP_RG_TYPE_CODE);
+    assert_eq!(
+        group_schema["x-gts-traits-schema"]["properties"]["membership_type"]["const"],
+        USER_MEMBERSHIP_SCHEMA,
+        "descendants must keep AM's membership schema"
+    );
     let registry = admitted_registry().await;
     let catalog = RegistryTypeCatalog::new(registry);
     let caller = toolkit_security::SecurityContext::builder()

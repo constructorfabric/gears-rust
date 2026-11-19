@@ -4,13 +4,21 @@
 use toolkit_gts::gts_id;
 use toolkit_gts::local::gts_type_schema;
 
+/// Type-level binding to the membership schema used by new groups.
+#[derive(schemars::JsonSchema, serde::Serialize, toolkit_gts::GtsTraitsSchema)]
+pub struct ResourceGroupTypeTraitsV1 {
+    /// GTS ID of a concrete membership schema.
+    #[schemars(extend("x-gts-type-ref" = MEMBERSHIP_TYPE_V1))]
+    pub membership_type: String,
+}
+
 /// Abstract GTS base type for Resource Group types: `gts.cf.core.rg.type.v1~`.
 ///
 /// The persisted types registry is the only catalogue of RG types. Owners
 /// publish derived types (`gts.cf.core.rg.type.v1~<vendor>...~`) before
 /// application `init`; resource-group publishes this base.
 ///
-/// A concrete type must fix `membership_type` with a string `const` for new
+/// A concrete type must fix the `membership_type` trait with a string `const` for new
 /// groups; it may narrow `parent_type` and metadata. The owner does the
 /// narrowing: resource-group enforces the schema as published and does not
 /// check that it narrows anything. Left as declared here, `parent_type`
@@ -25,11 +33,12 @@ use toolkit_gts::local::gts_type_schema;
     dir_path = "schemas",
     type_id = gts_id!("cf.core.rg.type.v1~"),
     description = "Resource group placement, membership schema and metadata",
-    properties = "id,metadata,parent_type,membership_type",
+    properties = "id,metadata,parent_type",
+    traits_schema = inline(ResourceGroupTypeTraitsV1),
     base = true,
     gts_abstract = true
 )]
-#[schemars(extend("required" = ["parent_type", "membership_type"]))]
+#[schemars(extend("required" = ["parent_type"]))]
 pub struct ResourceGroupTypeV1<M> {
     /// GTS type path (schema identifier).
     pub id: gts::GtsInstanceId,
@@ -38,9 +47,6 @@ pub struct ResourceGroupTypeV1<M> {
     /// Actual parent's GTS type, or null when the group is a root.
     #[schemars(extend("x-gts-type-ref" = TYPE_RESOURCE_TYPE))]
     pub parent_type: Option<String>,
-    /// Exact membership schema identifier, bound at group creation.
-    #[schemars(extend("x-gts-type-ref" = MEMBERSHIP_TYPE_V1))]
-    pub membership_type: String,
 }
 
 /// Base of schemas constraining the type of a group member.

@@ -112,9 +112,9 @@ Types Registry; RG does not duplicate them in this identifier check.
 ### Registry Snapshot Consumption
 
 `RegistryTypeCatalog` implements `RgTypeCatalog` using `TypesRegistryApi` with the
-caller's SecurityContext. Group type reads request authored content and the
-resolved schema. `RgType` compiles the group validator and extracts the
-membership binding. New links load the bound membership schema and verify that
+caller's SecurityContext. Group type reads request authored content, the resolved schema and effective
+traits. `RgType` compiles the payload validator and reads the membership binding
+from the effective traits. New links load the bound membership schema and verify that
 the resource type is active. Registry reads run before the RG write transaction.
 
 A new group or membership requires active definitions. Existing group updates
@@ -126,21 +126,21 @@ availability failures retain their intended error classifications.
 ### Schema-Validated Group and Membership Types
 
 The SDK publishes the abstract group base `gts.cf.core.rg.type.v1~` with required
-`parent_type` and `membership_type`, and the abstract membership base
+payload field `parent_type` and required trait `membership_type`, and the abstract membership base
 `gts.cf.core.rg.membership.v1~`.
 The base `parent_type` accepts `null` or a string matching the fixed
 `x-gts-type-ref` for the RG type family.
-A concrete group schema constrains the actual `parent_type` and declares an unconditional
-`properties.membership_type.const` naming a concrete membership schema.
+A concrete group schema constrains the actual `parent_type` and supplies the membership schema ID
+in `x-gts-traits.membership_type`. A `const` on that property in
+`x-gts-traits-schema` fixes the value for descendants.
 Publish both concrete definitions through Types Registry before creating
 groups that use them.
 
-RG reads the effective group schema and the active membership definition before
-creation. The group write transaction validates the actual parent's type
-(or `null` at the root), the fixed binding and metadata, and stores the
-binding as a key in `gts_type`. A group update that needs type validation
-uses the same binding and checks the resulting payload in the write
-transaction. The parent group still has to pass RG's tenant and hierarchy checks.
+Before creation RG reads the group schema, resolves `membership_type` from
+`effective_traits` and verifies that the membership definition is active. The group write transaction validates the actual parent's type
+(or `null` at the root) and metadata, and stores the binding as a key in
+`gts_type`. Group updates validate the resulting payload in the write
+transaction and retain the stored binding. The parent group still has to pass RG's tenant and hierarchy checks.
 
 A membership addition verifies the group type, the bound membership schema and
 the resource type are active. The membership schema validates only
@@ -150,7 +150,8 @@ the binding column existed, RG uses the binding from the published group schema.
 
 Types Registry checks same-ID revisions against the previous schema. The
 placement and membership schemas can widen through ordinary publication,
-while incompatible revisions are refused. The admission tests verify
+while incompatible payload revisions are refused. Checking the effective traits schema
+on same-ID revisions is tracked in [#6064](https://github.com/constructorfabric/gears-rust/issues/6064). The admission tests verify
 widening an inherited placement `anyOf` with GTS 0.17.2. Indirect changes
 from mutable references remain subject to the existing dependent refresh
 behavior.

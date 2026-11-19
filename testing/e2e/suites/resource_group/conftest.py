@@ -74,17 +74,21 @@ def membership_schema_id(group_code: str) -> str:
     return RG_MEMBERSHIP_BASE + group_code.removeprefix(RG_BASE_TYPE)
 
 
-def rg_type_schema(code: str, parent_type: Optional[dict] = None) -> dict:
+def rg_type_schema(
+    code: str, parent_type: Optional[dict] = None, *, membership_type: Optional[str] = None,
+) -> dict:
     """The concrete group definition published through Types Registry."""
+    binding = membership_schema_id(code) if membership_type is None else membership_type
     return {
         "$id": f"gts://{code}",
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
+        "x-gts-traits-schema": {"type": "object", "properties": {"membership_type": {"const": binding}}},
+        "x-gts-traits": {"membership_type": binding},
         "allOf": [
             {"$ref": f"gts://{RG_BASE_TYPE}"},
             {"properties": {
                 "parent_type": parent_type if parent_type is not None else {"type": "null"},
-                "membership_type": {"type": "string", "const": membership_schema_id(code)},
             }},
         ],
     }

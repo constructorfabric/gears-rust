@@ -12,7 +12,7 @@ from .conftest import (
     rg_type_schema,
     unique_type_code,
 )
-from ..types_registry.helpers import PLATFORM_API, RECEIPT, submit_and_poll
+from ..types_registry.helpers import PLATFORM_API, RECEIPT, get_entity, submit_and_poll
 
 
 async def register_schema(registry, code, schema, *, version=None, refusal_reasons=()):
@@ -68,28 +68,55 @@ async def test_existing_group_can_move_after_placement_schema_widens(
             refusal_reasons=("incompatible_with_baseline", "compatibility_undecidable"),
         )
 
-        changed_binding = deepcopy(widened)
-        changed_binding["allOf"][1]["properties"]["membership_type"] = {
-            "type": "string", "const": membership_schema_id(department),
-        }
-        await register_schema(
-            registry, team, changed_binding, version=2, refusal_reasons=("incompatible_with_baseline",),
-        )
-
         moved = await rg.put(path, json=move)
         assert moved.status_code == 200, moved.text
         assert moved.json()["hierarchy"]["parent_id"] == parent["id"]
 
-        del widened["allOf"][1]["properties"]["membership_type"]
-        await register_schema(registry, team, widened, version=2)
-        new_group = await rg.post(
-            f"{rg_base_url}/resource-group/v1/groups", json={"type": team, "name": "Unbound"},
-        )
-        assert new_group.status_code == 400, new_group.text
         existing = await rg.post(
             f"{rg_base_url}/resource-group/v1/memberships/{group['id']}/{department}/member-1",
         )
         assert existing.status_code == 201, existing.text
+
+
+async def test_a_concrete_group_type_requires_a_membership_trait(registry, create_type):
+    team = await create_type("bound")
+    unbound = rg_type_schema(team)
+    del unbound["x-gts-traits"]
+    await register_schema(registry, team, unbound, version=1, refusal_reasons=("invalid_schema",))
+
+
+async def test_derived_group_inherits_the_locked_membership_trait(registry, create_type):
+    team = await create_type("team")
+    other = await create_type("other")
+    child = team + "x.e2etest._.child.v1~"
+    schema = {
+        "$id": f"gts://{child}", "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object", "allOf": [{"$ref": f"gts://{team}"}],
+    }
+    await register_schema(registry, child, schema)
+    current = await get_entity(registry, PLATFORM_API, child, select="effective_traits")
+    assert current.status_code == 200, current.text
+    assert current.json()["effective_traits"]["membership_type"] == membership_schema_id(team)
+
+    schema["x-gts-traits"] = {"membership_type": membership_schema_id(other)}
+    await register_schema(registry, child, schema, version=1, refusal_reasons=("invalid_schema",))
+
+
+@pytest.mark.skip(
+    reason="Types Registry must check effective trait schema compatibility: "
+           "https://github.com/constructorfabric/gears-rust/issues/6064",
+)
+async def test_group_type_revision_cannot_replace_its_membership_binding(registry, create_type):
+    team = await create_type("team")
+    other = await create_type("other")
+    rebound = rg_type_schema(team, membership_type=membership_schema_id(other))
+    await register_schema(
+        registry, team, rebound, version=1, refusal_reasons=("incompatible_with_baseline",),
+    )
+    current = await get_entity(registry, PLATFORM_API, team, select="origin,effective_traits")
+    assert current.status_code == 200, current.text
+    assert current.json()["origin"]["resource_version"] == 1
+    assert current.json()["effective_traits"]["membership_type"] == membership_schema_id(team)
 
 
 async def test_existing_group_uses_widened_membership_schema(

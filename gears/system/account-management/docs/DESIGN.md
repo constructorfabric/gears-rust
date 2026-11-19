@@ -402,12 +402,12 @@ When strict-mode enforcement is active, AM validates the chained schema identifi
 
 **User-group Resource Group type schema:** AM declares the chained RG type `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` — [user_group.v1.schema.json](./schemas/user_group.v1.schema.json). The schema reuses the RG base contract and accepts an omitted or empty `metadata` object in v1. The authoritative declaration is `UserGroupTypeV1` in `account-management/src/gts/rg_types.rs`, published with AM's types-registry manifest. The JSON file is a documentation copy. The chained GTS `$id` identifies the AM user-group type as a derivative of the RG base type.
 
-**Member resource type:** The bound membership schema accepts the AM user resource type `gts.cf.core.am.user.v1~` and its derived types as `resource_type`. The `anyOf` branch uses `x-gts-type-ref` to select that family. [User resource schema](./schemas/user.v1.schema.json)
+**Member resource type:** The bound membership schema accepts the AM user resource type `gts.cf.core.am.user.v1~` and its derived types as `resource_type`. The `x-gts-type-ref` on `resource_type` selects that family. [User resource schema](./schemas/user.v1.schema.json)
 
 | Schema field | Value | Meaning |
 |-------|-------|---------|
-| `parent_type` | `anyOf` with `null` and a string constrained by `x-gts-type-ref` to the user-group type | Allows roots and nesting under the user-group type or its derivatives. |
-| `membership_type` | `gts.cf.core.rg.membership.v1~cf.core.am.user_group_member.v1~` | Binds the schema that allows the AM user resource type and its derivatives. |
+| `parent_type` | `enum` containing `null` and the exact AM user-group type ID | Allows roots and nesting under the exact AM user-group type. |
+| `x-gts-traits.membership_type` | `gts.cf.core.rg.membership.v1~cf.core.am.user_group_member.v1~` | Binds the schema that allows the AM user resource type and its derivatives. |
 
 Resource Group's ownership-graph profile enforces tenant compatibility and scope isolation at write time. The schema governs type topology, metadata, and membership type constraints.
 

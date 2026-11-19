@@ -10,38 +10,27 @@ use account_management_sdk::gts::{USER_GROUP_RG_TYPE_CODE, USER_RESOURCE_TYPE};
 
 const USER_MEMBERSHIP_SCHEMA: &str = <UserGroupMembershipV1 as gts::GtsSchema>::TYPE_ID;
 
-fn user_group_parent(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    schemars::json_schema!({
-        "anyOf": [
-            {"type": "null"},
-            {"type": "string", "x-gts-type-ref": USER_GROUP_RG_TYPE_CODE}
-        ]
-    })
+#[derive(schemars::JsonSchema, serde::Serialize, toolkit_gts::GtsTraitsSchema)]
+struct UserGroupTraits {
+    #[schemars(extend("const" = USER_MEMBERSHIP_SCHEMA))]
+    membership_type: &'static str,
 }
 
-/// The AM user-group container allows root placement and parent types in the AM user-group family.
+/// The AM user-group container can be a root or nest under another group of this exact type.
 #[gts_type_schema(
     dir_path = "schemas",
     base = ResourceGroupTypeV1,
     type_id = gts_id!("cf.core.rg.type.v1~cf.core.am.user_group.v1~"),
     description = "Account Management user group: an RG group of AM users",
     properties = "",
+    traits_schema = inline(UserGroupTraits),
+    traits = UserGroupTraits { membership_type: USER_MEMBERSHIP_SCHEMA },
     overrides(ResourceGroupTypeV1 = {
-        #[schemars(schema_with = "user_group_parent")]
-        parent_type: String,
-        #[schemars(extend("x-gts-type-ref" = resource_group_sdk::gts::MEMBERSHIP_TYPE_V1, "const" = USER_MEMBERSHIP_SCHEMA))]
-        membership_type: String,
+        #[schemars(extend("enum" = [null, USER_GROUP_RG_TYPE_CODE]))]
+        parent_type: Option<String>,
     })
 )]
 pub struct UserGroupTypeV1;
-
-fn user_group_member_type(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    schemars::json_schema!({
-        "anyOf": [
-            {"type": "string", "x-gts-type-ref": USER_RESOURCE_TYPE}
-        ]
-    })
-}
 
 /// Allowed resource types for membership in AM user groups.
 #[gts_type_schema(
@@ -51,7 +40,7 @@ fn user_group_member_type(_: &mut schemars::SchemaGenerator) -> schemars::Schema
     description = "Allowed resource types for Account Management user groups",
     properties = "",
     overrides(ResourceGroupMembershipV1 = {
-        #[schemars(schema_with = "user_group_member_type")]
+        #[schemars(extend("x-gts-type-ref" = USER_RESOURCE_TYPE))]
         resource_type: String,
     })
 )]

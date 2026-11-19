@@ -17,26 +17,30 @@
           "properties": {}
         },
         "parent_type": {
-          "anyOf": [
-            {
-              "type": "null"
-            },
-            {
-              "type": "string",
-              "x-gts-type-ref": "gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~"
-            }
+          "enum": [
+            null,
+            "gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~"
           ]
-        },
-        "membership_type": {
-          "type": "string",
-          "x-gts-type-ref": "gts.cf.core.rg.membership.v1~",
-          "const": "gts.cf.core.rg.membership.v1~cf.core.am.user_group_member.v1~"
         }
       },
       "required": [
-        "parent_type",
-        "membership_type"
+        "parent_type"
       ]
     }
-  ]
+  ],
+  "x-gts-traits-schema": {
+    "type": "object",
+    "properties": {
+      "membership_type": {
+        "type": "string",
+        "const": "gts.cf.core.rg.membership.v1~cf.core.am.user_group_member.v1~"
+      }
+    },
+    "required": [
+      "membership_type"
+    ]
+  },
+  "x-gts-traits": {
+    "membership_type": "gts.cf.core.rg.membership.v1~cf.core.am.user_group_member.v1~"
+  }
 }

@@ -226,8 +226,7 @@ fn seed_into(registry: &MockTypesRegistry, req: &CreateTypeRequest) {
         json!({"type": ["string", "null"], "enum": parents})
     };
     let mut properties = json!({
-        "parent_type": parent_type,
-        "membership_type": {"type": "string", "const": membership_type}
+        "parent_type": parent_type
     });
     if let Some(metadata) = &req.metadata_schema {
         properties["metadata"] = metadata.clone();
@@ -239,6 +238,8 @@ fn seed_into(registry: &MockTypesRegistry, req: &CreateTypeRequest) {
             "$id": format!("gts://{}", req.code),
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
+            "x-gts-traits": {"membership_type": membership_type},
+            "x-gts-traits-schema": {"properties": {"membership_type": {"const": membership_type}}},
             "allOf": [{ "$ref": format!("gts://{parent}~") }, { "properties": properties }],
         }),
     );

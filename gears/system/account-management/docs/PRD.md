@@ -752,7 +752,7 @@ User groups are implemented as [Resource Group](../../resource-group/docs/PRD.md
 
 **Actors**: `cpt-cf-account-management-actor-platform-admin`
 
-AM **MUST** publish the chained user-group schema `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~`, the user resource type `gts.cf.core.am.user.v1~`, and the user membership schema with its Types Registry manifest before application initialization. The group schema **MUST** admit root placement and parents whose type is the user-group type or one of its derivatives. The bound membership schema **MUST** admit `resource_type` values in the AM user type family. Resource Group reads these schemas from Types Registry and enforces tenant-scoped placement through its ownership-graph rules.
+AM **MUST** publish the chained user-group schema `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~`, the user resource type `gts.cf.core.am.user.v1~`, and the user membership schema with its Types Registry manifest before application initialization. The group schema **MUST** admit root placement and parents of the exact AM user-group type. The bound membership schema **MUST** admit `resource_type` values in the AM user type family. Resource Group reads these schemas from Types Registry and enforces tenant-scoped placement through its ownership-graph rules.
 
 - **Rationale**: A dedicated Resource Group type ensures user group operations are governed by the same typed hierarchy, forest invariants, and tenant isolation rules as all other Resource Group entities, without reimplementing group infrastructure in AM.
 
@@ -1975,7 +1975,7 @@ IdP implementations may align with standards such as SCIM 2.0 and OIDC where app
 - [ ] Direct children queries return paginated results with status filtering.
 - [ ] IdP user operations (provision, deprovision, query) work through pluggable IdP integration contract.
 - [ ] User deprovisioning is idempotent: deleting an already-absent IdP user returns success while a missing tenant still returns `not_found`.
-- [ ] AM's Types Registry manifest publishes the user-group schema, its bound membership schema, and the user resource schema before user-group operations begin. The group schema accepts roots and nesting under the user-group type or its derivatives.
+- [ ] AM's Types Registry manifest publishes the user-group schema, its bound membership schema, and the user resource schema before user-group operations begin. The group schema accepts roots and nesting under the exact AM user-group type.
 - [ ] User groups (delegated to Resource Group) support creation, membership management, and nested groups with cycle detection via Resource Group forest invariants.
 - [ ] Extensible tenant metadata (e.g., branding, contacts, billing-address) is configurable per tenant via GTS-registered schemas, with per-schema inheritance policy, exposed via tenant metadata resolution API.
 - [ ] Tenant metadata entries written directly on a tenant are discoverable via a dedicated listing endpoint with pagination; listing honors self-managed barriers the same way other tenant-scoped reads do.

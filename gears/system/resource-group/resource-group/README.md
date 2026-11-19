@@ -47,16 +47,16 @@ Dynamic publishers use Types Registry's platform API. See the
 [migration guidance](../docs/DESIGN.md).
 
 Group types derive from `gts.cf.core.rg.type.v1~`, which requires
-`parent_type` and `membership_type`. Publish a concrete membership schema
+a `parent_type` payload field and a `membership_type` trait on concrete types. Publish a concrete membership schema
 under `gts.cf.core.rg.membership.v1~` and the group schema that binds to it.
 Several group types can share a membership schema.
 
 - The group schema constrains `parent_type` in its body. At write time RG
   supplies the actual parent's GTS type, or `null` for a root. For a parent
   family, use a string branch with `x-gts-type-ref`.
-- The group schema declares an unconditional string `const` for
-  `membership_type` under `properties`. RG reads that constant from the
-  resolved schema, checks that the target is active and concrete, and binds
+- The group type sets `x-gts-traits.membership_type` and locks it with
+  `const` in `x-gts-traits-schema.properties.membership_type`. RG reads the
+  value from `effective_traits`, checks that the target is active and concrete, and binds
   the new group to it using a dictionary key. Group creation takes the usual
   group request.
 - When adding a member, RG uses that binding to validate `{resource_type}`
@@ -68,12 +68,18 @@ rules. Widening placement or membership constraints can take effect for
 existing groups. The [schema revision E2E tests](../../../../testing/e2e/suites/resource_group/test_type_revisions.py)
 publish revisions through Types Registry and verify that existing groups can
 move or accept members under the widened rules. They also check that the
-registry refuses incompatible revisions.
+registry refuses incompatible payload revisions. Same-ID compatibility of the
+effective traits schema is tracked in [#6064](https://github.com/constructorfabric/gears-rust/issues/6064).
 
 The upgrade adds a nullable binding column for pre-existing database rows.
 Those groups resolve their binding from the published type until they have
 one in storage. Publish group and membership schemas for their existing GTS
 identifiers before they need type-dependent writes.
+
+Registries that already admitted the earlier v1 schema with a required
+`membership_type` payload field need a schema migration. Moving that field
+to traits changes the accepted payloads and can fail the registry's same-ID
+compatibility check.
 
 Export custom type definitions before upgrading: the migration removes the old
 local definitions (metadata schemas, placement rules) irreversibly and keeps
