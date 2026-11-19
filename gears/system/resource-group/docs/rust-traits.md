@@ -1,314 +1,103 @@
-<!-- Updated: 2026-04-20 by Constructor Tech -->
+# Resource Group Rust Interfaces
 
-# Rust SDK Contracts — Resource Group
+The public contracts live in
+[`resource-group-sdk/src/api.rs`](../resource-group-sdk/src/api.rs).
+Both are async, `Send + Sync` interfaces registered in ClientHub. Every fallible
+method returns `CanonicalError`; consumers can project it into the SDK's
+`ResourceGroupError` when they need typed dispatch.
 
-> Reference document for planned Rust trait contracts and SDK types.
-> Canonical source after implementation: `resource-group-sdk/src/`.
+## Authorized client: `ResourceGroupClient`
 
-## SDK Models
+This interface is for application consumers and the REST adapter. Operations use
+the caller's `SecurityContext` and enforce PolicyEnforcer constraints.
 
-Defined in `resource-group-sdk/src/models.rs`. Aligned with REST API schemas ([openapi.yaml](./openapi.yaml)).
+| Method | Purpose |
+| --- | --- |
+| `create_group` | Create a group from `CreateGroupRequest` |
+| `get_group` | Read a scoped group by UUID |
+| `list_groups` | List groups using `&ODataQuery` |
+| `update_group` | Replace name, parent and metadata; type and tenant are immutable |
+| `delete_group` | Delete an empty group |
+| `delete_group_cascade` | Delete a subtree and its memberships |
+| `get_group_descendants` | Read descendants with relative depth |
+| `get_group_ancestors` | Read ancestors with relative depth |
+| `add_membership` | Add `(group_id, resource_type, resource_id)` |
+| `remove_membership` | Remove a scoped membership by that key |
+| `list_memberships` | List memberships through the owning groups' scope |
 
-```rust
-use uuid::Uuid;
+List and hierarchy methods return `toolkit_odata::Page<T>`. The concrete service
+implements cascade deletion; the trait's default `delete_group_cascade` delegates
+to non-cascade deletion, so another implementation must override it to provide
+cascade semantics.
 
-// ── Type ────────────────────────────────────────────────────────────────
-
-/// Matches REST `Type` schema.
-#[derive(Debug, Clone)]
-pub struct ResourceGroupType {
-    pub code: String,
-    pub can_be_root: bool,
-    pub allowed_parents: Vec<String>,
-    pub allowed_memberships: Vec<String>,
-    pub metadata_schema: Option<serde_json::Value>,
-}
-
-/// Matches REST `CreateTypeRequest` schema.
-#[derive(Debug, Clone)]
-pub struct CreateTypeRequest {
-    pub code: String,
-    pub can_be_root: bool,
-    pub allowed_parents: Vec<String>,
-    pub allowed_memberships: Vec<String>,
-    pub metadata_schema: Option<serde_json::Value>,
-}
-
-/// Matches REST `UpdateTypeRequest` schema.
-#[derive(Debug, Clone)]
-pub struct UpdateTypeRequest {
-    pub can_be_root: bool,
-    pub allowed_parents: Vec<String>,
-    pub allowed_memberships: Vec<String>,
-    pub metadata_schema: Option<serde_json::Value>,
-}
-
-// ── Hierarchy context ────────────────────────────────────────────────────
-
-/// RG hierarchy context — position in the resource group tree.
-#[derive(Debug, Clone)]
-pub struct Hierarchy {
-    pub parent_id: Option<Uuid>,
-    pub tenant_id: Uuid,
-}
-
-/// Hierarchy context with computed depth (for hierarchy traversal responses).
-#[derive(Debug, Clone)]
-pub struct HierarchyWithDepth {
-    pub parent_id: Option<Uuid>,
-    pub tenant_id: Uuid,
-    pub depth: i32,
-}
-
-// ── Group ───────────────────────────────────────────────────────────────
-
-/// Matches REST `Group` schema. GTS-aligned: `id`/`type`/`name` + derived type
-/// fields at top level. Hierarchy context in `hierarchy` envelope.
-/// Derived type fields (e.g. `menu_bold`, `barrier`) are flattened to top level
-/// in API; stored in `metadata` JSONB column in DB. `id`/`name` are not duplicated
-/// in DB `metadata`.
-#[derive(Debug, Clone)]
-pub struct ResourceGroup {
-    pub id: Uuid,
-    pub r#type: String,
-    pub name: String,
-    pub hierarchy: Hierarchy,
-    /// Derived type fields, flattened. Stored in DB as `metadata` JSONB.
-    #[serde(flatten)]
-    pub metadata: serde_json::Map<String, serde_json::Value>,
-}
-
-/// Matches REST `GroupWithDepth` schema.
-#[derive(Debug, Clone)]
-pub struct ResourceGroupWithDepth {
-    pub id: Uuid,
-    pub r#type: String,
-    pub name: String,
-    pub hierarchy: HierarchyWithDepth,
-    #[serde(flatten)]
-    pub metadata: serde_json::Map<String, serde_json::Value>,
-}
-
-/// Matches REST `CreateGroupRequest` schema.
-/// Derived type fields sent as top-level properties.
-#[derive(Debug, Clone)]
-pub struct CreateGroupRequest {
-    pub id: Option<Uuid>,
-    pub r#type: String,
-    pub name: String,
-    pub parent_id: Option<Uuid>,
-    #[serde(flatten)]
-    pub metadata: serde_json::Map<String, serde_json::Value>,
-}
-
-/// Matches REST `UpdateGroupRequest` schema.
-#[derive(Debug, Clone)]
-pub struct UpdateGroupRequest {
-    pub r#type: String,
-    pub name: String,
-    pub parent_id: Option<Uuid>,
-    #[serde(flatten)]
-    pub metadata: serde_json::Map<String, serde_json::Value>,
-}
-
-// ── Membership ──────────────────────────────────────────────────────────
-
-/// Matches REST `Membership` schema.
-#[derive(Debug, Clone)]
-pub struct ResourceGroupMembership {
-    pub group_id: Uuid,
-    pub resource_type: String,
-    pub resource_id: String,
-}
-
-/// Matches REST `addMembership` / `deleteMembership` path params.
-#[derive(Debug, Clone)]
-pub struct AddMembershipRequest {
-    pub group_id: Uuid,
-    pub resource_type: String,
-    pub resource_id: String,
-}
-
-/// Matches REST `addMembership` / `deleteMembership` path params.
-#[derive(Debug, Clone)]
-pub struct RemoveMembershipRequest {
-    pub group_id: Uuid,
-    pub resource_type: String,
-    pub resource_id: String,
-}
-
-// ── Pagination ──────────────────────────────────────────────────────────
-
-/// Cursor-based pagination metadata. Matches REST `PageInfo` schema.
-#[derive(Debug, Clone)]
-pub struct PageInfo {
-    pub next_cursor: Option<String>,
-    pub prev_cursor: Option<String>,
-    pub limit: u64,
-}
-
-/// Generic paginated response. Matches REST `*Page` schemas.
-#[derive(Debug, Clone)]
-pub struct Page<T> {
-    pub items: Vec<T>,
-    pub page_info: PageInfo,
-}
-```
-
-## Core API Trait — `ResourceGroupClient`
-
-Defined in `resource-group-sdk/src/api.rs`. Full read+write contract for general consumers.
+Publish the group's GTS type through Types Registry before creating a group:
 
 ```rust
-use async_trait::async_trait;
+use resource_group_sdk::{CreateGroupRequest, ResourceGroup, ResourceGroupClient};
+use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
-use uuid::Uuid;
 
-#[async_trait]
-pub trait ResourceGroupClient: Send + Sync {
-    // ── Type lifecycle ──────────────────────────────────────────────
-    async fn create_type(&self, ctx: &SecurityContext, request: CreateTypeRequest) -> Result<ResourceGroupType, ResourceGroupError>;
-    async fn get_type(&self, ctx: &SecurityContext, code: &str) -> Result<ResourceGroupType, ResourceGroupError>;
-    async fn list_types(&self, ctx: &SecurityContext, query: ListQuery) -> Result<Page<ResourceGroupType>, ResourceGroupError>;
-    async fn update_type(&self, ctx: &SecurityContext, code: &str, request: UpdateTypeRequest) -> Result<ResourceGroupType, ResourceGroupError>;
-    async fn delete_type(&self, ctx: &SecurityContext, code: &str) -> Result<(), ResourceGroupError>;
-
-    // ── Group lifecycle ─────────────────────────────────────────────
-    async fn create_group(&self, ctx: &SecurityContext, request: CreateGroupRequest) -> Result<ResourceGroup, ResourceGroupError>;
-    async fn get_group(&self, ctx: &SecurityContext, group_id: Uuid) -> Result<ResourceGroup, ResourceGroupError>;
-    async fn list_groups(&self, ctx: &SecurityContext, query: ListQuery) -> Result<Page<ResourceGroup>, ResourceGroupError>;
-    async fn update_group(&self, ctx: &SecurityContext, group_id: Uuid, request: UpdateGroupRequest) -> Result<ResourceGroup, ResourceGroupError>;
-    async fn delete_group(&self, ctx: &SecurityContext, group_id: Uuid) -> Result<(), ResourceGroupError>;
-
-    // ── Hierarchy ───────────────────────────────────────────────────
-    async fn list_group_depth(&self, ctx: &SecurityContext, group_id: Uuid, query: ListQuery) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError>;
-
-    // ── Membership lifecycle ────────────────────────────────────────
-    async fn add_membership(&self, ctx: &SecurityContext, request: AddMembershipRequest) -> Result<ResourceGroupMembership, ResourceGroupError>;
-    async fn remove_membership(&self, ctx: &SecurityContext, request: RemoveMembershipRequest) -> Result<(), ResourceGroupError>;
-    async fn list_memberships(&self, ctx: &SecurityContext, query: ListQuery) -> Result<Page<ResourceGroupMembership>, ResourceGroupError>;
+async fn create_team(
+    client: &dyn ResourceGroupClient,
+    ctx: &SecurityContext,
+    type_code: &str,
+) -> Result<ResourceGroup, CanonicalError> {
+    client
+        .create_group(ctx, CreateGroupRequest::new(type_code, "Engineering"))
+        .await
 }
 ```
 
-## Integration Read Trait — `ResourceGroupReadHierarchy`
+A caller outside a group's scope observes the same not-found result as for a
+missing group. Membership reads and removal enforce scope through the owning
+group. An idempotent cleanup caller may treat not found as already removed only
+when its enumeration scope is no wider than its deletion scope.
 
-Narrow read-only contract for in-process plugin consumers — the AuthZ resolver
-plugin, the tenant-resolver RG plugin, and an in-process AuthZ PDP. Carries
-hierarchy walks, flat group listing, single-group existence lookup, and
-membership listing. All methods are resolved **unscoped** (they bypass
-`PolicyEnforcer`): a consumer that *is* the PDP cannot route reads back through
-the PEP without recursing. Writes remain on `ResourceGroupClient`.
+## Trusted reads: `ResourceGroupReadHierarchy`
 
-```rust
-/// Narrow reads for in-process plugin consumers (AuthZ resolver, tenant-resolver
-/// RG plugin, in-process AuthZ PDP). Resolved unscoped — bypasses PolicyEnforcer.
-#[async_trait]
-pub trait ResourceGroupReadHierarchy: Send + Sync {
-    /// Descendants of a reference group (depth >= 0).
-    async fn get_group_descendants(
-        &self,
-        ctx: &SecurityContext,
-        group_id: Uuid,
-        query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError>;
+This in-process interface serves AuthZ and tenant resolver consumers. Its methods
+bypass PolicyEnforcer: a PDP reading RG as a policy information source must not
+re-enter itself. The caller owns tenant scoping and must supply the appropriate
+filters or check the returned `tenant_id`.
 
-    /// Ancestors of a reference group (depth <= 0).
-    async fn get_group_ancestors(
-        &self,
-        ctx: &SecurityContext,
-        group_id: Uuid,
-        query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError>;
+| Method | Return type |
+| --- | --- |
+| `get_group_descendants(ctx, group_id, &query)` | `Page<ResourceGroupWithDepth>` |
+| `get_group_ancestors(ctx, group_id, &query)` | `Page<ResourceGroupWithDepth>` |
+| `list_groups(ctx, &query)` | `Page<ResourceGroup>` |
+| `get_group(ctx, id)` | `ResourceGroup` |
+| `list_memberships(ctx, &query)` | `Page<ResourceGroupMembership>` |
 
-    /// Flat OData-filtered group listing; enables batch reads (`id in (…)`).
-    async fn list_groups(
-        &self,
-        ctx: &SecurityContext,
-        query: &ODataQuery,
-    ) -> Result<Page<ResourceGroup>, ResourceGroupError>;
+Each result is wrapped in `Result<_, CanonicalError>`. A subject-membership
+lookup must filter by `resource_id` and, where appropriate, `resource_type`;
+an unfiltered call returns all membership rows. This trusted interface has no
+separate unscoped REST endpoint.
 
-    /// Single-group existence + tenant-ownership lookup. Backs PDP scope
-    /// validation (`/tenants/{t}/resourceGroups/{rg}`). Resolved unscoped.
-    async fn get_group(
-        &self,
-        ctx: &SecurityContext,
-        id: Uuid,
-    ) -> Result<ResourceGroup, ResourceGroupError>;
+## Models and query fields
 
-    /// Membership listing. Backs PDP group-membership resolution; the caller
-    /// MUST supply a subject-scoped filter (`resource_id eq '<subject_id>'`).
-    /// Resolved unscoped.
-    async fn list_memberships(
-        &self,
-        ctx: &SecurityContext,
-        query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupMembership>, ResourceGroupError>;
-}
-```
+`ResourceGroup` contains `id`, GTS `code`, `name`, `hierarchy` and optional
+`metadata`. The hierarchy contains `parent_id` and `tenant_id`;
+`ResourceGroupWithDepth` adds relative `depth`. REST serializes `code` as `type`.
 
-## Plugin Trait — collapsed into `ResourceGroupReadHierarchy`
+`CreateGroupRequest::new(code, name)` supplies the required values; its `with_*`
+setters add the optional ID, parent, target tenant and metadata.
+`UpdateGroupRequest` contains `name`, `parent_id` and `metadata`.
+`ResourceGroupMembership` contains `group_id`, `resource_type` and `resource_id`.
 
-The earlier two-tier design had a separate `ResourceGroupReadPluginClient`
-extending `ResourceGroupReadHierarchy` with `list_memberships`. The shipped SDK
-collapses this: `list_memberships` (and `get_group`) live directly on
-`ResourceGroupReadHierarchy`, and the vendor-specific plugin gateway resolves
-`dyn ResourceGroupReadHierarchy`. A vendor backend replaces the registered
-`ResourceGroupReadHierarchy` implementation at gear init rather than
-implementing a distinct plugin trait.
+`ODataQuery` carries typed filters and pagination. The SDK's
+[`odata` modules](../resource-group-sdk/src/odata/) define the supported fields.
 
-## ClientHub Registration
+## Wiring and type ownership
 
-Single implementation, two registrations:
+[`ResourceGroup::init`](../resource-group/src/gear.rs) builds `RgService` for
+`ResourceGroupClient` and `RgReadService` for `ResourceGroupReadHierarchy`, then
+registers each under its own ClientHub trait key. Both share the underlying group
+and membership services.
 
-```rust
-let svc: Arc<RgService> = Arc::new(RgService::new(/* ... */));
+RG publishes its base GTS schema from the SDK's crate-local collector. Each
+consumer publishes its derived types through its own managed publication. Group
+and membership writes obtain materialized type rules from `TypesRegistryApi`
+with the caller's context; payload validation uses `types-registry-sdk`.
 
-// Full read+write client: hub.get::<dyn ResourceGroupClient>()
-hub.register::<dyn ResourceGroupClient>(svc.clone());
-
-// AuthZ plugin: hub.get::<dyn ResourceGroupReadHierarchy>()
-hub.register::<dyn ResourceGroupReadHierarchy>(svc.clone());
-```
-
-## Usage Example
-
-```rust
-use toolkit_security::SecurityContext;
-use resource_group_sdk::{ResourceGroupClient, ResourceGroupReadHierarchy};
-use uuid::Uuid;
-
-// AuthZ plugin — hierarchy only
-let rg_hierarchy = hub.get::<dyn ResourceGroupReadHierarchy>()?;
-
-// General consumer — full CRUD including reads
-let rg = hub.get::<dyn ResourceGroupClient>()?;
-
-let ctx = SecurityContext::builder()
-    .subject_id(Uuid::new_v4())
-    .subject_tenant_id(Uuid::parse_str("11111111-1111-1111-1111-111111111111")?)
-    .build()?;
-
-// Hierarchy traversal — descendants (unscoped read)
-let query = ODataQuery::default(); // e.g. $filter "hierarchy/depth ge 0"
-let descendants = rg_hierarchy
-    .get_group_descendants(&ctx, group_id, &query)
-    .await?;
-
-// Full CRUD — create group
-let group = rg
-    .create_group(&ctx, CreateGroupRequest {
-        id: None,
-        r#type: "gts.cf.core.rg.type.v1~y.system.tn.tenant.v1~".into(),
-        name: "Acme Corp".into(),
-        parent_id: None,
-        metadata: Default::default(),
-    })
-    .await?;
-```
-
-## Trait Hierarchy Summary
-
-| Trait | Methods | Consumers | ClientHub key |
-|-------|---------|-----------|---------------|
-| `ResourceGroupClient` | 14 (full CRUD: types, groups, memberships, hierarchy) | Domain services, Apps, Admins | `dyn ResourceGroupClient` |
-| `ResourceGroupReadHierarchy` | 5 (`get_group_descendants`, `get_group_ancestors`, `list_groups`, `get_group`, `list_memberships`; all unscoped / PEP-bypassing) | AuthZ resolver plugin, tenant-resolver RG plugin, in-process AuthZ PDP | `dyn ResourceGroupReadHierarchy` |
+See [DESIGN.md](DESIGN.md) for transaction boundaries, lifecycle behavior and the
+three-table persistence model.

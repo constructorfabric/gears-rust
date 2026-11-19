@@ -6,10 +6,10 @@ SDK crate for the Resource Group gear, providing public API contracts for hierar
 
 This crate defines the transport-agnostic interface for the Resource Group gear:
 
-- **`ResourceGroupClient`** — Async trait for full type/group/membership lifecycle
+- **`ResourceGroupClient`** — Async trait for group and membership lifecycle
 - **`ResourceGroupReadHierarchy`** — Narrow read-only trait for in-process plugin consumers (e.g. AuthZ resolver, tenant-resolver RG plugin) that need ancestor/descendant walks plus flat OData listing
-- Models: `ResourceGroupType`, `ResourceGroup`, `ResourceGroupMembership`, `ResourceGroupWithDepth`, `GroupHierarchy`, etc.
-- **`ResourceGroupError`** — Error type for all operations
+- Models: `ResourceGroup`, `ResourceGroupMembership`, `ResourceGroupWithDepth`, `GroupHierarchy`, etc.
+- **`ResourceGroupError`** — Optional typed projection of the `CanonicalError` returned by client methods
 - OData filter field definitions (behind the `odata` feature)
 
 ## Usage
@@ -24,14 +24,17 @@ use resource_group_sdk::ResourceGroupClient;
 let rg = hub.get::<dyn ResourceGroupClient>()?;
 ```
 
-### Type Lifecycle
+### Publishing Types
 
-```rust
-use resource_group_sdk::CreateTypeRequest;
+Types Registry owns RG type definitions. The RG SDK publishes the base contract
+`gts.cf.core.rg.type.v1~` and its placement traits. Consumer gears declare their
+derived schemas through managed GTS publication (`gts_publication`), which runs
+before application initialization. Dynamic publishers use Types Registry's
+platform API. Publish the group and member resource types before creating links.
 
-let rg_type = rg.create_type(&ctx, CreateTypeRequest { /* ... */ }).await?;
-let fetched = rg.get_type(&ctx, &rg_type.code).await?;
-```
+See the [registry-owned type workflow](../docs/features/0002-type-management.md)
+and [upgrade guidance](../docs/DESIGN.md). Groups and memberships store GTS
+identifiers directly; type definitions are read from Types Registry when needed.
 
 ### Group Lifecycle
 
@@ -60,9 +63,14 @@ let ancestors   = rg.get_group_ancestors(&ctx, group.id, &ODataQuery::default())
 ### Memberships
 
 ```rust
-rg.add_membership(&ctx, group.id, "tenant", &tenant_id.to_string()).await?;
-rg.remove_membership(&ctx, group.id, "tenant", &tenant_id.to_string()).await?;
+rg.add_membership(&ctx, group.id, &resource_type, &resource_id).await?;
+rg.remove_membership(&ctx, group.id, &resource_type, &resource_id).await?;
 ```
+
+`resource_type` is a registered concrete GTS type identifier. On addition, the
+UTF-8 length of `resource_id` must not exceed `MAX_MEMBERSHIP_RESOURCE_ID_BYTES`
+(2600 bytes), on either supported database backend. Removal matches the stored
+type without consulting the registry and works after type retirement.
 
 ## Read-Only Hierarchy Trait
 
@@ -83,9 +91,9 @@ let page = read.list_groups(&ctx, &query).await?;
 ```rust
 use resource_group_sdk::ResourceGroupError;
 
-match rg.get_group(&ctx, id).await {
+match rg.get_group(&ctx, id).await.map_err(ResourceGroupError::from) {
     Ok(group) => { /* ... */ }
-    Err(ResourceGroupError::GroupNotFound { .. }) => { /* ... */ }
+    Err(ResourceGroupError::NotFound { .. }) => { /* ... */ }
     Err(e) => return Err(e.into()),
 }
 ```

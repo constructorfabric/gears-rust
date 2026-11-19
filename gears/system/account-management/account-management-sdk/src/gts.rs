@@ -75,12 +75,12 @@ pub const SERVICE_ACCOUNT_RESOURCE_TYPE: &str = gts_id!("cf.core.am.service_acco
 //
 // Two related identifier forms:
 // - AM resource-type names (for PEP / canonical envelopes).
-// - RG-prefixed type codes (required by RG's `validate_type_code`).
+// - RG-prefixed type identifiers for the published user-group and member types.
 //
 // Both are exported as crate constants so sibling crates import them by
 // name instead of hard-coding strings.
 
-/// RG type-registry code for the AM user-group **container** type.
+/// Registry-owned RG type identifier for the AM user-group **container** type.
 ///
 /// Used by:
 ///
@@ -88,14 +88,14 @@ pub const SERVICE_ACCOUNT_RESOURCE_TYPE: &str = gts_id!("cf.core.am.service_acco
 ///   list user-groups (optionally combined with `tenant_id eq <t>`).
 /// * `ResourceGroupClient::create_group({code: <this>, ...})` -- to
 ///   create a new user-group instance.
-/// * AM's `register_user_group_types` at gear init.
+/// * AM's `UserGroupRgTypeV1` GTS declaration, published with AM's
+///   types-registry manifest.
 ///
-/// The string lives in RG's type-registry namespace
-/// (`gts.cf.core.rg.type.v1~` prefix) as required by RG's
-/// `validate_type_code`.
+/// The string lives in RG's type namespace (`gts.cf.core.rg.type.v1~`
+/// prefix), which Resource Group requires of every group type.
 pub const USER_GROUP_RG_TYPE_CODE: &str = gts_id!("cf.core.rg.type.v1~cf.core.am.user_group.v1~");
 
-/// RG type-registry code for the AM user **member-handle** type.
+/// Registry-owned RG type identifier for the AM user **member-handle** type.
 ///
 /// Used by:
 ///
@@ -106,9 +106,9 @@ pub const USER_GROUP_RG_TYPE_CODE: &str = gts_id!("cf.core.rg.type.v1~cf.core.am
 /// * `ResourceGroupClient::list_memberships($filter=resource_type eq <this>)`
 ///   -- to enumerate user→group links (e.g. "what groups is user X in").
 ///
-/// This is a type-registry-only entry; AM users themselves live in
-/// AM's tables + `IdP`, never as RG groups. Wraps
-/// [`USER_RESOURCE_TYPE`] in the RG type-registry namespace.
+/// AM publishes this declaration through Types Registry. AM users themselves
+/// live in AM's tables + `IdP`, never as RG groups. Wraps
+/// [`USER_RESOURCE_TYPE`] in the RG type namespace.
 pub const USER_RG_TYPE_CODE: &str = gts_id!("cf.core.rg.type.v1~cf.core.am.user.v1~");
 
 // ---------------------------------------------------------------------------

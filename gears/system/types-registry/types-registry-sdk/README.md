@@ -122,16 +122,18 @@ defaults are not inserted. Consumers choose freshness, lifecycle and availabilit
 and construct their own payload envelopes; existing consumers migrate separately in T38.
 
 **Intermediate AM topology (implemented for the current execution slice).** An embedded
-registry configured `mode: legacy_only` keeps only the legacy client and v1 routes for RG:
-it registers neither new API locally, routes neither, runs no seeding or admission over a
-bound database and is not advertised in the service directory, so AM and its selected
-publishers reach a remote registry through the wiring that `gts_publication(...)` generates. The runtime
-publishes all application GTS Type Schemas and Instances before any application `init`; readiness waits for
-that barrier. `am-host publish-gts --registry <url>` publishes the same
-GTS Type Schemas and Instances as a deployment step. RG's sealed local
-`ResourceGroupTypeBootstrap` is unchanged. The composition is
-`apps/cf-gears-am-host` with flight-control as the remote registry (`config/am-remote-*.yaml`,
-`make e2e-am-remote`).
+registry configured `mode: legacy_only` keeps only the legacy client and v1 routes for
+consumers that have not migrated yet: it registers neither new API locally, routes neither,
+runs no seeding or admission over a bound database and is not advertised in the service
+directory. Consumers of the new APIs therefore reach a remote registry: AM and its selected
+publishers through the wiring that `gts_publication(...)` generates, and RG through the
+`TypesRegistryApi` it consumes to read group type definitions under each caller's context.
+The runtime publishes all application GTS Type Schemas and Instances before any application
+`init`; readiness waits for that barrier. The server's `publish-gts --registry <url>`
+subcommand publishes the same GTS Type Schemas and Instances as a deployment step. RG keeps no local type
+definitions or bootstrap (only an identity dictionary of type keys), and AM's RG types are AM-owned declarations published with AM's
+manifest. The dedicated AM remote-host executable, its configuration pair and
+`make e2e-am-remote` are deferred to T41 (see `docs/p0/SPEC.md`).
 
 ## Publishing from a gear
 

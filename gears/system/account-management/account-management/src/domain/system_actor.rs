@@ -41,8 +41,6 @@
 //!
 //! # Today's call sites
 //!
-//! * [`for_gear_init`] — RG type-schema registration from
-//!   `gear::init`. Platform-scoped (no tenant binding).
 //! * [`for_bootstrap`] — `provision_tenant` / compensation
 //!   `deprovision_tenant` on the platform root inside the bootstrap
 //!   saga and its step-3 compensator.
@@ -94,19 +92,6 @@ fn build_inner(scope_tenant: Option<Uuid>) -> SecurityContext {
         .subject_tenant_id(scope_tenant.unwrap_or_else(Uuid::nil))
         .build()
         .expect("AM_SYSTEM_ACTOR_UUID + tenant_id are always present")
-}
-
-/// gear init — RG type-schema registration. Platform-scoped (no
-/// tenant binding; the registration is a workspace-wide operation
-/// that pre-dates any tenant).
-#[must_use]
-pub(crate) fn for_gear_init() -> SecurityContext {
-    tracing::info!(
-        target: "am.system_actor",
-        site = "gear_init",
-        "am system actor constructed",
-    );
-    build_inner(None)
 }
 
 /// Bootstrap saga — `provision_tenant` on the platform root and its
@@ -188,14 +173,6 @@ mod tests {
     //! extend this test block — otherwise the new path could drift on
     //! one of these three properties without trial-firing.
     use super::*;
-
-    #[test]
-    fn gear_init_uses_nil_tenant() {
-        let ctx = for_gear_init();
-        assert_eq!(ctx.subject_id(), AM_SYSTEM_ACTOR_UUID);
-        assert_eq!(ctx.subject_type(), Some(AM_SYSTEM_SUBJECT_TYPE));
-        assert_eq!(ctx.subject_tenant_id(), Uuid::nil());
-    }
 
     #[test]
     fn tenant_bound_factories_carry_supplied_tenant() {

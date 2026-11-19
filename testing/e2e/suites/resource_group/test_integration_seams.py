@@ -2,7 +2,7 @@
 # @cpt-dod:cpt-cf-resource-group-dod-e2e-test-suite:p1
 """E2E integration seam tests for resource-group gear (Feature 0007).
 
-11 tests. One file. < 15 seconds. Zero flakes.
+Integration seam coverage for group operations and registry-owned types.
 
 Each test guards a specific integration seam -- a point where two independently
 correct components can break when connected. If the seam is already covered by
@@ -16,7 +16,8 @@ import uuid
 import httpx
 import pytest
 
-from .conftest import REQUEST_TIMEOUT, assert_group_shape
+from .conftest import REQUEST_TIMEOUT, assert_group_shape, publish_rg_type
+from ..types_registry.helpers import PLATFORM_API, get_entity
 
 
 # ── URL helpers ──────────────────────────────────────────────────────────
@@ -26,7 +27,9 @@ def _groups(base: str) -> str:
     return f"{base}/resource-group/v1/groups"
 
 
-def _types(base: str) -> str:
+def _removed_types(base: str) -> str:
+    """Resource-group's former type catalogue route; RG types now live only
+    in the types registry and are published through its platform API."""
     return f"{base}/types-registry/v1/types"
 
 
@@ -51,28 +54,6 @@ async def test_route_smoke_all_endpoints(
         h = rg_headers
 
         # --- Endpoints NOT covered by other seam tests ---
-
-        # GET /types -- list types, not exercised elsewhere
-        r = await c.get(_types(rg_base_url), headers=h)
-        assert r.status_code not in (404, 405), f"GET /types: {r.status_code}"
-
-        # GET /types/{code} -- get single type, not exercised elsewhere
-        type_data = await create_type("s1route")
-        type_code = type_data["code"]
-        r = await c.get(f"{_types(rg_base_url)}/{type_code}", headers=h)
-        assert r.status_code not in (404, 405), f"GET /types/{{code}}: {r.status_code}"
-
-        # PUT /types/{code} -- update type, not exercised elsewhere
-        r = await c.put(
-            f"{_types(rg_base_url)}/{type_code}", headers=h,
-            json={"code": type_code, "can_be_root": True},
-        )
-        assert r.status_code not in (404, 405), f"PUT /types/{{code}}: {r.status_code}"
-
-        # DELETE /types/{code} -- delete type, not exercised elsewhere
-        del_type = await create_type("s1del")
-        r = await c.delete(f"{_types(rg_base_url)}/{del_type['code']}", headers=h)
-        assert r.status_code not in (404, 405), f"DELETE /types/{{code}}: {r.status_code}"
 
         # DELETE /memberships/{group_id}/{type}/{id} -- not exercised elsewhere
         member_type = await create_type("s1mem", allowed_membership_types=[])
@@ -101,6 +82,73 @@ async def test_route_smoke_all_endpoints(
             f"{_groups(rg_base_url)}/{grp['id']}/ancestors", headers=h,
         )
         assert r.status_code not in (404, 405), f"GET /groups/{{id}}/ancestors: {r.status_code}"
+
+
+@pytest.mark.smoke
+async def test_former_type_catalogue_routes_are_gone(
+    rg_base_url, rg_headers, create_type,
+):
+    """Seam: the RG type catalogue was removed (T38b).
+
+    The `/types-registry/v1/types*` routes resource-group served are no longer
+    mounted -- RG types are published to the types registry only -- and they
+    are absent from the published OpenAPI document.
+    """
+    published = await create_type("gonecat")
+    code = published["code"]
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
+        h = rg_headers
+        base = _removed_types(rg_base_url)
+        for method, url, body in [
+            ("GET", base, None),
+            ("POST", base, {"code": code, "can_be_root": True}),
+            ("GET", f"{base}/{code}", None),
+            ("PUT", f"{base}/{code}", {"can_be_root": True}),
+            ("DELETE", f"{base}/{code}", None),
+        ]:
+            r = await c.request(method, url, headers=h, json=body)
+            assert r.status_code in (404, 405), (
+                f"{method} {url}: expected the route to be gone, got "
+                f"{r.status_code} {r.text}"
+            )
+
+        r = await c.get(f"{rg_base_url}/openapi.json")
+        assert r.status_code == 200, r.text
+        paths = r.json().get("paths", {})
+        assert not [p for p in paths if p.startswith("/types-registry/v1/types")], (
+            f"removed type routes still documented: "
+            f"{[p for p in paths if p.startswith('/types-registry/v1/types')]}"
+        )
+        assert "/resource-group/v1/groups" in paths, sorted(paths)
+
+
+# ── Registry publication contract ───────────────────────────────────────
+
+
+@pytest.mark.smoke
+async def test_type_publication_is_repeatable(
+    rg_base_url, platform_headers, create_type,
+):
+    """Seam: repeated fixture publication uses the registry revision contract.
+
+    A second suite using the same registry must admit an identical declaration
+    without creating a revision or failing with already_exists.
+    """
+    published = await create_type("repeat")
+    code = published["code"]
+    async with httpx.AsyncClient(
+        base_url=rg_base_url.rstrip("/") + "/",
+        headers=platform_headers,
+        timeout=REQUEST_TIMEOUT,
+    ) as client:
+        before = await get_entity(client, PLATFORM_API, code, select="origin,content")
+        assert before.status_code == 200, before.text
+
+        await publish_rg_type(rg_base_url, code)
+
+        after = await get_entity(client, PLATFORM_API, code, select="origin,content")
+        assert after.status_code == 200, after.text
+        assert after.json() == before.json()
 
 
 # ── S2: DTO roundtrip ───────────────────────────────────────────────────

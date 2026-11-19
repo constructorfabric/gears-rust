@@ -12,24 +12,23 @@ mod common;
 
 use std::sync::Arc;
 
+use common::CreateTypeRequest;
 use common::{
     create_root_group, create_root_type, make_ctx, make_group_service, make_membership_service,
     make_type_service, test_db,
 };
 use resource_group::domain::error::DomainError;
 use resource_group::domain::membership_service::MembershipService;
-use resource_group::domain::repo::{MembershipRepositoryTrait, TypeRepositoryTrait};
+use resource_group::domain::repo::MembershipRepositoryTrait;
 use resource_group::infra::storage::group_repo::GroupRepository;
 use resource_group::infra::storage::membership_repo::MembershipRepository;
-use resource_group::infra::storage::type_repo::TypeRepository;
-use resource_group_sdk::CreateTypeRequest;
 use toolkit_db::{DBProvider, DbError};
 use toolkit_gts::GTS_ID_PREFIX;
 use toolkit_odata::ODataQuery;
 use toolkit_security::{AccessScope, ScopeConstraint, ScopeFilter, pep_properties};
 use uuid::Uuid;
 
-type MbrSvc = MembershipService<GroupRepository, TypeRepository, MembershipRepository>;
+type MbrSvc = MembershipService<GroupRepository, MembershipRepository>;
 
 struct Fixture {
     db: Arc<DBProvider<DbError>>,
@@ -54,7 +53,7 @@ async fn setup() -> Fixture {
 
     let member_type = create_root_type(&type_svc, "isombr").await;
     let grp_code = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.isogrp{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.isogrp.i{}.v1~",
         Uuid::now_v7().as_simple()
     );
     type_svc
@@ -77,10 +76,10 @@ async fn setup() -> Fixture {
         .await
         .id;
 
-    svc.add_membership_unscoped(group_a, &member_type.code, "res-a")
+    svc.add_membership(&make_ctx(tenant_a), group_a, &member_type.code, "res-a")
         .await
         .expect("seed membership in A");
-    svc.add_membership_unscoped(group_b, &member_type.code, "res-b")
+    svc.add_membership(&make_ctx(tenant_b), group_b, &member_type.code, "res-b")
         .await
         .expect("seed membership in B");
 
@@ -211,7 +210,7 @@ async fn paging_as_tenant_b_never_returns_tenant_a_rows() {
             .await;
             let res_id = format!("res-{tenant}-{i}");
             f.svc
-                .add_membership_unscoped(group.id, &f.member_type, &res_id)
+                .add_membership(&make_ctx(tenant), group.id, &f.member_type, &res_id)
                 .await
                 .expect("seed membership");
             rows.push((group.id, res_id));
@@ -427,13 +426,9 @@ async fn owner_can_add_list_and_remove_in_own_group() {
 
 // -- Repository level: the scope is applied through the owning group --
 
-async fn type_id(f: &Fixture) -> i16 {
-    let conn = f.db.conn().expect("conn");
-    TypeRepository
-        .resolve_id(&conn, &f.member_type)
-        .await
-        .expect("resolve")
-        .expect("type exists")
+/// Memberships key the member type by its GTS identifier.
+fn type_id(f: &Fixture) -> String {
+    f.member_type.clone()
 }
 
 #[tokio::test]
@@ -456,7 +451,7 @@ async fn repo_delete_under_deny_all_scope_deletes_nothing() {
             &conn,
             &AccessScope::deny_all(),
             f.group_a,
-            type_id(&f).await,
+            &type_id(&f),
             "res-a",
         )
         .await
@@ -484,7 +479,7 @@ async fn repo_resource_id_scope_fails_closed() {
     assert!(page.items.is_empty());
 
     let deleted = MembershipRepository
-        .delete(&conn, &scope, f.group_a, type_id(&f).await, "res-a")
+        .delete(&conn, &scope, f.group_a, &type_id(&f), "res-a")
         .await
         .expect("delete");
     assert_eq!(deleted, 0);
@@ -519,7 +514,7 @@ async fn repo_mixed_scope_fails_closed() {
     assert!(page.items.is_empty(), "whole scope must be closed");
 
     let deleted = MembershipRepository
-        .delete(&conn, &scope, f.group_b, type_id(&f).await, "res-b")
+        .delete(&conn, &scope, f.group_b, &type_id(&f), "res-b")
         .await
         .expect("delete");
     assert_eq!(deleted, 0, "whole scope must be closed");
@@ -558,14 +553,14 @@ async fn repo_list_respects_tenant_scopes() {
 async fn repo_delete_respects_tenant_scopes() {
     let f = setup().await;
     let conn = f.db.conn().expect("conn");
-    let type_id = type_id(&f).await;
+    let type_id = type_id(&f);
 
     let by_b = MembershipRepository
         .delete(
             &conn,
             &AccessScope::for_tenant(f.tenant_b),
             f.group_a,
-            type_id,
+            &type_id,
             "res-a",
         )
         .await
@@ -582,7 +577,7 @@ async fn repo_delete_respects_tenant_scopes() {
             &conn,
             &AccessScope::for_tenant(f.tenant_a),
             f.group_a,
-            type_id,
+            &type_id,
             "res-a",
         )
         .await

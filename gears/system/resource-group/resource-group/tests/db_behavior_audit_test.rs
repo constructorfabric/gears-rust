@@ -42,12 +42,10 @@ mod common;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use common::{CreateTypeRequest, UpdateTypeRequest};
 use resource_group::domain::group_service::{GroupService, QueryProfile};
-use resource_group::domain::seeding::{self, GroupSeedDef};
-use resource_group::domain::type_service::TypeService;
 use resource_group::infra::storage::group_repo::GroupRepository;
-use resource_group::infra::storage::type_repo::TypeRepository;
-use resource_group_sdk::{CreateTypeRequest, UpdateGroupRequest, UpdateTypeRequest};
+use resource_group_sdk::UpdateGroupRequest;
 use toolkit_db::test_support::{QueryKind, snapshot_trace};
 use toolkit_gts::gts_id;
 use toolkit_security::SecurityContext;
@@ -60,23 +58,22 @@ use uuid::Uuid;
 fn make_group_service_with_profile(
     db: Arc<toolkit_db::DBProvider<toolkit_db::DbError>>,
     profile: QueryProfile,
-) -> GroupService<GroupRepository, TypeRepository> {
+) -> GroupService<GroupRepository> {
     GroupService::new(
         db,
         profile,
         common::make_enforcer(),
         Arc::new(GroupRepository),
-        Arc::new(TypeRepository),
-        common::make_types_registry(),
+        common::make_types_catalog(),
     )
 }
 
 /// A type that can root itself and allows itself as a parent -- lets a
 /// single type build chains/trees of arbitrary depth and width.
 async fn create_self_referencing_type(
-    type_svc: &TypeService<TypeRepository>,
+    type_svc: &common::TestTypes,
     suffix: &str,
-) -> resource_group_sdk::ResourceGroupType {
+) -> common::ResourceGroupType {
     // `resolve_ids` rejects a parent path that doesn't exist yet, so a type
     // can't reference itself as an allowed parent at create time; create it
     // plain, then update it to add the self-reference.
@@ -113,10 +110,10 @@ async fn create_self_referencing_type(
 /// Mirrors `membership_service_test.rs`'s local helper: a root type whose
 /// `allowed_membership_types` includes the given resource-type paths.
 async fn create_type_with_memberships(
-    type_svc: &TypeService<TypeRepository>,
+    type_svc: &common::TestTypes,
     suffix: &str,
     memberships: &[&str],
-) -> resource_group_sdk::ResourceGroupType {
+) -> common::ResourceGroupType {
     let code = format!(
         "{}x.test.{}.i{}.v1~",
         gts_id!("cf.core.rg.type.v1~"),
@@ -138,7 +135,7 @@ async fn create_type_with_memberships(
 /// Build a chain of `depth` nodes (root + `depth - 1` single children),
 /// returning the id of the last (deepest) node.
 async fn build_chain(
-    group_svc: &GroupService<GroupRepository, TypeRepository>,
+    group_svc: &GroupService<GroupRepository>,
     ctx: &SecurityContext,
     type_code: &str,
     tenant_id: Uuid,
@@ -166,7 +163,7 @@ async fn build_chain(
 /// `child_count` leaves directly under it. Returns the subtree root's id.
 /// Total subtree size (including the subtree root) is `child_count + 1`.
 async fn build_flat_subtree(
-    group_svc: &GroupService<GroupRepository, TypeRepository>,
+    group_svc: &GroupService<GroupRepository>,
     ctx: &SecurityContext,
     type_code: &str,
     parent_id: Uuid,
@@ -236,16 +233,31 @@ async fn trace_create_root_group() {
          re-read it; got {rg_selects} resource_group SELECTs:\n{}",
         rec.dump()
     );
-    // Exactly 1 gts_type SELECT: `find_by_code_with_model`'s combined id+type
-    // lookup (RG-11). The second one belonged to the response read-back,
-    // which resolved the very code this request supplied -- it went with the
-    // read-back itself (RG-08).
-    let type_selects = count_in(&rec.stats(), QueryKind::Select, "gts_type");
+    // The type definition comes from the types registry before `BEGIN`
+    // (RG-09, T38b): the database holds no type catalogue to read. The only
+    // type table touched is the identity dictionary, inside the transaction:
+    // the first group of a type reads it and adds the key.
+    let tables: std::collections::BTreeSet<String> =
+        rec.stats().keys().map(|(_, table)| table.clone()).collect();
+    assert!(
+        tables
+            .iter()
+            .all(|t| !t.starts_with("gts_type") || t == "gts_type"),
+        "RG type definitions are not read from RG's database: {tables:?}\n{}",
+        rec.dump()
+    );
+    assert_eq!(count_in(&rec.stats(), QueryKind::Select, "gts_type"), 1);
+    assert_eq!(count_in(&rec.stats(), QueryKind::Insert, "gts_type"), 1);
+
+    // A known type only reads its key: no insert, no identity consumed.
+    rec.clear();
+    common::create_root_group(&group_svc, &ctx, &root_type.code, "Root 2", tenant_id).await;
+    assert!(rec.writes_outside_tx().is_empty(), "{}", rec.dump());
+    assert_eq!(count_in(&rec.stats(), QueryKind::Select, "gts_type"), 1);
     assert_eq!(
-        type_selects,
-        1,
-        "RG-11 regression: expected exactly 1 gts_type SELECT (the combined \
-         find_by_code_with_model lookup), got {type_selects}:\n{}",
+        count_in(&rec.stats(), QueryKind::Insert, "gts_type"),
+        0,
+        "a known type must not insert into the dictionary:\n{}",
         rec.dump()
     );
 }
@@ -369,7 +381,7 @@ async fn trace_move_group() {
 
     rec.clear();
     let result = group_svc
-        .move_group(moved, Some(target_parent.id))
+        .move_group(&ctx, moved, Some(target_parent.id))
         .await
         .expect("move_group should succeed");
     assert_eq!(result.hierarchy.parent_id, Some(target_parent.id));
@@ -413,83 +425,6 @@ async fn trace_force_delete_subtree() {
         rec.all_in_serializable_transaction(),
         "the force-delete cascade rewrites a subtree it does not lock and \
          must open SERIALIZABLE:\n{}",
-        rec.dump()
-    );
-}
-
-#[tokio::test]
-async fn trace_create_type() {
-    let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = common::make_type_service(db.clone());
-
-    rec.clear();
-    let t = common::create_root_type(&type_svc, "newtype").await;
-    assert!(t.can_be_root);
-
-    snapshot_trace("create_type", &rec);
-    assert!(
-        rec.writes_outside_tx().is_empty(),
-        "create_type's writes run inside a transaction. That transaction is \
-         still SERIALIZABLE without a retry wrapper -- RG-03, pinned as a \
-         known defect by the static rule at the bottom of this file:\n{}",
-        rec.dump()
-    );
-    // Exactly 1 gts_type SELECT: the "does this code already exist" pre-check.
-    // SeaORM used to add a re-select after the insert on SQLite; as of SeaORM
-    // 2.0 the insert carries RETURNING there too, so only the pre-check is
-    // left.
-    let type_selects = count_in(&rec.stats(), QueryKind::Select, "gts_type");
-    assert_eq!(
-        type_selects,
-        1,
-        "RG-08 regression: expected exactly 1 gts_type SELECT (the \
-         exists-check), got {type_selects}:\n{}",
-        rec.dump()
-    );
-}
-
-#[tokio::test]
-async fn trace_update_type() {
-    let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = common::make_type_service(db.clone());
-    let t = common::create_root_type(&type_svc, "upd").await;
-
-    rec.clear();
-    let updated = type_svc
-        .update_type_unscoped(
-            &t.code,
-            UpdateTypeRequest {
-                can_be_root: true,
-                allowed_parent_types: vec![],
-                allowed_membership_types: vec![],
-                metadata_schema: Some(serde_json::json!({"type": "object"})),
-            },
-        )
-        .await
-        .expect("update_type should succeed");
-    assert_eq!(
-        updated.metadata_schema,
-        Some(serde_json::json!({"type": "object"}))
-    );
-
-    snapshot_trace("update_type", &rec);
-    assert!(
-        rec.writes_outside_tx().is_empty(),
-        "update_type's writes run inside a transaction. As with create_type, \
-         that transaction is still SERIALIZABLE without retry (RG-03):\n{}",
-        rec.dump()
-    );
-    // Exactly 1 gts_type SELECT: find_by_code_with_model's combined lookup.
-    // `SecureUpdateMany` reports only rows-affected, but the row it wrote is
-    // fully determined by that lookup plus the values the update set, so the
-    // service assembles the answer instead of reading it back (RG-08).
-    let type_selects = count_in(&rec.stats(), QueryKind::Select, "gts_type");
-    assert_eq!(
-        type_selects,
-        1,
-        "RG-08/RG-11 regression: expected exactly 1 gts_type SELECT (the \
-         combined find_by_code_with_model lookup, with no post-update re-read), \
-         got {type_selects}:\n{}",
         rec.dump()
     );
 }
@@ -768,57 +703,6 @@ async fn trace_delete_group_non_force() {
     );
 }
 
-#[tokio::test]
-async fn trace_seeding() {
-    let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
-    let tenant_id = Uuid::now_v7();
-
-    let type_code = format!(
-        "{}x.test.seed.i{}.v1~",
-        gts_id!("cf.core.rg.type.v1~"),
-        Uuid::now_v7().as_simple()
-    );
-
-    rec.clear();
-    let type_seeds = vec![CreateTypeRequest {
-        code: type_code.clone(),
-        can_be_root: true,
-        allowed_parent_types: vec![],
-        allowed_membership_types: vec![],
-        metadata_schema: None,
-    }];
-    let type_result = seeding::seed_types(&type_svc, &type_seeds)
-        .await
-        .expect("seed_types should succeed");
-    assert_eq!(type_result.created, 1);
-
-    let root_id = Uuid::now_v7();
-    let group_seeds = vec![GroupSeedDef {
-        id: root_id,
-        code: type_code,
-        name: "Seeded Root".to_owned(),
-        parent_id: None,
-        metadata: None,
-        tenant_id,
-    }];
-    let group_result = seeding::seed_groups(&group_svc, &group_seeds)
-        .await
-        .expect("seed_groups should succeed");
-    assert_eq!(group_result.created, 1);
-
-    snapshot_trace("seeding", &rec);
-
-    // Seeding is a write path, so it carries the class's assertion like the
-    // others, rather than deferring to another test for it.
-    assert!(
-        rec.writes_outside_tx().is_empty(),
-        "seeding's writes run inside a transaction:\n{}",
-        rec.dump()
-    );
-}
-
 // =========================================================================
 // Section 2 -- scale-invariance: statement count must not grow with N
 // =========================================================================
@@ -891,7 +775,7 @@ async fn move_stats_for_subtree_size(n: usize) -> (BTreeMap<(QueryKind, String),
 
     rec.clear();
     group_svc
-        .move_group(moved, Some(target_parent.id))
+        .move_group(&ctx, moved, Some(target_parent.id))
         .await
         .expect("move_group should succeed");
     (rec.stats(), rec.total_params())
@@ -947,132 +831,6 @@ async fn scale_move_descendant_depth_selects_do_not_grow_with_subtree_size() {
         small, large,
         "closure SELECT count during move must not scale with subtree size \
          (small={small} at N=3, large={large} at N=15)"
-    );
-}
-
-async fn junction_inserts_for_parent_count(n: usize) -> usize {
-    let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = common::make_type_service(db.clone());
-    let mut parent_codes = Vec::with_capacity(n);
-    for i in 0..n {
-        let t = common::create_root_type(&type_svc, &format!("par{i}")).await;
-        parent_codes.push(t.code);
-    }
-
-    rec.clear();
-    type_svc
-        .create_type_unscoped(CreateTypeRequest {
-            code: format!(
-                "{}x.test.child.i{}.v1~",
-                gts_id!("cf.core.rg.type.v1~"),
-                Uuid::now_v7().as_simple()
-            ),
-            can_be_root: false,
-            allowed_parent_types: parent_codes,
-            allowed_membership_types: vec![],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create_type with N allowed parents should succeed");
-
-    count_in(&rec.stats(), QueryKind::Insert, "gts_type_allowed_parent")
-}
-
-#[tokio::test]
-async fn scale_create_type_junction_inserts_do_not_grow_with_parent_count() {
-    // Allowed-parent/membership junction rows insert via a single
-    // secure_insert_many call (RG-07).
-    let small = junction_inserts_for_parent_count(2).await;
-    let large = junction_inserts_for_parent_count(8).await;
-    assert_eq!(
-        small, large,
-        "gts_type_allowed_parent INSERT count must not scale with \
-         allowed_parent_types length (small={small} at N=2, large={large} at N=8)"
-    );
-}
-
-async fn list_types_total_statements_for_page_size(n: usize) -> usize {
-    let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = common::make_type_service(db.clone());
-    // Self-referencing types (non-empty allowed_parent_types) so the batch
-    // loader's junction-row and id->code resolution queries are actually
-    // exercised for every row in the page, not skipped as trivially empty.
-    for i in 0..n {
-        create_self_referencing_type(&type_svc, &format!("listscale{i}")).await;
-    }
-
-    rec.clear();
-    let query = toolkit_odata::ODataQuery {
-        limit: Some(n as u64 + 5),
-        ..Default::default()
-    };
-    let page = type_svc
-        .list_types_unscoped(&query)
-        .await
-        .expect("list_types should succeed");
-    assert_eq!(page.items.len(), n, "page must contain all N created types");
-    rec.total()
-}
-
-#[tokio::test]
-async fn scale_list_types_statements_do_not_grow_with_page_size() {
-    // load_full_types_batch issues a constant number of queries for the
-    // whole page, regardless of page size (RG-12, the one read-path finding).
-    let small = list_types_total_statements_for_page_size(3).await;
-    let large = list_types_total_statements_for_page_size(15).await;
-    assert_eq!(
-        small, large,
-        "list_types total statement count must not scale with page size \
-         (small={small} at N=3, large={large} at N=15)"
-    );
-}
-
-#[tokio::test]
-async fn create_type_conflict_check_does_not_overfetch_junctions() {
-    // resolve_id's existence check is a plain id lookup, with no junction
-    // reads on either the happy or conflict path (RG-13).
-    let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = common::make_type_service(db.clone());
-    let t = common::create_root_type(&type_svc, "conflict").await;
-
-    rec.clear();
-    let result = type_svc
-        .create_type_unscoped(CreateTypeRequest {
-            code: t.code.clone(),
-            can_be_root: true,
-            allowed_parent_types: vec![],
-            allowed_membership_types: vec![],
-            metadata_schema: None,
-        })
-        .await;
-    assert!(
-        matches!(
-            result,
-            Err(resource_group::domain::error::DomainError::TypeAlreadyExists { .. })
-        ),
-        "expected a clean TypeAlreadyExists for the conflicting create, got: {result:?}"
-    );
-
-    let parent_junction_selects =
-        count_in(&rec.stats(), QueryKind::Select, "gts_type_allowed_parent");
-    let membership_junction_selects = count_in(
-        &rec.stats(),
-        QueryKind::Select,
-        "gts_type_allowed_membership",
-    );
-    assert_eq!(
-        parent_junction_selects,
-        0,
-        "RG-13 regression: the duplicate-code conflict check must not read \
-         gts_type_allowed_parent at all, got {parent_junction_selects} SELECTs:\n{}",
-        rec.dump()
-    );
-    assert_eq!(
-        membership_junction_selects,
-        0,
-        "RG-13 regression: the duplicate-code conflict check must not read \
-         gts_type_allowed_membership at all, got {membership_junction_selects} SELECTs:\n{}",
-        rec.dump()
     );
 }
 
@@ -1196,183 +954,6 @@ async fn scale_rejected_delete_statements_do_not_grow_with_child_type_count() {
     );
 }
 
-/// N+1 audit finding (b) guard: `gts_type` SELECTs for a `type in (...)`
-/// `$filter` on `list_groups`, with `n` values in the list. No groups of
-/// any of these types are created -- this isolates
-/// `odata_filter::resolve_type_filter`'s own query cost from `resolve_type_paths_batch`'s
-/// (which would otherwise also touch `gts_type` once per page, but is
-/// skipped entirely when the page is empty).
-async fn gts_type_selects_for_list_groups_type_in_filter(n: usize) -> usize {
-    let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
-    let tenant_id = Uuid::now_v7();
-    let ctx = common::make_ctx(tenant_id);
-
-    let mut codes = Vec::with_capacity(n);
-    for i in 0..n {
-        let t = common::create_root_type(&type_svc, &format!("infiltn{i}")).await;
-        codes.push(t.code);
-    }
-
-    rec.clear();
-    let quoted: Vec<String> = codes.iter().map(|c| format!("'{c}'")).collect();
-    let parsed = toolkit_odata::parse_filter_string(&format!("type in ({})", quoted.join(", ")))
-        .expect("parse type in-list filter");
-    let query = toolkit_odata::ODataQuery::new().with_filter(parsed.into_expr());
-
-    let page = group_svc
-        .list_groups(&ctx, &query)
-        .await
-        .expect("list_groups with a type in-list filter should succeed");
-    assert_eq!(
-        page.items.len(),
-        0,
-        "no groups were created of these types, only the types themselves"
-    );
-
-    count_in(&rec.stats(), QueryKind::Select, "gts_type")
-}
-
-#[tokio::test]
-async fn scale_list_groups_type_in_filter_gts_type_selects_do_not_grow_with_value_count() {
-    // odata_filter::resolve_type_filter batches every literal in a `type in (...)`
-    // filter into one `WHERE schema_id IN (...)` query (N+1 audit finding
-    // (b)) instead of one `resolve_id` round trip per value (pre-fix:
-    // N=3 -> 4 gts_type SELECTs, N=20 -> 21, slope 1.0).
-    let small = gts_type_selects_for_list_groups_type_in_filter(3).await;
-    assert_eq!(
-        small, 1,
-        "empty page must still resolve all filter types in one lookup"
-    );
-    let large = gts_type_selects_for_list_groups_type_in_filter(20).await;
-    assert_eq!(
-        small, large,
-        "gts_type SELECT count for a `type in (...)` filter on list_groups must \
-         not scale with the number of values in the list (small={small} at N=3, \
-         large={large} at N=20)"
-    );
-}
-
-/// Same guard as the one above, but through `list_memberships`'s
-/// `resource_type in (...)` filter -- `MembershipRepository::list_memberships`
-/// calls the exact same `odata_filter::resolve_type_filter`, so
-/// this is a second call site for the same fix, not a second
-/// implementation of it.
-async fn gts_type_selects_for_list_memberships_resource_type_in_filter(n: usize) -> usize {
-    let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
-    let membership_svc = common::make_membership_service(db.clone());
-    let tenant_id = Uuid::now_v7();
-    let ctx = common::make_ctx(tenant_id);
-
-    let mut member_type_codes = Vec::with_capacity(n);
-    for i in 0..n {
-        let t = common::create_root_type(&type_svc, &format!("mifiltn{i}")).await;
-        member_type_codes.push(t.code);
-    }
-    let grp_type = create_type_with_memberships(
-        &type_svc,
-        "mifiltgrp",
-        &member_type_codes
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-    )
-    .await;
-    let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G1", tenant_id).await;
-
-    rec.clear();
-    let quoted: Vec<String> = member_type_codes.iter().map(|c| format!("'{c}'")).collect();
-    let parsed =
-        toolkit_odata::parse_filter_string(&format!("resource_type in ({})", quoted.join(", ")))
-            .expect("parse resource_type in-list filter");
-    let query = toolkit_odata::ODataQuery::new().with_filter(parsed.into_expr());
-
-    let page = membership_svc
-        .list_memberships(&ctx, &query)
-        .await
-        .expect("list_memberships with a resource_type in-list filter should succeed");
-    assert_eq!(
-        page.items.len(),
-        0,
-        "no memberships were added -- {} exists only to make the group's type valid",
-        group.id
-    );
-
-    count_in(&rec.stats(), QueryKind::Select, "gts_type")
-}
-
-#[tokio::test]
-async fn scale_list_memberships_resource_type_in_filter_gts_type_selects_do_not_grow_with_value_count()
- {
-    // Same fix as `scale_list_groups_type_in_filter_gts_type_selects_do_not_grow_with_value_count`,
-    // exercised through the other call site of `odata_filter::resolve_type_filter`
-    // Membership filters now resolve GTS identifiers through the shared helper.
-    let small = gts_type_selects_for_list_memberships_resource_type_in_filter(3).await;
-    assert_eq!(
-        small, 1,
-        "empty page must still resolve all filter types in one lookup"
-    );
-    let large = gts_type_selects_for_list_memberships_resource_type_in_filter(20).await;
-    assert_eq!(
-        small, large,
-        "gts_type SELECT count for a `resource_type in (...)` filter on \
-         list_memberships must not scale with the number of values in the list \
-         (small={small} at N=3, large={large} at N=20)"
-    );
-}
-
-/// N+1 audit finding (b) guard, second half: `update_type`'s total
-/// statement count when removing `n` allowed-parent-types at once, none of
-/// which are actually in use by any group (so the safety check runs to
-/// completion for all of them instead of early-returning on the first
-/// violation).
-async fn total_statements_for_update_type_removing_n_parents(n: usize) -> usize {
-    let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = common::make_type_service(db.clone());
-
-    let mut parent_codes = Vec::with_capacity(n);
-    for i in 0..n {
-        let t = common::create_root_type(&type_svc, &format!("rmpar{i}")).await;
-        parent_codes.push(t.code);
-    }
-    let parent_refs: Vec<&str> = parent_codes.iter().map(String::as_str).collect();
-    let child_type = common::create_child_type(&type_svc, "rmchild", &parent_refs, &[]).await;
-
-    rec.clear();
-    type_svc
-        .update_type_unscoped(
-            &child_type.code,
-            UpdateTypeRequest {
-                can_be_root: true,
-                allowed_parent_types: vec![],
-                allowed_membership_types: vec![],
-                metadata_schema: None,
-            },
-        )
-        .await
-        .expect("update_type removing all N allowed parents should succeed (unused by any group)");
-    rec.total()
-}
-
-#[tokio::test]
-async fn scale_update_type_removed_parents_statements_do_not_grow_with_count() {
-    // check_hierarchy_safety batches the resolve + violating-group lookup
-    // for every removed parent type into a small constant number of
-    // queries (N+1 audit finding (b)) instead of one resolve_id + one
-    // single-parent lookup *per* removed parent (pre-fix: N=3 -> 16 total,
-    // N=20 -> 50, slope 2.0).
-    let small = total_statements_for_update_type_removing_n_parents(3).await;
-    let large = total_statements_for_update_type_removing_n_parents(20).await;
-    assert_eq!(
-        small, large,
-        "update_type's total statement count when removing N allowed parent \
-         types must not scale with N (small={small} at N=3, large={large} at N=20)"
-    );
-}
-
 // Section 3 -- negative controls: both rely on SERIALIZABLE + retry and
 // must show writes_outside_tx() == empty, proving the no-tx-write rule
 // doesn't flag these paths.
@@ -1467,10 +1048,10 @@ async fn negative_control_read_paths_produce_no_write_statements() {
         .list_groups(&ctx, &toolkit_odata::ODataQuery::default())
         .await
         .expect("list_groups should succeed");
-    type_svc
-        .list_types_unscoped(&toolkit_odata::ODataQuery::default())
+    group_svc
+        .list_groups_unscoped(&toolkit_odata::ODataQuery::default())
         .await
-        .expect("list_types should succeed");
+        .expect("list_groups_unscoped should succeed");
 
     assert!(
         rec.total() > 0,
@@ -1489,42 +1070,6 @@ async fn negative_control_read_paths_produce_no_write_statements() {
     assert!(
         rec.writes_outside_tx().is_empty(),
         "trivially true for read paths, asserted for completeness"
-    );
-}
-
-#[tokio::test]
-async fn trace_delete_type() {
-    // RG-02. `delete_type` resolved the id, counted referencing groups and
-    // deleted the row on a bare connection, so a concurrent `create_group` of
-    // that type could land between the count and the delete. All three are
-    // one transaction now.
-    let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = common::make_type_service(db.clone());
-    let t = common::create_root_type(&type_svc, "deltype").await;
-
-    rec.clear();
-    type_svc
-        .delete_type_unscoped(&t.code)
-        .await
-        .expect("delete_type should succeed for an unreferenced type");
-
-    snapshot_trace("delete_type", &rec);
-    assert!(
-        rec.writes_outside_tx().is_empty(),
-        "delete_type must run its writes inside a transaction (RG-02):\n{}",
-        rec.dump()
-    );
-    // `writes_outside_tx` only flags writes: a regression that moved the id
-    // resolution or the reference count ahead of `BEGIN` would still pass
-    // that check as long as the delete itself stayed transactional, and
-    // that ordering is exactly the check-then-delete race RG-02 was about.
-    // "Every event is in *a* transaction" isn't quite enough either -- that
-    // still passes if the resolution/count and the delete ran in two
-    // separate, sequential transactions, so this checks they share one.
-    assert!(
-        rec.all_in_one_transaction(),
-        "delete_type must run its reads and writes inside one transaction (RG-02):\n{}",
-        rec.dump()
     );
 }
 
@@ -1630,49 +1175,18 @@ fn static_rule_passes_group_service_uses_retry() {
         "negative control violated: group_service.rs should not bypass \
          transaction_with_retry for its writes"
     );
-    // Exact count, not a floor: the five call sites are create_group,
-    // update_group, move_group, delete_group, and create_group_unscoped --
+    // Exact count, not a floor: the four call sites are create_group,
+    // update_group (via attempt_update_group), move_group and delete_group --
     // two of them pass a level chosen from the request, which is why the
-    // needle above matches the call and not the level. A floor of >= 5 would
-    // pass just as well if a sixth transaction were added without retry, and
-    // a floor of >= 3 if a refactor quietly dropped the wrapper from two;
-    // only exact equality catches both directions.
+    // needle above matches the call and not the level. A floor would pass
+    // just as well if another transaction were added without retry, or if a
+    // refactor quietly dropped the wrapper from one; only exact equality
+    // catches both directions.
     assert_eq!(
-        retried, 5,
-        "expected exactly 5 transaction_with_retry call sites in \
+        retried, 4,
+        "expected exactly 4 transaction_with_retry call sites in \
          group_service.rs -- create_group, update_group, move_group, \
-         delete_group, create_group_unscoped -- found {retried}"
-    );
-}
-
-#[test]
-fn static_rule_passes_type_service_uses_retry() {
-    let src = include_str!("../src/domain/type_service.rs");
-    // The rule is "every transaction here is retry-aware", not "every
-    // transaction here is SERIALIZABLE". `create_type` runs at the backend
-    // default now, and still has to retry: contention retries catch
-    // deadlocks, which no isolation level rules out.
-    let unretried = count_occurrences(src, ".transaction_ref_mapped_with_config(");
-    let retried = count_occurrences(src, ".transaction_with_retry(");
-    assert_eq!(
-        unretried, 0,
-        "create_type/update_type must not open a transaction through the \
-         non-retrying helper: a 40001 then reaches the caller as an unhandled \
-         database error and is reported as 500, on a path account-management \
-         drives at gear init"
-    );
-    // Exact count, not a floor, for the same reason as the group_service
-    // rule above: a floor of >= 2 stays green if a fourth transaction is
-    // added without retry, or if a refactor quietly drops the wrapper from
-    // one of the three while adding it to a new one. All three of this
-    // file's transactions -- create_type, update_type, and delete_type --
-    // are retry-aware; only exact equality catches a regression in either
-    // direction.
-    assert_eq!(
-        retried, 3,
-        "expected exactly 3 transaction_with_retry call sites in \
-         type_service.rs -- create_type, update_type, delete_type -- \
-         found {retried}"
+         delete_group -- found {retried}"
     );
 }
 
@@ -1755,25 +1269,31 @@ fn static_rule_non_force_delete_locks_before_it_decides() {
 fn static_rule_metadata_schema_is_resolved_before_begin() {
     let src = include_str!("../src/domain/group_service.rs");
 
-    // RG-09. Resolving the chained GTS schema is a network round-trip and the
-    // schema is then compiled; under an open transaction that time is
-    // snapshot lifetime, and every retry pays it again. The fix is structural
-    // rather than positional: the transaction-inner functions do not take a
-    // `TypesRegistryClient`, so the call cannot drift back inside. This rule
-    // asserts the parameter stays gone -- a positional check ("the call comes
-    // before `transaction_with_retry`") would pass again the moment someone
-    // reintroduced the argument and moved the call.
+    // RG-09. Reading the type from the types registry is a network
+    // round-trip and the schema is then compiled; under an open transaction
+    // that time is snapshot lifetime, and every retry pays it again. The fix
+    // is structural rather than positional: the transaction-inner functions
+    // take the already-read `RgType`, never the `RgTypeCatalog`, so the call
+    // cannot drift back inside. This rule asserts the catalogue stays out --
+    // a positional check would pass again the moment someone reintroduced
+    // the argument and moved the call.
     let inner_fns: Vec<&str> = src
         .split("async fn ")
-        .filter(|f| f.starts_with("create_group_inner") || f.starts_with("update_group_inner"))
+        .filter(|f| {
+            f.starts_with("create_group_inner")
+                || f.starts_with("update_group_inner")
+                || f.starts_with("move_group_inner")
+                || f.starts_with("move_group_internal_impl")
+        })
         .collect();
     // Without this the rule below would pass on an empty set -- a rename or a
     // reshuffle would silently turn it into an assertion about nothing.
     assert_eq!(
         inner_fns.len(),
-        2,
-        "the scan should find create_group_inner and update_group_inner; \
-         found {} definition(s). Rename? Then update this rule with it.",
+        4,
+        "the scan should find create_group_inner, update_group_inner, \
+         move_group_inner and move_group_internal_impl; found {} \
+         definition(s). Rename? Then update this rule with it.",
         inner_fns.len()
     );
 
@@ -1781,22 +1301,23 @@ fn static_rule_metadata_schema_is_resolved_before_begin() {
         .iter()
         .filter(|f| {
             let signature_end = f.find(") -> Result").unwrap_or(f.len());
-            f[..signature_end].contains("types_registry")
+            let signature = &f[..signature_end];
+            signature.contains("RgTypeCatalog") || signature.contains("types_registry")
         })
         .map(|f| f.split('(').next().unwrap_or(f))
         .collect();
     assert!(
         inner_taking_registry.is_empty(),
-        "these transaction-inner functions take a TypesRegistryClient, which \
+        "these transaction-inner functions take a registry client, which \
          puts an external call inside the transaction (RG-09): {inner_taking_registry:?}"
     );
 
     // Negative control: the validation must still happen somewhere. Without
     // this, deleting the call outright would satisfy the rule above.
-    let calls = count_occurrences(src, "validate_metadata_via_gts(");
+    let calls = count_occurrences(src, "validate_metadata(");
     assert!(
-        calls >= 3,
-        "expected create_group, create_group_unscoped and update_group to each \
-         validate metadata before opening their transaction, found {calls} call(s)"
+        calls >= 2,
+        "expected create_group and update_group to each validate metadata \
+         before opening their transaction, found {calls} call(s)"
     );
 }

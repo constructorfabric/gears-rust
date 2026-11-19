@@ -1,59 +1,8 @@
 // Created: 2026-04-16 by Constructor Tech
 // @cpt-dod:cpt-cf-resource-group-dod-testing-rest-api:p2
 use super::*;
-use toolkit_gts::{GTS_ID_PREFIX, gts_id};
+use toolkit_gts::gts_id;
 use uuid::Uuid;
-
-// TC-DTO-01: ResourceGroupType -> TypeDto
-#[test]
-fn dto_type_from_resource_group_type() {
-    let rgt = ResourceGroupType {
-        code: gts_id!("cf.system.rg.type.v1~x.test.dto.mytype.v1~").to_owned(),
-        can_be_root: true,
-        allowed_parent_types: vec![format!("{GTS_ID_PREFIX}parent~")],
-        allowed_membership_types: vec![format!("{GTS_ID_PREFIX}member~")],
-        metadata_schema: Some(serde_json::json!({"type": "object"})),
-    };
-    let dto: TypeDto = rgt.into();
-    assert_eq!(
-        dto.code,
-        gts_id!("cf.system.rg.type.v1~x.test.dto.mytype.v1~")
-    );
-    assert!(dto.can_be_root);
-    assert_eq!(
-        dto.allowed_parent_types,
-        vec![format!("{GTS_ID_PREFIX}parent~")]
-    );
-    assert_eq!(
-        dto.allowed_membership_types,
-        vec![format!("{GTS_ID_PREFIX}member~")]
-    );
-    assert!(dto.metadata_schema.is_some());
-}
-
-// TC-DTO-02: CreateTypeDto -> CreateTypeRequest
-#[test]
-fn dto_create_type_to_request() {
-    let dto = CreateTypeDto {
-        code: gts_id!("cf.system.rg.type.v1~x.test.dto.mytype.v1~").to_owned(),
-        can_be_root: false,
-        allowed_parent_types: vec![format!("{GTS_ID_PREFIX}parent~")],
-        allowed_membership_types: vec![],
-        metadata_schema: None,
-    };
-    let req: CreateTypeRequest = dto.into();
-    assert_eq!(
-        req.code,
-        gts_id!("cf.system.rg.type.v1~x.test.dto.mytype.v1~")
-    );
-    assert!(!req.can_be_root);
-    assert_eq!(
-        req.allowed_parent_types,
-        vec![format!("{GTS_ID_PREFIX}parent~")]
-    );
-    assert!(req.allowed_membership_types.is_empty());
-    assert!(req.metadata_schema.is_none());
-}
 
 // TC-DTO-03: ResourceGroup -> GroupDto
 #[test]
@@ -149,19 +98,6 @@ fn dto_create_group_no_id_maps_to_none() {
     };
     let req: CreateGroupRequest = dto.into();
     assert!(req.id.is_none());
-}
-
-// TC-DTO-06: Deserialize with no vectors -> defaults to empty
-#[test]
-fn dto_create_type_deserialize_missing_vectors_default_empty() {
-    let json = serde_json::json!({
-        "code": gts_id!("cf.system.rg.type.v1~x.test.dto.mytype.v1~"),
-        "can_be_root": true
-    })
-    .to_string();
-    let dto: CreateTypeDto = serde_json::from_str(&json).unwrap();
-    assert!(dto.allowed_parent_types.is_empty());
-    assert!(dto.allowed_membership_types.is_empty());
 }
 
 // TC-DTO-07: MembershipDto serialization has no tenant_id key

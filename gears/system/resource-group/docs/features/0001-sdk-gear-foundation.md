@@ -42,6 +42,7 @@
   - [S8: `test_error_response_rfc9457`](#s8-test_error_response_rfc9457)
   - [S9: `test_pagination_cursor_roundtrip`](#s9-test_pagination_cursor_roundtrip)
   - [Acceptance Criteria (S1, S2, S8, S9)](#acceptance-criteria-s1-s2-s8-s9)
+  - [Registry Migration Verification](#registry-migration-verification)
 
 <!-- /toc -->
 
@@ -49,7 +50,7 @@
 
 ### 1.1 Overview
 
-Establish the SDK crate with trait contracts, domain models, and error taxonomy; scaffold the RG gear with ClientHub registration; implement persistence adapter with SeaORM entities and DB migrations for all 6 tables; wire cross-cutting infrastructure for REST/OData endpoints and deterministic error mapping.
+Establish the SDK crate with trait contracts, domain models, and error taxonomy; scaffold the RG gear with ClientHub registration; implement persistence adapter with SeaORM entities and DB migrations for the three group, closure and membership tables; wire cross-cutting infrastructure for REST/OData endpoints and deterministic error mapping.
 
 ### 1.2 Purpose
 
@@ -59,7 +60,7 @@ This feature provides the foundation that all subsequent RG features depend on. 
 
 **Principles**: `cpt-cf-resource-group-principle-policy-agnostic`
 
-**Constraints**: `cpt-cf-resource-group-constraint-no-authz-decision`, `cpt-cf-resource-group-constraint-no-sql-filter-generation`, `cpt-cf-resource-group-constraint-db-agnostic`, `cpt-cf-resource-group-constraint-surrogate-ids-internal`
+**Constraints**: `cpt-cf-resource-group-constraint-no-authz-decision`, `cpt-cf-resource-group-constraint-no-sql-filter-generation`, `cpt-cf-resource-group-constraint-db-agnostic`, `cpt-cf-resource-group-constraint-gts-identifiers`
 
 ### 1.3 Actors
 
@@ -104,24 +105,22 @@ Not applicable. This feature provides SDK contracts and gear infrastructure with
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-algo-sdk-foundation-map-domain-error`
 
-**Input**: `ResourceGroupError` domain error variant
+**Input**: `DomainError` variant
 
 **Output**: RFC-9457 Problem response with HTTP status, type URI, title, and detail
 
 **Steps**:
-1. [x] - `p1` - Receive `ResourceGroupError` variant - `inst-err-map-1`
+1. [x] - `p1` - Receive a `DomainError` variant - `inst-err-map-1`
 2. [x] - `p1` - Match error variant to HTTP status and Problem fields - `inst-err-map-2`
    1. [x] - `p1` - `Validation` -> 400 Bad Request, type "validation", field-level details - `inst-err-map-2a`
    2. [x] - `p1` - `NotFound` -> 404 Not Found, type "not-found", entity identifier in detail - `inst-err-map-2b`
-   3. [x] - `p1` - `TypeAlreadyExists` -> 409 Conflict, type "type-already-exists", conflicting code in detail - `inst-err-map-2c`
-   4. [x] - `p1` - `InvalidParentType` -> 409 Conflict, type "invalid-parent-type", type mismatch in detail - `inst-err-map-2d`
-   5. [x] - `p1` - `AllowedParentsViolation` -> 409 Conflict, type "allowed-parents-violation", violating groups in detail - `inst-err-map-2e`
-   6. [x] - `p1` - `CycleDetected` -> 409 Conflict, type "cycle-detected", involved node IDs in detail - `inst-err-map-2f`
-   7. [x] - `p1` - `ConflictActiveReferences` -> 409 Conflict, type "active-references", reference count in detail - `inst-err-map-2g`
-   8. [x] - `p1` - `LimitViolation` -> 409 Conflict, type "limit-violation", limit name and values in detail - `inst-err-map-2h`
-   9. [x] - `p1` - `TenantIncompatibility` -> 409 Conflict, type "tenant-incompatibility", tenant IDs in detail - `inst-err-map-2i`
-   10. [x] - `p1` - `ServiceUnavailable` -> 503 Service Unavailable, type "service-unavailable" - `inst-err-map-2j`
-   11. [x] - `p1` - `Internal` -> 500 Internal Server Error, type "internal", no internal details exposed - `inst-err-map-2k`
+   3. [x] - `p1` - `InvalidParentType` -> 400 Bad Request, parent-type field violation - `inst-err-map-2d`
+   4. [x] - `p1` - `CycleDetected` -> 400 Bad Request, hierarchy precondition violation - `inst-err-map-2f`
+   5. [x] - `p1` - `ConflictActiveReferences` -> 400 Bad Request, active-reference precondition violation - `inst-err-map-2g`
+   6. [x] - `p1` - `LimitViolation` -> 409 Conflict, type "limit-violation", limit name and values in detail - `inst-err-map-2h`
+   7. [x] - `p1` - `TenantIncompatibility` -> 400 Bad Request, tenant precondition violation - `inst-err-map-2i`
+   8. [x] - `p1` - `ServiceUnavailable` -> 503 Service Unavailable, type "service-unavailable" - `inst-err-map-2j`
+   9. [x] - `p1` - `Internal` -> 500 Internal Server Error, type "internal", no internal details exposed - `inst-err-map-2k`
 3. [x] - `p1` - Construct Problem response with `type`, `title`, `status`, `detail` fields - `inst-err-map-3`
 4. [x] - `p1` - **RETURN** Problem response - `inst-err-map-4`
 
@@ -138,7 +137,7 @@ Not applicable. This feature defines SDK contracts, gear scaffold, and persisten
 The system **MUST** define SDK model types in `resource-group-sdk/src/models.rs` that represent the public API surface for all RG domain entities and query constructs.
 
 **Required types**:
-- `ResourceGroupType` — type definition with `schema_id` (GtsTypePath), `allowed_parents` (Vec), `allowed_memberships` (Vec), `can_be_root` (bool), `metadata_schema` (Option)
+- `ResourceGroupTypeTraitsV1` — authored placement traits contributed to registry-managed GTS schemas
 - `ResourceGroup` — group entity with `id` (Uuid), `type` (GtsTypePath), `name` (String), `metadata` (Option), `hierarchy` (ResourceGroupHierarchy with `parent_id`, `tenant_id`)
 - `ResourceGroupWithDepth` — extends ResourceGroup with `hierarchy.depth` (i32, relative distance)
 - `ResourceGroupMembership` — membership link with `group_id` (Uuid), `resource_type` (GtsTypePath), `resource_id` (String)
@@ -150,10 +149,10 @@ The system **MUST** define SDK model types in `resource-group-sdk/src/models.rs`
 **Implements**:
 - `cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path`
 
-**Constraints**: `cpt-cf-resource-group-constraint-surrogate-ids-internal`
+**Constraints**: `cpt-cf-resource-group-constraint-gts-identifiers`
 
 **Touches**:
-- Entities: `ResourceGroupType`, `ResourceGroup`, `ResourceGroupWithDepth`, `ResourceGroupMembership`, `GtsTypePath`, `Page`, `PageInfo`, `ListQuery`
+- Entities: `ResourceGroupTypeTraitsV1`, `ResourceGroup`, `ResourceGroupWithDepth`, `ResourceGroupMembership`, `GtsTypePath`, `Page`, `PageInfo`, `ListQuery`
 
 ### SDK Trait Contracts
 
@@ -162,7 +161,7 @@ The system **MUST** define SDK model types in `resource-group-sdk/src/models.rs`
 The system **MUST** define SDK trait contracts in `resource-group-sdk/src/api.rs` that represent the stable public interface for all RG operations.
 
 **Required traits**:
-- `ResourceGroupClient` — full CRUD trait: type management (`create_type`, `get_type`, `list_types`, `update_type`, `delete_type`), group management (`create_group`, `get_group`, `list_groups`, `update_group`, `delete_group`, `list_group_depth`), membership management (`add_membership`, `remove_membership`, `list_memberships`). All methods accept `SecurityContext` as first argument.
+- `ResourceGroupClient` — group and membership trait: group management (`create_group`, `get_group`, `list_groups`, `update_group`, `delete_group`, `list_group_depth`), membership management (`add_membership`, `remove_membership`, `list_memberships`). All methods accept `SecurityContext` as first argument.
 - `ResourceGroupReadHierarchy` — narrow hierarchy-only read trait: `list_group_depth(ctx, group_id, query)` returning `Page<ResourceGroupWithDepth>`. Used exclusively by AuthZ plugin.
 - `ResourceGroupReadPluginClient` — extends `ResourceGroupReadHierarchy` with `list_memberships`. Used for vendor-specific plugin gateway routing.
 
@@ -177,9 +176,9 @@ The system **MUST** define SDK trait contracts in `resource-group-sdk/src/api.rs
 
 The system **MUST** define `ResourceGroupError` enum in `resource-group-sdk/src/error.rs` covering all deterministic failure categories.
 
-**Required variants**: `Validation`, `NotFound`, `TypeAlreadyExists`, `InvalidParentType`, `AllowedParentsViolation`, `CycleDetected`, `ConflictActiveReferences`, `LimitViolation`, `TenantIncompatibility`, `ServiceUnavailable`, `Internal`.
+**Required categories**: validation, not found, invalid parent type, cycle, active references, limits, tenant incompatibility, access refusal, service unavailable and internal failures.
 
-Each variant **MUST** carry structured context (field details for Validation, entity identifier for NotFound, conflicting code for TypeAlreadyExists, etc.) sufficient for the error mapping algorithm to produce informative Problem responses.
+Each variant **MUST** carry structured context (field details for Validation, entity identifier for NotFound, etc.) sufficient for the error mapping algorithm to produce informative Problem responses.
 
 **Implements**:
 - `cpt-cf-resource-group-algo-sdk-foundation-map-domain-error`
@@ -191,22 +190,21 @@ Each variant **MUST** carry structured context (field details for Validation, en
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-dod-sdk-foundation-persistence`
 
-The system **MUST** define SeaORM entity models and DB migration scripts for all 6 RG tables.
+The system **MUST** define SeaORM entity models and executable migrations for the
+three RG tables. Group and membership repository traits are injected into domain
+services; group persistence owns closure-table maintenance. `RgTypeCatalog` is the
+separate registry port for definitions, without a local type repository.
 
-Each persistence adapter (type, group, closure, membership) **MUST** be defined as a trait first (e.g., `TypeRepositoryTrait`, `GroupRepositoryTrait`, `ClosureRepositoryTrait`, `MembershipRepositoryTrait`) and injected into domain services as `Arc<dyn Trait>`. This enables unit testing with in-memory trait implementations (`InMemoryTypeRepository`, etc.) without a database, and ensures a clean contract boundary between domain and infrastructure layers.
+**Required tables**:
+- `resource_group` — UUID primary key, parent and tenant UUIDs, GTS type identifier, name, metadata and timestamps.
+- `resource_group_membership` — composite key of group UUID, resource GTS type identifier and resource ID, plus creation timestamp.
+- `resource_group_closure` — ancestor/descendant UUID key and integer depth, with group foreign keys and traversal indexes.
 
-**Required tables** (per DESIGN 3.7):
-- `gts_type` — SMALLINT PK (identity), `schema_id` (unique TEXT), `metadata_schema` (JSONB nullable), timestamps
-- `gts_type_allowed_parent` — composite PK `(type_id, parent_type_id)` with CASCADE FK
-- `gts_type_allowed_membership` — composite PK `(type_id, membership_type_id)` with CASCADE FK
-- `resource_group` — UUID PK, `parent_id` FK (self-referential), `gts_type_id` FK, `name`, `metadata` (JSONB nullable), `tenant_id`, timestamps. Indexes: `(parent_id)`, `(name)`, `(gts_type_id, id)`, `(tenant_id)`
-- `resource_group_membership` — unique `(group_id, gts_type_id, resource_id)`, FK group_id → resource_group, FK gts_type_id → gts_type, `created_at`. Index: `(gts_type_id, resource_id)`
-- `resource_group_closure` — composite PK `(ancestor_id, descendant_id)`, `depth` INTEGER, FK both → resource_group. Indexes: `(descendant_id)`, `(ancestor_id, depth)`
-
-**Constraints**: `cpt-cf-resource-group-constraint-db-agnostic`, `cpt-cf-resource-group-constraint-surrogate-ids-internal`
-
-**Touches**:
-- DB: `gts_type`, `gts_type_allowed_parent`, `gts_type_allowed_membership`, `resource_group`, `resource_group_membership`, `resource_group_closure`
+Type identifiers are constrained text values. There is no cross-database foreign
+key to Types Registry. The migration copies existing type identifiers before
+removing the local type and allowed-type tables; existing hierarchy rows and
+memberships are preserved. SQLite and PostgreSQL migration tests verify those
+constraints and rollback behavior.
 
 ### Gear Scaffold and Initialization
 
@@ -280,7 +278,7 @@ In-source `#[cfg(test)]` tests for filter field definitions and DTO conversions:
 
 - [x] SDK crate (`resource-group-sdk`) compiles with all model types, trait contracts, and error types defined
 - [x] `GtsTypePath::new("gts.cf.core.rg.type.v1~")` succeeds; `GtsTypePath::new("invalid")` returns validation error
-- [x] All 6 DB tables are created by migration scripts with correct constraints and indexes
+- [x] The three group, closure and membership tables are created by migrations with correct constraints and indexes
 - [x] SeaORM entities compile and map to the DB schema without runtime errors
 - [x] Gear registers `dyn ResourceGroupClient` and `dyn ResourceGroupReadHierarchy` in ClientHub during Phase 1 init
 - [x] All `ResourceGroupError` variants map to correct HTTP status codes and RFC-9457 Problem responses
@@ -297,9 +295,9 @@ In-source `#[cfg(test)]` tests for filter field definitions and DTO conversions:
 
 ### SDK Value Objects & Models
 
-**File**: `resource-group-sdk/src/models.rs` (in-source `#[cfg(test)]` block — following `auth.rs` pattern)
+**Files**: `resource-group-sdk/src/models_tests.rs` and `gts_tests.rs`.
 
-Other gears (`nodes-registry`, `types-registry`) place pure-logic tests directly in source files. `GtsTypePath` has 110 lines of validation logic with zero tests.
+The following cases retain SDK normalization, validation and serialization coverage. Registry traits and builder tests additionally cover authored type declarations.
 
 #### TC-SDK-01: GtsTypePath::new() valid path [P1]
 - **Covers**: G36, 0001-AC-2
@@ -310,7 +308,7 @@ Other gears (`nodes-registry`, `types-registry`) place pure-logic tests directly
 - **Covers**: G36
 - **Assert**: `Err("must not be empty")`
 
-#### TC-SDK-03: GtsTypePath::new() exceeds 255 chars [P1]
+#### TC-SDK-03: GtsTypePath::new() exceeds 1024 chars [P1]
 - **Covers**: G36
 - **Assert**: `Err("exceeds maximum length")`
 
@@ -374,21 +372,15 @@ Other gears (`nodes-registry`, `types-registry`) place pure-logic tests directly
 #### TC-SDK-21: GtsTypePath whitespace-only input "   " [P2]
 - trim → empty → Err("must not be empty")
 
-#### TC-SDK-22: GtsTypePath exactly 255 chars [P2]
+#### TC-SDK-22: GtsTypePath exactly 1024 chars [P2]
 - Boundary → Ok
 
-#### TC-SDK-23: GtsTypePath exactly 256 chars [P2]
+#### TC-SDK-23: GtsTypePath exactly 1025 chars [P2]
 - Boundary → Err("exceeds maximum length")
 
-#### TC-SDK-24: validate_type_code vs GtsTypePath normalization mismatch [P1]
-- `validate_type_code("  gts.cf.SYSTEM.RG.TYPE.V1~  ")` → fails (no trim/lowercase)
-- `GtsTypePath::new("  gts.cf.SYSTEM.RG.TYPE.V1~  ")` → succeeds (trims + lowercases)
-- Document this inconsistency and verify behavior
-
-#### TC-SDK-14: SDK model camelCase serialization [P1]
-- **Covers**: G41
-- **Setup**: Serialize `ResourceGroupType` to JSON
-- **Assert**: Keys are camelCase (`canBeRoot`, `allowedParents`, `allowedMemberships`, `metadataSchema`)
+#### TC-SDK-24: Type identifier normalization [P1]
+- Both SDK value objects and domain identifier validation trim whitespace and lowercase input before checking it.
+- The RG family prefix remains required by domain validation.
 
 #### TC-SDK-15: SDK model `type` field rename [P1]
 - **Covers**: G41
@@ -406,17 +398,9 @@ Other gears (`nodes-registry`, `types-registry`) place pure-logic tests directly
 
 ### DTO Conversions & Serialization
 
-**File**: `api/rest/dto.rs` (in-source `#[cfg(test)]` block)
+**Files**: `api/rest/dto.rs` and `dto_tests.rs`.
 
-Other gears test DTO conversion correctness. `dto.rs` has 9 `From` impls and serde attributes with zero tests.
-
-#### TC-DTO-01: ResourceGroupType -> TypeDto preserves all fields [P2]
-- **Covers**: G39
-- **Assert**: code, can_be_root, allowed_parents, allowed_memberships, metadata_schema all match
-
-#### TC-DTO-02: CreateTypeDto -> CreateTypeRequest conversion [P2]
-- **Covers**: G39
-- **Assert**: All fields transferred
+Group, hierarchy and membership DTO conversion/serialization cases remain in scope. Type CRUD DTOs are retired with the removed endpoints.
 
 #### TC-DTO-03: ResourceGroup -> GroupDto preserves hierarchy fields [P2]
 - **Covers**: G39
@@ -430,11 +414,6 @@ Other gears test DTO conversion correctness. `dto.rs` has 9 `From` impls and ser
 - **Covers**: G40
 - **Setup**: Deserialize `{"type": "gts...", "name": "X"}` into CreateGroupDto
 - **Assert**: `dto.type_path` populated correctly from `"type"` JSON key
-
-#### TC-DTO-06: CreateTypeDto default vectors [P2]
-- **Covers**: G40
-- **Setup**: Deserialize `{"code":"...", "can_be_root": true}` (no allowed_parents/memberships)
-- **Assert**: `allowed_parents == []`, `allowed_memberships == []` (via `#[serde(default)]`)
 
 #### TC-DTO-07: MembershipDto has no tenant_id field [P2]
 - **Covers**: G40, 0004-AC-12
@@ -461,15 +440,11 @@ OData filter fields use manual `FilterField` trait implementations with string f
 
 #### TC-ODATA-04: HierarchyFilterField names and kinds [P1]
 - **Covers**: G43
-- **Assert**: `HierarchyDepth.name() == "hierarchy/depth"`, `Type.name() == "type"`, both `I64`
+- **Assert**: `HierarchyDepth.name() == "hierarchy/depth"`, `Type.name() == "type"`; depth is `I64` and type is `String`
 
 #### TC-ODATA-05: MembershipFilterField names and kinds [P1]
 - **Covers**: G44
-- **Assert**: `GroupId -> ("group_id", Uuid)`, `ResourceType -> ("resource_type", I64)`, `ResourceId -> ("resource_id", String)`
-
-#### TC-ODATA-06: TypeODataMapper field-to-column mapping [P2]
-- **Covers**: G45
-- **Assert**: `TypeFilterField::Code` maps to `TypeColumn::SchemaId`
+- **Assert**: `GroupId -> ("group_id", Uuid)`, `ResourceType -> ("resource_type", String)`, `ResourceId -> ("resource_id", String)`
 
 #### TC-ODATA-07: GroupODataMapper field-to-column mapping [P2]
 - **Covers**: G45
@@ -485,23 +460,22 @@ OData filter fields use manual `FilterField` trait implementations with string f
 
 > General E2E testing philosophy, patterns, and infrastructure: [`docs/toolkit_unified_system/13_e2e_testing.md`](../../../../../docs/toolkit_unified_system/13_e2e_testing.md).
 
-Tests S1, S2, S8, S9 verify integration seams that unit tests (TC-DTO-*, TC-SDK-14/15, TC-REST-10) cannot cover because they run on `Router::oneshot` with SQLite, not a real running server.
+Tests S1, S2, S8, S9 verify integration seams that unit tests (TC-DTO-*, TC-SDK-15, TC-REST-10) cannot cover because they run on `Router::oneshot` with SQLite, not a real running server.
 
 ### File Layout
 
 ```
 testing/e2e/suites/resource_group/
 ├── conftest.py                          ← helpers, timeout config
-├── test_authz_tenant_scoping.py         ← existing (9 tests) — keep as-is
 ├── test_mtls_auth.py                    ← (p2 — deferred, not implemented yet) 4 MTLS tests; do not run in current iteration
-├── test_integration_seams.py            ← 10 integration seam tests
+├── test_integration_seams.py            ← integration seam tests
 ```
 
 ### Shared Helpers (conftest.py)
 
 `REQUEST_TIMEOUT = 5.0` — applied to every httpx call.
 
-Helper `assert_group_shape(data)` verifies the JSON wire shape of a group response: `id` and `tenant_id` are valid UUIDs; `name` is a string; `created_at` is present and parseable as ISO 8601; when `parent_id` is not None it is a valid UUID; when `metadata` is not None it is a dict.
+Helper `assert_group_shape(data)` verifies the JSON wire shape of a group response: `id` and `tenant_id` are valid UUIDs; `name` is a string; when `parent_id` is not None it is a valid UUID; when `metadata` is not None it is a dict.
 
 ### S1: `test_route_smoke_all_endpoints`
 
@@ -512,9 +486,9 @@ Helper `assert_group_shape(data)` verifies the JSON wire shape of a group respon
 ```
 HEAD /cf/resource-group/v1/groups               → not 404/405
 HEAD /cf/resource-group/v1/groups/{uuid}        → not 405 (404 ok — group doesn't exist)
-HEAD /cf/resource-group/v1/groups/{uuid}/hierarchy  → not 405
+GET /cf/resource-group/v1/groups/{uuid}/descendants → not 405
 HEAD /cf/resource-group/v1/memberships          → not 405
-POST /cf/types-registry/v1/types (empty body)   → not 404/405 (400 ok — validation)
+Former /cf/types-registry/v1/types* CRUD routes → 404/405 (not mounted)
 
 Verify: each returns a status code, meaning the route exists and the handler runs.
 No data setup needed. Fastest possible test.
@@ -524,10 +498,10 @@ No data setup needed. Fastest possible test.
 
 **Seam**: DTO serialization — JSON field names, types, and presence match OpenAPI contract over HTTP.
 
-**Why not in unit tests**: TC-DTO-01–07 and TC-SDK-14/15 test `From<Group> for GroupDto` (Rust struct conversion). They do NOT test the JSON wire format: `#[serde(rename = "type")]`, `#[serde(skip_serializing_if = "Option::is_none")]`, camelCase conventions, timestamp format. A serde attribute typo passes unit tests but breaks clients.
+**Why not in unit tests**: the retained TC-DTO group/membership cases and TC-SDK-15 test `From<Group> for GroupDto` (Rust struct conversion). They do NOT test the JSON wire format: `#[serde(rename = "type")]`, `#[serde(skip_serializing_if = "Option::is_none")]`, camelCase conventions, timestamp format. A serde attribute typo passes unit tests but breaks clients.
 
 ```
-POST /types → create type
+Publish fixture type through the Types Registry platform API
 POST /groups → create group with metadata: {"self_managed": true}
 GET  /groups/{id} → 200
 
@@ -535,14 +509,10 @@ Assert JSON keys:
   "id"         — string, UUID format
   "name"       — string
   "type"       — string (NOT "type_path", NOT "gts_type_id")
-  "tenant_id"  — string, UUID format
-  "parent_id"  — null (root group)
-  "depth"      — integer, == 0
+  "hierarchy"  — object with tenant_id (UUID string) and parent_id (null for a root)
   "metadata"   — {"self_managed": true} (JSONB roundtrip)
-  "created_at" — string, ISO 8601
-  "updated_at" — null or absent (fresh create)
 
-Assert NO unexpected keys leaking (like "gts_type_id" internal SMALLINT).
+Assert NO unexpected keys leaking (like "gts_type_id" persistence field).
 ```
 
 ### S8: `test_error_response_rfc9457`
@@ -586,3 +556,10 @@ assert all 5 created IDs present                 (no missing)
 - [x] S2 (DTO roundtrip) verifies exact JSON key names — not just "response is 200"
 - [x] S8 (error format) checks `Content-Type: application/problem+json` header and no internal field leaks
 - [x] S9 (pagination) asserts no duplicates AND no missing items across all pages
+
+### Registry Migration Verification
+
+The retained cases above are supplemented by managed admission and identifier
+migration coverage in feature 0002. E2E type fixtures publish through the platform
+API and repeat identical declarations under the current registry version. The
+local SQLite harness does not replace PostgreSQL backend tests.

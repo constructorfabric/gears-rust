@@ -13,6 +13,7 @@ pub struct Model {
     pub id: Uuid,
     #[sea_orm(nullable)]
     pub parent_id: Option<Uuid>,
+    /// Key of the group's GTS type in the `gts_type` dictionary (immutable).
     pub gts_type_id: i16,
     pub name: String,
     #[sea_orm(column_type = "JsonBinary", nullable)]

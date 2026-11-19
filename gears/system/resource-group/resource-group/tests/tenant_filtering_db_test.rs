@@ -30,7 +30,6 @@ use toolkit_security::{PlatformSecurityContext, pep_properties};
 use resource_group::domain::group_service::{GroupService, QueryProfile};
 use resource_group::infra::storage::group_repo::GroupRepository;
 use resource_group::infra::storage::membership_repo::MembershipRepository;
-use resource_group::infra::storage::type_repo::TypeRepository;
 
 use common::{make_ctx, test_db};
 
@@ -75,9 +74,7 @@ impl AuthZResolverApi for TenantScopingAuthZ {
 /// Differs from `common::make_group_service` only by the `AuthZ` implementation:
 /// `common` uses `AllowAllAuthZ`, while these tests need explicit tenant
 /// scoping via `In(OWNER_TENANT_ID)` to exercise the `AccessScope` path.
-fn make_group_service(
-    db: Arc<DBProvider<DbError>>,
-) -> GroupService<GroupRepository, TypeRepository> {
+fn make_group_service(db: Arc<DBProvider<DbError>>) -> GroupService<GroupRepository> {
     let authz: Arc<dyn AuthZResolverApi> = Arc::new(TenantScopingAuthZ);
     let enforcer = PolicyEnforcer::new(authz);
     GroupService::new(
@@ -85,8 +82,7 @@ fn make_group_service(
         QueryProfile::default(),
         enforcer,
         Arc::new(GroupRepository),
-        Arc::new(TypeRepository),
-        common::make_types_registry(),
+        common::make_types_catalog(),
     )
 }
 
@@ -96,7 +92,7 @@ fn make_group_service(
 /// learn from *which* error comes back.
 fn make_group_service_with_unavailable_registry(
     db: Arc<DBProvider<DbError>>,
-) -> GroupService<GroupRepository, TypeRepository> {
+) -> GroupService<GroupRepository> {
     let authz: Arc<dyn AuthZResolverApi> = Arc::new(TenantScopingAuthZ);
     let enforcer = PolicyEnforcer::new(authz);
     GroupService::new(
@@ -104,8 +100,7 @@ fn make_group_service_with_unavailable_registry(
         QueryProfile::default(),
         enforcer,
         Arc::new(GroupRepository),
-        Arc::new(TypeRepository),
-        common::make_unavailable_types_registry(),
+        common::make_unavailable_types_catalog(),
     )
 }
 
@@ -578,7 +573,7 @@ async fn group_based_membership_data_correctly_stored() {
 
     // Create task type first (project references it in allowed_membership_types)
     type_svc
-        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(common::CreateTypeRequest {
             code: task_type.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -589,7 +584,7 @@ async fn group_based_membership_data_correctly_stored() {
         .expect("create task type");
 
     type_svc
-        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+        .create_type_unscoped(common::CreateTypeRequest {
             code: project_type.clone(),
             can_be_root: true,
             allowed_parent_types: vec![],
@@ -628,7 +623,7 @@ async fn group_based_membership_data_correctly_stored() {
         db.clone(),
         enforcer,
         Arc::new(GroupRepository),
-        Arc::new(TypeRepository),
+        common::make_types_catalog(),
         Arc::new(MembershipRepository),
     );
 

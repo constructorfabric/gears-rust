@@ -20,28 +20,22 @@ use async_trait::async_trait;
 use serde_json::json;
 use uuid::Uuid;
 
+use common::{CreateTypeRequest, UpdateTypeRequest};
 use resource_group::domain::error::DomainError;
 use resource_group::domain::group_service::{GroupService, QueryProfile, TenantTypes};
 use resource_group::domain::metrics::{Operation, Outcome, RgMetricsPort};
-use resource_group::domain::repo::GroupRepositoryTrait;
-use resource_group::domain::type_service::TypeService;
-use resource_group::infra::storage::entity::gts_type::{
-    Column as GtsTypeColumn, Entity as GtsTypeEntity,
-};
+use resource_group::domain::repo::{GroupRecord, GroupRepositoryTrait, GtsTypeKey};
 use resource_group::infra::storage::entity::resource_group::{
-    Column as RgColumn, Entity as RgEntity, Model as RgModel,
+    Column as RgColumn, Entity as RgEntity,
 };
 use resource_group::infra::storage::entity::resource_group_membership::{
     self as membership_entity, Entity as MembershipEntity,
 };
 use resource_group::infra::storage::group_repo::GroupRepository;
-use resource_group::infra::storage::type_repo::TypeRepository;
 use resource_group_sdk::models::{ResourceGroup as ResourceGroupSdkModel, ResourceGroupWithDepth};
-use resource_group_sdk::{
-    CreateGroupRequest, CreateTypeRequest, UpdateGroupRequest, UpdateTypeRequest,
-};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
-use toolkit_db::secure::{DBRunner, SecureEntityExt, secure_insert};
+use resource_group_sdk::{CreateGroupRequest, UpdateGroupRequest};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use toolkit_db::secure::{DBRunner, SecureEntityExt};
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::AccessScope;
 
@@ -49,14 +43,13 @@ use toolkit_security::AccessScope;
 fn make_group_service_with_profile(
     db: std::sync::Arc<toolkit_db::DBProvider<toolkit_db::DbError>>,
     profile: QueryProfile,
-) -> GroupService<GroupRepository, TypeRepository> {
+) -> GroupService<GroupRepository> {
     GroupService::new(
         db,
         profile,
         common::make_enforcer(),
         Arc::new(GroupRepository),
-        Arc::new(TypeRepository),
-        common::make_types_registry(),
+        common::make_types_catalog(),
     )
 }
 
@@ -391,7 +384,7 @@ async fn group_move_closure_rebuild() {
 
     // Move child (and its subtree) from root1 to root2
     let moved = group_svc
-        .move_group(child.id, Some(root2.id))
+        .move_group(&ctx, child.id, Some(root2.id))
         .await
         .expect("move group");
 
@@ -435,9 +428,9 @@ async fn group_move_closure_rebuild() {
 /// be built. `resolve_ids` rejects a parent path that does not exist yet, so
 /// the self-reference is added by a follow-up update.
 async fn create_self_parenting_type(
-    type_svc: &TypeService<TypeRepository>,
+    type_svc: &common::TestTypes,
     suffix: &str,
-) -> resource_group_sdk::ResourceGroupType {
+) -> common::ResourceGroupType {
     let code = format!(
         "{}x.test.{}.i{}.v1~",
         gts_id!("cf.core.rg.type.v1~"),
@@ -501,7 +494,7 @@ async fn group_move_under_deep_parent_rebuilds_every_depth() {
         common::create_child_group(&group_svc, &ctx, &t.code, moved.id, "leaf", tenant_id).await;
 
     group_svc
-        .move_group(moved.id, Some(target.id))
+        .move_group(&ctx, moved.id, Some(target.id))
         .await
         .expect("move under the deep parent");
 
@@ -562,7 +555,7 @@ async fn group_move_to_parent_in_another_tenant_rejected() {
     let root_b = common::create_root_group(&group_svc, &ctx_b, &t.code, "b-root", tenant_b).await;
 
     let err = group_svc
-        .move_group(child_a.id, Some(root_b.id))
+        .move_group(&ctx_a, child_a.id, Some(root_b.id))
         .await
         .expect_err("a move across the tenant boundary must be refused");
 
@@ -663,7 +656,7 @@ async fn group_move_under_descendant_cycle() {
 
     // Try to move root under its child
     let err = group_svc
-        .move_group(root.id, Some(child.id))
+        .move_group(&ctx, root.id, Some(child.id))
         .await
         .unwrap_err();
 
@@ -687,7 +680,7 @@ async fn group_move_self_parent_cycle() {
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
 
     let err = group_svc
-        .move_group(root.id, Some(root.id))
+        .move_group(&ctx, root.id, Some(root.id))
         .await
         .unwrap_err();
 
@@ -727,7 +720,7 @@ async fn group_move_incompatible_parent_type() {
 
     // Move child to root_b (incompatible)
     let err = group_svc
-        .move_group(child.id, Some(root_b.id))
+        .move_group(&ctx, child.id, Some(root_b.id))
         .await
         .unwrap_err();
 
@@ -750,7 +743,7 @@ async fn group_move_child_to_root() {
     // Create a type that can be both root and child
     let root_type = common::create_root_type(&type_svc, "org").await;
     let child_code = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.flexible{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.flexible.i{}.v1~",
         Uuid::now_v7().as_simple()
     );
     let _flexible_type = type_svc
@@ -772,7 +765,7 @@ async fn group_move_child_to_root() {
 
     // Move child to root (detach from parent)
     let moved = group_svc
-        .move_group(child.id, None)
+        .move_group(&ctx, child.id, None)
         .await
         .expect("move to root");
 
@@ -808,7 +801,10 @@ async fn group_move_to_root_cannot_be_root() {
     )
     .await;
 
-    let err = group_svc.move_group(child.id, None).await.unwrap_err();
+    let err = group_svc
+        .move_group(&ctx, child.id, None)
+        .await
+        .unwrap_err();
 
     assert!(
         matches!(err, DomainError::InvalidParentType { ref message } if message.contains("cannot be a root group")),
@@ -823,7 +819,7 @@ async fn group_move_nonexistent() {
     let group_svc = common::make_group_service(db.clone());
 
     let err = group_svc
-        .move_group(Uuid::now_v7(), None)
+        .move_group(&common::make_anon_ctx(), Uuid::now_v7(), None)
         .await
         .unwrap_err();
 
@@ -847,7 +843,7 @@ async fn group_move_to_nonexistent_parent() {
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
 
     let err = group_svc
-        .move_group(root.id, Some(Uuid::now_v7()))
+        .move_group(&ctx, root.id, Some(Uuid::now_v7()))
         .await
         .unwrap_err();
 
@@ -872,7 +868,7 @@ async fn group_move_max_width_exceeded() {
 
     let root_type = common::create_root_type(&type_svc, "org").await;
     let child_code = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.flex{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.flex.i{}.v1~",
         Uuid::now_v7().as_simple()
     );
     type_svc
@@ -899,7 +895,7 @@ async fn group_move_max_width_exceeded() {
         common::create_root_group(&group_svc, &ctx, &child_code, "Standalone", tenant_id).await;
 
     let err = group_svc
-        .move_group(standalone.id, Some(root1.id))
+        .move_group(&ctx, standalone.id, Some(root1.id))
         .await
         .unwrap_err();
 
@@ -1087,28 +1083,8 @@ async fn group_delete_with_memberships_no_force() {
     let root =
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
 
-    // Insert membership directly. Resolve the surrogate `gts_type_id` from the
-    // type we just created instead of hard-coding `1` — that hard-code would
-    // silently break if `common::test_db()` ever seeds base types or if the
-    // SMALLINT IDENTITY sequence behaviour changes.
-    let conn = db.conn().expect("conn");
-    let scope = AccessScope::allow_all();
-    let root_type_id = GtsTypeEntity::find()
-        .filter(GtsTypeColumn::SchemaId.eq(&root_type.code))
-        .secure()
-        .scope_with(&scope)
-        .one(&conn)
-        .await
-        .expect("query gts_type")
-        .expect("type row exists")
-        .id;
-    let membership = membership_entity::ActiveModel {
-        group_id: Set(root.id),
-        gts_type_id: Set(root_type_id),
-        resource_id: Set("resource-1".to_owned()),
-        ..Default::default()
-    };
-    secure_insert::<MembershipEntity>(membership, &scope, &conn)
+    // Insert membership directly, keyed through RG's type dictionary.
+    common::insert_membership_directly(&db, root.id, &root_type.code, "resource-1")
         .await
         .expect("insert membership");
 
@@ -1159,28 +1135,12 @@ async fn group_force_delete_subtree() {
     )
     .await;
 
-    // Add a membership to child (direct insert). Resolve the surrogate
-    // `gts_type_id` from the actual type row instead of hard-coding `1`.
-    let conn = db.conn().expect("conn");
-    let scope = AccessScope::allow_all();
-    let root_type_id = GtsTypeEntity::find()
-        .filter(GtsTypeColumn::SchemaId.eq(&root_type.code))
-        .secure()
-        .scope_with(&scope)
-        .one(&conn)
-        .await
-        .expect("query gts_type")
-        .expect("type row exists")
-        .id;
-    let membership = membership_entity::ActiveModel {
-        group_id: Set(child.id),
-        gts_type_id: Set(root_type_id),
-        resource_id: Set("resource-m".to_owned()),
-        ..Default::default()
-    };
-    secure_insert::<MembershipEntity>(membership, &scope, &conn)
+    // Add a membership to child (direct insert), keyed through the dictionary.
+    common::insert_membership_directly(&db, child.id, &root_type.code, "resource-m")
         .await
         .expect("insert membership");
+    let conn = db.conn().expect("conn");
+    let scope = AccessScope::allow_all();
 
     // Force delete root subtree
     group_svc
@@ -1469,7 +1429,7 @@ async fn group_move_max_depth_exceeded() {
     let child_type = common::create_child_type(&type_svc, "dept", &[&root_type.code], &[]).await;
     // sub_type allows child_type as parent, can also be root
     let sub_code = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.sub{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.sub.i{}.v1~",
         Uuid::now_v7().as_simple()
     );
     type_svc
@@ -1501,7 +1461,7 @@ async fn group_move_max_depth_exceeded() {
         common::create_root_group(&group_svc, &ctx, &sub_code, "Standalone", tenant_id).await;
     // sub needs a type that allows sub_code as parent -- create another type for that
     let subsub_code = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.subsub{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.subsub.i{}.v1~",
         Uuid::now_v7().as_simple()
     );
     type_svc
@@ -1530,7 +1490,7 @@ async fn group_move_max_depth_exceeded() {
     // But standalone's type (sub_code) must allow child_type as parent.
     // Actually sub_code allows child_type as parent, so the move is type-compatible.
     let err = group_svc
-        .move_group(standalone.id, Some(child.id))
+        .move_group(&ctx, standalone.id, Some(child.id))
         .await
         .unwrap_err();
 
@@ -2037,19 +1997,19 @@ async fn group_metadata_in_hierarchy_response() {
 /// Helper: build the ADR-001 type ecosystem.
 /// Returns (tenant_type, dept_type, branch_type, user_type, course_type).
 async fn create_adr_types(
-    type_svc: &resource_group::domain::type_service::TypeService<TypeRepository>,
+    type_svc: &common::TestTypes,
 ) -> (
-    resource_group_sdk::ResourceGroupType,
-    resource_group_sdk::ResourceGroupType,
-    resource_group_sdk::ResourceGroupType,
-    resource_group_sdk::ResourceGroupType,
-    resource_group_sdk::ResourceGroupType,
+    common::ResourceGroupType,
+    common::ResourceGroupType,
+    common::ResourceGroupType,
+    common::ResourceGroupType,
+    common::ResourceGroupType,
 ) {
     let user_type = common::create_root_type(type_svc, "adruser").await;
     let course_type = common::create_root_type(type_svc, "adrcourse").await;
 
     let suffix_t = format!("adrtenant{}", uuid::Uuid::now_v7().as_simple());
-    let tenant_code = format!("{}x.test.{suffix_t}.v1~", gts_id!("cf.core.rg.type.v1~"));
+    let tenant_code = format!("{}x.test._.{suffix_t}.v1~", gts_id!("cf.core.rg.type.v1~"));
 
     // Tenant type: create first without self-reference, then update
     type_svc
@@ -2066,7 +2026,7 @@ async fn create_adr_types(
     let tenant_type = type_svc
         .update_type_unscoped(
             &tenant_code,
-            resource_group_sdk::UpdateTypeRequest {
+            common::UpdateTypeRequest {
                 can_be_root: true,
                 allowed_parent_types: vec![tenant_code.clone()],
                 allowed_membership_types: vec![user_type.code.clone()],
@@ -2239,11 +2199,8 @@ async fn adr_branch_only_under_department() {
         .unwrap_err();
 
     assert!(
-        matches!(
-            err,
-            DomainError::InvalidParentType { .. } | DomainError::AllowedParentTypesViolation { .. }
-        ),
-        "Expected InvalidParentType or AllowedParentTypesViolation, got {err:?}"
+        matches!(err, DomainError::InvalidParentType { .. }),
+        "Expected InvalidParentType, got {err:?}"
     );
 }
 
@@ -2474,20 +2431,18 @@ async fn security_group_metadata_large_payload() {
 /// tenant-type group.
 fn unique_tenant_type_code() -> String {
     format!(
-        "{}test{}.v1~",
+        "{}x.test._.t{}.v1~",
         resource_group_sdk::TENANT_RG_TYPE_PATH,
         Uuid::now_v7().as_simple()
     )
 }
 
 /// Create a tenant-type RG type (`can_be_root=true`, `allowed_parent_types=[self]`).
-async fn create_tenant_type(
-    svc: &TypeService<TypeRepository>,
-) -> resource_group_sdk::models::ResourceGroupType {
+async fn create_tenant_type(svc: &common::TestTypes) -> common::ResourceGroupType {
     // `allowed_parent_types = []` because self-references aren't allowed at
     // create time (the type is not yet in the registry). Suitable for testing
     // the uniqueness invariant at root level.
-    svc.create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+    svc.create_type_unscoped(common::CreateTypeRequest {
         code: unique_tenant_type_code(),
         can_be_root: true,
         allowed_parent_types: vec![],
@@ -2501,10 +2456,10 @@ async fn create_tenant_type(
 /// Create a tenant-type RG type that allows being placed under the given
 /// parent tenant-type (used to build a root→sub-tenant fixture).
 async fn create_tenant_sub_type(
-    svc: &TypeService<TypeRepository>,
+    svc: &common::TestTypes,
     parent_type_code: &str,
-) -> resource_group_sdk::models::ResourceGroupType {
-    svc.create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+) -> common::ResourceGroupType {
+    svc.create_type_unscoped(common::CreateTypeRequest {
         code: unique_tenant_type_code(),
         can_be_root: true,
         allowed_parent_types: vec![parent_type_code.to_owned()],
@@ -2520,11 +2475,17 @@ const CUSTOM_TENANT_RG_TYPE_PATH: &str = gts_id!("cf.core.rg.type.v1~acme.core._
 
 /// Create a root-capable RG type whose code starts with `prefix`.
 async fn create_root_type_with_prefix(
-    svc: &TypeService<TypeRepository>,
+    svc: &common::TestTypes,
     prefix: &str,
-) -> resource_group_sdk::models::ResourceGroupType {
-    svc.create_type_unscoped(resource_group_sdk::CreateTypeRequest {
-        code: format!("{prefix}test{}.v1~", Uuid::now_v7().as_simple()),
+) -> common::ResourceGroupType {
+    // The prefix is itself an RG type the derived one extends.
+    common::publish_type(common::CreateTypeRequest {
+        code: prefix.to_owned(),
+        can_be_root: true,
+        ..common::CreateTypeRequest::default()
+    });
+    svc.create_type_unscoped(common::CreateTypeRequest {
+        code: format!("{prefix}x.test._.t{}.v1~", Uuid::now_v7().as_simple()),
         can_be_root: true,
         allowed_parent_types: vec![],
         allowed_membership_types: vec![],
@@ -3103,32 +3064,24 @@ async fn list_groups_filters_by_negated_type() {
 }
 
 #[tokio::test]
-async fn list_groups_rejects_an_unknown_type_in_the_filter() {
-    // The resolution map is built from the paths that exist. A path that is
-    // absent has no id to substitute, and the request is a client error --
-    // not an empty page, which would read as "no such groups" rather than
-    // "no such type", and not a 500.
+async fn list_groups_filters_an_unknown_type_to_an_empty_page() {
+    // Reads compare the stored GTS type identifier and never consult the
+    // types registry: a type no group has -- unknown, deleted or never
+    // published -- simply matches nothing.
     let db = common::test_db().await;
     let group_svc = common::make_group_service(db.clone());
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let err = group_svc
+    let page = group_svc
         .list_groups(
             &ctx,
             &filter_query("type eq 'gts.cf.core.rg.type.v1~x.test._.absent.v1~'"),
         )
         .await
-        .expect_err("an unresolvable type path must be refused");
+        .expect("an unknown type is not a registry question");
 
-    assert!(
-        matches!(err, DomainError::Validation { .. }),
-        "expected a validation error, got: {err:?}"
-    );
-    assert!(
-        err.to_string().contains("Unknown type in filter"),
-        "the message should name the problem: {err}"
-    );
+    assert!(page.items.is_empty(), "{page:?}");
 }
 
 #[tokio::test]
@@ -3233,7 +3186,6 @@ impl ParentFlippingGroupRepo {
                     db,
                     id,
                     Some(self.new_parent_id),
-                    model.gts_type_id,
                     &model.name,
                     model.metadata.as_ref(),
                 )
@@ -3271,7 +3223,7 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
         &self,
         db: &C,
         id: Uuid,
-    ) -> Result<Option<RgModel>, DomainError> {
+    ) -> Result<Option<GroupRecord>, DomainError> {
         if let Some(stale_parent) = self.stale_unlocked_parent {
             let mut result = self.inner.find_model_by_id(db, id).await?;
             if id == self.watched_group_id
@@ -3294,7 +3246,6 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
                     db,
                     id,
                     Some(self.new_parent_id),
-                    model.gts_type_id,
                     &model.name,
                     model.metadata.as_ref(),
                 )
@@ -3308,7 +3259,7 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
         db: &C,
         scope: &AccessScope,
         id: Uuid,
-    ) -> Result<Option<RgModel>, DomainError> {
+    ) -> Result<Option<GroupRecord>, DomainError> {
         self.inner.find_model_by_id_scoped(db, scope, id).await
     }
 
@@ -3316,7 +3267,7 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
         &self,
         db: &C,
         id: Uuid,
-    ) -> Result<Option<RgModel>, DomainError> {
+    ) -> Result<Option<GroupRecord>, DomainError> {
         self.inner.find_model_by_id_for_update(db, id).await
     }
 
@@ -3359,18 +3310,26 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
         self.inner.get_ancestors(db, scope, group_id, query).await
     }
 
+    async fn ensure_type_key<C: DBRunner>(
+        &self,
+        db: &C,
+        code: &str,
+    ) -> Result<GtsTypeKey, DomainError> {
+        self.inner.ensure_type_key(db, code).await
+    }
+
     async fn insert<C: DBRunner>(
         &self,
         db: &C,
         id: Uuid,
         parent_id: Option<Uuid>,
-        gts_type_id: i16,
+        type_key: GtsTypeKey,
         name: &str,
         metadata: Option<&serde_json::Value>,
         tenant_id: Uuid,
-    ) -> Result<RgModel, DomainError> {
+    ) -> Result<(), DomainError> {
         self.inner
-            .insert(db, id, parent_id, gts_type_id, name, metadata, tenant_id)
+            .insert(db, id, parent_id, type_key, name, metadata, tenant_id)
             .await
     }
 
@@ -3379,13 +3338,10 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
         db: &C,
         id: Uuid,
         parent_id: Option<Uuid>,
-        gts_type_id: i16,
         name: &str,
         metadata: Option<&serde_json::Value>,
     ) -> Result<u64, DomainError> {
-        self.inner
-            .update(db, id, parent_id, gts_type_id, name, metadata)
-            .await
+        self.inner.update(db, id, parent_id, name, metadata).await
     }
 
     async fn delete_by_id<C: DBRunner>(&self, db: &C, id: Uuid) -> Result<(), DomainError> {
@@ -3511,14 +3467,6 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
     ) -> Result<bool, DomainError> {
         self.inner.has_memberships(db, group_id).await
     }
-
-    async fn resolve_type_paths_batch<C: DBRunner>(
-        &self,
-        db: &C,
-        type_ids: &[i16],
-    ) -> Result<std::collections::HashMap<i16, String>, DomainError> {
-        self.inner.resolve_type_paths_batch(db, type_ids).await
-    }
 }
 
 /// Records only `isolation_escalation` calls; every other `RgMetricsPort`
@@ -3605,8 +3553,7 @@ async fn group_rename_does_not_revert_a_concurrent_reparent() {
         QueryProfile::default(),
         common::make_enforcer(),
         racing_repo,
-        Arc::new(TypeRepository),
-        common::make_types_registry(),
+        common::make_types_catalog(),
     );
 
     // A pure rename: the request carries the parent the group already had.
@@ -3701,8 +3648,7 @@ async fn group_update_escalates_to_serializable_on_concurrent_reparent() {
         QueryProfile::default(),
         common::make_enforcer(),
         flipping_repo,
-        Arc::new(TypeRepository),
-        common::make_types_registry(),
+        common::make_types_catalog(),
     )
     .with_metrics(recorder.clone());
 

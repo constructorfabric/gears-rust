@@ -12,6 +12,7 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub group_id: Uuid,
     #[sea_orm(primary_key, auto_increment = false)]
+    /// Key of the member resource's GTS type in the `gts_type` dictionary.
     pub gts_type_id: i16,
     #[sea_orm(primary_key, auto_increment = false)]
     pub resource_id: String,

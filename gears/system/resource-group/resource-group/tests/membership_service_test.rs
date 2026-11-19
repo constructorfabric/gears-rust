@@ -12,13 +12,11 @@ use common::{create_root_type, make_ctx, make_group_service, make_membership_ser
 use toolkit_odata::ODataQuery;
 use uuid::Uuid;
 
+use common::CreateTypeRequest;
 use resource_group::domain::error::DomainError;
-use resource_group::domain::type_service::TypeService;
 use resource_group::infra::storage::entity::resource_group_membership::{
     Column as MbrColumn, Entity as MbrEntity,
 };
-use resource_group::infra::storage::type_repo::TypeRepository;
-use resource_group_sdk::CreateTypeRequest;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use toolkit_db::secure::SecureEntityExt;
 use toolkit_gts::{GTS_ID_PREFIX, gts_id};
@@ -26,12 +24,12 @@ use toolkit_security::AccessScope;
 
 /// Helper: create a root type that allows the given membership type paths.
 async fn create_type_with_memberships(
-    type_svc: &TypeService<TypeRepository>,
+    type_svc: &common::TestTypes,
     suffix: &str,
     memberships: &[&str],
-) -> resource_group_sdk::ResourceGroupType {
+) -> common::ResourceGroupType {
     let code = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.{}{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.{}.i{}.v1~",
         suffix,
         Uuid::now_v7().as_simple()
     );
@@ -138,15 +136,16 @@ async fn membership_add_duplicate() {
         .await
         .expect_err("duplicate add should fail");
 
-    assert!(
-        matches!(
-            err,
-            DomainError::Conflict { .. }
-                | DomainError::ConflictActiveReferences { .. }
-                | DomainError::DuplicateMembership { .. }
-        ),
-        "expected Conflict, ConflictActiveReferences, or DuplicateMembership, got: {err:?}"
-    );
+    // The duplicate names the member type by its GTS identifier, never by
+    // its dictionary key.
+    let expected = format!("({}, {}, res-dup)", group.id, member_type.code);
+    match err {
+        DomainError::DuplicateMembership { key, message } => {
+            assert_eq!(key, expected);
+            assert_eq!(message, format!("Membership already exists: {expected}"));
+        }
+        other => panic!("expected DuplicateMembership, got: {other:?}"),
+    }
 }
 
 // TC-MBR-04: Unregistered resource_type
@@ -426,6 +425,8 @@ async fn membership_remove_unregistered_resource_type() {
     let grp_type = create_type_with_memberships(&type_svc, "grp", &[&member_type.code]).await;
     let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G1", tenant).await;
 
+    // Removal is keyed by the stored identifier and never asks the types
+    // registry, so an unknown type is simply a membership that is not there.
     let err = mbr_svc
         .remove_membership(
             &ctx,
@@ -434,15 +435,11 @@ async fn membership_remove_unregistered_resource_type() {
             "res-001",
         )
         .await
-        .expect_err("remove with unregistered type should fail");
+        .expect_err("no such membership");
 
     assert!(
-        matches!(err, DomainError::Validation { .. }),
-        "expected Validation, got: {err:?}"
-    );
-    assert!(
-        format!("{err:?}").contains("Unknown resource type"),
-        "error should mention unknown resource type: {err:?}"
+        matches!(err, DomainError::MembershipNotFound { .. }),
+        "expected MembershipNotFound, got: {err:?}"
     );
 }
 

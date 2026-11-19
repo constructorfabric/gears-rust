@@ -181,7 +181,8 @@ pub const USER: ResourceType = ResourceType::from_static(
 ```
 
 The PEP uses that same identity to qualify
-`resource_group_membership.gts_type_id` through RG's `gts_type.schema_id`;
+`resource_group_membership.gts_type_id` through RG's `gts_type.schema_id`
+(an identity dictionary: key ↔ GTS type identifier, no definitions);
 consumers do not configure a second membership type. Without the per-resource
 opt-in, or for a non-canonical GTS policy name, `PolicyEnforcer` suppresses
 `GroupMembership` and `GroupHierarchy`, asking the PDP to expand the group scope
@@ -191,9 +192,10 @@ bundled plugins deny — neither implements expansion today).
 The querying database must also contain or project the tables each predicate
 executes against before the enforcer is configured with the corresponding
 capability: native `in_group` needs `resource_group_membership` and RG's
-`gts_type` registry; native `in_group_subtree` additionally needs
-`resource_group_closure`. External membership-type registration is tracked
-separately in [#4052](https://github.com/constructorfabric/gears-rust/issues/4052).
+`gts_type` dictionary; native `in_group_subtree` additionally needs
+`resource_group_closure`. Membership types are defined in types-registry; RG
+keys any admitted member type in its dictionary on first use, and the
+membership rows must be recorded under the resource's canonical GTS type path.
 
 ### Defining actions
 

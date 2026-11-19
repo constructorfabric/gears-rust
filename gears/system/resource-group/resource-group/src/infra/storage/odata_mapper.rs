@@ -8,41 +8,13 @@
 use toolkit_db::odata::sea_orm_filter::{FieldToColumn, ODataFieldMapping};
 use toolkit_odata::filter::{FieldKind, FilterField as _};
 
-use crate::infra::storage::entity::gts_type::{
-    Column as TypeColumn, Entity as TypeEntity, Model as TypeModel,
-};
 use crate::infra::storage::entity::resource_group::{
     Column as GroupColumn, Entity as GroupEntity, Model as GroupModel,
 };
 use crate::infra::storage::entity::resource_group_membership::{
     Column as MembershipColumn, Entity as MembershipEntity, Model as MembershipModel,
 };
-use resource_group_sdk::odata::{
-    GroupFilterField, HierarchyFilterField, MembershipFilterField, TypeFilterField,
-};
-
-/// `OData` mapper for GTS types.
-pub struct TypeODataMapper;
-
-impl FieldToColumn<TypeFilterField> for TypeODataMapper {
-    type Column = TypeColumn;
-
-    fn map_field(field: TypeFilterField) -> TypeColumn {
-        match field {
-            TypeFilterField::Code => TypeColumn::SchemaId,
-        }
-    }
-}
-
-impl ODataFieldMapping<TypeFilterField> for TypeODataMapper {
-    type Entity = TypeEntity;
-
-    fn extract_cursor_value(model: &TypeModel, field: TypeFilterField) -> sea_orm::Value {
-        match field {
-            TypeFilterField::Code => sea_orm::Value::String(Some(model.schema_id.clone())),
-        }
-    }
-}
+use resource_group_sdk::odata::{GroupFilterField, HierarchyFilterField, MembershipFilterField};
 
 /// `OData` mapper for resource groups.
 pub struct GroupODataMapper;
@@ -77,11 +49,11 @@ impl ODataFieldMapping<GroupFilterField> for GroupODataMapper {
         }
     }
 
-    /// `type` is a wire string but its cursor value is the storage
-    /// `SMALLINT` gts ordinal — without this override the cursor codec
-    /// would try to encode the `SmallInt` under the wire `String` kind
-    /// and fail with `InvalidCursor` on any `$orderby=type` page
-    /// overflow (same wire-vs-storage seam as AM's `status`).
+    /// `type` is a wire string but its storage (and so its sort and cursor
+    /// value) is the `SMALLINT` dictionary key: `$orderby=type` orders by key,
+    /// stable but not lexical. Without this override the cursor codec would
+    /// encode the `SmallInt` under the wire `String` kind and fail with
+    /// `InvalidCursor` on the next page.
     fn cursor_kind(field: GroupFilterField) -> FieldKind {
         match field {
             GroupFilterField::Type => FieldKind::I64,
@@ -115,7 +87,7 @@ impl ODataFieldMapping<HierarchyFilterField> for HierarchyODataMapper {
         }
     }
 
-    /// Same wire-string / storage-SMALLINT seam as `GroupODataMapper`.
+    /// Same wire-string / storage-`SMALLINT` seam as `GroupODataMapper`.
     fn cursor_kind(field: HierarchyFilterField) -> FieldKind {
         match field {
             HierarchyFilterField::Type => FieldKind::I64,
@@ -157,7 +129,7 @@ impl ODataFieldMapping<MembershipFilterField> for MembershipODataMapper {
         }
     }
 
-    /// Same wire-string / storage-SMALLINT seam as `GroupODataMapper`.
+    /// Same wire-string / storage-`SMALLINT` seam as `GroupODataMapper`.
     fn cursor_kind(field: MembershipFilterField) -> FieldKind {
         match field {
             MembershipFilterField::ResourceType => FieldKind::I64,

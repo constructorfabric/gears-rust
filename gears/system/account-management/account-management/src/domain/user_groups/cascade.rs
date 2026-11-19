@@ -268,19 +268,12 @@ async fn cascade_one(
 /// cost of moving the narrowing client-side is that a tenant's
 /// non-root user-groups now travel over the wire and are discarded
 /// here; they are bounded by the tenant's own group count and the
-/// listing is already paginated. AM's registration
-/// pins `allowed_parent_types = [USER_GROUP_TYPE_CODE]` (a user-group
-/// may only parent another user-group of the same type), so every
-/// descendant of a root user-group in the tenant is itself a
-/// user-group — hence reachable through its root's cascade. This
-/// invariant rests on two pillars: AM is the sole writer of
-/// user-group rows (it only ever passes another user-group's UUID as
-/// `parent_id` when creating one), and RG enforces
-/// `allowed_parent_types` at `create_group` time — so even an RG seed
-/// with broader `allowed_parent_types` (which `classify_existing`
-/// admits per the looseness contract) cannot produce a user-group
-/// with a non-user-group parent unless AM itself requests one, which
-/// it does not.
+/// listing is already paginated. AM's published user-group declaration sets
+/// `allowed_parent_types = [USER_GROUP_TYPE_CODE]`. With this rule, each
+/// non-root user-group has a user-group parent and is reachable through a
+/// user-group root's cascade. RG enforces the published placement rule on
+/// create and move, including calls made directly by consumers; AM does not
+/// own or proxy those writes.
 async fn fetch_tenant_groups(
     client: &Arc<dyn ResourceGroupClient + Send + Sync>,
     ctx: &SecurityContext,

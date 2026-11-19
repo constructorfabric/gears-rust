@@ -984,6 +984,18 @@ mod tests {
                 sql.starts_with("SELECT DISTINCT"),
                 "a membership sibling must be distinct: {sql}"
             );
+            // The graph path shares `typed_membership_query`: the member type
+            // is qualified through RG's identity dictionary, never dropped.
+            assert!(
+                sql.contains(r#""membership"."gts_type_id" IN (SELECT "member_type"."id" FROM "gts_type" AS "member_type""#),
+                "a membership sibling must qualify the member type through the dictionary: {sql}"
+            );
+            assert!(
+                sql.contains(&format!(
+                    r#""member_type"."schema_id" = '{MEMBERSHIP_TYPE}'"#
+                )),
+                "a membership sibling must match the member type identifier: {sql}"
+            );
         }
 
         let closure =

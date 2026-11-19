@@ -18,20 +18,19 @@ use std::sync::Arc;
 use toolkit_odata::ODataQuery;
 use uuid::Uuid;
 
+use common::{CreateTypeRequest, ResourceGroupType};
 use resource_group::domain::read_service::RgReadService;
-use resource_group::domain::type_service::TypeService;
-use resource_group::infra::storage::type_repo::TypeRepository;
-use resource_group_sdk::{CreateTypeRequest, ResourceGroupReadHierarchy, ResourceGroupType};
+use resource_group_sdk::ResourceGroupReadHierarchy;
 use toolkit_gts::GTS_ID_PREFIX;
 
 /// Root type (`can_be_root = true`) that accepts the given membership types.
 async fn root_type_with_memberships(
-    type_svc: &TypeService<TypeRepository>,
+    type_svc: &common::TestTypes,
     suffix: &str,
     memberships: &[&str],
 ) -> ResourceGroupType {
     let code = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.{}{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.{}.i{}.v1~",
         suffix,
         Uuid::now_v7().as_simple()
     );

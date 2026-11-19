@@ -29,11 +29,12 @@ pub mod rg_tables {
     /// Column in membership table: the RG-local GTS type surrogate.
     pub const MEMBERSHIP_GTS_TYPE_ID: &str = "gts_type_id";
 
-    /// RG-local GTS type registry table.
+    /// RG-local GTS type identity dictionary (key <-> GTS type identifier;
+    /// holds no type definitions -- those live in the types registry).
     pub const GTS_TYPE_TABLE: &str = "gts_type";
-    /// Primary key in the RG-local GTS type registry.
+    /// Primary key in the RG-local GTS type identity dictionary.
     pub const GTS_TYPE_ID: &str = "id";
-    /// External GTS schema identifier in the RG-local type registry.
+    /// External GTS type identifier in the RG-local identity dictionary.
     pub const GTS_TYPE_SCHEMA_ID: &str = "schema_id";
 
     /// Closure table for group hierarchy.

@@ -249,6 +249,14 @@ resolvable scope dimension:
 | `gts_type_allowed_parent` | `.../entity/gts_type_allowed_parent.rs` | `no_tenant, no_resource, no_owner, no_type` |
 | `gts_type_allowed_membership` | `.../entity/gts_type_allowed_membership.rs` | `no_tenant, no_resource, no_owner, no_type` |
 
+> **Superseded inventory (2026-11):** `gts_type_allowed_parent` and
+> `gts_type_allowed_membership` were dropped, and `gts_type` reduced to an
+> identity dictionary (`id`, `schema_id`, `created_at`; same scope flags), when
+> resource-group moved its type definitions to types-registry
+> ([#5939](https://github.com/constructorfabric/gears-rust/pull/5939)). The rows
+> above record the inventory this decision was made against; the policy is
+> unaffected.
+
 This is deliberate and correct for those tables — a closure row references *two* tenants, so
 there is no single row-owning tenant to filter on. But it means that used as a graph element
 under any constrained scope, such a table compiles to `WHERE false`: the traversal is safe and

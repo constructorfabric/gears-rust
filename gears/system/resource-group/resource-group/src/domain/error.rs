@@ -13,14 +13,8 @@ pub enum DomainError {
     #[error("Type not found: {code}")]
     TypeNotFound { code: String },
 
-    #[error("Type already exists: {code}")]
-    TypeAlreadyExists { code: String },
-
     #[error("Validation failed: {message}")]
     Validation { message: String },
-
-    #[error("Allowed parents violation: {message}")]
-    AllowedParentTypesViolation { message: String },
 
     #[error("Active references exist: {message}")]
     ConflictActiveReferences { message: String },
@@ -78,6 +72,14 @@ pub enum DomainError {
     #[error("Access denied: {message}")]
     AccessDenied { message: String },
 
+    /// The types registry refused the caller's credential (401/403); kept
+    /// unchanged so the caller sees the registry's own refusal.
+    #[error("Types registry refused the caller: {0}")]
+    RegistryRefusedCaller(toolkit_canonical_errors::CanonicalError),
+
+    #[error("Service unavailable: {message}")]
+    ServiceUnavailable { message: String },
+
     #[error("Database error: {0}")]
     Database(sea_orm::DbErr),
 
@@ -121,18 +123,8 @@ impl DomainError {
         Self::TypeNotFound { code: code.into() }
     }
 
-    pub fn type_already_exists(code: impl Into<String>) -> Self {
-        Self::TypeAlreadyExists { code: code.into() }
-    }
-
     pub fn validation(message: impl Into<String>) -> Self {
         Self::Validation {
-            message: message.into(),
-        }
-    }
-
-    pub fn allowed_parent_types_violation(message: impl Into<String>) -> Self {
-        Self::AllowedParentTypesViolation {
             message: message.into(),
         }
     }

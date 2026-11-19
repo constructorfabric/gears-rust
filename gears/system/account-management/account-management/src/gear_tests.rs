@@ -476,7 +476,6 @@ mod no_seed_startup_tests {
     use toolkit_db::migration_runner::run_migrations_for_testing;
     use toolkit_db::{ConnectOpts, DBProvider, Db, connect_db};
     use toolkit_security::PlatformSecurityContext;
-    use types_registry_sdk::testing::MockTypesRegistryClient;
     use types_registry_sdk::testing_platform::MockTypesRegistry;
     use types_registry_sdk::{
         EntityField, FieldSelection, GtsTypeId, PlatformTypesRegistryApi,
@@ -563,11 +562,8 @@ mod no_seed_startup_tests {
         let tenant: Arc<dyn types_registry_sdk::TypesRegistryApi> =
             Arc::new(types_registry_sdk::testing_platform::MockTypesRegistry::new());
         hub.register::<dyn types_registry_sdk::TypesRegistryApi>(tenant);
-        // AM's own init needs Resource Group — over the legacy registry client, as
-        // with an embedded legacy-only registry.
-        let legacy: Arc<dyn types_registry_sdk::TypesRegistryClient> =
-            Arc::new(types_registry_sdk::testing::MockTypesRegistryClient::new());
-        hub.register::<dyn types_registry_sdk::TypesRegistryClient>(legacy);
+        // AM's own init needs Resource Group, which reads RG types through the
+        // tenant API registered above.
         resource_group::gear::ResourceGroup::default()
             .init(&context(
                 "resource-group",
@@ -635,10 +631,6 @@ mod no_seed_startup_tests {
         let fake = Arc::new(MockTypesRegistry::new());
         fake.seed_inventory();
         fake.install(&hub);
-        // Resource Group still consumes the legacy registry contract.
-        hub.register::<dyn types_registry_sdk::TypesRegistryClient>(Arc::new(
-            MockTypesRegistryClient::new(),
-        ));
 
         let registry = hub
             .get::<dyn PlatformTypesRegistryApi>()
@@ -654,7 +646,7 @@ mod no_seed_startup_tests {
         );
 
         // Initialize the actual Resource Group gear so AM resolves its normal
-        // production dependencies and performs user-group type registration.
+        // production dependencies.
         let resource_group_gear = resource_group::gear::ResourceGroup::default();
         let resource_group_ctx = context(
             "resource-group",
@@ -770,9 +762,6 @@ mod no_seed_startup_tests {
         let fake = Arc::new(MockTypesRegistry::new());
         fake.seed_inventory();
         fake.install(&hub);
-        hub.register::<dyn types_registry_sdk::TypesRegistryClient>(Arc::new(
-            MockTypesRegistryClient::new(),
-        ));
         let resource_group_gear = resource_group::gear::ResourceGroup::default();
         resource_group_gear
             .init(&context(
@@ -876,7 +865,6 @@ mod restart_tests {
     use toolkit_db::secure::{AccessScope, secure_insert};
     use toolkit_db::{ConnectOpts, DBProvider, Db, connect_db};
     use toolkit_security::{PlatformSecurityContext, SecurityContext};
-    use types_registry_sdk::testing::MockTypesRegistryClient;
     use types_registry_sdk::testing_platform::MockTypesRegistry;
     use types_registry_sdk::{
         EntityField, FieldSelection, GtsTypeId, Origin, PlatformTypesRegistryApi,
@@ -993,10 +981,6 @@ mod restart_tests {
             hub.register::<dyn AuthZResolverApi>(authz);
 
             self.registry.install(&hub);
-            // Resource Group still consumes the legacy registry contract.
-            hub.register::<dyn types_registry_sdk::TypesRegistryClient>(Arc::new(
-                MockTypesRegistryClient::new(),
-            ));
 
             let rg_db = self
                 .database(

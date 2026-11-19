@@ -43,7 +43,6 @@ inventory = { workspace = true }
 # Serde and JSON schema
 serde = { workspace = true }
 serde_json = { workspace = true }
-jsonschema = { workspace = true }
 utoipa = { workspace = true, features = ["time"] }
 
 # HTTP and REST
@@ -66,10 +65,9 @@ thiserror = { workspace = true }
 # AuthZ
 authz-resolver-sdk = { workspace = true, features = ["rest-client"] }
 
-# GTS type system — types registry for schema resolution
-types-registry-sdk = { workspace = true }
-types-registry = { workspace = true }
-gts = { workspace = true }
+# GTS type system — RG type definitions are read from the types registry
+# (`TypesRegistryApi`); `rest-client`: the default `gts_publication(...)` adapter.
+types-registry-sdk = { workspace = true, features = ["rest-client"] }
 
 # Local dependencies
 toolkit = { workspace = true }
@@ -83,6 +81,8 @@ toolkit-macros = { workspace = true }
 
 [dev-dependencies]
 authz-resolver-sdk = { workspace = true, features = ["test-util"] }
+# Consumer-owned integration tests against real persisted registry admission.
+types-registry = { package = "cf-gears-types-registry", path = "../../types-registry/types-registry" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["metrics", "testing"] }

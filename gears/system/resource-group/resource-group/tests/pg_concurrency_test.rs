@@ -26,9 +26,7 @@
 //! |---|------------|------------|--------|
 //! | 1 | move A→B   | move B→A   | no cycle committed |
 //! | 2 | create child | move parent | closure consistent |
-//! | 3 | two `create_type` same code | | exactly one 409 |
 //! | 4 | non-force delete | create child | FK blocks create |
-//! | 5 | `delete_type` | `create_group` of type | RESTRICT blocks |
 //! | 6 | `add_membership` (tenant A) | `add_membership` (tenant B), same resource | exactly one commits, the other gets a clean `TenantIncompatibility` -- not a bare DB error |
 //! | 7 | `remove_membership` x2, same resource | | the resource is free for another tenant once its last membership is gone |
 //! | 8 | tenant check + membership insert, forced overlap at `SERIALIZABLE` | | SSI cancels one side; the resource ends up owned by one tenant |
@@ -38,18 +36,17 @@ mod common;
 
 use std::sync::Arc;
 
+use common::{CreateTypeRequest, UpdateTypeRequest};
 use resource_group::domain::error::DomainError;
 use resource_group::domain::group_service::GroupService;
-use resource_group::domain::repo::MembershipRepositoryTrait;
-use resource_group::domain::type_service::TypeService;
+use resource_group::domain::repo::{GroupRepositoryTrait, MembershipRepositoryTrait};
 use resource_group::infra::storage::entity::resource_group_membership::{
     self as membership_entity, Entity as MembershipEntity,
 };
 use resource_group::infra::storage::group_repo::GroupRepository;
 use resource_group::infra::storage::membership_repo::MembershipRepository;
 use resource_group::infra::storage::migrations::Migrator;
-use resource_group::infra::storage::type_repo::TypeRepository;
-use resource_group_sdk::models::{CreateGroupRequest, CreateTypeRequest, UpdateTypeRequest};
+use resource_group_sdk::models::CreateGroupRequest;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use sea_orm_migration::MigratorTrait;
 use testcontainers::{ImageExt, runners::AsyncRunner};
@@ -138,10 +135,7 @@ fn type_code(suffix: &str) -> String {
 
 fn make_services(
     db: Arc<DBProvider<DbError>>,
-) -> (
-    TypeService<TypeRepository>,
-    GroupService<GroupRepository, TypeRepository>,
-) {
+) -> (common::TestTypes, GroupService<GroupRepository>) {
     let type_svc = common::make_type_service(db.clone());
     let group_svc = common::make_group_service(db);
     (type_svc, group_svc)
@@ -227,8 +221,8 @@ async fn concurrent_move_a_to_b_and_b_to_a() {
 
     // Move A→B and B→A concurrently.
     let (r1, r2) = tokio::join!(
-        group_svc.move_group(a.id, Some(b.id)),
-        group_svc.move_group(b.id, Some(a.id)),
+        group_svc.move_group(&ctx, a.id, Some(b.id)),
+        group_svc.move_group(&ctx, b.id, Some(a.id)),
     );
 
     match (&r1, &r2) {
@@ -326,54 +320,10 @@ async fn concurrent_create_child_and_move_parent() {
                 .with_parent_id(Some(parent.id)),
             tenant_id
         ),
-        group_svc.move_group(parent.id, Some(other.id)),
+        group_svc.move_group(&ctx, parent.id, Some(other.id)),
     );
 
     child.expect("concurrent create child should succeed");
-}
-
-// -----------------------------------------------------------------------
-// 3. two concurrent create_type of same code → 409
-// -----------------------------------------------------------------------
-#[tokio::test]
-async fn concurrent_create_type_same_code_returns_one_409() {
-    let Some(fix) = pg_fixture().await else {
-        return;
-    };
-
-    let (type_svc, _) = make_services(fix.db.clone());
-    let code = type_code("dup");
-
-    let req = CreateTypeRequest {
-        code: code.clone(),
-        can_be_root: true,
-        allowed_parent_types: vec![],
-        allowed_membership_types: vec![],
-        metadata_schema: None,
-    };
-
-    let (r1, r2) = tokio::join!(
-        type_svc.create_type_unscoped(req.clone()),
-        type_svc.create_type_unscoped(req),
-    );
-
-    match (&r1, &r2) {
-        (Ok(_), Ok(_)) => panic!("both creates succeeded -- duplicate committed!"),
-        (Err(e1), Err(e2)) => {
-            let m = format!("{e1}{e2}");
-            assert!(
-                m.contains("already exists"),
-                "expected 'already exists', got: {e1} / {e2}"
-            );
-        }
-        (Ok(t), Err(e)) | (Err(e), Ok(t)) => {
-            assert_eq!(t.code, code);
-            assert!(
-                format!("{e}").contains("already exists"),
-                "expected 'already exists', got: {e}"
-            );
-        }
-    }
 }
 
 // -----------------------------------------------------------------------
@@ -481,60 +431,6 @@ async fn concurrent_non_force_delete_and_create_child() {
                 matches!(e, DomainError::ConflictActiveReferences { .. }),
                 "create won the race, so delete must see the new child -- expected \
                  ConflictActiveReferences, got: {e}"
-            );
-        }
-    }
-}
-
-// -----------------------------------------------------------------------
-// 5. delete_type vs create_group of that type
-// -----------------------------------------------------------------------
-#[tokio::test]
-async fn concurrent_delete_type_and_create_group() {
-    let Some(fix) = pg_fixture().await else {
-        return;
-    };
-
-    let tenant_id = Uuid::now_v7();
-    let ctx = make_ctx(tenant_id);
-    let (type_svc, group_svc) = make_services(fix.db.clone());
-
-    let rt = type_svc
-        .create_type_unscoped(CreateTypeRequest {
-            code: type_code("deltp"),
-            can_be_root: true,
-            allowed_parent_types: vec![],
-            allowed_membership_types: vec![],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create type");
-
-    let (del_res, create_res) = tokio::join!(
-        type_svc.delete_type(&ctx, &rt.code),
-        group_svc.create_group(
-            &ctx,
-            CreateGroupRequest::new(rt.code.clone(), "Race".to_owned()),
-            tenant_id
-        ),
-    );
-
-    match (&del_res, &create_res) {
-        (Ok(()), Ok(_)) => {
-            panic!("both delete_type and create_group succeeded -- type in use but removed!")
-        }
-        (Err(e1), Err(e2)) => {
-            let m = format!("{e1}{e2}");
-            assert!(
-                m.contains("conflict") || m.contains("references") || m.contains("not found"),
-                "expected conflict/references, got: {e1} / {e2}"
-            );
-        }
-        (Ok(()), Err(e)) | (Err(e), Ok(_)) => {
-            let m = format!("{e}");
-            assert!(
-                m.contains("conflict") || m.contains("references") || m.contains("not found"),
-                "expected conflict/references/not_found, got: {e}"
             );
         }
     }
@@ -804,11 +700,16 @@ async fn run_first_membership_overlap(fix: &PgFixture, config: TxConfig) -> Over
     }
     let (group_a, group_b) = (group_ids[0], group_ids[1]);
 
-    let conn = fix.db.conn().expect("conn");
-    let gts_type_id: i16 = TypeRepository::resolve_id(&conn, &member_type.code)
-        .await
-        .expect("resolve type id")
-        .expect("type must exist");
+    // The member type's dictionary key is taken up front: this race is about
+    // the tenant check, not about the dictionary.
+    let gts_type_id = member_type.code.clone();
+    {
+        let conn = fix.db.conn().expect("conn");
+        GroupRepository
+            .ensure_type_key(&conn, &gts_type_id)
+            .await
+            .expect("member type key");
+    }
 
     let resource_id = "overlap-res".to_owned();
     let db = fix.db.db();
@@ -817,11 +718,13 @@ async fn run_first_membership_overlap(fix: &PgFixture, config: TxConfig) -> Over
     let (b_done_tx, b_done_rx) = tokio::sync::oneshot::channel::<()>();
 
     let db_a = db.clone();
+    let type_a = gts_type_id.clone();
     let resource_a = resource_id.clone();
     let config_a = config.clone();
     let first = tokio::spawn(async move {
         db_a.transaction_ref_mapped_with_config::<_, (), DomainError>(config_a, move |tx| {
             let resource_id = resource_a.clone();
+            let gts_type_id = type_a.clone();
             // Ignored, not `expect`ed: at SERIALIZABLE the peer may already
             // have returned by the time this fires, and its receiver going
             // away is an outcome of the race, not a reason to panic.
@@ -829,13 +732,13 @@ async fn run_first_membership_overlap(fix: &PgFixture, config: TxConfig) -> Over
             let b_done_rx = b_done_rx;
             Box::pin(async move {
                 let conflict = MembershipRepository
-                    .has_membership_in_other_tenant(tx, gts_type_id, &resource_id, tenant_a)
+                    .has_membership_in_other_tenant(tx, &gts_type_id, &resource_id, tenant_a)
                     .await?;
                 assert!(!conflict, "A must see an unclaimed resource");
                 let _send = a_checked_tx.send(());
                 let _recv = b_done_rx.await;
                 MembershipRepository
-                    .insert(tx, group_a, gts_type_id, &resource_id)
+                    .insert(tx, group_a, &gts_type_id, &resource_id)
                     .await?;
                 Ok(())
             })
@@ -846,19 +749,21 @@ async fn run_first_membership_overlap(fix: &PgFixture, config: TxConfig) -> Over
     a_checked_rx.await.expect("A must reach its check");
 
     let db_b = db.clone();
+    let type_b = gts_type_id.clone();
     let resource_b = resource_id.clone();
     let config_b = config.clone();
     let second = tokio::spawn(async move {
         let out = db_b
             .transaction_ref_mapped_with_config::<_, (), DomainError>(config_b, move |tx| {
                 let resource_id = resource_b.clone();
+                let gts_type_id = type_b.clone();
                 Box::pin(async move {
                     let conflict = MembershipRepository
-                        .has_membership_in_other_tenant(tx, gts_type_id, &resource_id, tenant_b)
+                        .has_membership_in_other_tenant(tx, &gts_type_id, &resource_id, tenant_b)
                         .await?;
                     assert!(!conflict, "B must still see an unclaimed resource");
                     MembershipRepository
-                        .insert(tx, group_b, gts_type_id, &resource_id)
+                        .insert(tx, group_b, &gts_type_id, &resource_id)
                         .await?;
                     Ok(())
                 })
@@ -879,7 +784,6 @@ async fn run_first_membership_overlap(fix: &PgFixture, config: TxConfig) -> Over
     for (group_id, tenant_id) in [(group_a, tenant_a), (group_b, tenant_b)] {
         let row = MembershipEntity::find()
             .filter(membership_entity::Column::GroupId.eq(group_id))
-            .filter(membership_entity::Column::GtsTypeId.eq(gts_type_id))
             .filter(membership_entity::Column::ResourceId.eq(resource_id.clone()))
             .secure()
             .scope_with(&scope)
@@ -963,4 +867,366 @@ async fn forced_overlap_at_read_committed_splits_the_resource() {
          resource ends up owned by two tenants; got {:?}",
         outcome.owning_tenants
     );
+}
+
+// -----------------------------------------------------------------------
+// GTS type identity dictionary: SMALLINT identity use and first-use races
+// -----------------------------------------------------------------------
+
+/// The dictionary key stored for `code`, if any (read only).
+async fn dictionary_key(fix: &PgFixture, code: &str) -> Option<i16> {
+    use resource_group::infra::storage::entity::gts_type::{Column, Entity};
+    let conn = fix.db.conn().expect("conn");
+    Entity::find()
+        .filter(Column::SchemaId.eq(code))
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .one(&conn)
+        .await
+        .expect("dictionary read")
+        .map(|row| row.id)
+}
+
+/// Create a key for a fresh probe identifier and return it: the identity
+/// value the dictionary hands out next.
+async fn probe_next_key(fix: &PgFixture) -> i16 {
+    let probe = type_code("probe");
+    let conn = fix.db.conn().expect("conn");
+    GroupRepository
+        .ensure_type_key(&conn, &probe)
+        .await
+        .expect("probe key");
+    dictionary_key(fix, &probe).await.expect("probe row")
+}
+
+fn root_type(suffix: &str) -> CreateTypeRequest {
+    CreateTypeRequest {
+        code: type_code(suffix),
+        can_be_root: true,
+        ..CreateTypeRequest::default()
+    }
+}
+
+/// PostgreSQL does not return identity values on rollback, so a key taken
+/// before a deterministic rejection would burn one `SMALLINT` per rejected
+/// request (and a client could exhaust the dictionary). Placement rejections
+/// and a duplicate caller-supplied id, repeated with admitted types that have
+/// no key yet, must leave the identity sequence where it was; a type already
+/// keyed must not take another value on success.
+#[tokio::test]
+async fn deterministic_rejections_do_not_consume_dictionary_identities() {
+    let Some(fix) = pg_fixture().await else {
+        return;
+    };
+    let tenant = Uuid::now_v7();
+    let ctx = make_ctx(tenant);
+    let (type_svc, group_svc) = make_services(fix.db.clone());
+
+    let parent_type = type_svc
+        .create_type_unscoped(root_type("seqparent"))
+        .await
+        .unwrap();
+    let parent = group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest::new(parent_type.code.clone(), "parent".to_owned()),
+            tenant,
+        )
+        .await
+        .expect("parent");
+    // Admitted types that no group has used yet.
+    let not_root = type_svc
+        .create_type_unscoped(CreateTypeRequest {
+            code: type_code("seqnotroot"),
+            can_be_root: false,
+            ..CreateTypeRequest::default()
+        })
+        .await
+        .unwrap();
+    let wrong_parent = type_svc
+        .create_type_unscoped(CreateTypeRequest {
+            code: type_code("seqwrongparent"),
+            allowed_parent_types: vec![type_code("seqelsewhere")],
+            ..CreateTypeRequest::default()
+        })
+        .await
+        .unwrap();
+    let duplicate_id_type = type_svc
+        .create_type_unscoped(root_type("seqdupid"))
+        .await
+        .unwrap();
+
+    let first = probe_next_key(&fix).await;
+    for _ in 0..5 {
+        let err = group_svc
+            .create_group(
+                &ctx,
+                CreateGroupRequest::new(not_root.code.clone(), "root".to_owned()),
+                tenant,
+            )
+            .await
+            .expect_err("type cannot be a root");
+        assert!(
+            matches!(err, DomainError::InvalidParentType { .. }),
+            "{err:?}"
+        );
+
+        let err = group_svc
+            .create_group(
+                &ctx,
+                CreateGroupRequest::new(wrong_parent.code.clone(), "child".to_owned())
+                    .with_parent_id(Some(parent.id)),
+                tenant,
+            )
+            .await
+            .expect_err("parent type not allowed");
+        assert!(
+            matches!(err, DomainError::InvalidParentType { .. }),
+            "{err:?}"
+        );
+
+        let err = group_svc
+            .create_group(
+                &ctx,
+                CreateGroupRequest::new(duplicate_id_type.code.clone(), "dup".to_owned())
+                    .with_id(Some(parent.id)),
+                tenant,
+            )
+            .await
+            .expect_err("caller-supplied id already taken");
+        assert!(
+            matches!(err, DomainError::GroupAlreadyExists { .. }),
+            "{err:?}"
+        );
+    }
+    for code in [&not_root.code, &wrong_parent.code, &duplicate_id_type.code] {
+        assert_eq!(dictionary_key(&fix, code).await, None, "{code}");
+    }
+    let second = probe_next_key(&fix).await;
+    assert_eq!(
+        second,
+        first + 1,
+        "deterministic rejections must not consume identity values"
+    );
+
+    // A successful first use takes exactly one value; later uses of the same
+    // type take none.
+    for name in ["a", "b", "c"] {
+        group_svc
+            .create_group(
+                &ctx,
+                CreateGroupRequest::new(duplicate_id_type.code.clone(), name.to_owned()),
+                tenant,
+            )
+            .await
+            .expect("create");
+    }
+    assert_eq!(
+        dictionary_key(&fix, &duplicate_id_type.code).await,
+        Some(second + 1)
+    );
+    assert_eq!(probe_next_key(&fix).await, second + 2);
+}
+
+/// Concurrent first uses of one type -- groups and memberships -- all
+/// succeed and converge on a single dictionary key: the losing inserts fail
+/// with a serialization error and are retried, never surfacing a unique
+/// violation or an aborted transaction.
+#[tokio::test]
+async fn concurrent_first_use_converges_on_one_dictionary_key() {
+    const N: usize = 6;
+    let Some(fix) = pg_fixture().await else {
+        return;
+    };
+    let (type_svc, group_svc) = make_services(fix.db.clone());
+    let group_svc = Arc::new(group_svc);
+    let fresh = type_svc
+        .create_type_unscoped(root_type("firstuse"))
+        .await
+        .unwrap();
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(N));
+    let mut tasks = Vec::new();
+    for i in 0..N {
+        let group_svc = group_svc.clone();
+        let barrier = barrier.clone();
+        let code = fresh.code.clone();
+        tasks.push(tokio::spawn(async move {
+            let tenant = Uuid::now_v7();
+            barrier.wait().await;
+            group_svc
+                .create_group(
+                    &make_ctx(tenant),
+                    CreateGroupRequest::new(code, format!("g{i}")),
+                    tenant,
+                )
+                .await
+        }));
+    }
+    for task in tasks {
+        task.await.expect("task").expect("every first use succeeds");
+    }
+    let key = dictionary_key(&fix, &fresh.code).await.expect("one key");
+    let conn = fix.db.conn().expect("conn");
+    let stored = resource_group::infra::storage::entity::resource_group::Entity::find()
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .all(&conn)
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), N);
+    assert!(stored.iter().all(|g| g.gts_type_id == key));
+
+    // The same for a member type no membership has used yet.
+    let member = type_svc
+        .create_type_unscoped(CreateTypeRequest {
+            code: type_code("firstusemember"),
+            ..CreateTypeRequest::default()
+        })
+        .await
+        .unwrap();
+    let holder = type_svc
+        .create_type_unscoped(CreateTypeRequest {
+            code: type_code("firstuseholder"),
+            can_be_root: true,
+            allowed_membership_types: vec![member.code.clone()],
+            ..CreateTypeRequest::default()
+        })
+        .await
+        .unwrap();
+    let tenant = Uuid::now_v7();
+    let ctx = make_ctx(tenant);
+    let holder_group = group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest::new(holder.code.clone(), "holder".to_owned()),
+            tenant,
+        )
+        .await
+        .unwrap();
+    let members = Arc::new(common::make_membership_service(fix.db.clone()));
+    let barrier = Arc::new(tokio::sync::Barrier::new(N));
+    let mut tasks = Vec::new();
+    for i in 0..N {
+        let members = members.clone();
+        let barrier = barrier.clone();
+        let ctx = ctx.clone();
+        let code = member.code.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            members
+                .add_membership(&ctx, holder_group.id, &code, &format!("r{i}"))
+                .await
+        }));
+    }
+    for task in tasks {
+        task.await.expect("task").expect("every first use succeeds");
+    }
+    let member_key = dictionary_key(&fix, &member.code).await.expect("one key");
+    let rows = MembershipEntity::find()
+        .filter(membership_entity::Column::GroupId.eq(holder_group.id))
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .all(&conn)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), N);
+    assert!(rows.iter().all(|m| m.gts_type_id == member_key));
+}
+
+/// Forced overlap of two first uses of one identifier: both `SERIALIZABLE`
+/// transactions read "no key" (fixing their snapshots) before either
+/// inserts. The loser's `ON CONFLICT DO NOTHING` then meets a row committed
+/// after its snapshot, which PostgreSQL reports as a serialization failure;
+/// the typed error reaches `transaction_with_retry`, whose next attempt reads
+/// the winner's row. Both end with the same key and there is one row.
+#[tokio::test]
+async fn forced_first_use_overlap_retries_and_converges() {
+    let Some(fix) = pg_fixture().await else {
+        return;
+    };
+    let attempts = forced_first_use_overlap(&fix, TxConfig::serializable()).await;
+    assert!(
+        attempts > 2,
+        "the loser must have been retried after a serialization failure"
+    );
+}
+
+/// The same overlap below `SERIALIZABLE`: the loser's insert waits for the
+/// winner, `ON CONFLICT DO NOTHING` turns the conflict into "not inserted",
+/// and the re-read sees the committed row -- no unique violation, no retry.
+#[tokio::test]
+async fn forced_first_use_overlap_at_read_committed_rereads_the_winner() {
+    let Some(fix) = pg_fixture().await else {
+        return;
+    };
+    let attempts = forced_first_use_overlap(
+        &fix,
+        TxConfig::with_isolation(toolkit_db::secure::TxIsolationLevel::ReadCommitted),
+    )
+    .await;
+    assert_eq!(attempts, 2, "neither side needs a retry");
+}
+
+/// Two transactions at `config` read "no key" for one fresh identifier, meet
+/// at a barrier, then both `ensure_type_key` it. Asserts they converge on one
+/// key and one row; returns the number of transaction attempts.
+async fn forced_first_use_overlap(fix: &PgFixture, config: TxConfig) -> usize {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let code = type_code("forcedfirstuse");
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        let db = fix.db.db();
+        let code = code.clone();
+        let attempts = attempts.clone();
+        let barrier = barrier.clone();
+        let first_attempt = Arc::new(AtomicBool::new(true));
+        let config = config.clone();
+        tasks.push(tokio::spawn(async move {
+            db.transaction_with_retry(config, DomainError::db_err, move |tx| {
+                let code = code.clone();
+                let attempts = attempts.clone();
+                let barrier = barrier.clone();
+                let first_attempt = first_attempt.clone();
+                Box::pin(async move {
+                    use resource_group::infra::storage::entity::gts_type::{Column, Entity};
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    let seen = Entity::find()
+                        .filter(Column::SchemaId.eq(code.as_str()))
+                        .secure()
+                        .scope_with(&AccessScope::allow_all())
+                        .one(tx)
+                        .await
+                        .map_err(|e| DomainError::database(e.to_string()))?;
+                    if first_attempt.swap(false, Ordering::SeqCst) {
+                        assert!(seen.is_none(), "both first attempts see no key");
+                        barrier.wait().await;
+                    }
+                    let key = GroupRepository.ensure_type_key(tx, &code).await?;
+                    Ok::<_, DomainError>(key)
+                })
+            })
+            .await
+        }));
+    }
+    let mut keys = Vec::new();
+    for task in tasks {
+        keys.push(task.await.expect("task").expect("both first uses succeed"));
+    }
+    assert_eq!(keys[0], keys[1], "both converge on one key");
+    let conn = fix.db.conn().expect("conn");
+    let rows = resource_group::infra::storage::entity::gts_type::Entity::find()
+        .filter(
+            resource_group::infra::storage::entity::gts_type::Column::SchemaId.eq(code.as_str()),
+        )
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .all(&conn)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    attempts.load(Ordering::SeqCst)
 }
