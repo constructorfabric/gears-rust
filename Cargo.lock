@@ -5753,6 +5753,7 @@ dependencies = [
  "tempfile",
  "testcontainers",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]

@@ -354,3 +354,13 @@ impl Service {
         )
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "service_tests.rs"]
+mod service_tests;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "service_retry_tests.rs"]
+mod service_retry_tests;

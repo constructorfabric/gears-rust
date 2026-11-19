@@ -217,3 +217,8 @@ impl TokenStore {
         }
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "token_tests.rs"]
+mod token_tests;

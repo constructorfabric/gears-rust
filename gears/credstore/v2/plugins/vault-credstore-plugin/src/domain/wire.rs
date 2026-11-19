@@ -495,3 +495,8 @@ pub fn classify_metadata_response(
 pub fn classify_destroy_response(status: u16, body: &str) -> Result<(), CredStorePluginError> {
     classify_delete_response(status, body)
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "wire_tests.rs"]
+mod wire_tests;

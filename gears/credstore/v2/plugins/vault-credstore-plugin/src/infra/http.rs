@@ -153,3 +153,8 @@ fn classify_error(err: &reqwest::Error) -> TransportError {
         TransportError::Other
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "http_tests.rs"]
+mod http_tests;

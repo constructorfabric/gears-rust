@@ -75,3 +75,8 @@ impl RetryPolicy {
         half + Duration::from_micros(noise % (span_us + 1))
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "retry_tests.rs"]
+mod retry_tests;
