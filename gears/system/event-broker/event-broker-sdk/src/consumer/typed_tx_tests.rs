@@ -1171,12 +1171,13 @@ impl TxBatchHandler<OrderPlacedV1, Manager> for PoisoningTxBatchHandler {
         _delivery: &Delivery,
         commit: TxCommitHandle<Manager>,
     ) -> Result<HandlerOutcome, ConsumerError> {
-        let state = commit.committed_offset.clone();
-        let _ = std::thread::spawn(move || {
+        let state = commit.committed_offset;
+        std::thread::spawn(move || {
             let _guard = state.lock().unwrap();
             panic!("poisons the commit state");
         })
-        .join();
+        .join()
+        .ok();
         Ok(HandlerOutcome::Success)
     }
 }
@@ -1389,9 +1390,8 @@ async fn a_tx_typed_route_whose_payload_type_id_is_not_a_gts_id_fails_start() {
         .event::<serde_json::Value>(TxUndecodable::Stall)
         .handler(ValueTxHandler);
 
-    let err = match ready.start().await {
-        Ok(_) => panic!("a typed route without a GTS type id must fail start"),
-        Err(err) => err,
+    let Err(err) = ready.start().await else {
+        panic!("a typed route without a GTS type id must fail start");
     };
 
     assert!(
@@ -1421,9 +1421,8 @@ async fn a_tx_typed_batch_route_whose_payload_type_id_is_not_a_gts_id_fails_star
         .event::<serde_json::Value>(TxUndecodable::Stall)
         .batch_handler(ValueTxHandler);
 
-    let err = match ready.start().await {
-        Ok(_) => panic!("a typed batch route without a GTS type id must fail start"),
-        Err(err) => err,
+    let Err(err) = ready.start().await else {
+        panic!("a typed batch route without a GTS type id must fail start");
     };
 
     assert!(

@@ -113,9 +113,8 @@ async fn managed_client_agent_drift_fails_loudly() {
         .unwrap();
 
     let result = managed_setup(db, broker, "order-service/2.0").await;
-    let err = match result {
-        Ok(_) => panic!("managed client-agent drift must fail"),
-        Err(err) => err,
+    let Err(err) = result else {
+        panic!("managed client-agent drift must fail");
     };
 
     assert!(matches!(
@@ -130,9 +129,8 @@ async fn managed_registration_requires_producer_migrations() {
     let db = db_without_producer_migrations().await;
 
     let result = managed_setup(db, broker, "order-service/1.0").await;
-    let err = match result {
-        Ok(_) => panic!("managed registration must require producer migrations"),
-        Err(err) => err,
+    let Err(err) = result else {
+        panic!("managed registration must require producer migrations");
     };
 
     assert!(
@@ -397,7 +395,7 @@ async fn a_partition_id_is_registered_on_its_first_drain() {
         .process_outbox_payload_for_test(managed_envelope_payload(&producer).await, 1)
         .await;
 
-    assert_message_ok(result);
+    assert_message_ok(&result);
     let registrations = producer.registrations_for_test().await.unwrap();
     let id = registrations[0].2;
     assert_eq!(registrations, vec![(TEST_QUEUE.to_owned(), 0, id, 1)]);
@@ -414,7 +412,7 @@ async fn an_unknown_producer_id_is_replaced_and_the_message_retried() {
     let (db, broker, harness) = fixture().await;
     let producer = managed_producer(db, broker).await;
     assert_message_ok(
-        producer
+        &producer
             .process_outbox_payload_for_test(managed_envelope_payload(&producer).await, 1)
             .await,
     );
@@ -429,13 +427,13 @@ async fn an_unknown_producer_id_is_replaced_and_the_message_retried() {
     let replacement = registrations[0].2;
     let retried = producer.process_outbox_payload_for_test(envelope, 2).await;
 
-    assert_message_retry(first);
+    assert_message_retry(&first);
     assert_ne!(replacement, forgotten);
     assert_eq!(
         registrations,
         vec![(TEST_QUEUE.to_owned(), 0, replacement, 2)]
     );
-    assert_message_ok(retried);
+    assert_message_ok(&retried);
     wait_for_stored(&harness, TOPIC, 2).await;
 }
 
@@ -635,7 +633,7 @@ async fn reset_chain_clears_the_chain_and_keeps_the_id() {
     let (db, broker, _harness) = fixture().await;
     let producer = managed_producer(db.clone(), Arc::clone(&broker)).await;
     assert_message_ok(
-        producer
+        &producer
             .process_outbox_payload_for_test(managed_envelope_payload(&producer).await, 1)
             .await,
     );
@@ -747,7 +745,7 @@ async fn outbox_processor_treats_duplicate_as_ok() {
 
     let result = producer.process_outbox_payload_for_test(envelope, 1).await;
 
-    assert_message_ok(result);
+    assert_message_ok(&result);
     wait_for_stored(&harness, TOPIC, 1).await;
     assert_eq!(stored_count(&harness, TOPIC).await, 1);
 }
@@ -854,7 +852,7 @@ async fn outbox_processor_retries_transient_rate_limit() {
         .process_outbox_payload_for_test(serde_json::to_vec(&envelope).unwrap(), 1)
         .await;
 
-    assert_message_retry(result);
+    assert_message_retry(&result);
 }
 
 /// A chained producer's processor starts with an empty cursor cache, so its first message
@@ -879,7 +877,7 @@ async fn outbox_processor_retries_transient_initial_cursor_read_with_empty_cache
         let result = producer
             .process_outbox_payload_for_test(envelope.clone(), 1)
             .await;
-        assert_message_retry(result);
+        assert_message_retry(&result);
         assert_eq!(
             faulty.cursor_reads(),
             reads + 1,
@@ -890,7 +888,7 @@ async fn outbox_processor_retries_transient_initial_cursor_read_with_empty_cache
     }
 
     let result = producer.process_outbox_payload_for_test(envelope, 1).await;
-    assert_message_ok(result);
+    assert_message_ok(&result);
     wait_for_stored(&harness, TOPIC, 1).await;
     let mut stored = Vec::new();
     for partition in 0..FIXTURE_BROKER_PARTITIONS {
@@ -980,7 +978,7 @@ async fn outbox_processor_recovers_chained_cursor_on_startup() {
         .get_producer_cursors(&toolkit_security::SecurityContext::anonymous(), producer_id)
         .await
         .unwrap();
-    assert_message_ok(result);
+    assert_message_ok(&result);
     assert_eq!(
         cursors.last_sequence(&GtsInstanceId::try_new(TOPIC).unwrap()),
         Some(4)
@@ -1005,7 +1003,7 @@ async fn outbox_processor_recovers_chained_sequence_violation_by_refreshing_curs
         .get_producer_cursors(&toolkit_security::SecurityContext::anonymous(), producer_id)
         .await
         .unwrap();
-    assert_message_ok(result);
+    assert_message_ok(&result);
     assert_eq!(
         cursors.last_sequence(&GtsInstanceId::try_new(TOPIC).unwrap()),
         Some(4)
@@ -1273,11 +1271,11 @@ fn chained_event_for_sequence(producer_id: ProducerId, sequence: i64, previous: 
     .expect("a well-formed event body")
 }
 
-fn assert_message_retry(result: toolkit_db::outbox::MessageResult) {
+fn assert_message_retry(result: &toolkit_db::outbox::MessageResult) {
     assert!(matches!(result, toolkit_db::outbox::MessageResult::Retry));
 }
 
-fn assert_message_ok(result: toolkit_db::outbox::MessageResult) {
+fn assert_message_ok(result: &toolkit_db::outbox::MessageResult) {
     assert!(matches!(result, toolkit_db::outbox::MessageResult::Ok));
 }
 

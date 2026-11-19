@@ -439,7 +439,7 @@ fn frame_event_decodes_into_wire_frame() {
 }
 
 /// An event frame with every member the server sends.
-fn delivered_event_frame(overrides: serde_json::Value) -> FrameWire {
+fn delivered_event_frame(overrides: &serde_json::Value) -> FrameWire {
     let mut payload = json!({
         "id": "00000000-0000-0000-0000-000000000001",
         "type": "gts.cf.core.events.event.v1~acme.orders.order.created.v1~",
@@ -467,7 +467,7 @@ fn delivered_event_frame(overrides: serde_json::Value) -> FrameWire {
 
 #[test]
 fn a_delivered_event_frame_keeps_its_source_and_position() {
-    let frame = delivered_event_frame(json!({})).into_frame().unwrap();
+    let frame = delivered_event_frame(&json!({})).into_frame().unwrap();
 
     let crate::api::WireFrame::Event(event) = frame else {
         panic!("expected an Event frame, got {frame:?}");
@@ -510,8 +510,8 @@ fn a_delivered_event_frame_keeps_its_source_and_position() {
 #[test]
 fn a_delivered_event_frame_keeps_its_owner() {
     let owners = [
-        delivered_event_frame(json!({ "subject_owner": "00000000-0000-0000-0000-000000000009" })),
-        delivered_event_frame(json!({})),
+        delivered_event_frame(&json!({ "subject_owner": "00000000-0000-0000-0000-000000000009" })),
+        delivered_event_frame(&json!({})),
     ]
     .map(|frame| match frame.into_frame().unwrap() {
         crate::api::WireFrame::Event(event) => event.subject_owner(),
@@ -648,7 +648,7 @@ fn an_event_frame_from_an_older_broker_with_a_topic_still_decodes() {
 
 #[test]
 fn a_delivered_event_with_null_data_has_no_data() {
-    let frame = delivered_event_frame(json!({ "data": null }))
+    let frame = delivered_event_frame(&json!({ "data": null }))
         .into_frame()
         .unwrap();
 
@@ -662,7 +662,7 @@ fn a_delivered_event_with_null_data_has_no_data() {
 
 #[test]
 fn a_delivered_event_without_sequence_time_takes_occurred_at() {
-    let frame = delivered_event_frame(json!({ "sequence_time": null }))
+    let frame = delivered_event_frame(&json!({ "sequence_time": null }))
         .into_frame()
         .unwrap();
 
@@ -685,7 +685,7 @@ fn a_delivered_event_without_sequence_time_takes_occurred_at() {
 /// optional telemetry: delivery drops a malformed one instead of failing the stream.
 #[test]
 fn a_delivered_event_with_a_malformed_trace_parent_is_delivered_without_it() {
-    let frame = delivered_event_frame(json!({ "trace_parent": "00-abc-def-01" }))
+    let frame = delivered_event_frame(&json!({ "trace_parent": "00-abc-def-01" }))
         .into_frame()
         .unwrap();
 
@@ -724,7 +724,7 @@ fn a_delivered_event_with_a_malformed_trace_parent_is_delivered_without_it() {
 
 #[test]
 fn a_delivered_partition_outside_u32_is_a_transport_error() {
-    let err = delivered_event_frame(json!({ "partition": -1 }))
+    let err = delivered_event_frame(&json!({ "partition": -1 }))
         .into_frame()
         .unwrap_err();
 
@@ -747,7 +747,7 @@ fn a_delivered_event_that_breaks_an_envelope_rule_is_a_transport_error() {
         "text field invalid: subject: must contain only printable ASCII (0x20-0x7E)"
     );
 
-    let err = delivered_event_frame(json!({ "subject": PLANTED }))
+    let err = delivered_event_frame(&json!({ "subject": PLANTED }))
         .into_frame()
         .unwrap_err();
 
@@ -818,7 +818,7 @@ fn frame_event_missing_sequence_is_transport_error() {
 #[test]
 fn a_malformed_trace_parent_warning_names_the_event_not_the_value() {
     let planted = "00-PLANTED-def-01";
-    let frame = delivered_event_frame(json!({ "trace_parent": planted }));
+    let frame = delivered_event_frame(&json!({ "trace_parent": planted }));
     assert!(
         format!("{frame:?}").contains("PLANTED"),
         "the frame carries the planted value"

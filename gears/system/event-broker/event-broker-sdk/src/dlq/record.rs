@@ -98,21 +98,25 @@ impl std::fmt::Debug for DeadLetterRecordBuilder {
 }
 
 impl DeadLetterRecordBuilder {
+    #[must_use]
     pub fn consumer_group(mut self, consumer_group: ConsumerGroupId) -> Self {
         self.consumer_group = Some(consumer_group);
         self
     }
 
+    #[must_use]
     pub fn attempts(mut self, attempts: u16) -> Self {
         self.attempts = Some(attempts);
         self
     }
 
+    #[must_use]
     pub fn occurred_at(mut self, occurred_at: DateTime<Utc>) -> Self {
         self.occurred_at = occurred_at;
         self
     }
 
+    #[must_use]
     pub fn build(self) -> DeadLetterRecord {
         DeadLetterRecord {
             consumer_group: self.consumer_group,

@@ -481,9 +481,8 @@ async fn a_typed_route_whose_payload_type_id_is_not_a_gts_id_fails_start() {
         .event::<serde_json::Value>(Undecodable::Skip)
         .handler(ValueHandler);
 
-    let err = match ready.start().await {
-        Ok(_) => panic!("a typed route without a GTS type id must fail start"),
-        Err(err) => err,
+    let Err(err) = ready.start().await else {
+        panic!("a typed route without a GTS type id must fail start");
     };
 
     assert!(
@@ -1427,9 +1426,8 @@ async fn a_typed_batch_route_whose_payload_type_id_is_not_a_gts_id_fails_start()
         .event::<serde_json::Value>(Undecodable::Skip)
         .batch_handler(ValueBatchHandler);
 
-    let err = match ready.start().await {
-        Ok(_) => panic!("a typed batch route without a GTS type id must fail start"),
-        Err(err) => err,
+    let Err(err) = ready.start().await else {
+        panic!("a typed batch route without a GTS type id must fail start");
     };
 
     assert!(

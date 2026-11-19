@@ -4,7 +4,7 @@ use crate::gts::EventV1;
 
 use super::schema_cache::ProducerSchemaCache;
 
-pub(crate) struct PreparedEvent {
+pub struct PreparedEvent {
     pub(crate) event: EventV1,
     /// Resolved from the event type, which owns the topic binding.
     pub(crate) topic: String,

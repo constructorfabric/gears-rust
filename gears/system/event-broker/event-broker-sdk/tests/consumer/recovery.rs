@@ -127,7 +127,7 @@ async fn seek_topology_mismatch_is_bounded_per_seek() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let _ = handle.stop().await;
+    handle.stop().await.ok();
 
     assert!(
         seek_calls.load(Ordering::SeqCst) >= want_seeks,
@@ -169,12 +169,11 @@ impl BatchHandler<serde_json::Value> for SubjectRecorder {
                         .as_i64(),
                 )
             }));
-        Ok(chunk
-            .last()
-            .map(|event| BatchHandlerOutcome::AdvanceThrough {
+        Ok(chunk.last().map_or(BatchHandlerOutcome::Success, |event| {
+            BatchHandlerOutcome::AdvanceThrough {
                 offset: event.sequence().expect("a delivered event is stamped"),
-            })
-            .unwrap_or(BatchHandlerOutcome::Success))
+            }
+        }))
     }
 }
 
@@ -366,12 +365,11 @@ impl BatchHandler<serde_json::Value> for PlacementRecorder {
                         .as_i64(),
                 )
             }));
-        Ok(chunk
-            .last()
-            .map(|event| BatchHandlerOutcome::AdvanceThrough {
+        Ok(chunk.last().map_or(BatchHandlerOutcome::Success, |event| {
+            BatchHandlerOutcome::AdvanceThrough {
                 offset: event.sequence().expect("a delivered event is stamped"),
-            })
-            .unwrap_or(BatchHandlerOutcome::Success))
+            }
+        }))
     }
 }
 

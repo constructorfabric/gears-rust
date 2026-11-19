@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use gts::GtsTypeId;
 use toolkit_db::outbox::{LeasedMessageHandler, MessageResult, OutboxMessage};
@@ -14,20 +14,23 @@ use super::db::DbProducer;
 /// The `ProducerOutboxEnvelope` shape version written on every producer-outbox
 /// row; the drain rejects an envelope of any other version right after it
 /// decodes, before any broker call.
-pub(crate) const PRODUCER_OUTBOX_ENVELOPE_VERSION: u16 = 1;
+pub const PRODUCER_OUTBOX_ENVELOPE_VERSION: u16 = 1;
 /// The outbox payload type the SDK writes on every producer-outbox row. No
 /// outbox claim filters on it: the processor decodes every row of its queue as
 /// a `ProducerOutboxEnvelope`.
-pub(crate) const PRODUCER_OUTBOX_PAYLOAD_TYPE: &str =
+pub const PRODUCER_OUTBOX_PAYLOAD_TYPE: &str =
     "application/vnd.constructorfabric.event-broker.producer-outbox+json;version=1";
 
 /// A producer's chain is kept per `(producer, topic)` (ADR-0004 "Chain Scope").
 type ProducerOutboxCursorKey = (ProducerId, String);
 type ProducerOutboxCursorMap = HashMap<ProducerOutboxCursorKey, i64>;
+/// A poisoned lock is recovered: every write is a single insert or `max` of
+/// one independent per-topic cursor, so no entry is left half-written, and a
+/// stale cursor is corrected from the broker on `SequenceViolation`.
 type SharedProducerOutboxCursor = Arc<Mutex<ProducerOutboxCursorMap>>;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct ProducerOutboxEnvelope {
+pub struct ProducerOutboxEnvelope {
     version: u16,
     event_id: uuid::Uuid,
     #[serde(rename = "type")]
@@ -54,8 +57,8 @@ pub(crate) struct ProducerOutboxEnvelope {
 /// `ProducerMode` carries no serde derives (SDK types stay transport-free), so
 /// this local serde-derived mirror is the one place the mode's wire form is
 /// defined; `#[serde(with = "producer_mode_wire")]` maps the envelope field
-/// through it. It is an outbox row format, not a REST DTO: it has no OpenAPI
-/// schema and does not belong under `api/rest`.
+/// through it. It is an outbox row format, not a REST DTO: no API schema
+/// describes it, and it does not belong under `api/rest`.
 mod producer_mode_wire {
     use serde::{Deserialize, Serialize};
 
@@ -89,6 +92,10 @@ mod producer_mode_wire {
         }
     }
 
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde's `with` calls `serialize` with a reference"
+    )]
     pub(super) fn serialize<S: serde::Serializer>(
         mode: &ProducerMode,
         serializer: S,
@@ -104,7 +111,7 @@ mod producer_mode_wire {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct ProducerOutboxDiagnostics {
+pub struct ProducerOutboxDiagnostics {
     sdk_client_agent: String,
 }
 
@@ -253,7 +260,7 @@ impl ProducerOutboxProcessor {
         {
             self.cursor_state
                 .lock()
-                .expect("producer outbox cursor state lock poisoned")
+                .unwrap_or_else(PoisonError::into_inner)
                 .insert((producer_id, envelope.topic), previous);
         }
     }
@@ -309,7 +316,7 @@ impl ProducerOutboxProcessor {
         if let Some(previous) = self
             .cursor_state
             .lock()
-            .expect("producer outbox cursor state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .get(&key)
             .copied()
         {
@@ -332,7 +339,7 @@ impl ProducerOutboxProcessor {
             .map_or(-1, |t| t.last_sequence);
         self.cursor_state
             .lock()
-            .expect("producer outbox cursor state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(key, last_sequence);
         Ok(last_sequence)
     }
@@ -416,7 +423,7 @@ impl ProducerOutboxProcessor {
             let mut cursor_state = self
                 .cursor_state
                 .lock()
-                .expect("producer outbox cursor state lock poisoned");
+                .unwrap_or_else(PoisonError::into_inner);
             let last = cursor_state
                 .entry((ProducerId(producer_id), topic.to_owned()))
                 .or_insert(sequence);
@@ -501,15 +508,15 @@ impl LeasedMessageHandler for ProducerOutboxProcessor {
             }
             Err(err) => return retry_or_reject(&err),
         };
-        match self.publish(&envelope.topic, &event).await {
-            Err(EventBrokerError::SequenceViolation { .. })
+        // `producer_for` gives every non-stateless producer an id.
+        match (self.publish(&envelope.topic, &event).await, producer_id) {
+            (Err(EventBrokerError::SequenceViolation { .. }), Some(producer_id))
                 if envelope.producer_mode == ProducerMode::Chained =>
             {
-                let producer_id = producer_id.expect("a chained producer has a producer id");
                 self.handle_sequence_violation(&envelope, producer_id, partition, msg.seq)
                     .await
             }
-            result => self.answer(result, partition).await,
+            (result, _) => self.answer(result, partition).await,
         }
     }
 }

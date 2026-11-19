@@ -48,6 +48,7 @@ impl DeadLetterEnvelope {
     pub const PAYLOAD_TYPE: &'static str =
         "application/vnd.constructorfabric.event-broker.dlq+json";
 
+    #[must_use]
     pub fn from_record(record: DeadLetterRecord) -> Self {
         Self {
             version: Self::VERSION,
@@ -67,6 +68,10 @@ impl DeadLetterEnvelope {
         }
     }
 
+    /// # Errors
+    ///
+    /// [`EventBrokerError::Internal`](crate::error::EventBrokerError::Internal) when
+    /// the envelope does not serialize.
     pub fn to_vec(&self) -> Result<Vec<u8>, ConsumerError> {
         serde_json::to_vec(self).map_err(|err| {
             crate::error::EventBrokerError::Internal(format!(
@@ -75,6 +80,10 @@ impl DeadLetterEnvelope {
         })
     }
 
+    /// # Errors
+    ///
+    /// [`EventBrokerError::Internal`](crate::error::EventBrokerError::Internal) when
+    /// `payload` is not a dead-letter envelope.
     pub fn from_slice(payload: &[u8]) -> Result<Self, ConsumerError> {
         serde_json::from_slice(payload).map_err(|err| {
             crate::error::EventBrokerError::Internal(format!(
@@ -83,6 +92,7 @@ impl DeadLetterEnvelope {
         })
     }
 
+    #[must_use]
     pub fn source_coordinates(&self) -> DeadLetterSourceCoordinates {
         DeadLetterSourceCoordinates {
             consumer_group: self.consumer_group,

@@ -28,7 +28,7 @@ pub struct TxCommitHandle<OM: super::CommitOffsetInTx> {
 }
 
 #[cfg(feature = "db")]
-pub(crate) struct TxCommitHandleParts<OM: super::CommitOffsetInTx> {
+pub struct TxCommitHandleParts<OM: super::CommitOffsetInTx> {
     pub(crate) partition: u32,
     pub(crate) offsets: Vec<Sequence>,
     pub(crate) offset_manager: std::sync::Arc<OM>,

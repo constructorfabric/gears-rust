@@ -53,7 +53,7 @@ fn sse_and_multipart_decode_to_the_same_frames() {
 #[test]
 fn sse_buffers_a_partial_event_across_chunks() {
     let blob = sse_blob();
-    let split = blob.len() / 2;
+    let split = blob.len().div_euclid(2);
     let mut sse = Decoder::sse();
     sse.push(&blob[..split]);
     let first = sse.drain().unwrap();

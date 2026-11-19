@@ -32,7 +32,7 @@ fn partition_for(key: &str, count: u32) -> u32 {
 /// A partition-key value (an event's `subject`, which the fixture's types point
 /// their partition key at) that the broker maps onto `target` of `count`.
 fn key_for_partition(target: u32, count: u32) -> String {
-    (0..)
+    (0..u32::MAX)
         .map(|i| format!("pk-{i}"))
         .find(|key| partition_for(key, count) == target)
         .expect("a key hashing onto the target partition exists")
@@ -118,17 +118,17 @@ async fn runtime_dispatch_never_mixes_topics_or_partitions_in_handler_batches() 
     handle.stop().await.expect("consumer stops");
 
     assert_eq!(*violations.lock().unwrap(), Vec::<String>::new());
-    let recorded = scopes.lock().unwrap().clone();
+    let batches = scopes.lock().unwrap().clone();
     assert_eq!(
-        recorded.len(),
+        batches.len(),
         4,
-        "four distinct buffers -> four batches: {recorded:?}"
+        "four distinct buffers -> four batches: {batches:?}"
     );
     assert!(
-        recorded.iter().all(|(_, _, len)| *len == 1),
-        "each buffer holds one event: {recorded:?}"
+        batches.iter().all(|(_, _, len)| *len == 1),
+        "each buffer holds one event: {batches:?}"
     );
-    let topics = recorded
+    let topics = batches
         .iter()
         .map(|(topic, _, _)| topic.as_str())
         .collect::<BTreeSet<_>>();

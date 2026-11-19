@@ -1,5 +1,11 @@
 //! Event declarations must register as narrowings of the broker's base type.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test helpers outside #[test] functions panic on a failed setup, as the tests do"
+)]
+
 use event_broker_sdk::gts::{EventV1, EventV1Traits, TopicV1, data_contract};
 use gts::{GtsRefValidation, GtsSchema, GtsStore};
 use serde_json::json;

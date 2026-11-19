@@ -18,7 +18,7 @@ use crate::error::EventBrokerError;
 /// this mapping is sound and why `partition` alone is not: partition 0 exists on
 /// every topic a subscription may be assigned.
 #[derive(Default)]
-pub(crate) struct ConsumerTypeCache {
+pub struct ConsumerTypeCache {
     topics: tokio::sync::RwLock<HashMap<String, GtsInstanceId>>,
 }
 

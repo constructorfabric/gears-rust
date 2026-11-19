@@ -195,6 +195,10 @@ pub enum ResetScope<'a> {
 #[derive(Debug, Clone)]
 pub struct Event {
     pub id: Uuid,
+    #[expect(
+        clippy::struct_field_names,
+        reason = "public field named after the envelope's `type`; renaming breaks callers"
+    )]
     pub event_type: GtsTypeId,
     pub subject_tenant: Uuid,
     pub source: String,

@@ -135,7 +135,7 @@ async fn db_with_showcase_tables() -> (sea_orm::DatabaseConnection, toolkit_db::
     .expect("offset table");
     raw.execute_raw(Statement::from_string(
         backend,
-        r#"
+        r"
 CREATE TABLE IF NOT EXISTS showcase_dead_letters (
     event_id UUID NOT NULL PRIMARY KEY,
     topic TEXT NOT NULL,
@@ -146,7 +146,7 @@ CREATE TABLE IF NOT EXISTS showcase_dead_letters (
     payload TEXT NOT NULL,
     occurred_at TIMESTAMP NOT NULL
 );
-"#
+"
         .to_owned(),
     ))
     .await
@@ -207,7 +207,7 @@ where
         event_id: Set(record.event),
         topic: Set(record.topic.as_ref().to_owned()),
         event_type: Set(record.event_type.as_ref().to_owned()),
-        partition: Set(record.partition as i32),
+        partition: Set(i32::try_from(record.partition).expect("the partition fits i32")),
         offset: Set(record.offset.as_i64()),
         reason: Set(record.reason.clone()),
         payload: Set(record.payload.to_string()),

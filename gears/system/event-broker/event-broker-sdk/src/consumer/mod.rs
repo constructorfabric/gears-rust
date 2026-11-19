@@ -26,7 +26,8 @@ mod type_cache_tests;
 mod typed_fixtures;
 #[cfg(test)]
 mod typed_tests;
-#[cfg(all(test, feature = "db"))]
+#[cfg(test)]
+#[cfg(feature = "db")]
 mod typed_tx_tests;
 #[cfg(test)]
 mod types_tests;

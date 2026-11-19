@@ -9,6 +9,7 @@
 //! against the real broker. Nothing here fakes broker behaviour.
 
 use std::cell::RefCell;
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -99,12 +100,11 @@ impl BatchHandler<serde_json::Value> for BatchScopeRecorder {
                 chunk.len(),
             ));
         }
-        Ok(chunk
-            .last()
-            .map(|event| BatchHandlerOutcome::AdvanceThrough {
+        Ok(chunk.last().map_or(BatchHandlerOutcome::Success, |event| {
+            BatchHandlerOutcome::AdvanceThrough {
                 offset: event.sequence().expect("a delivered event is stamped"),
-            })
-            .unwrap_or(BatchHandlerOutcome::Success))
+            }
+        }))
     }
 }
 
@@ -486,12 +486,11 @@ impl BatchHandler<serde_json::Value> for AckAllBatchHandler {
                 e.sequence().expect("a delivered event is stamped").as_i64(),
             )
         }));
-        Ok(chunk
-            .last()
-            .map(|e| BatchHandlerOutcome::AdvanceThrough {
+        Ok(chunk.last().map_or(BatchHandlerOutcome::Success, |e| {
+            BatchHandlerOutcome::AdvanceThrough {
                 offset: e.sequence().expect("a delivered event is stamped"),
-            })
-            .unwrap_or(BatchHandlerOutcome::Success))
+            }
+        }))
     }
 }
 
@@ -517,12 +516,11 @@ impl BatchHandler<serde_json::Value> for SleepingBatchHandler {
                 e.sequence().expect("a delivered event is stamped").as_i64(),
             )
         }));
-        Ok(chunk
-            .last()
-            .map(|e| BatchHandlerOutcome::AdvanceThrough {
+        Ok(chunk.last().map_or(BatchHandlerOutcome::Success, |e| {
+            BatchHandlerOutcome::AdvanceThrough {
                 offset: e.sequence().expect("a delivered event is stamped"),
-            })
-            .unwrap_or(BatchHandlerOutcome::Success))
+            }
+        }))
     }
 }
 
@@ -553,7 +551,7 @@ impl BatchHandler<serde_json::Value> for FailingThenCommitBatchHandler {
     }
 }
 
-/// Records a "load"/"handle" timeline across load_position and the handler, for
+/// Records a "load"/"handle" timeline across `load_position` and the handler, for
 /// asserting the drain-before-rejoin ordering.
 pub(super) struct SequencedOffsetManager {
     pub(super) timeline: SharedTimeline,
@@ -826,12 +824,16 @@ struct WarnLine {
 }
 
 impl tracing::field::Visit for WarnLine {
+    #[expect(
+        clippy::use_debug,
+        reason = "tracing hands every field value over as `dyn Debug`"
+    )]
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
             self.message = format!("{value:?}");
         } else {
-            self.fields
-                .push_str(&format!(" {}={value:?}", field.name()));
+            // Writing to a `String` does not fail.
+            write!(self.fields, " {}={value:?}", field.name()).ok();
         }
     }
 }

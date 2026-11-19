@@ -94,11 +94,23 @@ impl Options {
     }
 }
 
-/// Each check of `build` refuses its input with its own text, in order and
-/// before any broker call; the accepted bounds build.
+/// Builds each of `refused` and expects `InvalidProducerOptions` with its text.
+async fn assert_refused<const N: usize>(refused: [(&str, Options, String); N]) {
+    for (case, options, expected) in refused {
+        let built = options.build().await;
+
+        let Err(EventBrokerError::InvalidProducerOptions { detail }) = &built else {
+            panic!("{case} must be refused, got {built:?}");
+        };
+        assert_eq!(detail, &expected, "{case}");
+    }
+}
+
+/// Each topic, pattern, source and client-agent check of `build` refuses its input with its own text, before any
+/// broker call.
 #[tokio::test]
-async fn a_setup_build_refuses_each_invalid_option_before_any_call() {
-    let refused = [
+async fn a_setup_build_refuses_each_invalid_topic_source_or_agent_option() {
+    assert_refused([
         (
             "empty topics",
             Options {
@@ -163,6 +175,15 @@ async fn a_setup_build_refuses_each_invalid_option_before_any_call() {
             },
             "client_agent must be 1-256 bytes, got 0".to_owned(),
         ),
+    ])
+    .await;
+}
+
+/// Each managed-registration check of `build` refuses its input with its own text, before any
+/// broker call.
+#[tokio::test]
+async fn a_setup_build_refuses_each_invalid_registration_key() {
+    assert_refused([
         (
             "a stateless managed registration",
             Options {
@@ -226,6 +247,15 @@ async fn a_setup_build_refuses_each_invalid_option_before_any_call() {
             "managed producer registration key must not have leading or trailing whitespace"
                 .to_owned(),
         ),
+    ])
+    .await;
+}
+
+/// Each queue-name check of `build` refuses its input with its own text, before any
+/// broker call.
+#[tokio::test]
+async fn a_setup_build_refuses_each_invalid_queue_name() {
+    assert_refused([
         (
             "a too-long blank queue",
             Options {
@@ -300,16 +330,13 @@ async fn a_setup_build_refuses_each_invalid_option_before_any_call() {
             "producer outbox queue name must contain only ASCII alphanumerics, '.', '_' and '-'"
                 .to_owned(),
         ),
-    ];
-    for (case, options, expected) in refused {
-        let built = options.build().await;
+    ])
+    .await;
+}
 
-        let Err(EventBrokerError::InvalidProducerOptions { detail }) = &built else {
-            panic!("{case} must be refused, got {built:?}");
-        };
-        assert_eq!(detail, &expected, "{case}");
-    }
-
+/// The accepted bounds of `build`'s checks build.
+#[tokio::test]
+async fn a_setup_build_accepts_each_option_bound() {
     let accepted = [
         (
             "a 256-byte client agent",

@@ -60,7 +60,7 @@ impl LocalHeads {
             }
         }
         // No receiver is not an error: nobody is waiting.
-        let _ = self.changes.send(head);
+        self.changes.send(head).ok();
     }
 
     /// The highest head published for `at`, if any.

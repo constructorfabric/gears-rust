@@ -9,7 +9,7 @@ use crate::error::EventBrokerError;
 use crate::models::EventType;
 
 #[derive(Clone)]
-pub(crate) struct PreparedEventType {
+pub struct PreparedEventType {
     pub(crate) type_id: String,
     pub(crate) topic: String,
     /// JSON Pointer the type declares as its partition key.
@@ -55,7 +55,7 @@ impl PreparedEventType {
     }
 }
 
-pub(crate) struct ProducerSchemaCache {
+pub struct ProducerSchemaCache {
     /// Topics confirmed to exist at the broker.
     topics: tokio::sync::RwLock<HashSet<String>>,
     event_types: tokio::sync::RwLock<HashMap<String, PreparedEventType>>,
@@ -262,7 +262,7 @@ impl ProducerSchemaCache {
 
 /// Matches by the GTS library rule (derived-type coverage, trailing `*`), as
 /// the consumer does; an unparsable pattern matches nothing.
-pub(crate) fn gts_pattern_matches(pattern: &str, type_id: &str) -> bool {
+pub fn gts_pattern_matches(pattern: &str, type_id: &str) -> bool {
     let (Ok(pattern), Ok(id)) = (GtsIdPattern::try_new(pattern), GtsId::try_new(type_id)) else {
         return false;
     };

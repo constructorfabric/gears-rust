@@ -69,7 +69,7 @@ impl From<Fallback> for Position {
 /// does not run as written; the `topic` key column would also need
 /// `CHARACTER SET ascii` to fit the 3,072-byte index limit.
 #[cfg(feature = "db")]
-pub const LOCAL_DB_OFFSET_STORE_MIGRATION_SQL: &str = r#"
+pub const LOCAL_DB_OFFSET_STORE_MIGRATION_SQL: &str = r"
 CREATE TABLE IF NOT EXISTS evbk_consumer_offsets (
     consumer_group_id UUID NOT NULL,
     topic VARCHAR(1024) NOT NULL,
@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS evbk_consumer_offsets (
     updated_at TIMESTAMP NOT NULL,
     PRIMARY KEY (consumer_group_id, topic, partition)
 );
-"#;
+";
 
 // ---- Traits ------------------------------------------------------------------
 //
@@ -159,6 +159,7 @@ pub struct LocalDbOffsetManager {
 
 #[cfg(feature = "db")]
 impl LocalDbOffsetManager {
+    #[must_use]
     pub fn new(db: toolkit_db::Db, fallback: Fallback) -> Self {
         Self {
             db,
@@ -168,6 +169,7 @@ impl LocalDbOffsetManager {
     }
 
     /// Per-partition seed offsets, consulted only when the DB has no row.
+    #[must_use]
     pub fn with_overrides(
         mut self,
         overrides: impl IntoIterator<Item = (PartitionOffsetKey, Sequence)>,
@@ -275,6 +277,7 @@ pub struct InMemoryOffsetManager {
 }
 
 impl InMemoryOffsetManager {
+    #[must_use]
     pub fn new(fallback: Fallback) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
@@ -283,6 +286,7 @@ impl InMemoryOffsetManager {
         }
     }
 
+    #[must_use]
     pub fn with_overrides(
         mut self,
         overrides: impl IntoIterator<Item = (PartitionOffsetKey, Sequence)>,

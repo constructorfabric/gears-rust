@@ -147,11 +147,7 @@ fn boundary_of(content_type: &str) -> Option<String> {
 
 /// Opens the delivery stream for `id` and returns a frame stream. Reconnects on
 /// a dropped connection until a terminal control frame or the retry budget.
-pub(crate) async fn open(
-    client: &RestBroker,
-    ctx: &SecurityContext,
-    id: SubscriptionId,
-) -> Result<FrameStream, EventBrokerError> {
+pub fn open(client: &RestBroker, ctx: &SecurityContext, id: SubscriptionId) -> FrameStream {
     // Clone what the owned stream needs; the returned stream outlives the call.
     let http = client.http().clone();
     let framing = client.framing();
@@ -268,7 +264,7 @@ pub(crate) async fn open(
             tokio::time::sleep(RECONNECT_BACKOFF).await;
         }
     };
-    Ok(Box::pin(stream))
+    Box::pin(stream)
 }
 
 #[cfg(test)]
