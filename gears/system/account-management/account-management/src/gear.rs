@@ -976,7 +976,7 @@ impl Gear for AccountManagementGear {
             // dangling rows from RG's `resource_group_membership` table
             // referencing the deleted AM user. Without this, hard-
             // deleted users leave orphaned `(group_id,
-            // gts.cf.core.rg.type.v1~cf.core.am.user.v1~, user_uuid)`
+            // gts.cf.core.am.user.v1~, user_uuid)`
             // rows that surface in group-member listings until the
             // RG-side cleanup pipeline catches up.
             .with_rg_membership_cleanup(Arc::clone(&rg_client))

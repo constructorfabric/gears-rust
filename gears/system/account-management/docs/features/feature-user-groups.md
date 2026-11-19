@@ -32,7 +32,7 @@
 
 ### 1.1 Overview
 
-Delegates every aspect of user-group hierarchy, membership storage, cycle detection, and tenant-scoped isolation to the Resource Group gear. Account Management owns only three thin touchpoints: (1) declaring the user-group container and user member-handle types and publishing them with AM’s types-registry manifest before application `init`; (2) triggering Resource Group cleanup of a tenant's user-group subtree during tenant hard-deletion; (3) publishing the tenant-scoped user-query surface that consumers combine with `ResourceGroupClient` membership operations to verify user existence.
+Delegates every aspect of user-group hierarchy, membership storage, cycle detection, and tenant-scoped isolation to the Resource Group gear. Account Management owns only three thin touchpoints: (1) declaring the user-group and membership schemas and publishing them with AM’s types-registry manifest before application `init`; (2) triggering Resource Group cleanup of a tenant's user-group subtree during tenant hard-deletion; (3) publishing the tenant-scoped user-query surface that consumers combine with `ResourceGroupClient` membership operations to verify user existence.
 
 ### 1.2 Purpose
 
@@ -68,7 +68,7 @@ Delivers the delegation half of PRD §5.6 (User Groups Management) by ensuring A
 
 **Success Scenarios**:
 
-- Before application `init`, the runtime publishes AM's manifest through `PlatformTypesRegistryApi`. It includes the user-group container, user member handle, and user membership schema from [rg_types.rs](../../account-management/src/gts/rg_types.rs). Resource Group's manifest publishes the group and membership base schemas.
+- Before application `init`, the runtime publishes AM's manifest through `PlatformTypesRegistryApi`. It includes the user-group and membership schemas from [rg_types.rs](../../account-management/src/gts/rg_types.rs) and the AM user resource schema from the SDK. Resource Group's manifest publishes the group and membership base schemas.
 - An identical restart leaves the admitted definitions unchanged. Absent definitions are created; differing definitions are reconciled under the registry's revision and admission rules.
 
 **Error Scenarios**:
@@ -122,16 +122,16 @@ The existing `rg-type-registration` / `rg-type-schema-registration` traceability
 | Declaration | GTS identifier | Placement and membership |
 |-------------|----------------|---------------------------------|
 | `UserGroupRgTypeV1` | `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` | `parent_type` accepts roots and parent types in the user-group family. `membership_type` binds the user membership schema. `metadata` may be omitted or empty. |
-| `UserMemberRgTypeV1` | `gts.cf.core.rg.type.v1~cf.core.am.user.v1~` | Abstract type handle for the member resource. |
-| [User membership schema](../schemas/user_group_member.v1.schema.json) | `gts.cf.core.rg.membership.v1~cf.core.am.user_group_member.v1~` | Accepts the AM user member handle and its derived types as `resource_type` through `anyOf` with `x-gts-type-ref`. |
+| `UserV1` | `gts.cf.core.am.user.v1~` | AM user resource type used as the membership's `resource_type`. |
+| [User membership schema](../schemas/user_group_member.v1.schema.json) | `gts.cf.core.rg.membership.v1~cf.core.am.user_group_member.v1~` | Accepts the AM user resource type and its derived types as `resource_type` through `anyOf` with `x-gts-type-ref`. |
 
 **Output**: Successful publication (`UpToDate`, or `Reconciled` with every desired identifier `Admitted`), or a publication failure that stops startup.
 
 **Steps**:
 
-1. [ ] - `p1` - Collect the declarations from AM's crate-local inventory into its manifest; retain the existing group and member-handle identifiers so persisted RG groups and memberships keep resolving - `inst-algo-rgreg-collect`
+1. [ ] - `p1` - Collect the declarations from AM's crate-local inventory into its manifest; retain the existing user-group identifier and use the AM user resource type for membership - `inst-algo-rgreg-collect`
 2. [ ] - `p1` - Publish through the shared Types Registry SDK publisher using `PlatformTypesRegistryApi`; reconcile absent or differing documents under registry admission and revision rules - `inst-algo-rgreg-publish`
-3. [ ] - `p1` - Await admission of every desired identifier, including dependencies on RG's base and the member handle; retry transient failures and pending dependencies within the shared startup budget - `inst-algo-rgreg-await`
+3. [ ] - `p1` - Await admission of every desired identifier, including the RG bases and the AM user resource schema; retry transient failures and pending dependencies within the shared startup budget - `inst-algo-rgreg-await`
 4. [ ] - `p1` - **IF** publication succeeds, **RETURN** success; identical restarts preserve existing revisions - `inst-algo-rgreg-success`
 5. [ ] - `p1` - **ELSE RETURN** the publication error with its publisher, identifier and cause context; application `init` does not run - `inst-algo-rgreg-failure`
 
@@ -156,7 +156,7 @@ AM's manifest **MUST** include the declarations in §3, per `fr-user-group-rg-ty
 
 **Touches**:
 
-- Data: `UserGroupRgTypeV1`, `UserMemberRgTypeV1`, and the user membership schema in AM's crate-local GTS inventory. [user_group.v1.schema.json](../schemas/user_group.v1.schema.json) documents the published group schema.
+- Data: `UserGroupRgTypeV1` and `UserGroupMembershipV1` in AM's crate-local GTS inventory, and `UserV1` in the SDK inventory. [user_group.v1.schema.json](../schemas/user_group.v1.schema.json) documents the published group schema.
 - Sibling integration: shared ToolKit startup publisher, `PlatformTypesRegistryApi`; RG consumes the definitions through `TypesRegistryApi`.
 - Errors: shared publication diagnostics preserve the underlying registry failure and identify the publisher and affected identifiers.
 
@@ -197,7 +197,7 @@ The system **MUST NOT** expose any AM-side REST endpoint for user-group CRUD, me
 
 - [ ] `p1` - **ID**: `cpt-cf-account-management-dod-user-groups-membership-user-existence-pattern`
 
-Membership-write callers **MUST** combine AM's `GET /tenants/{tenant_id}/users` (owned by `feature-idp-user-operations-contract`, with `?user_id=<id>` for point checks) with `ResourceGroupClient` membership operations: caller verifies user existence via AM's user-list surface first, then invokes `ResourceGroupClient` to add the user to a group. AM **MUST NOT** introduce any composite or convenience endpoint that wraps these two steps — the delegation principle requires consumers to call both surfaces directly so the authoritative user-existence signal and the authoritative membership write stay with their respective owners. RG validates the member's type against the bound membership schema, which admits the AM user handle family. User existence remains the caller’s separate AM check.
+Membership-write callers **MUST** combine AM's `GET /tenants/{tenant_id}/users` (owned by `feature-idp-user-operations-contract`, with `?user_id=<id>` for point checks) with `ResourceGroupClient` membership operations: caller verifies user existence via AM's user-list surface first, then invokes `ResourceGroupClient` to add the user to a group. AM **MUST NOT** introduce any composite or convenience endpoint that wraps these two steps — the delegation principle requires consumers to call both surfaces directly so the authoritative user-existence signal and the authoritative membership write stay with their respective owners. RG validates the member's type against the bound membership schema, which admits the AM user type family. User existence remains the caller’s separate AM check.
 
 **Implements**:
 

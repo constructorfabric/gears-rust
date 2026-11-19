@@ -1,15 +1,12 @@
 //! AM-owned resource-group types, published with AM's manifest.
 //!
-//! Resource-group keeps no type definitions: these declarations are the only
-//! definition of AM's user-group container and user member-handle. Their
-//! identifiers are the ones AM has always used, so existing RG rows keep
-//! resolving. They replace AM's `init`-time registration through
-//! resource-group's bootstrap catalogue.
+//! The user-group type binds a membership schema that admits the AM user
+//! resource type and its descendants.
 
 use resource_group_sdk::gts::{ResourceGroupMembershipV1, ResourceGroupTypeV1};
 use toolkit_gts::local::gts_type_schema;
 
-use account_management_sdk::gts::{USER_GROUP_RG_TYPE_CODE, USER_RG_TYPE_CODE};
+use account_management_sdk::gts::{USER_GROUP_RG_TYPE_CODE, USER_RESOURCE_TYPE};
 
 const USER_MEMBERSHIP_SCHEMA: &str = <UserGroupMembershipV1 as gts::GtsSchema>::TYPE_ID;
 
@@ -41,7 +38,7 @@ pub struct UserGroupRgTypeV1;
 fn user_group_member_type(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({
         "anyOf": [
-            {"type": "string", "x-gts-type-ref": USER_RG_TYPE_CODE}
+            {"type": "string", "x-gts-type-ref": USER_RESOURCE_TYPE}
         ]
     })
 }
@@ -59,18 +56,6 @@ fn user_group_member_type(_: &mut schemars::SchemaGenerator) -> schemars::Schema
     })
 )]
 pub struct UserGroupMembershipV1;
-
-/// GTS type handle for AM user resources. AM uses the identifier on links
-/// and does not instantiate it as a resource group.
-#[gts_type_schema(
-    dir_path = "schemas",
-    base = ResourceGroupTypeV1,
-    type_id = gts_id!("cf.core.rg.type.v1~cf.core.am.user.v1~"),
-    description = "Account Management user as a resource-group member",
-    properties = "",
-    gts_abstract = true
-)]
-pub struct UserMemberRgTypeV1;
 
 #[cfg(test)]
 #[path = "rg_types_tests.rs"]

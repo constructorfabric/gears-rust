@@ -42,7 +42,7 @@
 
 use std::sync::Arc;
 
-use account_management_sdk::gts::{USER_GROUP_RG_TYPE_CODE, USER_RG_TYPE_CODE};
+use account_management_sdk::gts::{USER_GROUP_RG_TYPE_CODE, USER_RESOURCE_TYPE};
 use account_management_sdk::{
     IdpDeprovisionUserRequest, IdpListUsersRequest, IdpNewUser, IdpPluginClient,
     IdpProvisionUserRequest, IdpTenantContext, IdpUpdateUserRequest, IdpUser, IdpUserFilterField,
@@ -1006,7 +1006,7 @@ impl UserService {
     ///    `ResourceGroupMembership` does not, so a membership-keyed
     ///    listing cannot express a tenant filter without joining
     ///    through `group_id`.
-    /// 2. For each group: `remove_membership(group_id, USER_RG_TYPE_CODE,
+    /// 2. For each group: `remove_membership(group_id, USER_RESOURCE_TYPE,
     ///    user_id.to_string())`. `NotFound` is idempotent success —
     ///    the user simply isn't a member of that group, or a peer
     ///    cleanup tick has already removed the row.
@@ -1068,7 +1068,7 @@ impl UserService {
 /// future.
 ///
 /// Lists every user-group in the tenant, then issues one
-/// `remove_membership(group_id, USER_RG_TYPE_CODE, user_id)` per
+/// `remove_membership(group_id, USER_RESOURCE_TYPE, user_id)` per
 /// listed group. `NotFound` on remove is idempotent (the user
 /// wasn't a member of that group); transport errors surface as
 /// [`DomainError::ServiceUnavailable`] so the caller's retry path
@@ -1090,7 +1090,7 @@ async fn cleanup_inner(
         // idempotent arm dispatches as before.
         let outcome = tokio::time::timeout(
             RG_CLEANUP_TIMEOUT,
-            rg.remove_membership(sys_ctx, *group_id, USER_RG_TYPE_CODE, &user_id_str),
+            rg.remove_membership(sys_ctx, *group_id, USER_RESOURCE_TYPE, &user_id_str),
         )
         .await
         .map(|r| r.map_err(ResourceGroupError::from));

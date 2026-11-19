@@ -114,7 +114,7 @@ graph LR
 | `cpt-cf-account-management-fr-service-account-rotate` | `ServiceAccountService::rotate_secret` gates on the separately grantable `rotate_secret` action and calls `IdpPluginClient::rotate_service_account_secret`; the 200 carries `Cache-Control: no-store` and a new one-time secret with the account's identity unchanged. Unlike revoke, a provider-reported absence is surfaced as `not_found` (404) carrying the addressed `client_id` — a rotation that found nothing minted no usable credential. |
 | `cpt-cf-account-management-fr-service-account-revoke` | `ServiceAccountService::revoke` calls `IdpPluginClient::revoke_service_account` and folds a provider-reported absence into the same 204 as a removal (idempotency by error-mapping: the adapter maps vendor errors, AM assigns meaning), which also makes revoke useless as a probe for accounts owned by other tenants. A clean failure or an ambiguous outcome is NOT absence-equivalent. |
 | `cpt-cf-account-management-fr-service-account-secret-confidentiality` | The secret is wrapped in `secrecy::SecretString` (redacted `Debug`, zeroize-on-drop, no Serde) from the contract boundary to the single DTO conversion that serialises it; nothing persists it and no endpoint reads it back. `ServiceAccountFailureExt` discards every provider `detail` and `field` rather than digesting them, substituting fixed AM-owned messages and logging only category, length, and whether a field was attributed — see §4.2 Credential Handling on the Machine-Identity Surface. |
-| `cpt-cf-account-management-fr-user-group-rg-type` | AM declares the user-group Resource Group type `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` and the user member-handle type `gts.cf.core.rg.type.v1~cf.core.am.user.v1~` as GTS declarations published with its types-registry manifest; the bound membership schema admits the `gts.cf.core.rg.type.v1~cf.core.am.user.v1~` family. |
+| `cpt-cf-account-management-fr-user-group-rg-type` | AM's manifest publishes the user-group Resource Group type `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` and the membership schema that admits the `gts.cf.core.am.user.v1~` family. |
 | `cpt-cf-account-management-fr-user-group-lifecycle` | Consumers call `ResourceGroupClient` directly for group create/update/delete. AM does not proxy these operations. |
 | `cpt-cf-account-management-fr-user-group-membership` | Consumers call `ResourceGroupClient` directly for membership add/remove. Callers verify user existence via AM's user-list endpoint; RG treats `resource_id` as opaque. |
 | `cpt-cf-account-management-fr-nested-user-groups` | Nested groups via Resource Group parent-child hierarchy; cycle detection enforced by Resource Group forest invariants. No AM involvement at runtime. |
@@ -402,12 +402,12 @@ When strict-mode enforcement is active, AM validates the chained schema identifi
 
 **User-group Resource Group type schema:** AM declares the chained RG type `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` — [user_group.v1.schema.json](./schemas/user_group.v1.schema.json). The schema reuses the RG base contract and accepts an omitted or empty `metadata` object in v1. The authoritative declaration is `UserGroupRgTypeV1` in `account-management/src/gts/rg_types.rs`, published with AM's types-registry manifest. The JSON file is a documentation copy. The chained GTS `$id` identifies the AM user-group type as a derivative of the RG base type.
 
-**Member-handle type:** The bound membership schema accepts `gts.cf.core.rg.type.v1~cf.core.am.user.v1~` and its derived types as `resource_type`. Each allowed family is a branch of `anyOf` with an `x-gts-type-ref`. The AM-declared handle wraps the platform user resource type `gts.cf.core.am.user.v1~` — [user.v1.schema.json](./schemas/user.v1.schema.json) — in the RG type namespace.
+**Member resource type:** The bound membership schema accepts the AM user resource type `gts.cf.core.am.user.v1~` and its derived types as `resource_type`. The `anyOf` branch uses `x-gts-type-ref` to select that family. [User resource schema](./schemas/user.v1.schema.json)
 
 | Schema field | Value | Meaning |
 |-------|-------|---------|
 | `parent_type` | `anyOf` with `null` and a string constrained by `x-gts-type-ref` to the user-group type | Allows roots and nesting under the user-group type or its derivatives. |
-| `membership_type` | `gts.cf.core.rg.membership.v1~cf.core.am.user_group_member.v1~` | Binds the schema that restricts direct memberships to platform users via the member handle. |
+| `membership_type` | `gts.cf.core.rg.membership.v1~cf.core.am.user_group_member.v1~` | Binds the schema that allows the AM user resource type and its derivatives. |
 
 Resource Group's ownership-graph profile enforces tenant compatibility and scope isolation at write time. The schema governs type topology, metadata, and membership type constraints.
 
@@ -924,7 +924,7 @@ This interface exposes raw and resolved tenant metadata keyed by registered GTS 
 | Dependency Gear    | Interface Used | Purpose |
 |-------------------|----------------|---------|
 | [Resource Group](../../resource-group/docs/PRD.md) | `ResourceGroupClient` (SDK trait via ClientHub) | AM publishes its user-group RG type declarations through the types registry (not through RG), uses RG ownership-graph reads to verify that no tenant-owned resource associations remain before soft deletion, and triggers tenant-scoped group cleanup during hard-deletion. If RG is unavailable during deletion validation, AM fails the operation with `service_unavailable` rather than proceeding. Consumers call `ResourceGroupClient` directly for all group lifecycle, membership, and hierarchy operations. |
-| GTS Types Registry | `PlatformTypesRegistryApi` (SDK trait via ClientHub) | Startup publication of AM declarations (including its user-group container and member handle), runtime tenant type definitions, parent-child constraint validation, and metadata schema validation. |
+| GTS Types Registry | `PlatformTypesRegistryApi` (SDK trait via ClientHub) | Startup publication of AM declarations (including its user-group and membership schemas), runtime tenant type definitions, parent-child constraint validation, and metadata schema validation. |
 
 **Dependency Rules** (per project conventions):
 - No circular dependencies

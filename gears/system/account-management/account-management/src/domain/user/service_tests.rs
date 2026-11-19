@@ -1340,7 +1340,7 @@ async fn create_user_rejects_oversized_profile_fields_no_idp_call() {
 //
 //   1. `list_groups($filter = tenant_id eq T AND type eq
 //      USER_GROUP_RG_TYPE_CODE)` — drain all pages.
-//   2. For each group: `remove_membership(group_id, USER_RG_TYPE_CODE,
+//   2. For each group: `remove_membership(group_id, USER_RESOURCE_TYPE,
 //      user_id)`. `NotFound` is idempotent success.
 //
 // The cleanup short-circuits when the service is constructed without
@@ -1349,7 +1349,7 @@ async fn create_user_rejects_oversized_profile_fields_no_idp_call() {
 
 mod cleanup {
     use super::*;
-    use account_management_sdk::gts::{USER_GROUP_RG_TYPE_CODE, USER_RG_TYPE_CODE};
+    use account_management_sdk::gts::{USER_GROUP_RG_TYPE_CODE, USER_RESOURCE_TYPE};
     use async_trait::async_trait;
     use resource_group_sdk::{
         CreateGroupRequest, GroupHierarchy, ResourceGroup, ResourceGroupClient,
@@ -1617,8 +1617,8 @@ mod cleanup {
         assert!(
             removed
                 .iter()
-                .all(|(_, t, r)| t == USER_RG_TYPE_CODE && r == &user_str),
-            "every remove targets the deprovisioned user under USER_RG_TYPE_CODE"
+                .all(|(_, t, r)| t == USER_RESOURCE_TYPE && r == &user_str),
+            "every remove targets the deprovisioned user under USER_RESOURCE_TYPE"
         );
         let group_ids: std::collections::HashSet<Uuid> =
             removed.iter().map(|(g, _, _)| *g).collect();

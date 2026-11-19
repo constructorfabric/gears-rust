@@ -3,16 +3,11 @@
 //! Delegates all user-group state to the Resource Group gear.
 //! AM owns two thin touchpoints:
 //!
-//! 1. Two AM-owned RG types, declared in [`crate::gts`] and published
-//!    with AM's manifest before `init` (resource-group reads them from the
-//!    types registry):
-//!
-//!    - [`USER_RG_TYPE_CODE`](account_management_sdk::gts::USER_RG_TYPE_CODE) -- the AM-user member handle. AM users
-//!      live in AM's tables + `IdP`, never as RG groups; the handle is the
-//!      `resource_type` of their memberships.
-//!    - [`USER_GROUP_TYPE_CODE`] -- the user-group container. Groups
-//!      of this type are AM-owned RG groups (tenant-scoped) whose
-//!      `allowed_membership_types` lists [`USER_RG_TYPE_CODE`](account_management_sdk::gts::USER_RG_TYPE_CODE).
+//! 1. Group and membership schemas declared in [`crate::gts`] and published
+//!    with AM's manifest before `init`. The group type
+//!    [`USER_GROUP_TYPE_CODE`] binds the schema that accepts the AM
+//!    [user resource type](account_management_sdk::gts::USER_RESOURCE_TYPE)
+//!    and its derived types.
 //! 2. A [`TenantHardDeleteHook`] that triggers RG-side cascade cleanup
 //!    of the tenant's user-group subtree before the `tenants` row is
 //!    removed ([`build_cascade_cleanup_hook`]).

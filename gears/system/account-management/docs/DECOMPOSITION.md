@@ -170,7 +170,7 @@ upstream PRD/DESIGN definition, with no broken references.
   - Creation of the initial Platform Administrator user identity — the Platform Admin is pre-provisioned in the IdP during infrastructure setup; AM does not create this user (covered by the `idp-user-operations-contract` feature for all other user operations).
   - Validation of IdP binding sufficiency or identifier equality between AM's tenant UUID and the IdP's internal identifiers — that is the IdP provider's responsibility.
   - Creation of any non-root tenant — child tenant creation belongs to `tenant-hierarchy-management`.
-  - Publication of GTS-backed types/schemas — AM’s declared types, including the user-group container and member handle, are admitted with its manifest before application `init`; runtime tenant and metadata types use the Types Registry publication contract. Bootstrap’s IdP wait does not gate publication.
+  - Publication of GTS-backed types/schemas — AM’s declared types, including the user-group and membership schemas, are admitted with its manifest before application `init`; runtime tenant and metadata types use the Types Registry publication contract. Bootstrap’s IdP wait does not gate publication.
   - Error taxonomy and metrics definitions themselves — provided by the `errors-observability` foundation feature.
 
 - **Requirements Covered**:
@@ -504,7 +504,7 @@ upstream PRD/DESIGN definition, with no broken references.
 - **Depends On**: `cpt-cf-account-management-feature-tenant-hierarchy-management`, `cpt-cf-account-management-feature-idp-user-operations-contract`, `cpt-cf-account-management-feature-errors-observability`
 
 - **Scope**:
-  - AM-owned GTS declarations published with AM's types-registry manifest. The user-group schema permits roots and nesting under the user-group type or its derivatives. Its bound membership schema admits the AM user handle `gts.cf.core.rg.type.v1~cf.core.am.user.v1~` and its derived types.
+  - AM-owned GTS declarations published with AM's types-registry manifest. The user-group schema permits roots and nesting under the user-group type or its derivatives. Its bound membership schema admits `gts.cf.core.am.user.v1~` and its derived types.
   - Account-Management-side cascade cleanup trigger during tenant hard-deletion so Resource Group can remove the tenant's user-group subtree before the tenant row is deleted.
   - Exposure of AM's tenant-scoped user-query capability (from feature 5) as the valid user set that callers combine with Resource Group membership operations.
   - Documented delegation contract: consumers call `ResourceGroupClient` directly for group and membership operations; AM does not proxy.

@@ -463,6 +463,9 @@ fn stub_types_registry() -> Arc<dyn types_registry_sdk::PlatformTypesRegistryApi
 mod no_seed_startup_tests {
     use std::sync::Arc;
 
+    use account_management_sdk::gts::{USER_GROUP_RG_TYPE_CODE, USER_RESOURCE_TYPE};
+    use authz_resolver_sdk::constraints::{Constraint, InPredicate, Predicate};
+
     use async_trait::async_trait;
     use authz_resolver_sdk::{
         AuthZResolverApi,
@@ -497,6 +500,39 @@ mod no_seed_startup_tests {
     }
 
     struct PermitAllAuthz;
+
+    /// Permits every request within the caller's own tenant, as Resource
+    /// Group's tenant-scoped writes require.
+    struct PermitOwnTenantAuthz;
+
+    #[async_trait]
+    impl AuthZResolverApi for PermitOwnTenantAuthz {
+        async fn evaluate(
+            &self,
+            _ctx: PlatformSecurityContext,
+            request: EvaluationRequest,
+        ) -> Result<EvaluationResponse, CanonicalError> {
+            let tenant_id = request
+                .subject
+                .properties
+                .get("tenant_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| uuid::Uuid::parse_str(s).ok())
+                .unwrap_or(uuid::Uuid::nil());
+            Ok(EvaluationResponse {
+                decision: true,
+                context: EvaluationResponseContext {
+                    constraints: vec![Constraint {
+                        predicates: vec![Predicate::In(InPredicate::new(
+                            toolkit_security::pep_properties::OWNER_TENANT_ID,
+                            [tenant_id],
+                        ))],
+                    }],
+                    deny_reason: None,
+                },
+            })
+        }
+    }
 
     #[async_trait]
     impl AuthZResolverApi for PermitAllAuthz {
@@ -624,7 +660,7 @@ mod no_seed_startup_tests {
             }),
         });
         let hub = Arc::new(ClientHub::new());
-        let authz: Arc<dyn AuthZResolverApi> = Arc::new(PermitAllAuthz);
+        let authz: Arc<dyn AuthZResolverApi> = Arc::new(PermitOwnTenantAuthz);
         hub.register::<dyn AuthZResolverApi>(authz);
 
         // Seed declarations only: AM must publish its own root type.
@@ -669,6 +705,20 @@ mod no_seed_startup_tests {
                 .build_gts_manifest(config.as_ref())
                 .expect("manifest"),
         );
+        // AM itself publishes the user-group declarations the writes below
+        // rely on (the seeded inventory would mask an omission).
+        for id in [
+            USER_GROUP_RG_TYPE_CODE,
+            toolkit_gts::gts_id!("cf.core.rg.membership.v1~cf.core.am.user_group_member.v1~"),
+        ] {
+            assert!(
+                manifest
+                    .documents()
+                    .iter()
+                    .any(|(doc, _)| doc.as_ref() == id),
+                "AM's manifest publishes {id}"
+            );
+        }
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
             toolkit::gts_publication::PreparedGtsPublication::bind(
@@ -731,6 +781,43 @@ mod no_seed_startup_tests {
             runtime_root.resolved_schema.is_some(),
             "the root resolves against the seeded envelope"
         );
+
+        // AM's published user-group declarations are the rule Resource Group
+        // enforces on writes: a user group binds AM's membership schema,
+        // which admits AM users and refuses other resource types.
+        let rg = hub
+            .get::<dyn resource_group_sdk::ResourceGroupClient>()
+            .expect("Resource Group client");
+        let caller = toolkit_security::SecurityContext::builder()
+            .subject_id(uuid::Uuid::now_v7())
+            .subject_tenant_id(uuid::Uuid::now_v7())
+            .build()
+            .expect("caller");
+        let group = rg
+            .create_group(
+                &caller,
+                resource_group_sdk::CreateGroupRequest::new(USER_GROUP_RG_TYPE_CODE, "admins"),
+            )
+            .await
+            .expect("a root user group");
+        rg.add_membership(&caller, group.id, USER_RESOURCE_TYPE, "user-1")
+            .await
+            .expect("an AM user joins a user group");
+        let refused = rg
+            .add_membership(&caller, group.id, USER_GROUP_RG_TYPE_CODE, "group-1")
+            .await
+            .expect_err("a user group is not a member type");
+        assert_eq!(refused.status_code(), 400, "{refused:?}");
+        let links = rg
+            .list_memberships(&caller, &toolkit_odata::ODataQuery::default())
+            .await
+            .expect("list memberships");
+        let links: Vec<_> = links
+            .items
+            .iter()
+            .map(|m| (m.group_id, m.resource_type.as_str(), m.resource_id.as_str()))
+            .collect();
+        assert_eq!(links, [(group.id, USER_RESOURCE_TYPE, "user-1")]);
     }
 
     /// AM's init over the SDK registry fake and an AM database holding a
