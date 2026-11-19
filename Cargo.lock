@@ -5731,6 +5731,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-gears-vault-credstore-plugin-v2"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "cf-gears-credstore-v2-sdk",
+ "cf-gears-test-containers",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-security",
+ "cf-gears-types-registry-sdk",
+ "httpmock",
+ "inventory",
+ "reqwest",
+ "serde",
+ "serde-saphyr 1.3.0",
+ "serde_json",
+ "temp-env",
+ "tempfile",
+ "testcontainers",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "cf-k8s-cluster-plugin"
 version = "0.1.9"
 dependencies = [
