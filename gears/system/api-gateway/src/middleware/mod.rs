@@ -7,5 +7,6 @@ pub mod http_metrics;
 pub mod license_validation;
 pub mod mime_validation;
 pub mod request_id;
+pub mod request_timeout;
 pub mod scope_enforcement;
 pub mod throttling;

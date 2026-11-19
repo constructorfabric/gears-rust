@@ -375,7 +375,7 @@ for event in batch:
     key = resolve_pointer(event, event_type.partition_key)       # ADR-0002; no partition here
     group = outbox_group(topic)                                   # feature 0005 §2.5
     ip = murmur3(f"{topic}:{key}") % group.partitions            # ingest partition
-wait = prefer_wait(request)                                       # Prefer: wait=N (None = async), capped by publish.max_wait (default 20s, under the api-gateway deadline)
+wait = prefer_wait(request)                                       # Prefer: wait=N (None = async), capped by publish.max_wait (default 50s, under the publish routes' declared 60s api-gateway deadline)
 groups = outbox groups the batch touches                          # feature 0005 §2.5
 if wait is not None:                                              # any Prefer: wait, wait=0 included (sync path, zero hold)
     for g in groups:

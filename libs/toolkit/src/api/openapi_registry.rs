@@ -138,6 +138,25 @@ fn operation_vendor_extensions(
         );
     }
 
+    // Per-route request deadline, readable by edge gateways that proxy this
+    // route (key shared with toolkit-gateway). `Inherit` emits nothing so the
+    // document stays quiet for the common case.
+    match spec.request_timeout {
+        operation_builder::RouteTimeout::Inherit => {}
+        operation_builder::RouteTimeout::Disabled => {
+            ext.insert(
+                "x-toolkit-request-timeout".to_owned(),
+                serde_json::Value::String("none".to_owned()),
+            );
+        }
+        operation_builder::RouteTimeout::Custom(timeout) => {
+            ext.insert(
+                "x-toolkit-request-timeout".to_owned(),
+                serde_json::Value::String(humantime::format_duration(timeout).to_string()),
+            );
+        }
+    }
+
     // Throttling zone bindings. The contract layer only knows zone
     // *names*; the API gateway enriches these operations with the
     // zones' numeric limits (`x-rate-limit-rps` / `x-rate-limit-burst`)
@@ -715,7 +734,7 @@ mod tests {
     use super::*;
     use crate::api::operation_builder::{
         OperationSpec, ParamSpec, ResponseHeaderSpec, ResponseHeaderType, ResponseSchema,
-        ResponseSpec, VendorExtensions,
+        ResponseSpec, RouteTimeout, VendorExtensions,
     };
     use http::Method;
 
@@ -748,6 +767,7 @@ mod tests {
             allowed_request_content_types: None,
             vendor_extensions: VendorExtensions::default(),
             license_requirement: None,
+            request_timeout: RouteTimeout::Inherit,
         }
     }
 
@@ -798,6 +818,50 @@ mod tests {
         let plain = &json["paths"]["/plain"]["get"];
         assert!(plain.get("x-throttling-rate-limit-zone").is_none());
         assert!(plain.get("x-throttling-in-flight-limit-zone").is_none());
+    }
+
+    #[test]
+    fn request_timeout_is_emitted_as_a_vendor_extension() {
+        use std::time::Duration;
+
+        let registry = OpenApiRegistryImpl::new();
+
+        let mut custom = spec_with_response("/custom", "custom_op", None);
+        custom.request_timeout = RouteTimeout::Custom(Duration::from_secs(60));
+        registry.register_operation(&custom);
+
+        let mut disabled = spec_with_response("/stream", "stream_op", None);
+        disabled.request_timeout = RouteTimeout::Disabled;
+        registry.register_operation(&disabled);
+
+        registry.register_operation(&spec_with_response("/inherit", "inherit_op", None));
+
+        let doc = registry.build_openapi(&test_info()).expect("build OpenAPI");
+        let json = serde_json::to_value(&doc).expect("serialize OpenAPI");
+
+        // `Custom` emits humantime's normalised form (`60s` renders as `"1m"`),
+        // pinned so a formatting change can't silently shift the wire contract
+        // toolkit-gateway's `parse_request_timeout` reads.
+        let emitted = json["paths"]["/custom"]["get"]["x-toolkit-request-timeout"]
+            .as_str()
+            .expect("a Custom timeout emits a string");
+        assert_eq!(emitted, "1m");
+        assert_eq!(
+            humantime::parse_duration(emitted).expect("the emitted string is valid humantime"),
+            Duration::from_secs(60)
+        );
+
+        assert_eq!(
+            json["paths"]["/stream"]["get"]["x-toolkit-request-timeout"],
+            serde_json::json!("none"),
+        );
+
+        // `Inherit` (the default) stays quiet so the common case is unchanged.
+        assert!(
+            json["paths"]["/inherit"]["get"]
+                .get("x-toolkit-request-timeout")
+                .is_none(),
+        );
     }
 
     #[test]
@@ -879,6 +943,7 @@ mod tests {
             allowed_request_content_types: None,
             vendor_extensions: VendorExtensions::default(),
             license_requirement: None,
+            request_timeout: RouteTimeout::Inherit,
         };
 
         registry.register_operation(&spec);
@@ -1045,6 +1110,7 @@ mod tests {
             allowed_request_content_types: None,
             vendor_extensions: VendorExtensions::default(),
             license_requirement: None,
+            request_timeout: RouteTimeout::Inherit,
         };
 
         registry.register_operation(&spec);
@@ -1106,6 +1172,7 @@ mod tests {
             allowed_request_content_types: Some(vec!["application/octet-stream"]),
             vendor_extensions: VendorExtensions::default(),
             license_requirement: None,
+            request_timeout: RouteTimeout::Inherit,
         };
 
         registry.register_operation(&spec);
@@ -1186,6 +1253,7 @@ mod tests {
             allowed_request_content_types: None,
             vendor_extensions: VendorExtensions::default(),
             license_requirement: None,
+            request_timeout: RouteTimeout::Inherit,
         };
         spec.vendor_extensions.x_odata_filter = Some(filter);
         spec.vendor_extensions.x_odata_orderby = Some(order_by);
@@ -1241,6 +1309,7 @@ mod tests {
             allowed_request_content_types: None,
             vendor_extensions: VendorExtensions::default(),
             license_requirement: None,
+            request_timeout: RouteTimeout::Inherit,
         };
         registry.register_operation(&spec);
         spec.method = Method::GET;
@@ -1294,6 +1363,7 @@ mod tests {
             allowed_request_content_types: None,
             vendor_extensions: VendorExtensions::default(),
             license_requirement: None,
+            request_timeout: RouteTimeout::Inherit,
         };
         // A second, internal operation must NOT carry the extension.
         let mut internal = public.clone();
@@ -1350,6 +1420,7 @@ mod tests {
             allowed_request_content_types: None,
             vendor_extensions: VendorExtensions::default(),
             license_requirement: None,
+            request_timeout: RouteTimeout::Inherit,
         };
 
         registry.register_operation(&platform);

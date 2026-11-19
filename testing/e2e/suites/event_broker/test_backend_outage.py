@@ -283,10 +283,11 @@ async def test_sync_publish_times_out_to_202_when_the_backend_is_down(test_env):
         _docker("stop", sidecar.container_id)
 
         tenant_id = str(uuid.uuid4())
-        # `wait=20` is the configured cap (`publish.max_wait_secs`): the hold runs
+        # `wait=20` is under the `publish.max_wait_secs` cap (50): the hold runs
         # its full length with the backend down and must still answer `202`
-        # through the real api-gateway, not `504` - so the cap sits inside the
-        # gateway's request deadline. The client timeout clears the full hold.
+        # through the real api-gateway, not `504` - so the wait sits inside the
+        # publish route's declared request deadline. The client timeout clears
+        # the full hold.
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 f"{BASE_URL}/events",

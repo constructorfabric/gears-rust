@@ -42,9 +42,9 @@ const SYNC_PROCESSING_MARGIN: std::time::Duration = std::time::Duration::from_se
 /// (management, async publish, opening a stream) returns well inside it.
 ///
 /// There is no fixed ceiling: `sync_wait` is the caller's own budget, so the
-/// timeout tracks it - and therefore whatever hold a per-route gateway deadline
-/// may later allow (#4752) - rather than a hardcoded bound that would cut a
-/// longer hold off. The broker still clamps the actual hold to its
+/// timeout tracks it - and therefore whatever hold the per-route gateway
+/// deadline on the publish routes allows - rather than a hardcoded bound that
+/// would cut a longer hold off. The broker still clamps the actual hold to its
 /// `publish.max_wait_secs`, and api-gateway bounds every request at its own
 /// deadline (answering `504` past it), so at the default `sync_wait` this
 /// timeout sits just above that deadline: a stuck request surfaces as the

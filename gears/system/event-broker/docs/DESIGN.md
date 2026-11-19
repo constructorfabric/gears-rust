@@ -2525,13 +2525,14 @@ modules:
       max_payload_bytes: 1048576  # 1MB
 
     publish:
-      # Ceiling on a `Prefer: wait=N` hold, in seconds. Default 20: the hold must
-      # stay inside api-gateway's request deadline (`defaults.request_timeout`,
-      # default 30s), with margin for the two gateway hops a cluster publish
-      # crosses. In the ingest-serving modes (standalone, cluster_ingest) a value
-      # above 20 fails startup, so a publish cannot hold its response head until
-      # the gateway answers 504; the non-ingest roles never enqueue.
-      max_wait_secs: 20
+      # Ceiling on a `Prefer: wait=N` hold, in seconds. Default 50: the hold must
+      # stay inside the 60s request deadline the publish routes declare to
+      # api-gateway (`x-toolkit-request-timeout`, #4752); the dispatcher's
+      # forwarding routes declare 75s to cover the second hop a cluster publish
+      # crosses. In the ingest-serving modes (standalone, cluster_ingest) a
+      # value above 50 fails startup, so a publish cannot hold its response head
+      # until the gateway answers 504; the non-ingest roles never enqueue.
+      max_wait_secs: 50
 
     subscription:
       join_timeout_secs: 60              # joined without a stream this long, then reaped; at least 1

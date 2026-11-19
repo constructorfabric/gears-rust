@@ -18,6 +18,7 @@ use http::Method;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
+use std::time::Duration;
 use toolkit_canonical_errors::problem;
 use toolkit_gts::gts_id;
 
@@ -458,6 +459,24 @@ pub use super::openapi_registry::INTERNAL_TOKEN_SECURITY_SCHEME;
 /// Per-route credential requirement, shared with listeners and the gateway.
 pub use toolkit_security::RouteAuth;
 
+/// Per-route request deadline declared on an operation.
+///
+/// The API gateway applies its global `defaults.request_timeout` to every
+/// route unless the operation overrides it here. The declared value is also
+/// emitted as the `x-toolkit-request-timeout` `OpenAPI` vendor extension so
+/// edge gateways proxying the route honour the same deadline.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RouteTimeout {
+    /// Inherit the gateway-wide `defaults.request_timeout` (default).
+    #[default]
+    Inherit,
+    /// No server-side deadline; for long-lived streaming routes (SSE,
+    /// multipart streams) that must not be cut by the unary timeout.
+    Disabled,
+    /// A route-specific deadline replacing the gateway default.
+    Custom(Duration),
+}
+
 /// Simplified operation specification for the type-safe builder
 #[derive(Clone, Debug)]
 pub struct OperationSpec {
@@ -495,6 +514,8 @@ pub struct OperationSpec {
     /// `OpenAPI` vendor extensions (x-*)
     pub vendor_extensions: VendorExtensions,
     pub license_requirement: Option<LicenseReqSpec>,
+    /// Per-route request deadline; see [`RouteTimeout`]. `Inherit` by default.
+    pub request_timeout: RouteTimeout,
 }
 
 impl OperationSpec {
@@ -765,6 +786,7 @@ impl<S> OperationBuilder<Missing, Missing, S, AuthNotSet> {
                 allowed_request_content_types: None,
                 vendor_extensions: VendorExtensions::default(),
                 license_requirement: None,
+                request_timeout: RouteTimeout::Inherit,
             },
             method_router: (), // no router in Missing state
             _has_handler: PhantomData,
@@ -832,6 +854,22 @@ where
     /// themselves are defined in the gateway configuration.
     pub fn with_throttling(mut self, spec: ThrottlingSpec) -> Self {
         self.spec.throttling = Some(spec);
+        self
+    }
+
+    /// Give this operation its own request deadline, replacing the gateway's
+    /// `defaults.request_timeout` (e.g. a synchronous-publish route whose
+    /// handler legitimately holds the response longer than the default).
+    pub fn request_timeout(mut self, timeout: Duration) -> Self {
+        self.spec.request_timeout = RouteTimeout::Custom(timeout);
+        self
+    }
+
+    /// Exempt this operation from the gateway request timeout entirely; for
+    /// long-lived streaming routes (SSE, multipart streams) that a unary
+    /// deadline would truncate.
+    pub fn no_request_timeout(mut self) -> Self {
+        self.spec.request_timeout = RouteTimeout::Disabled;
         self
     }
 
