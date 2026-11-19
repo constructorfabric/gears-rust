@@ -121,19 +121,17 @@ error, while boolean schemas retain their native meaning. Payloads are not modif
 defaults are not inserted. Consumers choose freshness, lifecycle and availability policy,
 and construct their own payload envelopes; existing consumers migrate separately in T38.
 
-**Intermediate AM topology (implemented for the current execution slice).** An embedded
-registry configured `mode: legacy_only` keeps only the legacy client and v1 routes for
-consumers that have not migrated yet: it registers neither new API locally, routes neither,
-runs no seeding or admission over a bound database and is not advertised in the service
-directory. Consumers of the new APIs therefore reach a remote registry: AM and its selected
-publishers through the wiring that `gts_publication(...)` generates, and RG through the
-`TypesRegistryApi` it consumes to read group type definitions under each caller's context.
-The runtime publishes all application GTS Type Schemas and Instances before any application
-`init`; readiness waits for that barrier. The server's `publish-gts --registry <url>`
-subcommand publishes the same GTS Type Schemas and Instances as a deployment step. RG keeps no local type
-definitions or bootstrap (only an identity dictionary of type keys), and AM's RG types are AM-owned declarations published with AM's
-manifest. The dedicated AM remote-host executable, its configuration pair and
-`make e2e-am-remote` are deferred to T41 (see `docs/p0/SPEC.md`).
+**Intermediate AM topology.** An embedded `legacy_only` registry serves the
+legacy client and v1 routes. It skips seeding, admission and service-directory
+advertisement. New API calls go to the remote registry. AM publishes through
+`gts_publication(...)`, including its RG declarations. RG reads definitions
+through `TypesRegistryApi` with the caller's context and stores only type keys
+and their identifiers locally.
+
+Application readiness waits for GTS Type Schema and Instance publication
+before `init`. The server's `publish-gts --registry <url>` subcommand publishes
+the same documents during deployment. The dedicated AM remote host, its two
+configs and `make e2e-am-remote` are deferred to T41. See [the P0 spec](../docs/p0/SPEC.md).
 
 ## Publishing from a gear
 

@@ -39,54 +39,32 @@ cf-gears-resource-group  (this crate — services, repos, REST handlers)
 
 ## Type Publication and Upgrade
 
-Types Registry owns the RG type definitions. The SDK declares the RG base
-schemas. Consumer gears publish derived group schemas and member resource types
-through managed GTS publication (`gts_publication`) before application initialization.
-Dynamic publishers use Types Registry's platform API. See the
-[type contracts](../docs/features/0002-type-management.md) and
-[migration guidance](../docs/DESIGN.md).
+RG publishes its SDK's base schemas. Owners publish derived group schemas and
+member resource types through `gts_publication` before application initialization.
+Dynamic publishers use Types Registry's platform API.
 
-Group types derive from `gts.cf.core.rg.type.v1~`, which requires
-a `parent_type` payload field and a `membership_type` trait on concrete types. Publish a concrete membership schema
-under `gts.cf.core.rg.group_membership.v1~` and the group schema that binds to it.
-Several group types can share a membership schema.
+- Derive group types from `gts.cf.core.rg.type.v1~`. Constrain the
+  `parent_type` payload field, which receives the actual parent's GTS type or
+  `null` at the root. Use `x-gts-type-ref` for parent families.
+- Derive a membership schema from `gts.cf.core.rg.group_membership.v1~`.
+  Bind it through `x-gts-traits.membership_type` and lock that value with
+  `const` in `x-gts-traits-schema.properties.membership_type`. Several group
+  types can share one membership schema. Group creation requires an active,
+  concrete binding.
+- Membership additions use the group type's current binding to validate
+  `{resource_type}`. Use `anyOf` with `x-gts-type-ref` for type families or
+  `enum` for exact IDs.
 
-- The group schema constrains `parent_type` in its body. At write time RG
-  supplies the actual parent's GTS type, or `null` for a root. For a parent
-  family, use a string branch with `x-gts-type-ref`.
-- The group type sets `x-gts-traits.membership_type` and locks it with
-  `const` in `x-gts-traits-schema.properties.membership_type`. RG reads the
-  value from `effective_traits` and checks that the selected schema is active
-  and concrete before creating the group.
-- When adding a member, RG reads the group's current type declaration and
-  batches the membership schema and member type lookup. It validates `{resource_type}`
-  against the active membership schema. Use `anyOf` with `x-gts-type-ref` to
-  allow type families, or `enum` to allow exact type IDs.
+Compatible revisions can widen placement and membership rules for existing
+groups. Types Registry rejects incompatible revisions, including changing the
+locked membership schema ID. See the [type contracts](../docs/features/0002-type-management.md)
+and [schema revision tests](../../../../testing/e2e/suites/resource_group/test_type_revisions.py).
 
-Types Registry checks same-ID revisions using its normal schema compatibility
-rules. Widening placement or membership constraints can take effect for
-existing groups. The [schema revision E2E tests](../../../../testing/e2e/suites/resource_group/test_type_revisions.py)
-publish revisions through Types Registry and verify that existing groups can
-move or accept members under the widened rules. They also check that the
-registry refuses incompatible payload revisions and rejects a same-ID revision
-that replaces the `membership_type` constant with a different schema ID.
-
-Publish group and membership schemas for existing GTS identifiers before
-upgrading deployments that use custom types. Adding a member to any group
-uses the current membership rule published for that group type.
-
-Registries that already admitted the earlier v1 schema with a required
-`membership_type` payload field need a schema migration. Moving that field
-to traits changes the accepted payloads and can fail the registry's same-ID
-compatibility check.
-
-Export custom type definitions before upgrading: the migration removes the old
-local definitions (metadata schemas, placement rules) irreversibly and keeps
-`gts_type` only as an identity dictionary of type keys. Existing groups and
-memberships keep their keys and remain readable and removable after their types
-are retired. Membership additions limit `resource_id` to 2600 UTF-8 bytes.
-Upgrade preflight rejects oversized legacy identifiers before altering tables;
-reconcile those resource identifiers and their links before retrying the upgrade.
+Before upgrading, export and publish custom definitions. The migration
+irreversibly removes local schemas and rules but preserves the stored type
+keys used for reads and cleanup. It rejects legacy membership identifiers over
+2600 UTF-8 bytes. Registries with the earlier `membership_type` payload field
+also need a schema migration. See [upgrade steps](../docs/DESIGN.md#upgrading-resource-group).
 
 ## Configuration
 

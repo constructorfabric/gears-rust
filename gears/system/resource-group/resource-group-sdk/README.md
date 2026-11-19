@@ -26,15 +26,13 @@ let rg = hub.get::<dyn ResourceGroupClient>()?;
 
 ### Publishing Types
 
-Types Registry owns RG type definitions. The RG SDK publishes the base contract
-`gts.cf.core.rg.type.v1~` and its placement traits. Consumer gears declare their
-derived schemas through managed GTS publication (`gts_publication`), which runs
-before application initialization. Dynamic publishers use Types Registry's
-platform API. Publish the group and member resource types before creating links.
-
-See the [registry-owned type workflow](../docs/features/0002-type-management.md)
-and [upgrade guidance](../docs/DESIGN.md). Groups and memberships store GTS
-identifiers directly; type definitions are read from Types Registry when needed.
+RG publishes the SDK's abstract group and membership schemas. Owners publish
+derived schemas through `gts_publication` before application initialization
+or use Types Registry's platform API for dynamic publication. Publish group
+and member resource types before creating links. SDK models expose GTS type
+identifiers, and RG fetches definitions for type-dependent writes. See the
+[type workflow](../docs/features/0002-type-management.md) and
+[upgrade steps](../docs/DESIGN.md#upgrading-resource-group).
 
 ### Group Lifecycle
 

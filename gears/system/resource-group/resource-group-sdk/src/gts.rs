@@ -18,12 +18,10 @@ pub struct ResourceGroupTypeTraitsV1 {
 /// publish derived types (`gts.cf.core.rg.type.v1~<vendor>...~`) before
 /// application `init`; resource-group publishes this base.
 ///
-/// A concrete type must fix the `membership_type` trait with a string `const` for new
-/// groups; it may narrow `parent_type` and metadata. The owner does the
-/// narrowing: resource-group enforces the schema as published and does not
-/// check that it narrows anything. Left as declared here, `parent_type`
-/// admits `null` (a root) and any RG type, and a membership schema's
-/// `resource_type` admits any active GTS type.
+/// Concrete types fix the `membership_type` trait with a string `const`.
+/// Owners narrow `parent_type`, `metadata` and membership `resource_type`
+/// as needed. RG enforces the published schema. The bases allow root
+/// placement, any RG parent type and any active concrete member type.
 ///
 /// "Is this type a tenant?" is **not** a trait — it is derived from the type
 /// code: any type whose GTS chain starts with one of the configured tenant

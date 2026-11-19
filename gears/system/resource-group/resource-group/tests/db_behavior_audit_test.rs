@@ -1281,14 +1281,9 @@ fn static_rule_non_force_delete_locks_before_it_decides() {
 fn static_rule_metadata_schema_is_resolved_before_begin() {
     let src = include_str!("../src/domain/group_service.rs");
 
-    // RG-09. Reading the type from the types registry is a network
-    // round-trip and the schema is then compiled; under an open transaction
-    // that time is snapshot lifetime, and every retry pays it again. The fix
-    // is structural rather than positional: the transaction-inner functions
-    // take the already-read `RgType`, never the `RgTypeCatalog`, so the call
-    // cannot drift back inside. This rule asserts the catalogue stays out --
-    // a positional check would pass again the moment someone reintroduced
-    // the argument and moved the call.
+    // RG-09. Inner operations take a compiled `RgType` so neither registry
+    // I/O nor compilation extends the transaction snapshot or repeats on retry.
+    // Assert the catalogue stays out of these functions.
     let inner_fns: Vec<&str> = src
         .split("async fn ")
         .filter(|f| {

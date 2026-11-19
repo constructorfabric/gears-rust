@@ -23,10 +23,9 @@ pub enum MemberTypes<'a> {
 
 /// Storage key of a GTS type in RG's local identity dictionary (`gts_type`).
 ///
-/// Opaque to the domain: it only travels from
-/// [`GroupRepositoryTrait::ensure_type_key`] to the insert it was obtained
-/// for, within one transaction. It says nothing about the type in the types registry -- existence,
-/// admission and lifecycle are decided there, from the string identifier.
+/// Pass this key from [`GroupRepositoryTrait::ensure_type_key`] to the
+/// insert in the same transaction. Types Registry owns admission and
+/// lifecycle for the corresponding GTS identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[domain_model]
 pub struct GtsTypeKey(pub(crate) i16);
@@ -130,14 +129,11 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
 
     /// The dictionary key for the GTS type `code`, created on first use.
     ///
-    /// Only for paths about to link a new group or membership of a type the
-    /// registry admitted (registry I/O stays before `BEGIN`); reads, filters
-    /// and deletes never create keys. Call it inside the write transaction
-    /// that inserts the referencing row, so a failed write leaves no key
-    /// behind, and only after every check that can reject the request:
-    /// PostgreSQL does not return identity values on rollback. Concurrent first uses converge on one row; under
-    /// `SERIALIZABLE` the loser fails with a typed serialization error and
-    /// is retried.
+    /// Call inside the write transaction after registry admission and other
+    /// checks. The key row rolls back with the referencing write, but PostgreSQL
+    /// identity values are not reclaimed. Concurrent first uses share a key,
+    /// with a typed serialization error triggering retry under `SERIALIZABLE`.
+    /// Reads, filters and deletes only look up keys.
     async fn ensure_type_key<C: DBRunner>(
         &self,
         db: &C,
@@ -294,12 +290,9 @@ pub trait MembershipRepositoryTrait: Send + Sync + 'static {
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupMembership>, DomainError>;
 
-    /// Insert a membership of the member type `resource_type`, keying the
-    /// type in the identity dictionary first. Two writes, so it takes a
-    /// transaction: a refused insert must not leave a dictionary row behind.
-    /// Call it as the last step, after every check that can reject the
-    /// request: PostgreSQL does not return identity values on rollback. A
-    /// duplicate is reported with the GTS type identifier.
+    /// Insert the membership and its type key in the same transaction. Call
+    /// after validation because PostgreSQL identity values survive rollback.
+    /// Duplicate errors use the GTS type identifier.
     async fn insert(
         &self,
         tx: &DbTx<'_>,

@@ -304,11 +304,8 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
         validation::validate_type_code(&req.code)?;
         Self::validate_name(&req.name)?;
 
-        // The type's payload schema is
-        // read from the types registry here rather than inside the
-        // transaction: a network round-trip, then a schema compile. Held open,
-        // that time is snapshot lifetime and SSI read-set age, and every retry
-        // paid for both again. A new group needs an Active type.
+        // Fetch and compile the active type before starting the transaction to
+        // keep registry latency and compilation out of its snapshot and retries.
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5b
         let validation_started = std::time::Instant::now();
         let validated = self.types.get_type(ctx, &req.code, TypeUse::NewLink).await;
@@ -533,14 +530,8 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
 
         // One pre-transaction read, serving two purposes.
         //
-        // The type definition comes from the types registry over the network
-        // and the metadata schema is compiled, so neither may run with the
-        // transaction open -- see `create_group`. Unlike create, the type is
-        // not in the request; it has to be read, and it cannot go stale for
-        // this id, because a group's type is immutable (which is why
-        // `UpdateGroupRequest` has no `code` field). The transaction still
-        // rechecks it, so a group deleted and re-created under the same id
-        // with another type is not validated against the wrong definition.
+        // Read the group's immutable type before fetching and compiling its
+        // schema. Recheck the type in the transaction in case the ID was reused.
         //
         // The same row also carries the current `parent_id`, which decides
         // the transaction's isolation level below. `conn` is scoped to this
@@ -977,10 +968,8 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
 
     /// Inner logic for `create_group`, runs inside a SERIALIZABLE transaction.
     ///
-    /// Takes the type definition already read, not a registry client, and
-    /// that is the point: the registry read and the metadata schema compile
-    /// must not happen with a transaction open. The caller does both before
-    /// `BEGIN`. Without a client the call cannot drift back in here.
+    /// Accepts a precompiled type definition to keep registry I/O and schema
+    /// compilation outside the transaction.
     #[allow(clippy::cognitive_complexity)]
     async fn create_group_inner(
         group_repo: &GR,
@@ -992,10 +981,8 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
         tenant_types: &TenantTypes,
     ) -> Result<ResourceGroup, DomainError> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-3
-        // The definition was read from the types registry before `BEGIN`;
-        // only that admission allows a new link. The group stores the type's
-        // key in RG's local identity dictionary (`ensure_type_key`, right
-        // before each insert below).
+        // Registry admission precedes this transaction. The insert uses the
+        // corresponding local dictionary key.
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-3
 
         // Determine effective tenant_id by code-prefix rule:
@@ -1005,13 +992,10 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
         let is_tenant_type = tenant_types.is_tenant(&req.code);
         let effective_tenant_id = if is_tenant_type { group_id } else { tenant_id };
 
-        // A caller-supplied id may already be taken. The primary key still
-        // decides a race, but a deterministic duplicate is rejected here,
-        // before `ensure_type_key`: otherwise each repeat with a not-yet-used
-        // type would take (and roll back) a dictionary key, and PostgreSQL
-        // does not return identity values on rollback. Same answer as the
-        // insert's unique violation; nothing about the existing group is
-        // disclosed. Generated ids skip this read.
+        // Reject an existing caller-supplied ID before allocating a dictionary
+        // key. PostgreSQL identity values survive rollback. The primary key
+        // handles races, and both paths return the same conflict. Generated
+        // IDs skip this check.
         if req.id.is_some() && group_repo.find_model_by_id(tx, group_id).await?.is_some() {
             return Err(DomainError::group_already_exists(group_id));
         }
@@ -1091,13 +1075,8 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4
 
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-6
-            // Insert group. The type key is created on first use only now,
-            // after every check that can reject the request: PostgreSQL does
-            // not return identity values on rollback, so a key taken before a
-            // rejection would burn a `SMALLINT` per rejected request. The row
-            // itself commits or rolls back with the group. An existing
-            // dictionary row is not an admission: the registry check ran
-            // before `BEGIN`.
+            // Allocate the type key after validation. The row rolls back with
+            // the group, but PostgreSQL does not reclaim the identity value.
             let type_key = group_repo.ensure_type_key(tx, &rg_type.code).await?;
             group_repo
                 .insert(
@@ -1265,10 +1244,8 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
         // by that helper and the metadata validation block right below.
         // Type is immutable on update — the update never writes it.
         //
-        // The definition, when this update needed one, was read from the
-        // types registry before `BEGIN` for the type the pre-read saw. This
-        // row is the authoritative one: a group deleted and re-created under
-        // the same id with another type must not be checked against it.
+        // Reject a type mismatch if the group ID was reused after the
+        // pre-transaction schema lookup.
         if rg_type.is_some_and(|definition| definition.code != existing.code) {
             return Err(DomainError::conflict(format!(
                 "Group {group_id} changed while it was being updated"
@@ -1276,10 +1253,9 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
         }
         let existing_type_path = existing.code.clone();
 
-        // A concurrent update may have added metadata after the pre-read
-        // skipped the registry. Never clear that value without validating
-        // its removal; the caller can retry to load the definition outside
-        // the transaction. The row lock keeps this check and write atomic.
+        // A concurrent update may have added metadata after the pre-read.
+        // Check the locked row and require a retry with the schema before
+        // clearing it.
         if rg_type.is_none() && existing.metadata.is_some() {
             return Err(DomainError::conflict(format!(
                 "Group {group_id} metadata changed while it was being updated; retry the update"
@@ -1763,11 +1739,9 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
             // Profile checks passed
             // @cpt-end:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-4
         }
-        // Tenant-root uniqueness: at most one tenant-type group may be a
-        // forest root. Mirrors the guard in `create_group_inner` —
-        // `cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`. We
-        // exclude the moved group itself so a no-op move (already root)
-        // does not falsely fire.
+        // Allow one tenant-type forest root, as in `create_group_inner`
+        // (`cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`).
+        // Exclude this group so a no-op move to root succeeds.
         else if tenant_types.is_tenant(&rg_type.code)
             && let Some(existing_root_id) = group_repo
                 .find_root_id_with_type_prefixes(conn, tenant_types.prefixes())

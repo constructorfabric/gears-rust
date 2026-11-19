@@ -40,10 +40,8 @@ memberships in its own database.
 
 ### 1.1 Architectural Vision
 
-RG owns the group forest and memberships; Types Registry owns their type
-contracts. Declaring gears publish their schemas before application initialization.
-RG reads materialized schemas with the caller's context, validates
-payloads through the registry SDK and persists only group and membership data.
+RG validates group and membership payloads with materialized registry schemas
+read under the caller's context.
 
 | Owner | Responsibility |
 | --- | --- |
@@ -209,17 +207,11 @@ Parent types belong to the RG type family. Member resource types may be any
 registered GTS type. RG records the resource identifier supplied by the caller.
 The owning gear remains responsible for confirming that its resource exists.
 
-The schemas govern type eligibility, and narrowing them is the owner's duty.
-The base leaves `parent_type` open to `null` and to any RG type, and the
-membership base leaves `resource_type` open to any active GTS type. RG does
-not check that a concrete schema narrows them: a group type that does not
-constrain `parent_type` accepts a root placement and a parent of any RG type,
-and a membership schema that does not constrain `resource_type` accepts any
-active resource type, subject to the RG checks applicable to each operation
-(forest, tenant and query-profile checks for placement; cross-tenant
-ownership for membership). Account Management's user group, for example, allows `null`
-or a user-group parent and binds a membership schema whose `resource_type`
-admits only AM users.
+Owners narrow the schemas to fit their domain. The bases allow root placement,
+any RG parent type and any active concrete member type. RG applies the published
+constraints alongside its forest, tenant and query-profile checks. For example,
+Account Management allows root user groups and nesting under other user groups,
+with membership limited to the AM user type family.
 
 The registry controls evolution of type definitions. RG applies the definition
 read for an operation; publication does not scan or rewrite existing RG rows.
@@ -234,11 +226,9 @@ Type-specific group data is stored in `resource_group.metadata` and returned as
 RG validates a payload with the actual `parent_type` and `metadata` when present. It compiles the resolved registry snapshot using
 `TypeSchema::compile_payload_validator()` from `types-registry-sdk`.
 
-This keeps inherited constraints, references and GTS validation semantics in the
-SDK validator. RG does not extract metadata sub-schemas or compile them through
-a separate JSON Schema implementation. SDK payload validation itself performs
-no registry I/O; target existence checks beyond its documented reference
-validation remain separate concerns.
+The SDK validator applies inherited constraints, references and GTS semantics
+to the full payload without registry I/O. Existence checks outside the
+validator's reference contract are separate.
 
 For tenant types, `metadata.self_managed` can express a barrier. RG stores and
 returns it without pruning hierarchy queries. Trusted tenant resolver and AuthZ
@@ -475,12 +465,12 @@ co-located and use ClientHub; this sequence does not claim implemented MTLS rout
 **ID**: `cpt-cf-resource-group-seq-create-entity-with-parent`
 
 1. Validate the requested RG type path and name.
-2. Read an active type through the caller's registry API and validate the group
-   payload with the SDK validator.
-3. Resolve create permissions, target tenant and applicable scope.
-4. In a retryable serializable transaction, read the actual parent, check
-   placement, tenant rules and profile limits, then insert the group and its
-   closure rows.
+2. Fetch and compile the active group and bound membership schemas under
+   the caller's context.
+3. Resolve create permissions, target tenant and scope.
+4. In a retryable serializable transaction, check the payload against the
+   actual parent and enforce tenant and profile limits. Insert the group and
+   its closure rows.
 5. Return the inserted representation.
 
 ```mermaid
@@ -492,11 +482,11 @@ sequenceDiagram
     participant DB as RG database
     Caller->>RG: create_group(ctx, request)
     RG->>TR: exact type read (ctx, selected artifacts)
-    TR-->>RG: materialized schema
-    RG->>RG: SDK payload validation
+    TR-->>RG: materialized group and membership schemas
+    RG->>RG: compile SDK validators
     RG->>PDP: authorize create and target tenant
     PDP-->>RG: scope
-    RG->>DB: transaction: check parent, insert group and closure
+    RG->>DB: transaction: validate payload and placement, insert group and closure
     DB-->>RG: committed row
     RG-->>Caller: ResourceGroup
 ```
@@ -552,8 +542,8 @@ create dictionary keys nor consult type definitions.
 
 | Operation | Type-definition requirement |
 | --- | --- |
-| Create group | Active RG type; validate payload and placement |
-| Add membership | Active group type and active concrete member resource type; validate allowed memberships |
+| Create group | Active RG type and active bound membership schema. Validate placement and metadata. |
+| Add membership | Active group and bound membership schemas. Validate the active, concrete member resource type. |
 | Non-null metadata replacement / removal of existing metadata / reparent existing group | Exact RG type definition, deleted included; unknown type is refused |
 | Rename with unchanged parent and metadata remaining absent | No registry lookup |
 | Group/membership reads and filters | No registry lookup |
@@ -641,8 +631,30 @@ it is stored as a key. Membership admission checks the bound before any
 registry read or write; the `ck_rgm_resource_id_bytes` CHECK enforces it on both
 backends.
 
-The CHECK is new to the upgraded schema. Before upgrading, stop writes and
-audit the old PostgreSQL database:
+#### Upgrading Resource Group
+
+1. Export custom definitions from the old `GET /types-registry/v1/types` route
+   by following `page_info.next_cursor` to the last page, or back up the old
+   database. The migration cannot recover or publish those definitions.
+2. Convert each legacy `TypeDto` to a GTS Type Schema. Set `$id` to
+   `gts://<code>` and inherit from the chain parent through `allOf`/`$ref`.
+   Constrain `properties.parent_type` to the exact `allowed_parent_types`
+   and include `null` when `can_be_root` is true. Copy a non-null
+   `metadata_schema` to `properties.metadata`. Constrain the membership
+   schema's `properties.resource_type` to the exact `allowed_membership_types`,
+   then bind that schema through the group's `membership_type` trait. See the
+   [type contracts](features/0002-type-management.md).
+3. Publish those schemas through the owner's `gts_publication` or the
+   platform API before upgrading. Publication after upgrade requires the
+   saved export or backup. Until publication, reads and cleanup still work,
+   while creates, moves, metadata changes that need validation and new
+   memberships fail with `TypeNotFound`.
+
+If Types Registry already admitted the earlier v1 group schema with a required
+`membership_type` payload field, migrate that schema as well. Moving the field
+into traits can fail the same-ID compatibility check.
+
+Stop writes before upgrading and audit legacy PostgreSQL membership IDs.
 
 ```sql
 SELECT group_id, gts_type_id, resource_id, octet_length(resource_id) AS bytes
@@ -650,31 +662,24 @@ FROM resource_group_membership
 WHERE octet_length(resource_id) > 2600;
 ```
 
-For SQLite, replace `octet_length(resource_id)` with
-`length(CAST(resource_id AS BLOB))`. The migration performs this preflight on
-both backends and refuses before any DDL if oversized identifiers remain; the
-old schema and rows stay intact. Export or back up the database, then
-coordinate a shorter resource identifier with its owning gear, or remove the
-affected membership through the old API and recreate it with the remapped
-identifier. Do not truncate identifiers automatically: that can link a
-different resource or create duplicate memberships. Repeat the audit until it
-returns no rows, then retry the upgrade.
+On SQLite, use `length(CAST(resource_id AS BLOB))`. Preflight rejects oversized
+IDs before any DDL. Coordinate remapping with the owning gear or remove the
+affected links through the old API and recreate them with the remapped IDs.
+Truncation can link the wrong resource or create duplicates. Retry the upgrade
+once the audit returns no rows.
 
-The migration (`m20261111_000001_gts_type_dictionary`) drops the
-`gts_type_allowed_parent` and `gts_type_allowed_membership` tables and the
-`metadata_schema` and `updated_at` columns of `gts_type`, keeping every key,
-identifier, group, membership and closure row. It runs in one transaction with
-its history record, so any failure leaves the previous schema. Its `down()`
-refuses: the dropped definitions cannot be rebuilt from the dictionary, and
-recreating empty rule tables would give the previous release a catalog that
-silently allows nothing. Roll back by restoring the pre-upgrade backup.
+The migration `m20261111_000001_gts_type_dictionary` drops the placement-rule
+tables and the `metadata_schema` and `updated_at` columns of `gts_type`.
+It preserves all dictionary rows, foreign keys, groups, memberships and closure
+rows. PostgreSQL adds the ID size check in place. SQLite rebuilds the membership
+table. The migration and its history record commit together. Restore the
+pre-upgrade backup to roll back.
 
 ## 4. Runtime and Verification
 
 ### 4.1 Transactions and concurrency
 
-All multi-statement writes use bounded transaction retries for transient database
-failures. The isolation level follows the invariant being protected:
+Multi-statement writes retry transient database failures within a bounded budget.
 
 | Write | Isolation / locking |
 | --- | --- |
@@ -684,11 +689,9 @@ failures. The isolation level follows the invariant being protected:
 | Membership add and cross-tenant ownership check | Serializable |
 | Membership removal | One scoped delete statement |
 
-Registry I/O and payload compilation run outside write transactions. Group type
-snapshots are rechecked against actual group rows inside the transaction. Profile,
-parent, cycle and tenant checks that depend on database state use that transaction's
-rows. Database retries reuse the operation's registry snapshot; they do not fetch
-types while a transaction is held open.
+Retries reuse the compiled registry snapshot. Each attempt rechecks the
+group type against that snapshot and uses current rows for profile, parent,
+cycle and tenant checks.
 
 ### 4.2 Errors and observability
 

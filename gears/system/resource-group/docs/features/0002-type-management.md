@@ -38,16 +38,11 @@ description: "Registry-owned RG type publication, caller-scoped snapshots and ad
 
 ### 1.1 Overview
 
-Resource Group consumes GTS type definitions owned by Types Registry. RG publishes
-its base schemas through managed GTS publication; each consuming gear publishes
-its own derived types. Group and membership rows reference their type by a
-key into RG's local identity dictionary (`gts_type`), which maps keys to GTS
-identifiers and holds no definitions; a dictionary row never admits a type.
-
-The former local type CRUD routes and SDK methods, type bootstrap interface and
-configuration-driven type/group/membership seed services are removed. These
-retired operations are not part of the current implementation contract. Their
-replacement is owner publication followed by ordinary group and membership APIs.
+RG publishes the base schemas and each consuming gear publishes its derived
+types. RG rows reference local `gts_type` keys, which map to identifiers.
+Types Registry owns the definitions and admission. Owner publication and
+ordinary group and membership APIs replace local type CRUD, bootstrap and
+configuration-driven seed services.
 
 ### 1.2 Purpose
 
@@ -117,11 +112,10 @@ traits. `RgType` compiles the payload validator and reads the membership binding
 from the effective traits. New links load the bound membership schema and verify that
 the resource type is active. Registry reads run before the RG write transaction.
 
-A new group or membership requires active definitions. Existing group updates
-that need type validation may use the exact retained definition of a deleted
-type. Row-only reads, rename/metadata-clear operations with an unchanged parent,
-and cleanup do not look up type definitions. Registry caller refusals and
-availability failures retain their intended error classifications.
+New links require active definitions. Updates that need validation can use
+the exact retained definition of a deleted type. Reads, cleanup and renames
+with unchanged parent and absent metadata skip the registry. Registry caller
+refusals and availability failures preserve their error categories.
 
 ### Schema-Validated Group and Membership Types
 
@@ -147,14 +141,11 @@ The resource type must be active and concrete. The membership schema validates
 `resource_type`. RG validates the resource identifier and rechecks the group's scope
 and type in the transaction before inserting the link.
 
-Types Registry checks same-ID revisions against the previous schema. The
-placement and membership schemas can widen through ordinary publication,
-while incompatible payload revisions are refused. The registry also checks backward compatibility of the effective
-traits schema. Replacing the `membership_type` constant in a same-ID revision
-is rejected with `incompatible_with_baseline`. The admission tests verify
-widening an inherited placement `anyOf` with GTS 0.17.2. Indirect changes
-from mutable references remain subject to the existing dependent refresh
-behavior.
+Compatible same-ID revisions can widen placement and membership rules.
+Types Registry also checks effective traits schema compatibility and rejects
+a changed `membership_type` constant as `incompatible_with_baseline`. Tests
+cover widening an inherited placement `anyOf` on GTS 0.17.2. Mutable references
+still follow the registry's dependent refresh rules.
 
 ## 4. States (CDSL)
 
@@ -182,7 +173,7 @@ performing registration or waiting on remote registry admission itself.
 Type lookups forward the caller context, select the artifacts required by the
 operation and distinguish absent/deleted definitions, access refusal,
 unavailability and malformed registry responses. Placement and payload validation
-use the materialized snapshot. Groups and memberships store GTS identifiers.
+use the materialized snapshot. Group and membership rows reference dictionary keys.
 
 **Touches**: `resource-group/src/infra/types_registry.rs`, `resource-group/src/domain/type_catalog.rs`.
 

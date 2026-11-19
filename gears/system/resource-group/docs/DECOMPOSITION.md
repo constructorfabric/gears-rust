@@ -147,7 +147,7 @@ The Resource Group DESIGN is decomposed into seven features organized around the
 - **Scope**:
   - Entity service: create/get/update (PUT full replace)/move/delete group operations with domain validation
   - Forest integrity: cycle detection and single-parent validation inside SERIALIZABLE write transactions
-  - Parent type compatibility: validate parent-child placement traits on create and move; group type is immutable
+  - Parent type compatibility: validate `parent_type` against the group schema on create and move. The group type is immutable.
   - Entity delete safety: reject when active references (children, memberships) prevent removal per configured deletion policy
   - Closure table engine: self-row creation on entity insert, ancestor-descendant row computation on parent assignment, subtree move with full path rebuild (delete old paths + insert new paths), cascade closure row removal on entity delete
   - Hierarchy queries: ancestors/descendants ordered by depth via indexed closure table lookups

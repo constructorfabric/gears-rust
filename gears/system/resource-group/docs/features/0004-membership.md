@@ -112,7 +112,7 @@ Memberships link resources (users, courses, documents, etc.) to groups in the hi
 
 **Steps**:
 1. [x] - `p1` - Actor sends DELETE /api/resource-group/v1/memberships/{group_id}/{resource_type}/{resource_id} - `inst-remove-memb-1`
-2. [x] - `p1` - Use the resource_type GTS identifier directly - `inst-remove-memb-2`
+2. [x] - `p1` - Match the resource type through the dictionary - `inst-remove-memb-2`
 3. [x] - `p1` - DB: DELETE FROM resource_group_membership WHERE group_id = {group_id} AND gts_type_id = {type_id} AND resource_id = {resource_id} AND group_id IN (groups in the caller's scope) - `inst-remove-memb-3`
 4. [x] - `p1` - **IF** no rows affected (missing membership, or group outside the caller's scope) → **RETURN** NotFound: membership does not exist - `inst-remove-memb-4`
 5. [x] - `p1` - **RETURN** success (204 No Content) - `inst-remove-memb-5`
@@ -317,7 +317,7 @@ Test setup: SQLite in-memory, admitted registry definitions, GroupService and Me
 
 | Operation | Required DB Assertions |
 |-----------|----------------------|
-| **Add membership** | Row exists with correct composite key `(group_id, gts_type_id, resource_id)`. `gts_type_id` is the resource GTS type identifier stored as text. |
+| **Add membership** | Row exists with correct composite key `(group_id, gts_type_id, resource_id)`. `gts_type_id` references the member type's dictionary key. |
 | **Remove membership** | Row **gone**. Other memberships of same group **untouched**. |
 | **Force delete group** | All membership rows for subtree groups → **0**. |
 | **Same resource multiple groups** | Two rows with different `group_id`, same `(gts_type_id, resource_id)`. |

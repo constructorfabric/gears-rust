@@ -88,12 +88,7 @@ async def test_route_smoke_all_endpoints(
 async def test_former_type_catalogue_routes_are_gone(
     rg_base_url, rg_headers, create_type,
 ):
-    """Seam: the RG type catalogue was removed (T38b).
-
-    The `/types-registry/v1/types*` routes resource-group served are no longer
-    mounted -- RG types are published to the types registry only -- and they
-    are absent from the published OpenAPI document.
-    """
+    """Verify T38b removed RG type CRUD routes and their OpenAPI entries."""
     code = await create_type("gonecat")
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
         h = rg_headers
@@ -128,11 +123,7 @@ async def test_former_type_catalogue_routes_are_gone(
 async def test_type_publication_is_repeatable(
     rg_base_url, platform_headers, create_type,
 ):
-    """Seam: repeated fixture publication uses the registry revision contract.
-
-    A second suite using the same registry must admit an identical declaration
-    without creating a revision or failing with already_exists.
-    """
+    """Republishing an identical fixture keeps its registry revision."""
     code = await create_type("repeat")
     async with httpx.AsyncClient(
         base_url=rg_base_url.rstrip("/") + "/",

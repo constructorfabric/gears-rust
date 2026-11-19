@@ -5,11 +5,10 @@
 //! Membership list `$filter` fields: `group_id` (eq, ne, in), `resource_type` (eq, ne, in),
 //! `resource_id` (eq, ne, in).
 //! RG accepts UUID literals with or without single quotes for `group_id`.
-//! `resource_type` takes quoted GTS type path strings; other literal types and
-//! unsupported operators return Invalid Argument (HTTP 400). Values are not
-//! checked against the types registry: a type no membership was stored under
-//! matches no row, so `eq`/`in` select nothing for it and `ne`/`not` select
-//! every row, keeping the predicate's boolean meaning.
+//! `resource_type` takes quoted GTS type paths. Other literal types and
+//! unsupported operators return HTTP 400. Predicates use stored identifiers,
+//! so an unrecognized value matches no rows under `eq`/`in` and all rows
+//! under `ne` or a negated equality.
 
 use toolkit_odata::filter::{FieldKind, FilterField};
 

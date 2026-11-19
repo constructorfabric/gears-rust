@@ -103,15 +103,10 @@ fn normalize_uuid_literal<F: FilterField>(
     Ok(())
 }
 
-/// Lower the validated filter to SQL, accepting only `eq`, `ne` and `in` with
-/// string values on the GTS type field. GTS type predicates compare the stored
-/// key with the dictionary keys of the given identifiers in a subquery
-/// (`key IN (SELECT id FROM gts_type WHERE schema_id IN (...))`, or `NOT IN`
-/// for `ne`), so no key is created or looked up beforehand and the registry is
-/// never consulted. An identifier with no dictionary row contributes no key:
-/// `eq`/`in` match nothing, `ne` matches every row, and `not`/`or`/`and` keep
-/// their boolean meaning (both key columns are `NOT NULL`, so `NOT IN` never
-/// meets `NULL`). Other fields use the shared lowering.
+/// Lower GTS type filters (`eq`, `ne` and `in` on strings) through a dictionary
+/// subquery. Unknown identifiers contribute no keys, so `eq` and `in` match
+/// nothing for them and `ne` matches every row. Non-null keys preserve this
+/// behavior in compound predicates. Other fields use the shared lowering.
 fn filter_to_condition<F, M>(node: &FilterNode<F>, type_field: F) -> Result<Condition, DomainError>
 where
     F: FilterField,

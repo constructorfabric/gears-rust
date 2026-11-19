@@ -135,43 +135,17 @@ impl<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> MembershipService<
         resource_type: &str,
         resource_id: &str,
     ) -> Result<ResourceGroupMembership, DomainError> {
-        // Check the resource identifier's UTF-8 size before any registry or
-        // write work. It is part of the membership primary key (with the group
-        // UUID and the type's dictionary key); the portable bound leaves
-        // PostgreSQL B-tree tuple room. The type identifier is stored as a
-        // key, so its length does not count.
+        // Bound the resource ID before registry I/O. The primary key stores
+        // the type's dictionary key, so the GTS identifier uses no key space.
         if resource_id.len() > MAX_MEMBERSHIP_RESOURCE_ID_BYTES {
             return Err(DomainError::validation(format!(
                 "Membership resource_id must be at most \
                  {MAX_MEMBERSHIP_RESOURCE_ID_BYTES} UTF-8 bytes"
             )));
         }
-        // Tenant compatibility and the membership insert share one
-        // `SERIALIZABLE` transaction (RG-01).
-        //
-        // The check reads a predicate -- "which tenants already own
-        // memberships of this pair" -- and the insert then writes into that
-        // same predicate. Run apart, as they were, two first memberships from
-        // different tenants each read an empty set and both commit, and the
-        // resource ends up owned by two tenants. Run together at the backend
-        // default, each still reads from its own snapshot and neither sees
-        // the other's uncommitted row: `READ COMMITTED` has nothing to say
-        // about rows that did not exist when the statement began.
-        //
-        // At `SERIALIZABLE` that shape is write skew, which is precisely what
-        // PostgreSQL's SSI cancels: the two read/write pairs form a cycle of
-        // rw-antidependencies, one side is cancelled as the pivot with
-        // `40001`, and the retry already wrapping this transaction re-runs
-        // it against the committed winner and rejects. On SQLite writes
-        // serialize regardless, so the same conclusion holds there for a
-        // different reason.
-        //
-        // The type rule comes from the types registry, read before the
-        // transaction opens (no network I/O under an open transaction): the
-        // group's type is immutable, so it is read first -- under the caller's
-        // scope, so a group outside it is "not found" before any type-shaped
-        // answer -- and the transaction re-reads the group and confirms it
-        // still has that type.
+        // Read the group under the caller's scope before fetching its rule
+        // from the registry. Recheck scope and type in the same SERIALIZABLE
+        // transaction as the tenant check and insert (RG-01).
         let db = self.db.db();
         let group_scope = group_scope_for_membership(scope);
         let group = {
@@ -218,14 +192,8 @@ impl<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> MembershipService<
             Box::pin(async move {
                 // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-3
                 // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-4
-                // Verify the group exists and is visible under the caller's
-                // scope, and get its type info. A group outside the scope
-                // is reported exactly like a missing one, so this is not an
-                // existence oracle. The read runs inside the same
-                // SERIALIZABLE transaction as the insert, so a group that
-                // was deleted and re-created with the same id under another
-                // tenant between the check and the insert cannot pass the
-                // gate.
+                // Use the scoped read so an out-of-scope group returns the same
+                // error as a missing group, even if the ID was reused.
                 let group_model = group_repo
                     .find_model_by_id_scoped(tx, &group_scope, group_id)
                     .await?
@@ -245,12 +213,8 @@ impl<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> MembershipService<
                 // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-1
                 // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-2
                 // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-3
-                // DB: does this resource already have a membership owned
-                // by another tenant? An existence check with `LIMIT 1`,
-                // not a count and not a scan of the memberships
-                // themselves. No memberships at all, or only this
-                // tenant's, and the answer is "no conflict" -- the first
-                // membership of a resource may come from any tenant.
+                // Check for any membership in another tenant with `LIMIT 1`.
+                // The first membership may belong to any tenant.
                 let owned_elsewhere = membership_repo
                     .has_membership_in_other_tenant(
                         tx,
@@ -274,11 +238,8 @@ impl<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> MembershipService<
                         resource_id = %resource_id,
                         "Tenant incompatibility on membership add"
                     );
-                    // The message stays generic about *which* tenant owns
-                    // the resource: that id belongs to a tenant other than
-                    // the caller's, and this error reaches the caller
-                    // verbatim over the API (api/rest/error.rs), so it
-                    // must not name it.
+                    // This error reaches the caller verbatim. Keep the other
+                    // tenant's identity private.
                     return Err(DomainError::tenant_incompatibility(format!(
                         "Resource ({resource_type}, {resource_id}) is already \
                              linked to a different tenant"
@@ -292,14 +253,9 @@ impl<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> MembershipService<
                 // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-11
                 // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-12
                 // Insert the membership (repo handles duplicate detection)
-                // The member type is keyed in RG's identity dictionary
-                // only now, after every check that can reject the request:
-                // PostgreSQL does not return identity values on rollback, so
-                // a key taken earlier would burn a `SMALLINT` per rejected
-                // request. The key commits or rolls back with the membership.
-                // Reached only after the registry admitted the member type
-                // (before `BEGIN`): an existing dictionary row is not an
-                // admission.
+                // Registry admission ran before BEGIN. Allocate the key only
+                // after validation, since PostgreSQL identity values survive
+                // rollback even though the dictionary row rolls back.
                 membership_repo
                     .insert(tx, group_id, &resource_type, &resource_id)
                     .await

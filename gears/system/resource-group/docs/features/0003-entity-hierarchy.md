@@ -125,7 +125,7 @@ transaction. The validator checks the actual parent and resulting payload in the
    1. [x] - `p1` - **IF** the schema rejects `parent_type: null` → **RETURN** Validation error - `inst-create-group-5a`
    2. [x] - `p1` - **IF** type code starts with `TENANT_RG_TYPE_PATH` (tenant type) AND there already exists any other root group whose type is a tenant type → **RETURN** `TenantRootAlreadyExists` (409 Conflict) - `inst-create-group-5c`
 6. [x] - `p1` - Before the write transaction, compile the SDK validator from the materialized registry schema - `inst-create-group-5b`
-7. [x] - `p1` - After every rejecting check (a caller-supplied id already taken is rejected first): get or create the type's dictionary key in this transaction, then DB: INSERT INTO resource_group (id, parent_id, gts_type_id, name, metadata, tenant_id) - `inst-create-group-6`
+7. [x] - `p1` - After validation and the caller-supplied ID check, resolve the type key in the transaction and insert the group - `inst-create-group-6`
 7. [x] - `p1` - DB: INSERT INTO resource_group_closure (ancestor_id=id, descendant_id=id, depth=0) — self-row - `inst-create-group-7`
 8. [x] - `p1` - **IF** parent_id is provided - `inst-create-group-8`
    1. [x] - `p1` - DB: INSERT INTO resource_group_closure — ancestor rows from parent's ancestors with depth+1 - `inst-create-group-8a`
@@ -157,7 +157,7 @@ transaction. The validator checks the actual parent and resulting payload in the
    2. [x] - `p1` - Determine whether the current row requires a structural parent change - `inst-update-group-4b`
    3. [x] - `p1` - Escalate an unexpected parent change to a serializable retry before any write - `inst-update-group-4c`
    4. [x] - `p1` - Validate the move with the current parent snapshot, group schema and closure rules - `inst-update-group-4d`
-5. [x] - `p1` - Validate replacement or removal of metadata through the SDK snapshot before the transaction; reject a concurrent unvalidated removal and use the same immutable type inside the write - `inst-update-group-4e`
+5. [x] - `p1` - Compile the schema before the transaction. Validate metadata against the actual parent and require a retry if concurrent metadata would be cleared without validation - `inst-update-group-4e`
 6. [x] - `p1` - DB: UPDATE resource_group SET name, parent_id, metadata, updated_at — preserve type and tenant identifiers - `inst-update-group-5`
 7. [x] - `p1` - **RETURN** updated ResourceGroup - `inst-update-group-6`
 
@@ -410,9 +410,7 @@ REST-level tests for endpoints not covered by existing `api_rest_test.rs`:
 
 ### Current Verification Suites
 
-Tests provision admitted registry definitions before exercising ordinary group
-operations. Test counts are determined by the current suite; the detailed cases
-below retain the supported hierarchy, tenant, metadata and REST behavior plan.
+Tests publish type definitions before exercising group operations.
 
 | Suite | Contract |
 | --- | --- |
@@ -733,10 +731,9 @@ Each chained RG type may constrain the group payload, including metadata, with f
 
 Registry admission validates the authored schemas. These cases verify the runtime payload validation path through the registry SDK using the materialized full schema and the group metadata payload.
 
-`RegistryTypeCatalog` reads content and resolved schema through `TypesRegistryApi`.
-`RgType` compiles the public SDK payload validator and services validate the full
-payload before opening the write transaction. The cases below exercise inherited
-constraints and metadata rules through that implemented path.
+`RegistryTypeCatalog` fetches the schema through `TypesRegistryApi` and
+`RgType` compiles the SDK validator before the transaction. Services validate
+the payload with the actual parent in the transaction.
 
 ##### Tenant metadata (`self_managed: boolean`, `custom_domain: hostname`)
 
@@ -1157,8 +1154,5 @@ GET /groups/{root.id}                            → 404
 
 ### Registry Migration Verification
 
-The cases above use admitted type declarations and immutable GTS identifiers.
-The removed local type CRUD and seed-service cases are replaced by the managed
-admission, consumer provisioning and migration coverage in feature 0002. The
-local SQLite E2E harness does not discharge PostgreSQL-specific claims; dedicated
-backend suites verify those behaviors.
+See [feature 0002](0002-type-management.md#7-verification) for managed
+admission, consumer provisioning and migration tests on both backends.

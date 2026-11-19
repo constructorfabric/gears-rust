@@ -11,19 +11,15 @@ release-plz updates this file in the Release PR.
 
 ### Breaking changes
 
-- Resource Group type definitions now live in Types Registry. The former
-  `/types-registry/v1/types` and `/types-registry/v1/types/{code}` CRUD routes,
-  SDK type CRUD methods and `ResourceGroupTypeBootstrap` are removed. Publish
-  declarations through Types Registry's platform API or managed GTS publication.
-  Export and publish custom type definitions before upgrading: the irreversible
-  RG database migration drops the local definitions (metadata schemas and
-  placement rules) and keeps `gts_type` only as an identity dictionary of type
-  keys, preserving its keys, groups, memberships and hierarchy data. A
-  dictionary row does not admit a type; new links still require it to be
-  registered and active in Types Registry. Membership `resource_id` is limited
-  to 2600 UTF-8 bytes (`MAX_MEMBERSHIP_RESOURCE_ID_BYTES`); the migration
-  refuses databases holding longer identifiers. See the
-  [Resource Group design](gears/system/resource-group/docs/DESIGN.md).
+- Resource Group type definitions moved to Types Registry. The legacy
+  `/types-registry/v1/types` and `/types-registry/v1/types/{code}` routes,
+  SDK type CRUD and `ResourceGroupTypeBootstrap` are removed.
+- Export custom definitions and publish their schemas through Types Registry
+  before upgrading. The irreversible migration drops local schemas and
+  placement rules while preserving `gts_type` keys, groups, memberships and
+  hierarchy. New links still require active registry types. Preflight rejects
+  membership IDs over 2600 UTF-8 bytes (`MAX_MEMBERSHIP_RESOURCE_ID_BYTES`).
+  See [Upgrading Resource Group](gears/system/resource-group/docs/DESIGN.md#upgrading-resource-group).
 
 ## [0.3.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-llm-gateway-sdk-v0.3.1...cf-gears-llm-gateway-sdk-v0.3.2) - 2026-11-18
 

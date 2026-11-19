@@ -1,10 +1,5 @@
-//! The RG type definitions resource-group consults, owned by the types registry.
-//!
-//! Resource-group keeps no type definitions. A group or membership references its
-//! GTS type identifier through a local identity dictionary key; the definition
-//! behind it is read from the
-//! registry when a write needs it, before the write's transaction opens. Reads
-//! and cleanup of existing rows never consult it.
+//! Resolve Types Registry definitions before type-dependent writes.
+//! Reads and cleanup resolve stored identifiers through the local dictionary.
 
 use async_trait::async_trait;
 use resource_group_sdk::gts::GROUP_MEMBERSHIP_RESOURCE_TYPE;

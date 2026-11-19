@@ -190,21 +190,18 @@ Each variant **MUST** carry structured context (field details for Validation, en
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-dod-sdk-foundation-persistence`
 
-The system **MUST** define SeaORM entity models and executable migrations for the
-three RG tables. Group and membership repository traits are injected into domain
-services; group persistence owns closure-table maintenance. `RgTypeCatalog` is the
-separate registry port for definitions, without a local type repository.
+The system **MUST** define SeaORM entities and migrations for the RG tables.
+Domain services use injected repositories. Group persistence maintains closure
+rows, and `RgTypeCatalog` resolves registry definitions.
 
 **Required tables**:
-- `resource_group` — UUID primary key, parent and tenant UUIDs, GTS type identifier, name, metadata and timestamps.
-- `resource_group_membership` — composite key of group UUID, resource GTS type identifier and resource ID, plus creation timestamp.
+- `resource_group` — UUID primary key, parent and tenant UUIDs, GTS type key, name, metadata and timestamps.
+- `resource_group_membership` — composite key of group UUID, member type key and resource ID, plus creation timestamp.
 - `resource_group_closure` — ancestor/descendant UUID key and integer depth, with group foreign keys and traversal indexes.
 
-Type identifiers are constrained text values. There is no cross-database foreign
-key to Types Registry. The migration copies existing type identifiers before
-removing the local type and allowed-type tables; existing hierarchy rows and
-memberships are preserved. SQLite and PostgreSQL migration tests verify those
-constraints and rollback behavior.
+The `gts_type` dictionary maps local keys to GTS identifiers. The migration
+drops local definitions and preserves keys, hierarchy and memberships. SQLite
+and PostgreSQL tests cover these invariants, constraints and rollback.
 
 ### Gear Scaffold and Initialization
 
@@ -559,7 +556,6 @@ assert all 5 created IDs present                 (no missing)
 
 ### Registry Migration Verification
 
-The retained cases above are supplemented by managed admission and identifier
-migration coverage in feature 0002. E2E type fixtures publish through the platform
-API and repeat identical declarations under the current registry version. The
-local SQLite harness does not replace PostgreSQL backend tests.
+[Feature 0002](0002-type-management.md#7-verification) covers managed admission
+and migration on both backends. E2E fixtures repeat identical publication
+through the platform API using the current registry version.

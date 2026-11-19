@@ -3081,17 +3081,64 @@ Rust API; REST contracts and dependency versions are unchanged.
 **Description:** Complete each remaining non-BSS consumer end to end while legacy remains available to other groups. Scope includes declarations-only owners, not just `TypesRegistryClient` matches.
 
 **Slices (each includes its plugins, tests and dependent fixtures):**
-- [ ] Resource-group, then OAGW host/startup closure; migrate OAGW UUID-tail provisioning identities and `seed_legacy_registry_fixtures` together with its reader. Baseline before the RG slice: resource-group's `validate_metadata_via_gts` read the legacy catalogue and skipped validation on `NotFound`, so group metadata of an RG type that existed only in the managed catalogue was accepted unvalidated; the RG part below is now completed (the OAGW part of this item remains open). **RG scope (extended, agreed 2026-11-11): the persisted registry is the only catalogue of RG type definitions.**
-  - [x] Remove RG's editable catalogue: `gts_type_allowed_parent`/`gts_type_allowed_membership`, `gts_type.metadata_schema`, `TypeService`/`TypeRepository`, type CRUD on `ResourceGroupClient`, REST `/types-registry/v1/types*`, `ResourceGroupTypeBootstrap` and its seal, type seeding. RG keeps groups, closure and memberships, each referencing its GTS type by the existing `SMALLINT` key. **Amended 2026-11-17:** `gts_type` stays as a local identity dictionary (`id`, `schema_id`, `created_at`) instead of storing identifier text in every row; a dictionary row neither defines nor admits a type (definitions, traits, validation and lifecycle stay registry-only), keys are created on first use inside the write transaction after every rejecting check, and rows are never updated or deleted, so reads and cleanup work without the registry. External SDK/REST identifiers stay strings. No local mirror of definitions, sync or own cache; reads use the public SDK `ReadOptions` (no T36 decorator exists yet — T36 stays a fleet acceptance gate, see Dependencies).
-  - [x] RG SDK declares the base `gts.cf.core.rg.type.v1~` with `x-gts-traits-schema` (`can_be_root`, `allowed_parent_types`, `allowed_membership_types`, defaults false/[]/[]); RG publishes it with `gts_publication(...)`. Placement and membership rules read `effective_traits`. Moving traits into the schema is out of scope.
-  - [x] Schemas and traits come only from the registry's materialized `Content`/`ResolvedSchema`/`EffectiveTraits` through the SDK API; payload validation uses `TypeSchema::compile_payload_validator()` (or another SDK helper). RG runtime has no own `allOf`/property merge, sub-schema extraction or direct `jsonschema` validator. RG validates its own domain envelope (the group payload carrying `metadata`) against the unmodified resolved schema. A regression proves inherited metadata constraints and a nested `$ref` on a managed schema and fails if RG bypasses the SDK.
-  - [x] Owners publish RG types before application `init`: AM declares its user-group container and user member-handle as AM-owned GTS types (same identifiers as today) and drops `register_user_group_types`. Tests/e2e publish fixtures through the platform API.
-  - [x] Request-path reads use `TypesRegistryApi` with the caller's `SecurityContext`; 401/403/unavailable propagate, no fallback. Registry I/O never runs inside a DB transaction: create, move and add-membership take a managed snapshot before `BEGIN` (the type of an existing group is immutable).
-  - [x] Failure semantics, each with a test (no `NotFound` skip): a new group requires an Active type — unknown or deleted is `TypeNotFound`; a new membership requires an Active group type (unknown or deleted: `TypeNotFound`) and an Active, concrete member resource type (unknown, deleted, malformed, wildcard or instance identifier: `Validation`, 400); an update or move of an existing group applies its type's exact definition, deleted included (the registry retains its content), and an unknown type is `TypeNotFound`; get/list of groups and memberships and their cleanup (remove membership, delete group, force delete) use stored type keys resolved through the identity dictionary only, never create keys and never consult the registry, so a deleted or narrowed type never blocks reads or deletion. Update/move keep the scoped group lookup ahead of any type error and recheck the group's actual type and parent inside the transaction.
-  - [x] Deliberately dropped: RG's refusal to narrow `can_be_root` / allowed parents / memberships while rows depend on them. Narrowing a type no longer checks existing rows; no cross-service validation callback or distributed transaction replaces it.
-  - [x] Forward DB migration (PostgreSQL, SQLite; RG has never supported MySQL), `m20261111_000001_gts_type_dictionary` (amended 2026-11-17, replacing the earlier text-identifier rewrite): drops the placement-rule tables and `gts_type.metadata_schema`/`updated_at`, keeps every `gts_type` key/identifier/timestamp (unreferenced rows included), the numeric `gts_type_id` foreign keys, groups, closure and memberships untouched, and adds `ck_rgm_resource_id_bytes` (`resource_id` ≤ 2600 UTF-8 bytes, preflighted before any DDL; SQLite rebuilds only the membership table). One transaction with its history record; `down()` refuses (restore the pre-upgrade backup). Historical migrations are untouched. The migration cannot publish and drops the only copy of any definition held in RG's catalogue. Operator order for custom types known only to an old RG database: export them while the old version still serves them — every page of `GET /types-registry/v1/types` (cursor-paginated: follow `page_info.next_cursor` until it is empty) — or back up the database; convert each legacy `TypeDto` into a GTS Type Schema (`$id` = `gts://<code>`, derived from `gts.cf.core.rg.type.v1~` through `allOf`/`$ref` to its chain parent, `x-gts-traits` = `can_be_root`/`allowed_parent_types`/`allowed_membership_types`, a non-null `metadata_schema` becoming `properties.metadata`) rather than submitting the DTO as is; publish them to the types registry (owner `gts_publication` or the platform API) before the upgrade — or after it, only from that saved export/backup; there is no runtime fallback. Existing groups and memberships keep their type keys and identifiers either way: reads and cleanup work without a definition, while create, move, metadata update and new memberships refuse an unpublished type (`TypeNotFound`) until it is published.
-  - Evidence (RG slice, 2026-11-11; commits `0d018a34e`, `01e35ad06`, `2284a77f0`, `d8c49a00d` and the S5 fixtures/docs commit): `cargo test -p cf-gears-resource-group` (19 binaries incl. `registry_types_test`, then `migration_gts_type_identifiers_test`), `RG_PG_REQUIRE_DOCKER=1 cargo test -p cf-gears-resource-group --features integration --test pg_migration_gts_type_identifiers_test --test pg_smoke_test --test pg_concurrency_test`, `cargo test -p cf-gears-resource-group-sdk`, `cargo test -p cf-gears-account-management`, `cargo test -p cf-gears-resource-group --test managed_types_admission_test` (real admission incl. upgrade from the previously seeded base), `cargo test -p cf-gears-rg-tr-plugin`, clippy `--all-targets -D warnings` on RG/RG-SDK/AM, `cargo check --all-targets` on every RG-SDK dependent, `make e2e-local SUITE=resource_group` (14 passed; types published only through the platform API, `/types-registry/v1/types*` 404/405 and absent from OpenAPI) and `SUITE=account_management` (22 passed). Not run here: `make cfs-validate` (no `cfs`/`pipx` locally), OAGW, remote-AM (T41), T36 (no SDK cache: reads are uncached until T36 lands).
-  - Evidence (identity-dictionary amendment, 2026-11-17, uncommitted at the time of writing): `cargo test -p cf-gears-resource-group` (all SQLite targets, incl. `migration_gts_type_dictionary_test` with post-DDL rollback, `registry_types_test` proving an existing key admits no deleted/unknown type and reads create no keys, `db_behavior_audit_test`); `RG_PG_REQUIRE_DOCKER=1 cargo test -p cf-gears-resource-group --features integration --test pg_migration_gts_type_dictionary_test --test pg_smoke_test --test pg_concurrency_test` (rejected creates and duplicate caller ids consume no identity values; concurrent and forced-overlap first uses converge, SERIALIZABLE via typed retry and READ COMMITTED via `ON CONFLICT` re-read; each regression checked against a mutant); `cargo test -p cf-gears-resource-group-sdk`; `cargo test -p cf-gears-toolkit-db` secure unit tests and `--features integration,pg --test group_scope_postgres`.
+- [ ] OAGW host/startup closure. Migrate the UUID-tail provisioning identities
+  and `seed_legacy_registry_fixtures` with the reader.
+- [x] Resource Group. Types Registry now owns all RG definitions (scope agreed
+  2026-11-11). Previously, a legacy catalogue miss let managed-only metadata
+  bypass validation.
+  - [x] Remove local type CRUD, bootstrap and its seal, type seeding, and
+    `TypeService`/`TypeRepository`. Keep `gts_type` as an immutable identity
+    dictionary (amended 2026-11-17). Allocate `SMALLINT` keys only after
+    validation, within the referencing write transaction. SDK and REST still
+    expose string IDs. Use SDK `ReadOptions` directly pending the T36 cache gate.
+  - [x] Publish the abstract group and membership bases via `gts_publication`.
+    Group payloads validate `parent_type` and metadata. The effective
+    `membership_type` trait binds the schema that validates member resource types.
+    AM publishes its own group, membership and user schemas before `init`.
+    E2E fixtures publish through the platform API.
+  - [x] Use the SDK's `Content`, `ResolvedSchema` and `EffectiveTraits`
+    projections and `TypeSchema::compile_payload_validator()`. Tests cover
+    inherited metadata constraints and nested references on the unmodified
+    materialized schema.
+  - [x] Fetch snapshots through `TypesRegistryApi` with the caller's context
+    before opening write transactions. Preserve 401/403 and unavailable
+    responses. Scoped group lookup precedes type errors. Updates and moves
+    recheck the stored type and actual parent in the transaction.
+  - [x] Require active group and membership schemas for new links. Unknown or
+    deleted group types return `TypeNotFound` when an active definition is
+    required. Invalid member types return `Validation` (400). Type-dependent
+    updates and moves accept retained deleted group definitions. Reads and
+    cleanup use stored keys without allocating keys or calling the registry.
+    See [lifecycle and failure cases](../../../resource-group/docs/DESIGN.md#registry-lifecycle-and-failure-behavior).
+  - [x] Apply current schemas to writes. Publication can change type rules
+    without scanning existing RG rows or coordinating across services.
+  - [x] Migrate PostgreSQL and SQLite with
+    `m20261111_000001_gts_type_dictionary`. Preserve all dictionary rows and
+    existing foreign keys, and keep historical migrations intact. Drop the
+    definition columns and placement-rule tables. Preflight the 2600-byte
+    `ck_rgm_resource_id_bytes` limit before DDL. The migration and history
+    record commit together. See [operator steps and rollback](../../../resource-group/docs/DESIGN.md#upgrading-resource-group).
+  - Evidence, 2026-11-11 (`0d018a34e`, `01e35ad06`, `2284a77f0`, `d8c49a00d`
+    and S5 fixtures/docs). Cargo tests passed for RG (19 binaries), RG SDK, AM
+    and `cf-gears-rg-tr-plugin`. `managed_types_admission_test` exercised real
+    admission from the seeded base. The Docker-required RG integration run
+    passed `pg_migration_gts_type_identifiers_test`, `pg_smoke_test` and
+    `pg_concurrency_test`. Clippy with `--all-targets -D warnings` passed on
+    RG, RG SDK and AM. `cargo check --all-targets` passed on RG SDK dependents.
+    `make e2e-local` passed for `SUITE=resource_group` (14, including platform
+    publication and retired routes returning 404/405 and absent from OpenAPI)
+    and `SUITE=account_management` (22). CFS validation was pending locally
+    (`cfs`/`pipx` required), along with OAGW, remote AM (T41) and the SDK cache (T36).
+  - Evidence, 2026-11-17 dictionary amendment. RG's SQLite tests covered
+    rollback after DDL, rejection of deleted or unknown types with existing
+    keys, and reads that allocate no keys. `db_behavior_audit_test` passed.
+    The Docker-required PostgreSQL lane passed
+    `pg_migration_gts_type_dictionary_test`, `pg_smoke_test` and
+    `pg_concurrency_test`. Mutants verified rejection without consuming
+    identity values and convergent first-use races through serializable retry
+    or a read-committed `ON CONFLICT` re-read. RG SDK and toolkit-db secure
+    unit tests passed, as did toolkit-db's
+    `--features integration,pg --test group_scope_postgres`.
 - [ ] Quota-enforcement + storage plugin; consume materialized `resolved_schema`/`effective_traits`, retain catalogue checks and compile validators once at bootstrap (detailed requirements remain in T38)
 - [ ] License-resolver + static-license and license-enforcement; usage-collector + noop/ClickHouse/TimescaleDB
 - [ ] Event-broker declarations and cluster SDK ownership; event-broker's platform reads already exist. For system-group owners respect T37's prohibition on system publication capabilities: decide the supported seed/owner path before adding an attribute

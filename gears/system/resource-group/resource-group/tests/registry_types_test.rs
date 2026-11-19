@@ -757,10 +757,8 @@ async fn a_failed_membership_insert_keys_no_type() {
     assert_eq!(dictionary_rows(&db).await, before);
 }
 
-/// A dictionary key is identity only: a type whose key already exists --
-/// from earlier groups and memberships, or created directly -- is still
-/// refused new links once the registry no longer has it Active (or never had
-/// it), and the refusal adds nothing to the dictionary.
+/// Existing keys do not admit deleted or unpublished types for new links.
+/// Rejected writes add no dictionary rows.
 #[tokio::test]
 async fn an_existing_dictionary_key_does_not_admit_a_deleted_or_unknown_type() {
     use resource_group::domain::repo::GroupRepositoryTrait;

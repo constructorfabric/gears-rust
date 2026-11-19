@@ -1,40 +1,22 @@
-//! RG's type catalogue shrinks to a local identity dictionary (T38b: the types
-//! registry is the only catalogue of type definitions).
+//! Convert RG's local catalogue to a GTS identity dictionary (T38b).
 //!
-//! `gts_type` keeps `id` (the `SMALLINT` key groups and memberships reference
-//! through their existing foreign keys), `schema_id` (the full GTS type
-//! identifier, unique) and `created_at`. Everything that defined a type --
-//! `metadata_schema`, the `gts_type_allowed_parent` / `gts_type_allowed_membership`
-//! placement rules -- is dropped; `updated_at` goes too, as dictionary rows are
-//! immutable. Groups, memberships, closure rows and every dictionary row stay
-//! as they are, including rows for types nothing references any more: a
-//! dictionary row only maps a key to an identifier and proves nothing about the
-//! type's existence, admission or lifecycle in the registry.
+//! Keep all `gts_type` IDs, identifiers and creation timestamps, including
+//! unreferenced entries, and preserve groups, memberships, closure rows and
+//! their foreign keys. Drop the placement-rule tables and the
+//! `metadata_schema` and `updated_at` columns.
 //!
-//! The membership primary key is `(group_id, gts_type_id, resource_id)`, so the
-//! external resource identifier must fit PostgreSQL's B-tree item limit (2704
-//! bytes on standard 8 KiB pages) together with the 16-byte UUID, the 2-byte
-//! type key and the tuple and varlena headers. Both backends therefore bound
-//! `resource_id` to 2600 UTF-8 bytes (`ck_rgm_resource_id_bytes`). A preflight
-//! refuses old oversized identifiers before any DDL; remap or remove them with
-//! the owning gear before upgrading. PostgreSQL adds the constraint in place;
-//! SQLite cannot add a constraint, so it rebuilds the membership table (nothing
-//! references it).
+//! The membership key includes a UUID, a type key and `resource_id`. The
+//! 2600-byte UTF-8 limit leaves room for those fields and headers within the
+//! PostgreSQL B-tree limit (2704 bytes on standard 8 KiB pages). Preflight
+//! rejects oversized legacy IDs before DDL. PostgreSQL adds the check in
+//! place. SQLite rebuilds the unreferenced membership table.
 //!
-//! The runtime applies the migration and its history record in one transaction
-//! (DDL is transactional on both backends), so a refusal leaves the previous
-//! schema untouched. MySQL is refused, as by the initial migration.
-//!
-//! The dropped definitions are not carried anywhere: the migration cannot
-//! publish them to the types registry. Types defined only in an old RG database
-//! must be exported (or the database backed up) before upgrading and published
-//! by their owners. Until then their groups and memberships stay readable and
-//! deletable, and refuse new links, moves and metadata updates.
-//!
-//! `down()` refuses: the definitions cannot be rebuilt from the identifiers
-//! that remain, and recreating empty rule tables would hand the previous
-//! release a catalogue that silently says "no parents, no members" for every
-//! type. Roll back by restoring the pre-upgrade backup.
+//! Both backends apply the DDL and history record in one transaction. MySQL
+//! is unsupported. Export custom definitions or back up the old database
+//! before upgrading. Until owners publish them, existing rows remain readable
+//! and removable, while new links, moves and metadata updates need a published
+//! definition. Restore the backup to roll back because `down()` cannot
+//! reconstruct the dropped rules.
 
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::sea_orm::{ConnectionTrait, Statement};

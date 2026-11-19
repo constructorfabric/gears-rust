@@ -121,9 +121,7 @@ async def publish_rg_type(
     parent_type: Optional[dict] = None,
     resource_type: Optional[dict] = None,
 ) -> str:
-    """Publish an RG type through the types registry's platform API and wait
-    for its admission. Existing declarations use a version-matched revision
-    so successive suite runs sharing a registry can publish the same type."""
+    """Publish and await admission. Reuse the current version for existing types."""
     async with httpx.AsyncClient(
         base_url=base_url.rstrip("/") + "/", headers=_platform_headers(), timeout=10.0
     ) as platform:

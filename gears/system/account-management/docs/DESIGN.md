@@ -221,7 +221,7 @@ AM does not enforce access-control barriers. It stores the `self_managed` flag o
 
 - [ ] `p2` - **ID**: `cpt-cf-account-management-principle-delegation-to-rg`
 
-User group hierarchy, membership storage, cycle detection, and tenant-scoped isolation are handled by the Resource Group gear. AM publishes the user-group RG type declarations with its types-registry manifest and triggers RG cleanup during tenant hard-deletion. Consumers call `ResourceGroupClient` directly for all group and membership operations — AM does not proxy or coordinate these calls. AM's user-list endpoint (`GET /tenants/{id}/users`) provides the valid user set; callers combine it with RG's membership API.
+Resource Group owns hierarchy, membership storage, cycle detection and tenant isolation. AM publishes the user-group schemas and triggers RG cleanup at tenant hard-deletion. Consumers pair `GET /tenants/{id}/users` with `ResourceGroupClient` for membership writes.
 
 **Drivers**: `cpt-cf-account-management-fr-user-group-rg-type`, `cpt-cf-account-management-fr-user-group-lifecycle`, `cpt-cf-account-management-fr-user-group-membership`, `cpt-cf-account-management-fr-nested-user-groups`
 
@@ -400,7 +400,7 @@ When strict-mode enforcement is active, AM validates the chained schema identifi
 3. Validate the requested parent-child type relationship against the GTS `allowed_parent_types` rules — reject with `CanonicalError::FailedPrecondition` (HTTP 400, `reason=TYPE_NOT_ALLOWED`) if not permitted
 4. Call `IdpPluginClient::provision_tenant`; provider implementations create tenant-scoped resources or reuse shared ones based on deployment-specific behavior and tenant traits such as `idp_provisioning`. Providers **MUST NOT** silently no-op — unsupported operations **MUST** fail with `CanonicalError::Unimplemented` (HTTP 501)
 
-**User-group Resource Group type schema:** AM declares the chained RG type `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` — [user_group.v1.schema.json](./schemas/user_group.v1.schema.json). The schema reuses the RG base contract and accepts an omitted or empty `metadata` object in v1. The authoritative declaration is `UserGroupTypeV1` in `account-management/src/gts/rg_types.rs`, published with AM's types-registry manifest. The JSON file is a documentation copy. The chained GTS `$id` identifies the AM user-group type as a derivative of the RG base type.
+`UserGroupTypeV1` in `account-management/src/gts/rg_types.rs` derives `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` from the RG base and allows omitted or empty `metadata` in v1. AM publishes it with its manifest. See the [schema reference](./schemas/user_group.v1.schema.json).
 
 **Member resource type:** The bound membership schema accepts the AM user resource type `gts.cf.core.am.user.v1~` and its derived types as `resource_type`. The `x-gts-type-ref` on `resource_type` selects that family. [User resource schema](./schemas/user.v1.schema.json)
 
@@ -923,7 +923,7 @@ This interface exposes raw and resolved tenant metadata keyed by registered GTS 
 
 | Dependency Gear    | Interface Used | Purpose |
 |-------------------|----------------|---------|
-| [Resource Group](../../resource-group/docs/PRD.md) | `ResourceGroupClient` (SDK trait via ClientHub) | AM publishes its user-group RG type declarations through the types registry (not through RG), uses RG ownership-graph reads to verify that no tenant-owned resource associations remain before soft deletion, and triggers tenant-scoped group cleanup during hard-deletion. If RG is unavailable during deletion validation, AM fails the operation with `service_unavailable` rather than proceeding. Consumers call `ResourceGroupClient` directly for all group lifecycle, membership, and hierarchy operations. |
+| [Resource Group](../../resource-group/docs/PRD.md) | `ResourceGroupClient` (SDK trait via ClientHub) | AM checks for tenant-owned associations before soft deletion and triggers group cleanup at hard-deletion. Unavailable RG reads fail deletion validation with `service_unavailable`. Consumers call RG directly for groups and memberships. |
 | GTS Types Registry | `PlatformTypesRegistryApi` (SDK trait via ClientHub) | Startup publication of AM declarations (including its user-group and membership schemas), runtime tenant type definitions, parent-child constraint validation, and metadata schema validation. |
 
 **Dependency Rules** (per project conventions):

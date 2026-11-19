@@ -1,8 +1,7 @@
 //! [`RgTypeCatalog`] over the types registry's tenant API (`TypesRegistryApi`).
 //!
-//! Every read carries the caller's `SecurityContext`. Reads go through the
-//! public SDK reads and `ReadOptions`; there is no adapter cache or local
-//! catalogue (the SDK client cache, T36, is a separate fleet gate).
+//! Forward the caller's `SecurityContext` and use the SDK's `ReadOptions`.
+//! The adapter reads directly from the registry until the SDK cache (T36).
 
 use std::sync::Arc;
 
@@ -38,9 +37,8 @@ fn registry_failure(error: CanonicalError, code: &str) -> DomainError {
         CanonicalError::Unauthenticated { .. } | CanonicalError::PermissionDenied { .. } => {
             DomainError::RegistryRefusedCaller(error)
         }
-        // A read the registry aborted (`Aborted`) is a conflict inside the
-        // registry, not with this request: RG has not opened its transaction
-        // yet, so the caller retries the whole operation, as for an outage.
+        // A registry-aborted read is retryable like an outage. RG's
+        // transaction has yet to start.
         CanonicalError::ServiceUnavailable { .. }
         | CanonicalError::DeadlineExceeded { .. }
         | CanonicalError::ResourceExhausted { .. }

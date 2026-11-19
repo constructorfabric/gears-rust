@@ -6,16 +6,10 @@ decision-makers: Constructor Fabric Steering Committee
 
 # ADR-001: GTS Type System for Resource Group
 
-> The managed Types Registry migration supersedes this decision's local type
-> definitions (metadata schemas, placement-rule junction tables) and RG type
-> CRUD. The `SMALLINT` surrogate keys are retained, as a local identity
-> dictionary (`gts_type`: key ↔ GTS identifier) that holds no definitions and
-> admits no type. Group and membership schemas now define placement and
-> membership policy. See [the current DESIGN](../DESIGN.md) for publication,
-> persistence and retirement
-> behavior. The sections below are historical: they describe the earlier
-> implementation, including the junction tables and DB-level relationship
-> enforcement that no longer exist.
+> This ADR records the historical junction-table design. Types Registry now
+> owns the schemas for placement and membership. RG retains `gts_type` as the
+> `SMALLINT` key-to-identifier dictionary. See the [current design](../DESIGN.md)
+> for publication, persistence and retirement behavior.
 
 <!-- toc -->
 
@@ -718,7 +712,7 @@ This decision directly addresses the following requirements and design elements:
 
 * `cpt-cf-resource-group-fr-manage-types` — GTS type system defines how types are identified, composed, and validated
 * `cpt-cf-resource-group-fr-validate-parent-type` — Junction tables enforce parent type compatibility at DB level
-* `cpt-cf-resource-group-constraint-gts-identifiers` — the managed-registry migration replaces the original SMALLINT catalog keys with stored GTS identifiers
+* `cpt-cf-resource-group-constraint-gts-identifiers` — the dictionary keeps SMALLINT keys and maps them to GTS identifiers
 * `cpt-cf-resource-group-constraint-db-agnostic` — GTS path validation at application layer for non-PostgreSQL backends
 * `cpt-cf-resource-group-principle-dynamic-types` — GTS enables runtime-configurable type definitions
 * `cpt-cf-resource-group-principle-barrier-as-data` — Barrier stored in `metadata` JSONB per GTS derived type schema

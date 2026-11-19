@@ -1,17 +1,9 @@
-//! RG-local GTS type identity dictionary (`gts_type`).
+//! Maps stored `SMALLINT` keys to GTS type identifiers via `gts_type`.
 //!
-//! Groups and memberships store a `SMALLINT` key; this module maps it to and
-//! from the full GTS type identifier. The dictionary holds no definitions: a
-//! row proves nothing about the type in the types registry (existence,
-//! admission, lifecycle), and rows are never updated or deleted, so reads and
-//! cleanup keep working for types the registry no longer has.
-//!
-//! Only [`ensure_key`] writes, and only the write paths that link a new group
-//! or membership call it -- after the registry admitted the type (before
-//! `BEGIN`), inside the same transaction as the row that references the key,
-//! so a failed operation leaves no dictionary row behind. Reads, filters and
-//! deletes look keys up and treat a missing row as "nothing stored under this
-//! type".
+//! Rows are immutable, so reads and cleanup work after type retirement.
+//! [`ensure_key`] runs after registry admission and in the same transaction
+//! as the referencing write. Reads, filters and deletes treat a missing
+//! identifier as having no stored groups or memberships.
 
 use std::collections::HashMap;
 
@@ -55,21 +47,14 @@ pub async fn find_key(
 
 /// The key for `schema_id`, creating the dictionary row on first use.
 ///
-/// Reads first, so the common case (type already known) inserts nothing and,
-/// on PostgreSQL, consumes no identity value: the `SMALLINT` sequence is
-/// spent only by genuinely new types, by a first use whose transaction rolls
-/// back, and by the losing side of a first-use race.
+/// Look up existing keys before inserting to conserve PostgreSQL's
+/// `SMALLINT` sequence. First-use races and rollbacks can still consume values.
 ///
-/// Callers run this inside their write transaction, so the row commits or
-/// rolls back with the group or membership that references it. The insert
-/// is `ON CONFLICT (schema_id) DO NOTHING`, so a concurrent first use never
-/// raises a unique violation (which would abort a PostgreSQL transaction).
-/// Under `SERIALIZABLE`, a conflicting row committed after this
-/// transaction's snapshot makes PostgreSQL fail the insert with a
-/// serialization error; driver errors stay typed ([`DomainError::Database`]),
-/// so that reaches the caller's retry loop, whose next attempt reads the
-/// winner's row. At weaker levels (and on SQLite) the conflict is reported
-/// as "not inserted" and the committed row is re-read.
+/// Use the same transaction as the referencing write. With
+/// `ON CONFLICT (schema_id) DO NOTHING`, a concurrent first use re-reads the
+/// winner's row on SQLite or at weaker PostgreSQL isolation levels. At
+/// `SERIALIZABLE`, a conflict outside the snapshot returns a typed
+/// [`DomainError::Database`] for the caller to retry.
 pub async fn ensure_key(db: &impl DBRunner, schema_id: &str) -> Result<GtsTypeKey, DomainError> {
     if let Some(key) = find_key(db, schema_id).await? {
         return Ok(key);
@@ -148,11 +133,9 @@ pub async fn find_path(db: &impl DBRunner, key: GtsTypeKey) -> Result<String, Do
     find_paths(db, [key]).await?.code(key)
 }
 
-/// `SELECT id FROM gts_type WHERE schema_id IN (schema_ids)`: a subquery for
-/// SQL predicates on a stored key column. An identifier with no row
-/// contributes nothing, so `key IN (...)` is false and `key NOT IN (...)` is
-/// true for it (both columns are `NOT NULL`) -- the boolean meaning of the
-/// public string predicate survives `NOT`, `OR` and `in`.
+/// Select dictionary keys for SQL predicates. Unknown identifiers contribute
+/// no keys. Both columns are `NOT NULL`, preserving boolean semantics for
+/// `IN`, `NOT IN` and compound predicates.
 pub fn keys_subquery<I, S>(schema_ids: I) -> SelectStatement
 where
     I: IntoIterator<Item = S>,

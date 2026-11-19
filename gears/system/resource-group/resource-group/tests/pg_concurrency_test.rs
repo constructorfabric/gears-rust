@@ -907,12 +907,9 @@ fn root_type(suffix: &str) -> CreateTypeRequest {
     }
 }
 
-/// PostgreSQL does not return identity values on rollback, so a key taken
-/// before a deterministic rejection would burn one `SMALLINT` per rejected
-/// request (and a client could exhaust the dictionary). Placement rejections
-/// and a duplicate caller-supplied id, repeated with admitted types that have
-/// no key yet, must leave the identity sequence where it was; a type already
-/// keyed must not take another value on success.
+/// PostgreSQL identity values survive rollback. Repeated placement and
+/// duplicate-ID rejections must leave the SMALLINT sequence untouched, as
+/// must successful writes that reuse an existing key.
 #[tokio::test]
 async fn deterministic_rejections_do_not_consume_dictionary_identities() {
     let Some(fix) = pg_fixture().await else {
@@ -1133,12 +1130,9 @@ async fn concurrent_first_use_converges_on_one_dictionary_key() {
     assert!(rows.iter().all(|m| m.gts_type_id == member_key));
 }
 
-/// Forced overlap of two first uses of one identifier: both `SERIALIZABLE`
-/// transactions read "no key" (fixing their snapshots) before either
-/// inserts. The loser's `ON CONFLICT DO NOTHING` then meets a row committed
-/// after its snapshot, which PostgreSQL reports as a serialization failure;
-/// the typed error reaches `transaction_with_retry`, whose next attempt reads
-/// the winner's row. Both end with the same key and there is one row.
+/// Both `SERIALIZABLE` transactions see no key before either inserts. The
+/// loser gets a typed serialization error and `transaction_with_retry` reads
+/// the winner's key on retry. Both resolve to one row.
 #[tokio::test]
 async fn forced_first_use_overlap_retries_and_converges() {
     let Some(fix) = pg_fixture().await else {
@@ -1151,9 +1145,8 @@ async fn forced_first_use_overlap_retries_and_converges() {
     );
 }
 
-/// The same overlap below `SERIALIZABLE`: the loser's insert waits for the
-/// winner, `ON CONFLICT DO NOTHING` turns the conflict into "not inserted",
-/// and the re-read sees the committed row -- no unique violation, no retry.
+/// At lower isolation, `ON CONFLICT DO NOTHING` lets the losing insert
+/// re-read the committed key without retrying.
 #[tokio::test]
 async fn forced_first_use_overlap_at_read_committed_rereads_the_winner() {
     let Some(fix) = pg_fixture().await else {

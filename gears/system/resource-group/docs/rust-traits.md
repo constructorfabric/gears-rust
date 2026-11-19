@@ -94,10 +94,7 @@ setters add the optional ID, parent, target tenant and metadata.
 registers each under its own ClientHub trait key. Both share the underlying group
 and membership services.
 
-RG publishes its base GTS schema from the SDK's crate-local collector. Each
-consumer publishes its derived types through its own managed publication. Group
-and membership writes obtain materialized type rules from `TypesRegistryApi`
-with the caller's context; payload validation uses `types-registry-sdk`.
-
-See [DESIGN.md](DESIGN.md) for transaction boundaries, lifecycle behavior and the
-three-table persistence model.
+RG publishes the SDK's base schemas and consumers publish their derived
+types. Type-dependent writes read materialized schemas through
+`TypesRegistryApi` under the caller's context and validate with the SDK.
+See [DESIGN.md](DESIGN.md) for persistence, transactions and type lifecycle.

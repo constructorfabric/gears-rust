@@ -32,11 +32,20 @@
 
 ### 1.1 Overview
 
-Delegates every aspect of user-group hierarchy, membership storage, cycle detection, and tenant-scoped isolation to the Resource Group gear. Account Management owns only three thin touchpoints: (1) declaring the user-group and membership schemas and publishing them with AM’s types-registry manifest before application `init`; (2) triggering Resource Group cleanup of a tenant's user-group subtree during tenant hard-deletion; (3) publishing the tenant-scoped user-query surface that consumers combine with `ResourceGroupClient` membership operations to verify user existence.
+Resource Group owns the user-group hierarchy, memberships and tenant isolation.
+AM publishes the group and membership schemas before application `init`,
+triggers RG cleanup at tenant hard-deletion and exposes tenant-scoped user
+lookups.
 
 ### 1.2 Purpose
 
-Delivers the delegation half of PRD §5.6 (User Groups Management) by ensuring Account Management NEVER becomes a second source of truth for user-group state. The Resource Group gear already provides typed hierarchy, tenant scoping, forest invariants, cycle detection, and isolation — duplicating any of that inside AM would add pass-through layers without domain value (per `principle-delegation-to-rg` and the rejected alternative recorded in `adr-resource-group-tenant-hierarchy-source`). This feature therefore authorizes consumers to call `ResourceGroupClient` directly for CRUD and membership, while AM publishes its RG type declarations through the shared startup publication mechanism (`fr-user-group-rg-type`) and triggers RG cleanup during tenant hard-deletion so no orphaned user-group subtree survives a deleted tenant. User-existence checks needed for membership writes come from `feature-idp-user-operations-contract` (`GET /tenants/{tenant_id}/users` with `?user_id=<id>`) — this feature documents the combination pattern without adding any REST surface of its own.
+Implements PRD §5.6 under `principle-delegation-to-rg` and
+`adr-resource-group-tenant-hierarchy-source`. Consumers use `ResourceGroupClient`
+for groups and memberships and check user existence through
+`GET /tenants/{tenant_id}/users?user_id=<id>`
+(`feature-idp-user-operations-contract`). AM publishes its declarations
+under `fr-user-group-rg-type` and triggers cleanup to remove the tenant's
+user-group subtree.
 
 **Requirements**: `cpt-cf-account-management-fr-user-group-rg-type`, `cpt-cf-account-management-fr-user-group-lifecycle`, `cpt-cf-account-management-fr-user-group-membership`, `cpt-cf-account-management-fr-nested-user-groups`
 
@@ -69,12 +78,14 @@ Delivers the delegation half of PRD §5.6 (User Groups Management) by ensuring A
 **Success Scenarios**:
 
 - Before application `init`, the runtime publishes AM's manifest through `PlatformTypesRegistryApi`. It includes the user-group and membership schemas from [rg_types.rs](../../account-management/src/gts/rg_types.rs) and the AM user resource schema from the SDK. Resource Group's manifest publishes the group and membership base schemas.
-- An identical restart leaves the admitted definitions unchanged. Absent definitions are created; differing definitions are reconciled under the registry's revision and admission rules.
+- Identical restarts preserve revisions. The registry admits new definitions
+  and reconciles changes under its revision rules.
 
 **Error Scenarios**:
 
-- Registry unavailability, unresolved dependencies or transient conflicts prevent publication from completing within its bounded startup budget — startup fails before application `init`.
-- A declaration is rejected or the registry refuses publication — startup fails with the publisher, affected identifiers and underlying cause. AM does not implement a separate RG-side schema comparison or error mapping.
+- A refusal or failure to finish within the startup budget stops application
+  `init`. The shared publisher reports the publisher, affected IDs and cause,
+  including unresolved dependencies, unavailability and transient conflicts.
 
 **Steps**:
 
@@ -115,7 +126,8 @@ Delivers the delegation half of PRD §5.6 (User Groups Management) by ensuring A
 
 - [ ] `p1` - **ID**: `cpt-cf-account-management-algo-user-groups-rg-type-schema-registration`
 
-The existing `rg-type-registration` / `rg-type-schema-registration` traceability IDs now describe manifest publication. The former AM-specific RG bootstrap algorithm has been removed.
+The `rg-type-registration` and `rg-type-schema-registration` IDs track
+manifest publication.
 
 **Input**: AM's manifest, including the following declarations:
 
@@ -135,11 +147,15 @@ The existing `rg-type-registration` / `rg-type-schema-registration` traceability
 4. [ ] - `p1` - **IF** publication succeeds, **RETURN** success; identical restarts preserve existing revisions - `inst-algo-rgreg-success`
 5. [ ] - `p1` - **ELSE RETURN** the publication error with its publisher, identifier and cause context; application `init` does not run - `inst-algo-rgreg-failure`
 
-See [Types Registry SDK publication](../../../types-registry/types-registry-sdk/README.md#publishing-from-a-gear) for reconciliation, retries and failure diagnostics. Resource Group reads definitions through `TypesRegistryApi` under the caller's context when validating writes. It owns no type catalogue, and AM performs no init-time type CRUD through `ResourceGroupClient`.
+RG reads definitions under the caller's context through `TypesRegistryApi`.
+See [Types Registry SDK publication](../../../types-registry/types-registry-sdk/README.md#publishing-from-a-gear)
+for reconciliation, retries and diagnostics.
 
 ## 4. States (CDSL)
 
-**Not applicable.** This feature owns no AM-side state machine. The shared publisher awaits Types Registry admission before application `init`; the registry owns type lifecycle and revisions. RG owns group hierarchy and membership state. AM stores no user-group rows, membership adapter tables or registration mirror; its hard-delete hook triggers RG cleanup.
+Types Registry owns type lifecycle and revisions. RG owns group and
+membership state. AM contributes declarations and delegates hard-delete
+cleanup to RG.
 
 ## 5. Definitions of Done
 
@@ -147,7 +163,12 @@ See [Types Registry SDK publication](../../../types-registry/types-registry-sdk/
 
 - [ ] `p1` - **ID**: `cpt-cf-account-management-dod-user-groups-rg-type-schema-idempotent-registration`
 
-AM's manifest **MUST** include the declarations in §3, per `fr-user-group-rg-type`. The shared publisher **MUST** await admission before application `init`. Identical restarts **MUST** preserve revisions; absent or differing documents **MUST** follow the registry's reconciliation and admission rules. A rejected or incomplete publication **MUST** stop startup. AM **MUST NOT** maintain an RG-local type catalogue or register types through `ResourceGroupClient`.
+AM **MUST** publish the §3 declarations under `fr-user-group-rg-type` and
+await admission before application `init`. Identical restarts **MUST**
+preserve revisions. New or changed declarations follow registry admission
+rules. Refused or incomplete publication **MUST** stop startup. AM **MUST
+NOT** register types through `ResourceGroupClient` or maintain a local
+type catalogue.
 
 **Implements**:
 

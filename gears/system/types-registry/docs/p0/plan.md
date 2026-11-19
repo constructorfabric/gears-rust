@@ -17,7 +17,9 @@ Global entities only — no tenant ownership, no PDP, no federation. `PlatformSe
 
 **Publication persistence decision.** Stateless publication reconciles each time. Stateful services will use SDK-owned journal tables in their own database, independent of T36's read cache. T46–T49 add confirmed receipts, restart reuse, replica coordination and force resync after the publisher-version guard; none of this persistence exists yet.
 
-**Intermediate topology.** AM uses the remote new APIs. RG's local type definitions and its sealed bootstrap are removed by T38b's RG slice (RG keeps only an identity dictionary of type keys): AM publishes its RG types as owned declarations and RG reads the persisted registry. T41/T43 retain the final remote composition proof.
+**Intermediate topology.** AM uses the remote APIs and publishes its RG
+types. T38b replaces RG's local definitions and bootstrap with registry reads
+and a local type-key dictionary. T41/T43 verify the final remote composition.
 
 **Framework scope (2026-10-27).** Deliver contracts and REST providers; application
 composition owns the executable and AuthN plugins. T35 uses the existing example

@@ -351,8 +351,8 @@ there is no separate RG type bootstrap API or direct database type seeding.
 
 Types Registry owns schema evolution and admission. RG **MUST** validate group
 creation and moves against the type snapshot read for that operation. Publishing
-a new definition does not scan or rewrite existing RG hierarchy rows. Registry
-reads and payload validation **MUST** precede database write transactions.
+a new definition leaves existing hierarchy rows untouched. Registry reads
+and schema compilation **MUST** precede database write transactions.
 
 #### Preserve Existing Instances After Type Retirement
 
@@ -817,7 +817,7 @@ consumes them.
 #### Scenario: Tightened Placement Rules Apply to New Writes
 
 - **GIVEN** group `B1` of type `branch` has parent `D1` of type `department`
-- **AND** a new revision of `branch` removes `department` from `allowed_parent_types`
+- **AND** the current `branch` schema excludes `department` from `parent_type`
 - **WHEN** caller moves another `branch` group under a `department` group
 - **THEN** the move is rejected against the current definition
 - **AND** existing group `B1` is neither scanned nor rewritten

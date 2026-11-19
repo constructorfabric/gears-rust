@@ -802,10 +802,8 @@ impl Gear for AccountManagementGear {
             PolicyEnforcer::new(authz).with_capabilities(vec![Capability::TenantHierarchy]);
         info!("authz-resolver client resolved from client hub; PolicyEnforcer wired");
 
-        // FEATURE 2.6 — AM's user-group RG types (container and member
-        // handle) are AM-owned GTS declarations (`crate::gts::rg_types`),
-        // admitted with AM's publication before this `init`; resource-group
-        // reads them from the types registry. No init-time registration.
+        // FEATURE 2.6 — AM publishes its group and membership schemas
+        // (`crate::gts::rg_types`) before init. RG reads them from Types Registry.
 
         // FEATURE 2.6 — register the cascade cleanup hook so
         // tenant hard-delete removes the tenant's user-group subtree

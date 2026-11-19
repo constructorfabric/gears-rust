@@ -56,7 +56,7 @@ Whether and which tables to project depends on the deployment topology and acces
 |------------|------------------------|-----------|
 | **Monolith** (single shared DB) | **None** — all tables are already co-located | PEP JOINs against canonical tables directly; no extra databases or sync needed |
 | **Microservices** (separate DBs, typical case) | **`resource_group` + `resource_group_closure`** | Supports local hierarchy operations. Authorization must use explicit `in` predicates expanded by a capable PDP because the membership table is absent. Hierarchy tables are small (~100 K rows). |
-| **Microservices** with membership filtering/pagination | **`resource_group` + `resource_group_closure` + `resource_group_membership` + `gts_type`** | Only when profiling confirms the two-request pattern (RG API → domain service) is unacceptable for latency budget. `gts_type` is RG's identity dictionary (`SMALLINT` key ↔ GTS type identifier, no definitions); it is required to resolve external member-handle types to the membership rows' `gts_type_id` keys. The membership table grows as `M_resources × N_groups_per_resource` and is expected to be **10× or more larger** than hierarchy tables — see [RG DESIGN §Storage Estimates](../../../gears/system/resource-group/docs/DESIGN.md#storage-estimates) for concrete numbers |
+| **Microservices** with membership filtering/pagination | **`resource_group` + `resource_group_closure` + `resource_group_membership` + `gts_type`** | Use when profiling shows two requests exceed the latency budget. The `gts_type` dictionary maps GTS identifiers to membership keys. Membership rows grow as `M_resources × N_groups_per_resource` and can outnumber hierarchy rows by **10× or more**. See [RG production scale](../../../gears/system/resource-group/docs/PRD.md#65-expected-production-scale). |
 
 > **Important:** When a domain service query includes filters by resource group attributes (e.g., `GET /tasks?status=pending&project={projectX}&after=…&limit=50`), the two-request pattern means N additional round-trips to the RG Membership API (one per filter page or group), not just +1. If this N-request fan-out violates the latency budget, that is the signal to project the membership table locally.
 >
@@ -84,17 +84,13 @@ condition to the membership subquery. This is required because
 `resource_group_membership` is shared by all member types and external resource
 IDs are only unique within a type.
 
-Type definitions are owned by types-registry: RG accepts a membership only when
-its resource type is registered and active there and is listed in the group
-type's `allowed_membership_types`, and it records the type under its
-dictionary key (creating the key on first use). A dictionary row carries no
-definition and does not admit a type; an identifier absent from the
-dictionary matches no membership.
-A service MUST NOT opt a resource into native group predicates unless its
-memberships are written under exactly the resource's canonical GTS type path;
-rows recorded under a different member-handle type (for example an
-RG-prefixed wrapper) do not match. It must instead use PDP-expanded explicit
-`in` predicates or deny.
+RG accepts active, concrete resource types permitted by the group's bound
+membership schema in Types Registry. It allocates a dictionary key on first use.
+An identifier absent from the dictionary matches no membership.
+
+Services **MUST** write memberships under the resource's exact canonical GTS
+type path to use native predicates. For other paths, including legacy wrappers,
+use PDP-expanded `in` predicates or deny.
 
 A resource without the per-resource opt-in, or with a non-canonical GTS policy
 name, suppresses configured group capabilities for that request. The opt-in says

@@ -15,12 +15,9 @@ use uuid::Uuid;
 
 /// Maximum UTF-8 byte length of a membership's resource identifier.
 ///
-/// The identifier is part of the membership primary key
-/// `(group_id, type key, resource_id)`, and PostgreSQL B-tree entries are
-/// limited to 2704 bytes on standard 8 KiB pages; 2600 leaves room for the
-/// 16-byte group UUID, the 2-byte type key and tuple/varlena headers. The GTS
-/// type identifier does not count: it is stored as a dictionary key. Enforced
-/// on all supported backends.
+/// On all backends, the limit leaves room in PostgreSQL's 2704-byte B-tree
+/// entries (standard 8 KiB pages) for the group UUID, two-byte type key and
+/// headers. The full GTS identifier is stored in the dictionary.
 pub const MAX_MEMBERSHIP_RESOURCE_ID_BYTES: usize = 2600;
 
 // -- GtsTypePath value object --
