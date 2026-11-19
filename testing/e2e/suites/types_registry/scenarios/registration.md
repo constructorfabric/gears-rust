@@ -48,6 +48,9 @@ Valid root Type Schema fixtures follow the GTS §4.4.1 closed-envelope pattern: 
   - [TR-REG-503 — A live derived Type Schema prevents a final transition](#tr-reg-503--a-live-derived-type-schema-prevents-a-final-transition)
   - [TR-REG-504 — Publish a breaking contract under a new major](#tr-reg-504--publish-a-breaking-contract-under-a-new-major)
   - [TR-REG-505 — A revision refreshes transitive schema references](#tr-reg-505--a-revision-refreshes-transitive-schema-references)
+  - [TR-REG-506 — Narrowing a trait enum preserves the published revision](#tr-reg-506--narrowing-a-trait-enum-preserves-the-published-revision)
+  - [TR-REG-507 — Widening a trait enum updates the inherited schema](#tr-reg-507--widening-a-trait-enum-updates-the-inherited-schema)
+  - [TR-REG-508 — Resolve a trait reference against each minor](#tr-reg-508--resolve-a-trait-reference-against-each-minor)
 - [Minor versions and version-family shape](#minor-versions-and-version-family-shape)
   - [TR-REG-601 — Order contiguous minors within one batch](#tr-reg-601--order-contiguous-minors-within-one-batch)
   - [TR-REG-602 — Refuse a minor with a missing predecessor](#tr-reg-602--refuse-a-minor-with-a-missing-predecessor)
@@ -444,6 +447,18 @@ B also reports `dependency_kind=ref` and the missing ID. A is readable; B and C 
 
 **Then:** `person_schema` succeeds at version 2 and returns its revised authored content. Both referrers return `200` with changed ETags and resolved schemas containing `nickname` at the nested person definition, including through both reference levels for `outer_referrer_schema`. Their authored content, GTS IDs, UUIDs, active lifecycle and own resource versions remain unchanged at version 1. `independent_schema` returns bodyless `304` with its previous ETag. Repeating the referrer reads with their new ETags returns bodyless `304`; no sleep or read retry is required after operation completion.
 
+
+### TR-REG-506 — Narrowing a trait enum preserves the published revision
+
+A registered type allows both `internal` and `public` categories and uses `internal`. Revising its trait enum to allow only `internal` fails with `incompatible_with_baseline`. An exact read returns the original content at resource version 1.
+
+### TR-REG-507 — Widening a trait enum updates the inherited schema
+
+A base type adds `partner` to its category enum. Registration succeeds at resource version 2. A read of its derived type returns the expanded effective traits schema at the derived type’s existing resource version.
+
+### TR-REG-508 — Resolve a trait reference against each minor
+
+Two consecutive minors use the same local trait `$ref`. The definition in the second minor removes an allowed value. Dry run and commit both accept the first minor and refuse the second with `incompatible_with_baseline`.
 
 ## Minor versions and version-family shape
 

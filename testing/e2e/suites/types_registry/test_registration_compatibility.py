@@ -289,3 +289,73 @@ async def test_a_revision_refreshes_transitive_schema_references(
             if_none_match=fresh[name],
         )
         assert_exact(response, {"status": 304, "etag": fresh[name]})
+
+
+@pytest.mark.scenario("TR-REG-506")
+async def test_traits_schema_narrowing_preserves_the_published_revision(
+    registry_http, registry_api_path, reading_fixture, given_registered
+):
+    schema = reading_fixture("trait_base_schema")
+    await given_registered(schema)
+    revised = deepcopy(schema)
+    revised["expected_resource_version"] = 1
+    revised["content"]["x-gts-traits-schema"]["properties"]["category"]["enum"] = ["internal"]
+    await register_and_assert(
+        registry_http, registry_api_path, [revised],
+        outcome(schema, "failed", None, "incompatible_with_baseline"),
+    )
+    response = await get_entity(
+        registry_http, registry_api_path, schema["gts_id"], select="content,origin"
+    )
+    assert_exact(response, {
+        "status": 200, "etag": "<etag>",
+        "body": {**mandatory(schema), "origin": managed(1), "content": schema["content"]},
+    })
+
+
+@pytest.mark.scenario("TR-REG-507")
+async def test_traits_schema_widening_is_visible_on_a_derived_type(
+    registry_http, registry_api_path, reading_fixture, given_registered
+):
+    base = reading_fixture("trait_base_schema")
+    derived = reading_fixture("trait_derived_schema")
+    await given_registered(base, derived)
+    revised = deepcopy(base)
+    revised["expected_resource_version"] = 1
+    traits_schema = revised["content"]["x-gts-traits-schema"]
+    traits_schema["properties"]["category"]["enum"].append("partner")
+    await register_and_assert(
+        registry_http, registry_api_path, [revised], outcome(base, "succeeded", 2)
+    )
+    response = await get_entity(
+        registry_http, registry_api_path, derived["gts_id"], select="effective_traits_schema,origin"
+    )
+    assert_exact(response, {
+        "status": 200, "etag": "<etag>",
+        "body": {
+            **mandatory(derived),
+            "origin": managed(1),
+            "effective_traits_schema": {"$schema": base["content"]["$schema"], **traits_schema},
+        },
+    })
+
+
+@pytest.mark.scenario("TR-REG-508")
+async def test_traits_schema_ref_is_resolved_against_each_minor_in_a_batch(
+    registry_http, registry_api_path, registration_fixture
+):
+    first = registration_fixture("person_minor_0_schema")
+    first["content"]["definitions"] = {"mode": {"enum": ["read", "write"]}}
+    first["content"]["x-gts-traits-schema"] = {
+        "type": "object", "properties": {"mode": {"$ref": "#/definitions/mode"}}
+    }
+    later = schema_with_id(first, registration_fixture("person_minor_1_schema")["gts_id"])
+    later["content"]["definitions"]["mode"]["enum"] = ["read"]
+
+    for dry_run in (True, False):
+        await register_and_assert(
+            registry_http, registry_api_path, [first, later],
+            outcome(first, "succeeded", None if dry_run else 1),
+            outcome(later, "failed", None, "incompatible_with_baseline"),
+            dry_run=dry_run,
+        )

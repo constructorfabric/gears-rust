@@ -1129,8 +1129,10 @@ is the stable machine-readable refusal category; `message` is for humans and is 
 a parsing contract. There is no separate `diagnostics` field (PRD, ADR-0003).
 
 For `incompatible_with_baseline` and `compatibility_undecidable`, this build renders
-up to 20 backward findings as `finding at path`, in engine order, and counts omitted
-findings in the message. Each path retains at most 200 UTF-8 bytes, cut at a character
+up to 20 backward findings as `finding at path` and counts omitted findings in the
+message. Findings against the effective traits schema carry an `x-gts-traits-schema: `
+prefix. Findings that refute inclusion come before those that only fail to prove it;
+within each group payload precedes traits, in engine order. Each path retains at most 200 UTF-8 bytes, cut at a character
 boundary and followed by `...(truncated)` when shortened. Paths use GTS notation
 (`$`, `$.payload`, etc.); the engine's unbounded human `detail` is not copied.
 Refusals before comparison, such as `dialect_changed` and `baseline_unresolvable`,

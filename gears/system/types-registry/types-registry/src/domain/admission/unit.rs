@@ -17,6 +17,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use gts::schema_traits::X_GTS_TRAITS_SCHEMA;
 use gts::{
     CompatibilityVerdict, GTS_IMPLEMENTATION_VERSION, GTS_SPECIFICATION_VERSION, GtsId,
     GtsRefValidation,
@@ -133,6 +134,7 @@ enum BaselineDocument {
         gts_id: String,
         revision_no: i32,
         content: Value,
+        traits_schema: Value,
     },
     /// No predecessor to compare yet. The commit-time family gate checks existence
     /// after shape conflicts, which take precedence. This is always a creation.
@@ -144,8 +146,8 @@ enum BaselineDocument {
 
 /// Read the baseline from the comparison store's snapshot (SPEC §8.1 step 3).
 ///
-/// Cross-minor content is already in `loaded`; only `CurrentRevision` needs
-/// a query because the candidate overlay replaced its committed document.
+/// Cross-minor authored content is already in `loaded`. Both edges read the
+/// effective traits schema of the committed baseline in this snapshot.
 /// Its observed version must match the accepted precondition: the commit CAS
 /// then protects the same baseline that evaluation compared against.
 /// Take `loaded` by value: `UnitStore` is not `Sync` and cannot be borrowed
@@ -159,24 +161,50 @@ async fn read_baseline(
     choice: &Baseline,
     loaded: Option<CommittedSchema>,
 ) -> Result<Result<BaselineDocument, ItemFailure>, WorkerError> {
-    let gts_id = match choice {
+    let (gts_id, committed) = match choice {
         Baseline::Exempt(_) => return Ok(Ok(BaselineDocument::Exempt)),
         Baseline::PrecedingMinor { gts_id } => {
-            // Absent from the loaded closure is absent from the database: the
-            // identifier was passed as a root, so a row would have been read.
-            return Ok(Ok(match loaded {
-                Some(committed) => BaselineDocument::Present {
-                    gts_id: gts_id.clone(),
-                    revision_no: committed.revision_no,
-                    content: committed.content,
-                },
-                None => BaselineDocument::PredecessorAbsent,
-            }));
+            let Some(committed) = loaded else {
+                return Ok(Ok(BaselineDocument::PredecessorAbsent));
+            };
+            (gts_id.as_str(), committed)
         }
-        Baseline::CurrentRevision => candidate_id,
+        Baseline::CurrentRevision => {
+            match read_revision_baseline(stores, tx, scope, candidate_id, precondition).await? {
+                Ok(committed) => (candidate_id, committed),
+                Err(failure) => return Ok(Err(failure)),
+            }
+        }
     };
-    // Match revision_entity's refusal order in the evaluation snapshot. Deleted
-    // predecessors remain valid baselines; that creation arm returned above.
+    let traits_schema = stores
+        .current_traits_schema(tx, scope, committed.entity_id)
+        .await?
+        .ok_or_else(|| WorkerError::CurrentStateMissing {
+            gts_id: gts_id.to_owned(),
+            entity_id: committed.entity_id,
+        })?;
+    let traits_schema =
+        serde_json::from_str(&traits_schema).map_err(|source| WorkerError::BaselineUnparsable {
+            gts_id: gts_id.to_owned(),
+            column: "type_schema.effective_traits_schema",
+            source,
+        })?;
+    Ok(Ok(BaselineDocument::Present {
+        gts_id: gts_id.to_owned(),
+        revision_no: committed.revision_no,
+        content: committed.content,
+        traits_schema,
+    }))
+}
+
+async fn read_revision_baseline(
+    stores: &dyn Stores,
+    tx: &DbTx<'_>,
+    scope: &AccessScope,
+    gts_id: &str,
+    precondition: Precondition,
+) -> Result<Result<CommittedSchema, ItemFailure>, WorkerError> {
+    // Match revision_entity's refusal order in the evaluation snapshot.
     let Some(entity) = stores.find_by_gts_id(tx, scope, gts_id).await? else {
         return Ok(Err(ItemFailure::new(
             AdmissionFailureReason::PreconditionFailed,
@@ -214,11 +242,12 @@ async fn read_baseline(
     let content = serde_json::from_str(&current.raw_schema).map_err(|source| {
         WorkerError::BaselineUnparsable {
             gts_id: gts_id.to_owned(),
+            column: "type_schema_revision.raw_schema",
             source,
         }
     })?;
-    Ok(Ok(BaselineDocument::Present {
-        gts_id: gts_id.to_owned(),
+    Ok(Ok(CommittedSchema {
+        entity_id: entity.id,
         revision_no: current.revision_no,
         content,
     }))
@@ -688,6 +717,14 @@ fn evaluate_loaded(
             ItemFailure::new(AdmissionFailureReason::InvalidSchema, error.to_string())
         })?;
         let artifacts = materialize_bounded(&resolved, limits)?;
+        check_compatibility(
+            &mut store,
+            id,
+            content,
+            &resolved.effective_traits_schema,
+            baseline,
+            reporting,
+        )?;
         EvaluatedOutcome::TypeSchema {
             artifacts,
             is_abstract: resolved.is_abstract,
@@ -721,14 +758,12 @@ fn evaluate_loaded(
             .map_err(|error| {
                 ItemFailure::new(AdmissionFailureReason::InvalidValue, error.to_string())
             })?;
+        reporting.record(None, None, None);
         EvaluatedOutcome::Instance {
             type_schema_entity_id,
             type_schema_revision_no,
         }
     };
-
-    // Validate the candidate before judging its compatibility with another document.
-    check_compatibility(&mut store, id, content, baseline, reporting)?;
 
     Ok(EvaluatedUnit {
         gts_id: id.id().to_owned(),
@@ -815,10 +850,12 @@ fn check_compatibility(
     store: &mut UnitStore,
     id: &GtsId,
     candidate: &Value,
+    candidate_traits_schema: &Value,
     baseline: &BaselineDocument,
     reporting: CompatReporting<'_>,
 ) -> Result<(), ItemFailure> {
-    let (baseline_id, baseline_revision, baseline_content) = match baseline {
+    let (baseline_id, baseline_revision, baseline_content, baseline_traits_schema) = match baseline
+    {
         // The family gate handles an absent predecessor. Neither case emits a verdict.
         BaselineDocument::Exempt | BaselineDocument::PredecessorAbsent => {
             reporting.record(None, None, None);
@@ -828,17 +865,16 @@ fn check_compatibility(
             gts_id,
             revision_no,
             content,
-        } => (gts_id, *revision_no, content),
+            traits_schema,
+        } => (gts_id, *revision_no, content, traits_schema),
     };
 
     // Pin the dialect before comparison so drift has its own refusal and no verdict.
     // Instances have no declared dialect and are exempt.
-    if id.is_type()
-        && let Err(drift) = compat::dialect_pin(
-            compat::BaselineDoc::new(baseline_content),
-            compat::CandidateDoc::new(candidate),
-        )
-    {
+    if let Err(drift) = compat::dialect_pin(
+        compat::BaselineDoc::new(baseline_content),
+        compat::CandidateDoc::new(candidate),
+    ) {
         reporting.record(Some(baseline_id), Some(baseline_revision), None);
         return Err(ItemFailure::new(
             compat::DialectDrift::REASON,
@@ -849,10 +885,18 @@ fn check_compatibility(
         ));
     }
 
-    let comparison = match compat::backward_comparison(
+    let declaration = compat::TraitsDeclaration::between(
+        compat::BaselineDoc::new(baseline_content),
+        compat::CandidateDoc::new(candidate),
+        || ancestors_declare_traits(store, id),
+    );
+    let evolution = match compat::evolution_comparison(
         store.store_mut(),
         compat::BaselineDoc::new(baseline_content),
         compat::CandidateDoc::new(candidate),
+        compat::BaselineDoc::new(baseline_traits_schema),
+        compat::CandidateDoc::new(candidate_traits_schema),
+        declaration,
     ) {
         Ok(comparison) => comparison,
         Err(error) => {
@@ -868,7 +912,7 @@ fn check_compatibility(
             ));
         }
     };
-    let verdict = comparison.backward_compatibility();
+    let verdict = evolution.verdict;
     reporting.record(Some(baseline_id), Some(baseline_revision), Some(verdict));
     let waived = reporting.forced;
     if waived && verdict != CompatibilityVerdict::Compatible {
@@ -894,7 +938,7 @@ fn check_compatibility(
                  (verdict {}): {}",
                 id.id(),
                 verdict.as_str(),
-                diagnostics_summary(&comparison),
+                diagnostics_summary(&evolution.payload, &evolution.traits),
             ),
         )),
     }
@@ -903,23 +947,48 @@ fn check_compatibility(
 /// Maximum diagnostics included in a refusal message.
 const MAX_REPORTED_DIAGNOSTICS: usize = 20;
 
+/// Whether a proper prefix of `id`'s chain declares `x-gts-traits-schema`, read
+/// from the unit store that already resolved the candidate. An ancestor absent
+/// from it counts as declaring nothing, which can only refuse.
+fn ancestors_declare_traits(store: &mut UnitStore, id: &GtsId) -> bool {
+    let chain = id.chain_ids();
+    let ancestors = &chain[..chain.len().saturating_sub(1)];
+    ancestors.iter().any(|ancestor| {
+        store
+            .store_mut()
+            .get(ancestor)
+            .is_some_and(|entity| entity.content.get(X_GTS_TRAITS_SCHEMA).is_some())
+    })
+}
+
 /// Maximum path bytes per diagnostic; property names are caller-controlled,
 /// so the entry cap alone cannot bound the payload.
 const MAX_REPORTED_PATH_BYTES: usize = 200;
 
-/// The backward diagnostics as `finding at path` pairs, in the order `gts-rust`
-/// reported them, capped at [`MAX_REPORTED_DIAGNOSTICS`] entries of
-/// [`MAX_REPORTED_PATH_BYTES`] each, with the remainder counted.
-fn diagnostics_summary(comparison: &gts::SchemaComparison) -> String {
-    let total = comparison.backward_diagnostics.len();
+/// The backward diagnostics as `finding at path` pairs, the traits contract's
+/// under its keyword, capped at [`MAX_REPORTED_DIAGNOSTICS`] entries of
+/// [`MAX_REPORTED_PATH_BYTES`] each, with the remainder counted. Findings that
+/// refute come first so a capped list still explains an incompatible verdict;
+/// otherwise payload precedes traits in the order `gts-rust` reported them.
+fn diagnostics_summary(
+    payload: &[gts::CompatibilityDiagnostic],
+    traits: &[gts::CompatibilityDiagnostic],
+) -> String {
+    let total = payload.len() + traits.len();
     if total == 0 {
         return "no diagnostic evidence".to_owned();
     }
-    let shown = comparison
-        .backward_diagnostics
+    let all = payload
         .iter()
+        .map(|d| ("", d))
+        .chain(traits.iter().map(|d| ("x-gts-traits-schema: ", d)));
+    let (refuting, inconclusive): (Vec<_>, Vec<_>) =
+        all.partition(|(_, d)| !is_inconclusive(d.finding));
+    let shown = refuting
+        .into_iter()
+        .chain(inconclusive)
         .take(MAX_REPORTED_DIAGNOSTICS)
-        .map(|d| {
+        .map(|(contract, d)| {
             let prefix = path_prefix(&d.path);
             // Keep the persisted marker ASCII, as required by the workspace lint.
             let marker = if prefix.len() < d.path.len() {
@@ -927,7 +996,7 @@ fn diagnostics_summary(comparison: &gts::SchemaComparison) -> String {
             } else {
                 ""
             };
-            format!("{:?} at {prefix}{marker}", d.finding)
+            format!("{contract}{:?} at {prefix}{marker}", d.finding)
         })
         .collect::<Vec<_>>()
         .join("; ");
@@ -935,6 +1004,15 @@ fn diagnostics_summary(comparison: &gts::SchemaComparison) -> String {
         0 => shown,
         remaining => format!("{shown}; and {remaining} more"),
     }
+}
+
+/// A finding that fails to establish inclusion rather than refuting it, as
+/// `gts-rust` classifies it when deriving an undecided verdict.
+const fn is_inconclusive(finding: gts::CompatibilityFinding) -> bool {
+    matches!(
+        finding,
+        gts::CompatibilityFinding::NotProvable | gts::CompatibilityFinding::DialectChanged
+    )
 }
 
 /// Truncate at a UTF-8 boundary, without adding presentation markers.

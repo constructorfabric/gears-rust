@@ -92,7 +92,10 @@ fn root(gts_id: &str, traits: Option<Value>) -> Value {
         "properties": { "name": { "type": "string" } },
     });
     if let Some(properties) = traits {
-        schema["x-gts-traits-schema"] = json!({ "type": "object", "properties": properties });
+        // A later revision can add an optional trait at this closed level.
+        schema["x-gts-traits-schema"] = json!({
+            "type": "object", "properties": properties, "additionalProperties": false,
+        });
     }
     schema
 }

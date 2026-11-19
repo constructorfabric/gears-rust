@@ -265,10 +265,14 @@ impl From<WorkerError> for CanonicalError {
                 &format!("entity '{gts_id}' (id {entity_id}) vanished mid-transaction"),
                 "admission",
             ),
-            // Corruption of an immutable stored revision, so the document itself
-            // stays in the operator log and never reaches the caller.
-            WorkerError::BaselineUnparsable { gts_id, source } => opaque_internal(
-                &format!("the stored baseline document for '{gts_id}' is not valid JSON: {source}"),
+            // Corruption of a stored baseline column, named so the operator checks
+            // the right one; the document itself never reaches the caller.
+            WorkerError::BaselineUnparsable {
+                gts_id,
+                column,
+                source,
+            } => opaque_internal(
+                &format!("the stored baseline {column} for '{gts_id}' is not valid JSON: {source}"),
                 "admission",
             ),
             // A target disappearing after evaluation violates the persisted-identity invariant.
@@ -1150,6 +1154,7 @@ mod tests {
             // it and the identifier into its `Display`.
             worker_problem(WorkerError::BaselineUnparsable {
                 gts_id: "baseline-secret".to_owned(),
+                column: "type_schema.effective_traits_schema",
                 source: serde_json::from_str::<serde_json::Value>("{not-secret-json")
                     .expect_err("the fixture must not parse"),
             }),

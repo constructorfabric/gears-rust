@@ -790,6 +790,17 @@ pub trait TypeSchemaStore: Send + Sync {
         entity_ids: &[i64],
     ) -> Result<Vec<CurrentDocument>, ScopeError>;
 
+    /// The effective traits schema of one entity's current type schema row, as
+    /// stored JSON. Only that column is read: the compatibility baseline needs
+    /// none of the other materialized documents [`Self::find_current_schema`] loads.
+    /// `None` when the entity has no current row visible under `scope`.
+    async fn current_traits_schema(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_id: i64,
+    ) -> Result<Option<String>, ScopeError>;
+
     async fn find_current_schema(
         &self,
         tx: &DbTx<'_>,

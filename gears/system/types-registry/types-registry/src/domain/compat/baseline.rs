@@ -17,9 +17,18 @@
 //! admitted minor would make selection race-dependent. Deleted predecessors
 //! remain baselines.
 
-use gts::{CompatibilityVerdict, GtsId, GtsIdSegment, GtsStore, SchemaComparison, StoreError};
+use std::collections::HashSet;
+use std::mem::discriminant;
+
+use gts::schema_traits::X_GTS_TRAITS_SCHEMA;
+use gts::{
+    CompatibilityDiagnostic, CompatibilityVerdict, GtsId, GtsIdSegment, GtsStore, SchemaComparison,
+    StoreError,
+};
+use serde_json::{Value, json};
 use toolkit_macros::domain_model;
 
+use super::derivation::normalize_dialect;
 use super::sides::{BaselineDoc, CandidateDoc};
 use crate::domain::admission::{AdmissionFailureReason, Precondition};
 use crate::domain::family::{VersionProbe, version_probe};
@@ -152,12 +161,202 @@ pub fn select_baseline(
 ///
 /// # Errors
 /// [`StoreError`] if either side has an unresolvable reference; no verdict is produced.
-pub fn backward_comparison(
+fn backward_comparison(
     store: &GtsStore,
     baseline: BaselineDoc<'_>,
     candidate: CandidateDoc<'_>,
 ) -> Result<SchemaComparison, StoreError> {
     store.compare_documents(baseline.get(), candidate.get())
+}
+
+/// Which of the two contracts could not be compared. The message names the
+/// traits side, since the payload's resolution error alone points at the host.
+#[domain_model]
+#[derive(Debug, thiserror::Error)]
+pub enum ComparisonFailure {
+    #[error("{0}")]
+    Payload(#[source] StoreError),
+    #[error("x-gts-traits-schema: {0}")]
+    TraitsSchema(#[source] StoreError),
+}
+
+/// Whether the candidate's chain still declares `x-gts-traits-schema`. GTS
+/// materializes the same dialect-only contract for an explicit `{}` and for no
+/// declaration at all, yet refuses every trait value in the latter case, so the
+/// withdrawal is carried beside the artifact.
+#[domain_model]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TraitsDeclaration {
+    /// The candidate's chain declares as much as the baseline's did.
+    Kept,
+    /// The candidate withdrew the last declaration the baseline's chain had.
+    Withdrawn,
+}
+
+impl TraitsDeclaration {
+    /// Withdrawn when the baseline declared at its own level, the candidate does
+    /// not, and no ancestor does. Ancestors are shared by both sides: the same
+    /// identifier, or a preceding minor under the same parent prefix.
+    pub fn between(
+        baseline: BaselineDoc<'_>,
+        candidate: CandidateDoc<'_>,
+        ancestors_declare: impl FnOnce() -> bool,
+    ) -> Self {
+        // Trait schemas may appear only at the top level (GTS §9.7.1).
+        let declares = |document: &Value| document.get(X_GTS_TRAITS_SCHEMA).is_some();
+        if declares(baseline.get()) && !declares(candidate.get()) && !ancestors_declare() {
+            Self::Withdrawn
+        } else {
+            Self::Kept
+        }
+    }
+}
+
+/// The contract of a chain with no traits declaration: only the empty object.
+fn no_trait_values() -> Value {
+    json!({ "type": "object", "maxProperties": 0 })
+}
+
+/// The verdict over both contracts, with each contract's evidence kept apart so
+/// a refusal can say which one it is about.
+#[domain_model]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Evolution {
+    pub verdict: CompatibilityVerdict,
+    pub payload: Vec<CompatibilityDiagnostic>,
+    pub traits: Vec<CompatibilityDiagnostic>,
+}
+
+/// Both the payload and the effective trait values must remain admissible.
+///
+/// # Errors
+/// [`ComparisonFailure`] naming the contract that could not be resolved.
+pub fn evolution_comparison(
+    store: &GtsStore,
+    baseline: BaselineDoc<'_>,
+    candidate: CandidateDoc<'_>,
+    baseline_traits: BaselineDoc<'_>,
+    candidate_traits: CandidateDoc<'_>,
+    declaration: TraitsDeclaration,
+) -> Result<Evolution, ComparisonFailure> {
+    let payload =
+        backward_comparison(store, baseline, candidate).map_err(ComparisonFailure::Payload)?;
+    let undeclared;
+    let candidate_traits = match declaration {
+        TraitsDeclaration::Kept => candidate_traits,
+        TraitsDeclaration::Withdrawn => {
+            undeclared = no_trait_values();
+            CandidateDoc::new(&undeclared)
+        }
+    };
+    let (traits_verdict, traits_diagnostics) = traits_comparison(
+        store,
+        baseline,
+        candidate,
+        baseline_traits,
+        candidate_traits,
+    )
+    .map_err(ComparisonFailure::TraitsSchema)?;
+    Ok(Evolution {
+        verdict: all_hold(payload.backward_compatibility(), traits_verdict),
+        payload: payload.backward_diagnostics,
+        traits: traits_diagnostics,
+    })
+}
+
+/// Trait values are objects, validated against the effective traits schema of
+/// the type being validated: the host itself, or any descendant inheriting the
+/// contract. A self-relative operand such as `/$id` binds to that type, so the
+/// contract is compared under the host's identity and with the operand left
+/// unbound, standing for a descendant's. Both comparisons must prove inclusion;
+/// an unbound operand that cannot be proven fails closed as undecided. A final
+/// baseline has no descendants, so only the host reading is owed.
+fn traits_comparison(
+    store: &GtsStore,
+    baseline: BaselineDoc<'_>,
+    candidate: CandidateDoc<'_>,
+    baseline_traits: BaselineDoc<'_>,
+    candidate_traits: CandidateDoc<'_>,
+) -> Result<(CompatibilityVerdict, Vec<CompatibilityDiagnostic>), StoreError> {
+    let contract = |host: &Value, traits: &Value, as_host: bool| {
+        let mut contract = json!({
+            "$schema": host["$schema"],
+            "type": "object",
+            "allOf": [traits],
+        });
+        if as_host {
+            contract["$id"] = host["$id"].clone();
+        }
+        contract
+    };
+    let mut verdict = CompatibilityVerdict::Compatible;
+    let mut diagnostics: Vec<CompatibilityDiagnostic> = Vec::new();
+    let mut reported = HashSet::new();
+    if same_contract(baseline, candidate, baseline_traits, candidate_traits) {
+        return Ok((verdict, diagnostics));
+    }
+    let final_baseline =
+        baseline.get().get(gts::schema_modifiers::X_GTS_FINAL) == Some(&Value::Bool(true));
+    let readings: &[bool] = if final_baseline {
+        &[true]
+    } else {
+        &[true, false]
+    };
+    for &as_host in readings {
+        let comparison = store.compare_documents(
+            &contract(baseline.get(), baseline_traits.get(), as_host),
+            &contract(candidate.get(), candidate_traits.get(), as_host),
+        )?;
+        verdict = all_hold(verdict, comparison.backward_compatibility());
+        // The readings word one finding differently; report each place and kind once.
+        for diagnostic in comparison.backward_diagnostics {
+            if reported.insert((diagnostic.path.clone(), discriminant(&diagnostic.finding))) {
+                diagnostics.push(diagnostic);
+            }
+        }
+    }
+    Ok((verdict, diagnostics))
+}
+
+/// An untouched traits contract of the same type admits the same values. GTS
+/// cannot always prove that structurally (an `additionalProperties`
+/// intersection is never proven), so identity is decided here. The `$id` must
+/// match exactly: `/$id` means a different type under a different identifier.
+/// Dialects are compared by meaning where they are declared, the host and the
+/// root GTS pins on the effective schema; everything else is compared verbatim,
+/// since a `$schema` key elsewhere may be literal data.
+fn same_contract(
+    baseline: BaselineDoc<'_>,
+    candidate: CandidateDoc<'_>,
+    baseline_traits: BaselineDoc<'_>,
+    candidate_traits: CandidateDoc<'_>,
+) -> bool {
+    let dialect = |schema: &Value| schema["$schema"].as_str().and_then(normalize_dialect);
+    let without_dialect = |schema: &Value| {
+        let mut schema = schema.clone();
+        if let Some(members) = schema.as_object_mut() {
+            members.remove("$schema");
+        }
+        schema
+    };
+    let (baseline, candidate) = (baseline.get(), candidate.get());
+    let (baseline_traits, candidate_traits) = (baseline_traits.get(), candidate_traits.get());
+    baseline["$id"] == candidate["$id"]
+        && dialect(baseline).is_some()
+        && dialect(baseline) == dialect(candidate)
+        && dialect(baseline_traits) == dialect(candidate_traits)
+        && without_dialect(baseline_traits) == without_dialect(candidate_traits)
+}
+
+/// The verdict of obligations that must all hold: one refutation refutes, and
+/// an undecided one leaves the whole undecided.
+const fn all_hold(left: CompatibilityVerdict, right: CompatibilityVerdict) -> CompatibilityVerdict {
+    use CompatibilityVerdict::{Compatible, Incompatible, Unknown};
+    match (left, right) {
+        (Incompatible, _) | (_, Incompatible) => Incompatible,
+        (Unknown, _) | (_, Unknown) => Unknown,
+        (Compatible, Compatible) => Compatible,
+    }
 }
 
 /// Map a verdict to admission: `None` admits, `Some` gives the refusal reason.

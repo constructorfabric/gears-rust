@@ -52,6 +52,21 @@ impl TypeSchemaStore for AdmissionView {
         ))
     }
 
+    async fn current_traits_schema(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_id: i64,
+    ) -> Result<Option<String>, ScopeError> {
+        if let Some(state) = self.overlay().await.schema(entity_id) {
+            return Ok(Some(state.effective_traits_schema.to_string()));
+        }
+        if entity_id < 0 {
+            return Ok(None);
+        }
+        self.base.current_traits_schema(tx, scope, entity_id).await
+    }
+
     async fn find_current_schema(
         &self,
         tx: &DbTx<'_>,

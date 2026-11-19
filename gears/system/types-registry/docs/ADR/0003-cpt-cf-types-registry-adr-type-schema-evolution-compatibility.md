@@ -101,6 +101,16 @@ Chosen option: **Types Registry follows a `BACKWARD` compatibility strategy and 
 
 A candidate is admissible only when `Valid(baseline) ⊆ Valid(candidate)` under the platform-approved GTS implementation, where the baseline is the current revision of the same logical entity when it is major-only, and the definition of the preceding minor of its major when the candidate is minor-bearing (ADR-0004). Because deciding that inclusion is not always possible for arbitrary JSON Schema, a candidate whose compatibility the implementation cannot establish is rejected rather than published; Types Registry fails closed and never treats an undecided check as a pass.
 
+Admission applies this inclusion independently to the payload schema and the effective `x-gts-traits-schema`. A revision that narrows the allowed trait objects breaks compatibility even when the type's own `x-gts-traits` still validates. Both comparisons use the same baseline and waiver policy.
+
+Three properties of trait values shape the traits comparison:
+
+- **Who validates them.** A self-relative operand such as `/$id` binds to the type being validated, which is the host itself or any descendant inheriting the contract. The contract is compared under the host's identity and again with the operand unbound, and both must prove inclusion. A final baseline has no descendants, so only the host reading applies.
+- **Declaration, not just content.** A chain with no `x-gts-traits-schema` admits no trait values, although GTS materializes the same contract for it as for an explicit `{}`. Withdrawing the last declaration is compared as a contract that admits only the empty object, which refuses it whenever the old contract admitted a trait. Both sides have the same ancestor identifiers, and an active baseline is re-materialized against the same current ancestors, so only the type's own declaration can be withdrawn; a deleted preceding minor keeps the artifacts of its time (#6065). When the checker cannot prove that the old contract admitted nothing, the withdrawal is refused; on a major-only revision that refusal cannot be waived, and a new major is the way out.
+- **An untouched contract.** GTS cannot prove some contracts included in themselves, such as an `allOf` intersection with `additionalProperties: false`. When a revision of the same identifier leaves its effective traits contract unchanged, up to the spelling of its dialect, the traits comparison passes by identity; the payload is still compared.
+
+Dependents re-materialized by a revision of a type they reference are not compared against their previous artifacts; that is tracked separately (#6065).
+
 The one exception is per candidate and reaches only the second case: ADR-0004's `skip_compatibility_check` waives the cross-minor check, and can never waive the intra-entity one. §*The comparison baseline* records why that asymmetry is sound rather than convenient.
 
 This is exactly the guarantee the architecture requires. Because a domain object carries no revision and a `$ref` floats, the current revision is validated against payloads and references created under any earlier revision. Backward compatibility is the property that makes that safe.
