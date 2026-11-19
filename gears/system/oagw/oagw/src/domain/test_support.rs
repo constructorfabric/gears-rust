@@ -854,6 +854,7 @@ pub struct TestDpBuilder {
     websocket_close_timeout: Option<Duration>,
     metrics: Option<Arc<dyn crate::domain::ports::OagwMetricsPort>>,
     transform_plugins: Vec<(String, Arc<dyn crate::domain::plugin::TransformPlugin>)>,
+    streaming_idle_timeout: Option<Duration>,
 }
 
 impl TestDpBuilder {
@@ -871,6 +872,7 @@ impl TestDpBuilder {
             websocket_close_timeout: None,
             metrics: None,
             transform_plugins: Vec::new(),
+            streaming_idle_timeout: None,
         }
     }
 
@@ -960,6 +962,13 @@ impl TestDpBuilder {
         self
     }
 
+    /// Override the SSE streaming idle timeout.
+    #[must_use]
+    pub fn with_streaming_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.streaming_idle_timeout = Some(timeout);
+        self
+    }
+
     /// Fetch `CredStoreClientV1` from the hub, create a DP service with
     /// the given CP, and return the trait object.
     pub(crate) fn build_and_register(
@@ -1040,6 +1049,9 @@ impl TestDpBuilder {
         }
         for (plugin_id, plugin) in self.transform_plugins {
             svc = svc.with_transform_plugin(&plugin_id, plugin);
+        }
+        if let Some(timeout) = self.streaming_idle_timeout {
+            svc = svc.with_streaming_idle_timeout(timeout);
         }
 
         let streams = svc.stream_shutdown();

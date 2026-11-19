@@ -396,6 +396,7 @@ fn project_invalid_argument(ctx: &InvalidArgument, detail: String) -> ServiceGat
 /// inside the SDK's own SSE/WebSocket decoders that never cross a wire
 /// boundary as an OAGW response.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum StreamingError {
     /// SSE parse error — a chunk could not be decoded as UTF-8.
     #[error("SSE parse error: {detail}")]
@@ -410,6 +411,20 @@ pub enum StreamingError {
     /// the request is, ideally on another replica.
     #[error("the gateway closed the stream because it is stopping")]
     ClosedByGateway,
+
+    /// The gateway cut the stream because the upstream sent nothing for the
+    /// configured streaming idle timeout. The response is incomplete.
+    #[error("the gateway closed the stream after the upstream was idle too long")]
+    IdleTimeout,
+
+    /// An SSE event, or the data buffered for it before the blank line that
+    /// ends it, is over the limit: [`crate::sse::DEFAULT_MAX_EVENT_BYTES`], or the
+    /// one passed to
+    /// [`ServerEventsStream::from_response_with_max_event_bytes`](crate::sse::ServerEventsStream::from_response_with_max_event_bytes).
+    /// The stream ends: the upstream is not framing events, or an event is
+    /// larger than the caller accepts.
+    #[error("SSE event exceeds the limit of {limit} bytes")]
+    EventTooLarge { limit: usize },
 
     /// WebSocket connection to upstream failed.
     #[error("WebSocket connect error: {detail}")]
@@ -436,10 +451,29 @@ impl StreamClosedByGateway {
     }
 }
 
+/// The body error the gateway ends a streamed (SSE) response with when the
+/// upstream stays silent for the streaming idle timeout. SDK readers see it
+/// as [`StreamingError::IdleTimeout`]; a raw body consumer can `downcast_ref`
+/// it.
+#[derive(Debug, Clone, Default, thiserror::Error)]
+#[error("the gateway closed the stream after the upstream was idle too long")]
+#[non_exhaustive]
+pub struct StreamIdleTimeout;
+
+impl StreamIdleTimeout {
+    /// The error for a stream the gateway cut on its idle timeout.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
 impl From<Box<dyn std::error::Error + Send + Sync>> for StreamingError {
     fn from(e: Box<dyn std::error::Error + Send + Sync>) -> Self {
         if e.is::<StreamClosedByGateway>() {
             Self::ClosedByGateway
+        } else if e.is::<StreamIdleTimeout>() {
+            Self::IdleTimeout
         } else {
             Self::Stream(e)
         }
@@ -1086,6 +1120,15 @@ mod projection_tests {
         assert!(matches!(
             StreamingError::from(other),
             StreamingError::Stream(_)
+        ));
+    }
+
+    #[test]
+    fn an_idle_cut_is_its_own_streaming_error() {
+        let idle: Box<dyn std::error::Error + Send + Sync> = Box::new(StreamIdleTimeout::new());
+        assert!(matches!(
+            StreamingError::from(idle),
+            StreamingError::IdleTimeout
         ));
     }
 }

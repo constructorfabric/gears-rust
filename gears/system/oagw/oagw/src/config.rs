@@ -44,8 +44,9 @@ pub struct OagwConfig {
     #[serde(default = "default_websocket_close_timeout_secs")]
     pub websocket_close_timeout_secs: u64,
     /// Idle timeout in seconds for SSE streaming connections.
-    /// A connection with no data received from upstream for this duration
-    /// will be closed. Between 1 and [`MAX_PROXY_TIMEOUT_SECS`]. Default: 300 (5 minutes).
+    /// A stream with no data received from upstream for this duration is
+    /// cut with an error, not ended cleanly. Between 1 and
+    /// [`MAX_PROXY_TIMEOUT_SECS`]. Default: 300 (5 minutes).
     #[serde(default = "default_streaming_idle_timeout_secs")]
     pub streaming_idle_timeout_secs: u64,
     /// TTL in seconds for cached HTTP protocol version (ALPN) negotiation

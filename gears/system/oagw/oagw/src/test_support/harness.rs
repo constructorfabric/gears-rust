@@ -80,6 +80,7 @@ pub struct AppHarnessBuilder {
     tenant_resolver: Option<MockTenantResolverClient>,
     metrics: Option<Arc<dyn crate::domain::ports::OagwMetricsPort>>,
     transform_plugins: Vec<(String, Arc<dyn crate::domain::plugin::TransformPlugin>)>,
+    streaming_idle_timeout: Option<Duration>,
 }
 
 impl AppHarnessBuilder {
@@ -157,6 +158,12 @@ impl AppHarnessBuilder {
         self
     }
 
+    /// Override the SSE streaming idle timeout.
+    pub fn with_streaming_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.streaming_idle_timeout = Some(timeout);
+        self
+    }
+
     pub async fn build(self) -> AppHarness {
         let hub = ClientHub::new();
 
@@ -193,6 +200,9 @@ impl AppHarnessBuilder {
         }
         for (plugin_id, plugin) in self.transform_plugins {
             dp_builder = dp_builder.with_transform_plugin(&plugin_id, plugin);
+        }
+        if let Some(timeout) = self.streaming_idle_timeout {
+            dp_builder = dp_builder.with_streaming_idle_timeout(timeout);
         }
         dp_builder =
             dp_builder.with_token_http_config(toolkit_http::HttpClientConfig::for_testing());

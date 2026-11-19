@@ -97,28 +97,51 @@ impl From<CancellationToken> for StreamSignal {
     }
 }
 
-/// Wrap a [`BodyStream`] with idle timeout and graceful shutdown awareness.
-///
-/// Applied to SSE responses so that long-lived streams are terminated when:
-/// - No data is received from upstream within `idle_timeout`
-/// - The gateway stops (`stopped`)
+/// Names a stream in its logs. No query string: it may carry credentials.
+#[derive(Clone)]
+pub(crate) struct StreamLabels {
+    /// The upstream alias.
+    pub(crate) alias: String,
+    /// The path after the alias.
+    pub(crate) path: String,
+}
+
+/// Logs an upstream body error at WARN and passes it on. The response head is
+/// already sent, so the caller only sees the body abort.
+pub(crate) fn log_upstream_body_error(inner: BodyStream, labels: StreamLabels) -> BodyStream {
+    use futures_util::TryStreamExt as _;
+    Box::pin(inner.inspect_err(move |e| {
+        tracing::warn!(
+            alias = %labels.alias,
+            path = %labels.path,
+            error = %e,
+            "Upstream response body failed mid-stream"
+        );
+    }))
+}
+
+/// Wrap an SSE [`BodyStream`] with idle timeout and graceful shutdown
+/// awareness.
 ///
 /// Normal chunks are forwarded unchanged; the idle timer is reset on each
 /// chunk. Upstream EOF ends the stream cleanly. A stop ends it with
-/// [`oagw_sdk::StreamClosedByGateway`], so the caller can tell a cut stream
-/// from a finished one, and releases the upstream at once.
+/// [`oagw_sdk::StreamClosedByGateway`]; `idle_timeout` without a chunk ends
+/// it with [`oagw_sdk::StreamIdleTimeout`]. Either error lets the caller tell
+/// a cut stream from a finished one, and both release the upstream at once.
 pub(crate) fn streaming_body_with_lifecycle(
     inner: BodyStream,
     idle_timeout: Duration,
     stopped: StreamSignal,
+    labels: StreamLabels,
 ) -> BodyStream {
     struct State {
-        /// `None` once the stop was reported: the upstream is released and
-        /// the next poll ends the stream.
+        /// `None` once a cut was reported: the upstream is released and the
+        /// next poll ends the stream.
         inner: Option<BodyStream>,
         stopped: StreamSignal,
         deadline: std::pin::Pin<Box<tokio::time::Sleep>>,
         idle_timeout: Duration,
+        labels: StreamLabels,
     }
 
     Box::pin(unfold(
@@ -127,31 +150,45 @@ pub(crate) fn streaming_body_with_lifecycle(
             stopped,
             deadline: Box::pin(tokio::time::sleep(idle_timeout)),
             idle_timeout,
+            labels,
         },
         |mut state| async move {
             let inner = state.inner.as_mut()?;
-            tokio::select! {
+            let cut: BoxError = tokio::select! {
                 biased;
                 () = state.stopped.stopped() => {
-                    tracing::debug!("SSE stream terminated by shutdown");
-                    state.inner = None;
-                    Some((
-                        Err(Box::new(oagw_sdk::StreamClosedByGateway::new()) as BoxError),
-                        state,
-                    ))
+                    tracing::debug!(
+                        alias = %state.labels.alias,
+                        path = %state.labels.path,
+                        "SSE stream terminated by shutdown"
+                    );
+                    Box::new(oagw_sdk::StreamClosedByGateway::new())
                 }
-                _ = &mut state.deadline => {
-                    tracing::debug!("SSE stream idle timeout");
-                    None
-                }
+                // Polled before the deadline, which keeps running while a slow
+                // reader holds back the next poll: a chunk the upstream
+                // already sent wins over an expired deadline.
                 item = inner.next() => {
                     let chunk = item?;
-                    state.deadline.as_mut().reset(
-                        tokio::time::Instant::now() + state.idle_timeout
-                    );
-                    Some((chunk, state))
+                    state
+                        .deadline
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + state.idle_timeout);
+                    return Some((chunk, state));
                 }
-            }
+                // cancel-safe: only borrows the pinned Sleep held in State;
+                // dropping this future leaves the deadline intact.
+                () = state.deadline.as_mut() => {
+                    tracing::warn!(
+                        alias = %state.labels.alias,
+                        path = %state.labels.path,
+                        idle_timeout = ?state.idle_timeout,
+                        "SSE stream cut: the upstream sent nothing for the streaming idle timeout"
+                    );
+                    Box::new(oagw_sdk::StreamIdleTimeout::new())
+                }
+            };
+            state.inner = None;
+            Some((Err(cut), state))
         },
     ))
 }
@@ -164,6 +201,19 @@ pub(crate) mod tests {
     use futures_util::StreamExt;
     use oagw_sdk::body::BoxError;
 
+    /// [`streaming_body_with_lifecycle`] with placeholder log labels.
+    pub(crate) fn sse(
+        inner: BodyStream,
+        idle_timeout: Duration,
+        stopped: StreamSignal,
+    ) -> BodyStream {
+        let labels = StreamLabels {
+            alias: "test".to_owned(),
+            path: "/sse".to_owned(),
+        };
+        streaming_body_with_lifecycle(inner, idle_timeout, stopped, labels)
+    }
+
     fn bytes_stream(chunks: Vec<&'static str>) -> BodyStream {
         Box::pin(futures_util::stream::iter(
             chunks
@@ -175,7 +225,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn sse_lifecycle_forwards_chunks() {
         let stop = CancellationToken::new();
-        let stream = streaming_body_with_lifecycle(
+        let stream = sse(
             bytes_stream(vec!["data: hello\n\n", "data: world\n\n"]),
             Duration::from_secs(60),
             stop.into(),
@@ -194,7 +244,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn sse_lifecycle_upstream_eof_ends_stream() {
         let stop = CancellationToken::new();
-        let stream = streaming_body_with_lifecycle(
+        let stream = sse(
             bytes_stream(vec!["one"]),
             Duration::from_secs(60),
             stop.into(),
@@ -214,7 +264,11 @@ pub(crate) mod tests {
         })
     }
 
+    /// An idle cut ends the stream with an error, so a caller cannot take
+    /// the truncated stream for a complete one, and releases the upstream.
+    /// It is logged as a warning that names the stream.
     #[tokio::test]
+    #[tracing_test::traced_test]
     async fn sse_lifecycle_idle_timeout_ends_stream() {
         let stop = CancellationToken::new();
         let (inner_tx, inner_rx) = tokio::sync::mpsc::channel::<Result<Bytes, BoxError>>(1);
@@ -225,20 +279,117 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let stream = streaming_body_with_lifecycle(
+        let mut stream = sse(
             channel_stream(inner_rx),
             Duration::from_millis(50),
             stop.into(),
         );
-        let chunks: Vec<_> = stream
-            .collect::<Vec<_>>()
+        assert_eq!(stream.next().await.unwrap().unwrap(), "data: first\n\n");
+        match stream.next().await {
+            Some(Err(e)) => assert!(
+                e.downcast_ref::<oagw_sdk::StreamIdleTimeout>().is_some(),
+                "not the idle error: {e}"
+            ),
+            other => panic!("expected the idle error, got {other:?}"),
+        }
+        assert!(inner_tx.is_closed(), "the upstream is still held");
+        assert!(stream.next().await.is_none());
+        logs_assert(|lines: &[&str]| {
+            let cuts: Vec<_> = lines
+                .iter()
+                .filter(|l| l.contains("SSE stream cut"))
+                .collect();
+            match cuts[..] {
+                [line]
+                    if line.contains(" WARN ")
+                        && line.contains("alias=test")
+                        && line.contains("path=/sse")
+                        && line.contains("idle_timeout=50ms") =>
+                {
+                    Ok(())
+                }
+                _ => Err(format!(
+                    "no single idle-cut warning with its fields: {cuts:?}"
+                )),
+            }
+        });
+    }
+
+    /// Each chunk restarts the idle timer: a stream silent past the first
+    /// deadline but within the restarted one stays open, and the restarted
+    /// deadline still cuts it.
+    #[tokio::test(start_paused = true)]
+    async fn sse_lifecycle_chunks_reset_the_idle_timer() {
+        let start = tokio::time::Instant::now();
+        let stop = CancellationToken::new();
+        let (inner_tx, inner_rx) = tokio::sync::mpsc::channel::<Result<Bytes, BoxError>>(1);
+        let mut stream = sse(
+            channel_stream(inner_rx),
+            Duration::from_secs(10),
+            stop.into(),
+        );
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        inner_tx
+            .send(Ok(Bytes::from("data: tick\n\n")))
             .await
-            .into_iter()
-            .map(|r| r.unwrap())
-            .collect();
-        // Should get the first chunk, then timeout ends the stream.
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0], "data: first\n\n");
+            .unwrap();
+        assert_eq!(stream.next().await.unwrap().unwrap(), "data: tick\n\n");
+
+        // Polled and silent past t=10s, the deadline without the restart.
+        let next = tokio::time::timeout(Duration::from_secs(8), stream.next()).await;
+        assert!(next.is_err(), "cut before the restarted deadline: {next:?}");
+
+        match stream.next().await {
+            Some(Err(e)) if e.downcast_ref::<oagw_sdk::StreamIdleTimeout>().is_some() => {}
+            other => panic!("expected the idle error, got {other:?}"),
+        }
+        assert_eq!(start.elapsed(), Duration::from_secs(16));
+        drop(inner_tx);
+    }
+
+    /// An upstream body error is logged as a warning that names the stream,
+    /// and passed on after the chunks before it.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn an_upstream_body_error_is_logged_and_passed_on() {
+        let inner: BodyStream = Box::pin(futures_util::stream::iter([
+            Ok(Bytes::from("data: first\n\n")),
+            Err::<Bytes, BoxError>("connection reset".into()),
+        ]));
+        let labels = StreamLabels {
+            alias: "test".to_owned(),
+            path: "/sse".to_owned(),
+        };
+        let mut stream = log_upstream_body_error(inner, labels);
+
+        assert_eq!(stream.next().await.unwrap().unwrap(), "data: first\n\n");
+        let err = stream.next().await.unwrap().unwrap_err();
+        assert_eq!(err.to_string(), "connection reset");
+        assert!(stream.next().await.is_none());
+        assert!(logs_contain("WARN"));
+        assert!(logs_contain("Upstream response body failed mid-stream"));
+        assert!(logs_contain("alias=test"));
+        assert!(logs_contain("path=/sse"));
+        assert!(logs_contain("error=connection reset"));
+    }
+
+    /// A reader that polls late (client backpressure) still gets a chunk the
+    /// upstream sent before the idle deadline passed, not the idle error.
+    #[tokio::test(start_paused = true)]
+    async fn sse_lifecycle_a_ready_chunk_beats_an_expired_idle_deadline() {
+        let stop = CancellationToken::new();
+        let (inner_tx, inner_rx) = tokio::sync::mpsc::channel::<Result<Bytes, BoxError>>(1);
+        let mut stream = sse(
+            channel_stream(inner_rx),
+            Duration::from_secs(10),
+            stop.into(),
+        );
+        inner_tx
+            .send(Ok(Bytes::from("data: ready\n\n")))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(stream.next().await.unwrap().unwrap(), "data: ready\n\n");
     }
 
     /// Polls `stream` once more within a second: the shutdown error, then
@@ -275,7 +426,7 @@ pub(crate) mod tests {
             .send(Ok(Bytes::from("data: first\n\n")))
             .await
             .unwrap();
-        let mut stream = streaming_body_with_lifecycle(
+        let mut stream = sse(
             channel_stream(inner_rx),
             Duration::from_secs(300),
             streams.subscribe(),
@@ -299,7 +450,7 @@ pub(crate) mod tests {
         let streams = StreamShutdown::new();
         streams.end_streams();
         let (inner_tx, inner_rx) = tokio::sync::mpsc::channel::<Result<Bytes, BoxError>>(1);
-        let mut stream = streaming_body_with_lifecycle(
+        let mut stream = sse(
             channel_stream(inner_rx),
             Duration::from_secs(300),
             streams.subscribe(),
@@ -312,7 +463,7 @@ pub(crate) mod tests {
         assert!(inner_tx.is_closed(), "the upstream is still held");
         assert!(stream.next().await.is_none());
 
-        let mut stream = streaming_body_with_lifecycle(
+        let mut stream = sse(
             bytes_stream(vec!["data: late\n\n"]),
             Duration::from_secs(300),
             streams.subscribe(),
@@ -327,7 +478,7 @@ pub(crate) mod tests {
     async fn a_stop_followed_by_a_start_still_ends_the_open_streams() {
         let streams = StreamShutdown::new();
         let (_inner_tx, inner_rx) = tokio::sync::mpsc::channel::<Result<Bytes, BoxError>>(1);
-        let mut open = streaming_body_with_lifecycle(
+        let mut open = sse(
             channel_stream(inner_rx),
             Duration::from_secs(300),
             streams.subscribe(),
@@ -336,7 +487,7 @@ pub(crate) mod tests {
         streams.resume_streams(&CancellationToken::new());
         assert_ends_with_shutdown_error(&mut open).await;
 
-        let mut later = streaming_body_with_lifecycle(
+        let mut later = sse(
             bytes_stream(vec!["data: after\n\n"]),
             Duration::from_secs(300),
             streams.subscribe(),
@@ -353,7 +504,7 @@ pub(crate) mod tests {
     async fn a_start_leaves_open_streams_to_the_next_stop() {
         let streams = StreamShutdown::new();
         let (inner_tx, inner_rx) = tokio::sync::mpsc::channel::<Result<Bytes, BoxError>>(1);
-        let mut before = streaming_body_with_lifecycle(
+        let mut before = sse(
             channel_stream(inner_rx),
             Duration::from_secs(300),
             streams.subscribe(),
@@ -367,7 +518,7 @@ pub(crate) mod tests {
         assert_eq!(next.unwrap().unwrap().unwrap(), "data: on\n\n");
 
         let (_after_tx, after_rx) = tokio::sync::mpsc::channel::<Result<Bytes, BoxError>>(1);
-        let mut after = streaming_body_with_lifecycle(
+        let mut after = sse(
             channel_stream(after_rx),
             Duration::from_secs(300),
             streams.subscribe(),
@@ -385,7 +536,7 @@ pub(crate) mod tests {
         let root = CancellationToken::new();
         let streams = StreamShutdown::under(&root);
         let (_inner_tx, inner_rx) = tokio::sync::mpsc::channel::<Result<Bytes, BoxError>>(1);
-        let mut open = streaming_body_with_lifecycle(
+        let mut open = sse(
             channel_stream(inner_rx),
             Duration::from_secs(300),
             streams.subscribe(),

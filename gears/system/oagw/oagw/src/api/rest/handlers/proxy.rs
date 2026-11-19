@@ -292,7 +292,7 @@ async fn proxy(
     builder = builder.header("x-oagw-error-source", error_source.as_str());
 
     // Stream the response body.
-    let body = Body::from_stream(sdk_body.into_stream());
+    let body = Body::from_stream(yield_before_error(sdk_body.into_stream()));
 
     let mut response = builder
         .body(body)
@@ -310,6 +310,25 @@ async fn proxy(
     // of what is still a streamed body.
     response.extensions_mut().insert(ForeignPassthrough);
     Ok(response)
+}
+
+/// Passes `body` on, yielding once before an error item.
+///
+/// hyper's HTTP/1 server drops what it has buffered (the head and the last
+/// chunks) when the body fails in the same write pass. One `Pending` lets it
+/// flush them first, so the caller keeps everything sent before the error.
+/// This only helps when the socket takes the bytes at once; a full socket
+/// buffer still loses them.
+fn yield_before_error(
+    body: oagw_sdk::body::BodyStream,
+) -> impl futures_util::Stream<Item = Result<Bytes, oagw_sdk::body::BoxError>> + Send {
+    use futures_util::StreamExt as _;
+    body.then(|item| async move {
+        if item.is_err() {
+            tokio::task::yield_now().await;
+        }
+        item
+    })
 }
 
 #[cfg(test)]

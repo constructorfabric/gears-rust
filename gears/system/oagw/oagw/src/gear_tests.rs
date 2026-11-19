@@ -563,7 +563,7 @@ async fn in_memory_post_init_reconciles_and_start_spawns_nothing() {
 /// An SSE stream on a silent upstream, watching the gear's stream signal.
 fn open_stream(gear: &OutboundApiGatewayGear) -> oagw_sdk::body::BodyStream {
     let streams = gear.stream_shutdown.get().expect("init sets the signal");
-    crate::infra::proxy::streaming::streaming_body_with_lifecycle(
+    crate::infra::proxy::streaming::tests::sse(
         Box::pin(futures_util::stream::pending::<
             Result<bytes::Bytes, oagw_sdk::body::BoxError>,
         >()),

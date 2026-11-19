@@ -9,9 +9,13 @@ import json
 import httpx
 import pytest
 import websockets
-from websockets.exceptions import InvalidStatus
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from .helpers import APIKEY_AUTH_PLUGIN_ID, create_route, create_upstream, unique_alias
+from .private_server import private_oagw
+
+# The private server's WebSocket idle timeout in 14.4.
+WS_IDLE_TIMEOUT_SECS = 1
 
 
 async def _ws_uri(base, headers, mock_url, cleanup, prefix, paths=("/ws/echo",), **upstream_kwargs):
@@ -372,3 +376,44 @@ async def test_websocket_handshake_auth_injected(
     async with websockets.connect(f"{base}/ws/handshake", additional_headers=oagw_headers) as ws:
         handshake = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
         assert handshake["headers"].get("authorization") == "Bearer sk-test-e2e-fake-key"
+
+
+@pytest.fixture
+def short_ws_idle_oagw():
+    """A private server whose WebSocket idle timeout is WS_IDLE_TIMEOUT_SECS."""
+    with private_oagw(
+        {"websocket_idle_timeout_secs": WS_IDLE_TIMEOUT_SECS}, log_suffix="oagw-ws-idle",
+    ) as server:
+        yield server
+
+
+@pytest.mark.scenario("negative-14.4-ws-connection-idle-timeout-enforced")
+@pytest.mark.timeout(60, func_only=True)
+@pytest.mark.asyncio
+async def test_websocket_idle_timeout_sends_close_1001(
+    short_ws_idle_oagw, oagw_headers, mock_upstream_url, mock_upstream,
+):
+    """Scenario 14.4: an idle relay ends with Close 1001 "Going Away"; a bare EOF fails."""
+    _ = mock_upstream
+    _, base_url = short_ws_idle_oagw
+    alias = unique_alias("ws-idle")
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        # No cleanup: the private server keeps them in memory.
+        upstream = await create_upstream(
+            client, base_url, oagw_headers, mock_upstream_url, alias=alias,
+        )
+        await create_route(client, base_url, oagw_headers, upstream["id"], ["GET"], "/ws/echo")
+    ws_url = base_url.replace("http://", "ws://") + f"/oagw/v1/proxy/{alias}/ws/echo"
+
+    # No client pings: they would keep the relay from going idle.
+    async with websockets.connect(
+        ws_url, additional_headers=oagw_headers, ping_interval=None,
+    ) as ws:
+        await ws.send("alive")
+        assert await ws.recv() == "alive"
+        with pytest.raises(ConnectionClosed) as exc_info:
+            await asyncio.wait_for(ws.recv(), timeout=WS_IDLE_TIMEOUT_SECS + 5)
+
+    close = exc_info.value.rcvd
+    assert close is not None, "the connection ended without a Close frame"
+    assert (close.code, close.reason) == (1001, "Going Away")

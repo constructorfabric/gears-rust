@@ -8,7 +8,9 @@ use http::{HeaderMap, StatusCode};
 use crate::body::Body;
 use crate::codec::Json;
 use crate::error::StreamingError;
-use crate::sse::{ServerEvent, is_server_events_response, parse_server_events_stream};
+use crate::sse::{
+    DEFAULT_MAX_EVENT_BYTES, ServerEvent, is_server_events_response, parse_server_events_stream,
+};
 
 /// Trait for types that can be extracted from an SSE event.
 ///
@@ -70,12 +72,13 @@ pub enum ServerEventsResponse<T: FromServerEvent = ServerEvent> {
 /// Created via [`from_response`](ServerEventsStream::from_response), which
 /// checks the `Content-Type` header and returns a [`ServerEventsResponse`]
 /// — either an event stream or the original response unchanged.
-#[allow(clippy::type_complexity)]
 pub struct ServerEventsStream<T: FromServerEvent = ServerEvent> {
-    inner: Pin<Box<dyn Stream<Item = Result<T, StreamingError>> + Send>>,
+    inner: EventStream<T>,
     status: StatusCode,
     headers: HeaderMap,
 }
+
+type EventStream<T> = Pin<Box<dyn Stream<Item = Result<T, StreamingError>> + Send>>;
 
 impl<T: FromServerEvent> std::fmt::Debug for ServerEventsStream<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -95,8 +98,22 @@ impl ServerEventsStream {
     /// Returns [`ServerEventsResponse::Response`] with the **original response**
     /// if it's not SSE, so you can fall back to normal processing without
     /// losing the response.
+    ///
+    /// One event may take up to [`DEFAULT_MAX_EVENT_BYTES`]; see
+    /// [`from_response_with_max_event_bytes`](Self::from_response_with_max_event_bytes).
     pub fn from_response<T: FromServerEvent>(
         resp: impl Into<http::Response<Body>>,
+    ) -> ServerEventsResponse<T> {
+        Self::from_response_with_max_event_bytes(resp, DEFAULT_MAX_EVENT_BYTES)
+    }
+
+    /// [`from_response`](Self::from_response) with one event limited to
+    /// `max_event_bytes`, counting its lines with their line endings. An
+    /// event over it, or a body that never sends the blank line ending an
+    /// event, ends the stream with [`StreamingError::EventTooLarge`].
+    pub fn from_response_with_max_event_bytes<T: FromServerEvent>(
+        resp: impl Into<http::Response<Body>>,
+        max_event_bytes: usize,
     ) -> ServerEventsResponse<T> {
         let resp = resp.into();
         if !is_server_events_response(resp.headers()) {
@@ -104,11 +121,10 @@ impl ServerEventsStream {
         }
 
         let (parts, body) = resp.into_parts();
-        let event_stream = parse_server_events_stream(body.into_stream());
-        let mapped = event_stream.map(|r| r.and_then(T::from_server_event));
-
+        let events = parse_server_events_stream(body.into_stream(), max_event_bytes)
+            .map(|r| r.and_then(T::from_server_event));
         ServerEventsResponse::Events(ServerEventsStream {
-            inner: Box::pin(mapped),
+            inner: Box::pin(events),
             status: parts.status,
             headers: parts.headers,
         })
