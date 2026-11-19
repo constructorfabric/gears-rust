@@ -415,6 +415,10 @@ async fn constraints_hold_after_the_upgrade() {
             ),
         ),
         (
+            "group membership type",
+            format!("UPDATE resource_group SET membership_type_id = 999 WHERE id = X'{ROOT}'"),
+        ),
+        (
             "dictionary row in use",
             format!("DELETE FROM gts_type WHERE id = {USER_KEY}"),
         ),

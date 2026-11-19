@@ -1,4 +1,8 @@
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "integration tests: a failed fixture or assertion step is a test failure"
+)]
 //! Resource-group over types-registry type definitions (T38b): which operations
 //! read a definition, which lifecycle they accept, and that reads and cleanup
 //! never depend on the registry.
@@ -25,7 +29,7 @@ fn code(name: &str) -> String {
     )
 }
 
-/// A member type, a root type admitting it, and a child type under the root.
+/// A member type, and a root type and a child type under it, both admitting it.
 fn publish_family() -> (String, String, String) {
     let member = code("member");
     common::publish_type(CreateTypeRequest {
@@ -47,6 +51,7 @@ fn publish_family() -> (String, String, String) {
     common::publish_type(CreateTypeRequest {
         code: child.clone(),
         allowed_parent_types: vec![root.clone()],
+        allowed_membership_types: vec![member.clone()],
         ..CreateTypeRequest::default()
     });
     (member, root, child)
@@ -269,7 +274,10 @@ async fn groups_of_a_deleted_type_stay_readable_updatable_and_deletable() {
     let r1 = common::create_root_group(&groups, &ctx, &root, "r1", tenant).await;
     let r2 = common::create_child_group(&groups, &ctx, &root, r1.id, "r2", tenant).await;
     let c = common::create_child_group(&groups, &ctx, &child, r1.id, "c", tenant).await;
-    members.add_membership(&ctx, c.id, &member, "m1").await.ok();
+    members
+        .add_membership(&ctx, c.id, &member, "m1")
+        .await
+        .expect("the child type admits the member type");
     members
         .add_membership(&ctx, r1.id, &member, "m2")
         .await
@@ -308,15 +316,31 @@ async fn groups_of_a_deleted_type_stay_readable_updatable_and_deletable() {
         .await
         .expect_err("the retained schema applies");
     assert!(matches!(err, DomainError::Validation { .. }), "{err:?}");
-    groups
+    let err = groups
+        .move_group(&ctx, c.id, None)
+        .await
+        .expect_err("the retained schema does not allow a root child");
+    assert!(matches!(err, DomainError::Validation { .. }), "{err:?}");
+    let unmoved = groups.get_group(&ctx, c.id).await.expect("read");
+    assert_eq!(
+        unmoved.hierarchy.parent_id,
+        Some(r1.id),
+        "the refused move changed nothing"
+    );
+    let moved = groups
         .move_group(&ctx, c.id, Some(r2.id))
         .await
-        .expect("a move applies the retained placement traits");
+        .expect("the retained schema allows a root parent");
+    assert_eq!(moved.hierarchy.parent_id, Some(r2.id));
+    let stored = groups.get_group(&ctx, c.id).await.expect("read");
+    assert_eq!(stored.hierarchy.parent_id, Some(r2.id));
 
-    members
-        .remove_membership(&ctx, r1.id, &member, "m2")
-        .await
-        .expect("cleanup");
+    for (group, resource) in [(c.id, "m1"), (r1.id, "m2")] {
+        members
+            .remove_membership(&ctx, group, &member, resource)
+            .await
+            .expect("cleanup of a deleted type's membership");
+    }
     groups
         .delete_group(&ctx, r1.id, true)
         .await
@@ -324,6 +348,48 @@ async fn groups_of_a_deleted_type_stay_readable_updatable_and_deletable() {
 }
 
 // -------- replacement metadata and portable membership key bounds --------
+
+/// A new group's metadata is validated against its type's schema, as a root
+/// and under a parent alike, and a refused create stores nothing.
+#[tokio::test]
+async fn group_creation_validates_metadata_against_the_type_schema() {
+    let db = common::test_db().await;
+    let groups = common::make_group_service(db);
+    let tenant = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant);
+    let (_, root, _) = publish_family();
+    let invalid = Some(json!({ "tier": 7 }));
+
+    let err = groups
+        .create_group(
+            &ctx,
+            CreateGroupRequest::new(root.clone(), "bad-root").with_metadata(invalid.clone()),
+            tenant,
+        )
+        .await
+        .expect_err("a root with invalid metadata");
+    assert!(matches!(err, DomainError::Validation { .. }), "{err:?}");
+
+    let r = common::create_root_group(&groups, &ctx, &root, "r", tenant).await;
+    let err = groups
+        .create_group(
+            &ctx,
+            CreateGroupRequest::new(root, "bad-child")
+                .with_parent_id(Some(r.id))
+                .with_metadata(invalid),
+            tenant,
+        )
+        .await
+        .expect_err("a child with invalid metadata");
+    assert!(matches!(err, DomainError::Validation { .. }), "{err:?}");
+
+    let listed = groups
+        .list_groups(&ctx, &ODataQuery::default())
+        .await
+        .unwrap();
+    let ids: Vec<_> = listed.items.iter().map(|g| g.id).collect();
+    assert_eq!(ids, vec![r.id], "only the valid root is stored");
+}
 
 #[tokio::test]
 async fn required_metadata_cannot_be_cleared_by_a_replacement_update() {
@@ -576,17 +642,29 @@ impl RgTypeCatalog for ChangeRowDuringRuleRead {
     }
 }
 
+/// Removes a test database directory, also when the test fails.
+struct TempDir(std::path::PathBuf);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.0) {
+            eprintln!("leaving {}: {e}", self.0.display());
+        }
+    }
+}
+
 /// A file database, so a second connection sees the services' rows.
 async fn file_db() -> (
     Arc<toolkit_db::DBProvider<toolkit_db::DbError>>,
     sea_orm::DatabaseConnection,
-    std::path::PathBuf,
+    TempDir,
 ) {
     use resource_group::infra::storage::migrations::Migrator;
     use sea_orm_migration::MigratorTrait;
     let dir = std::env::temp_dir().join(format!("rg-race-{}", Uuid::now_v7()));
     std::fs::create_dir_all(&dir).unwrap();
-    let dsn = format!("sqlite://{}?mode=rwc", dir.join("rg.db").display());
+    let dir = TempDir(dir);
+    let dsn = format!("sqlite://{}?mode=rwc", dir.0.join("rg.db").display());
     let db = toolkit_db::connect_db(
         &dsn,
         toolkit_db::ConnectOpts {
@@ -621,7 +699,7 @@ async fn a_group_row_changed_after_the_rule_read_refuses_the_membership() {
         ("gts_type_id", &other_root),
         ("membership_type_id", &other_binding),
     ] {
-        let (db, raw, dir) = file_db().await;
+        let (db, raw, _dir) = file_db().await;
         let groups = common::make_group_service(db.clone());
         // Keys both of the other root's identifiers in the dictionary.
         common::create_root_group(&groups, &ctx, &other_root, "other", tenant).await;
@@ -650,8 +728,6 @@ async fn a_group_row_changed_after_the_rule_read_refuses_the_membership() {
             .await
             .unwrap();
         assert!(stored.items.is_empty(), "{column}: nothing written");
-        drop(members);
-        std::fs::remove_dir_all(dir).expect("remove the test database");
     }
 }
 
@@ -661,9 +737,15 @@ async fn a_group_row_changed_after_the_rule_read_refuses_the_membership() {
 async fn a_failed_membership_insert_keys_no_type() {
     let db = common::test_db().await;
     let before = dictionary_rows(&db).await;
-    common::insert_membership_directly(&db, Uuid::now_v7(), &code("never_keyed"), "r1")
+    let err = common::insert_membership_directly(&db, Uuid::now_v7(), &code("never_keyed"), "r1")
         .await
         .expect_err("no such group");
+    // The dictionary row was written, then the membership's foreign key
+    // refused the insert.
+    assert!(
+        matches!(&err, DomainError::Database(e) if e.to_string().contains("FOREIGN KEY")),
+        "{err:?}"
+    );
     assert_eq!(dictionary_rows(&db).await, before);
 }
 

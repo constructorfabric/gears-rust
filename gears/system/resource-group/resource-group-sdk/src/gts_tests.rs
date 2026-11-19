@@ -6,7 +6,7 @@ use gts::GtsSchema;
 use serde_json::json;
 use toolkit_gts::gts_id;
 
-use super::{MEMBERSHIP_TYPE_V1, ResourceGroupTypeV1};
+use super::{MEMBERSHIP_TYPE_V1, ResourceGroupMembershipV1, ResourceGroupTypeV1};
 
 const BASE: &str = gts_id!("cf.core.rg.type.v1~");
 
@@ -31,4 +31,18 @@ fn the_group_envelope_carries_an_optional_metadata_object() {
         .cloned()
         .unwrap_or_default();
     assert_eq!(required, [json!("parent_type"), json!("membership_type")]);
+}
+
+#[test]
+fn the_membership_base_requires_an_any_type_resource_type() {
+    let schema = ResourceGroupMembershipV1::gts_schema_with_refs();
+    assert_eq!(schema["x-gts-abstract"], true, "{schema}");
+    assert_eq!(
+        schema["required"],
+        json!(["resource_type"]),
+        "only the member type is part of a membership payload"
+    );
+    let resource_type = &schema["properties"]["resource_type"];
+    assert_eq!(resource_type["type"], "string");
+    assert_eq!(resource_type["x-gts-type-ref"], "gts.*");
 }

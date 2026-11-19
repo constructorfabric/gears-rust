@@ -125,9 +125,11 @@ pub struct ResourceGroupType {
 #[derive(Clone, Copy, Default)]
 pub struct TestTypes;
 
-// `async` keeps the call shape fixtures had against the removed RG type
-// service; publishing to the in-memory registry itself does not await.
-#[allow(clippy::unused_async)]
+#[expect(
+    clippy::unused_async,
+    reason = "keeps the call shape fixtures had against the removed RG type service; \
+              publishing to the in-memory registry does not await"
+)]
 impl TestTypes {
     /// Publish `req` as a type derived from the RG base (unconditionally:
     /// the registry, not resource-group, validates type definitions).
