@@ -361,6 +361,10 @@ pub fn intersect_scopes(a: &AccessScope, b: &AccessScope) -> AccessScope {
 }
 
 #[cfg(test)]
+#[path = "authz_tests.rs"]
+mod authz_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

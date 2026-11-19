@@ -487,3 +487,7 @@ fn apply_leaf(parsed: &mut ParsedFilter, leaf: Leaf) -> Result<(), DomainError> 
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "list_filter_tests.rs"]
+mod tests;
