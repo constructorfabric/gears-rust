@@ -34,13 +34,17 @@ pub fn apply_passthrough(
             strip_forwarding_headers(&mut all);
             all
         }
+        // Every line of a repeated header, in order, as `All` forwards it;
+        // a signing phase must see what the client sent, not the first line.
         PassthroughMode::Allowlist => {
             let mut h = HeaderMap::new();
             for name in allowlist {
                 if let Ok(n) = HeaderName::from_bytes(name.to_lowercase().as_bytes())
-                    && let Some(v) = inbound.get(&n)
+                    && !h.contains_key(&n)
                 {
-                    h.insert(n, v.clone());
+                    for v in inbound.get_all(&n) {
+                        h.append(n.clone(), v.clone());
+                    }
                 }
             }
             h
@@ -956,6 +960,29 @@ mod tests {
 
         assert_eq!(out.get("x-allowed").unwrap(), "yes");
         assert!(out.get("x-blocked").is_none());
+    }
+
+    /// Every line of an allowlisted header is kept, in order, once even if
+    /// the allowlist names it twice.
+    #[test]
+    fn passthrough_allowlist_keeps_repeated_lines() {
+        let mut inbound = HeaderMap::new();
+        inbound.append("x-multi", "b".parse().unwrap());
+        inbound.append("x-multi", "a".parse().unwrap());
+        inbound.append("x-multi", HeaderValue::from_bytes(b"c\xff").unwrap());
+
+        let out = apply_passthrough(
+            &inbound,
+            &PassthroughMode::Allowlist,
+            &["x-multi".into(), "X-Multi".into()],
+        );
+
+        let lines: Vec<&[u8]> = out
+            .get_all("x-multi")
+            .iter()
+            .map(|v| v.as_bytes())
+            .collect();
+        assert_eq!(lines, [&b"b"[..], b"a", b"c\xff"]);
     }
 
     #[test]

@@ -11,6 +11,7 @@ use http::{HeaderMap, HeaderValue};
 use oagw_sdk::body::{Body, BodyStream};
 use oagw_sdk::{field, reason};
 use tokio_util::sync::CancellationToken;
+use toolkit_http_proxy::sanitize::{self, RequestKind};
 use toolkit_http_proxy::{ReplayableBody, UpgradeOutcome, empty_body, full_body, stream_body};
 use toolkit_security::SecurityContext;
 
@@ -23,8 +24,8 @@ use crate::domain::model::{
 };
 use crate::domain::plugin::credentials::CredentialMode;
 use crate::domain::plugin::{
-    AuthContext, GuardContext, GuardDecision, PluginError, TransformErrorContext,
-    TransformRequestContext, TransformResponseContext,
+    AuthContext, AuthPlugin, GuardContext, GuardDecision, PluginError, SigningBody,
+    TransformErrorContext, TransformRequestContext, TransformResponseContext,
 };
 use crate::domain::ports::OagwMetricsPort;
 use crate::domain::ports::metric_labels::{self, RateLimitBucket, StreamOutcome, phase};
@@ -46,7 +47,7 @@ use super::engine::{
 };
 use super::headers;
 use super::streaming::StreamShutdown;
-use super::{request_builder, secret_ref, streaming};
+use super::{request_builder, secret_ref, signing, streaming};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default maximum request body size: 100 MB.
@@ -202,6 +203,15 @@ impl DataPlaneServiceImpl {
     #[must_use]
     pub fn with_streaming_idle_timeout(mut self, timeout: Duration) -> Self {
         self.streaming_idle_timeout = timeout;
+        self
+    }
+
+    /// Register an auth plugin under `plugin_id`, replacing a built-in of
+    /// that id, for pipeline tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub(crate) fn with_auth_plugin(mut self, plugin_id: &str, plugin: Arc<dyn AuthPlugin>) -> Self {
+        self.auth_registry.insert(plugin_id, plugin);
         self
     }
 
@@ -1113,6 +1123,7 @@ impl DataPlaneServiceImpl {
         // guard rejection does not load it either. `config` mode keeps its
         // order.
         let mut early_rate_limit = None;
+        let mut signer = None;
         if request_ref.is_some() {
             early_rate_limit = Some(check_rate_limits(
                 &self.rate_limiter,
@@ -1142,7 +1153,8 @@ impl DataPlaneServiceImpl {
                 phase::AUTH,
                 auth_start.elapsed().as_secs_f64(),
             );
-            auth_result?;
+            let plugin = auth_result?;
+            signer = plugin.signs().then_some((plugin, auth));
         }
 
         // 5b. Execute guard plugins (upstream then route).
@@ -1324,7 +1336,7 @@ impl DataPlaneServiceImpl {
             .as_ref()
             .map_or("/", |h| h.path.as_str());
         let remaining_suffix = route_suffix(&path_suffix, route_path)?;
-        let url = request_builder::build_upstream_url(
+        let mut url = request_builder::build_upstream_url(
             endpoint,
             route_path,
             remaining_suffix,
@@ -1396,6 +1408,87 @@ impl DataPlaneServiceImpl {
             rate_limit_outcome,
             host: &host_label,
         };
+
+        // Passthrough may have dropped `Connection`; the handshake needs it.
+        // Set here so the signing phase sees it.
+        if is_upgrade {
+            outbound_headers.insert(
+                http::header::CONNECTION,
+                HeaderValue::from_static("upgrade"),
+            );
+        }
+
+        // 8c. Signing phase of the auth plugin (ADR-0023): the last change to
+        //     the URL and headers. It sees them as sent and the body (empty
+        //     for a WebSocket handshake). A failure stops the request.
+        //     `request_ref` mode runs no auth plugin, so it has no signing.
+        //     The plugin's `sign` is timed as phase="sign", on errors and
+        //     timeouts too.
+        if let Some((plugin, auth)) = signer {
+            // The engine's header hygiene, applied now so the signer sees what
+            // the engine sends; the engine's own pass then changes nothing.
+            // A handshake is validated first, as the engine does, so one it
+            // would refuse is not normalised into one it accepts.
+            let kind = if is_upgrade {
+                sanitize::validate_websocket_upgrade(&method, &outbound_headers, true)
+                    .map_err(|e| map_proxy_error(&e, &instance_uri))?;
+                RequestKind::WebSocketUpgrade
+            } else {
+                RequestKind::Regular
+            };
+            sanitize::sanitize_request_headers(&mut outbound_headers, kind);
+            let uri = url
+                .parse::<http::Uri>()
+                .map_err(|e| DomainError::DownstreamError {
+                    detail: format!("invalid upstream request: {e}"),
+                    instance: instance_uri.clone(),
+                })?;
+            // The handshake goes out without a body, whatever the caller sent.
+            let body = if is_upgrade {
+                SigningBody::Buffered(Bytes::new())
+            } else if body_stream.is_some() {
+                SigningBody::Streamed
+            } else {
+                SigningBody::Buffered(body_bytes.clone())
+            };
+            let input = signing::SigningInput {
+                method: &method,
+                uri,
+                port: endpoint.port,
+                body,
+                config: auth.config.clone().unwrap_or_default(),
+                security_context: ctx.clone(),
+            };
+            // cancel-safe: sign_request changes the headers only after the
+            // plugin's sign returns, with no await after it, and the URL is
+            // replaced only on success; a timeout fails the request.
+            tracing::debug!(plugin = %auth.plugin_type, "signing the request");
+            let sign_start = std::time::Instant::now();
+            let signed = tokio::time::timeout_at(
+                deadline,
+                signing::sign_request(plugin.as_ref(), input, &mut outbound_headers),
+            )
+            .await;
+            self.metrics.record_request_duration_seconds(
+                &host_label,
+                &path_label,
+                phase::SIGN,
+                sign_start.elapsed().as_secs_f64(),
+            );
+            let signed_url = signed
+                .map_err(|_| DomainError::RequestTimeout {
+                    detail: format!(
+                        "signing the request timed out after {:?}",
+                        self.request_timeout
+                    ),
+                    instance: instance_uri.clone(),
+                })?
+                .map_err(|e| auth_plugin_error(e, &instance_uri))?;
+            tracing::debug!(plugin = %auth.plugin_type, "request signed");
+            if let Some(signed_url) = signed_url {
+                url = signed_url;
+            }
+        }
 
         // 9. WebSocket upgrade: tunnel on a dedicated upstream connection,
         // only after the upstream switched protocols.
@@ -1524,13 +1617,13 @@ impl DataPlaneServiceImpl {
         pipeline: &ResponsePipelineCtx<'_>,
         instance_uri: &str,
     ) -> Result<http::Response<Body>, DomainError> {
-        let mut headers = outbound_headers.clone();
-        // Passthrough may have dropped `Connection`; the handshake needs it.
-        headers.insert(
-            http::header::CONNECTION,
-            HeaderValue::from_static("upgrade"),
-        );
-        let req = build_outbound_request(method, url, headers, empty_body(), instance_uri)?;
+        let req = build_outbound_request(
+            method,
+            url,
+            outbound_headers.clone(),
+            empty_body(),
+            instance_uri,
+        )?;
 
         let upgrade_timeout = self.request_timeout;
         let outcome = match tokio::time::timeout_at(
@@ -1831,7 +1924,8 @@ fn limit_body_stream(
 }
 
 /// Execute the auth plugin for the upstream and set the headers it asks for
-/// (e.g. Bearer token, API key) on the outbound request.
+/// (e.g. Bearer token, API key) on the outbound request. Returns the plugin
+/// for its signing phase.
 ///
 /// Only the named headers change: other lines, repeated ones and non-UTF-8
 /// values included, pass through as the client sent them.
@@ -1841,7 +1935,7 @@ async fn execute_auth_plugin(
     outbound_headers: &mut HeaderMap,
     ctx: &SecurityContext,
     instance_uri: &str,
-) -> Result<(), DomainError> {
+) -> Result<Arc<dyn AuthPlugin>, DomainError> {
     tracing::debug!(plugin = %auth.plugin_type, "executing auth plugin");
     let plugin = auth_registry.resolve(&auth.plugin_type).map_err(|e| {
         DomainError::AuthenticationFailed {
@@ -1857,7 +1951,7 @@ async fn execute_auth_plugin(
         .and_then(|()| set_auth_headers(outbound_headers, auth_ctx.set_headers))
         .map_err(|e| auth_plugin_error(e, instance_uri))?;
     tracing::debug!(plugin = %auth.plugin_type, "auth plugin succeeded");
-    Ok(())
+    Ok(plugin)
 }
 
 /// Set the headers an auth plugin asked for, each replacing any line of the
@@ -4349,6 +4443,7 @@ pub(crate) mod tests {
         };
         match execute_auth_plugin(&svc.auth_registry, &auth, &mut HeaderMap::new(), &ctx, "/i")
             .await
+            .map(|_| ())
         {
             Err(DomainError::AuthenticationFailed { reason: r, .. }) => {
                 assert_eq!(r, reason::auth::PLUGIN_NOT_FOUND);

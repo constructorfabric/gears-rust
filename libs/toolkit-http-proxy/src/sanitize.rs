@@ -178,6 +178,17 @@ pub enum RequestKind {
     WebSocketUpgrade,
 }
 
+/// Whether [`sanitize_request_headers`] drops every `name` line from a
+/// request head, whatever the request's `Connection` field nominates. Lets
+/// a caller that changes the head after sanitizing it refuse a header the
+/// engine would drop. `Trailer` is filtered rather than dropped, so it is
+/// not included. `TE` is included although `TE: trailers` survives: a
+/// caller using this predicate refuses every `TE` line.
+#[must_use]
+pub fn is_dropped_request_header(name: &HeaderName) -> bool {
+    REQUEST_DROPPED.contains(name)
+}
+
 /// Sanitize outbound request headers in place.
 ///
 /// `Trailer` is filtered like the trailers themselves

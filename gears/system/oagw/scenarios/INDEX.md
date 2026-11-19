@@ -460,7 +460,7 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 
 #### Request metrics count every request
 - **Scenario**: *Section 22.2 — no separate file.*
-- **Mechanism**: `oagw_requests_total` increments once per request with a response, with correct labels (`host`, `http.request.method`, `http.route`, `http.response.status_code`): the upstream's status, 4xx/5xx included, or for a gateway error (401, 403, 429, 502, ...) the status the client gets. Histogram `oagw_request_duration_seconds` records `phase=total` (request start to the response head), `resolve` and `auth`. Verified by Rust unit tests: the e2e suite has no metrics collector.
+- **Mechanism**: `oagw_requests_total` increments once per request with a response, with correct labels (`host`, `http.request.method`, `http.route`, `http.response.status_code`): the upstream's status, 4xx/5xx included, or for a gateway error (401, 403, 429, 502, ...) the status the client gets. Histogram `oagw_request_duration_seconds` records `phase=total` (request start to the response head), `resolve`, `auth` and, for an auth plugin that signs, `sign`. Verified by Rust unit tests: the e2e suite has no metrics collector.
 
 #### Error metrics increment on gateway errors
 - **Scenario**: *Section 22.3 — no separate file.*
