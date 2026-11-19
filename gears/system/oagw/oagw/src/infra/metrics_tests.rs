@@ -6,7 +6,7 @@ use opentelemetry_sdk::metrics::{
 
 use crate::domain::plugin::credentials::CredentialMode;
 use crate::domain::ports::OagwMetricsPort;
-use crate::domain::ports::metric_labels::phase;
+use crate::domain::ports::metric_labels::{RateLimitBucket, StreamOutcome, phase};
 
 const CARDINALITY_LIMIT: usize = 2000;
 
@@ -178,12 +178,20 @@ fn rate_limit_exceeded_counter_increments() {
     let (provider, exporter) = local_provider();
     let m = make_meter(&provider, "oagw");
 
-    m.record_rate_limit_exceeded("openai", "/v1/chat");
-    m.record_rate_limit_exceeded("openai", "/v1/chat");
+    m.record_rate_limit_exceeded("openai", "/v1/chat", RateLimitBucket::Route);
+    m.record_rate_limit_exceeded("openai", "/v1/chat", RateLimitBucket::Route);
+    m.record_rate_limit_exceeded("openai", "/v1/chat", RateLimitBucket::Pool);
 
     provider.force_flush().unwrap();
 
-    assert_eq!(counter_u64(&exporter, "oagw_rate_limit_exceeded"), 2);
+    assert_eq!(counter_u64(&exporter, "oagw_rate_limit_exceeded"), 3);
+    assert_eq!(
+        counter_points(&exporter, "oagw_rate_limit_exceeded"),
+        points(&[
+            ("bucket=pool,host=openai,http.route=/v1/chat", 1),
+            ("bucket=route,host=openai,http.route=/v1/chat", 2),
+        ])
+    );
 }
 
 #[test]
@@ -258,19 +266,42 @@ fn in_flight_returns_to_zero_after_balanced_calls() {
 
 // ── Gauge ───────────────────────────────────────────────────────────────
 
+/// Each bucket keeps its own series: a wider bucket checked later does not
+/// overwrite the route's ratio (#4989). Within a bucket the last value wins.
 #[test]
-fn rate_limit_usage_ratio_records_last_value() {
+fn rate_limit_usage_ratio_records_a_series_per_bucket() {
     let (provider, exporter) = local_provider();
     let m = make_meter(&provider, "oagw");
 
-    m.record_rate_limit_usage_ratio("openai", "/v1/chat", 0.25);
-    m.record_rate_limit_usage_ratio("openai", "/v1/chat", 0.75);
+    m.record_rate_limit_usage_ratio("openai", "/v1/chat", RateLimitBucket::Route, 0.5);
+    m.record_rate_limit_usage_ratio("openai", "/v1/chat", RateLimitBucket::Route, 0.9);
+    m.record_rate_limit_usage_ratio("openai", "/v1/chat", RateLimitBucket::ShadowedRoute, 0.25);
+    m.record_rate_limit_usage_ratio("openai", "/v1/chat", RateLimitBucket::Upstream, 0.1);
+    m.record_rate_limit_usage_ratio("openai", "/v1/chat", RateLimitBucket::Pool, 0.75);
 
     provider.force_flush().unwrap();
 
-    let v = gauge_last_f64(&exporter, "oagw_rate_limit_usage_ratio")
-        .expect("gauge should have at least one data point");
-    assert!((v - 0.75).abs() < f64::EPSILON, "expected 0.75, got {v}");
+    assert_eq!(
+        gauge_points_f64(&exporter, "oagw_rate_limit_usage_ratio"),
+        [
+            (
+                "bucket=pool,host=openai,http.route=/v1/chat".to_owned(),
+                0.75
+            ),
+            (
+                "bucket=route,host=openai,http.route=/v1/chat".to_owned(),
+                0.9
+            ),
+            (
+                "bucket=shadowed_route,host=openai,http.route=/v1/chat".to_owned(),
+                0.25
+            ),
+            (
+                "bucket=upstream,host=openai,http.route=/v1/chat".to_owned(),
+                0.1
+            ),
+        ]
+    );
 }
 
 #[test]
@@ -278,7 +309,7 @@ fn rate_limit_usage_ratio_clamps_values_above_one() {
     let (provider, exporter) = local_provider();
     let m = make_meter(&provider, "oagw");
 
-    m.record_rate_limit_usage_ratio("openai", "/v1/chat", 2.5);
+    m.record_rate_limit_usage_ratio("openai", "/v1/chat", RateLimitBucket::Route, 2.5);
     provider.force_flush().unwrap();
 
     let v = gauge_last_f64(&exporter, "oagw_rate_limit_usage_ratio")
@@ -294,7 +325,7 @@ fn rate_limit_usage_ratio_clamps_negative_values() {
     let (provider, exporter) = local_provider();
     let m = make_meter(&provider, "oagw");
 
-    m.record_rate_limit_usage_ratio("openai", "/v1/chat", -0.5);
+    m.record_rate_limit_usage_ratio("openai", "/v1/chat", RateLimitBucket::Route, -0.5);
     provider.force_flush().unwrap();
 
     let v = gauge_last_f64(&exporter, "oagw_rate_limit_usage_ratio")
@@ -414,15 +445,48 @@ fn websocket_session_duration_histogram_records() {
     let (provider, exporter) = local_provider();
     let m = make_meter(&provider, "oagw");
 
-    m.record_websocket_session_duration_seconds("openai", 2.5);
-    m.record_websocket_session_duration_seconds("openai", 120.0);
-    m.record_websocket_session_duration_seconds("openai", 3600.0);
+    m.record_websocket_session_duration_seconds("openai", StreamOutcome::Completed, 2.5);
+    m.record_websocket_session_duration_seconds("openai", StreamOutcome::Completed, 120.0);
+    m.record_websocket_session_duration_seconds("openai", StreamOutcome::Error, 3600.0);
 
     provider.force_flush().unwrap();
 
     assert_eq!(
         histogram_count(&exporter, "oagw_websocket_session_duration_seconds"),
         3
+    );
+    assert_eq!(
+        histogram_points(&exporter, "oagw_websocket_session_duration_seconds"),
+        points(&[
+            ("host=openai,outcome=completed", 2),
+            ("host=openai,outcome=error", 1)
+        ])
+    );
+}
+
+/// The stream duration carries how the body ended, under the request's
+/// host and route (#4987).
+#[test]
+fn stream_duration_histogram_carries_the_outcome() {
+    let (provider, exporter) = local_provider();
+    let m = make_meter(&provider, "oagw");
+
+    m.record_stream_duration_seconds("openai", "/v1/chat", StreamOutcome::Completed, 0.2);
+    m.record_stream_duration_seconds("openai", "/v1/chat", StreamOutcome::Completed, 900.0);
+    m.record_stream_duration_seconds("openai", "/v1/chat", StreamOutcome::Error, 30.0);
+    m.record_stream_duration_seconds("openai", "/v1/chat", StreamOutcome::Cancelled, 1.0);
+    m.record_stream_duration_seconds("openai", "/v1/chat", StreamOutcome::Shutdown, 5.0);
+
+    provider.force_flush().unwrap();
+
+    assert_eq!(
+        histogram_points(&exporter, "oagw_stream_duration_seconds"),
+        points(&[
+            ("host=openai,http.route=/v1/chat,outcome=cancelled", 1),
+            ("host=openai,http.route=/v1/chat,outcome=completed", 2),
+            ("host=openai,http.route=/v1/chat,outcome=error", 1),
+            ("host=openai,http.route=/v1/chat,outcome=shutdown", 1),
+        ])
     );
 }
 
@@ -650,6 +714,52 @@ fn gauge_points(exporter: &InMemoryMetricExporter, name: &str) -> Vec<(String, u
                     points.extend(
                         g.data_points()
                             .map(|dp| (labels(dp.attributes()), dp.value())),
+                    );
+                }
+            }
+        }
+    }
+    points.sort();
+    points
+}
+
+/// The last value of each `f64` gauge data point named `name`, by its
+/// string attributes.
+fn gauge_points_f64(exporter: &InMemoryMetricExporter, name: &str) -> Vec<(String, f64)> {
+    let metrics = exporter.get_finished_metrics().unwrap();
+    let mut points = Vec::new();
+    for rm in &metrics {
+        for sm in rm.scope_metrics() {
+            for m in sm.metrics() {
+                if m.name() == name
+                    && let AggregatedMetrics::F64(MetricData::Gauge(g)) = m.data()
+                {
+                    points.extend(
+                        g.data_points()
+                            .map(|dp| (labels(dp.attributes()), dp.value())),
+                    );
+                }
+            }
+        }
+    }
+    points.sort_by(|a, b| a.0.cmp(&b.0));
+    points
+}
+
+/// The observation count of each `f64` histogram data point named `name`,
+/// by its string attributes.
+fn histogram_points(exporter: &InMemoryMetricExporter, name: &str) -> Vec<(String, u64)> {
+    let metrics = exporter.get_finished_metrics().unwrap();
+    let mut points = Vec::new();
+    for rm in &metrics {
+        for sm in rm.scope_metrics() {
+            for m in sm.metrics() {
+                if m.name() == name
+                    && let AggregatedMetrics::F64(MetricData::Histogram(h)) = m.data()
+                {
+                    points.extend(
+                        h.data_points()
+                            .map(|dp| (labels(dp.attributes()), dp.count())),
                     );
                 }
             }

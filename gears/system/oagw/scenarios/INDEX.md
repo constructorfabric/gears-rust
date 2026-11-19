@@ -424,7 +424,7 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 
 #### on_error transform handles gateway errors
 - **Scenario**: [positive-11.5-error-transform-handles-gateway-errors.md](plugins/transforms/positive-11.5-error-transform-handles-gateway-errors.md)
-- **Mechanism**: For a gateway error (e.g., rate limit), `on_error` can rewrite `title/detail` and status if allowed.
+- **Mechanism**: `on_error` runs only for gateway-originated errors of the upstream exchange (connection failure, timeout, protocol error, body limit, response guard rejection). A WebSocket upgrade does not run it: a failed upgrade returns its gateway error without `on_error`. It gets the error type, the status and the detail, and cannot change the response. An upstream 4xx/5xx response goes through `on_response`, not `on_error`, and reaches the client as the upstream sent it (part B).
 
 #### Plugin ordering and layering (upstream before route)
 - **Scenario**: [positive-11.6-plugin-ordering-layering.md](plugins/transforms/positive-11.6-plugin-ordering-layering.md)
@@ -450,13 +450,13 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 - **Scenario**: *Section 22.1 — no separate file. Verified as part of management auth scenarios.*
 - **Mechanism**: Unauthenticated `GET /metrics` rejected. Non-admin rejected.
 
-#### Request metrics increment on success
+#### Request metrics count every request
 - **Scenario**: *Section 22.2 — no separate file.*
-- **Mechanism**: `oagw_requests_total` increments with correct labels (`host`, `http.request.method`, `http.route`, `http.response.status_code`). Histogram `phase=total/upstream/plugins` recorded.
+- **Mechanism**: `oagw_requests_total` increments once per request with a response, with correct labels (`host`, `http.request.method`, `http.route`, `http.response.status_code`): the upstream's status, 4xx/5xx included, or for a gateway error (401, 403, 429, 502, ...) the status the client gets. Histogram `oagw_request_duration_seconds` records `phase=total` (request start to the response head), `resolve` and `auth`. Verified by Rust unit tests: the e2e suite has no metrics collector.
 
 #### Error metrics increment on gateway errors
 - **Scenario**: *Section 22.3 — no separate file.*
-- **Mechanism**: Induce gateway error; `oagw_errors_total{error_type=...}` increments.
+- **Mechanism**: Induce gateway error; `oagw_errors_total{error_type=...}` increments, and `oagw_requests_total` counts the request with the error's status. A request the REST handler rejects after the `proxy:invoke` grant (bad proxy path 400, body over the limit 413, failed body read) counts the same way under `host="unknown"`. A request the client drops before its response head counts only as `error_type="Cancelled"`.
 
 #### Cardinality rules (no tenant labels)
 - **Scenario**: *Section 22.4 — no separate file.*
@@ -465,6 +465,14 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 #### Status label follows OTel HTTP semantic conventions
 - **Scenario**: *Section 22.5 — no separate file.*
 - **Mechanism**: Metrics export uses the numeric `http.response.status_code` attribute (OTel HTTP semconv), matching the inbound API Gateway. Status-class queries (e.g. 5xx error rate) are expressed at query time via regex on the numeric code.
+
+#### In-flight and stream duration last until the body ends
+- **Scenario**: *Section 22.6 — no separate file.*
+- **Mechanism**: `oagw_requests_in_flight` rises at the start of the Data Plane pipeline (under `host="unknown"` until the upstream is resolved) and falls when the response body ends, fails or is dropped, SSE streams included; a gateway error falls at once. `oagw_stream_duration_seconds{outcome}` is recorded then: `completed` (EOF, or the declared `Content-Length` relayed, as hyper drops such a body without reading its end), `error` (upstream cut, idle timeout), `shutdown` (gateway stop) or `cancelled` (client went away). `oagw_websocket_session_duration_seconds` carries the same `outcome`: `completed` when the tunnel closed, from either side (the relay does not parse frames, and after a client-initiated Close the server closes TCP first), `error` on an idle timeout or an IO error, `shutdown` on a gateway stop.
+
+#### Rate-limit metrics per bucket
+- **Scenario**: *Section 22.7 — no separate file.*
+- **Mechanism**: `oagw_rate_limit_usage_ratio` and `oagw_rate_limit_exceeded_total` carry `bucket` (`route`, `shadowed_route`, `upstream`, `pool`): each bucket checked writes its own series, so a wider bucket does not overwrite the route's ratio. The shadowed ancestor routes of one route share the `shadowed_route` series, written once per request with the highest ratio among them.
 
 #### Proxy requests produce structured audit log
 - **Scenario**: *Section 23.1 — no separate file.*

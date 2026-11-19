@@ -3926,6 +3926,7 @@ dependencies = [
  "form_urlencoded",
  "futures-util",
  "gts",
+ "h2",
  "heck 0.5.0",
  "http",
  "http-body-util",

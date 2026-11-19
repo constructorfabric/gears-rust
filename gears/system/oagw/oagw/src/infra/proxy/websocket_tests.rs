@@ -634,3 +634,134 @@ async fn relay_tears_down_when_leftover_bytes_meet_a_stalled_caller() {
         started.elapsed()
     );
 }
+
+/// Keeps the WebSocket session metrics.
+#[derive(Default)]
+struct SessionRecorder(Mutex<Vec<String>>);
+
+impl OagwMetricsPort for SessionRecorder {
+    fn record_request(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: u16,
+        _: Option<crate::domain::plugin::credentials::CredentialMode>,
+    ) {
+    }
+    fn record_error(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: Option<crate::domain::plugin::credentials::CredentialMode>,
+    ) {
+    }
+    fn record_request_duration_seconds(&self, _: &str, _: &str, _: &str, _: f64) {}
+    fn record_stream_duration_seconds(&self, _: &str, _: &str, _: StreamOutcome, _: f64) {}
+    fn increment_in_flight(&self, _: &str) {}
+    fn decrement_in_flight(&self, _: &str) {}
+    fn record_rate_limit_exceeded(
+        &self,
+        _: &str,
+        _: &str,
+        _: crate::domain::ports::metric_labels::RateLimitBucket,
+    ) {
+    }
+    fn record_rate_limit_usage_ratio(
+        &self,
+        _: &str,
+        _: &str,
+        _: crate::domain::ports::metric_labels::RateLimitBucket,
+        _: f64,
+    ) {
+    }
+    fn increment_active_websocket_sessions(&self, host: &str) {
+        self.0.lock().push(format!("open {host}"));
+    }
+    fn decrement_active_websocket_sessions(&self, host: &str) {
+        self.0.lock().push(format!("close {host}"));
+    }
+    fn record_websocket_session_duration_seconds(
+        &self,
+        host: &str,
+        outcome: StreamOutcome,
+        _: f64,
+    ) {
+        self.0
+            .lock()
+            .push(format!("duration {host} {}", outcome.as_str()));
+    }
+    fn record_rate_limit_sweep(&self, _: u64, _: u64) {}
+    fn record_registry_provisioning_failure(&self, _: &str, _: &str) {}
+    fn record_registry_provisioning_run(&self, _: &str) {}
+    fn record_credential_withheld(&self, _: &str, _: &'static str) {}
+    fn record_proxy_cache_lookup(
+        &self,
+        _: crate::domain::ports::metric_labels::CacheMap,
+        _: crate::domain::ports::metric_labels::CacheLookup,
+    ) {
+    }
+    fn record_proxy_cache_entries(&self, _: crate::domain::ports::metric_labels::CacheMap, _: u64) {
+    }
+    fn record_proxy_cache_evictions(
+        &self,
+        _: crate::domain::ports::metric_labels::CacheMap,
+        _: crate::domain::ports::metric_labels::CacheEviction,
+        _: u64,
+    ) {
+    }
+    fn record_proxy_cache_change(&self, _: &str) {}
+    fn record_proxy_cache_flush(&self, _: &str) {}
+    fn record_proxy_cache_load_discarded(&self, _: crate::domain::ports::metric_labels::CacheMap) {}
+    fn record_proxy_cache_stale_served(
+        &self,
+        _: crate::domain::ports::metric_labels::CacheMap,
+        _: crate::domain::ports::metric_labels::CacheStale,
+    ) {
+    }
+    fn record_proxy_cache_publish_failures(&self, _: &str, _: u64) {}
+}
+
+/// The session duration carries how the relay ended: a closed tunnel
+/// completes it, whichever side closed first; an idle timeout or an IO error
+/// is an error; a stop is `shutdown`; a bridge dropped before the relay
+/// returned is cancelled (#4987).
+#[test]
+fn session_duration_carries_the_outcome() {
+    let closed_by = |ended_by| RelayOutcome::Closed {
+        to_upstream: 1,
+        to_client: 1,
+        ended_by,
+    };
+    let cases = [
+        (Some(closed_by(TunnelEnd::Client)), "completed"),
+        (Some(closed_by(TunnelEnd::Upstream)), "completed"),
+        (Some(closed_by(TunnelEnd::Unknown)), "completed"),
+        (Some(RelayOutcome::IdleTimeout), "error"),
+        (Some(RelayOutcome::Shutdown), "shutdown"),
+        (
+            Some(RelayOutcome::Error(std::io::Error::other("reset"))),
+            "error",
+        ),
+        (None, "cancelled"),
+    ];
+    for (relay, outcome) in cases {
+        let metrics = Arc::new(SessionRecorder::default());
+        let mut guard = WsSessionGuard::new(metrics.clone(), "ws".to_owned());
+        if let Some(relay) = &relay {
+            guard.ended(relay);
+        }
+        drop(guard);
+        let events = metrics.0.lock().clone();
+        assert_eq!(
+            events,
+            [
+                "open ws".to_owned(),
+                "close ws".to_owned(),
+                format!("duration ws {outcome}"),
+            ],
+            "{relay:?}"
+        );
+    }
+}

@@ -9,6 +9,8 @@ use oagw_sdk::body::{BodyStream, BoxError};
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::domain::ports::metric_labels::StreamOutcome;
+
 /// The signal that ends open SSE streams and WebSocket relays when the
 /// gateway stops.
 ///
@@ -191,6 +193,78 @@ pub(crate) fn streaming_body_with_lifecycle(
             Some((Err(cut), state))
         },
     ))
+}
+
+/// Call `on_end` once, when `inner` ends: [`StreamOutcome::Completed`] at
+/// EOF or once `declared_len` bytes went through,
+/// [`StreamOutcome::Shutdown`] when the gateway's stop cut it,
+/// [`StreamOutcome::Error`] at any other first error (an idle cut included),
+/// [`StreamOutcome::Cancelled`] when it is dropped before any of these (the
+/// client went away).
+///
+/// `declared_len` is the response's `Content-Length`: hyper's HTTP/1.1
+/// server drops such a body once it has written that many bytes, without
+/// polling it for its end.
+pub(crate) fn on_body_end<F>(inner: BodyStream, declared_len: Option<u64>, on_end: F) -> BodyStream
+where
+    F: FnOnce(StreamOutcome) + Send + 'static,
+{
+    Box::pin(BodyEnd {
+        inner,
+        remaining: declared_len,
+        on_end: Some(on_end),
+    })
+}
+
+struct BodyEnd<F: FnOnce(StreamOutcome)> {
+    inner: BodyStream,
+    /// Bytes still to come of a declared length.
+    remaining: Option<u64>,
+    on_end: Option<F>,
+}
+
+impl<F: FnOnce(StreamOutcome)> BodyEnd<F> {
+    fn end(&mut self, outcome: StreamOutcome) {
+        if let Some(on_end) = self.on_end.take() {
+            on_end(outcome);
+        }
+    }
+}
+
+// `on_end` is never pinned: the struct moves freely.
+impl<F: FnOnce(StreamOutcome)> Unpin for BodyEnd<F> {}
+
+impl<F: FnOnce(StreamOutcome)> futures_util::Stream for BodyEnd<F> {
+    type Item = Result<bytes::Bytes, BoxError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let item = std::task::ready!(self.inner.poll_next_unpin(cx));
+        match &item {
+            Some(Ok(chunk)) => {
+                if let Some(remaining) = self.remaining.as_mut() {
+                    *remaining = remaining.saturating_sub(chunk.len() as u64);
+                    if *remaining == 0 {
+                        self.end(StreamOutcome::Completed);
+                    }
+                }
+            }
+            Some(Err(e)) if e.is::<oagw_sdk::StreamClosedByGateway>() => {
+                self.end(StreamOutcome::Shutdown);
+            }
+            Some(Err(_)) => self.end(StreamOutcome::Error),
+            None => self.end(StreamOutcome::Completed),
+        }
+        std::task::Poll::Ready(item)
+    }
+}
+
+impl<F: FnOnce(StreamOutcome)> Drop for BodyEnd<F> {
+    fn drop(&mut self) {
+        self.end(StreamOutcome::Cancelled);
+    }
 }
 
 #[cfg(test)]
@@ -558,6 +632,74 @@ pub(crate) mod tests {
         tokio::time::timeout(Duration::from_secs(1), second.stopped())
             .await
             .expect("the stop reaches the remaining stream");
+    }
+
+    /// `items`, then a body that never ends, wrapped in [`on_body_end`]; the
+    /// outcomes it reports.
+    fn ending_body(
+        items: Vec<Result<Bytes, BoxError>>,
+        declared_len: Option<u64>,
+    ) -> (BodyStream, Arc<Mutex<Vec<StreamOutcome>>>) {
+        let outcomes = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&outcomes);
+        let inner =
+            Box::pin(futures_util::stream::iter(items).chain(futures_util::stream::pending()));
+        let body = on_body_end(inner, declared_len, move |outcome| {
+            recorded.lock().push(outcome);
+        });
+        (body, outcomes)
+    }
+
+    /// A body is complete once its `Content-Length` went through, before
+    /// anyone polls it for its end: hyper drops it there. A longer body
+    /// does not panic, a shorter one dropped early is cancelled.
+    #[tokio::test]
+    async fn a_declared_length_completes_the_body() {
+        let (mut body, outcomes) = ending_body(
+            vec![
+                Ok(Bytes::from_static(b"hel")),
+                Ok(Bytes::from_static(b"lo")),
+            ],
+            Some(5),
+        );
+        body.next().await.unwrap().unwrap();
+        assert!(outcomes.lock().is_empty());
+        body.next().await.unwrap().unwrap();
+        drop(body);
+        assert_eq!(*outcomes.lock(), [StreamOutcome::Completed]);
+
+        let (mut body, outcomes) = ending_body(vec![Ok(Bytes::from_static(b"hello"))], Some(3));
+        body.next().await.unwrap().unwrap();
+        drop(body);
+        assert_eq!(*outcomes.lock(), [StreamOutcome::Completed]);
+
+        let (mut body, outcomes) = ending_body(vec![Ok(Bytes::from_static(b"hel"))], Some(5));
+        body.next().await.unwrap().unwrap();
+        drop(body);
+        assert_eq!(*outcomes.lock(), [StreamOutcome::Cancelled]);
+    }
+
+    /// The gateway's stop ends a body as `shutdown`, not `error`; an idle
+    /// cut and an upstream failure stay errors.
+    #[tokio::test]
+    async fn a_stop_is_not_an_error() {
+        let cases: [(BoxError, StreamOutcome); 3] = [
+            (
+                Box::new(oagw_sdk::StreamClosedByGateway::new()),
+                StreamOutcome::Shutdown,
+            ),
+            (
+                Box::new(oagw_sdk::StreamIdleTimeout::new()),
+                StreamOutcome::Error,
+            ),
+            ("upstream reset".into(), StreamOutcome::Error),
+        ];
+        for (err, expected) in cases {
+            let (mut body, outcomes) = ending_body(vec![Err(err)], None);
+            assert!(body.next().await.unwrap().is_err());
+            drop(body);
+            assert_eq!(*outcomes.lock(), [expected]);
+        }
     }
 }
 

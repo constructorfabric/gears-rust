@@ -224,11 +224,38 @@ impl crate::domain::ports::OagwMetricsPort for ProvisioningMetrics {
     fn record_request_duration_seconds(&self, _: &str, _: &str, _: &str, _: f64) {}
     fn increment_in_flight(&self, _: &str) {}
     fn decrement_in_flight(&self, _: &str) {}
-    fn record_rate_limit_exceeded(&self, _: &str, _: &str) {}
-    fn record_rate_limit_usage_ratio(&self, _: &str, _: &str, _: f64) {}
+    fn record_rate_limit_exceeded(
+        &self,
+        _: &str,
+        _: &str,
+        _: crate::domain::ports::metric_labels::RateLimitBucket,
+    ) {
+    }
+    fn record_rate_limit_usage_ratio(
+        &self,
+        _: &str,
+        _: &str,
+        _: crate::domain::ports::metric_labels::RateLimitBucket,
+        _: f64,
+    ) {
+    }
     fn increment_active_websocket_sessions(&self, _: &str) {}
     fn decrement_active_websocket_sessions(&self, _: &str) {}
-    fn record_websocket_session_duration_seconds(&self, _: &str, _: f64) {}
+    fn record_websocket_session_duration_seconds(
+        &self,
+        _: &str,
+        _: crate::domain::ports::metric_labels::StreamOutcome,
+        _: f64,
+    ) {
+    }
+    fn record_stream_duration_seconds(
+        &self,
+        _: &str,
+        _: &str,
+        _: crate::domain::ports::metric_labels::StreamOutcome,
+        _: f64,
+    ) {
+    }
     fn record_rate_limit_sweep(&self, _: u64, _: u64) {}
     fn record_registry_provisioning_failure(&self, kind: &str, reason: &str) {
         self.failures
@@ -1031,7 +1058,7 @@ impl TestDpBuilder {
             backend_selector,
             engine,
             self.metrics
-                .unwrap_or_else(|| std::sync::Arc::new(crate::domain::ports::NoopMetrics)),
+                .unwrap_or_else(|| Arc::new(crate::domain::ports::NoopMetrics)),
             rate_limiter,
         )
         .with_allow_http_upstream(true);

@@ -9,12 +9,15 @@
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
 use authz_resolver_sdk::{EnforcerError, PolicyEnforcer};
 use oagw_sdk::PROXY_SCHEMA;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use toolkit_macros::domain_model;
 use toolkit_security::{SecurityContext, pep_properties};
 
 use crate::domain::error::DomainError;
+use crate::domain::ports::OagwMetricsPort;
+use crate::domain::ports::metric_labels::{self, phase};
 
 /// Resource type identifying a proxied upstream target.
 static PROXY_RESOURCE: ResourceType =
@@ -24,13 +27,37 @@ static PROXY_RESOURCE: ResourceType =
 const INVOKE: &str = "invoke";
 
 /// Proof that the policy engine granted `proxy:invoke` to a caller.
+///
+/// A grant issued for a request that the metrics count (see
+/// [`Self::count_if_dropped`]) counts it as `Cancelled` when it is dropped
+/// before [`Self::take_count`] hands the counting over: the client went
+/// away, or the caller was dropped, before the request was proxied or
+/// rejected.
 #[domain_model]
-#[derive(Debug)]
 pub(crate) struct ProxyGrant {
     ctx: SecurityContext,
     /// How long the check took: a request's metrics include it in the
     /// total, but not the time spent reading the body after it.
     authorized_in: Duration,
+    /// Who counts the request while nobody else does.
+    count: Option<GrantCount>,
+}
+
+/// The request metrics a grant holds until it is proxied or rejected.
+struct GrantCount {
+    metrics: Arc<dyn OagwMetricsPort>,
+    /// The request's `method` metric label.
+    method: &'static str,
+}
+
+impl std::fmt::Debug for ProxyGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyGrant")
+            .field("ctx", &self.ctx)
+            .field("authorized_in", &self.authorized_in)
+            .field("counted", &self.count.is_some())
+            .finish()
+    }
 }
 
 impl ProxyGrant {
@@ -69,7 +96,26 @@ impl ProxyGrant {
         Ok(Self {
             ctx,
             authorized_in: started.elapsed(),
+            count: None,
         })
+    }
+
+    /// Count the request in `metrics`, under the `method` label, as
+    /// `Cancelled` if the grant is dropped before [`Self::take_count`].
+    pub(crate) fn count_if_dropped(
+        mut self,
+        metrics: Arc<dyn OagwMetricsPort>,
+        method: &'static str,
+    ) -> Self {
+        self.count = Some(GrantCount { metrics, method });
+        self
+    }
+
+    /// Hand the counting of the request over to the caller: the metrics and
+    /// the `method` label of [`Self::count_if_dropped`], if it was called.
+    /// The grant then drops without counting anything.
+    pub(crate) fn take_count(&mut self) -> Option<(Arc<dyn OagwMetricsPort>, &'static str)> {
+        self.count.take().map(|c| (c.metrics, c.method))
     }
 
     /// The security context the grant was issued for.
@@ -88,6 +134,25 @@ impl ProxyGrant {
         Self {
             ctx,
             authorized_in: Duration::ZERO,
+            count: None,
         }
+    }
+}
+
+impl Drop for ProxyGrant {
+    fn drop(&mut self) {
+        let Some(GrantCount { metrics, .. }) = self.count.take() else {
+            return;
+        };
+        // Timed as a proxied request is: the check, not the client's upload.
+        // No status: the client got no response.
+        let unknown = metric_labels::UNKNOWN;
+        metrics.record_request_duration_seconds(
+            unknown,
+            unknown,
+            phase::TOTAL,
+            self.authorized_in.as_secs_f64(),
+        );
+        metrics.record_error(unknown, unknown, metric_labels::CANCELLED, None);
     }
 }

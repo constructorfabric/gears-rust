@@ -56,6 +56,55 @@ fn body_read_error(err: &axum::Error, max_body_size: usize, path: &str) -> Domai
     }
 }
 
+/// Whether a failed body read means the client went away mid-upload: the
+/// connection closed or reset, or the HTTP/2 stream cancelled. Such a request
+/// is counted as `Cancelled`, not as a 400 nobody receives.
+fn client_gone(err: &axum::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(cause) = source {
+        if let Some(e) = cause.downcast_ref::<hyper::Error>()
+            && (e.is_incomplete_message() || e.is_canceled())
+        {
+            return true;
+        }
+        if let Some(e) = cause.downcast_ref::<h2::Error>()
+            && (e.reason() == Some(h2::Reason::CANCEL) || e.is_go_away() || e.is_io())
+        {
+            return true;
+        }
+        if let Some(e) = cause.downcast_ref::<std::io::Error>()
+            && matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+        {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
+}
+
+/// A request [`granted_request`] refused.
+struct Rejected {
+    /// The error the client gets.
+    err: DomainError,
+    /// The client went away while its body was read.
+    client_gone: bool,
+}
+
+impl From<DomainError> for Rejected {
+    fn from(err: DomainError) -> Self {
+        Self {
+            err,
+            client_gone: false,
+        }
+    }
+}
+
 /// The body of [`proxy_handler`]. A failure stays a [`DomainError`] until the
 /// handler renders it, so this `Result` does not carry a 128-byte `Response`.
 async fn proxy(
@@ -105,120 +154,25 @@ async fn proxy(
     }
 
     let max_body_size = state.config.max_body_size_bytes;
-    let (mut parts, body) = req.into_parts();
+    let (parts, body) = req.into_parts();
 
     // Authorize before anything reads, buffers or validates the request
     // (WebSocket, path, body): a caller without `proxy:invoke` gets 403, not
     // a 400 from a request check (#4981).
-    let grant = state.dp.authorize_proxy(ctx).await?;
-
-    // Detect WebSocket upgrade and extract the hyper upgrade handle.
-    // This must happen before body consumption — the OnUpgrade future is
-    // stored in extensions by hyper and is needed after returning the 101.
-    let is_upgrade = headers::is_websocket_upgrade(&parts.headers);
-
-    // RFC 6455 §4.1: WebSocket upgrade MUST be GET with no body.
-    if is_upgrade {
-        let path = parts.uri.path().to_string();
-        if parts.method != http::Method::GET {
-            return Err(DomainError::Validation {
-                field: "method",
-                reason: field::WS_UPGRADE_REQUIRES_GET,
-                detail: "WebSocket upgrade requires GET method".into(),
-                instance: path,
-            });
+    //
+    // The grant counts the request as `Cancelled` if it is dropped here: the
+    // handler dropped while it reads the body (the gateway's request
+    // timeout, a shutdown), or the client gone mid-upload.
+    let grant = state.dp.authorize_proxy(ctx, &parts.method).await?;
+    let (proxy_req, on_upgrade) = match granted_request(parts, body, max_body_size).await {
+        Ok(prepared) => prepared,
+        Err(Rejected { err, client_gone }) => {
+            if !client_gone {
+                state.dp.reject_granted(grant, &err);
+            }
+            return Err(err);
         }
-        if parts.headers.contains_key(http::header::CONTENT_LENGTH)
-            || parts.headers.contains_key(http::header::TRANSFER_ENCODING)
-        {
-            return Err(DomainError::Validation {
-                field: "body",
-                reason: field::WS_UPGRADE_BODY_FORBIDDEN,
-                detail: "WebSocket upgrade request must not contain a body".into(),
-                instance: path,
-            });
-        }
-    }
-
-    let on_upgrade = if is_upgrade {
-        parts.extensions.remove::<hyper::upgrade::OnUpgrade>()
-    } else {
-        None
     };
-
-    // Parse alias from the URI to validate it's present.
-    let path = parts.uri.path();
-    let prefix = "/oagw/v1/proxy/";
-    let remaining = path
-        .strip_prefix(prefix)
-        .ok_or_else(|| DomainError::Validation {
-            field: "path",
-            reason: field::INVALID_PROXY_PATH,
-            detail: "invalid proxy path".into(),
-            instance: path.to_string(),
-        })?;
-
-    // Validate alias is not empty.
-    let alias_end = remaining.find('/').unwrap_or(remaining.len());
-    if alias_end == 0 {
-        return Err(DomainError::Validation {
-            field: "path",
-            reason: field::MISSING_ALIAS,
-            detail: "missing alias in proxy path".into(),
-            instance: path.to_string(),
-        });
-    }
-
-    // Validate Content-Length if present (skip for WebSocket — no body).
-    if !is_upgrade && let Some(cl) = parts.headers.get(http::header::CONTENT_LENGTH) {
-        let cl_str = cl.to_str().map_err(|_| DomainError::Validation {
-            field: "content-length",
-            reason: field::INVALID_CONTENT_LENGTH,
-            detail: "invalid Content-Length header".into(),
-            instance: path.to_string(),
-        })?;
-        let cl_val: usize = cl_str.parse().map_err(|_| DomainError::Validation {
-            field: "content-length",
-            reason: field::INVALID_CONTENT_LENGTH,
-            detail: format!("Content-Length is not a valid integer: '{cl_str}'"),
-            instance: path.to_string(),
-        })?;
-        if cl_val > max_body_size {
-            return Err(DomainError::PayloadTooLarge {
-                detail: format!(
-                    "request body of {cl_val} bytes exceeds maximum of {max_body_size} bytes"
-                ),
-                instance: path.to_string(),
-            });
-        }
-    }
-
-    // Read body bytes (limited to max_body_size).
-    // WebSocket upgrade requests have no body — skip buffering.
-    let body_bytes = if is_upgrade {
-        Bytes::new()
-    } else {
-        axum::body::to_bytes(body, max_body_size)
-            .await
-            .map_err(|e| body_read_error(&e, max_body_size, path))?
-    };
-
-    // Strip the proxy prefix from the URI so the DP receives /{alias}/{path}?query.
-    let new_uri_str = if let Some(query) = parts.uri.query() {
-        format!("/{remaining}?{query}")
-    } else {
-        format!("/{remaining}")
-    };
-    parts.uri = new_uri_str.parse().map_err(|_| DomainError::Validation {
-        field: "path",
-        reason: field::INVALID_REWRITTEN_URI,
-        detail: "failed to parse proxy URI".into(),
-        instance: path.to_string(),
-    })?;
-
-    // Build http::Request<Body> for the DP service.
-    let sdk_body = oagw_sdk::Body::from(body_bytes);
-    let proxy_req = http::Request::from_parts(parts, sdk_body);
 
     // Execute proxy pipeline.
     let proxy_resp = state.dp.proxy_request_granted(grant, proxy_req).await?;
@@ -310,6 +264,135 @@ async fn proxy(
     // of what is still a streamed body.
     response.extensions_mut().insert(ForeignPassthrough);
     Ok(response)
+}
+
+/// Validate a granted request and read its body: the request for the Data
+/// Plane, and the upgrade handle of a WebSocket upgrade.
+async fn granted_request(
+    mut parts: http::request::Parts,
+    body: Body,
+    max_body_size: usize,
+) -> Result<
+    (
+        http::Request<oagw_sdk::Body>,
+        Option<hyper::upgrade::OnUpgrade>,
+    ),
+    Rejected,
+> {
+    // Detect WebSocket upgrade and extract the hyper upgrade handle.
+    // This must happen before body consumption — the OnUpgrade future is
+    // stored in extensions by hyper and is needed after returning the 101.
+    let is_upgrade = headers::is_websocket_upgrade(&parts.headers);
+
+    // RFC 6455 §4.1: WebSocket upgrade MUST be GET with no body.
+    if is_upgrade {
+        let path = parts.uri.path().to_string();
+        if parts.method != http::Method::GET {
+            return Err(DomainError::Validation {
+                field: "method",
+                reason: field::WS_UPGRADE_REQUIRES_GET,
+                detail: "WebSocket upgrade requires GET method".into(),
+                instance: path,
+            }
+            .into());
+        }
+        if parts.headers.contains_key(http::header::CONTENT_LENGTH)
+            || parts.headers.contains_key(http::header::TRANSFER_ENCODING)
+        {
+            return Err(DomainError::Validation {
+                field: "body",
+                reason: field::WS_UPGRADE_BODY_FORBIDDEN,
+                detail: "WebSocket upgrade request must not contain a body".into(),
+                instance: path,
+            }
+            .into());
+        }
+    }
+
+    let on_upgrade = if is_upgrade {
+        parts.extensions.remove::<hyper::upgrade::OnUpgrade>()
+    } else {
+        None
+    };
+
+    // Parse alias from the URI to validate it's present.
+    let path = parts.uri.path();
+    let prefix = "/oagw/v1/proxy/";
+    let remaining = path
+        .strip_prefix(prefix)
+        .ok_or_else(|| DomainError::Validation {
+            field: "path",
+            reason: field::INVALID_PROXY_PATH,
+            detail: "invalid proxy path".into(),
+            instance: path.to_string(),
+        })?;
+
+    // Validate alias is not empty.
+    let alias_end = remaining.find('/').unwrap_or(remaining.len());
+    if alias_end == 0 {
+        return Err(DomainError::Validation {
+            field: "path",
+            reason: field::MISSING_ALIAS,
+            detail: "missing alias in proxy path".into(),
+            instance: path.to_string(),
+        }
+        .into());
+    }
+
+    // Validate Content-Length if present (skip for WebSocket — no body).
+    if !is_upgrade && let Some(cl) = parts.headers.get(http::header::CONTENT_LENGTH) {
+        let cl_str = cl.to_str().map_err(|_| DomainError::Validation {
+            field: "content-length",
+            reason: field::INVALID_CONTENT_LENGTH,
+            detail: "invalid Content-Length header".into(),
+            instance: path.to_string(),
+        })?;
+        let cl_val: usize = cl_str.parse().map_err(|_| DomainError::Validation {
+            field: "content-length",
+            reason: field::INVALID_CONTENT_LENGTH,
+            detail: format!("Content-Length is not a valid integer: '{cl_str}'"),
+            instance: path.to_string(),
+        })?;
+        if cl_val > max_body_size {
+            return Err(DomainError::PayloadTooLarge {
+                detail: format!(
+                    "request body of {cl_val} bytes exceeds maximum of {max_body_size} bytes"
+                ),
+                instance: path.to_string(),
+            }
+            .into());
+        }
+    }
+
+    // Read body bytes (limited to max_body_size).
+    // WebSocket upgrade requests have no body — skip buffering.
+    let body_bytes = if is_upgrade {
+        Bytes::new()
+    } else {
+        axum::body::to_bytes(body, max_body_size)
+            .await
+            .map_err(|e| Rejected {
+                err: body_read_error(&e, max_body_size, path),
+                client_gone: client_gone(&e),
+            })?
+    };
+
+    // Strip the proxy prefix from the URI so the DP receives /{alias}/{path}?query.
+    let new_uri_str = if let Some(query) = parts.uri.query() {
+        format!("/{remaining}?{query}")
+    } else {
+        format!("/{remaining}")
+    };
+    parts.uri = new_uri_str.parse().map_err(|_| DomainError::Validation {
+        field: "path",
+        reason: field::INVALID_REWRITTEN_URI,
+        detail: "failed to parse proxy URI".into(),
+        instance: path.to_string(),
+    })?;
+
+    // Build http::Request<Body> for the DP service.
+    let sdk_body = oagw_sdk::Body::from(body_bytes);
+    Ok((http::Request::from_parts(parts, sdk_body), on_upgrade))
 }
 
 /// Passes `body` on, yielding once before an error item.

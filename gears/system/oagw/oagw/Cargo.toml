@@ -108,6 +108,7 @@ tokio = { workspace = true, features = ["time"] }
 tokio-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+h2 = { workspace = true }
 # Upstream proxy engine (ADR-0019)
 toolkit-http-proxy = { workspace = true }
 http-body-util = { workspace = true }

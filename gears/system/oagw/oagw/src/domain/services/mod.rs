@@ -223,8 +223,23 @@ pub(crate) trait DataPlaneService: Send + Sync {
     ) -> Result<http::Response<Body>, DomainError>;
 
     /// Check `proxy:invoke` for `ctx` before the caller reads the request
-    /// body (#4981). A denial is counted in the request metrics.
-    async fn authorize_proxy(&self, ctx: SecurityContext) -> Result<ProxyGrant, DomainError>;
+    /// body (#4981). A denial is counted in the request metrics under the
+    /// request's `method`; a grant dropped before it is proxied or rejected
+    /// is counted as `Cancelled`.
+    async fn authorize_proxy(
+        &self,
+        ctx: SecurityContext,
+        method: &http::Method,
+    ) -> Result<ProxyGrant, DomainError>;
+
+    /// Count a request the caller rejects itself after
+    /// [`Self::authorize_proxy`] granted it (a bad path, a body over the
+    /// limit, a failed body read other than the client going away), with
+    /// the status the client gets, as
+    /// [`Self::proxy_request_granted`] counts a gateway error. The upstream
+    /// is not resolved yet, so the request counts under `host` and route
+    /// `"unknown"`. A grant dropped instead counts as `Cancelled`.
+    fn reject_granted(&self, grant: ProxyGrant, err: &DomainError);
 
     /// Proxy a request [`Self::authorize_proxy`] already authorized, as the
     /// caller the grant was issued for.
