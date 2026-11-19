@@ -156,3 +156,8 @@ impl PluginSelector for GtsCredStorePluginSelector {
             })
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "plugin_select_tests.rs"]
+mod plugin_select_tests;

@@ -151,3 +151,7 @@ impl TenantDirectory for TenantResolverDir {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tenant_resolver_tests.rs"]
+mod tests;

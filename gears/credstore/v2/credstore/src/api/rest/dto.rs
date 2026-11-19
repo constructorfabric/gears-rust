@@ -391,3 +391,7 @@ impl CredentialDto {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "dto_tests.rs"]
+mod tests;

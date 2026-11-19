@@ -233,3 +233,7 @@ pub fn register_routes(
 
     router.layer(axum::Extension(svc))
 }
+
+#[cfg(test)]
+#[path = "routes_tests.rs"]
+mod tests;

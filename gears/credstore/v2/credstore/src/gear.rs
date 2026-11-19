@@ -210,3 +210,7 @@ impl RestApiCapability for CredStoreGear {
         Ok(router)
     }
 }
+
+#[cfg(test)]
+#[path = "gear_tests.rs"]
+mod gear_tests;
