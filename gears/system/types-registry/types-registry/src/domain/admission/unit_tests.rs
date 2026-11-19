@@ -3,24 +3,28 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use gts::SchemaComparison;
 use gts::schema_evolution::{CompatibilityDiagnostic, CompatibilityFinding};
 
 use super::{MAX_REPORTED_DIAGNOSTICS, MAX_REPORTED_PATH_BYTES, diagnostics_summary};
 
 /// A comparison carrying `count` backward diagnostics, each at `path`.
-fn comparison(count: usize, path: &str) -> SchemaComparison {
-    SchemaComparison {
-        backward_diagnostics: (0..count)
-            .map(|_| CompatibilityDiagnostic {
-                path: path.to_owned(),
-                finding: CompatibilityFinding::PropertyAdded,
-                detail: String::new(),
-            })
-            .collect(),
-        forward_diagnostics: Vec::new(),
-        candidate_object_levels: Vec::new(),
-    }
+fn diagnostics(count: usize, path: &str) -> Vec<CompatibilityDiagnostic> {
+    findings(count, path, CompatibilityFinding::PropertyAdded)
+}
+
+/// `count` diagnostics of one `finding`, each at `path`.
+fn findings(
+    count: usize,
+    path: &str,
+    finding: CompatibilityFinding,
+) -> Vec<CompatibilityDiagnostic> {
+    (0..count)
+        .map(|_| CompatibilityDiagnostic {
+            path: path.to_owned(),
+            finding,
+            detail: String::new(),
+        })
+        .collect()
 }
 
 /// An empty list says so, rather than producing an empty message a reader would
@@ -28,16 +32,61 @@ fn comparison(count: usize, path: &str) -> SchemaComparison {
 #[test]
 fn no_diagnostics_reports_the_absence_of_evidence() {
     assert_eq!(
-        diagnostics_summary(&comparison(0, "$")),
+        diagnostics_summary(&diagnostics(0, "$"), &[]),
         "no diagnostic evidence"
     );
+}
+
+/// A payload property may be named `x-gts-traits-schema`, so the traits contract
+/// is labelled by its keyword rather than spliced into the path.
+#[test]
+fn traits_findings_are_labelled_apart_from_payload_paths() {
+    let summary = diagnostics_summary(
+        &diagnostics(1, "$.x-gts-traits-schema.mode"),
+        &diagnostics(1, "$.mode"),
+    );
+    assert_eq!(
+        summary,
+        "PropertyAdded at $.x-gts-traits-schema.mode; \
+         x-gts-traits-schema: PropertyAdded at $.mode",
+    );
+}
+
+/// The cap spans both contracts, payload first.
+#[test]
+fn the_cap_spans_both_contracts() {
+    let summary = diagnostics_summary(
+        &diagnostics(MAX_REPORTED_DIAGNOSTICS, "$.a"),
+        &diagnostics(2, "$.b"),
+    );
+    assert!(!summary.contains("x-gts-traits-schema"), "got {summary}");
+    assert!(summary.ends_with("; and 2 more"), "got {summary}");
+}
+
+/// A capped list still explains a refutation: findings that refute come before
+/// those that only fail to prove, whichever contract they belong to.
+#[test]
+fn a_refuting_finding_survives_the_cap() {
+    let summary = diagnostics_summary(
+        &findings(
+            MAX_REPORTED_DIAGNOSTICS,
+            "$.a",
+            CompatibilityFinding::NotProvable,
+        ),
+        &findings(1, "$.mode", CompatibilityFinding::EnumChanged),
+    );
+    assert!(
+        summary.starts_with("x-gts-traits-schema: EnumChanged at $.mode; NotProvable at $.a"),
+        "got {summary}"
+    );
+    assert!(summary.ends_with("; and 1 more"), "got {summary}");
 }
 
 /// Under the cap every diagnostic is named and nothing is counted: ADR-0003 wants
 /// the offending levels, and a short list is the case where it gets all of them.
 #[test]
 fn a_short_list_names_every_diagnostic_and_counts_nothing() {
-    let summary = diagnostics_summary(&comparison(3, "$.a"));
+    let summary = diagnostics_summary(&diagnostics(3, "$.a"), &[]);
     assert_eq!(summary.matches("PropertyAdded at $.a").count(), 3);
     assert!(!summary.contains("more"), "got {summary}");
 }
@@ -46,7 +95,7 @@ fn a_short_list_names_every_diagnostic_and_counts_nothing() {
 #[test]
 fn a_long_list_is_capped_and_the_remainder_is_counted() {
     let total = MAX_REPORTED_DIAGNOSTICS + 7;
-    let summary = diagnostics_summary(&comparison(total, "$.a"));
+    let summary = diagnostics_summary(&diagnostics(total, "$.a"), &[]);
     assert_eq!(
         summary.matches("PropertyAdded at $.a").count(),
         MAX_REPORTED_DIAGNOSTICS,
@@ -58,7 +107,7 @@ fn a_long_list_is_capped_and_the_remainder_is_counted() {
 #[test]
 fn one_diagnostic_with_an_enormous_path_still_produces_a_bounded_message() {
     let huge = "$.".to_owned() + &"x".repeat(100_000);
-    let summary = diagnostics_summary(&comparison(1, &huge));
+    let summary = diagnostics_summary(&diagnostics(1, &huge), &[]);
     assert!(
         summary.len() < 4 * MAX_REPORTED_PATH_BYTES,
         "one diagnostic produced {} bytes",
@@ -72,7 +121,7 @@ fn one_diagnostic_with_an_enormous_path_still_produces_a_bounded_message() {
 #[test]
 fn the_message_is_bounded_by_the_two_constants_together() {
     let huge = "$.".to_owned() + &"y".repeat(MAX_REPORTED_PATH_BYTES * 2);
-    let summary = diagnostics_summary(&comparison(MAX_REPORTED_DIAGNOSTICS + 1, &huge));
+    let summary = diagnostics_summary(&diagnostics(MAX_REPORTED_DIAGNOSTICS + 1, &huge), &[]);
     // Each entry contributes the truncated path, the finding name, the marker and
     // the separator. A generous per-entry allowance still bounds the whole.
     let ceiling = MAX_REPORTED_DIAGNOSTICS * (MAX_REPORTED_PATH_BYTES + 128);
@@ -90,7 +139,7 @@ fn a_multi_byte_path_is_cut_on_a_character_boundary() {
     // cap on a boundary without walking back — the case a byte slice would panic on.
     let path = "\u{2603}".repeat(200);
     assert!(path.len() > MAX_REPORTED_PATH_BYTES);
-    let summary = diagnostics_summary(&comparison(1, &path));
+    let summary = diagnostics_summary(&diagnostics(1, &path), &[]);
     assert!(summary.contains("...(truncated)"), "got {summary}");
     // Reaching here at all means no byte-boundary panic; assert the prefix survived
     // as whole characters.
@@ -111,7 +160,7 @@ fn a_multi_byte_path_is_cut_on_a_character_boundary() {
 #[test]
 fn a_path_at_the_cap_is_left_alone() {
     let path = "z".repeat(MAX_REPORTED_PATH_BYTES);
-    let summary = diagnostics_summary(&comparison(1, &path));
+    let summary = diagnostics_summary(&diagnostics(1, &path), &[]);
     assert!(!summary.contains("truncated"), "got {summary}");
     assert!(summary.ends_with(&path), "got {summary}");
 }

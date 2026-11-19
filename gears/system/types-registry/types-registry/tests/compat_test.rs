@@ -355,6 +355,236 @@ async fn an_optional_property_added_at_a_closed_level_is_compatible() {
     succeeded(&admit(&db, "two", SUBJECT, two(SUBJECT, Level::Closed), Some(1)).await);
 }
 
+#[tokio::test]
+async fn a_revision_must_preserve_the_values_allowed_by_the_traits_schema() {
+    let db = test_db().await;
+    let with_modes = |modes: &[&str]| {
+        let mut doc = one(SUBJECT, Level::Closed);
+        doc["x-gts-traits-schema"] = json!({
+            "type": "object",
+            "properties": { "mode": { "type": "string", "enum": modes } }
+        });
+        doc["x-gts-traits"] = json!({ "mode": "read" });
+        doc
+    };
+    succeeded(&admit(&db, "one", SUBJECT, with_modes(&["read", "write"]), None).await);
+    let narrowed = admit(&db, "two", SUBJECT, with_modes(&["read"]), Some(1)).await;
+    refused_with(&narrowed, AdmissionFailureReason::IncompatibleWithBaseline);
+    assert!(
+        narrowed.items[0]
+            .failure
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("x-gts-traits-schema: EnumChanged at $.mode")
+    );
+
+    succeeded(
+        &admit(
+            &db,
+            "three",
+            SUBJECT,
+            with_modes(&["read", "write", "admin"]),
+            Some(1),
+        )
+        .await,
+    );
+}
+
+/// The root document with `traits_schema` declared, or with no declaration.
+fn declaring(traits_schema: Option<Value>) -> Value {
+    let mut doc = one(SUBJECT, Level::Closed);
+    if let Some(traits_schema) = traits_schema {
+        doc["x-gts-traits-schema"] = traits_schema;
+    }
+    doc
+}
+
+/// With no declaration left in its chain a type admits no trait values, though
+/// it materializes the same contract as an explicit `{}`. No descendant exists
+/// yet, so only the compatibility check can refuse.
+#[tokio::test]
+async fn withdrawing_the_last_open_traits_declaration_is_refused() {
+    let db = test_db().await;
+    succeeded(&admit(&db, "one", SUBJECT, declaring(Some(json!({}))), None).await);
+    refused_with(
+        &admit(&db, "two", SUBJECT, declaring(None), Some(1)).await,
+        AdmissionFailureReason::IncompatibleWithBaseline,
+    );
+}
+
+/// A declaration that admitted no trait value strands none when withdrawn.
+#[tokio::test]
+async fn withdrawing_a_declaration_that_admitted_nothing_is_admitted() {
+    let db = test_db().await;
+    succeeded(&admit(&db, "one", SUBJECT, declaring(Some(json!(false))), None).await);
+    succeeded(&admit(&db, "two", SUBJECT, declaring(None), Some(1)).await);
+}
+
+/// A first open declaration admits trait values where none were admissible.
+#[tokio::test]
+async fn a_first_open_traits_declaration_is_compatible() {
+    let db = test_db().await;
+    succeeded(&admit(&db, "one", SUBJECT, declaring(None), None).await);
+    succeeded(&admit(&db, "two", SUBJECT, declaring(Some(json!({}))), Some(1)).await);
+}
+
+/// A leaf's own declaration can go while an ancestor still declares, here two
+/// levels up past an undeclaring middle type: the chain keeps a traits
+/// contract, and dropping an open `{}` from it narrows nothing.
+#[tokio::test]
+async fn a_leaf_may_drop_its_declaration_while_an_ancestor_declares() {
+    let db = test_db().await;
+    let middle = gts_id!("cf.core.compat.thing.v1~cf.core.compat.middle.v1~");
+    let leaf = gts_id!("cf.core.compat.thing.v1~cf.core.compat.middle.v1~cf.core.compat.leaf.v1~");
+    let mode = json!({ "type": "object", "properties": { "mode": { "type": "string" } } });
+    succeeded(&admit(&db, "root", SUBJECT, declaring(Some(mode)), None).await);
+    let derived = |gts_id: &str, base: &str, traits_schema: Option<Value>| {
+        let mut doc = json!({
+            "$id": format!("gts://{gts_id}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "allOf": [{ "$ref": format!("gts://{base}") }],
+        });
+        if let Some(traits_schema) = traits_schema {
+            doc["x-gts-traits-schema"] = traits_schema;
+        }
+        doc
+    };
+    succeeded(&admit(&db, "middle", middle, derived(middle, SUBJECT, None), None).await);
+    succeeded(
+        &admit(
+            &db,
+            "one",
+            leaf,
+            derived(leaf, middle, Some(json!({}))),
+            None,
+        )
+        .await,
+    );
+    succeeded(&admit(&db, "two", leaf, derived(leaf, middle, None), Some(1)).await);
+}
+
+/// The traits contract of the matrix: `mode`, plus optional `region` in the
+/// candidate, at an object level in `level`'s content model.
+fn traits_level(level: Level, with_region: bool) -> Value {
+    let mut properties = json!({ "mode": { "type": "string" } });
+    if with_region {
+        properties["region"] = json!({ "type": "string" });
+    }
+    let mut contract = json!({ "type": "object", "properties": properties });
+    if let Value::Object(keywords) = level.keywords() {
+        for (key, value) in keywords {
+            // The partial level's pattern names `b*`; trait names start elsewhere.
+            let value = if key == "patternProperties" {
+                json!({ "^r": { "type": "string" } })
+            } else {
+                value
+            };
+            contract[key] = value;
+        }
+    }
+    contract
+}
+
+/// The payload matrix applied to the traits contract: an open level already
+/// admitted `{"region": 42}`, which a typed optional trait now refuses.
+#[tokio::test]
+async fn an_optional_trait_follows_the_content_model_of_its_level() {
+    for (level, expected) in [
+        (Level::Closed, None),
+        (
+            Level::Open,
+            Some(AdmissionFailureReason::IncompatibleWithBaseline),
+        ),
+        (
+            Level::Partial,
+            Some(AdmissionFailureReason::CompatibilityUndecidable),
+        ),
+    ] {
+        let db = test_db().await;
+        succeeded(
+            &admit(
+                &db,
+                "one",
+                SUBJECT,
+                declaring(Some(traits_level(level, false))),
+                None,
+            )
+            .await,
+        );
+        let outcome = admit(
+            &db,
+            "two",
+            SUBJECT,
+            declaring(Some(traits_level(level, true))),
+            Some(1),
+        )
+        .await;
+        match expected {
+            None => succeeded(&outcome),
+            Some(reason) => refused_with(&outcome, reason),
+        }
+    }
+}
+
+/// The effective contract is compared, not the authored keyword: a child that
+/// restates its parent's constraint at its own level admits exactly what it
+/// inherited, though its own declaration went from absent to a closed `mode`.
+#[tokio::test]
+async fn a_child_restating_an_inherited_traits_constraint_is_compatible() {
+    let db = test_db().await;
+    let child = gts_id!("cf.core.compat.thing.v1~cf.core.compat.child.v1~");
+    let read_only = json!({
+        "type": "object",
+        "properties": { "mode": { "type": "string", "enum": ["read"] } },
+    });
+    succeeded(
+        &admit(
+            &db,
+            "parent",
+            SUBJECT,
+            declaring(Some(read_only.clone())),
+            None,
+        )
+        .await,
+    );
+    let derived = |traits_schema: Option<Value>| {
+        let mut doc = json!({
+            "$id": format!("gts://{child}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "allOf": [{ "$ref": format!("gts://{SUBJECT}") }],
+        });
+        if let Some(traits_schema) = traits_schema {
+            doc["x-gts-traits-schema"] = traits_schema;
+        }
+        doc
+    };
+    succeeded(&admit(&db, "one", child, derived(None), None).await);
+    succeeded(&admit(&db, "two", child, derived(Some(read_only)), Some(1)).await);
+}
+
+/// A revision that leaves the traits contract alone stays admissible even when
+/// GTS cannot prove that contract included in itself: the stored baseline
+/// artifact and the candidate's materialized one are compared as the same contract.
+#[tokio::test]
+async fn a_revision_that_leaves_the_traits_schema_alone_is_compatible() {
+    let db = test_db().await;
+    let titled = |title: &str| {
+        let mut doc = one(SUBJECT, Level::Closed);
+        doc["title"] = json!(title);
+        doc["x-gts-traits-schema"] = json!({
+            "type": "object",
+            "allOf": [
+                { "additionalProperties": false, "properties": { "a": { "type": "string" } } },
+                { "properties": { "b": { "type": "string" } } },
+            ],
+        });
+        doc
+    };
+    succeeded(&admit(&db, "one", SUBJECT, titled("Thing"), None).await);
+    succeeded(&admit(&db, "two", SUBJECT, titled("Renamed thing"), Some(1)).await);
+}
+
 /// An open level already accepted arbitrary values under that name, so constraining
 /// it to a string rejects instances the baseline accepted.
 #[tokio::test]

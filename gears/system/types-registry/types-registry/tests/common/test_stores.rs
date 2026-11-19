@@ -713,6 +713,15 @@ impl TypeSchemaStore for TestStores {
         Ok(out)
     }
 
+    async fn current_traits_schema(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_id: i64,
+    ) -> Result<Option<String>, ScopeError> {
+        self.inner.current_traits_schema(tx, scope, entity_id).await
+    }
+
     async fn find_current_schema(
         &self,
         tx: &DbTx<'_>,

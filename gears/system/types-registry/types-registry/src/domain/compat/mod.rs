@@ -9,7 +9,7 @@ mod derivation;
 mod sides;
 
 pub(crate) use baseline::{
-    Baseline, UnreadableVersion, backward_comparison, refusal, select_baseline,
+    Baseline, TraitsDeclaration, UnreadableVersion, evolution_comparison, refusal, select_baseline,
 };
 pub(crate) use derivation::{DialectDrift, dialect_pin, normalize_dialect, quarantine};
 pub(crate) use sides::{BaselineDoc, CandidateDoc};

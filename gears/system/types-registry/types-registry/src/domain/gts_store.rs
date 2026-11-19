@@ -81,6 +81,7 @@ pub struct UnitStore {
 #[domain_model]
 #[derive(Clone, Debug)]
 pub struct CommittedSchema {
+    pub entity_id: i64,
     pub revision_no: i32,
     pub content: Value,
 }
@@ -413,6 +414,7 @@ pub async fn load_unit_store(
             committed_schemas.insert(
                 gts_id.clone(),
                 CommittedSchema {
+                    entity_id,
                     revision_no,
                     content: content.clone(),
                 },

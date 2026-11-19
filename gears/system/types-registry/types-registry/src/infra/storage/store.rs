@@ -191,6 +191,15 @@ impl TypeSchemaStore for Repos {
         TypeSchemaRepo::current_documents(tx, scope, entity_ids).await
     }
 
+    async fn current_traits_schema(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_id: i64,
+    ) -> Result<Option<String>, ScopeError> {
+        TypeSchemaRepo::current_traits_schema(tx, scope, entity_id).await
+    }
+
     async fn find_current_schema(
         &self,
         tx: &DbTx<'_>,

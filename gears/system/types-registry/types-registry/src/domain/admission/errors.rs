@@ -52,9 +52,12 @@ pub enum WorkerError {
         reason: String,
     },
     /// Invalid JSON in a stored baseline indicates corruption, not a candidate refusal.
-    #[error("the stored baseline document for '{gts_id}' is not valid JSON: {source}")]
+    /// `column` names the stored input: the immutable authored revision, or the
+    /// effective traits artifact that refresh rewrites.
+    #[error("the stored baseline {column} for '{gts_id}' is not valid JSON: {source}")]
     BaselineUnparsable {
         gts_id: String,
+        column: &'static str,
         #[source]
         source: serde_json::Error,
     },

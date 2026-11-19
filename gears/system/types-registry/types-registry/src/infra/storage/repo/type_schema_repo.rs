@@ -80,6 +80,34 @@ fn current_row(m: type_schema::Model) -> CurrentTypeSchemaRow {
 pub struct TypeSchemaRepo;
 
 impl TypeSchemaRepo {
+    /// Read only the effective traits schema for the compatibility check.
+    ///
+    /// # Errors
+    /// Propagates the scoped query's failure.
+    pub async fn current_traits_schema(
+        runner: &impl DBRunner,
+        scope: &AccessScope,
+        entity_id: i64,
+    ) -> Result<Option<String>, ScopeError> {
+        #[derive(FromQueryResult)]
+        struct TraitsSchema {
+            effective_traits_schema: String,
+        }
+        Ok(type_schema::Entity::find()
+            .filter(type_schema::Column::EntityId.eq(entity_id))
+            .secure()
+            .scope_with(scope)
+            .project_all(runner, |query| {
+                query
+                    .select_only()
+                    .column(type_schema::Column::EffectiveTraitsSchema)
+                    .into_model::<TraitsSchema>()
+            })
+            .await?
+            .pop()
+            .map(|row| row.effective_traits_schema))
+    }
+
     /// Authored documents of the given entities' current revisions.
     ///
     /// Two reads rather than a join: no relations are declared on these entities
