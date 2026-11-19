@@ -2,7 +2,7 @@
 
 Every place where a scenario had to choose because the Task Engine docs are silent, unclear or contradict each other. Each entry names the docs, the scenarios that depend on it, what those scenarios assume, and the question the doc owner must settle. When a gap is settled, fix the docs, update the scenarios it lists, and delete the entry.
 
-- **Status (2026-11-06):** every entry is decided. Each carries a `Decided` line from the wire review (2026-11-04) or the gap review (2026-11-06); entries that only asked for an accepted proposal's doc edit are settled by that proposal. The scenarios, [CONVENTIONS.md](CONVENTIONS.md), [ERRORS.md](ERRORS.md), the draft OpenAPI ([#5791](https://github.com/constructorfabric/gears-rust/pull/5791)) and the draft reference DDL follow the decisions. What is left in each entry is its `Remaining` work: the PRD, DESIGN, ADR and schema edits, which wait for the proposals PR, plus the library changes named there (G-SEC-03, G-SEC-09). Delete an entry once its doc edit lands. The `Assumed` lines record what the scenarios assumed before the decision.
+- **Status (2026-11-06):** every entry is decided. Each carries a `Decided` line from the wire review (2026-11-04) or the gap review (2026-11-06); entries that only asked for an accepted proposal's doc edit are settled by that proposal. The scenarios, [CONVENTIONS.md](CONVENTIONS.md), [ERRORS.md](ERRORS.md), the draft [`openapi.yaml`](../docs/openapi.yaml) (and its published copy) and the reference [`migration.sql`](../docs/migration.sql) follow the decisions. What is left in each entry is its `Remaining` work: the PRD, DESIGN, ADR and schema edits, which wait for the proposals PR, plus the library changes named there (G-SEC-03, G-SEC-09). Delete an entry once its doc edit lands. The `Assumed` lines record what the scenarios assumed before the decision.
 - **Baseline:** `main` at `6efb0f856` plus the accepted proposals of [PR #5730](https://github.com/constructorfabric/gears-rust/pull/5730) (CONVENTIONS §1). Line numbers refer to that commit.
 - **Kinds:** `contradiction` (two docs disagree), `missing` (no rule), `unclear` (a rule that admits two readings), `proposal-open` (depends on an `Open` proposal item), `wire` (a request or response shape the docs do not give).
 - **IDs** are stable and grouped by area: `WIRE` shapes and error contract · `CRT` create, idempotency, dedup, supersession · `CLM` claim, ordering, limits · `EXE` sessions, fencing, execution, release, entries · `RTY` retry, timeouts, dead-letter, cancel · `WAI` waits, parent/child, dependencies · `SEC` auth, errors, search, reads, events · `OPS` queues, config, bulk, domains, reassignment, blacklist, retention, flows.
@@ -26,7 +26,7 @@ Every place where a scenario had to choose because the Task Engine docs are sile
 Several areas hit the same problem from different sides. Settle these first; each one closes a cluster of entries.
 
 1. **The error contract cannot be built as written.** DESIGN puts reason codes in `context.reason` on categories whose platform context has no such key, and asks for field violations on `404`/`403`, which cannot carry them. The library also sends `Retry-After` only on `503`, while the PRD requires it on every `429`, and no doc gives values. → G-WIRE-14, G-WIRE-15, G-SEC-02, G-SEC-03, G-SEC-19, G-CLM-09, G-CLM-10, G-WAI-25, G-WAI-33, G-CRT-07, G-CRT-08, G-CLM-18, G-SEC-21, G-CRT-23.
-2. **No API contract.** There is no OpenAPI on `main`; the draft OpenAPI ([#5791](https://github.com/constructorfabric/gears-rust/pull/5791)) is the annotated draft, and branch `docs/task-engine-openapi` carries the same contract without annotations (CONVENTIONS §5), and the DESIGN endpoint table and sequence diagram disagree on the claim and complete shapes. DESIGN §3.1 is an internal domain model with no API projection to the SDK or the wire, and it types GTS references as `Uuid`. → G-WIRE-02 to G-WIRE-13, G-WIRE-16, G-WIRE-17, G-WIRE-19, G-EXE-15, G-EXE-18, plus the `wire` entries of each area.
+2. **No API contract.** There is no OpenAPI on `main`; CONVENTIONS §5 stands in for it, [`../docs/openapi.yaml`](../docs/openapi.yaml) is the annotated draft built from it, and branch `docs/task-engine-openapi` carries the same contract without annotations (CONVENTIONS §5 › Draft OpenAPI), and the DESIGN endpoint table and sequence diagram disagree on the claim and complete shapes. DESIGN §3.1 is an internal domain model with no API projection to the SDK or the wire, and it types GTS references as `Uuid`. → G-WIRE-02 to G-WIRE-13, G-WIRE-16, G-WIRE-17, G-WIRE-19, G-EXE-15, G-EXE-18, plus the `wire` entries of each area.
 3. **The docs still describe what the accepted proposals removed.** Consumer-set waits, `update` on the parent, dependency add/remove, `update` covering more than tags, `resolve` under `update`, `authz_scope`, the k-way claim merge, the "no SKIP LOCKED" rule, the exact per-tenant depth counter, and `GET /admin/dlq` are all still on `main`, and the event schemas lack the new states. → G-WAI-01, G-WAI-02, G-WAI-03, G-WAI-04, G-WAI-27, G-CRT-15, G-CLM-01, G-CLM-07, G-CLM-11, G-RTY-01, G-SEC-11.
 4. **PDP unreachable: `403` or `503`.** PRD.md:918 says `403`; PRD.md:961 and DESIGN.md:1022, :1215 say `503`. Scenarios assume `503`. → G-SEC-01, G-EXE-06, G-WAI-31.
 5. **Consequences of sampled per-tenant depth.** The check moves before the transaction, so a replay can get `429` and a supersession no longer frees its own capacity first; the backlog table goes away and the deferred limit is sampled too; tests cannot see when a sample was taken. → G-CRT-14, G-CLM-24, G-CLM-11, G-CLM-13, G-EXE-23.
@@ -87,7 +87,7 @@ These entries describe the same question from two areas. Keep both until it is s
 - **Docs**: DESIGN.md:1065-1071, :1081
 - **Scenarios**: worker/sessions/*, worker/execution/*, worker/release/*
 - **Assumed**: start/complete/release return the task resource; batch heartbeat returns `results[{task_id, outcome: ok|lease_lost, state, cancel_requested}]`; progress returns `200` with no body (DESIGN.md:1314; the update is buffered); checkpoint returns the merged `context`.
-- **Question**: confirm each response body (the draft the draft OpenAPI ([#5791](https://github.com/constructorfabric/gears-rust/pull/5791)) follows these assumptions).
+- **Question**: confirm each response body (the draft [`../docs/openapi.yaml`](../docs/openapi.yaml) follows these assumptions).
 - **Decided** (wire review 2026-11-04): `start`, `complete` and `release` return `200` with the full task resource; `checkpoint` returns `{ context }`; `progress` returns `200` empty. The batch heartbeat returns `{ session_id, heartbeat_interval_secs, results: [{ task_id, outcome: ok, state, cancel_requested, cancel_request? }, { task_id, outcome: lease_lost }] }`. Remaining: the doc edit.
 
 ### G-WIRE-07 — Reported failure has no endpoint of its own
@@ -165,7 +165,7 @@ These entries describe the same question from two areas. Keep both until it is s
 ### G-WIRE-16 — DESIGN types GTS references and subjects as `Uuid`
 - **Kind**: contradiction
 - **Docs**: DESIGN.md:282-285 (`type_id (GTS)`, `queue_id (GTS)`, `owner_id`, `created_by` as `Uuid`); GTS IDs are strings (`gts.cf.core.tasks.task.v1~acme.reports._.render.v1~`); `schemas/types/…task_created.v1~` (`task_type`, `queue` as GTS strings, `created_by` as `string`); the Event Broker SDK uses `GtsTypeId` / `GtsInstanceId` (`event-broker-sdk/src/models.rs`)
-- **Scenarios**: every scenario (fixtures use full GTS IDs); the draft OpenAPI ([#5791](https://github.com/constructorfabric/gears-rust/pull/5791)) `Task`, `CreateTaskRequest`
+- **Scenarios**: every scenario (fixtures use full GTS IDs); [../docs/openapi.yaml](../docs/openapi.yaml) `Task`, `CreateTaskRequest`
 - **Assumed**: `type` and `queue` are GTS ID strings on the wire and typed GTS IDs in the SDK; `created_by` and `owner_id` are platform subject IDs (strings).
 - **Question**: Retype these fields in DESIGN §3.1 (and the SDK) as GTS IDs and subject IDs.
 - **Decided** (wire review 2026-11-04): `type` and `queue` are GTS ID strings on the wire; DESIGN §3.1 is to retype them. Remaining: the doc edit.
@@ -173,7 +173,7 @@ These entries describe the same question from two areas. Keep both until it is s
 ### G-WIRE-17 — No API projection from the domain model to the SDK and the wire
 - **Kind**: missing
 - **Docs**: DESIGN.md:276-450 (§3.1 domain model, internal), DESIGN.md:1040-1240 (§3.3 endpoint tables, names only some body fields); Event Broker DESIGN §3.1 "API projection" table for Topic (the pattern); `docs/toolkit_unified_system/02_gear_layout_and_sdk_pattern.md:60-80` (SDK models vs REST DTOs)
-- **Scenarios**: CONVENTIONS §5 (every **S** wire name); the draft OpenAPI ([#5791](https://github.com/constructorfabric/gears-rust/pull/5791))
+- **Scenarios**: CONVENTIONS §5 (every **S** wire name); [../docs/openapi.yaml](../docs/openapi.yaml)
 - **Assumed**: wire name = domain name, except `type`/`queue` (domain `type_id`/`queue_id`), `predecessors[]` + `dependency_mode` (domain `TaskDependency { predecessor_id, mode }` per row), `assignment` without `lease_token`, `session_id`, `handoff_until` or deadlines, and `idempotency_key` (REST header; field of the SDK `CreateTaskRequest` until header binding is supported). Event `data` uses `task_id` / `task_type` because the envelope owns `id` / `type`.
 - **Question**: Add an "API projection" table per resource (task, assignment, wait condition, entry, queue) to DESIGN §3.3: domain field → SDK field → wire field, and which fields are hidden, renamed, server-set, input-only or read-only. Decide whether the dependency mode is per task or per edge.
 - **Decided** (wire review 2026-11-04): wire names `type`, `queue`; `predecessors: [{ task_id, on_predecessor_failure }]` with one `dependency_mode` per task. Remaining: the doc edit.
@@ -181,15 +181,15 @@ These entries describe the same question from two areas. Keep both until it is s
 ### G-WIRE-19 — Stored task data the API does not project
 - **Kind**: missing
 - **Docs**: DESIGN.md:329-340 (`Assignment`: `assignment_deadline`, `execution_deadline`, `handoff_until`), DESIGN.md:367 (`resolved_payload` on the wait condition), PRD.md:346-353 and `POST /tasks/{id}/cancel` `reason` (cancel request), PRD.md:521-527 (SLA breach), DESIGN.md (re-enqueue restarts the lifetime), Proposals › Domains (task domain fixed at creation)
-- **Scenarios**: the draft OpenAPI ([#5791](https://github.com/constructorfabric/gears-rust/pull/5791)) `Task`, `Assignment`, `WaitConditionBase`; CONVENTIONS §5.1
+- **Scenarios**: [../docs/openapi.yaml](../docs/openapi.yaml) `Task`, `Assignment`, `WaitConditionBase`; CONVENTIONS §5.1
 - **Assumed**: as decided below. Internal only: `idempotency_key`, `revision`, `resume_pending`, `lease_token`, `session_id`, `assignment_deadline`, `handoff_until`, the lifetime deadline, dedup and supersede keys.
-- **Question**: Add the decided fields to DESIGN's API projection (G-WIRE-17). Storage in the draft reference DDL (`migration.sql`, kept outside this branch): the cancel request columns (`cancel_mode_code`, `cancel_requested_by`, `cancel_requested_at`, `cancel_reason`) back `cancel_request`, `grace_until` comes from the `cancel_grace` timer, `resolved_payload` backs the wait-condition `result`.
+- **Question**: Add the decided fields to DESIGN's API projection (G-WIRE-17). Storage in [../docs/migration.sql](../docs/migration.sql): the cancel request columns (`cancel_mode_code`, `cancel_requested_by`, `cancel_requested_at`, `cancel_reason`) back `cancel_request`, `grace_until` comes from the `cancel_grace` timer, `resolved_payload` backs the wait-condition `result`.
 - **Decided** (wire review 2026-11-04): the task also returns `domain` and `cancel_request { mode, requested_by, requested_at, reason, grace_until, superseded_by }`; `assignment` adds `execution_deadline` only. Not exposed: `lifetime_deadline`, `sla_breached_at`, a wait-group summary, `started_at`, `assignment_deadline`, `handoff_until` (`started_at` and `sla_breached_at` stay as internal columns in migration.sql, on both `te_task_state` and `te_task_results`: written once, kept for run-time and SLA reporting). The wait-condition `result` is returned (G-WAI-08).
 
 ### G-WIRE-20 — Storage choices made by the draft migration.sql
 - **Kind**: missing
 - **Docs**: DESIGN.md §3.7 (DESIGN.md:1394-1960)
-- **Scenarios**: the draft reference DDL (`migration.sql`, kept outside this branch)
+- **Scenarios**: [../docs/migration.sql](../docs/migration.sql)
 - **Assumed**: the draft picks these where DESIGN is silent or names no column, index or query:
   - MySQL/MariaDB times are `TIMESTAMP(6)` with a UTC session time zone, as in OAGW; it ends in 2038 (`2038-01-19 03:14:07` UTC), accepted: a later migration changes the type before then. Until it does, a caller-supplied time past that limit (`run_after`, `sla_deadline`, queue `hold_until`) cannot be stored on MySQL.
   - Enum discriminants other than `urgency` are assigned by the draft; 0 is unused so a defaulted 0 fails the `CHECK`.
@@ -214,7 +214,7 @@ These entries describe the same question from two areas. Keep both until it is s
 ### G-WIRE-21 — Reassignment accept response
 - **Kind**: missing
 - **Docs**: DESIGN.md:1069 (`accept` gives the new assignee "a lease in its session"), DESIGN.md:755 (`accept_reassignment → (Task, Lease)`)
-- **Scenarios**: [worker/reassignment/1.02-positive-only-named-identity-accepts.md](worker/reassignment/1.02-positive-only-named-identity-accepts.md); the draft OpenAPI ([#5791](https://github.com/constructorfabric/gears-rust/pull/5791)) `AcceptResponse`
+- **Scenarios**: [worker/reassignment/1.02-positive-only-named-identity-accepts.md](worker/reassignment/1.02-positive-only-named-identity-accepts.md); [../docs/openapi.yaml](../docs/openapi.yaml) `AcceptResponse`
 - **Assumed**: as decided below.
 - **Question**: Add the shape to DESIGN §3.3.
 - **Decided** (wire review 2026-11-04): `200 { session_id, domain, heartbeat_interval_secs, task, lease, authority }`, the same as one claim entry plus its session. Remaining: the doc edit.
@@ -247,7 +247,7 @@ These entries describe the same question from two areas. Keep both until it is s
 
 ### G-CRT-04 — Which resolved settings are stored, and how a partial retry policy is filled
 - **Kind**: unclear
-- **Docs**: PRD.md:980 ("a retry policy is taken whole from the first level that has one"); DESIGN.md:715 (resolved result stored on the task); task-type schema `retry_policy` (required `max_retries`, `strategy`, `base_interval_secs`, `max_interval_secs`; defaults `max_liveness_requeues` 20, `jitter_factor` 0, `non_retryable_codes` []); queue schema `timeouts` description (null `heartbeat_timeout_secs` = engine default lease); DESIGN.md:530 (lease resolved at claim); the draft reference DDL (`migration.sql`, kept outside this branch) (stores the effective values in `te_tasks.retry_policy_json` / `timeouts_json`)
+- **Docs**: PRD.md:980 ("a retry policy is taken whole from the first level that has one"); DESIGN.md:715 (resolved result stored on the task); task-type schema `retry_policy` (required `max_retries`, `strategy`, `base_interval_secs`, `max_interval_secs`; defaults `max_liveness_requeues` 20, `jitter_factor` 0, `non_retryable_codes` []); queue schema `timeouts` description (null `heartbeat_timeout_secs` = engine default lease); DESIGN.md:530 (lease resolved at claim); [../docs/migration.sql](../docs/migration.sql) (stores the effective values in `te_tasks.retry_policy_json` / `timeouts_json`)
 - **Scenarios**: [tasks/create/1.03-positive-settings-resolution.md](tasks/create/1.03-positive-settings-resolution.md)
 - **Assumed**: omitted fields of the winning retry policy take the trait schema defaults (not the queue's values); the stored `heartbeat_timeout_secs` is the resolved `default_lease_duration_secs` (30), not `null`.
 - **Question**: When a type trait or request gives a partial retry policy, are the omitted fields schema defaults, or is that policy invalid? Is the lease (`heartbeat_timeout_secs`) and `default_execution_timeout_secs` resolved and stored at create, or left null and resolved at claim/start? What does `GET /tasks/{id}` show?
@@ -263,7 +263,7 @@ These entries describe the same question from two areas. Keep both until it is s
 
 ### G-CRT-06 — Tag limits: per-task count limit has no name, default or error; length unit and error unstated
 - **Kind**: missing
-- **Docs**: Proposals › Task mutability (accepted: "Tags. Set on `POST /tasks`, with a new limit on tags per task"; API changes "Add a limit on tags per task"); PRD.md:363 (keys up to 128, values up to 256 "characters"); DESIGN.md:1876-1877 (`VARCHAR(128)`, `VARCHAR(256)`); DESIGN.md:2057-2248 (no tag-count config key); the draft reference DDL (`migration.sql`, kept outside this branch) (`te_tags` `VARCHAR(128)` / `VARCHAR(256)`; the count is checked when tags are written)
+- **Docs**: Proposals › Task mutability (accepted: "Tags. Set on `POST /tasks`, with a new limit on tags per task"; API changes "Add a limit on tags per task"); PRD.md:363 (keys up to 128, values up to 256 "characters"); DESIGN.md:1876-1877 (`VARCHAR(128)`, `VARCHAR(256)`); DESIGN.md:2057-2248 (no tag-count config key); [../docs/migration.sql](../docs/migration.sql) (`te_tags` `VARCHAR(128)` / `VARCHAR(256)`; the count is checked when tags are written)
 - **Scenarios**: [tasks/create/1.10-negative-field-limits.md](tasks/create/1.10-negative-field-limits.md)
 - **Assumed**: config `max_tags_per_task: 16` (name and value invented); over-length or over-count → `400` `invalid_argument`, field violation on `tags` / `tags.<key>`; lengths in Unicode characters.
 - **Question**: Name and default of the per-task tag limit; error for too many tags and for over-long keys/values; characters vs bytes (`VARCHAR` length semantics differ between PostgreSQL and MySQL); are empty keys allowed?
@@ -295,7 +295,7 @@ These entries describe the same question from two areas. Keep both until it is s
 
 ### G-CRT-10 — `resource_id` length: 256 in the table, 1024 in event schemas, no error stated
 - **Kind**: contradiction
-- **Docs**: DESIGN.md:1891 (`te_resource_refs.resource_id VARCHAR(256)`); `schemas/types/…task_created.v1~.schema.json` line 86 (`resource_id` `maxLength: 1024`, same in every task-scoped event schema); PRD.md:372 (count bounded, no length); the draft reference DDL (`migration.sql`, kept outside this branch) (keeps `te_resource_refs.resource_id VARCHAR(256)`)
+- **Docs**: DESIGN.md:1891 (`te_resource_refs.resource_id VARCHAR(256)`); `schemas/types/…task_created.v1~.schema.json` line 86 (`resource_id` `maxLength: 1024`, same in every task-scoped event schema); PRD.md:372 (count bounded, no length); [../docs/migration.sql](../docs/migration.sql) (keeps `te_resource_refs.resource_id VARCHAR(256)`)
 - **Scenarios**: [tasks/create/1.05-positive-tags-and-resource-refs.md](tasks/create/1.05-positive-tags-and-resource-refs.md)
 - **Assumed**: nothing about lengths above 256; the scenario uses a short ID.
 - **Question**: What is the maximum `resource_id` length, and what does a create with a longer one get (`400` field violation on `resource_refs[i].resource_id`)? Align the table and the event schemas.
@@ -622,7 +622,7 @@ These entries describe the same question from two areas. Keep both until it is s
 
 ### G-CLM-27 — Priority aging is Open; ordering tests assume none
 - **Kind**: proposal-open
-- **Docs**: PRD.md:535-539; DESIGN.md:2514; Proposals › Claiming and ordering › Open "Drop priority aging …"; the draft reference DDL (`migration.sql`, kept outside this branch) (priority aging can only use `created_at` as queued age; no column records entry into `queued`)
+- **Docs**: PRD.md:535-539; DESIGN.md:2514; Proposals › Claiming and ordering › Open "Drop priority aging …"; [../docs/migration.sql](../docs/migration.sql) (priority aging can only use `created_at` as queued age; no column records entry into `queued`)
 - **Scenarios**: [worker/ordering/1.03-positive-priority-orders-only-within-tenant.md](worker/ordering/1.03-positive-priority-orders-only-within-tenant.md), [worker/ordering/1.04-positive-fifo-queue-orders-by-priority-age-id.md](worker/ordering/1.04-positive-fifo-queue-orders-by-priority-age-id.md)
 - **Assumed**: no aging changes a priority within the few seconds a test runs.
 - **Question**: decide the item; if aging stays, give its threshold so tests can stay below it, and add a scenario for it.
@@ -1256,7 +1256,7 @@ These entries describe the same question from two areas. Keep both until it is s
 
 ### G-WAI-32 — Default `on_timeout` when a condition omits it
 - **Kind**: missing
-- **Docs**: PRD.md:561, PRD.md:583, DESIGN.md:366, DESIGN.md:836; the draft reference DDL (`migration.sql`, kept outside this branch) (`te_wait_conditions.on_timeout_code` NULL = no timeout)
+- **Docs**: PRD.md:561, PRD.md:583, DESIGN.md:366, DESIGN.md:836; [../docs/migration.sql](../docs/migration.sql) (`te_wait_conditions.on_timeout_code` NULL = no timeout)
 - **Scenarios**: [waits/event/1.03-positive-no-timeout-gets-max-wait-with-fail.md](waits/event/1.03-positive-no-timeout-gets-max-wait-with-fail.md)
 - **Assumed**: an event condition with neither a timeout nor an action gets `max_wait_secs` and `on_timeout = fail` (DESIGN.md:836); nothing else asserted.
 - **Question**: What is the default `on_timeout` for a condition of any kind that sets a timeout but no action? Is `on_timeout` without a timeout allowed?
@@ -1296,7 +1296,7 @@ These entries describe the same question from two areas. Keep both until it is s
 
 ### G-WAI-37 — `on_predecessor_failure: ignore` has no storage and no cascade branch
 - **Kind**: missing
-- **Docs**: DESIGN.md:1556 (`te_task_results.predecessors`), DESIGN.md:1858-1866 (`te_dependencies` has no column for it), DESIGN.md:2656, DESIGN.md:2911-2916 (`on_predecessor_terminal` has no `ignore` branch); Proposals › Task mutability › Set only in the create request; the draft reference DDL (`migration.sql`, kept outside this branch) (`te_dependencies.on_predecessor_failure_code`; `outcome_code` 0 pending / 1 succeeded / 2 failed_ignored / 3 failed replaces `satisfied`)
+- **Docs**: DESIGN.md:1556 (`te_task_results.predecessors`), DESIGN.md:1858-1866 (`te_dependencies` has no column for it), DESIGN.md:2656, DESIGN.md:2911-2916 (`on_predecessor_terminal` has no `ignore` branch); Proposals › Task mutability › Set only in the create request; [../docs/migration.sql](../docs/migration.sql) (`te_dependencies.on_predecessor_failure_code`; `outcome_code` 0 pending / 1 succeeded / 2 failed_ignored / 3 failed replaces `satisfied`)
 - **Scenarios**: [hierarchy/dependencies/1.01-positive-create-with-predecessors-initial-state.md](hierarchy/dependencies/1.01-positive-create-with-predecessors-initial-state.md), [hierarchy/dependencies/1.02-positive-predecessor-outcome-moves-successor.md](hierarchy/dependencies/1.02-positive-predecessor-outcome-moves-successor.md), [hierarchy/dependencies/1.10-flow-fan-out-then-join.md](hierarchy/dependencies/1.10-flow-fan-out-then-join.md)
 - **Assumed**: the setting is per link, stored on the link and returned in `predecessors[].on_predecessor_failure`; a failed, cancelled or dead-lettered predecessor on an `ignore` link sets `satisfied = true`, at create and in the cascade; in `any` mode an ignored failure counts as a success and unblocks the successor.
 - **Question**: Which column holds it? How does `on_predecessor_terminal` treat `ignore` in `all` and `any` mode — does `any` + `ignore` unblock on a failure? Should the task resource show each link's outcome?
@@ -1394,7 +1394,7 @@ These entries describe the same question from two areas. Keep both until it is s
 
 ### G-SEC-06 — Members and caps of the lists embedded at `view=full`
 - **Kind**: wire
-- **Docs**: DESIGN.md:1170, :1172, :2146; PRD.md:1136, :1147; Proposals › API reads and responses › Bounded responses ("every list embedded at detail `full` is capped"); the draft reference DDL (`migration.sql`, kept outside this branch) (reuses `search_full_event_cap` for embedded wait conditions and entries)
+- **Docs**: DESIGN.md:1170, :1172, :2146; PRD.md:1136, :1147; Proposals › API reads and responses › Bounded responses ("every list embedded at detail `full` is capped"); [../docs/migration.sql](../docs/migration.sql) (reuses `search_full_event_cap` for embedded wait conditions and entries)
 - **Scenarios**: [search/1.04-positive-views.md](search/1.04-positive-views.md)
 - **Assumed**: members `events` (50 most recent, newest first), `wait_conditions`, `entries`, `dependencies`.
 - **Question**: Name the members, the order of the capped events, and the caps (config keys and defaults) for entries and wait conditions at `full`.
@@ -1402,7 +1402,7 @@ These entries describe the same question from two areas. Keep both until it is s
 
 ### G-SEC-07 — Event history paging: names, limits and order
 - **Kind**: missing
-- **Docs**: DESIGN.md:1108, :1837; PRD.md:868, :1075; Proposals › API reads and responses › Bounded responses; the draft reference DDL (`migration.sql`, kept outside this branch) (`id asc` serves `timestamp asc, id asc`: UUID v7 ids, `occurred_at` = id time)
+- **Docs**: DESIGN.md:1108, :1837; PRD.md:868, :1075; Proposals › API reads and responses › Bounded responses; [../docs/migration.sql](../docs/migration.sql) (`id asc` serves `timestamp asc, id asc`: UUID v7 ids, `occurred_at` = id time)
 - **Scenarios**: events/1.01, 1.02, 1.03
 - **Assumed**: the REST paging guideline through the ToolKit OData extractor: `limit`/`cursor`, cap 100 (clamped), `limit=0` → `400`; `$filter` on `event_type` (`eq`, `in`) and `timestamp` (range); order oldest first by event ID, no `$orderby`. Default page size is G-SEC-25.
 - **Question**: Confirm the filter set and the order of the history, and the cap.
@@ -1571,7 +1571,7 @@ These entries describe the same question from two areas. Keep both until it is s
 ### G-SEC-28 — No history event for a tag change
 - **Kind**: missing
 - **Docs**: PRD.md:879 (event list has no tag event); PRD.md:868 (history includes user actions); Proposals › Task mutability (tags are the only field an API consumer may still change)
-- **Scenarios**: the draft reference DDL (`migration.sql`, kept outside this branch)
+- **Scenarios**: [../docs/migration.sql](../docs/migration.sql)
 - **Assumed**: `PATCH /tasks/{id}/tags` records no event; only the tag rows change.
 - **Question**: Add an event (e.g. `taskTagsUpdated` with the changed keys) or state that tag changes are not audited.
 - **Decided** (gap review 2026-11-06): add `taskTagsUpdated` with `actor`, the keys set (with their new values) and the keys removed; one history row per `PATCH /tasks/{id}/tags`. A tag PATCH bumps `updated_at` of a live task only. Remaining: the schema, the doc edit and a scenario.
@@ -1580,7 +1580,7 @@ These entries describe the same question from two areas. Keep both until it is s
 
 ### G-OPS-01 — How queue per-state counts are computed
 - **Kind**: missing
-- **Docs**: PRD.md:493, DESIGN.md:763, :1106-1107; the draft reference DDL (`migration.sql`, kept outside this branch) (leader samples in `te_queue_depth_samples`; the dead-lettered count scans every history partition per sample, cadence unsettled)
+- **Docs**: PRD.md:493, DESIGN.md:763, :1106-1107; [../docs/migration.sql](../docs/migration.sql) (leader samples in `te_queue_depth_samples`; the dead-lettered count scans every history partition per sample, cadence unsettled)
 - **Scenarios**: [queues/1.01-positive-queue-introspection.md](queues/1.01-positive-queue-introspection.md)
 - **Assumed**: `GET /queues` returns a count per live state with `sampled_at`; exact values are not asserted for a sample older than `queue_depth.sample_secs`. A `dead_letter` queue reports a `dead_lettered` count and no limits.
 - **Question**: Are per-state counts exact queries or leader samples, how stale may they be, are they capped, and what does a dead-letter queue report?
@@ -1588,7 +1588,7 @@ These entries describe the same question from two areas. Keep both until it is s
 
 ### G-OPS-02 — What a tenant subject with queue `read` sees in queue counts
 - **Kind**: missing
-- **Docs**: PRD.md:923 ("seeing queues never grants access to task data"), PRD.md:455 (`429` shows no usage figures), DESIGN.md:1106-1107; the draft reference DDL (`migration.sql`, kept outside this branch) (`te_queue_depth_samples` holds all-tenant counts only)
+- **Docs**: PRD.md:923 ("seeing queues never grants access to task data"), PRD.md:455 (`429` shows no usage figures), DESIGN.md:1106-1107; [../docs/migration.sql](../docs/migration.sql) (`te_queue_depth_samples` holds all-tenant counts only)
 - **Scenarios**: [queues/1.01-positive-queue-introspection.md](queues/1.01-positive-queue-introspection.md)
 - **Assumed**: Introspection scenarios use a root operator, who sees all-tenant counts. Nothing is asserted for a tenant caller.
 - **Question**: Do queue counts of a shared queue cover all tenants for any caller with queue `read` (which reveals other tenants' volume, while `429` deliberately hides usage), or are they narrowed to the caller's tenant scope?
@@ -1596,7 +1596,7 @@ These entries describe the same question from two areas. Keep both until it is s
 
 ### G-OPS-03 — Where a hold is stored and how fast it takes effect
 - **Kind**: unclear
-- **Docs**: Proposals › Queue operations › Admin queue hold ("stored in the queue's domain … within a short refresh interval"); DESIGN.md:2154 (`runtime_config_poll_secs`); DESIGN §3.7 (DESIGN.md:1394-1960) has no table for it; the draft reference DDL (`migration.sql`, kept outside this branch) (`te_queue_holds`, one row per held queue, written to every domain of the queue during a move)
+- **Docs**: Proposals › Queue operations › Admin queue hold ("stored in the queue's domain … within a short refresh interval"); DESIGN.md:2154 (`runtime_config_poll_secs`); DESIGN §3.7 (DESIGN.md:1394-1960) has no table for it; [../docs/migration.sql](../docs/migration.sql) (`te_queue_holds`, one row per held queue, written to every domain of the queue during a move)
 - **Scenarios**: [flows/1.07-flow-incident-hold-and-release.md](flows/1.07-flow-incident-hold-and-release.md), [queues/2.01-positive-hold-queue.md](queues/2.01-positive-hold-queue.md)
 - **Assumed**: The hold reaches every node within `runtime_config_poll_secs` (5 s); claims started in that window may still take a task from the held queue.
 - **Question**: Name the table/columns for the hold, the refresh interval, and whether a hold response guarantees no claim starts after it (e.g. claims re-check the hold row inside their transaction).
@@ -1628,7 +1628,7 @@ These entries describe the same question from two areas. Keep both until it is s
 
 ### G-OPS-07 — Queue timeout while a queue is held
 - **Kind**: proposal-open
-- **Docs**: Proposals › Queue operations › Open questions (queue timeouts while held; leaning: do not fire); PRD.md:517; DESIGN.md:541; the draft reference DDL (`migration.sql`, kept outside this branch) (nothing stored to suspend a held queue's queue timeout; it keeps firing)
+- **Docs**: Proposals › Queue operations › Open questions (queue timeouts while held; leaning: do not fire); PRD.md:517; DESIGN.md:541; [../docs/migration.sql](../docs/migration.sql) (nothing stored to suspend a held queue's queue timeout; it keeps firing)
 - **Scenarios**: [flows/1.07-flow-incident-hold-and-release.md](flows/1.07-flow-incident-hold-and-release.md), [queues/2.02-positive-held-queue-stops-claims-only.md](queues/2.02-positive-held-queue-stops-claims-only.md)
 - **Assumed**: Scenarios assert only what holds either way: the lifetime timeout still ends a held task. On main + accepted, a queue timeout would also fire during a hold.
 - **Question**: Decide whether held time counts toward the queue timeout, and how a timer that is due during a hold is re-armed on release.
@@ -1636,7 +1636,7 @@ These entries describe the same question from two areas. Keep both until it is s
 
 ### G-OPS-08 — Mechanism of `until` auto-release
 - **Kind**: missing
-- **Docs**: Proposals › Queue operations › Admin queue hold (`until?` "for automatic release"); the draft reference DDL (`migration.sql`, kept outside this branch) (no timer; a maintenance sweep on `te_queue_holds.hold_until`)
+- **Docs**: Proposals › Queue operations › Admin queue hold (`until?` "for automatic release"); [../docs/migration.sql](../docs/migration.sql) (no timer; a maintenance sweep on `te_queue_holds.hold_until`)
 - **Scenarios**: [queues/2.03-positive-release-resumes-claims.md](queues/2.03-positive-release-resumes-claims.md)
 - **Assumed**: At `until` the queue is released within `runtime_config_poll_secs`; exactly one `queueReleased` is published, with no `actor`.
 - **Question**: Is the release a durable timer (`te_timers` type) or a clock comparison on each node? Who writes the single `queueReleased` event? What about an `until` in the past (assumed `400`)?
@@ -1644,7 +1644,7 @@ These entries describe the same question from two areas. Keep both until it is s
 
 ### G-OPS-09 — Repeated hold and release of a queue that is not held
 - **Kind**: missing
-- **Docs**: Proposals › Queue operations › Admin queue hold; the draft reference DDL (`migration.sql`, kept outside this branch) (a repeated hold overwrites `reason` / `hold_until`, keeps `held_since` / `held_by`)
+- **Docs**: Proposals › Queue operations › Admin queue hold; [../docs/migration.sql](../docs/migration.sql) (a repeated hold overwrites `reason` / `hold_until`, keeps `held_since` / `held_by`)
 - **Scenarios**: [queues/2.03-positive-release-resumes-claims.md](queues/2.03-positive-release-resumes-claims.md), [queues/2.04-guardrail-hold-and-release-edge-cases.md](queues/2.04-guardrail-hold-and-release-edge-cases.md)
 - **Assumed**: Holding a held queue returns `200`, replaces `reason` and `until`, keeps `since`/`by`, and publishes another `queueHeld`. Releasing a queue that is not held returns `200` with `hold: null` and publishes nothing.
 - **Question**: Define both cases (update vs. no-op vs. `409`), and whether `by` changes when another admin re-holds.
@@ -1660,7 +1660,7 @@ These entries describe the same question from two areas. Keep both until it is s
 
 ### G-OPS-11 — Runtime config: body semantics, storage, validation and apply lag
 - **Kind**: missing
-- **Docs**: PRD.md:482-487; DESIGN.md:208 and :1129-1130 (`te_runtime_config` named, no table in §3.7), DESIGN.md:860 (step 6), :862 (single leader); the draft reference DDL (`migration.sql`, kept outside this branch) (`te_runtime_config` columns `config_version`, `overrides`, `saved_by`, `saved_at`; singleton `te_runtime_config_applied`)
+- **Docs**: PRD.md:482-487; DESIGN.md:208 and :1129-1130 (`te_runtime_config` named, no table in §3.7), DESIGN.md:860 (step 6), :862 (single leader); [../docs/migration.sql](../docs/migration.sql) (`te_runtime_config` columns `config_version`, `overrides`, `saved_by`, `saved_at`; singleton `te_runtime_config_applied`)
 - **Scenarios**: [queues/3.01-positive-runtime-config-save-is-complete-version.md](queues/3.01-positive-runtime-config-save-is-complete-version.md), [queues/3.03-positive-config-version-apply-status.md](queues/3.03-positive-config-version-apply-status.md), [queues/3.05-negative-queue-outside-trust-limits-refuses-tasks.md](queues/3.05-negative-queue-outside-trust-limits-refuses-tasks.md)
 - **Assumed**: A save merges into the previous version (only changed keys appear in `configUpdated`); each domain applies at its next maintenance pass; a value outside the trust limits is rejected at save with `400`; `GET /admin/config/{n}` for an unknown version is `404`; versions are cumulative.
 - **Question**: Define the `te_runtime_config` table, merge vs. replace, validation at save (trust limits, unknown keys, unknown queue IDs), how removal of an override is expressed, the maintenance interval that bounds apply lag, and the unknown-version answer.
@@ -1892,7 +1892,7 @@ These entries describe the same question from two areas. Keep both until it is s
 ### G-OPS-44 — Who returns a ring slot from `free` to `active`
 - **Kind**: missing
 - **Docs**: DESIGN.md:1434 (`te_ring_state.status` `active` / `recycling` / `free`), DESIGN.md:1439 (*Ring fence*), DESIGN.md:852 (Mark step); ADR-0009
-- **Scenarios**: the draft reference DDL (`migration.sql`, kept outside this branch)
+- **Scenarios**: [../docs/migration.sql](../docs/migration.sql)
 - **Assumed**: after truncation the slot is `free` for bucket `B + N`, and a writer treats `free` for its own bucket like `active`; nothing ever sets it back to `active`.
 - **Question**: Is `free` a distinct state at all? If so, who moves the slot to `active` and when, and what does a fenced writer do when it finds `free`?
 - **Decided** (gap review 2026-11-06): drop `free`: after the truncate the same step sets the slot `active` for bucket `B + N`; a fenced writer writes to the ring table when the slot's bucket equals the task's bucket, else to `_retained`. Remaining: the doc edit.
@@ -1900,7 +1900,7 @@ These entries describe the same question from two areas. Keep both until it is s
 ### G-OPS-45 — Retention of engine- and queue-scoped events
 - **Kind**: missing
 - **Docs**: DESIGN.md:1438 (engine-scoped events take the slot of their own id), DESIGN.md:1829 (`task_id` NULL); ADR-0009 (rescue is per task)
-- **Scenarios**: the draft reference DDL (`migration.sql`, kept outside this branch)
+- **Scenarios**: [../docs/migration.sql](../docs/migration.sql)
 - **Assumed**: `configUpdated`, `workerBlacklisted`, `queueHeld`, `queueReleased` are never rescued and disappear when their slot is recycled (about `(N − 2) × W` days).
 - **Question**: What retention applies to events that have no task, and must any of them (audit of config changes) outlive the ring?
 - **Decided** (gap review 2026-11-06): no special retention: events without a task follow their ring slot (about `(N − 2) × W` days), documented in DESIGN; long-term audit is a broker consumer's job. Remaining: the doc edit.
@@ -1908,7 +1908,7 @@ These entries describe the same question from two areas. Keep both until it is s
 ### G-OPS-46 — DESIGN indexes that no query uses
 - **Kind**: unclear
 - **Docs**: DESIGN.md:1473 (`ix_te_tasks_type`, "type-based queries and concurrency counting"), DESIGN.md:1530 (`ix_te_task_state_run_after`, "scheduled enqueue scan"), DESIGN.md:1531 (`ix_te_task_state_assignee`, "worker-based queries"), DESIGN.md:1927 (`ix_te_sessions_worker`, "operator views"), DESIGN.md:1948 (MySQL form of `run_after`), DESIGN.md:1795 (`ix_te_waits_timeout`, "timeout scan"); DESIGN.md §4.6 procTimers (scheduled and wait timeouts fire from `te_timers`)
-- **Scenarios**: the draft reference DDL (`migration.sql`, kept outside this branch)
+- **Scenarios**: [../docs/migration.sql](../docs/migration.sql)
 - **Assumed**: only indexes a query uses are created (benchmark later). Not created: `ix_te_tasks_type` (type queries read `te_task_state` / `te_task_results`), `ix_te_task_state_run_after` (scheduled tasks are enqueued by their `scheduled` timer), `ix_te_task_state_assignee` and `ix_te_sessions_worker` (no query filters by worker); `ix_te_waits_timeout` serves only a safety sweep for wait conditions whose `wait` timer was lost.
 - **Question**: Name the query each index serves or drop it from DESIGN §3.7 (write-cost rule). Is a timer-loss safety sweep wanted?
 - **Decided** (gap review 2026-11-06): drop `ix_te_tasks_type`, `ix_te_task_state_run_after`, `ix_te_task_state_assignee`, `ix_te_sessions_worker` from DESIGN §3.7. Keep a slow safety sweep (about every 5 min) that re-arms a missing `wait` timer and counts `te_wait_timer_repairs_total`: it uses `ix_te_waits_timeout` and, because timer conditions keep their time in `timer_resume_at`, a second partial index `(timer_resume_at) WHERE kind_code = timer AND state_code = pending`. Remaining: the doc edit.
@@ -1916,7 +1916,7 @@ These entries describe the same question from two areas. Keep both until it is s
 ### G-OPS-47 — No length limit for free-text `reason` on cancel and queue hold
 - **Kind**: missing
 - **Docs**: PRD.md:346-353 and `POST /tasks/<built-in function id>/cancel` `reason`; Proposals › Queue operations › Admin queue hold (`reason`)
-- **Scenarios**: the draft reference DDL (`migration.sql`, kept outside this branch)
+- **Scenarios**: [../docs/migration.sql](../docs/migration.sql)
 - **Assumed**: both are stored as `VARCHAR(1024)` (`te_task_state.cancel_reason`, `te_queue_holds.reason`); nothing is asserted about longer values.
 - **Question**: Give the maximum length (characters or bytes) and the error for both fields.
 - **Decided** (gap review 2026-11-06): `reason` on cancel and queue hold: at most 1024 characters, else `400 TOO_LONG` on `/reason`. Remaining: the doc edit.

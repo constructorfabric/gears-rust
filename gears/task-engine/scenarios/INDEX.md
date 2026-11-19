@@ -5,7 +5,7 @@ Concrete behaviour scenarios for the Task Engine, written as literal HTTP exchan
 1. **Test basis.** Each file is one behaviour a test can assert. Requirement IDs and doc lines in each header make coverage traceable to the [PRD](../docs/PRD.md), [DESIGN](../docs/DESIGN.md) and [ADRs](../docs/ADR/).
 2. **Gap finder.** Wherever the docs did not settle an outcome, the scenario cites an entry in [GAPS.md](GAPS.md). All 232 entries are decided (wire review 2026-11-04, gap review 2026-11-06) and the scenarios follow the decisions; what remains is the PRD, DESIGN and ADR edit each entry names. Error shapes and every reason code are catalogued in [ERRORS.md](ERRORS.md).
 
-**Read [CONVENTIONS.md](CONVENTIONS.md) first.** It sets the baseline, the fixtures, where the wire contract lives (the draft OpenAPI in [#5791](https://github.com/constructorfabric/gears-rust/pull/5791); `main` has no OpenAPI yet), the error envelope, the side-effect vocabulary and the file format.
+**Read [CONVENTIONS.md](CONVENTIONS.md) first.** It sets the baseline, the fixtures, the wire shapes (each marked documented, agreed, proposed or set by the scenarios, and drafted as [`../docs/openapi.yaml`](../docs/openapi.yaml); `main` has no OpenAPI yet), the error envelope, the side-effect vocabulary and the file format.
 
 **Baseline.** `main` at `6efb0f856` plus every `Proposed` item of the design proposals in [PR #5730](https://github.com/constructorfabric/gears-rust/pull/5730), taken as accepted (CONVENTIONS §1). 95 scenarios depend on an accepted proposal and say so in a `Depends on` row; the docs on `main` have not been edited for those items yet.
 
