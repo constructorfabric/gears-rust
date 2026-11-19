@@ -121,6 +121,14 @@ checks exist, which Subject/Resource pairs they involve, and which properties ar
   not call the check; reviews, approves, and authors rules against the licensing contracts that Gears expose,
   enumerating them via the types registry — without reading Gear source code.
 
+#### End User
+
+**ID**: `cpt-cf-license-resolver-actor-end-user`
+
+- **Role**: A person, or a UI that calls with that person's token, who asks whether they themselves are licensed for a
+  resource, for example to hide unlicensed features. Calls only the check whose subject and tenant come from their own
+  `SecurityContext`; its answer is a hint for the UI, not proof of a license.
+
 ### 2.2 System Actors
 
 #### Consuming Module
@@ -245,11 +253,15 @@ delegated as any other subject. A principal type without a mapping **MUST** yiel
 
 The system **MUST** also provide a check that takes the caller's `SecurityContext`, the resource and the operation
 context: the subject is the principal of that context and the tenant is the principal's tenant. The operation context
-comes from the caller, not from `SecurityContext`, which fixes only the subject and the tenant.
+comes from the caller, not from `SecurityContext`, which fixes only the subject and the tenant. This check **MUST**
+require authentication only, no policy permission: it answers only about the caller in its own tenant. Its answer is
+a hint for the caller: a module **MUST NOT** accept it as proof of a license. A module that gates an operation **MUST**
+build the check's resource and `metadata` from its own data, not from user input.
 
 - **Rationale**: The calling module knows the principal but not the platform vendor's Subject contract types; one
   mapping in the resolver serves every caller, and backends keep receiving Subject contract types only.
-- **Actors**: `cpt-cf-license-resolver-actor-consuming-module`, `cpt-cf-license-resolver-actor-platform-vendor`
+- **Actors**: `cpt-cf-license-resolver-actor-consuming-module`, `cpt-cf-license-resolver-actor-platform-vendor`,
+  `cpt-cf-license-resolver-actor-end-user`
 
 #### Resource Identity
 
@@ -584,7 +596,9 @@ bounded within that tenant (the current tenant-bounded model — see §11).
 | Contract drift (Gear code vs registered schema)  | Checks start failing validation after a Gear change          | Engine-side validation surfaces drift immediately and fail-closed; additive-optional evolution is non-breaking by rule.                       |
 | Contract governance overhead                     | New licensable surfaces require registration and review      | The review point is the feature; per-Gear contract count is small and bounded by its distinct licensable surfaces.                            |
 | A platform service checks the wrong subject      | Access is granted or denied on another subject's license     | Only platform services can name a subject; the principal of a user request comes from its `SecurityContext` (SDK helper).                     |
-| A platform service checks subjects in any tenant | Another tenant's license status is disclosed to that service | The platform contract is reachable only by platform services; authorization of the calling service when the platform supports it.             |
+| Any platform service learns the license status of any subject | The resolver performs no policy check, so the license status of any subject in any tenant is disclosed to any service that holds a platform credential | The platform contract is reachable only by platform services. A backend plugin **MAY** authorize a check by the tenant, subject and resource it receives, for example through authz-resolver; the plugin receives no caller identity, so its decision cannot depend on the calling service. Authorization of the calling service is tracked in #6037. |
+| End-user checks load the backend                 | Checks on the caller's own context compete with checks that gate operations for plugin capacity; a gating check that fails is treated as not granted | No rate limit per caller yet: a `#[toolkit::rest_contract]` route cannot name a throttling zone, and the api-gateway binds zones only through the route's operation, not by path (toolkit gap). A deployment may limit the path in a proxy in front of the api-gateway. |
+| A module gates an operation by a check built from user input | The user names a resource or `metadata` that is licensed and gets an operation on another one | The module builds the resource and `metadata` from its own data. The answer to an end user's own check is a hint for the UI; a module never accepts it as proof of a license (`cpt-cf-license-resolver-fr-principal-subject`). |
 
 ## 13. Open Questions
 

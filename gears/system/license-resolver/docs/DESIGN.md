@@ -113,7 +113,7 @@ Requirements from PRD that significantly influence architecture decisions.
 | `cpt-cf-license-resolver-adr-typed-licensing-contracts` | Subject/Resource shapes are registered, versioned GTS types derived from the licensing base types; the gateway validates every request against the registered contracts (fail-closed) before delegation; metadata is schematized but semantically opaque to the engine.   |
 | `cpt-cf-license-resolver-adr-plugin-delegation`         | No resolver-owned store; backend discovered via types-registry and selected by vendor + priority, failing closed when none matches.                                                                                                                                       |
 | `cpt-cf-license-resolver-adr-principal-subject-mapping` | The gateway maps a principal type to a Subject contract type from its configuration (exact entry, then nearest ancestor); an unmapped principal is not granted; plugins receive Subject contract types only.                                                              |
-| `cpt-cf-license-resolver-adr-two-planes`                | Platform plane: subject and tenant from the request, user principal passed as data; tenant plane at the edge for the caller itself.                                                                                                                                       |
+| `cpt-cf-license-resolver-adr-two-planes`                | Platform plane: subject and tenant from the request, user principal passed as data; tenant plane, open to any authenticated caller, for the caller itself.                                                                                                                                       |
 
 ### 1.3 Architecture Layers
 
@@ -481,8 +481,21 @@ The platform route accepts only a service credential, which external clients do 
 reach it; the resolver trusts its `tenant_id` and `subject` as the in-process call does. No component checks which
 platform service may check which tenant: this is an exception to the toolkit's two-plane rule
 ([ADR-0008](../../../../docs/arch/toolkit-oop/ADR/0008-cpt-cf-adr-two-plane-auth.md)) until the toolkit authorizes
-platform-plane callers (`cpt-cf-license-resolver-adr-two-planes`). The tenant route takes the caller's bearer token:
-any authenticated principal can call it, and it answers only about that principal in its own tenant.
+platform-plane callers ([#6037](https://github.com/constructorfabric/gears-rust/issues/6037),
+`cpt-cf-license-resolver-adr-two-planes`). The tenant route takes the caller's bearer token:
+any authenticated principal can call it, and it answers only about that principal in its own tenant. It requires no
+policy permission, because a caller learns only its own license status in its own tenant. Its answer is a hint: a UI may
+hide a feature by it, but a module never accepts it as proof of a license. A module that gates an operation builds the
+check's resource and `metadata` from its own data, not from user input.
+
+The Visibility column is the route's visibility axis
+([ADR-0003](../../../../docs/arch/toolkit-oop/ADR/0003-cpt-cf-adr-gateway-abstraction.md)): `exposed` lets the
+api-gateway forward the route to a resolver that runs in its own process. Who can call a route follows from its context
+type, not from its visibility.
+
+Both planes call the same plugin, so tenant-plane checks share its capacity with the checks that gate operations. The
+tenant route has no rate limit per caller yet: a `#[toolkit::rest_contract]` route cannot name a throttling zone, and
+the api-gateway binds a zone only through the route's operation, not by path (PRD § Risks).
 
 **Plugin client — `LicenseResolverPluginClient`** (realizes PRD `cpt-cf-license-resolver-contract-plugin`): a single
 `is_licensed` method over `LicenseCheckRequest` (the subject already a Subject contract object) and `LicenseDecision`,
