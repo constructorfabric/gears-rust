@@ -104,7 +104,7 @@ OAGW solves these problems by providing a single outbound proxy layer with plugg
 | Data Plane | Internal service that orchestrates proxy requests: resolves configuration, executes plugin chains, and forwards HTTP calls to external services |
 | Control Plane | Internal service that manages configuration data (upstreams, routes, plugins) with repository access |
 | Alias | Short identifier used in proxy URLs to reference an upstream. Auto-derived from hostname for hostname-based endpoints (user-provided alias rejected); explicit alias required for IP-based or non-derivable endpoints. Normalized to ASCII lowercase; resolution is case-insensitive |
-| Sharing Mode | Configuration visibility setting for hierarchical tenancy: `private` (owner only), `inherit` (descendants can override), `enforce` (descendants cannot override) |
+| Sharing Mode | Configuration visibility setting for hierarchical tenancy: `private` (owner only: never applied to or returned for a descendant's request, also when the descendant has no upstream of its own), `inherit` (descendants can override), `enforce` (no descendant down the chain can override) |
 | GTS | Global Type System — the platform's schema and instance registration system used for plugin type identification |
 
 ## 2. Actors
@@ -343,14 +343,14 @@ The system **MUST** support hierarchical configuration override across tenant hi
 
 | Mode | Behavior |
 |------|----------|
-| `private` | Not visible to descendants (default) |
+| `private` | Not visible to descendants (default): never applied to or returned for a descendant's request, also when the alias resolves to the owner's upstream |
 | `inherit` | Visible; descendant can override if specified |
-| `enforce` | Visible; descendant cannot override |
+| `enforce` | Visible; no descendant down the chain can override, whatever the levels in between set |
 
 Override rules:
 - **Auth**: With `sharing: inherit`, descendant with permission can use own credentials
 - **Rate limits**: Descendant can only be stricter: `effective = min(ancestor.enforced, descendant)`
-- **Plugins**: Descendant's plugins append; enforced plugins cannot be removed
+- **Plugins**: Descendant's plugins append; enforced plugins cannot be removed or replaced, by a descendant or a route
 
 Tags do not have a sharing mode — they always use add-only union semantics:
 `effective_tags = union(ancestor_tags..., descendant_tags)`. Descendants can add tags but cannot remove inherited tags.
@@ -446,6 +446,8 @@ Sub:  alias "api.openai.com" (shadows root)
 
 Effective for sub: min(root.enforced:10000, sub:500) = 500
 ```
+
+The same holds for routes: when a descendant's route matches a request that an ancestor's route on the shadowed upstream would also match, the ancestor route's enforced plugins still apply, ahead of anything the descendant sets: a descendant that enforces the same plugin on its own upstream does not replace the ancestor route's config. The ancestor route's enforced rate limit is not yet applied across route shadowing.
 
 - **Rationale**: Provides human-readable proxy URLs while supporting multi-tenant isolation and override semantics.
 - **Actors**: `cpt-cf-oagw-actor-app-developer`, `cpt-cf-oagw-actor-platform-operator`

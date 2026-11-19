@@ -38,7 +38,10 @@ Expected:
 
 ## Scenario C: private
 
-Parent sets `auth.sharing=private`.
+Parent sets `auth.sharing=private` (example: apikey with `secret_ref`) and shares something else, so its upstream is visible to the child (example: `rate_limit.sharing=inherit`).
 
 Expected:
-- Child must provide its own auth.
+- The parent's own requests carry its credential.
+- A child request never carries it: the upstream receives no `Authorization` from OAGW (the client's own token is not forwarded either).
+- This holds when the child has no upstream of its own and the alias resolves to the parent's upstream, and when the child binds the alias without auth.
+- The child must provide its own auth.

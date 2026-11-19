@@ -311,6 +311,10 @@ pub struct RateLimitKeyContext<'a> {
     pub resource: RateLimitResource,
     /// ID of the owning upstream or route.
     pub resource_id: &'a Uuid,
+    /// Upstream (or route) whose limit is in effect, when not `resource_id`:
+    /// keeps apart the buckets of tenants that resolve different limits on
+    /// one upstream.
+    pub limit_owner: Option<&'a Uuid>,
     /// Configured rate-limit scope, which decides which identity parts form the key.
     pub scope: &'a RateLimitScope,
     /// Tenant of the calling subject.
@@ -325,7 +329,9 @@ pub struct RateLimitKeyContext<'a> {
 
 /// Build a rate-limit bucket key based on the configured scope.
 ///
-/// Key format: `oagw:ratelimit:{resource_type}:{resource_id}:{scope}:{scope_id}:{window}`
+/// Key format: `oagw:ratelimit:{resource_type}:{resource_id}:{scope}:{scope_id}:{window}`,
+/// with `{resource_id}:via:{limit_owner}` in place of `{resource_id}` when
+/// `limit_owner` is set.
 ///
 /// The resource type and id are placed first so that all keys for a given
 /// resource share a common prefix. This enables efficient prefix-based cleanup
@@ -345,35 +351,26 @@ pub fn build_rate_limit_key(ctx: &RateLimitKeyContext<'_>) -> String {
         RateLimitResource::Upstream => "upstream",
         RateLimitResource::Route => "route",
     };
+    let id = match ctx.limit_owner {
+        Some(owner) => format!("{}:via:{owner}", ctx.resource_id),
+        None => ctx.resource_id.to_string(),
+    };
     let w = window_label(ctx.window);
     match ctx.scope {
-        RateLimitScope::Global => {
-            format!("oagw:ratelimit:{res}:{}:global:{w}", ctx.resource_id)
-        }
+        RateLimitScope::Global => format!("oagw:ratelimit:{res}:{id}:global:{w}"),
         RateLimitScope::Tenant => {
-            format!(
-                "oagw:ratelimit:{res}:{}:tenant:{}:{w}",
-                ctx.resource_id, ctx.tenant_id
-            )
+            format!("oagw:ratelimit:{res}:{id}:tenant:{}:{w}", ctx.tenant_id)
         }
         RateLimitScope::User => {
-            format!(
-                "oagw:ratelimit:{res}:{}:user:{}:{w}",
-                ctx.resource_id, ctx.subject_id
-            )
+            format!("oagw:ratelimit:{res}:{id}:user:{}:{w}", ctx.subject_id)
         }
         // When client_ip is None (no X-Forwarded-For / X-Real-IP), falls back to
         // "unknown" — all such requests share one bucket (effectively global scope).
-        RateLimitScope::Ip => {
-            format!(
-                "oagw:ratelimit:{res}:{}:ip:{}:{w}",
-                ctx.resource_id,
-                ctx.client_ip.unwrap_or("unknown")
-            )
-        }
-        RateLimitScope::Route => {
-            format!("oagw:ratelimit:{res}:{}:route:{w}", ctx.resource_id)
-        }
+        RateLimitScope::Ip => format!(
+            "oagw:ratelimit:{res}:{id}:ip:{}:{w}",
+            ctx.client_ip.unwrap_or("unknown")
+        ),
+        RateLimitScope::Route => format!("oagw:ratelimit:{res}:{id}:route:{w}"),
     }
 }
 
@@ -426,10 +423,14 @@ impl RateLimiter {
         self.buckets.len()
     }
 
-    /// Remove all rate-limit buckets associated with an upstream (across all scopes).
+    /// Remove all rate-limit buckets associated with an upstream (across all
+    /// scopes), including other upstreams' buckets that count its limit
+    /// (`…:via:{upstream_id}:…`).
     pub fn remove_keys_for_upstream(&self, upstream_id: Uuid) {
         let prefix = format!("oagw:ratelimit:upstream:{upstream_id}:");
-        self.buckets.retain(|k, _| !k.starts_with(&prefix));
+        let via = format!(":via:{upstream_id}:");
+        self.buckets
+            .retain(|k, _| !k.starts_with(&prefix) && !k.contains(&via));
     }
 
     /// Remove all rate-limit buckets associated with a route.
@@ -582,6 +583,7 @@ mod tests {
             cost: 1,
             response_headers: true,
             pool_owner_id: None,
+            limit_owner_id: None,
         }
     }
 
@@ -990,6 +992,7 @@ mod tests {
         RateLimitKeyContext {
             resource: RateLimitResource::Upstream,
             resource_id: id,
+            limit_owner: None,
             scope,
             tenant_id,
             subject_id,
@@ -1009,6 +1012,7 @@ mod tests {
         RateLimitKeyContext {
             resource: RateLimitResource::Route,
             resource_id: id,
+            limit_owner: None,
             scope,
             tenant_id,
             subject_id,
@@ -1030,6 +1034,35 @@ mod tests {
             &Window::Second,
         ));
         assert_eq!(key, format!("oagw:ratelimit:upstream:{uid}:global:second"));
+    }
+
+    #[test]
+    fn build_key_names_another_limit_owner() {
+        let uid = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let zero = Uuid::nil();
+        let mut ctx = upstream_ctx(
+            &uid,
+            &RateLimitScope::Global,
+            &zero,
+            &zero,
+            None,
+            &Window::Second,
+        );
+        ctx.limit_owner = Some(&owner);
+        let key = build_rate_limit_key(&ctx);
+        assert_eq!(
+            key,
+            format!("oagw:ratelimit:upstream:{uid}:via:{owner}:global:second")
+        );
+
+        // Still under the upstream's prefix, so its cleanup removes it.
+        let limiter = RateLimiter::new();
+        limiter
+            .try_consume(&key, &make_config(10, Window::Second, None), "/test")
+            .unwrap();
+        limiter.remove_keys_for_upstream(uid);
+        assert_eq!(limiter.bucket_count(), 0);
     }
 
     #[test]
@@ -1175,6 +1208,30 @@ mod tests {
     }
 
     #[test]
+    fn remove_keys_for_upstream_cleans_buckets_that_count_its_limit() {
+        let _clock = FrozenClock::new();
+        let limiter = RateLimiter::new();
+        let config = make_config(10, Window::Second, None);
+        let owner = Uuid::from_u128(1);
+        let (descendant, unrelated) = (Uuid::from_u128(2), Uuid::from_u128(3));
+
+        let counts_owner =
+            format!("oagw:ratelimit:upstream:{descendant}:via:{owner}:global:second");
+        let own = format!("oagw:ratelimit:upstream:{descendant}:global:second");
+        let other_owner =
+            format!("oagw:ratelimit:upstream:{descendant}:via:{unrelated}:global:second");
+        for k in [&counts_owner, &own, &other_owner] {
+            limiter.try_consume(k, &config, "/test").unwrap();
+        }
+
+        limiter.remove_keys_for_upstream(owner);
+
+        assert!(!limiter.buckets.contains_key(&counts_owner));
+        assert!(limiter.buckets.contains_key(&own));
+        assert!(limiter.buckets.contains_key(&other_owner));
+    }
+
+    #[test]
     fn remove_keys_for_route_cleans_only_route() {
         let _clock = FrozenClock::new();
         let limiter = RateLimiter::new();
@@ -1207,6 +1264,7 @@ mod tests {
             cost: 1,
             response_headers: true,
             pool_owner_id: None,
+            limit_owner_id: None,
         }
     }
 

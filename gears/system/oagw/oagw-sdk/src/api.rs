@@ -150,8 +150,9 @@ pub trait ServiceGatewayClientV1: Send + Sync {
     ///
     /// - `PermissionDenied` (403) without `read` on upstreams in the
     ///   caller's tenant (checked first), on the upstreams of every tenant
-    ///   in its chain (any of them may contribute merged settings), or on
-    ///   the returned route.
+    ///   in its chain (any of them may contribute merged settings), on the
+    ///   returned route, or on an ancestor route the returned route shadows
+    ///   at least one of whose enforced plugins the answer carries.
     /// - `InvalidArgument` (400) for a path the proxy would reject: an
     ///   encoded dot-segment, a `;` path parameter, a stray `%`.
     /// - `NotFound` when no upstream or route matches.

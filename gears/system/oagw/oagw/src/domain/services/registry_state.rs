@@ -265,6 +265,7 @@ impl Encoder {
             cost,
             response_headers,
             pool_owner_id: _, // set by the hierarchical merge, never by provisioning
+            limit_owner_id: _, // likewise
         } = r;
         self.variant(sharing);
         self.variant(algorithm);

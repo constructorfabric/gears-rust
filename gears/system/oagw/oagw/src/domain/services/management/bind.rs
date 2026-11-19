@@ -60,24 +60,35 @@ pub(in crate::domain::services) struct BindOverrides<'a> {
 /// Validate bind constraints when a descendant creates or updates an
 /// upstream whose alias matches an ancestor's upstream.
 ///
-/// Permissions (per `cpt-cf-oagw-algo-tenant-permission-check`):
+/// `ancestors` are every ancestor upstream with the alias, closest first
+/// ([`super::ancestor::ancestor_upstreams`]); without one there is nothing to
+/// bind to and nothing is checked.
+///
+/// Permissions (per `cpt-cf-oagw-algo-tenant-permission-check`), on the
+/// closest ancestor:
 /// - `oagw:upstream:bind` — always required
 /// - `oagw:upstream:override_auth` — required when ancestor auth sharing is `inherit`
 /// - `oagw:upstream:override_rate` — required when ancestor rate_limit sharing is `inherit`
 /// - `oagw:upstream:add_plugins` — required when ancestor plugins sharing is not `private`
 ///
 /// Sharing modes:
-/// - `enforce` → blocked (plugins excepted: merge-time protection)
+/// - `enforce` → blocked (plugins excepted: merge-time protection). For auth
+///   and cors on any ancestor: an enforced field is sticky down the chain,
+///   whatever the ancestors in between set. For rate_limit on the closest
+///   ancestor only; the merge caps the effective limit by every enforcing one
 /// - `private` → shadow allowed, no permission
 /// - `inherit` → allowed with permission
 pub(in crate::domain::services) async fn validate_bind_constraints(
     ctx: &SecurityContext,
     enforcer: &PolicyEnforcer,
-    ancestor: &Upstream,
-    enforced_server: Option<&crate::domain::model::Server>,
+    ancestors: &[Upstream],
     overrides: &BindOverrides<'_>,
 ) -> Result<(), DomainError> {
     use crate::domain::model::SharingMode;
+
+    let Some(ancestor) = ancestors.first() else {
+        return Ok(());
+    };
 
     // 1. Check bind permission.
     let access_req = AccessRequest::new()
@@ -96,7 +107,7 @@ pub(in crate::domain::services) async fn validate_bind_constraints(
 
     // 2. An enforced credential is applied on every request, and it may go
     //    only to endpoints its owner configured.
-    if let Some(server) = enforced_server
+    if let Some(server) = enforced_auth_server(ancestors)
         && !super::merge::server_within(overrides.server, server)
     {
         return Err(DomainError::validation(format!(
@@ -110,12 +121,12 @@ pub(in crate::domain::services) async fn validate_bind_constraints(
 
     // Auth override.
     if overrides.auth.is_some() {
+        if enforced_by_any(ancestors, |u| u.auth.as_ref().map(|a| a.sharing)) {
+            return Err(DomainError::validation(
+                "cannot override auth: ancestor upstream has sharing mode 'enforce'",
+            ));
+        }
         match ancestor.auth.as_ref().map(|a| a.sharing) {
-            Some(SharingMode::Enforce) => {
-                return Err(DomainError::validation(
-                    "cannot override auth: ancestor upstream has sharing mode 'enforce'",
-                ));
-            }
             Some(SharingMode::Private) => {
                 // Private = invisible → descendant is providing fresh config (shadow),
                 // not overriding.  No permission check needed.
@@ -136,7 +147,11 @@ pub(in crate::domain::services) async fn validate_bind_constraints(
         }
     }
 
-    // Rate-limit override.
+    // Rate-limit override. Only the closest ancestor's enforce refuses it: the
+    // merge keeps an enforced limit as a floor down the whole chain, so a
+    // descendant's limit never exceeds a farther enforcing ancestor's at
+    // runtime. Refusing it here would only block allocated-budget children
+    // under an inherit parent, whose semantics under enforce wait on #4971.
     if overrides.rate_limit.is_some() {
         match ancestor.rate_limit.as_ref().map(|r| r.sharing) {
             Some(SharingMode::Enforce) => {
@@ -181,10 +196,7 @@ pub(in crate::domain::services) async fn validate_bind_constraints(
 
     // CORS override (no additional permission required, but Enforce blocks).
     if overrides.cors.is_some()
-        && ancestor
-            .cors
-            .as_ref()
-            .is_some_and(|c| c.sharing == SharingMode::Enforce)
+        && enforced_by_any(ancestors, |u| u.cors.as_ref().map(|c| c.sharing))
     {
         return Err(DomainError::validation(
             "cannot override cors: ancestor upstream has sharing mode 'enforce'",
@@ -192,6 +204,18 @@ pub(in crate::domain::services) async fn validate_bind_constraints(
     }
 
     Ok(())
+}
+
+/// Whether any of `ancestors` enforces the field `sharing` reads. A disabled
+/// ancestor counts too: the merge applies its enforced field again once it is
+/// enabled, so a descendant's override of it could never take effect.
+fn enforced_by_any(
+    ancestors: &[Upstream],
+    sharing: impl Fn(&Upstream) -> Option<crate::domain::model::SharingMode>,
+) -> bool {
+    ancestors
+        .iter()
+        .any(|u| sharing(u) == Some(crate::domain::model::SharingMode::Enforce))
 }
 
 /// How long a write waits for the credential store to answer whether a
@@ -311,38 +335,11 @@ pub(in crate::domain::services) fn parse_secret_ref(
     })
 }
 
-/// Validate bind constraints against the **closest** ancestor with a matching
-/// alias (the first of [`super::ancestor::ancestor_upstreams`]).
-/// Delegates to [`validate_bind_constraints`] for the actual checks.
-///
-/// No-op if no ancestor has the alias (fresh upstream, no bind needed).
-///
-/// `enforced_server` is the server of the ancestor whose enforced auth is in
-/// effect ([`enforced_auth_server`]): an enforced auth is sticky down the
-/// chain, so every binding under it must stay within those endpoints, whatever
-/// the ancestors in between set.
-pub(in crate::domain::services) async fn validate_ancestor_bind(
-    ctx: &SecurityContext,
-    enforcer: &PolicyEnforcer,
-    ancestor: Option<&Upstream>,
-    enforced_server: Option<&crate::domain::model::Server>,
-    overrides: &BindOverrides<'_>,
-) -> Result<(), DomainError> {
-    match ancestor {
-        Some(ancestor) => {
-            validate_bind_constraints(ctx, enforcer, ancestor, enforced_server, overrides).await
-        }
-        None => Ok(()),
-    }
-}
-
 /// The server of the ancestor whose enforced auth is in effect: the farthest
 /// enabled one of `ancestors` (closest first) that enforces its auth. The
 /// proxy merges only enabled ancestors and keeps the first enforced auth it
 /// meets from the root down.
-pub(in crate::domain::services) fn enforced_auth_server(
-    ancestors: &[Upstream],
-) -> Option<&crate::domain::model::Server> {
+fn enforced_auth_server(ancestors: &[Upstream]) -> Option<&crate::domain::model::Server> {
     ancestors
         .iter()
         .rfind(|u| {

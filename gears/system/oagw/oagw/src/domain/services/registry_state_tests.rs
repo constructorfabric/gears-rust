@@ -48,6 +48,7 @@ fn rate_limit(ratio: f64) -> RateLimitConfig {
         cost: 1,
         response_headers: false,
         pool_owner_id: None,
+        limit_owner_id: None,
     }
 }
 
@@ -68,7 +69,7 @@ fn headers(pairs: &[(&str, &str)]) -> HeadersConfig {
 }
 
 /// Listing order and `HashMap` order do not change the hash; content,
-/// tenant and ID do; `pool_owner_id` is not content.
+/// tenant and ID do; `pool_owner_id` and `limit_owner_id` are not content.
 ///
 /// ADR-0018: PERS-GATE-013.
 #[test]
@@ -89,6 +90,7 @@ fn the_content_hash_is_canonical() {
 
     let mut owned = upstreams.clone();
     owned[0].request.rate_limit.as_mut().unwrap().pool_owner_id = Some(Uuid::new_v4());
+    owned[0].request.rate_limit.as_mut().unwrap().limit_owner_id = Some(Uuid::new_v4());
     assert_eq!(content_hash(&owned, &routes, root), base);
 
     // The root tenant fills in instances that name none, as the writes do.
@@ -186,6 +188,7 @@ fn full_rate_limit() -> RateLimitConfig {
         cost: 1,
         response_headers: true,
         pool_owner_id: None,
+        limit_owner_id: None,
     }
 }
 

@@ -1629,9 +1629,19 @@ fn check_rate_limits(
         // For shared-pool budgets, use the pool owner's ID so all children
         // sharing the pool consume from the same token bucket.
         let effective_resource_id = rl.pool_owner_id.as_ref().unwrap_or(&upstream.id);
+        // Tenants on one upstream (or one shared pool) can resolve different
+        // limits (another tenant's `private` one is not theirs): the bucket
+        // names whose limit it is when that is not the key's resource, else
+        // one tenant's requests would reset the other's bucket. Tenants that
+        // inherit the pool owner's limit keep sharing its bucket.
+        let limit_owner = rl
+            .limit_owner_id
+            .as_ref()
+            .filter(|owner| *owner != effective_resource_id);
         let key = build_rate_limit_key(&RateLimitKeyContext {
             resource: RateLimitResource::Upstream,
             resource_id: effective_resource_id,
+            limit_owner,
             scope: &rl.scope,
             tenant_id: &tenant_id,
             subject_id: &subject_id,
@@ -1648,6 +1658,7 @@ fn check_rate_limits(
         let key = build_rate_limit_key(&RateLimitKeyContext {
             resource: RateLimitResource::Route,
             resource_id: &route.id,
+            limit_owner: None,
             scope: &rl.scope,
             tenant_id: &tenant_id,
             subject_id: &subject_id,
@@ -2683,6 +2694,7 @@ mod tests {
             cost: 1,
             response_headers: false,
             pool_owner_id: None,
+            limit_owner_id: None,
         }
     }
 

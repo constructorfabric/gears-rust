@@ -1128,6 +1128,7 @@ async fn every_kind_of_bad_content_is_skipped_and_keeps_its_row(b: Backend) {
         cost: 1,
         response_headers: false,
         pool_owner_id: None,
+        limit_owner_id: None,
     });
     secret.request.auth = Some(AuthConfig {
         plugin_type: crate::domain::gts_helpers::APIKEY_AUTH_PLUGIN_ID.into(),
@@ -1164,6 +1165,7 @@ async fn every_kind_of_bad_content_is_skipped_and_keeps_its_row(b: Backend) {
         cost: 1,
         response_headers: false,
         pool_owner_id: None,
+        limit_owner_id: None,
     });
     tag.request.tags = vec!["LLM".into()];
     bad_cors_route.request.cors = Some(wildcard_with_credentials);

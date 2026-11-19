@@ -7,8 +7,8 @@
 //!
 //! Sharing modes are not part of these shapes where the table has a sharing
 //! column (the column is the source of truth). Route CORS has no column, so
-//! [`StoredCors::sharing`] carries it. `RateLimitConfig::pool_owner_id` is
-//! computed at merge time and never stored.
+//! [`StoredCors::sharing`] carries it. `RateLimitConfig::pool_owner_id` and
+//! `RateLimitConfig::limit_owner_id` are computed at merge time and never stored.
 
 use std::collections::HashMap;
 
@@ -346,6 +346,7 @@ impl StoredRateLimit {
             cost: self.cost,
             response_headers: self.response_headers,
             pool_owner_id: None,
+            limit_owner_id: None,
         }
     }
 }

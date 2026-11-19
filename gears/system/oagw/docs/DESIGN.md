@@ -421,9 +421,13 @@ Multi-tenant hierarchy with sharing modes (`private`/`inherit`/`enforce`) per co
 | Field | Merge Strategy |
 |---|---|
 | Auth | Override if `inherit`; forced if `enforce`; never sent to endpoints its owner did not configure |
-| Rate Limits | `min(ancestor, descendant)` — stricter always wins |
-| Plugins | Concatenate: `ancestor.plugins + descendant.plugins` |
+| Rate Limits | `min(ancestor, descendant)` — stricter always wins; an enforced limit stays `enforce` down the chain, whichever level's value wins, so a `private` level below cannot replace it |
+| Plugins | Concatenate: `ancestor.plugins + descendant.plugins`; a `private` level (upstream or route) keeps only the enforced items and appends its own; an enforced item is never dropped, and a level or route naming the same `plugin_ref` does not replace it |
 | CORS | Union origins if `inherit`; forced if `enforce` |
+
+`private` means the field stays with its owner: an upstream or route of another tenant takes part in a descendant's resolution only with its shared fields. Its `private` auth, rate limit, plugins and CORS are neither merged nor returned, also when the descendant has no upstream of its own and the alias resolves to the ancestor's. Headers have no sharing mode and follow the endpoint rule below.
+
+A descendant cannot override auth or CORS that any ancestor upstream with the alias enforces, not only the closest one (`400`). A rate limit is refused only when the closest ancestor enforces it: a farther enforcing ancestor's limit stays the floor in the merge, so the descendant's limit cannot exceed it, and a child of an `inherit` parent with an allocated budget must set a limit to allocate. The override permissions are checked on the closest ancestor.
 
 Tags do not have a sharing mode — they always use add-only union semantics: `effective_tags = union(ancestor_tags, descendant_tags)`. Descendants cannot remove inherited tags.
 
