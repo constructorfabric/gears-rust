@@ -139,18 +139,22 @@ impl MembershipSchema {
 
 pub(crate) fn compile(schema: &TypeSchema) -> Result<PayloadValidator, DomainError> {
     use types_registry_sdk::CompilePayloadValidatorError as E;
+    use types_registry_sdk::GtsCompilePayloadValidatorError as Gts;
 
     schema
         .compile_payload_validator()
         .map_err(|error| match error {
-            E::MissingField { .. } | E::InvalidContent { .. } => {
-                tracing::error!(code = %schema.type_id, %error, "incomplete type snapshot");
-                DomainError::InternalError
-            }
-            other => DomainError::validation(format!(
-                "Type '{}' accepts no payload: {other}",
+            // The caller named a type that has no direct instances.
+            E::Upstream(Gts::Abstract(_)) => DomainError::validation(format!(
+                "Type '{}' accepts no payload: {error}",
                 schema.type_id
             )),
+            // An incomplete snapshot or an admitted schema GTS cannot compile
+            // is a registry or owner defect, not the caller's.
+            other => {
+                tracing::error!(code = %schema.type_id, error = %other, "type schema does not compile");
+                DomainError::InternalError
+            }
         })
 }
 

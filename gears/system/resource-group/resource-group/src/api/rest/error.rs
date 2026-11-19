@@ -143,11 +143,28 @@ impl From<DomainError> for CanonicalError {
                     .create()
             }
             // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2j
-            // ServiceUnavailable: no dedicated variant — DB / infra failures
-            // fall through to the Database arm below and surface as a
-            // canonical Internal (HTTP 500). A genuine 503 (e.g. AuthZ
-            // Resolver unreachable) is produced by platform middleware
-            // upstream of this mapper, not here.
+            // ServiceUnavailable: a transient types-registry read failure
+            // (outage, deadline, quota, aborted read) is a 503 carrying the
+            // registry's retry hint. DB / infra failures fall through to the
+            // Database arm below and surface as a canonical Internal (HTTP
+            // 500).
+            DomainError::ServiceUnavailable {
+                message,
+                retry_after_seconds,
+            } => {
+                tracing::warn!(reason = %message, "resource-group dependency unavailable");
+                let unavailable = CanonicalError::service_unavailable();
+                match retry_after_seconds {
+                    Some(seconds) => unavailable.with_retry_after_seconds(seconds).create(),
+                    None => unavailable.create(),
+                }
+            }
+            // The types registry refused the caller (401/403): its refusal is
+            // returned unchanged, so the caller sees who denied access.
+            DomainError::RegistryRefusedCaller(refusal) => {
+                tracing::debug!(error = %refusal, "types registry refused the caller");
+                refusal
+            }
             // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2j
             // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2k
             // Source description flows into the canonical's `ctx.description`
@@ -155,11 +172,6 @@ impl From<DomainError> for CanonicalError {
             // (DESIGN.md §3.6) logs it server-side with the request `trace_id`.
             // `Internal::description` is `#[serde(skip)]`, so the DB text
             // never reaches the wire `detail`.
-            DomainError::RegistryRefusedCaller(refusal) => refusal,
-            DomainError::ServiceUnavailable { message } => {
-                tracing::warn!(reason = %message, "resource-group dependency unavailable");
-                CanonicalError::service_unavailable().create()
-            }
             DomainError::Database(db_err) => {
                 CanonicalError::internal(format!("resource-group DB error: {db_err}")).create()
             }

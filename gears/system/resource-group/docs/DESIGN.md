@@ -561,9 +561,11 @@ create dictionary keys nor consult type definitions.
 An unknown or deleted group type is `TypeNotFound` when an active type is
 required. An unknown, deleted, malformed, wildcard or instance identifier used as
 a new member resource type is a validation error. Caller registry refusals retain
-401/403; an unavailable registry is reported as service unavailable. Missing
-required projections are internal contract errors. SDK payload compilation or
-validation refusal is a validation error.
+401/403 unchanged; an unavailable registry (outage, deadline, quota or aborted
+read) is reported as service unavailable with the registry's retry hint.
+Missing required projections and an admitted schema that GTS cannot compile
+are internal errors. An abstract type and a payload the schema rejects are
+validation errors.
 
 ### 3.5 Database schemas & tables
 

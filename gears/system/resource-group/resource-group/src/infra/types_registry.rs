@@ -38,10 +38,14 @@ fn registry_failure(error: CanonicalError, code: &str) -> DomainError {
         CanonicalError::Unauthenticated { .. } | CanonicalError::PermissionDenied { .. } => {
             DomainError::RegistryRefusedCaller(error)
         }
+        // A read the registry aborted (`Aborted`) is a conflict inside the
+        // registry, not with this request: RG has not opened its transaction
+        // yet, so the caller retries the whole operation, as for an outage.
         CanonicalError::ServiceUnavailable { .. }
         | CanonicalError::DeadlineExceeded { .. }
         | CanonicalError::ResourceExhausted { .. }
         | CanonicalError::Aborted { .. } => DomainError::ServiceUnavailable {
+            retry_after_seconds: error.retry_after_seconds(),
             message: format!("types-registry read of '{code}' failed: {error}"),
         },
         other => {

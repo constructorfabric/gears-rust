@@ -16,7 +16,9 @@
 //! this projection only reads the finished `CanonicalError`.
 //!
 //! The conversion is infallible (`From<CanonicalError>`). Canonical
-//! categories resource-group does not emit fall through to
+//! categories without a typed variant — those resource-group does not
+//! emit, the registry's 401 it passes on, and the 503 for an unavailable
+//! dependency (with the dependency's optional retry hint) — fall through to
 //! [`ResourceGroupError::Other`], which preserves the full
 //! [`CanonicalError`] for inspection / forward-compatible dispatch on the
 //! inner variant.
@@ -41,6 +43,9 @@
 //! | state precondition — inspect [`precondition::Subject`] | [`ResourceGroupError::FailedPrecondition`] | 400 |
 //! | generic concurrency / state conflict — inspect `reason` ([`reason::aborted`]) | [`ResourceGroupError::Aborted`] | 409 |
 //! | PDP denial — inspect `reason` ([`reason::permission`]) | [`ResourceGroupError::PermissionDenied`] | 403 |
+//! | types registry refused the caller's credential — the registry's own `reason` | [`ResourceGroupError::PermissionDenied`] | 403 |
+//! | types registry refused the caller as unauthenticated | [`ResourceGroupError::Other`] | 401 |
+//! | types registry unavailable — honour `retry_after_seconds` | [`ResourceGroupError::Other`] | 503 |
 //! | internal error (DB / infra) | [`ResourceGroupError::Internal`] | 500 |
 //! | anything else (forward-compat) | [`ResourceGroupError::Other`] | — |
 //!
@@ -106,9 +111,10 @@ use crate::precondition::Subject;
 ///
 /// The impl crate's `From<DomainError> for CanonicalError` is the single
 /// authoritative AIP-193 mapping; this enum is a forward-compatible, flat
-/// view over the seven categories resource-group emits, plus the
-/// mandatory catch-all [`Self::Other`]. See the [gear docs](self) for
-/// the dispatch table and consumer patterns.
+/// view with seven typed categories, plus the mandatory catch-all
+/// [`Self::Other`] (which also carries a forwarded registry 401 and the 503
+/// for an unavailable dependency). See the [gear docs](self) for the
+/// dispatch table and consumer patterns.
 #[derive(Error, Debug, Clone)]
 pub enum ResourceGroupError {
     /// Resource not found (type, group, or membership). `resource_type`
@@ -162,7 +168,8 @@ pub enum ResourceGroupError {
 
     /// Authorization denial (HTTP 403). `reason` is the
     /// [`reason::permission::ACCESS_DENIED`](crate::reason::permission::ACCESS_DENIED)
-    /// constant.
+    /// constant when resource-group's PDP denied the request, or the types
+    /// registry's own reason when the registry refused the caller.
     #[error("permission denied [{reason}]: {detail}")]
     PermissionDenied { reason: String, detail: String },
 
@@ -172,9 +179,10 @@ pub enum ResourceGroupError {
     #[error("internal error: {detail}")]
     Internal { detail: String },
 
-    /// Catch-all for canonical categories resource-group does not model —
-    /// preserves the full [`CanonicalError`] so consumers stay
-    /// forward-compatible if the impl crate ever emits a new category.
+    /// Catch-all for canonical categories without a typed variant — the
+    /// registry's 401, a 503 when a dependency is unavailable (with its
+    /// optional retry hint), and any category added later. Preserves the
+    /// full [`CanonicalError`] so consumers stay forward-compatible.
     #[error("[{}] {}", canonical.gts_type(), canonical.detail())]
     Other { canonical: CanonicalError },
 }

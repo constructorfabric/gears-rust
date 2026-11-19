@@ -224,27 +224,72 @@ async fn a_refused_caller_keeps_the_registry_refusal() {
             panic!("{err:?}");
         };
         assert_eq!(kept.status_code(), refusal.status_code());
+        let problem = |error: CanonicalError| {
+            serde_json::to_value(toolkit_canonical_errors::Problem::from(error))
+                .expect("problem JSON")
+        };
         assert_eq!(
-            CanonicalError::from(err).status_code(),
-            refusal.status_code(),
-            "401/403 reach the caller unmasked"
+            problem(CanonicalError::from(err)),
+            problem(refusal.clone()),
+            "401/403 reach the caller unmasked, reason and resource included"
         );
     }
 }
 
 #[tokio::test]
-async fn an_unavailable_registry_is_service_unavailable() {
+async fn a_transient_registry_failure_is_service_unavailable_with_its_retry_hint() {
+    for (failure, retry_after) in [
+        (
+            CanonicalError::service_unavailable()
+                .with_retry_after_seconds(7)
+                .create(),
+            Some(7),
+        ),
+        (Catalogue::deadline_exceeded("slow read").create(), None),
+        (
+            Catalogue::resource_exhausted("read quota")
+                .with_quota_violation("READS", "too many reads")
+                .with_quota_violation_retry_after_seconds(11)
+                .create(),
+            Some(11),
+        ),
+        (
+            Catalogue::aborted("read conflict")
+                .with_reason("CONFLICT")
+                .create(),
+            None,
+        ),
+    ] {
+        let registry = registry();
+        registry.inject(Fault::on(Call::BatchGet).fail(failure.clone()));
+        let err = catalog(registry)
+            .get_type(&caller(1), TENANT, TypeUse::NewLink)
+            .await
+            .expect_err("transient failure");
+        assert!(
+            matches!(
+                &err,
+                DomainError::ServiceUnavailable { retry_after_seconds, .. }
+                    if *retry_after_seconds == retry_after
+            ),
+            "{failure:?} -> {err:?}"
+        );
+        let canonical = CanonicalError::from(err);
+        assert_eq!(canonical.status_code(), 503, "{failure:?}");
+        assert_eq!(canonical.retry_after_seconds(), retry_after, "{failure:?}");
+    }
+}
+
+#[tokio::test]
+async fn any_other_registry_failure_is_internal() {
     let registry = registry();
-    registry.inject(Fault::on(Call::BatchGet).fail(CanonicalError::service_unavailable().create()));
+    registry
+        .inject(Fault::on(Call::BatchGet).fail(CanonicalError::internal("registry bug").create()));
     let err = catalog(registry)
         .get_type(&caller(1), TENANT, TypeUse::NewLink)
         .await
-        .expect_err("outage");
-    assert!(
-        matches!(err, DomainError::ServiceUnavailable { .. }),
-        "{err:?}"
-    );
-    assert_eq!(CanonicalError::from(err).status_code(), 503);
+        .expect_err("registry failure");
+    assert!(matches!(err, DomainError::InternalError), "{err:?}");
 }
 
 // -------- payload validation --------

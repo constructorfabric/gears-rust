@@ -77,8 +77,13 @@ pub enum DomainError {
     #[error("Types registry refused the caller: {0}")]
     RegistryRefusedCaller(toolkit_canonical_errors::CanonicalError),
 
+    /// A dependency read failed transiently; `retry_after_seconds` carries
+    /// the dependency's own retry hint, when it gave one.
     #[error("Service unavailable: {message}")]
-    ServiceUnavailable { message: String },
+    ServiceUnavailable {
+        message: String,
+        retry_after_seconds: Option<u64>,
+    },
 
     #[error("Database error: {0}")]
     Database(sea_orm::DbErr),
