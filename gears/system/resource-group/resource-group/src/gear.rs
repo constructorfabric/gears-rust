@@ -33,7 +33,7 @@ pub type ConcreteRgService = RgService<GroupRepository, MembershipRepository>;
 /// Resource-group gear.
 ///
 /// Publication (`gts_publication(...)`, run by the runtime before any application
-/// `init`): the RG SDK's base type `gts.cf.core.rg.type.v1~`.
+/// `init`): the SDK's group and membership base schemas.
 ///
 /// RG type definitions live only in the types registry: `init` takes its
 /// tenant API (`TypesRegistryApi`, consumed and wired before the application

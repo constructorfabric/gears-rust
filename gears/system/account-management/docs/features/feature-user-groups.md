@@ -68,7 +68,7 @@ Delivers the delegation half of PRD §5.6 (User Groups Management) by ensuring A
 
 **Success Scenarios**:
 
-- Before application `init`, the runtime publishes AM's manifest through `PlatformTypesRegistryApi`. It includes both AM-owned declarations from [rg_types.rs](../../account-management/src/gts/rg_types.rs): the user-group container and user member-handle. The RG SDK publishes their base `gts.cf.core.rg.type.v1~` with Resource Group's manifest.
+- Before application `init`, the runtime publishes AM's manifest through `PlatformTypesRegistryApi`. It includes the user-group container, user member handle, and user membership schema from [rg_types.rs](../../account-management/src/gts/rg_types.rs). Resource Group's manifest publishes the group and membership base schemas.
 - An identical restart leaves the admitted definitions unchanged. Absent definitions are created; differing definitions are reconciled under the registry's revision and admission rules.
 
 **Error Scenarios**:
@@ -119,16 +119,17 @@ The existing `rg-type-registration` / `rg-type-schema-registration` traceability
 
 **Input**: AM's manifest, including the following declarations:
 
-| Declaration | GTS identifier | Placement and membership traits |
+| Declaration | GTS identifier | Placement and membership |
 |-------------|----------------|---------------------------------|
-| `UserGroupRgTypeV1` | `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` | `can_be_root = true`; `allowed_parent_types` contains itself; `allowed_membership_types` contains the user member-handle below; metadata is unconstrained. |
-| `UserMemberRgTypeV1` | `gts.cf.core.rg.type.v1~cf.core.am.user.v1~` | `can_be_root = true`; empty `allowed_parent_types` and `allowed_membership_types`. Used as a membership resource type; AM users live in AM/IdP, not as RG groups. |
+| `UserGroupRgTypeV1` | `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` | `parent_type` accepts roots and parent types in the user-group family. `membership_type` binds the user membership schema. `metadata` may be omitted or empty. |
+| `UserMemberRgTypeV1` | `gts.cf.core.rg.type.v1~cf.core.am.user.v1~` | Abstract type handle for the member resource. |
+| [User membership schema](../schemas/user_group_member.v1.schema.json) | `gts.cf.core.rg.membership.v1~cf.core.am.user_group_member.v1~` | Accepts the AM user member handle and its derived types as `resource_type` through `anyOf` with `x-gts-type-ref`. |
 
 **Output**: Successful publication (`UpToDate`, or `Reconciled` with every desired identifier `Admitted`), or a publication failure that stops startup.
 
 **Steps**:
 
-1. [ ] - `p1` - Collect both declarations from AM's crate-local inventory into its manifest; retain their existing GTS identifiers so persisted RG groups and memberships keep resolving - `inst-algo-rgreg-collect`
+1. [ ] - `p1` - Collect the declarations from AM's crate-local inventory into its manifest; retain the existing group and member-handle identifiers so persisted RG groups and memberships keep resolving - `inst-algo-rgreg-collect`
 2. [ ] - `p1` - Publish through the shared Types Registry SDK publisher using `PlatformTypesRegistryApi`; reconcile absent or differing documents under registry admission and revision rules - `inst-algo-rgreg-publish`
 3. [ ] - `p1` - Await admission of every desired identifier, including dependencies on RG's base and the member handle; retry transient failures and pending dependencies within the shared startup budget - `inst-algo-rgreg-await`
 4. [ ] - `p1` - **IF** publication succeeds, **RETURN** success; identical restarts preserve existing revisions - `inst-algo-rgreg-success`
@@ -146,7 +147,7 @@ See [Types Registry SDK publication](../../../types-registry/types-registry-sdk/
 
 - [ ] `p1` - **ID**: `cpt-cf-account-management-dod-user-groups-rg-type-schema-idempotent-registration`
 
-AM's manifest **MUST** include both declarations in §3 with their existing identifiers and traits, per `fr-user-group-rg-type`. The shared publisher **MUST** await admission before application `init`. Identical restarts **MUST** preserve revisions; absent or differing documents **MUST** follow the registry's reconciliation and admission rules. A rejected or incomplete publication **MUST** stop startup. AM **MUST NOT** maintain an RG-local type catalogue or register types through `ResourceGroupClient`.
+AM's manifest **MUST** include the declarations in §3, per `fr-user-group-rg-type`. The shared publisher **MUST** await admission before application `init`. Identical restarts **MUST** preserve revisions; absent or differing documents **MUST** follow the registry's reconciliation and admission rules. A rejected or incomplete publication **MUST** stop startup. AM **MUST NOT** maintain an RG-local type catalogue or register types through `ResourceGroupClient`.
 
 **Implements**:
 
@@ -155,7 +156,7 @@ AM's manifest **MUST** include both declarations in §3 with their existing iden
 
 **Touches**:
 
-- Data: `UserGroupRgTypeV1` and `UserMemberRgTypeV1` in AM's crate-local GTS inventory; [user_group.v1.schema.json](../schemas/user_group.v1.schema.json) is a documentation copy, not a runtime publication input.
+- Data: `UserGroupRgTypeV1`, `UserMemberRgTypeV1`, and the user membership schema in AM's crate-local GTS inventory. [user_group.v1.schema.json](../schemas/user_group.v1.schema.json) documents the published group schema.
 - Sibling integration: shared ToolKit startup publisher, `PlatformTypesRegistryApi`; RG consumes the definitions through `TypesRegistryApi`.
 - Errors: shared publication diagnostics preserve the underlying registry failure and identify the publisher and affected identifiers.
 
@@ -196,7 +197,7 @@ The system **MUST NOT** expose any AM-side REST endpoint for user-group CRUD, me
 
 - [ ] `p1` - **ID**: `cpt-cf-account-management-dod-user-groups-membership-user-existence-pattern`
 
-Membership-write callers **MUST** combine AM's `GET /tenants/{tenant_id}/users` (owned by `feature-idp-user-operations-contract`, with `?user_id=<id>` for point checks) with `ResourceGroupClient` membership operations: caller verifies user existence via AM's user-list surface first, then invokes `ResourceGroupClient` to add the user to a group. AM **MUST NOT** introduce any composite or convenience endpoint that wraps these two steps — the delegation principle requires consumers to call both surfaces directly so the authoritative user-existence signal and the authoritative membership write stay with their respective owners. RG enforces `allowed_membership_types = [gts.cf.core.rg.type.v1~cf.core.am.user.v1~]` on the published user-group type; this member handle wraps the AM user resource type. User existence remains the caller’s separate AM check.
+Membership-write callers **MUST** combine AM's `GET /tenants/{tenant_id}/users` (owned by `feature-idp-user-operations-contract`, with `?user_id=<id>` for point checks) with `ResourceGroupClient` membership operations: caller verifies user existence via AM's user-list surface first, then invokes `ResourceGroupClient` to add the user to a group. AM **MUST NOT** introduce any composite or convenience endpoint that wraps these two steps — the delegation principle requires consumers to call both surfaces directly so the authoritative user-existence signal and the authoritative membership write stay with their respective owners. RG validates the member's type against the bound membership schema, which admits the AM user handle family. User existence remains the caller’s separate AM check.
 
 **Implements**:
 
@@ -208,13 +209,13 @@ Membership-write callers **MUST** combine AM's `GET /tenants/{tenant_id}/users` 
 
 ## 6. Acceptance Criteria
 
-- [ ] On startup with no AM user-group definitions in Types Registry, AM's manifest publishes both declarations from §3 and awaits their admission against the RG base before application `init`. RG can create root and nested user groups, accept AM-user memberships under the member-handle type, and accept unconstrained metadata. Fingerprints `dod-user-groups-rg-type-schema-idempotent-registration`.
+- [ ] On startup with no AM user-group definitions in Types Registry, AM's manifest publishes the declarations from §3 and awaits their admission before application `init`. RG accepts root groups and groups nested under the user-group type or its derivatives. It accepts AM-user memberships and rejects unknown metadata fields. Fingerprints `dod-user-groups-rg-type-schema-idempotent-registration`.
 - [ ] On an identical restart, publication succeeds without changing either type's revision. A differing document follows the registry's revision and admission rules. Fingerprints `dod-user-groups-rg-type-schema-idempotent-registration`.
 - [ ] If publication is rejected, cancelled or cannot complete within its startup budget, application `init` does not run; diagnostics identify the publisher, affected identifiers and underlying cause. No RG type-management API or RG-local type table is used. Fingerprints `dod-user-groups-rg-type-schema-idempotent-registration`.
 - [ ] During tenant hard-deletion invoked by the retention job in `feature-tenant-hierarchy-management`, AM calls `ResourceGroupClient` to delete the tenant's user-group subtree before the `tenants` row is removed; if the RG cleanup call fails transport-level, the hard-delete flow aborts with `code=service_unavailable` via the `feature-errors-observability` envelope and the `tenants` row is NOT removed. On the next retry, the hard-delete flow re-attempts cleanup. Fingerprints `dod-user-groups-cascade-cleanup-trigger`.
 - [ ] The AM OpenAPI spec contains NO `/user-groups` family of endpoints and NO `/memberships` family — user-group CRUD, membership add/remove, and nested-group operations are not part of AM's REST surface. The AM gear contains no `user_group_*` or `user_group_membership_*` tables, no adapter tables, and no in-memory group-hierarchy cache; RG is the single storage owner. Fingerprints `dod-user-groups-delegation-boundary`.
-- [ ] A membership-write consumer (e.g., `feature-user-groups` caller) combining `GET /tenants/{tenant_id}/users?user_id=<id>` with a `ResourceGroupClient` membership add returns the authoritative user-existence signal before the RG membership write is issued; AM does NOT expose a convenience endpoint that wraps the two-step pattern, and the user-group type's `allowed_membership_types` restricting membership to the AM user member-handle `gts.cf.core.rg.type.v1~cf.core.am.user.v1~` is the RG-side integrity guard. Fingerprints `dod-user-groups-membership-user-existence-pattern`, `dod-user-groups-delegation-boundary`.
-- [ ] Nested user-group cycles (e.g., group `A` as a parent of group `B` and `B` as a parent of `A`) are refused by Resource Group forest invariants at the `ResourceGroupClient` boundary; AM's `allowed_parent_types` trait on the published type permits only the same chained user-group type as parent, so the RG-side cycle check is the authoritative enforcement. AM performs NO cycle detection of its own. Fingerprints `dod-user-groups-delegation-boundary`.
+- [ ] A membership-write consumer checks `GET /tenants/{tenant_id}/users?user_id=<id>` before adding the AM user via `ResourceGroupClient`. RG validates the member's type against the bound membership schema. Fingerprints `dod-user-groups-membership-user-existence-pattern`, `dod-user-groups-delegation-boundary`.
+- [ ] Resource Group forest invariants reject nested user-group cycles at the `ResourceGroupClient` boundary, including when the parents belong to different types in the user-group family. Fingerprints `dod-user-groups-delegation-boundary`.
 
 ## 7. Deliberate Omissions
 

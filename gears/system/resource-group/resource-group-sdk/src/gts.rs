@@ -1,213 +1,65 @@
 // Created: 2026-04-16 by Constructor Tech
 //! GTS schema definitions for the Resource Group type system.
 
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use toolkit_gts::gts_id;
 use toolkit_gts::local::gts_type_schema;
-use toolkit_gts::{GtsTraitsSchema, gts_id};
 
-/// One `allowed_parent_types` entry: the GTS type identifier of an RG type.
-///
-/// `x-gts-type-ref` makes registry admission check every value is a type
-/// derived from `gts.cf.core.rg.type.v1~` (a type may list its own id for
-/// same-type nesting).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(transparent)]
-#[schemars(transparent, extend("x-gts-type-ref" = gts_id!("cf.core.rg.type.v1~")))]
-pub struct RgTypeRef(pub String);
-
-/// One `allowed_membership_types` entry: the GTS type identifier of a member
-/// resource type. Any registered GTS type; it need not be an RG type.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(transparent)]
-#[schemars(transparent, extend("x-gts-type-ref" = "gts.*"))]
-pub struct MembershipTypeRef(pub String);
-
-/// Placement traits of an RG type (`x-gts-traits-schema` of
-/// [`ResourceGroupTypeV1`]).
-///
-/// The registry materializes them as a derived type's `effective_traits`
-/// (leaf values over the base defaults); resource-group reads that
-/// materialization and deserializes it into this struct.
-#[derive(
-    Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, GtsTraitsSchema,
-)]
-#[serde(deny_unknown_fields)]
-pub struct ResourceGroupTypeTraitsV1 {
-    /// Whether groups of this type may be roots (no parent).
-    #[serde(default)]
-    pub can_be_root: bool,
-    /// RG types a group of this type may be placed under.
-    #[serde(default)]
-    pub allowed_parent_types: Vec<RgTypeRef>,
-    /// Resource types that may be members of a group of this type.
-    #[serde(default)]
-    pub allowed_membership_types: Vec<MembershipTypeRef>,
-}
-
-impl ResourceGroupTypeTraitsV1 {
-    /// Starts a builder requiring all three placement policy choices.
-    ///
-    /// Setters may be called in any order. `false` and empty lists are valid
-    /// explicit choices; registry admission validates the supplied identifiers.
-    /// JSON-authored declarations retain their schema defaults.
-    ///
-    /// ```
-    /// use cf_gears_resource_group_sdk::gts::ResourceGroupTypeTraitsV1;
-    /// let traits = ResourceGroupTypeTraitsV1::builder()
-    ///     .with_can_be_root(true)
-    ///     .with_allowed_parent_types(Vec::<String>::new())
-    ///     .with_allowed_membership_types(["gts.cf.core.am.user.v1~"])
-    ///     .build();
-    /// assert!(traits.can_be_root);
-    /// ```
-    ///
-    /// Omitting any policy choice prevents building:
-    ///
-    /// ```compile_fail
-    /// use cf_gears_resource_group_sdk::gts::ResourceGroupTypeTraitsV1;
-    /// let _ = ResourceGroupTypeTraitsV1::builder()
-    ///     .with_allowed_parent_types(Vec::<String>::new())
-    ///     .with_allowed_membership_types(Vec::<String>::new())
-    ///     .build();
-    /// ```
-    ///
-    /// ```compile_fail
-    /// use cf_gears_resource_group_sdk::gts::ResourceGroupTypeTraitsV1;
-    /// let _ = ResourceGroupTypeTraitsV1::builder()
-    ///     .with_can_be_root(false)
-    ///     .with_allowed_membership_types(Vec::<String>::new())
-    ///     .build();
-    /// ```
-    ///
-    /// ```compile_fail
-    /// use cf_gears_resource_group_sdk::gts::ResourceGroupTypeTraitsV1;
-    /// let _ = ResourceGroupTypeTraitsV1::builder()
-    ///     .with_can_be_root(false)
-    ///     .with_allowed_parent_types(Vec::<String>::new())
-    ///     .build();
-    /// ```
-    #[must_use]
-    pub const fn builder() -> ResourceGroupTypeTraitsV1Builder {
-        ResourceGroupTypeTraitsV1Builder {
-            can_be_root: (),
-            allowed_parent_types: (),
-            allowed_membership_types: (),
-        }
-    }
-}
-
-/// Builds [`ResourceGroupTypeTraitsV1`] after all three policy setters are called.
-///
-/// Each type parameter holds its value or `()` while the choice is missing.
-pub struct ResourceGroupTypeTraitsV1Builder<R = (), P = (), M = ()> {
-    can_be_root: R,
-    allowed_parent_types: P,
-    allowed_membership_types: M,
-}
-
-impl<R, P, M> ResourceGroupTypeTraitsV1Builder<R, P, M> {
-    /// Sets whether groups may be roots (required).
-    #[must_use]
-    pub fn with_can_be_root(
-        self,
-        can_be_root: bool,
-    ) -> ResourceGroupTypeTraitsV1Builder<bool, P, M> {
-        ResourceGroupTypeTraitsV1Builder {
-            can_be_root,
-            allowed_parent_types: self.allowed_parent_types,
-            allowed_membership_types: self.allowed_membership_types,
-        }
-    }
-
-    /// Sets allowed parent type IDs (required); an empty list allows no parents.
-    #[must_use]
-    pub fn with_allowed_parent_types(
-        self,
-        types: impl IntoIterator<Item = impl Into<String>>,
-    ) -> ResourceGroupTypeTraitsV1Builder<R, Vec<RgTypeRef>, M> {
-        ResourceGroupTypeTraitsV1Builder {
-            can_be_root: self.can_be_root,
-            allowed_parent_types: types.into_iter().map(|id| RgTypeRef(id.into())).collect(),
-            allowed_membership_types: self.allowed_membership_types,
-        }
-    }
-
-    /// Sets allowed member type IDs (required); an empty list allows no members.
-    #[must_use]
-    pub fn with_allowed_membership_types(
-        self,
-        types: impl IntoIterator<Item = impl Into<String>>,
-    ) -> ResourceGroupTypeTraitsV1Builder<R, P, Vec<MembershipTypeRef>> {
-        ResourceGroupTypeTraitsV1Builder {
-            can_be_root: self.can_be_root,
-            allowed_parent_types: self.allowed_parent_types,
-            allowed_membership_types: types
-                .into_iter()
-                .map(|id| MembershipTypeRef(id.into()))
-                .collect(),
-        }
-    }
-}
-
-impl ResourceGroupTypeTraitsV1Builder<bool, Vec<RgTypeRef>, Vec<MembershipTypeRef>> {
-    /// Builds the traits after all three placement policy choices are supplied.
-    #[must_use]
-    pub fn build(self) -> ResourceGroupTypeTraitsV1 {
-        ResourceGroupTypeTraitsV1 {
-            can_be_root: self.can_be_root,
-            allowed_parent_types: self.allowed_parent_types,
-            allowed_membership_types: self.allowed_membership_types,
-        }
-    }
-}
-
-/// GTS base type for Resource Group types: `gts.cf.core.rg.type.v1~`.
+/// Abstract GTS base type for Resource Group types: `gts.cf.core.rg.type.v1~`.
 ///
 /// The persisted types registry is the only catalogue of RG types. Owners
 /// publish derived types (`gts.cf.core.rg.type.v1~<vendor>...~`) before
 /// application `init`; resource-group publishes this base.
 ///
-/// * Placement traits: [`ResourceGroupTypeTraitsV1`], defaults `false`/`[]`/`[]`.
-/// * Group payload: the schema describes a group as resource-group validates
-///   it, an object with an optional `metadata` object. A derived type
-///   constrains `metadata` (as `properties.metadata`, or through the generic
-///   parameter of a Rust-declared derived type).
+/// A concrete type must fix `membership_type` with a string `const` for new
+/// groups; it may narrow `parent_type` and metadata. The owner does the
+/// narrowing: resource-group enforces the schema as published and does not
+/// check that it narrows anything. Left as declared here, `parent_type`
+/// admits `null` (a root) and any RG type, and a membership schema's
+/// `resource_type` admits any active GTS type.
 ///
 /// "Is this type a tenant?" is **not** a trait — it is derived from the type
 /// code: any type whose GTS chain starts with one of the configured tenant
 /// type prefixes (default: [`TENANT_RG_TYPE_PATH`]) is a tenant type.
 ///
-/// # Compatibility with the previously published `v1~`
-///
-/// The previous SDK published this id with the instance properties `id`,
-/// `can_be_root`, `allowed_parent_types` and `allowed_membership_types`, all
-/// required, and a persisted registry keeps that revision as the baseline of
-/// `v1~`. Removing a property from a closed schema is not backward compatible,
-/// so they stay declared (with their previous docs, which are part of the
-/// emitted schema) but are no longer required and are never read: placement
-/// comes only from the traits. `metadata` is an added optional property.
 #[gts_type_schema(
     dir_path = "schemas",
     type_id = gts_id!("cf.core.rg.type.v1~"),
-    description = "Resource Group base type: placement traits and the group metadata container",
-    properties = "id,can_be_root,allowed_parent_types,allowed_membership_types,metadata",
+    description = "Resource group placement, membership schema and metadata",
+    properties = "id,metadata,parent_type,membership_type",
     base = true,
-    traits_schema = inline(ResourceGroupTypeTraitsV1),
-    traits = ResourceGroupTypeTraitsV1::default()
+    gts_abstract = true
 )]
-#[schemars(extend("required" = []))]
+#[schemars(extend("required" = ["parent_type", "membership_type"]))]
 pub struct ResourceGroupTypeV1<M> {
     /// GTS type path (schema identifier).
     pub id: gts::GtsInstanceId,
-    /// Whether groups of this type can be root nodes (no parent). Default `false`.
-    pub can_be_root: bool,
-    /// GTS type paths of allowed parent types.
-    pub allowed_parent_types: Vec<String>,
-    /// GTS type paths of allowed membership resource types.
-    pub allowed_membership_types: Vec<String>,
     /// The group's type-specific metadata; constrained by derived types.
     pub metadata: M,
+    /// Actual parent's GTS type, or null when the group is a root.
+    #[schemars(extend("x-gts-type-ref" = TYPE_RESOURCE_TYPE))]
+    pub parent_type: Option<String>,
+    /// Exact membership schema identifier, bound at group creation.
+    #[schemars(extend("x-gts-type-ref" = MEMBERSHIP_TYPE_V1))]
+    pub membership_type: String,
+}
+
+/// Base of schemas constraining the type of a group member.
+pub const MEMBERSHIP_TYPE_V1: &str = gts_id!("cf.core.rg.membership.v1~");
+
+/// Resource type checked against the schema bound to the target group.
+#[gts_type_schema(
+    dir_path = "schemas",
+    type_id = gts_id!("cf.core.rg.membership.v1~"),
+    description = "Allowed resource types for group membership",
+    properties = "gts_type",
+    base = true,
+    gts_abstract = true
+)]
+pub struct ResourceGroupMembershipV1 {
+    /// GTS type of the candidate member resource.
+    #[serde(rename = "resource_type")]
+    #[schemars(with = "String", extend("x-gts-type-ref" = "gts.*"))]
+    pub gts_type: gts::GtsTypeId,
 }
 
 /// Canonical GTS resource type for a resource **group** as a resource.
@@ -251,8 +103,8 @@ pub const TYPE_RESOURCE_TYPE: &str = gts_id!("cf.core.rg.type.v1~");
 /// deployment with its own vendor overrides both lists (e.g.
 /// `gts.cf.core.rg.type.v1~acme.core._.tenant.v1~`).
 ///
-/// The tenant RG type itself is seeded externally (via API/config) with
-/// `can_be_root: true` so root tenants are valid placements.
+/// Owners publish the tenant RG type through Types Registry and allow a
+/// `null` parent type where root tenants are supported.
 pub const TENANT_RG_TYPE_PATH: &str = gts_id!("cf.core.rg.type.v1~cf.core._.tenant.v1~");
 
 #[cfg(test)]

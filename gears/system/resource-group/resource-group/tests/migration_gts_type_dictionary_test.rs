@@ -552,7 +552,8 @@ async fn down_is_refused_as_irreversible() {
     let f = at_initial_schema().await;
     upgrade(&f.db).await.expect("upgrade");
     let migration = Migrator::migrations()
-        .pop()
+        .into_iter()
+        .find(|migration| migration.name() == "m20261111_000001_gts_type_dictionary")
         .expect("the dictionary migration");
     let err = migration
         .down(&SchemaManager::new(&f.raw))

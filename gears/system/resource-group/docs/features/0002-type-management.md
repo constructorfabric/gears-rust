@@ -19,6 +19,7 @@ description: "Registry-owned RG type publication, caller-scoped snapshots and ad
 - [3. Processes / Business Logic (CDSL)](#3-processes--business-logic-cdsl)
   - [RG Type Identifier Validation](#rg-type-identifier-validation)
   - [Registry Snapshot Consumption](#registry-snapshot-consumption)
+  - [Schema-Validated Group and Membership Types](#schema-validated-group-and-membership-types)
 - [4. States (CDSL)](#4-states-cdsl)
 - [5. Definitions of Done](#5-definitions-of-done)
   - [Managed Owner Publication](#managed-owner-publication)
@@ -38,7 +39,7 @@ description: "Registry-owned RG type publication, caller-scoped snapshots and ad
 ### 1.1 Overview
 
 Resource Group consumes GTS type definitions owned by Types Registry. RG publishes
-its base schema through managed GTS publication; each consuming gear publishes
+its base schemas through managed GTS publication; each consuming gear publishes
 its own derived types. Group and membership rows reference their type by a
 key into RG's local identity dictionary (`gts_type`), which maps keys to GTS
 identifiers and holds no definitions; a dictionary row never admits a type.
@@ -85,8 +86,8 @@ interface for authored definitions. Registry admission, version preconditions an
 receipts follow the Types Registry contract.
 
 Group creation and membership addition remain RG actor flows in features 0003
-and 0004. Their placement traits come from the admitted registry snapshot rather
-than a local type CRUD service.
+and 0004. RG reads the admitted schema definitions from the registry and applies the
+contracts below.
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -105,22 +106,54 @@ than a local type CRUD service.
 3. [x] - `p1` - Reject identifiers longer than 1024 characters - `inst-val-input-3`
 
 Full GTS shape validation belongs to the SDK value object. Definition admission,
-parent/member references, inheritance and traits-schema validation belong to
+parent/member references, inheritance and schema validation belong to
 Types Registry; RG does not duplicate them in this identifier check.
 
 ### Registry Snapshot Consumption
 
 `RegistryTypeCatalog` implements `RgTypeCatalog` using `TypesRegistryApi` with the
-caller's SecurityContext. Group payload reads request content, resolved schema
-and effective traits; membership reads request effective traits in a batch.
-`RgType` decodes placement rules and compiles the SDK payload validator from the
-snapshot. No registry request occurs inside an RG write transaction.
+caller's SecurityContext. Group type reads request authored content and the
+resolved schema. `RgType` compiles the group validator and extracts the
+membership binding. New links load the bound membership schema and verify that
+the resource type is active. Registry reads run before the RG write transaction.
 
 A new group or membership requires active definitions. Existing group updates
 that need type validation may use the exact retained definition of a deleted
 type. Row-only reads, rename/metadata-clear operations with an unchanged parent,
 and cleanup do not look up type definitions. Registry caller refusals and
 availability failures retain their intended error classifications.
+
+### Schema-Validated Group and Membership Types
+
+The SDK publishes the abstract group base `gts.cf.core.rg.type.v1~` with required
+`parent_type` and `membership_type`, and the abstract membership base
+`gts.cf.core.rg.membership.v1~`.
+The base `parent_type` accepts `null` or a string matching the fixed
+`x-gts-type-ref` for the RG type family.
+A concrete group schema constrains the actual `parent_type` and declares an unconditional
+`properties.membership_type.const` naming a concrete membership schema.
+Publish both concrete definitions through Types Registry before creating
+groups that use them.
+
+RG reads the effective group schema and the active membership definition before
+creation. The group write transaction validates the actual parent's type
+(or `null` at the root), the fixed binding and metadata, and stores the
+binding as a key in `gts_type`. A group update that needs type validation
+uses the same binding and checks the resulting payload in the write
+transaction. The parent group still has to pass RG's tenant and hierarchy checks.
+
+A membership addition verifies the group type, the bound membership schema and
+the resource type are active. The membership schema validates only
+`resource_type`. RG validates that `resource_id` is nonempty and checks the
+group type and binding again before inserting the link. For rows created before
+the binding column existed, RG uses the binding from the published group schema.
+
+Types Registry checks same-ID revisions against the previous schema. The
+placement and membership schemas can widen through ordinary publication,
+while incompatible revisions are refused. The admission tests verify
+widening an inherited placement `anyOf` with GTS 0.17.2. Indirect changes
+from mutable references remain subject to the existing dependent refresh
+behavior.
 
 ## 4. States (CDSL)
 
@@ -158,7 +191,7 @@ use the materialized snapshot. Groups and memberships store GTS identifiers.
 
 Consumer-owned tests exercise real persisted Types Registry admission for the RG
 base type and derived declarations. Tests cover inherited payload validation,
-placement traits and invalid declarations. Adapter tests cover caller context,
+placement constraints and invalid declarations. Adapter tests cover caller context,
 requested projections, lifecycle policies and error classification.
 
 **Touches**: `managed_types_admission_test.rs`, `registry_types_test.rs`, `infra/types_registry_tests.rs`.
@@ -177,7 +210,7 @@ internal database details out of response bodies.
 
 - [x] The RG base schema is contributed through managed GTS publication.
 - [x] Consumers can publish derived RG types through Types Registry admission.
-- [x] New group/membership writes use active registry definitions and effective placement traits.
+- [x] New group/membership writes use active group and membership schemas.
 - [x] Group payload validation uses the unmodified materialized schema through the registry SDK.
 - [x] Type reads forward the caller context and precede database write transactions.
 - [x] Cleanup and ordinary reads resolve stored type keys through the identity dictionary, without registry lookups and without creating keys.
@@ -187,7 +220,7 @@ internal database details out of response bodies.
 
 ## 7. Verification
 
-- `managed_types_admission_test.rs`: real persisted admission of consumer-owned schemas and traits.
+- `managed_types_admission_test.rs`: real persisted admission of consumer-owned group and membership schemas.
 - `registry_types_test.rs`: registry definition policies exercised by group and membership services.
 - `infra/types_registry_tests.rs`: context/projection forwarding and error classification.
 - SQLite/PostgreSQL type-identifier migration tests: preserved rows, indexes, constraints and rollback on refusal.

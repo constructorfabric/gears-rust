@@ -236,7 +236,7 @@ async fn trace_create_root_group() {
     // The type definition comes from the types registry before `BEGIN`
     // (RG-09, T38b): the database holds no type catalogue to read. The only
     // type table touched is the identity dictionary, inside the transaction:
-    // the first group of a type reads it and adds the key.
+    // the first group adds keys for its type and its membership schema.
     let tables: std::collections::BTreeSet<String> =
         rec.stats().keys().map(|(_, table)| table.clone()).collect();
     assert!(
@@ -246,14 +246,14 @@ async fn trace_create_root_group() {
         "RG type definitions are not read from RG's database: {tables:?}\n{}",
         rec.dump()
     );
-    assert_eq!(count_in(&rec.stats(), QueryKind::Select, "gts_type"), 1);
-    assert_eq!(count_in(&rec.stats(), QueryKind::Insert, "gts_type"), 1);
+    assert_eq!(count_in(&rec.stats(), QueryKind::Select, "gts_type"), 2);
+    assert_eq!(count_in(&rec.stats(), QueryKind::Insert, "gts_type"), 2);
 
-    // A known type only reads its key: no insert, no identity consumed.
+    // Later groups read the two existing keys without inserting dictionary rows.
     rec.clear();
     common::create_root_group(&group_svc, &ctx, &root_type.code, "Root 2", tenant_id).await;
     assert!(rec.writes_outside_tx().is_empty(), "{}", rec.dump());
-    assert_eq!(count_in(&rec.stats(), QueryKind::Select, "gts_type"), 1);
+    assert_eq!(count_in(&rec.stats(), QueryKind::Select, "gts_type"), 2);
     assert_eq!(
         count_in(&rec.stats(), QueryKind::Insert, "gts_type"),
         0,
@@ -1312,12 +1312,20 @@ fn static_rule_metadata_schema_is_resolved_before_begin() {
          puts an external call inside the transaction (RG-09): {inner_taking_registry:?}"
     );
 
-    // Negative control: the validation must still happen somewhere. Without
-    // this, deleting the call outright would satisfy the rule above.
-    let calls = count_occurrences(src, "validate_metadata(");
-    assert!(
-        calls >= 2,
-        "expected create_group and update_group to each validate metadata \
-         before opening their transaction, found {calls} call(s)"
-    );
+    // The inner operations use the precompiled validator with the current
+    // parent, binding and metadata read under the transaction.
+    for operation in [
+        "create_group_inner",
+        "update_group_inner",
+        "move_group_inner",
+    ] {
+        let body = inner_fns
+            .iter()
+            .find(|body| body.starts_with(operation))
+            .expect("group operation");
+        assert!(
+            body.contains(".validate_group("),
+            "{operation} must validate the group"
+        );
+    }
 }

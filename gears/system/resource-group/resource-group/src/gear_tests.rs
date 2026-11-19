@@ -60,10 +60,11 @@ impl ConfigProvider for NoConfig {
     }
 }
 
-/// RG publishes exactly its SDK's declarations (the RG base type), under its
+/// RG publishes exactly its SDK's base declarations, under its
 /// own name and version, before any application `init`.
 #[test]
 fn the_publication_manifest_is_the_sdk_declarations() {
+    use resource_group_sdk::gts::{MEMBERSHIP_TYPE_V1, TYPE_RESOURCE_TYPE};
     use toolkit::gts_publication::GtsPublicationCapability as _;
 
     let manifest = ResourceGroup::default()
@@ -74,7 +75,7 @@ fn the_publication_manifest_is_the_sdk_declarations() {
     assert_eq!(manifest.publisher_name(), ResourceGroup::MODULE_NAME);
     assert_eq!(manifest.publisher_version(), env!("CARGO_PKG_VERSION"));
     let ids: Vec<&str> = manifest.documents().iter().map(|(id, _)| id.id()).collect();
-    assert_eq!(ids, [toolkit_gts::gts_id!("cf.core.rg.type.v1~")]);
+    assert_eq!(ids, [MEMBERSHIP_TYPE_V1, TYPE_RESOURCE_TYPE]);
 }
 
 /// Without the types registry's tenant API `init` fails closed: RG keeps no

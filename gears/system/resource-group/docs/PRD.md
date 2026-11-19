@@ -311,9 +311,9 @@ their behavior now follows registry ownership instead of the removed RG catalog.
 
 RG **MUST** resolve group types derived from `gts.cf.core.rg.type.v1~` through
 Types Registry using the caller's SecurityContext. Types Registry owns the
-schema, resolved payload schema and effective placement traits (`can_be_root`,
-`allowed_parent_types`, `allowed_membership_types`). RG **MUST NOT** maintain a
-local type-definition catalog or expose type CRUD endpoints.
+authored and resolved schemas for group placement, metadata, and membership
+policy. RG **MUST NOT** maintain a local type-definition catalog or expose type
+CRUD endpoints.
 
 #### Validate Type Identifiers
 
@@ -422,7 +422,7 @@ Group creation that would produce a second tenant-type root **MUST** be rejected
 
 Entity create/move with parent **MUST** validate parent-child type compatibility against type definition.
 
-Invalid relation **MUST** return `InvalidParentType`.
+When the group schema rejects the parent type, RG **MUST** return a validation error.
 
 #### Delete Entity Only If No Active References
 
@@ -457,7 +457,7 @@ Membership composite key: `(group_id, resource_type, resource_id)`.
 Membership fields:
 
 - `group_id` (UUID, reference to group entity)
-- `resource_type` (registered GTS type identifier permitted by the group type's membership traits)
+- `resource_type` (registered GTS type identifier permitted by the group's bound membership schema)
 - `resource_id` (string, caller-defined resource identifier)
 
 The UTF-8 byte length of `resource_id` **MUST NOT** exceed 2600 bytes on
@@ -482,7 +482,7 @@ The gear **MUST** support deterministic membership lookups:
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-fr-seed-memberships`
 
-Consumers may bootstrap memberships through normal RG client operations after their group and member types have been admitted. Addition **MUST** validate group existence, allowed membership traits and tenant compatibility. Consumers own rerun handling; RG has no separate membership-seeding service.
+Consumers may bootstrap memberships through normal RG client operations after their group and member types have been admitted. Addition **MUST** validate group existence, the member type against the bound membership schema, and tenant compatibility. Consumers own rerun handling; RG has no separate membership-seeding service.
 
 ### 5.4 Hierarchy Operations (Closure Table)
 
@@ -798,7 +798,7 @@ consumes them.
 #### Scenario: Use a Published Type
 
 - **GIVEN** a gear published `gts.cf.core.rg.type.v1~vendor.app.branch.v1~` with
-  `allowed_parent_types` `["gts.cf.core.rg.type.v1~vendor.app.tenant.v1~"]` before application `init`
+  a `parent_type` constraint allowing `gts.cf.core.rg.type.v1~vendor.app.tenant.v1~` before application `init`
 - **WHEN** caller creates a group of that type under a group of the tenant type
 - **THEN** RG reads the type from Types Registry and creates the group
 
@@ -833,7 +833,7 @@ consumes them.
 
 #### Scenario: Create Root Entity
 
-- **GIVEN** type `tenant` exists with `can_be_root: true` (permits root placement)
+- **GIVEN** type `tenant` accepts `parent_type: null`
 - **WHEN** caller creates group with type `tenant`, name `"Acme Corp"`, no `parent_id`
 - **THEN** root entity is created with self-referencing closure row (depth 0)
 
@@ -852,10 +852,10 @@ consumes them.
 
 #### Scenario: Reject Invalid Parent Type
 
-- **GIVEN** type `team` allows allowed_parents `["branch"]` only
+- **GIVEN** the `team` schema allows only `branch` as its parent type
 - **AND** parent entity `D1` has type `department`
 - **WHEN** caller creates group of type `team` with `parent_id = D1`
-- **THEN** `InvalidParentType` — `department` is not in allowed_parents for `team`
+- **THEN** validation fails because the `team` schema rejects `department` as a parent type
 
 #### Scenario: Move Subtree to Valid Parent
 
@@ -884,7 +884,7 @@ consumes them.
 - **AND** new target parent `T1` has type `team`
 - **AND** `branch` does not allow `team` as parent
 - **WHEN** caller moves `B1` to `parent_id = T1`
-- **THEN** `InvalidParentType`
+- **THEN** the group schema rejects the parent type and RG returns a validation error.
 
 #### Scenario: Reject Move — Tenant Scope Change via Parent
 

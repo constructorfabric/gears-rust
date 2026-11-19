@@ -39,12 +39,40 @@ cf-gears-resource-group  (this crate — services, repos, REST handlers)
 
 ## Type Publication and Upgrade
 
-Types Registry owns the RG type definitions. The SDK declares the RG base schema;
-consumer gears publish derived group schemas and membership resource types through
-managed GTS publication (`gts_publication`) before application initialization.
+Types Registry owns the RG type definitions. The SDK declares the RG base
+schemas. Consumer gears publish derived group schemas and member resource types
+through managed GTS publication (`gts_publication`) before application initialization.
 Dynamic publishers use Types Registry's platform API. See the
 [type contracts](../docs/features/0002-type-management.md) and
 [migration guidance](../docs/DESIGN.md).
+
+Group types derive from `gts.cf.core.rg.type.v1~`, which requires
+`parent_type` and `membership_type`. Publish a concrete membership schema
+under `gts.cf.core.rg.membership.v1~` and the group schema that binds to it.
+Several group types can share a membership schema.
+
+- The group schema constrains `parent_type` in its body. At write time RG
+  supplies the actual parent's GTS type, or `null` for a root. For a parent
+  family, use a string branch with `x-gts-type-ref`.
+- The group schema declares an unconditional string `const` for
+  `membership_type` under `properties`. RG reads that constant from the
+  resolved schema, checks that the target is active and concrete, and binds
+  the new group to it using a dictionary key. Group creation takes the usual
+  group request.
+- When adding a member, RG uses that binding to validate `{resource_type}`
+  against the active membership schema. Use `anyOf` with `x-gts-type-ref` to
+  allow type families, or `enum` to allow exact type IDs.
+
+Types Registry checks same-ID revisions using its normal schema compatibility
+rules. Widening placement or membership constraints can take effect for
+existing groups. The [admission integration test](tests/managed_types_admission_test.rs)
+covers widening an inherited placement `anyOf`, widening membership, and
+refusal of incompatible revisions with GTS 0.17.2.
+
+The upgrade adds a nullable binding column for pre-existing database rows.
+Those groups resolve their binding from the published type until they have
+one in storage. Publish group and membership schemas for their existing GTS
+identifiers before they need type-dependent writes.
 
 Export custom type definitions before upgrading: the migration removes the old
 local definitions (metadata schemas, placement rules) irreversibly and keeps

@@ -38,34 +38,38 @@ use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry, Seed}
 
 // -- RG types: published to a test types registry --
 //
-// Resource-group keeps no type definitions; its types live in the types registry.
-// Tests publish them into one process-wide `MockTypesRegistry` (which
-// materializes `effective_traits` and `resolved_schema` with gts-rust), seeded
-// with the RG SDK's base type. Codes are unique per test, so sharing it across
-// a test binary is safe.
-
+// Tests publish schemas with unique codes into a process-wide registry.
 const RG_BASE: &str = gts_id!("cf.core.rg.type.v1~");
 
 static REGISTRY: std::sync::LazyLock<Arc<MockTypesRegistry>> = std::sync::LazyLock::new(|| {
     let registry = MockTypesRegistry::new();
-    let (_, base) = resource_group_sdk::gts_declarations()
-        .into_iter()
-        .find(|(id, _)| id == RG_BASE)
-        .expect("the RG SDK declares its base type");
-    registry.seed(RG_BASE, serde_json::from_str(&base).expect("base JSON"));
-    let registry = Arc::new(registry);
-    // The default tenant type (resource-group's default `tenant_type_paths`),
-    // the base of the tenant types tests derive.
-    seed_into(
-        &registry,
-        &CreateTypeRequest {
-            code: resource_group_sdk::TENANT_RG_TYPE_PATH.to_owned(),
-            can_be_root: true,
-            ..CreateTypeRequest::default()
-        },
-    );
-    registry
+    for (id, schema) in resource_group_sdk::gts_declarations() {
+        registry.seed(
+            &id,
+            serde_json::from_str(&schema).expect("RG base schema JSON"),
+        );
+    }
+    seed_type_ancestor(&registry, resource_group_sdk::TENANT_RG_TYPE_PATH);
+    Arc::new(registry)
 });
+
+fn seed_type_ancestor(registry: &MockTypesRegistry, code: &str) {
+    registry.seed(
+        code,
+        serde_json::json!({
+            "$id": format!("gts://{code}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "x-gts-abstract": true,
+            "allOf": [{ "$ref": format!("gts://{RG_BASE}") }],
+        }),
+    );
+}
+
+/// Publish a common ancestor for independent concrete group types in a test.
+pub fn publish_type_ancestor(code: &str) {
+    seed_type_ancestor(&types_registry(), code);
+}
 
 /// The shared test types registry.
 pub fn types_registry() -> Arc<MockTypesRegistry> {
@@ -181,30 +185,59 @@ pub fn publish_type(req: CreateTypeRequest) -> ResourceGroupType {
     }
 }
 
-/// The schema a test type is published with: derived from its parent in the
-/// GTS chain (the RG base for a two-segment code).
+/// Publish a group schema and the membership policy bound to it.
 fn seed_into(registry: &MockTypesRegistry, req: &CreateTypeRequest) {
-    let extension = req.metadata_schema.as_ref().map_or_else(
-        || serde_json::json!({}),
-        |metadata| serde_json::json!({ "properties": { "metadata": metadata } }),
+    use resource_group_sdk::gts::MEMBERSHIP_TYPE_V1;
+    use serde_json::{Value, json};
+
+    let trimmed = req.code.trim_end_matches('~');
+    let (parent, suffix) = trimmed.rsplit_once('~').expect("a derived RG type code");
+    let membership_type = format!("{MEMBERSHIP_TYPE_V1}{suffix}~");
+    let mut resource_type = json!({"type": "string", "x-gts-type-ref": "gts.*"});
+    if req.allowed_membership_types.is_empty() {
+        resource_type["maxLength"] = json!(0);
+    } else {
+        resource_type["enum"] = json!(req.allowed_membership_types);
+    }
+    registry.seed(
+        &membership_type,
+        json!({
+            "$id": format!("gts://{membership_type}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "allOf": [
+                { "$ref": format!("gts://{MEMBERSHIP_TYPE_V1}") },
+                { "properties": { "resource_type": resource_type } }
+            ],
+        }),
     );
-    let parent = {
-        let trimmed = req.code.trim_end_matches('~');
-        let cut = trimmed.rfind('~').expect("a derived RG type code");
-        format!("{}~", &trimmed[..cut])
+
+    let parents: Vec<Value> = req
+        .can_be_root
+        .then_some(Value::Null)
+        .into_iter()
+        .chain(req.allowed_parent_types.iter().map(|parent| json!(parent)))
+        .collect();
+    let parent_type = if parents.is_empty() {
+        json!({"type": "string", "maxLength": 0})
+    } else {
+        json!({"type": ["string", "null"], "enum": parents})
     };
+    let mut properties = json!({
+        "parent_type": parent_type,
+        "membership_type": {"type": "string", "const": membership_type}
+    });
+    if let Some(metadata) = &req.metadata_schema {
+        properties["metadata"] = metadata.clone();
+    }
+
     registry.seed(
         &req.code,
-        serde_json::json!({
+        json!({
             "$id": format!("gts://{}", req.code),
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
-            "allOf": [{ "$ref": format!("gts://{parent}") }, extension],
-            "x-gts-traits": {
-                "can_be_root": req.can_be_root,
-                "allowed_parent_types": req.allowed_parent_types,
-                "allowed_membership_types": req.allowed_membership_types,
-            },
+            "allOf": [{ "$ref": format!("gts://{parent}~") }, { "properties": properties }],
         }),
     );
 }

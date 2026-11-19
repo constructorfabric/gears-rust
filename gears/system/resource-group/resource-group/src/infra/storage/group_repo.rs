@@ -66,15 +66,30 @@ impl GroupRepository {
     }
 
     /// Map a stored row to the domain record with its resolved type identifier.
-    fn model_to_record(model: rg_entity::Model, code: String) -> GroupRecord {
-        GroupRecord {
+    async fn model_to_record(
+        db: &impl DBRunner,
+        model: Option<rg_entity::Model>,
+    ) -> Result<Option<GroupRecord>, DomainError> {
+        let Some(model) = model else { return Ok(None) };
+        let paths = gts_type_dict::find_paths(
+            db,
+            std::iter::once(model.gts_type_id)
+                .chain(model.membership_type_id)
+                .map(GtsTypeKey),
+        )
+        .await?;
+        Ok(Some(GroupRecord {
             id: model.id,
             parent_id: model.parent_id,
-            code,
+            code: paths.code(GtsTypeKey(model.gts_type_id))?,
+            membership_type: model
+                .membership_type_id
+                .map(|key| paths.code(GtsTypeKey(key)))
+                .transpose()?,
             name: model.name,
             metadata: model.metadata,
             tenant_id: model.tenant_id,
-        }
+        }))
     }
 
     /// Resolve one optional row's type key (one dictionary read).
@@ -396,9 +411,7 @@ impl GroupRepositoryTrait for GroupRepository {
             .one(db)
             .await
             .map_err(|e| DomainError::database(e.to_string()))?;
-        Ok(Self::with_code(db, model)
-            .await?
-            .map(|(m, code)| Self::model_to_record(m, code)))
+        Self::model_to_record(db, model).await
     }
 
     async fn find_model_by_id_for_update<C: DBRunner>(
@@ -416,9 +429,7 @@ impl GroupRepositoryTrait for GroupRepository {
             .one(db)
             .await
             .map_err(|e| DomainError::database(e.to_string()))?;
-        Ok(Self::with_code(db, model)
-            .await?
-            .map(|(m, code)| Self::model_to_record(m, code)))
+        Self::model_to_record(db, model).await
     }
 
     /// Return the id of any existing root group (`parent_id IS NULL`) whose
@@ -604,6 +615,7 @@ impl GroupRepositoryTrait for GroupRepository {
         id: Uuid,
         parent_id: Option<Uuid>,
         type_key: GtsTypeKey,
+        membership_type_key: Option<GtsTypeKey>,
         name: &str,
         metadata: Option<&serde_json::Value>,
         tenant_id: Uuid,
@@ -614,6 +626,7 @@ impl GroupRepositoryTrait for GroupRepository {
             id: Set(id),
             parent_id: Set(parent_id),
             gts_type_id: Set(type_key.0),
+            membership_type_id: Set(membership_type_key.map(|key| key.0)),
             name: Set(name.to_owned()),
             metadata: Set(metadata.cloned()),
             tenant_id: Set(tenant_id),

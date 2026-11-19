@@ -15,10 +15,9 @@ info:
 
     Resource Group serves no type endpoint. RG types are GTS Type Schemas derived from
     `gts.cf.core.rg.type.v1~`, published to the types registry by their owners
-    (`gts_publication`, or the registry's platform API). Placement comes from the type's
-    `x-gts-traits` (`can_be_root`, `allowed_parent_types`, `allowed_membership_types`) and
-    group `metadata` is validated against the type's resolved schema, both read from the
-    registry. Groups and memberships store the GTS type identifier.
+    (`gts_publication`, or the registry's platform API). The group's resolved schema
+    constrains placement through `parent_type` and validates `metadata`. The membership
+    schema bound through `membership_type` validates the member's `resource_type`.
 
     ## Groups & Memberships API
 
@@ -260,8 +259,8 @@ paths:
                 invalid-parent-type:
                   summary: Parent type not allowed
                   value:
-                    type: https://api.example.com/errors/invalid-parent-type
-                    title: Invalid parent type
+                    type: https://api.example.com/errors/validation
+                    title: Validation error
                     status: 400
                     detail: "Type 'gts.cf.core.rg.type.v1~cf.core.rg.branch.v1~' does not allow parent of type 'gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~'"
                     trace_id: 01HXYZRGVALIDATION
@@ -271,7 +270,7 @@ paths:
                     type: https://api.example.com/errors/validation
                     title: Validation error
                     status: 400
-                    detail: "Type 'gts.cf.core.rg.type.v1~w.core.org.department.v1~' cannot be root (can_be_root=false and no parent_id provided)"
+                    detail: "The department group schema rejects a null parent type"
                     trace_id: 01HXYZRGNOROOT
         '409':
           description: Conflict

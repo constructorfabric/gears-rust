@@ -187,7 +187,7 @@ async fn membership_add_unregistered_resource_type() {
 
 // TC-MBR-05: resource_type not in allowed_membership_types
 #[tokio::test]
-async fn membership_add_not_in_allowed_membership_types() {
+async fn membership_add_rejects_a_type_excluded_by_the_schema() {
     let db = test_db().await;
     let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
@@ -214,8 +214,8 @@ async fn membership_add_not_in_allowed_membership_types() {
         "expected Validation, got: {err:?}"
     );
     assert!(
-        format!("{err:?}").contains("not in allowed_membership_types"),
-        "error should mention allowed_membership_types: {err:?}"
+        format!("{err:?}").contains("Payload does not match type"),
+        "the bound schema must reject the payload: {err:?}"
     );
 }
 
@@ -399,14 +399,13 @@ async fn membership_empty_resource_id() {
     let grp_type = create_type_with_memberships(&type_svc, "grp", &[&member_type.code]).await;
     let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G1", tenant).await;
 
-    // Document behavior: empty resource_id is accepted (no domain validation on it)
-    let result = mbr_svc
+    let error = mbr_svc
         .add_membership(&ctx, group.id, &member_type.code, "")
-        .await;
-    // The service does not validate resource_id content, so this should succeed
+        .await
+        .expect_err("the resource identifier is required");
     assert!(
-        result.is_ok(),
-        "empty resource_id is accepted by the domain: {result:?}"
+        matches!(error, DomainError::Validation { ref message } if message.contains("resource_id")),
+        "{error:?}"
     );
 }
 
@@ -445,7 +444,7 @@ async fn membership_remove_unregistered_resource_type() {
 
 // TC-MBR-13: Empty allowed_membership_types rejects all
 #[tokio::test]
-async fn membership_empty_allowed_membership_types_rejects_all() {
+async fn a_membership_schema_can_exclude_all_resource_types() {
     let db = test_db().await;
     let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
@@ -462,15 +461,15 @@ async fn membership_empty_allowed_membership_types_rejects_all() {
     let err = mbr_svc
         .add_membership(&ctx, group.id, &member_type.code, "res-001")
         .await
-        .expect_err("empty allowed_membership_types should reject");
+        .expect_err("the schema excludes every member type");
 
     assert!(
         matches!(err, DomainError::Validation { .. }),
         "expected Validation, got: {err:?}"
     );
     assert!(
-        format!("{err:?}").contains("not in allowed_membership_types"),
-        "error should mention allowed_membership_types: {err:?}"
+        format!("{err:?}").contains("Payload does not match type"),
+        "the bound schema must reject the payload: {err:?}"
     );
 }
 

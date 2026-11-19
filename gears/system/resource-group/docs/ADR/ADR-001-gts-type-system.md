@@ -10,8 +10,9 @@ decision-makers: Constructor Fabric Steering Committee
 > definitions (metadata schemas, placement-rule junction tables) and RG type
 > CRUD. The `SMALLINT` surrogate keys are retained, as a local identity
 > dictionary (`gts_type`: key ↔ GTS identifier) that holds no definitions and
-> admits no type. GTS identifiers and traits remain the type-contract basis; see
-> [the current DESIGN](../DESIGN.md) for publication, persistence and retirement
+> admits no type. Group and membership schemas now define placement and
+> membership policy. See [the current DESIGN](../DESIGN.md) for publication,
+> persistence and retirement
 > behavior. The sections below are historical: they describe the earlier
 > implementation, including the junction tables and DB-level relationship
 > enforcement that no longer exist.

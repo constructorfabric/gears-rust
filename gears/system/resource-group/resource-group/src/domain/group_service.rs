@@ -304,26 +304,24 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
         validation::validate_type_code(&req.code)?;
         Self::validate_name(&req.name)?;
 
-        // The type's definition -- placement traits and payload schema -- is
+        // The type's payload schema is
         // read from the types registry here rather than inside the
         // transaction: a network round-trip, then a schema compile. Held open,
         // that time is snapshot lifetime and SSI read-set age, and every retry
         // paid for both again. A new group needs an Active type.
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5b
         let validation_started = std::time::Instant::now();
-        let validated = self
-            .types
-            .get_type(ctx, &req.code, TypeUse::NewLink)
-            .await
-            .and_then(|rg_type| {
-                rg_type.validate_metadata(req.metadata.as_ref())?;
-                Ok(rg_type)
-            });
+        let validated = self.types.get_type(ctx, &req.code, TypeUse::NewLink).await;
         self.metrics.metadata_validation_duration(
             Operation::Create,
             validation_started.elapsed().as_secs_f64(),
         );
         let rg_type = validated?;
+        // The bound membership schema must be Active and compile before the
+        // group can be created with it.
+        self.types
+            .get_membership_schema(ctx, rg_type.membership_type()?)
+            .await?;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5b
 
         // Derive `is_tenant` for AuthZ properties from the code prefix: any type
@@ -576,19 +574,16 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
             || existing.metadata.is_some()
             || existing.parent_id != req.parent_id
         {
-            Some(self.existing_group_type(ctx, &existing.code).await?)
-        } else {
-            None
-        };
-        if let Some(t) = rg_type.as_ref() {
             let validation_started = std::time::Instant::now();
-            let validated = t.validate_metadata(req.metadata.as_ref());
+            let definition = self.existing_group_type(ctx, &existing).await;
             self.metrics.metadata_validation_duration(
                 Operation::Update,
                 validation_started.elapsed().as_secs_f64(),
             );
-            validated?;
-        }
+            Some(definition?)
+        } else {
+            None
+        };
 
         // Take the least-strict level that stays correct for this update.
         // Write-skew here -- cycle detection racing a concurrent create or
@@ -635,7 +630,7 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
                 // read here between the attempts, never under a transaction.
                 let rg_type = match rg_type {
                     Some(t) => t,
-                    None => self.existing_group_type(ctx, &existing.code).await?,
+                    None => self.existing_group_type(ctx, &existing).await?,
                 };
                 match Self::attempt_update_group(
                     &db,
@@ -719,15 +714,14 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
         let started = std::time::Instant::now();
         // The group's type definition, read before the transaction (see
         // `update_group`); the transaction rechecks the group's type.
-        let group_type = {
+        let existing = {
             let conn = self.db.conn()?;
             self.group_repo
                 .find_model_by_id(&conn, group_id)
                 .await?
                 .ok_or_else(|| DomainError::group_not_found(group_id))?
-                .code
         };
-        let rg_type = self.existing_group_type(ctx, &group_type).await?;
+        let rg_type = self.existing_group_type(ctx, &existing).await?;
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-1
         // Actor sends PUT /api/resource-group/v1/groups/{group_id} with new hierarchy.parent_id
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-move-group:p1:inst-move-group-1
@@ -1022,6 +1016,7 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
             return Err(DomainError::group_already_exists(group_id));
         }
 
+        let binding = rg_type.membership_type()?;
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4
         if let Some(parent_id) = req.parent_id {
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4a
@@ -1032,17 +1027,6 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
                 .ok_or_else(|| DomainError::group_not_found(parent_id))?;
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4b
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4a
-
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4c
-            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4d
-            if !rg_type.allows_parent(&parent.code) {
-                return Err(DomainError::invalid_parent_type(format!(
-                    "Type '{}' does not allow parent type '{}'",
-                    req.code, parent.code
-                )));
-            }
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4d
-            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4c
 
             // @cpt-algo:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1
             // @cpt-begin:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1:inst-tenant-enforce-1
@@ -1073,6 +1057,11 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
             // @cpt-begin:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1:inst-tenant-enforce-6
             // RETURN pass (tenant enforcement passed)
             // @cpt-end:cpt-cf-resource-group-algo-integration-auth-tenant-scope-enforcement:p1:inst-tenant-enforce-6
+            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4c
+            // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4d
+            rg_type.validate_group(Some(&parent.code), Some(binding), req.metadata.as_ref())?;
+            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4d
+            // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4c
 
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-4e
             // Check query profile: depth limit
@@ -1111,12 +1100,14 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
             // dictionary row is not an admission: the registry check ran
             // before `BEGIN`.
             let type_key = group_repo.ensure_type_key(tx, &rg_type.code).await?;
+            let membership_type_key = group_repo.ensure_type_key(tx, binding).await?;
             group_repo
                 .insert(
                     tx,
                     group_id,
                     Some(parent_id),
                     type_key,
+                    Some(membership_type_key),
                     &req.name,
                     req.metadata.as_ref(),
                     effective_tenant_id,
@@ -1152,13 +1143,7 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
         } else {
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5a
-            // Root group: validate can_be_root
-            if !rg_type.traits.can_be_root {
-                return Err(DomainError::invalid_parent_type(format!(
-                    "Type '{}' cannot be a root group (can_be_root=false)",
-                    req.code
-                )));
-            }
+            rg_type.validate_group(None, Some(binding), req.metadata.as_ref())?;
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5a
 
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-5c
@@ -1182,12 +1167,14 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
 
             // Insert group; the type key is taken last, as in the child branch.
             let type_key = group_repo.ensure_type_key(tx, &rg_type.code).await?;
+            let membership_type_key = group_repo.ensure_type_key(tx, binding).await?;
             group_repo
                 .insert(
                     tx,
                     group_id,
                     None,
                     type_key,
+                    Some(membership_type_key),
                     &req.name,
                     req.metadata.as_ref(),
                     effective_tenant_id,
@@ -1287,9 +1274,7 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
         // types registry before `BEGIN` for the type the pre-read saw. This
         // row is the authoritative one: a group deleted and re-created under
         // the same id with another type must not be checked against it.
-        if let Some(t) = rg_type
-            && t.code != existing.code
-        {
+        if rg_type.is_some_and(|definition| definition.code != existing.code) {
             return Err(DomainError::conflict(format!(
                 "Group {group_id} changed while it was being updated"
             )));
@@ -1307,10 +1292,8 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
         }
 
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4e
-        // Already validated against this same type before `BEGIN` -- the type
-        // is immutable, so the path resolved here and the one resolved there
-        // are the same string. See the caller for why it does not run under
-        // an open transaction.
+        // The schema was compiled before `BEGIN`. The validator uses the
+        // actual parent, membership binding and replacement metadata below.
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4e
 
         // Cross-tenant parent change is forbidden. `tenant_id` is established
@@ -1324,14 +1307,15 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
         // Also the one read of the new parent this whole update makes: kept
         // as a `ParentSnapshot` and handed to `move_group_internal_impl`
         // below instead of letting it read the same row again.
+        let parent_changed = existing.parent_id != req.parent_id;
         let new_parent_snapshot = if let Some(new_parent_id) = req.parent_id
-            && new_parent_id != existing.parent_id.unwrap_or_default()
+            && (parent_changed || rg_type.is_some())
         {
             let new_parent = group_repo
                 .find_model_by_id(tx, new_parent_id)
                 .await?
                 .ok_or_else(|| DomainError::group_not_found(new_parent_id))?;
-            if new_parent.tenant_id != existing.tenant_id {
+            if parent_changed && new_parent.tenant_id != existing.tenant_id {
                 // Generic message: do not interpolate tenant ids — the caller
                 // can't act on them legitimately, and disclosing the foreign
                 // tenant_id would leak ownership of `new_parent_id` across the
@@ -1355,16 +1339,10 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
         // closure-table queries when a parent change occurs; type itself is
         // immutable here so a type-driven children rescan is unnecessary).
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4c
-        // FOR EACH child: verify child's type includes new type in
-        // allowed_parents (no-op for immutable-type updates; the move helper
-        // runs the equivalent allowed_parent_types check against the new
-        // parent on a parent change).
+        // The group's type stays fixed. The validator checks the actual parent
+        // from the transaction snapshot.
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4d
-        // IF any child would become invalid → RETURN InvalidParentType with
-        // child details (returned by `move_group_internal_impl` as
-        // `DomainError::invalid_parent_type` when the parent's type is not in
-        // the moved subtree's `allowed_parent_types`).
-        let parent_changed = existing.parent_id != req.parent_id;
+        // Placement violations found by the validator return a validation error.
         // The fresh read is the authoritative one. If it says this request
         // moves the group but the transaction was opened below SERIALIZABLE
         // on a stale hint, stop here -- before the move branch and before the
@@ -1373,13 +1351,17 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
         if parent_changed && !isolation.is_serializable() {
             return Ok(UpdateGroupOutcome::NeedsSerializable);
         }
+        if let Some(t) = rg_type {
+            t.validate_group(
+                new_parent_snapshot
+                    .as_ref()
+                    .map(|parent| parent.code.as_str()),
+                existing.membership_type.as_deref(),
+                req.metadata.as_ref(),
+            )?;
+        }
         if parent_changed {
             // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4a
-            // Validate new type's allowed_parents permits current parent's type
-            // (or the new type allows root if no parent). For the immutable-type
-            // case this collapses into `move_group_internal_impl` running the
-            // `rg_type.allowed_parent_types` check on a parent change.
-            //
             // The caller read the definition before `BEGIN` whenever it
             // expected a parent change; a change it did not expect is first
             // escalated (`NeedsSerializable` above) and rerun with one.
@@ -1389,9 +1371,7 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
             // @cpt-end:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-4a
 
             // Delegate to move logic (cycle detection + closure rebuild).
-            // Type stays the same, so use the resolved `rg_type` for parent
-            // compatibility checks inside the move helper. Its
-            // `MoveOutcome::parent_tenant_id` is not read here: the
+            // The `MoveOutcome::parent_tenant_id` is not used here: the
             // cross-tenant check already ran above, against the exact row
             // `new_parent_snapshot` came from.
             Self::move_group_internal_impl(
@@ -1501,6 +1481,14 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
             }
             None => None,
         };
+
+        rg_type.validate_group(
+            new_parent_snapshot
+                .as_ref()
+                .map(|parent| parent.code.as_str()),
+            existing.membership_type.as_deref(),
+            existing.metadata.as_ref(),
+        )?;
 
         // Cycle detect, type compat, profile enforce, closure rebuild
         let outcome = Self::move_group_internal_impl(
@@ -1730,13 +1718,6 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
             let parent = parent.ok_or_else(|| DomainError::group_not_found(new_pid))?;
             parent_tenant_id = Some(parent.tenant_id);
 
-            if !rg_type.allows_parent(&parent.code) {
-                return Err(DomainError::invalid_parent_type(format!(
-                    "Type '{}' does not allow parent type '{}'",
-                    rg_type.code, parent.code
-                )));
-            }
-
             // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-cycle-detect:p1:inst-cycle-4
             // Cycle detection passed
             // @cpt-end:cpt-cf-resource-group-algo-entity-hier-cycle-detect:p1:inst-cycle-4
@@ -1792,34 +1773,25 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
             // @cpt-begin:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-4
             // Profile checks passed
             // @cpt-end:cpt-cf-resource-group-algo-entity-hier-enforce-query-profile:p1:inst-profile-4
-        } else {
-            // Moving to root: validate can_be_root + tenant-root uniqueness.
-            if !rg_type.traits.can_be_root {
-                return Err(DomainError::invalid_parent_type(format!(
-                    "Type '{}' cannot be a root group (can_be_root=false)",
+        }
+        // Tenant-root uniqueness: at most one tenant-type group may be a
+        // forest root. Mirrors the guard in `create_group_inner` —
+        // `cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`. We
+        // exclude the moved group itself so a no-op move (already root)
+        // does not falsely fire.
+        else if tenant_types.is_tenant(&rg_type.code)
+            && let Some(existing_root_id) = group_repo
+                .find_root_id_with_type_prefixes(conn, tenant_types.prefixes())
+                .await?
+            && existing_root_id != group_id
+        {
+            return Err(DomainError::tenant_root_already_exists(
+                existing_root_id,
+                format!(
+                    "Cannot move tenant-type group '{}' ({group_id}) to root: tenant root already exists",
                     rg_type.code
-                )));
-            }
-
-            // Tenant-root uniqueness: at most one tenant-type group may be a
-            // forest root. Mirrors the guard in `create_group_inner` —
-            // `cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`. We
-            // exclude the moved group itself so a no-op move (already root)
-            // does not falsely fire.
-            if tenant_types.is_tenant(&rg_type.code)
-                && let Some(existing_root_id) = group_repo
-                    .find_root_id_with_type_prefixes(conn, tenant_types.prefixes())
-                    .await?
-                && existing_root_id != group_id
-            {
-                return Err(DomainError::tenant_root_already_exists(
-                    existing_root_id,
-                    format!(
-                        "Cannot move tenant-type group '{}' ({group_id}) to root: tenant root already exists",
-                        rg_type.code
-                    ),
-                ));
-            }
+                ),
+            ));
         }
 
         // Rebuild closure table for the subtree
@@ -1896,9 +1868,11 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
     async fn existing_group_type(
         &self,
         ctx: &SecurityContext,
-        code: &str,
+        existing: &crate::domain::repo::GroupRecord,
     ) -> Result<RgType, DomainError> {
-        self.types.get_type(ctx, code, TypeUse::ExistingGroup).await
+        self.types
+            .get_type(ctx, &existing.code, TypeUse::ExistingGroup)
+            .await
     }
 
     fn validate_name(name: &str) -> Result<(), DomainError> {

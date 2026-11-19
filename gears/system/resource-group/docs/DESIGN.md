@@ -42,7 +42,7 @@ memberships in its own database.
 
 RG owns the group forest and memberships; Types Registry owns their type
 contracts. Declaring gears publish their schemas before application initialization.
-RG reads materialized schemas and traits with the caller's context, validates
+RG reads materialized schemas with the caller's context, validates
 payloads through the registry SDK and persists only group and membership data.
 
 | Owner | Responsibility |
@@ -135,7 +135,7 @@ local identity dictionary, never through the registry.
 | --- | --- |
 | `resource-group-sdk/src/api.rs` | Public SDK traits |
 | `resource-group-sdk/src/models.rs` | Group, hierarchy and membership models |
-| `resource-group-sdk/src/gts.rs` | RG base schema and placement traits |
+| `resource-group-sdk/src/gts.rs` | Abstract RG group and membership schemas |
 | `resource-group-sdk/src/odata/` | Public query fields |
 | `resource-group/src/gear.rs` | Configuration, publication, client wiring, migrations and REST composition |
 | `resource-group/src/domain/` | Group and membership services, type catalog port, invariants and metrics port |
@@ -185,7 +185,7 @@ default is `gts.cf.core.rg.type.v1~cf.core._.tenant.v1~`.
   must belong to the same tenant as its parent.
 - A group retains its tenant when reparented. Cross-tenant moves are refused.
 - At most one tenant-type group may be a forest root. Other root types remain
-  permitted, subject to their traits.
+  permitted when their schema accepts a null parent.
 - A resource identified by `(resource_type, resource_id)` may have memberships
   in several groups of one tenant, but cannot simultaneously belong to groups
   in different tenants.
@@ -197,25 +197,28 @@ constraints. A caller-supplied target does not confer permission to write there.
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-principle-dynamic-types`
 
-An RG type is a GTS Type Schema derived from `gts.cf.core.rg.type.v1~`. RG obtains
-its `content`, `resolved_schema` and `effective_traits` from Types Registry.
-Placement rules are the materialized traits:
-
-| Trait | Meaning | Base default |
-| --- | --- | --- |
-| `can_be_root` | Whether a group may have no parent | `false` |
-| `allowed_parent_types` | Exact RG type identifiers permitted as direct parents | `[]` |
-| `allowed_membership_types` | Exact resource type identifiers permitted as members | `[]` |
+An RG type is a GTS Type Schema derived from the abstract
+`gts.cf.core.rg.type.v1~`. RG reads its `content` and `resolved_schema` from
+Types Registry. The group schema validates `parent_type` and `metadata` and
+sets an unconditional `membership_type` constant. A root supplies
+`parent_type: null`. The active membership schema selected by that binding
+validates the candidate's `resource_type`.
 
 Parent types belong to the RG type family. Member resource types may be any
-registered GTS type; they need not be RG types. An RG membership records a
-resource identifier, and does not prove that the resource instance exists in its
-owning gear.
+registered GTS type. RG records the resource identifier supplied by the caller.
+The owning gear remains responsible for confirming that its resource exists.
 
-`ResourceGroupTypeTraitsV1::builder()` requires explicit choices for all three
-traits and accepts strings for both lists. Registry admission validates authored
-types. RG consumes `effective_traits` without reconstructing inheritance or
-merging trait defaults itself.
+The schemas govern type eligibility, and narrowing them is the owner's duty.
+The base leaves `parent_type` open to `null` and to any RG type, and the
+membership base leaves `resource_type` open to any active GTS type. RG does
+not check that a concrete schema narrows them: a group type that does not
+constrain `parent_type` accepts a root placement and a parent of any RG type,
+and a membership schema that does not constrain `resource_type` accepts any
+active resource type, subject to the RG checks applicable to each operation
+(forest, tenant and query-profile checks for placement; cross-tenant
+ownership for membership). Account Management's user group, for example, allows `null`
+or a user-group parent and binds a membership schema whose `resource_type`
+admits only AM users.
 
 The registry controls evolution of type definitions. RG applies the definition
 read for an operation; publication does not scan or rewrite existing RG rows.
@@ -227,8 +230,8 @@ There is no distributed transaction between registry publication and an RG write
 
 Type-specific group data is stored in `resource_group.metadata` and returned as
 `metadata` in SDK and REST models. Derived GTS schemas constrain that field.
-RG validates a domain payload of `{"metadata": ...}` (or `{}` when metadata is
-absent) against the unmodified registry snapshot using
+RG validates a payload with the actual `parent_type`, the bound `membership_type`,
+and `metadata` when present. It compiles the resolved registry snapshot using
 `TypeSchema::compile_payload_validator()` from `types-registry-sdk`.
 
 This keeps inherited constraints, references and GTS validation semantics in the
@@ -299,7 +302,7 @@ a platform identity.
 | `GroupHierarchy` | Direct parent UUID and owning tenant UUID |
 | `ResourceGroupWithDepth` | Group representation with relative hierarchy depth |
 | `ResourceGroupMembership` | Group UUID, resource GTS type identifier and opaque resource ID |
-| `RgType` | Operation-local registry snapshot with placement traits and payload schema |
+| `RgType` | Compiled group validator and concrete membership binding |
 | `GtsTypePath` | SDK value object for validated type identifiers |
 
 A group references another group through `parent_id`. The closure table records
@@ -353,9 +356,8 @@ tenant ownership. This interface has no separate unscoped HTTP route.
 
 `RgTypeCatalog` is a domain port. `RegistryTypeCatalog` implements it over
 `TypesRegistryApi`, forwarding the caller's `SecurityContext`. Group payload
-reads select `Content`, `ResolvedSchema` and `EffectiveTraits`. Membership rule
-reads batch the group type and member resource type and select `EffectiveTraits`;
-only the group type is decoded as RG placement traits.
+reads select `Content` and `ResolvedSchema`. Adding a membership batches the
+lookup of the bound membership schema and member resource type.
 
 `GroupRepositoryTrait` and `MembershipRepositoryTrait` are injected into services.
 Their SecureORM implementations operate on `DBRunner` connections/transactions;
@@ -418,8 +420,9 @@ application `init`. RG publishes its base type; gears that use
 RG publish their own derived types through their own collectors.
 
 Account Management owns the user-group container
-`gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` and the user member-handle
-`gts.cf.core.rg.type.v1~cf.core.am.user.v1~`. They arrive through AM's publication.
+`gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` and the membership schema
+`gts.cf.core.rg.membership.v1~cf.core.am.user_group_member.v1~`. AM also publishes
+`gts.cf.core.am.user.v1~` as the user resource type for membership links.
 Application initialization depends on successful admission of the declarations.
 The same declarations are available to the runtime's `publish-gts` deployment
 path.
@@ -488,7 +491,7 @@ sequenceDiagram
     participant DB as RG database
     Caller->>RG: create_group(ctx, request)
     RG->>TR: exact type read (ctx, selected artifacts)
-    TR-->>RG: materialized schema and traits
+    TR-->>RG: materialized schema
     RG->>RG: SDK payload validation
     RG->>PDP: authorize create and target tenant
     PDP-->>RG: scope
@@ -505,8 +508,8 @@ The public update path authorizes the caller and reads the existing group under
 that scope before returning any type-shaped error. An update supplying non-null
 metadata, removing existing metadata, or changing the parent obtains the group's
 exact type definition before the transaction. Deleted definitions remain usable
-because the registry retains their content. The replacement metadata envelope,
-including `{}` for removal, is validated with the SDK. With an unchanged parent
+because the registry retains their content. The SDK validates the resulting
+group payload and omits the metadata field when it is being removed. With an unchanged parent
 and metadata absent both before and after the update, a rename takes the
 row-only path without requesting a type definition. If metadata appears between
 the pre-read and the locked transaction read, that path returns a conflict
@@ -526,9 +529,9 @@ type lookup occurs between transaction attempts.
 ##### Add a membership
 
 The caller is authorized for membership creation. RG first reads the group under
-the membership-derived group scope, then batch-reads the group and resource types
-from the registry. Both types must be active, and the group's traits must permit
-the resource type.
+the membership-derived group scope, then reads the active group type and the
+active membership schema bound to that group. RG checks that the resource type
+is active and validates it against the membership schema.
 
 A retryable serializable transaction rechecks the group's scope and type, checks
 for memberships of the resource in other tenants, and inserts the membership.
@@ -559,10 +562,8 @@ An unknown or deleted group type is `TypeNotFound` when an active type is
 required. An unknown, deleted, malformed, wildcard or instance identifier used as
 a new member resource type is a validation error. Caller registry refusals retain
 401/403; an unavailable registry is reported as service unavailable. Missing
-required projections or undecodable RG traits are internal contract errors. SDK
-payload compilation or
-validation refusal is a validation error; an absent definition never silently
-skips validation on a path requiring one.
+required projections are internal contract errors. SDK payload compilation or
+validation refusal is a validation error.
 
 ### 3.5 Database schemas & tables
 
@@ -705,7 +706,7 @@ retried operation are recorded outside the retry closure.
 | --- | --- |
 | SDK contract | `resource-group-sdk/src/gts_tests.rs`, model and error projection tests; trait builder compile-fail examples |
 | Registry adapter | `resource-group/src/infra/types_registry_tests.rs`: projections, caller forwarding, lifecycle, SDK validation of inherited schemas/references |
-| Real admission | `resource-group/tests/managed_types_admission_test.rs`: persisted registry/outbox, declared base and derived types, effective traits and SDK payload validation |
+| Real admission | `resource-group/tests/managed_types_admission_test.rs`: persisted registry/outbox, declared base and derived types, membership binding and SDK payload validation |
 | Domain and REST | `group_service_test`, `membership_service_test`, `api_rest_test`, `tenant_filtering_db_test`, `registry_types_test` |
 | Database behavior | `db_behavior_audit_test`, `query_recorder_test`, membership tenant isolation tests |
 | Backend migration | SQLite and PostgreSQL dictionary migration tests: byte-exact row and key preservation, constraints, indexes, refusal before DDL and rollback after it |

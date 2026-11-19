@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use resource_group::domain::error::DomainError;
-use resource_group::domain::type_catalog::{RgType, RgTypeCatalog, TypeUse};
+use resource_group::domain::type_catalog::{MembershipSchema, RgType, RgTypeCatalog, TypeUse};
 use resource_group_sdk::{CreateGroupRequest, UpdateGroupRequest};
 use serde_json::json;
 use toolkit_odata::ODataQuery;
@@ -98,6 +98,41 @@ async fn creating_a_group_of_an_unknown_or_deleted_type_is_type_not_found() {
         .await
         .expect_err("deleted type");
     assert!(matches!(err, DomainError::TypeNotFound { .. }), "{err:?}");
+}
+
+/// The membership schema a group type binds is part of its definition: a
+/// group cannot be created while that schema is unknown or deleted, and the
+/// refusal writes nothing.
+#[tokio::test]
+async fn creating_a_group_needs_its_bound_membership_schema() {
+    let db = common::test_db().await;
+    let groups = common::make_group_service(db.clone());
+    let tenant = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant);
+    let (_, root, _) = publish_family();
+    let suffix = root
+        .trim_end_matches('~')
+        .rsplit_once('~')
+        .expect("a derived RG type code")
+        .1;
+    let bound = format!("{}{suffix}~", resource_group_sdk::gts::MEMBERSHIP_TYPE_V1);
+    common::delete_published_type(&bound);
+    let before = dictionary_rows(&db).await;
+
+    let err = groups
+        .create_group(&ctx, CreateGroupRequest::new(root, "g".to_owned()), tenant)
+        .await
+        .expect_err("the bound membership schema is deleted");
+    assert!(
+        matches!(&err, DomainError::TypeNotFound { code } if *code == bound),
+        "{err:?}"
+    );
+    assert_eq!(dictionary_rows(&db).await, before, "nothing keyed");
+    let listed = groups
+        .list_groups(&ctx, &ODataQuery::default())
+        .await
+        .unwrap();
+    assert!(listed.items.is_empty(), "no group row");
 }
 
 #[tokio::test]
@@ -297,26 +332,16 @@ async fn required_metadata_cannot_be_cleared_by_a_replacement_update() {
     let tenant = Uuid::now_v7();
     let ctx = common::make_ctx(tenant);
     let root = code("required_metadata");
-    common::types_registry().seed(
-        &root,
-        json!({
-            "$id": format!("gts://{root}"),
-            "$schema": "http://json-schema.org/draft-07/schema#",
-            "type": "object",
-            "allOf": [
-                { "$ref": "gts://gts.cf.core.rg.type.v1~" },
-                {
-                    "required": ["metadata"],
-                    "properties": { "metadata": { "type": "object" } }
-                }
-            ],
-            "x-gts-traits": {
-                "can_be_root": true,
-                "allowed_parent_types": [],
-                "allowed_membership_types": []
-            },
-        }),
-    );
+    common::publish_type(common::CreateTypeRequest {
+        code: root.clone(),
+        can_be_root: true,
+        metadata_schema: Some(json!({"type": "object"})),
+        ..common::CreateTypeRequest::default()
+    });
+    let registry = common::types_registry();
+    let mut schema = registry.content(&root).expect("published group schema");
+    schema["allOf"][1]["required"] = json!(["metadata"]);
+    registry.seed(&root, schema);
     let metadata = json!({ "tier": "gold" });
     let group = groups
         .create_group(
@@ -446,14 +471,23 @@ impl RgTypeCatalog for WrongType {
         self.inner.get_type(ctx, &self.other, usage).await
     }
 
+    async fn get_membership_schema(
+        &self,
+        ctx: &SecurityContext,
+        membership_type: &str,
+    ) -> Result<MembershipSchema, DomainError> {
+        self.inner.get_membership_schema(ctx, membership_type).await
+    }
+
     async fn get_membership_rule(
         &self,
         ctx: &SecurityContext,
-        _group_code: &str,
-        member_code: &str,
-    ) -> Result<RgType, DomainError> {
+        group_type: &str,
+        binding: Option<&str>,
+        resource_type: &str,
+    ) -> Result<MembershipSchema, DomainError> {
         self.inner
-            .get_membership_rule(ctx, &self.other, member_code)
+            .get_membership_rule(ctx, group_type, binding, resource_type)
             .await
     }
 }
@@ -464,7 +498,7 @@ async fn a_definition_read_for_another_type_is_refused_inside_the_transaction() 
     let tenant = Uuid::now_v7();
     let ctx = common::make_ctx(tenant);
     let (_, root, _) = publish_family();
-    let (other_member, other_root, _) = publish_family();
+    let (_, other_root, _) = publish_family();
     let groups = common::make_group_service(db.clone());
     let g = common::create_root_group(&groups, &ctx, &root, "g", tenant).await;
 
@@ -492,13 +526,133 @@ async fn a_definition_read_for_another_type_is_refused_inside_the_transaction() 
         .await
         .expect_err("the in-transaction row has another type");
     assert!(matches!(err, DomainError::Conflict { .. }), "{err:?}");
+    // A membership rule is read for the pre-read row's own type and binding,
+    // so no catalog answer names another type; the transaction compares its
+    // row with that pre-read row.
+}
 
-    let skewed_members = common::make_membership_service_with(db, skewed);
-    let err = skewed_members
-        .add_membership(&ctx, g.id, &other_member, "r1")
+/// Rewrites the group row through a second connection while the membership
+/// rule is read, between the pre-transaction read and the transaction.
+struct ChangeRowDuringRuleRead {
+    inner: Arc<dyn RgTypeCatalog>,
+    raw: sea_orm::DatabaseConnection,
+    sql: String,
+}
+
+#[async_trait]
+impl RgTypeCatalog for ChangeRowDuringRuleRead {
+    async fn get_type(
+        &self,
+        ctx: &SecurityContext,
+        code: &str,
+        usage: TypeUse,
+    ) -> Result<RgType, DomainError> {
+        self.inner.get_type(ctx, code, usage).await
+    }
+
+    async fn get_membership_schema(
+        &self,
+        ctx: &SecurityContext,
+        membership_type: &str,
+    ) -> Result<MembershipSchema, DomainError> {
+        self.inner.get_membership_schema(ctx, membership_type).await
+    }
+
+    async fn get_membership_rule(
+        &self,
+        ctx: &SecurityContext,
+        group_type: &str,
+        binding: Option<&str>,
+        resource_type: &str,
+    ) -> Result<MembershipSchema, DomainError> {
+        use sea_orm::ConnectionTrait;
+        self.raw
+            .execute_unprepared(&self.sql)
+            .await
+            .expect("rewrite the group row");
+        self.inner
+            .get_membership_rule(ctx, group_type, binding, resource_type)
+            .await
+    }
+}
+
+/// A file database, so a second connection sees the services' rows.
+async fn file_db() -> (
+    Arc<toolkit_db::DBProvider<toolkit_db::DbError>>,
+    sea_orm::DatabaseConnection,
+    std::path::PathBuf,
+) {
+    use resource_group::infra::storage::migrations::Migrator;
+    use sea_orm_migration::MigratorTrait;
+    let dir = std::env::temp_dir().join(format!("rg-race-{}", Uuid::now_v7()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dsn = format!("sqlite://{}?mode=rwc", dir.join("rg.db").display());
+    let db = toolkit_db::connect_db(
+        &dsn,
+        toolkit_db::ConnectOpts {
+            max_conns: Some(1),
+            min_conns: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    toolkit_db::migration_runner::run_migrations_for_testing(&db, Migrator::migrations())
         .await
-        .expect_err("the in-transaction row has another type");
-    assert!(matches!(err, DomainError::Conflict { .. }), "{err:?}");
+        .unwrap();
+    let raw = sea_orm::Database::connect(&dsn).await.unwrap();
+    (Arc::new(toolkit_db::DBProvider::new(db)), raw, dir)
+}
+
+/// A membership is checked against the group row it read before the
+/// transaction: a row whose type or bound membership schema changed by the
+/// time the transaction reads it is a conflict, and nothing is written.
+#[tokio::test]
+async fn a_group_row_changed_after_the_rule_read_refuses_the_membership() {
+    let tenant = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant);
+    let (member, root, _) = publish_family();
+    let (_, other_root, _) = publish_family();
+    let other_binding = {
+        let suffix = other_root.trim_end_matches('~').rsplit_once('~').unwrap().1;
+        format!("{}{suffix}~", resource_group_sdk::gts::MEMBERSHIP_TYPE_V1)
+    };
+    for (column, value) in [
+        ("gts_type_id", &other_root),
+        ("membership_type_id", &other_binding),
+    ] {
+        let (db, raw, dir) = file_db().await;
+        let groups = common::make_group_service(db.clone());
+        // Keys both of the other root's identifiers in the dictionary.
+        common::create_root_group(&groups, &ctx, &other_root, "other", tenant).await;
+        let g = common::create_root_group(&groups, &ctx, &root, "g", tenant).await;
+        let catalog: Arc<dyn RgTypeCatalog> = Arc::new(ChangeRowDuringRuleRead {
+            inner: common::make_types_catalog(),
+            raw,
+            sql: format!(
+                "UPDATE resource_group SET {column} = \
+                 (SELECT id FROM gts_type WHERE schema_id = '{value}') \
+                 WHERE id = X'{}'",
+                g.id.as_simple()
+            ),
+        });
+        let members = common::make_membership_service_with(db, catalog);
+        let err = members
+            .add_membership(&ctx, g.id, &member, "r1")
+            .await
+            .expect_err("the row changed under the rule");
+        assert!(
+            matches!(err, DomainError::Conflict { .. }),
+            "{column}: {err:?}"
+        );
+        let stored = members
+            .list_memberships(&ctx, &ODataQuery::default())
+            .await
+            .unwrap();
+        assert!(stored.items.is_empty(), "{column}: nothing written");
+        drop(members);
+        std::fs::remove_dir_all(dir).expect("remove the test database");
+    }
 }
 
 /// A membership insert keys its member type in the same transaction, so an

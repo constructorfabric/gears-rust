@@ -2192,7 +2192,7 @@ async fn group_type_filters_preserve_registered_identifiers() {
             let id = Uuid::now_v7();
             let key = GroupRepository.ensure_type_key(&conn, code).await.unwrap();
             GroupRepository
-                .insert(&conn, id, None, key, "Stored spelling", None, tenant)
+                .insert(&conn, id, None, key, None, "Stored spelling", None, tenant)
                 .await
                 .unwrap();
             GroupRepository

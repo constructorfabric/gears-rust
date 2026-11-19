@@ -100,8 +100,8 @@ impl<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> MembershipService<
 
     /// Add a membership link between a resource and a group.
     ///
-    /// Validates group existence, `resource_type` registration, `allowed_membership_types`
-    /// compatibility, and tenant scope before inserting the membership row.
+    /// Validates group existence, the resource type against the bound membership
+    /// schema, and tenant scope before inserting the membership row.
     /// The caller's scope is enforced through the owning group: a group
     /// outside the scope is reported as not found.
     pub async fn add_membership(
@@ -146,9 +146,8 @@ impl<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> MembershipService<
                  {MAX_MEMBERSHIP_RESOURCE_ID_BYTES} UTF-8 bytes"
             )));
         }
-        // Tenant compatibility, the allowed_membership_types check, and the
-        // membership insert all share one transaction, and that transaction
-        // is `SERIALIZABLE` (RG-01).
+        // Tenant compatibility and the membership insert share one
+        // `SERIALIZABLE` transaction (RG-01).
         //
         // The check reads a predicate -- "which tenants already own
         // memberships of this pair" -- and the insert then writes into that
@@ -172,43 +171,43 @@ impl<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> MembershipService<
         // group's type is immutable, so it is read first -- under the caller's
         // scope, so a group outside it is "not found" before any type-shaped
         // answer -- and the transaction re-reads the group and confirms it
-        // still has that type. Narrowing a type's `allowed_membership_types`
-        // no longer races this insert: that guarantee went with RG's own
-        // catalogue (T38b).
+        // still has that type and schema binding.
         let db = self.db.db();
         let group_scope = group_scope_for_membership(scope);
-        let group_type = {
+        let group = {
             let conn = self.conn()?;
             self.group_repo
                 .find_model_by_id_scoped(&conn, &group_scope, group_id)
                 .await?
                 .ok_or(DomainError::GroupNotFound { id: group_id })?
-                .code
         };
         // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-5
         // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-6
         // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-7
-        // The member resource type must be registered and Active (any GTS
-        // type); the group's type supplies `allowed_membership_types`.
-        let rule = self
-            .types
-            .get_membership_rule(ctx, &group_type, resource_type)
-            .await?;
+        // An empty resource identifier is refused, like an oversized one,
+        // before any registry read. Then the group and member resource types
+        // must both be Active.
+        if resource_id.is_empty() {
+            return Err(DomainError::validation(
+                "Membership resource_id must not be empty".to_owned(),
+            ));
+        }
+        self.types
+            .get_membership_rule(
+                ctx,
+                &group.code,
+                group.membership_type.as_deref(),
+                resource_type,
+            )
+            .await?
+            .validate_member(resource_type)?;
+        let group_type = group.code;
         // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-7
         // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-6
         // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-5
         // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-8
-        if !rule.allows_member(resource_type) {
-            return Err(DomainError::validation(format!(
-                "Resource type '{resource_type}' is not in allowed_membership_types for group type '{}'",
-                rule.code
-            )));
-        }
+        let membership_type = group.membership_type;
         // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-8
-
-        // The definition the rule came from; the transaction's row must be
-        // of exactly this type.
-        let group_type = rule.code;
         let group_repo = self.group_repo.clone();
         let membership_repo = self.membership_repo.clone();
         let resource_type_owned = resource_type.to_owned();
@@ -219,6 +218,7 @@ impl<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> MembershipService<
             let membership_repo = membership_repo.clone();
             let group_scope = group_scope.clone();
             let group_type = group_type.clone();
+            let membership_type = membership_type.clone();
             let resource_type = resource_type_owned.clone();
             let resource_id = resource_id_owned.clone();
             Box::pin(async move {
@@ -240,7 +240,8 @@ impl<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> MembershipService<
                 // The rule above was read for this type; a group deleted
                 // and re-created under the same id with another type does
                 // not inherit it.
-                if group_model.code != group_type {
+                if group_model.code != group_type || group_model.membership_type != membership_type
+                {
                     return Err(DomainError::conflict(format!(
                         "Group {group_id} changed while the membership was being added"
                     )));

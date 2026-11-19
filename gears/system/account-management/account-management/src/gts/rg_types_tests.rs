@@ -4,17 +4,24 @@
 
 use std::sync::Arc;
 
-use resource_group_sdk::gts::{MembershipTypeRef, ResourceGroupTypeTraitsV1, RgTypeRef};
+use resource_group_sdk::gts::MEMBERSHIP_TYPE_V1;
+use serde_json::json;
 use toolkit_security::PlatformSecurityContext;
 use types_registry_sdk::testing_platform::MockTypesRegistry;
 use types_registry_sdk::{
-    EntityField, FieldSelection, GtsId, GtsTypeId, PlatformTypesRegistryApi,
+    EntityField, FieldSelection, GtsId, GtsTypeId, PayloadValidator, PlatformTypesRegistryApi,
     PlatformTypesRegistryApiExt, Projection, PublisherContext, ReadOptions, ReconcileOptions,
 };
 
 use account_management_sdk::gts::{USER_GROUP_RG_TYPE_CODE, USER_RG_TYPE_CODE};
 
+use super::USER_MEMBERSHIP_SCHEMA;
+
 const RG_BASE: &str = toolkit_gts::gts_id!("cf.core.rg.type.v1~");
+const DERIVED_USER_GROUP: &str =
+    toolkit_gts::gts_id!("cf.core.rg.type.v1~cf.core.am.user_group.v1~cf.test.am.custom_group.v1~");
+const DERIVED_USER: &str =
+    toolkit_gts::gts_id!("cf.core.rg.type.v1~cf.core.am.user.v1~cf.test.am.custom_user.v1~");
 
 fn declaration(id: &str) -> serde_json::Value {
     let (_, text) = crate::gts_declarations()
@@ -24,10 +31,10 @@ fn declaration(id: &str) -> serde_json::Value {
     serde_json::from_str(&text).expect("declared JSON")
 }
 
-fn rg_base() -> serde_json::Value {
+fn rg_base(code: &str) -> serde_json::Value {
     let (_, text) = resource_group_sdk::gts_declarations()
         .into_iter()
-        .find(|(declared, _)| declared == RG_BASE)
+        .find(|(declared, _)| declared == code)
         .expect("RG declares its base");
     serde_json::from_str(&text).expect("declared JSON")
 }
@@ -45,17 +52,19 @@ fn am_declares_its_user_group_container_and_member_handle() {
     assert!(ids.iter().any(|id| id == USER_RG_TYPE_CODE), "{ids:?}");
 }
 
-async fn admitted_traits(id: &str) -> ResourceGroupTypeTraitsV1 {
+async fn admitted_registry() -> Arc<MockTypesRegistry> {
     let registry = Arc::new(MockTypesRegistry::new());
     let api: &dyn PlatformTypesRegistryApi = registry.as_ref();
     let platform = PlatformSecurityContext::outbound_marker();
     let desired: Vec<(GtsId, serde_json::Value)> = [
-        (RG_BASE, rg_base()),
+        (RG_BASE, rg_base(RG_BASE)),
+        (MEMBERSHIP_TYPE_V1, rg_base(MEMBERSHIP_TYPE_V1)),
         (USER_RG_TYPE_CODE, declaration(USER_RG_TYPE_CODE)),
         (
             USER_GROUP_RG_TYPE_CODE,
             declaration(USER_GROUP_RG_TYPE_CODE),
         ),
+        (USER_MEMBERSHIP_SCHEMA, declaration(USER_MEMBERSHIP_SCHEMA)),
     ]
     .into_iter()
     .map(|(id, doc)| (GtsId::try_new(id).expect("id"), doc))
@@ -72,70 +81,75 @@ async fn admitted_traits(id: &str) -> ResourceGroupTypeTraitsV1 {
     )
     .await
     .expect("AM's RG types are admitted");
-    let schema = api
-        .get_type_schema(
-            &platform,
-            &GtsTypeId::new(id),
-            ReadOptions::default().with_projection(Projection::Select(FieldSelection::with(&[
-                EntityField::EffectiveTraits,
-            ]))),
-        )
-        .await
-        .expect("admitted");
-    serde_json::from_value(schema.effective_traits.expect("selected")).expect("RG traits")
+    registry
 }
 
-#[tokio::test]
-async fn the_container_nests_under_itself_and_admits_am_users() {
-    assert_eq!(
-        admitted_traits(USER_GROUP_RG_TYPE_CODE).await,
-        ResourceGroupTypeTraitsV1 {
-            can_be_root: true,
-            allowed_parent_types: vec![RgTypeRef(USER_GROUP_RG_TYPE_CODE.to_owned())],
-            allowed_membership_types: vec![MembershipTypeRef(USER_RG_TYPE_CODE.to_owned())],
-        }
-    );
-}
-
-#[tokio::test]
-async fn the_member_handle_keeps_its_previous_placement() {
-    assert_eq!(
-        admitted_traits(USER_RG_TYPE_CODE).await,
-        ResourceGroupTypeTraitsV1 {
-            can_be_root: true,
-            allowed_parent_types: Vec::new(),
-            allowed_membership_types: Vec::new(),
-        }
-    );
-}
-
-#[tokio::test]
-async fn user_group_metadata_stays_unconstrained() {
-    let registry = Arc::new(MockTypesRegistry::new());
-    registry.seed(RG_BASE, rg_base());
-    registry.seed(USER_RG_TYPE_CODE, declaration(USER_RG_TYPE_CODE));
-    registry.seed(
-        USER_GROUP_RG_TYPE_CODE,
-        declaration(USER_GROUP_RG_TYPE_CODE),
-    );
-    let api: &dyn PlatformTypesRegistryApi = registry.as_ref();
-    let validator = api
+async fn validator(registry: &dyn PlatformTypesRegistryApi, id: &str) -> PayloadValidator {
+    registry
         .get_type_schema(
             &PlatformSecurityContext::outbound_marker(),
-            &GtsTypeId::new(USER_GROUP_RG_TYPE_CODE),
+            &GtsTypeId::new(id),
             ReadOptions::default().with_projection(Projection::Select(FieldSelection::with(&[
                 EntityField::Content,
                 EntityField::ResolvedSchema,
             ]))),
         )
         .await
-        .expect("seeded")
+        .expect("admitted")
         .compile_payload_validator()
-        .expect("validator");
-    validator
-        .validate(&serde_json::json!({ "metadata": { "anything": [1, "two"] } }))
-        .expect("the container never constrained metadata");
-    validator
-        .validate(&serde_json::json!({}))
-        .expect("metadata is optional");
+        .expect("validator")
+}
+
+#[tokio::test]
+async fn user_groups_nest_and_accept_only_user_memberships() {
+    let registry = admitted_registry().await;
+    let group = validator(registry.as_ref(), USER_GROUP_RG_TYPE_CODE).await;
+    group
+        .validate(&json!({"parent_type":null,"membership_type":USER_MEMBERSHIP_SCHEMA}))
+        .expect("root and absent metadata");
+    group
+        .validate(&json!({
+            "parent_type": USER_GROUP_RG_TYPE_CODE,
+            "membership_type": USER_MEMBERSHIP_SCHEMA,
+            "metadata": {}
+        }))
+        .expect("same-type parent and empty metadata");
+    group
+        .validate(&json!({
+            "parent_type": DERIVED_USER_GROUP,
+            "membership_type": USER_MEMBERSHIP_SCHEMA
+        }))
+        .expect("a derived user-group type can be a parent");
+    group
+        .validate(
+            &json!({"parent_type":USER_RG_TYPE_CODE,"membership_type":USER_MEMBERSHIP_SCHEMA}),
+        )
+        .expect_err("users cannot parent groups");
+
+    let membership = validator(registry.as_ref(), USER_MEMBERSHIP_SCHEMA).await;
+    membership
+        .validate(&json!({"resource_type": USER_RG_TYPE_CODE}))
+        .expect("user resource type");
+    membership
+        .validate(&json!({"resource_type": DERIVED_USER}))
+        .expect("derived user resource type");
+    membership
+        .validate(&json!({"resource_type": USER_GROUP_RG_TYPE_CODE}))
+        .expect_err("groups cannot be members");
+    membership
+        .validate(&json!({"resource_type": USER_RG_TYPE_CODE, "resource_id": "user-42"}))
+        .expect_err("membership schema accepts only resource_type");
+}
+
+#[tokio::test]
+async fn user_group_metadata_rejects_unknown_fields() {
+    let registry = admitted_registry().await;
+    let group = validator(registry.as_ref(), USER_GROUP_RG_TYPE_CODE).await;
+    group
+        .validate(&json!({
+            "parent_type": null,
+            "membership_type": USER_MEMBERSHIP_SCHEMA,
+            "metadata": {"extra": 1}
+        }))
+        .expect_err("v1 user groups declare no metadata fields");
 }

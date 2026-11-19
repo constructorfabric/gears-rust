@@ -28,6 +28,7 @@ pub struct GroupRecord {
     pub parent_id: Option<Uuid>,
     /// The group's GTS type identifier (immutable).
     pub code: String,
+    pub membership_type: Option<String>,
     pub name: String,
     pub metadata: Option<serde_json::Value>,
     pub tenant_id: Uuid,
@@ -139,6 +140,7 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         id: Uuid,
         parent_id: Option<Uuid>,
         type_key: GtsTypeKey,
+        membership_type_key: Option<GtsTypeKey>,
         name: &str,
         metadata: Option<&serde_json::Value>,
         tenant_id: Uuid,

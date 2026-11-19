@@ -504,7 +504,7 @@ upstream PRD/DESIGN definition, with no broken references.
 - **Depends On**: `cpt-cf-account-management-feature-tenant-hierarchy-management`, `cpt-cf-account-management-feature-idp-user-operations-contract`, `cpt-cf-account-management-feature-errors-observability`
 
 - **Scope**:
-  - AM-owned GTS declarations, published with AM's types-registry manifest, for `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` (with `allowed_membership_types = [gts.cf.core.rg.type.v1~cf.core.am.user.v1~]` and `allowed_parent_types` permitting self-nesting for nested user groups) and for the member handle `gts.cf.core.rg.type.v1~cf.core.am.user.v1~`.
+  - AM-owned GTS declarations published with AM's types-registry manifest. The user-group schema permits roots and nesting under the user-group type or its derivatives. Its bound membership schema admits the AM user handle `gts.cf.core.rg.type.v1~cf.core.am.user.v1~` and its derived types.
   - Account-Management-side cascade cleanup trigger during tenant hard-deletion so Resource Group can remove the tenant's user-group subtree before the tenant row is deleted.
   - Exposure of AM's tenant-scoped user-query capability (from feature 5) as the valid user set that callers combine with Resource Group membership operations.
   - Documented delegation contract: consumers call `ResourceGroupClient` directly for group and membership operations; AM does not proxy.

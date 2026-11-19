@@ -183,8 +183,8 @@ async fn group_create_incompatible_parent_type() {
         .unwrap_err();
 
     assert!(
-        matches!(err, DomainError::InvalidParentType { .. }),
-        "Expected InvalidParentType, got: {err:?}"
+        matches!(err, DomainError::Validation { .. }),
+        "Expected parent schema validation error, got: {err:?}"
     );
 }
 
@@ -210,8 +210,8 @@ async fn group_create_root_when_cannot_be_root() {
         .unwrap_err();
 
     assert!(
-        matches!(err, DomainError::InvalidParentType { ref message } if message.contains("cannot be a root group")),
-        "Expected InvalidParentType with 'cannot be a root group', got: {err:?}"
+        matches!(err, DomainError::Validation { ref message } if message.contains("null")),
+        "Expected the parent schema to reject null, got: {err:?}"
     );
 }
 
@@ -654,7 +654,13 @@ async fn group_move_under_descendant_cycle() {
     )
     .await;
 
-    // Try to move root under its child
+    common::publish_type(common::CreateTypeRequest {
+        code: root_type.code,
+        can_be_root: true,
+        allowed_parent_types: vec![child_type.code],
+        ..Default::default()
+    });
+    // The parent schema allows the child's type; the hierarchy rejects the cycle.
     let err = group_svc
         .move_group(&ctx, root.id, Some(child.id))
         .await
@@ -679,6 +685,12 @@ async fn group_move_self_parent_cycle() {
     let root =
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
 
+    common::publish_type(common::CreateTypeRequest {
+        code: root_type.code.clone(),
+        can_be_root: true,
+        allowed_parent_types: vec![root_type.code],
+        ..Default::default()
+    });
     let err = group_svc
         .move_group(&ctx, root.id, Some(root.id))
         .await
@@ -725,8 +737,8 @@ async fn group_move_incompatible_parent_type() {
         .unwrap_err();
 
     assert!(
-        matches!(err, DomainError::InvalidParentType { .. }),
-        "Expected InvalidParentType, got: {err:?}"
+        matches!(err, DomainError::Validation { .. }),
+        "Expected parent schema validation error, got: {err:?}"
     );
 }
 
@@ -807,8 +819,8 @@ async fn group_move_to_root_cannot_be_root() {
         .unwrap_err();
 
     assert!(
-        matches!(err, DomainError::InvalidParentType { ref message } if message.contains("cannot be a root group")),
-        "Expected InvalidParentType with 'cannot be a root group', got: {err:?}"
+        matches!(err, DomainError::Validation { ref message } if message.contains("null")),
+        "Expected the parent schema to reject null, got: {err:?}"
     );
 }
 
@@ -2170,8 +2182,8 @@ async fn adr_department_cannot_be_root() {
         .unwrap_err();
 
     assert!(
-        matches!(err, DomainError::InvalidParentType { .. }),
-        "Expected InvalidParentType, got {err:?}"
+        matches!(err, DomainError::Validation { .. }),
+        "Expected parent schema validation error, got {err:?}"
     );
 }
 
@@ -2199,8 +2211,8 @@ async fn adr_branch_only_under_department() {
         .unwrap_err();
 
     assert!(
-        matches!(err, DomainError::InvalidParentType { .. }),
-        "Expected InvalidParentType, got {err:?}"
+        matches!(err, DomainError::Validation { .. }),
+        "Expected parent schema validation error, got {err:?}"
     );
 }
 
@@ -2257,9 +2269,9 @@ async fn adr_tenant_rejects_course_membership() {
     assert!(
         matches!(
             &err,
-            DomainError::Validation { message } if message.contains("allowed_membership_types")
+            DomainError::Validation { message } if message.contains(&course_type.code)
         ),
-        "Expected DomainError::Validation mentioning allowed_membership_types, got: {err:?}"
+        "Expected the membership schema to reject the course type, got: {err:?}"
     );
 }
 
@@ -2479,11 +2491,7 @@ async fn create_root_type_with_prefix(
     prefix: &str,
 ) -> common::ResourceGroupType {
     // The prefix is itself an RG type the derived one extends.
-    common::publish_type(common::CreateTypeRequest {
-        code: prefix.to_owned(),
-        can_be_root: true,
-        ..common::CreateTypeRequest::default()
-    });
+    common::publish_type_ancestor(prefix);
     svc.create_type_unscoped(common::CreateTypeRequest {
         code: format!("{prefix}x.test._.t{}.v1~", Uuid::now_v7().as_simple()),
         can_be_root: true,
@@ -3335,12 +3343,22 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
         id: Uuid,
         parent_id: Option<Uuid>,
         type_key: GtsTypeKey,
+        membership_type_key: Option<GtsTypeKey>,
         name: &str,
         metadata: Option<&serde_json::Value>,
         tenant_id: Uuid,
     ) -> Result<(), DomainError> {
         self.inner
-            .insert(db, id, parent_id, type_key, name, metadata, tenant_id)
+            .insert(
+                db,
+                id,
+                parent_id,
+                type_key,
+                membership_type_key,
+                name,
+                metadata,
+                tenant_id,
+            )
             .await
     }
 

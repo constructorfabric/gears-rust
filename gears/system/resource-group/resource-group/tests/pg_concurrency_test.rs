@@ -966,10 +966,7 @@ async fn deterministic_rejections_do_not_consume_dictionary_identities() {
             )
             .await
             .expect_err("type cannot be a root");
-        assert!(
-            matches!(err, DomainError::InvalidParentType { .. }),
-            "{err:?}"
-        );
+        assert!(matches!(err, DomainError::Validation { .. }), "{err:?}");
 
         let err = group_svc
             .create_group(
@@ -980,10 +977,7 @@ async fn deterministic_rejections_do_not_consume_dictionary_identities() {
             )
             .await
             .expect_err("parent type not allowed");
-        assert!(
-            matches!(err, DomainError::InvalidParentType { .. }),
-            "{err:?}"
-        );
+        assert!(matches!(err, DomainError::Validation { .. }), "{err:?}");
 
         let err = group_svc
             .create_group(
@@ -1009,8 +1003,8 @@ async fn deterministic_rejections_do_not_consume_dictionary_identities() {
         "deterministic rejections must not consume identity values"
     );
 
-    // A successful first use takes exactly one value; later uses of the same
-    // type take none.
+    // A successful first use takes one key for the group type and one for
+    // its membership binding. Later uses take none.
     for name in ["a", "b", "c"] {
         group_svc
             .create_group(
@@ -1025,7 +1019,7 @@ async fn deterministic_rejections_do_not_consume_dictionary_identities() {
         dictionary_key(&fix, &duplicate_id_type.code).await,
         Some(second + 1)
     );
-    assert_eq!(probe_next_key(&fix).await, second + 2);
+    assert_eq!(probe_next_key(&fix).await, second + 3);
 }
 
 /// Concurrent first uses of one type -- groups and memberships -- all

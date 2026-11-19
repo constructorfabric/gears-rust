@@ -102,13 +102,13 @@ Groups are the core nodes of the resource group hierarchy. This feature implemen
 **Error Scenarios**:
 - Invalid type → Validation error
 - Parent not found → NotFound
-- Parent type not in allowed_parents → InvalidParentType
-- Type does not allow root placement (can_be_root=false) and no parent → Validation error
+- The schema rejects the actual parent type → Validation error
+- The schema rejects `parent_type: null` for a root → Validation error
 - Creating a tenant-type group as root while another tenant-type root already exists → `TenantRootAlreadyExists` (409 Conflict)
 - Depth or width limit exceeded → LimitViolation
 
-The active registry snapshot and payload validation are completed before the
-transaction opens. Type and tenant identifiers are immutable after creation.
+RG reads the active registry snapshot and compiles the validator before the
+transaction. The validator checks the actual parent and resulting payload in the transaction. Type and tenant identifiers are immutable after creation.
 
 **Steps**:
 1. [x] - `p1` - Actor sends POST /api/resource-group/v1/groups with {type, name, metadata, hierarchy: {parent_id, tenant_id}} - `inst-create-group-1`
@@ -117,14 +117,14 @@ transaction opens. Type and tenant identifiers are immutable after creation.
 4. [x] - `p1` - **IF** parent_id is provided - `inst-create-group-4`
    1. [x] - `p1` - DB: SELECT id, gts_type_id, tenant_id FROM resource_group WHERE id = {parent_id} — load parent in tx - `inst-create-group-4a`
    2. [x] - `p1` - **IF** parent not found → **RETURN** NotFound - `inst-create-group-4b`
-   3. [x] - `p1` - Validate child type's allowed_parents includes parent's type - `inst-create-group-4c`
-   4. [x] - `p1` - **IF** type incompatible → **RETURN** InvalidParentType - `inst-create-group-4d`
+   3. [x] - `p1` - Validate the group payload with the actual parent's type - `inst-create-group-4c`
+   4. [x] - `p1` - **IF** the schema rejects the payload → **RETURN** Validation error - `inst-create-group-4d`
    5. [x] - `p1` - Invoke query profile enforcement: check depth limit - `inst-create-group-4e`
    6. [x] - `p1` - Invoke query profile enforcement: check width limit (sibling count under parent) - `inst-create-group-4f`
 5. [x] - `p1` - **ELSE** (root group) - `inst-create-group-5`
-   1. [x] - `p1` - **IF** type does not allow root placement (can_be_root=false) → **RETURN** Validation error - `inst-create-group-5a`
+   1. [x] - `p1` - **IF** the schema rejects `parent_type: null` → **RETURN** Validation error - `inst-create-group-5a`
    2. [x] - `p1` - **IF** type code starts with `TENANT_RG_TYPE_PATH` (tenant type) AND there already exists any other root group whose type is a tenant type → **RETURN** `TenantRootAlreadyExists` (409 Conflict) - `inst-create-group-5c`
-6. [x] - `p1` - Before the write transaction, validate the complete metadata payload through the SDK validator compiled from the materialized registry schema; return Validation on refusal - `inst-create-group-5b`
+6. [x] - `p1` - Before the write transaction, compile the SDK validator from the materialized registry schema - `inst-create-group-5b`
 7. [x] - `p1` - After every rejecting check (a caller-supplied id already taken is rejected first): get or create the type's dictionary key in this transaction, then DB: INSERT INTO resource_group (id, parent_id, gts_type_id, name, metadata, tenant_id) - `inst-create-group-6`
 7. [x] - `p1` - DB: INSERT INTO resource_group_closure (ancestor_id=id, descendant_id=id, depth=0) — self-row - `inst-create-group-7`
 8. [x] - `p1` - **IF** parent_id is provided - `inst-create-group-8`
@@ -145,7 +145,7 @@ transaction opens. Type and tenant identifiers are immutable after creation.
 
 **Error Scenarios**:
 - Group not found → NotFound
-- Parent change violates the stored type's placement rules → InvalidParentType
+- The group schema rejects the new parent type → Validation error
 - Replacement metadata, including removal, violates the type schema → Validation
 
 **Steps**:
@@ -156,7 +156,7 @@ transaction opens. Type and tenant identifiers are immutable after creation.
    1. [x] - `p1` - Require the preloaded type snapshot when the parent changes - `inst-update-group-4a`
    2. [x] - `p1` - Determine whether the current row requires a structural parent change - `inst-update-group-4b`
    3. [x] - `p1` - Escalate an unexpected parent change to a serializable retry before any write - `inst-update-group-4c`
-   4. [x] - `p1` - Validate the move with the current parent snapshot, placement traits and closure rules - `inst-update-group-4d`
+   4. [x] - `p1` - Validate the move with the current parent snapshot, group schema and closure rules - `inst-update-group-4d`
 5. [x] - `p1` - Validate replacement or removal of metadata through the SDK snapshot before the transaction; reject a concurrent unvalidated removal and use the same immutable type inside the write - `inst-update-group-4e`
 6. [x] - `p1` - DB: UPDATE resource_group SET name, parent_id, metadata, updated_at — preserve type and tenant identifiers - `inst-update-group-5`
 7. [x] - `p1` - **RETURN** updated ResourceGroup - `inst-update-group-6`
@@ -175,7 +175,7 @@ transaction opens. Type and tenant identifiers are immutable after creation.
 - New parent not found → NotFound
 - New parent is a descendant of group → CycleDetected
 - Self-parent attempt → CycleDetected
-- Parent type incompatible → InvalidParentType
+- The group schema rejects the parent type → Validation error
 - Depth or width limit exceeded at new position → LimitViolation
 
 **Steps**:
@@ -378,15 +378,15 @@ REST-level tests for endpoints not covered by existing `api_rest_test.rs`:
 
 ## 6. Acceptance Criteria
 
-- [x] Root group (can_be_root=true, no parent) is created with self-referencing closure row (depth=0)
+- [x] Root group whose schema admits `parent_type: null` is created with self-referencing closure row (depth=0)
 - [x] Child group is created with closure rows linking to all ancestors at correct depths
-- [x] Creating group with parent of incompatible type returns `InvalidParentType` (400)
+- [x] Creating group with parent of incompatible type returns a validation error (400)
 - [x] Creating group with nonexistent parent returns `NotFound` (404)
-- [x] Creating root group when type has can_be_root=false returns validation error (400)
+- [x] Creating a root when its schema rejects `parent_type: null` returns validation error (400)
 - [x] Moving group to new parent rebuilds closure paths transactionally for entire subtree
 - [x] Moving group under its own descendant returns `CycleDetected` (400)
 - [x] Moving group under itself (self-parent) returns `CycleDetected` (400)
-- [x] Moving group to incompatible parent type returns `InvalidParentType` (400)
+- [x] Moving group to incompatible parent type returns a validation error (400)
 - [x] Group type is immutable; reparenting validates placement against the admitted type snapshot
 - [x] Deleting leaf group (no children, no memberships) succeeds (204) and removes closure rows
 - [x] Deleting group with children without force returns `ConflictActiveReferences` (400) with response body listing blocking entities (children count/IDs and membership count) so the caller can display what prevents deletion
@@ -432,7 +432,7 @@ Test setup: SQLite in-memory, admitted registry definitions and GroupService wit
 
 #### TC-GRP-01: Create child group with parent - closure rows correct [P1]
 - **Covers**: G8, 0003-AC-1,2
-- **Setup**: Create parent type (can_be_root=true), child type (allowed_parents=[parent_type]). Create root group, then child group under it.
+- **Setup**: Publish a parent type that permits a root and a child type that permits the parent's type. Create root group, then child group under it.
 - **Assert**: Child group returned with `hierarchy.parent_id`, closure table has self-row (depth=0) and ancestor row (depth=1)
 
 #### TC-GRP-02: Create 3-level hierarchy - closure table completeness [P1]
@@ -442,13 +442,13 @@ Test setup: SQLite in-memory, admitted registry definitions and GroupService wit
 
 #### TC-GRP-03: Create group with incompatible parent type [P1]
 - **Covers**: G9, 0003-AC-3
-- **Setup**: Create type A (can_be_root=true), type B (can_be_root=false, allowed_parents=[]... wait, that violates placement invariant). Create type A (root), type B (allowed_parents=[A]), type C (allowed_parents=[B]). Create root group of type A. Try to create child of type C under group A.
-- **Assert**: `DomainError::InvalidParentType`
+- **Setup**: Publish type A for roots, type B for children of A, and type C for children of B. Create root group of type A. Try to create child of type C under group A.
+- **Assert**: `DomainError::Validation` from the group schema
 
-#### TC-GRP-04: Create root group when can_be_root=false [P1]
+#### TC-GRP-04: Create a root when its schema rejects a null parent [P1]
 - **Covers**: G10, 0003-AC-5
-- **Setup**: Create type with can_be_root=false, allowed_parents=[some_parent_type]. Try to create root group (no parent).
-- **Assert**: `DomainError::InvalidParentType` with "cannot be a root group"
+- **Setup**: Publish a group type requiring a specific non-null parent type. Try to create root group (no parent).
+- **Assert**: `DomainError::Validation` because the schema rejects a null parent
 
 #### TC-GRP-05: Move group - happy path with closure rebuild [P1]
 - **Covers**: G11, 0003-AC-6
@@ -467,8 +467,8 @@ Test setup: SQLite in-memory, admitted registry definitions and GroupService wit
 
 #### TC-GRP-08: Move group to incompatible parent type [P1]
 - **Covers**: G14, 0003-AC-9
-- **Setup**: Type A (root), Type B (allowed_parents=[A]). Create group of type B under group of type A. Create group of type A (root). Try to move group B under another group B.
-- **Assert**: `DomainError::InvalidParentType`
+- **Setup**: Type A accepts a null parent and type B permits parents of type A. Create group of type B under group of type A. Create group of type A (root). Try to move group B under another group B.
+- **Assert**: `DomainError::Validation` from the group schema
 
 #### TC-GRP-09: Update group name and metadata [P2]
 - **Covers**: G15
@@ -534,14 +534,14 @@ Test setup: SQLite in-memory, admitted registry definitions and GroupService wit
 - Create with `metadata: Some(json!({"self_managed": true}))`, verify stored and returned
 
 #### TC-GRP-25: Multiple root groups of same type [P2]
-- Create 2 root groups of same can_be_root=true type, both succeed
+- Create 2 roots of the same type that accepts a null parent, both succeed
 
 #### TC-GRP-29: Move child to root (detach from parent) - happy path [P1]
-- Child under parent, move with new_parent_id=None, type allows can_be_root=true
+- Child under parent, move with new_parent_id=None, the schema accepts `parent_type: null`
 - **Assert**: Success, parent_id=None, closure rebuilt (old ancestor rows removed, self-row only)
 
-#### TC-GRP-30: Move child to root when can_be_root=false [P1]
-- **Assert**: `DomainError::InvalidParentType("cannot be a root group")`
+#### TC-GRP-30: Move child to root when its schema rejects a null parent [P1]
+- **Assert**: `DomainError::Validation` because the schema rejects a null parent
 
 #### TC-GRP-31: Move nonexistent group [P2]
 - **Assert**: `DomainError::GroupNotFound`
@@ -692,19 +692,19 @@ Reproduce the full ADR example hierarchy (T1→D2→B3, T7→D8, T9) with correc
 - **Membership assert**: each membership group_id + resource_type correct
 
 #### TC-ADR-02: Tenant type allows self-nesting (T7 under T1) [P1]
-- Tenant type: `allowed_parents: [tenant_type_code]` — self-referential
+- Tenant schema permits its own type as a parent
 - Create T1 (root), create T7 under T1 (both tenant type)
 - **Assert**: Success, T7 parent_id = T1.id
 
 #### TC-ADR-03: Department cannot be root [P1]
-- Department type: `can_be_root: false, allowed_parents: [tenant_type_code]`
+- Department schema requires a tenant parent
 - Try to create department with parent_id=None
-- **Assert**: `DomainError::InvalidParentType("cannot be a root group")`
+- **Assert**: `DomainError::Validation` because the schema rejects a null parent
 
 #### TC-ADR-04: Branch only under department (not under tenant) [P1]
-- Branch type: `allowed_parents: [department_type_code]`
+- Branch schema requires a department parent
 - Try to create branch directly under tenant
-- **Assert**: `DomainError::InvalidParentType`
+- **Assert**: `DomainError::Validation` from the group schema
 
 #### TC-ADR-05: Branch allows users AND courses as members [P1]
 - Branch type: `allowed_memberships: [user_type, course_type]`
@@ -909,7 +909,7 @@ These test domain invariants that prevent data corruption or violate core busine
 | **TC-GRP-01** | Child group + closure rows | Hierarchy queries broken |
 | **TC-GRP-02** | 3-level closure completeness | Ancestor/descendant queries wrong |
 | **TC-GRP-03** | Incompatible parent type | Type system bypassed |
-| **TC-GRP-04** | Root group when can_be_root=false | Type system bypassed |
+| **TC-GRP-04** | Root group whose schema rejects a null parent | Type system bypassed |
 | **TC-GRP-05** | Move with closure rebuild | Hierarchy corrupt after move |
 | **TC-GRP-06** | Move under descendant -> cycle | Infinite loops in hierarchy |
 | **TC-GRP-07** | Self-parent -> cycle | Infinite loops in hierarchy |
@@ -931,7 +931,7 @@ These test domain invariants that prevent data corruption or violate core busine
 | **TC-GRP-22** | Create group nonexistent type | Group with invalid type |
 | **TC-GRP-23** | Child group cross-tenant parent | Tenant isolation broken |
 | **TC-GRP-29** | Move child to root (detach) | Closure corruption on detach |
-| **TC-GRP-30** | Move to root when can_be_root=false | Unauthorized root creation |
+| **TC-GRP-30** | Move to root when the schema rejects a null parent | Unauthorized root creation |
 | **TC-GRP-37** | Depth exact boundary (>=) | Off-by-one in guardrail |
 | **TC-GRP-38** | Width exact boundary (>=) | Off-by-one in guardrail |
 | **TC-SDK-24** | validate_type_code vs GtsTypePath mismatch | Silent validation inconsistency |
@@ -1104,7 +1104,7 @@ Tests S5, S6, S7 verify PostgreSQL-specific behavior that unit tests cannot catc
 **Why not in unit tests**: TC-GRP-01/02 verify closure rows on SQLite. PostgreSQL uses `INSERT INTO resource_group_closure SELECT ...` with joins against existing closure rows — column order or join condition errors produce wrong depth values silently on SQLite but fail or corrupt data on PostgreSQL.
 
 ```
-POST parent_type (can_be_root), child_type (allowed_parents: [parent])
+Publish parent and child schemas with their placement rules
 POST root → child → grandchild
 
 GET /groups/{root.id}/hierarchy     → 200

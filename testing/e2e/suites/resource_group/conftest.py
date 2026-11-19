@@ -67,24 +67,50 @@ TENANT_B_ID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 TENANT_TYPE_CODE = "gts.cf.core.rg.type.v1~x.e2etest._.tenant.v1~"
 
 
+RG_MEMBERSHIP_BASE = "gts.cf.core.rg.membership.v1~"
+
+
+def membership_schema_id(group_code: str) -> str:
+    return RG_MEMBERSHIP_BASE + group_code.removeprefix(RG_BASE_TYPE)
+
+
 def rg_type_schema(
     code: str,
     can_be_root: bool = True,
     allowed_parent_types: Optional[list[str]] = None,
     allowed_membership_types: Optional[list[str]] = None,
 ) -> dict:
-    """An RG type as its owner publishes it: derived from the RG base type,
-    placement in `x-gts-traits`."""
+    """The concrete group definition published through Types Registry."""
+    parents = ([None] if can_be_root else []) + (allowed_parent_types or [])
     return {
         "$id": f"gts://{code}",
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
-        "allOf": [{"$ref": f"gts://{RG_BASE_TYPE}"}],
-        "x-gts-traits": {
-            "can_be_root": can_be_root,
-            "allowed_parent_types": allowed_parent_types or [],
-            "allowed_membership_types": allowed_membership_types or [],
-        },
+        "allOf": [
+            {"$ref": f"gts://{RG_BASE_TYPE}"},
+            {"properties": {
+                "parent_type": {"type": ["string", "null"], "enum": parents},
+                "membership_type": {"type": "string", "const": membership_schema_id(code)},
+            }},
+        ],
+    }
+
+
+def membership_schema(group_code: str, member_types: list[str]) -> dict:
+    resource_type = {"type": "string", "x-gts-type-ref": "gts.*"}
+    if member_types:
+        resource_type["enum"] = member_types
+    else:
+        # The intersection excludes every valid GTS type ID.
+        resource_type["maxLength"] = 0
+    return {
+        "$id": f"gts://{membership_schema_id(group_code)}",
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "allOf": [
+            {"$ref": f"gts://{RG_MEMBERSHIP_BASE}"},
+            {"properties": {"resource_type": resource_type}},
+        ],
     }
 
 
@@ -100,24 +126,27 @@ async def publish_rg_type(base_url: str, code: str, **traits) -> dict:
     async with httpx.AsyncClient(
         base_url=base_url.rstrip("/") + "/", headers=_platform_headers(), timeout=10.0
     ) as platform:
-        candidate = {"gts_id": code, "content": rg_type_schema(code, **traits)}
-        current = await get_entity(platform, PLATFORM_API, code, select="origin")
-        if current.status_code == 200:
-            candidate["expected_resource_version"] = current.json()["origin"]["resource_version"]
-        else:
-            assert current.status_code == 404, (
-                f"types-registry read of '{code}': {current.status_code} {current.text}"
-            )
-        operation = await submit_and_poll(
-            platform,
-            PLATFORM_API,
-            [candidate],
-            RECEIPT,
+        candidates = [
+            {
+                "gts_id": membership_schema_id(code),
+                "content": membership_schema(code, traits.get("allowed_membership_types") or []),
+            },
+            {"gts_id": code, "content": rg_type_schema(code, **traits)},
+        ]
+        for candidate in candidates:
+            type_id = candidate["gts_id"]
+            current = await get_entity(platform, PLATFORM_API, type_id, select="origin")
+            if current.status_code == 200:
+                candidate["expected_resource_version"] = current.json()["origin"]["resource_version"]
+            else:
+                assert current.status_code == 404, (
+                    f"types-registry read of '{type_id}': {current.status_code} {current.text}"
+                )
+        operation = await submit_and_poll(platform, PLATFORM_API, candidates, RECEIPT)
+    for item in operation["items"]:
+        assert item["status"] in ("succeeded", "unchanged"), (
+            f"types-registry refused a definition for RG type '{code}': {item}"
         )
-    [item] = operation["items"]
-    assert item["status"] in ("succeeded", "unchanged"), (
-        f"types-registry refused RG type '{code}': {item}"
-    )
     return {"code": code, **traits}
 
 
@@ -153,13 +182,18 @@ def _seed_root_tenants():
         tid_a = uuid_to_blob(TENANT_A_ID)
         tid_b = uuid_to_blob(TENANT_B_ID)
 
-        # 1. Root groups reference their type by GTS identifier.
-        type_id = TENANT_TYPE_CODE
+        # 1. Resolve the published identifiers into RG's numeric dictionary.
+        def type_key(code: str) -> int:
+            conn.execute("INSERT OR IGNORE INTO gts_type (schema_id) VALUES (?)", (code,))
+            return conn.execute("SELECT id FROM gts_type WHERE schema_id = ?", (code,)).fetchone()[0]
+
+        type_id = type_key(TENANT_TYPE_CODE)
+        binding_id = type_key(membership_schema_id(TENANT_TYPE_CODE))
 
         # 2. Root tenant A (UUIDs as BLOB to match SeaORM format)
         conn.execute(
-            "INSERT OR IGNORE INTO resource_group (id, gts_type_id, name, tenant_id) VALUES (?, ?, ?, ?)",
-            (tid_a, type_id, "e2e-root-tenant-a", tid_a),
+            "INSERT OR IGNORE INTO resource_group (id, gts_type_id, membership_type_id, name, tenant_id) VALUES (?, ?, ?, ?, ?)",
+            (tid_a, type_id, binding_id, "e2e-root-tenant-a", tid_a),
         )
         conn.execute(
             "INSERT OR IGNORE INTO resource_group_closure (ancestor_id, descendant_id, depth) VALUES (?, ?, 0)",
@@ -168,8 +202,8 @@ def _seed_root_tenants():
 
         # 3. Root tenant B
         conn.execute(
-            "INSERT OR IGNORE INTO resource_group (id, gts_type_id, name, tenant_id) VALUES (?, ?, ?, ?)",
-            (tid_b, type_id, "e2e-root-tenant-b", tid_b),
+            "INSERT OR IGNORE INTO resource_group (id, gts_type_id, membership_type_id, name, tenant_id) VALUES (?, ?, ?, ?, ?)",
+            (tid_b, type_id, binding_id, "e2e-root-tenant-b", tid_b),
         )
         conn.execute(
             "INSERT OR IGNORE INTO resource_group_closure (ancestor_id, descendant_id, depth) VALUES (?, ?, 0)",

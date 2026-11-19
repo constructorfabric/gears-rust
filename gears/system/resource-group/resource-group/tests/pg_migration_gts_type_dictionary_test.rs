@@ -335,7 +335,16 @@ async fn pg_an_existing_hierarchy_keeps_every_row_and_dictionary_key() {
     );
     upgrade(&f.db).await.expect("a repeated upgrade is a no-op");
     assert_eq!(snapshot(&f.raw).await, before);
-    assert_eq!(history(&f.raw).await.len(), 2);
+    assert_eq!(history(&f.raw).await.len(), 3);
+    assert_eq!(
+        rows(
+            &f.raw,
+            "SELECT count(membership_type_id)::text FROM resource_group"
+        )
+        .await,
+        vec![vec!["0"]],
+        "legacy groups have no membership schema binding",
+    );
 
     assert_eq!(table_names(&f.raw, "gts_type%").await, ["gts_type"]);
     assert_eq!(
@@ -366,6 +375,7 @@ async fn pg_an_existing_hierarchy_keeps_every_row_and_dictionary_key() {
             vec!["ck_rgm_resource_id_bytes"],
             vec!["fk_resource_group_parent"],
             vec!["fk_rg_gts_type"],
+            vec!["fk_rg_membership_type"],
             vec!["fk_rgm_group_id"],
             vec!["fk_rgm_gts_type"],
             vec!["resource_group_name_check"],
@@ -418,6 +428,10 @@ async fn pg_constraints_hold_after_the_upgrade() {
                 "INSERT INTO resource_group (id, parent_id, gts_type_id, name, tenant_id) \
                  VALUES ('00000000-0000-0000-0000-000000000098', NULL, 999, 'x', '{ROOT}')"
             ),
+        ),
+        (
+            "fk_rg_membership_type",
+            format!("UPDATE resource_group SET membership_type_id = 999 WHERE id = '{ROOT}'"),
         ),
         (
             "fk_rgm_gts_type",
