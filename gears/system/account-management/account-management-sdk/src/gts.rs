@@ -78,7 +78,7 @@ pub const SERVICE_ACCOUNT_RESOURCE_TYPE: &str = gts_id!("cf.core.am.service_acco
 ///   list user-groups (optionally combined with `tenant_id eq <t>`).
 /// * `ResourceGroupClient::create_group({code: <this>, ...})` -- to
 ///   create a new user-group instance.
-/// * AM's `UserGroupRgTypeV1` GTS declaration, published with AM's
+/// * AM's `UserGroupTypeV1` GTS declaration, published with AM's
 ///   types-registry manifest.
 ///
 /// The string lives in RG's type namespace (`gts.cf.core.rg.type.v1~`

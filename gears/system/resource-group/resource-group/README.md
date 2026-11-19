@@ -65,9 +65,10 @@ Several group types can share a membership schema.
 
 Types Registry checks same-ID revisions using its normal schema compatibility
 rules. Widening placement or membership constraints can take effect for
-existing groups. The [admission integration test](tests/managed_types_admission_test.rs)
-covers widening an inherited placement `anyOf`, widening membership, and
-refusal of incompatible revisions with GTS 0.17.2.
+existing groups. The [schema revision E2E tests](../../../../testing/e2e/suites/resource_group/test_type_revisions.py)
+publish revisions through Types Registry and verify that existing groups can
+move or accept members under the widened rules. They also check that the
+registry refuses incompatible revisions.
 
 The upgrade adds a nullable binding column for pre-existing database rows.
 Those groups resolve their binding from the published type until they have

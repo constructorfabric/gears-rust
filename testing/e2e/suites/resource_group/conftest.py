@@ -74,14 +74,8 @@ def membership_schema_id(group_code: str) -> str:
     return RG_MEMBERSHIP_BASE + group_code.removeprefix(RG_BASE_TYPE)
 
 
-def rg_type_schema(
-    code: str,
-    can_be_root: bool = True,
-    allowed_parent_types: Optional[list[str]] = None,
-    allowed_membership_types: Optional[list[str]] = None,
-) -> dict:
+def rg_type_schema(code: str, parent_type: Optional[dict] = None) -> dict:
     """The concrete group definition published through Types Registry."""
-    parents = ([None] if can_be_root else []) + (allowed_parent_types or [])
     return {
         "$id": f"gts://{code}",
         "$schema": "http://json-schema.org/draft-07/schema#",
@@ -89,20 +83,17 @@ def rg_type_schema(
         "allOf": [
             {"$ref": f"gts://{RG_BASE_TYPE}"},
             {"properties": {
-                "parent_type": {"type": ["string", "null"], "enum": parents},
+                "parent_type": parent_type if parent_type is not None else {"type": "null"},
                 "membership_type": {"type": "string", "const": membership_schema_id(code)},
             }},
         ],
     }
 
 
-def membership_schema(group_code: str, member_types: list[str]) -> dict:
-    resource_type = {"type": "string", "x-gts-type-ref": "gts.*"}
-    if member_types:
-        resource_type["enum"] = member_types
-    else:
-        # The intersection excludes every valid GTS type ID.
-        resource_type["maxLength"] = 0
+def membership_schema(group_code: str, resource_type: Optional[dict] = None) -> dict:
+    if resource_type is None:
+        # No valid GTS resource type matches the empty string.
+        resource_type = {"type": "string", "x-gts-type-ref": "gts.*", "maxLength": 0}
     return {
         "$id": f"gts://{membership_schema_id(group_code)}",
         "$schema": "http://json-schema.org/draft-07/schema#",
@@ -119,7 +110,13 @@ def _platform_headers() -> dict:
     return {"X-ToolKit-Internal-Token": os.getenv("E2E_INTERNAL_TOKEN", "e2e-internal-token")}
 
 
-async def publish_rg_type(base_url: str, code: str, **traits) -> dict:
+async def publish_rg_type(
+    base_url: str,
+    code: str,
+    *,
+    parent_type: Optional[dict] = None,
+    resource_type: Optional[dict] = None,
+) -> str:
     """Publish an RG type through the types registry's platform API and wait
     for its admission. Existing declarations use a version-matched revision
     so successive suite runs sharing a registry can publish the same type."""
@@ -129,9 +126,9 @@ async def publish_rg_type(base_url: str, code: str, **traits) -> dict:
         candidates = [
             {
                 "gts_id": membership_schema_id(code),
-                "content": membership_schema(code, traits.get("allowed_membership_types") or []),
+                "content": membership_schema(code, resource_type),
             },
-            {"gts_id": code, "content": rg_type_schema(code, **traits)},
+            {"gts_id": code, "content": rg_type_schema(code, parent_type)},
         ]
         for candidate in candidates:
             type_id = candidate["gts_id"]
@@ -147,7 +144,7 @@ async def publish_rg_type(base_url: str, code: str, **traits) -> dict:
         assert item["status"] in ("succeeded", "unchanged"), (
             f"types-registry refused a definition for RG type '{code}': {item}"
         )
-    return {"code": code, **traits}
+    return code
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -166,10 +163,10 @@ def _seed_root_tenants():
     import asyncio
 
     base_url = os.getenv("E2E_BASE_URL", "http://localhost:8087")
-    asyncio.run(publish_rg_type(base_url, TENANT_TYPE_CODE, can_be_root=True))
+    asyncio.run(publish_rg_type(base_url, TENANT_TYPE_CODE))
 
-    home = os.path.expanduser(os.getenv("CF_GEARS_HOME", "~/.cf-gears"))
-    db_path = pathlib.Path(home) / "resource-group" / "resource_group.db"
+    home = os.getenv("APP__SERVER__HOME_DIR") or os.getenv("CF_GEARS_HOME", "~/.cf-gears")
+    db_path = pathlib.Path(home).expanduser() / "resource-group" / "resource_group.db"
     if not db_path.exists():
         return  # server not started or different DB path
 
@@ -230,26 +227,14 @@ def unique_type_code(name: str) -> str:
 
 
 @pytest.fixture
-def create_type(rg_base_url, rg_headers):
-    """Factory fixture: publish an RG type to the types registry and return it."""
-    created_codes = []
-
+def create_type(rg_base_url):
+    """Publish a group and its membership schema; return the group type ID."""
     async def _create(
-        name: str,
-        can_be_root: bool = True,
-        allowed_parent_types: Optional[list[str]] = None,
-        allowed_membership_types: Optional[list[str]] = None,
-    ):
-        code = unique_type_code(name)
-        created = await publish_rg_type(
-            rg_base_url,
-            code,
-            can_be_root=can_be_root,
-            allowed_parent_types=allowed_parent_types or [],
-            allowed_membership_types=allowed_membership_types or [],
+        name: str, *, parent_type: Optional[dict] = None, resource_type: Optional[dict] = None,
+    ) -> str:
+        return await publish_rg_type(
+            rg_base_url, unique_type_code(name), parent_type=parent_type, resource_type=resource_type,
         )
-        created_codes.append(code)
-        return created
 
     return _create
 

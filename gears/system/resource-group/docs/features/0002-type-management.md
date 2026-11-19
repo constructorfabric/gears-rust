@@ -189,12 +189,13 @@ use the materialized snapshot. Groups and memberships store GTS identifiers.
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-dod-testing-managed-types`
 
-Consumer-owned tests exercise real persisted Types Registry admission for the RG
-base type and derived declarations. Tests cover inherited payload validation,
-placement constraints and invalid declarations. Adapter tests cover caller context,
+Rust tests use the registry SDK mock to check inherited payload validation,
+placement constraints and membership bindings. E2E tests publish schemas to
+Types Registry, check that it refuses incompatible revisions and exercise RG
+writes against the accepted revisions. Adapter tests cover caller context,
 requested projections, lifecycle policies and error classification.
 
-**Touches**: `managed_types_admission_test.rs`, `registry_types_test.rs`, `infra/types_registry_tests.rs`.
+**Touches**: `managed_types_test.rs`, `registry_types_test.rs`, `infra/types_registry_tests.rs`, `testing/e2e/suites/resource_group/test_type_revisions.py`.
 
 ### Error Conversion Chain Tests
 
@@ -220,8 +221,8 @@ internal database details out of response bodies.
 
 ## 7. Verification
 
-- `managed_types_admission_test.rs`: real persisted admission of consumer-owned group and membership schemas.
+- `managed_types_test.rs`: inherited schemas and stored membership bindings with the registry SDK mock.
 - `registry_types_test.rs`: registry definition policies exercised by group and membership services.
 - `infra/types_registry_tests.rs`: context/projection forwarding and error classification.
 - SQLite/PostgreSQL type-identifier migration tests: preserved rows, indexes, constraints and rollback on refusal.
-- `testing/e2e/suites/resource_group`: publication followed by group/membership HTTP calls, including repeat publication without a new revision.
+- `testing/e2e/suites/resource_group`: publication followed by group/membership HTTP calls, including repeat publication, compatible revisions applied to existing groups, and rejection of incompatible revisions.

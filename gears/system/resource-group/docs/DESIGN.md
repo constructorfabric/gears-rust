@@ -708,13 +708,13 @@ retried operation are recorded outside the retry closure.
 | --- | --- |
 | SDK contract | `resource-group-sdk/src/gts_tests.rs`, model and error projection tests; trait builder compile-fail examples |
 | Registry adapter | `resource-group/src/infra/types_registry_tests.rs`: projections, caller forwarding, lifecycle, SDK validation of inherited schemas/references |
-| Real admission | `resource-group/tests/managed_types_admission_test.rs`: persisted registry/outbox, declared base and derived types, membership binding and SDK payload validation |
+| Managed schemas | `resource-group/tests/managed_types_test.rs` uses the SDK mock for inherited payload validation and membership bindings on new and imported groups |
 | Domain and REST | `group_service_test`, `membership_service_test`, `api_rest_test`, `tenant_filtering_db_test`, `registry_types_test` |
 | Database behavior | `db_behavior_audit_test`, `query_recorder_test`, membership tenant isolation tests |
 | Backend migration | SQLite and PostgreSQL dictionary migration tests: byte-exact row and key preservation, constraints, indexes, refusal before DDL and rollback after it |
 | Dictionary use | `pg_concurrency_test`: rejected creates consume no identity values, concurrent and forced-overlap first uses converge on one key; `registry_types_test`: a key admits nothing, reads create no keys |
 | PostgreSQL concurrency | `pg_smoke_test`, `pg_concurrency_test` with the `integration` feature |
-| End-to-end | `testing/e2e/suites/resource_group` and Account Management's existing suite |
+| End-to-end | `testing/e2e/suites/resource_group/test_type_revisions.py` publishes schema revisions through Types Registry and checks their effect on Resource Group writes. The Resource Group and Account Management suites also exercise publication and consumption over HTTP. |
 
 Focused commands from the repository root:
 

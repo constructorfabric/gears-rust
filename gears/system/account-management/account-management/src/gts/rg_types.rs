@@ -33,7 +33,7 @@ fn user_group_parent(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
         membership_type: String,
     })
 )]
-pub struct UserGroupRgTypeV1;
+pub struct UserGroupTypeV1;
 
 fn user_group_member_type(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({

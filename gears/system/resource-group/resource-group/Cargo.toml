@@ -81,11 +81,6 @@ toolkit-macros = { workspace = true }
 
 [dev-dependencies]
 authz-resolver-sdk = { workspace = true, features = ["test-util"] }
-# Consumer-owned integration tests against real persisted registry admission
-# (`managed_types_admission_test`): the SDK's in-memory fake does not run the
-# registry's publisher guards or its DB-backed admission, so the test builds the
-# registry from its implementation crate, as graph-storage's tests do.
-types-registry = { package = "cf-gears-types-registry", path = "../../types-registry/types-registry" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["metrics", "testing"] }

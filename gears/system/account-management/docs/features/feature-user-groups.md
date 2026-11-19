@@ -121,7 +121,7 @@ The existing `rg-type-registration` / `rg-type-schema-registration` traceability
 
 | Declaration | GTS identifier | Placement and membership |
 |-------------|----------------|---------------------------------|
-| `UserGroupRgTypeV1` | `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` | `parent_type` accepts roots and parent types in the user-group family. `membership_type` binds the user membership schema. `metadata` may be omitted or empty. |
+| `UserGroupTypeV1` | `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` | `parent_type` accepts roots and parent types in the user-group family. `membership_type` binds the user membership schema. `metadata` may be omitted or empty. |
 | `UserV1` | `gts.cf.core.am.user.v1~` | AM user resource type used as the membership's `resource_type`. |
 | [User membership schema](../schemas/user_group_member.v1.schema.json) | `gts.cf.core.rg.membership.v1~cf.core.am.user_group_member.v1~` | Accepts the AM user resource type and its derived types as `resource_type` through `anyOf` with `x-gts-type-ref`. |
 
@@ -156,7 +156,7 @@ AM's manifest **MUST** include the declarations in §3, per `fr-user-group-rg-ty
 
 **Touches**:
 
-- Data: `UserGroupRgTypeV1` and `UserGroupMembershipV1` in AM's crate-local GTS inventory, and `UserV1` in the SDK inventory. [user_group.v1.schema.json](../schemas/user_group.v1.schema.json) documents the published group schema.
+- Data: `UserGroupTypeV1` and `UserGroupMembershipV1` in AM's crate-local GTS inventory, and `UserV1` in the SDK inventory. [user_group.v1.schema.json](../schemas/user_group.v1.schema.json) documents the published group schema.
 - Sibling integration: shared ToolKit startup publisher, `PlatformTypesRegistryApi`; RG consumes the definitions through `TypesRegistryApi`.
 - Errors: shared publication diagnostics preserve the underlying registry failure and identify the publisher and affected identifiers.
 

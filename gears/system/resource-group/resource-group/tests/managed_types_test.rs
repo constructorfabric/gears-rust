@@ -1,0 +1,312 @@
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "integration tests: a failed fixture or assertion step is a test failure"
+)]
+//! Resource Group consumption of managed schemas from the registry SDK.
+// @cpt-dod:cpt-cf-resource-group-dod-testing-managed-types:p1
+
+use std::sync::Arc;
+
+use serde_json::{Value, json};
+use toolkit_gts::{gts_id, gts_uri};
+use toolkit_security::PlatformSecurityContext;
+use types_registry_sdk::testing_platform::MockTypesRegistry;
+use types_registry_sdk::{
+    CompilePayloadValidatorError, EntityField, FieldSelection, GtsCompilePayloadValidatorError,
+    GtsTypeId, PlatformTypesRegistryApiExt, Projection, ReadOptions, TypeSchema,
+};
+
+mod common;
+
+const MEMBER_V1: &str = gts_id!("cf.core.rg.membership.v1~");
+const TEAM_SCHEMA: &str = gts_id!("cf.core.rg.type.v1~cf.test.rg.team.v1~");
+const TEAM_MEMBER: &str = gts_id!("cf.core.rg.membership.v1~cf.test.rg.team_member.v1~");
+const BASE: &str = gts_id!("cf.core.rg.type.v1~");
+const USER: &str = gts_id!("cf.test.rg.user.v1~");
+const TENANT: &str = gts_id!("cf.core.rg.type.v1~cf.test.rg.tenant.v1~");
+const DEPT: &str = gts_id!("cf.core.rg.type.v1~cf.test.rg.tenant.v1~cf.test.rg.dept.v1~");
+
+fn registry() -> MockTypesRegistry {
+    let registry = MockTypesRegistry::new();
+    for (id, schema) in resource_group_sdk::gts_declarations() {
+        registry.seed(&id, serde_json::from_str(&schema).expect("declared JSON"));
+    }
+    registry
+}
+
+fn user_type() -> Value {
+    json!({
+        "$id": gts_uri!("cf.test.rg.user.v1~"),
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": { "id": { "type": "string" } }
+    })
+}
+
+/// A tenant RG type: self-nesting, users as members, and metadata described
+/// through a local `$defs` reference.
+fn tenant_type() -> Value {
+    json!({
+        "$id": gts_uri!("cf.core.rg.type.v1~cf.test.rg.tenant.v1~"),
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "$defs": {
+            "tenant_meta": {
+                "type": "object",
+                "required": ["tier"],
+                "properties": { "tier": { "type": "string" } }
+            }
+        },
+        "allOf": [
+            { "$ref": gts_uri!("cf.core.rg.type.v1~") },
+            { "properties": {
+                "parent_type": {"type": ["string", "null"], "enum": [null, TENANT]},
+                "membership_type": {"type": "string", "const": TEAM_MEMBER},
+                "metadata": { "$ref": "#/$defs/tenant_meta" }
+            } }
+        ]
+    })
+}
+
+/// Derived from the tenant type: inherits its metadata constraints and adds one.
+fn dept_type() -> Value {
+    json!({
+        "$id": gts_uri!("cf.core.rg.type.v1~cf.test.rg.tenant.v1~cf.test.rg.dept.v1~"),
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "allOf": [
+            { "$ref": gts_uri!("cf.core.rg.type.v1~cf.test.rg.tenant.v1~") },
+            { "properties": { "metadata": {
+                "type": "object",
+                "properties": { "code": { "type": "string", "maxLength": 3 } }
+            } } }
+        ]
+    })
+}
+
+async fn read(registry: &MockTypesRegistry, type_id: &str) -> TypeSchema {
+    registry
+        .get_type_schema(
+            &PlatformSecurityContext::outbound_marker(),
+            &GtsTypeId::new(type_id),
+            ReadOptions::default().with_projection(Projection::Select(FieldSelection::with(&[
+                EntityField::Content,
+                EntityField::ResolvedSchema,
+            ]))),
+        )
+        .await
+        .expect("seeded type")
+}
+
+fn registry_with_derived_types() -> MockTypesRegistry {
+    let registry = registry();
+    registry.seed(USER, user_type());
+    registry.seed(TENANT, tenant_type());
+    registry.seed(DEPT, dept_type());
+    registry
+}
+
+#[tokio::test]
+async fn the_abstract_group_base_constrains_parent_types_of_concrete_groups() {
+    let registry = registry();
+    let concrete = json!({
+        "$id": format!("gts://{TEAM_SCHEMA}"),
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "allOf": [
+            {"$ref": format!("gts://{BASE}")},
+            {"properties": {"membership_type": {"type": "string", "const": TEAM_MEMBER}}}
+        ]
+    });
+    registry.seed(TEAM_SCHEMA, concrete);
+    assert!(matches!(
+        read(&registry, BASE).await.compile_payload_validator(),
+        Err(CompilePayloadValidatorError::Upstream(
+            GtsCompilePayloadValidatorError::Abstract(_)
+        ))
+    ));
+
+    let validator = read(&registry, TEAM_SCHEMA)
+        .await
+        .compile_payload_validator()
+        .expect("concrete group inherits the base parent type constraint");
+
+    for parent_type in [Value::Null, json!(TENANT), json!(DEPT)] {
+        validator
+            .validate(&json!({"parent_type": parent_type, "membership_type": TEAM_MEMBER}))
+            .expect("root or a type in the resource-group family");
+    }
+    validator
+        .validate(&json!({"membership_type": TEAM_MEMBER}))
+        .expect_err("parent_type is required");
+    validator
+        .validate(&json!({"parent_type": USER, "membership_type": TEAM_MEMBER}))
+        .expect_err("a type outside the resource-group family cannot be a parent");
+}
+
+#[tokio::test]
+async fn the_group_payload_requires_parent_type_and_membership_type() {
+    let registry = registry_with_derived_types();
+    let validator = read(&registry, TENANT)
+        .await
+        .compile_payload_validator()
+        .expect("tenant schema");
+    let mut root = json!({
+        "parent_type": null, "membership_type": TEAM_MEMBER, "metadata": {"tier": "gold"}
+    });
+    validator
+        .validate(&root)
+        .expect("null is the required root placement value");
+    root.as_object_mut()
+        .expect("group document")
+        .remove("parent_type");
+    validator
+        .validate(&root)
+        .expect_err("parent_type is required");
+    root["parent_type"] = json!(TENANT);
+    validator
+        .validate(&root)
+        .expect("nests under the same type");
+    root.as_object_mut()
+        .expect("group document")
+        .remove("membership_type");
+    validator
+        .validate(&root)
+        .expect_err("membership_type is required");
+}
+
+#[tokio::test]
+async fn the_sdk_validator_applies_inherited_metadata_through_a_nested_ref() {
+    let registry = registry_with_derived_types();
+    let validator = read(&registry, DEPT)
+        .await
+        .compile_payload_validator()
+        .expect("compiles from the managed materialization");
+
+    let payload = |metadata| {
+        json!({
+            "parent_type": null, "membership_type": TEAM_MEMBER, "metadata": metadata
+        })
+    };
+    validator
+        .validate(&payload(json!({ "tier": "gold", "code": "ab" })))
+        .expect("conforms to the tenant and dept constraints");
+    for invalid in [
+        json!({"code": "ab"}),
+        json!({"tier": 7}),
+        json!({"tier": "gold", "code": "abcd"}),
+        json!("not an object"),
+    ] {
+        validator
+            .validate(&payload(invalid))
+            .expect_err("metadata constraints apply");
+    }
+}
+
+#[tokio::test]
+async fn imported_groups_resolve_the_schema_and_new_groups_keep_their_stored_binding() {
+    use resource_group::domain::error::DomainError;
+    use resource_group::domain::repo::GroupRepositoryTrait;
+    use resource_group::infra::storage::group_repo::GroupRepository;
+    use resource_group::infra::types_registry::RegistryTypeCatalog;
+    use resource_group_sdk::CreateGroupRequest;
+
+    let registry = Arc::new(registry());
+    registry.seed(USER, user_type());
+    registry.seed(
+        TEAM_MEMBER,
+        json!({
+            "$id": format!("gts://{TEAM_MEMBER}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "allOf": [
+                {"$ref": format!("gts://{MEMBER_V1}")},
+                {"properties": {"resource_type": {"type": "string", "const": USER}}}
+            ]
+        }),
+    );
+    let mut team_schema = json!({
+        "$id": format!("gts://{TEAM_SCHEMA}"),
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "allOf": [
+            {"$ref": format!("gts://{BASE}")},
+            {"properties": {"membership_type": {"type": "string", "const": TEAM_MEMBER}}}
+        ]
+    });
+    registry.seed(TEAM_SCHEMA, team_schema.clone());
+
+    let db = common::test_db().await;
+    let catalog = Arc::new(RegistryTypeCatalog::new(registry.clone()));
+    let groups = common::make_group_service_with(db.clone(), catalog.clone());
+    let members = common::make_membership_service_with(db.clone(), catalog);
+    let tenant = uuid::Uuid::new_v4();
+    let ctx = common::make_ctx(tenant);
+    let imported_id = uuid::Uuid::new_v4();
+    {
+        let conn = db.conn().expect("RG database");
+        let type_key = GroupRepository
+            .ensure_type_key(&conn, TEAM_SCHEMA)
+            .await
+            .expect("imported group type");
+        GroupRepository
+            .insert(
+                &conn,
+                imported_id,
+                None,
+                type_key,
+                None,
+                "Imported",
+                None,
+                tenant,
+            )
+            .await
+            .expect("pre-existing group without a binding column value");
+    }
+    members
+        .add_membership(&ctx, imported_id, USER, "imported-user")
+        .await
+        .expect("the existing row uses the published membership schema");
+    assert!(matches!(
+        members
+            .add_membership(&ctx, imported_id, TEAM_SCHEMA, "not-a-user")
+            .await,
+        Err(DomainError::Validation { .. })
+    ));
+    let team = groups
+        .create_group(
+            &ctx,
+            CreateGroupRequest::new(TEAM_SCHEMA, "Platform"),
+            tenant,
+        )
+        .await
+        .expect("team root");
+    let binding = GroupRepository
+        .find_model_by_id(&db.conn().expect("RG database"), team.id)
+        .await
+        .expect("read group")
+        .expect("stored group")
+        .membership_type;
+    assert_eq!(binding.as_deref(), Some(TEAM_MEMBER));
+
+    team_schema["allOf"][1]["properties"]
+        .as_object_mut()
+        .expect("group properties")
+        .remove("membership_type");
+    registry.seed(TEAM_SCHEMA, team_schema);
+    assert!(matches!(
+        groups
+            .create_group(
+                &ctx,
+                CreateGroupRequest::new(TEAM_SCHEMA, "Unbound"),
+                tenant
+            )
+            .await,
+        Err(DomainError::Validation { .. })
+    ));
+    members
+        .add_membership(&ctx, team.id, USER, "user-43")
+        .await
+        .expect("the group keeps its persisted binding");
+}
