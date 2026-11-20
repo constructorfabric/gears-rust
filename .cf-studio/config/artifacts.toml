@@ -1,4 +1,8 @@
 [[ignore]]
+reason = "Ignore API key while its exploratory proposal is the only documentation; register it after PRD and DESIGN are added."
+patterns = ["gears/api-key/*"]
+
+[[ignore]]
 reason = "Ignore graph-storage research companions for ADR-0001 (graph-engine evaluation, PG19 SQL/PGQ spike report) and the perf-lane method (PERF.md) — evidence and how-to documents, not Constructor Studio SDLC artifacts."
 patterns = [
   "gears/graph-storage/docs/graph-engine-alternatives.md",
