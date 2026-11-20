@@ -543,13 +543,13 @@ fn validate_endpoints_accepts_single() {
 }
 
 #[test]
-fn validate_endpoints_rejects_ipv6() {
+fn forbid_ipv6_endpoints_rejects_ipv6() {
     let endpoints = vec![Endpoint {
         scheme: Scheme::Https,
         host: "::1".into(),
         port: 443,
     }];
-    let err = validate_endpoints(&endpoints).unwrap_err();
+    let err = forbid_ipv6_endpoints(&endpoints).unwrap_err();
     match err {
         DomainError::Validation { detail, .. } => {
             assert!(
@@ -566,24 +566,24 @@ fn validate_endpoints_rejects_ipv6() {
 }
 
 #[test]
-fn validate_endpoints_rejects_ipv6_full_address() {
+fn forbid_ipv6_endpoints_rejects_ipv6_full_address() {
     let endpoints = vec![Endpoint {
         scheme: Scheme::Https,
         host: "2001:db8::1".into(),
         port: 8443,
     }];
-    let err = validate_endpoints(&endpoints).unwrap_err();
+    let err = forbid_ipv6_endpoints(&endpoints).unwrap_err();
     assert!(matches!(err, DomainError::Validation { .. }));
 }
 
 #[test]
-fn validate_endpoints_rejects_bracketed_ipv6() {
+fn forbid_ipv6_endpoints_rejects_bracketed_ipv6() {
     let endpoints = vec![Endpoint {
         scheme: Scheme::Https,
         host: "[2001:db8::1]".into(),
         port: 8443,
     }];
-    let err = validate_endpoints(&endpoints).unwrap_err();
+    let err = forbid_ipv6_endpoints(&endpoints).unwrap_err();
     match err {
         DomainError::Validation { detail, .. } => {
             assert!(
@@ -6783,6 +6783,65 @@ async fn update_upstream_ssrf_enabled_blocks_private_ip() {
         .await
         .unwrap_err();
     assert!(matches!(err, DomainError::Validation { .. }));
+}
+
+/// An IPv6 endpoint in a denied range is refused with its SSRF reason, not
+/// with the generic IPv6 refusal; other IPv6 endpoints still get that one.
+#[tokio::test]
+async fn create_upstream_names_the_ssrf_reason_for_a_denied_ipv6_endpoint() {
+    let ctx = test_ctx(Uuid::new_v4());
+    let detail = |err: DomainError| match err {
+        DomainError::Validation {
+            field: "",
+            reason: oagw_sdk::field::VALIDATION,
+            detail,
+            instance,
+        } if instance.is_empty() => detail,
+        other => panic!("expected a plain validation error, got: {other:?}"),
+    };
+
+    let guarded = make_service_ssrf_enabled();
+    for (host, reason) in [
+        ("[5f00::1]", "SRv6 segment identifier (5f00::/16)"),
+        ("[fec0::1]", "site-local address (fec0::/10)"),
+        (
+            "[64:ff9b:1::a00:1]",
+            "local-use NAT64 address (64:ff9b:1::/48)",
+        ),
+        (
+            "[4000::1]",
+            "address outside global unicast space (2000::/3)",
+        ),
+        ("[::808:808]", "deprecated IPv4-compatible address (::/96)"),
+    ] {
+        let err = guarded
+            .create_upstream(&ctx, make_create_upstream_with_ip(host, "denied-v6"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            detail(err),
+            format!("endpoint[0] IP address '{host}' is blocked by SSRF protection: {reason}")
+        );
+    }
+
+    let not_supported =
+        "endpoint[0] uses IPv6 address '[5f00::1]'; IPv6 endpoints are not yet supported";
+    let err = make_service()
+        .create_upstream(&ctx, make_create_upstream_with_ip("[5f00::1]", "denied-v6"))
+        .await
+        .unwrap_err();
+    assert_eq!(detail(err), not_supported, "SSRF off");
+    let err = guarded
+        .create_upstream(
+            &ctx,
+            make_create_upstream_with_ip("[2606:4700::1111]", "public-v6"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        detail(err),
+        "endpoint[0] uses IPv6 address '[2606:4700::1111]'; IPv6 endpoints are not yet supported"
+    );
 }
 
 // -- canonical tags and HTTP methods --

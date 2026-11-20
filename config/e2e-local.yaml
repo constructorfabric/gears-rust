@@ -618,7 +618,10 @@ gears:
       max_body_size_bytes: 1048576
       allow_http_upstream: true # Only for testing - do not enable in production without proper security controls
       ssrf_policy:
-        enabled: false # Disabled for e2e tests (mock upstreams use 127.0.0.1)
+        # Mock upstreams listen on loopback, or on the `mock` host in docker mode;
+        # everything else is denied as in production.
+        allow_cidrs: ["127.0.0.0/8", "::1/128"]
+        allow_hostnames: ["mock"]
 
   # Graph storage and Construct (only used when their features are built in:
   # `make openapi GEAR=graph-storage` or `GEAR=construct`)

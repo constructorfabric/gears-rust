@@ -68,6 +68,56 @@ fn ssrf_filter_reports_reason() {
     assert!(off.check("example.com", &addr(80)).is_ok());
 }
 
+/// A hostname resolving into a non-public IPv6 range is refused at connect
+/// time, by the pool's filter and by the fallback resolution alike.
+#[test]
+fn resolved_addresses_in_non_public_ipv6_ranges_are_refused() {
+    let guard = Arc::new(SsrfGuard::from_config(&Default::default()).unwrap());
+    let filter = SsrfFilter(Arc::clone(&guard));
+    let denied: [(SocketAddr, &str); 4] = [
+        (
+            "[4000::1]:443".parse().unwrap(),
+            "address outside global unicast space (2000::/3)",
+        ),
+        (
+            "[5f00::1]:443".parse().unwrap(),
+            "SRv6 segment identifier (5f00::/16)",
+        ),
+        (
+            "[fec0::1]:443".parse().unwrap(),
+            "site-local address (fec0::/10)",
+        ),
+        (
+            "[64:ff9b:1::a00:1]:443".parse().unwrap(),
+            "local-use NAT64 address (64:ff9b:1::/48)",
+        ),
+    ];
+    for (addr, reason) in denied {
+        assert_eq!(
+            filter.check("api.example.com", &addr),
+            Err(reason),
+            "{addr}"
+        );
+    }
+
+    let public: SocketAddr = "[2606:4700::1111]:443".parse().unwrap();
+    assert_eq!(filter.check("api.example.com", &public), Ok(()));
+    assert_eq!(
+        first_permitted_addr(
+            &guard,
+            "api.example.com",
+            denied.iter().map(|(a, _)| *a).chain([public])
+        ),
+        Ok(public)
+    );
+    assert_eq!(
+        first_permitted_addr(&guard, "api.example.com", denied.iter().map(|(a, _)| *a)),
+        Err(NoPermittedAddr::Refused(
+            "local-use NAT64 address (64:ff9b:1::/48)".to_owned()
+        ))
+    );
+}
+
 fn exempting(host: &str) -> SsrfGuard {
     SsrfGuard::from_config(&crate::domain::ssrf::SsrfPolicy {
         allow_hostnames: vec![host.into()],

@@ -245,25 +245,27 @@ Preflight returns a permissive 204 at the handler level (no upstream resolution)
 
 ### SSRF Protection Validation
 
-- [ ] `p1` - **ID**: `cpt-cf-oagw-algo-obs-ssrf-protection`
+- [x] `p1` - **ID**: `cpt-cf-oagw-algo-obs-ssrf-protection`
 
-**Input**: Resolved upstream endpoint (scheme, host, port), inbound request headers
+**Input**: Upstream endpoints (scheme, host, port) on write and on proxy; the addresses an endpoint host resolves to on connect; inbound request headers, path and query
 
 **Output**: Validation result (pass or reject with error)
 
+The SSRF policy is the gear option `ssrf_policy` (on by default; `enabled: false` skips steps 3 and 4). DESIGN lists the denied ranges and how IPv4 and IPv6 CIDRs match each address family ([Security Considerations](../DESIGN.md#security-considerations)).
+
 **Steps**:
-1. [ ] - `p1` - Validate scheme against allowlist - `inst-ssrf-1`
-2. [ ] - `p1` - **IF** scheme is not HTTPS (MVP constraint: HTTPS-only) - `inst-ssrf-2`
-   1. [ ] - `p1` - **RETURN** reject with 400 ValidationError: "Only HTTPS upstreams are allowed" - `inst-ssrf-2a`
-3. [ ] - `p1` - Resolve DNS for upstream host - `inst-ssrf-3`
-4. [ ] - `p1` - **IF** resolved IP is in private/reserved ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 169.254.0.0/16, ::1, fc00::/7) - `inst-ssrf-4`
-   1. [ ] - `p1` - **IF** IP is not in explicitly configured allowed_internal_segments - `inst-ssrf-4a`
-      1. [ ] - `p1` - **RETURN** reject with 400 ValidationError: "Upstream resolves to disallowed IP range" - `inst-ssrf-4a1`
+1. [x] - `p1` - Validate the endpoint scheme on upstream create, update and registry reconcile, and again in the proxy before the auth plugin runs, for upstreams stored earlier - `inst-ssrf-1`
+2. [x] - `p1` - **IF** the scheme is `http` and the gear option `allow_http_upstream` is off (the default: HTTPS-only) - `inst-ssrf-2`
+   1. [x] - `p1` - **RETURN** reject with 400 `invalid_argument`, field `server.endpoints.scheme`, reason `HTTP_UPSTREAM_FORBIDDEN` - `inst-ssrf-2a`
+3. [x] - `p1` - On write, check every endpoint host: a denied hostname (`localhost`, `localhost.localdomain`, `extra_deny_hostnames`; not in `allow_hostnames`) or an IP address in a denied range (built-in list, `extra_deny_cidrs`; not in `allow_cidrs`) is rejected with 400: "endpoint[i] IP address '…' is blocked by SSRF protection: <reason>" or "endpoint[i] hostname '…' is blocked by SSRF protection (matches '…')". The hostname check runs again on every alias resolution - `inst-ssrf-3`
+4. [x] - `p1` - On connect, check every address the endpoint host resolves to, on every resolution (DNS rebinding); IP literals are checked the same way - `inst-ssrf-4`
+   1. [x] - `p1` - **IF** the address is in a denied range and not in `allow_cidrs`; an `allow_hostnames` entry lifts the deny for its hostname's addresses, except loopback, unspecified, link-local, multicast, broadcast and cloud metadata addresses - `inst-ssrf-4a`
+      1. [x] - `p1` - Skip the address and log the reason; **IF** every address is refused, **RETURN** an upstream connection error without connecting (503 for a single endpoint, 502 for a pool) - `inst-ssrf-4a1`
 5. [x] - `p1` - Strip well-known internal headers from outbound request - `inst-ssrf-5`
    1. [x] - `p1` - Remove: `Forwarded`, `Via`, `X-Forwarded*`, `X-Envoy-*`, `X-ProxyUser-Ip`, `*Client-IP`, `X-Real-IP`, `X-Originating-IP`, `X-Remote-IP`, `X-Remote-Addr`, `CF-Connecting-IP`, `X-Original-Forwarded-For`, URL/host override (`X-Original-URL`, `X-Original-URI`, `X-Rewrite-URL`, `X-Original-Host`, `X-Host`) and method override (`X-HTTP-Method-Override`, `X-HTTP-Method`, `X-Method-Override`) headers (unless explicitly allowed: the upstream's `passthrough_allowlist` names the header; `passthrough: all` does not count) - `inst-ssrf-5a`
 6. [x] - `p1` - Validate request path against route configuration: resolve literal `.` and `..` segments before route matching, and reject with 400 a segment that is a dot-segment once percent-decoded (`%2e%2e`, `..%2f`, `..\\`, `..;`, double encoding, non-UTF-8 escapes) - `inst-ssrf-6`
-7. [ ] - `p1` - Validate query parameters against route `query_allowlist` if configured - `inst-ssrf-7`
-8. [ ] - `p1` - **RETURN** pass (request is safe to forward) - `inst-ssrf-8`
+7. [x] - `p1` - Validate query parameters against the route's `query_allowlist`: a parameter it does not name is rejected with 400, reason `QUERY_NOT_ALLOWED` - `inst-ssrf-7`
+8. [x] - `p1` - **RETURN** pass (request is safe to forward) - `inst-ssrf-8`
 
 ### HTTP Smuggling Prevention
 
@@ -411,14 +413,15 @@ Configuration **MUST** support: `allowed_origins`, `allowed_methods`. Origin mat
 
 ### Implement SSRF Protection
 
-- [ ] `p1` - **ID**: `cpt-cf-oagw-dod-obs-ssrf-protection`
+- [x] `p1` - **ID**: `cpt-cf-oagw-dod-obs-ssrf-protection`
 
 The system **MUST** enforce SSRF protection on all outbound requests:
-- Scheme allowlist: HTTPS-only for MVP (`cpt-cf-oagw-constraint-https-only`)
-- IP pinning: reject DNS results resolving to private/reserved IP ranges unless explicitly allowed
-- Header stripping: remove internal forwarding headers (`X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`, `X-Real-IP`) from outbound requests unless explicitly allowed
+- Scheme allowlist: HTTPS-only unless `allow_http_upstream` is on (`cpt-cf-oagw-constraint-https-only`), checked on write and in the proxy
+- Write-time check: an endpoint whose hostname is denied or whose IP address is in a denied range is rejected with 400 unless `allow_hostnames` / `allow_cidrs` exempts it
+- Connect-time check: every resolved address is checked on every resolution, and a refused one is never connected to; `allow_hostnames` never exempts loopback, link-local or metadata addresses
+- Header stripping: remove forwarding and override headers (`Forwarded`, `X-Forwarded-*`, `X-Real-IP` and the rest of `inst-ssrf-5a`) received from the client unless the upstream's `passthrough_allowlist` names them
 - Path validation: reject path traversal sequences (`../`, `..\\`, encoded variants)
-- Query validation: validate against route `query_allowlist` if configured
+- Query validation: reject query parameters the route's `query_allowlist` does not name
 
 **Implements**:
 - `cpt-cf-oagw-algo-obs-ssrf-protection`
@@ -475,10 +478,11 @@ A failed or slow change log append **MUST NOT** fail the write: it is logged at 
 - [ ] CORS preflight OPTIONS requests return permissive 204 at handler level without upstream resolution (see [ADR: CORS](../ADR/0006-cors.md))
 - [ ] CORS is disabled by default; only explicitly configured origins are allowed
 - [ ] Unrecognized origins on actual requests are rejected with 403 before reaching the upstream
-- [ ] HTTPS-only scheme enforcement blocks non-HTTPS upstream connections
-- [ ] DNS results resolving to private/reserved IP ranges are rejected (unless explicitly allowed)
-- [ ] Internal forwarding headers are stripped from outbound requests
-- [ ] Path traversal sequences are rejected
+- [x] HTTPS-only scheme enforcement rejects `http` endpoints on write and in the proxy unless `allow_http_upstream` is on
+- [x] An endpoint IP address in a denied range is rejected on write with 400 naming the range (unless `allow_cidrs` exempts it)
+- [x] Resolved addresses in a denied range are refused on connect (unless explicitly allowed)
+- [x] Forwarding and override headers from the client are stripped from outbound requests
+- [x] Path traversal sequences are rejected
 - [ ] Requests with ambiguous CL/TE combinations are rejected
 - [ ] Bare CR/LF characters in headers are rejected
 - [ ] With a database, a repeated proxy lookup is served from the proxy configuration cache with no database query, and returns what an uncached lookup returns

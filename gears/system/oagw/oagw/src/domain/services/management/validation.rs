@@ -90,6 +90,7 @@ fn validate_upstream_content(
     validate_endpoints(endpoints)?;
     forbid_http_endpoints(endpoints, allow_http, "")?;
     validate_endpoints_ssrf(ssrf, endpoints)?;
+    forbid_ipv6_endpoints(endpoints)?;
     if let Some(cors) = cors {
         crate::domain::cors::validate_cors_config(cors)?;
     }
@@ -532,19 +533,6 @@ pub(in crate::domain::services) fn validate_endpoints(
         }
     }
 
-    // IPv6 endpoints are not yet supported — reject early with a clear message.
-    // SSRF protections for IPv6 (link-local, ULA, IPv4-mapped, etc.) are in
-    // place (`ssrf.rs`), but the proxy and endpoint infrastructure has not been
-    // tested with IPv6 upstream addresses yet.
-    for (i, ep) in endpoints.iter().enumerate() {
-        if ep.normalized_host().parse::<std::net::Ipv6Addr>().is_ok() {
-            return Err(DomainError::validation(format!(
-                "endpoint[{i}] uses IPv6 address '{}'; IPv6 endpoints are not yet supported",
-                ep.host
-            )));
-        }
-    }
-
     // Check all-IP vs all-hostname consistency.
     let ip_count = endpoints.iter().filter(|ep| ep.is_ip()).count();
     if ip_count != 0 && ip_count != endpoints.len() {
@@ -580,6 +568,23 @@ pub(in crate::domain::services) fn validate_endpoints(
         }
     }
 
+    Ok(())
+}
+
+/// Refuse IPv6 address endpoints: the proxy has not been tested with IPv6
+/// upstreams yet. Runs after the SSRF check, so an address in a denied range
+/// is refused with its SSRF reason.
+pub(in crate::domain::services) fn forbid_ipv6_endpoints(
+    endpoints: &[Endpoint],
+) -> Result<(), DomainError> {
+    for (i, ep) in endpoints.iter().enumerate() {
+        if ep.normalized_host().parse::<std::net::Ipv6Addr>().is_ok() {
+            return Err(DomainError::validation(format!(
+                "endpoint[{i}] uses IPv6 address '{}'; IPv6 endpoints are not yet supported",
+                ep.host
+            )));
+        }
+    }
     Ok(())
 }
 

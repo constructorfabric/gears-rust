@@ -58,7 +58,7 @@ use validation::{
 #[cfg(test)]
 use {
     budget::validate_budget_config,
-    validation::{validate_endpoints, validate_endpoints_ssrf},
+    validation::{forbid_ipv6_endpoints, validate_endpoints, validate_endpoints_ssrf},
 };
 
 use async_trait::async_trait;

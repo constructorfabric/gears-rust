@@ -227,7 +227,9 @@ async def test_update_hostname_upstream_to_ip_rejected(
             f"{oagw_base_url}/oagw/v1/upstreams/{upstream['id']}",
             headers=oagw_headers,
             json={
-                "server": {"endpoints": [{"scheme": "https", "host": "10.0.0.1", "port": 443}]},
+                # A public address: a private one is refused by the SSRF check first.
+                # The PUT is refused, so nothing connects to it.
+                "server": {"endpoints": [{"scheme": "https", "host": "8.8.8.8", "port": 443}]},
                 "protocol": HTTP_PROTOCOL_ID,
                 # A PUT must carry `enabled` and `tags` or it is a 422 (M-03).
                 "enabled": True,
