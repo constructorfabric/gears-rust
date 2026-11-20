@@ -12,13 +12,11 @@ use common::{create_root_type, make_ctx, make_group_service, make_membership_ser
 use toolkit_odata::ODataQuery;
 use uuid::Uuid;
 
+use common::CreateTypeRequest;
 use resource_group::domain::error::DomainError;
-use resource_group::domain::type_service::TypeService;
 use resource_group::infra::storage::entity::resource_group_membership::{
     Column as MbrColumn, Entity as MbrEntity,
 };
-use resource_group::infra::storage::type_repo::TypeRepository;
-use resource_group_sdk::CreateTypeRequest;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use toolkit_db::secure::SecureEntityExt;
 use toolkit_gts::{GTS_ID_PREFIX, gts_id};
@@ -26,12 +24,12 @@ use toolkit_security::AccessScope;
 
 /// Helper: create a root type that allows the given membership type paths.
 async fn create_type_with_memberships(
-    type_svc: &TypeService<TypeRepository>,
+    type_svc: &common::TestTypes,
     suffix: &str,
     memberships: &[&str],
-) -> resource_group_sdk::ResourceGroupType {
+) -> common::ResourceGroupType {
     let code = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.{}{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.group.v1~x.test.{}.i{}.v1~",
         suffix,
         Uuid::now_v7().as_simple()
     );
@@ -138,15 +136,16 @@ async fn membership_add_duplicate() {
         .await
         .expect_err("duplicate add should fail");
 
-    assert!(
-        matches!(
-            err,
-            DomainError::Conflict { .. }
-                | DomainError::ConflictActiveReferences { .. }
-                | DomainError::DuplicateMembership { .. }
-        ),
-        "expected Conflict, ConflictActiveReferences, or DuplicateMembership, got: {err:?}"
-    );
+    // The duplicate names the member type by its GTS identifier, never by
+    // its dictionary key.
+    let expected = format!("({}, {}, res-dup)", group.id, member_type.code);
+    match err {
+        DomainError::DuplicateMembership { key, message } => {
+            assert_eq!(key, expected);
+            assert_eq!(message, format!("Membership already exists: {expected}"));
+        }
+        other => panic!("expected DuplicateMembership, got: {other:?}"),
+    }
 }
 
 // TC-MBR-04: Unregistered resource_type
@@ -188,7 +187,7 @@ async fn membership_add_unregistered_resource_type() {
 
 // TC-MBR-05: resource_type not in allowed_membership_types
 #[tokio::test]
-async fn membership_add_not_in_allowed_membership_types() {
+async fn membership_add_rejects_a_type_excluded_by_the_schema() {
     let db = test_db().await;
     let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
@@ -215,8 +214,8 @@ async fn membership_add_not_in_allowed_membership_types() {
         "expected Validation, got: {err:?}"
     );
     assert!(
-        format!("{err:?}").contains("not in allowed_membership_types"),
-        "error should mention allowed_membership_types: {err:?}"
+        format!("{err:?}").contains("Payload does not match type"),
+        "the bound schema must reject the payload: {err:?}"
     );
 }
 
@@ -400,14 +399,13 @@ async fn membership_empty_resource_id() {
     let grp_type = create_type_with_memberships(&type_svc, "grp", &[&member_type.code]).await;
     let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G1", tenant).await;
 
-    // Document behavior: empty resource_id is accepted (no domain validation on it)
-    let result = mbr_svc
+    let error = mbr_svc
         .add_membership(&ctx, group.id, &member_type.code, "")
-        .await;
-    // The service does not validate resource_id content, so this should succeed
+        .await
+        .expect_err("the resource identifier is required");
     assert!(
-        result.is_ok(),
-        "empty resource_id is accepted by the domain: {result:?}"
+        matches!(error, DomainError::Validation { ref message } if message.contains("resource_id")),
+        "{error:?}"
     );
 }
 
@@ -426,6 +424,8 @@ async fn membership_remove_unregistered_resource_type() {
     let grp_type = create_type_with_memberships(&type_svc, "grp", &[&member_type.code]).await;
     let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G1", tenant).await;
 
+    // Removal is keyed by the stored identifier and never asks the types
+    // registry, so an unknown type is simply a membership that is not there.
     let err = mbr_svc
         .remove_membership(
             &ctx,
@@ -434,21 +434,17 @@ async fn membership_remove_unregistered_resource_type() {
             "res-001",
         )
         .await
-        .expect_err("remove with unregistered type should fail");
+        .expect_err("no such membership");
 
     assert!(
-        matches!(err, DomainError::Validation { .. }),
-        "expected Validation, got: {err:?}"
-    );
-    assert!(
-        format!("{err:?}").contains("Unknown resource type"),
-        "error should mention unknown resource type: {err:?}"
+        matches!(err, DomainError::MembershipNotFound { .. }),
+        "expected MembershipNotFound, got: {err:?}"
     );
 }
 
 // TC-MBR-13: Empty allowed_membership_types rejects all
 #[tokio::test]
-async fn membership_empty_allowed_membership_types_rejects_all() {
+async fn a_membership_schema_can_exclude_all_resource_types() {
     let db = test_db().await;
     let type_svc = common::make_type_service(db.clone());
     let group_svc = make_group_service(db.clone());
@@ -465,15 +461,15 @@ async fn membership_empty_allowed_membership_types_rejects_all() {
     let err = mbr_svc
         .add_membership(&ctx, group.id, &member_type.code, "res-001")
         .await
-        .expect_err("empty allowed_membership_types should reject");
+        .expect_err("the schema excludes every member type");
 
     assert!(
         matches!(err, DomainError::Validation { .. }),
         "expected Validation, got: {err:?}"
     );
     assert!(
-        format!("{err:?}").contains("not in allowed_membership_types"),
-        "error should mention allowed_membership_types: {err:?}"
+        format!("{err:?}").contains("Payload does not match type"),
+        "the bound schema must reject the payload: {err:?}"
     );
 }
 

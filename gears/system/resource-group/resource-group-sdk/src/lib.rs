@@ -3,13 +3,11 @@
 //! Resource Group SDK
 //!
 //! This crate provides the public API for the `resource-group` gear:
-//! - `ResourceGroupClient` / `ResourceGroupReadHierarchy` /
-//!   `ResourceGroupTypeBootstrap` traits (boundary returns
-//!   [`toolkit_canonical_errors::CanonicalError`] per [ADR 0005][adr]).
-//!   `ResourceGroupTypeBootstrap` is a narrow, un-gated surface for
-//!   deployment-time type-registry bootstrap from another gear's `init` —
-//!   see its own doc comment for why it bypasses `PolicyEnforcer`.
-//! - Model types for GTS types, groups, memberships
+//! - `ResourceGroupClient` / `ResourceGroupReadHierarchy` traits (boundary
+//!   returns [`toolkit_canonical_errors::CanonicalError`] per [ADR 0005][adr]).
+//! - The RG base type `gts.cf.core.rg.group.v1~` and its placement traits
+//!   ([`gts`]); RG type definitions live only in the types registry.
+//! - Model types for groups and memberships
 //! - [`ResourceGroupError`] — opt-in `From<CanonicalError>` projection
 //!   (see [`error`]) plus its co-located wire vocabulary ([`field`],
 //!   [`precondition`], [`reason`], [`gts`])
@@ -19,6 +17,8 @@
 
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
+
+toolkit_gts::declare_gts_inventory!();
 
 pub mod api;
 pub mod error;
@@ -33,13 +33,11 @@ pub mod reason;
 pub mod odata;
 
 // Re-export main types at crate root for convenience
-pub use api::{ResourceGroupClient, ResourceGroupReadHierarchy, ResourceGroupTypeBootstrap};
+pub use api::{ResourceGroupClient, ResourceGroupReadHierarchy};
 pub use error::ResourceGroupError;
-pub use gts::{
-    GROUP_MEMBERSHIP_RESOURCE_TYPE, GROUP_RESOURCE_TYPE, TENANT_RG_TYPE_PATH, TYPE_RESOURCE_TYPE,
-};
+pub use gts::{GROUP_MEMBERSHIP_TYPE_ID, GROUP_TYPE_ID, TENANT_GROUP_TYPE_ID};
 pub use models::{
-    CreateGroupRequest, CreateTypeRequest, GroupHierarchy, GroupHierarchyWithDepth, GtsTypePath,
-    ResourceGroup, ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth,
-    UpdateGroupRequest, UpdateTypeRequest,
+    CreateGroupRequest, GroupHierarchy, GroupHierarchyWithDepth, GtsTypePath,
+    MAX_MEMBERSHIP_RESOURCE_ID_BYTES, ResourceGroup, ResourceGroupMembership,
+    ResourceGroupWithDepth, UpdateGroupRequest,
 };

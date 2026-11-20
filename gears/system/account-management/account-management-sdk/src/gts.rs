@@ -47,7 +47,8 @@ pub const CONVERSION_REQUEST_RESOURCE_TYPE: &str = gts_id!("cf.core.am.conversio
 /// `gears/system/account-management/docs/schemas/user.v1.schema.json`
 /// and produced by [`crate::IdpUser`]. Surfaces as the `resource_type`
 /// on user-scoped canonical errors raised by the user-operations
-/// feature (`feature-idp-user-operations-contract`).
+/// feature (`feature-idp-user-operations-contract`) and on users' Resource Group
+/// memberships.
 pub const USER_RESOURCE_TYPE: &str = gts_id!("cf.core.am.user.v1~");
 
 /// AM **service account** resource — the tenant-scoped machine
@@ -69,18 +70,7 @@ pub const USER_RESOURCE_TYPE: &str = gts_id!("cf.core.am.user.v1~");
 /// classified, so neither can stand in for the other.
 pub const SERVICE_ACCOUNT_RESOURCE_TYPE: &str = gts_id!("cf.core.am.service_account.v1~");
 
-// ---------------------------------------------------------------------------
-// IdpUser-groups feature -- two flavours of identifiers
-// ---------------------------------------------------------------------------
-//
-// Two related identifier forms:
-// - AM resource-type names (for PEP / canonical envelopes).
-// - RG-prefixed type codes (required by RG's `validate_type_code`).
-//
-// Both are exported as crate constants so sibling crates import them by
-// name instead of hard-coding strings.
-
-/// RG type-registry code for the AM user-group **container** type.
+/// Registry-owned RG type identifier for the AM user-group **container** type.
 ///
 /// Used by:
 ///
@@ -88,28 +78,12 @@ pub const SERVICE_ACCOUNT_RESOURCE_TYPE: &str = gts_id!("cf.core.am.service_acco
 ///   list user-groups (optionally combined with `tenant_id eq <t>`).
 /// * `ResourceGroupClient::create_group({code: <this>, ...})` -- to
 ///   create a new user-group instance.
-/// * AM's `register_user_group_types` at gear init.
+/// * AM's `UserGroupTypeV1` GTS declaration, published with AM's
+///   types-registry manifest.
 ///
-/// The string lives in RG's type-registry namespace
-/// (`gts.cf.core.rg.type.v1~` prefix) as required by RG's
-/// `validate_type_code`.
-pub const USER_GROUP_RG_TYPE_CODE: &str = gts_id!("cf.core.rg.type.v1~cf.core.am.user_group.v1~");
-
-/// RG type-registry code for the AM user **member-handle** type.
-///
-/// Used by:
-///
-/// * `ResourceGroupClient::add_membership(group_id, <this>, user_uuid)`
-///   -- to add an AM user as a member of a user-group.
-/// * `ResourceGroupClient::remove_membership(group_id, <this>, user_uuid)`
-///   -- to remove a user from a group.
-/// * `ResourceGroupClient::list_memberships($filter=resource_type eq <this>)`
-///   -- to enumerate user→group links (e.g. "what groups is user X in").
-///
-/// This is a type-registry-only entry; AM users themselves live in
-/// AM's tables + `IdP`, never as RG groups. Wraps
-/// [`USER_RESOURCE_TYPE`] in the RG type-registry namespace.
-pub const USER_RG_TYPE_CODE: &str = gts_id!("cf.core.rg.type.v1~cf.core.am.user.v1~");
+/// The string lives in RG's type namespace (`gts.cf.core.rg.group.v1~`
+/// prefix), which Resource Group requires of every group type.
+pub const USER_GROUP_RG_TYPE_CODE: &str = gts_id!("cf.core.rg.group.v1~cf.core.am.user_group.v1~");
 
 // ---------------------------------------------------------------------------
 // AM base envelope schema registration

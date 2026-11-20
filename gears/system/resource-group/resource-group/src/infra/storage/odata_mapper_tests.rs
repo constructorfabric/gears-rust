@@ -1,16 +1,6 @@
 // Created: 2026-04-16 by Constructor Tech
 use super::*;
 
-// TC-ODATA-06: TypeODataMapper field -> column
-#[test]
-fn type_odata_mapper_field_to_column() {
-    let col = TypeODataMapper::map_field(TypeFilterField::Code);
-    assert!(
-        matches!(col, TypeColumn::SchemaId),
-        "Expected TypeColumn::SchemaId, got: {col:?}"
-    );
-}
-
 // TC-ODATA-07: GroupODataMapper field -> column
 #[test]
 fn group_odata_mapper_field_to_column() {

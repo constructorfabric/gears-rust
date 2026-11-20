@@ -11,7 +11,7 @@
 - [1. Overview](#1-overview)
 - [2. Entries](#2-entries)
   - [2.1 SDK Contracts, Error Types & Gear Foundation &mdash; HIGH](#21-sdk-contracts-error-types--gear-foundation-mdash-high)
-  - [2.2 GTS Type Management &mdash; HIGH](#22-gts-type-management-mdash-high)
+  - [2.2 Registry-Owned Type Contracts (HIGH)](#22-registry-owned-type-contracts-high)
   - [2.3 Group Entity & Hierarchy Engine &mdash; HIGH](#23-group-entity--hierarchy-engine-mdash-high)
   - [2.4 Membership Management &mdash; MEDIUM](#24-membership-management-mdash-medium)
   - [2.5 Integration Read Port & Dual Authentication Modes &mdash; MEDIUM](#25-integration-read-port--dual-authentication-modes-mdash-medium)
@@ -42,10 +42,10 @@ The Resource Group DESIGN is decomposed into seven features organized around the
 - **Depends On**: None
 
 - **Scope**:
-  - SDK crate (`resource-group-sdk`): `models.rs` (ResourceGroupType, ResourceGroup, ResourceGroupWithDepth, ResourceGroupMembership, Page, PageInfo, GtsTypePath), `api.rs` (ResourceGroupClient, ResourceGroupReadHierarchy, ResourceGroupReadPluginClient traits), `error.rs` (ResourceGroupError taxonomy)
+  - SDK crate (`resource-group-sdk`): `models.rs` (ResourceGroup, ResourceGroupWithDepth, ResourceGroupMembership, Page, PageInfo, GtsTypePath), `api.rs` (ResourceGroupClient, ResourceGroupReadHierarchy traits), `error.rs` (ResourceGroupError taxonomy)
   - Gear scaffold: `#[toolkit::gear]` annotated gear, ClientHub registration for `dyn ResourceGroupClient` and `dyn ResourceGroupReadHierarchy`
-  - Persistence adapter: SeaORM entity definitions for all 6 tables (gts_type, gts_type_allowed_parent, gts_type_allowed_membership, resource_group, resource_group_membership, resource_group_closure), DB migration scripts
-  - Error mapping: DomainError to Problem (RFC-9457) mapping for all deterministic error categories (Validation, NotFound, TypeAlreadyExists, InvalidParentType, CycleDetected, ConflictActiveReferences, LimitViolation, TenantIncompatibility, ServiceUnavailable, Internal)
+  - Persistence adapter: SeaORM entities for the three group, membership and closure tables, plus database migrations preserving numeric GTS type keys
+  - Error mapping: DomainError to Problem (RFC-9457) mapping for validation, not-found, failed-precondition, conflict, authentication, dependency and internal error categories
   - REST infrastructure: OperationBuilder wiring, OData `$filter` parsing, cursor-based pagination helpers
   - GtsTypePath value object with format validation (`^gts\.[a-z_]...~$`)
   - gear initialization phasing (SystemCapability → ready) for circular dependency resolution with AuthZ
@@ -78,10 +78,10 @@ The Resource Group DESIGN is decomposed into seven features organized around the
   - [x] `p1` - `cpt-cf-resource-group-constraint-no-authz-decision`
   - [x] `p1` - `cpt-cf-resource-group-constraint-no-sql-filter-generation`
   - [x] `p1` - `cpt-cf-resource-group-constraint-db-agnostic`
-  - [x] `p1` - `cpt-cf-resource-group-constraint-surrogate-ids-internal`
+  - [x] `p1` - `cpt-cf-resource-group-constraint-gts-identifiers`
 
 - **Domain Model Entities**:
-  - ResourceGroupType
+  - RgType (operation-local registry snapshot)
   - ResourceGroup (ResourceGroupEntity)
   - ResourceGroupMembership
   - ResourceGroupClosure
@@ -101,65 +101,40 @@ The Resource Group DESIGN is decomposed into seven features organized around the
 
   - `cpt-cf-resource-group-seq-init-order`
 
-### 2.2 GTS Type Management &mdash; HIGH
+### 2.2 Registry-Owned Type Contracts (HIGH)
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-feature-type-management`
 
-- **Purpose**: Implement the full type lifecycle (create, list, get, update, delete) with code format validation, uniqueness enforcement, hierarchy-safe updates, delete-if-unused policy, and idempotent type seeding for deployment bootstrapping.
-
+- **Purpose**: Publish the RG base schema, consume caller-scoped registry
+  materializations and validate group payloads and placement through the public SDK.
 - **Depends On**: `cpt-cf-resource-group-feature-sdk-gear-foundation`
-
 - **Scope**:
-  - Type service: create/list/get/update/delete type operations with domain validation
-  - Type code validation: length 1..63, no whitespace, case-insensitive uniqueness via `schema_id` unique constraint
-  - Duplicate rejection: deterministic `TypeAlreadyExists` on conflict
-  - Hierarchy-safe updates: reject removal of `allowed_parents` or `can_be_root` changes when existing groups would violate new rules (`AllowedParentsViolation`)
-  - Delete safety: reject type deletion when entities of that type exist
-  - Type REST endpoints: CRUD under `/api/types-registry/v1/types` with OData `$filter` on `code` field
-  - allowed_parents and allowed_memberships junction table management (gts_type_allowed_parent, gts_type_allowed_membership)
-  - Type data seeding: idempotent seed operation for bootstrapping (missing types created, existing types updated)
-  - GTS type path ↔ SMALLINT surrogate ID resolution at persistence boundary
-  - Placement invariant enforcement: `can_be_root OR len(allowed_parents) >= 1`
-
-- **Out of scope**:
-  - Group entity operations (feature 3)
-  - GTS schema catalog integration with Types Registry gear (Phase 3 architecture evolution)
-
+  - Managed publication of the RG base type before application initialization.
+  - Consumer-owned publication of derived group and membership types.
+  - RgTypeCatalog backed by TypesRegistryApi; reads and SDK payload validation
+    occur before database write transactions.
+  - `gts_type` kept as a local identity dictionary (SMALLINT key ↔ GTS
+    identifier) behind the existing foreign keys; migration preserves keys, rows
+    and hierarchy while removing the local definitions.
+  - Registry retirement semantics for active writes, retained definitions and cleanup.
+- **Out of scope**: Local type CRUD, type tables and the removed bootstrap API.
 - **Requirements Covered**:
-
   - [x] `p1` - `cpt-cf-resource-group-fr-manage-types`
   - [x] `p1` - `cpt-cf-resource-group-fr-validate-type-code`
   - [x] `p1` - `cpt-cf-resource-group-fr-reject-duplicate-type`
   - [x] `p1` - `cpt-cf-resource-group-fr-seed-types`
   - [x] `p1` - `cpt-cf-resource-group-fr-validate-type-update-hierarchy`
   - [x] `p1` - `cpt-cf-resource-group-fr-delete-type-only-if-empty`
-
 - **Design Principles Covered**:
-
   - [x] `p1` - `cpt-cf-resource-group-principle-dynamic-types`
-
 - **Design Constraints Covered**:
-
-  None (type management relies on foundation constraints from feature 1)
-
-- **Domain Model Entities**:
-  - ResourceGroupType
-  - GtsTypePath
-
+  - [x] `p1` - `cpt-cf-resource-group-constraint-gts-identifiers`
+- **Domain Model Entities**: RgType, GtsTypePath.
 - **Design Components**:
-
-  - [x] `p1` - `cpt-cf-resource-group-component-type-service`
-
-- **API**:
-  - GET /api/types-registry/v1/types
-  - POST /api/types-registry/v1/types
-  - GET /api/types-registry/v1/types/{code}
-  - PUT /api/types-registry/v1/types/{code}
-  - DELETE /api/types-registry/v1/types/{code}
-
-- **Sequences**:
-
-  None (type operations are straightforward CRUD without complex multi-component interactions)
+  - [x] `p1` - `cpt-cf-resource-group-component-type-catalog`
+- **API**: Types Registry platform publication and caller-scoped SDK reads;
+  RG mounts no type-management routes.
+- **Sequences**: `cpt-cf-resource-group-seq-init-order`.
 
 ### 2.3 Group Entity & Hierarchy Engine &mdash; HIGH
 
@@ -172,7 +147,7 @@ The Resource Group DESIGN is decomposed into seven features organized around the
 - **Scope**:
   - Entity service: create/get/update (PUT full replace)/move/delete group operations with domain validation
   - Forest integrity: cycle detection and single-parent validation inside SERIALIZABLE write transactions
-  - Parent type compatibility: validate parent-child type rules on create, move, and type change (including validation that children's types still permit the new type in their `allowed_parents`)
+  - Parent type compatibility: validate `parent_type` against the group schema on create and move. The group type is immutable.
   - Entity delete safety: reject when active references (children, memberships) prevent removal per configured deletion policy
   - Closure table engine: self-row creation on entity insert, ancestor-descendant row computation on parent assignment, subtree move with full path rebuild (delete old paths + insert new paths), cascade closure row removal on entity delete
   - Hierarchy queries: ancestors/descendants ordered by depth via indexed closure table lookups
@@ -180,7 +155,7 @@ The Resource Group DESIGN is decomposed into seven features organized around the
   - Query profile enforcement: configurable `max_depth`/`max_width` on writes, no truncation on reads for already-existing data, deterministic `DepthLimitExceeded`/`WidthLimitExceeded` errors
   - Group REST endpoints: CRUD under `/api/resource-group/v1/groups` with OData `$filter` on `type`, `hierarchy/parent_id`, `tenant_id`, `id`, `name`
   - Force delete: optional `?force=true` for cascade deletion of subtree and associated memberships
-  - Group data seeding: idempotent seed with parent-child link and type compatibility validation
+  - Consumer bootstrap through normal group operations with parent-child and type compatibility validation
   - Write concurrency: SERIALIZABLE isolation with bounded retry for serialization conflicts
 
 - **Out of scope**:
@@ -243,7 +218,7 @@ The Resource Group DESIGN is decomposed into seven features organized around the
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-feature-membership`
 
-- **Purpose**: Implement membership lifecycle (add, remove, list) with composite key semantics, deterministic lookups by group and by resource, tenant compatibility validation derived from the referenced group, and idempotent membership seeding.
+- **Purpose**: Implement membership lifecycle (add, remove, list) with composite key semantics, deterministic lookups by group and by resource, tenant compatibility validation derived from the referenced group, and consumer bootstrap through normal membership operations.
 
 - **Depends On**: `cpt-cf-resource-group-feature-sdk-gear-foundation`, `cpt-cf-resource-group-feature-entity-hierarchy`
 
@@ -253,8 +228,8 @@ The Resource Group DESIGN is decomposed into seven features organized around the
   - Membership REST endpoints: list/add/remove under `/api/resource-group/v1/memberships` with OData `$filter` on `resource_id`, `resource_type`, `group_id`
   - Tenant compatibility: tenant scope derived from group's `tenant_id` via JOIN, reject tenant-incompatible membership writes when resource already linked in incompatible tenant
   - GTS type path resolution for `resource_type` via surrogate ID at persistence boundary
-  - allowed_memberships validation: reject if `resource_type` is not in the group type's allowed_memberships
-  - Membership data seeding: idempotent seed with group existence and tenant compatibility validation
+  - Validate the candidate’s `resource_type` against the active membership schema selected by the group type’s `membership_type` trait
+  - Consumer bootstrap through normal membership operations with group existence and tenant compatibility validation
   - Active reference integration: membership references block entity deletion in feature 3 (unless force delete)
   - Data lifecycle: cascade-delete memberships on tenant deprovisioning
 

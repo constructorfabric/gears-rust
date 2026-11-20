@@ -12,7 +12,7 @@
 //!   (a parent's cascade may have eaten the descendant already).
 //! * RG unavailable during list → `Retryable`.
 //! * RG unavailable during cascade → `Retryable`.
-//! * Listed non-root groups → skipped (only roots are cascaded).
+//! * Groups with listed parents → skipped, as the parent cascade covers them.
 //!
 //! The fake's `list_groups` runs the listed query through
 //! [`convert_expr_to_filter_node`] against RG's own
@@ -34,9 +34,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use resource_group_sdk::odata::GroupFilterField;
 use resource_group_sdk::{
-    CreateGroupRequest, CreateTypeRequest, GroupHierarchy, ResourceGroup, ResourceGroupClient,
-    ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth, UpdateGroupRequest,
-    UpdateTypeRequest,
+    CreateGroupRequest, GroupHierarchy, ResourceGroup, ResourceGroupClient,
+    ResourceGroupMembership, ResourceGroupWithDepth, UpdateGroupRequest,
 };
 use toolkit_canonical_errors::{CanonicalError, resource_error};
 use toolkit_odata::filter::convert_expr_to_filter_node;
@@ -144,38 +143,6 @@ impl ResourceGroupClient for FakeCascadeRgClient {
     }
     async fn delete_group(&self, _ctx: &SecurityContext, _id: Uuid) -> Result<(), CanonicalError> {
         unreachable!("cascade hook only calls delete_group_cascade, not delete_group")
-    }
-    async fn create_type(
-        &self,
-        _ctx: &SecurityContext,
-        _request: CreateTypeRequest,
-    ) -> Result<ResourceGroupType, CanonicalError> {
-        unreachable!()
-    }
-    async fn get_type(
-        &self,
-        _ctx: &SecurityContext,
-        _code: &str,
-    ) -> Result<ResourceGroupType, CanonicalError> {
-        unreachable!()
-    }
-    async fn list_types(
-        &self,
-        _ctx: &SecurityContext,
-        _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupType>, CanonicalError> {
-        unreachable!()
-    }
-    async fn update_type(
-        &self,
-        _ctx: &SecurityContext,
-        _code: &str,
-        _request: UpdateTypeRequest,
-    ) -> Result<ResourceGroupType, CanonicalError> {
-        unreachable!()
-    }
-    async fn delete_type(&self, _ctx: &SecurityContext, _code: &str) -> Result<(), CanonicalError> {
-        unreachable!()
     }
     async fn create_group(
         &self,
@@ -308,7 +275,7 @@ async fn single_group_deletes_via_cascade() {
 /// Both fixtures land as sibling roots (`make_group` builds rows with
 /// `parent_id: None`); production `fetch_tenant_groups` narrows the
 /// listing to roots client-side, so this matches the real shape.
-/// [`only_root_groups_are_cascaded`] covers a non-root in the page.
+/// [`groups_without_a_listed_parent_are_cascaded`] covers nested groups.
 #[tokio::test]
 async fn two_listed_groups_each_cascade_called_exactly_once() {
     // Asserting only `cascade_calls == 2` is too weak -- it would pass
@@ -413,29 +380,27 @@ async fn cascade_error_returns_retryable() {
     assert!(matches!(result, Err(HookError::Retryable { .. })));
 }
 
-/// A non-root in the listed page is skipped; only the root is cascaded.
-///
-/// Root-ness cannot be expressed in RG's `$filter`: `hierarchy/parent_id`
-/// is Uuid-kinded and the grammar carries no null literal and no `is null`
-/// operator, so the page comes back with the tenant's whole user-group set
-/// and the hook narrows it itself. Cascading the root already tears down
-/// its subtree on the RG side, so a delete for the child would be a
-/// redundant round-trip against `CASCADE_BUDGET`.
+/// A listed parent covers its children. A child whose parent is absent from
+/// the listing needs its own cascade.
 #[tokio::test]
-async fn only_root_groups_are_cascaded() {
+async fn groups_without_a_listed_parent_are_cascaded() {
     let root = make_group(1);
     let child = make_child_group(2, root.id);
+    let child_of_unlisted_parent = make_child_group(3, Uuid::from_u128(4));
     let root_id = root.id;
+    let child_of_unlisted_parent_id = child_of_unlisted_parent.id;
 
     let called: Arc<parking_lot::Mutex<Vec<Uuid>>> = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let called_clone = Arc::clone(&called);
 
     let fake = FakeCascadeRgClient {
-        list_groups_fn: {
-            let root = root.clone();
-            let child = child.clone();
-            Box::new(move || Ok(groups_page(vec![root.clone(), child.clone()])))
-        },
+        list_groups_fn: Box::new(move || {
+            Ok(groups_page(vec![
+                root.clone(),
+                child.clone(),
+                child_of_unlisted_parent.clone(),
+            ]))
+        }),
         delete_cascade_fn: Box::new(move |id| {
             called_clone.lock().push(id);
             Ok(())
@@ -451,7 +416,7 @@ async fn only_root_groups_are_cascaded() {
     assert!(result.is_ok());
     assert_eq!(
         called.lock().as_slice(),
-        [root_id],
-        "only the root group is dispatched to delete_group_cascade"
+        [root_id, child_of_unlisted_parent_id],
+        "cascade starts at each group without a listed parent"
     );
 }

@@ -15,6 +15,8 @@ Seams pinned (one per test):
 * S3  -- create_tenant_validates_tenant_type_via_types_registry: the
         cross-gear ``tenant_type`` lookup rejects a missing catalog
         entry with a 400 envelope.
+* S4  -- the registry rejects an incompatible revision of the membership
+        trait on AM's published user-group type.
 * S5  -- metadata_lifecycle_via_real_schema_registry: register schema
         in types-registry, then PUT/GET/RESOLVE walk-up against AM.
 * S6  -- metadata_distinct_404_codes_propagate_through_envelope: both
@@ -42,6 +44,7 @@ import uuid
 import httpx
 import pytest
 
+from ..types_registry.helpers import PLATFORM_API, get_entity, outcome, register_and_assert
 from .conftest import (
     DEFAULT_METADATA_SCHEMA_ID,
     DEFAULT_TENANT_TYPE,
@@ -271,7 +274,7 @@ async def test_create_tenant_validates_tenant_type_via_types_registry(
     Unit tests stub the registry client -- only this seam exercises
     the real SDK -> registry crossing.
     """
-    bogus_type = "gts.cf.core.rg.type.v1~x.e2etest.does_not_exist_zz.v1~"
+    bogus_type = "gts.cf.core.rg.group.v1~x.e2etest.does_not_exist_zz.v1~"
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
         r = await c.post(
@@ -292,6 +295,43 @@ async def test_create_tenant_validates_tenant_type_via_types_registry(
         body = r.json()
         assert "code" in body or "title" in body, (
             f"Expected typed envelope, got: {body}"
+        )
+
+
+async def test_published_user_group_membership_trait_rejects_rebinding(am_base_url, platform_headers):
+    group = "gts.cf.core.rg.group.v1~cf.core.am.user_group.v1~"
+    member = "gts.cf.core.rg.group_membership.v1~cf.core.am.user_group_member.v1~"
+    async with httpx.AsyncClient(
+        base_url=am_base_url.rstrip("/") + "/", headers=platform_headers, timeout=REQUEST_TIMEOUT,
+    ) as registry:
+        published = await get_entity(registry, PLATFORM_API, group, select="content,origin")
+        assert published.status_code == 200, published.text
+        entity = published.json()
+        content = entity["content"]
+        trait = content["x-gts-traits-schema"]["properties"]["membership_type"]
+        assert trait["const"] == content["x-gts-traits"]["membership_type"] == member
+
+        # Supply a valid alternative in the dry run so only compatibility with
+        # AM's published traits schema prevents this revision.
+        alternate = member + "cf.e2etest._.alternate.v1~"
+        alternate_schema = {
+            "gts_id": alternate,
+            "content": {
+                "$id": f"gts://{alternate}", "$schema": content["$schema"], "type": "object",
+                "allOf": [{"$ref": f"gts://{member}"}],
+            },
+        }
+        trait["const"] = alternate
+        content["x-gts-traits"]["membership_type"] = alternate
+        revision = {
+            "gts_id": group, "content": content,
+            "expected_resource_version": entity["origin"]["resource_version"],
+        }
+        await register_and_assert(
+            registry, PLATFORM_API, [alternate_schema, revision],
+            outcome(alternate_schema, "succeeded", None),
+            outcome(revision, "failed", None, "incompatible_with_baseline"),
+            dry_run=True,
         )
 
 

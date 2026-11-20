@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use resource_group_sdk::TENANT_RG_TYPE_PATH;
+use resource_group_sdk::TENANT_GROUP_TYPE_ID;
 use resource_group_sdk::api::ResourceGroupReadHierarchy;
 use resource_group_sdk::models::{
     GroupHierarchy, GroupHierarchyWithDepth, ResourceGroup, ResourceGroupMembership,
@@ -266,7 +266,7 @@ fn make_group(
 ) -> ResourceGroupWithDepth {
     ResourceGroupWithDepth {
         id,
-        code: TENANT_RG_TYPE_PATH.to_owned(),
+        code: TENANT_GROUP_TYPE_ID.to_owned(),
         name: name.to_owned(),
         hierarchy: GroupHierarchyWithDepth {
             parent_id,
@@ -278,7 +278,7 @@ fn make_group(
 }
 
 fn service_with(mock: MockRgHierarchy) -> Service {
-    Service::new(Arc::new(mock), vec![TENANT_RG_TYPE_PATH.to_owned()])
+    Service::new(Arc::new(mock), vec![TENANT_GROUP_TYPE_ID.to_owned()])
 }
 
 fn ctx() -> SecurityContext {
@@ -298,7 +298,7 @@ async fn get_tenant_returns_info() {
     assert_eq!(tenant.name, "Root");
     assert_eq!(tenant.status, TenantStatus::Active);
     assert!(!tenant.self_managed);
-    assert_eq!(tenant.tenant_type, Some(TENANT_RG_TYPE_PATH.to_owned()));
+    assert_eq!(tenant.tenant_type, Some(TENANT_GROUP_TYPE_ID.to_owned()));
 }
 
 #[tokio::test]
@@ -572,7 +572,7 @@ async fn get_descendants_drops_non_tenant_types() {
     let root = Uuid::now_v7();
     let tenant_child = Uuid::now_v7();
     let mut dept = make_group(Uuid::now_v7(), "Dept", Some(root), 1, None);
-    dept.code = gts_id!("cf.core.rg.type.v1~x.test._.dept.v1~").to_owned();
+    dept.code = gts_id!("cf.core.rg.group.v1~x.test._.dept.v1~").to_owned();
     let mock = MockRgHierarchy::descendants_only(vec![
         make_group(root, "Root", None, 0, None),
         dept,
@@ -837,7 +837,7 @@ async fn rg_error_propagates() {
         }
     }
 
-    let svc = Service::new(Arc::new(FailingRg), vec![TENANT_RG_TYPE_PATH.to_owned()]);
+    let svc = Service::new(Arc::new(FailingRg), vec![TENANT_GROUP_TYPE_ID.to_owned()]);
     let err = svc.get_tenant(&ctx(), TenantId(Uuid::now_v7())).await;
     assert!(
         matches!(err, Err(TenantResolverError::Internal(_))),
@@ -858,7 +858,7 @@ mod group_matches_filter_tests {
     fn g(id: Uuid, parent_id: Option<Uuid>, tenant_id: Uuid) -> ResourceGroupWithDepth {
         ResourceGroupWithDepth {
             id,
-            code: TENANT_RG_TYPE_PATH.to_owned(),
+            code: TENANT_GROUP_TYPE_ID.to_owned(),
             name: "g".to_owned(),
             hierarchy: GroupHierarchyWithDepth {
                 parent_id,
@@ -1285,8 +1285,8 @@ fn type_in_values(expr: &Expr, out: &mut Vec<Vec<String>>) {
 
 #[tokio::test]
 async fn configured_tenant_types_are_sent_as_type_in_filter() {
-    const CUSTOM: &str = gts_id!("cf.core.rg.type.v1~acme.core._.tenant.v1~");
-    let tenant_types = vec![CUSTOM.to_owned(), TENANT_RG_TYPE_PATH.to_owned()];
+    const CUSTOM: &str = gts_id!("cf.core.rg.group.v1~acme.core._.tenant.v1~");
+    let tenant_types = vec![CUSTOM.to_owned(), TENANT_GROUP_TYPE_ID.to_owned()];
     let rg = Arc::new(CapturingRg::default());
     let svc = Service::new(rg.clone(), tenant_types.clone());
 

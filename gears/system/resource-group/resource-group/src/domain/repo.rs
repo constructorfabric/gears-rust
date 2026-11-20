@@ -1,18 +1,44 @@
 // Created: 2026-04-16 by Constructor Tech
 // @cpt-dod:cpt-cf-resource-group-dod-sdk-foundation-sdk-traits:p1
 use async_trait::async_trait;
-use resource_group_sdk::models::{
-    ResourceGroup, ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth,
-};
-use toolkit_db::secure::DBRunner;
+use resource_group_sdk::models::{ResourceGroup, ResourceGroupMembership, ResourceGroupWithDepth};
+use toolkit_db::secure::{DBRunner, DbTx};
+use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
-use crate::infra::storage::entity::{
-    gts_type, resource_group as rg_entity, resource_group_membership as membership_entity,
-};
+
+/// Stored resource types selected for removal of a membership.
+#[derive(Debug, Clone, Copy)]
+#[domain_model]
+pub enum MemberTypes<'a> {
+    Exact(&'a str),
+    Family(&'a types_registry_sdk::GtsTypeId),
+}
+
+/// Storage key of a GTS type in RG's local identity dictionary (`gts_type`).
+///
+/// Pass this key from [`GroupRepositoryTrait::ensure_type_key`] to the
+/// insert in the same transaction. Types Registry owns admission and
+/// lifecycle for the corresponding GTS identifier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[domain_model]
+pub struct GtsTypeKey(pub(crate) i16);
+
+/// A stored group with its type key resolved to the GTS type identifier.
+#[derive(Clone, Debug, PartialEq)]
+#[domain_model]
+pub struct GroupRecord {
+    pub id: Uuid,
+    pub parent_id: Option<Uuid>,
+    /// The group's GTS type identifier (immutable).
+    pub code: String,
+    pub name: String,
+    pub metadata: Option<serde_json::Value>,
+    pub tenant_id: Uuid,
+}
 
 #[async_trait]
 #[allow(clippy::too_many_arguments)]
@@ -26,7 +52,7 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         id: Uuid,
     ) -> Result<Option<ResourceGroup>, DomainError>;
 
-    /// Find the raw entity model by ID.
+    /// Find the stored group by ID.
     ///
     /// Reads under the system scope, with no caller scope applied. Never use
     /// it as an authorization gate, use `find_model_by_id_scoped` for that.
@@ -34,15 +60,15 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         &self,
         db: &C,
         id: Uuid,
-    ) -> Result<Option<rg_entity::Model>, DomainError>;
+    ) -> Result<Option<GroupRecord>, DomainError>;
 
-    /// Find the raw entity model by ID, visible under `scope`.
+    /// Find the stored group by ID, visible under `scope`.
     async fn find_model_by_id_scoped<C: DBRunner>(
         &self,
         db: &C,
         scope: &AccessScope,
         id: Uuid,
-    ) -> Result<Option<rg_entity::Model>, DomainError>;
+    ) -> Result<Option<GroupRecord>, DomainError>;
 
     /// Same read, taking a row lock on the group for the rest of the
     /// transaction.
@@ -58,10 +84,10 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         &self,
         db: &C,
         id: Uuid,
-    ) -> Result<Option<rg_entity::Model>, DomainError>;
+    ) -> Result<Option<GroupRecord>, DomainError>;
 
     /// Return the id of *any* existing root group (`parent_id` IS NULL) whose
-    /// `gts_type.schema_id` starts with any of the given prefixes, or `None`
+    /// GTS type identifier starts with any of the given prefixes, or `None`
     /// when no such root exists (or `type_prefixes` is empty). Used to enforce tenant-root uniqueness
     /// (`cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`).
     ///
@@ -98,16 +124,29 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
 
     // -- Write operations --
 
+    /// The dictionary key for the GTS type `code`, created on first use.
+    ///
+    /// Call inside the write transaction after registry admission and other
+    /// checks. The key row rolls back with the referencing write, but PostgreSQL
+    /// identity values are not reclaimed. Concurrent first uses share a key,
+    /// with a typed serialization error triggering retry under `SERIALIZABLE`.
+    /// Reads, filters and deletes only look up keys.
+    async fn ensure_type_key<C: DBRunner>(
+        &self,
+        db: &C,
+        code: &str,
+    ) -> Result<GtsTypeKey, DomainError>;
+
     async fn insert<C: DBRunner>(
         &self,
         db: &C,
         id: Uuid,
         parent_id: Option<Uuid>,
-        gts_type_id: i16,
+        type_key: GtsTypeKey,
         name: &str,
         metadata: Option<&serde_json::Value>,
         tenant_id: Uuid,
-    ) -> Result<rg_entity::Model, DomainError>;
+    ) -> Result<(), DomainError>;
 
     /// Apply the update and return the number of rows it touched.
     ///
@@ -125,7 +164,6 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         db: &C,
         id: Uuid,
         parent_id: Option<Uuid>,
-        gts_type_id: i16,
         name: &str,
         metadata: Option<&serde_json::Value>,
     ) -> Result<u64, DomainError>;
@@ -236,168 +274,6 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         db: &C,
         group_id: Uuid,
     ) -> Result<bool, DomainError>;
-
-    async fn resolve_type_paths_batch<C: DBRunner>(
-        &self,
-        db: &C,
-        type_ids: &[i16],
-    ) -> Result<std::collections::HashMap<i16, String>, DomainError>;
-}
-
-#[async_trait]
-pub trait TypeRepositoryTrait: Send + Sync + 'static {
-    async fn find_by_code<C: DBRunner>(
-        &self,
-        db: &C,
-        code: &str,
-    ) -> Result<Option<ResourceGroupType>, DomainError>;
-
-    /// Same lookup as `find_by_code`, but also returns the `gts_type` row
-    /// itself alongside the assembled `ResourceGroupType`, in one query
-    /// (RG-11).
-    ///
-    /// The row, not just its surrogate id: the update path needs
-    /// `created_at` off it to assemble its answer without reading the row
-    /// back a second time after the write, and this query already held it.
-    async fn find_by_code_with_model<C: DBRunner>(
-        &self,
-        db: &C,
-        code: &str,
-    ) -> Result<Option<(gts_type::Model, ResourceGroupType)>, DomainError>;
-
-    async fn load_full_type_by_id<C: DBRunner>(
-        &self,
-        db: &C,
-        type_id: i16,
-    ) -> Result<ResourceGroupType, DomainError>;
-
-    async fn load_full_type<C: DBRunner>(
-        &self,
-        db: &C,
-        type_model: &gts_type::Model,
-    ) -> Result<ResourceGroupType, DomainError>;
-
-    async fn resolve_id<C: DBRunner>(&self, db: &C, code: &str)
-    -> Result<Option<i16>, DomainError>;
-
-    async fn insert<C: DBRunner>(
-        &self,
-        db: &C,
-        schema_id: &str,
-        metadata_schema: Option<&serde_json::Value>,
-    ) -> Result<gts_type::Model, DomainError>;
-
-    async fn insert_allowed_parent_types<C: DBRunner>(
-        &self,
-        db: &C,
-        type_id: i16,
-        parent_ids: &[i16],
-    ) -> Result<(), DomainError>;
-
-    async fn insert_allowed_membership_types<C: DBRunner>(
-        &self,
-        db: &C,
-        type_id: i16,
-        membership_ids: &[i16],
-    ) -> Result<(), DomainError>;
-
-    async fn delete_allowed_parent_types<C: DBRunner>(
-        &self,
-        db: &C,
-        type_id: i16,
-    ) -> Result<(), DomainError>;
-
-    async fn delete_allowed_membership_types<C: DBRunner>(
-        &self,
-        db: &C,
-        type_id: i16,
-    ) -> Result<(), DomainError>;
-
-    /// Update `metadata_schema` and `updated_at` on one `gts_type` row.
-    ///
-    /// Returns the row as the database now holds it: assembled from
-    /// `current` plus the two columns this write just set, not re-read.
-    /// Every other column is either the key `current` was addressed by or
-    /// immutable, so a second `gts_type` SELECT per update could not have
-    /// told the caller anything `current` didn't already have (RG-08).
-    async fn update_type<C: DBRunner>(
-        &self,
-        db: &C,
-        current: gts_type::Model,
-        metadata_schema: Option<&serde_json::Value>,
-    ) -> Result<gts_type::Model, DomainError>;
-
-    async fn delete_by_id<C: DBRunner>(&self, db: &C, type_id: i16) -> Result<(), DomainError>;
-
-    async fn count_groups_of_type<C: DBRunner>(
-        &self,
-        db: &C,
-        type_id: i16,
-    ) -> Result<u64, DomainError>;
-
-    /// Batch replacement for a removed-allowed-parent-types sweep: resolves
-    /// every candidate parent-type path to its surrogate id and finds every
-    /// group of `child_type_id` whose direct parent is of one of those
-    /// types, in a small constant number of queries regardless of how many
-    /// paths are checked (was one `resolve_id` + one single-parent
-    /// violation lookup per candidate -- slope 2.0, N+1 audit finding (b)
-    /// -- see `check_hierarchy_safety`).
-    ///
-    /// A `parent_code` that doesn't currently resolve to any `gts_type` row
-    /// is silently skipped (mirrors the pre-batch code's per-item `if let
-    /// Some(parent_id) = ...` guard) -- reachable when the parent type was
-    /// deleted out from under a still-referencing junction row (junction
-    /// FKs declare `ON DELETE CASCADE`, but that cascade only fires when
-    /// the connection actually enforces FK constraints; the test suite's
-    /// `SQLite` connections don't turn that pragma on, see
-    /// `type_update_hierarchy_check_skips_deleted_parent`). A type that no
-    /// longer exists has no groups referencing it, so there's nothing to
-    /// check either way. Returns `(parent_code, group_id, group_name)`
-    /// triples so callers can attribute each violation back to the specific
-    /// removed-parent path that caused it.
-    async fn find_groups_violating_removed_parents<C: DBRunner>(
-        &self,
-        db: &C,
-        child_type_id: i16,
-        parent_codes: &[String],
-    ) -> Result<Vec<(String, Uuid, String)>, DomainError>;
-
-    async fn find_root_groups_of_type<C: DBRunner>(
-        &self,
-        db: &C,
-        type_id: i16,
-    ) -> Result<Vec<(Uuid, String)>, DomainError>;
-
-    /// The membership counterpart of `find_groups_violating_removed_parents`,
-    /// and it makes the same decisions for the same reasons: one query per
-    /// bind-parameter chunk rather than one per candidate path, the system
-    /// scope because an integrity sweep must see the real data regardless of
-    /// the caller's view, and a result bounded by the violating memberships
-    /// rather than by the popularity of the child type.
-    ///
-    /// Returns `(membership_code, group_id, group_name)` triples -- one per
-    /// violating pair, deduplicated, so a group with several memberships of
-    /// the same removed type is named once. A `membership_code` that no
-    /// longer resolves to a `gts_type` row is skipped: a type that does not
-    /// exist has no memberships to protect.
-    async fn find_groups_violating_removed_membership_types<C: DBRunner>(
-        &self,
-        db: &C,
-        child_type_id: i16,
-        membership_codes: &[String],
-    ) -> Result<Vec<(String, Uuid, String)>, DomainError>;
-
-    async fn list_types<C: DBRunner>(
-        &self,
-        db: &C,
-        query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupType>, DomainError>;
-
-    async fn resolve_ids<C: DBRunner>(
-        &self,
-        db: &C,
-        codes: &[String],
-    ) -> Result<Vec<i16>, DomainError>;
 }
 
 #[async_trait]
@@ -411,27 +287,32 @@ pub trait MembershipRepositoryTrait: Send + Sync + 'static {
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupMembership>, DomainError>;
 
-    async fn insert<C: DBRunner>(
+    /// Insert the membership and its type key in the same transaction. Call
+    /// after validation because PostgreSQL identity values survive rollback.
+    /// Duplicate errors use the GTS type identifier.
+    async fn insert(
         &self,
-        db: &C,
+        tx: &DbTx<'_>,
         group_id: Uuid,
-        gts_type_id: i16,
+        resource_type: &str,
         resource_id: &str,
-    ) -> Result<membership_entity::Model, DomainError>;
+    ) -> Result<(), DomainError>;
 
-    /// Delete a membership. `scope` is the caller's scope and is applied
+    /// Delete matching memberships. `scope` is the caller's scope and is applied
     /// through the owning group; an unconstrained scope means no tenant
-    /// filtering.
+    /// filtering. Stored types are matched through the dictionary without
+    /// creating a key or consulting the registry: an unknown type deletes
+    /// nothing.
     async fn delete<C: DBRunner>(
         &self,
         db: &C,
         scope: &AccessScope,
         group_id: Uuid,
-        gts_type_id: i16,
+        types: MemberTypes<'_>,
         resource_id: &str,
     ) -> Result<u64, DomainError>;
 
-    /// Whether `(gts_type_id, resource_id)` already has a membership owned by
+    /// Whether `(resource_type, resource_id)` already has a membership owned by
     /// a tenant other than `tenant_id`.
     ///
     /// An existence check, not a count and not a fetch: one statement,
@@ -455,10 +336,14 @@ pub trait MembershipRepositoryTrait: Send + Sync + 'static {
     /// tenants each see no conflict and both commit otherwise (RG-01). At
     /// `SERIALIZABLE` that is the write skew SSI cancels, and the retry
     /// already wrapping the transaction re-runs it against the winner.
+    ///
+    /// `resource_type` is matched through the identity dictionary in the same
+    /// statement, without creating a key: a type with no key has no
+    /// memberships anywhere.
     async fn has_membership_in_other_tenant<C: DBRunner>(
         &self,
         db: &C,
-        gts_type_id: i16,
+        resource_type: &str,
         resource_id: &str,
         tenant_id: Uuid,
     ) -> Result<bool, DomainError>;

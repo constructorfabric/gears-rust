@@ -13,6 +13,13 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Maximum UTF-8 byte length of a membership's resource identifier.
+///
+/// On all backends, the limit leaves room in PostgreSQL's 2704-byte B-tree
+/// entries (standard 8 KiB pages) for the group UUID, two-byte type key and
+/// headers. The full GTS identifier is stored in the dictionary.
+pub const MAX_MEMBERSHIP_RESOURCE_ID_BYTES: usize = 2600;
+
 // -- GtsTypePath value object --
 
 // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-1
@@ -20,7 +27,7 @@ use uuid::Uuid;
 ///
 /// A GTS type path follows the pattern `gts.<segment>~(<segment>~)*` where
 /// each segment consists of lowercase alphanumeric characters, underscores,
-/// and dots. Examples: `gts.cf.core.rg.type.v1~`, `gts.cf.core.rg.type.v1~cf.core._.tenant.v1~`.
+/// and dots. Examples: `gts.cf.core.rg.group.v1~`, `gts.cf.core.rg.group.v1~cf.core.rg.tenant.v1~`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct GtsTypePath(String);
@@ -97,70 +104,6 @@ impl AsRef<str> for GtsTypePath {
 }
 // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-validate-gts-type-path:p1:inst-gts-val-1
 
-// -- Type --
-
-/// A GTS resource group type definition.
-///
-/// Matches the REST `Type` schema. All references use string GTS type paths;
-/// surrogate SMALLINT IDs are internal to the persistence layer.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ResourceGroupType {
-    /// GTS type path (e.g. `gts.cf.core.rg.type.v1~cf.core._.tenant.v1~`)
-    pub code: String,
-    /// Whether groups of this type can be root nodes (no parent).
-    pub can_be_root: bool,
-    /// GTS type paths of types allowed as parents.
-    pub allowed_parent_types: Vec<String>,
-    /// GTS type paths of resource types allowed as members.
-    pub allowed_membership_types: Vec<String>,
-    /// Optional JSON Schema for the metadata object of instances of this type.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata_schema: Option<serde_json::Value>,
-}
-
-/// Request body for creating a new GTS type.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateTypeRequest {
-    /// GTS type path. Must have prefix `gts.cf.core.rg.type.v1~`.
-    ///
-    /// Whether this creates a new tenant scope is derived from the code: any
-    /// type whose path starts with a configured tenant-type prefix (default:
-    /// [`TENANT_RG_TYPE_PATH`](crate::TENANT_RG_TYPE_PATH)) is a tenant type
-    /// (`tenant_id = group.id` for its instances).
-    pub code: String,
-    /// Whether groups of this type can be root nodes.
-    pub can_be_root: bool,
-    /// GTS type paths of allowed parent types.
-    #[serde(default)]
-    pub allowed_parent_types: Vec<String>,
-    /// GTS type paths of allowed membership resource types.
-    #[serde(default)]
-    pub allowed_membership_types: Vec<String>,
-    /// Optional JSON Schema for instance metadata.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata_schema: Option<serde_json::Value>,
-}
-
-/// Request body for updating an existing GTS type (full replacement via PUT).
-///
-/// Every replaceable field is **required** so an omitted field cannot be
-/// confused with "preserve previous value". Nullable fields
-/// (`metadata_schema`) must be sent explicitly as `null` to clear them.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateTypeRequest {
-    /// Whether groups of this type can be root nodes.
-    pub can_be_root: bool,
-    /// GTS type paths of allowed parent types.
-    pub allowed_parent_types: Vec<String>,
-    /// GTS type paths of allowed membership resource types.
-    pub allowed_membership_types: Vec<String>,
-    /// JSON Schema for instance metadata (`null` to clear).
-    pub metadata_schema: Option<serde_json::Value>,
-}
-
 // -- Group --
 
 /// Hierarchy context for a resource group.
@@ -195,7 +138,7 @@ pub struct GroupHierarchyWithDepth {
 pub struct ResourceGroup {
     /// Group identifier.
     pub id: Uuid,
-    /// GTS chained type code (e.g. `gts.cf.core.rg.type.v1~cf.core._.tenant.v1~`).
+    /// GTS chained type code (e.g. `gts.cf.core.rg.group.v1~cf.core.rg.tenant.v1~`).
     #[serde(rename = "type")]
     pub code: String,
     /// Display name.
@@ -213,7 +156,7 @@ pub struct ResourceGroup {
 pub struct ResourceGroupWithDepth {
     /// Group identifier.
     pub id: Uuid,
-    /// GTS chained type code (e.g. `gts.cf.core.rg.type.v1~cf.core._.tenant.v1~`).
+    /// GTS chained type code (e.g. `gts.cf.core.rg.group.v1~cf.core.rg.tenant.v1~`).
     #[serde(rename = "type")]
     pub code: String,
     /// Display name.
@@ -242,7 +185,7 @@ pub struct CreateGroupRequest {
     /// Optional caller-supplied ID (used by seeding for stable identity).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<Uuid>,
-    /// GTS chained type code. Must have prefix `gts.cf.core.rg.type.v1~`.
+    /// GTS chained type code. Must have prefix `gts.cf.core.rg.group.v1~`.
     #[serde(rename = "type")]
     pub code: String,
     /// Display name (1..255 characters).
@@ -260,7 +203,7 @@ pub struct CreateGroupRequest {
     /// request is rejected.
     ///
     /// Rejected for tenant-typed groups (`code` starting with a configured
-    /// tenant-type prefix, default `TENANT_RG_TYPE_PATH`): their effective
+    /// tenant-type prefix, default `TENANT_GROUP_TYPE_ID`): their effective
     /// tenant is always `group.id`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<Uuid>,
@@ -321,8 +264,7 @@ impl CreateGroupRequest {
 /// converted between tenant-typed and non-tenant-typed (or between any two
 /// distinct GTS types) — the request payload deliberately does not carry a
 /// `type` / `code` field. To change semantics, delete the old group and
-/// create a new one. See `UpdateTypeRequest` for changing the *definition*
-/// of an existing GTS type — that's a different concern.
+/// create a new one. RG type *definitions* are owned by the types registry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateGroupRequest {

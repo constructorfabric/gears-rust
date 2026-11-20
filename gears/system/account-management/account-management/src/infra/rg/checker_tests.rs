@@ -8,8 +8,8 @@
 
 use super::*;
 use resource_group_sdk::{
-    CreateGroupRequest, CreateTypeRequest, GroupHierarchy, ResourceGroup, ResourceGroupMembership,
-    ResourceGroupType, ResourceGroupWithDepth, UpdateGroupRequest, UpdateTypeRequest,
+    CreateGroupRequest, GroupHierarchy, ResourceGroup, ResourceGroupMembership,
+    ResourceGroupWithDepth, UpdateGroupRequest,
 };
 use std::sync::Mutex;
 use toolkit_canonical_errors::CanonicalError;
@@ -71,7 +71,7 @@ impl FakeRgClient {
 fn sample_group(tenant_id: Uuid) -> ResourceGroup {
     ResourceGroup {
         id: Uuid::from_u128(0xDEAD),
-        code: gts_id!("cf.core.rg.type.v1~acme.rg.test.example.v1~").into(),
+        code: gts_id!("cf.core.rg.group.v1~acme.rg.test.example.v1~").into(),
         name: "sample".into(),
         hierarchy: GroupHierarchy {
             parent_id: None,
@@ -83,38 +83,6 @@ fn sample_group(tenant_id: Uuid) -> ResourceGroup {
 
 #[async_trait]
 impl ResourceGroupClient for FakeRgClient {
-    async fn create_type(
-        &self,
-        _ctx: &SecurityContext,
-        _request: CreateTypeRequest,
-    ) -> Result<ResourceGroupType, CanonicalError> {
-        unreachable!("not used by RgResourceOwnershipChecker")
-    }
-    async fn get_type(
-        &self,
-        _ctx: &SecurityContext,
-        _code: &str,
-    ) -> Result<ResourceGroupType, CanonicalError> {
-        unreachable!()
-    }
-    async fn list_types(
-        &self,
-        _ctx: &SecurityContext,
-        _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupType>, CanonicalError> {
-        unreachable!()
-    }
-    async fn update_type(
-        &self,
-        _ctx: &SecurityContext,
-        _code: &str,
-        _request: UpdateTypeRequest,
-    ) -> Result<ResourceGroupType, CanonicalError> {
-        unreachable!()
-    }
-    async fn delete_type(&self, _ctx: &SecurityContext, _code: &str) -> Result<(), CanonicalError> {
-        unreachable!()
-    }
     async fn create_group(
         &self,
         _ctx: &SecurityContext,

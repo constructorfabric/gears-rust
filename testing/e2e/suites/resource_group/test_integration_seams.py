@@ -2,7 +2,7 @@
 # @cpt-dod:cpt-cf-resource-group-dod-e2e-test-suite:p1
 """E2E integration seam tests for resource-group gear (Feature 0007).
 
-11 tests. One file. < 15 seconds. Zero flakes.
+Integration seam coverage for group operations and registry-owned types.
 
 Each test guards a specific integration seam -- a point where two independently
 correct components can break when connected. If the seam is already covered by
@@ -16,7 +16,8 @@ import uuid
 import httpx
 import pytest
 
-from .conftest import REQUEST_TIMEOUT, assert_group_shape
+from .conftest import REQUEST_TIMEOUT, assert_group_shape, publish_rg_type
+from ..types_registry.helpers import PLATFORM_API, get_entity
 
 
 # ── URL helpers ──────────────────────────────────────────────────────────
@@ -26,7 +27,9 @@ def _groups(base: str) -> str:
     return f"{base}/resource-group/v1/groups"
 
 
-def _types(base: str) -> str:
+def _removed_types(base: str) -> str:
+    """Resource-group's former type catalogue route; RG types now live only
+    in the types registry and are published through its platform API."""
     return f"{base}/types-registry/v1/types"
 
 
@@ -52,45 +55,23 @@ async def test_route_smoke_all_endpoints(
 
         # --- Endpoints NOT covered by other seam tests ---
 
-        # GET /types -- list types, not exercised elsewhere
-        r = await c.get(_types(rg_base_url), headers=h)
-        assert r.status_code not in (404, 405), f"GET /types: {r.status_code}"
-
-        # GET /types/{code} -- get single type, not exercised elsewhere
-        type_data = await create_type("s1route")
-        type_code = type_data["code"]
-        r = await c.get(f"{_types(rg_base_url)}/{type_code}", headers=h)
-        assert r.status_code not in (404, 405), f"GET /types/{{code}}: {r.status_code}"
-
-        # PUT /types/{code} -- update type, not exercised elsewhere
-        r = await c.put(
-            f"{_types(rg_base_url)}/{type_code}", headers=h,
-            json={"code": type_code, "can_be_root": True},
-        )
-        assert r.status_code not in (404, 405), f"PUT /types/{{code}}: {r.status_code}"
-
-        # DELETE /types/{code} -- delete type, not exercised elsewhere
-        del_type = await create_type("s1del")
-        r = await c.delete(f"{_types(rg_base_url)}/{del_type['code']}", headers=h)
-        assert r.status_code not in (404, 405), f"DELETE /types/{{code}}: {r.status_code}"
-
         # DELETE /memberships/{group_id}/{type}/{id} -- not exercised elsewhere
-        member_type = await create_type("s1mem", allowed_membership_types=[])
-        org_type = await create_type("s1org", allowed_membership_types=[member_type["code"]])
-        group = await create_group(org_type["code"], "S1 Route")
+        member_type = await create_type("s1mem")
+        org_type = await create_type("s1org", resource_type={"const": member_type})
+        group = await create_group(org_type, "S1 Route")
         r = await c.post(
-            f"{_memberships(rg_base_url)}/{group['id']}/{member_type['code']}/res-s1",
+            f"{_memberships(rg_base_url)}/{group['id']}/{member_type}/res-s1",
             headers=h,
         )
         assert r.status_code == 201, f"POST membership setup: {r.status_code}"
         r = await c.delete(
-            f"{_memberships(rg_base_url)}/{group['id']}/{member_type['code']}/res-s1",
+            f"{_memberships(rg_base_url)}/{group['id']}/{member_type}/res-s1",
             headers=h,
         )
         assert r.status_code not in (404, 405), f"DELETE /memberships/...: {r.status_code}"
 
         # GET /groups/{id}/descendants -- hierarchy endpoint
-        grp = await create_group(org_type["code"], "S1 Desc")
+        grp = await create_group(org_type, "S1 Desc")
         r = await c.get(
             f"{_groups(rg_base_url)}/{grp['id']}/descendants", headers=h,
         )
@@ -101,6 +82,62 @@ async def test_route_smoke_all_endpoints(
             f"{_groups(rg_base_url)}/{grp['id']}/ancestors", headers=h,
         )
         assert r.status_code not in (404, 405), f"GET /groups/{{id}}/ancestors: {r.status_code}"
+
+
+@pytest.mark.smoke
+async def test_former_type_catalogue_routes_are_gone(
+    rg_base_url, rg_headers, create_type,
+):
+    """Verify T38b removed RG type CRUD routes and their OpenAPI entries."""
+    code = await create_type("gonecat")
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
+        h = rg_headers
+        base = _removed_types(rg_base_url)
+        for method, url, body in [
+            ("GET", base, None),
+            ("POST", base, {"code": code, "can_be_root": True}),
+            ("GET", f"{base}/{code}", None),
+            ("PUT", f"{base}/{code}", {"can_be_root": True}),
+            ("DELETE", f"{base}/{code}", None),
+        ]:
+            r = await c.request(method, url, headers=h, json=body)
+            assert r.status_code in (404, 405), (
+                f"{method} {url}: expected the route to be gone, got "
+                f"{r.status_code} {r.text}"
+            )
+
+        r = await c.get(f"{rg_base_url}/openapi.json")
+        assert r.status_code == 200, r.text
+        paths = r.json().get("paths", {})
+        assert not [p for p in paths if p.startswith("/types-registry/v1/types")], (
+            f"removed type routes still documented: "
+            f"{[p for p in paths if p.startswith('/types-registry/v1/types')]}"
+        )
+        assert "/resource-group/v1/groups" in paths, sorted(paths)
+
+
+# ── Registry publication contract ───────────────────────────────────────
+
+
+@pytest.mark.smoke
+async def test_type_publication_is_repeatable(
+    rg_base_url, platform_headers, create_type,
+):
+    """Republishing an identical fixture keeps its registry revision."""
+    code = await create_type("repeat")
+    async with httpx.AsyncClient(
+        base_url=rg_base_url.rstrip("/") + "/",
+        headers=platform_headers,
+        timeout=REQUEST_TIMEOUT,
+    ) as client:
+        before = await get_entity(client, PLATFORM_API, code, select="origin,content")
+        assert before.status_code == 200, before.text
+
+        await publish_rg_type(rg_base_url, code)
+
+        after = await get_entity(client, PLATFORM_API, code, select="origin,content")
+        assert after.status_code == 200, after.text
+        assert after.json() == before.json()
 
 
 # ── S2: DTO roundtrip ───────────────────────────────────────────────────
@@ -115,9 +152,9 @@ async def test_dto_roundtrip_group_json_shape(
     Unit tests (0006 G39-G45) test Rust struct conversions, NOT the JSON wire
     format. A serde attribute typo passes unit tests but breaks clients.
     """
-    type_data = await create_type("s2dto")
+    type_code = await create_type("s2dto")
     group = await create_group(
-        type_data["code"], "S2 DTO Test", metadata={"self_managed": True},
+        type_code, "S2 DTO Test", metadata={"self_managed": True},
     )
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
@@ -169,8 +206,7 @@ async def test_authz_tenant_filter_applied(
 
     Unit tests mock PolicyEnforcer; real wiring only exists in gear.rs.
     """
-    type_data = await create_type("s3authz")
-    type_code = type_data["code"]
+    type_code = await create_type("s3authz")
     group = await create_group(type_code, "S3 AuthZ Test")
     group_id = group["id"]
     tenant_id = group["hierarchy"]["tenant_id"]
@@ -208,8 +244,7 @@ async def test_cross_tenant_invisible(
 
     headers_b = {**rg_headers, "Authorization": f"Bearer {token_b}"}
 
-    type_data = await create_type("s4xtenant")
-    type_code = type_data["code"]
+    type_code = await create_type("s4xtenant")
     group = await create_group(type_code, "S4 Cross-Tenant")
     group_id = group["id"]
 
@@ -253,15 +288,15 @@ async def test_hierarchy_closure(
     """
     root_type = await create_type("s5root")
     child_type = await create_type(
-        "s5child", can_be_root=False, allowed_parent_types=[root_type["code"]],
+        "s5child", parent_type={"const": root_type},
     )
     gc_type = await create_type(
-        "s5gc", can_be_root=False, allowed_parent_types=[child_type["code"]],
+        "s5gc", parent_type={"const": child_type},
     )
 
-    root = await create_group(root_type["code"], "S5 Root")
-    child = await create_group(child_type["code"], "S5 Child", parent_id=root["id"])
-    grandchild = await create_group(gc_type["code"], "S5 Grandchild", parent_id=child["id"])
+    root = await create_group(root_type, "S5 Root")
+    child = await create_group(child_type, "S5 Child", parent_id=root["id"])
+    grandchild = await create_group(gc_type, "S5 Grandchild", parent_id=child["id"])
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
         # Hierarchy from root
@@ -318,23 +353,23 @@ async def test_move_closure_rebuild(
     """
     root_type = await create_type("s6root")
     child_type = await create_type(
-        "s6child", can_be_root=False, allowed_parent_types=[root_type["code"]],
+        "s6child", parent_type={"const": root_type},
     )
     gc_type = await create_type(
-        "s6gc", can_be_root=False, allowed_parent_types=[child_type["code"]],
+        "s6gc", parent_type={"const": child_type},
     )
 
-    root_a = await create_group(root_type["code"], "S6 Root A")
-    child = await create_group(child_type["code"], "S6 Child", parent_id=root_a["id"])
-    grandchild = await create_group(gc_type["code"], "S6 Grandchild", parent_id=child["id"])
-    root_b = await create_group(root_type["code"], "S6 Root B")
+    root_a = await create_group(root_type, "S6 Root A")
+    child = await create_group(child_type, "S6 Child", parent_id=root_a["id"])
+    grandchild = await create_group(gc_type, "S6 Grandchild", parent_id=child["id"])
+    root_b = await create_group(root_type, "S6 Root B")
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
         # Move child subtree from root_a to root_b
         r = await c.put(
             f"{_groups(rg_base_url)}/{child['id']}",
             headers=rg_headers,
-            json={"type": child_type["code"], "name": "S6 Child", "parent_id": root_b["id"]},
+            json={"type": child_type, "name": "S6 Child", "parent_id": root_b["id"]},
         )
         assert r.status_code == 200, f"Move failed: {r.status_code} {r.text}"
 
@@ -385,21 +420,21 @@ async def test_force_delete_cascade(
     """
     member_type = await create_type("s7member")
     root_type = await create_type(
-        "s7root", allowed_membership_types=[member_type["code"]],
+        "s7root", resource_type={"const": member_type},
     )
     child_type = await create_type(
-        "s7child", can_be_root=False,
-        allowed_parent_types=[root_type["code"]],
-        allowed_membership_types=[member_type["code"]],
+        "s7child",
+        parent_type={"const": root_type},
+        resource_type={"const": member_type},
     )
 
-    root = await create_group(root_type["code"], "S7 Root")
-    child = await create_group(child_type["code"], "S7 Child", parent_id=root["id"])
+    root = await create_group(root_type, "S7 Root")
+    child = await create_group(child_type, "S7 Child", parent_id=root["id"])
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
         # Add membership on child
         r = await c.post(
-            f"{_memberships(rg_base_url)}/{child['id']}/{member_type['code']}/res-s7",
+            f"{_memberships(rg_base_url)}/{child['id']}/{member_type}/res-s7",
             headers=rg_headers,
         )
         assert r.status_code == 201, f"Add membership: {r.status_code} {r.text}"
@@ -476,8 +511,7 @@ async def test_pagination_cursor_roundtrip(
     0006 tests Page<T> construction. The cursor codec (base64 encode/decode)
     only runs in the handler layer over HTTP.
     """
-    type_data = await create_type("s9page")
-    type_code = type_data["code"]
+    type_code = await create_type("s9page")
     created_ids = set()
     for i in range(5):
         g = await create_group(type_code, f"S9 Page {i}")
@@ -532,21 +566,21 @@ async def test_membership_filter_wiring(
     -> FilterField -> SQL WHERE -- is never tested end-to-end.
     """
     member_type = await create_type("s10member")
-    org_type = await create_type("s10org", allowed_membership_types=[member_type["code"]])
+    org_type = await create_type("s10org", resource_type={"const": member_type})
 
-    group_a = await create_group(org_type["code"], "S10 Group A")
-    group_b = await create_group(org_type["code"], "S10 Group B")
+    group_a = await create_group(org_type, "S10 Group A")
+    group_b = await create_group(org_type, "S10 Group B")
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
         # Add memberships to different groups
         r = await c.post(
-            f"{_memberships(rg_base_url)}/{group_a['id']}/{member_type['code']}/res-1",
+            f"{_memberships(rg_base_url)}/{group_a['id']}/{member_type}/res-1",
             headers=rg_headers,
         )
         assert r.status_code == 201
 
         r = await c.post(
-            f"{_memberships(rg_base_url)}/{group_b['id']}/{member_type['code']}/res-2",
+            f"{_memberships(rg_base_url)}/{group_b['id']}/{member_type}/res-2",
             headers=rg_headers,
         )
         assert r.status_code == 201
@@ -588,15 +622,15 @@ async def test_hierarchy_depth_filter_wiring(
     """
     root_type = await create_type("s11root")
     child_type = await create_type(
-        "s11child", can_be_root=False, allowed_parent_types=[root_type["code"]],
+        "s11child", parent_type={"const": root_type},
     )
     gc_type = await create_type(
-        "s11gc", can_be_root=False, allowed_parent_types=[child_type["code"]],
+        "s11gc", parent_type={"const": child_type},
     )
 
-    root = await create_group(root_type["code"], "S11 Root")
-    child = await create_group(child_type["code"], "S11 Child", parent_id=root["id"])
-    grandchild = await create_group(gc_type["code"], "S11 GC", parent_id=child["id"])
+    root = await create_group(root_type, "S11 Root")
+    child = await create_group(child_type, "S11 Child", parent_id=root["id"])
+    grandchild = await create_group(gc_type, "S11 GC", parent_id=child["id"])
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
         # /descendants returns self + descendants (depth >= 0), so a `ge 0`
@@ -638,23 +672,23 @@ async def test_barrier_metadata_in_descendants(
     """
     root_type = await create_type("s12root")
     child_type = await create_type(
-        "s12child", can_be_root=False, allowed_parent_types=[root_type["code"]],
+        "s12child", parent_type={"const": root_type},
     )
     gc_type = await create_type(
-        "s12gc", can_be_root=False, allowed_parent_types=[child_type["code"]],
+        "s12gc", parent_type={"const": child_type},
     )
 
-    root = await create_group(root_type["code"], "S12 Root")
+    root = await create_group(root_type, "S12 Root")
     barrier = await create_group(
-        child_type["code"], "S12 Barrier",
+        child_type, "S12 Barrier",
         parent_id=root["id"], metadata={"self_managed": True},
     )
     behind = await create_group(
-        gc_type["code"], "S12 Behind",
+        gc_type, "S12 Behind",
         parent_id=barrier["id"],
     )
     normal = await create_group(
-        child_type["code"], "S12 Normal",
+        child_type, "S12 Normal",
         parent_id=root["id"],
     )
 
@@ -693,13 +727,13 @@ async def test_membership_quoted_uuid_and_gts_filter_sql(
     """VHP-2042: quoted UUID and GTS filters bind the correct SQL value types."""
     member_type = await create_type("quotedmember")
     group_type = await create_type(
-        "quotedgroup", allowed_membership_types=[member_type["code"]],
+        "quotedgroup", resource_type={"const": member_type},
     )
-    group = await create_group(group_type["code"], "Quoted membership filters")
+    group = await create_group(group_type, "Quoted membership filters")
     resource_id = str(uuid.uuid4())
     membership_url = (
         f"{_memberships(rg_base_url)}/{group['id']}/"
-        f"{member_type['code']}/{resource_id}"
+        f"{member_type}/{resource_id}"
     )
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         response = await client.post(membership_url, headers=rg_headers)
@@ -711,7 +745,7 @@ async def test_membership_quoted_uuid_and_gts_filter_sql(
                     params={
                         "$filter": (
                             f"group_id eq {group_literal} and "
-                            f"resource_type eq '{member_type['code']}'"
+                            f"resource_type eq '{member_type}'"
                         ),
                         "limit": 200,
                     },
@@ -719,7 +753,7 @@ async def test_membership_quoted_uuid_and_gts_filter_sql(
                 assert response.status_code == 200, response.text
                 assert response.json()["items"] == [{
                     "group_id": group["id"],
-                    "resource_type": member_type["code"],
+                    "resource_type": member_type,
                     "resource_id": resource_id,
                 }]
         finally:

@@ -17,16 +17,17 @@ use uuid::Uuid;
 #[tokio::test]
 async fn recorder_observes_statements_and_tags_tx_membership() {
     let (db, rec) = common::test_db_with_recorder().await;
-    let type_svc = common::make_type_service(db);
+    let type_svc = common::make_type_service(db.clone());
+    let group_svc = common::make_group_service(db);
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+    let root_type = common::create_root_type(&type_svc, "recorder").await;
 
-    // A plain read: TypeService::get_type runs on `self.db.conn()?` --
-    // outside any transaction.
-    let code = format!(
-        "gts.cf.core.rg.type.v1~x.test.recorder.i{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
+    // A plain read: GroupService::get_group_unscoped runs on
+    // `self.db.conn()?` -- outside any transaction.
     // NotFound is fine -- we only care that a SELECT ran.
-    type_svc.get_type_unscoped(&code).await.ok();
+    let missing = Uuid::now_v7();
+    group_svc.get_group_unscoped(missing).await.ok();
 
     let after_read = rec.total();
     assert!(
@@ -39,24 +40,16 @@ async fn recorder_observes_statements_and_tags_tx_membership() {
         rec.dump()
     );
 
-    // A write wrapped in `db.transaction_with_retry(...)`: create_type's
+    // A write wrapped in `db.transaction_with_retry(...)`: create_group's
     // INSERT statements must be tagged in_tx = true.
-    let created = type_svc
-        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
-            code: code.clone(),
-            can_be_root: true,
-            allowed_parent_types: vec![],
-            allowed_membership_types: vec![],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create_type should succeed");
-    assert_eq!(created.code, code);
+    let created =
+        common::create_root_group(&group_svc, &ctx, &root_type.code, "Recorded", tenant_id).await;
+    assert_eq!(created.code, root_type.code);
 
     let events = rec.events();
     assert!(
         events.len() > after_read,
-        "create_type should have produced additional statements"
+        "create_group should have produced additional statements"
     );
     // Sliced by position, not by `seq`. Both agree -- `seq` is the row's
     // index in the trace -- but taking the slice by position keeps this test
@@ -69,11 +62,11 @@ async fn recorder_observes_statements_and_tags_tx_membership() {
         .collect();
     assert!(
         !inserts.is_empty(),
-        "create_type must issue INSERT statements"
+        "create_group must issue INSERT statements"
     );
     assert!(
         inserts.iter().all(|e| e.in_tx),
-        "create_type's inserts must be tagged in_tx = true (it runs inside a transaction):\n{}",
+        "create_group's inserts must be tagged in_tx = true (it runs inside a transaction):\n{}",
         rec.dump()
     );
 
@@ -94,7 +87,7 @@ async fn recorder_observes_statements_and_tags_tx_membership() {
     // And it restarts with the trace: `clear()` needs no separate counter to
     // reset, because there is no separate counter.
     rec.clear();
-    type_svc.get_type_unscoped(&code).await.ok();
+    group_svc.get_group_unscoped(missing).await.ok();
     let after_clear = rec.events();
     assert!(
         !after_clear.is_empty(),

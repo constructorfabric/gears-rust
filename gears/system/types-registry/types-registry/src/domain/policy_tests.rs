@@ -9,8 +9,8 @@ use crate::domain::enums::OwnershipScope;
 use std::collections::BTreeMap;
 use toolkit_gts::gts_id;
 
-const RG_BASE: &str = gts_id!("cf.core.rg.type.v1~");
-const RG_DERIVED: &str = gts_id!("cf.core.rg.type.v1~acme.crm.group.type.v1~");
+const RG_BASE: &str = gts_id!("cf.core.rg.group.v1~");
+const RG_DERIVED: &str = gts_id!("cf.core.rg.group.v1~acme.crm.group.type.v1~");
 const PLUGIN_DERIVED: &str = gts_id!("cf.toolkit.plugins.plugin.v1~zeta.pkg.ns.type.v1~");
 const ACME_OWN: &str = gts_id!("acme.crm.customer.type.v1~");
 const OTHER_VENDOR: &str = gts_id!("zeta.crm.customer.type.v1~");
@@ -84,11 +84,11 @@ fn the_documented_policy_matrix_behaves_as_specified() {
     let p = policy(vec![
         (gts_id!("acme.*"), entry(Some(&["acme"]), Some(true))),
         (
-            gts_id!("cf.core.rg.type.v1~*"),
+            gts_id!("cf.core.rg.group.v1~*"),
             entry(Some(&["acme"]), Some(true)),
         ),
         (
-            gts_id!("cf.core.rg.type.v1~"),
+            gts_id!("cf.core.rg.group.v1~"),
             entry(Some(&[]), Some(false)),
         ),
         (
@@ -139,11 +139,11 @@ fn the_documented_policy_matrix_behaves_as_specified() {
 fn an_exact_key_governs_only_the_base_not_its_subtree() {
     let p = policy(vec![
         (
-            gts_id!("cf.core.rg.type.v1~*"),
+            gts_id!("cf.core.rg.group.v1~*"),
             entry(Some(&["acme"]), Some(true)),
         ),
         (
-            gts_id!("cf.core.rg.type.v1~"),
+            gts_id!("cf.core.rg.group.v1~"),
             entry(Some(&[]), Some(false)),
         ),
     ]);
@@ -151,7 +151,7 @@ fn an_exact_key_governs_only_the_base_not_its_subtree() {
     let (region, list) = p
         .allowed_vendors(&id(RG_BASE))
         .expect("the exact entry matches the base");
-    assert_eq!(region, gts_id!("cf.core.rg.type.v1~"));
+    assert_eq!(region, gts_id!("cf.core.rg.group.v1~"));
     assert!(list.is_empty(), "the base type stays closed");
 
     let (region, list) = p
@@ -159,7 +159,7 @@ fn an_exact_key_governs_only_the_base_not_its_subtree() {
         .expect("the pattern entry matches the derivation");
     assert_eq!(
         region,
-        gts_id!("cf.core.rg.type.v1~*"),
+        gts_id!("cf.core.rg.group.v1~*"),
         "the exact key must not reach the subtree",
     );
     assert_eq!(list, ["acme"]);
@@ -176,16 +176,16 @@ fn an_exact_key_governs_only_the_base_not_its_subtree() {
 fn a_more_specific_vendor_set_replaces_rather_than_extends() {
     let p = policy(vec![
         (gts_id!("cf.core.*"), vendors(&["acme", "zeta"])),
-        (gts_id!("cf.core.rg.type.v1~*"), vendors(&["acme"])),
+        (gts_id!("cf.core.rg.group.v1~*"), vendors(&["acme"])),
     ]);
 
     let (region, list) = p
         .allowed_vendors(&id(RG_DERIVED))
         .expect("an entry matches");
-    assert_eq!(region, gts_id!("cf.core.rg.type.v1~*"));
+    assert_eq!(region, gts_id!("cf.core.rg.group.v1~*"));
     assert_eq!(list, ["acme"], "zeta must not survive from the broader set");
 
-    let zeta_derived = gts_id!("cf.core.rg.type.v1~zeta.crm.group.type.v1~");
+    let zeta_derived = gts_id!("cf.core.rg.group.v1~zeta.crm.group.type.v1~");
     assert!(
         p.admits(&id(zeta_derived), OwnershipScope::Global).is_err(),
         "the narrower entry excludes zeta inside the resource-group region",
@@ -207,7 +207,7 @@ fn an_entry_omitting_a_parameter_is_skipped_and_a_broader_one_supplies_it() {
     let p = policy(vec![
         (gts_id!("cf.core.*"), entry(Some(&["acme"]), None)),
         // Matches more specifically, but names only `tenant_ownable`.
-        (gts_id!("cf.core.rg.type.v1~*"), entry(None, Some(true))),
+        (gts_id!("cf.core.rg.group.v1~*"), entry(None, Some(true))),
     ]);
 
     let (region, list) = p
@@ -219,7 +219,7 @@ fn an_entry_omitting_a_parameter_is_skipped_and_a_broader_one_supplies_it() {
     let (region, ownable) = p
         .tenant_ownable(&id(RG_DERIVED))
         .expect("the narrower entry supplies the ownership parameter");
-    assert_eq!(region, gts_id!("cf.core.rg.type.v1~*"));
+    assert_eq!(region, gts_id!("cf.core.rg.group.v1~*"));
     assert!(ownable);
 }
 
@@ -231,7 +231,7 @@ fn the_two_parameters_resolve_independently() {
         (gts_id!("cf.*"), entry(Some(&["acme"]), Some(true))),
         (gts_id!("cf.core.*"), entry(Some(&["zeta"]), None)),
     ]);
-    let candidate = id(gts_id!("cf.core.rg.type.v1~zeta.crm.group.type.v1~"));
+    let candidate = id(gts_id!("cf.core.rg.group.v1~zeta.crm.group.type.v1~"));
 
     assert_eq!(
         p.allowed_vendors(&candidate).expect("vendors").0,
@@ -251,7 +251,7 @@ fn the_longest_literal_prefix_wins_among_patterns() {
         (gts_id!("cf.*"), vendors(&["zeta"])),
         (gts_id!("cf.core.*"), vendors(&["omega"])),
     ]);
-    let candidate = id(gts_id!("cf.core.rg.type.v1~omega.crm.group.type.v1~"));
+    let candidate = id(gts_id!("cf.core.rg.group.v1~omega.crm.group.type.v1~"));
     let (region, list) = p.allowed_vendors(&candidate).expect("vendors");
     assert_eq!(region, gts_id!("cf.core.*"));
     assert_eq!(list, ["omega"]);
@@ -388,7 +388,7 @@ fn an_empty_vendor_list_compiles_and_closes_the_region() {
 /// The evidence for the exact-key rule, asserted against `gts-rust` directly rather
 /// than taken on trust: a **bare** identifier used as a pattern accepts its
 /// derivations too (GTS spec §3.6 implicit derived-type coverage). Compiled to a
-/// pattern, `gts.cf.core.rg.type.v1~` would close its whole subtree — and, being
+/// pattern, `gts.cf.core.rg.group.v1~` would close its whole subtree — and, being
 /// exact, outrank the `…~*` entry that opens it.
 #[test]
 fn a_bare_identifier_used_as_a_pattern_covers_its_derivations() {

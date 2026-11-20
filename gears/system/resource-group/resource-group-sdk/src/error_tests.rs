@@ -22,7 +22,7 @@ mod wire_vocabulary_round_trip {
     use toolkit_canonical_errors::{CanonicalError, Problem, resource_error};
 
     // Test scope mirroring the impl crate's `#[resource_error]` marker.
-    // Its literal MUST equal `gts::GROUP_RESOURCE_TYPE` — the
+    // Its literal MUST equal `gts::GROUP_TYPE_ID` — the
     // `gts_resource_type_round_trip` test asserts that equality (the
     // proc-macro cannot reference the const directly).
     #[resource_error(gts_id!("cf.core.rg.group.v1~"))]
@@ -38,7 +38,7 @@ mod wire_vocabulary_round_trip {
         let json = problem(err);
         assert_eq!(
             json["context"]["resource_type"],
-            gts::GROUP_RESOURCE_TYPE,
+            gts::GROUP_TYPE_ID,
             "resource type must round-trip into context.resource_type",
         );
     }
@@ -68,7 +68,6 @@ mod wire_vocabulary_round_trip {
     #[test]
     fn precondition_subject_constants_round_trip_to_violations() {
         for subject in [
-            precondition::ALLOWED_PARENTS_SUBJECT,
             precondition::HIERARCHY_SUBJECT,
             precondition::ACTIVE_REFERENCES_SUBJECT,
             precondition::LIMIT_SUBJECT,
@@ -146,7 +145,7 @@ mod projection_tests {
                 name,
                 ..
             } => {
-                assert_eq!(resource_type, gts::GROUP_RESOURCE_TYPE);
+                assert_eq!(resource_type, gts::GROUP_TYPE_ID);
                 assert_eq!(name, "7");
             }
             other => panic!("expected NotFound, got {other:?}"),
@@ -164,7 +163,7 @@ mod projection_tests {
                 name,
                 ..
             } => {
-                assert_eq!(resource_type, gts::GROUP_RESOURCE_TYPE);
+                assert_eq!(resource_type, gts::GROUP_TYPE_ID);
                 assert_eq!(name, "my.code");
             }
             other => panic!("expected AlreadyExists, got {other:?}"),
@@ -230,10 +229,6 @@ mod projection_tests {
     #[test]
     fn failed_precondition_projects_typed_subject() {
         let cases = [
-            (
-                precondition::ALLOWED_PARENTS_SUBJECT,
-                Subject::AllowedParents,
-            ),
             (precondition::HIERARCHY_SUBJECT, Subject::Hierarchy),
             (
                 precondition::ACTIVE_REFERENCES_SUBJECT,
@@ -329,7 +324,7 @@ mod projection_tests {
     fn not_found_without_resource_type_falls_through_to_other() {
         // A malformed / foreign NotFound envelope (no resource_type) must
         // NOT project to NotFound { resource_type: "" } — it would silently
-        // mis-dispatch consumers matching on gts::GROUP_RESOURCE_TYPE.
+        // mis-dispatch consumers matching on gts::GROUP_TYPE_ID.
         let canonical = RgScope::not_found("missing").with_resource("7").create();
         let malformed = canonical_from_mutated_problem(canonical, |v| {
             v["context"]

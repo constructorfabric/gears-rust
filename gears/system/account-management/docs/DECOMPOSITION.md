@@ -170,7 +170,7 @@ upstream PRD/DESIGN definition, with no broken references.
   - Creation of the initial Platform Administrator user identity — the Platform Admin is pre-provisioned in the IdP during infrastructure setup; AM does not create this user (covered by the `idp-user-operations-contract` feature for all other user operations).
   - Validation of IdP binding sufficiency or identifier equality between AM's tenant UUID and the IdP's internal identifiers — that is the IdP provider's responsibility.
   - Creation of any non-root tenant — child tenant creation belongs to `tenant-hierarchy-management`.
-  - Registration of GTS-backed types/schemas (tenant types, metadata schemas, user-group RG type) — those are performed by the respective functional features (`tenant-type-enforcement`, `tenant-metadata`, `user-groups`) during their own initialization paths; bootstrap's IdP wait does not gate them.
+  - Publication of GTS-backed types/schemas — AM’s declared types, including the user-group and membership schemas, are admitted with its manifest before application `init`; runtime tenant and metadata types use the Types Registry publication contract. Bootstrap’s IdP wait does not gate publication.
   - Error taxonomy and metrics definitions themselves — provided by the `errors-observability` foundation feature.
 
 - **Requirements Covered**:
@@ -236,7 +236,7 @@ upstream PRD/DESIGN definition, with no broken references.
   - Managed vs self-managed mode selection, barrier semantics, and `ConversionRequest` dual-consent state machine — owned by `managed-self-managed-modes`; this feature only maintains the `barrier` column in `tenant_closure` as a transactional consequence of mode writes performed by that feature.
   - User-level IdP operations (provision/deprovision/query of users) — owned by `idp-user-operations-contract`. Tenant-side IdP operations (provision/deprovision of tenants) remain in this feature as hierarchy-op side-effects.
   - Tenant metadata CRUD, schemas, and inheritance resolution — owned by `tenant-metadata`; metadata is removed through the tenant-metadata feature's cascade-delete contract when a tenant row is removed, while the schema and resolution logic live in that feature.
-  - User-group Resource Group type registration and lifecycle — owned by `user-groups`.
+  - User-group Resource Group type publication and lifecycle — owned by `user-groups`.
   - Read-only plugin query facade (`get_tenant`, `get_ancestors`, `get_descendants`, barrier-mode reductions) — owned by `tenant-resolver-plugin`, which reads AM-owned `tenants` and `tenant_closure` directly via a dedicated SecureConn read-only pool. The REST `recursive=true` children listing is not that facade — it is this feature's own paginated read over `tenants` + `tenant_closure`.
   - Cross-cutting error taxonomy, audit pipeline, reliability/SLA policy, data-classification policy — owned by `errors-observability`.
 
@@ -499,12 +499,12 @@ upstream PRD/DESIGN definition, with no broken references.
 
 - [ ] `p1` - **ID**: `cpt-cf-account-management-feature-user-groups`
 
-- **Purpose**: Orchestrate user groups entirely through delegation to the Resource Group gear. Account Management registers the chained user-group type schema `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` during gear initialization, triggers cascade cleanup of user groups during tenant hard-deletion, and exposes AM's user-query surface so callers can combine user existence checks with Resource Group's membership operations. Account Management deliberately does not proxy CRUD or membership calls and owns no user-group tables — all group hierarchy, membership storage, cycle detection, and tenant-scoped isolation are performed by Resource Group.
+- **Purpose**: AM publishes `gts.cf.core.rg.group.v1~cf.core.am.user_group.v1~`, triggers RG cleanup at tenant hard-deletion and exposes user lookups for membership callers. Resource Group owns group and membership APIs, storage and tenant isolation.
 
 - **Depends On**: `cpt-cf-account-management-feature-tenant-hierarchy-management`, `cpt-cf-account-management-feature-idp-user-operations-contract`, `cpt-cf-account-management-feature-errors-observability`
 
 - **Scope**:
-  - Chained RG type-schema registration during AM gear init for `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~`, with `allowed_memberships = [gts.cf.core.am.user.v1~]` and `allowed_parents` permitting self-nesting for nested user groups.
+  - AM-owned GTS declarations published with AM's types-registry manifest. The user-group schema permits roots and nesting under the exact AM user-group type. Its bound membership schema admits `gts.cf.core.am.user.v1~` and its derived types.
   - Account-Management-side cascade cleanup trigger during tenant hard-deletion so Resource Group can remove the tenant's user-group subtree before the tenant row is deleted.
   - Exposure of AM's tenant-scoped user-query capability (from feature 5) as the valid user set that callers combine with Resource Group membership operations.
   - Documented delegation contract: consumers call `ResourceGroupClient` directly for group and membership operations; AM does not proxy.
@@ -534,7 +534,7 @@ upstream PRD/DESIGN definition, with no broken references.
 - **Domain Model Entities**:
   - `UserGroup` (delegated view/adapter — delegated to Resource Group; not owned here)
   - `UserGroupMembership` (delegated adapter — delegated to Resource Group; not owned here)
-  - Chained type-schema reference `gts://gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` (registered by AM, schema body published for RG-side validation; AM stores no instance rows)
+  - Chained type-schema reference `gts://gts.cf.core.rg.group.v1~cf.core.am.user_group.v1~` (declared by AM and published through Types Registry for RG-side validation; AM stores no instance rows)
 
 - **Design Components**:
 

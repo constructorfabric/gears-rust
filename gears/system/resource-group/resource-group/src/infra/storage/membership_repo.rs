@@ -2,8 +2,10 @@
 // @cpt-dod:cpt-cf-resource-group-dod-membership-service:p1
 //! Persistence layer for membership management.
 //!
-//! All surrogate SMALLINT ID resolution happens here. The domain and API layers
-//! work exclusively with string GTS type paths and UUIDs.
+//! Memberships store the `SMALLINT` key of the member's GTS type in RG's local
+//! identity dictionary (`gts_type`, see `gts_type_dict`). Keys are resolved to
+//! GTS type identifiers here, batched per page; the domain and API layers work
+//! with string GTS type identifiers and UUIDs only.
 
 use async_trait::async_trait;
 use resource_group_sdk::models::ResourceGroupMembership;
@@ -12,7 +14,7 @@ use sea_orm::ExprTrait;
 use sea_orm::sea_query::{Expr, Query, SelectStatement};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait, Set};
 use toolkit_db::odata::{LimitCfg, paginate_odata};
-use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt};
+use toolkit_db::secure::{DBRunner, DbTx, SecureDeleteExt, SecureEntityExt};
 use toolkit_odata::{ODataQuery, Page, SortDir};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
@@ -20,7 +22,7 @@ use uuid::Uuid;
 use super::odata_filter::prepare_filter;
 use crate::domain::error::DomainError;
 use crate::domain::membership_service::group_scope_for_membership;
-use crate::domain::repo::MembershipRepositoryTrait;
+use crate::domain::repo::{GtsTypeKey, MemberTypes, MembershipRepositoryTrait};
 use crate::infra::storage::FK_RGM_GROUP_ID;
 use crate::infra::storage::entity::resource_group::{
     self as rg_entity, Entity as ResourceGroupEntity,
@@ -28,6 +30,7 @@ use crate::infra::storage::entity::resource_group::{
 use crate::infra::storage::entity::resource_group_membership::{
     self as membership_entity, Entity as MembershipEntity,
 };
+use crate::infra::storage::gts_type_dict;
 use crate::infra::storage::odata_mapper::MembershipODataMapper;
 
 /// Default `OData` pagination limits for memberships.
@@ -78,8 +81,8 @@ impl MembershipRepositoryTrait for MembershipRepository {
     /// List memberships with `OData` filtering and pagination.
     ///
     /// The `OData` filter supports `group_id`, `resource_type`, and `resource_id` fields.
-    /// `resource_type` values in filters are GTS type path strings; they are resolved
-    /// to surrogate IDs at the persistence boundary.
+    /// `resource_type` takes GTS type identifiers and is matched through the
+    /// dictionary in SQL; no type registry is consulted.
     async fn list_memberships<C: DBRunner>(
         &self,
         db: &C,
@@ -96,12 +99,11 @@ impl MembershipRepositoryTrait for MembershipRepository {
             .scope_with(&row_scope);
         let (base_query, query_no_filter) =
             prepare_filter::<MembershipFilterField, MembershipODataMapper, _>(
-                db,
                 base_query,
                 query,
                 MembershipFilterField::ResourceType,
-            )
-            .await?;
+                toolkit_db::secure::max_bind_params_for(db),
+            )?;
 
         let page = paginate_odata::<MembershipFilterField, MembershipODataMapper, _, _, _, _>(
             base_query,
@@ -114,31 +116,20 @@ impl MembershipRepositoryTrait for MembershipRepository {
         .await
         .map_err(DomainError::from)?;
 
-        // Batch-resolve type IDs to GTS paths (single query)
-        let type_ids: Vec<i16> = page.items.iter().map(|m| m.gts_type_id).collect();
-        let group_repo = crate::infra::storage::group_repo::GroupRepository;
-        let type_map = crate::domain::repo::GroupRepositoryTrait::resolve_type_paths_batch(
-            &group_repo,
-            db,
-            &type_ids,
-        )
-        .await?;
-
+        let type_paths =
+            gts_type_dict::find_paths(db, page.items.iter().map(|m| GtsTypeKey(m.gts_type_id)))
+                .await?;
         let memberships = page
             .items
             .into_iter()
             .map(|model| {
-                let type_path = type_map
-                    .get(&model.gts_type_id)
-                    .cloned()
-                    .unwrap_or_default();
-                ResourceGroupMembership {
+                Ok(ResourceGroupMembership {
                     group_id: model.group_id,
-                    resource_type: type_path,
+                    resource_type: type_paths.code(GtsTypeKey(model.gts_type_id))?,
                     resource_id: model.resource_id,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<_, DomainError>>()?;
 
         Ok(Page {
             items: memberships,
@@ -146,21 +137,22 @@ impl MembershipRepositoryTrait for MembershipRepository {
         })
     }
 
-    /// Insert a membership. Returns the created membership with resolved type path.
-    async fn insert<C: DBRunner>(
+    /// Insert a membership, keying its member type first.
+    async fn insert(
         &self,
-        db: &C,
+        db: &DbTx<'_>,
         group_id: Uuid,
-        gts_type_id: i16,
+        resource_type: &str,
         resource_id: &str,
-    ) -> Result<membership_entity::Model, DomainError> {
+    ) -> Result<(), DomainError> {
         let scope = system_scope();
+        let type_key = gts_type_dict::ensure_key(db, resource_type).await?;
 
         let created_at = time::OffsetDateTime::now_utc();
 
         let model = membership_entity::ActiveModel {
             group_id: Set(group_id),
-            gts_type_id: Set(gts_type_id),
+            gts_type_id: Set(type_key.0),
             resource_id: Set(resource_id.to_owned()),
             created_at: Set(created_at),
         };
@@ -169,21 +161,18 @@ impl MembershipRepositoryTrait for MembershipRepository {
             .await
             .map_err(|e| {
                 if e.is_unique_violation() {
+                    let key = format!("({group_id}, {resource_type}, {resource_id})");
                     DomainError::duplicate_membership(
-                        format!("({group_id}, type_id={gts_type_id}, {resource_id})"),
-                        format!(
-                            "Membership already exists: ({group_id}, type_id={gts_type_id}, {resource_id})"
-                        ),
+                        key.clone(),
+                        format!("Membership already exists: {key}"),
                     )
                 } else if e.is_foreign_key_violation() {
                     // The group can be deleted between the caller's read of
                     // it and this insert, and then the answer comes from
                     // `fk_rgm_group_id` -- a missing group, not an internal
                     // failure. Matched by constraint name, the same way
-                    // `GroupRepository::insert` does: this table's other
-                    // foreign key, `fk_rgm_gts_type`, fails on a concurrent
-                    // `delete_type` and must not be reported as a missing
-                    // group. PostgreSQL names the constraint; SQLite says
+                    // `GroupRepository::insert` does. PostgreSQL names the
+                    // constraint; SQLite says
                     // only "FOREIGN KEY constraint failed", so there the
                     // answer stays a database error rather than a confident
                     // lie about which resource was missing.
@@ -198,34 +187,32 @@ impl MembershipRepositoryTrait for MembershipRepository {
                 }
             })?;
 
-        // Assembled, not read back (RG-08). This table has four columns:
-        // three primary-key parts and `created_at`, and all four were just
-        // written from values held right here. The row the database now holds
-        // is fully determined, so the read this replaces could only return
-        // what is already in scope.
-        Ok(membership_entity::Model {
-            group_id,
-            gts_type_id,
-            resource_id: resource_id.to_owned(),
-            created_at,
-        })
+        // Nothing is read back (RG-08): every column was just written from
+        // values the caller holds.
+        Ok(())
     }
 
-    /// Delete a membership by its composite key. Returns the number of affected rows.
+    /// Delete matching membership keys. Returns the number of affected rows.
     async fn delete<C: DBRunner>(
         &self,
         db: &C,
         scope: &AccessScope,
         group_id: Uuid,
-        gts_type_id: i16,
+        types: MemberTypes<'_>,
         resource_id: &str,
     ) -> Result<u64, DomainError> {
         // No scope columns on the membership row: tenant scope is applied
         // through the owning group, the row is run under the system scope.
+        // The type is matched through the dictionary in the same statement,
+        // never creating a key: an unknown type deletes nothing.
+        let keys = match types {
+            MemberTypes::Exact(code) => gts_type_dict::keys_subquery([code]),
+            MemberTypes::Family(root) => gts_type_dict::family_keys(root.as_ref()),
+        };
         let row_scope = system_scope();
         let result = MembershipEntity::delete_many()
             .filter(membership_entity::Column::GroupId.eq(group_id))
-            .filter(membership_entity::Column::GtsTypeId.eq(gts_type_id))
+            .filter(membership_entity::Column::GtsTypeId.in_subquery(keys))
             .filter(membership_entity::Column::ResourceId.eq(resource_id))
             .apply_if(membership_group_condition(scope), QueryFilter::filter)
             .secure()
@@ -242,7 +229,7 @@ impl MembershipRepositoryTrait for MembershipRepository {
     async fn has_membership_in_other_tenant<C: DBRunner>(
         &self,
         db: &C,
-        gts_type_id: i16,
+        resource_type: &str,
         resource_id: &str,
         tenant_id: Uuid,
     ) -> Result<bool, DomainError> {
@@ -273,7 +260,10 @@ impl MembershipRepositoryTrait for MembershipRepository {
         let member_group_ids = Query::select()
             .column(membership_entity::Column::GroupId)
             .from(MembershipEntity)
-            .and_where(Expr::col(membership_entity::Column::GtsTypeId).eq(gts_type_id))
+            .and_where(
+                Expr::col(membership_entity::Column::GtsTypeId)
+                    .in_subquery(gts_type_dict::keys_subquery([resource_type])),
+            )
             .and_where(Expr::col(membership_entity::Column::ResourceId).eq(resource_id))
             .to_owned();
 

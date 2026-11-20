@@ -14,7 +14,6 @@ use sea_orm::DbErr;
 
 use super::{FK_RESOURCE_GROUP_PARENT, map_insert_error};
 use crate::domain::error::DomainError;
-use crate::infra::storage::FK_RG_GTS_TYPE;
 use toolkit_db::secure::ScopeError;
 
 fn fk_violation(constraint: &str) -> ScopeError {
@@ -52,19 +51,21 @@ fn fk_resource_group_parent_maps_to_group_not_found_by_parent_id() {
 }
 
 #[test]
-fn fk_rg_gts_type_is_not_reported_as_group_not_found() {
-    // `fk_rg_gts_type` fails when a concurrent `delete_type` removes the type
-    // between resolution and insert -- a different resource and a different
-    // cause than a missing parent, so this must not be answered with
-    // `GroupNotFound`.
+fn another_foreign_key_is_not_reported_as_group_not_found() {
+    // Only the parent constraint means "the parent is gone"; any other
+    // foreign key must not be answered with `GroupNotFound`.
     let id = uuid::Uuid::now_v7();
     let parent_id = uuid::Uuid::now_v7();
 
-    let err = map_insert_error(&fk_violation(FK_RG_GTS_TYPE), id, Some(parent_id));
+    let err = map_insert_error(
+        &fk_violation("fk_some_other_constraint"),
+        id,
+        Some(parent_id),
+    );
 
     assert!(
         !matches!(err, DomainError::GroupNotFound { .. }),
-        "fk_rg_gts_type must not be mistaken for a missing parent, got: {err}"
+        "another foreign key must not be mistaken for a missing parent, got: {err}"
     );
     assert!(
         matches!(err, DomainError::Database(_)),

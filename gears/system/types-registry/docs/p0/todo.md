@@ -3081,7 +3081,64 @@ Rust API; REST contracts and dependency versions are unchanged.
 **Description:** Complete each remaining non-BSS consumer end to end while legacy remains available to other groups. Scope includes declarations-only owners, not just `TypesRegistryClient` matches.
 
 **Slices (each includes its plugins, tests and dependent fixtures):**
-- [ ] Resource-group, then OAGW host/startup closure; migrate OAGW UUID-tail provisioning identities and `seed_legacy_registry_fixtures` together with its reader. Resource-group's `validate_metadata_via_gts` reads the legacy catalogue and skips validation on `NotFound`, so group metadata of an RG type that exists only in the managed catalogue (admitted through the platform API or a managed publication) is accepted unvalidated today. The slice reads the managed catalogue and adds a test that such metadata is validated, and decides whether an unknown RG type stays a skip or becomes an error.
+- [ ] OAGW host/startup closure. Migrate the UUID-tail provisioning identities
+  and `seed_legacy_registry_fixtures` with the reader.
+- [x] Resource Group. Types Registry now owns all RG definitions (scope agreed
+  2026-11-11). Previously, a legacy catalogue miss let managed-only metadata
+  bypass validation.
+  - [x] Remove local type CRUD, bootstrap and its seal, type seeding, and
+    `TypeService`/`TypeRepository`. Keep `gts_type` as an immutable identity
+    dictionary (amended 2026-11-17). See the [deviation from ADR-0001](../../../resource-group/docs/DESIGN.md#storage-deviation-from-types-registry-adr-0001) and [UUID migration follow-up #6086](https://github.com/constructorfabric/gears-rust/issues/6086). Allocate `SMALLINT` keys only after
+    validation, within the referencing write transaction. SDK and REST still
+    expose string IDs. Use SDK `ReadOptions` directly pending the T36 cache gate.
+  - [x] Publish the abstract group and membership bases via `gts_publication`.
+    Group payloads validate `parent_type` and metadata. The effective
+    `membership_type` trait binds the schema that validates member resource types.
+    AM publishes its own group, membership and user schemas before `init`.
+    E2E fixtures publish through the platform API.
+  - [x] Use the SDK's `Content`, `ResolvedSchema` and `EffectiveTraits`
+    projections and `TypeSchema::compile_payload_validator()`. Tests cover
+    inherited metadata constraints and nested references on the unmodified
+    materialized schema.
+  - [x] Fetch snapshots through `TypesRegistryApi` with the caller's context
+    before opening write transactions. Preserve 401/403 and unavailable
+    responses. Scoped group lookup precedes type errors. Updates and moves
+    recheck the stored type and actual parent in the transaction.
+  - [x] Require active group and membership schemas for new links. Unknown or
+    deleted group types return `TypeNotFound` when an active definition is
+    required. Invalid member types return `Validation` (400). Type-dependent
+    updates and moves accept retained deleted group definitions. Reads and
+    cleanup use stored keys without allocating keys or calling the registry.
+    See [lifecycle and failure cases](../../../resource-group/docs/DESIGN.md#registry-lifecycle-and-failure-behavior).
+  - [x] Apply current schemas to writes. Publication can change type rules
+    without scanning existing RG rows or coordinating across services.
+  - [x] Migrate PostgreSQL and SQLite with
+    `m20261111_000001_gts_type_dictionary`. Preserve all dictionary rows and
+    existing foreign keys, and keep historical migrations intact. Drop the
+    definition columns and placement-rule tables. Preflight the 2600-byte
+    `ck_rgm_resource_id_bytes` limit before DDL. The migration and history
+    record commit together. See [operator steps and rollback](../../../resource-group/docs/DESIGN.md#upgrading-resource-group).
+  - Evidence, 2026-11-11 (`0d018a34e`, `01e35ad06`, `2284a77f0`, `d8c49a00d`
+    and S5 fixtures/docs). Cargo tests passed for RG (19 binaries), RG SDK, AM
+    and `cf-gears-rg-tr-plugin`. `managed_types_admission_test` exercised real
+    admission from the seeded base. The Docker-required RG integration run
+    passed `pg_migration_gts_type_identifiers_test`, `pg_smoke_test` and
+    `pg_concurrency_test`. Clippy with `--all-targets -D warnings` passed on
+    RG, RG SDK and AM. `cargo check --all-targets` passed on RG SDK dependents.
+    `make e2e-local` passed for `SUITE=resource_group` (14, including platform
+    publication and retired routes returning 404/405 and absent from OpenAPI)
+    and `SUITE=account_management` (22). CFS validation was pending locally
+    (`cfs`/`pipx` required), along with OAGW, remote AM (T41) and the SDK cache (T36).
+  - Evidence, 2026-11-17 dictionary amendment. RG's SQLite tests covered
+    rollback after DDL, rejection of deleted or unknown types with existing
+    keys, and reads that allocate no keys. `db_behavior_audit_test` passed.
+    The Docker-required PostgreSQL lane passed
+    `pg_migration_gts_type_dictionary_test`, `pg_smoke_test` and
+    `pg_concurrency_test`. Mutants verified rejection without consuming
+    identity values and convergent first-use races through serializable retry
+    or a read-committed `ON CONFLICT` re-read. RG SDK and toolkit-db secure
+    unit tests passed, as did toolkit-db's
+    `--features integration,pg --test group_scope_postgres`.
 - [ ] Quota-enforcement + storage plugin; consume materialized `resolved_schema`/`effective_traits`, retain catalogue checks and compile validators once at bootstrap (detailed requirements remain in T38)
 - [ ] License-resolver + static-license and license-enforcement; usage-collector + noop/ClickHouse/TimescaleDB
 - [ ] Event-broker declarations and cluster SDK ownership; event-broker's platform reads already exist. For system-group owners respect T37's prohibition on system publication capabilities: decide the supported seed/owner path before adding an attribute
@@ -3323,7 +3380,7 @@ Implementation exists in `libs/toolkit-gts/src/local.rs`, `libs/toolkit-gts-macr
   - **saga failures after the prerequisites are met** (business, database or IdP errors) — keep today's `handle_bootstrap_failure` policy (`account-management/src/gear.rs`): `RootBindingMismatch` is lifecycle-fatal regardless of policy, any other failure is fatal under `strict = true` and logged-and-skipped under `strict = false`. `bootstrap.strict` also keeps governing configuration validation as today
 - [x] Both static-idp-plugin and keycloak-idp-plugin publish config-built instances through `gts_publication(...)` and bind their real scoped backend in init after admission; configuration changes reconcile. Preserve backend behavior and verify Keycloak in its supported environment
 - [ ] AM's lazy IdP selection uses T40's selector rule: it waits while the instance or its schema is delayed, and a rejected instance never reads as success
-- [ ] Resource Group's init-only `ResourceGroupTypeBootstrap` keeps its sealed, no-REST boundary: `register_user_group_types` → RG `TypeService` uses RG's own database and schema validation without the registry (`resource-group/src/gear.rs:97-180`), so it stays in AM's `init`, proved by a test; the unscoped handle is never kept past its seal in `register_rest` or exposed remotely
+- [ ] AM's RG user-group types are AM-owned declarations admitted with AM's publication before `init` (T38b RG slice); no `ResourceGroupTypeBootstrap` or RG-local type catalogue remains, and RG resolves them through the registry it is wired to
 - [x] AM and both IdP plugins retain T32's API-migrated status and are now marked lifecycle-migrated in the audit, so T42 does not repeat either change. Drop `deps = [types_registry]` and the registry implementation-crate dependency together with the last init-time registry call; keep the SDK/resolving contract dependency
 
 **Verification:**
@@ -3362,7 +3419,7 @@ Implementation exists in `libs/toolkit-gts/src/local.rs`, `libs/toolkit-gts-macr
 ### Checkpoint 8A — Account Management after wiring and remotely
 - [ ] Real AM and static-idp-plugin publish declarations and configured entities after wiring, bootstrap an Active root and create and read child tenants through the new registry, in the embedded host and with the registry in another process (T41)
 - [ ] Both start orders, delayed dependencies, a configuration change and restarts converge; type-invalid requests are refused; root-binding drift is fatal and a refused root type holds readiness; application preparation covers AM publication; business bootstrap availability remains separate (#5547/#5562)
-- [ ] The production authenticator path is exercised; RG's init-only bootstrap boundary and real authz enforcement are intact; embedded AM suites pass
+- [ ] The production authenticator path is exercised; AM's RG types arrive through publication (no RG-local bootstrap) and real authz enforcement is intact; embedded AM suites pass
 - [ ] `make ci` (including the real AM remote target from T41 onward), gear tests on three backends, `make e2e-local` green; human review before T42 removes global inventory. Final deployment waits for Checkpoint 9
 
 ---

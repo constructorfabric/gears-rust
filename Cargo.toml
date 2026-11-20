@@ -950,10 +950,10 @@ jsonschema = { version = "0.60", default-features = false }
 email_address = { version = "0.2.9", default-features = false }
 walkdir = "2.5"
 
-# GTS library — published on crates.io.
-gts-id = "0.16.1"
-gts = "0.16.1"
-gts-macros = "0.16.1"
+# GTS library
+gts-id = "0.17.2"
+gts = "0.17.2"
+gts-macros = "0.17.2"
 
 license-resolver-sdk = { package = "cf-gears-license-resolver-sdk", version = "0.2.6", path = "gears/system/license-resolver/license-resolver-sdk" }
 license-resolver = { package = "cf-gears-license-resolver", version = "0.2.3", path = "gears/system/license-resolver/license-resolver" }

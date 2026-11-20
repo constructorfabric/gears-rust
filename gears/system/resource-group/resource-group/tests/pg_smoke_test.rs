@@ -52,12 +52,9 @@ mod common;
 
 use std::sync::Arc;
 
+use common::{CreateTypeRequest, UpdateTypeRequest};
 use resource_group::domain::error::DomainError;
 use resource_group::domain::group_service::GroupService;
-use resource_group::domain::type_service::TypeService;
-use resource_group::infra::storage::entity::gts_type::{
-    Column as GtsTypeColumn, Entity as GtsTypeEntity,
-};
 use resource_group::infra::storage::entity::resource_group::{
     Column as RgColumn, Entity as RgEntity,
 };
@@ -65,17 +62,15 @@ use resource_group::infra::storage::entity::resource_group_closure::{
     Column as ClosureColumn, Entity as ClosureEntity,
 };
 use resource_group::infra::storage::entity::resource_group_membership::{
-    self as membership_entity, Column as MembershipColumn, Entity as MembershipEntity,
+    Column as MembershipColumn, Entity as MembershipEntity,
 };
 use resource_group::infra::storage::group_repo::GroupRepository;
 use resource_group::infra::storage::migrations::Migrator;
-use resource_group::infra::storage::type_repo::TypeRepository;
-use resource_group_sdk::{CreateTypeRequest, UpdateTypeRequest};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use sea_orm_migration::MigratorTrait;
 use testcontainers::{ImageExt, runners::AsyncRunner};
 use testcontainers_modules::postgres::Postgres;
-use toolkit_db::secure::{SecureEntityExt, secure_insert};
+use toolkit_db::secure::SecureEntityExt;
 use toolkit_db::{
     ConnectOpts, DBProvider, DbError, connect_db, migration_runner::run_migrations_for_testing,
 };
@@ -176,15 +171,15 @@ macro_rules! pg_fixture_or_skip {
 /// single type build chains/trees of arbitrary depth. Mirrors
 /// `db_behavior_audit_test.rs`'s helper of the same name.
 async fn create_self_referencing_type(
-    type_svc: &TypeService<TypeRepository>,
+    type_svc: &common::TestTypes,
     suffix: &str,
-) -> resource_group_sdk::ResourceGroupType {
+) -> common::ResourceGroupType {
     // `resolve_ids` rejects a parent path that doesn't exist yet, so a type
     // can't reference itself as an allowed parent at create time; create it
     // plain, then update it to add the self-reference.
     let code = format!(
         "{}x.test.{}.i{}.v1~",
-        gts_id!("cf.core.rg.type.v1~"),
+        gts_id!("cf.core.rg.group.v1~"),
         suffix.to_ascii_lowercase(),
         Uuid::now_v7().as_simple()
     );
@@ -216,7 +211,7 @@ async fn create_self_referencing_type(
 /// returning the id of the last (deepest) node. Mirrors
 /// `db_behavior_audit_test.rs`'s helper of the same name.
 async fn build_chain(
-    group_svc: &GroupService<GroupRepository, TypeRepository>,
+    group_svc: &GroupService<GroupRepository>,
     ctx: &SecurityContext,
     type_code: &str,
     tenant_id: Uuid,
@@ -287,7 +282,7 @@ async fn pg_move_under_deep_parent_rebuilds_every_depth() {
     }
 
     group_svc
-        .move_group(subtree_root.id, Some(deepest))
+        .move_group(&ctx, subtree_root.id, Some(deepest))
         .await
         .expect("move subtree under the deepest chain node");
 
@@ -339,26 +334,10 @@ async fn pg_force_delete_leaves_no_orphans() {
     .await;
 
     // A direct membership insert (mirrors group_service_test.rs's
-    // group_force_delete_subtree): resolve the real surrogate gts_type_id
-    // instead of hard-coding one.
+    // group_force_delete_subtree), keyed through RG's type dictionary.
     let conn = db.conn().expect("conn");
     let scope = AccessScope::allow_all();
-    let root_type_id = GtsTypeEntity::find()
-        .filter(GtsTypeColumn::SchemaId.eq(&root_type.code))
-        .secure()
-        .scope_with(&scope)
-        .one(&conn)
-        .await
-        .expect("query gts_type")
-        .expect("type row exists")
-        .id;
-    let membership = membership_entity::ActiveModel {
-        group_id: Set(child.id),
-        gts_type_id: Set(root_type_id),
-        resource_id: Set("pg-smoke-resource".to_owned()),
-        ..Default::default()
-    };
-    secure_insert::<MembershipEntity>(membership, &scope, &conn)
+    common::insert_membership_directly(&db, child.id, &root_type.code, "pg-smoke-resource")
         .await
         .expect("insert membership");
 
@@ -413,15 +392,6 @@ async fn pg_force_delete_leaves_no_orphans() {
         mem_count, 0,
         "memberships for the deleted group should be gone"
     );
-
-    // With every membership of the subtree gone, nothing on real PostgreSQL
-    // FK-restricts deleting `root_type` any more: `ON DELETE RESTRICT` on
-    // `resource_group_membership.gts_type_id` is what would otherwise answer
-    // with "group(s) or membership(s) of this type exist".
-    type_svc
-        .delete_type_unscoped(&root_type.code)
-        .await
-        .expect("delete_type should succeed once the subtree's memberships are gone");
 }
 
 /// RG-06 on real PostgreSQL: a 4-deep create chain, then the full closure

@@ -121,17 +121,17 @@ error, while boolean schemas retain their native meaning. Payloads are not modif
 defaults are not inserted. Consumers choose freshness, lifecycle and availability policy,
 and construct their own payload envelopes; existing consumers migrate separately in T38.
 
-**Intermediate AM topology (implemented for the current execution slice).** An embedded
-registry configured `mode: legacy_only` keeps only the legacy client and v1 routes for RG:
-it registers neither new API locally, routes neither, runs no seeding or admission over a
-bound database and is not advertised in the service directory, so AM and its selected
-publishers reach a remote registry through the wiring that `gts_publication(...)` generates. The runtime
-publishes all application GTS Type Schemas and Instances before any application `init`; readiness waits for
-that barrier. `am-host publish-gts --registry <url>` publishes the same
-GTS Type Schemas and Instances as a deployment step. RG's sealed local
-`ResourceGroupTypeBootstrap` is unchanged. The composition is
-`apps/cf-gears-am-host` with flight-control as the remote registry (`config/am-remote-*.yaml`,
-`make e2e-am-remote`).
+**Intermediate AM topology.** An embedded `legacy_only` registry serves the
+legacy client and v1 routes. It skips seeding, admission and service-directory
+advertisement. New API calls go to the remote registry. AM publishes through
+`gts_publication(...)`, including its RG declarations. RG reads definitions
+through `TypesRegistryApi` with the caller's context and stores only type keys
+and their identifiers locally.
+
+Application readiness waits for GTS Type Schema and Instance publication
+before `init`. The server's `publish-gts --registry <url>` subcommand publishes
+the same documents during deployment. The dedicated AM remote host, its two
+configs and `make e2e-am-remote` are deferred to T41. See [the P0 spec](../docs/p0/SPEC.md).
 
 ## Publishing from a gear
 

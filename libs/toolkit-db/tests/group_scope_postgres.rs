@@ -24,8 +24,8 @@ use toolkit_db::secure::{SecureEntityExt, secure_insert};
 use toolkit_security::{AccessScope, ScopeConstraint, ScopeFilter, ScopeValue, pep_properties};
 use uuid::Uuid;
 
-const RESOURCE_MEMBER_TYPE: &str = "gts.cf.core.rg.type.v1~example.core.rg.resource.v1~";
-const OTHER_MEMBER_TYPE: &str = "gts.cf.core.rg.type.v1~example.core.rg.other.v1~";
+const RESOURCE_MEMBER_TYPE: &str = "gts.cf.core.rg.group.v1~example.core.rg.resource.v1~";
+const OTHER_MEMBER_TYPE: &str = "gts.cf.core.rg.group.v1~example.core.rg.other.v1~";
 
 #[derive(Iden)]
 enum ResourceTable {
@@ -380,7 +380,7 @@ async fn in_group_casts_uuid_to_text_and_excludes_other_member_types() -> Result
         ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant_id]),
         ScopeFilter::in_group_typed(
             pep_properties::RESOURCE_ID,
-            "gts.cf.core.rg.type.v1~example.core.rg.missing.v1~",
+            "gts.cf.core.rg.group.v1~example.core.rg.missing.v1~",
             vec![ScopeValue::Uuid(group_id)],
         ),
     ]));

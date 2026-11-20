@@ -15,7 +15,7 @@ use crate::domain::error::DomainError;
 
 /// Errors attributable to a resource group as a resource.
 ///
-/// The macro literal mirrors [`resource_group_sdk::gts::GROUP_RESOURCE_TYPE`]
+/// The macro literal mirrors [`resource_group_sdk::gts::GROUP_TYPE_ID`]
 /// (proc-macros cannot resolve a const); the SDK round-trip tests pin the
 /// two equal.
 #[resource_error(gts_id!("cf.core.rg.group.v1~"))]
@@ -64,13 +64,6 @@ impl From<DomainError> for CanonicalError {
                     .create()
             }
             // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2b
-            // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2c
-            DomainError::TypeAlreadyExists { code } => {
-                RgError::already_exists(format!("GTS type with code '{code}' already exists"))
-                    .with_resource(code)
-                    .create()
-            }
-            // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2c
             // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2d
             DomainError::InvalidParentType { message } => RgError::invalid_argument()
                 .with_field_violation(
@@ -80,16 +73,6 @@ impl From<DomainError> for CanonicalError {
                 )
                 .create(),
             // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2d
-            // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2e
-            // ⚠ wire change accepted in the migration plan: 409 → 400.
-            DomainError::AllowedParentTypesViolation { message } => RgError::failed_precondition()
-                .with_precondition_violation(
-                    precondition::ALLOWED_PARENTS_SUBJECT,
-                    message,
-                    precondition::STATE_TYPE,
-                )
-                .create(),
-            // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2e
             // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2f
             // ⚠ wire change accepted in the migration plan: 409 → 400.
             DomainError::CycleDetected { message } => RgError::failed_precondition()
@@ -160,11 +143,28 @@ impl From<DomainError> for CanonicalError {
                     .create()
             }
             // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2j
-            // ServiceUnavailable: no dedicated variant — DB / infra failures
-            // fall through to the Database arm below and surface as a
-            // canonical Internal (HTTP 500). A genuine 503 (e.g. AuthZ
-            // Resolver unreachable) is produced by platform middleware
-            // upstream of this mapper, not here.
+            // ServiceUnavailable: a transient types-registry read failure
+            // (outage, deadline, quota, aborted read) is a 503 carrying the
+            // registry's retry hint. DB / infra failures fall through to the
+            // Database arm below and surface as a canonical Internal (HTTP
+            // 500).
+            DomainError::ServiceUnavailable {
+                message,
+                retry_after_seconds,
+            } => {
+                tracing::warn!(reason = %message, "resource-group dependency unavailable");
+                let unavailable = CanonicalError::service_unavailable();
+                match retry_after_seconds {
+                    Some(seconds) => unavailable.with_retry_after_seconds(seconds).create(),
+                    None => unavailable.create(),
+                }
+            }
+            // The types registry refused the caller (401/403): its refusal is
+            // returned unchanged, so the caller sees who denied access.
+            DomainError::RegistryRefusedCaller(refusal) => {
+                tracing::debug!(error = %refusal, "types registry refused the caller");
+                refusal
+            }
             // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2j
             // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2k
             // Source description flows into the canonical's `ctx.description`

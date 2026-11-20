@@ -23,38 +23,35 @@
   - [Cycle Detection](#cycle-detection)
   - [Closure Table Rebuild for Subtree Move](#closure-table-rebuild-for-subtree-move)
   - [Query Profile Enforcement](#query-profile-enforcement)
-  - [Group Data Seeding](#group-data-seeding)
 - [4. States (CDSL)](#4-states-cdsl)
 - [5. Definitions of Done](#5-definitions-of-done)
   - [Entity Service](#entity-service)
   - [Hierarchy Engine](#hierarchy-engine)
   - [Group REST Handlers and Hierarchy Endpoint](#group-rest-handlers-and-hierarchy-endpoint)
-  - [Group Data Seeding](#group-data-seeding-1)
   - [Unit Test Coverage for Entity Hierarchy](#unit-test-coverage-for-entity-hierarchy)
   - [REST API Test Coverage](#rest-api-test-coverage)
 - [6. Acceptance Criteria](#6-acceptance-criteria)
 - [7. Unit Test Plan](#7-unit-test-plan)
-  - [Gear-Level Summary](#gear-level-summary)
-  - [Coverage Summary](#coverage-summary)
+  - [Current Verification Suites](#current-verification-suites)
   - [Entity Hierarchy Test Cases](#entity-hierarchy-test-cases)
   - [Group `metadata` — Barrier as Data](#group-metadata--barrier-as-data)
   - [REST-level metadata serialization](#rest-level-metadata-serialization)
   - [Invalid / Non-GTS Input Tests](#invalid--non-gts-input-tests)
   - [ADR-001 Hierarchy Reproduction in RG Gear](#adr-001-hierarchy-reproduction-in-rg-gear)
-  - [metadata Validation Against Type's metadata_schema](#metadata-validation-against-types-metadata_schema)
+  - [Metadata Validation Against the Materialized Registry Schema](#metadata-validation-against-the-materialized-registry-schema)
   - [REST API Layer](#rest-api-layer)
   - [Priority Matrix](#priority-matrix)
   - [Acceptance Criteria](#acceptance-criteria)
   - [Closure Table Assertions (`resource_group_closure`)](#closure-table-assertions-resource_group_closure)
   - [Entity State Assertions (`resource_group` table)](#entity-state-assertions-resource_group-table)
   - [Hierarchy Endpoint Response Shape](#hierarchy-endpoint-response-shape)
-  - [Seeding DB Verification](#seeding-db-verification)
   - [Test Infrastructure](#test-infrastructure)
 - [8. E2E Test Plan](#8-e2e-test-plan)
-  - [S5: `test_hierarchy_closure_postgresql`](#s5-test_hierarchy_closure_postgresql)
-  - [S6: `test_move_closure_rebuild_postgresql`](#s6-test_move_closure_rebuild_postgresql)
-  - [S7: `test_force_delete_cascade_postgresql`](#s7-test_force_delete_cascade_postgresql)
+  - [S5: `test_hierarchy_closure`](#s5-test_hierarchy_closure)
+  - [S6: `test_move_closure_rebuild`](#s6-test_move_closure_rebuild)
+  - [S7: `test_force_delete_cascade`](#s7-test_force_delete_cascade)
   - [Acceptance Criteria (S5, S6, S7)](#acceptance-criteria-s5-s6-s7)
+  - [Registry Migration Verification](#registry-migration-verification)
 
 <!-- /toc -->
 
@@ -62,7 +59,7 @@
 
 ### 1.1 Overview
 
-Group entity lifecycle (create, get, update, move, delete) with strict forest invariants (single parent, no cycles), closure-table-based hierarchy engine for efficient ancestor/descendant queries, query profile enforcement (`max_depth`/`max_width`), subtree move/delete operations, hierarchy depth endpoint with relative depth, force delete, and group data seeding.
+Group entity lifecycle (create, get, update, move, delete) with strict forest invariants (single parent, no cycles), closure-table-based hierarchy engine for efficient ancestor/descendant queries, query profile enforcement (`max_depth`/`max_width`), subtree move/delete operations, hierarchy depth endpoint with relative depth, force delete.
 
 ### 1.2 Purpose
 
@@ -78,7 +75,7 @@ Groups are the core nodes of the resource group hierarchy. This feature implemen
 
 | Actor | Role in Feature |
 |-------|-----------------|
-| `cpt-cf-resource-group-actor-instance-administrator` | Manages group hierarchy via REST API, operates group seeding |
+| `cpt-cf-resource-group-actor-instance-administrator` | Manages group hierarchy via REST API; consumers own deployment provisioning |
 | `cpt-cf-resource-group-actor-tenant-administrator` | Manages groups within tenant scope via REST API |
 | `cpt-cf-resource-group-actor-apps` | Programmatic group management via `ResourceGroupClient` SDK |
 
@@ -105,27 +102,30 @@ Groups are the core nodes of the resource group hierarchy. This feature implemen
 **Error Scenarios**:
 - Invalid type → Validation error
 - Parent not found → NotFound
-- Parent type not in allowed_parents → InvalidParentType
-- Type does not allow root placement (can_be_root=false) and no parent → Validation error
+- The schema rejects the actual parent type → Validation error
+- The schema rejects `parent_type: null` for a root → Validation error
 - Creating a tenant-type group as root while another tenant-type root already exists → `TenantRootAlreadyExists` (409 Conflict)
 - Depth or width limit exceeded → LimitViolation
+
+RG reads the active registry snapshot and compiles the validator before the
+transaction. The validator checks the actual parent and resulting payload in the transaction. Type and tenant identifiers are immutable after creation.
 
 **Steps**:
 1. [x] - `p1` - Actor sends POST /api/resource-group/v1/groups with {type, name, metadata, hierarchy: {parent_id, tenant_id}} - `inst-create-group-1`
 2. [x] - `p1` - DB: BEGIN transaction (SERIALIZABLE isolation) - `inst-create-group-2`
-3. [x] - `p1` - Resolve type GTS path to surrogate ID; verify type exists - `inst-create-group-3`
+3. [x] - `p1` - Use the active registry snapshot resolved before the transaction; persist its GTS identifier - `inst-create-group-3`
 4. [x] - `p1` - **IF** parent_id is provided - `inst-create-group-4`
    1. [x] - `p1` - DB: SELECT id, gts_type_id, tenant_id FROM resource_group WHERE id = {parent_id} — load parent in tx - `inst-create-group-4a`
    2. [x] - `p1` - **IF** parent not found → **RETURN** NotFound - `inst-create-group-4b`
-   3. [x] - `p1` - Validate child type's allowed_parents includes parent's type - `inst-create-group-4c`
-   4. [x] - `p1` - **IF** type incompatible → **RETURN** InvalidParentType - `inst-create-group-4d`
+   3. [x] - `p1` - Validate the group payload with the actual parent's type - `inst-create-group-4c`
+   4. [x] - `p1` - **IF** the schema rejects the payload → **RETURN** Validation error - `inst-create-group-4d`
    5. [x] - `p1` - Invoke query profile enforcement: check depth limit - `inst-create-group-4e`
    6. [x] - `p1` - Invoke query profile enforcement: check width limit (sibling count under parent) - `inst-create-group-4f`
 5. [x] - `p1` - **ELSE** (root group) - `inst-create-group-5`
-   1. [x] - `p1` - **IF** type does not allow root placement (can_be_root=false) → **RETURN** Validation error - `inst-create-group-5a`
-   2. [x] - `p1` - **IF** type code starts with `TENANT_RG_TYPE_PATH` (tenant type) AND there already exists any other root group whose type is a tenant type → **RETURN** `TenantRootAlreadyExists` (409 Conflict) - `inst-create-group-5c`
-6. [x] - `p1` - **IF** metadata provided AND type has metadata_schema → validate metadata against the chained GTS type schema via `TypesRegistryClient` (types-registry-sdk, already in workspace). The `gts` crate (v0.8.4) validates metadata fields against the inline `metadata` sub-schema defined in the chained RG type (`additionalProperties: false`, field types, `maxLength`). **IF** invalid → **RETURN** Validation error with field-level details - `inst-create-group-5b`
-7. [x] - `p1` - DB: INSERT INTO resource_group (id, parent_id, gts_type_id, name, metadata, tenant_id) - `inst-create-group-6`
+   1. [x] - `p1` - **IF** the schema rejects `parent_type: null` → **RETURN** Validation error - `inst-create-group-5a`
+   2. [x] - `p1` - **IF** type code starts with `TENANT_GROUP_TYPE_ID` (tenant type) AND there already exists any other root group whose type is a tenant type → **RETURN** `TenantRootAlreadyExists` (409 Conflict) - `inst-create-group-5c`
+6. [x] - `p1` - Before the write transaction, compile the SDK validator from the materialized registry schema - `inst-create-group-5b`
+7. [x] - `p1` - After validation and the caller-supplied ID check, resolve the type key in the transaction and insert the group - `inst-create-group-6`
 7. [x] - `p1` - DB: INSERT INTO resource_group_closure (ancestor_id=id, descendant_id=id, depth=0) — self-row - `inst-create-group-7`
 8. [x] - `p1` - **IF** parent_id is provided - `inst-create-group-8`
    1. [x] - `p1` - DB: INSERT INTO resource_group_closure — ancestor rows from parent's ancestors with depth+1 - `inst-create-group-8a`
@@ -140,25 +140,25 @@ Groups are the core nodes of the resource group hierarchy. This feature implemen
 **Actor**: `cpt-cf-resource-group-actor-tenant-administrator`
 
 **Success Scenarios**:
-- Group name, metadata, or type updated successfully
-- On type change: children's types validated against new type
+- Group name, metadata, or parent updated successfully
+- Group type and tenant ownership remain immutable; parent changes validate the moved subtree placement
 
 **Error Scenarios**:
 - Group not found → NotFound
-- New type's allowed_parents does not include current parent → InvalidParentType
-- Children's types do not include new type in their allowed_parents → InvalidParentType
+- The group schema rejects the new parent type → Validation error
+- Replacement metadata, including removal, violates the type schema → Validation
 
 **Steps**:
-1. [x] - `p1` - Actor sends PUT /api/resource-group/v1/groups/{group_id} with {name, type, metadata} - `inst-update-group-1`
+1. [x] - `p1` - Actor sends PUT /api/resource-group/v1/groups/{group_id} with {name, parent_id, metadata}; nullable replacement fields must be explicit - `inst-update-group-1`
 2. [x] - `p1` - DB: SELECT FROM resource_group WHERE id = {group_id} — load existing group - `inst-update-group-2`
 3. [x] - `p1` - **IF** group not found → **RETURN** NotFound - `inst-update-group-3`
-4. [x] - `p1` - **IF** type is changed - `inst-update-group-4`
-   1. [x] - `p1` - Validate new type's allowed_parents permits current parent's type (or new type allows root if no parent) - `inst-update-group-4a`
-   2. [x] - `p1` - DB: SELECT gts_type_id FROM resource_group WHERE parent_id = {group_id} — load children types - `inst-update-group-4b`
-   3. [x] - `p1` - **FOR EACH** child: verify child's type includes new type in allowed_parents - `inst-update-group-4c`
-   4. [x] - `p1` - **IF** any child would become invalid → **RETURN** InvalidParentType with child details - `inst-update-group-4d`
-5. [x] - `p1` - **IF** metadata provided AND type has metadata_schema → validate metadata against the chained GTS type schema via `TypesRegistryClient` / `gts` crate. **IF** invalid → **RETURN** Validation error - `inst-update-group-4e`
-6. [x] - `p1` - DB: UPDATE resource_group SET name, gts_type_id, metadata, updated_at — apply changes - `inst-update-group-5`
+4. [x] - `p1` - Preserve the stored type identifier and refuse a mismatched pre-read type snapshot - `inst-update-group-4`
+   1. [x] - `p1` - Require the preloaded type snapshot when the parent changes - `inst-update-group-4a`
+   2. [x] - `p1` - Determine whether the current row requires a structural parent change - `inst-update-group-4b`
+   3. [x] - `p1` - Escalate an unexpected parent change to a serializable retry before any write - `inst-update-group-4c`
+   4. [x] - `p1` - Validate the move with the current parent snapshot, group schema and closure rules - `inst-update-group-4d`
+5. [x] - `p1` - Compile the schema before the transaction. Validate metadata against the actual parent and require a retry if concurrent metadata would be cleared without validation - `inst-update-group-4e`
+6. [x] - `p1` - DB: UPDATE resource_group SET name, parent_id, metadata, updated_at — preserve type and tenant identifiers - `inst-update-group-5`
 7. [x] - `p1` - **RETURN** updated ResourceGroup - `inst-update-group-6`
 
 ### Move Group (Subtree)
@@ -175,7 +175,7 @@ Groups are the core nodes of the resource group hierarchy. This feature implemen
 - New parent not found → NotFound
 - New parent is a descendant of group → CycleDetected
 - Self-parent attempt → CycleDetected
-- Parent type incompatible → InvalidParentType
+- The group schema rejects the parent type → Validation error
 - Depth or width limit exceeded at new position → LimitViolation
 
 **Steps**:
@@ -276,23 +276,6 @@ Groups are the core nodes of the resource group hierarchy. This feature implemen
    2. [x] - `p1` - **IF** sibling_count + 1 > max_width → **RETURN** LimitViolation: WidthLimitExceeded with current width and limit - `inst-profile-3b`
 4. [x] - `p1` - **RETURN** pass - `inst-profile-4`
 
-### Group Data Seeding
-
-- [x] `p1` - **ID**: `cpt-cf-resource-group-algo-entity-hier-seed-groups`
-
-**Input**: List of group seed definitions with parent references and type assignments
-
-**Output**: Seed result (groups created, updated, unchanged count)
-
-**Steps**:
-1. [x] - `p1` - Load seed definitions, order by dependency (parents before children) - `inst-seed-groups-1`
-2. [x] - `p1` - **FOR EACH** seed_def in ordered definitions - `inst-seed-groups-2`
-   1. [x] - `p1` - DB: SELECT FROM resource_group WHERE id = {seed_def.id} or name/type match - `inst-seed-groups-2a`
-   2. [x] - `p1` - **IF** group exists AND definition matches → skip (unchanged) - `inst-seed-groups-2b`
-   3. [x] - `p1` - **IF** group exists AND definition differs → update via update flow - `inst-seed-groups-2c`
-   4. [x] - `p1` - **IF** group does not exist → create via create flow (validates type compat, builds closure) - `inst-seed-groups-2d`
-3. [x] - `p1` - **RETURN** seed result: {created: N, updated: N, unchanged: N} - `inst-seed-groups-3`
-
 ## 4. States (CDSL)
 
 Not applicable. Groups exist as hierarchy nodes without lifecycle states. A group is either present in the hierarchy or deleted. Structural integrity (parent-child relationships, closure projections) is managed by the entity service and hierarchy engine, not by state machine transitions.
@@ -308,7 +291,7 @@ The system **MUST** implement an Entity Service that provides create, get, updat
 **Required behavior**:
 - Create: validate type, parent compatibility, profile limits; persist entity + closure rows in SERIALIZABLE tx
 - Get: retrieve by UUID; return NotFound if absent
-- Update: validate type change against parent and children compatibility; update mutable fields
+- Update: preserve the group type, validate supplied metadata and any parent change; update mutable fields
 - Move: cycle detection, parent type validation, profile limits; rebuild closure paths in SERIALIZABLE tx with bounded retry
 - Delete: reference check (children + memberships); reject or force-cascade; remove closure rows
 - All hierarchy-mutating writes (create/move/delete) use SERIALIZABLE isolation with bounded retry for serialization conflicts
@@ -359,7 +342,7 @@ The system **MUST** implement REST endpoint handlers for group management under 
 - `GET /groups` — list groups with OData `$filter` (fields: `type`, `hierarchy/parent_id`, `tenant_id`, `id`, `name`; operators: `eq`, `ne`, `in`) and cursor-based pagination
 - `POST /groups` — create group, return 201 Created
 - `GET /groups/{group_id}` — get group by UUID, return 404 if not found
-- `PUT /groups/{group_id}` — update group (name, type, metadata) or move group (hierarchy.parent_id), return 200 OK
+- `PUT /groups/{group_id}` — replace mutable fields (name, parent_id, metadata); type and tenant ownership remain immutable, return 200 OK
 - `DELETE /groups/{group_id}?force={true|false}` — delete group, return 204 No Content
 - `GET /groups/{group_id}/hierarchy` — hierarchy depth traversal with OData `$filter` on `hierarchy/depth` and `type`, cursor-based pagination
 
@@ -371,25 +354,6 @@ The system **MUST** implement REST endpoint handlers for group management under 
 
 **Touches**:
 - API: `GET/POST /api/resource-group/v1/groups`, `GET/PUT/DELETE /api/resource-group/v1/groups/{group_id}`, `GET /api/resource-group/v1/groups/{group_id}/hierarchy`
-
-### Group Data Seeding
-
-- [x] `p1` - **ID**: `cpt-cf-resource-group-dod-entity-hier-seeding`
-
-The system **MUST** provide an idempotent group seeding mechanism for deployment bootstrapping.
-
-**Required behavior**:
-- Accept ordered list of group seed definitions (parents before children)
-- For each seed: create if missing, update if definition differs, skip if unchanged
-- Validate parent-child links, type compatibility, and profile limits during seeding
-- Seeding runs as a pre-deployment step with system SecurityContext
-- Repeated runs produce the same result (idempotent)
-
-**Implements**:
-- `cpt-cf-resource-group-algo-entity-hier-seed-groups`
-
-**Touches**:
-- DB: `resource_group`, `resource_group_closure`
 
 ### Unit Test Coverage for Entity Hierarchy
 
@@ -408,25 +372,24 @@ All acceptance criteria from feature 0003 are covered by automated tests:
 - [x] `p2` - **ID**: `cpt-cf-resource-group-dod-testing-rest-api`
 
 REST-level tests for endpoints not covered by existing `api_rest_test.rs`:
-- PUT /types/{code} (update type)
 - POST/DELETE /memberships/{group_id}/{type}/{resource_id}
 - GET /groups/{id}/hierarchy
 - DELETE /groups/{id}?force=true
 
 ## 6. Acceptance Criteria
 
-- [x] Root group (can_be_root=true, no parent) is created with self-referencing closure row (depth=0)
+- [x] Root group whose schema admits `parent_type: null` is created with self-referencing closure row (depth=0)
 - [x] Child group is created with closure rows linking to all ancestors at correct depths
-- [x] Creating group with parent of incompatible type returns `InvalidParentType` (409)
+- [x] Creating group with parent of incompatible type returns a validation error (400)
 - [x] Creating group with nonexistent parent returns `NotFound` (404)
-- [x] Creating root group when type has can_be_root=false returns validation error (400)
+- [x] Creating a root when its schema rejects `parent_type: null` returns validation error (400)
 - [x] Moving group to new parent rebuilds closure paths transactionally for entire subtree
-- [x] Moving group under its own descendant returns `CycleDetected` (409)
-- [x] Moving group under itself (self-parent) returns `CycleDetected` (409)
-- [x] Moving group to incompatible parent type returns `InvalidParentType` (409)
-- [x] Updating group type validates both parent and children compatibility
+- [x] Moving group under its own descendant returns `CycleDetected` (400)
+- [x] Moving group under itself (self-parent) returns `CycleDetected` (400)
+- [x] Moving group to incompatible parent type returns a validation error (400)
+- [x] Group type is immutable; reparenting validates placement against the admitted type snapshot
 - [x] Deleting leaf group (no children, no memberships) succeeds (204) and removes closure rows
-- [x] Deleting group with children without force returns `ConflictActiveReferences` (409) with response body listing blocking entities (children count/IDs and membership count) so the caller can display what prevents deletion
+- [x] Deleting group with children without force returns `ConflictActiveReferences` (400) with response body listing blocking entities (children count/IDs and membership count) so the caller can display what prevents deletion
 - [x] Force delete removes entire subtree including memberships and closure rows
 - [x] Hierarchy endpoint returns ancestors (negative depth) and descendants (positive depth) with correct relative distances
 - [x] OData `$filter` on `hierarchy/depth` supports eq, ne, gt, ge, lt, le operators
@@ -434,104 +397,40 @@ REST-level tests for endpoints not covered by existing `api_rest_test.rs`:
 - [x] Write operations that exceed max_width are rejected with `WidthLimitExceeded`
 - [x] Reads return full stored data even when profile was tightened (no truncation)
 - [x] Concurrent hierarchy mutations use SERIALIZABLE isolation with bounded retry
-- [x] Group seeding creates hierarchy with correct parent-child links and closure rows (idempotent)
-- [x] Creating group with metadata that violates type's metadata_schema returns Validation error (400) — field type mismatch, maxLength exceeded, unknown field (additionalProperties:false)
-- [x] Creating group with valid metadata matching type's metadata_schema succeeds
-- [x] Updating group metadata validates against type's metadata_schema
-- [x] Creating group when type has no metadata_schema accepts any metadata (no validation)
+- [x] Consumers provision group hierarchies through the ordinary authorized API after publishing their types
+- [x] Creating group with metadata that violates materialized payload schema returns Validation error (400) — field type mismatch, maxLength exceeded, unknown field (additionalProperties:false)
+- [x] Creating group with valid metadata matching materialized payload schema succeeds
+- [x] Updating group metadata validates against materialized payload schema
+- [x] Creating a group is checked against the admitted full payload schema, including inherited constraints
 ---
 
 ## 7. Unit Test Plan
 
 > General testing philosophy, patterns, and infrastructure: [`docs/toolkit_unified_system/12_unit_testing.md`](../../../../../docs/toolkit_unified_system/12_unit_testing.md).
 
-### Gear-Level Summary
+### Current Verification Suites
 
-~325 tests (308 in `cf-gears-resource-group` + 17 in `cf-gears-resource-group-sdk`). Fast (< 5s total). Zero sleeps. Every test atomic.
+Tests publish type definitions before exercising group operations.
 
-Unit tests guard **deterministic domain logic** — the same logic that runs identically regardless of whether it's called via HTTP or directly in Rust. If a test needs a real PostgreSQL or a real HTTP connection, it belongs in Feature 0007 (E2E), not here.
-
-This feature covers the unit and integration test plan for the `resource-group` gear. The current test suite contains 318 tests (302 in `cf-gears-resource-group` across 10 test files + inline `#[cfg(test)]` gears, 16 in `cf-gears-resource-group-sdk`) totaling ~9,400 lines of test code. All tests pass with 0 failures.
-
-The plan was originally based on a gap analysis against acceptance criteria defined in features 0001-0005 and ADR-001 (GTS Type System). The analysis incorporates:
-- Acceptance criteria from features 0001-0005 and ADR-001
-- Testing patterns from other project gears (`nodes-registry`, `types-registry`, `api-gateway`)
-- ADR-001 metadata validation requirements (`additionalProperties: false`, field types, maxLength constraints)
-
-**Scope**: Domain service tests with SQLite in-memory, in-source `#[cfg(test)]` for pure logic, metadata validation against `metadata_schema`.
-
-**Out of scope**: E2E tests (Feature 0007), PostgreSQL-specific tests, MTLS (`p2` — deferred, not implemented yet), performance.
-
-### Coverage Summary
-
-#### What IS Covered
-
-**cf-gears-resource-group** (302 tests):
-
-| File | Tests | Covers |
-|------|-------|--------|
-| In-source `#[cfg(test)]` (lib.rs) | 23 | Inline tests in `auth.rs` (JWT mode routing — `p1`; MTLS mode routing and path matching — `p2`, deferred / not implemented yet), `dto.rs` (DTO serde attributes, `type` rename, camelCase), `odata_mapper.rs` (Type/Group/Hierarchy/Membership ODataMapper field→column) |
-| `api_rest_test.rs` | 54 | Type CRUD REST (create 201, dup 409, invalid 400, list 200, get 200/404, delete 204), Group REST (create/list/get/update/delete/hierarchy), Membership REST (add/remove/list), RFC 9457 error format + Content-Type verification (TC-REST-10), deserialization errors, SMALLINT non-exposure, metadata in REST responses, route smoke all 14 endpoints (RG7) |
-| `authz_integration_test.rs` | 9 | PolicyEnforcer tenant scoping, deny-all, allow-all, resource_id passing, all CRUD actions, full chain list_groups/deny |
-| `domain_unit_test.rs` | 79 | `validate_type_code` (5 cases), `DomainError` construction (13 variants), `DomainError` → `ResourceGroupError` mapping, `DomainError` → `Problem` mapping, serialization failure detection, `EnforcerError` → `DomainError` conversions, `DbErr` → `DomainError`, ADR-001 hierarchy reproduction, GTS-specific logic, invalid/non-GTS input validation |
-| `group_service_test.rs` | 55 | TC-GRP-01..38: child creation + closure rows, 3-level hierarchy, incompatible parent type, can_be_root enforcement, move with closure rebuild, cycle detection, self-parent, type change validation, leaf/force delete, hierarchy depth traversal, max_depth/max_width enforcement, name validation, cross-tenant parent, simultaneous type+parent change, detach to root, metadata barrier tests |
-| `type_service_test.rs` | 45 | TC-TYP-01..16 + TC-META-01..11 + TC-META-ATK-01..11 + TC-GTS-01..15: create/update/delete types, placement invariant, hierarchy safety checks, metadata_schema round-trip (Object/Array/String/Number), `__can_be_root` derivation/fallback, internal key stripping, security attack vectors (privilege escalation, DoS, SQL injection), resolve_id/resolve_ids, allowed_parents/memberships resolution |
-| `membership_service_test.rs` | 15 | TC-MBR-01..15: add/remove membership, nonexistent group, duplicate, unregistered type, not in allowed_memberships, tenant incompatibility, multiple resource types, first-always-allowed tenant, empty resource_id |
-| `seeding_test.rs` | 12 | TC-SEED-01..12: seed_types (create/skip/update/idempotent), seed_groups (create with closure/skip/wrong order), seed_memberships (create/duplicate skip/tenant-incompatible skip/nonexistent group), empty list |
-| `tenant_filtering_db_test.rs` | 7 | Tenant isolation (list/get/hierarchy/update/delete cross-tenant), InGroup predicate, membership data storage |
-| `tenant_scoping_test.rs` | 10 | AccessScope construction (for_tenant, for_tenants, allow_all, deny_all, tenant_only, for_resource) |
-
-**cf-gears-resource-group-sdk** (16 tests):
-
-| File | Tests | Covers |
-|------|-------|--------|
-| `models.rs` (in-source) | 10 | TC-SDK-01..24: `GtsTypePath::new()` validation (valid/invalid/boundary), trim+lowercase normalization, serde round-trip (JSON serialize/deserialize, invalid rejection), `Display`+`Into<String>`, SDK model camelCase serialization, `type` field rename, optional field omission, `QueryProfile::default()` |
-| `odata/groups.rs` (in-source) | 3 | TC-ODATA-01..03: `GroupFilterField` names, kinds, `FIELDS` completeness |
-| `odata/hierarchy.rs` (in-source) | 1 | TC-ODATA-04: `HierarchyFilterField` names and kinds |
-| `odata/memberships.rs` (in-source) | 1 | TC-ODATA-05: `MembershipFilterField` names and kinds |
-
-**Total**: ~9,700 lines of test code, 325 tests (all passing), 0 failed
-
-#### What IS NOT Covered (Gaps)
-
-> **Status as of 2026-03-29**: Gap analysis updated after full test suite run (318 tests passing). Most original gaps (G1-G52) have been closed. Remaining open gaps and newly discovered gaps are listed below.
-
-**Original gaps (G1-G52) — status:**
-
-| # | Area | Gap | Status |
-|---|------|-----|--------|
-| G1-G7 | Type Management | CRUD, safety checks, placement invariant, delete | ✅ **CLOSED** — 45 tests in `type_service_test.rs` |
-| G8-G24 | Group Hierarchy | Create/move/delete, closure, cycles, query profile, type compat | ✅ **CLOSED** — 55 tests in `group_service_test.rs` |
-| G25-G33 | Membership | Add/remove, validation, tenant compat, duplicates | ✅ **CLOSED** — 15 tests in `membership_service_test.rs` |
-| G34-G35 | REST Layer | Update type, membership endpoints | ✅ **CLOSED** — 53 tests in `api_rest_test.rs` (PUT type, POST/DELETE membership, hierarchy, force delete, metadata, SMALLINT non-exposure, deserialization errors, GTS tilde encoding, error Content-Type) |
-| G36-G38 | SDK Value Object | `GtsTypePath` validation, serde, format matching | ✅ **CLOSED** — 10 tests in `models.rs` (in-source) |
-| G39-G41 | DTO & Serde | `From` impls, `type` rename, camelCase, skip_serializing_if | ✅ **CLOSED** — inline tests in `dto.rs` |
-| G42-G44 | OData Filter Fields | GroupFilterField, HierarchyFilterField, MembershipFilterField | ✅ **CLOSED** — 5 tests in SDK `odata/*.rs` (in-source) |
-| G45 | OData Mapper | Field-to-column mapping for all mappers | ✅ **CLOSED** — 4 tests in `odata_mapper.rs`: Type (TC-ODATA-06), Group (TC-ODATA-07), Hierarchy (TC-ODATA-08a), Membership (TC-ODATA-08) |
-| G46-G48 | Seeding | seed_types, seed_groups, seed_memberships | ✅ **CLOSED** — 12 tests in `seeding_test.rs` |
-| G49-G51 | Error Chains | EnforcerError/DbErr → DomainError | ✅ **CLOSED** — covered in `domain_unit_test.rs` (79 tests) |
-| G52 | QueryProfile | `QueryProfile::default()` values | ✅ **CLOSED** — tested in SDK `models.rs` |
-
-**Remaining open gaps (RG):**
-
-| # | Priority | Area | Gap | Impact |
-|---|----------|------|-----|--------|
-| ~~RG2~~ | ~~CRITICAL~~ | ~~OData Mappers~~ | ✅ **CLOSED** — TC-ODATA-07 (Group), TC-ODATA-08a (Hierarchy), TC-ODATA-08 (Membership) all implemented in `odata_mapper.rs` | |
-| ~~RG3~~ | ~~CRITICAL~~ | ~~REST: Error Mapping~~ | ✅ **CLOSED** — TC-REST-10 added to `api_rest_test.rs`: verifies Content-Type `application/problem+json` and correct status codes (404, 409, 400) + no internal leak fields | |
-| ~~RG4~~ | ~~HIGH~~ | ~~REST: Response DTO Serialization~~ | ✅ **CLOSED** — 7 inline DTO tests (TC-DTO-01..07) in `dto.rs` cover all `From` impls, serde attributes, and field conversion. 2 REST tests (`rest_group_response_omits_null_metadata`, `rest_type_response_omits_null_metadata_schema`) verify `skip_serializing_if` null omission at HTTP level. | |
-| ~~RG5~~ | ~~HIGH~~ | ~~Infrastructure: Repositories~~ | **ACCEPTED** — repository logic is thoroughly covered indirect via 55 group service, 45 type service, 15 membership service, and 12 seeding tests that exercise every repo method through real SQLite DB. Direct repo unit tests would duplicate this coverage without additional value. | |
-| ~~RG6~~ | ~~MEDIUM~~ | ~~gear init~~ | **ACCEPTED** — `gear.rs` initialization is integration-level wiring (OnceLock, ClientHub, capability registration) that cannot be meaningfully tested without a full server bootstrap. Covered by E2E tests (0007 S1-S10) which exercise the real initialized gear. | |
-| ~~RG7~~ | ~~MEDIUM~~ | ~~REST: Route Registration~~ | ✅ **CLOSED** — `rest_route_smoke_all_endpoints_registered` test verifies all 14 endpoints (5 type + 6 group + 3 membership) respond non-405 via `Router::oneshot`. | |
+| Suite | Contract |
+| --- | --- |
+| `group_service_test.rs` | Root/child placement, name and payload validation, immutable type, move/cycle rules, closure maintenance and profile limits |
+| `registry_types_test.rs` | Registry lifecycle behavior and schema/trait consumption for writes |
+| `tenant_filtering_db_test.rs` and `create_group_target_tenant_test.rs` | Caller scope, target-tenant authorization and row visibility |
+| `db_behavior_audit_test.rs` and `query_recorder_test.rs` | SQL scope enforcement, set-based hierarchy operations and query behavior |
+| `api_rest_test.rs` | Group/hierarchy REST contracts, error classification and absence of retired type routes |
+| SQLite/PostgreSQL type-identifier migration suites | Preserved identifiers, groups, memberships, closure rows, indexes and constraints |
+| `pg_concurrency_test.rs` and `pg_smoke_test.rs` | PostgreSQL transaction/concurrency behavior and backend SQL |
 
 ### Entity Hierarchy Test Cases
 
 **File**: `group_service_test.rs`
 
-Test setup: SQLite in-memory + TypeService + GroupService with configurable QueryProfile.
+Test setup: SQLite in-memory, admitted registry definitions and GroupService with configurable QueryProfile.
 
 #### TC-GRP-01: Create child group with parent - closure rows correct [P1]
 - **Covers**: G8, 0003-AC-1,2
-- **Setup**: Create parent type (can_be_root=true), child type (allowed_parents=[parent_type]). Create root group, then child group under it.
+- **Setup**: Publish a parent type that permits a root and a child type that permits the parent's type. Create root group, then child group under it.
 - **Assert**: Child group returned with `hierarchy.parent_id`, closure table has self-row (depth=0) and ancestor row (depth=1)
 
 #### TC-GRP-02: Create 3-level hierarchy - closure table completeness [P1]
@@ -541,13 +440,13 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 
 #### TC-GRP-03: Create group with incompatible parent type [P1]
 - **Covers**: G9, 0003-AC-3
-- **Setup**: Create type A (can_be_root=true), type B (can_be_root=false, allowed_parents=[]... wait, that violates placement invariant). Create type A (root), type B (allowed_parents=[A]), type C (allowed_parents=[B]). Create root group of type A. Try to create child of type C under group A.
-- **Assert**: `DomainError::InvalidParentType`
+- **Setup**: Publish type A for roots, type B for children of A, and type C for children of B. Create root group of type A. Try to create child of type C under group A.
+- **Assert**: `DomainError::Validation` from the group schema
 
-#### TC-GRP-04: Create root group when can_be_root=false [P1]
+#### TC-GRP-04: Create a root when its schema rejects a null parent [P1]
 - **Covers**: G10, 0003-AC-5
-- **Setup**: Create type with can_be_root=false, allowed_parents=[some_parent_type]. Try to create root group (no parent).
-- **Assert**: `DomainError::InvalidParentType` with "cannot be a root group"
+- **Setup**: Publish a group type requiring a specific non-null parent type. Try to create root group (no parent).
+- **Assert**: `DomainError::Validation` because the schema rejects a null parent
 
 #### TC-GRP-05: Move group - happy path with closure rebuild [P1]
 - **Covers**: G11, 0003-AC-6
@@ -566,23 +465,13 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 
 #### TC-GRP-08: Move group to incompatible parent type [P1]
 - **Covers**: G14, 0003-AC-9
-- **Setup**: Type A (root), Type B (allowed_parents=[A]). Create group of type B under group of type A. Create group of type A (root). Try to move group B under another group B.
-- **Assert**: `DomainError::InvalidParentType`
+- **Setup**: Type A accepts a null parent and type B permits parents of type A. Create group of type B under group of type A. Create group of type A (root). Try to move group B under another group B.
+- **Assert**: `DomainError::Validation` from the group schema
 
 #### TC-GRP-09: Update group name and metadata [P2]
 - **Covers**: G15
 - **Setup**: Create group, update with new name and metadata
 - **Assert**: Updated group returned with new name/metadata
-
-#### TC-GRP-10: Update group type - validates parent compatibility [P1]
-- **Covers**: G16, 0003-AC-10
-- **Setup**: Type A (root), Type B (allowed_parents=[A]), Type C (root, no allowed_parents). Create group of type B under group of type A. Change group type to C (which doesn't allow parent A).
-- **Assert**: `DomainError::InvalidParentType` ("does not allow current parent type")
-
-#### TC-GRP-11: Update group type - validates children compatibility [P1]
-- **Covers**: G16, 0003-AC-10
-- **Setup**: Type P (root), Type C (allowed_parents=[P]), Type P2 (root). Create P group with C child. Change P group to type P2.
-- **Assert**: `DomainError::InvalidParentType` ("child group... does not allow... as parent type")
 
 #### TC-GRP-12: Delete leaf group (no children, no memberships) [P1]
 - **Covers**: G17, 0003-AC-11
@@ -643,26 +532,14 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 - Create with `metadata: Some(json!({"self_managed": true}))`, verify stored and returned
 
 #### TC-GRP-25: Multiple root groups of same type [P2]
-- Create 2 root groups of same can_be_root=true type, both succeed
-
-#### TC-GRP-26: Update group - simultaneous type change AND parent change [P1]
-- Both `type_changed` and `parent_changed` are true → type validation + move logic both run
-- Verify the combined operation succeeds or fails atomically
-
-#### TC-GRP-27: Update root group type to non-root type (no parent) [P1]
-- Root group (parent_id=None), change type to can_be_root=false type
-- Hits `else if !rg_type.can_be_root` branch (line 508-512)
-- **Assert**: `DomainError::InvalidParentType("cannot be a root group")`
-
-#### TC-GRP-28: Update group with nonexistent new type_path [P2]
-- **Assert**: `DomainError::TypeNotFound`
+- Create 2 roots of the same type that accepts a null parent, both succeed
 
 #### TC-GRP-29: Move child to root (detach from parent) - happy path [P1]
-- Child under parent, move with new_parent_id=None, type allows can_be_root=true
+- Child under parent, move with new_parent_id=None, the schema accepts `parent_type: null`
 - **Assert**: Success, parent_id=None, closure rebuilt (old ancestor rows removed, self-row only)
 
-#### TC-GRP-30: Move child to root when can_be_root=false [P1]
-- **Assert**: `DomainError::InvalidParentType("cannot be a root group")`
+#### TC-GRP-30: Move child to root when its schema rejects a null parent [P1]
+- **Assert**: `DomainError::Validation` because the schema rejects a null parent
 
 #### TC-GRP-31: Move nonexistent group [P2]
 - **Assert**: `DomainError::GroupNotFound`
@@ -732,10 +609,6 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 
 **File**: `api_rest_test.rs`
 
-#### TC-META-19: REST create type with metadataSchema (camelCase in JSON) [P1]
-- POST body: `{"code": "...", "canBeRoot": true, "metadataSchema": {"type": "object"}}`
-- **Assert**: 201, response body has `"metadataSchema"` key (camelCase)
-
 #### TC-META-20: REST create group with metadata in body [P1]
 - POST body: `{"type": "...", "name": "X", "metadata": {"self_managed": true}}`
 - **Assert**: 201, response body has `"metadata": {"self_managed": true}`
@@ -744,57 +617,29 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 - Create group without metadata
 - **Assert**: JSON response does NOT contain `"metadata"` key (via `skip_serializing_if`)
 
-#### TC-META-22: REST response omits metadataSchema when null [P2]
-- Create type without metadata_schema
-- **Assert**: JSON response does NOT contain `"metadataSchema"` key
-
 ### Invalid / Non-GTS Input Tests
 
-**ONE existing test** checks invalid type code: `create_type_invalid_code_returns_400` with `"code": "invalid"`. Nothing else.
-
-**File**: `api_rest_test.rs` (REST-level for deserialization), `type_service_test.rs` / `group_service_test.rs` (service-level for domain validation)
+The router tests exercise invalid identifiers on group creation and membership addition.
 
 #### Type code / type_path — wrong GTS format:
 
-#### TC-NOGTS-01: Create type with valid GTS path but NOT RG prefix [P1]
-- `code: "gts.cf.core.user.v1~"` — valid GTS format, but missing `system.rg.type.v1~` prefix
-- **Assert**: 400 Validation ("must start with prefix")
-
-#### TC-NOGTS-02: Create type with empty code [P1]
-- `code: ""`
-- **Assert**: 400 ("must not be empty")
-
-#### TC-NOGTS-03: Create type with completely garbage code [P2]
-- `code: "'; DROP TABLE gts_type; --"` (SQL injection attempt)
-- **Assert**: 400 Validation (wrong prefix) — no SQL injection
-
 #### TC-NOGTS-04: Create group with non-RG type_path [P1]
-- `type: "gts.cf.core.user.v1~"` — valid GTS but not RG type
-- **Assert**: 400 Validation ("must start with prefix")
+- `type: "gts.cf.core.am.user.v1~"` — valid GTS type outside the RG group family
+- **Assert**: 400 Validation
 
 #### TC-NOGTS-05: Create group with empty type_path [P1]
 - `type: ""`
-- **Assert**: 400 ("must not be empty")
+- **Assert**: 400 Validation
 
 #### TC-NOGTS-06: Membership with non-GTS resource_type [P1]
 - POST `/memberships/{group_id}/not.a.gts.path/res-1`
-- **Assert**: 400 Validation ("Unknown resource type") — resolve_id returns None
+- **Assert**: 400 Validation for the malformed GTS type ID
 
 #### TC-NOGTS-07: Membership with empty resource_type [P2]
 - POST `/memberships/{group_id}//res-1` or empty segment
 - **Assert**: 404 (route mismatch) or 400
 
 #### REST deserialization errors — wrong JSON types:
-
-#### TC-DESER-01: Create type with `code: 123` (number not string) [P1]
-- **Assert**: 400/422 — Axum JSON deserialization error before handler
-
-#### TC-DESER-02: Create type with `can_be_root: "yes"` (string not bool) [P1]
-- **Assert**: 400/422
-
-#### TC-DESER-03: Create type with `can_be_root` missing [P1]
-- Body: `{"code": "gts.cf.core.rg.type.v1~test.v1~"}`
-- **Assert**: 400/422 (required field missing — no `#[serde(default)]` on `can_be_root`)
 
 #### TC-DESER-04: Create group with `type` field missing [P1]
 - Body: `{"name": "X"}`
@@ -808,7 +653,7 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 - **Assert**: 400
 
 #### TC-DESER-07: Empty body when body expected [P1]
-- POST /types with empty body
+- POST /groups with empty body
 - **Assert**: 400/422
 
 #### TC-DESER-08: Create group with `name: ""` (empty string) [P1]
@@ -824,15 +669,15 @@ Test setup: SQLite in-memory + TypeService + GroupService with configurable Quer
 - **Assert**: 400
 
 #### TC-DESER-11: Extra unknown fields in body [P3]
-- `{"code": "...", "can_be_root": true, "unknown_field": 42}`
-- **Assert**: Verify behavior — serde default is ignore (200) or reject?
+- POST /groups with a registered group `type`, a valid `name` and `unknown_field`.
+- **Assert**: The router test accepts 201 if the field is ignored or 400/422 if deserialization rejects it.
 
 ### ADR-001 Hierarchy Reproduction in RG Gear
 
 Reproduce the full ADR example hierarchy (T1→D2→B3, T7→D8, T9) with correct types, parents, and metadata — entirely through RG service layer.
 
 #### TC-ADR-01: Full ADR hierarchy with types, groups, and memberships [P1]
-- **Setup**: Create all RG types (tenant, department, branch + user/course as membership types) via TypeService. Create groups T1, D2, B3, T7, D8, T9 via GroupService with correct parent-child and metadata. Add memberships (user in T1, user in D2, course in B3).
+- **Setup**: Create all RG types (tenant, department, branch + user/course as membership types) through the registry test fixture. Create groups T1, D2, B3, T7, D8, T9 via GroupService with correct parent-child and metadata. Add memberships (user in T1, user in D2, course in B3).
 - **Assert per group**:
   - T1: root tenant, `parent_id=None`, `metadata: None`
   - D2: dept under T1, `metadata: {category: "finance", short_description: "Mega Department"}`
@@ -844,30 +689,30 @@ Reproduce the full ADR example hierarchy (T1→D2→B3, T7→D8, T9) with correc
 - **Membership assert**: each membership group_id + resource_type correct
 
 #### TC-ADR-02: Tenant type allows self-nesting (T7 under T1) [P1]
-- Tenant type: `allowed_parents: [tenant_type_code]` — self-referential
+- Tenant schema permits its own type as a parent
 - Create T1 (root), create T7 under T1 (both tenant type)
 - **Assert**: Success, T7 parent_id = T1.id
 
 #### TC-ADR-03: Department cannot be root [P1]
-- Department type: `can_be_root: false, allowed_parents: [tenant_type_code]`
+- Department schema requires a tenant parent
 - Try to create department with parent_id=None
-- **Assert**: `DomainError::InvalidParentType("cannot be a root group")`
+- **Assert**: `DomainError::Validation` because the schema rejects a null parent
 
 #### TC-ADR-04: Branch only under department (not under tenant) [P1]
-- Branch type: `allowed_parents: [department_type_code]`
+- Branch schema requires a department parent
 - Try to create branch directly under tenant
-- **Assert**: `DomainError::InvalidParentType`
+- **Assert**: `DomainError::Validation` from the group schema
 
 #### TC-ADR-05: Branch allows users AND courses as members [P1]
-- Branch type: `allowed_memberships: [user_type, course_type]`
+- Bind the branch type to a membership schema whose `resource_type` enum contains the user and course type IDs.
 - Add user membership to branch → success
 - Add course membership to branch → success
 - **Assert**: both memberships exist
 
 #### TC-ADR-06: Tenant allows only users as members (not courses) [P1]
-- Tenant type: `allowed_memberships: [user_type]` (no course)
+- Bind the tenant type to a membership schema whose `resource_type` is fixed to the user type ID.
 - Add user to tenant → success
-- Add course to tenant → **DomainError::Validation("not in allowed_memberships")**
+- Add course to tenant → `DomainError::Validation` because the bound schema rejects the course type.
 
 #### TC-ADR-07: Same resource (user) in multiple groups with different group_ids [P1]
 - Per ADR: "R8 appears twice: as user in D8 and T7"
@@ -879,15 +724,15 @@ Reproduce the full ADR example hierarchy (T1→D2→B3, T7→D8, T9) with correc
 - Add R4 with type=course to B3, add R4 with type=user to T1
 - **Assert**: both succeed (different gts_type_id, same resource_id)
 
-### metadata Validation Against Type's metadata_schema
+### Metadata Validation Against the Materialized Registry Schema
 
-Per ADR-001, each chained RG type defines a `metadata_schema` with `additionalProperties: false`, field types, and length constraints. **RG MUST validate group metadata against the type's metadata_schema on create/update.**
+Each chained RG type may constrain the group payload, including metadata, with field types, length limits and `additionalProperties`. **RG MUST validate the full payload through the SDK using the unmodified materialized registry schema on create and non-null metadata replacement.**
 
-GTS-level validation (33 tests in `rg_gts_type_system_tests.rs`) validates at schema registration time. These unit tests verify the **runtime** validation path: when a caller creates/updates a group, RG checks the `metadata` payload against the stored `metadata_schema` for the group's type.
+Registry admission validates the authored schemas. These cases verify the runtime payload validation path through the registry SDK using the materialized full schema and the group metadata payload.
 
-> **Note**: As of current implementation, this validation is **missing** in code — `group_service.rs` stores metadata as-is without validation. These tests will initially fail and serve as acceptance criteria for implementing the validation.
->
-> **Implementation**: Use `TypesRegistryClient` (types-registry-sdk, already used by `credstore` gear) + `gts` crate (v0.8.4, already in workspace). The GTS type system validates instance data (including `metadata` sub-object) against the chained RG type schema registered in types-registry. RG gear should resolve the group's GTS type via `TypesRegistryClient`, then validate the incoming metadata against the type's inline `metadata` schema (which includes `additionalProperties: false`, field types, `maxLength`). This follows the same pattern as `credstore` gear which uses `TypesRegistryClient` from ClientHub for GTS-level validation. Do NOT use raw `jsonschema` crate directly — validation must go through the GTS layer to respect `x-gts-traits`, `allOf` composition, and the metadata sub-object schema.
+`RegistryTypeCatalog` fetches the schema through `TypesRegistryApi` and
+`RgType` compiles the SDK validator before the transaction. Services validate
+the payload with the actual parent in the transaction.
 
 ##### Tenant metadata (`self_managed: boolean`, `custom_domain: hostname`)
 
@@ -986,29 +831,15 @@ GTS-level validation (33 tests in `rg_gts_type_system_tests.rs`) validates at sc
 - Update with `metadata: {"category": "X".repeat(101)}` → 400 (over limit)
 - Update with `metadata: {"category": "finance"}` → 200 (valid)
 
-#### TC-ADR-30: Type without metadata_schema — any metadata accepted [P2]
-- Create type with `metadata_schema: None`
+#### TC-ADR-30: Type without additional metadata restrictions [P2]
+- Publish a derived type that adds no restrictions to the base metadata payload
 - Create group with `metadata: {"anything": "goes", "x": 42}`
-- **Assert**: 201 — no schema means no validation
-
-#### TC-ADR-31: Update type metadata_schema — existing groups NOT retroactively validated [P2]
-- Create type with permissive metadata_schema, create group with metadata
-- Update type with stricter metadata_schema (adds maxLength)
-- **Assert**: existing group still readable. New groups validated against new schema.
-
-#### TC-ADR-15: metadata_schema round-trip with ADR tenant schema [P1]
-- Create tenant RG type with metadata_schema from ADR (self_managed: boolean, custom_domain: hostname)
-- Get type → metadata_schema returned correctly (no `__can_be_root`, no `__user_schema`)
-- **Assert**: metadata_schema matches input
+- **Assert**: 201 — the admitted full schema permits this metadata object; validation still runs
 
 #### TC-ADR-16: Chained type path format in RG [P1]
-- ADR uses: `gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~` (multi-segment)
-- Code validates prefix: `gts.cf.core.rg.type.v1~` (different namespace!)
-- **Assert**: Verify which prefix the code actually requires. If `system` not `core` → document discrepancy with ADR.
-
-#### TC-ADR-17: Type response contains no SMALLINT IDs [P1]
-- Create type, GET → response JSON
-- **Assert**: no `gts_type_id`, `type_id`, `parent_type_id` numeric fields. `code`, `allowed_parents`, `allowed_memberships` are all strings.
+- ADR uses: `gts.cf.core.rg.group.v1~y.core.tn.tenant.v1~` (multi-segment)
+- Code validates the RG family prefix: `gts.cf.core.rg.group.v1~`
+- **Assert**: An admitted chained schema in that family is accepted; a foreign family is rejected.
 
 #### TC-ADR-18: Group response contains no SMALLINT IDs [P1]
 - Create group, GET → response JSON
@@ -1025,14 +856,6 @@ GTS-level validation (33 tests in `rg_gts_type_system_tests.rs`) validates at sc
 ### REST API Layer
 
 **File**: `api_rest_test.rs` (extend existing)
-
-#### TC-REST-01: Update type PUT returns 200 [P2]
-- **Covers**: G34, 0002-AC-7
-- **Setup**: Create type via service, PUT with updated body
-- **Assert**: 200 OK, body contains updated fields
-
-#### TC-REST-02: Update type not found returns 404 [P2]
-- **Covers**: G34
 
 #### TC-REST-03: Add membership POST returns 201 [P2]
 - **Covers**: G35, 0004-AC-1
@@ -1059,12 +882,12 @@ GTS-level validation (33 tests in `rg_gts_type_system_tests.rs`) validates at sc
 
 #### TC-REST-10: Error response HTTP mapping — status codes and Content-Type [P1]
 - **Covers**: RG3
-- **Why**: `error.rs` maps `DomainError` variants to HTTP status + `Content-Type: application/problem+json`. No direct unit tests verify this mapping. `error_response_has_problem_fields` (existing) checks one 404 response, but does not verify all status codes or Content-Type header explicitly.
+The router test `rest_error_responses_have_problem_content_type_and_status` checks the status and problem response for group operations.
 - **Setup**: Trigger multiple error paths via `Router::oneshot`:
   - GET /groups/{random-uuid} → 404 Not Found
-  - POST /types {duplicate code} → 409 Conflict
-  - POST /types {invalid body} → 400 Bad Request
-  - POST /groups {type "gts.cf.core.rg.type.v1~nonexistent.v1~"} → 404 (TypeNotFound)
+  - POST /groups with an existing group ID → 409 Conflict
+  - POST /groups with an invalid group type ID → 400 Bad Request
+  - POST /groups {type "gts.cf.core.rg.group.v1~x.test.rg.unknown.v1~"} → 404 (TypeNotFound)
 - **Assert per response**:
   - HTTP status code matches expected
   - `Content-Type` header contains `application/problem+json`
@@ -1073,27 +896,20 @@ GTS-level validation (33 tests in `rg_gts_type_system_tests.rs`) validates at sc
 
 ### Priority Matrix
 
-#### P1 - Critical (must have, business invariants) — 64 tests
+#### P1 - Critical (must have, business invariants)
 
 These test domain invariants that prevent data corruption or violate core business rules:
 
 | ID | Test Case | Risk if Missing |
 |----|-----------|-----------------|
-| **TC-TYP-02** | Create type - nonexistent allowed_parents | Dangling type references |
-| **TC-TYP-04** | Placement invariant violation | Orphan types that can't be placed |
-| **TC-TYP-06** | Update type - remove parent in use | Breaks existing group hierarchy |
-| **TC-TYP-07** | Update type - can_be_root=false with roots | Orphans existing root groups |
-| **TC-TYP-09** | Delete type with groups | Cascading data loss |
 | **TC-GRP-01** | Child group + closure rows | Hierarchy queries broken |
 | **TC-GRP-02** | 3-level closure completeness | Ancestor/descendant queries wrong |
 | **TC-GRP-03** | Incompatible parent type | Type system bypassed |
-| **TC-GRP-04** | Root group when can_be_root=false | Type system bypassed |
+| **TC-GRP-04** | Root group whose schema rejects a null parent | Type system bypassed |
 | **TC-GRP-05** | Move with closure rebuild | Hierarchy corrupt after move |
 | **TC-GRP-06** | Move under descendant -> cycle | Infinite loops in hierarchy |
 | **TC-GRP-07** | Self-parent -> cycle | Infinite loops in hierarchy |
 | **TC-GRP-08** | Move to incompatible type | Type system bypassed |
-| **TC-GRP-10** | Type change vs parent compat | Type constraints violated |
-| **TC-GRP-11** | Type change vs children compat | Children become orphans |
 | **TC-GRP-12** | Leaf delete | Data cleanup |
 | **TC-GRP-13** | Delete with children no force | Accidental data loss |
 | **TC-GRP-14** | Delete with memberships no force | Accidental data loss |
@@ -1104,58 +920,49 @@ These test domain invariants that prevent data corruption or violate core busine
 | **TC-MBR-01** | Add membership happy path | Core write feature |
 | **TC-MBR-02** | Add to nonexistent group | Dangling membership |
 | **TC-MBR-03** | Duplicate membership | Data integrity |
-| **TC-MBR-05** | Not in allowed_memberships | Type system bypassed |
+| **TC-MBR-05** | Bound membership schema rejects the candidate type | Type system bypassed |
 | **TC-MBR-06** | Tenant incompatibility | Cross-tenant data leak |
-| **TC-MBR-13** | Empty allowed_memberships rejects all | Type system bypassed |
+| **TC-MBR-13** | An explicitly restrictive membership schema rejects every member type | Type system bypassed |
 | **TC-MBR-14** | Same resource in multiple groups same tenant | Multi-group membership broken |
 | **TC-GRP-22** | Create group nonexistent type | Group with invalid type |
 | **TC-GRP-23** | Child group cross-tenant parent | Tenant isolation broken |
-| **TC-GRP-26** | Simultaneous type + parent change | Atomicity of combined update |
-| **TC-GRP-27** | Root group → non-root type change | Root groups orphaned |
 | **TC-GRP-29** | Move child to root (detach) | Closure corruption on detach |
-| **TC-GRP-30** | Move to root when can_be_root=false | Unauthorized root creation |
+| **TC-GRP-30** | Move to root when the schema rejects a null parent | Unauthorized root creation |
 | **TC-GRP-37** | Depth exact boundary (>=) | Off-by-one in guardrail |
 | **TC-GRP-38** | Width exact boundary (>=) | Off-by-one in guardrail |
-| **TC-SDK-24** | validate_type_code vs GtsTypePath mismatch | Silent validation inconsistency |
+| **TC-SDK-24** | Canonical group schema IDs and GtsTypePath normalization | Silent validation inconsistency |
 | **TC-SDK-01..06,08** | GtsTypePath value object validation | Invalid types accepted into system |
 | **TC-SDK-11,12** | GtsTypePath serde round-trip | API deserialization breaks silently |
-| **TC-SDK-14,15** | SDK model camelCase + `type` rename | Wire format mismatch |
+| **TC-SDK-15** | SDK group model `type` rename | Wire format mismatch |
 | **TC-DTO-05** | CreateGroupDto `type` JSON rename | Request deserialization fails |
 | **TC-ODATA-01,02** | GroupFilterField names + kinds | OData $filter silently broken |
 | **TC-ODATA-04,05** | Hierarchy + Membership FilterField | OData $filter silently broken |
-| **TC-SEED-01..03** | seed_types create/update/skip | Bootstrap data corruption |
-| **TC-SEED-05,06** | seed_groups create + skip | Hierarchy bootstrap broken |
-| **TC-SEED-07,08** | seed_memberships create + skip | Membership bootstrap broken |
 | **TC-ERR-01** | EnforcerError::AccessDenied -> AccessDenied | Auth errors mishandled |
 | **TC-REST-10** | Error response HTTP mapping — status codes + Content-Type | Incorrect HTTP status codes or missing `application/problem+json` Content-Type |
 
-#### P2 - Important (error paths, REST layer, edges) — 53 tests
+#### P2 - Important (error paths, REST layer, edges)
 
 | ID | Area |
 |----|------|
-| TC-TYP-03, TC-TYP-05, TC-TYP-08, TC-TYP-10..15 | Type management edges + metadata + memberships |
-| TC-GRP-09, TC-GRP-19..21, TC-GRP-24..25, TC-GRP-28, TC-GRP-31..36 | Group update/validation/error paths |
+| TC-GRP-09, TC-GRP-19..21, TC-GRP-24..25, TC-GRP-31..36 | Group update/validation/error paths |
 | TC-MBR-07..12 | Membership edges + empty resource_id + unregistered type |
-| TC-REST-01..08 | REST layer coverage |
+| TC-REST-03..08 | REST layer coverage |
 | TC-SDK-07, TC-SDK-09, TC-SDK-10, TC-SDK-16..23 | SDK edge cases + boundary |
-| TC-DTO-01..04, TC-DTO-06, TC-DTO-07 | DTO conversion |
-| TC-ODATA-03, TC-ODATA-06..08 | OData mapper correctness |
-| TC-SEED-04, TC-SEED-09, TC-SEED-11, TC-SEED-12 | Seeding edge cases |
+| TC-DTO-03..05, TC-DTO-07 | DTO conversion |
+| TC-ODATA-03, TC-ODATA-07..08 | OData mapper correctness |
 | TC-ERR-02..05 | Error conversion chains |
 | TC-GRP-33 | max_width on move |
 
-#### P3 - Nice to have (boundary, cosmetic) — 4 tests
+#### P3 - Nice to have (boundary, cosmetic)
 
 | ID | Test Case |
 |----|-----------|
 | TC-SDK-13 | GtsTypePath Display + Into<String> |
-| TC-TYP-16 | Hierarchy check skips deleted parent type |
 | TC-MBR-15 | List memberships empty result |
-| TC-SEED-10 | seed_types empty list |
 
 ### Acceptance Criteria
 
-- [x] All ~325 unit tests pass (`cargo test -p cf-gears-resource-group -p cf-gears-resource-group-sdk`) — 325 tests, 0 failed (as of 2026-03-29)
+- [x] The current unit suites pass (`cargo test -p cf-gears-resource-group -p cf-gears-resource-group-sdk`); no legacy test count is assumed after the registry migration
 - [x] Full suite completes in < 5 seconds
 - [x] Zero `sleep`, `timeout`, or `tokio::time` usage in tests
 - [x] Every domain invariant from features 0001-0005 is covered by at least one test
@@ -1193,7 +1000,6 @@ Every test that creates, moves, or deletes groups **MUST** query the closure tab
 | **Create group** | `parent_id`, `gts_type_id`, `tenant_id`, `name`, `metadata` match request. |
 | **Update name/metadata** | `name` and `metadata` changed. `parent_id`, `gts_type_id` **unchanged**. |
 | **Move group** | `parent_id` updated. `gts_type_id`, `name`, `tenant_id` **unchanged**. |
-| **Update type** | `gts_type_id` changed. `parent_id`, `name` **unchanged**. |
 
 ### Hierarchy Endpoint Response Shape
 
@@ -1203,15 +1009,6 @@ Every test that creates, moves, or deletes groups **MUST** query the closure tab
 - Descendant C: `hierarchy.depth > 0` (e.g., 1)
 - **All nodes present** (no missing nodes)
 - Each node has `hierarchy.tenant_id`, `hierarchy.parent_id`
-
-### Seeding DB Verification
-
-| Operation | Required DB Assertions |
-|-----------|----------------------|
-| **seed_types creates** | Type **physically exists** in `gts_type`. Junction rows present. |
-| **seed_types unchanged** | `updated_at` **not modified** on re-run. |
-| **seed_groups creates** | Groups exist in `resource_group`. Closure rows correct. `parent_id` FK valid. |
-| **seed_memberships creates** | Membership rows exist with correct composite key. |
 
 ### Test Infrastructure
 
@@ -1231,12 +1028,12 @@ pub fn make_ctx(tenant_id: Uuid) -> SecurityContext { ... }
 /// AllowAll PolicyEnforcer (returns tenant-scoped AccessScope).
 pub fn make_enforcer() -> PolicyEnforcer { ... }
 
-/// Create root type with unique code suffix. One DB round-trip.
-pub async fn create_root_type(svc: &TypeService, suffix: &str) -> ResourceGroupType { ... }
+/// Publish a root-capable type with a unique code to the test registry.
+pub async fn create_root_type(svc: &TestTypes, suffix: &str) -> ResourceGroupType { ... }
 
-/// Create child type referencing parent codes. One DB round-trip.
+/// Publish a child group schema and its bound membership schema to the test registry.
 pub async fn create_child_type(
-    svc: &TypeService, suffix: &str, parents: &[&str], memberships: &[&str]
+    svc: &TestTypes, suffix: &str, parents: &[&str], memberships: &[&str]
 ) -> ResourceGroupType { ... }
 
 /// Create root group. Returns ResourceGroup.
@@ -1256,9 +1053,6 @@ pub async fn assert_closure_rows(
 
 /// Assert total closure row count for a set of groups (no extra rows left).
 pub async fn assert_closure_count(conn: &impl DBRunner, group_ids: &[Uuid], expected_total: usize) { ... }
-
-/// Assert junction table rows for a type.
-pub async fn assert_allowed_parents(conn: &impl DBRunner, type_id: i16, expected_parent_ids: &[i16]) { ... }
 
 /// Assert no SMALLINT IDs in JSON value (recursive check).
 pub fn assert_no_surrogate_ids(json: &serde_json::Value) { ... }
@@ -1284,10 +1078,8 @@ tests/
   authz_integration_test.rs      # ✅ DONE (9 tests)
   tenant_filtering_db_test.rs    # ✅ DONE (7 tests)
   tenant_scoping_test.rs         # ✅ DONE (10 tests)
-  type_service_test.rs           # ✅ DONE (45 tests) TC-TYP + TC-META + TC-GTS
-  group_service_test.rs          # ✅ DONE (55 tests) TC-GRP-01..38
+  group_service_test.rs          # ✅ DONE (55 tests) retained TC-GRP cases
   membership_service_test.rs     # ✅ DONE (15 tests) TC-MBR-01..15
-  seeding_test.rs                # ✅ DONE (12 tests) TC-SEED-01..12
 ```
 
 ---
@@ -1298,14 +1090,14 @@ tests/
 
 Tests S5, S6, S7 verify PostgreSQL-specific behavior that unit tests cannot catch because 0006 runs on SQLite where FK enforcement requires `PRAGMA foreign_keys = ON` and closure SQL may silently produce wrong results due to looser type coercion.
 
-### S5: `test_hierarchy_closure_postgresql`
+### S5: `test_hierarchy_closure`
 
 **Seam**: Closure table INSERT SQL under PostgreSQL.
 
 **Why not in unit tests**: TC-GRP-01/02 verify closure rows on SQLite. PostgreSQL uses `INSERT INTO resource_group_closure SELECT ...` with joins against existing closure rows — column order or join condition errors produce wrong depth values silently on SQLite but fail or corrupt data on PostgreSQL.
 
 ```
-POST parent_type (can_be_root), child_type (allowed_parents: [parent])
+Publish parent and child schemas with their placement rules
 POST root → child → grandchild
 
 GET /groups/{root.id}/hierarchy     → 200
@@ -1320,7 +1112,7 @@ GET /groups/{child.id}/hierarchy    → 200
   assert grandchild depth == 1
 ```
 
-### S6: `test_move_closure_rebuild_postgresql`
+### S6: `test_move_closure_rebuild`
 
 **Seam**: Closure table DELETE + re-INSERT under PostgreSQL SERIALIZABLE transaction.
 
@@ -1336,7 +1128,7 @@ GET /groups/{root_B.id}/hierarchy    → 200
   assert child in items with depth == 1            (closure rebuilt on PG)
 ```
 
-### S7: `test_force_delete_cascade_postgresql`
+### S7: `test_force_delete_cascade`
 
 **Seam**: FK `ON DELETE RESTRICT` + service-level cascade on PostgreSQL.
 
@@ -1355,3 +1147,8 @@ GET /groups/{root.id}                            → 404
 - [x] S5 verifies `depth` values on real PostgreSQL — not just "hierarchy returns items"
 - [x] S6 verifies child appears under new parent with correct depth after PG SERIALIZABLE move
 - [x] S7 verifies 204 + target returns 404 — PG FK cascade succeeds in correct deletion order
+
+### Registry Migration Verification
+
+See [feature 0002](0002-type-management.md#7-verification) for managed
+admission, consumer provisioning and migration tests on both backends.

@@ -6,6 +6,11 @@ decision-makers: Constructor Fabric Steering Committee
 
 # ADR-001: GTS Type System for Resource Group
 
+> This ADR records the historical junction-table design. Types Registry now
+> owns the schemas for placement and membership under the group base
+> `gts.cf.core.rg.group.v1~`. RG retains `gts_type` as the
+> `SMALLINT` key-to-identifier dictionary. See the [current design](../DESIGN.md)
+> for publication, persistence and retirement behavior.
 
 <!-- toc -->
 
@@ -708,7 +713,7 @@ This decision directly addresses the following requirements and design elements:
 
 * `cpt-cf-resource-group-fr-manage-types` — GTS type system defines how types are identified, composed, and validated
 * `cpt-cf-resource-group-fr-validate-parent-type` — Junction tables enforce parent type compatibility at DB level
-* `cpt-cf-resource-group-constraint-surrogate-ids-internal` — SMALLINT surrogate keys are DB-internal, GTS paths are external
+* `cpt-cf-resource-group-constraint-gts-identifiers` — the dictionary keeps SMALLINT keys and maps them to GTS identifiers
 * `cpt-cf-resource-group-constraint-db-agnostic` — GTS path validation at application layer for non-PostgreSQL backends
 * `cpt-cf-resource-group-principle-dynamic-types` — GTS enables runtime-configurable type definitions
 * `cpt-cf-resource-group-principle-barrier-as-data` — Barrier stored in `metadata` JSONB per GTS derived type schema

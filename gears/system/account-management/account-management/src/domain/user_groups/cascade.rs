@@ -2,6 +2,7 @@
 //!
 //! Implements `cpt-cf-account-management-flow-user-groups-cascade-cleanup-trigger`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -43,7 +44,7 @@ const CASCADE_BUDGET: Duration = Duration::from_secs(120);
 /// The hook:
 /// 1. Lists all groups of type `USER_GROUP_TYPE_CODE` scoped to
 ///    `tenant_id`.
-/// 2. For each listed group: invokes
+/// 2. For each listed group without a listed parent, invokes
 ///    [`ResourceGroupClient::delete_group_cascade`] (RG's `force=true`
 ///    variant), which atomically tears down the group + its subtree +
 ///    every membership row + every closure-table row anchored at it,
@@ -246,48 +247,15 @@ async fn cascade_one(
     }
 }
 
-/// Fetch root user-group RG entries scoped to `tenant_id`, draining
-/// all pages.
+/// Fetch the tenant's AM user groups that need their own cascade.
 ///
-/// Narrows to roots (`parent_id IS NULL`) **client-side**, not in the
-/// `$filter`. Root-ness is not expressible in RG's group filter
-/// grammar: `hierarchy/parent_id` is declared `FieldKind::Uuid`
-/// (`GroupFilterField::kind`), `validate_value_type` admits no null
-/// literal for any field kind, and the grammar has no `is null`
-/// operator — so a `hierarchy/parent_id eq null` term is rejected
-/// outright as `invalid $filter: Type mismatch ... expected Uuid, got
-/// null`. That reject reaches this hook as a retryable error and
-/// defers the tenant on every retention tick, which stalls the whole
-/// hard-delete sweep, so the term must not be sent. `vpctl` narrows
-/// the same listing the same way for the same reason.
-///
-/// Roots are what we want to dispatch: `delete_group_cascade` on a
-/// root atomically removes the entire subtree on the RG side, so
-/// cascading a descendant as well would only produce redundant
-/// `NotFound` responses that burn `CASCADE_BUDGET` for no work. The
-/// cost of moving the narrowing client-side is that a tenant's
-/// non-root user-groups now travel over the wire and are discarded
-/// here; they are bounded by the tenant's own group count and the
-/// listing is already paginated. AM's registration
-/// pins `allowed_parent_types = [USER_GROUP_TYPE_CODE]` (a user-group
-/// may only parent another user-group of the same type), so every
-/// descendant of a root user-group in the tenant is itself a
-/// user-group — hence reachable through its root's cascade. This
-/// invariant rests on two pillars: AM is the sole writer of
-/// user-group rows (it only ever passes another user-group's UUID as
-/// `parent_id` when creating one), and RG enforces
-/// `allowed_parent_types` at `create_group` time — so even an RG seed
-/// with broader `allowed_parent_types` (which `classify_existing`
-/// admits per the looseness contract) cannot produce a user-group
-/// with a non-user-group parent unless AM itself requests one, which
-/// it does not.
+/// Drain all pages of the exact-type listing before pruning groups covered by
+/// a listed parent's cascade.
 async fn fetch_tenant_groups(
     client: &Arc<dyn ResourceGroupClient + Send + Sync>,
     ctx: &SecurityContext,
     tenant_id: Uuid,
 ) -> Result<Vec<Uuid>, HookError> {
-    // tenant_id eq T AND type eq USER_GROUP — root-ness is applied
-    // below, on the returned rows (see this function's doc comment).
     let filter = Expr::And(
         Box::new(Expr::Compare(
             Box::new(Expr::Identifier("tenant_id".to_owned())),
@@ -301,7 +269,7 @@ async fn fetch_tenant_groups(
         )),
     );
 
-    let mut all_ids = Vec::new();
+    let mut groups = Vec::new();
     let mut cursor: Option<CursorV1> = None;
 
     loop {
@@ -341,37 +309,10 @@ async fn fetch_tenant_groups(
                 Ok(Ok(p)) => p,
             };
 
-        // Narrowing to roots in memory rather than in the `$filter` is not a
-        // throughput concern, because the list this walks is almost always
-        // empty and is bounded when it is not:
-        //
-        // * `delete_tenant` refuses to soft-delete a tenant that still owns any
-        //   RG group (`count_ownership_links`, `tenant_id eq T`, no type
-        //   filter), so a tenant normally reaches hard-delete owning none.
-        // * Groups can still appear in the window between soft- and
-        //   hard-delete, and that window is real: RG's `create_group` sets no
-        //   `tenant_status` on its `AccessRequest`, and the tenant-resolver
-        //   authz default (`VisibleAll`) excludes only `Provisioning`, so
-        //   nothing stops a group being created in a `Deleted` tenant during
-        //   retention.
-        // * Even then the listing is paginated at `CASCADE_PAGE_SIZE`, bounded
-        //   by the tenant's own group count, and the whole cascade runs under
-        //   `CASCADE_BUDGET`. Each non-root row costs one `is_none()` check.
-        //
-        // The defect this narrowing replaced was never about group count: the
-        // `$filter` it removed was rejected by RG's validator before storage
-        // was touched, so EVERY due tenant deferred forever — including
-        // tenants owning zero groups.
-        //
-        // Teaching `$filter` a null literal or an `is null` operator is worth
-        // doing, but it belongs in `toolkit-odata` alongside the validator that
-        // rejects them, as its own change rather than a precondition for
-        // unblocking the sweep.
-        all_ids.extend(
+        groups.extend(
             page.items
                 .into_iter()
-                .filter(|g| g.hierarchy.parent_id.is_none())
-                .map(|g| g.id),
+                .map(|group| (group.id, group.hierarchy.parent_id)),
         );
 
         match page.page_info.next_cursor {
@@ -385,7 +326,12 @@ async fn fetch_tenant_groups(
         }
     }
 
-    Ok(all_ids)
+    let listed_ids: HashSet<_> = groups.iter().map(|(id, _)| *id).collect();
+    Ok(groups
+        .into_iter()
+        .filter(|(_, parent_id)| parent_id.is_none_or(|id| !listed_ids.contains(&id)))
+        .map(|(id, _)| id)
+        .collect())
 }
 
 fn retryable(detail: impl Into<String>) -> HookError {

@@ -5,9 +5,7 @@
 mod groups;
 mod hierarchy;
 mod memberships;
-mod types;
 
 pub use groups::GroupFilterField;
 pub use hierarchy::HierarchyFilterField;
 pub use memberships::MembershipFilterField;
-pub use types::{TypeFilterField, TypeQuery, TypeQueryFilterField};

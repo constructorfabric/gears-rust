@@ -789,7 +789,7 @@ mod tests {
     const NIL: uuid::Uuid = uuid::Uuid::nil();
 
     const MEMBERSHIP_TYPE: &str =
-        toolkit_gts::gts_id!("cf.core.rg.type.v1~example.core.rg.member.v1~");
+        toolkit_gts::gts_id!("cf.core.rg.group.v1~example.core.rg.member.v1~");
 
     fn one(filter: ScopeFilter) -> AccessScope {
         AccessScope::from_constraints(vec![ScopeConstraint::new(vec![filter])])
@@ -850,11 +850,11 @@ mod tests {
             ),
             (
                 group_scope(),
-                r#"SELECT 1 FROM "t" WHERE CAST("custom_prop_test"."id" AS text) IN (SELECT "membership"."resource_id" FROM "resource_group_membership" AS "membership" WHERE "membership"."group_id" IN ('00000000-0000-0000-0000-000000000007') AND "membership"."gts_type_id" IN (SELECT "member_type"."id" FROM "gts_type" AS "member_type" WHERE "member_type"."schema_id" = 'gts.cf.core.rg.type.v1~example.core.rg.member.v1~')) AND "custom_prop_test"."tenant_id" = '00000000-0000-0000-0000-000000000000'"#,
+                r#"SELECT 1 FROM "t" WHERE CAST("custom_prop_test"."id" AS text) IN (SELECT "membership"."resource_id" FROM "resource_group_membership" AS "membership" WHERE "membership"."group_id" IN ('00000000-0000-0000-0000-000000000007') AND "membership"."gts_type_id" IN (SELECT "member_type"."id" FROM "gts_type" AS "member_type" WHERE "member_type"."schema_id" = 'gts.cf.core.rg.group.v1~example.core.rg.member.v1~')) AND "custom_prop_test"."tenant_id" = '00000000-0000-0000-0000-000000000000'"#,
             ),
             (
                 group_subtree_scope(),
-                r#"SELECT 1 FROM "t" WHERE CAST("custom_prop_test"."id" AS text) IN (SELECT "membership"."resource_id" FROM "resource_group_membership" AS "membership" WHERE "membership"."group_id" IN (SELECT "group_closure"."descendant_id" FROM "resource_group_closure" AS "group_closure" WHERE "group_closure"."ancestor_id" IN ('00000000-0000-0000-0000-000000000007')) AND "membership"."gts_type_id" IN (SELECT "member_type"."id" FROM "gts_type" AS "member_type" WHERE "member_type"."schema_id" = 'gts.cf.core.rg.type.v1~example.core.rg.member.v1~')) AND "custom_prop_test"."tenant_id" = '00000000-0000-0000-0000-000000000000'"#,
+                r#"SELECT 1 FROM "t" WHERE CAST("custom_prop_test"."id" AS text) IN (SELECT "membership"."resource_id" FROM "resource_group_membership" AS "membership" WHERE "membership"."group_id" IN (SELECT "group_closure"."descendant_id" FROM "resource_group_closure" AS "group_closure" WHERE "group_closure"."ancestor_id" IN ('00000000-0000-0000-0000-000000000007')) AND "membership"."gts_type_id" IN (SELECT "member_type"."id" FROM "gts_type" AS "member_type" WHERE "member_type"."schema_id" = 'gts.cf.core.rg.group.v1~example.core.rg.member.v1~')) AND "custom_prop_test"."tenant_id" = '00000000-0000-0000-0000-000000000000'"#,
             ),
             (
                 tenant_subtree_scope(),
@@ -983,6 +983,18 @@ mod tests {
             assert!(
                 sql.starts_with("SELECT DISTINCT"),
                 "a membership sibling must be distinct: {sql}"
+            );
+            // The graph path shares `typed_membership_query`: the member type
+            // is qualified through RG's identity dictionary, never dropped.
+            assert!(
+                sql.contains(r#""membership"."gts_type_id" IN (SELECT "member_type"."id" FROM "gts_type" AS "member_type""#),
+                "a membership sibling must qualify the member type through the dictionary: {sql}"
+            );
+            assert!(
+                sql.contains(&format!(
+                    r#""member_type"."schema_id" = '{MEMBERSHIP_TYPE}'"#
+                )),
+                "a membership sibling must match the member type identifier: {sql}"
             );
         }
 

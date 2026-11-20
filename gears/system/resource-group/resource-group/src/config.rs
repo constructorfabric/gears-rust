@@ -1,9 +1,8 @@
 //! Configuration for the resource-group gear.
 
-use resource_group_sdk::{GtsTypePath, TENANT_RG_TYPE_PATH};
+use resource_group_sdk::{GROUP_TYPE_ID, TENANT_GROUP_TYPE_ID};
 use serde::Deserialize;
-
-use crate::domain::validation;
+use types_registry_sdk::GtsTypeId;
 
 /// Gear configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -13,15 +12,15 @@ pub struct ResourceGroupConfig {
     ///
     /// A type whose code starts with any of these opens a new tenant scope
     /// (`tenant_id = group.id`) and takes part in the tenant-root uniqueness
-    /// check. Defaults to `[TENANT_RG_TYPE_PATH]`; a deployment with its own
-    /// vendor sets e.g. `["gts.cf.core.rg.type.v1~acme.core._.tenant.v1~"]`.
+    /// check. Defaults to `[TENANT_GROUP_TYPE_ID]`; a deployment with its own
+    /// vendor sets e.g. `["gts.cf.core.rg.group.v1~acme.core._.tenant.v1~"]`.
     pub tenant_type_paths: Vec<String>,
 }
 
 impl Default for ResourceGroupConfig {
     fn default() -> Self {
         Self {
-            tenant_type_paths: vec![TENANT_RG_TYPE_PATH.to_owned()],
+            tenant_type_paths: vec![TENANT_GROUP_TYPE_ID.to_owned()],
         }
     }
 }
@@ -42,22 +41,13 @@ impl ResourceGroupConfig {
             anyhow::bail!("resource-group: tenant_type_paths must not be empty");
         }
         for path in &self.tenant_type_paths {
-            if path.trim() != path || path.to_lowercase() != *path {
-                anyhow::bail!(
-                    "resource-group: tenant_type_paths entry '{path}' must be trimmed and lowercase"
-                );
-            }
-            if !path.ends_with('~') {
-                anyhow::bail!(
-                    "resource-group: tenant_type_paths entry '{path}' must be a GTS type path ending in '~'"
-                );
-            }
-            validation::validate_type_code(path).map_err(|e| {
+            let id = GtsTypeId::try_new(path).map_err(|e| {
                 anyhow::anyhow!("resource-group: invalid tenant_type_paths entry '{path}': {e}")
             })?;
-            GtsTypePath::new(path.as_str()).map_err(|e| {
-                anyhow::anyhow!("resource-group: invalid tenant_type_paths entry '{path}': {e}")
-            })?;
+            anyhow::ensure!(
+                id.as_ref().starts_with(GROUP_TYPE_ID),
+                "resource-group: tenant_type_paths entry '{path}' must start with '{GROUP_TYPE_ID}'"
+            );
         }
         Ok(())
     }
@@ -73,27 +63,39 @@ mod tests {
     #[test]
     fn default_is_sdk_tenant_type() {
         let cfg = ResourceGroupConfig::default();
-        assert_eq!(cfg.tenant_type_paths, vec![TENANT_RG_TYPE_PATH.to_owned()]);
+        assert_eq!(cfg.tenant_type_paths, vec![TENANT_GROUP_TYPE_ID.to_owned()]);
         cfg.validate().unwrap();
     }
 
     #[test]
     fn empty_object_falls_back_to_default() {
         let cfg: ResourceGroupConfig = serde_json::from_value(serde_json::json!({})).unwrap();
-        assert_eq!(cfg.tenant_type_paths, vec![TENANT_RG_TYPE_PATH.to_owned()]);
+        assert_eq!(cfg.tenant_type_paths, vec![TENANT_GROUP_TYPE_ID.to_owned()]);
     }
 
     #[test]
     fn custom_tenant_types_are_accepted() {
         let cfg: ResourceGroupConfig = serde_json::from_value(serde_json::json!({
             "tenant_type_paths": [
-                gts_id!("cf.core.rg.type.v1~acme.core._.tenant.v1~"),
-                TENANT_RG_TYPE_PATH,
+                gts_id!("cf.core.rg.group.v1~acme.core._.tenant.v1~"),
+                TENANT_GROUP_TYPE_ID,
             ]
         }))
         .unwrap();
         assert_eq!(cfg.tenant_type_paths.len(), 2);
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn tenant_path_respects_the_gts_length_limit() {
+        let start = format!("{GROUP_TYPE_ID}x.test.rg.");
+        let end = ".v1~";
+        let name = "a".repeat(1024 - start.len() - end.len());
+        let config = |path| ResourceGroupConfig {
+            tenant_type_paths: vec![path],
+        };
+        assert!(config(format!("{start}{name}{end}")).validate().is_ok());
+        assert!(config(format!("{start}{name}a{end}")).validate().is_err());
     }
 
     #[test]
@@ -115,7 +117,7 @@ mod tests {
     #[test]
     fn malformed_gts_path_is_rejected() {
         let cfg = ResourceGroupConfig {
-            tenant_type_paths: vec![format!("{}not-a-gts-type", gts_id!("cf.core.rg.type.v1~"))],
+            tenant_type_paths: vec![format!("{}not-a-gts-type", gts_id!("cf.core.rg.group.v1~"))],
         };
         assert!(cfg.validate().is_err());
     }
@@ -126,19 +128,19 @@ mod tests {
         let cfg = ResourceGroupConfig {
             tenant_type_paths: vec![format!(
                 "{}acme.core._.tenant.v1",
-                gts_id!("cf.core.rg.type.v1~")
+                gts_id!("cf.core.rg.group.v1~")
             )],
         };
         let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("ending in '~'"), "{err}");
+        assert!(err.contains(&cfg.tenant_type_paths[0]), "{err}");
     }
 
     #[test]
     fn non_canonical_path_is_rejected() {
         for path in [
-            format!(" {TENANT_RG_TYPE_PATH}"),
-            format!("{TENANT_RG_TYPE_PATH} "),
-            TENANT_RG_TYPE_PATH.to_uppercase(),
+            format!(" {TENANT_GROUP_TYPE_ID}"),
+            format!("{TENANT_GROUP_TYPE_ID} "),
+            TENANT_GROUP_TYPE_ID.to_uppercase(),
         ] {
             let cfg = ResourceGroupConfig {
                 tenant_type_paths: vec![path.clone()],

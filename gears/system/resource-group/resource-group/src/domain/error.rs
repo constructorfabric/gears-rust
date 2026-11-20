@@ -13,14 +13,8 @@ pub enum DomainError {
     #[error("Type not found: {code}")]
     TypeNotFound { code: String },
 
-    #[error("Type already exists: {code}")]
-    TypeAlreadyExists { code: String },
-
     #[error("Validation failed: {message}")]
     Validation { message: String },
-
-    #[error("Allowed parents violation: {message}")]
-    AllowedParentTypesViolation { message: String },
 
     #[error("Active references exist: {message}")]
     ConflictActiveReferences { message: String },
@@ -56,7 +50,7 @@ pub enum DomainError {
     ///
     /// Raised when a `create_group`/`update_group` would leave the RG forest
     /// with more than one root group whose GTS type code starts with a
-    /// configured tenant-type prefix (default `TENANT_RG_TYPE_PATH`). Enforces
+    /// configured tenant-type prefix (default `TENANT_GROUP_TYPE_ID`). Enforces
     /// `cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`. Maps to
     /// canonical `already_exists` (HTTP 409) with `existing_root_id` as the
     /// `resource_name`.
@@ -77,6 +71,19 @@ pub enum DomainError {
 
     #[error("Access denied: {message}")]
     AccessDenied { message: String },
+
+    /// The types registry refused the caller's credential (401/403); kept
+    /// unchanged so the caller sees the registry's own refusal.
+    #[error("Types registry refused the caller: {0}")]
+    RegistryRefusedCaller(toolkit_canonical_errors::CanonicalError),
+
+    /// A dependency read failed transiently; `retry_after_seconds` carries
+    /// the dependency's own retry hint, when it gave one.
+    #[error("Service unavailable: {message}")]
+    ServiceUnavailable {
+        message: String,
+        retry_after_seconds: Option<u64>,
+    },
 
     #[error("Database error: {0}")]
     Database(sea_orm::DbErr),
@@ -121,18 +128,8 @@ impl DomainError {
         Self::TypeNotFound { code: code.into() }
     }
 
-    pub fn type_already_exists(code: impl Into<String>) -> Self {
-        Self::TypeAlreadyExists { code: code.into() }
-    }
-
     pub fn validation(message: impl Into<String>) -> Self {
         Self::Validation {
-            message: message.into(),
-        }
-    }
-
-    pub fn allowed_parent_types_violation(message: impl Into<String>) -> Self {
-        Self::AllowedParentTypesViolation {
             message: message.into(),
         }
     }

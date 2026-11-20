@@ -5,4 +5,5 @@
 //! and traits instead of adding an unconditional inventory declaration.
 
 mod permissions;
+mod rg_types;
 pub mod root_type;

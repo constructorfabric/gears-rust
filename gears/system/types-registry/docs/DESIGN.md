@@ -720,8 +720,8 @@ An entry key is an exact canonical GTS Identifier or a GTS pattern with one trai
 | Entry | `allowed_vendors` | `tenant_ownable` | Meaning |
 |---|---|---|---|
 | `gts.acme.*` | `[acme]` | `true` | Onboard `acme` in its own namespace, including derivations |
-| `gts.cf.core.rg.type.v1~*` | `[acme]` | `true` | Let `acme` create tenant-owned derivations of the resource-group type |
-| `gts.cf.core.rg.type.v1~` | `[]` | `false` | Keep the base type itself closed |
+| `gts.cf.core.rg.group.v1~*` | `[acme]` | `true` | Let `acme` create tenant-owned derivations of the resource-group type |
+| `gts.cf.core.rg.group.v1~` | `[]` | `false` | Keep the base type itself closed |
 | `gts.cf.toolkit.plugins.plugin.v1~*` | `["*"]` | `false` | Allow any vendor globally in the plugin region, but not tenant ownership |
 
 The exact entry separates the base type from `…~*`, which also matches that base.
@@ -2357,7 +2357,7 @@ gears:
         "gts.acme.*":                     # onboard one vendor
           allowed_vendors: [acme]
           tenant_ownable: true
-        "gts.cf.core.rg.type.v1~*":       # open one platform type to it
+        "gts.cf.core.rg.group.v1~*":       # open one platform type to it
           allowed_vendors: [acme]
           tenant_ownable: true
         "gts.cf.toolkit.authz.permission.v1~*":   # its gear's own permissions

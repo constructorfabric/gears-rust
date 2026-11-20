@@ -954,7 +954,12 @@ payload compiler. User v1 and Tenant v1 resource declarations remain published.
 
 Both registry APIs are wired before the application group. AM's `gts_publication(...)` declaration includes its owned declarations, configured root type and optional TR-plugin instance, admitted before AM's `init`. AM's `serve` runs the bootstrap saga (the selected IdP within `idp_wait_timeout`, `strict` policy), then reports ready; its business clients are not gated. The selected IdP plugins publish with `gts_publication(...)` and bind in `init`.
 
-AM's user/user-group type registration through `ResourceGroupTypeBootstrap` stays local in RG during the existing init-only window. Preserve its seal and no-REST boundary. This slice requires no RG implementation or SDK migration. Keep stored root-binding validation local in AM `init`; move new-registry lookup, publication and dependent bootstrap work after wiring. Other host dependencies remain local where supported; adapt only callers whose eager startup would otherwise block or race AM/IdP publication.
+AM publishes its user-group and user schemas through `gts_publication(...)`.
+T38b replaces `ResourceGroupTypeBootstrap` and RG's local definitions with
+persisted registry reads and a local type-key dictionary. Validate the stored
+root binding in AM `init`. Perform registry lookups, publication and dependent
+bootstrap after wiring. Keep other host dependencies local where supported
+and adapt eager callers that would block or race AM/IdP publication.
 
 Implemented as follows. The embedded registry runs `mode: legacy_only`. Declaring crates opt into crate-local collectors through `toolkit_gts::declare_gts_inventory!()` and the `toolkit_gts::local::{gts_type_schema, gts_instance, gts_instance_raw}` macros, which also keep submitting to the process-wide inventory; the crate-root `toolkit_gts` macros are unchanged and other crates need no change. Gears declare publications with `gts_publication(...)`; the runtime publishes application gears’ GTS Type Schemas and Instances concurrently, through the SDK's bounded reconciliation, before any application `init`. The dedicated AM remote-host executable, its configuration pair and its E2E suite are deferred outside this branch; the final remote process gate remains planned in T41. Still planned for T39–T42: the migration of the remaining publishers.
 
@@ -1606,8 +1611,8 @@ The four resolution examples of DESIGN §3.2 are the P0 test matrix, reproduced 
 | Entry key | `allowed_vendors` | `tenant_ownable` | P0 effect |
 |---|---|---|---|
 | `gts.acme.*` | `[acme]` | `true` | `acme` admitted in its own namespace, including derivations; the ownership half is inert |
-| `gts.cf.core.rg.type.v1~*` | `[acme]` | `true` | `acme` may derive from the resource-group type; derivations are global in P0 |
-| `gts.cf.core.rg.type.v1~` | `[]` | `false` | the base type itself stays closed — the exact key governs only the base, `…~*` governs the subtree |
+| `gts.cf.core.rg.group.v1~*` | `[acme]` | `true` | `acme` may derive from the resource-group type; derivations are global in P0 |
+| `gts.cf.core.rg.group.v1~` | `[]` | `false` | the base type itself stays closed — the exact key governs only the base, `…~*` governs the subtree |
 | `gts.cf.toolkit.plugins.plugin.v1~*` | `["*"]` | `false` | any vendor may register in the plugin region; still global-only |
 
 The last row is what makes third-party plugin and permission Instances registrable without

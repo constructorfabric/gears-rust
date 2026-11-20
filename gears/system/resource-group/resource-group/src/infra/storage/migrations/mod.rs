@@ -5,11 +5,17 @@
 use sea_orm_migration::MigratorTrait;
 
 mod m20260306_000001_initial;
+mod m20261111_000001_gts_type_dictionary;
+mod m20261120_000001_group_and_tenant_type_prefixes;
 
 pub struct Migrator;
 
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn sea_orm_migration::MigrationTrait>> {
-        vec![Box::new(m20260306_000001_initial::Migration)]
+        vec![
+            Box::new(m20260306_000001_initial::Migration),
+            Box::new(m20261111_000001_gts_type_dictionary::Migration),
+            Box::new(m20261120_000001_group_and_tenant_type_prefixes::Migration),
+        ]
     }
 }

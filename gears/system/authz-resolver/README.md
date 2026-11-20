@@ -176,6 +176,6 @@ let response = authz.evaluate(ctx.clone(), EvaluationRequest {
 ### Phase 2: Production PDP Plugin (Planned)
 
 - Advanced predicates: `in_tenant_subtree`, `in_group`, `in_group_subtree`.
-- Native `in_group` requires `ResourceType::with_native_group_predicates()`, an exact canonical GTS resource name, and local `resource_group_membership` and `gts_type` tables; the same resource identity qualifies membership rows. Native `in_group_subtree` additionally requires `resource_group_closure` and advertises both `GroupMembership` and `GroupHierarchy`.
+- Native `in_group` requires `ResourceType::with_native_group_predicates()`, an exact canonical GTS resource name, and local `resource_group_membership` and `gts_type` (RG's identity dictionary) tables; the same resource identity qualifies membership rows. Native `in_group_subtree` additionally requires `resource_group_closure` and advertises both `GroupMembership` and `GroupHierarchy`.
 - A service MUST omit a group capability when any required projection is unavailable. Capability omission asks a capable PDP to return expanded resource-ID `in` predicates; degradation is not automatic in the PEP, so a PDP unable to expand must deny.
 - Local projection tables for hierarchy-aware constraints (`tenant_closure`, `resource_group_closure`; `resource_group_membership` projection not recommended but not forbidden)

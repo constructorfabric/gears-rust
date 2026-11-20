@@ -1,6 +1,10 @@
 use super::*;
 use resource_group_sdk::odata::{GroupFilterField, MembershipFilterField};
+use sea_orm::sea_query::{Asterisk, Query, SqliteQueryBuilder};
 use toolkit_odata::parse_filter_string;
+
+use crate::infra::storage::entity::resource_group_membership::Entity as MembershipEntity;
+use crate::infra::storage::odata_mapper::MembershipODataMapper;
 
 const ID: &str = "019f1d85-e3a3-7670-ae2a-0257e3777fb7";
 
@@ -67,9 +71,16 @@ fn invalid_uuid_and_wrong_literal_types_are_validation_errors() {
     }
 }
 
+fn lower(node: &FilterNode<MembershipFilterField>) -> Result<Condition, DomainError> {
+    filter_to_condition::<MembershipFilterField, MembershipODataMapper>(
+        node,
+        MembershipFilterField::ResourceType,
+    )
+}
+
 /// Reject unsupported operations regardless of their position in the logical tree.
 #[test]
-fn collect_type_paths_rejects_nested_operators_and_non_strings() {
+fn type_predicates_reject_nested_operators_and_non_strings() {
     use MembershipFilterField::{ResourceId, ResourceType};
     for (op, value) in [
         (FilterOp::Gt, Value::String("type".into())),
@@ -84,7 +95,7 @@ fn collect_type_paths_rejects_nested_operators_and_non_strings() {
             FilterNode::and(vec![other.clone(), invalid.clone()]),
             FilterNode::or(vec![other, invalid]),
         ] {
-            let error = collect_type_paths(&tree, ResourceType, &mut Vec::new()).unwrap_err();
+            let error = lower(&tree).unwrap_err();
             assert!(matches!(error, DomainError::Validation { .. }));
         }
     }
@@ -93,97 +104,47 @@ fn collect_type_paths_rejects_nested_operators_and_non_strings() {
             field: ResourceType,
             values: vec![Value::String("known".into()), value],
         };
-        assert!(collect_type_paths(&tree, ResourceType, &mut Vec::new()).is_err());
+        assert!(lower(&tree).is_err());
     }
 }
 
-/// Substitution preserves nesting, operators, list order, and unrelated values.
+fn render(filter: &str) -> String {
+    let parsed = parse_filter_string(filter).expect("valid syntax");
+    let node = validate_filter::<MembershipFilterField>(parsed.as_expr()).expect("valid filter");
+    Query::select()
+        .column(Asterisk)
+        .from(MembershipEntity)
+        .cond_where(lower(&node).expect("lowered"))
+        .to_string(SqliteQueryBuilder)
+}
+
+/// GTS type predicates go through the dictionary in SQL: no key lookup or
+/// creation beforehand, and an unknown identifier simply contributes no key,
+/// so `eq`/`in` select nothing, `ne` selects everything, and `not`/`or` keep
+/// their meaning.
 #[test]
-fn map_type_values_preserves_structure_and_other_fields() {
-    let parsed = parse_filter_string(&format!(
-        "not (resource_type eq 'first') or (resource_type in ('first', 'second') and group_id eq '{ID}' and resource_id eq 'first')"
-    )).unwrap();
-    let original = validate_filter::<MembershipFilterField>(parsed.as_expr()).unwrap();
-    let mut paths = Vec::new();
-    collect_type_paths(&original, MembershipFilterField::ResourceType, &mut paths).unwrap();
-    assert_eq!(paths, ["first", "first", "second"]);
-    let mapped = map_type_values(
-        &original,
-        MembershipFilterField::ResourceType,
-        &mut |value| {
-            Ok(Value::Number(
-                if matches!(value, Value::String(raw) if raw == "first") {
-                    1.into()
-                } else {
-                    2.into()
-                },
-            ))
-        },
-    )
-    .unwrap();
-    assert_mapped_tree(&original, &mapped);
-}
-
-/// Compare corresponding branches without relying on debug formatting.
-fn assert_mapped_tree(
-    original: &FilterNode<MembershipFilterField>,
-    mapped: &FilterNode<MembershipFilterField>,
-) {
-    let check_value = |field, before: &Value, after: &Value| {
-        if field == MembershipFilterField::ResourceType {
-            let expected = if matches!(before, Value::String(raw) if raw == "first") {
-                1
-            } else {
-                2
-            };
-            assert!(matches!(after, Value::Number(number) if number == expected));
-        } else {
-            match (before, after) {
-                (Value::String(a), Value::String(b)) => assert_eq!(a, b),
-                (Value::Uuid(a), Value::Uuid(b)) => assert_eq!(a, b),
-                _ => panic!("unrelated value changed"),
-            }
-        }
-    };
-    match (original, mapped) {
-        (
-            FilterNode::Binary { field, op, value },
-            FilterNode::Binary {
-                field: f,
-                op: o,
-                value: v,
-            },
-        ) => {
-            assert_eq!((field, op), (f, o));
-            check_value(*field, value, v);
-        }
-        (
-            FilterNode::InList { field, values },
-            FilterNode::InList {
-                field: f,
-                values: vs,
-            },
-        ) => {
-            assert_eq!(field, f);
-            assert_eq!(values.len(), vs.len());
-            for (a, b) in values.iter().zip(vs) {
-                check_value(*field, a, b);
-            }
-        }
-        (
-            FilterNode::Composite { op, children },
-            FilterNode::Composite {
-                op: o,
-                children: cs,
-            },
-        ) => {
-            assert_eq!(op, o);
-            assert_eq!(children.len(), cs.len());
-            for (a, b) in children.iter().zip(cs) {
-                assert_mapped_tree(a, b);
-            }
-        }
-        (FilterNode::Not(a), FilterNode::Not(b)) => assert_mapped_tree(a, b),
-        _ => panic!("tree shape changed"),
-    }
+fn type_predicates_match_dictionary_keys_in_a_subquery() {
+    const T: &str = "gts.cf.core.rg.group.v1~x.test.member.v1~";
+    let keys = format!(r#"(SELECT "id" FROM "gts_type" WHERE "gts_type"."schema_id" IN ('{T}'))"#);
+    let eq = render(&format!("resource_type eq '{T}'"));
+    assert!(eq.contains(&format!(r#""gts_type_id" IN {keys}"#)), "{eq}");
+    let ne = render(&format!("resource_type ne '{T}'"));
+    assert!(
+        ne.contains(&format!(r#""gts_type_id" NOT IN {keys}"#)),
+        "{ne}"
+    );
+    let not = render(&format!("not (resource_type eq '{T}')"));
+    assert!(
+        not.contains(&format!(r#"NOT "gts_type_id" IN {keys}"#)),
+        "{not}"
+    );
+    let list = render(&format!(
+        "resource_type in ('{T}', 'gts.other~') or resource_id eq 'r'"
+    ));
+    assert!(
+        list.contains(&format!(
+            r#""gts_type_id" IN (SELECT "id" FROM "gts_type" WHERE "gts_type"."schema_id" IN ('{T}', 'gts.other~'))"#
+        )) && list.contains(r#" OR "resource_id" = 'r'"#),
+        "{list}"
+    );
 }

@@ -5,7 +5,7 @@
 //!
 //! Maps Resource Group hierarchy data to tenant resolver models.
 //! Groups whose type code is one of the configured tenant types (default:
-//! `TENANT_RG_TYPE_PATH`) are treated as tenants; all other groups are
+//! `TENANT_GROUP_TYPE_ID`) are treated as tenants; all other groups are
 //! invisible to this plugin.
 
 use std::collections::{HashMap, HashSet};
@@ -59,7 +59,7 @@ fn tenant_type_filter(field_name: &str, tenant_types: &[String]) -> Expr {
 ///
 /// Resolves tenant data from Resource Group hierarchy. Only groups whose
 /// type code is one of the configured tenant types are treated as tenants
-/// (default: `resource_group_sdk::TENANT_RG_TYPE_PATH`).
+/// (default: `resource_group_sdk::TENANT_GROUP_TYPE_ID`).
 #[domain_model]
 pub struct Service {
     rg: Arc<dyn ResourceGroupReadHierarchy>,

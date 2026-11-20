@@ -55,9 +55,12 @@ pub(super) fn register_group_routes(mut router: Router, openapi: &dyn OpenApiReg
             "Created resource group",
         )
         .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
         .error_404(openapi)
         .error_409(openapi)
         .error_500(openapi)
+        .error_503(openapi)
         .register(router, openapi);
 
     // GET /resource-group/v1/groups/{group_id} - Get a specific group
@@ -97,9 +100,12 @@ pub(super) fn register_group_routes(mut router: Router, openapi: &dyn OpenApiReg
             "Updated resource group",
         )
         .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
         .error_404(openapi)
         .error_409(openapi)
         .error_500(openapi)
+        .error_503(openapi)
         .register(router, openapi);
 
     // DELETE /resource-group/v1/groups/{group_id} - Delete a group

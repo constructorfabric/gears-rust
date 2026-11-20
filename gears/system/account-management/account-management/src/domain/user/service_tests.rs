@@ -1340,21 +1340,20 @@ async fn create_user_rejects_oversized_profile_fields_no_idp_call() {
 //
 //   1. `list_groups($filter = tenant_id eq T AND type eq
 //      USER_GROUP_RG_TYPE_CODE)` — drain all pages.
-//   2. For each group: `remove_membership(group_id, USER_RG_TYPE_CODE,
-//      user_id)`. `NotFound` is idempotent success.
+//   2. Remove the AM user type family in each group.
+//      `NotFound` is idempotent success.
 //
 // The cleanup short-circuits when the service is constructed without
 // `with_rg_membership_cleanup`; the tests below wire a minimal fake
-// RG client around `list_groups` + `remove_membership`.
+// RG client around `list_groups` + `remove_resource_memberships`.
 
 mod cleanup {
     use super::*;
-    use account_management_sdk::gts::{USER_GROUP_RG_TYPE_CODE, USER_RG_TYPE_CODE};
+    use account_management_sdk::gts::{USER_GROUP_RG_TYPE_CODE, USER_RESOURCE_TYPE};
     use async_trait::async_trait;
     use resource_group_sdk::{
-        CreateGroupRequest, CreateTypeRequest, GroupHierarchy, ResourceGroup, ResourceGroupClient,
-        ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth, UpdateGroupRequest,
-        UpdateTypeRequest,
+        CreateGroupRequest, GroupHierarchy, ResourceGroup, ResourceGroupClient,
+        ResourceGroupMembership, ResourceGroupWithDepth, UpdateGroupRequest,
     };
     use std::sync::Mutex;
     use toolkit_canonical_errors::{CanonicalError, resource_error};
@@ -1376,7 +1375,7 @@ mod cleanup {
             .create()
     }
 
-    // -- minimal RG fake focused on list_groups + remove_membership --
+    // -- minimal RG fake focused on list_groups + remove_resource_memberships --
 
     enum ListBehaviour {
         Pages(Vec<Page<ResourceGroup>>),
@@ -1476,6 +1475,16 @@ mod cleanup {
         async fn remove_membership(
             &self,
             _ctx: &SecurityContext,
+            _group_id: Uuid,
+            _resource_type: &str,
+            _resource_id: &str,
+        ) -> Result<(), CanonicalError> {
+            unreachable!("deprovision uses the stored AM user type family");
+        }
+
+        async fn remove_resource_memberships(
+            &self,
+            _ctx: &SecurityContext,
             group_id: Uuid,
             resource_type: &str,
             resource_id: &str,
@@ -1502,42 +1511,6 @@ mod cleanup {
             unreachable!(
                 "cleanup uses list_groups(tenant) + per-group remove, never list_memberships"
             )
-        }
-        async fn create_type(
-            &self,
-            _ctx: &SecurityContext,
-            _request: CreateTypeRequest,
-        ) -> Result<ResourceGroupType, CanonicalError> {
-            unreachable!()
-        }
-        async fn get_type(
-            &self,
-            _ctx: &SecurityContext,
-            _code: &str,
-        ) -> Result<ResourceGroupType, CanonicalError> {
-            unreachable!()
-        }
-        async fn list_types(
-            &self,
-            _ctx: &SecurityContext,
-            _query: &ODataQuery,
-        ) -> Result<Page<ResourceGroupType>, CanonicalError> {
-            unreachable!()
-        }
-        async fn update_type(
-            &self,
-            _ctx: &SecurityContext,
-            _code: &str,
-            _request: UpdateTypeRequest,
-        ) -> Result<ResourceGroupType, CanonicalError> {
-            unreachable!()
-        }
-        async fn delete_type(
-            &self,
-            _ctx: &SecurityContext,
-            _code: &str,
-        ) -> Result<(), CanonicalError> {
-            unreachable!()
         }
         async fn create_group(
             &self,
@@ -1654,8 +1627,8 @@ mod cleanup {
         assert!(
             removed
                 .iter()
-                .all(|(_, t, r)| t == USER_RG_TYPE_CODE && r == &user_str),
-            "every remove targets the deprovisioned user under USER_RG_TYPE_CODE"
+                .all(|(_, t, r)| t == USER_RESOURCE_TYPE && r == &user_str),
+            "every remove targets the deprovisioned user under USER_RESOURCE_TYPE"
         );
         let group_ids: std::collections::HashSet<Uuid> =
             removed.iter().map(|(g, _, _)| *g).collect();
