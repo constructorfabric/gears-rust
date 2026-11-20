@@ -619,22 +619,21 @@ Test setup: SQLite in-memory, admitted registry definitions and GroupService wit
 
 ### Invalid / Non-GTS Input Tests
 
-**ONE existing test** checks invalid type code: `create_type_invalid_code_returns_400` with `"code": "invalid"`. Nothing else.
-
+The router tests exercise invalid identifiers on group creation and membership addition.
 
 #### Type code / type_path — wrong GTS format:
 
 #### TC-NOGTS-04: Create group with non-RG type_path [P1]
-- `type: "gts.cf.core.user.v1~"` — valid GTS but not RG type
-- **Assert**: 400 Validation ("must start with prefix")
+- `type: "gts.cf.core.am.user.v1~"` — valid GTS type outside the RG group family
+- **Assert**: 400 Validation
 
 #### TC-NOGTS-05: Create group with empty type_path [P1]
 - `type: ""`
-- **Assert**: 400 ("must not be empty")
+- **Assert**: 400 Validation
 
 #### TC-NOGTS-06: Membership with non-GTS resource_type [P1]
 - POST `/memberships/{group_id}/not.a.gts.path/res-1`
-- **Assert**: 400 Validation ("Unknown resource type") — resolve_id returns None
+- **Assert**: 400 Validation for the malformed GTS type ID
 
 #### TC-NOGTS-07: Membership with empty resource_type [P2]
 - POST `/memberships/{group_id}//res-1` or empty segment
@@ -654,7 +653,7 @@ Test setup: SQLite in-memory, admitted registry definitions and GroupService wit
 - **Assert**: 400
 
 #### TC-DESER-07: Empty body when body expected [P1]
-- POST /types with empty body
+- POST /groups with empty body
 - **Assert**: 400/422
 
 #### TC-DESER-08: Create group with `name: ""` (empty string) [P1]
@@ -670,8 +669,8 @@ Test setup: SQLite in-memory, admitted registry definitions and GroupService wit
 - **Assert**: 400
 
 #### TC-DESER-11: Extra unknown fields in body [P3]
-- `{"code": "...", "can_be_root": true, "unknown_field": 42}`
-- **Assert**: Verify behavior — serde default is ignore (200) or reject?
+- POST /groups with a registered group `type`, a valid `name` and `unknown_field`.
+- **Assert**: The router test accepts 201 if the field is ignored or 400/422 if deserialization rejects it.
 
 ### ADR-001 Hierarchy Reproduction in RG Gear
 
@@ -705,15 +704,15 @@ Reproduce the full ADR example hierarchy (T1→D2→B3, T7→D8, T9) with correc
 - **Assert**: `DomainError::Validation` from the group schema
 
 #### TC-ADR-05: Branch allows users AND courses as members [P1]
-- Branch type: `allowed_memberships: [user_type, course_type]`
+- Bind the branch type to a membership schema whose `resource_type` enum contains the user and course type IDs.
 - Add user membership to branch → success
 - Add course membership to branch → success
 - **Assert**: both memberships exist
 
 #### TC-ADR-06: Tenant allows only users as members (not courses) [P1]
-- Tenant type: `allowed_memberships: [user_type]` (no course)
+- Bind the tenant type to a membership schema whose `resource_type` is fixed to the user type ID.
 - Add user to tenant → success
-- Add course to tenant → **DomainError::Validation("not in allowed_memberships")**
+- Add course to tenant → `DomainError::Validation` because the bound schema rejects the course type.
 
 #### TC-ADR-07: Same resource (user) in multiple groups with different group_ids [P1]
 - Per ADR: "R8 appears twice: as user in D8 and T7"
@@ -883,12 +882,12 @@ the payload with the actual parent in the transaction.
 
 #### TC-REST-10: Error response HTTP mapping — status codes and Content-Type [P1]
 - **Covers**: RG3
-- **Why**: `error.rs` maps `DomainError` variants to HTTP status + `Content-Type: application/problem+json`. No direct unit tests verify this mapping. `error_response_has_problem_fields` (existing) checks one 404 response, but does not verify all status codes or Content-Type header explicitly.
+The router test `rest_error_responses_have_problem_content_type_and_status` checks the status and problem response for group operations.
 - **Setup**: Trigger multiple error paths via `Router::oneshot`:
   - GET /groups/{random-uuid} → 404 Not Found
-  - POST /types {duplicate code} → 409 Conflict
-  - POST /types {invalid body} → 400 Bad Request
-  - POST /groups {type "gts.cf.core.rg.group.v1~nonexistent.v1~"} → 404 (TypeNotFound)
+  - POST /groups with an existing group ID → 409 Conflict
+  - POST /groups with an invalid group type ID → 400 Bad Request
+  - POST /groups {type "gts.cf.core.rg.group.v1~x.test.rg.unknown.v1~"} → 404 (TypeNotFound)
 - **Assert per response**:
   - HTTP status code matches expected
   - `Content-Type` header contains `application/problem+json`
@@ -921,9 +920,9 @@ These test domain invariants that prevent data corruption or violate core busine
 | **TC-MBR-01** | Add membership happy path | Core write feature |
 | **TC-MBR-02** | Add to nonexistent group | Dangling membership |
 | **TC-MBR-03** | Duplicate membership | Data integrity |
-| **TC-MBR-05** | Not in allowed_memberships | Type system bypassed |
+| **TC-MBR-05** | Bound membership schema rejects the candidate type | Type system bypassed |
 | **TC-MBR-06** | Tenant incompatibility | Cross-tenant data leak |
-| **TC-MBR-13** | Empty allowed_memberships rejects all | Type system bypassed |
+| **TC-MBR-13** | An explicitly restrictive membership schema rejects every member type | Type system bypassed |
 | **TC-MBR-14** | Same resource in multiple groups same tenant | Multi-group membership broken |
 | **TC-GRP-22** | Create group nonexistent type | Group with invalid type |
 | **TC-GRP-23** | Child group cross-tenant parent | Tenant isolation broken |
@@ -1029,10 +1028,10 @@ pub fn make_ctx(tenant_id: Uuid) -> SecurityContext { ... }
 /// AllowAll PolicyEnforcer (returns tenant-scoped AccessScope).
 pub fn make_enforcer() -> PolicyEnforcer { ... }
 
-/// Create root type with unique code suffix. One DB round-trip.
+/// Publish a root-capable type with a unique code to the test registry.
 pub async fn create_root_type(svc: &TestTypes, suffix: &str) -> ResourceGroupType { ... }
 
-/// Create child type referencing parent codes. One DB round-trip.
+/// Publish a child group schema and its bound membership schema to the test registry.
 pub async fn create_child_type(
     svc: &TestTypes, suffix: &str, parents: &[&str], memberships: &[&str]
 ) -> ResourceGroupType { ... }
@@ -1054,9 +1053,6 @@ pub async fn assert_closure_rows(
 
 /// Assert total closure row count for a set of groups (no extra rows left).
 pub async fn assert_closure_count(conn: &impl DBRunner, group_ids: &[Uuid], expected_total: usize) { ... }
-
-/// Assert junction table rows for a type.
-pub async fn assert_allowed_parents(conn: &impl DBRunner, type_id: i16, expected_parent_ids: &[i16]) { ... }
 
 /// Assert no SMALLINT IDs in JSON value (recursive check).
 pub fn assert_no_surrogate_ids(json: &serde_json::Value) { ... }

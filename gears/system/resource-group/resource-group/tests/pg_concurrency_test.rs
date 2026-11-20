@@ -1224,7 +1224,7 @@ async fn forced_first_use_overlap(fix: &PgFixture, config: TxConfig) -> usize {
 }
 
 #[tokio::test]
-async fn stored_user_memberships_are_removed_across_schema_versions() {
+async fn cleanup_removes_only_the_requested_users_type_family() {
     let Some(fixture) = pg_fixture().await else {
         return;
     };

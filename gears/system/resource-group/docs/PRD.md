@@ -953,18 +953,17 @@ consumes them.
 - **AND** response contains only groups visible to tenant `T7`: `[T7, D2, D3]`
 - **AND** groups from other tenants (`T1`, `D1`, `T9`, `D4`) are not returned
 
-#### Scenario: Seed Groups (Pre-Deployment Step)
+#### Scenario: A Consumer Bootstraps Its Group Hierarchy
 
-- **GIVEN** deployment configuration defines group hierarchy:
+- **GIVEN** the tenant group schema is active, T1 is provisioned, and the consumer needs this hierarchy:
   ```
   T1 (type=tenant, name="Root Tenant")
   ├── T3 (type=tenant, name="Child Tenant A", parent=T1)
   └── T7 (type=tenant, name="Child Tenant B", parent=T1)
   ```
-- **WHEN** operator runs the seeding step before deployment (pre-deployment migration)
-- **THEN** missing groups are created with closure rows, existing groups are updated to match seed definitions
-- **AND** parent-child links and type compatibility are validated during seeding
-- **AND** seeding is idempotent — repeated runs produce the same result
+- **WHEN** the consumer looks up groups by their stable IDs and creates missing children through the RG group API
+- **THEN** RG validates each child against its published group schema and records its parent and closure rows
+- **AND** on a rerun the consumer reuses the existing groups.
 
 #### Scenario: Reduced Query Profile Without Migration
 
@@ -1043,16 +1042,15 @@ consumes them.
 - **WHEN** caller queries memberships with `$filter=resource_type eq 'User' and resource_id eq 'U1'`
 - **THEN** three membership links are returned: `(G1, User, U1)`, `(G2, User, U1)`, `(G3, User, U1)`
 
-#### Scenario: Seed Memberships (Pre-Deployment Step)
+#### Scenario: A Consumer Bootstraps Group Memberships
 
 - **GIVEN** deployment configuration defines membership links:
   - `(G1, User, admin-user-1)`
   - `(G1, ServiceAccount, svc-monitoring)`
   - `(G2, User, admin-user-1)`
-- **WHEN** operator runs the seeding step before deployment (pre-deployment migration)
-- **THEN** missing membership links are created, existing links are preserved
-- **AND** group existence and tenant compatibility are validated during seeding
-- **AND** seeding is idempotent — repeated runs produce the same result
+- **WHEN** the consumer adds missing links through the RG membership API using the active member type IDs
+- **THEN** RG checks the group, its bound membership schema and tenant compatibility before storing each link
+- **AND** the consumer preserves existing links on a rerun.
 
 ### 8.4 Group Hierarchy (AuthZ Plugin Read Path)
 
@@ -1105,7 +1103,7 @@ consumes them.
 - [x] `resource_group_membership` derives tenant scope from the referenced group's `tenant_id` via `group_id` JOIN, and AuthZ query path always uses effective tenant-scoped reads/SQL predicates.
 - [x] Platform-admin provisioning via RG API may run without caller tenant scoping, while tenant hierarchy compatibility invariants remain enforced.
 - [x] Membership operations use composite key `(group_id, resource_type, resource_id)`.
-- [x] REST API endpoints available under `/api/resource-group/v1/` (groups/memberships) and `/api/types-registry/v1/` (types) with OData query support.
+- [x] RG exposes groups, hierarchy and memberships under `/resource-group/v1/` plus the host prefix. List endpoints support OData queries. Owners publish type definitions through Types Registry.
 - [x] Dedicated group depth endpoint returns relative `depth` and supports depth-based filtering.
 
 ## 10. Dependencies

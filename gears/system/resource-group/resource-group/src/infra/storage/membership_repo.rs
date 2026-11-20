@@ -207,9 +207,7 @@ impl MembershipRepositoryTrait for MembershipRepository {
         // never creating a key: an unknown type deletes nothing.
         let keys = match types {
             MemberTypes::Exact(code) => gts_type_dict::keys_subquery([code]),
-            MemberTypes::Family { root, exact_alias } => {
-                gts_type_dict::family_keys(root.as_ref(), exact_alias)
-            }
+            MemberTypes::Family(root) => gts_type_dict::family_keys(root.as_ref()),
         };
         let row_scope = system_scope();
         let result = MembershipEntity::delete_many()

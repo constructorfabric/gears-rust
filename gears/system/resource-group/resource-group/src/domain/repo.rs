@@ -15,10 +15,7 @@ use crate::domain::error::DomainError;
 #[domain_model]
 pub enum MemberTypes<'a> {
     Exact(&'a str),
-    Family {
-        root: &'a types_registry_sdk::GtsTypeId,
-        exact_alias: Option<&'a str>,
-    },
+    Family(&'a types_registry_sdk::GtsTypeId),
 }
 
 /// Storage key of a GTS type in RG's local identity dictionary (`gts_type`).

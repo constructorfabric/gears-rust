@@ -295,27 +295,18 @@ impl<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> MembershipService<
         .await
     }
 
-    /// Remove all stored spellings of one resource under the same delete scope.
+    /// Remove links for one resource of the given type family under the membership delete scope.
     pub async fn remove_resource_memberships(
         &self,
         ctx: &SecurityContext,
         group_id: Uuid,
         type_family: &str,
         resource_id: &str,
-        exact_alias: Option<&str>,
     ) -> Result<(), DomainError> {
         let root = types_registry_sdk::GtsTypeId::try_new(type_family)
             .map_err(|e| DomainError::validation(format!("Invalid member type family: {e}")))?;
-        self.remove_matching(
-            ctx,
-            group_id,
-            resource_id,
-            MemberTypes::Family {
-                root: &root,
-                exact_alias,
-            },
-        )
-        .await
+        self.remove_matching(ctx, group_id, resource_id, MemberTypes::Family(&root))
+            .await
     }
 
     async fn remove_matching(
@@ -368,7 +359,7 @@ impl<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> MembershipService<
                 "({group_id}, {}, {resource_id})",
                 match types {
                     MemberTypes::Exact(code) => code,
-                    MemberTypes::Family { root, .. } => root.as_ref(),
+                    MemberTypes::Family(root) => root.as_ref(),
                 }
             )));
         }

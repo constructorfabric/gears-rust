@@ -207,8 +207,10 @@ Parent types belong to the RG type family. Member resource types may be any
 registered GTS type. RG records the resource identifier supplied by the caller.
 The owning gear remains responsible for confirming that its resource exists.
 
-Owners narrow the schemas to fit their domain. The bases allow root placement,
-any RG parent type and any active concrete member type. RG applies the published
+Narrowing the inherited schemas is optional. A concrete group with an active
+membership binding can inherit root placement and any RG parent type. If the
+bound membership schema inherits its `resource_type` constraint unchanged,
+it accepts any active concrete member type. RG applies the published
 constraints alongside its forest, tenant and query-profile checks. For example,
 Account Management allows root user groups and nesting under other user groups,
 with membership limited to the AM user type family.
@@ -258,6 +260,14 @@ Authorization decisions and SQL scope generation remain outside RG's domain
 services. Query profile changes apply to subsequent writes without rewriting
 the existing forest.
 
+#### Storage deviation from Types Registry ADR-0001
+
+Types Registry specifies an opaque SDK-issued UUID for each registry reference.
+The T38b amendment of 2026-11-17 retained RG’s numeric foreign keys so deployed
+groups and memberships keep their links during the move to registry-owned
+schemas. See [ADR-0001](../../types-registry/docs/ADR/0001-cpt-cf-types-registry-adr-storage-identity-query-model.md#decision-outcome)
+and the [T38b implementation record](https://github.com/constructorfabric/gears-rust/commit/358726c2d8b85d4d887df1bc60106eb69d2f669f).
+
 Groups and memberships reference their GTS type by a `SMALLINT` key into RG's
 local identity dictionary (`gts_type`: key, GTS identifier, creation time).
 The dictionary holds no definitions, and a row proves nothing about the type's
@@ -265,9 +275,14 @@ existence, admission or lifecycle in Types Registry: every new link is admitted
 by the registry first. Keys are created on first use, inside the write
 transaction that inserts the referencing row and after every check that can
 reject the request (PostgreSQL does not return identity values on rollback).
-Rows are never updated or deleted, also when a type is retired in the registry,
-so reads and cleanup keep working without it. Public SDK and REST contracts use
+RG retains dictionary rows when a type is retired, so reads and cleanup keep
+working without a registry lookup. Public SDK and REST contracts use
 GTS identifier strings only.
+
+Move to UUID references once the upgrade can map stored identifiers (including
+retired types and unpublished legacy definitions), preserve membership scope
+queries, and serve reads and cleanup during registry outages. The decision and
+migration work are tracked in [#6086](https://github.com/constructorfabric/gears-rust/issues/6086).
 
 The implementation supports PostgreSQL and SQLite. Executable migrations and
 backend-specific SQL live under `infra/storage/migrations/`. The reference
@@ -648,13 +663,25 @@ backends.
    and include `null` when `can_be_root` is true. Copy a non-null
    `metadata_schema` to `properties.metadata`. Constrain the membership
    schema's `properties.resource_type` to the exact `allowed_membership_types`,
-   then bind that schema through the group's `membership_type` trait. See the
+   then bind that schema through the group's `membership_type` trait. If the
+   old membership list was empty, explicitly exclude all member IDs. The RG
+   validation fixtures use `"maxLength": 0` on the required `resource_type`
+   string, which no valid GTS ID satisfies. See the
    [type contracts](features/0002-type-management.md).
 3. Publish those schemas through the owner's `gts_publication` or the
    platform API before upgrading. Publication after upgrade requires the
    saved export or backup. Until publication, reads and cleanup still work,
    while creates, moves, metadata changes that need validation and new
    memberships fail with `TypeNotFound`.
+
+For Rust SDK consumers, update these imports when upgrading:
+
+| SDK | Previous constant | Replacement |
+| --- | --- | --- |
+| Resource Group | `TYPE_RESOURCE_TYPE` or `GROUP_RESOURCE_TYPE` | `GROUP_TYPE_ID` |
+| Resource Group | `GROUP_MEMBERSHIP_RESOURCE_TYPE` | `GROUP_MEMBERSHIP_TYPE_ID` |
+| Resource Group | `TENANT_RG_TYPE_PATH` | `TENANT_GROUP_TYPE_ID` |
+| Account Management | `USER_RG_TYPE_CODE` | `USER_RESOURCE_TYPE` (AM user memberships use `gts.cf.core.am.user.v1~` and its descendants) |
 
 The group CRUD authorization target is already `gts.cf.core.rg.group.v1~`.
 A single migration rewrites the group prefix in every matching dictionary entry,

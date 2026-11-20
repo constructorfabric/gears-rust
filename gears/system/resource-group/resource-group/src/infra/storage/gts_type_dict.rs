@@ -150,20 +150,17 @@ where
 
 /// Literal prefix ending at the GTS segment boundary. `SUBSTR` and equality
 /// keep underscores literal and preserve case on both `PostgreSQL` and `SQLite`.
-pub fn family_keys(root: &str, exact_alias: Option<&str>) -> SelectStatement {
+pub fn family_keys(root: &str) -> SelectStatement {
     use sea_orm::ExprTrait;
     use sea_orm::sea_query::{Alias, Expr, Func};
     let prefix = Func::cust(Alias::new("substr"))
         .arg(Expr::col(Column::SchemaId))
         .arg(1)
         .arg(Func::char_length(root));
-    let condition = sea_orm::Condition::any()
-        .add(prefix.eq(root))
-        .add_option(exact_alias.map(|alias| Column::SchemaId.eq(alias)));
     Query::select()
         .column(Column::Id)
         .from(Entity)
-        .cond_where(condition)
+        .and_where(prefix.eq(root))
         .to_owned()
 }
 

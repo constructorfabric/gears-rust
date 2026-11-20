@@ -11,7 +11,7 @@
 - [1. Overview](#1-overview)
 - [2. Entries](#2-entries)
   - [2.1 SDK Contracts, Error Types & Gear Foundation &mdash; HIGH](#21-sdk-contracts-error-types--gear-foundation-mdash-high)
-  - [2.2 Registry-Owned Type Contracts &mdash; HIGH](#22-registry-owned-type-contracts-mdash-high)
+  - [2.2 Registry-Owned Type Contracts (HIGH)](#22-registry-owned-type-contracts-high)
   - [2.3 Group Entity & Hierarchy Engine &mdash; HIGH](#23-group-entity--hierarchy-engine-mdash-high)
   - [2.4 Membership Management &mdash; MEDIUM](#24-membership-management-mdash-medium)
   - [2.5 Integration Read Port & Dual Authentication Modes &mdash; MEDIUM](#25-integration-read-port--dual-authentication-modes-mdash-medium)
@@ -101,7 +101,7 @@ The Resource Group DESIGN is decomposed into seven features organized around the
 
   - `cpt-cf-resource-group-seq-init-order`
 
-### 2.2 Registry-Owned Type Contracts &mdash; HIGH
+### 2.2 Registry-Owned Type Contracts (HIGH)
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-feature-type-management`
 
@@ -228,7 +228,7 @@ The Resource Group DESIGN is decomposed into seven features organized around the
   - Membership REST endpoints: list/add/remove under `/api/resource-group/v1/memberships` with OData `$filter` on `resource_id`, `resource_type`, `group_id`
   - Tenant compatibility: tenant scope derived from group's `tenant_id` via JOIN, reject tenant-incompatible membership writes when resource already linked in incompatible tenant
   - GTS type path resolution for `resource_type` via surrogate ID at persistence boundary
-  - allowed_memberships validation: reject if `resource_type` is not in the group type's allowed_memberships
+  - Validate the candidate’s `resource_type` against the active membership schema selected by the group type’s `membership_type` trait
   - Consumer bootstrap through normal membership operations with group existence and tenant compatibility validation
   - Active reference integration: membership references block entity deletion in feature 3 (unless force delete)
   - Data lifecycle: cascade-delete memberships on tenant deprovisioning

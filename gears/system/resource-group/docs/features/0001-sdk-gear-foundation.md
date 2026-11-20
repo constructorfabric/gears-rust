@@ -230,17 +230,17 @@ The system **MUST** provide an RG gear annotated with `#[toolkit::gear]` that re
 The system **MUST** wire OperationBuilder-based REST API routing with OData `$filter` parsing and cursor-based pagination for all list endpoints.
 
 **Required infrastructure**:
-- OperationBuilder endpoint registration for types (under `/api/types-registry/v1/`), groups and memberships (under `/api/resource-group/v1/`)
+- OperationBuilder endpoint registration for groups, hierarchy and memberships
 - OData `$filter` parser supporting field-specific operators: `eq`, `ne`, `in` for string/UUID fields; `eq`, `ne`, `gt`, `ge`, `lt`, `le` for integer fields; nested path syntax (`hierarchy/parent_id`, `hierarchy/depth`)
 - Cursor-based pagination: `limit` (1..200, default 25), `cursor` (opaque token). Ordering is undefined but consistent — no `$orderby` support.
 - DomainError → Problem (RFC-9457) error response mapping wired into all endpoint handlers via OperationBuilder error hooks
-- Path-based API versioning: `/api/resource-group/v1/` for groups and memberships, `/api/types-registry/v1/` for types
+- Path-based API versioning under `/resource-group/v1/` plus the host prefix. Type publication belongs to Types Registry.
 
 **Implements**:
 - `cpt-cf-resource-group-algo-sdk-foundation-map-domain-error`
 
 **Touches**:
-- API: `GET/POST/PUT/DELETE /api/types-registry/v1/types*`, `GET/POST/PUT/DELETE /api/resource-group/v1/groups*`, `GET/POST/DELETE /api/resource-group/v1/memberships*`
+- API: `GET/POST/PUT/DELETE /api/resource-group/v1/groups*`, `GET/POST/DELETE /api/resource-group/v1/memberships*`
 
 ### E2E Test Suite
 

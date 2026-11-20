@@ -155,8 +155,7 @@ pub trait ResourceGroupClient: Send + Sync {
     ) -> Result<(), CanonicalError>;
 
     /// Remove links for one resource in one group under the membership delete scope.
-    /// Matches the GTS type family (base and descendants) and, when supplied, one
-    /// exact historical type alias. Returns `NotFound` if no visible link matches.
+    /// Matches the base GTS type and its descendants. Returns `NotFound` if no visible link matches.
     /// Implementations without family-aware deletion report `Unimplemented`.
     async fn remove_resource_memberships(
         &self,
@@ -164,7 +163,6 @@ pub trait ResourceGroupClient: Send + Sync {
         _group_id: Uuid,
         _type_family: &str,
         _resource_id: &str,
-        _exact_alias: Option<&str>,
     ) -> Result<(), CanonicalError> {
         #[toolkit_canonical_errors::resource_error(toolkit_gts::gts_id!("cf.core.rg.group_membership.v1~"))]
         struct Membership;

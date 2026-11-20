@@ -880,7 +880,7 @@ async fn reads_filters_and_removals_create_no_dictionary_keys() {
 }
 
 #[tokio::test]
-async fn stored_user_memberships_are_removed_across_schema_versions() {
+async fn cleanup_removes_only_the_requested_users_type_family() {
     common::assert_stored_membership_cleanup(common::test_db().await).await;
 }
 

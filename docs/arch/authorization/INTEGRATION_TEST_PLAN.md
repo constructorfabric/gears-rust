@@ -313,22 +313,22 @@ E2E tests using AuthZ plugins (profile `tr-authz` in `testing/e2e/suites/resourc
 ### Fixture: `tenant_hierarchy`
 
 ```
-T1 (root tenant, tenant type, can_be_root=true, token-a subject_tenant_id)
+T1 (root tenant, tenant type permits a null parent, token-a subject_tenant_id)
 ├── T_normal (child tenant, tenant type)
 ├── T_barrier (tenant with metadata.self_managed=true, tenant type)
 │   └── T_behind (child of barrier, tenant type)
-└── Dept1 (department, non-tenant type, can_be_root=false, inherits T1 tenant_id)
+└── Dept1 (department, requires a tenant parent, inherits T1 tenant_id)
 
 T2 (root tenant, token-b subject_tenant_id)
 ```
 
 Tenant-type recognition is code-prefix-driven: any GTS type whose path starts with `TENANT_GROUP_TYPE_ID` (`gts.cf.core.rg.group.v1~cf.core.rg.tenant.v1~`) creates a new tenant scope for its instances.
 
-**Setup steps** (all via REST API, executed once per session):
+**Fixture setup** (once per session)
 
-1. Create tenant type (code starts with `TENANT_GROUP_TYPE_ID`, `can_be_root=true`, `allowed_parent_types=[self]`)
-2. Create department type (code outside the tenant prefix, `can_be_root=false`, `allowed_parent_types=[tenant_type]`)
-3. **Seed T1 root tenant** directly in the DB backend used by the tr-authz overlay — SQLite in CI/e2e; in production deployments the same seeding query runs against the configured SQL-compatible backend (PostgreSQL by default). `id` = token-a `subject_tenant_id`. Root tenants are created via DB seeding, not API.
+1. Through the Types Registry platform API, publish a concrete membership schema and a tenant group schema under the configured tenant prefix. Fix the group’s `membership_type` trait to the membership schema ID. Allow `null` and the exact tenant type ID in `parent_type`.
+2. Publish a department group schema under the RG group base, outside the tenant prefix. Bind its membership schema and set `parent_type` to the exact tenant type ID. Wait for admission before creating groups.
+3. **Seed T1** in the test database with its type key, its self-closure row and `id` equal to token A’s `subject_tenant_id`.
 4. `POST /groups` -- T_normal (parent=T1) -- `tenant_id = T_normal.id`
 5. `POST /groups` -- T_barrier (parent=T1, metadata=`{"self_managed": true}`) -- `tenant_id = T_barrier.id`
 6. `POST /groups` -- T_behind (parent=T_barrier) -- `tenant_id = T_behind.id`

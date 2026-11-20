@@ -3088,7 +3088,7 @@ Rust API; REST contracts and dependency versions are unchanged.
   bypass validation.
   - [x] Remove local type CRUD, bootstrap and its seal, type seeding, and
     `TypeService`/`TypeRepository`. Keep `gts_type` as an immutable identity
-    dictionary (amended 2026-11-17). Allocate `SMALLINT` keys only after
+    dictionary (amended 2026-11-17). See the [deviation from ADR-0001](../../../resource-group/docs/DESIGN.md#storage-deviation-from-types-registry-adr-0001) and [UUID migration follow-up #6086](https://github.com/constructorfabric/gears-rust/issues/6086). Allocate `SMALLINT` keys only after
     validation, within the referencing write transaction. SDK and REST still
     expose string IDs. Use SDK `ReadOptions` directly pending the T36 cache gate.
   - [x] Publish the abstract group and membership bases via `gts_publication`.

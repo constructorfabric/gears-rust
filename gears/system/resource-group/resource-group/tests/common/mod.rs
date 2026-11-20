@@ -777,10 +777,9 @@ pub async fn assert_stored_membership_cleanup(db: Arc<DBProvider<DbError>>) {
     let group = create_root_group(&groups, &ctx, &root.code, "users", tenant).await;
     let user = Uuid::now_v7().to_string();
     let family = "gts.cf.core.am.user.v1~";
-    let legacy = "gts.cf.core.rg.group.v1~cf.core.am.user.v1~";
     let child = "gts.cf.core.am.user.v1~cf.test.am.staff.v1~";
     let unrelated = "gts.cf.core.am.device.v1~";
-    for kind in [legacy, family, child, unrelated] {
+    for kind in [family, child, unrelated] {
         insert_membership_directly(&db, group.id, kind, &user)
             .await
             .expect("membership cleanup fixture");
@@ -790,7 +789,7 @@ pub async fn assert_stored_membership_cleanup(db: Arc<DBProvider<DbError>>) {
         .expect("membership cleanup fixture");
     let foreign = make_ctx(Uuid::now_v7());
     let err = members
-        .remove_resource_memberships(&foreign, group.id, family, &user, Some(legacy))
+        .remove_resource_memberships(&foreign, group.id, family, &user)
         .await
         .expect_err("foreign group must be invisible to cleanup");
     assert!(
@@ -798,7 +797,7 @@ pub async fn assert_stored_membership_cleanup(db: Arc<DBProvider<DbError>>) {
         "{err:?}"
     );
     members
-        .remove_resource_memberships(&ctx, group.id, family, &user, Some(legacy))
+        .remove_resource_memberships(&ctx, group.id, family, &user)
         .await
         .expect("membership cleanup fixture");
     let remaining = members
