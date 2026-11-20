@@ -92,10 +92,7 @@ fn hub_over(tenants: MockTenantResolverClient, registry: MockTypesRegistry) -> A
 }
 
 /// [`hub_over`] with any tenant resolver.
-fn hub_with(
-    tenants: Arc<dyn TenantResolverClient>,
-    registry: MockTypesRegistry,
-) -> Arc<ClientHub> {
+fn hub_with(tenants: Arc<dyn TenantResolverClient>, registry: MockTypesRegistry) -> Arc<ClientHub> {
     let hub = Arc::new(ClientHub::new());
     hub.register::<dyn TenantResolverClient>(tenants);
     hub.register::<dyn CredStoreClientV1>(Arc::new(MockCredStoreClient::empty()));
@@ -1274,7 +1271,7 @@ async fn a_second_start_after_stop_reconciles_again() {
     let file = SqliteFile::new();
     let db = file.open().await;
     let root = Uuid::new_v4();
-    let (upstream_id, route_id) = registry_row_ids();
+    let (_, route_id) = registry_row_ids();
     let hub = hub_over(
         MockTenantResolverClient::with_siblings(TenantId(root), vec![]),
         one_upstream_registry(),
