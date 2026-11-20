@@ -64,14 +64,16 @@ API key management is an established capability in the industry, offered both as
 - A revoked or expired key, or a key whose owning user was deleted, stops authenticating within a bounded, configured time.
 - A tenant administrator can withdraw all API keys of a user without that user's participation.
 - A leaked database snapshot does not reveal usable API keys.
+- An attacker with read/write access to the credential database alone cannot mint an accepted key, reassign an issued key, or extend its lifetime.
 
 ### 1.4 Glossary
 
 | Term | Definition |
 |------|------------|
-| API key | A credential record issued by this gear to a user: identity, owner, name, expiration, status, and the hash of its API key secret. |
-| API Key Secret | The full credential string presented by the client, including the API key prefix, API key format version, and random part. Disclosed only once, in the issuance response. |
-| API Key Prefix | A configurable leading label of every API key secret that makes keys recognizable and lets the AuthN resolver plugin route them to this gear. |
+| API key | A credential record issued by this gear to a user: identity, owner, name, expiration, status, and an issuance MAC used for verification until revocation. |
+| API Key ID | Public, opaque identifier for lookup and management. Issuance time and expiration are separate metadata fields. |
+| API Key Secret | The full credential string presented by the client, including the API key prefix, format version, public key ID, and random secret. Disclosed only once, in the issuance response. |
+| API Key Prefix | A configurable leading label of every API key secret that makes keys recognizable and lets the AuthN resolver select the configured API key authentication plugin. |
 | API Key Format Version | A marker inside every API key secret that identifies its layout, so later releases can change the layout without invalidating issued keys. |
 | API Key Hint | A non-secret display form of an API key secret (its API key prefix plus its last characters) used to tell keys apart in listings. |
 | Owner | The user (subject ID, subject type, and home tenant) that issued the key and on whose behalf the key authenticates. |
@@ -100,7 +102,7 @@ API key management is an established capability in the industry, offered both as
 
 **ID**: `cpt-cf-api-key-management-actor-operator`
 
-- **Role**: The person who deploys and configures the gear and the AuthN resolver plugin: the API key prefix in both places, lifetime policy, key limit, and the gear's service authorization in Account Management; investigates verification failures and dependency outages.
+- **Role**: The person who deploys and configures the issuing prefix on the gear and the matching prefix-to-plugin route on every AuthN resolver, along with the lifetime policy, key limit, and the gear's service authorization in Account Management; investigates verification failures and dependency outages.
 - **Needs**: Configuration errors detected at startup, and operational signals that explain why verifications fail.
 
 ### 2.2 System Actors
@@ -109,7 +111,7 @@ API key management is an established capability in the industry, offered both as
 
 **ID**: `cpt-cf-api-key-management-actor-authn-plugin`
 
-- **Role**: The AuthN resolver plugin that receives a bearer credential, recognizes an API key by its API key prefix, asks this gear to verify it, and turns the result into a `SecurityContext`. Credentials without the API key prefix and client-credentials exchange are handled by the platform's existing authentication path.
+- **Role**: The API key authentication plugin receives credentials routed to its GTS instance by the AuthN resolver, asks this gear to verify them, and turns a successful result into a `SecurityContext`. Credentials without the API key prefix and client-credentials exchange are handled by the platform's existing authentication path.
 
 #### Account Management
 
@@ -129,7 +131,7 @@ Runtime, deployment, and integration patterns follow the repository baselines in
 
 ### 3.1 Gear-Specific Environment Constraints
 
-- The AuthN resolver selects a single plugin per deployment, so API key authentication is delivered by a plugin that handles API keys itself and preserves the platform's existing OIDC bearer authentication and client-credentials exchange for everything else.
+- P1 requires the AuthN resolver to dispatch bearer tokens using operator-configured prefix routes. The existing default authentication plugin handles unmatched bearers and client-credentials exchange.
 - Verification runs on the request authentication path, before any user `SecurityContext` exists; the gear calls Account Management under its own service identity, which requires a deployment-time grant to read users and tenants in every tenant whose users own keys.
 - Supported deployments apply platform admission controls to unauthenticated verification and to issuance traffic, and bound the volume of failure diagnostics; per-key rate limits are out of scope for P1.
 
@@ -138,13 +140,15 @@ Runtime, deployment, and integration patterns follow the repository baselines in
 ### 4.1 In Scope
 
 - Issuing an API key for the calling user, with a name and an expiration.
-- One-time disclosure of the API key secret; storage of a non-reversible hash only.
+- One-time disclosure of the API key secret, lookup by public key ID, and HMAC protection of the credential record.
+- Planned rotation and emergency withdrawal of the server HMAC secrets used to authenticate issued records.
+- A bundled static HMAC provider and support for vendor-supplied HMAC providers, including those backed by a key management service (KMS).
 - Listing and inspecting the caller's own keys, with name, API key hint, timestamps, status, and revocation reason.
 - Revoking a key by its owner; listing and revoking keys of users by a tenant administrator.
 - A per-owner limit on active keys.
 - Verifying a presented key for the AuthN resolver plugin and returning the owner's identity.
 - Withdrawing access when the owning user no longer exists in Account Management or the owner's home tenant is not active.
-- A configurable API key prefix, shared by the gear and the AuthN resolver plugin.
+- A configurable API key prefix, configured on the issuing gear and in the AuthN resolver's route table.
 - Structured security events for key issuance and revocation.
 - Time-bounded retention of revoked and expired key records.
 
@@ -160,6 +164,7 @@ Implementation of the AuthN resolver plugin, construction and propagation of `Se
 - Idempotent issuance with a client-supplied request key (Google AIP-155): in P1 a retried issuance after a lost response creates a second key; the owner finds the unused one by name and creation time and revokes it.
 - An integrity checksum inside the API key secret for offline rejection of mistyped or fabricated keys, introduced as a new API key format version (`cpt-cf-api-key-management-fr-key-format-version`).
 - Per-key rate limits.
+- An optional verification-time age limit for issued keys (`cpt-cf-api-key-management-fr-max-key-age`).
 - Per-key IP allowlists.
 
 **Not planned**:
@@ -221,14 +226,25 @@ In addition to `cpt-cf-api-key-management-fr-management-auth`, the system **MUST
 
 The system **MUST** give every key an expiration time, measured from issuance. When the caller does not request a lifetime, the configured default lifetime applies. The system **MUST** reject a requested lifetime that is not positive or is longer than the configured maximum, without creating a key. The configuration **MUST** satisfy `0 < default lifetime ≤ maximum lifetime`; otherwise the gear **MUST** fail to start. Changing the lifetime policy **MUST NOT** change the expiration of issued keys. Expiration is an absolute cutoff: from its expiration time on, a key **MUST NOT** authenticate, and a reused verification result **MUST NOT** extend it.
 
-- **Rationale**: Bounds the damage of a forgotten or leaked key.
+- **Rationale**: Bounds the damage of a forgotten or leaked key. Applying lifetime policy changes only at issuance lets operators tighten the limit without unexpectedly interrupting existing integrations. Administrators can revoke affected keys explicitly when earlier withdrawal is required, preserving the reason and time of withdrawal for audit.
 - **Actors**: `cpt-cf-api-key-management-actor-key-owner`, `cpt-cf-api-key-management-actor-operator`
+
+#### Maximum Key Age at Verification
+
+- [ ] `p2` - **ID**: `cpt-cf-api-key-management-fr-max-key-age`
+
+Operators **MUST** be able to configure a positive `max_key_age` for new authentication decisions, including those involving previously issued keys. This policy is disabled by default. When enabled, the cutoff is the earlier of the stored expiration and the issuance time plus `max_key_age`. From that instant the key **MUST** yield the uniform invalid-credential outcome. Reused verification results and derived credentials **MUST** respect the effective policy.
+
+Changing this policy preserves the recorded expiration, revocation state and retention deadline. Relaxing or disabling it can restore eligibility only while the key is otherwise valid.
+
+- **Rationale**: Operators can restrict the age of credentials already in circulation independently of the maximum lifetime allowed at issuance.
+- **Actors**: `cpt-cf-api-key-management-actor-operator`, `cpt-cf-api-key-management-actor-authn-plugin`
 
 #### One-Time API Key Secret Disclosure
 
 - [ ] `p1` - **ID**: `cpt-cf-api-key-management-fr-secret-once`
 
-The system **MUST** return the API key secret only in the issuance response. Every later operation **MUST NOT** return the API key secret or any value from which it can be recovered. The system **MUST** store only a non-reversible hash of the API key secret.
+The system **MUST** return the API key secret only in the issuance response. Every later operation **MUST NOT** return the API key secret or any value from which it can be recovered. The system **MUST** persist only a non-reversible issuance MAC as verification material.
 
 - **Rationale**: A database or API leak must not disclose usable keys.
 - **Actors**: `cpt-cf-api-key-management-actor-key-owner`
@@ -239,9 +255,9 @@ The system **MUST** return the API key secret only in the issuance response. Eve
 
 Every issued key **MUST** start with the configured API key prefix. The system **MUST** treat a presented credential without the configured API key prefix as invalid. The gear **MUST** fail to start with an empty API key prefix or with an API key prefix that can be the beginning of another supported credential format, such as a JWT.
 
-Changing the configured API key prefix is a breaking operational change: once the new prefix is effective in the gear and the AuthN resolver plugin, keys issued under a previous prefix **MUST** fail authentication, including unexpired and unrevoked ones. A prefix change does not revoke keys and does not change their status; if a previous prefix is configured again, its unexpired and unrevoked keys become eligible for verification again. Permanent withdrawal requires revocation.
+Changing the configured API key prefix is a breaking operational change: once the new prefix is effective in the gear and the AuthN resolver, keys issued under a previous prefix **MUST** fail authentication, including unexpired and unrevoked ones. A prefix change does not revoke keys and does not change their status; if a previous prefix is configured again, its unexpired and unrevoked keys become eligible for verification again. Permanent withdrawal requires revocation.
 
-- **Rationale**: Lets the AuthN resolver plugin route credentials, and lets people and secret scanners recognize leaked keys. Supporting several prefixes at once is not worth its complexity in P1.
+- **Rationale**: Lets the AuthN resolver route credentials, and lets people and secret scanners recognize leaked keys. Supporting several prefixes at once is not worth its complexity in P1.
 - **Actors**: `cpt-cf-api-key-management-actor-authn-plugin`, `cpt-cf-api-key-management-actor-operator`
 
 #### Versioned API Key Format
@@ -327,7 +343,7 @@ The system **MUST** reject issuance when the owner already has the configured ma
 
 - [ ] `p1` - **ID**: `cpt-cf-api-key-management-fr-retention`
 
-The system **MUST** retain the metadata and stored hash of a key for 90 days from revocation or expiration, whichever occurs first, and **MUST** remove them within 24 hours after that period ends while the gear is operational; when downtime prevents this, overdue removals **MUST** complete within 24 hours of restored operation. Repeated requests and later lifecycle timestamps **MUST NOT** restart the retention period, and retention **MUST NOT** extend credential validity. Removal **MUST NOT** depend on the owner still existing. A removed key **MUST** be omitted from listings, return not-found on lookup, and fail verification. Security events follow their own platform retention policy and are not removed with the key.
+The system **MUST** clear the issuance MAC atomically on revocation, retain key metadata for 90 days from revocation or expiration, whichever occurs first, and **MUST** remove the entire record within 24 hours after that period ends while the gear is operational; when downtime prevents this, overdue removals **MUST** complete within 24 hours of restored operation. Repeated requests and later lifecycle timestamps **MUST NOT** restart the retention period, and retention **MUST NOT** extend credential validity. Removal **MUST NOT** depend on the owner still existing. A removed key **MUST** be omitted from listings, return not-found on lookup, and fail verification. Security events follow their own platform retention policy and are not removed with the key.
 
 - **Rationale**: Keeps revoked and expired keys visible for incident response and offboarding for a bounded time, without growing storage forever.
 - **Actors**: `cpt-cf-api-key-management-actor-key-owner`, `cpt-cf-api-key-management-actor-tenant-admin`
@@ -340,6 +356,17 @@ The system **MUST** report, for each key, the approximate time it last authentic
 
 - **Rationale**: Lets owners and administrators find and remove unused keys.
 - **Actors**: `cpt-cf-api-key-management-actor-key-owner`, `cpt-cf-api-key-management-actor-tenant-admin`
+
+#### Vendor-Supplied HMAC Providers
+
+- [ ] `p1` - **ID**: `cpt-cf-api-key-management-fr-hmac-provider`
+
+The gear **MUST** expose a provider contract through which a vendor can supply HMAC issuance, verification and server-key rotation without modifying the gear. The contract **MUST** support a KMS that keeps its keys non-exportable. Deployments **MUST** be able to select a provider while preserving the public REST and SDK credential formats.
+
+The gear **MUST** ship a static provider that accepts the complete current and retired key set from a file or an environment variable. In file mode it **MUST** apply a valid replacement of the key set atomically without restarting the process. In environment mode operators apply an updated set by restarting the process.
+
+- **Rationale**: The same gear can run with locally supplied secrets or under a vendor's KMS access controls.
+- **Actors**: `cpt-cf-api-key-management-actor-operator`
 
 #### Developer and Operator Guidance
 
@@ -412,16 +439,34 @@ Project-wide NFR baselines are defined in [docs/ARCHITECTURE_MANIFEST.md](../../
 The system **MUST** generate the random part of every API key secret from a cryptographically secure source with at least 256 bits of entropy.
 
 - **Threshold**: ≥ 256 bits of entropy per API key secret.
-- **Rationale**: Makes guessing infeasible and makes a fast non-reversible hash sufficient for storage.
+- **Rationale**: Makes guessing the random secret infeasible even when the public key ID is known. Record integrity is covered by `cpt-cf-api-key-management-nfr-record-integrity`.
 
 #### No API Key Secret Exposure
 
 - [ ] `p1` - **ID**: `cpt-cf-api-key-management-nfr-no-secret-exposure`
 
-The system **MUST NOT** write an API key secret, or the bearer credential carrying it, to logs, traces, metrics, security events, error responses, or persistent storage other than as a non-reversible hash.
+The system **MUST NOT** write an API key secret, or the bearer credential carrying it, to logs, traces, metrics, security events, error responses, or persistent storage.
 
 - **Threshold**: Zero occurrences of an API key secret in any of the listed sinks in automated tests that issue and verify keys.
 - **Rationale**: API keys are long-lived; any leak path is high impact.
+
+#### Credential Record Integrity
+
+- [ ] `p1` - **ID**: `cpt-cf-api-key-management-nfr-record-integrity`
+
+Assume an attacker can read and write all credential records but has no access to the gear's runtime or HMAC provider. The gear **MUST** verify an HMAC-SHA-256 issuance tag before accepting a record. The tag **MUST** bind the presented credential (including its key ID and format version) to the owner identity and home tenant, issuance and expiration times, and HMAC key ID. The server HMAC secrets **MUST** remain outside the credential database under independent access controls. If the provider is unavailable, verification **MUST** fail closed.
+
+- **Threshold**: Zero successful authentications from fabricated records, records with altered bound fields, or revoked records whose revocation metadata alone has been cleared.
+- **Threat boundary**: Database write access can still destroy records or restore a previously valid copy of a record. Preventing denial of service or detecting rollback requires controls outside this integrity guarantee.
+
+#### Server HMAC Secret Rotation
+
+- [ ] `p1` - **ID**: `cpt-cf-api-key-management-nfr-hmac-rotation`
+
+The gear **MUST** support operator-controlled rotation on the deployment's cryptoperiod schedule. New issuance uses the current HMAC secret. All verifier instances **MUST** be able to accept its successor before issuance switches to it. The previous secret may remain trusted for verification until its configured deadline or explicit withdrawal. Planned rollover **MUST** preserve otherwise valid client API keys without reissuance. Operators **MUST** be able to withdraw a compromised secret early across all instances.
+
+- **Threshold**: In a multi-instance rollover test, both previously issued keys and newly issued keys authenticate throughout the planned transition. After withdrawal takes effect on all instances, every record protected by the withdrawn secret is rejected and otherwise valid keys protected by the successor still authenticate.
+- **Rationale**: OWASP recommends regular rotation of service secrets. NIST distinguishes the cryptoperiod for generating authentication tags from the period in which existing tags may still be verified. The operator sets the schedule according to deployment risk. [OWASP Secrets Management Cheat Sheet, §2.7.2](https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html#272-rotation) · [NIST SP 800-57 Part 1 Rev. 5, §5.3](https://csrc.nist.gov/pubs/sp/800/57/pt1/r5/final)
 
 #### Verification Latency
 
@@ -522,13 +567,13 @@ Contracts marked "required from" state dependencies on other gears. Their implem
 - **Protocol/Format**: SDK client call, available only to authorized platform authentication services and never exposed through the public REST API. It does not require an authenticated key-owner context; remote invocation authenticates and authorizes the calling service independently of the presented API key.
 - **Compatibility**: Input is the full bearer credential. Output is the key ID, owner identity, token scopes, and key expiration (`cpt-cf-api-key-management-fr-verify-key`), the "invalid credential" outcome, or the "verification unavailable" outcome. Verification does not issue IdP access tokens and does not select the downstream credential. New output fields are added backward-compatibly.
 
-#### API Key Routing in the AuthN Resolver Plugin
+#### API Key Routing in the AuthN Resolver
 
 - [ ] `p1` - **ID**: `cpt-cf-api-key-management-contract-authn-routing`
 
-- **Direction**: required from the AuthN resolver plugin
-- **Protocol/Format**: The plugin is configured with the same API key prefix as the gear, rejects an empty or ambiguous prefix at startup, sends every credential that starts with it to the verification contract, and passes every other credential to the platform's existing OIDC authentication unchanged. A credential routed as an API key that fails verification **MUST NOT** be retried through another authentication path. The plugin preserves the existing client-credentials exchange behavior.
-- **Compatibility**: A prefix mismatch between plugin and gear configuration makes API keys fail authentication; it never makes an invalid credential succeed. Existing OIDC bearer authentication and client-credentials exchange keep their current behavior and failure semantics.
+- **Direction**: required from the AuthN resolver and its API key authentication plugin.
+- **Protocol/Format**: The operator maps each bearer prefix to the exact GTS instance ID of an AuthN plugin in resolver configuration. In P1 this configuration is the sole authority for prefix routing. The resolver **MUST** send a matching bearer only to that instance. A missing or unavailable target yields “verification unavailable”. A rejected credential yields “invalid credential”. Both outcomes terminate the route.
+- **Compatibility**: Unmatched bearers and client-credentials exchange use the existing default authentication path independently of API Key Management availability. The deployment **MUST** install the issuing prefix on every resolver that can receive these keys before issuance is enabled.
 
 #### API-Key-Origin Security Context
 
@@ -563,7 +608,7 @@ All caller-initiated management steps below require an eligible IdP-issued acces
 1. The owner requests a new key with a name and a lifetime within the configured maximum.
 2. The system issues the key and returns the API key secret once, together with the key's metadata.
 3. The owner stores the API key secret in a CI job and calls a platform API with it as the bearer credential.
-4. The AuthN resolver plugin recognizes the API key prefix and asks the gear to verify the key.
+4. The AuthN resolver matches the configured prefix and calls the designated plugin, which asks the gear to verify the key.
 5. The gear returns the key ID and the owner's identity; the request proceeds with the owner's `SecurityContext`.
 
 **Postconditions**:
@@ -632,6 +677,10 @@ Criteria involving platform authentication or downstream credentials verify inte
 
 - [ ] An authenticated user issues a key, authenticates a platform request with it, and the resulting `SecurityContext` carries the user's subject ID, subject type, home tenant, and token scopes `["*"]`.
 - [ ] The API key secret appears in the issuance response and nowhere else: not in listings, single-key responses, logs, security events, or storage.
+- [ ] With read/write access limited to the credential database, a fabricated record, a changed owner or expiry, and a revoked record with only its revocation fields cleared all fail verification.
+- [ ] Across two verifier instances, planned HMAC rotation preserves working client keys. Emergency withdrawal rejects credentials protected by the withdrawn secret on both instances while keys issued under the new secret continue to work.
+- [ ] The same gear issues and verifies keys in separate deployments using the bundled static provider and a vendor provider with non-exportable KMS keys. The static provider accepts an environment-supplied key set and, in file mode, applies a valid rollover without a restart.
+- [ ] In P2, tightening `max_key_age` blocks an otherwise valid older key at the age cutoff. Relaxing the limit restores eligibility only before the recorded expiration and only for an unrevoked, otherwise valid key.
 - [ ] A key stops authenticating at its expiration time, after revocation within the propagation bound on every instance, and after its owner is deleted or its owner's tenant is suspended within the owner check interval.
 - [ ] A user cannot see, inspect, or revoke another user's key; a tenant administrator can list and revoke all keys of a user in an administered tenant, also after the user was deleted.
 - [ ] Issue, list, get, revoke, administrative list/revoke, and bulk revoke reject API-key-origin credentials, including exchanged access tokens, and unknown authentication origin through REST and direct or remote SDK invocation. The rejection applies even to owners and tenant administrators, for both the authenticating key and other keys.
@@ -640,8 +689,8 @@ Criteria involving platform authentication or downstream credentials verify inte
 - [ ] Bulk administrative revocation covers all keys active at its cutoff; it does not prevent subsequent issuance.
 - [ ] In P1, an unexpired, unrevoked key becomes eligible for verification again when Account Management again reports its recorded owner identity in an active home tenant; an explicitly revoked key remains invalid.
 - [ ] When Account Management is unavailable and no reusable owner check exists, verification returns "verification unavailable" and the request is not authenticated.
-- [ ] Credentials without the API key prefix and client-credentials exchange keep working through the existing OIDC path unchanged; a credential with the API key prefix that fails verification is not retried through OIDC.
-- [ ] Once a changed API key prefix is effective in the gear and the plugin, keys issued under the previous prefix fail authentication; the gear refuses to start with an empty or ambiguous prefix or an invalid lifetime policy.
+- [ ] With API Key Management or the configured plugin unavailable, a matching bearer fails as unavailable and never reaches OIDC. Ordinary OIDC bearers and client-credentials exchange still work. Registering another plugin cannot redirect a configured prefix.
+- [ ] Once a changed API key prefix is effective in the gear and the resolver, keys issued under the previous prefix fail authentication; the gear refuses to start with an empty or ambiguous prefix or an invalid lifetime policy.
 - [ ] A security event is emitted for every committed issuance and revocation, and none for a repeated revocation.
 - [ ] While the gear is operational, a key is removed no later than 90 days plus 24 hours from revocation or expiration, whichever occurs first, after which it is absent from listings, not found on lookup, and fails verification.
 
@@ -649,10 +698,11 @@ Criteria involving platform authentication or downstream credentials verify inte
 
 | Dependency | Description | Criticality |
 |------------|-------------|-------------|
-| AuthN resolver | Hosts the plugin that routes API keys to this gear, builds the `SecurityContext`, and preserves the API-key origin downstream. | p1 |
+| AuthN resolver | Routes API keys to the configured plugin, builds the `SecurityContext`, and preserves the API-key origin downstream. | p1 |
 | Account Management | Answers whether a key owner exists in an active home tenant; requires deployment-provisioned authorization for the gear's service identity. | p1 |
 | AuthZ resolver | Authorizes self-service and administrative operations and requests made with API keys. | p1 |
-| Platform database | Stores key metadata and API key secret hashes. | p1 |
+| Platform database | Stores key metadata and issuance tags. | p1 |
+| HMAC provider | Holds the independently protected server secrets and supports issuance, verification, rotation and emergency withdrawal. | p1 |
 | Platform audit gear | Durable audit delivery of lifecycle security events; not implemented yet. | p2 |
 
 ## 11. Assumptions
@@ -667,7 +717,7 @@ Criteria involving platform authentication or downstream credentials verify inte
 | A user disabled but not deleted in the IdP keeps API key access. | Access survives a disablement that blocks OIDC login. | A tenant administrator revokes the user's keys (`cpt-cf-api-key-management-fr-admin-revoke`); automatic detection is deferred to P2 and requires Account Management to expose user enablement. |
 | Account Management or the IdP is unavailable. | API-key-authenticated requests fail once reusable owner checks expire. | Fail closed by design with a distinct "verification unavailable" outcome; owner check reuse smooths short outages. |
 | The gear's service identity lacks read access in some tenant. | Keys of users in that tenant never authenticate. | Runtime signals distinguish authorization misconfiguration (`cpt-cf-api-key-management-nfr-operational-signals`). |
-| API key prefix configured differently in the gear and the plugin. | API keys stop authenticating. | Fail-closed contract (`cpt-cf-api-key-management-contract-authn-routing`); prefix validation at startup. |
+| Issuing prefix omitted from a resolver's configuration. | The bearer follows the unmatched-token path and may reach an external IdP. | Verify route coverage on every ingress before issuance or a prefix change. Keep routes for previously issued prefixes while those secrets may still be presented. |
 | An exchanged downstream token loses the API-key origin. | A leaked key can mint replacement keys through a downstream call. | The AuthN resolver keeps the origin distinguishable (`cpt-cf-api-key-management-contract-authn-context`); all key management requires an eligible access token with a positively established non-API-key origin. |
 | Unrestricted token scopes on every key. | A leaked key grants the owner's permissions on APIs that accept API keys; key management remains excluded. | Mandatory expiration, revocation, administrative withdrawal, no management from key-based sessions and no issuance from restricted sessions; per-key scopes are deferred to P2. |
 | Security events are lost before the platform audit gear exists. | Incomplete lifecycle evidence for an incident. | Accepted P1 limitation; durable delivery in P2 (`cpt-cf-api-key-management-nfr-audit`). |
@@ -681,6 +731,6 @@ Criteria involving platform authentication or downstream credentials verify inte
 
 ## 14. Traceability
 
-- **Design**: `DESIGN.md` (planned)
+- **Design**: [DESIGN.md](./DESIGN.md)
 - **ADRs**: `ADR/` (planned)
 - **Features**: `features/` (planned)
