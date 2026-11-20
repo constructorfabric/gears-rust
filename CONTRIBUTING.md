@@ -82,6 +82,14 @@ Constructor Fabric Gears follows a spec-driven development (SDD) approach for la
 - **[FEATURE.md](./studio-kit-gears/artifacts/FEATURE/template.md)** — Feature Specification: flows, algorithms, states, requirements
 - **[UPSTREAM_REQS.md](./studio-kit-gears/artifacts/UPSTREAM_REQS/template.md)** — Upstream Requirements: technical requirements from other gears to this gear
 
+#### Gear maturity
+
+Every gear declares a maturity level in `gear.gdl`: `unpublished`, `preview`, `stable`, or `deprecated`. The level decides what consumers can rely on, how much specification the gear needs, which approvals a pull request needs (§2.10), and how breaking changes are versioned (§3). See [guidelines/MATURITY.md](./guidelines/MATURITY.md).
+
+- A new gear starts as `unpublished`, with `publish = false` on every crate.
+- A gear moves to `preview` (`0.1.0`) and then to `stable` (`1.0.0`) only through the acceptance process in [MATURITY.md §3](./guidelines/MATURITY.md#3-transitions). It never moves back.
+- A new feature of a `stable` gear that is not proven yet ships as an `alpha` or `beta` feature behind a flag, never as a change to the stable surface. See [MATURITY.md §4](./guidelines/MATURITY.md#4-unstable-features-in-a-stable-gear).
+
 ### 2.3. Make Your Changes
 
 Follow the coding standards and guidelines:
@@ -366,7 +374,8 @@ Best practices:
 - Use imperative mood (e.g., "Fix bug", not "Fixed bug")
 - Make commits atomic (one logical change per commit)
 - Add details in the body when necessary (what/why, not how)
-- For breaking changes, either use `feat!:`/`fix!:` or include a `BREAKING CHANGE:` footer
+- For breaking changes, either use `feat!:`/`fix!:` or include a `BREAKING CHANGE:` footer. release-plz reads these markers to choose the version bump, so the `breaking` type alone is not enough for a published crate
+- Changes to an `alpha` or `beta` feature of a `stable` gear mention the feature, for example `feat(file-storage): bulk-import (beta): add resume token`
 
 New functionality development:
 
@@ -384,16 +393,34 @@ Then create a Pull Request on GitHub with:
 - Clear title and description
 - Reference to related issues
 - Test coverage information
-- Breaking changes (if any)
+- The maturity level of each affected gear and, for a `stable` gear, the stage of each changed feature
+- Contract and data impact: none, additive, or breaking, for each public contract (SDK, REST, gRPC, event, GTS, MCP, configuration) and for persisted data
+- For a breaking change: the version bump and the migration note for consumers
+- For a migration: proof that the previous release works on the new schema
+
+Keep one gear per pull request when a change touches a public contract or persisted data, so the version bump and the review level are unambiguous.
 
 Use the [PR template](./.github/pull_request_template.md) for the description.
 
 ### 2.10. Review Process
 
 1. **Automated checks** must pass (CI/CD pipeline)
-2. **At least one approval** from maintainer required
+2. **Approvals** as required by the table below
 3. **All conversations resolved** before merge
 4. **Up-to-date with main** branch
+5. **No open CRITICAL or HIGH finding** from the design or code review ([DESIGN_REVIEW.md §3](./guidelines/DESIGN_REVIEW.md#3-severity)). A MEDIUM finding is fixed or tracked in an issue linked from the maturity card
+
+Required approvals depend on the maturity of the affected gear and on what the change touches. When several rows apply, the strictest one wins. A *contributor group* is one organization or team with maintainers in [MAINTAINERS.md](./MAINTAINERS.md); the gear owner is listed in [CODEOWNERS](./.github/CODEOWNERS).
+
+| Change | `unpublished` | `preview` | `stable` |
+|---|---|---|---|
+| Internals, tests, docs, `alpha` features | 1 maintainer | 1 maintainer | 1 maintainer + gear owner |
+| Public contract or persisted data (additive) | 1 maintainer | gear owner + 1 maintainer | gear owner + 1 maintainer from another group, after a design review |
+| Breaking contract change, `beta` feature added or graduated | 1 maintainer | gear owner + 1 maintainer from another group | gear owner + 2 maintainers from other groups, after a design review |
+| Security, tenant isolation, secrets | gear owner + 1 maintainer from another group | gear owner + 1 maintainer from another group | gear owner + 1 maintainer from another group, after a design review |
+| Maturity transition | – | [MATURITY.md §3](./guidelines/MATURITY.md#3-transitions) | [MATURITY.md §3](./guidelines/MATURITY.md#3-transitions) |
+
+ToolKit libraries (`libs/**`) follow the column of their crate version (`0.x` as `preview`, `>= 1.0` as `stable`) and always need a design review for public API changes.
 
 Merge Strategy:
 
@@ -435,6 +462,18 @@ Applies to:
 
 Non-goals:
 - Internal-only refactors that do not change any public contract (still must be tested, but do not force version bumps).
+
+## Maturity and Versions
+
+The crate version follows the gear's maturity level ([MATURITY.md](./guidelines/MATURITY.md)):
+
+| Maturity | Crate version | Breaking change |
+|---|---|---|
+| `unpublished` | any, `publish = false` | free; update in-repo callers in the same PR |
+| `preview` | `0.x` | `0.(x+1).0`, `feat!` or `BREAKING CHANGE`, migration note |
+| `stable` | `>= 1.0` | next major, after the deprecation policy below |
+
+All published crates of a gear share the major version of its SDK crate.
 
 ## SemVer Rules (Crates)
 
@@ -498,6 +537,18 @@ Not breaking (SemVer-wise), but must be documented in changelog/release notes:
 ### REST API
 - Versioned in the URL (`/v1/...`, `/v2/...`).
 - Breaking REST changes require a new API version (for example `/v2`) and a deprecation period for old versions.
+- Unstable (`alpha`/`beta`) operations and fields of a `stable` gear are served only under `/v{N}beta/...` ([MATURITY.md §4.3](./guidelines/MATURITY.md#43-how-each-contract-type-carries-an-unstable-feature)); `/v{N}` does not change for them.
+- Deprecated operations return the `Deprecation` header (RFC 9745) and, once a removal date is set, the `Sunset` header (RFC 8594).
+
+### Events, GTS types, MCP tools, configuration
+- Additive changes only within a major version of the type, tool, or key.
+- A breaking change is a new major version of the type or tool, served next to the old one.
+- Unstable types use major version `v0`; unstable configuration lives under `features.<feature>`.
+
+### Persisted data
+- Migrations are forward-only once a gear is `preview`. The previous release must work on the migrated schema (rolling deploy and rollback).
+- `stable` gears use expand/contract: add the new shape, migrate readers and writers, and drop the old shape only in a later release.
+- Migrations are never gated by a feature flag.
 
 ### gRPC / Protobuf
 - Treat `.proto` as a public contract.
@@ -518,6 +569,19 @@ When feasible, prefer deprecation over immediate removal:
 - Include migration notes (what to use instead).
 
 Removal of deprecated APIs is breaking and requires MAJOR.
+
+Minimum deprecation periods by maturity:
+
+| Contract | `preview` | `stable` |
+|---|---|---|
+| Rust SDK item | none; removal in `0.(x+1)` with a migration note | `#[deprecated]` in a `1.x` minor, kept for at least one minor release and 90 days, removed in the next major |
+| REST, gRPC, event, GTS, MCP version | compatible with the previous release | the old version keeps working for at least 12 months after its replacement is `ga`; removal is a major release of the gear |
+| `beta` feature of a `stable` gear | – | announced in one minor release, removed in a later one ([MATURITY.md §4.4](./guidelines/MATURITY.md#44-lifecycle-of-an-unstable-feature)) |
+| `alpha` feature | – | none |
+
+## Unstable Features
+
+Items behind an `unstable-<feature>` Cargo feature, `/v{N}beta` REST paths, `v0` GTS types, and `features.<feature>` configuration keys are exempt from SemVer. They follow the stage rules of [MATURITY.md §4](./guidelines/MATURITY.md#4-unstable-features-in-a-stable-gear). Semver checks of a `stable` crate run without `unstable-*` features.
 
 ## Workspace Policy (Monorepo)
 
@@ -558,6 +622,9 @@ Use this table:
 | Backward compatible new API/feature | MINOR |
 | Any breaking change | MAJOR |
 | Pre-1.0: breaking change | bump 0.(x+1).0 |
+| Add, change, or remove an `alpha`/`beta` feature | MINOR |
+| Graduate a feature to `ga` | MINOR |
+| Remove a deprecated stable item or contract version | MAJOR |
 
 ## Required Release Notes
 
@@ -565,7 +632,9 @@ Every release must document:
 - Added
 - Changed
 - Fixed
+- Deprecated (with the replacement and the earliest removal release)
 - Breaking (if any) with migration steps
+- Unstable features: added, changed, graduated, or removed `alpha`/`beta` features
 
 No "minor fixes" wording for releases that break users.
 
@@ -574,6 +643,7 @@ No "minor fixes" wording for releases that break users.
 Before merging changes that affect public crates/contracts:
 - Tests must pass.
 - If you touched a public surface, you must justify the version bump category in the PR description.
+- The change follows the rules of the gear's maturity level; CI checks that `gear.gdl`, `publish`, and crate versions agree ([MATURITY.md §6](./guidelines/MATURITY.md#6-consistency-checks-ci)).
 
 ## Getting Help
 
