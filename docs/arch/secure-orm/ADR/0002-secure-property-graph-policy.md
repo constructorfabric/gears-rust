@@ -63,8 +63,8 @@ the implementation substrate.
 
 **Why now, before there is a consumer.** Nothing in the repository uses SQL/PGQ today; a
 repo-wide search for `GRAPH_TABLE` / `pgq` / property-graph vocabulary returns only
-considered-and-rejected mentions of graph *databases*
-([authorization/DESIGN.md:156](../../authorization/DESIGN.md#L156),
+mentions of graph *databases* as a vendor policy storage option or a design alternative
+([authorization plugin roles](../../authorization/DESIGN.md#plugin-roles),
 `gears/chat-engine/docs/ADR/0001-message-tree-structure.md:27`). But there is one tracked,
 first-class requirement: IRM's `cpt-cf-infrastructure-resource-manager-fr-graph-query`
 (`p2`, Planned —

@@ -7,11 +7,11 @@ For the full architectural design (AuthZEN model, predicate types, caching, depl
 ## Core invariants
 
 - **Rule**: Authentication is handled by API Gateway middleware — gears receive a ready-to-use `SecurityContext`.
-- **Rule**: Use `SecureConn` for all DB access in handlers/services. Gears cannot access raw database connections/pools.
+- **Rule**: Use the secure query builders with a `DBRunner` for database access in services and repositories. Gears cannot access raw database connections/pools.
 - **Rule**: Derive `Scopable` on SeaORM entities with tenant/resource columns.
-- **Rule**: Use `PolicyEnforcer` from `authz-resolver-sdk` for all authorization decisions. Do not construct `AccessScope` manually in production code.
-- **Rule**: Every sensitive DB access MUST be covered by a PDP decision (via `PolicyEnforcer`). Exception: the approved prefetch-first flow for GET/UPDATE/DELETE may read with `AccessScope::allow_all()` before the PDP call, provided the required compensating checks are applied (see [GET prefetch pattern](#get--prefetch-pattern) and [UPDATE/DELETE prefetch + TOCTOU safety](#update--delete--prefetch--toctou-safety)).
-- **Rule**: Fail-closed — no `EnforcerError`, including an unknown outcome class, lets the operation proceed. See [EnforcerError](#enforcererror-authz-errors) for the recommended HTTP mapping; existing consumers may keep legacy mappings.
+- **Rule**: Use `PolicyEnforcer` from `authz-resolver-sdk` to obtain the scope for resource access. Use explicit scopes in repository tests and in the approved prefetch step described below.
+- **Rule**: Every sensitive DB access MUST be covered by a PDP decision. Exception: the approved prefetch-first flow for GET/UPDATE/DELETE may read with `AccessScope::allow_all()` before the PDP call, provided the required compensating checks are applied (see [GET prefetch pattern](#get--prefetch-pattern) and [UPDATE/DELETE prefetch + TOCTOU safety](#update--delete--prefetch--toctou-safety)).
+- **Rule**: Apply the [PEP validation rules](../arch/authorization/DESIGN.md#fail-closed-rules). No `EnforcerError`, including an unknown outcome class, lets the operation proceed. See [EnforcerError](#enforcererror-authz-errors) for the recommended HTTP mapping; existing consumers may keep legacy mappings.
 - **Rule**: Map `EnforcerError` to domain errors. Never expose PDP internals to the client.
 - **Rule**: Use `.authenticated()` on `OperationBuilder` for protected endpoints, `.anonymous()` for unauthenticated ones.
 - **Rule**: No plain SQL in handlers/services/repos. Raw SQL is allowed only in migration infrastructure. See [`11_database_patterns.md`](./11_database_patterns.md) for migration rules.
@@ -99,41 +99,38 @@ pub async fn list_users(
 | `subject_tenant_id` | Yes | Tenant the subject belongs to |
 | `subject_type` | No | GTS type identifier (e.g., `gts.cf.core.security.subject_user.v1~`) |
 | `token_scopes` | Yes | Capability restrictions (`["*"]` for first-party apps) |
-| `bearer_token` | No | Original token (wrapped in `Secret<String>`, forwarded to PDP) |
+| `bearer_token` | No | Original token wrapped in `SecretString`, available to an in-process PDP. The evaluation request skips this field during serialization. |
 
 ## AuthZ: PolicyEnforcer (PEP)
 
 ### Wiring up
 
-1. **Declare dependency** on `authz-resolver` in your gear:
+1. Enable the `rest-client` feature on the gear's `authz-resolver-sdk` dependency and declare the consumed contract. The runtime uses this declaration to wire a remote resolver client.
 
 ```rust
+#[toolkit::consumes(contract = authz_resolver_sdk::AuthZResolverApi, from = "authz-resolver")]
 #[toolkit::gear(
-    name = "my_gear",
-    deps = ["authz-resolver"],
+    name = "my-gear",
     capabilities = [db, rest],
 )]
 pub struct MyGear { /* ... */ }
 ```
 
-2. **Resolve the AuthZ client** from `ClientHub` during `init()`:
-
-```rust
-use authz_resolver_sdk::AuthZResolverApi;
-
-async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
-    let authz = ctx.client_hub().get::<dyn AuthZResolverApi>()?;
-    // Pass authz to your domain service...
-}
-```
-
-3. **Create a single `PolicyEnforcer`** in your service and clone it into sub-services:
+2. Create the enforcer once during `init()` and clone it into the services that use it. Lazy lookup supports out-of-process deployments where the resolver proxy is wired after gear initialization.
 
 ```rust
 use authz_resolver_sdk::PolicyEnforcer;
 
+let enforcer = PolicyEnforcer::from_hub(ctx.client_hub());
+```
+
+For an in-process provider already registered in the hub during initialization, the gear can also resolve the client immediately:
+
+```rust
+use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
+
+let authz = ctx.client_hub().get::<dyn AuthZResolverApi>()?;
 let enforcer = PolicyEnforcer::new(authz);
-// Clone enforcer into each sub-service (cheap Arc clone)
 ```
 
 ### Defining resource types
@@ -272,7 +269,7 @@ For paginated catalogs, preserve the endpoint's empty-page format and query vali
 
 `matches_nothing()` detects statically known emptiness: deny-all, or a scope whose every OR branch contained an empty `In` / `InGroup` / `InGroupSubtree` set. Such a scope is normalized to no live branches, so `matches_nothing()` and `is_deny_all()` give the same answer. It does not query the database or detect general logical contradictions. A `false` result does not prove that rows exist or that a particular row is authorized.
 
-Discarding `Ok(scope)` after `?` is valid only for action-level permission gates. Row access must enforce the scope even with the default `allow_empty_scope(false)`: a nonempty scope may cover another tenant, owner, or resource.
+A standalone decision-only gate may proceed on an unconstrained permit. If the PDP supplies constraints, enforce them or refuse the operation. Row access must enforce the scope even with the default `allow_empty_scope(false)`: a nonempty scope may cover another tenant, owner, or resource.
 
 #### Inspecting scope branches
 
@@ -283,7 +280,7 @@ Every `AccessScope` is normalized, whether compiled or built by hand:
 - An all-empty scope is operationally deny-all but keeps its originals, and equality is structural: it is not `==` to `AccessScope::deny_all()`. Check `is_unconstrained()` separately: both allow-all and deny-all have no live branches.
 - `tenant_only()`, `tenant_and_owner()`, `ensure_owner()` and gear-local projections build a new scope from the live branches only; the source's originals are not carried over.
 
-The PEP compiler fully validates every PDP branch before normalization. Downstream checks (SecureORM property resolution, sibling placement, OData projection) see only live branches, so an all-empty scope lowers to `FALSE` without their entity-specific diagnostics. This is an accepted loss of diagnostics, never a widening of access. The invalid-branch policy is unchanged (an invalid branch is dropped; the request fails only if no branch compiles); strict rejection is tracked in [#5958](https://github.com/constructorfabric/gears-rust/issues/5958).
+The PEP compiler validates supported properties and predicate shapes before normalization. Downstream checks (SecureORM property resolution, sibling placement, OData projection) see only live branches, so an all-empty scope lowers to `FALSE` without their entity-specific diagnostics. This is an accepted loss of diagnostics, never a widening of access. The invalid-branch policy is unchanged (an invalid branch is dropped; the request fails only if no branch compiles); strict rejection is tracked in [#5958](https://github.com/constructorfabric/gears-rust/issues/5958).
 
 The low-level `compile_to_access_scope` refuses an all-empty scope by default with `ConstraintCompileError::ScopeMatchesNothing`; opt in with `compile_to_access_scope_with_options(.., CompileOptions::new().allow_empty_scope(true))`.
 
@@ -291,7 +288,7 @@ See [the full contract](../arch/authorization/DESIGN.md#permission-gates-and-emp
 
 ### AccessRequest builder
 
-Use `AccessRequest` for per-call overrides:
+Use `AccessRequest` for per-call overrides. Choose `require_constraints` by [operation semantics](../arch/authorization/DESIGN.md#require_constraints-flag), not by the action name.
 
 ```rust
 use authz_resolver_sdk::pep::AccessRequest;
@@ -300,8 +297,8 @@ use toolkit_security::pep_properties;
 let request = AccessRequest::new()
     // Pass resource properties to PDP for narrow constraints
     .resource_property(pep_properties::OWNER_TENANT_ID, tenant_id)
-    // Override constraint requirement (default: true)
-    .require_constraints(false)
+    // Require a scope to enforce on the resource (the builder default)
+    .require_constraints(true)
     // Override tenant context
     .context_tenant_id(specific_tenant_id);
 
@@ -312,11 +309,17 @@ let list_request = AccessRequest::new().allow_empty_scope(true);
 
 ### Empty constraints versus empty scopes
 
-With `decision: true`, missing `constraints` and `constraints: []` both mean no row-level restrictions were supplied. With the default `require_constraints(true)`, they cause `EnforcerError::CompileFailed`. Explicitly setting `require_constraints(false)` accepts them and produces an unconstrained scope (`allow_all()`), as in the [GET prefetch pattern](#get--prefetch-pattern). If constraints are supplied, they are still compiled and enforced. `predicates: []` inside a constraint remains malformed.
+With `decision: true`, missing `constraints` and `constraints: []` both mean no row-level restrictions were supplied. With the default `require_constraints(true)`, they cause `EnforcerError::CompileFailed`. Explicitly setting `require_constraints(false)` accepts them and produces an unconstrained scope (`allow_all()`) for a standalone decision-only gate. If constraints are supplied, the SDK compiles them and the caller must enforce them or refuse the operation. `predicates: []` inside a constraint remains malformed.
 
 This differs from a valid scope that matches no rows. `allow_empty_scope(true)` preserves that empty scope; it does not make missing constraints acceptable. Conversely, `require_constraints(false)` does not prevent `ScopeMatchesNothing` when supplied constraints compile to an all-empty scope and `allow_empty_scope` remains false.
 
-`in(id, [])`, `in_group(id, [])`, and `in_group_subtree(id, [])` are valid predicates that compile to SQL `FALSE`, never `IN ()`. Property, capability, tenant, and owner validation still applies; other OR branches may match. See [Permission gates and empty scopes](#permission-gates-and-empty-scopes) for PEP options and non-SQL handling.
+`in(id, [])`, `in_group(id, [])`, and `in_group_subtree(id, [])` are valid predicates that compile to SQL `FALSE`, never `IN ()`. Property, capability, and tenant checks still apply. The PDP must verify that the selected groups belong to the authorized tenant. Other OR branches may match. [Group ownership and enforcement](../arch/authorization/DESIGN.md#group-tenant-scoping) See [Permission gates and empty scopes](#permission-gates-and-empty-scopes) for PEP options and non-SQL handling.
+
+### Optional resource conditions
+
+For an owner selector, validate the UUID and add `.resource_property(pep_properties::OWNER_ID, owner_id)` only when supplied. Advertise `owner_id` in the resource descriptor and map it to the entity’s owner column. Keep the caller in `SecurityContext`. [Owner scenarios](../arch/authorization/AUTHZ_USAGE_SCENARIOS.md#subject-owner-based-access)
+
+The SDK forwards the requested `owner_id` without checking the returned predicates, and the bundled static and TR plugins ignore it. When a request specifies an owner, the PEP must reject an allow response before compilation if any branch omits the equality for that owner. [Implementation status](../arch/authorization/DESIGN.md#implementation-status)
 
 ## How AuthZ connects to the database: pep_prop
 
@@ -409,15 +412,15 @@ This adds `("city_id", Column::CityId)` to the generated `custom` list, so `reso
 To use the custom property, include it in both `ResourceType.supported_properties` and the PDP policy:
 
 ```rust
-pub const ADDRESS: ResourceType = ResourceType {
-    name: "my_gear.address",
-    supported_properties: &[
+pub const ADDRESS: ResourceType = ResourceType::from_static(
+    "my_gear.address",
+    &[
         pep_properties::OWNER_TENANT_ID,
         pep_properties::RESOURCE_ID,
         pep_properties::OWNER_ID,
         "city_id",  // matches the pep_prop key
     ],
-};
+);
 ```
 
 When the PDP returns constraints referencing `"city_id"`, the PEP compiler includes them in the `AccessScope`, and `SecureConn` resolves them to `Column::CityId` for the SQL `WHERE` clause.
@@ -436,7 +439,7 @@ SecureConn → build_scope_condition::<E>() → E::SCOPE.resolve_property("city_
 Column::CityId → WHERE city_id IN (uuid)
 ```
 
-If `resolve_property()` returns `None` for a property (unknown property), the entire constraint fails (fail-closed → deny-all).
+If `resolve_property()` returns `None`, SecureORM drops that OR branch. It produces a deny-all condition if no branch survives.
 
 ### pep_prop validation rules
 
@@ -450,13 +453,15 @@ The macro enforces at compile time:
 
 Use `#[secure(unrestricted)]` only for truly global tables where the entity has **no scoping columns**. Notes:
 
-- `secure_insert` does not require `tenant_id` for such entities.
+- `secure_insert` skips scope validation entirely for an unrestricted entity, even for a deny-all scope. The caller must authorize insertion before using this path.
 - Queries with a scope that contains tenant IDs will be denied (by policy: tenants requested but entity has no `tenant_col`).
 - If you need to read/write a global table within a tenant-scoped request, do not use `unrestricted`. Model it with explicit columns and use an appropriate scope shape (often `resources_only`).
 
 ## CRUD authorization patterns
 
-All patterns below are from the canonical `users-info` example gear.
+The examples show how a service calls `authz-resolver` through `PolicyEnforcer::access_scope_with` and passes the returned `AccessScope` to storage. The enforcer evaluates the request, stops on a denial, and compiles the constraints on a permit.
+
+The examples using `resource.properties` assume a PDP that preserves every requested equality in every allowed branch. The current enforcer does not check this before compilation. [Implementation status](../arch/authorization/DESIGN.md#implementation-status)
 
 ### LIST — simple scope
 
@@ -486,152 +491,117 @@ pub async fn list_users_page(
 
 ### GET — prefetch pattern
 
-For point reads, a two-step pattern provides narrower PDP constraints:
+A PDP may need the target tenant before it can evaluate a point read. For example, the TR plugin requires `resource.properties.owner_tenant_id` whenever `resource.id` is present.
+
+Prefetch by ID to build the evaluation request. Here `requested_tenant_id: Option<Uuid>` is the caller’s parsed tenant condition. Check it against the prefetched row before evaluation.
 
 ```rust
 pub async fn get_user(
     &self,
     ctx: &SecurityContext,
     id: Uuid,
+    requested_tenant_id: Option<Uuid>,
 ) -> Result<User, DomainError> {
     let conn = self.db.conn()?;
-
-    // Step 1: Prefetch with allow_all to extract owner_tenant_id
-    let prefetch_scope = AccessScope::allow_all();
-    let user = self.repo
-        .get(&conn, &prefetch_scope, id)
+    let prefetched = self.repo
+        .get(&conn, &AccessScope::allow_all(), id)
         .await?
         .ok_or_else(|| DomainError::user_not_found(id))?;
+    if requested_tenant_id.is_some_and(|tenant| tenant != prefetched.tenant_id) {
+        return Err(DomainError::user_not_found(id));
+    }
 
-    // Step 2: PDP call with prefetched properties → narrow constraint
+    let conditions = AccessRequest::new()
+        .resource_property(pep_properties::OWNER_TENANT_ID, prefetched.tenant_id);
     let scope = self.policy_enforcer
-        .access_scope_with(
-            ctx,
-            &resources::USER,
-            actions::GET,
-            Some(id),
-            &AccessRequest::new()
-                .resource_property(pep_properties::OWNER_TENANT_ID, user.tenant_id)
-                .require_constraints(false),
-        )
+        .access_scope_with(ctx, &resources::USER, actions::GET, Some(id), &conditions)
         .await?;
 
-    // Step 3: If unconstrained, return prefetch; otherwise scoped re-read
-    let user = if scope.is_unconstrained() {
-        user
-    } else {
-        self.repo
-            .get(&conn, &scope, id)
-            .await?
-            .ok_or_else(|| DomainError::user_not_found(id))?
-    };
-
-    Ok(user)
+    self.repo.get(&conn, &scope, id)
+        .await?
+        .ok_or_else(|| DomainError::user_not_found(id))
 }
 ```
 
-**Why prefetch?** Without it, PDP would need to expand the full tenant subtree. By providing `owner_tenant_id`, PDP can return a simple `eq` predicate. If PDP returns `decision: true` without constraints (unconstrained), we skip the second DB query entirely.
+This example keeps the default `require_constraints: true` and returns the scoped read. The current `users-info` GET uses `require_constraints(false)` and can return the prefetched row directly. [Current GET implementation](../../examples/toolkit/users-info/users-info/src/domain/service/users.rs)
 
 ### CREATE — resource properties
 
-CREATE operations pass the target `owner_tenant_id` as a resource property so the PDP can validate the subject is allowed to create in that tenant:
+Here `user: User` is the proposed row, constructed from validated input with its ID, tenant and timestamps set. Pass the same tenant to the PDP and the same row to the repository.
 
 ```rust
-pub async fn create_user(
-    &self,
-    ctx: &SecurityContext,
-    new_user: NewUser,
-) -> Result<User, DomainError> {
-    let conn = self.db.conn()?;
+let conditions = AccessRequest::new()
+    .resource_property(pep_properties::OWNER_TENANT_ID, user.tenant_id);
+let scope = self.policy_enforcer
+    .access_scope_with(ctx, &resources::USER, actions::CREATE, None, &conditions)
+    .await?;
 
-    // PDP validates: can subject create in this tenant?
-    let scope = self.policy_enforcer
-        .access_scope_with(
-            ctx,
-            &resources::USER,
-            actions::CREATE,
-            None,
-            &AccessRequest::new()
-                .resource_property(pep_properties::OWNER_TENANT_ID, new_user.tenant_id),
-        )
-        .await?;
+let conn = self.db.conn()?;
+let created = self.repo.create(&conn, &scope, user).await?;
+```
 
-    // SecureConn INSERT validates tenant_id is within the scope
-    let created = self.repo.create(&conn, &scope, user).await?;
-    Ok(created)
-}
+The repository receives `scope: &AccessScope` and sets all columns before calling `secure_insert`, so the helper can check the inserted values against the returned scope. [INSERT validation](#insert-secure_insert--secureconninsert)
+
+```rust
+let model = UserAM {
+    id: Set(user.id),
+    tenant_id: Set(user.tenant_id),
+    email: Set(user.email.clone()),
+    display_name: Set(user.display_name.clone()),
+    created_at: Set(user.created_at),
+    updated_at: Set(user.updated_at),
+};
+secure_insert::<UserEntity>(model, scope, conn).await.map_err(db_err)?;
 ```
 
 ### UPDATE / DELETE — prefetch + TOCTOU safety
 
-Mutations combine prefetch (for narrow PDP constraints) with scoped writes (for TOCTOU protection):
+After prefetching the current row and checking any explicit caller condition as in GET, request permission for the specific mutation. For a display-name update, `current.tenant_id` is the tenant of the existing user:
 
 ```rust
-pub async fn update_user(
-    &self,
-    ctx: &SecurityContext,
-    id: Uuid,
-    patch: UserPatch,
-) -> Result<User, DomainError> {
-    let conn = self.db.conn()?;
+let conditions = AccessRequest::new()
+    .resource_property(pep_properties::OWNER_TENANT_ID, current.tenant_id);
+let scope = self.policy_enforcer
+    .access_scope_with(ctx, &resources::USER, actions::UPDATE, Some(id), &conditions)
+    .await?;
+```
 
-    // Step 1: Prefetch to extract owner_tenant_id
-    let prefetch_scope = AccessScope::allow_all();
-    let mut current = self.repo
-        .get(&conn, &prefetch_scope, id)
-        .await?
-        .ok_or_else(|| DomainError::user_not_found(id))?;
+Pass `&scope` and `id` to the repository. To check the scope at write time, apply both in the UPDATE statement:
 
-    // Step 2: PDP call with prefetched properties
-    let scope = self.policy_enforcer
-        .access_scope_with(
-            ctx,
-            &resources::USER,
-            actions::UPDATE,
-            Some(id),
-            &AccessRequest::new()
-                .resource_property(pep_properties::OWNER_TENANT_ID, current.tenant_id),
-        )
-        .await?;
+```rust
+use sea_orm::{EntityTrait, ExprTrait, QueryFilter, sea_query::Expr};
+use toolkit_db::secure::SecureUpdateExt;
 
-    // Step 3: Apply patch
-    if let Some(email) = patch.email { current.email = email; }
-    if let Some(name) = patch.display_name { current.display_name = name; }
-
-    // Step 4: Scoped write — WHERE clause enforces TOCTOU safety
-    let updated = self.repo.update(&conn, &scope, current).await?;
-    Ok(updated)
+let result = UserEntity::update_many()
+    .filter(Expr::col(Column::Id).eq(id))
+    .secure()
+    .scope_with(scope)
+    .col_expr(Column::DisplayName, Expr::value(display_name))
+    .exec(conn)
+    .await?;
+if result.rows_affected == 0 {
+    return Err(DomainError::user_not_found(id));
 }
 ```
 
-**TOCTOU protection**: between prefetch and mutation, the resource's tenant might change (race condition). The scoped write includes `WHERE (scope constraints)`, so if the tenant changed, the update returns 0 rows → treated as not found.
+For DELETE, evaluate the delete action with the same target ID and current tenant condition:
+
+```rust
+let scope = self.policy_enforcer
+    .access_scope_with(ctx, &resources::USER, actions::DELETE, Some(id), &conditions)
+    .await?;
+if !self.repo.delete(&conn, &scope, id).await? {
+    return Err(DomainError::user_not_found(id));
+}
+```
+
+The repository applies the ID and scope in its DELETE statement. A concurrent change that takes the row out of scope then prevents the write. The current `users-info` update delegates to `secure_update_with_scope`, which checks scope on a SELECT and subsequently updates by primary key. That helper does not provide this atomic guarantee.
 
 ## SecureConn usage
 
-### Preferred: SecureConn for scoped access
+### Scoped access in a repository
 
-```rust
-use toolkit_db::secure::AccessScope;
-
-pub async fn list_users(
-    Extension(ctx): Extension<SecurityContext>,
-    Extension(db): Extension<Arc<DbHandle>>,
-) -> ApiResult<JsonPage<UserDto>> {
-    let secure_conn = db.sea_secure();
-    // In production, scope comes from PolicyEnforcer (see CRUD patterns above)
-    let scope = enforcer
-        .access_scope_with(
-            &ctx, &resources::USER, actions::LIST, None,
-            &AccessRequest::new().allow_empty_scope(true),
-        )
-        .await?;
-    let users = secure_conn
-        .find::<user::Entity>(&scope)
-        .all(&secure_conn)
-        .await?;
-    Ok(Json(users.into_iter().map(UserDto::from).collect()))
-}
-```
+The service passes `db.conn()?` and the scope to the repository. A `DBRunner` parameter accepts a `DbConn`, `SecureConn`, or transaction runner. For updates, `secure_conn.update_many::<E>(scope)` wraps `E::update_many().secure().scope_with(scope)`. [Users repository](../../examples/toolkit/users-info/users-info/src/infra/storage/users_sea_repo.rs)
 
 ### Implicit security policy (how `AccessScope` becomes SQL)
 
@@ -655,36 +625,40 @@ This is enforced inside `toolkit-db` when you call `.scope_with(&scope)` / `Secu
 - Unknown properties fail that constraint (fail-closed)
 - If all constraints fail resolution → deny-all
 
-### Auto-scoped queries
+### Scoped queries
 
 ```rust
-let secure_conn = db.sea_secure();
+use sea_orm::EntityTrait;
+use toolkit_db::secure::SecureEntityExt;
 
-// Automatically adds scope filters
-let users = secure_conn
-    .find::<user::Entity>(&scope)
-    .all(&secure_conn)
+// scope: &AccessScope, runner: &impl DBRunner
+let users = user::Entity::find()
+    .secure()
+    .scope_with(scope)
+    .all(runner)
     .await?;
 
-// Automatically adds scope + id filter
-let user = secure_conn
-    .find_by_id::<user::Entity>(&scope, user_id)?
-    .one(&secure_conn)
+let user = user::Entity::find()
+    .secure()
+    .scope_with(scope)
+    .and_id(user_id)?
+    .one(runner)
     .await?;
 ```
 
-### Manual scoping
+To combine a business filter with authorization, apply both to the same query before executing it:
 
 ```rust
+use sea_orm::{EntityTrait, ExprTrait, QueryFilter, sea_query::Expr};
 use toolkit_db::secure::SecureEntityExt;
 
-// For complex queries, build your filters first, then apply scope and execute via SecureConn.
-let user = user::Entity::find()
-    .filter(user::Column::Email.eq(email))
+let count = UserEntity::find()
+    .filter(Expr::col(Column::Email).eq(email))
     .secure()
-    .scope_with(&scope)
-    .one(&secure_conn)
-    .await?;
+    .scope_with(scope)
+    .count(conn)
+    .await
+    .map_err(db_err)?;
 ```
 
 ### Advanced scoping for joins / related entities
@@ -698,9 +672,9 @@ Use these when the base entity cannot be tenant-filtered directly:
 
 ### Insert (`secure_insert` / `SecureConn::insert`)
 
-- If the entity has a `tenant_col`, the `ActiveModel` MUST include `tenant_id`.
-- The inserted `tenant_id` MUST be inside `scope.all_values_for(pep_properties::OWNER_TENANT_ID)`.
-- Violations are errors (`Denied` / `TenantNotInScope` / `Invalid("tenant_id is required")`).
+- For an entity with `tenant_col`, leaving that column `NotSet` returns `ScopeError::Invalid("tenant_id is required")`. On a scoped entity, failure to match any live branch returns `ScopeError::Denied`.
+- For constrained, scoped entities, all filters in at least one scope branch must match the inserted values; checking tenant membership alone is insufficient.
+- SecureORM rejects an all-empty scope on a scoped entity, including when a column is `NotSet`. Within a live branch, validation skips filters on `NotSet` columns. To satisfy the [resource-condition contract](../arch/authorization/DESIGN.md#scope-determination), materialize and check authorization-relevant values before inserting, or refuse the operation. The in-memory comparison supports `eq` and `in`. With a populated column it cannot satisfy a group or tenant-subtree predicate, which requires a database lookup.
 
 ### Update one record (`SecureConn::update_with_ctx`)
 
@@ -773,7 +747,7 @@ For development and testing, Gears provide static AuthN and AuthZ plugins:
   - `accept_all`: any non-empty token maps to a default identity
   - `static_tokens`: specific tokens map to specific identities (subject_id, tenant_id, scopes)
 
-- **Static AuthZ plugin** — returns `decision: true` with an `In` predicate on `owner_tenant_id` scoped to the subject's tenant from the request context. Denies if no tenant is resolvable.
+- **Static AuthZ plugin** — uses the requested context root, falling back to the subject tenant. It denies an absent or nil tenant and requests containing group selectors. On a permit it emits an `in` branch for supported `owner_tenant_id`. With `tenant_hierarchy` it also emits subtree branches for supported `owner_tenant_id` and `id`. If none apply, the response has empty constraints. Use a PDP with owner-based policies for endpoints that require an `owner_id` constraint. [Plugin implementation](../../gears/system/authz-resolver/plugins/static-authz-plugin/src/domain/service.rs)
 
 ### Feature flags
 
@@ -803,34 +777,39 @@ This injects a default `SecurityContext` for all requests without calling any Au
 
 ## Testing with SecureConn
 
-### Test setup
+For repository tests, construct an explicit scope with `AccessScope::for_tenant(tenant_id)`, `for_tenants(tenant_ids)`, or `for_resources(resource_ids)` and pass it with the test database runner. For service tests, configure the mock PDP and exercise the public operation. The `users-info` tests seed two tenants and assert that a scoped LIST returns only the permitted tenant’s row. [Tenant-scoping tests](../../examples/toolkit/users-info/users-info/src/domain/service/tests_tenant_scoping.rs)
 
 ```rust
-use toolkit_db::DbHandle;
-use toolkit_security::AccessScope;
-
 #[tokio::test]
-async fn test_user_repository() {
-    let db = setup_test_db().await;
-    let scope = AccessScope::for_tenant(Uuid::new_v4());
-    let repo = UserRepository;
-    let conn = db.sea_secure();
+async fn tenant_scope_only_sees_its_tenant() {
+    let db = inmem_db().await;
+    let tenant1 = Uuid::new_v4();
+    let tenant2 = Uuid::new_v4();
 
-    // Test operations
-    let user = repo.create(&conn, &scope, new_user).await.unwrap();
-    let found = repo.find_by_id(&conn, &scope, user.id).await.unwrap();
-    assert_eq!(found.id, user.id);
+    let user1 = Uuid::new_v4();
+    let user2 = Uuid::new_v4();
+    let conn = db.conn().unwrap();
+    seed_user(&conn, user1, tenant1, "u1@example.com", "U1").await;
+    seed_user(&conn, user2, tenant2, "u2@example.com", "U2").await;
+
+    let services = build_services(db.clone(), ServiceConfig::default());
+    let ctx_t1 = ctx_allow_tenants(&[tenant1]);
+
+    let page = services
+        .users
+        .list_users_page(&ctx_t1, &toolkit_odata::ODataQuery::default())
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].tenant_id, tenant1);
 }
 ```
-
-In tests, build scopes explicitly (`AccessScope::for_tenant(...)`, `AccessScope::for_tenants(...)`, `AccessScope::for_resources(...)`). This is the one place where manual `AccessScope` construction is appropriate.
 
 ## Quick checklist
 
 ### AuthZ wiring
-- [ ] Add `deps = ["authz-resolver"]` to your gear declaration.
-- [ ] Resolve `AuthZResolverApi` from `ClientHub` in `init()`.
-- [ ] Create `PolicyEnforcer::new(authz)` once, clone into sub-services.
+- [ ] Declare `AuthZResolverApi` with `#[toolkit::consumes]` and enable the SDK’s `rest-client` feature.
+- [ ] Create `PolicyEnforcer::from_hub(ctx.client_hub())` once in `init()` and clone it into sub-services.
 - [ ] Define `ResourceType` constants with `supported_properties` for each resource.
 - [ ] Define action constants (`get`, `list`, `create`, `update`, `delete`).
 - [ ] Call `policy_enforcer.access_scope()` / `.access_scope_with()` in every point operation and ordinary action-level permission gate, keeping the default `allow_empty_scope(false)`.
@@ -844,16 +823,17 @@ In tests, build scopes explicitly (`AccessScope::for_tenant(...)`, `AccessScope:
 - [ ] Derive `Scopable` on SeaORM entities with `tenant_col` (required).
 - [ ] Declare all four dimensions or use `unrestricted`.
 - [ ] Add `pep_prop(name = "column")` for custom domain properties.
-- [ ] Use `db.sea_secure()` for all DB access in handlers/services.
+- [ ] Obtain the connection runner with `db.conn()?` or use the active transaction runner.
 - [ ] Pass the `AccessScope` from `PolicyEnforcer` to `SecureConn` methods.
-- [ ] Use `secure_conn.find::<Entity>(&scope).all(&secure_conn)` for auto-scoped queries.
-- [ ] Use `secure_conn.update_with_ctx::<Entity>(&scope, id, am)` for single-record updates.
+- [ ] Apply `.secure().scope_with(&scope)` to the entity query before executing it with the runner.
+- [ ] For atomic single-record changes, apply both the resource ID and the full scope to the UPDATE statement.
 - [ ] See [`11_database_patterns.md`](./11_database_patterns.md) for DBRunner, transaction, repository, and migration checklists.
 
 ### CRUD patterns
-- [ ] Use prefetch pattern for GET/UPDATE/DELETE (extract `owner_tenant_id` for narrow PDP constraints).
-- [ ] For CREATE, pass `owner_tenant_id` as a resource property.
-- [ ] In tests, build scopes explicitly.
+- [ ] Require constraints for resource CRUD. If the PDP needs a prefetched attribute, preserve any explicit caller condition and enforce the result on the read or write.
+- [ ] Validate every requested equality in every allow-response branch before compilation.
+- [ ] For CREATE, verify the actual insert values satisfy all predicates of at least one branch.
+- [ ] In repository tests, build scopes explicitly. Exercise service authorization through the test PDP.
 
 ## Related docs
 

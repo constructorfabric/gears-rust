@@ -1545,7 +1545,7 @@
         "type": "object"
       },
       "Capability": {
-        "description": "PEP-level capability declarations.\n\nTells the PDP which advanced features the PEP can handle so the PDP\ncan tailor its response accordingly.\n\n**Note:** `GroupMembership` and `GroupHierarchy` require access to the\nResource Group tables (`resource_group`, `resource_group_membership`, `resource_group_closure`).\nServices that can join against these tables may declare the capabilities;\nthe PDP will then return `InGroup`/`InGroupSubtree` predicates directly.\nEach capable [`crate::pep::ResourceType`] must explicitly enable native\ngroup predicates, use an exact canonical GTS type path as its resource name,\nand support the `id` property. The enforcer uses that same type to qualify\nRG membership rows and suppresses group capabilities when any prerequisite\nis absent. Services without table access should omit these capabilities —\nthe PDP will degrade group predicates to explicit `In` with pre-resolved IDs.",
+        "description": "PEP-level capability declarations.\n\nThe PEP advertises which predicates it can enforce. The PDP uses these\ncapabilities to choose a supported constraint representation.\n\nAdvertise `GroupMembership` when the PEP can join `resource_group_membership`\nwith `gts_type`. For subtree queries, also advertise `GroupHierarchy`\nwhen the PEP can join `resource_group_closure`.\n\nThe enforcer sends group capabilities only for resources that opt in to\nnative group predicates, have a canonical GTS type path, and support `id`.\nSecureORM uses that type path to qualify membership rows in the query.\nWithout the required capabilities, a PDP enforcing a group restriction\nmust expand it to explicit resource IDs or deny access.",
         "enum": [
           "tenant_hierarchy",
           "group_membership",
@@ -4923,9 +4923,13 @@
             "type": "string"
           },
           "port": {
+            "description": "TCP port. Defaults to the scheme's port when omitted: 80 for `http`,\n443 otherwise. Responses always carry the stored port.",
             "format": "int32",
             "minimum": 0,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "scheme": {
             "$ref": "#/components/schemas/Scheme"
@@ -5343,7 +5347,7 @@
             "type": "array"
           },
           "require_constraints": {
-            "description": "Whether the PDP should return row-level constraints.\n- `true` for LIST/GET/UPDATE/DELETE (need scope filtering)\n- `false` for CREATE (just need decision)",
+            "description": "Whether the PDP should return row-level constraints.\nSet to `true` for resource reads and writes, including CREATE. A\nstandalone decision-only gate may accept absent constraints.\nAn omitted wire field defaults to `false`. `PolicyEnforcer` sends\n`true` by default.",
             "type": "boolean"
           },
           "supported_properties": {
@@ -5395,7 +5399,7 @@
         "description": "Authorization evaluation response context.\n\nContains constraints (when `decision` is `true`) or deny reason\n(when `decision` is `false`).",
         "properties": {
           "constraints": {
-            "description": "Row-level constraints to apply when `decision` is `true`.\nEmpty when `require_constraints` was `false` or when access is unrestricted.\nMultiple constraints are `ORed` (any one matching is sufficient).",
+            "description": "Row-level constraints to apply when `decision` is `true`.\nOn an allow decision, an empty outer list is accepted only when the\nrequest allowed a decision without constraints.\nMultiple constraints are `ORed` (any one matching is sufficient).",
             "items": {
               "$ref": "#/components/schemas/Constraint"
             },
@@ -18170,7 +18174,7 @@
           },
           "properties": {
             "additionalProperties": {},
-            "description": "Additional resource properties for policy evaluation.",
+            "description": "Under the resource-condition contract, each entry requests equality on a target property.\nThe SDK forwards this map to the configured PDP. The PEP must enforce the\nrequested equalities together with policy restrictions.",
             "propertyNames": {
               "type": "string"
             },

@@ -27,6 +27,8 @@
 
 This document describes Gears' approach to authentication (AuthN) and authorization (AuthZ).
 
+**Status:** The resource-condition contract below is a target design; see [implementation status](#implementation-status).
+
 **Authentication** verifies the identity of the subject making a request. Gears use the **AuthN Resolver** gear to integrate with vendor's Identity Provider (IdP), validate access tokens, and extract subject identity into a `SecurityContext`.
 
 **Authorization** determines what the authenticated subject can do. Gears use the **AuthZ Resolver** gear (acting as PDP) to obtain access decisions and query-level constraints. The core challenge: Gears need to enforce authorization at the **query level** (SQL WHERE clauses), not just perform point-in-time access checks.
@@ -67,11 +69,11 @@ In a multi-tenant system, resource access is defined along **two orthogonal dime
 
 **Tenancy (mandatory, isolation boundary)**
 Every resource belongs to exactly one tenant (`owner_tenant_id`). This is the primary data boundary.
-PEP MUST always enforce a tenant predicate in queries to prevent cross-tenant data leakage, regardless of policy decisions.
+For a tenant-owned resource, the PEP must enforce a tenant predicate on every allowed access path, including owner-only policies. The SDK compiler checks for a tenant predicate in branches with native group predicates. For ordinary `eq` or `in` branches it can compile an owner-only filter, so successful compilation alone does not establish tenant isolation. [PEP compiler](../../../gears/system/authz-resolver/authz-resolver-sdk/src/pep/compiler.rs)
 
 **Subject scoping (optional, per-subject filtering)**
 A resource may optionally be associated with a specific subject within the tenant via `owner_id`.
-This enables "my resources" views (e.g., "show only my tasks"). Tenant-level shared objects may have empty `owner_id`. It aligns with AuthZEN's `resource.properties.ownerID` resource property convention (see [AuthZEN interop spec](https://authzen-interop.net/docs/scenarios/todo-1.1/)).
+This enables "my resources" views (e.g., "show only my tasks"). Stored tenant-level shared objects may have `owner_id = NULL`. It aligns with AuthZEN's `resource.properties.ownerID` resource property convention (see [AuthZEN interop spec](https://authzen-interop.net/docs/scenarios/todo-1.1/)).
 
 **Important semantics**
 - `owner_tenant_id` is the isolation / partition key; `owner_id` is a nullable scoping attribute.
@@ -144,7 +146,7 @@ The AuthZ Resolver plugin bridges Gears to the vendor's Authorization Service (P
 - **Policy evaluation** — calling vendor's authorization API with subject, action, resource, context
 - **Constraint generation** — translating vendor's policy decisions into SQL-compilable constraints
 - **Hierarchy queries** — using Tenant Resolver and RG Resolver to query tenant and group hierarchies for constraint generation
-- **Token validation** (optional) — in out-of-process deployments, independently validating bearer_token for defense-in-depth
+- **Token validation** (optional) — a plugin with access to the caller’s bearer token can validate it independently. The internal evaluation REST request omits that token.
 
 **Policy Storage and Retrieval (Out of Scope):**
 
@@ -240,7 +242,7 @@ flowchart TB
 2. **AuthN Resolver (Gear) → AuthN Resolver (Plugin)** — Gear delegates to vendor plugin
 3. **AuthN Resolver (Plugin) → IdP** — Token validation (JWT signature verification or introspection)
 4. **AuthN Middleware → Handler** — Middleware extracts `SecurityContext` from `AuthenticationResult` and passes to handler
-5. **Handler → AuthZ Resolver (Gear)** — PEP calls `/access/v1/evaluation` for authorization decisions with `SecurityContext`
+5. **Handler → AuthZ Resolver (Gear)** — PEP derives the evaluation subject from `SecurityContext` and calls `AuthZResolverApi::evaluate` on the platform plane
 6. **AuthZ Resolver (Gear) → AuthZ Resolver (Plugin)** — Gear delegates to vendor plugin (PDP)
 7. **AuthZ Resolver (Plugin) → Authz Svc** — Policy evaluation
 8. **AuthZ Resolver (Plugin) → Tenant Resolver (Gear)** — Tenant hierarchy queries
@@ -249,28 +251,29 @@ flowchart TB
 
 ### Deployment Modes and Trust Model
 
-Both AuthN Resolver and AuthZ Resolver can run in two deployment configurations:
+A PEP can call the AuthZ Resolver in process or through its internal REST endpoint. AuthN consumers use the in-process `AuthNResolverClient`.
 
 **In-Process (Plugin):**
-- Resolvers run as plugins in the same process
+- The PEP calls the resolver through its local `ClientHub`
 - Communication via direct function calls
 - Trust model: implicit — same process, same memory space
 - No additional authentication required
 
 **Out-of-Process (Separate Service):**
 - Resolvers run as separate processes (same machine or remote)
-- Communication via REST/HTTP — the gear's `#[toolkit::rest_contract]` projection, discovered via the directory and routed through the api-gateway
+- Communication via REST/HTTP — the gear's `#[toolkit::rest_contract]` projection. Internal clients resolve the AuthZ evaluation endpoint through the directory and call it directly
 - Trust model: explicit authentication required
-- **Platform-plane authentication** — the caller's service identity is asserted with an `X-ToolKit-Internal-Token`; network-level hardening such as mTLS is an optional, orthogonal transport concern
+- **Platform-plane authentication** — the caller presents an `X-ToolKit-Internal-Token`; network-level hardening such as mTLS is an optional, orthogonal transport concern
 
 **Trust Boundaries:**
 
-In both modes, AuthZ Resolver (PDP) trusts subject identity data from PEP. In out-of-process mode the platform-plane token authenticates *which workload* is calling, not the validity of subject claims. Subject identity originates from AuthN Resolver (Gear) and flows through PEP to AuthZ Resolver.
+In both modes, AuthZ Resolver (PDP) trusts subject identity data from PEP. For a remote call, the Kubernetes authenticator identifies the caller’s service account. The development shared-secret authenticator assigns the same platform identity to every holder of the secret. In either configuration, the PEP supplies the subject claims derived from AuthN. [Shared-secret authenticator](../../../libs/toolkit-security/src/shared_secret.rs)
 
 | Aspect | In-Process | Out-of-Process |
 |--------|------------|----------------|
-| Gear → Plugin | implicit (same process) | separate-process plugin; platform-plane token (`X-ToolKit-Internal-Token`) authenticates the calling workload |
-| Subject identity trust | Same process | Subject identity supplied by PEP; the platform-plane token authenticates only the workload, not subject claims |
+| PEP → AuthZ Resolver | Local client call | Internal REST call authenticated with `X-ToolKit-Internal-Token` |
+| AuthZ Resolver → PDP plugin | Scoped plugin client from the resolver’s local `ClientHub` | Same scoped plugin lookup in the resolver process |
+| Subject identity trust | Same process | PEP supplies the subject identity over an authenticated platform connection |
 | Network exposure | none | internal network only |
 
 ## Token Scopes
@@ -297,7 +300,7 @@ Token scopes provide capability narrowing for third-party applications. They act
 | First-party | UI, CLI | `["*"]` | No restrictions, full user permissions |
 | Third-party | Partner integrations | `["read:events"]` | Limited to granted scopes |
 
-**Detection:** AuthN Resolver plugin determines app type during introspection and sets `token_scopes` accordingly. Gears do not maintain a trusted client list.
+The AuthN plugin classifies the client during token validation or introspection, so each consuming gear can use the resulting scopes directly. The bundled OIDC AuthN plugin compares the validated JWT’s `azp` (falling back to `client_id`) with its configured first-party client list. A match produces `["*"]`. For other clients it reads the configured scope claim, which defaults to `scope`. [OIDC claim mapping](../../../gears/system/authn-resolver/plugins/oidc-authn-plugin/src/domain/claim_mapper.rs)
 
 ### Vendor Neutrality
 
@@ -315,15 +318,13 @@ AuthN Resolver plugin is responsible for:
 ### SecurityContext Integration
 
 ```rust
-SecurityContext {
-    subject_id: "user123-uuid",                                  // required
-    subject_type: Some("gts.cf.core.security.subject_user.v1~"),  // optional
-    subject_tenant_id: "tenant456-uuid",                         // required
-    bearer_token: Some(Secret::new("eyJ...".into())),            // optional, Secret<String>
-    token_scopes: ["*"],                                         // first-party: full access
-    // OR
-    token_scopes: ["read:events", "write:tasks"],                // third-party: limited
-}
+// Inside the AuthN plugin, after validating the token and mapping its claims.
+let ctx = SecurityContext::builder()
+    .subject_id(subject_id)
+    .subject_tenant_id(tenant_id)
+    .subject_type("gts.cf.core.security.subject_user.v1~")
+    .token_scopes(token_scopes)
+    .build()?;
 ```
 
 ### PDP Evaluation Flow
@@ -370,8 +371,10 @@ api-gateway:
 Authentication is performed by **AuthN middleware** within the gear that accepts the request. The middleware:
 1. Extracts the bearer token from the request
 2. Calls **AuthN Resolver** to do authentication
-3. Receives `AuthenticationResult` containing validated subject identity (and, optionally, a `VerifiedPrincipal`)
-4. Passes the `SecurityContext` from `AuthenticationResult` to the gear's handler (PEP); when the result also carries a `VerifiedPrincipal`, the middleware inserts it into the request extensions as well (see [ADR 0005](./ADR/0005-verified-principal-request-extension.md))
+3. Receives `AuthenticationResult` containing validated subject identity
+4. Passes its `SecurityContext` to the gear's handler (PEP)
+
+The current [SDK result](../../../gears/system/authn-resolver/authn-resolver-sdk/src/models.rs) contains only `security_context`. The optional `VerifiedPrincipal` field, constructors and request extension described below are the target design in [ADR 0005](./ADR/0005-verified-principal-request-extension.md).
 
 Authentication is handled by the **AuthN Resolver** — a gear with plugins and a minimalist interface that validates bearer tokens and produces `AuthenticationResult`.
 
@@ -445,7 +448,7 @@ sequenceDiagram
     Plugin-->>Resolver: AuthenticationResult
     Resolver-->>Middleware: AuthenticationResult
     Middleware->>Middleware: Insert SecurityContext into request extensions
-    opt VerifiedPrincipal present
+    opt Proposed in ADR 0005: VerifiedPrincipal present
         Middleware->>Middleware: Insert VerifiedPrincipal into request extensions
     end
     Middleware->>Handler: Request + SecurityContext (+ VerifiedPrincipal)
@@ -455,7 +458,7 @@ sequenceDiagram
 
 ### AuthenticationResult
 
-The `AuthenticationResult` is returned by the AuthN Resolver upon successful authentication:
+ADR 0005 proposes the following result for a successful authentication:
 
 ```rust
 pub struct AuthenticationResult {
@@ -476,17 +479,21 @@ an authenticated request as an internal error (5xx), not a 401 — see [ADR 0005
 
 ### SecurityContext
 
-The `SecurityContext` is extracted from `AuthenticationResult` and flows from AuthN Resolver to PEPs (via handlers):
+AuthN middleware extracts the validated `SecurityContext` from `AuthenticationResult` and passes it to the handler. [Rust definition](../../../libs/toolkit-security/src/context.rs)
 
 ```rust
-use secrecy::Secret;
+use secrecy::SecretString;
+use uuid::Uuid;
 
-SecurityContext {
-    subject_id: Uuid,                      // required - internal, server-assigned subject id
-    subject_type: Option<GtsTypeId>,       // optional - vendor-specific subject type
-    subject_tenant_id: TenantId,           // required - Subject Tenant
-    token_scopes: Vec<String>,             // required - capability restrictions (["*"] for first-party)
-    bearer_token: Option<Secret<String>>,  // optional - original token for forwarding to PDP
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SecurityContext {
+    subject_id: Uuid,
+    subject_type: Option<String>,
+    subject_tenant_id: Uuid,
+    #[serde(default)]
+    token_scopes: Vec<String>,
+    #[serde(skip)]
+    bearer_token: Option<SecretString>,
 }
 ```
 
@@ -495,18 +502,17 @@ SecurityContext {
 | Field | Required | Description | Used By |
 |-------|----------|-------------|---------|
 | `subject_id` | Yes | Unique identifier for the subject | All authorization decisions |
-| `subject_type` | No | GTS type identifier (e.g., `gts.cf.core.security.subject_user.v1~`) | PDP for role/permission mapping |
+| `subject_type` | No | Subject classification string (e.g., `gts.cf.core.security.subject_user.v1~`) | PDP for role/permission mapping |
 | `subject_tenant_id` | Yes | Subject Tenant — tenant the subject belongs to. Used as default `owner_tenant_id` for CREATE when the API has no explicit tenant field (see S06 in [AUTHZ_USAGE_SCENARIOS.md](./AUTHZ_USAGE_SCENARIOS.md)) | PDP for tenant context, PEP for resource ownership |
-| `token_scopes` | Yes | Capability restrictions from token (see [Token Scopes](#token-scopes)) | PDP for scope narrowing |
-| `bearer_token` | No | Original bearer token (wrapped in `Secret` from [secrecy](https://crates.io/crates/secrecy) crate) | PDP validation, external API calls |
+| `token_scopes` | No | Defaults to an empty list, which grants no token scopes (see [Token Scopes](#token-scopes)) | PDP for scope narrowing |
+| `bearer_token` | No | Original bearer token (wrapped in `SecretString` from [secrecy](https://crates.io/crates/secrecy) crate) | PDP validation, external API calls |
 
 **Security Notes:**
 - Token expiration (`exp`) is validated during authentication but not included in SecurityContext (expiration is token metadata, not identity)
-- `bearer_token` uses `Secret<String>` from the `secrecy` crate which provides: redacted `Debug` output, no `Display` impl, and zeroization on drop
+- `bearer_token` uses `SecretString` from the `secrecy` crate which provides: redacted `Debug` output, no `Display` impl, and zeroization on drop
 - `bearer_token` MUST NOT be logged, serialized to persistent storage, or included in error messages
-- The token is included for:
-  1. **PDP validation** — In out-of-process deployments, AuthZ Resolver may independently validate the token for defense-in-depth
-  2. **Forwarding** — AuthZ Resolver plugin may need to call external vendor services requiring authentication
+- An in-process PDP can use the original token if the AuthN plugin supplied it. Serialization skips the field, so the remote evaluation endpoint receives only the subject and context data sent by the PEP. The REST client authenticates the call with the workload credential.
+
 
 ### VerifiedPrincipal
 
@@ -556,7 +562,7 @@ The AuthN Resolver plugin bridges Gears to the vendor's IdP. Plugin responsibili
 
 1. **Token Validation** — Implement vendor-specific validation logic (JWT signature verification, introspection, custom protocols)
 2. **Claim Extraction** — Extract subject identity from token claims or introspection response
-3. **Claim Enrichment** — If IdP doesn't include required claims (`subject_type`, `subject_tenant_id`), fetch from vendor services
+3. **Claim Enrichment** — Resolve the required home tenant from trusted identity data. A plugin may also supply a subject type
 4. **Token Scope Detection** — Determine first-party vs third-party apps and set `token_scopes` accordingly (see [Token Scopes](#token-scopes))
 5. **Response Mapping** — Convert vendor-specific responses to `AuthenticationResult` (containing `SecurityContext`)
 6. **S2S Credential Exchange** — Implement `exchange_client_credentials()` for service-to-service authentication (see [S2S Authentication](#s2s-authentication-service-to-service))
@@ -652,7 +658,7 @@ We extend AuthZEN's evaluation response with optional `context.constraints`. Ins
     "constraints": [
       {
         "predicates": [
-          { "type": "in_tenant_subtree", "resource_property": "owner_tenant_id", "root_tenant_id": "tenant123-uuid", "barrier_mode": "all" }
+          { "op": "in_tenant_subtree", "property": "owner_tenant_id", "root_tenant_id": "tenant123-uuid", "barrier_mode": "respect" }
         ]
       }
     ]
@@ -663,10 +669,10 @@ We extend AuthZEN's evaluation response with optional `context.constraints`. Ins
 ```
 
 This gives us:
-- **O(1) authorization overhead** per query (single PDP call)
+- **One evaluation call per query.** The cost of resolving memberships and enforcing predicates depends on the scope.
 - **Correct pagination** — constraints applied at SQL level before LIMIT
 - **Accurate counts** — database handles filtering
-- **No resource sync** — PDP never needs to know about individual resources
+- **Local resource data.** A native predicate can be evaluated against local tables. A PDP that expands group membership into explicit IDs needs access to that membership data.
 
 ---
 
@@ -674,7 +680,7 @@ This gives us:
 
 #### Unified PEP Flow
 
-All operations (LIST, GET, UPDATE, DELETE) follow the same flow:
+Resource operations follow evaluation → validation → enforcement; this diagram illustrates a read:
 
 ```mermaid
 sequenceDiagram
@@ -691,7 +697,7 @@ sequenceDiagram
     PEP-->>Client: response
 ```
 
-The only difference between LIST and point operations (GET/UPDATE/DELETE) is whether `resource.id` is present.
+LIST and point operations (GET/UPDATE/DELETE) share the same enforcement flow. Point operations identify a resource with `resource.id`; `resource.properties` always expresses required properties of the target resource (see [Scope Determination](#scope-determination)).
 
 #### Constraint Compilation to SQL
 
@@ -703,19 +709,20 @@ When constraints are present, the PEP compiles each constraint to SQL WHERE clau
 
 #### Fail-Closed Rules
 
-The PEP MUST:
+The PEP MUST apply these rules. On an allow response, requested-property validation (rule #12) precedes branch compilation or discard.
 
 1. **Validate decision** - Deny `decision: false` (403 Forbidden); reject a missing `decision` as a decoding error.
-2. **Enforce require_constraints** - If `require_constraints: true` and `decision: true` but absent or empty `constraints` -> deny all (403 Forbidden)
-3. **Apply constraints** - Compile and enforce valid branches; fail if none compiles. Empty scopes follow [empty-scope handling](#permission-gates-and-empty-scopes).
-4. **Trust decision when constraints not required** - `decision: true` without `constraints` AND `require_constraints: false` -> allow (non-resource decisions only; all standard CRUD operations use `require_constraints: true`)
-5. **Handle unreachable PDP** - Network failure, timeout -> deny all
+2. **Enforce require_constraints** - An allow response with absent or empty outer constraints when `require_constraints: true` produces `EnforcerError::CompileFailed`. The recommended handler mapping is 500. [SDK error mapping](../../toolkit_unified_system/06_authn_authz_secure_orm.md#enforcererror-authz-errors)
+3. **Apply constraints** - Compile and enforce valid branches on the operation; fail if none compiles. Empty scopes follow [empty-scope handling](#permission-gates-and-empty-scopes).
+4. **Restrict decision-only authorization** — Use it only as defined by the [`require_constraints` flag](#require_constraints-flag).
+5. **Handle unreachable PDP** — Stop the operation on transport failure or timeout. The SDK reports an evaluation failure, which handlers can distinguish from an explicit PDP denial.
 6. **Handle unknown predicate operators** - Unknown `op` is a decoding error; reject the entire response.
 7. **Handle empty predicate arrays** - `predicates: []` invalidates its branch; a missing `predicates` field rejects the response (rule #8).
 8. **Handle structurally invalid responses** - Reject missing required fields or invalid wire types. Semantic errors (e.g. malformed group UUIDs) invalidate the entire branch.
-9. **Handle unknown property names** - Properties outside `supported_properties` invalidate the branch and must be logged as PDP contract violations.
+9. **Validate properties and capabilities** — Discard branches that cannot be compiled against the advertised properties and capabilities; log contract violations. Reject the response if no valid branch remains.
 10. **Handle absent or empty constraints** - With `decision: true`, absent or empty outer `constraints` yield `allow_all` only when `require_constraints: false`; otherwise reject. Empty `predicates` remain malformed (rule #7).
 11. **Handle empty value lists in set predicates** - Empty `In`/`InGroup`/`InGroupSubtree` sets are valid `FALSE` predicates, never SQL `IN ()`. Existing validation still applies; remove whole false branches as described under [Normalized scopes](#normalized-scopes).
+12. **Preserve requested equalities** — For every supplied `resource.properties` entry `P = V`, every returned branch in an allow response MUST contain `eq(P, V)` alongside policy restrictions. Compare typed, canonical values before branch compilation or discard, for fresh and cached responses alike. Any missing or mismatched equality rejects the entire response with a generic 403; log the violation. Never repair the response by inserting or substituting predicates.
 
 ---
 
@@ -734,15 +741,30 @@ Some policies cannot be expressed as SQL constraints (e.g., time-based access, I
 
 #### Scope Determination
 
-No protocol-level differentiator is needed to tell PDP whether to apply subject scoping (`owner_id`) vs tenant-only scoping. PDP determines this from its own policy using information already present in the request:
-- `subject` — identity and attributes for role/permission lookup
-- `action.name` — semantic operation (e.g., `list`, `read`, `update`)
-- `resource.type` — resource-specific policy rules
-- `context.supported_properties` — declares that PEP **can** enforce `owner_id`, not that it **wants** to; this is a capability signal, not an intent signal
+- `subject.id` identifies the authenticated caller.
+- `action.name` names an arbitrary domain action, such as `read`, `publish`, or `approve`. CRUD actions are examples, not a fixed protocol vocabulary.
+- `resource.type` selects the resource policy; `resource.id` identifies a particular target when applicable.
+- `resource.properties` supplies required equalities on the target resource. These are conditions to enforce, not verified facts or proof of permission.
 
-Adding a scope hint (e.g., `"scope_mode": "owner"`) would leak authorization logic into PEP, violating PDP/PEP separation. The PEP declares what it can enforce; the PDP decides what to enforce.
+`effective_scope = requested_conditions AND policy_scope`
 
-For "my resources" endpoints (e.g., `GET /tasks/my`), PEP can either use a semantic `action.name` that PDP policies recognize (e.g., `list_own`), or apply `owner_id` as an application-level filter on top of authorization constraints — this is a UI filter, not an authorization decision.
+Advertising `owner_id` in `context.supported_properties` means the PEP can enforce an owner predicate. The PDP chooses whether its policy requires one. For example, a `GET /tasks/my` endpoint can request `owner_id = subject.id` and use the domain action `list` or a policy-defined `list_own`. Neither the action name nor the selector grants access. No separate owner/tenant scope-mode flag is needed.
+
+Omitting a condition leaves policy restrictions in effect. A requested owner never replaces caller identity or tenant isolation. Property value types belong to the resource domain contract shared by PEP and PDP; `supported_properties` advertises names only. PEP rejects names or value types it cannot enforce. For `owner_id`, only omission or a UUID string is valid: reject null, empty, malformed, or non-string client values with 400 before evaluation or cache lookup. PDP also rejects invalid evaluation input. Stored ownership may be nullable; an ownerless-only selector is not defined here.
+
+PDP returns the intersection as constraints, and PEP checks every branch using [rule #12](#fail-closed-rules). If policy excludes all requested access paths, PDP denies; otherwise an authorized scope may simply match no resources. Domain checks such as owner existence still apply independently.
+
+PEP enforces the scope at the point of access or effect, according to the operation's semantics. Reads apply constraints before pagination/counting, mutations constrain the affected rows atomically, and creation validates actual inserted values, including defaults and generated fields. Prefetch may inform conditions but cannot replace enforcement or overwrite explicit caller conditions. Changing ownership or tenant requires separate authorization of the source and destination and an atomic transition; reject such changes until that transition is supported.
+
+See [S24–S32](./AUTHZ_USAGE_SCENARIOS.md#subject-owner-based-access) for detailed CRUD examples, including policy denial, no match, and ownership changes.
+
+#### Implementation Status
+
+The SDK forwards `resource.properties`. Endpoints must validate owner UUIDs, and a custom PEP must verify requested equalities before compilation. Endpoints with owner-based policies need a PDP that supports them. The bundled static and TR plugins scope access by tenant and ignore `owner_id` by design. Neither evaluates `context.token_scopes`. For a point request, TR returns the permitted tenant as a singleton `in`; a PEP checking a requested `owner_tenant_id` equality requires `eq`. [TR plugin](../../../gears/system/authz-resolver/plugins/tr-authz-plugin/src/domain/service.rs) · [Static plugin](../../../gears/system/authz-resolver/plugins/static-authz-plugin/src/domain/service.rs)
+
+Migrating decision-only CRUD callers and implementing authorized ownership transfers are follow-up work. The current `users-info` GET may return a prefetched row, `secure_update_with_scope` checks the scope before issuing a primary-key update, and INSERT validation skips unset columns in live branches. See the [CRUD guide](../../toolkit_unified_system/06_authn_authz_secure_orm.md#get--prefetch-pattern). Resource Group CREATE also uses `resource.properties` for provisioning inputs such as `parent_id` and `is_tenant`, which its resource descriptor cannot enforce as equalities. [Group creation](../../../gears/system/resource-group/resource-group/src/domain/group_service.rs)
+
+Decision caching is tracked in [#5502](https://github.com/constructorfabric/gears-rust/issues/5502).
 
 #### Permission gates and empty scopes
 
@@ -753,7 +775,7 @@ For "my resources" endpoints (e.g., `GET /tasks/my`), PEP can either use a seman
 | Has live branches | Normalized scope | Same |
 | All branches are empty | `EnforcerError::AccessDenied(AccessDenial::ScopeMatchesNothing)` (403) | Empty scope with its originals |
 
-PDP denials and validation failures retain their existing error handling. Invalid branches are discarded individually, so `[valid-empty, invalid]` is a valid empty scope; strict rejection is separate work in [#5958](https://github.com/constructorfabric/gears-rust/issues/5958).
+The current SDK discards invalid branches individually, so `[valid-empty, invalid]` is a valid empty scope; strict rejection is separate work in [#5958](https://github.com/constructorfabric/gears-rust/issues/5958).
 
 The low-level `compile_to_access_scope` also refuses empty scopes (`ConstraintCompileError::ScopeMatchesNothing`; `EnforcerError::from` classifies it as `AccessDenial::ScopeMatchesNothing`). Opt in with `compile_to_access_scope_with_options` and `CompileOptions::new().allow_empty_scope(true)`.
 
@@ -773,7 +795,7 @@ Every `AccessScope` constructor removes whole branches made false by empty membe
 - With `is_unconstrained() == false`, no live branches means `is_deny_all()` and `matches_nothing()` are true. Equality compares both lists, positions and the flag, so an all-empty scope can differ from `deny_all()`.
 - Transforms (`tenant_only`, `tenant_and_owner`, `ensure_owner`, gear-local projections) start fresh from live branches: old removed branches are not inherited; new empty branches are retained in the result. `clone()` preserves both lists.
 
-The compiler validates branches before normalization. Storage checks only live branches, so diagnostics for removed branches are lost without widening access. INSERT rejects all-empty scopes even for `NotSet` columns.
+The compiler validates branches before normalization. Storage checks only live branches, so diagnostics for removed branches are lost without widening access. On scoped entities, INSERT rejects all-empty scopes even for `NotSet` columns. For live branches, see [INSERT validation and its limits](../../toolkit_unified_system/06_authn_authz_secure_orm.md#insert-secure_insert--secureconninsert).
 
 **Consumer limitations:** file-storage enforces only a tenant pin on nonempty scopes; resource-group memberships are scoped through their owning group.
 
@@ -795,9 +817,13 @@ Any caching implementation MUST satisfy:
 
 3. **Tenant isolation** - Cache key MUST include tenant context to prevent cross-tenant data leakage.
 
+4. **Evaluation equivalence** — Include every decision-relevant input in the cache key: subject and attributes, action, resource type/ID/properties, tenant context, token scopes, supported properties, capabilities, `require_constraints`, and plugin-specific context or credentials. Never log or store credentials as plaintext keys.
+
+Use deterministic serialization and canonical UUIDs. Preserve absent versus supplied properties (including the selected owner); normalize array order only where semantically irrelevant. Reject invalid conditions before lookup and do not reuse responses when equivalence is uncertain. TTL/invalidation and the same response validation as for fresh evaluations still apply.
+
 #### Open Questions (TODO)
 
-- Cache key structure - Which request fields participate? How to canonicalize `resource.properties`?
+- Cache key encoding - Select a concrete canonical serialization, key format, and credential-safe fingerprinting scheme satisfying the equivalence requirements above.
 - Cache-control protocol - Should PDP signal cacheability? TTL negotiation?
 - Invalidation strategy - Proactive invalidation (policy version, WebSocket events) vs pure TTL expiration?
 - Token expiration access - Add `token_expires_at` to `SecurityContext` or pass separately?
@@ -807,31 +833,24 @@ Any caching implementation MUST satisfy:
 
 ### API Specifications
 
-> **Note on interface representation:** The Authentication section above uses Rust trait definitions to specify the AuthN Resolver interface, while this Authorization section uses JSON examples (REST API payloads). This is intentional — authorization request/response payloads are more verbose and complex, making JSON more readable for documentation purposes. The Rust trait interface for AuthZ Resolver will be specified in the AuthZ Resolver gear design documentation.
-
 #### Access Evaluation API (AuthZEN-extended)
 
-Two endpoints for authorization checks, following AuthZEN structure:
-
-- `POST /access/v1/evaluation` - Single evaluation request
-- `POST /access/v1/evaluations` - Batch evaluation (array of requests -> array of responses)
-
-PDP returns `decision` plus optional `constraints` for each evaluation.
+The SDK's [REST contract](../../../gears/system/authz-resolver/authz-resolver-sdk/src/rest.rs) exposes the internal platform-plane route `POST /authz-resolver/v1/evaluate` for a single evaluation. The PDP returns `decision` and may include row constraints in `context.constraints`. ADR 0001 also describes batch evaluation, with a decision and optional constraints per input. Only the single-evaluation operation is exposed by the SDK today. [Authorization model ADR](./ADR/0001-pdp-pep-authorization-model.md)
 
 #### Design Principles
 
 1. **AuthZEN alignment** - Use same `subject`, `action`, `resource`, `context` structure
-2. **Constraints are optional** - PDP decides when to include based on action type
+2. **Constraint requirement** - PEP selects the enforcement mode via [`require_constraints`](#require_constraints-flag); PDP must satisfy it for an allow response.
 3. **Constraint-first** - Return predicates, not enumerated IDs
 4. **Capability negotiation** - PEP declares enforcement capabilities
-5. **Fail-closed** - Unknown constraints or schemas result in deny
+5. **Fail-closed** - Reject undecodable responses. For decoded branches, apply the [validation rules](#fail-closed-rules).
 6. **OR/AND semantics** - Multiple constraints are OR'd (alternative access paths), predicates within constraint are AND'd
-7. **Token passthrough** - Original bearer token optionally included in `context.bearer_token` for PDP validation and external service calls (MUST NOT be logged)
+7. **Caller identity** - The PEP builds `subject` from the authenticated caller. The platform transport validates the calling service’s credential.
 8. **Property schema contract** - PEP declares supported properties; PDP validates constraints use only supported properties
 
 #### ID Conventions
 
-All **core entity identifiers** in the authorization API are **UUIDs**:
+The authorization wire model and Resource Group storage use these identifier types:
 
 | ID | Type | Description |
 |----|------|-------------|
@@ -839,11 +858,11 @@ All **core entity identifiers** in the authorization API are **UUIDs**:
 | `subject.properties.tenant_id` | UUID | Subject's home tenant |
 | `resource.id` | UUID | Resource instance identifier |
 | `owner_tenant_id` | UUID | Tenant that owns a resource (resource property) |
-| `owner_id` | UUID | Subject that owns a resource (resource property, nullable) |
+| `owner_id` | UUID | Stored owner may be null; a request condition must be a UUID or omitted. |
 | `group_id` | UUID | Resource group identifier |
 | `tenant_closure` keys | UUID | `ancestor_id`, `descendant_id` |
 | `resource_group_closure` keys | UUID | `ancestor_id`, `descendant_id` |
-| `resource_group_membership` keys | UUID | `resource_id`, `group_id` |
+| `resource_group_membership` keys | Composite | UUID `group_id`, SMALLINT `gts_type_id`, and opaque text `resource_id` |
 
 **Domain-specific identifiers** (e.g., `topic_id`) are **exceptions** — they are structured string identifiers from the Global Type System (e.g., `gts.cf.core.events.topic.v1~`), not UUIDs. How a domain gear stores GTS IDs internally is up to the gear: either as a string as-is, or as a deterministic UUIDv5 computed from the GTS ID string. PDP may return GTS IDs in constraint values (e.g., `topic_id`); PEP is responsible for mapping them to the storage format used by the gear.
 
@@ -859,7 +878,7 @@ All **core entity identifiers** in the authorization API are **UUIDs**:
 #### Request
 
 ```
-POST /access/v1/evaluation
+POST /authz-resolver/v1/evaluate
 Content-Type: application/json
 ```
 
@@ -870,7 +889,7 @@ Content-Type: application/json
     "type": "gts.cf.core.security.user.v1~",          // optional - SecurityContext.subject_type
     "id": "a254d252-7129-4240-bae5-847c59008fb6",    // required - SecurityContext.subject_id
     "properties": {
-      "tenant_id": "51f18034-3b2f-4bfa-bb99-22113bddee68"  // optional - SecurityContext.subject_tenant_id
+      "tenant_id": "51f18034-3b2f-4bfa-bb99-22113bddee68"  // populated by PolicyEnforcer from SecurityContext.subject_tenant_id
     }
   },
 
@@ -882,7 +901,6 @@ Content-Type: application/json
   // Resource — handler sets type; id/properties from HTTP request
   "resource": {
     "type": "gts.cf.core.events.event.v1~",               // handler: gear's resource GTS type
-    "id": "e81307e5-5ee8-4c0a-8d1f-bd98a65c517e",   // URL path param (point ops only, absent for list)
     "properties": {
       "topic_id": "gts.cf.core.events.topic.v1~z.app._.some_topic.v1"  // from query param ?topic=...
     }
@@ -894,15 +912,14 @@ Content-Type: application/json
     "tenant_context": {
       "mode": "subtree",           // "root_only" | "subtree", default: "subtree"
       "root_id": "51f18034-3b2f-4bfa-bb99-22113bddee68",  // optional - request param (URL query, header), handler can set
-      "barrier_mode": "all",       // default: "all"
+      "barrier_mode": "respect",       // default: "respect"
       "tenant_status": ["active", "suspended"]  // optional filter
     },
 
     "token_scopes": ["read:events", "write:tasks"],  // SecurityContext.token_scopes
     "require_constraints": true,   // handler config: LIST requires constraints
     "capabilities": ["tenant_hierarchy"],  // gear config: has tenant_closure table
-    "supported_properties": ["owner_tenant_id", "topic_id", "id", "owner_id"],  // handler config: properties PEP can map to SQL
-    "bearer_token": "eyJhbGciOiJSUzI1NiIs..."  // SecurityContext.bearer_token: Secret<String> (optional, see notes below)
+    "supported_properties": ["owner_tenant_id", "topic_id", "id", "owner_id"]  // handler config: properties PEP can map to SQL
   }
 }
 ```
@@ -924,16 +941,16 @@ The response contains a `decision` and, when `decision: true`, optional `context
         "predicates": [
           {
             // Tenant subtree predicate - uses local tenant_closure table
-            "type": "in_tenant_subtree",
-            "resource_property": "owner_tenant_id",
+            "op": "in_tenant_subtree",
+            "property": "owner_tenant_id",
             "root_tenant_id": "51f18034-3b2f-4bfa-bb99-22113bddee68",
-            "barrier_mode": "all",       // default: "all"
-            "tenant_status": ["active", "suspended"]
+            "barrier_mode": "respect",       // default: "respect"
+            "descendant_status": ["active", "suspended"]
           },
           {
             // Equality predicate
-            "type": "eq",
-            "resource_property": "topic_id",
+            "op": "eq",
+            "property": "topic_id",
             "value": "gts.cf.core.events.topic.v1~z.app._.some_topic.v1"
           }
         ]
@@ -949,7 +966,7 @@ The response contains a `decision` and, when `decision: true`, optional `context
 {
   "decision": false,
   "context": {
-    // deny_reason is required when decision is false
+    // Structured denial diagnostics
     "deny_reason": {
       // GTS-formatted error code for programmatic handling (required)
       "error_code": "gts.cf.core.errors.err.v1~x.authz.errors.insufficient_permissions.v1",
@@ -960,7 +977,7 @@ The response contains a `decision` and, when `decision: true`, optional `context
 }
 ```
 
-**Note on `bearer_token`:** The `context.bearer_token` field is optional. Include it when PDP needs to: (1) validate token independently (defense-in-depth in OoP deployments), (2) call external vendor APIs requiring authentication, or (3) extract token-embedded policies/scopes. Omit it if PDP fully trusts PEP's claim extraction. Security: `bearer_token` is a credential — PDP MUST NOT log it or persist it. In Rust code, use `Secret<String>` from the `secrecy` crate. Note: `Secret<String>` (secrecy v0.10 / `SecretBox<T>`) does **not** implement `Serialize` by default — calling `serde_json::to_string()` on it will fail at compile time unless the inner type implements `SerializableSecret` (or a custom serializer is provided via `serde_secrecy`). When serialization is required (e.g., for PDP communication), explicitly call `expose_secret()` at the call site.
+**Note on `bearer_token`:** In process, the SDK can carry the caller's `SecretString` in the evaluation context. The SDK skips that field during serialization. Never log or persist the token. Out-of-process evaluation authenticates the caller using the configured platform credential.
 
 **Note on `tenant_context`:** The `context.tenant_context` object is optional. It defines the tenant context for the operation:
 
@@ -968,7 +985,7 @@ The response contains a `decision` and, when `decision: true`, optional `context
 |-------|----------|---------|-------------|
 | `mode` | No | `"subtree"` | `"root_only"` (single tenant) or `"subtree"` (tenant + descendants) |
 | `root_id` | No | — | Root context tenant ID. If absent, PDP determines from `token_scopes`, `subject.properties.tenant_id`, or something else - it's fully up to the PDP implementation |
-| `barrier_mode` | No | `"all"` | `"all"` (respect barriers) or `"none"` (ignore barriers) |
+| `barrier_mode` | No | `"respect"` | `"respect"` (respect barriers) or `"ignore"` (ignore barriers) |
 | `tenant_status` | No | — | Filter by tenant status (e.g., `["active", "suspended"]`) |
 
 The `barrier_mode` and `tenant_status` parameters apply to any scope source — whether explicitly provided via `root_id` or derived from the token/subject.
@@ -978,15 +995,17 @@ The `barrier_mode` and `tenant_status` parameters apply to any scope source — 
 | `decision` | `constraints` | `require_constraints` | PEP Action |
 |------------|---------------|----------------------|------------|
 | `false` | (any) | (any) | **403 Forbidden** |
-| `true` | absent or empty | `false` | Allow (trust PDP decision) |
-| `true` | absent or empty | `true` | **403 Forbidden** (constraints required but missing) |
-| `true` | nonempty | (any) | Compile constraints; apply [empty-scope handling](#permission-gates-and-empty-scopes) |
+| `true` | absent or `[]` | `false` | Allow the decision-only gate |
+| `true` | absent or `[]` | `true` | Reject (required constraints missing) |
+| `true` | nonempty | (any) | Validate, compile, and enforce using [empty-scope handling](#permission-gates-and-empty-scopes) |
 
-**Key insight:** PEP declares via `require_constraints` capability whether it needs constraints for the operation. For LIST operations, this should typically be `true`; for CREATE, it can be `false`.
+See the [`require_constraints` rules](#require_constraints-flag) for choosing the enforcement mode.
 
 #### Operation-Specific Behavior
 
-**CREATE** (PDP returns constraints, same as other operations):
+These CRUD examples illustrate enforcement; the action vocabulary is domain-defined.
+
+**CREATE** (the PEP advertises the properties it can enforce on the inserted values):
 ```jsonc
 // PEP -> PDP
 {
@@ -995,7 +1014,7 @@ The `barrier_mode` and `tenant_status` parameters apply to any scope source — 
     "type": "gts.cf.core.events.event.v1~",
     "properties": { "owner_tenant_id": "tenantB-uuid", "topic_id": "..." }
   },
-  "context": { "require_constraints": true }
+  "context": { "require_constraints": true, "supported_properties": ["owner_tenant_id", "topic_id"] }
   // ... subject, tenant_context
 }
 
@@ -1004,7 +1023,10 @@ The `barrier_mode` and `tenant_status` parameters apply to any scope source — 
   "decision": true,
   "context": {
     "constraints": [
-      { "predicates": [{ "type": "eq", "resource_property": "owner_tenant_id", "value": "tenantB-uuid" }] }
+      { "predicates": [
+        { "op": "eq", "property": "owner_tenant_id", "value": "tenantB-uuid" },
+        { "op": "eq", "property": "topic_id", "value": "..." }
+      ] }
     ]
   }
 }
@@ -1029,7 +1051,7 @@ The `barrier_mode` and `tenant_status` parameters apply to any scope source — 
     "constraints": [
       {
         "predicates": [
-          { "type": "in_tenant_subtree", "resource_property": "owner_tenant_id", "root_tenant_id": "tenantA-uuid", "barrier_mode": "all" }
+          { "op": "in_tenant_subtree", "property": "owner_tenant_id", "root_tenant_id": "tenantA-uuid", "barrier_mode": "respect" }
         ]
       }
     ]
@@ -1055,7 +1077,7 @@ The `barrier_mode` and `tenant_status` parameters apply to any scope source — 
     "constraints": [
       {
         "predicates": [
-          { "type": "in_tenant_subtree", "resource_property": "owner_tenant_id", "root_tenant_id": "tenantA-uuid", "barrier_mode": "all" }
+          { "op": "in_tenant_subtree", "property": "owner_tenant_id", "root_tenant_id": "tenantA-uuid", "barrier_mode": "respect" }
         ]
       }
     ]
@@ -1068,6 +1090,8 @@ The `barrier_mode` and `tenant_status` parameters apply to any scope source — 
 
 #### Response with Resource Group Predicate
 
+This separate example assumes no requested resource properties. The PEP advertises `tenant_hierarchy`, `group_membership`, and `group_hierarchy` and supports both `owner_tenant_id` and `id`.
+
 ```jsonc
 {
   "decision": true,
@@ -1077,16 +1101,16 @@ The `barrier_mode` and `tenant_status` parameters apply to any scope source — 
         "predicates": [
           {
             // Tenant subtree predicate
-            "type": "in_tenant_subtree",
-            "resource_property": "owner_tenant_id",
+            "op": "in_tenant_subtree",
+            "property": "owner_tenant_id",
             "root_tenant_id": "tenantA-uuid",
-            "barrier_mode": "all"  // default: "all"
+            "barrier_mode": "respect"  // default: "respect"
           },
           {
             // Group subtree predicate - uses resource_group_membership + resource_group_closure tables
-            "type": "in_group_subtree",
-            "resource_property": "id",
-            "root_group_id": "project-root-group-uuid"
+            "op": "in_group_subtree",
+            "property": "id",
+            "ancestor_ids": ["project-root-group-uuid"]
           }
         ]
       }
@@ -1097,11 +1121,11 @@ The `barrier_mode` and `tenant_status` parameters apply to any scope source — 
 
 #### Deny Response
 
-When the PDP denies access, it returns `decision: false` with a required `deny_reason` in the context (see example in [Response](#response) section above).
+The producer contract requires `decision: false` with a structured `context.deny_reason`. The SDK also accepts a bare denial. For example, `tr-authz-plugin` currently returns an empty context. Both responses stop the operation.
 
 ##### Deny Reason Structure
 
-The `deny_reason` object is **required** when `decision: false` and provides structured information about why access was denied:
+`context.deny_reason` provides structured diagnostics. The SDK represents `error_code` as a string. The following conventions apply to producers of structured reasons.
 
 | Field | Required | Description |
 |-------|----------|-------------|
@@ -1126,161 +1150,159 @@ gts.cf.core.errors.err.v1~vendor.acme.quota_exceeded.v1
 
 ##### PEP Handling of Deny Reason
 
-The PEP MUST:
-1. **Use `error_code` for programmatic handling** — Route to appropriate logic based on error type (e.g., distinguish `invalid_request` from `insufficient_permissions` for different error responses or retry strategies)
-2. **Log the deny_reason** — Include `error_code` and `details` in audit/debug logs for troubleshooting
-3. **NOT expose details to client** — Return generic 403 Forbidden without leaking `details` or internal denial reasons
-
-**Security rationale:** The `details` field may contain information about authorization policies, tenant structure, or resource existence. The PEP uses `error_code` for handling logic and logs `details` internally, but returns only a generic 403 to the client.
+The SDK returns `AccessDenial::Pdp` with the optional reason. Deny the operation regardless of whether the plugin supplies one. Return a generic 403 to the client. When supplied, the machine-readable error code lets the PEP distinguish a malformed evaluation from insufficient permissions in internal metrics or audit logs. Keep `deny_reason.details` out of client responses: it may reveal policy, tenant structure, or resource existence.
 
 ---
 
 ### Predicate Types Reference
 
-All predicates filter resources based on their properties. The `resource_property` field specifies which property to filter on — these correspond directly to `resource.properties` in the request.
+Each predicate names a property advertised in `context.supported_properties`. Policy may constrain advertised properties even when the caller omits them from `resource.properties`.
 
-**Extensibility:**
+**Wire format:** The SDK serializes the predicate discriminator as `op` and the target field as `property`. `type` remains the discriminator for subjects/resources, not predicates. `in_group_subtree` carries `ancestor_ids`, an array; `in_tenant_subtree` carries a single `root_tenant_id`. In a tenant predicate the optional status field is `descendant_status`; the request-side tenant context uses `tenant_status`.
 
-The Rust SQL compilation library supports **extensible predicate types**:
-
-- **Standard predicates** — Gears' built-in gears use only the standard predicates listed below (`eq`, `in`, `in_tenant_subtree`, `in_group`, `in_group_subtree`)
-- **Custom predicates** — Vendors can extend the system by:
-  1. Registering new predicate types with the SQL compilation library
-  2. Providing SQL compilation handlers for these predicates
-  3. Returning custom predicates from their AuthZ Resolver Plugin (PDP)
-  4. Using custom predicates in their domain gears
-
-**Example use case:** A vendor with a custom geospatial authorization model could register a `within_geo_boundary` predicate type and implement its SQL compilation handler using PostGIS functions. Their PDP would return constraints like `{ "type": "within_geo_boundary", "resource_property": "location", "boundary": "...geojson..." }`, and the SQL compiler would generate the corresponding PostGIS query.
+**Extensibility:** The current SDK has a closed `Predicate` enum. Adding an operator requires compatible SDK serialization, validation, and enforcement support on both sides. An unknown `op` cannot be deserialized and rejects the response; a plugin cannot enable a custom operator merely by emitting it. For example, a vendor that needs a spatial predicate would need a negotiated wire representation and a matching PEP database operation before its PDP could issue it.
 
 **Standard Predicate Types:**
 
 | Type | Description | Required Fields | Optional Fields |
 |------|-------------|-----------------|-----------------|
-| `eq` | Property equals value | `resource_property`, `value` | — |
-| `in` | Property in value list | `resource_property`, `values` | — |
-| `in_tenant_subtree` | Tenant subtree via closure table | `resource_property`, `root_tenant_id` | `barrier_mode`, `descendant_status` |
-| `in_group` | Flat group membership | `resource_property`, `group_ids` | — |
-| `in_group_subtree` | Group subtree via closure table | `resource_property`, `root_group_id` | — |
+| `eq` | Property equals value | `property`, `value` | — |
+| `in` | Property in value list | `property`, `values` | — |
+| `in_tenant_subtree` | Tenant subtree via closure table | `property`, `root_tenant_id` | `barrier_mode`, `descendant_status` |
+| `in_group` | Flat group membership | `property`, `group_ids` | — |
+| `in_group_subtree` | Group subtree via closure table | `property`, `ancestor_ids` | — |
 
-#### 1. Equality Predicate (`type: "eq"`)
+<a name="1-equality-predicate-type-eq"></a>
+
+#### 1. Equality Predicate (`op: "eq"`)
 
 Compares resource property to a single value.
 
 **Schema:**
-- `type` (required): `"eq"`
-- `resource_property` (required): Property name (e.g., `topic_id`, `owner_tenant_id`)
+- `op` (required): `"eq"`
+- `property` (required): Property name (e.g., `topic_id`, `owner_tenant_id`)
 - `value` (required): Single value to compare
 
 ```jsonc
-{ "type": "eq", "resource_property": "topic_id", "value": "uuid123-uuid" }
+{ "op": "eq", "property": "topic_id", "value": "uuid123-uuid" }
 // SQL: topic_id = 'uuid123-uuid'
 ```
 
-#### 2. IN Predicate (`type: "in"`)
+<a name="2-in-predicate-type-in"></a>
+
+#### 2. IN Predicate (`op: "in"`)
 
 Compares resource property to a list of values.
 
 **Schema:**
-- `type` (required): `"in"`
-- `resource_property` (required): Property name (e.g., `owner_tenant_id`, `status`)
+- `op` (required): `"in"`
+- `property` (required): Property name (e.g., `owner_tenant_id`, `status`)
 - `values` (required): Array of values
 
 ```jsonc
-{ "type": "in", "resource_property": "owner_tenant_id", "values": ["tenant1-uuid", "tenant2-uuid"] }
+{ "op": "in", "property": "owner_tenant_id", "values": ["tenant1-uuid", "tenant2-uuid"] }
 // SQL: owner_tenant_id IN ('tenant1-uuid', 'tenant2-uuid')
 
-{ "type": "in", "resource_property": "status", "values": ["active", "pending"] }
+{ "op": "in", "property": "status", "values": ["active", "pending"] }
 // SQL: status IN ('active', 'pending')
+
+{ "op": "in", "property": "id", "values": [] }
+// SQL: FALSE (or an equivalent predicate such as 1 != 2)
 ```
 
-#### 3. Tenant Subtree Predicate (`type: "in_tenant_subtree"`)
+<a name="3-tenant-subtree-predicate-type-in_tenant_subtree"></a>
 
-Filters resources by tenant subtree using the closure table. The `resource_property` specifies which property contains the tenant ID.
+#### 3. Tenant Subtree Predicate (`op: "in_tenant_subtree"`)
+
+Filters resources by tenant subtree using the closure table. The `property` specifies which property contains the tenant ID.
 
 **Schema:**
-- `type` (required): `"in_tenant_subtree"`
-- `resource_property` (required): Property containing tenant ID (e.g., `owner_tenant_id`)
+- `op` (required): `"in_tenant_subtree"`
+- `property` (required): Property containing tenant ID (e.g., `owner_tenant_id`)
 - `root_tenant_id` (required): Root of tenant subtree
-- `barrier_mode` (optional): Barrier handling mode, default `"all"`. Values: `"all"` (respect all barriers), `"none"` (ignore barriers)
-- `descendant_status` (optional): Filter by tenant status — applies to descendants reached via the closure (the column name mirrors `tenant_closure.descendant_status` so the binding is unambiguous; the root ancestor itself is not filtered)
+- `barrier_mode` (optional): Barrier handling mode, default `"respect"`. Values: `"respect"` (respect all barriers), `"ignore"` (ignore barriers)
+- `descendant_status` (optional): Filter candidate tenants by their own status, including the root through its self-row. This predicate does not inspect intermediate ancestors or prune an active descendant because its parent is suspended. Tenant Resolver traversal can have different status-pruning behavior; see [Tenant Model](../../security/SECURITY.md#multi-tenancy--tenant-resolver).
 
 ```jsonc
 {
-  "type": "in_tenant_subtree",
-  "resource_property": "owner_tenant_id",
+  "op": "in_tenant_subtree",
+  "property": "owner_tenant_id",
   "root_tenant_id": "tenantA-uuid",
-  "barrier_mode": "all",  // default: "all"
+  "barrier_mode": "respect",  // default: "respect"
   "descendant_status": ["active", "suspended"]
 }
 // SQL: owner_tenant_id IN (
 //   SELECT descendant_id FROM tenant_closure
 //   WHERE ancestor_id = 'tenantA-uuid'
-//     AND barrier = 0  -- barrier_mode: "all"
-//     AND descendant_status IN ('active', 'suspended')
+//     AND barrier = 0  -- barrier_mode: "respect"
+//     AND descendant_status IN (1, 2)  -- active, suspended
 // )
-// Note: barrier_mode: "none" omits the barrier clause
+// Note: barrier_mode: "ignore" omits the barrier clause
 ```
 
 **Barrier Modes:**
 
 | Mode | SQL Clause | Description |
 |------|------------|-------------|
-| `"all"` | `AND barrier = 0` | (default) Respect all barriers. Stops traversal at `self_managed` tenants. |
-| `"none"` | (omit clause) | Ignore barriers. Use for billing, tenant metadata, or other cross-barrier operations. |
+| `"respect"` | `AND barrier = 0` | (default) Respect all barriers. Stops traversal at `self_managed` tenants. |
+| `"ignore"` | (omit clause) | Ignore barriers. Use for billing, tenant metadata, or other cross-barrier operations. |
 
 **Future extensibility:** The `barrier` column is SMALLINT to allow future use as a bitmask for multiple barrier types (16 bits of headroom; portable across PostgreSQL and MySQL). Future modes (e.g., `"data_sovereignty_only"`) can be added with selective checks like `(barrier & mask) = 0` without breaking existing consumers.
 
-**Relationship to request `tenant_context`:** The PDP uses `context.tenant_context` from the request to determine the tenant context, then generates `in_tenant_subtree` predicates in the response. The predicate's `root_tenant_id` comes from either the request's `tenant_context.root_id` or PDP's resolution from token/subject. The request-side `barrier_mode` flows through to the predicate unchanged; the request-side `tenant_status` (caller intent: "only tenants with these statuses") is emitted on the predicate as `descendant_status` to match the SQL column it binds to in `tenant_closure`.
+**Relationship to request `tenant_context`:** The PDP uses `context.tenant_context` from the request to determine the tenant context, then generates `in_tenant_subtree` predicates in the response. The predicate's `root_tenant_id` comes from either the request's `tenant_context.root_id` or PDP's resolution from token/subject. A PDP issuing a native predicate must authorize the requested traversal and encode its effective barrier and status restrictions in `barrier_mode` and `descendant_status`. The SDK compiles the returned predicate fields. The tr-authz plugin instead uses Tenant Resolver for subtree expansion and returns explicit tenant IDs.
 
-#### 4. Group Membership Predicate (`type: "in_group"`)
+The SQL examples below use joins for readability. SecureORM emits an equivalent `gts_type_id IN (SELECT id FROM gts_type ...)` subquery. Native group queries qualify `resource_group_membership.gts_type_id` through RG's `gts_type.schema_id` using the exact canonical resource type. Group/resource UUID filters alone are insufficient. Native `in_group` requires both tables; `in_group_subtree` additionally requires `resource_group_closure`. See [native group opt-in and table prerequisites](../../toolkit_unified_system/06_authn_authz_secure_orm.md#defining-resource-types).
 
-Filters resources by explicit group membership. The `resource_property` specifies which property is used for group membership join.
+<a name="4-group-membership-predicate-type-in_group"></a>
+
+#### 4. Group Membership Predicate (`op: "in_group"`)
+
+Filters resources by explicit group membership. The `property` specifies which property is used for group membership join.
 
 **Schema:**
-- `type` (required): `"in_group"`
-- `resource_property` (required): Property for group membership join (typically `id`)
+- `op` (required): `"in_group"`
+- `property` (required): Property for group membership join; native SDK compilation requires `id`
 - `group_ids` (required): Array of group IDs
 
 ```jsonc
-{ "type": "in_group", "resource_property": "id", "group_ids": ["group1-uuid", "group2-uuid"] }
-// SQL: id IN (
-//   SELECT resource_id FROM resource_group_membership
-//   WHERE group_id IN ('group1-uuid', 'group2-uuid')
+{ "op": "in_group", "property": "id", "group_ids": ["group1-uuid", "group2-uuid"] }
+// SQL (membership predicate within the tenant-scoped branch):
+// CAST(id AS TEXT) IN (
+//   SELECT m.resource_id FROM resource_group_membership AS m
+//   JOIN gts_type AS t ON t.id = m.gts_type_id
+//   WHERE t.schema_id = :canonical_resource_type AND m.group_id IN ('group1-uuid', 'group2-uuid')
 // )
 ```
 
-#### 5. Group Subtree Predicate (`type: "in_group_subtree"`)
+<a name="5-group-subtree-predicate-type-in_group_subtree"></a>
 
-Filters resources by group subtree using the closure table. The `resource_property` specifies which property is used for group membership join.
+#### 5. Group Subtree Predicate (`op: "in_group_subtree"`)
+
+Filters resources by group subtree using the closure table. The `property` specifies which property is used for group membership join.
 
 **Schema:**
-- `type` (required): `"in_group_subtree"`
-- `resource_property` (required): Property for group membership join (typically `id`)
-- `root_group_id` (required): Root of group subtree
+- `op` (required): `"in_group_subtree"`
+- `property` (required): Property for group membership join; native SDK compilation requires `id`
+- `ancestor_ids` (required): Array of ancestor group UUIDs; membership in any descendant subtree matches. An empty array is a valid empty selection.
 
 ```jsonc
-{ "type": "in_group_subtree", "resource_property": "id", "root_group_id": "rootgroup-uuid" }
-// SQL: id IN (
-//   SELECT resource_id FROM resource_group_membership
-//   WHERE group_id IN (
+{ "op": "in_group_subtree", "property": "id", "ancestor_ids": ["rootgroup-uuid"] }
+// SQL (membership predicate within the tenant-scoped branch):
+// CAST(id AS TEXT) IN (
+//   SELECT m.resource_id FROM resource_group_membership AS m
+//   JOIN gts_type AS t ON t.id = m.gts_type_id
+//   WHERE t.schema_id = :canonical_resource_type AND m.group_id IN (
 //     SELECT descendant_id FROM resource_group_closure
-//     WHERE ancestor_id = 'rootgroup-uuid'
+//     WHERE ancestor_id IN ('rootgroup-uuid')
 //   )
 // )
 ```
 
 #### Group Tenant Scoping
 
-Resource groups are tenant-scoped. **PDP guarantees** that any `group_ids` (in `in_group` predicate) or `root_group_id` (in `in_group_subtree` predicate) returned in constraints belong to the same tenant as the request context.
+The PDP is responsible for verifying that the selected groups belong to the authorized tenant before issuing a group predicate. Native PEP enforcement checks resource membership and resource tenancy. The compiler requires an `eq`, `in`, or `in_tenant_subtree` predicate on `owner_tenant_id` in the same AND branch. Its SQL does not check the group's tenant.
 
-**Trust model:**
-- PEP trusts this guarantee and does not perform additional tenant validation on group IDs
-- PEP does not have access to group metadata (including `tenant_id`) — only `resource_group_membership` and `resource_group_closure` tables
-- AuthZ Resolver (PDP via plugin) has access to group hierarchy from vendor's Resource Group service and validates tenant ownership
-
-**Defense in depth:** All group-based constraints also include a tenant predicate on the **resource** (typically `eq` on `owner_tenant_id`). This ensures:
-1. PDP validates group belongs to correct tenant (group-level check)
-2. SQL filters resources by tenant (resource-level check)
+The current [tr-authz plugin](../../../gears/system/authz-resolver/plugins/tr-authz-plugin/src/domain/service.rs) treats `group_ids` and `ancestor_group_ids` in request properties as group selectors. It checks their UUIDs and the advertised capabilities and appends group predicates to its tenant scope. These plugin-specific selectors produce membership predicates on `id`. They do not satisfy the target contract for equality conditions in `resource.properties`. The plugin also does not look up group ownership. Deployments requiring that guarantee need a PDP that performs the ownership check.
 
 See [RESOURCE_GROUP_MODEL.md](./RESOURCE_GROUP_MODEL.md) for group data model details.
 
@@ -1290,7 +1312,7 @@ See [RESOURCE_GROUP_MODEL.md](./RESOURCE_GROUP_MODEL.md) for group data model de
 
 The PEP declares its supported properties in every authorization request via `context.supported_properties`. This field contains the list of property names that the PEP can map to SQL columns. The PDP uses this information to validate that returned constraints only reference properties the PEP can enforce.
 
-The `resource_property` in predicates corresponds to `resource.properties` in the request. Each gear (PEP) defines a mapping from property names to physical SQL columns. PDP uses property names — **it doesn't know the database schema**.
+A predicate names an advertised resource property. Each gear (PEP) defines a mapping from property names to physical SQL columns. PDP uses property names — **it doesn't know the database schema**.
 
 #### Standard Properties
 
@@ -1321,12 +1343,12 @@ Gears may also declare custom properties via `pep_prop(property_name = "column")
 
 | Predicate | SQL |
 |-----------|-----|
-| `{ "type": "eq", "resource_property": "topic_id", "value": "v" }` | `events.topic_id = 'v'` |
-| `{ "type": "eq", "resource_property": "owner_id", "value": "user123-uuid" }` | `events.creator_id = 'user123-uuid'` |
-| `{ "type": "in", "resource_property": "owner_tenant_id", "values": ["t1-uuid", "t2-uuid"] }` | `events.tenant_id IN ('t1-uuid', 't2-uuid')` |
-| `{ "type": "in_tenant_subtree", "resource_property": "owner_tenant_id", ... }` | `events.tenant_id IN (SELECT descendant_id FROM tenant_closure WHERE ...)` |
-| `{ "type": "in_group", "resource_property": "id", "group_ids": ["g1-uuid", "g2-uuid"] }` | `events.id IN (SELECT resource_id FROM resource_group_membership WHERE ...)` |
-| `{ "type": "in_group_subtree", "resource_property": "id", "root_group_id": "g1-uuid" }` | `events.id IN (SELECT ... FROM resource_group_membership WHERE group_id IN (SELECT ... FROM resource_group_closure ...))` |
+| `{ "op": "eq", "property": "topic_id", "value": "v" }` | `events.topic_id = 'v'` |
+| `{ "op": "eq", "property": "owner_id", "value": "user123-uuid" }` | `events.creator_id = 'user123-uuid'` |
+| `{ "op": "in", "property": "owner_tenant_id", "values": ["t1-uuid", "t2-uuid"] }` | `events.tenant_id IN ('t1-uuid', 't2-uuid')` |
+| `{ "op": "in_tenant_subtree", "property": "owner_tenant_id", ... }` | `events.tenant_id IN (SELECT descendant_id FROM tenant_closure WHERE ...)` |
+| `{ "op": "in_group", "property": "id", "group_ids": ["g1-uuid", "g2-uuid"] }` | `CAST(events.id AS TEXT) IN (SELECT ... FROM resource_group_membership JOIN gts_type ...)` |
+| `{ "op": "in_group_subtree", "property": "id", "ancestor_ids": ["g1-uuid"] }` | `CAST(events.id AS TEXT) IN (SELECT ... FROM resource_group_membership JOIN gts_type ... WHERE ... AND group_id IN (SELECT ... FROM resource_group_closure ...))` |
 
 ---
 
@@ -1336,17 +1358,14 @@ The PEP declares its capabilities in the request. This determines what predicate
 
 #### `require_constraints` Flag
 
-The `require_constraints` field (separate from capabilities array) controls PEP behavior when constraints are absent or the outer array is empty:
+The `require_constraints` field controls acceptance of absent or empty outer constraints; see the [PEP decision matrix](#pep-decision-matrix). It is separate from the capabilities array.
 
-| `require_constraints` | `decision: true` with absent or empty `constraints` |
-|-----------------------|----------------------------------------|
-| `true` | **deny** (constraints required but missing) |
-| `false` | **allow** (trust PDP decision) |
+**Choose by operation semantics, not by `action.name`:**
 
-**Usage:**
-- For LIST operations: typically `true` (constraints needed for SQL WHERE)
-- For CREATE operations: typically `true` (PEP validates INSERT against constraints — tenant isolation, ownership). It can be `false` if PEP trusts the PDP decision alone and skips local constraint validation (see S12 in [AUTHZ_USAGE_SCENARIOS.md](./AUTHZ_USAGE_SCENARIOS.md)).
-- For GET/UPDATE/DELETE: depends on whether PEP wants SQL-level enforcement or trusts PDP decision
+- Operations that read or change resource data MUST require constraints and enforce them at the point of access or effect. CRUD is one set of examples; a domain action such as `publish` is subject to the same rule.
+- A standalone decision-only gate may use `false` when no resource conditions need enforcement. Its permit does not authorize a subsequent unscoped resource read or mutation.
+
+Any returned constraints must be enforced or the response rejected, regardless of the flag.
 
 #### Capabilities Array
 
@@ -1355,17 +1374,17 @@ Capabilities declare what predicate types the PEP can enforce locally:
 | Capability | Enables Predicate Types | Required Projection |
 |------------|---------------------|---------------------|
 | `tenant_hierarchy` | `in_tenant_subtree` | `tenant_closure` |
-| `group_membership` | `in_group` | `resource_group_membership` (projection not recommended — see below) |
-| `group_hierarchy` | `in_group_subtree` | `resource_group_closure` + `resource_group_membership` (projection not recommended — see below) |
+| `group_membership` | `in_group` | `resource_group_membership` + `gts_type` (project only when needed — see below) |
+| `group_membership` + `group_hierarchy` | `in_group_subtree` | `resource_group_closure` + `resource_group_membership` + `gts_type` (project only when needed — see below) |
 
 **Progressive projection guidance:**
 - **Monolith** (single shared DB): no projections needed — PEP JOINs canonical tables directly.
-- **Microservices** (typical): project `resource_group` + `resource_group_closure` (small tables). Leave `resource_group_membership` to PDP capability degradation (→ `in` predicates with explicit IDs).
-- **Microservices** with membership filtering/pagination where the two-request pattern causes unacceptable N-request fan-out: project `resource_group_membership`. This table grows as `M_resources × N_groups_per_resource` and is expected to be **10× or more larger** than hierarchy tables (see [RG DESIGN §Storage Estimates](../../../gears/system/resource-group/docs/DESIGN.md#storage-estimates)) — only project after profiling confirms the need.
+- **Microservices** can omit local membership data when their PDP can resolve authorized resource IDs. A service that only traverses group hierarchy may project the smaller group and closure tables.
+- **Microservices** with membership filtering/pagination where the two-request pattern causes unacceptable N-request fan-out: project `resource_group_membership`. This table grows as `M_resources × N_groups_per_resource` and is expected to be **10× or more larger** than hierarchy tables (see [RG production scale](../../../gears/system/resource-group/docs/PRD.md#65-expected-production-scale)) — only project after profiling confirms the need.
 
 Do not add projections speculatively — each projection creates an additional database and synchronization load.
 
-`group_membership` and `group_hierarchy` capabilities are only available when the membership table is present in the PEP's database (RG gear, monolith with shared DB, or an explicit projection). Domain services that choose **not** to project the table rely on PDP capability degradation — PDP expands group memberships to explicit resource IDs and returns `in` predicates.
+A PEP needs the tables listed above, a resource descriptor with the exact canonical type and `id` property, and explicit native group opt-in. The SDK uses the descriptor to decide which group capabilities to advertise. The service must ensure the tables exist.
 
 **Predicate type availability by capability:**
 
@@ -1373,22 +1392,22 @@ Do not add projections speculatively — each projection creates an additional d
 |-------------|---------------------|
 | `eq`, `in` | (none — always available) |
 | `in_tenant_subtree` | `tenant_hierarchy` |
-| `in_group` | `group_membership` (requires membership table) |
-| `in_group_subtree` | `group_hierarchy` (requires membership table) |
+| `in_group` | `group_membership` (requires membership and type dictionary tables) |
+| `in_group_subtree` | `group_membership` + `group_hierarchy` (requires membership, type dictionary, and closure tables) |
 
 **Capability degradation**: If a PEP lacks a capability, the PDP must either:
 1. Expand the predicate to explicit IDs (may be large) — e.g., resolve group memberships into `in` predicate with explicit resource IDs
 2. Return `decision: false` if expansion is not feasible
 
-**Note:** For domain services (which lack the `resource_group_membership` table), PDP always degrades `in_group`/`in_group_subtree` to explicit `in` predicates. These predicates can only be handled natively when the membership table is present in the PEP's database.
+Neither bundled PDP expands group selectors to explicit resource IDs. The TR plugin denies them when the required native capability is missing. The static plugin denies requests with either selector.
 
 ---
 
 ### Table Schemas (Local Projections)
 
-These tables are maintained locally by CF/Gears (Tenant Resolver, Resource Group gear) and used by PEPs to execute constraint queries efficiently without calling back to the vendor platform.
+Account Management maintains the canonical tenant closure. Resource Group maintains the group hierarchy, memberships and type dictionary. A PEP can query these tables in a shared database or maintain local projections.
 
-**Projectable to domain services:** `tenant_closure`, `resource_group`, `resource_group_closure`, `resource_group_membership` (progressively — see [Capabilities and Projection Tables](#capabilities-and-projection-tables) for guidance on when to project each table).
+**Projectable to domain services:** `tenant_closure`, `resource_group`, `resource_group_closure`, `resource_group_membership`, and the `gts_type` identity dictionary required for native group predicates (progressively — see [Capabilities Array](#capabilities-array) for guidance on when to project each table).
 
 #### `tenant_closure`
 
@@ -1404,8 +1423,8 @@ Denormalized closure table for tenant hierarchy. Enables efficient subtree queri
 **Notes:**
 - Status is denormalized into closure for query simplicity (avoids JOIN). When a tenant's status changes, all rows where it is `descendant_id` are updated.
 - **Provisioning exclusion:** `tenant_closure` never contains a row for a tenant in `provisioning` state. Closure rows are inserted on the `provisioning → active` transition (end of the tenant-create saga) and removed on hard-deletion; the `0=provisioning` code is therefore not a legal value for `tenant_closure.descendant_status` even though it is legal for `tenants.status`. The database-level enforcement point is `CHECK (descendant_status IN (1, 2, 3))` on the `tenant_closure` table — see [`gears/system/account-management/docs/migration.sql`](../../../gears/system/account-management/docs/migration.sql) for the constraint and column COMMENT, and [AM ADR-0007 — Exclude Provisioning Tenants from `tenant_closure`](../../../gears/system/account-management/docs/ADR/0007-cpt-cf-account-management-adr-provisioning-excluded-from-closure.md) for the decision rationale. Consumers of `tenant_closure` (Tenant Resolver Plugin today, business-gear replicas later) therefore do **not** need a provisioning-specific filter — the invisibility is structural.
-- **Barrier semantics:** The `barrier` column is defined over the interval **`(ancestor, descendant]`** — the ancestor endpoint is excluded, the descendant endpoint is included (canonical definition in [TENANT_MODEL.md §Closure Table](./TENANT_MODEL.md#closure-table)). This means when T2 is self_managed, rows with `ancestor_id = T2` have `barrier = 0`, while rows with T2 on the path from another ancestor have `barrier = 1`.
-- The `barrier` column enables simple filtering: `barrier_mode: "all"` adds `AND barrier = 0`, `barrier_mode: "none"` omits the clause.
+- **Barrier semantics:** The `barrier` column is defined over the interval **`(ancestor, descendant]`** — the ancestor endpoint is excluded, the descendant endpoint is included (canonical definition in [TENANT_MODEL.md §Closure Table](./TENANT_MODEL.md#closure-table)). For a walk starting at T2, T2’s own barrier is excluded. A self-managed tenant farther down that path still sets the row’s barrier to 1.
+- The `barrier` column enables simple filtering: `barrier_mode: "respect"` adds `AND barrier = 0`, `barrier_mode: "ignore"` omits the clause.
 - Self-referential rows exist: each tenant has a row where `ancestor_id = descendant_id`.
 - **Predicate mapping:** `in_tenant_subtree` predicate compiles to SQL using this closure table.
 - **Future extensibility:** The `barrier` column is SMALLINT to allow future use as a bitmask for multiple barrier types (16 bits of headroom, portable across PostgreSQL and MySQL; e.g., `(barrier & mask) = 0` for selective enforcement).
@@ -1416,8 +1435,8 @@ SELECT * FROM events
 WHERE owner_tenant_id IN (
   SELECT descendant_id FROM tenant_closure
   WHERE ancestor_id = :root_tenant_id
-    AND barrier = 0  -- barrier_mode: "all"
-    AND descendant_status IN ('active', 'suspended')  -- tenant_status filter
+    AND barrier = 0  -- barrier_mode: "respect"
+    AND descendant_status IN (1, 2)  -- active, suspended
 )
 ```
 
@@ -1436,27 +1455,31 @@ Closure table for resource group hierarchy. Similar structure to tenant_closure 
 
 #### `resource_group_membership` (RG-owned — project only when needed)
 
-Association between resources and groups. A resource can belong to multiple groups. This table grows as `M_resources × N_groups_per_resource` and is expected to be **10× or more larger** than other projection tables — concrete estimates depend on vendor scale (see [RG DESIGN §Storage Estimates](../../../gears/system/resource-group/docs/DESIGN.md#storage-estimates)). Project only after profiling confirms the two-request pattern causes unacceptable latency — see [Capabilities -> Predicate Matrix](#capabilities---predicate-matrix) for the progressive projection strategy.
+Association between resources and groups. A resource can belong to multiple groups. This table grows as `M_resources × N_groups_per_resource` and is expected to be **10× or more larger** than other projection tables — concrete estimates depend on vendor scale (see [RG production scale](../../../gears/system/resource-group/docs/PRD.md#65-expected-production-scale)). Project only after profiling confirms the two-request pattern causes unacceptable latency — see [Capabilities -> Predicate Matrix](#capabilities---predicate-matrix) for the progressive projection strategy.
 
 | Column | Type | Nullable | Description |
 |--------|------|----------|-------------|
-| `resource_id` | UUID | No | ID of the resource (FK to resource table) |
-| `group_id` | UUID | No | ID of the group (FK to resource_group_closure) |
+| `resource_id` | TEXT | No | Opaque resource ID within the type identified by `gts_type_id` |
+| `gts_type_id` | SMALLINT | No | Key in RG's local identity dictionary, resolved by canonical `schema_id` |
+| `group_id` | UUID | No | ID of the group (FK to `resource_group.id`) |
 
 **Notes:**
-- The `resource_id` column joins with the resource table's ID column (configurable per gear, default `id`).
-- **Predicate mapping:** `in_group` and `in_group_subtree` predicates use this table for the resource-to-group join. These predicates are only executable within the RG gear; domain services receive degraded `in` predicates with explicit IDs instead.
+- Native group predicates compare the entity column mapped to `id`, cast to text, with `resource_group_membership.resource_id`.
+- **Predicate mapping:** `in_group` and `in_group_subtree` use this table and `gts_type` to qualify the resource-to-group join; subtree predicates also need closure. Any PEP with the local tables and explicit native group opt-in can enforce them. For PEPs without those prerequisites, the PDP must resolve the authorized resource IDs or deny the request.
 
 **Example query (in_group_subtree):**
 ```sql
 SELECT * FROM events
-WHERE id IN (
-  SELECT resource_id FROM resource_group_membership
-  WHERE group_id IN (
-    SELECT descendant_id FROM resource_group_closure
-    WHERE ancestor_id = :root_group_id
+WHERE tenant_id = :owner_tenant_id
+  AND CAST(id AS TEXT) IN (
+    SELECT m.resource_id FROM resource_group_membership AS m
+    JOIN gts_type AS t ON t.id = m.gts_type_id
+    WHERE t.schema_id = :canonical_resource_type
+      AND m.group_id IN (
+        SELECT descendant_id FROM resource_group_closure
+        WHERE ancestor_id IN (:ancestor_ids)
+      )
   )
-)
 ```
 
 ---
@@ -1519,13 +1542,13 @@ S2S `SecurityContext` flows through the standard AuthZ pipeline unchanged. The t
 
 These questions require further design work.
 
-1. **Batch evaluation optimization** - We support `/access/v1/evaluations` for batch requests. Should PDP optimize constraint generation when multiple evaluations share the same subject/context? Use cases: bulk operations, permission checks for UI rendering (checking permissions for 50 list items at once).
+1. **Batch evaluation** - Should the SDK expose batch evaluation and allow the PDP to share work across requests with the same subject and context? Use cases: bulk operations, permission checks for UI rendering (checking permissions for 50 list items at once).
 
 2. **Projection tables scalability** - Closure table approach works well for moderate scale, but may not perform for all scenarios. Key factors: tenant hierarchy depth (10+ levels), total object count (10M+), object distribution across tenants, and query patterns (root tenant queries are heavier than leaf). For large-scale deployments, vendors may need alternative strategies: denormalization (e.g., PostgreSQL ltree), materialized views, or sharding. This design doc describes the reference architecture; concrete optimization strategy depends on vendor's data model and scale requirements.
 
-3. **Local projections sync** - How to keep projection tables (`tenant_closure`, `resource_group_closure`) in sync with vendor's source of truth? Possible approaches: event-based sync (requires event broker), CDC-based (Debezium-like), or periodic polling via Resolver APIs. Each has trade-offs in consistency, latency, and infrastructure complexity. Note: `resource_group_membership` projection is not recommended (see [Capabilities and Projection Tables](#capabilities-and-projection-tables)) but is not forbidden if the use case demands it.
+3. **Local projections sync** - How to keep projection tables (`tenant_closure`, `resource_group_closure`) in sync with vendor's source of truth? Possible approaches: event-based sync (requires event broker), CDC-based (Debezium-like), or periodic polling via Resolver APIs. Each has trade-offs in consistency, latency, and infrastructure complexity. Note: `resource_group_membership` projection is not recommended (see [Capabilities Array](#capabilities-array)) but is not forbidden if the use case demands it.
 
-4. **Resource Group Service** - Should Gears have its own Resource Group Service, or is Resource Group Resolver (gear bridging to vendor's service) sufficient? Having a Gears-native service has pros and cons. Needs design.
+4. ~~**Resource Group Service**~~ — The [Resource Group gear](../../../gears/system/resource-group/) provides group hierarchy and membership operations.
 
 5. **Authorization decision caching** - See [Authorization Decision Caching](#authorization-decision-caching) section for detailed open questions: cache key structure, cache-control protocol, invalidation strategy, token expiration handling.
 
