@@ -67,7 +67,7 @@ pub enum BarrierMode {
 ///
 /// The enforcer sends group capabilities only for resources that opt in to
 /// native group predicates, have a canonical GTS type path, and support `id`.
-/// SecureORM uses that type path to qualify membership rows in the query.
+/// `SecureORM` uses that type path to qualify membership rows in the query.
 /// Without the required capabilities, a PDP enforcing a group restriction
 /// must expand it to explicit resource IDs or deny access.
 #[derive(
