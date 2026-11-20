@@ -239,8 +239,7 @@ impl BatchGetBody {
                     Ok(BatchGetItem {
                         entity_key: item.key.to_string(),
                         if_none_match: item
-                            .if_none_match
-                            .as_ref()
+                            .validator_for(&request.projection)
                             .map(entity_tag)
                             .transpose()?
                             .flatten(),

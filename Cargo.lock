@@ -5618,6 +5618,7 @@ dependencies = [
  "cf-gears-toolkit-http",
  "cf-gears-toolkit-security",
  "gts",
+ "lru",
  "parking_lot",
  "proptest",
  "rand 0.10.3",

@@ -15,8 +15,8 @@ use toolkit_db::{DBProvider, DbError};
 use toolkit_gts::{all_inventory_instances, all_inventory_type_schemas};
 use tracing::{debug, info};
 use types_registry_sdk::{
-    PlatformTypesRegistryApi, RegisterResult, RegisterSummary, TypesRegistryApi,
-    TypesRegistryClient,
+    CachedPlatformTypesRegistry, PlatformTypesRegistryApi, RegisterResult, RegisterSummary,
+    TypesRegistryApi, TypesRegistryClient,
 };
 
 use crate::config::{RegistryMode, TypesRegistryConfig};
@@ -84,9 +84,13 @@ impl Default for TypesRegistryGear {
     }
 }
 
-/// The seeded database-backed client, held in the `ClientHub` only while `init` wires the
-/// two contracts: the `provides` factories receive a context, not the gear.
-struct SeededClient(Arc<LocalClient>);
+/// The seeded database-backed client and the platform API's cache settings, held in the
+/// `ClientHub` only while `init` wires the two contracts: the `provides` factories receive
+/// a context, not the gear.
+struct SeededClient {
+    client: Arc<LocalClient>,
+    cache: types_registry_sdk::CacheSettings,
+}
 
 /// Register `value` in `hub` for the duration of `wire` only, and return what `wire`
 /// returns: the entry is gone afterwards, whether wiring succeeded, failed, panicked or
@@ -116,27 +120,32 @@ impl TypesRegistryGear {
         self.mode.get().copied().unwrap_or_default()
     }
 
-    fn seeded(ctx: &GearCtx) -> anyhow::Result<Arc<LocalClient>> {
-        let seeded = ctx.client_hub().get::<SeededClient>().map_err(|_| {
-            anyhow::anyhow!("types-registry wires its APIs only past the seed barrier")
-        })?;
-        Ok(Arc::clone(&seeded.0))
+    fn seeded(ctx: &GearCtx) -> anyhow::Result<Arc<SeededClient>> {
+        ctx.client_hub().get::<SeededClient>().map_err(|e| {
+            anyhow::Error::new(e)
+                .context("types-registry wires its APIs only past the seed barrier")
+        })
     }
 
-    /// `provides` factory: the platform API over the seeded database.
+    /// `provides` factory: the platform API over the seeded database, behind the SDK
+    /// client cache (SPEC §8.3). Every local consumer shares this one instance.
     fn seeded_platform_api(
         ctx: &GearCtx,
         _policies: Arc<PolicyStack>,
     ) -> anyhow::Result<Arc<dyn PlatformTypesRegistryApi>> {
-        Ok(Self::seeded(ctx)?)
+        let seeded = Self::seeded(ctx)?;
+        Ok(Arc::new(CachedPlatformTypesRegistry::new(
+            Arc::clone(&seeded.client) as Arc<dyn PlatformTypesRegistryApi>,
+            seeded.cache,
+        )))
     }
 
-    /// `provides` factory: the tenant API over the same seeded database.
+    /// `provides` factory: the tenant API over the same seeded database, uncached in P0.
     fn seeded_tenant_api(
         ctx: &GearCtx,
         _policies: Arc<PolicyStack>,
     ) -> anyhow::Result<Arc<dyn TypesRegistryApi>> {
-        Ok(Self::seeded(ctx)?)
+        Ok(Arc::clone(&Self::seeded(ctx)?.client) as Arc<dyn TypesRegistryApi>)
     }
 
     /// Publish both contracts over `registry`, through the `provides` wiring.
@@ -144,9 +153,13 @@ impl TypesRegistryGear {
         &self,
         ctx: &GearCtx,
         registry: &Arc<RegistryService>,
+        cache: types_registry_sdk::CacheSettings,
     ) -> anyhow::Result<()> {
         refuse_remote_wiring(ctx.config_provider(), ctx.gear_name())?;
-        let seeded = SeededClient(Arc::new(LocalClient::new(Arc::clone(registry))));
+        let seeded = SeededClient {
+            client: Arc::new(LocalClient::new(Arc::clone(registry))),
+            cache,
+        };
         held_while(&ctx.client_hub(), Arc::new(seeded), async {
             self.wire_platform_types_registry_api(ctx).await?;
             self.wire_types_registry_api(ctx).await
@@ -256,10 +269,13 @@ impl Gear for TypesRegistryGear {
 
         debug!(
             "Loaded types_registry config: entity_id_fields={:?}, schema_id_fields={:?}, \
+             local_client.cache={{freshness_window={:?}, store_bound={}}}, \
              local_client.cache.type_schemas={{capacity={}, ttl={:?}}}, \
              local_client.cache.instances={{capacity={}, ttl={:?}}}",
             cfg.entity_id_fields,
             cfg.schema_id_fields,
+            cfg.local_client.cache.freshness_window,
+            cfg.local_client.cache.store_bound,
             cfg.local_client.cache.type_schemas.capacity,
             cfg.local_client.cache.type_schemas.ttl,
             cfg.local_client.cache.instances.capacity,
@@ -269,6 +285,7 @@ impl Gear for TypesRegistryGear {
         let gts_config = cfg.to_gts_config();
         let static_entities = cfg.entities.clone();
         let cfg_for_registry = cfg.clone();
+        let client_cache = cfg.local_client.cache.client_cache();
         let type_schemas_cache_cfg = cfg.local_client.cache.type_schemas.to_cache_config();
         let instances_cache_cfg = cfg.local_client.cache.instances.to_cache_config();
 
@@ -383,7 +400,7 @@ impl Gear for TypesRegistryGear {
         // Only past the seed barrier: a host without a database, or one whose seed
         // failed, publishes neither, and a resolution fails rather than falling back.
         if let Some(registry) = self.registry.get() {
-            self.publish_apis(ctx, registry).await?;
+            self.publish_apis(ctx, registry, client_cache).await?;
             info!("types_registry published the platform and tenant APIs in ClientHub");
         }
 

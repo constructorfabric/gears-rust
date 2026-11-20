@@ -262,14 +262,46 @@ pub struct LocalClientSettings {
     pub cache: CacheSettings,
 }
 
-/// Per-kind cache settings.
-#[derive(Debug, Clone, Deserialize, Default)]
+/// Cache settings: the SDK client cache over the platform API published here, and the
+/// legacy client's per-kind caches until T38 removes them.
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CacheSettings {
-    /// Cache settings for the type-schema cache.
+    /// How long the platform API's client cache serves a confirmed entry before it
+    /// revalidates (SPEC §8.3). `0s` revalidates every read.
+    #[serde(with = "toolkit_utils::humantime_serde")]
+    pub freshness_window: Duration,
+    /// Bytes of snapshots the platform API's client cache holds, evicted
+    /// least-recently-used, e.g. `64MB`.
+    pub store_bound: ByteSize,
+    /// The legacy client's type-schema cache.
     pub type_schemas: SingleCacheSettings,
-    /// Cache settings for the instance cache.
+    /// The legacy client's instance cache.
     pub instances: SingleCacheSettings,
+}
+
+impl Default for CacheSettings {
+    fn default() -> Self {
+        Self {
+            freshness_window: types_registry_sdk::CacheSettings::DEFAULT_FRESHNESS_WINDOW,
+            store_bound: ByteSize::from_bytes(
+                types_registry_sdk::CacheSettings::DEFAULT_STORE_BOUND,
+            ),
+            type_schemas: SingleCacheSettings::default(),
+            instances: SingleCacheSettings::default(),
+        }
+    }
+}
+
+impl CacheSettings {
+    /// The SDK client cache's settings.
+    #[must_use]
+    pub fn client_cache(&self) -> types_registry_sdk::CacheSettings {
+        types_registry_sdk::CacheSettings {
+            freshness_window: self.freshness_window,
+            store_bound: self.store_bound.bytes(),
+        }
+    }
 }
 
 /// Settings for a single LRU cache.

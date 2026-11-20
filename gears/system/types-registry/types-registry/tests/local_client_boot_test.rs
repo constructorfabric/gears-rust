@@ -90,6 +90,12 @@ enum Behavior {
     Observe,
     /// Read every expected seed the moment the platform API is resolvable.
     Verify(Vec<(GtsId, Value)>),
+    /// Read the configured base through both APIs around a direct database change;
+    /// `cached`: whether the platform read is expected to keep its snapshot.
+    ProbeCache {
+        database: std::path::PathBuf,
+        cached: bool,
+    },
     /// Publish owned documents through the platform API.
     Publish {
         declarations: Vec<(GtsId, Value)>,
@@ -109,6 +115,9 @@ impl Consumer {
         match &self.behavior {
             Behavior::Observe => Ok(None),
             Behavior::Verify(expected) => verify(ctx, expected).await.map(|()| None),
+            Behavior::ProbeCache { database, cached } => {
+                probe_cache(ctx, database, *cached).await.map(|()| None)
+            }
             Behavior::Publish {
                 declarations,
                 version,
@@ -253,6 +262,94 @@ async fn verify(ctx: &GearCtx, expected: &[(GtsId, Value)]) -> Result<(), String
         Ok(())
     } else {
         Err(format!("not seeded: {}", problems.join("; ")))
+    }
+}
+
+/// The published platform API is cached (T36) and the tenant API is not: both are warmed,
+/// then the row changes behind them. The ordinary platform read keeps its snapshot when
+/// `cached` (inside the window, within the bound) and sees the change otherwise; the
+/// ordinary tenant read sees it at once; a `fresh` platform read sees it.
+async fn probe_cache(
+    ctx: &GearCtx,
+    database: &std::path::Path,
+    cached: bool,
+) -> Result<(), String> {
+    let hub = ctx.client_hub();
+    let platform = hub
+        .get::<dyn PlatformTypesRegistryApi>()
+        .map_err(|e| format!("resolve the platform API: {e}"))?;
+    let tenant = hub
+        .get::<dyn TypesRegistryApi>()
+        .map_err(|e| format!("resolve the tenant API: {e}"))?;
+    let key = EntityKey::GtsId(GtsId::try_new(BASE).unwrap());
+    let request = |fresh: bool| BatchGetEntitiesRequest {
+        items: vec![key.clone().into()],
+        projection: Projection::Default,
+        fresh,
+    };
+    let version = |mut response: types_registry_sdk::BatchGetEntitiesResponse| match response
+        .0
+        .remove(&key)
+    {
+        Some(EntityLookup::Found { entity, .. }) => match entity.origin {
+            Some(Origin::Managed {
+                resource_version, ..
+            }) => Ok(resource_version),
+            _ => Err("no managed origin".to_owned()),
+        },
+        other => Err(format!("{other:?}")),
+    };
+    let platform = &platform;
+    let request = &request;
+    let version = &version;
+    let platform_read = |fresh: bool| async move {
+        platform
+            .batch_get_entities(&PlatformSecurityContext::outbound_marker(), request(fresh))
+            .await
+            .map_err(|e| format!("platform read: {e}"))
+            .and_then(version)
+    };
+
+    let tenant_read = || async {
+        tenant
+            .batch_get_entities(&SecurityContext::anonymous(), request(false))
+            .await
+            .map_err(|e| format!("tenant read: {e}"))
+            .and_then(version)
+    };
+
+    let before = platform_read(false).await?;
+    if tenant_read().await? != before {
+        return Err("the two APIs disagree before the change".to_owned());
+    }
+    let db = Database::connect(format!("sqlite://{}?mode=rw", database.display()))
+        .await
+        .map_err(|e| format!("open the database: {e}"))?;
+    db.execute_raw(Statement::from_string(
+        db.get_database_backend(),
+        format!(
+            "UPDATE types_registry__entity SET resource_version = resource_version + 1 \
+             WHERE gts_id = '{BASE}'"
+        ),
+    ))
+    .await
+    .map_err(|e| format!("change the row: {e}"))?;
+
+    let windowed = platform_read(false).await?;
+    let tenant_after = tenant_read().await?;
+    let fresh = platform_read(true).await?;
+    let seen = (windowed, tenant_after, fresh);
+    let expected = (
+        if cached { before } else { before + 1 },
+        before + 1,
+        before + 1,
+    );
+    if seen == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "expected (platform, tenant, fresh) = {expected:?}, saw {seen:?}"
+        ))
     }
 }
 
@@ -765,4 +862,47 @@ async fn the_documented_example_publishes_and_restarts() {
     let report = published(restart.run().await);
     assert!(report.up_to_date, "an equal restart submits nothing");
     assert_eq!(report.resource_version, 1);
+}
+
+async fn probe(registry_config: Value, cached: bool) {
+    let dir = common::TestDir::new("tr-boot-cache");
+    let mut host = Host::new(&dir);
+    host.registry_config = registry_config;
+    host.behavior = Behavior::ProbeCache {
+        database: dir.path().join("boot.db"),
+        cached,
+    };
+    let outcome = host.run().await;
+    outcome.boot.expect("a healthy boot");
+    outcome
+        .report
+        .expect("the consumer ran")
+        .expect("the probe held");
+}
+
+#[tokio::test]
+async fn the_published_platform_api_is_cached_and_the_tenant_api_is_not() {
+    probe(json!({ "entities": [base()] }), true).await;
+}
+
+/// Both client-cache keys reach the published client: a zero window and a bound too
+/// small for any snapshot each leave the platform read uncached.
+#[tokio::test]
+async fn the_client_cache_keys_configure_the_published_platform_api() {
+    probe(
+        json!({
+            "entities": [base()],
+            "local_client": { "cache": { "freshness_window": "0s" } },
+        }),
+        false,
+    )
+    .await;
+    probe(
+        json!({
+            "entities": [base()],
+            "local_client": { "cache": { "store_bound": 1 } },
+        }),
+        false,
+    )
+    .await;
 }

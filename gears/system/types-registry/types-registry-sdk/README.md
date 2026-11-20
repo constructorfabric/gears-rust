@@ -323,7 +323,16 @@ in `ClientHub`. Missing database or failed seeding leaves neither registered;
 - `PublisherContext` is required but only forwarded/enforced in T44/T45;
   mixed-version publishers have no earlier guarantee.
 - Local clients trust both context types without validation or tenant scope (C2/C6).
-- Reads hit the database until the SDK cache (T36).
+- Platform reads go through the SDK client cache (`CachedPlatformTypesRegistry`): the
+  host's published platform API and the platform REST resolving client both carry it.
+  It keeps one entry per entity, holding every field read under one validator: a read
+  the entry covers is answered from it with exactly the selected fields, an answer under
+  the same validator merges into it and one under a new validator replaces it.
+  A confirmed entry is served for `freshness_window` (30 s by default), then revalidated
+  in one conditional batch; `fresh` revalidates at once. A terminal successful outcome
+  this client observes drops the affected entries; a change it did not observe can be
+  served until the window ends. `NotFound`, failed reads, discovery pages and
+  operations are never cached, and the tenant API is uncached.
 - Legacy and new catalogues share seeds but no later writes until T38. Dependencies
   registered only through legacy cannot support publication through the new API.
 - Shared-database outbox polling can delay admission by one minute; keep
@@ -375,6 +384,46 @@ Single and batch typed read helpers take `ReadOptions`. Its default uses
 and apply `fresh` to every request, including each chunk of a batch read. `fresh`
 controls the client cache and is not sent on the wire. On a client without a
 cache, this flag has no effect.
+
+### Conditional reads
+
+A validator names an entity's state and is the same under every projection, so
+`Unchanged` says that what you hold is current, not which fields it has. A `Condition`
+binds a validator to its entity and to the fields held under it; take it from the answer
+you hold, never rebuild it from the next request's projection:
+
+```rust,no_run
+use toolkit_security::PlatformSecurityContext;
+use types_registry_sdk::{
+    BatchGetEntitiesRequest, BatchGetItem, EntityKey, EntityLookup, PlatformTypesRegistryApi,
+};
+
+async fn refresh(
+    registry: &dyn PlatformTypesRegistryApi,
+    ctx: &PlatformSecurityContext,
+    key: EntityKey,
+    held: &EntityLookup,
+) -> anyhow::Result<()> {
+    let mut item = BatchGetItem::new(key.clone());
+    // The fields and the entity are read off the snapshot held, not the next request.
+    if let Some(condition) = held.condition() {
+        item = item.with_if_none_match(condition);
+    }
+    let answer = registry
+        .batch_get_entities(ctx, BatchGetEntitiesRequest::new([item]))
+        .await?;
+    match &answer.0[&key] {
+        EntityLookup::Unchanged { .. } => { /* `held` is still current */ }
+        EntityLookup::Found { .. } => { /* hold this answer instead */ }
+        _ => { /* absent, or a future variant */ }
+    }
+    Ok(())
+}
+```
+
+Every transport sends the condition only for the same entity (either key form) and a
+projection its fields cover; otherwise the read goes unconditionally and is answered in
+full. `Condition::new(key, etag, covers)` is for adapters that track coverage themselves.
 
 `resolve_type_uuid` / `resolve_instance_uuid` map registered IDs to Registry
 References; `resolve_type_id` / `resolve_instance_id` reverse them. Plural forms

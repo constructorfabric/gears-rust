@@ -1,10 +1,11 @@
 //! Directory-resolving wrappers over both REST clients, as `#[toolkit::consumes]` registers
 //! them for a consumer the registry is not linked into (SPEC §8.4).
 //!
-//! Each call resolves the registry anew and rebuilds the client only when the endpoint
-//! changes (`DirectoryResolvingClient`). While the directory has no live registry, or cannot
-//! answer, a call is a canonical `ServiceUnavailable`; nothing falls back to another
-//! implementation.
+//! Each call that reaches the transport resolves the registry anew and rebuilds the client
+//! only when the endpoint changes (`DirectoryResolvingClient`). While the directory has no
+//! live registry, or cannot answer, such a call is a canonical `ServiceUnavailable`; nothing
+//! falls back to another implementation. A platform read the client cache answers inside
+//! its window does not reach the transport.
 
 use std::sync::Arc;
 
@@ -18,6 +19,7 @@ use uuid::Uuid;
 
 use super::client::TypesRegistryApiRestClient;
 use super::platform_client::PlatformTypesRegistryApiRestClient;
+use crate::cache::{CacheSettings, CachedPlatformTypesRegistry};
 use crate::contract::{PlatformTypesRegistryApi, TypesRegistryApi};
 use crate::models::{
     BatchGetEntitiesRequest, BatchGetEntitiesResponse, DeleteEntitiesRequest, DeletionOperation,
@@ -25,16 +27,85 @@ use crate::models::{
     RegistrationOperation,
 };
 
-/// [`PlatformTypesRegistryApi`] on whichever registry the directory names. The tuning's
-/// internal-token source rides on every client built, so each attempt carries the token.
+/// [`PlatformTypesRegistryApi`] on whichever registry the directory names, behind the SDK
+/// client cache (SPEC §8.3) with [`CacheSettings::default`]: one cache for the logical
+/// client, above endpoint resolution, so a read the cache answers resolves nothing and
+/// replicas the directory rotates between share it. The tuning's internal-token source
+/// rides on every client built, so each attempt carries the token.
+///
+/// `#[toolkit::consumes]` builds this type with no cache settings of its own; a consumer
+/// needing others composes [`CachedPlatformTypesRegistry`] over its own client.
 pub struct PlatformTypesRegistryApiRestResolvingClient {
-    inner: DirectoryResolvingClient<PlatformTypesRegistryApiRestClient>,
+    inner: CachedPlatformTypesRegistry,
 }
 
 impl PlatformTypesRegistryApiRestResolvingClient {
-    /// Resolve `from_gear` through `resolver` on every call.
+    /// Resolve `from_gear` through `resolver` on every call the cache does not answer.
     #[must_use]
     pub fn new(
+        resolver: Arc<dyn EndpointResolver>,
+        from_gear: impl Into<String>,
+        tuning: ClientTuning,
+    ) -> Self {
+        let resolving = PlatformResolving::new(resolver, from_gear, tuning);
+        Self {
+            inner: CachedPlatformTypesRegistry::new(Arc::new(resolving), CacheSettings::default()),
+        }
+    }
+}
+
+#[async_trait]
+impl PlatformTypesRegistryApi for PlatformTypesRegistryApiRestResolvingClient {
+    async fn batch_get_entities(
+        &self,
+        ctx: &PlatformSecurityContext,
+        request: BatchGetEntitiesRequest,
+    ) -> Result<BatchGetEntitiesResponse, CanonicalError> {
+        self.inner.batch_get_entities(ctx, request).await
+    }
+
+    async fn list_entities(
+        &self,
+        ctx: &PlatformSecurityContext,
+        request: ListEntitiesRequest,
+    ) -> Result<ListEntitiesResponse, CanonicalError> {
+        self.inner.list_entities(ctx, request).await
+    }
+
+    async fn register_entities(
+        &self,
+        ctx: &PlatformSecurityContext,
+        key: IdempotencyKey,
+        request: RegisterEntitiesRequest,
+    ) -> Result<RegistrationOperation, CanonicalError> {
+        self.inner.register_entities(ctx, key, request).await
+    }
+
+    async fn delete_entities(
+        &self,
+        ctx: &PlatformSecurityContext,
+        key: IdempotencyKey,
+        request: DeleteEntitiesRequest,
+    ) -> Result<DeletionOperation, CanonicalError> {
+        self.inner.delete_entities(ctx, key, request).await
+    }
+
+    async fn get_operation(
+        &self,
+        ctx: &PlatformSecurityContext,
+        operation_id: Uuid,
+    ) -> Result<Operation, CanonicalError> {
+        self.inner.get_operation(ctx, operation_id).await
+    }
+}
+
+/// The uncached platform client on whichever registry the directory names.
+struct PlatformResolving {
+    inner: DirectoryResolvingClient<PlatformTypesRegistryApiRestClient>,
+}
+
+impl PlatformResolving {
+    fn new(
         resolver: Arc<dyn EndpointResolver>,
         from_gear: impl Into<String>,
         tuning: ClientTuning,
@@ -51,7 +122,7 @@ impl PlatformTypesRegistryApiRestResolvingClient {
 }
 
 #[async_trait]
-impl PlatformTypesRegistryApi for PlatformTypesRegistryApiRestResolvingClient {
+impl PlatformTypesRegistryApi for PlatformResolving {
     async fn batch_get_entities(
         &self,
         ctx: &PlatformSecurityContext,

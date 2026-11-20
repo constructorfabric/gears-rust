@@ -636,7 +636,7 @@ impl RegistryService {
                     rows.sort_by_key(|row| row.id);
                     rows.dedup_by_key(|row| row.id);
 
-                    let etags = validators(&*stores, tx, &scope, &rows, selection).await?;
+                    let etags = validators(&*stores, tx, &scope, &rows).await?;
                     let answers = answer(requested, &rows, &etags);
                     let found: std::collections::BTreeSet<i64> = answers
                         .iter()
@@ -779,7 +779,6 @@ async fn validators(
     tx: &toolkit_db::DbTx<'_>,
     scope: &AccessScope,
     rows: &[EntityRow],
-    selection: FieldSelection,
 ) -> Result<BTreeMap<i64, Validator>, ServiceError> {
     let type_ids = ids_of(rows, EntityKind::TypeSchema);
     let fingerprints: BTreeMap<i64, Vec<u8>> = stores
@@ -799,7 +798,7 @@ async fn validators(
                         .as_slice(),
                 ),
             };
-            let etag = Validator::compute(row.resource_version, fingerprint, selection);
+            let etag = Validator::compute(row.resource_version, fingerprint);
             Ok((row.id, etag))
         })
         .collect()

@@ -1027,20 +1027,16 @@ fn snapshot(
     })
 }
 
-/// Bind the token to the projection and resolved documents, including parent changes.
-fn validator(
-    stored: &Stored,
-    fields: &FieldSelection,
-    resolution: Option<&Resolution>,
-) -> Validator {
+/// Bind the token to the entity's state: its revision and resolved documents, including
+/// parent changes. Like the registry's, it is the same under every projection and
+/// carries no identity.
+fn validator(stored: &Stored, resolution: Option<&Resolution>) -> Validator {
     let resolution = resolution.map(|r| {
         let mut hasher = DefaultHasher::new();
         hasher.write(format!("{r:?}").as_bytes());
         hasher.finish()
     });
-    Validator::from_bytes(
-        format!("v{}:{fields:?}:{resolution:?}", stored.resource_version).into_bytes(),
-    )
+    Validator::from_bytes(format!("v{}:{resolution:?}", stored.resource_version).into_bytes())
 }
 
 /// Bind cursors to filters and projection, allowing page-size changes.
@@ -1108,8 +1104,8 @@ impl MockTypesRegistry {
             let resolution = is_type(&id)
                 .then(|| resolve_and_freeze(&mut state.resolver, &mut state.entities, &id));
             let stored = state.entities.get(&id).expect("found above");
-            let etag = validator(stored, &fields, resolution.as_ref());
-            let lookup = if item.if_none_match.as_ref() == Some(&etag) {
+            let etag = validator(stored, resolution.as_ref());
+            let lookup = if item.validator_for(&request.projection) == Some(&etag) {
                 EntityLookup::Unchanged { etag }
             } else {
                 let mut snapshot = snapshot(&id, stored, &fields, resolution.as_ref())?;

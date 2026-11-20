@@ -1010,9 +1010,9 @@ Deletion has two spellings of one operation. `:batchDelete` is a body-based cust
 
 ##### Conditional reads
 
-For one read, the validator is both HTTP `ETag` and SDK `Validator`; matching `If-None-Match` returns a bodyless `304` **carrying the `ETag`**, per [RFC 9110 §15.4.5](https://www.rfc-editor.org/rfc/rfc9110#name-304-not-modified) and for the same reason the batch returns one on `unchanged`. Batch validators travel beside individual keys, in each item's `if_none_match`, because one header cannot represent them; each result may be `unchanged`, and the response remains `200` even when all are unchanged. The two body fields are the two header names, lowercased — `if_none_match` going out and `etag` coming back — so a reader who knows the single-read surface already knows this one, and a caller copying a value between them cannot misread which direction it travels. An `If-None-Match` **header** on `:batchGet` is refused rather than ignored, because a caller that sent one believes the batch is conditional and it is not. A validator is scoped to its projection, detected by recomputation rather than stored reader state.
+For one read, the validator is both HTTP `ETag` and SDK `Validator`; matching `If-None-Match` returns a bodyless `304` **carrying the `ETag`**, per [RFC 9110 §15.4.5](https://www.rfc-editor.org/rfc/rfc9110#name-304-not-modified) and for the same reason the batch returns one on `unchanged`. Batch validators travel beside individual keys, in each item's `if_none_match`, because one header cannot represent them; each result may be `unchanged`, and the response remains `200` even when all are unchanged. The two body fields are the two header names, lowercased — `if_none_match` going out and `etag` coming back — so a reader who knows the single-read surface already knows this one, and a caller copying a value between them cannot misread which direction it travels. An `If-None-Match` **header** on `:batchGet` is refused rather than ignored, because a caller that sent one believes the batch is conditional and it is not. A validator names the entity's state and is the same under every projection, detected by recomputation rather than stored reader state. `unchanged` therefore says that what the client holds is current, not which fields it holds: a client sends a validator only for a read whose projection the representation it holds covers. The SDK enforces this with a typed condition bound to its entity and the fields it covers; a raw HTTP client owns it, as it owns sending an `If-None-Match` only with a URI it holds a response for.
 
-**Where a client gets the validator it later sends back.** The loop closes inside each exact-read surface and never across two of them:
+**Where a client gets the validator it later sends back.** Both exact-read surfaces hand out and take back the same validator for one key, so it may cross between them — from a `GET` to a `:batchGet` item or back — for the same entity, under a `$select` the held representation covers:
 
 | Surface | Hands the validator out as | Takes it back as |
 |---|---|---|
@@ -1033,18 +1033,17 @@ Per `cpt-cf-types-registry-principle-derive-not-store`, validators are computed 
 | `entity.resource_version` | ✓ | — |
 | `type_schema.resolution_fingerprint` | ✓, Type Schemas only | — |
 | subject visibility-chain version | ✓, tenant plane only | ✓, tenant plane only |
-| Context Tenant availability-chain version | ✓, when availability is selected | ✓, when availability is selected |
+| Context Tenant availability-chain version | ✓, whenever the read names a Context Tenant | ✓, whenever the read names a Context Tenant |
 | routing generation | — | ✓ |
 | `external_revision` | — | ✓, verbatim |
-| normalized projection | ✓ | ✓ |
 
-Routing generation appears only externally: claim changes cannot affect managed results under ADR-0011, but must invalidate tokens tied to an old source. `resolution_fingerprint` appears only for Type Schemas, because Instances have no derived form. When subject and Context Tenant are the same, one chain version fills both roles; a platform read has no subject visibility chain and includes a Context Tenant chain only when it requests availability.
+Routing generation appears only externally: claim changes cannot affect managed results under ADR-0011, but must invalidate tokens tied to an old source. `resolution_fingerprint` appears only for Type Schemas, because Instances have no derived form. When subject and Context Tenant are the same, one chain version fills both roles; a platform read has no subject visibility chain and includes a Context Tenant chain whenever it names a Context Tenant. That chain enters the validator whether or not availability is selected, because one state has one validator under every `$select` of one scope (see *Projection is not a validator input*): a narrow read's validator must also answer for a wider read that selects availability.
 
 The plugin token must be scoped to `(entity, tenant)` and change whenever any source-owned response field that affects the platform-visible result changes: canonical content, the effective artifacts of a Type Schema, source lifecycle, ownership scope, or source-owned tenant enablement. It need not change for platform-owned availability or visibility, which the chain-version inputs above cover; equal tokens under equal platform inputs therefore identify an equal platform-visible result. A plugin unable to guarantee this must always answer conditional reads as changed. The registry cannot verify that source-owned state, so it delegates the comparison.
 
-##### Projection as a validator input
+##### Projection is not a validator input
 
-Projection prevents a narrow `$select` token from producing false `unchanged` for a wider representation, consistent with [RFC 9110 §8.8.3](https://www.rfc-editor.org/rfc/rfc9110#name-etag). The digest uses the normalized field set, not the query string: field order is irrelevant, and absent `$select` equals an explicit default set. A Type Schema's fingerprint enters every projection, so a dependency refresh can also cost an extra transfer for `$select=content`.
+Every projection of one state carries one validator, so a client cache keeps one entry per entity, merges answers read under the same validator and confirms all of them with one conditional read. This is RFC 9110-correct: an `ETag` is compared only for the target resource, `$select` makes each projection its own URI, and the validator changes whenever the bytes of any projection change. The converse need not hold: a dependency refresh moves a Type Schema's validator even when its `content` is byte-identical, which costs a transfer, never a false `unchanged`. The cost is that a validator no longer tells the registry which fields its holder has: the client sends one only for a read its held representation covers (see *Conditional reads*). A validator also carries no identity — two entities in the same state may share one — so it is compared only with the current validator of the key it accompanies, and the SDK's condition is bound to its entity. A Type Schema's fingerprint enters every projection, so a dependency refresh can also cost an extra transfer for `$select=content`.
 
 ##### Wire form
 
@@ -1285,7 +1284,7 @@ The single-entity spelling: one item's worth of `:batchDelete`, with the item sp
 
 This spelling carries no `publisher`, so it is a tenant-plane route only; on the platform plane a deletion goes through `:batchDelete`.
 
-**The precondition is not `If-Match`,** even though one entity would fit in one header. `If-None-Match` on the read of this same resource already carries a *validator* — projection-scoped, and including `resolution_fingerprint`, which the caller's write precondition deliberately excludes (the worker's drift check includes it). Putting a `resource_version` in `If-Match` would give one resource two unrelated token vocabularies in two conditional headers, and a caller that reasonably fed the `ETag` back into `If-Match` would be refused for a reason the shape does not explain. So `If-Match` is not merely unused here: it is **refused** if sent on either deletion route, rather than ignored, because a caller that sent one believes the request is conditional in the RFC 9110 §13.1.1 sense — and it is not, per the next paragraph. `expected_resource_version` is the same name the batch body uses, taken from the entity body rather than from any response header.
+**The precondition is not `If-Match`,** even though one entity would fit in one header. `If-None-Match` on the read of this same resource already carries a *validator* — naming the entity's state under every projection, and including `resolution_fingerprint`, which the caller's write precondition deliberately excludes (the worker's drift check includes it). Putting a `resource_version` in `If-Match` would give one resource two unrelated token vocabularies in two conditional headers, and a caller that reasonably fed the `ETag` back into `If-Match` would be refused for a reason the shape does not explain. So `If-Match` is not merely unused here: it is **refused** if sent on either deletion route, rather than ignored, because a caller that sent one believes the request is conditional in the RFC 9110 §13.1.1 sense — and it is not, per the next paragraph. `expected_resource_version` is the same name the batch body uses, taken from the entity body rather than from any response header.
 
 **A precondition failure stays asynchronous.** The split is by mistake class, not by route:
 
@@ -1444,9 +1443,12 @@ pub struct BatchGetItem {
     /// One value, one field — `EntityKey` is an enum, and the wire spells it
     /// as the single string `entity_key`, classified exactly as the path segment is.
     pub key: EntityKey,
-    /// A validator makes the read conditional for that key alone; `None`
-    /// reads it unconditionally.
-    pub if_none_match: Option<Validator>,
+    /// Makes the read conditional for that key alone, where the condition
+    /// applies; `None` reads it unconditionally. A `Condition` binds a
+    /// validator to its entity and to the fields held under it, ordinarily
+    /// taken from the answer itself (`EntityLookup::condition`). Transports
+    /// send it only for the same entity and a projection it covers.
+    pub if_none_match: Option<Condition>,
 }
 
 /// Default yields the service default set; Select yields exactly its fields.
@@ -1460,8 +1462,8 @@ pub enum Projection {
 pub struct BatchGetEntitiesResponse(pub HashMap<EntityKey, EntityLookup>);
 
 pub enum EntityLookup {
-    /// `etag` is metadata outside `$select`, but is scoped to the normalized
-    /// projection and therefore changes when that projection does. Named for
+    /// `etag` is metadata outside `$select`; it names the entity's state and is
+    /// the same under every projection. Named for
     /// the header it is carried in rather than for its `Validator` type, so
     /// that it pairs by sight with `BatchGetItem::if_none_match`.
     Found { snapshot: Box<EntitySnapshot>, etag: Validator },
@@ -1743,7 +1745,7 @@ Kind narrowing costs no round trip: the kind is the trailing `~` of the identifi
 
 The P1 SDK cache required by `cpt-cf-types-registry-fr-client-cache` lives in each consumer, not the registry. Server-side and replica caches validate against committed tokens before use. The SDK cache instead makes the explicit bounded-freshness trade below and offers authoritative reads through `fresh` or a zero window.
 
-Each client instance stores entries by `(EntityKey, visibility context, Context Tenant, normalized projection)`, containing snapshot, validator, and last-confirmed instant. Plane is implicit in the client instance. On the tenant plane, visibility context is the subject tenant from `SecurityContext`; on the platform plane it is a fixed unrestricted marker. Principal identity is otherwise absent because results are not grant-filtered: a `read` grant is gear-wide, so two subjects of one tenant that both hold it see identical content. The consequence is that this cache is not an authorization boundary — within the freshness window a subject whose grant was revoked may still be served an entry an authorized one populated, which is accepted because the consumer process legitimately holds that content already and a strict caller uses `fresh`. Keying by subject instead would multiply entries per end user for the same bytes. This prevents a shared client instance from serving a snapshot visible to one tenant subject to another subject that names the same Context Tenant.
+Each client instance stores one entry per `(entity, visibility context, Context Tenant)`, containing the snapshot, the fields it covers, its validator, and the last-confirmed instant. A read is answered from the entry only when the entry covers its normalized projection, and is cut down to exactly that projection. An answer under the entry's validator is merged into the entry, unless the two together would not fit the store, in which case the entry is kept as it was; an answer under a new validator replaces it, and one too large to keep still removes the stale entry. Plane is implicit in the client instance. On the tenant plane, visibility context is the subject tenant from `SecurityContext`; on the platform plane it is a fixed unrestricted marker. Principal identity is otherwise absent because results are not grant-filtered: a `read` grant is gear-wide, so two subjects of one tenant that both hold it see identical content. The consequence is that this cache is not an authorization boundary — within the freshness window a subject whose grant was revoked may still be served an entry an authorized one populated, which is accepted because the consumer process legitimately holds that content already and a strict caller uses `fresh`. Keying by subject instead would multiply entries per end user for the same bytes. This prevents a shared client instance from serving a snapshot visible to one tenant subject to another subject that names the same Context Tenant.
 
 Found entries are indexed by both identifier and UUID so either resolution direction hits the same snapshot.
 
@@ -1796,7 +1798,8 @@ Content duplicates across Context Tenants even when only availability and owners
 - a terminal `register_entities` or `delete_entities` drops the affected entries, so the next read reflects the mutation with no window elapsing;
 - a read that started before that terminal outcome does not refill the entry when it completes;
 - a batch read of cached and expired keys issues exactly one conditional `batchGet`, carrying validators only for the expired ones;
-- a validator or snapshot obtained under one projection, subject visibility context, or Context Tenant is never presented under another.
+- a snapshot never answers a projection it does not cover, and no caller condition is matched for another entity or for a projection its held fields do not cover;
+- a validator or snapshot obtained under one subject visibility context or Context Tenant is never presented under another.
 
 ##### Inventory and startup reconciliation
 
@@ -2188,10 +2191,10 @@ sequenceDiagram
         Z-->>A: Allow or deny, boolean only
         Note over Z: Evaluated before any chain fetch or entity<br/>lookup, so refusal cannot depend on what exists
         A->>T: Subject ancestor chain, authorize named Context Tenant
-        opt Context Tenant differs and availability is selected
+        opt Context Tenant differs
             A->>T: Context Tenant ancestor chain (cached separately)
         end
-    else platform plane with availability selected
+    else platform plane naming a Context Tenant
         A->>T: Named Context Tenant ancestor chain
     end
     A->>D: One keyed read per entity, no history scan

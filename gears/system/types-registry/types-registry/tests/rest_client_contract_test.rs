@@ -28,11 +28,12 @@ use toolkit_security::constants::INTERNAL_TOKEN_HEADER;
 use toolkit_security::{PlatformSecurityContext, SecurityContext};
 use types_registry::domain::local_client::LocalClient;
 use types_registry_sdk::{
-    BatchGetEntitiesRequest, BatchGetItem, EntityField, EntityFilter, EntityKey, EntityKind,
-    EntityLookup, FieldSelection, IdempotencyKey, ListEntitiesRequest, Operation, OperationStatus,
-    PageRequest, PlatformTypesRegistryApi, PlatformTypesRegistryApiRestClient, Projection,
-    PublisherContext, ReadOptions, RegisterEntitiesRequest, RegisterItem, RegistrationOutcome,
-    TypesRegistryApi, TypesRegistryApiExt, TypesRegistryApiRestClient, Validator, reason,
+    BatchGetEntitiesRequest, BatchGetItem, Condition, EntityField, EntityFilter, EntityKey,
+    EntityKind, EntityLookup, FieldSelection, IdempotencyKey, ListEntitiesRequest, Operation,
+    OperationStatus, PageRequest, PlatformTypesRegistryApi, PlatformTypesRegistryApiRestClient,
+    Projection, PublisherContext, ReadOptions, RegisterEntitiesRequest, RegisterItem,
+    RegistrationOutcome, TypesRegistryApi, TypesRegistryApiExt, TypesRegistryApiRestClient,
+    Validator, reason,
 };
 use uuid::Uuid;
 
@@ -225,10 +226,10 @@ async fn submit_read_and_replay_over_tcp() {
     );
 
     let selection = Projection::Select(FieldSelection::full());
-    let read = |if_none_match| BatchGetEntitiesRequest {
+    let read = |if_none_match: Option<EntityLookup>| BatchGetEntitiesRequest {
         items: vec![BatchGetItem {
             key: EntityKey::GtsId(gts::GtsId::try_new(CF_TYPE).unwrap()),
-            if_none_match,
+            if_none_match: if_none_match.as_ref().and_then(EntityLookup::condition),
         }],
         projection: selection.clone(),
         fresh: false,
@@ -238,12 +239,12 @@ async fn submit_read_and_replay_over_tcp() {
         .await
         .expect("read")
         .0;
-    let Some(EntityLookup::Found { entity, etag }) = found.values().next() else {
+    let Some(lookup @ EntityLookup::Found { entity, etag }) = found.values().next() else {
         panic!("found: {found:?}");
     };
     assert_eq!(entity.content, Some(schema(CF_TYPE)));
     let unchanged = client
-        .batch_get_entities(&ctx(), read(Some(etag.clone())))
+        .batch_get_entities(&ctx(), read(Some(lookup.clone())))
         .await
         .expect("read")
         .0;
@@ -555,7 +556,7 @@ async fn tenant_reads_over_tcp_answer_as_the_local_tenant_client() {
     let conditional = BatchGetEntitiesRequest {
         items: vec![BatchGetItem {
             key: type_key(CF_TYPE),
-            if_none_match: Some(etag.clone()),
+            if_none_match: found.0[&type_key(CF_TYPE)].condition(),
         }],
         projection,
         fresh: false,
@@ -592,7 +593,11 @@ async fn tenant_reads_over_tcp_answer_as_the_local_tenant_client() {
     let oversized = BatchGetEntitiesRequest {
         items: vec![BatchGetItem {
             key: type_key(CF_TYPE),
-            if_none_match: Some(Validator::from_bytes(vec![b'v'; 2048])),
+            if_none_match: Some(Condition::new(
+                &type_key(CF_TYPE),
+                Validator::from_bytes(vec![b'v'; 2048]),
+                Projection::Default,
+            )),
         }],
         projection: Projection::Default,
         fresh: false,

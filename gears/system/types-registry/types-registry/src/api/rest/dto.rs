@@ -1417,7 +1417,8 @@ pub struct BatchGetItemDto {
     /// as `GET /entities/{entity_key}` classifies its path segment.
     #[schema(max_length = 1024)]
     pub entity_key: String,
-    /// A prior `etag` for this key and `$select`; a match returns `unchanged`.
+    /// A prior `etag` for this key; a match returns `unchanged`. One state has one `etag`
+    /// under every `$select`, so send it only while holding every field `$select` names.
     /// Batch validators are per item. Exactly one entity-tag, weak or strong:
     /// `*`, an unquoted value or a list is refused rather than read as no condition.
     #[serde(default)]
@@ -1524,8 +1525,8 @@ pub enum EntityLookupStatusDto {
 pub struct EntityLookupDto {
     pub entity_key: String,
     pub status: EntityLookupStatusDto,
-    /// The validator for this key under this `$select`, byte-identical to the exact
-    /// read's `ETag`. Present unless `not_found`.
+    /// The validator of this key's current state, the same under every `$select` and
+    /// byte-identical to the exact read's `ETag`. Present unless `not_found`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub etag: Option<String>,
     /// The selected fields, exactly as the exact read returns them for the same

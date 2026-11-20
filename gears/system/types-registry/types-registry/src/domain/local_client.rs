@@ -90,7 +90,7 @@ impl LocalClient {
         let mut reads = Vec::with_capacity(request.items.len());
         for item in request.items {
             let key = domain_key(&item.key);
-            let if_none_match = match &item.if_none_match {
+            let if_none_match = match item.validator_for(&request.projection) {
                 Some(validator) => condition(validator)?,
                 None => None,
             };

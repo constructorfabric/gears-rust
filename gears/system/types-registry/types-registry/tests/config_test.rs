@@ -64,6 +64,11 @@ fn the_defaults_are_the_ones_the_spec_documents() {
     assert_eq!(cfg.worker.operation_timeout, Duration::from_mins(5));
     assert_eq!(cfg.worker.max_revalidation_attempts, 8);
     assert_eq!(cfg.worker.max_delivery_attempts, 8);
+    assert_eq!(
+        cfg.local_client.cache.freshness_window,
+        Duration::from_secs(30)
+    );
+    assert_eq!(cfg.local_client.cache.store_bound.bytes(), 64 * 1024 * 1024);
 }
 
 /// The existing keys are retained (SPEC §10.3), so an existing deployment's
@@ -82,11 +87,27 @@ fn the_pre_existing_keys_are_retained() {
     assert!(cfg.allow_compatibility_force);
 }
 
-/// The four `local_client.cache.*` keys stay live in P0 — the cache is kept
-/// (SPEC §8.3) and its reshaping into `freshness_window` / `store_bound` belongs
-/// to T36. Asserted so that reshaping is a deliberate change and not a silent one.
+/// `freshness_window` / `store_bound` configure the platform API's SDK client cache
+/// (T36); a zero window is meaningful, not refused.
 #[test]
-fn the_cache_keys_are_still_the_pre_sdk_cache_shape() {
+fn the_client_cache_keys_parse_and_a_zero_window_is_accepted() {
+    let cfg = parse(json!({
+        "local_client": { "cache": { "freshness_window": "0s", "store_bound": "16MB" } }
+    }));
+    assert_eq!(cfg.local_client.cache.freshness_window, Duration::ZERO);
+    assert_eq!(
+        cfg.local_client.cache.store_bound,
+        ByteSize::from_bytes(16 * 1024 * 1024)
+    );
+    let client = cfg.local_client.cache.client_cache();
+    assert_eq!(client.freshness_window, Duration::ZERO);
+    assert_eq!(client.store_bound, 16 * 1024 * 1024);
+}
+
+/// The four legacy `local_client.cache.*` keys stay live until T38 deletes the legacy
+/// cache, beside the new client-cache keys.
+#[test]
+fn the_legacy_cache_keys_are_still_live() {
     let cfg = parse(json!({
         "local_client": {
             "cache": {
@@ -101,6 +122,11 @@ fn the_cache_keys_are_still_the_pre_sdk_cache_shape() {
         Some(Duration::from_secs(90))
     );
     assert_eq!(cfg.local_client.cache.instances.ttl, None);
+    assert_eq!(
+        cfg.local_client.cache.freshness_window,
+        Duration::from_secs(30),
+        "an omitted client-cache key keeps its default"
+    );
 }
 
 // ---------------------------------------------------------------------------

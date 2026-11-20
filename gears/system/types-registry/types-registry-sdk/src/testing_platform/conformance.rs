@@ -15,9 +15,9 @@ use crate::contract::PlatformTypesRegistryApi;
 use crate::field;
 use crate::item_failure::AdmissionFailure;
 use crate::models::{
-    BatchGetEntitiesRequest, BatchGetItem, CandidateStatus, DeleteEntitiesRequest, DeleteItem,
-    DeletionItemResult, DeletionOutcome, Entity, EntityField, EntityFilter, EntityKey, EntityKind,
-    EntityLookup, FieldSelection, IdempotencyKey, LifecycleFilter, LifecycleStatus,
+    BatchGetEntitiesRequest, BatchGetItem, CandidateStatus, Condition, DeleteEntitiesRequest,
+    DeleteItem, DeletionItemResult, DeletionOutcome, Entity, EntityField, EntityFilter, EntityKey,
+    EntityKind, EntityLookup, FieldSelection, IdempotencyKey, LifecycleFilter, LifecycleStatus,
     ListEntitiesRequest, Operation, OperationStatus, Origin, PageRequest, Projection, Provenance,
     PublisherContext, RegisterEntitiesRequest, RegisterItem, RegistrationOperation,
     RegistrationOutcome, Validator,
@@ -54,7 +54,10 @@ pub async fn run(client: &dyn PlatformTypesRegistryApi) {
     c.documents_resolve_through_the_chain().await;
     c.a_reference_an_instance_and_a_light_read_answer_their_fields()
         .await;
-    c.validators_are_scoped_to_the_projection().await;
+    c.a_validator_names_the_state_and_a_condition_what_it_covers()
+        .await;
+    c.a_condition_for_one_entity_never_conditions_another()
+        .await;
     c.a_repeated_key_is_answered_under_its_first_mention().await;
     let (tombstone, etag) = c
         .tombstones_keep_their_documents_and_are_never_rewritten()
@@ -374,13 +377,10 @@ impl Checker<'_> {
     async fn get_if(
         &self,
         key: EntityKey,
-        etag: &Validator,
+        condition: &Condition,
         projection: Projection,
     ) -> EntityLookup {
-        let item = BatchGetItem {
-            key,
-            if_none_match: Some(etag.clone()),
-        };
+        let item = BatchGetItem::new(key).with_if_none_match(condition.clone());
         self.read(vec![item], projection).await
     }
 
@@ -496,31 +496,70 @@ impl Checker<'_> {
         );
     }
 
-    async fn validators_are_scoped_to_the_projection(&self) {
-        let (_, etag) = found(self.get(gts_key(CHILD), Projection::Default).await);
+    /// One state has one validator under every projection; what a condition may answer
+    /// is decided by the fields it covers, read off the answer it came from.
+    async fn a_validator_names_the_state_and_a_condition_what_it_covers(&self) {
+        let narrow = self.get(gts_key(CHILD), Projection::Default).await;
+        let held = narrow
+            .condition()
+            .expect("a found answer gives a condition");
+        let (_, etag) = found(narrow);
+        let (_, wide_etag) = found(self.get(gts_key(CHILD), content_only()).await);
+        assert_eq!(wide_etag, etag, "one state, one validator");
+
         assert!(
             matches!(
-                self.get_if(gts_key(CHILD), &etag, Projection::Default)
+                self.get_if(gts_key(CHILD), &held, Projection::Default)
                     .await,
                 EntityLookup::Unchanged { .. }
             ),
-            "a matching validator transfers nothing"
+            "a covering condition transfers nothing"
         );
         assert!(
             matches!(
-                self.get_if(gts_key(CHILD), &etag, content_only()).await,
+                self.get_if(gts_key(CHILD), &held, content_only()).await,
                 EntityLookup::Found { .. }
             ),
-            "a validator read under one projection does not condition another"
+            "a condition that does not cover the read is not sent"
+        );
+
+        let wide = self
+            .get(gts_key(CHILD), every_field())
+            .await
+            .condition()
+            .expect("a found answer gives a condition");
+        assert!(
+            matches!(
+                self.get_if(gts_key(CHILD), &wide, Projection::Default)
+                    .await,
+                EntityLookup::Unchanged { .. }
+            ),
+            "a wider holding covers a narrower read"
+        );
+    }
+
+    /// A validator carries no identity, so a condition is bound to its entity: one
+    /// carrying the other entity's own current validator still conditions nothing.
+    async fn a_condition_for_one_entity_never_conditions_another(&self) {
+        let (_, instance_etag) = found(self.get(gts_key(INSTANCE), Projection::Default).await);
+        let misbound = Condition::new(&gts_key(CHILD), instance_etag, Projection::Default);
+        assert!(
+            matches!(
+                self.get_if(gts_key(INSTANCE), &misbound, Projection::Default)
+                    .await,
+                EntityLookup::Found { .. }
+            ),
+            "a condition bound to another entity is not sent"
         );
     }
 
     async fn a_repeated_key_is_answered_under_its_first_mention(&self) {
         let (_, etag) = found(self.get(gts_key(CHILD), Projection::Default).await);
-        let conditional = BatchGetItem {
-            key: gts_key(CHILD),
-            if_none_match: Some(etag),
-        };
+        let conditional = BatchGetItem::new(gts_key(CHILD)).with_if_none_match(Condition::new(
+            &gts_key(CHILD),
+            etag,
+            Projection::Default,
+        ));
         let lookup = self
             .read(
                 vec![gts_key(CHILD).into(), conditional.clone()],
@@ -589,7 +628,12 @@ impl Checker<'_> {
         tombstone: Entity,
         tombstone_etag: Validator,
     ) {
-        let (_, child_etag) = found(self.get(gts_key(CHILD), light()).await);
+        let child_held = self
+            .get(gts_key(CHILD), every_field())
+            .await
+            .condition()
+            .expect("a found answer gives a condition");
+        let tombstone_held = Condition::of(&tombstone, tombstone_etag);
         self.register(vec![revise(
             BASE,
             root(BASE, Some(revised_base_traits())),
@@ -598,7 +642,7 @@ impl Checker<'_> {
         .await;
 
         let (child, _) = found(
-            self.get_if(gts_key(CHILD), &child_etag, every_field())
+            self.get_if(gts_key(CHILD), &child_held, every_field())
                 .await,
         );
         assert_eq!(
@@ -616,7 +660,7 @@ impl Checker<'_> {
         );
         assert!(
             matches!(
-                self.get_if(gts_key(CHILD), &child_etag, light()).await,
+                self.get_if(gts_key(CHILD), &child_held, light()).await,
                 EntityLookup::Found { .. }
             ),
             "and moves their validators, even under a projection without documents"
@@ -624,7 +668,7 @@ impl Checker<'_> {
 
         assert!(
             matches!(
-                self.get_if(gts_key(DOOMED), &tombstone_etag, every_field())
+                self.get_if(gts_key(DOOMED), &tombstone_held, every_field())
                     .await,
                 EntityLookup::Unchanged { .. }
             ),

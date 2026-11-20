@@ -5,13 +5,14 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use toolkit_macros::domain_model;
 use toolkit_security::crypto::hash::Sha256;
 
-use crate::domain::selection::{EntityField, FieldSelection};
-
 /// ponytail: ceiling C7 — no visibility or availability inputs yet; P1 adds them
-/// under a new version, which a v1 token then never matches.
-const VERSION: u8 = 1;
+/// under a new version, which a v2 token then never matches. v1 also digested the
+/// selected fields; its tokens no longer match.
+const VERSION: u8 = 2;
 
-/// A 128-bit digest of what a representation depends on. Equality is the only
+/// A 128-bit digest of the entity state every projection of it is read from. One
+/// entity's validator is the same under every field selection, so it says nothing of
+/// which fields the holder has: that is the caller's to track. Equality is the only
 /// operation.
 #[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,11 +21,7 @@ pub struct Validator([u8; 16]);
 impl Validator {
     /// Instances pass no fingerprint: they have no derived form.
     #[must_use]
-    pub fn compute(
-        resource_version: i64,
-        resolution_fingerprint: Option<&[u8]>,
-        selection: FieldSelection,
-    ) -> Self {
+    pub fn compute(resource_version: i64, resolution_fingerprint: Option<&[u8]>) -> Self {
         // TODO(P1): subject visibility-chain version, Context Tenant availability-chain
         // version, routing generation.
         let mut ctx = Sha256::new();
@@ -37,7 +34,6 @@ impl Validator {
                 update_prefixed(&mut ctx, fingerprint);
             }
         }
-        update_selection(&mut ctx, selection);
         let mut digest = [0; 16];
         digest.copy_from_slice(&ctx.finalize().as_ref()[..16]);
         Self(digest)
@@ -94,20 +90,6 @@ impl IfNoneMatch {
 fn update_prefixed(ctx: &mut Sha256, bytes: &[u8]) {
     ctx.update((bytes.len() as u64).to_be_bytes());
     ctx.update(bytes);
-}
-
-/// [`update_prefixed`] over [`FieldSelection::canonical`], streamed: a batch
-/// digests one selection per row, so this allocates nothing.
-fn update_selection(ctx: &mut Sha256, selection: FieldSelection) {
-    let names = || selection.fields().map(EntityField::name);
-    let len = names().map(str::len).sum::<usize>() + names().count().saturating_sub(1);
-    ctx.update((len as u64).to_be_bytes());
-    for (index, name) in names().enumerate() {
-        if index > 0 {
-            ctx.update(b",");
-        }
-        ctx.update(name.as_bytes());
-    }
 }
 
 #[cfg(test)]

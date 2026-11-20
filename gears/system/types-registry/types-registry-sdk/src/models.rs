@@ -33,6 +33,16 @@ impl EntityKey {
             Self::GtsUuid(_) => None,
         }
     }
+
+    /// The Registry Reference of the entity the key names: an identifier's is derived
+    /// from it, so both forms of one entity give the same UUID.
+    #[must_use]
+    pub fn to_uuid(&self) -> Uuid {
+        match self {
+            Self::GtsId(id) => id.to_uuid(),
+            Self::GtsUuid(uuid) => *uuid,
+        }
+    }
 }
 
 impl From<GtsId> for EntityKey {
@@ -82,12 +92,106 @@ impl fmt::Debug for Validator {
     }
 }
 
+/// What a caller holds of one entity: the validator a read gave it, and the fields of
+/// the snapshot it holds under that validator.
+///
+/// A validator names the entity's state and is the same under every projection, so
+/// `Unchanged` only says that what the caller holds is current. A condition is
+/// therefore sent only for a read of the same entity whose projection it covers;
+/// any other read goes unconditionally and is answered in full. Validators carry no
+/// identity, so the entity binding is the condition's, never the token's. P0 reads
+/// have one visibility scope (SPEC C7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Condition {
+    entity: Uuid,
+    etag: Validator,
+    covers: FieldSelection,
+}
+
+impl Condition {
+    /// What a caller holds after a read answered `entity` with `etag`: the fields the
+    /// snapshot carries, and those its kind never has. Read off the snapshot itself, so
+    /// it cannot claim a field the caller does not hold. This is the ordinary way to a
+    /// condition; [`EntityLookup::condition`] gives it straight from an answer.
+    #[must_use]
+    pub fn of(entity: &Entity, etag: Validator) -> Self {
+        let schema = entity.kind == EntityKind::TypeSchema;
+        let held: Vec<EntityField> = [
+            (EntityField::Origin, entity.origin.is_some(), true),
+            (EntityField::Content, entity.content.is_some(), true),
+            (
+                EntityField::ResolvedSchema,
+                entity.resolved_schema.is_some(),
+                schema,
+            ),
+            (
+                EntityField::EffectiveTraits,
+                entity.effective_traits.is_some(),
+                schema,
+            ),
+            (
+                EntityField::EffectiveTraitsSchema,
+                entity.effective_traits_schema.is_some(),
+                schema,
+            ),
+            (EntityField::Provenance, entity.provenance.is_some(), schema),
+        ]
+        .into_iter()
+        .filter(|(_, present, applicable)| *present || !applicable)
+        .map(|(field, ..)| field)
+        .collect();
+        Self {
+            entity: entity.gts_uuid,
+            etag,
+            covers: FieldSelection::with(&held),
+        }
+    }
+
+    /// `etag` as read for `key` under `covers`: the projection of the snapshot held. For
+    /// adapters that track coverage themselves; a caller holding the answer uses
+    /// [`Self::of`], which cannot mistake the next read's projection for the held one.
+    #[must_use]
+    pub fn new(key: &EntityKey, etag: Validator, covers: impl Into<Projection>) -> Self {
+        Self {
+            entity: key.to_uuid(),
+            etag,
+            covers: covers.into().normalized(),
+        }
+    }
+
+    /// The entity this condition is about.
+    #[must_use]
+    pub fn entity(&self) -> Uuid {
+        self.entity
+    }
+
+    #[must_use]
+    pub fn etag(&self) -> &Validator {
+        &self.etag
+    }
+
+    /// The fields held under [`Self::etag`].
+    #[must_use]
+    pub fn covers(&self) -> &FieldSelection {
+        &self.covers
+    }
+
+    /// The validator to send with a read of `key` under `projection`: only for the same
+    /// entity, and only when the held fields include every field the read selects.
+    #[must_use]
+    pub fn validator_for(&self, key: &EntityKey, projection: &Projection) -> Option<&Validator> {
+        (key.to_uuid() == self.entity && self.covers.is_superset(&projection.normalized()))
+            .then_some(&self.etag)
+    }
+}
+
 /// One key of a batch read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchGetItem {
     pub key: EntityKey,
-    /// Makes the read conditional for this key alone; `None` reads it unconditionally.
-    pub if_none_match: Option<Validator>,
+    /// Makes the read conditional for this key alone, where the condition applies (see
+    /// [`Condition::validator_for`]); `None` reads it unconditionally.
+    pub if_none_match: Option<Condition>,
 }
 
 impl BatchGetItem {
@@ -100,11 +204,20 @@ impl BatchGetItem {
         }
     }
 
-    /// Makes this key's read conditional on `validator`.
+    /// Makes this key's read conditional on `condition`, where it applies.
     #[must_use]
-    pub fn with_if_none_match(mut self, validator: Validator) -> Self {
-        self.if_none_match = Some(validator);
+    pub fn with_if_none_match(mut self, condition: Condition) -> Self {
+        self.if_none_match = Some(condition);
         self
+    }
+
+    /// The validator a transport sends for this key under `projection`: the condition's,
+    /// where it applies to this key and projection, and otherwise none.
+    #[must_use]
+    pub fn validator_for(&self, projection: &Projection) -> Option<&Validator> {
+        self.if_none_match
+            .as_ref()
+            .and_then(|condition| condition.validator_for(&self.key, projection))
     }
 }
 
@@ -246,6 +359,12 @@ impl FieldSelection {
         self.0.contains(&field)
     }
 
+    /// Whether every field of `other` is selected here.
+    #[must_use]
+    pub fn is_superset(&self, other: &Self) -> bool {
+        self.0.is_superset(&other.0)
+    }
+
     /// The selected fields in a stable order.
     pub fn fields(&self) -> impl Iterator<Item = EntityField> + '_ {
         self.0.iter().copied()
@@ -330,7 +449,7 @@ pub struct BatchGetEntitiesResponse(pub HashMap<EntityKey, EntityLookup>);
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum EntityLookup {
-    /// `etag` is scoped to the normalized projection, so it changes with it.
+    /// `etag` names the entity's state, the same under every projection.
     Found {
         entity: Box<Entity>,
         etag: Validator,
@@ -339,6 +458,19 @@ pub enum EntityLookup {
     Unchanged { etag: Validator },
     /// Absent.
     NotFound,
+}
+
+impl EntityLookup {
+    /// The condition a caller holding this answer sends with its next read of the entity:
+    /// [`Condition::of`] a `Found`. `Unchanged` transfers no snapshot, so the caller keeps
+    /// the condition it sent; `NotFound` holds nothing.
+    #[must_use]
+    pub fn condition(&self) -> Option<Condition> {
+        match self {
+            Self::Found { entity, etag } => Some(Condition::of(entity, etag.clone())),
+            Self::Unchanged { .. } | Self::NotFound => None,
+        }
+    }
 }
 
 /// Projected entity with mandatory identity, kind and lifecycle.

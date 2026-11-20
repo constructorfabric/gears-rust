@@ -936,7 +936,7 @@ fn narrow<T: Kinded>(snapshot: Entity) -> Result<T, CanonicalError> {
 }
 
 /// The kind field agrees with the identifier, and an Instance carries no derived form.
-fn consistent(snapshot: &Entity) -> bool {
+pub(crate) fn consistent(snapshot: &Entity) -> bool {
     snapshot.kind == EntityKind::of(&snapshot.gts_id)
         && (snapshot.kind == EntityKind::TypeSchema
             || (snapshot.resolved_schema.is_none()

@@ -117,7 +117,11 @@ startup seed:
   stay unpublished.
 - **Database required:** without `gears.types-registry.database`, or after seed
   failure, neither contract is registered; resolution fails.
-- **Uncached:** every read hits the database until T36.
+- **Client cache:** the published platform API caches reads for
+  `local_client.cache.freshness_window` (30 s) within `local_client.cache.store_bound`
+  (64MB). A registration or deletion polled to its terminal outcome through it drops
+  the affected entries; read with `fresh` when another writer's change must be seen at
+  once. The tenant API is uncached.
 - **Independent catalogues:** legacy `/v1` shares initial declarations but no later
   writes with the database until T38.
 - **Multiple instances:** outbox polling can delay admission by one minute. Keep
@@ -266,7 +270,8 @@ key count does not bound response bytes once documents are selected.
 ### Skip an unchanged body
 
 An exact read's `ETag` and a batch result's `etag` are the same value, quotes included, for
-that key and `$select`. Send it back unchanged and an unchanged entity costs no body:
+that key's current state, whatever the `$select`. Send it back unchanged and an unchanged
+entity costs no body:
 
 ```bash
 URL="$TENANT/entities/gts.cf.core.example.event.v1~"
@@ -284,8 +289,12 @@ curl -s -X POST "$TENANT/entities:batchGet" \
 # {"items": [{"entity_key": "...", "status": "unchanged", "etag": "<$ETAG>"}]}
 ```
 
-A revision, a refreshed dependency or another `$select` yields a new validator; discovery
-pages carry none. On `:batchGet` the `If-None-Match` header is refused: validators are per key.
+A revision or a refreshed dependency yields a new validator; another `$select` does not, so
+`304`/`unchanged` says the response you hold is current, not that it has the fields you now
+select. Send a validator only with a `$select` whose fields the response you hold carries,
+and only for the key it came from. The Rust SDK enforces both (`EntityLookup::condition`).
+Discovery pages carry no validator. On `:batchGet` the `If-None-Match` header is refused:
+validators are per key.
 
 ### Discover what exists
 

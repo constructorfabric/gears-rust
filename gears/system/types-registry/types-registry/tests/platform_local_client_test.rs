@@ -21,12 +21,12 @@ use types_registry::domain::registry_service::{EntityLookup as DomainLookup, Reg
 use types_registry::domain::selection::FieldSelection as DomainSelection;
 use types_registry::infra::outbox::OutboxDispatch;
 use types_registry_sdk::{
-    AdmissionFailure, BatchGetEntitiesRequest, BatchGetItem, CandidateStatus,
-    DeleteEntitiesRequest, DeleteItem, DeletionOutcome, EntityField, EntityFilter, EntityKey,
-    EntityKind, EntityLookup, FieldSelection, IdempotencyKey, LifecycleStatus, ListEntitiesRequest,
-    Operation, OperationStatus, Origin, PageRequest, PlatformTypesRegistryApi, Projection,
-    Provenance, PublisherContext, ReadOptions, RegisterEntitiesRequest, RegisterItem,
-    RegistrationOutcome,
+    AdmissionFailure, BatchGetEntitiesRequest, BatchGetItem, CacheSettings,
+    CachedPlatformTypesRegistry, CandidateStatus, DeleteEntitiesRequest, DeleteItem,
+    DeletionOutcome, EntityField, EntityFilter, EntityKey, EntityKind, EntityLookup,
+    FieldSelection, IdempotencyKey, LifecycleStatus, ListEntitiesRequest, Operation,
+    OperationStatus, Origin, PageRequest, PlatformTypesRegistryApi, Projection, Provenance,
+    PublisherContext, ReadOptions, RegisterEntitiesRequest, RegisterItem, RegistrationOutcome,
 };
 
 mod common;
@@ -447,10 +447,13 @@ async fn a_read_carries_the_domain_validator_byte_for_byte_and_answers_unchanged
         .batch_get_entities(
             &ctx(),
             batch(
-                vec![BatchGetItem {
-                    key: key.clone(),
-                    if_none_match: Some(etag.clone()),
-                }],
+                vec![
+                    BatchGetItem::new(key.clone()).with_if_none_match(
+                        first.0[&key]
+                            .condition()
+                            .expect("a found answer gives a condition"),
+                    ),
+                ],
                 projection,
             ),
         )
@@ -473,12 +476,13 @@ async fn a_validator_this_registry_never_issued_is_answered_in_full() {
         .batch_get_entities(
             &ctx(),
             batch(
-                vec![BatchGetItem {
-                    key: key.clone(),
-                    if_none_match: Some(types_registry_sdk::Validator::from_bytes(
-                        b"\"not-a-token\"".to_vec(),
-                    )),
-                }],
+                vec![BatchGetItem::new(key.clone()).with_if_none_match(
+                    types_registry_sdk::Condition::new(
+                        &key,
+                        types_registry_sdk::Validator::from_bytes(b"\"not-a-token\"".to_vec()),
+                        Projection::Default,
+                    ),
+                )],
                 Projection::Default,
             ),
         )
@@ -1366,4 +1370,112 @@ async fn a_lost_acknowledgement_is_bridged_from_the_calls_logs_to_its_operation(
         .get_operation(&ctx, operation_id)
         .await
         .expect("the operation the logs lead to exists");
+}
+
+/// T36 through the real local client: an observed terminal registration leaves no stale
+/// entry, while a change the client did not observe is served from the window until
+/// `fresh` asks the database.
+#[tokio::test]
+async fn the_client_cache_over_the_local_client_drops_what_it_observes_change() {
+    let h = harness().await;
+    let cached = CachedPlatformTypesRegistry::new(
+        Arc::new(LocalClient::new(Arc::clone(&h.service))) as Arc<dyn PlatformTypesRegistryApi>,
+        CacheSettings::default(),
+    );
+    let version = |lookup: Option<EntityLookup>| match lookup {
+        Some(EntityLookup::Found { entity, .. }) => match entity.origin {
+            Some(Origin::Managed {
+                resource_version, ..
+            }) => resource_version,
+            _ => panic!("a managed origin is selected"),
+        },
+        other => panic!("found, got {other:?}"),
+    };
+    let read = |fresh: bool| {
+        let mut request = batch(
+            vec![EntityKey::GtsId(id(CF_TYPE)).into()],
+            Projection::Default,
+        );
+        request.fresh = fresh;
+        let cached = &cached;
+        async move {
+            cached
+                .batch_get_entities(&ctx(), request)
+                .await
+                .expect("read")
+                .0
+                .remove(&EntityKey::GtsId(id(CF_TYPE)))
+        }
+    };
+
+    register_and_complete(
+        &h,
+        "cache-create",
+        register(vec![create(CF_TYPE, schema(CF_TYPE))]),
+    )
+    .await;
+    assert_eq!(version(read(false).await), 1, "warm");
+
+    // Observed through the cache: register, then poll to the terminal outcome.
+    let mut revised = schema(CF_TYPE);
+    revised["description"] = json!("revised");
+    let mut update = create(CF_TYPE, revised);
+    update.expected_resource_version = Some(1);
+    let submitted = cached
+        .register_entities(
+            &ctx(),
+            IdempotencyKey::new("cache-update").unwrap(),
+            register(vec![update]),
+        )
+        .await
+        .expect("accepted");
+    let operation = common::await_delivery("the update completes", || async {
+        let operation = cached
+            .get_operation(&ctx(), submitted.operation_id)
+            .await
+            .expect("poll");
+        (operation.status() == OperationStatus::Completed).then_some(operation)
+    })
+    .await;
+    let outcome = &items_of(operation)[0].outcome;
+    assert!(
+        matches!(
+            outcome,
+            RegistrationOutcome::Succeeded {
+                resource_version: 2
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        version(read(false).await),
+        2,
+        "no stale entry after the terminal outcome"
+    );
+
+    // Not observed: a deletion through another client.
+    let deletion = h
+        .client
+        .delete_entities(
+            &ctx(),
+            IdempotencyKey::new("cache-delete").unwrap(),
+            DeleteEntitiesRequest {
+                items: vec![DeleteItem {
+                    key: EntityKey::GtsId(id(CF_TYPE)),
+                    expected_resource_version: 2,
+                }],
+                dry_run: false,
+                publisher: publisher(),
+            },
+        )
+        .await
+        .expect("accepted");
+    completed(&h.client, deletion.operation_id).await;
+    assert_eq!(
+        version(read(false).await),
+        2,
+        "inside the window: the snapshot it holds"
+    );
+    assert_eq!(version(read(true).await), 3, "fresh asks the database");
+    assert_eq!(version(read(false).await), 3, "and replaced the entry");
 }

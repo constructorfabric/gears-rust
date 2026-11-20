@@ -4,7 +4,7 @@ use gts::GtsId;
 use uuid::Uuid;
 
 use super::{
-    BatchGetEntitiesRequest, BatchGetItem, Cursor, EntityField, EntityFilter, EntityKey,
+    BatchGetEntitiesRequest, BatchGetItem, Condition, Cursor, EntityField, EntityFilter, EntityKey,
     EntityKind, FieldSelection, IdempotencyKey, LifecycleFilter, ListEntitiesRequest, PageRequest,
     Projection, ReadOptions, Validator,
 };
@@ -483,9 +483,10 @@ fn a_batch_read_keeps_its_keys_in_order_and_conditions_only_the_asked_key() {
     let first = EntityKey::from(id("gts.cf.example.batch.thing.v1~"));
     let second = EntityKey::from(Uuid::nil());
     let validator = Validator::from_bytes(b"etag".to_vec());
+    let condition = Condition::new(&second, validator, Projection::Default);
     let request = BatchGetEntitiesRequest::new([
         BatchGetItem::new(first.clone()),
-        BatchGetItem::new(second.clone()).with_if_none_match(validator.clone()),
+        BatchGetItem::new(second.clone()).with_if_none_match(condition.clone()),
     ]);
     assert_eq!(
         request,
@@ -497,7 +498,7 @@ fn a_batch_read_keeps_its_keys_in_order_and_conditions_only_the_asked_key() {
                 },
                 BatchGetItem {
                     key: second,
-                    if_none_match: Some(validator),
+                    if_none_match: Some(condition),
                 },
             ],
             projection: Projection::Default,
@@ -513,4 +514,124 @@ fn a_batch_read_keeps_its_keys_in_order_and_conditions_only_the_asked_key() {
         keyed.projection,
         Projection::Select(FieldSelection::light())
     );
+}
+
+mod conditions {
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::id;
+    use crate::models::{
+        BatchGetItem, Condition, Entity, EntityField, EntityKey, EntityKind, EntityLookup,
+        FieldSelection, LifecycleStatus, Projection, Validator,
+    };
+
+    const TYPE: &str = "gts.cf.test.pkg.thing.v1~";
+    const INSTANCE: &str = "gts.cf.test.pkg.thing.v1~cf.test.pkg.one.v1";
+
+    fn etag() -> Validator {
+        Validator::from_bytes(b"etag".to_vec())
+    }
+
+    /// A snapshot of `gts_id` read with only its content selected.
+    fn content_read(gts_id: &str, kind: EntityKind) -> Entity {
+        let gts_id = id(gts_id);
+        let gts_uuid = gts_id.to_uuid();
+        Entity {
+            gts_id,
+            gts_uuid,
+            kind,
+            lifecycle_status: LifecycleStatus::Active,
+            origin: None,
+            content: Some(json!({ "n": 1 })),
+            resolved_schema: None,
+            effective_traits: None,
+            effective_traits_schema: None,
+            provenance: None,
+        }
+    }
+
+    fn select(fields: &[EntityField]) -> Projection {
+        Projection::Select(FieldSelection::with(fields))
+    }
+
+    #[test]
+    fn a_condition_of_an_answer_covers_exactly_the_fields_it_carries() {
+        let key = EntityKey::from(id(TYPE));
+        let held = Condition::of(&content_read(TYPE, EntityKind::TypeSchema), etag());
+        assert_eq!(
+            held.validator_for(&key, &select(&[EntityField::Content])),
+            Some(&etag())
+        );
+        assert_eq!(
+            held.validator_for(&key, &FieldSelection::light().into()),
+            Some(&etag())
+        );
+        for wider in [
+            Projection::Default,
+            select(&[EntityField::Content, EntityField::ResolvedSchema]),
+            FieldSelection::full().into(),
+        ] {
+            assert_eq!(held.validator_for(&key, &wider), None, "{wider:?}");
+        }
+    }
+
+    /// An Instance never has the derived documents or provenance, so holding its content
+    /// covers a read that also selects them.
+    #[test]
+    fn an_instance_holds_the_fields_its_kind_never_has() {
+        let key = EntityKey::from(id(INSTANCE));
+        let held = Condition::of(&content_read(INSTANCE, EntityKind::Instance), etag());
+        let documents = select(&[
+            EntityField::Content,
+            EntityField::ResolvedSchema,
+            EntityField::EffectiveTraits,
+            EntityField::EffectiveTraitsSchema,
+            EntityField::Provenance,
+        ]);
+        assert_eq!(held.validator_for(&key, &documents), Some(&etag()));
+        assert_eq!(held.validator_for(&key, &Projection::Default), None);
+    }
+
+    /// The negative coverage case a caller can construct by hand: held under the
+    /// default projection, read with content. The read goes unconditionally.
+    #[test]
+    fn a_condition_that_does_not_cover_the_read_is_not_sent() {
+        let key = EntityKey::from(id(TYPE));
+        let item = BatchGetItem::new(key.clone()).with_if_none_match(Condition::new(
+            &key,
+            etag(),
+            Projection::Default,
+        ));
+        assert_eq!(item.validator_for(&Projection::Default), Some(&etag()));
+        assert_eq!(item.validator_for(&select(&[EntityField::Content])), None);
+    }
+
+    #[test]
+    fn a_condition_applies_to_either_key_form_of_its_entity_and_no_other() {
+        let by_id = EntityKey::from(id(TYPE));
+        let by_uuid = EntityKey::from(id(TYPE).to_uuid());
+        let held = Condition::new(&by_id, etag(), FieldSelection::full());
+        assert_eq!(held.entity(), by_uuid.to_uuid());
+        for key in [&by_id, &by_uuid] {
+            assert_eq!(held.validator_for(key, &Projection::Default), Some(&etag()));
+        }
+        for other in [EntityKey::from(id(INSTANCE)), EntityKey::from(Uuid::nil())] {
+            assert_eq!(held.validator_for(&other, &Projection::Default), None);
+            let item = BatchGetItem::new(other).with_if_none_match(held.clone());
+            assert_eq!(item.validator_for(&Projection::Default), None);
+        }
+    }
+
+    #[test]
+    fn only_a_found_answer_gives_a_condition() {
+        let entity = content_read(TYPE, EntityKind::TypeSchema);
+        let found = EntityLookup::Found {
+            entity: Box::new(entity.clone()),
+            etag: etag(),
+        };
+        assert_eq!(found.condition(), Some(Condition::of(&entity, etag())));
+        assert_eq!(EntityLookup::Unchanged { etag: etag() }.condition(), None);
+        assert_eq!(EntityLookup::NotFound.condition(), None);
+    }
 }

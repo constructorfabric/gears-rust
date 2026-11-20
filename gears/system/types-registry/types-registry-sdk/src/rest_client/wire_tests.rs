@@ -17,7 +17,7 @@ use super::{
 };
 use crate::item_failure::{AdmissionFailure, AdmissionFailureReason};
 use crate::models::{
-    BatchGetEntitiesRequest, BatchGetItem, Cursor, DeleteEntitiesRequest, DeleteItem,
+    BatchGetEntitiesRequest, BatchGetItem, Condition, Cursor, DeleteEntitiesRequest, DeleteItem,
     DeletionOutcome, EntityField, EntityFilter, EntityKey, EntityKind, EntityLookup,
     FieldSelection, LifecycleFilter, LifecycleStatus, ListEntitiesRequest, Operation,
     OperationStatus, Origin, PageRequest, Projection, PublisherContext, RegisterEntitiesRequest,
@@ -70,6 +70,34 @@ fn operation_in(status: &str, kind: &str, dry_run: bool, items: &Value) -> Value
 
 // ---- validators -----------------------------------------------------------------
 
+/// `token` held for `TYPE` under the default projection.
+fn held(token: Validator) -> Condition {
+    Condition::new(&EntityKey::from(id(TYPE)), token, Projection::Default)
+}
+
+/// Only a condition for the asked entity that covers the read reaches the wire.
+#[test]
+fn a_condition_that_does_not_apply_is_not_sent() {
+    let token = Validator::from_bytes("v1:abc");
+    for condition in [
+        Condition::new(
+            &EntityKey::from(id(INSTANCE)),
+            token.clone(),
+            FieldSelection::full(),
+        ),
+        held(token),
+    ] {
+        let body = BatchGetBody::encode(&BatchGetEntitiesRequest {
+            items: vec![BatchGetItem::new(id(TYPE)).with_if_none_match(condition.clone())],
+            projection: Projection::Select(FieldSelection::with(&[EntityField::Content])),
+            fresh: false,
+        })
+        .expect("encodable");
+        let item = &serde_json::to_value(body).unwrap()["items"][0];
+        assert!(item.get("if_none_match").is_none(), "{condition:?}: {item}");
+    }
+}
+
 #[test]
 fn a_validator_is_the_same_token_from_either_transport() {
     let received = validator("\"v1:abc\"").expect("a strong entity-tag");
@@ -78,7 +106,7 @@ fn a_validator_is_the_same_token_from_either_transport() {
     let body = BatchGetBody::encode(&BatchGetEntitiesRequest {
         items: vec![BatchGetItem {
             key: EntityKey::from(id(TYPE)),
-            if_none_match: Some(received),
+            if_none_match: Some(held(received)),
         }],
         projection: Projection::Default,
         fresh: false,
@@ -104,7 +132,7 @@ fn a_validator_no_entity_tag_can_carry_is_sent_as_no_condition() {
         let body = BatchGetBody::encode(&BatchGetEntitiesRequest {
             items: vec![BatchGetItem {
                 key: EntityKey::from(id(TYPE)),
-                if_none_match: Some(Validator::from_bytes(token)),
+                if_none_match: Some(held(Validator::from_bytes(token))),
             }],
             projection: Projection::Default,
             fresh: false,
@@ -121,7 +149,7 @@ fn an_oversized_validator_is_refused_as_the_local_client_refuses_it() {
         let encoded = BatchGetBody::encode(&BatchGetEntitiesRequest {
             items: vec![BatchGetItem {
                 key: EntityKey::from(id(TYPE)),
-                if_none_match: Some(Validator::from_bytes(token)),
+                if_none_match: Some(held(Validator::from_bytes(token))),
             }],
             projection: Projection::Default,
             fresh: false,
@@ -139,7 +167,7 @@ fn an_oversized_validator_is_refused_as_the_local_client_refuses_it() {
     let at_bound = BatchGetBody::encode(&BatchGetEntitiesRequest {
         items: vec![BatchGetItem {
             key: EntityKey::from(id(TYPE)),
-            if_none_match: Some(Validator::from_bytes(vec![b'a'; 1024])),
+            if_none_match: Some(held(Validator::from_bytes(vec![b'a'; 1024]))),
         }],
         projection: Projection::Default,
         fresh: false,

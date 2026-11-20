@@ -125,7 +125,7 @@ fn idempotency_key_param() -> ParamSpec {
 fn etag_header() -> ResponseHeaderSpec {
     ResponseHeaderSpec::new(
         "ETag",
-        "The validator of this key under this `$select`",
+        "The validator of this key's current state, the same under every `$select`",
         ResponseHeaderType::String,
     )
 }
@@ -359,8 +359,10 @@ fn register_exact_read(router: Router, openapi: &dyn OpenApiRegistry, plane: Pla
              case-insensitive; an empty, duplicate, unknown or nested name is a 400. \
              `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always returned, \
              whether or not `$select` names them, so a deleted entity is still readable and \
-             reports it. No other query parameter is accepted. The `ETag` is scoped to the \
-             `$select`; `If-None-Match` with a current one returns a bodyless 304.",
+             reports it. No other query parameter is accepted. The `ETag` names the entity's \
+             state and is the same under every `$select`; `If-None-Match` with a current one \
+             returns a bodyless 304 whatever the `$select`, so a client sends only the `ETag` \
+             of a representation that holds every field it now selects.",
         )
         .tag(API_TAG);
     let builder = plane
@@ -374,7 +376,10 @@ fn register_exact_read(router: Router, openapi: &dyn OpenApiRegistry, plane: Pla
         .param(
             ParamSpec::header("If-None-Match")
                 .required(false)
-                .description("An earlier `ETag` of this key under the same `$select`, or `*`"),
+                .description(
+                    "An earlier `ETag` of this key, sent only while the client holds every \
+                     field this `$select` names, or `*`",
+                ),
         )
         .with_odata_select();
     let builder = match plane {

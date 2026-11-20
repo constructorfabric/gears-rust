@@ -4230,9 +4230,9 @@ async fn provenance_is_a_type_schema_group_absent_on_instances() {
         default.body
     );
     let selected = call(&router, exact(CF_TYPE, &format!("?$select={SELECT}"))).await;
-    assert_ne!(
+    assert_eq!(
         selected.etag, default.etag,
-        "the validator is scoped to the selection"
+        "one state, one validator, whatever the selection"
     );
 }
 
@@ -5434,9 +5434,11 @@ async fn a_current_etag_answers_304_with_the_same_etag() {
     }
 }
 
-/// A validator from before a revision, or for another `$select`, is not current.
+/// The `ETag` names the entity's state, not the `$select`: a current one answers `304`
+/// under any selection (holding the selected fields is the client's to track), and
+/// one from before a revision is not current.
 #[tokio::test]
-async fn a_stale_or_narrower_etag_answers_200_with_the_representation() {
+async fn a_current_etag_answers_any_select_and_a_stale_one_200() {
     let router = router_with_db().await;
     register_entity(&router, "arrange", CF_TYPE).await;
     let uri = format!("{PLATFORM}/entities/{CF_TYPE}");
@@ -5447,13 +5449,8 @@ async fn a_stale_or_narrower_etag_answers_200_with_the_representation() {
         get_if_none_match(&format!("{uri}?$select=content"), &stale),
     )
     .await;
-    assert_eq!(
-        wide.status,
-        StatusCode::OK,
-        "a narrow token never answers a wider read"
-    );
-    assert!(wide.body["content"].is_object(), "{:?}", wide.body);
-    assert_ne!(wide.etag.as_deref(), Some(stale.as_str()));
+    assert_eq!(wide.status, StatusCode::NOT_MODIFIED, "{:?}", wide.body);
+    assert_eq!(wide.etag.as_deref(), Some(stale.as_str()));
 
     let mut revised = schema(CF_TYPE);
     revised["title"] = json!("revised");

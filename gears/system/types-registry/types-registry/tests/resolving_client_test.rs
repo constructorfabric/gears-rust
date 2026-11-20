@@ -104,6 +104,15 @@ fn read() -> BatchGetEntitiesRequest {
     }
 }
 
+/// A platform read that must reach the registry resolved: the platform client's cache
+/// would otherwise answer from its window while the test moves between endpoints.
+fn routed() -> BatchGetEntitiesRequest {
+    BatchGetEntitiesRequest {
+        fresh: true,
+        ..read()
+    }
+}
+
 /// Registers [`CF_TYPE`] on `server` only, through its own local client, and waits.
 async fn seed(server: &PlatformServer) {
     let local = LocalClient::new(Arc::clone(&server.service));
@@ -168,18 +177,18 @@ async fn the_platform_resolving_client_follows_the_registry() {
         tuning(&resolutions),
     );
 
-    assert_unavailable(client.batch_get_entities(&platform(), read()).await);
+    assert_unavailable(client.batch_get_entities(&platform(), routed()).await);
 
     directory.point(Directory::At(first.base_url.clone()));
     let at_first = client
-        .batch_get_entities(&platform(), read())
+        .batch_get_entities(&platform(), routed())
         .await
         .expect("served with the process's token");
     assert!(found(&at_first), "{at_first:?}");
 
     directory.point(Directory::At(second.base_url.clone()));
     let at_second = client
-        .batch_get_entities(&platform(), read())
+        .batch_get_entities(&platform(), routed())
         .await
         .expect("served by the registry it moved to");
     assert_eq!(
@@ -189,13 +198,13 @@ async fn the_platform_resolving_client_follows_the_registry() {
     );
 
     directory.point(Directory::Down);
-    assert_unavailable(client.batch_get_entities(&platform(), read()).await);
+    assert_unavailable(client.batch_get_entities(&platform(), routed()).await);
     assert_unavailable(client.get_operation(&platform(), Uuid::nil()).await);
 
     directory.point(Directory::At(first.base_url.clone()));
     assert!(found(
         &client
-            .batch_get_entities(&platform(), read())
+            .batch_get_entities(&platform(), routed())
             .await
             .expect("recovered")
     ));
@@ -395,4 +404,98 @@ async fn await_completed(
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+}
+
+/// The platform client's cache sits above resolution (T36): a read it answers resolves
+/// nothing, one it cannot answer fails as the directory does, and a registration polled
+/// to its terminal outcome through the client leaves no stale entry.
+#[tokio::test]
+async fn the_platform_resolving_client_caches_above_resolution() {
+    let server = serve().await;
+    seed(&server).await;
+    let directory = Scripted::new(Directory::At(server.base_url.clone()));
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let client = PlatformTypesRegistryApiRestResolvingClient::new(
+        Arc::clone(&directory) as Arc<dyn EndpointResolver>,
+        "types-registry",
+        tuning(&resolutions),
+    );
+    let cached = read;
+    let version = |response: types_registry_sdk::BatchGetEntitiesResponse| match response
+        .0
+        .into_values()
+        .next()
+    {
+        Some(EntityLookup::Found { entity, .. }) => match entity.origin {
+            Some(types_registry_sdk::Origin::Managed {
+                resource_version, ..
+            }) => resource_version,
+            _ => panic!("a managed origin is selected"),
+        },
+        other => panic!("found, got {other:?}"),
+    };
+
+    let warm = client
+        .batch_get_entities(&platform(), cached())
+        .await
+        .expect("warm");
+    assert_eq!(version(warm), 1);
+
+    directory.point(Directory::Down);
+    let hit = client
+        .batch_get_entities(&platform(), cached())
+        .await
+        .expect("answered by the cache, resolving nothing");
+    assert_eq!(version(hit), 1);
+    assert_unavailable(client.batch_get_entities(&platform(), routed()).await);
+
+    directory.point(Directory::At(server.base_url.clone()));
+    let submitted = client
+        .register_entities(
+            &platform(),
+            key("resolving-cache-update"),
+            RegisterEntitiesRequest {
+                items: vec![RegisterItem {
+                    gts_id: gts::GtsId::try_new(CF_TYPE).unwrap(),
+                    content: json!({
+                        "$id": format!("gts://{CF_TYPE}"),
+                        "$schema": "http://json-schema.org/draft-07/schema#",
+                        "type": "object",
+                        "description": "revised",
+                    }),
+                    expected_resource_version: Some(1),
+                    skip_compatibility_check: false,
+                }],
+                dry_run: false,
+                publisher: PublisherContext {
+                    name: "resolving-client-test".to_owned(),
+                    version: "1.0.0".parse().unwrap(),
+                },
+            },
+        )
+        .await
+        .expect("accepted");
+    let Operation::Registration(done) = await_completed(&client, submitted.operation_id).await
+    else {
+        panic!("a registration");
+    };
+    assert!(
+        matches!(
+            done.items[0].outcome,
+            RegistrationOutcome::Succeeded {
+                resource_version: 2
+            }
+        ),
+        "{:?}",
+        done.items
+    );
+    let after = client
+        .batch_get_entities(&platform(), cached())
+        .await
+        .expect("read");
+    assert_eq!(
+        version(after),
+        2,
+        "no stale entry after the terminal outcome"
+    );
 }

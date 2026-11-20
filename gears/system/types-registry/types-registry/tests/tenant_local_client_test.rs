@@ -22,8 +22,8 @@ use types_registry::domain::policy::RegistrationPolicy;
 use types_registry::domain::registry_service::RegistryService;
 use types_registry::infra::outbox::OutboxDispatch;
 use types_registry_sdk::{
-    BatchGetEntitiesRequest, BatchGetItem, EntityField, EntityFilter, EntityKey, EntityKind,
-    EntityLookup, FieldSelection, IdempotencyKey, ListEntitiesRequest, OperationStatus,
+    BatchGetEntitiesRequest, BatchGetItem, Condition, EntityField, EntityFilter, EntityKey,
+    EntityKind, EntityLookup, FieldSelection, IdempotencyKey, ListEntitiesRequest, OperationStatus,
     PageRequest, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, Projection,
     PublisherContext, ReadOptions, RegisterEntitiesRequest, RegisterItem, TypesRegistryApi,
     TypesRegistryApiExt, Validator,
@@ -239,7 +239,7 @@ async fn a_batch_read_is_found_then_unchanged_under_the_same_select() {
     let conditional = batch(
         vec![BatchGetItem {
             key: key.clone(),
-            if_none_match: Some(etag.clone()),
+            if_none_match: first.0[&key].condition(),
         }],
         projection,
     );
@@ -267,7 +267,11 @@ async fn an_unusable_condition_reads_in_full_and_an_oversized_one_is_refused() {
         batch(
             vec![BatchGetItem {
                 key: key.clone(),
-                if_none_match: Some(Validator::from_bytes(validator)),
+                if_none_match: Some(Condition::new(
+                    &key,
+                    Validator::from_bytes(validator),
+                    Projection::Default,
+                )),
             }],
             Projection::Default,
         )

@@ -30,7 +30,7 @@ Responses are compared whole as JSON values. The mandatory `gts_id`, `gts_uuid`,
 - [Conditional reads](#conditional-reads)
   - [TR-READ-301 — An exact ETag survives no-op admission and changes after revision](#tr-read-301--an-exact-etag-survives-no-op-admission-and-changes-after-revision)
   - [TR-READ-302 — Batch revalidation answers each key independently](#tr-read-302--batch-revalidation-answers-each-key-independently)
-  - [TR-READ-303 — A validator belongs to one projection](#tr-read-303--a-validator-belongs-to-one-projection)
+  - [TR-READ-303 — A validator names the state under every projection](#tr-read-303--a-validator-names-the-state-under-every-projection)
   - [TR-READ-304 — A base refresh invalidates its derived schema's ETag](#tr-read-304--a-base-refresh-invalidates-its-derived-schemas-etag)
 
 ## Exact read
@@ -221,15 +221,15 @@ Responses are compared whole as JSON values. The mandatory `gts_id`, `gts_uuid`,
 
 **Then:** the first conditional batch returns HTTP `200`: other is `unchanged` with the same `etag` and no `entity`; person is `found` with its revised document and new `etag`; the unconditioned Instance is `found` with its own content and `etag`; the absent key is `not_found` without either field. The second batch returns HTTP `200` with three `unchanged` results. Match every result by echoed key after checking completeness and uniqueness, since batch order is not contractual; a UUID key is echoed lowercase and hyphenated.
 
-### TR-READ-303 — A validator belongs to one projection
+### TR-READ-303 — A validator names the state under every projection
 
 **Fixtures:** [person_schema](../fixtures/reading/person_schema.json), [person_instance](../fixtures/reading/person_instance.json), [other_schema](../fixtures/reading/other_schema.json), [other_instance](../fixtures/reading/other_instance.json).
 
 **Given:** Register `person_schema`, `person_instance`, `other_schema`, and `other_instance` in one fresh namespace. Person and other schema documents differ.
 
-**When:** GET `person_schema` and `person_instance` without `$select` and retain their ETags. GET each key with `$select=content` and `If-None-Match` set to its metadata ETag; repeat each with its content response's ETag. GET `other_schema` with `$select=content` as a contrasting key.
+**When:** GET `person_schema` and `person_instance` without `$select` and retain their ETags. GET each key with `$select=content` unconditionally, then again with `If-None-Match` set to its retained ETag. GET `other_schema` with `$select=content` as a contrasting key.
 
-**Then:** both wider reads return `200`, their own full authored content and ETags different from their metadata ETags; their repeats return bodyless `304` carrying the corresponding content ETags. The other schema returns its own document. A metadata validator never declares a wider schema or Instance representation unchanged.
+**Then:** each content read returns `200`, its own full authored content and the same ETag as its metadata read: one state has one validator under every `$select`. The conditional content reads return bodyless `304` carrying that ETag — the client holds the content by then, and sending a validator only for fields it holds is the client's responsibility (the SDK enforces it with a typed condition). The other schema returns its own document.
 
 ### TR-READ-304 — A base refresh invalidates its derived schema's ETag
 
