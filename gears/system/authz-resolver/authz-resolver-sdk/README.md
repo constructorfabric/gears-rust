@@ -24,9 +24,10 @@ and live alternatives.
 
 ### PolicyEnforcer (Recommended)
 
-The `PolicyEnforcer` encapsulates the full PEP flow — most services should use this:
+`PolicyEnforcer` builds the request, calls the resolver, checks the decision, and compiles the returned constraints into an `AccessScope`. Apply that scope through SecureORM.
 
 ```rust
+use authz_resolver_sdk::AuthZResolverApi;
 use authz_resolver_sdk::pep::{AccessRequest, PolicyEnforcer, ResourceType};
 use sea_orm::EntityTrait;
 use toolkit_db::secure::SecureEntityExt;
@@ -36,16 +37,16 @@ use toolkit_security::pep_properties;
 // (any `DBRunner`, e.g. from `db.conn()`).
 
 // Define resource type with supported constraint properties
-const USER: ResourceType = ResourceType {
-    name: "gts.cf.core.users.user.v1~",
-    supported_properties: &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
-};
+const USER: ResourceType = ResourceType::from_static(
+    "gts.cf.core.users.user.v1~",
+    &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
+);
 
 // Create enforcer once during service init.
 // In-process: resolve the client eagerly. Out-of-process consumers (the client
 // is wired after `init`) should use `PolicyEnforcer::from_hub(hub)` instead.
 let authz = hub.get::<dyn AuthZResolverApi>()?;
-let enforcer = PolicyEnforcer::new(authz.clone());
+let enforcer = PolicyEnforcer::new(authz);
 
 // LIST: opt in to empty scopes and apply the whole scope through SecureORM.
 // An empty scope compiles to SQL `FALSE`, so the query returns no rows.
@@ -87,31 +88,41 @@ let scope = enforcer.access_scope_with(
         .tenant_mode(TenantMode::RootOnly)
         .resource_property(pep_properties::OWNER_TENANT_ID, target_tenant_id),
 ).await?;
+
+// new_user is a user::ActiveModel with its tenant set to target_tenant_id.
+let created = toolkit_db::secure::secure_insert::<user::Entity>(new_user, &scope, &conn).await?;
 ```
+
+Validate the proposed row against the returned scope before inserting. For a scoped entity, `secure_insert` checks populated columns and skips filters on unset columns in live branches. Materialize the values used for authorization first.
+
+The example assumes the PDP preserves the requested tenant equality. The SDK forwards the property but does not verify `eq(owner_tenant_id, target_tenant_id)` in every allow branch. A custom PEP enforcing this requirement must check the decoded response before compilation. [Implementation status](../../../../docs/arch/authorization/DESIGN.md#implementation-status)
 
 ### Low-Level: Direct Evaluation
 
-For cases where `PolicyEnforcer` is not suitable:
+Direct `AuthZResolverApi::evaluate` calls return decision data. A custom PEP must perform [response validation](../../../../docs/arch/authorization/DESIGN.md#fail-closed-rules) and enforce the resulting scope on the operation.
 
 ```rust
 use authz_resolver_sdk::pep::{
     CompileOptions, compile_to_access_scope, compile_to_access_scope_with_options,
 };
-use authz_resolver_sdk::{AccessDenial, AuthZResolverApi, EnforcerError, EvaluationRequest};
+use authz_resolver_sdk::{AccessDenial, AuthZResolverApi, EnforcerError};
 use toolkit_security::PlatformSecurityContext;
 
-// Inside a function returning `Result<_, E>` where `E: From<EnforcerError>`.
+// The caller's error type propagates both hub lookup and enforcer errors.
 // Lift compile errors with `EnforcerError::from`, which classifies
 // `ConstraintCompileError::ScopeMatchesNothing` as an access denial.
 
-// `request: EvaluationRequest` carries the caller as `request.subject` (built
-// from the caller's `SecurityContext`, as `PolicyEnforcer::build_request`
-// does). `evaluate` is a platform-plane call: pass the credential-free
-// outbound marker; the transport attaches this gear's service identity.
+// Build a point-read request from the caller's SecurityContext.
+let request = enforcer.build_request(&ctx, &USER, "get", Some(resource_id), true);
+let supported_properties = USER.supported_properties();
+
+// The resolver receives the subject in the request. For a remote call, the
+// transport attaches the calling service's credential to the platform request.
 let authz = hub.get::<dyn AuthZResolverApi>()?;
 let response = authz
     .evaluate(PlatformSecurityContext::outbound_marker(), request)
-    .await?;
+    .await
+    .map_err(EnforcerError::from)?;
 
 // The low-level compiler does not check the decision: stop on a deny first.
 if !response.decision {
@@ -122,10 +133,10 @@ if !response.decision {
 }
 ```
 
-Only after that guard, compile the constraints in one of two modes:
+The following examples assume a request with no resource properties and a response containing only `eq` and `in` predicates. The low-level functions receive no negotiated capability set. A custom PEP must check native predicates against the capabilities sent in the request before compilation. Native group predicates also require the resource descriptor available through `PolicyEnforcer`. For requests with resource properties, verify each requested equality in every decoded branch before compilation.
 
 ```rust
-// Point operations and permission gates: the default refuses a scope whose
+// Point operations: the default refuses a scope whose
 // every compiled branch is empty with `ConstraintCompileError::ScopeMatchesNothing`.
 let scope = compile_to_access_scope(&response, true, supported_properties)
     .map_err(EnforcerError::from)?;
@@ -167,7 +178,7 @@ pub struct EvaluationResponse {
 
 ### Constraints
 
-PDP returns row-level constraints when `decision=true`:
+A PDP permit for a resource operation must carry row-level constraints.
 
 ```rust
 pub struct Constraint {
@@ -178,10 +189,15 @@ pub struct Constraint {
 pub enum Predicate {
     Eq(EqPredicate),   // property = value
     In(InPredicate),   // property IN (values)
+    InGroup(InGroupPredicate),
+    InGroupSubtree(InGroupSubtreePredicate),
+    InTenantSubtree(InTenantSubtreePredicate),
 }
 ```
 
 ## PEP Compilation Matrix
+
+The table describes the current compiler API for a decoded `decision: true` response. Choose the flag by [operation semantics](../../../../docs/arch/authorization/DESIGN.md#require_constraints-flag), independently of the action name.
 
 | `require_constraints` | constraints | Result |
 |---|---|---|
@@ -190,7 +206,7 @@ pub enum Predicate {
 | `true` | absent or empty array | Error (fail-closed) |
 | `true` | nonempty | Compile to `AccessScope` |
 
-Unknown properties fail that constraint (fail-closed). If ALL constraints fail, access is denied.
+An unsupported property invalidates its branch. If every branch is invalid, the compiler returns an error and the operation must stop. An empty outer `constraints` array differs from a predicate with `values: []`; see [empty-scope handling](../../../../docs/arch/authorization/DESIGN.md#permission-gates-and-empty-scopes).
 
 Empty `In`, `InGroup`, and `InGroupSubtree` sets are valid and compile to SQL `FALSE`; other OR branches may match. Empty `predicates: []` is malformed. Property, capability, and tenant checks still apply. See [Permission gates and empty scopes](#permission-gates-and-empty-scopes) for handling an all-empty scope.
 

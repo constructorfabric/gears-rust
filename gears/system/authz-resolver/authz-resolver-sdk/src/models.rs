@@ -58,19 +58,18 @@ pub enum BarrierMode {
 
 /// PEP-level capability declarations.
 ///
-/// Tells the PDP which advanced features the PEP can handle so the PDP
-/// can tailor its response accordingly.
+/// The PEP advertises which predicates it can enforce. The PDP uses these
+/// capabilities to choose a supported constraint representation.
 ///
-/// **Note:** `GroupMembership` and `GroupHierarchy` require access to the
-/// Resource Group tables (`resource_group`, `resource_group_membership`, `resource_group_closure`).
-/// Services that can join against these tables may declare the capabilities;
-/// the PDP will then return `InGroup`/`InGroupSubtree` predicates directly.
-/// Each capable [`crate::pep::ResourceType`] must explicitly enable native
-/// group predicates, use an exact canonical GTS type path as its resource name,
-/// and support the `id` property. The enforcer uses that same type to qualify
-/// RG membership rows and suppresses group capabilities when any prerequisite
-/// is absent. Services without table access should omit these capabilities —
-/// the PDP will degrade group predicates to explicit `In` with pre-resolved IDs.
+/// Advertise `GroupMembership` when the PEP can join `resource_group_membership`
+/// with `gts_type`. For subtree queries, also advertise `GroupHierarchy`
+/// when the PEP can join `resource_group_closure`.
+///
+/// The enforcer sends group capabilities only for resources that opt in to
+/// native group predicates, have a canonical GTS type path, and support `id`.
+/// SecureORM uses that type path to qualify membership rows in the query.
+/// Without the required capabilities, a PDP enforcing a group restriction
+/// must expand it to explicit resource IDs or deny access.
 #[derive(
     Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema, utoipa::ToSchema,
 )]
@@ -145,7 +144,9 @@ pub struct Resource {
     /// Specific resource ID (for GET/UPDATE/DELETE on a single resource).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<Uuid>,
-    /// Additional resource properties for policy evaluation.
+    /// Under the resource-condition contract, each entry requests equality on a target property.
+    /// The SDK forwards this map to the configured PDP. The PEP must enforce the
+    /// requested equalities together with policy restrictions.
     #[serde(default)]
     pub properties: HashMap<String, serde_json::Value>,
 }
@@ -178,8 +179,10 @@ pub struct EvaluationRequestContext {
     #[serde(default)]
     pub token_scopes: Vec<String>,
     /// Whether the PDP should return row-level constraints.
-    /// - `true` for LIST/GET/UPDATE/DELETE (need scope filtering)
-    /// - `false` for CREATE (just need decision)
+    /// Set to `true` for resource reads and writes, including CREATE. A
+    /// standalone decision-only gate may accept absent constraints.
+    /// An omitted wire field defaults to `false`. `PolicyEnforcer` sends
+    /// `true` by default.
     #[serde(default)]
     pub require_constraints: bool,
     /// PEP capabilities (tells PDP what the PEP can handle).
@@ -202,7 +205,8 @@ pub struct EvaluationRequestContext {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema, utoipa::ToSchema)]
 pub struct EvaluationResponseContext {
     /// Row-level constraints to apply when `decision` is `true`.
-    /// Empty when `require_constraints` was `false` or when access is unrestricted.
+    /// On an allow decision, an empty outer list is accepted only when the
+    /// request allowed a decision without constraints.
     /// Multiple constraints are `ORed` (any one matching is sufficient).
     #[serde(default)]
     pub constraints: Vec<Constraint>,

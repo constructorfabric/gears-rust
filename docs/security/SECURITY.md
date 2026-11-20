@@ -163,9 +163,9 @@ Plain AuthZEN point-in-time `true/false` decisions are insufficient for LIST que
 |---|---|
 | `eq(property, value)` | Exact match (e.g., `owner_id`) |
 | `in(property, values)` | Set membership |
-| `in_tenant_subtree(root_id, barrier_mode, status)` | Hierarchical tenant scoping via `tenant_closure` |
-| `in_group(group_ids)` | Resource group membership |
-| `in_group_subtree(group_ids)` | Hierarchical group membership |
+| `in_tenant_subtree(property, root_tenant_id, barrier_mode, descendant_status)` | Hierarchical tenant scoping via `tenant_closure` |
+| `in_group(property, group_ids)` | Resource group membership |
+| `in_group_subtree(property, ancestor_ids)` | Hierarchical group membership |
 
 Constraints **OR** across alternatives, **AND** predicates within each constraint. PEP compiles constraints into `AccessScope` → SecureORM translates to SQL `WHERE` clauses.
 
@@ -176,17 +176,19 @@ Constraints **OR** across alternatives, **AND** predicates within each constrain
 - A decoded branch with unsupported properties/capabilities, invalid semantic values, or `predicates: []` fails compilation. Discard that entire branch; reject the response if no branch compiles successfully.
 - Valid empty branches are fully validated, then normalized out of `AccessScope::constraints()` (kept in `original_constraints()`). An all-empty scope is refused by default by both the enforcer and the low-level `compile_to_access_scope`; PEP-local `AccessRequest::allow_empty_scope(true)` (or `CompileOptions::allow_empty_scope(true)`) returns it, as a deny-all-equivalent scope, for queries or catalog gates. Invalid siblings are still discarded (strict rejection: #5958).
 
-Empty value lists inside `in`, `in_group`, and `in_group_subtree` are valid predicates that match nothing, compiled to `FALSE`; they do not invalidate other OR branches. With `decision: true`, absent or empty outer `constraints` permit unrestricted row access only when `require_constraints: false`. See [the full PEP contract](../arch/authorization/DESIGN.md#pep-enforcement).
+Empty value lists inside `in`, `in_group`, and `in_group_subtree` are valid predicates that match nothing, compiled to `FALSE`; they do not invalidate other OR branches. With `decision: true`, absent or empty outer `constraints` produce an unconstrained scope only when `require_constraints: false`. Use that mode only for a standalone permission check. If the PDP returns constraints, the PEP must enforce them or refuse the operation. Resource reads and writes require constraints. See [the full PEP contract](../arch/authorization/DESIGN.md#pep-enforcement).
+
+**Resource conditions** — The target contract requires every allow-response branch to preserve each requested `resource.properties` equality. The current SDK forwards the properties but does not verify their presence in the response. See the [contract](../arch/authorization/DESIGN.md#scope-determination) and its [implementation gaps](../arch/authorization/DESIGN.md#implementation-status).
 
 **Capability negotiation** — PEP sends `capabilities`, `supported_properties`, and `require_constraints` with each evaluation request. The PDP must not emit unsupported property names and must degrade gracefully (expand groups to explicit `in` lists, or deny).
 
-**Token scopes as capability ceiling** — `effective_access = min(token_scopes, user_permissions)`. First-party apps typically carry `["*"]` (unrestricted).
+**Token scopes as capability ceiling** — Policy must intersect the token’s scopes with the subject’s permissions. A wildcard scope (`["*"]`) leaves the subject’s permissions as the ceiling. The PEP forwards the scopes. The bundled static and TR PDPs do not evaluate them. Configured API Gateway route policies can enforce required scopes on matching routes. [PDP implementation status](../arch/authorization/DESIGN.md#implementation-status)
 
 **Deny contract** — the design requires `decision: false` to include a `deny_reason` with a machine-readable `error_code`, but the current SDK model accepts an absent reason for interoperability and still denies. Individual gears may log the reason and map it to a generic client error; centralized audit logging is not enforced by `PolicyEnforcer`.
 
 **404 vs 403 for point reads** — Constrained queries returning 0 rows yield 404, preventing existence leakage.
 
-**TOCTOU mitigation** — For UPDATE/DELETE, PEP prefetches the target attribute and uses `eq` predicates in the WHERE clause so the mutation is atomic with the authorization check.
+**TOCTOU mitigation** — A prefetch can supply a required equality on the current row. Enforce the full scope and target ID in the UPDATE or DELETE statement. Moving a resource to another tenant or owner requires authorization of both its source and its destination in an atomic transition. [Scoped mutation patterns and helper limitations](../toolkit_unified_system/06_authn_authz_secure_orm.md#update--delete--prefetch--toctou-safety)
 
 ### Multi-Tenancy — Tenant Resolver
 
@@ -203,7 +205,7 @@ Hierarchical multi-tenancy with a **single-root tree topology** (exactly one ten
 
 - **Plugin architecture** — gateway discovers a backend plugin by GTS vendor string; routes all calls through `TenantResolverPluginClient`. Built-in plugins: `static-tr-plugin` (in-memory tree from config), `single-tenant-tr-plugin` (enforces `ctx.subject_tenant_id()` as the only tenant).
 - **Barrier-aware traversal** — ancestor/descendant walks respect `self_managed` barriers and use visited sets for cycle safety.
-- **Status filtering** — queries filter by `TenantStatus`; filtering a suspended parent excludes its entire subtree.
+- **Status filtering** — Tenant Resolver traversal can prune subtrees: the built-in static plugin skips a filtered-out child and its descendants. This differs from the native SQL `descendant_status` predicate, which filters each candidate tenant (including the root self-row) by its own status and does not inspect intermediate ancestors. Do not assume these paths have identical status-pruning semantics; see [Tenant Subtree Predicate](../arch/authorization/DESIGN.md#3-tenant-subtree-predicate-op-in_tenant_subtree).
 - **PIP role** — Tenant Resolver serves as a **Policy Information Point (PIP)**: the AuthZ plugin queries it for hierarchy data when building tenant constraints.
 
 ### Resource Groups
@@ -295,14 +297,14 @@ OAGW is a **centralized outbound API gateway** built on the platform's upstream 
 
 ### Authorization (Platform PEP)
 
-Every proxy request is authorized via `PolicyEnforcer` before routing:
+Every proxy request is authorized via `PolicyEnforcer` before routing. In `ProxyGrant::authorize`, the gateway checks the caller’s `proxy:invoke` permission in the subject’s tenant.
 
 ```rust
-self.policy_enforcer
+enforcer
     .access_scope_with(
         &ctx,
-        &resources::PROXY,                      // gts.cf.core.oagw.proxy.v1~
-        actions::INVOKE,
+        &PROXY_RESOURCE,
+        INVOKE,
         None,
         &AccessRequest::new()
             .require_constraints(false)
@@ -310,6 +312,8 @@ self.policy_enforcer
     )
     .await?;
 ```
+
+The current gate accepts a nonempty scope without applying its row predicates to the proxy target.
 
 Ancestor bind flows (descendant reusing parent upstream aliases) have separate authorization actions: `bind`, `override_auth`, `override_rate`, `add_plugins`.
 

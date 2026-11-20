@@ -2,16 +2,15 @@
 
 # Authorization Usage Scenarios
 
-This document demonstrates the authorization model through concrete examples.
-Each scenario shows the full flow: HTTP request → PDP evaluation → SQL execution.
-
-For the core authorization design, see [DESIGN.md](./DESIGN.md).
+These scenarios illustrate the authorization contract from the HTTP request through PDP evaluation to SQL execution. The design describes [scope determination](./DESIGN.md#scope-determination) and [current SDK limitations](./DESIGN.md#implementation-status).
 
 All examples use a Task Management domain:
 - **Resource:** `tasks` table with `id`, `owner_tenant_id`, `owner_id`, `title`, `status`
 - **Owner:** `owner_id` references the subject (user) who owns/is assigned the task
 - **Resource Groups:** Projects (tasks belong to projects)
 - **Tenant Model:** Hierarchical multi-tenancy on a single-root tree — see [TENANT_MODEL.md](./TENANT_MODEL.md) for details on topology, barriers, and closure tables
+
+Identifiers such as `T1-uuid`, `alice-uuid`, and `task456-uuid` are readable placeholders. Replace them with valid UUIDs when exercising the API. The PEP forwards the scopes from the authenticated context. The requests below show first-party tokens with `token_scopes: ["*"]`. Omitting the wire field yields an empty list, which grants no token scopes.
 
 ---
 
@@ -25,7 +24,7 @@ All examples use a Task Management domain:
     - [Capabilities and PDP Response](#capabilities-and-pdp-response)
     - [When No Projection Tables Are Needed](#when-no-projection-tables-are-needed)
     - [When to Use `tenant_closure`](#when-to-use-tenant_closure)
-    - [`resource_group_membership` — RG-Internal Only](#resource_group_membership--rg-internal-only)
+    - [`resource_group_membership` — When to Project](#resource_group_membership--when-to-project)
     - [When to Use `resource_group_closure`](#when-to-use-resource_group_closure)
     - [Combinations Summary](#combinations-summary)
   - [Scenarios](#scenarios)
@@ -36,7 +35,7 @@ All examples use a Task Management domain:
       - [S04: DELETE, tenant subtree, PEP has tenant\_closure](#s04-delete-tenant-subtree-pep-has-tenant_closure)
       - [S05: CREATE, PEP-provided tenant context](#s05-create-pep-provided-tenant-context)
       - [S06: CREATE, subject tenant context (no explicit tenant in API)](#s06-create-subject-tenant-context-no-explicit-tenant-in-api)
-      - [S07: LIST, billing data, ignore barriers (barrier\_mode: "none")](#s07-list-billing-data-ignore-barriers-barrier_mode-none)
+      - [S07: LIST, billing data, ignore barriers (barrier\_mode: "ignore")](#s07-list-billing-data-ignore-barriers-barrier_mode-ignore)
     - [Without `tenant_closure`](#without-tenant_closure)
       - [S08: LIST, tenant subtree, PEP without tenant\_closure](#s08-list-tenant-subtree-pep-without-tenant_closure)
       - [S09: GET, tenant subtree, PEP without tenant\_closure](#s09-get-tenant-subtree-pep-without-tenant_closure)
@@ -57,11 +56,15 @@ All examples use a Task Management domain:
       - [S22: LIST, multiple access paths (OR)](#s22-list-multiple-access-paths-or)
       - [S23: Access denied](#s23-access-denied)
     - [Subject Owner-Based Access](#subject-owner-based-access)
-      - [S24: LIST, owner-only access](#s24-list-owner-only-access)
+      - [S24: LIST, no owner filter, owner-only policy](#s24-list-no-owner-filter-owner-only-policy)
       - [S25: GET, owner-only access](#s25-get-owner-only-access)
       - [S26: UPDATE, owner-only mutation](#s26-update-owner-only-mutation)
       - [S27: DELETE, owner-only mutation](#s27-delete-owner-only-mutation)
       - [S28: CREATE, owner-only](#s28-create-owner-only)
+      - [S29: LIST, explicitly selected own resources](#s29-list-explicitly-selected-own-resources)
+      - [S30: LIST, another owner selected](#s30-list-another-owner-selected)
+      - [S31: LIST, no owner filter, tenant-wide policy](#s31-list-no-owner-filter-tenant-wide-policy)
+      - [S32: Owner conditions across resource CRUD](#s32-owner-conditions-across-resource-crud)
   - [TOCTOU Analysis](#toctou-analysis)
     - [When TOCTOU Matters](#when-toctou-matters)
     - [How Each Scenario Handles TOCTOU](#how-each-scenario-handles-toctou)
@@ -92,7 +95,7 @@ All examples use a Task Management domain:
 1. Call an external service to resolve the tenant hierarchy, or
 2. Receive thousands of explicit tenant IDs from PDP (doesn't scale)
 
-Projection tables allow PEP to JOIN against local data, making authorization O(1) regardless of hierarchy size.
+Projection tables let the PEP join against indexed local data. Query cost still depends on the number of matching hierarchy and resource rows.
 
 **Types of projection tables:**
 
@@ -104,7 +107,7 @@ Projection tables allow PEP to JOIN against local data, making authorization O(1
 
 **Closure tables** specifically solve the hierarchy traversal problem. A closure table contains all ancestor-descendant pairs, allowing subtree queries with a simple `WHERE ancestor_id = X` instead of recursive tree walking.
 
-> **Progressive projection:** do not add projections speculatively — each one creates an additional database and sync load. In a **monolith** with a single shared DB, no projections are needed (PEP JOINs against canonical tables). In **microservices**, start with `resource_group` + `resource_group_closure` (small tables, covers hierarchy). Only add `resource_group_membership` when profiling confirms the two-request pattern is unacceptable for the latency budget — this table grows as `M_resources × N_groups_per_resource` and is expected to be **10×+ larger** than hierarchy tables (see [RG DESIGN §Storage Estimates](../../../gears/system/resource-group/docs/DESIGN.md#storage-estimates)).
+> **Progressive projection:** do not add projections speculatively — each one creates an additional database and sync load. In a **monolith** with a single shared DB, no projections are needed (PEP JOINs against canonical tables). In **microservices**, start with `resource_group` + `resource_group_closure` (small tables, covers hierarchy). Only add `resource_group_membership` when profiling confirms the two-request pattern is unacceptable for the latency budget — this table grows as `M_resources × N_groups_per_resource` and is expected to be **10×+ larger** than hierarchy tables (see [RG production scale](../../../gears/system/resource-group/docs/PRD.md#65-expected-production-scale)).
 
 ### Choosing Projection Tables
 
@@ -115,12 +118,12 @@ The choice depends on the application's tenant structure, resource organization,
 | PEP Capability | Projection Table | Prefetch | PDP Response | Available To |
 |----------------|-----------------|----------|--------------|--------------|
 | `tenant_hierarchy` | tenant_closure ✅ | **No** | `in_tenant_subtree` predicate | Domain services |
-| (none) | ❌ | **Yes** | `eq`/`in` or decision only | Domain services |
-| `group_hierarchy` _(Phase 2 — planned)_ | resource_group_closure + resource_group_membership ✅ | **No** | `in_group_subtree` predicate | RG gear only |
-| `group_membership` _(Phase 2 — planned)_ | resource_group_membership ✅ | **No** | `in_group` predicate | RG gear only |
-| (none for groups) | ❌ | **Yes** | explicit resource IDs via `in` | Domain services |
+| (none) | ❌ | Optional for point operations | `eq`/`in` constraints required for CRUD | Domain services |
+| `group_membership` + `group_hierarchy` | resource_group_closure + resource_group_membership + gts_type ✅ | **No** | `in_group_subtree` predicate | PEPs with local tables and native group opt-in |
+| `group_membership` | resource_group_membership + gts_type ✅ | **No** | `in_group` predicate | PEPs with local tables and native group opt-in |
+| (none for groups) | ❌ | Not required for LIST | explicit resource IDs via `in` | Domain services |
 
-**Note:** `group_membership` and `group_hierarchy` capabilities require the `resource_group_membership` table. This table is expected to be 10×+ larger than other projections. By default, domain services operate in the "(none for groups)" row — PDP resolves group memberships into explicit resource IDs. See [below](#resource_group_membership--when-to-project) for guidance on when projection is warranted.
+**Note:** `group_membership` and `group_hierarchy` capabilities require the `resource_group_membership` table. This table is expected to be 10×+ larger than other projections. Domain services without group projections need a PDP that can resolve group membership or deny the operation. See [below](#resource_group_membership--when-to-project) for guidance on when projection is warranted.
 
 ### When No Projection Tables Are Needed
 
@@ -130,7 +133,7 @@ The choice depends on the application's tenant structure, resource organization,
 | Few tenants per vendor | PDP can return explicit tenant IDs in `in` predicate |
 | Flat tenant structure | No hierarchy → `in_tenant_subtree` not needed |
 | No resource groups | `in_group*` predicates not used |
-| Low frequency LIST requests | Prefetch overhead is acceptable |
+| Low frequency LIST requests | PDP expansion to explicit IDs may meet the latency budget without local projections |
 
 **Important:** The first condition applies regardless of overall tenant model. Even in a hierarchical multi-tenant system, specific endpoints may be designed to work within a single context tenant without subtree access. This is an endpoint-level decision, not a system-wide constraint.
 
@@ -149,7 +152,7 @@ The choice depends on the application's tenant structure, resource organization,
 
 ### `resource_group_membership` — When to Project
 
-The `resource_group_membership` table grows as `M_resources × N_groups_per_resource` and is expected to be **10× or more larger** than other projection tables. Concrete estimates depend on vendor scale — see [RG DESIGN §Storage Estimates](../../../gears/system/resource-group/docs/DESIGN.md#storage-estimates). Do not project it speculatively.
+The `resource_group_membership` table grows as `M_resources × N_groups_per_resource` and is expected to be **10× or more larger** than other projection tables. Concrete estimates depend on vendor scale — see [RG production scale](../../../gears/system/resource-group/docs/PRD.md#65-expected-production-scale). Do not project it speculatively.
 
 **Decision guide:**
 
@@ -166,9 +169,9 @@ The `resource_group_membership` table grows as `M_resources × N_groups_per_reso
 
 This works well for simple paginated listing. However, when the query includes filters by resource group attributes (e.g., `GET /tasks?status=pending&project={projectX}&after=…&limit=50`), the pattern requires **N additional round-trips** to the RG Membership API — one per filter-group or page — not just a single +1. If this N-request fan-out violates the latency budget, that is the signal to project the membership table locally.
 
-**For domain services (default):** PDP resolves group memberships and returns explicit resource IDs via `in` predicates (capability degradation). No local membership table is needed.
+**For domain services without group tables:** S18–S22 assume a PDP that resolves group membership for a specific resource or returns explicit resource IDs for a list. The current TR plugin has no membership lookup. When a request supplies a group selector and lacks the corresponding native capabilities, the plugin denies it.
 
-**Within the RG gear:** `in_group` and `in_group_subtree` predicates use membership natively for efficient SQL subqueries.
+Production RG wiring advertises no native group capabilities. Its group resource uses group closure to represent the hierarchy. The native predicates in S14–S17 apply to an opted-in member resource, such as a task.
 
 ### When to Use `resource_group_closure`
 
@@ -189,7 +192,7 @@ This works well for simple paginated listing. However, when the query includes f
 | Project-based SaaS (flat tenants + projects) | ❌ | ✅ | ❌ |
 | Complex SaaS (hierarchy + nested projects) | ✅ | ✅ | ✅ |
 
-> **Note:** Rows that use `group_membership` or `group_closure` describe RG-gear / monolith reference deployments where the `resource_group_membership` table is co-located with the domain service. Domain services in separate deployments do **not** project `resource_group_membership` (too large at scale). For those cases, PDP resolves group memberships and returns explicit resource IDs via `in` predicates (capability degradation) — the domain service remains in the top row regardless of group usage.
+> **Note:** Rows that use `group_membership` or `group_closure` require local membership tables and the `gts_type` identity dictionary, supplied by RG, a shared database, or an explicit projection. By default, separately deployed domain services avoid membership projections; add one only when profiling justifies it. Without native group support, PDP must expand group access to explicit resource IDs via `in`, or deny if it cannot. The group columns then remain ❌; the need for `tenant_closure` is independent of group usage.
 
 ---
 
@@ -230,8 +233,9 @@ Authorization: Bearer <token>
     "tenant_context": {
       "mode": "subtree",
       "root_id": "T1-uuid",
-      "barrier_mode": "all"
+      "barrier_mode": "respect"
     },
+    "token_scopes": ["*"],
     "require_constraints": true,
     "capabilities": ["tenant_hierarchy"],
     "supported_properties": ["owner_tenant_id", "id"]
@@ -248,10 +252,10 @@ Authorization: Bearer <token>
       {
         "predicates": [
           {
-            "type": "in_tenant_subtree",
-            "resource_property": "owner_tenant_id",
+            "op": "in_tenant_subtree",
+            "property": "owner_tenant_id",
             "root_tenant_id": "T1-uuid",
-            "barrier_mode": "all"
+            "barrier_mode": "respect"
           }
         ]
       }
@@ -302,6 +306,7 @@ Authorization: Bearer <token>
       "mode": "subtree",
       "root_id": "T1-uuid"
     },
+    "token_scopes": ["*"],
     "require_constraints": true,
     "capabilities": ["tenant_hierarchy"],
     "supported_properties": ["owner_tenant_id", "id"]
@@ -318,8 +323,8 @@ Authorization: Bearer <token>
       {
         "predicates": [
           {
-            "type": "in_tenant_subtree",
-            "resource_property": "owner_tenant_id",
+            "op": "in_tenant_subtree",
+            "property": "owner_tenant_id",
             "root_tenant_id": "T1-uuid"
           }
         ]
@@ -336,7 +341,7 @@ WHERE id = 'task456-uuid'
   AND owner_tenant_id IN (
     SELECT descendant_id FROM tenant_closure
     WHERE ancestor_id = 'T1-uuid'
-      AND barrier = 0  -- barrier_mode defaults to "all"
+      AND barrier = 0  -- barrier_mode defaults to "respect"
   )
 ```
 
@@ -379,6 +384,7 @@ Content-Type: application/json
       "mode": "subtree",
       "root_id": "T1-uuid"
     },
+    "token_scopes": ["*"],
     "require_constraints": true,
     "capabilities": ["tenant_hierarchy"],
     "supported_properties": ["owner_tenant_id", "id"]
@@ -395,8 +401,8 @@ Content-Type: application/json
       {
         "predicates": [
           {
-            "type": "in_tenant_subtree",
-            "resource_property": "owner_tenant_id",
+            "op": "in_tenant_subtree",
+            "property": "owner_tenant_id",
             "root_tenant_id": "T1-uuid"
           }
         ]
@@ -414,7 +420,7 @@ WHERE id = 'task456-uuid'
   AND owner_tenant_id IN (
     SELECT descendant_id FROM tenant_closure
     WHERE ancestor_id = 'T1-uuid'
-      AND barrier = 0  -- barrier_mode defaults to "all"
+      AND barrier = 0  -- barrier_mode defaults to "respect"
   )
 ```
 
@@ -437,7 +443,7 @@ WHERE id = 'task456-uuid'
   AND owner_tenant_id IN (
     SELECT descendant_id FROM tenant_closure
     WHERE ancestor_id = 'T1-uuid'
-      AND barrier = 0  -- barrier_mode defaults to "all"
+      AND barrier = 0  -- barrier_mode defaults to "respect"
   )
 ```
 
@@ -482,6 +488,7 @@ Content-Type: application/json
       "mode": "root_only",
       "root_id": "T2-uuid"
     },
+    "token_scopes": ["*"],
     "require_constraints": true,
     "capabilities": ["tenant_hierarchy"],
     "supported_properties": ["owner_tenant_id", "id"]
@@ -498,8 +505,8 @@ Content-Type: application/json
       {
         "predicates": [
           {
-            "type": "eq",
-            "resource_property": "owner_tenant_id",
+            "op": "eq",
+            "property": "owner_tenant_id",
             "value": "T2-uuid"
           }
         ]
@@ -517,7 +524,7 @@ INSERT INTO tasks (id, owner_tenant_id, title, status)
 VALUES ('tasknew-uuid', 'T2-uuid', 'New Task', 'pending')
 ```
 
-**Note:** PDP returns constraints for CREATE using the same flow as other operations. PEP validates that the INSERT's `owner_tenant_id` (or other resource properties in case of RBAC) matches the constraint. This prevents the caller from creating resources in tenants the PDP didn't authorize.
+**Note:** PDP returns constraints for CREATE using the same flow as other operations. PEP verifies that the values to be inserted satisfy every predicate in at least one returned branch. This prevents the caller from creating resources in tenants the PDP didn't authorize.
 
 ---
 
@@ -560,6 +567,7 @@ The PEP reads `subject_tenant_id` (T1-uuid) from the `SecurityContext` produced 
       "mode": "root_only",
       "root_id": "T1-uuid"
     },
+    "token_scopes": ["*"],
     "require_constraints": true,
     "capabilities": ["tenant_hierarchy"],
     "supported_properties": ["owner_tenant_id", "id"]
@@ -576,8 +584,8 @@ The PEP reads `subject_tenant_id` (T1-uuid) from the `SecurityContext` produced 
       {
         "predicates": [
           {
-            "type": "eq",
-            "resource_property": "owner_tenant_id",
+            "op": "eq",
+            "property": "owner_tenant_id",
             "value": "T1-uuid"
           }
         ]
@@ -597,15 +605,15 @@ VALUES ('tasknew-uuid', 'T1-uuid', 'New Task', 'pending')
 
 **Difference from S05:** In S05, PEP knows the target tenant from the request body (explicit `owner_tenant_id` field). Here, the API has no tenant field — PEP uses `SecurityContext.subject_tenant_id` instead. Both scenarios follow the same PDP validation flow.
 
-**Design rationale:** Constraints are enforcement predicates (WHERE clauses), not a data source. The PEP should never extract `owner_tenant_id` for INSERT from PDP constraints. Instead, the tenant for a new resource is always determined by the PEP — either from the request body (S05) or from `SecurityContext.subject_tenant_id` (S06) — and then validated by the PDP through the standard constraint flow.
+**Design rationale:** Constraints are enforcement predicates (WHERE clauses), not a data source. The PEP should never extract `owner_tenant_id` for INSERT from PDP constraints. Instead, the tenant for a new resource is always determined by the PEP — either from the request body (S05) or from `SecurityContext.subject_tenant_id` (S06) — and then checked by the PEP against the scope returned by the PDP.
 
 ---
 
-#### S07: LIST, billing data, ignore barriers (barrier_mode: "none")
+#### S07: LIST, billing data, ignore barriers (barrier_mode: "ignore")
 
-`GET /billing/usage?tenant_subtree=true&barrier_mode=none`
+`GET /billing/usage?tenant_subtree=true&barrier_mode=ignore`
 
-Billing service needs usage data from all tenants in subtree, including self-managed tenants (barriers ignored). This is a cross-barrier operation for administrative purposes.
+Billing collects usage across the tenant subtree, including self-managed tenants. The PDP must authorize this cross-barrier operation before issuing an `ignore` predicate.
 
 **Tenant hierarchy:**
 ```text
@@ -617,7 +625,7 @@ T1 (parent)
 
 **Request:**
 ```http
-GET /billing/usage?tenant_subtree=true&barrier_mode=none
+GET /billing/usage?tenant_subtree=true&barrier_mode=ignore
 Authorization: Bearer <token>
 ```
 
@@ -635,8 +643,9 @@ Authorization: Bearer <token>
     "tenant_context": {
       "mode": "subtree",
       "root_id": "T1-uuid",
-      "barrier_mode": "none"
+      "barrier_mode": "ignore"
     },
+    "token_scopes": ["*"],
     "require_constraints": true,
     "capabilities": ["tenant_hierarchy"],
     "supported_properties": ["owner_tenant_id", "id"]
@@ -653,10 +662,10 @@ Authorization: Bearer <token>
       {
         "predicates": [
           {
-            "type": "in_tenant_subtree",
-            "resource_property": "owner_tenant_id",
+            "op": "in_tenant_subtree",
+            "property": "owner_tenant_id",
             "root_tenant_id": "T1-uuid",
-            "barrier_mode": "none"
+            "barrier_mode": "ignore"
           }
         ]
       }
@@ -671,7 +680,7 @@ SELECT * FROM billing_usage
 WHERE owner_tenant_id IN (
   SELECT descendant_id FROM tenant_closure
   WHERE ancestor_id = 'T1-uuid'
-  -- no barrier clause because barrier_mode = "none"
+  -- no barrier clause because barrier_mode = "ignore"
 )
 ```
 
@@ -688,7 +697,7 @@ WHERE owner_tenant_id IN (
 | T2-uuid | T2-uuid | 0 |
 | T2-uuid | T3-uuid | 0 |
 
-When querying from T1 with `barrier_mode=all`, only rows where `barrier = 0` match → T1, T4.
+When querying from T1 with `barrier_mode=respect`, only rows where `barrier = 0` match → T1, T4.
 
 **Key insight:** T2 → T2 and T2 → T3 have `barrier = 0` because the `barrier` column is defined over the interval **`(ancestor, descendant]`** — the ancestor endpoint is excluded (canonical definition in [TENANT_MODEL.md §Closure Table](./TENANT_MODEL.md#closure-table)). When T2 is the query root, its self_managed status doesn't block access to its own subtree.
 
@@ -727,6 +736,7 @@ Authorization: Bearer <token>
       "mode": "subtree",
       "root_id": "T1-uuid"
     },
+    "token_scopes": ["*"],
     "require_constraints": true,
     "capabilities": [],
     "supported_properties": ["owner_tenant_id", "id"]
@@ -746,8 +756,8 @@ PDP resolves the subtree internally and returns explicit IDs:
       {
         "predicates": [
           {
-            "type": "in",
-            "resource_property": "owner_tenant_id",
+            "op": "in",
+            "property": "owner_tenant_id",
             "values": ["T1-uuid", "T2-uuid", "T3-uuid"]
           }
         ]
@@ -771,9 +781,9 @@ WHERE owner_tenant_id IN ('T1-uuid', 'T2-uuid', 'T3-uuid')
 
 `GET /tasks/{id}?tenant_subtree=true`
 
-PEP doesn't have tenant_closure. PEP fetches the resource first (prefetch), then asks PDP for an access decision based on resource attributes with `require_constraints: false`. Since PEP already has the entity, it doesn't need row-level SQL constraints — the PDP decision alone is sufficient.
+PEP has no tenant_closure. It may prefetch the resource to choose a narrow tenant condition, then asks PDP with `require_constraints: true`. `resource.properties.owner_tenant_id` means "the target must belong to this tenant", exactly as for LIST. It does not turn a desired property into verified state for a boolean-only authorization path.
 
-If the PDP returns `decision: true` **without** constraints, PEP returns the prefetched entity directly (no second query). If the PDP returns constraints despite `require_constraints: false`, PEP compiles them and performs a scoped re-read as a fallback.
+An allow response must contain the requested property equalities and policy restrictions. PEP always returns a scoped re-read, never the prefetched entity solely on `decision: true`. Explicit caller conditions must not be overwritten by prefetch; a conflicting owner/tenant condition yields 404 or no match in the scoped read.
 
 **Request:**
 ```http
@@ -781,13 +791,13 @@ GET /tasks/task456-uuid?tenant_subtree=true
 Authorization: Bearer <token>
 ```
 
-**Step 1 — PEP prefetches resource:**
+**Step 1 — PEP reads the tenant needed for evaluation:**
 ```sql
-SELECT * FROM tasks WHERE id = 'task456-uuid'
+SELECT owner_tenant_id FROM tasks WHERE id = 'task456-uuid'
 ```
-Result: full task record with `owner_tenant_id = 'T2-uuid'`
+Result: `owner_tenant_id = 'T2-uuid'`
 
-**Step 2 — PEP → PDP Request (with resource properties, `require_constraints: false`):**
+**Step 2 — PEP → PDP Request (with target conditions, `require_constraints: true`):**
 ```json
 {
   "subject": {
@@ -808,7 +818,8 @@ Result: full task record with `owner_tenant_id = 'T2-uuid'`
       "mode": "subtree",
       "root_id": "T1-uuid"
     },
-    "require_constraints": false,
+    "token_scopes": ["*"],
+    "require_constraints": true,
     "capabilities": [],
     "supported_properties": ["owner_tenant_id", "id"]
   }
@@ -817,28 +828,29 @@ Result: full task record with `owner_tenant_id = 'T2-uuid'`
 
 **PDP → PEP Response:**
 
-PDP validates that T2 is in T1's subtree. Since `require_constraints: false`, PDP may return a decision-only response (no constraints):
+PDP validates that the policy permits the requested T2 scope and returns its tenant condition:
 
 ```json
 {
   "decision": true,
   "context": {
-    "constraints": []
+    "constraints": [
+      { "predicates": [
+        { "op": "eq", "property": "owner_tenant_id", "value": "T2-uuid" }
+      ] }
+    ]
   }
 }
 ```
 
-Alternatively, PDP may still return constraints (e.g., `eq(owner_tenant_id, T2-uuid)`) — the PEP handles both cases.
-
 **Step 3 — Enforce and return result:**
 
-PEP compiles the response into `AccessScope`:
-- **No constraints** (`scope.is_unconstrained()`) → return the prefetched entity directly. No second SQL query needed.
-- **Constraints returned** → compile to `AccessScope` and perform a scoped re-read (`SELECT ... WHERE id = 'task456-uuid' AND owner_tenant_id = 'T2-uuid'`).
-- Resource not found in Step 1 → **404 Not Found**.
-- `decision: false` → **404 Not Found** (hides resource existence from unauthorized callers).
+```sql
+SELECT * FROM tasks
+WHERE id = 'task456-uuid' AND owner_tenant_id = 'T2-uuid'
+```
 
-**Why no TOCTOU concern:** For GET, the "use" is returning data to the client. Even if `owner_tenant_id` changed between prefetch and response, no security violation occurs — the client either gets data they had access to at query time, or gets 404. For mutations (UPDATE/DELETE), see S10.
+PDP may add further policy predicates; PEP applies all of them. A missing/empty constraints array is rejected. No resource in prefetch or scoped re-read gives 404; a policy denial follows the endpoint's denial mapping. If the resource moved after prefetch, the scoped read matches no row. For mutations, S10 applies the same conditions atomically in the write.
 
 ---
 
@@ -846,7 +858,7 @@ PEP compiles the response into `AccessScope`:
 
 `PUT /tasks/{id}?tenant_subtree=true`
 
-Unlike S09 (GET), mutations require TOCTOU protection. PEP prefetches `owner_tenant_id`, gets `eq` constraint from PDP, and applies it in UPDATE's WHERE clause. This ensures atomic check-and-modify.
+As in S09, the PEP prefetches `owner_tenant_id` and requests a tenant equality. Applying the returned scope to the UPDATE checks the row at write time.
 
 **Request:**
 ```http
@@ -884,6 +896,7 @@ Result: `owner_tenant_id = 'T2-uuid'`
       "mode": "subtree",
       "root_id": "T1-uuid"
     },
+    "token_scopes": ["*"],
     "require_constraints": true,
     "capabilities": [],
     "supported_properties": ["owner_tenant_id", "id"]
@@ -900,8 +913,8 @@ Result: `owner_tenant_id = 'T2-uuid'`
       {
         "predicates": [
           {
-            "type": "eq",
-            "resource_property": "owner_tenant_id",
+            "op": "eq",
+            "property": "owner_tenant_id",
             "value": "T2-uuid"
           }
         ]
@@ -942,9 +955,9 @@ TOCTOU protection is identical to S10: if `owner_tenant_id` changed between pref
 
 #### S12: CREATE, PEP without tenant_closure
 
-CREATE does not query existing rows, so the presence of `tenant_closure` is irrelevant. Both PEP-provided and PDP-resolved tenant patterns work identically regardless of PEP capabilities. See S05 and S06.
+In S05 and S06, the PEP obtains the proposed tenant from the request body or the authenticated context and checks the inserted value against the returned equality predicate. These inserts require no local `tenant_closure` lookup.
 
-**`require_constraints: false` optimization:** When PEP sends resource properties (e.g., `owner_tenant_id` of the entity being created) to the PDP, it can set `require_constraints: false`. If the PDP returns `decision: true` without constraints, the resulting `AccessScope` is `allow_all()`, and `validate_insert_scope` skips validation (its `is_unconstrained()` fast path). If the PDP returns constraints, they are compiled and validated against the insert as usual. This avoids unnecessary constraint compilation when the PDP decision alone is sufficient.
+**Constraints are required:** CREATE sends conditions for the proposed resource with `require_constraints: true`, and PEP validates the actual inserted values against the returned scope.
 
 ---
 
@@ -978,6 +991,7 @@ Authorization: Bearer <token>
       "mode": "root_only",
       "root_id": "T1-uuid"
     },
+    "token_scopes": ["*"],
     "require_constraints": true,
     "capabilities": [],
     "supported_properties": ["owner_tenant_id", "id"]
@@ -994,8 +1008,8 @@ Authorization: Bearer <token>
       {
         "predicates": [
           {
-            "type": "eq",
-            "resource_property": "owner_tenant_id",
+            "op": "eq",
+            "property": "owner_tenant_id",
             "value": "T1-uuid"
           }
         ]
@@ -1018,11 +1032,13 @@ WHERE id = 'task456-uuid'
 
 ### Resource Groups
 
-> **Note:** Resource groups are tenant-scoped. **PDP guarantees** that any `group_ids` or `root_group_id` returned in constraints belong to the request context tenant. PEP trusts this guarantee.
+S14–S17 assume the task type is active in Types Registry, is permitted by the group’s membership schema, and has memberships recorded under the same canonical task type sent by the PEP. RG assigns its local dictionary key on first use. Native SQL qualifies membership by the exact canonical resource type through `resource_group_membership.gts_type_id` and RG's `gts_type.schema_id`. Native membership predicates require both tables; subtree predicates also require `resource_group_closure`. See [native group opt-in and table prerequisites](../../toolkit_unified_system/06_authn_authz_secure_orm.md#defining-resource-types).
+
+> The policy in S14–S17 must validate group ownership before emitting group or ancestor IDs. The native SQL checks membership, resource type and resource tenant. The current TR plugin only appends group predicates for group selectors supplied in the request. It checks selector syntax and capabilities but does not look up the groups’ tenants or derive the caller’s group permissions.
 >
 > All group-based constraints also include a tenant predicate on the resource (typically `eq` on `owner_tenant_id`) as defense in depth, ensuring tenant isolation at the resource level.
 >
-> **Important — projection architecture:** `resource_group_membership` grows as `M_resources × N_groups_per_resource` and is expected to be 10×+ larger than hierarchy tables. Project it only when profiling confirms the two-request pattern is unacceptable (see [When to Project](#resource_group_membership--when-to-project)). `in_group`/`in_group_subtree` predicates require this table and are only executable when it is present in the PEP's database (RG gear, monolith with shared DB, or an explicit projection). By default, domain services rely on PDP capability degradation — PDP resolves group memberships internally and returns degraded predicates: explicit resource IDs via `in`, or `eq` for point operations. Scenarios S14–S17 below are reference patterns (require membership table); S18–S19 are the standard domain service patterns.
+> **Important — projection architecture:** `resource_group_membership` grows as `M_resources × N_groups_per_resource` and is expected to be 10×+ larger than hierarchy tables. Project it only when profiling confirms the two-request pattern is unacceptable (see [When to Project](#resource_group_membership--when-to-project)). `in_group`/`in_group_subtree` predicates require this table and are only executable when it is present in the PEP's database (RG gear, monolith with shared DB, or an explicit projection). S18–S19 assume a PDP that can check membership itself for a point operation or return explicit resource IDs for a LIST. Scenarios S14–S17 below are reference patterns (require membership table); S18–S19 are the standard domain service patterns.
 
 ---
 
@@ -1032,7 +1048,7 @@ WHERE id = 'task456-uuid'
 
 User has access to specific projects (flat group membership, no hierarchy).
 
-> **Reference pattern:** This scenario requires `resource_group_membership` in the PEP's database. Since membership projection is not recommended for domain services, this pattern typically applies within the RG gear or in monolith deployments with a shared database. For the standard domain service pattern, see S19.
+> **Reference pattern:** This scenario requires `resource_group_membership` in the PEP's database. The task PEP in this example opts in and has access to RG’s type dictionary and membership data in the same database. For the standard domain service pattern, see S19.
 
 **Request:**
 ```http
@@ -1055,6 +1071,7 @@ Authorization: Bearer <token>
       "mode": "root_only",
       "root_id": "T1-uuid"
     },
+    "token_scopes": ["*"],
     "require_constraints": true,
     "capabilities": ["group_membership"],
     "supported_properties": ["owner_tenant_id", "id"]
@@ -1074,13 +1091,13 @@ Tenant constraint is always included — groups don't bypass tenant isolation:
       {
         "predicates": [
           {
-            "type": "eq",
-            "resource_property": "owner_tenant_id",
+            "op": "eq",
+            "property": "owner_tenant_id",
             "value": "T1-uuid"
           },
           {
-            "type": "in_group",
-            "resource_property": "id",
+            "op": "in_group",
+            "property": "id",
             "group_ids": ["ProjectA-uuid", "ProjectB-uuid"]
           }
         ]
@@ -1094,9 +1111,10 @@ Tenant constraint is always included — groups don't bypass tenant isolation:
 ```sql
 SELECT * FROM tasks
 WHERE owner_tenant_id = 'T1-uuid'
-  AND id IN (
+  AND CAST(id AS TEXT) IN (
     SELECT resource_id FROM resource_group_membership
-    WHERE group_id IN ('ProjectA-uuid', 'ProjectB-uuid')
+    WHERE gts_type_id IN (SELECT id FROM gts_type WHERE schema_id = 'gts.cf.core.tasks.task.v1~')
+      AND group_id IN ('ProjectA-uuid', 'ProjectB-uuid')
   )
 ```
 
@@ -1108,7 +1126,7 @@ WHERE owner_tenant_id = 'T1-uuid'
 
 User has access to a project folder and all its subfolders.
 
-> **Reference pattern:** This scenario requires both `resource_group_closure` and `resource_group_membership` in the PEP's database. Since membership projection is not recommended for domain services, this pattern typically applies within the RG gear or in monolith deployments with a shared database. For the standard domain service pattern, see S19.
+> **Reference pattern:** This scenario requires both `resource_group_closure` and `resource_group_membership` in the PEP's database. The task PEP in this example opts in and has access to RG’s type dictionary and membership data in the same database. For the standard domain service pattern, see S19.
 
 **Request:**
 ```http
@@ -1131,8 +1149,9 @@ Authorization: Bearer <token>
       "mode": "root_only",
       "root_id": "T1-uuid"
     },
+    "token_scopes": ["*"],
     "require_constraints": true,
-    "capabilities": ["group_hierarchy"],
+    "capabilities": ["group_membership", "group_hierarchy"],
     "supported_properties": ["owner_tenant_id", "id"]
   }
 }
@@ -1150,14 +1169,14 @@ Tenant constraint is always included:
       {
         "predicates": [
           {
-            "type": "eq",
-            "resource_property": "owner_tenant_id",
+            "op": "eq",
+            "property": "owner_tenant_id",
             "value": "T1-uuid"
           },
           {
-            "type": "in_group_subtree",
-            "resource_property": "id",
-            "root_group_id": "FolderA-uuid"
+            "op": "in_group_subtree",
+            "property": "id",
+            "ancestor_ids": ["FolderA-uuid"]
           }
         ]
       }
@@ -1170,13 +1189,14 @@ Tenant constraint is always included:
 ```sql
 SELECT * FROM tasks
 WHERE owner_tenant_id = 'T1-uuid'
-  AND id IN (
+  AND CAST(id AS TEXT) IN (
     SELECT resource_id FROM resource_group_membership
-    WHERE group_id IN (
-      SELECT descendant_id FROM resource_group_closure
-      WHERE ancestor_id = 'FolderA-uuid'
+    WHERE gts_type_id IN (SELECT id FROM gts_type WHERE schema_id = 'gts.cf.core.tasks.task.v1~')
+      AND group_id IN (
+        SELECT descendant_id FROM resource_group_closure
+        WHERE ancestor_id = 'FolderA-uuid'
+      )
   )
-)
 ```
 
 ---
@@ -1216,6 +1236,7 @@ Content-Type: application/json
       "mode": "root_only",
       "root_id": "T1-uuid"
     },
+    "token_scopes": ["*"],
     "require_constraints": true,
     "capabilities": ["group_membership"],
     "supported_properties": ["owner_tenant_id", "id"]
@@ -1235,13 +1256,13 @@ Tenant constraint is always included:
       {
         "predicates": [
           {
-            "type": "eq",
-            "resource_property": "owner_tenant_id",
+            "op": "eq",
+            "property": "owner_tenant_id",
             "value": "T1-uuid"
           },
           {
-            "type": "in_group",
-            "resource_property": "id",
+            "op": "in_group",
+            "property": "id",
             "group_ids": ["ProjectA-uuid", "ProjectB-uuid"]
           }
         ]
@@ -1257,9 +1278,10 @@ UPDATE tasks
 SET status = 'completed'
 WHERE id = 'task456-uuid'
   AND owner_tenant_id = 'T1-uuid'
-  AND id IN (
+  AND CAST(id AS TEXT) IN (
     SELECT resource_id FROM resource_group_membership
-    WHERE group_id IN ('ProjectA-uuid', 'ProjectB-uuid')
+    WHERE gts_type_id IN (SELECT id FROM gts_type WHERE schema_id = 'gts.cf.core.tasks.task.v1~')
+      AND group_id IN ('ProjectA-uuid', 'ProjectB-uuid')
   )
 ```
 
@@ -1304,8 +1326,9 @@ Content-Type: application/json
       "mode": "root_only",
       "root_id": "T1-uuid"
     },
+    "token_scopes": ["*"],
     "require_constraints": true,
-    "capabilities": ["group_hierarchy"],
+    "capabilities": ["group_membership", "group_hierarchy"],
     "supported_properties": ["owner_tenant_id", "id"]
   }
 }
@@ -1323,14 +1346,14 @@ Tenant constraint is always included:
       {
         "predicates": [
           {
-            "type": "eq",
-            "resource_property": "owner_tenant_id",
+            "op": "eq",
+            "property": "owner_tenant_id",
             "value": "T1-uuid"
           },
           {
-            "type": "in_group_subtree",
-            "resource_property": "id",
-            "root_group_id": "FolderA-uuid"
+            "op": "in_group_subtree",
+            "property": "id",
+            "ancestor_ids": ["FolderA-uuid"]
           }
         ]
       }
@@ -1345,12 +1368,13 @@ UPDATE tasks
 SET status = 'completed'
 WHERE id = 'task456-uuid'
   AND owner_tenant_id = 'T1-uuid'
-  AND id IN (
+  AND CAST(id AS TEXT) IN (
     SELECT resource_id FROM resource_group_membership
-    WHERE group_id IN (
-      SELECT descendant_id FROM resource_group_closure
-      WHERE ancestor_id = 'FolderA-uuid'
-    )
+    WHERE gts_type_id IN (SELECT id FROM gts_type WHERE schema_id = 'gts.cf.core.tasks.task.v1~')
+      AND group_id IN (
+        SELECT descendant_id FROM resource_group_closure
+        WHERE ancestor_id = 'FolderA-uuid'
+      )
   )
 ```
 
@@ -1386,6 +1410,7 @@ Authorization: Bearer <token>
       "mode": "root_only",
       "root_id": "T1-uuid"
     },
+    "token_scopes": ["*"],
     "require_constraints": true,
     "capabilities": [],
     "supported_properties": ["owner_tenant_id", "id"]
@@ -1410,8 +1435,8 @@ PDP returns tenant constraint as defense in depth (group check already done):
       {
         "predicates": [
           {
-            "type": "eq",
-            "resource_property": "owner_tenant_id",
+            "op": "eq",
+            "property": "owner_tenant_id",
             "value": "T1-uuid"
           }
         ]
@@ -1432,7 +1457,7 @@ WHERE id = 'task456-uuid'
 - 1 row → return task
 - 0 rows → **404 Not Found**
 
-**Note:** This is the standard domain service pattern — `resource_group_membership` projection is not recommended for domain services. PDP resolves group membership internally via PIP. For LIST operations, PDP returns explicit resource IDs via `in` predicate (see S19). This pattern works best for point operations (GET, UPDATE, DELETE by ID) where PDP can check a single resource's membership efficiently.
+The group decision uses membership at evaluation time. The subsequent SQL rechecks the resource ID and tenant only. If policy requires group revocation to take effect at query or mutation time, use a membership check in the statement (as in S14–S17) with a suitably current membership table. For LIST with pre-resolved IDs, see S19.
 
 ---
 
@@ -1463,6 +1488,7 @@ Authorization: Bearer <token>
       "mode": "root_only",
       "root_id": "T1-uuid"
     },
+    "token_scopes": ["*"],
     "require_constraints": true,
     "capabilities": [],
     "supported_properties": ["owner_tenant_id", "id"]
@@ -1484,13 +1510,13 @@ PDP knows user has access to FolderA and its subfolders. PDP resolves the hierar
       {
         "predicates": [
           {
-            "type": "eq",
-            "resource_property": "owner_tenant_id",
+            "op": "eq",
+            "property": "owner_tenant_id",
             "value": "T1-uuid"
           },
           {
-            "type": "in",
-            "resource_property": "id",
+            "op": "in",
+            "property": "id",
             "values": ["task1-uuid", "task2-uuid", "task5-uuid", "task7-uuid"]
           }
         ]
@@ -1542,6 +1568,7 @@ Authorization: Bearer <token>
       "mode": "subtree",
       "root_id": "T1-uuid"
     },
+    "token_scopes": ["*"],
     "require_constraints": true,
     "capabilities": ["tenant_hierarchy"],
     "supported_properties": ["owner_tenant_id", "id"]
@@ -1561,13 +1588,13 @@ Single constraint with multiple predicates (AND semantics). Tenant subtree uses 
       {
         "predicates": [
           {
-            "type": "in_tenant_subtree",
-            "resource_property": "owner_tenant_id",
+            "op": "in_tenant_subtree",
+            "property": "owner_tenant_id",
             "root_tenant_id": "T1-uuid"
           },
           {
-            "type": "in",
-            "resource_property": "id",
+            "op": "in",
+            "property": "id",
             "values": ["task1-uuid", "task3-uuid"]
           }
         ]
@@ -1583,7 +1610,7 @@ SELECT * FROM tasks
 WHERE owner_tenant_id IN (
     SELECT descendant_id FROM tenant_closure
     WHERE ancestor_id = 'T1-uuid'
-      AND barrier = 0  -- barrier_mode defaults to "all"
+      AND barrier = 0  -- barrier_mode defaults to "respect"
   )
   AND id IN ('task1-uuid', 'task3-uuid')
 ```
@@ -1619,6 +1646,7 @@ Authorization: Bearer <token>
       "mode": "subtree",
       "root_id": "T1-uuid"
     },
+    "token_scopes": ["*"],
     "require_constraints": true,
     "capabilities": ["tenant_hierarchy"],
     "supported_properties": ["owner_tenant_id", "id"]
@@ -1638,13 +1666,13 @@ Single constraint with two predicates (AND semantics). Tenant subtree uses `in_t
       {
         "predicates": [
           {
-            "type": "in_tenant_subtree",
-            "resource_property": "owner_tenant_id",
+            "op": "in_tenant_subtree",
+            "property": "owner_tenant_id",
             "root_tenant_id": "T1-uuid"
           },
           {
-            "type": "in",
-            "resource_property": "id",
+            "op": "in",
+            "property": "id",
             "values": ["task1-uuid", "task2-uuid", "task5-uuid"]
           }
         ]
@@ -1668,7 +1696,7 @@ WHERE owner_tenant_id IN (
 **Projection tables used:**
 - `tenant_closure` — resolves tenant subtree (T1 and all descendants)
 
-**Note:** PDP resolves group hierarchy (via closure) and group membership internally. The domain service only receives degraded `in` predicates with explicit resource IDs. For the equivalent pattern within the RG gear (using all three tables natively), see S15.
+**Note:** PDP resolves group hierarchy (via closure) and group membership internally. The domain service only receives degraded `in` predicates with explicit resource IDs. For an opted-in PEP with native group predicates, see S15.
 
 ---
 
@@ -1699,6 +1727,7 @@ Authorization: Bearer <token>
       "mode": "root_only",
       "root_id": "T1-uuid"
     },
+    "token_scopes": ["*"],
     "require_constraints": true,
     "capabilities": [],
     "supported_properties": ["owner_tenant_id", "id"]
@@ -1718,13 +1747,13 @@ Multiple constraints (OR semantics). Tenant constraint is included in each path.
       {
         "predicates": [
           {
-            "type": "eq",
-            "resource_property": "owner_tenant_id",
+            "op": "eq",
+            "property": "owner_tenant_id",
             "value": "T1-uuid"
           },
           {
-            "type": "in",
-            "resource_property": "id",
+            "op": "in",
+            "property": "id",
             "values": ["task1-uuid", "task2-uuid", "task3-uuid"]
           }
         ]
@@ -1732,13 +1761,13 @@ Multiple constraints (OR semantics). Tenant constraint is included in each path.
       {
         "predicates": [
           {
-            "type": "eq",
-            "resource_property": "owner_tenant_id",
+            "op": "eq",
+            "property": "owner_tenant_id",
             "value": "T1-uuid"
           },
           {
-            "type": "in",
-            "resource_property": "id",
+            "op": "in",
+            "property": "id",
             "values": ["taskshared1-uuid", "taskshared2-uuid"]
           }
         ]
@@ -1790,6 +1819,7 @@ Authorization: Bearer <token>
       "mode": "root_only",
       "root_id": "T1-uuid"
     },
+    "token_scopes": ["*"],
     "require_constraints": true,
     "capabilities": ["tenant_hierarchy"],
     "supported_properties": ["owner_tenant_id", "id"]
@@ -1816,31 +1846,33 @@ Authorization: Bearer <token>
 - Log `deny_reason` for audit/debugging (includes `error_code` and `details`)
 - Return **403 Forbidden** to client without exposing `details`
 
-**Fail-closed principle:** The PEP never executes a database query when `decision: false`. This prevents any data leakage and ensures authorization is enforced before resource access.
+**Fail-closed principle:** On `decision: false`, the PEP stops before the protected read or write. For a flow that prefetched attributes, the PEP must not return that data.
 
-**Note on deny_reason:** The `deny_reason` is required when `decision: false`. PEP uses `error_code` for programmatic handling and logs `details` for troubleshooting, but returns a generic 403 response to prevent leaking authorization policy details to clients.
+The current SDK accepts denial with or without `deny_reason`. The TR plugin omits it. Denial prevents resource access in either case.
 
 ---
 
 ### Subject Owner-Based Access
 
+S24–S32 assume a PDP that supports owner-based policies. The bundled static and TR plugins evaluate tenant scope and ignore `owner_id` by design.
+
 PEP supports `owner_id` as a standard resource property for per-subject ownership filtering. These scenarios demonstrate how `owner_id` constraints restrict access to resources owned by a specific user.
 
 **No projection tables** are needed — `owner_id` uses simple `eq` predicates compiled directly to SQL.
 
-**No prefetch** is needed — PDP always knows the subject's identity from `subject.id` in the evaluation request, so it can return `eq(owner_id, subject_id)` without PEP prefetching resource attributes. This is fundamentally different from "without tenant_closure" scenarios (S09–S11), where PEP must prefetch `owner_tenant_id` to tell PDP which specific tenant to validate.
+**No prefetch** is needed for owner selection. Under an owner-only policy, PDP can return `eq(owner_id, subject.id)` using the authenticated identity. For an explicitly selected owner, it intersects `resource.properties.owner_id` with policy; an unfiltered request under tenant-wide policy needs no owner predicate. This differs from "without tenant_closure" point-operation scenarios (S09–S11), where PEP prefetches `owner_tenant_id` to tell PDP which specific tenant to validate.
 
-**`tenant_context` is omitted** from these requests. PDP infers the tenant context from `subject.properties.tenant_id` (see [DESIGN.md — tenant_context note](./DESIGN.md#request--response-example)). This is only safe when the subject's home tenant is the intended context; for cross-tenant access or service-to-service flows, supply `tenant_context` explicitly. PDP still returns `eq(owner_tenant_id, ...)` as defense-in-depth to ensure tenant isolation at the SQL level.
+**`tenant_context` is omitted in S24–S28.** Those examples assume PDP policies resolve the context to the subject's home tenant (see [DESIGN.md — tenant_context note](./DESIGN.md#request--response-example)). For cross-tenant access, supply the intended tenant context explicitly. S29–S32 set T1 as the root with `mode: "root_only"`. PDP still returns a tenant predicate to ensure tenant isolation at the SQL level.
 
 ---
 
-#### S24: LIST, owner-only access
+#### S24: LIST, no owner filter, owner-only policy
 
 `GET /tasks`
 
-User requests only their own tasks. PDP restricts access to resources where `owner_id` matches the subject.
+User requests tasks without selecting an owner. The policy permits only their own tasks, so PDP restricts access to resources where `owner_id` matches the subject.
 
-**Use case:** Personal task list — "show only my tasks."
+**Use case:** List all tasks available to the caller under an owner-only policy. Absence of `resource.properties.owner_id` does not request or grant unrestricted access to other owners.
 
 **Request:**
 ```http
@@ -1859,6 +1891,7 @@ Authorization: Bearer <token>
   "action": { "name": "list" },
   "resource": { "type": "gts.cf.core.tasks.task.v1~" },
   "context": {
+    "token_scopes": ["*"],
     "require_constraints": true,
     "capabilities": [],
     "supported_properties": ["owner_tenant_id", "id", "owner_id"]
@@ -1878,13 +1911,13 @@ Single constraint with two predicates (AND semantics) — tenant isolation (defe
       {
         "predicates": [
           {
-            "type": "eq",
-            "resource_property": "owner_tenant_id",
+            "op": "eq",
+            "property": "owner_tenant_id",
             "value": "T1-uuid"
           },
           {
-            "type": "eq",
-            "resource_property": "owner_id",
+            "op": "eq",
+            "property": "owner_id",
             "value": "user123-uuid"
           }
         ]
@@ -1931,6 +1964,7 @@ Authorization: Bearer <token>
     "id": "task456-uuid"
   },
   "context": {
+    "token_scopes": ["*"],
     "require_constraints": true,
     "capabilities": [],
     "supported_properties": ["owner_tenant_id", "id", "owner_id"]
@@ -1947,13 +1981,13 @@ Authorization: Bearer <token>
       {
         "predicates": [
           {
-            "type": "eq",
-            "resource_property": "owner_tenant_id",
+            "op": "eq",
+            "property": "owner_tenant_id",
             "value": "T1-uuid"
           },
           {
-            "type": "eq",
-            "resource_property": "owner_id",
+            "op": "eq",
+            "property": "owner_id",
             "value": "user123-uuid"
           }
         ]
@@ -2008,6 +2042,7 @@ Content-Type: application/json
     "id": "task456-uuid"
   },
   "context": {
+    "token_scopes": ["*"],
     "require_constraints": true,
     "capabilities": [],
     "supported_properties": ["owner_tenant_id", "id", "owner_id"]
@@ -2024,13 +2059,13 @@ Content-Type: application/json
       {
         "predicates": [
           {
-            "type": "eq",
-            "resource_property": "owner_tenant_id",
+            "op": "eq",
+            "property": "owner_tenant_id",
             "value": "T1-uuid"
           },
           {
-            "type": "eq",
-            "resource_property": "owner_id",
+            "op": "eq",
+            "property": "owner_id",
             "value": "user123-uuid"
           }
         ]
@@ -2115,6 +2150,7 @@ PEP reads `subject_id` (user123-uuid) and `subject_tenant_id` (T1-uuid) from `Se
     }
   },
   "context": {
+    "token_scopes": ["*"],
     "require_constraints": true,
     "capabilities": [],
     "supported_properties": ["owner_tenant_id", "id", "owner_id"]
@@ -2131,13 +2167,13 @@ PEP reads `subject_id` (user123-uuid) and `subject_tenant_id` (T1-uuid) from `Se
       {
         "predicates": [
           {
-            "type": "eq",
-            "resource_property": "owner_tenant_id",
+            "op": "eq",
+            "property": "owner_tenant_id",
             "value": "T1-uuid"
           },
           {
-            "type": "eq",
-            "resource_property": "owner_id",
+            "op": "eq",
+            "property": "owner_id",
             "value": "user123-uuid"
           }
         ]
@@ -2159,21 +2195,77 @@ VALUES ('tasknew-uuid', 'T1-uuid', 'user123-uuid', 'New Task', 'pending')
 
 ---
 
+#### S29: LIST, explicitly selected own resources
+
+Alice calls `GET /tasks/my` in T1. The PEP sets `subject.id` from her credentials and requests `resource.properties.owner_id = Alice`. Even with tenant-wide list permission, the result is limited to Alice’s tasks in T1.
+
+#### S30: LIST, another owner selected
+
+Alice calls `GET /tasks?owner_id=bob-uuid`. The PEP validates the owner UUID, takes Alice’s identity and token scopes from her authenticated context, and sends:
+
+```json
+{
+  "subject": {"id": "alice-uuid", "properties": {"tenant_id": "T1-uuid"}},
+  "action": {"name": "list"},
+  "resource": {"type": "gts.cf.core.tasks.task.v1~", "properties": {"owner_id": "bob-uuid"}},
+  "context": {
+    "tenant_context": {"root_id": "T1-uuid", "mode": "root_only"},
+    "token_scopes": ["*"], "require_constraints": true,
+    "capabilities": [], "supported_properties": ["owner_tenant_id", "owner_id", "id"]
+  }
+}
+```
+
+Under a tenant-wide policy the PDP can permit this selection:
+
+```json
+{"decision": true, "context": {"constraints": [{"predicates": [
+  {"op": "eq", "property": "owner_tenant_id", "value": "T1-uuid"},
+  {"op": "eq", "property": "owner_id", "value": "bob-uuid"}
+]}]}}
+```
+
+After validating the response, the PEP applies the scope to the query:
+
+```sql
+SELECT * FROM tasks WHERE owner_tenant_id = 'T1-uuid' AND owner_id = 'bob-uuid'
+```
+
+Every alternative branch must retain the requested owner equality and its own policy restrictions. An own-only policy denies Alice’s request for Bob (403). A permitted query with no matching tasks returns an empty list. If an allow response omits the requested equality in any branch, the PEP rejects the response before querying.
+
+#### S31: LIST, no owner filter, tenant-wide policy
+
+With `GET /tasks` and tenant-wide permission, Alice can see all tasks in T1, including ownerless tasks. Under S24’s own-only policy the same request returns only her tasks. Omitted, Alice, and Bob are distinct owner selections for [cache lookup](./DESIGN.md#authorization-decision-caching). An explicitly null or malformed owner is invalid input (400).
+
+#### S32: Owner conditions across resource CRUD
+
+Alice selects Bob’s task in T1. The PEP requests constraints for each action and verifies the requested equality in every allowed branch.
+
+| Operation | Enforcement |
+|---|---|
+| GET | Read by ID with the full scope. Return 404 if the task no longer matches, even after a successful prefetch. |
+| UPDATE / DELETE | Include the ID and full scope in the write predicate. Zero matching rows gives 404. |
+| CREATE | Derive the tenant and owner conditions from the proposed task. Materialize the insert values and verify that they satisfy every predicate in at least one branch. |
+
+Updating a title under `owner_id = Bob` checks the current owner. Reassigning the task to Carol requires authorization for both source and destination and an atomic transition. Reject reassignment until the endpoint supports that operation.
+
+---
+
 ## TOCTOU Analysis
 
 [Time-of-check to time-of-use (TOCTOU)](https://en.wikipedia.org/wiki/Time-of-check_to_time-of-use) is a class of race condition where a security check is performed at one point, but the protected action occurs later when conditions may have changed.
 
 ### When TOCTOU Matters
 
-TOCTOU is a security concern only for **mutations** (UPDATE, DELETE). For **reads** (GET, LIST), there's no security violation if the resource changes between check and response — the client receives data they had access to at query time.
+A scoped statement checks row conditions against its database snapshot. A decision based on a separate prefetch, remote group lookup, or replicated projection sees state as of that lookup or projection. Rechecking local row conditions protects reads as well as writes when those conditions change.
 
 | Operation | TOCTOU Concern | Why |
 |-----------|----------------|-----|
-| GET | ❌ No | Read returns point-in-time snapshot; no state change |
-| LIST | ❌ No | Same as GET — read-only |
+| GET | Yes after prefetch | Return the scoped read so a change of owner or tenant is checked at read time |
+| LIST | Yes for external inputs | A pre-resolved ID list captures membership at evaluation time |
 | UPDATE | ✅ Yes | Must ensure authorization at mutation time |
 | DELETE | ✅ Yes | Must ensure authorization at mutation time |
-| CREATE | ❌ No | No existing resource to race against |
+| CREATE | Depends on the policy | Validate the actual inserted values. A check on mutable related data may also require an atomic database constraint |
 
 ### How Each Scenario Handles TOCTOU
 
@@ -2182,9 +2274,10 @@ TOCTOU is a security concern only for **mutations** (UPDATE, DELETE). For **read
 | Scenario | Operation | Closure | Constraint | TOCTOU Protection |
 |----------|-----------|---------|------------|-------------------|
 | S01-S04, S07 | LIST/GET/UPDATE/DELETE | ✅ | `in_tenant_subtree` | ✅ Atomic SQL check |
-| S09 | GET | ❌ | `eq` (prefetched) | N/A (read-only) |
+| S08 | LIST | ❌ | `in` (explicit tenant IDs) | SQL enforces the tenant set resolved at evaluation time |
+| S09 | GET | ❌ | `eq` (prefetched) | Scoped read |
 | S10, S11 | UPDATE/DELETE | ❌ | `eq` (prefetched) | ✅ Atomic SQL check |
-| S05, S06, S12 | CREATE | N/A | `eq` (from PDP) | N/A (no existing resource) |
+| S05, S06, S12 | CREATE | N/A | `eq` (from PDP) | Validate the tenant of the row being inserted |
 
 **Resource group scenarios (reference — require membership table):**
 
@@ -2197,19 +2290,21 @@ TOCTOU is a security concern only for **mutations** (UPDATE, DELETE). For **read
 
 | Scenario | Operation | Constraint | TOCTOU Protection |
 |----------|-----------|------------|-------------------|
-| S18 | GET | `eq` (tenant, PDP resolves group internally) | N/A (read-only) |
-| S19 | LIST | `in` (explicit resource IDs from PDP) | N/A (read-only) |
-| S20, S21 | LIST | `in_tenant_subtree` + `in` (explicit IDs) | N/A (read-only) |
+| S18 | GET | `eq` (tenant, PDP resolves group internally) | SQL rechecks tenant. Membership comes from the PDP snapshot |
+| S19 | LIST | `in` (explicit resource IDs from PDP) | SQL enforces IDs from the PDP snapshot |
+| S20, S21 | LIST | `in_tenant_subtree` + `in` (explicit IDs) | SQL checks tenant closure at read time. Resource IDs reflect membership at PDP evaluation time |
 
 **Subject owner-based scenarios:**
 
 | Scenario | Operation | Constraint | TOCTOU Protection |
 |----------|-----------|------------|-------------------|
-| S24 | LIST | `eq` (owner) | N/A (read-only) |
-| S25 | GET | `eq` (owner) | N/A (read-only) |
+| S24 | LIST | `eq` (owner) | Scoped read |
+| S25 | GET | `eq` (owner) | Scoped read |
 | S26 | UPDATE | `eq` (owner) | ✅ Atomic SQL check |
 | S27 | DELETE | `eq` (owner) | ✅ Atomic SQL check |
-| S28 | CREATE | `eq` (owner) | N/A (no existing resource) |
+| S28 | CREATE | `eq` (tenant and owner) | Validate both values on the row being inserted |
+| S29–S31 | LIST | `eq` (tenant and, when required, owner); each branch retains its policy restrictions | Scoped read |
+| S32 | GET / UPDATE / DELETE / CREATE | `eq` (tenant + requested owner) | Atomic WHERE for UPDATE/DELETE; inserted values validated for CREATE |
 
 ### Key Insight: Prefetch + Constraint for Mutations
 
@@ -2220,9 +2315,11 @@ Without closure tables, mutations (UPDATE/DELETE) use a two-step pattern:
 3. **SQL execution:** `UPDATE tasks SET ... WHERE id = 'X' AND owner_tenant_id = 'T2-uuid'`
 4. **If tenant changed:** WHERE clause won't match → 0 rows affected → 404
 
+An UPDATE with this guarantee must include the full scope in the write statement. In SecureORM, `SecureConn::update_many(scope)` applies the scope to the UPDATE. The single-row `secure_update_with_scope` helper checks the scope in a preceding SELECT and updates by primary key.
+
 The constraint acts as a [compare-and-swap](https://en.wikipedia.org/wiki/Compare-and-swap) mechanism — if the value changed between check and use, the operation atomically fails.
 
-**For reads (S09):** PEP prefetches the resource, asks PDP with `require_constraints: false`, and returns the prefetched data if `decision: true` with no constraints. If constraints are returned, PEP falls back to a scoped re-read.
+**For reads (S09):** PEP may derive conditions from prefetch, requests constraints, and always returns a scoped re-read. A boolean permit alone never authorizes returning the prefetched data.
 
 ---
 
@@ -2230,7 +2327,9 @@ The constraint acts as a [compare-and-swap](https://en.wikipedia.org/wiki/Compar
 
 The **`tr-authz-plugin`** implements tenant-based access enforcement backed by `TenantResolverClient`. It does not depend on `resource-group-sdk` directly — all hierarchy queries go through the Tenant Resolver.
 
-This section enumerates the 8 decision rules (R1–R8) that govern how `Service::evaluate` must translate an incoming request into an access predicate. They are referenced by the PR-2 review comments on `gears/system/authz-resolver/plugins/tr-authz-plugin/src/domain/service.rs` and are the target implementation for `evaluate`.
+The matrix describes tenant scoping. The TR plugin does not evaluate `owner_id`, token scopes, or action-specific permissions for S29–S32. For a LIST such as S30 it can return a tenant-only permit despite the requested owner. A PEP handling S30 must reject a tenant-only permit because it omits the requested owner equality.
+
+The table summarizes the eight tenant checks in [the plugin](../../../gears/system/authz-resolver/plugins/tr-authz-plugin/src/domain/service.rs). The plugin emits `in` for both singletons and sets of tenants. A singleton `in` does not satisfy the target contract for an explicitly requested equality. The plugin also retains a legacy decision-only CREATE path. For R6 and R8, a successful subtree lookup includes the root even when no descendants match.
 
 Example hierarchy used throughout:
 
@@ -2248,12 +2347,12 @@ The algorithm branches on three orthogonal axes derived from `EvaluationRequest`
 
 | Axis | Value | Source |
 |------|-------|--------|
-| **Kind of request** | single-resource / list | `resource.id` is present / absent |
+| **Kind of request** | single-resource / list or CREATE | `resource.id` is present / absent |
 | **Explicit target tenant** | specified / absent | `context.tenant_context.root_id` |
 | **Scope mode** | `root_only` / `subtree` (default) | `context.tenant_context.mode` |
 
 Additional required values:
-- `subject.properties.tenant_id` — the acting subject's tenant (mandatory; deny if missing)
+- `subject.properties.tenant_id` — the acting subject’s tenant (must parse as a non-nil UUID)
 - `resource.properties.owner_tenant_id` — required for single-resource rules (R1–R4) when `resource.id` is present; deny if missing
 - `is_parent(ancestor, descendant)` — TR-backed helper returning `true` if `descendant` is `ancestor` or any descendant of `ancestor` in the tenant tree
 
@@ -2261,18 +2360,18 @@ Additional required values:
 
 | Rule | `resource.id` | `root_id` | `mode` | Access check | Returned predicate |
 |------|---------------|-----------|--------|--------------|--------------------|
-| R1 | present | specified | `root_only` | `owner_tenant_id == root_id` ∧ `is_parent(subject.tenant_id, root_id)` | `EQ(owner_tenant_id)` |
-| R2 | present | specified | `subtree` | `is_parent(root_id, owner_tenant_id)` ∧ `is_parent(subject.tenant_id, root_id)` | `EQ(owner_tenant_id)` |
-| R3 | present | absent | `root_only` | `owner_tenant_id == subject.tenant_id` | `EQ(owner_tenant_id)` |
-| R4 | present | absent | `subtree` | `is_parent(subject.tenant_id, owner_tenant_id)` | `EQ(owner_tenant_id)` |
-| R5 | absent | specified | `root_only` | `is_parent(subject.tenant_id, root_id)` | `EQ(root_id)` |
-| R6 | absent | specified | `subtree` | `is_parent(subject.tenant_id, root_id)` | `IN(get_descendants(root_id))` |
-| R7 | absent | absent | `root_only` | always allowed (subject scope) | `EQ(subject.tenant_id)` |
-| R8 | absent | absent | `subtree` | always allowed (subject scope) | `IN(get_descendants(subject.tenant_id))` |
+| R1 | present | specified | `root_only` | `owner_tenant_id == root_id` ∧ `is_parent(subject.tenant_id, root_id)` | `IN([owner_tenant_id])` |
+| R2 | present | specified | `subtree` | `is_parent(root_id, owner_tenant_id)` ∧ `is_parent(subject.tenant_id, root_id)` | `IN([owner_tenant_id])` |
+| R3 | present | absent | `root_only` | `owner_tenant_id == subject.tenant_id` | `IN([owner_tenant_id])` |
+| R4 | present | absent | `subtree` | `is_parent(subject.tenant_id, owner_tenant_id)` | `IN([owner_tenant_id])` |
+| R5 | absent | specified | `root_only` | `is_parent(subject.tenant_id, root_id)` | `IN([root_id])` |
+| R6 | absent | specified | `subtree` | `is_parent(subject.tenant_id, root_id)` | `IN(root_id + filtered descendants)` |
+| R7 | absent | absent | `root_only` | always allowed (subject scope) | `IN([subject.tenant_id])` |
+| R8 | absent | absent | `subtree` | successful subtree lookup for the subject tenant | `IN(subject.tenant_id + filtered descendants)` |
 
-Semantics of `is_parent(a, b)`: `b` is `a` itself or any descendant of `a`. Wherever the access check fails, the plugin returns **deny** (fail-closed). Where a helper call (e.g. `get_descendants`) errors out, the plugin also denies.
+`is_parent(a, b)` accepts equality and otherwise asks TR whether `b` is reachable from `a` under the request’s barrier mode. Failed checks and TR errors deny access. The plugin rejects unknown tenant status strings before selecting a rule. Recognized status filters apply to descendants in R6/R8. They do not filter the root or affect R1–R5/R7.
 
-All returned predicates apply to `owner_tenant_id` of the target resource table; R5/R7 narrow the scope to exactly one tenant, while R6/R8 expand it to a full subtree.
+The table shows the tenant predicate. R5/R7 select one tenant. R6/R8 include the root and descendants returned under the requested barrier and status filters. On a permit, the plugin can also append group predicates on `id` when the request supplies group selectors.
 
 ### R1 — Single-resource, explicit target tenant, root_only
 
@@ -2285,7 +2384,7 @@ Subject tenant: t1
 
 **Check:** `resource.owner_tenant_id == t2` AND `is_parent(t1, t2)` — i.e., the subject's tenant must be an ancestor of the declared target tenant, and the resource must actually belong to that target.
 
-**Predicate:** `EQ(owner_tenant_id, t2)`
+**Predicate:** `IN(owner_tenant_id, [t2])`
 
 ### R2 — Single-resource, explicit target tenant, subtree (default)
 
@@ -2298,7 +2397,7 @@ Subject tenant: t1
 
 **Check:** `is_parent(t2, resource.owner_tenant_id)` AND `is_parent(t1, t2)` — the resource must lie within the target's subtree, and the subject must be an ancestor of the target.
 
-**Predicate:** `EQ(owner_tenant_id, resource.owner_tenant_id)` (constraint is still pinned to the concrete resource tenant to make the SQL deterministic)
+**Predicate:** `IN(owner_tenant_id, [resource.owner_tenant_id])` (constraint is still pinned to the concrete resource tenant to make the SQL deterministic)
 
 ### R3 — Single-resource, no target tenant, root_only
 
@@ -2311,7 +2410,7 @@ Subject tenant: t3
 
 **Check:** `resource.owner_tenant_id == subject.tenant_id`.
 
-**Predicate:** `EQ(owner_tenant_id, subject.tenant_id)`
+**Predicate:** `IN(owner_tenant_id, [subject.tenant_id])`
 
 ### R4 — Single-resource, no target tenant, subtree (default)
 
@@ -2324,7 +2423,7 @@ Subject tenant: t1
 
 **Check:** `is_parent(subject.tenant_id, resource.owner_tenant_id)`.
 
-**Predicate:** `EQ(owner_tenant_id, resource.owner_tenant_id)`
+**Predicate:** `IN(owner_tenant_id, [resource.owner_tenant_id])`
 
 ### R5 — List, explicit target tenant, root_only
 
@@ -2337,7 +2436,7 @@ Subject tenant: t1
 
 **Check:** `is_parent(t1, t2)`.
 
-**Predicate:** `EQ(owner_tenant_id, t2)` — one tenant only.
+**Predicate:** `IN(owner_tenant_id, [t2])` — one tenant only.
 
 ### R6 — List, explicit target tenant, subtree (default)
 
@@ -2350,13 +2449,13 @@ Subject tenant: t1
 
 **Check:** `is_parent(t1, t2)`.
 
-**Action:** resolve `get_descendants(t2)` via TR (barriers respected).
+**Action:** resolve `get_descendants(t2)` via TR with the requested barrier mode and status filter.
 
-**Predicate:** `IN(owner_tenant_id, descendants(t2))`
+**Predicate:** `IN(owner_tenant_id, [t2, ...filtered descendants])`
 
 ### R7 — List, no target tenant, root_only
 
-**Use case:** Customer-level user lists their own tasks only.
+**Use case:** Customer-level user lists tasks in their own tenant, including tasks owned by other users. This tenant-only rule does not enforce per-user ownership.
 
 ```http
 GET /tasks?tenant_mode=root_only
@@ -2365,7 +2464,7 @@ Subject tenant: t3
 
 **Check:** none beyond identity (the subject is always allowed to list within their own tenant).
 
-**Predicate:** `EQ(owner_tenant_id, subject.tenant_id)`
+**Predicate:** `IN(owner_tenant_id, [subject.tenant_id])`
 
 ### R8 — List, no target tenant, subtree (default)
 
@@ -2376,11 +2475,9 @@ GET /tasks
 Subject tenant: t1
 ```
 
-**Check:** none beyond identity.
+**Check:** resolve `get_descendants(subject.tenant_id)` via TR. A lookup error denies the request.
 
-**Action:** resolve `get_descendants(subject.tenant_id)` via TR.
-
-**Predicate:** `IN(owner_tenant_id, descendants(subject.tenant_id))`
+**Predicate:** `IN(owner_tenant_id, [subject.tenant_id, ...filtered descendants])`
 
 ### Required Helpers
 
@@ -2389,7 +2486,7 @@ The matrix relies on two core capabilities provided by `tr-authz-plugin`:
 1. **`is_parent(ancestor, descendant)`** — reflexive ancestor check, implemented in `tr-authz-plugin` as `Service::is_in_subtree` on top of `TenantResolverClient::is_ancestor` (with the reflexive `anchor == candidate` short-circuit returning `true`).
 2. **Reading `context.tenant_context.mode`** — `root_only` / `subtree` selection used to route R1–R8 branches; surfaced through `authz-resolver-sdk::TenantMode` on `TenantContext`.
 
-Test all 8 rules and fail-closed paths (missing subject tenant, `is_parent` returns false, TR error). An authorized empty descendants set must remain constrained and yield an empty LIST.
+Test all 8 rules and fail-closed paths (missing subject tenant, `is_parent` returns false, TR error).
 
 ---
 

@@ -58,7 +58,7 @@ The tenant structure is a **single-root tree** — every tenant except the root 
 - Depth is not bounded by the tenant model itself; any limits on hierarchy depth come from the concrete Account/Tenant Management service implementation (operational policy, performance envelope, storage constraints).
 - The root is identified by convention (the single tenant with `parent_id = NULL`). There is no `is_system` field, and the root is not referred to as a "system tenant".
 
-**Relationship with the RG forest.** When tenants are materialized as groups in the Resource Group gear, the single-root tree is embedded inside the broader **RG forest**: RG may hold several root groups (ownership-graph roots, auxiliary forests), each carrying its own `tenant_id`. At most one of those roots may be a tenant-type group — that root *is* the single tenant root described above. All other tenants live below it as sub-tenants. Non-tenant RG roots inherit the main tenant's `tenant_id` via seeding but are not tenants themselves. RG enforces this at create time (`TenantRootAlreadyExists` / 409 Conflict). See [RG DESIGN §Tenant Root Uniqueness](../../../gears/system/resource-group/docs/DESIGN.md#tenant-root-uniqueness).
+**Relationship with the RG forest.** When tenants are materialized as groups in the Resource Group gear, the single-root tree is embedded inside the broader **RG forest**: RG may hold several root groups (ownership-graph roots, auxiliary forests), each carrying its own `tenant_id`. At most one of those roots may be a tenant-type group — that root *is* the single tenant root described above. All other tenants live below it as sub-tenants. The RG create path assigns a non-tenant root to the target tenant, which defaults to the caller’s tenant. A tenant-type group takes its own group ID as its tenant ID. RG rejects creation of a second tenant-type root with `TenantRootAlreadyExists` (409 Conflict). [Group creation](../../../gears/system/resource-group/resource-group/src/domain/group_service.rs) · [Tenant root requirement](../../../gears/system/resource-group/docs/PRD.md#enforce-tenant-root-uniqueness)
 
 **Why single-root tree?**
 - **One OAuth client is enough** for S2S tenant-scoped flows that need to act as the root — no per-root credential fan-out at the vendor IdP.
@@ -193,7 +193,7 @@ Many operations need to query "all resources in tenant T and its children". This
 |----------|------|------|
 | Recursive CTE | No extra tables | Slow for deep hierarchies, not portable |
 | Explicit ID list from PDP | Simple SQL | Doesn't scale (thousands of IDs) |
-| Closure table | O(1) JOIN, scales well | Requires sync, storage overhead |
+| Closure table | Indexed ancestor lookup without recursive traversal | Requires sync, storage overhead |
 
 Gears recommend **closure tables** for production deployments with hierarchical tenants.
 
@@ -203,14 +203,14 @@ Gears recommend **closure tables** for production deployments with hierarchical 
 |-----------|---------|-------------|
 | `mode` | `"subtree"` | `"root_only"` (single tenant) or `"subtree"` (tenant + descendants) |
 | `root_id` | — | Root tenant. Optional — PDP can determine from `token_scopes` or `subject.properties.tenant_id` |
-| `barrier_mode` | `"all"` | `"all"` (respect barriers) or `"none"` (ignore). See [DESIGN.md](./DESIGN.md#3-tenant-subtree-predicate-type-in_tenant_subtree). |
-| `tenant_status` | all | Filter by tenant status (`active`, `suspended`) |
+| `barrier_mode` | `"respect"` | `"respect"` (respect barriers) or `"ignore"` (ignore). See [DESIGN.md](./DESIGN.md#3-tenant-subtree-predicate-op-in_tenant_subtree). |
+| `tenant_status` | all | List of descendant statuses (`active`, `suspended`, `deleted`). In TR subtree resolution, the root is returned independently of this filter |
 
 ---
 
 ## Closure Table
 
-The `tenant_closure` table is a denormalized representation of the tenant hierarchy. It contains all ancestor-descendant pairs, enabling efficient subtree queries.
+The `tenant_closure` table is a denormalized representation of the tenant hierarchy. It contains every ancestor–descendant pair for SDK-visible tenants, including each tenant’s self-row. Account Management creates closure rows when provisioning completes.
 
 **Schema:**
 
@@ -219,7 +219,7 @@ The `tenant_closure` table is a denormalized representation of the tenant hierar
 | `ancestor_id` | UUID | Ancestor tenant |
 | `descendant_id` | UUID | Descendant tenant |
 | `barrier` | SMALLINT NOT NULL DEFAULT 0 | 0 = no respected barrier on path `(ancestor, descendant]`, 1 = at least one `self_managed` tenant exists on that path |
-| `descendant_status` | enum | Status of descendant tenant (denormalized for query efficiency) |
+| `descendant_status` | SMALLINT NOT NULL | Status of descendant tenant: `1=active`, `2=suspended`, `3=deleted` (denormalized for query efficiency). Wire values use the corresponding names. |
 
 **Barrier semantics:** The `barrier` column is defined over the path `(ancestor, descendant]`: the ancestor endpoint is excluded, the descendant endpoint is included. Formally, `barrier = 1` iff any tenant on that path has `self_managed = true`. Self-rows `(id, id)` are a special case and always carry `barrier = 0`.
 
@@ -237,7 +237,7 @@ T1
 └── T4
 ```
 
-| ancestor_id | descendant_id | barrier | descendant_status |
+| ancestor_id | descendant_id | barrier | descendant_status (label) |
 |-------------|---------------|---------|-------------------|
 | T1 | T1 | 0 | active |
 | T1 | T2 | 1 | active |
@@ -255,14 +255,14 @@ T1
 - `T2 → T3`: barrier = 0 because ancestor `T2` is excluded from `(T2, T3]`
 - Because the hierarchy has a single root, that root appears as `ancestor_id` of every tenant in the table (subject to the barrier rules above).
 
-**Query: "All tenants in T1's subtree, with `barrier_mode: "all"`"**
+**Query: "All tenants in T1's subtree, with `barrier_mode: "respect"`"**
 
 ```sql
--- barrier_mode: "all" (default) adds the barrier clause
+-- barrier_mode: "respect" (default) adds the barrier clause
 SELECT descendant_id FROM tenant_closure
 WHERE ancestor_id = 'T1'
   AND barrier = 0
--- barrier_mode: "none" omits the barrier clause
+-- barrier_mode: "ignore" omits the barrier clause
 ```
 
 Result: T1, T4 (T2 and T3 excluded due to barrier = 1)
