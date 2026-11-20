@@ -52,6 +52,15 @@ match ServerEventsStream::from_response::<ServerEvent>(resp) {
 }
 ```
 
+One event may take up to 16 MiB (`sse::DEFAULT_MAX_EVENT_BYTES`, its lines with
+their line endings). A larger event, or a body that never ends an event with a
+blank line, ends the stream with `StreamingError::EventTooLarge`; set another
+limit with `ServerEventsStream::from_response_with_max_event_bytes`.
+
+An event the body ends before its blank line is dropped, at a clean end too
+(W3C EventSource). A body error ends the stream with that error; invalid UTF-8
+ends it with `StreamingError::ServerEventsParse`.
+
 ## Features
 
 - `axum` — enables `ws::axum_adapter` for bridging axum WebSocket upgrades into `WebSocketStream`

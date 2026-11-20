@@ -385,6 +385,16 @@ async def _handle(method: str, target: str, headers: dict, body: bytes, writer: 
                 pass
         writer.write(_sse_end())
 
+    # POST /sse/fail — one event, then the connection closes without the
+    # body's terminating chunk (an upstream failing mid-stream). A FIN, not a
+    # reset: a reset may discard the event before the gateway reads it.
+    elif method == "POST" and path == "/sse/fail":
+        writer.write(_sse_header())
+        writer.write(_sse_chunk("one"))
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
     # POST /v1/chat/completions/stream
     elif method == "POST" and path == "/v1/chat/completions/stream":
         writer.write(_sse_header())

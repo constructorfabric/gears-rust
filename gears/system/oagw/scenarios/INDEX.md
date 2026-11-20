@@ -336,7 +336,7 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 
 #### SSE stream ends when the gear stops
 - **Scenario**: [positive-13.3-sse-stream-ends-on-gear-stop.md](protocols/sse/positive-13.3-sse-stream-ends-on-gear-stop.md)
-- **Mechanism**: Server shutdown or gear stop ends open SSE streams (and sends Close 1001 on WebSocket relays) before the HTTP drain, also a stream opened before the first start or one that starts waiting after the stop was signalled. A later start lets new streams run.
+- **Mechanism**: Server shutdown or gear stop ends open SSE streams (and sends Close 1001 on WebSocket relays) before the HTTP drain, also a stream opened before the first start or one that starts waiting after the stop was signalled. Non-SSE bodies are not cut: they finish within the HTTP drain deadline. A later start lets new streams run.
 
 ---
 
@@ -794,6 +794,14 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 - **Scenario**: [negative-15.4-grpc-status-mapping-error-source.md](protocols/grpc/negative-15.4-grpc-status-mapping-error-source.md)
 - **What happens**: gRPC `RESOURCE_EXHAUSTED` maps to rate limit error. Upstream gRPC failures marked `ESrc=upstream`.
 
+#### SSE idle timeout ends the stream with an error
+- **Scenario**: [negative-13.4-sse-idle-timeout-ends-stream-with-error.md](protocols/sse/negative-13.4-sse-idle-timeout-ends-stream-with-error.md)
+- **What happens**: Upstream silent past `streaming_idle_timeout_secs` → body aborted after the events sent (no terminating chunk), nothing injected; SDK gets `StreamingError::IdleTimeout`.
+
+#### Upstream failure mid-stream breaks the SSE stream
+- **Scenario**: [negative-13.5-upstream-failure-mid-stream-breaks-stream.md](protocols/sse/negative-13.5-upstream-failure-mid-stream-breaks-stream.md)
+- **What happens**: Upstream drops the connection after the head → caller gets the events sent, then a broken body; no JSON after the head; SDK gets `StreamingError::Stream`.
+
 ---
 
 ### Connection limits
@@ -804,7 +812,7 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 
 #### WS connection idle timeout enforced
 - **Scenario**: [negative-14.4-ws-connection-idle-timeout-enforced.md](protocols/websocket/negative-14.4-ws-connection-idle-timeout-enforced.md)
-- **What happens**: Idle connection closed after configured timeout.
+- **What happens**: Idle connection gets Close 1001 (Going Away) after the configured timeout, then EOF. A bare EOF fails.
 
 #### Stalled caller does not block upstream's graceful close
 - **Scenario**: [negative-14.5-stalled-caller-does-not-block-upstream-close.md](protocols/websocket/negative-14.5-stalled-caller-does-not-block-upstream-close.md)
@@ -828,7 +836,7 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 
 #### Stream aborted classified distinctly
 - **Scenario**: *Section 24.4 — no separate file.*
-- **What happens**: Abort SSE/WS mid-flight → classified as `StreamAborted`.
+- **What happens**: Upstream read/write failure before the response head → `502 StreamAborted`. After the head no status can follow: the body is aborted instead (13.5).
 
 #### Every documented error type has at least one reproducer
 - **Scenario**: *Section 24.5 — no separate file.*

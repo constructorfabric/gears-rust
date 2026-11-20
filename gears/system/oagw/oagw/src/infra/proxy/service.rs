@@ -293,13 +293,22 @@ impl DataPlaneServiceImpl {
         self.apply_response_pipeline(pipeline, status, &mut resp_headers)
             .await;
 
-        // Apply streaming lifecycle management for SSE responses:
-        // idle timeout and graceful shutdown awareness.
+        let labels = streaming::StreamLabels {
+            alias: pipeline.host.to_owned(),
+            path: pipeline.path_suffix.to_owned(),
+        };
+        // Inside the SSE lifecycle, so the idle and shutdown cuts it adds are
+        // not logged as upstream failures.
+        let resp_body_stream = streaming::log_upstream_body_error(resp_body_stream, labels.clone());
+        // SSE bodies get the streaming idle timeout and end on shutdown. Other
+        // bodies keep the engine's read timeout and finish within the HTTP
+        // drain.
         let resp_body_stream = if is_sse {
             streaming::streaming_body_with_lifecycle(
                 resp_body_stream,
                 self.streaming_idle_timeout,
                 self.stream_shutdown.subscribe(),
+                labels,
             )
         } else {
             resp_body_stream

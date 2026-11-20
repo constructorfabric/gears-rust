@@ -9,7 +9,9 @@ pub mod response;
 
 pub use body::{IntoBody, Json};
 pub use harness::{AppHarness, AppHarnessBuilder};
-pub use mock::{MockBody, MockGuard, MockResponse, MockUpstream, RecordedRequest, RouteKey};
+pub use mock::{
+    MockBody, MockGuard, MockResponse, MockStreamEnd, MockUpstream, RecordedRequest, RouteKey,
+};
 pub use request::RequestCase;
 pub use response::TestResponse;
 

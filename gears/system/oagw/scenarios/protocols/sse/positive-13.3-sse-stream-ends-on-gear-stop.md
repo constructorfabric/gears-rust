@@ -31,4 +31,12 @@ SSE route on an upstream that sends events rarely (well inside `streaming_idle_t
 - A stream opened before OAGW's first start (the server serves REST before it starts the app gears) ends on shutdown and on stop as well.
 - After OAGW starts again, new SSE requests stream normally.
 
-`testing/e2e/suites/oagw/test_sse_shutdown.py` covers the first two bullets and the exit with a private server stopped by SIGTERM under a stream the mock holds open (`/sse/hold`). Rust tests cover the rest (`infra/proxy/streaming.rs`, `gear_tests.rs`, `tests/proxy_integration.rs`).
+### Non-SSE responses
+
+Every upstream response is streamed, so OAGW does not cut non-SSE bodies on stop: that would truncate ordinary REST responses still in transfer.
+
+- A non-SSE body still streaming when OAGW stops runs on and finishes within the server's HTTP drain deadline.
+- A silent upstream is bounded by the proxy read timeout (`proxy_timeout_secs`), not by `streaming_idle_timeout_secs`.
+- SSE streams and WebSocket relays open at the same moment still end at once.
+
+`testing/e2e/suites/oagw/test_sse_shutdown.py` covers the first two SSE bullets and the exit with a private server stopped by SIGTERM under a stream the mock holds open (`/sse/hold`). Rust tests cover the rest (`infra/proxy/streaming.rs`, `gear_tests.rs`, `tests/proxy_integration.rs`).

@@ -45,6 +45,22 @@ pub enum MockBody {
         body: Box<MockBody>,
         gate: Arc<tokio::sync::Mutex<Option<oneshot::Receiver<()>>>>,
     },
+    /// The chunks as sent, one body frame each, then `end`. No default
+    /// `content-type`.
+    Stream {
+        chunks: Vec<String>,
+        end: MockStreamEnd,
+    },
+}
+
+/// How a [`MockBody::Stream`] body ends after its chunks.
+#[derive(Clone, Copy, Debug)]
+pub enum MockStreamEnd {
+    /// The body stays open and silent until the client goes away.
+    Hold,
+    /// The upstream fails mid-body: the connection is cut without the
+    /// body's end (no terminating chunk).
+    Abort,
 }
 
 /// A registered mock response for dynamic routing.
@@ -99,6 +115,28 @@ impl MockResponse {
                     builder = builder.header(k.as_str(), v.as_str());
                 }
                 builder.body(axum::body::Body::from(text)).unwrap()
+            }
+            MockBody::Stream { chunks, end } => {
+                let mut builder = axum::response::Response::builder()
+                    .status(StatusCode::from_u16(self.status).unwrap_or(StatusCode::OK));
+                for (k, v) in &self.headers {
+                    builder = builder.header(k.as_str(), v.as_str());
+                }
+                let body = async_stream::stream! {
+                    for chunk in chunks {
+                        yield Ok::<_, std::io::Error>(Bytes::from(chunk));
+                    }
+                    match end {
+                        MockStreamEnd::Hold => std::future::pending::<()>().await,
+                        MockStreamEnd::Abort => {
+                            // Lets the server flush the chunks before it
+                            // drops the connection.
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            yield Err(std::io::Error::other("mock upstream failed mid-body"));
+                        }
+                    }
+                };
+                builder.body(axum::body::Body::from_stream(body)).unwrap()
             }
             MockBody::Sse(chunks) => {
                 let sse_body = chunks

@@ -79,8 +79,8 @@ Design constraints enforced: `cpt-cf-oagw-constraint-https-only`.
 
 **Error Scenarios**:
 - Upstream does not respond with `Content-Type: text/event-stream` (502 ProtocolError)
-- Upstream connection drops mid-stream (502 StreamAborted)
-- Idle timeout exceeded with no events received (504 IdleTimeout)
+- Upstream connection drops mid-stream: the response head is already sent, so the body to the caller is aborted (no status or problem body follows)
+- Idle timeout exceeded with no events received: the body to the caller is aborted the same way
 - Auth/guard/body validation failures before streaming begins (same as base proxy flow)
 
 **Steps**:
@@ -103,12 +103,13 @@ Design constraints enforced: `cpt-cf-oagw-constraint-https-only`.
    1. [x] - `p1` - Close caller connection gracefully - `inst-sse-9a`
 10. [x] - `p1` - **IF** caller disconnects before upstream completes - `inst-sse-10`
     1. [x] - `p1` - Abort upstream connection and release resources - `inst-sse-10a`
-11. [x] - `p1` - **IF** upstream connection drops unexpectedly (TCP reset, TLS error) - `inst-sse-11`
-    1. [x] - `p1` - **RETURN** 502 StreamAborted with `X-OAGW-Error-Source: gateway` - `inst-sse-11a`
-12. [x] - `p1` - **IF** idle timeout exceeded (no events received within configured timeout) - `inst-sse-12`
-    1. [x] - `p1` - **RETURN** 504 IdleTimeout with `X-OAGW-Error-Source: gateway` - `inst-sse-12a`
+11. [x] - `p1` - **IF** upstream connection drops unexpectedly after the response head (TCP reset, TLS error) - `inst-sse-11`
+    1. [x] - `p1` - Abort the body to the caller: the events already received are kept, nothing is written after them (no JSON error), and the body does not end cleanly (HTTP/1.1: no terminating chunk); SDK consumers get `StreamingError::Stream` - `inst-sse-11a`
+12. [x] - `p1` - **IF** idle timeout exceeded (no data from upstream within `streaming_idle_timeout_secs`) - `inst-sse-12`
+    1. [x] - `p1` - Abort the body to the caller the same way, so a cut stream cannot pass for a complete one, and release the upstream connection; SDK consumers get `StreamingError::IdleTimeout` - `inst-sse-12a`
 13. [x] - `p1` - **IF** the server starts shutting down or the gear stops, including when the signal came before the stream began waiting or a start followed at once - `inst-sse-13`
     1. [x] - `p1` - Abort the stream to the caller (the body ends with an error, not a clean end, so a cut answer cannot pass for a complete one; SDK consumers get `StreamingError::ClosedByGateway`) and release the upstream connection at once; open WebSocket relays get Close 1001 on the same signal - `inst-sse-13a`
+    2. [x] - `p1` - Leave non-SSE response bodies running: every upstream response is streamed, so a cut would truncate ordinary REST responses still in transfer. They finish within the server's HTTP drain deadline, and a silent upstream is bounded by the proxy read timeout (`proxy_timeout_secs`) - `inst-sse-13b`
 
 ### WebSocket Proxy Flow
 
@@ -123,8 +124,8 @@ Design constraints enforced: `cpt-cf-oagw-constraint-https-only`.
 
 **Error Scenarios**:
 - Upstream rejects WebSocket upgrade (502 ProtocolError)
-- Upstream connection drops during session (502 StreamAborted)
-- Idle timeout on WebSocket session (504 IdleTimeout)
+- Upstream connection drops during session: the caller's leg is half-closed
+- Idle timeout on WebSocket session: Close 1001 to both sides
 - Auth/guard failures before upgrade (same as base proxy flow)
 
 **Steps**:
@@ -166,7 +167,7 @@ Design constraints enforced: `cpt-cf-oagw-constraint-https-only`.
 **Error Scenarios**:
 - Upstream does not support WebTransport (502 ProtocolError)
 - HTTP/2 negotiation fails (502 ProtocolError with fallback guidance)
-- Session drops mid-stream (502 StreamAborted)
+- Session drops mid-stream: open streams are closed
 
 **Steps**:
 1. [ ] - `p2` - Actor initiates WebTransport session via `CONNECT` to `/api/oagw/v1/proxy/{alias}[/{path}]` with `:protocol` pseudo-header set to `webtransport` - `inst-wt-1`
@@ -227,7 +228,7 @@ Design constraints enforced: `cpt-cf-oagw-constraint-https-only`.
 
 **Steps**:
 1. [x] - `p1` - Initialize connection state: `OPEN` - `inst-lifecycle-1`
-2. [x] - `p1` - Start idle timer with configured timeout (from upstream/route `timeout` guard plugin config or system default) - `inst-lifecycle-2`
+2. [x] - `p1` - Start idle timer with the gear's configured timeout (`streaming_idle_timeout_secs` for SSE, `websocket_idle_timeout_secs` for WebSocket); other response bodies keep the proxy read timeout (`proxy_timeout_secs`) - `inst-lifecycle-2`
 3. [x] - `p1` - **FOR EACH** data event (SSE event, WebSocket message, WebTransport stream data) - `inst-lifecycle-3`
    1. [x] - `p1` - Reset idle timer - `inst-lifecycle-3a`
    2. [x] - `p1` - **IF** destination is not ready to receive (backpressure) - `inst-lifecycle-3b`
@@ -235,7 +236,7 @@ Design constraints enforced: `cpt-cf-oagw-constraint-https-only`.
    3. [x] - `p1` - Forward data to the appropriate destination - `inst-lifecycle-3c`
 4. [x] - `p1` - **IF** idle timer expires (no data in either direction) - `inst-lifecycle-4`
    1. [x] - `p1` - Transition to `CLOSING` state - `inst-lifecycle-4a`
-   2. [x] - `p1` - Initiate protocol-appropriate close (SSE: close response stream; WebSocket: send Close frame 1001; WebTransport: close session) - `inst-lifecycle-4b`
+   2. [x] - `p1` - Initiate protocol-appropriate close (SSE: abort the response body with an error; WebSocket: send Close frame 1001; WebTransport: close session) - `inst-lifecycle-4b`
 5. [x] - `p1` - **IF** upstream signals close (EOF, Close frame, session close) - `inst-lifecycle-5`
    1. [x] - `p1` - Transition to `CLOSING` state - `inst-lifecycle-5a`
    2. [x] - `p1` - Propagate close to caller - `inst-lifecycle-5b`
@@ -258,7 +259,7 @@ Not applicable. Streaming connections are transient request-scoped sessions — 
 
 - [x] `p1` - **ID**: `cpt-cf-oagw-dod-sse-streaming`
 
-The system **MUST** detect SSE responses (`Content-Type: text/event-stream`) from upstream and forward events to the caller in real time without buffering the full response. SSE fields (`data:`, `event:`, `id:`, `retry:`) **MUST** be preserved as-is. Individual SSE events are forwarded without size validation (pass-through; upstream controls event granularity). The system **MUST** handle connection lifecycle: upstream close (clean EOF), caller disconnect (abort upstream), unexpected drop (502 StreamAborted), idle timeout (504 IdleTimeout), and shutdown, which aborts every open stream at once (also one opened after the signal), as soon as the server starts shutting down rather than at the end of its HTTP drain. Non-SSE responses from an upstream expected to return SSE **MUST** return 502 ProtocolError with `X-OAGW-Error-Source: gateway`. Error source distinction per `cpt-cf-oagw-principle-error-source` applies to all streaming error scenarios.
+The system **MUST** detect SSE responses (`Content-Type: text/event-stream`) from upstream and forward events to the caller in real time without buffering the full response. SSE fields (`data:`, `event:`, `id:`, `retry:`) **MUST** be preserved as-is. Individual SSE events are forwarded without size validation (pass-through; upstream controls event granularity). The system **MUST** handle connection lifecycle: upstream close (clean EOF), caller disconnect (abort upstream), unexpected drop after the response head (the body is aborted, nothing is injected after the head), idle timeout (the body is aborted with an error, not ended cleanly), and shutdown, which aborts every open stream at once (also one opened after the signal), as soon as the server starts shutting down rather than at the end of its HTTP drain. Non-SSE response bodies are not cut at shutdown: they finish within the server's HTTP drain deadline. Non-SSE responses from an upstream expected to return SSE **MUST** return 502 ProtocolError with `X-OAGW-Error-Source: gateway`. Error source distinction per `cpt-cf-oagw-principle-error-source` applies to all streaming error scenarios.
 
 **Implements**:
 - `cpt-cf-oagw-flow-streaming-sse`
@@ -311,9 +312,10 @@ The system **MUST** implement adaptive per-host HTTP version detection using ALP
 - [x] SSE fields (`data:`, `event:`, `id:`, `retry:`) are preserved as-is during forwarding
 - [x] Upstream close (EOF) during SSE streaming results in clean caller connection closure
 - [x] Caller disconnect during SSE streaming aborts the upstream connection and releases resources
-- [x] Unexpected upstream drop during SSE streaming returns 502 StreamAborted with `X-OAGW-Error-Source: gateway`
-- [x] Idle timeout during SSE streaming (no events within configured timeout) returns 504 IdleTimeout with `X-OAGW-Error-Source: gateway`
+- [x] Unexpected upstream drop during SSE streaming aborts the body to the caller after the events already sent: no JSON is injected after the head and the body does not end cleanly
+- [x] Idle timeout during SSE streaming (no data within `streaming_idle_timeout_secs`) aborts the body with an error, not a clean end, and releases the upstream; SDK consumers get `StreamingError::IdleTimeout`
 - [x] Server shutdown or gear stop aborts every open SSE stream at once with an error, not a clean end, and releases its upstream; this includes streams opened before the gear's first start and streams that start waiting after the signal, and the server's HTTP drain does not wait for them
+- [x] Server shutdown or gear stop does not cut non-SSE response bodies: they finish within the HTTP drain deadline, bounded by the proxy read timeout
 - [ ] Non-SSE upstream response when SSE was expected returns 502 ProtocolError with `X-OAGW-Error-Source: gateway`
 - [x] WebSocket upgrade requests (`Upgrade: websocket`) are negotiated with both caller and upstream
 - [x] WebSocket text and binary messages are forwarded bidirectionally with opcode preservation
@@ -358,11 +360,12 @@ All streaming connections are subject to the same auth and guard plugin chain as
 
 | Parameter | Scope | Default | Description |
 |-----------|-------|---------|-------------|
-| `streaming_idle_timeout_seconds` | upstream / route | Inherited from `timeout` guard plugin or system default | Idle timeout for streaming connections (no data in either direction) |
+| `streaming_idle_timeout_secs` | system | 300 | Idle timeout for SSE responses (no data from upstream); on expiry the body is aborted with an error |
+| `websocket_idle_timeout_secs` | system | 300 | Idle timeout for WebSocket relays (no data in either direction); on expiry both sides get Close 1001 |
 | `websocket_close_timeout_secs` | system | 5 | Bound on delivering the gateway's Close 1001 and half-closing both legs at teardown |
-| `protocol_version_cache_ttl_seconds` | system | 3600 (1 hour) | TTL for cached ALPN negotiation results per host |
+| `protocol_cache_ttl_secs` | system | 3600 (1 hour) | TTL for cached ALPN negotiation results per host |
 
-All parameters are read from upstream/route configuration at connection time. System-level defaults are set via gear configuration (`OagwConfig`).
+All parameters are gear configuration (`OagwConfig`), read at startup. There are no per-upstream or per-route streaming timeouts.
 
 ### Deliberate Omissions
 
