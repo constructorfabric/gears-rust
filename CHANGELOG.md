@@ -14,6 +14,15 @@ release-plz updates this file in the Release PR.
 - Resource Group type definitions moved to Types Registry. The legacy
   `/types-registry/v1/types` and `/types-registry/v1/types/{code}` routes,
   SDK type CRUD and `ResourceGroupTypeBootstrap` are removed.
+- The Resource Group base schema now uses the group authorization target
+  `gts.cf.core.rg.group.v1~`. Update derived schema IDs, references, tenant
+  type configuration and client filters that use `gts.cf.core.rg.type.v1~`.
+  The default tenant segment changes from `cf.core._.tenant.v1~` to
+  `cf.core.rg.tenant.v1~` in the tenant schema and its descendants.
+  In the Resource Group SDK, replace `TYPE_RESOURCE_TYPE` and `GROUP_RESOURCE_TYPE`
+  with `GROUP_TYPE_ID`, `GROUP_MEMBERSHIP_RESOURCE_TYPE` with `GROUP_MEMBERSHIP_TYPE_ID`,
+  and `TENANT_RG_TYPE_PATH` with `TENANT_GROUP_TYPE_ID`. The migration updates
+  stored group type IDs in place.
 - Export custom definitions and publish their schemas through Types Registry
   before upgrading. The irreversible migration drops local schemas and
   placement rules while preserving `gts_type` keys, groups, memberships and

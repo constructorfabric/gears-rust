@@ -53,7 +53,7 @@ async fn setup() -> Fixture {
 
     let member_type = create_root_type(&type_svc, "isombr").await;
     let grp_code = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.isogrp.i{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.group.v1~x.test.isogrp.i{}.v1~",
         Uuid::now_v7().as_simple()
     );
     type_svc
@@ -329,7 +329,7 @@ async fn assert_foreign_add_looks_like_missing(f: &Fixture, resource_type: &str)
 async fn add_foreign_group_with_unregistered_type_looks_like_missing_group() {
     let f = setup().await;
     let unregistered = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.nosuch.i{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.group.v1~x.test.nosuch.i{}.v1~",
         Uuid::now_v7().as_simple()
     );
     assert_foreign_add_looks_like_missing(&f, &unregistered).await;

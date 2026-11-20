@@ -9,20 +9,20 @@ fn gts_type_path_valid_cases() {
     let valid = vec![
         // TC-SDK-01: basic valid path
         (
-            gts_id!("cf.core.rg.type.v1~"),
-            gts_id!("cf.core.rg.type.v1~"),
+            gts_id!("cf.core.rg.group.v1~"),
+            gts_id!("cf.core.rg.group.v1~"),
         ),
         // TC-SDK-06: uppercase is lowered
-        ("GTS.CF.CORE.RG.TYPE.V1~", gts_id!("cf.core.rg.type.v1~")),
+        ("GTS.CF.CORE.RG.GROUP.V1~", gts_id!("cf.core.rg.group.v1~")),
         // TC-SDK-07: trimmed + lowered
         (
-            "  GTS.CF.CORE.RG.TYPE.V1~  ",
-            gts_id!("cf.core.rg.type.v1~"),
+            "  GTS.CF.CORE.RG.GROUP.V1~  ",
+            gts_id!("cf.core.rg.group.v1~"),
         ),
         // TC-SDK-08: multi-segment
         (
-            gts_id!("cf.core.rg.type.v1~x.test.unit.root.v1~"),
-            gts_id!("cf.core.rg.type.v1~x.test.unit.root.v1~"),
+            gts_id!("cf.core.rg.group.v1~x.test.unit.root.v1~"),
+            gts_id!("cf.core.rg.group.v1~x.test.unit.root.v1~"),
         ),
         // TC-SDK-19: numeric version in segment
         (
@@ -53,17 +53,17 @@ fn gts_type_path_invalid_cases() {
         ("invalid.path~".to_owned(), "Invalid GTS type path format"),
         // TC-SDK-05: no trailing tilde
         (
-            format!("{GTS_ID_PREFIX}cf.core.rg.type.v1"),
+            format!("{GTS_ID_PREFIX}cf.core.rg.group.v1"),
             "Invalid GTS type path format",
         ),
         // TC-SDK-09: double tilde
         (
-            format!("{GTS_ID_PREFIX}cf.core.rg.type.v1~~"),
+            format!("{GTS_ID_PREFIX}cf.core.rg.group.v1~~"),
             "Invalid GTS type path format",
         ),
         // TC-SDK-10: hyphen in segment
         (
-            format!("{GTS_ID_PREFIX}cf.core.rg.type.v1~hello-world~"),
+            format!("{GTS_ID_PREFIX}cf.core.rg.group.v1~hello-world~"),
             "Invalid GTS type path format",
         ),
         // TC-SDK-18: empty segment after gts.
@@ -115,7 +115,7 @@ fn gts_type_path_max_length_boundary() {
 #[test]
 fn gts_type_path_serde_round_trip() {
     // TC-SDK-11: serialize then deserialize
-    let original = GtsTypePath::new(gts_id!("cf.core.rg.type.v1~")).unwrap();
+    let original = GtsTypePath::new(gts_id!("cf.core.rg.group.v1~")).unwrap();
     let json = serde_json::to_string(&original).unwrap();
     let deserialized: GtsTypePath = serde_json::from_str(&json).unwrap();
     assert_eq!(original, deserialized);
@@ -132,7 +132,7 @@ fn gts_type_path_serde_invalid_rejects() {
 
 #[test]
 fn gts_type_path_display_and_into_string() {
-    let path = GtsTypePath::new(gts_id!("cf.core.rg.type.v1~")).unwrap();
+    let path = GtsTypePath::new(gts_id!("cf.core.rg.group.v1~")).unwrap();
     let display = path.to_string();
     let into_string: String = path.into();
     assert_eq!(display, into_string);
@@ -145,7 +145,7 @@ fn resource_group_type_field_renamed() {
     // TC-SDK-15: Rust field is `code`, serialized as JSON key `"type"`.
     let group = ResourceGroup {
         id: Uuid::nil(),
-        code: gts_id!("cf.core.rg.type.v1~").to_owned(),
+        code: gts_id!("cf.core.rg.group.v1~").to_owned(),
         name: "Test".to_owned(),
         hierarchy: GroupHierarchy {
             parent_id: None,
@@ -169,7 +169,7 @@ fn resource_group_metadata_absent_when_none() {
     // TC-SDK-16: metadata: None -> no "metadata" key
     let group = ResourceGroup {
         id: Uuid::nil(),
-        code: gts_id!("cf.core.rg.type.v1~").to_owned(),
+        code: gts_id!("cf.core.rg.group.v1~").to_owned(),
         name: "Test".to_owned(),
         hierarchy: GroupHierarchy {
             parent_id: None,
@@ -189,13 +189,11 @@ fn resource_group_metadata_absent_when_none() {
 #[test]
 fn gts_type_path_trims_and_lowercases() {
     // TC-SDK-24: GtsTypePath::new trims whitespace and lowercases.
-    // validate_type_code (in the domain crate) also trims and lowercases,
-    // ensuring consistent normalization across SDK and domain layers.
-    let input = "  GTS.CF.CORE.RG.TYPE.V1~  ";
+    let input = "  GTS.CF.CORE.RG.GROUP.V1~  ";
     let path = GtsTypePath::new(input);
     assert!(
         path.is_ok(),
         "GtsTypePath::new should accept trimmed/lowered input"
     );
-    assert_eq!(path.unwrap().as_str(), gts_id!("cf.core.rg.type.v1~"));
+    assert_eq!(path.unwrap().as_str(), gts_id!("cf.core.rg.group.v1~"));
 }

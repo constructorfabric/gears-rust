@@ -309,7 +309,7 @@ their behavior now follows registry ownership instead of the removed RG catalog.
 
 **Actors**: `cpt-cf-resource-group-actor-instance-administrator`, `cpt-cf-resource-group-actor-apps`
 
-RG **MUST** resolve group types derived from `gts.cf.core.rg.type.v1~` through
+RG **MUST** resolve group types derived from `gts.cf.core.rg.group.v1~` through
 Types Registry using the caller's SecurityContext. Types Registry owns the
 authored and resolved schemas for group placement, metadata, and membership
 policy. RG **MUST NOT** maintain a local type-definition catalog or expose type
@@ -384,7 +384,7 @@ The gear **MUST** provide API operations for:
 Entity fields (GTS-aligned naming):
 
 - `id` (UUID) — group identifier
-- `type` (GTS chained type path, e.g. `gts.cf.core.rg.type.v1~w.system.org.department.v1~`)
+- `type` (GTS chained type path, e.g. `gts.cf.core.rg.group.v1~w.system.org.department.v1~`)
 - `name` (1..255) — display name
 - `metadata` (object) — type-specific fields defined by the chained RG type schema. Examples: `metadata.self_managed`, `metadata.custom_domain`, `metadata.category`. For types supporting barrier semantics, `metadata.self_managed` (boolean) is included here.
 - `hierarchy` (object) — RG hierarchy context:
@@ -410,7 +410,7 @@ The forest **MAY** contain multiple root groups. Each root has `parent_id = NULL
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`
 
-At most **one** root in the whole RG forest **MUST** be of a tenant type (GTS type code with prefix `TENANT_RG_TYPE_PATH`, see `resource_group_sdk::TENANT_RG_TYPE_PATH`). That unique tenant root is the **main tenant**; every other tenant exists as its sub-tenant (`parent_id` points inside the main tenant's subtree).
+At most **one** root in the whole RG forest **MUST** be of a tenant type (GTS type code with prefix `TENANT_GROUP_TYPE_ID`, see `resource_group_sdk::TENANT_GROUP_TYPE_ID`). That unique tenant root is the **main tenant**; every other tenant exists as its sub-tenant (`parent_id` points inside the main tenant's subtree).
 
 Non-tenant roots **MAY** coexist alongside the main tenant root; they carry `tenant_id` of the main tenant but are not tenants themselves.
 
@@ -797,8 +797,8 @@ consumes them.
 
 #### Scenario: Use a Published Type
 
-- **GIVEN** a gear published `gts.cf.core.rg.type.v1~vendor.app.branch.v1~` with
-  a `parent_type` constraint allowing `gts.cf.core.rg.type.v1~vendor.app.tenant.v1~` before application `init`
+- **GIVEN** a gear published `gts.cf.core.rg.group.v1~vendor.app.branch.v1~` with
+  a `parent_type` constraint allowing `gts.cf.core.rg.group.v1~vendor.app.tenant.v1~` before application `init`
 - **WHEN** caller creates a group of that type under a group of the tenant type
 - **THEN** RG reads the type from Types Registry and creates the group
 

@@ -50,7 +50,7 @@ pub enum DomainError {
     ///
     /// Raised when a `create_group`/`update_group` would leave the RG forest
     /// with more than one root group whose GTS type code starts with a
-    /// configured tenant-type prefix (default `TENANT_RG_TYPE_PATH`). Enforces
+    /// configured tenant-type prefix (default `TENANT_GROUP_TYPE_ID`). Enforces
     /// `cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`. Maps to
     /// canonical `already_exists` (HTTP 409) with `existing_root_id` as the
     /// `resource_name`.

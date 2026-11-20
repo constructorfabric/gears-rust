@@ -3200,7 +3200,7 @@
             ]
           },
           "type": {
-            "description": "GTS chained type path. Must have prefix `gts.cf.core.rg.type.v1~`.",
+            "description": "GTS chained type path. Must have prefix `gts.cf.core.rg.group.v1~`.",
             "type": "string"
           }
         },

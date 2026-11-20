@@ -231,7 +231,7 @@ async fn group_create_nonexistent_type() {
         .create_group(
             &ctx,
             CreateGroupRequest::new(
-                gts_id!("cf.core.rg.type.v1~x.test.nonexistent.type.v1~").to_owned(),
+                gts_id!("cf.core.rg.group.v1~x.test.nonexistent.type.v1~").to_owned(),
                 "Ghost".to_owned(),
             ),
             tenant_id,
@@ -437,7 +437,7 @@ async fn create_self_parenting_type(
 ) -> common::ResourceGroupType {
     let code = format!(
         "{}x.test.{}.i{}.v1~",
-        gts_id!("cf.core.rg.type.v1~"),
+        gts_id!("cf.core.rg.group.v1~"),
         suffix.to_ascii_lowercase(),
         Uuid::now_v7().as_simple()
     );
@@ -759,7 +759,7 @@ async fn group_move_child_to_root() {
     // Create a type that can be both root and child
     let root_type = common::create_root_type(&type_svc, "org").await;
     let child_code = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.flexible.i{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.group.v1~x.test.flexible.i{}.v1~",
         Uuid::now_v7().as_simple()
     );
     let _flexible_type = type_svc
@@ -884,7 +884,7 @@ async fn group_move_max_width_exceeded() {
 
     let root_type = common::create_root_type(&type_svc, "org").await;
     let child_code = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.flex.i{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.group.v1~x.test.flex.i{}.v1~",
         Uuid::now_v7().as_simple()
     );
     type_svc
@@ -1445,7 +1445,7 @@ async fn group_move_max_depth_exceeded() {
     let child_type = common::create_child_type(&type_svc, "dept", &[&root_type.code], &[]).await;
     // sub_type allows child_type as parent, can also be root
     let sub_code = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.sub.i{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.group.v1~x.test.sub.i{}.v1~",
         Uuid::now_v7().as_simple()
     );
     type_svc
@@ -1477,7 +1477,7 @@ async fn group_move_max_depth_exceeded() {
         common::create_root_group(&group_svc, &ctx, &sub_code, "Standalone", tenant_id).await;
     // sub needs a type that allows sub_code as parent -- create another type for that
     let subsub_code = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.subsub.i{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.group.v1~x.test.subsub.i{}.v1~",
         Uuid::now_v7().as_simple()
     );
     type_svc
@@ -2025,7 +2025,7 @@ async fn create_adr_types(
     let course_type = common::create_root_type(type_svc, "adrcourse").await;
 
     let suffix_t = format!("adrtenant{}", uuid::Uuid::now_v7().as_simple());
-    let tenant_code = format!("{}x.test._.{suffix_t}.v1~", gts_id!("cf.core.rg.type.v1~"));
+    let tenant_code = format!("{}x.test._.{suffix_t}.v1~", gts_id!("cf.core.rg.group.v1~"));
 
     // Tenant type: create first without self-reference, then update
     type_svc
@@ -2442,13 +2442,13 @@ async fn security_group_metadata_large_payload() {
 // Tenant-root uniqueness (cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness)
 // =========================================================================
 
-/// Build a unique tenant-type code: code starts with `TENANT_RG_TYPE_PATH` so
-/// `type_code.starts_with(TENANT_RG_TYPE_PATH)` classifies the group as a
+/// Build a unique tenant-type code: code starts with `TENANT_GROUP_TYPE_ID` so
+/// `type_code.starts_with(TENANT_GROUP_TYPE_ID)` classifies the group as a
 /// tenant-type group.
 fn unique_tenant_type_code() -> String {
     format!(
         "{}x.test._.t{}.v1~",
-        resource_group_sdk::TENANT_RG_TYPE_PATH,
+        resource_group_sdk::TENANT_GROUP_TYPE_ID,
         Uuid::now_v7().as_simple()
     )
 }
@@ -2487,7 +2487,7 @@ async fn create_tenant_sub_type(
 }
 
 /// Vendor-specific tenant-type prefix used by the configurable-tenant-type tests.
-const CUSTOM_TENANT_RG_TYPE_PATH: &str = gts_id!("cf.core.rg.type.v1~acme.core._.tenant.v1~");
+const CUSTOM_TENANT_GROUP_TYPE_ID: &str = gts_id!("cf.core.rg.group.v1~acme.core._.tenant.v1~");
 
 /// Create a root-capable RG type whose code starts with `prefix`.
 async fn create_root_type_with_prefix(
@@ -2508,7 +2508,7 @@ async fn create_root_type_with_prefix(
 }
 
 /// TC-TRU-CFG-01: With a custom tenant-type prefix configured, groups of that
-/// type open a new tenant scope, and the built-in `TENANT_RG_TYPE_PATH` no
+/// type open a new tenant scope, and the built-in `TENANT_GROUP_TYPE_ID` no
 /// longer does.
 #[tokio::test]
 async fn configured_tenant_type_prefix_replaces_default() {
@@ -2516,12 +2516,12 @@ async fn configured_tenant_type_prefix_replaces_default() {
     let type_svc = common::make_type_service(db.clone());
     let group_svc =
         common::make_group_service(db.clone()).with_tenant_types(TenantTypes::new(vec![
-            CUSTOM_TENANT_RG_TYPE_PATH.to_owned(),
+            CUSTOM_TENANT_GROUP_TYPE_ID.to_owned(),
         ]));
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let custom_type = create_root_type_with_prefix(&type_svc, CUSTOM_TENANT_RG_TYPE_PATH).await;
+    let custom_type = create_root_type_with_prefix(&type_svc, CUSTOM_TENANT_GROUP_TYPE_ID).await;
     let custom_root = group_svc
         .create_group(
             &ctx,
@@ -2553,8 +2553,8 @@ async fn tenant_root_uniqueness_spans_all_configured_prefixes() {
     let type_svc = common::make_type_service(db.clone());
     let group_svc =
         common::make_group_service(db.clone()).with_tenant_types(TenantTypes::new(vec![
-            resource_group_sdk::TENANT_RG_TYPE_PATH.to_owned(),
-            CUSTOM_TENANT_RG_TYPE_PATH.to_owned(),
+            resource_group_sdk::TENANT_GROUP_TYPE_ID.to_owned(),
+            CUSTOM_TENANT_GROUP_TYPE_ID.to_owned(),
         ]));
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
@@ -2569,7 +2569,7 @@ async fn tenant_root_uniqueness_spans_all_configured_prefixes() {
         .await
         .expect("first tenant root");
 
-    let custom_type = create_root_type_with_prefix(&type_svc, CUSTOM_TENANT_RG_TYPE_PATH).await;
+    let custom_type = create_root_type_with_prefix(&type_svc, CUSTOM_TENANT_GROUP_TYPE_ID).await;
     let err = group_svc
         .create_group(
             &ctx,
@@ -2665,7 +2665,7 @@ async fn non_tenant_root_alongside_tenant_root_allowed() {
         .expect("tenant root");
 
     // Non-tenant root (auxiliary forest, e.g. "workspace") — created with a
-    // regular can_be_root type whose code does NOT start with TENANT_RG_TYPE_PATH.
+    // regular can_be_root type whose code does NOT start with TENANT_GROUP_TYPE_ID.
     let workspace_type = common::create_root_type(&type_svc, "workspace").await;
     let workspace = group_svc
         .create_group(
@@ -3088,7 +3088,7 @@ async fn list_groups_filters_an_unknown_type_to_an_empty_page() {
     let page = group_svc
         .list_groups(
             &ctx,
-            &filter_query("type eq 'gts.cf.core.rg.type.v1~x.test._.absent.v1~'"),
+            &filter_query("type eq 'gts.cf.core.rg.group.v1~x.test._.absent.v1~'"),
         )
         .await
         .expect("an unknown type is not a registry question");

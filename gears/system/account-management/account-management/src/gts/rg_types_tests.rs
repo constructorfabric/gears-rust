@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use resource_group_sdk::gts::GROUP_MEMBERSHIP_RESOURCE_TYPE;
+use resource_group_sdk::gts::GROUP_MEMBERSHIP_TYPE_ID;
 use serde_json::json;
 use toolkit_security::PlatformSecurityContext;
 use types_registry_sdk::testing_platform::MockTypesRegistry;
@@ -17,9 +17,10 @@ use account_management_sdk::gts::{USER_GROUP_RG_TYPE_CODE, USER_RESOURCE_TYPE};
 
 use super::USER_MEMBERSHIP_SCHEMA;
 
-const RG_BASE: &str = toolkit_gts::gts_id!("cf.core.rg.type.v1~");
-const DERIVED_USER_GROUP: &str =
-    toolkit_gts::gts_id!("cf.core.rg.type.v1~cf.core.am.user_group.v1~cf.test.am.custom_group.v1~");
+const RG_BASE: &str = toolkit_gts::gts_id!("cf.core.rg.group.v1~");
+const DERIVED_USER_GROUP: &str = toolkit_gts::gts_id!(
+    "cf.core.rg.group.v1~cf.core.am.user_group.v1~cf.test.am.custom_group.v1~"
+);
 const DERIVED_USER: &str = toolkit_gts::gts_id!("cf.core.am.user.v1~cf.test.am.custom_user.v1~");
 
 fn declaration(declarations: Vec<(String, String)>, id: &str) -> serde_json::Value {
@@ -40,10 +41,10 @@ async fn admitted_registry() -> Arc<MockTypesRegistry> {
             declaration(resource_group_sdk::gts_declarations(), RG_BASE),
         ),
         (
-            GROUP_MEMBERSHIP_RESOURCE_TYPE,
+            GROUP_MEMBERSHIP_TYPE_ID,
             declaration(
                 resource_group_sdk::gts_declarations(),
-                GROUP_MEMBERSHIP_RESOURCE_TYPE,
+                GROUP_MEMBERSHIP_TYPE_ID,
             ),
         ),
         (

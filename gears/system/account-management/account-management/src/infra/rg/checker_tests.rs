@@ -71,7 +71,7 @@ impl FakeRgClient {
 fn sample_group(tenant_id: Uuid) -> ResourceGroup {
     ResourceGroup {
         id: Uuid::from_u128(0xDEAD),
-        code: gts_id!("cf.core.rg.type.v1~acme.rg.test.example.v1~").into(),
+        code: gts_id!("cf.core.rg.group.v1~acme.rg.test.example.v1~").into(),
         name: "sample".into(),
         hierarchy: GroupHierarchy {
             parent_id: None,

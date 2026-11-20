@@ -14,8 +14,8 @@
 //! # Why an exact key is compared by string equality and not as a pattern
 //!
 //! The P0 matrix relies on DESIGN §3.2's separation of the base type from `…~*`:
-//! the exact key `gts.cf.core.rg.type.v1~` keeps the base closed while
-//! `gts.cf.core.rg.type.v1~*` opens its subtree. That is **not** expressible
+//! the exact key `gts.cf.core.rg.group.v1~` keeps the base closed while
+//! `gts.cf.core.rg.group.v1~*` opens its subtree. That is **not** expressible
 //! through `GtsIdPattern` — a bare identifier is an implicit derived-type coverage
 //! envelope (GTS spec §3.6), so `…v1~` and `…v1~*` accept the same set, and
 //! `matches_pattern` on an exact key would make it govern the whole subtree. So a

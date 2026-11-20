@@ -123,7 +123,7 @@ transaction. The validator checks the actual parent and resulting payload in the
    6. [x] - `p1` - Invoke query profile enforcement: check width limit (sibling count under parent) - `inst-create-group-4f`
 5. [x] - `p1` - **ELSE** (root group) - `inst-create-group-5`
    1. [x] - `p1` - **IF** the schema rejects `parent_type: null` → **RETURN** Validation error - `inst-create-group-5a`
-   2. [x] - `p1` - **IF** type code starts with `TENANT_RG_TYPE_PATH` (tenant type) AND there already exists any other root group whose type is a tenant type → **RETURN** `TenantRootAlreadyExists` (409 Conflict) - `inst-create-group-5c`
+   2. [x] - `p1` - **IF** type code starts with `TENANT_GROUP_TYPE_ID` (tenant type) AND there already exists any other root group whose type is a tenant type → **RETURN** `TenantRootAlreadyExists` (409 Conflict) - `inst-create-group-5c`
 6. [x] - `p1` - Before the write transaction, compile the SDK validator from the materialized registry schema - `inst-create-group-5b`
 7. [x] - `p1` - After validation and the caller-supplied ID check, resolve the type key in the transaction and insert the group - `inst-create-group-6`
 7. [x] - `p1` - DB: INSERT INTO resource_group_closure (ancestor_id=id, descendant_id=id, depth=0) — self-row - `inst-create-group-7`
@@ -838,8 +838,8 @@ the payload with the actual parent in the transaction.
 - **Assert**: 201 — the admitted full schema permits this metadata object; validation still runs
 
 #### TC-ADR-16: Chained type path format in RG [P1]
-- ADR uses: `gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~` (multi-segment)
-- Code validates the RG family prefix: `gts.cf.core.rg.type.v1~`
+- ADR uses: `gts.cf.core.rg.group.v1~y.core.tn.tenant.v1~` (multi-segment)
+- Code validates the RG family prefix: `gts.cf.core.rg.group.v1~`
 - **Assert**: An admitted chained schema in that family is accepted; a foreign family is rejected.
 
 #### TC-ADR-18: Group response contains no SMALLINT IDs [P1]
@@ -888,7 +888,7 @@ the payload with the actual parent in the transaction.
   - GET /groups/{random-uuid} → 404 Not Found
   - POST /types {duplicate code} → 409 Conflict
   - POST /types {invalid body} → 400 Bad Request
-  - POST /groups {type "gts.cf.core.rg.type.v1~nonexistent.v1~"} → 404 (TypeNotFound)
+  - POST /groups {type "gts.cf.core.rg.group.v1~nonexistent.v1~"} → 404 (TypeNotFound)
 - **Assert per response**:
   - HTTP status code matches expected
   - `Content-Type` header contains `application/problem+json`
@@ -931,7 +931,7 @@ These test domain invariants that prevent data corruption or violate core busine
 | **TC-GRP-30** | Move to root when the schema rejects a null parent | Unauthorized root creation |
 | **TC-GRP-37** | Depth exact boundary (>=) | Off-by-one in guardrail |
 | **TC-GRP-38** | Width exact boundary (>=) | Off-by-one in guardrail |
-| **TC-SDK-24** | validate_type_code vs GtsTypePath mismatch | Silent validation inconsistency |
+| **TC-SDK-24** | Canonical group schema IDs and GtsTypePath normalization | Silent validation inconsistency |
 | **TC-SDK-01..06,08** | GtsTypePath value object validation | Invalid types accepted into system |
 | **TC-SDK-11,12** | GtsTypePath serde round-trip | API deserialization breaks silently |
 | **TC-SDK-15** | SDK group model `type` rename | Wire format mismatch |

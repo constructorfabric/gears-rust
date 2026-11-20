@@ -2,7 +2,7 @@
 //! Reads and cleanup resolve stored identifiers through the local dictionary.
 
 use async_trait::async_trait;
-use resource_group_sdk::gts::GROUP_MEMBERSHIP_RESOURCE_TYPE;
+use resource_group_sdk::gts::GROUP_MEMBERSHIP_TYPE_ID;
 use serde_json::{Value, json};
 use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
@@ -141,9 +141,9 @@ fn placement_validator(schema: &TypeSchema) -> Option<PayloadValidator> {
 }
 
 /// A concrete membership schema: a valid GTS type strictly derived from
-/// [`GROUP_MEMBERSHIP_RESOURCE_TYPE`]. The base itself selects no member types.
+/// [`GROUP_MEMBERSHIP_TYPE_ID`]. The base itself selects no member types.
 pub(crate) fn concrete_membership_type(id: &str) -> Option<GtsTypeId> {
-    if id.starts_with(GROUP_MEMBERSHIP_RESOURCE_TYPE) && id != GROUP_MEMBERSHIP_RESOURCE_TYPE {
+    if id.starts_with(GROUP_MEMBERSHIP_TYPE_ID) && id != GROUP_MEMBERSHIP_TYPE_ID {
         GtsTypeId::try_new(id).ok()
     } else {
         None

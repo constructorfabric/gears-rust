@@ -1611,8 +1611,8 @@ The four resolution examples of DESIGN §3.2 are the P0 test matrix, reproduced 
 | Entry key | `allowed_vendors` | `tenant_ownable` | P0 effect |
 |---|---|---|---|
 | `gts.acme.*` | `[acme]` | `true` | `acme` admitted in its own namespace, including derivations; the ownership half is inert |
-| `gts.cf.core.rg.type.v1~*` | `[acme]` | `true` | `acme` may derive from the resource-group type; derivations are global in P0 |
-| `gts.cf.core.rg.type.v1~` | `[]` | `false` | the base type itself stays closed — the exact key governs only the base, `…~*` governs the subtree |
+| `gts.cf.core.rg.group.v1~*` | `[acme]` | `true` | `acme` may derive from the resource-group type; derivations are global in P0 |
+| `gts.cf.core.rg.group.v1~` | `[]` | `false` | the base type itself stays closed — the exact key governs only the base, `…~*` governs the subtree |
 | `gts.cf.toolkit.plugins.plugin.v1~*` | `["*"]` | `false` | any vendor may register in the plugin region; still global-only |
 
 The last row is what makes third-party plugin and permission Instances registrable without

@@ -20,7 +20,7 @@ For background on how AuthZ uses RG data, see [RESOURCE_GROUP_MODEL.md](./RESOUR
 | **AccessScope → SecureORM in RG repo** | **Done** | `GroupRepository.list_groups`, `find_by_id`, `get_descendants`, `get_ancestors` accept `&AccessScope` |
 | **Rust integration tests** | **Done** | 324 unit tests + 8 tr-authz-plugin tests |
 | **E2E HTTP tests** | **Partial** | 214 e2e tests (static-authz); authz e2e blocked on tenant provisioning |
-| **Tenant provisioning** | **Planned** | Tenant groups are identified by GTS type prefix (`TENANT_RG_TYPE_PATH`): `tenant_id = group.id` for tenant groups. Required for authz e2e |
+| **Tenant provisioning** | **Planned** | Tenant groups are identified by GTS type prefix (`TENANT_GROUP_TYPE_ID`): `tenant_id = group.id` for tenant groups. Required for authz e2e |
 | Group predicates (`in_group`, `in_group_subtree`) | Planned | Requires RG-aware PDP behavior |
 
 ---
@@ -322,11 +322,11 @@ T1 (root tenant, tenant type, can_be_root=true, token-a subject_tenant_id)
 T2 (root tenant, token-b subject_tenant_id)
 ```
 
-Tenant-type recognition is code-prefix-driven: any GTS type whose path starts with `TENANT_RG_TYPE_PATH` (`gts.cf.core.rg.type.v1~cf.core._.tenant.v1~`) creates a new tenant scope for its instances.
+Tenant-type recognition is code-prefix-driven: any GTS type whose path starts with `TENANT_GROUP_TYPE_ID` (`gts.cf.core.rg.group.v1~cf.core.rg.tenant.v1~`) creates a new tenant scope for its instances.
 
 **Setup steps** (all via REST API, executed once per session):
 
-1. Create tenant type (code starts with `TENANT_RG_TYPE_PATH`, `can_be_root=true`, `allowed_parent_types=[self]`)
+1. Create tenant type (code starts with `TENANT_GROUP_TYPE_ID`, `can_be_root=true`, `allowed_parent_types=[self]`)
 2. Create department type (code outside the tenant prefix, `can_be_root=false`, `allowed_parent_types=[tenant_type]`)
 3. **Seed T1 root tenant** directly in the DB backend used by the tr-authz overlay — SQLite in CI/e2e; in production deployments the same seeding query runs against the configured SQL-compatible backend (PostgreSQL by default). `id` = token-a `subject_tenant_id`. Root tenants are created via DB seeding, not API.
 4. `POST /groups` -- T_normal (parent=T1) -- `tenant_id = T_normal.id`
@@ -336,7 +336,7 @@ Tenant-type recognition is code-prefix-driven: any GTS type whose path starts wi
 8. **Seed T2 root tenant** directly in the same DB backend (SQLite in CI/e2e; PostgreSQL in production deployments). `id` = token-b `subject_tenant_id`.
 
 **Prerequisites**:
-- Tenant provisioning feature (tenant-type prefix): sub-tenant groups set `tenant_id = group.id` when their type code starts with `TENANT_RG_TYPE_PATH`
+- Tenant provisioning feature (tenant-type prefix): sub-tenant groups set `tenant_id = group.id` when their type code starts with `TENANT_GROUP_TYPE_ID`
 - Root tenants seeded in DB before server start or via conftest SQLite fixture
 
 ### Test coverage using fixture

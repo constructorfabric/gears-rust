@@ -90,19 +90,14 @@ contracts below.
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-algo-type-mgmt-validate-type-input`
 
-**Input**: A group type identifier, normalized by trimming and lowercasing.
+**Input**: A canonical group schema identifier.
 
-**Output**: Success or a validation error before lookup or persistence.
+**Output**: A parsed `GtsTypeId` or a validation error before registry lookup.
 
-**Steps**:
-1. [x] - `p1` - Reject an empty identifier - `inst-val-input-1`
-2. [x] - `p1` - Check the identifier begins with the RG type family prefix - `inst-val-input-2`
-   1. [x] - `p1` - Return a validation error if the prefix differs - `inst-val-input-2a`
-3. [x] - `p1` - Reject identifiers longer than 1024 characters - `inst-val-input-3`
+1. [x] - `p1` - Parse the input with `GtsTypeId::try_new`. The GTS parser checks syntax, length and type versus instance - `inst-val-input-1`
+2. [x] - `p1` - Require the parsed type to belong to the RG group family - `inst-val-input-2`
 
-Full GTS shape validation belongs to the SDK value object. Definition admission,
-parent/member references, inheritance and schema validation belong to
-Types Registry; RG does not duplicate them in this identifier check.
+Types Registry checks definition admission, parent and member references, inheritance and schema compatibility.
 
 ### Registry Snapshot Consumption
 
@@ -119,7 +114,7 @@ refusals and availability failures preserve their error categories.
 
 ### Schema-Validated Group and Membership Types
 
-The SDK publishes the abstract group base `gts.cf.core.rg.type.v1~` with required
+The SDK publishes the abstract group base `gts.cf.core.rg.group.v1~` with required
 payload field `parent_type` and required trait `membership_type`, and the abstract membership base
 `gts.cf.core.rg.group_membership.v1~`.
 The base `parent_type` accepts `null` or a string matching the fixed
@@ -208,7 +203,7 @@ internal database details out of response bodies.
 - [x] Type reads forward the caller context and precede database write transactions.
 - [x] Cleanup and ordinary reads resolve stored type keys through the identity dictionary, without registry lookups and without creating keys.
 - [x] Local type CRUD and bootstrap interfaces are absent from SDK, REST routes and OpenAPI.
-- [x] Database migration preserves dictionary keys and identifiers, groups, memberships and hierarchy while removing the local definitions.
+- [x] Database migration preserves dictionary keys, groups, memberships and hierarchy while renaming group type identifiers and removing the local definitions.
 - [x] Repeating an identical E2E declaration uses the registry's current version and leaves its resource version unchanged.
 
 ## 7. Verification

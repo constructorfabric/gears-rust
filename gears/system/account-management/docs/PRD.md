@@ -752,7 +752,7 @@ User groups are implemented as [Resource Group](../../resource-group/docs/PRD.md
 
 **Actors**: `cpt-cf-account-management-actor-platform-admin`
 
-AM **MUST** publish the chained user-group schema `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~`, the user resource type `gts.cf.core.am.user.v1~`, and the user membership schema with its Types Registry manifest before application initialization. The group schema **MUST** admit root placement and parents of the exact AM user-group type. The bound membership schema **MUST** admit `resource_type` values in the AM user type family. Resource Group reads these schemas from Types Registry and enforces tenant-scoped placement through its ownership-graph rules.
+AM **MUST** publish the chained user-group schema `gts.cf.core.rg.group.v1~cf.core.am.user_group.v1~`, the user resource type `gts.cf.core.am.user.v1~`, and the user membership schema with its Types Registry manifest before application initialization. The group schema **MUST** admit root placement and parents of the exact AM user-group type. The bound membership schema **MUST** admit `resource_type` values in the AM user type family. Resource Group reads these schemas from Types Registry and enforces tenant-scoped placement through its ownership-graph rules.
 
 - **Rationale**: A dedicated Resource Group type ensures user group operations are governed by the same typed hierarchy, forest invariants, and tenant isolation rules as all other Resource Group entities, without reimplementing group infrastructure in AM.
 
@@ -1652,7 +1652,7 @@ IdP implementations may align with standards such as SCIM 2.0 and OIDC where app
 
 **Preconditions**:
 - Tenant `T1` exists with status `active`
-- User-group Resource Group type `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` is published in Types Registry and binds a membership schema admitting `gts.cf.core.am.user.v1~`
+- User-group Resource Group type `gts.cf.core.rg.group.v1~cf.core.am.user_group.v1~` is published in Types Registry and binds a membership schema admitting `gts.cf.core.am.user.v1~`
 
 **Main Flow**:
 1. Tenant admin calls the Resource Group API directly to create a Resource Group entity of the user-group type within tenant scope `T1`.

@@ -127,7 +127,7 @@ fn make_ctx(tenant_id: Uuid) -> SecurityContext {
 fn type_code(suffix: &str) -> String {
     format!(
         "{}x.test.{}.i{}.v1~",
-        toolkit_gts::gts_id!("cf.core.rg.type.v1~"),
+        toolkit_gts::gts_id!("cf.core.rg.group.v1~"),
         suffix,
         Uuid::now_v7().as_simple()
     )

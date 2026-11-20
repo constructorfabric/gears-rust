@@ -185,9 +185,9 @@ const RG_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Matches `CASCADE_PAGE_SIZE` in `domain::user_groups::cascade`.
 const RG_CLEANUP_PAGE_SIZE: u64 = 100;
 
-/// RG stored this exact member type before AM published its own user schema.
+/// Historical AM user membership type after RG's group-prefix migration.
 const LEGACY_USER_MEMBERSHIP_TYPE: &str =
-    toolkit_gts::gts_id!("cf.core.rg.type.v1~cf.core.am.user.v1~");
+    toolkit_gts::gts_id!("cf.core.rg.group.v1~cf.core.am.user.v1~");
 
 /// Overall cleanup budget. Tighter than `CASCADE_BUDGET` because
 /// cleanup runs on the synchronous `delete_user` request path

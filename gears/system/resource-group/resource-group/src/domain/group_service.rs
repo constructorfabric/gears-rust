@@ -30,7 +30,7 @@ use authz_resolver_sdk::pep::{AccessRequest, PolicyEnforcer, ResourceType};
 use resource_group_sdk::models::{
     CreateGroupRequest, GroupHierarchy, ResourceGroup, ResourceGroupWithDepth, UpdateGroupRequest,
 };
-use resource_group_sdk::{GROUP_RESOURCE_TYPE, TENANT_RG_TYPE_PATH};
+use resource_group_sdk::{GROUP_TYPE_ID, TENANT_GROUP_TYPE_ID};
 use toolkit_db::secure::{DBRunner, Db, TxConfig};
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::{SecurityContext, pep_properties};
@@ -42,7 +42,6 @@ use crate::domain::error::DomainError;
 use crate::domain::metrics::{NoopMetrics, Operation, Outcome, RgMetricsPort};
 use crate::domain::repo::{GroupRecord, GroupRepositoryTrait};
 use crate::domain::type_catalog::{RgType, RgTypeCatalog, TypeUse};
-use crate::domain::validation;
 
 /// `AuthZ` resource type descriptor for resource groups.
 ///
@@ -53,7 +52,7 @@ use crate::domain::validation;
 /// production RG wiring also advertises no group capabilities. A PDP must
 /// expand group scopes to explicit `in` predicates on `id`, or deny.
 pub const RG_GROUP_RESOURCE: ResourceType = ResourceType::from_static(
-    GROUP_RESOURCE_TYPE,
+    GROUP_TYPE_ID,
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
@@ -81,7 +80,7 @@ impl Default for QueryProfile {
 ///
 /// A type whose code starts with **any** of these prefixes opens a new tenant
 /// scope (`tenant_id = group.id`) and takes part in the tenant-root
-/// uniqueness invariant. Defaults to [`TENANT_RG_TYPE_PATH`]; a deployment
+/// uniqueness invariant. Defaults to [`TENANT_GROUP_TYPE_ID`]; a deployment
 /// overrides the list through the gear config (`tenant_type_paths`).
 #[allow(unknown_lints, de0309_must_have_domain_model)]
 #[derive(Debug, Clone)]
@@ -114,7 +113,7 @@ impl TenantTypes {
 
 impl Default for TenantTypes {
     fn default() -> Self {
-        Self::new(vec![TENANT_RG_TYPE_PATH.to_owned()])
+        Self::new(vec![TENANT_GROUP_TYPE_ID.to_owned()])
     }
 }
 
@@ -301,7 +300,6 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
         let started = std::time::Instant::now();
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-1
         // Pre-validation (stateless, outside transaction)
-        validation::validate_type_code(&req.code)?;
         Self::validate_name(&req.name)?;
 
         // Fetch and compile the active type before starting the transaction to

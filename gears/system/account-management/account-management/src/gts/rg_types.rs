@@ -20,7 +20,7 @@ struct UserGroupTraits {
 #[gts_type_schema(
     dir_path = "schemas",
     base = ResourceGroupTypeV1,
-    type_id = gts_id!("cf.core.rg.type.v1~cf.core.am.user_group.v1~"),
+    type_id = gts_id!("cf.core.rg.group.v1~cf.core.am.user_group.v1~"),
     description = "Account Management user group: an RG group of AM users",
     properties = "",
     traits_schema = inline(UserGroupTraits),
@@ -28,7 +28,7 @@ struct UserGroupTraits {
     overrides(ResourceGroupTypeV1 = {
         // A root carries an explicit null. The property itself remains required.
         #[schemars(extend("type" = ["string", "null"], "enum" = [null, USER_GROUP_RG_TYPE_CODE],
-            "x-gts-type-ref" = resource_group_sdk::gts::TYPE_RESOURCE_TYPE))]
+            "x-gts-type-ref" = resource_group_sdk::gts::GROUP_TYPE_ID))]
         parent_type: serde_json::Value,
     })
 )]

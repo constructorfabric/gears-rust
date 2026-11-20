@@ -176,7 +176,7 @@ metadata; it has no type field.
 - [x] `p1` - **ID**: `cpt-cf-resource-group-principle-tenant-root-uniqueness`
 
 `tenant_type_paths` classifies tenant group types by GTS identifier prefix. The
-default is `gts.cf.core.rg.type.v1~cf.core._.tenant.v1~`.
+default is `gts.cf.core.rg.group.v1~cf.core.rg.tenant.v1~`.
 
 - Creating a tenant-type group opens a tenant scope: `tenant_id = group.id`.
 - Other groups are created in an authorized target tenant. A non-tenant child
@@ -196,7 +196,7 @@ constraints. A caller-supplied target does not confer permission to write there.
 - [x] `p1` - **ID**: `cpt-cf-resource-group-principle-dynamic-types`
 
 An RG type is a GTS Type Schema derived from the abstract
-`gts.cf.core.rg.type.v1~`. RG reads its `content`, `resolved_schema` and `effective_traits` from
+`gts.cf.core.rg.group.v1~`. RG reads its `content`, `resolved_schema` and `effective_traits` from
 Types Registry. The group schema validates `parent_type` and `metadata`.
 A concrete type fixes the required `membership_type` trait with `const` in
 `x-gts-traits-schema` and supplies its value in `x-gts-traits`. A root supplies
@@ -411,7 +411,7 @@ application `init`. RG publishes its base type; gears that use
 RG publish their own derived types through their own collectors.
 
 Account Management owns the user-group container
-`gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` and the membership schema
+`gts.cf.core.rg.group.v1~cf.core.am.user_group.v1~` and the membership schema
 `gts.cf.core.rg.group_membership.v1~cf.core.am.user_group_member.v1~`. AM also publishes
 `gts.cf.core.am.user.v1~` as the user resource type for membership links.
 Application initialization depends on successful admission of the declarations.
@@ -636,7 +636,13 @@ backends.
 1. Export custom definitions from the old `GET /types-registry/v1/types` route
    by following `page_info.next_cursor` to the last page, or back up the old
    database. The migration cannot recover or publish those definitions.
-2. Convert each legacy `TypeDto` to a GTS Type Schema. Set `$id` to
+2. Replace the leading `gts.cf.core.rg.type.v1~` with `gts.cf.core.rg.group.v1~`
+   in group codes, schema references, allowed parent group types and client filters.
+   For the standard tenant and its descendants, also change the segment immediately
+   following the group base from `cf.core._.tenant.v1~` to `cf.core.rg.tenant.v1~`.
+   Update custom `tenant_type_paths` (RG), `tenant_types` (rg-tr-plugin) and
+   Types Registry policy patterns that refer to the old family. Use the new
+   codes when converting each legacy `TypeDto` to a GTS Type Schema. Set `$id` to
    `gts://<code>` and inherit from the chain parent through `allOf`/`$ref`.
    Constrain `properties.parent_type` to the exact `allowed_parent_types`
    and include `null` when `can_be_root` is true. Copy a non-null
@@ -650,9 +656,11 @@ backends.
    while creates, moves, metadata changes that need validation and new
    memberships fail with `TypeNotFound`.
 
-If Types Registry already admitted the earlier v1 group schema with a required
-`membership_type` payload field, migrate that schema as well. Moving the field
-into traits can fail the same-ID compatibility check.
+The group CRUD authorization target is already `gts.cf.core.rg.group.v1~`.
+A single migration rewrites the group prefix in every matching dictionary entry,
+then the standard tenant prefix and its descendants. Both updates preserve the
+numeric keys and commit together. A destination ID collision or a path longer
+than 1024 characters rolls back both updates and reports the conflicting path.
 
 Stop writes before upgrading and audit legacy PostgreSQL membership IDs.
 
@@ -715,7 +723,7 @@ retried operation are recorded outside the retry closure.
 | Managed schemas | `resource-group/tests/managed_types_test.rs` uses the SDK mock for inherited payload validation and membership bindings on new and imported groups |
 | Domain and REST | `group_service_test`, `membership_service_test`, `api_rest_test`, `tenant_filtering_db_test`, `registry_types_test` |
 | Database behavior | `db_behavior_audit_test`, `query_recorder_test`, membership tenant isolation tests |
-| Backend migration | SQLite and PostgreSQL dictionary migration tests: byte-exact row and key preservation, constraints, indexes, refusal before DDL and rollback after it |
+| Backend migration | SQLite and PostgreSQL dictionary migration tests: preservation of rows and keys across the group ID rename, constraints, indexes, preflight refusals and transactional rollback |
 | Dictionary use | `pg_concurrency_test`: rejected creates consume no identity values, concurrent and forced-overlap first uses converge on one key; `registry_types_test`: a key admits nothing, reads create no keys |
 | PostgreSQL concurrency | `pg_smoke_test`, `pg_concurrency_test` with the `integration` feature |
 | End-to-end | `testing/e2e/suites/resource_group/test_type_revisions.py` publishes schema revisions through Types Registry and checks their effect on Resource Group writes. The Resource Group and Account Management suites also exercise publication and consumption over HTTP. |

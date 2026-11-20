@@ -51,7 +51,7 @@
 //!
 //! Resource-scoped variants ([`ResourceGroupError::NotFound`] /
 //! [`ResourceGroupError::AlreadyExists`]) carry the raw `resource_type`;
-//! match it against [`crate::gts::GROUP_RESOURCE_TYPE`].
+//! match it against [`crate::gts::GROUP_TYPE_ID`].
 //!
 //! [`FailedPrecondition`](ResourceGroupError::FailedPrecondition) flattens
 //! several domain families that share the canonical category; the
@@ -119,7 +119,7 @@ use crate::precondition::Subject;
 pub enum ResourceGroupError {
     /// Resource not found (type, group, or membership). `resource_type`
     /// is the canonical GTS type — match it against
-    /// [`crate::gts::GROUP_RESOURCE_TYPE`]; `name` is the raw identifier
+    /// [`crate::gts::GROUP_TYPE_ID`]; `name` is the raw identifier
     /// the caller supplied.
     #[error("not found [{resource_type}]: {name}")]
     NotFound {
@@ -205,7 +205,7 @@ impl From<CanonicalError> for ResourceGroupError {
         match err {
             // A resource-scoped category MUST carry its `resource_type`
             // (the dispatch key consumers match against
-            // `gts::GROUP_RESOURCE_TYPE`). Resource-group always sets it;
+            // `gts::GROUP_TYPE_ID`). Resource-group always sets it;
             // a `None` here means a malformed / foreign envelope reached us
             // via the wire path, so we let it fall through to `Other`
             // rather than forge a `NotFound { resource_type: "" }` that

@@ -20,12 +20,12 @@ use types_registry_sdk::{
 mod common;
 
 const MEMBER_V1: &str = gts_id!("cf.core.rg.group_membership.v1~");
-const TEAM_SCHEMA: &str = gts_id!("cf.core.rg.type.v1~cf.test.rg.team.v1~");
+const TEAM_SCHEMA: &str = gts_id!("cf.core.rg.group.v1~cf.test.rg.team.v1~");
 const TEAM_MEMBER: &str = gts_id!("cf.core.rg.group_membership.v1~cf.test.rg.team_member.v1~");
-const BASE: &str = gts_id!("cf.core.rg.type.v1~");
+const BASE: &str = gts_id!("cf.core.rg.group.v1~");
 const USER: &str = gts_id!("cf.test.rg.user.v1~");
-const TENANT: &str = gts_id!("cf.core.rg.type.v1~cf.test.rg.tenant.v1~");
-const DEPT: &str = gts_id!("cf.core.rg.type.v1~cf.test.rg.tenant.v1~cf.test.rg.dept.v1~");
+const TENANT: &str = gts_id!("cf.core.rg.group.v1~cf.test.rg.tenant.v1~");
+const DEPT: &str = gts_id!("cf.core.rg.group.v1~cf.test.rg.tenant.v1~cf.test.rg.dept.v1~");
 
 fn registry() -> MockTypesRegistry {
     let registry = MockTypesRegistry::new();
@@ -48,7 +48,7 @@ fn user_type() -> Value {
 /// through a local `$defs` reference.
 fn tenant_type() -> Value {
     json!({
-        "$id": gts_uri!("cf.core.rg.type.v1~cf.test.rg.tenant.v1~"),
+        "$id": gts_uri!("cf.core.rg.group.v1~cf.test.rg.tenant.v1~"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "x-gts-traits": {"membership_type": TEAM_MEMBER},
@@ -61,7 +61,7 @@ fn tenant_type() -> Value {
             }
         },
         "allOf": [
-            { "$ref": gts_uri!("cf.core.rg.type.v1~") },
+            { "$ref": gts_uri!("cf.core.rg.group.v1~") },
             { "properties": {
                 "parent_type": {"type": ["string", "null"], "enum": [null, TENANT]},
                 "metadata": { "$ref": "#/$defs/tenant_meta" }
@@ -73,11 +73,11 @@ fn tenant_type() -> Value {
 /// Derived from the tenant type: inherits its metadata constraints and adds one.
 fn dept_type() -> Value {
     json!({
-        "$id": gts_uri!("cf.core.rg.type.v1~cf.test.rg.tenant.v1~cf.test.rg.dept.v1~"),
+        "$id": gts_uri!("cf.core.rg.group.v1~cf.test.rg.tenant.v1~cf.test.rg.dept.v1~"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "allOf": [
-            { "$ref": gts_uri!("cf.core.rg.type.v1~cf.test.rg.tenant.v1~") },
+            { "$ref": gts_uri!("cf.core.rg.group.v1~cf.test.rg.tenant.v1~") },
             { "properties": { "metadata": {
                 "type": "object",
                 "properties": { "code": { "type": "string", "maxLength": 3 } }

@@ -124,7 +124,7 @@ fn render(filter: &str) -> String {
 /// their meaning.
 #[test]
 fn type_predicates_match_dictionary_keys_in_a_subquery() {
-    const T: &str = "gts.cf.core.rg.type.v1~x.test.member.v1~";
+    const T: &str = "gts.cf.core.rg.group.v1~x.test.member.v1~";
     let keys = format!(r#"(SELECT "id" FROM "gts_type" WHERE "gts_type"."schema_id" IN ('{T}'))"#);
     let eq = render(&format!("resource_type eq '{T}'"));
     assert!(eq.contains(&format!(r#""gts_type_id" IN {keys}"#)), "{eq}");

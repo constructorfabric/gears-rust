@@ -124,8 +124,8 @@ fn the_documented_configuration_block_parses_and_validates() {
         },
         "registration_policy": {
             (gts_id!("acme.*")): { "allowed_vendors": ["acme"], "tenant_ownable": true },
-            (gts_id!("cf.core.rg.type.v1~*")): { "allowed_vendors": ["acme"], "tenant_ownable": true },
-            (gts_id!("cf.core.rg.type.v1~")): { "allowed_vendors": [], "tenant_ownable": false },
+            (gts_id!("cf.core.rg.group.v1~*")): { "allowed_vendors": ["acme"], "tenant_ownable": true },
+            (gts_id!("cf.core.rg.group.v1~")): { "allowed_vendors": [], "tenant_ownable": false },
             (gts_id!("cf.toolkit.plugins.plugin.v1~*")): {
                 "allowed_vendors": ["*"], "tenant_ownable": false,
             },

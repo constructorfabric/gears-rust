@@ -27,7 +27,7 @@ pub const MAX_MEMBERSHIP_RESOURCE_ID_BYTES: usize = 2600;
 ///
 /// A GTS type path follows the pattern `gts.<segment>~(<segment>~)*` where
 /// each segment consists of lowercase alphanumeric characters, underscores,
-/// and dots. Examples: `gts.cf.core.rg.type.v1~`, `gts.cf.core.rg.type.v1~cf.core._.tenant.v1~`.
+/// and dots. Examples: `gts.cf.core.rg.group.v1~`, `gts.cf.core.rg.group.v1~cf.core.rg.tenant.v1~`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct GtsTypePath(String);
@@ -138,7 +138,7 @@ pub struct GroupHierarchyWithDepth {
 pub struct ResourceGroup {
     /// Group identifier.
     pub id: Uuid,
-    /// GTS chained type code (e.g. `gts.cf.core.rg.type.v1~cf.core._.tenant.v1~`).
+    /// GTS chained type code (e.g. `gts.cf.core.rg.group.v1~cf.core.rg.tenant.v1~`).
     #[serde(rename = "type")]
     pub code: String,
     /// Display name.
@@ -156,7 +156,7 @@ pub struct ResourceGroup {
 pub struct ResourceGroupWithDepth {
     /// Group identifier.
     pub id: Uuid,
-    /// GTS chained type code (e.g. `gts.cf.core.rg.type.v1~cf.core._.tenant.v1~`).
+    /// GTS chained type code (e.g. `gts.cf.core.rg.group.v1~cf.core.rg.tenant.v1~`).
     #[serde(rename = "type")]
     pub code: String,
     /// Display name.
@@ -185,7 +185,7 @@ pub struct CreateGroupRequest {
     /// Optional caller-supplied ID (used by seeding for stable identity).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<Uuid>,
-    /// GTS chained type code. Must have prefix `gts.cf.core.rg.type.v1~`.
+    /// GTS chained type code. Must have prefix `gts.cf.core.rg.group.v1~`.
     #[serde(rename = "type")]
     pub code: String,
     /// Display name (1..255 characters).
@@ -203,7 +203,7 @@ pub struct CreateGroupRequest {
     /// request is rejected.
     ///
     /// Rejected for tenant-typed groups (`code` starting with a configured
-    /// tenant-type prefix, default `TENANT_RG_TYPE_PATH`): their effective
+    /// tenant-type prefix, default `TENANT_GROUP_TYPE_ID`): their effective
     /// tenant is always `group.id`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<Uuid>,

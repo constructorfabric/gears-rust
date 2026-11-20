@@ -24,7 +24,7 @@
 //! - explicit `tenant_id` conflicting with an explicit `parent_id`'s actual
 //!   tenant -> rejected, message does not leak tenant ids (style)
 //!   (`explicit_tenant_id_conflicting_with_parent_tenant_returns_validation_error`)
-//! - a tenant-typed group (`code` starting with `TENANT_RG_TYPE_PATH`) with
+//! - a tenant-typed group (`code` starting with `TENANT_GROUP_TYPE_ID`) with
 //!   an explicit `tenant_id` is a contradiction, rejected outright
 //!   (`tenant_typed_group_with_explicit_tenant_id_returns_validation_error`)
 //! - an explicit `id` combined with a cross-tenant target is rejected as a
@@ -58,7 +58,7 @@ use common::CreateTypeRequest;
 use resource_group::domain::error::DomainError;
 use resource_group::domain::group_service::{GroupService, QueryProfile};
 use resource_group::infra::storage::group_repo::GroupRepository;
-use resource_group_sdk::{CreateGroupRequest, TENANT_RG_TYPE_PATH};
+use resource_group_sdk::{CreateGroupRequest, TENANT_GROUP_TYPE_ID};
 
 /// Build a `GroupService` wired with a caller-supplied enforcer, otherwise
 /// identical to `common::make_group_service`.
@@ -77,11 +77,11 @@ fn make_group_service_with_enforcer(
 
 /// Build a unique tenant-type code (mirrors
 /// `group_service_test.rs::unique_tenant_type_code`): a code starting with
-/// `TENANT_RG_TYPE_PATH` classifies the group as tenant-typed.
+/// `TENANT_GROUP_TYPE_ID` classifies the group as tenant-typed.
 fn unique_tenant_type_code() -> String {
     format!(
         "{}x.test.tn.i{}.v1~",
-        TENANT_RG_TYPE_PATH,
+        TENANT_GROUP_TYPE_ID,
         Uuid::now_v7().as_simple()
     )
 }
@@ -601,7 +601,7 @@ async fn empty_scope_cannot_create_memberships() {
         .create_type_unscoped(CreateTypeRequest {
             code: format!(
                 "{}x.test.emptygroup.i{}.v1~",
-                toolkit_gts::gts_id!("cf.core.rg.type.v1~"),
+                toolkit_gts::gts_id!("cf.core.rg.group.v1~"),
                 Uuid::now_v7().as_simple()
             ),
             can_be_root: true,
@@ -676,7 +676,7 @@ async fn empty_scope_lists_succeed_and_still_validate_user_filters() {
         .create_type_unscoped(CreateTypeRequest {
             code: format!(
                 "{}x.test.emptylistgroup.i{}.v1~",
-                toolkit_gts::gts_id!("cf.core.rg.type.v1~"),
+                toolkit_gts::gts_id!("cf.core.rg.group.v1~"),
                 Uuid::now_v7().as_simple()
             ),
             can_be_root: true,

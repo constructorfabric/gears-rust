@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use resource_group_sdk::gts::GROUP_MEMBERSHIP_RESOURCE_TYPE;
+use resource_group_sdk::gts::GROUP_MEMBERSHIP_TYPE_ID;
 use serde_json::{Value, json};
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_gts::{gts_id, gts_uri};
@@ -26,8 +26,8 @@ use crate::domain::type_catalog::{RgTypeCatalog, TypeUse};
 struct Catalogue;
 
 const USER: &str = gts_id!("cf.test.rg.user.v1~");
-const TENANT: &str = gts_id!("cf.core.rg.type.v1~cf.test.rg.tenant.v1~");
-const DEPT: &str = gts_id!("cf.core.rg.type.v1~cf.test.rg.tenant.v1~cf.test.rg.dept.v1~");
+const TENANT: &str = gts_id!("cf.core.rg.group.v1~cf.test.rg.tenant.v1~");
+const DEPT: &str = gts_id!("cf.core.rg.group.v1~cf.test.rg.tenant.v1~cf.test.rg.dept.v1~");
 const MEMBERSHIP: &str = gts_id!("cf.core.rg.group_membership.v1~cf.test.rg.member.v1~");
 
 fn registry() -> Arc<MockTypesRegistry> {
@@ -45,7 +45,7 @@ fn registry() -> Arc<MockTypesRegistry> {
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
             "allOf": [
-                { "$ref": format!("gts://{GROUP_MEMBERSHIP_RESOURCE_TYPE}") },
+                { "$ref": format!("gts://{GROUP_MEMBERSHIP_TYPE_ID}") },
                 { "properties": { "resource_type": { "const": USER } } }
             ]
         }),
@@ -61,7 +61,7 @@ fn registry() -> Arc<MockTypesRegistry> {
     registry.seed(
         TENANT,
         json!({
-            "$id": gts_uri!("cf.core.rg.type.v1~cf.test.rg.tenant.v1~"),
+            "$id": gts_uri!("cf.core.rg.group.v1~cf.test.rg.tenant.v1~"),
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
             "x-gts-traits": {"membership_type": MEMBERSHIP},
@@ -72,7 +72,7 @@ fn registry() -> Arc<MockTypesRegistry> {
                 "properties": { "tier": { "type": "string" } }
             } },
             "allOf": [
-                { "$ref": gts_uri!("cf.core.rg.type.v1~") },
+                { "$ref": gts_uri!("cf.core.rg.group.v1~") },
                 { "properties": {
                     "metadata": { "$ref": "#/$defs/tenant_meta" },
                     "parent_type": { "enum": [null, TENANT] }
@@ -83,11 +83,11 @@ fn registry() -> Arc<MockTypesRegistry> {
     registry.seed(
         DEPT,
         json!({
-            "$id": gts_uri!("cf.core.rg.type.v1~cf.test.rg.tenant.v1~cf.test.rg.dept.v1~"),
+            "$id": gts_uri!("cf.core.rg.group.v1~cf.test.rg.tenant.v1~cf.test.rg.dept.v1~"),
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
             "allOf": [
-                { "$ref": gts_uri!("cf.core.rg.type.v1~cf.test.rg.tenant.v1~") },
+                { "$ref": gts_uri!("cf.core.rg.group.v1~cf.test.rg.tenant.v1~") },
                 { "properties": {
                     "parent_type": { "const": TENANT },
                     "metadata": {
@@ -186,7 +186,7 @@ async fn an_unknown_type_is_type_not_found_for_every_use() {
         let err = catalog(registry())
             .get_type(
                 &caller(1),
-                gts_id!("cf.core.rg.type.v1~cf.test.rg.nope.v1~"),
+                gts_id!("cf.core.rg.group.v1~cf.test.rg.nope.v1~"),
                 usage,
             )
             .await
@@ -369,7 +369,7 @@ impl TypesRegistryApi for ResolvedOverride {
 async fn validation_follows_the_registry_resolved_schema_not_the_authored_content() {
     let registry = registry();
     let stricter = json!({
-        "$id": gts_uri!("cf.core.rg.type.v1~cf.test.rg.tenant.v1~cf.test.rg.dept.v1~"),
+        "$id": gts_uri!("cf.core.rg.group.v1~cf.test.rg.tenant.v1~cf.test.rg.dept.v1~"),
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "properties": {
@@ -466,7 +466,7 @@ async fn a_membership_rule_checks_the_group_type_first() {
 #[tokio::test]
 async fn only_a_concrete_membership_schema_is_read() {
     for membership_type in [
-        GROUP_MEMBERSHIP_RESOURCE_TYPE,
+        GROUP_MEMBERSHIP_TYPE_ID,
         gts_id!("cf.test.rg.member.v1~"),
         "gts.cf.core.rg.group_membership.v1~not an id",
     ] {

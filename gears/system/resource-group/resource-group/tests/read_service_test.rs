@@ -30,7 +30,7 @@ async fn root_type_with_memberships(
     memberships: &[&str],
 ) -> ResourceGroupType {
     let code = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.{}.i{}.v1~",
+        "{GTS_ID_PREFIX}cf.core.rg.group.v1~x.test.{}.i{}.v1~",
         suffix,
         Uuid::now_v7().as_simple()
     );

@@ -2039,7 +2039,8 @@ mod tests {
 
     // --- ScopeFilter::InGroup ---
 
-    const MEMBER_TYPE: &str = toolkit_gts::gts_id!("cf.core.rg.type.v1~example.core.rg.member.v1~");
+    const MEMBER_TYPE: &str =
+        toolkit_gts::gts_id!("cf.core.rg.group.v1~example.core.rg.member.v1~");
 
     #[test]
     fn scope_filter_in_group_constructor() {

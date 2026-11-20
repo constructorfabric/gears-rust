@@ -3,7 +3,7 @@
 //! Resolves tenant hierarchy via the Resource Group gear's
 //! `ResourceGroupReadHierarchy` trait. Production replacement for
 //! `static-tr-plugin`: tenants are RG groups whose GTS type code is one of
-//! the configured `tenant_types` (default: `TENANT_RG_TYPE_PATH`, see
+//! the configured `tenant_types` (default: `TENANT_GROUP_TYPE_ID`, see
 //! `resource_group_sdk`). Metadata contains `status` and `self_managed`
 //! fields.
 //!
@@ -16,7 +16,7 @@
 //!       vendor: "constructorfabric"
 //!       priority: 50
 //!       tenant_types:
-//!         - "gts.cf.core.rg.type.v1~cf.core._.tenant.v1~"
+//!         - "gts.cf.core.rg.group.v1~cf.core.rg.tenant.v1~"
 //! ```
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 

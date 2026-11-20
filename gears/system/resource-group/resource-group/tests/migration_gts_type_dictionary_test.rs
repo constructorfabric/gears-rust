@@ -7,7 +7,7 @@
 //! `m20261111_000001_gts_type_dictionary` on SQLite with foreign keys enforced,
 //! through the production migration runner: an existing hierarchy keeps every
 //! group, closure row, membership and dictionary row (sparse keys and
-//! timestamps included) byte for byte; the type definitions are dropped; the
+//! timestamps included), with group schema IDs renamed; the type definitions are dropped; the
 //! numeric foreign keys, indexes and the resource identifier bound hold; and a
 //! refused preflight leaves the old schema untouched.
 
@@ -18,7 +18,7 @@ use toolkit_db::{ConnectOpts, Db, connect_db};
 
 use resource_group::infra::storage::migrations::Migrator;
 
-const TENANT_TYPE: &str = "gts.cf.core.rg.type.v1~cf.test.rg.tenant.v1~";
+const TENANT_TYPE: &str = "gts.cf.core.rg.type.v1~cf.core._.tenant.v1~";
 const DEPT_TYPE: &str = "gts.cf.core.rg.type.v1~cf.test.rg.dept.v1~";
 const USER_TYPE: &str = "gts.cf.test.rg.user.v1~";
 
@@ -112,7 +112,7 @@ const TENANT_KEY: i64 = 3;
 const DEPT_KEY: i64 = 37;
 const USER_KEY: i64 = 91;
 const RETIRED_KEY: i64 = 92;
-const RETIRED_TYPE: &str = "gts.cf.core.rg.type.v1~cf.test.rg.retired.v1~";
+const RETIRED_TYPE: &str = "gts.cf.core.rg.type.v1~cf.core._.tenant.v1~cf.test.rg.retired.v1~";
 
 /// Two roots, a three-level chain, its closure rows and memberships, a
 /// dictionary row nothing references, and placement rules.
@@ -299,10 +299,45 @@ async fn oversized_resource_id_refuses_upgrade_before_any_ddl() {
 }
 
 #[tokio::test]
+async fn conflicting_or_oversized_group_paths_refuse_the_rename_atomically() {
+    for (extra_id, error) in [
+        (
+            resource_group_sdk::TENANT_GROUP_TYPE_ID.to_owned(),
+            "already exists",
+        ),
+        (
+            "gts.cf.core.rg.group.v1~cf.test.rg.dept.v1~".to_owned(),
+            "already exists",
+        ),
+        (
+            format!("gts.cf.core.rg.type.v1~{}~", "x".repeat(1000)),
+            "1024",
+        ),
+    ] {
+        let f = at_initial_schema().await;
+        seed_hierarchy(&f.raw).await;
+        run(
+            &f.raw,
+            &format!("INSERT INTO gts_type (schema_id) VALUES ('{extra_id}')"),
+        )
+        .await;
+        let before = snapshot(&f.raw).await;
+        let err = upgrade(&f.db).await.expect_err("invalid rename");
+        assert!(err.to_string().contains(error), "{err}");
+        assert_eq!(snapshot(&f.raw).await, before);
+    }
+}
+
+#[tokio::test]
 async fn an_existing_hierarchy_keeps_every_row_and_dictionary_key() {
     let f = at_initial_schema().await;
     seed_hierarchy(&f.raw).await;
-    let before = snapshot(&f.raw).await;
+    let mut expected = snapshot(&f.raw).await;
+    // Dictionary rows ordered by sparse key. Only the group schema IDs change.
+    let dictionary = &mut expected[3];
+    dictionary[0][1] = resource_group_sdk::TENANT_GROUP_TYPE_ID.into();
+    dictionary[1][1] = "gts.cf.core.rg.group.v1~cf.test.rg.dept.v1~".into();
+    dictionary[3][1] = "gts.cf.core.rg.group.v1~cf.core.rg.tenant.v1~cf.test.rg.retired.v1~".into();
     upgrade(&f.db).await.expect("upgrade");
     assert!(
         !columns(&f.raw, "resource_group")
@@ -313,13 +348,13 @@ async fn an_existing_hierarchy_keeps_every_row_and_dictionary_key() {
 
     assert_eq!(
         snapshot(&f.raw).await,
-        before,
+        expected,
         "rows, keys and timestamps are kept"
     );
     upgrade(&f.db).await.expect("a repeated upgrade is a no-op");
     assert_eq!(
         snapshot(&f.raw).await,
-        before,
+        expected,
         "the repeated upgrade changes nothing"
     );
     assert_eq!(
@@ -328,7 +363,9 @@ async fn an_existing_hierarchy_keeps_every_row_and_dictionary_key() {
             &format!("SELECT schema_id FROM gts_type WHERE id = {RETIRED_KEY}")
         )
         .await,
-        vec![vec![RETIRED_TYPE]],
+        vec![vec![
+            "gts.cf.core.rg.group.v1~cf.core.rg.tenant.v1~cf.test.rg.retired.v1~"
+        ]],
         "a dictionary row nothing references is kept"
     );
     assert_eq!(

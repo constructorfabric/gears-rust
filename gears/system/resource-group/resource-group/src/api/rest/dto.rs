@@ -79,7 +79,7 @@ pub struct CreateGroupDto {
     /// Optional caller-supplied ID. If omitted, the server generates a UUID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<Uuid>,
-    /// GTS chained type path. Must have prefix `gts.cf.core.rg.type.v1~`.
+    /// GTS chained type path. Must have prefix `gts.cf.core.rg.group.v1~`.
     #[serde(rename = "type")]
     pub type_path: String,
     /// Display name (1..255 characters).

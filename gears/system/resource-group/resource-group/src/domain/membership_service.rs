@@ -10,8 +10,7 @@ use std::sync::Arc;
 
 use authz_resolver_sdk::pep::{AccessRequest, PolicyEnforcer, ResourceType};
 use resource_group_sdk::{
-    GROUP_MEMBERSHIP_RESOURCE_TYPE, MAX_MEMBERSHIP_RESOURCE_ID_BYTES,
-    models::ResourceGroupMembership,
+    GROUP_MEMBERSHIP_TYPE_ID, MAX_MEMBERSHIP_RESOURCE_ID_BYTES, models::ResourceGroupMembership,
 };
 use toolkit_db::secure::TxConfig;
 use toolkit_odata::{ODataQuery, Page};
@@ -26,10 +25,8 @@ use crate::domain::repo::{GroupRepositoryTrait, MemberTypes, MembershipRepositor
 use crate::domain::type_catalog::RgTypeCatalog;
 
 /// `AuthZ` resource type descriptor for group memberships.
-pub const RG_MEMBERSHIP_RESOURCE: ResourceType = ResourceType::from_static(
-    GROUP_MEMBERSHIP_RESOURCE_TYPE,
-    &[pep_properties::OWNER_TENANT_ID],
-);
+pub const RG_MEMBERSHIP_RESOURCE: ResourceType =
+    ResourceType::from_static(GROUP_MEMBERSHIP_TYPE_ID, &[pep_properties::OWNER_TENANT_ID]);
 
 /// Narrow a scope issued for the membership resource type so it can be
 /// applied to the owning group.

@@ -44,7 +44,7 @@ The Resource Group DESIGN is decomposed into seven features organized around the
 - **Scope**:
   - SDK crate (`resource-group-sdk`): `models.rs` (ResourceGroup, ResourceGroupWithDepth, ResourceGroupMembership, Page, PageInfo, GtsTypePath), `api.rs` (ResourceGroupClient, ResourceGroupReadHierarchy traits), `error.rs` (ResourceGroupError taxonomy)
   - Gear scaffold: `#[toolkit::gear]` annotated gear, ClientHub registration for `dyn ResourceGroupClient` and `dyn ResourceGroupReadHierarchy`
-  - Persistence adapter: SeaORM entities for the three group, membership and closure tables, plus database migrations preserving stored GTS identifiers
+  - Persistence adapter: SeaORM entities for the three group, membership and closure tables, plus database migrations preserving numeric GTS type keys
   - Error mapping: DomainError to Problem (RFC-9457) mapping for validation, not-found, failed-precondition, conflict, authentication, dependency and internal error categories
   - REST infrastructure: OperationBuilder wiring, OData `$filter` parsing, cursor-based pagination helpers
   - GtsTypePath value object with format validation (`^gts\.[a-z_]...~$`)

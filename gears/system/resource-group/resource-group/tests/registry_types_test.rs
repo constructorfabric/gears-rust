@@ -24,7 +24,7 @@ use common::CreateTypeRequest;
 
 fn code(name: &str) -> String {
     format!(
-        "gts.cf.core.rg.type.v1~x.test.{name}.i{}.v1~",
+        "gts.cf.core.rg.group.v1~x.test.{name}.i{}.v1~",
         Uuid::now_v7().as_simple()
     )
 }
@@ -122,7 +122,7 @@ async fn creating_a_group_needs_its_bound_membership_schema() {
         .1;
     let bound = format!(
         "{}{suffix}~",
-        resource_group_sdk::gts::GROUP_MEMBERSHIP_RESOURCE_TYPE
+        resource_group_sdk::gts::GROUP_MEMBERSHIP_TYPE_ID
     );
     common::delete_published_type(&bound);
     let before = dictionary_rows(&db).await;
@@ -190,7 +190,7 @@ async fn a_member_type_must_be_a_concrete_type_identifier() {
         "gts.cf.test.rg.*",
         "gts.x.test.*",
         // An instance identifier (no trailing `~`) is not a type.
-        "gts.cf.core.rg.type.v1~x.test._.thing.v1",
+        "gts.cf.core.rg.group.v1~x.test._.thing.v1",
         "",
     ] {
         let err = members

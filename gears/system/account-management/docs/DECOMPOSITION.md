@@ -499,7 +499,7 @@ upstream PRD/DESIGN definition, with no broken references.
 
 - [ ] `p1` - **ID**: `cpt-cf-account-management-feature-user-groups`
 
-- **Purpose**: AM publishes `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~`, triggers RG cleanup at tenant hard-deletion and exposes user lookups for membership callers. Resource Group owns group and membership APIs, storage and tenant isolation.
+- **Purpose**: AM publishes `gts.cf.core.rg.group.v1~cf.core.am.user_group.v1~`, triggers RG cleanup at tenant hard-deletion and exposes user lookups for membership callers. Resource Group owns group and membership APIs, storage and tenant isolation.
 
 - **Depends On**: `cpt-cf-account-management-feature-tenant-hierarchy-management`, `cpt-cf-account-management-feature-idp-user-operations-contract`, `cpt-cf-account-management-feature-errors-observability`
 
@@ -534,7 +534,7 @@ upstream PRD/DESIGN definition, with no broken references.
 - **Domain Model Entities**:
   - `UserGroup` (delegated view/adapter — delegated to Resource Group; not owned here)
   - `UserGroupMembership` (delegated adapter — delegated to Resource Group; not owned here)
-  - Chained type-schema reference `gts://gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` (declared by AM and published through Types Registry for RG-side validation; AM stores no instance rows)
+  - Chained type-schema reference `gts://gts.cf.core.rg.group.v1~cf.core.am.user_group.v1~` (declared by AM and published through Types Registry for RG-side validation; AM stores no instance rows)
 
 - **Design Components**:
 

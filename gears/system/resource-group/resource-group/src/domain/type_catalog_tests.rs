@@ -2,7 +2,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, reason = "test assertions")]
 
-use resource_group_sdk::gts::GROUP_MEMBERSHIP_RESOURCE_TYPE;
+use resource_group_sdk::gts::GROUP_MEMBERSHIP_TYPE_ID;
 use serde_json::{Value, json};
 use toolkit_gts::gts_id;
 use types_registry_sdk::{GtsId, GtsTypeId, LifecycleStatus, TypeSchema};
@@ -10,7 +10,7 @@ use types_registry_sdk::{GtsId, GtsTypeId, LifecycleStatus, TypeSchema};
 use super::{RgType, compile, concrete_membership_type};
 use crate::domain::error::DomainError;
 
-const GROUP: &str = gts_id!("cf.core.rg.type.v1~cf.test.rg.team.v1~");
+const GROUP: &str = gts_id!("cf.core.rg.group.v1~cf.test.rg.team.v1~");
 const MEMBERSHIP: &str = gts_id!("cf.core.rg.group_membership.v1~cf.test.rg.member.v1~");
 
 fn snapshot(content: Value, resolved_schema: Value) -> TypeSchema {
@@ -65,7 +65,7 @@ fn the_binding_comes_from_effective_trait_values() {
 #[test]
 fn only_a_concrete_membership_schema_binds() {
     for id in [
-        GROUP_MEMBERSHIP_RESOURCE_TYPE,
+        GROUP_MEMBERSHIP_TYPE_ID,
         gts_id!("cf.test.rg.member.v1~"),
         "gts.cf.core.rg.group_membership.v1~not an id",
     ] {

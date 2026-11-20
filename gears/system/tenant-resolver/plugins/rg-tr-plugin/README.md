@@ -4,7 +4,7 @@ Tenant resolver plugin that resolves tenant hierarchy via the Resource Group gea
 
 ## How It Works
 
-Tenants are represented as RG groups whose type code is one of the configured `tenant_types` (default: `TENANT_RG_TYPE_PATH` = `gts.cf.core.rg.type.v1~cf.core._.tenant.v1~`). The plugin reads tenant data via `ResourceGroupReadHierarchy` (bypass AuthZ), filters with `type in (<tenant_types>)`, and maps matching groups to `TenantInfo` / `TenantRef`.
+Tenants are represented as RG groups whose type code is one of the configured `tenant_types` (default: `TENANT_GROUP_TYPE_ID` = `gts.cf.core.rg.group.v1~cf.core.rg.tenant.v1~`). The plugin reads tenant data via `ResourceGroupReadHierarchy` (bypass AuthZ), filters with `type in (<tenant_types>)`, and maps matching groups to `TenantInfo` / `TenantRef`.
 
 ### Metadata Convention
 
@@ -33,12 +33,12 @@ gears:
     config:
       vendor: "constructorfabric"
       priority: 50
-      # Exact RG type paths treated as tenants. Default: [TENANT_RG_TYPE_PATH].
+      # Exact RG type paths treated as tenants. Default: [TENANT_GROUP_TYPE_ID].
       # Unlike resource-group's `tenant_type_paths` (prefixes), list every
       # concrete tenant type. Every entry must be registered in resource-group
       # (RG rejects a `$filter` on an unknown type).
       tenant_types:
-        - "gts.cf.core.rg.type.v1~acme.core._.tenant.v1~"
+        - "gts.cf.core.rg.group.v1~acme.core._.tenant.v1~"
 ```
 
 ## Dependencies

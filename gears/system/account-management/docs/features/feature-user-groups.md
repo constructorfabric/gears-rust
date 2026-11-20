@@ -113,7 +113,7 @@ user-group subtree.
 **Steps**:
 
 1. [ ] - `p1` - Called by the hard-delete flow in `feature-tenant-hierarchy-management` with `{tenant_id}` just before the `tenants` row delete - `inst-flow-cascade-entry`
-2. [ ] - `p1` - Invoke `ResourceGroupClient` to delete the tenant's user-group subtree (groups of type `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` scoped to `{tenant_id}`) - `inst-flow-cascade-invoke-rg`
+2. [ ] - `p1` - Invoke `ResourceGroupClient` to delete the tenant's user-group subtree (groups of type `gts.cf.core.rg.group.v1~cf.core.am.user_group.v1~` scoped to `{tenant_id}`) - `inst-flow-cascade-invoke-rg`
 3. [ ] - `p1` - **IF** RG call failed transport-level (unreachable or timeout) - `inst-flow-cascade-unavailable-branch`
    1. [ ] - `p1` - **RETURN** `(reject, code=service_unavailable)` via the `feature-errors-observability` envelope; hard-delete flow aborts and `tenants` row is NOT removed - `inst-flow-cascade-unavailable-return`
 4. [ ] - `p1` - **IF** RG call returned a provider-level error - `inst-flow-cascade-provider-error-branch`
@@ -133,7 +133,7 @@ manifest publication.
 
 | Declaration | GTS identifier | Placement and membership |
 |-------------|----------------|---------------------------------|
-| `UserGroupTypeV1` | `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` | `parent_type` accepts roots and parents of the exact AM user-group type. The `membership_type` trait binds the user membership schema. `metadata` may be omitted or empty. |
+| `UserGroupTypeV1` | `gts.cf.core.rg.group.v1~cf.core.am.user_group.v1~` | `parent_type` accepts roots and parents of the exact AM user-group type. The `membership_type` trait binds the user membership schema. `metadata` may be omitted or empty. |
 | `UserV1` | `gts.cf.core.am.user.v1~` | AM user resource type used as the membership's `resource_type`. |
 | [User membership schema](../schemas/user_group_member.v1.schema.json) | `gts.cf.core.rg.group_membership.v1~cf.core.am.user_group_member.v1~` | Accepts the AM user resource type and its derived types as `resource_type` through `x-gts-type-ref`. |
 

@@ -10,7 +10,7 @@
 //! missing Docker fail instead of skip), through the production runner.
 //!
 //! Every group, closure row, membership and dictionary row (sparse keys and
-//! timestamps included) survives as is, the `SMALLINT` keys and their foreign
+//! timestamps included) survives the group schema ID rename, the `SMALLINT` keys and their foreign
 //! keys stay, the type definitions go, and the 2600-byte `resource_id` bound
 //! holds -- with pre-upgrade refusal of legacy oversized identifiers and a
 //! whole-migration rollback when a step after the first DDL fails.
@@ -24,11 +24,11 @@ use toolkit_db::{ConnectOpts, Db, connect_db};
 
 use resource_group::infra::storage::migrations::Migrator;
 
-const TENANT_TYPE: &str = "gts.cf.core.rg.type.v1~cf.test.rg.tenant.v1~";
+const TENANT_TYPE: &str = "gts.cf.core.rg.type.v1~cf.core._.tenant.v1~";
 const DEPT_TYPE: &str = "gts.cf.core.rg.type.v1~cf.test.rg.dept.v1~";
 const USER_TYPE: &str = "gts.cf.test.rg.user.v1~";
 
-const RETIRED_TYPE: &str = "gts.cf.core.rg.type.v1~cf.test.rg.retired.v1~";
+const RETIRED_TYPE: &str = "gts.cf.core.rg.type.v1~cf.core._.tenant.v1~cf.test.rg.retired.v1~";
 
 // Sparse dictionary keys: the migration must keep them, not renumber.
 const TENANT_KEY: i64 = 3;
@@ -320,12 +320,37 @@ async fn pg_oversized_resource_id_refuses_upgrade_before_ddl() {
 }
 
 #[tokio::test]
+async fn pg_tenant_type_collision_rolls_back_the_group_type_rename() {
+    let Some(f) = at_initial_schema().await else {
+        return;
+    };
+    seed_hierarchy(&f.raw).await;
+    run(
+        &f.raw,
+        &format!(
+            "INSERT INTO gts_type (schema_id) VALUES ('{}')",
+            resource_group_sdk::TENANT_GROUP_TYPE_ID
+        ),
+    )
+    .await;
+    let before = snapshot(&f.raw).await;
+    let err = upgrade(&f.db).await.expect_err("tenant type collision");
+    assert!(err.to_string().contains("already exists"), "{err}");
+    assert_eq!(snapshot(&f.raw).await, before);
+}
+
+#[tokio::test]
 async fn pg_an_existing_hierarchy_keeps_every_row_and_dictionary_key() {
     let Some(f) = at_initial_schema().await else {
         return;
     };
     seed_hierarchy(&f.raw).await;
-    let before = snapshot(&f.raw).await;
+    let mut expected = snapshot(&f.raw).await;
+    // Dictionary rows ordered by sparse key. Only the group schema IDs change.
+    let dictionary = &mut expected[3];
+    dictionary[0][1] = resource_group_sdk::TENANT_GROUP_TYPE_ID.into();
+    dictionary[1][1] = "gts.cf.core.rg.group.v1~cf.test.rg.dept.v1~".into();
+    dictionary[3][1] = "gts.cf.core.rg.group.v1~cf.core.rg.tenant.v1~cf.test.rg.retired.v1~".into();
     upgrade(&f.db).await.expect("upgrade");
     assert!(
         !columns(&f.raw, "resource_group")
@@ -336,11 +361,11 @@ async fn pg_an_existing_hierarchy_keeps_every_row_and_dictionary_key() {
 
     assert_eq!(
         snapshot(&f.raw).await,
-        before,
+        expected,
         "rows, keys and timestamps are kept"
     );
     upgrade(&f.db).await.expect("a repeated upgrade is a no-op");
-    assert_eq!(snapshot(&f.raw).await, before);
+    assert_eq!(snapshot(&f.raw).await, expected);
     assert_eq!(history(&f.raw).await.len(), Migrator::migrations().len());
 
     assert_eq!(table_names(&f.raw, "gts_type%").await, ["gts_type"]);

@@ -8,7 +8,6 @@
 //! TODO-16 (repository trait abstraction).
 
 use resource_group::domain::error::DomainError;
-use resource_group::domain::validation::{self, RG_TYPE_PREFIX};
 use toolkit_canonical_errors::{CanonicalError, Problem};
 use toolkit_gts::{gts_id, gts_uri};
 
@@ -35,77 +34,6 @@ const INTERNAL_TYPE: &str = gts_uri!("cf.core.errors.err.v1~cf.core.err.internal
 
 /// Resource-group GTS prefix (matches `RgError`'s `#[resource_error(...)]`).
 const RG_GTS: &str = gts_id!("cf.core.rg.group.v1~");
-
-// ── validate_type_code ──────────────────────────────────────────────────
-
-#[test]
-fn validate_type_code_rejects_empty() {
-    let result = validation::validate_type_code("");
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert!(matches!(err, DomainError::Validation { .. }));
-    assert!(err.to_string().contains("empty"));
-}
-
-#[test]
-fn validate_type_code_rejects_wrong_prefix() {
-    let result = validation::validate_type_code("wrong.prefix.type");
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert!(matches!(err, DomainError::Validation { .. }));
-    assert!(err.to_string().contains("prefix"));
-}
-
-#[test]
-fn validate_type_code_rejects_too_long() {
-    let long_code = format!(
-        "{}{}",
-        RG_TYPE_PREFIX,
-        "a".repeat(1025 - RG_TYPE_PREFIX.len())
-    );
-    assert!(long_code.len() > 1024);
-    let result = validation::validate_type_code(&long_code);
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert!(matches!(err, DomainError::Validation { .. }));
-    assert!(err.to_string().contains("1024"));
-}
-
-#[test]
-fn validate_type_code_accepts_valid_code() {
-    let code = format!("{RG_TYPE_PREFIX}tenant");
-    let result = validation::validate_type_code(&code);
-    assert!(result.is_ok());
-}
-
-#[test]
-fn validate_type_code_accepts_exact_max_length() {
-    let code = format!(
-        "{}{}",
-        RG_TYPE_PREFIX,
-        "a".repeat(1024 - RG_TYPE_PREFIX.len())
-    );
-    assert_eq!(code.len(), 1024);
-    let result = validation::validate_type_code(&code);
-    assert!(result.is_ok());
-}
-
-#[test]
-fn validate_type_code_rejects_prefix_only() {
-    // The prefix itself is a valid type code (non-empty, correct prefix, within length)
-    let result = validation::validate_type_code(RG_TYPE_PREFIX);
-    assert!(result.is_ok());
-}
-
-// ── validate_membership_type_code ───────────────────────────────────────
-
-// ── validate_metadata_schema ────────────────────────────────────────────
-
-// ── validate_metadata_against_schema ────────────────────────────────────
-
-// ── validate_metadata_schema: additional edge cases ─────────────────────
-
-// ── validate_metadata_against_schema: additional edge cases ─────────────
 
 // ── DomainError construction ────────────────────────────────────────────
 

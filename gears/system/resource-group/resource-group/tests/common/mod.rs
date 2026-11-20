@@ -39,7 +39,7 @@ use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry, Seed}
 // -- RG types: published to a test types registry --
 //
 // Tests publish schemas with unique codes into a process-wide registry.
-const RG_BASE: &str = gts_id!("cf.core.rg.type.v1~");
+const RG_BASE: &str = gts_id!("cf.core.rg.group.v1~");
 
 static REGISTRY: std::sync::LazyLock<Arc<MockTypesRegistry>> = std::sync::LazyLock::new(|| {
     let registry = MockTypesRegistry::new();
@@ -49,7 +49,7 @@ static REGISTRY: std::sync::LazyLock<Arc<MockTypesRegistry>> = std::sync::LazyLo
             serde_json::from_str(&schema).expect("RG base schema JSON"),
         );
     }
-    seed_type_ancestor(&registry, resource_group_sdk::TENANT_RG_TYPE_PATH);
+    seed_type_ancestor(&registry, resource_group_sdk::TENANT_GROUP_TYPE_ID);
     Arc::new(registry)
 });
 
@@ -189,12 +189,12 @@ pub fn publish_type(req: CreateTypeRequest) -> ResourceGroupType {
 
 /// Publish a group schema and the membership policy bound to it.
 fn seed_into(registry: &MockTypesRegistry, req: &CreateTypeRequest) {
-    use resource_group_sdk::gts::GROUP_MEMBERSHIP_RESOURCE_TYPE;
+    use resource_group_sdk::gts::GROUP_MEMBERSHIP_TYPE_ID;
     use serde_json::{Value, json};
 
     let trimmed = req.code.trim_end_matches('~');
     let (parent, suffix) = trimmed.rsplit_once('~').expect("a derived RG type code");
-    let membership_type = format!("{GROUP_MEMBERSHIP_RESOURCE_TYPE}{suffix}~");
+    let membership_type = format!("{GROUP_MEMBERSHIP_TYPE_ID}{suffix}~");
     let mut resource_type = json!({"type": "string", "x-gts-type-ref": "gts.*"});
     if req.allowed_membership_types.is_empty() {
         resource_type["maxLength"] = json!(0);
@@ -208,7 +208,7 @@ fn seed_into(registry: &MockTypesRegistry, req: &CreateTypeRequest) {
             "$schema": "http://json-schema.org/draft-07/schema#",
             "type": "object",
             "allOf": [
-                { "$ref": format!("gts://{GROUP_MEMBERSHIP_RESOURCE_TYPE}") },
+                { "$ref": format!("gts://{GROUP_MEMBERSHIP_TYPE_ID}") },
                 { "properties": { "resource_type": resource_type } }
             ],
         }),
@@ -406,7 +406,7 @@ pub async fn create_root_type(svc: &TestTypes, suffix: &str) -> ResourceGroupTyp
     // `i` so it starts with a letter) goes in type.
     let code = format!(
         "{}x.test.{}.i{}.v1~",
-        gts_id!("cf.core.rg.type.v1~"),
+        gts_id!("cf.core.rg.group.v1~"),
         suffix.to_ascii_lowercase().replace('-', "_"),
         Uuid::now_v7().as_simple()
     );
@@ -434,7 +434,7 @@ pub async fn create_child_type(
     // `i` so it starts with a letter) goes in type.
     let code = format!(
         "{}x.test.{}.i{}.v1~",
-        gts_id!("cf.core.rg.type.v1~"),
+        gts_id!("cf.core.rg.group.v1~"),
         suffix.to_ascii_lowercase().replace('-', "_"),
         Uuid::now_v7().as_simple()
     );
@@ -777,7 +777,7 @@ pub async fn assert_stored_membership_cleanup(db: Arc<DBProvider<DbError>>) {
     let group = create_root_group(&groups, &ctx, &root.code, "users", tenant).await;
     let user = Uuid::now_v7().to_string();
     let family = "gts.cf.core.am.user.v1~";
-    let legacy = "gts.cf.core.rg.type.v1~cf.core.am.user.v1~";
+    let legacy = "gts.cf.core.rg.group.v1~cf.core.am.user.v1~";
     let child = "gts.cf.core.am.user.v1~cf.test.am.staff.v1~";
     let unrelated = "gts.cf.core.am.device.v1~";
     for kind in [legacy, family, child, unrelated] {

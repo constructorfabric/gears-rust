@@ -6,9 +6,19 @@ use gts::GtsSchema;
 use serde_json::json;
 use toolkit_gts::gts_id;
 
-use super::{GROUP_MEMBERSHIP_RESOURCE_TYPE, ResourceGroupMembershipV1, ResourceGroupTypeV1};
+use super::{
+    GROUP_MEMBERSHIP_TYPE_ID, ResourceGroupMembershipV1, ResourceGroupTypeV1, TENANT_GROUP_TYPE_ID,
+};
 
-const BASE: &str = gts_id!("cf.core.rg.type.v1~");
+const BASE: &str = gts_id!("cf.core.rg.group.v1~");
+
+#[test]
+fn default_tenant_uses_the_rg_namespace() {
+    assert_eq!(
+        TENANT_GROUP_TYPE_ID,
+        gts_id!("cf.core.rg.group.v1~cf.core.rg.tenant.v1~")
+    );
+}
 
 #[test]
 fn the_base_types_are_this_crates_declarations() {
@@ -16,7 +26,7 @@ fn the_base_types_are_this_crates_declarations() {
         .into_iter()
         .map(|(id, _)| id)
         .collect();
-    assert_eq!(ids, [gts_id!("cf.core.rg.group_membership.v1~"), BASE]);
+    assert_eq!(ids, [BASE, gts_id!("cf.core.rg.group_membership.v1~")]);
 }
 
 #[test]
@@ -26,7 +36,7 @@ fn the_group_envelope_carries_an_optional_metadata_object() {
     assert_eq!(traits["required"], json!(["membership_type"]));
     assert_eq!(
         traits["properties"]["membership_type"]["x-gts-type-ref"],
-        GROUP_MEMBERSHIP_RESOURCE_TYPE
+        GROUP_MEMBERSHIP_TYPE_ID
     );
     assert!(schema["properties"].get("membership_type").is_none());
     assert!(schema.get("x-gts-traits").is_none());

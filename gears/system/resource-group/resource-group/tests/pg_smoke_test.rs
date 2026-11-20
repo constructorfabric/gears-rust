@@ -179,7 +179,7 @@ async fn create_self_referencing_type(
     // plain, then update it to add the self-reference.
     let code = format!(
         "{}x.test.{}.i{}.v1~",
-        gts_id!("cf.core.rg.type.v1~"),
+        gts_id!("cf.core.rg.group.v1~"),
         suffix.to_ascii_lowercase(),
         Uuid::now_v7().as_simple()
     );

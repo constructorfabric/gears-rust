@@ -13,7 +13,7 @@ import pytest
 from ..types_registry.helpers import PLATFORM_API, RECEIPT, get_entity, submit_and_poll
 
 REQUEST_TIMEOUT = 5.0  # per-request hard timeout for all E2E calls
-RG_BASE_TYPE = "gts.cf.core.rg.type.v1~"
+RG_BASE_TYPE = "gts.cf.core.rg.group.v1~"
 
 
 # ── Environment-driven fixtures ──────────────────────────────────────────
@@ -64,7 +64,7 @@ def _check_rg_reachable():
 # Tenant IDs must match static-authn-plugin token config in e2e yaml.
 TENANT_A_ID = "00000000-df51-5b42-9538-d2b56b7ee953"
 TENANT_B_ID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
-TENANT_TYPE_CODE = "gts.cf.core.rg.type.v1~x.e2etest._.tenant.v1~"
+TENANT_TYPE_CODE = "gts.cf.core.rg.group.v1~x.e2etest._.tenant.v1~"
 
 
 RG_MEMBERSHIP_BASE = "gts.cf.core.rg.group_membership.v1~"
@@ -221,7 +221,7 @@ def unique_type_code(name: str) -> str:
     """Generate a unique RG type code to avoid collisions between test runs."""
     global _counter
     _counter += 1
-    return f"gts.cf.core.rg.type.v1~x.e2etest._.{name}{_counter}.v1~"
+    return f"gts.cf.core.rg.group.v1~x.e2etest._.{name}{_counter}.v1~"
 
 
 @pytest.fixture

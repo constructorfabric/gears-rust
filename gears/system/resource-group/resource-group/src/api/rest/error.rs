@@ -15,7 +15,7 @@ use crate::domain::error::DomainError;
 
 /// Errors attributable to a resource group as a resource.
 ///
-/// The macro literal mirrors [`resource_group_sdk::gts::GROUP_RESOURCE_TYPE`]
+/// The macro literal mirrors [`resource_group_sdk::gts::GROUP_TYPE_ID`]
 /// (proc-macros cannot resolve a const); the SDK round-trip tests pin the
 /// two equal.
 #[resource_error(gts_id!("cf.core.rg.group.v1~"))]

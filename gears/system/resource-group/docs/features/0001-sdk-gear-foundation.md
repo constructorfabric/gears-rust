@@ -274,7 +274,7 @@ In-source `#[cfg(test)]` tests for filter field definitions and DTO conversions:
 ## 6. Acceptance Criteria
 
 - [x] SDK crate (`resource-group-sdk`) compiles with all model types, trait contracts, and error types defined
-- [x] `GtsTypePath::new("gts.cf.core.rg.type.v1~")` succeeds; `GtsTypePath::new("invalid")` returns validation error
+- [x] `GtsTypePath::new("gts.cf.core.rg.group.v1~")` succeeds; `GtsTypePath::new("invalid")` returns validation error
 - [x] The three group, closure and membership tables are created by migrations with correct constraints and indexes
 - [x] SeaORM entities compile and map to the DB schema without runtime errors
 - [x] Gear registers `dyn ResourceGroupClient` and `dyn ResourceGroupReadHierarchy` in ClientHub during Phase 1 init
@@ -298,7 +298,7 @@ The following cases retain SDK normalization, validation and serialization cover
 
 #### TC-SDK-01: GtsTypePath::new() valid path [P1]
 - **Covers**: G36, 0001-AC-2
-- **Input**: `"gts.cf.core.rg.type.v1~"`
+- **Input**: `"gts.cf.core.rg.group.v1~"`
 - **Assert**: `Ok(GtsTypePath)`, `as_str()` returns lowercase
 
 #### TC-SDK-02: GtsTypePath::new() empty string [P1]
@@ -321,32 +321,32 @@ The following cases retain SDK normalization, validation and serialization cover
 
 #### TC-SDK-06: GtsTypePath::new() invalid format - uppercase chars [P1]
 - **Covers**: G38
-- **Input**: `"gts.cf.core.rg.type.v1~"` with uppercase -> trimmed/lowercased
+- **Input**: `"gts.cf.core.rg.group.v1~"` with uppercase -> trimmed/lowercased
 
 #### TC-SDK-07: GtsTypePath::new() trims whitespace and lowercases [P2]
 - **Covers**: G36
-- **Input**: `"  gts.cf.System.RG.Type.V1~  "`
-- **Assert**: `Ok`, `as_str() == "gts.cf.system.rg.type.v1~"` (`new` only normalizes case/whitespace; it does not rewrite the GTS namespace)
+- **Input**: `"  gts.cf.System.RG.Group.V1~  "`
+- **Assert**: `Ok`, `as_str() == "gts.cf.system.rg.group.v1~"` (`new` only normalizes case/whitespace; it does not rewrite the GTS namespace)
 
 #### TC-SDK-08: GtsTypePath::new() chained path (multi-segment) [P1]
 - **Covers**: G38
-- **Input**: `"gts.cf.core.rg.type.v1~x.test.v1~"`
+- **Input**: `"gts.cf.core.rg.group.v1~x.test.v1~"`
 - **Assert**: `Ok`
 
 #### TC-SDK-09: GtsTypePath::new() double tilde (empty segment) [P2]
 - **Covers**: G38
-- **Input**: `"gts.cf.core.rg.type.v1~~"`
+- **Input**: `"gts.cf.core.rg.group.v1~~"`
 - **Assert**: `Err` (empty segment between tildes)
 
 #### TC-SDK-10: GtsTypePath::new() special chars in segment [P2]
 - **Covers**: G38
-- **Input**: `"gts.cf.core.rg.type.v1~hello-world~"` (hyphen not allowed)
+- **Input**: `"gts.cf.core.rg.group.v1~hello-world~"` (hyphen not allowed)
 - **Assert**: `Err`
 
 #### TC-SDK-11: GtsTypePath serde round-trip (JSON) [P1]
 - **Covers**: G37
 - **Setup**: Serialize `GtsTypePath` to JSON string, deserialize back
-- **Assert**: `serde_json::to_string(&path)` produces `"gts.cf.core.rg.type.v1~"`, deserialize back equals original
+- **Assert**: `serde_json::to_string(&path)` produces `"gts.cf.core.rg.group.v1~"`, deserialize back equals original
 
 #### TC-SDK-12: GtsTypePath serde invalid JSON string [P1]
 - **Covers**: G37
@@ -376,7 +376,7 @@ The following cases retain SDK normalization, validation and serialization cover
 - Boundary → Err("exceeds maximum length")
 
 #### TC-SDK-24: Type identifier normalization [P1]
-- Both SDK value objects and domain identifier validation trim whitespace and lowercase input before checking it.
+- `GtsTypePath::new` trims whitespace and lowercases input. Group schema lookup and tenant configuration require canonical GTS type IDs.
 - The RG family prefix remains required by domain validation.
 
 #### TC-SDK-15: SDK model `type` field rename [P1]

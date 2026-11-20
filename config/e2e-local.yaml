@@ -195,7 +195,7 @@ gears:
         "gts.cf.core.am.tenant_metadata.v1~x.e2etest.*":
           allowed_vendors: [x]
         # The Resource Group suite publishes group and membership schemas.
-        "gts.cf.core.rg.type.v1~x.e2etest.*":
+        "gts.cf.core.rg.group.v1~x.e2etest.*":
           allowed_vendors: [x]
         "gts.cf.core.rg.group_membership.v1~x.e2etest.*":
           allowed_vendors: [x]

@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use resource_group_sdk::GROUP_TYPE_ID;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
 use types_registry_sdk::{
@@ -61,8 +62,18 @@ impl RgTypeCatalog for RegistryTypeCatalog {
         code: &str,
         usage: TypeUse,
     ) -> Result<RgType, DomainError> {
+        // @cpt-algo:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1
+        // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-1
         let type_id = GtsTypeId::try_new(code)
             .map_err(|e| DomainError::validation(format!("Invalid GTS type '{code}': {e}")))?;
+        // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-1
+        // @cpt-begin:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-2
+        if !type_id.as_ref().starts_with(GROUP_TYPE_ID) {
+            return Err(DomainError::validation(format!(
+                "Group type '{code}' must start with '{GROUP_TYPE_ID}'"
+            )));
+        }
+        // @cpt-end:cpt-cf-resource-group-algo-type-mgmt-validate-type-input:p1:inst-val-input-2
         let schema = self
             .registry
             .get_type_schema(

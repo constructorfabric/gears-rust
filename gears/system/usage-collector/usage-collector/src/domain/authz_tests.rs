@@ -40,7 +40,7 @@ const SAMPLE_GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.t
 
 /// Arbitrary RG member-handle type for group-filter fixtures — usage-collector
 /// rejects group predicates regardless of the type, so only the shape matters.
-const SAMPLE_MEMBER_TYPE: &str = gts_id!("cf.core.rg.type.v1~example.core.uc.owner.v1~");
+const SAMPLE_MEMBER_TYPE: &str = gts_id!("cf.core.rg.group.v1~example.core.uc.owner.v1~");
 
 fn ctx() -> SecurityContext {
     SecurityContext::builder()

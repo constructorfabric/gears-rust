@@ -1492,7 +1492,7 @@ mod cleanup {
         ) -> Result<(), CanonicalError> {
             assert_eq!(
                 exact_alias,
-                Some("gts.cf.core.rg.type.v1~cf.core.am.user.v1~")
+                Some("gts.cf.core.rg.group.v1~cf.core.am.user.v1~")
             );
             self.removed.lock().expect("lock").push((
                 group_id,
@@ -1678,7 +1678,7 @@ mod cleanup {
             .unwrap();
         let raw = sea_orm::Database::connect(&dsn).await.unwrap();
         raw.execute_unprepared(&format!(
-            "INSERT INTO gts_type (id, schema_id) VALUES (1, '{USER_GROUP_RG_TYPE_CODE}'), (2, 'gts.cf.core.rg.type.v1~cf.core.am.user.v1~');
+            "INSERT INTO gts_type (id, schema_id) VALUES (1, 'gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~'), (2, 'gts.cf.core.rg.type.v1~cf.core.am.user.v1~');
              INSERT INTO resource_group (id, gts_type_id, name, tenant_id) VALUES (X'{group}', 1, 'admins', X'{}');
              INSERT INTO resource_group_closure (ancestor_id, descendant_id, depth) VALUES (X'{group}', X'{group}', 0);
              INSERT INTO resource_group_membership (group_id, gts_type_id, resource_id) VALUES (X'{group}', 2, '{user_id}');",
@@ -1713,6 +1713,10 @@ mod cleanup {
             .await
             .unwrap();
         assert_eq!(listed.items.len(), 1, "upgrade retained the original link");
+        assert_eq!(
+            listed.items[0].resource_type,
+            toolkit_gts::gts_id!("cf.core.rg.group.v1~cf.core.am.user.v1~"),
+        );
 
         let tenants = Arc::new(FakeTenantRepo::new());
         seed_tenant(

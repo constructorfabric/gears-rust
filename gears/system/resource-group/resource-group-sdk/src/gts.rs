@@ -8,14 +8,14 @@ use toolkit_gts::local::gts_type_schema;
 #[derive(schemars::JsonSchema, serde::Serialize, toolkit_gts::GtsTraitsSchema)]
 pub struct ResourceGroupTypeTraitsV1 {
     /// GTS ID of a concrete membership schema.
-    #[schemars(extend("x-gts-type-ref" = GROUP_MEMBERSHIP_RESOURCE_TYPE))]
+    #[schemars(extend("x-gts-type-ref" = GROUP_MEMBERSHIP_TYPE_ID))]
     pub membership_type: String,
 }
 
-/// Abstract GTS base type for Resource Group types: `gts.cf.core.rg.type.v1~`.
+/// Abstract GTS base type for Resource Group types: `gts.cf.core.rg.group.v1~`.
 ///
 /// The persisted types registry is the only catalogue of RG types. Owners
-/// publish derived types (`gts.cf.core.rg.type.v1~<vendor>...~`) before
+/// publish derived types (`gts.cf.core.rg.group.v1~<vendor>...~`) before
 /// application `init`; resource-group publishes this base.
 ///
 /// Concrete types fix the `membership_type` trait with a string `const`.
@@ -25,11 +25,11 @@ pub struct ResourceGroupTypeTraitsV1 {
 ///
 /// "Is this type a tenant?" is **not** a trait — it is derived from the type
 /// code: any type whose GTS chain starts with one of the configured tenant
-/// type prefixes (default: [`TENANT_RG_TYPE_PATH`]) is a tenant type.
+/// type prefixes (default: [`TENANT_GROUP_TYPE_ID`]) is a tenant type.
 ///
 #[gts_type_schema(
     dir_path = "schemas",
-    type_id = gts_id!("cf.core.rg.type.v1~"),
+    type_id = gts_id!("cf.core.rg.group.v1~"),
     description = "Resource group placement, membership schema and metadata",
     properties = "id,metadata,parent_type",
     traits_schema = inline(ResourceGroupTypeTraitsV1),
@@ -43,7 +43,7 @@ pub struct ResourceGroupTypeV1<M> {
     /// The group's type-specific metadata; constrained by derived types.
     pub metadata: M,
     /// Actual parent's GTS type, or null when the group is a root.
-    #[schemars(extend("x-gts-type-ref" = TYPE_RESOURCE_TYPE))]
+    #[schemars(extend("x-gts-type-ref" = GROUP_TYPE_ID))]
     pub parent_type: Option<String>,
 }
 
@@ -63,7 +63,7 @@ pub struct ResourceGroupMembershipV1 {
     pub gts_type: gts::GtsTypeId,
 }
 
-/// Canonical GTS resource type for a resource **group** as a resource.
+/// GTS type ID of the base group schema, used for group authorization and errors.
 ///
 /// Lands in `CanonicalError::{NotFound,AlreadyExists}.ctx.resource_type`
 /// for every group-attributable error and backs the impl crate's
@@ -74,25 +74,12 @@ pub struct ResourceGroupMembershipV1 {
 /// Match it against the resource-scoped projection variants
 /// ([`crate::ResourceGroupError::NotFound`] /
 /// [`crate::ResourceGroupError::AlreadyExists`]).
-// `rg` namespace, NOT the crate-name-derived `resource_group`: this
-// string is the PEP-evaluated resource type for every group CRUD gate,
-// and every deployed role grant is written against the documented
-// `gts.cf.core.rg.*` family (siblings: `rg.group_membership.v1~`,
-// `rg.type.v1~`). The gts-rust v0.11.0 migration mechanically swapped
-// the literal for a crate-derived id and silently renamed the type —
-// which 403'd every existing grant (tenant members could no longer
-// create groups, AM's ownership probe on tenant delete failed closed).
-pub const GROUP_RESOURCE_TYPE: &str = gts_id!("cf.core.rg.group.v1~");
+pub const GROUP_TYPE_ID: &str = <ResourceGroupTypeV1<()> as gts::GtsSchema>::TYPE_ID;
 
-/// GTS resource type for membership authorization and base for concrete membership schemas.
-pub const GROUP_MEMBERSHIP_RESOURCE_TYPE: &str =
-    <ResourceGroupMembershipV1 as gts::GtsSchema>::TYPE_ID;
+/// GTS type ID of the base membership schema, used for membership authorization.
+pub const GROUP_MEMBERSHIP_TYPE_ID: &str = <ResourceGroupMembershipV1 as gts::GtsSchema>::TYPE_ID;
 
-/// GTS identifier of the RG base type (`gts.cf.core.rg.type.v1~`): the
-/// prefix every RG type identifier starts with.
-pub const TYPE_RESOURCE_TYPE: &str = gts_id!("cf.core.rg.type.v1~");
-
-/// Default GTS type path for the tenant resource-group type.
+/// GTS type ID of the default tenant group.
 ///
 /// Any RG type whose code **starts with** a configured tenant-type path is
 /// considered a tenant type — creating a group of such a type starts a new
@@ -103,11 +90,11 @@ pub const TYPE_RESOURCE_TYPE: &str = gts_id!("cf.core.rg.type.v1~");
 /// This constant is the default of the resource-group gear's
 /// `tenant_type_paths` and the rg-tr-plugin's `tenant_types` config; a
 /// deployment with its own vendor overrides both lists (e.g.
-/// `gts.cf.core.rg.type.v1~acme.core._.tenant.v1~`).
+/// `gts.cf.core.rg.group.v1~acme.core._.tenant.v1~`).
 ///
 /// Owners publish the tenant RG type through Types Registry and allow a
 /// `null` parent type where root tenants are supported.
-pub const TENANT_RG_TYPE_PATH: &str = gts_id!("cf.core.rg.type.v1~cf.core._.tenant.v1~");
+pub const TENANT_GROUP_TYPE_ID: &str = gts_id!("cf.core.rg.group.v1~cf.core.rg.tenant.v1~");
 
 #[cfg(test)]
 #[path = "gts_tests.rs"]

@@ -81,9 +81,9 @@ pub const SERVICE_ACCOUNT_RESOURCE_TYPE: &str = gts_id!("cf.core.am.service_acco
 /// * AM's `UserGroupTypeV1` GTS declaration, published with AM's
 ///   types-registry manifest.
 ///
-/// The string lives in RG's type namespace (`gts.cf.core.rg.type.v1~`
+/// The string lives in RG's type namespace (`gts.cf.core.rg.group.v1~`
 /// prefix), which Resource Group requires of every group type.
-pub const USER_GROUP_RG_TYPE_CODE: &str = gts_id!("cf.core.rg.type.v1~cf.core.am.user_group.v1~");
+pub const USER_GROUP_RG_TYPE_CODE: &str = gts_id!("cf.core.rg.group.v1~cf.core.am.user_group.v1~");
 
 // ---------------------------------------------------------------------------
 // AM base envelope schema registration

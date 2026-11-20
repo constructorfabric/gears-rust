@@ -458,7 +458,7 @@ impl GroupRepositoryTrait for GroupRepository {
     /// List groups with `OData` filtering and pagination.
     ///
     /// The `type` filter field takes GTS type identifiers
-    /// (e.g. `$filter=type eq 'gts.cf.core.rg.type.v1~x.test.org.v1~'`) and is
+    /// (e.g. `$filter=type eq 'gts.cf.core.rg.group.v1~x.test.org.v1~'`) and is
     /// matched through the dictionary in SQL; no type registry is consulted.
     ///
     /// Uses the provided `AccessScope` for tenant-level filtering (`SecureORM`).

@@ -7,7 +7,8 @@ decision-makers: Constructor Fabric Steering Committee
 # ADR-001: GTS Type System for Resource Group
 
 > This ADR records the historical junction-table design. Types Registry now
-> owns the schemas for placement and membership. RG retains `gts_type` as the
+> owns the schemas for placement and membership under the group base
+> `gts.cf.core.rg.group.v1~`. RG retains `gts_type` as the
 > `SMALLINT` key-to-identifier dictionary. See the [current design](../DESIGN.md)
 > for publication, persistence and retirement behavior.
 

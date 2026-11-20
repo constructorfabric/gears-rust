@@ -64,7 +64,7 @@ impl ConfigProvider for NoConfig {
 /// own name and version, before any application `init`.
 #[test]
 fn the_publication_manifest_is_the_sdk_declarations() {
-    use resource_group_sdk::gts::{GROUP_MEMBERSHIP_RESOURCE_TYPE, TYPE_RESOURCE_TYPE};
+    use resource_group_sdk::gts::{GROUP_MEMBERSHIP_TYPE_ID, GROUP_TYPE_ID};
     use toolkit::gts_publication::GtsPublicationCapability as _;
 
     let manifest = ResourceGroup::default()
@@ -75,7 +75,7 @@ fn the_publication_manifest_is_the_sdk_declarations() {
     assert_eq!(manifest.publisher_name(), ResourceGroup::MODULE_NAME);
     assert_eq!(manifest.publisher_version(), env!("CARGO_PKG_VERSION"));
     let ids: Vec<&str> = manifest.documents().iter().map(|(id, _)| id.id()).collect();
-    assert_eq!(ids, [GROUP_MEMBERSHIP_RESOURCE_TYPE, TYPE_RESOURCE_TYPE]);
+    assert_eq!(ids, [GROUP_TYPE_ID, GROUP_MEMBERSHIP_TYPE_ID]);
 }
 
 /// Without the types registry's tenant API `init` fails closed: RG keeps no

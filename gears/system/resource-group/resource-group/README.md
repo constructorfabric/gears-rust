@@ -43,7 +43,7 @@ RG publishes its SDK's base schemas. Owners publish derived group schemas and
 member resource types through `gts_publication` before application initialization.
 Dynamic publishers use Types Registry's platform API.
 
-- Derive group types from `gts.cf.core.rg.type.v1~`. Constrain the
+- Derive group types from `gts.cf.core.rg.group.v1~`. Constrain the
   `parent_type` payload field, which receives the actual parent's GTS type or
   `null` at the root. Use `x-gts-type-ref` for parent families.
 - Derive a membership schema from `gts.cf.core.rg.group_membership.v1~`.
@@ -75,9 +75,9 @@ gears:
       # GTS type-path prefixes that make an RG type a tenant type
       # (`tenant_id = group.id`, tenant-root uniqueness). A type is a tenant
       # type when its code starts with ANY of the entries.
-      # Default: [TENANT_RG_TYPE_PATH] = ["gts.cf.core.rg.type.v1~cf.core._.tenant.v1~"]
+      # Default: [TENANT_GROUP_TYPE_ID] = ["gts.cf.core.rg.group.v1~cf.core.rg.tenant.v1~"]
       tenant_type_paths:
-        - "gts.cf.core.rg.type.v1~acme.core._.tenant.v1~"
+        - "gts.cf.core.rg.group.v1~acme.core._.tenant.v1~"
 ```
 
 Entries must be canonical (trimmed, lowercase). `rg-tr-plugin`'s `tenant_types`

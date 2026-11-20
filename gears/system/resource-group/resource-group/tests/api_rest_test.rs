@@ -41,7 +41,7 @@ use resource_group::infra::storage::migrations::Migrator;
 
 macro_rules! rg_type_id {
     ($($arg:tt)*) => {
-        format!("{}{}", gts_id!("cf.core.rg.type.v1~"), format_args!($($arg)*))
+        format!("{}{}", gts_id!("cf.core.rg.group.v1~"), format_args!($($arg)*))
     };
 }
 
@@ -876,12 +876,7 @@ async fn input_create_group_non_rg_type_returns_400() {
         tenant_id,
     );
     let resp = router.oneshot(req).await.unwrap();
-    // Should be 400 (validation) or 404 (type not found)
-    let status = resp.status();
-    assert!(
-        status == StatusCode::BAD_REQUEST || status == StatusCode::NOT_FOUND,
-        "Expected 400 or 404, got {status}"
-    );
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 /// TC-NOGTS-05: Create group with empty type_path returns 400.
@@ -1009,7 +1004,7 @@ async fn input_deser_group_invalid_parent_uuid_returns_error() {
         "POST",
         "/resource-group/v1/groups",
         Some(serde_json::json!({
-            "type": gts_id!("cf.core.rg.type.v1~test.rg.simple.type.v1~"),
+            "type": gts_id!("cf.core.rg.group.v1~test.rg.simple.type.v1~"),
             "name": "BadParent",
             "parent_id": "not-a-uuid"
         })),
@@ -1122,7 +1117,7 @@ async fn input_deser_membership_path_non_uuid_returns_400() {
         "POST",
         &format!(
             "/resource-group/v1/memberships/not-a-uuid/{}/res-001",
-            gts_id!("cf.core.rg.type.v1~test.rg.simple.type.v1~")
+            gts_id!("cf.core.rg.group.v1~test.rg.simple.type.v1~")
         ),
         None,
         tenant_id,
@@ -1524,7 +1519,7 @@ async fn rest_error_responses_have_problem_content_type_and_status() {
         "POST",
         "/resource-group/v1/groups",
         Some(serde_json::json!({
-            "type": gts_id!("cf.core.rg.type.v1~test.rg.nonexistent.type.v1~"),
+            "type": gts_id!("cf.core.rg.group.v1~test.rg.nonexistent.type.v1~"),
             "name": "Ghost"
         })),
         tenant_id,

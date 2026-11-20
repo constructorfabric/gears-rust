@@ -79,7 +79,7 @@ async fn create_self_referencing_type(
     // plain, then update it to add the self-reference.
     let code = format!(
         "{}x.test.{}.i{}.v1~",
-        gts_id!("cf.core.rg.type.v1~"),
+        gts_id!("cf.core.rg.group.v1~"),
         suffix.to_ascii_lowercase(),
         Uuid::now_v7().as_simple()
     );
@@ -116,7 +116,7 @@ async fn create_type_with_memberships(
 ) -> common::ResourceGroupType {
     let code = format!(
         "{}x.test.{}.i{}.v1~",
-        gts_id!("cf.core.rg.type.v1~"),
+        gts_id!("cf.core.rg.group.v1~"),
         suffix.to_ascii_lowercase(),
         Uuid::now_v7().as_simple()
     );
@@ -978,7 +978,7 @@ async fn scale_rejected_delete_statements_do_not_grow_with_child_type_count() {
 fn unique_tenant_type_code() -> String {
     format!(
         "{}x.test.tn.i{}.v1~",
-        resource_group_sdk::TENANT_RG_TYPE_PATH,
+        resource_group_sdk::TENANT_GROUP_TYPE_ID,
         Uuid::now_v7().as_simple()
     )
 }
