@@ -210,7 +210,9 @@ The owning gear remains responsible for confirming that its resource exists.
 Narrowing the inherited schemas is optional. A concrete group with an active
 membership binding can inherit root placement and any RG parent type. If the
 bound membership schema inherits its `resource_type` constraint unchanged,
-it accepts any active concrete member type. RG applies the published
+it accepts any active concrete member type. RG enforces the schema as
+published and does not check that it narrows anything. This reverses the
+legacy default, where an empty rule list admitted nobody. RG applies the published
 constraints alongside its forest, tenant and query-profile checks. For example,
 Account Management allows root user groups and nesting under other user groups,
 with membership limited to the AM user type family.
@@ -266,7 +268,7 @@ Types Registry specifies an opaque SDK-issued UUID for each registry reference.
 The T38b amendment of 2026-11-17 retained RG’s numeric foreign keys so deployed
 groups and memberships keep their links during the move to registry-owned
 schemas. See [ADR-0001](../../types-registry/docs/ADR/0001-cpt-cf-types-registry-adr-storage-identity-query-model.md#decision-outcome)
-and the [T38b implementation record](https://github.com/constructorfabric/gears-rust/commit/358726c2d8b85d4d887df1bc60106eb69d2f669f).
+and the T38b entry in the [Types Registry plan](../../types-registry/docs/p0/todo.md).
 
 Groups and memberships reference their GTS type by a `SMALLINT` key into RG's
 local identity dictionary (`gts_type`: key, GTS identifier, creation time).
@@ -688,6 +690,12 @@ A single migration rewrites the group prefix in every matching dictionary entry,
 then the standard tenant prefix and its descendants. Both updates preserve the
 numeric keys and commit together. A destination ID collision or a path longer
 than 1024 characters rolls back both updates and reports the conflicting path.
+
+Memberships stored under the former Account Management user type
+`gts.cf.core.rg.type.v1~cf.core.am.user.v1~` are not migrated to
+`gts.cf.core.am.user.v1~`. The prefix rename turns their dictionary entry into
+`gts.cf.core.rg.group.v1~cf.core.am.user.v1~`, which user deletion does not
+clean up. Remove such memberships before upgrading.
 
 Stop writes before upgrading and audit legacy PostgreSQL membership IDs.
 

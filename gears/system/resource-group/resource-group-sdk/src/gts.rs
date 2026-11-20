@@ -20,7 +20,8 @@ pub struct ResourceGroupTypeTraitsV1 {
 ///
 /// Concrete types fix the `membership_type` trait with a string `const`.
 /// Narrowing `parent_type`, `metadata` and membership `resource_type` is
-/// optional. RG enforces the published schema. The bases allow root
+/// optional. RG enforces the published schema and does not check that it
+/// narrows anything. The bases allow root
 /// placement, any RG parent type and any active concrete member type.
 ///
 /// "Is this type a tenant?" is **not** a trait — it is derived from the type

@@ -147,10 +147,9 @@ Request → API Gateway (AuthN) → SecurityContext{tenant=T1}
 - `tenant_isolation_update_cross_tenant_blocked` — cross-tenant `update_group` → blocked
 - `tenant_isolation_delete_cross_tenant_blocked` — cross-tenant `delete_group` → blocked; own-tenant delete succeeds
 
-### Planned E2E HTTP tests (9 tests)
+### Planned E2E HTTP tests (8 tests)
 
 **`test_authz_tenant_scoping.py`**:
-- `test_create_and_get_type` — type CRUD
 - `test_create_and_get_group` — group with tenant_id from SecurityContext
 - `test_list_groups_returns_created_groups` — list returns own groups
 - `test_group_has_tenant_id_from_security_context` — consistent tenant_id across groups

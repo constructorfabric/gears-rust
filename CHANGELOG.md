@@ -9,6 +9,35 @@ release-plz updates this file in the Release PR.
 
 ## [Unreleased]
 
+### Breaking changes
+
+- Resource Group type definitions moved to Types Registry. The legacy
+  `/types-registry/v1/types` and `/types-registry/v1/types/{code}` routes,
+  SDK type CRUD and `ResourceGroupTypeBootstrap` are removed.
+- The Resource Group base schema now uses the group authorization target
+  `gts.cf.core.rg.group.v1~`. Update derived schema IDs, references, tenant
+  type configuration and client filters that use `gts.cf.core.rg.type.v1~`.
+  The default tenant segment changes from `cf.core._.tenant.v1~` to
+  `cf.core.rg.tenant.v1~` in the tenant schema and its descendants.
+  In the Resource Group SDK, replace `TYPE_RESOURCE_TYPE` and `GROUP_RESOURCE_TYPE`
+  with `GROUP_TYPE_ID`, `GROUP_MEMBERSHIP_RESOURCE_TYPE` with `GROUP_MEMBERSHIP_TYPE_ID`,
+  and `TENANT_RG_TYPE_PATH` with `TENANT_GROUP_TYPE_ID`. The migration updates
+  stored group type IDs in place.
+- Account Management user memberships now use `gts.cf.core.am.user.v1~`
+  instead of `gts.cf.core.rg.type.v1~cf.core.am.user.v1~`. Replace
+  `USER_RG_TYPE_CODE` with `USER_RESOURCE_TYPE`. Memberships stored under the
+  former type are not migrated: remove them before upgrading.
+- Placement and membership rules are no longer deny-by-default. A type
+  published without constraining `parent_type` or the membership
+  `resource_type` accepts root placement, any RG parent type and any active
+  member type. Resource Group does not check that a schema narrows anything.
+- Export custom definitions and publish their schemas through Types Registry
+  before upgrading. The irreversible migration drops local schemas and
+  placement rules while preserving `gts_type` keys, groups, memberships and
+  hierarchy. New links still require active registry types. Preflight rejects
+  membership IDs over 2600 UTF-8 bytes (`MAX_MEMBERSHIP_RESOURCE_ID_BYTES`).
+  See [Upgrading Resource Group](gears/system/resource-group/docs/DESIGN.md#upgrading-resource-group).
+
 ## [0.3.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-llm-gateway-sdk-v0.3.1...cf-gears-llm-gateway-sdk-v0.3.2) - 2026-11-18
 
 ### Other
