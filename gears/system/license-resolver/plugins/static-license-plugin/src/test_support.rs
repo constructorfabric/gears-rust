@@ -52,11 +52,7 @@ pub fn resource(id: Option<&str>, meta: Value) -> Resource {
 
 #[must_use]
 pub fn request_for(subject: Subject, resource: Resource, tenant_id: Uuid) -> LicenseCheckRequest {
-    let context = LicenseCheckContext::builder()
-        .tenant_id(tenant_id)
-        .build()
-        .expect("tenant is set");
-    LicenseCheckRequest::new(subject, resource, context)
+    LicenseCheckRequest::new(tenant_id, subject, resource, LicenseCheckContext::default())
 }
 
 /// The check the fixtures are built around: a named user against a named model.

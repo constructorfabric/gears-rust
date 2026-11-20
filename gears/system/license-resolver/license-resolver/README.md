@@ -6,11 +6,12 @@ Main gear for license checks in Gears. Validates every check against the licensi
 
 The `cf-gears-license-resolver` gear provides:
 
+- **Principal mapping** — Maps a principal subject (principal type + id) to the Subject contract type configured for its principal type or its nearest ancestor; an unmapped principal is not granted
 - **Contract validation** — Resolves the Subject / Resource contract types from types-registry and validates the request against them (schemas + `admitted_subjects`) before anything else runs
 - **Plugin discovery** — Finds license-resolver plugins via GTS types-registry
 - **Vendor-based selection** — Selects a plugin by vendor and priority, memoized after the first resolution
 - **Fail-closed semantics** — A non-conforming request, a missing plugin and an unreachable backend all yield an error; none of them can produce a granted decision
-- **ClientHub and REST** — Registers `LicenseResolverApi` in ClientHub and hosts it at `POST /license-resolver/v1/is-licensed` (internal, not exposed by the api-gateway)
+- **ClientHub and REST** — Registers `PlatformLicenseResolverApi` and `LicenseResolverApi` in ClientHub and hosts them at `POST /license-resolver/v1/platform/is-licensed` (service credential, platform services only) and `POST /license-resolver/v1/is-licensed` (bearer token, any authenticated principal, answers only about that principal)
 
 This is a **main gear** — it holds no grant store and decides no licensing question. It validates *shape and compatibility* and routes; what the contract properties mean, and whether the pair is licensed, belong to the plugin.
 
@@ -20,7 +21,7 @@ This is a **main gear** — it holds no grant store and decides no licensing que
 Consumer Gear
     │  projects its domain objects into registered contract types
     ▼
-LicenseResolverApi  (SDK contract: ClientHub in process, REST from another process)
+PlatformLicenseResolverApi / LicenseResolverApi  (SDK contracts: ClientHub in process, REST from another process)
     │
     ▼
 license-resolver gateway  (this crate — validates, then routes)
@@ -36,23 +37,30 @@ Plugin implementation  (holds the grant facts)
 ## Usage
 
 ```rust
-use license_resolver_sdk::{LicenseCheckContext, LicenseCheckRequest, LicenseResolverApi};
+use license_resolver_sdk::{
+    IsLicensedRequest, LicenseResolverApi, PlatformIsLicensedRequest, PlatformLicenseResolverApi,
+};
 use toolkit_security::PlatformSecurityContext;
 
-let resolver = hub.get::<dyn LicenseResolverApi>()?;
+// A platform service names the tenant and the subject; here, the user of its request.
+let platform = hub.get::<dyn PlatformLicenseResolverApi>()?;
+// `PlatformIsLicensedRequest::new(tenant_id, subject, resource)` names any other subject.
+let request = PlatformIsLicensedRequest::for_caller(&ctx, resource.clone());
 
-let request = LicenseCheckRequest::new(
-    subject,   // instance of your derived `gts.cf.core.lic.subj.v1~…` contract
-    resource,  // instance of your derived `gts.cf.core.lic.res.v1~…` contract
-    LicenseCheckContext::from_security_context(&ctx),
-);
-
-if resolver
+if platform
     .is_licensed(PlatformSecurityContext::outbound_marker(), request)
     .await?
     .granted {
     // allow
 }
+
+// End-user form: the caller asks about itself, for example to show or hide a feature.
+// The subject and the tenant come from `ctx`. A module that enforces a license checks
+// the user of its request on the platform plane, as above.
+let decision = hub
+    .get::<dyn LicenseResolverApi>()?
+    .is_licensed(ctx, IsLicensedRequest::new(resource))
+    .await?;
 ```
 
 A not-granted answer is `LicenseDecision { granted: false }`, not an error. Every error is a cannot-determine condition the caller must treat as not-granted — see the `LicenseResolverError` to `CanonicalError` mapping in the SDK.
@@ -84,7 +92,13 @@ gears:
   license-resolver:
     config:
       vendor: "constructorfabric"   # selects the backend plugin
+      principal_subject_types:      # principal type -> Subject contract type
+        "gts.cf.core.identity.principal.v1~cf.core.identity.user.v1~": "gts.cf.core.lic.subj.v1~acme.lic.licensing.user.v1~"
+        # legacy `subject_type` value, until the platform principal types are registered
+        "user": "gts.cf.core.lic.subj.v1~acme.lic.licensing.user.v1~"
 ```
+
+A principal type without an entry takes the entry of its nearest ancestor in types-registry. An exact entry applies to any value, including legacy ones such as `user` that types-registry does not know. A principal that is not mapped — no entry for its type or any ancestor, or no `subject_type` in the `SecurityContext` — gets `granted: false` with the diagnostic `reason: principal_not_mapped`, without validating the resource or calling the plugin. The mapped subject carries the principal id and empty `metadata`, so the target Subject contract must accept empty metadata.
 
 ## Telemetry
 

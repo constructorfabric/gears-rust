@@ -7,17 +7,21 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use license_resolver_sdk::{
-    LicenseCheckRequest, LicenseDecision, LicenseResolverPluginClient, LicenseResolverPluginSpecV1,
+    LicenseCheckContext, LicenseCheckRequest, LicenseDecision, LicenseResolverPluginClient,
+    LicenseResolverPluginSpecV1, PrincipalSubject, Resource, Subject, field,
 };
+use serde_json::Map;
 use toolkit::client_hub::{ClientHub, ClientScope};
 use toolkit::plugins::{GtsPluginSelector, choose_plugin_instance};
 use toolkit::telemetry::ThrottledLog;
 use toolkit_macros::domain_model;
 use tracing::info;
 use types_registry_sdk::{InstanceQuery, TypesRegistryClient};
+use uuid::Uuid;
 
 use super::error::DomainError;
 use super::ports::{CheckOutcome, LicenseMetrics, ViolationKind};
+use super::principal::PrincipalMapper;
 use super::validation::ContractValidator;
 
 const UNAVAILABLE_LOG_THROTTLE: Duration = Duration::from_secs(10);
@@ -29,18 +33,23 @@ const UNAVAILABLE_LOG_THROTTLE: Duration = Duration::from_secs(10);
 /// the metric's label space without limit.
 const UNVALIDATED_CONTRACT: &str = "unvalidated";
 
+const PRINCIPAL_NOT_MAPPED: &str = "principal_not_mapped";
+
 /// License resolver service.
 ///
-/// Validates each request against its registered licensing contracts, selects a
-/// backend plugin by vendor + priority, and delegates the check.
+/// Maps a principal subject to its Subject contract type, validates each request
+/// against its registered licensing contracts, selects a backend plugin by
+/// vendor + priority, and delegates the check.
 #[domain_model]
 pub struct Service {
     hub: Arc<ClientHub>,
     vendor: String,
     validator: ContractValidator,
+    principals: PrincipalMapper,
     metrics: Arc<dyn LicenseMetrics>,
     selector: GtsPluginSelector,
     unavailable_log_throttle: ThrottledLog,
+    mapping_log_throttle: ThrottledLog,
 }
 
 impl Service {
@@ -49,15 +58,18 @@ impl Service {
         hub: Arc<ClientHub>,
         vendor: String,
         validator: ContractValidator,
+        principals: PrincipalMapper,
         metrics: Arc<dyn LicenseMetrics>,
     ) -> Self {
         Self {
             hub,
             vendor,
             validator,
+            principals,
             metrics,
             selector: GtsPluginSelector::new(),
             unavailable_log_throttle: ThrottledLog::new(UNAVAILABLE_LOG_THROTTLE),
+            mapping_log_throttle: ThrottledLog::new(UNAVAILABLE_LOG_THROTTLE),
         }
     }
 
@@ -74,19 +86,27 @@ impl Service {
     ///   no backend, or an unreachable one. Never a granted decision.
     /// - Anything the selected backend surfaces, mapped through
     ///   [`DomainError::from_plugin`].
-    #[tracing::instrument(
-        skip_all,
-        fields(
-            tenant_id = %request.context.tenant_id,
-            resource_contract = %request.resource.gts_type,
-        )
-    )]
     pub async fn is_licensed(
         &self,
         request: LicenseCheckRequest,
     ) -> Result<LicenseDecision, DomainError> {
-        let started = Instant::now();
+        self.check(request, Instant::now()).await
+    }
 
+    /// [`is_licensed`](Self::is_licensed) with the resolver latency measured
+    /// from `started`, so a principal check includes its mapping.
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            tenant_id = %request.tenant_id,
+            resource_contract = %request.resource.gts_type,
+        )
+    )]
+    async fn check(
+        &self,
+        request: LicenseCheckRequest,
+        started: Instant,
+    ) -> Result<LicenseDecision, DomainError> {
         // Validation gates selection: a non-conforming request is refused on its
         // own terms, so the answer cannot depend on a backend being reachable.
         // The label is owned because the delegated call takes `request`.
@@ -133,6 +153,74 @@ impl Service {
             }
             Err(err) => Err(self.fail(&label, DomainError::from_plugin(&instance_id, err))),
         }
+    }
+
+    /// Answer whether the resource is licensed to the principal, mapped to its
+    /// Subject contract type with `id` and empty `metadata`. A principal that is
+    /// not mapped, or has a nil id or tenant, is not granted, without validating
+    /// the resource.
+    ///
+    /// # Errors
+    ///
+    /// [`DomainError::TypesRegistryUnavailable`] when the mapping cannot be
+    /// determined, otherwise as [`is_licensed`](Self::is_licensed).
+    pub async fn is_principal_licensed(
+        &self,
+        tenant_id: Uuid,
+        principal: PrincipalSubject,
+        resource: Resource,
+        context: LicenseCheckContext,
+    ) -> Result<LicenseDecision, DomainError> {
+        let started = Instant::now();
+        let PrincipalSubject {
+            principal_type,
+            id: principal_id,
+        } = principal;
+        let subject_type = if principal_id.is_nil() || tenant_id.is_nil() {
+            Ok(None)
+        } else {
+            self.principals.subject_type(&principal_type).await
+        };
+        if !matches!(subject_type, Ok(Some(_))) {
+            self.metrics
+                .record_resolver_latency(started.elapsed().as_secs_f64() * 1_000.0);
+        }
+        let Some(gts_type) = subject_type.map_err(|err| self.fail(UNVALIDATED_CONTRACT, err))?
+        else {
+            self.metrics
+                .record_check(UNVALIDATED_CONTRACT, CheckOutcome::PrincipalNotMapped);
+            return Ok(LicenseDecision::new(false).with_diagnostic("reason", PRINCIPAL_NOT_MAPPED));
+        };
+        let subject = Subject {
+            gts_type: gts_type.clone(),
+            id: Some(principal_id.to_string()),
+            metadata: Map::new(),
+        };
+        let result = self
+            .check(
+                LicenseCheckRequest::new(tenant_id, subject, resource, context),
+                started,
+            )
+            .await;
+        // The caller did not choose this subject type, the configuration did, so
+        // the operator needs to see a subject that its own contract rejects.
+        if let Err(DomainError::ContractViolation { violations }) = &result
+            && violations.iter().any(|v| {
+                v.field.starts_with(field::SUBJECT_FIELD)
+                    && !matches!(
+                        ViolationKind::from(v.reason.as_str()),
+                        ViolationKind::Other | ViolationKind::SubjectNotAdmitted
+                    )
+            })
+            && self.mapping_log_throttle.should_log()
+        {
+            tracing::warn!(
+                principal_type = %principal_type,
+                subject_type = %gts_type,
+                "principal_subject_types maps to a Subject contract type that the mapped subject does not conform to"
+            );
+        }
+        result
     }
 
     fn fail(&self, label: &str, err: DomainError) -> DomainError {

@@ -1355,11 +1355,12 @@ impl<R: GrantRepo> GrantService<R> {
         if !violations.is_empty() {
             return Err(DomainError::InvalidArgument(violations));
         }
-        let context = LicenseCheckContext::builder()
-            .tenant_id(ctx.subject_tenant_id())
-            .build()
-            .map_err(|e| DomainError::Internal(format!("check context: {e}")))?;
-        Ok(LicenseCheckRequest::new(req.subject, req.resource, context))
+        Ok(LicenseCheckRequest::new(
+            ctx.subject_tenant_id(),
+            req.subject,
+            req.resource,
+            LicenseCheckContext::default(),
+        ))
     }
 
     /// # Errors

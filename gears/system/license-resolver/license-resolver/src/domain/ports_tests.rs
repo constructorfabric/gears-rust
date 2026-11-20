@@ -63,6 +63,7 @@ fn check_outcome_labels_are_distinct() {
     let labels = [
         CheckOutcome::Granted,
         CheckOutcome::NotGranted,
+        CheckOutcome::PrincipalNotMapped,
         CheckOutcome::InvalidRequest,
         CheckOutcome::NoPlugin,
         CheckOutcome::Unavailable,

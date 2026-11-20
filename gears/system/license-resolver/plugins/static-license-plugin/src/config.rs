@@ -101,7 +101,7 @@ impl GrantRule {
             && matches_instance(self.subject_id.as_deref(), request.subject.id.as_deref())
             && self
                 .tenant_id
-                .is_none_or(|tenant_id| tenant_id == request.context.tenant_id)
+                .is_none_or(|tenant_id| tenant_id == request.tenant_id)
             && contains_all(&request.resource.metadata, &self.resource_metadata)
             && contains_all(&request.subject.metadata, &self.subject_metadata)
     }

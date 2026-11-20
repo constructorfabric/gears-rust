@@ -5,13 +5,15 @@
 //! answers exactly one question: *is this resource licensed to this subject
 //! right now?*
 //!
-//! - [`LicenseResolverApi`] — public API contract for consumers (the single
-//!   `is_licensed` check), in process or over REST ([`rest`]).
+//! - [`PlatformLicenseResolverApi`] — the check for a subject and tenant the
+//!   caller names (platform plane); [`LicenseResolverApi`] — the check for the
+//!   caller itself (tenant plane). In process or over REST ([`rest`]).
 //! - [`LicenseResolverPluginClient`] — plugin API trait for backend
 //!   implementations (mirrors the public signature).
-//! - [`LicenseCheckRequest`], [`LicenseDecision`] — the check input/output.
-//! - [`Subject`], [`Resource`], [`LicenseCheckContext`] — the contract objects
-//!   bundled into a request.
+//! - [`PlatformIsLicensedRequest`], [`IsLicensedRequest`], [`LicenseDecision`] —
+//!   the check inputs/output; [`LicenseCheckRequest`] — the plugin's input.
+//! - [`Subject`], [`PrincipalSubject`], [`Resource`], [`LicenseCheckContext`] —
+//!   the objects bundled into a request.
 //! - [`LicenseResolverError`] — the typed error enum of the plugin API, its
 //!   mapping to `CanonicalError`, and the violation vocabulary ([`field`]).
 //! - [`LicenseResolverPluginSpecV1`] — GTS plugin spec used for discovery.
@@ -26,10 +28,10 @@
 //! ## Usage
 //!
 //! ```ignore
-//! use license_resolver_sdk::LicenseResolverApi;
+//! use license_resolver_sdk::PlatformLicenseResolverApi;
 //! use toolkit_security::PlatformSecurityContext;
 //!
-//! let resolver = hub.get::<dyn LicenseResolverApi>()?;
+//! let resolver = hub.get::<dyn PlatformLicenseResolverApi>()?;
 //! let decision = resolver
 //!     .is_licensed(PlatformSecurityContext::outbound_marker(), request)
 //!     .await?;
@@ -45,16 +47,25 @@ pub mod models;
 pub mod plugin_api;
 pub mod rest;
 
-pub use api::{LicenseResolverApi, license_resolver_api_ir};
+pub use api::{
+    LicenseResolverApi, PlatformLicenseResolverApi, license_resolver_api_ir,
+    platform_license_resolver_api_ir,
+};
 pub use error::{FieldViolation, LicenseResolverError};
 pub use gts::{
     LicenseResolverPluginSpecV1, LicenseResourceV1, LicenseSubjectV1, LicenseTenantSubjectV1,
 };
 pub use models::{
-    LicenseCheckContext, LicenseCheckContextBuildError, LicenseCheckContextBuilder,
-    LicenseCheckRequest, LicenseDecision, Resource, Subject,
+    IsLicensedRequest, LicenseCheckContext, LicenseCheckRequest, LicenseDecision,
+    PlatformIsLicensedRequest, PrincipalSubject, Resource, Subject, SubjectInput,
 };
 pub use plugin_api::LicenseResolverPluginClient;
-pub use rest::{LicenseResolverApiRest, license_resolver_api_rest_http_binding};
+pub use rest::{
+    LicenseResolverApiRest, PlatformLicenseResolverApiRest, license_resolver_api_rest_http_binding,
+    platform_license_resolver_api_rest_http_binding,
+};
 #[cfg(feature = "rest-client")]
-pub use rest::{LicenseResolverApiRestClient, LicenseResolverApiRestResolvingClient};
+pub use rest::{
+    LicenseResolverApiRestClient, LicenseResolverApiRestResolvingClient,
+    PlatformLicenseResolverApiRestClient, PlatformLicenseResolverApiRestResolvingClient,
+};

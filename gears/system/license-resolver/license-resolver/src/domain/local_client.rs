@@ -4,17 +4,19 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use license_resolver_sdk::{
-    LicenseCheckRequest, LicenseDecision, LicenseResolverApi, LicenseResolverError,
+    IsLicensedRequest, LicenseCheckRequest, LicenseDecision, LicenseResolverApi,
+    LicenseResolverError, PlatformIsLicensedRequest, PlatformLicenseResolverApi, PrincipalSubject,
+    SubjectInput,
 };
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_macros::domain_model;
-use toolkit_security::PlatformSecurityContext;
+use toolkit_security::{PlatformSecurityContext, SecurityContext};
 
 use super::Service;
 
-/// Local client wrapping the license resolver service.
+/// Both public contracts over the license resolver service.
 ///
-/// Registered in `ClientHub` by the gear during `init()`.
+/// Registered in `ClientHub` for each by the gear during `init()`.
 #[domain_model]
 pub struct LicenseResolverLocalClient {
     svc: Arc<Service>,
@@ -28,14 +30,55 @@ impl LicenseResolverLocalClient {
 }
 
 #[async_trait]
-impl LicenseResolverApi for LicenseResolverLocalClient {
+impl PlatformLicenseResolverApi for LicenseResolverLocalClient {
     async fn is_licensed(
         &self,
         _ctx: PlatformSecurityContext,
-        request: LicenseCheckRequest,
+        request: PlatformIsLicensedRequest,
     ) -> Result<LicenseDecision, CanonicalError> {
+        let PlatformIsLicensedRequest {
+            tenant_id,
+            subject,
+            resource,
+            context,
+            ..
+        } = request;
+        match subject {
+            SubjectInput::License(subject) => {
+                self.svc
+                    .is_licensed(LicenseCheckRequest::new(
+                        tenant_id, subject, resource, context,
+                    ))
+                    .await
+            }
+            SubjectInput::Principal(principal) => {
+                self.svc
+                    .is_principal_licensed(tenant_id, principal, resource, context)
+                    .await
+            }
+        }
+        .map_err(|e| LicenseResolverError::from(e).into())
+    }
+}
+
+/// The caller's principal in the caller's tenant, checked as on the platform plane.
+#[async_trait]
+impl LicenseResolverApi for LicenseResolverLocalClient {
+    async fn is_licensed(
+        &self,
+        ctx: SecurityContext,
+        request: IsLicensedRequest,
+    ) -> Result<LicenseDecision, CanonicalError> {
+        let IsLicensedRequest {
+            resource, context, ..
+        } = request;
         self.svc
-            .is_licensed(request)
+            .is_principal_licensed(
+                ctx.subject_tenant_id(),
+                PrincipalSubject::from_security_context(&ctx),
+                resource,
+                context,
+            )
             .await
             .map_err(|e| LicenseResolverError::from(e).into())
     }

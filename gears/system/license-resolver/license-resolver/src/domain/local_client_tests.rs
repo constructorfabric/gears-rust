@@ -1,29 +1,68 @@
 //! Unit tests for the boundary the local client draws: domain errors become
 //! canonical errors, decisions pass through.
 
-use license_resolver_sdk::{LicenseResolverPluginClient, field};
+use license_resolver_sdk::{
+    LicenseResolverPluginClient, PrincipalSubject, Resource, Subject, SubjectInput, field,
+};
 use serde_json::json;
 use toolkit::client_hub::ClientHub;
 use toolkit_canonical_errors::Problem;
 
 use super::*;
 use crate::domain::ports::{LicenseMetrics, NoopMetrics};
+use crate::domain::principal::PrincipalMapper;
 use crate::domain::test_support::{
-    FakeContractRegistry, MODEL_USAGE_RESOURCE, MockPlugin, USER_SUBJECT, conforming_request,
-    empty_hub, hub_with_registry_and_plugin, request, resource, subject, test_instance_id,
+    FakeContractRegistry, MODEL_USAGE_RESOURCE, MockPlugin, SEAT_SUBJECT, USER_SUBJECT,
+    conforming_request, empty_hub, hub_with_registry_and_plugin, model_usage, principal_mapping,
+    resource, subject, test_instance_id, test_tenant,
 };
 use crate::domain::validation::ContractValidator;
+use uuid::Uuid;
 
 const VENDOR: &str = "constructorfabric";
 
 fn client(hub: Arc<ClientHub>, registry: FakeContractRegistry) -> LicenseResolverLocalClient {
+    let registry: Arc<dyn crate::domain::ContractRegistry> = Arc::new(registry);
     let svc = Arc::new(Service::new(
         hub,
         VENDOR.to_owned(),
-        ContractValidator::new(Arc::new(registry)),
+        ContractValidator::new(registry.clone()),
+        PrincipalMapper::new(principal_mapping(&[("user", SEAT_SUBJECT)]), registry),
         Arc::new(NoopMetrics) as Arc<dyn LicenseMetrics>,
     ));
     LicenseResolverLocalClient::new(svc)
+}
+
+fn platform(client: &LicenseResolverLocalClient) -> &dyn PlatformLicenseResolverApi {
+    client
+}
+
+fn tenant(client: &LicenseResolverLocalClient) -> &dyn LicenseResolverApi {
+    client
+}
+
+fn public(request: LicenseCheckRequest) -> PlatformIsLicensedRequest {
+    PlatformIsLicensedRequest::new(request.tenant_id, request.subject, request.resource)
+}
+
+fn check(subject: impl Into<SubjectInput>, resource: Resource) -> PlatformIsLicensedRequest {
+    PlatformIsLicensedRequest::new(test_tenant(), subject, resource)
+}
+
+fn caller(subject_type: Option<&str>) -> SecurityContext {
+    let builder = SecurityContext::builder()
+        .subject_id(Uuid::from_u128(7))
+        .subject_tenant_id(Uuid::from_u128(42));
+    match subject_type {
+        Some(subject_type) => builder.subject_type(subject_type),
+        None => builder,
+    }
+    .build()
+    .expect("valid security context")
+}
+
+fn seat_of(id: Uuid) -> Subject {
+    subject(SEAT_SUBJECT, Some(&id.to_string()), json!({}))
 }
 
 fn granting_plugin() -> Arc<dyn LicenseResolverPluginClient> {
@@ -36,10 +75,10 @@ async fn a_decision_passes_through_the_boundary() {
         hub_with_registry_and_plugin(&test_instance_id(), VENDOR, granting_plugin()),
         FakeContractRegistry::with_test_contracts(),
     );
-    let decision = client
+    let decision = platform(&client)
         .is_licensed(
             PlatformSecurityContext::outbound_marker(),
-            conforming_request(),
+            public(conforming_request()),
         )
         .await
         .expect("conforming check succeeds");
@@ -52,7 +91,7 @@ async fn a_contract_violation_becomes_invalid_request() {
         hub_with_registry_and_plugin(&test_instance_id(), VENDOR, granting_plugin()),
         FakeContractRegistry::with_test_contracts(),
     );
-    let req = request(
+    let req = check(
         subject(USER_SUBJECT, None, json!({ "category": 42 })),
         resource(
             MODEL_USAGE_RESOURCE,
@@ -60,7 +99,7 @@ async fn a_contract_violation_becomes_invalid_request() {
             json!({ "model_vendor": "openai", "model_name": "gpt-4o" }),
         ),
     );
-    let err = client
+    let err = platform(&client)
         .is_licensed(PlatformSecurityContext::outbound_marker(), req)
         .await
         .expect_err("a non-conforming request must be refused");
@@ -82,10 +121,10 @@ async fn a_contract_violation_becomes_invalid_request() {
 #[tokio::test]
 async fn an_unreachable_registry_becomes_service_unavailable() {
     let client = client(empty_hub(), FakeContractRegistry::with_test_contracts());
-    let err = client
+    let err = platform(&client)
         .is_licensed(
             PlatformSecurityContext::outbound_marker(),
-            conforming_request(),
+            public(conforming_request()),
         )
         .await
         .expect_err("no registry means no answer");
@@ -93,4 +132,73 @@ async fn an_unreachable_registry_becomes_service_unavailable() {
         matches!(err, CanonicalError::ServiceUnavailable { .. }),
         "expected ServiceUnavailable, got: {err:?}"
     );
+}
+
+#[tokio::test]
+async fn a_principal_subject_is_checked_as_its_mapped_subject() {
+    let plugin = MockPlugin::granting();
+    let client = client(
+        hub_with_registry_and_plugin(
+            &test_instance_id(),
+            VENDOR,
+            plugin.clone() as Arc<dyn LicenseResolverPluginClient>,
+        ),
+        FakeContractRegistry::with_test_contracts(),
+    );
+    let id = Uuid::from_u128(7);
+
+    let decision = platform(&client)
+        .is_licensed(
+            PlatformSecurityContext::outbound_marker(),
+            check(PrincipalSubject::new("user", id), model_usage()),
+        )
+        .await
+        .expect("mapped principal check succeeds");
+
+    assert!(decision.granted);
+    assert_eq!(plugin.seen()[0].subject, seat_of(id));
+}
+
+#[tokio::test]
+async fn the_tenant_plane_takes_subject_and_tenant_from_the_context() {
+    let plugin = MockPlugin::granting();
+    let client = client(
+        hub_with_registry_and_plugin(
+            &test_instance_id(),
+            VENDOR,
+            plugin.clone() as Arc<dyn LicenseResolverPluginClient>,
+        ),
+        FakeContractRegistry::with_test_contracts(),
+    );
+
+    let decision = tenant(&client)
+        .is_licensed(caller(Some("user")), IsLicensedRequest::new(model_usage()))
+        .await
+        .expect("tenant-plane check succeeds");
+
+    assert!(decision.granted);
+    let seen = plugin.seen();
+    assert_eq!(seen[0].subject, seat_of(Uuid::from_u128(7)));
+    assert_eq!(seen[0].tenant_id, Uuid::from_u128(42));
+}
+
+#[tokio::test]
+async fn a_caller_without_a_principal_type_is_not_granted() {
+    let plugin = MockPlugin::granting();
+    let client = client(
+        hub_with_registry_and_plugin(
+            &test_instance_id(),
+            VENDOR,
+            plugin.clone() as Arc<dyn LicenseResolverPluginClient>,
+        ),
+        FakeContractRegistry::with_test_contracts(),
+    );
+
+    let decision = tenant(&client)
+        .is_licensed(caller(None), IsLicensedRequest::new(model_usage()))
+        .await
+        .expect("an unmapped caller is a decision");
+
+    assert!(!decision.granted);
+    assert!(plugin.seen().is_empty());
 }

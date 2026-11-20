@@ -55,6 +55,9 @@ pub enum CheckOutcome {
     Granted,
     /// The backend answered `granted: false`.
     NotGranted,
+    /// A principal subject whose type has no mapping; not granted without a
+    /// backend.
+    PrincipalNotMapped,
     /// The request did not conform to its licensing contracts.
     InvalidRequest,
     /// No backend plugin is registered for the configured vendor.
@@ -73,6 +76,7 @@ impl CheckOutcome {
         match self {
             Self::Granted => "granted",
             Self::NotGranted => "not_granted",
+            Self::PrincipalNotMapped => "principal_not_mapped",
             Self::InvalidRequest => "invalid_request",
             Self::NoPlugin => "no_plugin",
             Self::Unavailable => "unavailable",

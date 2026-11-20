@@ -3,6 +3,7 @@
 pub mod error;
 pub mod local_client;
 pub mod ports;
+pub mod principal;
 pub mod service;
 pub mod validation;
 
@@ -16,5 +17,6 @@ pub use ports::{
     CheckOutcome, ContractRegistry, ContractRegistryError, LicenseMetrics, NoopMetrics,
     ViolationKind,
 };
+pub use principal::PrincipalMapper;
 pub use service::Service;
 pub use validation::ContractValidator;

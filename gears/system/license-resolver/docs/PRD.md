@@ -1,3 +1,7 @@
+---
+description: "Product requirements for the license resolver: one check that answers whether a resource is licensed to a subject right now, with the answer delegated to a backend plugin."
+---
+
 <!-- cpt:
 version: 1.0.0
 status: draft
@@ -45,9 +49,10 @@ system: cf
 ### 1.1 Purpose
 
 License Resolver is a read-only CF/Gears system module that answers a single question: *is a specific resource
-licensed (granted) to a specific subject right now?* Callers ask `is_licensed(request)` — a single `LicenseCheckRequest`
-carrying the subject and resource contract objects (each with schematized `metadata`) and the tenant context — and
-receive a yes/no decision plus structured, non-authoritative diagnostics (debug information about how the decision was
+licensed (granted) to a specific subject right now?* Callers ask `is_licensed(request)` — a single request carrying
+the tenant, the subject (a contract object or a principal), the resource contract object and the operation context
+(inputs that describe the operation being checked beyond its subject and resource, set by the caller) — and receive
+a yes/no decision plus structured, non-authoritative diagnostics (debug information about how the decision was
 reached). It is the authoritative point-in-time license check used by other modules to gate access.
 
 License Resolver owns no grant data; it delegates the lookup to a pluggable backend selected at runtime, mirroring
@@ -65,8 +70,9 @@ for it, no common GTS-typed identity, and no fail-closed guarantee to rely on wh
 A dedicated resolver consolidates the check behind one contract with consistent GTS-typed subject and resource
 identity and consistent deny semantics. Because grant facts live in heterogeneous backends owned by
 different vendors, the resolver must delegate the lookup rather than own a store — matching the proven authz-resolver /
-tenant-resolver delegation model. (Tenancy enters only as the isolation scope, carried in the request context that the
-caller derives from its `SecurityContext`.)
+tenant-resolver delegation model. (Tenancy enters only as the isolation scope: the tenant a trusted platform service — a
+CF module that calls with its own service credential rather than a user's token — names in the request, or the tenant
+of the calling principal.)
 
 Licensing is also split across levels: the Gear performing enforcement knows *where* a check belongs, while only the
 platform vendor — who composes a concrete platform out of Gears and a licensing backend — knows *what* must be
@@ -89,7 +95,8 @@ checks exist, which Subject/Resource pairs they involve, and which properties ar
 
 | Term                  | Definition                                                                                                                                                                                                                                                                                                                                           |
 |-----------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `LicenseCheckRequest` | A single object bundling the inputs of one check: the subject and resource contract objects and the tenant context. The contract's growth surface (new inputs are added as request fields).                                                                                                                                                          |
+| Check request         | A single object bundling the inputs of one check: the tenant, the subject (a Subject contract object or a principal), the resource contract object and the operation context (inputs that describe the operation being checked, set by the caller). The contract's growth surface (new inputs are added as request fields). A check for the calling principal itself omits the tenant and the subject. |
+| Principal             | Whoever authenticated: a person, a service account, a system actor. Its principal type (a GTS type) and id are in the caller's `SecurityContext`.                                                                                                                                                                                                    |
 | Licensing Contract    | A registered, versioned GTS type derived from the licensing base types, describing a Subject or Resource shape: identity fields plus the schema of its `metadata`; a Resource contract also declares which Subject types it admits. The set of a Gear's derived contract types is its published licensing surface.                                   |
 | Subject               | The "someone" a license is checked for — an instance of a derived Subject contract type, carrying its licensing contract type (required), an optional id (well-known name or UUID), and `metadata` conforming to the contract schema. Polymorphic — e.g. a tenant, a user, or any future subject type (the licensee is not restricted to tenants). |
 | Resource              | The licensable thing — an instance of a derived Resource contract type, carrying its licensing contract type (required), an optional instance id (well-known name or UUID), and `metadata` conforming to the contract schema. Without the id the check targets the whole resource type; with it, a specific resource.                             |
@@ -113,6 +120,14 @@ checks exist, which Subject/Resource pairs they involve, and which properties ar
 - **Role**: Composes a concrete platform out of Gears and a licensing backend, and defines the licensing rules. Does
   not call the check; reviews, approves, and authors rules against the licensing contracts that Gears expose,
   enumerating them via the types registry — without reading Gear source code.
+
+#### End User
+
+**ID**: `cpt-cf-license-resolver-actor-end-user`
+
+- **Role**: A person, or a UI that calls with that person's token, who asks whether they themselves are licensed for a
+  resource, for example to hide unlicensed features. Calls only the check whose subject and tenant come from their own
+  `SecurityContext`; its answer is a hint for the UI, not proof of a license.
 
 ### 2.2 System Actors
 
@@ -143,7 +158,7 @@ patterns are inherited from the project-wide architecture in
 
 - Point-in-time check of whether a resource — a specific instance or a whole resource type — is licensed to a single
   subject.
-- Tenant-scoped resolution via the request's tenant context (derived from the caller's `SecurityContext`).
+- Tenant-scoped resolution: the tenant named by a trusted platform service, or the tenant of the calling principal.
 - Typed licensing contracts: base Subject/Resource GTS types owned by this module, derived contract types registered by
   consuming Gears, and validation of every check request against the registered contracts before delegation.
 - GTS-typed identity inside the contracts (whole-type, named/well-known, and opaque).
@@ -172,12 +187,15 @@ patterns are inherited from the project-wide architecture in
 
 - [ ] `p1` - **ID**: `cpt-cf-license-resolver-fr-is-licensed-check`
 
-The system **MUST** provide a single check operation `is_licensed(request)` taking a `LicenseCheckRequest` — which
-bundles the subject (whom) and resource (what) contract objects — each carrying its schematized `metadata` — and the
-tenant context (the caller derives it from its `SecurityContext`) — and returning a decision indicating whether the
+The system **MUST** provide a single check operation `is_licensed(request)` taking a check request — which
+bundles the subject (whom), given as a Subject contract object or as a principal (see
+`cpt-cf-license-resolver-fr-principal-subject`), the resource (what) contract object — each contract object carrying its
+schematized `metadata` — the tenant, and the operation context — and returning a
+decision indicating whether the
 resource is licensed to the subject at the time of the call, together with structured, non-authoritative
 **diagnostics** (a string-keyed map of debug information about how the decision was reached — e.g. which backend
-answered, matched grant, denial cause).
+answered, matched grant, denial cause). The same check for the calling principal itself takes the caller's
+`SecurityContext` instead of the subject and the tenant (see `cpt-cf-license-resolver-fr-principal-subject`).
 Diagnostics are advisory only and **MUST NOT** be required for the caller to interpret the boolean outcome. The single
 request object is the contract's growth surface — new inputs are added as request fields, not as new parameters or
 method-signature changes. (See `cpt-cf-license-resolver-fr-evaluation-metadata` for the `metadata` field.)
@@ -194,9 +212,7 @@ Every Subject and Resource shape used in a license check **MUST** be a registere
 licensing base types owned by this module (under `gts.cf.core.lic.*`) — never an ad-hoc payload assembled at the call
 site. A module that wants license enforcement **MUST** register, before the check, both the Subject and Resource
 contract types it checks — as derivatives of the base types — together with the exact schema of the properties it
-supplies with each; a derived Resource type **MUST** declare which Subject types it admits. This module **MAY** provide
-helpers other modules use to register the reusable, well-known Subject types sourced from the `SecurityContext` (e.g.
-`user`, `tenant`).
+supplies with each; a derived Resource type **MUST** declare which Subject types it admits.
 
 - **Rationale**: Platform vendors author licensing rules against contracts, not against source code. A contract that
   exists only in a Gear's internals cannot be reviewed, approved, or relied upon.
@@ -214,15 +230,38 @@ Subject contract types **MUST** be open-ended — a license may be granted to a 
 type — and the resolver **MUST NOT** assume the subject is a tenant.
 This module owns the base Subject type. A module that wants license enforcement registers its derived Subject contract
 type — alongside its Resource contract type (see `cpt-cf-license-resolver-fr-contract-registration`) — as a derivative
-of the base type, projecting an externally-owned domain subject type. To ease reuse of the common subjects sourced from
-the `SecurityContext` (e.g. `user`, `tenant`), this module **MAY** provide helpers other modules use to register those
-well-known Subject types. The domain types themselves are owned by their modules and are neither defined nor
-referenced here — a contract projects from them, it does not name them.
+of the base type, projecting an externally-owned domain subject type. The tenant Subject type is well-known and owned
+by this module; Subject types for principals are chosen by the platform vendor (see
+`cpt-cf-license-resolver-fr-principal-subject`). The domain types themselves are owned by their modules and are neither
+defined nor referenced here — a contract projects from them, it does not name them.
 
 - **Rationale**: A GTS-typed, contract-carried subject identity is polymorphic and type-safe, supports licensing any
   subject kind, and makes the subject side of every check observable to platform vendors via the registered contract —
   while domain-type ownership stays with the modules that define those types.
 - **Actors**: `cpt-cf-license-resolver-actor-consuming-module`
+
+#### Principal Subject
+
+- [ ] `p1` - **ID**: `cpt-cf-license-resolver-fr-principal-subject`
+
+A **principal** is whoever authenticated; its **principal type** and id are in the caller's `SecurityContext`
+(`subject_type`, `subject_id`). The caller **MAY** give the subject of a check as a principal (principal type + id)
+instead of a Subject contract object. The system **MUST** map the principal type to a Subject contract type from its
+configuration, which the platform vendor sets: an entry for the principal type itself, or else for its nearest ancestor
+in the GTS type hierarchy. The mapped subject carries the principal id and empty `metadata`, and is then validated and
+delegated as any other subject. A principal type without a mapping **MUST** yield a not-granted decision.
+
+The system **MUST** also provide a check that takes the caller's `SecurityContext`, the resource and the operation
+context: the subject is the principal of that context and the tenant is the principal's tenant. The operation context
+comes from the caller, not from `SecurityContext`, which fixes only the subject and the tenant. This check **MUST**
+require authentication only, no policy permission: it answers only about the caller in its own tenant. Its answer is
+a hint for the caller: a module **MUST NOT** accept it as proof of a license. A module that gates an operation **MUST**
+build the check's resource and `metadata` from its own data, not from user input.
+
+- **Rationale**: The calling module knows the principal but not the platform vendor's Subject contract types; one
+  mapping in the resolver serves every caller, and backends keep receiving Subject contract types only.
+- **Actors**: `cpt-cf-license-resolver-actor-consuming-module`, `cpt-cf-license-resolver-actor-platform-vendor`,
+  `cpt-cf-license-resolver-actor-end-user`
 
 #### Resource Identity
 
@@ -355,12 +394,44 @@ systems (e.g. issuance or billing); how a backend sources or maintains grants is
 
 - [ ] `p1` - **ID**: `cpt-cf-license-resolver-nfr-read-latency`
 
-The `is_licensed` check **MUST** complete within 50ms at p95, measured at the resolver boundary excluding backend plugin
-processing time, under normal load.
+Once the plugin is resolved and the contract schemas are cached, the time the resolver adds to a check, excluding the
+plugin call, **MUST** be at most 50 ms at p95 while checks arrive at the backend's throughput threshold.
 
-- **Threshold**: 50ms p95 at the resolver boundary (excludes plugin compute), normal load.
+- **Threshold**: ≤ 50 ms p95 at the resolver boundary, plugin time excluded, at the backend's throughput threshold.
 - **Rationale**: The check sits on the access-granting path of consuming modules, so added latency directly impacts
   every gated request.
+- **Architecture Allocation**: See DESIGN.md § NFR Allocation for how this is realized.
+
+#### Throughput and Latency
+
+- [ ] `p1` - **ID**: `cpt-cf-license-resolver-nfr-throughput`
+
+Checks through the resolver **MUST** sustain the backend's throughput threshold. Once the plugin is resolved and the
+contract schemas are cached, and at that load, their p95 latency **MUST** be at most the backend's p95 latency
+threshold plus 50 ms.
+
+- **Threshold**: for a backend that states p95 ≤ B at N checks/s, checks through the resolver sustain N checks/s with
+  p95 ≤ B + 50 ms, measured at the resolver boundary. For the license-enforcement backend: 1 000 checks/s per node,
+  p95 ≤ 90 ms.
+- **Rationale**: Each backend states its own capacity and latency; the resolver must not lower either.
+- **Architecture Allocation**: See DESIGN.md § NFR Allocation for how this is realized.
+
+#### Availability
+
+- [ ] `p1` - **ID**: `cpt-cf-license-resolver-nfr-availability`
+
+Once the plugin of a check is resolved, the check **MUST** depend only on the plugin and on types-registry, which runs
+in the same process and answers from memory, so checks through the resolver meet the backend's availability target. At
+start the resolver calls no other gear: it checks only the form of its configuration. The plugin is resolved on the
+first check after start; a failed plugin resolution or registry lookup fails the check with `ServiceUnavailable`.
+
+A calling module **MUST** limit each check by its own deadline. It **MAY** retry a check that failed with
+`ServiceUnavailable` or ran past its deadline; a check changes nothing, so a retry is safe. If the check stays
+unavailable, the module treats it as not granted.
+
+- **Threshold**: availability of checks through the resolver is at least the backend's target, over the backend's
+  measurement period.
+- **Rationale**: The resolver fails closed, so a dependency it adds to a check would deny licensed access on its outage.
 - **Architecture Allocation**: See DESIGN.md § NFR Allocation for how this is realized.
 
 #### Fail-Closed on No Plugin
@@ -378,11 +449,12 @@ non-granted decision or an error, and **MUST NOT** grant by default — in 100% 
 
 - [ ] `p1` - **ID**: `cpt-cf-license-resolver-nfr-tenant-scoping`
 
-Every resolution **MUST** be scoped to the tenant carried by the request context (which the caller derives from its
-`SecurityContext`), with 0 cross-tenant grant leaks tolerated. Regardless of subject type, the subject is treated as
+Every resolution **MUST** be scoped to one tenant — the tenant a trusted platform service names in the request, or the
+tenant of the calling principal — with 0 cross-tenant grant leaks tolerated. Regardless of subject type, the subject is treated as
 bounded within that tenant (the current tenant-bounded model — see §11).
 
-- **Threshold**: 0 cross-tenant resolutions; tenant scope derived solely from the request context.
+- **Threshold**: 0 cross-tenant resolutions; the tenant is taken solely from the request (platform service) or from
+  the caller's `SecurityContext` (calling principal).
 - **Rationale**: Under the current model every license is tenant-bounded (a user belongs to a tenant), so the resolver
   enforces tenant isolation like other CF modules; a cross-tenant grant would expose another tenant's entitlements.
 - **Architecture Allocation**: See DESIGN.md § NFR Allocation for how this is realized.
@@ -399,17 +471,21 @@ bounded within that tenant (the current tenant-bounded model — see §11).
 
 - [ ] `p1` - **ID**: `cpt-cf-license-resolver-interface-client`
 
-- **Type**: Rust trait (`LicenseResolverApi`), available in process and over an internal REST endpoint
+- **Type**: Rust traits (`PlatformLicenseResolverApi`, `LicenseResolverApi`), available in process and over REST
 - **Stability**: stable
-- **Description**: The public client contract exposing the **single** method
-  `is_licensed(request: LicenseCheckRequest) -> LicenseDecision` — the point-in-time check of whether a resource is
-  licensed to a subject. A consumer in the same process calls it directly; a consumer in another process calls the
-  same method over REST. The REST endpoint is reachable only by platform services, not by external clients. 
-  `LicenseCheckRequest` bundles the Subject and Resource contract objects (instances of registered derived licensing 
-  types, each carrying its contract type + optional id + schematized `metadata`) and the tenant context 
-  (caller-derived from `SecurityContext`). A request that does not conform to its registered contracts is rejected 
-  with a validation error, distinct from a not-granted decision. There is no listing or enumeration method.
-- **Breaking Change Policy**: Major version bump required to change the `LicenseCheckRequest`/`LicenseDecision` shape (a
+- **Description**: The public client contract exposing the point-in-time check of whether a resource is licensed to a
+  subject, on two contracts: `PlatformLicenseResolverApi::is_licensed`, where a platform service names the tenant and
+  the subject, and `LicenseResolverApi::is_licensed`, whose subject and tenant come from the caller's
+  `SecurityContext`. A consumer in the same process calls them directly; a consumer in another process calls the same
+  methods over REST. Over REST, the platform contract is reachable only by platform services; the other is reachable
+  by any authenticated principal and answers only about that principal in its own tenant. The platform request
+  bundles the tenant, the subject — a Subject contract object or a principal — the Resource contract object
+  (instances of registered derived licensing types, each carrying its contract type + optional id + schematized
+  `metadata`) and the operation context; the other request carries the Resource contract object and the operation
+  context. A request that does not conform to its registered contracts
+  is rejected with a validation error, distinct from a not-granted decision. There is no listing or enumeration
+  method.
+- **Breaking Change Policy**: Major version bump required to change the request/`LicenseDecision` shape (a
   backward-compatible new optional request field is not breaking), the identity model (contract GTS type + optional
   instance id), or the decision/error semantics. Individual licensing contracts evolve under
   `cpt-cf-license-resolver-fr-contract-compatibility` (additive optional properties are non-breaking).
@@ -421,8 +497,9 @@ bounded within that tenant (the current tenant-bounded model — see §11).
 - [ ] `p2` - **ID**: `cpt-cf-license-resolver-contract-plugin`
 
 - **Direction**: required from backend plugin
-- **Protocol/Format**: In-process plugin trait (`LicenseResolverPluginClient`) with the same `is_licensed` request and
-  decision, discovered via the GTS types registry plugin spec.
+- **Protocol/Format**: In-process plugin trait (`LicenseResolverPluginClient`) with an `is_licensed` method over a
+  `LicenseCheckRequest` — the public request with the subject always a Subject contract object, a principal already
+  mapped — and the same decision, discovered via the GTS types registry plugin spec.
 - **Compatibility**: Plugin spec is GTS-versioned; the plugin contract tracks the public client contract's major
   version.
 
@@ -445,9 +522,12 @@ bounded within that tenant (the current tenant-bounded model — see §11).
    projecting the licensing-relevant fields from the data it has at hand (e.g. the resource from its domain objects,
    the subject from `SecurityContext`): each carries its contract GTS type (required), an optional id (a well-known
    name or UUID; omitted to check a whole resource type), and `metadata` conforming to the contract schema.
-2. Module assembles a `LicenseCheckRequest` with the two contract objects and the tenant context derived from its
-   `SecurityContext`, and calls `is_licensed(request)`.
-3. Resolver validates the request against the registered contracts (schemas + admitted subject types).
+2. Module assembles a check request with the tenant, the two contract objects and the operation context, and calls
+   `is_licensed(request)`. To check the user of its request, the module passes the user's principal and tenant, read
+   from its `SecurityContext`, instead of a Subject contract object; an end user calls the `SecurityContext` form with
+   the resource and the operation context.
+3. Resolver maps a principal to its Subject contract type and validates the request against the registered contracts
+   (schemas + admitted subject types).
 4. Resolver selects the backend plugin via the GTS registry and delegates the check, forwarding the request unchanged.
 5. Resolver returns a decision (granted true/false plus diagnostics).
 6. Module enforces the decision.
@@ -461,6 +541,8 @@ bounded within that tenant (the current tenant-bounded model — see §11).
 - **Request does not conform to its registered contracts** (schema mismatch, missing contract type, subject type not
   admitted): Resolver rejects with a validation error before delegation — fail-closed, never evaluated; the module
   denies access.
+- **Principal type has no mapping**: Resolver returns not-granted without consulting the backend; the module denies
+  access.
 - **No plugin available / backend unreachable**: Resolver fails closed — returns not-granted or an error; the module
   denies access.
 
@@ -474,8 +556,8 @@ bounded within that tenant (the current tenant-bounded model — see §11).
   licensing base types), with per-contract property schemas and admitted subject types.
 - [ ] No listing or enumeration capability exists in the public contract.
 - [ ] When no backend plugin is available, the resolver never grants by default.
-- [ ] All resolutions are tenant-scoped via the request context (derived from `SecurityContext`) with no cross-tenant
-  leakage.
+- [ ] All resolutions are scoped to one tenant (named by a platform service or taken from the caller's
+  `SecurityContext`) with no cross-tenant leakage.
 - [ ] Backend selection is performed by GTS registry discovery (vendor + priority) with no resolver-owned grant store.
 
 ## 10. Dependencies
@@ -483,7 +565,7 @@ bounded within that tenant (the current tenant-bounded model — see §11).
 | Dependency                            | Description                                                                                              | Criticality |
 |---------------------------------------|----------------------------------------------------------------------------------------------------------|-------------|
 | GTS types registry (`types-registry`) | Backend plugin discovery (by GTS plugin spec); registration and schema resolution of licensing contracts | p1          |
-| `SecurityContext`                     | Source of the request's tenant context (built by the caller)                                             | p1          |
+| `SecurityContext`                     | Source of the principal and its tenant: read by the calling module, or by the resolver for a check of the calling principal | p1          |
 | Backend license plugin                | Holds grant facts and answers the delegated check                                                        | p1          |
 
 ## 11. Assumptions
@@ -493,27 +575,30 @@ bounded within that tenant (the current tenant-bounded model — see §11).
   contract to its domain type is deferred (ADR-0001).
 - The licensing base types are owned by this module under `gts.cf.core.lic.*`; a module that wants license enforcement
   registers its derived Subject and Resource contract types before checks are made.
-- This module **MAY**, at some stage, provide a set of helpers that other modules use to register the reusable,
-  well-known Subject contract types sourced from the `SecurityContext` (e.g. `user`, `tenant`), so common subjects need
-  not be re-declared by each module.
+- Principal types form a GTS hierarchy registered in the types registry; until it is registered, a principal type is
+  mapped only by an exact configuration entry.
 - At least one backend plugin is registered in environments where license checks are expected to grant.
-- Contract schemas are resolvable from the types registry and cacheable; the registry is available at bootstrap and its
-  schema reads are not on the per-check hot path (cached).
+- Contract schemas are resolvable from the types registry, which runs in the same process as the resolver and serves
+  them from its cache over an in-memory store, so a schema read on each check adds no network call.
 - **Tenant-bounded grants (current model)**: at this stage, every license is assumed to be bounded within a single
   tenant — regardless of subject type, the subject (e.g. a user) belongs to a tenant — and the resolver enforces tenant
-  isolation via the request's tenant context (derived from `SecurityContext`) as other CF modules do. Cross-tenant or
+  isolation via the tenant of each check as other CF modules do. Cross-tenant or
   tenant-independent licensing is not
   modeled yet; lifting this assumption would be a future, explicitly-versioned contract change.
 
 ## 12. Risks
 
-| Risk                                            | Impact                                                  | Mitigation                                                                                                                                    |
-|-------------------------------------------------|---------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------|
-| No backend plugin registered in an environment  | All checks deny, blocking legitimate access             | Fail-closed by design; surface a clear `NoPluginAvailable` signal for operability.                                                            |
-| Backend latency degrades the check              | Slows every gated request in consuming modules          | Boundary p95 NFR; consuming modules may apply their own timeouts/fallbacks.                                                                   |
-| Misreferenced contract type path                | Check resolves against the wrong contract               | Engine validates the request against the registered contract; the backend licensing service validates licensability and denies unknown types. |
-| Contract drift (Gear code vs registered schema) | Checks start failing validation after a Gear change     | Engine-side validation surfaces drift immediately and fail-closed; additive-optional evolution is non-breaking by rule.                       |
-| Contract governance overhead                    | New licensable surfaces require registration and review | The review point is the feature; per-Gear contract count is small and bounded by its distinct licensable surfaces.                            |
+| Risk                                             | Impact                                                       | Mitigation                                                                                                                                    |
+|--------------------------------------------------|--------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------|
+| No backend plugin registered in an environment   | All checks deny, blocking legitimate access                  | Fail-closed by design; surface a clear `NoPluginAvailable` signal for operability.                                                            |
+| Backend latency degrades the check               | Slows every gated request in consuming modules               | Boundary p95 NFR; consuming modules may apply their own timeouts/fallbacks.                                                                   |
+| Misreferenced contract type path                 | Check resolves against the wrong contract                    | Engine validates the request against the registered contract; the backend licensing service validates licensability and denies unknown types. |
+| Contract drift (Gear code vs registered schema)  | Checks start failing validation after a Gear change          | Engine-side validation surfaces drift immediately and fail-closed; additive-optional evolution is non-breaking by rule.                       |
+| Contract governance overhead                     | New licensable surfaces require registration and review      | The review point is the feature; per-Gear contract count is small and bounded by its distinct licensable surfaces.                            |
+| A platform service checks the wrong subject      | Access is granted or denied on another subject's license     | Only platform services can name a subject; the principal of a user request comes from its `SecurityContext` (SDK helper).                     |
+| Any platform service learns the license status of any subject | The resolver performs no policy check, so the license status of any subject in any tenant is disclosed to any service that holds a platform credential | The platform contract is reachable only by platform services. A backend plugin **MAY** authorize a check by the tenant, subject and resource it receives, for example through authz-resolver; the plugin receives no caller identity, so its decision cannot depend on the calling service. Authorization of the calling service is tracked in #6037. |
+| End-user checks load the backend                 | Checks on the caller's own context compete with checks that gate operations for plugin capacity; a gating check that fails is treated as not granted | No rate limit per caller yet: a `#[toolkit::rest_contract]` route cannot name a throttling zone, and the api-gateway binds zones only through the route's operation, not by path (toolkit gap). A deployment may limit the path in a proxy in front of the api-gateway. |
+| A module gates an operation by a check built from user input | The user names a resource or `metadata` that is licensed and gets an operation on another one | The module builds the resource and `metadata` from its own data. The answer to an end user's own check is a hint for the UI; a module never accepts it as proof of a license (`cpt-cf-license-resolver-fr-principal-subject`). |
 
 ## 13. Open Questions
 
