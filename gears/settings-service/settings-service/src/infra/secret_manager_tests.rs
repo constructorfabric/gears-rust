@@ -478,3 +478,32 @@ async fn a_gate_refusal_counts_one_authz_denial_under_read_and_a_permit_counts_n
     assert!(matches!(err, DomainError::Unauthorized { .. }), "{err:?}");
     assert_eq!(metrics.denials(), vec![("read", "denied")]);
 }
+
+#[tokio::test]
+async fn the_gate_asks_read_on_the_value_resource_naming_the_declaration() {
+    // What a policy is matched against when the machine path resolves a
+    // secret: one question, `read` on the value resource type, naming the
+    // declaration whose secret is resolved.
+    use crate::domain::ports::SecretResolveGate;
+    use crate::test_support::{RecordingPdp, context_for, enforcer_over};
+
+    let pdp = Arc::new(RecordingPdp::default());
+    let gate = super::PepSecretGate::new(
+        Arc::new(enforcer_over(&pdp)),
+        Arc::new(crate::domain::ports::NoMetrics),
+    );
+    let declaration_id = Uuid::from_u128(0xdec1);
+    gate.may_resolve(&context_for(Uuid::new_v4()), declaration_id)
+        .await
+        .expect("permitted");
+
+    let asked = pdp.take();
+    assert_eq!(asked.len(), 1, "one question");
+    let request = &asked[0];
+    assert_eq!(
+        request.resource.resource_type,
+        settings_service_sdk::gts::VALUE_SCHEMA
+    );
+    assert_eq!(request.action.name, "read");
+    assert_eq!(request.resource.id, Some(declaration_id));
+}

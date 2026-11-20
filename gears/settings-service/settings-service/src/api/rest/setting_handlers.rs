@@ -13,7 +13,7 @@ use toolkit_odata::{CursorV1, ODataQuery, PageInfo};
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
-use crate::api::authz::{self, resource};
+use crate::api::authz::{Permission, PermissionEnforcer};
 use crate::api::rest::browse_narrowing::{
     browse_binding, candidate_batch, page_size, value_part_matches,
 };
@@ -29,13 +29,12 @@ use crate::domain::declaration::{BrowseNarrowing, Declaration};
 use crate::domain::error::DomainError;
 use crate::domain::ports::SecurityMetrics;
 use crate::domain::resolution::{EffectiveValue, SUBTREE_BUDGET, ScopeTarget, subtree_too_large};
-use crate::domain::search::{Corpus, Needle};
+use crate::domain::search::service::declaration_match;
+use crate::domain::search::{Corpus, MatchedField, Needle};
 use crate::domain::value::{ReviewRequest, review_binding};
 use crate::field;
 use crate::gear::ConcreteResolver;
 use crate::log_text::LogSafe;
-
-const READ: authz::Operation = authz::Operation::Read;
 
 /// The optional `tenant` query parameter: the target scope as a tenant id.
 #[derive(Debug, Default, Deserialize)]
@@ -56,6 +55,68 @@ pub struct BrowseParams {
     /// Free text narrowing the page; trimmed, 2..200 characters.
     #[serde(default)]
     pub q: Option<String>,
+}
+
+/// The query parameters of the history read: the target tenant and whether
+/// the tenants below it are read with it.
+#[derive(Debug, Default, Deserialize)]
+pub struct HistoryParams {
+    /// The target tenant's id, a UUID, as [`TenantParam::tenant`].
+    #[serde(default)]
+    pub tenant: Option<String>,
+    /// `true` for the history of the target and of every tenant below it that
+    /// administration from the target reaches, in one list; `false` or
+    /// omitted, the target's own scope alone.
+    #[serde(default)]
+    pub descendants: Option<String>,
+}
+
+/// Parses the optional `descendants` query parameter: `true` or `false`,
+/// omitted meaning `false`. Anything else is refused rather than read as one
+/// of the two — the modes answer different sets, and a caller whose spelling
+/// was guessed at would page the wrong one without a sign.
+fn parse_descendants(raw: Option<&str>) -> Result<bool, DomainError> {
+    match raw {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(raw) => Err(DomainError::Validation {
+            field: "descendants".to_owned(),
+            code: field::VALIDATION,
+            message: format!("`{raw}` is not a boolean; `descendants` takes `true` or `false`"),
+        }),
+    }
+}
+
+/// The path from the reader tenant down to one history record's tenant, which
+/// the identity rule reads.
+///
+/// `to_target` is the path from the reader down to the target. A record at
+/// the target is on that path; a record below it extends the path by the
+/// walk's parent links from the target down to the record's tenant. A
+/// definition record has no tenant and is on no path. A tenant that is
+/// neither the target nor one the walk reached is on no path either: the page
+/// query lists only the walk's tenants, so this does not happen, and if it
+/// did the actor would be withheld rather than shown on the target's path.
+fn record_path(
+    to_target: &[Uuid],
+    target: Uuid,
+    walk: Option<&crate::domain::resolution::Subtree>,
+    record_tenant: Option<Uuid>,
+) -> Vec<Uuid> {
+    let Some(tenant) = record_tenant else {
+        return Vec::new();
+    };
+    if tenant == target {
+        return to_target.to_vec();
+    }
+    match walk {
+        Some(walk) if walk.contains(tenant) => {
+            let mut path = to_target.to_vec();
+            path.extend(walk.path_from(target, tenant).into_iter().skip(1));
+            path
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Parses the optional `tenant` query parameter; absent or empty means "not given".
@@ -149,10 +210,10 @@ pub(crate) async fn target_chain(
 /// governs — a `pii` value, or a setter identity, which is an
 /// administrator's and so PII as the audit actor is.
 pub(crate) async fn may_read_pii(
-    enforcer: &authz_resolver_sdk::PolicyEnforcer,
+    enforcer: &PermissionEnforcer,
     ctx: &SecurityContext,
 ) -> Result<bool, DomainError> {
-    authz::may_read_unmasked(enforcer, ctx).await
+    enforcer.may_read_unmasked(ctx).await
 }
 
 // @cpt-dod:cpt-cf-settings-service-dod-value-resolution-rest-read-surface:p1
@@ -168,7 +229,7 @@ pub async fn get_setting(
     Extension(ctx): Extension<SecurityContext>,
     Extension(resolver): Extension<Arc<ConcreteResolver>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
-    Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(enforcer): Extension<Arc<PermissionEnforcer>>,
     Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Path(key): Path<String>,
     Query(params): Query<TenantParam>,
@@ -181,15 +242,9 @@ pub async fn get_setting(
     // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-read:p1:inst-vr-aread-3
     // A denied or unobtainable decision is a denial: `access_scope` maps both
     // to the unauthorized outcome, which answers 403.
-    let scope = authz::access_scope(
-        &enforcer,
-        security.as_ref(),
-        &ctx,
-        &resource::VALUE,
-        READ,
-        None,
-    )
-    .await?;
+    let scope = enforcer
+        .access_scope(security.as_ref(), &ctx, Permission::ValueRead, None)
+        .await?;
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-read:p1:inst-vr-aread-3
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-read:p1:inst-vr-aread-2
     let target = gate_target(&resolver, &ctx, requested).await?;
@@ -322,6 +377,36 @@ struct NarrowedBrowse<'a> {
     postgres: bool,
 }
 
+/// What the database's match on a candidate's own text comes to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextMatch {
+    /// The declaration's text did not match.
+    No,
+    /// It matched, and no field can be named: the database folds letter case
+    /// its own way, so a match it finds is not always found again in any one
+    /// field here. The candidate is kept and no field is guessed for it.
+    Unnamed,
+    /// It matched in this field.
+    In(MatchedField),
+}
+
+impl TextMatch {
+    const fn matched(self) -> bool {
+        !matches!(self, Self::No)
+    }
+
+    const fn field(self) -> Option<MatchedField> {
+        match self {
+            Self::In(field) => Some(field),
+            Self::No | Self::Unnamed => None,
+        }
+    }
+}
+
+/// What a candidate carries beside its declaration: what its text match came
+/// to, and its place in the listing.
+type CandidateMark = (TextMatch, CursorV1);
+
 /// A row the narrowing kept, with its place in the listing.
 struct KeptRow {
     item: SettingItemDto,
@@ -329,22 +414,27 @@ struct KeptRow {
     position: CursorV1,
 }
 
-/// Whether a candidate qualifies, and if so its entry.
+/// Whether a candidate qualifies, and if so its entry, naming the field that
+/// matched.
 ///
-/// By its declaration text, or by the value or fallback the caller receives
-/// unmasked. A `retired` candidate qualifies by its text alone. A candidate
-/// whose value could not be read because a dependency is unavailable, and
-/// whose value the caller would have seen unmasked, cannot be decided: the
-/// whole request is refused with that failure rather than paged through. One
-/// that fails on its own keeps its `error` entry under the same condition, so
-/// a defect is never hidden behind the narrowing; a value the caller could
-/// never match leaves the decision to the text.
+/// By its declaration text — `text`, with the field that match is attributed
+/// to when one can be named — or by the value or fallback the caller receives
+/// unmasked, reported as `value`; the text comes first, as in the search's
+/// order. A text match no field names keeps the candidate and reports `value`
+/// when the shown value matches too, else no field at all. A `retired` candidate qualifies by its text alone. A
+/// candidate whose value could not be read because a dependency is
+/// unavailable, and whose value the caller would have seen unmasked, cannot
+/// be decided: the whole request is refused with that failure rather than
+/// paged through. One that fails on its own keeps its `error` entry under the
+/// same condition, so a defect is never hidden behind the narrowing — an entry
+/// nothing matched, which names no field; a value the caller could never
+/// match leaves the decision to the text.
 ///
 /// # Errors
 /// The `Unavailable` failure of an undecidable candidate.
 fn qualify(
     declaration: &Declaration,
-    text_matched: bool,
+    text: TextMatch,
     outcome: Result<Arc<EffectiveValue>, DomainError>,
     needle: &Needle,
     pii: bool,
@@ -357,21 +447,30 @@ fn qualify(
         Ok(effective) => {
             // Rendered once: the entry is this rendering, kept or not.
             let dto = render(&effective, pii, reader, chain);
-            let qualifies =
-                text_matched || value_part_matches(&dto, effective.secret_backed, needle);
-            Ok(qualifies.then(|| {
+            // `value` is named only through `value_part_matches`, which a
+            // masked value never passes: the field never tells of content the
+            // caller is not shown.
+            let field = text.field().or_else(|| {
+                value_part_matches(&dto, effective.secret_backed, needle)
+                    .then_some(MatchedField::Value)
+            });
+            Ok((text.matched() || field.is_some()).then(|| {
                 (
                     SettingItemDto::resolved(dto)
                         .with_mode(&declaration.mode)
-                        .with_display_name(declaration.display_name.as_deref()),
+                        .with_display_name(declaration.display_name.as_deref())
+                        .with_matched_field(field),
                     None,
                 )
             }))
         }
-        Err(err @ DomainError::Unavailable { .. }) if !text_matched && readable => Err(err),
+        Err(err @ DomainError::Unavailable { .. }) if !text.matched() && readable => Err(err),
         Err(err) => {
-            let keep = text_matched || (readable && matches!(err, DomainError::Internal { .. }));
-            Ok(keep.then(|| browse_entry(declaration, Err(err), pii, reader, chain)))
+            let keep = text.matched() || (readable && matches!(err, DomainError::Internal { .. }));
+            Ok(keep.then(|| {
+                let (item, diagnostic) = browse_entry(declaration, Err(err), pii, reader, chain);
+                (item.with_matched_field(text.field()), diagnostic)
+            }))
         }
     }
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-11
@@ -433,10 +532,27 @@ async fn narrowed_page<C: toolkit_db::secure::DBRunner>(
             batch.page_info.next_cursor.clone()
         };
         // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-12-match
-        let (declarations, marks): (Vec<Declaration>, Vec<(bool, CursorV1)>) = batch
+        // A candidate whose text matched is attributed here, by the search's
+        // own attribution and in its order, from the category names the batch
+        // read brought with it. Where that names no field the candidate is
+        // kept without one: the search's fallback attribution is not applied.
+        let (declarations, marks): (Vec<Declaration>, Vec<CandidateMark>) = batch
             .items
             .into_iter()
-            .map(|c| (c.declaration, (c.text_matched, c.position)))
+            .map(|c| {
+                let text = if c.text_matched {
+                    declaration_match(
+                        &c.declaration,
+                        c.category_name.as_deref(),
+                        ctx.needle,
+                        narrowing.corpus,
+                    )
+                    .map_or(TextMatch::Unnamed, TextMatch::In)
+                } else {
+                    TextMatch::No
+                };
+                (c.declaration, (text, c.position))
+            })
             .unzip();
         let outcomes = resolver
             .resolve_declarations(conn, &declarations, ctx.target)
@@ -445,10 +561,10 @@ async fn narrowed_page<C: toolkit_db::secure::DBRunner>(
         if backward {
             rows.reverse();
         }
-        for ((declaration, (text_matched, position)), outcome) in rows {
+        for ((declaration, (text, position)), outcome) in rows {
             let qualified = match qualify(
                 declaration,
-                text_matched,
+                text,
                 outcome,
                 ctx.needle,
                 ctx.pii,
@@ -550,7 +666,7 @@ pub async fn browse_settings(
     Extension(ctx): Extension<SecurityContext>,
     Extension(resolver): Extension<Arc<ConcreteResolver>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
-    Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(enforcer): Extension<Arc<PermissionEnforcer>>,
     Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Query(params): Query<BrowseParams>,
     OData(query): OData,
@@ -575,15 +691,9 @@ pub async fn browse_settings(
     // secure scope, so a setting the caller may not read is absent from the
     // page and from the count and the page still comes back full — the
     // candidate batch, its evaluation and the refill happen in the query.
-    let scope: AccessScope = authz::access_scope(
-        &enforcer,
-        security.as_ref(),
-        &ctx,
-        &resource::VALUE,
-        READ,
-        None,
-    )
-    .await?;
+    let scope: AccessScope = enforcer
+        .access_scope(security.as_ref(), &ctx, Permission::ValueRead, None)
+        .await?;
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-3
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-2
     let target = gate_target(&resolver, &ctx, requested).await?;
@@ -769,7 +879,7 @@ pub async fn list_review(
     Extension(ctx): Extension<SecurityContext>,
     Extension(resolver): Extension<Arc<ConcreteResolver>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
-    Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(enforcer): Extension<Arc<PermissionEnforcer>>,
     Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Query(params): Query<TenantParam>,
     OData(query): OData,
@@ -802,15 +912,9 @@ pub async fn list_review(
     // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-review-list:p1:inst-vr-review-2
     // One decision on the value resource for the whole page; its constraints
     // narrow the settings the rows may belong to, in the page query.
-    let scope: AccessScope = authz::access_scope(
-        &enforcer,
-        security.as_ref(),
-        &ctx,
-        &resource::VALUE,
-        READ,
-        None,
-    )
-    .await?;
+    let scope: AccessScope = enforcer
+        .access_scope(security.as_ref(), &ctx, Permission::ValueRead, None)
+        .await?;
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-review-list:p1:inst-vr-review-2
     // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-review-list:p1:inst-vr-review-3
     let target = gate_target(&resolver, &ctx, requested).await?;
@@ -932,14 +1036,24 @@ mod setting_handlers_tests;
 
 // @cpt-dod:cpt-cf-settings-service-dod-audit-store-history-read:p1
 /// `GET /settings-service/v1/settings/{key}/history?tenant={tenant_id}` with
-/// `limit` and `cursor`.
+/// `limit`, `cursor` and `descendants`.
+///
+/// Without `descendants` the history of the one `(setting, tenant)` scope.
+/// With `descendants=true` the records of the target and of every tenant
+/// below it that administration from the target reaches — standalone
+/// subtrees left out — in one list, newest first; the target is gated and
+/// each record rendered exactly as in the single-scope read, and no total is
+/// reported.
 ///
 /// # Errors
-/// 400 on a malformed key or `tenant`, or on `$filter`, `$orderby` or `$select`,
-/// which the history does not take; 403 when the caller may not read values or
-/// the target is outside its subtree or standalone; 404 when no declaration
-/// exists at the key or it is outside the caller's administrative domain; 503
-/// when the store cannot answer.
+/// 400 on a malformed key, `tenant` or `descendants`, on `$filter`, `$orderby`
+/// or `$select`, which the history does not take, on a cursor minted for
+/// another history or the other mode, or, with `descendants=true`, on a
+/// subtree past the budget; 403 when the caller may not read values or the
+/// target is outside its subtree or standalone; 404 when no declaration exists
+/// at the key, it is outside the caller's administrative domain or it is
+/// hidden from the caller; 500 when the database fails the history's page
+/// read; 503 when the tenant hierarchy or another dependency cannot answer.
 #[allow(
     clippy::too_many_arguments,
     reason = "one extractor per extension the handler reads"
@@ -948,16 +1062,17 @@ pub async fn get_history(
     Extension(ctx): Extension<SecurityContext>,
     Extension(resolver): Extension<Arc<ConcreteResolver>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
-    Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(enforcer): Extension<Arc<PermissionEnforcer>>,
     Extension(names): Extension<Arc<crate::infra::actor_names::ActorNameResolver>>,
     Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Path(key): Path<String>,
-    Query(params): Query<TenantParam>,
+    Query(params): Query<HistoryParams>,
     OData(query): OData,
 ) -> ApiResult<impl IntoResponse> {
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-1
     let key = parse_key(&key)?;
     let requested = parse_tenant(params.tenant.as_deref())?;
+    let with_descendants = parse_descendants(params.descendants.as_deref())?;
     if query.filter.is_some() || !query.order.0.is_empty() || query.select.is_some() {
         return Err(unsupported(
             "history takes `limit` and `cursor` only; it is always newest first",
@@ -967,15 +1082,9 @@ pub async fn get_history(
     // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-1
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-2
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-3
-    let scope = authz::access_scope(
-        &enforcer,
-        security.as_ref(),
-        &ctx,
-        &resource::VALUE,
-        READ,
-        None,
-    )
-    .await?;
+    let scope = enforcer
+        .access_scope(security.as_ref(), &ctx, Permission::ValueRead, None)
+        .await?;
     // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-3
     // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-2
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-4
@@ -1002,7 +1111,7 @@ pub async fn get_history(
         })?;
     // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-5
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-6
-    // Hidden from the target tenant: 404 rather than 403, so a hidden setting's
+    // Hidden from the caller: 404 rather than 403, so a hidden setting's
     // existence is not disclosed through its history either.
     let caller = ScopeTarget::Tenant(ctx.subject_tenant_id()).normalize(root);
     if resolver
@@ -1016,51 +1125,89 @@ pub async fn get_history(
         .into());
     }
     // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-6
-    let page = crate::infra::storage::audit_store::AuditStore::history(
-        &conn,
-        &scope,
-        key.as_str(),
-        target.tenant_id(root),
-        &query,
-    )
-    .await?;
+    let target_tenant = target.tenant_id(root);
+    // One scope, or the target with the tenants below it. The second is asked
+    // for only after the checks above, so a setting the caller may not see
+    // answers 404 whatever the size of the subtree.
+    let (records, page_info, walk) = if with_descendants {
+        // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-7
+        // The tenants administration from the target reaches, standalone
+        // subtrees left out by the hierarchy, and at most the subtree budget
+        // of them: a list the budget cut would leave records out silently, so
+        // the request is refused with the bound named, as the review listing
+        // refuses it. The walk's parent links are kept: they are the path from
+        // the target down to each record's tenant, which the identity rule
+        // reads.
+        let walk = resolver
+            .hierarchy()
+            .subtree(target_tenant, SUBTREE_BUDGET)
+            .await?;
+        if walk.truncated {
+            return Err(subtree_too_large("tenant", "target's").into());
+        }
+        // No total: counting would read every record of the subtree.
+        let page = crate::infra::storage::audit_store::AuditStore::history_subtree(
+            &conn,
+            &scope,
+            key.as_str(),
+            target_tenant,
+            &walk.order,
+            &query,
+        )
+        .await?;
+        // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-7
+        (
+            page.items,
+            PageInfoDto::of(page.page_info, None),
+            Some(walk),
+        )
+    } else {
+        let page = crate::infra::storage::audit_store::AuditStore::history(
+            &conn,
+            &scope,
+            key.as_str(),
+            target_tenant,
+            &query,
+        )
+        .await?;
+        (
+            page.items,
+            PageInfoDto::of(page.page_info, Some(page.total_count)),
+            None,
+        )
+    };
     let values_are_pii = declaration.data_classification == "pii";
     // A `pii` image keeps its class after the setting is declassified, so it
     // asks for the entitlement as much as a `pii` setting or actor does.
     let needs_entitlement = values_are_pii
-        || page.items.iter().any(|r| {
+        || records.iter().any(|r| {
             r.actor_classification == crate::audit::ActorClassification::Pii || r.has_pii_image()
         });
     let pii = needs_entitlement && may_read_pii(&enforcer, &ctx).await?;
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-9
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-10
     // The path from the reader tenant down to the record's tenant is the
-    // target's chain from the reader. A definition record has no tenant, so
-    // its actor is on no path.
+    // target's chain from the reader, extended below the target by the walk's
+    // parent links when the record sits at a descendant. A definition record
+    // has no tenant, so its actor is on no path.
     let reader = Reader::new(ctx.subject_tenant_id(), root);
-    let target_chain = target_chain(&resolver, reader, target.tenant_id(root)).await?;
+    let target_chain = target_chain(&resolver, reader, target_tenant).await?;
     let to_target = reader.path_in(&target_chain);
     // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-10
-    let mut items: Vec<AuditRecordDto> = page
-        .items
+    let mut items: Vec<AuditRecordDto> = records
         .iter()
         .map(|r| {
-            let path: &[Uuid] = if r.tenant_id.is_some() {
-                to_target
-            } else {
-                &[]
-            };
+            let path = record_path(to_target, target_tenant, walk.as_ref(), r.tenant_id);
             render_record(
                 r,
                 values_are_pii,
                 pii,
-                reader.is_shown(r.actor_tenant_id, path),
+                reader.is_shown(r.actor_tenant_id, &path),
             )
         })
         .collect();
     // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-9
-    let actors: Vec<crate::infra::actor_names::ActorRef> = page
-        .items
+    let actors: Vec<crate::infra::actor_names::ActorRef> = records
         .iter()
         .zip(&items)
         .map(|(record, item)| crate::infra::actor_names::ActorRef {
@@ -1071,12 +1218,9 @@ pub async fn get_history(
         .collect();
     let actor_names = names.names_for_page(&ctx, &actors).await;
     for (item, name) in items.iter_mut().zip(actor_names) {
-        item.actor_name = name.as_str().map(str::to_owned);
+        item.name_actor(name);
     }
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-9
-    Ok(Json(PageDto {
-        items,
-        page_info: PageInfoDto::of(page.page_info, Some(page.total_count)),
-    }))
+    Ok(Json(PageDto { items, page_info }))
     // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-9
 }

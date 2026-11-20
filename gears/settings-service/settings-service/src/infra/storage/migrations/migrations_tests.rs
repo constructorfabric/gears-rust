@@ -58,6 +58,7 @@ fn the_harness_declares_its_migrations_in_order() {
             "m20260925_000003_audit_retention_policy_seed".to_owned(),
             "m20261014_000001_declaration_display_name".to_owned(),
             "m20261015_000001_setter_tenant".to_owned(),
+            "m20261114_000001_audit_records_subtree_history_index".to_owned(),
         ]
     );
 }

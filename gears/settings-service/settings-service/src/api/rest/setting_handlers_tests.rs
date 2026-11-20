@@ -4,10 +4,11 @@ use toolkit_odata::ast::Expr;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use super::{gate_target, interpret, qualify};
+use super::{TextMatch, gate_target, interpret, qualify};
 use crate::api::rest::setting_dto::Reader;
 use crate::domain::error::DomainError;
 use crate::domain::resolution::ScopeTarget;
+use crate::domain::search::MatchedField;
 use crate::test_support::ResolutionHarness;
 
 fn parse(raw: &str) -> Expr {
@@ -202,7 +203,7 @@ async fn a_failed_candidate_is_decided_by_what_the_caller_could_have_seen() {
     for (declaration, entitled) in [(&public, false), (&pii, true)] {
         let outcome = qualify(
             declaration,
-            false,
+            TextMatch::No,
             Err(failure("unavailable")),
             &needle,
             entitled,
@@ -214,7 +215,7 @@ async fn a_failed_candidate_is_decided_by_what_the_caller_could_have_seen() {
     // A defect keeps its entry, as it does without `q`.
     let kept = qualify(
         &public,
-        false,
+        TextMatch::No,
         Err(failure("internal")),
         &needle,
         false,
@@ -230,7 +231,7 @@ async fn a_failed_candidate_is_decided_by_what_the_caller_could_have_seen() {
         for kind in ["unavailable", "internal"] {
             let outcome = qualify(
                 declaration,
-                false,
+                TextMatch::No,
                 Err(failure(kind)),
                 &needle,
                 entitled,
@@ -244,7 +245,7 @@ async fn a_failed_candidate_is_decided_by_what_the_caller_could_have_seen() {
     assert!(matches!(
         qualify(
             &public,
-            false,
+            TextMatch::No,
             Err(failure("retired")),
             &needle,
             true,
@@ -256,13 +257,247 @@ async fn a_failed_candidate_is_decided_by_what_the_caller_could_have_seen() {
     for kind in ["retired", "unavailable", "internal"] {
         let outcome = qualify(
             &secret,
-            true,
+            TextMatch::In(MatchedField::Key),
             Err(failure(kind)),
             &needle,
             false,
             Reader::Platform,
             &[],
         );
-        assert!(matches!(outcome, Ok(Some(_))), "{kind}");
+        let (item, _) = outcome.expect("decided").expect("kept");
+        // The failure entry names the field its text matched in.
+        assert_eq!(item.matched_field.as_deref(), Some("key"), "{kind}");
+    }
+    // An entry kept for its own failure alone matched nothing: no field.
+    assert_eq!(kept.0.matched_field, None);
+}
+
+#[tokio::test]
+async fn a_qualifying_candidate_names_its_text_field_first_and_a_shown_value_as_value() {
+    let h = ResolutionHarness::new().await;
+    let needle = crate::domain::search::Needle::parse("lantern").expect("needle");
+    let id = h
+        .declare("lamp", "cascading", serde_json::json!("plain"))
+        .await;
+    h.set(id, h.tree.root, serde_json::json!("lantern-set"))
+        .await;
+    let declaration = h.load_declaration(id).await;
+    let resolved = || async {
+        h.resolve("lamp", ScopeTarget::Platform)
+            .await
+            .expect("resolves")
+    };
+    let field = |text: TextMatch, outcome| {
+        qualify(
+            &declaration,
+            text,
+            Ok(outcome),
+            &needle,
+            false,
+            Reader::Platform,
+            &[],
+        )
+        .expect("decided")
+        .map(|(item, _)| item.matched_field)
+    };
+
+    // The value alone: `value`.
+    assert_eq!(
+        field(TextMatch::No, resolved().await),
+        Some(Some("value".to_owned()))
+    );
+    // The text and the value: the text's field, whichever it is.
+    for text in [
+        MatchedField::Key,
+        MatchedField::DisplayName,
+        MatchedField::Description,
+        MatchedField::CategoryName,
+        MatchedField::DefaultValue,
+    ] {
+        assert_eq!(
+            field(TextMatch::In(text), resolved().await),
+            Some(Some(text.as_str().to_owned()))
+        );
+    }
+    // The text in no field that can be named, and the shown value: the value
+    // did match, and is what is named.
+    assert_eq!(
+        field(TextMatch::Unnamed, resolved().await),
+        Some(Some("value".to_owned()))
+    );
+    // The text in no field that can be named, and nothing else: kept, with
+    // no field guessed for it.
+    let other = crate::domain::search::Needle::parse("zzz").expect("needle");
+    let (item, _) = qualify(
+        &declaration,
+        TextMatch::Unnamed,
+        Ok(resolved().await),
+        &other,
+        false,
+        Reader::Platform,
+        &[],
+    )
+    .expect("decided")
+    .expect("kept by its text");
+    assert_eq!(item.matched_field, None);
+    assert_eq!(item.outcome, "resolved");
+    // Neither: not on the page.
+    let other = crate::domain::search::Needle::parse("zzz").expect("needle");
+    let dropped = qualify(
+        &declaration,
+        TextMatch::No,
+        Ok(resolved().await),
+        &other,
+        false,
+        Reader::Platform,
+        &[],
+    );
+    assert!(matches!(dropped, Ok(None)));
+}
+
+#[tokio::test]
+async fn a_masked_value_qualifies_by_its_text_alone_and_is_never_named_as_value() {
+    let h = ResolutionHarness::new().await;
+    let needle = crate::domain::search::Needle::parse("lantern").expect("needle");
+    let id = h
+        .declare_typed(
+            "contact",
+            "cascading",
+            serde_json::json!("x"),
+            crate::test_support::TEXT,
+            "pii",
+        )
+        .await;
+    h.set_classified(
+        id,
+        h.tree.root,
+        serde_json::json!("lantern@example.test"),
+        "pii",
+    )
+    .await;
+    let declaration = h.load_declaration(id).await;
+    let run = |text: TextMatch, entitled: bool, outcome| {
+        qualify(
+            &declaration,
+            text,
+            Ok(outcome),
+            &needle,
+            entitled,
+            Reader::Platform,
+            &[],
+        )
+        .expect("decided")
+    };
+    let resolved = || async {
+        h.resolve("contact", ScopeTarget::Platform)
+            .await
+            .expect("resolves")
+    };
+
+    // Masked for the caller, the value containing the text: no entry at all,
+    // so no field can tell of it.
+    assert!(run(TextMatch::No, false, resolved().await).is_none());
+    // On the page by its text, it names the text's field and stays masked.
+    let (item, _) = run(TextMatch::In(MatchedField::Key), false, resolved().await).expect("kept");
+    assert_eq!(item.matched_field.as_deref(), Some("key"));
+    assert!(item.effective.as_ref().is_some_and(|e| e.masked));
+    // Shown to an entitled caller, the same value is a `value` match.
+    let (item, _) = run(TextMatch::No, true, resolved().await).expect("kept");
+    assert_eq!(item.matched_field.as_deref(), Some("value"));
+    assert!(item.effective.as_ref().is_some_and(|e| !e.masked));
+    // Kept by a text match no field names, the masked value is still not
+    // named: the entry carries no field.
+    let (item, _) = run(TextMatch::Unnamed, false, resolved().await).expect("kept");
+    assert_eq!(item.matched_field, None);
+    assert!(item.effective.as_ref().is_some_and(|e| e.masked));
+}
+
+// ── The path of one history record ───────────────────────────────────────────
+
+mod record_path {
+    use std::collections::HashMap;
+
+    use uuid::Uuid;
+
+    use super::super::record_path;
+    use crate::api::rest::setting_dto::Reader;
+    use crate::domain::resolution::Subtree;
+
+    /// `reader -> target -> child -> grandchild`, with `stray` on no link.
+    struct Fixture {
+        reader: Uuid,
+        target: Uuid,
+        child: Uuid,
+        grandchild: Uuid,
+        stray: Uuid,
+        walk: Subtree,
+    }
+
+    fn fixture() -> Fixture {
+        let ids: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
+        let (reader, target, child, grandchild, stray) = (ids[0], ids[1], ids[2], ids[3], ids[4]);
+        Fixture {
+            reader,
+            target,
+            child,
+            grandchild,
+            stray,
+            walk: Subtree {
+                order: vec![child, grandchild],
+                parent: HashMap::from([(child, target), (grandchild, child)]),
+                truncated: false,
+            },
+        }
+    }
+
+    #[test]
+    fn a_record_below_the_target_extends_the_path_by_the_walks_links() {
+        let f = fixture();
+        let to_target = [f.reader, f.target];
+        assert_eq!(
+            record_path(&to_target, f.target, Some(&f.walk), Some(f.target)),
+            vec![f.reader, f.target]
+        );
+        assert_eq!(
+            record_path(&to_target, f.target, Some(&f.walk), Some(f.child)),
+            vec![f.reader, f.target, f.child]
+        );
+        assert_eq!(
+            record_path(&to_target, f.target, Some(&f.walk), Some(f.grandchild)),
+            vec![f.reader, f.target, f.child, f.grandchild]
+        );
+    }
+
+    #[test]
+    fn a_record_at_the_target_is_on_the_targets_path_in_either_mode() {
+        let f = fixture();
+        let to_target = [f.reader, f.target];
+        assert_eq!(
+            record_path(&to_target, f.target, None, Some(f.target)),
+            vec![f.reader, f.target]
+        );
+    }
+
+    #[test]
+    fn a_definition_record_and_a_tenant_the_walk_did_not_reach_are_on_no_path() {
+        // Neither is ever shown to a tenant reader: an empty path holds no
+        // actor tenant. The second cannot come out of the page query, which
+        // lists the walk's tenants only; were it to, the actor is withheld
+        // rather than judged on the target's path.
+        let f = fixture();
+        let to_target = [f.reader, f.target];
+        for (walk, tenant) in [
+            (Some(&f.walk), None),
+            (None, None),
+            (Some(&f.walk), Some(f.stray)),
+            (None, Some(f.child)),
+        ] {
+            let path = record_path(&to_target, f.target, walk, tenant);
+            assert!(path.is_empty(), "{path:?}");
+            assert!(
+                !Reader::Tenant(f.reader).is_shown(Some(f.reader), &path),
+                "an actor at the reader tenant itself is withheld on no path"
+            );
+        }
     }
 }

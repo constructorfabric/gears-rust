@@ -248,3 +248,44 @@ async fn the_setter_tenant_columns_are_nullable_uuids_after_the_chain() {
         );
     }
 }
+
+/// The subtree history index on the backend it is written for: one setting's
+/// records newest first with the id as the tiebreak, beside the index the
+/// single-scope history keeps.
+#[tokio::test]
+async fn the_subtree_history_index_exists_after_the_chain_beside_the_scoped_one() {
+    let Some(fixture) = pg_fixture("migration").await else {
+        return;
+    };
+    run_migrations_for_testing(&fixture.db, Migrator::migrations())
+        .await
+        .expect("the chain applies on an empty database");
+
+    let definition = |name: &'static str| {
+        let conn = &fixture.conn;
+        async move {
+            conn.query_one_raw(Statement::from_string(
+                conn.get_database_backend(),
+                format!(
+                    "SELECT indexdef FROM pg_indexes
+                     WHERE tablename = 'audit_records' AND indexname = '{name}'"
+                ),
+            ))
+            .await
+            .expect("readable")
+            .unwrap_or_else(|| panic!("`{name}` exists after the chain"))
+            .try_get::<String>("", "indexdef")
+            .expect("a definition")
+        }
+    };
+    let recent = definition("idx_audit_key_recent").await;
+    assert!(
+        recent.contains("(declaration_key, occurred_at DESC, id DESC)"),
+        "{recent}"
+    );
+    let scoped = definition("idx_audit_scoped").await;
+    assert!(
+        scoped.contains("(declaration_key, tenant_id, occurred_at DESC)"),
+        "{scoped}"
+    );
+}

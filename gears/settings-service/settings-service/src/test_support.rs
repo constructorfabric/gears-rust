@@ -86,6 +86,22 @@ impl FakeSource {
         self
     }
 
+    /// A type derived from one this source already holds: the parent is the
+    /// id minus its last segment, as the registry chains a derived type.
+    pub fn with_derived_type(mut self, id: &str, schema: Value) -> Self {
+        let parent = GtsTypeSchema::derive_parent_type_id(id).expect("a derived type id");
+        let parent = self
+            .schemas
+            .get(parent.as_ref())
+            .cloned()
+            .expect("the parent is registered first");
+        let schema =
+            GtsTypeSchema::try_new(GtsTypeId::new(id), schema, None, Some(Arc::new(parent)))
+                .expect("fixture schema is a valid derived type");
+        self.schemas.insert(id.to_owned(), schema);
+        self
+    }
+
     pub fn with_instance(mut self, id: &str) -> Self {
         self.instances.insert(id.to_owned());
         self
@@ -612,8 +628,67 @@ pub const SECRET: &str = "gts.cf.core.settings.type_secret_string.v1~";
 /// credentials: classified `pii`, held inline, masked without the entitlement.
 pub const TEXT: &str = "gts.cf.core.settings.type_plain_text.v1~";
 
+/// A setting some administrator already declared: a GTS type of its own,
+/// derived from the abstract base, and not a value type.
+pub const DECLARED_SETTING: &str =
+    "gts.cf.core.settings.setting_type.v1~acme.settings.network.already_declared.v1~";
+/// A value type a module registered in its own namespace.
+pub const MODULE_TYPE: &str = "gts.acme.demo.values.retry_limit.v1~";
+
+/// A module's type whose schema refers to another type by `gts://` outside
+/// its own parent chain: registered, and not buildable into a validator.
+pub const REFERRING_TYPE: &str = "gts.acme.demo.values.wrapper.v1~";
+
+/// The schema of [`REFERRING_TYPE`].
+pub fn referring_type_schema() -> Value {
+    json!({
+        "$id": format!("gts://{REFERRING_TYPE}"),
+        "type": "object",
+        "properties": { "inner": { "$ref": format!("gts://{MODULE_TYPE}") } }
+    })
+}
+
+/// Ids that are not GTS type ids: a bare word, and an instance id — a type id
+/// names its type up to a trailing `~`, and neither ends in one.
+pub const NOT_TYPE_IDS: [&str; 2] = [
+    "string",
+    "gts.acme.demo.values.retry_limit.v1~acme.demo.values.default.v1",
+];
+
+/// The types registry's own test client, holding the boolean catalogue type.
+/// It answers an id that is not a type id as the registry does — a refusal of
+/// the argument, where [`FakeSource`] only knows presence and absence.
+pub fn registry_client() -> Arc<dyn types_registry_sdk::TypesRegistryClient> {
+    let boolean = GtsTypeSchema::try_new(
+        GtsTypeId::new(BOOL),
+        json!({ "$id": format!("gts://{BOOL}"), "type": "boolean" }),
+        None,
+        None,
+    )
+    .expect("fixture schema is a valid root type");
+    Arc::new(
+        types_registry_sdk::testing::MockTypesRegistryClient::new().with_type_schemas([boolean]),
+    )
+}
+
+/// The catalogue the resolution tests run over, and beside it what the real
+/// registry also holds: the abstract base every setting derives from, one
+/// declared setting as the registrar registers it, and a module's value type.
 pub fn resolution_catalogue() -> FakeSource {
+    let declared = SettingKey::parse(DECLARED_SETTING).expect("a setting key");
     FakeSource::default()
+        .with_type(
+            settings_service_sdk::gts::SETTING_TYPE_BASE,
+            settings_service_sdk::gts::setting_type_base_schema(),
+        )
+        .with_derived_type(
+            DECLARED_SETTING,
+            crate::infra::setting_type_registrar::setting_type_schema(&declared, BOOL),
+        )
+        .with_type(
+            MODULE_TYPE,
+            json!({ "$id": format!("gts://{MODULE_TYPE}"), "type": "integer", "minimum": 0 }),
+        )
         .with_type(
             BOOL,
             json!({ "$id": format!("gts://{BOOL}"), "type": "boolean" }),
@@ -1647,23 +1722,78 @@ impl authz_resolver_sdk::AuthZResolverApi for UncompilablePdp {
 }
 
 /// An enforcer over a policy decision point that denies everything.
-pub fn denying_enforcer() -> authz_resolver_sdk::PolicyEnforcer {
-    authz_resolver_sdk::PolicyEnforcer::new(Arc::new(DenyAll))
+pub fn denying_enforcer() -> crate::api::authz::PermissionEnforcer {
+    crate::api::authz::PermissionEnforcer::over(authz_resolver_sdk::PolicyEnforcer::new(Arc::new(
+        DenyAll,
+    )))
 }
 
 /// An enforcer over a policy decision point that allows everything.
-pub fn allowing_enforcer() -> authz_resolver_sdk::PolicyEnforcer {
-    authz_resolver_sdk::PolicyEnforcer::new(Arc::new(AllowAll))
+pub fn allowing_enforcer() -> crate::api::authz::PermissionEnforcer {
+    crate::api::authz::PermissionEnforcer::over(authz_resolver_sdk::PolicyEnforcer::new(Arc::new(
+        AllowAll,
+    )))
+}
+
+/// A policy decision point that allows everything, with no constraint, and
+/// keeps every request it was asked: what a caller asked the enforcer, as the
+/// decision point received it.
+#[derive(Default)]
+pub struct RecordingPdp {
+    asked: Mutex<Vec<authz_resolver_sdk::models::EvaluationRequest>>,
+}
+
+impl RecordingPdp {
+    /// The requests asked since the last call, in the order they were asked.
+    pub fn take(&self) -> Vec<authz_resolver_sdk::models::EvaluationRequest> {
+        std::mem::take(
+            &mut *self
+                .asked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+}
+
+#[async_trait]
+impl authz_resolver_sdk::AuthZResolverApi for RecordingPdp {
+    async fn evaluate(
+        &self,
+        _ctx: toolkit_security::PlatformSecurityContext,
+        request: authz_resolver_sdk::models::EvaluationRequest,
+    ) -> Result<
+        authz_resolver_sdk::models::EvaluationResponse,
+        toolkit::api::canonical_prelude::CanonicalError,
+    > {
+        self.asked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(request);
+        Ok(authz_resolver_sdk::models::EvaluationResponse {
+            decision: true,
+            context: authz_resolver_sdk::models::EvaluationResponseContext::default(),
+        })
+    }
+}
+
+/// An enforcer over `pdp`.
+pub fn enforcer_over(pdp: &Arc<RecordingPdp>) -> crate::api::authz::PermissionEnforcer {
+    let pdp: Arc<dyn authz_resolver_sdk::AuthZResolverApi> = pdp.clone();
+    crate::api::authz::PermissionEnforcer::over(authz_resolver_sdk::PolicyEnforcer::new(pdp))
 }
 
 /// An enforcer over a policy decision point that cannot be reached.
-pub fn unreachable_enforcer() -> authz_resolver_sdk::PolicyEnforcer {
-    authz_resolver_sdk::PolicyEnforcer::new(Arc::new(UnreachablePdp))
+pub fn unreachable_enforcer() -> crate::api::authz::PermissionEnforcer {
+    crate::api::authz::PermissionEnforcer::over(authz_resolver_sdk::PolicyEnforcer::new(Arc::new(
+        UnreachablePdp,
+    )))
 }
 
 /// An enforcer whose decision arrives with constraints that cannot be compiled.
-pub fn uncompilable_enforcer() -> authz_resolver_sdk::PolicyEnforcer {
-    authz_resolver_sdk::PolicyEnforcer::new(Arc::new(UncompilablePdp))
+pub fn uncompilable_enforcer() -> crate::api::authz::PermissionEnforcer {
+    crate::api::authz::PermissionEnforcer::over(authz_resolver_sdk::PolicyEnforcer::new(Arc::new(
+        UncompilablePdp,
+    )))
 }
 
 /// What a request answered with: the status, the decoded body, and the two
@@ -1681,7 +1811,7 @@ pub struct Answer {
     pub headers: HashMap<String, String>,
 }
 
-/// A directory that lists nobody: every history name reads `null`.
+/// A directory that lists nobody: every user of a history page reads `unknown`.
 struct NobodyDirectory;
 
 #[async_trait]
@@ -1760,6 +1890,9 @@ pub struct RestHarness {
     /// What the enforcement points counted, for the tests that assert a
     /// refusal is — or is not — an authorization denial.
     pub security: Arc<RecordingSecurityMetrics>,
+    /// The operations the surface registered, for the tests that read a
+    /// route's declaration rather than its answer.
+    pub openapi: toolkit::api::OpenApiRegistryImpl,
     router: axum::Router,
 }
 
@@ -1804,6 +1937,19 @@ impl RestHarness {
                 unavailable: true,
                 ..resolution_catalogue()
             },
+        )
+        .await
+    }
+
+    /// The same surface whose declaration admin asks a types registry client
+    /// about a value type, so the adapter over the registry is part of what a
+    /// request exercises — as it is in the gear — and not the hand-built
+    /// catalogue standing in for both.
+    pub async fn with_registry(registry: Arc<dyn types_registry_sdk::TypesRegistryClient>) -> Self {
+        Self::build_with(
+            Arc::new(AllowAll),
+            Arc::new(FixedStepUp::verified()),
+            registry,
         )
         .await
     }
@@ -1894,7 +2040,7 @@ impl RestHarness {
     async fn build_with(
         pdp: Arc<dyn authz_resolver_sdk::AuthZResolverApi>,
         step_up: Arc<dyn crate::domain::stepup::StepUpVerifier>,
-        admin_catalogue: FakeSource,
+        admin_catalogue: impl SchemaSource + 'static,
     ) -> Self {
         Self::build_over(
             ResolutionHarness::new().await,
@@ -1910,6 +2056,13 @@ impl RestHarness {
     /// rewrite raw, through [`RestHarness::probe_query`] and
     /// [`RestHarness::probe_exec`].
     pub async fn probed() -> Self {
+        Self::probed_with_directory(nobody()).await
+    }
+
+    /// The probed surface with a directory the test scripts.
+    pub async fn probed_with_directory(
+        directory: Arc<dyn crate::infra::actor_names::ActorDirectory>,
+    ) -> Self {
         let (inner, probe) = ResolutionHarness::probed().await;
         Self::build_over(
             inner,
@@ -1917,7 +2070,7 @@ impl RestHarness {
             Arc::new(AllowAll),
             Arc::new(FixedStepUp::verified()),
             resolution_catalogue(),
-            nobody(),
+            directory,
         )
     }
 
@@ -1954,11 +2107,13 @@ impl RestHarness {
         probe: Option<Probe>,
         pdp: Arc<dyn authz_resolver_sdk::AuthZResolverApi>,
         step_up: Arc<dyn crate::domain::stepup::StepUpVerifier>,
-        admin_catalogue: FakeSource,
+        admin_catalogue: impl SchemaSource + 'static,
         directory: Arc<dyn crate::infra::actor_names::ActorDirectory>,
     ) -> Self {
         *inner.hierarchy.connection_guard.lock().expect("lock") = Some(Arc::clone(&inner.db));
-        let enforcer = Arc::new(authz_resolver_sdk::PolicyEnforcer::new(pdp));
+        let enforcer = Arc::new(crate::api::authz::PermissionEnforcer::over(
+            authz_resolver_sdk::PolicyEnforcer::new(pdp),
+        ));
         let openapi = toolkit::api::OpenApiRegistryImpl::new();
         let search = Arc::new(crate::domain::search::service::SearchService::new(
             crate::infra::storage::search_repo::SearchRepo::new(inner.db.db().backend()),
@@ -2077,6 +2232,7 @@ impl RestHarness {
             registrar,
             probe,
             security,
+            openapi,
             router,
         }
     }

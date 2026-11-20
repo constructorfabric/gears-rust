@@ -11,7 +11,7 @@ use toolkit::api::odata::OData;
 use toolkit_odata::ODataQuery;
 use toolkit_security::{AccessScope, SecurityContext};
 
-use crate::api::authz::{self, resource};
+use crate::api::authz::{Permission, PermissionEnforcer};
 use crate::api::rest::page_dto::{PageDto, PageInfoDto};
 use crate::api::rest::search_dto::{SearchHitDto, render_hit};
 use crate::api::rest::setting_filter::interpret;
@@ -28,8 +28,6 @@ use crate::infra::storage::search_repo::SearchRepo;
 
 /// The service over the concrete repository binding.
 pub type ConcreteSearchService = SearchService<SearchRepo>;
-
-const READ: authz::Operation = authz::Operation::Read;
 
 /// The plain query parameters; `$filter`, `limit` and `cursor` arrive through
 /// the `OData` extractor, which is also what carries the options this
@@ -64,7 +62,7 @@ pub async fn search_settings(
     Extension(search): Extension<Arc<ConcreteSearchService>>,
     Extension(resolver): Extension<Arc<ConcreteResolver>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
-    Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(enforcer): Extension<Arc<PermissionEnforcer>>,
     Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Query(params): Query<SearchParams>,
     OData(query): OData,
@@ -89,15 +87,9 @@ pub async fn search_settings(
     // One decision on the value resource for the whole request; its
     // constraints are the secure scope of the declarations query, so a setting
     // the caller may not read is absent from the results and from the count.
-    let scope: AccessScope = authz::access_scope(
-        &enforcer,
-        security.as_ref(),
-        &ctx,
-        &resource::VALUE,
-        READ,
-        None,
-    )
-    .await?;
+    let scope: AccessScope = enforcer
+        .access_scope(security.as_ref(), &ctx, Permission::ValueRead, None)
+        .await?;
     // @cpt-end:cpt-cf-settings-service-flow-search-discoverability-search:p2:inst-sd-search-2
 
     // @cpt-begin:cpt-cf-settings-service-flow-search-discoverability-search:p2:inst-sd-search-3

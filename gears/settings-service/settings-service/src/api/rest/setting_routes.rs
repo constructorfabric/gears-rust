@@ -34,7 +34,7 @@ pub fn register_routes(
     openapi: &dyn OpenApiRegistry,
     resolver: Arc<ConcreteResolver>,
     db: Arc<DBProvider<DbError>>,
-    enforcer: Arc<authz_resolver_sdk::PolicyEnforcer>,
+    enforcer: Arc<crate::api::authz::PermissionEnforcer>,
     names: Arc<crate::infra::actor_names::ActorNameResolver>,
 ) -> Router {
     let router = OperationBuilder::get("/settings-service/v1/settings")
@@ -56,7 +56,14 @@ pub fn register_routes(
              key that is visible but not flagged is absent from it. The flagged rows of \
              the target's subtree are `GET /settings-service/v1/settings/review`. `q` \
              narrows the page to the settings whose declaration text or shown value \
-             contains it; a value masked for the caller never matches. Under `q`, a \
+             contains it; a value masked for the caller never matches. Each item `q` \
+             matched carries `matched_field`, present only under `q`: `key`, \
+             `display_name`, `description`, `category_name`, `default_value` or `value`, \
+             the vocabulary and the order of `GET /settings-service/v1/search`, the first \
+             of them that matched being named; `value` covers the effective value and the fallback \
+             value as shown, and is never reported for a masked one. An item kept by \
+             its declaration text carries no `matched_field` when no field can be \
+             named for the match. Under `q`, a \
              dependency that is unavailable for a setting whose value the caller could \
              have matched answers 503, since the narrowing cannot be decided; a page \
              already full still answers, with a cursor. A cursor continues only the \
@@ -78,8 +85,8 @@ pub fn register_routes(
              characters after trimming; keeps the settings whose key, display name, \
              description, category name, Schema Default, effective value or fallback value \
              contains it, case-insensitively; combines with $filter; the cursor is bound \
-             to it beside the $filter and the target, and a page it narrows carries no \
-             total_count",
+             to it beside the $filter and the target, a page it narrows carries no \
+             total_count, and each item it matched names the field in matched_field",
         )
         .query_param_typed("limit", false, "Page size", "integer")
         .query_param("cursor", false, "Cursor for pagination")
@@ -188,9 +195,21 @@ pub fn register_routes(
         .error_503(openapi)
         .register(router, openapi);
 
-    let router = OperationBuilder::get("/settings-service/v1/settings/{key}/history")
+    let router = register_history(router, openapi);
+
+    router
+        .layer(axum::Extension(resolver))
+        .layer(axum::Extension(db))
+        .layer(axum::Extension(enforcer))
+        .layer(axum::Extension(names))
+}
+
+/// Register the history read: one scope, or a tenant with the tenants below
+/// it.
+fn register_history(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
+    OperationBuilder::get("/settings-service/v1/settings/{key}/history")
         .operation_id("settings_service.get_setting_history")
-        .summary("Read a setting's history at a scope")
+        .summary("Read a setting's history at a scope or across a subtree")
         .description(
             "The mutation history of one setting at one scope, newest first and \
              cursor-paginated, served from the gear's own audit store. `tenant` follows the \
@@ -198,7 +217,19 @@ pub fn register_routes(
              subtree or a standalone descendant answers 403. A `pii` actor, and `pii` values, \
              are masked for a caller without the PII entitlement; a secret was never recorded \
              in plaintext. A retired declaration keeps its history. An empty history is an \
-             empty page. `$filter`, `$orderby` and `$select` are refused.",
+             empty page. `$filter`, `$orderby` and `$select` are refused.\n\n\
+             With `descendants=true` the page holds the records of the target tenant and of \
+             every tenant below it, in one list ordered by `occurred_at` descending and then \
+             `id` descending, with the setting's definition records listed once. A standalone \
+             descendant and everything below it are left out. Every record is masked and its \
+             actor shown or withheld exactly as the single-scope history of the record's own \
+             `tenant_id` does for the same caller. A setting hidden from the caller answers \
+             404; one hidden at a descendant keeps that descendant's records in the list of \
+             a caller it is not hidden from. `page_info.total_count` is not reported in this \
+             mode. A target whose subtree holds more than 5000 tenants answers 400 \
+             `subtree_too_large`. A cursor continues only the listing it was issued by: the \
+             same setting, the same `tenant` and the same `descendants`; any other answers \
+             400.",
         )
         .tag(TAG)
         .authenticated()
@@ -209,14 +240,22 @@ pub fn register_routes(
             false,
             "Target tenant id; omitted, the caller's own tenant",
         )
+        .query_param_typed(
+            "descendants",
+            false,
+            "`true` to list the records of the target tenant and of every tenant below it, \
+             standalone descendants excluded; `false` or omitted, the target tenant's own \
+             scope only",
+            "boolean",
+        )
         .query_param_typed("limit", false, "Page size", "integer")
         .query_param("cursor", false, "Cursor for pagination")
         .handler(handlers::get_history)
         .json_response_with_schema::<crate::api::rest::page_dto::PageDto<AuditRecordDto>>(
             openapi,
             StatusCode::OK,
-            "A page of audit records, newest first, with its pagination cursors and the \
-             total",
+            "A page of audit records, newest first, with its pagination cursors and, \
+             without `descendants=true`, the total",
         )
         .error_400(openapi)
         .error_401(openapi)
@@ -224,11 +263,5 @@ pub fn register_routes(
         .error_404(openapi)
         .error_500(openapi)
         .error_503(openapi)
-        .register(router, openapi);
-
-    router
-        .layer(axum::Extension(resolver))
-        .layer(axum::Extension(db))
-        .layer(axum::Extension(enforcer))
-        .layer(axum::Extension(names))
+        .register(router, openapi)
 }

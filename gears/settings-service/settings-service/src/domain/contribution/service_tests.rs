@@ -10,6 +10,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use settings_service_sdk::SettingKey;
 use settings_service_sdk::api::SettingsContributionClient;
+use settings_service_sdk::gts::{SETTING_TYPE_BASE, setting_type_base_schema};
 use settings_service_sdk::models::{
     ContributedClassification, ContributedDeclaration, ReconcileResult, ScopeClass, SettingMode,
 };
@@ -37,6 +38,9 @@ const SECRET: &str = "gts.cf.core.settings.type_secret_string.v1~";
 const NARROW_PORT: &str = "gts.cf.core.settings.type_narrow_port.v1~";
 const STRING: &str = "gts.cf.core.settings.type_string.v1~";
 const MODULE: &str = "settings-demo";
+/// A setting some administrator already declared: a GTS type, not a value type.
+const DECLARED_SETTING: &str =
+    "gts.cf.core.settings.setting_type.v1~acme.settings.network.already_declared.v1~";
 
 fn catalogue() -> FakeSource {
     FakeSource::default()
@@ -99,7 +103,7 @@ impl Harness {
     fn build(
         db: Arc<DBProvider<DbError>>,
         registrar: RecordingRegistrar,
-        source: FakeSource,
+        source: impl crate::infra::type_validator::SchemaSource + 'static,
     ) -> Self {
         let audit = Arc::new(RecordingAudit::default());
         let registrar = Arc::new(registrar);
@@ -487,6 +491,239 @@ async fn an_unknown_value_type_is_refused() {
     );
     let result = h.register(vec![unknown]).await;
     assert_eq!(codes(&result), vec![reason::VALUE_TYPE_UNKNOWN]);
+}
+
+/// The registry of [`catalogue`] with what the real one also holds: the
+/// abstract setting base and one declared setting.
+fn catalogue_with_setting_types() -> FakeSource {
+    let declared = SettingKey::parse(DECLARED_SETTING).expect("a setting key");
+    catalogue()
+        .with_type(SETTING_TYPE_BASE, setting_type_base_schema())
+        .with_derived_type(
+            DECLARED_SETTING,
+            crate::infra::setting_type_registrar::setting_type_schema(&declared, BOOL),
+        )
+}
+
+#[tokio::test]
+async fn a_setting_or_the_abstract_base_as_the_value_type_refuses_that_item_only() {
+    let h = Harness::build(
+        sqlite_provider().await,
+        RecordingRegistrar::default(),
+        catalogue_with_setting_types(),
+    );
+    let declare = |name: &str, value_type: &str, default: Value| {
+        ContributedDeclaration::new(
+            key("network", name, 1),
+            value_type.to_owned(),
+            default,
+            ScopeClass::Cascading,
+        )
+    };
+    let result = h
+        .register(vec![
+            declare("as_setting", DECLARED_SETTING, json!(true)),
+            declare("as_base", SETTING_TYPE_BASE, json!({ "payload": true })),
+            flag("network", "proxy_enabled"),
+        ])
+        .await;
+    assert_eq!(
+        codes(&result),
+        vec![reason::NOT_A_VALUE_TYPE, reason::NOT_A_VALUE_TYPE],
+        "{result:?}"
+    );
+    assert_eq!(result.registered, 1, "the rest of the set is reconciled");
+    let registered = h.registrar.registered.lock().expect("lock").clone();
+    assert_eq!(
+        registered,
+        vec![(
+            key("network", "proxy_enabled", 1).to_string(),
+            BOOL.to_owned()
+        )],
+        "no setting type registered for a refused item"
+    );
+    for name in ["as_setting", "as_base"] {
+        assert!(
+            h.stored(&key("network", name, 1)).await.is_none(),
+            "`{name}` left no row"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_value_type_id_that_is_no_type_id_refuses_that_item_only() {
+    // Over the registry's own test client, which refuses such an id as an
+    // invalid argument: the item is refused as naming an unknown type, and
+    // the set is not failed as if the registry were down.
+    let h = Harness::build(
+        sqlite_provider().await,
+        RecordingRegistrar::default(),
+        crate::test_support::registry_client(),
+    );
+    let [word, instance] = crate::test_support::NOT_TYPE_IDS;
+    let declare = |name: &str, value_type: &str| {
+        ContributedDeclaration::new(
+            key("network", name, 1),
+            value_type.to_owned(),
+            json!(true),
+            ScopeClass::Cascading,
+        )
+    };
+    let result = h
+        .register(vec![
+            declare("as_word", word),
+            declare("as_instance", instance),
+            flag("network", "proxy_enabled"),
+        ])
+        .await;
+    assert_eq!(
+        codes(&result),
+        vec![reason::VALUE_TYPE_UNKNOWN, reason::VALUE_TYPE_UNKNOWN],
+        "{result:?}"
+    );
+    assert_eq!(result.registered, 1, "the rest of the set is reconciled");
+    for name in ["as_word", "as_instance"] {
+        assert!(
+            h.stored(&key("network", name, 1)).await.is_none(),
+            "`{name}` left no row"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_value_type_whose_schema_does_not_build_refuses_that_item_only() {
+    use crate::test_support::{REFERRING_TYPE, referring_type_schema};
+    let h = Harness::build(
+        sqlite_provider().await,
+        RecordingRegistrar::default(),
+        catalogue().with_type(REFERRING_TYPE, referring_type_schema()),
+    );
+    let referring = ContributedDeclaration::new(
+        key("network", "wrapped", 1),
+        REFERRING_TYPE.to_owned(),
+        json!({ "inner": 3 }),
+        ScopeClass::Cascading,
+    );
+    let result = h
+        .register(vec![referring, flag("network", "proxy_enabled")])
+        .await;
+    assert_eq!(
+        codes(&result),
+        vec![reason::VALUE_TYPE_UNSUPPORTED],
+        "{result:?}"
+    );
+    assert_eq!(result.registered, 1, "the rest of the set is reconciled");
+    assert!(h.stored(&key("network", "wrapped", 1)).await.is_none());
+}
+
+#[tokio::test]
+async fn an_unreachable_registry_fails_the_registration_and_refuses_nothing() {
+    // The value-type check answers two ways: a refusal of the type, which
+    // refuses the one item, and a failure of the lookup, which is not a
+    // verdict on any type. A registry that cannot be reached is the second:
+    // the call fails as unavailable, and nothing is reported refused or kept.
+    let h = Harness::build(
+        sqlite_provider().await,
+        RecordingRegistrar::default(),
+        FakeSource {
+            unavailable: true,
+            ..catalogue()
+        },
+    );
+
+    let err = h
+        .client
+        .register_declarations(
+            &SecurityContext::anonymous(),
+            MODULE.to_owned(),
+            vec![flag("network", "proxy_enabled")],
+        )
+        .await
+        .expect_err("an unreachable registry is a failure, not a refusal");
+
+    assert!(
+        matches!(
+            err,
+            toolkit_canonical_errors::CanonicalError::ServiceUnavailable { .. }
+        ),
+        "{err:?}"
+    );
+    assert!(
+        h.stored(&key("network", "proxy_enabled", 1))
+            .await
+            .is_none(),
+        "no declaration was stored"
+    );
+    assert!(!h.category_exists("network").await);
+    assert!(h.registrar.registered.lock().expect("lock").is_empty());
+    assert!(h.registered_events().is_empty());
+}
+
+#[tokio::test]
+async fn a_stored_row_with_a_non_value_type_is_not_reconciled_or_reactivated() {
+    // A row the module owns that names the abstract base — written before
+    // the check existed — re-registered as it is: active it is refused and
+    // left alone, retired it is refused and stays retired.
+    let h = Harness::build(
+        sqlite_provider().await,
+        RecordingRegistrar::default(),
+        catalogue_with_setting_types(),
+    );
+    // The category comes from an ordinary registration; the row itself is
+    // written straight to the store.
+    h.register(vec![flag("network", "proxy_enabled")]).await;
+    let category_id = h
+        .stored(&key("network", "proxy_enabled", 1))
+        .await
+        .expect("registered")
+        .category_id;
+    let key = key("network", "as_base", 1);
+    {
+        let conn = h.db.conn().expect("connection");
+        DeclarationRepo
+            .insert(
+                &conn,
+                &AccessScope::allow_all(),
+                crate::domain::declaration::DeclarationDraft {
+                    key: key.to_string(),
+                    leaf_slug: key.leaf_slug().to_owned(),
+                    value_type_id: SETTING_TYPE_BASE.to_owned(),
+                    category_id,
+                    default_value: json!({ "payload": true }),
+                    scope_class: "cascading".to_owned(),
+                    mode: "standard".to_owned(),
+                    requires_step_up: true,
+                    anonymous_exposable: false,
+                    domain_affinity: None,
+                    has_secret_trait: false,
+                    data_classification: "public".to_owned(),
+                    source: "module_contributed".to_owned(),
+                    owner_module: Some(MODULE.to_owned()),
+                    licence_feature: None,
+                    display_name: None,
+                    description: None,
+                    created_by: MODULE.to_owned(),
+                },
+            )
+            .await
+            .expect("stored");
+    }
+    let contributed = ContributedDeclaration::new(
+        key.clone(),
+        SETTING_TYPE_BASE.to_owned(),
+        json!({ "payload": true }),
+        ScopeClass::Cascading,
+    );
+
+    let result = h.register(vec![contributed.clone()]).await;
+    assert_eq!(codes(&result), vec![reason::NOT_A_VALUE_TYPE], "{result:?}");
+
+    assert_eq!(h.retire_as(MODULE, vec![key.clone()]).await.retired, 1);
+    let result = h.register(vec![contributed]).await;
+    assert_eq!(codes(&result), vec![reason::NOT_A_VALUE_TYPE], "{result:?}");
+    assert_eq!(result.reactivated, 0);
+    let row = h.stored(&key).await.expect("the row is kept");
+    assert_eq!(row.status, DeclarationStatus::Retired);
 }
 
 #[tokio::test]
@@ -1832,6 +2069,60 @@ async fn a_display_name_with_a_control_character_refuses_that_item_and_names_the
     assert!(h.stored(&key("network", "refused", 1)).await.is_none());
     assert!(h.stored(&key("network", "before", 1)).await.is_some());
     assert!(h.stored(&key("network", "after", 1)).await.is_some());
+}
+
+/// [`flag`] with a description of `chars` characters.
+fn described_flag(category: &str, name: &str, chars: usize) -> ContributedDeclaration {
+    let mut declaration = flag(category, name);
+    declaration.description = Some("d".repeat(chars));
+    declaration
+}
+
+#[tokio::test]
+async fn a_description_over_the_bound_refuses_that_item_and_the_rest_reconcile() {
+    // The bound the administrator's create and update apply, 4096
+    // characters: one over it refuses the item with its own reason, one at
+    // it registers, and the neighbours still register.
+    let h = Harness::new().await;
+    let result = h
+        .register(vec![
+            flag("network", "before"),
+            described_flag("network", "refused", 4097),
+            described_flag("network", "at_bound", 4096),
+            flag("network", "after"),
+        ])
+        .await;
+
+    assert_eq!(
+        codes(&result),
+        vec![reason::DESCRIPTION_TOO_LONG],
+        "{result:?}"
+    );
+    assert_eq!(result.registered, 3, "{result:?}");
+    let error = &result.errors[0];
+    assert_eq!(error.key, key("network", "refused", 1).to_string());
+    assert!(!error.message.contains(&"d".repeat(64)), "{error:?}");
+    assert!(h.stored(&key("network", "refused", 1)).await.is_none());
+    let at_bound = h
+        .stored(&key("network", "at_bound", 1))
+        .await
+        .expect("registered");
+    assert_eq!(at_bound.description.map(|d| d.chars().count()), Some(4096));
+
+    // An update in place is refused alike, and the stored row is kept.
+    let result = h
+        .register(vec![described_flag("network", "at_bound", 4097)])
+        .await;
+    assert_eq!(
+        codes(&result),
+        vec![reason::DESCRIPTION_TOO_LONG],
+        "{result:?}"
+    );
+    let kept = h
+        .stored(&key("network", "at_bound", 1))
+        .await
+        .expect("still there");
+    assert_eq!(kept.description.map(|d| d.chars().count()), Some(4096));
 }
 
 #[tokio::test]

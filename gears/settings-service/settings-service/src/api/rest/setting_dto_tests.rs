@@ -168,11 +168,12 @@ mod history {
     use time::OffsetDateTime;
     use uuid::Uuid;
 
-    use crate::api::rest::setting_dto::render_record;
+    use crate::api::rest::setting_dto::{AuditRecordDto, render_record};
     use crate::audit::{
         ActorClassification, AuditOperation, AuditOutcome, AuditValue, StoredAuditRecord,
     };
     use crate::domain::resolution::MASK_TOKEN;
+    use crate::infra::actor_names::ActorName;
 
     fn record(actor: ActorClassification) -> StoredAuditRecord {
         StoredAuditRecord {
@@ -225,6 +226,115 @@ mod history {
         assert!(pii.values_masked);
         let entitled = render_record(&record(ActorClassification::Public), true, true, true);
         assert_eq!(entitled.pre_value, Some(json!("old")));
+    }
+
+    /// Every status the resolver can answer, with the name it carries.
+    fn every_name() -> [(ActorName, &'static str, Option<&'static str>); 7] {
+        [
+            (
+                ActorName::Resolved("Ann".to_owned()),
+                "resolved",
+                Some("Ann"),
+            ),
+            (ActorName::System, "system", Some("System")),
+            (ActorName::Masked, "masked", None),
+            (ActorName::Module, "module", None),
+            (ActorName::NotRecorded, "not_recorded", None),
+            (ActorName::Unavailable, "unavailable", None),
+            (ActorName::Unknown, "unknown", None),
+        ]
+    }
+
+    #[test]
+    fn each_status_is_on_the_wire_and_the_name_key_only_with_a_name() {
+        for (name, status, shown) in every_name() {
+            let mut dto = render_record(&record(ActorClassification::Public), false, true, true);
+            dto.name_actor(name);
+            let wire = serde_json::to_value(&dto).expect("a record serializes");
+            let object = wire.as_object().expect("an object");
+            assert_eq!(object["actor_name_status"], json!(status));
+            match shown {
+                Some(shown) => assert_eq!(object["actor_name"], json!(shown), "{status}"),
+                None => assert!(!object.contains_key("actor_name"), "{status}: {wire}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_masked_record_reads_masked_before_and_after_any_answer() {
+        // Masked for the entitlement, and withheld by the boundary.
+        for (may_read_pii, actor_shown) in [(false, true), (true, false), (false, false)] {
+            let rendered = render_record(
+                &record(ActorClassification::Pii),
+                false,
+                may_read_pii,
+                actor_shown,
+            );
+            assert!(rendered.actor_masked);
+            assert_eq!(rendered.actor_name_status, "masked");
+            assert_eq!(rendered.actor_name, None);
+            // Whatever a resolver answers, a masked record takes no name.
+            for (name, _, _) in every_name() {
+                let mut dto = rendered.clone();
+                dto.name_actor(name);
+                assert_eq!(dto.actor_name_status, "masked");
+                assert_eq!(dto.actor_name, None);
+                let wire = serde_json::to_value(&dto).expect("a record serializes");
+                assert!(wire.get("actor_name").is_none(), "{wire}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unmasked_record_without_an_answer_carries_no_name() {
+        let dto = render_record(&record(ActorClassification::Public), false, true, true);
+        assert_eq!(dto.actor_name_status, "unavailable");
+        assert_eq!(dto.actor_name, None);
+    }
+
+    #[test]
+    fn a_definition_record_has_no_tenant_key() {
+        let mut definition = record(ActorClassification::Public);
+        definition.tenant_id = None;
+        let wire = serde_json::to_value(render_record(&definition, false, true, true))
+            .expect("a record serializes");
+        assert!(wire.get("tenant_id").is_none(), "{wire}");
+        let scoped = serde_json::to_value(render_record(
+            &record(ActorClassification::Public),
+            false,
+            true,
+            true,
+        ))
+        .expect("a record serializes");
+        assert_eq!(scoped["tenant_id"], json!(Uuid::nil().to_string()));
+    }
+
+    #[test]
+    fn the_schema_spells_the_status_as_an_open_string_and_the_name_as_optional() {
+        use utoipa::PartialSchema;
+        let schema = serde_json::to_value(AuditRecordDto::schema()).expect("a schema serializes");
+        let status = &schema["properties"]["actor_name_status"];
+        assert_eq!(status["type"], json!("string"), "{status}");
+        assert!(status.get("enum").is_none(), "an open string: {status}");
+        // The doc comment's line breaks are not part of a value's spelling.
+        let described = status["description"]
+            .as_str()
+            .expect("a description")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for (_, value, _) in every_name() {
+            assert!(described.contains(&format!("`{value}`")), "{value}");
+        }
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("required fields")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(required.contains(&"actor_name_status"), "{required:?}");
+        assert!(!required.contains(&"actor_name"), "{required:?}");
+        assert!(!required.contains(&"tenant_id"), "{required:?}");
     }
 }
 
@@ -581,4 +691,36 @@ fn the_collapsed_entry_carries_its_two_facts_and_nothing_else() {
     assert!(!entry.needs_review && !entry.set_by_withheld);
     assert!(entry.scope.is_none() && entry.tenant_id.is_none());
     assert!(entry.set_by.is_none() && entry.last_change_at.is_none());
+}
+
+#[test]
+fn the_matched_field_is_the_searchs_wire_spelling_and_absent_when_nothing_matched() {
+    use crate::domain::search::MatchedField;
+
+    for (field, spelling) in [
+        (MatchedField::Key, "key"),
+        (MatchedField::DisplayName, "display_name"),
+        (MatchedField::Description, "description"),
+        (MatchedField::CategoryName, "category_name"),
+        (MatchedField::DefaultValue, "default_value"),
+        (MatchedField::Value, "value"),
+    ] {
+        let item = super::SettingItemDto::not_found("k").with_matched_field(Some(field));
+        let wire = serde_json::to_value(&item).expect("serializes");
+        assert_eq!(wire["matched_field"], json!(spelling));
+    }
+    for item in [
+        super::SettingItemDto::not_found("k"),
+        super::SettingItemDto::not_found("k").with_matched_field(None),
+        super::SettingItemDto::resolved(render(&effective("public"), false, Reader::Platform, &[])),
+    ] {
+        let wire = serde_json::to_value(&item).expect("serializes");
+        assert!(
+            !wire
+                .as_object()
+                .expect("an object")
+                .contains_key("matched_field"),
+            "{wire}"
+        );
+    }
 }

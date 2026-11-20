@@ -1,19 +1,22 @@
 //! The gear scaffold and its initialization.
 //!
+//! The gear's GTS declarations (the setting-type base, the resource types, the
+//! value-type catalogue and the permission catalogue) are published by the
+//! runtime through `gts_publication(...)` and admitted before any `init`.
 //! `init` validates the deployment configuration fail-closed, acquires the
-//! database, registers the setting-type base with the types registry, builds
-//! every service, and registers `SettingsReaderClient` and
+//! database, builds every service, and registers `SettingsReaderClient` and
 //! `SettingsContributionClient` into `ClientHub` for the gears that consume
 //! them. No `@cpt-dod` marker for `dod-gear-foundation-gear-scaffold` yet:
-//! that definition of done also asks for the remaining GTS control-plane
-//! schemas and the category seed at init, which are still open. The marker
-//! lands with the tick.
+//! that definition of done also asks for the effective value, change set and
+//! event schemas, which are not published yet, and for the category seed at
+//! init. Category, declaration and value are published as authorization-label
+//! stubs, which register the identifier and constrain nothing; that is
+//! deliberate. The marker lands with the tick.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use authz_resolver_sdk::PolicyEnforcer;
 use sea_orm_migration::MigrationTrait;
 use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
@@ -23,6 +26,7 @@ use toolkit_db::{DBProvider, DbError};
 use tracing::info;
 use types_registry_sdk::TypesRegistryClient;
 
+use crate::api::authz::PermissionEnforcer;
 use crate::domain::declaration::DeclarationStatus;
 use crate::domain::metric_labels::{DeclarationSource, ScopeClass, ScopeKind};
 use crate::domain::platform_scope::PlatformScope;
@@ -37,8 +41,9 @@ use crate::log_text::LogSafe;
 /// Holds what initialization resolves, so later phases can hang services off it
 /// without changing the startup contract.
 ///
-/// `deps` names the one gear this service calls during its **own** init — the
-/// types registry — because a `deps` entry is an ordering claim that a gear
+/// `deps` names only the gears whose clients this service resolves during its
+/// **own** init — the types registry and the credential store —
+/// because a `deps` entry is an ordering claim that a gear
 /// reading settings during *its* init could turn into an unsortable cycle
 /// (DESIGN.md §4.9). Everything else is consumed: the authorization resolver is
 /// declared below and wired by the runtime's proxy-wiring phase after init, so
@@ -59,12 +64,13 @@ pub type ConcreteResolver = crate::domain::resolution::ValueResolver<
     name = "settings-service",
     deps = [types_registry, credstore],
     capabilities = [db, rest, stateful],
-    lifecycle(entry = "serve", stop_timeout = "30s", await_ready)
+    lifecycle(entry = "serve", stop_timeout = "30s", await_ready),
+    gts_publication(crates = [crate, settings_service_sdk])
 )]
 pub struct SettingsService {
     config: OnceLock<Arc<SettingsServiceConfig>>,
     db: OnceLock<Arc<DBProvider<DbError>>>,
-    enforcer: OnceLock<Arc<PolicyEnforcer>>,
+    enforcer: OnceLock<Arc<PermissionEnforcer>>,
     names: OnceLock<Arc<crate::infra::actor_names::ActorNameResolver>>,
     security: OnceLock<Arc<dyn crate::domain::ports::SecurityMetrics>>,
     types: OnceLock<Arc<dyn TypesRegistryClient>>,
@@ -561,7 +567,7 @@ impl SettingsService {
     ///
     /// # Errors
     /// Returns an error when called before [`Gear::init`].
-    pub fn enforcer(&self) -> anyhow::Result<Arc<PolicyEnforcer>> {
+    pub fn enforcer(&self) -> anyhow::Result<Arc<PermissionEnforcer>> {
         self.enforcer
             .get()
             .cloned()
@@ -714,11 +720,12 @@ impl Gear for SettingsService {
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
         // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-6
-        // The one client called during our own init, and therefore the one
-        // `deps` entry: registering the settings GTS schemas is a real call into
-        // the registry, so it must already be up. A registry that is absent must
-        // not first be discovered by a read that has already passed
-        // authorization and reached the database.
+        // The client called during our own init, and therefore a `deps` entry:
+        // the type validator and the setting-type registrar built below call the
+        // registry, so it must already be up. The gear's own GTS declarations are
+        // not part of that: the runtime publishes them before any `init`. A
+        // registry that is absent must not first be discovered by a read that
+        // has already passed authorization and reached the database.
         let types = ctx
             .client_hub()
             .get::<dyn TypesRegistryClient>()
@@ -744,7 +751,7 @@ impl Gear for SettingsService {
         // an ordering claim on the rest of the platform (DESIGN.md §4.9).
         let hub = ctx.client_hub();
         self.enforcer
-            .set(Arc::new(PolicyEnforcer::from_hub(Arc::clone(&hub))))
+            .set(Arc::new(PermissionEnforcer::from_hub(Arc::clone(&hub))))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
         // Actor names on the history read: AM is found in the hub at each pass.
         self.names

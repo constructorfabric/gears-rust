@@ -22,11 +22,19 @@ pub mod reason {
     pub const KEY_NOT_NAMESPACED: &str = "key_not_namespaced";
     /// The named value type is not registered.
     pub const VALUE_TYPE_UNKNOWN: &str = "value_type_unknown";
+    /// The named type is not a value type: one of this gear's own types
+    /// outside the catalogue, or an abstract type.
+    pub const NOT_A_VALUE_TYPE: &str = "not_a_value_type";
+    /// The named type is registered, but its schema does not build into a
+    /// validator, so no value of it could be checked.
+    pub const VALUE_TYPE_UNSUPPORTED: &str = "value_type_unsupported";
     /// The Schema Default fails its value type.
     pub const DEFAULT_INVALID: &str = "default_invalid";
     /// A supplied `display_name` is empty after trimming, over 256 characters,
     /// or contains a control character.
     pub const DISPLAY_NAME_INVALID: &str = "display_name_invalid";
+    /// A supplied `description` is over 4096 characters.
+    pub const DESCRIPTION_TOO_LONG: &str = "description_too_long";
     /// A secret-trait type was given a non-empty default.
     pub const SECRET_DEFAULT_NOT_EMPTY: &str = "secret_default_not_empty";
     /// The caller's classification contradicts the value type's trait.

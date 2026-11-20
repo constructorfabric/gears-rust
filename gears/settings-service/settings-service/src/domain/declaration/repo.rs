@@ -248,6 +248,11 @@ pub struct BrowseCandidate {
     /// Whether the declaration text (`key`, `display_name`, `description`,
     /// category name, Schema Default) contains the needle.
     pub text_matched: bool,
+    /// The name of the declaration's category, as the text read could match
+    /// it — within the domains the caller may see — for attributing a text
+    /// match to its field. Read for the candidates whose text matched only;
+    /// `None` for every other, and for a category outside those domains.
+    pub category_name: Option<String>,
     /// The forward cursor positioned after this row, not yet encoded; the
     /// same position with `d = "bwd"` is the cursor before it.
     pub position: CursorV1,

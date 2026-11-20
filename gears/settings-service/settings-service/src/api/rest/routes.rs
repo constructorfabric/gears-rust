@@ -42,7 +42,7 @@ pub fn register_routes(
     service: Arc<CategoryService<CategoryRepo, AuditStore>>,
     resolver: Arc<ConcreteResolver>,
     db: Arc<DBProvider<DbError>>,
-    enforcer: Arc<authz_resolver_sdk::PolicyEnforcer>,
+    enforcer: Arc<crate::api::authz::PermissionEnforcer>,
 ) -> Router {
     // @cpt-begin:cpt-cf-settings-service-flow-category-management-list:p1:inst-cat-list-1
     let router = OperationBuilder::get("/settings-service/v1/categories")

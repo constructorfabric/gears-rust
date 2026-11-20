@@ -1336,3 +1336,39 @@ async fn a_failed_inventory_refresh_publishes_nothing_so_the_gauges_keep_their_l
     assert!(metrics.declarations.lock().expect("lock").is_empty());
     assert!(metrics.values.lock().expect("lock").is_empty());
 }
+
+/// The gear's publication manifest: what the runtime hands to the types
+/// registry before any `init`. It merges the collectors of this crate and of
+/// the SDK, so both the permission catalogue and the SDK's schemas are in it.
+#[test]
+fn the_publication_manifest_carries_the_catalogue_and_the_sdk_schemas() {
+    use toolkit::gts_publication::GtsPublicationCapability as _;
+
+    let gear = SettingsService::default();
+    let manifest = gear
+        .descriptor()
+        .build_gts_manifest(&FixedConfig(serde_json::json!({ "config": {} })))
+        .expect("the manifest builds");
+    let ids: Vec<&str> = manifest.documents().iter().map(|(id, _)| id.id()).collect();
+
+    let permissions = ids
+        .iter()
+        .filter(|id| id.starts_with("gts.cf.toolkit.authz.permission.v1~cf.core.settings."))
+        .count();
+    assert_eq!(permissions, crate::api::authz::Permission::ALL.len());
+    for wanted in [
+        settings_service_sdk::gts::SETTING_TYPE_BASE,
+        settings_service_sdk::gts::DECLARATION_SCHEMA,
+        settings_service_sdk::gts::VALUE_SCHEMA,
+        settings_service_sdk::gts::CATEGORY_SCHEMA,
+    ] {
+        assert!(ids.contains(&wanted), "`{wanted}` is in the manifest");
+    }
+    for value_type in settings_service_sdk::catalogue::CATALOGUE {
+        assert!(
+            ids.contains(&value_type.id),
+            "`{}` is in the manifest",
+            value_type.id
+        );
+    }
+}

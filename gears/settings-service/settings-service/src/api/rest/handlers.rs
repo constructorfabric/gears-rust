@@ -15,7 +15,7 @@ use toolkit_db::secure::DBRunner;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use crate::api::authz::{self, resource};
+use crate::api::authz::{Permission, PermissionEnforcer};
 use crate::api::rest::dto::CategoryDto;
 use crate::api::rest::if_match;
 use crate::api::rest::page_dto::PageDto;
@@ -32,12 +32,6 @@ pub type ConcreteCategoryService = CategoryService<
     crate::infra::storage::category_repo::CategoryRepo,
     crate::infra::storage::audit_store::AuditStore,
 >;
-
-/// The operations authorization decisions are made against.
-const READ: authz::Operation = authz::Operation::Read;
-const CREATE: authz::Operation = authz::Operation::Create;
-const UPDATE: authz::Operation = authz::Operation::Update;
-const DELETE: authz::Operation = authz::Operation::Delete;
 
 // @cpt-dod:cpt-cf-settings-service-dod-category-management-counts:p1
 /// How many settings each of `category_ids` holds for the caller, or nothing
@@ -57,7 +51,7 @@ const DELETE: authz::Operation = authz::Operation::Delete;
 /// [`DomainError`] when the caller's chain or the tallies cannot be read; a
 /// denied or unobtainable decision is not an error here but an absent count.
 async fn category_tallies<C: DBRunner>(
-    enforcer: &authz_resolver_sdk::PolicyEnforcer,
+    enforcer: &PermissionEnforcer,
     ctx: &SecurityContext,
     resolver: &ConcreteResolver,
     conn: &C,
@@ -66,7 +60,7 @@ async fn category_tallies<C: DBRunner>(
     // @cpt-begin:cpt-cf-settings-service-flow-category-management-list:p1:inst-cat-list-10
     // @cpt-begin:cpt-cf-settings-service-flow-category-management-get:p1:inst-cat-get-9
     // A known refusal is an absent count; any other failure is an error.
-    let Some(scope) = authz::optional_scope(enforcer, ctx, &resource::VALUE, READ).await? else {
+    let Some(scope) = enforcer.optional_scope(ctx, Permission::ValueRead).await? else {
         return Ok(None);
     };
     let caller_chain = resolver.chain_of(ctx.subject_tenant_id()).await?;
@@ -102,21 +96,15 @@ pub async fn get_category<R: CategoryRepository + 'static, S: AuditSink + 'stati
     Extension(svc): Extension<Arc<CategoryService<R, S>>>,
     Extension(resolver): Extension<Arc<ConcreteResolver>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
-    Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(enforcer): Extension<Arc<PermissionEnforcer>>,
     Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<impl IntoResponse> {
     // @cpt-begin:cpt-cf-settings-service-flow-category-management-get:p1:inst-cat-get-2
     // @cpt-begin:cpt-cf-settings-service-flow-category-management-get:p1:inst-cat-get-3
-    let scope = authz::access_scope(
-        &enforcer,
-        security.as_ref(),
-        &ctx,
-        &resource::CATEGORY,
-        READ,
-        Some(id),
-    )
-    .await?;
+    let scope = enforcer
+        .access_scope(security.as_ref(), &ctx, Permission::CategoryRead, Some(id))
+        .await?;
     // @cpt-end:cpt-cf-settings-service-flow-category-management-get:p1:inst-cat-get-3
     // @cpt-end:cpt-cf-settings-service-flow-category-management-get:p1:inst-cat-get-2
 
@@ -160,21 +148,15 @@ pub async fn list_categories<R: CategoryRepository + 'static, S: AuditSink + 'st
     Extension(svc): Extension<Arc<CategoryService<R, S>>>,
     Extension(resolver): Extension<Arc<ConcreteResolver>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
-    Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(enforcer): Extension<Arc<PermissionEnforcer>>,
     Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     OData(query): OData,
 ) -> ApiResult<impl IntoResponse> {
     // @cpt-begin:cpt-cf-settings-service-flow-category-management-list:p1:inst-cat-list-2
     // @cpt-begin:cpt-cf-settings-service-flow-category-management-list:p1:inst-cat-list-3
-    let scope = authz::access_scope(
-        &enforcer,
-        security.as_ref(),
-        &ctx,
-        &resource::CATEGORY,
-        READ,
-        None,
-    )
-    .await?;
+    let scope = enforcer
+        .access_scope(security.as_ref(), &ctx, Permission::CategoryRead, None)
+        .await?;
     // @cpt-end:cpt-cf-settings-service-flow-category-management-list:p1:inst-cat-list-3
     // @cpt-end:cpt-cf-settings-service-flow-category-management-list:p1:inst-cat-list-2
 
@@ -211,7 +193,7 @@ pub async fn create_category<R: CategoryRepository + 'static, S: AuditSink + 'st
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<CategoryService<R, S>>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
-    Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(enforcer): Extension<Arc<PermissionEnforcer>>,
     Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     headers: axum::http::HeaderMap,
     Json(body): Json<crate::api::rest::dto::CreateCategoryRequest>,
@@ -220,15 +202,9 @@ pub async fn create_category<R: CategoryRepository + 'static, S: AuditSink + 'st
     // @cpt-begin:cpt-cf-settings-service-flow-category-management-create:p1:inst-cat-create-3
     // A denial and an unobtainable decision are one branch: `access_scope`
     // fails closed, so neither can reach the write below.
-    let scope = authz::access_scope(
-        &enforcer,
-        security.as_ref(),
-        &ctx,
-        &resource::CATEGORY,
-        CREATE,
-        None,
-    )
-    .await?;
+    let scope = enforcer
+        .access_scope(security.as_ref(), &ctx, Permission::CategoryCreate, None)
+        .await?;
     // @cpt-end:cpt-cf-settings-service-flow-category-management-create:p1:inst-cat-create-3
     // @cpt-end:cpt-cf-settings-service-flow-category-management-create:p1:inst-cat-create-2
 
@@ -286,7 +262,7 @@ pub async fn update_category<R: CategoryRepository + 'static, S: AuditSink + 'st
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<CategoryService<R, S>>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
-    Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(enforcer): Extension<Arc<PermissionEnforcer>>,
     Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Path(id): Path<Uuid>,
     headers: axum::http::HeaderMap,
@@ -294,15 +270,14 @@ pub async fn update_category<R: CategoryRepository + 'static, S: AuditSink + 'st
 ) -> ApiResult<impl IntoResponse> {
     // @cpt-begin:cpt-cf-settings-service-flow-category-management-update:p1:inst-cat-update-2
     // @cpt-begin:cpt-cf-settings-service-flow-category-management-update:p1:inst-cat-update-3
-    let scope = authz::access_scope(
-        &enforcer,
-        security.as_ref(),
-        &ctx,
-        &resource::CATEGORY,
-        UPDATE,
-        Some(id),
-    )
-    .await?;
+    let scope = enforcer
+        .access_scope(
+            security.as_ref(),
+            &ctx,
+            Permission::CategoryUpdate,
+            Some(id),
+        )
+        .await?;
     // @cpt-end:cpt-cf-settings-service-flow-category-management-update:p1:inst-cat-update-3
     // @cpt-end:cpt-cf-settings-service-flow-category-management-update:p1:inst-cat-update-2
     let patch = body.into_patch()?;
@@ -347,22 +322,21 @@ pub async fn delete_category<R: CategoryRepository + 'static, S: AuditSink + 'st
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<CategoryService<R, S>>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
-    Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(enforcer): Extension<Arc<PermissionEnforcer>>,
     Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Path(id): Path<Uuid>,
     headers: axum::http::HeaderMap,
 ) -> ApiResult<impl IntoResponse> {
     // @cpt-begin:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-2
     // @cpt-begin:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-3
-    let scope = authz::access_scope(
-        &enforcer,
-        security.as_ref(),
-        &ctx,
-        &resource::CATEGORY,
-        DELETE,
-        Some(id),
-    )
-    .await?;
+    let scope = enforcer
+        .access_scope(
+            security.as_ref(),
+            &ctx,
+            Permission::CategoryDelete,
+            Some(id),
+        )
+        .await?;
     // @cpt-end:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-3
     // @cpt-end:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-2
 

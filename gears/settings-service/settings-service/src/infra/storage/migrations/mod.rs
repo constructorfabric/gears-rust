@@ -27,6 +27,7 @@ mod m20260925_000002_audit_retention_policy;
 mod m20260925_000003_audit_retention_policy_seed;
 mod m20261014_000001_declaration_display_name;
 mod m20261015_000001_setter_tenant;
+mod m20261114_000001_audit_records_subtree_history_index;
 
 /// The gear's migrations, oldest first.
 pub struct Migrator;
@@ -50,6 +51,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260925_000003_audit_retention_policy_seed::Migration),
             Box::new(m20261014_000001_declaration_display_name::Migration),
             Box::new(m20261015_000001_setter_tenant::Migration),
+            Box::new(m20261114_000001_audit_records_subtree_history_index::Migration),
         ]
     }
 }

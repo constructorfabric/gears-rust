@@ -15,8 +15,8 @@ gts.cf.core.settings.setting_type.v1~acme.billing.network.enable_proxy.v1~
 └──── gear-owned abstract base ────┘└──── the setting, four tokens ─────┘
 ```
 
-- The **base** is owned by the Settings gear, defined here and registered at
-  gear init.
+- The **base** is owned by the Settings gear, defined here and published with
+  the gear's manifest before any init.
 - The **derived half** is the setting: `<vendor>.<package>.<category>.<name>`
   before its version, the category always the third token. A module supplies
   its own half; an admin-authored setting is composed as

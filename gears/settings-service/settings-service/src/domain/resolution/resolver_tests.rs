@@ -1314,6 +1314,13 @@ struct CountingValidator {
 
 #[async_trait::async_trait]
 impl crate::domain::validation::TypeValidator for CountingValidator {
+    async fn ensure_value_type(
+        &self,
+        value_type_id: &str,
+    ) -> Result<Result<(), crate::domain::validation::ValueTypeRefusal>, DomainError> {
+        self.inner.ensure_value_type(value_type_id).await
+    }
+
     async fn validate_value(
         &self,
         value_type_id: &str,

@@ -55,7 +55,7 @@ Chosen option: **"Each setting is its own registered GTS type"**, because it is 
 
 The key is `gts.cf.core.settings.setting_type.v1~<vendor>.<package>.<category>.<name>.v1~`:
 
-1. The **abstract base** `gts.cf.core.settings.setting_type.v1~` is owned by the Settings gear, defined in its SDK, and registered at gear init. It is not part of `libs/toolkit-gts`.
+1. The **abstract base** `gts.cf.core.settings.setting_type.v1~` is owned by the Settings gear, defined in its SDK, and published with the gear's manifest before any `init`. It is not part of `libs/toolkit-gts`.
 2. The **derived half** is the setting. It carries exactly four name tokens before its version — `<vendor>.<package>.<category>.<name>` — with no `gts.` prefix of its own. The **category is always the third token**: a module supplies its own half and the category is read from `<namespace>`; an admin setting is composed as `<vendor>.settings.<category>.<name>.v1`, the admin supplying `<vendor>` and `<name>`.
 3. The trailing `~` makes the key a **type**, not an instance — which is what lets a policy name a single setting.
 4. Both authoring paths call `register_type_schemas` **before** inserting the declaration row, composing the concrete schema from the base and the setting's `value_type_id`. The composed schema carries **no `default`**: the Schema Default lives in the `default_value` column alone. Registration is idempotent, so a retried create re-registers the same type rather than minting a second one.

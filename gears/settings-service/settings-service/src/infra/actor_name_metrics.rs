@@ -17,8 +17,8 @@ const LOOKUP_DURATION_BUCKETS_SECONDS: &[f64] =
 /// `settings_actor_name_lookups_total` and
 /// `settings_actor_name_lookup_duration_seconds`, both by `result`: `ok`,
 /// `degraded` (a chunk failed, timed out or hit the budget) or `skipped` (no
-/// lookup was made). A rising `degraded` share is the signal that names are
-/// reading `null` because Account Management is slow or failing.
+/// lookup was made). A rising `degraded` share is the signal that actors are
+/// reading `unavailable` because Account Management is slow or failing.
 pub struct OtelActorNameMetrics {
     lookups: Counter<u64>,
     duration: Histogram<f64>,
