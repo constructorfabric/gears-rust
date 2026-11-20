@@ -18,7 +18,7 @@ level. [DESIGN_REVIEW.md](DESIGN_REVIEW.md) §3 defines how review severity depe
 | `maturity`    | Crates                                | Promise to consumers                                                 |
 |---------------|---------------------------------------|----------------------------------------------------------------------|
 | `unpublished` | not published (`publish = false`)    | None. Usable only through a git dependency.                          |
-| `preview`     | published, version `0.x`              | Usable. Breaking changes only in a `0.(x+1)` release, with a migration note. |
+| `preview`     | published, version `0.x`              | Usable. Breaking changes only in a `0.(x+1)` release, with a [migration note](../CONTRIBUTING.md#migration-notes). |
 | `stable`      | published, version `>= 1.0`           | SemVer and the deprecation policy of [CONTRIBUTING.md §3](../CONTRIBUTING.md#3-versioning). |
 | `deprecated`  | published, any version                | The promise of the level it had before. Names its replacement.       |
 
@@ -43,12 +43,12 @@ how much of the specification is built; the level shows how proven the built par
 
 | Area | `unpublished` | `preview` | `stable` |
 |---|---|---|---|
-| Rust SDK API | Free. Update in-repo callers in the same PR. | Breaking change = `0.(x+1)` + `feat!` + migration note. | Breaking change = next major (`2.0`). A previous `1.x` minor marks the old item `#[deprecated]` and adds its replacement. |
-| Wire contracts (REST, gRPC, event, GTS, MCP, config) | Free. | Compatible with the previous release (rolling deploy). | Additive only. Breaking change = new path or type version; the old one keeps working ([CONTRIBUTING.md §3](../CONTRIBUTING.md#3-versioning)). |
+| Rust SDK API | No compatibility requirement. Any PR may break the API without a version bump or migration note; the same PR updates every caller in this repository. | Breaking change = `0.(x+1)` + `feat!` + [migration note](../CONTRIBUTING.md#migration-notes). | Breaking change = next major (`2.0`). A previous `1.x` minor marks the old item `#[deprecated]` and adds its replacement. Migration note required. |
+| Wire contracts (REST, gRPC, event, GTS, MCP, config) | No compatibility requirement between commits: environments are redeployed or reset, not rolled. GTS types use major `v0`. | Compatible with the previous release (rolling deploy). GTS types use major `v1` or higher; a breaking change is the next major, served next to the old one. | Additive only. Breaking change = new path or type major; the old one keeps working ([CONTRIBUTING.md §3](../CONTRIBUTING.md#3-versioning)). |
 | Persisted data | Migrations may be rewritten while no environment keeps data. | Forward-only. The previous release runs on the new schema. | Same, plus expand/contract and a tested rollback to the previous release. |
 | Specifications | Short PRD (p1) and a DESIGN for contracts, data, and tenancy. | PRD and DESIGN match the code. The maturity card lists the gaps. | Full PRD, DESIGN, and ADRs. Contract and data changes are designed and reviewed before implementation. |
-| Unstable features (§4) | Not applicable: the whole gear is unstable. | Allowed, gated. | Allowed only as `alpha` or `beta` features, gated. |
-| Tests | No minimum. | Unit coverage >= 85%. Every p1 use case has an integration or e2e test. | Unit coverage >= 90%. Every p1 and p2 use case has an integration or e2e test. |
+| Unstable features (§4) | Not applicable: no part of the gear has a promise. | Optional. A new feature may ship as `alpha` or `beta` behind its compile-time and runtime gates (§4.1). | Required for every new feature that is not proven: it ships as `alpha` or `beta` behind its gates (§4.1), never as a change to the stable surface. |
+| Tests | No minimum. | Unit coverage >= 80%. Every p1 use case has an integration or e2e test. | Unit coverage >= 90%. Every p1 and p2 use case has an integration or e2e test. |
 | Security, tenant isolation, secrets | Full rules. | Full rules. | Full rules. |
 
 **Why wire contracts need compatibility earlier than the Rust API.** During every rolling deploy,
@@ -107,9 +107,10 @@ A pull request sets `maturity = "preview"`, removes `publish = false`, and sets 
 
 A pull request sets `maturity = "stable"` and the version to `1.0.0`. It is a formal acceptance:
 
-1. **Production evidence.** At least one named consumer has run the gear in production for at
-   least N releases of the gear (default N = 3, and at least 60 days).
-2. **Contract stability.** No `feat!` or `BREAKING CHANGE` in the last N releases.
+1. **Production evidence.** At least one named consumer runs the gear in production. The gear
+   owner decides how long and over how many releases, and records the evidence in the promotion
+   pull request.
+2. **Contract stability.** No `feat!` or `BREAKING CHANGE` during that period.
 3. **Quality.** No known critical or major functional, security, or performance bug. No open
    CRITICAL or HIGH review finding. Each known gap is closed or accepted in an ADR.
 4. **Operations.** Limits, timeouts, metrics, alerts, and a tested rollback to the previous release
@@ -137,12 +138,55 @@ promise must hold for everyone who does not use that feature. This section separ
 
 | Stage | Built by default | Enabled by default | Promise | Production use |
 |---|---|---|---|---|
-| `alpha` | No: Cargo feature `unstable-<feature>` | No | None. May change or disappear in any release. Its data may be dropped. | No |
-| `beta` | Yes | No: runtime opt-in | Breaking change only in a minor release, after one release of notice, with a migration note. Its data is migrated, never dropped silently. | Yes, by opted-in consumers |
-| `ga` | Yes | Yes | The gear's stable promise. | Yes |
+| `alpha` | No: the gear's Cargo feature `unstable-<feature>` is not in `default` | No | None. May change or disappear in any release. Its data may be dropped. | No |
+| `beta` | Yes: the gear's `default` features include `unstable-<feature>` | No: runtime opt-in | Breaking change only in a minor release, after one release of notice, with a [migration note](../CONTRIBUTING.md#migration-notes). Its data is migrated, never dropped silently. | Yes, by opted-in consumers |
+| `ga` | Yes, no Cargo feature | Yes, no flag | The gear's stable promise. | Yes |
 
 A feature starts at `alpha` or `beta`. It moves to `ga` (§4.4) or is removed. Small, low-risk
 additive changes that pass a stable-level review may go to `ga` directly.
+
+**Gated** means the feature's code does nothing unless someone turns it on. Every `alpha` and
+`beta` feature has two gates:
+
+1. **Compile-time gate**: the Cargo feature `unstable-<feature>`, declared on the gear crate and on
+   its SDK crate. Unstable SDK items exist only with this feature, so a Rust consumer opts in
+   explicitly. It is never in the SDK crate's `default` features. In the gear crate it is in
+   `default` for `beta` (prebuilt servers contain the code) and not for `alpha`.
+2. **Runtime gate**: the configuration flag `features.<feature>.enabled` in the gear's `config`
+   section, default `false`. While it is `false`, the gear registers no route, ClientHub client,
+   MCP tool, GTS type, event consumer, or background job of the feature.
+
+Example for a `beta` feature `bulk-import` in the `file-storage` gear:
+
+```toml
+# gears/file-storage/file-storage-sdk/Cargo.toml
+[features]
+unstable-bulk-import = []
+
+# gears/file-storage/file-storage/Cargo.toml
+[features]
+default = ["unstable-bulk-import"]          # beta: built by default; remove for alpha
+unstable-bulk-import = ["file-storage-sdk/unstable-bulk-import"]
+```
+
+```yaml
+# deployment configuration
+gears:
+  file-storage:
+    config:
+      features:
+        bulk_import:
+          enabled: true                     # default: false
+```
+
+```rust
+// gear init: register the feature only when both gates are open
+#[cfg(feature = "unstable-bulk-import")]
+if cfg.features.bulk_import.enabled {
+    bulk_import::register_routes(&mut router, &deps)?;   // /file-storage/v1beta/...
+    hub.register::<dyn BulkImportUnstableApi>(bulk_import::client(&deps));
+}
+```
 
 ### 4.2 Isolation rules
 
@@ -161,9 +205,8 @@ HIGH in review (DESIGN_REVIEW.md G1, G2).
 4. **Security is never gated.** Authentication, authorization, tenant isolation, and secret
    handling follow the full rules from the first `alpha` commit. A disabled or missing flag denies
    access; it never widens it.
-5. **One flag per feature.** The runtime flag lives in the gear configuration
-   (`features.<feature>.enabled`, default `false`). A tenant-level switch, when needed, is a
-   setting or a license feature on top of the deployment flag, never instead of it.
+5. **One runtime flag per feature** (§4.1). A tenant-level switch, when needed, is a setting or a
+   license feature on top of the deployment flag, never instead of it.
 6. **Visible usage.** The gear emits a metric per enabled unstable feature, and logs one warning
    at startup for each enabled `alpha` feature.
 
@@ -171,11 +214,11 @@ HIGH in review (DESIGN_REVIEW.md G1, G2).
 
 | Contract | Mechanism |
 |---|---|
-| Rust SDK | Items behind the Cargo feature `unstable-<feature>` in an `unstable` module, with `#[cfg_attr(docsrs, doc(cfg(...)))]`. New operations go on a separate trait (for example `FooUnstableApi`) that the gear registers in ClientHub only when the flag is on. Never add a method to a stable trait for an unstable feature. New variants only on `#[non_exhaustive]` enums. Semver checks run without `unstable-*` features; these items are exempt from SemVer. |
-| REST | Unstable operations and fields are served only under the beta channel path `/{gear}/v{N}beta/...`, which is a superset of `/v{N}`. The `/v{N}` paths and their OpenAPI document do not change. Operations carry `x-cf-stage: alpha|beta` in OpenAPI. With the flag off, beta routes are not registered (`404`). |
+| Rust SDK | Items behind the compile-time gate `unstable-<feature>` in an `unstable` module, with `#[cfg_attr(docsrs, doc(cfg(...)))]`. New operations go on a separate trait (for example `FooUnstableApi`) that the gear registers in ClientHub only when the flag is on. Never add a method to a stable trait for an unstable feature. New variants only on `#[non_exhaustive]` enums. Semver checks run without `unstable-*` features; these items are exempt from SemVer. |
+| REST | Unstable operations and fields are served only under the beta channel path `/{gear}/v{N}beta/...`, which is a superset of `/v{N}`. The `/v{N}` paths and their OpenAPI document do not change. Operations carry `x-cf-stage: alpha|beta` in OpenAPI. With the flag off, beta routes are not registered (`404`). Prerequisite: lint DE0801 in `cargo-gears` accepts `v{N}beta` (today it accepts only `v` followed by digits). |
 | gRPC | A separate service or package with a `v{N}beta` suffix. Do not add unstable fields to stable messages. |
-| GTS types and events | A new type with major version `v0`. Graduation registers `v1`. Never add unstable fields to a stable type; use a derived type. Consumers opt in by subscribing to the `v0` type. |
-| MCP tools | A separate tool name with a `.v0` version, registered only when the flag is on. |
+| GTS types and events | A new type, registered only when the flag is on. `alpha`: major `v0`. `beta`: major `v1` or higher, compatible within the major, and it keeps its identifier at graduation. Never add unstable fields to a stable type; use a new or derived type. Consumers opt in by subscribing to the new type. See §4.6. |
+| MCP tools | A separate tool, registered only when the flag is on. Its version follows the GTS row. |
 | Configuration | Keys under `features.<feature>`. Unknown keys under `features` are ignored with a warning, so removing a feature does not break existing configuration files. |
 | Persisted data | Additive schema only (§4.2 rule 3). `beta` data is migrated forward like stable data. `alpha` data may be dropped only when the card says so and the release notes announce it. |
 
@@ -189,8 +232,9 @@ HIGH in review (DESIGN_REVIEW.md G1, G2).
    table; a change to the gating, the isolation rules, or any stable surface is reviewed with the
    `stable` column (DESIGN_REVIEW.md §3).
 3. **Graduate to `ga`.** In a minor release: the contract moves to the stable surface (`/v{N}`,
-   `v1` GTS type, default SDK features), the flag defaults to `true`, and the PR records the
-   production evidence (a named consumer, no breaking change for N releases). The beta path and
+   default SDK features; a `beta` GTS type keeps its identifier), the flag defaults to `true`, and
+   the PR records the production evidence (a named consumer, no breaking change during the period
+   the gear owner chose). The beta path and
    the `unstable-<feature>` Cargo feature stay one more minor release as deprecated aliases, then
    are removed. The flag is removed one release later.
 4. **Time limit.** A feature reaches `ga` or is removed within 4 minor releases or 6 months after
@@ -212,6 +256,21 @@ HIGH in review (DESIGN_REVIEW.md G1, G2).
   [CONTRIBUTING.md §3](../CONTRIBUTING.md#3-versioning).
 - **Plan majors.** Each major release costs every consumer a migration. Batch breaking changes and
   avoid more than one major release of a gear's SDK in six months.
+
+### 4.6 GTS major `v0`
+
+The [GTS specification](https://github.com/GlobalTypeSystem/gts-spec) allows major `0` but gives it
+no special meaning: every major, `v0` included, must stay compatible across its minor versions and
+revisions, and Types Registry enforces this. GTS IDs are also stored as deterministic UUIDs, so
+renaming a type changes every stored reference to it. The platform convention is therefore:
+
+- **`v0`** only where nothing is persisted that must survive: `unpublished` gears and `alpha`
+  features. A breaking change to a `v0` type resets the Types Registry and data of the
+  environments that registered it; there are no consumers to protect.
+- **`v1` and higher** for `preview` and `stable` gears and for `beta` features. A breaking change
+  is the next major, served next to the old one.
+- **Renaming `v0` to `v1`** happens once: in the pull request that promotes the gear to `preview`,
+  or the feature to `beta`. The migration note lists the renamed identifiers.
 
 ---
 
@@ -250,6 +309,8 @@ crate versions, and the card in the same pull request.
   `--features unstable-*` (all its unstable features).
 - Semver checks of a `stable` crate run without `unstable-*` features.
 - A `/v{N}beta` route or `unstable-*` Cargo feature in a gear has a matching row in the card.
+- No SDK crate lists an `unstable-*` feature in `default`; a gear crate lists only its `beta` features there.
+- An `unpublished` gear registers only `v0` GTS types; other gears register `v0` types only for `alpha` features.
 
 ---
 
@@ -264,15 +325,18 @@ Existing gears map to the new levels as follows, before CI enforces §6:
 | `preview` | published `0.x` | `preview` |
 | `implementation = "design"` | no crate | reviewed as `unpublished` |
 
-Gearbox accepts `experimental` today. Until Gearbox accepts `unpublished`, `experimental` with
-`publish = false` means `unpublished`.
+`experimental` is renamed to `unpublished`. Prerequisite: Gearbox accepts `unpublished` as a
+`maturity` value. The pull request that renames the value in every `gear.gdl` also turns on the
+CI checks of §6.
 
 ---
 
 ## 8. Open questions
 
-- The value of N for `stable` (default proposed: 3 releases and 60 days).
 - A limit on breaking `0.(x+1)` releases per release train for `preview` gears.
-- The name `unpublished` in Gearbox, or keeping `experimental` as the GDL value.
-- Whether `/{gear}/v{N}beta` passes the versioned REST path lint, or the lint needs an update.
-- Whether the GTS specification gives `v0` the "no compatibility promise" meaning used in §4.3.
+
+## 9. Prerequisites in other repositories
+
+- **Gearbox**: accept `unpublished` as a `maturity` value.
+- **cargo-gears**: DE0801 (`de0801_api_endpoint_version`) accepts the version segment `v{N}beta`
+  in addition to `v{N}`.

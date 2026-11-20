@@ -395,7 +395,7 @@ Then create a Pull Request on GitHub with:
 - Test coverage information
 - The maturity level of each affected gear and, for a `stable` gear, the stage of each changed feature
 - Contract and data impact: none, additive, or breaking, for each public contract (SDK, REST, gRPC, event, GTS, MCP, configuration) and for persisted data
-- For a breaking change: the version bump and the migration note for consumers
+- For a breaking change: the version bump and a link to the [migration note](#migration-notes)
 - For a migration: proof that the previous release works on the new schema
 
 Keep one gear per pull request when a change touches a public contract or persisted data, so the version bump and the review level are unambiguous.
@@ -469,9 +469,9 @@ The crate version follows the gear's maturity level ([MATURITY.md](./guidelines/
 
 | Maturity | Crate version | Breaking change |
 |---|---|---|
-| `unpublished` | any, `publish = false` | free; update in-repo callers in the same PR |
-| `preview` | `0.x` | `0.(x+1).0`, `feat!` or `BREAKING CHANGE`, migration note |
-| `stable` | `>= 1.0` | next major, after the deprecation policy below |
+| `unpublished` | any, `publish = false` | allowed in any PR without a version bump or migration note; the same PR updates every caller in this repository |
+| `preview` | `0.x` | `0.(x+1).0`, `feat!` or `BREAKING CHANGE`, [migration note](#migration-notes) |
+| `stable` | `>= 1.0` | next major, after the deprecation policy below, [migration note](#migration-notes) |
 
 All published crates of a gear share the major version of its SDK crate.
 
@@ -543,7 +543,8 @@ Not breaking (SemVer-wise), but must be documented in changelog/release notes:
 ### Events, GTS types, MCP tools, configuration
 - Additive changes only within a major version of the type, tool, or key.
 - A breaking change is a new major version of the type or tool, served next to the old one.
-- Unstable types use major version `v0`; unstable configuration lives under `features.<feature>`.
+- GTS major `v0` is used only by `unpublished` gears and `alpha` features; `preview` and `stable` gears and `beta` features use `v1` or higher ([MATURITY.md §4.6](./guidelines/MATURITY.md#46-gts-major-v0)).
+- Unstable configuration lives under `features.<feature>` in the gear's `config` section.
 
 ### Persisted data
 - Migrations are forward-only once a gear is `preview`. The previous release must work on the migrated schema (rolling deploy and rollback).
@@ -579,9 +580,65 @@ Minimum deprecation periods by maturity:
 | `beta` feature of a `stable` gear | – | announced in one minor release, removed in a later one ([MATURITY.md §4.4](./guidelines/MATURITY.md#44-lifecycle-of-an-unstable-feature)) |
 | `alpha` feature | – | none |
 
+## Migration Notes
+
+A migration note tells a consumer exactly what to change after a breaking change or a deprecation. It is required for:
+
+- every breaking change of a `preview` or `stable` gear, a ToolKit library, or a `beta` feature;
+- every deprecation of a `stable` item, contract version, or `beta` feature;
+- every renamed GTS identifier (for example `v0` to `v1` at promotion).
+
+`unpublished` gears and `alpha` features need no migration note.
+
+**Where.** In the gear's `docs/MIGRATION.md` (for example `gears/file-storage/docs/MIGRATION.md`; for ToolKit, `libs/<crate>/MIGRATION.md`), in the same pull request as the change. The changelog shows only the commit title, so the note must live in this file. The commit links to it:
+
+```text
+feat(file-storage)!: take a request struct in list_files
+
+BREAKING CHANGE: FileStorageApi::list_files takes ListFilesRequest.
+See gears/file-storage/docs/MIGRATION.md#file-storage-sdk-14--20
+```
+
+**Rules.**
+
+1. One section per release that contains breaking changes or deprecations, newest first. The heading names the crate and the version step: `## file-storage-sdk 1.4 → 2.0`. Use the next version from the bump rules above; several pull requests in one release add items to the same section.
+2. One item per change, with these fields: **Affects** (Rust SDK users, REST clients, event consumers, plugin authors, operators), **Change** (before and after), **Action** (the steps, with a code or request example), and, when relevant, **Data** (what the migration does, whether rollback to the previous release works) and **Removal** (earliest release that removes a deprecated item).
+3. Each item is complete without the pull request: the reader may not have access to it.
+4. Never edit an item after its release, except to fix an error; add a new item instead.
+
+Example:
+
+````markdown
+## file-storage-sdk 1.4 → 2.0
+
+### `list_files` takes a request struct
+
+- **Affects**: Rust SDK users.
+- **Change**: `list_files(ctx, folder_id, limit)` is now `list_files(ctx, ListFilesRequest)`.
+  The page size is optional and defaults to 50.
+- **Action**:
+
+  ```rust
+  // before
+  let page = api.list_files(&ctx, folder_id, 100).await?;
+  // after
+  let page = api
+      .list_files(&ctx, ListFilesRequest::new(folder_id).with_limit(100))
+      .await?;
+  ```
+
+### `GET /file-storage/v1/files?offset=` is deprecated
+
+- **Affects**: REST clients.
+- **Change**: offset pagination is replaced by cursor pagination (`$skiptoken`).
+  Responses with `offset` carry the `Deprecation` header.
+- **Action**: read `@odata.nextLink` from each page and request it for the next page.
+- **Removal**: not before `/file-storage/v2` and at least 12 months after 2.0.
+````
+
 ## Unstable Features
 
-Items behind an `unstable-<feature>` Cargo feature, `/v{N}beta` REST paths, `v0` GTS types, and `features.<feature>` configuration keys are exempt from SemVer. They follow the stage rules of [MATURITY.md §4](./guidelines/MATURITY.md#4-unstable-features-in-a-stable-gear). Semver checks of a `stable` crate run without `unstable-*` features.
+Items behind an `unstable-<feature>` Cargo feature, `/v{N}beta` REST paths, GTS types and MCP tools of `alpha`/`beta` features, and `features.<feature>` configuration keys are exempt from SemVer. They follow the stage rules of [MATURITY.md §4](./guidelines/MATURITY.md#4-unstable-features-in-a-stable-gear). Semver checks of a `stable` crate run without `unstable-*` features.
 
 ## Workspace Policy (Monorepo)
 
