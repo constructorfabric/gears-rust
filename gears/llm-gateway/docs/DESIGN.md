@@ -45,11 +45,11 @@ description: "Technical design of the llm-gateway gear: stateless core pipeline,
 
 ### 1.1 Architectural Vision
 
-LLM Gateway is a stateless request pipeline in front of a set of provider plugins. The core gear owns everything that is the same for every provider: the public API (REST and the `LlmGatewayClientV1` SDK client), per-operation authorization through the platform `PolicyEnforcer`, model resolution through Model Registry, capability and parameter checks, tool schema resolution, quota admission and settle through Quota Enforcement, credential retrieval, stream supervision, structured output validation, usage reporting, and structured logging and tracing. Each provider plugin owns everything that differs per provider: translation between the Open Responses contract and the provider HTTP API, provider settings schema, cost calculation in AI credits, error and stop-reason normalization, and the provider call itself through OAGW. The core and plugins meet at one in-process trait (`LlmGatewayProviderPluginClientV1`) resolved through scoped ClientHub entries keyed by GTS plugin instances.
+LLM Gateway is a stateless request pipeline in front of a set of provider plugins. The core gear owns everything that is the same for every provider: the public API (REST and the `LlmGatewayClientV1` SDK client), per-operation authorization through the platform `PolicyEnforcer`, model resolution through Model Registry, capability and parameter checks, tool schema resolution, quota admission and settle through Quota Enforcement, cost calculation in AI credits from the model's cost rates, stream supervision, structured output validation, usage reporting, and structured logging and tracing. Each provider plugin owns everything that differs per provider: translation between the Open Responses contract and the provider HTTP API, provider settings schema, normalization of provider usage into generic usage, error and stop-reason normalization, and the provider call itself through OAGW. The core and plugins meet at one in-process trait (`LlmGatewayProviderPluginClientV1`) resolved through scoped ClientHub entries keyed by GTS plugin instances.
 
 The public contract is the Open Responses request/response/streaming model defined in `llm-gateway-sdk`. The Gateway normalizes what is common (input items, tool calls, reasoning, usage, status, errors, citations) and forwards provider-specific items and tools verbatim as namespaced extensions. It never interprets content and never executes tools. Requests carry full context: the request model has no fields for provider-side state (`previous_response_id`, `store`), the Gateway keeps no conversation state, and plugins always request stateless provider behavior. The gear has no database and persists no request or response data, so any instance can serve any request.
 
-Security is enforced at the core, not in plugins. Provider API keys are fetched from CredStore per request by the secret reference in the model info and are sent only through OAGW, over HTTPS, to the model's OAGW upstream alias. Keys live in memory for the duration of one call and are never logged, persisted, or serialized. Governance is fail-closed for authorization, model resolution, quota admission, and credential retrieval (Quota Enforcement unavailable means the request is rejected) and fail-open for telemetry (Usage Collector outages never block a consumer request; usage is retried with an idempotency key equal to the response `id`). Quota settle after the response is non-blocking: it is retried in the background, and a lease that cannot be settled expires in Quota Enforcement.
+Security is enforced at the core and in OAGW, not in plugins. Provider API keys never enter the Gateway: the plugin names the model's credential by the secret reference in the model info on its OAGW call, and OAGW loads the key from CredStore and sets it on the request it forwards, over HTTPS, to the upstream named by the model's destination. Governance is fail-closed for authorization, model resolution, quota admission, and credentials (OAGW forwards nothing when it cannot use the named credential) (Quota Enforcement unavailable means the request is rejected) and fail-open for telemetry (Usage Collector outages never block a consumer request; usage is retried with an idempotency key equal to the response `id`). Quota settle after the response is non-blocking: it is retried in the background, and a lease that cannot be settled expires in Quota Enforcement.
 
 ### 1.2 Architecture Drivers
 
@@ -59,27 +59,27 @@ Requirements that significantly influence architecture decisions.
 
 | Requirement | Design Response |
 |-------------|------------------|
-| `cpt-cf-llm-gateway-fr-chat-completion-v1` | Request Pipeline (`cpt-cf-llm-gateway-component-request-pipeline-v1`) runs resolve → check → credentials → dispatch for `POST /responses`; Open Responses SDK models are the only wire format; the request model carries no provider-state fields, and `item_reference` input items are rejected with `capability_not_supported`. |
+| `cpt-cf-llm-gateway-fr-chat-completion-v1` | Request Pipeline (`cpt-cf-llm-gateway-component-request-pipeline-v1`) runs resolve → check → admit → dispatch for `POST /responses`; Open Responses SDK models are the only wire format; the request model carries no provider-state fields, and `item_reference` input items are rejected with `capability_not_supported`. |
 | `cpt-cf-llm-gateway-fr-streaming-v1` | Stream Supervisor (`cpt-cf-llm-gateway-component-stream-supervisor-v1`) relays normalized SSE events, propagates consumer disconnect as cancellation down to the OAGW connection, and marks usage incomplete. |
 | `cpt-cf-llm-gateway-fr-embeddings-v1` | Separate `POST /embeddings` pipeline variant; Capability Checker enforces the `dimensions` never-drop rule; plugins map `input_type` and convert `encoding_format` when the provider cannot. |
 | `cpt-cf-llm-gateway-fr-provider-plugins-v1` | Provider Plugin component (`cpt-cf-llm-gateway-component-provider-plugin-v1`) behind `LlmGatewayProviderPluginClientV1`; Plugin Directory (`cpt-cf-llm-gateway-component-plugin-directory-v1`) selects the plugin by `ModelInfoV1.gts_type`. |
-| `cpt-cf-llm-gateway-fr-custom-endpoints-v1` | The model's OAGW upstream alias (`provider_settings.oagw_alias`) comes from model info; the plugin sends provider requests through OAGW to that alias, so self-hosted and OpenAI-compatible endpoints are reached as OAGW upstreams. |
-| `cpt-cf-llm-gateway-fr-provider-credentials-v1` | Credential Broker (`cpt-cf-llm-gateway-component-credential-broker-v1`) fetches the key from CredStore by the secret reference in the model info and passes it as a non-serializable secret value in the provider call context; the plugin sends it only through OAGW, over HTTPS, to the model's upstream alias; an alias that does not resolve to an upstream enabled for the tenant returns `unapproved_destination`. |
+| `cpt-cf-llm-gateway-fr-custom-endpoints-v1` | The model's destination is `ModelInfoV1.base_url`, or the plugin's default URL for the provider when it is absent; its host and port name the OAGW upstream alias, and the plugin sends provider requests through OAGW to that alias, so self-hosted and OpenAI-compatible endpoints are reached as OAGW upstreams. The plugin sends `provider_model_id` as the provider's model name. |
+| `cpt-cf-llm-gateway-fr-provider-credentials-v1` | No Gateway component reads CredStore. The plugin names `ModelInfoV1.secret_ref` as the credential of its OAGW call (OAGW credential selection), and OAGW loads the key from CredStore under the caller's context and sets it on the forwarded HTTPS request (§ 3.6 `cpt-cf-llm-gateway-seq-credential-resolution-v1`); OAGW refusing the credential returns `credentials_unavailable`, and an alias that does not resolve to an upstream enabled for the tenant returns `unapproved_destination`. |
 | `cpt-cf-llm-gateway-fr-vision-v1` | Input content parts (`input_image`, `input_file`) pass through as URLs or base64; Media Resolver (`cpt-cf-llm-gateway-component-media-resolver-v1`) prefetches bytes through the egress layer only when the plugin requires bytes. |
 | `cpt-cf-llm-gateway-fr-document-understanding-v1` | Same path as image input (`input_file` parts); capability check against the model's `file_input` capability. |
 | `cpt-cf-llm-gateway-fr-reasoning-v1` | Normalized `reasoning` config mapped by plugins; reasoning output items carry opaque continuation artifacts that consumers send back; the core never inspects them. |
 | `cpt-cf-llm-gateway-fr-tool-calling-v1` | Tool Resolver (`cpt-cf-llm-gateway-component-tool-resolver-v1`) resolves GTS references and inline GTS schemas through Type Registry; Capability Checker then validates `tool_choice` and `parallel_tool_calls` against the resolved tools; tool calls are returned, never executed. |
 | `cpt-cf-llm-gateway-fr-web-search-v1` | `cf_gears:web_search` is a Gateway-owned tool type; the plugin maps it to the provider's native tool; capability check uses model `web_search` capability; citations normalized to `url_citation` annotations. |
 | `cpt-cf-llm-gateway-fr-provider-tools-v1` | Tools typed `<provider>:<tool>` are checked against the plugin's declared tool namespace and forwarded verbatim; provider-executed tool output items are preserved as extensions. |
-| `cpt-cf-llm-gateway-fr-structured-output-v1` | Capability Checker rejects schemas not expressible in the provider subset with `unsupported_schema` before quota admission and credential retrieval, using the provider rules kept in the core; the plugin adapts the schema at call time; Output Validator (`cpt-cf-llm-gateway-component-output-validator-v1`) validates the result against the original schema. |
+| `cpt-cf-llm-gateway-fr-structured-output-v1` | Capability Checker rejects schemas not expressible in the provider subset with `unsupported_schema` before quota admission, using the provider rules kept in the core; the plugin adapts the schema at call time; Output Validator (`cpt-cf-llm-gateway-component-output-validator-v1`) validates the result against the original schema. |
 | `cpt-cf-llm-gateway-fr-generation-parameters-v1` | Capability Checker applies the parameter policy: per-model parameter support from the provider rules kept in the core, model defaults from `default_parameters` overridable by request values only when the model's `allow_parameter_override` is true, `drop_unsupported_params`, cache-control hints always droppable, provider-specific parameters gated by Model Registry `allow_extra_params`; every drop listed in `ignored_parameters`. |
-| `cpt-cf-llm-gateway-fr-usage-tracking-v1` | Plugins compute AI credits from the model's provider pricing; responses carry cost, generic usage, and raw provider usage; Usage Reporter (`cpt-cf-llm-gateway-component-usage-reporter-v1`) delivers records with the response `id` as idempotency key. |
+| `cpt-cf-llm-gateway-fr-usage-tracking-v1` | Plugins normalize provider usage into generic usage; Cost Calculator (`cpt-cf-llm-gateway-component-cost-calculator-v1`) computes AI credits from it and the model's provider-independent cost rates (`ModelInfoV1.cost`); responses carry cost, generic usage, and raw provider usage; Usage Reporter (`cpt-cf-llm-gateway-component-usage-reporter-v1`) delivers records with the response `id` as idempotency key. |
 | `cpt-cf-llm-gateway-fr-budget-enforcement-v1` | Quota Guard (`cpt-cf-llm-gateway-component-quota-guard-v1`) acquires a Quota Enforcement lease for the request's upper-bound AI credits before dispatch (fail closed: denial returns `quota_exceeded`, an unavailable check returns `quota_check_unavailable`) and settles it at the terminal state by committing the actual AI credits or releasing the hold; the Usage Reporter then reports the actual AI credits to Usage Collector. |
 | `cpt-cf-llm-gateway-fr-model-capability-check-v1` | Capability Checker (`cpt-cf-llm-gateway-component-capability-checker-v1`) derives required capabilities from the request and checks model capabilities plus plugin integration capabilities before dispatch. |
 | `cpt-cf-llm-gateway-fr-provider-error-normalization-v1` | Plugins map provider errors to the fixed category set with provider code, message, and `provider_request_id`; the core maps categories to canonical errors and RFC 9457 Problems (§ 4.1) and to `response.failed` mid-stream. |
 | `cpt-cf-llm-gateway-fr-completion-status-v1` | Plugins map stop reasons to `status` and `incomplete_details.reason` and always include the original stop reason; Stream Supervisor guarantees exactly one terminal event. |
 | `cpt-cf-llm-gateway-fr-request-traceability-v1` | Request Pipeline allocates the response `id` before any dependency call and carries it in the provider call context, usage records, error Problems, logs, and trace spans; plugins capture `provider_request_id`. |
-| `cpt-cf-llm-gateway-fr-pass-through-apis-v1` | Pass-through REST routes for the OpenAI and Anthropic APIs (§ 3.3) keep the provider's native request, response, and streaming format but run the same Request Pipeline as `POST /responses`: authorization, in-flight slot, model resolution from the request's `model` field, the Capability Checker check that the model's capabilities include the matching pass-through API (`capability_not_supported` otherwise), quota admission and settle, credential retrieval, the plugin's denylist check of stateful fields and paid provider tools at the start of `forward_passthrough` (`capability_not_supported` before any provider call), Stream Supervisor (cancellation on consumer disconnect, one terminal outcome), usage reporting, and response `id` traceability. The matching provider plugin forwards the native body through OAGW to the model's upstream alias without translation to Open Responses, reads usage from the native response, and computes the AI credit cost; the core enriches the native response with Gateway usage (§ 3.3). |
+| `cpt-cf-llm-gateway-fr-pass-through-apis-v1` | Pass-through REST routes for the OpenAI and Anthropic APIs (§ 3.3) keep the provider's native request, response, and streaming format but run the same Request Pipeline as `POST /responses`: authorization, in-flight slot, model resolution from the request's `model` field, the Capability Checker check that the model's capabilities include the matching pass-through API (`capability_not_supported` otherwise), quota admission and settle, the plugin's denylist check of stateful fields and paid provider tools at the start of `forward_passthrough` (`capability_not_supported` before any provider call), Stream Supervisor (cancellation on consumer disconnect, one terminal outcome), usage reporting, and response `id` traceability. The matching provider plugin forwards the native body through OAGW to the model's destination, naming the model's credential, without translation to Open Responses, and reads generic usage from the native response; the Cost Calculator prices it for quota settle and usage reporting, and the native response is returned without Gateway fields, correlated with its usage by the response `id` header (§ 3.3). The model listing endpoints of both APIs (`GET /v1/models`, `GET /v1/models/{model_id}`) are answered by the core from Model Registry through the Model Resolver, without a plugin or provider call (§ 3.3 Pass-through model listing). |
 | Not covered by this design | `cpt-cf-llm-gateway-fr-filestorage-media-v1`, `cpt-cf-llm-gateway-fr-image-generation-v1`, `cpt-cf-llm-gateway-fr-text-to-speech-v1`, `cpt-cf-llm-gateway-fr-video-understanding-v1`, `cpt-cf-llm-gateway-fr-async-jobs-v1`, `cpt-cf-llm-gateway-fr-timeout-v1`, `cpt-cf-llm-gateway-fr-rate-limiting-v1`, `cpt-cf-llm-gateway-fr-speech-to-text-v1`, `cpt-cf-llm-gateway-fr-video-generation-v1`, `cpt-cf-llm-gateway-fr-realtime-audio-v1`, `cpt-cf-llm-gateway-fr-batch-processing-v1`, `cpt-cf-llm-gateway-fr-audit-events-v1` |
 
 #### NFR Allocation
@@ -90,7 +90,7 @@ This table maps non-functional requirements from PRD to specific design/architec
 |--------|-------------|--------------|-----------------|----------------------|
 | `cpt-cf-llm-gateway-nfr-scalability-v1` | Horizontal scaling, no instance-local state, any instance serves any request | Request Pipeline, deployment topology | No request affinity; caches hold only configuration (plugin directory); the gear persists no state, so any instance serves any request. | Load test with requests round-robined across instances; kill-instance test under load |
 | `cpt-cf-llm-gateway-nfr-data-retention-v1` | No persistence of request or response data; nothing to retain or clean up | Request Pipeline, deployment topology | The gear persists no request or response data and has no database, so there are no records to retain or clean up | Design and code review: the gear declares no database, table, or other persistent store |
-| PRD § 1.3 success criteria (no NFR ID) | Gateway overhead < 50 ms P99 at 1 000 concurrent requests; 500 rps steady, 2 000 rps peak | Request Pipeline, Quota Guard, Credential Broker | Independent pre-dispatch steps run concurrently after model resolution (quota admission, credential resolution, and media resolution run as one concurrent step); quota settle runs after the response and adds no latency; streaming relays events without buffering whole responses; no per-request disk I/O | Pre-release load test with a fixed-latency mock provider behind a mock egress; overhead = end-to-end minus provider latency. Not measured in production (monitoring exception, § 4.6) |
+| PRD § 1.3 success criteria (no NFR ID) | Gateway overhead < 50 ms P99 at 1 000 concurrent requests; 500 rps steady, 2 000 rps peak | Request Pipeline, Quota Guard | Independent pre-dispatch steps run concurrently after model resolution (quota admission and media resolution run as one concurrent step); quota settle runs after the response and adds no latency; streaming relays events without buffering whole responses; no per-request disk I/O | Pre-release load test with a fixed-latency mock provider behind a mock egress; overhead = end-to-end minus provider latency. Not measured in production (monitoring exception, § 4.6) |
 | PRD § 1.3 success criteria (no NFR ID) | Availability ≥ 99.9 % monthly; rolling restarts with zero downtime | Deployment topology, lifecycle | Stateless instances behind api-gateway; graceful shutdown drains in-flight requests and the usage delivery buffer within the stop timeout; streams still open at the drain deadline end with `response.failed` (§ 4.5) | Pre-release rolling-restart test under load: zero failed requests among requests that finish within the drain deadline, and every stream cut at the deadline ends with exactly one `response.failed`. Availability is not measured in production (monitoring exception, § 4.6) |
 | `cpt-cf-llm-gateway-nfr-compatibility-v1` | Backward compatibility within a major API version; breaking changes need a new version prefix | Not allocated (p2) | Not covered by this design: the requirement is p2. The P1 contract already uses versioned paths (`/llm-gateway/v1`, § 3.3), and its evolution rules are in ADR 0001 | Not verified in this design |
 | `cpt-cf-llm-gateway-nfr-recovery-v1` | Async and batch job state survives instance restarts | Not allocated (p2) | Not covered by this design: the requirement is p2 and applies only to async and batch jobs, which are outside P1; P1 keeps no job state to recover | Not verified in this design |
@@ -113,7 +113,7 @@ The architecture decision below is recorded as an ADR.
 | Presentation | REST routes for responses and embeddings; SSE framing; DTO validation; Problem mapping; ClientHub registration of the local client | Rust, ToolKit `OperationBuilder` registered on api-gateway (Axum), SSE, utoipa OpenAPI |
 | Application | Pipeline orchestration, stream supervision, usage delivery | Rust async (Tokio), `CancellationToken`, ToolKit `WithLifecycle` background tasks |
 | Domain | Capability and parameter policy, tool schema handling, structured output validation, normalized error and status model | Rust domain types (`#[domain_model]`), SDK Open Responses models, JSON Schema validator |
-| Infrastructure | Adapters to Model Registry, Type Registry, CredStore, Quota Enforcement (Quota Guard), Usage Collector, OAGW, and the platform `PolicyEnforcer` (AuthZ Resolver) | SDK clients resolved from ClientHub, scoped ClientHub for plugins, platform tracing and structured logging |
+| Infrastructure | Adapters to Model Registry, Type Registry, Quota Enforcement (Quota Guard), Usage Collector, OAGW, and the platform `PolicyEnforcer` (AuthZ Resolver) | SDK clients resolved from ClientHub, scoped ClientHub for plugins, platform tracing and structured logging |
 
 ## 2. Principles & Constraints
 
@@ -141,13 +141,13 @@ Semantics shared across providers (messages, function tools, tool choice, reason
 
 - [ ] `p1` - **ID**: `cpt-cf-llm-gateway-principle-provider-isolation-v1`
 
-Provider-specific code lives only in provider plugins. The core branches on provider identity only to select the plugin and to apply the provider rules it keeps for pre-dispatch checks and estimates (per-model parameter support, JSON Schema subset, token counting and pricing; § 4.10). Plugins never perform cross-cutting work (model resolution, quota, credentials, usage delivery). Adding a provider means adding a plugin gear and the provider's rules in the core; consumers do not change.
+Provider-specific code lives only in provider plugins. The core branches on provider identity only to select the plugin and to apply the provider rules it keeps for pre-dispatch checks and estimates (per-model parameter support, JSON Schema subset, token counting; § 4.10). Pricing is not provider-specific: the cost rates have one shape for every provider type. Plugins never perform cross-cutting work (model resolution, quota, credentials, cost calculation, usage delivery). Adding a provider means adding a plugin gear and the provider's rules in the core; consumers do not change.
 
 #### Fail Closed on Governance, Fail Open on Telemetry
 
 - [ ] `p1` - **ID**: `cpt-cf-llm-gateway-principle-fail-closed-governance-v1`
 
-Steps that protect tenants, money, or secrets block the request when they cannot complete: authorization, model resolution, quota admission, credential retrieval. Quota admission is never bypassed: a denial or an unavailable Quota Enforcement stops the request before dispatch. Steps that only observe or close out an admitted request never block it: quota settle and usage delivery are retried in the background without delaying the response.
+Steps that protect tenants, money, or secrets block the request when they cannot complete: authorization, model resolution, quota admission, and credential use in OAGW. Quota admission is never bypassed: a denial or an unavailable Quota Enforcement stops the request before dispatch. Steps that only observe or close out an admitted request never block it: quota settle and usage delivery are retried in the background without delaying the response.
 
 #### No Silent Outcomes
 
@@ -177,17 +177,17 @@ All outbound HTTP traffic to providers and to external media URLs goes through t
 
 Plugins implement provider HTTP contracts directly on top of the egress interface. Provider SDK libraries are not used because they bring their own HTTP clients (bypassing OAGW), their own retries, and their own credential handling.
 
-#### No Credential Persistence or Logging
+#### No Credential Handling, Persistence, or Logging
 
 - [ ] `p1` - **ID**: `cpt-cf-llm-gateway-constraint-no-credential-persistence-v1`
 
-Provider API keys exist only in memory for the duration of one provider call. They are held in a secret type with redacted debug output, excluded from serialization, and dropped (and zeroed) when the call completes. Keys never appear in logs, traces, metrics, errors, or usage records.
+Provider API keys never enter the Gateway core or its plugins. Neither reads CredStore: the core passes the model info, whose `secret_ref` is a name, not a secret, and the plugin passes that name to OAGW, which loads the key per call and sets it on the outbound request. The provider call context carries no key. Keys therefore never appear in Gateway logs, traces, metrics, errors, or usage records.
 
 #### Key-Destination Binding
 
 - [ ] `p1` - **ID**: `cpt-cf-llm-gateway-constraint-key-destination-binding-v1`
 
-A provider API key is fetched from CredStore only by the secret reference in the model info, and the plugin sends it only in requests to the model's OAGW upstream alias (`provider_settings.oagw_alias`), through OAGW, over HTTPS. The key is never sent to any other destination. When the alias does not resolve to an upstream enabled for the tenant, OAGW forwards nothing and the request fails with `unapproved_destination`.
+The plugin names the model's credential (`secret_ref` from the model info) only on requests to the model's destination: `base_url`, or the plugin's default URL for the provider when the model has none, whose host and port name the OAGW upstream alias. OAGW sets the key only on the request it forwards to that upstream, over HTTPS (OAGW admits only HTTPS upstreams); the key is never sent to any other destination. When the alias does not resolve to an upstream enabled for the tenant, OAGW forwards nothing and the request fails with `unapproved_destination`. When OAGW cannot use the named credential, it forwards nothing and the request fails with `credentials_unavailable`; it never falls back to another credential.
 
 #### No Provider-Side State and No Tool Execution
 
@@ -215,7 +215,7 @@ The gear follows the platform gear layout (`llm-gateway-sdk` plus `llm-gateway` 
 
 ### 3.1 Domain Model
 
-**Technology**: GTS (plugin spec, provider settings schemas, tool schemas, usage type), Rust structs in `llm-gateway-sdk` (serde + schemars, Open Responses aligned), `#[domain_model]` types in the gear crate.
+**Technology**: GTS (plugin spec, provider types derived from `gts.cf.genai.model.provider.v1~`, tool schemas, usage type), Rust structs in `llm-gateway-sdk` (serde + schemars, Open Responses aligned), `#[domain_model]` types in the gear crate.
 
 **Location**: [llm-gateway-sdk/src/models](../llm-gateway-sdk/src/models)
 
@@ -239,9 +239,9 @@ The gear follows the platform gear layout (`llm-gateway-sdk` plus `llm-gateway` 
 | StreamingEvent (`cpt-cf-llm-gateway-entity-streaming-event-v1`) | Typed SSE event with `sequence_number`; lifecycle events (`response.created`, `response.in_progress`), delta events, and exactly one terminal event (`response.completed`, `response.incomplete`, `response.failed`); the Gateway never emits a standalone `error` event | [streaming.rs](../llm-gateway-sdk/src/models/streaming.rs) |
 | Embedding (`cpt-cf-llm-gateway-entity-embedding-v1`) | Gateway-defined embedding request (`input`, `dimensions`, `input_type`, `encoding_format`, provider-specific parameters) and response (vectors as floats or base64, `usage`), outside the Open Responses specification | [core.rs](../llm-gateway-sdk/src/models/core.rs) (`EmbeddingRequest`, `EmbeddingResponse`) |
 | Tool (`cpt-cf-llm-gateway-entity-tool-v1`) | Tool definition family: `function` (inline JSON schema), `reference` (GTS schema id), `inline_gts`, the Gateway tool `cf_gears:web_search`, and provider tools `<provider>:<tool>` kept as `Extension` | [tools.rs](../llm-gateway-sdk/src/models/tools.rs), [extension.rs](../llm-gateway-sdk/src/models/extension.rs) |
-| Usage (`cpt-cf-llm-gateway-entity-usage-v1`) | Generic token usage (input, output, cached, reasoning), cost in AI credits, provider raw usage (opaque), completeness flag, estimate label | [core.rs](../llm-gateway-sdk/src/models/core.rs) (`Usage`) |
-| ProviderCallContext (`cpt-cf-llm-gateway-entity-provider-call-context-v1`) | Per-call input to a plugin: resolved `ModelInfoV1` as received from Model Registry (including the OAGW upstream alias), response `id`, optional provider API key (secret, not serialized), effective parameter decisions, cancellation token | [plugin.rs](../llm-gateway-sdk/src/models/plugin.rs) (`ProviderCallCtx`) |
-| ProviderPluginSpec (`cpt-cf-llm-gateway-entity-provider-plugin-spec-v1`) | GTS plugin instance (`gts.cf.toolkit.plugins.plugin.v1~cf.llmgw.provider.plugin.v1~…`): `provider_type` (model-info `gts_type` served), provider tool namespace, priority | [gts.rs](../llm-gateway-sdk/src/gts.rs) (`LlmGatewayProviderPluginSpecV1`) |
+| Usage (`cpt-cf-llm-gateway-entity-usage-v1`) | Generic usage: input, output, cache read, cache write, and reasoning tokens (cache and reasoning counts are parts of input and output), web search calls; cost in AI credits, set by the core (zero as returned by a plugin); provider raw usage (opaque); completeness flag; estimate label | [core.rs](../llm-gateway-sdk/src/models/core.rs) (`Usage`) |
+| ProviderCallContext (`cpt-cf-llm-gateway-entity-provider-call-context-v1`) | Per-call input to a plugin: resolved `ModelInfoV1` as received from Model Registry (including `provider_model_id`, `base_url`, and `secret_ref`), response `id`, effective parameter decisions, cancellation token. It carries no key and no secret material | [plugin.rs](../llm-gateway-sdk/src/models/plugin.rs) (`ProviderCallCtx`) |
+| ProviderPluginSpec (`cpt-cf-llm-gateway-entity-provider-plugin-spec-v1`) | GTS plugin instance (`gts.cf.toolkit.plugins.plugin.v1~cf.llmgw.provider.plugin.v1~…`): `provider_type` (the provider type served, derived from `gts.cf.genai.model.provider.v1~` and equal to the `gts_type` of its models), provider tool namespace, priority | [gts.rs](../llm-gateway-sdk/src/gts.rs) (`LlmGatewayProviderPluginSpecV1`) |
 | NormalizedError (`cpt-cf-llm-gateway-entity-normalized-error-v1`) | Gateway error code (pre-dispatch codes and provider categories), message, `param`, provider code and message, `provider_request_id`, `retry_after`, response `id` | [errors.rs](../llm-gateway-sdk/src/errors.rs) (`LlmGatewayError`) |
 | UsageRecord (`cpt-cf-llm-gateway-entity-usage-record-v1`) | Outbound record to Usage Collector: tenant and user as explicit attribution, model, AI credit quantity, time window, idempotency key = response `id`, metadata (completeness, estimate flag, `provider_request_id`, provider type) | Usage Collector SDK `CreateUsageRecord` |
 
@@ -250,7 +250,7 @@ The gear follows the platform gear layout (`llm-gateway-sdk` plus `llm-gateway` 
 - CreateResponseRequest → Response: one request produces one Response with a Gateway-allocated `id`; streaming produces the same Response as the payload of the terminal event.
 - Response → Usage: every Response and every terminal streaming event carries one Usage.
 - Response → UsageRecord: one completed or interrupted request produces one UsageRecord keyed by the Response `id`.
-- ProviderCallContext → ModelInfoV1: the context embeds the model info returned by Model Registry unchanged; the plugin narrows `provider_settings` to its typed view and reads the OAGW upstream alias from it.
+- ProviderCallContext → ModelInfoV1: the context embeds the model info returned by Model Registry unchanged; the plugin narrows `provider_settings` to its typed view and reads `provider_model_id`, `base_url`, and `secret_ref` from the generic fields.
 - ProviderPluginSpec → ModelInfoV1: a plugin serves models whose `gts_type` equals its `provider_type`.
 
 ### 3.2 Component Model
@@ -268,7 +268,7 @@ graph LR
     PIPE --> CC["Capability Checker"]
     PIPE --> TR["Tool Resolver"]
     PIPE --> QG["Quota Guard"]
-    PIPE --> CB["Credential Broker"]
+    PIPE --> COST["Cost Calculator"]
     PIPE --> MEDIA["Media Resolver"]
     PIPE --> SUP["Stream Supervisor"]
     PIPE --> OV["Output Validator"]
@@ -281,7 +281,9 @@ graph LR
     MR --> MRG["Model Registry"]
     PDIR --> TYR["Type Registry"]
     TR --> TYR
-    CB --> CS["CredStore"]
+    SUP --> COST
+    QG --> COST
+    OAGW --> CS["CredStore"]
     QG --> QE["Quota Enforcement"]
     UR --> UC["Usage Collector"]
     MEDIA --> OAGW
@@ -317,11 +319,11 @@ Every operation shares the same ordered governance steps. One orchestrator keeps
 
 ##### Responsibility scope
 
-Allocates the response `id` first. Runs the per-operation authorization check through the platform `PolicyEnforcer` (§ 3.3) and acquires an in-flight slot (§ 4.5). Rejects `item_reference` input items and requests for unsupported capabilities (§ 3.3). Resolves the model, selects the plugin, resolves tool schemas, then runs the capability, parameter, and structured output schema checks; only then runs quota admission, credential resolution, and media resolution as one concurrent step; dispatches to the plugin only after all succeed. If admission fails, the fetched key is dropped unused; if credential or media resolution fails after a lease was acquired, the lease is released. For sync calls runs output validation, attaches `ignored_parameters`, and hands the terminal outcome to the Quota Guard for settle (the Quota Guard then passes usage to the Usage Reporter). For streaming calls hands the plugin stream to the Stream Supervisor. Converts every failure to a NormalizedError with the response `id`. Opens one trace span per stage.
+Allocates the response `id` first. Runs the per-operation authorization check through the platform `PolicyEnforcer` (§ 3.3) and acquires an in-flight slot (§ 4.5). Rejects `item_reference` input items and requests for unsupported capabilities (§ 3.3). Resolves the model, selects the plugin, resolves tool schemas, then runs the capability, parameter, and structured output schema checks; only then runs quota admission and media resolution as one concurrent step; dispatches to the plugin only after both succeed. If media resolution fails after a lease was acquired, the lease is released. For sync calls has the Cost Calculator set the cost in the plugin's usage, runs output validation, attaches `ignored_parameters`, and hands the terminal outcome to the Quota Guard for settle (the Quota Guard then passes usage to the Usage Reporter). For streaming calls hands the plugin stream to the Stream Supervisor. Converts every failure to a NormalizedError with the response `id`. Opens one trace span per stage.
 
 ##### Responsibility boundaries
 
-Does not translate to provider formats, does not compute cost, does not talk to providers, and does not retry provider calls. Does not persist anything.
+Does not translate to provider formats, does not compute cost itself (the Cost Calculator does), does not read credentials, does not talk to providers, and does not retry provider calls. Does not persist anything.
 
 ##### Related components (by ID)
 
@@ -330,7 +332,7 @@ Does not translate to provider formats, does not compute cost, does not talk to 
 - `cpt-cf-llm-gateway-component-capability-checker-v1` — calls (capability and parameter policy)
 - `cpt-cf-llm-gateway-component-tool-resolver-v1` — calls (tool schemas)
 - `cpt-cf-llm-gateway-component-quota-guard-v1` — calls (admission and settle)
-- `cpt-cf-llm-gateway-component-credential-broker-v1` — calls (provider key)
+- `cpt-cf-llm-gateway-component-cost-calculator-v1` — calls (cost of the response usage)
 - `cpt-cf-llm-gateway-component-media-resolver-v1` — calls (media inputs)
 - `cpt-cf-llm-gateway-component-provider-plugin-v1` — calls (dispatch)
 - `cpt-cf-llm-gateway-component-stream-supervisor-v1` — delegates streams to
@@ -342,11 +344,11 @@ Does not translate to provider formats, does not compute cost, does not talk to 
 
 ##### Why this component exists
 
-Model identity, tenant availability, OAGW upstream alias, secret reference, capabilities, defaults, and pricing are owned by Model Registry. The Gateway needs one adapter that turns a model identifier into model info for the caller's tenant.
+Model identity, tenant availability, provider model name, destination (`base_url`), secret reference, capabilities, defaults, and cost rates are owned by Model Registry. The Gateway needs one adapter that turns a model identifier into model info for the caller's tenant.
 
 ##### Responsibility scope
 
-Calls `ModelRegistryClientV1::get_tenant_model` with the caller's `SecurityContext` on every request. Maps "unknown" and "not available for tenant" to `model_not_found` without telling them apart, and Model Registry unavailability to `model_resolution_unavailable`. Returns `ModelInfoV1` unchanged for the plugin.
+Calls `ModelRegistryClientV1::resolve_model` with the caller's `SecurityContext` and the requested model identifier (the canonical id `provider_slug::name`) on every request; it returns the full `ModelV1`, whose `info` is the `ModelInfoV1` the plugin receives. Maps the outcomes: not found (`NotFound`), provider disabled (`PROVIDER_DISABLED`), and model not approved (`MODEL_NOT_APPROVED`) to `model_not_found` without telling them apart; the caller lacking the model `evaluate` permission (`NOT_PERMITTED`) to `permission_denied`; Model Registry or its dependencies unavailable (`ServiceUnavailable`) to `model_resolution_unavailable`. Returns `ModelInfoV1` unchanged for the plugin. For the pass-through model listing (§ 3.3), calls `list_available_models` with the caller's `SecurityContext` to list the caller's available models, and `resolve_model` to get one; maps the outcomes the same way.
 
 ##### Responsibility boundaries
 
@@ -387,7 +389,7 @@ The PRD requires capability and parameter problems to be caught before the provi
 
 ##### Responsibility scope
 
-Derives required capabilities from the request (streaming, image and file input, function calling, `cf_gears:web_search`, reasoning options, structured output, embeddings, and for pass-through routes the pass-through API of the route: OpenAI or Anthropic) and checks them against `ModelInfoV1.capabilities`, `disabled_capabilities`, `supported_api`, and the plugin's integration capabilities; failure returns `capability_not_supported`, as does any request for a capability that the resolved model or this gear does not support (§ 3.3). Applies the parameter policy: applies the model's `default_parameters`; when the model's `allow_parameter_override` is true, request values override those defaults, and when it is false, a request value for a parameter that has a model default is not applied, the default is used, and the parameter is listed in `ignored_parameters`; determines which generic parameters the resolved model supports from the provider rules kept in the core (per provider type and model); rejects unsupported ones with `unsupported_parameter` unless `drop_unsupported_params` is set; always drops unsupported cache-control hints; never drops `dimensions`; gates provider-specific parameters by the model's `allow_extra_params`. Runs after tool resolution, so `tool_choice` is validated against the resolved function set; validates provider tool prefixes against the plugin namespace (`validation_error`). Checks, from the same provider rules, that the structured output schema can be expressed in the provider's JSON Schema subset, and returns `unsupported_schema` naming the construct otherwise. For pass-through routes, checks only the model's pass-through capability; the denylists of stateful fields and paid tools are owned and checked by the plugin in `forward_passthrough` (§ 3.3 Pass-through stateless guard); the parameter policy and the other content checks above do not apply to pass-through routes. Produces the effective request and the `ignored_parameters` list. All of these checks complete before quota admission and credential retrieval, so no lease is acquired and no key is fetched for a request that is certain to fail.
+Derives required capabilities from the request (streaming, image and file input, function calling, `cf_gears:web_search`, reasoning options, structured output, embeddings, and for pass-through routes the pass-through API of the route: OpenAI or Anthropic) and checks them against `ModelInfoV1.capabilities`, `disabled_capabilities`, `supported_api`, and the plugin's integration capabilities; failure returns `capability_not_supported`, as does any request for a capability that the resolved model or this gear does not support (§ 3.3). Applies the parameter policy: applies the model's `default_parameters`; when the model's `allow_parameter_override` is true, request values override those defaults, and when it is false, a request value for a parameter that has a model default is not applied, the default is used, and the parameter is listed in `ignored_parameters`; determines which generic parameters the resolved model supports from the provider rules kept in the core (per provider type and model); rejects unsupported ones with `unsupported_parameter` unless `drop_unsupported_params` is set; always drops unsupported cache-control hints; never drops `dimensions`; gates provider-specific parameters by the model's `allow_extra_params`. Runs after tool resolution, so `tool_choice` is validated against the resolved function set; validates provider tool prefixes against the plugin namespace (`validation_error`). Checks, from the same provider rules, that the structured output schema can be expressed in the provider's JSON Schema subset, and returns `unsupported_schema` naming the construct otherwise. For pass-through routes, checks only the model's pass-through capability; the denylists of stateful fields and paid tools are owned and checked by the plugin in `forward_passthrough` (§ 3.3 Pass-through stateless guard); the parameter policy and the other content checks above do not apply to pass-through routes. Produces the effective request and the `ignored_parameters` list. All of these checks complete before quota admission, so no lease is acquired for a request that is certain to fail.
 
 ##### Responsibility boundaries
 
@@ -418,26 +420,35 @@ Does not validate tool call arguments returned by the model and does not execute
 
 - `cpt-cf-llm-gateway-component-request-pipeline-v1` — called by
 
-#### Credential Broker
+#### Cost Calculator
 
-- [ ] `p1` - **ID**: `cpt-cf-llm-gateway-component-credential-broker-v1`
+- [ ] `p1` - **ID**: `cpt-cf-llm-gateway-component-cost-calculator-v1`
 
 ##### Why this component exists
 
-Provider keys are the most sensitive data the Gateway handles. Key retrieval must happen in one place, outside plugins.
+Model cost rates are part of the model info, with one shape for every provider type (`ModelInfoV1.cost`), not part of the provider settings. Pricing is therefore the same for every provider and belongs in the core; plugins report only generic usage. One component keeps the reservation, the reported cost, and the committed quantity on the same formula.
 
 ##### Responsibility scope
 
-Reads the secret reference from the model info and fetches the provider API key from CredStore by that reference under the caller's `SecurityContext`. Returns `credentials_unavailable` when CredStore fails or the referenced secret is missing. Returns the key in a secret wrapper for the provider call context. For models without a secret reference it returns no key and performs no CredStore call.
+Computes the AI credits of a usage from the model's cost rates, in exact decimal arithmetic, locally and without I/O. Rates are micro-credits (1 AI credit = 1,000,000 micro-credits):
+
+- input tokens that are neither cache reads nor cache writes × `input_per_1m_micro` / 1,000,000 (the count saturates at 0);
+- cache read tokens × `cache_read_per_1m_micro` / 1,000,000;
+- cache write tokens × `cache_write_per_1m_micro` / 1,000,000;
+- output tokens, reasoning tokens included, × `output_per_1m_micro` / 1,000,000;
+- web search calls × `web_search_per_1k_calls_micro` / 1,000.
+
+The sum, divided by 1,000,000, is the cost in AI credits. An absent rate prices that kind of usage at 0, as Model Registry defines it. The result is not rounded; only the Quota Guard rounds up to the metric's integer unit. Called by the Request Pipeline to set `usage.cost` on a sync response, an embedding response, and the usage of a pass-through response before it is reported; by the Stream Supervisor for the usage of the terminal event; and by the Quota Guard for the lease amount and for the core's usage estimates (§ 3.2 Quota Guard, § 3.2 Usage Reporter). A cost a plugin returns is replaced.
 
 ##### Responsibility boundaries
 
-Does not cache keys across requests, does not inject keys into HTTP requests (the plugin does), does not choose the provider destination (the model's OAGW upstream alias does), and does not configure OAGW upstreams.
+Does not count or estimate tokens (plugins normalize provider usage; estimates come from the provider rules kept in the core), does not read provider settings, and does not call any dependency.
 
 ##### Related components (by ID)
 
 - `cpt-cf-llm-gateway-component-request-pipeline-v1` — called by
-- `cpt-cf-llm-gateway-component-provider-plugin-v1` — supplies the provider key to
+- `cpt-cf-llm-gateway-component-stream-supervisor-v1` — called by
+- `cpt-cf-llm-gateway-component-quota-guard-v1` — called by (lease amount, estimates)
 
 #### Quota Guard
 
@@ -451,9 +462,9 @@ The PRD requires the AI credit quota to be checked before execution through Quot
 
 Integrates with Quota Enforcement through `QuotaEnforcementApi` on the AI credit metric (a metric registered as quota-gated, § 4.10). Holds at most one lease per request, keyed by the response `id`.
 
-`admit` runs before dispatch, in the concurrent step with credential and media resolution, after the capability, parameter, and schema checks (§ 3.2 Request Pipeline):
+`admit` runs before dispatch, in the concurrent step with media resolution, after the capability, parameter, and schema checks (§ 3.2 Request Pipeline):
 
-- Amount: the request's upper-bound cost. The Quota Guard computes it locally, without I/O, from the provider rules kept in the core: estimated input tokens plus the maximum output the request allows, priced from the pricing in the model's provider settings. The maximum output is `max_output_tokens` when the request sets it, otherwise the model's output limit from model info, otherwise the fallback output allowance from gear configuration (§ 4.5). For embeddings the amount is the estimated input only. The Quota Guard converts the AI credits to the metric's integer unit, rounding up.
+- Amount: the request's upper-bound cost. The Quota Guard computes it locally, without I/O, from the provider rules kept in the core: estimated input tokens plus the maximum output the request allows, priced by the Cost Calculator from the model's cost rates (input and output rates; cache and web search rates are not part of the estimate). The maximum output is `max_output_tokens` when the request sets it, otherwise the model's output limit from model info, otherwise the fallback output allowance from gear configuration (§ 4.5). For embeddings the amount is the estimated input only. The Quota Guard converts the AI credits to the metric's integer unit, rounding up.
 - Call: `acquire_lease` under the caller's `SecurityContext`, with attribution tenant and subject (user) of the request and the request metadata required by the metric's request contract (for example model and provider type; the contract is settled with the metric registration, § 4.10), the amount, a TTL, and an idempotency key derived from the response `id`.
 - TTL: the request's maximum duration (sync provider call timeout for sync calls and embeddings, maximum stream duration for streams) plus a settle margin from gear configuration. The configured values must fall inside the operator's lease TTL window in Quota Enforcement (`min_lease_ttl`, `max_lease_ttl`).
 - Outcomes:
@@ -468,19 +479,19 @@ Integrates with Quota Enforcement through `QuotaEnforcementApi` on the AI credit
 
 - Commit: `commit_lease` with `actual_amount` equal to the AI credit quantity the Usage Reporter records for the same request (§ 3.2 Usage Reporter), converted to the metric's integer unit and rounded up, capped at the reserved amount.
 - Overrun: when the actual quantity exceeds the reserved amount, the Quota Guard commits the reserved amount and logs the overrun with the response `id`, the reserved amount, and the actual amount. The Usage Reporter still records the full actual quantity.
-- Release: when the actual quantity is 0, the Quota Guard calls `release_lease`. It also calls `release_lease` when the request fails before dispatch after a lease was acquired (credential or media resolution failure, shutdown before dispatch).
+- Release: when the actual quantity is 0, the Quota Guard calls `release_lease`. It also calls `release_lease` when the request fails before dispatch after a lease was acquired (media resolution failure, shutdown before dispatch), and when OAGW forwards nothing on dispatch (`credentials_unavailable`, `unapproved_destination`).
 - Execution: settle never blocks the consumer. It runs in the background under the gear's own service (S2S) identity, the same identity as usage delivery (§ 3.2 Usage Reporter), and passes the tenant explicitly (`tenant_id` and the lease token). The settle call has its own idempotency key derived from the response `id` and is retried with backoff on transient failures until it succeeds or the lease expires. When the lease is no longer active (`LEASE_NOT_ACTIVE`) or expires before settle completes, Quota Enforcement auto-releases the hold, and the Quota Guard logs the settle failure with the response `id`.
 - Order with usage: after settle completes, or is abandoned as above, the Quota Guard hands the usage of a dispatched request to the Usage Reporter. The Usage Collector record of a request therefore never precedes the settle of its lease. A request admitted without a lease goes to the Usage Reporter at once.
 
 ##### Responsibility boundaries
 
-Does not own quotas, quota policies, or quota counters (Quota Enforcement does). Computes the reservation estimate itself; the actual cost of a dispatched call comes from the plugin. Does not block the response on settle. Does not report usage to Usage Collector (the Usage Reporter does), and Usage Collector records are not an input to Quota Enforcement.
+Does not own quotas, quota policies, or quota counters (Quota Enforcement does). Computes the reservation estimate itself; the actual cost of a dispatched call is the Cost Calculator's price of the plugin's usage. Does not block the response on settle. Does not report usage to Usage Collector (the Usage Reporter does), and Usage Collector records are not an input to Quota Enforcement.
 
 ##### Related components (by ID)
 
 - `cpt-cf-llm-gateway-component-request-pipeline-v1` — called by (admission and settle)
 - `cpt-cf-llm-gateway-component-stream-supervisor-v1` — called by (settle at stream terminal state)
-- `cpt-cf-llm-gateway-component-provider-plugin-v1` — depends on (actual AI credits)
+- `cpt-cf-llm-gateway-component-cost-calculator-v1` — calls (lease amount, estimates)
 - `cpt-cf-llm-gateway-component-usage-reporter-v1` — hands usage to after settle
 
 #### Media Resolver
@@ -517,15 +528,15 @@ Does not transcode media, does not inspect media content beyond type and size, a
 
 ##### Why this component exists
 
-Provider APIs differ in request shape, streaming format, schema support, errors, stop reasons, pricing, and usage reporting. Plugins isolate these differences behind one trait.
+Provider APIs differ in request shape, streaming format, schema support, errors, stop reasons, and usage reporting. Plugins isolate these differences behind one trait.
 
 ##### Responsibility scope
 
-At startup registers its GTS plugin instance and scoped client, and publishes its provider settings schema (including pricing) in Type Registry so Model Registry can validate model settings. Per call: narrows `ModelInfoV1` to its typed settings; applies defaults and allowed provider-specific settings; maps reasoning config, tool choice, `cf_gears:web_search`, provider tools, and cache-control hints; at call time adapts the structured output schema to the provider subset (schemas the subset cannot express are already rejected by the Capability Checker); sets the provider key on the request; sends the request through OAGW to the model's upstream alias (`provider_settings.oagw_alias`) and maps an alias that does not resolve to an upstream enabled for the tenant to `unapproved_destination`; parses responses and SSE into SDK models; maps stop reasons and errors to normalized values with provider originals; converts embedding encoding when needed; captures `provider_request_id`; computes cost in AI credits from model pricing; reacts to the cancellation token. For pass-through, owns the provider's endpoint allowlist (declared in `capabilities`) and denylists of stateful fields and paid tools and, in `forward_passthrough`, checks the native body against them before forwarding it.
+At startup registers its GTS plugin instance and scoped client, and publishes its provider type, derived from `gts.cf.genai.model.provider.v1~`, in Type Registry; its schema constrains `provider_settings`, so Model Registry can validate model settings. Per call: narrows `provider_settings` to its typed settings (`ProviderCallCtx::provider_settings`); sends `provider_model_id` as the provider's model name; applies defaults and allowed provider-specific settings; maps reasoning config, tool choice, `cf_gears:web_search`, provider tools, and cache-control hints; at call time adapts the structured output schema to the provider subset (schemas the subset cannot express are already rejected by the Capability Checker); sends the request through OAGW to the model's destination (`base_url`, or its default URL for the provider), naming `secret_ref` as the credential when the model has one; maps an alias that does not resolve to an upstream enabled for the tenant to `unapproved_destination`, and OAGW's refusal of the named credential to `credentials_unavailable`; parses responses and SSE into SDK models; maps stop reasons and errors to normalized values with provider originals; converts embedding encoding when needed; captures `provider_request_id`; normalizes the provider's usage into generic usage (input, output, cache read, cache write, and reasoning tokens, web search calls) and leaves the cost at 0 for the core; reacts to the cancellation token. For pass-through, owns the provider's endpoint allowlist (declared in `capabilities`) and denylists of stateful fields and paid tools and, in `forward_passthrough`, checks the native body against them before forwarding it.
 
 ##### Responsibility boundaries
 
-Does not resolve models, check or settle quotas, fetch credentials, report usage, persist anything, retry provider calls, or call anything other than OAGW and Type Registry (registration only). Does not use third-party provider SDKs.
+Does not resolve models, check or settle quotas, read credentials, compute cost, report usage, persist anything, retry provider calls, or call anything other than OAGW and Type Registry (registration only). Does not use third-party provider SDKs.
 
 ##### Related components (by ID)
 
@@ -543,7 +554,7 @@ Streams fail in more ways than sync calls: provider omits a stop event, the conn
 
 ##### Responsibility scope
 
-Wraps the plugin stream. Emits `response.created` and `response.in_progress`, renumbers `sequence_number`, relays deltas through a bounded channel (backpressure; capacity from gear configuration, § 4.5), and tracks whether a terminal event was seen, the last provider usage seen, and the output relayed so far (for the incomplete-usage estimate). Enforces the stream idle timeout and maximum stream duration (§ 4.5): on expiry it cancels the request token and ends the stream with `response.failed` (`provider_unavailable`) and incomplete usage. Synthesizes `response.completed` when the provider ends normally without one, and `response.failed` with the normalized category and incomplete usage when the stream breaks. Converts a provider `error` event into the terminal `response.failed` and never emits a standalone `error` event. Drops anything after the terminal event. On consumer disconnect, cancels the request token so the plugin stream and OAGW connection close, and reports usage marked incomplete, with the quantity set by the incomplete-usage policy of the Usage Reporter. At every terminal state hands the AI credit quantity to the Quota Guard, which settles the lease and then passes the usage to the Usage Reporter. For `json_schema` output, accumulates the final text and validates it before emitting the terminal event (failure turns into `response.failed` with `output_validation_error`). Logs stream aborts with the reason and the response `id`.
+Wraps the plugin stream. Emits `response.created` and `response.in_progress`, renumbers `sequence_number`, relays deltas through a bounded channel (backpressure; capacity from gear configuration, § 4.5), and tracks whether a terminal event was seen, the last provider usage seen, and the output relayed so far (for the incomplete-usage estimate). Enforces the stream idle timeout and maximum stream duration (§ 4.5): on expiry it cancels the request token and ends the stream with `response.failed` (`provider_unavailable`) and incomplete usage. Synthesizes `response.completed` when the provider ends normally without one, and `response.failed` with the normalized category and incomplete usage when the stream breaks. Converts a provider `error` event into the terminal `response.failed` and never emits a standalone `error` event. Drops anything after the terminal event. On consumer disconnect, cancels the request token so the plugin stream and OAGW connection close, and reports usage marked incomplete, with the quantity set by the incomplete-usage policy of the Usage Reporter. At every terminal state has the Cost Calculator price the usage of the terminal event and hands the AI credit quantity to the Quota Guard, which settles the lease and then passes the usage to the Usage Reporter. For `json_schema` output, accumulates the final text and validates it before emitting the terminal event (failure turns into `response.failed` with `output_validation_error`). Logs stream aborts with the reason and the response `id`.
 
 ##### Responsibility boundaries
 
@@ -554,6 +565,7 @@ Does not translate provider events (plugin) and does not buffer the whole stream
 - `cpt-cf-llm-gateway-component-provider-plugin-v1` — consumes streams from
 - `cpt-cf-llm-gateway-component-output-validator-v1` — calls
 - `cpt-cf-llm-gateway-component-quota-guard-v1` — hands terminal usage to (settle, then usage reporting)
+- `cpt-cf-llm-gateway-component-cost-calculator-v1` — calls (cost of the terminal usage)
 - `cpt-cf-llm-gateway-component-request-pipeline-v1` — called by
 
 #### Output Validator
@@ -589,14 +601,14 @@ Usage must reach Usage Collector at least once per request without blocking the 
 
 Builds one UsageRecord per terminal request state (completed, incomplete, failed after dispatch, disconnected) with tenant and user (subject) as explicit attribution, model, AI credit quantity, completeness flag, optional labeled estimate, `provider_request_id`, and idempotency key equal to the response `id`. Receives the usage of a request from the Quota Guard after the settle of its lease completes or is abandoned (at once for a request admitted without a lease), so the record is emitted only after the Quota Enforcement settle for the same request. Delivers asynchronously in batches through `UsageCollectorClientV1::create_usage_records`, retrying transient failures with backoff from a bounded in-memory buffer; treats idempotent replays as success. Drains the buffer during graceful shutdown within the gear stop timeout. Logs delivery failures with the response `id`.
 
-AI credit quantity per terminal state (interim policy, design assumption pending the PRD open question on budget edge cases, § 4.10). Quantities from provider usage are computed by the plugin with the call's cost; estimates for requests without final provider usage are computed by the core from the provider rules and the pricing in the model's provider settings. The Usage Reporter only records them. The same values appear in the `usage` of the Response or terminal event when one is sent, and the Quota Guard commits the same quantity, capped at the reserved amount (§ 3.2 Quota Guard).
+AI credit quantity per terminal state (interim policy, design assumption pending the PRD open question on budget edge cases, § 4.10). Quantities from provider usage are the Cost Calculator's price of the generic usage the plugin normalized; estimates for requests without final provider usage are token estimates from the provider rules kept in the core, priced by the Cost Calculator from the model's cost rates. The Usage Reporter only records them. The same values appear in the `usage` of the Response or terminal event when one is sent, and the Quota Guard commits the same quantity, capped at the reserved amount (§ 3.2 Quota Guard).
 
 | Terminal state | Quantity | `complete` | `estimate` |
 |----------------|----------|------------|------------|
-| Provider reported final usage (completed, or incomplete by stop reason such as output token limit) | Plugin cost from provider usage | true | false |
-| Failed after dispatch with a provider error response | Plugin cost from provider usage if the error carries it, otherwise 0 | true | false |
-| No final provider usage: stream broke, consumer disconnected, stream or sync call timed out, instance shutdown cut the request | Core estimate: estimated input tokens plus output relayed so far (or the last partial provider usage seen, whichever is higher), priced from the model's provider settings | false | true |
-| Same as above, but no estimate can be made (no token counting or pricing rule for the provider) | 0 | false | false |
+| Provider reported final usage (completed, or incomplete by stop reason such as output token limit) | Cost of provider usage | true | false |
+| Failed after dispatch with a provider error response | Cost of provider usage if the error carries it, otherwise 0 | true | false |
+| No final provider usage: stream broke, consumer disconnected, stream or sync call timed out, instance shutdown cut the request | Core estimate: estimated input tokens plus output relayed so far (or the last partial provider usage seen, whichever is higher), priced from the model's cost rates; on pass-through routes, estimated input tokens only (§ 3.3) | false | true |
+| Same as above, but no estimate can be made (no token counting rule for the provider) | 0 | false | false |
 
 Delivery identity: the Usage Reporter calls Usage Collector under the gear's own service (S2S) identity, obtained through the platform client-credentials exchange (`exchange_client_credentials`), and passes the tenant and subject (user) of each request explicitly as attribution on its record. It keeps no caller `SecurityContext` after the request ends. Usage Collector authorizes, through its PDP, the tenants and subjects the gear may report for.
 
@@ -626,21 +638,31 @@ Paths are relative to the api-gateway prefix (deployment `prefix_path`, empty by
 |--------|------|-------------|-----------|
 | `POST` | `/llm-gateway/v1/responses` | Create a response. `stream=false`: `200` JSON Response. `stream=true`: `200` SSE stream of StreamingEvents. | stable (P1) |
 | `POST` | `/llm-gateway/v1/embeddings` | Generate embeddings | stable (P1) |
-| `POST` | `/llm-gateway/v1/passthrough/openai/{*path}` | OpenAI pass-through: provider-native JSON or SSE; `path` must be an endpoint declared by the selected plugin (§ 3.3 Pass-through stateless guard) | stable (P1) |
-| `POST` | `/llm-gateway/v1/passthrough/anthropic/{*path}` | Anthropic pass-through: provider-native JSON or SSE; `path` must be an endpoint declared by the selected plugin | stable (P1) |
+| `GET`, `POST`, `PUT`, `PATCH`, `DELETE` | `/llm-gateway/v1/passthrough/openai/{*path}` | OpenAI pass-through: provider-native JSON or SSE; the method and `path` must be an endpoint declared by the selected plugin (§ 3.3 Pass-through stateless guard) | stable (P1) |
+| `GET`, `POST`, `PUT`, `PATCH`, `DELETE` | `/llm-gateway/v1/passthrough/anthropic/{*path}` | Anthropic pass-through: provider-native JSON or SSE; the method and `path` must be an endpoint declared by the selected plugin | stable (P1) |
+| `GET` | `/llm-gateway/v1/passthrough/openai/v1/models` | OpenAI pass-through model list, answered by the core from Model Registry (§ 3.3 Pass-through model listing) | stable (P1) |
+| `GET` | `/llm-gateway/v1/passthrough/openai/v1/models/{model_id}` | OpenAI pass-through model, answered by the core from Model Registry | stable (P1) |
+| `GET` | `/llm-gateway/v1/passthrough/anthropic/v1/models` | Anthropic pass-through model list, answered by the core from Model Registry | stable (P1) |
+| `GET` | `/llm-gateway/v1/passthrough/anthropic/v1/models/{model_id}` | Anthropic pass-through model, answered by the core from Model Registry | stable (P1) |
 
 **Operation registration**:
 
-- Every operation is registered through `OperationBuilder` with `.authenticated()`, an `operation_id` following `<crate>.<resource>.<action>` (`llm_gateway.responses.create`, `llm_gateway.embeddings.create`, `llm_gateway.openai_passthrough.forward`, `llm_gateway.anthropic_passthrough.forward`), JSON request schemas, success responses, and `.standard_errors(...)` plus the Gateway-specific Problem responses from § 4.1 (`501`, `503`).
+- Every operation is registered through `OperationBuilder` with `.authenticated()`, an `operation_id` following `<crate>.<resource>.<action>` (`llm_gateway.responses.create`, `llm_gateway.embeddings.create`, `llm_gateway.openai_passthrough.forward`, `llm_gateway.openai_passthrough.list_models`, `llm_gateway.openai_passthrough.get_model`, and the same three for `llm_gateway.anthropic_passthrough`), JSON request schemas, success responses, and `.standard_errors(...)` plus the Gateway-specific Problem responses from § 4.1 (`501`, `503`).
 - `llm_gateway.responses.create` declares two success media types on one operation: `application/json` (Response) and `text/event-stream` (StreamingEvent). The handler selects by the `stream` flag.
 - `llm_gateway.responses.create` and `llm_gateway.embeddings.create` use the typed Open Responses schemas from `llm-gateway-sdk`.
-- Pass-through operations (the `llm_gateway.openai_passthrough.*` and `llm_gateway.anthropic_passthrough.*` operations above) do not use the Open Responses schemas. Each route is a catch-all for one provider API; the endpoint allowlist is owned by the provider plugin (stateless guard below), so only endpoints the selected plugin declares are forwarded and no other provider path is reachable through the Gateway. A path the plugin does not declare, and any method other than `POST` under `/llm-gateway/v1/passthrough/openai/` or `/llm-gateway/v1/passthrough/anthropic/`, is answered with a 404 in the provider-native error format (§ 4.1 Pass-through error format) and `x-should-retry: false`, so the provider SDKs report it as an ordinary not-found error. Request: `application/json`, a provider-native body declared as an untyped JSON object. The Gateway reads a narrow typed view of it for routing and the quota estimate, scans it for the denylisted fields of the stateless guard and the paid-tool denylist below, and treats everything else as opaque. The typed view: `model` (required, model resolution), `stream`, the output limit (`max_tokens` for Anthropic; `max_completion_tokens` or `max_tokens` for OpenAI Chat Completions; `max_output_tokens` for OpenAI Responses), and the input text used for the quota estimate. The quota lease amount is computed from this view by the provider rules kept in the core; when the request has no output limit, the model's maximum output from `context_window` is used. Apart from the stateless guard below, the Gateway does not restrict anything else in the native request: disabled capabilities, the parameter policy, and provider-executed tools are not checked on these routes. Non-metered endpoints declared by the plugin (in P1, Anthropic `count_tokens`) generate no output: they have no quota lease, no AI credit cost, and no usage enrichment. The plugin replaces `model` with the model's `provider_model_id` before the call and replaces it back with the Gateway model identifier in the `model` fields of the native response and stream events. Success responses: `application/json` with the provider-native body, or `text/event-stream` with provider-native SSE events when the native request asks for streaming. The Gateway enriches the native response with Gateway usage: it adds the usage extensions (AI credit cost, completeness and estimate flags) to the provider's native `usage` object, and in streaming to the event that carries the final usage; when the provider sends streaming usage only on request (OpenAI Chat Completions `stream_options.include_usage`), the plugin always requests it, because the Gateway needs the usage for quota settle and usage reporting. The extra final chunk this produces (usage with an empty `choices` array) is forwarded, with Gateway usage added, only when the consumer set `include_usage` itself; otherwise the plugin reads the usage from it and drops it, so the consumer receives exactly the stream it asked for, and clients that index `choices[0]` on every chunk keep working. For a stream that ends without final provider usage, the plugin counts the output deltas relayed so far, and the usage estimate policy of § 3.2 Usage Reporter applies. All other fields and events are relayed unchanged. Every pass-through response, success or error, JSON or SSE, carries the Gateway response `id` in the `x-llm-gateway-response-id` header (for SSE, sent with the response headers before the first event), because the native body carries only the provider's own id; this is the identifier of the usage record, the quota lease, logs, and traces (PRD `cpt-cf-llm-gateway-fr-request-traceability-v1`). Authentication: the platform authenticates pass-through routes with the bearer token in `Authorization`, like every other route; OpenAI SDK clients pass the platform token as the API key, Anthropic SDK clients pass it as `auth_token` (`ANTHROPIC_AUTH_TOKEN`), because the Anthropic API key travels in `x-api-key`, which the platform does not read. Header handling: the plugin builds the provider request headers itself; the consumer's `Authorization` and `x-api-key` are never forwarded, and only an allowlist of provider protocol headers (`anthropic-version`, `anthropic-beta`, `OpenAI-Beta`) is passed through; for the beta headers, only allowlisted values (gear configuration) are kept. Errors on pass-through routes use the provider-native error format of the route, not Problems (§ 4.1 Pass-through error format); provider error responses are relayed with the provider's status code and native error body.
+- Pass-through operations (the `llm_gateway.openai_passthrough.*` and `llm_gateway.anthropic_passthrough.*` operations above) do not use the Open Responses schemas. Each route is a catch-all for one provider API; the endpoint allowlist is owned by the provider plugin (stateless guard below), so only endpoints the selected plugin declares are forwarded and no other provider path is reachable through the Gateway. The routes accept every method, so that the API does not limit what a plugin can declare; the model listing `GET` routes below take precedence over the catch-all. A method and path the plugin does not declare is answered with a 404 in the provider-native error format (§ 4.1 Pass-through error format) and `x-should-retry: false`, so the provider SDKs report it as an ordinary not-found error. Request: the method, path, raw query string, and, when the request has a body, an `application/json` provider-native body declared as an untyped JSON object; the query string is passed to the plugin as is. Model resolution reads `model` from the body; in P1 every declared endpoint is a `POST` whose body carries `model`. An endpoint without `model` in the body (a `GET` or `DELETE`, for example) needs a model resolution rule that this design does not define yet (§ 4.10), so until then a request without `model` is rejected with `validation_error` in the route's error format. The Gateway reads a narrow typed view of it for routing and the quota estimate, scans it for the denylisted fields of the stateless guard and the paid-tool denylist below, and treats everything else as opaque. The typed view: `model` (required, model resolution), `stream`, the output limit (`max_tokens` for Anthropic; `max_completion_tokens` or `max_tokens` for OpenAI Chat Completions; `max_output_tokens` for OpenAI Responses), and the input text used for the quota estimate. The quota lease amount is computed from this view by the provider rules kept in the core; when the request has no output limit, the model's maximum output from `context_window` is used. Apart from the stateless guard below, the Gateway does not restrict anything else in the native request: disabled capabilities, the parameter policy, and provider-executed tools are not checked on these routes. Non-metered endpoints declared by the plugin (in P1, Anthropic `count_tokens`) generate no output: they have no quota lease, no AI credit cost, and no usage record. The plugin replaces `model` with the model's `provider_model_id` before the call and replaces it back with the Gateway model identifier in the `model` fields of the native response and stream events. Success responses: `application/json` with the provider-native body, or `text/event-stream` with provider-native SSE events when the native request asks for streaming. The Gateway does not add fields to the native response or events: clients built for the provider API may parse them strictly, so the native `usage` object is relayed as the provider sent it. The plugin reads generic usage from the native response, or in streaming from the event that carries the final usage; the Cost Calculator prices it for quota settle and usage reporting, and the consumer correlates the call with its usage record (AI credit cost, completeness and estimate flags) through the `x-llm-gateway-response-id` header. When the provider sends streaming usage only on request (OpenAI Chat Completions `stream_options.include_usage`), the plugin always requests it, because the Gateway needs the usage for quota settle and usage reporting. The extra final chunk this produces (usage with an empty `choices` array) is forwarded unchanged only when the consumer set `include_usage` itself; otherwise the plugin reads the usage from it and drops it, so the consumer receives exactly the stream it asked for, and clients that index `choices[0]` on every chunk keep working. For a stream that ends without final provider usage, the usage estimate policy of § 3.2 Usage Reporter applies with the output relayed so far left out: the core does not parse native events, and the plugin does not count output tokens, so the estimate is the estimated input tokens computed from the typed view of the request (as for the quota lease), priced from the model's cost rates, marked incomplete and estimated (open question in § 4.10). All other fields and events are relayed unchanged. Every pass-through response, success or error, JSON or SSE, carries the Gateway response `id` in the `x-llm-gateway-response-id` header (for SSE, sent with the response headers before the first event), because the native body carries only the provider's own id; this is the identifier of the usage record, the quota lease, logs, and traces (PRD `cpt-cf-llm-gateway-fr-request-traceability-v1`). Authentication: the platform authenticates pass-through routes with the bearer token in `Authorization`, like every other route; OpenAI SDK clients pass the platform token as the API key, Anthropic SDK clients pass it as `auth_token` (`ANTHROPIC_AUTH_TOKEN`), because the Anthropic API key travels in `x-api-key`, which the platform does not read. Header handling: the plugin builds the provider request headers itself; the consumer's `Authorization` and `x-api-key` are never forwarded, and only an allowlist of provider protocol headers (`anthropic-version`, `anthropic-beta`, `OpenAI-Beta`) is passed through; for the beta headers, only allowlisted values (gear configuration) are kept. Errors on pass-through routes use the provider-native error format of the route, not Problems (§ 4.1 Pass-through error format); provider error responses are relayed with the provider's status code and native error body.
 - The service is attached once with `Extension<Arc<Service>>` after all routes. Handlers take `Extension<SecurityContext>` and pass it to the pipeline unchanged.
+- Pass-through model listing: provider SDKs and tools discover models with `GET /v1/models` and `GET /v1/models/{model_id}`, so both pass-through APIs serve them. They are not forwarded to the provider: the request carries no `model` to select a plugin, destination, and `secret_ref` from, and the provider's own list would expose its whole catalog under provider model names instead of the tenant's models. The core answers them from Model Registry through the Model Resolver:
+  - Flow: PEP check with the route's pass-through action (`forward_openai_passthrough` or `forward_anthropic_passthrough`; listing models is part of native access), then `list_available_models` (list) or `resolve_model` (one model) under the caller's `SecurityContext`. No in-flight slot, quota lease, plugin call, provider call, or usage record.
+  - Filter: a model is listed only when the Capability Checker would admit it on the route: its capabilities include the route's pass-through API and the capability is not disabled, and the Plugin Directory has a plugin for its provider type that declares that pass-through API. `GET /v1/models/{model_id}` for a model outside this set returns `model_not_found` (404) in the route's error format, as the Model Resolver does for a model that is not available.
+  - OpenAI format: `{"object": "list", "data": [...]}` with every listed model; each model is `{"id", "object": "model", "created", "owned_by"}`: `id` is the canonical id (`provider_slug::name`), `created` is the model's `created_at` in Unix seconds, and `owned_by` is the provider slug.
+  - Anthropic format: `{"data": [...], "first_id", "last_id", "has_more"}`; each model is `{"id", "type": "model", "display_name", "created_at"}`: `id` is the canonical id, `display_name` is `info.display_name`, and `created_at` is RFC 3339. The list is ordered newest first by `created_at`; the core applies the Anthropic paging parameters (`limit`, default 20, 1 to 1000; `after_id`; `before_id`) to the filtered list.
+  - The core reads every page of `list_available_models` before filtering, because the filter is not expressible as a Model Registry query. Responses carry `x-llm-gateway-response-id` like every pass-through response, for log and trace correlation.
 - Pass-through stateless guard: pass-through requests must not create or reference provider-side state (§ 2.2).
-  - Endpoint allowlist, owned by the provider plugin: each plugin that implements a pass-through API declares in its integration capabilities (`capabilities`) the stateless endpoints it forwards, each with whether it is metered (a metered endpoint gets a quota lease, AI credit cost, and usage enrichment; a non-metered one, such as token counting, gets none). After model resolution and plugin selection, the Request Pipeline checks the request path against the selected plugin's declared endpoints, using the capabilities cached by the Plugin Directory, before the capability check and quota admission; an undeclared path returns a provider-format 404 without a provider call. P1 endpoints: OpenAI plugin `/v1/responses`, `/v1/chat/completions`; Anthropic plugin `/v1/messages`, `/v1/messages/count_tokens` (not metered). A plugin adds an endpoint only if it is stateless.
+  - Endpoint allowlist, owned by the provider plugin: each plugin that implements a pass-through API declares in its integration capabilities (`capabilities`) the stateless endpoints it forwards, each as a method and path with whether it is metered (a metered endpoint gets a quota lease, AI credit cost, and a usage record; a non-metered one, such as token counting, gets none). After model resolution and plugin selection, the Request Pipeline checks the request method and path against the selected plugin's declared endpoints, using the capabilities cached by the Plugin Directory, before the capability check and quota admission; an undeclared method and path returns a provider-format 404 without a provider call. P1 endpoints: OpenAI plugin `POST /v1/responses`, `POST /v1/chat/completions`; Anthropic plugin `POST /v1/messages`, `POST /v1/messages/count_tokens` (not metered). A plugin adds an endpoint only if it is stateless.
   - Forced no-store: the plugin always sets `store=false` on OpenAI Responses (where the provider default is `true`) and OpenAI Chat Completions requests, overriding any consumer value. Anthropic Messages stores nothing by default.
-  - Denylist of stateful fields, owned and checked by the provider plugin as the first step of `forward_passthrough`, before anything is sent to the provider; a match fails the call with `capability_not_supported` carrying the JSON path of the field as `param`, and the provider is not called. The check runs after quota admission and credential retrieval, so the Quota Guard releases the lease (nothing is committed, usage is not reported, as for any failure before dispatch) and the fetched key is dropped unused. The core enforces the outcome; the plugin supplies the provider-specific detection, because it owns the provider format. OpenAI Responses: `previous_response_id`, `conversation`, `background` set to `true`, `prompt` (stored prompts), `item_reference` input items, `file_id` in input content parts, tools of type `file_search` and `code_interpreter`. OpenAI Chat Completions: `file_id` in content parts. Anthropic Messages and `count_tokens`: `container`, content blocks with `source.type` `file`, `container_upload` content blocks, code execution tools. On every route, a `file_id`, `container`, or `vector_store_ids` key at any depth of the body is also rejected, so references to stored provider objects (files, containers, vector stores) are caught wherever the provider API places them. The scan skips subtrees whose content the consumer defines and the provider does not interpret as object references, so user tools and schemas with fields of these names keep working: JSON schemas (function tool `parameters`, Anthropic tool `input_schema`, `response_format.json_schema.schema`, `text.format.schema`), `metadata`, and the `input` of `tool_use` blocks (function call arguments in OpenAI APIs are JSON strings and are not scanned). The plugin owns this list of skipped subtrees together with the denylist. The denylist is part of the plugin and is extended in the plugin when the provider API adds stateful fields.
-  - Denylist of paid provider tools, owned and checked by the plugin in `forward_passthrough` the same way: provider-executed tools billed per call are rejected with `capability_not_supported`, because the quota lease is estimated from tokens only, the commit is capped at the lease, and the plugin's AI credit cost does not include per-call fees. OpenAI Responses: tools of type `web_search` and `web_search_preview`, `image_generation`. OpenAI Chat Completions: `web_search_options`. Anthropic Messages: web search tools (`web_search_*`). The list is extended when the provider adds tools billed per call.
+  - Denylist of stateful fields, owned and checked by the provider plugin as the first step of `forward_passthrough`, before anything is sent to the provider; a match fails the call with `capability_not_supported` carrying the JSON path of the field as `param`, and the provider is not called. The check runs after quota admission, so the Quota Guard releases the lease (nothing is committed, usage is not reported, as for any failure before dispatch). The core enforces the outcome; the plugin supplies the provider-specific detection, because it owns the provider format. OpenAI Responses: `previous_response_id`, `conversation`, `background` set to `true`, `prompt` (stored prompts), `item_reference` input items, `file_id` in input content parts, tools of type `file_search` and `code_interpreter`. OpenAI Chat Completions: `file_id` in content parts. Anthropic Messages and `count_tokens`: `container`, content blocks with `source.type` `file`, `container_upload` content blocks, code execution tools. On every route, a `file_id`, `container`, or `vector_store_ids` key at any depth of the body is also rejected, so references to stored provider objects (files, containers, vector stores) are caught wherever the provider API places them. The scan skips subtrees whose content the consumer defines and the provider does not interpret as object references, so user tools and schemas with fields of these names keep working: JSON schemas (function tool `parameters`, Anthropic tool `input_schema`, `response_format.json_schema.schema`, `text.format.schema`), `metadata`, and the `input` of `tool_use` blocks (function call arguments in OpenAI APIs are JSON strings and are not scanned). The plugin owns this list of skipped subtrees together with the denylist. The denylist is part of the plugin and is extended in the plugin when the provider API adds stateful fields.
+  - Denylist of paid provider tools, owned and checked by the plugin in `forward_passthrough` the same way: provider-executed tools billed per call are rejected with `capability_not_supported`, because the quota lease is estimated from tokens only and the commit is capped at the lease, so per-call fees could not be reserved. OpenAI Responses: tools of type `web_search` and `web_search_preview`, `image_generation`. OpenAI Chat Completions: `web_search_options`. Anthropic Messages: web search tools (`web_search_*`). The list is extended when the provider adds tools billed per call.
   - Beta headers: only allowlisted `anthropic-beta` and `OpenAI-Beta` values are forwarded, so stateful beta features (for example the Anthropic Files API) cannot be enabled.
 - Authorization: the platform authenticates every route. The Request Pipeline then runs one PEP check per operation through the platform `PolicyEnforcer` (`authz-resolver-sdk`), before any other dependency call, for both REST and SDK entry points. Resource type: one LLM Gateway resource type scoped by `OWNER_TENANT_ID` (the caller's tenant; GTS identifier settled with the GTS identifiers question, § 4.10). Actions: `create_response` (sync and streaming), `create_embedding`, `forward_openai_passthrough` (OpenAI pass-through route), and `forward_anthropic_passthrough` (Anthropic pass-through route). The pass-through actions are separate from `create_response` so that native provider access can be granted independently of the Open Responses API. A PDP denial returns `permission_denied` (403, § 4.1); PDP evaluation failure fails closed per the platform PEP error mapping. The PRD delegates authorization to platform middleware and names no resource types or actions, so this resource type and these actions are a design assumption. Model availability per tenant stays with Model Registry.
 
@@ -672,31 +694,30 @@ Paths are relative to the api-gateway prefix (deployment `prefix_path`, empty by
 - [ ] `p1` - **ID**: `cpt-cf-llm-gateway-interface-provider-plugin-v1`
 
 - **Contracts**: no PRD contract ID; `LlmGatewayProviderPluginClientV1` and `LlmGatewayProviderPluginSpecV1` in `llm-gateway-sdk` (PRD § 7)
-- **Technology**: Rust trait registered as a scoped ClientHub client keyed by the plugin's GTS instance id; GTS plugin instance and provider settings schema in Type Registry
+- **Technology**: Rust trait registered as a scoped ClientHub client keyed by the plugin's GTS instance id; GTS plugin instance and provider type in Type Registry
 - **Location**: [llm-gateway-sdk/src/plugin_api.rs](../llm-gateway-sdk/src/plugin_api.rs), [llm-gateway-sdk/src/gts.rs](../llm-gateway-sdk/src/gts.rs)
 
 **Endpoints Overview**:
 
 | Method | Path | Description | Stability |
 |--------|------|-------------|-----------|
-| `capabilities` | `LlmGatewayProviderPluginClientV1` | Local call: integration capabilities: streaming transport, media input mode, mapping of `cf_gears:web_search` to a native provider tool, and for pass-through the provider API it implements and its allowlist of endpoints (path, metered or not) | stable (P1) |
-| `create_response` | `LlmGatewayProviderPluginClientV1` | Sync call with the provider call context (model info, response `id`, optional provider API key, cancellation token); adapts the structured output schema to the provider subset; returns the normalized Response with usage and AI credits | stable (P1) |
+| `capabilities` | `LlmGatewayProviderPluginClientV1` | Local call: integration capabilities: streaming transport, media input mode, mapping of `cf_gears:web_search` to a native provider tool, and for pass-through the provider API it implements and its allowlist of endpoints (method, path, metered or not) | stable (P1) |
+| `create_response` | `LlmGatewayProviderPluginClientV1` | Sync call with the provider call context (model info, response `id`, cancellation token); adapts the structured output schema to the provider subset; returns the normalized Response with generic usage (cost left at 0 for the core) | stable (P1) |
 | `create_response_stream` | `LlmGatewayProviderPluginClientV1` | Streaming call; failures in-band as `response.failed`; stops on cancellation token or when the stream is dropped | stable (P1) |
 | `create_embedding` | `LlmGatewayProviderPluginClientV1` | Embeddings; converts vectors to the requested `encoding_format` when the provider cannot | stable (P1) |
-| `forward_passthrough` | `LlmGatewayProviderPluginClientV1` | Pass-through call (plugins that implement the pass-through API of their provider): first checks the native body against the plugin's denylists of stateful fields and paid provider tools, including the key scan at any depth, and fails with `capability_not_supported` and the field's JSON path on a match without calling the provider; then substitutes `model`, forces no-store, and sends the provider-native body, sync or streaming, with the provider call context; returns the native response or SSE stream together with the usage read from it and its cost in AI credits | stable (P1) |
+| `forward_passthrough` | `LlmGatewayProviderPluginClientV1` | Pass-through call (plugins that implement the pass-through API of their provider): first checks the native body against the plugin's denylists of stateful fields and paid provider tools, including the key scan at any depth, and fails with `capability_not_supported` and the field's JSON path on a match without calling the provider; then substitutes `model`, forces no-store, and sends the provider-native body, sync or streaming, with the provider call context; returns the native response or SSE stream together with the generic usage read from it | stable (P1) |
 
-The plugin trait carries no pre-dispatch or estimation calls. Per-model parameter support, the check that a structured output schema is expressible in the provider subset (`unsupported_schema`), the quota lease amount, and the usage estimate for requests that ended without final provider usage are computed by the Gateway service before quota admission and credential retrieval, or at the terminal state, not through `LlmGatewayProviderPluginClientV1`.
+The plugin trait carries no pre-dispatch or estimation calls. Per-model parameter support, the check that a structured output schema is expressible in the provider subset (`unsupported_schema`), the quota lease amount, and the usage estimate for requests that ended without final provider usage are computed by the Gateway service before quota admission, or at the terminal state, not through `LlmGatewayProviderPluginClientV1`.
 
 ### 3.4 Internal Dependencies
 
-All calls go through SDK clients resolved from ClientHub. Request-path calls carry the caller's `SecurityContext`, including tool GTS schema resolution through `TypesRegistryApi` and quota admission (`acquire_lease`). Quota settle (`commit_lease`, `release_lease`) and usage delivery run in the background after the request ends, under the gear's own service identity with the tenant passed explicitly: in the settle call (§ 3.2 Quota Guard), and with tenant and subject as attribution on each usage record (§ 3.2 Usage Reporter). Registration of the plugin spec schema, plugin instances, and provider settings schemas, and the plugin instance listing behind the Plugin Directory cache, use `PlatformTypesRegistryApi` with `PlatformSecurityContext`. These are the only calls not made with a request's context.
+All calls go through SDK clients resolved from ClientHub. Request-path calls carry the caller's `SecurityContext`, including tool GTS schema resolution through `TypesRegistryApi` and quota admission (`acquire_lease`). Quota settle (`commit_lease`, `release_lease`) and usage delivery run in the background after the request ends, under the gear's own service identity with the tenant passed explicitly: in the settle call (§ 3.2 Quota Guard), and with tenant and subject as attribution on each usage record (§ 3.2 Usage Reporter). Registration of the plugin spec schema, plugin instances, and provider types, and the plugin instance listing behind the Plugin Directory cache, use `PlatformTypesRegistryApi` with `PlatformSecurityContext`. These are the only calls not made with a request's context.
 
 | Dependency Gear | Interface Used | Purpose |
 |-------------------|----------------|----------|
-| Model Registry | `ModelRegistryClientV1::get_tenant_model` | Resolve model info per tenant on every request. Model info carries the provider `gts_type`, provider model id, the OAGW upstream alias (`provider_settings.oagw_alias`), the secret reference of the provider API key, capabilities, `default_parameters`, `allow_parameter_override`, `allow_extra_params`, and provider settings with pricing; provider settings are validated against the schemas that plugins publish in Type Registry |
-| Type Registry | `PlatformTypesRegistryApi` with `PlatformSecurityContext`; `TypesRegistryApi` | `PlatformTypesRegistryApi`: register the plugin spec schema (core) and plugin instances and settings schemas (plugins), and list plugin instances. `TypesRegistryApi`: resolve tool GTS schemas at request time under the caller's context |
-| OAGW | `ServiceGatewayClientV1` (`proxy_request`) | Only egress path for provider calls (to the model's upstream alias) and external media fetches; circuit breaking |
-| CredStore | `CredStoreClientV1::get` | Fetch the provider API key by the secret reference in the model info |
+| Model Registry | `ModelRegistryClientV1::resolve_model`, `ModelRegistryClientV1::list_available_models` | Resolve the requested model for the caller on every request (model `evaluate` permission); list the caller's available models for the pass-through model listing (§ 3.3). The returned `ModelV1.info` carries the provider `gts_type`, `provider_model_id`, `base_url`, `secret_ref` (the name of the provider credential, not the secret), the provider-independent `cost` rates, capabilities, `default_parameters`, `allow_parameter_override`, `allow_extra_params`, and `provider_settings`; provider settings are validated against the provider types that plugins publish in Type Registry |
+| Type Registry | `PlatformTypesRegistryApi` with `PlatformSecurityContext`; `TypesRegistryApi` | `PlatformTypesRegistryApi`: register the plugin spec schema (core) and plugin instances and provider types (plugins), and list plugin instances. `TypesRegistryApi`: resolve tool GTS schemas at request time under the caller's context |
+| OAGW | `ServiceGatewayClientV1` (`proxy_request`), with the OAGW credential selection for a named secret reference | Only egress path for provider calls (to the upstream alias named by the model's destination) and external media fetches; loads the provider API key named by the model's `secret_ref` from CredStore under the caller's context and sets it on the provider request; circuit breaking |
 | Quota Enforcement | `QuotaEnforcementApi` (`acquire_lease`, `commit_lease`, `release_lease`) | Pre-dispatch AI credit lease for the request's upper-bound cost under the caller's context; settle at the terminal state (commit of the actual AI credits capped at the reservation, or release) under the gear's service identity with explicit tenant |
 | Usage Collector | `UsageCollectorClientV1::create_usage_records` | At-least-once delivery of AI credit usage records under the gear's service identity, with explicit tenant and subject attribution per record |
 | AuthZ Resolver | `PolicyEnforcer` (`authz-resolver-sdk`) | Per-operation PEP check (`create_response`, `create_embedding`) before any other dependency call |
@@ -736,7 +757,7 @@ External systems, databases, and third-party services this gear interacts with. 
 
 **Use cases**: `cpt-cf-llm-gateway-usecase-chat-completion-v1`, `cpt-cf-llm-gateway-usecase-vision-v1`, `cpt-cf-llm-gateway-usecase-document-understanding-v1`
 
-**Actors**: `cpt-cf-llm-gateway-actor-consumer`, `cpt-cf-llm-gateway-actor-model-registry`, `cpt-cf-llm-gateway-actor-quota-enforcement`, `cpt-cf-llm-gateway-actor-credstore`, `cpt-cf-llm-gateway-actor-provider-plugin`, `cpt-cf-llm-gateway-actor-oagw`, `cpt-cf-llm-gateway-actor-provider`, `cpt-cf-llm-gateway-actor-usage-collector`
+**Actors**: `cpt-cf-llm-gateway-actor-consumer`, `cpt-cf-llm-gateway-actor-model-registry`, `cpt-cf-llm-gateway-actor-quota-enforcement`, `cpt-cf-llm-gateway-actor-provider-plugin`, `cpt-cf-llm-gateway-actor-oagw`, `cpt-cf-llm-gateway-actor-provider`, `cpt-cf-llm-gateway-actor-usage-collector`
 
 ```mermaid
 sequenceDiagram
@@ -751,7 +772,7 @@ sequenceDiagram
     participant CC as Capability Checker
     participant QG as Quota Guard
     participant QE as Quota Enforcement
-    participant CB as Credential Broker
+    participant CO as Cost Calculator
     participant PL as Provider Plugin
     participant O as OAGW
     participant PR as Provider
@@ -762,8 +783,8 @@ sequenceDiagram
     P->>AZ: access check (ctx, create_response)
     AZ-->>P: permitted
     P->>P: acquire in-flight slot, reject item_reference inputs
-    P->>MR: get_tenant_model(ctx, model)
-    MR-->>P: model info
+    P->>MR: resolve_model(ctx, model)
+    MR-->>P: model (info)
     P->>PD: select plugin by gts_type
     PD-->>P: plugin client and capabilities
     P->>TR: resolve GTS tools (when present)
@@ -771,22 +792,21 @@ sequenceDiagram
     P->>CC: check capabilities, parameters, tool_choice
     CC->>CC: schema expressible in provider subset, else unsupported_schema
     CC-->>P: effective request and ignored_parameters
-    par quota admission
-        P->>QG: admit(ctx, effective request, model info)
-        QG->>QG: estimate upper-bound AI credits (input plus output allowance, model pricing)
-        QG->>QE: acquire_lease(ctx, tenant and user, amount, ttl, key from response id)
-        QE-->>QG: Acquired (token, expires_at)
-        QG-->>P: admitted with lease
-    and credentials
-        P->>CB: resolve(ctx, model info)
-        CB-->>P: optional key (secret wrapper)
-    end
+    P->>QG: admit(ctx, effective request, model info)
+    QG->>CO: price upper-bound usage (input plus output allowance, model cost rates)
+    CO-->>QG: AI credits
+    QG->>QE: acquire_lease(ctx, tenant and user, amount, ttl, key from response id)
+    QE-->>QG: Acquired (token, expires_at)
+    QG-->>P: admitted with lease
     P->>PL: create_response(ctx, call ctx, request)
-    PL->>O: proxy_request to the model's oagw_alias
-    O->>PR: HTTPS request
+    PL->>O: proxy_request to the model's destination, credential = secret_ref
+    O->>O: load key from CredStore, set it on the request
+    O->>PR: HTTPS request with key
     PR-->>O: provider response
     O-->>PL: response
-    PL-->>P: normalized Response with usage and AI credits
+    PL-->>P: normalized Response with generic usage
+    P->>CO: price usage (model cost rates)
+    CO-->>P: AI credits (set as usage.cost)
     P->>QG: settle(lease, actual AI credits)
     P-->>API: Response with ignored_parameters
     API-->>C: 200 application/json
@@ -794,7 +814,7 @@ sequenceDiagram
     QG->>UR: enqueue usage record (key = response id)
 ```
 
-**Description**: The pipeline allocates the response `id`, runs the PEP check (`permission_denied` on denial), acquires an in-flight slot (§ 4.5), resolves the model, selects the plugin, resolves tool schemas, and runs the capability, parameter, and structured output schema checks. Only then do quota admission and credential resolution run concurrently (media resolution joins the same concurrent step when media parts are present); admission denial returns `quota_exceeded` and an unavailable check returns `quota_check_unavailable` (§ 3.6 Admission: Quota), the fetched key is then dropped unused, and a lease already acquired is released when credential or media resolution fails. The plugin translates, calls the provider through OAGW, normalizes the result, and computes cost. Image and document inputs travel as URLs or base64 (Media Resolver prefetches only when the plugin requires bytes; fetch or decode failures return `media_not_found`). Any failure before dispatch returns a Problem without calling the provider. Provider failures return the normalized category with provider details; usage is reported for every dispatched call. After the response is returned, the Quota Guard settles the lease in the background and only then hands the usage record to the Usage Reporter.
+**Description**: The pipeline allocates the response `id`, runs the PEP check (`permission_denied` on denial), acquires an in-flight slot (§ 4.5), resolves the model, selects the plugin, resolves tool schemas, and runs the capability, parameter, and structured output schema checks. Only then does quota admission run (media resolution runs concurrently with it when media parts are present); admission denial returns `quota_exceeded` and an unavailable check returns `quota_check_unavailable` (§ 3.6 Admission: Quota), and a lease already acquired is released when media resolution fails. The plugin translates, calls the provider through OAGW naming the model's credential (§ 3.6 Credential Resolution), and normalizes the result with generic usage; the Cost Calculator prices the usage before the response is returned. Image and document inputs travel as URLs or base64 (Media Resolver prefetches only when the plugin requires bytes; fetch or decode failures return `media_not_found`). Any failure before dispatch returns a Problem without calling the provider. Provider failures return the normalized category with provider details; usage is reported for every dispatched call. After the response is returned, the Quota Guard settles the lease in the background and only then hands the usage record to the Usage Reporter.
 
 #### Credential Resolution
 
@@ -802,39 +822,40 @@ sequenceDiagram
 
 **Use cases**: `cpt-cf-llm-gateway-usecase-chat-completion-v1`
 
-**Actors**: `cpt-cf-llm-gateway-actor-oagw`, `cpt-cf-llm-gateway-actor-credstore`, `cpt-cf-llm-gateway-actor-provider-plugin`
+**Actors**: `cpt-cf-llm-gateway-actor-oagw`, `cpt-cf-llm-gateway-actor-provider-plugin`
 
 ```mermaid
 sequenceDiagram
     participant P as Request Pipeline
-    participant CB as Credential Broker
-    participant CS as CredStore
     participant PL as Provider Plugin
     participant O as OAGW
-    P->>CB: resolve(ctx, model info)
+    participant CS as CredStore
+    P->>PL: dispatch(call ctx with model info)
     alt model has a secret reference
-        CB->>CS: get(ctx, secret_ref)
-        alt key returned
-            CS-->>CB: secret value
-            CB-->>P: key (secret wrapper)
-        else unavailable or missing
-            CS-->>CB: error or none
-            CB-->>P: credentials_unavailable
-        end
+        PL->>O: proxy_request(ctx, destination alias, request, credential = secret_ref)
     else no secret reference
-        CB-->>P: no key
+        PL->>O: proxy_request(ctx, destination alias, request)
     end
-    P->>PL: dispatch(call ctx with model info and optional key)
-    PL->>O: proxy_request(ctx, oagw_alias, HTTPS request with key)
-    alt alias resolves to an upstream enabled for the tenant
-        O-->>PL: provider response
-    else alias does not resolve
-        O-->>PL: no upstream, nothing forwarded
+    alt alias does not resolve to an upstream enabled for the tenant
+        O-->>PL: nothing forwarded
         PL-->>P: unapproved_destination
+    else credential named
+        O->>CS: get secret (caller ctx, secret_ref)
+        alt key returned
+            CS-->>O: secret value
+            O->>O: set key on the HTTPS request (upstream auth header and prefix)
+            O-->>PL: provider response
+        else missing, inaccessible, or CredStore unavailable
+            CS--xO: error or none
+            O-->>PL: credential refused, nothing forwarded
+            PL-->>P: credentials_unavailable
+        end
+    else no credential named
+        O-->>PL: provider response (upstream's own auth, if any)
     end
 ```
 
-**Description**: The Credential Broker reads the secret reference from the model info and fetches the key from CredStore by that reference; it never chooses a destination. The plugin sends the key only in requests to the model's OAGW upstream alias, over HTTPS, through OAGW; OAGW resolves the alias under the caller's tenant (upstream hierarchy and sharing rules apply) and forwards nothing when no enabled upstream matches, which the plugin reports as `unapproved_destination`. CredStore failure or a missing secret returns `credentials_unavailable` and the provider is not called.
+**Description**: Neither the Gateway core nor the plugin reads CredStore or sees a key. The plugin takes the destination from the model info (`base_url`, or its default URL for the provider; host and port name the OAGW upstream alias) and, when the model has a `secret_ref`, names it as the credential of the OAGW call. OAGW resolves the alias under the caller's tenant (upstream hierarchy and sharing rules apply) and forwards nothing when no enabled upstream matches, which the plugin reports as `unapproved_destination`. Otherwise OAGW loads the named secret from CredStore under the caller's context and sets it on the HTTPS request it forwards, with the header and prefix of the upstream's auth configuration. When OAGW cannot use the credential (secret missing or inaccessible to the caller, CredStore unavailable, credential not usable on that upstream), it forwards nothing and never falls back to another credential; the plugin reports `credentials_unavailable`. In both refusals the provider is not called and the Quota Guard releases the lease. The OAGW credential selection API is specified by OAGW (§ 4.10).
 
 #### Streaming Response
 
@@ -860,7 +881,7 @@ sequenceDiagram
     C->>API: POST /llm-gateway/v1/responses (stream=true)
     API->>P: create_response_stream(ctx, body)
     P->>P: pre-dispatch checks as in sync flow
-    P->>QG: admit(ctx, effective request, model info), concurrent with credentials
+    P->>QG: admit(ctx, effective request, model info)
     QG->>QE: acquire_lease(ctx, amount, ttl covering maximum stream duration)
     QE-->>QG: Acquired (token, expires_at)
     QG-->>P: admitted with lease
@@ -915,7 +936,7 @@ sequenceDiagram
     S->>PL: drop plugin stream (token cancelled)
     PL->>O: drop body stream
     O->>O: close upstream connection
-    S->>S: estimate usage (input plus output relayed so far, model pricing) or none
+    S->>S: estimate usage (input plus output relayed so far) or none, priced by the Cost Calculator from the model's cost rates
     S->>QG: settle(lease, estimate or 0)
     QG-)QE: commit_lease (estimate capped at reserved) or release_lease (0)
     QG->>UR: enqueue usage (complete=false, estimate or 0)
@@ -946,7 +967,7 @@ sequenceDiagram
     else input_type unsupported and drop flag set
         CC-->>P: drop input_type, list in ignored_parameters
     end
-    P->>P: quota admission and credentials
+    P->>P: quota admission
     P->>PL: create_embedding(ctx, call ctx, request)
     PL->>O: provider embeddings request
     O-->>PL: vectors
@@ -1009,7 +1030,7 @@ sequenceDiagram
     alt not expressible in provider subset
         P-->>C: unsupported_schema (no admission, no key fetch, no provider call)
     else expressible
-        P->>P: quota admission and credentials
+        P->>P: quota admission
         P->>PL: dispatch with original schema
         PL->>PL: adapt schema (inline refs, remove unsupported keywords)
         PL-->>P: Response with JSON output
@@ -1022,7 +1043,7 @@ sequenceDiagram
     end
 ```
 
-**Description**: Expressibility is decided in the pre-dispatch validation step, before quota admission and credential retrieval. Adaptation never loosens the final result because validation always uses the original schema.
+**Description**: Expressibility is decided in the pre-dispatch validation step, before quota admission. Adaptation never loosens the final result because validation always uses the original schema.
 
 #### Reasoning Continuation
 
@@ -1126,7 +1147,7 @@ sequenceDiagram
     participant QE as Quota Enforcement
     participant UR as Usage Reporter
     P->>QG: admit(ctx, effective request, model info)
-    QG->>QG: estimate upper-bound AI credits (input plus output allowance, model pricing)
+    QG->>QG: estimate upper-bound AI credits (input plus output allowance, priced by the Cost Calculator from the model's cost rates)
     QG->>QG: convert to metric unit (round up), TTL = max duration + settle margin
     QG->>QE: acquire_lease(caller ctx, tenant and user, amount, ttl, key from response id)
     alt Acquired
@@ -1142,11 +1163,11 @@ sequenceDiagram
         QE--xQG: error
         QG-->>P: quota_check_unavailable
     end
-    Note over P,QG: dispatch only after admission, credentials, and media all succeed
+    Note over P,QG: dispatch only after admission and media both succeed
     P->>QG: settle(outcome, actual AI credits)
     alt lease held and actual above 0
         QG-)QE: commit_lease(gear service ctx, tenant, token, min(actual, reserved), settle key)
-    else lease held and actual is 0, or failed before dispatch
+    else lease held and actual is 0, failed before dispatch, or nothing forwarded by OAGW
         QG-)QE: release_lease(gear service ctx, tenant, token, settle key)
     end
     opt transient settle failure
@@ -1200,11 +1221,11 @@ sequenceDiagram
     participant MR as Model Registry
     participant ADM as Administrator
     GW->>TY: register plugin spec schema (PlatformTypesRegistryApi, PlatformSecurityContext)
-    PL->>TY: register provider settings schema with pricing (PlatformTypesRegistryApi, PlatformSecurityContext)
+    PL->>TY: register provider type derived from gts.cf.genai.model.provider.v1~ (PlatformTypesRegistryApi, PlatformSecurityContext)
     PL->>TY: register plugin instance: provider_type, tool namespace, priority (PlatformTypesRegistryApi, PlatformSecurityContext)
     PL->>HUB: register scoped client (instance GTS id)
     ADM->>MR: register model with provider settings
-    MR->>TY: get provider settings schema
+    MR->>TY: get provider type schema
     MR->>MR: validate settings
     GW->>TY: list plugin instances (PlatformTypesRegistryApi, PlatformSecurityContext, first use)
     GW->>HUB: get scoped client
@@ -1236,7 +1257,6 @@ graph TB
     subgraph PLAT["Platform gears (in-process or OoP via ClientHub)"]
         MR["Model Registry"]
         TY["Type Registry"]
-        CS["CredStore"]
         QE["Quota Enforcement"]
         UC["Usage Collector"]
         OAGW["OAGW"]
@@ -1251,9 +1271,10 @@ graph TB
     PL1 --> OAGW
     PLN --> OAGW
     OAGW --> PROV
+    OAGW --> CS["CredStore"]
 ```
 
-The core and its provider plugins run in the same process (plugins are scoped ClientHub clients). Instances are identical and stateless; api-gateway can route any request to any instance. Dependency gears are resolved through ClientHub, in-process or out-of-process, without design changes. OAGW is the only component with network egress to providers. Zero-downtime rolling restarts rely on graceful shutdown: stop accepting, finish in-flight requests, settle their quota leases, drain the usage buffer, all within the gear stop timeout; streams still open at the drain deadline are ended with `response.failed` (§ 4.5).
+The core and its provider plugins run in the same process (plugins are scoped ClientHub clients). Instances are identical and stateless; api-gateway can route any request to any instance. Dependency gears are resolved through ClientHub, in-process or out-of-process, without design changes. OAGW is the only component with network egress to providers and the only one that reads provider keys from CredStore. Zero-downtime rolling restarts rely on graceful shutdown: stop accepting, finish in-flight requests, settle their quota leases, drain the usage buffer, all within the gear stop timeout; streams still open at the drain deadline are ended with `response.failed` (§ 4.5).
 
 ## 4. Additional context
 
@@ -1264,16 +1285,16 @@ Every error is a NormalizedError in the domain, an `LlmGatewayError` in the SDK,
 | Code | Raised by | Canonical category | HTTP | Retry |
 |------|-----------|--------------------|------|-------|
 | `validation_error` (request) | API Surface, Capability Checker, request limits (§ 4.5) | InvalidArgument | 400 | No |
-| `permission_denied` | Request Pipeline (PEP check through `PolicyEnforcer`), Quota Guard (Quota Enforcement refuses the quota attribution) | PermissionDenied | 403 | No |
+| `permission_denied` | Request Pipeline (PEP check through `PolicyEnforcer`), Model Resolver (Model Registry `NOT_PERMITTED`: no model `evaluate` permission), Quota Guard (Quota Enforcement refuses the quota attribution) | PermissionDenied | 403 | No |
 | `unsupported_parameter` | Capability Checker | InvalidArgument | 400 | No |
-| `unsupported_schema` | Capability Checker (before quota admission and credential retrieval) | InvalidArgument | 400 | No |
+| `unsupported_schema` | Capability Checker (before quota admission) | InvalidArgument | 400 | No |
 | `capability_not_supported` | Capability Checker, pipeline (`item_reference` input items, unsupported capabilities per § 3.3, pass-through request to a model whose capabilities do not include the route's pass-through API, pass-through request with a stateful field or paid provider tool, reported by the plugin's `forward_passthrough` before the provider call) | FailedPrecondition | 400 | No |
-| `model_not_found` | Model Resolver | NotFound | 404 | No |
+| `model_not_found` | Model Resolver (Model Registry not found, `PROVIDER_DISABLED`, or `MODEL_NOT_APPROVED`) | NotFound | 404 | No |
 | `schema_not_found` | Tool Resolver | NotFound | 404 | No |
 | `media_not_found` | Media Resolver | InvalidArgument | 400 | No |
 | `provider_not_supported` | Plugin Directory | Unimplemented | 501 | No |
-| `unapproved_destination` | Provider Plugin (the model's OAGW alias does not resolve to an upstream enabled for the tenant) | FailedPrecondition | 400 | No |
-| `credentials_unavailable` | Credential Broker | ServiceUnavailable | 503 | Yes |
+| `unapproved_destination` | Provider Plugin (the OAGW alias of the model's destination does not resolve to an upstream enabled for the tenant) | FailedPrecondition | 400 | No |
+| `credentials_unavailable` | Provider Plugin (OAGW refused the credential named by the model's `secret_ref` and forwarded nothing) | ServiceUnavailable | 503 | Yes |
 | `model_resolution_unavailable` | Model Resolver | ServiceUnavailable | 503 | Yes |
 | `quota_exceeded` | Quota Guard (Quota Enforcement denied the lease) | ResourceExhausted | 429 | After quota reset |
 | `quota_check_unavailable` | Quota Guard (Quota Enforcement unreachable, timed out, or failing; in-flight lease limit reached; lease contention timeout) | ServiceUnavailable | 503 | Yes |
@@ -1313,19 +1334,19 @@ On the pass-through routes (§ 3.3), Gateway errors are rendered in the error fo
 
 - **Authentication and authorization**: all routes are authenticated by api-gateway; the Request Pipeline runs a PEP check per operation through `PolicyEnforcer` before any other dependency call (resource type and actions in § 3.3; denial returns `permission_denied`); model access per tenant is enforced by Model Registry.
 - **Tenant isolation**: the caller's `SecurityContext` is propagated to every request-path dependency call, including quota admission; quota settle and usage delivery run under the gear's service identity with the tenant passed explicitly (§ 3.2 Quota Guard, § 3.2 Usage Reporter); no cache is shared across tenants except the tenant-neutral plugin directory; the gear stores no tenant data.
-- **Provider keys**: see `cpt-cf-llm-gateway-constraint-no-credential-persistence-v1` and `cpt-cf-llm-gateway-constraint-key-destination-binding-v1`. Keys are fetched per request by the secret reference in the model info, held in a secret wrapper, sent only through OAGW over HTTPS to the model's upstream alias, and dropped after the call. Plugin request logging redacts authorization headers.
-- **Provider destination**: the provider destination is the model's OAGW upstream alias; OAGW resolves it under the caller's tenant and forwards only to an upstream enabled for that tenant, so a key cannot reach a destination that is not configured in OAGW (`unapproved_destination` otherwise). Only authorized administrators can register models with their upstream alias and secret reference (PRD assumption).
+- **Provider keys**: see `cpt-cf-llm-gateway-constraint-no-credential-persistence-v1` and `cpt-cf-llm-gateway-constraint-key-destination-binding-v1`. The Gateway and its plugins never hold keys: they pass the model's secret reference to OAGW, which loads the key per call and sets it only on the HTTPS request it forwards to the model's upstream. Plugin request logging still redacts authorization headers.
+- **Provider destination**: the provider destination is the model's `base_url`, or the plugin's default URL for the provider, whose host and port name the OAGW upstream alias; OAGW resolves it under the caller's tenant and forwards only to an upstream enabled for that tenant, so a key cannot reach a destination that is not configured in OAGW (`unapproved_destination` otherwise). Only authorized administrators can register models with their `base_url` and secret reference (PRD assumption); Model Registry checks on write that the secret reference names a secret the model's tenant owns.
 - **Outbound request forgery**: the Gateway never fetches URLs with its own HTTP client. External media fetches (only when a plugin requires bytes) go through a dedicated media egress route: `https` only, public addresses only (loopback, private, link-local, metadata, and other non-public ranges blocked on the connected address, which defeats DNS rebinding), no redirects, and size, content-type, and time limits; blocked fetches return `media_not_found`. Without a configured media route, URL input for byte-only plugins is rejected with `capability_not_supported` (§ 3.2 Media Resolver).
 - **Input limits**: request body size limits are applied by api-gateway; the gear adds limits on item count, tool count, schema size, and media size from gear configuration (§ 4.5).
 - **Content handling**: content is never logged (`cpt-cf-llm-gateway-constraint-content-logging-v1`) and never interpreted (`cpt-cf-llm-gateway-principle-content-non-interpretation-v1`).
-- **Plugin trust**: plugins are compiled into the deployment and reviewed like core code; they run in-process and are trusted with keys for their own provider only.
+- **Plugin trust**: plugins are compiled into the deployment and reviewed like core code; they run in-process and never receive keys; they can only name the model's credential on calls to the model's destination.
 
 ### 4.3 Data Protection
 
 | Data | Handling |
 |------|----------|
 | Prompts, completions, embeddings, media in transit | Memory only for the request lifetime; not logged; streamed without full buffering except structured output text |
-| Provider API keys | Memory only for one call; secret wrapper; never serialized, logged, persisted |
+| Provider API keys | Never held by the Gateway or plugins; OAGW loads them per call; only the secret reference (a name) passes through the Gateway |
 | Usage telemetry | Sent to Usage Collector with tenant, user, model; pseudonymous personal data; not stored by the Gateway |
 | Quota attribution | Sent to Quota Enforcement with tenant, user, and request metadata (model, provider type) and AI credit amounts; no content; lease tokens held in memory until settle |
 
@@ -1335,9 +1356,9 @@ On the pass-through routes (§ 3.3), Gateway errors are rendered in the error fo
 |--------------------|----------|
 | AuthZ Resolver unavailable | Request rejected (fail closed, platform PEP error mapping) |
 | Model Registry unavailable | `model_resolution_unavailable` (fail closed) |
-| Quota Enforcement unavailable at admission | `quota_check_unavailable` (fail closed, never bypassed); the provider is not called and a fetched key is dropped unused |
+| Quota Enforcement unavailable at admission | `quota_check_unavailable` (fail closed, never bypassed); the provider is not called |
 | Quota Enforcement unavailable at settle | Request unaffected; settle retried in the background with its idempotency key until the lease expires; an unsettled lease auto-releases at its expiry, so its consumption is not counted in Quota Enforcement; logged with the response `id`; the usage record is still delivered |
-| CredStore unavailable or referenced secret missing (key required) | `credentials_unavailable`; keyless models unaffected |
+| CredStore unavailable or referenced secret missing (credential required), reported by OAGW | `credentials_unavailable`; OAGW forwards nothing and the lease is released; models without a secret reference unaffected |
 | Type Registry unavailable | Startup registration retried until ready; at request time unresolved tool schemas return `schema_not_found` |
 | OAGW unavailable or circuit open | `provider_unavailable`; the Gateway does not retry or fail over to another model or provider |
 | Provider failure mid-stream | `response.failed` with category, usage incomplete |
@@ -1348,7 +1369,7 @@ Each dependency call has a bounded timeout from gear configuration (§ 4.5). Pro
 
 ### 4.5 Performance and Capacity
 
-- The overhead budget (< 50 ms P99) covers the PEP check, model resolution, tool resolution, capability checks, quota admission, credential resolution, media resolution, and dispatch. Quota admission, credential resolution, and media resolution run concurrently after the checks, so the budget is roughly the PEP check plus Model Registry latency, plus Type Registry latency when GTS tools are present, plus the slowest of the concurrent steps. Quota settle runs after the response and is not on the critical path.
+- The overhead budget (< 50 ms P99) covers the PEP check, model resolution, tool resolution, capability checks, quota admission, media resolution, cost calculation, and dispatch. Quota admission and media resolution run concurrently after the checks, so the budget is roughly the PEP check plus Model Registry latency, plus Type Registry latency when GTS tools are present, plus the slower of the concurrent steps. The credential read happens in OAGW on the provider call and counts as provider-call latency. Quota settle runs after the response and is not on the critical path.
 - Quota admission is on the critical path of every request. Quota Enforcement documents a p95 target of 100 ms for single-quota operations, including lease acquisition (`cpt-cf-quota-enforcement-nfr-evaluation-latency`). That target alone exceeds the Gateway's total overhead budget, so the overhead criterion can be met only when admission is well below the Quota Enforcement target. The two targets must be aligned with the Quota Enforcement owners (§ 4.10). Until then, the pre-release overhead benchmark reports admission latency separately.
 - Streaming relays events through a bounded channel; memory per stream is constant except for structured output accumulation.
 
@@ -1358,7 +1379,7 @@ The gear sets protective operational bounds. Every value is set in gear configur
 
 | Limit | Owner | Configuration key | On breach |
 |-------|-------|-------------------|-----------|
-| Dependency call timeout (AuthZ Resolver, Model Registry, Type Registry, Quota Enforcement, CredStore, Usage Collector) | Gateway, per dependency | `timeouts.dependency.<name>` | That dependency's fail-closed code (§ 4.4); retry for usage delivery |
+| Dependency call timeout (AuthZ Resolver, Model Registry, Type Registry, Quota Enforcement, Usage Collector) | Gateway, per dependency | `timeouts.dependency.<name>` | That dependency's fail-closed code (§ 4.4); retry for usage delivery |
 | Sync provider call timeout | Gateway (cancels the request token). The OAGW route timeout is the outer bound set by the deployment and must not be shorter; the api-gateway sync route timeout must exceed both (§ 4.9) | `timeouts.provider_sync` | `provider_unavailable`; usage per the incomplete-usage policy (§ 3.2) |
 | Stream idle timeout (no provider event) and maximum stream duration | Stream Supervisor | `timeouts.stream_idle`, `timeouts.stream_max_duration` | `response.failed` (`provider_unavailable`), incomplete usage |
 | Media fetch timeout and size | Media egress route, Media Resolver | `media.fetch_timeout`, `media.max_bytes` | `media_not_found` |
@@ -1368,7 +1389,7 @@ The gear sets protective operational bounds. Every value is set in gear configur
 | Quota lease TTL: request maximum duration (`timeouts.provider_sync` or `timeouts.stream_max_duration`) plus settle margin; must lie within the Quota Enforcement lease TTL window (`min_lease_ttl`, `max_lease_ttl`) | Quota Guard; the TTL window is owned by the Quota Enforcement operator | `quota.lease_ttl_margin` | A TTL outside the window is rejected by Quota Enforcement (`TTL_OUT_OF_BOUNDS`) and returns `internal`, logged as a configuration fault |
 | Fallback output allowance for the lease amount when neither the request nor the model sets an output limit | Quota Guard | `quota.fallback_max_output_tokens` | No error; an actual cost above the reservation is an overrun (§ 3.2 Quota Guard) |
 | Settle retry backoff | Quota Guard | `quota.settle_retry_backoff` | Retries stop at lease expiry; the failure is logged |
-| Request limits: input items, tools, schema size, inline media size, embedding inputs | Capability Checker | `limits.max_input_items`, `limits.max_tools`, `limits.max_schema_bytes`, `limits.max_inline_media_bytes`, `limits.max_embedding_inputs` | `validation_error` before quota admission and credential retrieval |
+| Request limits: input items, tools, schema size, inline media size, embedding inputs | Capability Checker | `limits.max_input_items`, `limits.max_tools`, `limits.max_schema_bytes`, `limits.max_inline_media_bytes`, `limits.max_embedding_inputs` | `validation_error` before quota admission |
 
 - **Bulkheads**: streams and sync calls use separate in-flight pools, so long streams cannot starve sync and embeddings calls. A slot is taken right after the PEP check and released at the terminal state.
 - **Graceful shutdown**: on stop the instance stops accepting requests; in-flight sync calls and streams continue until the drain deadline, which is the gear stop timeout minus a reserve for draining the usage buffer (`shutdown.usage_drain_reserve`). At the deadline, open streams are cancelled and end with `response.failed` (`gateway_unavailable`), and sync calls still running return a `gateway_unavailable` Problem; their leases are settled and their usage is enqueued per the incomplete-usage policy before the buffer drains; the drain reserve covers pending settles and usage delivery. Rolling restarts therefore cause no failed requests among those that finish within the drain deadline; longer requests end with a retryable error (verification in § 1.2).
@@ -1381,20 +1402,21 @@ The gear relies on platform tracing and structured logging. Traces: one span per
 
 ### 4.7 Testing Strategy
 
-- **Unit**: capability and parameter policy tables, tool resolution, error and status mapping, terminal-event logic of the Stream Supervisor (including property tests over arbitrary event sequences, and conversion of provider `error` events into `response.failed`), credential broker behavior.
-- **Plugin conformance suite**: one shared suite run against every plugin with a mock egress and recorded provider fixtures: translation, streaming, stop-reason table, error categories, schema adaptation, encoding conversion, cost calculation, cancellation, key only sent to the model's OAGW upstream alias. For plugins that implement `forward_passthrough`, the suite also covers it: the declared endpoint allowlist contains only stateless endpoints, every denylisted field and paid tool of each route, the key scan at any depth and its skipped subtrees, the reported JSON path, `model` substitution, forced no-store, header allowlist, native sync and streaming relay, usage reading, AI credit cost, cancellation, and error mapping.
+- **Unit**: capability and parameter policy tables, tool resolution, error and status mapping, terminal-event logic of the Stream Supervisor (including property tests over arbitrary event sequences, and conversion of provider `error` events into `response.failed`), Cost Calculator formula (each rate, absent rates, cache counts as parts of input, saturation, exact decimals).
+- **Plugin conformance suite**: one shared suite run against every plugin with a mock egress and recorded provider fixtures: translation, streaming, stop-reason table, error categories, schema adaptation, encoding conversion, usage normalization into generic usage (cache read and write, reasoning tokens, web search calls; cost left at 0), cancellation, `provider_model_id` sent as the model name, requests sent only to the model's destination with the model's `secret_ref` as the credential and none when it is absent, and OAGW credential refusals mapped to `credentials_unavailable`. For plugins that implement `forward_passthrough`, the suite also covers it: the declared endpoint allowlist contains only stateless endpoints, every denylisted field and paid tool of each route, the key scan at any depth and its skipped subtrees, the reported JSON path, `model` substitution, forced no-store, header allowlist, native sync and streaming relay, usage reading into generic usage, cancellation, and error mapping.
 - **Integration**: the core with a mock plugin and mock dependency clients through ClientHub; fail-closed paths; usage idempotency; Problem shapes; SSE framing; rejection of unsupported capabilities with `capability_not_supported`.
-- **Quota**: with a mock `QuotaEnforcementApi`: a denied lease returns `quota_exceeded` and an unreachable or failing Quota Enforcement, the in-flight lease limit, and lease contention return `quota_check_unavailable`, in each case without a provider call; `NO_APPLICABLE_QUOTA` admits the request without a lease and without settle; the lease amount is the Quota Guard's upper-bound estimate rounded up to the metric unit and the TTL covers the request's maximum duration; a credential or media failure after admission releases the lease; settle commits the Usage Reporter quantity for completed, incomplete, failed-after-dispatch, disconnected, timed-out, and shutdown-cut requests and releases on 0; an actual above the reservation commits the reserved amount and logs the overrun; settle runs under the gear's service identity with explicit tenant, is retried with the same idempotency key, and stops at lease expiry with a logged failure; the usage record is enqueued only after settle completes or is abandoned; the response is never delayed by settle.
-- **Security**: no key in logs, traces, errors, or serialized contexts; a model whose OAGW alias does not resolve to an upstream enabled for the tenant returns `unapproved_destination` and nothing is forwarded; CredStore failure or a missing secret returns `credentials_unavailable` and the provider is not called; PEP denial returns `permission_denied` before any other dependency call. Media fetch: non-`https` schemes and URLs with user info rejected; loopback, private, link-local, metadata (`169.254.169.254`), and IPv6 unique-local targets blocked, including hostnames that resolve to them and DNS rebinding between check and connect; redirects not followed; oversize, wrong content type, and slow responses fail with `media_not_found`; byte-only plugins reject URL input with `capability_not_supported` when no media route is configured.
+- **Quota**: with a mock `QuotaEnforcementApi`: a denied lease returns `quota_exceeded` and an unreachable or failing Quota Enforcement, the in-flight lease limit, and lease contention return `quota_check_unavailable`, in each case without a provider call; `NO_APPLICABLE_QUOTA` admits the request without a lease and without settle; the lease amount is the Quota Guard's upper-bound estimate rounded up to the metric unit and the TTL covers the request's maximum duration; a media failure after admission, and an OAGW credential or destination refusal on dispatch, release the lease; settle commits the Usage Reporter quantity for completed, incomplete, failed-after-dispatch, disconnected, timed-out, and shutdown-cut requests and releases on 0; an actual above the reservation commits the reserved amount and logs the overrun; settle runs under the gear's service identity with explicit tenant, is retried with the same idempotency key, and stops at lease expiry with a logged failure; the usage record is enqueued only after settle completes or is abandoned; the response is never delayed by settle.
+- **Security**: no Gateway component calls CredStore, and the provider call context carries no key; a model whose destination alias does not resolve to an upstream enabled for the tenant returns `unapproved_destination` and nothing is forwarded; an OAGW credential refusal (CredStore failure, missing or inaccessible secret) returns `credentials_unavailable`, the provider is not called, and the lease is released; PEP denial returns `permission_denied` before any other dependency call. Media fetch: non-`https` schemes and URLs with user info rejected; loopback, private, link-local, metadata (`169.254.169.254`), and IPv6 unique-local targets blocked, including hostnames that resolve to them and DNS rebinding between check and connect; redirects not followed; oversize, wrong content type, and slow responses fail with `media_not_found`; byte-only plugins reject URL input with `capability_not_supported` when no media route is configured.
 - **Pass-through** (`cpt-cf-llm-gateway-fr-pass-through-apis-v1`), with a mock egress that records the outgoing provider request:
-  - Credentials and headers: the consumer's `Authorization` and `x-api-key` are never sent to the provider; only allowlisted headers and allowlisted `anthropic-beta` / `OpenAI-Beta` values are passed; the provider key is sent only to the model's OAGW upstream alias.
+  - Credentials and headers: the consumer's `Authorization` and `x-api-key` are never sent to the provider; only allowlisted headers and allowlisted `anthropic-beta` / `OpenAI-Beta` values are passed; the provider credential is named only on requests to the model's destination.
   - Model substitution: `model` is replaced with `provider_model_id` in the outgoing request and replaced back with the Gateway model identifier in the response body and in every stream event.
   - Traceability: every pass-through response (success and error, JSON and SSE) carries `x-llm-gateway-response-id`, equal to the idempotency key of the usage record and the id in logs and traces.
-  - Capability: a model without the matching pass-through capability is rejected with `capability_not_supported` before quota admission, credential retrieval, and any provider call.
+  - Capability: a model without the matching pass-through capability is rejected with `capability_not_supported` before quota admission and any provider call.
+  - Model listing: `GET /v1/models` on each route returns exactly the available models with the matching pass-through capability and a plugin that declares the API, under canonical ids, in the native format (Anthropic paging included); `GET /v1/models/{model_id}` returns the model or a provider-format 404; neither calls a plugin, the provider, Quota Enforcement, or Usage Collector; the official SDKs' `models.list` and `models.retrieve` parse the responses.
   - Paid provider tools: each denylisted paid tool of each route is rejected with `capability_not_supported` without a provider call.
   - Stored object references: `previous_response_id`, `conversation`, `file_id` and `vector_store_ids` at any depth, `container`, and `container_upload` blocks are rejected on every route where the provider accepts them, without a provider call; the same keys inside a function tool schema, a structured output schema, `metadata`, or a `tool_use` input pass and reach the provider.
   - Stateless guard: each denylisted field of each route is rejected with `capability_not_supported` without a provider call, the quota lease is released, and no usage is reported; `store=false` is sent on OpenAI Responses and Chat Completions requests, including when the consumer sends `store=true`; paths not declared by the selected plugin and non-`POST` methods return a provider-format 404 without a provider call.
-  - Usage: usage is read from native JSON responses and from the final usage event of native streams (with `stream_options.include_usage` requested for OpenAI Chat Completions; the usage chunk is forwarded only when the consumer set `include_usage` and is dropped otherwise); Gateway usage is added to the native `usage` object in both cases; a stream that ends without final usage reports the estimate marked incomplete; the quota lease amount is computed from the native output limit, or from the model's maximum output when the request has none; `count_tokens` acquires no lease and reports no cost.
+  - Usage: usage is read from native JSON responses and from the final usage event of native streams (with `stream_options.include_usage` requested for OpenAI Chat Completions; the usage chunk is forwarded only when the consumer set `include_usage` and is dropped otherwise); the native `usage` object and the rest of the native body and events are relayed unchanged apart from `model`, with no Gateway fields added; a stream that ends without final usage reports the estimated input tokens only, marked incomplete and estimated; the quota lease amount is computed from the native output limit, or from the model's maximum output when the request has none; `count_tokens` acquires no lease and reports no cost; the usage record carries the Cost Calculator's cost under the response `id` returned in `x-llm-gateway-response-id`.
   - Errors: Gateway errors are rendered in the OpenAI and Anthropic error formats with the HTTP status of § 4.1, before and after the stream starts; provider errors are relayed with the provider status and body; every error response carries `x-should-retry` as specified in § 4.1, and the official SDKs do not retry `quota_exceeded`, `provider_error`, `internal`, or `output_validation_error`.
   - SDK compatibility: the official OpenAI and Anthropic SDKs, pointed at the Gateway with a mock provider, complete sync and streaming calls with the platform bearer token (Anthropic through `auth_token`) and parse Gateway errors as ordinary API errors.
 - **Performance**: pre-release overhead benchmark with a fixed-latency provider stub at 1 000 concurrent requests; streaming soak tests; rolling-restart test under load. These are the only evidence for the PRD success criteria (§ 4.6).
@@ -1408,7 +1430,6 @@ The Gateway is a data processor: consumers own request and response data. Reques
 
 | Deviation | Rationale | Review owner |
 |-----------|-----------|--------------|
-| Provider API keys are fetched by the Gateway and passed in-process to plugins, instead of OAGW injecting credentials (Architecture Manifest: OAGW centralizes credential injection). OAGW injection remains available for models without a secret reference | PRD requires per-model secret references and plugin-set keys; the key is sent only through OAGW, over HTTPS, to the model's upstream alias | Platform Architecture and Security |
 | Deployments may replace OAGW with a plain HTTP client behind the same interface | PRD § 3.1 minimal deployments; plugins still use one egress interface; OAGW circuit breaking and egress policy are lost | Platform Architecture |
 | Sync `POST /responses` can exceed the ~30 s handler duration guideline | LLM generations routinely run longer; streaming is the recommended path, and the sync route needs a longer route timeout at api-gateway | Platform Architecture (api-gateway owners) |
 | Instance-local in-memory usage buffer | Required for non-blocking at-least-once delivery without persisting usage records; it holds no request-affinity state, so any-instance routing still holds | LLM Gateway team |
@@ -1424,15 +1445,17 @@ Carried from PRD § 13 (unchanged ownership):
 - Cross-gear request traceability may add a platform request id beside the response `id`.
 - OAGW upstream provisioning decides who creates the OAGW upstreams that model aliases refer to. Default in this design: configured outside the Gateway.
 - Stream cancellation mechanism: this design uses drop propagation plus a cancellation token (§ 3.6).
-- GTS identifiers for plugin instances, settings schemas, route declarations, and the AI credit usage type.
+- GTS identifiers for plugin instances, provider types, route declarations, and the AI credit usage type.
 - Migration from llm-connectors, including a Chat Completions compatibility layer, provider parity, and user-supplied keys. A compatibility layer is not part of this design.
 
 Raised by this design:
 
-- Provider rules in the core: per-model parameter support, JSON Schema subsets, token counting, and pricing formats for estimates are kept in the core per provider type, not reported by plugins, so adding a provider also changes the core. Owner: LLM Gateway team.
+- Provider rules in the core: per-model parameter support, JSON Schema subsets, and token counting for estimates are kept in the core per provider type, not reported by plugins, so adding a provider also changes the core. Owner: LLM Gateway team.
 - At-least-once usage delivery: an in-memory buffer loses undelivered records on a hard crash. Closing the gap needs durable storage, which PRD § 3.1 excludes for usage records; a decision is needed from Platform Architecture and the LLM Gateway team.
-- Model Registry model info carries the secret reference of the provider API key (§ 3.4). Owner: Model Registry and LLM Gateway teams.
-- Paid provider tools on pass-through: rejected in P1 (§ 3.3). Allowing them needs per-call prices in the model pricing, plugins that count tool calls in native responses (OpenAI `web_search_call` and `image_generation_call` items, Anthropic `usage.server_tool_use`), and a lease that covers the per-call fee times an upper bound on calls (`max_tool_calls`, `max_uses`, or a configured default). Owner: LLM Gateway and Model Registry teams.
+- OAGW credential selection: OAGW provides an API to call an upstream with the credential named by a secret reference (agreed with OAGW; see OAGW ADR `cpt-cf-oagw-adr-upstream-credentials`), and the mapping of its credential failures to `credentials_unavailable` and `unapproved_destination`. The plugin passes the model's `secret_ref` through it. Owner: OAGW and LLM Gateway teams.
+- Paid provider tools on pass-through: rejected in P1 (§ 3.3). Model cost rates already carry a per-call web search rate (`web_search_per_1k_calls_micro`), and generic usage counts web search calls; allowing them also needs rates for other paid tools (image generation), plugins that count tool calls in native responses (OpenAI `web_search_call` and `image_generation_call` items, Anthropic `usage.server_tool_use`), and a lease that covers the per-call fee times an upper bound on calls (`max_tool_calls`, `max_uses`, or a configured default). Owner: LLM Gateway and Model Registry teams.
+- Pass-through usage for streams cut before final usage: the estimate covers the input only, because the core does not parse native events and plugins do not count output, so output already relayed before a disconnect, timeout, or break is not charged. A consumer that drops the connection just before the provider's final usage event pays for the input only. Closing the gap needs either output accounting from the native events or a different settle rule (for example, committing the lease). Owner: LLM Gateway team.
+- Pass-through endpoints without `model` in the body: the routes and the plugin contract accept any method, but model resolution, and with it plugin selection, destination, and credential, reads `model` from the body. Before a plugin declares such an endpoint (a stateless `GET` or `DELETE`), the design needs a rule for finding the model (a path segment or query parameter named by the endpoint declaration, for example). Owner: LLM Gateway team.
 - Pass-through capability in Model Registry: `ModelCapabilities` must declare which pass-through APIs a model supports (OpenAI, Anthropic), and `DisabledCapabilities` must allow an administrator to disable them per model; the Capability Checker reads both for pass-through routes. Owner: Model Registry and LLM Gateway teams.
 - AI credit metric in Quota Enforcement: registration of the AI credit metric as quota-gated, its integer unit (the Quota Guard rounds AI credits up to it), and its request metadata contract (the metadata the Quota Guard sends on `acquire_lease`); also confirmation that Quota Enforcement authorizes the gear's service identity to commit and release leases for the tenant named in the call. Owner: LLM Gateway and Quota Enforcement teams.
 - `NO_APPLICABLE_QUOTA` handling: this design admits a request without a lease when no quota applies to the tenant, so its consumption is reported to Usage Collector without passing Quota Enforcement. The Quota Enforcement PRD treats a quota-gated metric without an applicable quota as absence of permission and expects operators to provision quotas before consumption. The two positions must be aligned; if they align on denial, the Quota Guard returns `quota_exceeded` for this reason too. Owner: LLM Gateway and Quota Enforcement teams.

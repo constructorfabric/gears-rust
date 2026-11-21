@@ -1,0 +1,466 @@
+// Created: 2026-11-16 by Constructor Tech
+//! Models for the pass-through APIs (`cpt-cf-llm-gateway-fr-pass-through-apis-v1`).
+//!
+//! A pass-through route (`/llm-gateway/v1/passthrough/openai/{*path}`,
+//! `/llm-gateway/v1/passthrough/anthropic/{*path}`) keeps the provider's
+//! native request, response, and streaming format but runs the same Gateway
+//! pipeline as `POST /responses`. The core hands the native request to the
+//! provider plugin that implements the route's API
+//! ([`crate::plugin_api::LlmGatewayProviderPluginClientV1::forward_passthrough`])
+//! and gets back the native response together with the generic usage read
+//! from it. The core prices that usage for quota settle and usage reporting
+//! but does not change the native body: the consumer gets the provider's
+//! native response as is (apart from `model`) and correlates it with its
+//! usage and cost through [`RESPONSE_ID_HEADER`].
+//!
+//! These are in-process values between the core and a plugin; only
+//! [`PassthroughApi`] and the endpoint allowlist have a wire form.
+
+use std::pin::Pin;
+
+use crate::errors::{LlmGatewayError, ProviderErrorCategory, ProviderFailure};
+use crate::models::core::Usage;
+use futures_core::Stream;
+
+/// Response header carrying the Gateway response `id` on every pass-through
+/// response, success or error, JSON or SSE (for SSE, sent with the response
+/// headers before the first event). The native body carries only the
+/// provider's own id; this one is the idempotency key of the usage record and
+/// the id in quota, logs, and traces.
+pub const RESPONSE_ID_HEADER: &str = "x-llm-gateway-response-id";
+
+/// Provider API exposed as a pass-through route.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PassthroughApi {
+    /// The `OpenAI` API (`/llm-gateway/v1/passthrough/openai/{*path}`).
+    #[serde(rename = "openai")]
+    OpenAi,
+    /// The Anthropic API (`/llm-gateway/v1/passthrough/anthropic/{*path}`).
+    Anthropic,
+}
+
+impl PassthroughApi {
+    /// Lowercase wire name, also the route segment after `passthrough/`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::Anthropic => "anthropic",
+        }
+    }
+}
+
+/// HTTP method of a pass-through endpoint.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "UPPERCASE")]
+#[non_exhaustive]
+pub enum PassthroughMethod {
+    /// `GET`.
+    Get,
+    /// `POST`.
+    Post,
+    /// `PUT`.
+    Put,
+    /// `PATCH`.
+    Patch,
+    /// `DELETE`.
+    Delete,
+}
+
+impl PassthroughMethod {
+    /// Uppercase method name, as on the wire.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+            Self::Put => "PUT",
+            Self::Patch => "PATCH",
+            Self::Delete => "DELETE",
+        }
+    }
+}
+
+/// One stateless provider endpoint a plugin forwards on its pass-through
+/// route: a method and a path.
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[non_exhaustive]
+pub struct PassthroughEndpoint {
+    /// HTTP method the endpoint accepts.
+    pub method: PassthroughMethod,
+    /// Provider path, relative to the route (e.g. `/v1/responses`). The model
+    /// listing (`GET /v1/models`, `GET /v1/models/{model_id}`) is not declared
+    /// here: the core answers it from Model Registry without calling the
+    /// plugin.
+    pub path: String,
+    /// Whether the endpoint generates output: a metered endpoint gets a quota
+    /// lease, an AI credit cost, and a usage record; a non-metered one (for
+    /// example Anthropic `/v1/messages/count_tokens`) gets none.
+    pub metered: bool,
+}
+
+impl PassthroughEndpoint {
+    /// A metered endpoint: `method` on `path`.
+    #[must_use]
+    pub fn metered(method: PassthroughMethod, path: impl Into<String>) -> Self {
+        Self {
+            method,
+            path: path.into(),
+            metered: true,
+        }
+    }
+
+    /// A non-metered endpoint: `method` on `path`.
+    #[must_use]
+    pub fn not_metered(method: PassthroughMethod, path: impl Into<String>) -> Self {
+        Self {
+            method,
+            path: path.into(),
+            metered: false,
+        }
+    }
+}
+
+/// Pass-through support a plugin reports in its integration capabilities.
+///
+/// The endpoint list is the route's allowlist: the core checks the request
+/// method and path against it before the capability check and quota admission, and
+/// answers an undeclared method and path with a provider-format 404 without a provider
+/// call. A plugin declares only stateless endpoints.
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[non_exhaustive]
+pub struct PassthroughCapability {
+    /// The provider API the plugin implements.
+    pub api: PassthroughApi,
+    /// Stateless endpoints the plugin forwards.
+    pub endpoints: Vec<PassthroughEndpoint>,
+}
+
+impl PassthroughCapability {
+    /// Pass-through support for `api` with the given endpoint allowlist.
+    #[must_use]
+    pub fn new(api: PassthroughApi, endpoints: Vec<PassthroughEndpoint>) -> Self {
+        Self { api, endpoints }
+    }
+
+    /// The declared endpoint for `method` on `path`, if any.
+    #[must_use]
+    pub fn endpoint(&self, method: PassthroughMethod, path: &str) -> Option<&PassthroughEndpoint> {
+        self.endpoints
+            .iter()
+            .find(|e| e.method == method && e.path == path)
+    }
+}
+
+/// A pass-through request the core hands to the plugin.
+///
+/// The body, when the request has one, is the consumer's native body as
+/// received: `model` still holds the Gateway model identifier, and nothing
+/// has been removed. The plugin
+/// first checks it against its denylists of stateful fields and paid provider
+/// tools, then replaces `model` with `provider_model_id`, forces no-store, and
+/// builds the provider request headers itself.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct PassthroughRequest {
+    /// The route's provider API.
+    pub api: PassthroughApi,
+    /// The request method, already checked with `path` against the plugin's
+    /// allowlist.
+    pub method: PassthroughMethod,
+    /// The declared endpoint path (e.g. `/v1/messages`), already checked
+    /// against the plugin's allowlist.
+    pub path: String,
+    /// The raw query string, without the leading `?`; `None` when the
+    /// request has none.
+    pub query: Option<String>,
+    /// Whether the native request asks for streaming, as read by the core
+    /// from the body. Selects [`PassthroughResponse::Stream`].
+    pub stream: bool,
+    /// Provider protocol headers to pass on (`anthropic-version`,
+    /// `anthropic-beta`, `OpenAI-Beta`), names lowercase, beta values already
+    /// filtered by the core's allowlist. The consumer's `Authorization` and
+    /// `x-api-key` are never among them.
+    pub headers: Vec<(String, String)>,
+    /// The provider-native JSON body; `None` when the request has no body
+    /// (e.g. a `GET`).
+    pub body: Option<serde_json::Value>,
+}
+
+impl PassthroughRequest {
+    /// A non-streaming `method` request to `path` with no query, protocol
+    /// headers, or body.
+    #[must_use]
+    pub fn new(api: PassthroughApi, method: PassthroughMethod, path: impl Into<String>) -> Self {
+        Self {
+            api,
+            method,
+            path: path.into(),
+            query: None,
+            stream: false,
+            headers: Vec::new(),
+            body: None,
+        }
+    }
+
+    /// Set the raw query string (without the leading `?`).
+    #[must_use]
+    pub fn with_query(mut self, query: impl Into<String>) -> Self {
+        self.query = Some(query.into());
+        self
+    }
+
+    /// Set the provider-native JSON body.
+    #[must_use]
+    pub fn with_body(mut self, body: serde_json::Value) -> Self {
+        self.body = Some(body);
+        self
+    }
+
+    /// Mark the request as streaming.
+    #[must_use]
+    pub fn with_stream(mut self, stream: bool) -> Self {
+        self.stream = stream;
+        self
+    }
+
+    /// Add a protocol header to pass on.
+    #[must_use]
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+}
+
+/// A non-streaming pass-through response, or an error response the provider
+/// returned before a stream started.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct PassthroughJsonResponse {
+    /// The provider's HTTP status, relayed as is.
+    pub status: u16,
+    /// The provider-native body, with `model` already replaced back with the
+    /// Gateway model identifier.
+    pub body: serde_json::Value,
+    /// Generic usage the plugin read from the body, with `cost` left at 0 for
+    /// the core; `None` for a non-metered endpoint or an error without usage.
+    /// Used for quota settle and usage reporting; the body is not changed.
+    pub usage: Option<Usage>,
+    /// For a provider error response: the normalized category the plugin
+    /// mapped it to, which sets `x-should-retry` and the logged code. The
+    /// native error body is still relayed unchanged.
+    pub error_category: Option<ProviderErrorCategory>,
+    /// Provider originals (`provider_request_id`, and for errors the provider
+    /// code, message, and `retry_after`).
+    pub details: ProviderFailure,
+}
+
+impl PassthroughJsonResponse {
+    /// A native response with `status` and `body`, no usage, no error.
+    #[must_use]
+    pub fn new(status: u16, body: serde_json::Value) -> Self {
+        Self {
+            status,
+            body,
+            usage: None,
+            error_category: None,
+            details: ProviderFailure::default(),
+        }
+    }
+
+    /// Set the usage read from the body.
+    #[must_use]
+    pub fn with_usage(mut self, usage: Usage) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+
+    /// Mark the response as a provider error of `category`.
+    #[must_use]
+    pub fn with_error_category(mut self, category: ProviderErrorCategory) -> Self {
+        self.error_category = Some(category);
+        self
+    }
+
+    /// Set the provider originals.
+    #[must_use]
+    pub fn with_details(mut self, details: ProviderFailure) -> Self {
+        self.details = details;
+        self
+    }
+}
+
+/// One provider-native SSE event of a pass-through stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PassthroughEvent {
+    /// SSE `event:` field, when the provider sets one (Anthropic, `OpenAI`
+    /// Responses).
+    pub event: Option<String>,
+    /// SSE `data:` payload as text, with `model` already replaced back with
+    /// the Gateway model identifier (`[DONE]` for the `OpenAI` Chat Completions
+    /// sentinel).
+    pub data: String,
+    /// Whether the core relays the event to the consumer. `false` for an
+    /// event the plugin produced only for the Gateway, such as the `OpenAI`
+    /// Chat Completions usage chunk the consumer did not ask for.
+    pub relay: bool,
+    /// Final generic usage, on the event that carries it, with `cost` left at
+    /// 0 for the core. Used for quota settle and usage reporting; the event
+    /// data is not changed.
+    pub usage: Option<Usage>,
+}
+
+impl PassthroughEvent {
+    /// A relayed event with `data` and no usage.
+    #[must_use]
+    pub fn new(data: impl Into<String>) -> Self {
+        Self {
+            event: None,
+            data: data.into(),
+            relay: true,
+            usage: None,
+        }
+    }
+
+    /// Set the SSE `event:` field.
+    #[must_use]
+    pub fn with_event(mut self, event: impl Into<String>) -> Self {
+        self.event = Some(event.into());
+        self
+    }
+
+    /// Mark the event as not relayed to the consumer.
+    #[must_use]
+    pub fn not_relayed(mut self) -> Self {
+        self.relay = false;
+        self
+    }
+
+    /// Attach the final usage.
+    #[must_use]
+    pub fn with_usage(mut self, usage: Usage) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+}
+
+/// Native event stream of a streaming pass-through call.
+///
+/// Provider error events are relayed as ordinary events. An `Err` item is a
+/// failure after the stream started (transport break, timeout, cancellation)
+/// and ends the stream; the core renders it as one provider-native error
+/// event and reports usage as incomplete. Dropping the stream closes the
+/// provider connection.
+pub type PassthroughEventStream =
+    Pin<Box<dyn Stream<Item = Result<PassthroughEvent, LlmGatewayError>> + Send>>;
+
+/// Result of a pass-through call.
+#[non_exhaustive]
+pub enum PassthroughResponse {
+    /// A native JSON response: a non-streaming call, or a provider error
+    /// returned before a stream started.
+    Json(Box<PassthroughJsonResponse>),
+    /// A native SSE stream with HTTP status 200.
+    Stream {
+        /// The native events, in provider order.
+        events: PassthroughEventStream,
+        /// Request identifier the provider assigned, when known.
+        provider_request_id: Option<String>,
+    },
+}
+
+impl std::fmt::Debug for PassthroughResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Json(json) => f.debug_tuple("Json").field(json).finish(),
+            Self::Stream {
+                provider_request_id,
+                ..
+            } => f
+                .debug_struct("Stream")
+                .field("provider_request_id", provider_request_id)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn passthrough_api_wire_names() {
+        assert_eq!(
+            serde_json::to_value(PassthroughApi::OpenAi).unwrap(),
+            serde_json::json!("openai")
+        );
+        assert_eq!(
+            serde_json::from_value::<PassthroughApi>(serde_json::json!("anthropic")).unwrap(),
+            PassthroughApi::Anthropic
+        );
+        assert_eq!(PassthroughApi::OpenAi.as_str(), "openai");
+    }
+
+    #[test]
+    fn capability_finds_declared_endpoints_only() {
+        let caps = PassthroughCapability::new(
+            PassthroughApi::Anthropic,
+            vec![
+                PassthroughEndpoint::metered(PassthroughMethod::Post, "/v1/messages"),
+                PassthroughEndpoint::not_metered(
+                    PassthroughMethod::Post,
+                    "/v1/messages/count_tokens",
+                ),
+            ],
+        );
+        let post = PassthroughMethod::Post;
+        assert!(caps.endpoint(post, "/v1/messages").unwrap().metered);
+        assert!(
+            !caps
+                .endpoint(post, "/v1/messages/count_tokens")
+                .unwrap()
+                .metered
+        );
+        assert!(
+            caps.endpoint(PassthroughMethod::Get, "/v1/messages")
+                .is_none()
+        );
+        assert!(caps.endpoint(post, "/v1/files").is_none());
+    }
+
+    #[test]
+    fn method_wire_names() {
+        assert_eq!(
+            serde_json::to_value(PassthroughMethod::Delete).unwrap(),
+            serde_json::json!("DELETE")
+        );
+        assert_eq!(PassthroughMethod::Get.as_str(), "GET");
+    }
+}

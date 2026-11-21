@@ -3,7 +3,8 @@
 //!
 //! Rust models for the LLM Gateway's Open Responses–aligned domain: the core
 //! request/response, embeddings, item, content, tool, and streaming
-//! (server-sent event) families, the consumer and provider-plugin traits, and
+//! (server-sent event) families, the pass-through models exchanged between the
+//! core and provider plugins, the consumer and provider-plugin traits, and
 //! transport-agnostic errors.
 //!
 //! Schema polymorphism (an `allOf` chain with a `const` `type` discriminator)
@@ -41,6 +42,11 @@ pub use models::items::{
     DataOutput, FunctionCallItem, FunctionCallOutputItem, InputContent, InputItem, ItemReference,
     ItemStatus, MessageItem, MessageOutput, OutputItem, ReasoningContentPart, ReasoningItem,
     ReasoningOutput, ReasoningSummaryPart, WebSearchCallOutput, WebSearchResult,
+};
+pub use models::passthrough::{
+    PassthroughApi, PassthroughCapability, PassthroughEndpoint, PassthroughEvent,
+    PassthroughEventStream, PassthroughJsonResponse, PassthroughMethod, PassthroughRequest,
+    PassthroughResponse, RESPONSE_ID_HEADER,
 };
 pub use models::plugin::{MediaInputMode, ProviderCallCtx, ProviderPluginCapabilities};
 pub use models::role::Role;

@@ -484,8 +484,16 @@ pub enum EmbeddingVector {
 // Usage
 // ---------------------------------------------------------------------------
 
-/// Usage of one request (`cpt-cf-llm-gateway-fr-usage-tracking-v1`): cost in
-/// AI credits, generic token usage, and the provider's raw usage.
+/// Usage of one request (`cpt-cf-llm-gateway-fr-usage-tracking-v1`): generic
+/// usage counts, the cost in AI credits, and the provider's raw usage.
+///
+/// The provider plugin normalizes the provider's usage into the generic
+/// counts: `input_tokens` is all input, cache reads and cache writes included,
+/// and [`InputTokensDetails`] breaks those out; `web_search_calls` counts
+/// billable searches. The plugin does not price the call and leaves `cost` at
+/// zero. The Gateway core computes `cost` from these counts and the model's
+/// provider-independent rates (`ModelInfoV1.cost`) and sets it with
+/// [`Usage::with_cost`].
 #[derive(
     Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
 )]
@@ -501,8 +509,13 @@ pub struct Usage {
     pub input_tokens_details: InputTokensDetails,
     /// Breakdown of output token usage.
     pub output_tokens_details: OutputTokensDetails,
-    /// Gateway extension: call cost in AI credits, computed by the provider
-    /// plugin from the model's `cost` rates (`ModelInfoV1.cost`). A JSON
+    /// Gateway extension: billable web search calls the provider made for
+    /// this request. Default 0.
+    #[serde(default)]
+    pub web_search_calls: u64,
+    /// Gateway extension: call cost in AI credits, computed by the Gateway
+    /// core from the usage counts and the model's `cost` rates
+    /// (`ModelInfoV1.cost`); zero as returned by a provider plugin. A JSON
     /// string on the wire (`"0.0125"`) so the amount never passes through a
     /// float.
     #[serde(default, with = "rust_decimal::serde::str")]
@@ -524,24 +537,24 @@ pub struct Usage {
 
 impl Usage {
     /// Final usage reported by the provider (`complete = true`,
-    /// `estimated = false`).
+    /// `estimated = false`), with zero cost.
     #[must_use]
-    pub fn reported(input_tokens: u64, output_tokens: u64, cost: Decimal) -> Self {
-        Self::build(input_tokens, output_tokens, cost, true, false)
+    pub fn reported(input_tokens: u64, output_tokens: u64) -> Self {
+        Self::build(input_tokens, output_tokens, true, false)
     }
 
     /// Estimate made when the provider gave no final usage (`complete =
-    /// false`, `estimated = true`).
+    /// false`, `estimated = true`), with zero cost.
     #[must_use]
-    pub fn estimated(input_tokens: u64, output_tokens: u64, cost: Decimal) -> Self {
-        Self::build(input_tokens, output_tokens, cost, false, true)
+    pub fn estimated(input_tokens: u64, output_tokens: u64) -> Self {
+        Self::build(input_tokens, output_tokens, false, true)
     }
 
     /// No final provider usage and no estimate: zero amounts, `complete =
     /// false`, `estimated = false`.
     #[must_use]
     pub fn unknown() -> Self {
-        Self::build(0, 0, Decimal::ZERO, false, false)
+        Self::build(0, 0, false, false)
     }
 
     /// Set the input and output token breakdowns.
@@ -552,6 +565,22 @@ impl Usage {
         self
     }
 
+    /// Set the number of billable web search calls.
+    #[must_use]
+    pub fn with_web_search_calls(mut self, calls: u64) -> Self {
+        self.web_search_calls = calls;
+        self
+    }
+
+    /// Set the call cost in AI credits. Called by the Gateway core after it
+    /// prices the usage counts with the model's `cost` rates; provider plugins
+    /// do not call it.
+    #[must_use]
+    pub fn with_cost(mut self, cost: Decimal) -> Self {
+        self.cost = cost;
+        self
+    }
+
     /// Set the provider's raw usage structure.
     #[must_use]
     pub fn with_provider_raw(mut self, raw: serde_json::Value) -> Self {
@@ -559,20 +588,15 @@ impl Usage {
         self
     }
 
-    fn build(
-        input_tokens: u64,
-        output_tokens: u64,
-        cost: Decimal,
-        complete: bool,
-        estimated: bool,
-    ) -> Self {
+    fn build(input_tokens: u64, output_tokens: u64, complete: bool, estimated: bool) -> Self {
         Self {
             input_tokens,
             output_tokens,
             total_tokens: input_tokens.saturating_add(output_tokens),
             input_tokens_details: InputTokensDetails::default(),
             output_tokens_details: OutputTokensDetails::default(),
-            cost,
+            web_search_calls: 0,
+            cost: Decimal::ZERO,
             provider_raw: None,
             complete,
             estimated,
@@ -584,7 +608,8 @@ fn default_true() -> bool {
     true
 }
 
-/// Input token usage breakdown.
+/// Input token usage breakdown. Both counts are parts of
+/// [`Usage::input_tokens`], not additions to it.
 #[derive(
     Debug,
     Clone,
@@ -597,8 +622,12 @@ fn default_true() -> bool {
     schemars::JsonSchema,
 )]
 pub struct InputTokensDetails {
-    /// Tokens served from cache.
+    /// Input tokens read from the provider's prompt cache.
     pub cached_tokens: u64,
+    /// Gateway extension: input tokens written to the provider's prompt
+    /// cache. Default 0.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
 }
 
 /// Output token usage breakdown.
@@ -1035,8 +1064,9 @@ mod tests {
             "input_tokens": 10,
             "output_tokens": 5,
             "total_tokens": 15,
-            "input_tokens_details": { "cached_tokens": 2 },
+            "input_tokens_details": { "cached_tokens": 2, "cache_write_tokens": 3 },
             "output_tokens_details": { "reasoning_tokens": 1 },
+            "web_search_calls": 1,
             "cost": "0.0125",
             "provider_raw": { "prompt_tokens": 10, "completion_tokens": 5 },
             "complete": true,
@@ -1058,6 +1088,8 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(usage.cost, Decimal::ZERO);
+        assert_eq!(usage.input_tokens_details.cache_write_tokens, 0);
+        assert_eq!(usage.web_search_calls, 0);
         assert!(usage.complete);
         assert!(!usage.estimated);
         assert!(usage.provider_raw.is_none());

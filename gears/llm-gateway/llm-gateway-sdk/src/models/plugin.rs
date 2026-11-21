@@ -10,44 +10,40 @@
 //! are deliberately not part of the plugin contract.
 
 use model_registry_sdk::ModelInfoV1;
-use secrecy::SecretString;
+
+use crate::models::passthrough::PassthroughCapability;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 /// Per-call context the core Gateway passes to every provider-plugin method.
 ///
 /// Carries what translation and transport need without the plugin reaching into
-/// Model Registry or `CredStore` itself. The core builds it from the resolved
-/// model, the provider API key, and the request being served. It is an
-/// in-process value and is deliberately not serializable, so the key cannot
-/// leak through serialization.
+/// Model Registry itself. The core builds it from the resolved model and the
+/// request being served. It holds no secret material: neither the core nor the
+/// plugin reads provider credentials from `CredStore`. The plugin names the
+/// model's credential (`model_info.secret_ref`) on the provider call, and OAGW
+/// loads and injects it (`cpt-cf-llm-gateway-fr-provider-credentials-v1`). It
+/// is an in-process value and is not serializable.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ProviderCallCtx {
     /// The resolved model info the core fetched from Model Registry, carried
     /// unchanged. Its `gts_type` is the provider type, the authoritative
     /// provider routing key, and equals the resolving plugin's declared
-    /// `provider_type`. The plugin reads `provider_model_id`, `base_url`,
-    /// generic settings, and the `cost` rates from it, and narrows the opaque
-    /// `provider_settings` to its own settings type via
-    /// [`ProviderCallCtx::provider_settings`].
+    /// `provider_type`. The plugin reads from it `provider_model_id` (the
+    /// model name sent to the provider, distinct from the canonical id the
+    /// consumer requested), `base_url` (the destination; the provider's
+    /// default URL when absent), `secret_ref` (the credential OAGW injects;
+    /// no credential when absent), and the generic settings, and narrows the
+    /// opaque `provider_settings` to its own settings type via
+    /// [`ProviderCallCtx::provider_settings`]. The `cost` rates are for the
+    /// core: the plugin does not price calls.
     pub model_info: ModelInfoV1,
 
     /// Gateway request correlation id (the response `id`), propagated for
     /// tracing across usage, error, and audit events
     /// (`cpt-cf-llm-gateway-fr-request-traceability-v1`).
     pub request_id: String,
-
-    /// Provider API key the core fetched from `CredStore` by the model's secret
-    /// reference (`cpt-cf-llm-gateway-fr-provider-credentials-v1`). The plugin
-    /// sets it on the outbound provider request, which goes only through OAGW,
-    /// over HTTPS, to the model's destination (`base_url`, or the provider's
-    /// default URL).
-    /// `None` for models without a secret reference (authentication handled by
-    /// OAGW, local provider). The
-    /// key is redacted in `Debug`, zeroed on drop, and must never be logged or
-    /// persisted.
-    pub api_key: Option<SecretString>,
 
     /// Per-request cancellation token. The core cancels it on consumer
     /// disconnect, on a provider call or stream timeout, and at the shutdown
@@ -64,8 +60,7 @@ pub struct ProviderCallCtx {
 }
 
 impl ProviderCallCtx {
-    /// Call context for request `request_id` on `model_info`, with no
-    /// provider API key.
+    /// Call context for request `request_id` on `model_info`.
     #[must_use]
     pub fn new(
         model_info: ModelInfoV1,
@@ -75,16 +70,8 @@ impl ProviderCallCtx {
         Self {
             model_info,
             request_id: request_id.into(),
-            api_key: None,
             cancel,
         }
-    }
-
-    /// Set the provider API key fetched from `CredStore`.
-    #[must_use]
-    pub fn with_api_key(mut self, api_key: SecretString) -> Self {
-        self.api_key = Some(api_key);
-        self
     }
 
     /// Narrow `model_info.provider_settings` to the plugin's settings type `S`,
@@ -141,17 +128,24 @@ pub struct ProviderPluginCapabilities {
     /// Whether the plugin maps the Gateway web search tool (`cf_gears:web_search`)
     /// to a native provider web search tool (`cpt-cf-llm-gateway-fr-web-search-v1`).
     pub web_search: bool,
+
+    /// The pass-through API the plugin implements and its endpoint allowlist
+    /// (`cpt-cf-llm-gateway-fr-pass-through-apis-v1`); `None` when the plugin
+    /// implements no pass-through API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passthrough: Option<PassthroughCapability>,
 }
 
 impl ProviderPluginCapabilities {
     /// Capabilities with the given media input mode, no streaming transport,
-    /// and no web search.
+    /// no web search, and no pass-through API.
     #[must_use]
     pub fn new(media_input: MediaInputMode) -> Self {
         Self {
             streaming_transport: false,
             media_input,
             web_search: false,
+            passthrough: None,
         }
     }
 
@@ -166,6 +160,13 @@ impl ProviderPluginCapabilities {
     #[must_use]
     pub fn with_web_search(mut self) -> Self {
         self.web_search = true;
+        self
+    }
+
+    /// The plugin implements a pass-through API with the given endpoints.
+    #[must_use]
+    pub fn with_passthrough(mut self, passthrough: PassthroughCapability) -> Self {
+        self.passthrough = Some(passthrough);
         self
     }
 }

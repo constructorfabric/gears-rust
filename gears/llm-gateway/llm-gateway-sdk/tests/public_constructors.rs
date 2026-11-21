@@ -6,19 +6,22 @@
 use llm_gateway_sdk::{
     EmbeddingInput, EmbeddingInputType, EmbeddingRequest, EmbeddingResponse, EncodingFormat,
     InputTokensDetails, ItemStatus, LlmGatewayError, MediaInputMode, OutputTokensDetails,
+    PassthroughApi, PassthroughCapability, PassthroughEndpoint, PassthroughEvent,
+    PassthroughJsonResponse, PassthroughMethod, PassthroughRequest, PassthroughResponse,
     ProviderDetails, ProviderErrorCategory, ProviderFailure, ProviderPluginCapabilities,
-    ResponseError, Usage, WebSearchCallOutput, WebSearchResult, WebSearchTool,
+    RESPONSE_ID_HEADER, ResponseError, Usage, WebSearchCallOutput, WebSearchResult, WebSearchTool,
 };
 use rust_decimal::Decimal;
 
 #[test]
 fn usage_constructors_set_completeness_flags() {
-    let reported = Usage::reported(10, 5, Decimal::new(125, 4));
+    let reported = Usage::reported(10, 5);
     assert_eq!(reported.total_tokens, 15);
+    assert_eq!(reported.cost, Decimal::ZERO);
     assert!(reported.complete);
     assert!(!reported.estimated);
 
-    let estimated = Usage::estimated(10, 3, Decimal::ONE);
+    let estimated = Usage::estimated(10, 3);
     assert!(!estimated.complete);
     assert!(estimated.estimated);
 
@@ -30,17 +33,28 @@ fn usage_constructors_set_completeness_flags() {
 
 #[test]
 fn usage_with_details_and_provider_raw() {
-    let usage = Usage::reported(10, 5, Decimal::ZERO)
+    let usage = Usage::reported(10, 5)
         .with_details(
-            InputTokensDetails { cached_tokens: 4 },
+            InputTokensDetails {
+                cached_tokens: 4,
+                cache_write_tokens: 3,
+            },
             OutputTokensDetails {
                 reasoning_tokens: 2,
             },
         )
+        .with_web_search_calls(2)
         .with_provider_raw(serde_json::json!({ "prompt_tokens": 10 }));
     assert_eq!(usage.input_tokens_details.cached_tokens, 4);
+    assert_eq!(usage.input_tokens_details.cache_write_tokens, 3);
+    assert_eq!(usage.web_search_calls, 2);
     assert_eq!(usage.output_tokens_details.reasoning_tokens, 2);
     assert!(usage.provider_raw.is_some());
+    assert_eq!(usage.cost, Decimal::ZERO);
+
+    // The core prices the counts; the plugin never does.
+    let priced = usage.with_cost(Decimal::new(125, 4));
+    assert_eq!(priced.cost, Decimal::new(125, 4));
 }
 
 #[test]
@@ -163,4 +177,87 @@ fn response_error_and_provider_details_builders() {
         .with_stop_reason("end_turn")
         .with_provider_request_id("req_1");
     assert_eq!(details.stop_reason.as_deref(), Some("end_turn"));
+}
+
+#[test]
+fn passthrough_capability_and_request_builders() {
+    let caps = ProviderPluginCapabilities::new(MediaInputMode::UrlForward).with_passthrough(
+        PassthroughCapability::new(
+            PassthroughApi::OpenAi,
+            vec![
+                PassthroughEndpoint::metered(PassthroughMethod::Post, "/v1/responses"),
+                PassthroughEndpoint::metered(PassthroughMethod::Post, "/v1/chat/completions"),
+            ],
+        ),
+    );
+    let passthrough = caps.passthrough.expect("declared");
+    assert_eq!(passthrough.api, PassthroughApi::OpenAi);
+    assert!(
+        passthrough
+            .endpoint(PassthroughMethod::Post, "/v1/responses")
+            .is_some()
+    );
+    assert!(
+        ProviderPluginCapabilities::new(MediaInputMode::UrlForward)
+            .passthrough
+            .is_none()
+    );
+
+    let req = PassthroughRequest::new(
+        PassthroughApi::Anthropic,
+        PassthroughMethod::Post,
+        "/v1/messages",
+    )
+    .with_body(serde_json::json!({ "model": "anthropic::claude", "stream": true }))
+    .with_stream(true)
+    .with_header("anthropic-version", "2023-06-01");
+    assert!(req.stream);
+    assert_eq!(req.headers.len(), 1);
+    assert!(req.body.is_some());
+
+    let get = PassthroughRequest::new(PassthroughApi::OpenAi, PassthroughMethod::Get, "/v1/x")
+        .with_query("limit=10");
+    assert!(get.body.is_none());
+    assert_eq!(get.query.as_deref(), Some("limit=10"));
+}
+
+#[test]
+fn passthrough_response_builders() {
+    let json = PassthroughJsonResponse::new(429, serde_json::json!({ "type": "error" }))
+        .with_error_category(ProviderErrorCategory::RateLimited)
+        .with_details(ProviderFailure::default().with_retry_after(3));
+    assert_eq!(
+        json.error_category,
+        Some(ProviderErrorCategory::RateLimited)
+    );
+    assert_eq!(json.details.retry_after, Some(3));
+    assert!(json.usage.is_none());
+
+    let event = PassthroughEvent::new(r#"{"type":"message_delta","usage":{}}"#)
+        .with_event("message_delta")
+        .with_usage(Usage::reported(10, 4));
+    assert!(event.relay);
+    assert_eq!(event.usage.map(|u| u.output_tokens), Some(4));
+
+    let hidden = PassthroughEvent::new("{}")
+        .not_relayed()
+        .with_usage(Usage::reported(1, 1));
+    assert!(!hidden.relay);
+
+    let response = PassthroughResponse::Json(Box::new(json));
+    assert!(format!("{response:?}").starts_with("Json"));
+    assert_eq!(RESPONSE_ID_HEADER, "x-llm-gateway-response-id");
+}
+
+#[test]
+fn capability_not_supported_carries_param() {
+    let err = LlmGatewayError::capability_not_supported_param(
+        "openai_passthrough",
+        "input[0].content[1].file_id",
+    );
+    assert_eq!(err.code(), "capability_not_supported");
+    assert_eq!(
+        err.to_response_error().param.as_deref(),
+        Some("input[0].content[1].file_id")
+    );
 }
