@@ -24,7 +24,7 @@
     - [Custom Plugin Lifecycle State Machine](#custom-plugin-lifecycle-state-machine)
   - [5. Definitions of Done](#5-definitions-of-done)
     - [Implement Plugin Trait Definitions](#implement-plugin-trait-definitions)
-    - [Implement All 11 Built-in Plugins](#implement-all-11-built-in-plugins)
+    - [Implement All 12 Built-in Plugins](#implement-all-12-built-in-plugins)
     - [Implement Plugin CRUD REST Handlers](#implement-plugin-crud-rest-handlers)
     - [Implement Plugin Identification Model](#implement-plugin-identification-model)
     - [Implement Starlark Sandbox](#implement-starlark-sandbox)
@@ -33,6 +33,7 @@
   - [7. Additional Context](#7-additional-context)
     - [Auth Plugin Credential Resolution](#auth-plugin-credential-resolution)
     - [Auth Plugin Request Signing](#auth-plugin-request-signing)
+    - [AWS SigV4 Auth Plugin](#aws-sigv4-auth-plugin)
     - [Scope Boundaries](#scope-boundaries)
     - [Performance Considerations](#performance-considerations)
     - [Usability Considerations](#usability-considerations)
@@ -344,11 +345,11 @@ The system **MUST** define `AuthPlugin`, `GuardPlugin`, and `TransformPlugin` as
 **Touches**:
 - Entities: `Plugin`
 
-### Implement All 11 Built-in Plugins
+### Implement All 12 Built-in Plugins
 
 - [ ] `p1` - **ID**: `cpt-cf-oagw-dod-builtin-plugins`
 
-The system **MUST** implement 6 auth plugins (`noop`, `apikey`, `basic`, `bearer`, `oauth2_client_cred`, `oauth2_client_cred_basic`), 2 guard plugins (`timeout`, `cors`), and 3 transform plugins (`logging`, `metrics`, `request_id`). Each built-in **MUST** be registered in the in-process plugin registry using its full GTS identifier. Auth plugins **MUST** resolve credentials via `cred_store` secret references at request time without storing secret material.
+The system **MUST** implement 7 auth plugins (`noop`, `apikey`, `basic`, `bearer`, `oauth2_client_cred`, `oauth2_client_cred_basic`, `aws_sigv4`), 2 guard plugins (`timeout`, `cors`), and 3 transform plugins (`logging`, `metrics`, `request_id`). Each built-in **MUST** be registered in the in-process plugin registry using its full GTS identifier. Auth plugins **MUST** resolve credentials via `cred_store` secret references at request time without storing secret material.
 
 **Implements**:
 - `cpt-cf-oagw-flow-plugin-bind`
@@ -452,7 +453,34 @@ In `authenticate`, an auth plugin does not see the outbound headers: it returns 
 
 ### Auth Plugin Request Signing
 
-An auth plugin can also sign the request ([ADR-0023](../ADR/0023-request-signing.md)). When its `signs` flag is `true`, its `sign` phase runs once per request, as the last step before the request is sent: after header rules, transforms, endpoint selection, the `Host` header, rate limits and the URL build, on the HTTP and WebSocket paths, and after the upstream engine's own header sanitization, so it sees only header lines the engine sends unchanged. It gets the method, the URL parts (scheme, host, port, path and query as sent), every header line as sent (repeated names keep all lines, in order; values as bytes), the body (the buffered bytes, a streamed marker, or an empty body for a WebSocket handshake), the upstream's `auth.config` and the caller's security context. It returns headers to set, each replacing the lines of that name and marked sensitive, and a query change: keep (the default), remove, or replace with a query sent exactly as returned. Headers the gateway sets or strips itself (`Host`, `Content-Length`, hop-by-hop, forwarding, `X-OAGW-*`) or the engine drops (`Expect`, `Proxy-Connection`, `HTTP2-Settings`) are refused, and so is a name set twice. A signing error or an output the gateway cannot send stops the request before anything reaches the upstream, with the same mapping as an `authenticate` error; an output the gateway cannot send is a plugin misconfiguration (500 `internal`). The built-in plugins (`noop`, `apikey`, `oauth2_client_cred`, `oauth2_client_cred_basic`) keep the default `signs` of `false`, so the phase is skipped for them. `request_ref` mode runs no auth plugin and therefore no signing.
+An auth plugin can also sign the request ([ADR-0023](../ADR/0023-request-signing.md)). When its `signs` flag is `true`, its `sign` phase runs once per request, as the last step before the request is sent: after header rules, transforms, endpoint selection, the `Host` header, rate limits and the URL build, on the HTTP and WebSocket paths, and after the upstream engine's own header sanitization, so it sees only header lines the engine sends unchanged. It gets the method, the URL parts (scheme, host, port, path and query as sent), every header line as sent (repeated names keep all lines, in order; values as bytes), the body (the buffered bytes, a streamed marker, or an empty body for a WebSocket handshake), the upstream's `auth.config` and the caller's security context. It returns headers to set, each replacing the lines of that name and marked sensitive, and a query change: keep (the default), remove, or replace with a query sent exactly as returned. Headers the gateway sets or strips itself (`Host`, `Content-Length`, hop-by-hop, forwarding, `X-OAGW-*`) or the engine drops (`Expect`, `Proxy-Connection`, `HTTP2-Settings`) are refused, and so is a name set twice. A signing error or an output the gateway cannot send stops the request before anything reaches the upstream, with the same mapping as an `authenticate` error (see the table above); an output the gateway cannot send is a plugin misconfiguration (500 `internal`). When the config is valid but the request as sent cannot be signed (`PluginError::InvalidRequest`), the request fails with 400 `VALIDATION` on the field the plugin names. Of the built-in plugins only `aws_sigv4` signs; `noop`, `apikey`, `oauth2_client_cred` and `oauth2_client_cred_basic` keep the default `signs` of `false`, so the phase is skipped for them. `request_ref` mode runs no auth plugin and therefore no signing.
+
+### AWS SigV4 Auth Plugin
+
+`gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.aws_sigv4.v1` signs requests to AWS APIs (Bedrock, S3, SQS, API Gateway and others) with [Signature Version 4](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv.html) and IAM access keys ([#5842](https://github.com/constructorfabric/gears-rust/issues/5842)). `authenticate` only checks the config; the request is signed in the signing phase, on the request as sent.
+
+| `auth.config` key | Required | Meaning |
+|---|---|---|
+| `region` | yes | Signing region, e.g. `us-east-1`. 1 to 64 ASCII letters, digits, `-`, `_` or `.`: AWS regions are lowercase, S3-compatible servers may use names such as `RegionOne`. |
+| `service` | yes | Signing name of the service, e.g. `bedrock` (also for `bedrock-runtime` endpoints), `s3`, `s3express`, `execute-api`. Same format as `region`. |
+| `access_key_id_ref` | yes | CredStore reference of the access key id. |
+| `secret_access_key_ref` | yes | CredStore reference of the secret access key. |
+| `session_token_ref` | no | CredStore reference of the session token of temporary credentials; sent as `X-Amz-Security-Token` and signed. |
+| `unsigned_payload` | no, `false` | `true` sends a streamed body as `UNSIGNED-PAYLOAD` instead of refusing it. It affects only a streamed body: a buffered body is always hashed. |
+| `uri_encoding` | no, derived | `single` signs the path as sent, without normalization, decoded and encoded once in SigV4 encoding as S3 checks it, so `:` or `(` a client sends unencoded are signed as `%3A`, `%28` (Amazon S3); `double` removes `.`/`..` segments and repeated slashes and encodes the path again (every other service). Default: `single` for the S3 signing names `s3`, `s3-object-lambda`, `s3-outposts` and `s3express`, matched exactly (the names the S3 and S3 Control endpoint rules sign without double encoding), else `double`. |
+| `content_sha256_header` | no, `true` | Send the payload hash as `X-Amz-Content-Sha256`. With `false` the header is not added, but a client's one is still replaced with the real hash. |
+
+- **Writes** check the config with the same parser the plugin uses: a missing or malformed key is 400 naming `auth.config.<key>`. The three references are in `CREDENTIAL_KEYS`, so each one present gets the format and access checks of every credential reference (400 `failed_precondition` naming the key when it does not resolve for the caller).
+- **Credentials** are read from CredStore as the caller on every signed request, the references concurrently, behind an internal credential source, so temporary credentials from the runtime's identity ([#5844](https://github.com/constructorfabric/gears-rust/issues/5844)) can plug in later. The access key id must be ASCII letters and digits and the session token visible ASCII. Failures follow the credential-failure table above: a missing or inaccessible secret is 401 `AUTH_CREDENTIAL_NOT_FOUND`, a credential store outage 503 `CREDENTIAL_STORE_UNAVAILABLE`, a stored value that is not an access key id, an empty secret key or a session token with other characters 401 `AUTH_PLUGIN_INTERNAL`, and a config the plugin cannot parse at proxy time (one written before a check existed) 500 `internal`. Errors name the config key, never the reference or a value. The secret key and the derived signing key are zeroized after use and never logged.
+- **Signed headers**: `host`, every `x-amz-*`, `content-type` and `content-md5`, each with every line it is sent with. Never `cookie`, `content-length`, `user-agent`, hop-by-hop or other fields the engine rewrites after signing ([ADR-0023](../ADR/0023-request-signing.md#what-the-plugin-sees)).
+- **Headers set**: `Authorization`, `X-Amz-Date`, `X-Amz-Content-Sha256` (see above) and, with a session token, `X-Amz-Security-Token`. They replace any client line of the same name. A signing phase cannot remove a header, so a client's `X-Amz-Security-Token` on an upstream without `session_token_ref` fails the request with 400 `VALIDATION` on field `x-amz-security-token`; drop it with `headers.request.remove`. Other client `x-amz-*` headers (for example `X-Amz-Target`) are signed as sent. Client `Authorization` is never forwarded.
+- **Query**: the gateway builds the outbound query form-urlencoded (`+` for a space). The plugin decodes it and rewrites it in SigV4 encoding (`%20` for a space, `%2B` for a plus, `%2A`, unencoded `~`), keeping the order, so the upstream receives exactly what was signed; the canonical query is the same pairs sorted. The query is replaced only when the encoding differs.
+- **Body**: a buffered body is hashed with SHA-256, whatever `unsigned_payload` says; on a multi-threaded runtime a body over 64 KiB is hashed under `block_in_place`, so the executor thread's other tasks move to another worker meanwhile. A streamed body (in-process SDK callers only; REST callers are always buffered) is refused with 400 `VALIDATION` on field `body` before any credential is read, unless `unsigned_payload` is `true`. A WebSocket handshake is signed with an empty payload.
+- **Circuit breaker**: the CredStore reads in the signing phase are the gateway's time, not the upstream's: a deadline hit after signing used more than a tenth of the request timeout does not count against the upstream ([ADR-0005](../ADR/0005-circuit-breaker.md)).
+- **Time**: `X-Amz-Date` and the credential scope date are taken from the system clock when the request is signed.
+- **Crypto**: every hash and HMAC goes through `toolkit-security::crypto::sigv4`; the canonical request, encoding and header selection are the plugin's.
+- **Rewritten paths**: the gateway normalizes the request path before route matching: it collapses `//`, resolves `.`/`..` and drops a trailing `/`. S3 does not normalize, so with `single` encoding a request whose path the gateway rewrote would sign and address another object key: it is refused with `400 VALIDATION` on field `path`, before any credential is read ([negative-9.14](../../scenarios/proxy-api/authentication/negative-9.14-aws-sigv4-s3-rewritten-path.md)). The trailing `/` is compared with the URL as built: one the route path gives back (route `/dir/`, request `/dir/`) is not a rewrite, one it adds (route `/dir/`, request `/dir`) is. With `double` encoding the normalized path is signed: the service normalizes the same way.
+- **Out of scope**: presigned URLs, SigV4a, S3 `aws-chunked` payload signing, S3 object keys with repeated slashes, dot segments or a trailing `/` (refused, see above).
 
 ### Scope Boundaries
 

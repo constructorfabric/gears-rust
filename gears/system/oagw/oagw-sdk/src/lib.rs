@@ -36,8 +36,9 @@ pub use body::Body;
 pub use codec::Json;
 pub use error::{ServiceGatewayError, StreamClosedByGateway, StreamIdleTimeout, StreamingError};
 pub use gts::{
-    APIKEY_AUTH_PLUGIN_ID, AUTH_PLUGIN_SCHEMA, GUARD_PLUGIN_SCHEMA, HTTP_PROTOCOL_ID,
-    PROTOCOL_SCHEMA, PROXY_SCHEMA, ROUTE_SCHEMA, TRANSFORM_PLUGIN_SCHEMA, UPSTREAM_SCHEMA,
+    APIKEY_AUTH_PLUGIN_ID, AUTH_PLUGIN_SCHEMA, AWS_SIGV4_AUTH_PLUGIN_ID, GUARD_PLUGIN_SCHEMA,
+    HTTP_PROTOCOL_ID, PROTOCOL_SCHEMA, PROXY_SCHEMA, ROUTE_SCHEMA, TRANSFORM_PLUGIN_SCHEMA,
+    UPSTREAM_SCHEMA,
 };
 pub use multipart::{MultipartBody, MultipartError, Part};
 pub use sse::{FromServerEvent, ServerEvent, ServerEventsResponse, ServerEventsStream};

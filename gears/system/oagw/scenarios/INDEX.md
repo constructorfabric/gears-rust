@@ -50,6 +50,7 @@ Configure how OAGW authenticates to the external service.
 
 - [API key injection](proxy-api/authentication/positive-9.2-api-key-injection.md) — header-based key injection from `cred_store`
 - [OAuth2 client credentials](proxy-api/authentication/positive-9.5-oauth2-client-credentials.md) — automatic token fetch + cache + refresh
+- [AWS SigV4](proxy-api/authentication/positive-9.11-aws-sigv4-signed-request.md) — Signature Version 4 with IAM access keys (Bedrock, S3, other AWS APIs)
 - [Noop (public APIs)](proxy-api/authentication/positive-9.1-noop-auth-plugin-forwards-credential-injection.md) — no credential injection
 - See → [Injecting authentication](#injecting-authentication)
 
@@ -191,6 +192,14 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 #### OAuth2 client credentials (basic-auth variant)
 - **Scenario**: [positive-9.6-oauth2-client-credentials.md](proxy-api/authentication/positive-9.6-oauth2-client-credentials.md)
 - **Mechanism**: Some token endpoints require `client_id/client_secret` via basic auth. Token request uses correct client authentication.
+
+#### AWS SigV4 signed request
+- **Scenario**: [positive-9.11-aws-sigv4-signed-request.md](proxy-api/authentication/positive-9.11-aws-sigv4-signed-request.md)
+- **Mechanism**: `aws_sigv4` signs in the signing phase ([ADR-0023](../docs/ADR/0023-request-signing.md)), on the request as sent: `Authorization`, `X-Amz-Date`, `X-Amz-Content-Sha256` and, with `session_token_ref`, `X-Amz-Security-Token`. Signs `host`, every `x-amz-*`, `content-type`, `content-md5`. The query goes out in SigV4 encoding, exactly as signed. A wrong secret reaches the upstream and its `403` is passed through. A missing `region`, `service` or key reference is a `400` naming the key on write.
+
+#### AWS SigV4: client signing headers
+- **Scenario**: [positive-9.13-aws-sigv4-client-amz-headers.md](proxy-api/authentication/positive-9.13-aws-sigv4-client-amz-headers.md)
+- **Mechanism**: A client's `X-Amz-Date`, `X-Amz-Content-Sha256` and `X-Amz-Security-Token` are replaced by the plugin's; other `x-amz-*` headers are signed as sent. Without `session_token_ref`, a client `X-Amz-Security-Token` cannot be removed by the signer and the request is refused (`400 VALIDATION` on field `x-amz-security-token`); `headers.request.remove` drops it.
 
 #### Per-request secret references (`X-OAGW-Secret-Ref`)
 - **Scenario**: [positive-31.1-inject-requested-secret.md](request-secret-refs/positive-31.1-inject-requested-secret.md)
@@ -720,6 +729,14 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 - **Scenario**: [negative-9.11-oauth2-identity-provider-unavailable.md](proxy-api/authentication/negative-9.11-oauth2-identity-provider-unavailable.md)
 - **What happens**: The OAuth2 token endpoint is unreachable, times out or answers `408`, `429` or `5xx`: `503` `service_unavailable`, reason `IDENTITY_PROVIDER_UNAVAILABLE`, `Retry-After: 5`. The upstream is not contacted. A credential store outage keeps `CREDENTIAL_STORE_UNAVAILABLE`.
 
+#### AWS SigV4 with a streamed request body → 400
+- **Scenario**: [negative-9.12-aws-sigv4-streamed-body.md](proxy-api/authentication/negative-9.12-aws-sigv4-streamed-body.md)
+- **What happens**: A body streamed by an in-process SDK caller cannot be hashed: `400 VALIDATION` on field `body`, naming `auth.config.unsigned_payload`, nothing sent. With `unsigned_payload: true` it is signed as `UNSIGNED-PAYLOAD`. REST callers are always buffered.
+
+#### AWS SigV4 for S3 on a path the gateway rewrote → 400
+- **Scenario**: [negative-9.14-aws-sigv4-s3-rewritten-path.md](proxy-api/authentication/negative-9.14-aws-sigv4-s3-rewritten-path.md)
+- **What happens**: With `uri_encoding: single` (the S3 signing names), a client path with `//`, `.`/`..` segments or a trailing `/` the gateway removed would sign and address another object key: `400 VALIDATION` on field `path`, nothing sent. A trailing `/` is compared with the URL as built: one the route path gives back is not a rewrite, one it adds (route `/dir/`, request `/dir`) is; `double` encoding signs the normalized path.
+
 #### Descendant override permissions enforced → blocked
 - **Scenario**: [negative-9.9-descendant-override-permissions-enforced.md](proxy-api/authentication/negative-9.9-descendant-override-permissions-enforced.md)
 - **What happens**: Without `oagw:upstream:override_auth`, child cannot override inherited auth. Same for `override_rate` and `add_plugins`. An auth or CORS override that any ancestor enforces is refused (`400`), even when the closest ancestor shares it with `inherit`. A rate limit is refused only under an enforcing closest ancestor: a leaf allocating from an `inherit` parent's allocated budget under an enforcing grand-ancestor is accepted (`201`) and still held to the grand-ancestor's limit (`429`).
@@ -939,6 +956,7 @@ For E2E coverage, ensure at least one scenario exists for each cell:
 - `bearer`: HTTP
 - `oauth2.client_cred`: HTTP
 - `oauth2.client_cred_basic`: HTTP
+- `aws_sigv4`: HTTP, WebSocket handshake (signed with an empty payload), SSE responses
 
 ### Plugin chain phases
 - Guard-only (`on_request`)

@@ -21,7 +21,9 @@
 ///   resource; the `subject` is the plugin's `error_code`;
 /// * an upstream's credential reference is not provisioned yet or not
 ///   shared with the tenant; the `subject` is the auth config key holding
-///   it: [`SECRET_REF`], [`CLIENT_ID_REF`] or [`CLIENT_SECRET_REF`].
+///   it: [`SECRET_REF`], [`CLIENT_ID_REF`], [`CLIENT_SECRET_REF`],
+///   [`ACCESS_KEY_ID_REF`], [`SECRET_ACCESS_KEY_REF`] or
+///   [`SESSION_TOKEN_REF`].
 pub const STATE: &str = "STATE";
 
 /// The upstream or route is managed by the types registry, so the
@@ -47,3 +49,12 @@ pub const CLIENT_ID_REF: &str = "auth.config.client_id_ref";
 
 /// The `subject` of a [`STATE`] violation for an OAuth2 client secret.
 pub const CLIENT_SECRET_REF: &str = "auth.config.client_secret_ref";
+
+/// The `subject` of a [`STATE`] violation for an AWS access key id.
+pub const ACCESS_KEY_ID_REF: &str = "auth.config.access_key_id_ref";
+
+/// The `subject` of a [`STATE`] violation for an AWS secret access key.
+pub const SECRET_ACCESS_KEY_REF: &str = "auth.config.secret_access_key_ref";
+
+/// The `subject` of a [`STATE`] violation for an AWS session token.
+pub const SESSION_TOKEN_REF: &str = "auth.config.session_token_ref";

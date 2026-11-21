@@ -17,6 +17,42 @@ pub(crate) fn canonical_path(raw: &str, instance: &str) -> Result<String, Domain
     Ok(normalize_path(&normalize_percent_encoding(raw)))
 }
 
+/// What [`canonical_path`] removes from a path besides percent-encoding
+/// changes, which keep the resource the path names.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PathRewrite {
+    /// An empty, `.` or `..` segment was removed.
+    pub(crate) segments: bool,
+    /// The path ends with `/` after a segment; normalization removes it.
+    /// The upstream URL gets it back when the route path ends with `/` and
+    /// nothing follows it, and gets one the client did not send in that
+    /// case too, so callers compare it with the URL as built.
+    pub(crate) trailing_slash: bool,
+}
+
+/// How [`canonical_path`] rewrites `raw` (a path [`canonical_path`]
+/// accepts). Upstreams that resolve `.`/`..` and `//` themselves see the
+/// same resource; an object store such as S3 sees another key.
+pub(crate) fn path_rewrite(raw: &str) -> PathRewrite {
+    let path = normalize_percent_encoding(raw);
+    let inner = path.strip_prefix('/').unwrap_or(&path);
+    let (body, trailing) = match inner.strip_suffix('/') {
+        Some(body) => (body, true),
+        None => (inner, false),
+    };
+    if body.is_empty() {
+        // `//` is an empty segment; `/` and the empty path stay as they are.
+        return PathRewrite {
+            segments: trailing,
+            trailing_slash: false,
+        };
+    }
+    PathRewrite {
+        segments: body.split('/').any(|s| matches!(s, "" | "." | "..")),
+        trailing_slash: trailing,
+    }
+}
+
 /// Decoding rounds [`reject_encoded_dot_segments`] follows before it gives up
 /// on a segment that keeps changing (`%25` nested this deep).
 const MAX_DECODE_ROUNDS: usize = 3;
@@ -208,4 +244,57 @@ pub(crate) fn normalize_percent_encoding(path: &str) -> String {
         i += ch.len_utf8().max(1);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const fn rewrite(segments: bool, trailing_slash: bool) -> PathRewrite {
+        PathRewrite {
+            segments,
+            trailing_slash,
+        }
+    }
+
+    #[test]
+    fn path_rewrite_reports_what_normalization_removes() {
+        for (raw, expected) in [
+            ("", rewrite(false, false)),
+            ("/", rewrite(false, false)),
+            ("/a", rewrite(false, false)),
+            ("/a/b", rewrite(false, false)),
+            ("a", rewrite(false, false)),
+            (".json", rewrite(false, false)),
+            ("/a..b/.x", rewrite(false, false)),
+            ("/a%2Fb", rewrite(false, false)),
+            ("/%41/%2f", rewrite(false, false)),
+            ("//", rewrite(true, false)),
+            ("//a", rewrite(true, false)),
+            ("/a//b", rewrite(true, false)),
+            ("/a/./b", rewrite(true, false)),
+            ("/a/../b", rewrite(true, false)),
+            ("/a/.", rewrite(true, false)),
+            ("/a/", rewrite(false, true)),
+            ("/a/b/", rewrite(false, true)),
+            ("/a//", rewrite(true, true)),
+            ("/a/./", rewrite(true, true)),
+        ] {
+            assert_eq!(path_rewrite(raw), expected, "{raw}");
+        }
+    }
+
+    /// A path [`path_rewrite`] reports as unchanged keeps its segments
+    /// through [`canonical_path`]; one it reports as changed does not.
+    #[test]
+    fn path_rewrite_agrees_with_canonical_path() {
+        for raw in [
+            "", "/", "/a", "/a/b", "/%41", "/a%2fb", "//", "//a", "/a//b", "/a/./b", "/a/../b",
+            "/a/.", "/a/", "/a//", "/./", "/..",
+        ] {
+            let canonical = canonical_path(raw, "").unwrap();
+            let kept = canonical == normalize_percent_encoding(raw);
+            assert_eq!(path_rewrite(raw) == PathRewrite::default(), kept, "{raw}");
+        }
+    }
 }

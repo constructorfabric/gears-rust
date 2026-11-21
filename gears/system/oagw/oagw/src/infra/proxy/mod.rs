@@ -4,6 +4,8 @@
 pub(crate) use crate::domain::gateway_headers::HOP_BY_HOP_HEADERS;
 
 #[cfg(test)]
+mod aws_sigv4_tests;
+#[cfg(test)]
 pub(crate) mod credstore_spy;
 /// Health-checked, DNS-refreshed endpoint selection.
 pub(crate) mod endpoint_selector;

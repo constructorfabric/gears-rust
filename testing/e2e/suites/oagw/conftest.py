@@ -362,13 +362,18 @@ def _check_oagw_reachable():
 # Provision the secrets the auth-injection tests resolve via `cred://`
 # ---------------------------------------------------------------------------
 
-# Secrets the apikey / oauth2 auth plugins resolve via `cred://<ref>`.
-# Values mirror the historical static-credstore-plugin seed in
-# config/e2e-local.yaml.
+# Secrets the apikey / oauth2 / aws_sigv4 auth plugins resolve via
+# `cred://<ref>`. The apikey and oauth2 values mirror the historical
+# static-credstore-plugin seed in config/e2e-local.yaml; the AWS ones are the
+# keys the mock's /aws/* verifier accepts, plus a wrong secret.
 _CREDSTORE_SECRETS = {
     "openai-key": "sk-test-e2e-fake-key",
     "test-oauth2-client-id": "test-client-id",
     "test-oauth2-client-secret": "test-client-secret",
+    "test-aws-access-key-id": "AKIDEXAMPLE",
+    "test-aws-secret-access-key": "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+    "test-aws-session-token": "FwoGZXIvYXdzEXAMPLEsessionTOKEN+/=",
+    "test-aws-wrong-secret-access-key": "wJalrXUtnFEMI/K7MDENG+bPxRfiCYWRONGKEYXX",
 }
 
 
@@ -403,7 +408,11 @@ def _provision_credstore_secrets(_check_oagw_reachable):
     }
     # Iterate over a literal tuple of reference names (not the value mapping)
     # so nothing derived from the secret values flows into log messages.
-    for ref in ("openai-key", "test-oauth2-client-id", "test-oauth2-client-secret"):
+    for ref in (
+        "openai-key", "test-oauth2-client-id", "test-oauth2-client-secret",
+        "test-aws-access-key-id", "test-aws-secret-access-key", "test-aws-session-token",
+        "test-aws-wrong-secret-access-key",
+    ):
         try:
             resp = httpx.post(
                 f"{base_url}/credstore/v1/secrets",

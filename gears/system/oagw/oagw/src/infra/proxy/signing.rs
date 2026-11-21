@@ -17,6 +17,8 @@ pub(crate) struct SigningInput<'a> {
     pub(crate) method: &'a http::Method,
     /// The outbound URL as built.
     pub(crate) uri: Uri,
+    /// See [`SigningContext::path_rewritten`].
+    pub(crate) path_rewritten: bool,
     /// Endpoint port, also when the URL leaves out the scheme's default.
     pub(crate) port: u16,
     /// The request body as the signer sees it.
@@ -47,6 +49,7 @@ fn signing_context(input: SigningInput<'_>, headers: &HeaderMap) -> SigningConte
     let SigningInput {
         method,
         uri,
+        path_rewritten,
         port,
         body,
         config,
@@ -58,6 +61,7 @@ fn signing_context(input: SigningInput<'_>, headers: &HeaderMap) -> SigningConte
         host: uri.host().unwrap_or_default().to_owned(),
         port,
         path: uri.path().to_owned(),
+        path_rewritten,
         query: uri.query().map(str::to_owned),
         // `HeaderMap` iterates every line of a name in insertion order, the
         // order the engine writes them in.
@@ -201,6 +205,7 @@ mod tests {
         SigningInput {
             method,
             uri: url.parse().unwrap(),
+            path_rewritten: false,
             port: 8443,
             body,
             config,

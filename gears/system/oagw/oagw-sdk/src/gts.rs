@@ -52,6 +52,10 @@ pub const HTTP_PROTOCOL_ID: &str = gts_id!("cf.core.oagw.protocol.v1~cf.core.oag
 pub const APIKEY_AUTH_PLUGIN_ID: &str =
     gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1");
 
+/// Built-in AWS Signature Version 4 auth plugin instance.
+pub const AWS_SIGV4_AUTH_PLUGIN_ID: &str =
+    gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.aws_sigv4.v1");
+
 // ---------------------------------------------------------------------------
 // Typed view of the wire `resource_type` strings above.
 //

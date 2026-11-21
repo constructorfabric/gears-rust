@@ -29,7 +29,7 @@ use crate::domain::plugin::{
 };
 use crate::domain::ports::OagwMetricsPort;
 use crate::domain::ports::metric_labels::{self, RateLimitBucket, StreamOutcome, phase};
-use crate::domain::proxy_path::canonical_path;
+use crate::domain::proxy_path::{PathRewrite, canonical_path, path_rewrite};
 use crate::domain::rate_limit::{
     RateLimitKeyContext, RateLimitOutcome, RateLimitResource, RateLimiter, build_pool_key,
     build_rate_limit_key, pool_config,
@@ -431,6 +431,8 @@ struct ParsedRequest {
     instance_uri: String,
     alias: String,
     path_suffix: String,
+    /// What normalizing the client's path suffix removed.
+    path_rewrite: PathRewrite,
     query_params: Vec<(String, String)>,
     method: http::Method,
     req_headers: HeaderMap,
@@ -456,7 +458,7 @@ fn parse_proxy_request(
     // Extract alias from the raw path first, then normalize only the
     // suffix. This prevents path traversal (e.g. `/../../admin/...`)
     // from influencing alias extraction.
-    let (alias, path_suffix) = {
+    let (alias, path_suffix, path_rewrite) = {
         let path = req.uri().path();
         let trimmed = path.strip_prefix('/').unwrap_or(path);
         let (alias, raw_suffix) = match trimmed.find('/') {
@@ -466,6 +468,7 @@ fn parse_proxy_request(
         (
             alias.to_string(),
             canonical_path(raw_suffix, &instance_uri)?,
+            path_rewrite(raw_suffix),
         )
     };
 
@@ -520,6 +523,7 @@ fn parse_proxy_request(
         instance_uri,
         alias,
         path_suffix,
+        path_rewrite,
         query_params,
         method,
         req_headers,
@@ -930,6 +934,7 @@ impl DataPlaneServiceImpl {
                 instance_uri,
                 alias,
                 path_suffix,
+                path_rewrite,
                 mut query_params,
                 method,
                 req_headers,
@@ -1349,18 +1354,18 @@ impl DataPlaneServiceImpl {
 
         // 8a. Circuit breaker permit. It covers target resolution and the
         //     exchange only, so a half-open probe slot is not held through
-        //     the gateway's own steps. Their time is not the upstream's: a
-        //     deadline hit counts only if they left it the full budget. A
-        //     request pinned to one endpoint of several is not counted.
+        //     the gateway's own steps before it. Their time is not the
+        //     upstream's: a deadline hit counts only if they left it the full
+        //     budget. The signing phase (8c) is the gateway's too; its time
+        //     is taken off the budget after it. A request pinned to one
+        //     endpoint of several is not counted.
         let pinned = upstream.server.endpoints.len() > 1
             && req_headers.contains_key(TARGET_HOST_HEADER);
-        let permit = self
+        let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let mut permit = self
             .circuit_breakers
             .admit(&upstream, &instance_uri)?
-            .with_budget(
-                deadline.saturating_duration_since(tokio::time::Instant::now()),
-                self.request_timeout,
-            )
+            .with_budget(budget, self.request_timeout)
             .pinned_to_one_endpoint(pinned);
 
         // 8b. Engine target: the LB's pre-resolved address, or DNS with the
@@ -1457,9 +1462,17 @@ impl DataPlaneServiceImpl {
             } else {
                 SigningBody::Buffered(body_bytes.clone())
             };
+            // The trailing `/` is compared with the URL as built: the route
+            // path gives back one the normalization removed (route `/dir/`,
+            // request `/dir/`) and adds one the client did not send (route
+            // `/dir/`, request `/dir`). The root `/` names no resource.
+            let path_rewritten = path_rewrite.segments
+                || (uri.path() != "/"
+                    && path_rewrite.trailing_slash != uri.path().ends_with('/'));
             let input = signing::SigningInput {
                 method: &method,
                 uri,
+                path_rewritten,
                 port: endpoint.port,
                 body,
                 config: auth.config.clone().unwrap_or_default(),
@@ -1469,18 +1482,22 @@ impl DataPlaneServiceImpl {
             // plugin's sign returns, with no await after it, and the URL is
             // replaced only on success; a timeout fails the request.
             tracing::debug!(plugin = %auth.plugin_type, "signing the request");
-            let sign_start = std::time::Instant::now();
+            let sign_start = tokio::time::Instant::now();
             let signed = tokio::time::timeout_at(
                 deadline,
                 signing::sign_request(plugin.as_ref(), input, &mut outbound_headers),
             )
             .await;
+            let sign_time = sign_start.elapsed();
             self.metrics.record_request_duration_seconds(
                 &host_label,
                 &path_label,
                 phase::SIGN,
-                sign_start.elapsed().as_secs_f64(),
+                sign_time.as_secs_f64(),
             );
+            // The signer's CredStore reads are the gateway's time, not the
+            // upstream's: a slow store must not open the breaker.
+            permit = permit.with_budget(budget.saturating_sub(sign_time), self.request_timeout);
             let signed_url = signed
                 .map_err(|_| DomainError::RequestTimeout {
                     detail: format!(
@@ -2088,6 +2105,15 @@ fn auth_plugin_error(e: PluginError, instance_uri: &str, scope: AuthScope<'_>) -
                 instance,
             }
         }
+        PluginError::InvalidRequest {
+            field: name,
+            detail,
+        } => DomainError::Validation {
+            field: name,
+            reason: field::VALIDATION,
+            detail,
+            instance,
+        },
         PluginError::InvalidConfig(_) => DomainError::Internal {
             message: format!("auth plugin misconfigured: {e}"),
         },
@@ -4554,6 +4580,14 @@ pub(crate) mod tests {
             (
                 PluginError::InvalidConfig("missing client_id_ref".into()),
                 500,
+                None,
+            ),
+            (
+                PluginError::InvalidRequest {
+                    field: "body",
+                    detail: "a streamed request body cannot be hashed".into(),
+                },
+                400,
                 None,
             ),
             (

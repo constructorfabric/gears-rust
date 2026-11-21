@@ -1,12 +1,12 @@
 use crate::domain::plugin::credentials::{
-    CLIENT_ID_REF_KEY, CLIENT_SECRET_REF_KEY, credstore_error_kind, credstore_read_error,
-    parse_credential_ref, secret_missing,
+    CLIENT_ID_REF_KEY, CLIENT_SECRET_REF_KEY, credstore_error_kind, parse_credential_ref,
 };
 use credstore_sdk::CredStoreClientV1;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::infra::plugin::read_credential;
 use crate::infra::ttl_cache::TtlCache;
 use toolkit_auth::oauth2::types::SecretString;
 use toolkit_auth::oauth2::{
@@ -190,13 +190,9 @@ impl OAuth2ClientCredAuthPlugin {
         let secret_ref = parse_credential_ref(cred_ref).map_err(|e| {
             PluginError::InvalidConfig(format!("auth.config.{key}: {}", credstore_error_kind(&e)))
         })?;
-        let response = self
-            .credstore
-            .get(security_context, &secret_ref)
-            .await
-            .map_err(|e| credstore_read_error(key, &e))?
-            .ok_or_else(|| secret_missing(key))?;
-        std::str::from_utf8(response.value.as_bytes())
+        let secret =
+            read_credential(self.credstore.as_ref(), security_context, key, &secret_ref).await?;
+        std::str::from_utf8(secret.as_bytes())
             .map(str::to_owned)
             .map_err(|_| {
                 PluginError::Internal(format!(

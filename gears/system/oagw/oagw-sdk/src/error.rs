@@ -218,7 +218,10 @@ pub enum ServiceGatewayError {
         /// plugin's `error_code`, a credential key
         /// ([`crate::precondition::SECRET_REF`],
         /// [`crate::precondition::CLIENT_ID_REF`],
-        /// [`crate::precondition::CLIENT_SECRET_REF`]), or
+        /// [`crate::precondition::CLIENT_SECRET_REF`],
+        /// [`crate::precondition::ACCESS_KEY_ID_REF`],
+        /// [`crate::precondition::SECRET_ACCESS_KEY_REF`],
+        /// [`crate::precondition::SESSION_TOKEN_REF`]), or
         /// [`crate::precondition::MANAGED_BY`].
         subject: String,
         detail: String,

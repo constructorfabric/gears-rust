@@ -29,13 +29,14 @@ PROXY_SCHEMA = "gts.cf.core.oagw.proxy.v1~"
 HTTP_PROTOCOL_ID = "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1"
 GRPC_PROTOCOL_ID = "gts.cf.core.oagw.protocol.v1~cf.core.oagw.grpc.v1"
 
-# Auth plugin instances (6)
+# Auth plugin instances (7)
 NOOP_AUTH_PLUGIN_ID = "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.noop.v1"
 APIKEY_AUTH_PLUGIN_ID = "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1"
 BASIC_AUTH_PLUGIN_ID = "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.basic.v1"
 BEARER_AUTH_PLUGIN_ID = "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.bearer.v1"
 OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID = "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred.v1"
 OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID = "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred_basic.v1"
+AWS_SIGV4_AUTH_PLUGIN_ID = "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.aws_sigv4.v1"
 
 # Guard plugin instances (3)
 TIMEOUT_GUARD_PLUGIN_ID = "gts.cf.core.oagw.guard_plugin.v1~cf.core.oagw.timeout.v1"
@@ -58,7 +59,7 @@ OAGW_INSTANCES = [
     HTTP_PROTOCOL_ID, GRPC_PROTOCOL_ID,
     NOOP_AUTH_PLUGIN_ID, APIKEY_AUTH_PLUGIN_ID, BASIC_AUTH_PLUGIN_ID,
     BEARER_AUTH_PLUGIN_ID, OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID,
-    OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID,
+    OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID, AWS_SIGV4_AUTH_PLUGIN_ID,
     TIMEOUT_GUARD_PLUGIN_ID, CORS_GUARD_PLUGIN_ID, REQUIRED_HEADERS_GUARD_PLUGIN_ID,
     LOGGING_TRANSFORM_PLUGIN_ID, METRICS_TRANSFORM_PLUGIN_ID,
     REQUEST_ID_TRANSFORM_PLUGIN_ID,

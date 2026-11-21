@@ -32,7 +32,7 @@ async def test_all_oagw_schemas_registered(oagw_base_url, oagw_headers):
 
 @pytest.mark.asyncio
 async def test_all_oagw_instances_registered(oagw_base_url, oagw_headers):
-    """After platform startup, all 14 built-in instances are registered as instances."""
+    """After platform startup, all 15 built-in instances are registered as instances."""
     by_id = await _registered(oagw_base_url, oagw_headers)
     missing = set(OAGW_INSTANCES) - by_id.keys()
     assert not missing, f"instances not registered: {missing}"
@@ -41,7 +41,7 @@ async def test_all_oagw_instances_registered(oagw_base_url, oagw_headers):
 
 @pytest.mark.asyncio
 async def test_oagw_entity_count(oagw_base_url, oagw_headers):
-    """OAGW registers exactly its 21 catalog entities, nothing extra.
+    """OAGW registers exactly its 22 catalog entities, nothing extra.
 
     Only OAGW's own entities are compared: its schemas and `cf.core.oagw.*`
     built-in instances. Instances other gears register against OAGW schemas

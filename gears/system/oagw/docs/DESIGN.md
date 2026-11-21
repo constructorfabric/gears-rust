@@ -280,6 +280,7 @@ Built-in auth plugins:
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1`
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred.v1`
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred_basic.v1`
+- `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.aws_sigv4.v1` — AWS Signature Version 4, signed in the signing phase ([ADR-0023](./ADR/0023-request-signing.md)); config in [F0003](./features/0003-cpt-cf-oagw-feature-plugin-system.md#aws-sigv4-auth-plugin)
 
 `basic.v1` and `bearer.v1` are reserved GTS identifiers cataloged in the types-registry with no backing `AuthPlugin` implementation in `AuthPluginRegistry`: setting either as `auth.type` is rejected on write with 400 `invalid_argument` (reason `NOT_IMPLEMENTED`).
 
@@ -400,12 +401,12 @@ Three plugin types with separate traits, deterministic execution order:
 2. **GuardPlugin** (`gts.cf.core.oagw.guard_plugin.v1~*`): Validation/policy enforcement (can reject). Multiple per upstream/route.
 3. **TransformPlugin** (`gts.cf.core.oagw.transform_plugin.v1~*`): Request/response mutation. Multiple per upstream/route.
 
-Execution order: Auth → Guards → Transform(on_request) → Auth signing → Upstream call → Transform(on_response/on_error). The auth plugin's optional signing phase ([ADR-0023](ADR/0023-request-signing.md)) runs last, after header rules, transforms, endpoint selection, the `Host` header, rate limits and the URL build, on the HTTP and WebSocket paths. It sees the method, URL, every header line as sent and the body (buffered bytes, a streamed marker, or empty for a WebSocket handshake), and may set headers and keep, remove or replace the query, a replacement sent as returned. A signing failure stops the request before anything is sent. Only plugins whose `signs` flag is `true` have the phase; the built-in plugins do not. `on_response` runs for every upstream response, 4xx/5xx included; `on_error` runs only for gateway-originated errors of the upstream exchange (connection failure, timeout, protocol error, body limit, response guard rejection). A WebSocket upgrade does not run it: a failed upgrade returns its gateway error without `on_error`.
+Execution order: Auth → Guards → Transform(on_request) → Auth signing → Upstream call → Transform(on_response/on_error). The auth plugin's optional signing phase ([ADR-0023](ADR/0023-request-signing.md)) runs last, after header rules, transforms, endpoint selection, the `Host` header, rate limits and the URL build, on the HTTP and WebSocket paths. It sees the method, URL, every header line as sent and the body (buffered bytes, a streamed marker, or empty for a WebSocket handshake), and may set headers and keep, remove or replace the query, a replacement sent as returned. A signing failure stops the request before anything is sent. Only plugins whose `signs` flag is `true` have the phase; among the built-ins only `aws_sigv4` does. `on_response` runs for every upstream response, 4xx/5xx included; `on_error` runs only for gateway-originated errors of the upstream exchange (connection failure, timeout, protocol error, body limit, response guard rejection). A WebSocket upgrade does not run it: a failed upgrade returns its gateway error without `on_error`.
 
 Plugin chain composition: upstream plugins execute before route plugins (`[U1, U2] + [R1, R2] => [U1, U2, R1, R2]`).
 
 **Built-in Plugins** (registered and resolvable via their plugin registry):
-- Auth: `noop`, `apikey`, `oauth2_client_cred`, `oauth2_client_cred_basic`
+- Auth: `noop`, `apikey`, `oauth2_client_cred`, `oauth2_client_cred_basic`, `aws_sigv4`
 - Guard: `required_headers`
 - Transform: `request_id`
 
@@ -438,7 +439,7 @@ The breaker is shared by every tenant that resolves to the upstream: it describe
 | Any other upstream status (`500`, `4xx`, `101` included) | success |
 | DNS failure or no address where the engine resolves the host (a single-endpoint upstream; a multi-endpoint upstream resolves in endpoint selection, whose errors are not counted), connection refused, no route, connect error or timeout, TLS handshake or certificate error, peer closed, invalid response, HTTP/2 or stream error before the response head, the engine's read or write timeout | failure |
 | Request deadline hit during target resolution or the exchange, which started with at least 90 % of the request timeout left | failure |
-| The same, when the gateway's own steps before them (the `request_ref` CredStore read, endpoint selection) used more than 10 % | not counted |
+| The same, when the gateway's own steps (the `request_ref` CredStore read, endpoint selection, an auth plugin's signing phase) used more than 10 % | not counted |
 | A timeout or a broken exchange while the client is still sending a streamed request body (a failure to connect still counts) | not counted |
 | Any outcome of a request pinned with `X-OAGW-Target-Host` to one endpoint of an upstream with several (still rejected while open) | not counted |
 | The SSRF policy refuses every resolved address | not counted |
@@ -446,7 +447,7 @@ The breaker is shared by every tenant that resolves to the upstream: it describe
 | The client cancels before the response head | not counted |
 | Anything after the response head (SSE or long body, WebSocket tunnel) | not counted |
 
-While the circuit is open, a check before the auth plugin, the rate limits and the CredStore read answers `503` (`service_unavailable`, `X-OAGW-Error-Source: gateway`) with `Retry-After` = the time left until a probe, without calling the upstream; that check keeps no half-open probe slot. The permit that counts the outcome (and holds a probe slot) is taken just before target resolution, so a slow auth plugin or CredStore read does not keep a probe slot. The cost is at the open → half-open edge: requests that pass the check before the first probe takes its slot do the gateway's steps and get `503` at the permit; this lasts at most the time between the check and the permit of the first request after `timeout_seconds`, once per open period, and once a probe holds the slot the check rejects. The outcome is taken at the response head (for a WebSocket upgrade, at the handshake).
+While the circuit is open, a check before the auth plugin, the rate limits and the CredStore read answers `503` (`service_unavailable`, `X-OAGW-Error-Source: gateway`) with `Retry-After` = the time left until a probe, without calling the upstream; that check keeps no half-open probe slot. The permit that counts the outcome (and holds a probe slot) is taken just before target resolution, so a slow `authenticate` or `request_ref` CredStore read does not keep a probe slot; a signing phase, which runs after target resolution, does, and its time is taken off the upstream's budget. The cost is at the open → half-open edge: requests that pass the check before the first probe takes its slot do the gateway's steps and get `503` at the permit; this lasts at most the time between the check and the permit of the first request after `timeout_seconds`, once per open period, and once a probe holds the slot the check rejects. The outcome is taken at the response head (for a WebSocket upgrade, at the handshake).
 
 State is kept in memory on each replica (`toolkit-resilience`), one breaker per resolved upstream and the upstream whose config is in effect; nothing is shared between replicas. A breaker is rebuilt closed on the next request, on every replica, when the effective config, the alias or the endpoints differ from those it was built for; disabling it removes it. A request that resolves no config leaves the breaker alone (under a `private` config a descendant sees none while the owner sees it). A write that changes or removes the stored `circuit_breaker`, and a delete, drop the upstream's breakers on the replica that handles the write; the idle sweep that evicts rate-limit buckets (every 60 s) evicts breakers unused for 10 minutes past their `timeout_seconds`, e.g. those of upstreams another replica deleted. Another replica does not see a removal, so an identical config re-added there before the sweep continues the old state, open for at most `timeout_seconds`. While two snapshots of one upstream are both in use (proxy config cache lag), each switch rebuilds the breaker closed, so it may not open until they converge.
 
@@ -868,7 +869,9 @@ The two backends an auth plugin depends on have their own reasons: `CREDENTIAL_S
 | Identity provider rejects the client: 400, 401 or 403 to the token request | 401 `unauthenticated` | `AUTH_PLUGIN_FAILED` |
 | Identity provider answers with an invalid response: any other status (discovery 400, 401 and 403 included), unparseable body, unsupported token type, invalid or zero lifetime, an access token that is empty or not a valid header value | 502 `service_unavailable` | `REQUEST_NOT_SENT` |
 | Plugin misconfiguration (bad config, an endpoint URL or scheme the HTTP client cannot use, header the gateway cannot set, signing output the gateway cannot send) | 500 `internal` | |
-| Other plugin failure (secret value not UTF-8 or not a header value, in `config` and `request_ref` mode alike; unexpected credential store error) | 401 `unauthenticated` | `AUTH_PLUGIN_INTERNAL` |
+| Other plugin failure (secret value not UTF-8 or not a header value, in `config` and `request_ref` mode alike; an `aws_sigv4` secret that is not an access key id, an empty secret key or a session token that is not visible ASCII; unexpected credential store error) | 401 `unauthenticated` | `AUTH_PLUGIN_INTERNAL` |
+
+A signer that has a valid config but cannot sign the request as the caller sent it (`PluginError::InvalidRequest`: an `aws_sigv4` streamed body without `unsigned_payload`, a client `X-Amz-Security-Token` without `session_token_ref`, an S3 path the gateway rewrote) is not a credential failure: 400 `invalid_argument`, reason `VALIDATION`, on the field the plugin names.
 
 An invalid identity provider response is logged and reported by a fixed class (for example "unsupported token type"), never with text from its body. An unusable token is never sent or cached.
 
