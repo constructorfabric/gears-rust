@@ -64,6 +64,13 @@ impl AuthPluginRegistry {
         Self { plugins }
     }
 
+    /// Register `plugin` under `plugin_id`, replacing a built-in of that id,
+    /// for tests of the pipeline.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn insert(&mut self, plugin_id: &str, plugin: Arc<dyn AuthPlugin>) {
+        self.plugins.insert(plugin_id.to_owned(), plugin);
+    }
+
     /// Resolve a plugin by its GTS identifier.
     ///
     /// # Errors

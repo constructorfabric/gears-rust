@@ -892,6 +892,7 @@ pub struct TestDpBuilder {
     websocket_close_timeout: Option<Duration>,
     metrics: Option<Arc<dyn crate::domain::ports::OagwMetricsPort>>,
     transform_plugins: Vec<(String, Arc<dyn crate::domain::plugin::TransformPlugin>)>,
+    auth_plugins: Vec<(String, Arc<dyn crate::domain::plugin::AuthPlugin>)>,
     streaming_idle_timeout: Option<Duration>,
     circuit_breakers: Option<Arc<CircuitBreakers>>,
     upstream_ssrf_policy: bool,
@@ -912,6 +913,7 @@ impl TestDpBuilder {
             websocket_close_timeout: None,
             metrics: None,
             transform_plugins: Vec::new(),
+            auth_plugins: Vec::new(),
             streaming_idle_timeout: None,
             circuit_breakers: None,
             upstream_ssrf_policy: false,
@@ -933,6 +935,18 @@ impl TestDpBuilder {
         plugin: Arc<dyn crate::domain::plugin::TransformPlugin>,
     ) -> Self {
         self.transform_plugins.push((plugin_id.to_owned(), plugin));
+        self
+    }
+
+    /// Register an auth plugin under `plugin_id`, replacing a built-in of
+    /// that id.
+    #[must_use]
+    pub(crate) fn with_auth_plugin(
+        mut self,
+        plugin_id: &str,
+        plugin: Arc<dyn crate::domain::plugin::AuthPlugin>,
+    ) -> Self {
+        self.auth_plugins.push((plugin_id.to_owned(), plugin));
         self
     }
 
@@ -1112,6 +1126,9 @@ impl TestDpBuilder {
         }
         for (plugin_id, plugin) in self.transform_plugins {
             svc = svc.with_transform_plugin(&plugin_id, plugin);
+        }
+        for (plugin_id, plugin) in self.auth_plugins {
+            svc = svc.with_auth_plugin(&plugin_id, plugin);
         }
         if let Some(timeout) = self.streaming_idle_timeout {
             svc = svc.with_streaming_idle_timeout(timeout);

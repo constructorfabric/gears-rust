@@ -40,6 +40,32 @@ fn request_framing_and_control_headers_are_dropped() {
     assert_eq!(h["trailer"], "x-t");
 }
 
+/// The predicate names exactly the fields the sanitizer drops from every
+/// request head.
+#[test]
+fn dropped_request_header_matches_the_sanitizer() {
+    for name in &REQUEST_DROPPED {
+        assert!(is_dropped_request_header(name), "{name}");
+        let mut h = map(&[(name.as_str(), "1")]);
+        sanitize_request_headers(&mut h, RequestKind::Regular);
+        assert!(!h.contains_key(name), "{name}");
+    }
+    for name in ["trailer", "host", "authorization", "x-keep"] {
+        let name = HeaderName::from_static(name);
+        assert!(!is_dropped_request_header(&name), "{name}");
+    }
+}
+
+/// `TE` counts as dropped although `TE: trailers` survives the sanitizer,
+/// so a caller using the predicate refuses every `TE` line.
+#[test]
+fn te_counts_as_dropped_although_te_trailers_survives() {
+    assert!(is_dropped_request_header(&header::TE));
+    let mut h = map(&[("te", "trailers")]);
+    sanitize_request_headers(&mut h, RequestKind::Regular);
+    assert_eq!(h["te"], "trailers");
+}
+
 #[test]
 fn request_trailer_declaration_loses_names_trailers_cannot_carry() {
     let mut h = map(&[

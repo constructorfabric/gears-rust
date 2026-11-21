@@ -69,7 +69,7 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
 - **PRD**: [PRD.md](../PRD.md)
 - **Design**: [DESIGN.md](../DESIGN.md)
 - **Sequence**: `cpt-cf-oagw-seq-proxy-flow`
-- **ADR**: [ADR/0020-proxy-config-cache.md](../ADR/0020-proxy-config-cache.md) — proxy configuration cache with a database
+- **ADR**: [ADR/0020-proxy-config-cache.md](../ADR/0020-proxy-config-cache.md) — proxy configuration cache with a database; [ADR/0023-request-signing.md](../ADR/0023-request-signing.md) — auth plugin signing phase on the final request
 - **Dependencies**: `cpt-cf-oagw-feature-management-api`, `cpt-cf-oagw-feature-plugin-system`
 
 ## 2. Actor Flows (CDSL)
@@ -138,23 +138,26 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
     1. [x] - `p1` - **RETURN** 400 InvalidTargetHost with `X-OAGW-Error-Source: gateway` - `inst-proxy-22a`
 24. [x] - `p1` - **IF** `X-OAGW-Target-Host` present AND value does not match any configured endpoint host - `inst-proxy-23`
     1. [x] - `p1` - **RETURN** 400 UnknownTargetHost with `X-OAGW-Error-Source: gateway` - `inst-proxy-23a`
-25. [x] - `p1` - **IF** request contains `Upgrade: websocket` header - `inst-proxy-24`
+25. [x] - `p1` - Run the auth plugin's signing phase ([ADR-0023](../ADR/0023-request-signing.md)) on the request as it will be sent: apply the upstream engine's request header sanitization (after its handshake validation for a WebSocket upgrade), then pass the method, URL (scheme, host, port, path, query after transforms), every header line (`Host` and, for a WebSocket handshake, `Connection: upgrade` and `Upgrade: websocket` included) and the body (buffered bytes, streamed marker, or empty for a WebSocket handshake). Set the headers it returns, marked sensitive, and keep, remove or replace the query as it returns, a replacement sent as returned. Only with a configured auth plugin whose `signs` flag is `true`, outside `request_ref` mode - `inst-proxy-24s`
+26. [x] - `p1` - **IF** signing fails, its output cannot be sent as given, or the request deadline passes (a built URL that does not parse is a `DownstreamError`, as for the engine request) - `inst-proxy-24s1`
+    1. [x] - `p1` - **RETURN** the `authenticate` error mapping (401 AuthenticationFailed, 500 SecretNotFound, 400 invalid plugin config) or 504 RequestTimeout with `X-OAGW-Error-Source: gateway`; nothing is sent - `inst-proxy-24s1a`
+27. [x] - `p1` - **IF** request contains `Upgrade: websocket` header - `inst-proxy-24`
     1. [x] - `p1` - Perform the handshake on a dedicated upstream connection via the engine's upgrade; tunnel only after the upstream answers `101`, otherwise **RETURN** 502 ProtocolError with `X-OAGW-Error-Source: gateway` - `inst-proxy-24a`
-26. [x] - `p1` - Build outbound HTTP request: set target URL (scheme + host + port + path), method, headers, body - `inst-proxy-25`
-27. [x] - `p1` - Forward the request through the upstream engine via `cpt-cf-oagw-algo-upstream-forwarding` - `inst-proxy-26`
-28. [x] - `p1` - **IF** the engine reports an upstream connection failure (refused, DNS, TLS) - `inst-proxy-27`
+28. [x] - `p1` - Build outbound HTTP request: set target URL (scheme + host + port + path), method, headers, body - `inst-proxy-25`
+29. [x] - `p1` - Forward the request through the upstream engine via `cpt-cf-oagw-algo-upstream-forwarding` - `inst-proxy-26`
+30. [x] - `p1` - **IF** the engine reports an upstream connection failure (refused, DNS, TLS) - `inst-proxy-27`
     1. [x] - `p1` - Map the engine error kind to `DomainError`; the REST layer writes the RFC 9457 Problem response with `X-OAGW-Error-Source: gateway` - `inst-proxy-27a`
     2. [x] - `p1` - **RETURN** 502 DownstreamError (503 LinkUnavailable for no route) with `X-OAGW-Error-Source: gateway` - `inst-proxy-27b`
-29. [x] - `p1` - **IF** connection or request timeout (connect timeout, response-head or body read timeout) - `inst-proxy-28`
+31. [x] - `p1` - **IF** connection or request timeout (connect timeout, response-head or body read timeout) - `inst-proxy-28`
     1. [x] - `p1` - **RETURN** 504 ConnectionTimeout or RequestTimeout via `cpt-cf-oagw-algo-error-source-classification` - `inst-proxy-28a`
-30. [x] - `p1` - **IF** the engine reports an HTTP/2 protocol error - `inst-proxy-29`
+32. [x] - `p1` - **IF** the engine reports an HTTP/2 protocol error - `inst-proxy-29`
     1. [x] - `p1` - **RETURN** 502 ProtocolError with `X-OAGW-Error-Source: gateway` - `inst-proxy-29a`
-31. [x] - `p1` - Receive the upstream response head; the body streams - `inst-proxy-30`
-32. [x] - `p1` - **IF** the exchange fails on the gateway side (connection failure, timeout, protocol error, request body limit, response guard rejection) - `inst-proxy-31`
+33. [x] - `p1` - Receive the upstream response head; the body streams - `inst-proxy-30`
+34. [x] - `p1` - **IF** the exchange fails on the gateway side (connection failure, timeout, protocol error, request body limit, response guard rejection) - `inst-proxy-31`
     1. [x] - `p1` - Execute transform plugins: `on_error` phase, with the status the client gets; `on_error` runs only for these gateway-originated errors (errors raised before forwarding, such as validation, auth, guard or rate-limit rejections, return without it, and so does a failed WebSocket upgrade) - `inst-proxy-31a`
     2. [x] - `p1` - **RETURN** the gateway error with `X-OAGW-Error-Source: gateway` - `inst-proxy-31b`
-33. [x] - `p1` - Execute transform plugins: `on_response` phase, for every upstream response; an upstream 4xx/5xx goes through `on_response`, not `on_error`, and is returned with its status, headers and body and `X-OAGW-Error-Source: upstream` - `inst-proxy-32`
-34. [x] - `p1` - **RETURN** transformed response with `X-OAGW-Error-Source: upstream` - `inst-proxy-33`
+35. [x] - `p1` - Execute transform plugins: `on_response` phase, for every upstream response; an upstream 4xx/5xx goes through `on_response`, not `on_error`, and is returned with its status, headers and body and `X-OAGW-Error-Source: upstream` - `inst-proxy-32`
+36. [x] - `p1` - **RETURN** transformed response with `X-OAGW-Error-Source: upstream` - `inst-proxy-33`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -254,7 +257,7 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
       1. [x] - `p1` - **RETURN** guard-specific rejection error - `inst-chain-8b1`
 9. [x] - `p1` - **FOR EACH** transform plugin in chain (type = transform, phase = on_request) - `inst-chain-9`
    1. [x] - `p1` - Execute transform: mutate request headers, body, query as configured. The transform sees the headers whose values are visible ASCII; lines that are not (obs-text, non-UTF-8) pass through unseen. Only the names whose lines the transform changed are rewritten: all their lines, unseen ones included, are replaced by the transform's (none: removed), keeping the sensitive flag. Every other line, the credential set by the auth plugin included, keeps its bytes, order and sensitive flag. The same applies to response headers in `on_response` - `inst-chain-9a`
-10. [x] - `p1` - **RETURN** processed request ready for upstream forwarding - `inst-chain-10`
+10. [x] - `p1` - **RETURN** processed request ready for upstream forwarding; the auth plugin's signing phase runs later, once the URL is built (`inst-proxy-24s`) - `inst-chain-10`
 
 ### Header Transformation
 

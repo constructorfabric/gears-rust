@@ -77,6 +77,108 @@ impl AuthContext {
     }
 }
 
+/// Body of the outbound request as [`AuthPlugin::sign`] sees it.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SigningBody {
+    /// The whole body. Empty for a request without a body and for a
+    /// WebSocket handshake.
+    Buffered(bytes::Bytes),
+    /// The body is streamed to the upstream; its bytes are not known yet.
+    Streamed,
+}
+
+/// The outbound request as it will be sent, passed to [`AuthPlugin::sign`]
+/// (ADR-0023).
+#[domain_model]
+#[allow(
+    dead_code,
+    reason = "part of the auth plugin API; no built-in plugin signs yet"
+)]
+pub struct SigningContext {
+    /// HTTP method.
+    pub method: String,
+    /// URL scheme: `http`, `https` or `wss`.
+    pub scheme: String,
+    /// Endpoint host as in the URL: an IPv6 address keeps its brackets.
+    pub host: String,
+    /// Endpoint port, also when the URL leaves out the scheme's default.
+    pub port: u16,
+    /// Path as sent, percent-encoding included.
+    pub path: String,
+    /// Query as sent, without the `?`; `None` when the URL has none.
+    pub query: Option<String>,
+    /// Headers as sent: lowercase names, every line of a repeated name in
+    /// order. `Host` is included. The engine still sets the framing and
+    /// connection-scoped headers and joins `Cookie` lines on HTTP/1.1, so a
+    /// signer must not cover those.
+    pub headers: Vec<(String, Vec<u8>)>,
+    /// The request body.
+    pub body: SigningBody,
+    /// Plugin-specific configuration key/value pairs.
+    pub config: HashMap<String, String>,
+    /// Security context of the calling subject.
+    pub security_context: SecurityContext,
+}
+
+/// What [`AuthPlugin::sign`] changes on the outbound request. The default
+/// changes nothing.
+///
+/// `Debug` prints the header names only: the values and the query carry
+/// the signature or a credential.
+#[domain_model]
+#[derive(Default, Clone, PartialEq, Eq)]
+pub struct SigningOutput {
+    /// Headers to set, as `(name, value)`. Each replaces the lines of that
+    /// name and is marked sensitive. An invalid name or value, a name set
+    /// twice, or a header the gateway or the engine sets or strips itself
+    /// (`Host`, `Content-Length`, `Expect`, hop-by-hop, forwarding,
+    /// `X-OAGW-*`), fails the request.
+    pub set_headers: Vec<(String, Vec<u8>)>,
+    /// What happens to the query.
+    pub query: QueryChange,
+}
+
+impl std::fmt::Debug for SigningOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> = self.set_headers.iter().map(|(n, _)| n.as_str()).collect();
+        f.debug_struct("SigningOutput")
+            .field("set_headers", &names)
+            .field("query", &self.query)
+            .finish()
+    }
+}
+
+/// The signing phase's change to the query. `Debug` hides a replacement:
+/// it may carry a presigned signature.
+#[domain_model]
+#[derive(Default, Clone, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "part of the auth plugin API; no built-in plugin signs yet"
+)]
+pub enum QueryChange {
+    /// Send the query as it is.
+    #[default]
+    Keep,
+    /// Send the URL without a query.
+    Remove,
+    /// Send this query, without the `?`, exactly as given (no
+    /// re-encoding). A query the URI parser would change or reject fails
+    /// the request.
+    Replace(String),
+}
+
+impl std::fmt::Debug for QueryChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Keep => f.write_str("Keep"),
+            Self::Remove => f.write_str("Remove"),
+            Self::Replace(_) => f.write_str("Replace(..)"),
+        }
+    }
+}
+
 /// Trait for outbound authentication plugins.
 ///
 /// Implementations add authentication material (e.g., API keys, bearer
@@ -85,6 +187,26 @@ impl AuthContext {
 pub trait AuthPlugin: Send + Sync {
     /// Apply authentication to the outbound request context.
     async fn authenticate(&self, ctx: &mut AuthContext) -> Result<(), PluginError>;
+
+    /// Whether the plugin has a signing phase. Only then does the gateway
+    /// build the [`SigningContext`] and call [`Self::sign`]: a plugin that
+    /// overrides `sign` must return `true` here, or its requests go out
+    /// unsigned.
+    fn signs(&self) -> bool {
+        false
+    }
+
+    /// Sign the final outbound request (ADR-0023). Runs once per request,
+    /// when [`Self::signs`] is true, after header rules, transforms,
+    /// endpoint selection and the URL build, right before the request is
+    /// sent. An error stops the request.
+    ///
+    /// Runs under the request deadline: the future may be dropped at any
+    /// await, so an implementation must not leave shared state (a nonce, a
+    /// cached credential) half-updated across one.
+    async fn sign(&self, _ctx: &SigningContext) -> Result<SigningOutput, PluginError> {
+        Ok(SigningOutput::default())
+    }
 }
 
 // ---------------------------------------------------------------------------

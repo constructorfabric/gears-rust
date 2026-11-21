@@ -84,6 +84,7 @@ This design satisfies the requirements for centralized outbound traffic manageme
 - `cpt-cf-oagw-adr-proxy-config-cache` — Per-replica cache of the proxy lookup with a database; each write evicts only the entries it affects, on every replica through a cluster change log, with a TTL backstop (proposed until its benchmark)
 - `cpt-cf-oagw-adr-upstream-credentials` — [Proposed tenant-local named API keys](ADR/0021-upstream-credentials.md)
 - `cpt-cf-oagw-adr-request-secret-refs` — [Proposed per-request CredStore references with guards](ADR/0022-request-secret-refs.md)
+- `cpt-cf-oagw-adr-request-signing` — [Proposed optional signing phase of auth plugins, run on the final outbound request](ADR/0023-request-signing.md)
 
 ### 1.3 Architecture Layers
 
@@ -399,7 +400,7 @@ Three plugin types with separate traits, deterministic execution order:
 2. **GuardPlugin** (`gts.cf.core.oagw.guard_plugin.v1~*`): Validation/policy enforcement (can reject). Multiple per upstream/route.
 3. **TransformPlugin** (`gts.cf.core.oagw.transform_plugin.v1~*`): Request/response mutation. Multiple per upstream/route.
 
-Execution order: Auth → Guards → Transform(on_request) → Upstream call → Transform(on_response/on_error). `on_response` runs for every upstream response, 4xx/5xx included; `on_error` runs only for gateway-originated errors of the upstream exchange (connection failure, timeout, protocol error, body limit, response guard rejection). A WebSocket upgrade does not run it: a failed upgrade returns its gateway error without `on_error`.
+Execution order: Auth → Guards → Transform(on_request) → Auth signing → Upstream call → Transform(on_response/on_error). The auth plugin's optional signing phase ([ADR-0023](ADR/0023-request-signing.md)) runs last, after header rules, transforms, endpoint selection, the `Host` header, rate limits and the URL build, on the HTTP and WebSocket paths. It sees the method, URL, every header line as sent and the body (buffered bytes, a streamed marker, or empty for a WebSocket handshake), and may set headers and keep, remove or replace the query, a replacement sent as returned. A signing failure stops the request before anything is sent. Only plugins whose `signs` flag is `true` have the phase; the built-in plugins do not. `on_response` runs for every upstream response, 4xx/5xx included; `on_error` runs only for gateway-originated errors of the upstream exchange (connection failure, timeout, protocol error, body limit, response guard rejection). A WebSocket upgrade does not run it: a failed upgrade returns its gateway error without `on_error`.
 
 Plugin chain composition: upstream plugins execute before route plugins (`[U1, U2] + [R1, R2] => [U1, U2, R1, R2]`).
 
@@ -543,6 +544,8 @@ OAGW processes headers in three categories:
 | `Transfer-Encoding` | Stripped |
 | `Upgrade` | Stripped |
 | `Forwarded`, `Via`, `X-Forwarded*`, `X-Envoy-*`, `*Client-IP`, `X-Real-IP`, `X-Originating-IP`, `X-Remote-IP`, `X-Remote-Addr`, `X-ProxyUser-Ip`, `CF-Connecting-IP`, `X-Original-Forwarded-For`, `X-Original-URL`, `X-Original-URI`, `X-Rewrite-URL`, `X-Original-Host`, `X-Host`, `X-HTTP-Method-Override`, `X-HTTP-Method`, `X-Method-Override` | Not forwarded under `passthrough: all`; forwarded only when the upstream's `passthrough_allowlist` names the header. The list cannot name every framework-specific header: an upstream that trusts client-identity or override headers should use `allowlist` |
+
+A forwarded header keeps every line the client sent, in order, under `passthrough: all` and `allowlist` alike.
 
 Request-phase guard plugins check the inbound headers as the client sent them, before passthrough filtering and auth injection ([ADR: Required Headers Guard Plugin](./ADR/0017-required-headers-guard-plugin.md)).
 
@@ -897,6 +900,9 @@ sequenceDiagram
     Chain-->>DP: validated request
     DP->>Chain: transform_request(request)
     Chain-->>DP: transformed request
+    DP->>DP: select endpoint, set Host, build URL
+    DP->>Auth: sign(final request)
+    Auth-->>DP: headers to set, query
     DP->>US: HTTP request
     US-->>DP: HTTP response
     DP->>Chain: transform_response(response)
@@ -1005,7 +1011,7 @@ The endpoint selector (`PoolEndpointSelector`) caches each upstream's endpoint p
 Prometheus metrics at `/metrics` (admin-only):
 
 - `oagw_requests_total{host, http.request.method, http.route, http.response.status_code, credential_mode}` — counter, one per request with a response: the upstream's status, or for a gateway error the status the client gets (a denied `proxy:invoke` check, and a granted request the REST handler rejects before the Data Plane runs, under `host` and `http.route` `unknown`); a request the client dropped before its response head is only in `oagw_errors_total` as `Cancelled` (label keys follow OTel HTTP semantic conventions; numeric status; method normalized to a standard verb or `_OTHER`; aligned with the inbound API Gateway; `credential_mode` is `config` or `request_ref`, see [ADR-0022](ADR/0022-request-secret-refs.md), and `unknown` before the upstream resolves)
-- `oagw_request_duration_seconds{host, http.route, phase}` — histogram (`phase`: `total` from request start to the response head or the gateway error, the body not included; `resolve` for the upstream and route lookup; `auth` for the auth plugin; a request that does not resolve records `resolve` with `host` and `http.route` set to `unknown`)
+- `oagw_request_duration_seconds{host, http.route, phase}` — histogram (`phase`: `total` from request start to the response head or the gateway error, the body not included; `resolve` for the upstream and route lookup; `auth` for the auth plugin; `sign` for its signing phase ([ADR-0023](ADR/0023-request-signing.md)), only for a plugin that signs; a request that does not resolve records `resolve` with `host` and `http.route` set to `unknown`)
 - `oagw_stream_duration_seconds{host, http.route, outcome}` — histogram, request start to the end of the response body (`outcome`: `completed` at the end of the body or once its `Content-Length` went through, `error` for an upstream failure or idle timeout, `shutdown` for a gateway stop, `cancelled` when the client went away); every upstream body, SSE or not; none for a response without a body
 - `oagw_requests_in_flight{host}` — gauge, from the start of the Data Plane pipeline until the response body ends, fails or is dropped (`host` `unknown` until the upstream is resolved)
 - `oagw_errors_total{host, http.route, error_type, credential_mode}` — counter (gateway errors, and `Cancelled`; upstream error responses are not errors here; `credential_mode` is `unknown` before the upstream resolves)
@@ -1145,3 +1151,4 @@ Structured JSON logs to stdout, ingested by centralized logging system (e.g., EL
 | [0020 Proxy Configuration Cache](./ADR/0020-proxy-config-cache.md) | `cpt-cf-oagw-tech-dependencies`, `cpt-cf-oagw-seq-proxy-flow` |
 | [0021 Named Upstream Credentials](./ADR/0021-upstream-credentials.md) (proposed) | `cpt-cf-oagw-fr-upstream-credentials`, `cpt-cf-oagw-seq-proxy-flow` |
 | [0022 Per-Request Secret References](./ADR/0022-request-secret-refs.md) (proposed) | `cpt-cf-oagw-fr-request-secret-refs`, `cpt-cf-oagw-seq-proxy-flow` |
+| [0023 Late Request Signing for Auth Plugins](./ADR/0023-request-signing.md) (proposed) | `cpt-cf-oagw-component-model`, `cpt-cf-oagw-seq-proxy-flow` |

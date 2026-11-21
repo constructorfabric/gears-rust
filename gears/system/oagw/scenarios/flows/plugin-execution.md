@@ -2,13 +2,13 @@
 
 ## Overview
 
-Plugins execute in Data Plane during proxy request processing. Three plugin types execute in strict order: Auth → Guards → Transform → Proxy Call → Transform.
+Plugins execute in Data Plane during proxy request processing. Three plugin types execute in strict order: Auth → Guards → Transform → Auth signing → Proxy Call → Transform.
 
 ## Plugin Types
 
 ### AuthPlugin
 - **Purpose**: Inject authentication credentials
-- **Execution**: Once per request, before guards
+- **Execution**: Once per request, before guards; the optional signing phase runs once more on the final request, right before the proxy call ([ADR-0023](../../docs/ADR/0023-request-signing.md))
 - **Can terminate**: No (always succeeds or errors)
 - **Examples**: API key, OAuth2, Bearer token
 
@@ -35,9 +35,11 @@ Incoming Request
   ↓
 3. Transform Plugins (modify request)
   ↓
-4. HTTP call to external service
+4. Auth Plugin signing phase (final URL and headers; only plugins that declare it)
   ↓
-5. Transform Plugins (modify response)
+5. HTTP call to external service
+  ↓
+6. Transform Plugins (modify response)
   ↓
 Response to Client
 ```

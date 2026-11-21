@@ -19,6 +19,10 @@ pub(crate) mod secret_ref;
 mod secret_ref_tests;
 /// Data-plane service implementation.
 pub(crate) mod service;
+/// The auth plugin's signing phase (ADR-0023).
+pub(crate) mod signing;
+#[cfg(test)]
+mod signing_tests;
 /// Lifecycle management for streamed (SSE) response bodies.
 pub(crate) mod streaming;
 /// WebSocket tunnel relay.

@@ -32,6 +32,7 @@
   - [6. Acceptance Criteria](#6-acceptance-criteria)
   - [7. Additional Context](#7-additional-context)
     - [Auth Plugin Credential Resolution](#auth-plugin-credential-resolution)
+    - [Auth Plugin Request Signing](#auth-plugin-request-signing)
     - [Scope Boundaries](#scope-boundaries)
     - [Performance Considerations](#performance-considerations)
     - [Usability Considerations](#usability-considerations)
@@ -77,7 +78,7 @@ Adheres to `cpt-cf-oagw-principle-plugin-immutable` (plugins immutable after cre
 
 - **PRD**: [PRD.md](../PRD.md)
 - **Design**: [DESIGN.md](../DESIGN.md)
-- **ADR**: [0003-plugin-system.md](../ADR/0003-plugin-system.md), [0009-storage-schema.md](../ADR/0009-storage-schema.md)
+- **ADR**: [0003-plugin-system.md](../ADR/0003-plugin-system.md), [0009-storage-schema.md](../ADR/0009-storage-schema.md), [0023-request-signing.md](../ADR/0023-request-signing.md)
 - **Requirements**: `cpt-cf-oagw-fr-plugin-system`, `cpt-cf-oagw-fr-builtin-plugins`, `cpt-cf-oagw-fr-auth-injection`, `cpt-cf-oagw-nfr-credential-isolation`, `cpt-cf-oagw-nfr-starlark-sandbox`
 - **Design elements**: `cpt-cf-oagw-component-model`, `cpt-cf-oagw-db-schema`, `cpt-cf-oagw-adr-plugin-system`, `cpt-cf-oagw-adr-storage-schema`
 - **Dependencies**: `cpt-cf-oagw-feature-domain-foundation`
@@ -334,7 +335,7 @@ Adheres to `cpt-cf-oagw-principle-plugin-immutable` (plugins immutable after cre
 
 - [ ] `p1` - **ID**: `cpt-cf-oagw-dod-plugin-traits`
 
-The system **MUST** define `AuthPlugin`, `GuardPlugin`, and `TransformPlugin` async traits in `oagw-sdk`. Each trait **MUST** include `id()`, `plugin_type()`, and type-specific methods (`authenticate`, `guard_request`/`guard_response`, `transform_request`/`transform_response`/`transform_error`). Traits **MUST** be `Send + Sync` for async runtime compatibility.
+The system **MUST** define `AuthPlugin`, `GuardPlugin`, and `TransformPlugin` async traits in `oagw-sdk`. Each trait **MUST** include `id()`, `plugin_type()`, and type-specific methods (`authenticate`, `guard_request`/`guard_response`, `transform_request`/`transform_response`/`transform_error`). `AuthPlugin` **MUST** also offer an optional `sign` phase, enabled by a `signs` capability flag that defaults to `false` ([ADR-0023](../ADR/0023-request-signing.md)). Traits **MUST** be `Send + Sync` for async runtime compatibility.
 
 **Implements**:
 - `cpt-cf-oagw-flow-plugin-bind`
@@ -435,7 +436,11 @@ The system **MUST** mark unlinked custom plugins with `gc_eligible_at = NOW() + 
 
 Auth plugins do not store credentials directly. At proxy request time, the auth plugin reads the `secret_ref` from `auth_config` (e.g., `cred://partner-openai-key`) and resolves it via `cred_store`. The `cred_store` gear enforces tenant visibility — OAGW receives secret material only if the current tenant has access. If resolution fails, OAGW returns `401 AuthenticationFailed`, or `500 SecretNotFound` when the secret does not exist. Errors and logs name the auth config key, never the reference.
 
-An auth plugin does not see the outbound headers: it returns the headers to set, and the proxy sets them on the request, each replacing the lines of that name. The client's other headers reach the upstream as sent, repeated and non-UTF-8 ones included. A header the plugin returns that is not a valid name or value fails the request.
+In `authenticate`, an auth plugin does not see the outbound headers: it returns the headers to set, and the proxy sets them on the request, each replacing the lines of that name. The client's other headers reach the upstream as sent, repeated and non-UTF-8 ones included. A header the plugin returns that is not a valid name or value fails the request.
+
+### Auth Plugin Request Signing
+
+An auth plugin can also sign the request ([ADR-0023](../ADR/0023-request-signing.md)). When its `signs` flag is `true`, its `sign` phase runs once per request, as the last step before the request is sent: after header rules, transforms, endpoint selection, the `Host` header, rate limits and the URL build, on the HTTP and WebSocket paths, and after the upstream engine's own header sanitization, so it sees only header lines the engine sends unchanged. It gets the method, the URL parts (scheme, host, port, path and query as sent), every header line as sent (repeated names keep all lines, in order; values as bytes), the body (the buffered bytes, a streamed marker, or an empty body for a WebSocket handshake), the upstream's `auth.config` and the caller's security context. It returns headers to set, each replacing the lines of that name and marked sensitive, and a query change: keep (the default), remove, or replace with a query sent exactly as returned. Headers the gateway sets or strips itself (`Host`, `Content-Length`, hop-by-hop, forwarding, `X-OAGW-*`) or the engine drops (`Expect`, `Proxy-Connection`, `HTTP2-Settings`) are refused, and so is a name set twice. A signing error or an output the gateway cannot send stops the request before anything reaches the upstream, with the same mapping as an `authenticate` error: 401 `AUTH_PLUGIN_FAILED` or `AUTH_PLUGIN_INTERNAL`, 500 `SecretNotFound`, or 400 `INVALID_PLUGIN_CONFIG`. The built-in plugins (`noop`, `apikey`, `oauth2_client_cred`, `oauth2_client_cred_basic`) keep the default `signs` of `false`, so the phase is skipped for them. `request_ref` mode runs no auth plugin and therefore no signing.
 
 ### Scope Boundaries
 

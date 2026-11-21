@@ -109,6 +109,8 @@ Incoming Request
   → Return to client
 ```
 
+Amended by [ADR-0023](./0023-request-signing.md): an auth plugin may also sign the request. Its optional signing phase runs last, after transforms, endpoint selection and the URL build, right before the HTTP call or WebSocket handshake.
+
 Upstream plugins execute before route plugins. Plugin definitions are immutable after creation; updates are performed by creating a new plugin version and re-binding references.
 
 ### Built-in Plugins
@@ -363,6 +365,7 @@ Circuit breaker is a core gateway resilience capability (configured as core poli
 - **PRD**: [PRD.md](../PRD.md)
 - **DESIGN**: [DESIGN.md](../DESIGN.md)
 - **Related ADR**: [ADR: Component Architecture](./0001-component-architecture.md)
+- **Amended by**: [ADR: Late Request Signing for Auth Plugins](./0023-request-signing.md)
 
 This decision directly addresses the following requirements or design elements:
 

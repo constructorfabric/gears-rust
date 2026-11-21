@@ -30,7 +30,7 @@ pub mod key {
     /// Where the injected API key came from (`config`, `request_ref`;
     /// ADR-0022). `unknown` before the upstream resolves.
     pub const CREDENTIAL_MODE: &str = "credential_mode";
-    /// Pipeline phase for duration histogram (`total`, `resolve`, `auth`; future: `guard`, `upstream`, …).
+    /// Pipeline phase for duration histogram (`total`, `resolve`, `auth`, `sign`; future: `guard`, `upstream`, …).
     pub const PHASE: &str = "phase";
     /// Registry instance kind (`upstream`, `route`).
     pub const KIND: &str = "kind";
@@ -359,6 +359,9 @@ pub mod phase {
     pub const AUTH: &str = "auth";
     /// Time spent resolving the upstream and route (`resolve_proxy_target`).
     pub const RESOLVE: &str = "resolve";
+    /// Time spent in the auth plugin's signing phase (ADR-0023), recorded
+    /// only for a plugin that signs.
+    pub const SIGN: &str = "sign";
 }
 
 /// Sentinel for sites that observe a request before host/path resolution.

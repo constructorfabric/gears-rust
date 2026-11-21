@@ -80,6 +80,7 @@ pub struct AppHarnessBuilder {
     tenant_resolver: Option<MockTenantResolverClient>,
     metrics: Option<Arc<dyn crate::domain::ports::OagwMetricsPort>>,
     transform_plugins: Vec<(String, Arc<dyn crate::domain::plugin::TransformPlugin>)>,
+    auth_plugins: Vec<(String, Arc<dyn crate::domain::plugin::AuthPlugin>)>,
     streaming_idle_timeout: Option<Duration>,
     upstream_ssrf_policy: bool,
 }
@@ -110,6 +111,18 @@ impl AppHarnessBuilder {
         plugin: Arc<dyn crate::domain::plugin::TransformPlugin>,
     ) -> Self {
         self.transform_plugins.push((plugin_id.to_owned(), plugin));
+        self
+    }
+
+    /// Register an auth plugin under `plugin_id`, replacing a built-in of
+    /// that id: writes accept only built-in auth plugin ids.
+    #[cfg(test)]
+    pub(crate) fn with_auth_plugin(
+        mut self,
+        plugin_id: &str,
+        plugin: Arc<dyn crate::domain::plugin::AuthPlugin>,
+    ) -> Self {
+        self.auth_plugins.push((plugin_id.to_owned(), plugin));
         self
     }
 
@@ -209,6 +222,9 @@ impl AppHarnessBuilder {
         }
         for (plugin_id, plugin) in self.transform_plugins {
             dp_builder = dp_builder.with_transform_plugin(&plugin_id, plugin);
+        }
+        for (plugin_id, plugin) in self.auth_plugins {
+            dp_builder = dp_builder.with_auth_plugin(&plugin_id, plugin);
         }
         if let Some(timeout) = self.streaming_idle_timeout {
             dp_builder = dp_builder.with_streaming_idle_timeout(timeout);
