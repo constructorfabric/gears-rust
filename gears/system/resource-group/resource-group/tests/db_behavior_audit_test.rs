@@ -326,8 +326,8 @@ async fn trace_update_group() {
         .count();
     assert_eq!(
         preflight_reads,
-        2,
-        "one scoped group read and one dictionary read:\n{}",
+        3,
+        "the owner prefetch, one scoped group read and one dictionary read:\n{}",
         rec.dump()
     );
     assert!(

@@ -767,7 +767,7 @@ async fn a_write_on_one_replica_is_seen_on_another(hub: &ClientHub) {
             &Unattended,
             upstreams,
             &routes,
-            root,
+            Some(root),
         )
         .await
         .unwrap();
@@ -847,7 +847,7 @@ async fn a_reconcile_run_waits_for_the_change_log_once() {
         &Unattended,
         &upstreams,
         &routes,
-        root,
+        Some(root),
     )
     .await
     .unwrap();

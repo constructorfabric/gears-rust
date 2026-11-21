@@ -83,6 +83,12 @@ impl ProvisioningCounts {
             && self.routes.failed == 0
             && self.upstreams.kept == 0
     }
+
+    /// A clean run that wrote nothing: every row already matched.
+    pub(crate) fn changed_nothing(&self) -> bool {
+        let untouched = |t: &Tally| t.created == 0 && t.updated == 0 && t.removed == 0;
+        self.is_clean() && untouched(&self.upstreams) && untouched(&self.routes)
+    }
 }
 
 /// Between the writes of a run: whether to go on.
@@ -149,10 +155,12 @@ async fn bounded_write<T>(
     }
 }
 
-/// A run nothing else coordinates (the in-memory backend).
+/// A run nothing coordinates or cancels.
+#[cfg(test)]
 #[domain_model]
 pub(crate) struct Unattended;
 
+#[cfg(test)]
 impl RunControl for Unattended {}
 
 /// Make the registry-managed upstreams and routes match the instances other
@@ -174,7 +182,7 @@ pub(crate) async fn reconcile_registry(
     control: &dyn RunControl,
     upstreams: &[ProvisionedUpstream],
     routes: &[ProvisionedRoute],
-    root_tenant_id: Uuid,
+    root_tenant_id: Option<Uuid>,
 ) -> anyhow::Result<ProvisioningCounts> {
     // Boxed: the run's future is large, and the scope would otherwise move
     // it on the stack.
@@ -196,7 +204,7 @@ async fn reconcile(
     control: &dyn RunControl,
     upstreams: &[ProvisionedUpstream],
     routes: &[ProvisionedRoute],
-    root_tenant_id: Uuid,
+    root_tenant_id: Option<Uuid>,
 ) -> anyhow::Result<ProvisioningCounts> {
     let mut run = Run {
         cp,
@@ -230,7 +238,7 @@ async fn reconcile(
         root_tenant_id,
         &stored_upstreams,
         &stored_routes,
-    );
+    )?;
 
     // -- Phase 3: removals --
     let recreated = run
@@ -441,15 +449,16 @@ impl Run<'_> {
         self.tally(kind).failed += 1;
     }
 
-    /// Phase 2: the checks that read nothing; every failure skips.
+    /// Phase 2: the checks that read nothing; every failure skips. Only an
+    /// instance with no tenant and no root tenant fails the run.
     fn content_check<'c>(
         &mut self,
         upstreams: &'c [ProvisionedUpstream],
         routes: &'c [ProvisionedRoute],
-        root_tenant_id: Uuid,
+        root_tenant_id: Option<Uuid>,
         stored_upstreams: &HashMap<RowKey, Upstream>,
         stored_routes: &HashMap<RowKey, Route>,
-    ) -> Checked<'c> {
+    ) -> anyhow::Result<Checked<'c>> {
         let mut checked = Checked {
             upstreams: Vec::new(),
             routes: Vec::new(),
@@ -458,7 +467,7 @@ impl Run<'_> {
         };
 
         for u in upstreams {
-            let Some(key) = instance_key(u.request.id, u.tenant_id, root_tenant_id) else {
+            let Some(key) = instance_key(u.request.id, u.tenant_id, root_tenant_id)? else {
                 self.skip(
                     Kind::Upstream,
                     None,
@@ -508,7 +517,7 @@ impl Run<'_> {
             .retain(|(key, _, _)| !duplicated.iter().any(|(k, _)| k == key));
 
         for r in routes {
-            let Some(key) = instance_key(r.request.id, r.tenant_id, root_tenant_id) else {
+            let Some(key) = instance_key(r.request.id, r.tenant_id, root_tenant_id)? else {
                 self.skip(
                     Kind::Route,
                     None,
@@ -574,7 +583,7 @@ impl Run<'_> {
         checked
             .routes
             .retain(|(key, _)| !skipped.iter().any(|(k, _)| k == key));
-        checked
+        Ok(checked)
     }
 
     /// Whether the next write may go ahead; marks the run stopped if not.
@@ -1191,10 +1200,36 @@ fn key_of(tenant_id: Uuid, id: Uuid) -> RowKey {
     RowKey { tenant_id, id }
 }
 
-/// The row key of a registry instance: its GTS instance UUID in its tenant,
-/// or the root tenant when the instance names none. `None` without an ID.
-fn instance_key(id: Option<Uuid>, tenant_id: Option<Uuid>, root_tenant_id: Uuid) -> Option<RowKey> {
-    Some(key_of(tenant_id.unwrap_or(root_tenant_id), id?))
+/// Whether an instance names no tenant, so the run needs the root tenant,
+/// which may not exist yet at startup (account-management creates it).
+pub(crate) fn needs_root_tenant(
+    upstreams: &[ProvisionedUpstream],
+    routes: &[ProvisionedRoute],
+) -> bool {
+    upstreams.iter().any(|u| u.tenant_id.is_none()) || routes.iter().any(|r| r.tenant_id.is_none())
+}
+
+/// The tenant of a registry instance: its own, or the root tenant when it
+/// names none. Without a resolved root such an instance is an error, never
+/// a row of some placeholder tenant.
+pub(crate) fn instance_tenant(
+    tenant_id: Option<Uuid>,
+    root_tenant_id: Option<Uuid>,
+) -> anyhow::Result<Uuid> {
+    tenant_id.or(root_tenant_id).ok_or_else(|| {
+        anyhow::anyhow!("A registry instance names no tenant and the root tenant is not resolved")
+    })
+}
+
+/// The row key of a registry instance: its GTS instance UUID in its
+/// [`instance_tenant`]. `None` without an ID.
+fn instance_key(
+    id: Option<Uuid>,
+    tenant_id: Option<Uuid>,
+    root_tenant_id: Option<Uuid>,
+) -> anyhow::Result<Option<RowKey>> {
+    let tenant_id = instance_tenant(tenant_id, root_tenant_id)?;
+    Ok(id.map(|id| key_of(tenant_id, id)))
 }
 
 /// The full replacement that makes a stored upstream match `req`.
@@ -1236,24 +1271,34 @@ fn provisioning_failed(kind: Kind, key: RowKey, error: &DomainError) -> anyhow::
     )
 }
 
-/// Log what a run did ("Type provisioning complete").
+/// Log what a run did ("Type provisioning complete"): at `debug` when it
+/// changed nothing (an in-memory re-check), at `info` otherwise.
 pub(crate) fn log_counts(counts: &ProvisioningCounts) {
-    info!(
-        upstreams_created = counts.upstreams.created,
-        upstreams_updated = counts.upstreams.updated,
-        upstreams_unchanged = counts.upstreams.unchanged,
-        upstreams_removed = counts.upstreams.removed,
-        upstreams_kept = counts.upstreams.kept,
-        upstreams_failed = counts.upstreams.failed,
-        routes_created = counts.routes.created,
-        routes_updated = counts.routes.updated,
-        routes_unchanged = counts.routes.unchanged,
-        routes_removed = counts.routes.removed,
-        routes_failed = counts.routes.failed,
-        passes = counts.passes,
-        stopped = counts.stopped,
-        "Type provisioning complete"
-    );
+    macro_rules! log_at {
+        ($level:ident) => {
+            $level!(
+                upstreams_created = counts.upstreams.created,
+                upstreams_updated = counts.upstreams.updated,
+                upstreams_unchanged = counts.upstreams.unchanged,
+                upstreams_removed = counts.upstreams.removed,
+                upstreams_kept = counts.upstreams.kept,
+                upstreams_failed = counts.upstreams.failed,
+                routes_created = counts.routes.created,
+                routes_updated = counts.routes.updated,
+                routes_unchanged = counts.routes.unchanged,
+                routes_removed = counts.routes.removed,
+                routes_failed = counts.routes.failed,
+                passes = counts.passes,
+                stopped = counts.stopped,
+                "Type provisioning complete"
+            )
+        };
+    }
+    if counts.changed_nothing() {
+        log_at!(debug);
+    } else {
+        log_at!(info);
+    }
 }
 
 #[cfg(test)]

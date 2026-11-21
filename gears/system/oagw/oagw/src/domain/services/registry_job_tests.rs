@@ -179,6 +179,7 @@ impl Harness {
     fn start(&self, cancel: &CancellationToken) -> tokio::task::JoinHandle<()> {
         tokio::spawn(run_registry_loop(
             self.job.clone(),
+            Duration::ZERO,
             RECHECK,
             self.status.clone(),
             cancel.clone(),
@@ -199,7 +200,7 @@ impl Harness {
 
     fn hash(&self) -> String {
         let (upstreams, routes) = self.registry.content.lock().unwrap().clone();
-        content_hash(&upstreams, &routes, self.root)
+        content_hash(&upstreams, &routes, Some(self.root)).unwrap()
     }
 }
 
@@ -521,4 +522,296 @@ async fn a_losing_pod_polls_until_the_winners_hash_appears() {
     assert!(h.tags().await.is_empty() && h.state.inner.lease_owner().is_none());
     cancel.cancel();
     task.await.unwrap();
+}
+
+/// The root tenant is only the default of instances that name no tenant: an
+/// empty registry, or one whose instances all name theirs, never asks the
+/// tenant resolver, on either backend; an upstream or a route without a
+/// tenant does, and is written under the root tenant.
+///
+/// ADR-0018: PERS-PROV-019.
+#[tokio::test]
+async fn the_root_tenant_is_resolved_only_for_instances_that_name_none() {
+    use crate::domain::test_support::UnauthorizedTenantResolver;
+
+    for gated in [true, false] {
+        let mut h = Harness::new(None, Counted::new());
+        let resolver = h.job.tenant_resolver.clone();
+        h.job.tenant_resolver = Arc::new(UnauthorizedTenantResolver);
+        if !gated {
+            h.job.gate = None;
+        }
+        let cancel = CancellationToken::new();
+
+        *h.registry.content.lock().unwrap() = (vec![], vec![]);
+        h.job
+            .run_once(&cancel)
+            .await
+            .expect("an empty registry needs no root tenant");
+
+        *h.registry.content.lock().unwrap() = registry_instances(h.root);
+        h.job
+            .run_once(&cancel)
+            .await
+            .expect("instances that name their tenant need no root tenant");
+        let upstream_id = h.registry.content.lock().unwrap().0[0].request.id.unwrap();
+        h.cp.get_upstream(&provisioning_ctx(h.root).unwrap(), upstream_id)
+            .await
+            .expect("the upstream is provisioned");
+
+        for unnamed in ["upstream", "route"] {
+            {
+                let mut content = h.registry.content.lock().unwrap();
+                content.0[0].tenant_id = Some(h.root);
+                content.1[0].tenant_id = Some(h.root);
+                content.0[0].request.tags = vec![unnamed.into()];
+                match unnamed {
+                    "upstream" => content.0[0].tenant_id = None,
+                    _ => content.1[0].tenant_id = None,
+                }
+            }
+            let err = h
+                .job
+                .run_once(&cancel)
+                .await
+                .expect_err("an instance without a tenant needs the root tenant");
+            assert!(
+                format!("{err:#}").contains("Failed to resolve root tenant"),
+                "gated: {gated}, {unnamed}: {err:#}"
+            );
+        }
+
+        // The route alone names no tenant; with the root resolved it is
+        // written under the root tenant.
+        h.job.tenant_resolver = resolver;
+        h.job
+            .run_once(&cancel)
+            .await
+            .expect("the root tenant resolves");
+        let route_id = h.registry.content.lock().unwrap().1[0].request.id.unwrap();
+        h.cp.get_route(&provisioning_ctx(h.root).unwrap(), route_id)
+            .await
+            .expect("the route is provisioned under the root tenant");
+        assert_eq!(h.tags().await, ["route"], "gated: {gated}");
+    }
+}
+
+/// A first wait delays only the task's first run; the re-checks follow at
+/// their own interval. A stop during the first wait ends the task without
+/// a run.
+///
+/// ADR-0018: PERS-LOOP-011.
+#[tokio::test(start_paused = true)]
+async fn a_first_wait_delays_the_first_run() {
+    const FIRST_WAIT: Duration = Duration::from_secs(30);
+    let mut h = Harness::new(None, Counted::new());
+    h.job.gate = None;
+    let attempts = || h.registry.listings.load(Ordering::SeqCst);
+    let cancel = CancellationToken::new();
+    let task = tokio::spawn(run_registry_loop(
+        h.job.clone(),
+        FIRST_WAIT,
+        RECHECK,
+        h.status.clone(),
+        cancel.clone(),
+    ));
+    tokio::time::sleep(FIRST_WAIT - Duration::from_secs(1)).await;
+    assert_eq!(attempts(), 0, "not before the first wait");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        (attempts(), h.status.get()),
+        (1, ProvisioningStatus::Settled)
+    );
+    tokio::time::sleep(RECHECK - Duration::from_secs(2)).await;
+    assert_eq!(attempts(), 1, "the re-check waits for the interval");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(attempts(), 2, "then re-checks");
+    cancel.cancel();
+    task.await.unwrap();
+
+    let cancel = CancellationToken::new();
+    let task = tokio::spawn(run_registry_loop(
+        h.job.clone(),
+        FIRST_WAIT,
+        RECHECK,
+        h.status.clone(),
+        cancel.clone(),
+    ));
+    settle().await;
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_millis(10), task)
+        .await
+        .expect("a stop ends the first wait")
+        .unwrap();
+    assert_eq!(attempts(), 2, "no run after the stop");
+    assert_eq!(
+        h.status.get(),
+        ProvisioningStatus::Settled,
+        "a stop before the run leaves the status"
+    );
+}
+
+/// The in-memory write path, which cancels `cancel` after its first write,
+/// or never finishes that write when `hang` is set.
+struct StopAtFirstWrite {
+    inner: Arc<dyn crate::domain::services::RegistryProvisioner>,
+    cancel: CancellationToken,
+    hang: bool,
+}
+
+#[async_trait]
+impl crate::domain::services::RegistryProvisioner for StopAtFirstWrite {
+    async fn get_upstream(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        id: Uuid,
+    ) -> Result<crate::domain::model::Upstream, DomainError> {
+        self.inner.get_upstream(ctx, id).await
+    }
+    async fn get_route(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        id: Uuid,
+    ) -> Result<crate::domain::model::Route, DomainError> {
+        self.inner.get_route(ctx, id).await
+    }
+    async fn list_routes(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        upstream_id: Option<Uuid>,
+        query: &crate::domain::model::ListQuery,
+    ) -> Result<Vec<crate::domain::model::Route>, DomainError> {
+        self.inner.list_routes(ctx, upstream_id, query).await
+    }
+    async fn create_registry_upstream(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        req: crate::domain::model::CreateUpstreamRequest,
+    ) -> Result<crate::domain::model::Upstream, DomainError> {
+        if self.hang {
+            std::future::pending::<()>().await;
+        }
+        let created = self.inner.create_registry_upstream(ctx, req).await;
+        self.cancel.cancel();
+        created
+    }
+    async fn update_registry_upstream(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        id: Uuid,
+        req: crate::domain::model::UpdateUpstreamRequest,
+    ) -> Result<crate::domain::model::Upstream, DomainError> {
+        self.inner.update_registry_upstream(ctx, id, req).await
+    }
+    fn check_registry_upstream(
+        &self,
+        req: &crate::domain::model::CreateUpstreamRequest,
+    ) -> Result<String, DomainError> {
+        self.inner.check_registry_upstream(req)
+    }
+    async fn create_registry_route(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        req: crate::domain::model::CreateRouteRequest,
+        upstream: crate::domain::services::UpstreamCheck,
+    ) -> Result<crate::domain::model::Route, DomainError> {
+        self.inner.create_registry_route(ctx, req, upstream).await
+    }
+    async fn update_registry_route(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        id: Uuid,
+        upstream_id: Uuid,
+        req: crate::domain::model::UpdateRouteRequest,
+        upstream: crate::domain::services::UpstreamCheck,
+    ) -> Result<crate::domain::model::Route, DomainError> {
+        self.inner
+            .update_registry_route(ctx, id, upstream_id, req, upstream)
+            .await
+    }
+    async fn delete_registry_route(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        id: Uuid,
+    ) -> Result<(), DomainError> {
+        self.inner.delete_registry_route(ctx, id).await
+    }
+    async fn delete_registry_upstream_if_unused(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        id: Uuid,
+    ) -> Result<crate::domain::repo::DeleteOutcome, DomainError> {
+        self.inner.delete_registry_upstream_if_unused(ctx, id).await
+    }
+    async fn registry_upstreams(&self) -> Result<Vec<crate::domain::model::Upstream>, DomainError> {
+        self.inner.registry_upstreams().await
+    }
+    async fn registry_routes(&self) -> Result<Vec<crate::domain::model::Route>, DomainError> {
+        self.inner.registry_routes().await
+    }
+}
+
+/// In memory, a stop mid-run ends the run at the next write: the upstream
+/// written before it stays, the route is not written, and the status turns
+/// `Pending` (from the `Settled` of an earlier run) so the next `start`
+/// reconciles at once.
+///
+/// ADR-0018: PERS-LOOP-006.
+#[tokio::test(start_paused = true)]
+async fn in_memory_a_stop_mid_run_ends_between_writes_and_leaves_pending() {
+    let mut h = Harness::new(None, Counted::new());
+    let cancel = CancellationToken::new();
+    h.job.gate = None;
+    h.job.cp = Arc::new(StopAtFirstWrite {
+        inner: h.job.cp.clone(),
+        cancel: cancel.clone(),
+        hang: false,
+    });
+    h.status.set(ProvisioningStatus::Settled);
+    let task = h.start(&cancel);
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("the task ends on stop")
+        .unwrap();
+
+    let (upstream_id, route_id) = {
+        let content = h.registry.content.lock().unwrap();
+        (
+            content.0[0].request.id.unwrap(),
+            content.1[0].request.id.unwrap(),
+        )
+    };
+    let ctx = provisioning_ctx(h.root).unwrap();
+    h.cp.get_upstream(&ctx, upstream_id)
+        .await
+        .expect("the write before the stop stays");
+    assert!(
+        h.cp.get_route(&ctx, route_id).await.is_err(),
+        "no write after the stop"
+    );
+    assert_eq!(h.runs(), ["not_clean"]);
+    assert_eq!(h.status.get(), ProvisioningStatus::Pending);
+}
+
+/// A task aborted in the middle of a write (the shutdown deadline) leaves
+/// the status `Pending` too.
+///
+/// ADR-0018: PERS-LOOP-006.
+#[tokio::test(start_paused = true)]
+async fn an_aborted_run_leaves_pending() {
+    let mut h = Harness::new(None, Counted::new());
+    let cancel = CancellationToken::new();
+    h.job.gate = None;
+    h.job.cp = Arc::new(StopAtFirstWrite {
+        inner: h.job.cp.clone(),
+        cancel: cancel.clone(),
+        hang: true,
+    });
+    h.status.set(ProvisioningStatus::Settled);
+    let task = h.start(&cancel);
+    settle().await;
+    assert_eq!(h.status.get(), ProvisioningStatus::Settled, "mid-write");
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(h.status.get(), ProvisioningStatus::Pending);
 }

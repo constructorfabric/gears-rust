@@ -33,7 +33,7 @@ use resource_group_sdk::models::{
 use resource_group_sdk::{GROUP_TYPE_ID, TENANT_GROUP_TYPE_ID};
 use toolkit_db::secure::{DBRunner, Db, TxConfig};
 use toolkit_odata::{ODataQuery, Page};
-use toolkit_security::{SecurityContext, pep_properties};
+use toolkit_security::{AccessScope, SecurityContext, pep_properties};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -140,6 +140,14 @@ pub struct GroupService<GR: GroupRepositoryTrait> {
     /// Defaults to [`TenantTypes::default`]; overridden from the gear config
     /// through `with_tenant_types`.
     tenant_types: TenantTypes,
+}
+
+/// An operation's access to one existing group (`GroupService::point_access`).
+struct PointAccess {
+    /// The PDP scope the operation runs under.
+    scope: AccessScope,
+    /// The group, as read under `scope`.
+    group: GroupRecord,
 }
 
 /// The isolation level one `update_group` attempt opens its transaction at.
@@ -428,22 +436,130 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-create-group:p1:inst-create-group-2
     }
 
+    /// Access to one existing group for `action`: the PDP scope, and the
+    /// group as read under it.
+    ///
+    /// Prefetches the group's tenant and sends it as `owner_tenant_id`: RG
+    /// has no tenant closure, so a PDP needs the owner to decide on a single
+    /// resource (S09-S11 and rules R1-R4 in
+    /// `docs/arch/authorization/AUTHZ_USAGE_SCENARIOS.md`). Callers still run
+    /// the operation under the returned scope.
+    ///
+    /// Every denial (PDP deny, a scope that matches nothing or excludes the
+    /// group, an unadvertised predicate) answers 404 when the caller may not
+    /// `get` the group, so a group it cannot see looks like an unknown id, and
+    /// 403 when it may see the group but not perform `action` (feature 0005,
+    /// JWT request flow).
+    async fn point_access(
+        &self,
+        ctx: &SecurityContext,
+        action: &str,
+        group_id: Uuid,
+    ) -> Result<PointAccess, DomainError> {
+        // The prefetch only fills the PDP request; it never decides access.
+        let owner_tenant_id = {
+            let conn = self.db.conn()?;
+            self.group_repo
+                .find_tenant_id(&conn, group_id)
+                .await?
+                .ok_or_else(|| DomainError::group_not_found(group_id))?
+        };
+        let reason = match self
+            .owner_scope(ctx, action, group_id, owner_tenant_id)
+            .await
+        {
+            Ok(scope) => match self.read_under(&scope, group_id).await? {
+                Some(group) => return Ok(PointAccess { scope, group }),
+                None => "the permitted scope excludes the group".to_owned(),
+            },
+            Err(DomainError::AccessDenied { message }) => message,
+            Err(e) => return Err(e),
+        };
+        let visible = action != "get" && self.can_get(ctx, group_id, owner_tenant_id).await?;
+        debug!(
+            group_id = %group_id,
+            action,
+            owner_tenant_id = %owner_tenant_id,
+            subject_id = %ctx.subject_id(),
+            subject_tenant_id = %ctx.subject_tenant_id(),
+            visible,
+            reason = %reason,
+            "resource-group point access denied"
+        );
+        if visible {
+            Err(DomainError::AccessDenied { message: reason })
+        } else {
+            Err(DomainError::group_not_found(group_id))
+        }
+    }
+
+    /// The PDP scope for `action` on the group owned by `owner_tenant_id`.
+    async fn owner_scope(
+        &self,
+        ctx: &SecurityContext,
+        action: &str,
+        group_id: Uuid,
+        owner_tenant_id: Uuid,
+    ) -> Result<AccessScope, DomainError> {
+        self.enforcer
+            .access_scope_with(
+                ctx,
+                &RG_GROUP_RESOURCE,
+                action,
+                Some(group_id),
+                &AccessRequest::new()
+                    .resource_property(pep_properties::OWNER_TENANT_ID, owner_tenant_id),
+            )
+            .await
+            .map_err(DomainError::from)
+    }
+
+    /// The group, if `scope` lets the caller see it.
+    async fn read_under(
+        &self,
+        scope: &AccessScope,
+        group_id: Uuid,
+    ) -> Result<Option<GroupRecord>, DomainError> {
+        let conn = self.db.conn()?;
+        self.group_repo
+            .find_model_by_id_scoped(&conn, scope, group_id)
+            .await
+    }
+
+    /// Whether `get_group` would return the group to the caller.
+    async fn can_get(
+        &self,
+        ctx: &SecurityContext,
+        group_id: Uuid,
+        owner_tenant_id: Uuid,
+    ) -> Result<bool, DomainError> {
+        match self
+            .owner_scope(ctx, "get", group_id, owner_tenant_id)
+            .await
+        {
+            Ok(scope) => Ok(self.read_under(&scope, group_id).await?.is_some()),
+            Err(DomainError::AccessDenied { .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Get a resource group by ID (AuthZ-scoped).
     pub async fn get_group(
         &self,
         ctx: &SecurityContext,
         group_id: Uuid,
     ) -> Result<ResourceGroup, DomainError> {
-        let scope = self
-            .enforcer
-            .access_scope(ctx, &RG_GROUP_RESOURCE, "get", Some(group_id))
-            .await
-            .map_err(DomainError::from)?;
-        let conn = self.db.conn()?;
-        self.group_repo
-            .find_by_id(&conn, &scope, group_id)
-            .await?
-            .ok_or_else(|| DomainError::group_not_found(group_id))
+        let PointAccess { group, .. } = self.point_access(ctx, "get", group_id).await?;
+        Ok(ResourceGroup {
+            id: group.id,
+            code: group.code,
+            name: group.name,
+            hierarchy: GroupHierarchy {
+                parent_id: group.parent_id,
+                tenant_id: group.tenant_id,
+            },
+            metadata: group.metadata,
+        })
     }
 
     // @cpt-algo:cpt-cf-resource-group-algo-integration-auth-auth-mode-decision:p1
@@ -508,11 +624,15 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
         // @cpt-begin:cpt-cf-resource-group-flow-entity-hier-update-group:p1:inst-update-group-1
         // Actor sends PUT /api/resource-group/v1/groups/{group_id}
         // AuthZ gate: verify the caller can update this group (tenant check).
-        let scope = self
-            .enforcer
-            .access_scope(ctx, &RG_GROUP_RESOURCE, "update", Some(group_id))
-            .await
-            .map_err(DomainError::from)?;
+        // Also the pre-transaction read under the caller's scope, before any
+        // registry lookup, so a foreign id yields the same 404 as a missing
+        // group. The group's type is immutable; the transaction rechecks it
+        // in case the id was reused. Its current `parent_id` decides the
+        // transaction's isolation level below.
+        let PointAccess {
+            scope,
+            group: existing,
+        } = self.point_access(ctx, "update", group_id).await?;
 
         // Pre-validation (stateless, outside transaction).
         // Type is immutable on update — `UpdateGroupRequest` deliberately
@@ -525,26 +645,6 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
         let tenant_types = self.tenant_types.clone();
         let db = self.db.db();
         let group_repo = self.group_repo.clone();
-
-        // One pre-transaction read, serving two purposes.
-        //
-        // Read the group's immutable type before fetching and compiling its
-        // schema. Recheck the type in the transaction in case the ID was reused.
-        //
-        // The same row also carries the current `parent_id`, which decides
-        // the transaction's isolation level below. `conn` is scoped to this
-        // block so the pooled connection is back before the transaction asks
-        // for its own.
-        let existing = {
-            let conn = db
-                .conn()
-                .map_err(|e| DomainError::database(e.to_string()))?;
-            // A foreign ID must yield the same 404 as a missing group before any registry lookup.
-            group_repo
-                .find_model_by_id_scoped(&conn, &scope, group_id)
-                .await?
-                .ok_or_else(|| DomainError::group_not_found(group_id))?
-        };
 
         // Replacing or removing metadata needs the definition, including when
         // the replacement is absent: a derived schema may require metadata.
@@ -777,11 +877,7 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
         // Actor sends DELETE /api/resource-group/v1/groups/{group_id}?force={true|false}
         // AuthZ gate: verify the caller can delete this group (tenant check).
         // Runs outside the transaction since AuthZ is idempotent.
-        let scope = self
-            .enforcer
-            .access_scope(ctx, &RG_GROUP_RESOURCE, "delete", Some(group_id))
-            .await
-            .map_err(DomainError::from)?;
+        let scope = self.point_access(ctx, "delete", group_id).await?.scope;
         // @cpt-end:cpt-cf-resource-group-flow-entity-hier-delete-group:p1:inst-delete-group-1
 
         let db = self.db.db();
@@ -849,20 +945,11 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
         group_id: Uuid,
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupWithDepth>, DomainError> {
-        let scope = self
-            .enforcer
-            .access_scope(ctx, &RG_GROUP_RESOURCE, "list", Some(group_id))
-            .await
-            .map_err(DomainError::from)?;
+        // `point_access` reads the group under the scope, so a cross-tenant
+        // id answers 404 like a non-existent one rather than 200 with an
+        // empty page, which would leak the existence of cross-tenant roots.
+        let scope = self.point_access(ctx, "list", group_id).await?.scope;
         let conn = self.db.conn()?;
-        // Scope-aware preflight: a cross-tenant id must look the same as a
-        // non-existent id from the caller's viewpoint, otherwise we leak the
-        // existence of cross-tenant roots (random id → 404, foreign id → 200
-        // with empty page).
-        self.group_repo
-            .find_by_id(&conn, &scope, group_id)
-            .await?
-            .ok_or_else(|| DomainError::group_not_found(group_id))?;
         self.group_repo
             .get_descendants(&conn, &scope, group_id, query)
             .await
@@ -875,17 +962,9 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
         group_id: Uuid,
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupWithDepth>, DomainError> {
-        let scope = self
-            .enforcer
-            .access_scope(ctx, &RG_GROUP_RESOURCE, "list", Some(group_id))
-            .await
-            .map_err(DomainError::from)?;
+        // Scope-aware: see the comment in `get_group_descendants`.
+        let scope = self.point_access(ctx, "list", group_id).await?.scope;
         let conn = self.db.conn()?;
-        // Scope-aware preflight: see comment in `get_group_descendants`.
-        self.group_repo
-            .find_by_id(&conn, &scope, group_id)
-            .await?
-            .ok_or_else(|| DomainError::group_not_found(group_id))?;
         self.group_repo
             .get_ancestors(&conn, &scope, group_id, query)
             .await

@@ -404,6 +404,33 @@ impl GroupRepositoryTrait for GroupRepository {
         Self::model_to_record(db, model).await
     }
 
+    async fn find_tenant_id<C: DBRunner>(
+        &self,
+        db: &C,
+        id: Uuid,
+    ) -> Result<Option<Uuid>, DomainError> {
+        use sea_orm::{FromQueryResult, QuerySelect};
+
+        #[derive(FromQueryResult)]
+        struct Owner {
+            tenant_id: Uuid,
+        }
+
+        let scope = system_scope();
+        let rows: Vec<Owner> = ResourceGroupEntity::find()
+            .filter(rg_entity::Column::Id.eq(id))
+            .secure()
+            .scope_with(&scope)
+            .project_all(db, |q| {
+                q.select_only()
+                    .column(rg_entity::Column::TenantId)
+                    .into_model::<Owner>()
+            })
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+        Ok(rows.into_iter().next().map(|r| r.tenant_id))
+    }
+
     async fn find_model_by_id_for_update<C: DBRunner>(
         &self,
         db: &C,

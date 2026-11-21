@@ -988,7 +988,7 @@ mod tests {
             &Unattended,
             &upstreams,
             &routes,
-            root,
+            Some(root),
         )
         .await
         .unwrap();

@@ -3253,6 +3253,14 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
         self.inner.find_model_by_id(db, id).await
     }
 
+    async fn find_tenant_id<C: DBRunner>(
+        &self,
+        db: &C,
+        id: Uuid,
+    ) -> Result<Option<Uuid>, DomainError> {
+        self.inner.find_tenant_id(db, id).await
+    }
+
     async fn find_model_by_id_scoped<C: DBRunner>(
         &self,
         db: &C,
@@ -3772,4 +3780,293 @@ async fn group_update_escalates_to_serializable_on_concurrent_reparent() {
     assert_eq!(model.name, "Renamed");
 
     common::assert_closure_matches_parent_links(&conn).await;
+}
+
+// -- Point operations carry the prefetched owner tenant --
+
+/// How [`OwnerCheckingAuthZ`] refuses a single-resource request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refusal {
+    /// `decision: false`.
+    Deny,
+    /// A permit whose scope matches nothing.
+    EmptyScope,
+    /// A permit whose scope names another tenant, so it excludes the group.
+    ExcludingScope,
+    /// A permit with a predicate RG never advertised.
+    Unadvertised,
+    /// Every single-resource request fails to evaluate.
+    Fail,
+}
+
+/// PDP that, like `tr-authz-plugin` (R3), decides a single-resource request
+/// from `resource.properties.owner_tenant_id` and denies when it is absent:
+/// the owner's tenant may `get` and `list` the group, and `update` and
+/// `delete` it unless `read_only`; everything else is refused with
+/// `refusal`. Records the owner of every single-resource request it sees.
+struct OwnerCheckingAuthZ {
+    refusal: Refusal,
+    read_only: bool,
+    seen_owners: std::sync::Mutex<Vec<Option<String>>>,
+}
+
+impl OwnerCheckingAuthZ {
+    fn new(refusal: Refusal, read_only: bool) -> Arc<Self> {
+        Arc::new(Self {
+            refusal,
+            read_only,
+            seen_owners: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+}
+
+#[async_trait]
+impl authz_resolver_sdk::AuthZResolverApi for OwnerCheckingAuthZ {
+    async fn evaluate(
+        &self,
+        _ctx: toolkit_security::PlatformSecurityContext,
+        request: authz_resolver_sdk::EvaluationRequest,
+    ) -> Result<
+        authz_resolver_sdk::EvaluationResponse,
+        toolkit::api::canonical_prelude::CanonicalError,
+    > {
+        use authz_resolver_sdk::constraints::{
+            Constraint, InPredicate, InTenantSubtreePredicate, Predicate,
+        };
+        use authz_resolver_sdk::{EvaluationResponse, EvaluationResponseContext};
+        use toolkit::api::canonical_prelude::CanonicalError;
+        use toolkit_security::pep_properties::OWNER_TENANT_ID;
+
+        let subject = request
+            .subject
+            .properties
+            .get("tenant_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok());
+        let owner = request
+            .resource
+            .properties
+            .get(OWNER_TENANT_ID)
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        let allowed = if request.resource.id.is_some() {
+            self.seen_owners.lock().unwrap().push(owner.clone());
+            if self.refusal == Refusal::Fail {
+                return Err(CanonicalError::internal("PDP unavailable").create());
+            }
+            let own = owner.is_some() && owner == subject.map(|s| s.to_string());
+            let writes = matches!(request.action.name.as_str(), "update" | "delete");
+            own && !(writes && self.read_only)
+        } else {
+            subject.is_some()
+        };
+        let (decision, predicates) = match (allowed, subject, self.refusal) {
+            (true, Some(tid), _) => (
+                true,
+                vec![Predicate::In(InPredicate::new(OWNER_TENANT_ID, [tid]))],
+            ),
+            (false, _, Refusal::EmptyScope) => (
+                true,
+                vec![Predicate::In(InPredicate::new(
+                    OWNER_TENANT_ID,
+                    Vec::<Uuid>::new(),
+                ))],
+            ),
+            (false, _, Refusal::ExcludingScope) => (
+                true,
+                vec![Predicate::In(InPredicate::new(
+                    OWNER_TENANT_ID,
+                    [Uuid::now_v7()],
+                ))],
+            ),
+            (false, Some(tid), Refusal::Unadvertised) => (
+                true,
+                vec![Predicate::InTenantSubtree(InTenantSubtreePredicate::new(
+                    OWNER_TENANT_ID,
+                    tid,
+                ))],
+            ),
+            _ => (false, vec![]),
+        };
+        let constraints = if predicates.is_empty() {
+            vec![]
+        } else {
+            vec![Constraint { predicates }]
+        };
+        Ok(EvaluationResponse {
+            decision,
+            context: EvaluationResponseContext {
+                constraints,
+                deny_reason: None,
+            },
+        })
+    }
+}
+
+fn owner_checking_service(
+    db: &Arc<toolkit_db::DBProvider<toolkit_db::DbError>>,
+    pdp: Arc<OwnerCheckingAuthZ>,
+) -> GroupService<GroupRepository> {
+    GroupService::new(
+        db.clone(),
+        QueryProfile::default(),
+        authz_resolver_sdk::PolicyEnforcer::new(pdp),
+        Arc::new(GroupRepository),
+        common::make_types_catalog(),
+    )
+}
+
+fn rename() -> UpdateGroupRequest {
+    UpdateGroupRequest {
+        name: "renamed".to_owned(),
+        parent_id: None,
+        metadata: None,
+    }
+}
+
+#[tokio::test]
+async fn point_operations_send_owner_tenant_and_hide_foreign_groups() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let pdp = OwnerCheckingAuthZ::new(Refusal::Deny, false);
+    let group_svc = owner_checking_service(&db, pdp.clone());
+    let tenant_a = Uuid::now_v7();
+    let ctx_a = common::make_ctx(tenant_a);
+    let ctx_b = common::make_ctx(Uuid::now_v7());
+    let t = common::create_root_type(&type_svc, "pointowner").await;
+    let group = common::create_root_group(&group_svc, &ctx_a, &t.code, "owned", tenant_a).await;
+    let query = ODataQuery::default();
+
+    group_svc.get_group(&ctx_a, group.id).await.unwrap();
+    group_svc
+        .get_group_descendants(&ctx_a, group.id, &query)
+        .await
+        .unwrap();
+    group_svc
+        .get_group_ancestors(&ctx_a, group.id, &query)
+        .await
+        .unwrap();
+    group_svc
+        .update_group(&ctx_a, group.id, rename())
+        .await
+        .unwrap();
+
+    // A denied foreign group answers like an unknown one.
+    for result in [
+        group_svc.get_group(&ctx_b, group.id).await.map(|_| ()),
+        group_svc.delete_group(&ctx_b, group.id, false).await,
+        group_svc
+            .get_group(&ctx_a, Uuid::now_v7())
+            .await
+            .map(|_| ()),
+    ] {
+        assert!(
+            matches!(result, Err(DomainError::GroupNotFound { .. })),
+            "expected GroupNotFound, got {result:?}"
+        );
+    }
+
+    group_svc
+        .delete_group(&ctx_a, group.id, false)
+        .await
+        .unwrap();
+
+    let seen = pdp.seen_owners.lock().unwrap().clone();
+    // get, descendants, ancestors, update, foreign get, foreign delete and
+    // its `get` visibility check, delete; the unknown id is refused before
+    // the PDP is asked.
+    assert_eq!(seen, vec![Some(tenant_a.to_string()); 8]);
+}
+
+/// Whatever the kind of denial, a group the caller may read answers 403 for
+/// an action it may not perform, and a group it may not read answers 404 for
+/// every action, like an unknown id.
+#[tokio::test]
+async fn point_denials_answer_403_on_readable_groups_and_404_on_hidden_ones() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let t = common::create_root_type(&type_svc, "pointdenial").await;
+    let query = ODataQuery::default();
+
+    for refusal in [
+        Refusal::Deny,
+        Refusal::EmptyScope,
+        Refusal::ExcludingScope,
+        Refusal::Unadvertised,
+    ] {
+        let group_svc = owner_checking_service(&db, OwnerCheckingAuthZ::new(refusal, true));
+        let tenant_a = Uuid::now_v7();
+        let ctx_a = common::make_ctx(tenant_a);
+        let ctx_b = common::make_ctx(Uuid::now_v7());
+        let group =
+            common::create_root_group(&group_svc, &ctx_a, &t.code, "readonly", tenant_a).await;
+
+        group_svc.get_group(&ctx_a, group.id).await.unwrap();
+        for result in [
+            group_svc
+                .update_group(&ctx_a, group.id, rename())
+                .await
+                .map(|_| ()),
+            group_svc.delete_group(&ctx_a, group.id, false).await,
+        ] {
+            assert!(
+                matches!(result, Err(DomainError::AccessDenied { .. })),
+                "{refusal:?}: expected AccessDenied, got {result:?}"
+            );
+        }
+
+        for result in [
+            group_svc.get_group(&ctx_b, group.id).await.map(|_| ()),
+            group_svc
+                .get_group_descendants(&ctx_b, group.id, &query)
+                .await
+                .map(|_| ()),
+            group_svc
+                .update_group(&ctx_b, group.id, rename())
+                .await
+                .map(|_| ()),
+            group_svc.delete_group(&ctx_b, group.id, false).await,
+        ] {
+            assert!(
+                matches!(result, Err(DomainError::GroupNotFound { .. })),
+                "{refusal:?}: expected GroupNotFound, got {result:?}"
+            );
+        }
+        let kept = group_svc.get_group(&ctx_a, group.id).await.unwrap();
+        assert_eq!(kept.name, group.name, "{refusal:?}");
+    }
+}
+
+/// A PDP that cannot evaluate a point operation is an internal error, never
+/// a not-found or a denial.
+#[tokio::test]
+async fn point_operations_surface_pdp_failures_as_internal_error() {
+    let db = common::test_db().await;
+    let type_svc = common::make_type_service(db.clone());
+    let t = common::create_root_type(&type_svc, "pointfail").await;
+    let tenant = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant);
+    let group = common::create_root_group(
+        &owner_checking_service(&db, OwnerCheckingAuthZ::new(Refusal::Deny, false)),
+        &ctx,
+        &t.code,
+        "failing",
+        tenant,
+    )
+    .await;
+    let group_svc = owner_checking_service(&db, OwnerCheckingAuthZ::new(Refusal::Fail, false));
+
+    for result in [
+        group_svc.get_group(&ctx, group.id).await.map(|_| ()),
+        group_svc
+            .update_group(&ctx, group.id, rename())
+            .await
+            .map(|_| ()),
+        group_svc.delete_group(&ctx, group.id, false).await,
+    ] {
+        assert!(
+            matches!(result, Err(DomainError::InternalError)),
+            "expected InternalError, got {result:?}"
+        );
+    }
 }

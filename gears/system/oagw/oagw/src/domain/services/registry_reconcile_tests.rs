@@ -507,7 +507,7 @@ impl Fixture {
             &Unattended,
             upstreams,
             routes,
-            root,
+            Some(root),
         )
         .await
     }
@@ -2360,7 +2360,7 @@ async fn stopped_gated_run(b: Backend, stop: Stop, at: usize, written: (usize, u
                 &cancel,
                 upstreams,
                 routes,
-                root,
+                Some(root),
             )
             .await
             .unwrap()
@@ -2408,7 +2408,7 @@ async fn stopped_gated_run(b: Backend, stop: Stop, at: usize, written: (usize, u
     );
     assert_eq!(
         inner.read().await.unwrap().content_hash,
-        Some(content_hash(&upstreams, &routes, root))
+        Some(content_hash(&upstreams, &routes, Some(root)).unwrap())
     );
 }
 
@@ -2450,7 +2450,7 @@ async fn stop_after(b: Backend, writes: usize, written: (usize, usize)) {
         &StopAfter::writes(writes),
         &upstreams,
         &routes,
-        root,
+        Some(root),
     )
     .await
     .unwrap();
@@ -2639,7 +2639,7 @@ async fn a_stop_after_a_moving_routes_delete_leaves_the_rest_to_the_next_run(b: 
         &StopAfter::writes(1),
         &upstreams,
         &routes,
-        root,
+        Some(root),
     )
     .await
     .unwrap();
@@ -2969,7 +2969,7 @@ async fn reconcile_writes_are_seen_through_the_proxy_cache() {
             &Unattended,
             upstreams,
             routes,
-            root,
+            Some(root),
         )
         .await
         .unwrap();
@@ -3013,4 +3013,28 @@ async fn reconcile_writes_are_seen_through_the_proxy_cache() {
         run(&[], &[]).await;
     })
     .await;
+}
+
+#[test]
+fn changed_nothing_only_for_a_clean_run_without_writes() {
+    let mut counts = ProvisioningCounts::default();
+    counts.upstreams.unchanged = 2;
+    counts.routes.unchanged = 3;
+    assert!(counts.changed_nothing());
+
+    for change in [
+        |c: &mut ProvisioningCounts| c.upstreams.created = 1,
+        |c: &mut ProvisioningCounts| c.upstreams.updated = 1,
+        |c: &mut ProvisioningCounts| c.upstreams.removed = 1,
+        |c: &mut ProvisioningCounts| c.upstreams.kept = 1,
+        |c: &mut ProvisioningCounts| c.routes.created = 1,
+        |c: &mut ProvisioningCounts| c.routes.updated = 1,
+        |c: &mut ProvisioningCounts| c.routes.removed = 1,
+        |c: &mut ProvisioningCounts| c.routes.failed = 1,
+        |c: &mut ProvisioningCounts| c.stopped = true,
+    ] {
+        let mut changed = ProvisioningCounts::default();
+        change(&mut changed);
+        assert!(!changed.changed_nothing(), "{changed:?}");
+    }
 }
