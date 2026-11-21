@@ -13,6 +13,7 @@ pub mod mac;
 pub mod rng;
 mod rsa;
 pub mod signature;
+pub mod sigv4;
 
 /// Failure to obtain the configured cryptographic implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -39,9 +40,15 @@ pub enum CryptoError {
     /// The native FIPS provider does not provide the requested algorithm.
     #[error("algorithm is unavailable under the configured crypto policy")]
     UnsupportedAlgorithm,
-    /// A signature or AEAD key could not be generated or imported.
+    /// A signature or AEAD key could not be generated or imported, or an AWS
+    /// Signature Version 4 secret access key is empty.
     #[error("invalid key")]
     InvalidKey,
+    /// An AWS Signature Version 4 credential scope has a date that is not
+    /// `YYYYMMDD`, or a region or service that is empty, longer than 64 bytes
+    /// or not ASCII letters, digits, `-`, `_` and `.`.
+    #[error("invalid SigV4 credential scope")]
+    InvalidCredentialScope,
     /// The selected backend could not generate a signing key.
     #[error("native signing key generation failed")]
     KeyGenerationFailed,

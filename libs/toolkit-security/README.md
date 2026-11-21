@@ -15,8 +15,8 @@ The `cf-gears-toolkit-security` crate provides:
 ## Application cryptography
 
 Use `crypto::hash::Sha256`, `crypto::mac::HmacSha256`, `crypto::aead::Aes256Gcm`,
-`crypto::rng::fill`, `crypto::constant_time_eq` and `crypto::signature` instead of
-backend crates.
+`crypto::rng::fill`, `crypto::constant_time_eq`, `crypto::signature` and `crypto::sigv4`
+instead of backend crates.
 The optional `jwt` feature provides `jwt::decode`, preserving jsonwebtoken
 claim validation after verifying signatures through the facade, and `jwt::encode`,
 which signs `ES256` tokens with an `EcdsaP256KeyPair` without constructing a
@@ -40,6 +40,12 @@ Verification also supports P-384/SHA-384.
 the module draws and returns (FIPS 140-3 IG C.H); opening takes the stored nonce. The
 layout matches the RustCrypto `aes-gcm` crate. It routes to AWS-LC only: FIPS builds
 on macOS and Windows have no AEAD route and report `UnsupportedAlgorithm` at key import.
+
+`sigv4::CredentialScope` validates and renders the AWS Signature Version 4 credential
+scope; `sigv4::SigningKey` derives the signing key for a scope and signs a string to sign;
+`sigv4::sha256_hex` hashes payloads and canonical requests. Canonical requests and strings
+to sign are built by the caller. Because the first HMAC key is `"AWS4"` plus
+the secret access key, FIPS builds reject secrets shorter than 10 bytes.
 
 HMAC FIPS keys must be at least 14 bytes. HMAC, AEAD and RSA/ECDSA messages are limited
 to `u32::MAX` bytes for portable CNG dispatch; SHA-256 and RNG split larger buffers.
