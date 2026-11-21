@@ -13,11 +13,13 @@ use crate::domain::plugin::{
 /// The outbound request apart from its headers, as the signing phase gets
 /// it.
 pub(crate) struct SigningInput<'a> {
+    /// The outbound HTTP method.
     pub(crate) method: &'a http::Method,
     /// The outbound URL as built.
     pub(crate) uri: Uri,
     /// Endpoint port, also when the URL leaves out the scheme's default.
     pub(crate) port: u16,
+    /// The request body as the signer sees it.
     pub(crate) body: SigningBody,
     /// The upstream's `auth.config`.
     pub(crate) config: HashMap<String, String>,

@@ -1,3 +1,13 @@
+// oagw is an HTTP gateway: methods, headers and upstream status codes are its
+// domain, not a transport detail, so the domain uses the `http` crate's types
+// instead of copies of them.
+#![allow(unknown_lints, reason = "dylint lint names are unknown to rustc")]
+#![allow(
+    de0301_no_infra_in_domain,
+    de0308_no_http_in_domain,
+    reason = "an HTTP gateway's domain is HTTP; see the comment above"
+)]
+
 /// Upstream circuit breakers, one registry per replica.
 pub(crate) mod circuit_breaker;
 pub(crate) mod cors;
