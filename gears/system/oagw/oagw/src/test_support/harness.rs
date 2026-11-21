@@ -81,6 +81,7 @@ pub struct AppHarnessBuilder {
     metrics: Option<Arc<dyn crate::domain::ports::OagwMetricsPort>>,
     transform_plugins: Vec<(String, Arc<dyn crate::domain::plugin::TransformPlugin>)>,
     streaming_idle_timeout: Option<Duration>,
+    upstream_ssrf_policy: bool,
 }
 
 impl AppHarnessBuilder {
@@ -164,6 +165,14 @@ impl AppHarnessBuilder {
         self
     }
 
+    /// Resolve upstream hosts under the default SSRF policy, which refuses
+    /// loopback and private addresses, instead of none. Writes are not
+    /// checked.
+    pub fn with_upstream_ssrf_policy(mut self) -> Self {
+        self.upstream_ssrf_policy = true;
+        self
+    }
+
     pub async fn build(self) -> AppHarness {
         let hub = ClientHub::new();
 
@@ -203,6 +212,9 @@ impl AppHarnessBuilder {
         }
         if let Some(timeout) = self.streaming_idle_timeout {
             dp_builder = dp_builder.with_streaming_idle_timeout(timeout);
+        }
+        if self.upstream_ssrf_policy {
+            dp_builder = dp_builder.with_upstream_ssrf_policy();
         }
         dp_builder =
             dp_builder.with_token_http_config(toolkit_http::HttpClientConfig::for_testing());

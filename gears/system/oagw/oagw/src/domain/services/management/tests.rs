@@ -83,6 +83,7 @@ fn make_create_upstream_hostname() -> CreateUpstreamRequest {
         headers: None,
         plugins: None,
         rate_limit: None,
+        circuit_breaker: None,
         cors: None,
         tags: vec![],
         enabled: true,
@@ -106,6 +107,7 @@ fn make_create_upstream_ip(alias: &str) -> CreateUpstreamRequest {
         headers: None,
         plugins: None,
         rate_limit: None,
+        circuit_breaker: None,
         cors: None,
         tags: vec![],
         enabled: true,
@@ -122,6 +124,7 @@ fn make_update_from_upstream(u: &Upstream) -> UpdateUpstreamRequest {
         headers: u.headers.clone(),
         plugins: u.plugins.clone(),
         rate_limit: u.rate_limit.clone(),
+        circuit_breaker: u.circuit_breaker.clone(),
         cors: u.cors.clone(),
         tags: u.tags.clone(),
         enabled: u.enabled,
@@ -237,6 +240,7 @@ async fn alias_auto_generation() {
         headers: None,
         plugins: None,
         rate_limit: None,
+        circuit_breaker: None,
         cors: None,
         tags: vec![],
         enabled: true,
@@ -957,6 +961,7 @@ async fn alias_shadowing_over_four_levels(backend: Backend) {
             headers: disabled.headers,
             plugins: disabled.plugins,
             rate_limit: disabled.rate_limit,
+            circuit_breaker: disabled.circuit_breaker,
             cors: disabled.cors,
             tags: disabled.tags,
             enabled: disabled.enabled,
@@ -1194,6 +1199,7 @@ fn make_upstream(
         headers: None,
         plugins,
         rate_limit,
+        circuit_breaker: None,
         cors: None,
         tags,
         managed_by: ManagedBy::Api,
@@ -4446,6 +4452,7 @@ async fn create_ip_requires_explicit_alias() {
         headers: None,
         plugins: None,
         rate_limit: None,
+        circuit_breaker: None,
         cors: None,
         tags: vec![],
         enabled: true,
@@ -4610,6 +4617,7 @@ async fn multi_endpoint_common_suffix_alias() {
         headers: None,
         plugins: None,
         rate_limit: None,
+        circuit_breaker: None,
         cors: None,
         tags: vec![],
         enabled: true,
@@ -4647,6 +4655,7 @@ async fn multi_endpoint_same_suffix_different_ports_get_distinct_aliases() {
         headers: None,
         plugins: None,
         rate_limit: None,
+        circuit_breaker: None,
         cors: None,
         tags: vec![],
         enabled: true,
@@ -4677,6 +4686,7 @@ async fn multi_endpoint_same_suffix_different_ports_get_distinct_aliases() {
         headers: None,
         plugins: None,
         rate_limit: None,
+        circuit_breaker: None,
         cors: None,
         tags: vec![],
         enabled: true,
@@ -4718,6 +4728,7 @@ async fn multi_endpoint_public_suffix_requires_explicit_alias() {
         headers: None,
         plugins: None,
         rate_limit: None,
+        circuit_breaker: None,
         cors: None,
         tags: vec![],
         enabled: true,
@@ -4760,6 +4771,7 @@ async fn multi_endpoint_public_suffix_with_explicit_alias_succeeds() {
         headers: None,
         plugins: None,
         rate_limit: None,
+        circuit_breaker: None,
         cors: None,
         tags: vec![],
         enabled: true,
@@ -6722,6 +6734,7 @@ fn make_create_upstream_with_ip(ip: &str, alias: &str) -> CreateUpstreamRequest 
         headers: None,
         plugins: None,
         rate_limit: None,
+        circuit_breaker: None,
         cors: None,
         tags: vec![],
         enabled: true,
@@ -10751,6 +10764,7 @@ async fn empty_scope_denies_each_ancestor_permission() {
         auth: Some(&auth),
         rate_limit: Some(&rate),
         plugins: Some(&plugins),
+        circuit_breaker: None,
         cors: None,
     };
     for action in ["bind", "override_auth", "override_rate", "add_plugins"] {
@@ -11498,4 +11512,320 @@ mod write_validation {
             other => panic!("expected SecretRefNotAccessible, got {other:?}"),
         }
     }
+}
+
+// -- Circuit breaker --
+
+fn breaker(
+    sharing: SharingMode,
+    failure_threshold: u32,
+) -> crate::domain::model::CircuitBreakerConfig {
+    crate::domain::model::CircuitBreakerConfig {
+        sharing,
+        enabled: true,
+        failure_threshold,
+        timeout_seconds: 60,
+        success_threshold: 1,
+        owner_id: None,
+    }
+}
+
+fn with_breaker(sharing: SharingMode, failure_threshold: u32) -> Upstream {
+    Upstream {
+        circuit_breaker: Some(breaker(sharing, failure_threshold)),
+        ..make_upstream(Uuid::new_v4(), "openai", None, None, None, vec![])
+    }
+}
+
+/// The effective breaker's `(failure_threshold, owner)`.
+fn effective_breaker(chain: &[Upstream]) -> Option<(u32, Option<Uuid>)> {
+    compute_effective_config(chain, None)
+        .unwrap()
+        .circuit_breaker
+        .map(|cb| (cb.failure_threshold, cb.owner_id))
+}
+
+#[test]
+fn circuit_breaker_merge_follows_the_sharing_mode() {
+    let root = with_breaker(SharingMode::Inherit, 5);
+    let none = make_upstream(Uuid::new_v4(), "openai", None, None, None, vec![]);
+    assert_eq!(
+        effective_breaker(std::slice::from_ref(&root)),
+        Some((5, Some(root.id)))
+    );
+    assert_eq!(
+        effective_breaker(&[root.clone(), none.clone()]),
+        Some((5, Some(root.id))),
+        "an absent breaker inherits the ancestor's"
+    );
+
+    // The closest level's config wins, whatever its sharing mode.
+    for sharing in [
+        SharingMode::Private,
+        SharingMode::Inherit,
+        SharingMode::Enforce,
+    ] {
+        let child = with_breaker(sharing, 2);
+        assert_eq!(
+            effective_breaker(&[root.clone(), child.clone()]),
+            Some((2, Some(child.id))),
+            "{sharing:?}"
+        );
+    }
+
+    // An enforced one stays for every level below.
+    let enforcing = with_breaker(SharingMode::Enforce, 7);
+    let child = with_breaker(SharingMode::Private, 1);
+    let grandchild = with_breaker(SharingMode::Inherit, 1);
+    assert_eq!(
+        effective_breaker(&[enforcing.clone(), child, none, grandchild]),
+        Some((7, Some(enforcing.id)))
+    );
+}
+
+#[test]
+fn a_private_circuit_breaker_stays_with_its_owner() {
+    let private = with_breaker(SharingMode::Private, 3);
+    assert!(!super::merge::is_visible_to_descendant(&private));
+    assert_eq!(
+        super::merge::shared_upstream_view(private).circuit_breaker,
+        None
+    );
+
+    let shared = with_breaker(SharingMode::Inherit, 3);
+    assert!(super::merge::is_visible_to_descendant(&shared));
+    assert_eq!(
+        super::merge::shared_upstream_view(shared.clone()).circuit_breaker,
+        shared.circuit_breaker
+    );
+}
+
+#[tokio::test]
+async fn circuit_breaker_round_trips_and_zero_values_are_rejected() {
+    let svc = make_service();
+    let ctx = test_ctx(Uuid::new_v4());
+    let mut req = make_create_upstream_hostname();
+    req.circuit_breaker = Some(breaker(SharingMode::Inherit, 3));
+    let up = svc.create_upstream(&ctx, req).await.unwrap();
+    assert_eq!(up.circuit_breaker, Some(breaker(SharingMode::Inherit, 3)));
+    assert_eq!(
+        svc.get_upstream(&ctx, up.id).await.unwrap().circuit_breaker,
+        up.circuit_breaker
+    );
+
+    let zero = |field: &str| {
+        let mut cb = breaker(SharingMode::Private, 3);
+        match field {
+            "failure_threshold" => cb.failure_threshold = 0,
+            "timeout_seconds" => cb.timeout_seconds = 0,
+            _ => cb.success_threshold = 0,
+        }
+        cb
+    };
+    for field in ["failure_threshold", "timeout_seconds", "success_threshold"] {
+        let expected = format!("circuit_breaker.{field} must be at least 1");
+        // Disabled too: enabling it later must not need another check.
+        let disabled = crate::domain::model::CircuitBreakerConfig {
+            enabled: false,
+            ..zero(field)
+        };
+        let mut create = make_create_upstream_ip(&format!("cb-{field}"));
+        create.circuit_breaker = Some(disabled);
+        let err = svc.create_upstream(&ctx, create).await.unwrap_err();
+        assert!(
+            matches!(&err, DomainError::Validation { detail, .. } if *detail == expected),
+            "create {field}: {err:?}"
+        );
+
+        let mut update = make_update_from_upstream(&up);
+        update.circuit_breaker = Some(zero(field));
+        let err = svc.update_upstream(&ctx, up.id, update).await.unwrap_err();
+        assert!(
+            matches!(&err, DomainError::Validation { detail, .. } if *detail == expected),
+            "update {field}: {err:?}"
+        );
+    }
+    assert_eq!(
+        svc.get_upstream(&ctx, up.id).await.unwrap().circuit_breaker,
+        up.circuit_breaker
+    );
+}
+
+/// Each value has an upper bound; the bound itself is accepted.
+#[tokio::test]
+async fn circuit_breaker_values_above_the_maximum_are_rejected() {
+    let svc = make_service();
+    let ctx = test_ctx(Uuid::new_v4());
+    let with = |field: &str, value: u32| {
+        let mut cb = breaker(SharingMode::Private, 3);
+        match field {
+            "failure_threshold" => cb.failure_threshold = value,
+            "timeout_seconds" => cb.timeout_seconds = value,
+            _ => cb.success_threshold = value,
+        }
+        cb
+    };
+    for (field, max) in [
+        ("failure_threshold", 1_000),
+        ("timeout_seconds", 86_400),
+        ("success_threshold", 100),
+    ] {
+        let mut at_max = make_create_upstream_ip(&format!("cb-max-{field}"));
+        at_max.circuit_breaker = Some(with(field, max));
+        let up = svc.create_upstream(&ctx, at_max).await.unwrap();
+
+        let expected = format!("circuit_breaker.{field} must be at most {max}");
+        let mut create = make_create_upstream_ip(&format!("cb-over-{field}"));
+        create.circuit_breaker = Some(crate::domain::model::CircuitBreakerConfig {
+            enabled: false,
+            ..with(field, max + 1)
+        });
+        let err = svc.create_upstream(&ctx, create).await.unwrap_err();
+        assert!(
+            matches!(&err, DomainError::Validation { detail, .. } if *detail == expected),
+            "create {field}: {err:?}"
+        );
+
+        let mut update = make_update_from_upstream(&up);
+        update.circuit_breaker = Some(with(field, u32::MAX));
+        let err = svc.update_upstream(&ctx, up.id, update).await.unwrap_err();
+        let expected = format!("circuit_breaker.{field} must be at most {max}");
+        assert!(
+            matches!(&err, DomainError::Validation { detail, .. } if *detail == expected),
+            "update {field}: {err:?}"
+        );
+    }
+}
+
+/// An enforced breaker on any ancestor refuses a descendant's own; under
+/// `inherit` the override needs no permission of its own.
+#[tokio::test]
+async fn bind_checks_the_circuit_breaker_override() {
+    let (root, mid, leaf) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let resolver = MockTenantResolverClient::with_hierarchy(vec![
+        TenantId(root),
+        TenantId(mid),
+        TenantId(leaf),
+    ]);
+    let svc = make_service_with_resolver(resolver);
+
+    let mut mid_req = make_create_upstream_ip("svc");
+    mid_req.circuit_breaker = Some(breaker(SharingMode::Inherit, 5));
+    svc.create_upstream(&test_ctx(mid), mid_req).await.unwrap();
+
+    let mut leaf_req = make_create_upstream_ip("svc");
+    leaf_req.circuit_breaker = Some(breaker(SharingMode::Private, 2));
+    let leaf_up = svc
+        .create_upstream(&test_ctx(leaf), leaf_req.clone())
+        .await
+        .unwrap();
+    svc.delete_upstream(&test_ctx(leaf), leaf_up.id)
+        .await
+        .unwrap();
+
+    let mut root_req = make_create_upstream_ip("svc");
+    root_req.circuit_breaker = Some(breaker(SharingMode::Enforce, 9));
+    svc.create_upstream(&test_ctx(root), root_req)
+        .await
+        .unwrap();
+    let err = svc
+        .create_upstream(&test_ctx(leaf), leaf_req)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, DomainError::Validation { detail, .. }
+            if detail == "cannot override circuit_breaker: ancestor upstream has sharing mode 'enforce'"),
+        "{err:?}"
+    );
+}
+
+/// A delete drops the upstream's breakers on this replica. An unchanged
+/// write keeps them; a changed config or endpoint list starts closed (here
+/// dropped by the write, elsewhere rebuilt on the next request).
+#[tokio::test]
+async fn a_delete_drops_the_breakers_and_an_update_rebuilds_them() {
+    use crate::domain::circuit_breaker::CircuitBreakers;
+
+    let breakers = Arc::new(CircuitBreakers::new());
+    let svc = make_service().with_circuit_breakers(breakers.clone());
+    let ctx = test_ctx(Uuid::new_v4());
+    let mut req = make_create_upstream_ip("svc");
+    req.circuit_breaker = Some(breaker(SharingMode::Private, 1));
+    let up = svc.create_upstream(&ctx, req).await.unwrap();
+    let open = |u: &Upstream| {
+        breakers
+            .admit(u, "/")
+            .unwrap()
+            .answered(http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(breakers.admit(u, "/").is_err());
+    };
+    let is_open = |u: &Upstream| breakers.admit(u, "/").is_err();
+
+    open(&up);
+    let up = svc
+        .update_upstream(&ctx, up.id, make_update_from_upstream(&up))
+        .await
+        .unwrap();
+    assert!(is_open(&up), "an unchanged write keeps the breaker");
+
+    let mut update = make_update_from_upstream(&up);
+    update.circuit_breaker = Some(crate::domain::model::CircuitBreakerConfig {
+        timeout_seconds: 30,
+        ..breaker(SharingMode::Private, 1)
+    });
+    let up = svc.update_upstream(&ctx, up.id, update).await.unwrap();
+    assert!(!is_open(&up), "a changed breaker starts closed");
+
+    open(&up);
+    let mut update = make_update_from_upstream(&up);
+    update.server.endpoints[0].host = "10.0.0.2".into();
+    let up = svc.update_upstream(&ctx, up.id, update).await.unwrap();
+    assert!(!is_open(&up), "new endpoints start closed");
+
+    open(&up);
+    svc.delete_upstream(&ctx, up.id).await.unwrap();
+    assert_eq!(breakers.len(), 0, "a delete drops the breaker");
+}
+
+/// An unchanged write keeps an open breaker; removing the breaker and adding
+/// the same config back starts closed: the data plane keeps a breaker whose
+/// config it no longer sees, so the write drops it.
+#[tokio::test]
+async fn a_removed_and_re_added_breaker_starts_closed() {
+    use crate::domain::circuit_breaker::CircuitBreakers;
+
+    let breakers = Arc::new(CircuitBreakers::new());
+    let svc = make_service().with_circuit_breakers(breakers.clone());
+    let ctx = test_ctx(Uuid::new_v4());
+    let config = breaker(SharingMode::Private, 1);
+    let mut req = make_create_upstream_ip("svc");
+    req.circuit_breaker = Some(config.clone());
+    let up = svc.create_upstream(&ctx, req).await.unwrap();
+    breakers
+        .admit(&up, "/")
+        .unwrap()
+        .answered(http::StatusCode::SERVICE_UNAVAILABLE);
+    let up = svc
+        .update_upstream(&ctx, up.id, make_update_from_upstream(&up))
+        .await
+        .unwrap();
+    assert!(
+        breakers.admit(&up, "/").is_err(),
+        "an unchanged write keeps the open breaker"
+    );
+
+    let mut update = make_update_from_upstream(&up);
+    update.circuit_breaker = None;
+    let removed = svc.update_upstream(&ctx, up.id, update).await.unwrap();
+    assert_eq!(removed.circuit_breaker, None);
+    assert_eq!(breakers.len(), 0, "the removal drops the breaker");
+
+    let mut update = make_update_from_upstream(&removed);
+    update.circuit_breaker = Some(config.clone());
+    let up = svc.update_upstream(&ctx, up.id, update).await.unwrap();
+    assert_eq!(up.circuit_breaker, Some(config));
+    assert!(
+        breakers.admit(&up, "/").is_ok(),
+        "re-added, it starts closed"
+    );
 }

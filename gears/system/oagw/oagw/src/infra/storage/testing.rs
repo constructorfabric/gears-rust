@@ -73,13 +73,26 @@ impl SqliteFile {
     /// Connect to the file, creating it if missing, and apply the migrations.
     /// On an already migrated file they apply nothing, as on a restart.
     pub(crate) async fn open(&self) -> Db {
-        let db = connect_db(&format!("sqlite://{}?mode=rwc", self.0.display()), opts(4))
+        self.open_with(Migrator::migrations()).await
+    }
+
+    /// [`Self::open`] applying only `migrations`, as an older release would.
+    pub(crate) async fn open_with(
+        &self,
+        migrations: Vec<Box<dyn sea_orm_migration::MigrationTrait>>,
+    ) -> Db {
+        let db = connect_db(&self.dsn(), opts(4))
             .await
             .expect("connect test database file");
-        run_migrations_for_testing(&db, Migrator::migrations())
+        run_migrations_for_testing(&db, migrations)
             .await
             .expect("migrations apply");
         db
+    }
+
+    /// The file's DSN, for a plain connection that writes raw SQL.
+    pub(crate) fn dsn(&self) -> String {
+        format!("sqlite://{}?mode=rwc", self.0.display())
     }
 }
 

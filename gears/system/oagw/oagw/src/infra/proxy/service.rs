@@ -15,6 +15,7 @@ use toolkit_http_proxy::{ReplayableBody, UpgradeOutcome, empty_body, full_body, 
 use toolkit_security::SecurityContext;
 
 use crate::config::TokenCacheConfig;
+use crate::domain::circuit_breaker::{CircuitBreakers, UpstreamPermit};
 use crate::domain::error::DomainError;
 use crate::domain::model::{
     PassthroughMode, PathSuffixMode, ProxyTarget, RateLimitConfig, ResponseHeaderRules,
@@ -40,7 +41,9 @@ use crate::domain::services::{
 };
 use crate::infra::plugin::{AuthPluginRegistry, GuardPluginRegistry, TransformPluginRegistry};
 
-use super::engine::{ProxyEngine, into_body_stream, map_proxy_error};
+use super::engine::{
+    ProxyEngine, TargetError, into_body_stream, is_connect_failure, map_proxy_error,
+};
 use super::headers;
 use super::streaming::StreamShutdown;
 use super::{request_builder, secret_ref, streaming};
@@ -48,8 +51,10 @@ use super::{request_builder, secret_ref, streaming};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default maximum request body size: 100 MB.
 const MAX_BODY_SIZE: usize = 100 * 1024 * 1024;
-/// How often idle rate-limit buckets are evicted.
-const RATE_LIMIT_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// Picks one endpoint of the upstream's (`custom-header-routing`).
+const TARGET_HOST_HEADER: &str = "x-oagw-target-host";
+/// How often idle rate-limit buckets and circuit breakers are evicted.
+const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Data Plane service implementation: proxy orchestration and plugin execution.
 pub struct DataPlaneServiceImpl {
@@ -65,6 +70,9 @@ pub struct DataPlaneServiceImpl {
     guard_registry: GuardPluginRegistry,
     transform_registry: TransformPluginRegistry,
     rate_limiter: Arc<RateLimiter>,
+    /// Shared with the Control Plane, which drops a deleted upstream's
+    /// breakers.
+    circuit_breakers: Arc<CircuitBreakers>,
     request_timeout: Duration,
     /// Enforces authorization policy before proxying each request.
     policy_enforcer: PolicyEnforcer,
@@ -95,6 +103,7 @@ impl DataPlaneServiceImpl {
         engine: Arc<ProxyEngine>,
         metrics: Arc<dyn OagwMetricsPort>,
         rate_limiter: Arc<RateLimiter>,
+        circuit_breakers: Arc<CircuitBreakers>,
     ) -> Self {
         let auth_registry = AuthPluginRegistry::with_builtins(
             Arc::clone(&credstore),
@@ -114,6 +123,7 @@ impl DataPlaneServiceImpl {
             guard_registry,
             transform_registry,
             rate_limiter,
+            circuit_breakers,
             request_timeout: REQUEST_TIMEOUT,
             policy_enforcer,
             allow_http_upstream: false,
@@ -125,14 +135,15 @@ impl DataPlaneServiceImpl {
         }
     }
 
-    /// Start evicting idle rate-limit buckets every
-    /// [`RATE_LIMIT_SWEEP_INTERVAL`]. The task ends when `cancel` fires or
-    /// the limiter, shared with the Control Plane, is dropped.
-    pub fn spawn_rate_limit_sweeper(&self, cancel: CancellationToken) {
-        tokio::spawn(sweep_rate_limits(
+    /// Start evicting idle rate-limit buckets and circuit breakers every
+    /// [`IDLE_SWEEP_INTERVAL`]. The task ends when `cancel` fires or the
+    /// limiter, shared with the Control Plane, is dropped.
+    pub fn spawn_idle_sweeper(&self, cancel: CancellationToken) {
+        tokio::spawn(sweep_idle_state(
             Arc::downgrade(&self.rate_limiter),
+            Arc::downgrade(&self.circuit_breakers),
             Arc::clone(&self.metrics),
-            RATE_LIMIT_SWEEP_INTERVAL,
+            IDLE_SWEEP_INTERVAL,
             cancel,
         ));
     }
@@ -338,7 +349,7 @@ impl DataPlaneServiceImpl {
 
         // Tier 1: Explicit selection via X-OAGW-Target-Host header.
         if let Some(target_host) = req_headers
-            .get("x-oagw-target-host")
+            .get(TARGET_HOST_HEADER)
             .and_then(|v| v.to_str().ok())
         {
             // Validate format: allowlist of safe hostname/IP characters.
@@ -1040,6 +1051,14 @@ impl DataPlaneServiceImpl {
             &instance_uri,
         )?;
 
+        // 3d. Circuit breaker (`inst-rl-3`): an open circuit fails fast,
+        //     before the auth plugin, the rate limits and the CredStore read.
+        //     No probe slot is kept: the permit is taken at step 8a. At the
+        //     open → half-open edge, requests that pass here before the first
+        //     probe takes its slot at 8a do the steps in between and get 503
+        //     at 8a; once a probe holds the slot, this check rejects.
+        self.circuit_breakers.check(&upstream, &instance_uri)?;
+
         // 4. Prepare outbound headers (passthrough + strip).
         let mode = upstream
             .headers
@@ -1312,17 +1331,53 @@ impl DataPlaneServiceImpl {
             &query_params,
         )?;
 
+        // 8a. Circuit breaker permit. It covers target resolution and the
+        //     exchange only, so a half-open probe slot is not held through
+        //     the gateway's own steps. Their time is not the upstream's: a
+        //     deadline hit counts only if they left it the full budget. A
+        //     request pinned to one endpoint of several is not counted.
+        let pinned = upstream.server.endpoints.len() > 1
+            && req_headers.contains_key(TARGET_HOST_HEADER);
+        let permit = self
+            .circuit_breakers
+            .admit(&upstream, &instance_uri)?
+            .with_budget(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                self.request_timeout,
+            )
+            .pinned_to_one_endpoint(pinned);
+
         // 8b. Engine target: the LB's pre-resolved address, or DNS with the
         // SSRF policy for target-host / single-endpoint selection.
-        let target = tokio::time::timeout_at(deadline, self.engine.target(&selected, &instance_uri))
-            .await
-            .map_err(|_| DomainError::RequestTimeout {
-                detail: format!(
-                    "resolving {} timed out after {:?}",
-                    endpoint.host, self.request_timeout
-                ),
-                instance: instance_uri.clone(),
-            })??;
+        let target = match tokio::time::timeout_at(
+            deadline,
+            self.engine.target(&selected, &instance_uri),
+        )
+        .await
+        {
+            Ok(Ok(target)) => target,
+            // A host that does not resolve is as unreachable as one that
+            // refuses the connection.
+            Ok(Err(TargetError::Unreachable(err))) => {
+                permit.failed(&err);
+                return Err(err);
+            }
+            // The gateway's own policy, not the upstream.
+            Ok(Err(TargetError::Refused(err))) => {
+                permit.ignored();
+                return Err(err);
+            }
+            Err(_) => {
+                permit.timed_out();
+                return Err(DomainError::RequestTimeout {
+                    detail: format!(
+                        "resolving {} timed out after {:?}",
+                        endpoint.host, self.request_timeout
+                    ),
+                    instance: instance_uri.clone(),
+                });
+            }
+        };
 
         let response_header_rules = upstream
             .headers
@@ -1348,6 +1403,7 @@ impl DataPlaneServiceImpl {
             return self
                 .handle_websocket_upgrade(
                     &target,
+                    permit,
                     deadline,
                     &method,
                     &url,
@@ -1362,6 +1418,7 @@ impl DataPlaneServiceImpl {
         let upstream_result = self
             .forward(
                 &target,
+                permit,
                 deadline,
                 &method,
                 &url,
@@ -1404,11 +1461,12 @@ impl DataPlaneServiceImpl {
     }
 }
 
-/// Evict idle rate-limit buckets every `interval` until `cancel` fires or the
-/// limiter is gone. The stream shutdown signal does not stop it: a gear stop
-/// and a later start keep the same limiter.
-async fn sweep_rate_limits(
+/// Evict idle rate-limit buckets and circuit breakers every `interval` until
+/// `cancel` fires or the limiter is gone. The stream shutdown signal does not
+/// stop it: a gear stop and a later start keep the same limiter and breakers.
+async fn sweep_idle_state(
     limiter: Weak<RateLimiter>,
+    breakers: Weak<CircuitBreakers>,
     metrics: Arc<dyn OagwMetricsPort>,
     interval: Duration,
     cancel: CancellationToken,
@@ -1429,6 +1487,12 @@ async fn sweep_rate_limits(
                 if evicted > 0 {
                     tracing::debug!(evicted, live, "evicted idle rate-limit buckets");
                 }
+                if let Some(breakers) = breakers.upgrade() {
+                    let evicted = breakers.evict_idle();
+                    if evicted > 0 {
+                        tracing::debug!(evicted, live = breakers.len(), "evicted idle circuit breakers");
+                    }
+                }
             }
         }
     }
@@ -1443,10 +1507,16 @@ impl DataPlaneServiceImpl {
     /// answered `101 Switching Protocols`. Response guards and the response
     /// pipeline run on the 101; the tunnel travels to the handler in the
     /// response extensions.
+    ///
+    /// The circuit breaker sees the handshake only: a 101 or another status
+    /// is an answer (502-504 failures), a transport error or timeout a
+    /// failure (a deadline hit as in [`UpstreamPermit::timed_out`]). What
+    /// happens on the tunnel afterwards is not counted.
     #[allow(clippy::too_many_arguments)]
     async fn handle_websocket_upgrade(
         &self,
         target: &toolkit_http_proxy::Target,
+        permit: UpstreamPermit,
         deadline: tokio::time::Instant,
         method: &http::Method,
         url: &str,
@@ -1463,18 +1533,37 @@ impl DataPlaneServiceImpl {
         let req = build_outbound_request(method, url, headers, empty_body(), instance_uri)?;
 
         let upgrade_timeout = self.request_timeout;
-        let outcome = tokio::time::timeout_at(deadline, self.engine.client().upgrade(target, req))
-            .await
-            .map_err(|_| DomainError::RequestTimeout {
-                // No URL: its query string may carry credentials.
-                detail: format!("upstream WebSocket upgrade timed out after {upgrade_timeout:?}"),
-                instance: instance_uri.to_string(),
-            })?
-            .map_err(|e| map_proxy_error(&e, instance_uri))?;
+        let outcome = match tokio::time::timeout_at(
+            deadline,
+            self.engine.client().upgrade(target, req),
+        )
+        .await
+        {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(e)) => {
+                let err = map_proxy_error(&e, instance_uri);
+                permit.failed(&err);
+                return Err(err);
+            }
+            Err(_) => {
+                permit.timed_out();
+                return Err(DomainError::RequestTimeout {
+                    // No URL: its query string may carry credentials.
+                    detail: format!(
+                        "upstream WebSocket upgrade timed out after {upgrade_timeout:?}"
+                    ),
+                    instance: instance_uri.to_string(),
+                });
+            }
+        };
 
         let (response, io) = match outcome {
-            UpgradeOutcome::Switched { response, io } => (response, io),
+            UpgradeOutcome::Switched { response, io } => {
+                permit.answered(response.status());
+                (response, io)
+            }
             UpgradeOutcome::Rejected(resp) => {
+                permit.answered(resp.status());
                 return Err(DomainError::ProtocolError {
                     detail: format!(
                         "upstream rejected WebSocket upgrade with status {}",
@@ -1542,6 +1631,7 @@ impl DataPlaneServiceImpl {
     async fn forward(
         &self,
         target: &toolkit_http_proxy::Target,
+        permit: UpstreamPermit,
         deadline: tokio::time::Instant,
         method: &http::Method,
         url: &str,
@@ -1553,6 +1643,7 @@ impl DataPlaneServiceImpl {
         instance_uri: &str,
     ) -> Result<http::Response<Body>, DomainError> {
         let body_state = Arc::new(StreamedBodyState::default());
+        let streamed = body_stream.is_some();
         let (body, replay) = match body_stream {
             Some(stream) => (
                 stream_body(limit_body_stream(stream, max_body, Arc::clone(&body_state))),
@@ -1573,25 +1664,50 @@ impl DataPlaneServiceImpl {
             tokio::time::timeout_at(deadline, self.engine.client().send(target, req)).await;
 
         // A failure on our side of the body wins over whatever the upstream
-        // made of the aborted request.
+        // made of the aborted request, and says nothing about the upstream.
         if let Some(err) = body_state.failure(max_body, instance_uri) {
             return Err(err);
         }
-        let resp = outcome
-            .map_err(|_| DomainError::RequestTimeout {
-                // No URL: its query string may carry credentials.
-                detail: format!("upstream request timed out after {timeout:?}"),
-                instance: instance_uri.to_string(),
-            })?
-            .map_err(|e| {
+        // Until the client has sent its whole body the exchange runs at the
+        // client's pace: a client trickling its upload would otherwise hit
+        // the deadline or the engine's read timeout and open the circuit
+        // for every tenant. Only failing to reach the upstream counts then.
+        let upload_done = !streamed || body_state.finished();
+        // Recorded at the response head: an SSE or long body that fails
+        // later does not count.
+        let resp = match outcome {
+            Ok(Ok(resp)) => {
+                permit.answered(resp.status());
+                resp
+            }
+            Ok(Err(e)) => {
                 tracing::warn!(
                     method = %method,
                     path = pipeline.path_suffix,
                     error = %e,
                     "Proxy request failed"
                 );
-                map_proxy_error(&e, instance_uri)
-            })?;
+                let err = map_proxy_error(&e, instance_uri);
+                if upload_done || is_connect_failure(&e) {
+                    permit.failed(&err);
+                } else {
+                    permit.ignored();
+                }
+                return Err(err);
+            }
+            Err(_) => {
+                if upload_done {
+                    permit.timed_out();
+                } else {
+                    permit.ignored();
+                }
+                return Err(DomainError::RequestTimeout {
+                    // No URL: its query string may carry credentials.
+                    detail: format!("upstream request timed out after {timeout:?}"),
+                    instance: instance_uri.to_string(),
+                });
+            }
+        };
 
         let (parts, mut body) = resp.into_parts();
         // SSE streams may stay silent longer than the read timeout; the
@@ -1641,9 +1757,15 @@ struct StreamedBodyState {
     exceeded: std::sync::OnceLock<usize>,
     /// Why the client's body stream failed.
     failed: std::sync::OnceLock<String>,
+    /// The client's body stream ended cleanly.
+    finished: std::sync::atomic::AtomicBool,
 }
 
 impl StreamedBodyState {
+    fn finished(&self) -> bool {
+        self.finished.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     fn failure(&self, max_body: usize, instance_uri: &str) -> Option<DomainError> {
         if let Some(total) = self.exceeded.get() {
             return Some(DomainError::PayloadTooLarge {
@@ -1662,17 +1784,18 @@ impl StreamedBodyState {
     }
 }
 
-/// Enforce `max_body` on a streamed request body, recording failures in
-/// `state`. Empty chunks are dropped. A breach or a stream error ends the
-/// stream with an error, which aborts the upstream request without a
-/// terminating chunk.
+/// Enforce `max_body` on a streamed request body, recording failures and
+/// the clean end in `state`. Empty chunks are dropped. A breach or a stream
+/// error ends the stream with an error, which aborts the upstream request
+/// without a terminating chunk.
 fn limit_body_stream(
     stream: BodyStream,
     max_body: usize,
     state: Arc<StreamedBodyState>,
 ) -> impl futures_util::Stream<Item = Result<Bytes, oagw_sdk::body::BoxError>> + Send {
     let mut total: usize = 0;
-    stream.filter_map(move |chunk| {
+    let end = Arc::clone(&state);
+    let limited = stream.filter_map(move |chunk| {
         let item = match chunk {
             Ok(bytes) if bytes.is_empty() => None,
             Ok(bytes) => {
@@ -1696,7 +1819,15 @@ fn limit_body_stream(
             }
         };
         std::future::ready(item)
+    });
+    // Polled only once the client's stream has ended. After an error item
+    // the body state reports the failure first, whatever this says.
+    let end = futures_util::stream::once(async move {
+        end.finished
+            .store(true, std::sync::atomic::Ordering::Release);
     })
+    .filter_map(|()| std::future::ready(None));
+    limited.chain(end)
 }
 
 /// Execute the auth plugin for the upstream and set the headers it asks for
@@ -2626,6 +2757,7 @@ pub(crate) mod tests {
             headers: None,
             plugins: None,
             rate_limit: None,
+            circuit_breaker: None,
             cors: None,
             tags: vec![],
             managed_by: ManagedBy::Api,
@@ -2871,6 +3003,7 @@ pub(crate) mod tests {
             engine,
             metrics,
             Arc::new(RateLimiter::new()),
+            Arc::new(CircuitBreakers::new()),
         )
     }
 
@@ -3112,8 +3245,9 @@ pub(crate) mod tests {
         limiter
             .try_consume("key", &fast_refill_config(), "/test")
             .unwrap();
-        let sweep = tokio::spawn(sweep_rate_limits(
+        let sweep = tokio::spawn(sweep_idle_state(
             Arc::downgrade(&limiter),
+            Weak::new(),
             Arc::new(crate::domain::ports::NoopMetrics),
             Duration::from_millis(5),
             CancellationToken::new(),
@@ -5173,25 +5307,58 @@ pub(crate) mod tests {
             .unwrap();
         // The limiter reads the real clock: let the fast bucket refill.
         std::thread::sleep(Duration::from_millis(5));
-        let half = RATE_LIMIT_SWEEP_INTERVAL / 2;
+        let half = IDLE_SWEEP_INTERVAL / 2;
         let cancel = CancellationToken::new();
-        svc.spawn_rate_limit_sweeper(cancel.clone());
+        svc.spawn_idle_sweeper(cancel.clone());
 
         // Ticks fire at 0 and at one interval; each sleep ends between ticks.
         tokio::time::sleep(half).await;
-        tokio::time::sleep(RATE_LIMIT_SWEEP_INTERVAL).await;
+        tokio::time::sleep(IDLE_SWEEP_INTERVAL).await;
         assert_eq!(*metrics.0.lock().unwrap(), vec![(1, 1), (0, 1)]);
 
         cancel.cancel();
-        tokio::time::sleep(RATE_LIMIT_SWEEP_INTERVAL * 3).await;
+        tokio::time::sleep(IDLE_SWEEP_INTERVAL * 3).await;
         assert_eq!(metrics.0.lock().unwrap().len(), 2, "no tick after cancel");
+    }
+
+    /// The same sweep evicts circuit breakers idle past their timeout.
+    #[tokio::test(start_paused = true)]
+    async fn sweep_evicts_idle_circuit_breakers() {
+        let mut upstream = upstream_with(vec![ep("10.0.0.1", 443)]);
+        upstream.circuit_breaker = Some(crate::domain::model::CircuitBreakerConfig {
+            sharing: Default::default(),
+            enabled: true,
+            failure_threshold: 1,
+            timeout_seconds: 1,
+            success_threshold: 1,
+            owner_id: None,
+        });
+        let limiter = Arc::new(RateLimiter::new());
+        let breakers = Arc::new(CircuitBreakers::new());
+        breakers
+            .admit(&upstream, "/")
+            .unwrap()
+            .answered(http::StatusCode::SERVICE_UNAVAILABLE);
+        let sweep = tokio::spawn(sweep_idle_state(
+            Arc::downgrade(&limiter),
+            Arc::downgrade(&breakers),
+            Arc::new(crate::domain::ports::NoopMetrics),
+            IDLE_SWEEP_INTERVAL,
+            CancellationToken::new(),
+        ));
+        tokio::time::sleep(IDLE_SWEEP_INTERVAL * 5).await;
+        assert_eq!(breakers.len(), 1, "idle for less than the grace");
+        tokio::time::sleep(IDLE_SWEEP_INTERVAL * 7).await;
+        assert_eq!(breakers.len(), 0);
+        sweep.abort();
     }
 
     #[tokio::test]
     async fn sweep_ends_when_the_limiter_is_dropped() {
         let limiter = Arc::new(RateLimiter::new());
-        let sweep = tokio::spawn(sweep_rate_limits(
+        let sweep = tokio::spawn(sweep_idle_state(
             Arc::downgrade(&limiter),
+            Weak::new(),
             Arc::new(crate::domain::ports::NoopMetrics),
             Duration::from_millis(5),
             CancellationToken::new(),

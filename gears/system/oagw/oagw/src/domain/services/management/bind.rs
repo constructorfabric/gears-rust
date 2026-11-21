@@ -53,6 +53,7 @@ pub(in crate::domain::services) struct BindOverrides<'a> {
     pub server: &'a crate::domain::model::Server,
     pub auth: Option<&'a crate::domain::model::AuthConfig>,
     pub rate_limit: Option<&'a crate::domain::model::RateLimitConfig>,
+    pub circuit_breaker: Option<&'a crate::domain::model::CircuitBreakerConfig>,
     pub plugins: Option<&'a crate::domain::model::PluginsConfig>,
     pub cors: Option<&'a crate::domain::model::CorsConfig>,
 }
@@ -72,10 +73,11 @@ pub(in crate::domain::services) struct BindOverrides<'a> {
 /// - `oagw:upstream:add_plugins` — required when ancestor plugins sharing is not `private`
 ///
 /// Sharing modes:
-/// - `enforce` → blocked (plugins excepted: merge-time protection). For auth
-///   and cors on any ancestor: an enforced field is sticky down the chain,
-///   whatever the ancestors in between set. For rate_limit on the closest
-///   ancestor only; the merge caps the effective limit by every enforcing one
+/// - `enforce` → blocked (plugins excepted: merge-time protection). For auth,
+///   circuit_breaker and cors on any ancestor: an enforced field is sticky
+///   down the chain, whatever the ancestors in between set. For rate_limit on
+///   the closest ancestor only; the merge caps the effective limit by every
+///   enforcing one
 /// - `private` → shadow allowed, no permission
 /// - `inherit` → allowed with permission
 pub(in crate::domain::services) async fn validate_bind_constraints(
@@ -192,6 +194,16 @@ pub(in crate::domain::services) async fn validate_bind_constraints(
                     .map_err(on_upstream(ctx, bind_actions::ADD_PLUGINS, ancestor))?;
             }
         }
+    }
+
+    // Circuit breaker override: no permission of its own, as for CORS; an
+    // enforced one is sticky down the chain, so any enforcing ancestor blocks.
+    if overrides.circuit_breaker.is_some()
+        && enforced_by_any(ancestors, |u| u.circuit_breaker.as_ref().map(|c| c.sharing))
+    {
+        return Err(DomainError::validation(
+            "cannot override circuit_breaker: ancestor upstream has sharing mode 'enforce'",
+        ));
     }
 
     // CORS override (no additional permission required, but Enforce blocks).

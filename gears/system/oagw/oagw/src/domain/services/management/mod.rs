@@ -15,6 +15,7 @@ use std::sync::Arc;
 use super::{ControlPlaneService, ProxyGrant, UpstreamCheck};
 use crate::domain::ssrf::SsrfGuard;
 
+use crate::domain::circuit_breaker::CircuitBreakers;
 use crate::domain::error::{DeniedOn, DomainError};
 use crate::domain::model::{
     CreateRouteRequest, CreateUpstreamRequest, ListQuery, ManagedBy, ProxyTarget, Route,
@@ -90,6 +91,10 @@ pub(crate) struct ControlPlaneServiceImpl {
     /// limit drops the buckets it made stale. None in tests that do not set
     /// it.
     rate_limiter: Option<Arc<RateLimiter>>,
+    /// The proxy's circuit breakers; a delete or a write that changes the
+    /// stored `circuit_breaker` drops the upstream's. None in tests that do
+    /// not set it.
+    circuit_breakers: Option<Arc<CircuitBreakers>>,
     withheld_log: withheld::WithheldLog,
 }
 
@@ -118,6 +123,7 @@ impl ControlPlaneServiceImpl {
             proxy_reader,
             metrics: None,
             rate_limiter: None,
+            circuit_breakers: None,
             withheld_log: withheld::WithheldLog::default(),
         }
     }
@@ -136,10 +142,22 @@ impl ControlPlaneServiceImpl {
         self
     }
 
-    /// Drop the rate-limit buckets of a deleted upstream.
-    fn drop_upstream_buckets(&self, id: Uuid) {
+    /// Drop the circuit breakers of `circuit_breakers` that a write or a
+    /// delete makes stale.
+    #[must_use]
+    pub(crate) fn with_circuit_breakers(mut self, circuit_breakers: Arc<CircuitBreakers>) -> Self {
+        self.circuit_breakers = Some(circuit_breakers);
+        self
+    }
+
+    /// Drop the rate-limit buckets of a deleted upstream, and its circuit
+    /// breakers and those it configures for descendants.
+    fn drop_upstream_state(&self, id: Uuid) {
         if let Some(limiter) = &self.rate_limiter {
             limiter.remove_keys_for_upstream(id);
+        }
+        if let Some(breakers) = &self.circuit_breakers {
+            breakers.remove_for_upstream(id);
         }
     }
 
@@ -502,6 +520,7 @@ impl ControlPlaneServiceImpl {
                 server: &req.server,
                 auth: req.auth.as_ref(),
                 rate_limit: req.rate_limit.as_ref(),
+                circuit_breaker: req.circuit_breaker.as_ref(),
                 plugins: req.plugins.as_ref(),
                 cors: req.cors.as_ref(),
             },
@@ -536,6 +555,7 @@ impl ControlPlaneServiceImpl {
             headers: req.headers,
             plugins: req.plugins,
             rate_limit: req.rate_limit,
+            circuit_breaker: req.circuit_breaker,
             cors: req.cors,
             tags: canonical_tags(req.tags),
             managed_by,
@@ -627,6 +647,7 @@ impl ControlPlaneServiceImpl {
                 server: &existing.server,
                 auth: req.auth.as_ref(),
                 rate_limit: req.rate_limit.as_ref(),
+                circuit_breaker: req.circuit_breaker.as_ref(),
                 plugins: req.plugins.as_ref(),
                 cors: req.cors.as_ref(),
             },
@@ -672,6 +693,8 @@ impl ControlPlaneServiceImpl {
         existing.headers = req.headers;
         existing.plugins = req.plugins;
         let previous_rate_limit = std::mem::replace(&mut existing.rate_limit, req.rate_limit);
+        let previous_circuit_breaker =
+            std::mem::replace(&mut existing.circuit_breaker, req.circuit_breaker);
         existing.cors = req.cors;
         existing.tags = canonical_tags(req.tags);
         existing.enabled = req.enabled;
@@ -688,6 +711,15 @@ impl ControlPlaneServiceImpl {
             && let Some(limiter) = &self.rate_limiter
         {
             limiter.remove_keys_for_upstream(id);
+        }
+        // The data plane rebuilds a breaker whose config differs from the one
+        // it sees, but keeps it when the config is removed (a descendant that
+        // does not see a `private` config must not drop its owner's breaker),
+        // so a removed and re-added config would continue the old state.
+        if previous_circuit_breaker != current.circuit_breaker
+            && let Some(breakers) = &self.circuit_breakers
+        {
+            breakers.remove_for_upstream(id);
         }
         Ok(current)
     }
@@ -714,9 +746,7 @@ impl ControlPlaneServiceImpl {
             .await
             .map_err(DomainError::from)?;
         // The deleted routes' buckets go with the idle-bucket sweep.
-        if let Some(limiter) = &self.rate_limiter {
-            limiter.remove_keys_for_upstream(id);
-        }
+        self.drop_upstream_state(id);
         self.routes
             .delete_by_upstream(tenant_id, id)
             .await

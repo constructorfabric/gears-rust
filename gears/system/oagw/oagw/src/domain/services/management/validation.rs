@@ -8,9 +8,9 @@ use crate::domain::gts_helpers::{
     IMPLEMENTED_GUARD_PLUGIN_IDS, IMPLEMENTED_TRANSFORM_PLUGIN_IDS, TRANSFORM_PLUGIN_SCHEMA,
 };
 use crate::domain::model::{
-    AuthConfig, CorsConfig, CreateRouteRequest, CreateUpstreamRequest, Endpoint, HeadersConfig,
-    HttpMatch, HttpMethod, MatchRules, PluginsConfig, RateLimitAlgorithm, RateLimitConfig, Route,
-    Scheme, UpdateRouteRequest, UpdateUpstreamRequest,
+    AuthConfig, CircuitBreakerConfig, CorsConfig, CreateRouteRequest, CreateUpstreamRequest,
+    Endpoint, HeadersConfig, HttpMatch, HttpMethod, MatchRules, PluginsConfig, RateLimitAlgorithm,
+    RateLimitConfig, Route, Scheme, UpdateRouteRequest, UpdateUpstreamRequest,
 };
 use crate::domain::plugin::credentials::{
     ApiKeyAuthConfig, AuthConfigError, parse_credential_mode, parse_request_secret_types,
@@ -37,6 +37,7 @@ pub(in crate::domain::services) fn validate_upstream_request(
         req.plugins.as_ref(),
         req.cors.as_ref(),
         req.rate_limit.as_ref(),
+        req.circuit_breaker.as_ref(),
         &req.server.endpoints,
     )?;
     match req.alias.as_deref() {
@@ -62,6 +63,7 @@ pub(in crate::domain::services) fn validate_upstream_update_request(
         req.plugins.as_ref(),
         req.cors.as_ref(),
         req.rate_limit.as_ref(),
+        req.circuit_breaker.as_ref(),
         &req.server.endpoints,
     )
 }
@@ -80,6 +82,7 @@ fn validate_upstream_content(
     plugins: Option<&PluginsConfig>,
     cors: Option<&CorsConfig>,
     rate_limit: Option<&RateLimitConfig>,
+    circuit_breaker: Option<&CircuitBreakerConfig>,
     endpoints: &[Endpoint],
 ) -> Result<(), DomainError> {
     validate_tags(tags)?;
@@ -99,6 +102,9 @@ fn validate_upstream_content(
     }
     if let Some(budget) = rate_limit.and_then(|rl| rl.budget.as_ref()) {
         validate_budget_config(budget)?;
+    }
+    if let Some(circuit_breaker) = circuit_breaker {
+        validate_circuit_breaker_values(circuit_breaker)?;
     }
     if let Some(auth) = auth {
         for credential in auth.credential_refs() {
@@ -274,6 +280,45 @@ fn validate_rate_limit_values(rate_limit: &RateLimitConfig) -> Result<(), Domain
             "rate_limit.cost ({}) must not exceed rate_limit.{field} ({capacity})",
             rate_limit.cost
         )));
+    }
+    Ok(())
+}
+
+/// A circuit breaker that can open and close again (`inst-cfg-5`): with a
+/// zero threshold or timeout it would never let a request through or never
+/// recover. The upper bounds keep a typo (milliseconds as seconds) from
+/// failing an upstream fast for months, an enforced one for every
+/// descendant; `timeout_seconds` is capped at a day, as the proxy timeout.
+/// Checked whether or not it is `enabled`, so enabling it later cannot store
+/// a broken config.
+fn validate_circuit_breaker_values(cb: &CircuitBreakerConfig) -> Result<(), DomainError> {
+    for (field, value, max) in [
+        (
+            "failure_threshold",
+            cb.failure_threshold,
+            u64::from(CircuitBreakerConfig::MAX_FAILURE_THRESHOLD),
+        ),
+        (
+            "timeout_seconds",
+            cb.timeout_seconds,
+            crate::config::MAX_PROXY_TIMEOUT_SECS,
+        ),
+        (
+            "success_threshold",
+            cb.success_threshold,
+            u64::from(CircuitBreakerConfig::MAX_SUCCESS_THRESHOLD),
+        ),
+    ] {
+        if value == 0 {
+            return Err(DomainError::validation(format!(
+                "circuit_breaker.{field} must be at least 1"
+            )));
+        }
+        if u64::from(value) > max {
+            return Err(DomainError::validation(format!(
+                "circuit_breaker.{field} must be at most {max}"
+            )));
+        }
     }
     Ok(())
 }

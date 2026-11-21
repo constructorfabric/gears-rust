@@ -146,7 +146,7 @@ impl ProxyEngine {
         &self,
         selected: &SelectedEndpoint,
         instance: &str,
-    ) -> Result<Target, DomainError> {
+    ) -> Result<Target, TargetError> {
         let ep = &selected.endpoint;
         let addr = match selected.resolved_addr {
             Some(addr) => addr,
@@ -155,29 +155,40 @@ impl ProxyEngine {
         Ok(target_for(ep, addr))
     }
 
-    async fn resolve(&self, ep: &Endpoint, instance: &str) -> Result<SocketAddr, DomainError> {
+    async fn resolve(&self, ep: &Endpoint, instance: &str) -> Result<SocketAddr, TargetError> {
+        // Both failures look the same on the wire: the client learns nothing
+        // about the SSRF policy.
+        let link_unavailable = || DomainError::LinkUnavailable {
+            detail: "upstream connection error".into(),
+            instance: instance.to_string(),
+        };
         let addrs = self.resolver.resolve(&ep.host, ep.port).await.map_err(|e| {
             warn!(host = %ep.host, port = ep.port, error = %e, "DNS resolution failed after retries");
-            DomainError::LinkUnavailable {
-                detail: "upstream connection error".into(),
-                instance: instance.to_string(),
-            }
+            TargetError::Unreachable(link_unavailable())
         })?;
-        first_permitted_addr(&self.ssrf_guard, &ep.host, addrs).map_err(|why| {
-            match why {
-                NoPermittedAddr::NoneResolved => {
-                    warn!(host = %ep.host, port = ep.port, "DNS returned no usable addresses");
-                }
-                NoPermittedAddr::Refused(reason) => {
-                    warn!(host = %ep.host, port = ep.port, reason, "SSRF policy refused every resolved address");
-                }
+        first_permitted_addr(&self.ssrf_guard, &ep.host, addrs).map_err(|why| match why {
+            NoPermittedAddr::NoneResolved => {
+                warn!(host = %ep.host, port = ep.port, "DNS returned no usable addresses");
+                TargetError::Unreachable(link_unavailable())
             }
-            DomainError::LinkUnavailable {
-                detail: "upstream connection error".into(),
-                instance: instance.to_string(),
+            NoPermittedAddr::Refused(reason) => {
+                warn!(host = %ep.host, port = ep.port, reason, "SSRF policy refused every resolved address");
+                TargetError::Refused(link_unavailable())
             }
         })
     }
+}
+
+/// Why [`ProxyEngine::target`] has no address to connect to. Both carry the
+/// error the client gets; the circuit breaker tells them apart.
+#[derive(Debug)]
+pub(crate) enum TargetError {
+    /// The host did not resolve, or resolved to nothing: the upstream is
+    /// unreachable.
+    Unreachable(DomainError),
+    /// The SSRF policy refused every resolved address: the gateway's policy,
+    /// not the upstream.
+    Refused(DomainError),
 }
 
 /// Map an endpoint and its address onto an engine target.
@@ -266,6 +277,21 @@ pub(crate) fn map_proxy_error(err: &ProxyError, instance: &str) -> DomainError {
             instance,
         },
     }
+}
+
+/// Whether `err` means no connection to the upstream was made: nothing of
+/// the request was sent, so the client's pace played no part.
+pub(crate) fn is_connect_failure(err: &ProxyError) -> bool {
+    matches!(
+        err.kind(),
+        ErrorKind::ConnectTimeout
+            | ErrorKind::ConnectRefused
+            | ErrorKind::ConnectNoRoute
+            | ErrorKind::Connect
+            | ErrorKind::TlsHandshakeTimeout
+            | ErrorKind::TlsHandshake
+            | ErrorKind::InvalidCertificate
+    )
 }
 
 /// Adapt an engine response body to the SDK body stream.

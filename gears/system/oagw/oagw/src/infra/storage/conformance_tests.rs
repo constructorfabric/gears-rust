@@ -236,6 +236,7 @@ fn upstream(tenant_id: Uuid, alias: &str) -> Upstream {
         headers: None,
         plugins: None,
         rate_limit: None,
+        circuit_breaker: None,
         cors: None,
         tags: vec![],
         managed_by: ManagedBy::Api,
@@ -334,6 +335,14 @@ fn full_upstream(tenant_id: Uuid, alias: &str) -> Upstream {
             ],
         }),
         rate_limit: Some(rate_limit()),
+        circuit_breaker: Some(crate::domain::model::CircuitBreakerConfig {
+            sharing: SharingMode::Inherit,
+            enabled: true,
+            failure_threshold: 5,
+            timeout_seconds: 30,
+            success_threshold: 3,
+            owner_id: None,
+        }),
         cors: Some(cors(SharingMode::Inherit)),
         tags: strings(&["ai", "llm"]),
         ..upstream(tenant_id, alias)
@@ -568,6 +577,11 @@ async fn case_upstream_round_trip_all_fields(f: &Fixture) {
         burst: None,
         ..rate_limit()
     });
+    if let Some(cb) = updated.circuit_breaker.as_mut() {
+        cb.sharing = SharingMode::Enforce;
+        cb.enabled = false;
+        cb.failure_threshold = 1;
+    }
     updated.cors = None;
     updated.tags = strings(&["llm"]);
 

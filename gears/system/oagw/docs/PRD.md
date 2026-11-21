@@ -506,6 +506,7 @@ The system **MUST** add less than 10ms overhead at p95 for proxy requests. Plugi
 The system **MUST** maintain 99.9% availability. Circuit breakers **MUST** prevent cascade failures from unhealthy upstreams.
 
 - **Threshold**: 99.9% uptime; circuit breaker trips within 5 failed requests in 30s window
+- **Implementation note**: Upstream circuit breakers trip after `failure_threshold` (default 5) consecutive failures, with no time window, and are kept per replica in memory: each replica trips on the failures it sees. A breaker is shared by every tenant on the upstream and counts only failures the upstream caused (`502`/`503`/`504`, connect, TLS and DNS failures, timeouts it had its full budget for); per-tenant isolation comes from rate limits. Fallback behaviour is planned.
 - **Rationale**: OAGW is a critical path component — if it's down, no outbound API calls succeed.
 - **Architecture Allocation**: See DESIGN.md § NFR Allocation for how this is realized
 
@@ -776,7 +777,7 @@ None. All project-default NFRs apply to this gear.
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| Upstream service outage cascading to OAGW callers | High — all consumers of that upstream blocked | Circuit breaker pattern; configurable timeout and fallback behavior |
+| Upstream service outage cascading to OAGW callers | High — all consumers of that upstream blocked | Per-upstream circuit breaker with configurable thresholds and timeout (fail fast with `503` + `Retry-After`); fallback behavior planned |
 | Credential store unavailability | High — proxy requests fail if credentials cannot be retrieved | Cache last-known-good credentials with short TTL; alert on cred_store health |
 | Rate limit state loss on restart | Medium — brief window of unlimited requests | Persist rate limit counters; accept brief burst on cold start |
 | Configuration loss on restart without a database | Medium — upstreams and routes created through the Management API disappear | Configure a database for production deployments; log a warning at startup when running with in-memory storage |

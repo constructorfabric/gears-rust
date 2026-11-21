@@ -269,6 +269,14 @@ fn full_instances(root: Uuid, reversed: bool) -> (Vec<ProvisionedUpstream>, Vec<
             }),
             plugins: Some(full_plugins(reversed)),
             rate_limit: Some(full_rate_limit()),
+            circuit_breaker: Some(crate::domain::model::CircuitBreakerConfig {
+                sharing: SharingMode::Inherit,
+                enabled: true,
+                failure_threshold: 5,
+                timeout_seconds: 30,
+                success_threshold: 3,
+                owner_id: None,
+            }),
             cors: Some(full_cors()),
             tags: vec!["t1".into(), "t2".into()],
             enabled: true,
@@ -453,6 +461,22 @@ fn upstream_mutations() -> Vec<Mutation<CreateUpstreamRequest>> {
         }),
         ("plugins none", |u| u.plugins = None),
         ("rate_limit none", |u| u.rate_limit = None),
+        ("circuit_breaker none", |u| u.circuit_breaker = None),
+        ("circuit_breaker.sharing", |u| {
+            u.circuit_breaker.as_mut().unwrap().sharing = SharingMode::Enforce;
+        }),
+        ("circuit_breaker.enabled", |u| {
+            u.circuit_breaker.as_mut().unwrap().enabled = false;
+        }),
+        ("circuit_breaker.failure_threshold", |u| {
+            u.circuit_breaker.as_mut().unwrap().failure_threshold = 6;
+        }),
+        ("circuit_breaker.timeout_seconds", |u| {
+            u.circuit_breaker.as_mut().unwrap().timeout_seconds = 31;
+        }),
+        ("circuit_breaker.success_threshold", |u| {
+            u.circuit_breaker.as_mut().unwrap().success_threshold = 4;
+        }),
         ("cors none", |u| u.cors = None),
         ("tags", |u| u.tags.reverse()),
         ("enabled", |u| u.enabled = false),
@@ -509,7 +533,7 @@ fn grpc_route_mutations() -> Vec<Mutation<CreateRouteRequest>> {
 /// ADR-0018: PERS-GATE-013.
 #[test]
 fn the_content_hash_of_fixed_content_is_pinned() {
-    const PINNED: &str = "ba788717e7bf0fde34c7b0240c6a3eaac21ebce58bdd524eaf5023ee24b636d5";
+    const PINNED: &str = "258439e92569ea57d14c077882698f0b70713ff4334fcf14f0f18f2683ed1eb7";
     let root = Uuid::from_u128(0x42);
     let (mut upstreams, mut routes) = full_instances(root, false);
     assert_eq!(

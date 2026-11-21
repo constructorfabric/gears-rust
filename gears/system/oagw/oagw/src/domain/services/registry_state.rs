@@ -27,9 +27,10 @@ use super::registry_reconcile::{
     log_counts, reconcile_registry,
 };
 use crate::domain::model::{
-    AuthConfig, BudgetConfig, BurstConfig, CorsConfig, CreateRouteRequest, CreateUpstreamRequest,
-    Endpoint, GrpcMatch, HeadersConfig, HttpMatch, MatchRules, PluginBinding, PluginsConfig,
-    RateLimitConfig, RequestHeaderRules, ResponseHeaderRules, Server, SustainedRate,
+    AuthConfig, BudgetConfig, BurstConfig, CircuitBreakerConfig, CorsConfig, CreateRouteRequest,
+    CreateUpstreamRequest, Endpoint, GrpcMatch, HeadersConfig, HttpMatch, MatchRules,
+    PluginBinding, PluginsConfig, RateLimitConfig, RequestHeaderRules, ResponseHeaderRules, Server,
+    SustainedRate,
 };
 use crate::domain::ports::OagwMetricsPort;
 use crate::domain::ports::metric_labels::provisioning_outcome;
@@ -193,6 +194,7 @@ impl Encoder {
             headers,
             plugins,
             rate_limit,
+            circuit_breaker,
             cors,
             tags,
             enabled,
@@ -209,6 +211,7 @@ impl Encoder {
         self.opt(headers.as_ref(), Self::headers);
         self.opt(plugins.as_ref(), Self::plugins);
         self.opt(rate_limit.as_ref(), Self::rate_limit);
+        self.opt(circuit_breaker.as_ref(), Self::circuit_breaker);
         self.opt(cors.as_ref(), Self::cors);
         self.strs(tags);
         self.bool(*enabled);
@@ -316,6 +319,22 @@ impl Encoder {
         self.variant(strategy);
         self.u64(u64::from(*cost));
         self.bool(*response_headers);
+    }
+
+    fn circuit_breaker(&mut self, c: &CircuitBreakerConfig) {
+        let CircuitBreakerConfig {
+            sharing,
+            enabled,
+            failure_threshold,
+            timeout_seconds,
+            success_threshold,
+            owner_id: _, // set by the hierarchical merge, never by provisioning
+        } = c;
+        self.variant(sharing);
+        self.bool(*enabled);
+        self.u64(u64::from(*failure_threshold));
+        self.u64(u64::from(*timeout_seconds));
+        self.u64(u64::from(*success_threshold));
     }
 
     fn cors(&mut self, c: &CorsConfig) {

@@ -62,10 +62,6 @@ const RETRY_AFTER_TRANSIENT_SECS: u64 = 5;
 /// No-route / connect-failure errors — retry once DNS/network settles.
 const RETRY_AFTER_LINK_SECS: u64 = 10;
 
-/// Circuit-breaker-open and admin-disabled upstreams — bounded by the
-/// circuit-breaker recovery window or operator action.
-const RETRY_AFTER_CIRCUIT_BREAKER_SECS: u64 = 30;
-
 /// Upstream-disabled by configuration — operator action required.
 const RETRY_AFTER_ADMIN_SECS: u64 = 30;
 
@@ -294,9 +290,8 @@ impl From<DomainError> for CanonicalError {
                 // identifiers; this is only the mapping step.
                 tracing::debug!(reason = %detail, "OAGW credential store unavailable");
                 // CredStore's hint, rounded up to whole seconds (at least 1).
-                let retry_after_secs = retry_after.map_or(RETRY_AFTER_TRANSIENT_SECS, |d| {
-                    (d.as_secs() + u64::from(d.subsec_nanos() > 0)).max(1)
-                });
+                let retry_after_secs =
+                    retry_after.map_or(RETRY_AFTER_TRANSIENT_SECS, retry_after_seconds);
                 CanonicalError::service_unavailable()
                     .with_retry_after_seconds(retry_after_secs)
                     .create()
@@ -377,10 +372,16 @@ impl From<DomainError> for CanonicalError {
                     .create()
             }
 
-            DomainError::CircuitBreakerOpen { detail, .. } => {
-                tracing::warn!(reason = %detail, "OAGW circuit breaker open");
+            DomainError::CircuitBreakerOpen {
+                detail,
+                retry_after,
+                ..
+            } => {
+                // The toolkit logs the transition and counts rejections.
+                tracing::debug!(reason = %detail, "OAGW circuit breaker open");
+                // Until the breaker lets a probe through.
                 CanonicalError::service_unavailable()
-                    .with_retry_after_seconds(RETRY_AFTER_CIRCUIT_BREAKER_SECS)
+                    .with_retry_after_seconds(retry_after_seconds(retry_after))
                     .create()
             }
 
@@ -419,6 +420,11 @@ impl From<DomainError> for CanonicalError {
             }
         }
     }
+}
+
+/// A retry hint in whole seconds, rounded up and at least 1.
+fn retry_after_seconds(d: std::time::Duration) -> u64 {
+    (d.as_secs() + u64::from(d.subsec_nanos() > 0)).max(1)
 }
 
 /// Route a plugin-not-found error to the resource scope matching the
@@ -908,10 +914,21 @@ mod tests {
             DomainError::CircuitBreakerOpen {
                 detail: "x".into(),
                 instance: i(),
+                retry_after: std::time::Duration::from_millis(12_300),
             },
             503,
-            RETRY_AFTER_CIRCUIT_BREAKER_SECS,
+            13,
             "CircuitBreakerOpen",
+        );
+        assert_retry(
+            DomainError::CircuitBreakerOpen {
+                detail: "x".into(),
+                instance: i(),
+                retry_after: std::time::Duration::ZERO,
+            },
+            503,
+            1,
+            "CircuitBreakerOpen about to probe",
         );
         assert_retry(
             DomainError::GuardRejected {
@@ -1121,6 +1138,7 @@ mod tests {
             DomainError::CircuitBreakerOpen {
                 detail: "test".into(),
                 instance: "/test".into(),
+                retry_after: std::time::Duration::from_secs(1),
             },
             DomainError::IdleTimeout {
                 detail: "test".into(),

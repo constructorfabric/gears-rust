@@ -284,11 +284,11 @@ impl Gear for OutboundApiGatewayGear {
 
         // -- Metrics --
         let metrics_prefix = cfg.metrics.effective_prefix("oagw");
-        let scope = opentelemetry::InstrumentationScope::builder("oagw").build();
-        let metrics: Arc<dyn OagwMetricsPort> = Arc::new(OagwMetricsMeter::new(
-            &opentelemetry::global::meter_with_scope(scope),
-            &metrics_prefix,
-        ));
+        let meter = opentelemetry::global::meter_with_scope(
+            opentelemetry::InstrumentationScope::builder("oagw").build(),
+        );
+        let metrics: Arc<dyn OagwMetricsPort> =
+            Arc::new(OagwMetricsMeter::new(&meter, &metrics_prefix));
 
         // -- Control Plane init --
         let Repositories {
@@ -341,6 +341,16 @@ impl Gear for OutboundApiGatewayGear {
         // Shared by the Control Plane, which drops the buckets a write makes
         // stale, and the Data Plane, which enforces the limits.
         let rate_limiter = Arc::new(crate::domain::rate_limit::RateLimiter::new());
+        // Likewise for the circuit breakers: the Control Plane drops a deleted
+        // upstream's. Their metrics are the toolkit's
+        // `resilience.circuit_breaker.*`, named `{alias}/{upstream id}`. No
+        // gear prefix: every gear's breakers share these names and dashboards.
+        let breaker_metrics =
+            toolkit_resilience::metrics::otel::OtelCircuitBreakerMetrics::new(&meter);
+        let circuit_breakers = Arc::new(
+            crate::domain::circuit_breaker::CircuitBreakers::new()
+                .with_observer(Arc::new(breaker_metrics)),
+        );
         let cp_impl = Arc::new(
             ControlPlaneServiceImpl::new(
                 upstream_repo,
@@ -353,6 +363,7 @@ impl Gear for OutboundApiGatewayGear {
             )
             .with_metrics(metrics.clone())
             .with_rate_limiter(rate_limiter.clone())
+            .with_circuit_breakers(circuit_breakers.clone())
             .with_allow_http_upstream(cfg.allow_http_upstream),
         );
         // The registry reconcile only; handlers and the SDK get `cp`.
@@ -412,6 +423,7 @@ impl Gear for OutboundApiGatewayGear {
             metrics.clone(),
             // Shared with the Control Plane (see above).
             rate_limiter,
+            circuit_breakers,
         )
         .with_request_timeout(Duration::from_secs(cfg.proxy_timeout_secs))
         .with_max_body_size(cfg.max_body_size_bytes)
@@ -422,7 +434,7 @@ impl Gear for OutboundApiGatewayGear {
         // The REST surface serves before the start phase: a stream opened in
         // that window must end at shutdown too.
         .with_streams_under(ctx.cancellation_token());
-        dp_impl.spawn_rate_limit_sweeper(ctx.cancellation_token().clone());
+        dp_impl.spawn_idle_sweeper(ctx.cancellation_token().clone());
         self.stream_shutdown
             .set(dp_impl.stream_shutdown())
             .map_err(|_| anyhow::anyhow!("stream shutdown signal already set"))?;

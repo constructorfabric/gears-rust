@@ -468,6 +468,13 @@ async def _handle(method: str, target: str, headers: dict, body: bytes, writer: 
         code = int(m.group(1))
         writer.write(_json_response({"status": code, "description": f"Status {code}"}, status=code))
 
+    # GET /flaky/{key}/{n} — 503 for the first n calls with this key, 200
+    # after: an upstream that recovers. Keys are per test, the mock is shared.
+    elif method == "GET" and (m := re.fullmatch(r"/flaky/([\w-]+)/(\d+)", path)):
+        call = _bump_count(f"flaky:{m.group(1)}")
+        status = 503 if call <= int(m.group(2)) else 200
+        writer.write(_json_response({"call": call, "status": status}, status=status))
+
     # POST /echo-401-once — returns 401 on first call, 200 thereafter.
     # Used to exercise the OAGW 401-retry logic.
     elif method == "POST" and path == "/echo-401-once":

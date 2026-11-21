@@ -77,6 +77,7 @@ fn upstream(tenant_id: Uuid, alias: &str) -> Upstream {
         headers: None,
         plugins: None,
         rate_limit: None,
+        circuit_breaker: None,
         cors: None,
         tags: vec![],
         managed_by: ManagedBy::Api,

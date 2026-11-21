@@ -30,7 +30,10 @@ use super::entity::{
     upstream_plugin, upstream_tag,
 };
 use super::error::invalid_stored;
-use super::json::{StoredCors, StoredHeaders, StoredMatchConfig, StoredRateLimit, StoredServer};
+use super::json::{
+    StoredCircuitBreaker, StoredCors, StoredHeaders, StoredMatchConfig, StoredRateLimit,
+    StoredServer,
+};
 use crate::domain::model::{
     AuthConfig, GrpcMatch, HttpMatch, HttpMethod, ManagedBy, MatchRules, PathSuffixMode,
     PluginBinding, PluginsConfig, Route, SharingMode, Upstream,
@@ -278,6 +281,12 @@ pub(super) fn upstream_rows(
             .map(|rl| encode(UPSTREAM, u.id, &StoredRateLimit::from(rl)))
             .transpose()?),
         rate_limit_sharing: Set(section_sharing(u.rate_limit.as_ref(), |rl| rl.sharing)),
+        circuit_breaker: Set(u
+            .circuit_breaker
+            .as_ref()
+            .map(|cb| encode(UPSTREAM, u.id, &StoredCircuitBreaker::from(cb)))
+            .transpose()?),
+        circuit_breaker_sharing: Set(section_sharing(u.circuit_breaker.as_ref(), |cb| cb.sharing)),
         plugins_sharing: Set(u
             .plugins
             .as_ref()
@@ -337,6 +346,19 @@ pub(super) fn upstream_from_rows(
                 )
             })
             .transpose()?;
+    let circuit_breaker = decode_opt::<StoredCircuitBreaker>(
+        UPSTREAM,
+        id,
+        "circuit_breaker",
+        row.circuit_breaker.as_ref(),
+    )?
+    .map(|cb| {
+        Ok::<_, RepositoryError>(cb.into_domain(sharing(
+            "circuit_breaker_sharing",
+            &row.circuit_breaker_sharing,
+        )?))
+    })
+    .transpose()?;
     let plugins = plugins_from_rows(
         UPSTREAM,
         id,
@@ -360,6 +382,7 @@ pub(super) fn upstream_from_rows(
             .map(Into::into),
         plugins,
         rate_limit,
+        circuit_breaker,
         cors,
         tags: sorted_tags(tags.into_iter().map(|t| t.tag)),
         managed_by,
@@ -651,8 +674,8 @@ mod tests {
         APIKEY_AUTH_PLUGIN_ID, AUTH_PLUGIN_SCHEMA, HTTP_PROTOCOL_ID, TIMEOUT_GUARD_PLUGIN_ID,
     };
     use crate::domain::model::{
-        CorsConfig, CorsHttpMethod, Endpoint, RateLimitAlgorithm, RateLimitConfig, RateLimitScope,
-        RateLimitStrategy, Scheme, Server, SustainedRate, Window,
+        CircuitBreakerConfig, CorsConfig, CorsHttpMethod, Endpoint, RateLimitAlgorithm,
+        RateLimitConfig, RateLimitScope, RateLimitStrategy, Scheme, Server, SustainedRate, Window,
     };
 
     const ALL_SHARING: [SharingMode; 3] = [
@@ -779,6 +802,14 @@ mod tests {
                 }],
             }),
             rate_limit: Some(rate_limit(SharingMode::Enforce)),
+            circuit_breaker: Some(CircuitBreakerConfig {
+                sharing: SharingMode::Enforce,
+                enabled: false,
+                failure_threshold: 4,
+                timeout_seconds: 9,
+                success_threshold: 2,
+                owner_id: None,
+            }),
             cors: Some(cors(SharingMode::Inherit)),
             tags: vec!["a".into(), "b".into()],
             managed_by: ManagedBy::Registry,
@@ -865,9 +896,33 @@ mod tests {
         // Sharing lives in the columns, not in the JSON.
         assert!(row.cors.as_ref().unwrap().get("sharing").is_none());
         assert!(row.rate_limit.as_ref().unwrap().get("sharing").is_none());
+        assert_eq!(
+            row.circuit_breaker,
+            Some(serde_json::json!({
+                "enabled": false,
+                "failure_threshold": 4,
+                "timeout_seconds": 9,
+                "success_threshold": 2,
+            }))
+        );
+        assert_eq!(row.circuit_breaker_sharing, "enforce");
         assert_eq!(row.cors_sharing, "inherit");
         assert_eq!(row.plugins_sharing.as_deref(), Some("enforce"));
         assert!(row.auth_plugin_uuid.is_some());
+        assert_eq!(upstream_from_rows(row, tags, plugins).unwrap(), u);
+    }
+
+    /// An upstream without a breaker stores NULL and `private`, as the
+    /// migration fills in for rows written before the column.
+    #[test]
+    fn absent_circuit_breaker_round_trips() {
+        let u = Upstream {
+            circuit_breaker: None,
+            ..sample_upstream()
+        };
+        let (row, tags, plugins) = upstream_models(&u);
+        assert_eq!(row.circuit_breaker, None);
+        assert_eq!(row.circuit_breaker_sharing, "private");
         assert_eq!(upstream_from_rows(row, tags, plugins).unwrap(), u);
     }
 
@@ -967,6 +1022,14 @@ mod tests {
             "rate_limit",
         );
         assert_invalid(corrupt(&|r| r.cors = Some(serde_json::json!([]))), "cors");
+        assert_invalid(
+            corrupt(&|r| r.circuit_breaker = Some(serde_json::json!({"enabled": true}))),
+            "circuit_breaker",
+        );
+        assert_invalid(
+            corrupt(&|r| r.circuit_breaker_sharing = "none".into()),
+            "circuit_breaker_sharing",
+        );
         assert_invalid(
             corrupt(&|r| r.auth_config = Some(serde_json::json!(1))),
             "auth_config",

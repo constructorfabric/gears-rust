@@ -56,6 +56,8 @@ toolkit-auth = { workspace = true }
 toolkit-canonical-errors = { workspace = true, features = ["axum"] }
 toolkit-gts = { workspace = true }
 toolkit-http = { workspace = true }
+# Upstream circuit breakers, with their OpenTelemetry observer.
+toolkit-resilience = { workspace = true, features = ["otel"] }
 toolkit-security = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-utils = { workspace = true, features = ["humantime-serde"] }

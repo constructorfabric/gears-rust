@@ -206,6 +206,35 @@ struct RateLimitConfig {
     response_headers: bool,
 }
 
+/// Defaults as in the REST DTO (ADR-0005); unknown fields are rejected, so
+/// a misspelled one does not fall back to its default.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CircuitBreakerConfig {
+    #[serde(default)]
+    sharing: SharingMode,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default = "default_failure_threshold")]
+    failure_threshold: u32,
+    #[serde(default = "default_timeout_seconds")]
+    timeout_seconds: u32,
+    #[serde(default = "default_success_threshold")]
+    success_threshold: u32,
+}
+
+fn default_failure_threshold() -> u32 {
+    oagw_sdk::CircuitBreakerConfig::DEFAULT_FAILURE_THRESHOLD
+}
+
+fn default_timeout_seconds() -> u32 {
+    oagw_sdk::CircuitBreakerConfig::DEFAULT_TIMEOUT_SECONDS
+}
+
+fn default_success_threshold() -> u32 {
+    oagw_sdk::CircuitBreakerConfig::DEFAULT_SUCCESS_THRESHOLD
+}
+
 #[derive(Deserialize)]
 struct BudgetConfig {
     #[serde(default)]
@@ -312,6 +341,8 @@ struct UpstreamPayload {
     plugins: Option<PluginsConfig>,
     #[serde(default)]
     rate_limit: Option<RateLimitConfig>,
+    #[serde(default)]
+    circuit_breaker: Option<CircuitBreakerConfig>,
     #[serde(default)]
     cors: Option<CorsConfig>,
     #[serde(default)]
@@ -515,6 +546,19 @@ impl From<RateLimitConfig> for domain::RateLimitConfig {
     }
 }
 
+impl From<CircuitBreakerConfig> for domain::CircuitBreakerConfig {
+    fn from(v: CircuitBreakerConfig) -> Self {
+        Self {
+            sharing: v.sharing.into(),
+            enabled: v.enabled,
+            failure_threshold: v.failure_threshold,
+            timeout_seconds: v.timeout_seconds,
+            success_threshold: v.success_threshold,
+            owner_id: None,
+        }
+    }
+}
+
 impl From<BudgetConfig> for domain::BudgetConfig {
     fn from(v: BudgetConfig) -> Self {
         Self {
@@ -643,6 +687,7 @@ impl UpstreamPayload {
                 headers: self.headers.map(Into::into),
                 plugins: self.plugins.map(Into::into),
                 rate_limit: self.rate_limit.map(Into::into),
+                circuit_breaker: self.circuit_breaker.map(Into::into),
                 cors: self.cors.map(Into::into),
                 tags: self.tags,
                 enabled: self.enabled,
@@ -1086,6 +1131,47 @@ mod tests {
         let rr = headers.request.as_ref().unwrap();
         assert_eq!(rr.set.get("x-custom").unwrap(), "value");
         assert_eq!(rr.passthrough, domain::PassthroughMode::All);
+        assert_eq!(req.circuit_breaker, None);
+    }
+
+    #[test]
+    fn deserialize_upstream_circuit_breaker_with_defaults() {
+        let json = serde_json::json!({
+            "server": {"endpoints": [{"host": "api.example.com"}]},
+            "protocol": HTTP_PROTOCOL_ID,
+            "circuit_breaker": {"sharing": "enforce", "failure_threshold": 2}
+        });
+        let payload: UpstreamPayload = serde_json::from_value(json).unwrap();
+        let provisioned = payload.into_provisioned(None);
+        assert_eq!(
+            provisioned.request.circuit_breaker,
+            Some(domain::CircuitBreakerConfig {
+                sharing: domain::SharingMode::Enforce,
+                enabled: true,
+                failure_threshold: 2,
+                timeout_seconds: 30,
+                success_threshold: 3,
+                owner_id: None,
+            })
+        );
+    }
+
+    /// A misspelled field is an error, not a silent default.
+    #[test]
+    fn upstream_circuit_breaker_rejects_unknown_fields() {
+        let json = serde_json::json!({
+            "server": {"endpoints": [{"host": "api.example.com"}]},
+            "protocol": HTTP_PROTOCOL_ID,
+            "circuit_breaker": {"failure_treshold": 1}
+        });
+        let err = serde_json::from_value::<UpstreamPayload>(json)
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("unknown field `failure_treshold`")),
+            "{err:?}"
+        );
     }
 
     #[test]

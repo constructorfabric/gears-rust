@@ -1242,6 +1242,7 @@ fn upstream_update(req: &CreateUpstreamRequest) -> UpdateUpstreamRequest {
         headers: req.headers.clone(),
         plugins: req.plugins.clone(),
         rate_limit: req.rate_limit.clone(),
+        circuit_breaker: req.circuit_breaker.clone(),
         cors: req.cors.clone(),
         tags: req.tags.clone(),
         enabled: req.enabled,

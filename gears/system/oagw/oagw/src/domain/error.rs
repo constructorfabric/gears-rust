@@ -285,6 +285,8 @@ pub enum DomainError {
         detail: String,
         /// Request instance URI the error relates to (used as the problem `instance`).
         instance: String,
+        /// How long until the breaker lets a probe through (`Retry-After`).
+        retry_after: std::time::Duration,
     },
 
     /// The connection was idle for longer than the idle timeout.
