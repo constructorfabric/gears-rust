@@ -150,10 +150,10 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
 30. [x] - `p1` - **IF** the engine reports an HTTP/2 protocol error - `inst-proxy-29`
     1. [x] - `p1` - **RETURN** 502 ProtocolError with `X-OAGW-Error-Source: gateway` - `inst-proxy-29a`
 31. [x] - `p1` - Receive the upstream response head; the body streams - `inst-proxy-30`
-32. [x] - `p1` - **IF** upstream returns error response - `inst-proxy-31`
-    1. [x] - `p1` - Execute transform plugins: `on_error` phase - `inst-proxy-31a`
-    2. [x] - `p1` - **RETURN** upstream response as-is with `X-OAGW-Error-Source: upstream` - `inst-proxy-31b`
-33. [x] - `p1` - Execute transform plugins: `on_response` phase - `inst-proxy-32`
+32. [x] - `p1` - **IF** the exchange fails on the gateway side (connection failure, timeout, protocol error, request body limit, response guard rejection) - `inst-proxy-31`
+    1. [x] - `p1` - Execute transform plugins: `on_error` phase, with the status the client gets; `on_error` runs only for these gateway-originated errors (errors raised before forwarding, such as validation, auth, guard or rate-limit rejections, return without it, and so does a failed WebSocket upgrade) - `inst-proxy-31a`
+    2. [x] - `p1` - **RETURN** the gateway error with `X-OAGW-Error-Source: gateway` - `inst-proxy-31b`
+33. [x] - `p1` - Execute transform plugins: `on_response` phase, for every upstream response; an upstream 4xx/5xx goes through `on_response`, not `on_error`, and is returned with its status, headers and body and `X-OAGW-Error-Source: upstream` - `inst-proxy-32`
 34. [x] - `p1` - **RETURN** transformed response with `X-OAGW-Error-Source: upstream` - `inst-proxy-33`
 
 ## 3. Processes / Business Logic (CDSL)
@@ -384,7 +384,7 @@ The system **MUST** match inbound requests to routes by HTTP method allowlist an
 
 - [x] `p1` - **ID**: `cpt-cf-oagw-dod-plugin-chain`
 
-The system **MUST** execute the plugin chain in deterministic order: Auth → Guards → Transform(on_request) → upstream call → Transform(on_response/on_error). Upstream plugins **MUST** execute before route plugins (`[U1, U2] + [R1, R2]`). Plugins **MUST** be resolved via GTS identifier: UUID-backed plugins from `oagw_plugin`, named plugins from in-process registry. Auth plugin credentials **MUST** be resolved from `cred_store` via `secret_ref` at request time per `cpt-cf-oagw-principle-cred-isolation`.
+The system **MUST** execute the plugin chain in deterministic order: Auth → Guards → Transform(on_request) → upstream call → Transform(on_response/on_error). `on_response` **MUST** run for every upstream response, 4xx/5xx included; `on_error` runs only for gateway-originated errors of the upstream exchange. Upstream plugins **MUST** execute before route plugins (`[U1, U2] + [R1, R2]`). Plugins **MUST** be resolved via GTS identifier: UUID-backed plugins from `oagw_plugin`, named plugins from in-process registry. Auth plugin credentials **MUST** be resolved from `cred_store` via `secret_ref` at request time per `cpt-cf-oagw-principle-cred-isolation`.
 
 **Implements**:
 - `cpt-cf-oagw-algo-plugin-chain-execution`

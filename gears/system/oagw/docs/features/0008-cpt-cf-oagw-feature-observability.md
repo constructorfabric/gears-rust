@@ -69,7 +69,7 @@ Operators need full visibility into outbound API traffic patterns, errors, and p
 - mTLS support for client certificate authentication with upstreams (future work)
 - Centralized logging system deployment and configuration (infrastructure concern)
 - Distributed tracing backend deployment (infrastructure concern; feature provides trace context propagation)
-- Custom metric definitions beyond the 16 OAGW standard metrics and the 8 proxy configuration cache metrics
+- Custom metric definitions beyond the OAGW standard metrics and the 8 proxy configuration cache metrics
 
 ### 1.6 Configuration Parameters
 
@@ -163,26 +163,27 @@ Operators need full visibility into outbound API traffic patterns, errors, and p
 1. [ ] - `p2` - Extract or generate trace_id from inbound request context (propagate W3C Trace Context `traceparent` header if present; generate new trace_id otherwise) - `inst-mc-0`
 2. [ ] - `p2` - Normalize path from route configuration (use route match pattern, not raw path) to control cardinality - `inst-mc-1`
 3. [ ] - `p2` - Capture the numeric HTTP response status code for the `http.response.status_code` label (OTel HTTP semconv; aligned with the inbound API Gateway) - `inst-mc-2`
-4. [ ] - `p2` - Increment `oagw_requests_in_flight{host}` gauge at request start - `inst-mc-3`
+4. [ ] - `p2` - Increment `oagw_requests_in_flight{host}` gauge at request start, under `host` `unknown` until the upstream is resolved, then under the upstream alias - `inst-mc-3`
 5. [ ] - `p2` - **TRY** - `inst-mc-4`
    1. [ ] - `p2` - Execute proxy pipeline (auth → guards → transform → upstream call → response transform) - `inst-mc-4a`
 6. [ ] - `p2` - **CATCH** any error - `inst-mc-5`
-   1. [ ] - `p2` - Increment `oagw_errors_total{host, path, error_type, credential_mode}` counter (`credential_mode`: `config`, `request_ref`, or `unknown` before the upstream resolves) - `inst-mc-5a`
-7. [ ] - `p2` - Decrement `oagw_requests_in_flight{host}` gauge at request end - `inst-mc-6`
-8. [ ] - `p2` - Increment `oagw_requests_total{host, http.request.method, http.route, http.response.status_code, credential_mode}` counter (label keys per OTel HTTP semconv; method normalized; `credential_mode` per ADR-0022) - `inst-mc-7`
-9. [ ] - `p2` - Observe request duration in `oagw_request_duration_seconds{host, path, phase}` histogram using configured buckets (`phase`: `total`, `resolve` for the upstream and route lookup with the proxy configuration cache on or off, `auth`) - `inst-mc-8`
-10. [ ] - `p2` - **IF** rate limit was evaluated - `inst-mc-9`
-    1. [ ] - `p2` - Update `oagw_rate_limit_usage_ratio{host, path}` gauge with current token ratio (0.0–1.0) - `inst-mc-9a`
-    2. [ ] - `p2` - **IF** rate limit exceeded, increment `oagw_rate_limit_exceeded_total{host, path}` counter - `inst-mc-9b`
-11. [ ] - `p2` - **IF** circuit breaker state changed - `inst-mc-10`
+   1. [ ] - `p2` - Increment `oagw_errors_total{host, path, error_type, credential_mode}` counter (gateway errors only; an upstream error response is not an error here; `credential_mode`: `config`, `request_ref`, or `unknown` before the upstream resolves) - `inst-mc-5a`
+7. [ ] - `p2` - Decrement `oagw_requests_in_flight{host}` gauge when the response body ends, fails or is dropped; for a gateway error, or a response without a body (101, HEAD, 204, 304), at the response head - `inst-mc-6`
+8. [ ] - `p2` - Increment `oagw_requests_total{host, http.request.method, http.route, http.response.status_code, credential_mode}` counter for every request with a response: the upstream's status (4xx/5xx included), or for a gateway error the status the client gets; a denied `proxy:invoke` check, and a granted request the REST handler rejects before the Data Plane runs (proxy path, WebSocket upgrade, body size and body read checks), count under `host` and `http.route` `unknown`. A request the client dropped before its response head counts only in `oagw_errors_total{error_type="Cancelled"}`. A response the REST handler fails to send after the Data Plane returned it (a 101 without its tunnel, a client connection that cannot upgrade) stays counted with the Data Plane's status (label keys per OTel HTTP semconv; method normalized; `credential_mode` per ADR-0022) - `inst-mc-7`
+9. [ ] - `p2` - Observe request duration in `oagw_request_duration_seconds{host, path, phase}` histogram using configured buckets (`phase`: `total` from request start to the response head or the gateway error, not to the end of the body; `resolve` for the upstream and route lookup with the proxy configuration cache on or off; `auth`) - `inst-mc-8`
+10. [ ] - `p2` - When the response body ends, fails or is dropped, observe `oagw_stream_duration_seconds{host, http.route, outcome}` from request start (`outcome`: `completed` at the end of the body, or once its `Content-Length` went through; `error` for an upstream failure or an idle timeout; `shutdown` for a gateway stop; `cancelled` when the client went away). Every upstream body is relayed as a stream, SSE or not; a response without a body (101, HEAD, 204, 304, `Content-Length: 0`) records none. A WebSocket session records `oagw_websocket_session_duration_seconds{host, outcome}` at teardown instead (`completed` when the tunnel closed, from either side; `error` on an idle timeout or an IO error; `shutdown` for a gateway stop; `cancelled` when the bridge task was dropped or panicked) - `inst-mc-8b`
+11. [ ] - `p2` - **IF** rate limit was evaluated - `inst-mc-9`
+    1. [ ] - `p2` - Update `oagw_rate_limit_usage_ratio{host, http.route, bucket}` gauge with the token ratio (0.0–1.0) of each bucket checked (`bucket`: `route`, `shadowed_route`, `upstream`, `pool`; the shadowed ancestor routes of one route share the `shadowed_route` series, written once per request with the highest ratio among them) - `inst-mc-9a`
+    2. [ ] - `p2` - **IF** rate limit exceeded, increment `oagw_rate_limit_exceeded_total{host, http.route, bucket}` counter for the rejecting bucket - `inst-mc-9b`
+12. [ ] - `p2` - **IF** circuit breaker state changed - `inst-mc-10`
     1. [ ] - `p2` - Update `oagw_circuit_breaker_state{host}` gauge (0=CLOSED, 1=HALF_OPEN, 2=OPEN) - `inst-mc-10a`
     2. [ ] - `p2` - Increment `oagw_circuit_breaker_transitions_total{host, from_state, to_state}` counter - `inst-mc-10b`
-12. [ ] - `p2` - **IF** multi-endpoint upstream - `inst-mc-11`
+13. [ ] - `p2` - **IF** multi-endpoint upstream - `inst-mc-11`
     1. [ ] - `p2` - Increment `oagw_routing_endpoint_selected{upstream_id, endpoint_host, selection_method}` counter - `inst-mc-11a`
     2. [ ] - `p2` - **IF** X-OAGW-Target-Host header was used, increment `oagw_routing_target_host_used{upstream_id, endpoint_host}` counter - `inst-mc-11b`
-13. [ ] - `p2` - Update `oagw_upstream_available{host, endpoint}` gauge based on response outcome (0=down, 1=up) - `inst-mc-12`
-14. [ ] - `p2` - Update `oagw_upstream_connections{host, state}` gauge with current connection pool state - `inst-mc-13`
-15. [ ] - `p2` - **RETURN** void (metrics updated in-place via Prometheus registry) - `inst-mc-14`
+14. [ ] - `p2` - Update `oagw_upstream_available{host, endpoint}` gauge based on response outcome (0=down, 1=up) - `inst-mc-12`
+15. [ ] - `p2` - Update `oagw_upstream_connections{host, state}` gauge with current connection pool state - `inst-mc-13`
+16. [ ] - `p2` - **RETURN** void (metrics updated in-place via Prometheus registry) - `inst-mc-14`
 
 ### Audit Log Emission
 
@@ -351,12 +352,18 @@ Not applicable — this feature implements pipeline-integrated cross-cutting con
 
 - [ ] `p2` - **ID**: `cpt-cf-oagw-dod-obs-prometheus-metrics`
 
-The system **MUST** expose all 16 OAGW Prometheus metrics at the admin `/metrics` endpoint:
+The system **MUST** expose these OAGW Prometheus metrics at the admin `/metrics` endpoint:
 - Counters: `oagw_requests_total`, `oagw_errors_total`, `oagw_rate_limit_exceeded_total`, `oagw_rate_limit_buckets_evicted_total`, `oagw_circuit_breaker_transitions_total`, `oagw_routing_target_host_used`, `oagw_routing_endpoint_selected`, `oagw_registry_provisioning_failures_total{kind, reason}`, `oagw_registry_provisioning_runs_total{outcome}`, `oagw_credentials_withheld_total{host, outcome}`
-- Histograms: `oagw_request_duration_seconds` with buckets `[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]`
-- Gauges: `oagw_requests_in_flight`, `oagw_circuit_breaker_state`, `oagw_rate_limit_usage_ratio`, `oagw_rate_limit_buckets`, `oagw_upstream_available`, `oagw_upstream_connections`
+- Histograms: `oagw_request_duration_seconds` with buckets `[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]`, `oagw_stream_duration_seconds{host, http.route, outcome}`, `oagw_websocket_session_duration_seconds{host, outcome}`
+- Gauges: `oagw_requests_in_flight`, `oagw_circuit_breaker_state`, `oagw_rate_limit_usage_ratio`, `oagw_rate_limit_buckets`, `oagw_upstream_available`, `oagw_upstream_connections`, `oagw_active_websocket_sessions{host}`
 
-`oagw_request_duration_seconds` records the phases `total`, `resolve` (the upstream and route lookup, with the proxy configuration cache on or off, so the two can be compared) and `auth`.
+`oagw_requests_total` counts every proxy request with a response under its status: the upstream's status, or for a gateway error (401, 403, 429, 502, ...) the status the client gets, so a 5xx-rate query covers gateway 5xx too. `oagw_errors_total` counts the gateway errors again by `error_type`, plus `Cancelled` for a request the client dropped before its response head; such a request has no status and is not in `oagw_requests_total`. Rejections the REST handler makes after `proxy:invoke` is granted and before the Data Plane runs (proxy path, WebSocket upgrade, body size and body read checks) are counted the same way, under `host` and `http.route` `unknown`; a granted request dropped before the Data Plane runs (the client gone mid-upload, the handler dropped by the request timeout) counts as `Cancelled`. Their `phase="total"` is the `proxy:invoke` check, as for a proxied request: the client's upload is not included. A response the REST handler fails to send after the Data Plane returned it (a 101 without its tunnel, a client connection that cannot upgrade) stays counted with the Data Plane's status.
+
+`oagw_request_duration_seconds` records the phases `total` (request start to the response head, or to the gateway error; the body is not included), `resolve` (the upstream and route lookup, with the proxy configuration cache on or off, so the two can be compared) and `auth`. `oagw_stream_duration_seconds` records request start to the end of the response body, by `outcome`: `completed` (the body ended, or its `Content-Length` went through: hyper's HTTP/1.1 server drops such a body there without reading its end), `error` (upstream failure, idle timeout), `shutdown` (gateway stop, so a rolling deploy is not an error spike) or `cancelled` (the client went away); a response without a body (101, HEAD, 204, 304, `Content-Length: 0`) records none. `oagw_websocket_session_duration_seconds` records a session's lifetime by the same outcomes: `completed` when the tunnel closed, from either side (the relay does not parse frames, and after a client-initiated Close the server closes TCP first), `error` on an idle timeout or an IO error, `shutdown` on a gateway stop, `cancelled` when the bridge task was dropped or panicked.
+
+`oagw_requests_in_flight` counts a request from the start of the Data Plane pipeline until its response body ends, fails or is dropped, SSE and other streamed bodies included; under `host` `unknown` until the upstream is resolved.
+
+`oagw_rate_limit_usage_ratio` and `oagw_rate_limit_exceeded_total` carry a `bucket` label: `route`, `shadowed_route`, `upstream` or `pool`, one series per bucket checked; the shadowed ancestor routes of one route share the `shadowed_route` series, which gets the highest ratio among them once per request (1.0 when one rejects), so an ancestor near its limit is not hidden by the root.
 
 With a database, the system **MUST** also expose the 8 proxy configuration cache metrics ([ADR: Proxy Configuration Cache](../ADR/0020-proxy-config-cache.md#health-and-metrics)):
 - Counters: `oagw_proxy_cache_lookups_total{map, result}`, `oagw_proxy_cache_evictions_total{map, reason}`, `oagw_proxy_cache_changes_total{source}`, `oagw_proxy_cache_flushes_total{cause}`, `oagw_proxy_cache_loads_discarded_total{map}`, `oagw_proxy_cache_stale_served_total{map, cause}`, `oagw_proxy_cache_publish_failures_total{reason}`
@@ -467,7 +474,11 @@ A failed or slow change log append **MUST NOT** fail the write: it is logged at 
 
 ## 6. Acceptance Criteria
 
-- [ ] All 16 Prometheus metrics are exposed at `/metrics` in Prometheus exposition format, plus the 8 `oagw_proxy_cache_*` metrics with a database
+- [ ] The OAGW Prometheus metrics of `cpt-cf-oagw-dod-obs-prometheus-metrics` are exposed at `/metrics` in Prometheus exposition format, plus the 8 `oagw_proxy_cache_*` metrics with a database
+- [ ] Every proxy request with a response is counted in `oagw_requests_total` with its status, gateway errors and the REST handler's own rejections included
+- [ ] `oagw_requests_in_flight` holds a request from its start until its response body ends, fails or is dropped
+- [ ] `oagw_request_duration_seconds{phase="total"}` ends at the response head; `oagw_stream_duration_seconds` ends with the body and carries its `outcome`
+- [ ] Each rate-limit bucket has its own `oagw_rate_limit_usage_ratio` and `oagw_rate_limit_exceeded_total` series (`bucket` label)
 - [ ] `oagw_request_duration_seconds` histogram uses the specified 12-bucket configuration, and records `phase="resolve"` for the upstream and route lookup
 - [ ] No metric label includes tenant_id (cardinality control)
 - [ ] Metric paths are normalized from route config, not raw request paths

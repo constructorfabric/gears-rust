@@ -11,7 +11,8 @@ use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, UpDownCounter};
 
 use crate::domain::ports::OagwMetricsPort;
 use crate::domain::ports::metric_labels::{
-    CacheEviction, CacheLookup, CacheMap, CacheStale, METHOD_OTHER, key,
+    CacheEviction, CacheLookup, CacheMap, CacheStale, METHOD_OTHER, RateLimitBucket, StreamOutcome,
+    key,
 };
 
 /// Map an HTTP method to a low-cardinality `http.request.method` label value.
@@ -46,6 +47,12 @@ const DURATION_BUCKETS_SECONDS: [f64; 12] = [
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
+/// Histogram bucket boundaries (seconds) for `oagw_stream_duration_seconds`:
+/// short JSON bodies and SSE streams that run for hours alike.
+const STREAM_BUCKETS_SECONDS: [f64; 14] = [
+    0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0, 1_800.0, 3_600.0,
+];
+
 /// Histogram bucket boundaries (seconds) for
 /// `oagw_websocket_session_duration_seconds`. Sessions live on a different
 /// scale than per-request latency — typical sessions span seconds to hours.
@@ -57,6 +64,7 @@ pub struct OagwMetricsMeter {
     requests: Counter<u64>,
     errors: Counter<u64>,
     request_duration_seconds: Histogram<f64>,
+    stream_duration_seconds: Histogram<f64>,
     requests_in_flight: UpDownCounter<i64>,
     rate_limit_exceeded: Counter<u64>,
     rate_limit_usage_ratio: Gauge<f64>,
@@ -104,13 +112,21 @@ impl OagwMetricsMeter {
                 .build(),
             request_duration_seconds: meter
                 .f64_histogram(format!("{prefix}_request_duration_seconds"))
-                .with_description("End-to-end proxy request latency (seconds)")
+                .with_description("Proxy request latency to the response head (seconds)")
                 .with_unit("s")
                 .with_boundaries(DURATION_BUCKETS_SECONDS.to_vec())
                 .build(),
+            stream_duration_seconds: meter
+                .f64_histogram(format!("{prefix}_stream_duration_seconds"))
+                .with_description(
+                    "Proxy request latency to the end of the response body (seconds), by outcome",
+                )
+                .with_unit("s")
+                .with_boundaries(STREAM_BUCKETS_SECONDS.to_vec())
+                .build(),
             requests_in_flight: meter
                 .i64_up_down_counter(format!("{prefix}_requests_in_flight"))
-                .with_description("Currently in-flight proxy requests")
+                .with_description("Proxy requests started whose response body has not ended")
                 .build(),
             rate_limit_exceeded: meter
                 .u64_counter(format!("{prefix}_rate_limit_exceeded"))
@@ -252,6 +268,23 @@ impl OagwMetricsPort for OagwMetricsMeter {
         );
     }
 
+    fn record_stream_duration_seconds(
+        &self,
+        host: &str,
+        path: &str,
+        outcome: StreamOutcome,
+        seconds: f64,
+    ) {
+        self.stream_duration_seconds.record(
+            seconds,
+            &[
+                KeyValue::new(key::HOST, host.to_owned()),
+                KeyValue::new(key::PATH, path.to_owned()),
+                KeyValue::new(key::OUTCOME, outcome.as_str()),
+            ],
+        );
+    }
+
     fn increment_in_flight(&self, host: &str) {
         self.requests_in_flight
             .add(1, &[KeyValue::new(key::HOST, host.to_owned())]);
@@ -262,23 +295,31 @@ impl OagwMetricsPort for OagwMetricsMeter {
             .add(-1, &[KeyValue::new(key::HOST, host.to_owned())]);
     }
 
-    fn record_rate_limit_exceeded(&self, host: &str, path: &str) {
+    fn record_rate_limit_exceeded(&self, host: &str, path: &str, bucket: RateLimitBucket) {
         self.rate_limit_exceeded.add(
             1,
             &[
                 KeyValue::new(key::HOST, host.to_owned()),
                 KeyValue::new(key::PATH, path.to_owned()),
+                KeyValue::new(key::BUCKET, bucket.as_str()),
             ],
         );
     }
 
-    fn record_rate_limit_usage_ratio(&self, host: &str, path: &str, ratio: f64) {
+    fn record_rate_limit_usage_ratio(
+        &self,
+        host: &str,
+        path: &str,
+        bucket: RateLimitBucket,
+        ratio: f64,
+    ) {
         let clamped = ratio.clamp(0.0, 1.0);
         self.rate_limit_usage_ratio.record(
             clamped,
             &[
                 KeyValue::new(key::HOST, host.to_owned()),
                 KeyValue::new(key::PATH, path.to_owned()),
+                KeyValue::new(key::BUCKET, bucket.as_str()),
             ],
         );
     }
@@ -293,9 +334,19 @@ impl OagwMetricsPort for OagwMetricsMeter {
             .add(-1, &[KeyValue::new(key::HOST, host.to_owned())]);
     }
 
-    fn record_websocket_session_duration_seconds(&self, host: &str, seconds: f64) {
-        self.websocket_session_duration_seconds
-            .record(seconds, &[KeyValue::new(key::HOST, host.to_owned())]);
+    fn record_websocket_session_duration_seconds(
+        &self,
+        host: &str,
+        outcome: StreamOutcome,
+        seconds: f64,
+    ) {
+        self.websocket_session_duration_seconds.record(
+            seconds,
+            &[
+                KeyValue::new(key::HOST, host.to_owned()),
+                KeyValue::new(key::OUTCOME, outcome.as_str()),
+            ],
+        );
     }
 
     fn record_rate_limit_sweep(&self, evicted: u64, live: u64) {

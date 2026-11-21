@@ -11,6 +11,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tracing::{debug, warn};
 
 use crate::domain::ports::OagwMetricsPort;
+use crate::domain::ports::metric_labels::StreamOutcome;
 
 // ---------------------------------------------------------------------------
 // Close frames
@@ -481,13 +482,15 @@ pub(crate) struct WebSocketBridgeIo {
 /// RAII guard for an active WebSocket session.
 ///
 /// Increments `active_websocket_sessions` on construction and, on drop,
-/// decrements the gauge and records `websocket_session_duration_seconds`.
-/// Drop semantics ensure the gauge cannot leak even if the bridge future
-/// is cancelled or panics — `Drop` runs in both cases.
+/// decrements the gauge and records `websocket_session_duration_seconds`
+/// with the outcome set by [`Self::ended`]. Drop semantics ensure the gauge
+/// cannot leak even if the bridge future is cancelled or panics — `Drop`
+/// runs in both cases, and records `cancelled` when no outcome was set.
 struct WsSessionGuard {
     metrics: Arc<dyn OagwMetricsPort>,
     host: String,
     start: Instant,
+    outcome: StreamOutcome,
 }
 
 impl WsSessionGuard {
@@ -497,7 +500,12 @@ impl WsSessionGuard {
             metrics,
             host,
             start: Instant::now(),
+            outcome: StreamOutcome::Cancelled,
         }
+    }
+
+    fn ended(&mut self, relay: &RelayOutcome) {
+        self.outcome = session_outcome(relay);
     }
 }
 
@@ -506,7 +514,20 @@ impl Drop for WsSessionGuard {
         let duration = self.start.elapsed().as_secs_f64();
         self.metrics.decrement_active_websocket_sessions(&self.host);
         self.metrics
-            .record_websocket_session_duration_seconds(&self.host, duration);
+            .record_websocket_session_duration_seconds(&self.host, self.outcome, duration);
+    }
+}
+
+/// A tunnel that closed completes the session, whichever side closed TCP
+/// first: the relay does not parse frames, and after a client-initiated
+/// Close handshake RFC 6455 has the server close TCP first, so `Upstream`
+/// is also the normal end. An idle timeout and an IO error are errors; a
+/// gateway stop is its own outcome.
+fn session_outcome(relay: &RelayOutcome) -> StreamOutcome {
+    match relay {
+        RelayOutcome::Closed { .. } => StreamOutcome::Completed,
+        RelayOutcome::IdleTimeout | RelayOutcome::Error(_) => StreamOutcome::Error,
+        RelayOutcome::Shutdown => StreamOutcome::Shutdown,
     }
 }
 
@@ -557,13 +578,13 @@ pub(crate) async fn websocket_bridge(
     } = bridge;
     // RAII guard: increments the active-sessions gauge now, records duration
     // and decrements on drop — even on panic / future cancellation.
-    let _session_guard = metrics.map(|m| WsSessionGuard::new(m, host));
+    let mut session_guard = metrics.map(|m| WsSessionGuard::new(m, host));
 
     // Wrap hyper's Upgraded in TokioIo so it implements tokio::io::AsyncRead/Write.
     let mut client = TokioIo::new(upgraded);
     let mut upstream = io;
 
-    match relay(
+    let outcome = relay(
         &mut client,
         &mut upstream,
         RelayConfig {
@@ -573,8 +594,11 @@ pub(crate) async fn websocket_bridge(
             stopped,
         },
     )
-    .await
-    {
+    .await;
+    if let Some(guard) = session_guard.as_mut() {
+        guard.ended(&outcome);
+    }
+    match outcome {
         RelayOutcome::Closed {
             to_upstream,
             to_client,

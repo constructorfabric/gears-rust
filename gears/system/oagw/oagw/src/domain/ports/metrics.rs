@@ -21,20 +21,30 @@
 //!
 //! The proxy configuration cache's labels are typed ([`CacheMap`],
 //! [`CacheLookup`], [`CacheEviction`], [`CacheStale`]) where a method takes two, so they
-//! cannot be swapped; the rest are `&'static str` constants from
+//! cannot be swapped, as are [`RateLimitBucket`] and [`StreamOutcome`]; the
+//! rest are `&'static str` constants from
 //! [`super::metric_labels`], so the hot path never copies a label.
 use toolkit_macros::domain_model;
 
-use super::metric_labels::{CacheEviction, CacheLookup, CacheMap, CacheStale};
+use super::metric_labels::{
+    CacheEviction, CacheLookup, CacheMap, CacheStale, RateLimitBucket, StreamOutcome,
+};
 
 /// Output port for recording OAGW operational metrics.
 pub trait OagwMetricsPort: Send + Sync {
     /// `{prefix}_requests_total` — counter
     ///
-    /// Incremented once per completed proxy request (success or upstream
-    /// 4xx/5xx). Pre-resolution failures (e.g. policy denial before
-    /// upstream lookup) are NOT counted here; they go to
-    /// [`Self::record_error`] only.
+    /// Incremented once per proxy request when its response head is known:
+    /// the upstream's status (4xx/5xx included), or for a gateway error the
+    /// status the client gets. A denied `proxy:invoke` check, and a granted
+    /// request the REST handler rejects before proxying it (a bad path, a
+    /// body over the limit, a failed body read), count with `host`/`path`
+    /// `"unknown"`. A request whose future was dropped first
+    /// (the client went away) is not counted here, only in
+    /// [`Self::record_error`] as `Cancelled`. A response the REST handler
+    /// fails to send after the Data Plane returned it (a 101 without its
+    /// tunnel, a client connection that cannot upgrade) stays counted with
+    /// the Data Plane's status.
     /// `credential_mode` labels `config` or `request_ref` (ADR-0022);
     /// `None` labels `unknown`.
     fn record_request(
@@ -48,9 +58,11 @@ pub trait OagwMetricsPort: Send + Sync {
 
     /// `{prefix}_errors_total` — counter
     ///
-    /// Incremented on every `DomainError` returned from the proxy pipeline.
-    /// `host`/`path` may be `"unknown"` when the failure occurred before
-    /// upstream/route resolution.
+    /// Incremented on every `DomainError` returned from the proxy pipeline,
+    /// and as `Cancelled` for a request dropped before its response head.
+    /// Upstream error responses are not errors here. `host`/`path` may be
+    /// `"unknown"` when the failure occurred before upstream/route
+    /// resolution.
     /// `credential_mode` labels `config` or `request_ref`; `None` (before
     /// the upstream resolves) labels `unknown` (ADR-0022). Typed, so it
     /// cannot be swapped with the string labels beside it.
@@ -64,11 +76,36 @@ pub trait OagwMetricsPort: Send + Sync {
 
     /// `{prefix}_request_duration_seconds` — histogram
     ///
+    /// Phase `total` ends at the response head (or the gateway error), not
+    /// at the end of the body: see [`Self::record_stream_duration_seconds`].
     /// Buckets are configured by the infra implementation to match the
     /// feature-doc spec (12 buckets, 1ms → 10s).
     fn record_request_duration_seconds(&self, host: &str, path: &str, phase: &str, seconds: f64);
 
+    /// `{prefix}_stream_duration_seconds` — histogram
+    ///
+    /// Recorded once per relayed response body when it ends, errors or is
+    /// dropped: request start to that moment. Bodies are relayed as
+    /// streams, so this covers SSE and every other upstream body. A body
+    /// with a `Content-Length` is `completed` once that many bytes went
+    /// through; the gateway's stop ends one as `shutdown`, an idle cut or an
+    /// upstream failure as `error`. A response without a body (101, HEAD,
+    /// 204, 304, `Content-Length: 0`) records none.
+    fn record_stream_duration_seconds(
+        &self,
+        host: &str,
+        path: &str,
+        outcome: StreamOutcome,
+        seconds: f64,
+    );
+
     /// `{prefix}_requests_in_flight` — gauge increment.
+    ///
+    /// A request is in flight from the start of the proxy pipeline until its
+    /// response body ends, errors or is dropped; a request that fails, or
+    /// has no body, leaves at its response head. Until the upstream is
+    /// resolved it counts under `host` `"unknown"`, then moves to the
+    /// upstream's alias.
     fn increment_in_flight(&self, host: &str);
 
     /// `{prefix}_requests_in_flight` — gauge decrement.
@@ -76,15 +113,23 @@ pub trait OagwMetricsPort: Send + Sync {
 
     /// `{prefix}_rate_limit_exceeded_total` — counter
     ///
-    /// Incremented when a configured rate-limit bucket rejects a request
-    /// (either upstream- or route-scoped).
-    fn record_rate_limit_exceeded(&self, host: &str, path: &str);
+    /// Incremented when the rate-limit `bucket` rejects a request.
+    fn record_rate_limit_exceeded(&self, host: &str, path: &str, bucket: RateLimitBucket);
 
     /// `{prefix}_rate_limit_usage_ratio` — gauge
     ///
     /// `ratio` is `1.0 - remaining/limit`, clamped to `[0.0, 1.0]`.
-    /// Updated on each rate-limit token consumption (allow or reject).
-    fn record_rate_limit_usage_ratio(&self, host: &str, path: &str, ratio: f64);
+    /// Updated on each token consumption (allow or reject) of `bucket`. The
+    /// shadowed ancestor routes of one route share the `shadowed_route`
+    /// series: it is written once per request with the highest ratio among
+    /// them (1.0 when one rejects).
+    fn record_rate_limit_usage_ratio(
+        &self,
+        host: &str,
+        path: &str,
+        bucket: RateLimitBucket,
+        ratio: f64,
+    );
 
     /// `{prefix}_active_websocket_sessions` — gauge increment.
     ///
@@ -99,9 +144,18 @@ pub trait OagwMetricsPort: Send + Sync {
 
     /// `{prefix}_websocket_session_duration_seconds` — histogram
     ///
-    /// Recorded once per session at bridge teardown. Uses coarser bucket
-    /// boundaries than the request histogram (sessions live seconds → hours).
-    fn record_websocket_session_duration_seconds(&self, host: &str, seconds: f64);
+    /// Recorded once per session at bridge teardown, with how it ended:
+    /// `completed` when the tunnel closed, from either side; `error` on an
+    /// idle timeout or an IO error; `shutdown` on the gateway's stop;
+    /// `cancelled` when the bridge task was dropped or panicked. Uses
+    /// coarser bucket boundaries than the request histogram (sessions live
+    /// seconds → hours).
+    fn record_websocket_session_duration_seconds(
+        &self,
+        host: &str,
+        outcome: StreamOutcome,
+        seconds: f64,
+    );
 
     /// `{prefix}_rate_limit_buckets_evicted_total` — counter, and
     /// `{prefix}_rate_limit_buckets` — gauge.
@@ -218,13 +272,14 @@ impl OagwMetricsPort for NoopMetrics {
     ) {
     }
     fn record_request_duration_seconds(&self, _: &str, _: &str, _: &str, _: f64) {}
+    fn record_stream_duration_seconds(&self, _: &str, _: &str, _: StreamOutcome, _: f64) {}
     fn increment_in_flight(&self, _: &str) {}
     fn decrement_in_flight(&self, _: &str) {}
-    fn record_rate_limit_exceeded(&self, _: &str, _: &str) {}
-    fn record_rate_limit_usage_ratio(&self, _: &str, _: &str, _: f64) {}
+    fn record_rate_limit_exceeded(&self, _: &str, _: &str, _: RateLimitBucket) {}
+    fn record_rate_limit_usage_ratio(&self, _: &str, _: &str, _: RateLimitBucket, _: f64) {}
     fn increment_active_websocket_sessions(&self, _: &str) {}
     fn decrement_active_websocket_sessions(&self, _: &str) {}
-    fn record_websocket_session_duration_seconds(&self, _: &str, _: f64) {}
+    fn record_websocket_session_duration_seconds(&self, _: &str, _: StreamOutcome, _: f64) {}
     fn record_rate_limit_sweep(&self, _: u64, _: u64) {}
     fn record_registry_provisioning_failure(&self, _: &str, _: &str) {}
     fn record_registry_provisioning_run(&self, _: &str) {}

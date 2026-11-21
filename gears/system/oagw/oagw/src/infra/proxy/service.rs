@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -25,7 +26,7 @@ use crate::domain::plugin::{
     TransformRequestContext, TransformResponseContext,
 };
 use crate::domain::ports::OagwMetricsPort;
-use crate::domain::ports::metric_labels::{self, phase};
+use crate::domain::ports::metric_labels::{self, RateLimitBucket, StreamOutcome, phase};
 use crate::domain::proxy_path::canonical_path;
 use crate::domain::rate_limit::{
     RateLimitKeyContext, RateLimitOutcome, RateLimitResource, RateLimiter, build_pool_key,
@@ -506,65 +507,87 @@ fn parse_proxy_request(
     })
 }
 
-/// Metric label of a request whose future was dropped before it finished.
-const CANCELLED: &str = "Cancelled";
-
 /// Where a `proxy:invoke` check stands, for [`AuthorizeMetricsGuard`].
 enum AuthorizeOutcome {
     /// Not answered yet: a drop now is a cancellation.
     Pending,
     /// Granted: the proxied request is counted by [`RequestMetricsGuard`].
     Granted,
-    /// Refused or failed, under this error label.
-    Failed(&'static str),
+    /// Refused or failed, under this error label and response status.
+    Failed { variant: &'static str, status: u16 },
 }
 
 /// Counts a `proxy:invoke` check that does not lead to a proxied request:
-/// a denial or failure, or a check whose future was dropped. A granted check
+/// a denial or failure, a check whose future was dropped, or a granted
+/// request the REST handler rejected before proxying it. A granted check
 /// records nothing here.
 struct AuthorizeMetricsGuard {
     metrics: Arc<dyn OagwMetricsPort>,
     start: Instant,
+    method: &'static str,
     outcome: AuthorizeOutcome,
 }
 
 impl AuthorizeMetricsGuard {
-    fn new(metrics: Arc<dyn OagwMetricsPort>) -> Self {
+    fn new(metrics: Arc<dyn OagwMetricsPort>, method: &'static str) -> Self {
         Self {
             metrics,
             start: Instant::now(),
+            method,
             outcome: AuthorizeOutcome::Pending,
         }
+    }
+
+    /// Count a request granted `authorized_in` ago and rejected before it
+    /// was proxied. It is timed as a proxied request is: the check, not the
+    /// client's upload.
+    fn record_rejected(
+        metrics: Arc<dyn OagwMetricsPort>,
+        method: &'static str,
+        authorized_in: Duration,
+        err: &DomainError,
+    ) {
+        let now = Instant::now();
+        let mut guard = Self {
+            metrics,
+            start: now.checked_sub(authorized_in).unwrap_or(now),
+            method,
+            outcome: AuthorizeOutcome::Pending,
+        };
+        guard.failed(err);
     }
 
     fn granted(&mut self) {
         self.outcome = AuthorizeOutcome::Granted;
     }
 
-    fn failed(&mut self, variant: &'static str) {
-        self.outcome = AuthorizeOutcome::Failed(variant);
+    fn failed(&mut self, err: &DomainError) {
+        self.outcome = AuthorizeOutcome::Failed {
+            variant: domain_error_type_name(err),
+            status: domain_error_status(err),
+        };
     }
 }
 
 impl Drop for AuthorizeMetricsGuard {
     fn drop(&mut self) {
-        let variant = match self.outcome {
+        let (variant, status) = match self.outcome {
             AuthorizeOutcome::Granted => return,
-            AuthorizeOutcome::Pending => CANCELLED,
-            AuthorizeOutcome::Failed(variant) => variant,
+            AuthorizeOutcome::Pending => (metric_labels::CANCELLED, None),
+            AuthorizeOutcome::Failed { variant, status } => (variant, Some(status)),
         };
+        let unknown = metric_labels::UNKNOWN;
         self.metrics.record_request_duration_seconds(
-            metric_labels::UNKNOWN,
-            metric_labels::UNKNOWN,
+            unknown,
+            unknown,
             phase::TOTAL,
             self.start.elapsed().as_secs_f64(),
         );
-        self.metrics.record_error(
-            metric_labels::UNKNOWN,
-            metric_labels::UNKNOWN,
-            variant,
-            None,
-        );
+        if let Some(status) = status {
+            self.metrics
+                .record_request(unknown, unknown, self.method, status, None);
+        }
+        self.metrics.record_error(unknown, unknown, variant, None);
     }
 }
 
@@ -592,19 +615,44 @@ enum Authorization {
 enum RequestOutcome {
     Pending,
     Success(u16),
-    Error(&'static str),
+    /// A gateway error: its variant and the status the client gets.
+    Error {
+        variant: &'static str,
+        status: u16,
+    },
+}
+
+/// One request counted in `requests_in_flight` under `host`; dropping it
+/// takes the request out.
+struct InFlight {
+    metrics: Arc<dyn OagwMetricsPort>,
+    host: Cow<'static, str>,
+}
+
+impl InFlight {
+    fn start(metrics: Arc<dyn OagwMetricsPort>, host: Cow<'static, str>) -> Self {
+        metrics.increment_in_flight(&host);
+        Self { metrics, host }
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.metrics.decrement_in_flight(&self.host);
+    }
 }
 
 /// RAII guard that owns the per-request metric bookkeeping for
 /// [`DataPlaneServiceImpl::proxy_request`].
 ///
-/// On construction it captures the start time. After upstream resolution,
-/// [`Self::mark_resolved`] sets the labels and increments the in-flight
-/// gauge. Before the request returns, the body calls
-/// [`Self::set_success`] or [`Self::set_error`] to record the terminal
-/// outcome. `Drop` then decrements the in-flight gauge (if it was ever
-/// incremented), records the duration histogram, and emits the success or
-/// error counter — even if the future is cancelled or panics.
+/// On construction it captures the start time and counts the request in
+/// flight under the unknown host; [`Self::mark_resolved`] sets the labels
+/// and moves it to the upstream's alias. Before the request returns, the
+/// body calls [`Self::set_success`] or [`Self::set_error`] to record the
+/// terminal outcome, and [`Self::observe_body`] hands the in-flight count
+/// to the response body. `Drop` records the duration to the response head
+/// and the request or error counter — even if the future is cancelled or
+/// panics — and ends the in-flight count unless the body took it.
 struct RequestMetricsGuard {
     metrics: Arc<dyn OagwMetricsPort>,
     start: Instant,
@@ -614,46 +662,132 @@ struct RequestMetricsGuard {
     /// `credential_mode` label: `None` (`unknown`) until the upstream
     /// resolves.
     credential_mode: Option<CredentialMode>,
-    in_flight: bool,
+    in_flight: Option<InFlight>,
     outcome: RequestOutcome,
 }
 
 impl RequestMetricsGuard {
     fn new(metrics: Arc<dyn OagwMetricsPort>, method: &'static str) -> Self {
         Self {
+            in_flight: Some(InFlight::start(
+                Arc::clone(&metrics),
+                Cow::Borrowed(metric_labels::UNKNOWN),
+            )),
             metrics,
             start: Instant::now(),
             method,
             host: metric_labels::UNKNOWN.to_owned(),
             path: metric_labels::UNKNOWN.to_owned(),
             credential_mode: None,
-            in_flight: false,
             outcome: RequestOutcome::Pending,
         }
     }
 
     fn mark_resolved(&mut self, host: String, path: String, credential_mode: CredentialMode) {
+        // Counted under the alias before the unknown entry goes, so the
+        // total never dips.
+        self.in_flight = Some(InFlight::start(
+            Arc::clone(&self.metrics),
+            Cow::Owned(host.clone()),
+        ));
         self.host = host;
         self.path = path;
         self.credential_mode = Some(credential_mode);
-        self.metrics.increment_in_flight(&self.host);
-        self.in_flight = true;
     }
 
     fn set_success(&mut self, status: u16) {
         self.outcome = RequestOutcome::Success(status);
     }
 
-    fn set_error(&mut self, variant: &'static str) {
-        self.outcome = RequestOutcome::Error(variant);
+    fn set_error(&mut self, err: &DomainError) {
+        self.outcome = RequestOutcome::Error {
+            variant: domain_error_type_name(err),
+            status: domain_error_status(err),
+        };
+    }
+
+    /// Keep the request in flight until the response body ends, and record
+    /// `stream_duration_seconds` then. A response without a body (101,
+    /// HEAD, 204, 304, `Content-Length: 0`) ends at its head and records no
+    /// stream duration.
+    fn observe_body(
+        &mut self,
+        resp: http::Response<Body>,
+        method: &http::Method,
+    ) -> http::Response<Body> {
+        let status = resp.status();
+        // The header the client gets: header rules and transforms run
+        // before this and may have changed or removed it.
+        let declared_len = declared_content_length(resp.headers());
+        let has_body = *method != http::Method::HEAD
+            && !status.is_informational()
+            && status != http::StatusCode::NO_CONTENT
+            && status != http::StatusCode::NOT_MODIFIED
+            && declared_len != Some(0);
+        let (parts, body) = resp.into_parts();
+        let body = match body {
+            Body::Stream(stream) if has_body => {
+                let end = StreamEnd {
+                    metrics: Arc::clone(&self.metrics),
+                    host: self.host.clone(),
+                    path: self.path.clone(),
+                    start: self.start,
+                };
+                let in_flight = self.in_flight.take();
+                Body::Stream(streaming::on_body_end(
+                    stream,
+                    declared_len,
+                    move |outcome| {
+                        end.record(outcome);
+                        drop(in_flight);
+                    },
+                ))
+            }
+            // hyper does not read the body of these (it would end as
+            // cancelled): the request ends at its head.
+            body @ Body::Stream(_) => body,
+            // A 101 carries no body; the session has its own metrics.
+            body @ Body::Empty => body,
+            // Built whole by the gateway, not relayed: nothing to wait for.
+            body @ Body::Bytes(_) => body,
+        };
+        http::Response::from_parts(parts, body)
+    }
+}
+
+/// The single `Content-Length` of a response, if it has one that parses.
+fn declared_content_length(headers: &HeaderMap) -> Option<u64> {
+    let mut values = headers.get_all(http::header::CONTENT_LENGTH).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    value.to_str().ok()?.trim().parse().ok()
+}
+
+/// Labels and start time for `stream_duration_seconds`.
+struct StreamEnd {
+    metrics: Arc<dyn OagwMetricsPort>,
+    host: String,
+    path: String,
+    start: Instant,
+}
+
+impl StreamEnd {
+    fn record(&self, outcome: StreamOutcome) {
+        self.metrics.record_stream_duration_seconds(
+            &self.host,
+            &self.path,
+            outcome,
+            self.start.elapsed().as_secs_f64(),
+        );
     }
 }
 
 impl Drop for RequestMetricsGuard {
     fn drop(&mut self) {
-        if self.in_flight {
-            self.metrics.decrement_in_flight(&self.host);
-        }
+        // A request without a body leaves the in-flight count first.
+        drop(self.in_flight.take());
         self.metrics.record_request_duration_seconds(
             &self.host,
             &self.path,
@@ -670,13 +804,24 @@ impl Drop for RequestMetricsGuard {
                     self.credential_mode,
                 );
             }
-            RequestOutcome::Error(variant) => {
+            RequestOutcome::Error { variant, status } => {
+                self.metrics.record_request(
+                    &self.host,
+                    &self.path,
+                    self.method,
+                    status,
+                    self.credential_mode,
+                );
                 self.metrics
                     .record_error(&self.host, &self.path, variant, self.credential_mode);
             }
             RequestOutcome::Pending => {
-                self.metrics
-                    .record_error(&self.host, &self.path, CANCELLED, self.credential_mode);
+                self.metrics.record_error(
+                    &self.host,
+                    &self.path,
+                    metric_labels::CANCELLED,
+                    self.credential_mode,
+                );
             }
         }
     }
@@ -692,20 +837,30 @@ impl DataPlaneService for DataPlaneServiceImpl {
         self.proxy(Authorization::Check(ctx), req).await
     }
 
-    async fn authorize_proxy(&self, ctx: SecurityContext) -> Result<ProxyGrant, DomainError> {
+    async fn authorize_proxy(
+        &self,
+        ctx: SecurityContext,
+        method: &http::Method,
+    ) -> Result<ProxyGrant, DomainError> {
         // cancel-safe: the guard records a denial or a cancellation (the
         // future dropped mid-check, e.g. by the gateway's request timeout)
-        // when it drops. A granted request is counted from the grant once it
-        // reaches `proxy_request_granted`; the REST handler's own rejections
-        // in between (body limit, body read) are not counted, as before
-        // (#4989 owns counting every request).
-        let mut guard = AuthorizeMetricsGuard::new(Arc::clone(&self.metrics));
+        // when it drops. A granted request is counted by
+        // `proxy_request_granted`, by `reject_granted` when the caller
+        // rejects it first, or by the grant itself when it is dropped.
+        let method = crate::infra::metrics::normalize_method(method);
+        let mut guard = AuthorizeMetricsGuard::new(Arc::clone(&self.metrics), method);
         let result = ProxyGrant::authorize(&self.policy_enforcer, ctx).await;
         match &result {
             Ok(_) => guard.granted(),
-            Err(e) => guard.failed(domain_error_type_name(e)),
+            Err(e) => guard.failed(e),
         }
-        result
+        result.map(|grant| grant.count_if_dropped(Arc::clone(&self.metrics), method))
+    }
+
+    fn reject_granted(&self, mut grant: ProxyGrant, err: &DomainError) {
+        if let Some((metrics, method)) = grant.take_count() {
+            AuthorizeMetricsGuard::record_rejected(metrics, method, grant.authorized_in(), err);
+        }
     }
 
     async fn proxy_request_granted(
@@ -722,12 +877,15 @@ impl DataPlaneServiceImpl {
     /// before the request is validated.
     async fn proxy(
         &self,
-        auth: Authorization,
+        mut auth: Authorization,
         req: http::Request<Body>,
     ) -> Result<http::Response<Body>, DomainError> {
-        let method = crate::infra::metrics::normalize_method(req.method());
+        let request_method = req.method().clone();
+        let method = crate::infra::metrics::normalize_method(&request_method);
         let mut guard = RequestMetricsGuard::new(Arc::clone(&self.metrics), method);
-        if let Authorization::Granted(grant) = &auth {
+        if let Authorization::Granted(grant) = &mut auth {
+            // The guard counts the request from here on.
+            grant.take_count();
             // The REST path authorized before reading the body: count the
             // check, as the SDK path does, but not the client's upload.
             guard.start = guard
@@ -791,8 +949,7 @@ impl DataPlaneServiceImpl {
             };
 
             // Capture metric labels now that upstream + route are known, and
-            // begin tracking this request in the in-flight gauge via the
-            // RAII guard.
+            // move the in-flight count to the upstream's alias.
             host_label = upstream.alias.clone();
             path_label = route
                 .match_rules
@@ -1234,12 +1391,16 @@ impl DataPlaneServiceImpl {
         }
         .await;
 
-        match &result {
-            Ok(resp) => guard.set_success(resp.status().as_u16()),
-            Err(err) => guard.set_error(domain_error_type_name(err)),
+        match result {
+            Ok(resp) => {
+                guard.set_success(resp.status().as_u16());
+                Ok(guard.observe_body(resp, &request_method))
+            }
+            Err(err) => {
+                guard.set_error(&err);
+                Err(err)
+            }
         }
-
-        result
     }
 }
 
@@ -1796,7 +1957,9 @@ struct RequestRefState {
 /// keys `scope: ip` limits on the shared `unknown` bucket.
 ///
 /// Side effect: updates `rate_limit_usage_ratio` and (on rejection)
-/// `rate_limit_exceeded_total` metrics via the injected port.
+/// `rate_limit_exceeded_total` metrics via the injected port, one series
+/// per [`RateLimitBucket`]; the shadowed routes' series gets the highest
+/// ratio among them.
 #[allow(clippy::too_many_arguments)]
 fn check_rate_limits(
     rate_limiter: &RateLimiter,
@@ -1814,22 +1977,21 @@ fn check_rate_limits(
     let tenant_id = ctx.subject_tenant_id();
     let subject_id = ctx.subject_id();
 
-    let mut consume = |key: &str, rl: &RateLimitConfig| -> Result<(), DomainError> {
-        let raw = rate_limiter.try_consume(key, rl, instance_uri);
-        match &raw {
-            Ok(o) if o.limit > 0 => {
-                let used = o.limit.saturating_sub(o.remaining) as f64;
-                let ratio = used / o.limit as f64;
-                metrics.record_rate_limit_usage_ratio(host_label, path_label, ratio);
-            }
-            Ok(_) => {}
-            Err(DomainError::RateLimitExceeded { .. }) => {
-                metrics.record_rate_limit_exceeded(host_label, path_label);
-                metrics.record_rate_limit_usage_ratio(host_label, path_label, 1.0);
-            }
-            Err(_) => {}
-        }
-        let result = raw?;
+    // Consume a token; the bucket's usage ratio when it admits the request.
+    let mut consume = |key: &str,
+                       rl: &RateLimitConfig,
+                       bucket: RateLimitBucket|
+     -> Result<Option<f64>, DomainError> {
+        let result = rate_limiter
+            .try_consume(key, rl, instance_uri)
+            .inspect_err(|e| {
+                if matches!(e, DomainError::RateLimitExceeded { .. }) {
+                    metrics.record_rate_limit_exceeded(host_label, path_label, bucket);
+                    metrics.record_rate_limit_usage_ratio(host_label, path_label, bucket, 1.0);
+                }
+            })?;
+        let ratio = (result.limit > 0)
+            .then(|| result.limit.saturating_sub(result.remaining) as f64 / result.limit as f64);
         // The tighter bucket's numbers are reported; on a tie the earlier
         // one stays. Headers are sent if any checked limit enables them.
         outcome = match outcome {
@@ -1841,17 +2003,15 @@ fn check_rate_limits(
                 rl.response_headers || previous.is_some_and(|(_, shown)| shown),
             )),
         };
-        Ok(())
+        Ok(ratio)
     };
-
-    let route_limits = route
-        .rate_limit
-        .as_ref()
-        .map(|rl| (&route.id, rl))
-        .into_iter()
-        .chain(shadowed.iter().rev().map(|s| (&s.route_id, &s.rate_limit)));
-    for (route_id, rl) in route_limits {
-        let key = build_rate_limit_key(&RateLimitKeyContext {
+    let record_usage = |bucket: RateLimitBucket, ratio: Option<f64>| {
+        if let Some(ratio) = ratio {
+            metrics.record_rate_limit_usage_ratio(host_label, path_label, bucket, ratio);
+        }
+    };
+    let route_key = |route_id: &uuid::Uuid, rl: &RateLimitConfig| {
+        build_rate_limit_key(&RateLimitKeyContext {
             resource: RateLimitResource::Route,
             resource_id: route_id,
             limit_owner: None,
@@ -1861,9 +2021,28 @@ fn check_rate_limits(
             route_id,
             client_ip,
             window: &rl.sustained.window,
-        });
-        consume(&key, rl)?;
+        })
+    };
+
+    if let Some(ref rl) = route.rate_limit {
+        let ratio = consume(&route_key(&route.id, rl), rl, RateLimitBucket::Route)?;
+        record_usage(RateLimitBucket::Route, ratio);
     }
+    // The shadowed routes share one series: it shows the one closest to its
+    // limit, not the last one checked.
+    let mut shadowed_max: Option<f64> = None;
+    for s in shadowed.iter().rev() {
+        let ratio = consume(
+            &route_key(&s.route_id, &s.rate_limit),
+            &s.rate_limit,
+            RateLimitBucket::ShadowedRoute,
+        )?;
+        shadowed_max = match (shadowed_max, ratio) {
+            (Some(max), Some(ratio)) => Some(max.max(ratio)),
+            (max, ratio) => max.or(ratio),
+        };
+    }
+    record_usage(RateLimitBucket::ShadowedRoute, shadowed_max);
 
     if let Some(ref rl) = upstream.rate_limit {
         // A shared budget keys the scoped bucket on the pool owner, so
@@ -1892,10 +2071,16 @@ fn check_rate_limits(
             client_ip,
             window: &rl.sustained.window,
         });
-        consume(&key, rl)?;
+        let ratio = consume(&key, rl, RateLimitBucket::Upstream)?;
+        record_usage(RateLimitBucket::Upstream, ratio);
 
         if let Some(ref pool) = rl.shared_pool {
-            consume(&build_pool_key(pool), &pool_config(pool, rl))?;
+            let ratio = consume(
+                &build_pool_key(pool),
+                &pool_config(pool, rl),
+                RateLimitBucket::Pool,
+            )?;
+            record_usage(RateLimitBucket::Pool, ratio);
         }
     }
 
@@ -2169,7 +2354,7 @@ fn build_proxy_response(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::domain::model::{Endpoint, ManagedBy, Scheme, Server, Upstream};
     use crate::domain::proxy_path::normalize_percent_encoding;
@@ -3338,11 +3523,38 @@ mod tests {
         }
         fn increment_in_flight(&self, _: &str) {}
         fn decrement_in_flight(&self, _: &str) {}
-        fn record_rate_limit_exceeded(&self, _: &str, _: &str) {}
-        fn record_rate_limit_usage_ratio(&self, _: &str, _: &str, _: f64) {}
+        fn record_rate_limit_exceeded(
+            &self,
+            _: &str,
+            _: &str,
+            _: crate::domain::ports::metric_labels::RateLimitBucket,
+        ) {
+        }
+        fn record_rate_limit_usage_ratio(
+            &self,
+            _: &str,
+            _: &str,
+            _: crate::domain::ports::metric_labels::RateLimitBucket,
+            _: f64,
+        ) {
+        }
         fn increment_active_websocket_sessions(&self, _: &str) {}
         fn decrement_active_websocket_sessions(&self, _: &str) {}
-        fn record_websocket_session_duration_seconds(&self, _: &str, _: f64) {}
+        fn record_websocket_session_duration_seconds(
+            &self,
+            _: &str,
+            _: crate::domain::ports::metric_labels::StreamOutcome,
+            _: f64,
+        ) {
+        }
+        fn record_stream_duration_seconds(
+            &self,
+            _: &str,
+            _: &str,
+            _: crate::domain::ports::metric_labels::StreamOutcome,
+            _: f64,
+        ) {
+        }
         fn record_rate_limit_sweep(&self, _: u64, _: u64) {}
         fn record_registry_provisioning_failure(&self, _: &str, _: &str) {}
         fn record_registry_provisioning_run(&self, _: &str) {}
@@ -3473,10 +3685,10 @@ mod tests {
 
     /// Keeps the request counters, durations and in-flight changes.
     #[derive(Default)]
-    struct RequestRecorder(std::sync::Mutex<Vec<String>>);
+    pub(crate) struct RequestRecorder(std::sync::Mutex<Vec<String>>);
 
     impl RequestRecorder {
-        fn events(&self) -> Vec<String> {
+        pub(crate) fn events(&self) -> Vec<String> {
             self.0.lock().unwrap().clone()
         }
         fn push(&self, event: String) {
@@ -3487,37 +3699,63 @@ mod tests {
     impl OagwMetricsPort for RequestRecorder {
         fn record_request(
             &self,
+            host: &str,
             _: &str,
-            _: &str,
-            _: &str,
+            method: &str,
             status: u16,
             _: Option<crate::domain::plugin::credentials::CredentialMode>,
         ) {
-            self.push(format!("request {status}"));
+            self.push(format!("request {host} {method} {status}"));
         }
         fn record_error(
             &self,
-            _: &str,
+            host: &str,
             _: &str,
             variant: &str,
             _: Option<crate::domain::plugin::credentials::CredentialMode>,
         ) {
-            self.push(format!("error {variant}"));
+            self.push(format!("error {host} {variant}"));
         }
         fn record_request_duration_seconds(&self, _: &str, _: &str, phase: &str, _: f64) {
             self.push(format!("duration {phase}"));
         }
-        fn increment_in_flight(&self, _: &str) {
-            self.push("in_flight +1".to_owned());
+        fn record_stream_duration_seconds(
+            &self,
+            host: &str,
+            _: &str,
+            outcome: crate::domain::ports::metric_labels::StreamOutcome,
+            _: f64,
+        ) {
+            self.push(format!("stream {host} {}", outcome.as_str()));
         }
-        fn decrement_in_flight(&self, _: &str) {
-            self.push("in_flight -1".to_owned());
+        fn increment_in_flight(&self, host: &str) {
+            self.push(format!("in_flight +1 {host}"));
         }
-        fn record_rate_limit_exceeded(&self, _: &str, _: &str) {}
-        fn record_rate_limit_usage_ratio(&self, _: &str, _: &str, _: f64) {}
+        fn decrement_in_flight(&self, host: &str) {
+            self.push(format!("in_flight -1 {host}"));
+        }
+        fn record_rate_limit_exceeded(&self, _: &str, _: &str, bucket: RateLimitBucket) {
+            self.push(format!("exceeded {}", bucket.as_str()));
+        }
+        fn record_rate_limit_usage_ratio(
+            &self,
+            _: &str,
+            _: &str,
+            bucket: RateLimitBucket,
+            ratio: f64,
+        ) {
+            self.push(format!("usage {} {ratio}", bucket.as_str()));
+        }
         fn increment_active_websocket_sessions(&self, _: &str) {}
         fn decrement_active_websocket_sessions(&self, _: &str) {}
-        fn record_websocket_session_duration_seconds(&self, _: &str, _: f64) {}
+        fn record_websocket_session_duration_seconds(
+            &self,
+            _: &str,
+            _: crate::domain::ports::metric_labels::StreamOutcome,
+            _: f64,
+        ) {
+        }
+
         fn record_rate_limit_sweep(&self, _: u64, _: u64) {}
         fn record_registry_provisioning_failure(&self, _: &str, _: &str) {}
         fn record_registry_provisioning_run(&self, _: &str) {}
@@ -3557,28 +3795,35 @@ mod tests {
         fn record_proxy_cache_publish_failures(&self, _: &str, _: u64) {}
     }
 
-    /// `authorize_proxy` counts a denial; a grant counts nothing, since the
-    /// proxied request is counted when it completes (#4981).
+    /// `authorize_proxy` counts a denial, with the request's method and the
+    /// 403 the client gets; a grant held counts nothing, since the proxied
+    /// request is counted when it completes (#4981, #4989).
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn authorize_proxy_counts_only_a_denial() {
         let metrics = Arc::new(RequestRecorder::default());
         let allowed =
             build_svc_with_decision(Arc::new(MockSelector::new()), metrics.clone(), None, true);
-        allowed.authorize_proxy(test_ctx()).await.unwrap();
+        let _grant = allowed
+            .authorize_proxy(test_ctx(), &http::Method::POST)
+            .await
+            .unwrap();
         assert!(metrics.events().is_empty(), "{:?}", metrics.events());
 
         let denied =
             build_svc_with_decision(Arc::new(MockSelector::new()), metrics.clone(), None, false);
-        let err = denied.authorize_proxy(test_ctx()).await.unwrap_err();
+        let err = denied
+            .authorize_proxy(test_ctx(), &http::Method::POST)
+            .await
+            .unwrap_err();
         assert!(logs_contain("OAGW proxy call denied"));
         assert!(matches!(err, DomainError::Forbidden { .. }), "{err:?}");
-        let events = metrics.events();
         assert_eq!(
-            events,
-            vec![
-                format!("duration {}", phase::TOTAL),
-                "error Forbidden".to_owned()
+            metrics.events(),
+            [
+                "duration total",
+                "request unknown POST 403",
+                "error unknown Forbidden",
             ]
         );
     }
@@ -4062,14 +4307,734 @@ mod tests {
         let mut svc =
             build_svc_with_decision(Arc::new(MockSelector::new()), metrics.clone(), None, true);
         svc.policy_enforcer = PolicyEnforcer::new(Arc::new(NeverAnswers));
-        let timed_out =
-            tokio::time::timeout(Duration::from_millis(20), svc.authorize_proxy(test_ctx())).await;
+        let timed_out = tokio::time::timeout(
+            Duration::from_millis(20),
+            svc.authorize_proxy(test_ctx(), &http::Method::GET),
+        )
+        .await;
+        assert!(timed_out.is_err());
+        // No status: the client got no response.
+        assert_eq!(
+            metrics.events(),
+            ["duration total", "error unknown Cancelled"]
+        );
+    }
+
+    /// A grant dropped before it is proxied or rejected counts its request
+    /// as `Cancelled`, with no status; one handed to the proxy or to
+    /// `reject_granted` counts nothing more on drop.
+    #[tokio::test]
+    async fn a_dropped_grant_is_counted_as_cancelled() {
+        let metrics = Arc::new(RequestRecorder::default());
+        let svc =
+            build_svc_with_decision(Arc::new(MockSelector::new()), metrics.clone(), None, true);
+        let grant = svc
+            .authorize_proxy(test_ctx(), &http::Method::GET)
+            .await
+            .unwrap();
+        drop(grant);
+        assert_eq!(
+            metrics.events(),
+            ["duration total", "error unknown Cancelled"]
+        );
+
+        let metrics = Arc::new(RequestRecorder::default());
+        let svc =
+            build_svc_with_decision(Arc::new(MockSelector::new()), metrics.clone(), None, true);
+        let grant = svc
+            .authorize_proxy(test_ctx(), &http::Method::POST)
+            .await
+            .unwrap();
+        svc.reject_granted(
+            grant,
+            &DomainError::PayloadTooLarge {
+                detail: "too large".into(),
+                instance: String::new(),
+            },
+        );
+        assert_eq!(
+            metrics.events(),
+            [
+                "duration total",
+                "request unknown POST 413",
+                "error unknown PayloadTooLarge",
+            ]
+        );
+
+        // A grant without a count (the SDK path, tests) counts nothing.
+        drop(ProxyGrant::for_tests(test_ctx()));
+    }
+
+    /// A gateway error is counted in `requests_total` with the status the
+    /// client gets, next to `errors_total`. The request is in flight from
+    /// the start, under `unknown` until the upstream is resolved (#4989).
+    #[tokio::test]
+    async fn gateway_errors_are_counted_with_their_status() {
+        let metrics = Arc::new(RequestRecorder::default());
+        let svc = build_svc_resolving(Arc::new(MockSelector::new()), metrics.clone(), None);
+        let err = svc
+            .proxy_request(test_ctx(), proxy_get("/missing/v1"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DomainError::NotFound { .. }), "{err:?}");
+        assert_eq!(
+            metrics.events(),
+            [
+                "in_flight +1 unknown",
+                "duration resolve",
+                "in_flight -1 unknown",
+                "duration total",
+                "request unknown GET 404",
+                "error unknown NotFound",
+            ]
+        );
+
+        // Failing after resolution: counted under the upstream's alias.
+        let (upstream, route) = local_target(1);
+        let metrics = Arc::new(RequestRecorder::default());
+        let svc = build_svc_resolving(
+            Arc::new(MockSelector::new()),
+            metrics.clone(),
+            Some((upstream, route)),
+        );
+        let err = svc
+            .proxy_request(test_ctx(), proxy_get("/test/v1?x=1"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Validation { .. }), "{err:?}");
+        assert_eq!(
+            metrics.events(),
+            [
+                "in_flight +1 unknown",
+                "in_flight +1 test",
+                "in_flight -1 unknown",
+                "duration resolve",
+                "in_flight -1 test",
+                "duration total",
+                "request test GET 400",
+                "error test ValidationError",
+            ]
+        );
+    }
+
+    /// An HTTP upstream on 127.0.0.1:`port` with a `GET /v1` route.
+    fn local_target(port: u16) -> (Upstream, crate::domain::model::Route) {
+        use crate::domain::model::{HttpMatch, HttpMethod, MatchRules, Route};
+        let upstream = upstream_with(vec![Endpoint {
+            scheme: Scheme::Http,
+            host: "127.0.0.1".into(),
+            port,
+        }]);
+        let route = Route {
+            id: Uuid::new_v4(),
+            tenant_id: upstream.tenant_id,
+            upstream_id: upstream.id,
+            match_rules: MatchRules {
+                http: Some(HttpMatch {
+                    methods: vec![HttpMethod::Get],
+                    path: "/v1".into(),
+                    query_allowlist: vec![],
+                    path_suffix_mode: PathSuffixMode::Append,
+                }),
+                grpc: None,
+            },
+            plugins: None,
+            rate_limit: None,
+            cors: None,
+            tags: vec![],
+            priority: 0,
+            enabled: true,
+            managed_by: ManagedBy::Api,
+        };
+        (upstream, route)
+    }
+
+    /// A one-request HTTP/1.1 upstream on 127.0.0.1. After the request head
+    /// it writes each part sent on the returned channel, and closes the
+    /// connection once the channel closes.
+    async fn raw_upstream() -> (u16, tokio::sync::mpsc::UnboundedSender<&'static [u8]>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<&'static [u8]>();
+        tokio::spawn(async move {
+            let Ok((mut tcp, _)) = listener.accept().await else {
+                return;
+            };
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match tcp.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => head.extend_from_slice(&buf[..n]),
+                }
+            }
+            while let Some(part) = rx.recv().await {
+                if tcp.write_all(part).await.is_err() {
+                    return;
+                }
+            }
+            let _ = tcp.shutdown().await;
+        });
+        (port, tx)
+    }
+
+    /// An HTTP/1.1 upstream on 127.0.0.1 that reads each request head and
+    /// closes the connection without a response. It keeps listening, so a
+    /// retry cannot reach another test's listener on a reused port.
+    async fn closing_upstream() -> u16 {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut tcp, _)) = listener.accept().await {
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match tcp.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+            }
+        });
+        port
+    }
+
+    /// A service proxying `/test/v1` to the raw upstream on `port`.
+    fn local_svc(port: u16, metrics: Arc<dyn OagwMetricsPort>) -> DataPlaneServiceImpl {
+        build_svc_resolving(
+            Arc::new(MockSelector::new()),
+            metrics,
+            Some(local_target(port)),
+        )
+        .with_allow_http_upstream(true)
+    }
+
+    const CHUNKED_HEAD: &[u8] =
+        b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n";
+
+    /// The events recorded when the response head of a resolved `GET` came
+    /// back with `status`, its body still open.
+    fn head_events(status: u16) -> Vec<String> {
+        [
+            "in_flight +1 unknown",
+            "in_flight +1 test",
+            "in_flight -1 unknown",
+            "duration resolve",
+            "duration total",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .chain([format!("request test GET {status}")])
+        .collect()
+    }
+
+    fn body_stream(resp: http::Response<Body>) -> BodyStream {
+        match resp.into_body() {
+            Body::Stream(stream) => stream,
+            other => panic!("expected a streamed body, got {other:?}"),
+        }
+    }
+
+    /// A request stays in flight until its body ends, and the stream
+    /// duration is recorded then, as `completed`; the duration to the head
+    /// and `requests_total` are recorded when the head returns (#4989, #4987).
+    #[tokio::test]
+    async fn in_flight_lasts_until_the_body_ends() {
+        let (port, upstream) = raw_upstream().await;
+        let metrics = Arc::new(RequestRecorder::default());
+        let svc = local_svc(port, metrics.clone());
+        upstream.send(CHUNKED_HEAD).unwrap();
+
+        let resp = svc
+            .proxy_request(test_ctx(), proxy_get("/test/v1"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let mut body = body_stream(resp);
+        assert_eq!(body.next().await.unwrap().unwrap(), "hello");
+        assert_eq!(metrics.events(), head_events(200));
+
+        upstream.send(b"0\r\n\r\n").unwrap();
+        assert!(body.next().await.is_none());
+        let mut expected = head_events(200);
+        expected.extend([
+            "stream test completed".to_owned(),
+            "in_flight -1 test".to_owned(),
+        ]);
+        assert_eq!(metrics.events(), expected);
+        drop(body);
+        assert_eq!(metrics.events(), expected, "recorded once");
+    }
+
+    /// A body the upstream cuts ends as `error`; an SSE stream the gateway's
+    /// stop ends as `shutdown`; a body dropped before its end (the client
+    /// went away) as `cancelled`. Each leaves the in-flight gauge then
+    /// (#4987).
+    #[tokio::test]
+    async fn stream_outcome_is_recorded_when_the_body_ends() {
+        // The upstream closes the connection mid-body.
+        let (port, upstream) = raw_upstream().await;
+        let metrics = Arc::new(RequestRecorder::default());
+        let svc = local_svc(port, metrics.clone());
+        upstream.send(CHUNKED_HEAD).unwrap();
+        let resp = svc
+            .proxy_request(test_ctx(), proxy_get("/test/v1"))
+            .await
+            .unwrap();
+        let mut body = body_stream(resp);
+        assert_eq!(body.next().await.unwrap().unwrap(), "hello");
+        drop(upstream);
+        assert!(matches!(body.next().await, Some(Err(_))));
+        let mut expected = head_events(200);
+        expected.extend([
+            "stream test error".to_owned(),
+            "in_flight -1 test".to_owned(),
+        ]);
+        assert_eq!(metrics.events(), expected);
+
+        // The gateway stops under an open SSE stream.
+        let (port, upstream) = raw_upstream().await;
+        let metrics = Arc::new(RequestRecorder::default());
+        let svc = local_svc(port, metrics.clone());
+        upstream
+            .send(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                  transfer-encoding: chunked\r\n\r\nb\r\ndata: one\n\n\r\n",
+            )
+            .unwrap();
+        let resp = svc
+            .proxy_request(test_ctx(), proxy_get("/test/v1"))
+            .await
+            .unwrap();
+        let mut body = body_stream(resp);
+        assert_eq!(body.next().await.unwrap().unwrap(), "data: one\n\n");
+        svc.stream_shutdown().end_streams();
+        crate::infra::proxy::streaming::tests::assert_shutdown_error(body.next().await);
+        let mut expected = head_events(200);
+        expected.extend([
+            "stream test shutdown".to_owned(),
+            "in_flight -1 test".to_owned(),
+        ]);
+        assert_eq!(metrics.events(), expected);
+
+        // The client goes away before the body ends.
+        let (port, upstream) = raw_upstream().await;
+        let metrics = Arc::new(RequestRecorder::default());
+        let svc = local_svc(port, metrics.clone());
+        upstream.send(CHUNKED_HEAD).unwrap();
+        let resp = svc
+            .proxy_request(test_ctx(), proxy_get("/test/v1"))
+            .await
+            .unwrap();
+        drop(resp);
+        let mut expected = head_events(200);
+        expected.extend([
+            "stream test cancelled".to_owned(),
+            "in_flight -1 test".to_owned(),
+        ]);
+        assert_eq!(metrics.events(), expected);
+    }
+
+    /// A response without a body (204, 304, an answer to HEAD) ends at its
+    /// head and records no stream duration: hyper never reads its body,
+    /// which would otherwise end as `cancelled`.
+    #[tokio::test]
+    async fn a_response_without_a_body_ends_at_its_head() {
+        let cases: [(http::Method, &'static [u8], u16); 3] = [
+            (http::Method::GET, b"HTTP/1.1 204 No Content\r\n\r\n", 204),
+            (http::Method::GET, b"HTTP/1.1 304 Not Modified\r\n\r\n", 304),
+            (
+                http::Method::HEAD,
+                b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\n",
+                200,
+            ),
+        ];
+        for (method, head, status) in cases {
+            let (port, upstream) = raw_upstream().await;
+            let metrics = Arc::new(RequestRecorder::default());
+            let svc = local_svc(port, metrics.clone());
+            upstream.send(head).unwrap();
+            let req = http::Request::builder()
+                .method(method.clone())
+                .uri("/test/v1")
+                .body(Body::Empty)
+                .unwrap();
+            let resp = svc.proxy_request(test_ctx(), req).await.unwrap();
+            assert_eq!(resp.status().as_u16(), status);
+            let expected = [
+                "in_flight +1 unknown".to_owned(),
+                "in_flight +1 test".to_owned(),
+                "in_flight -1 unknown".to_owned(),
+                "duration resolve".to_owned(),
+                "in_flight -1 test".to_owned(),
+                "duration total".to_owned(),
+                format!("request test {method} {status}"),
+            ];
+            assert_eq!(metrics.events(), expected, "{method} {status}");
+            drop(resp);
+            assert_eq!(metrics.events(), expected, "nothing more at the drop");
+        }
+    }
+
+    /// A request dropped after resolution, before the response head (the
+    /// client went away), leaves the in-flight gauge balanced and counts
+    /// only as `Cancelled`: no status, as the client got none (#4989).
+    #[tokio::test]
+    async fn a_request_dropped_before_its_head_is_cancelled() {
+        // The upstream reads the request and never answers.
+        let (port, _upstream) = raw_upstream().await;
+        let metrics = Arc::new(RequestRecorder::default());
+        let svc = local_svc(port, metrics.clone());
+        let timed_out = tokio::time::timeout(
+            Duration::from_millis(50),
+            svc.proxy_request(test_ctx(), proxy_get("/test/v1")),
+        )
+        .await;
         assert!(timed_out.is_err());
         assert_eq!(
             metrics.events(),
-            vec![
-                format!("duration {}", phase::TOTAL),
-                "error Cancelled".to_owned()
+            [
+                "in_flight +1 unknown",
+                "in_flight +1 test",
+                "in_flight -1 unknown",
+                "duration resolve",
+                "in_flight -1 test",
+                "duration total",
+                "error test Cancelled",
+            ]
+        );
+    }
+
+    /// A gateway recording into `metrics`, with the upstream `test` on
+    /// 127.0.0.1:`port` and its `GET /v1` route, served over HTTP/1.1 by
+    /// hyper on the returned address, so requests go through the REST
+    /// handler as in production.
+    async fn served_gateway(
+        port: u16,
+        metrics: Arc<RequestRecorder>,
+    ) -> (crate::test_support::AppHarness, std::net::SocketAddr) {
+        use oagw_sdk::{CreateRouteRequest, CreateUpstreamRequest, HttpMatch, MatchRules};
+        let h = crate::test_support::AppHarness::builder()
+            .with_metrics(metrics)
+            .with_max_body_size(8)
+            .build()
+            .await;
+        let ctx = h.security_context().clone();
+        let upstream = h
+            .facade()
+            .create_upstream(
+                ctx.clone(),
+                CreateUpstreamRequest::builder(
+                    oagw_sdk::Server {
+                        endpoints: vec![oagw_sdk::Endpoint {
+                            scheme: oagw_sdk::Scheme::Http,
+                            host: "127.0.0.1".into(),
+                            port,
+                        }],
+                    },
+                    oagw_sdk::HTTP_PROTOCOL_ID,
+                )
+                .alias("test")
+                .build(),
+            )
+            .await
+            .unwrap();
+        h.facade()
+            .create_route(
+                ctx,
+                CreateRouteRequest::builder(
+                    upstream.id,
+                    MatchRules {
+                        http: Some(HttpMatch {
+                            methods: vec![oagw_sdk::HttpMethod::Get, oagw_sdk::HttpMethod::Post],
+                            path: "/v1".into(),
+                            query_allowlist: vec![],
+                            path_suffix_mode: oagw_sdk::PathSuffixMode::Append,
+                        }),
+                        grpc: None,
+                    },
+                )
+                .build(),
+            )
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = h.router().clone();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        (h, addr)
+    }
+
+    /// Sends `req` over HTTP/1.1 to `addr`: the response status and its
+    /// whole body.
+    async fn http1_send(
+        addr: std::net::SocketAddr,
+        req: http::Request<http_body_util::Full<Bytes>>,
+    ) -> (http::StatusCode, Bytes) {
+        use http_body_util::BodyExt as _;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut sender, conn) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tcp))
+                .await
+                .unwrap();
+        tokio::spawn(conn);
+        let resp = sender.send_request(req).await.unwrap();
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, body)
+    }
+
+    /// The events once there are at least `n`; hyper ends the response body
+    /// after the client may have read it.
+    async fn events_after(metrics: &RequestRecorder, n: usize) -> Vec<String> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while metrics.events().len() < n {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("fewer than {n} events: {:?}", metrics.events()));
+        metrics.events()
+    }
+
+    /// hyper's HTTP/1.1 server stops polling a Content-Length body once it
+    /// has written the declared bytes and drops it, without asking for its
+    /// end. Such a body still ends as `completed` (#4987).
+    #[tokio::test]
+    async fn a_content_length_body_served_by_hyper_ends_as_completed() {
+        let (port, upstream) = raw_upstream().await;
+        let metrics = Arc::new(RequestRecorder::default());
+        let (_h, addr) = served_gateway(port, metrics.clone()).await;
+        upstream
+            .send(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello")
+            .unwrap();
+
+        let req = http::Request::get("/oagw/v1/proxy/test/v1")
+            .header(http::header::HOST, addr.to_string())
+            .body(http_body_util::Full::new(Bytes::new()))
+            .unwrap();
+        let (status, body) = http1_send(addr, req).await;
+        assert_eq!(status, http::StatusCode::OK);
+        assert_eq!(body, "hello");
+
+        let mut expected = head_events(200);
+        expected.extend([
+            "stream test completed".to_owned(),
+            "in_flight -1 test".to_owned(),
+        ]);
+        assert_eq!(events_after(&metrics, expected.len()).await, expected);
+    }
+
+    /// Requests the REST handler rejects after the `proxy:invoke` grant, a
+    /// body over the limit and a path without an alias, are counted as the
+    /// Data Plane counts its gateway errors: with the status the client
+    /// gets, under the unknown host (#4989).
+    #[tokio::test]
+    async fn handler_rejections_after_the_grant_are_counted() {
+        let metrics = Arc::new(RequestRecorder::default());
+        // No request reaches the upstream.
+        let (_h, addr) = served_gateway(1, metrics.clone()).await;
+
+        let too_large = http::Request::post("/oagw/v1/proxy/test/v1")
+            .header(http::header::HOST, addr.to_string())
+            .body(http_body_util::Full::new(Bytes::from_static(
+                b"longer than eight bytes",
+            )))
+            .unwrap();
+        let (status, _) = http1_send(addr, too_large).await;
+        assert_eq!(status, http::StatusCode::PAYLOAD_TOO_LARGE);
+        let events = metrics.events();
+        assert_eq!(
+            events,
+            [
+                "duration total",
+                "request unknown POST 413",
+                "error unknown PayloadTooLarge",
+            ]
+        );
+
+        let metrics = Arc::new(RequestRecorder::default());
+        let (_h, addr) = served_gateway(1, metrics.clone()).await;
+        let no_alias = http::Request::get("/oagw/v1/proxy//v1")
+            .header(http::header::HOST, addr.to_string())
+            .body(http_body_util::Full::new(Bytes::new()))
+            .unwrap();
+        let (status, _) = http1_send(addr, no_alias).await;
+        assert_eq!(status, http::StatusCode::BAD_REQUEST);
+        let events = metrics.events();
+        assert_eq!(
+            events,
+            [
+                "duration total",
+                "request unknown GET 400",
+                "error unknown ValidationError",
+            ]
+        );
+    }
+
+    /// Counts the transform phases it runs.
+    #[derive(Default)]
+    struct PhaseCounter {
+        responses: AtomicUsize,
+        errors: std::sync::Mutex<Vec<u16>>,
+    }
+
+    #[async_trait]
+    impl crate::domain::plugin::TransformPlugin for PhaseCounter {
+        async fn on_response(&self, _: &mut TransformResponseContext) -> Result<(), PluginError> {
+            self.responses.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn on_error(&self, ctx: &mut TransformErrorContext) -> Result<(), PluginError> {
+            self.errors.lock().unwrap().push(ctx.status);
+            Ok(())
+        }
+    }
+
+    /// `local_svc` with the [`PhaseCounter`] transform bound to the upstream.
+    fn svc_with_phase_counter(
+        port: u16,
+        metrics: Arc<dyn OagwMetricsPort>,
+        counter: Arc<PhaseCounter>,
+    ) -> DataPlaneServiceImpl {
+        use crate::domain::model::{PluginBinding, PluginsConfig, SharingMode};
+        let plugin_ref =
+            toolkit_gts::gts_id!("cf.core.oagw.transform_plugin.v1~cf.core.oagw.phase_test.v1");
+        let (mut upstream, route) = local_target(port);
+        upstream.plugins = Some(PluginsConfig {
+            sharing: SharingMode::Private,
+            items: vec![PluginBinding {
+                plugin_ref: plugin_ref.into(),
+                config: Default::default(),
+            }],
+        });
+        let mut svc = build_svc_resolving(
+            Arc::new(MockSelector::new()),
+            metrics,
+            Some((upstream, route)),
+        )
+        .with_allow_http_upstream(true);
+        svc.transform_registry.insert(plugin_ref, counter);
+        svc
+    }
+
+    /// An upstream error response goes through `on_response`, not
+    /// `on_error`, and is counted with its status, not as an error. A
+    /// gateway error from the exchange runs `on_error` with the status the
+    /// client gets (#4989).
+    #[tokio::test]
+    async fn on_error_runs_only_for_gateway_errors() {
+        let (port, upstream) = raw_upstream().await;
+        let metrics = Arc::new(RequestRecorder::default());
+        let counter = Arc::new(PhaseCounter::default());
+        let svc = svc_with_phase_counter(port, metrics.clone(), counter.clone());
+        upstream
+            .send(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 4\r\n\r\noops")
+            .unwrap();
+        let resp = svc
+            .proxy_request(test_ctx(), proxy_get("/test/v1"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(counter.responses.load(Ordering::SeqCst), 1);
+        let errors = counter.errors.lock().unwrap().clone();
+        assert!(errors.is_empty(), "{errors:?}");
+        let events = metrics.events();
+        assert!(
+            events.contains(&"request test GET 500".to_owned()),
+            "{events:?}"
+        );
+        assert!(!events.iter().any(|e| e.starts_with("error")), "{events:?}");
+
+        // The upstream closes the connection without a response.
+        let port = closing_upstream().await;
+        let metrics = Arc::new(RequestRecorder::default());
+        let counter = Arc::new(PhaseCounter::default());
+        let svc = svc_with_phase_counter(port, metrics.clone(), counter.clone());
+        let err = svc
+            .proxy_request(test_ctx(), proxy_get("/test/v1"))
+            .await
+            .unwrap_err();
+        let status = domain_error_status(&err);
+        assert!(status >= 500, "{err:?}");
+        assert_eq!(counter.responses.load(Ordering::SeqCst), 0);
+        let errors = counter.errors.lock().unwrap().clone();
+        assert_eq!(errors, [status]);
+        let events = metrics.events();
+        assert!(
+            events.contains(&format!("request test GET {status}")),
+            "{events:?}"
+        );
+        assert!(
+            events.contains(&format!("error test {}", domain_error_type_name(&err))),
+            "{events:?}"
+        );
+    }
+
+    /// Each rate-limit bucket writes its own series: the route, the
+    /// shadowed ancestor routes, the upstream and the shared pool. The
+    /// shadowed routes share theirs, which gets the highest ratio among them
+    /// once per request, not the last one checked (#4989).
+    #[test]
+    fn rate_limit_metrics_carry_the_bucket() {
+        use crate::domain::model::{RateLimitAlgorithm, RateLimitScope, SharedPool, Window};
+        let mut upstream = upstream_with(vec![]);
+        let mut rl = limit(10, Window::Minute, RateLimitScope::Tenant);
+        rl.shared_pool = Some(SharedPool {
+            owner_id: Uuid::new_v4(),
+            total: 5,
+            window: Window::Minute,
+            algorithm: RateLimitAlgorithm::TokenBucket,
+        });
+        upstream.rate_limit = Some(rl);
+        let route = route_on(
+            &upstream,
+            Some(limit(4, Window::Minute, RateLimitScope::Tenant)),
+        );
+        // Root first: the root is checked last, the nearer ancestor first.
+        let shadowed = [
+            ShadowedRouteLimit {
+                route_id: Uuid::new_v4(),
+                rate_limit: limit(10, Window::Minute, RateLimitScope::Tenant),
+            },
+            ShadowedRouteLimit {
+                route_id: Uuid::new_v4(),
+                rate_limit: limit(2, Window::Minute, RateLimitScope::Tenant),
+            },
+        ];
+        let ctx = test_ctx();
+        let limiter = RateLimiter::new();
+        let metrics = RequestRecorder::default();
+        let check = || {
+            check_rate_limits(
+                &limiter, &upstream, &route, &shadowed, None, &ctx, "/t", &metrics, "h", "/p",
+            )
+        };
+
+        check().unwrap();
+        check().unwrap();
+        assert!(matches!(
+            check(),
+            Err(DomainError::RateLimitExceeded { .. })
+        ));
+        assert_eq!(
+            metrics.events(),
+            [
+                "usage route 0.25",
+                "usage shadowed_route 0.5",
+                "usage upstream 0.1",
+                "usage pool 0.2",
+                "usage route 0.5",
+                "usage shadowed_route 1",
+                "usage upstream 0.2",
+                "usage pool 0.4",
+                "usage route 0.75",
+                "exceeded shadowed_route",
+                "usage shadowed_route 1",
             ]
         );
     }
@@ -4119,11 +5084,38 @@ mod tests {
         fn record_request_duration_seconds(&self, _: &str, _: &str, _: &str, _: f64) {}
         fn increment_in_flight(&self, _: &str) {}
         fn decrement_in_flight(&self, _: &str) {}
-        fn record_rate_limit_exceeded(&self, _: &str, _: &str) {}
-        fn record_rate_limit_usage_ratio(&self, _: &str, _: &str, _: f64) {}
+        fn record_rate_limit_exceeded(
+            &self,
+            _: &str,
+            _: &str,
+            _: crate::domain::ports::metric_labels::RateLimitBucket,
+        ) {
+        }
+        fn record_rate_limit_usage_ratio(
+            &self,
+            _: &str,
+            _: &str,
+            _: crate::domain::ports::metric_labels::RateLimitBucket,
+            _: f64,
+        ) {
+        }
         fn increment_active_websocket_sessions(&self, _: &str) {}
         fn decrement_active_websocket_sessions(&self, _: &str) {}
-        fn record_websocket_session_duration_seconds(&self, _: &str, _: f64) {}
+        fn record_websocket_session_duration_seconds(
+            &self,
+            _: &str,
+            _: crate::domain::ports::metric_labels::StreamOutcome,
+            _: f64,
+        ) {
+        }
+        fn record_stream_duration_seconds(
+            &self,
+            _: &str,
+            _: &str,
+            _: crate::domain::ports::metric_labels::StreamOutcome,
+            _: f64,
+        ) {
+        }
         fn record_rate_limit_sweep(&self, evicted: u64, live: u64) {
             self.0.lock().unwrap().push((evicted, live));
         }

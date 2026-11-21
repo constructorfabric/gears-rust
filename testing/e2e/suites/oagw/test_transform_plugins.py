@@ -194,3 +194,49 @@ async def test_unknown_plugin_rejected_at_write(
         if resp.status_code == 201:
             cleanup.upstream(oagw_headers, resp.json())
         assert_problem(resp, 400, esrc=None)
+
+
+# ---------------------------------------------------------------------------
+# Test H: an upstream error response passes through the transforms
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.scenario("positive-11.5-error-transform-handles-gateway-errors", part="B")
+@pytest.mark.asyncio
+async def test_upstream_error_response_passes_through_transforms(
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
+):
+    """Scenario 11.5-B: with a transform bound, an upstream 500 reaches the client untouched.
+
+    An upstream error response goes through `on_response`, so the client gets
+    the upstream's status, content type and body, not a gateway Problem
+    Details response. A built-in `on_error` cannot change the response, so
+    this test cannot see whether it ran; the unit test
+    `on_error_runs_only_for_gateway_errors` covers that.
+    """
+    _ = mock_upstream
+    alias = unique_alias("xform-up-err")
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        upstream = cleanup.upstream(oagw_headers, await create_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url,
+            alias=alias,
+            plugins=_request_id_plugins(),
+        ))
+        await create_route(
+            client, oagw_base_url, oagw_headers, upstream["id"], ["GET"], "/error",
+        )
+
+        resp = await client.get(
+            f"{oagw_base_url}/oagw/v1/proxy/{alias}/error/500",
+            headers=oagw_headers,
+        )
+        assert resp.status_code == 500, resp.text[:500]
+        assert resp.headers.get("x-oagw-error-source") == "upstream", resp.headers
+        assert resp.headers.get("content-type") == "application/json", resp.headers
+        assert resp.json() == {
+            "error": {
+                "message": "Simulated error 500",
+                "type": "server_error",
+                "code": "error_500",
+            },
+        }
