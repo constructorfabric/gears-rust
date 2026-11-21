@@ -996,17 +996,13 @@ mod advertise_uri {
     }
 }
 
-/// Tests for `build_platform_credentials` — the four outcomes that decide
-/// whether an `OoP` gear attaches any outbound platform-plane credential. Every
-/// wrong answer would otherwise be a silent "no credential", so these are
-/// exercised directly.
+/// The `OoP`-specific platform-credential rules. Building the credential itself
+/// is tested in `toolkit_contract::runtime::platform_credential`.
 mod platform_credentials {
     use super::*;
-    use secrecy::ExposeSecret as _;
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio_util::sync::CancellationToken;
-    use toolkit_contract::runtime::config::CredentialState;
-    use toolkit_security::InternalAuthConfig;
+    use toolkit_security::{InternalAuthConfig, KubePresent, KubeVerify};
 
     fn unique_dir(tag: &str) -> std::path::PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1015,72 +1011,40 @@ mod platform_credentials {
     }
 
     #[tokio::test]
-    async fn shared_secret_yields_provider_with_the_secret() {
-        let cfg = InternalAuthConfig::SharedSecret {
-            secret: secrecy::SecretString::from("shared-tok"),
-            peer_name: "toolkit-internal".to_owned(),
-        };
-        let (_interceptor, provider) = build_platform_credentials(&cfg, &CancellationToken::new())
-            .await
-            .expect("shared secret builds");
-        let provider = provider.expect("shared secret yields a provider");
-        match provider.current() {
-            CredentialState::Available(token) => assert_eq!(token.expose_secret(), "shared-tok"),
-            other => panic!("expected Available, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn kube_with_token_path_yields_provider_reading_the_file() {
-        let dir = unique_dir("kube-ok");
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        let path = dir.join("token");
-        tokio::fs::write(&path, "kube.sa.jwt").await.unwrap();
-
+    async fn kube_without_present_block_is_a_startup_error() {
+        // An OoP gear always registers and heartbeats with DirectoryService, so
+        // it can never be inbound-only: no `present` block is a config error,
+        // not "attach nothing".
         let cfg = InternalAuthConfig::Kube {
-            audiences: vec!["toolkit-internal".to_owned()],
-            token_path: Some(path),
+            verify: Some(KubeVerify {
+                audiences: vec!["toolkit-internal".to_owned()],
+            }),
+            present: None,
         };
-        let (_interceptor, provider) = build_platform_credentials(&cfg, &CancellationToken::new())
-            .await
-            .expect("kube with token path builds");
-        let provider = provider.expect("kube-with-path yields a provider");
-        match provider.current() {
-            CredentialState::Available(token) => assert_eq!(token.expose_secret(), "kube.sa.jwt"),
-            other => panic!("expected Available, got {other:?}"),
-        }
-
-        tokio::fs::remove_dir_all(&dir).await.ok();
-    }
-
-    #[tokio::test]
-    async fn kube_without_token_path_yields_no_provider() {
-        let cfg = InternalAuthConfig::Kube {
-            audiences: vec!["toolkit-internal".to_owned()],
-            token_path: None,
-        };
-        let (_interceptor, provider) = build_platform_credentials(&cfg, &CancellationToken::new())
-            .await
-            .expect("kube without token path builds (inbound-only)");
-        assert!(
-            provider.is_none(),
-            "inbound-only kube participant must attach no outbound credential"
-        );
-    }
-
-    #[tokio::test]
-    async fn kube_with_missing_token_file_is_an_error() {
-        let path = unique_dir("kube-missing").join("token");
-        let cfg = InternalAuthConfig::Kube {
-            audiences: vec!["toolkit-internal".to_owned()],
-            token_path: Some(path),
-        };
-        assert!(
-            build_platform_credentials(&cfg, &CancellationToken::new())
+        let Err(err) =
+            build_directory_client("http://127.0.0.1:1", Some(&cfg), &CancellationToken::new())
                 .await
-                .is_err(),
-            "a missing token file must surface a contextualized error, not Ok(None)"
-        );
+        else {
+            panic!("kube without a present block must not build the directory client");
+        };
+        assert!(err.to_string().contains("present"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn kube_without_verify_block_refuses_the_inbound_validator() {
+        // The OoP gear validates inbound platform calls on its own routes, so a
+        // kube config without `verify` must fail startup rather than leave the
+        // inbound side unauthenticated.
+        let cfg = InternalAuthConfig::Kube {
+            verify: None,
+            present: Some(KubePresent {
+                token_path: unique_dir("kube-noverify").join("token"),
+            }),
+        };
+        let err = build_internal_authenticator(Some(&cfg))
+            .await
+            .expect_err("no verify block means no inbound validator");
+        assert!(err.to_string().contains("verify"), "got: {err}");
     }
 }
 
@@ -1155,12 +1119,14 @@ mod directory_client_bootstrap {
         // the endpoint error — never the credential one (which would otherwise
         // mask the misconfigured endpoint).
         let cfg = InternalAuthConfig::Kube {
-            audiences: vec!["toolkit-internal".to_owned()],
-            token_path: Some(
-                std::env::temp_dir()
+            verify: Some(toolkit_security::KubeVerify {
+                audiences: vec!["toolkit-internal".to_owned()],
+            }),
+            present: Some(toolkit_security::KubePresent {
+                token_path: std::env::temp_dir()
                     .join("cf-oop-missing-token-regression")
                     .join("token"),
-            ),
+            }),
         };
         let Err(err) = build_directory_client("", Some(&cfg), &CancellationToken::new()).await
         else {

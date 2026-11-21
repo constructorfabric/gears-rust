@@ -60,6 +60,7 @@ use async_trait::async_trait;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, Endpoint};
 use toolkit_contract::runtime::config::InternalTokenProvider;
+use toolkit_contract::runtime::platform_credential::internal_auth_interceptor;
 use toolkit_transport_grpc::InternalAuthInterceptor;
 
 use crate::cache::ClusterCacheBackend;
@@ -116,34 +117,6 @@ pub(crate) type LeaderStub =
     stubs::leader::leader_election_api_client::LeaderElectionApiClient<AuthChannel>;
 /// The generated profile stub.
 type ProfileStub = stubs::profile::cluster_profile_api_client::ClusterProfileApiClient<AuthChannel>;
-
-/// Bridge the runtime's credential source to the transport's interceptor.
-///
-/// The attach *policy* is deliberately not reimplemented here:
-/// [`InternalTokenProvider::resolve_for_attach`] is the shared decision the REST
-/// and gRPC helpers both delegate to, so cluster behaves identically to every
-/// generated client —
-///
-/// - `None` / `NotConfigured` → attach nothing, silently. A legitimate Profile 1
-///   deployment, not a fault.
-/// - `Available` → attach the token.
-/// - `Unavailable` → attach nothing but **warn**. A broken credential source is
-///   not the same thing as an intentional opt-out, and failing the call instead
-///   would take the whole fleet down when a token file goes briefly empty.
-///
-/// The provider is invoked per request rather than captured once, so a rotating
-/// (projected service-account) token is picked up without rebuilding the channel.
-fn interceptor_for(provider: Option<&InternalTokenProvider>) -> InternalAuthInterceptor {
-    match provider {
-        Some(provider) => {
-            let provider = provider.clone();
-            InternalAuthInterceptor::new(move || {
-                InternalTokenProvider::resolve_for_attach(Some(&provider), RPC_LABEL)
-            })
-        }
-        None => InternalAuthInterceptor::disabled(),
-    }
-}
 
 /// Names this client in the `Unavailable` warning `resolve_for_attach` emits. The
 /// interceptor runs before the method is known, so there is no per-RPC label.
@@ -219,7 +192,9 @@ impl RemoteClusterClient {
             .connect_lazy();
         Ok(Self {
             channel,
-            interceptor: interceptor_for(internal_token_provider),
+            // The shared adapter applies `resolve_for_attach`, so cluster attaches
+            // exactly like every generated client.
+            interceptor: internal_auth_interceptor(internal_token_provider, RPC_LABEL),
             descriptors: Arc::new(DescriptorCache::new()),
         })
     }

@@ -18,9 +18,10 @@
 //! use toolkit_k8s_auth::{K8sAuthError, K8sTokenReviewAuthenticator};
 //!
 //! # async fn wire() -> Result<(), K8sAuthError> {
-//! // Validates tokens scoped to the `toolkit-internal` audience.
+//! // Validates tokens scoped to the `toolkit-internal` audience. Audiences are
+//! // `(first, rest)`, so the list cannot be empty.
 //! let authenticator =
-//!     K8sTokenReviewAuthenticator::try_default(vec!["toolkit-internal".to_owned()]).await?;
+//!     K8sTokenReviewAuthenticator::try_default(("toolkit-internal".to_owned(), vec![])).await?;
 //! # let _ = authenticator;
 //! # Ok(())
 //! # }
@@ -37,7 +38,8 @@ pub use toolkit_security::{
 use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec};
 use kube::api::{Api, PostParams};
 use toolkit_security::{
-    DynInternalAuthenticator, InternalAuthNError, InternalAuthenticator, PlatformIdentity,
+    DynInternalAuthenticator, InternalAuthNError, InternalAuthenticator, KubeAuthenticatorBuilder,
+    PlatformIdentity,
 };
 
 /// Prefix of the `user.username` returned by `TokenReview` for a
@@ -67,9 +69,9 @@ pub enum K8sAuthError {
 #[derive(Clone)]
 pub struct K8sTokenReviewAuthenticator {
     client: kube::Client,
-    /// Expected token audiences. When non-empty they are sent to the API server,
-    /// which rejects tokens not scoped to (at least) one of them.
-    audiences: Vec<String>,
+    /// Expected token audiences as `(first, rest)`, so never empty. Sent to the
+    /// API server, which rejects tokens not scoped to (at least) one of them.
+    audiences: (String, Vec<String>),
     /// Per-request timeout for the `TokenReview` API call.
     timeout: std::time::Duration,
 }
@@ -77,7 +79,7 @@ pub struct K8sTokenReviewAuthenticator {
 impl std::fmt::Debug for K8sTokenReviewAuthenticator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("K8sTokenReviewAuthenticator")
-            .field("audiences", &self.audiences)
+            .field("audiences", &self.audiences().collect::<Vec<_>>())
             .field("timeout", &self.timeout)
             .finish_non_exhaustive()
     }
@@ -86,8 +88,12 @@ impl std::fmt::Debug for K8sTokenReviewAuthenticator {
 impl K8sTokenReviewAuthenticator {
     /// Build an authenticator from an existing [`kube::Client`] with the
     /// default per-request timeout.
+    ///
+    /// `audiences` is `(first, rest)`, so it cannot be empty: an empty list
+    /// would leave the review unbound to the platform plane, and any
+    /// `ServiceAccount` token the API server accepts would authenticate.
     #[must_use]
-    pub fn new(client: kube::Client, audiences: Vec<String>) -> Self {
+    pub fn new(client: kube::Client, audiences: (String, Vec<String>)) -> Self {
         Self {
             client,
             audiences,
@@ -107,23 +113,23 @@ impl K8sTokenReviewAuthenticator {
     ///
     /// # Errors
     /// Returns [`K8sAuthError::Client`] if no valid configuration is available.
-    pub async fn try_default(audiences: Vec<String>) -> Result<Self, K8sAuthError> {
+    pub async fn try_default(audiences: (String, Vec<String>)) -> Result<Self, K8sAuthError> {
         let client = kube::Client::try_default().await?;
         Ok(Self::new(client, audiences))
     }
 
+    /// The expected audiences, first one included.
+    fn audiences(&self) -> impl Iterator<Item = &String> {
+        let (first, rest) = &self.audiences;
+        std::iter::once(first).chain(rest)
+    }
+
     /// Submit a `TokenReview` for `token` and resolve the platform identity.
     async fn review(&self, token: &str) -> Result<PlatformIdentity, InternalAuthNError> {
-        let audiences = if self.audiences.is_empty() {
-            None
-        } else {
-            Some(self.audiences.clone())
-        };
-
         let review = TokenReview {
             spec: TokenReviewSpec {
                 token: token.to_owned(),
-                audiences,
+                audiences: Some(self.audiences().cloned().collect()),
             },
             ..Default::default()
         };
@@ -156,23 +162,16 @@ impl K8sTokenReviewAuthenticator {
             return Err(InternalAuthNError::InvalidToken);
         }
 
-        // When audiences are requested, the API server returns the token's
-        // audiences in the status. Reject tokens that do not satisfy at least
-        // one of the configured expected audiences.
-        if !self.audiences.is_empty() {
-            let response_audiences = status.audiences.as_deref().unwrap_or_default();
-            if !self
-                .audiences
-                .iter()
-                .any(|a| response_audiences.contains(a))
-            {
-                tracing::debug!(
-                    expected = ?self.audiences,
-                    got = ?response_audiences,
-                    "TokenReview audience mismatch"
-                );
-                return Err(InternalAuthNError::InvalidToken);
-            }
+        // The API server returns the token's audiences in the status. Reject
+        // tokens that do not satisfy at least one of the expected audiences.
+        let response_audiences = status.audiences.as_deref().unwrap_or_default();
+        if !self.audiences().any(|a| response_audiences.contains(a)) {
+            tracing::debug!(
+                expected = ?self.audiences().collect::<Vec<_>>(),
+                got = ?response_audiences,
+                "TokenReview audience mismatch"
+            );
+            return Err(InternalAuthNError::InvalidToken);
         }
 
         let user = status
@@ -211,9 +210,9 @@ impl InternalAuthenticator for K8sTokenReviewAuthenticator {
 /// wrapped in [`CachingInternalAuthenticator`].
 ///
 /// This is the **one** place `provider: kube` is constructed. Every caller
-/// that wires it (the gRPC hub, the `OoP` HTTP bootstrap) goes through this
-/// function so they cannot drift on caching behavior or on what a
-/// construction failure means.
+/// that wires it (api-gateway, the gRPC hub, the `OoP` HTTP bootstrap) goes
+/// through this function, via [`kube_authenticator_builder`], so they cannot
+/// drift on caching behavior or on what a construction failure means.
 ///
 /// `authentication_timeout`, when `Some`, overrides
 /// [`DEFAULT_AUTHENTICATION_TIMEOUT`](toolkit_security::DEFAULT_AUTHENTICATION_TIMEOUT)
@@ -228,7 +227,7 @@ impl InternalAuthenticator for K8sTokenReviewAuthenticator {
 /// or a caching-TTL error (via [`InvalidCacheTtl`](toolkit_security::InvalidCacheTtl),
 /// converted with its `Display`) if `cache_ttl` is `Some` and out of bounds.
 pub async fn build_cached_k8s_authenticator(
-    audiences: Vec<String>,
+    audiences: (String, Vec<String>),
     cache_ttl: Option<std::time::Duration>,
     authentication_timeout: Option<std::time::Duration>,
 ) -> Result<DynInternalAuthenticator, K8sAuthError> {
@@ -243,6 +242,23 @@ pub async fn build_cached_k8s_authenticator(
         }
         None => Ok(DynInternalAuthenticator::new(validator)),
     }
+}
+
+/// [`build_cached_k8s_authenticator`] with these settings, as the Kubernetes
+/// backend for [`toolkit_security::build_inbound_authenticator`], which supplies
+/// `verify.audiences` as `(first, rest)`.
+#[must_use]
+pub fn kube_authenticator_builder(
+    cache_ttl: Option<std::time::Duration>,
+    authentication_timeout: Option<std::time::Duration>,
+) -> KubeAuthenticatorBuilder {
+    Box::new(move |audiences| {
+        Box::pin(async move {
+            build_cached_k8s_authenticator(audiences, cache_ttl, authentication_timeout)
+                .await
+                .map_err(Into::into)
+        })
+    })
 }
 
 /// Parse a `ServiceAccount` `TokenReview` username

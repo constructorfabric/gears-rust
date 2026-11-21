@@ -364,8 +364,8 @@ What is **missing** and needs to be added:
     - When all critical deps resolved: set readiness = true.
     - In Profile 1: no-op (topo-sort guarantees deps are already in-process).
 - Register the gear's REST endpoint and OpenAPI spec with DirectoryService.
-- **Initialize `InternalCredential`** from configuration (bootstrap token from env, SA token from projected volume) and
-  attach to all system-level outgoing calls automatically.
+- **Build the outbound platform-plane credential** from `oop_http.internal_auth` (a shared secret, or the projected SA
+  token at `present.token_path`) and attach it to all system-level outgoing calls automatically.
 - **Install `InternalAuthMiddleware`** (platform plane) to validate incoming system calls — SA token in the first
   phase; sets `PeerAuthenticated` for workload policy (cpt-cf-adr-platform-plane-auth).
 - Attach `security_context_middleware` (tenant plane) that delegates forwarded-JWT validation to the AuthN Resolver and reconstructs
@@ -738,27 +738,47 @@ contract it carries is defined by the two-plane model ([cpt-cf-adr-two-plane-aut
 
 ##### Current state
 
-No internal authentication exists. The OoP bootstrap connects to DirectoryService via gRPC without any credential. In
-Profile 1 (Embedded), this is not a problem (same process). In Profiles 2 and 3, it is an open attack surface.
+Two credential providers are implemented, selected by `internal_auth` configuration
+(`toolkit_security::InternalAuthConfig`): `shared_secret` (one pre-shared token; dev and single-node) and `kube`
+(projected SA tokens, Profile 3). The Profile 2 bootstrap token minted by Flight Control and mTLS are not implemented
+yet. Profile 1 (Embedded) needs no credential (same process).
 
 ##### Design
 
-The component provides a profile-specific credential abstraction:
+Every participant configures the platform plane through one `internal_auth` block (`InternalAuthConfig`): OoP gears
+under `oop_http.internal_auth`, grpc-hub and api-gateway under their own `internal_auth`.
 
-```rust
-pub enum InternalCredential {
-    /// Profile 1: no auth needed (in-process)
-    None,
-    /// Profile 2 single-node: ephemeral random token from Flight Control
-    BootstrapToken(SecretString),
-    /// Profile 3: k8s ServiceAccount JWT (auto-mounted, auto-rotated)
-    KubeServiceAccountToken { token_path: PathBuf, audience: String },
-    /// Profile 2 multi-node (P2): mTLS client certificate
-    MtlsIdentity { cert: PathBuf, key: PathBuf, ca: PathBuf },
-}
+```yaml
+internal_auth:
+  provider: kube
+  verify:                         # inbound: validate callers' projected SA tokens via TokenReview
+    audiences: [toolkit-internal]
+  present:                        # outbound: the projected SA token this participant attaches
+    token_path: /var/run/secrets/tokens/toolkit-internal/token
+# Dev / single-node alternative, symmetric (accepted inbound, attached outbound):
+#   provider: shared_secret
+#   secret: <token>
 ```
 
-**Profile 2 (single-node)** — Bootstrap Token:
+The two kube blocks are independent, and each participant requires only the one it uses: grpc-hub validates only
+(`verify`); OoP gears register with DirectoryService and validate their own routes (both); the host process and
+`publish-gts` only send (`present`); api-gateway always validates (`verify`) and also sends when its reverse proxy is
+enabled (`present`). A participant missing a block it needs fails startup rather than running that direction
+unauthenticated.
+
+- **Outbound** — `toolkit_contract::runtime::platform_credential::build_internal_token_provider` maps the config to a
+  transport-agnostic `InternalTokenProvider`. Generated clients attach it through
+  `InternalTokenProvider::resolve_for_attach`; hand-written tonic clients (the DirectoryService client, cluster-sdk) wrap
+  it with `internal_auth_interceptor`. A projected token is re-read on rotation by a refresh task bound to the caller's
+  cancellation token.
+- **Inbound** — `toolkit_security::build_inbound_authenticator` builds the validator: the shared secret directly, or a
+  TokenReview validator via `toolkit_k8s_auth::kube_authenticator_builder` (cached, configurable TTL). It is installed
+  as `internal_auth_middleware` (HTTP) or `InternalAuthGrpcLayer` (gRPC).
+
+`toolkit_security::InternalCredential` (`None` / `BootstrapToken` / `KubeServiceAccountToken` / `MtlsIdentity`) is
+unused: the configuration above selects the credential.
+
+**Profile 2 (single-node, planned)** — Bootstrap Token (until then, single-node deployments use `shared_secret`):
 
 1. Flight Control generates a cryptographically random 256-bit token at startup (in-memory only).
 2. Passes it to spawned workers via `TOOLKIT_INTERNAL_TOKEN` env var.
@@ -769,10 +789,10 @@ pub enum InternalCredential {
 **Profile 3 (K8s)** — ServiceAccount Tokens:
 
 1. Each gear pod has a projected SA token with audience `toolkit-internal` (auto-mounted by kubelet).
-2. Gear reads the token from the projected volume at startup and on rotation.
+2. Gear reads the token from `present.token_path` at startup (failing startup if it cannot) and re-reads it on rotation.
 3. Attaches it to system calls as `X-ToolKit-Internal-Token: <sa-token>` (never `Authorization`, to avoid colliding
    with the tenant-plane user JWT).
-4. Flight Control validates via k8s TokenReview API (cached, configurable TTL).
+4. Flight Control validates via k8s TokenReview API against `verify.audiences` (cached, configurable TTL).
 5. Response includes gear identity: `{namespace, serviceAccountName, podName}`.
 
 **One plane per request** (per [cpt-cf-adr-two-plane-auth](ADR/0008-cpt-cf-adr-two-plane-auth.md)): a request carries either the tenant
@@ -870,11 +890,13 @@ belong on the tenant plane — they are *not* candidates for `PlatformSecurityCo
 
 ##### Responsibility scope
 
-- Define the `InternalCredential` enum and `attach_internal_auth` / `validate_internal_auth` helpers.
+- Own `InternalAuthConfig` and its two builders: `build_internal_token_provider` (outbound) and
+  `build_inbound_authenticator` (inbound).
 - Profile 2: Flight Control generates a bootstrap token, passes it to spawned workers via env, and validates it at its `service-discovery` DirectoryService.
-- Profile 3: read projected SA token, attach to calls, validate via TokenReview at Flight Control's `service-discovery`.
-- Provide `InternalAuthMiddleware` for both gRPC (tonic interceptor) and HTTP (Axum middleware) that validates incoming
-  system calls.
+- Profile 3: read the projected SA token at `present.token_path`, attach it to calls, validate via TokenReview against
+  `verify.audiences` at Flight Control's `service-discovery`.
+- Provide `InternalAuthMiddleware` for both gRPC (`InternalAuthGrpcLayer`, a Tower layer, since validation is async)
+  and HTTP (`internal_auth_middleware`, Axum) that validates incoming system calls.
 - All logic lives in ToolKit runtime — gear developers do not interact with internal auth.
 
 ##### Responsibility boundaries
@@ -885,7 +907,8 @@ belong on the tenant plane — they are *not* candidates for `PlatformSecurityCo
 
 ##### Related components (by ID)
 
-- `cpt-cf-component-oop-bootstrap` — initializes `InternalCredential` at startup, attaches to all system calls
+- `cpt-cf-component-oop-bootstrap` — builds the outbound credential and inbound validator from
+  `oop_http.internal_auth` at startup, attaches the credential to all system calls
 - `cpt-cf-component-secctx-http` — coexists on the same requests (different headers, different purpose)
 - `cpt-cf-component-k8s-packaging` — Helm charts configure SA token projection and `TOOLKIT_INTERNAL_TOKEN` env
 
@@ -1483,7 +1506,7 @@ conventions into reusable named templates.
 | Health probes      | `/healthz` (liveness), `/readyz` (readiness), `/health` (diagnostics) — provided by ToolKit runtime | `health.liveness.*`, `health.readiness.*`         |
 | Gear config      | `TOOLKIT_MODULE_CONFIG` from ConfigMap                                     | `gearConfig` (arbitrary map → JSON)             |
 | Directory endpoint | `TOOLKIT_DIRECTORY_ENDPOINT` env var                                       | `global.directoryEndpoint`                        |
-| Internal auth      | Projected SA token volume (audience: `toolkit-internal`) for Profile 3     | `internalAuth.audience`, `internalAuth.tokenPath` |
+| Internal auth      | Projected SA token volume (audience: `toolkit-internal`) for Profile 3; gear config points `internal_auth.present.token_path` at it | `saToken.enabled`, `saToken.audience`, `saToken.mountPath`, `saToken.fileName` |
 | Resources          | requests/limits block                                                     | `resources.requests.*`, `resources.limits.*`      |
 | Labels             | `app.kubernetes.io/*` standard labels                                     | Automatic from chart metadata                     |
 | Image pull secrets | Global pull secrets for private registries                                | `global.imagePullSecrets`                         |

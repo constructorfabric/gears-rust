@@ -81,16 +81,14 @@ pub async fn run_server(config: AppConfig) -> Result<()> {
     // Remote platform-plane calls carry `X-ToolKit-Internal-Token` from
     // `oop_http.internal_auth` (cpt-cf-adr-two-plane-auth); without it they fail.
     // Co-hosted dependencies use local ClientHub objects and need no credential.
-    let internal_token_provider = match config
-        .oop_http
-        .as_ref()
-        .and_then(|http| http.internal_auth.as_ref())
-    {
-        Some(internal_auth) => {
-            super::oop::build_platform_credentials(internal_auth, &cancel)
-                .await?
-                .1
-        }
+    let internal_token_provider = match host_credential(&config)? {
+        Some(internal_auth) => Some(
+            toolkit_contract::runtime::platform_credential::build_internal_token_provider(
+                internal_auth,
+                &cancel,
+            )
+            .await?,
+        ),
         None => None,
     };
 
@@ -258,10 +256,11 @@ async fn publish_gts(
     let registry = crate::registry::GearRegistry::discover_and_build()?;
     validate_deployment_configuration(&registry, config)?;
     let internal_auth = platform_credential(config)?;
-    let (_, provider) = super::oop::build_platform_credentials(internal_auth, cancel).await?;
-    let provider = provider.ok_or_else(|| {
-        anyhow::anyhow!("oop_http.internal_auth gives no outbound platform credential")
-    })?;
+    let provider = toolkit_contract::runtime::platform_credential::build_internal_token_provider(
+        internal_auth,
+        cancel,
+    )
+    .await?;
     let tuning = toolkit_contract::wiring::ClientTuning::default()
         .with_internal_token_provider(Some(provider));
     let descriptors = crate::gts_publication::linked_descriptors();
@@ -292,17 +291,60 @@ fn validate_deployment_configuration(
     Ok(())
 }
 
-/// The platform credential `publish-gts` sends: `oop_http.internal_auth`.
-fn platform_credential(config: &AppConfig) -> Result<&toolkit_security::InternalAuthConfig> {
+/// `oop_http.internal_auth`, if configured.
+fn oop_internal_auth(config: &AppConfig) -> Option<&toolkit_security::InternalAuthConfig> {
     config
         .oop_http
         .as_ref()
         .and_then(|http| http.internal_auth.as_ref())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "publish-gts needs a platform credential: configure oop_http.internal_auth"
-            )
-        })
+}
+
+/// The host process's outbound platform credential: `oop_http.internal_auth`,
+/// or `None` when it is unset (Profile 1).
+///
+/// The host builds no inbound validator from this block; it only presents it on
+/// calls to remote dependencies. A kube block without `present` therefore does
+/// nothing here, and is refused with a host-specific message rather than the
+/// generic one, which assumes the participant sends calls.
+///
+/// # Errors
+/// When [`InternalAuthConfig::outbound`](toolkit_security::InternalAuthConfig::outbound)
+/// refuses `oop_http.internal_auth`.
+fn host_credential(config: &AppConfig) -> Result<Option<&toolkit_security::InternalAuthConfig>> {
+    let Some(internal_auth) = oop_internal_auth(config) else {
+        return Ok(None);
+    };
+    match internal_auth.outbound() {
+        Ok(_) => Ok(Some(internal_auth)),
+        Err(toolkit_security::InvalidOutboundAuth::MissingKubePresent) => anyhow::bail!(
+            "oop_http.internal_auth (provider: kube) has no `present:` block. The host process \
+             uses this block only as the outbound credential for remote platform-plane calls \
+             (`verify` is not used here): set `present.token_path`, or remove the block if no \
+             gear in this process has a remote dependency"
+        ),
+        Err(err) => anyhow::bail!(
+            "oop_http.internal_auth is unusable as the host's outbound credential: {err}"
+        ),
+    }
+}
+
+/// The platform credential `publish-gts` sends: `oop_http.internal_auth`.
+///
+/// # Errors
+/// When `oop_http.internal_auth` is unset, or
+/// [`InternalAuthConfig::outbound`](toolkit_security::InternalAuthConfig::outbound)
+/// refuses it: publish-gts always sends platform-plane calls.
+fn platform_credential(config: &AppConfig) -> Result<&toolkit_security::InternalAuthConfig> {
+    let internal_auth = oop_internal_auth(config).ok_or_else(|| {
+        anyhow::anyhow!("publish-gts needs a platform credential: configure oop_http.internal_auth")
+    })?;
+    internal_auth.outbound().map_err(|err| {
+        anyhow::anyhow!(
+            "publish-gts sends platform-plane calls, but oop_http.internal_auth is unusable as \
+             its credential: {err}"
+        )
+    })?;
+    Ok(internal_auth)
 }
 
 /// The job's result: an error carrying the report unless every publisher succeeded.
@@ -543,6 +585,22 @@ mod publish_gts_tests {
         assert!(err.to_string().contains("oop_http.internal_auth"), "{err}");
     }
 
+    /// publish-gts always sends, so a kube block without `present` is refused,
+    /// and the message must not suggest removing the block.
+    #[test]
+    fn publish_gts_needs_a_kube_present_block() {
+        let config = credential_tests::with_internal_auth(&credential_tests::kube_verify_only());
+        let err = platform_credential(&config).unwrap_err().to_string();
+        assert!(
+            err.contains("publish-gts") && err.contains("present.token_path"),
+            "{err}"
+        );
+        assert!(!err.contains("remove the block"), "{err}");
+
+        let config = credential_tests::with_internal_auth(&credential_tests::kube_present());
+        platform_credential(&config).expect("a present block is an outbound credential");
+    }
+
     #[test]
     fn a_failed_publisher_fails_the_job_with_the_report() {
         let failed = GtsDeploymentReport {
@@ -570,5 +628,97 @@ mod publish_gts_tests {
             publishers: vec![("ok", GtsDeploymentOutcome::Published { documents: 1 })],
         };
         publication_result(&succeeded).expect("every publisher succeeded");
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod credential_tests {
+    use super::*;
+
+    pub(super) fn kube_verify_only() -> serde_json::Value {
+        serde_json::json!({
+            "provider": "kube",
+            "verify": { "audiences": ["toolkit-internal"] }
+        })
+    }
+
+    pub(super) fn kube_present() -> serde_json::Value {
+        serde_json::json!({
+            "provider": "kube",
+            "present": { "token_path": "/var/run/secrets/tokens/toolkit-internal" }
+        })
+    }
+
+    /// An `AppConfig` whose `oop_http.internal_auth` is `internal_auth`.
+    pub(super) fn with_internal_auth(internal_auth: &serde_json::Value) -> AppConfig {
+        let oop_http = serde_json::from_value(serde_json::json!({
+            "listen_addr": "127.0.0.1:0",
+            "internal_auth": internal_auth,
+        }))
+        .expect("valid oop_http config");
+        AppConfig {
+            oop_http: Some(oop_http),
+            ..AppConfig::default()
+        }
+    }
+
+    #[test]
+    fn host_without_internal_auth_has_no_credential() {
+        assert!(
+            host_credential(&AppConfig::default())
+                .expect("Profile 1 needs no credential")
+                .is_none()
+        );
+    }
+
+    /// On the host `verify` is never read, so a verify-only kube block is
+    /// refused with a message that names both fixes.
+    #[test]
+    fn host_refuses_a_kube_block_without_present() {
+        let err = host_credential(&with_internal_auth(&kube_verify_only()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("oop_http.internal_auth")
+                && err.contains("present.token_path")
+                && err.contains("remove the block"),
+            "{err}"
+        );
+    }
+
+    /// Other refusals keep `outbound()`'s own message, with host context.
+    #[test]
+    fn host_refuses_an_unusable_shared_secret() {
+        let err = host_credential(&with_internal_auth(&serde_json::json!({
+            "provider": "shared_secret",
+            "secret": "",
+        })))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("oop_http.internal_auth") && err.contains("shared_secret"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn host_accepts_an_outbound_credential() {
+        let config = with_internal_auth(&kube_present());
+        assert!(
+            host_credential(&config)
+                .expect("a present block is an outbound credential")
+                .is_some()
+        );
+
+        let config = with_internal_auth(&serde_json::json!({
+            "provider": "shared_secret",
+            "secret": "s",
+        }));
+        assert!(
+            host_credential(&config)
+                .expect("a shared secret is symmetric")
+                .is_some()
+        );
     }
 }

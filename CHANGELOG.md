@@ -37,6 +37,48 @@ release-plz updates this file in the Release PR.
   hierarchy. New links still require active registry types. Preflight rejects
   membership IDs over 2600 UTF-8 bytes (`MAX_MEMBERSHIP_RESOURCE_ID_BYTES`).
   See [Upgrading Resource Group](gears/system/resource-group/docs/DESIGN.md#upgrading-resource-group).
+- `internal_auth` with `provider: kube` is split by direction. Move
+  `audiences` under `verify:` (inbound) and `token_path` under `present:`
+  (outbound):
+
+  ```yaml
+  # before                      # after
+  provider: kube                provider: kube
+  audiences: [toolkit-internal] verify:  { audiences: [toolkit-internal] }
+  token_path: /path/to/token    present: { token_path: /path/to/token }
+  ```
+
+  The flat form no longer loads; its error names the new blocks. A kube block
+  needs at least one of the two, `present.token_path` must not be empty, and
+  unknown keys are rejected for both providers.
+- Each participant now requires the block it uses, instead of silently running
+  that direction unauthenticated:
+  - `present` (outbound): `OoP` gears (`oop_http.internal_auth`), the host
+    process and `publish-gts` (same block), and api-gateway when
+    `gateway_proxy.enabled`. On the host, `verify` is unused: add `present`, or
+    remove the block if no gear in the process has a remote dependency.
+  - `verify` (inbound): grpc-hub, `OoP` gears, and api-gateway, which builds
+    its inbound validator at `init` whenever `internal_auth` is set, even if it
+    serves no platform routes.
+- api-gateway with `gateway_proxy.enabled` reads the projected token at `init`.
+  An unreadable `present.token_path` now fails startup, naming the file,
+  instead of being retried in the background with the reverse proxy inactive.
+- Outbound platform credential API: `build_internal_auth_interceptor` is
+  removed from `toolkit-transport-grpc`. Build the credential with
+  `toolkit_contract::runtime::platform_credential::build_internal_token_provider(&cfg, &cancel)`
+  (feature `platform-credential`) and wrap it for tonic clients with
+  `internal_auth_interceptor(Some(&provider), "<client>")`.
+  `ServiceAccountTokenReader::new` and `with_refresh_interval` are removed; use
+  `with_cancellation(path, interval, cancel)`.
+- Inbound platform validator API: `InternalAuthConfig::Kube` now has
+  `verify: Option<KubeVerify>` and `present: Option<KubePresent>`, and
+  `BuiltAuthenticator::RequiresExternalBackend` carries
+  `audiences: (String, Vec<String>)` (first, rest). In `toolkit-k8s-auth`,
+  `K8sTokenReviewAuthenticator::new` / `try_default` and
+  `build_cached_k8s_authenticator` take audiences the same way, so an empty
+  list, which would leave the review unbound, cannot be passed. Prefer
+  `toolkit_security::build_inbound_authenticator` with
+  `toolkit_k8s_auth::kube_authenticator_builder`.
 
 ## [0.3.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-llm-gateway-sdk-v0.3.1...cf-gears-llm-gateway-sdk-v0.3.2) - 2026-11-18
 

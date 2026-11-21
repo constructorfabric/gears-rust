@@ -36,3 +36,6 @@ pub mod sse;
 pub mod breaker;
 #[cfg(feature = "runtime-client")]
 pub mod resolving;
+
+#[cfg(feature = "platform-credential")]
+pub mod platform_credential;

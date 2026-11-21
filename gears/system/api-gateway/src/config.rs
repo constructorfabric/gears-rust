@@ -107,13 +107,17 @@ pub struct ApiGatewayConfig {
     ///   plane, validates the `X-ToolKit-Internal-Token` on co-hosted internal
     ///   routes (e.g. `authz-resolver`'s `/evaluate`) into a
     ///   `PlatformSecurityContext`. Permissive on a missing token, so tenant
-    ///   traffic is unaffected. Kube uses `audiences`.
+    ///   traffic is unaffected. The validator is built at `init` whenever
+    ///   `internal_auth` is set, whether or not any platform routes are served,
+    ///   so kube always needs the `verify` block (`audiences`); without it the
+    ///   gateway fails `init`.
     /// - **Outbound** — the credential attached to the edge's own
     ///   `DirectoryService` polls (when [`GatewayProxyConfig::enabled`]). Kube
-    ///   uses `token_path`; omit it to attach no outbound credential.
+    ///   needs the `present` block (`token_path`); without it the gateway fails
+    ///   `init`, rather than polling the directory unauthenticated.
     ///
-    /// Each direction reads only the fields it needs, so one block (e.g.
-    /// `Kube { audiences, token_path }`) configures the whole platform plane
+    /// Each direction reads only its own part, so one block (e.g.
+    /// `Kube { verify, present }`) configures the whole platform plane
     /// (`cpt-cf-adr-two-plane-auth`). Default: `None` (Profile 1 monolith).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub internal_auth: Option<toolkit_security::InternalAuthConfig>,
@@ -668,6 +672,37 @@ pub struct InFlightLimitZone {
 }
 
 impl ApiGatewayConfig {
+    /// Validate that an enabled reverse proxy can present an outbound
+    /// platform-plane credential on its `DirectoryService` polls.
+    ///
+    /// An `internal_auth` that cannot supply an outbound credential (kube
+    /// without a `present` block, an empty token path, an unusable shared
+    /// secret) is known from config alone, so it fails `init` — like a missing
+    /// `directory_endpoint` — rather than surfacing after startup as a proxy
+    /// that serves 404 for every out-of-process route. The check is
+    /// [`InternalAuthConfig::outbound`](toolkit_security::InternalAuthConfig::outbound),
+    /// shared with the credential builder.
+    ///
+    /// # Errors
+    /// Returns a human-readable description when `gateway_proxy.enabled` is
+    /// `true` and `internal_auth` is set but refused by `outbound()`.
+    pub fn validate_proxy_credential(&self) -> Result<(), String> {
+        if !self.gateway_proxy.enabled {
+            return Ok(());
+        }
+        // Profile 1 (no `internal_auth`) polls without a credential.
+        let Some(internal_auth) = &self.internal_auth else {
+            return Ok(());
+        };
+        internal_auth.outbound().map(drop).map_err(|err| {
+            format!(
+                "invalid configuration: `gateway_proxy.enabled` is true but `internal_auth` \
+                 cannot authenticate the reverse proxy's DirectoryService polls ({err}); fix \
+                 `internal_auth` or disable the reverse proxy"
+            )
+        })
+    }
+
     /// Validate the throttling configuration at load time.
     ///
     /// Checks that:
@@ -719,7 +754,80 @@ fn validate_status(zone: &str, status: u16) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::GatewayProxyConfig;
+    use super::{ApiGatewayConfig, GatewayProxyConfig};
+    use toolkit_security::{InternalAuthConfig, KubePresent, KubeVerify};
+
+    fn kube(present: Option<&str>) -> InternalAuthConfig {
+        InternalAuthConfig::Kube {
+            verify: Some(KubeVerify {
+                audiences: vec!["toolkit-internal".to_owned()],
+            }),
+            present: present.map(|p| KubePresent {
+                token_path: p.into(),
+            }),
+        }
+    }
+
+    fn gateway(enabled: bool, internal_auth: Option<InternalAuthConfig>) -> ApiGatewayConfig {
+        ApiGatewayConfig {
+            gateway_proxy: GatewayProxyConfig {
+                enabled,
+                directory_endpoint: Some("http://directory:50051".to_owned()),
+                ..Default::default()
+            },
+            internal_auth,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn enabled_proxy_with_kube_but_no_present_block_is_rejected() {
+        let err = gateway(true, Some(kube(None)))
+            .validate_proxy_credential()
+            .expect_err("the proxy could never authenticate its directory polls");
+        assert!(err.contains("present"), "got: {err}");
+    }
+
+    /// The init check is `InternalAuthConfig::outbound`, so it refuses every
+    /// config the credential builder would, not only kube without `present`.
+    #[test]
+    fn enabled_proxy_with_unusable_shared_secret_is_rejected() {
+        let err = gateway(
+            true,
+            Some(InternalAuthConfig::SharedSecret {
+                secret: String::new().into(),
+                peer_name: "toolkit-internal".to_owned(),
+            }),
+        )
+        .validate_proxy_credential()
+        .expect_err("an empty secret can never authenticate the directory polls");
+        assert!(err.contains("shared_secret"), "got: {err}");
+    }
+
+    #[test]
+    fn proxy_credential_is_only_required_when_it_is_used() {
+        // Proxy disabled: kube without `present` is a valid inbound-only edge.
+        gateway(false, Some(kube(None)))
+            .validate_proxy_credential()
+            .expect("no outbound calls, no outbound credential needed");
+        // Proxy enabled with a `present` block, or with no internal_auth at all
+        // (Profile 1), or with a shared secret: nothing to refuse here.
+        gateway(true, Some(kube(Some("/var/run/secrets/tokens/t"))))
+            .validate_proxy_credential()
+            .expect("present block configured");
+        gateway(true, None)
+            .validate_proxy_credential()
+            .expect("no internal_auth configured");
+        gateway(
+            true,
+            Some(InternalAuthConfig::SharedSecret {
+                secret: "s".to_owned().into(),
+                peer_name: "toolkit-internal".to_owned(),
+            }),
+        )
+        .validate_proxy_credential()
+        .expect("a shared secret is symmetric");
+    }
 
     #[test]
     fn disabled_proxy_needs_no_endpoint() {

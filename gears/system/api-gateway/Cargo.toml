@@ -26,6 +26,8 @@ toolkit-gateway = { workspace = true }
 toolkit-security = { workspace = true, features = ["internal-auth-cache"] }
 toolkit-k8s-auth = { workspace = true, optional = true }
 toolkit-transport-grpc = { workspace = true }
+# Outbound platform-plane credential for DirectoryService polls.
+toolkit-contract = { workspace = true, features = ["platform-credential"] }
 toolkit-canonical-errors = { workspace = true, features = ["axum"] }
 cf-gears-system-sdks = { workspace = true, features = ["directory_grpc"] }
 authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.44", path = "../authn-resolver/authn-resolver-sdk" }
