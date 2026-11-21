@@ -179,7 +179,7 @@ Multi-SQL backend portability: PostgreSQL, MySQL, SQLite. The OAGW build compile
 
 **ID**: `cpt-cf-oagw-constraint-body-limit`
 
-Body size hard limit: 100MB. Prevent resource exhaustion; reject before buffering.
+Body size hard limit: 100 MiB (`max_body_size_bytes` cannot be set higher). Prevent resource exhaustion; reject before buffering. The effective limit is the smaller of OAGW's `max_body_size_bytes` and the api-gateway's `body_limit_bytes` (16 MiB by default), see [Body Validation Rules](#body-validation-rules).
 
 **ID**: `cpt-cf-oagw-constraint-https-only`
 
@@ -584,6 +584,10 @@ Default validation checks (no configuration required):
 
 These checks run after the `proxy:invoke` permission check, so a caller without it gets `403` before any body is read.
 
+**Effective body limit.** The api-gateway in front of OAGW enforces its own `body_limit_bytes` (default 16 MiB) before OAGW sees the request. The effective limit is the smaller of the two:
+- A body over the api-gateway limit is rejected by the outer layer: `413` with an `about:blank` `application/problem+json` body and no `X-OAGW-Error-Source` header.
+- OAGW's own `413` (canonical `out_of_range` with the 413 override, field violation reason `PAYLOAD_TOO_LARGE`, `X-OAGW-Error-Source: gateway`) is returned only when `max_body_size_bytes` is the smaller limit. With both defaults (100 MiB and 16 MiB) the outer `413` comes first.
+
 Additional validation (JSON Schema, content-type checks, custom rules) implemented via guard plugins.
 
 #### Transformation Rules
@@ -616,7 +620,7 @@ Auth configuration references secrets via `secret_ref` (e.g., `cred://partner-op
 1. OAGW resolves `secret_ref` via `cred_store` API
 2. `cred_store` checks if secret is accessible to current tenant (own or shared by ancestor)
 3. If accessible → return secret material
-4. If not → return error, OAGW returns 401 Unauthorized (500 `SecretNotFound` when the secret does not exist); the error and the logs name the auth config key, never the `secret_ref`
+4. If not → OAGW returns 401 `unauthenticated` with reason `AUTH_CREDENTIAL_NOT_FOUND`, whether the secret does not exist or is not accessible to the tenant; the error and the logs name the auth config key, never the `secret_ref`. See [Credential failures](#credential-failures) for the other cases.
 
 Ancestor can share a secret with descendants via `cred_store` policies. Descendant can also use own secret with different `secret_ref`.
 
@@ -802,28 +806,73 @@ Request classification uses `upstream.protocol` to determine match strategy:
 
 All gateway errors follow RFC 9457 Problem Details (`application/problem+json`) with GTS `type` identifiers.
 
-| Error Type | HTTP | GTS Instance ID | Retriable | Description |
-|---|---|---|---|---|
-| RouteError | 400 | `gts.cf.core.errors.err.v1~cf.oagw.validation.error.v1` | No | General route validation error |
-| ValidationError | 400 | `gts.cf.core.errors.err.v1~cf.oagw.validation.error.v1` | No | Request validation failed |
-| MissingTargetHost | 400 | `gts.cf.core.errors.err.v1~cf.oagw.routing.missing_target_host.v1` | No | X-OAGW-Target-Host header required for multi-endpoint upstream with common suffix alias |
-| InvalidTargetHost | 400 | `gts.cf.core.errors.err.v1~cf.oagw.routing.invalid_target_host.v1` | No | X-OAGW-Target-Host header format is invalid (must be hostname or IP, no port/path/special chars) |
-| UnknownTargetHost | 400 | `gts.cf.core.errors.err.v1~cf.oagw.routing.unknown_target_host.v1` | No | X-OAGW-Target-Host value does not match any configured endpoint |
-| AuthenticationFailed | 401 | `gts.cf.core.errors.err.v1~cf.oagw.auth.failed.v1` | No | Authentication to upstream failed |
-| RouteNotFound | 404 | `gts.cf.core.errors.err.v1~cf.oagw.route.not_found.v1` | No | No matching route found |
-| PluginInUse | 409 | `gts.cf.core.errors.err.v1~cf.oagw.plugin.in_use.v1` | No | Plugin in use |
-| PayloadTooLarge | 413 | `gts.cf.core.errors.err.v1~cf.oagw.payload.too_large.v1` | No | Request payload exceeds limit |
-| RateLimitExceeded | 429 | `gts.cf.core.errors.err.v1~cf.oagw.rate_limit.exceeded.v1` | Yes | Rate limit exceeded |
-| SecretNotFound | 500 | `gts.cf.core.errors.err.v1~cf.oagw.secret.not_found.v1` | No | Referenced secret not found |
-| ProtocolError | 502 | `gts.cf.core.errors.err.v1~cf.oagw.protocol.error.v1` | No | Protocol-level error |
-| DownstreamError | 502 | `gts.cf.core.errors.err.v1~cf.oagw.downstream.error.v1` | Depends | Upstream service error |
-| StreamAborted | 502 | `gts.cf.core.errors.err.v1~cf.oagw.stream.aborted.v1` | No | Stream connection aborted |
-| LinkUnavailable | 503 | `gts.cf.core.errors.err.v1~cf.oagw.link.unavailable.v1` | Yes | Upstream link unavailable |
-| CircuitBreakerOpen | 503 | `gts.cf.core.errors.err.v1~cf.oagw.circuit_breaker.open.v1` | Yes | The upstream's circuit breaker is open (or half-open with every probe slot taken); `Retry-After` is the time left until a probe |
-| PluginNotFound | 503 | `gts.cf.core.errors.err.v1~cf.oagw.plugin.not_found.v1` | No | Plugin not found |
-| ConnectionTimeout | 504 | `gts.cf.core.errors.err.v1~cf.oagw.timeout.connection.v1` | Yes | Connection timeout |
-| RequestTimeout | 504 | `gts.cf.core.errors.err.v1~cf.oagw.timeout.request.v1` | Yes | Request timeout |
-| IdleTimeout | 504 | `gts.cf.core.errors.err.v1~cf.oagw.timeout.idle.v1` | Yes | Idle timeout |
+| Error Type | HTTP | GTS Instance ID | Retriable | `context.reason` | Description |
+|---|---|---|---|---|---|
+| RouteError | 400 | `gts.cf.core.errors.err.v1~cf.oagw.validation.error.v1` | No | | General route validation error |
+| ValidationError | 400 | `gts.cf.core.errors.err.v1~cf.oagw.validation.error.v1` | No | | Request validation failed |
+| MissingTargetHost | 400 | `gts.cf.core.errors.err.v1~cf.oagw.routing.missing_target_host.v1` | No | | X-OAGW-Target-Host header required for multi-endpoint upstream with common suffix alias |
+| InvalidTargetHost | 400 | `gts.cf.core.errors.err.v1~cf.oagw.routing.invalid_target_host.v1` | No | | X-OAGW-Target-Host header format is invalid (must be hostname or IP, no port/path/special chars) |
+| UnknownTargetHost | 400 | `gts.cf.core.errors.err.v1~cf.oagw.routing.unknown_target_host.v1` | No | | X-OAGW-Target-Host value does not match any configured endpoint |
+| AuthenticationFailed | 401 | `gts.cf.core.errors.err.v1~cf.oagw.auth.failed.v1` | No | `AUTH_PLUGIN_FAILED`, `AUTH_PLUGIN_INTERNAL`, `AUTH_PLUGIN_NOT_FOUND` | Authentication to upstream failed |
+| SecretNotFound | 401 | `gts.cf.core.errors.err.v1~cf.oagw.secret.not_found.v1` | No | `AUTH_CREDENTIAL_NOT_FOUND` | A secret the auth config references is missing or not accessible to the tenant |
+| RouteNotFound | 404 | `gts.cf.core.errors.err.v1~cf.oagw.route.not_found.v1` | No | | No matching route found |
+| PluginInUse | 409 | `gts.cf.core.errors.err.v1~cf.oagw.plugin.in_use.v1` | No | | Plugin in use |
+| PayloadTooLarge | 413 | `gts.cf.core.errors.err.v1~cf.oagw.payload.too_large.v1` | No | | Request payload exceeds limit |
+| RateLimitExceeded | 429 | `gts.cf.core.errors.err.v1~cf.oagw.rate_limit.exceeded.v1` | Yes | | Rate limit exceeded |
+| Internal | 500 | `gts.cf.core.errors.err.v1~cf.core.err.internal.v1` | No | | Gateway fault, including an auth plugin misconfiguration |
+| ProtocolError | 502 | `gts.cf.core.errors.err.v1~cf.oagw.protocol.error.v1` | Depends | dispatch reason | Protocol-level error |
+| DownstreamError | 502 | `gts.cf.core.errors.err.v1~cf.oagw.downstream.error.v1` | Depends | dispatch reason | Upstream connection refused or closed, TLS failure, invalid response |
+| StreamAborted | 502 | `gts.cf.core.errors.err.v1~cf.oagw.stream.aborted.v1` | Depends | dispatch reason | Stream connection aborted |
+| IdpInvalidResponse | 502 | `gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1` | Yes | `REQUEST_NOT_SENT` | The identity provider an auth plugin calls sent an invalid response |
+| LinkUnavailable | 503 | `gts.cf.core.errors.err.v1~cf.oagw.link.unavailable.v1` | Depends | dispatch reason | Upstream link unavailable (DNS failure, SSRF refusal, no route, connect error) |
+| UpstreamDisabled | 503 | `gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1` | After operator action | `UPSTREAM_DISABLED` | The upstream is disabled; `Retry-After: 300` |
+| CredentialStoreUnavailable | 503 | `gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1` | Yes | `CREDENTIAL_STORE_UNAVAILABLE` | The credential store is unavailable; `Retry-After` is the store's hint (default 5 s) |
+| IdpUnavailable | 503 | `gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1` | Yes | `IDENTITY_PROVIDER_UNAVAILABLE` | The OAuth2 identity provider's token endpoint an auth plugin calls is unreachable, times out or answers 408, 429 or 5xx; `Retry-After: 5` |
+| CircuitBreakerOpen | 503 | `gts.cf.core.errors.err.v1~cf.oagw.circuit_breaker.open.v1` | Yes | `REQUEST_NOT_SENT` | The upstream's circuit breaker is open (or half-open with every probe slot taken); `Retry-After` is the time left until a probe |
+| PluginNotFound | 503 | `gts.cf.core.errors.err.v1~cf.oagw.plugin.not_found.v1` | No | | Plugin not found |
+| ConnectionTimeout | 504 | `gts.cf.core.errors.err.v1~cf.oagw.timeout.connection.v1` | Depends | dispatch reason | Connection timeout |
+| RequestTimeout | 504 | `gts.cf.core.errors.err.v1~cf.oagw.timeout.request.v1` | Depends | dispatch reason | Request timeout |
+| IdleTimeout | 504 | `gts.cf.core.errors.err.v1~cf.oagw.timeout.idle.v1` | Depends | `REQUEST_MAY_HAVE_BEEN_SENT` | Idle timeout |
+
+On the wire the 502, 503 and 504 rows are the canonical `service_unavailable` (502 through the transport status override) and `deadline_exceeded` categories; `context.reason` carries the reason. The SDK exports the values in `oagw_sdk::reason::{auth, unavailable, timeout}`.
+
+#### Dispatch Reasons
+
+Every gateway 502, 503 or 504 from the upstream exchange carries a dispatch reason. It is set from the engine error kind (or the gateway step that failed), not from the error type, and tells the client whether a retry of a non-idempotent request is safe.
+
+`REQUEST_NOT_SENT` means no byte of the HTTP request left the gateway; TCP or TLS setup may have reached the upstream. The reason covers the whole exchange: when the engine resends a request after a first attempt the upstream may have processed (a stale keep-alive connection, a graceful HTTP/2 `GOAWAY`) and the resend fails, even to connect, the reason is `REQUEST_MAY_HAVE_BEEN_SENT`.
+
+| Reason | Cases | Status | Retry |
+|---|---|---|---|
+| `REQUEST_NOT_SENT` | Connection refused; TLS handshake failure or timeout; invalid certificate | 502 | Any method |
+| | DNS failure, SSRF refusal of every resolved address, no route, other connect error | 503, `Retry-After: 10` | |
+| | Circuit breaker open | 503, `Retry-After` until the probe | |
+| | Connect timeout; endpoint selection, resolution or signing timed out | 504 | |
+| | Upstream without endpoints; outbound request that cannot be built | 502 | |
+| `REQUEST_MAY_HAVE_BEEN_SENT` | Connection closed by the upstream, read or write error, HTTP/2 error, invalid response (`Protocol`), WebSocket upgrade rejected, streamed request body failed mid-stream, any engine error kind added later | 502 | Idempotent requests only |
+| | Read or write timeout; request timeout; WebSocket upgrade timeout | 504 | |
+
+The 502 cases send `retry_after_seconds: 5`. Statuses did not change with the reasons.
+
+#### Credential Failures
+
+All auth plugins (`authenticate` and `sign`) use one mapping. Errors and logs name the auth config key, never the reference or the secret. A missing secret, a credential store outage, an identity provider outage and an invalid identity provider response are each logged once, at WARN, with the upstream id and alias, the plugin type and the caller's tenant; a missing secret also logs the credential store's error kind (not found, access denied, invalid reference). None of these failures counts toward the upstream's circuit breaker.
+
+The two backends an auth plugin depends on have their own reasons: `CREDENTIAL_STORE_UNAVAILABLE` for the platform credential store, `IDENTITY_PROVIDER_UNAVAILABLE` for the OAuth2 identity provider's token endpoint the tenant configured. The first is a platform fault, the second a fault of a third party.
+
+| Failure | Status | `context.reason` |
+|---|---|---|
+| Secret missing or not accessible to the tenant | 401 `unauthenticated` | `AUTH_CREDENTIAL_NOT_FOUND` |
+| Credential store unavailable | 503 `service_unavailable`, the store's retry hint (default 5 s) | `CREDENTIAL_STORE_UNAVAILABLE` |
+| Identity provider unreachable, timing out or answering 408, 429 or 5xx (discovery or token request), or the connection dropped while reading its answer | 503 `service_unavailable`, `retry_after_seconds: 5` | `IDENTITY_PROVIDER_UNAVAILABLE` |
+| Identity provider rejects the client: 400, 401 or 403 to the token request | 401 `unauthenticated` | `AUTH_PLUGIN_FAILED` |
+| Identity provider answers with an invalid response: any other status (discovery 400, 401 and 403 included), unparseable body, unsupported token type, invalid or zero lifetime, an access token that is empty or not a valid header value | 502 `service_unavailable` | `REQUEST_NOT_SENT` |
+| Plugin misconfiguration (bad config, an endpoint URL or scheme the HTTP client cannot use, header the gateway cannot set, signing output the gateway cannot send) | 500 `internal` | |
+| Other plugin failure (secret value not UTF-8 or not a header value, in `config` and `request_ref` mode alike; unexpected credential store error) | 401 `unauthenticated` | `AUTH_PLUGIN_INTERNAL` |
+
+An invalid identity provider response is logged and reported by a fixed class (for example "unsupported token type"), never with text from its body. An unusable token is never sent or cached.
+
+In `request_ref` mode ([ADR-0022](./ADR/0022-request-secret-refs.md)) a credential store outage also carries `CREDENTIAL_STORE_UNAVAILABLE`; a requested secret that is missing or not visible stays 403 `SECRET_REF_NOT_ACCESSIBLE`.
 
 **Standard Fields** (RFC 9457):
 - `type`: GTS identifier for the error type (used for programmatic error handling)
@@ -842,7 +891,7 @@ All gateway errors follow RFC 9457 Problem Details (`application/problem+json`) 
 OAGW distinguishes between **gateway errors** (originated by OAGW) and **upstream errors** (passthrough from upstream service) using the `X-OAGW-Error-Source` header. See [ADR: Error Source Distinction](./ADR/0013-error-source-distinction.md).
 
 - **Gateway error**: `X-OAGW-Error-Source: gateway` — response body is `application/problem+json`
-- **Upstream error**: `X-OAGW-Error-Source: upstream` — response body is passthrough from upstream as-is
+- **Upstream error**: `X-OAGW-Error-Source: upstream` — status, body and headers are passed through from upstream as-is, including the upstream's own `Retry-After` and `WWW-Authenticate`. An upstream 429 or 503 differs from a gateway one only by this header.
 
 Header may be stripped by intermediaries. For critical error handling, clients should combine header check with error response structure inspection.
 

@@ -27,3 +27,5 @@ Content-Type: application/json
 - Body forwarded unchanged.
 - `X-OAGW-Error-Source: upstream`.
 - Content-Type preserved from upstream (not rewritten to Problem Details).
+- Headers forwarded unchanged, including the upstream's own `Retry-After` (for example `503` with `Retry-After: 120`) and `WWW-Authenticate` (for example `401` with `WWW-Authenticate: Bearer realm="upstream", error="invalid_token"`). The gateway does not add or rewrite them.
+- An upstream `429` or `503` differs from a gateway one only by `X-OAGW-Error-Source: upstream` and the body.

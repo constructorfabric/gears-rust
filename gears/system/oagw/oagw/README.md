@@ -81,6 +81,8 @@ OAGW checks these values at startup and does not start if one is out of range:
 | `max_body_size_bytes` | 1 to 104857600 (100 MiB, the DESIGN hard limit) | 104857600 |
 | `token_cache_capacity` | at least 1 | 10000 |
 
+The api-gateway in front of OAGW has its own request body limit, `body_limit_bytes` (16 MiB by default), so the effective limit is the smaller of the two. A body over the api-gateway limit gets a `413` with an `about:blank` problem body and no `X-OAGW-Error-Source` header; OAGW's own `413` (`PAYLOAD_TOO_LARGE`, `X-OAGW-Error-Source: gateway`) comes only when `max_body_size_bytes` is the smaller limit.
+
 ## Persistence
 
 Upstreams and routes are kept in memory unless the gear has a database. To persist them across restarts, add a `database` section to `gears.oagw`:

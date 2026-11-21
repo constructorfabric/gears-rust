@@ -25,13 +25,13 @@ Content-Type: application/problem+json
 X-OAGW-Error-Source: gateway
 ```
 
-- `type` contains `service_unavailable`. No `context.reason`.
+- `type` contains `service_unavailable`; `context.reason` = `CREDENTIAL_STORE_UNAVAILABLE`.
 - The provider receives no request.
 
 ## What to check
 
 - A second request gets 429 before any CredStore read: the first debit stays (SREF-ERR-004). With CredStore up, an exhausted limit gets 429 with no CredStore read (SREF-ERR-003).
-- The SDK gets `Unavailable` (SREF-SDK-005).
+- The SDK gets `Unavailable` with `UnavailableReason::CredentialStoreUnavailable` (SREF-SDK-005).
 - When CredStore's outage carries a retry hint, `context.retry_after_seconds` is that hint rounded up; otherwise it is the gateway default (SREF-ERR-004).
 - A CredStore error only a write can cause (conflict, type violation, unsupported transition) returns 500 with no retry hint (SREF-ERR-004).
 - The gateway log line names the caller tenant, upstream, route and request IDs, and not the reference (SREF-OBS-004).

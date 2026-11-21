@@ -7,6 +7,31 @@ use std::io;
 
 use crate::body::BoxError;
 
+/// Declares `ErrorKind` and `ErrorKind::ALL` from one variant list, so `ALL`
+/// cannot miss a kind.
+macro_rules! error_kind {
+    (
+        $(#[$meta:meta])*
+        $vis:vis enum $name:ident {
+            $( $(#[$variant_meta:meta])* $variant:ident, )+
+        }
+    ) => {
+        $(#[$meta])*
+        $vis enum $name {
+            $( $(#[$variant_meta])* $variant, )+
+        }
+
+        impl $name {
+            /// Every kind, in declaration order. The enum is
+            /// `#[non_exhaustive]`, so callers in other crates cannot match it
+            /// exhaustively; they check their own tables against this list
+            /// instead.
+            pub const ALL: &'static [Self] = &[ $( Self::$variant, )+ ];
+        }
+    };
+}
+
+error_kind! {
 /// What went wrong, independent of the underlying library.
 ///
 /// Callers map this onto their own error model; the variants follow the
@@ -48,6 +73,7 @@ pub enum ErrorKind {
     /// The engine could not be constructed (e.g. TLS configuration).
     Configuration,
 }
+}
 
 impl ErrorKind {
     /// Short, stable, lowercase name for logs and metrics labels.
@@ -88,6 +114,7 @@ pub struct ProxyError {
     message: Cow<'static, str>,
     #[source]
     source: Option<BoxError>,
+    earlier_attempt_may_have_been_processed: bool,
 }
 
 impl ProxyError {
@@ -97,7 +124,27 @@ impl ProxyError {
             kind,
             message: message.into(),
             source: None,
+            earlier_attempt_may_have_been_processed: false,
         }
+    }
+
+    /// Mark, when `yes`, an error from a resend whose first attempt may
+    /// have been processed (set by the client; public for custom clients
+    /// and tests).
+    #[must_use]
+    pub fn after_attempt_that_may_have_been_processed(mut self, yes: bool) -> Self {
+        self.earlier_attempt_may_have_been_processed |= yes;
+        self
+    }
+
+    /// The client resent this request after a first attempt the upstream
+    /// may have processed (a stale keep-alive connection or a graceful
+    /// HTTP/2 `GOAWAY`), and the resend failed. The request may have
+    /// reached the upstream whatever [`kind`](Self::kind) says, even a
+    /// connect failure.
+    #[must_use]
+    pub fn earlier_attempt_may_have_been_processed(&self) -> bool {
+        self.earlier_attempt_may_have_been_processed
     }
 
     /// Attach the underlying cause (reported by `Error::source`).
@@ -275,6 +322,15 @@ mod tests {
             ProxyError::from_tls_io(reset).kind(),
             ErrorKind::ConnectionClosed
         );
+    }
+
+    /// `ALL` comes from the enum's own variant list; this only guards the
+    /// macro's expansion.
+    #[test]
+    fn all_is_non_empty_and_unique() {
+        assert!(!ErrorKind::ALL.is_empty());
+        let unique: std::collections::HashSet<_> = ErrorKind::ALL.iter().collect();
+        assert_eq!(unique.len(), ErrorKind::ALL.len());
     }
 
     #[test]

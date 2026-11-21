@@ -169,7 +169,7 @@ Enables partner/customer hierarchies where partners share upstream access with c
 4. [x] - `p2` - **IF** no upstream found in hierarchy - `inst-resolve-4`
    1. [x] - `p2` - **RETURN** 404 RouteNotFound - `inst-resolve-4a`
 5. [x] - `p2` - **IF** resolved upstream is disabled and no enabled ancestor exists - `inst-resolve-5`
-   1. [x] - `p2` - **RETURN** 503 LinkUnavailable - `inst-resolve-5a`
+   1. [x] - `p2` - **RETURN** 503 UpstreamDisabled (reason `UPSTREAM_DISABLED`, `Retry-After: 300`) - `inst-resolve-5a`
 6. [x] - `p2` - Compute effective configuration via `cpt-cf-oagw-algo-tenant-config-merge` - `inst-resolve-6`
 7. [x] - `p2` - **RETURN** effective upstream configuration for proxy execution - `inst-resolve-7`
 

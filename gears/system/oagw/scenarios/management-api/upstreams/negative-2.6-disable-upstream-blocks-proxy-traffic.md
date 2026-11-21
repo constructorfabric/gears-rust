@@ -40,10 +40,28 @@ Content-Type: application/json
 
 ## Expected response
 
-- Gateway-generated rejection.
-- `503 Service Unavailable` (or implementation-defined status)
-- `Content-Type: application/problem+json`
-- `X-OAGW-Error-Source: gateway`
+```http
+HTTP/1.1 503 Service Unavailable
+Content-Type: application/problem+json
+Retry-After: 300
+X-OAGW-Error-Source: gateway
+```
+
+```json
+{
+  "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~",
+  "title": "Service Unavailable",
+  "status": 503,
+  "detail": "Service temporarily unavailable",
+  "instance": "/oagw/v1/proxy/httpbin.org/post",
+  "context": { "retry_after_seconds": 300, "reason": "UPSTREAM_DISABLED" },
+  "trace_id": "<trace id>"
+}
+```
+
+- The upstream receives nothing.
+- `context.reason` = `UPSTREAM_DISABLED` tells this 503 apart from a transport failure (`REQUEST_NOT_SENT`). The retry hint is long (300 s) because only an operator can enable the upstream again.
+- The SDK gets `Unavailable { retry_after_secs: Some(300), reason: Some(UnavailableReason::UpstreamDisabled) }`.
 
 ## Descendant tenant variant
 

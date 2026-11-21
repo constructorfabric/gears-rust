@@ -124,17 +124,34 @@ fn gateway_rate_limit_forwards_retry_hint() {
 
 #[test]
 fn gateway_timeout_maps_to_timeout() {
-    let mapped: LlmProviderError = ServiceGatewayError::Timeout.into();
-    assert!(matches!(mapped, LlmProviderError::Timeout));
+    for reason in [
+        None,
+        Some(oagw_sdk::reason::timeout::TimeoutReason::RequestNotSent),
+        Some(oagw_sdk::reason::timeout::TimeoutReason::RequestMayHaveBeenSent),
+    ] {
+        let mapped: LlmProviderError = ServiceGatewayError::Timeout { reason }.into();
+        assert!(matches!(mapped, LlmProviderError::Timeout));
+    }
 }
 
 #[test]
 fn gateway_unavailable_maps_to_provider_unavailable() {
-    let err = ServiceGatewayError::Unavailable {
-        retry_after_secs: Some(5),
-    };
-    let mapped: LlmProviderError = err.into();
-    assert!(matches!(mapped, LlmProviderError::ProviderUnavailable));
+    use oagw_sdk::reason::unavailable::UnavailableReason;
+    for reason in [
+        None,
+        Some(UnavailableReason::RequestNotSent),
+        Some(UnavailableReason::RequestMayHaveBeenSent),
+        Some(UnavailableReason::UpstreamDisabled),
+        Some(UnavailableReason::CredentialStoreUnavailable),
+        Some(UnavailableReason::IdentityProviderUnavailable),
+    ] {
+        let err = ServiceGatewayError::Unavailable {
+            retry_after_secs: Some(5),
+            reason,
+        };
+        let mapped: LlmProviderError = err.into();
+        assert!(matches!(mapped, LlmProviderError::ProviderUnavailable));
+    }
 }
 
 #[test]

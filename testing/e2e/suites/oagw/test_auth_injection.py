@@ -7,10 +7,13 @@ import pytest
 from .helpers import (
     APIKEY_AUTH_PLUGIN_ID,
     REQUEST_ID_TRANSFORM_PLUGIN_ID,
+    assert_gateway_problem_body,
     assert_problem,
     create_route,
     create_upstream,
     create_upstream_raw,
+    credential_not_found,
+    traced,
     unique_alias,
 )
 
@@ -201,12 +204,11 @@ async def test_apikey_secret_deleted_does_not_reveal_the_ref(
     oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
 ):
     """Scenario 9.7-B at proxy time: the secret existed at write time, then
-    was deleted. The gateway error does not contain the reference (#4989).
-
-    The status is today's 500 `internal`; PLG-10
-    (`test_oauth2_client_cred_secret_deleted_returns_401`) tracks the move
-    to 401. That the server log names the key and not the reference is
-    covered by Rust tests: E2E does not see the server log.
+    was deleted. The credential is missing: 401 with reason
+    `AUTH_CREDENTIAL_NOT_FOUND` (it was 500), and the body contains neither
+    the reference (#4989) nor the config key. That the server log names the
+    key and not the reference is covered by Rust tests: E2E does not see the
+    server log.
     """
     _ = mock_upstream
     alias = unique_alias("auth-gone")
@@ -240,9 +242,9 @@ async def test_apikey_secret_deleted_does_not_reveal_the_ref(
 
         resp = await client.post(
             f"{oagw_base_url}/oagw/v1/proxy/{alias}/echo",
-            headers={**oagw_headers, "content-type": "application/json"},
+            headers={**traced(oagw_headers), "content-type": "application/json"},
             json={"test": True},
         )
-        body = assert_problem(resp, 500, category="internal")
-        assert body["detail"] == "An internal error occurred. Please retry later.", body
+        assert_gateway_problem_body(resp, credential_not_found(f"/oagw/v1/proxy/{alias}/echo"))
         assert ref not in resp.text, resp.text[:500]
+        assert "secret_ref" not in resp.text, resp.text[:500]

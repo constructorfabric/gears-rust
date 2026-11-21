@@ -416,6 +416,8 @@ pub fn outcome_of_error(err: &DomainError) -> Outcome {
         | DomainError::SecretNotFound { .. }
         | DomainError::SecretRefNotAccessible { .. }
         | DomainError::CredentialStoreUnavailable { .. }
+        | DomainError::IdpUnavailable { .. }
+        | DomainError::IdpInvalidResponse { .. }
         | DomainError::GuardRejected { .. }
         | DomainError::CorsOriginNotAllowed { .. }
         | DomainError::CorsMethodNotAllowed { .. }

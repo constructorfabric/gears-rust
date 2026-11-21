@@ -3,7 +3,7 @@ error[E0599]: no method named `with_reason` found for struct `ResourceErrorBuild
    |
 11 |       let _err = UserResourceError::unimplemented("Not implemented")
    |  ________________-
-12 | |         .with_reason("UPSTREAM_NOT_CONTACTED")
+12 | |         .with_reason("REQUEST_NOT_SENT")
    | |         -^^^^^^^^^^^ method not found in `ResourceErrorBuilder<toolkit_canonical_errors::builder::ResourceOptional, toolkit_canonical_errors::builder::NoContext>`
    | |_________|
    |

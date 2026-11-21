@@ -647,7 +647,7 @@ impl<Resource> ResourceErrorBuilder<Resource, NeedsReason> {
 }
 
 impl<Resource> ResourceErrorBuilder<Resource, OptionalReason> {
-    /// Attach a machine-readable reason code (e.g. `UPSTREAM_NOT_CONTACTED`),
+    /// Attach a machine-readable reason code (e.g. `REQUEST_NOT_SENT`),
     /// sent as `context.reason`. Optional: without it, or with an empty
     /// string, the context has no `reason` field. The code is sent in the
     /// public response body: pass a fixed code, never caller input or secret

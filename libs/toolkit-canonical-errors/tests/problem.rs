@@ -448,13 +448,13 @@ fn service_unavailable_wire_with_reason() {
     let problem = Problem::from(
         CanonicalError::service_unavailable()
             .with_retry_after_seconds(30)
-            .with_reason("UPSTREAM_NOT_CONTACTED")
+            .with_reason("REQUEST_NOT_SENT")
             .create(),
     );
     let json = serde_json::to_value(&problem).unwrap();
     assert_eq!(
         json["context"],
-        serde_json::json!({ "retry_after_seconds": 30, "reason": "UPSTREAM_NOT_CONTACTED" })
+        serde_json::json!({ "retry_after_seconds": 30, "reason": "REQUEST_NOT_SENT" })
     );
 }
 
@@ -560,19 +560,19 @@ fn deadline_exceeded_empty_reason_is_omitted() {
 #[test]
 fn deadline_exceeded_reason_and_resource_in_either_order() {
     let reason_first = R::deadline_exceeded("Operation timed out")
-        .with_reason("UPSTREAM_NOT_CONTACTED")
+        .with_reason("REQUEST_NOT_SENT")
         .with_resource("session-abc")
         .create();
     let resource_first = R::deadline_exceeded("Operation timed out")
         .with_resource("session-abc")
-        .with_reason("UPSTREAM_NOT_CONTACTED")
+        .with_reason("REQUEST_NOT_SENT")
         .create();
     for err in [reason_first, resource_first] {
         let json = serde_json::to_value(Problem::from(err)).unwrap();
         assert_eq!(
             json["context"],
             serde_json::json!({
-                "reason": "UPSTREAM_NOT_CONTACTED",
+                "reason": "REQUEST_NOT_SENT",
                 "resource_type": USER_RESOURCE,
                 "resource_name": "session-abc",
             })

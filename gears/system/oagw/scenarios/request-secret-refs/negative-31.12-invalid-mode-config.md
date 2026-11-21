@@ -31,3 +31,4 @@ Content-Type: application/problem+json
 - In both modes, a missing or invalid `header`, or one the gateway sets or strips itself (`Host`, `Content-Length`, hop-by-hop, forwarding headers such as `X-Forwarded-For`, `X-OAGW-*`), is refused with a field violation on `auth.config.header` (SREF-CFG-007).
 - In both modes, a `prefix` that is not a valid header value or is longer than 64 bytes is refused with a field violation on `auth.config.prefix` (SREF-CFG-008).
 - In `request_ref` mode, a secret value that is not UTF-8 or not a valid header value returns 401 `AUTH_PLUGIN_INTERNAL` with no forward. The ADR's error table does not list this case; it keeps the API-key plugin's mapping.
+- A `request_ref` config stored before a write check refused it (no usable `header`) is a plugin misconfiguration at proxy time: 500 `internal`, no forward, as for the API-key plugin.

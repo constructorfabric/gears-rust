@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use credstore_sdk::CredStoreClientV1;
 
 use crate::domain::plugin::credentials::{
-    ApiKeyAuthConfig, CREDENTIAL_MODE_FIELD, CredentialMode, SECRET_REF_KEY, credstore_error_kind,
+    ApiKeyAuthConfig, CREDENTIAL_MODE_FIELD, CredentialMode, PREFIX_KEY, SECRET_REF_KEY,
+    credstore_read_error, secret_missing,
 };
 use crate::domain::plugin::{AuthContext, AuthPlugin, PluginError};
 
@@ -28,44 +29,50 @@ impl AuthPlugin for ApiKeyAuthPlugin {
         // `request_ref` mode is the proxy's (ADR-0022): it reads the secret
         // under the guards. Any mode but `config` (an unknown one included)
         // is refused here, before anything is read, so the plugin never
-        // injects a default without the guards. Errors name the config key:
-        // the reference and the store's own text stay out of errors and logs
+        // injects a default without the guards. A config the plugin cannot
+        // run is a misconfiguration. Errors name the config key: the
+        // reference and the store's own text stay out of errors and logs
         // (F0008).
         const ONLY_CONFIG: &str = "apikey auth plugin runs only in credential_mode 'config'";
         let config = match ApiKeyAuthConfig::parse(Some(&ctx.config)) {
             Ok(config) if config.mode == CredentialMode::Config => config,
-            Ok(_) => return Err(PluginError::Internal(ONLY_CONFIG.into())),
+            Ok(_) => return Err(PluginError::InvalidConfig(ONLY_CONFIG.into())),
             Err(e) if e.field == CREDENTIAL_MODE_FIELD => {
-                return Err(PluginError::Internal(ONLY_CONFIG.into()));
+                return Err(PluginError::InvalidConfig(ONLY_CONFIG.into()));
             }
             Err(e) => {
-                return Err(PluginError::Internal(format!(
+                return Err(PluginError::InvalidConfig(format!(
                     "invalid apikey auth config: {}",
                     e.detail
                 )));
             }
         };
         let key = config.secret_ref.ok_or_else(|| {
-            PluginError::Internal(format!("invalid apikey auth config: no {SECRET_REF_KEY}"))
+            PluginError::InvalidConfig(format!("invalid apikey auth config: no {SECRET_REF_KEY}"))
         })?;
 
         let response = self
             .credstore
             .get(&ctx.security_context, &key)
             .await
-            .map_err(|e| {
-                PluginError::Internal(format!(
-                    "credential store error for auth.config.{SECRET_REF_KEY}: {}",
-                    credstore_error_kind(&e)
-                ))
-            })?
-            .ok_or(PluginError::SecretNotFound(SECRET_REF_KEY))?;
+            .map_err(|e| credstore_read_error(SECRET_REF_KEY, &e))?
+            .ok_or_else(|| secret_missing(SECRET_REF_KEY))?;
 
+        // A stored value the header cannot carry is the secret's fault, not
+        // the config's: 401 `AUTH_PLUGIN_INTERNAL`, as in `request_ref` mode.
         let secret_str = std::str::from_utf8(response.value.as_bytes())
-            .map_err(|_| PluginError::Internal("secret value is not valid UTF-8".into()))?
-            .to_string();
-
+            .map_err(|_| PluginError::Internal("secret value is not valid UTF-8".into()))?;
+        if http::HeaderValue::from_str(&config.prefix).is_err() {
+            return Err(PluginError::InvalidConfig(format!(
+                "invalid apikey auth config: {PREFIX_KEY} is not a valid header value"
+            )));
+        }
         let value = format!("{}{}", config.prefix, secret_str);
+        if http::HeaderValue::from_str(&value).is_err() {
+            return Err(PluginError::Internal(
+                "secret value is not a valid header value".into(),
+            ));
+        }
         ctx.set_headers.push((config.header, value));
 
         Ok(())
@@ -127,7 +134,7 @@ mod tests {
 
             let err = plugin.authenticate(&mut ctx).await.unwrap_err();
             assert!(
-                matches!(&err, PluginError::Internal(msg) if msg.contains("credential_mode 'config'")),
+                matches!(&err, PluginError::InvalidConfig(msg) if msg.contains("credential_mode 'config'")),
                 "{mode}: {err:?}"
             );
             assert!(ctx.set_headers.is_empty(), "{mode}: no header is set");
@@ -225,47 +232,111 @@ mod tests {
         let mut ctx = make_auth_ctx(make_config("authorization", "Bearer ", "cred://missing"));
 
         let err = plugin.authenticate(&mut ctx).await.unwrap_err();
-        assert!(matches!(err, PluginError::SecretNotFound(SECRET_REF_KEY)));
+        assert!(matches!(
+            err,
+            PluginError::SecretNotFound {
+                key: SECRET_REF_KEY,
+                kind: "secret not found"
+            }
+        ));
         let text = err.to_string();
         assert!(text.contains("auth.config.secret_ref"), "{text}");
         assert!(!text.contains("missing"), "{text}");
     }
 
-    /// A credential store failure, or a malformed reference, names the
-    /// config key; neither the reference nor the store's text (which may
+    /// Credential store errors follow the one mapping for auth plugins: a
+    /// missing or refused secret, or an invalid reference, is not found and
+    /// keeps the store's error kind, an outage is unavailable with
+    /// the store's hint, an error only a write causes is internal. Each names
+    /// the config key; neither the reference nor the store's text (which may
     /// quote it) is in the error.
     #[tokio::test]
-    async fn credstore_error_maps_to_internal_without_the_ref() {
+    async fn credstore_errors_follow_the_credential_mapping_without_the_ref() {
         use crate::domain::test_support::ErroringCredStore;
         use credstore_sdk::CredStoreError;
+        use std::time::Duration;
         type MakeError = fn() -> CredStoreError;
 
-        let errors: [MakeError; 2] = [
-            || CredStoreError::Internal("store failed reading some-key".into()),
-            || CredStoreError::ServiceUnavailable {
-                detail: "some-key: backend down".into(),
-                retry_after: None,
-            },
+        let cases: [(MakeError, &str); 7] = [
+            (|| CredStoreError::NotFound, "secret not found"),
+            (|| CredStoreError::AccessDenied, "access denied"),
+            (
+                || CredStoreError::InvalidSecretRef {
+                    reason: "bad some-key".into(),
+                },
+                "invalid secret reference",
+            ),
+            (
+                || CredStoreError::Internal("store failed reading some-key".into()),
+                "unavailable, no hint",
+            ),
+            (
+                || CredStoreError::ServiceUnavailable {
+                    detail: "some-key: backend down".into(),
+                    retry_after: Some(Duration::from_secs(7)),
+                },
+                "unavailable, 7s",
+            ),
+            (|| CredStoreError::NoPluginAvailable, "unavailable, no hint"),
+            (|| CredStoreError::Conflict, "internal"),
         ];
-        for error in errors {
+        for (error, expected) in cases {
             let plugin = ApiKeyAuthPlugin::new(Arc::new(ErroringCredStore(error)));
             let mut ctx = make_auth_ctx(make_config("authorization", "Bearer ", "cred://some-key"));
             let err = plugin.authenticate(&mut ctx).await.unwrap_err();
-            let PluginError::Internal(text) = &err else {
-                panic!("expected Internal, got {err:?}");
+            let got = match &err {
+                PluginError::SecretNotFound {
+                    key: SECRET_REF_KEY,
+                    kind,
+                } => kind,
+                PluginError::CredentialStoreUnavailable {
+                    retry_after: None, ..
+                } => "unavailable, no hint",
+                PluginError::CredentialStoreUnavailable {
+                    retry_after: Some(d),
+                    ..
+                } if *d == Duration::from_secs(7) => "unavailable, 7s",
+                PluginError::Internal(_) => "internal",
+                other => panic!("{expected}: unexpected {other:?}"),
             };
+            assert_eq!(got, expected, "{err:?}");
+            let text = err.to_string();
             assert!(text.contains("auth.config.secret_ref"), "{text}");
             assert!(!text.contains("some-key"), "{text}");
         }
+    }
 
+    /// A malformed reference is a misconfiguration; the error names the key,
+    /// not the reference.
+    #[tokio::test]
+    async fn a_malformed_ref_is_a_misconfiguration() {
         let plugin = ApiKeyAuthPlugin::new(Arc::new(MockCredStoreClient::empty()));
         let mut ctx = make_auth_ctx(make_config("authorization", "", "cred://bad ref!"));
+        let err = plugin.authenticate(&mut ctx).await.unwrap_err();
+        let PluginError::InvalidConfig(text) = &err else {
+            panic!("expected InvalidConfig, got {err:?}");
+        };
+        assert!(text.contains("secret_ref"), "{text}");
+        assert!(!text.contains("bad ref"), "{text}");
+    }
+
+    /// A stored value a header cannot carry is the secret's fault: 401
+    /// `AUTH_PLUGIN_INTERNAL` (`PluginError::Internal`), as in `request_ref`
+    /// mode, not a misconfiguration. The error does not quote the value.
+    #[tokio::test]
+    async fn a_secret_that_cannot_form_a_header_is_internal() {
+        let credstore = Arc::new(MockCredStoreClient::with_secrets(vec![(
+            "my-key".into(),
+            "sk-123\nX-Injected: 1".into(),
+        )]));
+        let plugin = ApiKeyAuthPlugin::new(credstore);
+        let mut ctx = make_auth_ctx(make_config("authorization", "Bearer ", "cred://my-key"));
         let err = plugin.authenticate(&mut ctx).await.unwrap_err();
         let PluginError::Internal(text) = &err else {
             panic!("expected Internal, got {err:?}");
         };
-        assert!(text.contains("auth.config.secret_ref"), "{text}");
-        assert!(!text.contains("bad ref"), "{text}");
+        assert!(!text.contains("sk-123"), "{text}");
+        assert!(ctx.set_headers.is_empty());
     }
 
     #[tokio::test]

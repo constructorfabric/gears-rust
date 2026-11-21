@@ -2181,8 +2181,8 @@ async fn err_003_exhausted_limit_no_read() {
 }
 
 /// SREF-ERR-004: a CredStore outage or timeout returns 503 service
-/// unavailable, with no reason code, and keeps the limit debits already
-/// taken.
+/// unavailable with reason `CREDENTIAL_STORE_UNAVAILABLE`, and keeps the
+/// limit debits already taken.
 #[tokio::test]
 async fn err_004_outage_and_timeout_are_503_and_keep_debit() {
     for store in [
@@ -2194,7 +2194,11 @@ async fn err_004_outage_and_timeout_are_503_and_keep_debit() {
         assert_eq!(err.status_code(), 503);
         let p = problem_of(&err);
         assert!(p["type"].as_str().unwrap().contains("service_unavailable"));
-        assert!(p["context"].get("reason").is_none(), "{p}");
+        assert_eq!(
+            p["context"]["reason"],
+            oagw_sdk::reason::unavailable::CREDENTIAL_STORE_UNAVAILABLE,
+            "{p}"
+        );
         // The debit stays: the next request is over the limit, and is
         // refused before any CredStore read.
         let err = fx.sdk(fx.t.tenant, fx.post(&["k"])).await.unwrap_err();
@@ -2576,7 +2580,7 @@ fn unavailable() -> Outcome {
     Outcome {
         status: 503,
         category: "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~".into(),
-        reason: String::new(),
+        reason: oagw_sdk::reason::unavailable::CREDENTIAL_STORE_UNAVAILABLE.into(),
         field: String::new(),
     }
 }

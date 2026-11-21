@@ -306,8 +306,9 @@ This is an area of active design. The trait shape, the metadata returned, and th
 
 #### Risks
 
-- **CredStore unreachable**: returns `PluginError::Internal` on cache miss; cached tokens continue to be served until TTL expiry
-- **IdP unavailable**: `fetch_token()` fails → `PluginError::Internal`; not cached; next request retries
+- **CredStore unreachable**: returns `PluginError::CredentialStoreUnavailable` (503 `CREDENTIAL_STORE_UNAVAILABLE`) on cache miss; cached tokens continue to be served until TTL expiry
+- **IdP unavailable**: `fetch_token()` fails with a transport error, 408, 429 or 5xx → `PluginError::IdpUnavailable` (503 `IDENTITY_PROVIDER_UNAVAILABLE`); not cached; next request retries
+- Amended by [#4985](https://github.com/constructorfabric/gears-rust/issues/4985): both cases were `PluginError::Internal` (401 `AUTH_PLUGIN_INTERNAL`) before; see the OAGW DESIGN "Credential Failures" for the full mapping
 - **Hash collision in TinyUfo**: mitigated by `CachedToken` key verification — a collision returns a cache miss, never another tenant's token
 
 #### Known Residual Plaintext

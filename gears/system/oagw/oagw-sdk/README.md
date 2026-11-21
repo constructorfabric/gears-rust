@@ -8,7 +8,8 @@ This crate defines the transport-agnostic interface for the OAGW gear:
 
 - **`ServiceGatewayClientV1`** — Async trait for upstream/route management and request proxying
 - **`Upstream` / `Route`** — Core domain models with builder-based construction
-- **`ServiceGatewayError`** — Error types for all gateway operations
+- **`ServiceGatewayError`** — Error types for all gateway operations; `request_not_sent()` tells whether a retry is safe for any method
+- **`reason`** — Wire `reason` codes with typed enums: `auth`, `permission`, `unavailable` (why a 502/503: `REQUEST_NOT_SENT`, `REQUEST_MAY_HAVE_BEEN_SENT`, `UPSTREAM_DISABLED`, `CREDENTIAL_STORE_UNAVAILABLE`, `IDENTITY_PROVIDER_UNAVAILABLE`) and `timeout` (504)
 - **`Body`** — Request/response body abstraction (`Bytes` / `Stream` / `Empty`)
 - **`ServerEventsStream`** — SSE response parser with typed event support
 - **`WebSocketStream`** — WebSocket abstraction with sender/receiver halves

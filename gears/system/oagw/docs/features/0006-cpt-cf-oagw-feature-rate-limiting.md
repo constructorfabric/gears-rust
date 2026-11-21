@@ -85,7 +85,7 @@ Prevents abuse, cost overruns, and protects external service agreements. Maintai
 - Concurrency limit exceeded at upstream level (503 ConcurrencyLimitExceeded)
 - Concurrency limit exceeded at route level (503 ConcurrencyLimitExceeded)
 - Concurrency limit exceeded at tenant-global level (503 ConcurrencyLimitExceeded)
-- Circuit breaker open for upstream (503 CircuitBreakerOpen + `Retry-After`)
+- Circuit breaker open for upstream (503 CircuitBreakerOpen + `Retry-After`, reason `REQUEST_NOT_SENT`)
 - Circuit breaker half-open probe fails — circuit re-opens
 
 **Steps**:
@@ -93,7 +93,7 @@ Prevents abuse, cost overruns, and protects external service agreements. Maintai
 2. [x] - `p2` - Resolve effective rate limit config via `cpt-cf-oagw-algo-hierarchical-rate-limit-merge` for upstream and matched route - `inst-rl-2`
 3. [x] - `p2` - Check the upstream's circuit breaker via `cpt-cf-oagw-algo-circuit-breaker-evaluation`, before the auth plugin, the rate limits and any CredStore read, so an open circuit costs no credential or token. The check keeps no probe slot; the permit that counts the outcome is taken just before target resolution (`inst-rl-9a`) - `inst-rl-3`
 4. [x] - `p2` - **IF** circuit breaker is OPEN, or HALF_OPEN with every probe slot taken - `inst-rl-4`
-   1. [x] - `p2` - **RETURN** 503 CircuitBreakerOpen with `Retry-After` (the time left until a probe, in whole seconds rounded up, at least 1) via `cpt-cf-oagw-algo-error-source-classification` - `inst-rl-4a`
+   1. [x] - `p2` - **RETURN** 503 CircuitBreakerOpen with reason `REQUEST_NOT_SENT` and `Retry-After` (the time left until a probe, in whole seconds rounded up, at least 1) via `cpt-cf-oagw-algo-error-source-classification` - `inst-rl-4a`
 5. [x] - `p2` - Check rate limit via `cpt-cf-oagw-algo-token-bucket-check` with effective rate config and request cost - `inst-rl-5`
 6. [x] - `p2` - **IF** rate limit exceeded - `inst-rl-6`
    1. [x] - `p2` - **IF** strategy = `reject` - `inst-rl-6a`

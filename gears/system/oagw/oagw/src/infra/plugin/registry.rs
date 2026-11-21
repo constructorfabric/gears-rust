@@ -392,7 +392,7 @@ mod implemented_ids_tests {
                 assert!(
                     matches!(
                         complete,
-                        Err(crate::domain::plugin::PluginError::SecretNotFound(_))
+                        Err(crate::domain::plugin::PluginError::SecretNotFound { .. })
                     ),
                     "{plugin_id} with every listed key: {complete:?}"
                 );
@@ -420,7 +420,7 @@ mod implemented_ids_tests {
                 }
                 let mut auth_ctx = AuthContext::new(config, ctx.clone());
                 match plugin.authenticate(&mut auth_ctx).await {
-                    Err(e @ crate::domain::plugin::PluginError::SecretNotFound(key)) => {
+                    Err(e @ crate::domain::plugin::PluginError::SecretNotFound { key, .. }) => {
                         assert_eq!(key, absent.key, "{plugin_id}");
                         assert!(
                             !e.to_string().contains("ref-"),

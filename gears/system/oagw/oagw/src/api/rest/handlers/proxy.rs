@@ -1,7 +1,7 @@
 // Updated: 2026-04-07 by Constructor Tech
 use bytes::Bytes;
 
-use crate::domain::error::DomainError;
+use crate::domain::error::{Dispatch, DomainError};
 use crate::infra::proxy::headers;
 use crate::infra::proxy::websocket::{WebSocketBridgeHandle, websocket_bridge};
 use axum::body::Body;
@@ -192,6 +192,7 @@ async fn proxy(
         let on_upgrade = on_upgrade.ok_or_else(|| DomainError::ProtocolError {
             detail: "WebSocket upgrade requested but connection does not support upgrades".into(),
             instance: String::new(),
+            dispatch: Dispatch::MaybeSent,
         })?;
 
         // Build the 101 response to return to hyper (triggers the upgrade).
@@ -253,6 +254,7 @@ async fn proxy(
         .map_err(|e| DomainError::DownstreamError {
             detail: format!("failed to build response: {e}"),
             instance: String::new(),
+            dispatch: Dispatch::MaybeSent,
         })?;
 
     // This is the Data Plane's own response (relayed from the real

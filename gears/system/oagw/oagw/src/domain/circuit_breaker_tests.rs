@@ -147,6 +147,7 @@ async fn a_failed_probe_opens_the_circuit_again() {
         .failed(&DomainError::DownstreamError {
             detail: "refused".into(),
             instance: INSTANCE.into(),
+            dispatch: crate::domain::error::Dispatch::MaybeSent,
         });
     let err = breakers.admit(&u, INSTANCE).unwrap_err();
     assert_eq!(retry_after(err), Duration::from_secs(5));
@@ -293,6 +294,7 @@ async fn a_pinned_request_records_nothing() {
     pinned().failed(&DomainError::LinkUnavailable {
         detail: "x".into(),
         instance: INSTANCE.into(),
+        dispatch: crate::domain::error::Dispatch::NotSent,
     });
     assert!(breakers.admit(&u, INSTANCE).is_ok(), "not counted");
 
@@ -601,26 +603,32 @@ fn transport_errors_are_failures_and_gateway_errors_say_nothing() {
         DomainError::ConnectionTimeout {
             detail: d(),
             instance: i(),
+            dispatch: crate::domain::error::Dispatch::NotSent,
         },
         DomainError::RequestTimeout {
             detail: d(),
             instance: i(),
+            dispatch: crate::domain::error::Dispatch::MaybeSent,
         },
         DomainError::LinkUnavailable {
             detail: d(),
             instance: i(),
+            dispatch: crate::domain::error::Dispatch::NotSent,
         },
         DomainError::DownstreamError {
             detail: d(),
             instance: i(),
+            dispatch: crate::domain::error::Dispatch::MaybeSent,
         },
         DomainError::ProtocolError {
             detail: d(),
             instance: i(),
+            dispatch: crate::domain::error::Dispatch::MaybeSent,
         },
         DomainError::StreamAborted {
             detail: d(),
             instance: i(),
+            dispatch: crate::domain::error::Dispatch::MaybeSent,
         },
     ];
     for err in &failures {
@@ -649,6 +657,15 @@ fn transport_errors_are_failures_and_gateway_errors_say_nothing() {
         DomainError::CredentialStoreUnavailable {
             detail: d(),
             retry_after: None,
+            instance: i(),
+        },
+        // The identity provider, not the upstream.
+        DomainError::IdpUnavailable {
+            detail: d(),
+            instance: i(),
+        },
+        DomainError::IdpInvalidResponse {
+            detail: d(),
             instance: i(),
         },
         DomainError::GuardRejected {

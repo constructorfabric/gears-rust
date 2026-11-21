@@ -44,8 +44,17 @@ pub async fn discover_token_endpoint(
         .map_err(|e| TokenError::from_http(&e, HttpOperation::Discovery, &discovery_url))?
         .json()
         .await
-        .map_err(|e| {
-            TokenError::InvalidResponse(crate::http_error::format_http_error(&e, "OIDC discovery"))
+        // A body that is not a discovery document is an invalid response,
+        // as for the token request; a failure to read it stays an HTTP
+        // error.
+        .map_err(|e| match e {
+            toolkit_http::HttpError::Json(_) | toolkit_http::HttpError::BodyTooLarge { .. } => {
+                TokenError::InvalidResponse(crate::http_error::format_http_error(
+                    &e,
+                    "OIDC discovery",
+                ))
+            }
+            _ => TokenError::from_http(&e, HttpOperation::Discovery, &discovery_url),
         })?;
 
     Url::parse(&doc.token_endpoint).map_err(|e| {
@@ -211,5 +220,38 @@ mod tests {
             "expected Http error with 500 status, got: {err}"
         );
         mock.assert();
+    }
+
+    /// A discovery body the connection drops before it ends is a transport
+    /// failure (`Http`, so the identity provider is unavailable), not an
+    /// invalid document.
+    #[tokio::test]
+    async fn discover_body_read_failure_is_an_http_error() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                if s.read(&mut buf).await.is_err() {
+                    continue;
+                }
+                s.write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{\"tok",
+                )
+                .await
+                .ok();
+            }
+        });
+
+        let client = toolkit_http::HttpClientBuilder::with_config(
+            toolkit_http::HttpClientConfig::for_testing(),
+        )
+        .build()
+        .unwrap();
+        let issuer = Url::parse(&format!("http://{addr}")).unwrap();
+        let err = discover_token_endpoint(&client, &issuer).await.unwrap_err();
+        assert!(matches!(err, TokenError::Http(_)), "{err:?}");
     }
 }

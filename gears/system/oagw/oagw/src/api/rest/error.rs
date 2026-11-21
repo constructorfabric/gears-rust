@@ -39,11 +39,15 @@
 
 use axum::response::{IntoResponse, Response};
 use http::HeaderValue;
-use toolkit_canonical_errors::{CanonicalError, Http, Problem, resource_error};
+use toolkit_canonical_errors::builder::{HasReason, OptionalReason};
+use toolkit_canonical_errors::{
+    CanonicalError, Http, Problem, ResourceErrorBuilder, ServiceUnavailableBuilder, resource_error,
+};
 
-use crate::domain::error::{DeniedOn, DomainError};
+use crate::domain::error::{DeniedOn, Dispatch, DomainError};
 use crate::domain::gts_helpers as gts;
 use oagw_sdk::api::ErrorSource;
+use oagw_sdk::reason::{timeout::TimeoutReason, unavailable::UnavailableReason};
 use oagw_sdk::{field, precondition, quota, reason};
 
 // ---------------------------------------------------------------------------
@@ -62,8 +66,9 @@ const RETRY_AFTER_TRANSIENT_SECS: u64 = 5;
 /// No-route / connect-failure errors — retry once DNS/network settles.
 const RETRY_AFTER_LINK_SECS: u64 = 10;
 
-/// Upstream-disabled by configuration — operator action required.
-const RETRY_AFTER_ADMIN_SECS: u64 = 30;
+/// Upstream disabled by configuration — only an operator can enable it again,
+/// so the hint is long.
+const RETRY_AFTER_ADMIN_SECS: u64 = 300;
 
 /// Unknown 5xx from a guard plugin — conservative default.
 const RETRY_AFTER_GUARD_SECS: u64 = 10;
@@ -260,13 +265,14 @@ impl From<DomainError> for CanonicalError {
                 builder.create()
             }
 
-            DomainError::SecretNotFound { detail, .. } => {
-                // `CanonicalError::internal(detail)` captures the detail in
-                // `Internal::description`; the canonical error middleware
-                // surfaces it server-side via the `CanonicalError` extension
-                // (DESIGN.md §3.6), so no per-arm log is needed.
-                CanonicalError::internal(detail).create()
-            }
+            // The secret is missing or not shared with the tenant: the
+            // credential is absent, as for any other auth failure. The detail
+            // (config key and credential store error kind) stays off the
+            // wire; the auth plugin step already warned with it and the
+            // request's identifiers.
+            DomainError::SecretNotFound { .. } => CanonicalError::unauthenticated()
+                .with_reason(reason::auth::CREDENTIAL_NOT_FOUND)
+                .create(),
 
             // A state precondition, not a malformed request: the referenced
             // secret is not provisioned yet or not shared. Kept distinct from
@@ -279,59 +285,86 @@ impl From<DomainError> for CanonicalError {
                     .create()
             }
 
-            // The canonical context carries only a retry hint: a consumer
-            // sees an ordinary 503; the log names the credential store.
+            // The credential store is down; the upstream was not contacted.
             DomainError::CredentialStoreUnavailable {
                 detail,
                 retry_after,
                 ..
             } => {
-                // `secret_ref::resolve` already warned with the request's
-                // identifiers; this is only the mapping step.
+                // `secret_ref::resolve` or the auth plugin step already
+                // warned with the request's identifiers; this is only the
+                // mapping step.
                 tracing::debug!(reason = %detail, "OAGW credential store unavailable");
                 // CredStore's hint, rounded up to whole seconds (at least 1).
                 let retry_after_secs =
                     retry_after.map_or(RETRY_AFTER_TRANSIENT_SECS, retry_after_seconds);
                 CanonicalError::service_unavailable()
                     .with_retry_after_seconds(retry_after_secs)
+                    .with_typed_reason(UnavailableReason::CredentialStoreUnavailable)
                     .create()
             }
 
-            DomainError::DownstreamError { detail, .. } => {
-                tracing::warn!(reason = %detail, "OAGW downstream error");
+            // The identity provider's token endpoint is down; the upstream
+            // was not contacted.
+            DomainError::IdpUnavailable { detail, .. } => {
+                // The auth plugin step already warned with the request's
+                // identifiers; this is only the mapping step.
+                tracing::debug!(reason = %detail, "OAGW OAuth2 identity provider unavailable");
                 CanonicalError::service_unavailable()
                     .with_retry_after_seconds(RETRY_AFTER_TRANSIENT_SECS)
+                    .with_typed_reason(UnavailableReason::IdentityProviderUnavailable)
+                    .create()
+            }
+
+            // The auth step failed before anything was sent upstream.
+            DomainError::IdpInvalidResponse { detail, .. } => {
+                // The auth plugin step already warned with the request's
+                // identifiers; this is only the mapping step.
+                tracing::debug!(reason = %detail, "OAGW identity provider sent an invalid response");
+                CanonicalError::service_unavailable()
+                    .with_retry_after_seconds(RETRY_AFTER_TRANSIENT_SECS)
+                    .with_typed_reason(UnavailableReason::RequestNotSent)
                     .with_override(Http::status_code(502))
                     .create()
             }
 
-            DomainError::ProtocolError { detail, .. } => {
-                tracing::warn!(reason = %detail, "OAGW upstream protocol error");
-                CanonicalError::service_unavailable()
-                    .with_retry_after_seconds(RETRY_AFTER_TRANSIENT_SECS)
-                    .with_override(Http::status_code(502))
-                    .create()
+            // Transport failures: the status follows the variant, the
+            // `reason` the dispatch stage the engine error kind set.
+            DomainError::DownstreamError {
+                detail, dispatch, ..
+            } => {
+                tracing::warn!(reason = %detail, ?dispatch, "OAGW downstream error");
+                bad_gateway(dispatch)
+            }
+
+            DomainError::ProtocolError {
+                detail, dispatch, ..
+            } => {
+                tracing::warn!(reason = %detail, ?dispatch, "OAGW upstream protocol error");
+                bad_gateway(dispatch)
             }
 
             DomainError::UpstreamDisabled { alias } => {
                 tracing::debug!(upstream = %alias, "OAGW upstream is disabled");
                 CanonicalError::service_unavailable()
                     .with_retry_after_seconds(RETRY_AFTER_ADMIN_SECS)
+                    .with_typed_reason(UnavailableReason::UpstreamDisabled)
                     .create()
             }
 
-            DomainError::ConnectionTimeout { detail, .. } => {
-                OagwProxyError::deadline_exceeded(detail).create()
+            DomainError::ConnectionTimeout {
+                detail, dispatch, ..
             }
-
-            DomainError::RequestTimeout { detail, .. } => {
-                OagwProxyError::deadline_exceeded(detail).create()
-            }
+            | DomainError::RequestTimeout {
+                detail, dispatch, ..
+            } => OagwProxyError::deadline_exceeded(detail)
+                .with_typed_reason(dispatch.timeout_reason())
+                .create(),
 
             DomainError::Internal { message } => {
-                // See SecretNotFound: the canonical error middleware logs
-                // `Internal::description` via the extension path, so the
-                // per-arm `tracing::error!` would be redundant.
+                // The canonical error middleware logs `Internal::description`
+                // via the extension path, so a per-arm `tracing::error!`
+                // would be redundant.
                 CanonicalError::internal(message).create()
             }
 
@@ -357,18 +390,20 @@ impl From<DomainError> for CanonicalError {
                     .create()
             }
 
-            DomainError::StreamAborted { detail, .. } => {
-                tracing::warn!(reason = %detail, "OAGW upstream stream aborted");
-                CanonicalError::service_unavailable()
-                    .with_retry_after_seconds(RETRY_AFTER_TRANSIENT_SECS)
-                    .with_override(Http::status_code(502))
-                    .create()
+            DomainError::StreamAborted {
+                detail, dispatch, ..
+            } => {
+                tracing::warn!(reason = %detail, ?dispatch, "OAGW upstream stream aborted");
+                bad_gateway(dispatch)
             }
 
-            DomainError::LinkUnavailable { detail, .. } => {
-                tracing::warn!(reason = %detail, "OAGW upstream link unavailable");
+            DomainError::LinkUnavailable {
+                detail, dispatch, ..
+            } => {
+                tracing::warn!(reason = %detail, ?dispatch, "OAGW upstream link unavailable");
                 CanonicalError::service_unavailable()
                     .with_retry_after_seconds(RETRY_AFTER_LINK_SECS)
+                    .with_typed_reason(dispatch.unavailable_reason())
                     .create()
             }
 
@@ -379,15 +414,17 @@ impl From<DomainError> for CanonicalError {
             } => {
                 // The toolkit logs the transition and counts rejections.
                 tracing::debug!(reason = %detail, "OAGW circuit breaker open");
-                // Until the breaker lets a probe through.
+                // Until the breaker lets a probe through. Nothing was sent.
                 CanonicalError::service_unavailable()
                     .with_retry_after_seconds(retry_after_seconds(retry_after))
+                    .with_typed_reason(UnavailableReason::RequestNotSent)
                     .create()
             }
 
-            DomainError::IdleTimeout { detail, .. } => {
-                OagwProxyError::deadline_exceeded(detail).create()
-            }
+            // The upstream went quiet after the exchange started.
+            DomainError::IdleTimeout { detail, .. } => OagwProxyError::deadline_exceeded(detail)
+                .with_typed_reason(TimeoutReason::RequestMayHaveBeenSent)
+                .create(),
 
             // The `gts_id` prefix encodes the plugin kind, so dispatch
             // through the matching per-kind resource scope. The wire
@@ -420,6 +457,46 @@ impl From<DomainError> for CanonicalError {
             }
         }
     }
+}
+
+/// `with_reason` that takes the SDK enum for the category: the 502/503
+/// builder takes only an [`UnavailableReason`], the 504 builder only a
+/// [`TimeoutReason`], so a reason from the wrong category does not compile.
+/// Emit named variants; `Unknown` is for reading unfamiliar codes.
+trait WithTypedReason {
+    type Reason;
+    type Output;
+
+    fn with_typed_reason(self, reason: Self::Reason) -> Self::Output;
+}
+
+impl WithTypedReason for ServiceUnavailableBuilder {
+    type Reason = UnavailableReason;
+    type Output = Self;
+
+    fn with_typed_reason(self, reason: UnavailableReason) -> Self {
+        self.with_reason(reason.as_wire())
+    }
+}
+
+impl<Resource> WithTypedReason for ResourceErrorBuilder<Resource, OptionalReason> {
+    type Reason = TimeoutReason;
+    type Output = ResourceErrorBuilder<Resource, HasReason>;
+
+    fn with_typed_reason(self, reason: TimeoutReason) -> Self::Output {
+        self.with_reason(reason.as_wire())
+    }
+}
+
+/// A 502 for a failed upstream exchange: canonical `service_unavailable`
+/// with the transport override, the short retry hint and the dispatch
+/// reason.
+fn bad_gateway(dispatch: Dispatch) -> CanonicalError {
+    CanonicalError::service_unavailable()
+        .with_retry_after_seconds(RETRY_AFTER_TRANSIENT_SECS)
+        .with_typed_reason(dispatch.unavailable_reason())
+        .with_override(Http::status_code(502))
+        .create()
 }
 
 /// A retry hint in whole seconds, rounded up and at least 1.
@@ -870,6 +947,7 @@ mod tests {
             DomainError::DownstreamError {
                 detail: "x".into(),
                 instance: i(),
+                dispatch: crate::domain::error::Dispatch::MaybeSent,
             },
             502,
             RETRY_AFTER_TRANSIENT_SECS,
@@ -879,6 +957,7 @@ mod tests {
             DomainError::ProtocolError {
                 detail: "x".into(),
                 instance: i(),
+                dispatch: crate::domain::error::Dispatch::MaybeSent,
             },
             502,
             RETRY_AFTER_TRANSIENT_SECS,
@@ -896,6 +975,7 @@ mod tests {
             DomainError::StreamAborted {
                 detail: "x".into(),
                 instance: i(),
+                dispatch: crate::domain::error::Dispatch::MaybeSent,
             },
             502,
             RETRY_AFTER_TRANSIENT_SECS,
@@ -905,6 +985,7 @@ mod tests {
             DomainError::LinkUnavailable {
                 detail: "x".into(),
                 instance: i(),
+                dispatch: crate::domain::error::Dispatch::NotSent,
             },
             503,
             RETRY_AFTER_LINK_SECS,
@@ -972,6 +1053,15 @@ mod tests {
             1,
             "CredentialStoreUnavailable with a sub-second hint",
         );
+        assert_retry(
+            DomainError::IdpUnavailable {
+                detail: "x".into(),
+                instance: i(),
+            },
+            503,
+            RETRY_AFTER_TRANSIENT_SECS,
+            "IdpUnavailable",
+        );
     }
 
     #[test]
@@ -994,6 +1084,7 @@ mod tests {
         let err = DomainError::DownstreamError {
             detail: "upstream connection refused".into(),
             instance: "/oagw/v1/proxy/api.openai.com/v1/chat".into(),
+            dispatch: crate::domain::error::Dispatch::MaybeSent,
         };
         let p: Problem = err.into_test_problem();
         assert_eq!(p.status, Some(502));
@@ -1009,6 +1100,7 @@ mod tests {
         let err = DomainError::ProtocolError {
             detail: "upstream HTTP/2 error".into(),
             instance: "/oagw/v1/proxy/api.openai.com/v1/chat".into(),
+            dispatch: crate::domain::error::Dispatch::MaybeSent,
         };
         let p: Problem = err.into_test_problem();
         assert_eq!(p.status, Some(502));
@@ -1023,6 +1115,7 @@ mod tests {
         let err = DomainError::StreamAborted {
             detail: "upstream stream read error".into(),
             instance: "/oagw/v1/proxy/api.openai.com/v1/chat".into(),
+            dispatch: crate::domain::error::Dispatch::MaybeSent,
         };
         let p: Problem = err.into_test_problem();
         assert_eq!(p.status, Some(502));
@@ -1030,6 +1123,236 @@ mod tests {
             p.problem_type,
             gts_uri!("cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~")
         );
+    }
+
+    const SERVICE_UNAVAILABLE_TYPE: &str =
+        gts_uri!("cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~");
+    const DEADLINE_EXCEEDED_TYPE: &str =
+        gts_uri!("cf.core.errors.err.v1~cf.core.err.deadline_exceeded.v1~");
+    const UNAUTHENTICATED_TYPE: &str =
+        gts_uri!("cf.core.errors.err.v1~cf.core.err.unauthenticated.v1~");
+    const INTERNAL_TYPE: &str = gts_uri!("cf.core.errors.err.v1~cf.core.err.internal.v1~");
+
+    /// The JSON body the conversion produces (no `instance` / `trace_id`:
+    /// the middleware adds those).
+    fn body(err: DomainError) -> serde_json::Value {
+        serde_json::to_value(err.into_test_problem()).unwrap()
+    }
+
+    fn unavailable_body(status: u16, retry: u64, reason: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": SERVICE_UNAVAILABLE_TYPE,
+            "title": "Service Unavailable",
+            "status": status,
+            "detail": "Service temporarily unavailable",
+            "context": { "retry_after_seconds": retry, "reason": reason },
+        })
+    }
+
+    /// Each gateway 502/503/504 from the upstream exchange carries the
+    /// dispatch reason its stage set, whatever the variant: the full
+    /// problem body for every transport variant and both stages.
+    #[test]
+    fn transport_errors_carry_the_dispatch_reason() {
+        use crate::domain::error::Dispatch::{MaybeSent, NotSent};
+        use reason::unavailable::{REQUEST_MAY_HAVE_BEEN_SENT, REQUEST_NOT_SENT};
+
+        for (dispatch, wire) in [
+            (NotSent, REQUEST_NOT_SENT),
+            (MaybeSent, REQUEST_MAY_HAVE_BEEN_SENT),
+        ] {
+            let d = || "upstream connection refused".to_string();
+            let i = || "/oagw/v1/proxy/a/b".to_string();
+            for err in [
+                DomainError::DownstreamError {
+                    detail: d(),
+                    instance: i(),
+                    dispatch,
+                },
+                DomainError::ProtocolError {
+                    detail: d(),
+                    instance: i(),
+                    dispatch,
+                },
+                DomainError::StreamAborted {
+                    detail: d(),
+                    instance: i(),
+                    dispatch,
+                },
+            ] {
+                assert_eq!(
+                    body(err),
+                    unavailable_body(502, RETRY_AFTER_TRANSIENT_SECS, wire)
+                );
+            }
+            assert_eq!(
+                body(DomainError::LinkUnavailable {
+                    detail: d(),
+                    instance: i(),
+                    dispatch,
+                }),
+                unavailable_body(503, RETRY_AFTER_LINK_SECS, wire)
+            );
+            for err in [
+                DomainError::ConnectionTimeout {
+                    detail: "upstream connection timed out".into(),
+                    instance: i(),
+                    dispatch,
+                },
+                DomainError::RequestTimeout {
+                    detail: "upstream connection timed out".into(),
+                    instance: i(),
+                    dispatch,
+                },
+            ] {
+                assert_eq!(
+                    body(err),
+                    serde_json::json!({
+                        "type": DEADLINE_EXCEEDED_TYPE,
+                        "title": "Deadline Exceeded",
+                        "status": 504,
+                        "detail": "upstream connection timed out",
+                        "context": {
+                            "resource_type": gts::PROXY_SCHEMA,
+                            "reason": wire,
+                        },
+                    })
+                );
+            }
+        }
+    }
+
+    /// An open circuit sends nothing; a disabled upstream says so, with a
+    /// long retry hint because only an operator can enable it again.
+    #[test]
+    fn breaker_and_disabled_upstream_bodies() {
+        assert_eq!(
+            body(DomainError::CircuitBreakerOpen {
+                detail: "circuit open".into(),
+                instance: "/i".into(),
+                retry_after: std::time::Duration::from_secs(4),
+            }),
+            unavailable_body(503, 4, reason::unavailable::REQUEST_NOT_SENT)
+        );
+        assert_eq!(RETRY_AFTER_ADMIN_SECS, 300);
+        assert_eq!(
+            body(DomainError::upstream_disabled("api.example.com")),
+            unavailable_body(503, 300, reason::unavailable::UPSTREAM_DISABLED)
+        );
+        let resp = error_response(DomainError::upstream_disabled("api.example.com"));
+        assert_eq!(resp.status(), 503);
+        assert_eq!(resp.headers()["retry-after"], "300");
+    }
+
+    /// The credential-failure mapping: a missing secret is 401 with its own
+    /// reason (it was 500), a credential store outage 503 with the store's
+    /// hint, an identity provider outage 503 with its own reason and the
+    /// transient hint, an invalid identity provider answer 502. The wire
+    /// never carries the config key, the reference or the detail.
+    #[test]
+    fn credential_failures_have_one_mapping() {
+        let missing = body(DomainError::SecretNotFound {
+            detail: "secret referenced by auth.config.secret_ref not found".into(),
+            instance: "/i".into(),
+        });
+        assert_eq!(missing["type"], UNAUTHENTICATED_TYPE);
+        assert_eq!(missing["status"], 401);
+        assert_eq!(
+            missing["context"],
+            serde_json::json!({ "reason": reason::auth::CREDENTIAL_NOT_FOUND })
+        );
+        assert!(!missing.to_string().contains("secret_ref"), "{missing}");
+
+        assert_eq!(
+            body(DomainError::CredentialStoreUnavailable {
+                detail: "credential store unavailable for auth.config.secret_ref".into(),
+                retry_after: Some(std::time::Duration::from_millis(6_500)),
+                instance: "/i".into(),
+            }),
+            unavailable_body(503, 7, reason::unavailable::CREDENTIAL_STORE_UNAVAILABLE)
+        );
+        assert_eq!(
+            body(DomainError::IdpUnavailable {
+                detail: "identity provider unavailable: token endpoint returned 503".into(),
+                instance: "/i".into(),
+            }),
+            unavailable_body(
+                503,
+                RETRY_AFTER_TRANSIENT_SECS,
+                reason::unavailable::IDENTITY_PROVIDER_UNAVAILABLE
+            )
+        );
+        assert_eq!(
+            body(DomainError::IdpInvalidResponse {
+                detail: "invalid identity provider response: unsupported token type".into(),
+                instance: "/i".into(),
+            }),
+            unavailable_body(
+                502,
+                RETRY_AFTER_TRANSIENT_SECS,
+                reason::unavailable::REQUEST_NOT_SENT
+            )
+        );
+        let misconfigured = body(DomainError::internal(
+            "auth plugin misconfigured: missing client_id_ref",
+        ));
+        assert_eq!(misconfigured["type"], INTERNAL_TYPE);
+        assert_eq!(misconfigured["status"], 500);
+        assert!(
+            !misconfigured.to_string().contains("client_id_ref"),
+            "{misconfigured}"
+        );
+    }
+
+    /// REST callers rebuild the SDK projection from the problem body: the
+    /// reasons survive the round trip.
+    #[test]
+    fn dispatch_reasons_reach_the_sdk_projection() {
+        use oagw_sdk::ServiceGatewayError as E;
+        use oagw_sdk::reason::{timeout::TimeoutReason, unavailable::UnavailableReason};
+
+        let sdk = |err: DomainError| {
+            let rebuilt = CanonicalError::try_from(err.into_test_problem()).unwrap();
+            E::from(rebuilt)
+        };
+        assert!(matches!(
+            sdk(DomainError::DownstreamError {
+                detail: "x".into(),
+                instance: "/i".into(),
+                dispatch: crate::domain::error::Dispatch::NotSent,
+            }),
+            E::Unavailable {
+                retry_after_secs: Some(RETRY_AFTER_TRANSIENT_SECS),
+                reason: Some(UnavailableReason::RequestNotSent),
+            }
+        ));
+        assert!(matches!(
+            sdk(DomainError::RequestTimeout {
+                detail: "x".into(),
+                instance: "/i".into(),
+                dispatch: crate::domain::error::Dispatch::MaybeSent,
+            }),
+            E::Timeout {
+                reason: Some(TimeoutReason::RequestMayHaveBeenSent),
+            }
+        ));
+        assert!(matches!(
+            sdk(DomainError::upstream_disabled("a")),
+            E::Unavailable {
+                retry_after_secs: Some(300),
+                reason: Some(UnavailableReason::UpstreamDisabled),
+            }
+        ));
+        assert!(matches!(
+            sdk(DomainError::SecretNotFound {
+                detail: "x".into(),
+                instance: "/i".into(),
+            }),
+            E::AuthFailed {
+                reason: oagw_sdk::reason::auth::FailureReason::CredentialNotFound,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1093,10 +1416,12 @@ mod tests {
             DomainError::DownstreamError {
                 detail: "test".into(),
                 instance: "/test".into(),
+                dispatch: crate::domain::error::Dispatch::MaybeSent,
             },
             DomainError::ProtocolError {
                 detail: "test".into(),
                 instance: "/test".into(),
+                dispatch: crate::domain::error::Dispatch::MaybeSent,
             },
             DomainError::UpstreamDisabled {
                 alias: "test".into(),
@@ -1104,10 +1429,12 @@ mod tests {
             DomainError::ConnectionTimeout {
                 detail: "test".into(),
                 instance: "/test".into(),
+                dispatch: crate::domain::error::Dispatch::NotSent,
             },
             DomainError::RequestTimeout {
                 detail: "test".into(),
                 instance: "/test".into(),
+                dispatch: crate::domain::error::Dispatch::MaybeSent,
             },
             DomainError::Internal {
                 message: "test".into(),
@@ -1130,10 +1457,12 @@ mod tests {
             DomainError::StreamAborted {
                 detail: "test".into(),
                 instance: "/test".into(),
+                dispatch: crate::domain::error::Dispatch::MaybeSent,
             },
             DomainError::LinkUnavailable {
                 detail: "test".into(),
                 instance: "/test".into(),
+                dispatch: crate::domain::error::Dispatch::NotSent,
             },
             DomainError::CircuitBreakerOpen {
                 detail: "test".into(),
@@ -1160,6 +1489,14 @@ mod tests {
             DomainError::CredentialStoreUnavailable {
                 detail: "test".into(),
                 retry_after: None,
+                instance: "/test".into(),
+            },
+            DomainError::IdpUnavailable {
+                detail: "test".into(),
+                instance: "/test".into(),
+            },
+            DomainError::IdpInvalidResponse {
+                detail: "test".into(),
                 instance: "/test".into(),
             },
         ];

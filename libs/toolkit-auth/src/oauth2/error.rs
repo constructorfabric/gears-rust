@@ -110,6 +110,16 @@ impl TokenError {
                 status: *status,
                 target_url: sanitized_target(target),
             },
+            // A URL the client cannot use (unparseable, or a scheme the
+            // transport policy forbids) fails the same way on every retry.
+            // The message names no URL: the URL may carry credentials.
+            toolkit_http::HttpError::InvalidUri { .. } => {
+                Self::ConfigError(format!("{} URL is invalid", operation.label()))
+            }
+            toolkit_http::HttpError::InvalidScheme { scheme, .. } => Self::ConfigError(format!(
+                "{} URL scheme '{scheme}' is not allowed",
+                operation.label()
+            )),
             _ => Self::Http(crate::http_error::format_http_error(
                 error,
                 operation.label(),
@@ -161,6 +171,27 @@ mod tests {
             &url::Url::parse("https://example.com/oauth/token").unwrap(),
         );
         assert_eq!(error.status(), None);
+    }
+
+    /// A URL the client cannot use fails the same way on every retry: a
+    /// configuration error, not a transport one.
+    #[test]
+    fn an_unusable_url_is_a_config_error() {
+        let target = url::Url::parse("https://example.com/oauth/token").unwrap();
+        for error in [
+            toolkit_http::HttpError::InvalidScheme {
+                scheme: "ftp".into(),
+                reason: "unsupported".into(),
+            },
+            toolkit_http::HttpError::InvalidUri {
+                url: "bad".into(),
+                kind: toolkit_http::InvalidUriKind::ParseError,
+                reason: "bad".into(),
+            },
+        ] {
+            let e = TokenError::from_http(&error, HttpOperation::TokenRequest, &target);
+            assert!(matches!(e, TokenError::ConfigError(_)), "{e:?}");
+        }
     }
 
     #[test]

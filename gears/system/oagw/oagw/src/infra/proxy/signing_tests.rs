@@ -504,8 +504,8 @@ async fn refused_handshake_is_not_signed() {
     assert!(fx.handshakes(&marker).await.is_empty());
 }
 
-/// An output the gateway cannot send as given fails the request with the
-/// invalid-plugin-config error, before anything is sent.
+/// An output the gateway cannot send as given is a plugin misconfiguration:
+/// the request fails with 500, before anything is sent.
 #[tokio::test]
 async fn unusable_signing_output_stops_the_request() {
     for output in [
@@ -523,7 +523,14 @@ async fn unusable_signing_output_stops_the_request() {
             .send(fx.post(Body::Bytes(Bytes::from_static(b"{}"))))
             .await
             .unwrap_err();
-        assert_eq!(err.status_code(), 400);
+        assert_eq!(err.status_code(), 500);
+        assert!(
+            matches!(
+                err,
+                toolkit_canonical_errors::CanonicalError::Internal { .. }
+            ),
+            "{err:?}"
+        );
         assert!(fx.guard.recorded_requests().await.is_empty());
     }
 }
@@ -668,7 +675,9 @@ async fn hung_signing_times_out_and_sends_nothing() {
     assert_eq!(err.status_code(), 504);
     assert!(matches!(
         ServiceGatewayError::from(err),
-        ServiceGatewayError::Timeout
+        ServiceGatewayError::Timeout {
+            reason: Some(oagw_sdk::reason::timeout::TimeoutReason::RequestNotSent)
+        }
     ));
     assert_eq!(fx.signer.seen().len(), 1);
     assert!(fx.guard.recorded_requests().await.is_empty());

@@ -135,6 +135,42 @@ fn select_follows_the_mode_table() {
     );
 }
 
+/// A stored `request_ref` config the writes should have refused (no
+/// `header`, or a header name that is not valid) is a misconfiguration:
+/// `Internal`, 500, whatever the request asks for.
+#[test]
+fn select_reports_a_bad_request_ref_config_as_internal() {
+    use toolkit_canonical_errors::CanonicalError;
+
+    let no_header = apikey(&[("credential_mode", "request_ref"), ("secret_ref", "d")]);
+    let bad_header = apikey(&[
+        ("header", "bad header"),
+        ("credential_mode", "request_ref"),
+        ("secret_ref", "d"),
+    ]);
+    for (label, auth) in [("no header", &no_header), ("invalid header", &bad_header)] {
+        for requested in [None, Some("r")] {
+            let err = select(
+                CredentialMode::RequestRef,
+                Some(auth),
+                requested.map(key),
+                "/i",
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{label}, {requested:?}: expected an error"));
+            let DomainError::Internal { message } = &err else {
+                panic!("{label}, {requested:?}: expected Internal, got {err:?}");
+            };
+            assert!(message.contains("invalid apikey auth config"), "{message}");
+            assert_eq!(
+                CanonicalError::from(err).status_code(),
+                500,
+                "{label}, {requested:?}"
+            );
+        }
+    }
+}
+
 fn injected(value: &str) -> InjectedSecret {
     InjectedSecret {
         header: HeaderName::from_static("authorization"),

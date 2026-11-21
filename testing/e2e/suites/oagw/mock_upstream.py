@@ -127,6 +127,12 @@ def _json_response(data: object, status: int = 200) -> bytes:
     ).encode() + body
 
 
+def _with_header(response: bytes, name: str, value: str) -> bytes:
+    """``response`` with one more header line after the status line."""
+    status_line, _, rest = response.partition(b"\r\n")
+    return status_line + f"\r\n{name}: {value}".encode() + b"\r\n" + rest
+
+
 def _sse_header() -> bytes:
     return (
         "HTTP/1.1 200 OK\r\n"
@@ -344,6 +350,11 @@ async def _handle(method: str, target: str, headers: dict, body: bytes, writer: 
                 "token_type": "Bearer",
             }))
 
+    # POST /oauth2/token-unavailable — a token endpoint whose identity
+    # provider is down.
+    elif method == "POST" and path == "/oauth2/token-unavailable":
+        writer.write(_json_response({"error": "temporarily_unavailable"}, status=503))
+
     # POST /echo
     elif method == "POST" and path == "/echo":
         writer.write(_json_response({
@@ -475,21 +486,23 @@ async def _handle(method: str, target: str, headers: dict, body: bytes, writer: 
         status = 503 if call <= int(m.group(2)) else 200
         writer.write(_json_response({"call": call, "status": status}, status=status))
 
-    # POST /echo-401-once — returns 401 on first call, 200 thereafter.
-    # Used to exercise the OAGW 401-retry logic.
-    elif method == "POST" and path == "/echo-401-once":
-        call = _bump_count("echo-401-once")
-        if call == 1:
-            writer.write(_json_response(
-                {"error": "invalid_token", "error_description": "token expired"},
-                status=401,
-            ))
-        else:
-            writer.write(_json_response({
-                "headers": headers,
-                "body": body.decode("utf-8", errors="replace"),
-                "call_number": call,
-            }))
+    # GET /drop — reads the request and closes the connection without an
+    # answer: the request reached the upstream, which then went away.
+    elif method == "GET" and path == "/drop":
+        return
+
+    # GET /busy — 503 with the upstream's own Retry-After.
+    elif method == "GET" and path == "/busy":
+        writer.write(_with_header(
+            _json_response({"error": "busy"}, status=503), "Retry-After", "120",
+        ))
+
+    # GET /challenge — 401 with the upstream's own WWW-Authenticate.
+    elif method == "GET" and path == "/challenge":
+        writer.write(_with_header(
+            _json_response({"error": "invalid_token"}, status=401),
+            "WWW-Authenticate", 'Bearer realm="mock", error="invalid_token"',
+        ))
 
     # GET /ws/echo — WebSocket echo endpoint
     # GET /ws/handshake — same, but first sends the handshake request headers

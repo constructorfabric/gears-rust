@@ -11,22 +11,57 @@ use toolkit_security::SecurityContext;
 // ---------------------------------------------------------------------------
 
 /// Errors returned by auth plugins.
+///
+/// The proxy maps every auth plugin's errors the same way: a missing secret
+/// is 401 `AUTH_CREDENTIAL_NOT_FOUND`, an unavailable credential store 503
+/// `CREDENTIAL_STORE_UNAVAILABLE`, an unavailable identity provider 503
+/// `IDENTITY_PROVIDER_UNAVAILABLE`, an invalid identity provider response
+/// 502, rejected credentials 401 `AUTH_PLUGIN_FAILED`, a
+/// misconfiguration 500 and any other plugin failure 401
+/// `AUTH_PLUGIN_INTERNAL`.
 #[domain_model]
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {
     /// The secret referenced by the named auth config key does not exist in
-    /// the credential store. Carries the key, never the reference (F0008).
-    #[error("secret referenced by auth.config.{0} not found")]
-    SecretNotFound(&'static str),
-    /// The plugin could not authenticate the outbound request.
+    /// the credential store, is not accessible to the tenant, or the
+    /// reference is invalid. Carries the key and the credential store's
+    /// error kind, never the reference (F0008).
+    #[error("secret referenced by auth.config.{key} not accessible: {kind}")]
+    SecretNotFound {
+        /// The auth config key holding the reference.
+        key: &'static str,
+        /// The credential store's error kind
+        /// (`credentials::credstore_error_kind`).
+        kind: &'static str,
+    },
+    /// The credential store failed or timed out. The detail names the
+    /// config key, never a reference or secret.
+    #[error("{detail}")]
+    CredentialStoreUnavailable {
+        /// What was unavailable.
+        detail: String,
+        /// The store's own retry hint, when it gave one.
+        retry_after: Option<std::time::Duration>,
+    },
+    /// The identity provider's token endpoint failed: transport error,
+    /// timeout, 408, 429 or 5xx. Never names a secret.
+    #[error("identity provider unavailable: {0}")]
+    IdpUnavailable(String),
+    /// The identity provider answered with a response the plugin cannot use
+    /// (unparseable, missing token, unsupported token type, unexpected
+    /// status).
+    #[error("invalid identity provider response: {0}")]
+    IdpInvalidResponse(String),
+    /// The plugin could not authenticate the outbound request: the
+    /// credentials were rejected.
     #[error("authentication failed: {0}")]
-    #[allow(dead_code)] // Part of plugin trait API; no current plugin constructs this.
     AuthFailed(String),
     /// A guard plugin rejected the request.
     #[error("request rejected: {0}")]
     #[allow(dead_code)] // Part of plugin trait API; no current plugin constructs this.
     Rejected(String),
-    /// The plugin's configuration is missing or malformed.
+    /// The plugin's configuration is missing or malformed, or the plugin
+    /// returned an output the gateway cannot send.
     #[error("invalid plugin configuration: {0}")]
     InvalidConfig(String),
     /// Unexpected internal failure inside the plugin.

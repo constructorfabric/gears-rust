@@ -473,10 +473,13 @@ The system **MUST** return the following error codes for proxy and management op
 | 404  | RouteNotFound        | No        |
 | 413  | PayloadTooLarge      | No        |
 | 429  | RateLimitExceeded    | Yes       |
-| 500  | SecretNotFound       | No        |
+| 401  | SecretNotFound (reason `AUTH_CREDENTIAL_NOT_FOUND`) | No |
+| 500  | Internal (including auth plugin misconfiguration) | No |
 | 502  | DownstreamError      | Depends   |
-| 503  | CircuitBreakerOpen   | Yes       |
+| 503  | CircuitBreakerOpen, UpstreamDisabled, CredentialStoreUnavailable, IdpUnavailable | Yes |
 | 504  | Timeout              | Yes       |
+
+A gateway 502, 503 or 504 from the upstream exchange **MUST** carry a `reason` that says whether the request may have reached the upstream (`REQUEST_NOT_SENT` or `REQUEST_MAY_HAVE_BEEN_SENT`), so a client can tell whether retrying a non-idempotent request is safe. A disabled upstream's 503 carries `UPSTREAM_DISABLED`.
 
 - **Rationale**: Consistent, well-defined error codes enable clients to implement correct retry and fallback behavior.
 - **Actors**: `cpt-cf-oagw-actor-app-developer`

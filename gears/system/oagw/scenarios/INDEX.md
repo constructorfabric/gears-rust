@@ -612,9 +612,9 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 - **Scenario**: [negative-7.4-well-known-header-validation-errors-400.md](proxy-api/request-transforms/negative-7.4-well-known-header-validation-errors-400.md)
 - **What happens**: Invalid `Content-Length` or mismatch with actual body returns `400 PD`.
 
-#### Maximum body size limit enforced (100MB) → 413
+#### Maximum body size limit enforced → 413
 - **Scenario**: [negative-8.1-maximum-body-size-limit-enforced.md](proxy-api/body-validation/negative-8.1-maximum-body-size-limit-enforced.md)
-- **What happens**: Body > 100MB rejected early with `413 PD`, `ESrc=gateway`.
+- **What happens**: The smaller of OAGW's `max_body_size_bytes` (default and maximum 100 MiB) and the api-gateway's `body_limit_bytes` (default 16 MiB) applies. Over OAGW's limit → `413 PD` (`PAYLOAD_TOO_LARGE`), `ESrc=gateway`, rejected early. Over the api-gateway's limit → `413` `about:blank` PD from the outer layer, no `ESrc`.
 
 #### Transfer-Encoding support limited to chunked → 400
 - **Scenario**: [negative-8.2-transfer-encoding-support-limited-chunked.md](proxy-api/body-validation/negative-8.2-transfer-encoding-support-limited-chunked.md)
@@ -634,7 +634,7 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 
 #### Disable upstream blocks proxy traffic → 503
 - **Scenario**: [negative-2.6-disable-upstream-blocks-proxy-traffic.md](management-api/upstreams/negative-2.6-disable-upstream-blocks-proxy-traffic.md)
-- **What happens**: With `enabled=false`, proxy returns `503 PD`, `ESrc=gateway`. Disabled in ancestor → disabled for descendants too.
+- **What happens**: With `enabled=false`, proxy returns `503 PD` (`service_unavailable`, reason `UPSTREAM_DISABLED`), `Retry-After: 300`, `ESrc=gateway`. Disabled in ancestor → disabled for descendants too.
 
 #### Alias uniqueness enforced per tenant → conflict
 - **Scenario**: [negative-2.8-alias-uniqueness-enforced-per-tenant.md](management-api/upstreams/negative-2.8-alias-uniqueness-enforced-per-tenant.md)
@@ -712,9 +712,13 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 - **Scenario**: [negative-4.4-plugin-type-enforcement.md](management-api/plugins/negative-4.4-plugin-type-enforcement.md)
 - **What happens**: Attaching `plugin.guard` where auth is expected fails at config validation (`400`).
 
-#### Secret access control via cred_store → 401/500
+#### Secret access control via cred_store → 401
 - **Scenario**: [negative-9.7-secret-access-control-cred-store.md](proxy-api/authentication/negative-9.7-secret-access-control-cred-store.md)
-- **What happens**: If `cred_store` denies access, proxy returns `401 AuthenticationFailed`. A missing secret is rejected when the upstream is written (`400 failed_precondition` naming the key); one deleted after the write returns `500 SecretNotFound`. Neither the response nor the server log contains the reference; they name the auth config key.
+- **What happens**: A missing secret is rejected when the upstream is written (`400 failed_precondition` naming the key). At proxy time a secret `cred_store` denies, or one deleted after the write, returns `401 PD` (`unauthenticated`, reason `AUTH_CREDENTIAL_NOT_FOUND`), for every auth plugin. A credential store outage is `503` (`CREDENTIAL_STORE_UNAVAILABLE`), an identity provider outage `503` (`IDENTITY_PROVIDER_UNAVAILABLE`, 9.11), an invalid identity provider response `502`, a plugin misconfiguration `500`. The response contains neither the reference nor the key; the server log names the key.
+
+#### OAuth2 identity provider unavailable → 503
+- **Scenario**: [negative-9.11-oauth2-identity-provider-unavailable.md](proxy-api/authentication/negative-9.11-oauth2-identity-provider-unavailable.md)
+- **What happens**: The OAuth2 token endpoint is unreachable, times out or answers `408`, `429` or `5xx`: `503` `service_unavailable`, reason `IDENTITY_PROVIDER_UNAVAILABLE`, `Retry-After: 5`. The upstream is not contacted. A credential store outage keeps `CREDENTIAL_STORE_UNAVAILABLE`.
 
 #### Descendant override permissions enforced → blocked
 - **Scenario**: [negative-9.9-descendant-override-permissions-enforced.md](proxy-api/authentication/negative-9.9-descendant-override-permissions-enforced.md)
@@ -734,7 +738,7 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 
 #### Circuit opens after consecutive failures → 503
 - **Scenario**: [negative-18.9-circuit-opens-after-consecutive-failures.md](rate-limiting/negative-18.9-circuit-opens-after-consecutive-failures.md)
-- **What happens**: After `failure_threshold` failures in a row (upstream `502`/`503`/`504`, connect, TLS or DNS errors, a timeout the upstream had its full budget for), requests fail fast with `503 PD` (`service_unavailable`), `ESrc=gateway` and `Retry-After` = time left until a probe, without reaching the upstream. Per replica, shared by every tenant on the upstream: SSRF refusals, gateway errors, client cancellations and timeouts after a slow CredStore read do not count.
+- **What happens**: After `failure_threshold` failures in a row (upstream `502`/`503`/`504`, connect, TLS or DNS errors, a timeout the upstream had its full budget for), requests fail fast with `503 PD` (`service_unavailable`, reason `REQUEST_NOT_SENT`), `ESrc=gateway` and `Retry-After` = time left until a probe, without reaching the upstream. Per replica, shared by every tenant on the upstream: SSRF refusals, gateway errors, client cancellations and timeouts after a slow CredStore read do not count.
 
 #### Spoofed forwarding headers → same IP bucket
 - **Scenario**: [negative-18.8-spoofed-forwarding-headers-keep-the-ip-bucket.md](rate-limiting/negative-18.8-spoofed-forwarding-headers-keep-the-ip-bucket.md)
@@ -796,7 +800,7 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 
 #### Upstream error passthrough with ESrc=upstream
 - **Scenario**: [negative-12.2-upstream-error-passthrough-esrc-upstream.md](protocols/http/negative-12.2-upstream-error-passthrough-esrc-upstream.md)
-- **What happens**: Upstream returns `500` with JSON body. OAGW keeps body intact, sets `ESrc=upstream`.
+- **What happens**: Upstream returns `500` with JSON body. OAGW keeps body intact, sets `ESrc=upstream`. The upstream's own `Retry-After` and `WWW-Authenticate` pass through unchanged.
 
 #### Gateway error uses PD + ESrc=gateway
 - **Scenario**: [negative-12.3-gateway-error-uses-pd-esrc-gateway.md](protocols/http/negative-12.3-gateway-error-uses-pd-esrc-gateway.md)
@@ -805,6 +809,14 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 #### No automatic retries for upstream failures
 - **Scenario**: [negative-12.6-no-automatic-retries-upstream-failures.md](protocols/http/negative-12.6-no-automatic-retries-upstream-failures.md)
 - **What happens**: Upstream transient `5xx` or connection close → OAGW returns error once. Upstream sees single request attempt.
+
+#### Transport failure before sending → REQUEST_NOT_SENT
+- **Scenario**: [negative-12.8-transport-failure-before-sending-request-not-sent.md](protocols/http/negative-12.8-transport-failure-before-sending-request-not-sent.md)
+- **What happens**: Connection refused or TLS handshake failure → `502 PD` (`service_unavailable`, reason `REQUEST_NOT_SENT`), `Retry-After: 5`, `ESrc=gateway`. DNS, SSRF and no-route failures are `503`, connect timeouts `504`, with the same reason. Any method can be retried.
+
+#### Transport failure after sending → REQUEST_MAY_HAVE_BEEN_SENT
+- **Scenario**: [negative-12.9-transport-failure-after-sending-request-may-have-been-sent.md](protocols/http/negative-12.9-transport-failure-after-sending-request-may-have-been-sent.md)
+- **What happens**: Upstream reads the request and closes without answering → `502 PD` (reason `REQUEST_MAY_HAVE_BEEN_SENT`), `ESrc=gateway`. Read/write errors, HTTP/2 and protocol errors are `502`, read and request timeouts `504`, with the same reason. Retry only idempotent requests.
 
 #### Scheme/protocol mismatches fail explicitly
 - **Scenario**: [negative-12.7-scheme-protocol-mismatches-fail-explicitly.md](protocols/http/negative-12.7-scheme-protocol-mismatches-fail-explicitly.md)
@@ -854,13 +866,17 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 - **Scenario**: *Section 24.3 — no separate file.*
 - **What happens**: `429`, `503 link unavailable`, `503 circuit breaker open`, `504` timeouts include `Retry-After`.
 
+#### Gateway 502/503/504 from the upstream exchange carry a dispatch reason
+- **Scenario**: [12.8](protocols/http/negative-12.8-transport-failure-before-sending-request-not-sent.md), [12.9](protocols/http/negative-12.9-transport-failure-after-sending-request-may-have-been-sent.md).
+- **What happens**: `context.reason` is `REQUEST_NOT_SENT` or `REQUEST_MAY_HAVE_BEEN_SENT`, set from the engine error kind; a failed resend after a first attempt the upstream may have processed is `REQUEST_MAY_HAVE_BEEN_SENT`. A disabled upstream's `503` carries `UPSTREAM_DISABLED`, a credential store outage `CREDENTIAL_STORE_UNAVAILABLE`, an OAuth2 identity provider outage `IDENTITY_PROVIDER_UNAVAILABLE`.
+
 #### Stream aborted classified distinctly
 - **Scenario**: *Section 24.4 — no separate file.*
 - **What happens**: Upstream read/write failure before the response head → `502 StreamAborted`. After the head no status can follow: the body is aborted instead (13.5).
 
 #### Every documented error type has at least one reproducer
 - **Scenario**: *Section 24.5 — no separate file.*
-- **What happens**: `ValidationError`, `RouteNotFound`, `AuthenticationFailed`, `PayloadTooLarge`, `RateLimitExceeded`, `SecretNotFound`, `ProtocolError`, `DownstreamError`, `StreamAborted`, `LinkUnavailable`, `CircuitBreakerOpen`, `ConnectionTimeout`, `RequestTimeout`, `IdleTimeout`, `PluginNotFound`, `PluginInUse` — each has at least one reproducer scenario.
+- **What happens**: `ValidationError`, `RouteNotFound`, `AuthenticationFailed`, `PayloadTooLarge`, `RateLimitExceeded`, `SecretNotFound` (401), `UpstreamDisabled`, `CredentialStoreUnavailable`, `IdpUnavailable`, `ProtocolError`, `DownstreamError`, `StreamAborted`, `LinkUnavailable`, `CircuitBreakerOpen`, `ConnectionTimeout`, `RequestTimeout`, `IdleTimeout`, `PluginNotFound`, `PluginInUse` — each has at least one reproducer scenario.
 
 ---
 
