@@ -433,6 +433,7 @@ The `#[resource_error("gts.cf.core.users.user.v1~")] struct UserResourceError;` 
 1. Pre-sets `resource_type` to the GTS identifier (e.g., `"gts.cf.core.users.user.v1~"`)
 2. Accepts a `detail` string describing the error occurrence
 3. For `not_found`, `already_exists`, and `data_loss`: requires `.with_resource(name)` before `.create()` to set the `resource_name`
+4. For `deadline_exceeded`: accepts an optional `.with_reason(code)` that sets `context.reason`
 
 **Responsibility boundaries**:
 
@@ -704,7 +705,7 @@ The `trace_id` and `instance` fields are **not** set by handler code. They are i
 **Middleware implementation example**:
 
 ```rust
-use cf_toolkit_errors::{CanonicalError, Problem};
+use toolkit_canonical_errors::{CanonicalError, Problem};
 use axum::http::{HeaderMap, Uri};
 
 // In error middleware layer:

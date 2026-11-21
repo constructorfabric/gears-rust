@@ -1,0 +1,13 @@
+error[E0599]: no method named `with_reason` found for struct `ResourceErrorBuilder<toolkit_canonical_errors::builder::ResourceOptional, toolkit_canonical_errors::builder::NoContext>` in the current scope
+  --> tests/ui/reason_only_on_deadline_exceeded.rs:12:10
+   |
+11 |       let _err = UserResourceError::unimplemented("Not implemented")
+   |  ________________-
+12 | |         .with_reason("UPSTREAM_NOT_CONTACTED")
+   | |         -^^^^^^^^^^^ method not found in `ResourceErrorBuilder<toolkit_canonical_errors::builder::ResourceOptional, toolkit_canonical_errors::builder::NoContext>`
+   | |_________|
+   |
+   |
+   = note: the method was found for
+           - `ResourceErrorBuilder<Resource, toolkit_canonical_errors::builder::NeedsReason>`
+           - `ResourceErrorBuilder<Resource, toolkit_canonical_errors::builder::OptionalReason>`

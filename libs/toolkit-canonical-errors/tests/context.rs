@@ -85,7 +85,44 @@ fn invalid_argument_constraint_serialization() {
 fn deadline_exceeded_serialization() {
     let ctx = DeadlineExceeded::new();
     let json = serde_json::to_value(&ctx).unwrap();
-    assert!(json.is_object());
+    assert_eq!(json, serde_json::json!({}));
+}
+
+#[test]
+fn deadline_exceeded_with_reason_serialization() {
+    let ctx = DeadlineExceeded::new().with_reason("REQUEST_MAY_HAVE_BEEN_SENT");
+    let json = serde_json::to_value(&ctx).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({ "reason": "REQUEST_MAY_HAVE_BEEN_SENT" })
+    );
+}
+
+#[test]
+fn deadline_exceeded_deserializes_without_reason() {
+    let ctx: DeadlineExceeded = serde_json::from_str("{}").unwrap();
+    assert!(ctx.reason.is_none());
+}
+
+#[test]
+fn an_empty_reason_is_none_on_the_wire() {
+    // Read: an empty wire value is no reason.
+    let ctx: DeadlineExceeded = serde_json::from_str(r#"{"reason":""}"#).unwrap();
+    assert!(ctx.reason.is_none());
+    let ctx: ServiceUnavailable =
+        serde_json::from_str(r#"{"retry_after_seconds":5,"reason":""}"#).unwrap();
+    assert!(ctx.reason.is_none());
+
+    // Write: an empty value set on the field directly is not sent.
+    let mut ctx = DeadlineExceeded::new();
+    ctx.reason = Some(String::new());
+    assert_eq!(serde_json::to_value(&ctx).unwrap(), serde_json::json!({}));
+    let mut ctx = ServiceUnavailable::new(Some(5));
+    ctx.reason = Some(String::new());
+    assert_eq!(
+        serde_json::to_value(&ctx).unwrap(),
+        serde_json::json!({ "retry_after_seconds": 5 })
+    );
 }
 
 #[test]
@@ -163,7 +200,24 @@ fn internal_serialization() {
 fn service_unavailable_serialization() {
     let ctx = ServiceUnavailable::new(Some(30));
     let json = serde_json::to_value(&ctx).unwrap();
-    assert_eq!(json["retry_after_seconds"], 30);
+    assert_eq!(json, serde_json::json!({ "retry_after_seconds": 30 }));
+}
+
+#[test]
+fn service_unavailable_with_reason_serialization() {
+    let ctx = ServiceUnavailable::new(Some(300)).with_reason("UPSTREAM_DISABLED");
+    let json = serde_json::to_value(&ctx).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({ "retry_after_seconds": 300, "reason": "UPSTREAM_DISABLED" })
+    );
+}
+
+#[test]
+fn service_unavailable_deserializes_without_reason() {
+    let ctx: ServiceUnavailable = serde_json::from_str(r#"{"retry_after_seconds":30}"#).unwrap();
+    assert_eq!(ctx.retry_after_seconds, Some(30));
+    assert!(ctx.reason.is_none());
 }
 
 #[test]

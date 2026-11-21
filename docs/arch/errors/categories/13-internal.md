@@ -18,7 +18,7 @@
 ## Constructor Example
 
 ```rust
-use cf_toolkit_errors::CanonicalError;
+use toolkit_canonical_errors::CanonicalError;
 
 let err = CanonicalError::internal("An internal error occurred. Please retry later.").create();
 ```

@@ -226,7 +226,7 @@ fn generate_resource_error(
             #vis fn deadline_exceeded(detail: impl Into<String>)
                 -> #crate_path::ResourceErrorBuilder<
                     #crate_path::builder::ResourceOptional,
-                    #crate_path::builder::NoContext,
+                    #crate_path::builder::OptionalReason,
                 >
             {
                 #crate_path::ResourceErrorBuilder::__deadline_exceeded(#gts_lit, detail)

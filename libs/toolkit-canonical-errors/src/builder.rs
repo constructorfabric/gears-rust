@@ -45,6 +45,8 @@ pub struct HasConstraintMessage(String);
 #[doc(hidden)]
 pub struct NeedsReason;
 #[doc(hidden)]
+pub struct OptionalReason;
+#[doc(hidden)]
 pub struct HasReason(String);
 
 // ---------------------------------------------------------------------------
@@ -99,6 +101,12 @@ impl ContextResolved for NoContext {
             constraint_message: None,
             reason: String::new(),
         }
+    }
+}
+
+impl ContextResolved for OptionalReason {
+    fn into_context_data(self) -> ContextData {
+        NoContext.into_context_data()
     }
 }
 
@@ -287,18 +295,6 @@ impl ResourceErrorBuilder<ResourceOptional, NoContext> {
     }
 
     #[doc(hidden)]
-    pub fn __deadline_exceeded(resource_type: &'static str, detail: impl Into<String>) -> Self {
-        ResourceErrorBuilder {
-            resource_type: Some(resource_type),
-            detail: detail.into(),
-            variant: ErrorVariant::DeadlineExceeded,
-            resource: ResourceOptional,
-            context: NoContext,
-            overrides: TransportOverrides::default(),
-        }
-    }
-
-    #[doc(hidden)]
     pub fn __unimplemented(resource_type: &'static str, detail: impl Into<String>) -> Self {
         ResourceErrorBuilder {
             resource_type: Some(resource_type),
@@ -306,6 +302,20 @@ impl ResourceErrorBuilder<ResourceOptional, NoContext> {
             variant: ErrorVariant::Unimplemented,
             resource: ResourceOptional,
             context: NoContext,
+            overrides: TransportOverrides::default(),
+        }
+    }
+}
+
+impl ResourceErrorBuilder<ResourceOptional, OptionalReason> {
+    #[doc(hidden)]
+    pub fn __deadline_exceeded(resource_type: &'static str, detail: impl Into<String>) -> Self {
+        ResourceErrorBuilder {
+            resource_type: Some(resource_type),
+            detail: detail.into(),
+            variant: ErrorVariant::DeadlineExceeded,
+            resource: ResourceOptional,
+            context: OptionalReason,
             overrides: TransportOverrides::default(),
         }
     }
@@ -616,10 +626,32 @@ impl<Resource> ResourceErrorBuilder<Resource, HasQuotaViolations> {
 }
 
 // ---------------------------------------------------------------------------
-// with_reason() — NeedsReason → HasReason
+// with_reason() — NeedsReason / OptionalReason → HasReason
 // ---------------------------------------------------------------------------
 
 impl<Resource> ResourceErrorBuilder<Resource, NeedsReason> {
+    #[must_use]
+    pub fn with_reason(
+        self,
+        reason: impl Into<String>,
+    ) -> ResourceErrorBuilder<Resource, HasReason> {
+        ResourceErrorBuilder {
+            resource_type: self.resource_type,
+            detail: self.detail,
+            variant: self.variant,
+            resource: self.resource,
+            context: HasReason(reason.into()),
+            overrides: self.overrides,
+        }
+    }
+}
+
+impl<Resource> ResourceErrorBuilder<Resource, OptionalReason> {
+    /// Attach a machine-readable reason code (e.g. `UPSTREAM_NOT_CONTACTED`),
+    /// sent as `context.reason`. Optional: without it, or with an empty
+    /// string, the context has no `reason` field. The code is sent in the
+    /// public response body: pass a fixed code, never caller input or secret
+    /// data.
     #[must_use]
     pub fn with_reason(
         self,
@@ -657,6 +689,7 @@ impl CanonicalError {
     pub fn service_unavailable() -> ServiceUnavailableBuilder {
         ServiceUnavailableBuilder {
             retry_after_seconds: None,
+            reason: None,
             detail: None,
             overrides: TransportOverrides::default(),
         }
@@ -695,9 +728,9 @@ where
             ErrorVariant::AlreadyExists => CanonicalError::__already_exists(AlreadyExists::new()),
             ErrorVariant::Aborted => CanonicalError::__aborted(Aborted::new(&ctx_data.reason)),
             ErrorVariant::Unknown => CanonicalError::__unknown(Unknown::new(&self.detail)),
-            ErrorVariant::DeadlineExceeded => {
-                CanonicalError::__deadline_exceeded(DeadlineExceeded::new())
-            }
+            ErrorVariant::DeadlineExceeded => CanonicalError::__deadline_exceeded(
+                DeadlineExceeded::new().with_reason(ctx_data.reason),
+            ),
             ErrorVariant::PermissionDenied => {
                 CanonicalError::__permission_denied(PermissionDenied::new(&ctx_data.reason))
             }
@@ -772,6 +805,7 @@ where
 
 pub struct ServiceUnavailableBuilder {
     retry_after_seconds: Option<u64>,
+    reason: Option<String>,
     detail: Option<String>,
     overrides: TransportOverrides,
 }
@@ -780,6 +814,17 @@ impl ServiceUnavailableBuilder {
     #[must_use]
     pub fn with_retry_after_seconds(mut self, seconds: u64) -> Self {
         self.retry_after_seconds = Some(seconds);
+        self
+    }
+
+    /// Attach a machine-readable reason code (e.g. `UPSTREAM_DISABLED`),
+    /// sent as `context.reason`. Optional: without it, or with an empty
+    /// string, the context has no `reason` field. The code is sent in the
+    /// public response body: pass a fixed code, never caller input or secret
+    /// data.
+    #[must_use]
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
         self
     }
 
@@ -817,10 +862,11 @@ impl ServiceUnavailableBuilder {
         let detail = self
             .detail
             .unwrap_or_else(|| "Service temporarily unavailable".to_owned());
-        let mut err = CanonicalError::__service_unavailable(ServiceUnavailable::new(
-            self.retry_after_seconds,
-        ))
-        .with_detail(detail);
+        let mut ctx = ServiceUnavailable::new(self.retry_after_seconds);
+        if let Some(reason) = self.reason {
+            ctx = ctx.with_reason(reason);
+        }
+        let mut err = CanonicalError::__service_unavailable(ctx).with_detail(detail);
         *err.transport_overrides_mut() = self.overrides;
 
         if let Some(status) = err.http_status_override() {
