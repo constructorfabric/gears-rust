@@ -5,13 +5,17 @@
 //! can hit and fails with an error that names the limit instead of letting the
 //! process run out of memory.
 
+use std::time::Duration;
+
 use crate::domain::error::DomainError;
 use crate::domain::ir::{Inline, ParsedBlock};
 
 const MIB: u64 = 1024 * 1024;
 
-/// Upper bounds on the work one document may cause.
+/// Upper bounds on the work one document may cause. Start from
+/// [`ParseLimits::default`] and change fields; new limits may be added.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ParseLimits {
     /// Entries in a ZIP container (DOCX, PPTX, XLSX).
     pub max_zip_entries: usize,
@@ -38,6 +42,13 @@ pub struct ParseLimits {
     pub max_html_nodes: usize,
     /// Pages of one PDF.
     pub max_pdf_pages: usize,
+    /// Characters pdfium reports on one PDF page.
+    pub max_pdf_chars_per_page: usize,
+    /// Wall-clock time one PDF may take, waiting for the PDF engine included.
+    /// It is checked between pdfium calls; a single call cannot be
+    /// interrupted, so a hostile document can run past it (see the PDF engine
+    /// module docs).
+    pub pdf_timeout: Duration,
     /// Text extracted from one document.
     pub max_text_bytes: usize,
 }
@@ -56,6 +67,8 @@ impl Default for ParseLimits {
             max_sheets: 1_000,
             max_html_nodes: 500_000,
             max_pdf_pages: 2_000,
+            max_pdf_chars_per_page: 200_000,
+            pdf_timeout: Duration::from_secs(60),
             max_text_bytes: 100 * 1024 * 1024,
         }
     }

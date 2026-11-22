@@ -75,7 +75,8 @@ base64 = { workspace = true }
 tempfile = { workspace = true }
 
 # Document parsing libraries
-kreuzberg = { workspace = true }
+pdfium-render = { workspace = true }
+parking_lot = { workspace = true }
 zip = { workspace = true }
 # `escape-html`: the HTML5 named character reference table.
 quick-xml = { workspace = true, features = ["escape-html"] }
@@ -97,3 +98,8 @@ toolkit = { workspace = true }
 toolkit-canonical-errors = { workspace = true, features = ["axum"] }
 toolkit-security = { workspace = true }
 toolkit-macros = { workspace = true }
+
+[build-dependencies]
+flate2 = { workspace = true }
+tar = { workspace = true }
+toolkit-security = { workspace = true }

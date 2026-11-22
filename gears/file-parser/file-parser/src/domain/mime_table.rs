@@ -4,7 +4,7 @@
 //! (`domain::service::FileParserService`) and every parser backend that
 //! needs to derive one from the other. It replaces three separately
 //! maintained tables that had already drifted (the gateway's own table, and
-//! the `KreuzbergParser`/`ImageParser` copies).
+//! the PDF/office backend's and `ImageParser`'s copies).
 
 /// `(extension, MIME type)` pairs. Extensions are lowercase, without the leading dot.
 const EXTENSION_MIME_TABLE: &[(&str, &str)] = &[

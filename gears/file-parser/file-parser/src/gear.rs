@@ -3,7 +3,7 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use toolkit::api::OpenApiRegistry;
 use toolkit::{Gear, GearCtx, RestApiCapability};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use file_parser_sdk::FileParserClientV1;
 
@@ -11,8 +11,8 @@ use crate::config::FileParserConfig;
 use crate::domain::local_client::FileParserLocalClient;
 use crate::domain::service::{FileParserService, ServiceConfig};
 use crate::infra::parsers::{
-    DocxParser, HtmlParser, ImageParser, KreuzbergParser, PlainTextParser, PptxParser,
-    SpreadsheetParser, StubParser,
+    DocxParser, HtmlParser, ImageParser, PdfParser, PlainTextParser, PptxParser, SpreadsheetParser,
+    StubParser,
 };
 
 /// Main gear struct for file parsing
@@ -206,13 +206,21 @@ impl Gear for FileParserGear {
             Arc::new(SpreadsheetParser::new().with_max_bytes(max_file_size_bytes)),
             Arc::new(HtmlParser::new().with_max_bytes(max_file_size_bytes)),
             Arc::new(PptxParser::new().with_max_bytes(max_file_size_bytes)),
-            Arc::new(KreuzbergParser::new()),
+            Arc::new(PdfParser::new().with_max_bytes(max_file_size_bytes)),
             Arc::new(DocxParser::new()),
             Arc::new(ImageParser::new()),
             Arc::new(StubParser::new().with_max_bytes(max_file_size_bytes)),
         ];
 
         info!("Registered {} parser backends", parsers.len());
+
+        // Bind libpdfium now, so a broken deployment shows in the startup log
+        // rather than as failures on the first PDF.
+        match tokio::task::spawn_blocking(crate::infra::parsers::pdf::check_engine).await {
+            Ok(Ok(())) => debug!("PDF engine ready"),
+            Ok(Err(e)) => warn!("PDF parsing is unavailable: {e}"),
+            Err(e) => warn!("PDF engine check did not finish: {e}"),
+        }
 
         // Canonicalize at startup so we only do it once.
         let allowed_local_base_dir = cfg.allowed_local_base_dir.canonicalize().map_err(|e| {

@@ -921,9 +921,12 @@ cfb = "0.16"
 # Legacy code pages (BIFF5 workbooks) and declared HTML charsets in file-parser.
 encoding_rs = "0.8"
 docx-rust = "0.1.11"
-# `bundled-pdfium` downloads a prebuilt libpdfium at build time rather than vendoring one;
-# Cargo.lock does not pin it. The version lives in .cargo/config.toml as PDFIUM_VERSION.
-kreuzberg = { version = "=4.10.4", features = ["pdf", "bundled-pdfium"] }
+# PDF text through libpdfium, which file-parser's build.rs downloads (pinned build,
+# SHA-256 verified) and embeds. The `pdfium_NNNN` feature must be the highest one not
+# above that build: default features select a newer API and fail to bind.
+pdfium-render = { version = "=0.9.5", default-features = false, features = ["pdfium_7881", "thread_safe"] }
+# Build-time only: unpacking the pdfium archive in file-parser's build.rs.
+tar = { version = "0.4", default-features = false }
 # Content-based file type detection (ONNX model, embedded weights). Used
 # only by file-parser's optional `magika` feature.
 magika = "1.1"
