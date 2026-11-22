@@ -124,6 +124,13 @@ pub(super) struct Glyph {
     pub(super) italic: bool,
 }
 
+/// The glyphs of one page and its visible area (left, bottom, right, top).
+#[derive(Debug, Default)]
+pub(super) struct PageGlyphs {
+    pub(super) glyphs: Vec<Glyph>,
+    pub(super) area: Option<[f32; 4]>,
+}
+
 /// What a document yields besides its pages.
 pub(super) struct DocumentInfo {
     pub(super) title: Option<String>,
@@ -133,7 +140,7 @@ pub(super) struct DocumentInfo {
 pub(super) fn read_document(
     bytes: &[u8],
     limits: &ParseLimits,
-    on_page: &mut dyn FnMut(Vec<Glyph>) -> Result<(), DomainError>,
+    on_page: &mut dyn FnMut(PageGlyphs) -> Result<(), DomainError>,
 ) -> Result<DocumentInfo, DomainError> {
     let deadline = Deadline::new(limits);
     let _guard = {
@@ -191,7 +198,7 @@ fn read_locked(
     bytes: &[u8],
     limits: &ParseLimits,
     deadline: &Deadline,
-    on_page: &mut dyn FnMut(Vec<Glyph>) -> Result<(), DomainError>,
+    on_page: &mut dyn FnMut(PageGlyphs) -> Result<(), DomainError>,
 ) -> Result<DocumentInfo, DomainError> {
     let document = pdfium
         .load_pdf_from_byte_slice(bytes, None)
@@ -213,7 +220,7 @@ fn read_locked(
             match page {
                 Some(page) => page_glyphs(&page, limits, deadline)?,
                 // An unreadable page reads as empty; the rest still count.
-                None => Vec::new(),
+                None => PageGlyphs::default(),
             }
         };
         on_page(glyphs)?;
@@ -225,9 +232,9 @@ fn page_glyphs(
     page: &PdfPage<'_>,
     limits: &ParseLimits,
     deadline: &Deadline,
-) -> Result<Vec<Glyph>, DomainError> {
+) -> Result<PageGlyphs, DomainError> {
     let Ok(text) = page.text() else {
-        return Ok(Vec::new());
+        return Ok(PageGlyphs::default());
     };
     let count = usize::try_from(text.len()).unwrap_or(0);
     if count > limits.max_pdf_chars_per_page {
@@ -292,7 +299,7 @@ fn page_glyphs(
             space_before = false;
         }
     }
-    Ok(glyphs)
+    Ok(PageGlyphs { glyphs, area })
 }
 
 /// A glyph for `c`, or `None` when it is not visible text: degenerate

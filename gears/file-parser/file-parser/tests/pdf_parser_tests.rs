@@ -32,6 +32,15 @@ fn text_of(block: &ParsedBlock) -> Option<String> {
                 })
                 .collect(),
         ),
+        // List items read as Markdown would show them.
+        ParsedBlock::ListItem { blocks, .. } => Some(format!(
+            "- {}",
+            blocks
+                .iter()
+                .filter_map(text_of)
+                .collect::<Vec<_>>()
+                .join(" ")
+        )),
         _ => None,
     }
 }
@@ -97,6 +106,12 @@ async fn empty_pages_keep_their_page_breaks() {
 async fn multilingual_lines_in_logical_order() {
     let doc = parse_fixture("test_file_two_pages_international.pdf").await;
     assert_eq!(page_breaks(&doc), 1);
+    let items = doc
+        .blocks
+        .iter()
+        .filter(|b| matches!(b, ParsedBlock::ListItem { ordered: false, .. }))
+        .count();
+    assert_eq!(items, 18, "the symbol lines are list items");
     let lines = all_lines(&doc);
     for expected in [
         "Multilingual UTF-8 Characters Test",

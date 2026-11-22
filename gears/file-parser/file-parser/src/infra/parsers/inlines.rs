@@ -103,6 +103,22 @@ impl Inlines {
         })
     }
 
+    /// Removes a hyphen that ends the text right after a letter (a word
+    /// broken across lines); returns whether it did.
+    pub fn drop_trailing_hyphen(&mut self) -> bool {
+        let Some(last) = self.runs.last_mut() else {
+            return false;
+        };
+        let text = run_text(last);
+        let mut tail = text.chars().rev();
+        let broken = tail.next().is_some_and(|c| matches!(c, '-' | '\u{2010}'))
+            && tail.next().is_some_and(char::is_alphabetic);
+        if broken {
+            text.pop();
+        }
+        broken
+    }
+
     /// The runs with leading and trailing whitespace removed; empty if
     /// nothing but whitespace was collected.
     pub fn take(&mut self) -> Vec<Inline> {

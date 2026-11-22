@@ -2,7 +2,8 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 use super::engine::{Deadline, Direction, Glyph, PDFIUM_LOCK, clean_title, guarded};
-use super::layout::{Line, page_lines, paragraphs};
+use super::layout::{Line, page_lines};
+use super::structure::{self, Page};
 use super::*;
 use crate::domain::ir::{Inline, InlineStyle};
 
@@ -86,6 +87,11 @@ fn lines_of(glyphs: Vec<Glyph>) -> Vec<Line> {
     page_lines(glyphs, &mut TextBudget::new(&ParseLimits::default())).expect("lines")
 }
 
+/// The blocks of a one-page document made of `lines`.
+fn paragraphs(lines: Vec<Line>) -> Vec<ParsedBlock> {
+    structure::blocks(vec![Page { lines, area: None }])
+}
+
 fn texts(lines: &[Line]) -> Vec<String> {
     lines.iter().map(Line::text).collect()
 }
@@ -128,7 +134,7 @@ fn wide_gaps_split_a_row_into_lines() {
     let lines = lines_of(glyphs);
     assert_eq!(texts(&lines), ["left", "right"]);
     // Two lines on one baseline are separate paragraphs.
-    assert_eq!(paragraphs(&lines), [para("left"), para("right")]);
+    assert_eq!(paragraphs(lines), [para("left"), para("right")]);
 }
 
 #[test]
@@ -256,7 +262,7 @@ fn paragraphs_follow_the_usual_line_pitch() {
         glyphs.extend(word_glyphs(&text, 72.0, *y, seq));
         seq += 10;
     }
-    let blocks = paragraphs(&lines_of(glyphs));
+    let blocks = paragraphs(lines_of(glyphs));
     assert_eq!(blocks, [para("line0\nline1\nline2"), para("line3\nline4")]);
 }
 
@@ -266,8 +272,8 @@ fn a_size_change_starts_a_paragraph() {
     glyphs.extend(word_glyphs("body one", 72.0, 700.0, 10));
     glyphs.extend(word_glyphs("body two", 72.0, 686.0, 20));
     assert_eq!(
-        paragraphs(&lines_of(glyphs)),
-        [para("Title"), para("body one\nbody two")]
+        paragraphs(lines_of(glyphs)),
+        [heading(1, "Title"), para("body one\nbody two")]
     );
 }
 
@@ -282,7 +288,7 @@ fn styles_become_runs() {
         ..InlineStyle::default()
     };
     assert_eq!(
-        paragraphs(&lines_of(glyphs)),
+        paragraphs(lines_of(glyphs)),
         [ParsedBlock::Paragraph {
             inlines: vec![Inline::styled("bold", bold), Inline::plain(" plain")]
         }]
@@ -416,7 +422,7 @@ fn block_texts(blocks: &[ParsedBlock]) -> Vec<String> {
     blocks
         .iter()
         .map(|b| match b {
-            ParsedBlock::Paragraph { inlines } => inlines
+            ParsedBlock::Paragraph { inlines } | ParsedBlock::Heading { inlines, .. } => inlines
                 .iter()
                 .map(|i| match i {
                     Inline::Text { text, .. }
@@ -432,17 +438,19 @@ fn block_texts(blocks: &[ParsedBlock]) -> Vec<String> {
 
 #[test]
 fn text_title_and_bold_from_a_real_pdf() {
-    let content =
-        "BT /F2 24 Tf 72 700 Td (Main Title) Tj ET BT /F1 12 Tf 72 660 Td (Body text here.) Tj ET";
+    let content = "BT /F1 12 Tf 72 700 Td (plain ) Tj /F2 12 Tf (bold) Tj ET";
     let doc = read(&pdf(&[(content, "")], Some(b"  Real Title  ")));
     assert_eq!(doc.title.as_deref(), Some("Real Title"));
-    assert_eq!(block_texts(&doc.blocks), ["Main Title", "Body text here."]);
-    let ParsedBlock::Paragraph { inlines } = &doc.blocks[0] else {
-        panic!("{:?}", doc.blocks);
+    let bold = InlineStyle {
+        bold: true,
+        ..InlineStyle::default()
     };
-    assert!(
-        matches!(&inlines[0], Inline::Text { style, .. } if style.bold),
-        "Helvetica-Bold is bold: {inlines:?}"
+    // Helvetica-Bold reports no weight; the font name makes it bold.
+    assert_eq!(
+        doc.blocks,
+        [ParsedBlock::Paragraph {
+            inlines: vec![Inline::plain("plain "), Inline::styled("bold", bold)]
+        }]
     );
 }
 
@@ -771,4 +779,710 @@ fn skewed_text_in_a_real_pdf() {
         block_texts(&doc.blocks),
         ["first line of skewed text here\nsecond line of skewed text here"]
     );
+}
+
+// --- structure ---------------------------------------------------------------------
+
+fn heading(level: u8, text: &str) -> ParsedBlock {
+    ParsedBlock::Heading {
+        level,
+        inlines: vec![Inline::plain(text)],
+    }
+}
+
+fn item(level: u8, ordered: bool, text: &str) -> ParsedBlock {
+    ParsedBlock::ListItem {
+        level,
+        ordered,
+        blocks: vec![para(text)],
+    }
+}
+
+/// A page of lines: each `(text, x, size)` on its own line, 14 pt apart
+/// below 700 (more for larger text).
+fn page_of(rows: &[(&str, f32, f32)]) -> Vec<Line> {
+    let mut glyphs = Vec::new();
+    let mut y = 700.0;
+    for (i, (text, x, size)) in rows.iter().enumerate() {
+        let seq = 1000 * u32::try_from(i).unwrap();
+        glyphs.extend(glyphs_with(text, *x, y, seq, *size, Direction::Deg0));
+        y -= 14.0_f32.max(size * 1.4);
+    }
+    lines_of(glyphs)
+}
+
+#[test]
+fn headings_follow_size_rank() {
+    let blocks = paragraphs(page_of(&[
+        ("Big Title", 72.0, 24.0),
+        ("Section One", 72.0, 16.0),
+        ("Body text that is long enough.", 72.0, 12.0),
+        ("More body text here.", 72.0, 12.0),
+        ("Section Two", 72.0, 16.0),
+        ("Final body line.", 72.0, 12.0),
+    ]));
+    assert_eq!(
+        blocks,
+        [
+            heading(1, "Big Title"),
+            heading(2, "Section One"),
+            para("Body text that is long enough.\nMore body text here."),
+            heading(2, "Section Two"),
+            para("Final body line."),
+        ]
+    );
+}
+
+#[test]
+fn large_text_that_reads_like_prose_is_not_a_heading() {
+    let blocks = paragraphs(page_of(&[
+        ("This sentence ends.", 72.0, 16.0),
+        ("lowercase start", 72.0, 16.0),
+        ("12 34 56", 72.0, 16.0),
+        ("body body body body", 72.0, 12.0),
+        ("body body body body", 72.0, 12.0),
+        ("body body body body", 72.0, 12.0),
+    ]));
+    assert!(
+        blocks
+            .iter()
+            .all(|b| !matches!(b, ParsedBlock::Heading { .. })),
+        "{blocks:?}"
+    );
+}
+
+#[test]
+fn a_heading_may_span_lines() {
+    let mut glyphs = glyphs_with("A Long Heading", 72.0, 700.0, 0, 18.0, Direction::Deg0);
+    glyphs.extend(glyphs_with(
+        "Over Two Lines",
+        72.0,
+        680.0,
+        100,
+        18.0,
+        Direction::Deg0,
+    ));
+    glyphs.extend(word_glyphs(
+        "Body text that carries the page.",
+        72.0,
+        650.0,
+        200,
+    ));
+    glyphs.extend(word_glyphs(
+        "Second body line of the page.",
+        72.0,
+        636.0,
+        300,
+    ));
+    assert_eq!(
+        paragraphs(lines_of(glyphs)),
+        [
+            heading(1, "A Long Heading Over Two Lines"),
+            para("Body text that carries the page.\nSecond body line of the page.")
+        ]
+    );
+}
+
+#[test]
+fn list_markers() {
+    let blocks = paragraphs(page_of(&[
+        ("Intro:", 72.0, 12.0),
+        ("\u{2022} bullet one", 72.0, 12.0),
+        ("- dash item", 72.0, 12.0),
+        ("1. first", 72.0, 12.0),
+        ("(2) second", 72.0, 12.0),
+        ("iv. roman", 72.0, 12.0),
+        ("a) letter", 72.0, 12.0),
+    ]));
+    assert_eq!(
+        blocks,
+        [
+            para("Intro:"),
+            item(0, false, "bullet one"),
+            item(0, false, "dash item"),
+            item(0, true, "first"),
+            item(0, true, "second"),
+            item(0, true, "roman"),
+            item(0, true, "letter"),
+        ]
+    );
+}
+
+#[test]
+fn years_bylines_and_rules_are_not_list_items() {
+    for text in [
+        "2020. was a year",
+        "A. Smith wrote this",
+        "1.5 percent",
+        "-dash",
+        "word \u{2022} inside",
+    ] {
+        let blocks = paragraphs(page_of(&[(text, 72.0, 12.0)]));
+        assert_eq!(blocks, [para(text)], "{text}");
+    }
+}
+
+#[test]
+fn list_levels_follow_indent_and_items_continue() {
+    let blocks = paragraphs(page_of(&[
+        ("\u{2022} top item", 72.0, 12.0),
+        ("continues here", 84.0, 12.0),
+        ("\u{2022} nested item", 92.0, 12.0),
+        ("\u{2022} back to top", 72.0, 12.0),
+    ]));
+    assert_eq!(
+        blocks,
+        [
+            item(0, false, "top item\ncontinues here"),
+            item(1, false, "nested item"),
+            item(0, false, "back to top"),
+        ]
+    );
+}
+
+#[test]
+fn standalone_rule_lines_are_rules_but_underlines_are_text() {
+    let rows = [
+        ("Title line", 700.0),
+        ("==========", 686.0),
+        ("Body after.", 640.0),
+        ("more body", 626.0),
+        ("and more", 612.0),
+        ("* * * * *", 570.0),
+        ("Last paragraph.", 530.0),
+        ("ends here", 516.0),
+    ];
+    let mut glyphs = Vec::new();
+    for (i, (text, y)) in rows.iter().enumerate() {
+        glyphs.extend(word_glyphs(text, 72.0, *y, 100 * u32::try_from(i).unwrap()));
+    }
+    assert_eq!(
+        paragraphs(lines_of(glyphs)),
+        [
+            para("Title line\n=========="),
+            para("Body after.\nmore body\nand more"),
+            ParsedBlock::HorizontalRule,
+            para("Last paragraph.\nends here"),
+        ]
+    );
+}
+
+#[test]
+fn hyphenated_words_are_joined() {
+    let blocks = paragraphs(page_of(&[
+        ("we hy-", 72.0, 12.0),
+        ("phenate words but keep long-", 72.0, 12.0),
+        ("Term compounds", 72.0, 12.0),
+    ]));
+    assert_eq!(
+        blocks,
+        [para("we hyphenate words but keep long-\nTerm compounds")]
+    );
+}
+
+/// A page with an area of 612 x 792 and lines at the given baselines.
+fn area_page(rows: &[(&str, f32)], seq_from: u32) -> Page {
+    let mut glyphs = Vec::new();
+    for (i, (text, y)) in rows.iter().enumerate() {
+        glyphs.extend(word_glyphs(
+            text,
+            72.0,
+            *y,
+            seq_from + 100 * u32::try_from(i).unwrap(),
+        ));
+    }
+    Page {
+        lines: lines_of(glyphs),
+        area: Some([0.0, 0.0, 612.0, 792.0]),
+    }
+}
+
+#[test]
+fn running_headers_and_page_numbers_are_dropped() {
+    let pages: Vec<Page> = (1..=4)
+        .map(|n| {
+            let number = n.to_string();
+            let body = format!("Body of page {n} with 12 in it.");
+            area_page(
+                &[
+                    ("ACME Report", 770.0),
+                    (body.as_str(), 400.0),
+                    (number.as_str(), 30.0),
+                ],
+                1000 * n,
+            )
+        })
+        .collect();
+    let blocks = structure::blocks(pages);
+    assert_eq!(count(&blocks, "ACME Report"), 1, "{blocks:?}");
+    assert_eq!(count(&blocks, "2"), 0, "{blocks:?}");
+    assert_eq!(count(&blocks, "Body of page 2 with 12 in it."), 1);
+}
+
+/// How many paragraphs read exactly `text`.
+fn count(blocks: &[ParsedBlock], text: &str) -> usize {
+    block_texts(blocks).iter().filter(|t| *t == text).count()
+}
+
+#[test]
+fn short_documents_keep_their_margins() {
+    let pages: Vec<Page> = (1..=2)
+        .map(|n| area_page(&[("Footer text", 30.0), ("Body.", 400.0)], 1000 * n))
+        .collect();
+    let blocks = structure::blocks(pages);
+    assert_eq!(count(&blocks, "Footer text"), 2);
+}
+
+#[test]
+fn two_columns_are_read_column_by_column() {
+    let mut glyphs = Vec::new();
+    for i in 0..6_u32 {
+        let y = 700.0 - 40.0 * f32::from(u16::try_from(i).unwrap());
+        glyphs.extend(word_glyphs(&format!("left {i}"), 72.0, y, 100 * i));
+        glyphs.extend(word_glyphs(&format!("right {i}"), 340.0, y, 100 * i + 50));
+    }
+    let page = Page {
+        lines: lines_of(glyphs),
+        area: Some([0.0, 0.0, 612.0, 792.0]),
+    };
+    let blocks = structure::blocks(vec![page]);
+    let order: Vec<String> = block_texts(&blocks);
+    let first_right = order.iter().position(|t| t.starts_with("right")).unwrap();
+    assert!(
+        order[..first_right].iter().all(|t| t.starts_with("left")),
+        "{order:?}"
+    );
+}
+
+#[test]
+fn overprinted_text_is_kept_once_and_bold() {
+    let mut glyphs = word_glyphs("Bold", 72.0, 700.0, 0);
+    let mut copy = word_glyphs("Bold", 72.2, 700.1, 10);
+    glyphs.append(&mut copy);
+    let lines = lines_of(glyphs);
+    assert_eq!(texts(&lines), ["Bold"]);
+    assert!(lines[0].runs.iter().all(|r| r.bold));
+}
+
+#[test]
+fn structure_from_a_real_pdf() {
+    let content = "BT /F2 24 Tf 72 700 Td (Main Title) Tj ET \
+        BT /F1 12 Tf 72 660 Td (This is body text that is long enough to wrap and we hy-) Tj 0 -14 Td (phenate a word across lines.) Tj ET \
+        BT /F1 12 Tf 72 600 Td (\\225 bullet item one) Tj 0 -14 Td (1. ordered item) Tj ET";
+    let doc = read(&pdf(&[(content, "")], None));
+    assert_eq!(
+        doc.blocks,
+        [
+            heading(1, "Main Title"),
+            para(
+                "This is body text that is long enough to wrap and we hyphenate a word across lines."
+            ),
+            item(0, false, "bullet item one"),
+            item(0, true, "ordered item"),
+        ]
+    );
+}
+
+#[test]
+fn side_by_side_labels_are_not_headings() {
+    let mut glyphs = glyphs_with("Label One", 72.0, 700.0, 0, 16.0, Direction::Deg0);
+    glyphs.extend(glyphs_with(
+        "Label Two",
+        300.0,
+        700.0,
+        50,
+        16.0,
+        Direction::Deg0,
+    ));
+    for i in 0..3_u32 {
+        let y = 670.0 - 14.0 * f32::from(u16::try_from(i).unwrap());
+        glyphs.extend(word_glyphs("body text body text", 72.0, y, 100 + 50 * i));
+    }
+    let blocks = paragraphs(lines_of(glyphs));
+    assert!(
+        blocks
+            .iter()
+            .all(|b| !matches!(b, ParsedBlock::Heading { .. })),
+        "{blocks:?}"
+    );
+}
+
+#[test]
+fn long_runs_of_large_lines_are_labels() {
+    let mut rows: Vec<(&str, f32, f32)> = vec![
+        ("Alpha", 72.0, 16.0),
+        ("Beta", 72.0, 16.0),
+        ("Gamma", 72.0, 16.0),
+        ("Delta", 72.0, 16.0),
+        ("Epsilon", 72.0, 16.0),
+    ];
+    rows.extend([("body text here", 72.0, 12.0); 6]);
+    let blocks = paragraphs(page_of(&rows));
+    assert!(
+        blocks
+            .iter()
+            .all(|b| !matches!(b, ParsedBlock::Heading { .. })),
+        "{blocks:?}"
+    );
+}
+
+#[test]
+fn only_three_heading_levels() {
+    let body = ("body text that is the body", 72.0, 12.0);
+    let blocks = paragraphs(page_of(&[
+        ("Level One", 72.0, 30.0),
+        ("Level Two", 72.0, 24.0),
+        body,
+        ("Level Three", 72.0, 20.0),
+        body,
+        ("Level Four", 72.0, 16.0),
+        body,
+        ("Level Two Again", 72.0, 24.0),
+        body,
+        ("Level Three Again", 72.0, 20.0),
+        body,
+        ("Level Four Again", 72.0, 16.0),
+        body,
+    ]));
+    let headings: Vec<&ParsedBlock> = blocks
+        .iter()
+        .filter(|b| matches!(b, ParsedBlock::Heading { .. }))
+        .collect();
+    assert_eq!(
+        headings,
+        [
+            &heading(1, "Level One"),
+            &heading(2, "Level Two"),
+            &heading(3, "Level Three"),
+            &heading(2, "Level Two Again"),
+            &heading(3, "Level Three Again"),
+        ]
+    );
+}
+
+#[test]
+fn rotated_and_hyphen_ended_lines_are_not_headings() {
+    let mut glyphs = glyphs_with("Side Label", 100.0, 40.0, 0, 18.0, Direction::Deg90);
+    glyphs.extend(glyphs_with(
+        "Broken Word-",
+        72.0,
+        700.0,
+        50,
+        18.0,
+        Direction::Deg0,
+    ));
+    for i in 0..3_u32 {
+        let y = 670.0 - 14.0 * f32::from(u16::try_from(i).unwrap());
+        glyphs.extend(word_glyphs("body text body text", 72.0, y, 100 + 50 * i));
+    }
+    let blocks = paragraphs(lines_of(glyphs));
+    assert!(
+        blocks
+            .iter()
+            .all(|b| !matches!(b, ParsedBlock::Heading { .. })),
+        "{blocks:?}"
+    );
+}
+
+// --- structure: review cases -------------------------------------------------------
+
+/// A page of `(text, x, y)` lines on a 612 x 792 area.
+fn page_at(rows: &[(&str, f32, f32)], seq_from: u32) -> Page {
+    let mut glyphs = Vec::new();
+    for (i, (text, x, y)) in rows.iter().enumerate() {
+        glyphs.extend(word_glyphs(
+            text,
+            *x,
+            *y,
+            seq_from + 100 * u32::try_from(i).unwrap(),
+        ));
+    }
+    Page {
+        lines: lines_of(glyphs),
+        area: Some([0.0, 0.0, 612.0, 792.0]),
+    }
+}
+
+#[test]
+fn numbers_in_the_margins_are_content_unless_they_count_pages() {
+    let pages: Vec<Page> = (1..=12_u32)
+        .map(|n| {
+            let page_no = format!("Page {n} of 12");
+            let bare = n.to_string();
+            let balance = format!("Balance carried forward {}.15", 10 + 11 * n);
+            page_at(
+                &[
+                    (page_no.as_str(), 250.0, 770.0),
+                    ("Body text of the page.", 72.0, 400.0),
+                    (balance.as_str(), 72.0, 40.0),
+                    ("1,123.10", 400.0, 40.0),
+                    (bare.as_str(), 300.0, 20.0),
+                ],
+                1000 * n,
+            )
+        })
+        .collect();
+    let blocks = structure::blocks(pages);
+    let texts = block_texts(&blocks);
+    assert!(texts.iter().all(|t| !t.starts_with("Page ")), "{texts:?}");
+    assert!(
+        !texts.contains(&"10".to_owned()) && !texts.contains(&"12".to_owned()),
+        "{texts:?}"
+    );
+    assert_eq!(
+        count(&blocks, "1,123.10"),
+        12,
+        "repeated figures are content"
+    );
+    assert_eq!(
+        texts
+            .iter()
+            .filter(|t| t.starts_with("Balance carried forward"))
+            .count(),
+        12,
+        "{texts:?}"
+    );
+}
+
+#[test]
+fn alternating_running_heads_are_dropped() {
+    let pages: Vec<Page> = (0..6_u32)
+        .map(|n| {
+            let head = if n % 2 == 0 {
+                "J. Smith and A. Jones"
+            } else {
+                "A Short Title"
+            };
+            page_at(
+                &[(head, 72.0, 770.0), ("Body text of the page.", 72.0, 400.0)],
+                1000 * n,
+            )
+        })
+        .collect();
+    let blocks = structure::blocks(pages);
+    assert_eq!(count(&blocks, "J. Smith and A. Jones"), 1);
+    assert_eq!(count(&blocks, "A Short Title"), 1);
+}
+
+/// Two columns of prose, `rows` lines each, from `top` down.
+fn two_columns(rows: u32, top: f32, seq_from: u32) -> Vec<(String, f32, f32)> {
+    let mut out = Vec::new();
+    for i in 0..rows {
+        let y = top - 14.0 * f32::from(u16::try_from(i).unwrap());
+        out.push((format!("left column prose line {i}"), 72.0, y));
+        out.push((format!("right column prose line {i}"), 330.0, y));
+    }
+    let _ = seq_from;
+    out
+}
+
+fn page_of_rows(rows: &[(String, f32, f32)]) -> Page {
+    let borrowed: Vec<(&str, f32, f32)> =
+        rows.iter().map(|(t, x, y)| (t.as_str(), *x, *y)).collect();
+    page_at(&borrowed, 0)
+}
+
+#[test]
+fn a_full_width_title_does_not_stop_column_reading() {
+    let mut rows = vec![(
+        "A title that spans the whole width of the page across both columns".to_owned(),
+        72.0,
+        740.0,
+    )];
+    rows.extend(two_columns(8, 700.0, 0));
+    let blocks = structure::blocks(vec![page_of_rows(&rows)]);
+    let texts = block_texts(&blocks).join("\n");
+    let last_left = texts.find("left column prose line 7").unwrap();
+    let first_right = texts.find("right column prose line 0").unwrap();
+    assert!(last_left < first_right, "{texts}");
+}
+
+#[test]
+fn label_and_amount_tables_stay_row_by_row() {
+    let mut rows = Vec::new();
+    for i in 0..12_u16 {
+        let y = 700.0 - 14.0 * f32::from(i);
+        rows.push((format!("Line item {i}"), 72.0, y));
+        rows.push((format!("{}.00", 1000 + i), 450.0, y));
+    }
+    let blocks = structure::blocks(vec![page_of_rows(&rows)]);
+    let texts = block_texts(&blocks);
+    let first_amount = texts.iter().position(|t| t.contains("1000.00")).unwrap();
+    assert!(
+        texts[..first_amount]
+            .iter()
+            .filter(|t| t.starts_with("Line item"))
+            .count()
+            <= 1,
+        "rows stay paired: {texts:?}"
+    );
+}
+
+#[test]
+fn a_column_heading_next_to_body_in_the_other_column_stays_a_heading() {
+    let mut rows = two_columns(10, 700.0, 0);
+    // A larger heading in the left column, level with a right-column line.
+    rows.retain(|(t, _, _)| t != "left column prose line 3");
+    let mut page = page_of_rows(&rows);
+    let title = glyphs_with("Related Work", 72.0, 658.0, 9000, 16.0, Direction::Deg0);
+    page.lines.extend(lines_of(title));
+    page.lines.sort_by(|a, b| {
+        b.baseline
+            .total_cmp(&a.baseline)
+            .then(a.left.total_cmp(&b.left))
+    });
+    let blocks = structure::blocks(vec![page]);
+    assert!(blocks.contains(&heading(1, "Related Work")), "{blocks:?}");
+}
+
+#[test]
+fn a_list_in_the_right_column_starts_at_level_zero() {
+    let blocks = paragraphs(page_of(&[
+        ("Intro text here:", 330.0, 12.0),
+        ("\u{2022} first", 330.0, 12.0),
+        ("\u{2022} second", 330.0, 12.0),
+    ]));
+    assert_eq!(blocks[1], item(0, false, "first"));
+}
+
+#[test]
+fn large_bullet_lines_are_list_items() {
+    let blocks = paragraphs(page_of(&[
+        ("Slide Title", 72.0, 32.0),
+        ("\u{2022} Revenue grew in all regions", 72.0, 24.0),
+        ("\u{2022} Costs stayed flat", 72.0, 24.0),
+        ("details below", 90.0, 18.0),
+        ("details below", 90.0, 18.0),
+        ("details below", 90.0, 18.0),
+    ]));
+    assert_eq!(blocks[0], heading(1, "Slide Title"));
+    assert!(
+        matches!(blocks[1], ParsedBlock::ListItem { .. }),
+        "{blocks:?}"
+    );
+}
+
+#[test]
+fn a_cover_page_does_not_use_up_heading_levels() {
+    let cover = Page {
+        lines: page_of(&[
+            ("Annual Report", 72.0, 36.0),
+            ("Company Name", 72.0, 24.0),
+            ("Year Edition", 72.0, 20.0),
+        ]),
+        area: None,
+    };
+    let section = |seq: &str| Page {
+        lines: page_of(&[
+            ("Overview", 72.0, 16.0),
+            (seq, 72.0, 12.0),
+            ("Market Position", 72.0, 13.5),
+            ("body text of the section body text", 72.0, 11.0),
+            ("body text of the section body text", 72.0, 11.0),
+            ("body text of the section body text", 72.0, 11.0),
+        ]),
+        area: None,
+    };
+    let blocks = structure::blocks(vec![
+        cover,
+        section("more body text here"),
+        section("more body text there"),
+    ]);
+    assert!(blocks.contains(&heading(1, "Annual Report")), "{blocks:?}");
+    assert!(
+        blocks.iter().any(|b| matches!(b, ParsedBlock::Heading { inlines, .. } if inlines == &[Inline::plain("Overview")])),
+        "{blocks:?}"
+    );
+    assert!(
+        blocks.iter().any(|b| matches!(b, ParsedBlock::Heading { inlines, .. } if inlines == &[Inline::plain("Market Position")])),
+        "{blocks:?}"
+    );
+}
+
+#[test]
+fn a_dash_wrapping_into_a_paragraph_is_not_a_list() {
+    let blocks = paragraphs(page_of(&[
+        ("The project was approved in spring", 72.0, 12.0),
+        (
+            "\u{2013} which had been delayed \u{2013} and started",
+            72.0,
+            12.0,
+        ),
+        ("soon after the review.", 72.0, 12.0),
+    ]));
+    assert_eq!(blocks.len(), 1, "{blocks:?}");
+    assert!(matches!(blocks[0], ParsedBlock::Paragraph { .. }));
+}
+
+#[test]
+fn first_line_indents_separate_paragraphs() {
+    let blocks = paragraphs(page_of(&[
+        ("First paragraph starts here and", 72.0, 12.0),
+        ("goes on for a while.", 72.0, 12.0),
+        ("Second paragraph is indented", 90.0, 12.0),
+        ("and continues at the margin.", 72.0, 12.0),
+    ]));
+    assert_eq!(
+        blocks,
+        [
+            para("First paragraph starts here and\ngoes on for a while."),
+            para("Second paragraph is indented\nand continues at the margin."),
+        ]
+    );
+}
+
+#[test]
+fn word_private_use_bullets_are_list_markers() {
+    let blocks = paragraphs(page_of(&[("\u{f0b7} item", 72.0, 12.0)]));
+    assert_eq!(blocks, [item(0, false, "item")]);
+}
+
+#[test]
+fn a_page_of_rotated_text_has_headings_and_a_stamp_does_not_break_rules() {
+    let mut glyphs = glyphs_with("Big Heading", 100.0, 300.0, 0, 20.0, Direction::Deg90);
+    for i in 0..3_u16 {
+        let y = 270.0 - 14.0 * f32::from(i);
+        glyphs.extend(glyphs_with(
+            "body text on a turned page",
+            100.0,
+            y,
+            100 + 50 * u32::from(i),
+            12.0,
+            Direction::Deg90,
+        ));
+    }
+    let blocks = paragraphs(lines_of(glyphs));
+    assert_eq!(blocks[0], heading(1, "Big Heading"));
+
+    let mut upright = Vec::new();
+    let rows = [
+        ("Body paragraph text.", 700.0),
+        ("more body", 686.0),
+        ("and more", 672.0),
+        ("* * * * *", 630.0),
+        ("After the rule.", 590.0),
+        ("ends here", 576.0),
+    ];
+    for (i, (text, y)) in rows.iter().enumerate() {
+        upright.extend(word_glyphs(text, 72.0, *y, 100 * u32::try_from(i).unwrap()));
+    }
+    upright.extend(glyphs_with(
+        "CONFIDENTIAL DRAFT",
+        300.0,
+        580.0,
+        5000,
+        12.0,
+        Direction::Deg270,
+    ));
+    let blocks = paragraphs(lines_of(upright));
+    assert!(blocks.contains(&ParsedBlock::HorizontalRule), "{blocks:?}");
+}
+
+#[test]
+fn a_soft_hyphen_at_a_line_end_joins_the_word() {
+    let blocks = paragraphs(page_of(&[
+        ("we hy\u{ad}", 72.0, 12.0),
+        ("phenate here", 72.0, 12.0),
+    ]));
+    assert_eq!(blocks, [para("we hyphenate here")]);
 }

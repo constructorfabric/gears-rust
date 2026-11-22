@@ -12,8 +12,6 @@
 use std::collections::HashMap;
 
 use crate::domain::error::DomainError;
-use crate::domain::ir::{InlineStyle, ParsedBlock};
-use crate::infra::parsers::inlines::Inlines;
 use crate::infra::parsers::limits::TextBudget;
 
 use super::engine::{Direction, Glyph};
@@ -52,7 +50,6 @@ pub(super) struct Line {
 }
 
 impl Line {
-    #[cfg(test)]
     pub(super) fn text(&self) -> String {
         self.runs.iter().map(|r| r.text.as_str()).collect()
     }
@@ -245,9 +242,10 @@ fn build_line(
     let (Some(first), Some(last)) = (glyphs.first(), glyphs.last()) else {
         return Ok(None);
     };
-    let mut tokens: Vec<Token> = Vec::with_capacity(glyphs.len());
+    let kept = without_overprint(glyphs);
+    let mut tokens: Vec<Token> = Vec::with_capacity(kept.len());
     let mut prev: Option<&Placed> = None;
-    for p in glyphs {
+    for &(p, overprinted) in &kept {
         if let Some(prev) = prev
             && needs_space(prev, p)
         {
@@ -257,8 +255,17 @@ fn build_line(
                 italic: prev.glyph.italic && p.glyph.italic,
             });
         }
-        push_normalized(&mut tokens, &p.glyph);
+        push_normalized(&mut tokens, &p.glyph, overprinted);
         prev = Some(p);
+    }
+    // A soft hyphen ending the line marks a word broken there: keep it as a
+    // hyphen so the paragraph can join the word.
+    if kept.last().is_some_and(|(p, _)| p.glyph.ch == '\u{ad}') {
+        tokens.push(Token {
+            ch: '-',
+            bold: false,
+            italic: false,
+        });
     }
     reorder_rtl(&mut tokens, ctx.rtl);
     let runs = runs(&tokens);
@@ -299,7 +306,8 @@ fn needs_space(prev: &Placed, next: &Placed) -> bool {
 
 /// Pushes the glyph's character, expanding ligatures and turning special
 /// spaces into plain ones.
-fn push_normalized(tokens: &mut Vec<Token>, glyph: &Glyph) {
+fn push_normalized(tokens: &mut Vec<Token>, glyph: &Glyph, overprinted: bool) {
+    let bold = glyph.bold || overprinted;
     let expanded: &str = match glyph.ch {
         '\u{fb00}' => "ff",
         '\u{fb01}' => "fi",
@@ -311,7 +319,7 @@ fn push_normalized(tokens: &mut Vec<Token>, glyph: &Glyph) {
         _ => {
             tokens.push(Token {
                 ch: glyph.ch,
-                bold: glyph.bold,
+                bold,
                 italic: glyph.italic,
             });
             return;
@@ -319,9 +327,28 @@ fn push_normalized(tokens: &mut Vec<Token>, glyph: &Glyph) {
     };
     tokens.extend(expanded.chars().map(|ch| Token {
         ch,
-        bold: glyph.bold,
+        bold,
         italic: glyph.italic,
     }));
+}
+
+/// The glyphs of a line without overprinted copies: a character drawn again
+/// within a third of a point (fake bold) is kept once and marked bold.
+fn without_overprint(glyphs: &[Placed]) -> Vec<(&Placed, bool)> {
+    let mut kept: Vec<(&Placed, bool)> = Vec::with_capacity(glyphs.len());
+    for p in glyphs {
+        let start = kept.len().saturating_sub(8);
+        let copy = kept.get_mut(start..).and_then(|recent| {
+            recent.iter_mut().find(|(k, _)| {
+                k.glyph.ch == p.glyph.ch && (k.x - p.x).abs() < 0.3 && (k.y - p.y).abs() < 0.3
+            })
+        });
+        match copy {
+            Some((_, bold)) => *bold = true,
+            None => kept.push((p, false)),
+        }
+    }
+    kept
 }
 
 fn is_cjk(ch: char) -> bool {
@@ -563,42 +590,7 @@ fn content_order_lines(
     Ok(())
 }
 
-/// The paragraphs of one page.
-pub(super) fn paragraphs(lines: &[Line]) -> Vec<ParsedBlock> {
-    let pitch = usual_pitch(lines);
-    let mut blocks = Vec::new();
-    let mut para = Inlines::default();
-    let mut prev: Option<&Line> = None;
-    for line in lines {
-        if let Some(prev) = prev {
-            if starts_paragraph(prev, line, pitch) {
-                flush(&mut para, &mut blocks);
-            } else {
-                para.push("\n", &InlineStyle::default(), None);
-            }
-        }
-        for run in &line.runs {
-            let style = InlineStyle {
-                bold: run.bold,
-                italic: run.italic,
-                ..InlineStyle::default()
-            };
-            para.push(&run.text, &style, None);
-        }
-        prev = Some(line);
-    }
-    flush(&mut para, &mut blocks);
-    blocks
-}
-
-fn flush(para: &mut Inlines, blocks: &mut Vec<ParsedBlock>) {
-    let inlines = para.take();
-    if !inlines.is_empty() {
-        blocks.push(ParsedBlock::Paragraph { inlines });
-    }
-}
-
-fn starts_paragraph(prev: &Line, line: &Line, pitch: Option<f32>) -> bool {
+pub(super) fn starts_paragraph(prev: &Line, line: &Line, pitch: Option<f32>) -> bool {
     if prev.direction != line.direction
         || line.direction == Direction::Other
         || (prev.size - line.size).abs() > SIZE_CHANGE
@@ -618,7 +610,7 @@ fn starts_paragraph(prev: &Line, line: &Line, pitch: Option<f32>) -> bool {
 
 /// The median distance between consecutive baselines of same-sized lines,
 /// ignoring gaps too wide to be line spacing.
-fn usual_pitch(lines: &[Line]) -> Option<f32> {
+pub(super) fn usual_pitch(lines: &[Line]) -> Option<f32> {
     let mut pitches: Vec<f32> = lines
         .windows(2)
         .filter_map(|w| match w {

@@ -1,13 +1,16 @@
 //! PDF documents, through libpdfium.
 //!
 //! [`engine`] reads each page's characters with their position, size,
-//! direction and font style; [`layout`] turns them into lines and paragraphs.
+//! direction and font style; [`layout`] turns them into lines and
+//! [`structure`] the lines of the whole document into headings, list items,
+//! rules and paragraphs.
 //! Pages are separated by page breaks, empty pages included, so page numbers
 //! can be recovered from the output. The title comes from the Info
 //! dictionary unless it is blank or a producer's placeholder.
 
 mod engine;
 mod layout;
+mod structure;
 #[cfg(test)]
 mod tests;
 
@@ -133,19 +136,19 @@ struct Pdf {
 
 fn read_pdf(bytes: &[u8], limits: &ParseLimits) -> Result<Pdf, DomainError> {
     let mut budget = TextBudget::new(limits);
-    let mut blocks = Vec::new();
-    let mut pages = 0_usize;
-    let info = engine::read_document(bytes, limits, &mut |glyphs| {
-        if pages > 0 {
-            blocks.push(ParsedBlock::PageBreak);
-        }
-        pages += 1;
-        let lines = layout::page_lines(glyphs, &mut budget)?;
-        blocks.extend(layout::paragraphs(&lines));
+    let mut pages = Vec::new();
+    // Lines, not glyphs, are kept across pages: structure needs the whole
+    // document (body size, running headers), and lines are charged as text.
+    let info = engine::read_document(bytes, limits, &mut |page| {
+        let lines = layout::page_lines(page.glyphs, &mut budget)?;
+        pages.push(structure::Page {
+            lines,
+            area: page.area,
+        });
         Ok(())
     })?;
     Ok(Pdf {
         title: info.title,
-        blocks,
+        blocks: structure::blocks(pages),
     })
 }
