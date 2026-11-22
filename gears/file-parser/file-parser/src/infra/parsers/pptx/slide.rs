@@ -539,7 +539,8 @@ impl Walker<'_, '_> {
             Some(run) => (run.style.clone(), run.link.as_deref()),
             None => (InlineStyle::default(), None),
         };
-        para.inlines.push(&clean_text(text), &style, link);
+        let added = para.inlines.push(&clean_text(text), &style, link);
+        self.budgets.text.charge(added)?;
         Ok(())
     }
 

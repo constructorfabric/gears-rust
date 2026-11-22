@@ -20,7 +20,7 @@ use zip::ZipArchive;
 
 use crate::domain::error::DomainError;
 
-use super::limits::{DepthGuard, ParseLimits, limit_exceeded};
+use super::limits::{DepthGuard, ParseLimits, is_limit, limit_exceeded};
 
 /// Longest part name or target echoed back in an error message; both come from
 /// the uploaded file.
@@ -245,6 +245,24 @@ pub fn core_title(archive: &mut Archive, part: &str) -> Result<Option<String>, D
     Ok((!title.is_empty()).then(|| title.to_owned()))
 }
 
+/// `result`, or an empty value when an optional part is malformed: a broken
+/// slide, layout, style or relationships part costs only its own content.
+/// Limit breaches still fail the document. `format` and `what` label the
+/// warning.
+pub fn tolerate<T: Default>(
+    result: Result<T, DomainError>,
+    format: &str,
+    what: &str,
+) -> Result<T, DomainError> {
+    match result {
+        Err(e) if !is_limit(&e) => {
+            tracing::warn!(error = %e, "{format}: skipping malformed {what} part");
+            Ok(T::default())
+        }
+        other => other,
+    }
+}
+
 fn budget_exceeded(max_total: u64) -> DomainError {
     limit_exceeded(
         "max_total_uncompressed_bytes",
@@ -354,6 +372,10 @@ impl Relationships {
             self.by_id.insert(rel.id.clone(), self.items.len());
             self.items.push(rel);
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
     }
 
     pub fn get(&self, id: &str) -> Option<&Relationship> {

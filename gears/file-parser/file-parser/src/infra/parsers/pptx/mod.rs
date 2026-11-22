@@ -27,7 +27,7 @@ use crate::domain::ir::{DocumentBuilder, Inline, ParsedBlock, ParsedDocument, Pa
 use crate::domain::parser::FileParserBackend;
 
 use super::bounded_read::read_bounded;
-use super::limits::{ParseLimits, is_limit};
+use super::limits::ParseLimits;
 use super::ooxml::{self, Archive, Events, Relationships, xml};
 use slide::{Budgets, SlideContext, read_slide};
 use styles::{Inherited, PartStyles, read_part_styles};
@@ -261,20 +261,12 @@ fn slide_parts(rels: &Relationships, ids: &[String]) -> Vec<(usize, String)> {
         .collect()
 }
 
-/// `result`, or an empty value when an optional part is malformed: a broken
-/// slide, layout or relationships part costs only its own content. Limit
-/// breaches still fail the document.
+/// `result`, or an empty value when an optional part is malformed.
 pub(super) fn tolerate<T: Default>(
     result: Result<T, DomainError>,
     what: &str,
 ) -> Result<T, DomainError> {
-    match result {
-        Err(e) if !is_limit(&e) => {
-            tracing::warn!(error = %e, "PPTX: skipping malformed {what} part");
-            Ok(T::default())
-        }
-        other => other,
-    }
+    ooxml::tolerate(result, "PPTX", what)
 }
 
 /// Layout and master styles, each part read once however many slides use it.

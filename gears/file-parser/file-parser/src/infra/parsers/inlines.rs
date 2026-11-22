@@ -56,9 +56,12 @@ pub struct Inlines {
 }
 
 impl Inlines {
-    pub fn push(&mut self, text: &str, style: &InlineStyle, link: Option<&str>) {
+    /// Appends `text`; returns the bytes taken by a new copy of the link
+    /// target, which the caller charges like text (one long target over many
+    /// differently styled runs would otherwise be stored once per run).
+    pub fn push(&mut self, text: &str, style: &InlineStyle, link: Option<&str>) -> usize {
         if text.is_empty() {
-            return;
+            return 0;
         }
         // Merge with the previous run when nothing but the text differs.
         match (self.runs.last_mut(), link) {
@@ -70,6 +73,7 @@ impl Inlines {
                 None,
             ) if s == style => {
                 prev.push_str(text);
+                0
             }
             (
                 Some(Inline::Link {
@@ -78,18 +82,31 @@ impl Inlines {
                     style: s,
                 }),
                 Some(l),
-            ) if s == style && target == l => prev.push_str(text),
-            _ => self.runs.push(match link {
-                Some(target) => Inline::Link {
-                    text: text.to_owned(),
-                    target: target.to_owned(),
-                    style: style.clone(),
-                },
-                None => Inline::Text {
-                    text: text.to_owned(),
-                    style: style.clone(),
-                },
-            }),
+            ) if s == style && target == l => {
+                prev.push_str(text);
+                0
+            }
+            _ => {
+                let (run, added) = match link {
+                    Some(target) => (
+                        Inline::Link {
+                            text: text.to_owned(),
+                            target: target.to_owned(),
+                            style: style.clone(),
+                        },
+                        target.len(),
+                    ),
+                    None => (
+                        Inline::Text {
+                            text: text.to_owned(),
+                            style: style.clone(),
+                        },
+                        0,
+                    ),
+                };
+                self.runs.push(run);
+                added
+            }
         }
     }
 
@@ -101,6 +118,18 @@ impl Inlines {
                 run;
             text.ends_with([' ', '\n'])
         })
+    }
+
+    /// The text collected so far, untrimmed.
+    pub fn text(&self) -> String {
+        self.runs
+            .iter()
+            .map(|run| match run {
+                Inline::Text { text, .. }
+                | Inline::Link { text, .. }
+                | Inline::Code { text, .. } => text.as_str(),
+            })
+            .collect()
     }
 
     /// Removes a hyphen that ends the text right after a letter (a word
@@ -126,7 +155,7 @@ impl Inlines {
         let mut start = 0;
         while let Some(run) = runs.get_mut(start) {
             let text = run_text(run);
-            let trimmed = text.trim_start_matches([' ', '\n']).to_owned();
+            let trimmed = text.trim_start_matches([' ', '\n', '\t']).to_owned();
             if trimmed.is_empty() {
                 start += 1;
             } else {
@@ -137,7 +166,7 @@ impl Inlines {
         runs.drain(..start);
         while let Some(last) = runs.last_mut() {
             let text = run_text(last);
-            let trimmed = text.trim_end_matches([' ', '\n']).to_owned();
+            let trimmed = text.trim_end_matches([' ', '\n', '\t']).to_owned();
             if trimmed.is_empty() {
                 runs.pop();
             } else {

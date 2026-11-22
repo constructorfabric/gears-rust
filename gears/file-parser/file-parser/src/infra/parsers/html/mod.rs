@@ -382,7 +382,8 @@ impl Converter {
                     text.remove(0);
                 }
                 self.charge(text.len())?;
-                para.push(&text, style, link);
+                let added = para.push(&text, style, link);
+                self.charge(added)?;
             }
             Node::Element(e) => {
                 let name = e.name();
@@ -393,12 +394,14 @@ impl Converter {
                     return self.flatten(node, style, link, para);
                 }
                 if name == "br" {
-                    para.push("\n", style, link);
+                    let added = para.push("\n", style, link);
+                    self.charge(added)?;
                 } else if self.inline_mode > 0 && name == "img" {
                     // An image in a heading reads as its alternative text.
                     if let Some(alt) = e.attr("alt").map(str::trim).filter(|a| !a.is_empty()) {
                         self.charge(alt.len())?;
-                        para.push(alt, style, link);
+                        let added = para.push(alt, style, link);
+                        self.charge(added)?;
                     }
                 } else if is_block(name) && self.inline_mode == 0 {
                     flush_paragraph(para, out);
@@ -407,7 +410,8 @@ impl Converter {
                     // Blocks in inline mode are word-separated containers.
                     let separate = is_block(name);
                     if separate && !para.ends_with_space() {
-                        para.push(" ", style, link);
+                        let added = para.push(" ", style, link);
+                        self.charge(added)?;
                     }
                     self.depth += 1;
                     let mut inner = style.clone();
@@ -429,7 +433,8 @@ impl Converter {
                         self.flow(child, &inner, link, para, out)?;
                     }
                     if separate && !para.ends_with_space() {
-                        para.push(" ", style, link);
+                        let added = para.push(" ", style, link);
+                        self.charge(added)?;
                     }
                     self.depth -= 1;
                 }
@@ -452,7 +457,8 @@ impl Converter {
         while let Some(item) = stack.pop() {
             let Some(current) = item else {
                 if !para.ends_with_space() {
-                    para.push(" ", style, link);
+                    let added = para.push(" ", style, link);
+                    self.charge(added)?;
                 }
                 continue;
             };
@@ -463,7 +469,8 @@ impl Converter {
                         text.remove(0);
                     }
                     self.charge(text.len())?;
-                    para.push(&text, style, link);
+                    let added = para.push(&text, style, link);
+                    self.charge(added)?;
                 }
                 Node::Element(e) => {
                     let name = e.name();
@@ -473,7 +480,8 @@ impl Converter {
                     let separate = is_block(name) || matches!(name, "br" | "td" | "th" | "tr");
                     if separate {
                         if !para.ends_with_space() {
-                            para.push(" ", style, link);
+                            let added = para.push(" ", style, link);
+                            self.charge(added)?;
                         }
                         stack.push(None);
                     }

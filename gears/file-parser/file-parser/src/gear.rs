@@ -207,7 +207,7 @@ impl Gear for FileParserGear {
             Arc::new(HtmlParser::new().with_max_bytes(max_file_size_bytes)),
             Arc::new(PptxParser::new().with_max_bytes(max_file_size_bytes)),
             Arc::new(PdfParser::new().with_max_bytes(max_file_size_bytes)),
-            Arc::new(DocxParser::new()),
+            Arc::new(DocxParser::new().with_max_bytes(max_file_size_bytes)),
             Arc::new(ImageParser::new()),
             Arc::new(StubParser::new().with_max_bytes(max_file_size_bytes)),
         ];

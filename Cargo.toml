@@ -920,7 +920,6 @@ zip = { version = "9.8", default-features = false, features = ["deflate-flate2-z
 cfb = "0.16"
 # Legacy code pages (BIFF5 workbooks) and declared HTML charsets in file-parser.
 encoding_rs = "0.8"
-docx-rust = "0.1.11"
 # PDF text through libpdfium, which file-parser's build.rs downloads (pinned build,
 # SHA-256 verified) and embeds. The `pdfium_NNNN` feature must be the highest one not
 # above that build: default features select a newer API and fail to bind.
