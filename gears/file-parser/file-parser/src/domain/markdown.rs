@@ -366,8 +366,13 @@ impl MarkdownRenderer {
         content
     }
 
+    /// Escapes pipes and backslashes, and turns line breaks into `<br/>`: a raw
+    /// newline would end the table row in the middle of the cell.
     fn escape_table_content(text: &str) -> String {
-        text.replace('\\', "\\\\").replace('|', "\\|")
+        text.replace('\\', "\\\\")
+            .replace('|', "\\|")
+            .replace("\r\n", "<br/>")
+            .replace(['\r', '\n'], "<br/>")
     }
 }
 
@@ -611,6 +616,14 @@ mod tests {
                         }],
                     }],
                 },
+                TableRow {
+                    is_header: false,
+                    cells: vec![TableCell {
+                        blocks: vec![ParsedBlock::Paragraph {
+                            inlines: vec![Inline::plain("Line one\nLine two\r\nLine three")],
+                        }],
+                    }],
+                },
             ],
         };
 
@@ -633,6 +646,8 @@ mod tests {
         // Pipes and backslashes should be escaped
         assert!(markdown.contains("Pipe\\|test"));
         assert!(markdown.contains("Backslash\\\\test"));
+        // A line break inside a cell must not end the table row
+        assert!(markdown.contains("| Line one<br/>Line two<br/>Line three |"));
     }
 
     #[test]

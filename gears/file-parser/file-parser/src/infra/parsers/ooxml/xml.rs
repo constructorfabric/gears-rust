@@ -43,8 +43,29 @@ pub fn qname<'a>(e: &'a BytesStart<'_>) -> &'a str {
 /// `r:id`, `Id`). Predefined entities and character references are resolved; a
 /// value with anything else is returned raw.
 pub fn attr(e: &BytesStart<'_>, name: &str) -> Option<String> {
+    find_attr(e, |key| key == name)
+}
+
+/// The element name without its prefix (`x:row` -> `row`). Only for parts
+/// whose elements of interest all share one namespace: `SpreadsheetML` parts
+/// are written both unprefixed and with an `x:` prefix.
+pub fn local_name<'a>(e: &'a BytesStart<'_>) -> &'a str {
+    let name = e.name().into_inner();
+    name.rsplit_once(':').map_or(name, |(_, local)| local)
+}
+
+/// The value of a *prefixed* attribute with local name `local`, whatever the
+/// prefix (`r:id`, `ns1:id`). Unprefixed attributes never match, so the
+/// relationship id stays apart from a plain `id`.
+pub fn prefixed_attr(e: &BytesStart<'_>, local: &str) -> Option<String> {
+    find_attr(e, |key| {
+        key.rsplit_once(':').is_some_and(|(_, l)| l == local)
+    })
+}
+
+fn find_attr(e: &BytesStart<'_>, matches: impl Fn(&str) -> bool) -> Option<String> {
     e.attributes().with_checks(false).flatten().find_map(|a| {
-        if a.key.into_inner() != name {
+        if !matches(a.key.into_inner()) {
             return None;
         }
         Some(match a.normalized_value(XmlVersion::Implicit1_0) {
@@ -151,5 +172,7 @@ mod tests {
         };
         assert_eq!(attr(&e, "r:id").as_deref(), Some("rId2"));
         assert_eq!(attr(&e, "id").as_deref(), Some("256"));
+        assert_eq!(prefixed_attr(&e, "id").as_deref(), Some("rId2"));
+        assert_eq!(local_name(&e), "sldId");
     }
 }

@@ -25,10 +25,13 @@ pub struct ParseLimits {
     pub ratio_check_floor_bytes: u64,
     /// Element nesting depth in XML and HTML.
     pub max_nesting_depth: usize,
-    /// Table cells across the whole document.
+    /// Table cells across the whole document. Each table is charged its full
+    /// rows x columns area, since that is what the output holds.
     pub max_table_cells: usize,
     /// Columns in one table.
     pub max_table_columns: usize,
+    /// Sheets (or slides) in one workbook (or presentation).
+    pub max_sheets: usize,
     /// Pages of one PDF.
     pub max_pdf_pages: usize,
     /// Text extracted from one document.
@@ -46,6 +49,7 @@ impl Default for ParseLimits {
             max_nesting_depth: 1024,
             max_table_cells: 100_000,
             max_table_columns: 16_384,
+            max_sheets: 1_000,
             max_pdf_pages: 2_000,
             max_text_bytes: 100 * 1024 * 1024,
         }
@@ -55,6 +59,42 @@ impl Default for ParseLimits {
 /// Error for a document that exceeds `limit`.
 pub(crate) fn limit_exceeded(limit: &str, detail: impl std::fmt::Display) -> DomainError {
     DomainError::parse_error(format!("document exceeds parser limit `{limit}`: {detail}"))
+}
+
+/// The document-wide table-cell allowance ([`ParseLimits::max_table_cells`]).
+#[derive(Debug)]
+pub(crate) struct TableBudget {
+    remaining: usize,
+    max_columns: usize,
+}
+
+impl TableBudget {
+    pub(crate) fn new(limits: &ParseLimits) -> Self {
+        Self {
+            remaining: limits.max_table_cells,
+            max_columns: limits.max_table_columns,
+        }
+    }
+
+    /// Cells still allowed.
+    pub(crate) fn remaining(&self) -> usize {
+        self.remaining
+    }
+
+    /// Charges a `rows` x `columns` table if it fits; returns `false` and charges
+    /// nothing otherwise (too wide, or more cells than remain).
+    pub(crate) fn try_charge(&mut self, rows: usize, columns: usize) -> bool {
+        if columns > self.max_columns {
+            return false;
+        }
+        match rows.checked_mul(columns) {
+            Some(cells) if cells <= self.remaining => {
+                self.remaining -= cells;
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Tracks element nesting while walking XML or a DOM.
@@ -91,6 +131,24 @@ impl DepthGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_budget_charges_area_and_refuses_what_does_not_fit() {
+        let limits = ParseLimits {
+            max_table_cells: 10,
+            max_table_columns: 4,
+            ..ParseLimits::default()
+        };
+        let mut budget = TableBudget::new(&limits);
+        assert!(budget.try_charge(2, 3));
+        assert_eq!(budget.remaining(), 4);
+        assert!(!budget.try_charge(5, 1), "more cells than remain");
+        assert!(!budget.try_charge(1, 5), "wider than the column limit");
+        assert!(!budget.try_charge(usize::MAX, 2), "overflowing area");
+        assert_eq!(budget.remaining(), 4, "refused tables cost nothing");
+        assert!(budget.try_charge(2, 2));
+        assert_eq!(budget.remaining(), 0);
+    }
 
     #[test]
     fn depth_guard_rejects_past_limit_and_recovers_on_leave() {

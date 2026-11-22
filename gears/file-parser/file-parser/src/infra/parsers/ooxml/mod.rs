@@ -166,6 +166,11 @@ impl Archive {
         }
     }
 
+    /// Whether the package has a part called `name`.
+    pub fn contains(&self, name: &str) -> bool {
+        self.index_of(name).is_some()
+    }
+
     /// The limits this archive was opened with.
     pub fn limits(&self) -> &ParseLimits {
         &self.limits
@@ -632,6 +637,14 @@ mod tests {
             err.to_string().contains("max_total_uncompressed_bytes"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn contains_is_case_insensitive() {
+        let bytes = test_zip::build(&[("xl/sheet.xml", b"<a/>")]);
+        let archive = Archive::open(bytes, "XLSX", &limits()).unwrap();
+        assert!(archive.contains("XL/SHEET.XML"));
+        assert!(!archive.contains("xl/other.xml"));
     }
 
     #[test]

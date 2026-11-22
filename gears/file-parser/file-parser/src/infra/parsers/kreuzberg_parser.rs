@@ -10,26 +10,20 @@ use super::ir_convert::result_to_blocks;
 
 /// Unified document parser backed by Kreuzberg.
 ///
-/// Replaces the previously separate `HtmlParser`, `PdfParser`, `XlsxParser`, and
-/// `PptxParser` with a single extraction pipeline that delegates all format-specific
-/// logic to Kreuzberg.
+/// Handles the formats not yet moved to file-parser's own parsers (spreadsheets
+/// moved to [`super::SpreadsheetParser`]).
 ///
 /// # Supported formats
 /// | Extension(s)           | MIME type                                                                    |
 /// |------------------------|------------------------------------------------------------------------------|
 /// | `pdf`                  | `application/pdf`                                                            |
 /// | `html`, `htm`          | `text/html`                                                                  |
-/// | `xlsx`                 | `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`          |
-/// | `xls`                  | `application/vnd.ms-excel`                                                   |
-/// | `xlsm`                 | `application/vnd.ms-excel.sheet.macroEnabled.12`                             |
-/// | `xlsb`                 | `application/vnd.ms-excel.sheet.binary.macroEnabled.12`                      |
 /// | `pptx`                 | `application/vnd.openxmlformats-officedocument.presentationml.presentation`  |
 pub struct KreuzbergParser;
 
 /// Extensions this backend can extract; standalone so `mime_for_ext` can
 /// filter against it too.
-const SUPPORTED_EXTENSIONS: &[&str] =
-    &["pdf", "html", "htm", "xlsx", "xls", "xlsm", "xlsb", "pptx"];
+const SUPPORTED_EXTENSIONS: &[&str] = &["pdf", "html", "htm", "pptx"];
 
 impl KreuzbergParser {
     #[must_use]
@@ -215,7 +209,10 @@ mod tests {
         let exts = parser.supported_extensions();
         assert!(exts.contains(&"pdf"));
         assert!(exts.contains(&"html"));
-        assert!(exts.contains(&"xlsx"));
+        assert!(
+            !exts.contains(&"xlsx"),
+            "spreadsheets moved to SpreadsheetParser"
+        );
         assert!(exts.contains(&"pptx"));
     }
 
@@ -227,10 +224,7 @@ mod tests {
         );
         assert_eq!(KreuzbergParser::mime_for_ext("html"), Some("text/html"));
         assert_eq!(KreuzbergParser::mime_for_ext("htm"), Some("text/html"));
-        assert_eq!(
-            KreuzbergParser::mime_for_ext("xlsx"),
-            Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        );
+        assert_eq!(KreuzbergParser::mime_for_ext("xlsx"), None);
         assert_eq!(
             KreuzbergParser::mime_for_ext("pptx"),
             Some("application/vnd.openxmlformats-officedocument.presentationml.presentation")

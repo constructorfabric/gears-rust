@@ -5,7 +5,7 @@
 // of parsing features like merged cells and formulas.
 
 use file_parser::domain::parser::FileParserBackend;
-use file_parser::infra::parsers::kreuzberg_parser::KreuzbergParser;
+use file_parser::infra::parsers::SpreadsheetParser;
 use std::path::PathBuf;
 
 mod common;
@@ -16,22 +16,22 @@ fn get_test_file_path(filename: &str) -> PathBuf {
 
 #[tokio::test]
 async fn test_xlsx_parser_basic_info() {
-    let parser = KreuzbergParser::new();
+    let parser = SpreadsheetParser::new();
 
-    assert_eq!(parser.id(), "kreuzberg");
+    assert_eq!(parser.id(), "spreadsheet");
     assert!(
         parser.supported_extensions().contains(&"xlsx"),
-        "KreuzbergParser should support xlsx extension"
+        "SpreadsheetParser should support xlsx extension"
     );
     assert!(
         parser.supported_extensions().contains(&"xls"),
-        "KreuzbergParser should support xls extension"
+        "SpreadsheetParser should support xls extension"
     );
 }
 
 #[tokio::test]
 async fn test_xlsx_parser_with_simple_file() {
-    let parser = KreuzbergParser::new();
+    let parser = SpreadsheetParser::new();
     let test_file = get_test_file_path("simple_data.xlsx");
 
     assert!(test_file.exists(), "test fixture missing: {test_file:?}");
@@ -61,7 +61,7 @@ async fn test_xlsx_parser_with_simple_file() {
 
 #[tokio::test]
 async fn test_xlsx_parser_with_multisheet_file() {
-    let parser = KreuzbergParser::new();
+    let parser = SpreadsheetParser::new();
     let test_file = get_test_file_path("multi_sheet.xlsx");
 
     assert!(test_file.exists(), "test fixture missing: {test_file:?}");
@@ -92,7 +92,7 @@ async fn test_xlsx_parser_with_multisheet_file() {
 
 #[tokio::test]
 async fn test_xlsx_parser_nonexistent_file() {
-    let parser = KreuzbergParser::new();
+    let parser = SpreadsheetParser::new();
     let test_file = PathBuf::from("/nonexistent/path/to/file.xlsx");
 
     let result = parser.parse_local_path(&test_file, None).await;
@@ -102,7 +102,7 @@ async fn test_xlsx_parser_nonexistent_file() {
 
 #[tokio::test]
 async fn test_xlsx_parser_invalid_xlsx_bytes() {
-    let parser = KreuzbergParser::new();
+    let parser = SpreadsheetParser::new();
     let invalid_bytes = bytes::Bytes::from_static(b"This is not a valid XLSX file content");
 
     let result = parser
@@ -114,7 +114,7 @@ async fn test_xlsx_parser_invalid_xlsx_bytes() {
 
 #[tokio::test]
 async fn test_xlsx_parser_parse_bytes() {
-    let parser = KreuzbergParser::new();
+    let parser = SpreadsheetParser::new();
     let test_file = get_test_file_path("simple_data.xlsx");
 
     assert!(test_file.exists(), "test fixture missing: {test_file:?}");
@@ -138,7 +138,7 @@ async fn test_xlsx_parser_parse_bytes() {
 
 #[tokio::test]
 async fn test_xlsx_parser_parse_bytes_unrecognized_format() {
-    let parser = KreuzbergParser::new();
+    let parser = SpreadsheetParser::new();
     // Random bytes that don't match any Excel magic bytes
     let invalid_bytes = bytes::Bytes::from_static(b"This is not a valid Excel file content");
 
@@ -152,7 +152,7 @@ async fn test_xlsx_parser_parse_bytes_unrecognized_format() {
 
 #[tokio::test]
 async fn test_xlsx_parser_parse_bytes_with_ole_magic_but_invalid() {
-    let parser = KreuzbergParser::new();
+    let parser = SpreadsheetParser::new();
     // OLE magic bytes (D0 CF 11 E0) but invalid content after
     let mut invalid_bytes = vec![0xD0, 0xCF, 0x11, 0xE0];
     invalid_bytes.extend_from_slice(b"invalid content after magic");
@@ -168,7 +168,7 @@ async fn test_xlsx_parser_parse_bytes_with_ole_magic_but_invalid() {
 
 #[tokio::test]
 async fn test_xlsx_parser_extracts_tables() {
-    let parser = KreuzbergParser::new();
+    let parser = SpreadsheetParser::new();
     let test_file = get_test_file_path("simple_data.xlsx");
 
     assert!(test_file.exists(), "test fixture missing: {test_file:?}");
@@ -191,7 +191,7 @@ async fn test_xlsx_parser_extracts_tables() {
 
 #[tokio::test]
 async fn test_xlsx_parser_merged_cells() {
-    let parser = KreuzbergParser::new();
+    let parser = SpreadsheetParser::new();
     let test_file = get_test_file_path("merged_cells.xlsx");
 
     assert!(test_file.exists(), "test fixture missing: {test_file:?}");
@@ -222,7 +222,7 @@ async fn test_xlsx_parser_merged_cells() {
 
     assert!(!tables.is_empty(), "Should have at least one table");
 
-    // Merged cells: Kreuzberg returns the value in the top-left cell of the merge.
+    // Merged cells: the value sits in the top-left cell of the merge.
     // Verify we can parse the file without errors and get the expected row count.
     let first_table = tables[0];
     assert!(
@@ -234,7 +234,7 @@ async fn test_xlsx_parser_merged_cells() {
 
 #[tokio::test]
 async fn test_xlsx_parser_formula_cells() {
-    let parser = KreuzbergParser::new();
+    let parser = SpreadsheetParser::new();
     let test_file = get_test_file_path("formula_cells.xlsx");
 
     assert!(test_file.exists(), "test fixture missing: {test_file:?}");
@@ -265,7 +265,7 @@ async fn test_xlsx_parser_formula_cells() {
 
     assert!(!tables.is_empty(), "Should have at least one table");
 
-    // Kreuzberg reads cached formula results from xlsx files.
+    // The parser reads cached formula results from xlsx files.
     // Note: Files created programmatically (e.g., openpyxl) without Excel
     // may not have cached values, resulting in empty cells for formulas.
     // Files saved by Excel will have computed values cached.
@@ -305,9 +305,134 @@ async fn test_xlsx_parser_formula_cells() {
     );
 
     // Formula text (starting with =) should NOT appear in output
-    // Kreuzberg returns either computed values or empty, never raw formula text
+    // Formula cells give either computed values or empty, never raw formula text
     assert!(
         !cell_texts.iter().any(|t| t.starts_with('=')),
         "Raw formula text should not appear in output, found cells: {cell_texts:?}"
     );
+}
+
+#[tokio::test]
+async fn test_xlsx_parser_one_heading_per_sheet() {
+    use file_parser::domain::ir::{Inline, ParsedBlock};
+
+    let parser = SpreadsheetParser::new();
+    let document = parser
+        .parse_local_path(&get_test_file_path("multi_sheet.xlsx"), None)
+        .await
+        .expect("multi_sheet.xlsx parses");
+    let headings: Vec<&str> = document
+        .blocks
+        .iter()
+        .filter_map(|b| match b {
+            ParsedBlock::Heading { inlines, .. } => match inlines.first() {
+                Some(Inline::Text { text, .. }) => Some(text.as_str()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    // Each sheet name exactly once, in workbook order.
+    assert_eq!(headings, ["Sales", "Inventory", "Summary"]);
+}
+
+#[tokio::test]
+async fn test_xlsx_parser_merged_header_keeps_top_left_value_only() {
+    use file_parser::domain::ir::{Inline, ParsedBlock};
+
+    let parser = SpreadsheetParser::new();
+    let document = parser
+        .parse_local_path(&get_test_file_path("merged_cells.xlsx"), None)
+        .await
+        .expect("merged_cells.xlsx parses");
+    let table = document
+        .blocks
+        .iter()
+        .find_map(|b| match b {
+            ParsedBlock::Table(t) => Some(t),
+            _ => None,
+        })
+        .expect("table");
+    let first_row: Vec<&str> = table.rows[0]
+        .cells
+        .iter()
+        .map(|c| match c.blocks.first() {
+            Some(ParsedBlock::Paragraph { inlines }) => match inlines.first() {
+                Some(Inline::Text { text, .. }) => text.as_str(),
+                _ => "",
+            },
+            _ => "",
+        })
+        .collect();
+    assert_eq!(first_row, ["Merged Header Title", "", ""]);
+}
+
+/// Legacy `.xls` files written by `LibreOffice` from the xlsx fixtures: the
+/// same tables must come out of the BIFF8 reader as out of the XLSX reader.
+mod legacy_xls {
+    use super::*;
+    use file_parser::domain::ir::{Inline, ParsedBlock};
+
+    fn xls(name: &str) -> PathBuf {
+        common::fixture_path("xls", name)
+    }
+
+    fn tables(document: &file_parser::domain::ir::ParsedDocument) -> Vec<Vec<Vec<String>>> {
+        document
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                ParsedBlock::Table(t) => Some(
+                    t.rows
+                        .iter()
+                        .map(|r| {
+                            r.cells
+                                .iter()
+                                .map(|c| match c.blocks.first() {
+                                    Some(ParsedBlock::Paragraph { inlines }) => {
+                                        match inlines.first() {
+                                            Some(Inline::Text { text, .. }) => text.clone(),
+                                            _ => String::new(),
+                                        }
+                                    }
+                                    _ => String::new(),
+                                })
+                                .collect()
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn multi_sheet_xls_matches_the_xlsx() {
+        let parser = SpreadsheetParser::new();
+        let from_xls = parser
+            .parse_local_path(&xls("multi_sheet.xls"), None)
+            .await
+            .expect("multi_sheet.xls parses");
+        let from_xlsx = parser
+            .parse_local_path(&get_test_file_path("multi_sheet.xlsx"), None)
+            .await
+            .expect("multi_sheet.xlsx parses");
+        assert_eq!(
+            from_xls.meta.content_type.as_deref(),
+            Some("application/vnd.ms-excel")
+        );
+        assert_eq!(tables(&from_xls), tables(&from_xlsx));
+    }
+
+    #[tokio::test]
+    async fn merged_and_formula_xls_parse() {
+        let parser = SpreadsheetParser::new();
+        for name in ["merged_cells.xls", "formula_cells.xls"] {
+            let document = parser
+                .parse_local_path(&xls(name), None)
+                .await
+                .unwrap_or_else(|e| panic!("{name} parses: {e}"));
+            assert!(!tables(&document).is_empty(), "{name} has a table");
+        }
+    }
 }
