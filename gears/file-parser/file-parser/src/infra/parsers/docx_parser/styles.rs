@@ -201,19 +201,30 @@ impl Styles {
             .or(self.default_paragraph.as_deref())
     }
 
-    /// What a paragraph style makes of its paragraphs.
-    pub(super) fn role(&self, given: Option<&str>) -> Role {
+    /// What a paragraph makes of itself: its direct outline level `outline`,
+    /// then its style chain nearest first, each style by its outline level or
+    /// else its name. An outline level of 9 or more is body text: it rules
+    /// out headings further along, not code or quotes.
+    pub(super) fn role(&self, given: Option<&str>, outline: Option<u8>) -> Role {
         let id = self.paragraph_style(given);
-        if let Some(outline) = self.chain(id).find_map(|s| s.outline) {
-            return heading_for(outline).map_or(Role::Body, Role::Heading);
-        }
-        for style in self.chain(id) {
-            match style.named {
-                Named::Heading(level) => return Role::Heading(level),
+        let mut headings = true;
+        let outlines = std::iter::once((outline, Named::Plain))
+            .chain(self.chain(id).map(|s| (s.outline, s.named)));
+        for (outline, named) in outlines {
+            match outline.map(heading_for) {
+                Some(Some(level)) if headings => return Role::Heading(level),
+                Some(None) => headings = false,
+                _ => {}
+            }
+            match named {
+                Named::Heading(level) if headings => return Role::Heading(level),
                 Named::Code => return Role::Code,
                 Named::Quote => return Role::Quote,
-                Named::Plain | Named::CodeChars => {}
+                Named::Heading(_) | Named::Plain | Named::CodeChars => {}
             }
+        }
+        if !headings {
+            return Role::Body;
         }
         // Last resort: built-in style ids ("Heading2"), even when the
         // styles part does not define them.

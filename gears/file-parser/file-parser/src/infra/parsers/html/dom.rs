@@ -1,17 +1,20 @@
 //! A small DOM built from [`Tokenizer`] output, in linear time.
 //!
 //! This is not the HTML standard's tree construction: there is no adoption
-//! agency, no foster parenting and no foreign-content handling. It applies
-//! the implicit closes that matter for text structure (a new `p`, `li`,
-//! `dt`/`dd`, `option`, cell or row closing the previous one), void elements,
-//! and end tags that close up to the matching open element. Elements nested
+//! agency, no foster parenting and, beyond self-closed `svg`/`math` content,
+//! no foreign-content handling. It applies the implicit closes that matter
+//! for text structure (a new `p`, `li`, `dt`/`dd`, `option`, cell or row
+//! closing the previous one, a missing `tr` around cells), void elements,
+//! and end tags that close up to the matching open element without crossing
+//! a table, cell or caption (only `</template>` and `</select>` do). Cells,
+//! captions and column groups outside a table are ignored. Elements nested
 //! deeper than [`MAX_TREE_DEPTH`] are left out of the tree but their content
 //! is kept in the deepest open element, so the tree stays shallow and the
 //! text survives. Every token is handled in amortized constant time.
 
 use std::collections::HashMap;
 
-use crate::domain::error::DomainError;
+use crate::domain::error::{DomainError, ParseLimit};
 use crate::infra::parsers::limits::limit_exceeded;
 
 use super::tokenize::{Token, Tokenizer};
@@ -53,6 +56,8 @@ struct Slot {
 /// The parsed document; node 0 is the root `html` element.
 pub(super) struct Dom {
     slots: Vec<Slot>,
+    /// The first `title` outside `svg` and `math`.
+    title: Option<usize>,
 }
 
 /// A node of a [`Dom`].
@@ -101,16 +106,20 @@ impl Dom {
         NodeRef { dom: self, id: 0 }
     }
 
-    /// The first element called `name`, in document order.
-    pub(super) fn find(&self, name: &str) -> Option<NodeRef<'_>> {
-        self.slots
-            .iter()
-            .position(|s| matches!(&s.node, Node::Element(e) if e.name == name))
-            .map(|id| NodeRef { dom: self, id })
+    /// The document title element: the first `title` outside `svg` and
+    /// `math`, whose titles name their graphics.
+    pub(super) fn title(&self) -> Option<NodeRef<'_>> {
+        self.title.map(|id| NodeRef { dom: self, id })
     }
 
     /// Builds the tree of `html`, allowing at most `max_nodes` nodes.
     pub(super) fn parse(html: &str, max_nodes: usize) -> Result<Self, DomainError> {
+        Ok(Builder::build(html, max_nodes)?.dom)
+    }
+}
+
+impl Builder {
+    fn build(html: &str, max_nodes: usize) -> Result<Self, DomainError> {
         let mut builder = Builder {
             dom: Dom {
                 slots: vec![Slot {
@@ -122,22 +131,43 @@ impl Dom {
                     last_child: None,
                     next_sibling: None,
                 }],
+                title: None,
             },
             stack: vec![0],
-            open: HashMap::new(),
+            segments: vec![Segment {
+                at: 0,
+                open: HashMap::new(),
+            }],
             scopes: Vec::new(),
+            foreign: 0,
+            templates: 0,
+            selects: 0,
             head_at: None,
             drop_next_text: false,
             max_nodes,
+            #[cfg(test)]
+            work: 0,
         };
-        for token in Tokenizer::new(html) {
+        let mut tokens = Tokenizer::new(html);
+        while let Some(token) = tokens.next() {
             match token {
                 Token::Text(text) => builder.text(text)?,
-                Token::Start { name, attrs } => builder.start(name, attrs)?,
+                Token::Start {
+                    name,
+                    attrs,
+                    self_closing,
+                } => {
+                    // A self-closed `<title/>` or `<style/>` in foreign
+                    // content has no text to read.
+                    if self_closing && builder.foreign > 0 {
+                        tokens.skip_raw_text();
+                    }
+                    builder.start(name, attrs, self_closing)?;
+                }
                 Token::End { name } => builder.end(&name)?,
             }
         }
-        Ok(builder.dom)
+        Ok(builder)
     }
 }
 
@@ -240,26 +270,56 @@ struct Builder {
     dom: Dom,
     /// Open elements, root first.
     stack: Vec<usize>,
-    /// How many elements of each name are open: end tags without a match are
-    /// ignored without searching the stack.
-    open: HashMap<String, usize>,
+    /// The open elements split at each open table, cell and caption. An end
+    /// tag closes only within the innermost segment, as in browsers, and
+    /// cells and rows close through anything left open inside them.
+    segments: Vec<Segment>,
     /// Open table, list and definition elements with their stack positions:
-    /// a new cell closes the nearest open cell even under unclosed inline
-    /// elements (`<td><font>a<td>b`), but not across a nested table.
+    /// a new item or term closes the nearest open one even under unclosed
+    /// inline elements (`<li><b>a<li>b`), but not across a nested list or
+    /// table.
     scopes: Vec<(Scope, usize)>,
+    /// Open `svg` and `math` elements.
+    foreign: usize,
+    /// Open `template` and `select` elements, whose end tags close across
+    /// segments.
+    templates: usize,
+    selects: usize,
     /// Stack position of an open `head`, which closes implicitly.
     head_at: Option<usize>,
     /// The next text token is the content of a raw-text element left out of
     /// the tree (too deep) and is not document text.
     drop_next_text: bool,
     max_nodes: usize,
+    /// Stack entries looked at, for tests of the cost.
+    #[cfg(test)]
+    work: usize,
+}
+
+/// Open elements from one table, cell or caption (at stack position `at`)
+/// up to the next.
+struct Segment {
+    at: usize,
+    /// How many elements of each name are open in the segment, its first
+    /// element not counted: end tags without a match are ignored without
+    /// searching the stack.
+    open: HashMap<String, usize>,
+}
+
+impl Segment {
+    fn has(&self, name: &str) -> bool {
+        self.open.get(name).is_some_and(|&n| n > 0)
+    }
+}
+
+/// Elements that start a segment.
+fn starts_segment(name: &str) -> bool {
+    matches!(name, "table" | "td" | "th" | "caption")
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scope {
     Table,
-    Section,
-    Row,
     Cell,
     List,
     Item,
@@ -270,8 +330,6 @@ enum Scope {
 fn scope_of(name: &str) -> Option<Scope> {
     Some(match name {
         "table" => Scope::Table,
-        "thead" | "tbody" | "tfoot" => Scope::Section,
-        "tr" => Scope::Row,
         "td" | "th" => Scope::Cell,
         "ul" | "ol" | "menu" | "dir" => Scope::List,
         "li" => Scope::Item,
@@ -323,7 +381,7 @@ impl Builder {
     fn append(&mut self, node: Node) -> Result<usize, DomainError> {
         if self.dom.slots.len() >= self.max_nodes {
             return Err(limit_exceeded(
-                "max_html_nodes",
+                ParseLimit::MaxHtmlNodes,
                 format!("more than {} elements and text nodes", self.max_nodes),
             ));
         }
@@ -370,10 +428,26 @@ impl Builder {
         if self.stack.len() > 1
             && let Some(id) = self.stack.pop()
         {
+            #[cfg(test)]
+            {
+                self.work += 1;
+            }
             let position = self.stack.len();
-            let name = self.name_of(id).to_owned();
-            if let Some(n) = self.open.get_mut(&name) {
+            // Fields borrowed apart, so the name is not copied.
+            let name = match &self.dom.slots[id].node {
+                Node::Element(e) => e.name.as_str(),
+                Node::Text(_) => "",
+            };
+            if self.segments.len() > 1 && self.segments.last().is_some_and(|s| s.at == position) {
+                self.segments.pop();
+            } else if let Some(n) = self.segments.last_mut().and_then(|s| s.open.get_mut(name)) {
                 *n = n.saturating_sub(1);
+            }
+            match name {
+                "svg" | "math" => self.foreign = self.foreign.saturating_sub(1),
+                "template" => self.templates = self.templates.saturating_sub(1),
+                "select" => self.selects = self.selects.saturating_sub(1),
+                _ => {}
             }
             if self.scopes.last().is_some_and(|&(_, at)| at == position) {
                 self.scopes.pop();
@@ -400,10 +474,45 @@ impl Builder {
         }
     }
 
+    /// The name of the element that starts the innermost segment.
+    fn segment_name(&self) -> &str {
+        let at = self.segments.last().map_or(0, |s| s.at);
+        self.stack.get(at).map_or("", |&id| self.name_of(id))
+    }
+
+    /// Closes an open cell or caption with everything open inside it.
+    fn close_cell_or_caption(&mut self) {
+        if matches!(self.segment_name(), "td" | "th" | "caption")
+            && let Some(at) = self.segments.last().map(|s| s.at)
+        {
+            self.pop_to(at);
+        }
+    }
+
+    /// Closes the innermost element named one of `names` if the innermost
+    /// segment has one open, with everything above it.
+    fn close_in_segment(&mut self, names: &[&str]) {
+        if !self
+            .segments
+            .last()
+            .is_some_and(|s| names.iter().any(|n| s.has(n)))
+        {
+            return;
+        }
+        while self.stack.len() > 1 {
+            let matched = names.contains(&self.name_of(self.top()));
+            self.pop();
+            if matched {
+                break;
+            }
+        }
+    }
+
     fn start(
         &mut self,
         name: String,
         attrs: Vec<(&'static str, String)>,
+        self_closing: bool,
     ) -> Result<(), DomainError> {
         if name == "html" {
             // Attributes of a repeated html tag go to the root.
@@ -424,15 +533,35 @@ impl Builder {
             self.pop_to(head);
         }
         match name.as_str() {
-            "td" | "th" => self.close_scope(Scope::Cell),
-            "tr" => {
-                self.close_scope(Scope::Cell);
-                self.close_scope(Scope::Row);
+            // Outside a table these are ignored, as in browsers, and their
+            // content stays in the open element; a cell still separates words.
+            "td" | "th" | "caption" | "colgroup" if self.segments.len() == 1 => {
+                if separates_words(&name) {
+                    self.text(" ".to_owned())?;
+                }
+                return Ok(());
             }
-            "thead" | "tbody" | "tfoot" => {
-                self.close_scope(Scope::Cell);
-                self.close_scope(Scope::Row);
-                self.close_scope(Scope::Section);
+            "td" | "th" => {
+                self.close_cell_or_caption();
+                self.close_in_segment(&["colgroup"]);
+                // A cell right in a table gets the row it is missing.
+                if self.segment_name() == "table"
+                    && !self.segments.last().is_some_and(|s| s.has("tr"))
+                {
+                    self.start("tr".to_owned(), Vec::new(), false)?;
+                }
+            }
+            "tr" => {
+                self.close_cell_or_caption();
+                self.close_in_segment(&["colgroup"]);
+                self.close_in_segment(&["tr"]);
+            }
+            // A caption or column group also goes right in the table.
+            "thead" | "tbody" | "tfoot" | "colgroup" | "caption" => {
+                self.close_cell_or_caption();
+                self.close_in_segment(&["colgroup"]);
+                self.close_in_segment(&["tr"]);
+                self.close_in_segment(&["thead", "tbody", "tfoot"]);
             }
             "li" => self.close_scope(Scope::Item),
             "dt" | "dd" => self.close_scope(Scope::Def),
@@ -441,7 +570,9 @@ impl Builder {
         while self.stack.len() > 1 && closes(&name, self.name_of(self.top())) {
             self.pop();
         }
-        let void = is_void(&name);
+        // In `svg` and `math`, `/>` closes any element.
+        let void = is_void(&name)
+            || (self_closing && (self.foreign > 0 || matches!(name.as_str(), "svg" | "math")));
         let too_deep = self.stack.len() >= MAX_TREE_DEPTH;
         if too_deep && !void {
             // Left out of the tree; its content goes to the deepest element,
@@ -456,6 +587,9 @@ impl Builder {
             name: name.clone(),
             attrs,
         }))?;
+        if name == "title" && self.foreign == 0 && self.dom.title.is_none() {
+            self.dom.title = Some(id);
+        }
         if !void {
             let position = self.stack.len();
             if let Some(scope) = scope_of(&name) {
@@ -464,7 +598,20 @@ impl Builder {
             if name == "head" && self.head_at.is_none() {
                 self.head_at = Some(position);
             }
-            *self.open.entry(name).or_insert(0) += 1;
+            match name.as_str() {
+                "svg" | "math" => self.foreign += 1,
+                "template" => self.templates += 1,
+                "select" => self.selects += 1,
+                _ => {}
+            }
+            if starts_segment(&name) {
+                self.segments.push(Segment {
+                    at: position,
+                    open: HashMap::new(),
+                });
+            } else if let Some(segment) = self.segments.last_mut() {
+                *segment.open.entry(name).or_insert(0) += 1;
+            }
             self.stack.push(id);
         }
         Ok(())
@@ -474,23 +621,62 @@ impl Builder {
         self.drop_next_text = false;
         // `</br>` is a line break, as in browsers.
         if name == "br" {
-            return self.start("br".to_owned(), Vec::new());
+            return self.start("br".to_owned(), Vec::new(), false);
         }
-        if self.open.get(name).copied().unwrap_or(0) == 0 {
-            // The end of a block left out of the tree (too deep) still
-            // separates words.
-            if self.stack.len() >= MAX_TREE_DEPTH && separates_words(name) {
-                self.text(" ".to_owned())?;
+        // A table or cell left open in a template or select ends with it.
+        let open = match name {
+            "template" => self.templates,
+            "select" => self.selects,
+            _ => 0,
+        };
+        if open > 0 {
+            while self.stack.len() > 1 {
+                let matched = self.name_of(self.top()) == name;
+                self.pop();
+                if matched {
+                    break;
+                }
             }
             return Ok(());
         }
-        while self.stack.len() > 1 {
-            let top = self.top();
-            let matched = self.name_of(top) == name;
-            self.pop();
-            if matched {
-                break;
+        while let Some(segment) = self.segments.last() {
+            let at = segment.at;
+            #[cfg(test)]
+            {
+                self.work += 1;
             }
+            if segment.has(name) {
+                self.close_in_segment(&[name]);
+                return Ok(());
+            }
+            let first = self.segment_name();
+            if at > 0 && first == name {
+                self.pop_to(at);
+                return Ok(());
+            }
+            // The end of a row, section or table closes an open cell first,
+            // and the end of a table an open caption, if the element is open
+            // in the enclosing segment.
+            let through = match first {
+                "td" | "th" => matches!(name, "tr" | "tbody" | "thead" | "tfoot" | "table"),
+                "caption" => name == "table",
+                _ => false,
+            };
+            let outer = self.segments.len().checked_sub(2).and_then(|i| {
+                let outer = self.segments.get(i)?;
+                Some((outer.has(name), self.stack.get(outer.at).copied()?))
+            });
+            match outer {
+                Some((open, first_id)) if through && (open || self.name_of(first_id) == name) => {
+                    self.pop_to(at);
+                }
+                _ => break,
+            }
+        }
+        // Ignored. The end of a block left out of the tree (too deep) still
+        // separates words.
+        if self.stack.len() >= MAX_TREE_DEPTH && separates_words(name) {
+            self.text(" ".to_owned())?;
         }
         Ok(())
     }
@@ -565,9 +751,15 @@ mod tests {
 
     #[test]
     fn unmatched_end_tags_cost_nothing() {
-        let html = format!("{}{}", "<span>".repeat(400), "</zz>".repeat(400_000));
-        let dom = Dom::parse(&html, 1_000_000).unwrap();
-        assert_eq!(dom.slots.len(), 401);
+        // Searching the open elements for each end tag would look at 400
+        // entries per tag here.
+        let tags = 400_000;
+        let html = format!("{}{}x", "<span>".repeat(400), "</zz>".repeat(tags));
+        let builder = Builder::build(&html, 1_000_000).unwrap();
+        assert!(builder.work <= tags + 400, "{}", builder.work);
+        // Nothing was closed: the text is in the innermost span.
+        assert_eq!(builder.stack.len(), 401);
+        assert_eq!(builder.dom.slots.len(), 402);
     }
 
     #[test]
@@ -621,6 +813,61 @@ mod tests {
     }
 
     #[test]
+    fn end_tags_stay_inside_tables_and_cells() {
+        // `</font>` and `</div>` close nothing in a cell they are outside of.
+        assert_eq!(
+            tree("<font><table><tr><td>a</font><td>b</table></font>c"),
+            r#"html(font(table(tr(td("a"),td("b")))),"c")"#
+        );
+        // A second `</td>` in a table nested in the cell is ignored.
+        assert_eq!(
+            tree("<table><tr><td><table><tr><td>a</td></td>b</table>c</table>"),
+            r#"html(table(tr(td(table(tr(td("a"),"b")),"c"))))"#
+        );
+        // The end of a row, section or table closes the cell around it.
+        assert_eq!(
+            tree("<table><tbody><tr><td><b>a</tr><tr><td>b</tbody></table>"),
+            r#"html(table(tbody(tr(td(b("a"))),tr(td("b")))))"#
+        );
+        assert_eq!(
+            tree("<table><caption>c</table>x"),
+            r#"html(table(caption("c")),"x")"#
+        );
+        // A cell outside a table is ignored, and so is `</tr>`.
+        assert_eq!(tree("<td>a</tr>b"), r#"html(" ab")"#);
+        // `</template>` closes a table left open in it.
+        assert_eq!(
+            tree("<template><table><tr><td>a</template>b"),
+            r#"html(template(table(tr(td("a")))),"b")"#
+        );
+    }
+
+    #[test]
+    fn rows_cells_colgroups_and_captions_close_implicitly() {
+        assert_eq!(
+            tree("<table><colgroup><col><tr><td>a</table>"),
+            r#"html(table(colgroup(col()),tr(td("a"))))"#
+        );
+        assert_eq!(
+            tree("<table><caption>c<tbody><tr><td>a</table>"),
+            r#"html(table(caption("c"),tbody(tr(td("a")))))"#
+        );
+        assert_eq!(
+            tree("<table><tr><td><ul><li>x<td>y<tr><td>z</table>"),
+            r#"html(table(tr(td(ul(li("x"))),td("y")),tr(td("z"))))"#
+        );
+        assert_eq!(
+            tree("<table><td>a<td>b</table>"),
+            r#"html(table(tr(td("a"),td("b"))))"#
+        );
+        // A row nested deeper in the segment is still closed.
+        assert_eq!(
+            tree("<table><tr><ul><tr><td>a</table>"),
+            r#"html(table(tr(ul()),tr(td("a"))))"#
+        );
+    }
+
+    #[test]
     fn raw_text_left_out_of_the_tree_is_dropped() {
         let html = format!("{}<script>var x;</script>kept", "<div>".repeat(600));
         let dom = Dom::parse(&html, 1_000_000).unwrap();
@@ -637,9 +884,14 @@ mod tests {
     }
 
     #[test]
-    fn find_first_element() {
-        let dom = Dom::parse("<body><title>t</title></body>", 100).unwrap();
-        assert!(dom.find("title").is_some());
-        assert!(dom.find("head").is_none());
+    fn title_outside_svg_and_math() {
+        let dom = Dom::parse(
+            "<body><svg><title>Icon</title></svg><title>t</title></body>",
+            100,
+        )
+        .unwrap();
+        assert_eq!(dom.title().map(shape).as_deref(), Some(r#"title("t")"#));
+        let dom = Dom::parse("<math><title>m</title></math><p>x", 100).unwrap();
+        assert!(dom.title().is_none());
     }
 }

@@ -115,8 +115,11 @@ async fn big_document_has_one_page_break_and_no_empty_images() {
     assert_eq!(count(&doc, |b| matches!(b, ParsedBlock::PageBreak)), 1);
     assert_eq!(count(&doc, |b| matches!(b, ParsedBlock::Image { .. })), 0);
     // Words split across runs join without separators.
-    let text = format!("{:?}", doc.blocks);
-    assert!(text.contains("Online Video"));
+    let joined = doc.blocks.iter().any(|b| match b {
+        ParsedBlock::Paragraph { inlines } => text_of(inlines).contains("Online Video"),
+        _ => false,
+    });
+    assert!(joined, "no paragraph holds \"Online Video\"");
 }
 
 #[tokio::test]

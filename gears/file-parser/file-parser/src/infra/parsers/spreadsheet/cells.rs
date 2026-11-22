@@ -76,6 +76,10 @@ fn split_serial(serial: f64, date1904: bool) -> Option<(String, u32)> {
         days += 1.0;
         seconds = 0.0;
     }
+    // Rounding can carry the last day over to one Excel cannot show.
+    if days > MAX_DATE_SERIAL {
+        return None;
+    }
     let days = whole(days)?;
     let seconds = u32::try_from(whole(seconds)?).ok()?;
 
@@ -106,20 +110,25 @@ fn whole(value: f64) -> Option<i64> {
     if value.fract() != 0.0 || !(-9.0e15..=9.0e15).contains(&value) {
         return None;
     }
-    format!("{value:.0}").parse().ok()
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a whole number within +-9e15, checked above"
+    )]
+    Some(value as i64)
 }
 
 fn epoch(year: i32, month: Month, day: u8) -> Option<Date> {
     Date::from_calendar_date(year, month, day).ok()
 }
 
-/// The time-of-day part of `serial` as `HH:MM:SS`.
+/// The time-of-day part of `serial` as `HH:MM:SS`. A fraction that rounds up
+/// to a whole day is midnight, as in Excel and as the date carry above.
 fn time_of_day(serial: f64) -> Option<String> {
     if !serial.is_finite() || serial < 0.0 {
         return None;
     }
     let seconds = whole(((serial - serial.trunc()) * 86_400.0).round())?;
-    let seconds = u32::try_from(seconds).ok()?.min(86_399);
+    let seconds = u32::try_from(seconds).ok()? % 86_400;
     Some(hms(seconds))
 }
 
@@ -194,6 +203,18 @@ mod tests {
         assert_eq!(serial_text(-1.0, Kind::Date, false), "-1");
         assert_eq!(serial_text(-1e300, Kind::DateTime, false), "-1E+300");
         assert_eq!(serial_text(3_000_000.0, Kind::Date, false), "3000000");
+        // The last day Excel can show, and the first it cannot.
+        assert_eq!(serial_text(2_958_465.0, Kind::Date, false), "9999-12-31");
+        assert_eq!(
+            serial_text(2_958_465.5, Kind::DateTime, false),
+            "9999-12-31 12:00:00"
+        );
+        assert_eq!(serial_text(2_958_466.0, Kind::Date, false), "2958466");
+        // Rounds up to midnight after the last day: not a date either.
+        assert_eq!(
+            serial_text(2_958_465.999_999_9, Kind::DateTime, false),
+            "2958465.9999999"
+        );
         assert_eq!(serial_text(f64::INFINITY, Kind::Time, false), "inf");
         assert_eq!(serial_text(1e300, Kind::Duration, false), "1E+300");
     }
@@ -204,5 +225,12 @@ mod tests {
         assert_eq!(serial_text(45_352.75, Kind::Time, false), "18:00:00");
         assert_eq!(serial_text(1.5, Kind::Duration, false), "36:00:00");
         assert_eq!(serial_text(-0.5, Kind::Duration, false), "-12:00:00");
+        // Rounds up to midnight, like the date that carries to the next day.
+        assert_eq!(serial_text(0.999_999_999, Kind::Time, false), "00:00:00");
+        assert_eq!(
+            serial_text(45_352.999_999_9, Kind::DateTime, false),
+            "2024-03-02"
+        );
+        assert_eq!(serial_text(0.999_9, Kind::Time, false), "23:59:51");
     }
 }

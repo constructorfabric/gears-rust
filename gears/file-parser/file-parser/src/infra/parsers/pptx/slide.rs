@@ -14,25 +14,10 @@ use quick_xml::events::{BytesStart, Event};
 use crate::domain::error::DomainError;
 use crate::domain::ir::{Inline, InlineStyle, ParsedBlock, TableBlock, TableCell, TableRow};
 use crate::infra::parsers::inlines::{Inlines, link_target};
-use crate::infra::parsers::limits::{ParseLimits, TableBudget, TextBudget, skipped_table_note};
-use crate::infra::parsers::ooxml::{Events, Relationships, xml};
+use crate::infra::parsers::limits::{Budgets, ParseLimits, TextBudget, table_note};
+use crate::infra::parsers::ooxml::{AltAction, Alternates, Events, Relationships, xml};
 
 use super::styles::{Bullet, Inherited, Kind, LEVELS, ListStyle, Placeholder};
-
-/// Budgets shared by all slides of a deck.
-pub(super) struct Budgets {
-    pub(super) tables: TableBudget,
-    pub(super) text: TextBudget,
-}
-
-impl Budgets {
-    pub(super) fn new(limits: &ParseLimits) -> Self {
-        Self {
-            tables: TableBudget::new(limits),
-            text: TextBudget::new(limits),
-        }
-    }
-}
 
 /// What one slide holds.
 #[derive(Debug, Default)]
@@ -58,37 +43,12 @@ pub(super) fn read_slide(
     ctx: &SlideContext<'_>,
     budgets: &mut Budgets,
 ) -> Result<Slide, DomainError> {
-    let mut walker = Walker {
-        ctx,
-        budgets,
-        slide: Slide::default(),
-        skip: 0,
-        alternates: Vec::new(),
-        shape: None,
-        body: None,
-        table: None,
-        picture: None,
-        non_visual: false,
-        diagram_ids: HashSet::new(),
-        links: HashMap::new(),
-    };
+    let mut walker = Walker::new(ctx, budgets);
     let mut events = Events::new(text, ctx.limits, "PPTX");
     loop {
         match events.next()? {
-            Event::Start(e) => walker.start(&e, true)?,
-            Event::Empty(e) => walker.start(&e, false)?,
-            Event::End(e) => walker.end(e.name().into_inner())?,
-            Event::Text(t) => {
-                let text = t.xml10_content();
-                walker.text(&text)?;
-            }
-            Event::GeneralRef(r) => {
-                if let Some(text) = xml::resolve_ref(&r) {
-                    walker.text(&text)?;
-                }
-            }
             Event::Eof => return Ok(walker.slide),
-            _ => {}
+            event => walker.event(event)?,
         }
     }
 }
@@ -169,7 +129,7 @@ struct Walker<'a, 'b> {
     /// Depth inside a subtree being skipped; 0 when reading.
     skip: usize,
     /// One entry per open `mc:AlternateContent`: whether a branch was taken.
-    alternates: Vec<bool>,
+    alternates: Alternates,
     shape: Option<Shape>,
     body: Option<Body>,
     table: Option<Table>,
@@ -183,7 +143,38 @@ struct Walker<'a, 'b> {
     links: HashMap<String, Option<String>>,
 }
 
-impl Walker<'_, '_> {
+impl<'a, 'b> Walker<'a, 'b> {
+    fn new(ctx: &'a SlideContext<'a>, budgets: &'b mut Budgets) -> Self {
+        Self {
+            ctx,
+            budgets,
+            slide: Slide::default(),
+            skip: 0,
+            alternates: Alternates::default(),
+            shape: None,
+            body: None,
+            table: None,
+            picture: None,
+            non_visual: false,
+            diagram_ids: HashSet::new(),
+            links: HashMap::new(),
+        }
+    }
+
+    fn event(&mut self, event: Event<'_>) -> Result<(), DomainError> {
+        match event {
+            Event::Start(e) => self.start(&e, true),
+            Event::Empty(e) => self.start(&e, false),
+            Event::End(e) => self.end(e.name().into_inner()),
+            Event::Text(t) => self.text(&t.xml10_content()),
+            Event::GeneralRef(r) => match xml::resolve_ref(&r) {
+                Some(text) => self.text(&text),
+                None => Ok(()),
+            },
+            _ => Ok(()),
+        }
+    }
+
     fn start(&mut self, e: &BytesStart<'_>, is_start: bool) -> Result<(), DomainError> {
         if self.skip > 0 {
             self.skip += usize::from(is_start);
@@ -242,7 +233,11 @@ impl Walker<'_, '_> {
             "p:pic" if is_start => self.picture = Some(Picture::default()),
             "dgm:relIds" => {
                 if let Some(id) = xml::prefixed_attr(e, "dm")
-                    && let Some(rel) = self.ctx.rels.get(&id).filter(|rel| !rel.external)
+                    && let Some(rel) = self
+                        .ctx
+                        .rels
+                        .get(&id)
+                        .filter(|rel| !rel.external && rel.is_type("diagramData"))
                     && self.diagram_ids.insert(id)
                 {
                     self.slide
@@ -280,13 +275,11 @@ impl Walker<'_, '_> {
             self.skip -= 1;
             return Ok(());
         }
-        if name == "mc:AlternateContent" {
-            self.alternates.pop();
+        if self.alternates.end(name) {
             return Ok(());
         }
         if self.body.is_some() {
-            self.body_end(name);
-            return Ok(());
+            return self.body_end(name);
         }
         match name {
             "p:nvSpPr" | "p:nvPicPr" | "p:nvGrpSpPr" | "p:nvGraphicFramePr" | "p:nvCxnSpPr" => {
@@ -295,7 +288,7 @@ impl Walker<'_, '_> {
             "p:cNvPr" => self.picture_described()?,
             "p:sp" => {
                 if let Some(shape) = self.shape.take() {
-                    self.emit_shape(shape);
+                    self.emit_shape(shape)?;
                 }
             }
             "p:pic" => self.picture = None,
@@ -308,7 +301,7 @@ impl Walker<'_, '_> {
             }
             "a:tbl" => {
                 if let Some(table) = self.table.take() {
-                    self.emit_table(table);
+                    self.emit_table(table)?;
                 }
             }
             _ => {}
@@ -316,28 +309,16 @@ impl Walker<'_, '_> {
         Ok(())
     }
 
-    /// Handles `mc:AlternateContent`: the first branch is read and the others,
-    /// which repeat it for older readers, are skipped. Returns whether `name`
-    /// was one of its elements.
+    /// `mc:AlternateContent`: the first branch is read, the others skipped.
+    /// Returns whether `name` was one of its elements.
     fn alternate(&mut self, name: &str, is_start: bool) -> bool {
-        match name {
-            "mc:AlternateContent" => {
-                if is_start {
-                    self.alternates.push(false);
-                }
+        match self.alternates.start(name, is_start) {
+            AltAction::Other => false,
+            AltAction::Consumed => true,
+            AltAction::SkipElement => {
+                self.skip = 1;
                 true
             }
-            "mc:Choice" | "mc:Fallback" => {
-                if is_start {
-                    match self.alternates.last_mut() {
-                        Some(taken) if *taken => self.skip = 1,
-                        Some(taken) => *taken = true,
-                        None => {}
-                    }
-                }
-                true
-            }
-            _ => false,
         }
     }
 
@@ -395,6 +376,7 @@ impl Walker<'_, '_> {
         }
         let bytes = alt.as_ref().map_or(0, String::len) + title.as_ref().map_or(0, String::len);
         self.budgets.text.charge(bytes)?;
+        self.budgets.text.charge_block()?;
         self.slide.blocks.push(ParsedBlock::Image {
             alt,
             title,
@@ -473,8 +455,12 @@ impl Walker<'_, '_> {
             "a:t" | "m:t" if is_start => body.in_text = body.para.is_some(),
             "a:br" => {
                 if let Some(para) = body.para.as_mut() {
-                    self.budgets.text.charge(1)?;
-                    para.inlines.push("\n", &InlineStyle::default(), None);
+                    para.inlines.push(
+                        "\n",
+                        &InlineStyle::default(),
+                        None,
+                        &mut self.budgets.text,
+                    )?;
                 }
             }
             "a:extLst" if is_start => self.skip = 1,
@@ -489,9 +475,9 @@ impl Walker<'_, '_> {
         Ok(())
     }
 
-    fn body_end(&mut self, name: &str) {
+    fn body_end(&mut self, name: &str) -> Result<(), DomainError> {
         let Some(body) = self.body.as_mut() else {
-            return;
+            return Ok(());
         };
         match name {
             "a:lstStyle" => body.list_style = ListStyleAt::Outside,
@@ -511,17 +497,20 @@ impl Walker<'_, '_> {
             "a:p" => {
                 body.run = None;
                 body.in_text = false;
-                if let Some(para) = body.para.take() {
+                // An empty paragraph puts out nothing; buffering it until
+                // the shape ends would cost memory for nothing.
+                if let Some(para) = body.para.take().filter(|p| !p.inlines.is_empty()) {
                     body.paras.push(para);
                 }
             }
             "p:txBody" | "a:txBody" => {
                 if let Some(body) = self.body.take() {
-                    self.finish_body(body);
+                    self.finish_body(body)?;
                 }
             }
             _ => {}
         }
+        Ok(())
     }
 
     fn text(&mut self, text: &str) -> Result<(), DomainError> {
@@ -534,14 +523,12 @@ impl Walker<'_, '_> {
         let Some(para) = body.para.as_mut() else {
             return Ok(());
         };
-        self.budgets.text.charge(text.len())?;
         let (style, link) = match body.run.as_ref() {
             Some(run) => (run.style.clone(), run.link.as_deref()),
             None => (InlineStyle::default(), None),
         };
-        let added = para.inlines.push(&clean_text(text), &style, link);
-        self.budgets.text.charge(added)?;
-        Ok(())
+        para.inlines
+            .push(&clean_text(text), &style, link, &mut self.budgets.text)
     }
 
     /// The link target of `a:hlinkClick`: external hyperlink relationships
@@ -556,7 +543,7 @@ impl Walker<'_, '_> {
         self.links
             .entry(id)
             .or_insert_with(|| {
-                (rel.external && rel.rel_type.rsplit('/').next() == Some("hyperlink"))
+                (rel.external && rel.is_type("hyperlink"))
                     .then(|| link_target(&rel.target))
                     .flatten()
             })
@@ -564,33 +551,34 @@ impl Walker<'_, '_> {
     }
 
     /// Hands a finished text body to its table cell or shape.
-    fn finish_body(&mut self, body: Body) {
+    fn finish_body(&mut self, body: Body) -> Result<(), DomainError> {
         if let Some(cell) = self.table.as_mut().and_then(|t| t.cell.as_mut()) {
             // Cells inherit no bullets from the layout.
             for para in body.paras {
                 let bullet = para.bullet.or_else(|| body.style.get(para.level));
-                push_para(cell, para, bullet);
+                push_para(cell, para, bullet, &mut self.budgets.text)?;
             }
         } else if let Some(shape) = self.shape.as_mut() {
             shape.style = body.style;
             shape.paras.extend(body.paras);
         }
+        Ok(())
     }
 
-    fn emit_shape(&mut self, shape: Shape) {
+    fn emit_shape(&mut self, shape: Shape) -> Result<(), DomainError> {
         let placeholder = shape.placeholder;
-        match placeholder.map(|p| p.kind) {
-            Some(Kind::Furniture) => return,
+        match placeholder.map(|p| self.ctx.inherited.kind(&p)) {
+            Some(Kind::Furniture) => return Ok(()),
             Some(Kind::Title) if self.slide.title.is_empty() => {
                 self.slide.title = title_text(shape.paras);
-                return;
+                return Ok(());
             }
-            Some(Kind::Title | Kind::Footer) => {
-                // A second title, or a footer: plain paragraphs.
+            Some(Kind::Title) => {
+                // A second title: plain paragraphs.
                 for para in shape.paras {
-                    push_para(&mut self.slide.blocks, para, None);
+                    push_para(&mut self.slide.blocks, para, None, &mut self.budgets.text)?;
                 }
-                return;
+                return Ok(());
             }
             _ => {}
         }
@@ -599,20 +587,25 @@ impl Walker<'_, '_> {
                 .bullet
                 .or_else(|| shape.style.get(para.level))
                 .or_else(|| self.ctx.inherited.bullet(placeholder.as_ref(), para.level));
-            push_para(&mut self.slide.blocks, para, bullet);
+            push_para(&mut self.slide.blocks, para, bullet, &mut self.budgets.text)?;
         }
+        Ok(())
     }
 
-    fn emit_table(&mut self, mut table: Table) {
+    fn emit_table(&mut self, mut table: Table) -> Result<(), DomainError> {
         let width = table.rows.iter().map(Vec::len).max().unwrap_or(0);
         if width == 0 && !table.overflow {
-            return;
+            return Ok(());
         }
-        if table.overflow || !self.budgets.tables.try_charge(table.rows.len(), width) {
-            self.budgets.tables.spend(table.cells);
+        let kept =
+            self.budgets
+                .tables
+                .admit("PPTX", table.rows.len(), width, table.cells, table.overflow);
+        if !kept {
             let remaining = self.budgets.tables.remaining();
-            self.slide.blocks.push(skipped_table_note(remaining));
-            return;
+            let note = table_note(remaining, &mut self.budgets.text)?;
+            self.slide.blocks.push(note);
+            return Ok(());
         }
         let rows = table
             .rows
@@ -628,9 +621,11 @@ impl Walker<'_, '_> {
                 }
             })
             .collect();
+        self.budgets.text.charge_block()?;
         self.slide
             .blocks
             .push(ParsedBlock::Table(TableBlock { rows }));
+        Ok(())
     }
 }
 
@@ -642,13 +637,19 @@ fn push_cell(table: &mut Table, blocks: Vec<ParsedBlock>) {
     }
 }
 
-/// Appends `para` as a list item or paragraph; empty paragraphs are dropped,
-/// as `PowerPoint` draws no bullet for them.
-fn push_para(out: &mut Vec<ParsedBlock>, mut para: Para, bullet: Option<Bullet>) {
+/// Appends `para` as a list item or paragraph, charged to `text`; empty
+/// paragraphs are dropped, as `PowerPoint` draws no bullet for them.
+fn push_para(
+    out: &mut Vec<ParsedBlock>,
+    mut para: Para,
+    bullet: Option<Bullet>,
+    text: &mut TextBudget,
+) -> Result<(), DomainError> {
     let inlines = para.inlines.take();
     if inlines.is_empty() {
-        return;
+        return Ok(());
     }
+    text.charge_block()?;
     let paragraph = ParsedBlock::Paragraph { inlines };
     out.push(match bullet {
         Some(bullet @ (Bullet::Unordered | Bullet::Ordered)) => ParsedBlock::ListItem {
@@ -659,6 +660,7 @@ fn push_para(out: &mut Vec<ParsedBlock>, mut para: Para, bullet: Option<Bullet>)
         },
         Some(Bullet::None) | None => paragraph,
     });
+    Ok(())
 }
 
 /// The text of a title placeholder as one line: paragraphs, line breaks and
@@ -710,4 +712,40 @@ fn run_style(e: &BytesStart<'_>) -> InlineStyle {
 fn is_true(value: &str) -> bool {
     let value = value.trim();
     value == "1" || value.eq_ignore_ascii_case("true")
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use quick_xml::Reader;
+
+    use super::*;
+
+    #[test]
+    fn empty_paragraphs_are_dropped_as_they_end() {
+        // They put out nothing; kept until the shape ends, millions of them
+        // would hold memory no budget charges.
+        let xml = format!(
+            "<p:sp><p:txBody>{}<a:p><a:r><a:t>x</a:t></a:r></a:p><a:p/>",
+            "<a:p></a:p>".repeat(1_000)
+        );
+        let limits = ParseLimits::default();
+        let (inherited, rels) = (Inherited::default(), Relationships::default());
+        let ctx = SlideContext {
+            inherited: &inherited,
+            rels: &rels,
+            limits: &limits,
+        };
+        let mut budgets = Budgets::new(&limits);
+        let mut walker = Walker::new(&ctx, &mut budgets);
+        let mut reader = Reader::from_str(&xml);
+        loop {
+            match reader.read_event().expect("well-formed prefix") {
+                Event::Eof => break,
+                event => walker.event(event).expect("within limits"),
+            }
+        }
+        let paras = walker.body.as_ref().map(|b| b.paras.len());
+        assert_eq!(paras, Some(1));
+    }
 }

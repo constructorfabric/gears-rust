@@ -425,14 +425,36 @@ mod legacy_xls {
     }
 
     #[tokio::test]
-    async fn merged_and_formula_xls_parse() {
+    async fn merged_xls_matches_the_xlsx() {
         let parser = SpreadsheetParser::new();
-        for name in ["merged_cells.xls", "formula_cells.xls"] {
-            let document = parser
-                .parse_local_path(&xls(name), None)
-                .await
-                .unwrap_or_else(|e| panic!("{name} parses: {e}"));
-            assert!(!tables(&document).is_empty(), "{name} has a table");
-        }
+        let from_xls = parser
+            .parse_local_path(&xls("merged_cells.xls"), None)
+            .await
+            .expect("merged_cells.xls parses");
+        let from_xlsx = parser
+            .parse_local_path(&get_test_file_path("merged_cells.xlsx"), None)
+            .await
+            .expect("merged_cells.xlsx parses");
+        assert!(!tables(&from_xls).is_empty());
+        assert_eq!(tables(&from_xls), tables(&from_xlsx));
+    }
+
+    #[tokio::test]
+    async fn formula_xls_shows_cached_results() {
+        // The XLSX fixture was written without cached formula results, so the
+        // two files differ; the XLS one has them.
+        let document = SpreadsheetParser::new()
+            .parse_local_path(&xls("formula_cells.xls"), None)
+            .await
+            .expect("formula_cells.xls parses");
+        assert_eq!(
+            tables(&document),
+            [[
+                ["10", "5", "Hello"],
+                ["20", "3", "World"],
+                ["30", "50", "Hello World"],
+                ["", "15", ""],
+            ]]
+        );
     }
 }

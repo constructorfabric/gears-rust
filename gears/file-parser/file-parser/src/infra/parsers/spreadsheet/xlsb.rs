@@ -7,13 +7,14 @@
 //! read from the record's own body, so a short record cannot reuse bytes of an
 //! earlier one. Formulas contribute their cached result only.
 
-use crate::domain::error::DomainError;
+use crate::domain::error::{DomainError, ParseLimit};
+use crate::infra::parsers::le_bytes::{f64_at, u16_at, u32_at};
 use crate::infra::parsers::limits::{ParseLimits, limit_exceeded};
-use crate::infra::parsers::ooxml::{self, Archive};
+use crate::infra::parsers::ooxml::Archive;
 
-use super::Sink;
 use super::cells::bool_text;
 use super::shared::{CellFormats, SharedStrings, error_text, number_text, rk_value};
+use super::{Sink, Visibility};
 
 const BRT_ROW_HDR: u16 = 0x0000;
 const BRT_CELL_RK: u16 = 0x0002;
@@ -27,6 +28,7 @@ const BRT_FMLA_NUM: u16 = 0x0009;
 const BRT_FMLA_BOOL: u16 = 0x000A;
 const BRT_FMLA_ERROR: u16 = 0x000B;
 const BRT_SST_ITEM: u16 = 0x0013;
+const BRT_CELL_RSTRING: u16 = 0x003E;
 const BRT_FMT: u16 = 0x002C;
 const BRT_XF: u16 = 0x002F;
 const BRT_WB_PROP: u16 = 0x0099;
@@ -38,37 +40,29 @@ fn parse_error(detail: impl std::fmt::Display) -> DomainError {
     DomainError::parse_error(format!("Failed to parse XLSB: {detail}"))
 }
 
-/// Reads every worksheet of the package into `sink`; returns the title.
+/// Reads every worksheet of the package, whose workbook is `workbook_part`,
+/// into `sink`.
 pub(super) fn read(
     mut archive: Archive,
+    workbook_part: &str,
     limits: &ParseLimits,
     sink: &mut Sink,
-) -> Result<Option<String>, DomainError> {
-    let root = archive.read_rels("")?;
-    let workbook_part = root
-        .of_type("officeDocument")
-        .find(|r| !r.external && archive.contains(&r.target))
-        .map_or_else(|| "xl/workbook.bin".to_owned(), |r| r.target.clone());
-    let title = match root.of_type("core-properties").find(|r| !r.external) {
-        Some(rel) => ooxml::core_title(&mut archive, &rel.target.clone())?,
-        None => None,
-    };
-
+) -> Result<(), DomainError> {
     let workbook = archive
-        .read(&workbook_part)?
+        .read(workbook_part)?
         .ok_or_else(|| parse_error("no workbook part"))?;
-    let (date1904, sheets) = parse_workbook(&workbook, &workbook_part, limits)?;
+    let (date1904, sheets) = parse_workbook(&workbook, workbook_part, limits)?;
     drop(workbook);
-    let rels = archive.read_rels(&workbook_part)?;
+    let rels = archive.read_rels(workbook_part)?;
 
-    let shared = match internal(&rels, "sharedStrings") {
+    let shared = match rels.internal("sharedStrings") {
         Some(target) => match archive.read(&target)? {
             Some(part) => parse_shared_strings(&part, &target)?,
             None => SharedStrings::default(),
         },
         None => SharedStrings::default(),
     };
-    let formats = match internal(&rels, "styles") {
+    let formats = match rels.internal("styles") {
         Some(target) => match archive.read(&target)? {
             Some(part) => parse_styles(&part, &target)?,
             None => CellFormats::default(),
@@ -76,10 +70,10 @@ pub(super) fn read(
         None => CellFormats::default(),
     };
 
-    for (name, rel_id) in &sheets {
+    for (name, rel_id, visibility) in &sheets {
         let Some(rel) = rels
             .get(rel_id)
-            .filter(|r| !r.external && r.rel_type.rsplit('/').next() == Some("worksheet"))
+            .filter(|r| !r.external && r.is_type("worksheet"))
         else {
             continue;
         };
@@ -102,15 +96,9 @@ pub(super) fn read(
                 break;
             }
         }
-        sink.finish_sheet(name, cells)?;
+        sink.finish_sheet(name, *visibility, cells)?;
     }
-    Ok(title)
-}
-
-fn internal(rels: &crate::infra::parsers::ooxml::Relationships, kind: &str) -> Option<String> {
-    rels.of_type(kind)
-        .find(|r| !r.external)
-        .map(|r| r.target.clone())
+    Ok(())
 }
 
 /// Iterates the records of a binary part: `[type varint][length varint][body]`.
@@ -176,21 +164,6 @@ impl<'a> Records<'a> {
     }
 }
 
-fn u32_at(body: &[u8], at: usize) -> Option<u32> {
-    let b = body.get(at..at.checked_add(4)?)?;
-    Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-}
-
-fn u16_at(body: &[u8], at: usize) -> Option<u16> {
-    let b = body.get(at..at.checked_add(2)?)?;
-    Some(u16::from_le_bytes([b[0], b[1]]))
-}
-
-fn f64_at(body: &[u8], at: usize) -> Option<f64> {
-    let b: [u8; 8] = body.get(at..at.checked_add(8)?)?.try_into().ok()?;
-    Some(f64::from_le_bytes(b))
-}
-
 /// An `XLWideString` at `body[at]`: a 32-bit character count and UTF-16LE
 /// characters, which must all be present.
 fn wide_string(body: &[u8], at: usize) -> Option<String> {
@@ -205,8 +178,8 @@ fn wide_string(body: &[u8], at: usize) -> Option<String> {
     )
 }
 
-/// (sheet name, relationship id), in workbook order.
-type SheetList = Vec<(String, String)>;
+/// (sheet name, relationship id, visibility), in workbook order.
+type SheetList = Vec<(String, String, Visibility)>;
 
 /// The 1904 flag and the sheets of the workbook.
 fn parse_workbook(
@@ -222,6 +195,9 @@ fn parse_workbook(
             BRT_WB_PROP => date1904 = u32_at(body, 0).is_some_and(|f| f & 0x01 != 0),
             BRT_BUNDLE_SH => {
                 // state (4), tab id (4), relationship id (nullable), name.
+                let visibility = u32_at(body, 0)
+                    .and_then(|state| u8::try_from(state).ok())
+                    .map_or(Visibility::Visible, Visibility::from_state);
                 let Some(id_len) = u32_at(body, 8) else {
                     continue;
                 };
@@ -238,10 +214,10 @@ fn parse_workbook(
                     continue;
                 };
                 let name = wide_string(body, name_at).unwrap_or_default();
-                sheets.push((name, rel_id));
+                sheets.push((name, rel_id, visibility));
                 if sheets.len() > limits.max_sheets {
                     return Err(limit_exceeded(
-                        "max_sheets",
+                        ParseLimit::MaxSheets,
                         format!("more than {} sheets", limits.max_sheets),
                     ));
                 }
@@ -309,6 +285,8 @@ fn cell(
         BRT_CELL_BOOL | BRT_FMLA_BOOL => bool_text(*body.get(8)? != 0).to_owned(),
         BRT_CELL_ERROR | BRT_FMLA_ERROR => error_text(*body.get(8)?).to_owned(),
         BRT_CELL_ST | BRT_FMLA_STRING => wide_string(body, 8)?,
+        // A rich string: one flags byte, then the text; its runs are not read.
+        BRT_CELL_RSTRING => wide_string(body, 9)?,
         BRT_CELL_ISST => shared
             .get(usize::try_from(u32_at(body, 8)?).ok()?)?
             .to_owned(),
@@ -357,9 +335,17 @@ pub(super) mod build {
 
     /// `workbook.bin` listing (relationship id, sheet name) pairs.
     pub fn workbook(sheets: &[(&str, &str)], date1904: bool) -> Vec<u8> {
+        let sheets: Vec<(&str, &str, u32)> =
+            sheets.iter().map(|(id, name)| (*id, *name, 0)).collect();
+        workbook_in_states(&sheets, date1904)
+    }
+
+    /// As [`workbook`], with each sheet's state (`hsState`).
+    pub fn workbook_in_states(sheets: &[(&str, &str, u32)], date1904: bool) -> Vec<u8> {
         let mut out = record(super::BRT_WB_PROP, &u32::from(date1904).to_le_bytes());
-        for (id, name) in sheets {
-            let mut body = vec![0, 0, 0, 0, 1, 0, 0, 0];
+        for (id, name, state) in sheets {
+            let mut body = state.to_le_bytes().to_vec();
+            body.extend_from_slice(&1_u32.to_le_bytes());
             body.extend(wide(id));
             body.extend(wide(name));
             out.extend(record(super::BRT_BUNDLE_SH, &body));
@@ -377,6 +363,13 @@ pub(super) mod build {
         let mut body = n.to_le_bytes().to_vec();
         body.extend_from_slice(&[0; 13]);
         record(super::BRT_ROW_HDR, &body)
+    }
+
+    /// A cell record of type `typ`: the cell header, then `value` as is.
+    pub fn cell_record(typ: u16, col: u32, xf: u32, value: &[u8]) -> Vec<u8> {
+        let mut body = cell_head(col, xf);
+        body.extend_from_slice(value);
+        record(typ, &body)
     }
 
     pub fn real(col: u32, xf: u32, value: f64) -> Vec<u8> {
@@ -526,6 +519,81 @@ mod tests {
         let mut huge = u32::MAX.to_le_bytes().to_vec();
         huge.extend_from_slice(b"xy");
         assert_eq!(wide_string(&huge, 0), None);
+    }
+
+    #[test]
+    fn cell_records_of_every_value_kind() {
+        let strings = SharedStrings::default();
+        let formats = CellFormats::default();
+        let read = |typ: u16, value: &[u8]| {
+            let data = cell_record(typ, 3, 0, value);
+            let (typ, body) = records(&data, "p")
+                .next()
+                .expect("one record")
+                .expect("well formed");
+            cell(typ, body, &strings, &formats, false).map(|(col, text)| {
+                assert_eq!(col, 3);
+                text
+            })
+        };
+        // Formula records: the cached value, flags, then the formula.
+        let formula = |value: &[u8]| {
+            let mut out = value.to_vec();
+            out.extend_from_slice(&[0, 0]);
+            out.extend_from_slice(&2_u32.to_le_bytes());
+            out.extend_from_slice(&[0x1E, 0x01]);
+            out.extend_from_slice(&0_u32.to_le_bytes());
+            out
+        };
+        let rk_int = |n: i32| u32::from_le_bytes((n << 2).to_le_bytes()) | 0x02;
+        let rk_double = u32::try_from(1.5_f64.to_bits() >> 32).expect("high bits");
+        let mut rich = vec![0x01];
+        rich.extend(wide("rich"));
+        rich.extend_from_slice(&1_u32.to_le_bytes());
+        rich.extend_from_slice(&[0; 4]);
+        let cases: [(u16, Vec<u8>, &str); 10] = [
+            (BRT_CELL_RK, rk_int(7).to_le_bytes().to_vec(), "7"),
+            (
+                BRT_CELL_RK,
+                (rk_int(1234) | 0x01).to_le_bytes().to_vec(),
+                "12.34",
+            ),
+            (BRT_CELL_RK, rk_double.to_le_bytes().to_vec(), "1.5"),
+            (BRT_CELL_ERROR, vec![0x07], "#DIV/0!"),
+            (BRT_FMLA_STRING, formula(&wide("calc")), "calc"),
+            (BRT_FMLA_NUM, formula(&2.5_f64.to_le_bytes()), "2.5"),
+            (BRT_FMLA_BOOL, formula(&[1]), "TRUE"),
+            (BRT_FMLA_ERROR, formula(&[0x2A]), "#N/A"),
+            (BRT_CELL_RSTRING, rich, "rich"),
+            (BRT_CELL_RSTRING, vec![0x00], ""),
+        ];
+        for (typ, value, want) in cases {
+            let got = read(typ, &value);
+            if want.is_empty() {
+                assert_eq!(got, None, "a cut-short record of type {typ:#x}");
+            } else {
+                assert_eq!(got.as_deref(), Some(want), "type {typ:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn workbook_sheet_states() {
+        let data = workbook_in_states(
+            &[("rId1", "A", 0), ("rId2", "B", 1), ("rId3", "C", 2)],
+            true,
+        );
+        let (date1904, sheets) = parse_workbook(&data, "w", &ParseLimits::default()).unwrap();
+        assert!(date1904);
+        let states: Vec<Visibility> = sheets.iter().map(|s| s.2).collect();
+        assert_eq!(
+            states,
+            [
+                Visibility::Visible,
+                Visibility::Hidden,
+                Visibility::VeryHidden
+            ]
+        );
     }
 
     #[test]

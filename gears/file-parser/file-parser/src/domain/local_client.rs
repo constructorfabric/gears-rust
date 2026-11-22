@@ -26,10 +26,14 @@ impl From<DomainError> for FileParserClientError {
             }
             DomainError::InvalidRequest { message } => Self::InvalidRequest { message },
             DomainError::ParseError { message } => Self::ParseFailed { message },
+            DomainError::LimitExceeded { limit, detail } => Self::ParseFailed {
+                message: format!("document exceeds parser limit `{limit}`: {detail}"),
+            },
             DomainError::FileNotFound { path } => Self::Internal(format!("file not found: {path}")),
-            DomainError::IoError { message } | DomainError::PathTraversalBlocked { message } => {
-                Self::Internal(message)
-            }
+            DomainError::Busy { message } => Self::Busy { message },
+            DomainError::IoError { message }
+            | DomainError::Internal { message }
+            | DomainError::PathTraversalBlocked { message } => Self::Internal(message),
         }
     }
 }
@@ -163,6 +167,15 @@ mod tests {
                 "InvalidRequest",
             ),
             (DomainError::parse_error("broken document"), "ParseFailed"),
+            (
+                DomainError::limit_exceeded(
+                    crate::domain::error::ParseLimit::MaxTextBytes,
+                    "too much text",
+                ),
+                "ParseFailed",
+            ),
+            (DomainError::busy("engine busy"), "Busy"),
+            (DomainError::internal("engine gone"), "Internal"),
             (DomainError::file_not_found("/tmp/missing"), "Internal"),
             (DomainError::io_error("disk error"), "Internal"),
             (DomainError::path_traversal_blocked("blocked"), "Internal"),
@@ -174,7 +187,9 @@ mod tests {
                 FileParserClientError::UnsupportedFileType { .. } => "UnsupportedFileType",
                 FileParserClientError::InvalidRequest { .. } => "InvalidRequest",
                 FileParserClientError::ParseFailed { .. } => "ParseFailed",
+                FileParserClientError::Busy { .. } => "Busy",
                 FileParserClientError::Internal(_) => "Internal",
+                other => panic!("unexpected variant: {other:?}"),
             };
             assert_eq!(
                 actual_variant, expected_variant,

@@ -11,12 +11,14 @@
 
 use std::io::{Cursor, Read};
 
-use crate::domain::error::DomainError;
+use crate::domain::error::{DomainError, ParseLimit};
+use crate::infra::parsers::le_bytes::{f64_at, u16_at, u32_at};
 use crate::infra::parsers::limits::{ParseLimits, limit_exceeded};
 
 use super::cells::bool_text;
+use super::compound;
 use super::shared::{CellFormats, SharedStrings, error_text, number_text, rk_value};
-use super::{SheetCells, Sink};
+use super::{SheetCells, Sink, Visibility};
 
 const BOF: u16 = 0x0809;
 const EOF: u16 = 0x000A;
@@ -42,6 +44,8 @@ const FORMULA_STRING: u16 = 0x0207;
 const BIFF8: u16 = 0x0600;
 const BIFF5: u16 = 0x0500;
 
+const ENCRYPTED: &str = "encrypted workbooks are not supported";
+
 fn parse_error(detail: impl std::fmt::Display) -> DomainError {
     DomainError::parse_error(format!("Failed to parse XLS: {detail}"))
 }
@@ -57,14 +61,23 @@ pub(super) fn read(bytes: &[u8], limits: &ParseLimits, sink: &mut Sink) -> Resul
         }
         let mut cells = sink.new_sheet();
         read_sheet(&stream, sheet.offset, end, &globals, sink, &mut cells)?;
-        sink.finish_sheet(&sheet.name, cells)?;
+        sink.finish_sheet(&sheet.name, sheet.visibility, cells)?;
     }
     Ok(())
 }
 
 /// The BIFF stream: `Workbook` (BIFF8) or `Book` (BIFF5), at the root.
 fn workbook_stream(bytes: &[u8], limits: &ParseLimits) -> Result<Vec<u8>, DomainError> {
+    compound::check_fat_sectors(bytes)?;
     let mut file = cfb::CompoundFile::open(Cursor::new(bytes)).map_err(parse_error)?;
+    // A password-protected XLSX or XLSB is a compound file holding these
+    // streams instead of a ZIP.
+    if ["/EncryptionInfo", "/EncryptedPackage"]
+        .into_iter()
+        .any(|name| file.is_stream(name))
+    {
+        return Err(parse_error(ENCRYPTED));
+    }
     let name = ["/Workbook", "/Book"]
         .into_iter()
         .find(|name| file.is_stream(name))
@@ -77,7 +90,7 @@ fn workbook_stream(bytes: &[u8], limits: &ParseLimits) -> Result<Vec<u8>, Domain
         .map_err(parse_error)?;
     if data.len() as u64 > limits.max_entry_bytes {
         return Err(limit_exceeded(
-            "max_entry_bytes",
+            ParseLimit::MaxEntryBytes,
             format!("Workbook stream exceeds {} bytes", limits.max_entry_bytes),
         ));
     }
@@ -92,21 +105,6 @@ fn record_at(data: &[u8], pos: usize) -> Option<(u16, &[u8], usize)> {
     let start = pos + 4;
     let body = data.get(start..start.checked_add(len)?)?;
     Some((typ, body, start + len))
-}
-
-fn u16_at(body: &[u8], at: usize) -> Option<u16> {
-    let b = body.get(at..at.checked_add(2)?)?;
-    Some(u16::from_le_bytes([b[0], b[1]]))
-}
-
-fn u32_at(body: &[u8], at: usize) -> Option<u32> {
-    let b = body.get(at..at.checked_add(4)?)?;
-    Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-}
-
-fn f64_at(body: &[u8], at: usize) -> Option<f64> {
-    let b: [u8; 8] = body.get(at..at.checked_add(8)?)?.try_into().ok()?;
-    Some(f64::from_le_bytes(b))
 }
 
 /// Latin-1: each byte is the code point of the same value, which is what a
@@ -192,6 +190,7 @@ struct SheetEntry {
     offset: usize,
     name: String,
     worksheet: bool,
+    visibility: Visibility,
 }
 
 struct Globals {
@@ -224,7 +223,7 @@ fn read_globals(data: &[u8], limits: &ParseLimits) -> Result<Globals, DomainErro
     };
     while let Some((typ, body, next)) = record_at(data, pos) {
         match typ {
-            FILEPASS => return Err(parse_error("encrypted workbooks are not supported")),
+            FILEPASS => return Err(parse_error(ENCRYPTED)),
             DATEMODE => globals.date1904 = u16_at(body, 0).is_some_and(|v| v != 0),
             CODEPAGE if !biff8 => {
                 if let Some(number) = u16_at(body, 0) {
@@ -247,7 +246,10 @@ fn read_globals(data: &[u8], limits: &ParseLimits) -> Result<Globals, DomainErro
             }
             SST if biff8 => globals.sst = read_sst(data, pos)?,
             BOUNDSHEET => {
-                let (Some(offset), Some(&kind)) = (u32_at(body, 0), body.get(5)) else {
+                // Stream offset (4), state in the low two bits (1), sheet type (1).
+                let (Some(offset), Some(&state), Some(&kind)) =
+                    (u32_at(body, 0), body.get(4), body.get(5))
+                else {
                     return Err(parse_error("invalid BOUNDSHEET record"));
                 };
                 let name = record_string(body, 6, 1, globals.text).unwrap_or_default();
@@ -255,10 +257,11 @@ fn read_globals(data: &[u8], limits: &ParseLimits) -> Result<Globals, DomainErro
                     offset: usize::try_from(offset).unwrap_or(usize::MAX),
                     name,
                     worksheet: kind == 0,
+                    visibility: Visibility::from_state(state & 0x03),
                 });
                 if globals.sheets.len() > limits.max_sheets {
                     return Err(limit_exceeded(
-                        "max_sheets",
+                        ParseLimit::MaxSheets,
                         format!("more than {} sheets", limits.max_sheets),
                     ));
                 }
@@ -393,8 +396,11 @@ impl<'a> SstCursor<'a> {
                 let (pairs, _) = self.body.as_chunks::<2>();
                 let take = pairs.len().min(left);
                 if take == 0 {
-                    // A dangling byte cannot hold a character.
-                    return None;
+                    // A dangling byte cannot hold a character: drop it and go
+                    // on in the next record, so one damaged string does not
+                    // end the table.
+                    self.body = &[];
+                    continue;
                 }
                 units.extend(pairs[..take].iter().map(|&p| u16::from_le_bytes(p)));
                 self.body = &self.body[take * 2..];
@@ -689,12 +695,24 @@ pub(super) mod biff {
         record(super::XF, &body)
     }
 
+    /// A sheet: name, state (`hsState`) and records.
+    pub type Sheet<'a> = (&'a str, u8, Vec<Vec<u8>>);
+
     /// A workbook stream: `globals` after the globals BOF, then one sheet per
     /// `(name, records)`.
     pub fn workbook_with(globals: &[Vec<u8>], sheets: &[(&str, Vec<Vec<u8>>)]) -> Vec<u8> {
-        let boundsheet = |offset: u32, name: &str| {
+        let sheets: Vec<Sheet<'_>> = sheets
+            .iter()
+            .map(|(name, records)| (*name, 0, records.clone()))
+            .collect();
+        workbook_in_states(globals, &sheets)
+    }
+
+    /// As [`workbook_with`], with each sheet's state (`hsState`).
+    pub fn workbook_in_states(globals: &[Vec<u8>], sheets: &[Sheet<'_>]) -> Vec<u8> {
+        let boundsheet = |offset: u32, state: u8, name: &str| {
             let mut body = offset.to_le_bytes().to_vec();
-            body.extend_from_slice(&[0, 0]); // visible worksheet
+            body.extend_from_slice(&[state, 0]); // worksheet
             body.push(u8::try_from(name.len()).expect("short"));
             body.push(0);
             body.extend_from_slice(name.as_bytes());
@@ -704,12 +722,12 @@ pub(super) mod biff {
             + globals.iter().map(Vec::len).sum::<usize>()
             + sheets
                 .iter()
-                .map(|(n, _)| boundsheet(0, n).len())
+                .map(|(n, _, _)| boundsheet(0, 0, n).len())
                 .sum::<usize>()
             + eof().len();
         let mut substreams = Vec::new();
         let mut offsets = Vec::new();
-        for (_, records) in sheets {
+        for (_, _, records) in sheets {
             offsets.push(u32::try_from(globals_len + substreams.len()).expect("small"));
             substreams.extend(bof(true));
             for r in records {
@@ -721,8 +739,8 @@ pub(super) mod biff {
         for r in globals {
             out.extend_from_slice(r);
         }
-        for ((name, _), offset) in sheets.iter().zip(offsets) {
-            out.extend(boundsheet(offset, name));
+        for ((name, state, _), offset) in sheets.iter().zip(offsets) {
+            out.extend(boundsheet(offset, *state, name));
         }
         out.extend(eof());
         assert_eq!(out.len(), globals_len);
@@ -784,6 +802,46 @@ mod tests {
         stream.extend(record(CONTINUE, &cont));
         let sst = read_sst(&stream, 0).unwrap();
         assert_eq!(sst.to_vec(), ["ab\u{e9}defghij", "xy"]);
+    }
+
+    #[test]
+    fn rich_and_phonetic_sst_strings_split_across_continue_records() {
+        // Wide, phonetic and rich: 4 characters, 2 runs, 6 bytes of phonetic
+        // data. The characters, the runs and the phonetic data each cross a
+        // record boundary; only character data restarts with an option byte.
+        let mut sst_body = 2_u32.to_le_bytes().to_vec();
+        sst_body.extend_from_slice(&2_u32.to_le_bytes());
+        sst_body.extend_from_slice(&4_u16.to_le_bytes());
+        sst_body.push(0x0D);
+        sst_body.extend_from_slice(&2_u16.to_le_bytes());
+        sst_body.extend_from_slice(&6_u32.to_le_bytes());
+        sst_body.extend_from_slice(&[b'a', 0, b'b', 0]);
+        let mut first = vec![0x00];
+        first.extend_from_slice(b"cd");
+        first.extend_from_slice(&[1, 0, 2, 0, 3]); // runs, 5 of 8 bytes
+        let mut second = vec![0, 4, 0]; // the rest of the runs
+        second.extend_from_slice(&[0xEE, 0xEE]); // phonetic, 2 of 6 bytes
+        let mut third = vec![0xEE; 4];
+        third.extend_from_slice(&[2, 0, 0x00, b'x', b'y']);
+        let mut stream = record(SST, &sst_body);
+        for body in [first, second, third] {
+            stream.extend(record(CONTINUE, &body));
+        }
+        assert_eq!(read_sst(&stream, 0).unwrap().to_vec(), ["abcd", "xy"]);
+    }
+
+    #[test]
+    fn a_dangling_byte_in_wide_sst_text_does_not_end_the_table() {
+        // The first string's 16-bit text ends a record on half a character.
+        let mut sst_body = 2_u32.to_le_bytes().to_vec();
+        sst_body.extend_from_slice(&2_u32.to_le_bytes());
+        sst_body.extend_from_slice(&2_u16.to_le_bytes());
+        sst_body.push(0x01);
+        sst_body.extend_from_slice(&[b'a', 0, b'b']);
+        let cont = [0x00, b'c', 2, 0, 0x00, b'x', b'y'];
+        let mut stream = record(SST, &sst_body);
+        stream.extend(record(CONTINUE, &cont));
+        assert_eq!(read_sst(&stream, 0).unwrap().to_vec(), ["ac", "xy"]);
     }
 
     #[test]
@@ -864,6 +922,7 @@ mod tests {
             offset,
             name: String::new(),
             worksheet: true,
+            visibility: Visibility::Visible,
         };
         assert!(sheet_bounds(&[entry(10), entry(10)], 100).is_err());
         assert_eq!(

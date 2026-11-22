@@ -11,8 +11,8 @@ use crate::config::FileParserConfig;
 use crate::domain::local_client::FileParserLocalClient;
 use crate::domain::service::{FileParserService, ServiceConfig};
 use crate::infra::parsers::{
-    DocxParser, HtmlParser, ImageParser, PdfParser, PlainTextParser, PptxParser, SpreadsheetParser,
-    StubParser,
+    DocxParser, HtmlParser, ImageParser, ParseLimits, PdfParser, PlainTextParser, PptxParser,
+    SpreadsheetParser, StubParser,
 };
 
 /// Main gear struct for file parsing
@@ -200,14 +200,36 @@ impl Gear for FileParserGear {
 
         // Backends that read a whole local file into memory get the
         // configured ceiling, so their bounded reads agree with the
-        // service-level check rather than a compiled-in default.
+        // service-level check rather than a compiled-in default. The document
+        // parsers share one set of limits.
+        let limits = ParseLimits::default();
         let parsers: Vec<Arc<dyn crate::domain::parser::FileParserBackend>> = vec![
             Arc::new(PlainTextParser::new().with_max_bytes(max_file_size_bytes)),
-            Arc::new(SpreadsheetParser::new().with_max_bytes(max_file_size_bytes)),
-            Arc::new(HtmlParser::new().with_max_bytes(max_file_size_bytes)),
-            Arc::new(PptxParser::new().with_max_bytes(max_file_size_bytes)),
-            Arc::new(PdfParser::new().with_max_bytes(max_file_size_bytes)),
-            Arc::new(DocxParser::new().with_max_bytes(max_file_size_bytes)),
+            Arc::new(
+                SpreadsheetParser::new()
+                    .with_max_bytes(max_file_size_bytes)
+                    .with_limits(limits.clone()),
+            ),
+            Arc::new(
+                HtmlParser::new()
+                    .with_max_bytes(max_file_size_bytes)
+                    .with_limits(limits.clone()),
+            ),
+            Arc::new(
+                PptxParser::new()
+                    .with_max_bytes(max_file_size_bytes)
+                    .with_limits(limits.clone()),
+            ),
+            Arc::new(
+                PdfParser::new()
+                    .with_max_bytes(max_file_size_bytes)
+                    .with_limits(limits.clone()),
+            ),
+            Arc::new(
+                DocxParser::new()
+                    .with_max_bytes(max_file_size_bytes)
+                    .with_limits(limits.clone()),
+            ),
             Arc::new(ImageParser::new()),
             Arc::new(StubParser::new().with_max_bytes(max_file_size_bytes)),
         ];
@@ -215,11 +237,16 @@ impl Gear for FileParserGear {
         info!("Registered {} parser backends", parsers.len());
 
         // Bind libpdfium now, so a broken deployment shows in the startup log
-        // rather than as failures on the first PDF.
-        match tokio::task::spawn_blocking(crate::infra::parsers::pdf::check_engine).await {
-            Ok(Ok(())) => debug!("PDF engine ready"),
-            Ok(Err(e)) => warn!("PDF parsing is unavailable: {e}"),
-            Err(e) => warn!("PDF engine check did not finish: {e}"),
+        // rather than as failures on the first PDF. The check can take up to
+        // its own timeout; shutdown does not wait for it.
+        tokio::select! {
+            result = crate::infra::parsers::pdf::check_engine() => match result {
+                Ok(()) => debug!("PDF engine ready"),
+                Err(e) => warn!(error = %e, "PDF parsing is unavailable"),
+            },
+            () = ctx.cancellation_token().cancelled() => {
+                return Err(anyhow::anyhow!("file-parser init cancelled during the PDF engine check"));
+            }
         }
 
         // Canonicalize at startup so we only do it once.

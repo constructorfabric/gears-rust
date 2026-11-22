@@ -13,133 +13,82 @@ mod layout;
 mod structure;
 #[cfg(test)]
 mod tests;
+mod worker;
 
 pub(crate) use engine::check_engine;
 
-use std::path::Path;
-
-use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::domain::error::DomainError;
-use crate::domain::ir::{DocumentBuilder, ParsedBlock, ParsedDocument, ParsedSource};
-use crate::domain::parser::FileParserBackend;
+use crate::domain::ir::ParsedBlock;
+use crate::domain::mime_table;
 
-use super::bounded_read::read_bounded;
+use super::backend::{DocumentFormat, DocumentParser, ReadDocument, run_blocking};
 use super::limits::{ParseLimits, TextBudget};
 
-/// Ceiling applied by [`PdfParser::new`], matching `FileParserConfig`'s
-/// `max_file_size_mb` default; `Gear::init` passes the configured value.
-const DEFAULT_MAX_BYTES: u64 = 100 * 1024 * 1024;
-
-const SUPPORTED_EXTENSIONS: &[&str] = &["pdf"];
-
-const CONTENT_TYPE: &str = "application/pdf";
+/// PDF, read through libpdfium.
+pub struct Pdf;
 
 /// PDF parser.
-pub struct PdfParser {
-    max_bytes: u64,
-    limits: ParseLimits,
-}
+pub type PdfParser = DocumentParser<Pdf>;
 
-impl PdfParser {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            max_bytes: DEFAULT_MAX_BYTES,
-            limits: ParseLimits::default(),
-        }
-    }
+impl DocumentFormat for Pdf {
+    const ID: &'static str = "pdf";
+    const EXTENSIONS: &'static [&'static str] = &["pdf"];
 
-    /// Caps how much of a local file is read into memory.
-    #[must_use]
-    pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
-        self.max_bytes = max_bytes;
-        self
-    }
-
-    /// Replaces the default [`ParseLimits`].
-    #[must_use]
-    pub fn with_limits(mut self, limits: ParseLimits) -> Self {
-        self.limits = limits;
-        self
-    }
-
-    async fn parse(
-        &self,
+    async fn read(
         bytes: Bytes,
-        source: ParsedSource,
-        filename: Option<&str>,
-    ) -> Result<ParsedDocument, DomainError> {
-        let limits = self.limits.clone();
-        let pdf = tokio::task::spawn_blocking(move || read_pdf(&bytes, &limits))
-            .await
-            .map_err(|e| DomainError::parse_error(format!("PDF task failed: {e}")))??;
-
-        let mut builder = DocumentBuilder::new(source)
-            .content_type(CONTENT_TYPE)
-            .blocks(pdf.blocks);
-        if let Some(title) = pdf.title.as_deref().or(filename) {
-            builder = builder.title(title);
-        }
-        if let Some(filename) = filename {
-            builder = builder.original_filename(filename);
-        }
-        Ok(builder.build())
+        _content_type: Option<String>,
+        limits: ParseLimits,
+    ) -> Result<ReadDocument, DomainError> {
+        let pdf = read_pdf(bytes, limits).await?;
+        Ok(ReadDocument::new(mime_table::PDF, pdf.title, pdf.blocks))
     }
 }
 
-impl Default for PdfParser {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl FileParserBackend for PdfParser {
-    fn id(&self) -> &'static str {
-        "pdf"
-    }
-
-    fn supported_extensions(&self) -> &'static [&'static str] {
-        SUPPORTED_EXTENSIONS
-    }
-
-    async fn parse_local_path(
-        &self,
-        path: &Path,
-        _resolved_content_type: Option<&str>,
-    ) -> Result<ParsedDocument, DomainError> {
-        let bytes = read_bounded(path, self.max_bytes).await?;
-        let filename = path.file_name().and_then(|s| s.to_str());
-        let source = ParsedSource::LocalPath(path.display().to_string());
-        self.parse(Bytes::from(bytes), source, filename).await
-    }
-
-    async fn parse_bytes(
-        &self,
-        filename_hint: Option<&str>,
-        _content_type: Option<&str>,
-        bytes: Bytes,
-    ) -> Result<ParsedDocument, DomainError> {
-        let source = ParsedSource::Uploaded {
-            original_name: filename_hint.unwrap_or("unknown").to_owned(),
-        };
-        self.parse(bytes, source, filename_hint).await
-    }
-}
-
-struct Pdf {
+struct PdfDocument {
     title: Option<String>,
     blocks: Vec<ParsedBlock>,
 }
 
-fn read_pdf(bytes: &[u8], limits: &ParseLimits) -> Result<Pdf, DomainError> {
+/// What the engine thread hands back: the lines of every page, and the text
+/// budget they were charged to.
+struct PdfLines {
+    title: Option<String>,
+    pages: Vec<structure::Page>,
+    budget: TextBudget,
+}
+
+/// Reads `bytes`: glyphs and lines on the PDF engine thread, then structure
+/// on the blocking pool. Structure is plain Rust over the whole document, so
+/// it does not hold the one pdfium thread the next document waits for.
+// cancel-safe: as `engine::run` while reading; dropping it during structure
+// discards the result of a bounded computation.
+async fn read_pdf(bytes: Bytes, limits: ParseLimits) -> Result<PdfDocument, DomainError> {
+    let run_limits = limits.clone();
+    let lines = engine::run(&run_limits, move |engine| collect(engine, &bytes, &limits)).await?;
+    run_blocking("PDF", move || {
+        let PdfLines {
+            title,
+            pages,
+            mut budget,
+        } = lines;
+        let blocks = structure::blocks(pages, &mut budget)?;
+        Ok(PdfDocument { title, blocks })
+    })
+    .await
+}
+
+fn collect(
+    engine: &engine::Engine<'_>,
+    bytes: &[u8],
+    limits: &ParseLimits,
+) -> Result<PdfLines, DomainError> {
     let mut budget = TextBudget::new(limits);
     let mut pages = Vec::new();
     // Lines, not glyphs, are kept across pages: structure needs the whole
     // document (body size, running headers), and lines are charged as text.
-    let info = engine::read_document(bytes, limits, &mut |page| {
+    let info = engine.read_document(bytes, limits, &mut |page| {
         let lines = layout::page_lines(page.glyphs, &mut budget)?;
         pages.push(structure::Page {
             lines,
@@ -147,8 +96,9 @@ fn read_pdf(bytes: &[u8], limits: &ParseLimits) -> Result<Pdf, DomainError> {
         });
         Ok(())
     })?;
-    Ok(Pdf {
+    Ok(PdfLines {
         title: info.title,
-        blocks: structure::blocks(pages),
+        pages,
+        budget,
     })
 }

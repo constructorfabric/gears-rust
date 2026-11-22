@@ -1,9 +1,14 @@
-#![allow(clippy::format_in_format_args)] // nested markup reads best inline
+#![expect(
+    clippy::format_in_format_args,
+    reason = "nested markup reads best inline"
+)]
 
 use std::fmt::Write as _;
 
+use super::body::MAX_FIELDS;
 use super::*;
 use crate::domain::ir::{Inline, InlineStyle, TableBlock, TableCell, TableRow};
+use crate::infra::parsers::limits::BLOCK_COST;
 use crate::infra::parsers::ooxml::test_zip;
 
 const W: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing""#;
@@ -112,11 +117,11 @@ impl Package {
         test_zip::build(&parts)
     }
 
-    fn read(&self) -> Docx {
+    fn read(&self) -> DocxDocument {
         self.read_with(&ParseLimits::default())
     }
 
-    fn read_with(&self, limits: &ParseLimits) -> Docx {
+    fn read_with(&self, limits: &ParseLimits) -> DocxDocument {
         read_docx(self.bytes(), limits).expect("document reads")
     }
 
@@ -986,7 +991,7 @@ fn text_limit_is_enforced() {
 }
 
 #[test]
-fn deeply_nested_tables_and_boxes_do_not_overflow() {
+fn deeply_nested_tables_do_not_overflow() {
     let depth = 300;
     let mut body = String::new();
     for _ in 0..depth {
@@ -996,11 +1001,17 @@ fn deeply_nested_tables_and_boxes_do_not_overflow() {
     for _ in 0..depth {
         body.push_str("</w:tc></w:tr></w:tbl>");
     }
-    let out = blocks(&body);
-    assert!(format!("{out:?}").contains("core"));
+    // A table inside a cell joins that cell, past MAX_TABLE_DEPTH too: one
+    // table with one cell is left.
+    assert_eq!(
+        blocks(&body),
+        [ParsedBlock::Table(TableBlock {
+            rows: vec![row(true, &["core"])]
+        })]
+    );
 }
 
-// --- review fixes ----------------------------------------------------------------------
+// --- budgets, fields and edge cases ----------------------------------------------------
 
 #[test]
 fn empty_code_paragraphs_with_page_breaks_stay_linear() {
@@ -1013,15 +1024,29 @@ fn empty_code_paragraphs_with_page_breaks_stay_linear() {
         max_compression_ratio: 100_000,
         ..ParseLimits::default()
     };
-    let started = std::time::Instant::now();
     assert!(pkg.read_with(&limits).blocks.is_empty());
-    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    // What the body gives for a million of them, tidied directly: a few
+    // tenths of a second. Removing page breaks one at a time takes about
+    // ten minutes, far past nextest's two-minute kill.
+    let empty_code = ParsedBlock::CodeBlock {
+        language: None,
+        code: String::new(),
+    };
+    let body: Vec<ParsedBlock> = [empty_code, ParsedBlock::PageBreak]
+        .into_iter()
+        .cycle()
+        .take(1_000_000)
+        .collect();
+    assert!(tidy(body).is_empty());
 }
 
 #[test]
 fn long_style_names_are_read_once() {
-    let name = "x".repeat(200_000);
-    let mut pkg = Package::new(&p("", &["a"]).repeat(2_000));
+    // An 8 MB style name and 40,000 paragraphs: reading the name once is
+    // quick; reading it again per paragraph moves 3e11 bytes, several
+    // minutes, far past nextest's two-minute kill.
+    let name = "x".repeat(8_000_000);
+    let mut pkg = Package::new(&p("", &["a"]).repeat(40_000));
     pkg.set(
         "word/styles.xml",
         &format!(r#"<w:styles xmlns:w="w"><w:style w:type="paragraph" w:default="1" w:styleId="N"><w:name w:val="{name}"/></w:style></w:styles>"#),
@@ -1030,9 +1055,7 @@ fn long_style_names_are_read_once() {
         max_compression_ratio: 100_000,
         ..ParseLimits::default()
     };
-    let started = std::time::Instant::now();
-    assert_eq!(pkg.read_with(&limits).blocks.len(), 2_000);
-    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(pkg.read_with(&limits).blocks.len(), 40_000);
 }
 
 #[test]
@@ -1070,6 +1093,49 @@ fn nested_tables_share_the_cell_budget() {
         [crate::infra::parsers::limits::skipped_table_note(0)],
         "{out:?}"
     );
+}
+
+#[test]
+fn skipped_table_notes_are_charged() {
+    // The first table spends the one-cell budget; each later one becomes a
+    // note, which must cost text like any paragraph.
+    let empty = "<w:tbl><w:tr><w:tc></w:tc><w:tc></w:tc></w:tr></w:tbl>".repeat(200);
+    let limits = ParseLimits {
+        max_table_cells: 1,
+        max_text_bytes: 10_000,
+        ..ParseLimits::default()
+    };
+    let err = Package::new(&empty).error(&limits);
+    assert!(err.contains("max_text_bytes"), "{err}");
+}
+
+#[test]
+fn rules_and_images_are_charged_as_blocks() {
+    let rule =
+        r#"<w:p><w:r><w:pict><v:rect xmlns:v="v" xmlns:o="o" o:hr="t"/></w:pict></w:r></w:p>"#;
+    let image = r#"<w:p><w:r><w:drawing><wp:inline><wp:docPr id="1" descr="a"/></wp:inline></w:drawing></w:r></w:p>"#;
+    let body = format!("{rule}{image}").repeat(100);
+    let with = |max_text_bytes| ParseLimits {
+        max_text_bytes,
+        ..ParseLimits::default()
+    };
+    // 200 blocks and the images' one-byte alt texts.
+    let cost = 200 * BLOCK_COST + 100;
+    assert_eq!(Package::new(&body).read_with(&with(cost)).blocks.len(), 200);
+    let err = Package::new(&body).error(&with(cost - 1));
+    assert!(err.contains("max_text_bytes"), "{err}");
+}
+
+#[test]
+fn simple_field_instructions_are_cut_like_complex_ones() {
+    // Only the first 2048 characters are read, so a huge instruction is
+    // never split into tokens whole; a target past them is not seen.
+    let pad = " ".repeat(2_100);
+    let body = format!(
+        r#"<w:p><w:fldSimple w:instr='HYPERLINK{pad}"https://x.org/"'>{}</w:fldSimple></w:p>"#,
+        run("", &t("x"))
+    );
+    assert_eq!(blocks(&body), [para("x")]);
 }
 
 #[test]
@@ -1196,13 +1262,12 @@ fn deleted_rows_and_cells_are_dropped() {
         format!("<w:tr>{}</w:tr>", tc("", "last")),
     ]
     .concat();
-    let out = blocks(&tbl(&rows));
-    let text = format!("{out:?}");
-    assert!(
-        !text.contains("gone") && !text.contains("deleted row"),
-        "{text}"
+    assert_eq!(
+        blocks(&tbl(&rows)),
+        [ParsedBlock::Table(TableBlock {
+            rows: vec![row(true, &["keep"]), row(false, &["last"])]
+        })]
     );
-    assert!(text.contains("keep") && text.contains("last"), "{text}");
 }
 
 #[test]
@@ -1257,6 +1322,344 @@ fn nested_text_boxes_are_read() {
             "<w:p><w:r><w:drawing><w:txbxContent>{inner}</w:txbxContent></w:drawing></w:r></w:p>"
         );
     }
-    let out = blocks(&inner);
-    assert!(format!("{out:?}").contains("innermost"), "{out:?}");
+    // Boxes nest apart to MAX_BOX_DEPTH, deeper ones join their host: the
+    // text comes out once.
+    assert_eq!(blocks(&inner), [para("innermost")]);
+}
+
+#[test]
+fn fields_nested_past_the_cap_stay_balanced() {
+    let depth = MAX_FIELDS + 5;
+    let mut body = String::from("<w:p>");
+    for _ in 0..depth {
+        body.push_str(&fld("begin"));
+        body.push_str(&instr(" IF "));
+    }
+    for level in (0..depth).rev() {
+        body.push_str(&fld("separate"));
+        body.push_str(&run("", &t(&format!("r{level}"))));
+        body.push_str(&fld("end"));
+    }
+    body.push_str("</w:p>");
+    body.push_str(&p("", &["after"]));
+    // Inner results are part of the outer instructions; only the outermost
+    // result shows, and the next paragraph is untouched.
+    assert_eq!(blocks(&body), [para("r0"), para("after")]);
+}
+
+#[test]
+fn truncated_and_mangled_documents_never_panic() {
+    let body = format!(
+        "{}{}<w:p>{}{}{}{}{}</w:p>{}<w:sdt><w:sdtContent>{}</w:sdtContent></w:sdt>",
+        p(&style("Heading1"), &["Title"]),
+        tbl(&format!(
+            "<w:tr>{}{}</w:tr>",
+            tc(r#"<w:gridSpan w:val="2"/>"#, "cell"),
+            tc("", &tbl(&format!("<w:tr>{}</w:tr>", tc("", "inner"))))
+        )),
+        fld("begin"),
+        instr(r#" HYPERLINK "https://example.com/" "#),
+        fld("separate"),
+        run("<w:b/>", &t("link")),
+        fld("end"),
+        "<w:p><w:r><w:drawing><w:txbxContent><w:p><w:r><w:t>box</w:t></w:r></w:p></w:txbxContent></w:drawing></w:r></w:p>",
+        p("", &["in sdt"]),
+    );
+    let document = format!("<w:document {W}><w:body>{body}<w:sectPr/></w:body></w:document>");
+    let mut seed: u32 = 0x2545_F491;
+    for cut in (0..document.len()).step_by(5) {
+        let Some(prefix) = document.get(..cut) else {
+            continue;
+        };
+        let mut pkg = Package::new("");
+        pkg.set("word/document.xml", prefix);
+        drop(read_docx(pkg.bytes(), &ParseLimits::default()));
+        // Swap two random bytes of the ASCII document.
+        let mut bytes = document.clone().into_bytes();
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        let len = u32::try_from(bytes.len()).unwrap();
+        let i = usize::try_from(seed % len).unwrap();
+        let j = usize::try_from((seed >> 7) % len).unwrap();
+        bytes.swap(i, j);
+        pkg.set("word/document.xml", &String::from_utf8_lossy(&bytes));
+        drop(read_docx(pkg.bytes(), &ParseLimits::default()));
+    }
+}
+
+// --- revisions, legacy pictures, styles and merges ---------------------------------------
+
+fn styles_with(extra: &str) -> String {
+    STYLES.replace("</w:styles>", &format!("{extra}</w:styles>"))
+}
+
+#[test]
+fn legacy_vml_pictures_come_out_once_per_shape() {
+    let pict = |inner: &str| format!("<w:p><w:r><w:pict>{inner}</w:pict></w:r></w:p>");
+    let body = [
+        pict(r#"<v:shape xmlns:v="v" xmlns:o="o" alt="Chart"><v:imagedata r:id="rI" o:title="chart1"/></v:shape>"#),
+        pict(&format!(
+            r#"<v:shape xmlns:v="v" alt="Box"><v:textbox><w:txbxContent>{}</w:txbxContent></v:textbox></v:shape>"#,
+            p("", &["boxed"])
+        )),
+        pict(r#"<v:rect xmlns:v="v" xmlns:o="o"><v:imagedata o:title="framed"/></v:rect>"#),
+    ]
+    .concat();
+    assert_eq!(
+        blocks(&body),
+        [
+            ParsedBlock::Image {
+                alt: Some("Chart".to_owned()),
+                title: Some("chart1".to_owned()),
+                src: None
+            },
+            para("boxed"),
+            ParsedBlock::Image {
+                alt: None,
+                title: Some("framed".to_owned()),
+                src: None
+            },
+        ]
+    );
+}
+
+#[test]
+fn a_deleted_paragraph_mark_joins_the_next_paragraph() {
+    let deleted = r#"<w:rPr><w:del w:id="1" w:author="a"/></w:rPr>"#;
+    let body = [
+        // The joined paragraph takes the properties of the mark that stays.
+        p(deleted, &["one "]),
+        p(&style("827"), &["two"]),
+        // All of it deleted: nothing is left.
+        format!(
+            "<w:p><w:pPr>{deleted}</w:pPr><w:del>{}</w:del></w:p>",
+            r"<w:r><w:delText>gone</w:delText></w:r>"
+        ),
+        p("", &["three"]),
+        // A table ends the joined paragraph.
+        p(deleted, &["four"]),
+        tbl(&format!("<w:tr>{}</w:tr>", tc("", "cell"))),
+        // A mark with other run properties stays.
+        p(r"<w:rPr><w:b/><w:ins w:id='2'/></w:rPr>", &["five"]),
+        p("", &["six"]),
+    ]
+    .concat();
+    assert_eq!(
+        blocks(&body),
+        [
+            heading(1, "one two"),
+            para("three"),
+            para("four"),
+            ParsedBlock::Table(TableBlock {
+                rows: vec![row(true, &["cell"])]
+            }),
+            para("five"),
+            para("six"),
+        ]
+    );
+}
+
+#[test]
+fn a_picture_in_a_text_box_keeps_its_own_shape() {
+    let body = format!(
+        "<w:p><w:r><w:pict>{}</w:pict></w:r></w:p>",
+        r#"<v:shape xmlns:v="v" xmlns:o="o"><v:textbox><w:txbxContent><w:p><w:r><w:pict><v:rect><v:imagedata o:title="inner"/></v:rect></w:pict></w:r></w:p></w:txbxContent></v:textbox></v:shape>"#
+    );
+    assert_eq!(
+        blocks(&body),
+        [ParsedBlock::Image {
+            alt: None,
+            title: Some("inner".to_owned()),
+            src: None
+        }]
+    );
+}
+
+#[test]
+fn a_moved_away_paragraph_mark_joins_the_next_paragraph() {
+    let body = [
+        p(
+            r#"<w:rPr><w:moveFrom w:id="1" w:author="a"/></w:rPr>"#,
+            &["one "],
+        ),
+        p("", &["two"]),
+    ]
+    .concat();
+    assert_eq!(blocks(&body), [para("one two")]);
+}
+
+#[test]
+fn the_nearest_style_decides_the_role() {
+    let mut pkg = Package::new(
+        &[
+            p(&style("QuoteOn9"), &["quoted"]),
+            p("", &["-"]),
+            p(&style("TitleOn9"), &["titled"]),
+            p(&style("BodyOnH1"), &["body"]),
+            p(
+                &format!("{}<w:outlineLvl w:val=\"9\"/>", style("Q")),
+                &["still quoted"],
+            ),
+            p("", &["-"]),
+            p(
+                &format!("{}<w:outlineLvl w:val=\"9\"/>", style("Pre")),
+                &["still code"],
+            ),
+            p(
+                &format!("{}<w:outlineLvl w:val=\"9\"/>", style("Heading3")),
+                &["not by id"],
+            ),
+        ]
+        .concat(),
+    );
+    pkg.set(
+        "word/styles.xml",
+        &styles_with(concat!(
+            r#"<w:style w:type="paragraph" w:styleId="Body9"><w:name w:val="Body9"/><w:pPr><w:outlineLvl w:val="9"/></w:pPr></w:style>"#,
+            r#"<w:style w:type="paragraph" w:styleId="QuoteOn9"><w:name w:val="Quote"/><w:basedOn w:val="Body9"/></w:style>"#,
+            r#"<w:style w:type="paragraph" w:styleId="TitleOn9"><w:name w:val="Title"/><w:basedOn w:val="Body9"/></w:style>"#,
+            r#"<w:style w:type="paragraph" w:styleId="BodyOnH1"><w:name w:val="Mine"/><w:basedOn w:val="827"/><w:pPr><w:outlineLvl w:val="9"/></w:pPr></w:style>"#,
+        )),
+    );
+    let quote = |text| ParsedBlock::Quote {
+        blocks: vec![para(text)],
+    };
+    assert_eq!(
+        pkg.read().blocks,
+        [
+            quote("quoted"),
+            para("-"),
+            heading(1, "titled"),
+            para("body"),
+            quote("still quoted"),
+            para("-"),
+            ParsedBlock::CodeBlock {
+                language: None,
+                code: "still code".to_owned()
+            },
+            para("not by id"),
+        ]
+    );
+}
+
+#[test]
+fn hyperlink_fields_with_unsafe_targets_stay_text() {
+    let complex = |instruction: &str, text: &str| {
+        format!(
+            "{}{}{}{}{}",
+            fld("begin"),
+            instr(instruction),
+            fld("separate"),
+            run("", &t(text)),
+            fld("end")
+        )
+    };
+    let body = format!(
+        "<w:p>{}{}{}{}{}{}</w:p>",
+        complex(r#" HYPERLINK "javascript:alert(1)" "#, "a"),
+        complex(r#" HYPERLINK "data:text/html,x" "#, " b"),
+        r#"<w:fldSimple w:instr=' HYPERLINK "javascript:alert(1)" '><w:r><w:t> c</w:t></w:r></w:fldSimple>"#,
+        r#"<w:fldSimple w:instr=' HYPERLINK "data:text/html,x" '><w:r><w:t> d</w:t></w:r></w:fldSimple>"#,
+        complex(r#" HYPERLINK "https://example.com/" \l "usage" "#, "e"),
+        complex(r#" HYPERLINK \l "_Toc1" "#, " f"),
+    );
+    assert_eq!(
+        blocks(&body),
+        [ParsedBlock::Paragraph {
+            inlines: vec![
+                Inline::plain("a b c d"),
+                Inline::link("e", "https://example.com/#usage"),
+                Inline::plain(" f"),
+            ]
+        }]
+    );
+}
+
+#[test]
+fn horizontal_merges_and_grid_after() {
+    let rows = [
+        format!(
+            "<w:tr><w:trPr><w:gridAfter w:val=\"2\"/></w:trPr>{}{}</w:tr>",
+            tc(r#"<w:hMerge w:val="restart"/>"#, "merged"),
+            tc("<w:hMerge/>", "GONE")
+        ),
+        format!(
+            "<w:tr>{}{}{}{}</w:tr>",
+            tc("", "a"),
+            tc("", "b"),
+            tc("", "c"),
+            tc("", "d")
+        ),
+    ]
+    .concat();
+    assert_eq!(
+        blocks(&tbl(&rows)),
+        [ParsedBlock::Table(TableBlock {
+            rows: vec![
+                row(true, &["merged", "", "", ""]),
+                row(false, &["a", "b", "c", "d"]),
+            ]
+        })]
+    );
+}
+
+#[test]
+fn spans_are_clamped_to_the_column_limit() {
+    let limits = ParseLimits {
+        max_table_columns: 5,
+        ..ParseLimits::default()
+    };
+    let rows = format!(
+        "<w:tr><w:trPr><w:gridBefore w:val=\"100\"/></w:trPr></w:tr><w:tr>{}</w:tr>",
+        tc(r#"<w:gridSpan w:val="100"/>"#, "x")
+    );
+    let out = Package::new(&tbl(&rows)).read_with(&limits).blocks;
+    let ParsedBlock::Table(table) = &out[0] else {
+        panic!("{out:?}");
+    };
+    let widths: Vec<usize> = table.rows.iter().map(|r| r.cells.len()).collect();
+    assert_eq!(widths, [5, 5]);
+    assert_eq!(table.rows[1].cells[0], cell("x"));
+}
+
+#[test]
+fn picture_titles_are_kept() {
+    let body = format!(
+        "<w:p>{}</w:p>",
+        drawing(r#"<wp:docPr id="1" name="Picture 1" descr=" " title="Logo"/>"#)
+    );
+    assert_eq!(
+        blocks(&body),
+        [ParsedBlock::Image {
+            alt: None,
+            title: Some("Logo".to_owned()),
+            src: None
+        }]
+    );
+}
+
+#[test]
+fn text_boxes_in_table_cells_stay_in_the_cell() {
+    let content = format!(
+        "<w:p>{}<w:r><w:drawing><wps:txbx xmlns:wps=\"s\"><w:txbxContent>{}</w:txbxContent></wps:txbx></w:drawing></w:r></w:p>",
+        run("", &t("host")),
+        p("", &["boxed"])
+    );
+    let rows = format!("<w:tr><w:tc>{content}</w:tc>{}</w:tr>", tc("", "side"));
+    let out = blocks(&tbl(&rows));
+    assert_eq!(
+        out,
+        [ParsedBlock::Table(TableBlock {
+            rows: vec![TableRow {
+                is_header: true,
+                cells: vec![
+                    TableCell {
+                        blocks: vec![para("host"), para("boxed")]
+                    },
+                    cell("side"),
+                ]
+            }]
+        })]
+    );
 }

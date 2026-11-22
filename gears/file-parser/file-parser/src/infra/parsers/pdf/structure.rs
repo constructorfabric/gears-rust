@@ -22,11 +22,13 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::domain::error::DomainError;
 use crate::domain::ir::{Inline, InlineStyle, ParsedBlock};
 use crate::infra::parsers::inlines::Inlines;
+use crate::infra::parsers::limits::TextBudget;
 
-use super::engine::Direction;
-use super::layout::{Line, Run, starts_paragraph, usual_pitch};
+use super::engine::{Direction, Rect};
+use super::layout::{Line, Run, from_half_points, half_points, starts_paragraph, usual_pitch};
 
 /// Running headers and footers live in this fraction of the page height at
 /// the top and the bottom.
@@ -68,7 +70,7 @@ const RULE_MIN_WIDTH: f32 = 0.4;
 /// The lines of one page and its visible area.
 pub(super) struct Page {
     pub(super) lines: Vec<Line>,
-    pub(super) area: Option<[f32; 4]>,
+    pub(super) area: Option<Rect>,
 }
 
 /// A page being structured.
@@ -76,8 +78,8 @@ struct Sheet {
     lines: Vec<Line>,
     /// Text of each line, computed once.
     texts: Vec<String>,
-    /// Column of each line: 0 outside columns, 1 left, 2 right.
-    columns: Vec<u8>,
+    /// Column of each line.
+    columns: Vec<Column>,
     /// The direction most of the page's text runs in; "upright" for the
     /// rules below.
     dominant: Direction,
@@ -99,8 +101,13 @@ impl Sheet {
     }
 }
 
-/// The blocks of a document, pages separated by page breaks.
-pub(super) fn blocks(mut pages: Vec<Page>) -> Vec<ParsedBlock> {
+/// The blocks of a document, pages separated by page breaks. Line text was
+/// charged to `budget` when the lines were built; the line breaks and spaces
+/// that join lines here, and the blocks, are charged now.
+pub(super) fn blocks(
+    mut pages: Vec<Page>,
+    budget: &mut TextBudget,
+) -> Result<Vec<ParsedBlock>, DomainError> {
     remove_running_text(&mut pages);
     let sheets: Vec<Sheet> = pages.into_iter().map(prepare).collect();
     let body = body_size(&sheets);
@@ -109,12 +116,13 @@ pub(super) fn blocks(mut pages: Vec<Page>) -> Vec<ParsedBlock> {
     let mut out = Vec::new();
     for (i, sheet) in sheets.iter().enumerate() {
         if i > 0 {
+            budget.charge_block()?;
             out.push(ParsedBlock::PageBreak);
         }
         let headings = headings.get(i).map_or(&[][..], Vec::as_slice);
-        assemble(sheet, headings, &tiers, &mut out);
+        assemble(sheet, headings, &tiers, budget, &mut out)?;
     }
-    out
+    Ok(out)
 }
 
 fn letters_of(text: &str) -> usize {
@@ -140,7 +148,7 @@ fn dominant_direction(lines: &[Line]) -> Direction {
 fn prepare(page: Page) -> Sheet {
     let dominant = dominant_direction(&page.lines);
     let texts = page.lines.iter().map(Line::text).collect();
-    let columns = vec![0; page.lines.len()];
+    let columns = vec![Column::Spanning; page.lines.len()];
     let mut sheet = Sheet {
         lines: page.lines,
         texts,
@@ -154,14 +162,17 @@ fn prepare(page: Page) -> Sheet {
 // --- running headers and footers ----------------------------------------------
 
 /// The margin band and position step of a line, if it sits in a band.
-fn band(line: &Line, area: Option<[f32; 4]>) -> Option<(bool, i32)> {
-    let [_, bottom, _, top] = area?;
+fn band(line: &Line, area: Option<Rect>) -> Option<(bool, i32)> {
+    let Rect { bottom, top, .. } = area?;
     let height = top - bottom;
     if line.direction != Direction::Deg0 || height.is_nan() || height <= 0.0 {
         return None;
     }
     let relative = (line.baseline - bottom) / height;
-    #[allow(clippy::cast_possible_truncation)] // relative is within 0..=1 here
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "relative is within 0..=1 here"
+    )]
     let step = (relative / RUNNING_POSITION_STEP).round() as i32;
     if relative > 1.0 - MARGIN_BAND && relative <= 1.0 {
         Some((true, step))
@@ -189,7 +200,7 @@ struct Margin {
     has_letters: bool,
 }
 
-fn margin(line: &Line, area: Option<[f32; 4]>) -> Option<Margin> {
+fn margin(line: &Line, area: Option<Rect>) -> Option<Margin> {
     let (side, step) = band(line, area)?;
     let text = line.text().trim().to_lowercase();
     let mut masked = String::with_capacity(text.len());
@@ -224,7 +235,7 @@ fn margin(line: &Line, area: Option<[f32; 4]>) -> Option<Margin> {
 /// Whether pages `on` (sorted, distinct) make up most of the document, or
 /// most of its odd or even pages.
 fn repeats(on: &[usize], pages: usize) -> bool {
-    #[allow(clippy::cast_precision_loss)] // page counts are small
+    #[expect(clippy::cast_precision_loss, reason = "page counts are small")]
     let share = |count: usize, of: usize| count >= 2 && count as f32 >= RUNNING_SHARE * of as f32;
     let even = on.iter().filter(|p| *p % 2 == 0).count();
     let odd = on.len() - even;
@@ -314,6 +325,15 @@ fn tracks_page(occurrences: &[(usize, &[u32])]) -> bool {
 
 // --- columns ----------------------------------------------------------------------
 
+/// Where a line sits in a two-column band.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Column {
+    /// Outside any two-column band.
+    Spanning,
+    Left,
+    Right,
+}
+
 /// Reads two-column parts of a page column by column. The page is cut into
 /// bands at lines that span the text width; each band with a gutter and prose
 /// on both sides is reordered: its left lines, then its right lines.
@@ -377,7 +397,11 @@ fn split_band(sheet: &mut Sheet, start: usize, end: usize, width: f32) {
         let (Some(line), Some(text)) = (sheet.lines.get(i), sheet.texts.get(i)) else {
             return;
         };
-        columns.push(if line.left >= gap_right { 2 } else { 1 });
+        columns.push(if line.left >= gap_right {
+            Column::Right
+        } else {
+            Column::Left
+        });
         lines.push(line.clone());
         texts.push(text.clone());
     }
@@ -427,7 +451,10 @@ fn gutter(band: &[Line], texts: &[String], width: f32) -> Option<(f32, f32)> {
                 c + letters_of(t),
             )
         });
-        #[allow(clippy::cast_precision_loss)] // character counts stay far below 2^24
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "character counts stay far below 2^24"
+        )]
         let letter_share = letters as f32 / chars.max(1) as f32;
         median >= COLUMN_MIN_LINE_WIDTH * width && letter_share >= COLUMN_MIN_LETTERS
     };
@@ -436,16 +463,6 @@ fn gutter(band: &[Line], texts: &[String], width: f32) -> Option<(f32, f32)> {
 }
 
 // --- sizes and headings -----------------------------------------------------------
-
-#[allow(clippy::cast_possible_truncation)] // sizes are small, finite points
-fn half_points(size: f32) -> i32 {
-    (size * 2.0).round().clamp(0.0, 1.0e6) as i32
-}
-
-#[allow(clippy::cast_precision_loss)] // bins stay far below 2^24
-fn from_half_points(bin: i32) -> f32 {
-    bin as f32 / 2.0
-}
 
 /// The size most of the document's characters have; ties go to the smaller.
 fn body_size(sheets: &[Sheet]) -> f32 {
@@ -560,6 +577,15 @@ fn heading_candidates(sheet: &Sheet, body: f32) -> Vec<bool> {
     flags
 }
 
+/// Index of the tier `bin` belongs to: the first (largest) tier at most
+/// half a point above it. `tiers` is strictly descending, so this is a binary
+/// search; a linear scan per candidate line was quadratic in the number of
+/// distinct sizes, which a document chooses.
+pub(super) fn tier_of(tiers: &[i32], bin: i32) -> Option<usize> {
+    let at = tiers.partition_point(|&t| t - bin > 1);
+    (at < tiers.len()).then_some(at)
+}
+
 /// The heading sizes kept and their levels.
 struct Tiers {
     /// Kept tier sizes (half points), largest first; level = index + 1.
@@ -589,10 +615,7 @@ impl Tiers {
                 tiers.push(bin);
             }
         }
-        let tier_of = |size: f32| {
-            let bin = half_points(size);
-            tiers.iter().position(|&t| t - bin <= 1)
-        };
+        let tier_of = |size: f32| tier_of(&tiers, half_points(size));
         let mut uses = vec![0_usize; tiers.len()];
         for (sheet, flags) in sheets.iter().zip(headings.iter()) {
             for (line, flag) in sheet.lines.iter().zip(flags) {
@@ -761,7 +784,13 @@ fn ends_clause(text: &str) -> bool {
     text.trim_end().ends_with(['.', '!', '?', ':', ';'])
 }
 
-fn assemble(sheet: &Sheet, headings: &[bool], tiers: &Tiers, out: &mut Vec<ParsedBlock>) {
+fn assemble(
+    sheet: &Sheet,
+    headings: &[bool],
+    tiers: &Tiers,
+    budget: &mut TextBudget,
+    out: &mut Vec<ParsedBlock>,
+) -> Result<(), DomainError> {
     let lines = &sheet.lines;
     let pitch = usual_pitch(lines);
     let (text_left, text_right) = sheet.text_span();
@@ -781,8 +810,9 @@ fn assemble(sheet: &Sheet, headings: &[bool], tiers: &Tiers, out: &mut Vec<Parse
             && rule_text(text)
             && line.right - line.left >= RULE_MIN_WIDTH * (text_right - text_left)
         {
-            close(&mut open, out);
+            close(&mut open, budget, out)?;
             list_lefts.clear();
+            budget.charge_block()?;
             out.push(ParsedBlock::HorizontalRule);
             continue;
         }
@@ -800,12 +830,13 @@ fn assemble(sheet: &Sheet, headings: &[bool], tiers: &Tiers, out: &mut Vec<Parse
                     text: t, lines: n, ..
                 } = &mut open
                 {
+                    budget.charge(1)?;
                     t.push(' ');
                     t.push_str(text.trim());
                     *n += 1;
                 }
             } else {
-                close(&mut open, out);
+                close(&mut open, budget, out)?;
                 list_lefts.clear();
                 open = Open::Heading {
                     level,
@@ -825,7 +856,7 @@ fn assemble(sheet: &Sheet, headings: &[bool], tiers: &Tiers, out: &mut Vec<Parse
             && !prev_text.is_some_and(|t| ends_clause(t));
         let marker = list_marker(text).filter(|_| !rule_text(text) && !continues_paragraph);
         if let Some((ordered, drop)) = marker {
-            close(&mut open, out);
+            close(&mut open, budget, out)?;
             while list_lefts.last().is_some_and(|&l| line.left < l - 0.5 * em) {
                 list_lefts.pop();
             }
@@ -861,13 +892,13 @@ fn assemble(sheet: &Sheet, headings: &[bool], tiers: &Tiers, out: &mut Vec<Parse
                 && (line.size - *size).abs() <= 1.0
                 && line.left > *left + 0.3 * *size =>
             {
-                join_line(inlines, &line.runs);
+                join_line(inlines, &line.runs, budget)?;
             }
             Open::Paragraph(inlines) if !breaks_before && !indented => {
-                join_line(inlines, &line.runs);
+                join_line(inlines, &line.runs, budget)?;
             }
             _ => {
-                close(&mut open, out);
+                close(&mut open, budget, out)?;
                 list_lefts.clear();
                 let mut inlines = Inlines::default();
                 push_runs(&mut inlines, &line.runs);
@@ -875,7 +906,8 @@ fn assemble(sheet: &Sheet, headings: &[bool], tiers: &Tiers, out: &mut Vec<Parse
             }
         }
     }
-    close(&mut open, out);
+    close(&mut open, budget, out)?;
+    Ok(())
 }
 
 fn style(run: &Run) -> InlineStyle {
@@ -888,36 +920,44 @@ fn style(run: &Run) -> InlineStyle {
 
 fn push_runs(inlines: &mut Inlines, runs: &[Run]) {
     for run in runs {
-        inlines.push(&run.text, &style(run), None);
+        inlines.push_charged_text(&run.text, &style(run));
     }
 }
 
 /// Appends a line to a paragraph or item: after a line break, or directly
 /// when the previous line ends in a hyphen inside a word that this line
 /// continues in lowercase.
-fn join_line(inlines: &mut Inlines, runs: &[Run]) {
+fn join_line(
+    inlines: &mut Inlines,
+    runs: &[Run],
+    budget: &mut TextBudget,
+) -> Result<(), DomainError> {
     let continues = runs
         .first()
         .and_then(|r| r.text.chars().next())
         .is_some_and(char::is_lowercase);
     if continues && inlines.drop_trailing_hyphen() {
         push_runs(inlines, runs);
-        return;
+        return Ok(());
     }
-    inlines.push("\n", &InlineStyle::default(), None);
+    // After a styled run the break starts a run of its own: charge that too.
+    inlines.push("\n", &InlineStyle::default(), None, budget)?;
     push_runs(inlines, runs);
+    Ok(())
 }
 
-fn close(open: &mut Open, out: &mut Vec<ParsedBlock>) {
-    match std::mem::replace(open, Open::None) {
-        Open::None => {}
+fn close(
+    open: &mut Open,
+    budget: &mut TextBudget,
+    out: &mut Vec<ParsedBlock>,
+) -> Result<(), DomainError> {
+    let block = match std::mem::replace(open, Open::None) {
+        Open::None => None,
         Open::Paragraph(mut inlines) => {
             let inlines = inlines.take();
-            if !inlines.is_empty() {
-                out.push(ParsedBlock::Paragraph { inlines });
-            }
+            (!inlines.is_empty()).then_some(ParsedBlock::Paragraph { inlines })
         }
-        Open::Heading { level, text, .. } => out.push(ParsedBlock::Heading {
+        Open::Heading { level, text, .. } => Some(ParsedBlock::Heading {
             level,
             inlines: vec![Inline::plain(text)],
         }),
@@ -928,13 +968,16 @@ fn close(open: &mut Open, out: &mut Vec<ParsedBlock>) {
             ..
         } => {
             let inlines = inlines.take();
-            if !inlines.is_empty() {
-                out.push(ParsedBlock::ListItem {
-                    level,
-                    ordered,
-                    blocks: vec![ParsedBlock::Paragraph { inlines }],
-                });
-            }
+            (!inlines.is_empty()).then(|| ParsedBlock::ListItem {
+                level,
+                ordered,
+                blocks: vec![ParsedBlock::Paragraph { inlines }],
+            })
         }
+    };
+    if let Some(block) = block {
+        budget.charge_block()?;
+        out.push(block);
     }
+    Ok(())
 }

@@ -8,8 +8,8 @@ use quick_xml::{Reader, XmlVersion};
 /// sequences are replaced.
 pub fn decode_part(mut bytes: Vec<u8>) -> String {
     match bytes.as_slice() {
-        [0xFF, 0xFE, rest @ ..] => decode_utf16(rest, u16::from_le_bytes),
-        [0xFE, 0xFF, rest @ ..] => decode_utf16(rest, u16::from_be_bytes),
+        [0xFF, 0xFE, rest @ ..] => utf16_chars(rest, u16::from_le_bytes).collect(),
+        [0xFE, 0xFF, rest @ ..] => utf16_chars(rest, u16::from_be_bytes).collect(),
         _ => {
             if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
                 bytes.drain(..3);
@@ -20,12 +20,34 @@ pub fn decode_part(mut bytes: Vec<u8>) -> String {
     }
 }
 
-fn decode_utf16(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> String {
+/// The length [`decode_part`] gives `bytes`, found without building it:
+/// lossy decoding can triple the size.
+pub fn decoded_len(bytes: &[u8]) -> usize {
+    match bytes {
+        [0xFF, 0xFE, rest @ ..] => utf16_chars(rest, u16::from_le_bytes)
+            .map(char::len_utf8)
+            .sum(),
+        [0xFE, 0xFF, rest @ ..] => utf16_chars(rest, u16::from_be_bytes)
+            .map(char::len_utf8)
+            .sum(),
+        _ => {
+            let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+            // Lossy decoding puts one U+FFFD (3 bytes) for each invalid run.
+            bytes
+                .utf8_chunks()
+                .map(|chunk| {
+                    let replaced = if chunk.invalid().is_empty() { 0 } else { 3 };
+                    chunk.valid().len() + replaced
+                })
+                .sum()
+        }
+    }
+}
+
+fn utf16_chars(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> impl Iterator<Item = char> + '_ {
     let (pairs, _odd_trailing_byte) = bytes.as_chunks::<2>();
-    let units = pairs.iter().map(|&pair| unit(pair));
-    char::decode_utf16(units)
+    char::decode_utf16(pairs.iter().map(move |&pair| unit(pair)))
         .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
-        .collect()
 }
 
 /// A reader over a decoded part. Text is not trimmed: whitespace inside runs
@@ -105,6 +127,26 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn decoded_len_matches_the_decoded_text() {
+        let inputs: [&[u8]; 7] = [
+            b"plain",
+            b"\xEF\xBB\xBFbom",
+            b"a\xFF\xFEb\xC3",
+            b"\xE2\x82",
+            b"\xFF\xFEa\x00\x3B\x04\x00\xD8x",
+            b"\xFE\xFF\x00a\xD8\x3D\xDE\x00\x01",
+            b"",
+        ];
+        for input in inputs {
+            assert_eq!(
+                decoded_len(input),
+                decode_part(input.to_vec()).len(),
+                "{input:?}"
+            );
+        }
     }
 
     #[test]

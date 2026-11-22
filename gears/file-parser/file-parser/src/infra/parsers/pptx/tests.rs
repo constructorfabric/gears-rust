@@ -4,6 +4,7 @@ use super::styles::{Bullet, ListStyle, Placeholder};
 use super::*;
 
 use crate::domain::ir::{InlineStyle, TableBlock, TableCell, TableRow};
+use crate::infra::parsers::limits::BLOCK_COST;
 use crate::infra::parsers::ooxml::test_zip;
 
 const NS: &str = r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006""#;
@@ -212,8 +213,43 @@ fn headings(blocks: &[ParsedBlock]) -> Vec<String> {
         .collect()
 }
 
+/// Every piece of text a reader would see, one per line: inline text, code,
+/// image descriptions and table cells, in order.
 fn all_text(blocks: &[ParsedBlock]) -> String {
-    format!("{blocks:?}")
+    fn walk(blocks: &[ParsedBlock], out: &mut Vec<String>) {
+        for block in blocks {
+            match block {
+                ParsedBlock::Heading { inlines, .. } | ParsedBlock::Paragraph { inlines } => {
+                    out.push(
+                        inlines
+                            .iter()
+                            .map(|i| match i {
+                                Inline::Text { text, .. }
+                                | Inline::Link { text, .. }
+                                | Inline::Code { text, .. } => text.as_str(),
+                            })
+                            .collect(),
+                    );
+                }
+                ParsedBlock::ListItem { blocks, .. } | ParsedBlock::Quote { blocks } => {
+                    walk(blocks, out);
+                }
+                ParsedBlock::CodeBlock { code, .. } => out.push(code.clone()),
+                ParsedBlock::Table(table) => {
+                    for cell in table.rows.iter().flat_map(|r| &r.cells) {
+                        walk(&cell.blocks, out);
+                    }
+                }
+                ParsedBlock::Image { alt, title, .. } => {
+                    out.extend(alt.iter().chain(title).cloned());
+                }
+                ParsedBlock::HorizontalRule | ParsedBlock::PageBreak => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(blocks, &mut out);
+    out.join("\n")
 }
 
 // --- slides and order ---------------------------------------------------
@@ -227,6 +263,18 @@ fn slides_follow_the_slide_list_not_file_names() {
             r#"<p:presentation {NS}><p:sldIdLst><p:sldId id="300" r:id="rId2"/><p:sldId id="301" r:id="rId1"/></p:sldIdLst></p:presentation>"#
         ),
     );
+    assert_eq!(headings(&pkg.read().blocks), ["A", "B"]);
+}
+
+#[test]
+fn too_many_slides_are_rejected() {
+    let pkg = Package::new(&[slide_xml(&title_sp("A")), slide_xml(&title_sp("B"))]);
+    let limits = ParseLimits {
+        max_sheets: 1,
+        ..ParseLimits::default()
+    };
+    let err = pkg.error(&limits);
+    assert!(err.contains("max_sheets"), "{err}");
     assert_eq!(headings(&pkg.read().blocks), ["A", "B"]);
 }
 
@@ -673,17 +721,37 @@ fn hidden_shapes_and_groups_are_skipped() {
 }
 
 #[test]
-fn footer_is_kept_and_date_and_number_are_dropped() {
+fn footer_date_and_number_are_dropped() {
     let shapes = format!(
-        "{}{}{}",
+        "{}{}{}{}",
         sp(r#"<p:ph type="ftr" idx="11"/>"#, &para("Confidential")),
         sp(
             r#"<p:ph type="sldNum" idx="12"/>"#,
             r#"<a:p><a:fld type="slidenum"><a:t>7</a:t></a:fld></a:p>"#
         ),
         sp(r#"<p:ph type="dt" idx="10"/>"#, &para("1/2/2026")),
+        text_box(&para("Kept")),
     );
-    assert_eq!(one_slide(&shapes), [h2("Slide 1"), p("Confidential")]);
+    assert_eq!(one_slide(&shapes), [h2("Slide 1"), p("Kept")]);
+}
+
+#[test]
+fn an_index_only_placeholder_takes_its_layout_kind() {
+    // The layout's `ftr` placeholder is idx 11: footer, left out.
+    let footer = one_slide(&format!(
+        "{}{}",
+        sp(r#"<p:ph idx="11"/>"#, &para("Confidential")),
+        text_box(&para("Kept")),
+    ));
+    assert_eq!(footer, [h2("Slide 1"), p("Kept")]);
+
+    // A layout title with an index: the slide placeholder is the title.
+    let mut pkg = Package::new(&[slide_xml(&sp(r#"<p:ph idx="7"/>"#, &para("Agenda")))]);
+    pkg.set(
+        "ppt/slideLayouts/slideLayout1.xml",
+        &LAYOUT.replace(r#"<p:ph type="title"/>"#, r#"<p:ph type="title" idx="7"/>"#),
+    );
+    assert_eq!(pkg.read().blocks, [h2("Agenda")]);
 }
 
 #[test]
@@ -808,6 +876,54 @@ fn tables_over_the_cell_budget_become_notes_and_spend_it() {
 }
 
 #[test]
+fn skipped_table_notes_are_charged() {
+    // The first table spends the one-cell budget; each later one becomes a
+    // note, which must cost text like any paragraph.
+    let shapes = table_frame("<a:tr><a:tc/><a:tc/></a:tr>").repeat(200);
+    let limits = ParseLimits {
+        max_table_cells: 1,
+        max_text_bytes: 10_000,
+        ..ParseLimits::default()
+    };
+    let err = Package::new(&[slide_xml(&shapes)]).error(&limits);
+    assert!(err.contains("max_text_bytes"), "{err}");
+}
+
+#[test]
+fn every_paragraph_and_run_is_charged() {
+    let shapes = text_box(&para("a").repeat(100));
+    let with = |max_text_bytes| ParseLimits {
+        max_text_bytes,
+        ..ParseLimits::default()
+    };
+    // The heading and its text, then per paragraph its byte, run and block.
+    let cost = "Slide 1".len() + BLOCK_COST + 100 * (1 + 2 * BLOCK_COST);
+    let pkg = Package::new(&[slide_xml(&shapes)]);
+    assert_eq!(pkg.read_with(&with(cost)).blocks.len(), 101);
+    let err = pkg.error(&with(cost - 1));
+    assert!(err.contains("max_text_bytes"), "{err}");
+}
+
+#[test]
+fn a_slide_list_far_past_the_slide_limit_is_refused() {
+    let mut pkg = Package::new(&[slide_xml(&text_box(&para("x")))]);
+    let mut ids = String::new();
+    for i in 0..5 {
+        write!(ids, r#"<p:sldId id="{}" r:id="rX{i}"/>"#, 300 + i).unwrap();
+    }
+    pkg.set(
+        "ppt/presentation.xml",
+        &format!(r"<p:presentation {NS}><p:sldIdLst>{ids}</p:sldIdLst></p:presentation>"),
+    );
+    let limits = ParseLimits {
+        max_sheets: 2,
+        ..ParseLimits::default()
+    };
+    let err = pkg.error(&limits);
+    assert!(err.contains("max_sheets"), "{err}");
+}
+
+#[test]
 fn empty_rows_count_against_the_cell_budget() {
     let limits = ParseLimits {
         max_table_cells: 3,
@@ -915,6 +1031,23 @@ fn smartart_with_a_dangling_or_escaping_target_adds_nothing() {
     assert_eq!(pkg.read().blocks, [h2("Slide 1")]);
 }
 
+#[test]
+fn smartart_reads_only_a_diagram_data_relationship() {
+    let mut pkg = Package::new(&[slide_xml(&diagram_frame("rIdI"))]);
+    pkg.set(
+        "ppt/slides/_rels/slide1.xml.rels",
+        &rels(&[
+            ("rIdL", "slideLayout", "../slideLayouts/slideLayout1.xml"),
+            ("rIdI", "image", "../diagrams/data1.xml"),
+        ]),
+    );
+    pkg.set(
+        "ppt/diagrams/data1.xml",
+        r#"<dgm:dataModel xmlns:dgm="d" xmlns:a="a"><dgm:ptLst><dgm:pt modelId="1"><dgm:t><a:p><a:r><a:t>Plan</a:t></a:r></a:p></dgm:t></dgm:pt></dgm:ptLst></dgm:dataModel>"#,
+    );
+    assert_eq!(pkg.read().blocks, [h2("Slide 1")]);
+}
+
 // --- hostile input --------------------------------------------------------------
 
 #[test]
@@ -990,7 +1123,7 @@ fn truncated_and_mangled_slides_never_panic() {
     }
 }
 
-// --- review fixes ---------------------------------------------------------------
+// --- relationships, placeholders and inheritance --------------------------------
 
 /// Relationships of `slide1.xml` built from `items`, read through an archive.
 fn slide_rels_of(items: &[(&str, &str, &str)]) -> Relationships {
@@ -1179,8 +1312,16 @@ fn field_properties_do_not_change_the_paragraph() {
 
 #[test]
 fn misplaced_hidden_flags_do_not_corrupt_state() {
+    // A hidden shape's properties inside a table cell describe nothing that
+    // can be skipped: skipping would leave the cell and lose its text.
+    let in_cell = format!(
+        r#"<a:tr><a:tc><a:txBody><a:bodyPr/>{}</a:txBody><p:nvSpPr><p:cNvPr id="9" name="x" hidden="1"/></p:nvSpPr><a:tcPr/></a:tc>{}</a:tr>"#,
+        para("cell"),
+        tc("next")
+    );
     let shapes = format!(
-        r#"{}<mc:AlternateContent><mc:Choice><p:cNvPr hidden="1"/></mc:Choice><mc:Fallback>{}</mc:Fallback></mc:AlternateContent>{}"#,
+        r#"{}{}<mc:AlternateContent><mc:Choice><p:cNvPr hidden="1"/></mc:Choice><mc:Fallback>{}</mc:Fallback></mc:AlternateContent>{}"#,
+        table_frame(&in_cell),
         table_frame(&format!(
             r#"<a:tr>{}</a:tr><p:cNvPr hidden="1"/>"#,
             tc("cell")
@@ -1189,9 +1330,15 @@ fn misplaced_hidden_flags_do_not_corrupt_state() {
         text_box(&para("After"))
     );
     let blocks = one_slide(&shapes);
-    assert_eq!(blocks.len(), 3, "{blocks:?}");
-    assert!(matches!(blocks[1], ParsedBlock::Table(_)), "{blocks:?}");
-    assert_eq!(blocks[2], p("After"));
+    assert_eq!(blocks.len(), 4, "{blocks:?}");
+    assert_eq!(
+        blocks[1],
+        ParsedBlock::Table(TableBlock {
+            rows: vec![row(true, &["cell", "next"])]
+        })
+    );
+    assert!(matches!(blocks[2], ParsedBlock::Table(_)), "{blocks:?}");
+    assert_eq!(blocks[3], p("After"));
 }
 
 #[test]
@@ -1281,4 +1428,144 @@ fn core_properties_are_found_without_a_relationship() {
         r#"<cp:coreProperties xmlns:dc="d"><dc:title>Fallback</dc:title></cp:coreProperties>"#,
     );
     assert_eq!(pkg.read().title.as_deref(), Some("Fallback"));
+}
+
+// --- slide lists, SmartArt, layouts and wide tables -------------------------------
+
+#[test]
+fn a_slide_list_survives_errors_after_it() {
+    let mut pkg = Package::new(&[slide_xml(&title_sp("B")), slide_xml(&title_sp("A"))]);
+    pkg.set(
+        "ppt/presentation.xml",
+        &format!(
+            r#"<p:presentation {NS}><p:sldIdLst><p:sldId id="300" r:id="rId2"/><p:sldId id="301" r:id="rId1"/></p:sldIdLst><p:extLst><broken></p:extLst></p:presentation>"#
+        ),
+    );
+    assert_eq!(headings(&pkg.read().blocks), ["A", "B"]);
+}
+
+#[test]
+fn several_smartart_frames_on_one_slide() {
+    let shapes = format!(
+        "{}{}{}{}{}",
+        text_box(&para("A")),
+        diagram_frame("rIdD1"),
+        text_box(&para("B")),
+        diagram_frame("rIdD2"),
+        text_box(&para("C")),
+    );
+    let mut pkg = Package::new(&[slide_xml(&shapes)]);
+    pkg.set(
+        "ppt/slides/_rels/slide1.xml.rels",
+        &rels(&[
+            ("rIdL", "slideLayout", "../slideLayouts/slideLayout1.xml"),
+            ("rIdD1", "diagramData", "../diagrams/data1.xml"),
+            ("rIdD2", "diagramData", "../diagrams/data2.xml"),
+        ]),
+    );
+    let data = |texts: &[&str]| {
+        let mut points = String::new();
+        for (i, text) in texts.iter().enumerate() {
+            write!(
+                points,
+                r#"<dgm:pt modelId="{i}"><dgm:t><a:p><a:r><a:t>{text}</a:t></a:r></a:p></dgm:t></dgm:pt>"#
+            )
+            .unwrap();
+        }
+        format!(
+            r#"<dgm:dataModel xmlns:dgm="d" xmlns:a="a"><dgm:ptLst>{points}</dgm:ptLst></dgm:dataModel>"#
+        )
+    };
+    pkg.set("ppt/diagrams/data1.xml", &data(&["one", "two"]));
+    pkg.set("ppt/diagrams/data2.xml", &data(&["three"]));
+    assert_eq!(
+        pkg.read().blocks,
+        [
+            h2("Slide 1"),
+            p("A"),
+            p("one"),
+            p("two"),
+            p("B"),
+            p("three"),
+            p("C")
+        ]
+    );
+}
+
+#[test]
+fn each_slide_inherits_from_its_own_layout_and_master() {
+    let slide = || slide_xml(&body_sp(&para("item")));
+    let mut pkg = Package::new(&[slide(), slide(), slide()]);
+    pkg.set(
+        "ppt/slides/_rels/slide2.xml.rels",
+        &rels(&[("rIdL", "slideLayout", "../slideLayouts/slideLayout2.xml")]),
+    );
+    pkg.set(
+        "ppt/slideLayouts/slideLayout2.xml",
+        r#"<p:sldLayout xmlns:a="a" xmlns:p="p"><p:cSld><p:spTree><p:sp><p:nvSpPr><p:nvPr><p:ph idx="1"/></p:nvPr></p:nvSpPr></p:sp></p:spTree></p:cSld></p:sldLayout>"#,
+    );
+    pkg.set(
+        "ppt/slideLayouts/_rels/slideLayout2.xml.rels",
+        &rels(&[("rId1", "slideMaster", "../slideMasters/slideMaster2.xml")]),
+    );
+    pkg.set(
+        "ppt/slideMasters/slideMaster2.xml",
+        r#"<p:sldMaster xmlns:a="a" xmlns:p="p"><p:txStyles><p:bodyStyle><a:lvl1pPr><a:buAutoNum type="arabicPeriod"/></a:lvl1pPr></p:bodyStyle></p:txStyles></p:sldMaster>"#,
+    );
+    let items: Vec<ParsedBlock> = pkg
+        .read()
+        .blocks
+        .into_iter()
+        .filter(|b| matches!(b, ParsedBlock::ListItem { .. }))
+        .collect();
+    assert_eq!(
+        items,
+        [
+            li(0, false, "item"),
+            li(0, true, "item"),
+            li(0, false, "item")
+        ]
+    );
+}
+
+#[test]
+fn table_cells_read_their_own_list_style() {
+    let rows = format!(
+        r#"<a:tr>{}<a:tc><a:txBody><a:bodyPr/><a:lstStyle><a:lvl1pPr><a:buAutoNum type="arabicPeriod"/></a:lvl1pPr><a:lvl2pPr><a:buChar char="-"/></a:lvl2pPr></a:lstStyle>{}<a:p><a:pPr lvl="1"/><a:r><a:t>sub</a:t></a:r></a:p></a:txBody></a:tc></a:tr>"#,
+        tc("A"),
+        para("first")
+    );
+    let blocks = one_slide(&table_frame(&rows));
+    let ParsedBlock::Table(table) = &blocks[1] else {
+        panic!("expected a table: {blocks:?}");
+    };
+    assert_eq!(
+        table.rows[0].cells[1].blocks,
+        [li(0, true, "first"), li(1, false, "sub")]
+    );
+}
+
+#[test]
+fn tables_wider_than_the_column_limit_become_notes() {
+    let limits = ParseLimits {
+        max_table_columns: 2,
+        ..ParseLimits::default()
+    };
+    let wide = format!("<a:tr>{}{}{}</a:tr>", tc("a"), tc("b"), tc("c"));
+    let narrow = format!("<a:tr>{}{}</a:tr>", tc("x"), tc("y"));
+    let shapes = format!("{}{}", table_frame(&wide), table_frame(&narrow));
+    let blocks = Package::new(&[slide_xml(&shapes)])
+        .read_with(&limits)
+        .blocks;
+    // The wide table's cells are spent; the narrow one still fits.
+    assert_eq!(
+        blocks,
+        [
+            h2("Slide 1"),
+            crate::infra::parsers::limits::skipped_table_note(99_997),
+            ParsedBlock::Table(TableBlock {
+                rows: vec![row(true, &["x", "y"])]
+            }),
+        ]
+    );
 }

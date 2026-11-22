@@ -12,6 +12,7 @@ use bytes::Bytes;
 use file_parser::Detection;
 use file_parser::domain::detector::{Confidence, ContentTypeDetector, DetectedType};
 use file_parser::domain::error::DomainError;
+use file_parser::domain::ir::{Inline, ParsedBlock};
 use file_parser::domain::parser::FileParserBackend;
 use file_parser::domain::service::{FileParserService, ServiceConfig};
 use file_parser::infra::parsers::{HtmlParser, ImageParser, PlainTextParser, StubParser};
@@ -434,6 +435,15 @@ async fn detected_html_overrides_a_wrong_extension_and_still_parses() {
         .expect("detection should route to HtmlParser and supply an extractable MIME");
 
     assert_eq!(doc.meta.content_type.as_deref(), Some("text/html"));
+    assert!(
+        matches!(
+            doc.blocks.as_slice(),
+            [ParsedBlock::Paragraph { inlines }]
+                if matches!(inlines.as_slice(), [Inline::Text { text, .. }] if text == "hello")
+        ),
+        "the text is extracted: {:?}",
+        doc.blocks
+    );
 }
 
 #[tokio::test]

@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 
 use crate::domain::error::DomainError;
-use crate::infra::parsers::limits::TextBudget;
+use crate::infra::parsers::limits::{BLOCK_COST, TextBudget};
 
 use super::engine::{Direction, Glyph};
 
@@ -74,7 +74,8 @@ struct Placed {
 }
 
 /// The lines of one page, in reading order: left-to-right text top to
-/// bottom, then text in other directions. The text is charged to `budget`.
+/// bottom, then text in other directions. The text is charged to `budget`,
+/// with a block cost for each line and run.
 pub(super) fn page_lines(
     glyphs: Vec<Glyph>,
     budget: &mut TextBudget,
@@ -124,8 +125,14 @@ fn upright(angle: f32, x: f32, y: f32) -> (f32, f32) {
 
 fn place(angle: f32, glyph: Glyph) -> Placed {
     let (along, baseline) = upright(angle, glyph.x, glyph.y);
-    let [x0, y0, x1, y1] = glyph.bounds;
-    let corners = [(x0, y0), (x0, y1), (x1, y0), (x1, y1)].map(|(cx, cy)| upright(angle, cx, cy).0);
+    let b = glyph.bounds;
+    let corners = [
+        (b.left, b.bottom),
+        (b.left, b.top),
+        (b.right, b.bottom),
+        (b.right, b.top),
+    ]
+    .map(|(cx, cy)| upright(angle, cx, cy).0);
     let left = corners.iter().copied().fold(f32::INFINITY, f32::min);
     let right = corners.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     Placed {
@@ -273,7 +280,11 @@ fn build_line(
     if bytes == 0 {
         return Ok(None);
     }
-    ctx.budget.charge(bytes)?;
+    // The line and each run cost memory beyond their text: a page of
+    // single-glyph lines or runs must not be charged a byte each.
+    let pieces = runs.len().saturating_add(1);
+    ctx.budget
+        .charge(bytes.saturating_add(pieces.saturating_mul(BLOCK_COST)))?;
     Ok(Some(Line {
         runs,
         direction,
@@ -538,13 +549,16 @@ fn common_size(glyphs: &[Placed]) -> f32 {
         .map_or(0.0, |(bin, _)| from_half_points(*bin))
 }
 
-#[allow(clippy::cast_possible_truncation)] // sizes are small, finite points
-fn half_points(size: f32) -> i32 {
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "clamped to 0..=1e6 half points first"
+)]
+pub(super) fn half_points(size: f32) -> i32 {
     (size * 2.0).round().clamp(0.0, 1.0e6) as i32
 }
 
-#[allow(clippy::cast_precision_loss)] // bins stay far below 2^24
-fn from_half_points(bin: i32) -> f32 {
+#[expect(clippy::cast_precision_loss, reason = "bins stay far below 2^24")]
+pub(super) fn from_half_points(bin: i32) -> f32 {
     bin as f32 / 2.0
 }
 

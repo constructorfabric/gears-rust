@@ -18,13 +18,71 @@ use bytes::Bytes;
 use quick_xml::events::Event;
 use zip::ZipArchive;
 
-use crate::domain::error::DomainError;
+use crate::domain::error::{DomainError, ParseLimit};
+use crate::infra::parsers::le_bytes::{u16_at, u32_at};
 
-use super::limits::{DepthGuard, ParseLimits, is_limit, limit_exceeded};
+use super::limits::{
+    DepthGuard, ParseLimits, finish_title, is_limit, limit_exceeded, push_title_text,
+};
 
 /// Longest part name or target echoed back in an error message; both come from
 /// the uploaded file.
 const MAX_ECHOED_NAME: usize = 256;
+
+/// Signature that starts every ZIP central directory header.
+const CENTRAL_HEADER_SIGNATURE: [u8; 4] = *b"PK\x01\x02";
+/// Signature of the end of central directory record, and its fixed length.
+const END_SIGNATURE: [u8; 4] = *b"PK\x05\x06";
+const END_LEN: usize = 22;
+/// Longest archive comment, which sits after the end record.
+const MAX_COMMENT_LEN: usize = 0xFFFF;
+
+/// Where the central directory starts, when the last end record leaves zip no
+/// other choice: a plain (not ZIP64) single-disk record whose directory ends
+/// right where the record starts and begins with a header. zip reads such a
+/// directory, or fails, without trying another end record, and every header it
+/// decodes lies between that start and the end of the file. `None` for
+/// anything else, which is then scanned whole.
+fn central_directory_start(bytes: &[u8]) -> Option<usize> {
+    let window = bytes.len().saturating_sub(END_LEN + MAX_COMMENT_LEN);
+    let end = window
+        + bytes
+            .get(window..)?
+            .windows(END_SIGNATURE.len())
+            .rposition(|w| w == END_SIGNATURE)?;
+    let record = bytes.get(end..end.checked_add(END_LEN)?)?;
+    let disk = u16_at(record, 4)?;
+    let cd_disk = u16_at(record, 6)?;
+    let on_disk = u16_at(record, 8)?;
+    let entries = u16_at(record, 10)?;
+    let size = u32_at(record, 12)?;
+    let offset = u32_at(record, 16)?;
+    let comment = usize::from(u16_at(record, 20)?);
+    let plain = entries != u16::MAX && size != u32::MAX && offset != u32::MAX;
+    let single_disk = disk == 0 && cd_disk == 0 && on_disk == entries;
+    let start = usize::try_from(offset).ok()?;
+    let abuts = start.checked_add(usize::try_from(size).ok()?) == Some(end);
+    let fits = end + END_LEN + comment <= bytes.len();
+    let header_at_start = bytes.get(start..start + 4) == Some(&CENTRAL_HEADER_SIGNATURE[..]);
+    (plain && single_disk && entries > 0 && abuts && fits && header_at_start).then_some(start)
+}
+
+/// `Some(count)` once `bytes` holds more than `limit` central directory header
+/// signatures. Every entry zip decodes starts with one, and headers do not
+/// overlap, so this bounds the entry count whichever end record zip trusts.
+/// Compressed data matches by chance about once per 4 GiB.
+fn too_many_headers(bytes: &[u8], limit: usize) -> Option<usize> {
+    let mut found = 0usize;
+    for window in bytes.windows(CENTRAL_HEADER_SIGNATURE.len()) {
+        if window == CENTRAL_HEADER_SIGNATURE {
+            found += 1;
+            if found > limit {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
 
 /// An opened OOXML package.
 pub struct Archive {
@@ -37,6 +95,8 @@ pub struct Archive {
     /// not always match the case their relationships use.
     by_lower_name: HashMap<String, usize>,
     format: &'static str,
+    /// Length of the whole archive; no entry can hold more compressed bytes.
+    byte_len: u64,
 }
 
 impl Archive {
@@ -48,12 +108,27 @@ impl Archive {
         format: &'static str,
         limits: &ParseLimits,
     ) -> Result<Self, DomainError> {
+        // zip decodes every central directory entry, with no cap, before it
+        // returns; each takes several times its 46-byte header in memory.
+        // Only the directory is scanned when its place is certain, so a
+        // stored embedded ZIP does not count against the package.
+        let directory = central_directory_start(&bytes).map_or(&bytes[..], |start| &bytes[start..]);
+        if let Some(found) = too_many_headers(directory, limits.max_zip_entries) {
+            return Err(limit_exceeded(
+                ParseLimit::MaxZipEntries,
+                format!(
+                    "at least {found} central directory headers, limit {}",
+                    limits.max_zip_entries
+                ),
+            ));
+        }
+        let byte_len = bytes.len() as u64;
         let zip = ZipArchive::new(Cursor::new(bytes))
             .map_err(|e| DomainError::parse_error(format!("Failed to open {format} file: {e}")))?;
 
         if zip.len() > limits.max_zip_entries {
             return Err(limit_exceeded(
-                "max_zip_entries",
+                ParseLimit::MaxZipEntries,
                 format!("{} entries, limit {}", zip.len(), limits.max_zip_entries),
             ));
         }
@@ -73,6 +148,7 @@ impl Archive {
             read_budget: limits.max_total_uncompressed_bytes,
             by_lower_name,
             format,
+            byte_len,
         })
     }
 
@@ -96,11 +172,17 @@ impl Archive {
         let declared = file.size();
         if declared > max_entry {
             return Err(limit_exceeded(
-                "max_entry_bytes",
+                ParseLimit::MaxEntryBytes,
                 format!("part {shown} declares {declared} bytes, limit {max_entry}"),
             ));
         }
-        check_ratio(&shown, declared, file.compressed_size(), &self.limits)?;
+        // The declared compressed size is not checked against the archive by
+        // zip; an entry cannot read more than what follows its data start.
+        let available = file
+            .data_start()
+            .map_or(self.byte_len, |start| self.byte_len.saturating_sub(start));
+        let compressed = file.compressed_size().min(available);
+        check_ratio(&shown, declared, compressed, &self.limits)?;
         if declared > self.read_budget {
             return Err(budget_exceeded(max_total));
         }
@@ -111,6 +193,8 @@ impl Archive {
         self.read_budget -= declared;
         // The cap keeps the limits if zip ever stops enforcing the declared
         // size: read at most one byte past them and treat that byte as overflow.
+        // zip 9 fails such reads first, so the two checks after the read are
+        // defence in depth and no test reaches them.
         let cap = max_entry.min(self.read_budget.saturating_add(declared));
         let mut buf = Vec::new();
         let result = (&mut file)
@@ -125,7 +209,7 @@ impl Archive {
         })?;
         if read > max_entry {
             return Err(limit_exceeded(
-                "max_entry_bytes",
+                ParseLimit::MaxEntryBytes,
                 format!("part {shown} inflates past {max_entry} bytes"),
             ));
         }
@@ -138,14 +222,17 @@ impl Archive {
     /// Reads the part `name` and decodes it to text (UTF-8, or UTF-16 with a
     /// BOM). The decoded text is held to the per-part limit as well: lossy
     /// decoding of garbage can triple its size.
+    ///
+    /// The size is measured before the text is built, and what decoding adds
+    /// is charged to the archive's total budget.
     pub fn read_xml(&mut self, name: &str) -> Result<Option<String>, DomainError> {
         let Some(bytes) = self.read(name)? else {
             return Ok(None);
         };
-        let text = xml::decode_part(bytes);
-        if text.len() as u64 > self.limits.max_entry_bytes {
+        let decoded = xml::decoded_len(&bytes) as u64;
+        if decoded > self.limits.max_entry_bytes {
             return Err(limit_exceeded(
-                "max_entry_bytes",
+                ParseLimit::MaxEntryBytes,
                 format!(
                     "part {} decodes past {} bytes",
                     echo(name),
@@ -153,7 +240,12 @@ impl Archive {
                 ),
             ));
         }
-        Ok(Some(text))
+        let growth = decoded.saturating_sub(bytes.len() as u64);
+        self.read_budget = self
+            .read_budget
+            .checked_sub(growth)
+            .ok_or_else(|| budget_exceeded(self.limits.max_total_uncompressed_bytes))?;
+        Ok(Some(xml::decode_part(bytes)))
     }
 
     /// Reads the relationships of `part`, e.g. `word/_rels/document.xml.rels`
@@ -215,11 +307,47 @@ impl<'a> Events<'a> {
     }
 }
 
-/// `dc:title` from the core properties part `part`, trimmed; `None` when it
-/// is missing, blank or malformed. Metadata is not worth failing a document
-/// for, but the archive's read limits still apply.
+/// Conventional place of the core properties part.
+const CORE_PART: &str = "docProps/core.xml";
+
+/// The package's main part: the first internal `officeDocument` target that
+/// the package has, else the first of `fallbacks` it has. `root` is the
+/// package relationships (`archive.read_rels("")`).
+pub fn main_part(archive: &Archive, root: &Relationships, fallbacks: &[&str]) -> Option<String> {
+    root.of_type("officeDocument")
+        .find(|r| !r.external && archive.contains(&r.target))
+        .map(|r| r.target.clone())
+        .or_else(|| {
+            fallbacks
+                .iter()
+                .find(|part| archive.contains(part))
+                .map(|&part| part.to_owned())
+        })
+}
+
+/// The package title: `dc:title` of the core properties part, found like the
+/// main part, with `docProps/core.xml` as the fallback.
+pub fn package_title(
+    archive: &mut Archive,
+    root: &Relationships,
+) -> Result<Option<String>, DomainError> {
+    let part = root
+        .of_type("core-properties")
+        .find(|r| !r.external && archive.contains(&r.target))
+        .map(|r| r.target.clone())
+        .or_else(|| archive.contains(CORE_PART).then(|| CORE_PART.to_owned()));
+    match part {
+        Some(part) => core_title(archive, &part),
+        None => Ok(None),
+    }
+}
+
+/// `dc:title` from the core properties part `part`, whitespace collapsed;
+/// `None` when it is missing, blank, malformed or unreadable. Metadata is not
+/// worth failing a document for, but the archive's read limits still apply.
 pub fn core_title(archive: &mut Archive, part: &str) -> Result<Option<String>, DomainError> {
-    let Some(text) = archive.read_xml(part)? else {
+    let format = archive.format;
+    let Some(text) = tolerate(archive.read_xml(part), format, "core properties")? else {
         return Ok(None);
     };
     let limits = archive.limits().clone();
@@ -233,16 +361,67 @@ pub fn core_title(archive: &mut Archive, part: &str) -> Result<Option<String>, D
         match event {
             Event::Start(e) if xml::local_name(&e) == "title" => in_title = true,
             Event::End(e) if in_title && e.local_name().as_ref() == "title" => break,
-            Event::Text(t) if in_title => title.push_str(&t.xml10_content()),
+            Event::Text(t) if in_title => push_title_text(&mut title, &t.xml10_content()),
             Event::GeneralRef(r) if in_title => {
-                title.push_str(&xml::resolve_ref(&r).unwrap_or_default());
+                push_title_text(&mut title, &xml::resolve_ref(&r).unwrap_or_default());
             }
             Event::Eof => break,
             _ => {}
         }
     }
-    let title = title.trim();
-    Ok((!title.is_empty()).then(|| title.to_owned()))
+    Ok(finish_title(&title))
+}
+
+/// Open `mc:AlternateContent` elements. The first branch of each is read;
+/// the others repeat it for older readers and are skipped.
+#[derive(Debug, Default)]
+pub struct Alternates {
+    taken: Vec<bool>,
+}
+
+/// What a walker does with an element as far as alternate content goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AltAction {
+    /// Not an alternate-content element.
+    Other,
+    /// An alternate-content element; nothing more to do with it.
+    Consumed,
+    /// A branch after the one taken: skip the element and its content.
+    SkipElement,
+}
+
+impl Alternates {
+    /// Handles a start (or empty) element `name`.
+    pub fn start(&mut self, name: &str, is_start: bool) -> AltAction {
+        match name {
+            "mc:AlternateContent" => {
+                if is_start {
+                    self.taken.push(false);
+                }
+                AltAction::Consumed
+            }
+            "mc:Choice" | "mc:Fallback" => {
+                if is_start {
+                    match self.taken.last_mut() {
+                        Some(taken) if *taken => return AltAction::SkipElement,
+                        Some(taken) => *taken = true,
+                        None => {}
+                    }
+                }
+                AltAction::Consumed
+            }
+            _ => AltAction::Other,
+        }
+    }
+
+    /// Handles an end element; whether it closed an `mc:AlternateContent`.
+    pub fn end(&mut self, name: &str) -> bool {
+        let closes = name == "mc:AlternateContent";
+        if closes {
+            self.taken.pop();
+        }
+        closes
+    }
 }
 
 /// `result`, or an empty value when an optional part is malformed: a broken
@@ -256,7 +435,7 @@ pub fn tolerate<T: Default>(
 ) -> Result<T, DomainError> {
     match result {
         Err(e) if !is_limit(&e) => {
-            tracing::warn!(error = %e, "{format}: skipping malformed {what} part");
+            tracing::warn!(format, part = what, error = %e, "skipping malformed optional part");
             Ok(T::default())
         }
         other => other,
@@ -265,7 +444,7 @@ pub fn tolerate<T: Default>(
 
 fn budget_exceeded(max_total: u64) -> DomainError {
     limit_exceeded(
-        "max_total_uncompressed_bytes",
+        ParseLimit::MaxTotalUncompressedBytes,
         format!("parts inflate past {max_total} bytes"),
     )
 }
@@ -295,7 +474,7 @@ fn check_ratio(
         compressed == 0 || declared > compressed.saturating_mul(limits.max_compression_ratio);
     if too_high {
         return Err(limit_exceeded(
-            "max_compression_ratio",
+            ParseLimit::MaxCompressionRatio,
             format!(
                 "part {shown} inflates {compressed} -> {declared} bytes, limit {}:1",
                 limits.max_compression_ratio
@@ -323,6 +502,13 @@ pub struct Relationship {
     /// external targets, the target exactly as written (usually a URL).
     pub target: String,
     pub external: bool,
+}
+
+impl Relationship {
+    /// Whether the type URI ends with `/{suffix}` (e.g. `slide`).
+    pub fn is_type(&self, suffix: &str) -> bool {
+        self.rel_type.rsplit('/').next() == Some(suffix)
+    }
 }
 
 /// The relationships of one part, in document order.
@@ -382,12 +568,17 @@ impl Relationships {
         self.by_id.get(id).and_then(|&i| self.items.get(i))
     }
 
+    /// Target of the first internal relationship of type `suffix`.
+    pub fn internal(&self, suffix: &str) -> Option<String> {
+        self.of_type(suffix)
+            .find(|r| !r.external)
+            .map(|r| r.target.clone())
+    }
+
     /// Relationships whose type URI ends with `/{suffix}` (e.g. `slide`), in
     /// document order.
     pub fn of_type<'a>(&'a self, suffix: &'a str) -> impl Iterator<Item = &'a Relationship> + 'a {
-        self.items
-            .iter()
-            .filter(move |rel| rel.rel_type.rsplit('/').next() == Some(suffix))
+        self.items.iter().filter(move |rel| rel.is_type(suffix))
     }
 }
 
@@ -517,6 +708,26 @@ mod tests {
     }
 
     #[test]
+    fn a_huge_core_title_is_cut() {
+        let core = format!(
+            "<cp:coreProperties xmlns:cp=\"c\" xmlns:dc=\"d\"><dc:title>{}</dc:title></cp:coreProperties>",
+            "t".repeat(200_000)
+        );
+        let bytes = test_zip::build_with(
+            &[("docProps/core.xml", core.as_bytes())],
+            CompressionMethod::Stored,
+        );
+        let mut archive = Archive::open(bytes, "DOCX", &limits()).unwrap();
+        let title = core_title(&mut archive, "docProps/core.xml")
+            .unwrap()
+            .expect("a title");
+        assert_eq!(
+            title,
+            "t".repeat(crate::infra::parsers::limits::MAX_TITLE_CHARS)
+        );
+    }
+
+    #[test]
     fn missing_part_is_none() {
         let bytes = test_zip::build(&[("a.xml", b"<a/>")]);
         let mut archive = Archive::open(bytes, "DOCX", &limits()).unwrap();
@@ -547,6 +758,21 @@ mod tests {
             .err()
             .expect("must fail");
         assert!(err.to_string().contains("max_zip_entries"), "{err}");
+    }
+
+    #[test]
+    fn entry_count_is_checked_before_the_central_directory_is_decoded() {
+        // Not a ZIP zip could open: only the header count can reject it.
+        let bytes = Bytes::from(b"PK\x01\x02".repeat(4));
+        let limits = ParseLimits {
+            max_zip_entries: 3,
+            ..limits()
+        };
+        let err = Archive::open(bytes, "DOCX", &limits)
+            .err()
+            .expect("must fail");
+        assert!(err.to_string().contains("max_zip_entries"), "{err}");
+        assert!(too_many_headers(&b"PK\x01\x02".repeat(3), 3).is_none());
     }
 
     #[test]
@@ -629,6 +855,61 @@ mod tests {
         Bytes::from(out)
     }
 
+    /// Rewrites the compressed-size field of every local and central
+    /// directory header.
+    fn forge_compressed_size(bytes: &[u8], size: u32) -> Bytes {
+        let mut out = bytes.to_vec();
+        let mut i = 0;
+        while i + 4 <= out.len() {
+            let field = match out[i..i + 4] {
+                [0x50, 0x4B, 0x03, 0x04] => Some(i + 18),
+                [0x50, 0x4B, 0x01, 0x02] => Some(i + 20),
+                _ => None,
+            };
+            if let Some(at) = field {
+                out[at..at + 4].copy_from_slice(&size.to_le_bytes());
+            }
+            i += 1;
+        }
+        Bytes::from(out)
+    }
+
+    #[test]
+    fn forged_compressed_size_does_not_pass_the_ratio_check() {
+        // 2 MiB of zeros deflate to a few KiB; the entry claims 1 GiB.
+        let zeros = vec![0_u8; 2 * 1024 * 1024];
+        let honest = test_zip::build(&[("bomb.xml", &zeros)]);
+        let forged = forge_compressed_size(&honest, 1 << 30);
+        let mut archive = Archive::open(forged, "DOCX", &limits()).unwrap();
+        let err = archive.read("bomb.xml").unwrap_err();
+        assert!(err.to_string().contains("max_compression_ratio"), "{err}");
+    }
+
+    #[test]
+    fn a_stored_inner_zip_does_not_count_against_the_entry_limit() {
+        let names: Vec<String> = (0..20).map(|i| format!("p{i}.xml")).collect();
+        let inner_parts: Vec<(&str, &[u8])> =
+            names.iter().map(|n| (n.as_str(), &b"x"[..])).collect();
+        let inner = test_zip::build_with(&inner_parts, CompressionMethod::Stored);
+        let outer = test_zip::build_with(
+            &[("a.xml", b"<a/>"), ("embedded.zip", &inner)],
+            CompressionMethod::Stored,
+        );
+        let limits = ParseLimits {
+            max_zip_entries: 10,
+            ..limits()
+        };
+        let mut archive = Archive::open(outer.clone(), "DOCX", &limits).unwrap();
+        assert!(archive.read("a.xml").unwrap().is_some());
+
+        // Without a usable end record the whole file is scanned, as before.
+        let cut = outer.slice(..outer.len() - 1);
+        let err = Archive::open(cut, "DOCX", &limits)
+            .err()
+            .expect("must fail");
+        assert!(err.to_string().contains("max_zip_entries"), "{err}");
+    }
+
     #[test]
     fn entry_inflating_past_its_declared_size_is_rejected() {
         let real = vec![b'x'; 4096];
@@ -636,7 +917,14 @@ mod tests {
         let lying = forge_uncompressed_size(&honest, 16);
         let mut archive = Archive::open(lying, "DOCX", &limits()).unwrap();
         let err = archive.read("lie.xml").unwrap_err();
+        // zip's own size check fails the read, before the cap would.
+        assert!(!is_limit(&err), "{err}");
         assert!(err.to_string().contains("lie.xml"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("larger than its declared uncompressed size"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -692,6 +980,70 @@ mod tests {
         let mut archive = Archive::open(bytes, "DOCX", &limits).unwrap();
         let err = archive.read_xml("g.xml").unwrap_err();
         assert!(err.to_string().contains("max_entry_bytes"), "{err}");
+    }
+
+    #[test]
+    fn decoding_growth_is_charged_to_the_total_budget() {
+        // 30 invalid bytes decode to 90; with 20 more the total passes 100.
+        let bytes = test_zip::build_with(
+            &[("g.xml", &[0xFF_u8; 30]), ("h.xml", &[b'h'; 20])],
+            CompressionMethod::Stored,
+        );
+        let limits = ParseLimits {
+            max_entry_bytes: 100,
+            max_total_uncompressed_bytes: 100,
+            ..limits()
+        };
+        let mut archive = Archive::open(bytes, "DOCX", &limits).unwrap();
+        assert_eq!(
+            archive.read_xml("g.xml").unwrap().map(|t| t.len()),
+            Some(90)
+        );
+        let err = archive.read_xml("h.xml").unwrap_err();
+        assert!(
+            err.to_string().contains("max_total_uncompressed_bytes"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_core_part_gives_no_title() {
+        let core = b"<cp:coreProperties xmlns:cp=\"c\" xmlns:dc=\"d\"><dc:title>Quarterly</dc:title></cp:coreProperties>";
+        let honest =
+            test_zip::build_with(&[("docProps/core.xml", core)], CompressionMethod::Stored);
+        // Change the stored text: the CRC no longer matches.
+        let mut corrupt = honest.to_vec();
+        let at = corrupt
+            .windows(9)
+            .position(|w| w == b"Quarterly")
+            .expect("stored title");
+        corrupt[at] = b'q';
+        let mut archive = Archive::open(Bytes::from(corrupt), "DOCX", &limits()).unwrap();
+        assert!(archive.read(CORE_PART).is_err(), "the read itself fails");
+        assert_eq!(
+            package_title(&mut archive, &Relationships::default()).unwrap(),
+            None
+        );
+
+        // A limit breach still fails the document.
+        let limits = ParseLimits {
+            max_entry_bytes: 16,
+            ..limits()
+        };
+        let mut archive = Archive::open(honest, "DOCX", &limits).unwrap();
+        let err = package_title(&mut archive, &Relationships::default()).unwrap_err();
+        assert!(is_limit(&err), "{err}");
+    }
+
+    #[test]
+    fn a_core_title_is_collapsed_to_one_line() {
+        let core = "<cp:coreProperties xmlns:cp=\"c\" xmlns:dc=\"d\"><dc:title> a\n\n---\r\nlanguage: x </dc:title></cp:coreProperties>";
+        let bytes = test_zip::build(&[("docProps/core.xml", core.as_bytes())]);
+        let mut archive = Archive::open(bytes, "DOCX", &limits()).unwrap();
+        assert_eq!(
+            core_title(&mut archive, CORE_PART).unwrap().as_deref(),
+            Some("a --- language: x")
+        );
     }
 
     #[test]

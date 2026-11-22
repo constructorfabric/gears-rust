@@ -1,8 +1,10 @@
+pub(crate) mod backend;
 pub(crate) mod bounded_read;
 pub mod docx_parser;
 pub mod html;
 pub mod image_parser;
 pub(crate) mod inlines;
+pub(crate) mod le_bytes;
 pub mod limits;
 pub(crate) mod ooxml;
 pub mod pdf;
@@ -11,6 +13,7 @@ pub mod pptx;
 pub mod spreadsheet;
 pub mod stub;
 
+pub use backend::{DocumentFormat, DocumentParser, ReadDocument};
 pub use docx_parser::DocxParser;
 pub use html::HtmlParser;
 pub use image_parser::ImageParser;

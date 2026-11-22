@@ -31,6 +31,8 @@ pub(super) enum Token {
     Start {
         name: String,
         attrs: Vec<(&'static str, String)>,
+        /// The tag ends with `/>`.
+        self_closing: bool,
     },
     End {
         name: String,
@@ -74,6 +76,13 @@ impl<'a> Tokenizer<'a> {
         }
     }
 
+    /// Reads the content after the last start tag as markup even if the
+    /// tag names a raw-text element: a self-closed element in `svg` or
+    /// `math` has no content.
+    pub(super) fn skip_raw_text(&mut self) {
+        self.pending = None;
+    }
+
     fn bytes(&self) -> &'a [u8] {
         self.input.as_bytes()
     }
@@ -84,17 +93,12 @@ impl<'a> Tokenizer<'a> {
         let bytes = self.bytes();
         let start = self.pos;
         let mut end = bytes.len();
-        if kind != Content::Plaintext {
+        if name == "script" {
+            end = script_end(bytes, start);
+        } else if kind != Content::Plaintext {
             let mut i = start;
             while let Some(at) = find_from(bytes, i, b"</") {
-                let name_end = at + 2 + name.len();
-                let matches = bytes
-                    .get(at + 2..name_end)
-                    .is_some_and(|n| n.eq_ignore_ascii_case(name.as_bytes()))
-                    && bytes
-                        .get(name_end)
-                        .is_none_or(|b| b.is_ascii_whitespace() || *b == b'/' || *b == b'>');
-                if matches {
+                if tag_at(bytes, at + 2, name) {
                     end = at;
                     break;
                 }
@@ -154,15 +158,20 @@ impl<'a> Tokenizer<'a> {
         }
         let name = self.input[name_start..i].to_ascii_lowercase();
         let mut attrs: Vec<(&'static str, String)> = Vec::new();
+        let mut self_closing = false;
         // Attributes, up to the closing `>`.
         loop {
+            // Whether the last byte skipped is a `/`: `/>` closes the tag.
+            let mut slash = false;
             while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') {
+                slash = bytes[i] == b'/';
                 i += 1;
             }
             if i >= bytes.len() {
                 break;
             }
             if bytes[i] == b'>' {
+                self_closing = slash;
                 i += 1;
                 break;
             }
@@ -228,7 +237,11 @@ impl<'a> Tokenizer<'a> {
             if kind != Content::Markup {
                 self.pending = Some((name.clone(), kind));
             }
-            Token::Start { name, attrs }
+            Token::Start {
+                name,
+                attrs,
+                self_closing,
+            }
         }
     }
 }
@@ -282,6 +295,68 @@ impl Iterator for Tokenizer<'_> {
             }
         }
     }
+}
+
+/// Whether `name` (ASCII case-insensitive) starts at `at`, followed by
+/// whitespace, `/`, `>` or the end of the input.
+fn tag_at(bytes: &[u8], at: usize, name: &str) -> bool {
+    let name_end = at + name.len();
+    bytes
+        .get(at..name_end)
+        .is_some_and(|n| n.eq_ignore_ascii_case(name.as_bytes()))
+        && bytes
+            .get(name_end)
+            .is_none_or(|b| b.is_ascii_whitespace() || *b == b'/' || *b == b'>')
+}
+
+/// Where the text of a `script` starting at `start` ends. As in the HTML
+/// standard, inside `<!--` a `<script>` opens a nested one whose
+/// `</script>` does not end the element, so old pages that write scripts
+/// from scripts (`<!-- document.write('<script></script>') //-->`) stay
+/// whole. One pass; every step moves forward.
+fn script_end(bytes: &[u8], start: usize) -> usize {
+    #[derive(PartialEq)]
+    enum State {
+        Data,
+        Escaped,
+        DoubleEscaped,
+    }
+    let mut state = State::Data;
+    let mut i = start;
+    while i < bytes.len() {
+        let rest = &bytes[i..];
+        match state {
+            State::Data if rest.starts_with(b"<!--") => {
+                // The dashes are read again: `<!-->` opens and closes.
+                state = State::Escaped;
+                i += 2;
+                continue;
+            }
+            State::Escaped | State::DoubleEscaped if rest.starts_with(b"-->") => {
+                state = State::Data;
+                i += 3;
+                continue;
+            }
+            State::Data | State::Escaped
+                if rest.starts_with(b"</") && tag_at(bytes, i + 2, "script") =>
+            {
+                return i;
+            }
+            State::Escaped if rest.starts_with(b"<") && tag_at(bytes, i + 1, "script") => {
+                state = State::DoubleEscaped;
+                i += 7;
+                continue;
+            }
+            State::DoubleEscaped if rest.starts_with(b"</") && tag_at(bytes, i + 2, "script") => {
+                state = State::Escaped;
+                i += 8;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    bytes.len()
 }
 
 fn find_from(haystack: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
@@ -428,6 +503,7 @@ mod tests {
         Token::Start {
             name: name.to_owned(),
             attrs: attrs.iter().map(|(k, v)| (*k, (*v).to_owned())).collect(),
+            self_closing: false,
         }
     }
 
@@ -497,6 +573,35 @@ mod tests {
             ]
         );
         assert_eq!(
+            tokens("<script><!-- document.write('<script></script>'); //--></script>after"),
+            [
+                start("script", &[]),
+                text("<!-- document.write('<script></script>'); //-->"),
+                end("script"),
+                text("after")
+            ]
+        );
+        // Outside a nested script, `</script>` ends the element even
+        // inside `<!--`; `<!-->` opens and closes at once.
+        assert_eq!(
+            tokens("<script><!-- a </script>b<script><!-->c</script>d"),
+            [
+                start("script", &[]),
+                text("<!-- a "),
+                end("script"),
+                text("b"),
+                start("script", &[]),
+                text("<!-->c"),
+                end("script"),
+                text("d")
+            ]
+        );
+        // A nested script never closed with `-->` runs to the end.
+        assert_eq!(
+            tokens("<script><!--<script></script>x"),
+            [start("script", &[]), text("<!--<script></script>x")]
+        );
+        assert_eq!(
             tokens("<title>a &amp; <b></title>"),
             [start("title", &[]), text("a & <b>"), end("title")]
         );
@@ -556,5 +661,18 @@ mod tests {
             panic!("expected a start tag");
         };
         assert_eq!(attrs[0].1.len(), MAX_ATTRIBUTE_LEN);
+    }
+
+    #[test]
+    fn self_closing_flag() {
+        let flags: Vec<bool> = tokens(r#"<br/><svg / ><a href=x/><b title="/"><i/x>"#)
+            .into_iter()
+            .filter_map(|t| match t {
+                Token::Start { self_closing, .. } => Some(self_closing),
+                _ => None,
+            })
+            .collect();
+        // `/` must come right before `>`; in an unquoted value it is the value.
+        assert_eq!(flags, [true, false, false, false, false]);
     }
 }

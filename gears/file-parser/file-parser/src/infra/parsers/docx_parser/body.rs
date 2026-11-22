@@ -12,10 +12,10 @@ use quick_xml::events::{BytesStart, Event};
 use crate::domain::error::DomainError;
 use crate::domain::ir::{Inline, InlineStyle, ParsedBlock, TableBlock, TableCell, TableRow};
 use crate::infra::parsers::inlines::{Inlines, link_target};
-use crate::infra::parsers::limits::{ParseLimits, TableBudget, TextBudget, skipped_table_note};
-use crate::infra::parsers::ooxml::{Events, Relationships, xml};
+use crate::infra::parsers::limits::{Budgets, ParseLimits, table_note};
+use crate::infra::parsers::ooxml::{AltAction, Alternates, Events, Relationships, xml};
 
-use super::styles::{ListKind, Numbering, Role, Styles, Toggles, heading_for, level_attr, on_off};
+use super::styles::{ListKind, Numbering, Role, Styles, Toggles, level_attr, on_off};
 
 /// Deepest list level (`w:ilvl` 8).
 const MAX_LEVEL: u8 = 8;
@@ -23,27 +23,14 @@ const MAX_LEVEL: u8 = 8;
 const MAX_TABLE_DEPTH: usize = 32;
 /// Nested text boxes kept apart at most; deeper ones join their host.
 const MAX_BOX_DEPTH: usize = 8;
+/// Nested VML shapes tracked at most; deeper ones are transparent.
+const MAX_VML_DEPTH: usize = 32;
 /// Fields tracked at most; deeper ones are transparent.
-const MAX_FIELDS: usize = 64;
+pub(super) const MAX_FIELDS: usize = 64;
 /// Longest field instruction kept.
 const MAX_INSTRUCTION: usize = 2048;
 /// Widest cell span, as for HTML `colspan`.
 const MAX_SPAN: usize = 1000;
-
-/// Budgets shared by the whole document.
-pub(super) struct Budgets {
-    pub(super) tables: TableBudget,
-    pub(super) text: TextBudget,
-}
-
-impl Budgets {
-    pub(super) fn new(limits: &ParseLimits) -> Self {
-        Self {
-            tables: TableBudget::new(limits),
-            text: TextBudget::new(limits),
-        }
-    }
-}
 
 /// What the body is resolved against.
 pub(super) struct DocContext<'a> {
@@ -59,30 +46,7 @@ pub(super) fn read_body(
     ctx: &DocContext<'_>,
     budgets: &mut Budgets,
 ) -> Result<Vec<ParsedBlock>, DomainError> {
-    let mut walker = Walker {
-        ctx,
-        budgets,
-        skip: 0,
-        alternates: Vec::new(),
-        document: Vec::new(),
-        sinks: Vec::new(),
-        para: None,
-        nested_p: 0,
-        suspended: Vec::new(),
-        flat_boxes: 0,
-        tables: Vec::new(),
-        flat_tables: 0,
-        fields: Vec::new(),
-        field_overflow: 0,
-        links: Vec::new(),
-        link_cache: HashMap::new(),
-        run: None,
-        text: TextKind::None,
-        props: Props::None,
-        picture: None,
-        sdt_props: 0,
-        sdts: Vec::new(),
-    };
+    let mut walker = Walker::new(ctx, budgets);
     let mut events = Events::new(text, ctx.limits, "DOCX");
     let mut root_seen = false;
     loop {
@@ -96,24 +60,12 @@ pub(super) fn read_body(
                 );
             }
         }
-        match event {
-            Event::Start(e) => walker.start(&e, true)?,
-            Event::Empty(e) => walker.start(&e, false)?,
-            Event::End(e) => walker.end(e.name().into_inner())?,
-            Event::Text(t) => {
-                let text = t.xml10_content();
-                walker.text(&text)?;
-            }
-            Event::GeneralRef(r) => {
-                if let Some(text) = xml::resolve_ref(&r) {
-                    walker.text(&text)?;
-                }
-            }
-            Event::Eof => break,
-            _ => {}
+        if matches!(event, Event::Eof) {
+            break;
         }
+        walker.event(event)?;
     }
-    walker.finish_para();
+    walker.finish_para()?;
     Ok(walker.document)
 }
 
@@ -126,6 +78,8 @@ enum Props {
     Borders,
     /// A section break in a paragraph's properties.
     Section,
+    /// The paragraph mark's run properties.
+    Mark,
     Run,
     Row,
     Cell,
@@ -142,6 +96,7 @@ enum TextKind {
 
 /// A paragraph being read.
 #[derive(Default)]
+#[expect(clippy::struct_excessive_bools, reason = "independent paragraph flags")]
 struct Para {
     style: Option<String>,
     outline: Option<u8>,
@@ -156,6 +111,9 @@ struct Para {
     emitted: bool,
     /// Text boxes anchored in this paragraph, put out after it.
     pending: Vec<ParsedBlock>,
+    /// The paragraph mark is a tracked deletion: the next paragraph goes on
+    /// from here.
+    mark_deleted: bool,
 }
 
 /// The run (`w:r`) being read.
@@ -179,7 +137,10 @@ struct Field {
 
 /// A table being read.
 #[derive(Default)]
-#[allow(clippy::struct_excessive_bools)] // independent per-table and per-cell state
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent per-table and per-cell state"
+)]
 struct Table {
     rows: Vec<Vec<TableCell>>,
     cells: usize,
@@ -203,6 +164,16 @@ struct Picture {
     decorative: bool,
 }
 
+/// A legacy VML shape (`v:shape`, `v:rect`, ...) being read: a picture once
+/// it ends.
+#[derive(Default)]
+struct VmlShape {
+    alt: Option<String>,
+    title: Option<String>,
+    /// It holds a text box: its text is read, it is no picture.
+    text_box: bool,
+}
+
 /// What a text box suspends: the host paragraph, its open run, and the
 /// count of transparent nested paragraphs.
 struct Suspended {
@@ -216,12 +187,14 @@ struct Walker<'a, 'b> {
     budgets: &'b mut Budgets,
     /// Depth inside a subtree being skipped; 0 when reading.
     skip: usize,
-    alternates: Vec<bool>,
+    alternates: Alternates,
     /// The document's blocks.
     document: Vec<ParsedBlock>,
     /// Where blocks go instead while a table cell or text box is open.
     sinks: Vec<Vec<ParsedBlock>>,
     para: Option<Para>,
+    /// The open paragraph ended with a deleted mark; the next `w:p` joins it.
+    joining: bool,
     /// `w:p` inside an open paragraph (not valid markup): read as part of it.
     nested_p: usize,
     suspended: Vec<Suspended>,
@@ -236,13 +209,61 @@ struct Walker<'a, 'b> {
     text: TextKind,
     props: Props,
     picture: Option<Picture>,
+    /// Open VML shapes, innermost last (a text box can hold another).
+    vml: Vec<VmlShape>,
+    /// Open VML shapes past [`MAX_VML_DEPTH`].
+    vml_overflow: usize,
     /// Depth inside `w:sdtPr`.
     sdt_props: usize,
     /// One entry per open `w:sdt`: whether it shows placeholder text.
     sdts: Vec<bool>,
 }
 
-impl Walker<'_, '_> {
+impl<'a, 'b> Walker<'a, 'b> {
+    fn new(ctx: &'a DocContext<'a>, budgets: &'b mut Budgets) -> Self {
+        Self {
+            ctx,
+            budgets,
+            skip: 0,
+            alternates: Alternates::default(),
+            document: Vec::new(),
+            sinks: Vec::new(),
+            para: None,
+            joining: false,
+            nested_p: 0,
+            suspended: Vec::new(),
+            flat_boxes: 0,
+            tables: Vec::new(),
+            flat_tables: 0,
+            fields: Vec::new(),
+            field_overflow: 0,
+            links: Vec::new(),
+            link_cache: HashMap::new(),
+            run: None,
+            text: TextKind::None,
+            props: Props::None,
+            picture: None,
+            vml: Vec::new(),
+            vml_overflow: 0,
+            sdt_props: 0,
+            sdts: Vec::new(),
+        }
+    }
+
+    fn event(&mut self, event: Event<'_>) -> Result<(), DomainError> {
+        match event {
+            Event::Start(e) => self.start(&e, true),
+            Event::Empty(e) => self.start(&e, false),
+            Event::End(e) => self.end(e.name().into_inner()),
+            Event::Text(t) => self.text(&t.xml10_content()),
+            Event::GeneralRef(r) => match xml::resolve_ref(&r) {
+                Some(text) => self.text(&text),
+                None => Ok(()),
+            },
+            _ => Ok(()),
+        }
+    }
+
     fn start(&mut self, e: &BytesStart<'_>, is_start: bool) -> Result<(), DomainError> {
         if self.skip > 0 {
             self.skip += usize::from(is_start);
@@ -270,11 +291,18 @@ impl Walker<'_, '_> {
                 _ => {}
             }
         }
+        // A deleted paragraph mark (in its run properties).
+        if self.props == Props::Mark
+            && matches!(name, "w:del" | "w:moveFrom")
+            && let Some(para) = self.para.as_mut()
+        {
+            para.mark_deleted = true;
+        }
         if skipped(name) {
             self.skip = usize::from(is_start);
             return Ok(());
         }
-        if self.structure(name, is_start) {
+        if self.structure(name, is_start)? {
             return Ok(());
         }
         self.content(e, name, is_start)
@@ -297,7 +325,7 @@ impl Walker<'_, '_> {
 
     /// Paragraphs, properties, content controls, text boxes and tables;
     /// returns whether `name` was one of them.
-    fn structure(&mut self, name: &str, is_start: bool) -> bool {
+    fn structure(&mut self, name: &str, is_start: bool) -> Result<bool, DomainError> {
         match name {
             "w:sdt" if is_start => self.sdts.push(false),
             "w:sdtPr" if is_start => self.sdt_props = 1,
@@ -310,10 +338,7 @@ impl Walker<'_, '_> {
             "w:pPr" if is_start && self.para.is_some() => self.props = Props::Paragraph,
             "w:sectPr" => self.section(is_start),
             "w:pBdr" if is_start && self.props == Props::Paragraph => self.props = Props::Borders,
-            "w:rPr" if self.props == Props::Paragraph => {
-                // The paragraph mark's run properties.
-                self.skip = usize::from(is_start);
-            }
+            "w:rPr" if is_start && self.props == Props::Paragraph => self.props = Props::Mark,
             "w:r" if is_start => {
                 let hidden = self.paragraph_hidden();
                 self.run = Some(Run {
@@ -322,15 +347,15 @@ impl Walker<'_, '_> {
                 });
             }
             "w:rPr" if is_start && self.run.is_some() => self.props = Props::Run,
-            "w:txbxContent" if is_start => self.box_start(),
-            "w:tbl" if is_start => self.table_start(),
+            "w:txbxContent" if is_start => self.box_start()?,
+            "w:tbl" if is_start => self.table_start()?,
             "w:tr" if is_start => self.row_start(),
             "w:trPr" if is_start => self.props = Props::Row,
             "w:tc" if is_start => self.cell_start(),
             "w:tcPr" if is_start => self.props = Props::Cell,
-            _ => return false,
+            _ => return Ok(false),
         }
-        true
+        Ok(true)
     }
 
     /// Text, breaks, fields, links, pictures and properties.
@@ -360,7 +385,8 @@ impl Walker<'_, '_> {
             }
             "w:fldChar" => self.field_char(e),
             "w:fldSimple" if is_start => {
-                let link = xml::attr(e, "w:instr").and_then(|i| hyperlink_field(&i));
+                let link =
+                    xml::attr(e, "w:instr").and_then(|i| hyperlink_field(cut_instruction(&i)));
                 self.push_field(Field {
                     instruction: String::new(),
                     showing: true,
@@ -388,18 +414,40 @@ impl Walker<'_, '_> {
                     p.decorative = xml::attr(e, "val").is_none_or(|v| v == "1" || v == "true");
                 }
             }
-            "v:imagedata" | "v:shape" => {
-                let alt = xml::attr(e, "o:title").or_else(|| xml::attr(e, "alt"));
-                if alt.as_deref().is_some_and(|a| !a.trim().is_empty()) {
-                    self.picture = Some(Picture {
-                        alt,
-                        ..Picture::default()
-                    });
-                    self.emit_picture()?;
+            _ if is_vml_shape(name) => {
+                let hr = name == "v:rect"
+                    && xml::attr(e, "o:hr").is_some_and(|v| v == "t" || v == "true");
+                if hr {
+                    self.split_para(ParsedBlock::HorizontalRule)?;
+                }
+                // A group's alt text describes its shapes, which come out on
+                // their own.
+                let shape = VmlShape {
+                    alt: xml::attr(e, "alt").filter(|_| !hr && name != "v:group"),
+                    ..VmlShape::default()
+                };
+                if !is_start {
+                    self.emit_vml(shape)?;
+                } else if self.vml.len() < MAX_VML_DEPTH {
+                    self.vml.push(shape);
+                } else {
+                    self.vml_overflow += 1;
                 }
             }
-            "v:rect" if xml::attr(e, "o:hr").is_some_and(|v| v == "t" || v == "true") => {
-                self.split_para(ParsedBlock::HorizontalRule);
+            "v:imagedata" => {
+                let title = xml::attr(e, "o:title");
+                match self.vml.last_mut() {
+                    Some(shape) => shape.title = title,
+                    None => self.emit_vml(VmlShape {
+                        title,
+                        ..VmlShape::default()
+                    })?,
+                }
+            }
+            "v:textbox" => {
+                if let Some(shape) = self.vml.last_mut() {
+                    shape.text_box = true;
+                }
             }
             _ => self.property(e, name),
         }
@@ -464,10 +512,7 @@ impl Walker<'_, '_> {
                     match name {
                         "w:tblHeader" => table.row_header = on_off(e),
                         "w:gridBefore" => {
-                            let n = span_attr(e, max);
-                            for _ in 0..n {
-                                push_cell(table, Vec::new());
-                            }
+                            push_empty_cells(table, span_attr(e, max));
                             self.check_overflow();
                         }
                         "w:gridAfter" => table.row_after = span_attr(e, max),
@@ -492,7 +537,7 @@ impl Walker<'_, '_> {
                     }
                 }
             }
-            Props::None => {}
+            Props::Mark | Props::None => {}
         }
     }
 
@@ -507,7 +552,7 @@ impl Walker<'_, '_> {
         }
         match name {
             "mc:AlternateContent" => {
-                self.alternates.pop();
+                self.alternates.end(name);
             }
             "w:pPr" | "w:trPr" | "w:tcPr" => self.props = Props::None,
             "w:pBdr" | "w:sectPr" => {
@@ -515,6 +560,7 @@ impl Walker<'_, '_> {
                     self.props = Props::Paragraph;
                 }
             }
+            "w:rPr" if self.props == Props::Mark => self.props = Props::Paragraph,
             "w:rPr" if self.props == Props::Run => {
                 self.props = Props::None;
                 self.resolve_run();
@@ -522,6 +568,16 @@ impl Walker<'_, '_> {
             "w:r" => self.run = None,
             "w:t" | "m:t" | "w:instrText" => self.text = TextKind::None,
             "w:fldSimple" => self.close_simple_field(),
+            "w:sdt" => {
+                self.sdts.pop();
+            }
+            _ if is_vml_shape(name) => {
+                if self.vml_overflow > 0 {
+                    self.vml_overflow -= 1;
+                } else if let Some(shape) = self.vml.pop() {
+                    self.emit_vml(shape)?;
+                }
+            }
             "w:hyperlink" => {
                 self.links.pop();
             }
@@ -529,44 +585,46 @@ impl Walker<'_, '_> {
             "w:p" => {
                 if self.nested_p > 0 {
                     self.nested_p -= 1;
+                } else if self.para.as_ref().is_some_and(|p| p.mark_deleted) {
+                    // Read as accepted: the paragraph goes on in the next one.
+                    self.joining = true;
+                    self.run = None;
+                    self.text = TextKind::None;
                 } else {
-                    self.finish_para();
+                    self.finish_para()?;
                 }
             }
-            "w:txbxContent" => self.box_end(),
-            "w:tc" => self.cell_end(),
+            "w:txbxContent" => self.box_end()?,
+            "w:tc" => self.cell_end()?,
             "w:tr" => self.row_end(),
-            "w:tbl" => self.table_end(),
+            "w:tbl" => self.table_end()?,
             _ => {}
         }
         Ok(())
     }
 
     /// `mc:AlternateContent`: the first branch is read, the others skipped.
+    /// Returns whether `name` was one of its elements.
     fn alternate(&mut self, name: &str, is_start: bool) -> bool {
-        match name {
-            "mc:AlternateContent" => {
-                if is_start {
-                    self.alternates.push(false);
-                }
+        match self.alternates.start(name, is_start) {
+            AltAction::Other => false,
+            AltAction::Consumed => true,
+            AltAction::SkipElement => {
+                self.skip = 1;
                 true
             }
-            "mc:Choice" | "mc:Fallback" => {
-                if is_start {
-                    match self.alternates.last_mut() {
-                        Some(taken) if *taken => self.skip = 1,
-                        Some(taken) => *taken = true,
-                        None => {}
-                    }
-                }
-                true
-            }
-            _ => false,
         }
     }
 
     fn sink(&mut self) -> &mut Vec<ParsedBlock> {
         self.sinks.last_mut().unwrap_or(&mut self.document)
+    }
+
+    /// Puts out a block, charging it to the text budget.
+    fn emit(&mut self, block: ParsedBlock) -> Result<(), DomainError> {
+        self.budgets.text.charge_block()?;
+        self.sink().push(block);
+        Ok(())
     }
 
     fn in_table(&self) -> bool {
@@ -576,6 +634,18 @@ impl Walker<'_, '_> {
     // --- paragraphs ---------------------------------------------------------------
 
     fn para_start(&mut self) {
+        if std::mem::take(&mut self.joining)
+            && let Some(joined) = self.para.take()
+        {
+            // The text so far, with this paragraph's properties.
+            self.para = Some(Para {
+                inlines: joined.inlines,
+                emitted: joined.emitted,
+                pending: joined.pending,
+                ..Para::default()
+            });
+            return;
+        }
         if self.para.is_some() {
             self.nested_p += 1;
             return;
@@ -586,10 +656,7 @@ impl Walker<'_, '_> {
     /// What the open paragraph is: its block role and list membership.
     fn classify(&self, para: &Para) -> (Role, Option<(u8, bool)>) {
         let styles = self.ctx.styles;
-        let role = match para.outline {
-            Some(outline) => heading_for(outline).map_or(Role::Body, Role::Heading),
-            None => styles.role(para.style.as_deref()),
-        };
+        let role = styles.role(para.style.as_deref(), para.outline);
         // Tables hold paragraphs only: headings, code and quotes would break
         // the Markdown table.
         let role = if self.in_table() { Role::Body } else { role };
@@ -615,9 +682,9 @@ impl Walker<'_, '_> {
     }
 
     /// Puts out the paragraph's text so far as one block.
-    fn flush_segment(&mut self, closing: bool) {
+    fn flush_segment(&mut self, closing: bool) -> Result<(), DomainError> {
         let Some(mut para) = self.para.take() else {
-            return;
+            return Ok(());
         };
         let (role, list) = self.classify(&para);
         if !para.emitted
@@ -626,7 +693,7 @@ impl Walker<'_, '_> {
                 .page_break_before
                 .unwrap_or_else(|| self.ctx.styles.page_break_before(para.style.as_deref()))
         {
-            self.push_page_break();
+            self.push_page_break()?;
         }
         let block = if role == Role::Code {
             let code = para.inlines.text();
@@ -666,18 +733,22 @@ impl Walker<'_, '_> {
                 })
             }
         };
-        if let Some(block) = block {
-            para.emitted = true;
-            self.sink().push(block);
-        }
         self.para = Some(para);
+        if let Some(block) = block {
+            if let Some(para) = self.para.as_mut() {
+                para.emitted = true;
+            }
+            self.emit(block)?;
+        }
+        Ok(())
     }
 
-    fn finish_para(&mut self) {
+    fn finish_para(&mut self) -> Result<(), DomainError> {
+        self.joining = false;
         if self.para.is_none() {
-            return;
+            return Ok(());
         }
-        self.flush_segment(true);
+        self.flush_segment(true)?;
         // Field instructions never span paragraphs; an unclosed one must not
         // hide what follows. Fields showing their result (a table of
         // contents) stay open.
@@ -688,26 +759,28 @@ impl Walker<'_, '_> {
         self.text = TextKind::None;
         if let Some(para) = self.para.take() {
             if para.section_break && !self.in_table() {
-                self.push_page_break();
+                self.push_page_break()?;
             }
+            // Charged as they were put out in the text box.
             let pending = para.pending;
             self.sink().extend(pending);
         }
+        Ok(())
     }
 
     /// A block inside a paragraph (an image, a page break, a rule): the text
     /// before it, the block, then the rest of the paragraph.
-    fn split_para(&mut self, block: ParsedBlock) {
+    fn split_para(&mut self, block: ParsedBlock) -> Result<(), DomainError> {
         if self.para.is_some() {
-            self.flush_segment(false);
+            self.flush_segment(false)?;
             if let Some(para) = self.para.as_mut() {
                 para.emitted = true;
             }
         }
         if block == ParsedBlock::PageBreak {
-            self.push_page_break();
+            self.push_page_break()
         } else {
-            self.sink().push(block);
+            self.emit(block)
         }
     }
 
@@ -716,17 +789,20 @@ impl Walker<'_, '_> {
             // A table row cannot hold a page break.
             self.push_text("\n")
         } else {
-            self.split_para(ParsedBlock::PageBreak);
-            Ok(())
+            self.split_para(ParsedBlock::PageBreak)
         }
     }
 
     /// A page break, unless the output is empty or already ends with one.
-    fn push_page_break(&mut self) {
-        let sink = self.sink();
-        if sink.last().is_some_and(|b| *b != ParsedBlock::PageBreak) {
-            sink.push(ParsedBlock::PageBreak);
+    fn push_page_break(&mut self) -> Result<(), DomainError> {
+        if self
+            .sink()
+            .last()
+            .is_some_and(|b| *b != ParsedBlock::PageBreak)
+        {
+            self.emit(ParsedBlock::PageBreak)?;
         }
+        Ok(())
     }
 
     // --- runs and text -----------------------------------------------------------
@@ -787,7 +863,6 @@ impl Walker<'_, '_> {
         {
             return Ok(());
         }
-        self.budgets.text.charge(text.len())?;
         // A line break belongs to no style.
         let style = match self.run.as_ref() {
             Some(r) if text != "\n" => r.style.clone(),
@@ -803,8 +878,8 @@ impl Walker<'_, '_> {
             .find_map(|f| f.link.as_deref())
             .or_else(|| self.links.last().and_then(Option::as_deref));
         if let Some(para) = self.para.as_mut() {
-            let added = para.inlines.push(&text, &style, link);
-            self.budgets.text.charge(added)?;
+            para.inlines
+                .push(&text, &style, link, &mut self.budgets.text)?;
         }
         Ok(())
     }
@@ -872,7 +947,7 @@ impl Walker<'_, '_> {
             cached.clone()
         } else {
             let rel = self.ctx.rels.get(&id)?;
-            let base = (rel.external && rel.rel_type.rsplit('/').next() == Some("hyperlink"))
+            let base = (rel.external && rel.is_type("hyperlink"))
                 .then(|| link_target(&rel.target))
                 .flatten();
             self.link_cache.insert(id, base.clone());
@@ -885,6 +960,20 @@ impl Walker<'_, '_> {
     }
 
     // --- pictures and text boxes -------------------------------------------------
+
+    /// A legacy VML picture: the shape's alt text and its image's title. A
+    /// shape holding a text box is not a picture.
+    fn emit_vml(&mut self, shape: VmlShape) -> Result<(), DomainError> {
+        if shape.text_box {
+            return Ok(());
+        }
+        self.picture = Some(Picture {
+            alt: shape.alt,
+            title: shape.title,
+            ..Picture::default()
+        });
+        self.emit_picture()
+    }
 
     fn emit_picture(&mut self) -> Result<(), DomainError> {
         let Some(picture) = self.picture.take() else {
@@ -911,19 +1000,22 @@ impl Walker<'_, '_> {
             alt,
             title,
             src: None,
-        });
-        Ok(())
+        })
     }
 
-    fn box_start(&mut self) {
+    fn box_start(&mut self) -> Result<(), DomainError> {
+        if self.joining {
+            // Outside any paragraph: the joined one ends here.
+            self.finish_para()?;
+        }
         // A text box in hidden text is hidden too.
         if self.run.as_ref().is_some_and(|r| r.hidden) {
             self.skip = 1;
-            return;
+            return Ok(());
         }
         if self.suspended.len() >= MAX_BOX_DEPTH {
             self.flat_boxes += 1;
-            return;
+            return Ok(());
         }
         self.suspended.push(Suspended {
             para: self.para.take(),
@@ -931,19 +1023,20 @@ impl Walker<'_, '_> {
             nested_p: std::mem::take(&mut self.nested_p),
         });
         self.sinks.push(Vec::new());
+        Ok(())
     }
 
-    fn box_end(&mut self) {
+    fn box_end(&mut self) -> Result<(), DomainError> {
         if self.flat_boxes > 0 {
             self.flat_boxes -= 1;
-            return;
+            return Ok(());
         }
         let Some(saved) = self.suspended.pop() else {
-            return;
+            return Ok(());
         };
         // A paragraph left open in the box ends with it.
         if self.para.is_some() {
-            self.finish_para();
+            self.finish_para()?;
         }
         let blocks = self.sinks.pop().unwrap_or_default();
         self.para = saved.para;
@@ -953,6 +1046,7 @@ impl Walker<'_, '_> {
             Some(host) => host.pending.extend(blocks),
             None => self.sink().extend(blocks),
         }
+        Ok(())
     }
 
     // --- tables ------------------------------------------------------------------
@@ -961,16 +1055,17 @@ impl Walker<'_, '_> {
         MAX_SPAN.min(self.ctx.limits.max_table_columns)
     }
 
-    fn table_start(&mut self) {
+    fn table_start(&mut self) -> Result<(), DomainError> {
         if self.para.is_some() {
             // Not valid inside a paragraph; end the paragraph first.
-            self.finish_para();
+            self.finish_para()?;
         }
         if self.tables.len() >= MAX_TABLE_DEPTH {
             self.flat_tables += 1;
-            return;
+        } else {
+            self.tables.push(Table::default());
         }
-        self.tables.push(Table::default());
+        Ok(())
     }
 
     fn row_start(&mut self) {
@@ -1014,30 +1109,29 @@ impl Walker<'_, '_> {
         }
     }
 
-    fn cell_end(&mut self) {
+    fn cell_end(&mut self) -> Result<(), DomainError> {
         if self.flat_tables > 0 || self.tables.is_empty() {
-            return;
+            return Ok(());
         }
         if self.para.is_some() {
-            self.finish_para();
+            self.finish_para()?;
         }
         let mut blocks = self.sinks.pop().unwrap_or_default();
         let Some(table) = self.tables.last_mut() else {
-            return;
+            return Ok(());
         };
         if table.cell_deleted {
             // A tracked deletion: the cell is gone in the accepted document.
-            return;
+            return Ok(());
         }
         if table.continuation {
             // The merged cell's content is in the cell that starts the merge.
             blocks.clear();
         }
         push_cell(table, blocks);
-        for _ in 1..table.span {
-            push_cell(table, Vec::new());
-        }
+        push_empty_cells(table, table.span.saturating_sub(1));
         self.check_overflow();
+        Ok(())
     }
 
     fn row_end(&mut self) {
@@ -1051,9 +1145,7 @@ impl Walker<'_, '_> {
                 }
                 return;
             }
-            for _ in 0..table.row_after {
-                push_cell(table, Vec::new());
-            }
+            push_empty_cells(table, table.row_after);
             if table.row_header && table.rows.len() == table.header_rows + 1 {
                 table.header_rows += 1;
             }
@@ -1061,18 +1153,19 @@ impl Walker<'_, '_> {
         self.check_overflow();
     }
 
-    fn table_end(&mut self) {
+    fn table_end(&mut self) -> Result<(), DomainError> {
         if self.flat_tables > 0 {
             self.flat_tables -= 1;
-            return;
+            return Ok(());
         }
         let Some(mut table) = self.tables.pop() else {
-            return;
+            return Ok(());
         };
         table.rows.retain(|r| !r.is_empty());
         if !self.tables.is_empty() {
             // A table inside a cell cannot be drawn there: its cells' blocks
-            // join the enclosing cell, row by row.
+            // join the enclosing cell, row by row (charged as they were put
+            // out).
             self.budgets.tables.spend(table.cells);
             let blocks: Vec<ParsedBlock> = table
                 .rows
@@ -1082,17 +1175,21 @@ impl Walker<'_, '_> {
                 .filter(|b| !is_empty_paragraph(b))
                 .collect();
             self.sink().extend(blocks);
-            return;
+            return Ok(());
         }
         let width = table.rows.iter().map(Vec::len).max().unwrap_or(0);
         if width == 0 && !table.overflow {
-            return;
+            return Ok(());
         }
-        if table.overflow || !self.budgets.tables.try_charge(table.rows.len(), width) {
-            self.budgets.tables.spend(table.cells);
+        let kept =
+            self.budgets
+                .tables
+                .admit("DOCX", table.rows.len(), width, table.cells, table.overflow);
+        if !kept {
             let remaining = self.budgets.tables.remaining();
-            self.sink().push(skipped_table_note(remaining));
-            return;
+            let note = table_note(remaining, &mut self.budgets.text)?;
+            self.sink().push(note);
+            return Ok(());
         }
         // Rows marked as repeating headers; with none, the first row (a
         // Markdown table needs a header).
@@ -1109,8 +1206,25 @@ impl Walker<'_, '_> {
                 }
             })
             .collect();
-        self.sink().push(ParsedBlock::Table(TableBlock { rows }));
+        self.emit(ParsedBlock::Table(TableBlock { rows }))
     }
+}
+
+/// VML elements that can hold a picture or a text box.
+fn is_vml_shape(name: &str) -> bool {
+    matches!(
+        name,
+        "v:shape"
+            | "v:rect"
+            | "v:roundrect"
+            | "v:oval"
+            | "v:line"
+            | "v:polyline"
+            | "v:arc"
+            | "v:curve"
+            | "v:image"
+            | "v:group"
+    )
 }
 
 /// Elements whose subtree holds nothing to read: old properties of tracked
@@ -1152,6 +1266,18 @@ fn is_empty_paragraph(block: &ParsedBlock) -> bool {
     matches!(block, ParsedBlock::Paragraph { inlines } if inlines.iter().all(|i| plain_inline(i).is_empty()))
 }
 
+/// Pads the row with `n` empty cells (spans, `gridBefore`, `gridAfter`); a
+/// table already over the budget only counts them.
+fn push_empty_cells(table: &mut Table, n: usize) {
+    if table.overflow {
+        table.cells = table.cells.saturating_add(n);
+        return;
+    }
+    for _ in 0..n {
+        push_cell(table, Vec::new());
+    }
+}
+
 fn push_cell(table: &mut Table, blocks: Vec<ParsedBlock>) {
     table.cells += 1;
     if table.overflow {
@@ -1186,6 +1312,15 @@ fn plain_text(block: &ParsedBlock) -> String {
     match block {
         ParsedBlock::Paragraph { inlines } => inlines.iter().map(plain_inline).collect(),
         _ => String::new(),
+    }
+}
+
+/// The first [`MAX_INSTRUCTION`] characters of a `w:fldSimple` instruction,
+/// as kept for complex fields: tokenizing a huge one would cost memory.
+fn cut_instruction(instruction: &str) -> &str {
+    match instruction.char_indices().nth(MAX_INSTRUCTION) {
+        Some((end, _)) => instruction.get(..end).unwrap_or(instruction),
+        None => instruction,
     }
 }
 
@@ -1303,5 +1438,91 @@ fn symbol_char(code: u8) -> Option<char> {
         0xD5 => Some('\u{220f}'),
         0xF2 => Some('\u{222b}'),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use quick_xml::Reader;
+
+    use super::*;
+
+    /// Feeds the start of a body (`xml`, left unclosed) to a walker and
+    /// hands the walker to `check`.
+    fn walk_prefix(xml: &str, limits: &ParseLimits, check: impl FnOnce(&Walker<'_, '_>)) {
+        let (styles, numbering, rels) = (
+            Styles::default(),
+            Numbering::default(),
+            Relationships::default(),
+        );
+        let ctx = DocContext {
+            styles: &styles,
+            numbering: &numbering,
+            rels: &rels,
+            limits,
+        };
+        let mut budgets = Budgets::new(limits);
+        let mut walker = Walker::new(&ctx, &mut budgets);
+        let mut reader = Reader::from_str(xml);
+        loop {
+            match reader.read_event().expect("well-formed prefix") {
+                Event::Eof => break,
+                event => walker.event(event).expect("within limits"),
+            }
+        }
+        check(&walker);
+    }
+
+    #[test]
+    fn an_inner_table_counts_the_open_outer_table() {
+        // Nothing is charged until the outer table ends, so the inner table
+        // must count the outer one's 30 cells: each table fits the budget of
+        // 50 alone, both together do not. Once the inner table overflows it
+        // keeps no more cells.
+        let limits = ParseLimits {
+            max_table_cells: 50,
+            ..ParseLimits::default()
+        };
+        let filler = r#"<w:tc><w:tcPr><w:gridSpan w:val="30"/></w:tcPr></w:tc>"#;
+        let xml = format!("<w:tbl><w:tr>{filler}<w:tc><w:tbl><w:tr>{filler}<w:tc></w:tc>");
+        walk_prefix(&xml, &limits, |walker| {
+            let [outer, inner] = walker.tables.as_slice() else {
+                panic!("two open tables");
+            };
+            assert!(!outer.overflow);
+            assert!(
+                inner.overflow,
+                "the inner table counts the outer one's cells"
+            );
+            assert_eq!(inner.cells, 31);
+            assert_eq!(
+                inner.rows.iter().map(Vec::len).sum::<usize>(),
+                30,
+                "the cell after the overflow is counted, not kept"
+            );
+        });
+    }
+
+    #[test]
+    fn closed_content_controls_leave_the_stack() {
+        let xml = "<w:sdt><w:sdtPr><w:showingPlcHdr/></w:sdtPr><w:sdtContent/></w:sdt><w:sdt><w:sdtPr/><w:sdtContent>";
+        walk_prefix(xml, &ParseLimits::default(), |walker| {
+            assert_eq!(walker.sdts, [false], "one entry per open content control");
+        });
+    }
+
+    #[test]
+    fn an_overflowing_table_counts_padding_without_building_it() {
+        // Spans and grid padding repeat for every row and cell: once the
+        // table is over the budget they must not loop cell by cell. A
+        // regression shows as a hang, which the nextest timeout catches.
+        let mut table = Table {
+            overflow: true,
+            ..Table::default()
+        };
+        push_empty_cells(&mut table, usize::MAX);
+        assert_eq!(table.cells, usize::MAX);
+        assert!(table.rows.is_empty());
     }
 }

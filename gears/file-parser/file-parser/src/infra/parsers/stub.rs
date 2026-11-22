@@ -5,6 +5,7 @@ use crate::domain::error::DomainError;
 use crate::domain::ir::{DocumentBuilder, Inline, ParsedBlock, ParsedSource};
 use crate::domain::parser::FileParserBackend;
 
+use super::backend::DEFAULT_MAX_BYTES;
 use super::bounded_read::read_bounded;
 
 /// Stub parser that provides placeholder parsing for various file types
@@ -12,11 +13,6 @@ use super::bounded_read::read_bounded;
 pub struct StubParser {
     max_bytes: u64,
 }
-
-/// Ceiling applied by [`StubParser::new`], matching `FileParserConfig`'s
-/// `max_file_size_mb` default. `Gear::init` replaces it with the configured
-/// value via [`StubParser::with_max_bytes`].
-const DEFAULT_MAX_BYTES: u64 = 100 * 1024 * 1024;
 
 impl StubParser {
     #[must_use]

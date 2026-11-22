@@ -78,8 +78,9 @@ curl -s -X POST "http://127.0.0.1:8087/cf/file-parser/v1/upload?filename=test.tx
         },
         "blocks": [
             {
-                "type": "paragraph",
-                "inlines": [{"type": "text", "text": "Hello, Gears!", "style": {}}]
+                "type": "code_block",
+                "language": null,
+                "code": "Hello, Gears!\n"
             }
         ]
     }
@@ -108,12 +109,13 @@ curl -s -X POST "http://127.0.0.1:8087/cf/file-parser/v1/parse-local?render_mark
         },
         "blocks": [
             {
-                "type": "paragraph",
-                "inlines": [{"type": "text", "text": "Report content here.", "style": {}}]
+                "type": "code_block",
+                "language": null,
+                "code": "Report content here.\n"
             }
         ]
     },
-    "markdown": "Report content here.\n"
+    "markdown": "# report.txt\n\n---\nfilename: report.txt\ncontent-type: text/plain\n---\n\n```\nReport content here.\n```\n\n"
 }
 ```
 

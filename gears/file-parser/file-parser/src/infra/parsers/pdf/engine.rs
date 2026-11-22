@@ -3,37 +3,42 @@
 //! libpdfium is embedded by `build.rs`, written to a private temporary
 //! directory and bound once per process. pdfium is not thread-safe across
 //! documents (`pdfium-render`'s `thread_safe` feature only serialises single
-//! calls, and pdfium's last-error code is process-global), so one lock is held
-//! from binding and loading until the document and all its pages are dropped.
-//! Characters are read one by one with their geometry; pdfium's own page text
-//! (`FPDFText_GetText`) is not used, as it clips to the rotated page box.
+//! calls, and pdfium's last-error code is process-global), so every pdfium
+//! call runs on one thread, the engine's [`Worker`], which owns the binding.
+//! Documents queue for it (at most [`MAX_QUEUED`]) and their callers wait
+//! asynchronously. Characters are read one by one with their geometry;
+//! pdfium's own page text (`FPDFText_GetText`) is not used, as it clips to the
+//! rotated page box.
 //!
-//! The deadline is checked between pdfium calls only. A single call (loading
-//! a page with deeply nested forms, say) cannot be interrupted, so one hostile
-//! document can hold the engine longer than [`ParseLimits::pdf_timeout`];
-//! only a separate process could bound that. To keep such a document from
-//! also tying up the blocking thread pool, at most [`MAX_WAITERS`] documents
-//! wait for the engine; more are turned away as busy.
+//! The deadline starts when the engine takes the document and is checked
+//! between pdfium calls only. A single call (loading a page with deeply
+//! nested forms, say) cannot be interrupted, so one hostile document can hold
+//! the engine longer than [`ParseLimits::pdf_timeout`]; only a separate
+//! process could bound that. Its caller still gets an answer on time, later
+//! documents are turned away as busy until the engine is free, and the engine
+//! thread is never joined, so it does not hold up shutdown.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
 use pdfium_render::prelude::{
     PdfDocument, PdfDocumentMetadataTagType, PdfFontWeight, PdfPage, PdfPageTextChar, Pdfium,
     PdfiumError, PdfiumInternalError,
 };
 
-use crate::domain::error::DomainError;
-use crate::infra::parsers::limits::{ParseLimits, limit_exceeded};
+use crate::domain::error::{DomainError, ParseLimit};
+use tokio::sync::oneshot;
+use tokio::time::timeout;
+
+use super::worker::{Submit, Worker};
+use crate::infra::parsers::limits::{MAX_TITLE_CHARS, ParseLimits, limit_exceeded};
 
 /// Runtime override: a libpdfium to load instead of the embedded one (for
 /// builds without one, or hosts where the temporary directory is `noexec`).
 const RUNTIME_LIB_VAR: &str = "FILE_PARSER_PDFIUM_RUNTIME_LIB";
-
-/// Longest document title kept.
-const MAX_TITLE_CHARS: usize = 512;
 
 /// Glyphs smaller than this (points) are not text a reader sees.
 const MIN_GLYPH_SIZE: f32 = 1.0;
@@ -41,23 +46,94 @@ const MIN_GLYPH_SIZE: f32 = 1.0;
 /// How many characters are read between deadline checks.
 const DEADLINE_STRIDE: usize = 4096;
 
-/// Documents allowed to wait for the engine while another one holds it.
-/// Each waits on a blocking-pool thread (512 by default in tokio); the cap
-/// keeps a run of slow documents from taking all of them.
-const MAX_WAITERS: usize = 64;
+/// Documents allowed to wait for the engine while it reads another one.
+/// Each queued document holds its bytes in memory; a full queue answers busy.
+pub(super) const MAX_QUEUED: usize = 64;
+
+/// How long past [`ParseLimits::pdf_timeout`] a caller waits for a document
+/// the engine is reading before it gives up on it.
+const RUN_GRACE: Duration = Duration::from_secs(2);
+
+/// How long the startup check waits for the engine.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the engine waits for a caller to send its job once it has offered
+/// it the turn. The caller sends in the same poll that receives the offer, so
+/// this runs out for a caller whose future is no longer polled, or one whose
+/// runtime is too starved to poll it in time; either loses its turn (busy).
+const HANDOFF_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(5)
+};
 
 /// How long a failed bind is remembered before binding is tried again.
-const BIND_RETRY: Duration = Duration::from_secs(60);
+pub(super) const BIND_RETRY: Duration = Duration::from_secs(60);
 
-/// One lock for every pdfium call of this crate.
-pub(super) static PDFIUM_LOCK: Mutex<()> = Mutex::new(());
+/// Work for the engine thread, given the binding state that thread owns.
+type Job = Box<dyn FnOnce(&mut Option<Binding>) + Send>;
 
-/// Documents waiting for [`PDFIUM_LOCK`].
-static WAITERS: AtomicUsize = AtomicUsize::new(0);
+/// A place in the engine's queue. It carries no document: the engine hands
+/// back a channel when it is ready, and only then does the caller send the
+/// job. A caller that gives up while queued leaves nothing large behind.
+struct Ticket {
+    ready: oneshot::Sender<SyncSender<Job>>,
+}
 
-/// The bound library, or the last failure. Only touched with
-/// [`PDFIUM_LOCK`] held.
-static BINDING: Mutex<Option<Binding>> = Mutex::new(None);
+/// The engine thread; started on first use, and again if it has stopped. The
+/// lock is held only to clone or replace the sender.
+static ENGINE: Mutex<Option<Worker<Ticket>>> = Mutex::new(None);
+
+/// The document the engine is reading: when it started and how long its
+/// caller waits for it. Written only by the engine thread.
+static RUNNING: Mutex<Option<Running>> = Mutex::new(None);
+
+#[derive(Clone, Copy)]
+struct Running {
+    since: Instant,
+    /// How long the caller waits once the document started.
+    patience: Duration,
+    /// The overrun was reported; refusals while it lasts are not.
+    reported: bool,
+}
+
+impl Running {
+    /// How long the document has run past its caller's patience, if it has:
+    /// pdfium is stuck in a call that cannot be interrupted.
+    fn overrun(self) -> Option<Duration> {
+        self.since.elapsed().checked_sub(self.patience)
+    }
+}
+
+fn running() -> std::sync::MutexGuard<'static, Option<Running>> {
+    // Every critical section is one read or assignment.
+    RUNNING.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Warns, the first time a PDF is refused while a document holds the engine
+/// past its caller's patience, that this is the cause rather than load.
+fn warn_if_stuck() {
+    let overrun = {
+        let mut running = running();
+        let Some(current) = running.as_mut().filter(|r| !r.reported) else {
+            return;
+        };
+        let Some(overrun) = current.overrun() else {
+            return;
+        };
+        current.reported = true;
+        overrun
+    };
+    tracing::warn!(
+        ?overrun,
+        "PDF refused: the engine is still held by a document past its deadline; \
+         later refusals are not logged until it returns"
+    );
+}
+
+/// Set when the queue refused a document, cleared when it takes one again:
+/// a full queue is logged once, not once per refused request.
+static QUEUE_FULL: AtomicBool = AtomicBool::new(false);
 
 enum Binding {
     Bound(&'static Pdfium),
@@ -96,18 +172,60 @@ impl Direction {
     }
 }
 
+/// A rectangle in page space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct Rect {
+    pub(super) left: f32,
+    pub(super) bottom: f32,
+    pub(super) right: f32,
+    pub(super) top: f32,
+}
+
+impl Rect {
+    fn of(r: pdfium_render::prelude::PdfRect) -> Self {
+        Self {
+            left: r.left().value,
+            bottom: r.bottom().value,
+            right: r.right().value,
+            top: r.top().value,
+        }
+    }
+
+    fn is_finite(self) -> bool {
+        [self.left, self.bottom, self.right, self.top]
+            .iter()
+            .all(|v| v.is_finite())
+    }
+}
+
+/// `[left, bottom, right, top]`, for building test geometry.
+#[cfg(test)]
+impl From<[f32; 4]> for Rect {
+    fn from([left, bottom, right, top]: [f32; 4]) -> Self {
+        Self {
+            left,
+            bottom,
+            right,
+            top,
+        }
+    }
+}
+
 /// One character as drawn.
 #[derive(Debug, Clone, PartialEq)]
-#[allow(clippy::struct_excessive_bools)] // independent flags pdfium reports per glyph
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent flags pdfium reports per glyph"
+)]
 pub(super) struct Glyph {
     pub(super) ch: char,
     /// Baseline origin, page space.
     pub(super) x: f32,
     pub(super) y: f32,
-    /// Loose bounding box (the glyph's advance and the font's height), page
-    /// space: left, bottom, right, top. Tight boxes leave out side bearings,
-    /// so gaps between narrow glyphs would look like word breaks.
-    pub(super) bounds: [f32; 4],
+    /// Loose bounding box (the glyph's advance and the font's height). Tight
+    /// boxes leave out side bearings, so gaps between narrow glyphs would look
+    /// like word breaks.
+    pub(super) bounds: Rect,
     /// Effective font size in points.
     pub(super) size: f32,
     pub(super) direction: Direction,
@@ -124,11 +242,11 @@ pub(super) struct Glyph {
     pub(super) italic: bool,
 }
 
-/// The glyphs of one page and its visible area (left, bottom, right, top).
+/// The glyphs of one page and its visible area.
 #[derive(Debug, Default)]
 pub(super) struct PageGlyphs {
     pub(super) glyphs: Vec<Glyph>,
-    pub(super) area: Option<[f32; 4]>,
+    pub(super) area: Option<Rect>,
 }
 
 /// What a document yields besides its pages.
@@ -136,26 +254,160 @@ pub(super) struct DocumentInfo {
     pub(super) title: Option<String>,
 }
 
-/// Loads `bytes` and hands the glyphs of each page, in order, to `on_page`.
-pub(super) fn read_document(
-    bytes: &[u8],
-    limits: &ParseLimits,
-    on_page: &mut dyn FnMut(PageGlyphs) -> Result<(), DomainError>,
-) -> Result<DocumentInfo, DomainError> {
-    let deadline = Deadline::new(limits);
-    let _guard = {
-        let _waiting = Waiting::enter()?;
-        PDFIUM_LOCK
-            .try_lock_for(limits.pdf_timeout)
-            .ok_or_else(|| engine_error("the PDF engine stayed busy with other documents"))?
+/// pdfium, bound, for one document on the engine thread.
+pub(super) struct Engine<'a> {
+    pdfium: &'a Pdfium,
+    deadline: &'a Deadline<'a>,
+}
+
+/// Runs `work` on the engine thread and waits for its result.
+///
+/// - The queue is full: busy.
+/// - The engine does not take the document within `pdf_timeout`: busy.
+/// - The document takes longer than `pdf_timeout` (plus [`RUN_GRACE`]) once
+///   taken: `pdf_timeout` exceeded, even if pdfium is stuck in one call.
+///
+/// So a caller waits for the engine at most twice `pdf_timeout` plus
+/// [`RUN_GRACE`].
+// cancel-safe: dropping the future abandons the document. A queued ticket is
+// skipped, and a running document stops at its next deadline check.
+pub(super) async fn run<T, F>(limits: &ParseLimits, work: F) -> Result<T, DomainError>
+where
+    T: Send + 'static,
+    F: FnOnce(&Engine<'_>) -> Result<T, DomainError> + Send + 'static,
+{
+    let pdf_timeout = limits.pdf_timeout;
+    let (ready_tx, ready_rx) = oneshot::channel();
+    submit(Ticket { ready: ready_tx })?;
+    let job_tx = match timeout(pdf_timeout, ready_rx).await {
+        Ok(Ok(job_tx)) => job_tx,
+        // The ticket was dropped unanswered: the engine thread stopped.
+        Ok(Err(_)) => return Err(engine_error("the PDF engine dropped the document")),
+        Err(_) => {
+            warn_if_stuck();
+            return Err(DomainError::busy(
+                "the PDF engine stayed busy with other documents",
+            ));
+        }
     };
-    let pdfium = bound()?;
-    guarded(|| read_locked(pdfium, bytes, limits, &deadline, on_page))
+    let (reply_tx, reply_rx) = oneshot::channel::<Result<T, DomainError>>();
+    let patience = pdf_timeout.saturating_add(RUN_GRACE);
+    let span = tracing::Span::current();
+    let job: Job = Box::new(move |state| {
+        let _span = span.enter();
+        let started = Running {
+            since: Instant::now(),
+            patience,
+            reported: false,
+        };
+        *running() = Some(started);
+        let abandoned = || reply_tx.is_closed();
+        let deadline = Deadline::new(pdf_timeout, &abandoned);
+        let result = guarded(|| {
+            let pdfium = bound(state)?;
+            work(&Engine {
+                pdfium,
+                deadline: &deadline,
+            })
+        });
+        *running() = None;
+        if let Some(overrun) = started.overrun() {
+            tracing::warn!(?overrun, "PDF engine is free again after a stuck document");
+        }
+        // The caller may be gone by now; nobody else wants the result.
+        drop(reply_tx.send(result));
+    });
+    // Never blocks: the channel holds one job and this is the only send. It
+    // fails when the engine stopped waiting for this caller.
+    if job_tx.try_send(job).is_err() {
+        return Err(lost_turn());
+    }
+    match timeout(patience, reply_rx).await {
+        Ok(Ok(result)) => result,
+        // The job always answers once it runs (panics included), so it was
+        // dropped unrun: the engine gave up on the hand-off.
+        Ok(Err(_)) => Err(lost_turn()),
+        Err(_) => {
+            tracing::error!(
+                ?pdf_timeout,
+                "PDF engine is stuck in one pdfium call past the deadline; \
+                 later PDFs are refused as busy until it returns"
+            );
+            Err(limit_exceeded(
+                ParseLimit::PdfTimeout,
+                format!("the document took longer than {pdf_timeout:?}"),
+            ))
+        }
+    }
+}
+
+/// The engine stopped waiting for this caller's job before it arrived.
+fn lost_turn() -> DomainError {
+    DomainError::busy("the PDF engine moved on before the document was handed over")
+}
+
+/// Queues `ticket`, starting the engine thread if there is none.
+fn submit(ticket: Ticket) -> Result<(), DomainError> {
+    let submitted = {
+        // Every critical section is one assignment or a channel send, so a
+        // poisoned lock holds consistent data.
+        let mut slot = ENGINE.lock().unwrap_or_else(PoisonError::into_inner);
+        let worker =
+            match slot.as_ref() {
+                Some(worker) => worker,
+                None => slot.insert(start_engine().map_err(|e| {
+                    engine_error(&format!("cannot start the PDF engine thread: {e}"))
+                })?),
+            };
+        let submitted = worker.submit(ticket);
+        if submitted == Err(Submit::Gone) {
+            // Started again for the next document.
+            *slot = None;
+        }
+        submitted
+    };
+    // Logged outside the lock, once per full spell.
+    match submitted {
+        Ok(()) => {
+            QUEUE_FULL.store(false, Ordering::Relaxed);
+            Ok(())
+        }
+        Err(Submit::Full) => {
+            warn_if_stuck();
+            if !QUEUE_FULL.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    queued = MAX_QUEUED,
+                    "PDF refused: the engine queue is full; logged again once it has room"
+                );
+            }
+            Err(DomainError::busy("the PDF engine is busy; try again later"))
+        }
+        Err(Submit::Gone) => Err(engine_error("the PDF engine had stopped")),
+    }
+}
+
+fn start_engine() -> std::io::Result<Worker<Ticket>> {
+    let mut state: Option<Binding> = None;
+    Worker::spawn("pdfium", MAX_QUEUED, move |ticket: Ticket| {
+        let (job_tx, job_rx) = sync_channel(1);
+        // A caller that gave up while queued has dropped its receiver; one
+        // that goes away before sending the job drops `job_tx`.
+        if ticket.ready.send(job_tx).is_err() {
+            return;
+        }
+        match job_rx.recv_timeout(HANDOFF_TIMEOUT) {
+            Ok(job) => job(&mut state),
+            Err(RecvTimeoutError::Timeout) => tracing::warn!(
+                timeout = ?HANDOFF_TIMEOUT,
+                "PDF caller took its turn but sent no document; skipped"
+            ),
+            Err(RecvTimeoutError::Disconnected) => {}
+        }
+    })
 }
 
 /// Runs `f`, turning a panic into an engine error. pdfium-render asserts in a
-/// few places; a panic must not take the worker down, and the lock does not
-/// poison, so later documents still run.
+/// few places; a panic must fail only the document it happened on.
 pub(super) fn guarded<T>(f: impl FnOnce() -> Result<T, DomainError>) -> Result<T, DomainError> {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|payload| {
         let what = payload
@@ -169,77 +421,133 @@ pub(super) fn guarded<T>(f: impl FnOnce() -> Result<T, DomainError>) -> Result<T
 }
 
 /// Checks that the engine can be bound, binding it if needed.
-pub fn check_engine() -> Result<(), DomainError> {
-    let _guard = PDFIUM_LOCK.lock();
-    bound().map(|_| ())
-}
-
-/// A slot among the documents waiting for the engine.
-struct Waiting;
-
-impl Waiting {
-    fn enter() -> Result<Self, DomainError> {
-        if WAITERS.fetch_add(1, Ordering::AcqRel) >= MAX_WAITERS {
-            WAITERS.fetch_sub(1, Ordering::AcqRel);
-            return Err(engine_error("the PDF engine is busy; try again later"));
-        }
-        Ok(Self)
+// cancel-safe: dropping the future drops the check; nothing is left queued
+// but a ticket.
+pub async fn check_engine() -> Result<(), DomainError> {
+    let (ready_tx, ready_rx) = oneshot::channel();
+    submit(Ticket { ready: ready_tx })?;
+    let answer = async {
+        let job_tx = ready_rx.await.ok()?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let job: Job = Box::new(move |state| {
+            drop(reply_tx.send(guarded(|| bound(state).map(|_| ()))));
+        });
+        job_tx.try_send(job).ok()?;
+        reply_rx.await.ok()
+    };
+    match timeout(CHECK_TIMEOUT, answer).await {
+        Ok(Some(result)) => result,
+        Ok(None) => Err(engine_error("the PDF engine check failed")),
+        Err(_) => Err(engine_error(&format!(
+            "the PDF engine did not answer within {CHECK_TIMEOUT:?}"
+        ))),
     }
 }
 
-impl Drop for Waiting {
-    fn drop(&mut self) {
-        WAITERS.fetch_sub(1, Ordering::AcqRel);
+impl Engine<'_> {
+    /// Loads `bytes` and hands the glyphs of each page, in order, to `on_page`.
+    pub(super) fn read_document(
+        &self,
+        bytes: &[u8],
+        limits: &ParseLimits,
+        on_page: &mut dyn FnMut(PageGlyphs) -> Result<(), DomainError>,
+    ) -> Result<DocumentInfo, DomainError> {
+        read_document(self.pdfium, bytes, limits, self.deadline, on_page)
     }
 }
 
-fn read_locked(
+fn read_document(
     pdfium: &Pdfium,
     bytes: &[u8],
     limits: &ParseLimits,
-    deadline: &Deadline,
+    deadline: &Deadline<'_>,
     on_page: &mut dyn FnMut(PageGlyphs) -> Result<(), DomainError>,
 ) -> Result<DocumentInfo, DomainError> {
+    // The caller may have given up while the document waited for the engine.
+    deadline.check()?;
     let document = pdfium
         .load_pdf_from_byte_slice(bytes, None)
         .map_err(|e| load_error(&e))?;
     let count = usize::try_from(document.pages().len()).unwrap_or(0);
     if count > limits.max_pdf_pages {
         return Err(limit_exceeded(
-            "max_pdf_pages",
+            ParseLimit::MaxPdfPages,
             format!("{count} pages, limit {}", limits.max_pdf_pages),
         ));
     }
     let title = title(&document);
+    // An unreadable page reads as empty; the rest still count.
+    let mut unreadable = Unreadable::default();
     for index in 0..count {
         deadline.check()?;
         let glyphs = {
             let page = i32::try_from(index)
-                .ok()
-                .and_then(|i| document.pages().get(i).ok());
+                .map_err(|e| e.to_string())
+                .and_then(|i| document.pages().get(i).map_err(|e| e.to_string()));
             match page {
-                Some(page) => page_glyphs(&page, limits, deadline)?,
-                // An unreadable page reads as empty; the rest still count.
-                None => PageGlyphs::default(),
+                Ok(page) => page_glyphs(&page, limits, deadline, &mut unreadable, index)?,
+                Err(error) => {
+                    unreadable.note(index, &error);
+                    PageGlyphs::default()
+                }
             }
         };
         on_page(glyphs)?;
     }
+    unreadable.report(count);
     Ok(DocumentInfo { title })
+}
+
+/// Pages that could not be read, reported once per document.
+#[derive(Default)]
+struct Unreadable {
+    pages: usize,
+    first: Option<(usize, String)>,
+}
+
+impl Unreadable {
+    fn note(&mut self, index: usize, error: &str) {
+        self.pages += 1;
+        if self.first.is_none() {
+            self.first = Some((index, error.to_owned()));
+        }
+    }
+
+    fn report(&self, total: usize) {
+        if let Some((page, error)) = &self.first {
+            tracing::warn!(
+                unreadable = self.pages,
+                total,
+                first_page = page + 1,
+                %error,
+                "PDF pages could not be read and are treated as empty"
+            );
+        }
+    }
 }
 
 fn page_glyphs(
     page: &PdfPage<'_>,
     limits: &ParseLimits,
-    deadline: &Deadline,
+    deadline: &Deadline<'_>,
+    unreadable: &mut Unreadable,
+    index: usize,
 ) -> Result<PageGlyphs, DomainError> {
-    let Ok(text) = page.text() else {
+    let text = match page.text() {
+        Ok(text) => text,
+        Err(e) => {
+            unreadable.note(index, &e.to_string());
+            return Ok(PageGlyphs::default());
+        }
+    };
+    // pdfium answers -1 when it cannot count the characters.
+    let Ok(count) = usize::try_from(text.len()) else {
+        unreadable.note(index, "pdfium could not count the page's characters");
         return Ok(PageGlyphs::default());
     };
-    let count = usize::try_from(text.len()).unwrap_or(0);
     if count > limits.max_pdf_chars_per_page {
         return Err(limit_exceeded(
-            "max_pdf_chars_per_page",
+            ParseLimit::MaxPdfCharsPerPage,
             format!(
                 "a page has {count} characters, limit {}",
                 limits.max_pdf_chars_per_page
@@ -251,15 +559,7 @@ fn page_glyphs(
         .crop()
         .or_else(|_| page.boundaries().media())
         .ok()
-        .map(|b| {
-            let r = b.bounds;
-            [
-                r.left().value,
-                r.bottom().value,
-                r.right().value,
-                r.top().value,
-            ]
-        });
+        .map(|b| Rect::of(b.bounds));
     let chars = text.chars();
     let mut glyphs = Vec::new();
     let mut fonts = FontCache::default();
@@ -308,19 +608,11 @@ fn glyph(
     c: &PdfPageTextChar<'_>,
     ch: char,
     hyphen: bool,
-    area: Option<[f32; 4]>,
+    area: Option<Rect>,
     fonts: &mut FontCache,
 ) -> Option<Glyph> {
-    let rect = |r: pdfium_render::prelude::PdfRect| {
-        [
-            r.left().value,
-            r.bottom().value,
-            r.right().value,
-            r.top().value,
-        ]
-    };
-    let tight = rect(c.tight_bounds().ok()?);
-    let bounds = c.loose_bounds().map_or(tight, rect);
+    let tight = Rect::of(c.tight_bounds().ok()?);
+    let bounds = c.loose_bounds().map_or(tight, Rect::of);
     let (x, y) = c.origin().ok()?;
     let (x, y) = (x.value, y.value);
     // The text matrix gives both direction and scale; `scaled_font_size`
@@ -332,20 +624,21 @@ fn glyph(
             m.b().atan2(m.a()).to_degrees(),
         ),
         Err(_) => (
-            bounds[3] - bounds[1],
+            bounds.top - bounds.bottom,
             c.angle_degrees().map_or(0.0, |a| 360.0 - a),
         ),
     };
-    let finite = [x, y, size, degrees]
-        .iter()
-        .chain(&bounds)
-        .chain(&tight)
-        .all(|v| v.is_finite());
+    let finite = [x, y, size, degrees].iter().all(|v| v.is_finite())
+        && bounds.is_finite()
+        && tight.is_finite();
     if !finite || size < MIN_GLYPH_SIZE {
         return None;
     }
-    if let Some([left, bottom, right, top]) = area
-        && (tight[2] < left || tight[0] > right || tight[3] < bottom || tight[1] > top)
+    if let Some(area) = area
+        && (tight.right < area.left
+            || tight.left > area.right
+            || tight.top < area.bottom
+            || tight.bottom > area.top)
     {
         return None;
     }
@@ -442,7 +735,7 @@ fn pdf_error(detail: &str) -> DomainError {
 /// A failure of the engine rather than of the document: reported as an
 /// internal error.
 fn engine_error(detail: &str) -> DomainError {
-    DomainError::io_error(format!("PDF engine: {detail}"))
+    DomainError::internal(format!("PDF engine: {detail}"))
 }
 
 fn load_error(e: &PdfiumError) -> DomainError {
@@ -453,42 +746,67 @@ fn load_error(e: &PdfiumError) -> DomainError {
         PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::SecurityError) => {
             pdf_error("the document uses unsupported encryption")
         }
-        _ => pdf_error("not a readable PDF document"),
+        other => {
+            tracing::debug!(error = ?other, "pdfium could not load the document");
+            pdf_error("not a readable PDF document")
+        }
     }
 }
 
-pub(super) struct Deadline {
-    at: Instant,
-    limit: std::time::Duration,
+/// When the document must be done, and whether its caller is still waiting.
+pub(super) struct Deadline<'a> {
+    /// `None` when `limit` reaches past what `Instant` can hold: no
+    /// wall-clock deadline then, only the caller's.
+    at: Option<Instant>,
+    limit: Duration,
+    abandoned: &'a dyn Fn() -> bool,
 }
 
-impl Deadline {
-    pub(super) fn new(limits: &ParseLimits) -> Self {
+impl<'a> Deadline<'a> {
+    pub(super) fn new(limit: Duration, abandoned: &'a dyn Fn() -> bool) -> Self {
         Self {
-            at: Instant::now() + limits.pdf_timeout,
-            limit: limits.pdf_timeout,
+            at: Instant::now().checked_add(limit),
+            limit,
+            abandoned,
         }
     }
 
     pub(super) fn check(&self) -> Result<(), DomainError> {
-        if Instant::now() > self.at {
+        if self.at.is_some_and(|at| Instant::now() > at) {
             return Err(limit_exceeded(
-                "pdf_timeout",
+                ParseLimit::PdfTimeout,
                 format!("the document took longer than {:?}", self.limit),
             ));
+        }
+        if (self.abandoned)() {
+            // Nobody reads this; it only frees the engine sooner.
+            return Err(engine_error("the caller stopped waiting for the document"));
         }
         Ok(())
     }
 }
 
-/// The bound library; binds on first use. Called with [`PDFIUM_LOCK`] held.
-/// A failure is remembered for [`BIND_RETRY`]: binding writes the library
-/// out again, which is not worth repeating per document.
-fn bound() -> Result<&'static Pdfium, DomainError> {
-    let mut state = BINDING.lock();
-    match &*state {
-        Some(Binding::Bound(pdfium)) => return Ok(pdfium),
-        Some(Binding::Failed { at, error }) if at.elapsed() < BIND_RETRY => {
+/// Whether a bind that failed at `failed_at` is due again at `now`. A failure
+/// is remembered for [`BIND_RETRY`]: binding writes the library out again,
+/// which is not worth repeating per document.
+pub(super) fn retry_due(failed_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(failed_at) >= BIND_RETRY
+}
+
+/// The bound library, borrowed from the engine guard; binds on first use.
+fn bound(state: &mut Option<Binding>) -> Result<&Pdfium, DomainError> {
+    bound_with(state, Instant::now(), bind)
+}
+
+/// [`bound`] at `now`, binding with `bind`.
+fn bound_with(
+    state: &mut Option<Binding>,
+    now: Instant,
+    bind: impl FnOnce() -> Result<&'static Pdfium, String>,
+) -> Result<&'static Pdfium, DomainError> {
+    match state {
+        Some(Binding::Bound(pdfium)) => return Ok(*pdfium),
+        Some(Binding::Failed { at, error }) if !retry_due(*at, now) => {
             return Err(engine_error(&format!("not available: {error}")));
         }
         _ => {}
@@ -501,10 +819,7 @@ fn bound() -> Result<&'static Pdfium, DomainError> {
         Err(error) => {
             tracing::error!(%error, "cannot load libpdfium; PDF parsing is unavailable");
             let err = engine_error(&format!("not available: {error}"));
-            *state = Some(Binding::Failed {
-                at: Instant::now(),
-                error,
-            });
+            *state = Some(Binding::Failed { at: now, error });
             Err(err)
         }
     }
@@ -548,7 +863,8 @@ fn bind_embedded() -> Result<&'static Pdfium, String> {
 #[cfg(pdfium_unbundled)]
 fn bind_embedded() -> Result<&'static Pdfium, String> {
     Err(format!(
-        "this build has no bundled libpdfium; set {RUNTIME_LIB_VAR} to a libpdfium (chromium/7961)"
+        "this build has no bundled libpdfium; set {RUNTIME_LIB_VAR} to a libpdfium (chromium/{})",
+        env!("FILE_PARSER_PDFIUM_BUILD")
     ))
 }
 
@@ -562,20 +878,120 @@ fn remove_stale_dirs(current: &std::path::Path) {
     let Ok(entries) = std::fs::read_dir(parent) else {
         return;
     };
-    let day = Duration::from_hours(24);
+    let now = std::time::SystemTime::now();
     for entry in entries.flatten() {
         let path = entry.path();
-        let stale = entry
-            .file_name()
-            .to_str()
-            .is_some_and(|n| n.starts_with("file-parser-pdfium-"))
-            && path != current
-            && entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .is_ok_and(|t| t.elapsed().is_ok_and(|age| age > day));
-        if stale {
+        let modified = entry.metadata().and_then(|m| m.modified()).ok();
+        let name = entry.file_name();
+        if is_stale(name.to_str(), &path, current, modified, now) {
             let _removed = std::fs::remove_dir_all(&path);
         }
+    }
+}
+
+/// Whether a temporary directory entry is a libpdfium directory, not
+/// `current`, last changed more than a day before `now`. An entry without a
+/// readable name or time, or from the future, is kept.
+#[cfg(not(pdfium_unbundled))]
+fn is_stale(
+    name: Option<&str>,
+    path: &std::path::Path,
+    current: &std::path::Path,
+    modified: Option<std::time::SystemTime>,
+    now: std::time::SystemTime,
+) -> bool {
+    name.is_some_and(|n| n.starts_with("file-parser-pdfium-"))
+        && path != current
+        && modified
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age > Duration::from_hours(24))
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use std::cell::Cell;
+    use std::path::Path;
+    use std::time::SystemTime;
+
+    use super::*;
+
+    #[test]
+    fn a_failed_bind_is_remembered_until_the_retry_window_ends() {
+        let binds = Cell::new(0);
+        let failing = || {
+            binds.set(binds.get() + 1);
+            Err::<&'static Pdfium, _>("no library".to_owned())
+        };
+        let mut state = None;
+        let start = Instant::now();
+        assert!(bound_with(&mut state, start, failing).is_err());
+        assert_eq!(binds.get(), 1);
+        assert!(matches!(state, Some(Binding::Failed { .. })));
+        let inside = start + BIND_RETRY.saturating_sub(Duration::from_secs(1));
+        let err = bound_with(&mut state, inside, failing).expect_err("still failed");
+        assert!(err.to_string().contains("no library"), "{err}");
+        assert_eq!(binds.get(), 1, "no new bind inside the window");
+        assert!(bound_with(&mut state, start + BIND_RETRY, failing).is_err());
+        assert_eq!(binds.get(), 2, "bound again once the window ended");
+    }
+
+    #[test]
+    fn a_deadline_too_far_to_represent_only_follows_the_caller() {
+        let waiting = || false;
+        assert!(Deadline::new(Duration::MAX, &waiting).check().is_ok());
+        let gone = || true;
+        assert!(Deadline::new(Duration::MAX, &gone).check().is_err());
+    }
+
+    #[cfg(not(pdfium_unbundled))]
+    #[test]
+    fn only_old_libpdfium_directories_of_other_processes_are_stale() {
+        let current = Path::new("/tmp/file-parser-pdfium-current");
+        let other = Path::new("/tmp/file-parser-pdfium-other");
+        let now = SystemTime::now();
+        let old = now - Duration::from_hours(25);
+        let name = Some("file-parser-pdfium-other");
+        assert!(is_stale(name, other, current, Some(old), now));
+        assert!(!is_stale(
+            Some("file-parser-pdfium-current"),
+            current,
+            current,
+            Some(old),
+            now
+        ));
+        assert!(!is_stale(
+            Some("something-else"),
+            Path::new("/tmp/something-else"),
+            current,
+            Some(old),
+            now
+        ));
+        let recent = now - Duration::from_hours(23);
+        assert!(!is_stale(name, other, current, Some(recent), now));
+        let future = now + Duration::from_hours(1);
+        assert!(!is_stale(name, other, current, Some(future), now));
+        assert!(!is_stale(name, other, current, None, now));
+        assert!(!is_stale(None, other, current, Some(old), now));
+    }
+
+    #[test]
+    fn a_caller_that_never_sends_its_job_does_not_hold_the_engine() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let (ready_tx, ready_rx) = oneshot::channel();
+        submit(Ticket { ready: ready_tx }).expect("queued");
+        // Take the turn, as a caller whose future then stops being polled.
+        let job_tx = runtime
+            .block_on(ready_rx)
+            .expect("the engine offers the turn");
+        let result = runtime.block_on(run(&ParseLimits::default(), |_engine| Ok(())));
+        assert!(result.is_ok(), "the next document still runs: {result:?}");
+        assert!(
+            job_tx.try_send(Box::new(|_| {})).is_err(),
+            "the engine stopped waiting for the stalled caller"
+        );
     }
 }

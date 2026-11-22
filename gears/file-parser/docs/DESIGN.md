@@ -52,6 +52,7 @@ PDF is the exception: it is read through libpdfium, a native library that `build
 
 - `cpt-cf-file-parser-adr-content-based-type-detection` — [ADR-0001](./ADR/0001-cpt-cf-file-parser-adr-content-based-type-detection.md): routing may be driven by *content* rather than by the caller-supplied filename extension / `Content-Type`, behind the optional `magika` feature. Records the confidence threshold and fallback policy, why detection failure is a startup failure rather than a silent degradation, and the ONNX Runtime constraints that shape the implementation.
 - `cpt-cf-file-parser-adr-own-document-parsers` — [ADR-0002](./ADR/0002-cpt-cf-file-parser-adr-own-document-parsers.md): file-parser reads spreadsheets, HTML, PPTX and DOCX with its own parsers on zip, quick-xml, cfb and encoding_rs, and PDF through a directly bound, checksum-pinned libpdfium, instead of kreuzberg and docx-rust. Records why xberg, calamine and html5ever were rejected and the PDF engine's timeout limitation.
+- `cpt-cf-file-parser-adr-own-html-parser` — [ADR-0003](./ADR/0003-cpt-cf-file-parser-adr-own-html-parser.md): why HTML is read by the crate's own linear tokenizer and tree builder, not html5ever, with timings of both on hostile inputs from html5ever's issue tracker.
 
 ### 1.3 Architecture Layers
 
@@ -148,7 +149,11 @@ Currently supported:
 - No OCR. Image-only (scanned) PDFs produce no text. Invisible text layers that OCR tools add to PDFs are read.
 - PDF structure (headings, lists, paragraphs, columns) is found heuristically from glyph size and position, and can be wrong.
 - Tables are not reconstructed from PDFs; table text comes out as lines.
-- DOCX and PPTX notes and comments, and DOCX headers and footers, are not extracted.
+- PDF superscripts (footnote markers, exponents) split their paragraph: the raised text becomes a paragraph of its own between the two halves.
+- PDF running headers and footers are only recognised on upright text; on pages whose text is drawn rotated they are kept on every page.
+- PDF text tilted about 3-10° from the rest of its page (a stamp, say) may break into fragments that mix with the lines around it.
+- PPTX SmartArt text comes out in the order of the diagram's data part, which can differ from the order the diagram shows it in.
+- DOCX and PPTX notes and comments, DOCX headers and footers, and PPTX footer, date and slide-number placeholders are not extracted.
 <!-- fdd-id-content -->
 
 #### libpdfium Version Pin
@@ -179,14 +184,14 @@ The spreadsheet, HTML, PPTX, PDF and DOCX parsers enforce `ParseLimits` (`src/in
 | `max_html_nodes` | 500 000 | Elements and text nodes of one HTML document |
 | `max_pdf_pages` | 2 000 | Pages of one PDF |
 | `max_pdf_chars_per_page` | 200 000 | Characters pdfium reports on one PDF page |
-| `pdf_timeout` | 60 s | Wall-clock time for one PDF, waiting for the PDF engine included |
-| `max_text_bytes` | 100 MiB | Text extracted from one document |
+| `pdf_timeout` | 60 s | Wall-clock time for one PDF once the PDF engine is taken; also the longest wait for the engine |
+| `max_text_bytes` | 100 MiB | Text extracted from one document, plus 64 bytes for each block, inline run and PDF line, so a document of millions of tiny pieces is bounded too |
 
-A table that does not fit the remaining cell budget is replaced by a note paragraph instead of failing the document.
+A table (or a whole sheet) that does not fit the remaining cell budget is replaced by a note paragraph instead of failing the document; the note is charged to `max_text_bytes` like any paragraph, its full text included. A nested table counts the cells its enclosing tables have built so far. The paragraphs that fill table cells (each spreadsheet cell, and the empty cells padded into a grid) are charged their text but not the per-block cost: their number is bounded by `max_table_cells`.
 
 The `ooxml` package reader applies the ZIP limits to every part it reads; parts that are never read (media, embedded objects) are not checked. Relationship targets that escape the package root are dropped. XML is read without DTD entity expansion: only the predefined entities and numeric references are resolved.
 
-pdfium is not thread-safe across documents, so one lock serialises all PDF work. `pdf_timeout` is checked between pdfium calls only; a single call cannot be interrupted, so a hostile PDF can hold the engine past the timeout. At most 64 documents wait for the engine; further ones are rejected as busy.
+pdfium is not thread-safe across documents, so all PDF work runs on one dedicated thread that owns the pdfium binding. Documents queue for it and their callers wait asynchronously. At most 64 documents wait; further ones, and documents that wait longer than `pdf_timeout`, are rejected as busy (429 with `Retry-After`). `pdf_timeout` is checked between pdfium calls only; a single call cannot be interrupted, so a hostile PDF can keep the engine busy past the timeout. The engine's part of the answer still comes within `pdf_timeout` of waiting plus `pdf_timeout` and 2 s of reading (122 s with the defaults); arranging the lines into headings, lists and paragraphs then runs on the blocking pool, bounded by the page, character and text limits. The thread is not one of Tokio's blocking-pool threads, so runtime shutdown does not wait for it.
 
 ## 3. Technical Architecture
 
@@ -261,9 +266,10 @@ Future plugins implement `FileParserBackend` and are added to the `vec![]` in `g
 
 Each plugin produces a `ParsedDocument` using the platform IR (`src/domain/ir.rs`). Output per format:
 
-- **Spreadsheets**: one level-2 heading per sheet (the sheet name) and one table over the bounding box of its non-empty cells; the first row is the header. Cells show values as Excel displays them; formulas contribute their cached result.
-- **HTML**: headings, paragraphs, styled runs, links (`http`, `https`, `mailto`, `ftp`, `tel` and relative targets), lists, tables, quotes, preformatted text as code, rules and images. Scripts, styles, form controls, embedded media and hidden elements are skipped. The encoding is taken from a byte order mark, the `Content-Type` charset or a `<meta>` declaration, else UTF-8 or Windows-1252.
-- **PPTX**: slides in presentation order. Each slide becomes a level-2 heading (its title placeholder, or "Slide N"), then its shapes: paragraphs, list items where a bullet is set on the paragraph or inherited from the layout and master, tables, pictures with their description, and SmartArt text. Slides are separated by page breaks. Speaker notes, comments, charts and slide furniture are left out.
+- **Plain text** (`.txt`, `.log`, `.md`): the text as verbatim code blocks, so nothing in it is read as Markdown or HTML; `.md` blocks get the `markdown` language, others none. `\r\n` becomes `\n`; everything else, blank lines and indentation included, is kept. Text up to 16 KiB (`CODE_BLOCK_BYTES`) is one block. Longer text is cut at the last blank line that keeps the block within 16 KiB; a stretch without one is cut at the last line break within 16 KiB, a longer line is kept whole up to 64 KiB and cut at a character boundary past that. The blank lines at a cut stay at the end of the block before it, past the 16 KiB, so the blocks put together give back the text with `\r\n` turned into `\n`. Only the first 64 KiB of the remaining text are looked at for each cut, so a long line costs no more than its length. The text is decoded and split on the blocking pool, like the other formats. Each block is charged its text plus the per-block cost to `max_text_bytes`. Whitespace-only text gives no blocks.
+- **Spreadsheets**: one level-2 heading per sheet (the sheet name) and one table over the bounding box of its non-empty cells; the first row is the header. Hidden and very hidden sheets are read too, and their heading says so: `Name (hidden)`, `Name (very hidden)`. Cells show values as Excel displays them; formulas contribute their cached result.
+- **HTML**: headings, paragraphs, styled runs, links (`http`, `https`, `mailto`, `ftp`, `tel` and relative targets), lists, tables, quotes, preformatted text as code, rules and images. Scripts, styles, form controls, embedded media and hidden elements are skipped. The IR has only block images, so an `<img>` inside a paragraph splits it and an image inside a link loses the link. The encoding is taken from a byte order mark, the `Content-Type` charset or a `<meta>` declaration, else UTF-8 or Windows-1252.
+- **PPTX**: slides in presentation order. Each slide becomes a level-2 heading (its title placeholder, or "Slide N"), then its shapes: paragraphs, list items where a bullet is set on the paragraph or inherited from the layout and master, tables, pictures with their description, and SmartArt text. Slides are separated by page breaks. Speaker notes, comments, charts and slide furniture (footer, date and slide-number placeholders) are left out.
 - **PDF**: characters are read one by one with position, size, direction and font style. Lines are built per baseline direction, so rotated text and rotated pages read upright, and slightly skewed lines stay together; right-to-left runs are put back into logical order. Headings come from font size (up to three levels), plus list items, horizontal rules and paragraphs; words hyphenated across lines are joined. Running headers and footers are kept only at their first occurrence and page numbers are dropped; two-column text is read column by column. Pages are separated by page breaks. The title comes from the Info dictionary.
 - **DOCX**: headings from outline levels or heading styles, list items from numbering, code blocks and quotes from styles, styled runs and external links. Tracked changes read as accepted. Tables keep their grid (spans padded, merged cells empty); a table nested in a cell is flattened into the cell's paragraphs. Pictures with a description become images; text boxes follow their paragraph. Notes, comments, headers and footers are not extracted.
 <!-- fdd-id-content -->
@@ -276,6 +282,33 @@ Each plugin produces a `ParsedDocument` using the platform IR (`src/domain/ir.rs
 
 <!-- fdd-id-content -->
 `src/domain/markdown.rs` — converts any `ParsedDocument` to Markdown, preserving headings, lists, tables, code blocks, quotes, and inline formatting. Both eager (`render`) and streaming (`render_iter`) modes are supported.
+
+Where Markdown has no syntax of its own, the output uses inline HTML or a fixed convention:
+
+- Underlined text is wrapped in `<u>…</u>`.
+- Line breaks inside a table cell become `<br/>`; `|` in cells is written as `\|`, inside code too (GFM removes that backslash before it reads the cell). Readers agree on that only when the pipe follows an odd number of backslashes: `\\|` is kept whole by comrak and loses a backslash in pulldown-cmark. So a pipe after an even run of backslashes (none, or escaped backslashes of text or code) gets one more, and a pipe after an odd run is left alone, since a table nested in the cell already escaped it. Backslashes are not doubled otherwise (inside code a doubled one would show doubled), so a `\|` in code in a cell shows as `|`.
+- Every line of a list item after the first is indented to the item's content (the marker's width), and a nested item starts at its parent's content, so a code block in an item stays inside it. Leading blank lines of the item's content are dropped, since a blank line right after the marker would end the item. A table, a nested item or a quote in a list item is followed by a blank line, so the next block is not read as a row or as their continuation, and so are a paragraph or image followed by another one, which would otherwise join into one paragraph; such a list becomes loose. A rule or page break in a list item is written as `***`: `- ---` would be a rule in place of the item, and `---` under a paragraph line a heading underline. In a quote, every line gets `> `, also after a lone `\r`.
+- A table without a header row gets an empty header row; its first row stays a data row.
+- Link and image destinations that contain whitespace, parentheses, angle brackets, backslashes or control characters are written in angle brackets, with `<`, `>` and control characters percent-encoded and `\` written as `&#92;` (before the `&amp;` written for a `&`, a backslash would escape it). `&` is written as `&amp;` in every destination, so a renderer that decodes entity references gets the target back unchanged. Image titles use `&quot;`, `&#92;` and `&amp;` the same way. An image without a source but with a title gets `<>` as its destination; otherwise the title would be read as the destination and the rest of it as Markdown.
+
+Document text (text runs, link text, image alt, the title and the metadata values) is escaped just enough that it cannot form a link, an image, raw HTML or code, with CommonMark backslash escapes, which leave the text readable as it is (the output is mostly read raw, by language models): `[` is written as `\[` and a backtick as `` \` ``, and `<` as `\<` where it could start raw HTML or an autolink: before an ASCII letter or digit, before ASCII punctuation other than `<>()[]\,;:@"` (which covers `/`, `!`, `?` and the characters an email address can start with), and at the end of the text, where the next run follows. `a < b` stays as is.
+
+- `]` is escaped (`\]`) only in link text and image alt, where it would close the brackets early. Elsewhere it has no `[` to close: every `[` of the text is escaped, so text cannot open a link, an image, a reference definition or a footnote. The renderer's own `[` is closed by its own `](`, except that a `]` inside a code span in link text would end the label of a link reference definition (`` [`a]: b`](…) `` at the start of a line would vanish): link text in code style that contains `]` or starts with `^` is written as escaped text, without the code style. A `^` at the start of link text or image alt is escaped too: comrak reads `[^x\]: y` at the start of a line as a footnote definition, ignoring the escape before `]`.
+- `\` is doubled only where it would escape or break what follows: before ASCII punctuation (including another backslash and the escapes above, so `\[` in the document becomes `\\\[`), before a line ending (a hard line break) and at the end of the text, where the renderer's own markers follow. `C:\Users` stays as is.
+- `~` is escaped (`\~`) in every run of three or more, wherever it is, and in a run at either end of the text, so no line can start with `~~~` and open a code block, even after a list or quote marker or next to the renderer's own `~~` strikethrough markers. The whole run is escaped, not just its first `~`: pulldown-cmark reads `~~\~~x~~` as no strikethrough at all.
+- `!` at the end of the text is escaped (`\!`) when a link follows directly, since `![` would make the link an image. Other `!` stay as is.
+- `>` at the end of underlined text is escaped (`\>`): followed by the renderer's `</u>` after a line break it would be a quote holding an HTML block, where escapes are not read.
+- `&` is written as `&amp;` when it would start a character reference (`&name;`, `&#digits;`, `&#xhex;`) or ends the text, where the next run could complete one (`AT&` then `lt;T`), so `AT&T` stays as is and `&lt;` in the document reads back as `&lt;`. It keeps the entity, the form destinations and image titles use as well.
+
+Spaces and tabs at the start of each line of a paragraph or heading are dropped (not in code): renderers do not show them, and four columns of them at the start of a block or after a blank line would make an indented code block. A run of `#` that ends the first line of a heading or the title, alone or after a space, gets its first `#` escaped (`# Issue \#`); Markdown would take it for the closing sequence and drop it.
+
+Line breaks in link text and image alt are written as spaces: inside the brackets they could end the paragraph or start a block, and the destination and title would then be read as Markdown. Other emphasis characters (`*`, `_`, `#` and so on) are not escaped, so document text can still produce emphasis or, at the start of a line, a block marker; an escaped character is punctuation like the one it stands for, so it does not change where emphasis starts or ends. GFM extended autolinks are not prevented either: `www.…`, `http://…`, `https://…` and email addresses in text still become links, but only to http, https or mailto targets and with the visible text equal to the target.
+
+Code is written unescaped, inside delimiters chosen so that it cannot end early: a code span uses one backtick more than the longest run of backticks in its text, with a space inside the delimiters when the text starts or ends with a backtick, and with line breaks written as spaces; code that directly follows code (an inline code run, or text in code style, with nothing in between) joins the same span, because two spans side by side would touch as one longer run of backticks that closes neither; a code block uses a backtick fence at least three long and longer than any run of backticks in the code. A code block language is written only when it consists of `[A-Za-z0-9_+.#-]`; otherwise the fence has no info string.
+
+The plain-text parser emits code blocks, so a `.md`, `.log` or `.txt` file is rendered as its source inside a fence its content cannot close, with no escaping; its Markdown syntax (links, code fences, HTML) shows as literal characters, not as formatting. Eager and streaming rendering give the same output.
+
+The output is untrusted: a consumer that renders it to HTML must sanitise the result, as it would for any user-supplied Markdown.
 <!-- fdd-id-content -->
 
 ### 3.3 API Contracts
@@ -353,12 +386,11 @@ Plugin registration is done at gear startup in `src/gear.rs`. The gateway select
 | `cfb` | 0.16 | MIT | OLE compound files (legacy `.xls`) |
 | `encoding_rs` | 0.8 | (Apache-2.0 OR MIT) AND BSD-3-Clause | HTML and legacy `.xls` text encodings |
 | `pdfium-render` | `=0.9.5` (`pdfium_7881`, `thread_safe`) | MIT OR Apache-2.0 | Bindings to libpdfium |
-| `parking_lot` | 0.12 | MIT OR Apache-2.0 | PDF engine lock |
 | `tempfile` | 3 | MIT OR Apache-2.0 | Private directory the embedded libpdfium is written to |
 | libpdfium | `chromium/7961`, embedded | BSD-3-Clause, plus bundled third-party components | PDF engine; see `file-parser/THIRD_PARTY_NOTICES.md` |
 | `flate2` (build) | 1 | MIT OR Apache-2.0 | Unpacks the pdfium archive |
 | `tar` (build) | 0.4 | MIT OR Apache-2.0 | Unpacks the pdfium archive |
-| `toolkit-security` (build) | workspace | Apache-2.0 | SHA-256 of the pdfium archive (the workspace crypto facade, required by architecture lint DE0708) |
+| `cf-gears-toolkit-security` (build) | workspace | Apache-2.0 | SHA-256 of the pdfium archive, through the crypto facade |
 
 `build.rs` downloads the pdfium archive with `curl` from `https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/7961/`, verifies it, and extracts only the library file, which is embedded with `include_bytes!`. At runtime the library is written to a private temporary directory and bound once per process. Build inputs: `FILE_PARSER_PDFIUM_ARCHIVE` (local archive, still verified), `FILE_PARSER_PDFIUM_LIB` (prebuilt library, not verified), `FILE_PARSER_PDFIUM_CACHE_DIR` (archive cache), `CARGO_NET_OFFLINE=true` (no download), `DOCS_RS` (nothing bundled). At runtime `FILE_PARSER_PDFIUM_RUNTIME_LIB` loads a library from a path instead of the embedded one. Digests per target:
 
@@ -442,7 +474,8 @@ file_parser:
 | Path traversal attempt | 403 Forbidden |
 | Local file not found | 404 Not Found |
 | Malformed document, or a `ParseLimits` limit exceeded | 400 Bad Request |
-| PDF engine unavailable or busy; I/O failure | 500 Internal Server Error |
+| PDF engine busy | 429 Too Many Requests, `Retry-After: 1` |
+| PDF engine unavailable; parser panic; I/O failure | 500 Internal Server Error |
 
 ## Appendix
 

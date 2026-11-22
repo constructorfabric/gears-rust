@@ -14,8 +14,9 @@ use crate::domain::ir::{Inline, ParsedBlock};
 use crate::infra::parsers::limits::ParseLimits;
 use crate::infra::parsers::ooxml::{Archive, Events, xml};
 
-use super::slide::{Budgets, Slide, clean_text};
+use super::slide::{Slide, clean_text};
 use super::tolerate;
+use crate::infra::parsers::limits::Budgets;
 
 /// Reads the data parts `slide` refers to and puts their text where the
 /// graphic frames were. Each part is read once per slide.
@@ -106,6 +107,7 @@ fn read_data(
                     if let Some(p) = para.take() {
                         let p = p.trim();
                         if !p.is_empty() {
+                            budgets.text.charge_block()?;
                             blocks.push(ParsedBlock::Paragraph {
                                 inlines: vec![Inline::plain(p)],
                             });

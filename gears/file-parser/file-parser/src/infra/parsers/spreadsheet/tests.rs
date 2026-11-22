@@ -2,13 +2,18 @@ use std::fmt::Write as _;
 
 use super::xls::biff;
 use super::*;
+use crate::domain::parser::FileParserBackend;
 use crate::infra::parsers::ooxml::test_zip;
 
 /// A small XLSX package, built part by part.
 struct Book {
-    /// Where `_rels/.rels` says the workbook is.
+    /// Where the workbook is, and where `_rels/.rels` says it is unless
+    /// `root_target` is set.
     workbook_part: String,
-    sheets: Vec<(String, String)>,
+    root_target: Option<String>,
+    /// (name, rows, `state` attribute).
+    sheets: Vec<(String, String, Option<&'static str>)>,
+    date1904: bool,
     shared_strings: Option<String>,
     styles: Option<String>,
     macro_enabled: bool,
@@ -19,7 +24,9 @@ impl Book {
     fn new() -> Self {
         Self {
             workbook_part: "xl/workbook.xml".to_owned(),
+            root_target: None,
             sheets: Vec::new(),
+            date1904: false,
             shared_strings: None,
             styles: None,
             macro_enabled: false,
@@ -28,7 +35,13 @@ impl Book {
     }
 
     fn sheet(mut self, name: &str, rows: &str) -> Self {
-        self.sheets.push((name.to_owned(), rows.to_owned()));
+        self.sheets.push((name.to_owned(), rows.to_owned(), None));
+        self
+    }
+
+    fn sheet_in_state(mut self, name: &str, rows: &str, state: &'static str) -> Self {
+        self.sheets
+            .push((name.to_owned(), rows.to_owned(), Some(state)));
         self
     }
 
@@ -49,11 +62,14 @@ impl Book {
         let mut sheets_xml = String::new();
         let mut rels = String::new();
         let mut parts: Vec<(String, Vec<u8>)> = Vec::new();
-        for (i, (name, rows)) in self.sheets.iter().enumerate() {
+        for (i, (name, rows, state)) in self.sheets.iter().enumerate() {
             let n = i + 1;
+            let state = state
+                .map(|s| format!(r#" state="{s}""#))
+                .unwrap_or_default();
             write!(
                 sheets_xml,
-                r#"<sheet name="{name}" sheetId="{n}" r:id="rId{n}"/>"#
+                r#"<sheet name="{name}" sheetId="{n}"{state} r:id="rId{n}"/>"#
             )
             .unwrap();
             write!(
@@ -93,19 +109,24 @@ impl Book {
             "_rels/.rels".to_owned(),
             format!(
                 r#"<Relationships xmlns="r"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="{}"/></Relationships>"#,
-                self.workbook_part
+                self.root_target.as_deref().unwrap_or(&self.workbook_part)
             )
             .into_bytes(),
         ));
         parts.push((
             self.workbook_part.clone(),
-            format!(r#"<workbook xmlns="m" xmlns:r="r"><sheets>{sheets_xml}</sheets></workbook>"#)
-                .into_bytes(),
+            format!(
+                r#"<workbook xmlns="m" xmlns:r="r"><workbookPr date1904="{}"/><sheets>{sheets_xml}</sheets></workbook>"#,
+                u8::from(self.date1904)
+            )
+            .into_bytes(),
         ));
         parts.push((
             crate::infra::parsers::ooxml::rels_part_for(&self.workbook_part),
             format!(r#"<Relationships xmlns="r">{rels}</Relationships>"#).into_bytes(),
         ));
+        // An extra part replaces a generated one of the same name.
+        parts.retain(|(name, _)| !self.extra.iter().any(|(extra, _)| extra == name));
         parts.extend(self.extra.iter().cloned());
 
         let entries: Vec<(&str, &[u8])> = parts
@@ -499,6 +520,30 @@ fn legacy_xls_hidden_stream_and_encryption_are_rejected() {
 }
 
 #[test]
+fn legacy_xls_with_a_repeating_difat_is_rejected_before_cfb_reads_it() {
+    // cfb would read each listed FAT sector, about 113 times the file size.
+    let bytes = super::compound::tests::crafted(72, &[70; 109], 64, 70);
+    let err = read_err(Bytes::from(bytes), &ParseLimits::default());
+    assert!(err.contains("FAT sector 70 is listed twice"), "{err}");
+}
+
+#[test]
+fn password_protected_ooxml_is_reported_as_encrypted() {
+    // Encrypted XLSX/XLSB: a compound file with EncryptionInfo and
+    // EncryptedPackage streams and no Workbook stream.
+    for stream in ["/EncryptionInfo", "/EncryptedPackage"] {
+        let err = read_err(
+            Bytes::from(biff::xls_at(stream, b"x")),
+            &ParseLimits::default(),
+        );
+        assert!(
+            err.contains("encrypted workbooks are not supported"),
+            "{err}"
+        );
+    }
+}
+
+#[test]
 fn legacy_xls_too_many_sheets() {
     let stream = biff::workbook_with(&[], &[("A", vec![]), ("B", vec![])]);
     let limits = ParseLimits {
@@ -506,6 +551,44 @@ fn legacy_xls_too_many_sheets() {
         ..ParseLimits::default()
     };
     assert!(read_err(Bytes::from(biff::xls(&stream)), &limits).contains("max_sheets"));
+}
+
+#[test]
+fn legacy_xls_workbook_stream_is_held_to_the_entry_limit() {
+    let stream = biff::workbook_with(&[], &[("A", vec![])]);
+    let len = u64::try_from(stream.len()).unwrap();
+    let xls = Bytes::from(biff::xls(&stream));
+    let tight = ParseLimits {
+        max_entry_bytes: len - 1,
+        ..ParseLimits::default()
+    };
+    assert!(read_err(xls.clone(), &tight).contains("max_entry_bytes"));
+    let exact = ParseLimits {
+        max_entry_bytes: len,
+        ..ParseLimits::default()
+    };
+    assert_eq!(headings(&read(xls, &exact).blocks), ["A"]);
+}
+
+#[test]
+fn xlsb_too_many_sheets() {
+    use super::xlsb::build;
+
+    let workbook = build::workbook(&[("rId1", "A"), ("rId2", "B")], false);
+    let package = build::package(
+        &workbook,
+        &[
+            ("rId1", "worksheets/sheet1.bin", build::row(0)),
+            ("rId2", "worksheets/sheet2.bin", build::row(0)),
+        ],
+        None,
+        None,
+    );
+    let limits = ParseLimits {
+        max_sheets: 1,
+        ..ParseLimits::default()
+    };
+    assert!(read_err(package, &limits).contains("max_sheets"));
 }
 
 #[test]
@@ -593,6 +676,40 @@ fn text_of_a_skipped_sheet_is_given_back() {
             .iter()
             .any(|p| p.contains("\"Wide\" skipped"))
     );
+}
+
+#[test]
+fn each_sheet_is_charged_its_blocks() {
+    let mut book = Book::new();
+    for i in 0..10 {
+        book = book.sheet(&format!("S{i}"), "");
+    }
+    // Per sheet: the name as its heading and two blocks (heading and table).
+    let cost = 10 * (2 + 2 * BLOCK_COST);
+    let with = |max_text_bytes| ParseLimits {
+        max_text_bytes,
+        ..ParseLimits::default()
+    };
+    assert_eq!(headings(&read(book.bytes(), &with(cost)).blocks).len(), 10);
+    assert!(read_err(book.bytes(), &with(cost - 1)).contains("max_text_bytes"));
+}
+
+#[test]
+fn skip_note_is_charged_its_full_text() {
+    let wide = row(1, &[inline_cell("A1", "a"), inline_cell("B1", "b")]);
+    let book = Book::new().sheet("W", &wide);
+    let with = |max_text_bytes| ParseLimits {
+        max_table_cells: 1,
+        max_text_bytes,
+        ..ParseLimits::default()
+    };
+    let notes = paragraphs(&read(book.bytes(), &with(1_000)).blocks);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].starts_with("Sheet \"W\" skipped:"), "{notes:?}");
+    // The heading, the note and a block each.
+    let cost = "W".len() + notes[0].len() + 2 * BLOCK_COST;
+    assert_eq!(paragraphs(&read(book.bytes(), &with(cost)).blocks), notes);
+    assert!(read_err(book.bytes(), &with(cost - 1)).contains("max_text_bytes"));
 }
 
 #[test]
@@ -752,6 +869,131 @@ fn xlsx_cell_without_style_uses_the_first_cell_format() {
 }
 
 #[test]
+fn hidden_sheets_are_read_and_marked_in_all_formats() {
+    use super::xlsb::build;
+
+    let marked = ["Shown", "Spare (hidden)", "Macro (very hidden)"];
+    let one = |text: &str| row(1, &[inline_cell("A1", text)]);
+    let xlsx = Book::new()
+        .sheet_in_state("Shown", &one("a"), "visible")
+        .sheet_in_state("Spare", &one("b"), "hidden")
+        .sheet_in_state("Macro", &one("c"), "veryHidden")
+        .bytes();
+    let wb = read(xlsx, &ParseLimits::default());
+    assert_eq!(headings(&wb.blocks), marked);
+    assert_eq!(
+        tables(&wb.blocks).len(),
+        3,
+        "hidden sheets keep their cells"
+    );
+
+    let workbook = build::workbook_in_states(
+        &[
+            ("rId1", "Shown", 0),
+            ("rId2", "Spare", 1),
+            ("rId3", "Macro", 2),
+        ],
+        false,
+    );
+    let mut sheet = build::row(0);
+    sheet.extend(build::real(0, 0, 1.0));
+    let package = build::package(
+        &workbook,
+        &[
+            ("rId1", "worksheets/sheet1.bin", sheet.clone()),
+            ("rId2", "worksheets/sheet2.bin", sheet.clone()),
+            ("rId3", "worksheets/sheet3.bin", sheet),
+        ],
+        None,
+        None,
+    );
+    let wb = read(package, &ParseLimits::default());
+    assert_eq!(headings(&wb.blocks), marked);
+    assert_eq!(tables(&wb.blocks).len(), 3);
+
+    let cells = vec![biff::number(0, 0, 1.0)];
+    let stream = biff::workbook_in_states(
+        &[],
+        &[
+            ("Shown", 0, cells.clone()),
+            ("Spare", 1, cells.clone()),
+            // The upper six bits of the state byte are unused.
+            ("Macro", 0xFC | 2, cells),
+        ],
+    );
+    let wb = read(Bytes::from(biff::xls(&stream)), &ParseLimits::default());
+    assert_eq!(headings(&wb.blocks), marked);
+    assert_eq!(tables(&wb.blocks).len(), 3);
+}
+
+#[test]
+fn xlsx_cells_and_rows_without_references_follow_the_previous_ones() {
+    let sheet = concat!(
+        r#"<row r="2"><c t="inlineStr"><is><t>a</t></is></c><c/><c><v>3</v></c></row>"#,
+        r#"<row><c><v>4</v></c><c r="C3"><v>5</v></c><c><v>6</v></c></row>"#,
+    );
+    let wb = read(
+        Book::new().sheet("S", sheet).bytes(),
+        &ParseLimits::default(),
+    );
+    assert_eq!(
+        table_texts(tables(&wb.blocks)[0]),
+        [vec!["a", "", "3", ""], vec!["4", "", "5", "6"]]
+    );
+}
+
+#[test]
+fn xlsx_1904_workbook_dates_count_from_1904() {
+    let date_book = |date1904| {
+        let mut book = Book::new().sheet("S", &row(1, &[number_cell("A1", "1")]));
+        book.styles =
+            Some(r#"<styleSheet><cellXfs><xf numFmtId="14"/></cellXfs></styleSheet>"#.to_owned());
+        book.date1904 = date1904;
+        table_texts(tables(&read(book.bytes(), &ParseLimits::default()).blocks)[0])
+    };
+    assert_eq!(date_book(true), [vec!["1904-01-02"]]);
+    assert_eq!(date_book(false), [vec!["1900-01-01"]]);
+}
+
+#[test]
+fn xlsb_1904_workbook_dates_count_from_1904_and_rich_strings_are_read() {
+    use super::xlsb::build;
+
+    let date_book = |date1904| {
+        let workbook = build::workbook(&[("rId1", "S")], date1904);
+        let mut sheet = build::row(0);
+        sheet.extend(build::real(0, 1, 1.0));
+        // BrtCellRString: flags, then the text.
+        let mut rich = vec![0x00];
+        rich.extend(build::wide("rich"));
+        sheet.extend(build::cell_record(0x003E, 1, 0, &rich));
+        let package = build::package(
+            &workbook,
+            &[("rId1", "worksheets/sheet1.bin", sheet)],
+            None,
+            Some(build::styles(&[], &[0, 14])),
+        );
+        table_texts(tables(&read(package, &ParseLimits::default()).blocks)[0])
+    };
+    assert_eq!(date_book(true), [vec!["1904-01-02", "rich"]]);
+    assert_eq!(date_book(false), [vec!["1900-01-01", "rich"]]);
+}
+
+#[test]
+fn legacy_xls_rich_string_cells() {
+    // RSTRING: cell header, a 16-bit-length string, then its formatting runs.
+    let mut body = vec![0, 0, 1, 0, 0, 0];
+    body.extend_from_slice(&4_u16.to_le_bytes());
+    body.push(0x00);
+    body.extend_from_slice(b"rich");
+    body.extend_from_slice(&1_u16.to_le_bytes());
+    body.extend_from_slice(&[0, 0, 1, 0]);
+    let stream = biff::workbook("S", &[biff::number(0, 0, 1.0), biff::record(0x00D6, &body)]);
+    let wb = read(Bytes::from(biff::xls(&stream)), &ParseLimits::default());
+    assert_eq!(table_texts(tables(&wb.blocks)[0]), [vec!["1", "rich"]]);
+}
+
+#[test]
 fn xlsb_is_recognised_by_its_main_part_wherever_it_is() {
     use super::xlsb::build;
 
@@ -769,6 +1011,29 @@ fn xlsb_is_recognised_by_its_main_part_wherever_it_is() {
     let wb = read(package, &ParseLimits::default());
     assert_eq!(wb.format, Format::Xlsb);
     assert_eq!(table_texts(tables(&wb.blocks)[0]), [vec!["4"]]);
+}
+
+#[test]
+fn a_missing_binary_main_part_falls_back_to_the_xml_workbook() {
+    // The relationship names a workbook.bin the package lacks: the format is
+    // judged from the part that is read, not from the dangling name.
+    let mut book = Book::new().sheet("S", &row(1, &[number_cell("A1", "7")]));
+    book.root_target = Some("xl/workbook.bin".to_owned());
+    let wb = read(book.bytes(), &ParseLimits::default());
+    assert_eq!(wb.format, Format::Xlsx);
+    assert_eq!(table_texts(tables(&wb.blocks)[0]), [vec!["7"]]);
+}
+
+#[test]
+fn title_from_the_conventional_core_part_without_a_relationship() {
+    let mut book = Book::new().sheet("S", &row(1, &[number_cell("A1", "1")]));
+    book.extra.push((
+        "docProps/core.xml".to_owned(),
+        br#"<cp:coreProperties xmlns:cp="c" xmlns:dc="d"><dc:title>Budget</dc:title></cp:coreProperties>"#
+            .to_vec(),
+    ));
+    let wb = read(book.bytes(), &ParseLimits::default());
+    assert_eq!(wb.title.as_deref(), Some("Budget"));
 }
 
 #[test]
@@ -796,4 +1061,163 @@ fn copying_through_skipped_sheets_is_bounded() {
     };
     let err = read_err(book.bytes(), &limits);
     assert!(err.contains("skipped sheets included"), "{err}");
+}
+
+/// A xorshift step, for reproducible byte mangling.
+fn next_seed(seed: &mut u32) -> u32 {
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 17;
+    *seed ^= *seed << 5;
+    *seed
+}
+
+/// `data` with two bytes overwritten at positions picked by `seed`.
+fn mangled(data: &[u8], seed: &mut u32) -> Vec<u8> {
+    let mut bytes = data.to_vec();
+    let len = u32::try_from(bytes.len()).unwrap();
+    for _ in 0..2 {
+        let at = usize::try_from(next_seed(seed) % len).unwrap();
+        bytes[at] = u8::try_from(next_seed(seed) & 0xFF).unwrap();
+    }
+    bytes
+}
+
+#[test]
+fn truncated_and_mangled_xls_streams_never_panic() {
+    let rk_int = |n: i32| u32::from_le_bytes((n << 2).to_le_bytes()) | 0x02;
+    let stream = biff::workbook_with(
+        &[
+            biff::format(164, "yyyy-mm-dd"),
+            biff::xf(0),
+            biff::xf(164),
+            biff::sst(&["shared", "other"]),
+        ],
+        &[(
+            "Kinds",
+            vec![
+                biff::rk(0, 0, rk_int(7)),
+                biff::label_sst(0, 1, 1),
+                biff::label(0, 2, "label"),
+                biff::boolerr(0, 3, 1, false),
+                biff::number_xf(0, 5, 1, 45_352.0),
+                biff::formula(0, 6, [0, 0, 0, 0, 0, 0, 0xFF, 0xFF], 40_000),
+                biff::formula_string("calc"),
+                biff::mulrk(1, 0, &[rk_int(1), rk_int(2)]),
+            ],
+        )],
+    );
+    let limits = ParseLimits::default();
+    let mut seed: u32 = 0x9E37_79B9;
+    // Each read builds a compound file; every 5th cut keeps the test quick.
+    for cut in (0..stream.len()).step_by(5) {
+        drop(read_workbook(
+            Bytes::from(biff::xls(&stream[..cut])),
+            &limits,
+        ));
+        let bytes = mangled(&stream, &mut seed);
+        drop(read_workbook(Bytes::from(biff::xls(&bytes)), &limits));
+    }
+}
+
+#[test]
+fn truncated_and_mangled_xlsx_parts_never_panic() {
+    let sheet = row(
+        1,
+        &[
+            r#"<c r="A1" t="s"><v>0</v></c>"#.to_owned(),
+            r#"<c s="1"><v>45352.5</v></c>"#.to_owned(),
+            inline_cell("C1", "inline"),
+            r#"<c r="D1" t="b"><v>1</v></c>"#.to_owned(),
+            r#"<c r="E1" t="e"><v>#N/A</v></c>"#.to_owned(),
+        ],
+    ) + &row(
+        2,
+        &[number_cell("A2", "1.5"), r"<c><v>2</v></c>".to_owned()],
+    );
+    let sst = r#"<sst xmlns="m"><si><t>shared</t></si><si><r><t>rich</t></r><rPh><t>x</t></rPh></si></sst>"#;
+    let styles = r#"<styleSheet xmlns="m"><numFmts><numFmt numFmtId="164" formatCode="yyyy-mm-dd hh:mm"/></numFmts><cellXfs><xf numFmtId="0"/><xf numFmtId="164"/></cellXfs></styleSheet>"#;
+    // Raw bytes for every part: cut mid-element and invalid UTF-8 included.
+    let book = |sheet: &[u8], sst: &[u8], styles: &[u8]| {
+        let mut book = Book::new().sheet("S", "");
+        book.shared_strings = Some(String::new());
+        book.styles = Some(String::new());
+        book.extra = vec![
+            ("xl/worksheets/sheet1.xml".to_owned(), sheet.to_vec()),
+            ("xl/sharedStrings.xml".to_owned(), sst.to_vec()),
+            ("xl/styles.xml".to_owned(), styles.to_vec()),
+        ];
+        book.bytes()
+    };
+    let sheet =
+        format!(r#"<worksheet xmlns="m"><sheetData>{sheet}</sheetData></worksheet>"#).into_bytes();
+    let (sst, styles) = (sst.as_bytes(), styles.as_bytes());
+    let limits = ParseLimits::default();
+    let mut seed: u32 = 0x1F12_3BB5;
+    for cut in 0..sheet.len().max(sst.len()).max(styles.len()) {
+        let cut_of = |data: &[u8]| data[..cut.min(data.len())].to_vec();
+        drop(read_workbook(
+            book(&cut_of(&sheet), &cut_of(sst), &cut_of(styles)),
+            &limits,
+        ));
+        drop(read_workbook(
+            book(
+                &mangled(&sheet, &mut seed),
+                &mangled(sst, &mut seed),
+                &mangled(styles, &mut seed),
+            ),
+            &limits,
+        ));
+    }
+}
+
+#[test]
+fn truncated_and_mangled_xlsb_parts_never_panic() {
+    use super::xlsb::build;
+
+    let workbook = build::workbook(&[("rId1", "Numbers")], false);
+    let mut sheet = build::row(0);
+    sheet.extend(build::real(0, 0, 1.5));
+    sheet.extend(build::isst(1, 0));
+    sheet.extend(build::real(2, 1, 45_352.0));
+    sheet.extend(build::boolean(3, true));
+    sheet.extend(build::row(1));
+    sheet.extend(build::text(1, "second"));
+    let sst = build::sst(&["shared", "other"]);
+    let styles = build::styles(&[(164, "yyyy-mm-dd")], &[0, 164]);
+    let package = |workbook: &[u8], sheet: Vec<u8>, sst: Vec<u8>, styles: Vec<u8>| {
+        build::package(
+            workbook,
+            &[("rId1", "worksheets/sheet1.bin", sheet)],
+            Some(sst),
+            Some(styles),
+        )
+    };
+    let limits = ParseLimits::default();
+    let mut seed: u32 = 0x2545_F491;
+    for cut in 0..sheet
+        .len()
+        .max(sst.len())
+        .max(styles.len())
+        .max(workbook.len())
+    {
+        let cut_of = |data: &[u8]| data[..cut.min(data.len())].to_vec();
+        drop(read_workbook(
+            package(
+                &cut_of(&workbook),
+                cut_of(&sheet),
+                cut_of(&sst),
+                cut_of(&styles),
+            ),
+            &limits,
+        ));
+        drop(read_workbook(
+            package(
+                &mangled(&workbook, &mut seed),
+                mangled(&sheet, &mut seed),
+                mangled(&sst, &mut seed),
+                mangled(&styles, &mut seed),
+            ),
+            &limits,
+        ));
+    }
 }

@@ -1,11 +1,17 @@
 use std::fmt::Write as _;
-use std::time::Duration;
+use std::sync::mpsc as std_mpsc;
+use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::{Duration, Instant};
 
-use super::engine::{Deadline, Direction, Glyph, PDFIUM_LOCK, clean_title, guarded};
+use super::engine::{
+    BIND_RETRY, Deadline, Direction, Glyph, Rect, clean_title, guarded, retry_due,
+};
 use super::layout::{Line, page_lines};
 use super::structure::{self, Page};
 use super::*;
+use crate::domain::error::ParseLimit;
 use crate::domain::ir::{Inline, InlineStyle};
+use crate::infra::parsers::limits::BLOCK_COST;
 
 // --- synthetic glyphs ---------------------------------------------------------
 
@@ -66,7 +72,7 @@ fn glyph(
         ch,
         x: to_page.0,
         y: to_page.1,
-        bounds: box_page,
+        bounds: box_page.into(),
         size,
         direction,
         angle: match direction {
@@ -89,7 +95,12 @@ fn lines_of(glyphs: Vec<Glyph>) -> Vec<Line> {
 
 /// The blocks of a one-page document made of `lines`.
 fn paragraphs(lines: Vec<Line>) -> Vec<ParsedBlock> {
-    structure::blocks(vec![Page { lines, area: None }])
+    structure_blocks(vec![Page { lines, area: None }])
+}
+
+/// Structure with the default text budget.
+fn structure_blocks(pages: Vec<Page>) -> Vec<ParsedBlock> {
+    structure::blocks(pages, &mut TextBudget::new(&ParseLimits::default())).expect("within budget")
 }
 
 fn texts(lines: &[Line]) -> Vec<String> {
@@ -117,12 +128,12 @@ fn content_spaces_decide_between_content_neighbours() {
     // one word. A space hint: two words, however tight.
     let mut glyphs = word_glyphs("ab", 72.0, 700.0, 0);
     glyphs[1].x += 2.5;
-    glyphs[1].bounds[0] += 2.5;
-    glyphs[1].bounds[2] += 2.5;
+    glyphs[1].bounds.left += 2.5;
+    glyphs[1].bounds.right += 2.5;
     let mut tight = word_glyphs("c d", 72.0, 650.0, 2);
     tight[1].x -= 6.0;
-    tight[1].bounds[0] -= 6.0;
-    tight[1].bounds[2] -= 6.0;
+    tight[1].bounds.left -= 6.0;
+    tight[1].bounds.right -= 6.0;
     glyphs.extend(tight);
     assert_eq!(texts(&lines_of(glyphs)), ["ab", "c d"]);
 }
@@ -319,10 +330,79 @@ fn page_text_is_charged_to_the_budget() {
 }
 
 #[test]
+fn each_line_and_run_costs_a_block_beyond_its_text() {
+    let with = |max_text_bytes| ParseLimits {
+        max_text_bytes,
+        ..ParseLimits::default()
+    };
+    // One line, four runs: the bold alternates glyph by glyph.
+    let mut glyphs = word_glyphs("abcd", 72.0, 700.0, 0);
+    for g in glyphs.iter_mut().step_by(2) {
+        g.bold = true;
+    }
+    let cost = 4 + 5 * BLOCK_COST;
+    let lines = page_lines(glyphs.clone(), &mut TextBudget::new(&with(cost))).expect("fits");
+    assert_eq!(lines.first().map(|l| l.runs.len()), Some(4));
+    let err = page_lines(glyphs, &mut TextBudget::new(&with(cost - 1))).expect_err("runs charged");
+    assert!(err.to_string().contains("max_text_bytes"), "{err}");
+
+    // A page of single-glyph lines is charged per line, not per byte.
+    let glyphs: Vec<Glyph> = (0..500_u16)
+        .map(|i| {
+            glyph(
+                'a',
+                72.0,
+                7_000.0 - 20.0 * f32::from(i),
+                12.0,
+                Direction::Deg0,
+                u32::from(i),
+                false,
+            )
+        })
+        .collect();
+    let cost = 500 * (1 + 2 * BLOCK_COST);
+    let lines = page_lines(glyphs.clone(), &mut TextBudget::new(&with(cost))).expect("fits");
+    assert_eq!(lines.len(), 500);
+    let err = page_lines(glyphs, &mut TextBudget::new(&with(cost - 1))).expect_err("lines charged");
+    assert!(err.to_string().contains("max_text_bytes"), "{err}");
+}
+
+#[test]
+fn every_block_is_charged() {
+    // 200 one-glyph lines whose size changes line by line, so each is a
+    // block: the lines were charged when they were built, the blocks are
+    // charged here.
+    let glyphs: Vec<Glyph> = (0..200_u16)
+        .map(|i| {
+            let size = if i % 2 == 0 { 12.0 } else { 20.0 };
+            let y = 9_000.0 - 40.0 * f32::from(i);
+            glyph('a', 72.0, y, size, Direction::Deg0, u32::from(i), false)
+        })
+        .collect();
+    let page = || Page {
+        lines: lines_of(glyphs.clone()),
+        area: None,
+    };
+    let with = |max_text_bytes| ParseLimits {
+        max_text_bytes,
+        ..ParseLimits::default()
+    };
+    let blocks = structure::blocks(vec![page()], &mut TextBudget::new(&with(200 * BLOCK_COST)))
+        .expect("fits");
+    assert_eq!(blocks.len(), 200);
+    let err = structure::blocks(
+        vec![page()],
+        &mut TextBudget::new(&with(200 * BLOCK_COST - 1)),
+    )
+    .expect_err("blocks charged");
+    assert!(err.to_string().contains("max_text_bytes"), "{err}");
+}
+
+#[test]
 fn degenerate_geometry_does_not_panic() {
     let mut glyphs = word_glyphs("abc", 72.0, 700.0, 0);
     glyphs[1].x = f32::MAX;
-    glyphs[1].bounds = [f32::MIN, f32::MIN, f32::MAX, f32::MAX];
+    glyphs[1].bounds = [f32::MIN, f32::MIN, f32::MAX, f32::MAX].into();
     glyphs[2].seq = glyphs[0].seq;
     drop(lines_of(glyphs));
 }
@@ -344,7 +424,7 @@ fn titles_drop_placeholders() {
 
 /// A minimal PDF: one page per content stream, Helvetica as F1 and
 /// Helvetica-Bold as F2.
-fn pdf(pages: &[(&str, &str)], title: Option<&[u8]>) -> Vec<u8> {
+pub(super) fn pdf(pages: &[(&str, &str)], title: Option<&[u8]>) -> Vec<u8> {
     let mut objects: Vec<Vec<u8>> = vec![
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
             .to_vec(),
@@ -407,12 +487,43 @@ fn pdf(pages: &[(&str, &str)], title: Option<&[u8]>) -> Vec<u8> {
     out
 }
 
-fn read(bytes: &[u8]) -> Pdf {
-    read_pdf(bytes, &ParseLimits::default()).expect("PDF reads")
+/// Waits for `future` on a runtime of its own, so plain `#[test]`s and their
+/// threads can use the engine.
+pub(super) fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime")
+        .block_on(future)
+}
+
+/// The engine, its queue and its running-document state are process-wide,
+/// and `cargo test` runs tests as threads of one process. Tests that hold the
+/// engine or fill its queue take it alone; every other test that uses the
+/// engine shares it. A failed test must not block the rest, so poisoning is
+/// ignored.
+static ENGINE_TESTS: RwLock<()> = RwLock::new(());
+
+/// Shared use of the engine for a test that reads documents.
+pub(super) fn engine_shared() -> RwLockReadGuard<'static, ()> {
+    ENGINE_TESTS.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Sole use of the engine for a test that holds it or fills its queue.
+pub(super) fn engine_alone() -> RwLockWriteGuard<'static, ()> {
+    ENGINE_TESTS.write().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn read_with(bytes: &[u8], limits: &ParseLimits) -> Result<PdfDocument, DomainError> {
+    block_on(read_pdf(Bytes::copy_from_slice(bytes), limits.clone()))
+}
+
+fn read(bytes: &[u8]) -> PdfDocument {
+    read_with(bytes, &ParseLimits::default()).expect("PDF reads")
 }
 
 fn read_err(bytes: &[u8], limits: &ParseLimits) -> String {
-    match read_pdf(bytes, limits) {
+    match read_with(bytes, limits) {
         Ok(_) => panic!("expected an error"),
         Err(e) => e.to_string(),
     }
@@ -438,6 +549,7 @@ fn block_texts(blocks: &[ParsedBlock]) -> Vec<String> {
 
 #[test]
 fn text_title_and_bold_from_a_real_pdf() {
+    let _engine = engine_shared();
     let content = "BT /F1 12 Tf 72 700 Td (plain ) Tj /F2 12 Tf (bold) Tj ET";
     let doc = read(&pdf(&[(content, "")], Some(b"  Real Title  ")));
     assert_eq!(doc.title.as_deref(), Some("Real Title"));
@@ -456,6 +568,7 @@ fn text_title_and_bold_from_a_real_pdf() {
 
 #[test]
 fn every_page_is_separated_empty_ones_included() {
+    let _engine = engine_shared();
     let page = "BT /F1 12 Tf 72 700 Td (text) Tj ET";
     let doc = read(&pdf(&[("", ""), (page, ""), ("", "")], None));
     assert_eq!(block_texts(&doc.blocks), ["<break>", "text", "<break>"]);
@@ -463,6 +576,7 @@ fn every_page_is_separated_empty_ones_included() {
 
 #[test]
 fn rotated_pages_and_rotated_text_are_read() {
+    let _engine = engine_shared();
     let rotated_page = read(&pdf(
         &[(
             "BT /F1 12 Tf 72 700 Td (Rotated page text) Tj ET",
@@ -481,6 +595,7 @@ fn rotated_pages_and_rotated_text_are_read() {
 
 #[test]
 fn invisible_text_is_kept_and_tiny_or_offpage_text_dropped() {
+    let _engine = engine_shared();
     let content = "BT 3 Tr /F1 12 Tf 72 700 Td (Invisible OCR layer) Tj ET BT 0 Tr /F1 0.5 Tf 72 680 Td (tiny text) Tj ET BT /F1 12 Tf 2000 2000 Td (far away) Tj ET";
     let doc = read(&pdf(&[(content, "")], None));
     assert_eq!(block_texts(&doc.blocks), ["Invisible OCR layer"]);
@@ -488,6 +603,7 @@ fn invisible_text_is_kept_and_tiny_or_offpage_text_dropped() {
 
 #[test]
 fn placeholder_titles_fall_back() {
+    let _engine = engine_shared();
     let doc = read(&pdf(&[("", "")], Some(b"Microsoft Word - report.docx")));
     assert_eq!(doc.title, None);
     let utf16 = read(&pdf(&[("", "")], Some(b"\xfe\xff\x04\x1f\x04\x40\x04\x38")));
@@ -496,6 +612,7 @@ fn placeholder_titles_fall_back() {
 
 #[test]
 fn broken_inputs_are_errors() {
+    let _engine = engine_shared();
     let full = pdf(&[("BT /F1 12 Tf 72 700 Td (x) Tj ET", "")], None);
     for bytes in [
         &b""[..],
@@ -508,8 +625,45 @@ fn broken_inputs_are_errors() {
     }
 }
 
+/// `bytes`, a PDF from [`pdf`], with `entries` added to its trailer.
+fn with_trailer(bytes: &[u8], entries: &str) -> Vec<u8> {
+    let text = String::from_utf8(bytes.to_vec()).expect("test PDFs are ASCII");
+    let at = text.rfind(" >>\nstartxref").expect("trailer end");
+    let mut out = text[..at].to_owned();
+    out.push(' ');
+    out.push_str(entries);
+    out.push_str(&text[at..]);
+    out.into_bytes()
+}
+
+#[test]
+fn encrypted_documents_say_why_they_cannot_be_read() {
+    let _engine = engine_shared();
+    let plain = pdf(&[("BT /F1 12 Tf 72 700 Td (x) Tj ET", "")], None);
+    let id = format!("/ID [<{0}> <{0}>]", "00".repeat(16));
+    // Standard security handler; /U matches no password, not even the empty
+    // one, so pdfium asks for a password.
+    let locked = with_trailer(
+        &plain,
+        &format!(
+            "/Encrypt << /Filter /Standard /V 1 /R 2 /O <{o}> /U <{u}> /P -4 >> {id}",
+            o = "11".repeat(32),
+            u = "22".repeat(32),
+        ),
+    );
+    let err = read_err(&locked, &ParseLimits::default());
+    assert!(err.contains("password-protected"), "{err}");
+    let unknown = with_trailer(
+        &plain,
+        &format!("/Encrypt << /Filter /NoSuchHandler /V 1 /R 2 /P -4 >> {id}"),
+    );
+    let err = read_err(&unknown, &ParseLimits::default());
+    assert!(err.contains("unsupported encryption"), "{err}");
+}
+
 #[test]
 fn page_limit_is_checked_before_reading_pages() {
+    let _engine = engine_shared();
     let pages: Vec<(&str, &str)> = (0..6).map(|_| ("", "")).collect();
     let limits = ParseLimits {
         max_pdf_pages: 5,
@@ -521,6 +675,7 @@ fn page_limit_is_checked_before_reading_pages() {
 
 #[test]
 fn char_limit_per_page() {
+    let _engine = engine_shared();
     let limits = ParseLimits {
         max_pdf_chars_per_page: 5,
         ..ParseLimits::default()
@@ -537,8 +692,12 @@ fn char_limit_per_page() {
 
 #[test]
 fn concurrent_documents_are_serialised_safely() {
+    let _engine = engine_shared();
     // Every thread is started before any is joined.
-    #[allow(clippy::needless_collect)]
+    #[expect(
+        clippy::needless_collect,
+        reason = "every thread starts before any is joined"
+    )]
     let handles: Vec<_> = (0..8)
         .map(|i| {
             std::thread::spawn(move || {
@@ -580,7 +739,12 @@ fn tilted(text: &str, x: f32, y: f32, seq_from: u32, degrees: f32) -> Vec<Glyph>
         .into_iter()
         .map(|mut g| {
             (g.x, g.y) = turn(g.x, g.y);
-            let [x0, y0, x1, y1] = g.bounds;
+            let Rect {
+                left: x0,
+                bottom: y0,
+                right: x1,
+                top: y1,
+            } = g.bounds;
             let corners = [turn(x0, y0), turn(x0, y1), turn(x1, y0), turn(x1, y1)];
             g.bounds = [
                 corners.iter().map(|c| c.0).fold(f32::INFINITY, f32::min),
@@ -593,7 +757,8 @@ fn tilted(text: &str, x: f32, y: f32, seq_from: u32, degrees: f32) -> Vec<Glyph>
                     .iter()
                     .map(|c| c.1)
                     .fold(f32::NEG_INFINITY, f32::max),
-            ];
+            ]
+            .into();
             g.angle = degrees.rem_euclid(360.0);
             g.direction = Direction::from_degrees(degrees);
             g
@@ -718,22 +883,88 @@ fn a_dropped_glyph_breaks_content_adjacency() {
     assert_eq!(texts(&lines_of(glyphs)), ["a b"]);
 }
 
+/// Keeps the engine thread busy until the returned sender is dropped.
+fn hold_engine() -> (std_mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+    let (running_tx, running_rx) = std_mpsc::channel();
+    let (release_tx, release_rx) = std_mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let result = block_on(engine::run(&ParseLimits::default(), move |_engine| {
+            running_tx.send(()).expect("the test waits");
+            release_rx.recv().unwrap_or_default();
+            Ok(())
+        }));
+        assert!(result.is_ok(), "{result:?}");
+    });
+    running_rx.recv().expect("the hold job runs");
+    (release_tx, holder)
+}
+
 #[test]
-fn engine_busy_is_an_internal_error() {
-    let limits = ParseLimits {
+fn a_busy_engine_answers_busy_and_serves_the_next_document() {
+    let _engine = engine_alone();
+    let short = ParseLimits {
         pdf_timeout: Duration::from_millis(50),
         ..ParseLimits::default()
     };
-    let bytes = pdf(&[("BT /F1 12 Tf 72 700 Td (x) Tj ET", "")], None);
-    let held = PDFIUM_LOCK.lock();
-    let err = read_pdf(&bytes, &limits).err().map(|e| e.to_string());
-    drop(held);
-    let err = err.expect("busy while the lock is held");
-    assert!(err.contains("busy"), "{err}");
+    let (release, holder) = hold_engine();
+    let err = block_on(engine::run(&short, |_engine| Ok(()))).expect_err("the engine is held");
     assert!(
-        err.starts_with("IO error"),
-        "an engine failure, not the document's: {err}"
+        matches!(err, DomainError::Busy { .. }),
+        "retryable, not the document's fault: {err}"
     );
+    drop(release);
+    holder.join().expect("holder ends");
+    let doc = read(&pdf(&[("BT /F1 12 Tf 72 700 Td (x) Tj ET", "")], None));
+    assert_eq!(block_texts(&doc.blocks), ["x"]);
+}
+
+#[test]
+fn a_document_stuck_in_the_engine_does_not_hold_its_caller() {
+    let _engine = engine_alone();
+    // Long enough to get the engine while other tests use it (a first bind,
+    // the concurrency test), short enough to keep the test quick.
+    let short = ParseLimits {
+        pdf_timeout: Duration::from_secs(3),
+        ..ParseLimits::default()
+    };
+    let (release_tx, release_rx) = std_mpsc::channel::<()>();
+    let started = Instant::now();
+    let err = block_on(engine::run(&short, move |_engine| {
+        // Stands in for a pdfium call that cannot be interrupted.
+        release_rx
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap_or_default();
+        Ok(())
+    }))
+    .expect_err("gives up on the document");
+    assert!(
+        matches!(
+            err,
+            DomainError::LimitExceeded {
+                limit: ParseLimit::PdfTimeout,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the caller was held"
+    );
+    drop(release_tx);
+}
+
+#[test]
+fn a_failed_bind_is_retried_only_after_the_retry_window() {
+    let failed = Instant::now();
+    assert!(!retry_due(failed, failed));
+    assert!(!retry_due(
+        failed,
+        failed + BIND_RETRY.saturating_sub(Duration::from_secs(1))
+    ));
+    assert!(retry_due(failed, failed + BIND_RETRY));
+    // A clock that reads earlier than the failure does not retry.
+    assert!(!retry_due(failed + Duration::from_secs(5), failed));
 }
 
 #[test]
@@ -745,19 +976,33 @@ fn panics_become_engine_errors() {
 
 #[test]
 fn deadline_expires() {
-    let limits = ParseLimits {
-        pdf_timeout: Duration::from_millis(1),
-        ..ParseLimits::default()
-    };
-    let deadline = Deadline::new(&limits);
-    assert!(deadline.check().is_ok());
-    std::thread::sleep(Duration::from_millis(5));
-    let err = deadline.check().expect_err("expired").to_string();
-    assert!(err.contains("pdf_timeout"), "{err}");
+    let waiting = || false;
+    let generous = Deadline::new(Duration::from_hours(1), &waiting);
+    assert!(generous.check().is_ok());
+    let spent = Deadline::new(Duration::ZERO, &waiting);
+    std::thread::sleep(Duration::from_millis(2));
+    let err = spent.check().expect_err("expired");
+    assert!(
+        matches!(
+            err,
+            DomainError::LimitExceeded {
+                limit: ParseLimit::PdfTimeout,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    let gone = || true;
+    assert!(
+        Deadline::new(Duration::from_hours(1), &gone)
+            .check()
+            .is_err()
+    );
 }
 
 #[test]
 fn skewed_text_in_a_real_pdf() {
+    let _engine = engine_shared();
     // A 2 degree text matrix, as on a slightly tilted scan's text layer.
     let mut content = String::new();
     for (i, line) in [
@@ -831,6 +1076,108 @@ fn headings_follow_size_rank() {
             para("Final body line."),
         ]
     );
+}
+
+#[test]
+fn tier_lookup_matches_a_linear_scan() {
+    let tiers = [40, 30, 24, 21, 18];
+    for bin in -2..45 {
+        let linear = tiers.iter().position(|&t| t - bin <= 1);
+        assert_eq!(structure::tier_of(&tiers, bin), linear, "bin {bin}");
+    }
+    assert_eq!(structure::tier_of(&[], 10), None);
+}
+
+#[test]
+fn line_breaks_joining_lines_are_charged() {
+    let rows: Vec<(&str, f32, f32)> = (0..100).map(|_| ("ab", 72.0, 12.0)).collect();
+    let page = || Page {
+        lines: page_of(&rows),
+        area: None,
+    };
+    // The lines were charged when they were built; only the 99 joins and
+    // the one paragraph remain.
+    let tight = ParseLimits {
+        max_text_bytes: 99 + BLOCK_COST - 1,
+        ..ParseLimits::default()
+    };
+    let err = structure::blocks(vec![page()], &mut TextBudget::new(&tight))
+        .expect_err("the joins are over the limit");
+    assert!(err.to_string().contains("max_text_bytes"), "{err}");
+    let enough = ParseLimits {
+        max_text_bytes: 99 + BLOCK_COST,
+        ..ParseLimits::default()
+    };
+    assert!(structure::blocks(vec![page()], &mut TextBudget::new(&enough)).is_ok());
+}
+
+#[test]
+fn a_line_break_after_a_bold_run_is_charged_as_a_run() {
+    // "ab" with a bold "b", then "cd": the break after the bold run starts
+    // a plain run, which costs a block on top of its byte.
+    let mut glyphs = word_glyphs("ab", 72.0, 700.0, 0);
+    glyphs[1].bold = true;
+    glyphs.extend(word_glyphs("cd", 72.0, 686.0, 1000));
+    let page = || Page {
+        lines: lines_of(glyphs.clone()),
+        area: None,
+    };
+    let with = |max_text_bytes| ParseLimits {
+        max_text_bytes,
+        ..ParseLimits::default()
+    };
+    let cost = 1 + 2 * BLOCK_COST;
+    let blocks = structure::blocks(vec![page()], &mut TextBudget::new(&with(cost))).expect("fits");
+    let [ParsedBlock::Paragraph { inlines }] = blocks.as_slice() else {
+        panic!("one paragraph: {blocks:?}");
+    };
+    assert_eq!(inlines.len(), 3, "{inlines:?}");
+    let err = structure::blocks(vec![page()], &mut TextBudget::new(&with(cost - 1)))
+        .expect_err("the break's run is charged");
+    assert!(err.to_string().contains("max_text_bytes"), "{err}");
+}
+
+#[test]
+fn the_space_joining_heading_lines_is_charged() {
+    let page = || {
+        let mut glyphs = glyphs_with("A Long Heading", 72.0, 700.0, 0, 18.0, Direction::Deg0);
+        glyphs.extend(glyphs_with(
+            "Over Two Lines",
+            72.0,
+            680.0,
+            100,
+            18.0,
+            Direction::Deg0,
+        ));
+        glyphs.extend(word_glyphs(
+            "Body text that carries the page.",
+            72.0,
+            650.0,
+            200,
+        ));
+        Page {
+            lines: lines_of(glyphs),
+            area: None,
+        }
+    };
+    let with = |max_text_bytes| ParseLimits {
+        max_text_bytes,
+        ..ParseLimits::default()
+    };
+    // The lines were charged when they were built; the heading's one join
+    // space and the two blocks are all that is left.
+    let blocks = structure::blocks(
+        vec![page()],
+        &mut TextBudget::new(&with(1 + 2 * BLOCK_COST)),
+    )
+    .expect("one byte for the join");
+    assert_eq!(
+        blocks.first(),
+        Some(&heading(1, "A Long Heading Over Two Lines"))
+    );
+    let err = structure::blocks(vec![page()], &mut TextBudget::new(&with(2 * BLOCK_COST)))
+        .expect_err("the join is over the limit");
+    assert!(err.to_string().contains("max_text_bytes"), "{err}");
 }
 
 #[test]
@@ -993,7 +1340,7 @@ fn area_page(rows: &[(&str, f32)], seq_from: u32) -> Page {
     }
     Page {
         lines: lines_of(glyphs),
-        area: Some([0.0, 0.0, 612.0, 792.0]),
+        area: Some([0.0, 0.0, 612.0, 792.0].into()),
     }
 }
 
@@ -1013,7 +1360,7 @@ fn running_headers_and_page_numbers_are_dropped() {
             )
         })
         .collect();
-    let blocks = structure::blocks(pages);
+    let blocks = structure_blocks(pages);
     assert_eq!(count(&blocks, "ACME Report"), 1, "{blocks:?}");
     assert_eq!(count(&blocks, "2"), 0, "{blocks:?}");
     assert_eq!(count(&blocks, "Body of page 2 with 12 in it."), 1);
@@ -1029,7 +1376,7 @@ fn short_documents_keep_their_margins() {
     let pages: Vec<Page> = (1..=2)
         .map(|n| area_page(&[("Footer text", 30.0), ("Body.", 400.0)], 1000 * n))
         .collect();
-    let blocks = structure::blocks(pages);
+    let blocks = structure_blocks(pages);
     assert_eq!(count(&blocks, "Footer text"), 2);
 }
 
@@ -1043,9 +1390,9 @@ fn two_columns_are_read_column_by_column() {
     }
     let page = Page {
         lines: lines_of(glyphs),
-        area: Some([0.0, 0.0, 612.0, 792.0]),
+        area: Some([0.0, 0.0, 612.0, 792.0].into()),
     };
-    let blocks = structure::blocks(vec![page]);
+    let blocks = structure_blocks(vec![page]);
     let order: Vec<String> = block_texts(&blocks);
     let first_right = order.iter().position(|t| t.starts_with("right")).unwrap();
     assert!(
@@ -1066,6 +1413,7 @@ fn overprinted_text_is_kept_once_and_bold() {
 
 #[test]
 fn structure_from_a_real_pdf() {
+    let _engine = engine_shared();
     let content = "BT /F2 24 Tf 72 700 Td (Main Title) Tj ET \
         BT /F1 12 Tf 72 660 Td (This is body text that is long enough to wrap and we hy-) Tj 0 -14 Td (phenate a word across lines.) Tj ET \
         BT /F1 12 Tf 72 600 Td (\\225 bullet item one) Tj 0 -14 Td (1. ordered item) Tj ET";
@@ -1199,7 +1547,7 @@ fn page_at(rows: &[(&str, f32, f32)], seq_from: u32) -> Page {
     }
     Page {
         lines: lines_of(glyphs),
-        area: Some([0.0, 0.0, 612.0, 792.0]),
+        area: Some([0.0, 0.0, 612.0, 792.0].into()),
     }
 }
 
@@ -1222,7 +1570,7 @@ fn numbers_in_the_margins_are_content_unless_they_count_pages() {
             )
         })
         .collect();
-    let blocks = structure::blocks(pages);
+    let blocks = structure_blocks(pages);
     let texts = block_texts(&blocks);
     assert!(texts.iter().all(|t| !t.starts_with("Page ")), "{texts:?}");
     assert!(
@@ -1259,7 +1607,7 @@ fn alternating_running_heads_are_dropped() {
             )
         })
         .collect();
-    let blocks = structure::blocks(pages);
+    let blocks = structure_blocks(pages);
     assert_eq!(count(&blocks, "J. Smith and A. Jones"), 1);
     assert_eq!(count(&blocks, "A Short Title"), 1);
 }
@@ -1290,7 +1638,7 @@ fn a_full_width_title_does_not_stop_column_reading() {
         740.0,
     )];
     rows.extend(two_columns(8, 700.0, 0));
-    let blocks = structure::blocks(vec![page_of_rows(&rows)]);
+    let blocks = structure_blocks(vec![page_of_rows(&rows)]);
     let texts = block_texts(&blocks).join("\n");
     let last_left = texts.find("left column prose line 7").unwrap();
     let first_right = texts.find("right column prose line 0").unwrap();
@@ -1305,7 +1653,7 @@ fn label_and_amount_tables_stay_row_by_row() {
         rows.push((format!("Line item {i}"), 72.0, y));
         rows.push((format!("{}.00", 1000 + i), 450.0, y));
     }
-    let blocks = structure::blocks(vec![page_of_rows(&rows)]);
+    let blocks = structure_blocks(vec![page_of_rows(&rows)]);
     let texts = block_texts(&blocks);
     let first_amount = texts.iter().position(|t| t.contains("1000.00")).unwrap();
     assert!(
@@ -1331,7 +1679,7 @@ fn a_column_heading_next_to_body_in_the_other_column_stays_a_heading() {
             .total_cmp(&a.baseline)
             .then(a.left.total_cmp(&b.left))
     });
-    let blocks = structure::blocks(vec![page]);
+    let blocks = structure_blocks(vec![page]);
     assert!(blocks.contains(&heading(1, "Related Work")), "{blocks:?}");
 }
 
@@ -1383,7 +1731,7 @@ fn a_cover_page_does_not_use_up_heading_levels() {
         ]),
         area: None,
     };
-    let blocks = structure::blocks(vec![
+    let blocks = structure_blocks(vec![
         cover,
         section("more body text here"),
         section("more body text there"),

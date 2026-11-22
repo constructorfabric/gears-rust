@@ -5,74 +5,56 @@
 //! of them. Nothing is sized from counts the file declares (`uniqueCount`,
 //! `<dimension>`): shared strings and cells are collected as they are met.
 
-use std::collections::HashMap;
-
 use quick_xml::events::{BytesStart, Event};
 
-use crate::domain::error::DomainError;
+use crate::domain::error::{DomainError, ParseLimit};
 use crate::infra::parsers::limits::{ParseLimits, limit_exceeded};
-use crate::infra::parsers::ooxml::{self, Archive, Events, Relationship, xml};
+use crate::infra::parsers::ooxml::{Archive, Events, xml};
 
-use super::Sink;
-use super::cells::{bool_text, format_float, iso_datetime, serial_text};
-use super::numfmt::{self, Kind};
-use super::shared::SharedStrings;
+use super::cells::{bool_text, iso_datetime};
+use super::shared::{CellFormats, SharedStrings, number_text};
+use super::{Sink, Visibility};
 
 /// Workbook facts that do not come from the sheets.
 pub(super) struct XlsxInfo {
     pub(super) macro_enabled: bool,
-    pub(super) title: Option<String>,
 }
 
 fn parse_error(detail: impl std::fmt::Display) -> DomainError {
     DomainError::parse_error(format!("Failed to parse XLSX: {detail}"))
 }
 
-/// Reads every worksheet of the package into `sink`.
+/// Reads every worksheet of the package, whose workbook is `workbook_part`,
+/// into `sink`.
 pub(super) fn read(
     mut archive: Archive,
+    workbook_part: &str,
     limits: &ParseLimits,
     sink: &mut Sink,
 ) -> Result<XlsxInfo, DomainError> {
-    let root = archive.read_rels("")?;
-    let workbook_part = root
-        .of_type("officeDocument")
-        .find(|r| !r.external && archive.contains(&r.target))
-        .map(|r| r.target.clone())
-        .or_else(|| {
-            archive
-                .contains("xl/workbook.xml")
-                .then(|| "xl/workbook.xml".to_owned())
-        })
-        .ok_or_else(|| parse_error("no workbook part"))?;
-
-    let macro_enabled = workbook_content_type(&mut archive, &workbook_part)?
+    let macro_enabled = workbook_content_type(&mut archive, workbook_part)?
         .is_some_and(|ct| ct.contains("macroEnabled"));
-    let title = match root.of_type("core-properties").find(|r| !r.external) {
-        Some(rel) => ooxml::core_title(&mut archive, &rel.target.clone())?,
-        None => None,
-    };
 
     let workbook_xml = archive
-        .read_xml(&workbook_part)?
+        .read_xml(workbook_part)?
         .ok_or_else(|| parse_error("no workbook part"))?;
     let workbook = parse_workbook(&workbook_xml, limits)?;
     drop(workbook_xml);
-    let rels = archive.read_rels(&workbook_part)?;
+    let rels = archive.read_rels(workbook_part)?;
 
-    let shared = match internal(rels.of_type("sharedStrings")) {
+    let shared = match rels.internal("sharedStrings") {
         Some(target) => match archive.read_xml(&target)? {
             Some(text) => parse_shared_strings(&text, limits)?,
             None => SharedStrings::default(),
         },
         None => SharedStrings::default(),
     };
-    let styles = match internal(rels.of_type("styles")) {
+    let styles = match rels.internal("styles") {
         Some(target) => match archive.read_xml(&target)? {
             Some(text) => parse_styles(&text, limits)?,
-            None => Vec::new(),
+            None => CellFormats::default(),
         },
-        None => Vec::new(),
+        None => CellFormats::default(),
     };
     let context = SheetContext {
         shared: &shared,
@@ -83,15 +65,15 @@ pub(super) fn read(
 
     if workbook.sheets.len() > limits.max_sheets {
         return Err(limit_exceeded(
-            "max_sheets",
+            ParseLimit::MaxSheets,
             format!("more than {} sheets", limits.max_sheets),
         ));
     }
-    for (name, rel_id) in &workbook.sheets {
+    for (name, rel_id, visibility) in &workbook.sheets {
         // Chart, dialog and macro sheets hold no cells.
         let Some(rel) = rels
             .get(rel_id)
-            .filter(|r| !r.external && r.rel_type.rsplit('/').next() == Some("worksheet"))
+            .filter(|r| !r.external && r.is_type("worksheet"))
         else {
             continue;
         };
@@ -101,17 +83,10 @@ pub(super) fn read(
         };
         let mut cells = sink.new_sheet();
         parse_sheet(&sheet_xml, &context, sink, &mut cells)?;
-        sink.finish_sheet(name, cells)?;
+        sink.finish_sheet(name, *visibility, cells)?;
     }
 
-    Ok(XlsxInfo {
-        macro_enabled,
-        title,
-    })
-}
-
-fn internal<'a>(mut rels: impl Iterator<Item = &'a Relationship>) -> Option<String> {
-    rels.find(|r| !r.external).map(|r| r.target.clone())
+    Ok(XlsxInfo { macro_enabled })
 }
 
 /// The content type `[Content_Types].xml` gives the workbook part.
@@ -140,8 +115,8 @@ fn workbook_content_type(
 }
 
 struct WorkbookXml {
-    /// (sheet name, relationship id), in workbook order.
-    sheets: Vec<(String, String)>,
+    /// (sheet name, relationship id, visibility), in workbook order.
+    sheets: Vec<(String, String, Visibility)>,
     date1904: bool,
 }
 
@@ -159,7 +134,12 @@ fn parse_workbook(text: &str, limits: &ParseLimits) -> Result<WorkbookXml, Domai
                     if let (Some(name), Some(id)) =
                         (xml::attr(&e, "name"), xml::prefixed_attr(&e, "id"))
                     {
-                        sheets.push((name, id));
+                        let visibility = match xml::attr(&e, "state").as_deref() {
+                            Some("hidden") => Visibility::Hidden,
+                            Some("veryHidden") => Visibility::VeryHidden,
+                            _ => Visibility::Visible,
+                        };
+                        sheets.push((name, id, visibility));
                     }
                 }
                 _ => {}
@@ -222,10 +202,9 @@ fn parse_shared_strings(text: &str, limits: &ParseLimits) -> Result<SharedString
 }
 
 /// Display kind per cell style index (`<cellXfs>` order).
-fn parse_styles(text: &str, limits: &ParseLimits) -> Result<Vec<Kind>, DomainError> {
+fn parse_styles(text: &str, limits: &ParseLimits) -> Result<CellFormats, DomainError> {
     let mut events = Events::new(text, limits, "XLSX");
-    let mut custom: HashMap<u32, Kind> = HashMap::new();
-    let mut kinds = Vec::new();
+    let mut formats = CellFormats::default();
     let mut in_cell_xfs = false;
     loop {
         match events.next()? {
@@ -235,7 +214,7 @@ fn parse_styles(text: &str, limits: &ParseLimits) -> Result<Vec<Kind>, DomainErr
                         xml::attr(&e, "numFmtId").and_then(|v| v.parse().ok()),
                         xml::attr(&e, "formatCode"),
                     ) {
-                        custom.insert(id, numfmt::classify(&code));
+                        formats.add_format(id, &code);
                     }
                 }
                 "cellXfs" => in_cell_xfs = true,
@@ -243,12 +222,7 @@ fn parse_styles(text: &str, limits: &ParseLimits) -> Result<Vec<Kind>, DomainErr
                     let id: u32 = xml::attr(&e, "numFmtId")
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(0);
-                    kinds.push(
-                        custom
-                            .get(&id)
-                            .copied()
-                            .unwrap_or_else(|| numfmt::builtin(id)),
-                    );
+                    formats.add_xf(id);
                 }
                 _ => {}
             },
@@ -257,12 +231,12 @@ fn parse_styles(text: &str, limits: &ParseLimits) -> Result<Vec<Kind>, DomainErr
             _ => {}
         }
     }
-    Ok(kinds)
+    Ok(formats)
 }
 
 struct SheetContext<'a> {
     shared: &'a SharedStrings,
-    styles: &'a [Kind],
+    styles: &'a CellFormats,
     date1904: bool,
     limits: &'a ParseLimits,
 }
@@ -362,19 +336,12 @@ fn display_text(raw: RawCell, ctx: &SheetContext<'_>) -> Option<String> {
         _ => {
             let value = raw.value?;
             match value.trim().parse::<f64>() {
-                Ok(number) => {
-                    // A cell without `s` uses the first cell format, as in Excel.
-                    let kind = ctx
-                        .styles
-                        .get(raw.style.unwrap_or(0))
-                        .copied()
-                        .unwrap_or(Kind::Number);
-                    if kind == Kind::Number {
-                        format_float(number)
-                    } else {
-                        serial_text(number, kind, ctx.date1904)
-                    }
-                }
+                // A cell without `s` uses the first cell format, as in Excel.
+                Ok(number) => number_text(
+                    number,
+                    ctx.styles.kind(raw.style.unwrap_or(0)),
+                    ctx.date1904,
+                ),
                 Err(_) => value,
             }
         }
@@ -450,6 +417,7 @@ fn decode_xstring(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::numfmt::Kind;
     use super::*;
 
     #[test]
@@ -495,10 +463,17 @@ mod tests {
 <cellStyleXfs><xf numFmtId="14"/></cellStyleXfs>
 <cellXfs><xf numFmtId="0"/><xf numFmtId="164"/><xf numFmtId="165"/><xf numFmtId="22"/></cellXfs>
 </styleSheet>"#;
-        let kinds = parse_styles(xml, &ParseLimits::default()).unwrap();
+        let formats = parse_styles(xml, &ParseLimits::default()).unwrap();
+        let kinds: Vec<Kind> = (0..5).map(|xf| formats.kind(xf)).collect();
         assert_eq!(
             kinds,
-            [Kind::Number, Kind::Date, Kind::Number, Kind::DateTime]
+            [
+                Kind::Number,
+                Kind::Date,
+                Kind::Number,
+                Kind::DateTime,
+                Kind::Number
+            ]
         );
     }
 
@@ -508,6 +483,9 @@ mod tests {
 <x:sheets><x:sheet name="One" sheetId="5" id="bogus" r:id="rId3"/></x:sheets></x:workbook>"#;
         let wb = parse_workbook(xml, &ParseLimits::default()).unwrap();
         assert!(wb.date1904);
-        assert_eq!(wb.sheets, [("One".to_owned(), "rId3".to_owned())]);
+        assert_eq!(
+            wb.sheets,
+            [("One".to_owned(), "rId3".to_owned(), Visibility::Visible)]
+        );
     }
 }

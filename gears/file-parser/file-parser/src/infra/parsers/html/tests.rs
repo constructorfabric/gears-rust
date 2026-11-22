@@ -1,5 +1,6 @@
 use super::*;
 use crate::infra::parsers::inlines::MAX_URL_LEN;
+use crate::infra::parsers::limits::BLOCK_COST;
 
 fn page(html: &str) -> Page {
     convert(html.as_bytes(), None, &ParseLimits::default()).expect("page converts")
@@ -216,6 +217,22 @@ fn table_with_header_spans_and_caption() {
 }
 
 #[test]
+fn table_wider_than_the_column_limit_is_skipped_with_a_note() {
+    let limits = ParseLimits {
+        max_table_columns: 4,
+        ..ParseLimits::default()
+    };
+    let row = "<td>x</td>".repeat(5);
+    let html = format!("<table><tr>{row}</tr></table><p>after</p>");
+    let t = texts(&convert(html.as_bytes(), None, &limits).unwrap().blocks);
+    assert!(t[0].contains("Table skipped"), "{t:?}");
+    assert_eq!(t[1], "after");
+    let fits = format!("<table><tr>{}</tr></table>", "<td>x</td>".repeat(4));
+    let b = convert(fits.as_bytes(), None, &limits).unwrap().blocks;
+    assert!(matches!(b[0], ParsedBlock::Table(_)), "{b:?}");
+}
+
+#[test]
 fn table_over_the_cell_budget_is_skipped_with_a_note() {
     let limits = ParseLimits {
         max_table_cells: 3,
@@ -231,6 +248,91 @@ fn table_over_the_cell_budget_is_skipped_with_a_note() {
     let wide = r#"<table><tr><td colspan="999999">x</td></tr></table>"#;
     let b = convert(wide.as_bytes(), None, &limits).unwrap().blocks;
     assert!(texts(&b)[0].contains("Table skipped"));
+}
+
+#[test]
+fn nested_tables_leave_room_for_the_cells_around_them() {
+    // The outer table is charged only when it ends, so the table in its
+    // second cell must leave room for the outer table's 7 cells: it gets 3
+    // and is skipped, and the outer table fits.
+    let limits = ParseLimits {
+        max_table_cells: 10,
+        ..ParseLimits::default()
+    };
+    let inner = r#"<table><tr><td colspan="6">b</td></tr></table>"#;
+    let html = format!(r#"<table><tr><td colspan="6">a</td><td>{inner}</td></tr></table>"#);
+    let b = convert(html.as_bytes(), None, &limits).unwrap().blocks;
+    let [ParsedBlock::Table(table)] = b.as_slice() else {
+        panic!("the outer table is kept: {b:?}");
+    };
+    let last = table.rows[0].cells.last().map(|c| texts(&c.blocks));
+    assert!(
+        last.is_some_and(|t| t.iter().any(|x| x.contains("Table skipped"))),
+        "{table:?}"
+    );
+}
+
+#[test]
+fn a_table_in_a_spanning_cell_leaves_room_for_the_span() {
+    // The enclosing cell spans 4 columns: the inner table gets 10 - 3 - 4.
+    let limits = ParseLimits {
+        max_table_cells: 10,
+        ..ParseLimits::default()
+    };
+    let inner = r#"<table><tr><td colspan="5">b</td></tr></table>"#;
+    let html =
+        format!(r#"<table><tr><td colspan="3">a</td><td colspan="4">{inner}</td></tr></table>"#);
+    let b = convert(html.as_bytes(), None, &limits).unwrap().blocks;
+    let [ParsedBlock::Table(table)] = b.as_slice() else {
+        panic!("the outer table is kept: {b:?}");
+    };
+    assert!(
+        texts(&table.rows[0].cells[3].blocks)[0].contains("Table skipped"),
+        "{table:?}"
+    );
+}
+
+#[test]
+fn a_table_directly_in_a_table_leaves_room_for_it() {
+    // The inner table is converted after the outer grid is built but before
+    // the outer table is charged: it must leave room for those 6 cells.
+    let limits = ParseLimits {
+        max_table_cells: 10,
+        ..ParseLimits::default()
+    };
+    let html = concat!(
+        r#"<table><tr><td colspan="6">a</td></tr>"#,
+        r#"<table><tr><td colspan="6">b</td></tr></table></table>"#,
+    );
+    let b = convert(html.as_bytes(), None, &limits).unwrap().blocks;
+    let [note, ParsedBlock::Table(_)] = b.as_slice() else {
+        panic!("the inner table is skipped, the outer kept: {b:?}");
+    };
+    assert!(texts(std::slice::from_ref(note))[0].contains("Table skipped"));
+}
+
+#[test]
+fn image_sources_and_blocks_are_charged() {
+    let with = |max_text_bytes| ParseLimits {
+        max_text_bytes,
+        ..ParseLimits::default()
+    };
+    let src = format!("/{}", "s".repeat(1_999));
+    let html = format!(r#"<img src="{src}" alt="a">"#);
+    let cost = 1 + src.len() + BLOCK_COST;
+    assert!(convert(html.as_bytes(), None, &with(cost)).is_ok());
+    let err = convert(html.as_bytes(), None, &with(cost - 1))
+        .err()
+        .expect("the source is charged");
+    assert!(err.to_string().contains("max_text_bytes"), "{err}");
+
+    let rules = "<hr>".repeat(100);
+    let b = convert(rules.as_bytes(), None, &with(100 * BLOCK_COST)).unwrap();
+    assert_eq!(b.blocks.len(), 100);
+    let err = convert(rules.as_bytes(), None, &with(100 * BLOCK_COST - 1))
+        .err()
+        .expect("every block is charged");
+    assert!(err.to_string().contains("max_text_bytes"), "{err}");
 }
 
 #[test]
@@ -331,6 +433,50 @@ fn declared_charset_is_used() {
     assert_eq!(texts(&p.blocks), ["\u{434}\u{430}"]);
 }
 
+/// Text bytes and table cells in `blocks`, nested blocks included.
+fn output_size(blocks: &[ParsedBlock]) -> (usize, usize) {
+    fn inline_bytes(inlines: &[Inline]) -> usize {
+        inlines
+            .iter()
+            .map(|i| match i {
+                Inline::Text { text, .. } | Inline::Code { text, .. } => text.len(),
+                Inline::Link { text, target, .. } => text.len() + target.len(),
+            })
+            .sum()
+    }
+    let (mut bytes, mut cells) = (0, 0);
+    for block in blocks {
+        let (b, c) = match block {
+            ParsedBlock::Paragraph { inlines } | ParsedBlock::Heading { inlines, .. } => {
+                (inline_bytes(inlines), 0)
+            }
+            ParsedBlock::ListItem { blocks, .. } | ParsedBlock::Quote { blocks } => {
+                output_size(blocks)
+            }
+            ParsedBlock::CodeBlock { code, .. } => (code.len(), 0),
+            ParsedBlock::Image { alt, title, src } => (
+                [alt, title, src]
+                    .iter()
+                    .map(|v| v.as_ref().map_or(0, String::len))
+                    .sum(),
+                0,
+            ),
+            ParsedBlock::Table(table) => {
+                let mut size = (0, 0);
+                for cell in table.rows.iter().flat_map(|r| &r.cells) {
+                    let (b, c) = output_size(&cell.blocks);
+                    size = (size.0 + b, size.1 + c + 1);
+                }
+                size
+            }
+            ParsedBlock::HorizontalRule | ParsedBlock::PageBreak => (0, 0),
+        };
+        bytes += b;
+        cells += c;
+    }
+    (bytes, cells)
+}
+
 /// Inputs that made a spec tree builder (html5ever) super-linear for
 /// seconds to minutes; here each one is a single pass.
 #[test]
@@ -348,11 +494,24 @@ fn hostile_markup_stays_linear() {
             write!(acc, "<p><b id={i}></p>").unwrap();
             acc
         }),
+        // End tags that may not close across cells, under nested tables.
+        format!(
+            "{}{}",
+            "<table><tr><td><span>".repeat(5_000),
+            "</div></span></td></tr></table>".repeat(50_000)
+        ),
         // One tag with a hundred thousand attributes.
         format!("<p{}>x", " a=1".repeat(100_000)),
     ];
     for html in &cases {
-        drop(convert(html.as_bytes(), None, &ParseLimits::default()));
+        let started = std::time::Instant::now();
+        let page = convert(html.as_bytes(), None, &ParseLimits::default())
+            .unwrap_or_else(|e| panic!("{e}: {}", &html[..80]));
+        // Generous for a debug build; quadratic work takes minutes.
+        assert!(started.elapsed().as_secs() < 10, "{}", &html[..80]);
+        let (bytes, cells) = output_size(&page.blocks);
+        assert!(bytes <= html.len(), "{bytes}");
+        assert!(cells <= ParseLimits::default().max_table_cells, "{cells}");
     }
 }
 
@@ -429,6 +588,16 @@ fn list_directly_in_list_nests_and_loose_text_is_an_item() {
             (1, vec!["b".to_owned()]),
             (0, vec!["loose".to_owned()])
         ]
+    );
+}
+
+#[test]
+fn a_huge_title_is_cut() {
+    let html = format!("<title>{}</title><p>x</p>", "\u{e9}".repeat(100_000));
+    let p = page(&html);
+    assert_eq!(
+        p.title,
+        Some("\u{e9}".repeat(crate::infra::parsers::limits::MAX_TITLE_CHARS))
     );
 }
 
@@ -512,11 +681,8 @@ fn legacy_table_markup_keeps_rows_and_stray_text() {
 fn cells_close_through_unclosed_inline_elements() {
     let b = blocks("<table><tr><td><font>Name<td><font>Value<tr><td><font>A<td><font>B</table>");
     assert_eq!(first_table(&b), [vec!["Name", "Value"], vec!["A", "B"]]);
-    // Stray cells outside a table still separate words.
-    assert_eq!(
-        texts(&blocks("<div><td>a</td><td>b</td></div>")),
-        ["a", "b"]
-    );
+    // Stray cells outside a table are ignored but still separate words.
+    assert_eq!(texts(&blocks("<div><td>a</td><td>b</td></div>")), ["a b"]);
 }
 
 #[test]
@@ -526,8 +692,9 @@ fn oversized_tables_spend_the_budget() {
         ..ParseLimits::default()
     };
     let big = format!("<table><tr>{}</tr></table>", "<td>x</td>".repeat(900));
-    // The first table fits; the second would too, but the first oversized
-    // table in between used up what it built.
+    // The first table, 2 x 600 cells, is over the budget and skipped; it
+    // still spends the 600 cells it built, so the second, which would fit
+    // alone, is skipped too.
     let html = format!(
         "<table><tr>{}</tr><tr>{}</tr></table>{big}",
         "<td>a</td>".repeat(600),
@@ -581,6 +748,12 @@ fn noframes_and_noembed_are_skipped() {
 /// Random markup fragments: no panic, output bounded by the limits.
 #[test]
 fn random_markup_never_panics() {
+    let limits = ParseLimits {
+        max_table_cells: 40,
+        max_html_nodes: 150,
+        max_text_bytes: 4_096,
+        ..ParseLimits::default()
+    };
     let pieces: [&str; 24] = [
         "<",
         ">",
@@ -617,6 +790,217 @@ fn random_markup_never_panics() {
             let index = usize::try_from(state % 24).unwrap();
             html.push_str(pieces[index]);
         }
-        drop(convert(html.as_bytes(), None, &ParseLimits::default()));
+        match convert(html.as_bytes(), None, &limits) {
+            Ok(page) => {
+                let (bytes, cells) = output_size(&page.blocks);
+                assert!(bytes <= limits.max_text_bytes, "{bytes}: {html}");
+                assert!(cells <= limits.max_table_cells, "{cells}: {html}");
+            }
+            Err(e) => assert!(
+                ["max_text_bytes", "max_html_nodes"]
+                    .iter()
+                    .any(|l| e.to_string().contains(l)),
+                "{e}: {html}"
+            ),
+        }
     }
+}
+
+#[test]
+fn end_tags_do_not_close_across_cells() {
+    let b = blocks("<font><table><tr><td>a</font></td><td>b</td></tr></table>");
+    assert_eq!(first_table(&b), [vec!["a", "b"]]);
+    let b = blocks(
+        "<div><table><tr><td>a</div></td><td>b</td></tr><tr><td>c</td></tr></table>after</div>",
+    );
+    assert_eq!(first_table(&b), [vec!["a", "b"], vec!["c"]]);
+    assert_eq!(texts(&b), ["after"]);
+    // The end of a row or table still closes the cell around it.
+    let b = blocks("<table><tr><td><b>a</tr><tr><td>b</table>c");
+    assert_eq!(first_table(&b), [vec!["a"], vec!["b"]]);
+    assert_eq!(texts(&b), ["c"]);
+}
+
+#[test]
+fn unclosed_colgroup_and_caption_end_at_the_rows() {
+    let b = blocks("<table><colgroup><col><col><tr><td>a</td></tr></table>");
+    assert_eq!(first_table(&b), [vec!["a"]]);
+    let b = blocks("<table><caption>Parts<tr><td>1</td></tr></table>");
+    assert_eq!(texts(&b), ["Parts"]);
+    assert_eq!(first_table(&b), [vec!["1"]]);
+    // A table left in a colgroup is not skipped with the columns.
+    let b = blocks("<table><colgroup><col><table><tr><td>in</table><tr><td>out</table>");
+    let tables: Vec<Vec<Vec<String>>> = b
+        .iter()
+        .map(|block| first_table(std::slice::from_ref(block)))
+        .collect();
+    assert_eq!(tables, [vec![vec!["in"]], vec![vec!["out"]]]);
+}
+
+#[test]
+fn blocks_inside_links_and_styles_keep_them() {
+    let link = |text: &str, style: InlineStyle| Inline::Link {
+        text: text.to_owned(),
+        target: "/p".to_owned(),
+        style,
+    };
+    let b = blocks(r#"<a href="/p"><h3>Title</h3><p>Summary</p></a>"#);
+    assert_eq!(
+        b,
+        [
+            ParsedBlock::Heading {
+                level: 3,
+                inlines: vec![link("Title", InlineStyle::default())],
+            },
+            para(vec![link("Summary", InlineStyle::default())]),
+        ]
+    );
+    let b = blocks("<b><div><p>x</p></div><ul><li>y</li></ul></b>");
+    assert_eq!(b[0], para(vec![styled("x", |s| s.bold = true)]));
+    assert!(
+        matches!(&b[1], ParsedBlock::ListItem { blocks, .. }
+            if blocks[..] == [para(vec![styled("y", |s| s.bold = true)])]),
+        "{b:?}"
+    );
+    let b = blocks("<i><dl><dt>t</dl></i>");
+    assert_eq!(
+        b,
+        [para(vec![styled("t", |s| {
+            s.bold = true;
+            s.italic = true;
+        })])]
+    );
+    // Cells and captions do not take the style or link around the table.
+    let b = blocks(r#"<a href="/p"><b><table><caption>c</caption><tr><td>x</table></b></a>"#);
+    assert_eq!(b[0], para(vec![plain("c")]));
+    let ParsedBlock::Table(table) = &b[1] else {
+        panic!("{b:?}");
+    };
+    assert_eq!(table.rows[0].cells[0].blocks, [para(vec![plain("x")])]);
+}
+
+#[test]
+fn crlf_line_breaks_in_pre() {
+    let b = blocks("<pre>\r\ncode\r\nmore\rlast\r\n</pre>");
+    assert_eq!(
+        b,
+        [ParsedBlock::CodeBlock {
+            language: None,
+            code: "code\nmore\nlast".to_owned(),
+        }]
+    );
+}
+
+#[test]
+fn hidden_cells_and_preformatted_text_are_skipped() {
+    let b = blocks(
+        r#"<table><tr><td style="display:none">secret</td><td>shown</td><th hidden>h</th></tr></table>"#,
+    );
+    assert_eq!(first_table(&b), [vec!["shown"]]);
+    let b = blocks(r#"<pre>a<span style="visibility: hidden">secret</span>b</pre>"#);
+    assert_eq!(
+        b,
+        [ParsedBlock::CodeBlock {
+            language: None,
+            code: "ab".to_owned(),
+        }]
+    );
+}
+
+#[test]
+fn svg_and_math_titles_are_not_the_page_title() {
+    let p = page("<body><svg><title>Icon</title></svg><math><title>m</title></math><p>x</p>");
+    assert_eq!(p.title, None);
+    let p = page("<svg><title>Icon</title></svg><title>Page</title>");
+    assert_eq!(p.title.as_deref(), Some("Page"));
+}
+
+#[test]
+fn script_text_in_comments_does_not_leak() {
+    let b = blocks("<script><!-- document.write('<script></script>'); //--></script><p>kept</p>");
+    assert_eq!(texts(&b), ["kept"]);
+}
+
+#[test]
+fn table_structure_leftovers() {
+    // A new cell closes a list left open in the cell before it.
+    let b = blocks("<table><tr><td><ul><li>x<td>y<tr><td>z</table>");
+    let ParsedBlock::Table(table) = &b[0] else {
+        panic!("{b:?}");
+    };
+    assert_eq!(table.rows.len(), 2, "{table:?}");
+    assert!(matches!(
+        table.rows[0].cells[0].blocks[..],
+        [ParsedBlock::ListItem { .. }]
+    ));
+    assert_eq!(texts(&table.rows[0].cells[1].blocks), ["y"]);
+    assert_eq!(texts(&table.rows[1].cells[0].blocks), ["z"]);
+    // Cells without a row share one.
+    assert_eq!(
+        first_table(&blocks("<table><td>a<td>b</table>")),
+        [vec!["a", "b"]]
+    );
+    // A table in a row but outside its cells comes before the table.
+    let b = blocks("<table><tr><table><tr><td>in</table><td>out</table>");
+    let tables: Vec<Vec<Vec<String>>> = b
+        .iter()
+        .map(|block| first_table(std::slice::from_ref(block)))
+        .collect();
+    assert_eq!(tables, [vec![vec!["in"]], vec![vec!["out"]]]);
+}
+
+#[test]
+fn cells_and_captions_outside_tables_are_ignored() {
+    // Their content stays in the element around them, which still closes.
+    for html in [
+        "<select><option>a<td>b</select><p>after</p>",
+        "<button><td>x</button><p>after</p>",
+        "<button><caption>x</button><p>after</p>",
+        "<button><colgroup>x</button><p>after</p>",
+    ] {
+        assert_eq!(texts(&blocks(html)), ["after"], "{html}");
+    }
+    assert_eq!(texts(&blocks("<div><td>Price</div>$5")), ["Price", "$5"]);
+    let b = blocks("<ul><li>x<td>a</ul><p>after</p>");
+    assert!(
+        matches!(&b[..], [ParsedBlock::ListItem { blocks, .. }, last]
+            if texts(blocks) == ["x a"] && texts(std::slice::from_ref(last)) == ["after"]),
+        "{b:?}"
+    );
+}
+
+#[test]
+fn template_and_select_end_tags_close_tables_left_open_in_them() {
+    for html in [
+        "<template><table><tr><td>a</template><p>rest</p>",
+        "<template><td>x</template><p>rest</p>",
+        "<select><table><tr><td>a</select><p>rest</p>",
+    ] {
+        assert_eq!(texts(&blocks(html)), ["rest"], "{html}");
+    }
+}
+
+#[test]
+fn caption_after_rows_closes_them() {
+    let b = blocks("<table><tr><td>a<caption>c</caption><tr><td>b</table>");
+    assert_eq!(texts(&b), ["c"]);
+    assert_eq!(first_table(&b), [vec!["a"], vec!["b"]]);
+    let b = blocks("<table><tbody><tr><td>a<caption>c</caption>b</table>");
+    assert_eq!(texts(&b), ["c", "b"]);
+    assert_eq!(first_table(&b), [vec!["a"]]);
+}
+
+#[test]
+fn self_closing_foreign_elements_are_closed() {
+    let p = page("<svg/><title>T</title><p>x");
+    assert_eq!(p.title.as_deref(), Some("T"));
+    assert_eq!(texts(&p.blocks), ["x"]);
+    assert_eq!(
+        texts(&blocks(r#"<p>a<svg class="i"/> text</p>"#)),
+        ["a text"]
+    );
+    assert_eq!(
+        texts(&blocks("<p>a<math/>b<svg><path d=x/><title/></svg> c</p>")),
+        ["ab c"]
+    );
 }

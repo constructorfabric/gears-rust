@@ -78,10 +78,8 @@ pub(super) enum Kind {
     /// `body`, `obj` (the default) and content placeholders (`chart`, `tbl`,
     /// `pic`, ...).
     Body,
-    /// `ftr`: footer text, kept as a plain paragraph.
-    Footer,
-    /// `dt`, `sldNum`, `hdr`: generated date, slide number and header fields,
-    /// left out.
+    /// `ftr`, `dt`, `sldNum`, `hdr`: footer, date, slide number and header,
+    /// left out (the same on every slide).
     Furniture,
 }
 
@@ -90,8 +88,7 @@ impl Kind {
         match value {
             Some("title" | "ctrTitle") => Self::Title,
             Some("subTitle") => Self::SubTitle,
-            Some("ftr") => Self::Footer,
-            Some("dt" | "sldNum" | "hdr") => Self::Furniture,
+            Some("ftr" | "dt" | "sldNum" | "hdr") => Self::Furniture,
             _ => Self::Body,
         }
     }
@@ -176,6 +173,18 @@ pub(super) struct Inherited {
 }
 
 impl Inherited {
+    /// What placeholder `ph` holds: its own `type`, or, when it has only an
+    /// index, the kind of the layout placeholder it inherits from.
+    pub(super) fn kind(&self, ph: &Placeholder) -> Kind {
+        if ph.typed {
+            return ph.kind;
+        }
+        self.layout
+            .placeholders
+            .find(ph)
+            .map_or(ph.kind, |(kind, _)| kind)
+    }
+
     /// The inherited bullet for a paragraph at `level` in a shape that is
     /// placeholder `ph` (or no placeholder).
     pub(super) fn bullet(&self, ph: Option<&Placeholder>, level: usize) -> Option<Bullet> {
@@ -198,7 +207,7 @@ impl Inherited {
             .or_else(|| match kind {
                 Kind::Title => text.title.get(level),
                 Kind::Body | Kind::SubTitle => text.body.get(level),
-                Kind::Footer | Kind::Furniture => text.other.get(level),
+                Kind::Furniture => text.other.get(level),
             })
     }
 }

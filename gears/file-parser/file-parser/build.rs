@@ -29,7 +29,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-// SHA-256 through the workspace crypto facade (architecture lint DE0708).
+// Allow-listed for DE0708 in dylint.toml: this checks a downloaded archive at
+// build time and never reaches the binary, so the FIPS facade is not needed.
 use toolkit_security::crypto::hash::Sha256;
 
 /// The pinned pdfium build. `pdfium-render` must be built with the highest
@@ -103,6 +104,7 @@ fn main() {
 
 fn run() -> Result<(), String> {
     println!("cargo::rustc-check-cfg=cfg(pdfium_unbundled)");
+    println!("cargo:rustc-env=FILE_PARSER_PDFIUM_BUILD={PDFIUM_BUILD}");
     println!("cargo:rerun-if-changed=build.rs");
     for var in [
         "FILE_PARSER_PDFIUM_ARCHIVE",

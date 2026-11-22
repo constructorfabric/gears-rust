@@ -26,6 +26,10 @@ Supported formats, by parser id (the keys of the `/info` response):
 The stub also lists `xls`, `xlsx` and `pptx`, but those go to the earlier
 parsers: the first registered parser that claims an extension wins.
 
+Plain-text files come out verbatim as code blocks of up to about 16 KiB, cut
+at blank lines where possible, so Markdown or HTML in them is not interpreted;
+`.md` blocks are tagged `markdown`.
+
 ## Configuration
 
 ```yaml
@@ -69,13 +73,18 @@ from `ParseLimits::default()` and change fields.
 | `max_html_nodes` | 500 000 | Elements and text nodes of one HTML document |
 | `max_pdf_pages` | 2 000 | Pages of one PDF |
 | `max_pdf_chars_per_page` | 200 000 | Characters pdfium reports on one PDF page |
-| `pdf_timeout` | 60 s | Wall-clock time for one PDF, waiting for the PDF engine included |
-| `max_text_bytes` | 100 MiB | Text extracted from one document |
+| `pdf_timeout` | 60 s | Wall-clock time for one PDF once the PDF engine is taken; also the longest wait for the engine |
+| `max_text_bytes` | 100 MiB | Text extracted from one document, plus 64 bytes for each block, inline run and PDF line |
 
-`pdf_timeout` is checked between pdfium calls. A single pdfium call cannot be
-interrupted, so a hostile PDF can hold the engine past the timeout. pdfium is
-not thread-safe across documents, so PDFs are parsed one at a time; at most 64
-documents wait for the engine, and further ones are rejected as busy.
+pdfium is not thread-safe across documents, so all PDFs are parsed on one
+dedicated thread, one at a time. At most 64 documents wait for it; further
+ones, and documents that wait longer than `pdf_timeout`, are rejected as busy
+(429 with `Retry-After`). Callers wait asynchronously, so a queued document
+holds no thread. `pdf_timeout` is checked between pdfium calls. A single
+pdfium call cannot be interrupted, so a hostile PDF can keep the engine busy
+past the timeout. A caller still gets an answer within `pdf_timeout` of
+waiting plus `pdf_timeout` and 2 s of reading, and the thread is never joined,
+so it does not delay shutdown.
 
 ## License
 

@@ -1,6 +1,7 @@
 //! XLSX, XLSM, XLSB and legacy XLS workbooks.
 //!
-//! Each worksheet becomes one level-2 heading (the sheet name) and one table
+//! Each worksheet becomes one level-2 heading (the sheet name, with
+//! "(hidden)" or "(very hidden)" for sheets Excel does not show) and one table
 //! over the bounding box of its non-empty cells; the first row is the header.
 //! A sheet whose table does not fit the remaining
 //! [`ParseLimits::max_table_cells`] is replaced by a note, and the text copied
@@ -14,6 +15,7 @@
 //! hostile files could exhaust memory, the stack or the CPU.
 
 mod cells;
+mod compound;
 mod numfmt;
 mod shared;
 mod xls;
@@ -22,119 +24,40 @@ mod xlsx;
 
 use std::path::Path;
 
-use async_trait::async_trait;
 use bytes::Bytes;
 
-use crate::domain::error::DomainError;
-use crate::domain::ir::{
-    DocumentBuilder, Inline, ParsedBlock, ParsedDocument, ParsedSource, TableBlock, TableCell,
-    TableRow,
-};
-use crate::domain::parser::FileParserBackend;
+use crate::domain::error::{DomainError, ParseLimit};
+use crate::domain::ir::{Inline, ParsedBlock, TableBlock, TableCell, TableRow};
+use crate::domain::mime_table;
 
-use super::bounded_read::read_bounded;
-use super::limits::{ParseLimits, TableBudget, limit_exceeded};
-use super::ooxml::Archive;
-
-/// Ceiling applied by [`SpreadsheetParser::new`], matching `FileParserConfig`'s
-/// `max_file_size_mb` default; `Gear::init` passes the configured value.
-const DEFAULT_MAX_BYTES: u64 = 100 * 1024 * 1024;
-
-const SUPPORTED_EXTENSIONS: &[&str] = &["xlsx", "xls", "xlsm", "xlsb"];
+use super::backend::{DocumentFormat, DocumentParser, ReadDocument, run_blocking};
+use super::limits::{BLOCK_COST, ParseLimits, TableBudget, TextBudget, limit_exceeded};
+use super::ooxml::{self, Archive};
 
 /// Signature of an OLE compound file (legacy `.xls`).
 const CFB_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 
+/// Spreadsheets: XLSX, XLSM, XLSB and legacy XLS, told apart by content.
+pub struct Spreadsheet;
+
 /// Spreadsheet parser.
-pub struct SpreadsheetParser {
-    max_bytes: u64,
-    limits: ParseLimits,
-}
+pub type SpreadsheetParser = DocumentParser<Spreadsheet>;
 
-impl SpreadsheetParser {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            max_bytes: DEFAULT_MAX_BYTES,
-            limits: ParseLimits::default(),
-        }
-    }
+impl DocumentFormat for Spreadsheet {
+    const ID: &'static str = "spreadsheet";
+    const EXTENSIONS: &'static [&'static str] = &["xlsx", "xls", "xlsm", "xlsb"];
 
-    /// Caps how much of a local file is read into memory.
-    #[must_use]
-    pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
-        self.max_bytes = max_bytes;
-        self
-    }
-
-    /// Replaces the default [`ParseLimits`].
-    #[must_use]
-    pub fn with_limits(mut self, limits: ParseLimits) -> Self {
-        self.limits = limits;
-        self
-    }
-
-    async fn parse(
-        &self,
+    async fn read(
         bytes: Bytes,
-        source: ParsedSource,
-        filename: Option<&str>,
-    ) -> Result<ParsedDocument, DomainError> {
-        let limits = self.limits.clone();
-        let workbook = tokio::task::spawn_blocking(move || read_workbook(bytes, &limits))
-            .await
-            .map_err(|e| DomainError::parse_error(format!("Spreadsheet task failed: {e}")))??;
-
-        let mut builder = DocumentBuilder::new(source)
-            .content_type(workbook.format.mime())
-            .blocks(workbook.blocks);
-        if let Some(title) = workbook.title.as_deref().or(filename) {
-            builder = builder.title(title);
-        }
-        if let Some(filename) = filename {
-            builder = builder.original_filename(filename);
-        }
-        Ok(builder.build())
-    }
-}
-
-impl Default for SpreadsheetParser {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl FileParserBackend for SpreadsheetParser {
-    fn id(&self) -> &'static str {
-        "spreadsheet"
-    }
-
-    fn supported_extensions(&self) -> &'static [&'static str] {
-        SUPPORTED_EXTENSIONS
-    }
-
-    async fn parse_local_path(
-        &self,
-        path: &Path,
-        _resolved_content_type: Option<&str>,
-    ) -> Result<ParsedDocument, DomainError> {
-        let bytes = read_bounded(path, self.max_bytes).await?;
-        let filename = path.file_name().and_then(|s| s.to_str());
-        let source = ParsedSource::LocalPath(path.display().to_string());
-        self.parse(Bytes::from(bytes), source, filename).await
-    }
-
-    async fn parse_bytes(
-        &self,
-        filename_hint: Option<&str>,
-        _content_type: Option<&str>,
-        bytes: Bytes,
-    ) -> Result<ParsedDocument, DomainError> {
-        let source = ParsedSource::Uploaded {
-            original_name: filename_hint.unwrap_or("unknown").to_owned(),
-        };
-        self.parse(bytes, source, filename_hint).await
+        _content_type: Option<String>,
+        limits: ParseLimits,
+    ) -> Result<ReadDocument, DomainError> {
+        let workbook = run_blocking("spreadsheet", move || read_workbook(bytes, &limits)).await?;
+        Ok(ReadDocument::new(
+            workbook.format.mime(),
+            workbook.title,
+            workbook.blocks,
+        ))
     }
 }
 
@@ -150,10 +73,10 @@ enum Format {
 impl Format {
     fn mime(self) -> &'static str {
         match self {
-            Self::Xls => "application/vnd.ms-excel",
-            Self::Xlsx => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            Self::Xlsm => "application/vnd.ms-excel.sheet.macroEnabled.12",
-            Self::Xlsb => "application/vnd.ms-excel.sheet.binary.macroEnabled.12",
+            Self::Xls => mime_table::XLS,
+            Self::Xlsx => mime_table::XLSX,
+            Self::Xlsm => mime_table::XLSM,
+            Self::Xlsb => mime_table::XLSB,
         }
     }
 }
@@ -164,11 +87,41 @@ struct Workbook {
     blocks: Vec<ParsedBlock>,
 }
 
+/// Whether Excel shows a sheet tab. Hidden sheets are still read; the heading
+/// says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum Visibility {
+    #[default]
+    Visible,
+    /// The user can unhide it.
+    Hidden,
+    /// Only a macro can unhide it.
+    VeryHidden,
+}
+
+impl Visibility {
+    /// The sheet-state number BIFF8 and BIFF12 use (`hsState`).
+    fn from_state(state: u8) -> Self {
+        match state {
+            1 => Self::Hidden,
+            2 => Self::VeryHidden,
+            _ => Self::Visible,
+        }
+    }
+
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Visible => "",
+            Self::Hidden => " (hidden)",
+            Self::VeryHidden => " (very hidden)",
+        }
+    }
+}
+
 /// Collects the blocks of a workbook under the document-wide budgets.
 pub(super) struct Sink {
     budget: TableBudget,
-    text_left: usize,
-    max_text: usize,
+    text: TextBudget,
     /// Text copied into cells so far, refunds included: skipped sheets give
     /// their text back to the budget, but not to this ceiling, so the total
     /// copying work stays bounded too.
@@ -181,8 +134,7 @@ impl Sink {
     fn new(limits: &ParseLimits) -> Self {
         Self {
             budget: TableBudget::new(limits),
-            text_left: limits.max_text_bytes,
-            max_text: limits.max_text_bytes,
+            text: TextBudget::new(limits),
             copied: 0,
             max_copied: limits.max_text_bytes.saturating_mul(4),
             blocks: Vec::new(),
@@ -204,11 +156,11 @@ impl Sink {
         col: u32,
         text: String,
     ) -> Result<bool, DomainError> {
-        self.charge_text(text.len())?;
+        self.text.charge(text.len())?;
         self.copied = self.copied.saturating_add(text.len());
         if self.copied > self.max_copied {
             return Err(limit_exceeded(
-                "max_text_bytes",
+                ParseLimit::MaxTextBytes,
                 format!(
                     "cells copy more than {} bytes of text, skipped sheets included",
                     self.max_copied
@@ -219,23 +171,26 @@ impl Sink {
         Ok(sheet.push(row, col, text))
     }
 
-    fn charge_text(&mut self, bytes: usize) -> Result<(), DomainError> {
-        self.text_left = self.text_left.checked_sub(bytes).ok_or_else(|| {
-            limit_exceeded(
-                "max_text_bytes",
-                format!("document text exceeds {} bytes", self.max_text),
-            )
-        })?;
-        Ok(())
-    }
-
     /// Appends the heading and table (or a skip note) for one sheet.
-    fn finish_sheet(&mut self, name: &str, sheet: SheetCells) -> Result<(), DomainError> {
-        // The heading, and possibly a note quoting the name, cost text too.
-        self.charge_text(name.len().saturating_mul(2))?;
+    fn finish_sheet(
+        &mut self,
+        name: &str,
+        visibility: Visibility,
+        sheet: SheetCells,
+    ) -> Result<(), DomainError> {
+        let heading = format!("{name}{}", visibility.suffix());
+        // The heading costs text too, and it and the table (or the skip note)
+        // are a block each.
+        self.text
+            .charge(heading.len().saturating_add(2 * BLOCK_COST))?;
         let text_bytes = sheet.text_bytes;
-        if !emit_sheet(name, sheet, &mut self.budget, &mut self.blocks) {
-            self.text_left = self.text_left.saturating_add(text_bytes);
+        if !emit_sheet(&heading, sheet, &mut self.budget, &mut self.blocks) {
+            self.text.refund(text_bytes);
+            let note = skipped_note_text(name, self.budget.remaining());
+            self.text.charge(note.len())?;
+            self.blocks.push(ParsedBlock::Paragraph {
+                inlines: vec![Inline::plain(note)],
+            });
         }
         Ok(())
     }
@@ -257,40 +212,36 @@ fn read_workbook(bytes: Bytes, limits: &ParseLimits) -> Result<Workbook, DomainE
         ));
     }
     let mut archive = Archive::open(bytes, "spreadsheet", limits)?;
-    if is_xlsb(&mut archive)? {
-        let title = xlsb::read(archive, limits, &mut sink)?;
+    let root = archive.read_rels("")?;
+    // One lookup decides the format and is what the reader then opens.
+    let workbook_part = ooxml::main_part(&archive, &root, &["xl/workbook.bin", "xl/workbook.xml"])
+        .ok_or_else(|| DomainError::parse_error("Failed to parse spreadsheet: no workbook part"))?;
+    let title = ooxml::package_title(&mut archive, &root)?;
+    if is_binary(&workbook_part) {
+        xlsb::read(archive, &workbook_part, limits, &mut sink)?;
         return Ok(Workbook {
             format: Format::Xlsb,
             title,
             blocks: sink.blocks,
         });
     }
-    let info = xlsx::read(archive, limits, &mut sink)?;
+    let info = xlsx::read(archive, &workbook_part, limits, &mut sink)?;
     Ok(Workbook {
         format: if info.macro_enabled {
             Format::Xlsm
         } else {
             Format::Xlsx
         },
-        title: info.title,
+        title,
         blocks: sink.blocks,
     })
 }
 
-/// Whether the package's main part is a binary (XLSB) workbook, judged from
-/// the officeDocument relationship like every other part lookup.
-fn is_xlsb(archive: &mut Archive) -> Result<bool, DomainError> {
-    let root = archive.read_rels("")?;
-    let target = root
-        .of_type("officeDocument")
-        .find(|r| !r.external)
-        .map(|r| r.target.clone());
-    Ok(match target {
-        Some(target) => Path::new(&target)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("bin")),
-        None => archive.contains("xl/workbook.bin"),
-    })
+/// Whether the workbook part is binary (XLSB).
+fn is_binary(workbook_part: &str) -> bool {
+    Path::new(workbook_part)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("bin"))
 }
 
 /// The non-empty cells of one sheet, collected sparsely.
@@ -336,36 +287,26 @@ impl SheetCells {
     }
 }
 
-/// Appends the heading and table (or a skip note) for one sheet; `false` when
-/// the sheet's cells were skipped.
+/// Appends the heading and table for one sheet; `false` when the sheet's
+/// cells were skipped, in which case the caller appends the skip note.
 fn emit_sheet(
-    name: &str,
+    heading: &str,
     sheet: SheetCells,
     budget: &mut TableBudget,
     out: &mut Vec<ParsedBlock>,
 ) -> bool {
     out.push(ParsedBlock::Heading {
         level: 2,
-        inlines: vec![Inline::plain(name)],
+        inlines: vec![Inline::plain(heading)],
     });
     let (Some((r0, r1)), Some((c0, c1))) = (sheet.rows, sheet.cols) else {
-        if sheet.overflow {
-            out.push(skipped_note(name, budget.remaining()));
-            return false;
-        }
-        return true;
+        return !sheet.overflow;
     };
     let rows = usize::try_from(r1 - r0).map_or(usize::MAX, |n| n.saturating_add(1));
     let cols = usize::try_from(c1 - c0).map_or(usize::MAX, |n| n.saturating_add(1));
-    if sheet.overflow || !budget.try_charge(rows, cols) {
-        let shown: String = name.chars().take(64).collect();
-        tracing::warn!(
-            sheet = %shown,
-            rows,
-            cols,
-            "sheet skipped: over the table-cell limit"
-        );
-        out.push(skipped_note(name, budget.remaining()));
+    // The cells were gathered by the sink, not built into a grid: nothing to
+    // spend for them.
+    if !budget.admit("spreadsheet", rows, cols, 0, sheet.overflow) {
         return false;
     }
 
@@ -399,12 +340,10 @@ fn emit_sheet(
     true
 }
 
-fn skipped_note(name: &str, remaining: usize) -> ParsedBlock {
-    ParsedBlock::Paragraph {
-        inlines: vec![Inline::plain(format!(
-            "[Sheet \"{name}\" skipped: it does not fit the remaining limit of {remaining} table cells]"
-        ))],
-    }
+fn skipped_note_text(name: &str, remaining: usize) -> String {
+    format!(
+        "Sheet \"{name}\" skipped: it does not fit the remaining limit of {remaining} table cells"
+    )
 }
 
 #[cfg(test)]

@@ -5,8 +5,8 @@
 //! order: text as paragraphs, or list items where a bullet is set on the
 //! paragraph or inherited from the layout and master; tables; pictures with
 //! alternative text; `SmartArt` text. Slides are separated by page breaks.
-//! Speaker notes, comments, charts and slide furniture (date, footer, slide
-//! number) are left out.
+//! Speaker notes, comments, charts and slide furniture (footer, date and
+//! slide-number placeholders) are left out.
 
 mod diagram;
 mod slide;
@@ -15,122 +15,38 @@ mod styles;
 mod tests;
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::rc::Rc;
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use quick_xml::events::Event;
 
-use crate::domain::error::DomainError;
-use crate::domain::ir::{DocumentBuilder, Inline, ParsedBlock, ParsedDocument, ParsedSource};
-use crate::domain::parser::FileParserBackend;
+use crate::domain::error::{DomainError, ParseLimit};
+use crate::domain::ir::{Inline, ParsedBlock};
+use crate::domain::mime_table;
 
-use super::bounded_read::read_bounded;
-use super::limits::ParseLimits;
+use super::backend::{DocumentFormat, DocumentParser, ReadDocument, run_blocking};
+use super::limits::{Budgets, ParseLimits, limit_exceeded};
 use super::ooxml::{self, Archive, Events, Relationships, xml};
-use slide::{Budgets, SlideContext, read_slide};
+use slide::{SlideContext, read_slide};
 use styles::{Inherited, PartStyles, read_part_styles};
 
-/// Ceiling applied by [`PptxParser::new`], matching `FileParserConfig`'s
-/// `max_file_size_mb` default; `Gear::init` passes the configured value.
-const DEFAULT_MAX_BYTES: u64 = 100 * 1024 * 1024;
-
-const SUPPORTED_EXTENSIONS: &[&str] = &["pptx"];
-
-const CONTENT_TYPE: &str =
-    "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+/// PPTX: slides and their shapes.
+pub struct Pptx;
 
 /// PPTX parser.
-pub struct PptxParser {
-    max_bytes: u64,
-    limits: ParseLimits,
-}
+pub type PptxParser = DocumentParser<Pptx>;
 
-impl PptxParser {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            max_bytes: DEFAULT_MAX_BYTES,
-            limits: ParseLimits::default(),
-        }
-    }
+impl DocumentFormat for Pptx {
+    const ID: &'static str = "pptx";
+    const EXTENSIONS: &'static [&'static str] = &["pptx"];
 
-    /// Caps how much of a local file is read into memory.
-    #[must_use]
-    pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
-        self.max_bytes = max_bytes;
-        self
-    }
-
-    /// Replaces the default [`ParseLimits`].
-    #[must_use]
-    pub fn with_limits(mut self, limits: ParseLimits) -> Self {
-        self.limits = limits;
-        self
-    }
-
-    async fn parse(
-        &self,
+    async fn read(
         bytes: Bytes,
-        source: ParsedSource,
-        filename: Option<&str>,
-    ) -> Result<ParsedDocument, DomainError> {
-        let limits = self.limits.clone();
-        let deck = tokio::task::spawn_blocking(move || read_deck(bytes, &limits))
-            .await
-            .map_err(|e| DomainError::parse_error(format!("PPTX task failed: {e}")))??;
-
-        let mut builder = DocumentBuilder::new(source)
-            .content_type(CONTENT_TYPE)
-            .blocks(deck.blocks);
-        if let Some(title) = deck.title.as_deref().or(filename) {
-            builder = builder.title(title);
-        }
-        if let Some(filename) = filename {
-            builder = builder.original_filename(filename);
-        }
-        Ok(builder.build())
-    }
-}
-
-impl Default for PptxParser {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl FileParserBackend for PptxParser {
-    fn id(&self) -> &'static str {
-        "pptx"
-    }
-
-    fn supported_extensions(&self) -> &'static [&'static str] {
-        SUPPORTED_EXTENSIONS
-    }
-
-    async fn parse_local_path(
-        &self,
-        path: &Path,
-        _resolved_content_type: Option<&str>,
-    ) -> Result<ParsedDocument, DomainError> {
-        let bytes = read_bounded(path, self.max_bytes).await?;
-        let filename = path.file_name().and_then(|s| s.to_str());
-        let source = ParsedSource::LocalPath(path.display().to_string());
-        self.parse(Bytes::from(bytes), source, filename).await
-    }
-
-    async fn parse_bytes(
-        &self,
-        filename_hint: Option<&str>,
-        _content_type: Option<&str>,
-        bytes: Bytes,
-    ) -> Result<ParsedDocument, DomainError> {
-        let source = ParsedSource::Uploaded {
-            original_name: filename_hint.unwrap_or("unknown").to_owned(),
-        };
-        self.parse(bytes, source, filename_hint).await
+        _content_type: Option<String>,
+        limits: ParseLimits,
+    ) -> Result<ReadDocument, DomainError> {
+        let deck = run_blocking("PPTX", move || read_deck(bytes, &limits)).await?;
+        Ok(ReadDocument::new(mime_table::PPTX, deck.title, deck.blocks))
     }
 }
 
@@ -146,29 +62,9 @@ struct Deck {
 fn read_deck(bytes: Bytes, limits: &ParseLimits) -> Result<Deck, DomainError> {
     let mut archive = Archive::open(bytes, "PPTX", limits)?;
     let root = archive.read_rels("")?;
-    let presentation = root
-        .of_type("officeDocument")
-        .find(|r| !r.external && archive.contains(&r.target))
-        .map(|r| r.target.clone())
-        .or_else(|| {
-            archive
-                .contains("ppt/presentation.xml")
-                .then(|| "ppt/presentation.xml".to_owned())
-        })
+    let presentation = ooxml::main_part(&archive, &root, &["ppt/presentation.xml"])
         .ok_or_else(|| parse_error("no presentation part"))?;
-    let core = root
-        .of_type("core-properties")
-        .find(|r| !r.external)
-        .map(|r| r.target.clone())
-        .or_else(|| {
-            archive
-                .contains("docProps/core.xml")
-                .then(|| "docProps/core.xml".to_owned())
-        });
-    let title = match core {
-        Some(part) => ooxml::core_title(&mut archive, &part)?,
-        None => None,
-    };
+    let title = ooxml::package_title(&mut archive, &root)?;
 
     let presentation_xml = archive
         .read_xml(&presentation)?
@@ -177,6 +73,12 @@ fn read_deck(bytes: Bytes, limits: &ParseLimits) -> Result<Deck, DomainError> {
     drop(presentation_xml);
     let rels = archive.read_rels(&presentation)?;
     let slides = slide_parts(&rels, &slide_ids);
+    if slides.len() > limits.max_sheets {
+        return Err(limit_exceeded(
+            ParseLimit::MaxSheets,
+            format!("{} slides, limit {}", slides.len(), limits.max_sheets),
+        ));
+    }
 
     let mut styles = StyleCache::default();
     let mut budgets = Budgets::new(limits);
@@ -197,6 +99,7 @@ fn read_deck(bytes: Bytes, limits: &ParseLimits) -> Result<Deck, DomainError> {
         diagram::splice(&mut archive, &mut slide, &mut budgets)?;
 
         if !blocks.is_empty() {
+            budgets.text.charge_block()?;
             blocks.push(ParsedBlock::PageBreak);
         }
         let heading = if slide.title.is_empty() {
@@ -206,6 +109,7 @@ fn read_deck(bytes: Bytes, limits: &ParseLimits) -> Result<Deck, DomainError> {
         };
         // Headings count as text, so empty slides cannot add output for free.
         budgets.text.charge(heading.len())?;
+        budgets.text.charge_block()?;
         blocks.push(ParsedBlock::Heading {
             level: 2,
             inlines: vec![Inline::plain(heading)],
@@ -219,13 +123,24 @@ fn read_deck(bytes: Bytes, limits: &ParseLimits) -> Result<Deck, DomainError> {
 fn slide_ids(text: &str, limits: &ParseLimits) -> Result<Vec<String>, DomainError> {
     let mut events = Events::new(text, limits, "PPTX");
     let mut ids = Vec::new();
+    let max_ids = limits.max_sheets.saturating_mul(2);
     let mut in_list = false;
     loop {
         match events.next()? {
             Event::Start(e) if xml::qname(&e) == "p:sldIdLst" => in_list = true,
-            Event::End(e) if e.name().into_inner() == "p:sldIdLst" => in_list = false,
+            // Nothing after the list is needed, so a later error cannot lose it.
+            Event::End(e) if e.name().into_inner() == "p:sldIdLst" => return Ok(ids),
             Event::Start(e) | Event::Empty(e) if in_list && xml::qname(&e) == "p:sldId" => {
                 if let Some(id) = xml::prefixed_attr(&e, "id") {
+                    // Duplicate and dangling ids are dropped later, so the
+                    // list may run somewhat past the slide limit, not to
+                    // millions of entries.
+                    if ids.len() >= max_ids {
+                        return Err(limit_exceeded(
+                            ParseLimit::MaxSheets,
+                            format!("slide list longer than {max_ids} entries"),
+                        ));
+                    }
                     ids.push(id);
                 }
             }
@@ -247,7 +162,7 @@ fn slide_parts(rels: &Relationships, ids: &[String]) -> Vec<(usize, String)> {
         .iter()
         .enumerate()
         .filter_map(|(position, id)| rels.get(id).map(|rel| (position, rel)))
-        .filter(|(_, rel)| !rel.external && rel.rel_type.rsplit('/').next() == Some("slide"))
+        .filter(|(_, rel)| !rel.external && rel.is_type("slide"))
         .filter(|(_, rel)| fresh(&rel.target))
         .map(|(position, rel)| (position, rel.target.clone()))
         .collect();
@@ -283,7 +198,7 @@ impl StyleCache {
         archive: &mut Archive,
         slide_rels: &Relationships,
     ) -> Result<Inherited, DomainError> {
-        let Some(layout) = internal(slide_rels, "slideLayout") else {
+        let Some(layout) = slide_rels.internal("slideLayout") else {
             return Ok(Inherited::default());
         };
         let key = layout.to_ascii_lowercase();
@@ -291,7 +206,7 @@ impl StyleCache {
             master.clone()
         } else {
             let rels = tolerate(archive.read_rels(&layout), "layout relationships")?;
-            let master = internal(&rels, "slideMaster");
+            let master = rels.internal("slideMaster");
             self.masters.insert(key, master.clone());
             master
         };
@@ -319,10 +234,4 @@ impl StyleCache {
         self.parts.insert(key, Rc::clone(&styles));
         Ok(styles)
     }
-}
-
-fn internal(rels: &Relationships, kind: &str) -> Option<String> {
-    rels.of_type(kind)
-        .find(|r| !r.external)
-        .map(|r| r.target.clone())
 }
