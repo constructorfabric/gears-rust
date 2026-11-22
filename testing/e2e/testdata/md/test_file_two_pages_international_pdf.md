@@ -7,40 +7,55 @@ content-type: application/pdf
 
 Multilingual UTF-8 Characters Test
 ==================================
+
 Language Samples
 ----------------
+
 English: Hello World
 Spanish: ¡Hola! ¿Cómo estás?
 French: Bonjour. Ça va ?
 Russian: Привет. Как дела?
 German: Guten Tag. Wie geht’s?
-مرحبا بالعالم :Arabic
-שלום עולם :Hebrew
+Arabic: مرحبا بالعالم
+Hebrew: שלום עולם
 Chinese (Simplified): 你好 世界
 Japanese:こんにちは
+
 ------------------------------
 Common Typographic Symbols
 ------------------------------
+
 Dashes:
- - Hyphen: -
- - En dash: –
- - Em dash: —
- - Long dash: ——
+
+- Hyphen: -
+- En dash: –
+- Em dash: —
+- Long dash: ——
+
 Quotes:
- - “Double quotes”
- - ‘Single quotes’
+
+- “Double quotes”
+- ‘Single quotes’
+
 Punctuation & Marks:
- - Ellipsis: …
- - Middle dot: ·
+
+- Ellipsis: …
+- Middle dot: ·
+
+
+
+---
 
 - Bullet: •
- - Section: §
- - Copyright: ©
- - Trademark: ™
- - Registered: ®
+- Section: §
+- Copyright: ©
+- Trademark: ™
+- Registered: ®
+
 Math & Symbols:
- - Not equal: ≠
- - Plus-minus: ±
- - Infinity: ∞
- - Degree: °
- - Arrow: →
+
+- Not equal: ≠
+- Plus-minus: ±
+- Infinity: ∞
+- Degree: °
+- Arrow: →

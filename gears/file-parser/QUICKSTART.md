@@ -3,9 +3,11 @@
 Converts various document formats into a unified structured representation. Extracts text, formatting, and metadata from files and returns them as document blocks with inline elements.
 
 **Supported formats:**
-- Documents: PDF, DOCX, plain text, Markdown, HTML
-- Images: PNG, JPG, JPEG, WebP, GIF (OCR-capable)
-- Legacy formats: DOC, RTF, ODT, XLS, XLSX, PPT, PPTX (basic support)
+- Documents: PDF, DOCX, HTML, plain text, Markdown, log files
+- Spreadsheets: XLSX, XLSM, XLSB, XLS
+- Presentations: PPTX
+- Images: PNG, JPG, JPEG, WebP, GIF (returned as a base64 data URI; no OCR)
+- DOC, RTF, ODT, PPT: stub only; the result is a placeholder with a short text or base64 preview
 
 **Input methods:**
 - Upload files directly
@@ -42,13 +44,18 @@ curl -s http://127.0.0.1:8087/cf/file-parser/v1/info | python3 -m json.tool
 {
     "supported_extensions": {
         "plain_text": ["txt", "log", "md"],
-        "kreuzberg": ["pdf", "html", "htm", "xlsx", "xls", "xlsm", "xlsb", "pptx"],
+        "spreadsheet": ["xlsx", "xls", "xlsm", "xlsb"],
+        "html": ["html", "htm"],
+        "pptx": ["pptx"],
+        "pdf": ["pdf"],
         "docx": ["docx"],
         "image": ["png", "jpg", "jpeg", "webp", "gif"],
         "generic_stub": ["doc", "rtf", "odt", "xls", "xlsx", "ppt", "pptx"]
     }
 }
 ```
+
+The keys are parser ids; their order in the response is not fixed. When two parsers list the same extension, the one registered first handles it, so `xls`, `xlsx` and `pptx` go to `spreadsheet` and `pptx`, not to `generic_stub`.
 
 ### Upload and Parse a File
 

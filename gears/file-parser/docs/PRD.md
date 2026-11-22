@@ -53,7 +53,7 @@ Platform gears — most notably the Chat Engine and LLM Gateway — need to proc
 
 The gear was designed from the start with extensibility in mind: the `FileParserBackend` trait defines the plugin contract, and `FileParserService` acts as the gateway that routes requests to the correct plugin.
 
-The previous implementation had four separate format-specific plugins (`HtmlParser`, `PdfParser`, `XlsxParser`, `PptxParser`) each backed by different libraries (`tl`, `pdf-extract`, `calamine`, `pptx-to-md`), resulting in fragmented logic, inconsistent output quality, and no support for DOCX or images. The current version consolidates the four PDF/HTML/spreadsheet/presentation plugins into a single `KreuzbergParser`, adds `DocxParser` and `ImageParser`, and retains `PlainTextParser` and `StubParser` — all within the same gateway+plugin architecture.
+An earlier version routed PDF, HTML, spreadsheets and presentations through the `kreuzberg` crate and DOCX through `docx-rust`. Both are gone. Uploaded documents are untrusted, and the general-purpose libraries tried for spreadsheets (calamine) and HTML (html5ever) sized allocations from values the file declares or ran super-linear algorithms on hostile input. The current version has one plugin per format: `SpreadsheetParser`, `HtmlParser`, `PptxParser` and `DocxParser` are the crate's own code with explicit resource limits, and `PdfParser` reads PDFs through libpdfium, embedded at build time. `PlainTextParser`, `ImageParser` and `StubParser` remain — all within the same gateway+plugin architecture.
 
 ### 1.3 Goals (Business Outcomes)
 
@@ -73,7 +73,8 @@ The previous implementation had four separate format-specific plugins (`HtmlPars
 | IR (Intermediate Representation) | `ParsedDocument` — the internal data model produced by any parser plugin and consumed by the Markdown renderer |
 | Parser plugin | A Rust struct implementing `FileParserBackend`; declares the extensions it handles and contains all format-specific logic |
 | Parser gateway | `FileParserService` — routes each request to the correct plugin; contains no format-specific logic |
-| kreuzberg | Third-party Rust crate (`=4.10.4`, MIT) used by `KreuzbergParser` to handle PDF, HTML, XLSX, and PPTX |
+| libpdfium | PDFium as a native library (BSD-3-Clause), built by bblanchon/pdfium-binaries and embedded by the crate's build script; used by `PdfParser` |
+| `ParseLimits` | Public struct of resource limits (ZIP sizes, nesting depth, table cells, pages, time, text) that the document parsers enforce on each input |
 | `parse-local` | Endpoint family that parses files already present on the server filesystem |
 | `allowed_local_base_dir` | Mandatory config field constraining which filesystem paths `parse-local` may access |
 | Stub parser | `StubParser` — fallback plugin that returns a placeholder document for unsupported legacy formats |
@@ -121,7 +122,7 @@ The gear requires an `allowed_local_base_dir` config entry to be set at startup.
 
 ### 4.2 Out of Scope
 
-- OCR for scanned or image-only documents (future enhancement — kreuzberg `ocr` feature + Tesseract; separate PR)
+- OCR for scanned or image-only documents (future enhancement). Invisible OCR text layers already present in a PDF are read.
 - Document editing or modification
 - Long-term document storage
 - Format conversion other than Markdown rendering
@@ -148,14 +149,21 @@ Currently registered plugins (in priority order):
 | Plugin | Extensions |
 |---|---|
 | `PlainTextParser` | `txt`, `log`, `md` |
-| `KreuzbergParser` | `pdf`, `html`, `htm`, `xlsx`, `xls`, `xlsm`, `xlsb`, `pptx` |
+| `SpreadsheetParser` | `xlsx`, `xls`, `xlsm`, `xlsb` |
+| `HtmlParser` | `html`, `htm` |
+| `PptxParser` | `pptx` |
+| `PdfParser` | `pdf` |
 | `DocxParser` | `docx` |
 | `ImageParser` | `png`, `jpg`, `jpeg`, `webp`, `gif` |
-| `StubParser` (fallback) | `doc`, `rtf`, `odt`, `xls`, `xlsx`, `ppt`, `pptx` |
+| `StubParser` (fallback) | `doc`, `rtf`, `odt`, `xls`, `xlsx`, `ppt`, `pptx` (`xls`, `xlsx` and `pptx` reach the earlier parsers first) |
 
-**Known limitations of `KreuzbergParser` (kreuzberg 4.9.4 through 4.10.4)**:
-- PPTX multi-slide presentations: slides are emitted as headings rather than distinct nodes; `PageBreak` blocks between slides are not produced.
-- PPTX tables: structured `Table` blocks are not produced; table cell content is extracted as paragraphs.
+**Current limitations**:
+- No OCR: image-only (scanned) PDFs produce no text. Invisible OCR text layers in a PDF are read.
+- PDF structure (headings, lists, paragraphs, reading order of columns) is inferred from glyph size and position and can be wrong.
+- Tables are not reconstructed from PDFs; their text comes out as lines.
+- DOCX and PPTX notes and comments, and DOCX headers and footers, are not extracted.
+- PDF parsing is serialised through one in-process engine. `pdf_timeout` (default 60 s) is checked between pdfium calls, so one hostile PDF can hold the engine longer; at most 64 PDFs wait, and further ones are rejected as busy.
+- musl targets get no bundled libpdfium; PDF parsing there needs `FILE_PARSER_PDFIUM_RUNTIME_LIB`.
 
 **Actors**: `fdd-file-parser-actor-api-user`
 
@@ -172,6 +180,8 @@ The system SHALL support registration of additional parser plugins without requi
 - [ ] `p1` - **ID**: `cpt-cf-file-parser-fr-extraction`
 
 System SHALL extract text content and preserve document structure (headings, paragraphs, lists, tables, code blocks, quotes, page breaks). Inline text annotations (bold, italic, underline, strikethrough, code, hyperlinks) SHALL be preserved in the parsed output.
+
+System SHALL bound the work one document can cause. The spreadsheet, HTML, PPTX, PDF and DOCX parsers enforce `ParseLimits` (ZIP entry count, per-entry and total inflated size, compression ratio, XML nesting depth, table cells and columns, sheets or slides, HTML nodes, PDF pages, characters per PDF page, PDF time, extracted text); a document over a limit SHALL fail with an error naming the limit. Defaults are listed in DESIGN (`cpt-cf-file-parser-constraint-parse-limits`).
 
 **Actors**: `fdd-file-parser-actor-api-user`
 
@@ -233,7 +243,7 @@ REST endpoints exposed by the gear:
 
 ### 7.2 External Integration Contracts
 
-No external service contracts. The gear depends only on in-process Rust libraries (`kreuzberg`, `docx-rust`) and the host filesystem for `parse-local` endpoints.
+No external service contracts. The gear depends only on in-process libraries (Rust crates and the embedded libpdfium) and the host filesystem for `parse-local` endpoints.
 
 ## 8. Use Cases
 
@@ -275,30 +285,32 @@ Consumer gear requests parsing of a file already present on the server filesyste
 
 | Dependency | Type | Notes |
 |---|---|---|
-| `kreuzberg =4.10.4` | External library (MIT, no `deny.toml` exception) | Pinned with `=` to prevent silent upgrades, since upstream has changed license before; any bump must re-check the license. Used by `KreuzbergParser`. |
-| `pdfium` | Bundled native library | Included via `bundled-pdfium` feature; no separate install required |
-| `docx-rust` | External library (MIT) | Used by `DocxParser` for DOCX extraction |
+| libpdfium `chromium/7961` | Bundled native library (BSD-3-Clause, plus bundled third-party components) | Downloaded by `build.rs` from bblanchon/pdfium-binaries, verified by SHA-256 per target, embedded; no separate install on the pinned targets. Notices in `file-parser/THIRD_PARTY_NOTICES.md`. |
+| `pdfium-render =0.9.5` | External library (MIT OR Apache-2.0) | Bindings to libpdfium, feature `pdfium_7881` |
+| `zip`, `quick-xml`, `cfb`, `encoding_rs` | External libraries (MIT; `encoding_rs` is (Apache-2.0 OR MIT) AND BSD-3-Clause) | ZIP containers, XML, OLE compound files, text encodings |
 | Host filesystem | Runtime | Required for `parse-local` endpoints |
 | toolkit HTTP framework | Internal | REST endpoint registration and body-size enforcement |
 
 ## 11. Assumptions
 
 - All registered parser plugins are stateless and safe to share across concurrent requests.
-- The `bundled-pdfium` feature provides a sufficiently up-to-date PDFium for production PDF parsing.
+- The pinned libpdfium build (`chromium/7961`) is sufficiently up to date for production PDF parsing; bumping it is a deliberate change.
 - The configured `max_file_size_mb` (default 100 MB) is sufficient for current use cases; revision requires an NFR update.
 - Consumer gears calling `parse-local` are trusted to supply valid paths within `allowed_local_base_dir`.
-- `kreuzberg =4.10.4` will remain available on crates.io for the foreseeable future; any upgrade is a deliberate, reviewed action.
+- The pinned pdfium-binaries release stays downloadable from GitHub; offline builds can supply the archive with `FILE_PARSER_PDFIUM_ARCHIVE`.
 
 ## 12. Risks
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| kreuzberg upstream relicenses again (it went MIT → EL-2.0 → MIT) | Low | High | Exact `=` pin; upgrade requires explicit license review; `cargo-deny` license allow-list with no exception for kreuzberg |
-| PPTX multi-slide / table limitations persist in future kreuzberg releases | Medium | Low | Tests marked `#[ignore]` with strict assertions (fixtures are required, not skipped); re-evaluate on upgrade — still present at 4.10.4 |
-| PDFium bundled binary lags security patches | Low | Medium | Track pdfium releases; the PDFium build is pinned by `PDFIUM_VERSION` in `.cargo/config.toml` — bump it there, then run `cargo clean -p kreuzberg` (its build script does not rerun on `PDFIUM_VERSION` changes and reuses the cached PDFium in `OUT_DIR`) and regenerate the e2e goldens with `testing/e2e/suites/file_parser/generate_file_parser_golden.py` in the same commit |
+| One hostile PDF holds the single in-process PDF engine past `pdf_timeout` (a pdfium call cannot be interrupted) | Low | Medium | Deadline checked between pdfium calls; at most 64 PDFs wait and further ones are rejected as busy, so the blocking thread pool is not exhausted. Running pdfium in a separate process would bound it fully (follow-up). |
+| Bundled libpdfium lags security patches | Low | Medium | Track pdfium-binaries releases. To bump: change `PDFIUM_BUILD` and the digest table in `build.rs`, the `pdfium-render` `pdfium_NNNN` feature, and regenerate the e2e goldens with `testing/e2e/suites/file_parser/generate_file_parser_golden.py` in the same commit |
+| PDF structure heuristics misread a layout (headings, columns, lists) | Medium | Low | Rules are few and each has a test; e2e goldens catch regressions |
+| Image-only PDFs yield no text (no OCR) | Medium | Medium | Out of scope for this version; OCR text layers already in the PDF are read |
+| musl builds have no bundled libpdfium | Low | Low | Set `FILE_PARSER_PDFIUM_RUNTIME_LIB` to a libpdfium at runtime; the gear logs at startup when PDF parsing is unavailable |
 | Large document OOM under concurrency | Low | Medium | Configurable size limit enforced before any plugin is invoked; monitor memory usage in production |
 | Plugin registration order conflict (two plugins claim same extension) | Low | Low | First-match semantics are deterministic; document registration order in `gear.rs` |
-| `docx-rust` does not support all DOCX features | Medium | Low | Known limitation; `DocxParser` extracts text and basic structure; rich formatting may be lost |
+| Own OOXML, spreadsheet and HTML parsers miss features of real-world files | Medium | Low | Each parser reads only what reaches the output; extend the parser and its tests when a gap is found |
 
 ## Appendix
 
@@ -312,3 +324,4 @@ Consumer gear requests parsing of a file already present on the server filesyste
 | 2026-04-29 | 0.4.0 | Engineering | Restructured to match cypilot SDLC PRD template. Consolidated four format-specific plugins into `KreuzbergParser` backed by `kreuzberg =4.9.4` (Elastic-2.0). Added `DocxParser` (DOCX), `ImageParser` (PNG/JPG/WebP/GIF), `PlainTextParser` (TXT/MD/LOG). Added inline annotation extraction. Documented kreuzberg 4.9.4 PPTX limitations. |
 | 2026-04-30 | 0.5.0 | Engineering | Rewrote to accurately describe the full gateway+plugin architecture. Corrected Out of Scope (DOCX and images are in scope). Corrected file size limit (100 MB default). Updated Format Support FR to list all registered plugins in priority order. Added Plugin Extensibility FR. Corrected Acceptance Criteria, Dependencies, Assumptions, and Risks to be plugin-generic rather than kreuzberg-specific. Removed incorrect NFR exclusion for DOCX/image SLA. |
 | 2026-11-03 | 0.6.0 | Engineering | Bumped `kreuzberg` `=4.9.8` → `=4.10.4` (MIT again; `deny.toml` Elastic-2.0 exception removed). Re-verified the PPTX multi-slide / table known limitations: still present at 4.10.4. Parser tests now require their fixtures instead of silently skipping (issue #5649). |
+| 2026-11-22 | 0.7.0 | Engineering | Replaced `KreuzbergParser` and `docx-rust` with per-format parsers (own spreadsheet, HTML, PPTX and DOCX code, PDF on embedded libpdfium) and updated format support, limitations, dependencies and risks to match. |

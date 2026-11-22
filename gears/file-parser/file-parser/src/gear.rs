@@ -198,7 +198,7 @@ impl Gear for FileParserGear {
 
         let max_file_size_bytes = cfg.max_file_size_mb.saturating_mul(BYTES_IN_MB);
 
-        // The two backends that read a whole local file into memory get the
+        // Backends that read a whole local file into memory get the
         // configured ceiling, so their bounded reads agree with the
         // service-level check rather than a compiled-in default.
         let parsers: Vec<Arc<dyn crate::domain::parser::FileParserBackend>> = vec![

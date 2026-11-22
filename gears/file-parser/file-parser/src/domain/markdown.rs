@@ -40,6 +40,15 @@ impl Iterator for MarkdownRenderIter {
             self.block_index += 1;
             let mut chunk = String::new();
             MarkdownRenderer::render_block(block, &mut chunk);
+            // List items end with a single line break; the last one of a
+            // list needs a blank line, or the next paragraph would continue
+            // the item.
+            let next = self.doc.blocks.get(self.block_index);
+            if matches!(block, ParsedBlock::ListItem { .. })
+                && next.is_some_and(|b| !matches!(b, ParsedBlock::ListItem { .. }))
+            {
+                chunk.push('\n');
+            }
             Some(chunk)
         } else {
             None
@@ -265,7 +274,17 @@ impl MarkdownRenderer {
     }
 
     fn render_styled_text(text: &str, style: &crate::domain::ir::InlineStyle, output: &mut String) {
-        let mut wrapped = text.to_owned();
+        // Emphasis markers must touch the text: leading and trailing
+        // whitespace goes outside them ("**a **" is not bold in Markdown).
+        let core = text.trim();
+        if core.is_empty() {
+            output.push_str(text);
+            return;
+        }
+        let start = text.len() - text.trim_start().len();
+        let end = start + core.len();
+        output.push_str(&text[..start]);
+        let mut wrapped = core.to_owned();
 
         // Apply styles in order: code, bold, italic, underline, strike
         // Note: code is handled by Inline::Code variant, not here
@@ -274,8 +293,9 @@ impl MarkdownRenderer {
             wrapped = format!("~~{wrapped}~~");
         }
 
+        // Markdown has no underline (`__x__` is strong emphasis).
         if style.underline {
-            wrapped = format!("__{wrapped}__");
+            wrapped = format!("<u>{wrapped}</u>");
         }
 
         if style.italic {
@@ -291,6 +311,7 @@ impl MarkdownRenderer {
         }
 
         output.push_str(&wrapped);
+        output.push_str(&text[end..]);
     }
 
     fn render_table(table: &crate::domain::ir::TableBlock, output: &mut String) {
@@ -298,22 +319,21 @@ impl MarkdownRenderer {
             return;
         }
 
-        // Determine number of columns from first row
-        let num_cols = table.rows[0].cells.len();
+        // The widest row decides the columns, so no cell is dropped.
+        let num_cols = table.rows.iter().map(|r| r.cells.len()).max().unwrap_or(0);
 
-        // Check if we have a header row
-        let has_header = table.rows.first().is_some_and(|r| r.is_header);
-
-        let (header_row, data_rows) = if has_header {
-            (&table.rows[0], &table.rows[1..])
+        // A Markdown table needs a header row. Without one, an empty header
+        // goes first, rather than the first row twice.
+        let data_rows = if table.rows[0].is_header {
+            Self::render_table_row(&table.rows[0], num_cols, output);
+            &table.rows[1..]
         } else {
-            // Create synthetic header if needed
-            let first_row = &table.rows[0];
-            (first_row, &table.rows[..])
+            output.push('|');
+            for _ in 0..num_cols {
+                output.push_str("  |");
+            }
+            &table.rows[..]
         };
-
-        // Render header row
-        Self::render_table_row(header_row, num_cols, output);
         output.push('\n');
 
         // Render separator row
@@ -811,5 +831,73 @@ mod tests {
         // Should have only 1 chunk (the paragraph, no header)
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].contains("Only content"));
+    }
+
+    fn doc_of(blocks: Vec<ParsedBlock>) -> ParsedDocument {
+        ParsedDocument {
+            id: None,
+            title: None,
+            language: None,
+            meta: ParsedMetadata {
+                source: ParsedSource::LocalPath("t".to_owned()),
+                original_filename: None,
+                content_type: None,
+                created_at: None,
+                modified_at: None,
+                is_stub: false,
+            },
+            blocks,
+        }
+    }
+
+    fn para(inlines: Vec<Inline>) -> ParsedBlock {
+        ParsedBlock::Paragraph { inlines }
+    }
+
+    #[test]
+    fn a_paragraph_after_a_list_is_its_own_block() {
+        let item = ParsedBlock::ListItem {
+            level: 0,
+            ordered: false,
+            blocks: vec![para(vec![Inline::plain("item")])],
+        };
+        let markdown = MarkdownRenderer::render(&doc_of(vec![
+            item.clone(),
+            item,
+            para(vec![Inline::plain("after")]),
+        ]));
+        assert_eq!(markdown, "- item\n- item\n\nafter\n\n");
+    }
+
+    #[test]
+    fn emphasis_markers_touch_the_text() {
+        let bold = InlineStyle {
+            bold: true,
+            ..InlineStyle::default()
+        };
+        let underline = InlineStyle {
+            underline: true,
+            ..InlineStyle::default()
+        };
+        let markdown = MarkdownRenderer::render(&doc_of(vec![para(vec![
+            Inline::styled("Text title ", bold.clone()),
+            Inline::styled("spaced", underline),
+            Inline::styled("  ", bold),
+        ])]));
+        assert_eq!(markdown, "**Text title** <u>spaced</u>  \n\n");
+    }
+
+    #[test]
+    fn a_table_without_a_header_gets_an_empty_one() {
+        let row = |text: &str| TableRow {
+            is_header: false,
+            cells: vec![TableCell {
+                blocks: vec![para(vec![Inline::plain(text)])],
+            }],
+        };
+        let markdown = MarkdownRenderer::render(&doc_of(vec![ParsedBlock::Table(TableBlock {
+            rows: vec![row("a"), row("b")],
+        })]));
+        assert_eq!(markdown, "|  |\n| --- |\n| a |\n| b |\n\n\n");
     }
 }
