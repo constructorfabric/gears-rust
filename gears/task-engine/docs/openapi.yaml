@@ -48,10 +48,21 @@ info:
     header or query parameter is named as sent (`Idempotency-Key`, `cursor`). A route
     outside this contract answers `404` (the removed dependency-change routes, the
     single-task heartbeat and `GET /admin/dlq` included).
+  x-gaps: [G-SEC-25, G-SEC-26, G-WIRE-13, G-SEC-01, G-SEC-03, G-SEC-21, G-EXE-07, G-WAI-03]
+  x-refs: ["DESIGN §3.3", "PRD.md:1044", "Proposals › Waits", "scenarios/CONVENTIONS.md §5", "scenarios/CONVENTIONS.md §6"]
+  x-review: >-
+    Draft basis, provenance markers, model layers, removed endpoints and the ToolKit paging
+    rules that differ from the REST guideline: scenarios/CONVENTIONS.md §5 › Draft OpenAPI.
+    Default page size 25 (G-SEC-25), cursor binding of `$select`/`view` (G-SEC-26),
+    `_secs`/`_at` naming (G-WIRE-13), `503` fail-closed and `Retry-After` on every
+    `429`/`503` (G-SEC-01, G-SEC-03), JSON Pointer field paths (G-SEC-21) and overload
+    as `503` (G-EXE-07) are A.
+
 servers:
   - url: https://api.example.com/api/task_engine/v1
     description: >-
       Base path `/api/task_engine/v1`.
+    x-refs: ["DESIGN.md:966"]
 
 security:
   - bearerAuth: []
@@ -110,6 +121,17 @@ paths:
         (`403`) → missing `Idempotency-Key` (`428`) → trust limits and domain (`400`) →
         schemas and the 64 KiB payload (`400` / `413`) → dedup and idempotency (`409`) →
         sampled queue depth (`429`).
+      x-gaps: [G-CRT-02, G-CRT-03, G-CRT-09, G-CRT-11, G-CRT-22, G-CRT-24, G-CRT-25, G-SEC-13, G-SEC-23, G-CLM-24]
+      x-refs: ["PRD.md:258", "Proposals › Task mutability", "Proposals › Dedup and supersession", "Proposals › Limits and counters"]
+      x-review: >-
+        The `update`-on-parent alternative for children is removed (P). The initial
+        `wait` group is P. No PDP call runs inside the create transaction: authorization
+        and creator checks run before it, at most 3 attempts, then `409` `STATE_CHANGED`
+        (P; G-CRT-19). Check order A (G-CRT-24); depth after dedup A (G-CLM-24);
+        `owner_tenant_id` A (G-SEC-13). `409`: body A (G-CRT-25). `404`: unknown queue A
+        (G-CRT-03); cross-domain links are `404` (G-WAI-41). `400`: `DEAD_LETTER_QUEUE`
+        A (G-CRT-02); `TOO_DEEP` A (G-WAI-39); `DUPLICATE` A (G-WAI-42); `wait` rules A
+        (G-CRT-01). `503`: `Retry-After` A (G-CRT-23).
       parameters:
         - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
@@ -132,6 +154,8 @@ paths:
           description: >-
             Created. Body is the full task resource, as `GET /tasks/{task_id}`;
             `Location` names it.
+          x-gaps: [G-WIRE-03]
+          x-source: A
           headers:
             Location:
               $ref: "#/components/headers/Location"
@@ -238,6 +262,20 @@ paths:
         * Dead-lettered tasks: `$filter=state eq 'dead_lettered'`, optionally with
           `dead_lettered_from eq '<queue>'`; `read` is enough to list them. A `queue`
           filter on a dead-letter queue searches every task domain.
+      x-gaps: [G-SEC-05, G-SEC-25, G-SEC-26, G-SEC-27, G-SEC-20, G-RTY-10, G-RTY-11, G-OPS-23]
+      x-source: A
+      x-refs: ["DESIGN.md:1150-1158", "Proposals › API reads and responses"]
+      x-review: >-
+        `parent_task_id` and `predecessor_id` filters are P. Filter functions instead of
+        `any()` (the ToolKit parser has no lambda) A (G-SEC-05); `dead_lettered_from`
+        filter A (G-RTY-11); window exemption for searches restricted to
+        `dead_lettered` A (G-RTY-10); 13 filter fields kept as a documented exception to
+        the REST guideline's 10 (G-SEC-27); cursor binding of `view`/`$select` and the
+        `NOT_ALLOWED`/`OUT_OF_RANGE` codes A (G-SEC-26). The dead-letter filter replaces
+        `GET /admin/dlq`. `403` on outright denial A (G-SEC-20). Open: `dependencies`
+        stays as DESIGN.md:1138 has it, but no decision gives its syntax next to
+        `predecessor_id`. `[call]` in `x-odata-filter` marks a boolean filter function
+        (our notation).
       parameters:
         - $ref: "#/components/parameters/Filter"
         - $ref: "#/components/parameters/OrderBy"
@@ -333,6 +371,9 @@ paths:
         Returns the task resource. Action **`read`**. Works for every stored task, also
         outside the search window. Embeds no list that can grow without limit: children,
         successors, history, entries and wait conditions have their own reads.
+      x-refs: ["Proposals › Domains", "Proposals › API reads and responses"]
+      x-review: >-
+        P. Probes the configured task domains in a fixed order.
       parameters:
         - $ref: "#/components/parameters/TaskId"
       responses:
@@ -376,6 +417,14 @@ paths:
         records `taskCancelRequested` only when a leased task is flagged or escalated; an
         immediate or forced cancel records only `taskCancelled`. Cancellation reaches
         unfinished children in the same mode unless the parent opted out (p2).
+      x-gaps: [G-RTY-13, G-RTY-14, G-RTY-15, G-RTY-16, G-RTY-18, G-RTY-19, G-OPS-47, G-SEC-22, G-WAI-23]
+      x-source: A
+      x-refs: ["PRD.md:346"]
+      x-review: >-
+        Mode values D. Optional body and default mode A (G-RTY-18); terminal handling
+        (G-RTY-13), `NOT_CANCELLABLE` (G-RTY-14), events (G-RTY-15), forward-only modes
+        (G-RTY-16), engine-wide grace period (G-RTY-19), `reason` ≤ 1024 (G-OPS-47) and
+        `STATE_CHANGED` (G-SEC-22) are A.
       parameters:
         - $ref: "#/components/parameters/TaskId"
       requestBody:
@@ -397,6 +446,8 @@ paths:
           description: >-
             Cancel requested on a leased task, or a no-op repeat; body is the task,
             unchanged except `cancel_requested: true` and `cancel_request`.
+          x-gaps: [G-WIRE-08, G-RTY-16]
+          x-source: A
           content:
             application/json:
               schema:
@@ -432,6 +483,12 @@ paths:
         than `max_tags_per_task` (16) tags → `400` `TOO_MANY_TAGS` on `/set`. Records
         one `taskTagsUpdated` history event (`actor`, the keys set with their new values,
         the keys removed).
+      x-gaps: [G-CRT-06, G-SEC-28]
+      x-refs: ["Proposals › Task mutability"]
+      x-review: >-
+        After the accepted proposals `update` covers tags only. The per-task limit is P;
+        its name and value (`max_tags_per_task`, 16) are A (G-CRT-06); the history event
+        is A (G-SEC-28).
       parameters:
         - $ref: "#/components/parameters/TaskId"
       requestBody:
@@ -491,6 +548,15 @@ paths:
         `INVALID_FORMAT`, `OUT_OF_RANGE`, `TOO_MANY_QUEUES`, `DEAD_LETTER_QUEUE`,
         `CROSS_DOMAIN`, each on its JSON Pointer), then `404` for an unregistered queue,
         then the PDP (`403` `QUEUE_NOT_PERMITTED` / `503`).
+      x-gaps: [G-CLM-02, G-CLM-04, G-CLM-08, G-CLM-14, G-CLM-15, G-CLM-16, G-CLM-17, G-CLM-18, G-CLM-19, G-CLM-09, G-OPS-06, G-OPS-30, G-EXE-10, G-SEC-16]
+      x-refs: ["ADR-0017", "Proposals › Claiming and ordering", "Proposals › Queue operations"]
+      x-review: >-
+        Ordering and held-queue skipping are P; the critical offer rule (G-CLM-02),
+        rotation (G-CLM-04) and the ordering guarantee (G-CLM-08) are A. Session rules
+        A (G-CLM-16, G-CLM-17). Validation codes and order A (G-CLM-18). `404`: A
+        (G-CLM-15). `403`: A, any provably excluded queue (G-CLM-14, G-SEC-16). A
+        blacklisted worker gets no `400` (G-OPS-30). `429`: `Retry-After` = the claim
+        poll interval, 1 s (G-CLM-09). Execution deadline set by the claim (G-EXE-10).
       requestBody:
         required: true
         content:
@@ -509,6 +575,8 @@ paths:
             Nothing eligible before the long-poll timeout, also when every named queue is
             held or the worker is blacklisted on it. No session is opened, renewed or
             returned.
+          x-gaps: [G-CLM-16, G-OPS-06, G-OPS-30]
+          x-source: A
         "400":
           $ref: "#/components/responses/BadRequest"
           description: >-
@@ -520,6 +588,7 @@ paths:
             touched.
         "404":
           $ref: "#/components/responses/NotFound"
+          x-source: A
           description: >-
             A named queue is not registered: `not_found`, `resource_type` = the
             queue base type, `resource_name` = the first unknown ID; answered at
@@ -558,6 +627,13 @@ paths:
         `200` with every lease `lease_lost` (the same body in all three cases) and is not
         revived. A pending cancel is reported per lease in `cancel_requested` and
         `cancel_request` (with `superseded_by` when a supersession caused it).
+      x-gaps: [G-EXE-01, G-EXE-04, G-CRT-17, G-EXE-07]
+      x-refs: ["Proposals › Heartbeats and leases › No PDP call on heartbeat"]
+      x-review: >-
+        P. One write for the session, one read for the leases. The single-task heartbeat
+        is removed (P). Unknown-session answer A (G-EXE-01); batch limit and `400` A
+        (G-EXE-04); `superseded_by` A (G-CRT-17); reserved admission pool A (G-EXE-07).
+      x-source: P
       requestBody:
         required: true
         content:
@@ -569,6 +645,8 @@ paths:
           description: >-
             One result per listed lease, in request order. An unknown, expired or
             foreign session answers `200` with every lease `lease_lost`.
+          x-gaps: [G-EXE-01]
+          x-source: A
           content:
             application/json:
               schema:
@@ -603,10 +681,17 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/LeaseTokenRequest"
+      x-gaps: [G-EXE-10, G-EXE-11, G-EXE-09]
+      x-source: A
+      x-review: >-
+        Optional and idempotent `start` A (G-EXE-10, G-EXE-11); no `404` on worker calls
+        A (G-EXE-09).
       responses:
         "200":
           description: >-
             The task, `state: running`.
+          x-gaps: [G-WIRE-06]
+          x-source: A
           content:
             application/json:
               schema:
@@ -634,6 +719,9 @@ paths:
         flush (at most one flush interval old when read). A buffered update under a lease that is then lost is never saved.
         Action **`claim`**, lease-fenced: a call from anyone but the current holder with
         that token gets `409` `LEASE_LOST`, never `404`.
+      x-gaps: [G-EXE-08, G-EXE-09, G-EXE-11]
+      x-review: >-
+        Fence failure path A (G-EXE-08, G-EXE-09); allowed from `claimed` A (G-EXE-11).
       parameters:
         - $ref: "#/components/parameters/TaskId"
       requestBody:
@@ -646,6 +734,7 @@ paths:
         "200":
           description: >-
             Accepted into the buffer; empty body.
+          x-refs: ["DESIGN.md:1314"]
         "400":
           $ref: "#/components/responses/BadRequest"
           description: "`percent` outside 0..100 (`OUT_OF_RANGE`)."
@@ -669,6 +758,11 @@ paths:
         optimistic `revision` guard; the 64 KiB payload limit applies to the result.
         Records `taskCheckpointed`. Action **`claim`**, lease-fenced: a call from anyone
         but the current holder with that token gets `409` `LEASE_LOST`, never `404`.
+      x-gaps: [G-EXE-12, G-EXE-13, G-WAI-15, G-EXE-09]
+      x-source: A
+      x-review: >-
+        p1 (G-EXE-12); merge rule A (G-EXE-13); `taskCheckpointed` on every write that
+        carries a checkpoint A (G-WAI-15).
       parameters:
         - $ref: "#/components/parameters/TaskId"
       requestBody:
@@ -681,6 +775,8 @@ paths:
         "200":
           description: >-
             The merged context.
+          x-gaps: [G-WIRE-06]
+          x-source: A
           content:
             application/json:
               schema:
@@ -720,6 +816,13 @@ paths:
         **`claim`**, lease-fenced: a call from anyone but the current holder with that
         token gets `409` `LEASE_LOST`, never `404`; a result that fails validation is
         checked against the fence first, so a lost lease wins over `400`.
+      x-gaps: [G-WIRE-07, G-EXE-11, G-EXE-14, G-EXE-15, G-EXE-16, G-EXE-17, G-RTY-17, G-OPS-38, G-CRT-18, G-EXE-09]
+      x-refs: ["DESIGN.md:1316"]
+      x-review: >-
+        There is no `/fail` (G-WIRE-07). From `claimed` A (G-EXE-11); output revision A
+        (G-EXE-14); flat body A (G-EXE-15); non-terminal replay gets `LEASE_LOST` A
+        (G-EXE-16); fence before `400` A (G-EXE-17); outcome after a cancel request A
+        (G-RTY-17, G-OPS-38; graceful supersession ends `superseded`, G-CRT-18).
       parameters:
         - $ref: "#/components/parameters/TaskId"
       requestBody:
@@ -732,6 +835,8 @@ paths:
         "200":
           description: >-
             The task, terminal or `scheduled` for a retry.
+          x-gaps: [G-WIRE-06]
+          x-source: A
           content:
             application/json:
               schema:
@@ -772,6 +877,12 @@ paths:
         `409` `LEASE_LOST`: the first one was applied. Action **`claim`**, lease-fenced: a
         call from anyone but the current holder with that token gets `409` `LEASE_LOST`,
         never `404`.
+      x-gaps: [G-EXE-16, G-EXE-23, G-EXE-24, G-EXE-25, G-WAI-15, G-EXE-09]
+      x-source: A
+      x-review: >-
+        `delay_secs` bounds and release from `claimed` A (G-EXE-25); deferred-limit
+        refusal keeps the lease A (G-EXE-23); `taskQueued` with `run_after` A
+        (G-EXE-24); replay gets `LEASE_LOST` A (G-EXE-16).
       parameters:
         - $ref: "#/components/parameters/TaskId"
       requestBody:
@@ -784,6 +895,8 @@ paths:
         "200":
           description: >-
             The task, `queued` or `scheduled`.
+          x-gaps: [G-WIRE-06]
+          x-source: A
           content:
             application/json:
               schema:
@@ -832,6 +945,11 @@ paths:
         "200":
           description: >-
             Session, task and new lease.
+          x-gaps: [G-WIRE-21, G-OPS-27, G-OPS-41]
+          x-review: >-
+            A: shape (G-WIRE-21). Target rights checked only at accept (G-OPS-27);
+            `taskClaimed { handoff: true }` (G-OPS-41).
+          x-source: A
           content:
             application/json:
               schema:
@@ -869,6 +987,12 @@ paths:
         `failed_precondition` `TOO_MANY_ENTRIES`. Entries are never changed or
         deleted by a client: `PUT`, `PATCH` and `DELETE` on an entry answer `405` with an
         `Allow` header and no body.
+      x-gaps: [G-EXE-18, G-EXE-19, G-EXE-21, G-EXE-22, G-EXE-09]
+      x-source: A
+      x-refs: ["DESIGN.md:1087"]
+      x-review: >-
+        Type resolution and `UNKNOWN_ENTRY_TYPE` A (G-EXE-19); when entries may be added,
+        the per-task limit and `TOO_MANY_ENTRIES` A (G-EXE-21); `405` A (G-EXE-22).
       parameters:
         - $ref: "#/components/parameters/TaskId"
       requestBody:
@@ -881,6 +1005,8 @@ paths:
         "201":
           description: >-
             Created: `Location` + the entry.
+          x-gaps: [G-EXE-18]
+          x-source: A
           headers:
             Location:
               $ref: "#/components/headers/Location"
@@ -923,6 +1049,11 @@ paths:
         Keyset-paged. Sort `created_at asc, id asc`; no `$orderby`. Action **`read`**.
         Filterable through `$filter` by `type`, `creator` and `created_at` range.
         Default page size 25, maximum 100.
+      x-gaps: [G-EXE-18, G-SEC-25]
+      x-source: A
+      x-refs: ["PRD.md:637"]
+      x-review: >-
+        Sort and filters A (G-EXE-18); default 25 and maximum 100 A (G-SEC-25).
       parameters:
         - $ref: "#/components/parameters/TaskId"
         - $ref: "#/components/parameters/Filter"
@@ -957,6 +1088,8 @@ paths:
       description: >-
         Action **`read`** on the task. Entries are append-only: `PUT`, `PATCH` and
         `DELETE` here answer `405` with an `Allow` header and no body.
+      x-gaps: [G-EXE-22]
+      x-source: A
       parameters:
         - $ref: "#/components/parameters/TaskId"
         - $ref: "#/components/parameters/EntryId"
@@ -1008,6 +1141,17 @@ paths:
         `NOT_ALLOWED`. A timer condition takes no timeout. Phases: timer conditions p1;
         input, children and event conditions p2, refused in p1 with
         `FEATURE_NOT_AVAILABLE` on `/conditions/i/kind`.
+      x-gaps: [G-WAI-01, G-WAI-06, G-WAI-09, G-WAI-10, G-WAI-13, G-WAI-15, G-WAI-20, G-WAI-26, G-WAI-29, G-WAI-30, G-WAI-32, G-WAI-34, G-WAI-43, G-EXE-09]
+      x-source: A
+      x-refs: ["Proposals › Task mutability", "Proposals › Waits"]
+      x-review: >-
+        The API-consumer path (no token, action `update`) is removed (P); missing token →
+        `400 REQUIRED` A (G-WAI-01). Event conditions are p2 firm, after the others. Limit
+        name and value A (G-WAI-06); no timeout on timer conditions A (G-WAI-09); past
+        `resume_at` satisfied at once A (G-WAI-10, G-WAI-13); set from `claimed` A
+        (G-WAI-20); `on_timeout` default A (G-WAI-32); event-kind refusal in p1 A
+        (G-WAI-43). `403`: reasons A (G-WAI-26). `400`: event codes A (G-WAI-29,
+        G-WAI-30, G-WAI-34).
       parameters:
         - $ref: "#/components/parameters/TaskId"
       requestBody:
@@ -1021,6 +1165,8 @@ paths:
           description: >-
             The group as stored and the task state; or, when the group is satisfied at
             once, `parked: false` with the `result` (the shape of `ParkResponse`).
+          x-gaps: [G-WIRE-09, G-WAI-13]
+          x-source: A
           content:
             application/json:
               schema:
@@ -1075,6 +1221,10 @@ paths:
         `wait_group_id` or `state` to get the current group. Default page size 25,
         maximum 100. Action **`read`**. Conditions of an initial `wait` group set at
         create are listed here too.
+      x-gaps: [G-WAI-08, G-SEC-25, G-CRT-01]
+      x-refs: ["Proposals › Waits", "Proposals › API reads and responses"]
+      x-review: >-
+        Shape A (G-WAI-08); default 25 and maximum 100 A (G-SEC-25). Filters S.
       parameters:
         - $ref: "#/components/parameters/TaskId"
         - $ref: "#/components/parameters/Filter"
@@ -1088,6 +1238,7 @@ paths:
       responses:
         "200":
           description: One page of wait conditions.
+          x-source: A
           content:
             application/json:
               schema:
@@ -1123,11 +1274,17 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/ParkRequest"
+      x-gaps: [G-WAI-13, G-WAI-17, G-WAI-21, G-EXE-09]
+      x-source: A
+      x-review: >-
+        `NO_ARMED_WAIT` A (G-WAI-13); arm semantics per kind A (G-WAI-17, G-WAI-21).
       responses:
         "200":
           description: >-
             `parked: false` with `result` when already satisfied, else `parked:
             true` with `task_state: waiting`.
+          x-gaps: [G-WIRE-09, G-WAI-08]
+          x-source: A
           content:
             application/json:
               schema:
@@ -1175,6 +1332,14 @@ paths:
           `NOT_RESOLVABLE`.
 
         A resolved condition is kept until its task is deleted at retention.
+      x-gaps: [G-WAI-05, G-WAI-21, G-WAI-22, G-SEC-18, G-SEC-22]
+      x-refs: ["Proposals › Waits › resolve"]
+      x-review: >-
+        P: the `resolve` action and the replay rules. Conflicts as `400`
+        `failed_precondition` (not `409`) A (G-WAI-05); armed input A (G-WAI-21); value
+        measured alone A (G-WAI-22); no `read` needed A (G-SEC-18). `409` only for a lost
+        state guard (`STATE_CHANGED`, G-SEC-22).
+      x-source: P
       parameters:
         - $ref: "#/components/parameters/ConditionId"
       requestBody:
@@ -1187,6 +1352,8 @@ paths:
         "200":
           description: >-
             The condition, `satisfied`.
+          x-gaps: [G-WIRE-09]
+          x-source: A
           headers:
             Idempotency-Replayed:
               $ref: "#/components/headers/IdempotencyReplayed"
@@ -1235,6 +1402,12 @@ paths:
         `timestamp`, for example `$filter=event_type in ('taskRetrying','taskFailed')`.
         Default page size 25, maximum 100. A `taskRetrying` item carries the full
         `error` of the failed attempt (the published broker event keeps only a summary).
+      x-gaps: [G-SEC-07, G-SEC-25, G-RTY-03]
+      x-refs: ["Proposals › API reads and responses"]
+      x-review: >-
+        Paging is P; filters, sort and page sizes A (G-SEC-07, G-SEC-25); full error on
+        `taskRetrying` A (G-RTY-03).
+      x-source: P
       parameters:
         - $ref: "#/components/parameters/TaskId"
         - $ref: "#/components/parameters/Filter"
@@ -1273,10 +1446,17 @@ paths:
         Queues are platform-owned, so the list holds no tenant data. Per-state `counts`
         and `sampled_at` are included only for a caller that also holds `configure` on
         queues; others get the queue without them.
+      x-gaps: [G-OPS-02]
+      x-source: A
+      x-review: >-
+        Counts only for callers with queue `configure` A (G-OPS-02).
       responses:
         "200":
           description: >-
             All queues, unpaged.
+          x-gaps: [G-WIRE-11]
+          x-review: >-
+            A: `{ items }`, unpaged.
           content:
             application/json:
               schema:
@@ -1296,6 +1476,8 @@ paths:
       description: >-
         Action **`read`** on queues (`queue_read`). `counts` and `sampled_at` only for a
         caller that also holds `configure` on queues (queues have no `admin` action).
+      x-gaps: [G-OPS-02]
+      x-source: A
       parameters:
         - $ref: "#/components/parameters/QueueId"
       responses:
@@ -1325,6 +1507,13 @@ paths:
         **`read`** on queues (`queue_read`). Sort: oldest first (`timestamp asc, id
         asc`); no `$orderby`. Filter through `$filter` on `event_type` (`eq`, `in`) and
         `timestamp`. Default page size 25, maximum 100.
+      x-gaps: [G-OPS-05, G-OPS-04, G-SEC-07]
+      x-source: A
+      x-review: >-
+        New read path A (G-OPS-05); payloads of `queueHeld`/`queueReleased` A
+        (G-OPS-04). Open: where engine-wide (non-queue) `configUpdated` events are read
+        (G-OPS-05); the `queue_held`/`queue_released` schema files do not exist yet, so
+        their payloads are defined inline here.
       parameters:
         - $ref: "#/components/parameters/QueueId"
         - $ref: "#/components/parameters/Filter"
@@ -1364,6 +1553,11 @@ paths:
         rules (`mode` defaults to `requested`): `succeeded` means the task ended (or had
         already ended in the cancelled family); a leased task under
         `requested`/`graceful` is only flagged and reports `cancel_requested`.
+      x-gaps: [G-OPS-14, G-OPS-15, G-OPS-16, G-WIRE-12]
+      x-source: A
+      x-review: >-
+        `cancel_requested` outcome A (G-OPS-16); `BATCH_TOO_LARGE` and `bulk_max_ids` A
+        (G-OPS-15); `403` only on outright denial A (G-OPS-14).
       requestBody:
         required: true
         content:
@@ -1392,6 +1586,9 @@ paths:
       description: |
         Action **`admin`**, per task; raising to `critical` also needs `expedite` per task
         (else `unauthorized`). Each change records `taskUpdated { actor, changes }`. p2.
+      x-gaps: [G-OPS-14, G-OPS-15, G-OPS-19]
+      x-review: >-
+        `taskUpdated` A (G-OPS-19); `403` only on outright denial A (G-OPS-14).
       requestBody:
         required: true
         content:
@@ -1423,6 +1620,11 @@ paths:
         queue-depth limit reports `limit_exceeded` (no usage figures); one refused by a
         precondition (`TASK_DOMAIN_MISMATCH`, `PARENT_FINISHED`, `STALE_ORDER`) reports
         `invalid_state`; the others proceed. p2.
+      x-gaps: [G-CLM-25, G-OPS-14, G-OPS-15, G-OPS-17, G-RTY-20]
+      x-source: A
+      x-review: >-
+        `limit_exceeded` A (G-CLM-25, G-OPS-17); precondition refusals as
+        `invalid_state` A (G-RTY-20).
       requestBody:
         required: true
         content:
@@ -1457,6 +1659,12 @@ paths:
         refusal → `limit_exceeded`. One destination serves every task, so an
         unregistered destination refuses the whole request (`404`) and a dead-letter
         one too (`400` `DEAD_LETTER_QUEUE` on `/queue`). p2.
+      x-gaps: [G-CLM-25, G-CRT-02, G-CRT-03, G-OPS-14, G-OPS-15, G-OPS-19, G-OPS-20, G-OPS-21]
+      x-source: A
+      x-review: >-
+        Settings re-resolution A (G-OPS-20); `domain_mismatch` A (G-OPS-21);
+        `limit_exceeded` A (G-CLM-25); whole-request refusal of an unknown or
+        dead-letter destination A (G-CRT-02, G-CRT-03).
       requestBody:
         required: true
         content:
@@ -1506,10 +1714,15 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/ReassignRequest"
+      x-gaps: [G-OPS-27, G-OPS-41, G-OPS-47, G-SEC-22]
+      x-source: A
+      x-review: >-
+        Preconditions and `TARGET_BLACKLISTED` A (G-OPS-27); `reason` A (G-OPS-41).
       responses:
         "200":
           description: >-
             The task with the new `assignment`.
+          x-refs: ["scenarios/CONVENTIONS.md §5.6"]
           content:
             application/json:
               schema:
@@ -1548,6 +1761,14 @@ paths:
         its type; a different queue re-resolves the queue-level settings, as a move does. A child whose parent has ended cannot be re-enqueued. Successors
         cancelled with `dependency_failed` are not revived. Records `taskQueued { reason:
         reenqueued }`. Action **`admin`**. p2.
+      x-refs: ["PRD §5.8"]
+      x-gaps: [G-RTY-12, G-RTY-20, G-WAI-24, G-SEC-22, G-CRT-02, G-CRT-03]
+      x-source: A
+      x-review: >-
+        Cleared fields A (G-RTY-12); optional `queue`, its refusals (`404`,
+        `DEAD_LETTER_QUEUE`), settings re-resolution and `TASK_DOMAIN_MISMATCH` for a
+        moved source queue A (G-RTY-20); `PARENT_FINISHED` A (G-WAI-24). `NOT_ALLOWED`
+        for a queue that does not accept the type follows the create rule.
       parameters:
         - $ref: "#/components/parameters/TaskId"
       requestBody:
@@ -1560,6 +1781,7 @@ paths:
         "200":
           description: >-
             The task, `queued`.
+          x-refs: ["scenarios/CONVENTIONS.md §5.6"]
           content:
             application/json:
               schema:
@@ -1613,6 +1835,14 @@ paths:
         specificity matching the same queue are refused (`NOT_ALLOWED` on the later
         pattern). A runtime override beats a
         static one for the same pattern.
+      x-gaps: [G-WIRE-12, G-OPS-11, G-OPS-12, G-OPS-13, G-OPS-34, G-OPS-40, G-CLM-21]
+      x-source: A
+      x-review: >-
+        Body shape A (G-OPS-11). Saved in the default domain, in the same transaction as
+        the events. One `configure` check on the base type A (G-OPS-40); pattern
+        precedence A (G-CLM-21, G-OPS-12); no effect on existing tasks A (G-OPS-13).
+        Overlap → `NOT_ALLOWED` A (G-CLM-21); retention cap → `OUT_OF_RANGE` A
+        (G-OPS-34).
       requestBody:
         required: true
         content:
@@ -1649,6 +1879,9 @@ paths:
       description: >-
         Which task domains have applied the version. Action **`configure`** on queues.
         p3. An unknown version is `404`.
+      x-gaps: [G-WIRE-12, G-OPS-11]
+      x-review: >-
+        Body S; the `404` is S.
       parameters:
         - $ref: "#/components/parameters/ConfigVersion"
       responses:
@@ -1682,6 +1915,13 @@ paths:
         `reason` and `until`, keeps `since`, sets `by` to the caller and records another
         `queueHeld`. A dead-letter queue cannot be held. Recorded as the queue-scoped
         event `queueHeld`. Action **`configure`** on queues.
+      x-gaps: [G-OPS-03, G-OPS-07, G-OPS-08, G-OPS-09, G-OPS-10, G-OPS-47]
+      x-refs: ["Proposals › Queue operations"]
+      x-review: >-
+        P; the proposal sets no phase. Propagation bound A (G-OPS-03); held time counts
+        A (G-OPS-07); `until` A (G-OPS-08); repeated hold A (G-OPS-09); dead-letter
+        queue A (G-OPS-10); `reason` ≤ 1024 A (G-OPS-47).
+      x-source: P
       parameters:
         - $ref: "#/components/parameters/QueueId"
       requestBody:
@@ -1694,6 +1934,8 @@ paths:
         "200":
           description: >-
             The queue resource with `hold` set.
+          x-gaps: [G-WIRE-12]
+          x-source: A
           content:
             application/json:
               schema:
@@ -1725,12 +1967,19 @@ paths:
         refresh plus one claim poll interval). Recorded as `queueReleased`. Releasing a
         queue that is not held answers `200` with `hold: null` and records nothing.
         Action **`configure`** on queues. No body.
+      x-gaps: [G-OPS-06, G-OPS-09]
+      x-refs: ["Proposals › Queue operations", "Proposals › Domains"]
+      x-review: >-
+        P. Release of an unheld queue A (G-OPS-09); wake-up bound A (G-OPS-06).
+      x-source: P
       parameters:
         - $ref: "#/components/parameters/QueueId"
       responses:
         "200":
           description: >-
             The queue resource with `hold: null`.
+          x-gaps: [G-WIRE-12]
+          x-source: A
           content:
             application/json:
               schema:
@@ -1805,6 +2054,8 @@ components:
         task type without a derived dedup identity (missing → `428`); optional and
         ignored for types that declare the `dedup` trait. Empty or malformed → `400`
         `INVALID_FORMAT` on `Idempotency-Key`. Never returned on the task resource.
+      x-gaps: [G-CRT-09]
+      x-source: A
       schema:
         type: string
         minLength: 1
@@ -1840,6 +2091,9 @@ components:
       description: >-
         Page size (alias `$top`; send one spelling only). Default 25; values above the
         operation's maximum are clamped; `0` → `400` `INVALID_LIMIT`.
+      x-gaps: [G-SEC-25]
+      x-review: >-
+        Default A.
       schema:
         type: integer
         minimum: 1
@@ -1867,6 +2121,8 @@ components:
         `events` (newest 50), the current group's `wait_conditions`, `entries` (newest
         20), `dependencies`, and the two `*_truncated` flags. A cursor is bound to the
         `view` it was issued for.
+      x-gaps: [G-SEC-04, G-SEC-06, G-RTY-11, G-SEC-26]
+      x-source: A
       schema:
         type: string
         enum: [tiny, short, long, full]
@@ -1886,12 +2142,22 @@ components:
         `concurrency`: the claim poll interval rounded up (1 s). Queue-depth and
         event-wait limits: `retry_after_secs` (30) jittered uniformly in [15, 30]. `503`:
         `unavailable_retry_after_secs` (5).
+      x-gaps: [G-SEC-03, G-CLM-09, G-WAI-33, G-CRT-23]
+      x-source: A
+      x-refs: ["PRD.md:429", "PRD.md:451"]
+      x-review: >-
+        Needs the library change of G-SEC-03 (emit the header for `resource_exhausted`
+        from the largest `violations[].retry_after_seconds`).
       schema:
         type: integer
         minimum: 1
     IdempotencyReplayed:
       description: >-
         `true` when the response replays an earlier identical resolve.
+      x-refs: ["Proposals › Waits"]
+      x-review: >-
+        P.
+      x-source: P
       schema:
         type: string
         enum: ["true"]
@@ -1906,6 +2172,7 @@ components:
         `violations[{type: STATE, subject: <code>}]`, `resource_name` = the task or
         queue). Neither carries `context.reason`. In the Task Engine
         `failed_precondition` is `400`, not `409`.
+      x-gaps: [G-WIRE-14, G-SEC-02]
       content:
         application/problem+json:
           schema:
@@ -1925,6 +2192,8 @@ components:
         `EVENT_CONSUME_UNVERIFIABLE`, `DUPLICATE_NOT_READABLE`, `SUPERSEDE_CANCEL_DENIED`,
         `CLAIM_REVOKED`. No field violations; a check or condition index is only in
         `detail`.
+      x-gaps: [G-SEC-19, G-WIRE-15]
+      x-source: A
       content:
         application/problem+json:
           schema:
@@ -1935,6 +2204,10 @@ components:
         worker call: the caller holds the lease, but its scope no longer covers the task.
         The task is released (no budget, attempt or blacklist change; history
         `taskQueued { reason: revoked }`); the worker drops it.
+      x-gaps: [G-EXE-08, G-WAI-26]
+      x-refs: ["Proposals › Heartbeats and leases › Revocation"]
+      x-review: >-
+        P; reason code and history event A (G-EXE-08).
       content:
         application/problem+json:
           schema:
@@ -1962,6 +2235,7 @@ components:
         with that token (stale or unknown token, unknown task, a task of another tenant).
         Final: the task is no longer the caller's. Worker calls answer this instead of
         `404`. The body never echoes the token.
+      x-gaps: [G-EXE-09, G-SEC-22]
       content:
         application/problem+json:
           schema:
@@ -1972,6 +2246,7 @@ components:
         first; `context.reason` is `LEASE_LOST` (worker writes), `CONCURRENT_MODIFICATION`
         (payload revision) or `STATE_CHANGED` (a non-worker write whose state guard lost;
         read the target and retry).
+      x-gaps: [G-SEC-22]
       content:
         application/problem+json:
           schema:
@@ -2001,6 +2276,8 @@ components:
         the queue, except for `queue_depth.deferred` (the task base type, no name), a
         `concurrency` refusal of a claim naming several queues (the queue base type, no
         name) and the event-wait limits. Always carries `Retry-After`.
+      x-gaps: [G-WIRE-14, G-CLM-10, G-SEC-03]
+      x-source: A
       headers:
         Retry-After:
           $ref: "#/components/headers/RetryAfter"
@@ -2014,6 +2291,8 @@ components:
         the GTS registry is unreachable for a type that is not cached, or the node is
         overloaded (admission shed the request). Nothing changed, leases are kept;
         retrying is safe. Always carries `Retry-After`.
+      x-gaps: [G-SEC-01, G-CRT-23, G-EXE-07]
+      x-source: A
       headers:
         Retry-After:
           $ref: "#/components/headers/RetryAfter"
@@ -2026,6 +2305,8 @@ components:
         Multi-status carried in the body: overall `200`, one outcome per requested ID in
         request order. A task the caller may not read is `not_found`, indistinguishable
         from a missing one.
+      x-gaps: [G-WIRE-12]
+      x-source: A
       content:
         application/json:
           schema:
@@ -2059,16 +2340,19 @@ components:
       type: string
       description: >-
         Worker process identity within its subject.
+      x-refs: ["PRD.md:663"]
       pattern: '^[A-Za-z0-9._:-]{1,128}$'
     Domain:
       type: string
       description: Task domain name (`default` on a single-database deployment). Task domains are p3.
+      x-source: P
 
     TaskState:
       type: string
       description: >-
         Non-terminal `scheduled`, `queued`, `blocked`, `claimed`, `running`, `waiting`;
         terminal `completed`, `failed`, `cancelled`, `dead_lettered`.
+      x-refs: ["PRD.md:1024"]
       enum: [scheduled, queued, blocked, claimed, running, waiting, completed, failed, cancelled, dead_lettered]
     ResultCode:
       type: string
@@ -2095,13 +2379,20 @@ components:
       description: >-
         `all`: every predecessor must succeed; `any`: the first success unblocks.
         Default `all`.
+      x-gaps: [G-WAI-40]
+      x-review: >-
+        A.
       enum: [all, any]
     OnPredecessorFailure:
       type: string
+      x-source: P
       description: >-
         What a predecessor ending `failed`, `cancelled` or `dead_lettered` does to this
         task: `cancel` (default) cancels it with `dependency_failed`; `ignore` counts
         the predecessor as satisfied.
+      x-refs: ["Proposals › Task mutability"]
+      x-review: >-
+        P.
       enum: [cancel, ignore]
       default: cancel
     WaitMode:
@@ -2111,17 +2402,24 @@ components:
     WaitConditionKind:
       type: string
       description: Open set; p1 accepts only `timer`. `input`, `children` and `event` are p2 (refused in p1 with `FEATURE_NOT_AVAILABLE`).
+      x-gaps: [G-WAI-43]
       enum: [timer, input, children, event]
     WaitConditionState:
       type: string
+      x-source: A
       description: >-
         State of one wait condition.
+      x-gaps: [G-WIRE-09]
+      x-review: >-
+        A. DESIGN names `WaitConditionState` but not its values.
       enum: [pending, satisfied, timed_out, cancelled]
     OnTimeout:
       type: string
       description: >-
         `fail` ends the task `timed_out`; `resume` resumes it with a timeout note. A
         condition with a timeout and no `on_timeout` gets `fail`.
+      x-gaps: [G-WAI-32]
+      x-source: A
       enum: [fail, resume]
       default: fail
     ErrorFault:
@@ -2137,6 +2435,7 @@ components:
 
     Tags:
       type: array
+      x-source: A
       description: >-
         Tenant-local labels, an array of `{key, value}`; each key at most once per task
         (a repeated key → `400` `DUPLICATE`). Keys 1–128 and values 0–256 Unicode
@@ -2144,11 +2443,17 @@ components:
         empty key); a tag with an empty `value` works as a plain label. At most
         `max_tags_per_task` (16) tags per task (`TOO_MANY_TAGS` on `/tags`). Order is
         not significant; the engine returns them sorted by key.
+      x-gaps: [G-WIRE-04, G-CRT-06]
+      x-refs: ["PRD.md:363"]
+      x-review: >-
+        Array form A (G-WIRE-04). The per-task limit is P; its name, value and codes are
+        A (G-CRT-06).
       maxItems: 16
       items:
         $ref: "#/components/schemas/Tag"
     Tag:
       type: object
+      x-source: A
       required: [key, value]
       additionalProperties: false
       properties:
@@ -2173,6 +2478,8 @@ components:
           description: >-
             Resource ID, at most 256 characters (`TOO_LONG` on
             `/resource_refs/i/resource_id`).
+          x-gaps: [G-CRT-10]
+          x-source: A
           maxLength: 256
     ResourceRef:
       allOf:
@@ -2210,11 +2517,13 @@ components:
         outcome:
           type: string
           enum: [pending, succeeded, failed_ignored, failed]
+          x-source: A
           description: >-
             What this predecessor did for the task: `pending` (not ended), `succeeded`,
             `failed_ignored` (ended failed, cancelled or dead-lettered with
             `on_predecessor_failure: ignore`, so it counts as satisfied), `failed` (ended
             so, with `cancel`).
+          x-gaps: [G-WAI-37]
     Timeouts:
       description: >-
         Timeout settings in seconds (`queue_timeout_secs`, `assignment_timeout_secs`,
@@ -2224,6 +2533,7 @@ components:
         effective values, resolved and stored at create (an inherited value above a trust
         limit is clamped); `heartbeat_timeout_secs` is never `null`. Later configuration
         changes do not reach an existing task.
+      x-gaps: [G-CRT-04, G-CRT-05, G-OPS-13]
       $ref: "./schemas/types/gts.cf.core.tasks.queue.v1~.schema.json#/properties/timeouts"
     RetryPolicy:
       description: >-
@@ -2232,6 +2542,7 @@ components:
         `max_interval_secs`); omitted optional fields take the schema defaults; it is
         not merged with other levels. On the task resource: the effective policy,
         resolved and stored at create.
+      x-gaps: [G-CRT-04, G-CRT-05, G-OPS-13]
       $ref: "./schemas/types/gts.cf.core.tasks.queue.v1~.schema.json#/properties/retry_policy"
     TaskError:
       type: object
@@ -2289,6 +2600,10 @@ components:
       type: object
       description: >-
         Current holder of a `claimed`/`running` task. Never carries the lease token.
+      x-gaps: [G-WIRE-04, G-WIRE-19]
+      x-refs: ["DESIGN.md:329-340"]
+      x-review: >-
+        A: the returned subset and the `worker_id` name for `assignee`.
       required: [assignee_subject, worker_id, attempt, lease_epoch]
       properties:
         assignee_subject:
@@ -2307,9 +2622,12 @@ components:
         execution_deadline:
           type: [string, "null"]
           format: date-time
+          x-source: A
           description: >-
             Set by the claim (claim time + effective execution timeout) and never moved by
             `start`; the attempt ends `timed_out` then, whether `claimed` or `running`.
+          x-gaps: [G-WIRE-19, G-EXE-10, G-RTY-22]
+          x-refs: ["DESIGN.md:338"]
 
     # ---------------------------------------------------------- task resource
 
@@ -2318,6 +2636,8 @@ components:
       description: >-
         The task resource, returned by create, read, claim and the worker and admin
         calls. It never carries the `Idempotency-Key` or a lease token.
+      x-gaps: [G-CRT-09]
+      x-refs: ["scenarios/CONVENTIONS.md §5.1", "DESIGN.md:280-311"]
       required: [id, type, queue, owner_tenant_id, created_by, state, urgency, priority, attempt, created_at, updated_at]
       properties:
         id:
@@ -2326,11 +2646,13 @@ components:
           description: UUID v7 (creation order is ID order).
         type:
           $ref: "#/components/schemas/TaskTypeRef"
+          x-source: A
           description: >-
             GTS type ID of the task type. Lifecycle event `data` carries the same
             value as `task_type`.
         queue:
           $ref: "#/components/schemas/QueueRef"
+          x-source: A
           description: >-
             GTS queue ID. Lifecycle event `data` uses `queue`.
         owner_tenant_id:
@@ -2357,13 +2679,23 @@ components:
         retry_count:
           type: integer
           minimum: 0
+          x-source: A
           description: >-
             Retries used after reported failures.
+          x-gaps: [G-WIRE-04]
+          x-refs: ["DESIGN.md:538"]
+          x-review: >-
+            Stored per DESIGN; returning it is A.
         liveness_requeues:
           type: integer
           minimum: 0
+          x-source: A
           description: >-
             Requeues after lease expiry or assignment timeout.
+          x-gaps: [G-WIRE-04]
+          x-refs: ["DESIGN.md:539"]
+          x-review: >-
+            Stored per DESIGN; returning it is A.
         cancellable:
           type: boolean
         cancel_requested:
@@ -2397,10 +2729,12 @@ components:
           description: >-
             When `true`, a cancel reaches the unfinished children in the same mode, and a
             parent that ends in any other non-success state cancels them `graceful`.
+          x-gaps: [G-WAI-23, G-WAI-38]
         predecessors:
           type: array
           description: >-
             Bounded by `max_predecessors_per_task` (64); each with its `outcome`. p2.
+          x-gaps: [G-WAI-37]
           items:
             $ref: "#/components/schemas/Predecessor"
         dependency_mode:
@@ -2410,9 +2744,16 @@ components:
         timeouts:
           $ref: "#/components/schemas/Timeouts"
           description: Effective timeouts, resolved and stored at create.
+          x-gaps: [G-CRT-04]
+          x-source: A
         retry_policy:
           $ref: "#/components/schemas/RetryPolicy"
           description: Effective retry policy, resolved and stored at create.
+          x-gaps: [G-CRT-04]
+          x-source: A
+          x-review: >-
+            Was nullable in the earlier draft; G-CRT-04 stores the effective policy on
+            every task, so it is never `null`.
         run_after:
           type: [string, "null"]
           format: date-time
@@ -2420,6 +2761,7 @@ components:
           type: [string, "null"]
           format: date-time
           description: A passed deadline is cleared by re-enqueue.
+          x-gaps: [G-RTY-12]
         assignment:
           anyOf:
             - $ref: "#/components/schemas/Assignment"
@@ -2431,6 +2773,8 @@ components:
           description: >-
             Source queue of a dead-lettered task; cleared by re-enqueue. Filterable in
             search and part of the `short` view.
+          x-gaps: [G-RTY-11, G-RTY-12]
+          x-refs: ["DESIGN.md:545"]
         superseded_by:
           type: [string, "null"]
           format: uuid
@@ -2447,18 +2791,28 @@ components:
           description: Cleared by re-enqueue.
         domain:
           $ref: "#/components/schemas/Domain"
+          x-source: A
           description: >-
             Task domain the task was created in; fixed for its life.
         cancel_request:
           anyOf:
             - $ref: "#/components/schemas/CancelRequestInfo"
             - type: "null"
+          x-source: A
           description: >-
             Set while `cancel_requested` is true; `null` otherwise.
+          x-gaps: [G-WIRE-19]
+          x-review: >-
+            A.
+
     CancelRequestInfo:
       type: object
+      x-source: A
       description: >-
         The pending cancel request of a leased task.
+      x-gaps: [G-WIRE-19]
+      x-review: >-
+        A.
       required: [mode, requested_by, requested_at]
       properties:
         mode:
@@ -2480,6 +2834,8 @@ components:
           format: uuid
           description: >-
             Set when the request comes from supersession (p2); the heartbeat passes it on.
+          x-gaps: [G-CRT-17]
+          x-source: A
 
     # ---------------------------------------------------------- create
 
@@ -2491,21 +2847,32 @@ components:
         Create body. The SDK type of the same name also carries `idempotency_key`
         (the `Idempotency-Key` header here) until header binding is supported; it
         never carries `created_by` (taken from the caller's security context).
+      x-gaps: [G-WIRE-17]
+      x-review: >-
+        REST DTO. No doc defines this body; field names follow DESIGN §3.1 except where
+        marked.
       properties:
         type:
           $ref: "#/components/schemas/TaskTypeRef"
+          x-source: A
           description: >-
             GTS type ID of the task type.
         queue:
           $ref: "#/components/schemas/QueueRef"
+          x-source: A
           description: >-
             GTS queue ID. Absent → the type's `default_queue`, else `default`.
         priority:
           type: integer
           minimum: 0
           maximum: 1000
+          x-source: A
           description: >-
             Optional; default is the queue's `default_priority`.
+          x-gaps: [G-CRT-26]
+          x-refs: ["PRD.md:248"]
+          x-review: >-
+            A; PRD.md:248 to be marked optional.
         urgency:
           $ref: "#/components/schemas/Urgency"
         input:
@@ -2515,10 +2882,12 @@ components:
         owner_tenant_id:
           type: string
           format: uuid
+          x-source: A
           description: >-
             Tenant that owns the task; default the caller's tenant. The `create` check
             carries it and the PDP decides (subtree and barrier rules); a tenant barrier
             is crossed only for a queue that is `operated_by: platform`.
+          x-gaps: [G-SEC-13]
         owner_id:
           type: string
           description: Subject the task is done for.
@@ -2529,19 +2898,25 @@ components:
         run_after:
           type: string
           format: date-time
+          x-source: A
           description: >-
             Earliest claim time. A past value is stored as sent and the task is `queued`;
             a value later than `created_at` + the lifetime timeout → `400`
             `OUT_OF_RANGE` on `/run_after`. Not with an initial `wait` group when in the
             future.
+          x-gaps: [G-CRT-22, G-CRT-01]
         sla_deadline:
           type: string
           format: date-time
         cancellable:
           type: boolean
           default: true
+          x-source: A
           description: >-
             Default `true`.
+          x-gaps: [G-CRT-27]
+          x-review: >-
+            A.
         tags:
           $ref: "#/components/schemas/Tags"
         resource_refs:
@@ -2557,13 +2932,21 @@ components:
             task's domain (another domain → `404`). The hierarchy may be at most
             `max_hierarchy_depth` (10) deep; deeper → `400` `TOO_DEEP` on
             `/parent_task_id`.
+          x-gaps: [G-WAI-39, G-WAI-41, G-WAI-43]
+          x-review: >-
+            P; depth limit A (G-WAI-39); domain lookup A (G-WAI-41).
         parent_lease_token:
           type: string
           format: uuid
+          x-source: P
           description: >-
             The parent's lease token held by the calling worker. Required with
             `parent_task_id` (missing → `400` `REQUIRED` on `/parent_lease_token`); a
             wrong, stale or foreign token → the same `404` as a missing parent.
+          x-gaps: [G-WAI-02]
+          x-refs: ["Proposals › Task mutability"]
+          x-review: >-
+            P. The `update`-on-parent alternative is removed; statuses A (G-WAI-02).
         wait_for_children:
           type: boolean
           default: false
@@ -2572,16 +2955,21 @@ components:
           default: true
         predecessors:
           type: array
+          x-source: A
           description: >-
             `[{task_id, on_predecessor_failure}]`; the mode is per task
             (`dependency_mode`). p2. At most `max_predecessors_per_task` (64), else
             `DEPENDENCY_GRAPH_TOO_LARGE`; the same task twice → `DUPLICATE` on
             `/predecessors/i`. Not with an initial `wait` group. Fixed after creation.
+          x-gaps: [G-WIRE-17, G-WAI-42, G-CRT-01]
+          x-review: >-
+            Shape A; fixed after creation is P; `DUPLICATE` A (G-WAI-42).
           maxItems: 64
           items:
             $ref: "#/components/schemas/PredecessorInput"
         dependency_mode:
           $ref: "#/components/schemas/DependencyMode"
+          x-source: A
           description: >-
             One mode per task, default `all`.
         wait:
@@ -2591,6 +2979,7 @@ components:
 
     InitialWaitGroup:
       type: object
+      x-source: P
       description: >-
         Optional initial wait group: the task starts in `waiting`. Same shape as a
         worker's set-wait without `lease_token`, `park` and `checkpoint` (use
@@ -2603,6 +2992,12 @@ components:
         admission (`429` `queue_depth.deferred` when full). The condition IDs are read
         with `GET /tasks/{task_id}/wait-conditions`; a task resumed from this group is
         claimed with `attempt` 1.
+      x-gaps: [G-CRT-01, G-WAI-06, G-WAI-11, G-WAI-19, G-WAI-43, G-CLM-26]
+      x-refs: ["Proposals › Task mutability"]
+      x-review: >-
+        P. Dropping `checkpoint` is S. Placement, kinds, admission and events A
+        (G-CRT-01, G-CLM-26, G-WAI-19). Open for p2: the checks a create-time `event`
+        condition runs (whose context, which action; G-WAI-11).
       required: [mode, conditions]
       additionalProperties: false
       properties:
@@ -2631,6 +3026,8 @@ components:
             The worker's live session to reuse. `null`, a session that is no longer
             live, or one stored with another `worker_id` opens a new one (only when the
             claim takes a task).
+          x-gaps: [G-CLM-16, G-CLM-17]
+          x-refs: ["ADR-0017"]
         queues:
           type: array
           minItems: 1
@@ -2640,6 +3037,7 @@ components:
             distinct queues (`TOO_MANY_QUEUES`); missing or empty → `REQUIRED`. A
             `dead_letter` queue → `DEAD_LETTER_QUEUE` on `/queues/i`; an unregistered one
             → `404`.
+          x-gaps: [G-CLM-15, G-CLM-18]
           items:
             $ref: "#/components/schemas/QueueRef"
         max_tasks:
@@ -2651,9 +3049,14 @@ components:
           type: integer
           minimum: 0
           default: 0
+          x-source: A
           description: >-
             Long-poll wait in seconds, clamped to `claim_max_wait_secs` (50). `0`
             (the default) is one attempt without waiting; negative → `400`.
+          x-gaps: [G-CLM-19, G-WIRE-05]
+          x-refs: ["DESIGN.md:1064"]
+          x-review: >-
+            DESIGN names it `timeout`.
         domain:
           $ref: "#/components/schemas/Domain"
           description: >-
@@ -2694,6 +3097,11 @@ components:
       type: object
       description: >-
         One claimed task.
+      x-gaps: [G-WIRE-05]
+      x-refs: ["DESIGN.md:1064"]
+      x-review: >-
+        A. The lease is nested as in the endpoint table, not flattened as in the
+        sequence diagram.
       required: [task, lease, authority]
       properties:
         task:
@@ -2703,10 +3111,13 @@ components:
         authority:
           $ref: "#/components/schemas/Authority"
         resumed:
+          x-source: A
           description: >-
             The wait result when the task resumes from a wait; `null` for a fresh
             claim. Returned on every claim while the task's current wait group is a
             resolved parked group, so a lost claim response does not lose it.
+          x-gaps: [G-WIRE-05, G-WAI-08, G-WAI-14, G-WAI-19]
+          x-refs: ["PRD.md:550"]
           anyOf:
             - $ref: "#/components/schemas/WaitResult"
             - type: "null"
@@ -2728,8 +3139,13 @@ components:
         lease_secs:
           type: integer
           minimum: 1
+          x-source: A
           description: >-
             Session lease length after this claim.
+          x-gaps: [G-WIRE-05]
+          x-refs: ["ADR-0017:56"]
+          x-review: >-
+            A.
         domain:
           $ref: "#/components/schemas/Domain"
           description: >-
@@ -2739,6 +3155,7 @@ components:
       type: object
       description: >-
         Creator authority recorded at creation.
+      x-refs: ["DESIGN.md:1043"]
       required: [mode]
       properties:
         mode:
@@ -2746,8 +3163,12 @@ components:
           enum: [creator_verified, worker]
         checked:
           type: array
+          x-source: A
           description: >-
             The creator checks that ran at creation and their verdicts.
+          x-gaps: [G-SEC-24]
+          x-review: >-
+            A: entry shape.
           items:
             type: object
             properties:
@@ -2778,6 +3199,7 @@ components:
         leases:
           type: array
           description: At most `heartbeat_batch_max` (default 500); more → `400` `TOO_MANY` on `/leases`.
+          x-gaps: [G-EXE-04]
           items:
             type: object
             required: [task_id, lease_token]
@@ -2792,8 +3214,12 @@ components:
 
     HeartbeatResponse:
       type: object
+      x-source: A
       description: >-
         Batch heartbeat response.
+      x-gaps: [G-WIRE-06]
+      x-review: >-
+        A.
       required: [session_id, heartbeat_interval_secs, results]
       properties:
         session_id:
@@ -2809,6 +3235,7 @@ components:
 
     HeartbeatResult:
       type: object
+      x-source: A
       required: [task_id, outcome]
       properties:
         task_id:
@@ -2831,6 +3258,7 @@ components:
             Present when `outcome` is `ok` and a cancel is pending: its mode, for
             `graceful` its `grace_until`, and `superseded_by` when a supersession caused
             it.
+          x-gaps: [G-WIRE-06, G-CRT-17]
 
     LeaseTokenRequest:
       type: object
@@ -2880,9 +3308,12 @@ components:
           description: >-
             Merged into `context` as an RFC 7386 JSON Merge Patch: nested objects merge,
             `null` deletes a key, arrays are replaced whole.
+          x-gaps: [G-EXE-13]
+          x-source: A
 
     CheckpointResponse:
       type: object
+      x-source: A
       required: [context]
       properties:
         context:
@@ -2893,6 +3324,10 @@ components:
       type: object
       description: >-
         Completion body.
+      x-gaps: [G-EXE-15]
+      x-refs: ["DESIGN.md:1316"]
+      x-review: >-
+        Flat body per DESIGN.
       required: [lease_token, result_code]
       additionalProperties: false
       properties:
@@ -2923,17 +3358,23 @@ components:
           minimum: 0
           maximum: 86400
           default: 0
+          x-source: A
           description: >-
             Release to `scheduled` after this delay; `0` is an immediate release. At most
             `release_max_delay_secs` (86,400); outside 0..max → `400` `OUT_OF_RANGE`.
+          x-gaps: [G-EXE-25]
         checkpoint:
           type: object
           description: Merged into `context` as by `/checkpoint` (RFC 7386).
 
     CancelRequest:
       type: object
+      x-source: A
       description: >-
         Optional body. `mode` defaults to `requested`; an unknown mode → `400`.
+      x-gaps: [G-WIRE-08, G-RTY-18]
+      x-review: >-
+        A.
       additionalProperties: false
       properties:
         mode:
@@ -2942,9 +3383,11 @@ components:
         reason:
           type: string
           maxLength: 1024
+          x-source: A
           description: >-
             Free text, at most 1024 characters (`TOO_LONG` on `/reason`), stored on the
             task as `cancel_request.reason`.
+          x-gaps: [G-OPS-47]
 
     TagsPatchRequest:
       type: object
@@ -2952,6 +3395,7 @@ components:
         `set` adds or replaces tags by key (`[{key, value}]`); `remove` deletes keys. A key in
         both, or twice in `set` → `400`; a result over `max_tags_per_task` (16) → `400`
         `TOO_MANY_TAGS`. Keys not named are left unchanged.
+      x-gaps: [G-CRT-06]
       minProperties: 1
       additionalProperties: false
       properties:
@@ -2976,13 +3420,17 @@ components:
         reason:
           type: string
           maxLength: 1024
+          x-source: A
           description: Free text, at most 1024 characters, recorded in `taskReassigned`.
+          x-gaps: [G-OPS-41, G-OPS-47]
 
     ReenqueueRequest:
       type: object
+      x-source: A
       description: >-
         Optional re-enqueue body. Without `queue` the task returns to its source queue
         (`dead_lettered_from`, or its own queue for a failed task).
+      x-gaps: [G-RTY-20]
       additionalProperties: false
       properties:
         queue:
@@ -3004,9 +3452,13 @@ components:
 
     AcceptResponse:
       type: object
+      x-source: A
       description: >-
         Same shape as one claim entry plus its session, so an SDK can treat accept like
         a claim of one task.
+      x-gaps: [G-WIRE-21]
+      x-review: >-
+        A.
       required: [session_id, heartbeat_interval_secs, task, lease, authority]
       properties:
         session_id:
@@ -3014,6 +3466,7 @@ components:
           format: uuid
         domain:
           $ref: "#/components/schemas/Domain"
+          x-source: A
           description: >-
             Task domain of the session, as in the claim response.
         heartbeat_interval_secs:
@@ -3030,8 +3483,12 @@ components:
 
     CreateEntryRequest:
       type: object
+      x-source: A
       description: >-
         Create-entry body.
+      x-gaps: [G-EXE-18]
+      x-review: >-
+        A.
       required: [type, payload]
       additionalProperties: false
       properties:
@@ -3047,10 +3504,15 @@ components:
 
     Entry:
       type: object
+      x-source: A
       description: >-
         Immutable entry. Built-in types are `…entry_work`, `…entry_observation`,
         `…entry_issue`, `…entry_note`, `…entry_measurement` under
         `gts.cf.core.tasks.entry.v1~`.
+      x-gaps: [G-EXE-18]
+      x-refs: ["DESIGN.md:392-399"]
+      x-review: >-
+        Domain model `TaskEntry`; wire names A (G-EXE-18).
       required: [id, task_id, type, creator, payload, created_at]
       properties:
         id:
@@ -3094,13 +3556,18 @@ components:
         input and children conditions `on_timeout` without `timeout_secs` → `400`
         `NOT_ALLOWED`; an event condition without `timeout_secs` gets
         `event_waits.max_wait_secs`, so `on_timeout` alone is valid there.
+      x-gaps: [G-WAI-09, G-WAI-32]
       properties:
         timeout_secs:
           type: integer
           minimum: 1
+          x-source: A
           description: >-
             Timeout in seconds; starts at park time (at create for an initial `wait`
             group).
+          x-gaps: [G-WIRE-09, G-WIRE-13, G-CRT-01]
+          x-review: >-
+            Domain model `timeout: Duration`; name A.
         on_timeout:
           $ref: "#/components/schemas/OnTimeout"
 
@@ -3109,6 +3576,11 @@ components:
       description: >-
         Satisfied once `resume_at` passes. Takes no timeout: `timeout_secs` or
         `on_timeout` on a timer condition → `400` `NOT_ALLOWED`. p1.
+      x-gaps: [G-WAI-09]
+      x-source: A
+      x-review: >-
+        Was `allOf` with `ConditionTimeoutFields`; G-WAI-09 refuses a timeout on a timer
+        condition.
       required: [kind, resume_at]
       additionalProperties: false
       properties:
@@ -3120,10 +3592,14 @@ components:
           description: >-
             Satisfied when reached. A time already past is satisfied at once (a set
             answers `parked: false` with the result).
+          x-gaps: [G-WAI-10, G-WAI-13]
+          x-source: A
 
     InputConditionSpec:
       description: >-
         p2; refused in p1 with `FEATURE_NOT_AVAILABLE`.
+      x-review: >-
+        P.
       allOf:
         - $ref: "#/components/schemas/ConditionTimeoutFields"
         - type: object
@@ -3142,6 +3618,8 @@ components:
       description: >-
         No fields. Satisfied when the task has no unfinished children. p2; refused in p1
         with `FEATURE_NOT_AVAILABLE`.
+      x-review: >-
+        P.
       allOf:
         - $ref: "#/components/schemas/ConditionTimeoutFields"
         - type: object
@@ -3167,12 +3645,18 @@ components:
               description: >-
                 GTS event type ID on a waitable topic, resolved with the caller's GTS
                 visibility: an unregistered or hidden type → `UNKNOWN_EVENT_TYPE`.
+              x-gaps: [G-WAI-29]
             subject_type:
               type: string
               description: >-
                 Required unless the event type's `allowed_subject_types` is a single
                 entry that is not a wildcard pattern (`EVENT_SUBJECT_TYPE_REQUIRED`); a
                 type outside the allowed ones → `EVENT_SUBJECT_TYPE_NOT_ALLOWED`.
+              x-gaps: [G-WAI-30]
+              x-source: A
+              x-review: >-
+                Field name and wildcard rule A (G-WAI-30); DESIGN's error table calls it
+                `event_subject_type`.
             subject_id:
               type: string
             match_expression:
@@ -3181,6 +3665,8 @@ components:
                 CEL expression checked after the field match (p3). A parse error or a
                 breach of a CEL limit → `INVALID_MATCH_EXPRESSION` (checked before the
                 `consume` checks).
+              x-gaps: [G-WAI-34]
+              x-refs: ["ADR-0007"]
 
     SetWaitRequest:
       type: object
@@ -3192,6 +3678,9 @@ components:
           format: uuid
           description: >-
             Required; missing → `400` `REQUIRED` on `/lease_token` before any lookup.
+          x-gaps: [G-WAI-01]
+          x-review: >-
+            P: the consumer path without a token is removed; status A (G-WAI-01).
         mode:
           $ref: "#/components/schemas/WaitMode"
         park:
@@ -3201,6 +3690,7 @@ components:
         checkpoint:
           type: object
           description: Merged into `context` (RFC 7386) in the same guarded write; records `taskCheckpointed`.
+          x-gaps: [G-EXE-13, G-WAI-15]
         conditions:
           type: array
           minItems: 1
@@ -3208,11 +3698,15 @@ components:
           description: >-
             At most `wait.max_conditions_per_group` (16): empty → `REQUIRED`, more →
             `TOO_MANY`, both on `/conditions`.
+          x-gaps: [G-WAI-06]
+          x-review: >-
+            Limit P; name and value A (G-WAI-06).
           items:
             $ref: "#/components/schemas/WaitConditionSpec"
 
     SetWaitResponse:
       type: object
+      x-source: A
       required: [wait_group, task_state]
       properties:
         wait_group:
@@ -3222,6 +3716,7 @@ components:
 
     WaitGroup:
       type: object
+      x-source: A
       required: [id, mode, parked, conditions]
       properties:
         id:
@@ -3240,6 +3735,9 @@ components:
       type: object
       description: >-
         Fields every stored condition has.
+      x-refs: ["DESIGN.md:360-372"]
+      x-review: >-
+        Domain model `WaitCondition`.
       required: [id, kind, state]
       properties:
         id:
@@ -3248,12 +3746,14 @@ components:
         wait_group_id:
           type: string
           format: uuid
+          x-source: A
         kind:
           $ref: "#/components/schemas/WaitConditionKind"
         state:
           $ref: "#/components/schemas/WaitConditionState"
         timeout_secs:
           type: [integer, "null"]
+          x-source: A
         on_timeout:
           anyOf:
             - $ref: "#/components/schemas/OnTimeout"
@@ -3275,13 +3775,22 @@ components:
           anyOf:
             - $ref: "#/components/schemas/SubjectId"
             - type: "null"
+          x-source: P
           description: >-
             Subject that resolved an input condition.
+          x-refs: ["Proposals › Waits"]
+          x-review: >-
+            P.
         result:
+          x-source: A
           description: >-
             The condition's stored outcome, same per-kind shape as in `WaitResult`;
             `null` while pending or when cancelled. Lets an approver or operator
             read the answer without claiming the task.
+          x-gaps: [G-WAI-08, G-WIRE-19]
+          x-refs: ["DESIGN.md:367"]
+          x-review: >-
+            A. Domain `resolved_payload`.
           anyOf:
             - $ref: "#/components/schemas/InputWaitResult"
             - $ref: "#/components/schemas/EventWaitResult"
@@ -3354,6 +3863,7 @@ components:
 
     WaitConditionPage:
       type: object
+      x-source: A
       required: [items, page_info]
       properties:
         items:
@@ -3376,6 +3886,7 @@ components:
 
     ParkResponse:
       type: object
+      x-source: A
       required: [parked]
       properties:
         parked:
@@ -3389,9 +3900,13 @@ components:
 
     WaitResult:
       type: object
+      x-source: A
       description: >-
         The outcome of a wait group, given to the resumed worker (claim `resumed`) or by
         a park that found the group already satisfied.
+      x-gaps: [G-WAI-08]
+      x-review: >-
+        A.
       required: [wait_group_id, outcome, conditions]
       properties:
         wait_group_id:
@@ -3418,6 +3933,9 @@ components:
                   Per kind: input `{ value }`; event `{ event: <header> }`;
                   children `{ counts }`; timer `{ resume_at }`; timed out `{
                   timed_out: true, reason }`; `null` when cancelled.
+                x-gaps: [G-WAI-08]
+                x-review: >-
+                  A.
                 anyOf:
                   - $ref: "#/components/schemas/InputWaitResult"
                   - $ref: "#/components/schemas/EventWaitResult"
@@ -3428,6 +3946,7 @@ components:
 
     InputWaitResult:
       type: object
+      x-source: A
       required: [value]
       properties:
         value:
@@ -3435,8 +3954,10 @@ components:
 
     EventWaitResult:
       type: object
+      x-source: A
       description: >-
         Header only, never the event data.
+      x-refs: ["PRD.md:583"]
       required: [event]
       properties:
         event:
@@ -3463,12 +3984,14 @@ components:
 
     ChildrenWaitResult:
       type: object
+      x-source: A
       required: [counts]
       properties:
         counts:
           type: object
           description: >-
             Number of children per terminal state.
+          x-refs: ["PRD.md:621"]
           properties:
             completed:
               type: integer
@@ -3481,6 +4004,7 @@ components:
 
     TimerWaitResult:
       type: object
+      x-source: A
       required: [resume_at]
       properties:
         resume_at:
@@ -3489,6 +4013,7 @@ components:
 
     TimedOutWaitResult:
       type: object
+      x-source: A
       required: [timed_out]
       properties:
         timed_out:
@@ -3499,6 +4024,7 @@ components:
 
     ResolveRequest:
       type: object
+      x-source: A
       required: [value]
       additionalProperties: false
       properties:
@@ -3507,9 +4033,11 @@ components:
             Must be valid against the condition's `input_schema`. Measured alone against
             the 64 KiB payload limit (`413`); stored on the condition, not in the task's
             payload.
+          x-gaps: [G-WAI-22]
 
     ResolveResponse:
       type: object
+      x-source: A
       required: [condition]
       properties:
         condition:
@@ -3521,6 +4049,9 @@ components:
       type: object
       description: >-
         Cursors for the next and previous page, and the page size used.
+      x-refs: ["DESIGN.md:1176"]
+      x-review: >-
+        ToolKit `JsonPage` page info.
       required: [limit]
       properties:
         next_cursor:
@@ -3537,6 +4068,11 @@ components:
       description: >-
         A task narrowed by `view` and `$select`. Each property says the first view that
         returns it.
+      x-gaps: [G-SEC-04]
+      x-refs: ["DESIGN.md:1163-1170"]
+      x-review: >-
+        A. Members use the task resource's names (`assignment`, `result`), not DESIGN's
+        view lists (`assignee`, `output`).
       required: [id, state, type]
       properties:
         id:
@@ -3559,14 +4095,20 @@ components:
           anyOf:
             - $ref: "#/components/schemas/Assignment"
             - type: "null"
+          x-source: A
           description: >-
             From `short`.
+          x-gaps: [G-SEC-04]
+          x-review: >-
+            A. DESIGN's `assignee`.
         dead_lettered_from:
           anyOf:
             - $ref: "#/components/schemas/QueueRef"
             - type: "null"
+          x-source: A
           description: >-
             From `short`: source queue of a dead-lettered task.
+          x-gaps: [G-RTY-11]
         created_at:
           type: string
           format: date-time
@@ -3581,8 +4123,12 @@ components:
           anyOf:
             - $ref: "#/components/schemas/TaskResult"
             - type: "null"
+          x-source: A
           description: >-
             From `long`.
+          x-gaps: [G-SEC-04]
+          x-review: >-
+            A. DESIGN's `output`.
         context:
           description: From `long`.
         progress:
@@ -3595,46 +4141,75 @@ components:
           description: From `long`.
         resource_refs:
           type: array
+          x-source: A
           description: >-
             From `long`.
+          x-gaps: [G-SEC-04]
+          x-review: >-
+            A.
           items:
             $ref: "#/components/schemas/ResourceRef"
         events:
           type: array
+          x-source: A
           description: >-
             `full` only: the newest `search_full_event_cap` (50) events, newest
             first; `events_truncated` says whether older ones exist.
+          x-gaps: [G-SEC-06]
+          x-review: >-
+            A.
           items:
             $ref: "#/components/schemas/HistoryEvent"
         wait_conditions:
           type: array
+          x-source: A
           description: >-
             `full` only: the conditions of the current wait group (bounded by the
             per-group limit).
+          x-gaps: [G-SEC-06]
+          x-review: >-
+            A.
           items:
             $ref: "#/components/schemas/WaitCondition"
         entries:
           type: array
+          x-source: A
           description: >-
             `full` only: the newest 20 entries, newest first; `entries_truncated`
             says whether older ones exist.
+          x-gaps: [G-SEC-06]
+          x-review: >-
+            A.
           items:
             $ref: "#/components/schemas/Entry"
         dependencies:
           type: array
+          x-source: A
           description: >-
             `full` only: all of the task's predecessors (at most
             `max_predecessors_per_task`, 64).
+          x-gaps: [G-SEC-06]
+          x-review: >-
+            A.
           items:
             $ref: "#/components/schemas/Predecessor"
         events_truncated:
           type: boolean
+          x-source: A
           description: >-
             `full` only: `true` when the task has more than 50 events.
+          x-gaps: [G-SEC-06]
+          x-review: >-
+            A.
         entries_truncated:
           type: boolean
+          x-source: A
           description: >-
             `full` only: `true` when the task has more than 20 entries.
+          x-gaps: [G-SEC-06]
+          x-review: >-
+            A.
+
     TaskSearchPage:
       type: object
       required: [items, page_info]
@@ -3659,6 +4234,7 @@ components:
 
     EntryPage:
       type: object
+      x-source: A
       required: [items, page_info]
       properties:
         items:
@@ -3670,9 +4246,16 @@ components:
 
     HistoryEvent:
       type: object
+      x-source: A
       description: >-
         One entry of a task's history. Never carries a lease token, the input, the
         context or the output.
+      x-gaps: [G-WIRE-10, G-SEC-28, G-OPS-19]
+      x-refs: ["DESIGN.md:402-409"]
+      x-review: >-
+        Domain model `TaskEvent`; wire names A (G-WIRE-10). Open: `taskTagsUpdated`
+        (G-SEC-28) and `taskUpdated` (G-OPS-19) have no schema file yet, so `payload`
+        cannot reference them.
       required: [id, event_type, timestamp, payload]
       properties:
         id:
@@ -3689,6 +4272,7 @@ components:
             `taskCompleted`, `taskFailed`, `taskTimedOut`, `taskDeadLettered`,
             `slaBreached`, `taskTagsUpdated`, `taskUpdated`. The broker event type is
             `gts.cf.core.events.event.v1~cf.core.tasks.<snake_name>.v1~`.
+          x-refs: ["PRD.md:879"]
         actor:
           anyOf:
             - $ref: "#/components/schemas/SubjectId"
@@ -3736,8 +4320,10 @@ components:
 
     QueueHistoryEvent:
       type: object
+      x-source: A
       description: >-
         One queue-scoped event: same item shape as a task's history.
+      x-gaps: [G-OPS-04, G-OPS-05]
       required: [id, event_type, timestamp, payload]
       properties:
         id:
@@ -3766,6 +4352,8 @@ components:
 
     QueueHeldData:
       type: object
+      x-source: A
+      x-gaps: [G-OPS-04]
       required: [queue, actor]
       properties:
         queue:
@@ -3780,6 +4368,8 @@ components:
 
     QueueReleasedData:
       type: object
+      x-source: A
+      x-gaps: [G-OPS-04]
       required: [queue, automatic]
       properties:
         queue:
@@ -3793,6 +4383,7 @@ components:
 
     QueueHistoryEventPage:
       type: object
+      x-source: A
       required: [items, page_info]
       properties:
         items:
@@ -3806,9 +4397,14 @@ components:
 
     Queue:
       type: object
+      x-source: A
       description: >-
         Queue resource. `limits` are effective values after config overrides.
         Registration fields are defined by the queue type `gts.cf.core.tasks.queue.v1~`.
+      x-gaps: [G-WIRE-11]
+      x-refs: ["docs/schemas/types/gts.cf.core.tasks.queue.v1~.schema.json"]
+      x-review: >-
+        A.
       required: [id, kind, domains, hold]
       properties:
         id:
@@ -3822,10 +4418,16 @@ components:
           description: "`null` for a `dead_letter` queue."
         domains:
           type: array
+          x-source: P
           description: >-
             The queue's domain set: primary first, plus the source domain while a
             move lasts. `["default"]` on a single-domain deployment; empty for a
             `dead_letter` queue (not routed).
+          x-gaps: [G-OPS-23]
+          x-refs: ["Proposals › Domains"]
+          x-review: >-
+            P. Empty for a dead-letter queue is S (CONVENTIONS §5.9), consistent with
+            G-OPS-23 (dead-letter queues have no domain set); `minItems: 1` dropped.
           items:
             $ref: "#/components/schemas/Domain"
         counts:
@@ -3835,6 +4437,8 @@ components:
             for a dead-letter queue. Sampled by the maintenance leader every
             `queue_depth.sample_secs`, not exact. Present only for a caller that holds
             `configure` on queues.
+          x-gaps: [G-OPS-01, G-OPS-02, G-CLM-13]
+          x-source: A
           additionalProperties:
             type: integer
             minimum: 0
@@ -3843,29 +4447,45 @@ components:
         sampled_at:
           type: string
           format: date-time
+          x-source: A
           description: >-
             When `counts` and the depth samples were taken (one pass). Present only with
             `counts`.
+          x-gaps: [G-OPS-01, G-OPS-02, G-CLM-13]
         hold:
           anyOf:
             - $ref: "#/components/schemas/QueueHold"
             - type: "null"
+          x-source: P
           description: >-
             Hold state, `null` when not held.
+          x-refs: ["Proposals › Queue operations"]
+          x-review: >-
+            P.
         settings:
           anyOf:
             - $ref: "#/components/schemas/QueueEffectiveSettings"
             - type: "null"
+          x-source: A
           description: >-
             Effective settings after config overrides (registration → config default
             → override): what a task created now would get. `null` for a
             `dead_letter` queue.
+          x-gaps: [G-OPS-43]
+          x-review: >-
+            A.
         config_version:
           type: [integer, "null"]
+          x-source: A
           description: >-
             Runtime configuration version applied in the queue's domain.
+          x-gaps: [G-OPS-43]
+          x-review: >-
+            A.
+
     QueueEffectiveSettings:
       type: object
+      x-source: A
       description: >-
         Effective non-limit settings of a dispatch queue: the members of
         `gts.cf.core.tasks.queue.v1~` after config overrides. Limits are in `limits`.
@@ -3900,6 +4520,7 @@ components:
 
     QueueLimits:
       type: object
+      x-source: A
       properties:
         global_concurrency_limit:
           type: integer
@@ -3916,16 +4537,27 @@ components:
           minimum: 0
           description: >-
             Checked against a sampled count.
+          x-refs: ["Proposals › Limits and counters"]
         tenant_max_deferred_tasks:
           type: integer
           minimum: 0
+          x-source: A
           description: >-
             Per-tenant limit on `scheduled` + `blocked` + `waiting` tasks; checked
             against a sampled count like the queued limit.
+          x-refs: ["PRD.md:445", "PRD.md:457"]
+          x-review: >-
+            Exposing it is S (PRD.md:457 "effective depth limits").
+
     QueueHold:
       type: object
+      x-source: P
       description: >-
         Since when, by whom (the latest actor that held it), why and until when.
+      x-gaps: [G-OPS-09]
+      x-refs: ["Proposals › Queue operations"]
+      x-review: >-
+        P; field names S; `by` on a repeated hold A (G-OPS-09).
       required: [since, by]
       properties:
         since:
@@ -3941,9 +4573,12 @@ components:
           description: >-
             Automatic release time: each node treats the hold as over once its clock
             passes it; one `queueReleased { automatic: true }` is recorded.
+          x-gaps: [G-OPS-08]
+          x-source: A
 
     QueueList:
       type: object
+      x-source: A
       required: [items]
       properties:
         items:
@@ -3953,16 +4588,19 @@ components:
 
     HoldRequest:
       type: object
+      x-source: P
       additionalProperties: false
       properties:
         reason:
           type: string
           maxLength: 1024
           description: Free text, at most 1024 characters (`TOO_LONG` on `/reason`).
+          x-gaps: [G-OPS-47]
         until:
           type: string
           format: date-time
           description: Must be in the future (`400` `OUT_OF_RANGE` on `/until`).
+          x-gaps: [G-OPS-08]
 
     # ---------------------------------------------------------- bulk
 
@@ -3971,12 +4609,14 @@ components:
       minItems: 1
       uniqueItems: true
       description: At most `bulk_max_ids` (default 1000); more → `400` `BATCH_TOO_LARGE` on `/task_ids`.
+      x-gaps: [G-OPS-15]
       items:
         type: string
         format: uuid
 
     BulkTaskIdsRequest:
       type: object
+      x-source: A
       required: [task_ids]
       additionalProperties: false
       properties:
@@ -3985,6 +4625,11 @@ components:
 
     BulkCancelRequest:
       type: object
+      x-source: A
+      x-gaps: [G-WIRE-12, G-OPS-47]
+      x-review: >-
+        `mode` was required in the earlier draft; G-WIRE-12 makes it optional with
+        default `requested`.
       required: [task_ids]
       additionalProperties: false
       properties:
@@ -3999,6 +4644,7 @@ components:
 
     BulkReprioritizeRequest:
       type: object
+      x-source: A
       required: [task_ids]
       additionalProperties: false
       anyOf:
@@ -4016,6 +4662,7 @@ components:
 
     BulkMoveRequest:
       type: object
+      x-source: A
       required: [task_ids, queue]
       additionalProperties: false
       properties:
@@ -4045,12 +4692,14 @@ components:
                   only flagged), `limit_exceeded` (retry, move: refused by a queue-depth
                   limit, no usage figures), `domain_mismatch` (move: destination in
                   another task domain). Open set.
+                x-gaps: [G-OPS-16, G-CLM-25, G-OPS-21]
                 enum: [succeeded, unauthorized, not_found, invalid_state, cancel_requested, limit_exceeded, domain_mismatch]
 
     # ---------------------------------------------------------- runtime config
 
     RuntimeConfigRequest:
       type: object
+      x-source: A
       description: >-
         The complete override set of the new version: a key not present reverts to the
         registration or engine default, so removing an override is saving a version
@@ -4059,6 +4708,9 @@ components:
         then the longest literal prefix before the first wildcard; two patterns of equal
         specificity matching the same queue are refused (`NOT_ALLOWED` on the later
         pattern).
+      x-gaps: [G-OPS-11, G-OPS-12, G-CLM-21, G-OPS-34]
+      x-review: >-
+        A (G-OPS-11, G-OPS-12, G-CLM-21, G-OPS-34).
       minProperties: 1
       additionalProperties: false
       properties:
@@ -4075,8 +4727,10 @@ components:
 
     RetentionOverride:
       type: object
+      x-source: A
       description: >-
         Retention overrides. A legal hold is a long per-tenant retention.
+      x-gaps: [G-OPS-34]
       minProperties: 1
       additionalProperties: false
       properties:
@@ -4099,6 +4753,7 @@ components:
 
     QueueSettingsOverride:
       type: object
+      x-source: A
       description: Queue settings a runtime version may override (names as in the queue registration schema).
       minProperties: 1
       properties:
@@ -4137,6 +4792,7 @@ components:
 
     TypeSettingsOverride:
       type: object
+      x-source: A
       description: Task-type settings a runtime version may override (concurrency, progress).
       minProperties: 1
       properties:
@@ -4163,6 +4819,7 @@ components:
 
     RuntimeConfigStatus:
       type: object
+      x-source: A
       required: [config_version, domains]
       properties:
         config_version:
@@ -4180,6 +4837,9 @@ components:
                 type: boolean
                 description: >-
                   Versions are cumulative.
+                x-review: >-
+                  S.
+
     # ---------------------------------------------------------- errors
 
     Problem:
@@ -4197,6 +4857,10 @@ components:
 
         Error bodies never contain payload values, lease tokens, or PDP internals. Every
         `429` and `503` response carries a `Retry-After` header.
+      x-gaps: [G-WIRE-01]
+      x-refs: ["DESIGN.md:1186"]
+      x-review: >-
+        Built by `toolkit-canonical-errors`. DESIGN.md:1186 omits the `gts://` form.
       properties:
         type:
           type: string
@@ -4244,6 +4908,9 @@ components:
         `TARGET_BLACKLISTED`, `DEAD_LETTER_QUEUE`, `TOO_MANY_ENTRIES`. `aborted` reasons: `LEASE_LOST`,
         `CONCURRENT_MODIFICATION`, `STATE_CHANGED`. `permission_denied` reasons: see the
         `Forbidden` response.
+      x-gaps: [G-WIRE-14, G-WIRE-15, G-SEC-02, G-SEC-19, G-SEC-22, G-CLM-10]
+      x-source: A
+      x-refs: ["scenarios/CONVENTIONS.md §6"]
       properties:
         resource_type:
           type: string
@@ -4279,13 +4946,17 @@ components:
             RFC 6901 JSON Pointer from the request body root (`/input/report_id`,
             `/conditions/0/event_type`, `/queues/1`); a header or query parameter is named
             as sent (`Idempotency-Key`, `cursor`).
+          x-gaps: [G-SEC-21]
+          x-source: A
         description:
           type: string
           description: >-
             The rule broken, never the value sent; for `SCHEMA_VIOLATION` the failed
             schema keyword.
+          x-gaps: [G-SEC-21]
         reason:
           type: string
+          x-source: A
           description: >-
             The documented set; clients treat it as open. Generic: `REQUIRED`,
             `INVALID_FORMAT`, `OUT_OF_RANGE`, `TOO_LONG`, `TOO_MANY`, `DUPLICATE`,
@@ -4301,6 +4972,7 @@ components:
             `FEATURE_NOT_AVAILABLE`. Cursor and paging: `INVALID_CURSOR`,
             `FILTER_MISMATCH`, `ORDER_WITH_CURSOR`, `FIELD_SELECTION_MISMATCH`,
             `INVALID_LIMIT`.
+          x-gaps: [G-CRT-07, G-CRT-06, G-CLM-18, G-WAI-39, G-WAI-42, G-EXE-19, G-WAI-34]
 
     Violation:
       type: object
@@ -4316,6 +4988,7 @@ components:
             `resource_exhausted`: the full quota (`queue_depth.queue`,
             `queue_depth.tenant`, `queue_depth.domain_global`, `queue_depth.deferred`,
             `concurrency`, `event_waits.<dimension>`).
+          x-gaps: [G-WIRE-14, G-CLM-10]
         description:
           type: string
         retry_after_seconds:

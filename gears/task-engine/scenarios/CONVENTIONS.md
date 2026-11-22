@@ -2,10 +2,10 @@
 
 Shared rules, fixtures and wire shapes for every scenario under `gears/task-engine/scenarios/`. Read this before writing or reviewing a scenario.
 
-The Task Engine docs on `main` have **no OpenAPI contract** and only one JSON example (DESIGN.md:1184). The scenarios' contract is the draft OpenAPI in [#5791](https://github.com/constructorfabric/gears-rust/pull/5791) (branch `docs/task-engine-openapi`, `gears/task-engine/docs/openapi.yaml`); see §5. Where a scenario's Notes or a gap entry say where a shape comes from, they use these marks:
+The Task Engine docs on `main` have **no OpenAPI contract** and only one JSON example (DESIGN.md:1184). The shapes below are the scenarios' working contract; [`../docs/openapi.yaml`](../docs/openapi.yaml) is the draft OpenAPI built from them, and branch `docs/task-engine-openapi` carries the same contract without review annotations (§5 › Draft OpenAPI). Each field is marked:
 
 - **D**: named in PRD, DESIGN or an ADR on `main` (line given where useful).
-- **A**: agreed in the wire review of the draft OpenAPI (2026-11-04) or the gap review (2026-11-06); not yet in the PRD or DESIGN. The gap it cites records the decision in a `Decided` line.
+- **A**: agreed in the wire review of [`../docs/openapi.yaml`](../docs/openapi.yaml) (2026-11-04) or the gap review (2026-11-06); not yet in the PRD or DESIGN. The gap it cites records the decision in a `Decided` line.
 - **P**: comes from an accepted proposal of [PR #5730](https://github.com/constructorfabric/gears-rust/pull/5730) (§1).
 - **S**: set by these scenarios because the docs say nothing. Every **S** field is a doc gap, recorded in [GAPS.md](GAPS.md) under `G-WIRE-*`.
 
@@ -39,7 +39,7 @@ Accepted items that change the API (quick reference; source file in brackets):
 
 Cite a proposal as `Proposals › <Topic> › <item lead>` (for example `Proposals › Waits › resolve`).
 
-The contract the scenarios assume is the draft OpenAPI (§5). It and the scenarios follow the same decisions; when they disagree, fix one of them. Neither is authoritative over the PRD and DESIGN.
+The draft contract for these shapes is [`../docs/openapi.yaml`](../docs/openapi.yaml). Its descriptions are written for API consumers; provenance and gap citations are in extensions next to them (§5 › Draft OpenAPI). It settles some shapes §5 leaves open (stored wait-condition fields, per-kind wait results, entry and history paging, runtime-config keys), each citing its gap in `x-gaps`. When it and §5 disagree, fix one of them; neither is authoritative over the PRD and DESIGN.
 
 ## 2. Scenario file format
 
@@ -232,38 +232,307 @@ Ownership of the fixture types: **render**, **metric_job** and **export** are te
 
 ## 5. Wire shapes
 
-The contract is the draft OpenAPI in [#5791](https://github.com/constructorfabric/gears-rust/pull/5791) (`gears/task-engine/docs/openapi.yaml` on branch `docs/task-engine-openapi`, next to the SDK): every path, request and response body, status code, field limit and error response, with each operation's behaviour rules in its description. Scenarios show only the fields they assert and write the rest as `"…": "other fields as in CONVENTIONS §5.1"`; the subsections below name the schema or operation each shorthand means. When a scenario and the OpenAPI disagree, fix one of them.
-
 **Model layers.** The Task Engine follows the Event Broker gear's split (`gears/system/event-broker`; `docs/toolkit_unified_system/02_gear_layout_and_sdk_pattern.md:60-80`):
 
 | Layer | Where | Role |
 |---|---|---|
 | Domain model | DESIGN §3.1; `task-engine/src/domain/` (`#[domain_model]`) | Internal. Holds fields the API never shows (`idempotency_key`, `revision`, `Assignment.lease_token`, `session_id`, deadlines). Not a wire contract |
-| SDK models | `task-engine-sdk/src/models/` | Public Rust contract, named after the OpenAPI schemas (`CreateTaskRequest`, `Task`, `Lease`); `CreateTaskRequest` carries `idempotency_key` until header binding is supported |
-| REST DTOs | `api/rest/…/dto.rs` (`api_dto`) | The OpenAPI shapes, mapped from the domain with `From` |
-| GTS schemas | `docs/schemas/` | Task payload (`input`, `context`, `output`) and type traits; queue `timeouts` and `retry_policy`; lifecycle event `data` |
+| SDK models | `task-engine-sdk/src/models/` | Public Rust contract, transport-agnostic, named after the `openapi.yaml` schemas: `CreateTaskRequest` (create; carries `idempotency_key` until header binding is supported), `Task`, `Lease`, typed GTS IDs |
+| REST DTOs | `api/rest/…/dto.rs` (`api_dto`) | The wire shapes below and in [`../docs/openapi.yaml`](../docs/openapi.yaml), mapped from the domain with `From` |
+| GTS schemas | `docs/schemas/` | `gts.cf.core.tasks.task.v1~` defines only the payload (`input`, `context`, `output`) and type traits; the queue schema defines `timeouts` and `retry_policy`; event schemas define lifecycle `data` |
 
-A reference DDL for what the gear stores (`migration.sql`) was drafted with these decisions and is kept outside this branch; gap entries that mention it describe storage the gear's migrations must provide.
+[`../docs/migration.sql`](../docs/migration.sql) is the reference DDL (tables, columns and indexes; the gear's migrations are authoritative); every wire field is a column there or derived from one. It lives only on this branch: `docs/task-engine-openapi` does not carry it.
 
-**Removed by the accepted proposals** (not in the contract; the router answers `404`, G-WAI-03): `POST /tasks/{id}/dependencies`, `DELETE /tasks/{id}/dependencies/{predecessor_id}`, the API-consumer path of `POST /tasks/{id}/wait-conditions`, `POST /tasks/{id}/heartbeat` (batch only), `GET /admin/dlq` (search `state eq 'dead_lettered'` instead), and the `authz_scope` dedup scope.
+So a field marked **D** below has a documented concept and domain name; the wire name is the domain name unless the row says otherwise. Where DESIGN's domain name or type cannot be the wire one (`type_id`/`queue_id` typed `Uuid`), the field is **S** (G-WIRE-16, G-WIRE-17). Lifecycle event `data` names the task's type `task_type` because the event envelope's own `type` is the event type; that mapping is intended.
 
-**Paging** follows `guidelines/DNA/REST/QUERYING.md` through the ToolKit OData extractor; where they differ the contract follows ToolKit (`limit` out of range → `400`, not `422`; `$orderby` with a cursor always refused).
+### Draft OpenAPI
 
-| § | Shorthand in scenarios | In the OpenAPI |
+[`../docs/openapi.yaml`](../docs/openapi.yaml) is derived from PRD.md and DESIGN.md on `main` at `6efb0f856` plus every `[Proposed]` item of PR #5730, taken as accepted; `[Open]` proposal items are not assumed.
+
+Each `description` is written for API consumers: behaviour, PDP action, phase, errors, limits. Review annotations sit in extensions beside it, which renderers and code generators ignore:
+
+| Key | Holds |
+|---|---|
+| `x-source` | `P`, `A` or `S` as above; no key means **D** |
+| `x-gaps` | the [GAPS.md](GAPS.md) IDs the item depends on |
+| `x-refs` | the doc lines and proposal sections it comes from (`DESIGN.md:966`, `Proposals › Waits`) |
+| `x-review` | notes for reviewers: why the shape was chosen, what is still open |
+
+A response that is a `$ref` cannot carry extensions, so its notes go on the operation's `x-review`, prefixed with the status code. When a gap closes and DESIGN carries the shape, delete the item's extensions; the description should not need to change.
+
+**Published copy.** Branch `docs/task-engine-openapi` (worktree `../gears-rust-te-openapi`) carries the spec for review together with the SDK. It is this file without the `x-*` extensions and the provenance paragraph: the same paths, parameters, schemas, enums and status codes (checked against d7b5ad62b on 2026-11-06). Keep the two in step: a wire change goes into both files, and annotations live only here.
+
+**Removed by the accepted proposals** (not in the contract; the router answers `404`, G-WAI-03): `POST /tasks/{id}/dependencies`, `DELETE /tasks/{id}/dependencies/{predecessor_id}`, the API-consumer path of `POST /tasks/{id}/wait-conditions` (the worker path with a `lease_token` stays), `POST /tasks/{id}/heartbeat` (batch only), `GET /admin/dlq` (search `state eq 'dead_lettered'` instead), and the `authz_scope` dedup scope.
+
+**Paging** follows `guidelines/DNA/REST/QUERYING.md` and the ToolKit OData surface (`toolkit::api::odata`). Where they differ the spec follows ToolKit: an out-of-range `limit` is `400` (guideline: `422`), and `$orderby` with a cursor is always refused (guideline: ignored when equal).
+
+### 5.1 Task resource
+
+Returned by `POST /tasks` (`201`), `GET /tasks/{id}`, inside claim responses, and as search items (narrowed by `view`, DESIGN.md:1165-1170).
+
+```json
+{
+  "id": "{task_1}",
+  "type": "gts.cf.core.tasks.task.v1~acme.reports._.render.v1~",
+  "queue": "gts.cf.core.tasks.queue.v1~acme.reports._.render.v1",
+  "owner_tenant_id": "{tenant_a}",
+  "owner_id": null,
+  "created_by": "{creator_a}",
+  "state": "queued",
+  "urgency": "normal",
+  "priority": 100,
+  "attempt": 0,
+  "retry_count": 0,
+  "liveness_requeues": 0,
+  "cancellable": true,
+  "cancel_requested": false,
+  "input": { "report_id": "r-42", "format": "pdf" },
+  "context": null,
+  "result": null,
+  "progress": null,
+  "tags": [{ "key": "project", "value": "q4" }],
+  "resource_refs": [],
+  "parent_task_id": null,
+  "wait_for_children": false,
+  "propagate_cancel": true,
+  "predecessors": [],
+  "dependency_mode": null,
+  "timeouts": { "queue_timeout_secs": 3600, "assignment_timeout_secs": 60, "execution_timeout_secs": 900, "heartbeat_timeout_secs": 30, "lifetime_timeout_secs": 86400 },
+  "retry_policy": { "max_retries": 3, "max_liveness_requeues": 20, "strategy": "exponential", "base_interval_secs": 5, "max_interval_secs": 300, "jitter_factor": 0.2, "non_retryable_codes": ["INVALID_REPORT"] },
+  "run_after": null,
+  "sla_deadline": null,
+  "assignment": null,
+  "dead_lettered_from": null,
+  "superseded_by": null,
+  "created_at": "2026-11-03T10:00:00Z",
+  "updated_at": "2026-11-03T10:00:00Z",
+  "terminal_at": null
+}
+```
+
+| Field | Src | Notes |
 |---|---|---|
-| 5.1 | the task resource | schema `Task` (`assignment` never carries `lease_token`; `timeouts` and `retry_policy` are the effective values stored at create) |
-| 5.2 | create | `createTask`, schema `CreateTaskRequest` (its description gives the check order) |
-| 5.3 | claim | `claimTasks`, schemas `ClaimRequest`, `ClaimResponse`, `Lease` |
-| 5.4 | worker calls | `startTask`, `heartbeatTasks`, `reportProgress`, `saveCheckpoint`, `completeTask`, `releaseTask`, `createEntry`, `updateTaskTags` |
-| 5.5 | cancel | `cancelTask`, schema `CancelRequest` |
-| 5.6 | admin | `reenqueueTask`, `reassignTask`, `acceptReassignedTask`, `holdQueue`, `releaseQueue`, `saveRuntimeConfig`, `getRuntimeConfigStatus` |
-| 5.7 | bulk | `bulkCancel`, `bulkReprioritize`, `bulkRetry`, `bulkMove`, schema `BulkResult` |
-| 5.8 | waits | `setWaitConditions`, `parkWaitGroup`, `resolveWaitCondition`, `listWaitConditions` |
-| 5.9 | reads | `getTask`, `searchTasks`, `countTasks`, `listTaskEvents`, `listEntries`, `getEntry`, `listQueues`, `getQueue`, `listQueueEvents` |
+| `id`, `owner_tenant_id`, `owner_id`, `created_by`, `state`, `urgency`, `priority`, `attempt`, `cancellable`, `cancel_requested`, `input`, `context`, `result`, `progress`, `tags`, `resource_refs`, `parent_task_id`, `wait_for_children`, `propagate_cancel`, `timeouts`, `retry_policy`, `run_after`, `sla_deadline`, `created_at`, `updated_at` | D | Domain model, DESIGN.md:280-311 |
+| `domain`, `cancel_request { mode, requested_by, requested_at, reason, grace_until, superseded_by }`, `assignment.execution_deadline` | A | stored data now projected (G-WIRE-19); `null` when not applicable. Scenarios that do not assert them may omit them |
+| `type`, `queue` | A | GTS ID strings; DESIGN.md:282-283 `type_id`/`queue_id` typed `Uuid` to be retyped (G-WIRE-16, G-WIRE-17) |
+| `retry_count`, `liveness_requeues` | A | Stored counters (DESIGN.md:538-539), returned (G-WIRE-04) |
+| `predecessors[]` `{ task_id, on_predecessor_failure, outcome }`, `dependency_mode` (`all`\|`any`) | D/P/A | `on_predecessor_failure` is P; `outcome` (`pending`\|`succeeded`\|`failed_ignored`\|`failed`) replaces `satisfied` (A, G-WAI-37) |
+| `assignment` `{ assignee_subject, worker_id, claimed_at, attempt, lease_epoch, execution_deadline }` | D/A | DESIGN.md:329-340; never carries `lease_token`; `execution_deadline` is set by the claim (G-EXE-10) |
+| `dead_lettered_from`, `superseded_by`, `terminal_at` | D | DESIGN.md:545, :552; PRD.md:1546. Re-enqueue clears all three (G-RTY-12) |
+| `tags` as `[{ key, value }]`, each key at most once | A | agreed in the wire review (G-WIRE-04); PRD says key-value tags |
+| `timeouts`, `retry_policy` | A | Effective values, resolved and stored at create; `heartbeat_timeout_secs` is never `null` (G-CRT-04). Later config changes do not reach a live task (G-OPS-13); a move re-resolves the queue level (G-OPS-20) |
+
+The task resource never returns the `Idempotency-Key` (G-CRT-09).
+
+`result` when set (D, PRD.md:269):
+
+```json
+{ "result_code": "error", "output": null,
+  "error": { "domain": "acme.reports", "code": "RENDER_TIMEOUT", "message": "renderer timed out", "context": null, "fault": "dependency", "retryable": true },
+  "warnings": [] }
+```
+
+`resource_refs[]` (D, PRD.md:372-374): `{ "resource_type": "gts…~", "resource_id": "…", "verified": false }`.
+
+### 5.2 Create: `POST /tasks`
+
+```http
+POST /api/task_engine/v1/tasks HTTP/1.1
+Host: api.example.com
+Authorization: Bearer <creator-a-token>
+Content-Type: application/json
+Idempotency-Key: 7d1f0c2e-render-r-42
+
+{
+  "type": "gts.cf.core.tasks.task.v1~acme.reports._.render.v1~",
+  "queue": "gts.cf.core.tasks.queue.v1~acme.reports._.render.v1",
+  "priority": 100,
+  "input": { "report_id": "r-42", "format": "pdf" },
+  "tags": [{ "key": "project", "value": "q4" }]
+}
+```
+
+Required: `type` (A, G-WIRE-17) and `input` (D). `queue` (A, G-WIRE-17) is optional and defaults to the type's `default_queue`. Optional fields (D unless marked): `priority` (A: optional, default the queue's `default_priority`, G-CRT-26), `urgency`, `context`, `owner_id`, `timeouts` (any subset), `sla_deadline`, `retry_policy` (whole), `run_after`, `cancellable` (A: default `true`, G-CRT-27), `resource_refs`, `parent_task_id` + `parent_lease_token` (P: token required), `wait_for_children`, `propagate_cancel`, `predecessors[]` `{ task_id, on_predecessor_failure }` (A, G-WIRE-17; `on_predecessor_failure` P), `dependency_mode` (A: one per task, default `all`, G-WIRE-17, G-WAI-40), `wait` (P, initial wait group, shape as §5.8 without `lease_token`/`park`), `owner_tenant_id` (A, default the caller's tenant; the PDP decides, barrier `ignore` only on `operated_by: platform` queues, G-SEC-13).
+
+Field rules (A unless marked):
+
+- `Idempotency-Key`: 1–255 printable ASCII characters without spaces, case-sensitive; absent → `428`, empty or malformed → `400 INVALID_FORMAT` (G-CRT-09). On a retry the queue is compared with the queue resolved at create: absent or equal matches, another queue → `400` on `Idempotency-Key` (G-CRT-11).
+- `tags`: at most `max_tags_per_task` (16); key 1–128, value 0–256 characters (G-CRT-06). `resource_refs[].resource_id`: at most 256 characters (G-CRT-10). A dedup key-field value: at most 4 KiB in JCS form (G-CRT-16).
+- `run_after` in the past: stored as sent, task `queued`; later than `created_at` + lifetime timeout → `400` (G-CRT-22).
+- `timeouts` and `retry_policy`: a request value above the trust limit → `400`; an inherited or defaulted value above it is clamped (G-CRT-05). A partial `retry_policy` needs the schema's required fields; omitted optional ones take schema defaults (G-CRT-04).
+- `wait`: not with predecessors or a future `run_after` (`400`); p1 kinds `timer` only; `children` is `NOT_ALLOWED` in every phase; timeouts count from the create; a deferred admission; at most 16 conditions, none empty (G-CRT-01, G-WAI-06).
+- `predecessors`: the same task twice → `400 DUPLICATE` (G-WAI-42); a parent or predecessor is looked up only in the new task's domain, so one in another domain is `404` (G-WAI-41). Hierarchy depth at most `max_hierarchy_depth` (10, G-WAI-39).
+
+Check order (G-CRT-24): `413` body limit → JSON syntax → type (`400 UNKNOWN_TASK_TYPE` / `503`) → queue (`404` unknown, `400 DEAD_LETTER_QUEUE`, G-CRT-02, G-CRT-03) → PDP (`403` / `503`) → `expedite` (`403`) → `428` missing key → trust limits and domain (`400`) → schema and 64 KiB payload (`400` / `413`) → dedup and idempotency (`409`) → sampled depth (`429`, after dedup so a replay is never refused as full, G-CLM-24) → insert.
+
+Success: `201 Created`, `Location: /api/task_engine/v1/tasks/{task_1}`, body = the full task resource (A, G-WIRE-03). History: `taskCreated` with `initial_state` only, never `taskQueued` (G-SEC-23).
+
+Replay: `409` `already_exists` with `context.resource_type` = the task base type and `resource_name = {existing_id}` (D, DESIGN.md:1203; A, G-CRT-25). `STALE_ORDER` names no task.
+
+### 5.3 Claim: `POST /tasks/claim`
+
+```json
+{ "worker_id": "reports-7f9c-1", "session_id": null,
+  "queues": ["gts.cf.core.tasks.queue.v1~acme.reports._.render.v1"],
+  "max_tasks": 1, "timeout_secs": 30 }
+```
+
+`worker_id`, `session_id`, `queues`, `max_tasks` are D (DESIGN.md:1064); `timeout_secs` (DESIGN's `timeout`) is A: seconds, default `0` = no wait (G-CLM-19). Optional `domain` is P (Proposals › Domains › p1 lays the foundation): every named queue must be in that domain; it is required only when a named queue is in two domains (a move in progress, p3). p1 scenarios omit it.
+
+`200 OK`:
+
+```json
+{ "session_id": "{session_1}", "domain": "default", "heartbeat_interval_secs": 10,
+  "claims": [ {
+    "task": { "…": "task resource, state claimed" },
+    "lease": { "lease_token": "{lt_1}", "lease_epoch": 1, "attempt": 1, "lease_secs": 30, "domain": "default" },
+    "authority": { "mode": "creator_verified", "checked": [], "checked_at": "2026-11-03T10:00:00Z" },
+    "resumed": null
+  } ] }
+```
+
+| Field | Src | Notes |
+|---|---|---|
+| `session_id`, `heartbeat_interval_secs`, `claims[].task`, `claims[].lease` | D | DESIGN.md:1064, :1081 |
+| `lease.lease_token`, `lease_epoch`, `attempt` | D | DESIGN.md:1081 |
+| `lease.lease_secs` | A | session lease after this claim (ADR-0017:56) |
+| `domain` (response and `lease.domain`) | P | the task domain of the session and of each task (Proposals › Domains); `default` on a single-domain deployment |
+| `authority` | D | DESIGN.md:1043 |
+| `resumed` `{ wait_group_id, outcome: satisfied\|timed_out, conditions: [{ id, kind, state, result }] }` | A | PRD.md:550 says the resumed worker receives the wait result; shape not given |
+
+`204 No Content`: nothing eligible (also when every named queue is held or blacklisted for the worker, G-OPS-06, G-OPS-30). `429` + `Retry-After` (the claim poll interval, 1 s): an eligible task was skipped for capacity (D, PRD.md:429; A, G-CLM-09). A session is opened or renewed only by a claim that takes a task, so neither answer touches or returns a session (A, G-CLM-16). A `session_id` stored with another `worker_id` counts as unknown: a new session opens (G-CLM-17).
+
+Validation (A, G-CLM-18), before any session or PDP work: `REQUIRED` (missing `worker_id`, missing or empty `queues`), `INVALID_FORMAT` (`worker_id`), `OUT_OF_RANGE` (`max_tasks`), `TOO_MANY_QUEUES` (distinct queues), `DEAD_LETTER_QUEUE`, `CROSS_DOMAIN`, each on its JSON Pointer (`/queues/1`); an unregistered queue → `404` (G-CLM-15). Then the PDP: a named queue the policy provably excludes → `403` `QUEUE_NOT_PERMITTED` (G-CLM-14).
+
+The sequence diagram flattens the lease into each claim (`claims: [{task, lease_token, lease_epoch, attempt}]`, DESIGN.md:1297) while the endpoint table nests it (`claims: [{task, lease}]`, DESIGN.md:1064). Scenarios follow the table (G-WIRE-05).
+
+### 5.4 Worker calls
+
+All carry `lease_token` in the body (D, DESIGN.md:1081). `start`, `complete` and `release` return the full task resource, `checkpoint` returns `{ context }`, and each heartbeat result also carries `cancel_request` when a cancel is pending (A, G-WIRE-06).
+
+| Call | Body | Success |
+|---|---|---|
+| `POST /tasks/{id}/start` | `{ lease_token }` | `200` task resource, `state: running` |
+| `POST /tasks/heartbeat` (batch; the single-task heartbeat is removed, P) | `{ session_id, leases: [{ task_id, lease_token }] }` (D, DESIGN.md:1067) | `200 { session_id, heartbeat_interval_secs, results: [{ task_id, outcome: "ok", state, cancel_requested }, { task_id, outcome: "lease_lost" }] }` |
+| `POST /tasks/{id}/progress` | `{ lease_token, percent, milestone?, completed_units?, total_units?, current_stage?, eta? }` (fields D, PRD.md:753) | `200 OK` (D, DESIGN.md:1314), empty body; the update is buffered until the next flush |
+| `POST /tasks/{id}/checkpoint` | `{ lease_token, checkpoint: { … } }` | `200 { "context": { merged } }` |
+| `POST /tasks/{id}/complete` | `{ lease_token, result_code, output?, error?, warnings? }`, flat (D, DESIGN.md:1316) | `200` task resource (terminal, or `scheduled` for a retryable error) |
+| `POST /tasks/{id}/release` | `{ lease_token, delay_secs?, checkpoint? }` (D, DESIGN.md:1071) | `200` task resource (`queued` or `scheduled`) |
+| `POST /tasks/{id}/entries` (worker) | `{ lease_token, type, payload }` | `201` + `Location` + entry `{ id, task_id, type, creator, payload, created_at }` (A, G-EXE-18) |
+
+Consumer tag change (not a worker call, listed here for its shape): `PATCH /tasks/{id}/tags` `{ "set": [{ "key": "…", "value": "…" }], "remove": ["key"] }` (D, DESIGN.md:1075) → `200` task resource. Needs `update` (P: tags only). A key in both `set` and `remove` → `400`; the result over the per-task tag limit → `400` (P, limit value G-CRT-06).
+
+A reported failure is `complete` with `result_code: error` (D: the API table has no `/fail`, DESIGN.md:1070; A, G-WIRE-07). The body is flat (G-EXE-15).
+
+Worker-call rules (A):
+
+- `start` is optional. `complete`, a reported failure, a cancel acknowledgement, release, progress and set-wait are allowed from `claimed` too (G-EXE-11, G-WAI-20). A repeated `start` by the holder is a no-op `200` (G-EXE-10). The execution deadline is set by the claim and never moved by `start`; each claim, including one after a resume, gets the full timeout (G-RTY-22).
+- Fence failure: one unscoped re-read decides. Holder and token match but the scope no longer covers the task → the task is released, `403` `CLAIM_REVOKED`, history `taskQueued { reason: revoked }` without an actor (G-EXE-08). Anything else (unknown task, foreign tenant, stale token) → `409` `LEASE_LOST`; worker calls never answer `404` (G-EXE-09). A result that fails validation is checked against the fence before `400` is sent, so a lost lease wins (G-EXE-17).
+- A repeated non-terminal report (retryable failure, release) after a lost response gets `LEASE_LOST`; the SDK treats it as applied (G-EXE-16, G-RTY-05). Terminal completions stay replayable.
+- After expiry step 1 and before the requeue, a late write still succeeds (the token is the fence); the heartbeat already answers `lease_lost` (G-EXE-02).
+- Heartbeat with an unknown, expired or foreign session: `200`, every lease `lease_lost`, the same body in all three cases (G-EXE-01). More than `heartbeat_batch_max` (500) leases → `400 TOO_MANY` on `/leases` (G-EXE-04). A cancel caused by a supersession carries `cancel_request.superseded_by` (G-CRT-17).
+- Checkpoint merge is RFC 7386 JSON Merge Patch (`null` deletes a key); every call that carries a checkpoint records `taskCheckpointed` (G-EXE-13, G-WAI-15). Checkpoint is p1 (G-EXE-12).
+- `release.delay_secs`: 0 to `release_max_delay_secs` (86,400); 0 = immediate; otherwise `400 OUT_OF_RANGE` (G-EXE-25). A delayed release refused by the deferred limit keeps the lease (`429`, G-EXE-23). History: `taskQueued { reason: released, run_after? }` (G-EXE-24).
+- Output is validated against the type revision stored at create (G-EXE-14).
+- Entries: an API consumer may add entries in any state until the task is removed; a worker needs its lease; at most `max_entries_per_task` (1000) per task, else `400` `failed_precondition` `TOO_MANY_ENTRIES` (G-EXE-21). Unknown entry type → `400 UNKNOWN_ENTRY_TYPE` (G-EXE-19). `PUT`/`PATCH`/`DELETE` on an entry → `405` with `Allow` (G-EXE-22).
+
+### 5.5 Cancel: `POST /tasks/{id}/cancel`
+
+`{ "mode"?: "requested" | "graceful" | "forced", "reason"?: string }`: mode values D (PRD.md:346); body optional, `mode` defaults to `requested` (A, G-RTY-18).
+
+- Unleased task, any mode → `200`, task `cancelled` (result `cancelled`, or `forcibly_cancelled` for `forced`).
+- Leased task, `requested`/`graceful` → `202 Accepted` with the task resource, unchanged except `cancel_requested: true` and `cancel_request` (A, G-WIRE-08).
+- Leased task, `forced` → `200`, `cancelled` / `forcibly_cancelled`.
+- Already ended in the cancelled family (`cancelled`, `forcibly_cancelled`, `superseded`, `dependency_failed`) → `200`, task unchanged, no event; any other terminal state → `400` `failed_precondition` `TASK_FINISHED` (A, G-RTY-13).
+- `cancellable: false` with `requested`/`graceful` → `400` `failed_precondition` `NOT_CANCELLABLE`; `forced` still works (A, G-RTY-14).
+- A flagged task: modes only move forward. `requested` → `graceful` arms the grace timer; the same mode again, or `requested` after `graceful`, is a no-op `202` (A, G-RTY-16). The grace period is the engine-wide `cancel_grace_period_secs` (G-RTY-19).
+- Events: `taskCancelRequested` only when a leased task is flagged or escalated; an immediate or forced cancel records only `taskCancelled` with `actor` and `mode` (A, G-RTY-15).
+- The worker acknowledges with `complete` `result_code: cancelled`. After a cancel request `success`/`warning` still end the task `completed`; any `error` ends it `cancelled` with no retry (A, G-RTY-17, G-OPS-38). After a graceful supersession, `error` and `cancelled` end it `superseded` (G-CRT-18).
+- Cascade to children: each unfinished child is cancelled in the parent's mode; children end `cancelled`, or `forcibly_cancelled` when forced, never `superseded` (A, G-WAI-23, G-CRT-21). A parent with `propagate_cancel` that ends in any other non-success state cascades in `graceful` mode (G-WAI-38).
+- `reason`: at most 1024 characters (G-OPS-47).
+
+### 5.6 Admin
+
+| Call | Body | Success |
+|---|---|---|
+| `POST /admin/tasks/{id}/reenqueue` | none, or `{ queue? }` (A, G-RTY-20: a dispatch queue routed to the task's domain; unknown → `404`, dead-letter → `400 DEAD_LETTER_QUEUE`; another queue re-resolves settings like a move) | `200` task resource, `queued` |
+| `POST /tasks/{id}/reassign` | `{ subject_id, worker_id, reason? }` (D; `reason` A, G-OPS-41) | `200` task resource, no token |
+| `POST /tasks/{id}/accept` | `{ worker_id, session_id? }` (D) | `200 { session_id, domain, heartbeat_interval_secs, task, lease, authority }` (A, G-WIRE-21) |
+| `POST /admin/queues/{id}/hold` (P) | `{ reason?, until? }` | `200` queue resource |
+| `POST /admin/queues/{id}/release` (P) | none | `200` queue resource |
+| `POST /admin/config` | `{ "queues": { "<queue id or pattern>": { …settings } }, "types": { … } }` (S) | `202 { "config_version": 7 }` (D, DESIGN.md:1129) |
+| `GET /admin/config/{version}` | — | `200 { config_version, domains: [{ domain, applied: true }] }` (S) |
+
+Admin rules (A):
+
+- Hold: `until` must be in the future (`400`); holding a held queue replaces `reason` and `until`, keeps `since`, sets `by`, records another `queueHeld`; releasing an unheld queue → `200` with `hold: null`, no event; holding a dead-letter queue → `400` `failed_precondition` `DEAD_LETTER_QUEUE` (G-OPS-08, G-OPS-09, G-OPS-10).
+- Re-enqueue: clears `terminal_at`, the result, `dead_lettered_from` and a passed `sla_deadline` (G-RTY-12); a child whose parent ended → `400` `failed_precondition` `PARENT_FINISHED` (G-WAI-24).
+- Reassign: only `claimed`/`running`; a pending hand-off can be reassigned again; a target blacklisted on the queue → `400` `failed_precondition` `TARGET_BLACKLISTED`; the target's rights are checked only when it accepts (G-OPS-27). Accept records `taskClaimed` with `handoff: true` (G-OPS-41). An expired hand-off gives no blacklist strike and uses the liveness budget (G-OPS-26).
+- `POST /admin/config`: one `configure` check on the queue base type, all-or-nothing (G-OPS-40). Pattern specificity: exact ID, then longest literal prefix; equal-specificity overlaps are rejected at load; a runtime override beats a static one (G-CLM-21, G-OPS-12).
+
+### 5.7 Bulk: `POST /tasks/bulk/{cancel|reprioritize|retry|move}`
+
+Body `{ "task_ids": [...], …op fields }` (S: `mode` for cancel; `priority`/`urgency` for reprioritize; `queue` for move). Response `200 { "results": [{ "task_id", "outcome": "succeeded" | "unauthorized" | "not_found" | "invalid_state" | "cancel_requested" | "limit_exceeded" | "domain_mismatch" }] }` (D, DESIGN.md:1119; the last three A: G-OPS-16, G-CLM-25, G-OPS-21). Bulk reprioritize and move stay as on `main` (the proposals do not touch them).
+
+- More than `bulk_max_ids` (1000) IDs → `400` `BATCH_TOO_LARGE` on `/task_ids` (A, G-OPS-15). An outright PDP denial of the action → `403` `ACTION_DENIED` for the whole request; otherwise denials are per task (A, G-OPS-14).
+- `cancel_requested`: a leased task that was only flagged; `succeeded` means the task ended (G-OPS-16). `limit_exceeded`: refused by depth admission, others proceed (G-CLM-25). `domain_mismatch`: the destination is in another domain (G-OPS-21). An unknown or dead-letter destination refuses the whole request (`404` / `400 DEAD_LETTER_QUEUE`), because one destination serves every task (G-CRT-02, G-CRT-03). Bulk retry reports any per-task precondition refusal (`TASK_DOMAIN_MISMATCH`, `PARENT_FINISHED`, `STALE_ORDER`) as `invalid_state` (G-RTY-20).
+- A move re-resolves queue-level settings, keeps request- and type-level ones, and re-arms the queue timeout from the move (G-OPS-20). Each change records `taskUpdated { actor, changes }` (G-OPS-19).
+
+### 5.8 Waits
+
+Set (worker): `POST /tasks/{id}/wait-conditions`
+
+```json
+{ "lease_token": "{lt_1}", "mode": "all", "park": true, "checkpoint": { "step": 3 },
+  "conditions": [
+    { "kind": "timer", "resume_at": "2026-11-03T11:00:00Z" },
+    { "kind": "input", "input_schema": { "type": "object", "required": ["approved"], "properties": { "approved": { "type": "boolean" } } }, "prompt": "Approve export?", "timeout_secs": 86400, "on_timeout": "fail" },
+    { "kind": "children" },
+    { "kind": "event", "event_type": "gts.cf.core.events.event.v1~acme.orders._.paid.v1~", "subject_type": "gts.acme.orders._.order.v1~", "subject_id": "o-17", "timeout_secs": 3600, "on_timeout": "resume" }
+  ] }
+```
+
+`mode` (`all`\|`any`), `park`, `checkpoint`, `conditions[]`, `kind`, `resume_at`, `input_schema`, `prompt`, `event_type`, `subject_type`, `subject_id`, `match_expression`, `on_timeout` (`fail`\|`resume`) are D (DESIGN.md:360-391, :1095). `timeout_secs` is A: relative seconds in, absolute `timeout_at` out (G-WIRE-09).
+
+Success `200 { "wait_group": { "id", "mode", "parked": true, "conditions": [{ "id": "{wc_1}", "kind", "state": "pending", "timeout_at" }] }, "task_state": "waiting" }` (S).
+
+A set whose group resolves at once (a past `resume_at`, no unfinished children) behaves like parking a satisfied armed group: `200 { "parked": false, "result": { …resumed shape } }`, lease kept, task stays `running`; the group is consumed: its conditions stay listed as `satisfied` but it is not current, so no claim returns it (A, G-WAI-10, G-WAI-13). Set is allowed from `claimed` (G-WAI-20). Missing `lease_token` → `400 REQUIRED` before any lookup (G-WAI-01). A condition with a timeout and no `on_timeout` gets `fail`; `on_timeout` without a timeout → `400` (G-WAI-32). A timeout on a `timer` condition → `400` (G-WAI-09). At most `wait.max_conditions_per_group` (16), none empty (G-WAI-06).
+
+Park: `POST /tasks/{id}/wait-conditions/park` `{ lease_token, checkpoint? }` → `200 { "parked": false, "result": { …resumed shape } }` when already satisfied, else `200 { "parked": true, "task_state": "waiting" }` (D for behaviour, DESIGN.md:1096; S for shape). Nothing armed → `400` `failed_precondition` `NO_ARMED_WAIT`, lease kept (A, G-WAI-13). Arm works for every kind: an armed timer is satisfied once `resume_at` passes (checked at park), an armed input can be resolved, an armed children condition is evaluated at park (A, G-WAI-17, G-WAI-21).
+
+A task has one current wait group at a time. A parked group stays current after it resolves, until a new set or arm makes another group current or the task ends, and every claim of the task returns it in `claims[].resumed` (A, G-WAI-14). A replaced group's conditions stay stored and listed (Proposals › Waits). A task resumed from a create-time group is claimed with `attempt` 1 (G-WAI-19). Timer conditions and wait timeouts fire from one `wait` timer per task at the earliest pending deadline (G-WAI-09).
+
+Resolve (input): `POST /wait-conditions/{id}/resolve` `{ "value": { … } }` → `200 { "condition": { "id", "kind": "input", "state": "satisfied", "resolved_at", "resolved_by" } }` (S, `resolved_by` P). Needs `resolve` only, not `read` (P; A, G-SEC-18). Repeat (P, Proposals › Waits › `resolve`): same value (canonical JSON) from the same subject → `200`, same body, `Idempotency-Replayed: true`, no write; a different value, or the same value from another subject → `400` `failed_precondition` `ALREADY_RESOLVED` (A, G-WAI-05); a `cancelled` or `timed_out` condition → `400` `failed_precondition`; a timer, event or children condition → `400` `failed_precondition` `NOT_RESOLVABLE` (A, G-WAI-05). The value is checked alone against the 64 KiB payload limit (`413`, G-WAI-22).
+
+p1 refusals (P, Proposals › Waits › Input and children waits stay p2; A, G-WAI-43): a condition of kind `input`, `children` or `event` (set by a worker, or in the create `wait` group), and `parent_task_id` on create, → `400` `invalid_argument` with a field violation (`reason: FEATURE_NOT_AVAILABLE`) on that field. `wait_for_children` and `propagate_cancel` are accepted and stored.
+
+Condition states (A, G-WIRE-09): `pending` → `satisfied` \| `timed_out` \| `cancelled`.
+
+### 5.9 Reads
+
+- `GET /tasks/{id}` → task resource.
+- **Paging** (every list that can grow; `guidelines/DNA/REST/QUERYING.md` through the ToolKit OData extractor): request `limit` (alias `$top`) and `cursor` (alias `$skiptoken`); scenarios write `limit` and `cursor`. Response `{ "items": [...], "page_info": { "next_cursor", "prev_cursor", "limit" } }`, no total. Default page size 25 (A, G-SEC-25), larger values clamped to the endpoint's cap, `limit=0` → `400` on `$top` (`INVALID_LIMIT`). A cursor is bound to its request: another `$filter` → `FILTER_MISMATCH`, `$orderby` with a cursor → `ORDER_WITH_CURSOR`, another `$select` or `view` → `FIELD_SELECTION_MISMATCH` (A, G-SEC-26), a bad token → `INVALID_CURSOR`; all `400`, violation on `cursor`.
+- `GET /tasks/{id}/events?limit=50&cursor=…&$filter=event_type eq 'taskRetrying'` → `200 { "items": [{ "id": "{evt_1}", "event_type": "taskCreated", "actor": "{creator_a}", "payload": { … }, "timestamp": "…" }], "page_info": { … } }`. Oldest first by event ID; `$filter` on `event_type` (`eq`, `in`) and `timestamp`; default 25, cap 100 (P for paging and filters; A for the item shape, `actor` `null` for engine-caused events, G-WIRE-10; A for sort and page sizes, G-SEC-07). A `taskRetrying` item carries the full `error` (G-RTY-03).
+- `GET /queues/{id}/events` → queue-scoped history (`queueHeld`, `queueReleased`, `configUpdated`, `workerBlacklisted`), same paging, needs queue `read` (A, G-OPS-05).
+- `GET /tasks?$filter=…&$orderby=…&limit=…&view=short` → page of tasks (D, DESIGN.md:1136-1178); cap 100, 20 at `view=full`. An outright `read` denial → `403` `ACTION_DENIED`; a scope that matches nothing → empty page (A, G-SEC-20). Tag and resource-reference filters are engine functions, because the ToolKit parser has no `any()` lambda: `has_tag('project')`, `has_tag('project', 'q4')`, `has_resource_ref('<type>', '<id>')`; `parent_task_id eq …`, `predecessor_id eq …` and `dead_lettered_from eq …` are plain fields (A, G-SEC-05, G-RTY-11). The `created_at` window applies as designed (DESIGN.md:2824 exempts unfinished-only state filters); a search whose state filter restricts it to `dead_lettered` is exempt too, whatever its other filters (G-RTY-10). An unsupported `$orderby` key, a `$select` field outside the view or an unknown `view` → `NOT_ALLOWED` on that parameter; a range over the window → `OUT_OF_RANGE` on `$filter` (G-SEC-26). A `queue` filter on a dead-letter queue searches every domain (G-OPS-23). The 13 filter fields are a documented exception to the REST guideline's cap (G-SEC-27).
+- `GET /tasks/count?$filter=…` → `{ "count": n, "capped": bool }` (D, DESIGN.md:1174).
+- `GET /tasks/{id}/entries` (paged, `created_at asc`, `$filter` on `type`, `creator`, `created_at`), `GET /tasks/{id}/entries/{entry_id}`.
+- `GET /tasks/{id}/wait-conditions` → paged list of every condition of the task, current and resolved (kept until retention, Proposals › Waits), `created_at asc`, `$filter` on `wait_group_id`, `state`, `kind` (S).
+- `GET /queues`, `GET /queues/{id}` → queue resource (S):
+
+```json
+{ "id": "gts.cf.core.tasks.queue.v1~acme.reports._.render.v1", "kind": "dispatch",
+  "limits": { "global_concurrency_limit": 50, "per_tenant_concurrency_limit": 5,
+              "queue_max_queue_depth": 1000000, "tenant_max_queue_depth": 100000 },
+  "domains": ["default"],
+  "counts": { "queued": 12, "running": 3, "claimed": 0, "scheduled": 4, "blocked": 0, "waiting": 1 },
+  "sampled_at": "2026-11-03T10:00:00Z",
+  "hold": null }
+```
+
+`settings` (A, G-OPS-43): the effective non-limit settings (`default_priority`, `timeouts`, `retry_policy`, `tenant_fairness`, `dead_letter_queue`, `operated_by`, `accepted_types`, progress and blacklist settings) and `config_version`; `limits` also carries `tenant_max_deferred_tasks`. `domains` (P): the queue's domain set, primary first, plus the source domain while a move lasts. `hold` when set (P): `{ "since", "by", "reason", "until" }`. `sampled_at` is A: when the leader's sample was taken; all depth samples and the counts come from one pass, so tests wait until `sampled_at` is later than their setup (G-OPS-01, G-CLM-13). `counts` and `sampled_at` are returned only to callers that hold `configure` on the queue; others get the queue without them (A, G-OPS-02). A `dead_letter` queue is not routed, so its `domains` is empty (S).
 
 ### 5.10 Lifecycle events
-
-Events are not in the OpenAPI (their `data` is defined by the event schemas in `docs/schemas/types/`), so their rules stay here.
 
 Events in `GET /tasks/{id}/events` and on the broker topic `gts.cf.core.events.topic.v1~cf.core.tasks.task_events.v1`. Broker event type IDs are `gts.cf.core.events.event.v1~cf.core.tasks.<snake_name>.v1~` (D, `schemas/types/`); the history uses the camelCase name (`taskCreated`, PRD.md:879). Assert the event name and the payload keys a scenario cares about; check payload keys against the schema file.
 
@@ -280,13 +549,68 @@ Decided event rules (A; the schema files change under each gap's `Remaining`):
 
 ## 6. Errors
 
-Errors are RFC 9457 problem documents built from the platform canonical categories (D, DESIGN.md:1180-1236; `docs/arch/errors/DESIGN.md`). [ERRORS.md](ERRORS.md) shows the envelope, the category → status → `context` table, and every code with the scenario that owns it; the OpenAPI's error responses and `Problem` schema carry the same rules. The rules scenarios rely on most:
+All errors are RFC 9457 with the platform canonical categories (D, DESIGN.md:1180-1236; `docs/arch/errors/DESIGN.md`):
 
-- A code sits where its category allows it: `context.reason` only for `permission_denied`, `aborted` and `unauthenticated`; `field_violations[].reason` for `invalid_argument`; `violations[{ type: "STATE", subject: <code> }]` for `failed_precondition`; quota `violations[].subject` (`queue_depth.<dimension>`, `concurrency`, `event_waits.<dimension>`) for `resource_exhausted` (G-WIRE-14).
-- Field paths are RFC 6901 JSON Pointers from the body root; a header or query parameter is named as sent (G-SEC-21). `404` and `403` carry no field violations (G-WIRE-15).
-- Every `429` and `503` carries `Retry-After` (G-SEC-03).
-- A request about a task the caller may not read gets the same `404` as a missing task; `403` only when it may read but not act. Worker calls never answer `404` (PRD.md:918, G-EXE-09).
-- Do not invent other `context` keys; put extra detail into a `description`, which never echoes a value the caller sent.
+```json
+{
+  "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.<category>.v1~",
+  "title": "<Category Title>",
+  "status": 409,
+  "detail": "<human-readable detail>",
+  "instance": "/api/task_engine/v1/<path>",
+  "trace_id": "<trace>",
+  "context": { … }
+}
+```
+
+- `type` uses the `gts://` URI form of the platform errors DESIGN (`docs/arch/errors/DESIGN.md:525`). The Task Engine DESIGN example (DESIGN.md:1186) omits `gts://`: gap `G-WIRE-01`.
+- **What the library can build** (`libs/toolkit-canonical-errors/src/context.rs`). Any category may add `resource_type` and `resource_name`. Beyond that:
+
+  | Category | `context` keys |
+  |---|---|
+  | `invalid_argument` | exactly one of `field_violations[{field, description, reason}]`, `format`, `constraint` |
+  | `failed_precondition` | `violations[{type, subject, description}]` (required) |
+  | `resource_exhausted` | `violations[{subject, description, retry_after_seconds?}]` (required) |
+  | `permission_denied`, `aborted` | `reason` (required) |
+  | `unauthenticated` | `reason?` |
+  | `service_unavailable` | `retry_after_seconds?` |
+  | `not_found`, `already_exists` | nothing else |
+
+- **Where a code goes** (A, G-WIRE-14, G-SEC-02, G-CLM-10). Only `permission_denied`, `aborted` and `unauthenticated` have `context.reason`. The other categories carry the code in the slot the library builds, and never in `context.reason`:
+
+  | Category | Code goes in | Example |
+  |---|---|---|
+  | `invalid_argument` | `field_violations[].reason`; every code names a field | `{ "field": "/type", "reason": "UNKNOWN_TASK_TYPE" }` |
+  | `failed_precondition` | `violations[{ type: "STATE", subject: <code> }]`, `resource_name` = the task or queue | `{ "type": "STATE", "subject": "STALE_ORDER" }` |
+  | `resource_exhausted` | `violations[].subject` from a closed list: `queue_depth.queue`, `queue_depth.tenant`, `queue_depth.domain_global`, `queue_depth.deferred`, `concurrency`, `event_waits.<dimension>` | `{ "subject": "queue_depth.tenant", "retry_after_seconds": 30 }` |
+
+  `resource_exhausted` names the queue in `resource_type`/`resource_name` for `queue`, `tenant`, `domain_global` and `concurrency`, and the task base type without a name for `deferred`. A plain state conflict uses `subject: "STATE"`.
+- **Field paths** (A, G-SEC-21): an RFC 6901 JSON Pointer from the request body root (`/type`, `/queues/1`, `/wait/conditions/0/kind`, `/input/report_id`); a header or query parameter is named as sent (`Idempotency-Key`, `cursor`). A user-schema failure (input, output, entry, resolve value) has reason `SCHEMA_VIOLATION`, and its `description` names the failed keyword, never the value.
+- **No field violations on `404` / `403`** (A, G-WIRE-15). A `404` carries only `resource_type` and `resource_name`. A `403` carries its reason; the creator-check or condition index goes only into `detail`.
+- `field_violations[].reason` values (A, G-CRT-07 and the gap review): generic `REQUIRED`, `INVALID_FORMAT`, `OUT_OF_RANGE`, `TOO_LONG`, `TOO_MANY`, `DUPLICATE`, `PAYLOAD_TOO_LARGE`, `INVALID_ENUM_VALUE`, `NOT_ALLOWED`, `SCHEMA_VIOLATION`, `SCHEMA_TOO_LARGE`, `NOT_FOUND`, `UNSUPPORTED_QUERY_PARAM`; Task-Engine codes `UNKNOWN_TASK_TYPE`, `UNKNOWN_ENTRY_TYPE`, `UNKNOWN_EVENT_TYPE`, `TASK_DOMAIN_MISMATCH`, `DEPENDENCY_GRAPH_TOO_LARGE`, `EVENT_TOPIC_NOT_WAITABLE`, `EVENT_SUBJECT_TYPE_REQUIRED`, `EVENT_SUBJECT_TYPE_NOT_ALLOWED`, `INVALID_MATCH_EXPRESSION`, `BATCH_TOO_LARGE`, `TOO_MANY_TAGS`, `TOO_MANY_QUEUES`, `TOO_DEEP`, `DEAD_LETTER_QUEUE`, `CROSS_DOMAIN`, `TRUST_LIMIT`, `QUEUE_KIND`, `KEY_REUSED`, `INVALID_TYPE_POLICY`, `FEATURE_NOT_AVAILABLE`, and the cursor codes `INVALID_CURSOR`, `FILTER_MISMATCH`, `ORDER_WITH_CURSOR`, `FIELD_SELECTION_MISMATCH`, `INVALID_LIMIT`.
+- `failed_precondition` subjects (A): `STATE`, `STALE_ORDER`, `CHILDREN_PENDING`, `TASK_FINISHED`, `NOT_CANCELLABLE`, `NO_ARMED_WAIT`, `ALREADY_RESOLVED`, `NOT_RESOLVABLE`, `DEPENDENCY_UNSATISFIABLE`, `PARENT_FINISHED`, `TARGET_BLACKLISTED`, `TOO_MANY_ENTRIES`, `DEAD_LETTER_QUEUE` (hold).
+- `permission_denied` reasons (A, G-SEC-19): `ACTION_DENIED`, `EXPEDITE_REQUIRED`, `QUEUE_NOT_PERMITTED`, `CREATOR_AUTHORITY`, `CREATOR_AUTHORITY_UNVERIFIABLE`, `EVENT_CONSUME_DENIED`, `EVENT_CONSUME_UNVERIFIABLE`, `DUPLICATE_NOT_READABLE`, `SUPERSEDE_CANCEL_DENIED`, `CLAIM_REVOKED` (the task was released; the worker drops it).
+- `aborted` reasons (A, G-SEC-22): `LEASE_LOST` (worker writes), `CONCURRENT_MODIFICATION` (payload revision), `STATE_CHANGED` (a non-worker write whose state guard lost, or a supersession out of retries).
+- Do not invent other `context` keys; put extra detail into a `description`.
+- `Retry-After` (A, G-SEC-03, G-CLM-09): sent on every `429` and `503`. The library change emits the header for `resource_exhausted` from the largest `violations[].retry_after_seconds`. Values: `CONCURRENCY_LIMIT` (subject `concurrency`) = the claim poll interval rounded up (1 s); depth and event-wait limits = `retry_after_secs` (30) jittered uniformly in [15, 30]; `503` = `unavailable_retry_after_secs` (5). Scenarios assert the header is a positive integer and, for depth, within [15, 30].
+- `503` (A): PDP unreachable on any endpoint (G-SEC-01), registry unreachable for an uncached type (G-CRT-23), and node overload (admission shed, G-EXE-07). Overload is never `429`.
+- Category → status (platform defaults, overrides as DESIGN says):
+
+| Category | Title | Status in Task Engine |
+|---|---|---|
+| `invalid_argument` | Invalid Argument | 400; 413 for payload/body size; 428 for a missing `Idempotency-Key` |
+| `unauthenticated` | Unauthenticated | 401 |
+| `permission_denied` | Permission Denied | 403 |
+| `not_found` | Not Found | 404 |
+| `already_exists` | Already Exists | 409 |
+| `aborted` | Aborted | 409 (`LEASE_LOST`, `CONCURRENT_MODIFICATION`, `STATE_CHANGED`) |
+| `failed_precondition` | Failed Precondition | 400 (subjects listed above) |
+| `resource_exhausted` | Resource Exhausted | 429 + `Retry-After` |
+| `service_unavailable` | Service Unavailable | 503 |
+| `internal` | Internal | 500 |
+
+- `429` names only the full dimension, never usage numbers (PRD.md:455).
+- A request about a task the caller may not read gets the same `404` as a missing task; `403` only when it may read but not act (PRD.md:918, DESIGN.md:1016).
 
 ## 7. Side-effect vocabulary
 
