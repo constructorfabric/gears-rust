@@ -912,6 +912,10 @@ bytes = "1.11"
 mime = "0.3"
 
 # Document parsing libraries
+# Read-only OOXML containers (DOCX, PPTX) in file-parser: inflate only, no
+# encryption, no other codecs. Must stay >= 9 (RUSTSEC-2026-0367/0368/0369/0429,
+# 0545–0548 affect zip < 9).
+zip = { version = "9.8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 docx-rust = "0.1.11"
 # `bundled-pdfium` downloads a prebuilt libpdfium at build time rather than vendoring one;
 # Cargo.lock does not pin it. The version lives in .cargo/config.toml as PDFIUM_VERSION.

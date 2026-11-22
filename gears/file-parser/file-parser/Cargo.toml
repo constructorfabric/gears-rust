@@ -76,6 +76,8 @@ tempfile = { workspace = true }
 
 # Document parsing libraries
 kreuzberg = { workspace = true }
+zip = { workspace = true }
+quick-xml = { workspace = true }
 
 # Content-based file type detection (optional, behind the `magika` feature)
 magika = { workspace = true, optional = true }
