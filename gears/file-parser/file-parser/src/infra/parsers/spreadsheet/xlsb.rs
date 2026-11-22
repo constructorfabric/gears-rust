@@ -9,11 +9,11 @@
 
 use crate::domain::error::DomainError;
 use crate::infra::parsers::limits::{ParseLimits, limit_exceeded};
-use crate::infra::parsers::ooxml::Archive;
+use crate::infra::parsers::ooxml::{self, Archive};
 
+use super::Sink;
 use super::cells::bool_text;
 use super::shared::{CellFormats, SharedStrings, error_text, number_text, rk_value};
-use super::{Sink, xlsx};
 
 const BRT_ROW_HDR: u16 = 0x0000;
 const BRT_CELL_RK: u16 = 0x0002;
@@ -50,7 +50,7 @@ pub(super) fn read(
         .find(|r| !r.external && archive.contains(&r.target))
         .map_or_else(|| "xl/workbook.bin".to_owned(), |r| r.target.clone());
     let title = match root.of_type("core-properties").find(|r| !r.external) {
-        Some(rel) => xlsx::core_title(&mut archive, &rel.target.clone())?,
+        Some(rel) => ooxml::core_title(&mut archive, &rel.target.clone())?,
         None => None,
     };
 

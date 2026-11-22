@@ -28,7 +28,8 @@ use crate::domain::ir::{
 use crate::domain::parser::FileParserBackend;
 
 use super::bounded_read::read_bounded;
-use super::limits::{ParseLimits, TableBudget, limit_exceeded};
+use super::inlines::{Inlines, link_target};
+use super::limits::{ParseLimits, TableBudget, TextBudget, skipped_table_note};
 
 /// Ceiling applied by [`HtmlParser::new`], matching `FileParserConfig`'s
 /// `max_file_size_mb` default; `Gear::init` passes the configured value.
@@ -36,8 +37,6 @@ const DEFAULT_MAX_BYTES: u64 = 100 * 1024 * 1024;
 
 const SUPPORTED_EXTENSIONS: &[&str] = &["html", "htm"];
 
-/// Longest link target or image source kept; longer ones (inline data) drop.
-const MAX_URL_LEN: usize = 2048;
 /// Element nesting the converter follows. Deeper content is flattened into
 /// the current paragraph (as browsers flatten over-deep trees), which keeps
 /// the recursion well inside a 2 MiB thread stack.
@@ -326,138 +325,13 @@ fn collapse(text: &str) -> String {
     out
 }
 
-/// A link target worth keeping: relative, or with a scheme readers can
-/// follow (`http`, `https`, `mailto`, `ftp`, `tel`). Browsers ignore tabs and
-/// line breaks in URLs, so those are removed before the scheme is judged.
-fn link_target(href: &str) -> Option<String> {
-    let href: String = href
-        .chars()
-        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
-        .collect();
-    let href = href.trim_matches(|c: char| c <= ' ');
-    // A consumer trimming Unicode whitespace would see the scheme behind it.
-    if href.is_empty()
-        || href.len() > MAX_URL_LEN
-        || href.starts_with(|c: char| c.is_whitespace() || c.is_control())
-    {
-        return None;
-    }
-    let scheme = href.split_once(':').map(|(scheme, _)| scheme).filter(|s| {
-        s.starts_with(|c: char| c.is_ascii_alphabetic())
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-    });
-    match scheme {
-        None => Some(href.to_owned()),
-        Some(s)
-            if ["http", "https", "mailto", "ftp", "tel"]
-                .iter()
-                .any(|ok| s.eq_ignore_ascii_case(ok)) =>
-        {
-            Some(href.to_owned())
-        }
-        Some(_) => None,
-    }
-}
-
-/// Inline runs being collected for one paragraph or heading.
-#[derive(Default)]
-struct Inlines {
-    runs: Vec<Inline>,
-}
-
-impl Inlines {
-    fn push(&mut self, text: &str, style: &InlineStyle, link: Option<&str>) {
-        if text.is_empty() {
-            return;
-        }
-        // Merge with the previous run when nothing but the text differs.
-        match (self.runs.last_mut(), link) {
-            (
-                Some(Inline::Text {
-                    text: prev,
-                    style: s,
-                }),
-                None,
-            ) if s == style => {
-                prev.push_str(text);
-            }
-            (
-                Some(Inline::Link {
-                    text: prev,
-                    target,
-                    style: s,
-                }),
-                Some(l),
-            ) if s == style && target == l => prev.push_str(text),
-            _ => self.runs.push(match link {
-                Some(target) => Inline::Link {
-                    text: text.to_owned(),
-                    target: target.to_owned(),
-                    style: style.clone(),
-                },
-                None => Inline::Text {
-                    text: text.to_owned(),
-                    style: style.clone(),
-                },
-            }),
-        }
-    }
-
-    /// Whether the last character pushed is a space or line break (or
-    /// nothing has been pushed), so a following space is redundant.
-    fn ends_with_space(&self) -> bool {
-        self.runs.last().is_none_or(|run| {
-            let (Inline::Text { text, .. } | Inline::Link { text, .. } | Inline::Code { text, .. }) =
-                run;
-            text.ends_with([' ', '\n'])
-        })
-    }
-
-    /// The runs with leading and trailing whitespace removed; empty if
-    /// nothing but whitespace was collected.
-    fn take(&mut self) -> Vec<Inline> {
-        let mut runs = std::mem::take(&mut self.runs);
-        let mut start = 0;
-        while let Some(run) = runs.get_mut(start) {
-            let text = run_text(run);
-            let trimmed = text.trim_start_matches([' ', '\n']).to_owned();
-            if trimmed.is_empty() {
-                start += 1;
-            } else {
-                *text = trimmed;
-                break;
-            }
-        }
-        runs.drain(..start);
-        while let Some(last) = runs.last_mut() {
-            let text = run_text(last);
-            let trimmed = text.trim_end_matches([' ', '\n']).to_owned();
-            if trimmed.is_empty() {
-                runs.pop();
-            } else {
-                *text = trimmed;
-                break;
-            }
-        }
-        runs
-    }
-}
-
-fn run_text(run: &mut Inline) -> &mut String {
-    match run {
-        Inline::Text { text, .. } | Inline::Link { text, .. } | Inline::Code { text, .. } => text,
-    }
-}
-
 struct Converter {
     depth: usize,
     /// Above zero while collecting a heading, term or caption: block
     /// elements there add to the same line instead of starting blocks.
     inline_mode: usize,
     budget: TableBudget,
-    text_left: usize,
-    max_text: usize,
+    text: TextBudget,
 }
 
 impl Converter {
@@ -466,19 +340,12 @@ impl Converter {
             depth: 0,
             inline_mode: 0,
             budget: TableBudget::new(limits),
-            text_left: limits.max_text_bytes,
-            max_text: limits.max_text_bytes,
+            text: TextBudget::new(limits),
         }
     }
 
     fn charge(&mut self, bytes: usize) -> Result<(), DomainError> {
-        self.text_left = self.text_left.checked_sub(bytes).ok_or_else(|| {
-            limit_exceeded(
-                "max_text_bytes",
-                format!("document text exceeds {} bytes", self.max_text),
-            )
-        })?;
-        Ok(())
+        self.text.charge(bytes)
     }
 
     /// Converts the children of a block element into `out`, gathering loose
@@ -1030,14 +897,6 @@ fn empty_cell() -> TableCell {
         blocks: vec![ParsedBlock::Paragraph {
             inlines: vec![Inline::plain("")],
         }],
-    }
-}
-
-fn skipped_table_note(remaining: usize) -> ParsedBlock {
-    ParsedBlock::Paragraph {
-        inlines: vec![Inline::plain(format!(
-            "[Table skipped: it does not fit the remaining limit of {remaining} table cells]"
-        ))],
     }
 }
 

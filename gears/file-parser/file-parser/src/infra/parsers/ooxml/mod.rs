@@ -184,6 +184,67 @@ impl Archive {
     }
 }
 
+/// XML events of one part, with element depth held to
+/// [`ParseLimits::max_nesting_depth`].
+pub struct Events<'a> {
+    reader: quick_xml::Reader<&'a [u8]>,
+    depth: DepthGuard,
+    format: &'static str,
+}
+
+impl<'a> Events<'a> {
+    /// `format` (`"PPTX"`) only labels error messages.
+    pub fn new(text: &'a str, limits: &ParseLimits, format: &'static str) -> Self {
+        Self {
+            reader: xml::reader(text),
+            depth: DepthGuard::new(limits),
+            format,
+        }
+    }
+
+    pub fn next(&mut self) -> Result<Event<'a>, DomainError> {
+        let event = self.reader.read_event().map_err(|e| {
+            DomainError::parse_error(format!("Failed to parse {}: {e}", self.format))
+        })?;
+        match &event {
+            Event::Start(_) => self.depth.enter()?,
+            Event::End(_) => self.depth.leave(),
+            _ => {}
+        }
+        Ok(event)
+    }
+}
+
+/// `dc:title` from the core properties part `part`, trimmed; `None` when it
+/// is missing, blank or malformed. Metadata is not worth failing a document
+/// for, but the archive's read limits still apply.
+pub fn core_title(archive: &mut Archive, part: &str) -> Result<Option<String>, DomainError> {
+    let Some(text) = archive.read_xml(part)? else {
+        return Ok(None);
+    };
+    let limits = archive.limits().clone();
+    let mut events = Events::new(&text, &limits, archive.format);
+    let mut in_title = false;
+    let mut title = String::new();
+    loop {
+        let Ok(event) = events.next() else {
+            return Ok(None);
+        };
+        match event {
+            Event::Start(e) if xml::local_name(&e) == "title" => in_title = true,
+            Event::End(e) if in_title && e.local_name().as_ref() == "title" => break,
+            Event::Text(t) if in_title => title.push_str(&t.xml10_content()),
+            Event::GeneralRef(r) if in_title => {
+                title.push_str(&xml::resolve_ref(&r).unwrap_or_default());
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    let title = title.trim();
+    Ok((!title.is_empty()).then(|| title.to_owned()))
+}
+
 fn budget_exceeded(max_total: u64) -> DomainError {
     limit_exceeded(
         "max_total_uncompressed_bytes",

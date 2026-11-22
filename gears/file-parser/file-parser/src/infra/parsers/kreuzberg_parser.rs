@@ -12,18 +12,17 @@ use super::ir_convert::result_to_blocks;
 ///
 /// Handles the formats not yet moved to file-parser's own parsers
 /// (spreadsheets moved to [`super::SpreadsheetParser`], HTML to
-/// [`super::HtmlParser`]).
+/// [`super::HtmlParser`], PPTX to [`super::PptxParser`]).
 ///
 /// # Supported formats
 /// | Extension(s)           | MIME type                                                                    |
 /// |------------------------|------------------------------------------------------------------------------|
 /// | `pdf`                  | `application/pdf`                                                            |
-/// | `pptx`                 | `application/vnd.openxmlformats-officedocument.presentationml.presentation`  |
 pub struct KreuzbergParser;
 
 /// Extensions this backend can extract; standalone so `mime_for_ext` can
 /// filter against it too.
-const SUPPORTED_EXTENSIONS: &[&str] = &["pdf", "pptx"];
+const SUPPORTED_EXTENSIONS: &[&str] = &["pdf"];
 
 impl KreuzbergParser {
     #[must_use]
@@ -213,7 +212,7 @@ mod tests {
             !exts.contains(&"xlsx"),
             "spreadsheets moved to SpreadsheetParser"
         );
-        assert!(exts.contains(&"pptx"));
+        assert!(!exts.contains(&"pptx"), "PPTX moved to PptxParser");
     }
 
     #[test]
@@ -224,10 +223,7 @@ mod tests {
         );
         assert_eq!(KreuzbergParser::mime_for_ext("html"), None);
         assert_eq!(KreuzbergParser::mime_for_ext("xlsx"), None);
-        assert_eq!(
-            KreuzbergParser::mime_for_ext("pptx"),
-            Some("application/vnd.openxmlformats-officedocument.presentationml.presentation")
-        );
+        assert_eq!(KreuzbergParser::mime_for_ext("pptx"), None);
     }
 
     #[test]

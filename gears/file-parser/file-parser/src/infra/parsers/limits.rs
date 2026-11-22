@@ -6,6 +6,7 @@
 //! process run out of memory.
 
 use crate::domain::error::DomainError;
+use crate::domain::ir::{Inline, ParsedBlock};
 
 const MIB: u64 = 1024 * 1024;
 
@@ -60,9 +61,53 @@ impl Default for ParseLimits {
     }
 }
 
+const LIMIT_PREFIX: &str = "document exceeds parser limit `";
+
 /// Error for a document that exceeds `limit`.
 pub(crate) fn limit_exceeded(limit: &str, detail: impl std::fmt::Display) -> DomainError {
-    DomainError::parse_error(format!("document exceeds parser limit `{limit}`: {detail}"))
+    DomainError::parse_error(format!("{LIMIT_PREFIX}{limit}`: {detail}"))
+}
+
+/// Whether `error` came from [`limit_exceeded`]. Parsers that tolerate a
+/// malformed optional part still stop on these.
+pub(crate) fn is_limit(error: &DomainError) -> bool {
+    matches!(error, DomainError::ParseError { message } if message.starts_with(LIMIT_PREFIX))
+}
+
+/// The document-wide text allowance ([`ParseLimits::max_text_bytes`]).
+#[derive(Debug)]
+pub(crate) struct TextBudget {
+    left: usize,
+    max: usize,
+}
+
+impl TextBudget {
+    pub(crate) fn new(limits: &ParseLimits) -> Self {
+        Self {
+            left: limits.max_text_bytes,
+            max: limits.max_text_bytes,
+        }
+    }
+
+    /// Takes `bytes` of text from the allowance, or fails once it is spent.
+    pub(crate) fn charge(&mut self, bytes: usize) -> Result<(), DomainError> {
+        self.left = self.left.checked_sub(bytes).ok_or_else(|| {
+            limit_exceeded(
+                "max_text_bytes",
+                format!("document text exceeds {} bytes", self.max),
+            )
+        })?;
+        Ok(())
+    }
+}
+
+/// The paragraph that stands in for a table over the cell budget.
+pub(crate) fn skipped_table_note(remaining: usize) -> ParsedBlock {
+    ParsedBlock::Paragraph {
+        inlines: vec![Inline::plain(format!(
+            "[Table skipped: it does not fit the remaining limit of {remaining} table cells]"
+        ))],
+    }
 }
 
 /// The document-wide table-cell allowance ([`ParseLimits::max_table_cells`]).

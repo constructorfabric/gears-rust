@@ -1,4 +1,5 @@
 use super::*;
+use crate::infra::parsers::inlines::MAX_URL_LEN;
 
 fn page(html: &str) -> Page {
     convert(html.as_bytes(), None, &ParseLimits::default()).expect("page converts")

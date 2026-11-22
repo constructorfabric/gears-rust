@@ -11,8 +11,8 @@ use crate::config::FileParserConfig;
 use crate::domain::local_client::FileParserLocalClient;
 use crate::domain::service::{FileParserService, ServiceConfig};
 use crate::infra::parsers::{
-    DocxParser, HtmlParser, ImageParser, KreuzbergParser, PlainTextParser, SpreadsheetParser,
-    StubParser,
+    DocxParser, HtmlParser, ImageParser, KreuzbergParser, PlainTextParser, PptxParser,
+    SpreadsheetParser, StubParser,
 };
 
 /// Main gear struct for file parsing
@@ -205,6 +205,7 @@ impl Gear for FileParserGear {
             Arc::new(PlainTextParser::new().with_max_bytes(max_file_size_bytes)),
             Arc::new(SpreadsheetParser::new().with_max_bytes(max_file_size_bytes)),
             Arc::new(HtmlParser::new().with_max_bytes(max_file_size_bytes)),
+            Arc::new(PptxParser::new().with_max_bytes(max_file_size_bytes)),
             Arc::new(KreuzbergParser::new()),
             Arc::new(DocxParser::new()),
             Arc::new(ImageParser::new()),

@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use quick_xml::events::{BytesStart, Event};
 
 use crate::domain::error::DomainError;
-use crate::infra::parsers::limits::{DepthGuard, ParseLimits, limit_exceeded};
-use crate::infra::parsers::ooxml::{Archive, Relationship, xml};
+use crate::infra::parsers::limits::{ParseLimits, limit_exceeded};
+use crate::infra::parsers::ooxml::{self, Archive, Events, Relationship, xml};
 
 use super::Sink;
 use super::cells::{bool_text, format_float, iso_datetime, serial_text};
@@ -49,7 +49,7 @@ pub(super) fn read(
     let macro_enabled = workbook_content_type(&mut archive, &workbook_part)?
         .is_some_and(|ct| ct.contains("macroEnabled"));
     let title = match root.of_type("core-properties").find(|r| !r.external) {
-        Some(rel) => core_title(&mut archive, &rel.target.clone())?,
+        Some(rel) => ooxml::core_title(&mut archive, &rel.target.clone())?,
         None => None,
     };
 
@@ -114,31 +114,6 @@ fn internal<'a>(mut rels: impl Iterator<Item = &'a Relationship>) -> Option<Stri
     rels.find(|r| !r.external).map(|r| r.target.clone())
 }
 
-/// Reads XML events, keeping element depth within the limits.
-struct Events<'a> {
-    reader: quick_xml::Reader<&'a [u8]>,
-    depth: DepthGuard,
-}
-
-impl<'a> Events<'a> {
-    fn new(text: &'a str, limits: &ParseLimits) -> Self {
-        Self {
-            reader: xml::reader(text),
-            depth: DepthGuard::new(limits),
-        }
-    }
-
-    fn next(&mut self) -> Result<Event<'a>, DomainError> {
-        let event = self.reader.read_event().map_err(parse_error)?;
-        match &event {
-            Event::Start(_) => self.depth.enter()?,
-            Event::End(_) => self.depth.leave(),
-            _ => {}
-        }
-        Ok(event)
-    }
-}
-
 /// The content type `[Content_Types].xml` gives the workbook part.
 fn workbook_content_type(
     archive: &mut Archive,
@@ -149,7 +124,7 @@ fn workbook_content_type(
     };
     let wanted = format!("/{workbook_part}");
     let limits = archive.limits().clone();
-    let mut events = Events::new(&text, &limits);
+    let mut events = Events::new(&text, &limits, "XLSX");
     loop {
         match events.next()? {
             Event::Start(e) | Event::Empty(e) if xml::local_name(&e) == "Override" => {
@@ -164,31 +139,6 @@ fn workbook_content_type(
     }
 }
 
-/// `dc:title` from the core properties part.
-pub(super) fn core_title(archive: &mut Archive, part: &str) -> Result<Option<String>, DomainError> {
-    let Some(text) = archive.read_xml(part)? else {
-        return Ok(None);
-    };
-    let limits = archive.limits().clone();
-    let mut events = Events::new(&text, &limits);
-    let mut in_title = false;
-    let mut title = String::new();
-    loop {
-        match events.next()? {
-            Event::Start(e) if xml::local_name(&e) == "title" => in_title = true,
-            Event::End(e) if in_title && e.local_name().as_ref() == "title" => break,
-            Event::Text(t) if in_title => title.push_str(&t.xml10_content()),
-            Event::GeneralRef(r) if in_title => {
-                title.push_str(&xml::resolve_ref(&r).unwrap_or_default());
-            }
-            Event::Eof => break,
-            _ => {}
-        }
-    }
-    let title = title.trim();
-    Ok((!title.is_empty()).then(|| title.to_owned()))
-}
-
 struct WorkbookXml {
     /// (sheet name, relationship id), in workbook order.
     sheets: Vec<(String, String)>,
@@ -196,7 +146,7 @@ struct WorkbookXml {
 }
 
 fn parse_workbook(text: &str, limits: &ParseLimits) -> Result<WorkbookXml, DomainError> {
-    let mut events = Events::new(text, limits);
+    let mut events = Events::new(text, limits, "XLSX");
     let mut sheets = Vec::new();
     let mut date1904 = false;
     loop {
@@ -256,7 +206,7 @@ fn rich_text(events: &mut Events<'_>, end: &str) -> Result<String, DomainError> 
 
 /// The shared string table. Its size follows the part, not `uniqueCount`.
 fn parse_shared_strings(text: &str, limits: &ParseLimits) -> Result<SharedStrings, DomainError> {
-    let mut events = Events::new(text, limits);
+    let mut events = Events::new(text, limits, "XLSX");
     let mut strings = SharedStrings::default();
     loop {
         match events.next()? {
@@ -273,7 +223,7 @@ fn parse_shared_strings(text: &str, limits: &ParseLimits) -> Result<SharedString
 
 /// Display kind per cell style index (`<cellXfs>` order).
 fn parse_styles(text: &str, limits: &ParseLimits) -> Result<Vec<Kind>, DomainError> {
-    let mut events = Events::new(text, limits);
+    let mut events = Events::new(text, limits, "XLSX");
     let mut custom: HashMap<u32, Kind> = HashMap::new();
     let mut kinds = Vec::new();
     let mut in_cell_xfs = false;
@@ -332,7 +282,7 @@ fn parse_sheet(
     sink: &mut Sink,
     cells: &mut super::SheetCells,
 ) -> Result<(), DomainError> {
-    let mut events = Events::new(text, ctx.limits);
+    let mut events = Events::new(text, ctx.limits, "XLSX");
     // 0-based position of the last row and cell seen, for elements without `r`.
     let mut row: Option<u32> = None;
     let mut col: Option<u32> = None;
