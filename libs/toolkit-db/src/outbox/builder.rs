@@ -30,6 +30,8 @@ pub struct SpawnContext {
     pub cancel: CancellationToken,
     pub partition_notify: Arc<Notify>,
     pub processor_sem: Arc<Semaphore>,
+    /// This worker's own subscription to the start latch: it holds a permit
+    /// once `start()` has wired every worker. Never shared between workers.
     pub start_notify: Arc<Notify>,
     #[allow(dead_code)]
     pub outbox: Arc<Outbox>,

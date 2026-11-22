@@ -6762,3 +6762,142 @@ async fn batch_transactional_respects_configured_batch_size() {
     drop(db);
     handle.stop().await;
 }
+
+// ======================================================================
+// Chapter 23: Start Signal
+// ======================================================================
+//
+// `start()` spawns every worker and then gives each one startup wake. A worker
+// that the runtime has not polled yet when the wake goes out must still get it.
+
+/// Waits up to `limit` for `done`, checking it every 10 ms. Never cancels a
+/// check half-way, so a database query in `done` always runs to the end, and
+/// accepts a check only when it ended before the deadline.
+async fn within<F, Fut>(limit: Duration, done: F) -> bool
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        let complete = done().await;
+        // A check that ends past the deadline proves nothing: what it saw may
+        // be the work of a later wake.
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        if complete {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Rows that an earlier instance processed but did not collect are collected
+/// soon after a restart, not on the vacuum's idle poke.
+///
+/// `start()` spawns the maintenance workers after its last await, so on a
+/// current-thread runtime none of them has been polled when `start()` gives
+/// the start signal. A busy multi-thread runtime can leave any worker in the
+/// same state. The vacuum shows whether such a worker still gets the signal:
+/// nothing else wakes it before its idle poke (one hour by default, 30 s here),
+/// and the rows it collects are visible.
+#[tokio::test(flavor = "current_thread")]
+async fn a_worker_not_yet_polled_when_start_returns_still_makes_its_first_pass() {
+    let db = setup_db("ch23_unpolled_worker").await;
+
+    // The earlier instance: it processed two messages, then stopped before its
+    // vacuum collected them.
+    let earlier = make_default_test_outbox().await;
+    earlier.outbox.register_queue(&db, "q", 1).await.unwrap();
+    let pid = earlier.outbox.all_partition_ids()[0];
+    enqueue_and_sequence(&earlier, &db, "q", 0, &["a", "b"]).await;
+    let processed = Arc::new(AtomicU32::new(0));
+    run_leased(
+        &db,
+        pid,
+        CountingSuccessHandler {
+            count: Arc::clone(&processed),
+        },
+        Duration::from_secs(30),
+        10,
+    )
+    .await;
+    drop(earlier);
+    assert_eq!(processed.load(Ordering::Relaxed), 2);
+    assert!(read_vacuum_counter(&db, pid).await > 0);
+    assert_eq!(count_rows(&db, "toolkit_outbox_outgoing").await, 2);
+
+    let handle = Outbox::builder(db.clone())
+        .vacuum_tuning(WorkerTuning::vacuum().idle_interval(Duration::from_secs(30)))
+        .queue("q", Partitions::of(1))
+        .leased(CountingMessageHandler {
+            count: Arc::new(AtomicU32::new(0)),
+        })
+        .start()
+        .await
+        .unwrap();
+
+    let collected = within(Duration::from_secs(2), || async {
+        count_rows(&db, "toolkit_outbox_outgoing").await == 0
+    })
+    .await;
+    let left = count_rows(&db, "toolkit_outbox_outgoing").await;
+    handle.stop().await;
+
+    assert!(
+        collected,
+        "{left} processed rows were not collected within 2 s: the vacuum missed the \
+         start signal and waits for its 30 s idle poke"
+    );
+}
+
+/// Rows that an earlier instance sequenced but did not process are delivered
+/// soon after a restart, not on the processor's idle poke.
+///
+/// Nothing new is enqueued after the restart, so no sequencer wakes the
+/// processor: only the start signal makes it look at its backlog before the
+/// idle poke (30 s here). On this current-thread runtime the processor is
+/// polled during `start()`'s own database awaits, before the signal goes out,
+/// so this test does not depend on how the signal is delivered; it holds the
+/// processor to having a start signal at all. The unpolled case is the test
+/// above.
+#[tokio::test(flavor = "current_thread")]
+async fn rows_sequenced_before_a_restart_are_delivered_without_the_idle_poke() {
+    let db = setup_db("ch23_restart_backlog").await;
+
+    // The earlier instance: it enqueued and sequenced two messages, then
+    // stopped before a processor took them.
+    let earlier = make_default_test_outbox().await;
+    earlier.outbox.register_queue(&db, "q", 1).await.unwrap();
+    enqueue_and_sequence(&earlier, &db, "q", 0, &["a", "b"]).await;
+    drop(earlier);
+    assert_eq!(count_rows(&db, "toolkit_outbox_incoming").await, 0);
+    assert_eq!(count_rows(&db, "toolkit_outbox_outgoing").await, 2);
+
+    let delivered = Arc::new(AtomicU32::new(0));
+    let handle = Outbox::builder(db.clone())
+        .processor_tuning(WorkerTuning::processor_default().idle_interval(Duration::from_secs(30)))
+        .sequencer_tuning(WorkerTuning::sequencer_default().idle_interval(Duration::from_secs(30)))
+        .queue("q", Partitions::of(1))
+        .leased(CountingMessageHandler {
+            count: Arc::clone(&delivered),
+        })
+        .start()
+        .await
+        .unwrap();
+
+    let in_time = within(Duration::from_secs(2), || {
+        let delivered = delivered.load(Ordering::Relaxed);
+        async move { delivered >= 2 }
+    })
+    .await;
+    handle.stop().await;
+
+    assert!(
+        in_time,
+        "the backlog was not delivered within 2 s (delivered {} of 2): the processor \
+         missed the start signal and waits for its 30 s idle poke",
+        delivered.load(Ordering::Relaxed)
+    );
+}

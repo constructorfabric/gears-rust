@@ -217,6 +217,7 @@ mod migrations;
 /// Priority ordering of work items across partitions.
 pub(crate) mod prioritizer;
 mod record;
+mod start_latch;
 mod statements;
 /// Per-worker execution statistics and their periodic reporting.
 pub(crate) mod stats;

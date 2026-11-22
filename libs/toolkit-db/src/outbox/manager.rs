@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use super::builder::QueueBuilder;
 use super::core::Outbox;
 use super::prioritizer::SharedPrioritizer;
+use super::start_latch::StartLatch;
 use super::stats::{StatsListener, StatsRegistry, StatsReporter};
 use super::tables::OutboxTables;
 use super::types::{
@@ -48,7 +49,9 @@ struct StartContext<'a> {
     db: &'a Db,
     cancel: &'a CancellationToken,
     task_set: &'a mut toolkit_taskward::TaskSet,
-    start_notify: &'a Arc<Notify>,
+    /// Each worker takes its own subscription, so none can miss its startup
+    /// wake.
+    start: &'a mut StartLatch,
     stats_registry: &'a Option<Arc<std::sync::Mutex<super::stats::StatsRegistry>>>,
 }
 
@@ -344,7 +347,7 @@ impl OutboxBuilder {
                 .stop_grace(tuning.stop_grace)
                 .pacing(tuning)
                 .notifier(prioritizer.notifier())
-                .notifier(Arc::clone(ctx.start_notify))
+                .notifier(ctx.start.subscribe())
                 .bulkhead(Bulkhead::new(
                     &name,
                     BulkheadConfig {
@@ -402,7 +405,7 @@ impl OutboxBuilder {
                 .stop_grace(tuning.stop_grace)
                 .pacing(tuning)
                 .notifier(poker_notify)
-                .notifier(Arc::clone(ctx.start_notify))
+                .notifier(ctx.start.subscribe())
                 .bulkhead(Bulkhead::new(
                     &name,
                     BulkheadConfig {
@@ -452,7 +455,7 @@ impl OutboxBuilder {
             .pacing(tuning)
             .notifier(collectable_traces.wakeup())
             .notifier(poker_notify)
-            .notifier(Arc::clone(ctx.start_notify))
+            .notifier(ctx.start.subscribe())
             .listener(TracingListener)
             .on_panic(PanicPolicy::CatchAndRetry);
         let builder = register_stats(builder, ctx.stats_registry.as_ref(), name, count_payload());
@@ -480,7 +483,7 @@ impl OutboxBuilder {
             // sleeps on this wakeup when nobody is - a subscription being
             // taken is the only event that gives it a reason to look.
             .notifier(outbox.trace_mailbox().registry().arrivals())
-            .notifier(Arc::clone(ctx.start_notify))
+            .notifier(ctx.start.subscribe())
             .listener(TracingListener)
             .on_panic(PanicPolicy::CatchAndRetry);
         let builder = register_stats(builder, ctx.stats_registry.as_ref(), name, count_payload());
@@ -509,7 +512,7 @@ impl OutboxBuilder {
             .stop_grace(tuning.stop_grace)
             .pacing(tuning)
             .notifier(poker_notify)
-            .notifier(Arc::clone(ctx.start_notify))
+            .notifier(ctx.start.subscribe())
             .listener(TracingListener)
             .on_panic(PanicPolicy::CatchAndRetry);
         let builder = register_stats(builder, ctx.stats_registry.as_ref(), name, count_payload());
@@ -534,7 +537,7 @@ impl OutboxBuilder {
             .stop_grace(tuning.stop_grace)
             .pacing(tuning)
             .notifier(poker_notify)
-            .notifier(Arc::clone(ctx.start_notify))
+            .notifier(ctx.start.subscribe())
             .listener(TracingListener)
             .on_panic(PanicPolicy::CatchAndRetry)
             .build(reconciler);
@@ -599,7 +602,7 @@ impl OutboxBuilder {
         let outbox = Arc::new(Outbox::new_with_backend(config, backend));
         let cancel = CancellationToken::new();
         let mut task_set = TaskSet::new(cancel.clone());
-        let start_notify = Arc::new(Notify::new());
+        let mut start_latch = StartLatch::default();
         let partition_notify: DashMap<i64, Arc<Notify>> = DashMap::new();
 
         // Global processor semaphore — caps total concurrent partition processors
@@ -631,7 +634,7 @@ impl OutboxBuilder {
                     cancel: cancel.clone(),
                     partition_notify: notify,
                     processor_sem: Arc::clone(&processor_sem),
-                    start_notify: Arc::clone(&start_notify),
+                    start_notify: start_latch.subscribe(),
                     outbox: Arc::clone(&outbox),
                     stats_registry: stats_registry_shared.clone(),
                     tuning: tuning.processor.clone(),
@@ -670,7 +673,7 @@ impl OutboxBuilder {
             db: &self.db,
             cancel: &cancel,
             task_set: &mut task_set,
-            start_notify: &start_notify,
+            start: &mut start_latch,
             stats_registry: &stats_registry_shared,
         };
 
@@ -720,8 +723,9 @@ impl OutboxBuilder {
             Self::spawn_stats_reporter(&mut ctx, stats_registry_shared.clone(), interval);
         }
 
-        // 11. Signal all workers to start
-        start_notify.notify_waiters();
+        // 11. Give every worker its startup wake. A worker that the runtime
+        //     has not polled yet keeps its permit and starts when it is polled.
+        start_latch.open();
 
         Ok(OutboxHandle {
             outbox,
