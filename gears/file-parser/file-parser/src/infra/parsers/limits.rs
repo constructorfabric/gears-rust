@@ -23,7 +23,8 @@ pub struct ParseLimits {
     /// Entries smaller than this skip the ratio check: tiny, repetitive XML parts
     /// legitimately compress far better than 100:1.
     pub ratio_check_floor_bytes: u64,
-    /// Element nesting depth in XML and HTML.
+    /// Element nesting depth in XML parts. HTML keeps its own, smaller caps
+    /// (its tree and converter flatten deeper content instead of failing).
     pub max_nesting_depth: usize,
     /// Table cells across the whole document. Each table is charged its full
     /// rows x columns area, since that is what the output holds.
@@ -32,6 +33,8 @@ pub struct ParseLimits {
     pub max_table_columns: usize,
     /// Sheets (or slides) in one workbook (or presentation).
     pub max_sheets: usize,
+    /// Elements and text nodes of one HTML document.
+    pub max_html_nodes: usize,
     /// Pages of one PDF.
     pub max_pdf_pages: usize,
     /// Text extracted from one document.
@@ -50,6 +53,7 @@ impl Default for ParseLimits {
             max_table_cells: 100_000,
             max_table_columns: 16_384,
             max_sheets: 1_000,
+            max_html_nodes: 500_000,
             max_pdf_pages: 2_000,
             max_text_bytes: 100 * 1024 * 1024,
         }
@@ -79,6 +83,17 @@ impl TableBudget {
     /// Cells still allowed.
     pub(crate) fn remaining(&self) -> usize {
         self.remaining
+    }
+
+    /// Takes `cells` from the allowance (saturating), e.g. for a table that
+    /// was built and then skipped.
+    pub(crate) fn spend(&mut self, cells: usize) {
+        self.remaining = self.remaining.saturating_sub(cells);
+    }
+
+    /// Widest table allowed.
+    pub(crate) fn max_columns(&self) -> usize {
+        self.max_columns
     }
 
     /// Charges a `rows` x `columns` table if it fits; returns `false` and charges

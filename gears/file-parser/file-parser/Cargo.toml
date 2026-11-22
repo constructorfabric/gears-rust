@@ -77,7 +77,8 @@ tempfile = { workspace = true }
 # Document parsing libraries
 kreuzberg = { workspace = true }
 zip = { workspace = true }
-quick-xml = { workspace = true }
+# `escape-html`: the HTML5 named character reference table.
+quick-xml = { workspace = true, features = ["escape-html"] }
 cfb = { workspace = true }
 encoding_rs = { workspace = true }
 

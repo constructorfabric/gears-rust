@@ -10,20 +10,20 @@ use super::ir_convert::result_to_blocks;
 
 /// Unified document parser backed by Kreuzberg.
 ///
-/// Handles the formats not yet moved to file-parser's own parsers (spreadsheets
-/// moved to [`super::SpreadsheetParser`]).
+/// Handles the formats not yet moved to file-parser's own parsers
+/// (spreadsheets moved to [`super::SpreadsheetParser`], HTML to
+/// [`super::HtmlParser`]).
 ///
 /// # Supported formats
 /// | Extension(s)           | MIME type                                                                    |
 /// |------------------------|------------------------------------------------------------------------------|
 /// | `pdf`                  | `application/pdf`                                                            |
-/// | `html`, `htm`          | `text/html`                                                                  |
 /// | `pptx`                 | `application/vnd.openxmlformats-officedocument.presentationml.presentation`  |
 pub struct KreuzbergParser;
 
 /// Extensions this backend can extract; standalone so `mime_for_ext` can
 /// filter against it too.
-const SUPPORTED_EXTENSIONS: &[&str] = &["pdf", "html", "htm", "pptx"];
+const SUPPORTED_EXTENSIONS: &[&str] = &["pdf", "pptx"];
 
 impl KreuzbergParser {
     #[must_use]
@@ -208,7 +208,7 @@ mod tests {
         let parser = KreuzbergParser::new();
         let exts = parser.supported_extensions();
         assert!(exts.contains(&"pdf"));
-        assert!(exts.contains(&"html"));
+        assert!(!exts.contains(&"html"), "HTML moved to HtmlParser");
         assert!(
             !exts.contains(&"xlsx"),
             "spreadsheets moved to SpreadsheetParser"
@@ -222,8 +222,7 @@ mod tests {
             KreuzbergParser::mime_for_ext("pdf"),
             Some("application/pdf")
         );
-        assert_eq!(KreuzbergParser::mime_for_ext("html"), Some("text/html"));
-        assert_eq!(KreuzbergParser::mime_for_ext("htm"), Some("text/html"));
+        assert_eq!(KreuzbergParser::mime_for_ext("html"), None);
         assert_eq!(KreuzbergParser::mime_for_ext("xlsx"), None);
         assert_eq!(
             KreuzbergParser::mime_for_ext("pptx"),
