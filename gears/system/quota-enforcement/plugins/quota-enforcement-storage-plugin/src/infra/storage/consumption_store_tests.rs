@@ -2226,6 +2226,62 @@ async fn a_grant_for_one_lease_releases_that_lease() {
     h.down().await;
 }
 
+/// What a PDP grant for one Quota compiles to: the tenant, and that Quota's
+/// id as the resource.
+fn only_quota(id: QuotaId) -> AccessScope {
+    AccessScope::single(ScopeConstraint::new(vec![
+        ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant().as_uuid()]),
+        ScopeFilter::eq(pep_properties::RESOURCE_ID, id.as_uuid()),
+    ]))
+}
+
+#[tokio::test]
+async fn a_grant_for_one_quota_resolves_the_leases_that_hold_it() {
+    let h = Harness::up().await;
+    let id = h.consumption_quota("u1", Some(100), Vec::new()).await;
+    let token = h
+        .acquire("u1", 40, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("acquire")
+        .get()
+        .token
+        .expect("an allowed acquisition holds");
+    assert_eq!(
+        h.period_consumed(id).await,
+        40,
+        "the hold occupies the period"
+    );
+
+    let outcome = h
+        .quotas
+        .deactivate_quota(&actor(), &only_quota(id), id, &[])
+        .await
+        .expect("deactivate");
+    assert_eq!(
+        outcome.resolved_leases,
+        vec![token],
+        "the cascade resolves the lease that holds the Quota"
+    );
+    assert_eq!(h.period_consumed(id).await, 0, "and gives its hold back");
+
+    let committed = h
+        .store
+        .commit_lease(
+            &ctx(),
+            &scope_for(tenant()),
+            token,
+            Some(10),
+            &partial("c1", 2),
+            &[],
+        )
+        .await;
+    assert!(
+        matches!(committed, Err(StorageError::LeaseNotActive { .. })),
+        "a lease the cascade resolved charges nothing: {committed:?}"
+    );
+    h.down().await;
+}
+
 #[tokio::test]
 async fn a_deactivation_that_returns_a_hold_stamps_the_counter_with_its_own_time() {
     let h = Harness::up().await;

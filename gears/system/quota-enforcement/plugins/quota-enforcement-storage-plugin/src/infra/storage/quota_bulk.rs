@@ -35,7 +35,7 @@
 //! the PDP-authorized envelope tenant, so it is read and written unscoped, as
 //! `lookup_idempotency` reads it; every Quota row stays under its item's scope.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use quota_enforcement_sdk::{
@@ -589,16 +589,31 @@ impl SqlQuotaStore {
                         }
                         // @cpt-begin:cpt-cf-quota-enforcement-state-bulk-envelope:p2:inst-qbs-enter
                         // @cpt-begin:cpt-cf-quota-enforcement-algo-bulk-envelope:p2:inst-qbe-apply
-                        let cascades: Vec<(uuid::Uuid, &AccessScope)> =
-                            ascending(&targets).into_iter().collect();
+                        // Every item is checked against the row its own grant
+                        // locked before any cascade is: the cascades are locked
+                        // under the tenant, so only an admitted Quota may reach them.
+                        let mut validated = Vec::with_capacity(envelope.items.len());
+                        for (index, item) in envelope.items.iter().enumerate() {
+                            validated.push(
+                                active_target(&rows, tenant, item.quota_id)
+                                    .map_err(|error| error.at_item(index))?,
+                            );
+                        }
+                        let cascade = Self::cascade_scope(tenant.as_uuid());
+                        let cascades: Vec<(uuid::Uuid, &AccessScope)> = validated
+                            .iter()
+                            .map(|row| row.id)
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
+                            .map(|id| (id, &cascade))
+                            .collect();
                         Self::lock_cascades(tx, &cascades, now).await?;
                         // Again, past the cascades' own lock waits.
                         let now = clock();
                         let mut items = Vec::with_capacity(envelope.items.len());
                         let mut metrics = Vec::with_capacity(envelope.items.len());
-                        for (index, item) in envelope.items.iter().enumerate() {
-                            let row = active_target(&rows, tenant, item.quota_id)
-                                .map_err(|error| error.at_item(index))?;
+                        for ((index, item), row) in envelope.items.iter().enumerate().zip(validated)
+                        {
                             metrics.push(row.metric.clone());
                             let outcome = Self::deactivate_locked(
                                 tx,

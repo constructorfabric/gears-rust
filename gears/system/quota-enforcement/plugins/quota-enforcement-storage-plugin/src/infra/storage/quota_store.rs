@@ -409,6 +409,18 @@ impl SqlQuotaStore {
         Ok(quota_mapping::row_to_quota(committed)?)
     }
 
+    /// The scope a deactivation cascade reaches a Quota's leases, their holds
+    /// and their counters under: the Quota's tenant.
+    ///
+    /// The caller's grant admits the Quota row and nothing past it. A grant
+    /// for one Quota names it by id, and `id` is the Quota only where the
+    /// resource column is one: on `qe_leases` it is the lease token, and a
+    /// table without a resource column drops the constraint and denies
+    /// everything. Under that grant the cascade would find no lease to resolve.
+    fn cascade_scope(tenant_id: Uuid) -> AccessScope {
+        AccessScope::for_tenant(tenant_id)
+    }
+
     /// Lock what the cascades of `targets` write past their Quota rows, rank by
     /// rank: the live leases holding any of them, ascending by token, then
     /// those leases' capacity rows, then the counter of every hold of those
@@ -477,6 +489,7 @@ impl SqlQuotaStore {
             }
             .into());
         }
+        let scope = &Self::cascade_scope(row.tenant_id);
         // Rank 3: the leases still holding this Quota. Expired
         // ones are already released (I4) and belong to the sweeper,
         // so the cascade neither resolves nor re-credits them.
@@ -719,7 +732,8 @@ impl QuotaStore for SqlQuotaStore {
             self.db.transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
                     let row = Self::lock_active_row(tx, &scope, quota_id).await?;
-                    Self::lock_cascades(tx, &[(row.id, &scope)], now).await?;
+                    let cascade = Self::cascade_scope(row.tenant_id);
+                    Self::lock_cascades(tx, &[(row.id, &cascade)], now).await?;
                     Self::deactivate_locked(tx, &scope, &actor, row, &events, now, &*enqueuer).await
                 })
             }),
