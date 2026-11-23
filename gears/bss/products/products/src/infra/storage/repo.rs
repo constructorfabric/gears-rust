@@ -9,6 +9,8 @@ pub mod category_repo;
 pub mod derived_usage_type_repo;
 pub mod history_repo;
 pub mod idempotency_repo;
+pub mod quota_catalog_repo;
+pub mod quota_intake_repo;
 pub mod reference_repo;
 pub mod sku_list_repo;
 pub mod sku_repo;

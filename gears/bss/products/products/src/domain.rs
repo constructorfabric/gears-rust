@@ -6,6 +6,7 @@ pub mod concurrency;
 pub mod derived;
 pub mod error;
 pub mod idempotency;
+pub mod quota;
 pub mod recognized;
 pub mod validation;
 

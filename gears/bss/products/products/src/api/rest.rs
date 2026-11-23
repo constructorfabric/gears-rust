@@ -20,6 +20,7 @@ pub mod dto;
 pub(crate) mod governance;
 mod names;
 pub mod preconditions;
+pub mod quota;
 pub mod references;
 mod replay;
 pub mod sku_governance;
@@ -279,32 +280,44 @@ fn exhausted_contention(source: &sea_orm::DbErr) -> bool {
         .any(|backend| toolkit_db::contention::is_retryable_contention(backend, source))
 }
 fn tx_to_canonical_coded(e: TxError, unit: bool) -> CanonicalError {
+    tx_to_canonical_by(e, unit, CanonicalError::from)
+}
+/// [`tx_to_canonical`] whose refusals `refuse` converts: an endpoint that names its own resource
+/// on every refusal (the quota catalog, P-D-273) passes its conversion.
+pub(crate) fn tx_to_canonical_on(
+    e: TxError,
+    refuse: impl Fn(DomainError) -> CanonicalError,
+) -> CanonicalError {
+    tx_to_canonical_by(e, false, refuse)
+}
+fn tx_to_canonical_by(
+    e: TxError,
+    unit: bool,
+    refuse: impl Fn(DomainError) -> CanonicalError,
+) -> CanonicalError {
     if contention_db_err(&e).is_some_and(exhausted_contention) {
         tracing::warn!(
             unit,
             "bss-products: transaction contention outlasted its retries"
         );
         return if unit {
-            DomainError::from(bss_approval::ApprovalError::Contended).into()
+            refuse(DomainError::from(bss_approval::ApprovalError::Contended))
         } else {
-            DomainError::Conflict {
+            refuse(DomainError::Conflict {
                 code: "CONTENDED",
                 detail: "a concurrent writer held this data through every retry; retry".into(),
-            }
-            .into()
+            })
         };
     }
     match e {
-        TxError::Refused(d) => d.into(),
-        TxError::FencedReferences { code, rows } => DomainError::Conflict {
+        TxError::Refused(d) => refuse(d),
+        TxError::FencedReferences { code, rows } => refuse(DomainError::Conflict {
             code,
             detail: rows.to_string(),
-        }
-        .into(),
-        TxError::GenerationMismatch { seen, current } => {
-            DomainError::from(bss_approval::ApprovalError::GenerationMismatch { seen, current })
-                .into()
-        }
+        }),
+        TxError::GenerationMismatch { seen, current } => refuse(DomainError::from(
+            bss_approval::ApprovalError::GenerationMismatch { seen, current },
+        )),
         TxError::Repo(r) => repo_error_to_canonical(&r),
         TxError::OData(e) => e.into(),
         TxError::ApprovalDb(source) => repo_error_to_canonical(&RepoError::Driver {

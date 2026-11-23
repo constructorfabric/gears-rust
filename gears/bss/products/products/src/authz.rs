@@ -1,4 +1,4 @@
-//! SKU, category, approval-unit and derived-usage-type authorization catalog and shared PEP gate.
+//! The registry's authorization catalog (its resources and actions) and its shared PEP gate.
 use authz_resolver_sdk::PolicyEnforcer;
 use authz_resolver_sdk::models::TenantMode;
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
@@ -13,7 +13,20 @@ pub mod labels {
     /// A derived usage type (P-D-231): its writes ask `author` here; its reads ask `sku:read`
     /// (O-3).
     pub const DERIVED_USAGE_TYPE: &str = gts_id!("cf.bss.products.derived_usage_type.v1~");
-    pub const ALL: &[&str] = &[SKU, CATEGORY, APPROVAL_UNIT, DERIVED_USAGE_TYPE];
+    /// The quota catalog's definitions and candidates (P-D-273): `read`, `author` for a manual
+    /// record, `submit`, and `approve` for an approval or a rejection.
+    pub const QUOTA_DEFINITION: &str = gts_id!("cf.bss.products.quota_definition.v1~");
+    /// A quota discovery adapter target (P-D-273): `read`, and `author` for a create and a
+    /// discovery.
+    pub const QUOTA_ADAPTER_TARGET: &str = gts_id!("cf.bss.products.quota_adapter_target.v1~");
+    pub const ALL: &[&str] = &[
+        SKU,
+        CATEGORY,
+        APPROVAL_UNIT,
+        DERIVED_USAGE_TYPE,
+        QUOTA_DEFINITION,
+        QUOTA_ADAPTER_TARGET,
+    ];
 }
 /// Independent grants; reference is reserved for the gear-to-gear registry protocol.
 pub mod actions {
@@ -38,6 +51,10 @@ pub mod resource_types {
         ResourceType::from_static(labels::APPROVAL_UNIT, SUPPORTED_PROPERTIES);
     pub const DERIVED_USAGE_TYPE: ResourceType =
         ResourceType::from_static(labels::DERIVED_USAGE_TYPE, SUPPORTED_PROPERTIES);
+    pub const QUOTA_DEFINITION: ResourceType =
+        ResourceType::from_static(labels::QUOTA_DEFINITION, SUPPORTED_PROPERTIES);
+    pub const QUOTA_ADAPTER_TARGET: ResourceType =
+        ResourceType::from_static(labels::QUOTA_ADAPTER_TARGET, SUPPORTED_PROPERTIES);
 }
 /// Error from the registry's PEP gate.
 ///

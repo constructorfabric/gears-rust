@@ -6,8 +6,8 @@ use crate::api::rest::ApiState;
 use crate::domain::derived::{NewDerivedType, NewDerivedVersion};
 use crate::infra::storage::repo::derived_usage_type_repo as store;
 use crate::test_support::{
-    TestDsn, authed_ctx, counting_flat_in_enforcer, denying_enforcer, drop_table, flat_in_enforcer,
-    problem_code, resolved_usage_types, rest_app_on_db, test_db,
+    Accepting, Spanning, TestDsn, authed_ctx, counting_flat_in_enforcer, denying_enforcer,
+    drop_table, flat_in_enforcer, problem_code, resolved_usage_types, rest_app_on_db, test_db,
 };
 use async_trait::async_trait;
 use authz_resolver_sdk::constraints::{Constraint, InPredicate, Predicate};
@@ -29,33 +29,6 @@ use uuid::Uuid;
 const CLOUDLET_UNIT: &str = "cloudlet\u{b7}hour";
 const RAM_REF: &str = "gts.cf.core.uc.usage_record.v1~cf.test.usage.ram_mb.v1";
 const CPU_REF: &str = "gts.cf.core.uc.usage_record.v1~cf.test.usage.cpu_mhz.v1";
-
-/// A permitting PDP whose compiled scope is `In(tenants)` over the owner tenant: one tenant is the flat-`In` shape a
-/// tenant's grant compiles to, several the shape of a grant over a parent and its children.
-struct Spanning {
-    tenants: Vec<Uuid>,
-}
-#[async_trait]
-impl AuthZResolverApi for Spanning {
-    async fn evaluate(
-        &self,
-        _ctx: PlatformSecurityContext,
-        _req: EvaluationRequest,
-    ) -> Result<EvaluationResponse, CanonicalError> {
-        Ok(EvaluationResponse {
-            decision: true,
-            context: EvaluationResponseContext {
-                constraints: vec![Constraint {
-                    predicates: vec![Predicate::In(InPredicate::new(
-                        pep_properties::OWNER_TENANT_ID,
-                        self.tenants.clone(),
-                    ))],
-                }],
-                deny_reason: None,
-            },
-        })
-    }
-}
 
 /// A PDP that cannot be reached.
 struct Unreachable;
@@ -517,94 +490,6 @@ async fn a_constraint_with_no_owner_tenant_reads_nothing() {
         .await
         .unwrap_err();
     assert_eq!(refusal(error), (400, METER_VERSION_UNKNOWN.to_owned()));
-}
-
-/// The `TypesRegistryClient` the gear's init registers its authz labels with; nothing else is asked of it.
-struct Accepting;
-#[async_trait]
-impl types_registry_sdk::TypesRegistryClient for Accepting {
-    async fn register(
-        &self,
-        _entities: Vec<Value>,
-    ) -> Result<Vec<types_registry_sdk::RegisterResult>, CanonicalError> {
-        Ok(Vec::new())
-    }
-    async fn register_type_schemas(
-        &self,
-        _type_schemas: Vec<Value>,
-    ) -> Result<Vec<types_registry_sdk::RegisterResult>, CanonicalError> {
-        Err(CanonicalError::internal("unexpected registry call").create())
-    }
-    async fn get_type_schema(
-        &self,
-        _type_id: &str,
-    ) -> Result<types_registry_sdk::GtsTypeSchema, CanonicalError> {
-        Err(CanonicalError::internal("unexpected registry call").create())
-    }
-    async fn get_type_schema_by_uuid(
-        &self,
-        _type_uuid: Uuid,
-    ) -> Result<types_registry_sdk::GtsTypeSchema, CanonicalError> {
-        Err(CanonicalError::internal("unexpected registry call").create())
-    }
-    async fn get_type_schemas(
-        &self,
-        _type_ids: Vec<String>,
-    ) -> std::collections::HashMap<String, Result<types_registry_sdk::GtsTypeSchema, CanonicalError>>
-    {
-        std::collections::HashMap::new()
-    }
-    async fn get_type_schemas_by_uuid(
-        &self,
-        _type_uuids: Vec<Uuid>,
-    ) -> std::collections::HashMap<Uuid, Result<types_registry_sdk::GtsTypeSchema, CanonicalError>>
-    {
-        std::collections::HashMap::new()
-    }
-    async fn list_type_schemas(
-        &self,
-        _query: types_registry_sdk::TypeSchemaQuery,
-    ) -> Result<Vec<types_registry_sdk::GtsTypeSchema>, CanonicalError> {
-        Err(CanonicalError::internal("unexpected registry call").create())
-    }
-    async fn register_instances(
-        &self,
-        _instances: Vec<Value>,
-    ) -> Result<Vec<types_registry_sdk::RegisterResult>, CanonicalError> {
-        Err(CanonicalError::internal("unexpected registry call").create())
-    }
-    async fn get_instance(
-        &self,
-        _id: &str,
-    ) -> Result<types_registry_sdk::GtsInstance, CanonicalError> {
-        Err(CanonicalError::internal("unexpected registry call").create())
-    }
-    async fn get_instance_by_uuid(
-        &self,
-        _uuid: Uuid,
-    ) -> Result<types_registry_sdk::GtsInstance, CanonicalError> {
-        Err(CanonicalError::internal("unexpected registry call").create())
-    }
-    async fn get_instances(
-        &self,
-        _ids: Vec<String>,
-    ) -> std::collections::HashMap<String, Result<types_registry_sdk::GtsInstance, CanonicalError>>
-    {
-        std::collections::HashMap::new()
-    }
-    async fn get_instances_by_uuid(
-        &self,
-        _uuids: Vec<Uuid>,
-    ) -> std::collections::HashMap<Uuid, Result<types_registry_sdk::GtsInstance, CanonicalError>>
-    {
-        std::collections::HashMap::new()
-    }
-    async fn list_instances(
-        &self,
-        _query: types_registry_sdk::InstanceQuery,
-    ) -> Result<Vec<types_registry_sdk::GtsInstance>, CanonicalError> {
-        Err(CanonicalError::internal("unexpected registry call").create())
-    }
 }
 
 /// Decision 6: after the gear's own init, the hub's one `dyn UsageMeterSemanticsV1` is Products' dispatcher over the

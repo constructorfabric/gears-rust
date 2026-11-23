@@ -54,16 +54,19 @@ fn every_declared_label_joins_all_and_each_resource_type_names_one() {
         resource_types::CATEGORY,
         resource_types::APPROVAL_UNIT,
         resource_types::DERIVED_USAGE_TYPE,
+        resource_types::QUOTA_DEFINITION,
+        resource_types::QUOTA_ADAPTER_TARGET,
     ] {
         assert!(labels::ALL.contains(&rt.name()), "{}", rt.name());
     }
 }
-/// Five actions on the SKU, the category and the approval unit, `reference` on the SKU, and one,
-/// `author`, on the derived usage type, whose reads are `sku:read` (P-D-231, O-3).
+/// Five actions on the SKU, the category and the approval unit, `reference` on the SKU, one,
+/// `author`, on the derived usage type, whose reads are `sku:read` (P-D-231, O-3), and the quota
+/// catalog's six: four on the quota definition and two on the adapter target (P-D-273).
 #[test]
-fn seventeen_permissions_cover_exactly_the_declared_pairs_and_inventory() {
+fn the_permissions_cover_exactly_the_declared_pairs_and_inventory() {
     let all = crate::gts::permissions::all();
-    assert_eq!(all.len(), 17);
+    assert_eq!(all.len(), 23);
     let actual = all
         .iter()
         .map(|p| (p.resource_type.as_str(), p.action.as_str()))
@@ -82,6 +85,16 @@ fn seventeen_permissions_cover_exactly_the_declared_pairs_and_inventory() {
     }
     expected.insert((labels::SKU, actions::REFERENCE));
     expected.insert((labels::DERIVED_USAGE_TYPE, actions::AUTHOR));
+    for action in [
+        actions::READ,
+        actions::AUTHOR,
+        actions::SUBMIT,
+        actions::APPROVE,
+    ] {
+        expected.insert((labels::QUOTA_DEFINITION, action));
+    }
+    expected.insert((labels::QUOTA_ADAPTER_TARGET, actions::READ));
+    expected.insert((labels::QUOTA_ADAPTER_TARGET, actions::AUTHOR));
     assert_eq!(actual, expected);
     let prefix = gts_id!("cf.toolkit.authz.permission.v1~");
     let inventory = toolkit_gts::inventory::iter::<toolkit_gts::InventoryInstance>
@@ -91,7 +104,7 @@ fn seventeen_permissions_cover_exactly_the_declared_pairs_and_inventory() {
                 .starts_with(&format!("{prefix}cf.bss.products."))
         })
         .collect::<Vec<_>>();
-    assert_eq!(inventory.len(), 17);
+    assert_eq!(inventory.len(), 23);
     for p in all {
         let id = p.id.to_string();
         let entry = inventory.iter().find(|e| e.instance_id == id).unwrap();

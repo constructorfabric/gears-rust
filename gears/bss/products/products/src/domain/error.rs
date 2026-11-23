@@ -45,6 +45,14 @@ pub enum DomainError {
     UnrecognizedUnit(String),
     #[error("incomplete meter declaration: {0}")]
     MeterDeclarationIncomplete(String),
+    /// A quota dependency did not answer: types-registry or a discovery adapter, or a snapshot that
+    /// is not complete (P-D-268). A 503 whose detail leads with the code.
+    #[error("{code}: {detail}")]
+    QuotaUnavailable { code: &'static str, detail: String },
+    /// No discovery adapter is registered for a target's plugin instance (P-D-268). A 501 whose
+    /// detail leads with the code, answered before any read or write.
+    #[error("{code}: {detail}")]
+    QuotaClosed { code: &'static str, detail: String },
 }
 
 impl DomainError {
@@ -52,7 +60,10 @@ impl DomainError {
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
-            Self::Conflict { code, .. } | Self::Forbidden { code, .. } => code,
+            Self::Conflict { code, .. }
+            | Self::Forbidden { code, .. }
+            | Self::QuotaUnavailable { code, .. }
+            | Self::QuotaClosed { code, .. } => code,
             Self::NotFound { .. } => "NOT_FOUND",
             Self::Approval(refusal) => refusal.code,
             Self::StaleUnit { .. } => "UNIT_STALE",

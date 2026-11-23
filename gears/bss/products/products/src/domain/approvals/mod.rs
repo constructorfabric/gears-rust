@@ -105,7 +105,11 @@ pub(crate) fn store_err(error: RepoError) -> ApprovalError {
             | RepoRefusal::CategoryDefaultTaken
             | RepoRefusal::ReferenceExists
             | RepoRefusal::DerivedCodeTaken
-            | RepoRefusal::DerivedVersionTaken,
+            | RepoRefusal::DerivedVersionTaken
+            | RepoRefusal::QuotaTargetTaken
+            | RepoRefusal::QuotaSnapshotTaken
+            | RepoRefusal::QuotaManualRecordTaken
+            | RepoRefusal::QuotaApprovalContended,
         )
         | RepoError::Db(_)
         | RepoError::CorruptRow(_) => ApprovalError::Store(error.to_string()),

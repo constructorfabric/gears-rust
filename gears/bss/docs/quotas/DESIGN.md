@@ -128,7 +128,7 @@ Service calls follow the [commercial model §3.4](../../../../docs/arch/bss-comm
 | Accepted charging terms | Pricing / financial owner contracts | Versioned package/usage charge rules, billing-meter references, inclusion terms and applicable service/resource binding; frozen with the quota terms, interpreted by Rating/Billing |
 | AcceptedQuotaSnapshot | Pricing | Rule/binding snapshots or durable immutable references with digests, original plan quantity, selected dimensions, tenant axes, terms/profile and purchase identity; frozen alongside price |
 | CommercialPostureV1 | Subscriptions | Aggregate revision/digest, effective quantity, Granted/Restricted/Revoked, intervals, accepted provenance, operation/preparation identity and lifecycle posture |
-| QuotaAccountingPolicy / QuotaScopePolicy | Products publishes registered definitions; adapter owner qualifies interpretation | Immutable policy identity/content evidence, reviewed descriptions of what counts toward the limit and exact aggregation/dimension meaning; retained in plan/receipt/assignment evidence |
+| QuotaAccountingPolicy / QuotaScopePolicy | Adapter owner registers the named instances against Products' schemas and qualifies their interpretation; Products pins them in reviewed definitions | Immutable policy identity/content evidence, reviewed descriptions of what counts toward the limit and exact aggregation/dimension meaning; retained in plan/receipt/assignment evidence |
 | QuotaExclusivityClaim | Subscriptions protected acquisition admission | Canonical cross-payer ownership domain, acquisition identity, scope/terms evidence, durable version and retained safe-reuse fence |
 | QuotaAssignment | Entitlements | Stable identity of one acquisition, logical binding and preparation generation, resource owner/scope, source namespace, logical members, one saved adapter binding and current desired head |
 | DesiredQuotaSet | Entitlements | Complete source-owned members, exact caps, restriction/tombstones, effective boundary, revision/digest and authority context |
@@ -180,13 +180,13 @@ Detailed intake, validation and picker behavior: [Feature 1: catalog](features/0
 | `gts.cf.bss.products.quota_capability.v1~` | Products-owned, concrete extensible schema for adapter discovery records. Invariant fields are specified below; derived schemas may add validated adapter metadata under `properties`. |
 | `gts.cf.toolkit.plugins.plugin.v1~cf.bss.products.quota_discovery.v1~` | Products discovery plugin specification derived from the ToolKit plugin base; adapter instances implement the discovery interface and are selected by BSS configuration. |
 
-Metric and capability base schemas allow direct instances. Derived schemas use `allOf` and a `gts://` base reference. They must preserve every required field. For example, `gts.cf.bss.products.quota_capability.v1~cf.bss.products.allocation_capability.v1~` can add reviewed allocation metadata.
+Metric and capability base schemas allow direct instances. Derived schemas use `allOf` and a `gts://` base reference. They must preserve every required field. For example, an adapter owner can register `gts.cf.bss.products.quota_capability.v1~cf.compute.quota_adapter.allocation_capability.v1~` to add reviewed allocation metadata.
 
 Extensions cannot override units, scope, bounds or operations. New metadata can be stored without a database migration. A profile cannot qualify if it needs behavior the implementation does not support.
 
 Unit and policy schemas use `x-gts-final: true`. None of these schemas is abstract. Metric and capability schemas allow extensions only in `properties`. Unit and metric instance IDs must belong to their declared schema. A capability's `type_id` must name its registered schema. Schema-only `x-gts-*` keywords are invalid in instance metadata.
 
-A metric or unit is a **well-known instance**. It is not a new schema for each CPU size, purchased quantity or tenant. Example IDs are `gts.cf.bss.products.quota_metric.v1~cf.bss.products.vcpu.v1` and `gts.cf.bss.products.quota_unit.v1~cf.bss.products.vcpu.v1`. The last segment has no trailing `~`.
+A metric or unit is a **well-known instance**. It is not a new schema for each CPU size, purchased quantity or tenant. Metric and unit instances belong to the adapter owner. It registers them in its own namespace against Products' schemas; Products registers none. Example IDs are `gts.cf.bss.products.quota_metric.v1~cf.compute.quota_adapter.vcpu.v1` and `gts.cf.bss.products.quota_unit.v1~cf.compute.quota_adapter.vcpu.v1`. The schema segment is Products'; the instance segment is the adapter owner's namespace. The last segment has no trailing `~`.
 
 Capability observations are anonymous records with a UUID `id` and GTS `type_id`. Their registered schema declares that discriminator. References must name exact GTS identities. `latest` and wildcards are invalid. Publication and purchase also retain the resolved registry content, revision evidence and digests. A major-only ID does not freeze historical content.
 
@@ -226,7 +226,7 @@ The metric and adapter units must resolve to the same canonical identity. `GB` a
 
 Encode unit integers as decimal strings. Conversion must be exact and fit the supported bounds and adapter step. Matching names do not allow rounding or substitution.
 
-Example unit and metric instances use proposed IDs. This document does not register them:
+The example instances use the example adapter namespace `cf.compute.quota_adapter`:
 
 [quota-metric-unit.instances.json](schemas/quota-metric-unit.instances.json)
 
@@ -248,7 +248,7 @@ A change to unit meaning, conversion, metric meaning or mapping needs a new immu
 
 Accepted purchases retain exact references, content and digests. Missing historical evidence blocks reinterpretation. `EnforcementMappingVersion` connects catalog metrics to OSS metrics. Matching names or units alone do not prove compatibility.
 
-Registration and configuration of internal OSS metrics belong to the adapter integration design; publishing a Products metric does not perform them.
+Registration and configuration of internal OSS metrics belong to the adapter integration design; publishing a catalog definition does not perform them.
 
 **Quota rules and charging terms.** A plan has separate quota and charging rules for the same service/resource binding. `PlanQuotaRule` defines allocation and quantity scaling. Pricing defines package fees, usage rates and inclusions. Accepted terms retain their versioned references. Rating/Billing applies those rules through its contracts.
 
@@ -276,27 +276,29 @@ A `QuotaDefinitionVersion` has a UUID `definition_id` and a positive decimal-str
 
 Changed meaning or mapping needs a new definition version. Sale availability can change without changing that version's content.
 
+A definition version applies to the SKU version it was approved against and to every later version of that SKU.
+
 Each definition response contains:
 
 | Field | Meaning |
 | --- | --- |
 | `definition_id`, `version`, `definition_digest` | Exact catalog identity and content digest, including the pinned definition dependencies |
-| `sku_id`, `sku_version` | Product applicability; Pricing verifies these against the selected plan item |
+| `sku_id`, `sku_version` | Product applicability: the SKU version the definition was approved against, which also covers later versions of that SKU; Pricing verifies these against the selected plan item |
 | `metric_ref`, `metric_digest`, `quota_kind` | Registered metric instance, retained content digest and `allocation` kind |
 | `display_name`, `description`, `locale` | Resolved reviewed text with the English fallback from §3.3.1; identity is independent of localization |
 | `canonical_unit_ref`, `allowed_units` | Canonical unit and allowed plan units; each includes `unit_ref`, content digest, symbol, exact conversion and `min`/`step`/optional `max` in that unit |
 | `subject_type_ref`, `resource_type_refs` | Supported ownership and resource types, validated through registry ancestry |
-| `mapping_ref`, `profile_ref`, `qualification_ref` | Opaque immutable owner references, each `{id, version, digest}`; profile fixes aggregation, lifecycle and required operations |
+| `mapping_ref`, `profile_ref`, `qualification_ref` | Opaque immutable owner references, each `{id, version, digest}`; profile fixes aggregation, lifecycle and required operations; `qualification_ref` is null until qualification evidence is recorded (Feature 5) |
 | `accounting_policy_ref`, `accounting_policy_digest`, `accounting_policy` | Exact registered policy identity, retained digest and resolved allocated-capacity accounting semantics. |
 | `scope_policy_ref`, `scope_policy_digest`, `scope_policy`, `change_support` | Exact scope policy and supported qualified changes from §3.3.1.3; no runtime usage is exposed. |
-| `profile_conditions`, `supported_bases` | Reviewed localized accounting conditions and supported `Fixed`/`PerPlanUnit` bases |
+| `profile_conditions`, `supported_bases` | Reviewed localized accounting conditions and supported `Fixed`/`PerPlanUnit` bases; the Products REST projection spells them `fixed`/`per_plan_unit` |
 | `availability` | Current `{state, revision, observed_at, reason_code}`; state is `enabled`, `disabled` or `withdrawn`, reason is nullable when enabled |
 
-SDK list results use `{items, next_cursor}`. REST uses the Products browse envelope `{rows, page_info: {next_cursor}}`. Page size defaults to 50 and is limited to 200. The REST names are `limit` and `cursor`, with `$top`/`$skiptoken` aliases; typed equality filters use `$filter` and the fields listed above. Conflicting aliases and unsupported filters are invalid. Order is ascending `(definition_id, version)` with numeric version comparison. Cursors bind authorized catalog scope, filters and order; changing them requires a fresh list.
+SDK list results use `{items, next_cursor}`. REST uses the Products list envelope `{items, page_info: {next_cursor, prev_cursor, limit}}`. Page size defaults to 50 and is limited to 200. The REST names are `limit` and `cursor`, with `$top`/`$skiptoken` aliases; typed equality filters use `$filter` and the fields listed above. Conflicting aliases and unsupported filters are invalid. Order is ascending `(definition_id, version)` with numeric version comparison. Cursors bind authorized catalog scope, filters and order; changing them requires a fresh list.
 
 Reauthorize every page. Availability is checked at read time. Paging neither reserves a sale nor freezes eligibility. If a dependency fails, return an error, not an empty successful catalog.
 
-[Example catalog response](schemas/quota-catalog-list.example.json). UUIDs and 64-character lowercase SHA-256 digests are placeholders. Referenced records must be registered and validated.
+[Example catalog response](schemas/quota-catalog-list.example.json), an `availability=all` answer. UUIDs and 64-character lowercase SHA-256 digests are placeholders. Referenced records must be registered and validated.
 
 ##### 3.3.1.2 Pricing objects and authoring methods
 
@@ -379,7 +381,7 @@ Acceptance atomically retains price and quota evidence, including original quant
 
 ##### 3.3.1.3 Required accounting, scope and change semantics
 
-V1 requires these catalog contracts. Products publishes reviewed policy instances in types-registry. Adapters map their lifecycle and scope identities and provide conformance evidence. Pricing pins the policies to each definition. The receipt, posture provenance, desired set and adapter operation retain the same IDs and digests. A translated label or provider default cannot replace a policy.
+V1 requires these catalog contracts. Products reviews the registered policy instances into each definition. Adapters map their lifecycle and scope identities and provide conformance evidence. Pricing pins the policies to each definition. The receipt, posture provenance, desired set and adapter operation retain the same IDs and digests. A translated label or provider default cannot replace a policy.
 
 [Feature 5: qualification](features/0005-qualification.md) and [Feature 2: plan-rules](features/0002-plan-rules.md) check approved commercial semantics, scope selection and supported changes.
 
@@ -393,7 +395,7 @@ Both policy schemas are concrete and final. Their named instances follow the sam
 
 A change in policy meaning needs a new immutable definition and buyer acceptance. Keeping the same metric label cannot hide that change.
 
-Policy identifiers and example digests in [quota-policies.instances.json](schemas/quota-policies.instances.json) and the other examples illustrate proposed registrations, not installed records.
+The identifiers and example digests in [quota-policies.instances.json](schemas/quota-policies.instances.json) and the other examples illustrate an example adapter's registrations, not installed records.
 
 
 #### 3.3.2 Acceptance, quantity and distribution

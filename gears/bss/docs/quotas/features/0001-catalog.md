@@ -87,18 +87,18 @@ This feature covers discovery, registered semantics, candidate approval, immutab
 
 **Steps**:
 
-1. [ ] - `p1` - Read one authorized adapter target through the discovery contract. - `inst-discover`
-2. [ ] - `p1` - Verify one complete snapshot and resolve every registered definition and dependency. - `inst-complete`
-3. [ ] - `p1` - Save a candidate with its original snapshot and publisher provenance. - `inst-candidate`
-4. [ ] - `p1` - Review resource meaning, units, counted capacity and scope before approving a definition version. - `inst-review`
+1. [x] - `p1` - Read one authorized adapter target through the discovery contract. - `inst-discover`
+2. [x] - `p1` - Verify one complete snapshot and resolve every registered definition and dependency. - `inst-complete`
+3. [x] - `p1` - Save a candidate with its original snapshot and publisher provenance. - `inst-candidate`
+4. [x] - `p1` - Review resource meaning, units, counted capacity and scope before approving a definition version. - `inst-review`
 5. [ ] - `p1` - Attach matching qualification evidence before enabling the definition for sale. - `inst-qualify`
-6. [ ] - `p1` - Return applicable approved definitions to an authorized plan author with descriptions and availability reasons. - `inst-browse`
+6. [x] - `p1` - Return applicable approved definitions to an authorized plan author with descriptions and availability reasons. - `inst-browse`
 
 ## 3. Processes / Business Logic (CDSL)
 
 ### 3.1 Quota catalog onboarding checks
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-quotas-algo-catalog`
+- [x] `p1` - **ID**: `cpt-cf-bss-quotas-algo-catalog`
 
 **Input**: Authorized owner request and the pinned evidence defined in DESIGN §3.3.1, 3.3.1.1 and 3.3.1.3.
 
@@ -106,11 +106,11 @@ This feature covers discovery, registered semantics, candidate approval, immutab
 
 **Steps**:
 
-1. [ ] - `p1` - Authorize the catalog and adapter target before resolving input. - `inst-authorize`
-2. [ ] - `p1` - Check actual registry ancestry, exact units, supported major versions and pinned historical content. - `inst-identity`
-3. [ ] - `p1` - Recover the existing candidate for the same source revision and content. Reject conflicting content. - `inst-replay`
-4. [ ] - `p1` - Leave intake unresolved when pages or dependencies are missing. Do not infer capability removal. - `inst-incomplete`
-5. [ ] - `p1` - **RETURN** the reviewed definition or a classified validation or dependency failure. - `inst-result`
+1. [x] - `p1` - Authorize the catalog and adapter target before resolving input. - `inst-authorize`
+2. [x] - `p1` - Check actual registry ancestry, exact units, supported major versions and pinned historical content. - `inst-identity`
+3. [x] - `p1` - Recover the existing candidate for the same source revision and content. Reject conflicting content. - `inst-replay`
+4. [x] - `p1` - Leave intake unresolved when pages or dependencies are missing. Do not infer capability removal. - `inst-incomplete`
+5. [x] - `p1` - **RETURN** the reviewed definition or a classified validation or dependency failure. - `inst-result`
 
 ### 3.2 Catalog intake and publication
 
@@ -157,6 +157,8 @@ This feature uses the owner states defined in DESIGN. It adds no lifecycle state
 - [ ] `p1` - **ID**: `cpt-cf-bss-quotas-dod-catalog`
 
 Owners must implement this behavior and retain passing evidence for every criterion below. Under `DOCS-ONLY` traceability, FEATURE checkboxes and evidence references track implementation. They do not claim that code markers exist or tests have run.
+
+Implementation evidence: Products feature [Quota Catalog](../../../products/docs/features/quota-catalog.md) (P-D-266 … P-D-274).
 
 **Implements**: `cpt-cf-bss-quotas-flow-catalog`, `cpt-cf-bss-quotas-algo-catalog`.
 

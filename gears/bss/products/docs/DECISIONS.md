@@ -85,6 +85,15 @@
 | P-D-263 | M | A retired SKU or category can be archived, and its list hides it by default (twin of pricing D-522) | DECIDED 2026-10-03 · Owner, 2026-10-03 ("archived"; ask 58b); extends P-D-208, P-D-210, P-D-211, P-D-215; amended 2026-10-03 (branch review) |
 | P-D-264 | M | A text function on `lifecycle` filters by the lifecycles it matches | DECIDED 2026-10-03 · Owner, 2026-10-03 ("yes, add it"); amends P-D-249 |
 | P-D-265 | M | The PEP gate asks the PDP for the caller's tenant only (twin of pricing D-523) | DECIDED 2026-10-04 · Owner, 2026-10-04 (the approval lists under a root tenant) |
+| P-D-266 | H | Products owns the commercial quota catalog | DECIDED 2026-11-19 · Owner, 2026-11-19 (quotas programme); quotas ADR 0001 |
+| P-D-267 | H | The quota GTS contract lives in products-sdk; adapter owners register its instances | DECIDED 2026-11-19 · Owner, 2026-11-19 (the adapter brings its instances); quotas DESIGN §3.3.1 (amended) |
+| P-D-268 | H | Quota intake: adapter targets, complete snapshots, per-record verdicts | DECIDED 2026-11-19 · Owner, 2026-11-19; quotas feature 1 |
+| P-D-269 | H | A quota definition is approved on its candidate, with separation of duties | DECIDED 2026-11-19 · Owner, 2026-11-19 |
+| P-D-270 | H | Quota definitions, mappings and profiles are append-only versions | DECIDED 2026-11-19 · Owner, 2026-11-19; quotas DESIGN §3.3.1.1 (amended) |
+| P-D-271 | M | Every approved quota definition is unavailable for sale until qualification | DECIDED 2026-11-19 · Owner, 2026-11-19; quotas DECOMPOSITION §3 |
+| P-D-272 | M | Plan authors read the quota catalog through two endpoints and one SDK client | DECIDED 2026-11-19 · Owner, 2026-11-19; quotas DESIGN §3.3.1.1 (amended) |
+| P-D-273 | M | Two quota resources with six grants | DECIDED 2026-11-19 · Owner, 2026-11-19 |
+| P-D-274 | M | Migration 000015 creates the quota catalog store | DECIDED 2026-11-19 · quotas DESIGN §3.7 |
 
 ## Entries
 
@@ -2195,3 +2204,575 @@ P-D-215. Amended by the branch review, 2026-10-03.
 - **The tests.** `authz_tests::every_request_asks_for_the_callers_tenant_only`: a read and a write each ask for `RootOnly`.
 
 **Source:** Owner, 2026-10-04, after the approval lists measured 1.5–4 s under a root tenant. Twin of pricing D-523.
+
+#### P-D-266 [H] Products owns the commercial quota catalog
+
+**Status:** DECIDED 2026-11-19.
+
+- **The owner.** Products keeps the catalog of commercial quota definitions that the quotas package
+  describes ([quotas ADR 0001](../../docs/quotas/ADR/0001-commercial-quota-catalog.md),
+  `cpt-cf-bss-quotas-adr-commercial-catalog`): candidates from discovery and from manual input, their
+  review, immutable definition versions, sale availability and the catalog reads. The package's
+  [DESIGN §3.3.1](../../docs/quotas/DESIGN.md#331-catalog-onboarding-and-plan-publication) is the
+  contract; this gear's design carries the Products half of it.
+- **What stays elsewhere.** Prices and plan quota rules belong to Pricing, purchased rights to
+  Subscriptions, quota application to Entitlements and its adapters, and runtime usage to OSS. Products
+  stores no tenant quota, no purchased amount and no usage.
+- **Where.** DECOMPOSITION entry 2.6 and `features/quota-catalog.md`. The package's feature 1 steps are
+  implemented through that feature and ticked in the package, which has no code markers.
+- **Not built here.** The quota-set validation that Pricing calls (quotas DESIGN §3.3.1.1) and the
+  qualification records and sale decisions of the package's feature 5.
+- **The tests.** `gear_tests.rs`: `the_hubs_quota_catalog_is_products_client_after_the_gears_init`,
+  `the_production_wiring_closes_discovery_before_any_effect` and
+  `the_production_wiring_answers_503_without_a_registry`; the route and OpenAPI censuses with the twelve
+  quota operations.
+
+**Source:** Owner, 2026-11-19 (quotas programme). Adopts the quotas package's ADR 0001.
+
+#### P-D-267 [H] The quota GTS contract lives in products-sdk; adapter owners register its instances
+
+**Status:** DECIDED 2026-11-19.
+
+- **The schemas.** `products-sdk` declares five schemas: `gts.cf.bss.products.quota_unit.v1~`,
+  `gts.cf.bss.products.quota_accounting_policy.v1~` and `gts.cf.bss.products.quota_scope_policy.v1~`
+  (final), and `gts.cf.bss.products.quota_metric.v1~` and `gts.cf.bss.products.quota_capability.v1~`
+  (extensible only under `properties`). None is abstract. Each reference field is narrowed to its
+  family. The toolkit inventory seeds types-registry with them; nothing registers them by hand.
+- **The plugin specification.** `gts.cf.toolkit.plugins.plugin.v1~cf.bss.products.quota_discovery.v1~`,
+  derived from the toolkit's `PluginV1`. An adapter registers its plugin instance under it.
+- **The instances (the owner's ruling of 2026-11-19).** Products registers no metric, unit or policy
+  instance. The adapter owner registers the metric, unit, accounting-policy and scope-policy instances of
+  its service in its own namespace, against these schemas, and its discovery records reference them.
+  Products validates every reference at intake (P-D-268), and an administrator approves the record into
+  the catalog (P-D-269). The adapter owner knows what its service counts; Products owns the shape and the
+  review. Products' tests register such instances in a fake registry. The quotas package's examples use
+  an example adapter namespace, `cf.compute.quota_adapter`.
+- **The traits.** `ProductsQuotaDiscoveryPluginClientV1`: adapters implement it, with one read-only
+  `list_capabilities`. `ProductsQuotaCatalogClientV1`: the catalog reads (P-D-272).
+- **The arithmetic.** Units are exact rational factors on decimal strings of at most 39 digits, read as
+  `u128`. A conversion multiplies with checks, and an inexact or overflowing result is refused. No float.
+- **The digests.** One canonical rendering in the SDK (keys sorted at every depth, no whitespace,
+  strings and integers as written), so an adapter computes the same bytes. Each digest is the SHA-256 of a
+  domain line and the rendering, one domain per kind: snapshot, capability record, definition, mapping and
+  profile. Lowercase hex. The snapshot digest hashes `observed_at` as RFC 3339 text in UTC: `Z` as the
+  offset, whole seconds always written, and a fraction of a second only when it is not zero, without
+  trailing zeros.
+- **The schema's own limits.** The capability schema refuses a zero `step` itself, and `max` has one
+  encoding: absent for an unbounded capability, never `null`.
+- **The tests.** `quota/gts_tests.rs`: `unit_and_policy_schemas_are_final_and_metric_and_capability_are_not`,
+  `every_reference_is_narrowed_to_its_family`,
+  `the_ids_are_major_only_v1_and_the_plugin_derives_from_the_toolkit_base`,
+  `the_package_example_record_parses_and_an_unknown_member_does_not`, `an_absent_operation_flag_is_refused`,
+  `the_package_example_instances_parse`, `each_schema_type_id_is_its_constant`,
+  `a_malformed_type_id_is_refused_and_other_versions_still_parse`,
+  `every_reference_is_a_typed_gts_id_at_the_parse`,
+  `metric_and_capability_are_closed_at_the_top_level_and_open_in_properties`,
+  `the_unit_and_resource_type_references_are_narrowed`, `every_enum_property_is_a_flat_enum` and
+  `a_zero_step_is_outside_the_schema_and_max_has_one_encoding`. `quota/units_tests.rs`:
+  `gb_and_gib_reach_bytes_by_their_own_factors`, `a_zero_denominator_is_refused`,
+  `a_factor_that_is_not_reduced_is_refused`, `amounts_are_canonical_decimal_integers`,
+  `an_overflowing_conversion_is_refused_not_wrapped`,
+  `a_fractional_factor_converts_exactly_when_the_result_is_whole` and `every_refusal_names_its_stable_code`.
+  `quota/digest_tests.rs`: `the_rendering_sorts_keys_at_every_depth_and_keeps_arrays_in_order`,
+  `the_snapshot_digest_ignores_item_order_and_excludes_cursor_and_digest`,
+  `every_member_of_the_snapshot_identity_moves_the_digest`, `the_kinds_are_domain_separated`,
+  `the_package_example_snapshot_has_a_pinned_digest`, `an_item_without_a_string_id_is_refused`,
+  `an_instant_outside_the_utc_range_is_refused_not_a_panic` and
+  `the_observation_time_is_hashed_as_utc_with_a_fraction_only_when_non_zero`. `quota/catalog_tests.rs`:
+  `quota_version_round_trips_as_a_decimal_string`,
+  `the_package_example_row_deserializes_into_a_definition`,
+  `a_definition_serializes_its_bases_as_the_package_spells_them` and
+  `the_package_example_row_writes_back_unchanged`. `infra/quota/registry_tests.rs`:
+  `the_well_known_instances_validate_against_their_schemas` (the adapter instances the tests register).
+
+**Source:** Owner, 2026-11-19: the adapter brings every metric, unit and policy instance, and Products
+registers only its schemas and the plugin specification. Quotas DESIGN §3.3.1 and §3.3.1.3, amended in the
+same change to say so.
+
+#### P-D-268 [H] Quota intake: adapter targets, complete snapshots, per-record verdicts
+
+**Status:** DECIDED 2026-11-19.
+
+- **Targets.** An adapter target binds, in a tenant, one plugin instance that types-registry holds under
+  the quota discovery specification and an opaque target key (1 to 255 printable ASCII bytes), with a
+  name of at most 200 characters. An unknown plugin instance is 400 `QUOTA_TARGET_PLUGIN_UNKNOWN`; the
+  same binding twice is 409 `QUOTA_TARGET_TAKEN`. A target is append-only.
+- **Discovery.** An administrator starts it: `POST /quota-adapter-targets/{id}/discoveries` (operation
+  `bss_products.run_quota_discovery`). There is no scheduler. Products resolves the target's plugin client
+  through the scoped ClientHub and reads every page of one snapshot outside any transaction. Each page call
+  is bounded by `quota_discovery_timeout_ms` (default 5000, at least 1) and asks
+  `quota_discovery_page_size` records (default 50, 1 to 200). A snapshot holds at most
+  `quota_discovery_max_items` records (default 10 000, at least 1). `quota_discovery_deadline_ms`
+  (default 25 000, at least 1) bounds one discovery's read across its pages and the judging of its
+  records, so neither an adapter that answers each page in time nor a slow types-registry can hold the
+  intake; the staging transaction after it is not cut. The discovery operation declares its own request
+  timeout: the deadline plus 15 s for the staging, read from the gear's configuration when the routes
+  register (40 s by default, the `x-toolkit-request-timeout` extension). So a slow discovery answers 503
+  here before the API gateway cuts the request, whatever the gateway's default timeout is; a gateway
+  `defaults.max_request_timeout` below it still caps it. Every setting is checked at boot.
+- **Pages.** An adapter may answer fewer records than a page asks for, so only the record bound limits a
+  read. Every page but the last holds at least one record, so an adapter that never ends meets that bound.
+  Each record takes at most 64 KiB serialized as JSON (`MAX_RECORD_BYTES`), checked as its page arrives,
+  so no adapter makes the intake buffer, hash or store a record of unbounded size.
+- **A complete snapshot or nothing.** Pages that disagree on the snapshot id, revision, observation time,
+  count or digest, a repeated record id, a cursor that loops, an empty page that is not the last, a count
+  or digest mismatch, more records than the bound, a record over 64 KiB, a record that holds U+0000 in
+  any string or key (Postgres refuses it in the stored records, SQLite stores it), or a read or a judging
+  past the deadline are 503 `QUOTA_DISCOVERY_INCOMPLETE`, and nothing is stored. An adapter error or a late page is
+  503 `QUOTA_DISCOVERY_UNAVAILABLE`; the adapter's text is logged, never returned. An incomplete snapshot
+  never means that a capability was removed.
+- **The stored revision first.** Before any record is judged, the target's stored snapshot at the
+  revision answers: the same digest as a replay, another digest as 409 `QUOTA_SOURCE_CONFLICT`, and a
+  revision below the target's highest as 409 `QUOTA_SOURCE_STALE`. So a replay answers while
+  types-registry is down. The staging transaction asks the same again before it writes.
+- **Records.** Each record is judged through types-registry as the caller, outside any transaction, by
+  DESIGN §3.1's rules. A record that fails is rejected: it becomes no candidate and is listed in the
+  snapshot's review notes with its code, field and detail, and the complete snapshot and the valid records
+  are still stored. A capability schema that types-registry holds but cannot compile rejects the record
+  (`QUOTA_RECORD_INVALID` on `type_id`); it is a verdict, not an outage. A registry outage at any record
+  aborts the intake: 503 `QUOTA_REGISTRY_UNAVAILABLE`, nothing stored. Types-registry's own text is logged,
+  never answered.
+- **One record per capability key.** A capability key that two records of a snapshot name, valid or
+  rejected, rejects every record that names it: none of them can be the capability. A valid one is rejected
+  `QUOTA_RECORD_INVALID` on `capability_key`; a rejected one keeps its own refusal.
+- **Major-only identity.** No segment of a record's `type_id` or of its metric, unit or policy reference
+  carries a minor version. This includes the segments the adapter owner registered (P-D-267), which
+  Products does not control. Every `cf.bss.products.quota_*` segment is exactly `v1`. Anything else is
+  `QUOTA_VERSION_UNSUPPORTED`.
+- **Replay, conflict and stale.** One snapshot per target and source revision; revisions compare as
+  numbers. The same digest at that revision answers the stored snapshot and its candidates with 200, with
+  or without an `Idempotency-Key`. Another digest is 409 `QUOTA_SOURCE_CONFLICT`, and a revision below the
+  target's highest is 409 `QUOTA_SOURCE_STALE`. A lost insert race reads the winner and answers as a
+  replay or a conflict. The answer's `snapshot.id` is the `snapshot_row_id` its candidates carry.
+- **Notes.** A valid record whose capability has an approved mapping with another record digest or
+  evidence digest is a `drift` note. An approved mapping whose capability no record of the snapshot names,
+  valid or rejected, is a `retired` note. Notes are stored and answered; nothing published changes.
+- **Manual records.** `POST /quota-candidates` judges one record by the same rules and keeps its author.
+  A rejected record is 400 with its code on `record.<field>`. The same record id again answers the stored
+  candidate when its digest is equal, else 409 `QUOTA_SOURCE_CONFLICT`. Like every Products POST, it takes
+  an optional `Idempotency-Key`, and a keyed retry replays the first answer (P-D-198).
+- **Lists.** The target list pages by `name`, then `id`, and the candidate list newest first; each cursor
+  binds the caller's tenant (the candidate list's also its `target_id` and `state`), so a cursor another
+  tenant sends is 400.
+- **No adapter is built.** When no scoped client is registered for the target's plugin instance, discovery
+  answers 501 `QUOTA_DISCOVERY_CLOSED` before any read or write.
+- **Audit, no events.** Each write records one audit row in its transaction: `quota_adapter_target.create`,
+  `quota_discovery.intake` or `quota_candidate.create`. No outbox event is written: nothing consumes one,
+  and Pricing reads the catalog when it needs it.
+- **The tests.** `domain/quota/record_tests.rs`: `a_valid_record_is_judged_with_its_evidence`,
+  `an_unregistered_metric_is_unknown`, `a_unit_named_as_the_metric_is_a_family_refusal`,
+  `a_metric_that_is_not_allocation_is_unsupported`, `a_metric_without_english_text_is_refused`,
+  `a_minor_bearing_reference_is_refused`, `a_minor_bearing_adapter_instance_is_refused`,
+  `a_v2_family_is_unsupported`, `a_type_id_outside_the_capability_family_is_refused`, `a_zero_step_is_refused`,
+  `the_record_unit_and_the_metric_must_share_a_canonical_unit`,
+  `a_registry_outage_is_unavailable_not_a_refusal`,
+  `a_derived_capability_schema_with_validated_properties_is_accepted`,
+  `an_abstract_subject_type_is_a_family_refusal`, `one_run_asks_the_registry_once_per_entity`,
+  `a_unit_converts_directly_into_a_canonical_unit_that_refers_to_itself`,
+  `a_policy_outside_its_v1_meaning_is_refused`, `a_record_outside_the_v1_shape_is_invalid_on_its_field`,
+  `the_platform_registry_judges_references_before_the_schema`,
+  `a_capability_schema_that_does_not_compile_rejects_the_record` and
+  `a_canonical_unit_that_does_not_name_itself_is_invalid`. `domain/quota/locale_tests.rs`:
+  `a_missing_locale_falls_back_to_english`, `a_bad_tag_is_validation`, `more_than_32_locales_is_too_long`
+  and `english_is_required_and_not_blank`. `domain/quota/snapshot_tests.rs`:
+  `a_complete_snapshot_of_three_pages_is_verified_and_sorted`,
+  `pages_of_two_revisions_leave_intake_unresolved`, `a_repeated_record_id_leaves_intake_unresolved`,
+  `a_count_that_disagrees_leaves_intake_unresolved`, `a_digest_that_disagrees_leaves_intake_unresolved`,
+  `a_cursor_loop_leaves_intake_unresolved`, `more_items_than_the_bound_leave_intake_unresolved`,
+  `short_pages_inside_the_bound_read_complete`, `an_empty_page_that_is_not_the_last_is_incomplete`,
+  `an_adapter_error_is_unavailable_and_carries_no_adapter_text`,
+  `a_page_later_than_the_timeout_is_unavailable`,
+  `the_whole_read_is_bounded_by_the_discovery_deadline` and `every_page_repeats_the_snapshot_identity`.
+  `domain/quota/intake_tests.rs`: `drift_is_a_changed_digest_of_an_approved_capability`,
+  `retired_is_an_approved_capability_absent_from_the_snapshot`,
+  `a_rejected_record_is_neither_drift_nor_retired`, `a_capability_key_claimed_twice_rejects_both_records`,
+  `a_capability_key_named_by_a_rejected_record_rejects_the_valid_one_too` and `revisions_order_as_numbers`.
+  `infra/quota/registry_tests.rs`: `an_instance_reads_with_its_type_and_resource_version`,
+  `an_unknown_instance_is_none_and_an_outage_is_unavailable`,
+  `without_a_registry_in_the_hub_every_read_is_unavailable`,
+  `a_record_the_capability_schema_refuses_is_invalid`,
+  `a_derived_capability_schema_validates_through_its_ancestors` and
+  `a_live_schema_that_does_not_compile_is_a_verdict_not_an_outage`. `infra/quota/discovery_tests.rs`:
+  `a_registered_scoped_client_resolves_and_none_is_closed`. `api/rest/quota/intake_tests.rs`:
+  `the_same_snapshot_twice_is_one_snapshot_and_answers_the_stored_candidates`,
+  `other_content_at_the_same_revision_is_a_conflict_and_writes_nothing`, `a_lower_revision_is_stale`,
+  `staging_asks_no_registry_inside_its_transaction`, `a_replay_inside_the_transaction_runs_no_insert`,
+  `a_stored_lower_revision_replays_after_a_higher_one` and
+  `a_staged_snapshot_keeps_its_records_evidence_and_notes`. `api/rest/quota/targets_tests.rs`:
+  `a_target_is_created_read_and_listed`, `a_plugin_instance_of_another_type_is_refused`,
+  `the_same_binding_twice_is_taken`, `a_target_list_cursor_from_another_tenant_is_refused`,
+  `a_target_outside_its_caps_is_refused`, `a_registry_outage_binds_no_target` and
+  `a_keyed_target_create_replays_its_first_answer`. `api/rest/quota/discovery_tests.rs`:
+  `a_complete_snapshot_stages_one_candidate_per_valid_record`,
+  `the_same_snapshot_again_recovers_the_stored_candidates`, `a_replay_answers_while_the_registry_is_down`,
+  `other_content_at_the_same_revision_is_a_source_conflict`,
+  `a_registry_outage_stores_nothing_and_answers_503`,
+  `an_incomplete_snapshot_stores_nothing_and_answers_503`,
+  `a_changed_registry_record_is_reported_as_drift_and_leaves_the_definition`,
+  `a_capability_missing_from_a_complete_snapshot_is_a_retired_note`,
+  `without_an_adapter_discovery_is_closed_before_any_effect`, `a_keyed_discovery_replays_its_first_answer`,
+  `a_stale_revision_is_refused_before_any_record_is_judged`, `a_discovery_past_its_deadline_stores_nothing`,
+  `judging_past_the_discovery_deadline_stores_nothing`,
+  `the_discovery_route_declares_its_deadline_and_the_staging_as_its_timeout`,
+  `an_oversized_record_stores_nothing_and_answers_503` and
+  `a_record_holding_a_nul_stores_nothing_and_answers_503`. `api/rest/quota/candidates_tests.rs`:
+  `a_manual_record_passes_the_discovery_judgement`, `a_manual_record_with_an_unknown_unit_is_refused`,
+  `a_manual_record_with_the_same_id_and_other_content_conflicts`,
+  `a_keyed_manual_record_replays_its_first_answer`, `the_candidate_list_filters_by_state_and_target`,
+  `a_candidate_list_cursor_with_another_state_is_refused`,
+  `a_candidate_list_cursor_from_another_tenant_is_refused`, `another_tenants_candidate_is_not_found` and
+  `a_stored_candidate_that_does_not_decode_is_500`. `config_tests.rs`:
+  `the_quota_settings_default_and_refuse_out_of_range`. On Postgres, `tests/postgres_quota_catalog.rs`:
+  `two_concurrent_intakes_of_one_revision_store_one_snapshot_on_postgres`,
+  `a_manual_record_that_loses_the_insert_race_answers_the_winner_on_postgres` and
+  `the_highest_revision_compares_as_a_number_on_postgres`.
+
+**Source:** Owner, 2026-11-19 (quotas programme). Implements the package's feature 1 steps
+`inst-discover`, `inst-complete` and `inst-candidate` and its algorithm steps `inst-identity`,
+`inst-replay` and `inst-incomplete`.
+
+#### P-D-269 [H] A quota definition is approved on its candidate, with separation of duties
+
+**Status:** DECIDED 2026-11-19.
+
+- **The path.** A candidate is `staged`, from discovery or by hand, then `submitted` with its proposal,
+  then `approved` or `rejected`. Each move is one endpoint on the candidate: `submit` under the `submit`
+  grant, and `approve` and `reject` under the `approve` grant.
+- **The proposal.** A SKU and a SKU version the tenant holds (else 400 `QUOTA_SKU_VERSION_UNKNOWN`); an
+  optional existing definition to version that the `submit` grant reaches (else 404, P-D-273), of the same
+  SKU and metric (P-D-270; else 400 `QUOTA_RECORD_INVALID` on `definition_id`); one to eight plan units of
+  the metric's canonical unit,
+  into each of which the record's bounds convert exactly (a minor-bearing unit is 400
+  `QUOTA_VERSION_UNSUPPORTED`, an unregistered one `QUOTA_REFERENCE_UNKNOWN`, one of another family
+  `QUOTA_REFERENCE_FAMILY`, one of another canonical unit `QUOTA_UNIT_MISMATCH` and inexact bounds
+  `QUOTA_UNIT_INEXACT`, each on `allowed_unit_refs[i]`); the bases; reviewed profile conditions with
+  English text; an optional note. A capability without all six operations or without initial installation
+  is 400 `QUOTA_PROFILE_UNSUPPORTED`.
+- **The bases.** REST spells them `fixed` and `per_plan_unit`, as every Products REST enum is spelled;
+  another token is 400 `VALIDATION` on `supported_bases[i]`. The SDK keeps the quotas package's spelling,
+  `Fixed` and `PerPlanUnit`.
+- **The pin.** The submit reads, as the caller, the metric, the record's unit and its canonical unit,
+  both policies and each plan unit, and pins each, with its evidence and its content, in the candidate's
+  `proposal_evidence_json`; an approval reads only that. An entity that types-registry holds at another
+  revision than intake judged is 409 `QUOTA_SOURCE_CONFLICT`. One that it no longer holds is 400
+  `QUOTA_REFERENCE_UNKNOWN` on the record's field (`metric_ref`, `unit_ref`,
+  `metric_ref.canonical_unit_ref`, `accounting_policy_ref` or `scope_policy_ref`). An outage is 503
+  `QUOTA_REGISTRY_UNAVAILABLE`.
+- **A known limit.** The owner ruled on 2026-11-19 that a discovered candidate whose registry entity
+  changed after intake waits for a new snapshot revision of its target, or is replaced by a manual record
+  under a new record id. There is no re-pin path in this version: a discovery of the same revision replays
+  the stored candidate without judging it again. The submit's 409 names the remedy: "a new snapshot
+  revision of the target, or a manual record under a new record id, judges it again".
+- **Separation.** The submitter cannot approve or reject the candidate, and neither can the author of a
+  manual candidate: 403 `SOD_VIOLATION`. One approval publishes. A reject needs a note (400
+  `NOTE_REQUIRED`); an approval's note is optional.
+- **The answers.** A submit and a reject answer the candidate with its new `ETag`. An approval answers
+  `{candidate, definition}`, the definition as its version read answers it in English, and no `ETag`: an
+  approved candidate never moves again. An approve and a reject take a JSON body, `{}` at least.
+- **Why not an approval unit.** Approval units, their counts and the approvals inbox are typed to the three
+  SKU kinds (P-D-190, `cpt-cf-bss-products-constraint-approval-shape`). A fourth kind would change three
+  published closed sets: `ProductsApprovalKind`, the counts' `by_kind` and the inbox's `InboxKind`. The
+  candidate's review columns map onto a unit if that ever changes.
+- **Concurrency.** Each review write takes the candidate's `If-Match` and moves only from the version it
+  names. A miss reads the candidate again: another state is 409 `QUOTA_CANDIDATE_STATE`, the same state
+  409 `STALE_REVISION`. A decided candidate is frozen: the storage refuses every update of it. Each write
+  records its audit row in its transaction: `quota_candidate.submit`, `quota_candidate.approve` or
+  `quota_candidate.reject`.
+- **Lost answers.** Like every Products POST, submit, approve and reject take an optional
+  `Idempotency-Key` (P-D-198). A keyed retry replays the first answer, after the decision too. Without a
+  key, a client whose answer was lost sees 409 `QUOTA_CANDIDATE_STATE`, and it cannot tell its own
+  decision from another approver's.
+- **The tests.** `api/rest/quota/review_tests.rs`: `submit_moves_a_staged_candidate_with_its_proposal`,
+  `submit_needs_english_profile_conditions`, `submit_with_an_unknown_sku_version_is_refused`,
+  `a_gib_record_cannot_be_offered_in_gb`,
+  `each_plan_unit_refusal_names_its_index_and_leaves_the_candidate_staged`,
+  `submit_with_a_stale_if_match_is_stale_revision`,
+  `submit_without_if_match_is_validation`, `a_keyed_submit_replays_its_first_answer`,
+  `a_registry_revision_since_intake_is_a_source_conflict`,
+  `the_submitter_cannot_approve_and_the_author_of_a_manual_record_cannot_either`,
+  `a_reject_needs_a_note_and_closes_the_candidate`, `a_decision_needs_its_if_match_and_a_short_note`,
+  `a_keyed_approval_replays_after_the_decision`, `a_keyed_reject_replays_its_first_answer`,
+  `every_review_request_asks_its_grant_for_the_callers_tenant_only` and
+  `the_review_operations_declare_their_answers`. `domain/quota/review_tests.rs`:
+  `a_stored_proposal_reads_back_as_written`. `infra/storage/repo/quota_intake_repo_tests.rs`:
+  `a_review_write_moves_once_per_seen_version` and `a_review_write_moves_only_from_its_own_state`. The
+  migration's `_tests.rs`: `a_decided_candidate_is_frozen`. On Postgres, `tests/postgres_quota_catalog.rs`:
+  `two_concurrent_review_writes_move_one_on_postgres`, `two_concurrent_approvals_publish_one_version_on_postgres`
+  and `a_decided_candidate_is_frozen_on_postgres`.
+
+**Source:** Owner, 2026-11-19: the catalog has its own submit, approve and reject endpoints, with
+separation of duties. Implements the package's feature 1 step `inst-review` and its algorithm step
+`inst-result`.
+
+#### P-D-270 [H] Quota definitions, mappings and profiles are append-only versions
+
+**Status:** DECIDED 2026-11-19.
+
+- **The versions.** An approval writes, in one transaction and with no registry or plugin call, one
+  definition version `(definition_id, version)` built from the stored candidate and proposal, its mapping
+  version and its profile version. Each carries a digest over its canonical content (P-D-267). Nothing
+  changes them afterwards.
+- **Applicability (the owner's ruling of 2026-11-19).** A definition version applies to the SKU version
+  it was approved against and to every later version of that SKU. The list for SKU version N answers the
+  versions approved at a SKU version up to N, and each answers the SKU version it was approved against.
+  Products moves `published_version` on every approved SKU change (P-D-190, P-D-249), so an exact pin
+  would make every quota-bearing plan unsellable after any SKU change until a new review.
+- **The content.** The metric, the canonical unit and the allowed units with their bounds in each unit,
+  the subject and resource types, both policies with their content, the change support, the bases, the
+  conditions, the mapping and profile references, and the registry evidence (GTS id, UUID, resource
+  version, digest): the evidence intake resolved, and each plan unit's that the submit pinned. A later
+  registry revision changes no stored version. The metric, the subject type and each resource type are
+  also stored as their deterministic UUIDs (`GtsId::to_uuid`) for the reads.
+- **The mapping.** `mapping_json` holds the target, its plugin instance and key, the capability and
+  mapping keys, the metric and unit references, the limits, the operations, the record digest and the
+  intake evidence.
+- **The identity.** A submit names an existing definition, for its next version, or none, for a new
+  definition id minted at approval. The owner ruled on 2026-11-19 that a named definition's next version
+  must be for the same SKU, from any adapter target; its metric must be the same too. The submit, and the
+  approval again inside its transaction, refuse another SKU or metric with 400 `QUOTA_RECORD_INVALID` on
+  `definition_id`, whose detail names both SKUs, and nothing is stored. Both read the named definition
+  under the whole grant, so a definition the tenant does not hold, or one the grant does not reach, is 404
+  on the quota definition (P-D-273). A candidate of another target lineage may version the definition.
+- **The lineage.** A mapping's lineage is `(target, capability_key)`: the first approval mints the mapping
+  and profile ids, and a later one reuses the latest mapping version when both its mapping digest and its
+  profile digest are equal, else writes the next version; the profile version moves with it.
+- **A lost race.** A concurrent approval that took a definition's next version, or a mapping's, makes this
+  one 409 `CONTENDED` at the first collision, with no server retry and nothing written. The client sends
+  the approval again, and that retry takes the next version. A lineage holds one mapping row per version
+  (a unique key on `(tenant, target, capability_key, version)`, P-D-274), so two first approvals of one
+  capability key race for its version 1 the same way: the loser's retry continues the winner's lineage
+  and never forks it.
+- **The profile.** Version 1 is `bounded_allocation`: the scope policy's aggregation, the accounting
+  basis, all six operations required, and the record's change support. Increase support is recorded, not
+  required.
+- **A new meaning.** New metric text, units, mapping or policies make a new version, through review. A
+  candidate staged before types-registry revised one of its entities is not re-pinned (P-D-269).
+- **The tests.** `domain/quota/review_tests.rs`: `adapter_bounds_convert_exactly_into_each_plan_unit`,
+  `a_gib_step_is_inexact_in_gb`, `a_capability_missing_an_operation_is_profile_unsupported`,
+  `initial_installation_is_required_and_increase_is_recorded` and `bases_and_units_are_non_empty_sets`.
+  `domain/quota/definition_tests.rs`: `the_definition_digest_covers_the_pinned_dependencies`,
+  `an_equal_record_reuses_the_lineages_mapping`, `a_changed_mapping_key_is_the_next_mapping_version`,
+  `a_named_definition_takes_its_next_version` and `a_stored_candidate_without_its_proposal_does_not_build`.
+  `api/rest/quota/review_tests.rs`: `an_approval_publishes_one_definition_version_unavailable_for_sale`,
+  `a_registry_revision_after_approval_leaves_the_definition_unchanged`,
+  `a_second_version_of_a_definition_keeps_the_first_readable`,
+  `a_named_definition_of_another_metric_is_refused`, `a_named_definition_of_another_sku_is_refused_at_submit`,
+  `a_named_definition_of_another_sku_is_refused_at_approval`,
+  `a_candidate_of_another_target_versions_a_definition_of_its_sku_and_metric` and
+  `a_lost_race_for_a_definitions_next_version_is_contended`. `infra/storage/repo/quota_catalog_repo_tests.rs`:
+  `the_definition_list_answers_versions_up_to_the_sku_version`,
+  `a_definition_reads_as_stored_and_versions_count_up`, `the_latest_mapping_of_each_lineage_reads_back` and
+  `a_version_beyond_the_stored_range_is_refused_not_wrapped`. `api/rest/quota/definitions_tests.rs`:
+  `the_list_answers_the_versions_applicable_to_the_sku_version`. On Postgres,
+  `tests/postgres_quota_catalog.rs`: `the_definition_list_answers_versions_up_to_the_sku_version_on_postgres`,
+  `the_definition_digests_answer_each_stored_version_on_postgres` and
+  `two_first_approvals_of_one_lineage_store_one_mapping_on_postgres`.
+
+**Source:** Owner, 2026-11-19: a definition covers the SKU version it was approved against and every
+later one. Quotas DESIGN §3.3.1.1, amended in the same change to say so.
+
+#### P-D-271 [M] Every approved quota definition is unavailable for sale until qualification
+
+**Status:** DECIDED 2026-11-19.
+
+- **The slots.** Each approved version gets availability revision 1, `disabled`, reason
+  `qualification_pending`, with no qualification reference. Availability is a separate append-only
+  observation of a version, and it never changes the definition's content. The current one is the
+  highest revision.
+- **Nothing enables sale yet.** No endpoint writes another revision in this version, so the default
+  catalog list answers no row until qualification is built, and a definition's `qualification_ref` is
+  null until then.
+- **Why.** The quotas package lets the catalog store qualification evidence from the start but makes
+  sales wait for its feature 5 (its DECOMPOSITION §3). Here the wait holds by construction. Feature 5
+  adds qualification records and the enable, disable and withdraw decisions in its own migration.
+- **The tests.** `domain/quota/definition_tests.rs`: `the_availability_is_disabled_pending_qualification`.
+  `api/rest/quota/review_tests.rs`: `an_approval_publishes_one_definition_version_unavailable_for_sale`.
+  `api/rest/quota/definitions_tests.rs`: `the_default_list_is_enabled_only_and_all_carries_reasons`.
+  `infra/storage/repo/quota_catalog_repo_tests.rs`: `the_current_availability_is_the_highest_revision` and
+  `a_definition_without_availability_is_corrupt_not_missing`. The migration's `_tests.rs`: `the_checks_hold`
+  (a reason exactly when not enabled).
+
+**Source:** Owner, 2026-11-19: the catalog stores only the qualification slots, and every approved
+definition is stored disabled, pending qualification. The package's feature 1 step `inst-qualify` stays
+open.
+
+#### P-D-272 [M] Plan authors read the quota catalog through two endpoints and one SDK client
+
+**Status:** DECIDED 2026-11-19.
+
+- **The reads.** `GET /quota-definitions` and `GET /quota-definitions/{id}/versions/{version}`, under
+  `read` on `quota_definition`, and `ProductsQuotaCatalogClientV1`, registered in the ClientHub at init,
+  which reads as its caller through the same code. No REST client is published: Pricing runs in the same
+  process, as it does for `ProductsClient`.
+- **The envelope (the owner's ruling of 2026-11-19).** The list answers the toolkit's `Page<T>`,
+  `{items, page_info: {next_cursor, prev_cursor, limit}}`, as every other Products list does (P-D-210).
+  The SDK answers `{items, next_cursor}`.
+- **The bases.** REST spells them `fixed` and `per_plan_unit`, as every Products REST enum is spelled, and so
+  does the quotas package's example catalog answer, a REST list. The SDK keeps the spelling of the package's
+  DESIGN, `Fixed` and `PerPlanUnit`.
+- **The query.** `$filter` is required by the endpoint, although the OpenAPI document cannot mark it
+  required. It takes only `eq` terms joined by `and`, each at most once, on `sku_id` and `sku_version`
+  (both required), `subject_type_ref`, `resource_type_ref` and `profile_id`, and the operation publishes
+  that vocabulary (`x-odata-filter`). A term named twice, any other field, operator or shape, or a missing
+  required term is 400 `QUOTA_FILTER_INVALID` naming the term. The shared OData binding parses `$filter`
+  once, within its budget, and the list reads its terms from that parse: a `$filter` that does not parse,
+  or one over 8 KiB or 2000 nodes, is the binding's 400 on `$filter` (`INVALID_FILTER`, `FILTER_TOO_LONG`,
+  `FILTER_TOO_COMPLEX`), answered before any term is read.
+  `availability` is `enabled` (the default) or `all`; anything else is 400 `VALIDATION`. `locale` picks the
+  text, with an English fallback: `locale` in the answer names the tag the display name was served in, and
+  the description and the conditions fall back on their own. `limit`/`$top` is 50 by default and at most
+  200; `cursor`/`$skiptoken` continues. The order is `definition_id`, then `version`. The cursor binds the
+  authorized scope (the caller's tenant), the filters and `availability`; a cursor from another tenant or
+  under other filters is 400, as the quotas package requires.
+- **The scope.** The reads keep the whole `read` grant on `quota_definition`, with its row constraints: a
+  grant on some definitions lists and reads only those, and any other version is 404 (P-D-273).
+- **What a row carries.** The stored content and digest, the text in the locale, and the current
+  availability with its reason, read for the whole page in one statement. No read asks the registry or the
+  plugin, or computes a digest again. A stored row that does not decode is a 500, never a missing row.
+- **The SDK client.** It answers what the endpoints answer, through the same code; its test compares the
+  two through the REST mirror of the SDK types.
+- **Later, in place.** The quota-set validation that Pricing calls at authoring and acceptance (quotas
+  DESIGN §3.3.1.1) is added to the same trait when it is built.
+- **The tests.** `api/rest/quota/definitions_tests.rs`:
+  `the_list_answers_the_versions_applicable_to_the_sku_version`,
+  `the_default_list_is_enabled_only_and_all_carries_reasons`, `a_cursor_with_changed_filters_is_refused`,
+  `a_cursor_from_another_tenant_is_refused`, `the_list_makes_no_registry_call`,
+  `the_definition_answers_the_requested_locale_with_an_english_fallback`,
+  `the_filter_takes_only_eq_on_its_five_fields`, `an_exact_version_reads_as_stored_after_a_newer_version`,
+  `another_tenants_definition_is_not_found`, `a_pdp_outage_is_503_not_an_empty_page`,
+  `a_staged_or_submitted_candidate_is_not_listed`, `the_definition_carries_bounds_and_no_amount`,
+  `a_stored_definition_that_does_not_decode_is_500`, `a_grant_on_some_definitions_reads_only_those`,
+  `the_odata_budget_answers_before_the_terms_are_read`, `an_unparsable_filter_is_the_bindings_invalid_filter`
+  and `every_read_asks_read_for_the_callers_tenant_only`.
+  `infra/storage/repo/quota_catalog_repo_tests.rs`:
+  `the_definition_list_filters_by_resource_type`, `the_definition_list_filters_by_subject_type_and_profile`,
+  `the_definition_list_pages_by_definition_then_version`,
+  `the_list_reads_availability_in_one_statement_per_page` and
+  `the_definition_digests_of_a_page_are_one_statement`. `infra/quota/catalog_client_tests.rs`:
+  `the_sdk_client_answers_what_rest_answers` and `the_sdk_client_refuses_another_tenants_version`.
+  `api/rest/quota/dto_tests.rs`: `every_sdk_enum_maps_to_its_rest_mirror` and
+  `the_package_example_row_is_the_rest_definition`. `gear_tests.rs`:
+  `the_hubs_quota_catalog_is_products_client_after_the_gears_init` and
+  `served_query_parameters_are_typed_and_the_list_publishes_its_odata_vocabulary`.
+
+**Source:** Owner, 2026-11-19: the catalog list uses Products' `{items, page_info}` envelope. Quotas
+DESIGN §3.3.1.1 and its example list, amended in the same change to say so. Implements the package's
+feature 1 step `inst-browse`.
+
+#### P-D-273 [M] Two quota resources with six grants
+
+**Status:** DECIDED 2026-11-19.
+
+- **The resources.** `gts.cf.bss.products.quota_definition.v1~` with `read`, `author`, `submit` and
+  `approve`, and `gts.cf.bss.products.quota_adapter_target.v1~` with `read` and `author`: six permission
+  instances. Their label schemas are registered at boot with the others (P-D-204). Deployments add them
+  to roles.
+- **Who asks what.** A target create and a discovery ask `author` on `quota_adapter_target`, and the
+  target reads `read`. A manual record asks `author` on `quota_definition`, a submit `submit`, an approve
+  and a reject `approve`, and the candidate and definition reads `read`.
+- **The rule.** Every endpoint authorizes before it reads the body, asks for the caller's tenant only
+  (P-D-265), reads with that tenant as the SQL filter and writes to that tenant. A body that holds U+0000
+  in any string, value or key is 400 `VALIDATION` on that path (`record.mapping_key`, `note`, `<path> (a
+  key)`) before anything reads it: Postgres refuses the character in text and `jsonb` while SQLite stores
+  it, so neither engine sees one. Every quota list cursor
+  binds the caller's tenant: the target list's `{tenant}`, the candidate list's `{tenant, target_id,
+  state}`, and the definition list's its terms and `availability` too.
+- **The scopes.** Candidate rows, the review writes and an approval's writes take `tenant_only()` of the
+  `quota_definition` grant, since a row constraint of the grant names definitions, not those rows. The
+  definition reads keep the whole `read` grant with its row constraints, so a grant on some definitions
+  lists and reads only those (P-D-272). The definition a proposal names is a definition row too: the
+  submit reads it under the whole `submit` grant, and the approval again inside its transaction under the
+  whole `approve` grant, so a grant on some definitions versions only those. A definition the grant does
+  not reach is 404 on the quota definition, as for a read, and nothing moves. A grant limited to some
+  definitions still approves a proposal that names no definition, and that approval mints a new
+  definition id: such a grant limits which definitions take a next version, not which are created.
+- **What a refusal names.** Every refusal of a quota endpoint names that endpoint's quota resource, never
+  the SKU, even for a generic code (`VALIDATION`, `FIELD_TOO_LONG`, `CONTENDED`, a key's refusal, a stale
+  revision): the target endpoints and the discovery `quota_adapter_target`, and the candidate, review and
+  definition endpoints `quota_definition`. A miss names the quota row that is missing. The list-protocol
+  refusals (an unknown or repeated query parameter, a refused cursor, a `$filter` the OData binding
+  refuses) name `cf.core.odata.query.v1~`, as on every Products list. A 501 or a 503 leads its `detail`
+  with its code (`QUOTA_DISCOVERY_CLOSED: …`), since those canonical errors carry no reason field. A stored
+  row that does not read is a data-loss 500 whose detail is `a stored quota row does not read`; the table,
+  tenant and id are logged.
+- **Why not the SKU grants.** The quotas package names the catalog administrator as an actor of its own
+  (its PRD §2.1), and an adapter target is integration configuration, not catalog content.
+- **The tests.** `api/rest/quota/targets_tests.rs`: `a_denied_caller_is_403_before_the_body_is_read`,
+  `every_quota_request_asks_for_the_callers_tenant_only`, `another_tenant_cannot_read_or_discover_a_target`
+  and `a_target_refusal_names_the_adapter_target`. `api/rest/quota/discovery_tests.rs`:
+  `a_discovery_refusal_names_the_adapter_target`. `api/rest/quota/candidates_tests.rs`:
+  `a_candidate_refusal_names_the_quota_definition` and
+  `a_candidate_page_reads_its_definition_digests_in_one_statement`. `api/rest/quota/review_tests.rs`:
+  `every_review_request_asks_its_grant_for_the_callers_tenant_only` and
+  `a_grant_on_some_definitions_versions_only_those`. `api/rest/quota/candidates_tests.rs`:
+  `a_nul_in_a_quota_body_is_validation_on_its_path`; on Postgres, `tests/postgres_quota_catalog.rs`:
+  `a_nul_in_a_review_body_is_validation_on_postgres`. `api/rest/quota/definitions_tests.rs`:
+  `every_read_asks_read_for_the_callers_tenant_only` and `a_grant_on_some_definitions_reads_only_those`.
+  `authz_tests.rs`: `the_permissions_cover_exactly_the_declared_pairs_and_inventory`. The route census and
+  the refusal-resource census with the two resources.
+
+**Source:** Owner, 2026-11-19: two new authorization resources with six permissions. Implements the
+package's feature 1 algorithm step `inst-authorize`.
+
+#### P-D-274 [M] Migration 000015 creates the quota catalog store
+
+**Status:** DECIDED 2026-11-19.
+
+- **The tables.** `m20261119_000015_quota_catalog` creates seven tables on both engines, as DESIGN §3.7
+  states: `products_quota_adapter_target`, `products_quota_snapshot`, `products_quota_candidate`,
+  `products_quota_mapping_version`, `products_quota_definition_version`,
+  `products_quota_definition_resource_type` and `products_quota_availability`.
+- **The keys.** Every key leads with `tenant_id`, and every foreign key is tenant-qualified, so a child row
+  never names another tenant's parent. Unique indexes hold one binding per target, one snapshot per target
+  and revision, one candidate per snapshot and capability key, one manual candidate per target and record
+  id, one mapping version per lineage `(target, capability_key)` and version, and one definition version
+  per candidate. Tenant-led indexes serve each list in its own order: the
+  targets by name, the candidates newest first (all, of a target, or in a state), and the definitions of a
+  SKU by SKU version.
+- **Append-only.** Six tables refuse every `UPDATE`, `DELETE` and `TRUNCATE`: on Postgres one function per
+  table runs from a row trigger and from a statement trigger, since a row trigger does not fire on
+  `TRUNCATE`. A candidate refuses `DELETE`, `TRUNCATE` and any `UPDATE` of its content columns; only its
+  review columns move, and a decided (approved or rejected) candidate refuses every `UPDATE`. CHECKs hold
+  the canonical revision, the lowercase digests, the origin and its snapshot, the states, the versions and
+  the availability reason.
+- **SQLite.** Two triggers per table give the same refusals with fixed messages. `REPLACE` settles a key
+  conflict by deleting the stored row, which fires no delete trigger, so every key of every quota table has
+  a `BEFORE INSERT` trigger that refuses a stored key first. Its message is SQLite's own text for a unique
+  failure on that key; the repositories' typed refusals of a duplicate insert rest on toolkit-db's fallback
+  that matches that text, because an abort from a trigger (`SQLITE_CONSTRAINT_TRIGGER`, code 1811) is not
+  classified as a unique failure. Every quota table is `WITHOUT ROWID`, so no statement can reach a row
+  through `rowid`.
+- **A row that does not read.** A stored row that does not read as its stored shape is a corrupt row
+  naming its table, tenant and id, and a 500 (P-D-273), never a missing row.
+- **What stays.** No shipped migration changes. None of the seven names is a legacy table, so the schema
+  guard (P-D-195) is unchanged.
+- **The revert.** The owner ruled on 2026-11-19 that the migration's `down` refuses while any quota row
+  exists, so a revert never loses stored evidence. `down` first reads every quota table that exists and
+  refuses, naming each table that holds a row, before it drops anything. On empty tables it drops them,
+  children first, and on Postgres the trigger functions; `up` then applies again.
+- **The tests.** The migration's `_tests.rs`: `applies_replays_and_reverts_on_sqlite`,
+  `every_evidence_table_refuses_update_and_delete`, `a_candidate_moves_only_its_review_columns`,
+  `a_decided_candidate_is_frozen`, `a_replace_never_deletes_a_stored_row`, `no_quota_table_keeps_a_rowid`,
+  `one_snapshot_per_target_and_revision`, `the_checks_hold`, `a_child_row_cannot_name_another_tenants_parent`,
+  `one_candidate_per_snapshot_key_and_manual_record`, `one_mapping_version_per_lineage_and_version`,
+  `the_lists_read_through_tenant_led_indexes`, `down_refuses_while_one_quota_row_exists` and
+  `down_refuses_while_any_quota_row_exists`.
+  `infra/storage/repo/quota_intake_repo_tests.rs`: `a_target_reads_back_and_the_same_binding_is_taken`,
+  `another_tenant_reads_no_target`, `the_target_list_pages_by_name_then_id`,
+  `the_highest_revision_compares_as_a_number`, `the_highest_revision_reads_only_the_revision`,
+  `a_snapshot_and_its_candidates_read_back_as_written`,
+  `a_second_snapshot_at_a_revision_is_refused_as_a_conflict`, `a_manual_record_is_one_candidate_per_target`,
+  `a_stored_candidate_that_does_not_decode_is_corrupt`,
+  `the_candidate_list_is_newest_first_and_narrows_by_target_and_state`,
+  `the_candidate_list_walks_its_cursor_across_pages` and
+  `a_json_column_that_is_not_an_object_is_never_written`. `migrations_tests.rs`:
+  `the_chain_is_the_guard_coord_then_the_twelve_pricebook_migrations` and
+  `every_migration_reverses_except_the_named_irreversible_ones`. On Postgres,
+  `tests/postgres_quota_catalog.rs`: `every_evidence_table_refuses_update_and_delete_on_postgres`,
+  `a_candidate_moves_only_its_review_columns_on_postgres`, `a_decided_candidate_is_frozen_on_postgres`,
+  `no_quota_table_can_be_truncated_on_postgres`, `the_checks_and_tenant_keys_hold_on_postgres`,
+  `a_second_snapshot_at_a_revision_is_refused_as_a_conflict_on_postgres`,
+  `the_quota_migration_reverts_and_applies_again_on_postgres` and
+  `the_quota_migration_refuses_to_revert_while_a_row_exists_on_postgres`.
+
+**Source:** Quotas DESIGN §3.7 (owner designs define their physical migrations) and P-D-268 … P-D-271.

@@ -424,7 +424,11 @@ fn write_error(e: RepoError, category_id: Option<Uuid>) -> TxError {
             | RepoRefusal::ReferenceExists
             | RepoRefusal::VersionOrder
             | RepoRefusal::DerivedCodeTaken
-            | RepoRefusal::DerivedVersionTaken,
+            | RepoRefusal::DerivedVersionTaken
+            | RepoRefusal::QuotaTargetTaken
+            | RepoRefusal::QuotaSnapshotTaken
+            | RepoRefusal::QuotaManualRecordTaken
+            | RepoRefusal::QuotaApprovalContended,
         )
         | RepoError::Db(_)
         | RepoError::Driver { .. }

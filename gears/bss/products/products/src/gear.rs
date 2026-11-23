@@ -24,6 +24,8 @@ pub const USAGE_TYPE_SOURCE_UNCONFIGURED: &str = "unconfigured";
 pub(crate) struct ProductsRuntime {
     pub enforcer: Arc<authz_resolver_sdk::PolicyEnforcer>,
     pub api_state: Arc<crate::api::rest::ApiState>,
+    /// The quota catalog's endpoints and its SDK client share it (P-D-266 … P-D-272).
+    pub quota: Arc<crate::api::rest::quota::QuotaState>,
     /// The running outbox pipeline, taken and stopped once by `serve` after the cancel (RS-12):
     /// its workers run on a token of their own, so dropping nothing would leave them running past
     /// the stop window.
@@ -49,6 +51,41 @@ fn register_products_client(
 ) {
     hub.register::<dyn bss_products_sdk::ProductsClient>(Arc::new(
         crate::infra::sdk_client::LocalProductsClient::new(db, enforcer),
+    ));
+}
+
+/// The quota catalog's state over the REST state (P-D-268, P-D-272): types-registry and the
+/// discovery plugins resolved from `hub` at each call, and the intake's settings from `cfg`.
+fn build_quota_state(
+    hub: &Arc<toolkit::ClientHub>,
+    api: &Arc<crate::api::rest::ApiState>,
+    cfg: &ProductsConfig,
+) -> Arc<crate::api::rest::quota::QuotaState> {
+    Arc::new(crate::api::rest::quota::QuotaState {
+        api: Arc::clone(api),
+        registry: Arc::new(
+            crate::infra::quota::registry::TypesRegistryQuotaRegistry::new(Arc::clone(hub)),
+        ),
+        discovery: Arc::new(crate::infra::quota::discovery::HubQuotaDiscovery::new(
+            Arc::clone(hub),
+        )),
+        settings: cfg.quota_settings(),
+        approve_hook: None,
+    })
+}
+
+/// Register the quota catalog's in-process client (P-D-272), as `ProductsClient` is: Pricing reads
+/// it as its caller, in the same process.
+fn register_quota_catalog_client(
+    hub: &toolkit::ClientHub,
+    quota: &Arc<crate::api::rest::quota::QuotaState>,
+    enforcer: &Arc<authz_resolver_sdk::PolicyEnforcer>,
+) {
+    hub.register::<dyn bss_products_sdk::ProductsQuotaCatalogClientV1>(Arc::new(
+        crate::infra::quota::catalog_client::LocalQuotaCatalogClient::new(
+            Arc::clone(quota),
+            Arc::clone(enforcer),
+        ),
     ));
 }
 
@@ -415,6 +452,13 @@ impl Gear for BssProductsGear {
         });
         register_products_client(&ctx.client_hub(), api_state.db.db(), Arc::clone(&enforcer));
         register_pricing_ports(&ctx.client_hub(), &api_state, &enforcer);
+        let quota = build_quota_state(&ctx.client_hub(), &api_state, &cfg);
+        register_quota_catalog_client(&ctx.client_hub(), &quota, &enforcer);
+        // No discovery adapter is built in: a target's discovery is closed until a plugin gear
+        // registers its scoped client (P-D-268).
+        tracing::info!(
+            "bss-products: quota discovery has no adapter until a plugin registers a scoped client"
+        );
         // P-D-250: the approvals inbox reads and votes on this gear's units through this source,
         // as the caller, under the gear's own doors. The reference registry stays inside
         // `register_pricing_ports`, beside the meter-semantics dispatcher.
@@ -433,6 +477,7 @@ impl Gear for BssProductsGear {
         self.runtime.store(Some(Arc::new(ProductsRuntime {
             enforcer,
             api_state,
+            quota,
             pipeline: tokio::sync::Mutex::new(Some(pipeline)),
         })));
         Ok(())
@@ -484,6 +529,10 @@ impl RestApiCapability for BssProductsGear {
                     Arc::clone(&rt.api_state),
                     openapi,
                 ))
+                .merge(crate::api::rest::quota::router(
+                    Arc::clone(&rt.quota),
+                    openapi,
+                ))
                 .layer(axum::Extension((*rt.enforcer).clone())));
         }
         Ok(router)
@@ -509,9 +558,11 @@ impl BssProductsGear {
             }
         }
         let gear = Self::default();
+        let quota = build_quota_state(&api_state.hub, &api_state, &ProductsConfig::default());
         gear.runtime.store(Some(Arc::new(ProductsRuntime {
             enforcer: Arc::new(enforcer),
             api_state,
+            quota,
             pipeline: tokio::sync::Mutex::new(None),
         })));
         let ctx = GearCtx::new(

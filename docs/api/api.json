@@ -1545,7 +1545,7 @@
         "type": "object"
       },
       "Capability": {
-        "description": "PEP-level capability declarations.\n\nThe PEP advertises which predicates it can enforce. The PDP uses these\ncapabilities to choose a supported constraint representation.\n\nAdvertise `GroupMembership` when the PEP can join `resource_group_membership`\nwith `gts_type`. For subtree queries, also advertise `GroupHierarchy`\nwhen the PEP can join `resource_group_closure`.\n\nThe enforcer sends group capabilities only for resources that opt in to\nnative group predicates, have a canonical GTS type path, and support `id`.\nSecureORM uses that type path to qualify membership rows in the query.\nWithout the required capabilities, a PDP enforcing a group restriction\nmust expand it to explicit resource IDs or deny access.",
+        "description": "PEP-level capability declarations.\n\nThe PEP advertises which predicates it can enforce. The PDP uses these\ncapabilities to choose a supported constraint representation.\n\nAdvertise `GroupMembership` when the PEP can join `resource_group_membership`\nwith `gts_type`. For subtree queries, also advertise `GroupHierarchy`\nwhen the PEP can join `resource_group_closure`.\n\nThe enforcer sends group capabilities only for resources that opt in to\nnative group predicates, have a canonical GTS type path, and support `id`.\n`SecureORM` uses that type path to qualify membership rows in the query.\nWithout the required capabilities, a PDP enforcing a group restriction\nmust expand it to explicit resource IDs or deny access.",
         "enum": [
           "tenant_hierarchy",
           "group_membership",
@@ -9887,6 +9887,60 @@
         ],
         "type": "object"
       },
+      "Page_ProductsQuotaAdapterTarget": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ProductsQuotaAdapterTarget"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Page_ProductsQuotaCandidate": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ProductsQuotaCandidate"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "Page_ProductsQuotaDefinition": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ProductsQuotaDefinition"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
       "Page_ProductsSkuHistoryEntry": {
         "properties": {
           "items": {
@@ -15616,6 +15670,743 @@
           "retired"
         ],
         "type": "string"
+      },
+      "ProductsQuotaAdapterTarget": {
+        "description": "A tenant's binding of one discovery plugin instance and one target key (P-D-268).",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "created_by_name": {
+            "description": "The current name of `created_by` (P-D-262); null when no name is available now, and on a\nwrite answer.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "plugin_instance_id": {
+            "type": "string"
+          },
+          "target_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "plugin_instance_id",
+          "target_key",
+          "name",
+          "created_by",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "ProductsQuotaAdapterTargetRequest": {
+        "description": "What a target create binds: a discovery plugin instance and the adapter's opaque key, and a\nname for people.",
+        "properties": {
+          "name": {
+            "description": "1 to 200 characters.",
+            "type": "string"
+          },
+          "plugin_instance_id": {
+            "description": "An instance types-registry holds under the quota discovery plugin specification.",
+            "type": "string"
+          },
+          "target_key": {
+            "description": "The adapter's opaque key: 1 to 255 printable ASCII bytes.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "plugin_instance_id",
+          "target_key",
+          "name"
+        ],
+        "type": "object"
+      },
+      "ProductsQuotaAllowedUnit": {
+        "description": "One plan unit a definition allows, with its exact factor and the bounds converted into it.",
+        "properties": {
+          "denominator": {
+            "description": "The unit's factor into the canonical unit: denominator, a decimal.",
+            "type": "string"
+          },
+          "digest": {
+            "description": "The unit's registry content digest, kept at approval.",
+            "type": "string"
+          },
+          "max": {
+            "description": "The largest amount in this unit; null when unbounded.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "min": {
+            "description": "The smallest amount in this unit.",
+            "type": "string"
+          },
+          "numerator": {
+            "description": "The unit's factor into the canonical unit: numerator, a decimal.",
+            "type": "string"
+          },
+          "step": {
+            "description": "The granularity of an amount in this unit.",
+            "type": "string"
+          },
+          "symbol": {
+            "description": "Display symbol; never an identity.",
+            "type": "string"
+          },
+          "unit_ref": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "unit_ref",
+          "digest",
+          "symbol",
+          "numerator",
+          "denominator",
+          "min",
+          "step"
+        ],
+        "type": "object"
+      },
+      "ProductsQuotaApproval": {
+        "description": "What an approval answers (P-D-269, P-D-270): the approved candidate and the definition version\nit published, as its version read answers it in English.",
+        "properties": {
+          "candidate": {
+            "$ref": "#/components/schemas/ProductsQuotaCandidate"
+          },
+          "definition": {
+            "$ref": "#/components/schemas/ProductsQuotaDefinition"
+          }
+        },
+        "required": [
+          "candidate",
+          "definition"
+        ],
+        "type": "object"
+      },
+      "ProductsQuotaAvailability": {
+        "description": "A definition version's current availability: its highest revision (P-D-271).",
+        "properties": {
+          "observed_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "reason_code": {
+            "description": "Why the version is not enabled (`qualification_pending` until qualification); null exactly\nwhen it is enabled.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "revision": {
+            "description": "A canonical decimal from 1.",
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ProductsQuotaAvailabilityState"
+          }
+        },
+        "required": [
+          "state",
+          "revision",
+          "observed_at"
+        ],
+        "type": "object"
+      },
+      "ProductsQuotaAvailabilityState": {
+        "description": "Whether a definition version may be sold (P-D-271).",
+        "enum": [
+          "enabled",
+          "disabled",
+          "withdrawn"
+        ],
+        "type": "string"
+      },
+      "ProductsQuotaBasis": {
+        "description": "How a plan states a quota amount (P-D-270).",
+        "enum": [
+          "fixed",
+          "per_plan_unit"
+        ],
+        "type": "string"
+      },
+      "ProductsQuotaCandidate": {
+        "description": "One candidate: its record and evidence, never changed, and its review (P-D-268, P-D-269).",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "created_by_name": {
+            "description": "The current name of `created_by` (P-D-262); null when no name is available now, and on a\nwrite answer.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "decided_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "decided_by": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "decided_note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "definition_ref": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProductsQuotaOwnerRef",
+                "description": "The definition version an approval published, with the definition's digest; null until\napproved."
+              }
+            ]
+          },
+          "evidence": {
+            "description": "Every registry entity the record resolved to: `{gts_id: {uuid, resource_version, digest}}`."
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "origin": {
+            "$ref": "#/components/schemas/ProductsQuotaCandidateOrigin"
+          },
+          "proposal": {
+            "description": "The submitted proposal; null until submitted."
+          },
+          "record": {
+            "description": "The record as received."
+          },
+          "record_digest": {
+            "description": "The record's canonical digest, 64 lowercase hex digits.",
+            "type": "string"
+          },
+          "snapshot_row_id": {
+            "description": "The stored snapshot row a discovered candidate came from (the discovery answer's\n`snapshot.id`, not the adapter's `snapshot.snapshot_id`); null for a manual one.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/ProductsQuotaCandidateState"
+          },
+          "submit_note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "submitted_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "submitted_by": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "version": {
+            "description": "The candidate's version, also its `ETag`; every review write moves it by one.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "target_id",
+          "origin",
+          "record",
+          "record_digest",
+          "evidence",
+          "state",
+          "version",
+          "created_by",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "ProductsQuotaCandidateOrigin": {
+        "description": "Where a candidate came from (P-D-268).",
+        "enum": [
+          "discovery",
+          "manual"
+        ],
+        "type": "string"
+      },
+      "ProductsQuotaCandidateRequest": {
+        "description": "What a manual record create sends: the target and one capability record (P-D-268).",
+        "properties": {
+          "record": {
+            "description": "One capability record of the quota capability schema, as an adapter would answer it."
+          },
+          "target_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target_id",
+          "record"
+        ],
+        "type": "object"
+      },
+      "ProductsQuotaCandidateState": {
+        "description": "A candidate's review state (P-D-269).",
+        "enum": [
+          "staged",
+          "submitted",
+          "approved",
+          "rejected"
+        ],
+        "type": "string"
+      },
+      "ProductsQuotaChangeSupport": {
+        "description": "Which changes of an installed quota the adapter supports.",
+        "properties": {
+          "increase": {
+            "description": "Raising an installed quota.",
+            "type": "boolean"
+          },
+          "initial_set": {
+            "description": "The first installation of a quota.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "initial_set",
+          "increase"
+        ],
+        "type": "object"
+      },
+      "ProductsQuotaDecisionRequest": {
+        "description": "An approval's or a rejection's note (P-D-269): optional on an approval, required on a\nrejection.",
+        "properties": {
+          "note": {
+            "description": "At most 2000 characters.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ProductsQuotaDefinition": {
+        "description": "One immutable definition version with its current availability (P-D-270, P-D-272): the\nfields of the quotas package's catalog entry, as the SDK's `QuotaDefinition` answers them.",
+        "properties": {
+          "accounting_policy": {
+            "description": "The accounting policy's content, as kept at approval."
+          },
+          "accounting_policy_digest": {
+            "type": "string"
+          },
+          "accounting_policy_ref": {
+            "type": "string"
+          },
+          "allowed_units": {
+            "items": {
+              "$ref": "#/components/schemas/ProductsQuotaAllowedUnit"
+            },
+            "type": "array"
+          },
+          "availability": {
+            "$ref": "#/components/schemas/ProductsQuotaAvailability"
+          },
+          "canonical_unit_ref": {
+            "type": "string"
+          },
+          "change_support": {
+            "$ref": "#/components/schemas/ProductsQuotaChangeSupport"
+          },
+          "definition_digest": {
+            "description": "The canonical digest of the version's content, 64 lowercase hex digits.",
+            "type": "string"
+          },
+          "definition_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "description": {
+            "description": "The metric's description in `locale`.",
+            "type": "string"
+          },
+          "display_name": {
+            "description": "The metric's display name in `locale`.",
+            "type": "string"
+          },
+          "locale": {
+            "description": "The locale tag the texts are served in: the requested one, or `en`.",
+            "type": "string"
+          },
+          "mapping_ref": {
+            "$ref": "#/components/schemas/ProductsQuotaOwnerRef",
+            "description": "The enforcement mapping version."
+          },
+          "metric_digest": {
+            "description": "The metric's registry content digest, kept at approval.",
+            "type": "string"
+          },
+          "metric_ref": {
+            "type": "string"
+          },
+          "profile_conditions": {
+            "description": "The reviewed conditions a plan author shows the buyer, in `locale`.",
+            "type": "string"
+          },
+          "profile_ref": {
+            "$ref": "#/components/schemas/ProductsQuotaOwnerRef",
+            "description": "The qualified profile version."
+          },
+          "qualification_ref": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProductsQuotaOwnerRef",
+                "description": "Null until qualification evidence is recorded (P-D-271)."
+              }
+            ]
+          },
+          "quota_kind": {
+            "$ref": "#/components/schemas/ProductsQuotaKind"
+          },
+          "resource_type_refs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "scope_policy": {
+            "description": "The scope policy's content, as kept at approval."
+          },
+          "scope_policy_digest": {
+            "type": "string"
+          },
+          "scope_policy_ref": {
+            "type": "string"
+          },
+          "sku_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "sku_version": {
+            "description": "The SKU version it was approved against; it applies to that version and every later one.",
+            "type": "string"
+          },
+          "subject_type_ref": {
+            "type": "string"
+          },
+          "supported_bases": {
+            "items": {
+              "$ref": "#/components/schemas/ProductsQuotaBasis"
+            },
+            "type": "array"
+          },
+          "version": {
+            "description": "A canonical decimal from 1.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "definition_id",
+          "version",
+          "definition_digest",
+          "sku_id",
+          "sku_version",
+          "metric_ref",
+          "metric_digest",
+          "quota_kind",
+          "display_name",
+          "description",
+          "locale",
+          "canonical_unit_ref",
+          "allowed_units",
+          "subject_type_ref",
+          "resource_type_refs",
+          "mapping_ref",
+          "profile_ref",
+          "accounting_policy_ref",
+          "accounting_policy_digest",
+          "accounting_policy",
+          "scope_policy_ref",
+          "scope_policy_digest",
+          "scope_policy",
+          "change_support",
+          "profile_conditions",
+          "supported_bases",
+          "availability"
+        ],
+        "type": "object"
+      },
+      "ProductsQuotaDiscoveryResult": {
+        "description": "What a discovery staged, or the stored revision it recovered (P-D-268).",
+        "properties": {
+          "candidates": {
+            "description": "One staged candidate per valid record, by capability key.",
+            "items": {
+              "$ref": "#/components/schemas/ProductsQuotaCandidate"
+            },
+            "type": "array"
+          },
+          "drift": {
+            "description": "Approved capabilities whose record or evidence changed.",
+            "items": {
+              "$ref": "#/components/schemas/ProductsQuotaNote"
+            },
+            "type": "array"
+          },
+          "rejected": {
+            "description": "The records that became no candidate.",
+            "items": {
+              "$ref": "#/components/schemas/ProductsQuotaRefusal"
+            },
+            "type": "array"
+          },
+          "retired": {
+            "description": "Approved capabilities the snapshot no longer holds.",
+            "items": {
+              "$ref": "#/components/schemas/ProductsQuotaNote"
+            },
+            "type": "array"
+          },
+          "snapshot": {
+            "$ref": "#/components/schemas/ProductsQuotaSnapshot"
+          }
+        },
+        "required": [
+          "snapshot",
+          "candidates",
+          "rejected",
+          "drift",
+          "retired"
+        ],
+        "type": "object"
+      },
+      "ProductsQuotaKind": {
+        "description": "The kind of quantity a metric counts (P-D-267).",
+        "enum": [
+          "allocation"
+        ],
+        "type": "string"
+      },
+      "ProductsQuotaNote": {
+        "description": "A capability whose approved mapping the snapshot drifted from or no longer holds.",
+        "properties": {
+          "capability_key": {
+            "type": "string"
+          },
+          "mapping_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "mapping_version": {
+            "description": "A canonical decimal from 1.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "capability_key",
+          "mapping_id",
+          "mapping_version"
+        ],
+        "type": "object"
+      },
+      "ProductsQuotaOwnerRef": {
+        "description": "A stored version of an owner's entity, with its digest.",
+        "properties": {
+          "digest": {
+            "description": "64 lowercase hex digits.",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "version": {
+            "description": "A canonical decimal from 1.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "version",
+          "digest"
+        ],
+        "type": "object"
+      },
+      "ProductsQuotaRefusal": {
+        "description": "A record of a snapshot that became no candidate, with its refusal.",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "field": {
+            "type": "string"
+          },
+          "record": {
+            "description": "The record's own `id`, or `#<index>` in the snapshot when it has none.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "record",
+          "code",
+          "field",
+          "detail"
+        ],
+        "type": "object"
+      },
+      "ProductsQuotaSnapshot": {
+        "description": "One stored, verified capability snapshot.",
+        "properties": {
+          "content_digest": {
+            "description": "The snapshot's canonical digest, 64 lowercase hex digits.",
+            "type": "string"
+          },
+          "id": {
+            "description": "The stored snapshot's own id.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "item_count": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "snapshot_id": {
+            "description": "The adapter's snapshot id.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "source_revision": {
+            "description": "A canonical decimal of at most 39 digits.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "snapshot_id",
+          "source_revision",
+          "observed_at",
+          "item_count",
+          "content_digest"
+        ],
+        "type": "object"
+      },
+      "ProductsQuotaSubmitRequest": {
+        "description": "What a submit proposes for a staged candidate (P-D-269).",
+        "properties": {
+          "allowed_unit_refs": {
+            "description": "1 to 8 unit instances of the metric's canonical unit, each once, into which the record's\nbounds convert exactly.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "definition_id": {
+            "description": "The definition this versions, of the candidate's metric; absent for a new definition.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "note": {
+            "description": "At most 2000 characters.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "profile_conditions": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "The reviewed conditions a plan author shows the buyer, by locale tag; English is required.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "sku_id": {
+            "description": "A SKU of the caller's tenant.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "sku_version": {
+            "description": "A canonical decimal from 1: a version the SKU holds. The definition applies to it and to\nevery later version of the SKU.",
+            "type": "string"
+          },
+          "supported_bases": {
+            "description": "`fixed` and/or `per_plan_unit`, each once.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "sku_id",
+          "sku_version",
+          "allowed_unit_refs",
+          "supported_bases",
+          "profile_conditions"
+        ],
+        "type": "object"
       },
       "ProductsReferenceKind": {
         "description": "The kind of owner object a SKU reference protects.",
@@ -49392,6 +50183,1476 @@
         "summary": "Read one version of a derived usage type",
         "tags": [
           "Derived usage types"
+        ]
+      }
+    },
+    "/bss-products/v1/quota-adapter-targets": {
+      "get": {
+        "description": "One page of the caller's tenant's targets by name, then id. `$top` (alias `limit`; default 50, at most 200) and `cursor` (alias `$skiptoken`) from `page_info`; the cursor binds the caller's tenant, so another tenant's reuse of it is 400. Asks `read` on `quota_adapter_target`.",
+        "operationId": "bss_products.list_quota_adapter_targets",
+        "parameters": [
+          {
+            "description": "Page size, alias of $top (default 50, at most 200)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Continuation from page_info (alias $skiptoken)",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_ProductsQuotaAdapterTarget"
+                }
+              }
+            },
+            "description": "One page of targets."
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List quota discovery adapter targets",
+        "tags": [
+          "Quota catalog"
+        ]
+      },
+      "post": {
+        "description": "Binds, in the caller's tenant, one discovery plugin instance and the adapter's opaque target key (P-D-268). Asks `author` on `quota_adapter_target`. Refusals: 400 VALIDATION on a blank name or an empty key or one outside printable ASCII, FIELD_TOO_LONG on a name over 200 characters or a key over 255 bytes, QUOTA_TARGET_PLUGIN_UNKNOWN on `plugin_instance_id` when types-registry holds no instance of the quota discovery plugin specification under it; 409 QUOTA_TARGET_TAKEN when the tenant has bound the plugin instance and key, IDEMPOTENCY_CONFLICT, IDEMPOTENCY_KEY_IN_FLIGHT; 503 QUOTA_REGISTRY_UNAVAILABLE when types-registry does not answer.",
+        "operationId": "bss_products.create_quota_adapter_target",
+        "parameters": [
+          {
+            "description": "Replay this endpoint's original receipt within the retention period",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProductsQuotaAdapterTargetRequest"
+              }
+            }
+          },
+          "description": "plugin_instance_id, target_key, name",
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductsQuotaAdapterTarget"
+                }
+              }
+            },
+            "description": "The target."
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Bind a quota discovery adapter target",
+        "tags": [
+          "Quota catalog"
+        ]
+      }
+    },
+    "/bss-products/v1/quota-adapter-targets/{id}": {
+      "get": {
+        "description": "One target of the caller's tenant; 404 for an unknown or foreign one. Asks `read` on `quota_adapter_target`.",
+        "operationId": "bss_products.get_quota_adapter_target",
+        "parameters": [
+          {
+            "description": "The target's id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductsQuotaAdapterTarget"
+                }
+              }
+            },
+            "description": "The target."
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read a quota discovery adapter target",
+        "tags": [
+          "Quota catalog"
+        ]
+      }
+    },
+    "/bss-products/v1/quota-adapter-targets/{id}/discoveries": {
+      "post": {
+        "description": "Reads one complete capability snapshot of the target through its discovery plugin, judges every record through types-registry, and stages the snapshot with one candidate per valid record; the others are `rejected` notes, and approved capabilities that changed or are gone are `drift` and `retired` notes (P-D-268). No body. 201 when staged, 200 for the stored snapshot of the same revision and content. Asks `author` on `quota_adapter_target`. Refusals: 400 VALIDATION for an Idempotency-Key that is blank or too long; 404 for an unknown or foreign target; 409 QUOTA_SOURCE_CONFLICT when other content is stored at the revision, QUOTA_SOURCE_STALE for a revision below the target's highest, IDEMPOTENCY_CONFLICT, IDEMPOTENCY_KEY_IN_FLIGHT; 501 QUOTA_DISCOVERY_CLOSED when no discovery adapter is registered for the plugin instance, before any read or write; 503 QUOTA_DISCOVERY_INCOMPLETE, QUOTA_DISCOVERY_UNAVAILABLE or QUOTA_REGISTRY_UNAVAILABLE, with nothing stored.",
+        "operationId": "bss_products.run_quota_discovery",
+        "parameters": [
+          {
+            "description": "The target's id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Replay this endpoint's original receipt within the retention period",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductsQuotaDiscoveryResult"
+                }
+              }
+            },
+            "description": "The stored snapshot of the same revision and content, its candidates and its notes."
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductsQuotaDiscoveryResult"
+                }
+              }
+            },
+            "description": "The staged snapshot, its candidates and its notes."
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "501": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Implemented"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Discover a target's quota capabilities",
+        "tags": [
+          "Quota catalog"
+        ],
+        "x-toolkit-request-timeout": "40s"
+      }
+    },
+    "/bss-products/v1/quota-candidates": {
+      "get": {
+        "description": "One page of the caller's tenant's candidates, newest first, then by id. Plain `target_id` and `state` (`staged`, `submitted`, `approved` or `rejected`; else 400 VALIDATION); `$top` (alias `limit`; default 50, at most 200) and `cursor` (alias `$skiptoken`) from `page_info`. The cursor binds the caller's tenant, `target_id` and `state`: reused by another tenant or under other filters it is 400. Asks `read` on `quota_definition`.",
+        "operationId": "bss_products.list_quota_candidates",
+        "parameters": [
+          {
+            "description": "Only this target's candidates",
+            "in": "query",
+            "name": "target_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only the candidates in this state",
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size, alias of $top (default 50, at most 200)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Continuation from page_info (alias $skiptoken)",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_ProductsQuotaCandidate"
+                }
+              }
+            },
+            "description": "One page of candidates."
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List quota candidates",
+        "tags": [
+          "Quota catalog"
+        ]
+      },
+      "post": {
+        "description": "Judges one capability record for a target of the caller's tenant by the discovery's own rules and stores it as a manual candidate with its author (P-D-268). 201 with the candidate and its ETag; 200 with the stored candidate when the target holds the same record under its id. Asks `author` on `quota_definition`. Refusals: 400 VALIDATION on a body that does not read, and the record's own code on `record.<field>` (QUOTA_RECORD_INVALID, QUOTA_REFERENCE_UNKNOWN, QUOTA_REFERENCE_FAMILY, QUOTA_VERSION_UNSUPPORTED, QUOTA_CAPABILITY_UNSUPPORTED, QUOTA_UNIT_INVALID, QUOTA_UNIT_MISMATCH, QUOTA_POLICY_INVALID, QUOTA_DISPLAY_TEXT_MISSING); 404 for an unknown or foreign target; 409 QUOTA_SOURCE_CONFLICT when the target holds other content under the record's id, IDEMPOTENCY_CONFLICT, IDEMPOTENCY_KEY_IN_FLIGHT; 503 QUOTA_REGISTRY_UNAVAILABLE when types-registry does not answer.",
+        "operationId": "bss_products.create_quota_candidate",
+        "parameters": [
+          {
+            "description": "Replay this endpoint's original receipt within the retention period",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProductsQuotaCandidateRequest"
+              }
+            }
+          },
+          "description": "target_id, record",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductsQuotaCandidate"
+                }
+              }
+            },
+            "description": "The stored candidate of the same record.",
+            "headers": {
+              "ETag": {
+                "description": "The version to send back as If-Match",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductsQuotaCandidate"
+                }
+              }
+            },
+            "description": "The candidate.",
+            "headers": {
+              "ETag": {
+                "description": "The version to send back as If-Match",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Author a quota capability record",
+        "tags": [
+          "Quota catalog"
+        ]
+      }
+    },
+    "/bss-products/v1/quota-candidates/{id}": {
+      "get": {
+        "description": "One candidate of the caller's tenant with the ETag of its version; 404 for an unknown or foreign one. Asks `read` on `quota_definition`.",
+        "operationId": "bss_products.get_quota_candidate",
+        "parameters": [
+          {
+            "description": "The candidate's id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductsQuotaCandidate"
+                }
+              }
+            },
+            "description": "The candidate.",
+            "headers": {
+              "ETag": {
+                "description": "The version to send back as If-Match",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read a quota candidate",
+        "tags": [
+          "Quota catalog"
+        ]
+      }
+    },
+    "/bss-products/v1/quota-candidates/{id}/approve": {
+      "post": {
+        "description": "Approves a submitted candidate of the caller's tenant and publishes one immutable definition version with its mapping and profile versions, built from the stored candidate and proposal alone, and recorded unavailable for sale until qualification (P-D-269, P-D-270, P-D-271). Takes the candidate's ETag as If-Match. A JSON body is required (`{}` at least); the note is optional. 200 with the approved candidate and the definition as its version read answers it in English; the answer carries no ETag, since the approved candidate does not move again. Asks `approve` on `quota_definition`. Refusals: 400 VALIDATION (a missing If-Match or body included), FIELD_TOO_LONG on `note`, QUOTA_SKU_VERSION_UNKNOWN, QUOTA_RECORD_INVALID on `definition_id` when the named definition is of another SKU or metric; 403 SOD_VIOLATION for the candidate's submitter or a manual record's author; 404 for an unknown or foreign candidate, or a named definition the `approve` grant does not reach (P-D-273); 409 QUOTA_CANDIDATE_STATE, STALE_REVISION, CONTENDED when a concurrent approval took the definition's next version or the mapping lineage's (not retried: send the approval again), IDEMPOTENCY_CONFLICT, IDEMPOTENCY_KEY_IN_FLIGHT.",
+        "operationId": "bss_products.approve_quota_candidate",
+        "parameters": [
+          {
+            "description": "The candidate's id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Send the ETag returned by the last read. Missing or malformed: 400; stale: 409 STALE_REVISION.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Replay this endpoint's original receipt within the retention period",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProductsQuotaDecisionRequest"
+              }
+            }
+          },
+          "description": "note",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductsQuotaApproval"
+                }
+              }
+            },
+            "description": "The approved candidate and the definition version it published."
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Approve a quota candidate",
+        "tags": [
+          "Quota catalog"
+        ]
+      }
+    },
+    "/bss-products/v1/quota-candidates/{id}/reject": {
+      "post": {
+        "description": "Rejects a submitted candidate of the caller's tenant with a note (P-D-269). Takes the candidate's ETag as If-Match. A JSON body is required (`{}` at least); the note is required. 200 with the rejected candidate and its new ETag. Asks `approve` on `quota_definition`. Refusals: 400 VALIDATION (a missing If-Match or body included), NOTE_REQUIRED, FIELD_TOO_LONG on `note`; 403 SOD_VIOLATION for the candidate's submitter or a manual record's author; 404 for an unknown or foreign candidate; 409 QUOTA_CANDIDATE_STATE, STALE_REVISION, IDEMPOTENCY_CONFLICT, IDEMPOTENCY_KEY_IN_FLIGHT.",
+        "operationId": "bss_products.reject_quota_candidate",
+        "parameters": [
+          {
+            "description": "The candidate's id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Send the ETag returned by the last read. Missing or malformed: 400; stale: 409 STALE_REVISION.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Replay this endpoint's original receipt within the retention period",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProductsQuotaDecisionRequest"
+              }
+            }
+          },
+          "description": "note",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductsQuotaCandidate"
+                }
+              }
+            },
+            "description": "The rejected candidate.",
+            "headers": {
+              "ETag": {
+                "description": "The version to send back as If-Match",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Reject a quota candidate",
+        "tags": [
+          "Quota catalog"
+        ]
+      }
+    },
+    "/bss-products/v1/quota-candidates/{id}/submit": {
+      "post": {
+        "description": "Proposes a staged candidate of the caller's tenant for one SKU version: the plan units into which the record's bounds convert exactly, the bases (`fixed`, `per_plan_unit`) and the reviewed conditions (P-D-269). The submit pins the registry entities the definition carries (the metric, the record's unit and its canonical unit, both policies and each plan unit) at the content intake judged. Takes the candidate's ETag as If-Match; 200 with the submitted candidate and its new ETag. Asks `submit` on `quota_definition`. Refusals: 400 VALIDATION (a missing If-Match included), VALIDATION on `supported_bases[i]` for a basis other than `fixed` or `per_plan_unit`, FIELD_TOO_LONG, QUOTA_SKU_VERSION_UNKNOWN on `sku_version`, QUOTA_RECORD_INVALID on `definition_id` for a named definition of another SKU or metric, QUOTA_VERSION_UNSUPPORTED, QUOTA_REFERENCE_UNKNOWN, QUOTA_REFERENCE_FAMILY, QUOTA_UNIT_MISMATCH or QUOTA_UNIT_INEXACT on `allowed_unit_refs[i]`, QUOTA_REFERENCE_UNKNOWN on the record's field (`metric_ref`, `unit_ref`, `metric_ref.canonical_unit_ref`, `accounting_policy_ref` or `scope_policy_ref`) when types-registry no longer holds an entity the candidate was judged with, QUOTA_DISPLAY_TEXT_MISSING on `profile_conditions`, QUOTA_PROFILE_UNSUPPORTED; 404 for an unknown or foreign candidate, or a named definition the `submit` grant does not reach (P-D-273); 409 QUOTA_CANDIDATE_STATE, STALE_REVISION, QUOTA_SOURCE_CONFLICT when types-registry holds another revision of an entity the candidate was judged with (a discovery of the same revision replays the candidate unjudged: a new snapshot revision of the target, or a manual record under a new record id, judges it again), IDEMPOTENCY_CONFLICT, IDEMPOTENCY_KEY_IN_FLIGHT; 503 QUOTA_REGISTRY_UNAVAILABLE when types-registry does not answer.",
+        "operationId": "bss_products.submit_quota_candidate",
+        "parameters": [
+          {
+            "description": "The candidate's id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Send the ETag returned by the last read. Missing or malformed: 400; stale: 409 STALE_REVISION.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Replay this endpoint's original receipt within the retention period",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProductsQuotaSubmitRequest"
+              }
+            }
+          },
+          "description": "sku_id, sku_version, allowed_unit_refs, supported_bases, profile_conditions",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductsQuotaCandidate"
+                }
+              }
+            },
+            "description": "The submitted candidate.",
+            "headers": {
+              "ETag": {
+                "description": "The version to send back as If-Match",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Submit a quota candidate for review",
+        "tags": [
+          "Quota catalog"
+        ]
+      }
+    },
+    "/bss-products/v1/quota-definitions": {
+      "get": {
+        "description": "One page of the caller's tenant's definition versions applicable to one SKU version: those of the SKU approved at that SKU version or an earlier one (P-D-270, P-D-272), by `definition_id`, then `version`. `$filter` is required: a conjunction (`and`) of `eq` terms on `sku_id` and `sku_version` (both required), and optionally `subject_type_ref`, `resource_type_ref` (GTS ids) and `profile_id`, each at most once, as `sku_id eq <uuid> and sku_version eq '<n>'`; anything else, or a missing required term, is 400 QUOTA_FILTER_INVALID naming the term. A `$filter` that does not parse, or is over 8 KiB or 2000 nodes, is the shared OData refusal on `$filter` (INVALID_FILTER, FILTER_TOO_LONG, FILTER_TOO_COMPLEX), answered before any term is read. A grant on some definitions lists only those. `availability` is `enabled` (the default) or `all`, which adds the other versions with their reason; `locale` picks the text, English when the locale is not held. `$top` (alias `limit`; default 50, at most 200) and `cursor` (alias `$skiptoken`) from `page_info`; the cursor binds the caller's tenant, the filter and `availability`: reused by another tenant or under others it is 400. Asks `read` on `quota_definition`; no read asks types-registry.",
+        "operationId": "bss_products.list_quota_definitions",
+        "parameters": [
+          {
+            "description": "OData v4 filter expression\n- sku_id: eq\n- sku_version: eq\n- subject_type_ref: eq\n- resource_type_ref: eq\n- profile_id: eq",
+            "in": "query",
+            "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`enabled` (default) or `all`",
+            "in": "query",
+            "name": "availability",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The locale tag to serve texts in; English when not held",
+            "in": "query",
+            "name": "locale",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size, alias of $top (default 50, at most 200)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Continuation from page_info (alias $skiptoken)",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_ProductsQuotaDefinition"
+                }
+              }
+            },
+            "description": "One page of definition versions."
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List the quota definitions of a SKU version",
+        "tags": [
+          "Quota catalog"
+        ],
+        "x-odata-filter": {
+          "allowedFields": {
+            "profile_id": [
+              "eq"
+            ],
+            "resource_type_ref": [
+              "eq"
+            ],
+            "sku_id": [
+              "eq"
+            ],
+            "sku_version": [
+              "eq"
+            ],
+            "subject_type_ref": [
+              "eq"
+            ]
+          }
+        }
+      }
+    },
+    "/bss-products/v1/quota-definitions/{id}/versions/{version}": {
+      "get": {
+        "description": "One exact definition version of the caller's tenant with its current availability, as stored (P-D-272); `locale` picks the text, English when the locale is not held. Asks `read` on `quota_definition`. Refusals: 400 VALIDATION for a `version` that is not a canonical decimal from 1; 404 for an unknown or foreign version, or one the caller's grant does not name.",
+        "operationId": "bss_products.get_quota_definition",
+        "parameters": [
+          {
+            "description": "The definition's id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The version, a canonical decimal from 1",
+            "in": "path",
+            "name": "version",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The locale tag to serve texts in; English when not held",
+            "in": "query",
+            "name": "locale",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductsQuotaDefinition"
+                }
+              }
+            },
+            "description": "The definition version."
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read a quota definition version",
+        "tags": [
+          "Quota catalog"
         ]
       }
     },

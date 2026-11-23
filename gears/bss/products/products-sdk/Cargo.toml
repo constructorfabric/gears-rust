@@ -32,6 +32,16 @@ toolkit-security = { workspace = true }
 time = { workspace = true }
 # A derived declaration's constants and quantities are exact decimals (P-D-230); no float.
 rust_decimal = { workspace = true }
+# GTS PluginV1 base + the `#[gts_type_schema]` / `gts_id!` macros for the quota schemas (P-D-267).
+toolkit-gts = { workspace = true }
+# The macro expansion references the `gts` crate directly (same as other -sdk crates).
+gts = { workspace = true }
+# `#[gts_type_schema]` expands to `schemars`-derived JSON-schema code.
+schemars = { workspace = true }
+# Quota capability records and their open `properties` are JSON values (P-D-267).
+serde_json = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# datetime!() in the quota digest tests.
+time = { workspace = true, features = ["macros"] }

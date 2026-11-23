@@ -70,8 +70,12 @@ fn idempotency_expiry(now: OffsetDateTime, retention_hours: u32) -> OffsetDateTi
 /// are the same on every attempt by construction — `now` and `expires_at`
 /// are stamped once, before the first attempt, so a retry claims the same
 /// window rather than sliding it forward.
+///
+/// Public, its fields not, so a hidden entry the Postgres suites drive can take one
+/// (`api::rest::quota::discovery::stage_snapshot`); hidden from the docs like that entry.
+#[doc(hidden)]
 #[derive(Clone)]
-pub(crate) struct IdempotencyClaimInput {
+pub struct IdempotencyClaimInput {
     /// The **concrete resource path**, never the route template (P-D-198):
     /// `/bss-products/v1/skus`, not a pattern with a placeholder.
     ///
@@ -104,7 +108,9 @@ impl IdempotencyClaimInput {
     /// `ApiState::idempotency_retention_hours` by the calling door — this
     /// type reaches no configuration of its own, exactly as it reasons about
     /// no clock of its own.
-    pub(crate) fn new(
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new(
         endpoint: impl Into<String>,
         client_key: String,
         payload_hash: Vec<u8>,
