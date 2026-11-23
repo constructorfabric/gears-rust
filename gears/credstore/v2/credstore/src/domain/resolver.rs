@@ -2,12 +2,14 @@
 
 use async_trait::async_trait;
 use credstore_sdk::TenantId;
+use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 
 /// A tenant's ancestor chain with the visibility of its isolation barriers.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AncestorChain {
     /// `[req, parent, …, root]`, isolation barriers ignored (what inheritance walks).

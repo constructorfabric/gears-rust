@@ -134,6 +134,19 @@ where
     serde::Deserialize::deserialize(de).map(Some)
 }
 
+/// [`deserialize_double_option`] for `secret`: anything but a string or
+/// `null` is rejected with a fixed message, so the rejected input (a numeric
+/// PIN, say) never reaches an error body or a log line.
+#[allow(clippy::option_option)]
+pub(crate) fn deserialize_secret<'de, D>(de: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <Option<String> as serde::Deserialize>::deserialize(de)
+        .map(Some)
+        .map_err(|_| serde::de::Error::custom("secret must be a string or null"))
+}
+
 /// Request body for `PUT /credstore/v1/credentials/{ref}` (ADR-0007; tri-state
 /// `secret`): a whole-credential replace. `secret` is
 /// tri-state (`Option<Option<String>>`, like [`CredentialPatchDto::secret`])
@@ -165,7 +178,7 @@ pub struct PutCredentialRequestDto {
     /// The secret to write. Required at the wire — absent is `400
     /// SECRET_REQUIRED` — but once present it is tri-state: a string writes a
     /// value, an explicit `null` writes none (ADR-0007, "PUT: whole replace, secret tri-state").
-    #[serde(default, deserialize_with = "deserialize_double_option")]
+    #[serde(default, deserialize_with = "deserialize_secret")]
     #[schema(value_type = Option<String>)]
     pub secret: Option<Option<String>>,
 }
@@ -218,7 +231,7 @@ pub struct CredentialPatchDto {
     #[serde(default, deserialize_with = "deserialize_double_option")]
     #[schema(value_type = Option<String>)]
     pub expires_at: Option<Option<String>>,
-    #[serde(default, deserialize_with = "deserialize_double_option")]
+    #[serde(default, deserialize_with = "deserialize_secret")]
     #[schema(value_type = Option<String>)]
     pub secret: Option<Option<String>>,
 }

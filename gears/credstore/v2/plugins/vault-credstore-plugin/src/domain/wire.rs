@@ -42,6 +42,8 @@ use toolkit_macros::domain_model;
 pub const FORBIDDEN: u16 = 403;
 /// `404 Not Found`.
 const NOT_FOUND: u16 = 404;
+/// `204 No Content`.
+const NO_CONTENT: u16 = 204;
 /// `408 Request Timeout`.
 const REQUEST_TIMEOUT: u16 = 408;
 /// `429 Too Many Requests`.
@@ -349,9 +351,12 @@ pub fn error_text(body: &str, redact: &[&str]) -> String {
 /// for an absent key or version, and a body without `errors` (carrying the
 /// version metadata) for a soft-deleted or destroyed one. A `404` that
 /// explains itself (`no handler for route ...`: the mount does not exist) is
-/// a misconfiguration.
+/// a misconfiguration. A `404` whose body is not a Vault JSON object (empty,
+/// HTML from an ingress or proxy, plain text) is not plain either: it did not
+/// come from Vault's key handling.
 fn is_plain_not_found(status: u16, body: &str) -> bool {
-    status == NOT_FOUND && error_messages(body).is_empty()
+    status == NOT_FOUND
+        && serde_json::from_str::<ErrorBody>(body).is_ok_and(|b| b.errors.is_empty())
 }
 
 /// Maps a response that is not a success into the plugin error taxonomy.
@@ -456,13 +461,15 @@ pub fn classify_metadata_write_response(
     }
 }
 
-/// Classifies a `DELETE` metadata or `POST` destroy response: `2xx` or a
-/// plain `404` (already gone) both succeed (idempotent).
+/// Classifies a `DELETE` metadata or `POST` destroy response: `204` (what
+/// Vault answers) or a plain `404` (already gone) both succeed (idempotent).
+/// Any other `2xx` (for example a proxy's `200` page) is not a confirmed
+/// delete and is an error.
 ///
 /// # Errors
 /// See [`map_error_status`].
 pub fn classify_delete_response(status: u16, body: &str) -> Result<(), CredStorePluginError> {
-    if is_success(status) || is_plain_not_found(status, body) {
+    if status == NO_CONTENT || is_plain_not_found(status, body) {
         Ok(())
     } else {
         Err(map_error_status(status, body, None, &[]))
@@ -487,7 +494,7 @@ pub fn classify_metadata_response(
     Err(map_error_status(status, body, None, &[]))
 }
 
-/// Classifies a `POST destroy` response: `2xx` or a plain `404` succeed
+/// Classifies a `POST destroy` response: `204` or a plain `404` succeed
 /// (idempotent).
 ///
 /// # Errors

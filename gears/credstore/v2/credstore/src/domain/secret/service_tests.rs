@@ -1686,6 +1686,75 @@ async fn patching_expires_at_renews_in_place_and_the_secret_is_served_again() {
 }
 
 #[tokio::test]
+async fn patch_under_if_match_star_writes_only_the_fields_of_its_body() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    let row = create_k(&svc, &repo, &ctx, "v").await;
+
+    // Another writer widens the sharing after this PATCH read the row; the
+    // PATCH names only `fallback` and checks no version (`*`).
+    repo.change_sharing_before_next_metadata_write(row.id, SharingMode::Shared);
+    svc.patch(
+        &ctx,
+        &key("k"),
+        CredentialPatch {
+            fallback: Some(SdkFallback::None),
+            ..empty_patch()
+        },
+        exists(),
+    )
+    .await
+    .expect("patch");
+
+    let write = repo.last_metadata_write().expect("a metadata write");
+    assert_eq!(write.sharing, None);
+    assert_eq!(write.expires_at, None);
+    let stored = repo.rows()[0].clone();
+    assert_eq!(stored.sharing, SharingMode::Shared, "not reverted");
+    assert_eq!(
+        stored.fallback,
+        crate::domain::secret::model::Fallback::None
+    );
+}
+
+#[tokio::test]
+async fn patch_removing_the_secret_under_if_match_star_writes_only_the_fields_of_its_body() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    let row = create_k(&svc, &repo, &ctx, "v").await;
+
+    repo.change_sharing_before_next_metadata_write(row.id, SharingMode::Shared);
+    svc.patch(
+        &ctx,
+        &key("k"),
+        CredentialPatch {
+            secret: PatchField::Null,
+            ..empty_patch()
+        },
+        exists(),
+    )
+    .await
+    .expect("patch");
+
+    let write = repo.last_metadata_write().expect("a metadata write");
+    assert_eq!(
+        (write.sharing, write.fallback, write.expires_at),
+        (None, None, None)
+    );
+    let stored = repo.rows()[0].clone();
+    assert_eq!(stored.status, SecretStatus::Declared);
+    assert_eq!(stored.sharing, SharingMode::Shared, "not reverted");
+}
+
+#[tokio::test]
 async fn put_with_if_match_star_renews_an_expired_record_in_place() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());

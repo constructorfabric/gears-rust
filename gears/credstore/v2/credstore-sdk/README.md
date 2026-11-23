@@ -211,7 +211,7 @@ credstore_plugin_conformance!(MyPlugin::default());
 
 Outer attributes written before the expression are applied to every generated
 test. A plugin whose backend needs Docker keeps the suite out of a default
-`cargo test` with `#[ignore]`:
+`cargo test` with the `ignore` attribute:
 
 ```no_run
 # #[cfg(feature = "conformance")]

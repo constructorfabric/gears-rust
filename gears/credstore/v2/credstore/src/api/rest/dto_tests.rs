@@ -353,3 +353,49 @@ fn weak_etag_is_deterministic_opaque_and_sensitive_to_its_inputs() {
     let different_tenant = weak_etag(Uuid::new_v4(), "ref", winner_id, 1);
     assert_ne!(a, different_tenant);
 }
+
+/// Scalars a client may send as `secret`, with the text that must not leak.
+const NON_STRING_SECRETS: [(&str, &str); 3] = [
+    (r#"{"secret": 482913}"#, "482913"),
+    (r#"{"secret": 1.5}"#, "1.5"),
+    (r#"{"secret": true}"#, "true"),
+];
+
+#[test]
+fn put_credential_request_rejects_non_string_secret_without_echoing_it() {
+    for (json, leaked) in NON_STRING_SECRETS {
+        let err = serde_json::from_str::<PutCredentialRequestDto>(json)
+            .expect_err("a non-string secret must be rejected")
+            .to_string();
+        assert!(!err.contains(leaked), "error leaks the value: {err}");
+        assert!(err.contains("secret must be a string or null"), "{err}");
+    }
+}
+
+#[test]
+fn credential_patch_dto_rejects_non_string_secret_without_echoing_it() {
+    for (json, leaked) in NON_STRING_SECRETS {
+        let err = serde_json::from_str::<CredentialPatchDto>(json)
+            .expect_err("a non-string secret must be rejected")
+            .to_string();
+        assert!(!err.contains(leaked), "error leaks the value: {err}");
+        assert!(err.contains("secret must be a string or null"), "{err}");
+
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let err = serde_json::from_value::<CredentialPatchDto>(value)
+            .expect_err("a non-string secret must be rejected")
+            .to_string();
+        assert!(!err.contains(leaked), "error leaks the value: {err}");
+        assert!(err.contains("secret must be a string or null"), "{err}");
+    }
+}
+
+#[test]
+fn credential_patch_dto_secret_tri_state() {
+    let dto: CredentialPatchDto = serde_json::from_str(r#"{"fallback": "none"}"#).unwrap();
+    assert_eq!(dto.secret, None);
+    let dto: CredentialPatchDto = serde_json::from_str(r#"{"secret": null}"#).unwrap();
+    assert_eq!(dto.secret, Some(None));
+    let dto: CredentialPatchDto = serde_json::from_str(r#"{"secret": "x"}"#).unwrap();
+    assert_eq!(dto.secret, Some(Some("x".to_owned())));
+}

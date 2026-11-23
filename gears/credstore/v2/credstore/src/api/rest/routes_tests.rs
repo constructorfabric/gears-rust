@@ -1109,6 +1109,45 @@ async fn patch_empty_body_returns_400_empty_patch() {
 }
 
 #[tokio::test]
+async fn patch_non_string_secret_returns_400_without_echoing_it() {
+    let h = build_harness();
+    let (id, version) = seed_credential(&h, "numsecret", "v").await;
+
+    let req = raw_patch_request(
+        "/credstore/v1/credentials/numsecret",
+        Some(&strong_etag(id, version)),
+        br#"{"secret": 482913}"#,
+    );
+    let resp = h.router.oneshot(req).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let bytes = to_bytes(resp.into_body(), 1024 * 64).await.unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(!text.contains("482913"), "body leaks the secret: {text}");
+}
+
+#[tokio::test]
+async fn put_non_string_secret_returns_4xx_without_echoing_it() {
+    let h = build_harness();
+    let req = json_request_preconditioned(
+        "PUT",
+        "/credstore/v1/credentials/numput",
+        Some(serde_json::json!({
+            "type": SecretType::generic().gts_id(),
+            "sharing": "tenant",
+            "secret": 482_913
+        })),
+        Some("*"),
+        None,
+        test_ctx(),
+    );
+    let resp = h.router.oneshot(req).await.expect("router");
+    assert!(resp.status().is_client_error(), "status: {}", resp.status());
+    let bytes = to_bytes(resp.into_body(), 1024 * 64).await.unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(!text.contains("482913"), "body leaks the secret: {text}");
+}
+
+#[tokio::test]
 async fn patch_null_sharing_returns_400_null_not_allowed() {
     let h = build_harness();
     let (id, version) = seed_credential(&h, "nullshare", "v").await;

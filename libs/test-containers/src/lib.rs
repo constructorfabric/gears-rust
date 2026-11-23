@@ -158,7 +158,7 @@ pub const VAULT_IMAGE: &str = "hashicorp/vault";
 
 /// Tag of the `Vault` server image.
 ///
-/// Used only by the manual (`#[ignore]`) `Docker` suites of the `CredStore`
+/// Used only by the manual (ignored by default) `Docker` suites of the `CredStore`
 /// `Vault` plugin; no `E2E` sidecar pins it, so
 /// there is no second copy to keep in sync.
 pub const VAULT_TAG: &str = "2.1.1";
@@ -397,7 +397,7 @@ pub fn clickhouse() -> GenericImage {
 /// the caller supplies the exposed port, wait strategy, environment and command
 /// (`server -dev` for a throwaway dev server).
 ///
-/// Only the manual (`#[ignore]`) suites start it, so a CI version matrix never
+/// Only the manual (ignored by default) suites start it, so a CI version matrix never
 /// reaches it; the override exists to qualify another `Vault` release by hand.
 pub fn vault() -> GenericImage {
     GenericImage::new(VAULT_IMAGE.to_owned(), vault_tag())

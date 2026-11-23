@@ -195,7 +195,7 @@ curl -s -H "X-Vault-Token: root" \
 Unit tests run with a plain `cargo test -p cf-gears-vault-credstore-plugin-v2`.
 The integration tests start a `hashicorp/vault` dev server in Docker, run the
 SDK conformance suite and check the Vault-specific behaviour. They are
-`#[ignore]`d, are meant to be run by hand and never run in CI:
+ignored by default, are meant to be run by hand and never run in CI:
 
 ```bash
 cargo test -p cf-gears-vault-credstore-plugin-v2 -- --ignored

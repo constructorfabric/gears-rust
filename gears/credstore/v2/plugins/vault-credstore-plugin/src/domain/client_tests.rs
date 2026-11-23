@@ -43,7 +43,8 @@ async fn get_missing_returns_none() {
     let server = MockServer::start();
     server.mock(|when, then| {
         when.method(GET).path_includes("/v1/secret/data/credstore/");
-        then.status(404);
+        then.status(404)
+            .json_body(serde_json::json!({ "errors": [] }));
     });
 
     let svc = service_for(&server);
@@ -95,7 +96,8 @@ async fn delete_key_missing_is_success_through_trait() {
     server.mock(|when, then| {
         when.method(DELETE)
             .path_includes("/v1/secret/metadata/credstore/");
-        then.status(404);
+        then.status(404)
+            .json_body(serde_json::json!({ "errors": [] }));
     });
 
     let svc = service_for(&server);

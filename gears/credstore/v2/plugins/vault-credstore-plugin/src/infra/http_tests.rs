@@ -434,3 +434,31 @@ async fn no_retry_after_header_is_none() {
         .expect("ok");
     assert_eq!(got.retry_after, None);
 }
+
+#[tokio::test]
+async fn does_not_follow_redirects_with_token_or_body() {
+    for (method, body) in [
+        (HttpMethod::Get, None),
+        (HttpMethod::Post, Some(r#"{"data":{"value":"c2VjcmV0"}}"#)),
+    ] {
+        let target = MockServer::start();
+        let target_mock = target.mock(|when, then| {
+            when.any_request();
+            then.status(200).body("reached");
+        });
+        let origin = MockServer::start();
+        origin.mock(|when, then| {
+            when.any_request();
+            then.status(307)
+                .header("Location", target.url("/v1/secret/data/credstore/t/r"));
+        });
+
+        let got = transport_for(&origin)
+            .send(request(method, &origin, body))
+            .await
+            .expect("a 307 is a response, not an error");
+        assert_eq!(got.status, 307);
+        assert_ne!(got.body, "reached");
+        target_mock.assert_calls(0);
+    }
+}

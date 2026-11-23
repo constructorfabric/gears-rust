@@ -5,7 +5,7 @@ Updated:  2026-10-03 by Constructor Tech
 
 > **Status: implemented.** The suite is **206 tests** — 168 unit tests that run in
 > every `cargo test`, and 38 Docker-backed integration tests (21 SDK conformance
-> checks and 17 Vault behaviour tests) that are `#[ignore]`d, are run by hand and
+> checks and 17 Vault behaviour tests) that are ignored by default, are run by hand and
 > never run in CI. This is the test plan for `cf-gears-vault-credstore-plugin-v2`,
 > paired with [DESIGN.md](./DESIGN.md).
 
@@ -32,8 +32,8 @@ Updated:  2026-10-03 by Constructor Tech
 ## 1. Overview
 
 ```
-L3  Vault behaviour tests  (hashicorp/vault in Docker)        — manual, #[ignore]
-L2  SDK conformance suite  (hashicorp/vault in Docker)        — manual, #[ignore]
+L3  Vault behaviour tests  (hashicorp/vault in Docker)        — manual, ignored
+L2  SDK conformance suite  (hashicorp/vault in Docker)        — manual, ignored
 L1  Unit tests             (scripted transport, HTTP mock)    — every PR, sub-second
 ```
 
@@ -46,7 +46,7 @@ server, so a Vault release that changes an answer shows up as a failing test
 instead of a wrong secret.
 
 The integration tests are **manual by decision**: they need Docker and a
-~180 MB image, they are never part of CI, and every one of them is `#[ignore]`d
+~180 MB image, they are never part of CI, and every one of them is ignored
 with a reason string. A default `cargo test` (and CI) therefore runs layer 1
 only and never starts a container.
 

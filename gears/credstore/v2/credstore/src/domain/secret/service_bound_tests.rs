@@ -224,6 +224,33 @@ async fn a_suppressing_row_above_the_bound_is_a_miss_not_an_error() {
 }
 
 #[tokio::test]
+async fn a_value_written_into_a_suppressing_row_above_the_bound_after_the_first_resolve_is_a_miss()
+{
+    let w = world();
+    let mut suppress = w.build(w.partner, SharingMode::Shared, None);
+    suppress.fallback = Fallback::None;
+    let id = suppress.id;
+    let store_key = suppress.store_key();
+    w.repo.seed(suppress);
+    // The value lands in the same row (same `id`) between the two resolutions.
+    let version = w.plugin.seed(&store_key, b"raced-in");
+    w.repo.activate_before_next_resolve_for_get(id, version);
+
+    let got = w.within(w.tenant).await.expect("no error");
+    assert!(got.is_none(), "{got:?}");
+    assert_eq!(w.plugin.get_calls(), 0, "the backend is not read");
+}
+
+#[tokio::test]
+async fn a_value_of_the_caller_below_the_bound_is_served() {
+    let w = world();
+    w.row(w.tenant, SharingMode::Tenant, Some("mine"));
+
+    let secret = served(w.within(w.partner).await.expect("read"));
+    assert_eq!(bytes(&secret), b"mine");
+}
+
+#[tokio::test]
 async fn a_decisive_row_of_another_type_is_a_miss_whatever_the_bound() {
     let w = world();
     w.row(w.tenant, SharingMode::Private, None);

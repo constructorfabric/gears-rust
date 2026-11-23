@@ -42,9 +42,9 @@ use time::OffsetDateTime;
 use crate::domain::secret::etag::weak_etag;
 use crate::domain::secret::list_filter;
 use crate::domain::secret::model::{
-    CleanupDebt, CleanupTask, DeleteVerification, Fallback, IntentCommit, NewDeclaredSecret,
-    NewSecret, PutPrecondition, SecretRow, SecretStatus, WriteAttempt, WritePrecondition,
-    WriteVerification,
+    CleanupDebt, CleanupTask, DeleteVerification, Fallback, IntentCommit, MetadataWrite,
+    NewDeclaredSecret, NewSecret, PutPrecondition, SecretRow, SecretStatus, WriteAttempt,
+    WritePrecondition, WriteVerification,
 };
 use crate::domain::secret::reduce::{self, Reduced};
 use crate::domain::secret::repo::SecretRepo;
@@ -516,14 +516,13 @@ impl Service {
         // authorization and the type rule were not evaluated on.
         let secret = if need_read_secret {
             if let Some(row) = value_row {
-                // The bound applies to a value that exists: the row the value
-                // comes from (not the caller's own `effective` row) must not
-                // sit above `bound`, judged on the full chain. Before the
+                // The bound is judged on the row the value comes from (not the
+                // caller's own `effective` row), on the full chain, before the
                 // expiry test and before anything is read from the store.
-                if let Some(b) = bound
-                    && row.value_version.is_some()
-                    && Self::chain_pos(&chain, row.tenant_id.0) > Self::chain_pos(&chain, b.0)
-                {
+                let above_bound = bound.is_some_and(|b| {
+                    Self::chain_pos(&chain, row.tenant_id.0) > Self::chain_pos(&chain, b.0)
+                });
+                if above_bound && row.value_version.is_some() {
                     self.metrics.read_outcome(ReadOutcome::OwnerAboveBound);
                     self.audit_event(
                         ctx,
@@ -535,16 +534,24 @@ impl Service {
                     .await;
                     return Err(DomainError::OwnerAboveBound);
                 }
-                self.read_secret_audited(
-                    ctx,
-                    req,
-                    subject,
-                    key,
-                    &chain,
-                    &credential.secret_type,
-                    row.id,
-                )
-                .await?
+                if above_bound {
+                    // A value-less row above the bound is a miss right away:
+                    // a value written into this very row keeps its `id` and
+                    // would pass the guard of the re-resolution.
+                    self.metrics.read_outcome(ReadOutcome::Miss);
+                    None
+                } else {
+                    self.read_secret_audited(
+                        ctx,
+                        req,
+                        subject,
+                        key,
+                        &chain,
+                        &credential.secret_type,
+                        row.id,
+                    )
+                    .await?
+                }
             } else {
                 // Nothing resolves, or the decisive row is of another type
                 // than the record the caller sees: no value, and nothing is
@@ -1272,9 +1279,7 @@ impl Service {
                             &scope,
                             existing.id,
                             expected_version,
-                            sharing,
-                            fallback,
-                            expires_at,
+                            MetadataWrite::all(sharing, fallback, expires_at),
                             plugin.destroyer().is_some(),
                         )
                         .await?
@@ -1308,9 +1313,7 @@ impl Service {
                                 &scope,
                                 existing.id,
                                 expected_version,
-                                sharing,
-                                fallback,
-                                expires_at,
+                                MetadataWrite::all(sharing, fallback, expires_at),
                             )
                             .await?
                             .ok_or(DomainError::VersionConflict)?;
@@ -1620,6 +1623,19 @@ impl Service {
             self.heal_record_debts(&existing.store_key()).await;
         }
 
+        // Only the fields the body names are written (`If-Match: *` leaves
+        // the version unchecked, so a column the body does not name must not
+        // be rewritten from the snapshot read above); the merged values below
+        // serve validation, the no-op rule and the value switch.
+        let named = MetadataWrite {
+            sharing: patch.sharing,
+            fallback: patch.fallback.map(Fallback::from),
+            expires_at: match patch.expires_at {
+                PatchField::Absent => None,
+                PatchField::Null => Some(None),
+                PatchField::Set(at) => Some(Some(at)),
+            },
+        };
         let merged_sharing = patch.sharing.unwrap_or(existing.sharing);
         let merged_fallback = patch.fallback.map_or(existing.fallback, Fallback::from);
         let merged_expires_at = match patch.expires_at {
@@ -1652,14 +1668,7 @@ impl Service {
                 }
                 let row = self
                     .repo
-                    .update_metadata(
-                        &scope,
-                        existing.id,
-                        expected_version,
-                        merged_sharing,
-                        merged_fallback,
-                        merged_expires_at,
-                    )
+                    .update_metadata(&scope, existing.id, expected_version, named)
                     .await?
                     .ok_or(DomainError::VersionConflict)?;
                 Ok(Some(Validator {
@@ -1689,9 +1698,7 @@ impl Service {
                         &scope,
                         existing.id,
                         expected_version,
-                        merged_sharing,
-                        merged_fallback,
-                        merged_expires_at,
+                        named,
                         plugin.destroyer().is_some(),
                     )
                     .await?

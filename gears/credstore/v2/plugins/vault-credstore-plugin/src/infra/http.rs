@@ -49,6 +49,10 @@ impl ReqwestTransport {
         let tokens = TokenStore::new(TokenSource::from_config(cfg)?)?;
         let http = Client::builder()
             .timeout(Duration::from_secs(cfg.timeout_secs))
+            // The token and a write body (the encoded secret) must never be
+            // replayed at another address, so a 3xx (a standby node's redirect
+            // to the active one included) surfaces as an unexpected status.
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Ok(Self {
             http,

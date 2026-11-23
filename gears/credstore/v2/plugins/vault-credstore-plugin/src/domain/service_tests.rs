@@ -232,7 +232,8 @@ async fn delete_key_404_is_idempotent_success() {
     server.mock(|when, then| {
         when.method(DELETE)
             .path_includes("/v1/secret/metadata/credstore/");
-        then.status(404);
+        then.status(404)
+            .json_body(serde_json::json!({ "errors": [] }));
     });
     let svc = service_from(&config_for(&server));
     svc.delete_key_value(&key()).await.expect("ok, idempotent");
@@ -311,7 +312,8 @@ async fn destroy_below_on_missing_key_is_success() {
     server.mock(|when, then| {
         when.method(GET)
             .path_includes("/v1/secret/metadata/credstore/");
-        then.status(404);
+        then.status(404)
+            .json_body(serde_json::json!({ "errors": [] }));
     });
     let svc = service_from(&config_for(&server));
     svc.destroy_value(&key(), &DestroySelector::Below(vv("9")))
@@ -339,7 +341,8 @@ async fn namespace_header_sent_when_configured() {
         when.method(GET)
             .path_includes("/v1/secret/data/credstore/")
             .header("X-Vault-Namespace", "team-a");
-        then.status(404);
+        then.status(404)
+            .json_body(serde_json::json!({ "errors": [] }));
     });
 
     let mut cfg = config_for(&server);

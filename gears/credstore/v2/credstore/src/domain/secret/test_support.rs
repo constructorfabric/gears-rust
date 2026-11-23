@@ -32,7 +32,8 @@ use crate::domain::resolver::{AncestorChain, TenantDirectory};
 use crate::domain::secret::cleanup::{DeadContent, cleanup_tasks};
 use crate::domain::secret::model::{
     CleanupDebt, CleanupTask, DeleteVerification, HealFlags, HealedCreates, IntentCommit,
-    NewDeclaredSecret, NewSecret, SecretRow, SecretStatus, WriteAttempt, WriteVerification,
+    MetadataWrite, NewDeclaredSecret, NewSecret, SecretRow, SecretStatus, WriteAttempt,
+    WriteVerification,
 };
 use crate::domain::secret::repo::SecretRepo;
 use crate::domain::secret::type_resolver::{ResolvedSecretType, SecretTypeResolver};
@@ -673,12 +674,12 @@ pub struct FakePlugin {
     get_rejected: bool,
     /// Per-key injected `get` faults (secret-selecting list concurrency tests).
     get_faults: Mutex<HashMap<PluginKey, FakeGetFault>>,
-    /// Per-key injected read latency in milliseconds (secret-selecting list
-    /// concurrency tests): `get` sleeps this long for a key present here,
-    /// tracked by `in_flight`/`max_in_flight` so a test can observe how many
-    /// reads were in flight at once.
-    delays: Mutex<HashMap<PluginKey, u64>>,
-    /// Number of delayed `get` calls currently sleeping.
+    /// Per-key injected read latency in executor yields (secret-selecting
+    /// list concurrency tests): `get` yields this many times for a key present
+    /// here, tracked by `in_flight`/`max_in_flight` so a test can observe how
+    /// many reads were in flight at once.
+    yields: Mutex<HashMap<PluginKey, u32>>,
+    /// Number of delayed `get` calls currently yielding.
     in_flight: AtomicUsize,
     /// The largest `in_flight` value observed - see [`Self::max_in_flight`].
     max_in_flight: AtomicUsize,
@@ -702,7 +703,7 @@ impl FakePlugin {
             not_found_gets: Mutex::new(0),
             get_rejected,
             get_faults: Mutex::new(HashMap::new()),
-            delays: Mutex::new(HashMap::new()),
+            yields: Mutex::new(HashMap::new()),
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
             get_calls: AtomicUsize::new(0),
@@ -937,22 +938,21 @@ impl FakePlugin {
             .insert(plugin_key(key), FakeGetFault::Internal);
     }
 
-    /// Make every future `get` for `key` sleep `ms` milliseconds, with the
-    /// sleep tracked by [`Self::max_in_flight`] - for asserting the
-    /// secret-selecting list's bounded-concurrency fan-out.
+    /// Make every future `get` for `key` yield to the executor `n` times
+    /// (no timer involved), with the wait tracked by [`Self::max_in_flight`]:
+    /// for asserting the secret-selecting list's bounded-concurrency fan-out
+    /// and for ordering completions deterministically (fewer yields finish
+    /// first).
     ///
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned.
-    pub fn set_delay_ms(&self, key: &StoreKey, ms: u64) {
-        self.delays
-            .lock()
-            .expect("lock")
-            .insert(plugin_key(key), ms);
+    pub fn set_yields(&self, key: &StoreKey, n: u32) {
+        self.yields.lock().expect("lock").insert(plugin_key(key), n);
     }
 
-    /// The largest number of [`Self::set_delay_ms`]-delayed `get` calls this
-    /// plugin ever had sleeping at the same time.
+    /// The largest number of [`Self::set_yields`]-delayed `get` calls this
+    /// plugin ever had waiting at the same time.
     #[must_use]
     pub fn max_in_flight(&self) -> usize {
         self.max_in_flight.load(Ordering::SeqCst)
@@ -1034,17 +1034,19 @@ impl CredStorePluginClientV2 for FakePlugin {
         if Self::take_one(&self.not_found_gets) {
             return Ok(None);
         }
-        let delay_ms = self
-            .delays
+        let yields = self
+            .yields
             .lock()
             .expect("lock")
             .get(&k)
             .copied()
             .unwrap_or(0);
-        if delay_ms > 0 {
+        if yields > 0 {
             let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            for _ in 0..yields {
+                tokio::task::yield_now().await;
+            }
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
         }
         let Ok(n) = version.as_str().parse::<u64>() else {
@@ -1235,6 +1237,18 @@ pub struct FakeSecretRepo {
     /// id instead of its own answer — a concurrent change making the
     /// re-resolution land on another row than `resolve_candidates` saw.
     pending_redirect: Mutex<Option<Uuid>>,
+    /// One-shot: just before the next `resolve_for_get`, the stored row with
+    /// this id receives the value version and becomes `active` - a concurrent
+    /// write into an existing `declared` row landing after the read's first
+    /// resolution.
+    pending_activate: Mutex<Option<(Uuid, ValueVersion)>>,
+    /// The `MetadataWrite` of the last `update_metadata` / `remove_value`
+    /// call, for asserting which columns a service call names.
+    last_metadata_write: Mutex<Option<MetadataWrite>>,
+    /// One-shot: just before the next `update_metadata` / `remove_value`
+    /// applies, the stored row `id` gets this sharing mode, as a concurrent
+    /// `PATCH {"sharing": ...}` landing after the caller read the row.
+    pending_sharing_change: Mutex<Option<(Uuid, SharingMode)>>,
     /// When `> 0`, the next `insert_active` applies its change and THEN fails
     /// with a simulated internal error: an ambiguous commit that did happen.
     insert_active_fail_after_commit: Mutex<usize>,
@@ -1269,7 +1283,55 @@ pub struct FakeSecretRepo {
     list_candidate_references_calls: Mutex<Vec<Option<Vec<Uuid>>>>,
 }
 
+/// Applies the columns `meta` names to `row`, leaving the others as stored.
+fn apply_metadata(row: &mut SecretRow, meta: MetadataWrite) {
+    if let Some(sharing) = meta.sharing {
+        row.sharing = sharing;
+    }
+    if let Some(fallback) = meta.fallback {
+        row.fallback = fallback;
+    }
+    if let Some(expires_at) = meta.expires_at {
+        row.expires_at = expires_at;
+    }
+}
+
 impl FakeSecretRepo {
+    /// The `MetadataWrite` of the last `update_metadata` / `remove_value`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn last_metadata_write(&self) -> Option<MetadataWrite> {
+        *self.last_metadata_write.lock().expect("lock")
+    }
+
+    /// One-shot: just before the next `update_metadata` / `remove_value`
+    /// applies, set the stored row `row_id` to `sharing`, as a concurrent
+    /// `PATCH {"sharing": ...}` landing after the caller read the row.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn change_sharing_before_next_metadata_write(&self, row_id: Uuid, sharing: SharingMode) {
+        *self.pending_sharing_change.lock().expect("lock") = Some((row_id, sharing));
+    }
+
+    fn apply_pending_sharing_change(&self) {
+        let pending = self.pending_sharing_change.lock().expect("lock").take();
+        if let Some((id, sharing)) = pending
+            && let Some(row) = self
+                .rows
+                .lock()
+                .expect("lock")
+                .iter_mut()
+                .find(|r| r.id == id)
+        {
+            row.sharing = sharing;
+        }
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -1290,6 +1352,9 @@ impl FakeSecretRepo {
             pending_switch: Mutex::new(None),
             pending_vanish: Mutex::new(None),
             pending_redirect: Mutex::new(None),
+            pending_activate: Mutex::new(None),
+            last_metadata_write: Mutex::new(None),
+            pending_sharing_change: Mutex::new(None),
             insert_active_fail_after_commit: Mutex::new(0),
             switch_value_fail_after_commit: Mutex::new(0),
             delete_failures: Mutex::new(0),
@@ -1463,6 +1528,18 @@ impl FakeSecretRepo {
     /// Panics if the internal mutex is poisoned.
     pub fn redirect_next_resolve_for_get(&self, row_id: Uuid) {
         *self.pending_redirect.lock().expect("lock") = Some(row_id);
+    }
+
+    /// One-shot: just before the next `resolve_for_get`, write `value_version`
+    /// into the stored row `row_id` in place (same `id`, status `active`), as
+    /// a concurrent write into a `declared` row would, after the read's first
+    /// resolution (`resolve_candidates`) already saw it value-less.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn activate_before_next_resolve_for_get(&self, row_id: Uuid, value_version: ValueVersion) {
+        *self.pending_activate.lock().expect("lock") = Some((row_id, value_version));
     }
 
     /// Arrange for the next `n` `delete_by_id` calls to report `NotFound`
@@ -2041,7 +2118,14 @@ impl SecretRepo for FakeSecretRepo {
         key: &SecretRef,
         chain: &[Uuid],
     ) -> Result<Option<SecretRow>, DomainError> {
-        let rows = self.rows.lock().expect("lock");
+        let activate = self.pending_activate.lock().expect("lock").take();
+        let mut rows = self.rows.lock().expect("lock");
+        if let Some((id, value_version)) = activate
+            && let Some(stored) = rows.iter_mut().find(|r| r.id == id)
+        {
+            stored.value_version = Some(value_version);
+            stored.status = SecretStatus::Active;
+        }
         let key_str = key.as_ref();
 
         let pos = |t: Uuid| chain.iter().position(|c| *c == t).unwrap_or(usize::MAX);
@@ -2469,10 +2553,10 @@ impl SecretRepo for FakeSecretRepo {
         _scope: &AccessScope,
         id: Uuid,
         expected_version: Option<i64>,
-        sharing: SharingMode,
-        fallback: crate::domain::secret::model::Fallback,
-        expires_at: Option<OffsetDateTime>,
+        meta: MetadataWrite,
     ) -> Result<Option<SecretRow>, DomainError> {
+        *self.last_metadata_write.lock().expect("lock") = Some(meta);
+        self.apply_pending_sharing_change();
         let mut rows = self.rows.lock().expect("lock");
         let row = rows
             .iter_mut()
@@ -2480,28 +2564,22 @@ impl SecretRepo for FakeSecretRepo {
         let Some(row) = row else {
             return Ok(None);
         };
-        row.sharing = sharing;
-        row.fallback = fallback;
-        row.expires_at = expires_at;
+        apply_metadata(row, meta);
         row.version += 1;
         row.updated_at = OffsetDateTime::now_utc();
         Ok(Some(row.clone()))
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "mirrors SecretRepo::remove_value's one-CAS-with-every-field-it-may-update shape"
-    )]
     async fn remove_value(
         &self,
         _scope: &AccessScope,
         id: Uuid,
         expected_version: Option<i64>,
-        sharing: SharingMode,
-        fallback: crate::domain::secret::model::Fallback,
-        expires_at: Option<OffsetDateTime>,
+        meta: MetadataWrite,
         destroy_supported: bool,
     ) -> Result<Option<(SecretRow, Vec<CleanupDebt>)>, DomainError> {
+        *self.last_metadata_write.lock().expect("lock") = Some(meta);
+        self.apply_pending_sharing_change();
         let mut rows = self.rows.lock().expect("lock");
         let row = rows
             .iter_mut()
@@ -2511,9 +2589,7 @@ impl SecretRepo for FakeSecretRepo {
         };
         let old_value_version = row.value_version.take();
         row.status = SecretStatus::Declared;
-        row.sharing = sharing;
-        row.fallback = fallback;
-        row.expires_at = expires_at;
+        apply_metadata(row, meta);
         row.version += 1;
         row.updated_at = OffsetDateTime::now_utc();
         let row = row.clone();

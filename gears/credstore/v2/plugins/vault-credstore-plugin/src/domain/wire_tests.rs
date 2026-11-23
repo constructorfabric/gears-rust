@@ -11,6 +11,9 @@ const SOFT_DELETED_404: &str = r#"{"request_id":"r","lease_id":"","renewable":fa
 /// `destroyed = true`.
 const DESTROYED_404: &str = r#"{"request_id":"r","lease_id":"","renewable":false,"lease_duration":0,"data":{"data":null,"metadata":{"created_time":"2026-10-03T21:22:01.141165509Z","custom_metadata":null,"deletion_time":"","destroyed":true,"version":1}},"wrap_info":null,"warnings":null,"auth":null,"mount_type":""}"#;
 
+/// A proxy or ingress error page: not a Vault answer.
+const HTML_PAGE: &str = "<html><body>sign in</body></html>";
+
 /// What Vault answers for an absent key or version.
 const ABSENT_404: &str = r#"{"errors":[]}"#;
 
@@ -357,7 +360,12 @@ fn error_messages_never_contain_the_redacted_secret() {
 #[test]
 fn classify_get_response_absent_version_or_key_is_none() {
     assert_eq!(classify_get_response(404, ABSENT_404).expect("ok"), None);
-    assert_eq!(classify_get_response(404, "").expect("ok"), None);
+    for body in ["", HTML_PAGE] {
+        assert!(matches!(
+            classify_get_response(404, body).unwrap_err(),
+            CredStorePluginError::Internal { .. }
+        ));
+    }
 }
 
 #[test]
@@ -490,7 +498,12 @@ fn classify_metadata_response_404_is_empty() {
             .expect("ok")
             .is_empty()
     );
-    assert!(classify_metadata_response(404, "").expect("ok").is_empty());
+    for body in ["", HTML_PAGE] {
+        assert!(matches!(
+            classify_metadata_response(404, body).unwrap_err(),
+            CredStorePluginError::Internal { .. }
+        ));
+    }
     assert!(matches!(
         classify_metadata_response(404, NO_MOUNT_404).unwrap_err(),
         CredStorePluginError::Internal { .. }
@@ -512,9 +525,23 @@ fn classify_metadata_response_lists_live_versions() {
 fn classify_delete_and_destroy_responses() {
     for classify in [classify_delete_response, classify_destroy_response] {
         classify(204, "").expect("204 is ok");
-        classify(200, "").expect("200 is ok");
         classify(404, ABSENT_404).expect("a missing key is ok, idempotent");
-        classify(404, "").expect("a bare 404 is ok, idempotent");
+        classify(404, SOFT_DELETED_404).expect("a 404 without errors is ok, idempotent");
+        for (status, body) in [
+            (404, ""),
+            (404, HTML_PAGE),
+            (200, ""),
+            (200, HTML_PAGE),
+            (202, ""),
+        ] {
+            assert!(
+                matches!(
+                    classify(status, body).unwrap_err(),
+                    CredStorePluginError::Internal { .. }
+                ),
+                "{status} {body:?} must not read as a completed delete"
+            );
+        }
         assert!(classify(502, "").unwrap_err().is_unavailable());
         assert!(
             classify(403, FORBIDDEN_403)

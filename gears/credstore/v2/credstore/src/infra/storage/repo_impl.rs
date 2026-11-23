@@ -22,8 +22,8 @@ pub use helpers::{CredstoreDbProvider, SecretRepoImpl};
 
 use crate::domain::error::DomainError;
 use crate::domain::secret::model::{
-    CleanupDebt, DeleteVerification, Fallback, HealedCreates, IntentCommit, NewDeclaredSecret,
-    NewSecret, SecretRow, WriteAttempt, WriteVerification,
+    CleanupDebt, DeleteVerification, Fallback, HealedCreates, IntentCommit, MetadataWrite,
+    NewDeclaredSecret, NewSecret, SecretRow, WriteAttempt, WriteVerification,
 };
 use crate::domain::secret::repo::SecretRepo;
 
@@ -212,20 +212,9 @@ impl SecretRepo for SecretRepoImpl {
         scope: &AccessScope,
         id: Uuid,
         expected_version: Option<i64>,
-        sharing: SharingMode,
-        fallback: Fallback,
-        expires_at: Option<OffsetDateTime>,
+        meta: MetadataWrite,
     ) -> Result<Option<SecretRow>, DomainError> {
-        writes::update_metadata(
-            self,
-            scope,
-            id,
-            expected_version,
-            sharing,
-            fallback,
-            expires_at,
-        )
-        .await
+        writes::update_metadata(self, scope, id, expected_version, meta).await
     }
 
     async fn remove_value(
@@ -233,22 +222,10 @@ impl SecretRepo for SecretRepoImpl {
         scope: &AccessScope,
         id: Uuid,
         expected_version: Option<i64>,
-        sharing: SharingMode,
-        fallback: Fallback,
-        expires_at: Option<OffsetDateTime>,
+        meta: MetadataWrite,
         destroy_supported: bool,
     ) -> Result<Option<(SecretRow, Vec<CleanupDebt>)>, DomainError> {
-        writes::remove_value(
-            self,
-            scope,
-            id,
-            expected_version,
-            sharing,
-            fallback,
-            expires_at,
-            destroy_supported,
-        )
-        .await
+        writes::remove_value(self, scope, id, expected_version, meta, destroy_supported).await
     }
 
     async fn delete_by_id(

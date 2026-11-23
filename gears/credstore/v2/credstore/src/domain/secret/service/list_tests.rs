@@ -1107,7 +1107,7 @@ async fn secret_selected_reads_values_with_bounded_concurrency() {
     let svc = service_with(repo.clone(), plugin.clone(), dir, mock_enforcer(), 200);
     let ctx = make_ctx(Uuid::new_v4(), tenant);
 
-    let refs: Vec<String> = (0..6).map(|i| format!("r{i}")).collect();
+    let refs: Vec<String> = (0..20).map(|i| format!("r{i}")).collect();
     for name in &refs {
         svc.put(
             &ctx,
@@ -1118,11 +1118,10 @@ async fn secret_selected_reads_values_with_bounded_concurrency() {
         .await
         .expect("create");
     }
-    // Delay every value read so overlapping in-flight reads are observable;
-    // 6 references leave headroom under SECRET_READ_CONCURRENCY (8) to
-    // actually overlap rather than merely queueing.
+    // Every value read yields many times, so all reads the fan-out admits
+    // enter before the first one finishes: the peak is exactly the limit.
     for row in repo.rows() {
-        plugin.set_delay_ms(&row.store_key(), 10);
+        plugin.set_yields(&row.store_key(), 16);
     }
 
     let selector = refs
@@ -1132,16 +1131,12 @@ async fn secret_selected_reads_values_with_bounded_concurrency() {
         .join(", ");
     let query = secret_query(&format!("reference in ({selector})"));
     let page = svc.list(&ctx, &query).await.expect("list");
-    assert_eq!(page.items.len(), 6);
+    assert_eq!(page.items.len(), 20);
 
     let max = plugin.max_in_flight();
-    assert!(
-        max >= 2,
-        "expected overlapping in-flight reads, got max={max}"
-    );
-    assert!(
-        max <= 8,
-        "must not exceed SECRET_READ_CONCURRENCY (8), got max={max}"
+    assert_eq!(
+        max, 8,
+        "must reach and not exceed SECRET_READ_CONCURRENCY (8), got max={max}"
     );
 }
 
@@ -1165,16 +1160,16 @@ async fn secret_selected_value_reads_preserve_reference_order() {
         .await
         .expect("create");
     }
-    // Earlier references sleep longer than later ones, so completion order
-    // inverts reference order; the response must still come back in
+    // Earlier references yield more often than later ones, so completion
+    // order inverts reference order; the response must still come back in
     // reference order regardless.
     for row in repo.rows() {
         let idx = refs
             .iter()
             .position(|r| *r == row.reference)
             .expect("known reference");
-        let delay_ms = (refs.len() - idx) as u64 * 5;
-        plugin.set_delay_ms(&row.store_key(), delay_ms);
+        let yields = u32::try_from(refs.len() - idx).expect("small") * 4;
+        plugin.set_yields(&row.store_key(), yields);
     }
 
     let selector = refs
