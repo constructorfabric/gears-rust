@@ -582,6 +582,29 @@ async fn classify(
 
 ## Observability
 
+### Client cache metrics
+
+Local and REST caches use the process's global OpenTelemetry meter provider under the
+`cf-gears-types-registry-sdk` scope. In `ToolKit` hosts built with the `otel` feature,
+enable `opentelemetry.metrics.enabled` to export these metrics. Other hosts install
+their meter provider before constructing clients.
+
+| Instrument | Labels in addition to `plane` | What it measures |
+|---|---|---|
+| `types_registry_client_cache_lookups` | `operation` (`batch_get`, `batch_resolve`), `result` (`hit`, `miss`, `revalidate`) | One lookup per distinct key in a batch that goes through the cache |
+| `types_registry_client_cache_evictions` | `cache` (`snapshot`, `identity`) | Entries displaced by LRU to enforce a capacity limit |
+| `types_registry_client_cache_entries` | `cache` (`snapshot`, `identity`) | Resident entries summed across live cache instances |
+| `types_registry_client_cache_size` | | Compact JSON snapshot bytes plus raw `ETag` bytes, summed across live cache instances |
+
+`plane` is `platform` or `tenant`. A hit is answered without calling the registry for
+that key. A revalidation forwards the cache's own `ETag`. Other forwarded lookups are misses.
+These outcomes describe cache decisions even when a forwarded request fails. The cache
+hit rate is hits divided by all lookups, including revalidations. Occupancy series appear
+when entries are first retained. Replacement and explicit invalidation affect occupancy.
+Only capacity-driven removals count as evictions.
+
+### Reconciliation tracing
+
 `reconcile_entities_and_await` traces with `tracing` at INFO; nothing needs DEBUG to be
 correlated. Every log record has a stable `log_kind` field. Codes only: no document content, and no
 free text of an error (`detail`, a violation's description, an admission message). The full

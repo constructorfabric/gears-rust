@@ -22,9 +22,11 @@ use crate::models::{
 };
 
 mod identity;
+mod metrics;
 mod store;
 
-use store::{Store, TenantTicket, TenantViewer, Ticket, Weight};
+use metrics::CacheMetrics;
+use store::{Store, TenantTicket, TenantViewer, Ticket, Usage, Weight};
 
 /// Freshness and retention limits for Types Registry client caches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +95,7 @@ pub struct CachedPlatformTypesRegistry {
 }
 
 struct ReadCache {
+    metrics: CacheMetrics,
     freshness_window: Duration,
     /// The store's byte bound, so that a merge too large to keep is never built.
     max_size_bytes: usize,
@@ -100,6 +103,13 @@ struct ReadCache {
     /// lookup or a few inserts and removals that leave both consistent at each step, so a
     /// poisoned lock is recovered.
     store: Mutex<Store>,
+}
+
+impl Drop for ReadCache {
+    fn drop(&mut self) {
+        let store = self.store.get_mut().unwrap_or_else(PoisonError::into_inner);
+        self.metrics.update_usage(store.usage(), Usage::default());
+    }
 }
 
 /// How one distinct key of a batch is answered.
@@ -228,6 +238,7 @@ impl ReadCache {
             store.remember_identities(settings.max_identity_entries);
         }
         Self {
+            metrics: CacheMetrics::from_global(if tenant { "tenant" } else { "platform" }),
             freshness_window: settings.freshness_window,
             max_size_bytes: settings.max_size_bytes,
             store: Mutex::new(store),
@@ -236,6 +247,15 @@ impl ReadCache {
 
     fn store(&self) -> std::sync::MutexGuard<'_, Store> {
         self.store.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Records net occupancy changes under the same lock as the mutation.
+    fn update_store<T>(&self, update: impl FnOnce(&mut Store) -> T) -> T {
+        let mut store = self.store();
+        let before = store.usage();
+        let result = update(&mut store);
+        self.metrics.update_usage(before, store.usage());
+        result
     }
 
     /// A batch read through the cache.
@@ -255,17 +275,30 @@ impl ReadCache {
         let now = Instant::now();
         let selection = request.projection.normalized();
         let (plans, tickets) = self.plan(&request, &selection, now, viewer);
+        let mut revalidations = 0;
         let remote: Vec<BatchGetItem> = plans
             .iter()
             .filter_map(|(key, plan)| match plan {
                 Plan::Local { .. } => None,
-                Plan::Remote { sent, .. } => Some(BatchGetItem::for_cache_read(
-                    key.clone(),
-                    sent.clone(),
-                    &selection,
-                )),
+                Plan::Remote { pinned, sent, .. } => {
+                    revalidations += usize::from(*pinned);
+                    Some(BatchGetItem::for_cache_read(
+                        key.clone(),
+                        sent.clone(),
+                        &selection,
+                    ))
+                }
             })
             .collect();
+        // Classify each planned key, including lookups whose registry call later fails.
+        self.metrics.lookups(
+            "batch_get",
+            &[
+                ("hit", plans.len() - remote.len()),
+                ("miss", remote.len() - revalidations),
+                ("revalidate", revalidations),
+            ],
+        );
         let answers = if remote.is_empty() {
             HashMap::new()
         } else {
@@ -291,14 +324,29 @@ impl ReadCache {
         sent_at: Instant,
         tenant: Option<TenantTicket>,
     ) -> Result<(), CanonicalError> {
-        let mut store = self.store();
         let found = plans
             .iter()
             .zip(verified)
             .filter_map(|((_, plan), answer)| identified(plan, answer.as_ref()))
             .map(|snapshot| (&snapshot.gts_id, snapshot.gts_uuid));
-        Self::learn_identities(&mut store, &[], found)?;
-        commit(&mut store, plans, verified, sent_at, tenant);
+        let (identities, snapshots) = self.update_store(|store| {
+            let identities = Self::learn_identities(store, &[], found)?;
+            let snapshots = commit(store, plans, verified, sent_at, tenant);
+            Ok::<_, CanonicalError>((identities, snapshots))
+        })?;
+        self.metrics.evictions("identity", identities);
+        self.metrics.evictions("snapshot", snapshots);
+        Ok(())
+    }
+
+    /// Learns identities from a resolution or discovery reply and records any LRU pressure.
+    fn learn_from_reply<'a>(
+        &self,
+        held: &[&'a EntityIdentity],
+        found: impl Iterator<Item = (&'a GtsId, Uuid)> + Clone,
+    ) -> Result<(), CanonicalError> {
+        let evictions = self.update_store(|store| Self::learn_identities(store, held, found))?;
+        self.metrics.evictions("identity", evictions);
         Ok(())
     }
 
@@ -310,7 +358,7 @@ impl ReadCache {
         store: &mut Store,
         held: &[&'a EntityIdentity],
         found: impl Iterator<Item = (&'a GtsId, Uuid)> + Clone,
-    ) -> Result<(), CanonicalError> {
+    ) -> Result<u64, CanonicalError> {
         // Pairs the caller holds beside this read are part of the batch: checked against,
         // not learned again.
         let mut by_id: HashMap<&GtsId, Uuid> = held
@@ -352,10 +400,9 @@ impl ReadCache {
                 .create());
             }
         }
-        for (gts_id, gts_uuid) in found {
-            store.identities.learn(gts_id, gts_uuid);
-        }
-        Ok(())
+        Ok(found
+            .map(|(gts_id, gts_uuid)| u64::from(store.identities.learn(gts_id, gts_uuid)))
+            .sum())
     }
 
     /// Every distinct key this cache can resolve without the registry: from the identity
@@ -543,10 +590,11 @@ impl CachedPlatformTypesRegistry {
         if keys.is_empty() {
             return;
         }
-        let mut store = self.cache.store();
-        for key in keys {
-            store.invalidate(key, None);
-        }
+        self.cache.update_store(|store| {
+            for key in keys {
+                store.invalidate(key, None);
+            }
+        });
     }
 }
 
@@ -592,7 +640,7 @@ fn commit(
     verified: &[Option<Verified>],
     sent_at: Instant,
     tenant: Option<TenantTicket>,
-) {
+) -> u64 {
     // Judged before any of this batch is applied: its keys were ticketed together, so
     // what one of them records is not news to another.
     let quiet: Vec<bool> = plans
@@ -605,6 +653,7 @@ fn commit(
     let confirmed_viewer = tenant
         .filter(|ticket| store.tenant_ticket_current(*ticket))
         .map(|ticket| ticket.viewer);
+    let mut evictions = 0;
     for (((asked, plan), verified), quiet) in plans.iter().zip(verified).zip(quiet) {
         let (Plan::Remote { sent, resident, .. }, Some(verified)) = (plan, verified) else {
             continue;
@@ -656,7 +705,7 @@ fn commit(
                             // entry.
                             store.invalidate(asked, pair);
                         }
-                        store.insert(
+                        evictions += store.insert(
                             Arc::clone(&kept.snapshot),
                             kept.covers.clone(),
                             kept.weight.clone(),
@@ -701,6 +750,7 @@ fn commit(
         });
         store.revoke_tenant_reads(ticket.viewer, absent);
     }
+    evictions
 }
 
 /// Checks every answer against the request that was sent before any of it is cached:
@@ -898,6 +948,7 @@ impl PlatformTypesRegistryApi for CachedPlatformTypesRegistry {
             return self.inner.batch_resolve_identities(ctx, keys).await;
         }
         let (mut answers, unknown) = self.cache.known_identities(keys, Instant::now());
+        self.cache.metrics.resolutions(answers.len(), unknown.len());
         if unknown.is_empty() {
             return Ok(answers);
         }
@@ -909,8 +960,7 @@ impl PlatformTypesRegistryApi for CachedPlatformTypesRegistry {
         // The identities answered so far are held while the rest are resolved: an answer
         // contradicting one of them fails the resolution, and is learned nowhere.
         let held: Vec<&EntityIdentity> = answers.values().flatten().collect();
-        ReadCache::learn_identities(
-            &mut self.cache.store(),
+        self.cache.learn_from_reply(
             &held,
             fetched
                 .values()
@@ -938,8 +988,7 @@ impl PlatformTypesRegistryApi for CachedPlatformTypesRegistry {
             ))
             .create());
         }
-        ReadCache::learn_identities(
-            &mut self.cache.store(),
+        self.cache.learn_from_reply(
             &[],
             page.items
                 .iter()
@@ -1119,6 +1168,7 @@ impl TypesRegistryApi for CachedTypesRegistry {
             return result;
         };
         let (mut answers, unknown) = self.cache.visible_identities(keys, seen_by, Instant::now());
+        self.cache.metrics.resolutions(answers.len(), unknown.len());
         if unknown.is_empty() {
             return Ok(answers);
         }
@@ -1128,13 +1178,12 @@ impl TypesRegistryApi for CachedTypesRegistry {
             .await;
         self.revoke_if_refused(viewer, &result);
         let fetched = crate::ext::checked_resolutions(&unknown, result?)?;
-        {
-            let mut store = self.cache.store();
+        let evictions = self.cache.update_store(|store| {
             // Checked against the snapshots answered beside it and every resident one,
             // as a batch read's answers are; a tenant cache learns no identity.
             let held: Vec<&EntityIdentity> = answers.values().flatten().collect();
-            ReadCache::learn_identities(
-                &mut store,
+            let evictions = ReadCache::learn_identities(
+                store,
                 &held,
                 fetched
                     .values()
@@ -1145,7 +1194,9 @@ impl TypesRegistryApi for CachedTypesRegistry {
                 .iter()
                 .filter_map(|(key, identity)| identity.is_none().then_some(key));
             store.revoke_tenant_reads(seen_by, absent);
-        }
+            Ok::<_, CanonicalError>(evictions)
+        })?;
+        self.cache.metrics.evictions("identity", evictions);
         answers.extend(fetched);
         Ok(answers)
     }

@@ -54,6 +54,8 @@ toolkit-contract = { workspace = true }
 toolkit-security = { workspace = true }
 time = { workspace = true }
 tracing = { workspace = true }
+# Client cache metrics.
+opentelemetry = { workspace = true }
 # The client cache's byte-bounded LRU store.
 lru = { workspace = true }
 # Async deadlines, polling and cancellation.
@@ -82,6 +84,8 @@ tokio = { workspace = true, features = ["macros", "rt", "sync", "test-util"] }
 proptest = { workspace = true }
 # Captures reconciliation's events and spans in tests.
 tracing-subscriber = { workspace = true }
+# Verifies client cache metrics with an in-memory exporter.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 # The test doubles also compile under `cfg(test)` without `test-util`.
 toolkit = { workspace = true }
 parking_lot = { workspace = true }

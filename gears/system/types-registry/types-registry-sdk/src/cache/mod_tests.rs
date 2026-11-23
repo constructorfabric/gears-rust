@@ -2458,3 +2458,6 @@ mod resolve_tests;
 
 #[path = "tenant_tests.rs"]
 mod tenant_tests;
+
+#[path = "metrics_tests.rs"]
+mod metrics_tests;

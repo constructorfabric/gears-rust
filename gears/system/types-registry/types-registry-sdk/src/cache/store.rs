@@ -414,6 +414,13 @@ pub struct Store {
     max_entries: usize,
 }
 
+#[derive(Clone, Copy, Default)]
+pub(super) struct Usage {
+    pub(super) snapshots: usize,
+    pub(super) identities: usize,
+    pub(super) snapshot_bytes: usize,
+}
+
 impl Store {
     pub fn new(bound: usize, max_entries: usize) -> Self {
         Self {
@@ -688,7 +695,7 @@ impl Store {
     }
 
     /// Stores `snapshot`, holding `covers` under `etag`, as its entity's entry, replacing
-    /// what was there, and evicts the least recently used entries until it fits. A snapshot
+    /// what was there. Returns the number of LRU entries evicted for capacity. A snapshot
     /// that does not [fit](Self::fits) is not retained, and the entry it would replace is
     /// dropped rather than left stale. `weight` is [`weight`] of `snapshot`, measured
     /// before taking the store's lock. The caller has checked that its identity has no
@@ -701,7 +708,7 @@ impl Store {
         weight: Weight,
         etag: Validator,
         confirmed_at: Instant,
-    ) {
+    ) -> u64 {
         let key = snapshot.gts_uuid;
         if let Some(other) = self.aliases.get(&snapshot.gts_id).copied()
             && other != snapshot.gts_uuid
@@ -717,15 +724,17 @@ impl Store {
         });
         self.remove(&key);
         if !self.fits(&weight, &etag) {
-            return;
+            return 0;
         }
         let bytes = weight.bytes_with_validator(&etag);
+        let mut evictions = 0;
         // `used <= bound` holds throughout, so the subtraction cannot underflow.
         while bytes > self.bound - self.used || self.entries.len() >= self.max_entries {
             let Some((evicted, entry)) = self.entries.pop_lru() else {
                 break;
             };
             self.forget(&evicted, &entry);
+            evictions += 1;
         }
         self.used += bytes;
         self.aliases
@@ -741,6 +750,7 @@ impl Store {
                 tenant_version,
             },
         );
+        evictions
     }
 
     /// Records that the registry confirmed `etag` for the entity `key` spells at `at`, if
@@ -779,6 +789,14 @@ impl Store {
         self.used -= entry.weight.bytes_with_validator(&entry.etag);
         if self.aliases.get(&entry.snapshot.gts_id) == Some(key) {
             self.aliases.remove(&entry.snapshot.gts_id);
+        }
+    }
+
+    pub(super) fn usage(&self) -> Usage {
+        Usage {
+            snapshots: self.entries.len(),
+            identities: self.identities.len(),
+            snapshot_bytes: self.used,
         }
     }
 

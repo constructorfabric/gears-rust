@@ -70,20 +70,27 @@ impl Identities {
             .map(|known| EntityKey::GtsId(known.as_ref().clone()))
     }
 
-    /// Record a pair after the complete batch has passed identity checks.
-    pub fn learn(&mut self, gts_id: &GtsId, gts_uuid: Uuid) {
+    /// Number of resident pairs in the bounded identity store.
+    pub(super) fn len(&self) -> usize {
+        self.by_uuid.as_ref().map_or(0, LruCache::len)
+    }
+
+    /// Record a checked pair and report whether it displaced an LRU entry.
+    pub fn learn(&mut self, gts_id: &GtsId, gts_uuid: Uuid) -> bool {
         debug_assert!(self.agrees(gts_id, gts_uuid));
         let Some(store) = self.by_uuid.as_mut() else {
-            return;
+            return false;
         };
         if store.get(&gts_uuid).is_some() {
-            return;
+            return false;
         }
         let id = Arc::new(gts_id.clone());
-        if let Some((_, evicted)) = store.push(gts_uuid, Arc::clone(&id)) {
-            self.by_id.remove(&evicted);
+        let evicted = store.push(gts_uuid, Arc::clone(&id));
+        if let Some((_, evicted)) = &evicted {
+            self.by_id.remove(evicted);
         }
         self.by_id.insert(id, gts_uuid);
+        evicted.is_some()
     }
 }
 
