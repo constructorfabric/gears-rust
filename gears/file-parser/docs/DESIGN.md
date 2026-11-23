@@ -168,7 +168,7 @@ Targets without a pinned archive (musl included: a static binary cannot `dlopen`
 
 - [ ] `p1` - **ID**: `cpt-cf-file-parser-constraint-parse-limits`
 
-The spreadsheet, HTML, PPTX, PDF and DOCX parsers enforce `ParseLimits` (`src/infra/parsers/limits.rs`, public, `#[non_exhaustive]`). A document over a limit fails with a parse error that names the limit. The gear uses the defaults; each parser accepts other values through `with_limits`.
+The spreadsheet, HTML, PPTX, PDF and DOCX parsers enforce `ParseLimits`, and the plain-text parser its `max_text_bytes` (`src/infra/parsers/limits.rs`, public, `#[non_exhaustive]`). A document over a limit fails with a parse error that names the limit. The gear reads them from `limits` in its configuration (see Configuration); each key defaults as below.
 
 | Field | Default | Bounds |
 |---|---|---|
@@ -191,7 +191,7 @@ A table (or a whole sheet) that does not fit the remaining cell budget is replac
 
 The `ooxml` package reader applies the ZIP limits to every part it reads; parts that are never read (media, embedded objects) are not checked. Relationship targets that escape the package root are dropped. XML is read without DTD entity expansion: only the predefined entities and numeric references are resolved.
 
-pdfium is not thread-safe across documents, so all PDF work runs on one dedicated thread that owns the pdfium binding. Documents queue for it and their callers wait asynchronously. At most 64 documents wait; further ones, and documents that wait longer than `pdf_timeout`, are rejected as busy (429 with `Retry-After`). `pdf_timeout` is checked between pdfium calls only; a single call cannot be interrupted, so a hostile PDF can keep the engine busy past the timeout. The engine's part of the answer still comes within `pdf_timeout` of waiting plus `pdf_timeout` and 2 s of reading (122 s with the defaults); arranging the lines into headings, lists and paragraphs then runs on the blocking pool, bounded by the page, character and text limits. The thread is not one of Tokio's blocking-pool threads, so runtime shutdown does not wait for it.
+pdfium is not thread-safe across documents, so all PDF work runs on one dedicated thread that owns the pdfium binding. Documents queue for it and their callers wait asynchronously. At most `pdf.max_queued` documents wait (64 by default); further ones, and documents that wait longer than `pdf_timeout`, are rejected as busy (429 with `Retry-After`). `pdf_timeout` is checked between pdfium calls only; a single call cannot be interrupted, so a hostile PDF can keep the engine busy past the timeout. The engine's part of the answer still comes within `pdf_timeout` of waiting plus `pdf_timeout` and 2 s of reading (122 s with the defaults); arranging the lines into headings, lists and paragraphs then runs on the blocking pool, bounded by the page, character and text limits. The thread is not one of Tokio's blocking-pool threads, so runtime shutdown does not wait for it.
 
 ## 3. Technical Architecture
 
@@ -440,29 +440,46 @@ File Parser is stateless and does not own any database tables or persistent stor
 ### Configuration
 
 ```yaml
-# config/server.yaml (relevant keys)
-file_parser:
-  max_file_size_mb: 100              # optional; default 100 MB
-  allowed_local_base_dir: /data/uploads   # required; gear fails to start if absent
-  detection_confidence_threshold: 0.90  # optional; default 0.90. Minimum detector confidence, in
-                                      # [0.0, 1.0], at which content detection may override the
-                                      # caller's filename / Content-Type hint. Below it the hint
-                                      # wins. Configurable because ADR-0001 records 0.90 as an
-                                      # initial value rather than a tuned one; the gear fails to
-                                      # start on a value outside [0.0, 1.0] instead of clamping.
-                                      # Only has effect when a detector is registered.
-  magika_intra_op_threads: 2         # optional; leave unset (recommended). Only used with the
-                                      # `magika` feature — ONNX Runtime intra-op thread count for
-                                      # the detector's single magika::Session. Unset leaves ONNX
-                                      # Runtime's own default: measured ~6 threads and ~3.5 ms per
-                                      # detection on a 10-core host. Lower it only when detection
-                                      # must not contend with other CPU-bound work, and note the
-                                      # latency cost: ~5.6 ms at 2, ~9.3 ms at 1. There is no
-                                      # session-count setting: magika::Session needs &mut self per
-                                      # inference and each session brings its own thread pool and
-                                      # model copy, so detection is serialized through one session
-                                      # and tuned here.
+gears:
+  file-parser:
+    config:
+      max_file_size_mb: 100              # optional; default 100 MB
+      max_image_size_mb: 50              # optional; largest image read. Default 50 MB, or max_file_size_mb if smaller.
+      allowed_local_base_dir: /data/uploads   # required; gear fails to start if absent
+      detection_confidence_threshold: 0.90  # optional; default 0.90. Minimum detector confidence, in
+                                          # [0.0, 1.0], at which content detection may override the
+                                          # caller's filename / Content-Type hint. Below it the hint
+                                          # wins. Configurable because ADR-0001 records 0.90 as an
+                                          # initial value rather than a tuned one; the gear fails to
+                                          # start on a value outside [0.0, 1.0] instead of clamping.
+                                          # Only has effect when a detector is registered.
+      magika_intra_op_threads: 2         # optional; leave unset (recommended). Only used with the
+                                          # `magika` feature — ONNX Runtime intra-op thread count for
+                                          # the detector's single magika::Session. Unset leaves ONNX
+                                          # Runtime's own default: measured ~6 threads and ~3.5 ms per
+                                          # detection on a 10-core host. Lower it only when detection
+                                          # must not contend with other CPU-bound work, and note the
+                                          # latency cost: ~5.6 ms at 2, ~9.3 ms at 1. There is no
+                                          # session-count setting: magika::Session needs &mut self per
+                                          # inference and each session brings its own thread pool and
+                                          # model copy, so detection is serialized through one session
+                                          # and tuned here.
+      limits:                        # optional; every key optional, defaults as listed under Parse limits
+        max_pdf_pages: 2000
+        pdf_timeout: 60s             # humantime; from 1s to 1h
+        # ... any ParseLimits field: max_zip_entries, max_entry_bytes,
+        # max_total_uncompressed_bytes, max_compression_ratio, ratio_check_floor_bytes,
+        # max_nesting_depth, max_table_cells, max_table_columns, max_sheets,
+        # max_html_nodes, max_pdf_chars_per_page, max_text_bytes
+      pdf:
+        max_queued: 64               # optional; 1..=4096. PDFs that may wait for the engine; more get 429.
+        check_on_startup: true       # optional; bind libpdfium during init (a failure only warns)
+      parse_route_timeout: 5m        # optional; humantime, from 1s to 4h. Default: twice pdf_timeout plus 12 s.
 ```
+
+The gear validates the configuration at startup and refuses to start on a count of 0, `max_entry_bytes` above `max_total_uncompressed_bytes`, a `pdf_timeout` outside 1 s to 1 h, a `parse_route_timeout` outside 1 s to 4 h, or `pdf.max_queued` outside 1 to 4096. The engine queue is process-wide; its size is fixed when the engine starts. An explicit `max_image_size_mb` may not exceed `max_file_size_mb`, which applies first.
+
+The parse routes declare their own request deadline, `parse_route_timeout`. By default it is twice `pdf_timeout` plus 12 s (132 s with the defaults), so a PDF that waits for the engine and then reads is not cut off by the gateway's default request timeout. It replaces the gateway's default for these routes even when that default is longer, so a deployment that raised the default (for large uploads over slow links, say) sets `parse_route_timeout` as well; the deadline also covers reading the upload. The gateway's `defaults.max_request_timeout`, when set, caps it.
 
 ### Error Mapping
 

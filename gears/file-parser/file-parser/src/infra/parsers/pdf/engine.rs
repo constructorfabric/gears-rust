@@ -5,7 +5,7 @@
 //! documents (`pdfium-render`'s `thread_safe` feature only serialises single
 //! calls, and pdfium's last-error code is process-global), so every pdfium
 //! call runs on one thread, the engine's [`Worker`], which owns the binding.
-//! Documents queue for it (at most [`MAX_QUEUED`]) and their callers wait
+//! Documents queue for it (at most [`queue_capacity`]) and their callers wait
 //! asynchronously. Characters are read one by one with their geometry;
 //! pdfium's own page text (`FPDFText_GetText`) is not used, as it clips to the
 //! rotated page box.
@@ -19,9 +19,8 @@
 //! thread is never joined, so it does not hold up shutdown.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use pdfium_render::prelude::{
@@ -46,13 +45,51 @@ const MIN_GLYPH_SIZE: f32 = 1.0;
 /// How many characters are read between deadline checks.
 const DEADLINE_STRIDE: usize = 4096;
 
-/// Documents allowed to wait for the engine while it reads another one.
-/// Each queued document holds its bytes in memory; a full queue answers busy.
-pub(super) const MAX_QUEUED: usize = 64;
+/// Documents allowed to wait for the engine while it reads another one,
+/// unless [`configure_queue`] set another number. Each queued document holds
+/// its bytes in memory; a full queue answers busy.
+pub const DEFAULT_MAX_QUEUED: usize = 64;
+
+/// The queue size set at startup (`pdf.max_queued`).
+static QUEUE_CAPACITY: OnceLock<usize> = OnceLock::new();
+
+/// Sets the queue size before the engine starts. The engine is process-wide
+/// and keeps the size it started with, so a second, different value is
+/// refused (and logged) rather than applied halfway.
+pub fn configure_queue(capacity: usize) {
+    agree_capacity(&QUEUE_CAPACITY, capacity);
+}
+
+/// Sets `cell` to `capacity` unless it already holds a value; returns the
+/// value kept, warning when it differs.
+fn agree_capacity(cell: &OnceLock<usize>, capacity: usize) -> usize {
+    let current = *cell.get_or_init(|| capacity);
+    if current != capacity {
+        tracing::warn!(
+            requested = capacity,
+            current,
+            "PDF engine queue size is already set for this process; keeping it"
+        );
+    }
+    current
+}
+
+/// How many documents may wait for the engine. The first read fixes the
+/// value: an engine started without [`configure_queue`] keeps the default.
+pub(super) fn queue_capacity() -> usize {
+    *QUEUE_CAPACITY.get_or_init(|| DEFAULT_MAX_QUEUED)
+}
 
 /// How long past [`ParseLimits::pdf_timeout`] a caller waits for a document
 /// the engine is reading before it gives up on it.
 const RUN_GRACE: Duration = Duration::from_secs(2);
+
+/// The longest a caller waits for the engine with `pdf_timeout`: up to
+/// `pdf_timeout` for its turn, then `pdf_timeout` plus [`RUN_GRACE`] for the
+/// document.
+pub fn longest_wait(pdf_timeout: Duration) -> Duration {
+    pdf_timeout.saturating_mul(2).saturating_add(RUN_GRACE)
+}
 
 /// How long the startup check waits for the engine.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -85,7 +122,8 @@ struct Ticket {
 static ENGINE: Mutex<Option<Worker<Ticket>>> = Mutex::new(None);
 
 /// The document the engine is reading: when it started and how long its
-/// caller waits for it. Written only by the engine thread.
+/// caller waits for it. Set and cleared by the engine thread; callers only
+/// mark an overrun as reported.
 static RUNNING: Mutex<Option<Running>> = Mutex::new(None);
 
 #[derive(Clone, Copy)]
@@ -106,23 +144,15 @@ impl Running {
 }
 
 fn running() -> std::sync::MutexGuard<'static, Option<Running>> {
-    // Every critical section is one read or assignment.
+    // Every critical section is a read, an assignment or a flag update.
     RUNNING.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Warns, the first time a PDF is refused while a document holds the engine
 /// past its caller's patience, that this is the cause rather than load.
 fn warn_if_stuck() {
-    let overrun = {
-        let mut running = running();
-        let Some(current) = running.as_mut().filter(|r| !r.reported) else {
-            return;
-        };
-        let Some(overrun) = current.overrun() else {
-            return;
-        };
-        current.reported = true;
-        overrun
+    let Some(overrun) = first_report(&mut running()) else {
+        return;
     };
     tracing::warn!(
         ?overrun,
@@ -131,9 +161,52 @@ fn warn_if_stuck() {
     );
 }
 
-/// Set when the queue refused a document, cleared when it takes one again:
-/// a full queue is logged once, not once per refused request.
-static QUEUE_FULL: AtomicBool = AtomicBool::new(false);
+/// The overrun of the running document, the first time it is asked for;
+/// `None` before it overruns and after it was reported.
+fn first_report(running: &mut Option<Running>) -> Option<Duration> {
+    let current = running.as_mut().filter(|r| !r.reported)?;
+    let overrun = current.overrun()?;
+    current.reported = true;
+    Some(overrun)
+}
+
+/// How often a full queue is logged at most; the line carries the number of
+/// documents refused since the last one.
+const FULL_LOG_EVERY: Duration = Duration::from_mins(1);
+
+/// Counts one refusal in `log` (last report, refusals since); returns the
+/// count to report when the last report is older than [`FULL_LOG_EVERY`].
+fn count_refusal(log: &mut (Option<Instant>, u64), now: Instant) -> Option<u64> {
+    log.1 += 1;
+    if log
+        .0
+        .is_some_and(|at| now.saturating_duration_since(at) < FULL_LOG_EVERY)
+    {
+        return None;
+    }
+    log.0 = Some(now);
+    Some(std::mem::take(&mut log.1))
+}
+
+/// When a full queue was last logged, and refusals since.
+static FULL_LOG: Mutex<(Option<Instant>, u64)> = Mutex::new((None, 0));
+
+/// Counts a refusal for a full queue and logs it, at most once a minute.
+fn note_queue_full() {
+    let refused = {
+        // Every critical section is a few assignments.
+        let mut log = FULL_LOG.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(refused) = count_refusal(&mut log, Instant::now()) else {
+            return;
+        };
+        refused
+    };
+    tracing::warn!(
+        refused,
+        queued = queue_capacity(),
+        "PDF refused: the engine queue is full (refusals since the last report)"
+    );
+}
 
 enum Binding {
     Bound(&'static Pdfium),
@@ -276,10 +349,24 @@ where
     T: Send + 'static,
     F: FnOnce(&Engine<'_>) -> Result<T, DomainError> + Send + 'static,
 {
+    run_waiting(limits, limits.pdf_timeout, work).await
+}
+
+/// [`run`], waiting up to `turn_wait` for the engine to take the document.
+// cancel-safe: as `run`.
+async fn run_waiting<T, F>(
+    limits: &ParseLimits,
+    turn_wait: Duration,
+    work: F,
+) -> Result<T, DomainError>
+where
+    T: Send + 'static,
+    F: FnOnce(&Engine<'_>) -> Result<T, DomainError> + Send + 'static,
+{
     let pdf_timeout = limits.pdf_timeout;
     let (ready_tx, ready_rx) = oneshot::channel();
     submit(Ticket { ready: ready_tx })?;
-    let job_tx = match timeout(pdf_timeout, ready_rx).await {
+    let job_tx = match timeout(turn_wait, ready_rx).await {
         Ok(Ok(job_tx)) => job_tx,
         // The ticket was dropped unanswered: the engine thread stopped.
         Ok(Err(_)) => return Err(engine_error("the PDF engine dropped the document")),
@@ -366,20 +453,12 @@ fn submit(ticket: Ticket) -> Result<(), DomainError> {
         }
         submitted
     };
-    // Logged outside the lock, once per full spell.
+    // Logged outside the engine lock.
     match submitted {
-        Ok(()) => {
-            QUEUE_FULL.store(false, Ordering::Relaxed);
-            Ok(())
-        }
+        Ok(()) => Ok(()),
         Err(Submit::Full) => {
             warn_if_stuck();
-            if !QUEUE_FULL.swap(true, Ordering::Relaxed) {
-                tracing::warn!(
-                    queued = MAX_QUEUED,
-                    "PDF refused: the engine queue is full; logged again once it has room"
-                );
-            }
+            note_queue_full();
             Err(DomainError::busy("the PDF engine is busy; try again later"))
         }
         Err(Submit::Gone) => Err(engine_error("the PDF engine had stopped")),
@@ -388,7 +467,7 @@ fn submit(ticket: Ticket) -> Result<(), DomainError> {
 
 fn start_engine() -> std::io::Result<Worker<Ticket>> {
     let mut state: Option<Binding> = None;
-    Worker::spawn("pdfium", MAX_QUEUED, move |ticket: Ticket| {
+    Worker::spawn("pdfium", queue_capacity(), move |ticket: Ticket| {
         let (job_tx, job_rx) = sync_channel(1);
         // A caller that gave up while queued has dropped its receiver; one
         // that goes away before sending the job drops `job_tx`.
@@ -671,14 +750,13 @@ impl FontCache {
     fn style(&mut self, c: &PdfPageTextChar<'_>) -> (bool, bool) {
         let name = c.font_name();
         if name != self.name {
-            // Standard fonts report no weight, so the name decides first.
             let base = name.split_once('+').map_or(name.as_str(), |(_, b)| b);
             let lower = base.to_ascii_lowercase();
-            let bold = ["bold", "black", "heavy", "semibold", "demi"]
-                .iter()
-                .any(|w| lower.contains(w))
-                || c.font_is_bold_reenforced()
-                || c.font_weight().is_some_and(is_heavy);
+            // pdfium reports weight 0 for a font without a stem width (the
+            // standard fonts); only then does the name decide.
+            let weight = c.font_weight().filter(|w| *w != PdfFontWeight::Custom(0));
+            let bold =
+                c.font_is_bold_reenforced() || weight.map_or_else(|| bold_by_name(base), is_heavy);
             let italic =
                 lower.contains("italic") || lower.contains("oblique") || c.font_is_italic();
             self.style = (bold, italic);
@@ -686,6 +764,92 @@ impl FontCache {
         }
         self.style
     }
+}
+
+/// Weights that make a font bold.
+const BOLD_WEIGHTS: [&str; 4] = ["bold", "black", "heavy", "demi"];
+
+/// What may come before a weight in the same word (`SemiBold`, `Extrabold`).
+const WEIGHT_MODIFIERS: [&str; 5] = ["semi", "demi", "extra", "ultra", "super"];
+
+/// What may follow a weight in the same word (`BoldItalicMT`, `BoldIt`).
+const STYLE_SUFFIXES: [&str; 7] = ["italic", "oblique", "ital", "obl", "it", "mt", "ps"];
+
+/// Whether font name `base` names a bold weight. The name is split into words
+/// at punctuation, spaces and case changes; a word counts when it is a weight,
+/// optionally after a modifier and before style suffixes (`Bold`,
+/// `Semibolditalic`). A word all in one case may also end that way, as in
+/// `ARIALBOLDITALIC`. A weight as the first word counts only when every word
+/// after it is a weight or style too, so `BlackChancery` is a family name.
+fn bold_by_name(base: &str) -> bool {
+    let words = name_words(base);
+    words.iter().enumerate().any(|(i, word)| {
+        let lower = word.to_ascii_lowercase();
+        let one_case =
+            !word.chars().any(char::is_lowercase) || !word.chars().any(char::is_uppercase);
+        if !weight_word(&lower, one_case) {
+            return false;
+        }
+        i > 0
+            || words[1..].iter().all(|w| {
+                let w = w.to_ascii_lowercase();
+                styles_only(&w) || weight_word(&w, false)
+            })
+    })
+}
+
+/// Splits a font name into words at non-alphanumeric characters, before an
+/// upper-case letter that follows a lower-case one (`ArialBlack`), and before
+/// the last capital of a run followed by a lower-case letter (`PSBold`).
+fn name_words(name: &str) -> Vec<&str> {
+    let chars: Vec<(usize, char)> = name.char_indices().collect();
+    let mut words = Vec::new();
+    let mut start = None;
+    for (i, &(at, c)) in chars.iter().enumerate() {
+        if !c.is_alphanumeric() {
+            if let Some(from) = start.take() {
+                words.push(&name[from..at]);
+            }
+            continue;
+        }
+        let prev = i.checked_sub(1).map(|p| chars[p].1);
+        let next = chars.get(i + 1).map(|n| n.1);
+        let boundary = c.is_uppercase()
+            && (prev.is_some_and(char::is_lowercase)
+                || (prev.is_some_and(char::is_uppercase) && next.is_some_and(char::is_lowercase)));
+        match start {
+            Some(from) if boundary => {
+                words.push(&name[from..at]);
+                start = Some(at);
+            }
+            Some(_) => {}
+            None => start = Some(at),
+        }
+    }
+    if let Some(from) = start {
+        words.push(&name[from..]);
+    }
+    words
+}
+
+/// Whether lower-case `word` is a weight, optionally after a modifier and
+/// before style suffixes; with `anywhere`, whatever may come before it.
+fn weight_word(word: &str, anywhere: bool) -> bool {
+    BOLD_WEIGHTS.iter().any(|weight| {
+        word.match_indices(weight).any(|(at, _)| {
+            let before = &word[..at];
+            styles_only(&word[at + weight.len()..])
+                && (anywhere || before.is_empty() || WEIGHT_MODIFIERS.contains(&before))
+        })
+    })
+}
+
+/// Whether lower-case `rest` is made of style suffixes only (or is empty).
+fn styles_only(rest: &str) -> bool {
+    rest.is_empty()
+        || STYLE_SUFFIXES
+            .iter()
+            .any(|s| rest.strip_prefix(s).is_some_and(styles_only))
 }
 
 fn is_heavy(weight: PdfFontWeight) -> bool {
@@ -914,7 +1078,112 @@ mod tests {
     use std::path::Path;
     use std::time::SystemTime;
 
+    use super::super::tests::{block_on, engine_alone, engine_shared, pdf};
     use super::*;
+
+    #[test]
+    fn bold_is_read_from_weight_words_of_the_font_name() {
+        for (name, bold) in [
+            ("Helvetica-Bold", true),
+            ("BoldItalic", true),
+            ("Bold-Oblique", true),
+            ("Arial-BoldMT", true),
+            ("TimesNewRomanPS-BoldItalicMT", true),
+            ("TimesNewRomanPSBold", true),
+            ("Arial,Bold", true),
+            ("Arial (Bold)", true),
+            ("ARIALBOLDITALIC", true),
+            ("arialbold", true),
+            ("OpenSans-Semibolditalic", true),
+            ("MyriadPro-Semibold", true),
+            ("NotoSans-SemiBold", true),
+            ("Futura-DemiBold", true),
+            ("AvenirNext-Demi", true),
+            ("Demibold", true),
+            ("ExtraBold", true),
+            ("HelveticaNeue-ExtraBold", true),
+            ("HelveticaNeue-Heavy", true),
+            ("Roboto_Heavy", true),
+            ("Montserrat-Black", true),
+            ("Arial Black", true),
+            ("ArialBlack", true),
+            ("Helvetica-BOLD", true),
+            ("Academic", false),
+            ("Academy", false),
+            ("AcademicSans-Regular", false),
+            ("Blackletter", false),
+            ("BlackadderITC-Regular", false),
+            ("BlackChancery", false),
+            ("Blackoak", false),
+            ("Heavyweight", false),
+            ("Shoeblack", false),
+            ("Boldini", false),
+            ("TimesNewRomanPSMT", false),
+            ("Calibri-Light", false),
+            ("Helvetica", false),
+            ("Garamond-Italic", false),
+            ("", false),
+        ] {
+            assert_eq!(bold_by_name(name), bold, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_queue_size_set_first_is_kept() {
+        let cell = OnceLock::new();
+        assert_eq!(agree_capacity(&cell, 8), 8);
+        assert_eq!(agree_capacity(&cell, 8), 8);
+        assert_eq!(agree_capacity(&cell, 16), 8, "a later value is not applied");
+    }
+
+    #[test]
+    fn a_stuck_document_is_reported_once() {
+        let mut running = Some(Running {
+            since: Instant::now(),
+            patience: Duration::from_hours(1),
+            reported: false,
+        });
+        assert_eq!(first_report(&mut running), None, "not overrun yet");
+        if let Some(r) = running.as_mut() {
+            r.patience = Duration::ZERO;
+        }
+        assert!(first_report(&mut running).is_some());
+        assert_eq!(first_report(&mut running), None, "reported already");
+        assert_eq!(first_report(&mut None), None);
+    }
+
+    #[test]
+    fn a_full_queue_is_reported_once_a_minute_with_the_count() {
+        let start = Instant::now();
+        let mut log = (None, 0);
+        assert_eq!(
+            count_refusal(&mut log, start),
+            Some(1),
+            "the first is reported"
+        );
+        assert_eq!(
+            count_refusal(&mut log, start + Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(
+            count_refusal(&mut log, start + Duration::from_secs(30)),
+            None
+        );
+        assert_eq!(
+            count_refusal(&mut log, start + FULL_LOG_EVERY),
+            Some(3),
+            "the refusals since the last report"
+        );
+    }
+
+    #[test]
+    fn callers_wait_twice_the_timeout_plus_the_grace() {
+        assert_eq!(
+            longest_wait(Duration::from_secs(60)),
+            Duration::from_secs(122)
+        );
+        assert_eq!(longest_wait(Duration::MAX), Duration::MAX);
+    }
 
     #[test]
     fn a_failed_bind_is_remembered_until_the_retry_window_ends() {
@@ -975,8 +1244,200 @@ mod tests {
         assert!(!is_stale(None, other, current, Some(old), now));
     }
 
+    /// Runs `hold` on the engine from a thread of its own; returns once it
+    /// has started. The job waits for its turn longer than `limits` says, so
+    /// a short `pdf_timeout` sets only how long its caller waits once it runs.
+    fn hold_engine(
+        limits: ParseLimits,
+        hold: impl FnOnce() + Send + 'static,
+    ) -> std::thread::JoinHandle<Result<(), DomainError>> {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let turn_wait = Duration::from_secs(30);
+            block_on(run_waiting(&limits, turn_wait, move |_engine| {
+                started_tx.send(()).expect("the test waits");
+                hold();
+                Ok(())
+            }))
+        });
+        if started_rx.recv().is_err() {
+            let result = holder.join().expect("holder ends");
+            panic!("the hold job did not run: {result:?}");
+        }
+        holder
+    }
+
+    fn full_log_now() -> (Option<Instant>, u64) {
+        *FULL_LOG.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn running_now() -> Option<Running> {
+        *running()
+    }
+
+    #[test]
+    fn a_full_queue_answers_busy_and_is_logged() {
+        let _engine = engine_alone();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = hold_engine(ParseLimits::default(), move || {
+            release_rx.recv().unwrap_or_default();
+        });
+        let log_before = full_log_now();
+        let mut queued = Vec::new();
+        let refused = loop {
+            let (ready, ready_rx) = oneshot::channel();
+            match submit(Ticket { ready }) {
+                Ok(()) => queued.push(ready_rx),
+                Err(e) => break e,
+            }
+            assert!(queued.len() <= queue_capacity(), "the queue is bounded");
+        };
+        assert_eq!(queued.len(), queue_capacity());
+        assert!(matches!(refused, DomainError::Busy { .. }), "{refused}");
+        // Either logged now or counted toward the next report.
+        assert_ne!(full_log_now(), log_before, "the refusal was counted");
+        assert!(full_log_now().0.is_some(), "a full queue was logged");
+        // Callers that gave up leave tickets the engine skips.
+        drop(queued);
+        drop(release_tx);
+        holder
+            .join()
+            .expect("holder ends")
+            .expect("held document ends");
+        block_on(run(&ParseLimits::default(), |_engine| Ok(()))).expect("the engine is free");
+    }
+
+    #[test]
+    fn a_refusal_during_an_overrun_is_reported_and_the_engine_clears_it() {
+        let _engine = engine_alone();
+        let stuck = ParseLimits {
+            pdf_timeout: Duration::from_millis(50),
+            ..ParseLimits::default()
+        };
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        // Stands in for a pdfium call that cannot be interrupted.
+        let holder = hold_engine(stuck.clone(), move || {
+            release_rx
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_default();
+        });
+        assert!(running_now().is_some(), "set while a document runs");
+        let err = holder
+            .join()
+            .expect("holder ends")
+            .expect_err("its caller gives up");
+        assert!(
+            matches!(
+                err,
+                DomainError::LimitExceeded {
+                    limit: ParseLimit::PdfTimeout,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        let waited = Instant::now();
+        while running_now().is_none_or(|r| r.overrun().is_none()) {
+            assert!(waited.elapsed() < Duration::from_secs(10), "no overrun");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!running_now().is_some_and(|r| r.reported));
+        let refused = block_on(run(&stuck, |_engine| Ok(()))).expect_err("still held");
+        assert!(matches!(refused, DomainError::Busy { .. }), "{refused}");
+        assert!(
+            running_now().is_some_and(|r| r.reported),
+            "the refusal reported the overrun"
+        );
+        drop(release_tx);
+        let waited = Instant::now();
+        while running_now().is_some() {
+            assert!(
+                waited.elapsed() < Duration::from_secs(10),
+                "the engine clears the running document when it returns"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Reads `bytes` on the engine; its caller gives up once `gone` answers
+    /// true when asked with the number of deadline checks so far and the
+    /// pages handed on. Returns the result and the pages handed on.
+    fn read_until(
+        bytes: Vec<u8>,
+        gone: impl Fn(usize, usize) -> bool + Send + 'static,
+    ) -> (Result<(), DomainError>, usize) {
+        block_on(run(&ParseLimits::default(), move |engine| {
+            let pages = Cell::new(0);
+            let checks = Cell::new(0);
+            let abandoned = || {
+                checks.set(checks.get() + 1);
+                gone(checks.get(), pages.get())
+            };
+            let deadline = Deadline::new(Duration::from_hours(1), &abandoned);
+            let result = read_document(
+                engine.pdfium,
+                &bytes,
+                &ParseLimits::default(),
+                &deadline,
+                &mut |_page| {
+                    pages.set(pages.get() + 1);
+                    Ok(())
+                },
+            );
+            Ok((result.map(|_| ()), pages.get()))
+        }))
+        .expect("the engine runs the read")
+    }
+
+    fn assert_given_up(result: &Result<(), DomainError>) {
+        let err = result.as_ref().expect_err("the read stops");
+        assert!(err.to_string().contains("caller stopped waiting"), "{err}");
+    }
+
+    #[test]
+    fn a_caller_giving_up_stops_the_read_between_pages() {
+        let _engine = engine_shared();
+        // The second page has no characters, so only the check between
+        // pages can stop it.
+        let bytes = pdf(&[("BT /F1 12 Tf 72 700 Td (x) Tj ET", ""), ("", "")], None);
+        let (result, pages) = read_until(bytes, |_, pages| pages == 1);
+        assert_given_up(&result);
+        assert_eq!(pages, 1, "the first page was read, the second was not");
+    }
+
+    #[test]
+    fn a_caller_giving_up_stops_the_read_inside_a_long_page() {
+        let _engine = engine_shared();
+        let text = "x".repeat(DEADLINE_STRIDE + 100);
+        let content = format!("BT /F1 1 Tf 0 0 Td ({text}) Tj ET");
+        // Checks: before loading, before the page, at characters 0 and 4096.
+        let (result, pages) = read_until(pdf(&[(content.as_str(), "")], None), |checks, _| {
+            checks == 4
+        });
+        assert_given_up(&result);
+        assert_eq!(pages, 0, "stopped inside the page");
+    }
+
+    #[test]
+    fn a_page_pdfium_cannot_load_reads_as_empty() {
+        let _engine = engine_shared();
+        let mut bytes = pdf(&[("BT /F1 12 Tf 72 700 Td (x) Tj ET", ""), ("", "")], None);
+        // Point the second page at an object the file does not have: same
+        // length, so the cross-reference table still holds.
+        let kids = b"/Kids [5 0 R 7 0 R ]";
+        let at = bytes
+            .windows(kids.len())
+            .position(|w| w == kids)
+            .expect("page tree");
+        bytes[at..at + kids.len()].copy_from_slice(b"/Kids [5 0 R 9 0 R ]");
+        let (result, pages) = read_until(bytes, |_, _| false);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(pages, 2, "the unreadable page still counts");
+    }
+
     #[test]
     fn a_caller_that_never_sends_its_job_does_not_hold_the_engine() {
+        let _engine = engine_shared();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()

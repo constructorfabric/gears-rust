@@ -22,12 +22,15 @@ use crate::infra::parsers::{
 )]
 pub struct FileParserGear {
     service: OnceLock<Arc<FileParserService>>,
+    /// Deadline of the parse routes (`parse_route_timeout`).
+    parse_timeout: OnceLock<std::time::Duration>,
 }
 
 impl Default for FileParserGear {
     fn default() -> Self {
         Self {
             service: OnceLock::new(),
+            parse_timeout: OnceLock::new(),
         }
     }
 }
@@ -187,24 +190,35 @@ pub async fn init_magika_detector(
 impl Gear for FileParserGear {
     #[allow(clippy::cast_possible_truncation)]
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
-        const BYTES_IN_MB: u64 = 1024_u64 * 1024;
-
         // Load gear configuration
         let cfg: FileParserConfig = ctx.config()?;
+        cfg.validate()
+            .map_err(|e| anyhow::anyhow!("invalid file-parser config: {e}"))?;
         debug!(
-            "Loaded file-parser config: max_file_size_mb={}",
-            cfg.max_file_size_mb
+            max_file_size_mb = cfg.max_file_size_mb,
+            limits = ?cfg.limits,
+            pdf = ?cfg.pdf,
+            parse_route_timeout = ?cfg.parse_route_timeout(),
+            "Loaded file-parser config"
         );
 
-        let max_file_size_bytes = cfg.max_file_size_mb.saturating_mul(BYTES_IN_MB);
+        let max_file_size_bytes = cfg.max_file_size_bytes();
 
         // Backends that read a whole local file into memory get the
         // configured ceiling, so their bounded reads agree with the
         // service-level check rather than a compiled-in default. The document
         // parsers share one set of limits.
-        let limits = ParseLimits::default();
+        let limits = ParseLimits::from(&cfg.limits);
+        let parse_timeout = cfg.parse_route_timeout();
+        // Set once; a second init fails below with "already initialized".
+        let _set = self.parse_timeout.set(parse_timeout);
+        crate::infra::parsers::pdf::configure_queue(cfg.pdf.max_queued);
         let parsers: Vec<Arc<dyn crate::domain::parser::FileParserBackend>> = vec![
-            Arc::new(PlainTextParser::new().with_max_bytes(max_file_size_bytes)),
+            Arc::new(
+                PlainTextParser::new()
+                    .with_max_bytes(max_file_size_bytes)
+                    .with_limits(limits.clone()),
+            ),
             Arc::new(
                 SpreadsheetParser::new()
                     .with_max_bytes(max_file_size_bytes)
@@ -230,7 +244,7 @@ impl Gear for FileParserGear {
                     .with_max_bytes(max_file_size_bytes)
                     .with_limits(limits.clone()),
             ),
-            Arc::new(ImageParser::new()),
+            Arc::new(ImageParser::new().with_max_bytes(cfg.max_image_size_bytes())),
             Arc::new(StubParser::new().with_max_bytes(max_file_size_bytes)),
         ];
 
@@ -239,13 +253,17 @@ impl Gear for FileParserGear {
         // Bind libpdfium now, so a broken deployment shows in the startup log
         // rather than as failures on the first PDF. The check can take up to
         // its own timeout; shutdown does not wait for it.
-        tokio::select! {
-            result = crate::infra::parsers::pdf::check_engine() => match result {
-                Ok(()) => debug!("PDF engine ready"),
-                Err(e) => warn!(error = %e, "PDF parsing is unavailable"),
-            },
-            () = ctx.cancellation_token().cancelled() => {
-                return Err(anyhow::anyhow!("file-parser init cancelled during the PDF engine check"));
+        if cfg.pdf.check_on_startup {
+            tokio::select! {
+                result = crate::infra::parsers::pdf::check_engine() => match result {
+                    Ok(()) => debug!("PDF engine ready"),
+                    Err(e) => warn!(error = %e, "PDF parsing is unavailable"),
+                },
+                () = ctx.cancellation_token().cancelled() => {
+                    return Err(anyhow::anyhow!(
+                        "file-parser init cancelled during the PDF engine check"
+                    ));
+                }
             }
         }
 
@@ -352,7 +370,13 @@ impl RestApiCapability for FileParserGear {
             .ok_or_else(|| anyhow::anyhow!("Service not initialized"))?
             .clone();
 
-        let router = crate::api::rest::routes::register_routes(router, openapi, service);
+        let parse_timeout = self
+            .parse_timeout
+            .get()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("Service not initialized"))?;
+        let router =
+            crate::api::rest::routes::register_routes(router, openapi, service, parse_timeout);
 
         info!("File parser REST routes registered successfully");
         Ok(router)

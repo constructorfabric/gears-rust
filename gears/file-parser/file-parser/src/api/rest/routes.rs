@@ -2,6 +2,7 @@ use crate::api::rest::handlers;
 use crate::domain::service::FileParserService;
 use axum::{Extension, Router};
 use std::sync::Arc;
+use std::time::Duration;
 use toolkit::api::{
     OpenApiRegistry, OperationBuilder,
     operation_builder::{CORE_GLOBAL_BASE_LICENSE_FEATURE, LicenseFeature},
@@ -18,10 +19,15 @@ impl AsRef<str> for License {
 impl LicenseFeature for License {}
 
 #[allow(clippy::needless_pass_by_value)] // Arc is intentionally passed by value for Extension layer
+/// `parse_timeout` is the deadline of the parse routes (the gear's
+/// `parse_route_timeout`). It replaces the gateway's default request timeout
+/// for them, also when that is longer: by default it lets a PDF wait for the
+/// engine and then read for up to `pdf_timeout` each.
 pub fn register_routes(
     mut router: Router,
     openapi: &dyn OpenApiRegistry,
     service: Arc<FileParserService>,
+    parse_timeout: Duration,
 ) -> Router {
     // Explicitly register nested schemas that are only transitively referenced
     // These are used within ParsedBlockDto but not directly in any endpoint
@@ -51,6 +57,7 @@ pub fn register_routes(
     // POST /file-parser/v1/parse-local - Parse a file from a local path
     router = OperationBuilder::post("/file-parser/v1/parse-local")
         .operation_id("file_parser.parse_local")
+        .request_timeout(parse_timeout)
         .summary("Parse a file from a local path")
         .tag("File Parser")
         .authenticated()
@@ -76,6 +83,7 @@ pub fn register_routes(
     // POST /file-parser/v1/upload - Upload and parse a file
     router = OperationBuilder::post("/file-parser/v1/upload")
         .operation_id("file_parser.upload")
+        .request_timeout(parse_timeout)
         .summary("Upload and parse a file")
         .tag("File Parser")
         .authenticated()
@@ -106,6 +114,7 @@ pub fn register_routes(
     // POST /file-parser/v1/parse-local/markdown - Parse a local file and stream Markdown
     router = OperationBuilder::post("/file-parser/v1/parse-local/markdown")
         .operation_id("file_parser.parse_local_markdown")
+        .request_timeout(parse_timeout)
         .summary("Parse a local file and stream Markdown")
         .tag("File Parser")
         .authenticated()
@@ -120,6 +129,7 @@ pub fn register_routes(
     // POST /file-parser/v1/upload/markdown - Upload and parse a file, streaming Markdown
     router = OperationBuilder::post("/file-parser/v1/upload/markdown")
         .operation_id("file_parser.upload_markdown")
+        .request_timeout(parse_timeout)
         .summary("Upload and parse a file, streaming Markdown")
         .tag("File Parser")
         .authenticated()

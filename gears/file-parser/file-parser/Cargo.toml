@@ -96,6 +96,10 @@ toolkit = { workspace = true }
 toolkit-canonical-errors = { workspace = true, features = ["axum"] }
 toolkit-security = { workspace = true }
 toolkit-macros = { workspace = true }
+toolkit-utils = { workspace = true, features = ["humantime-serde"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
 
 [build-dependencies]
 flate2 = { workspace = true }

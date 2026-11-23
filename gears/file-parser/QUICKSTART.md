@@ -27,7 +27,13 @@ gears:
     config:
       max_file_size_mb: 100
       allowed_local_base_dir: /data/documents
+      # Optional: tighter limits for untrusted uploads.
+      limits:
+        max_pdf_pages: 500
+        pdf_timeout: 30s
 ```
+
+Every key under `limits` is optional; the defaults and the full list are in the crate README.
 
 Only files under this directory (after symlink resolution) are accessible via the `parse-local` endpoints. Paths containing `..` are always rejected regardless of where they point.
 

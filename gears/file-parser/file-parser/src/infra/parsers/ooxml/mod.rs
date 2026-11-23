@@ -466,7 +466,8 @@ fn check_ratio(
     compressed: u64,
     limits: &ParseLimits,
 ) -> Result<(), DomainError> {
-    if declared < limits.ratio_check_floor_bytes {
+    // An empty part inflates nothing, whatever the floor.
+    if declared == 0 || declared < limits.ratio_check_floor_bytes {
         return Ok(());
     }
     // No compressor turns zero bytes into data; an entry claiming so is forged.
@@ -773,6 +774,17 @@ mod tests {
             .expect("must fail");
         assert!(err.to_string().contains("max_zip_entries"), "{err}");
         assert!(too_many_headers(&b"PK\x01\x02".repeat(3), 3).is_none());
+    }
+
+    #[test]
+    fn an_empty_part_passes_the_ratio_check_at_any_floor() {
+        let bytes = test_zip::build_with(&[("empty.xml", b"")], CompressionMethod::Stored);
+        let limits = ParseLimits {
+            ratio_check_floor_bytes: 0,
+            ..limits()
+        };
+        let mut archive = Archive::open(bytes, "DOCX", &limits).unwrap();
+        assert_eq!(archive.read("empty.xml").unwrap(), Some(Vec::new()));
     }
 
     #[test]

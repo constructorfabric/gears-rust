@@ -161,8 +161,14 @@ Currently registered plugins (in priority order):
 - No OCR: image-only (scanned) PDFs produce no text. Invisible OCR text layers in a PDF are read.
 - PDF structure (headings, lists, paragraphs, reading order of columns) is inferred from glyph size and position and can be wrong.
 - Tables are not reconstructed from PDFs; their text comes out as lines.
-- DOCX and PPTX notes and comments, and DOCX headers and footers, are not extracted.
-- PDF parsing is serialised through one in-process engine. `pdf_timeout` (default 60 s) is checked between pdfium calls, so one hostile PDF can hold the engine longer; at most 64 PDFs wait, and further ones are rejected as busy.
+- PDF superscripts (footnote markers, exponents) split their paragraph: the raised text becomes a paragraph of its own between the two halves.
+- PDF running headers and footers are only recognised on upright text; on pages whose text is drawn rotated they are kept on every page.
+- PDF text tilted about 3-10° from the rest of its page (a stamp, say) may break into fragments that mix with the lines around it.
+- PPTX SmartArt text comes out in the order of the diagram's data part, which can differ from the order the diagram shows it in.
+- Hidden and very hidden spreadsheet sheets are extracted; their heading marks them `(hidden)` or `(very hidden)`.
+- `.md`, `.log` and `.txt` files come out as verbatim code blocks of up to about 16 KiB each: Markdown syntax in a `.md` file shows as source, not as formatting.
+- DOCX and PPTX notes and comments, DOCX headers and footers, and PPTX footer, date and slide-number placeholders are not extracted.
+- PDF parsing is serialised through one in-process engine. `pdf_timeout` (default 60 s) is checked between pdfium calls, so one hostile PDF can hold the engine longer; at most `pdf.max_queued` PDFs (default 64) wait, and further ones are rejected as busy.
 - musl targets get no bundled libpdfium; PDF parsing there needs `FILE_PARSER_PDFIUM_RUNTIME_LIB`.
 
 **Actors**: `fdd-file-parser-actor-api-user`
@@ -272,7 +278,7 @@ Consumer gear requests parsing of a file already present on the server filesyste
 | Criterion | Condition |
 |---|---|
 | Supported formats parsed | PDF, HTML, XLSX, PPTX, DOCX upload returns non-empty structured blocks |
-| Plain text parsed | TXT/MD upload returns non-empty paragraph blocks |
+| Plain text parsed | TXT/MD upload returns its text verbatim in code blocks |
 | Image parsed | PNG/JPG upload returns a document with an `Image` block or base64 content |
 | Markdown rendering | Upload-markdown endpoint returns valid Markdown preserving headings and tables |
 | Path traversal rejection | Requests with `..` components return HTTP 403 |
@@ -303,7 +309,7 @@ Consumer gear requests parsing of a file already present on the server filesyste
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| One hostile PDF holds the single in-process PDF engine past `pdf_timeout` (a pdfium call cannot be interrupted) | Low | Medium | Deadline checked between pdfium calls; at most 64 PDFs wait and further ones are rejected as busy, so the blocking thread pool is not exhausted. Running pdfium in a separate process would bound it fully (follow-up). |
+| One hostile PDF holds the single in-process PDF engine past `pdf_timeout` (a pdfium call cannot be interrupted) | Low | Medium | Deadline checked between pdfium calls; at most `pdf.max_queued` PDFs (default 64) wait and further ones are rejected as busy, so the blocking thread pool is not exhausted. Running pdfium in a separate process would bound it fully (follow-up). |
 | Bundled libpdfium lags security patches | Low | Medium | Track pdfium-binaries releases. To bump: change `PDFIUM_BUILD` and the digest table in `build.rs`, the `pdfium-render` `pdfium_NNNN` feature, and regenerate the e2e goldens with `testing/e2e/suites/file_parser/generate_file_parser_golden.py` in the same commit |
 | PDF structure heuristics misread a layout (headings, columns, lists) | Medium | Low | Rules are few and each has a test; e2e goldens catch regressions |
 | Image-only PDFs yield no text (no OCR) | Medium | Medium | Out of scope for this version; OCR text layers already in the PDF are read |

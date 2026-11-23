@@ -40,7 +40,26 @@ gears:
       # Required. Only files under this directory are accessible via parse-local.
       # Symlinks that resolve outside this directory are also blocked.
       allowed_local_base_dir: /data/documents
+      max_image_size_mb: 50          # largest image read; default 50, at most max_file_size_mb
+      # Parse limits (below); every key is optional and defaults as in the table.
+      limits:
+        max_pdf_pages: 2000
+        pdf_timeout: 60s             # humantime, from 1s to 1h
+      pdf:
+        max_queued: 64               # PDFs that may wait for the engine; more get 429
+        check_on_startup: true       # bind libpdfium during init; a failure only warns
+      parse_route_timeout: 5m        # humantime, from 1s to 4h; default twice pdf_timeout plus 12s
 ```
+
+The gear refuses to start on an invalid value (a count of 0, `max_entry_bytes`
+above `max_total_uncompressed_bytes`, `pdf_timeout` outside 1 s to 1 h,
+`parse_route_timeout` outside 1 s to 4 h, `pdf.max_queued` outside 1 to 4096,
+an explicit `max_image_size_mb` above `max_file_size_mb`). The parse routes
+declare their own request deadline, `parse_route_timeout`: by default twice
+`pdf_timeout` plus 12 s (132 s), so the gateway's default request timeout does
+not cut a PDF short. It replaces the gateway's default even when that is
+longer, so raise it too when you raise the gateway's;
+`defaults.max_request_timeout` caps it.
 
 ### Security: Local Path Restrictions
 
@@ -53,10 +72,11 @@ The `parse-local` endpoints validate requested file paths before any filesystem 
 ### Parse limits
 
 Every document is untrusted input. The spreadsheet, HTML, PPTX, PDF and DOCX
-parsers check the limits in `ParseLimits` (`infra::parsers::limits`) and fail
-with an error that names the limit. The gear uses the defaults; they are not
-read from the gear configuration. Code that builds the parsers itself can pass
-other values with `with_limits`. `ParseLimits` is `#[non_exhaustive]`: start
+parsers check the limits in `ParseLimits` (`infra::parsers::limits`), and the
+plain-text parser its `max_text_bytes`; a document over a limit fails with an
+error that names the limit. The gear reads them from `limits` in its
+configuration; a key left out keeps the default below. Code that builds the
+parsers itself can pass other values with `with_limits`. `ParseLimits` is `#[non_exhaustive]`: start
 from `ParseLimits::default()` and change fields.
 
 | Field | Default | Bounds |
@@ -77,14 +97,16 @@ from `ParseLimits::default()` and change fields.
 | `max_text_bytes` | 100 MiB | Text extracted from one document, plus 64 bytes for each block, inline run and PDF line |
 
 pdfium is not thread-safe across documents, so all PDFs are parsed on one
-dedicated thread, one at a time. At most 64 documents wait for it; further
+dedicated thread, one at a time. At most `pdf.max_queued` (64) wait for it; further
 ones, and documents that wait longer than `pdf_timeout`, are rejected as busy
 (429 with `Retry-After`). Callers wait asynchronously, so a queued document
 holds no thread. `pdf_timeout` is checked between pdfium calls. A single
 pdfium call cannot be interrupted, so a hostile PDF can keep the engine busy
-past the timeout. A caller still gets an answer within `pdf_timeout` of
-waiting plus `pdf_timeout` and 2 s of reading, and the thread is never joined,
-so it does not delay shutdown.
+past the timeout. The engine's part of the answer still comes within
+`pdf_timeout` of waiting plus `pdf_timeout` and 2 s of reading; arranging the
+lines into blocks then runs on the blocking pool, bounded by the page,
+character and text limits. The thread is never joined, so it does not delay
+shutdown.
 
 ## License
 

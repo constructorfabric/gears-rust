@@ -15,7 +15,7 @@ mod structure;
 mod tests;
 mod worker;
 
-pub(crate) use engine::check_engine;
+pub(crate) use engine::{DEFAULT_MAX_QUEUED, check_engine, configure_queue, longest_wait};
 
 use bytes::Bytes;
 
