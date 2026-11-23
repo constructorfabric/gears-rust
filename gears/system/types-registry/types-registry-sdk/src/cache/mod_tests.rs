@@ -11,18 +11,19 @@ use super::{CacheSettings, CachedPlatformTypesRegistry};
 use crate::contract::PlatformTypesRegistryApi;
 use crate::item_failure::AdmissionFailureReason;
 use crate::models::{
-    BatchGetEntitiesRequest, BatchGetEntitiesResponse, BatchGetItem, Condition,
-    DeleteEntitiesRequest, DeletionOperation, EntityField, EntityKey, EntityLookup, FieldSelection,
+    BatchGetEntitiesRequest, BatchGetEntitiesResponse, BatchGetItem, DeleteEntitiesRequest,
+    DeletionOperation, EntityField, EntityIdentity, EntityKey, EntityLookup, FieldSelection,
     IdempotencyKey, ListEntitiesRequest, ListEntitiesResponse, Operation, OperationStatus,
     Projection, PublisherContext, RegisterEntitiesRequest, RegisterItem, RegistrationOperation,
     Validator,
 };
-use crate::models::{DeleteItem, RegistrationOutcome};
+use crate::models::{DeleteItem, EntityKind, Provenance, RegistrationOutcome};
 use crate::testing_platform::{Call, Fault, MockTypesRegistry, Seed};
 
 const TYPE: &str = "gts.cf.cache.client.entity.v1~";
 const OTHER: &str = "gts.cf.cache.client.other.v1~";
 const THIRD: &str = "gts.cf.cache.client.third.v1~";
+const UNREGISTERED: &str = "gts.cf.cache.client.unregistered.v1~";
 const WINDOW: Duration = Duration::from_secs(30);
 
 fn ctx() -> PlatformSecurityContext {
@@ -52,8 +53,7 @@ fn schema(id: &str, title: &str) -> serde_json::Value {
 
 /// A read of `key` conditional on `etag`, held for every field.
 fn conditioned(key: EntityKey, etag: Validator) -> BatchGetItem {
-    let condition = Condition::new(&key, etag, FieldSelection::full());
-    BatchGetItem::new(key).with_if_none_match(condition)
+    BatchGetItem::for_cache_read(key, Some(etag), &FieldSelection::full())
 }
 
 fn full() -> Projection {
@@ -83,11 +83,24 @@ type Batch = Vec<(BatchGetItem, Answer)>;
 /// Rewrites the next registry answer before the cache sees it.
 type Tamper = Box<dyn FnOnce(&mut BatchGetEntitiesResponse) + Send>;
 
+/// Rewrites the next registry resolution before the cache sees it.
+type ResolutionTamper = Box<dyn FnOnce(&mut Resolutions) + Send>;
+
+type Resolutions = std::collections::HashMap<EntityKey, Option<EntityIdentity>>;
+
+/// Rewrites the next discovery page before the cache sees it.
+type ListTamper = Box<dyn FnOnce(&mut ListEntitiesResponse) + Send>;
+
 struct Recorder {
     registry: Arc<MockTypesRegistry>,
     batches: Mutex<Vec<Batch>>,
     tamper: Mutex<Option<Tamper>>,
-    /// Holds the next batch read's answer, already read from the registry, until released.
+    /// The keys of each batch resolution sent, in order.
+    resolutions: Mutex<Vec<Vec<EntityKey>>>,
+    resolution_tamper: Mutex<Option<ResolutionTamper>>,
+    list_tamper: Mutex<Option<ListTamper>>,
+    /// Holds the next batch read's or resolution's answer, already read from the
+    /// registry, until released.
     gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
@@ -100,6 +113,18 @@ impl Recorder {
         self.batches.lock().expect("lock").len()
     }
 
+    fn resolutions(&self) -> Vec<Vec<EntityKey>> {
+        self.resolutions.lock().expect("lock").clone()
+    }
+
+    fn resolution_count(&self) -> usize {
+        self.resolutions.lock().expect("lock").len()
+    }
+
+    fn tamper_next_resolution(&self, tamper: impl FnOnce(&mut Resolutions) + Send + 'static) {
+        *self.resolution_tamper.lock().expect("lock") = Some(Box::new(tamper));
+    }
+
     /// The next batch read reads the registry, then waits for the returned sender.
     fn hold_next(&self) -> tokio::sync::oneshot::Sender<()> {
         let (release, gate) = tokio::sync::oneshot::channel();
@@ -109,6 +134,10 @@ impl Recorder {
 
     fn tamper_next(&self, tamper: impl FnOnce(&mut BatchGetEntitiesResponse) + Send + 'static) {
         *self.tamper.lock().expect("lock") = Some(Box::new(tamper));
+    }
+
+    fn tamper_next_page(&self, tamper: impl FnOnce(&mut ListEntitiesResponse) + Send + 'static) {
+        *self.list_tamper.lock().expect("lock") = Some(Box::new(tamper));
     }
 }
 
@@ -148,7 +177,11 @@ impl PlatformTypesRegistryApi for Recorder {
         ctx: &PlatformSecurityContext,
         request: ListEntitiesRequest,
     ) -> Result<ListEntitiesResponse, CanonicalError> {
-        self.registry.list_entities(ctx, request).await
+        let mut page = self.registry.list_entities(ctx, request).await?;
+        if let Some(tamper) = self.list_tamper.lock().expect("lock").take() {
+            tamper(&mut page);
+        }
+        Ok(page)
     }
 
     async fn register_entities(
@@ -176,6 +209,23 @@ impl PlatformTypesRegistryApi for Recorder {
     ) -> Result<Operation, CanonicalError> {
         self.registry.get_operation(ctx, operation_id).await
     }
+
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &PlatformSecurityContext,
+        keys: Vec<EntityKey>,
+    ) -> Result<Resolutions, CanonicalError> {
+        self.resolutions.lock().expect("lock").push(keys.clone());
+        let mut response = self.registry.batch_resolve_identities(ctx, keys).await?;
+        if let Some(tamper) = self.resolution_tamper.lock().expect("lock").take() {
+            tamper(&mut response);
+        }
+        let gate = self.gate.lock().expect("lock").take();
+        if let Some(gate) = gate {
+            gate.await.expect("released");
+        }
+        Ok(response)
+    }
 }
 
 struct Fixture {
@@ -194,7 +244,7 @@ fn fixture_over(registry: MockTypesRegistry, window: Duration) -> Fixture {
         registry,
         CacheSettings {
             freshness_window: window,
-            store_bound: CacheSettings::DEFAULT_STORE_BOUND,
+            ..CacheSettings::default()
         },
     )
 }
@@ -208,6 +258,9 @@ fn fixture_with(registry: MockTypesRegistry, settings: CacheSettings) -> Fixture
         registry: Arc::clone(&registry),
         batches: Mutex::new(Vec::new()),
         tamper: Mutex::new(None),
+        resolutions: Mutex::new(Vec::new()),
+        resolution_tamper: Mutex::new(None),
+        list_tamper: Mutex::new(None),
         gate: Mutex::new(None),
     });
     let cache = CachedPlatformTypesRegistry::new(
@@ -273,7 +326,7 @@ async fn inside_the_window_a_read_is_cached_and_fresh_bypasses_it() {
     assert_eq!(f.title(gts_key(TYPE), full(), true).await, "v2");
     let fresh = &f.recorder.batches()[1];
     assert!(
-        fresh[0].0.if_none_match.is_some(),
+        fresh[0].0.if_none_match_for(&full()).is_some(),
         "fresh revalidates against the entry's validator"
     );
     assert_eq!(
@@ -318,7 +371,7 @@ async fn an_expired_unchanged_entry_is_kept_and_its_window_restarts() {
 
     assert_eq!(f.title(gts_key(TYPE), full(), false).await, "v1");
     let revalidation = &f.recorder.batches()[1];
-    assert!(revalidation[0].0.if_none_match.is_some());
+    assert!(revalidation[0].0.if_none_match_for(&full()).is_some());
     assert_eq!(
         revalidation[0].1,
         Answer::Unchanged,
@@ -368,7 +421,7 @@ async fn one_conditional_batch_carries_every_expired_key_and_only_those_validato
     let sent = &batches[2];
     let conditional: Vec<_> = sent
         .iter()
-        .filter(|(item, _)| item.if_none_match.is_some())
+        .filter(|(item, _)| item.if_none_match_for(&full()).is_some())
         .map(|(item, _)| item.key.clone())
         .collect();
     assert_eq!(conditional, vec![gts_key(TYPE), gts_key(OTHER)]);
@@ -378,7 +431,8 @@ async fn one_conditional_batch_carries_every_expired_key_and_only_those_validato
     );
     assert!(
         sent.iter()
-            .any(|(item, _)| item.key == gts_key(missing) && item.if_none_match.is_none()),
+            .any(|(item, _)| item.key == gts_key(missing)
+                && item.if_none_match_for(&full()).is_none()),
         "an uncached key is read unconditionally"
     );
     assert_eq!(response.0.len(), 4);
@@ -446,26 +500,178 @@ async fn not_found_is_never_cached() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_discovery_page_and_its_items_are_never_cached() {
+async fn discovery_warms_identities_but_pages_and_snapshots_still_read_the_registry() {
+    use crate::PlatformTypesRegistryApiExt;
+
     let f = fixture(WINDOW);
     let page = f
         .cache
         .list_entities(&ctx(), ListEntitiesRequest::default())
         .await
         .expect("page");
-    assert!(!page.items.is_empty());
+    assert_eq!(page.items.len(), 3);
+    for entity in &page.items {
+        let id = gts::GtsTypeId::try_new(entity.gts_id.as_ref()).expect("type identifier");
+        assert_eq!(
+            f.cache
+                .resolve_type_uuid(&ctx(), &id)
+                .await
+                .expect("forward"),
+            entity.gts_uuid
+        );
+        assert_eq!(
+            f.cache
+                .resolve_type_id(&ctx(), entity.gts_uuid)
+                .await
+                .expect("reverse"),
+            id
+        );
+    }
+    assert_eq!(f.recorder.batch_count(), 0);
     f.cache
         .list_entities(&ctx(), ListEntitiesRequest::default())
         .await
         .expect("page");
     assert_eq!(f.registry.calls(Call::List), 2, "the page is not cached");
 
-    f.lookup(gts_key(TYPE), Projection::Default, false).await;
+    assert_eq!(f.title(gts_key(TYPE), content_only(), false).await, "v1");
     assert_eq!(
         f.recorder.batch_count(),
         1,
         "a page item does not prime exact reads"
     );
+}
+
+#[tokio::test]
+async fn a_conflicting_pair_rejects_the_whole_discovery_page() {
+    let f = fixture(WINDOW);
+    let tail = "7a1d2f34-5678-49ab-9012-abcdef123456";
+    // These two different identifiers carry the same registry reference in the fake.
+    for base in [TYPE, OTHER] {
+        f.registry.seed(&format!("{base}{tail}"), json!({}));
+    }
+    let result = f
+        .cache
+        .list_entities(&ctx(), ListEntitiesRequest::default())
+        .await;
+    let error = result.expect_err("two identifiers for one Registry Reference");
+    assert!(
+        matches!(error, CanonicalError::Internal { .. }),
+        "{error:?}"
+    );
+    assert!(
+        format!("{error:?}").contains("this batch pairs"),
+        "{error:?}"
+    );
+    assert!(f.cache.identity(&gts_key(TYPE)).is_none());
+}
+
+/// An Instance carrying a Type Schema-only field is malformed wherever it arrives: the
+/// discovery page fails, and none of its pairs is learned.
+#[tokio::test]
+async fn a_discovery_item_with_a_field_its_kind_lacks_rejects_the_page() {
+    let f = fixture(WINDOW);
+    let instance = format!("{TYPE}7a1d2f34-5678-49ab-9012-abcdef123456");
+    f.registry.seed(&instance, json!({}));
+    f.recorder.tamper_next_page(move |page| {
+        for item in &mut page.items {
+            if item.kind == EntityKind::Instance {
+                item.provenance = Some(Provenance {
+                    compatibility_check_skipped: false,
+                });
+            }
+        }
+    });
+    let result = f
+        .cache
+        .list_entities(&ctx(), ListEntitiesRequest::default())
+        .await;
+    assert!(
+        matches!(result, Err(CanonicalError::Internal { .. })),
+        "{result:?}"
+    );
+    assert!(f.cache.identity(&gts_key(TYPE)).is_none());
+}
+
+#[tokio::test]
+async fn discovery_checks_both_stores_before_learning_any_pairs() {
+    for (max_size_bytes, max_identity_entries, source) in [
+        (0, 1, "the identity store pairs"),
+        (
+            CacheSettings::DEFAULT_MAX_SIZE_BYTES,
+            0,
+            "a resident snapshot pairs",
+        ),
+    ] {
+        let f = fixture_with(
+            MockTypesRegistry::new(),
+            CacheSettings {
+                max_size_bytes,
+                max_identity_entries,
+                ..CacheSettings::default()
+            },
+        );
+        let snapshot = snapshot_under(&f.registry, ISSUED).await;
+        answer_next(&f, gts_key(TYPE), snapshot);
+        f.lookup(gts_key(TYPE), full(), false).await;
+
+        // The ordinary list returns TYPE with the fake's original UUID instead.
+        let result = f
+            .cache
+            .list_entities(&ctx(), ListEntitiesRequest::default())
+            .await;
+        let error = result.expect_err("TYPE under another Registry Reference");
+        assert!(
+            matches!(error, CanonicalError::Internal { .. }),
+            "{error:?}"
+        );
+        // Names where the known pair is held, and its counterpart there.
+        let error = format!("{error:?}");
+        assert!(error.contains(source), "{error}");
+        assert!(error.contains(&ISSUED.to_string()), "{error}");
+        assert!(f.cache.identity(&gts_key(OTHER)).is_none());
+        let known = f
+            .cache
+            .batch_resolve_identities(&ctx(), vec![gts_key(TYPE)])
+            .await
+            .expect("known");
+        assert_eq!(
+            known[&gts_key(TYPE)].as_ref().expect("found").gts_uuid,
+            ISSUED
+        );
+        assert_eq!(f.recorder.batch_count(), 1);
+    }
+}
+
+#[tokio::test]
+async fn discovery_respects_the_identity_entry_limit_and_page_order() {
+    for bound in [0, 1] {
+        let f = fixture_with(
+            MockTypesRegistry::new(),
+            CacheSettings {
+                max_identity_entries: bound,
+                ..CacheSettings::default()
+            },
+        );
+        let page = f
+            .cache
+            .list_entities(&ctx(), ListEntitiesRequest::new().with_limit(2))
+            .await
+            .expect("page");
+        assert_eq!(page.items.len(), 2);
+        assert!(page.next.is_some());
+        assert!(
+            f.cache
+                .identity(&EntityKey::from(page.items[0].gts_uuid))
+                .is_none()
+        );
+        assert_eq!(
+            f.cache
+                .identity(&EntityKey::from(page.items[1].gts_uuid))
+                .is_some(),
+            bound == 1
+        );
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -539,7 +745,10 @@ async fn one_entry_answers_every_projection_it_covers_and_no_other() {
         "an entry never answers a field it does not hold"
     );
     assert!(
-        f.recorder.batches()[1][0].0.if_none_match.is_none(),
+        f.recorder.batches()[1][0]
+            .0
+            .if_none_match_for(&content_only())
+            .is_none(),
         "nor conditions the read on it"
     );
 
@@ -672,46 +881,30 @@ async fn an_out_of_range_batch_is_refused_even_when_every_key_is_cached() {
         .expect_err("oversized batch");
 }
 
-fn oversized() -> Validator {
+fn long_validator() -> Validator {
     Validator::from_bytes(vec![b'a'; 1025])
 }
 
-/// The request the registry last received carried `item` exactly.
-fn forwarded(f: &Fixture, item: &BatchGetItem) -> bool {
-    f.recorder
-        .batches()
-        .last()
-        .is_some_and(|batch| batch.iter().any(|(sent, _)| sent == item))
-}
-
 #[tokio::test(start_paused = true)]
-async fn an_oversized_caller_validator_reaches_the_registry_intact() {
+async fn a_long_caller_validator_is_forwarded_on_a_miss_and_compared_on_a_hit() {
     let f = fixture(WINDOW);
-    f.title(gts_key(TYPE), full(), false).await;
-    let bad = conditioned(gts_key(TYPE), oversized());
-
-    // Warm: a hit would have hidden it.
-    drop(f.read_with(vec![bad.clone()], full(), false).await);
-    assert!(forwarded(&f, &bad), "not answered from the cache");
-
-    // Expired: the cache's validator would have replaced it.
-    tokio::time::advance(WINDOW).await;
-    drop(f.read_with(vec![bad.clone()], full(), false).await);
-    assert!(forwarded(&f, &bad), "not replaced by the cache's validator");
-
-    // Repeated: deduplication would have dropped the second mention.
-    drop(
-        f.read_with(
-            vec![
-                gts_key(OTHER).into(),
-                conditioned(gts_key(OTHER), oversized()),
-            ],
-            full(),
-            false,
-        )
-        .await,
+    let item = conditioned(gts_key(TYPE), long_validator());
+    for _ in 0..2 {
+        let response = f
+            .read_with(vec![item.clone()], full(), false)
+            .await
+            .expect("read");
+        assert!(matches!(
+            response.0[&gts_key(TYPE)],
+            EntityLookup::Found { .. }
+        ));
+    }
+    let batches = f.recorder.batches();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(
+        batches[0][0].0.if_none_match_for(&full()),
+        Some(&long_validator())
     );
-    assert!(forwarded(&f, &conditioned(gts_key(OTHER), oversized())));
 }
 
 #[tokio::test(start_paused = true)]
@@ -820,23 +1013,31 @@ async fn a_mislabelled_snapshot_fails_the_read_and_is_not_cached() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_validator_over_the_quoted_bound_reaches_the_registry_intact() {
-    let f = fixture(WINDOW);
+async fn a_long_etag_over_budget_is_returned_and_drops_the_stale_entry() {
+    let f = fixture_with(
+        MockTypesRegistry::new(),
+        CacheSettings {
+            max_size_bytes: 4096,
+            ..CacheSettings::default()
+        },
+    );
     f.title(gts_key(TYPE), full(), false).await;
-    // 1023 bytes fit the local bound but not REST's quoted one.
-    let bad = conditioned(gts_key(TYPE), Validator::from_bytes(vec![b'a'; 1023]));
-    drop(f.read_with(vec![bad.clone()], full(), false).await);
-    assert!(forwarded(&f, &bad), "not answered from the cache");
-
-    // The forwarded read dropped the entry it could not check; warm it again.
-    f.title(gts_key(TYPE), full(), false).await;
-    let fits = conditioned(gts_key(TYPE), Validator::from_bytes(vec![b'a'; 1022]));
-    let batches = f.recorder.batch_count();
-    f.read_with(vec![fits], full(), false).await.expect("read");
-    assert_eq!(
-        f.recorder.batch_count(),
-        batches,
-        "a fitting one is served locally"
+    change(&f.registry, TYPE, "v2", 2);
+    f.recorder.tamper_next(|response| {
+        if let Some(EntityLookup::Found { etag, .. }) = response.0.get_mut(&gts_key(TYPE)) {
+            *etag = Validator::from_bytes(vec![b'v'; 4096]);
+        }
+    });
+    let EntityLookup::Found { etag, .. } = f.lookup(gts_key(TYPE), full(), true).await else {
+        panic!("expected changed state");
+    };
+    assert_eq!(etag.as_bytes().len(), 4096);
+    assert_eq!(f.title(gts_key(TYPE), full(), false).await, "v2");
+    assert!(
+        f.recorder.batches()[2][0]
+            .0
+            .if_none_match_for(&full())
+            .is_none()
     );
 }
 
@@ -860,7 +1061,10 @@ async fn a_snapshot_missing_a_selected_field_fails_the_read_and_is_not_cached() 
         EntityLookup::Found { entity, .. } if entity.origin.is_some()
     ));
     assert!(
-        f.recorder.batches()[1][0].0.if_none_match.is_none(),
+        f.recorder.batches()[1][0]
+            .0
+            .if_none_match_for(&full())
+            .is_none(),
         "the broken body left no validator to revalidate against"
     );
 }
@@ -887,24 +1091,31 @@ async fn a_snapshot_with_an_unselected_field_fails_the_read() {
     assert!(
         f.recorder.batches()[1]
             .iter()
-            .all(|(item, _)| item.if_none_match.is_none()),
+            .all(|(item, _)| item.if_none_match_for(&Projection::Default).is_none()),
         "no validator was left to revalidate against"
     );
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_validator_too_long_to_send_back_fails_the_read() {
+async fn a_long_registry_etag_is_cached_and_sent_back_verbatim() {
     let f = fixture(WINDOW);
     f.recorder.tamper_next(|response| {
         if let Some(EntityLookup::Found { etag, .. }) = response.0.get_mut(&gts_key(TYPE)) {
-            *etag = Validator::from_bytes(vec![b'a'; 1025]);
+            *etag = long_validator();
         }
     });
-    f.read_with(vec![gts_key(TYPE).into()], full(), false)
-        .await
-        .expect_err("unusable validator");
-    f.title(gts_key(TYPE), full(), false).await;
-    assert!(f.recorder.batches()[1][0].0.if_none_match.is_none());
+    for _ in 0..2 {
+        let EntityLookup::Found { etag, .. } = f.lookup(gts_key(TYPE), full(), false).await else {
+            panic!("expected a snapshot");
+        };
+        assert_eq!(etag, long_validator());
+    }
+    assert_eq!(f.recorder.batch_count(), 1);
+    f.lookup(gts_key(TYPE), full(), true).await;
+    assert_eq!(
+        f.recorder.batches()[1][0].0.if_none_match_for(&full()),
+        Some(&long_validator())
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -928,7 +1139,7 @@ async fn a_changed_validator_the_caller_sent_replaces_the_narrower_entry() {
         EntityLookup::Found { .. }
     ));
     assert_eq!(
-        f.recorder.batches()[1][0].0.validator_for(&full()),
+        f.recorder.batches()[1][0].0.if_none_match_for(&full()),
         Some(&held),
         "the entry does not cover the read, so the caller's own validator is sent"
     );
@@ -948,11 +1159,8 @@ async fn a_caller_condition_that_does_not_cover_the_read_is_answered_in_full() {
     let EntityLookup::Found { etag, .. } = f.lookup(gts_key(TYPE), full(), false).await else {
         panic!("found");
     };
-    let narrow = BatchGetItem::new(gts_key(TYPE)).with_if_none_match(Condition::new(
-        &gts_key(TYPE),
-        etag.clone(),
-        Projection::Default,
-    ));
+    let previous = f.lookup(gts_key(TYPE), Projection::Default, false).await;
+    let narrow = BatchGetItem::new(gts_key(TYPE)).revalidate(&previous);
     let response = f
         .read_with(vec![narrow.clone()], content_only(), false)
         .await
@@ -977,11 +1185,11 @@ async fn a_caller_condition_for_another_entity_is_never_matched() {
     let EntityLookup::Found { etag, .. } = f.lookup(gts_key(OTHER), full(), false).await else {
         panic!("found");
     };
-    let misbound = BatchGetItem::new(gts_key(OTHER)).with_if_none_match(Condition::new(
-        &gts_key(TYPE),
-        etag.clone(),
-        FieldSelection::full(),
-    ));
+    let previous = EntityLookup::Found {
+        entity: Box::new(registry_snapshot(&f.registry, TYPE).await),
+        etag,
+    };
+    let misbound = BatchGetItem::new(gts_key(OTHER)).revalidate(&previous);
     // Warm: answered from the entry.
     let response = f
         .read_with(vec![misbound.clone()], full(), false)
@@ -1001,7 +1209,12 @@ async fn a_caller_condition_for_another_entity_is_never_matched() {
         response.0[&gts_key(OTHER)],
         EntityLookup::Found { .. }
     ));
-    assert!(cold.recorder.batches()[0][0].0.if_none_match.is_none());
+    assert!(
+        cold.recorder.batches()[0][0]
+            .0
+            .if_none_match_for(&full())
+            .is_none()
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -1300,17 +1513,17 @@ async fn an_older_cold_read_does_not_overwrite_a_newer_one() {
 async fn a_dropped_read_releases_its_ticket() {
     let f = fixture(WINDOW);
     let _release = f.recorder.hold_next();
-    let uuid = gts::GtsId::try_new(TYPE).expect("identifier").to_uuid();
+    let key = gts_key(TYPE);
     {
-        let read = std::pin::pin!(f.title(gts_key(TYPE), full(), false));
+        let read = std::pin::pin!(f.title(key.clone(), full(), false));
         tokio::select! {
             _ = read => panic!("held"),
             () = tokio::task::yield_now() => {}
         }
-        assert!(f.cache.store().indexes(uuid), "the read holds a ticket");
+        assert!(f.cache.store().indexes(&key), "the read holds a ticket");
     }
     assert!(
-        !f.cache.store().indexes(uuid),
+        !f.cache.store().indexes(&key),
         "dropping the read released it"
     );
 }
@@ -1379,27 +1592,27 @@ async fn an_older_conditional_read_does_not_replace_a_newer_answer() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_forwarded_out_of_bounds_read_that_succeeds_drops_what_it_may_contradict() {
+async fn a_fresh_read_revalidates_the_cached_entry_even_with_a_long_caller_condition() {
     let f = fixture(WINDOW);
-    f.title(gts_key(TYPE), full(), false).await;
+    let EntityLookup::Found { etag: pinned, .. } = f.lookup(gts_key(TYPE), full(), false).await
+    else {
+        panic!("warmed");
+    };
     change(&f.registry, TYPE, "v2", 2);
-    // 1023 bytes: over REST's quoted bound, within the local adapter's (and the mock's).
-    let response = f
-        .read_with(
-            vec![conditioned(
-                gts_key(TYPE),
-                Validator::from_bytes(vec![b'a'; 1023]),
-            )],
-            full(),
-            true,
-        )
-        .await
-        .expect("the adapter accepted it");
-    assert!(matches!(
-        response.0[&gts_key(TYPE)],
-        EntityLookup::Found { .. }
-    ));
+    f.read_with(
+        vec![conditioned(gts_key(TYPE), long_validator())],
+        full(),
+        true,
+    )
+    .await
+    .expect("read changed state");
+    assert_eq!(
+        f.recorder.batches()[1][0].0.if_none_match_for(&full()),
+        Some(&pinned),
+        "the entry's validator is sent, not the caller's"
+    );
     assert_eq!(f.title(gts_key(TYPE), full(), false).await, "v2");
+    assert_eq!(f.recorder.batch_count(), 2);
 }
 
 /// The validator the registry would issue for `TYPE` under `full()` now, read past the cache.
@@ -1555,15 +1768,12 @@ async fn an_older_answer_does_not_fill_after_a_newer_one_was_evicted() {
     for id in [TYPE, OTHER, THIRD] {
         registry.seed(id, schema(id, "v1"));
     }
-    // Room for one full snapshot, never two.
-    let bound = super::store::weight(&registry_snapshot(&registry, TYPE).await)
-        .total()
-        .max(super::store::weight(&registry_snapshot(&registry, OTHER).await).total());
     let f = fixture_with(
         registry,
         CacheSettings {
             freshness_window: WINDOW,
-            store_bound: bound,
+            max_entries: 1,
+            ..CacheSettings::default()
         },
     );
     f.registry.inject(
@@ -1578,7 +1788,12 @@ async fn an_older_answer_does_not_fill_after_a_newer_one_was_evicted() {
         change(&f.registry, TYPE, "v2", 2);
         tokio::time::sleep(Duration::from_secs(6)).await;
         // A recorded v2; evict it before B, holding v1, commits.
+        assert!(f.cache.store().peek(&gts_key(TYPE)).is_some(), "A filled v2");
         f.title(gts_key(OTHER), full(), false).await;
+        assert!(
+            f.cache.store().peek(&gts_key(TYPE)).is_none(),
+            "OTHER evicted v2 before B settles"
+        );
         release.send(()).expect("held read");
     };
     let (a, b, ()) = tokio::join!(a, b, control);
@@ -1860,7 +2075,8 @@ async fn an_oversized_answer_of_the_same_state_keeps_the_smaller_entry() {
         MockTypesRegistry::new().completing_after(0),
         CacheSettings {
             freshness_window: WINDOW,
-            store_bound: bound,
+            max_size_bytes: bound,
+            ..CacheSettings::default()
         },
     );
     f.registry.seed(TYPE, big);
@@ -1886,7 +2102,8 @@ async fn an_oversized_answer_of_a_new_state_drops_the_old_entry() {
         MockTypesRegistry::new().completing_after(0),
         CacheSettings {
             freshness_window: WINDOW,
-            store_bound: 4096,
+            max_size_bytes: 4096,
+            ..CacheSettings::default()
         },
     );
     f.lookup(gts_key(TYPE), Projection::Default, false).await;
@@ -1918,3 +2135,326 @@ async fn an_oversized_answer_of_a_new_state_drops_the_old_entry() {
     );
     assert_eq!(f.recorder.batch_count(), 3);
 }
+
+// Identity consistency: the registry alone states which identifier and Registry Reference
+// are one entity. Nothing derives one from the other; a pair contradicting one already
+// known — resident, remembered, pinned by the read, or stated elsewhere in the batch — is
+// a protocol fault that fails the read and changes neither store.
+
+/// A Registry Reference no derivation produces for any fixture identifier.
+const ISSUED: Uuid = Uuid::from_u128(0x0123_4567_89ab_4cde_8f01_2345_6789_abcd);
+const FORGED: Uuid = Uuid::from_u128(0x0fed_cba9_8765_4321_8fed_cba9_8765_4321);
+
+/// TYPE as the registry reads it, but under `gts_uuid`.
+async fn snapshot_under(registry: &MockTypesRegistry, gts_uuid: Uuid) -> crate::models::Entity {
+    let mut entity = registry_snapshot(registry, TYPE).await;
+    entity.gts_uuid = gts_uuid;
+    entity
+}
+
+/// Rewrites the next answer for `key` to `entity`.
+fn answer_next(f: &Fixture, key: EntityKey, entity: crate::models::Entity) {
+    f.recorder.tamper_next(move |response| {
+        response.0.insert(
+            key,
+            EntityLookup::Found {
+                entity: Box::new(entity),
+                etag: Validator::from_bytes(b"forged".to_vec()),
+            },
+        );
+    });
+}
+
+/// Room for one full snapshot of TYPE or OTHER, never both.
+fn one_snapshot_settings(max_identity_entries: usize) -> CacheSettings {
+    CacheSettings {
+        freshness_window: WINDOW,
+        max_entries: 1,
+        max_identity_entries,
+        ..CacheSettings::default()
+    }
+}
+
+fn assert_protocol_fault(result: Result<BatchGetEntitiesResponse, CanonicalError>) {
+    let error = result.expect_err("a contradicting identity");
+    assert!(
+        matches!(error, CanonicalError::Internal { .. }),
+        "{error:?}"
+    );
+}
+
+/// A revalidation answered with the pinned entity under another Registry Reference fails,
+/// though both the entry and the remembered identity were evicted while it was in flight:
+/// the pair the read pinned is still known to it, and the forged one is learned nowhere.
+#[tokio::test(start_paused = true)]
+async fn a_revalidation_contradicting_its_pinned_pair_fails_after_both_stores_evicted_it() {
+    let f = fixture_with(
+        MockTypesRegistry::new().completing_after(0),
+        one_snapshot_settings(1),
+    );
+    f.title(gts_key(TYPE), full(), false).await;
+    let pinned = uuid_key(TYPE);
+    tokio::time::advance(WINDOW).await;
+
+    let forged = snapshot_under(&f.registry, FORGED).await;
+    let release = f.recorder.hold_next();
+    answer_next(&f, gts_key(TYPE), forged);
+    let (revalidation, ()) = tokio::join!(
+        f.read_with(vec![gts_key(TYPE).into()], full(), false),
+        async {
+            f.title(gts_key(OTHER), full(), false).await;
+            assert!(f.cache.store().peek(&gts_key(TYPE)).is_none(), "evicted");
+            assert!(f.cache.identity(&gts_key(TYPE)).is_none(), "evicted");
+            release.send(()).expect("held read");
+        }
+    );
+    // Batches are recorded as answered: the held revalidation last.
+    let held = &f.recorder.batches()[2][0].0;
+    assert_eq!(held.key, gts_key(TYPE));
+    assert!(
+        held.if_none_match_for(&full()).is_some(),
+        "the held read revalidated its pinned entry"
+    );
+    assert_protocol_fault(revalidation);
+
+    assert!(f.cache.identity(&EntityKey::GtsUuid(FORGED)).is_none());
+    assert!(f.cache.identity(&gts_key(TYPE)).is_none());
+    let store = f.cache.store();
+    assert!(store.peek(&EntityKey::GtsUuid(FORGED)).is_none());
+    assert!(store.peek(&gts_key(TYPE)).is_none());
+    assert!(store.peek(&pinned).is_none());
+}
+
+/// Two answers of one batch pairing one identifier with two Registry References: the
+/// batch fails and fills nothing, even with no identity store to remember either pair.
+#[tokio::test(start_paused = true)]
+async fn a_batch_contradicting_itself_fails_and_fills_nothing() {
+    let f = fixture_with(
+        MockTypesRegistry::new().completing_after(0),
+        CacheSettings {
+            max_identity_entries: 0,
+            ..CacheSettings::default()
+        },
+    );
+    let forged = snapshot_under(&f.registry, FORGED).await;
+    answer_next(&f, EntityKey::GtsUuid(FORGED), forged);
+    assert_protocol_fault(
+        f.read_with(
+            vec![gts_key(TYPE).into(), EntityKey::GtsUuid(FORGED).into()],
+            full(),
+            false,
+        )
+        .await,
+    );
+
+    f.title(gts_key(TYPE), full(), false).await;
+    assert_eq!(f.recorder.batch_count(), 2, "neither answer was kept");
+    assert_eq!(
+        f.lookup(EntityKey::GtsUuid(FORGED), full(), false).await,
+        EntityLookup::NotFound
+    );
+}
+
+/// A resident snapshot's pair holds with no identity store at all: another Registry
+/// Reference answered for its identifier fails the read and leaves the entry serving.
+#[tokio::test(start_paused = true)]
+async fn an_answer_contradicting_a_resident_pair_fails_and_leaves_the_entry() {
+    let f = fixture_with(
+        MockTypesRegistry::new().completing_after(0),
+        CacheSettings {
+            max_identity_entries: 0,
+            ..CacheSettings::default()
+        },
+    );
+    f.title(gts_key(TYPE), full(), false).await;
+    let forged = snapshot_under(&f.registry, FORGED).await;
+    answer_next(&f, EntityKey::GtsUuid(FORGED), forged);
+    assert_protocol_fault(
+        f.read_with(vec![EntityKey::GtsUuid(FORGED).into()], full(), false)
+            .await,
+    );
+
+    f.title(gts_key(TYPE), full(), false).await;
+    f.title(uuid_key(TYPE), full(), false).await;
+    assert_eq!(
+        f.recorder.batch_count(),
+        2,
+        "the entry still serves both spellings"
+    );
+}
+
+/// A remembered pair holds after its snapshot was evicted.
+#[tokio::test(start_paused = true)]
+async fn an_answer_contradicting_a_remembered_pair_fails_after_its_snapshot_was_evicted() {
+    let f = fixture_with(
+        MockTypesRegistry::new().completing_after(0),
+        one_snapshot_settings(CacheSettings::DEFAULT_MAX_IDENTITY_ENTRIES),
+    );
+    f.title(gts_key(TYPE), full(), false).await;
+    f.title(gts_key(OTHER), full(), false).await;
+    assert!(f.cache.store().peek(&gts_key(TYPE)).is_none(), "evicted");
+
+    let forged = snapshot_under(&f.registry, FORGED).await;
+    answer_next(&f, EntityKey::GtsUuid(FORGED), forged);
+    assert_protocol_fault(
+        f.read_with(vec![EntityKey::GtsUuid(FORGED).into()], full(), false)
+            .await,
+    );
+    assert!(f.cache.store().peek(&EntityKey::GtsUuid(FORGED)).is_none());
+    let known = f.cache.identity(&gts_key(TYPE)).expect("still remembered");
+    assert_eq!(EntityKey::GtsUuid(known.gts_uuid), uuid_key(TYPE));
+}
+
+/// Two reads in flight are answered with contradicting pairs: the one settled first holds,
+/// and the other fails rather than replacing it, with no identity store to arbitrate.
+#[tokio::test(start_paused = true)]
+async fn of_two_reads_answered_with_contradicting_pairs_the_later_settled_fails() {
+    let f = fixture_with(
+        MockTypesRegistry::new().completing_after(0),
+        CacheSettings {
+            max_identity_entries: 0,
+            ..CacheSettings::default()
+        },
+    );
+    let forged = snapshot_under(&f.registry, FORGED).await;
+    let release = f.recorder.hold_next();
+    let (held, ()) = tokio::join!(
+        f.read_with(vec![gts_key(TYPE).into()], full(), false),
+        async {
+            answer_next(&f, EntityKey::GtsUuid(FORGED), forged);
+            f.title(EntityKey::GtsUuid(FORGED), full(), false).await;
+            release.send(()).expect("held read");
+        }
+    );
+    assert_protocol_fault(held);
+    assert_eq!(
+        f.cache
+            .store()
+            .peek(&gts_key(TYPE))
+            .map(|entry| entry.snapshot.gts_uuid),
+        Some(FORGED),
+        "the pair settled first stays"
+    );
+}
+
+/// A miss on an unregistered identifier while a cold read by another identifier is in
+/// flight: two identifiers are never one entity, so the cold read still fills. A cold
+/// read by Registry Reference, which may be that identifier's entity, does not.
+#[tokio::test(start_paused = true)]
+async fn a_miss_on_another_identifier_does_not_fence_a_cold_read_by_identifier() {
+    for (cold, fills) in [(gts_key(TYPE), true), (uuid_key(TYPE), false)] {
+        let f = fixture(WINDOW);
+        let release = f.recorder.hold_next();
+        let (held, ()) = tokio::join!(f.lookup(cold.clone(), full(), false), async {
+            assert_eq!(
+                f.lookup(gts_key(UNREGISTERED), full(), false).await,
+                EntityLookup::NotFound
+            );
+            release.send(()).expect("held read");
+        });
+        assert!(matches!(held, EntityLookup::Found { .. }), "{held:?}");
+        f.title(cold.clone(), full(), false).await;
+        let expected = if fills { 2 } else { 3 };
+        assert_eq!(f.recorder.batch_count(), expected, "{cold}: filled {fills}");
+    }
+}
+
+/// End to end through the cache, the registry issuing TYPE a Registry Reference no
+/// derivation produces: both spellings share one entry, `resolve_*` answers without a
+/// read, a revalidation is conditional under the issued one, and an observed
+/// registration by identifier drops what the issued one would be served. With no
+/// identity store, the snapshot index alone answers every spelling.
+#[tokio::test(start_paused = true)]
+async fn an_issued_registry_reference_is_served_cached_under_either_spelling() {
+    use crate::PlatformTypesRegistryApiExt;
+
+    let issued = EntityKey::GtsUuid(ISSUED);
+    let type_id = gts::GtsTypeId::try_new(TYPE).expect("a Type Schema identifier");
+    for max_identity_entries in [0, CacheSettings::DEFAULT_MAX_IDENTITY_ENTRIES] {
+        let f = fixture_with(
+            MockTypesRegistry::new().completing_after(0),
+            CacheSettings {
+                max_identity_entries,
+                ..CacheSettings::default()
+            },
+        );
+        f.recorder.tamper_next(|response| {
+            if let Some(EntityLookup::Found { entity, .. }) = response.0.get_mut(&gts_key(TYPE)) {
+                entity.gts_uuid = ISSUED;
+            }
+        });
+        assert_eq!(f.title(gts_key(TYPE), full(), false).await, "v1");
+        assert_eq!(f.title(issued.clone(), full(), false).await, "v1");
+        assert_eq!(
+            f.cache
+                .resolve_type_uuid(&ctx(), &type_id)
+                .await
+                .expect("known"),
+            ISSUED
+        );
+        assert_eq!(
+            f.cache
+                .resolve_type_id(&ctx(), ISSUED)
+                .await
+                .expect("known"),
+            type_id
+        );
+        assert_eq!(
+            f.recorder.batch_count(),
+            1,
+            "{max_identity_entries}: one entry answered"
+        );
+
+        tokio::time::advance(WINDOW).await;
+        let held = f
+            .cache
+            .store()
+            .peek(&issued)
+            .expect("resident")
+            .etag
+            .clone();
+        let current = held.clone();
+        f.recorder.tamper_next(move |response| {
+            response.0.insert(
+                EntityKey::GtsUuid(ISSUED),
+                EntityLookup::Unchanged { etag: current },
+            );
+        });
+        assert_eq!(f.title(issued.clone(), full(), false).await, "v1");
+        let revalidation = &f.recorder.batches()[1][0];
+        assert_eq!(revalidation.0.key, issued);
+        assert_eq!(
+            revalidation.0.if_none_match_for(&full()),
+            Some(&held),
+            "{max_identity_entries}: revalidated under the issued Registry Reference"
+        );
+        assert_eq!(f.title(gts_key(TYPE), full(), false).await, "v1");
+        assert_eq!(
+            f.recorder.batch_count(),
+            2,
+            "the confirmation serves the identifier"
+        );
+
+        let operation = f.register(registration(TYPE, "v2", Some(1))).await;
+        assert!(matches!(
+            operation.items[0].outcome,
+            RegistrationOutcome::Succeeded { .. }
+        ));
+        let changed = snapshot_under(&f.registry, ISSUED).await;
+        answer_next(&f, issued.clone(), changed);
+        assert_eq!(f.title(issued.clone(), full(), false).await, "v2");
+        assert!(
+            f.recorder.batches()[2][0]
+                .0
+                .if_none_match_for(&full())
+                .is_none(),
+            "{max_identity_entries}: the registration by identifier dropped the issued spelling"
+        );
+    }
+}
+
+#[path = "resolve_tests.rs"]
+mod resolve_tests;
+
+#[path = "tenant_tests.rs"]
+mod tenant_tests;

@@ -31,3 +31,39 @@ fn the_bindings_name_each_planes_base_path() {
         "/types-registry/v2"
     );
 }
+
+/// Every contract method has a real route on its plane: the batch resolution included,
+/// on both.
+#[test]
+fn every_contract_method_is_bound_on_its_plane() {
+    for (ir, binding) in [
+        (
+            platform_types_registry_api_ir(),
+            platform_types_registry_api_rest_http_binding(),
+        ),
+        (
+            types_registry_api_ir(),
+            types_registry_api_rest_http_binding(),
+        ),
+    ] {
+        for method in &ir.methods {
+            assert!(!method.optional, "{} is optional in the IR", method.name);
+            let bound = binding
+                .methods
+                .iter()
+                .find(|bound| bound.method_name == method.name)
+                .unwrap_or_else(|| panic!("{} has no route", method.name));
+            assert!(!bound.optional, "{} is bound as optional", method.name);
+        }
+        let resolve = binding
+            .methods
+            .iter()
+            .find(|bound| bound.method_name == "batch_resolve_identities")
+            .expect("the batch resolution is bound");
+        assert_eq!(resolve.path_template, "/entities:batchResolve");
+        assert!(matches!(
+            resolve.http_method,
+            toolkit_contract::ir::HttpMethod::Post
+        ));
+    }
+}

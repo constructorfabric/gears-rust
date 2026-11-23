@@ -14,10 +14,11 @@ use toolkit_security::{PlatformSecurityContext, SecurityContext};
 use uuid::Uuid;
 
 use super::dto::{
-    BatchGetRequest, DeleteEntitiesRequest, DeleteEntityQuery, EntityDto, EntityLookupDto,
-    EntityLookupsDto, EntityPageDto, GtsEntityDto, ListEntitiesQuery, ListEntitiesResponse,
-    OperationAcceptedDto, OperationDto, PageInfoDto, RegisterEntitiesRequest,
-    RegisterEntitiesResponse, RegisterResultDto, RegisterSummaryDto, SubmitEntitiesRequest,
+    BatchGetRequest, BatchResolveRequest, DeleteEntitiesRequest, DeleteEntityQuery, EntityDto,
+    EntityLookupDto, EntityLookupsDto, EntityPageDto, EntityResolutionDto, EntityResolutionsDto,
+    GtsEntityDto, ListEntitiesQuery, ListEntitiesResponse, OperationAcceptedDto, OperationDto,
+    PageInfoDto, RegisterEntitiesRequest, RegisterEntitiesResponse, RegisterResultDto,
+    RegisterSummaryDto, SubmitEntitiesRequest,
 };
 use super::params::{DiscoveryParams, ExactReadSelection, NoQuery};
 use super::paths::PLATFORM;
@@ -33,7 +34,7 @@ use crate::domain::registry_service::{
 };
 use crate::domain::selection::FieldSelection;
 use crate::domain::service::TypesRegistryService;
-use crate::domain::validator::Validator;
+use crate::domain::validator::{MAX_VALIDATOR_LEN, Validator};
 
 /// POST /api/v1/types-registry/entities
 ///
@@ -514,7 +515,7 @@ async fn batch_read(
             return Err(super::error::key_too_long(item.entity_key.len()));
         }
         if let Some(validator) = &item.if_none_match
-            && validator.len() > MAX_KEY_LEN
+            && validator.len() > MAX_VALIDATOR_LEN
         {
             return Err(super::error::validator_too_long(
                 field::IF_NONE_MATCH_FIELD,
@@ -560,6 +561,80 @@ async fn batch_read(
             .collect::<Result<_, CanonicalError>>()?,
     };
     json_body(body, selection).await
+}
+
+/// `POST /types-registry/v2/entities:batchResolve`, the tenant batch resolution.
+pub async fn batch_resolve_entities(
+    Extension(service): Extension<Option<Arc<RegistryService>>>,
+    Extension(ctx): Extension<SecurityContext>,
+    _: NoQuery,
+    extract::Json(req): extract::Json<BatchResolveRequest>,
+) -> ApiResult<Response> {
+    batch_resolve(service, CallerContext::Tenant(&ctx), req).await
+}
+
+/// `POST /types-registry/v2/platform/entities:batchResolve`, the platform batch resolution.
+pub async fn platform_batch_resolve_entities(
+    Extension(service): Extension<Option<Arc<RegistryService>>>,
+    Extension(ctx): Extension<PlatformSecurityContext>,
+    _: NoQuery,
+    extract::Json(req): extract::Json<BatchResolveRequest>,
+) -> ApiResult<Response> {
+    batch_resolve(service, CallerContext::Platform(&ctx), req).await
+}
+
+/// Each key's canonical identity, Active or deleted, or `not_found`: the keyed identity
+/// rows only, with no validator and no document. A `POST` for the reasons `:batchGet` is.
+async fn batch_resolve(
+    service: Option<Arc<RegistryService>>,
+    caller: CallerContext<'_>,
+    req: BatchResolveRequest,
+) -> ApiResult<Response> {
+    let service = require_registry(service)?;
+    // Bounded on the raw count, duplicates included, before any per-item work.
+    let count = req.items.count();
+    if count == 0 || count > MAX_BATCH_GET_KEYS {
+        return Err(ServiceError::BatchReadOutOfRange { count }.into());
+    }
+    let items = req.items.into_items();
+    let mut asked: HashSet<EntityKey> = HashSet::with_capacity(items.len());
+    let mut keys: Vec<EntityKey> = Vec::with_capacity(items.len());
+    for item in items {
+        // Before `EntityKey::parse` copies the key; the domain repeats the check.
+        if item.entity_key.len() > MAX_KEY_LEN {
+            return Err(super::error::key_too_long(item.entity_key.len()));
+        }
+        let key = EntityKey::parse(&item.entity_key);
+        asked.insert(key.clone());
+        keys.push(key);
+    }
+
+    let results = service
+        .batch_resolve(caller, &keys)
+        .await
+        .map_err(CanonicalError::from)?;
+
+    let body = EntityResolutionsDto {
+        items: results
+            .into_iter()
+            .map(|(key, identity)| {
+                if !asked.remove(&key) {
+                    tracing::error!(
+                        unexpected_key = ?key,
+                        batch_size = keys.len(),
+                        "types_registry batch resolution answered a key it was not asked"
+                    );
+                    return Err(CanonicalError::internal(
+                        "the registry could not match a batch resolution result",
+                    )
+                    .create());
+                }
+                // Canonical, as a batch read echoes it.
+                Ok(EntityResolutionDto::new(key.to_string(), identity))
+            })
+            .collect::<Result<_, CanonicalError>>()?,
+    };
+    Ok(Json(body).into_response())
 }
 
 /// `GET /types-registry/v2/entities`, the tenant discovery page.

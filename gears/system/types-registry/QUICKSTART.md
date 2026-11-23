@@ -118,10 +118,18 @@ startup seed:
 - **Database required:** without `gears.types-registry.database`, or after seed
   failure, neither contract is registered; resolution fails.
 - **Client cache:** the published platform API caches reads for
-  `local_client.cache.freshness_window` (30 s) within `local_client.cache.store_bound`
-  (64MB). A registration or deletion polled to its terminal outcome through it drops
+  `local_client.cache.freshness_window` (30 s) within `local_client.cache.max_size_bytes`
+  (64 MiB of compact JSON and raw validators) and `local_client.cache.max_entries`
+  (16 384 snapshots). Setting either limit to zero disables snapshot retention. A registration or deletion polled to its terminal outcome through it drops
   the affected entries; read with `fresh` when another writer's change must be seen at
-  once. The tenant API is uncached.
+  once. The platform `resolve_*` helpers also answer known identities from
+  `local_client.cache.max_identity_entries` entries (16 384; `0` keeps none, leaving ordinary
+  light reads through the entries), with no window. A platform list primes both resolution
+  directions for the entities on that page.
+  The local platform and tenant caches each have their own byte and entry budgets.
+  The tenant API shares its snapshots across tenants. Each tenant must get a
+  successful read for an entity before it can use the snapshot cache. Use `fresh`
+  to check visibility and content with the registry immediately.
 - **Independent catalogues:** legacy `/v1` shares initial declarations but no later
   writes with the database until T38.
 - **Multiple instances:** outbox polling can delay admission by one minute. Keep
@@ -292,7 +300,7 @@ curl -s -X POST "$TENANT/entities:batchGet" \
 A revision or a refreshed dependency yields a new validator; another `$select` does not, so
 `304`/`unchanged` says the response you hold is current, not that it has the fields you now
 select. Send a validator only with a `$select` whose fields the response you hold carries,
-and only for the key it came from. The Rust SDK enforces both (`EntityLookup::condition`).
+and only for the key it came from. The Rust SDK enforces both (`BatchGetItem::new(key).revalidate(&previous_lookup)`).
 Discovery pages carry no validator. On `:batchGet` the `If-None-Match` header is refused:
 validators are per key.
 

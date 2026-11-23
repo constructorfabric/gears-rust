@@ -456,7 +456,7 @@ async fn list_children_serves_the_whole_page_without_types_when_their_read_fails
     );
 
     registry.inject(
-        Fault::on(Call::BatchGet)
+        Fault::on(Call::BatchResolve)
             .fail(toolkit_canonical_errors::CanonicalError::service_unavailable().create()),
     );
     let untyped = svc
@@ -4532,7 +4532,7 @@ async fn mandatory_tenant_type_read_preserves_caller_refusals_before_tenant_prov
         let repo = Arc::new(FakeTenantRepo::with_root(root));
         let registry = Arc::new(MockTypesRegistry::new());
         // The first read resolves the mandatory parent IdP context.
-        registry.inject(Fault::on(Call::BatchGet).fail(refusal));
+        registry.inject(Fault::on(Call::BatchResolve).fail(refusal));
         let idp = Arc::new(FakeIdpProvisioner::new(FakeOutcome::Ok));
         let service = TenantService::new(
             repo,
@@ -4551,8 +4551,8 @@ async fn mandatory_tenant_type_read_preserves_caller_refusals_before_tenant_prov
 
         assert_eq!(at_the_boundary(error).1, Some(status));
         assert_eq!(idp.provision_call_count(), 0);
-        assert_eq!(registry.calls(Call::BatchGet), 1);
-        assert_eq!(registry.platform_calls(Call::BatchGet), 0);
+        assert_eq!(registry.calls(Call::BatchResolve), 1);
+        assert_eq!(registry.platform_calls(Call::BatchResolve), 0);
     }
 }
 
@@ -4564,7 +4564,7 @@ async fn mandatory_tenant_type_read_classifies_platform_credential_refusals_as_i
     for (refusal, _) in refusals() {
         let root = Uuid::from_u128(0x100);
         let registry = Arc::new(MockTypesRegistry::new());
-        registry.inject(Fault::on(Call::BatchGet).fail(refusal));
+        registry.inject(Fault::on(Call::BatchResolve).fail(refusal));
         let service = make_service(Arc::new(FakeTenantRepo::with_root(root)), FakeOutcome::Ok)
             .with_registry(registry.clone());
 
@@ -4574,8 +4574,8 @@ async fn mandatory_tenant_type_read_classifies_platform_credential_refusals_as_i
             .expect_err("AM's own credential was refused");
 
         assert_eq!(at_the_boundary(error).1, Some(500));
-        assert_eq!(registry.platform_calls(Call::BatchGet), 1);
-        assert!(registry.caller_contexts(Call::BatchGet).is_empty());
+        assert_eq!(registry.platform_calls(Call::BatchResolve), 1);
+        assert!(registry.caller_contexts(Call::BatchResolve).is_empty());
     }
 }
 
@@ -4613,11 +4613,11 @@ async fn optional_tenant_type_hydration_preserves_caller_refusals() {
         let repo = Arc::new(FakeTenantRepo::with_root(root));
         seed_active_child(&repo, root, child);
         let registry = Arc::new(MockTypesRegistry::new());
-        registry.inject(Fault::on(Call::BatchGet).fail(refusal.clone()));
+        registry.inject(Fault::on(Call::BatchResolve).fail(refusal.clone()));
         let service = make_service(repo, FakeOutcome::Ok).with_registry(registry.clone());
 
         let get = service.get_tenant(&ctx_for(root), child).await;
-        registry.inject(Fault::on(Call::BatchGet).fail(refusal));
+        registry.inject(Fault::on(Call::BatchResolve).fail(refusal));
         let list = service
             .list_children(&ctx_for(root), root, &ODataQuery::default())
             .await;
@@ -4626,7 +4626,7 @@ async fn optional_tenant_type_hydration_preserves_caller_refusals() {
         let list = list.expect_err("LIST must answer the caller's refusal, not tenant_type: None");
         assert_eq!(at_the_boundary(get).1, Some(status));
         assert_eq!(at_the_boundary(list).1, Some(status));
-        assert_eq!(registry.platform_calls(Call::BatchGet), 0);
+        assert_eq!(registry.platform_calls(Call::BatchResolve), 0);
     }
 }
 
@@ -4644,7 +4644,7 @@ async fn optional_tenant_type_hydration_stays_best_effort_on_outages() {
     let service = make_service(repo, FakeOutcome::Ok).with_registry(registry.clone());
 
     registry.inject(
-        Fault::on(Call::BatchGet)
+        Fault::on(Call::BatchResolve)
             .fail(toolkit_canonical_errors::CanonicalError::service_unavailable().create()),
     );
     let tenant = service
@@ -4654,7 +4654,7 @@ async fn optional_tenant_type_hydration_stays_best_effort_on_outages() {
     assert_eq!(tenant.tenant_type, None);
 
     registry.inject(
-        Fault::on(Call::BatchGet)
+        Fault::on(Call::BatchResolve)
             .fail(toolkit_canonical_errors::CanonicalError::service_unavailable().create()),
     );
     let page = service
@@ -4680,7 +4680,7 @@ async fn a_refused_tenant_type_read_fails_an_update_before_it_writes() {
         seed_active_child(&repo, root, child);
         let before = repo.find_by_id_unchecked(child).expect("seeded");
         let registry = Arc::new(MockTypesRegistry::new());
-        registry.inject(Fault::on(Call::BatchGet).fail(refusal));
+        registry.inject(Fault::on(Call::BatchResolve).fail(refusal));
         let service = make_service(repo.clone(), FakeOutcome::Ok).with_registry(registry);
 
         let error = service
@@ -4716,7 +4716,7 @@ async fn updating_a_deleted_tenant_conflicts_before_any_tenant_type_read() {
     deleted.deleted_at = Some(deleted.updated_at);
     repo.insert_tenant_raw(deleted);
     let registry = Arc::new(MockTypesRegistry::new());
-    registry.inject(Fault::on(Call::BatchGet).fail(refusal));
+    registry.inject(Fault::on(Call::BatchResolve).fail(refusal));
     let service = make_service(repo, FakeOutcome::Ok).with_registry(registry.clone());
 
     let error = service
@@ -4729,7 +4729,7 @@ async fn updating_a_deleted_tenant_conflicts_before_any_tenant_type_read() {
         .expect_err("a deleted tenant is read-only");
 
     assert!(matches!(error, DomainError::Conflict { .. }), "{error:?}");
-    assert_eq!(registry.calls(Call::BatchGet), 0);
+    assert_eq!(registry.calls(Call::BatchResolve), 0);
 }
 
 #[tokio::test]

@@ -35,6 +35,17 @@ async def registry_http(base_url, registry_api_path, auth_headers, platform_head
         yield client
 
 
+@pytest.fixture
+async def registry_tenant_http(base_url, auth_headers):
+    """A bearer-only client for the tenant reads, beside the platform client."""
+    async with httpx.AsyncClient(
+        base_url=base_url.rstrip("/") + "/",
+        headers={**auth_headers, "traceparent": TRACEPARENT},
+        timeout=3.0,
+    ) as client:
+        yield client
+
+
 def _topic_loader(topic):
     """Load `fixtures/<topic>/` with one namespace per test.
 

@@ -447,13 +447,7 @@ async fn a_read_carries_the_domain_validator_byte_for_byte_and_answers_unchanged
         .batch_get_entities(
             &ctx(),
             batch(
-                vec![
-                    BatchGetItem::new(key.clone()).with_if_none_match(
-                        first.0[&key]
-                            .condition()
-                            .expect("a found answer gives a condition"),
-                    ),
-                ],
+                vec![BatchGetItem::new(key.clone()).revalidate(&first.0[&key])],
                 projection,
             ),
         )
@@ -471,18 +465,24 @@ async fn a_validator_this_registry_never_issued_is_answered_in_full() {
     register_and_complete(&h, "k-n", register(vec![create(CF_TYPE, schema(CF_TYPE))])).await;
     let key = EntityKey::from(id(CF_TYPE));
 
+    let first = h
+        .client
+        .batch_get_entities(&ctx(), batch(vec![key.clone().into()], Projection::Default))
+        .await
+        .expect("first read");
+    let EntityLookup::Found { entity, .. } = &first.0[&key] else {
+        panic!("found")
+    };
+    let previous = EntityLookup::Found {
+        entity: entity.clone(),
+        etag: types_registry_sdk::Validator::from_bytes(b"\"not-a-token\"".to_vec()),
+    };
     let lookups = h
         .client
         .batch_get_entities(
             &ctx(),
             batch(
-                vec![BatchGetItem::new(key.clone()).with_if_none_match(
-                    types_registry_sdk::Condition::new(
-                        &key,
-                        types_registry_sdk::Validator::from_bytes(b"\"not-a-token\"".to_vec()),
-                        Projection::Default,
-                    ),
-                )],
+                vec![BatchGetItem::new(key.clone()).revalidate(&previous)],
                 Projection::Default,
             ),
         )
@@ -1300,6 +1300,17 @@ impl PlatformTypesRegistryApi for LostAcknowledgement {
         operation_id: uuid::Uuid,
     ) -> Result<Operation, toolkit_canonical_errors::CanonicalError> {
         self.client.get_operation(ctx, operation_id).await
+    }
+
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &PlatformSecurityContext,
+        keys: Vec<EntityKey>,
+    ) -> Result<
+        std::collections::HashMap<EntityKey, Option<types_registry_sdk::EntityIdentity>>,
+        toolkit_canonical_errors::CanonicalError,
+    > {
+        self.client.batch_resolve_identities(ctx, keys).await
     }
 }
 

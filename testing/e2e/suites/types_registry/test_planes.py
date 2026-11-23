@@ -5,27 +5,13 @@ import uuid
 import httpx
 import pytest
 
-from .helpers import PLATFORM_API, TRACEPARENT, get_entity
-
-
-TENANT_API = "types-registry/v2"
+from .helpers import PLATFORM_API, TENANT_API, TRACEPARENT, get_entity
 
 
 @pytest.fixture
 def registry_api_path():
     """Plane checks always prepare data through the fixed platform API."""
     return PLATFORM_API
-
-
-@pytest.fixture
-async def registry_tenant_http(base_url, auth_headers):
-    """A bearer-only client used alongside the platform client in these checks."""
-    async with httpx.AsyncClient(
-        base_url=base_url.rstrip("/") + "/",
-        headers={**auth_headers, "traceparent": TRACEPARENT},
-        timeout=3.0,
-    ) as client:
-        yield client
 
 
 def _reason(response):
@@ -169,11 +155,13 @@ async def test_the_full_auth_matrix_on_every_route(
         ("GET", f"{PLATFORM_API}/operations/{operation}", None),
         ("GET", f"{PLATFORM_API}/entities/{gts_id}", None),
         ("POST", f"{PLATFORM_API}/entities:batchGet", read),
+        ("POST", f"{PLATFORM_API}/entities:batchResolve", read),
         ("GET", f"{PLATFORM_API}/entities", None),
     )
     tenant_routes = (
         ("GET", f"{TENANT_API}/entities/{gts_id}", None),
         ("POST", f"{TENANT_API}/entities:batchGet", read),
+        ("POST", f"{TENANT_API}/entities:batchResolve", read),
         ("GET", f"{TENANT_API}/entities", None),
     )
     forged_token = {"X-ToolKit-Internal-Token": f"forged-{uuid.uuid4()}"}

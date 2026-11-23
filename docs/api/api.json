@@ -1308,6 +1308,39 @@
         ],
         "type": "object"
       },
+      "BatchResolveItemDto": {
+        "additionalProperties": false,
+        "description": "One key in a batch resolution.",
+        "properties": {
+          "entity_key": {
+            "description": "A canonical GTS identifier or a Registry Reference UUID, classified exactly\nas `GET /entities/{entity_key}` classifies its path segment.",
+            "maxLength": 1024,
+            "type": "string"
+          }
+        },
+        "required": [
+          "entity_key"
+        ],
+        "type": "object"
+      },
+      "BatchResolveRequest": {
+        "additionalProperties": false,
+        "description": "A batch resolution. Unknown fields are refused.",
+        "properties": {
+          "items": {
+            "description": "No `max_items`: the ceiling is `MAX_BATCH_GET_KEYS`, applied while the body\nis parsed. Items past it are counted, not kept.",
+            "items": {
+              "$ref": "#/components/schemas/BatchResolveItemDto"
+            },
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
       "BatchResultDto": {
         "description": "A batch answer: one entry per change.",
         "properties": {
@@ -5036,6 +5069,32 @@
         ],
         "type": "object"
       },
+      "EntityIdentityDto": {
+        "description": "A registered entity's canonical identity.",
+        "properties": {
+          "gts_id": {
+            "type": "string"
+          },
+          "gts_uuid": {
+            "description": "The Registry Reference, canonical lowercase hyphenated.",
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "gts_id",
+          "gts_uuid"
+        ],
+        "type": "object"
+      },
+      "EntityIdentityStatusDto": {
+        "description": "`found` or `not_found`.",
+        "enum": [
+          "found",
+          "not_found"
+        ],
+        "type": "string"
+      },
       "EntityKindDto": {
         "description": "`type_schema` or `instance`.",
         "enum": [
@@ -5119,6 +5178,48 @@
         "required": [
           "items",
           "page_info"
+        ],
+        "type": "object"
+      },
+      "EntityResolutionDto": {
+        "description": "One key's resolution, echoing the key it was asked by, as a batch read echoes it.",
+        "properties": {
+          "entity_key": {
+            "type": "string"
+          },
+          "identity": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EntityIdentityDto",
+                "description": "Present only on `found`, Active or deleted alike."
+              }
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/EntityIdentityStatusDto"
+          }
+        },
+        "required": [
+          "entity_key",
+          "status"
+        ],
+        "type": "object"
+      },
+      "EntityResolutionsDto": {
+        "description": "One answer per distinct key in a batch resolution. Result order is not contractual.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/EntityResolutionDto"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
         ],
         "type": "object"
       },
@@ -68445,6 +68546,154 @@
         ]
       }
     },
+    "/types-registry/v2/entities:batchResolve": {
+      "post": {
+        "description": "Resolve up to 100 keys in one round trip. Each item names one entity in `entity_key` (a canonical GTS identifier or a Registry Reference UUID), classified exactly as GET /types-registry/v2/entities/{entity_key} classifies it. Returns 200 with one result per distinct requested key, in no contractual order, echoing the key it was asked by, a Registry Reference in canonical lowercase hyphenated form: `found` with the registered entity's stored `identity` (`gts_id` and `gts_uuid`), Active or deleted alike, or `not_found`. A result carries no lifecycle, `etag` or document, and resolution looks up no validator, schema fingerprint or document. A key named twice, in any UUID spelling, collapses onto its first mention; the identifier and the Registry Reference of one entity are two keys and get two results. The limit counts every item, duplicates included. Query parameters are refused.",
+        "operationId": "types_registry.batch_resolve_identities",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchResolveRequest"
+              }
+            }
+          },
+          "description": "Keys to resolve",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EntityResolutionsDto"
+                }
+              }
+            },
+            "description": "One result per requested key"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Payload Too Large"
+          },
+          "415": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Resolve a set of GTS entity keys to canonical identities",
+        "tags": [
+          "Types Registry"
+        ]
+      }
+    },
     "/types-registry/v2/platform/entities": {
       "get": {
         "description": "Return one bounded page of entities, ordered by canonical identifier, with a cursor only when another match remains; a page with a cursor is full. `lifecycle_status` is `active` (default), `deleted` (tombstones only) or `all`. Each item is projected by `$select` exactly as GET /types-registry/v2/platform/entities/{entity_key} projects it; absent, the document-free default; `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always returned. A page never carries a validator. `depth` bounds the number of identifier segments and `kind` narrows to Type Schemas or Instances; `lifecycle_status`, `depth` and `kind` intersect with `pattern` before the page limit. `limit` (alias `$top`) defaults to 50 and may not exceed 100; a caller selecting documents should page smaller. `cursor` (alias `$skiptoken`) is opaque, versioned and bound to the pattern, `depth`, `kind`, `lifecycle_status` and the normalized `$select` it was issued for: resuming under any of them changed, or with a token of another version, is a 400, while an absent and an explicit default value of `$select` or `lifecycle_status` are interchangeable. Any other query parameter is refused.",
@@ -69510,6 +69759,154 @@
           }
         ],
         "summary": "Read a set of GTS entities by key",
+        "tags": [
+          "Types Registry"
+        ]
+      }
+    },
+    "/types-registry/v2/platform/entities:batchResolve": {
+      "post": {
+        "description": "Resolve up to 100 keys in one round trip. Each item names one entity in `entity_key` (a canonical GTS identifier or a Registry Reference UUID), classified exactly as GET /types-registry/v2/platform/entities/{entity_key} classifies it. Returns 200 with one result per distinct requested key, in no contractual order, echoing the key it was asked by, a Registry Reference in canonical lowercase hyphenated form: `found` with the registered entity's stored `identity` (`gts_id` and `gts_uuid`), Active or deleted alike, or `not_found`. A result carries no lifecycle, `etag` or document, and resolution looks up no validator, schema fingerprint or document. A key named twice, in any UUID spelling, collapses onto its first mention; the identifier and the Registry Reference of one entity are two keys and get two results. The limit counts every item, duplicates included. Query parameters are refused.",
+        "operationId": "types_registry.platform.batch_resolve_identities",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchResolveRequest"
+              }
+            }
+          },
+          "description": "Keys to resolve",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EntityResolutionsDto"
+                }
+              }
+            },
+            "description": "One result per requested key"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Payload Too Large"
+          },
+          "415": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "internalToken": []
+          }
+        ],
+        "summary": "Resolve a set of GTS entity keys to canonical identities",
         "tags": [
           "Types Registry"
         ]

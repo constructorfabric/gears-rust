@@ -169,7 +169,7 @@ async fn mandatory_tenant_type_read_preserves_caller_refusals_before_service_acc
         let tenant_id = Uuid::from_u128(0x1);
         seed_tenant(&tenants, tenant_id, TenantStatus::Active, "acme");
         let registry = Arc::new(registry_with_test_tenant_type());
-        registry.inject(Fault::on(Call::BatchGet).fail(refusal));
+        registry.inject(Fault::on(Call::BatchResolve).fail(refusal));
         let idp = Arc::new(FakeServiceAccountProvider::new());
         let service =
             ServiceAccountService::new(tenants, idp.clone(), registry.clone(), mock_enforcer());
@@ -181,7 +181,7 @@ async fn mandatory_tenant_type_read_preserves_caller_refusals_before_service_acc
 
         assert_eq!(at_the_boundary(error).1, Some(status));
         assert_eq!(idp.create_call_count(), 0);
-        assert_eq!(registry.platform_calls(Call::BatchGet), 0);
+        assert_eq!(registry.platform_calls(Call::BatchResolve), 0);
     }
 }
 

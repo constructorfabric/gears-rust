@@ -244,10 +244,29 @@ async fn the_tenant_resolving_client_follows_the_registry_with_the_callers_beare
         "{refused:?}"
     );
 
+    let mut fresh = read();
+    fresh.fresh = true;
+    let wrong_bearer = SecurityContext::builder()
+        .subject_id(tenant().subject_id())
+        .subject_tenant_id(tenant().subject_tenant_id())
+        .bearer_token("wrong-bearer".to_owned())
+        .build()
+        .expect("tenant context");
+    assert!(matches!(
+        client.batch_get_entities(&wrong_bearer, read()).await,
+        Err(CanonicalError::Unauthenticated { .. })
+    ));
+
     directory.point(Directory::At(second.base_url.clone()));
+    assert!(found(
+        &client
+            .batch_get_entities(&tenant(), read())
+            .await
+            .expect("cache hit")
+    ));
     assert_eq!(
         client
-            .batch_get_entities(&tenant(), read())
+            .batch_get_entities(&tenant(), fresh.clone())
             .await
             .expect("served by the registry it moved to")
             .0
@@ -264,7 +283,7 @@ async fn the_tenant_resolving_client_follows_the_registry_with_the_callers_beare
             .await,
     );
     directory.point(Directory::Down);
-    assert_unavailable(client.batch_get_entities(&tenant(), read()).await);
+    assert_unavailable(client.batch_get_entities(&tenant(), fresh).await);
 
     directory.point(Directory::At(first.base_url.clone()));
     assert!(found(
@@ -497,5 +516,91 @@ async fn the_platform_resolving_client_caches_above_resolution() {
         version(after),
         2,
         "no stale entry after the terminal outcome"
+    );
+}
+
+/// The platform resolving client keeps the identities its `resolve_*` helpers learned
+/// above resolution, and they outlive an observed revision: once the revision drops the
+/// snapshot entry, an ordinary read under the mandatory fields needs the registry, while
+/// a known identity resolves with the directory down. An unknown one, and every tenant
+/// resolution, still need it.
+#[tokio::test]
+async fn the_platform_resolving_client_resolves_known_identities_without_resolution() {
+    use types_registry_sdk::{
+        FieldSelection, GtsTypeId, PlatformTypesRegistryApiExt, ReadOptions, TypesRegistryApiExt,
+    };
+
+    let server = serve().await;
+    seed(&server).await;
+    let directory = Scripted::new(Directory::At(server.base_url.clone()));
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let client = PlatformTypesRegistryApiRestResolvingClient::new(
+        Arc::clone(&directory) as Arc<dyn EndpointResolver>,
+        "types-registry",
+        tuning(&resolutions),
+    );
+    let tenant_client = TypesRegistryApiRestResolvingClient::new(
+        Arc::clone(&directory) as Arc<dyn EndpointResolver>,
+        "types-registry",
+        ClientTuning::default(),
+    );
+    let type_id = GtsTypeId::try_new(CF_TYPE).unwrap();
+    let uuid = client
+        .resolve_type_uuid(&platform(), &type_id)
+        .await
+        .expect("registered");
+
+    let submitted = client
+        .register_entities(
+            &platform(),
+            key("resolving-identity-revision"),
+            RegisterEntitiesRequest {
+                items: vec![RegisterItem {
+                    gts_id: gts::GtsId::try_new(CF_TYPE).unwrap(),
+                    content: json!({
+                        "$id": format!("gts://{CF_TYPE}"),
+                        "$schema": "http://json-schema.org/draft-07/schema#",
+                        "type": "object",
+                        "description": "revised",
+                    }),
+                    expected_resource_version: Some(1),
+                    skip_compatibility_check: false,
+                }],
+                dry_run: false,
+                publisher: PublisherContext {
+                    name: "resolving-client-test".to_owned(),
+                    version: "1.0.0".parse().unwrap(),
+                },
+            },
+        )
+        .await
+        .expect("accepted");
+    await_completed(&client, submitted.operation_id).await;
+
+    directory.point(Directory::Down);
+    let light = ReadOptions::new().with_projection(FieldSelection::light());
+    assert_unavailable(
+        client
+            .batch_get_type_schemas(&platform(), std::slice::from_ref(&type_id), light)
+            .await,
+    );
+    assert_eq!(
+        client
+            .resolve_type_uuid(&platform(), &type_id)
+            .await
+            .expect("known"),
+        uuid
+    );
+    assert_eq!(
+        client
+            .resolve_type_id(&platform(), uuid)
+            .await
+            .expect("known"),
+        type_id
+    );
+    let unknown = GtsTypeId::try_new(gts_id!("cf.core.example.unknown.v1~")).unwrap();
+    assert_unavailable(client.resolve_type_uuid(&platform(), &unknown).await);
+    assert_unavailable(
+        TypesRegistryApiExt::resolve_type_uuid(&tenant_client, &tenant(), &type_id).await,
     );
 }

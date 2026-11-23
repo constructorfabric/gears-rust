@@ -30,8 +30,8 @@ use crate::domain::enums::{
 use crate::domain::error::LocalClientError;
 use crate::domain::key::EntityKey;
 use crate::domain::registry_service::{
-    BatchGetItem, DiscoveryQuery, EntityLookup, EntityRecord, MAX_KEY_LEN, OperationItemRecord,
-    OperationRecord, RegistryService, ServiceError,
+    BatchGetItem, DiscoveryQuery, EntityLookup, EntityRecord, OperationItemRecord, OperationRecord,
+    RegistryService, ServiceError,
 };
 use crate::domain::selection::{EntityField, FieldSelection};
 use crate::domain::validator::{IfNoneMatch, Validator};
@@ -90,10 +90,9 @@ impl LocalClient {
         let mut reads = Vec::with_capacity(request.items.len());
         for item in request.items {
             let key = domain_key(&item.key);
-            let if_none_match = match item.validator_for(&request.projection) {
-                Some(validator) => condition(validator)?,
-                None => None,
-            };
+            let if_none_match = item
+                .if_none_match_for(&request.projection)
+                .and_then(condition);
             asked.entry(key.clone()).or_insert(item.key);
             reads.push(BatchGetItem { key, if_none_match });
         }
@@ -123,6 +122,47 @@ impl LocalClient {
         })
         .await?;
         Ok(sdk::BatchGetEntitiesResponse(lookups))
+    }
+
+    /// The batch resolution both contracts serve: every key answered by the key it was
+    /// asked by, with the identity the registry stored for it.
+    async fn batch_resolve(
+        &self,
+        caller: CallerContext<'_>,
+        keys: Vec<sdk::EntityKey>,
+    ) -> Result<HashMap<sdk::EntityKey, Option<sdk::EntityIdentity>>, CanonicalError> {
+        let domain_keys: Vec<EntityKey> = keys.iter().map(domain_key).collect();
+        let mut asked: HashMap<EntityKey, sdk::EntityKey> = HashMap::with_capacity(keys.len());
+        for (key, sdk_key) in domain_keys.iter().zip(keys) {
+            asked.entry(key.clone()).or_insert(sdk_key);
+        }
+
+        let results = self
+            .service
+            .batch_resolve(caller, &domain_keys)
+            .await
+            .map_err(CanonicalError::from)?;
+
+        let mut answered = HashMap::with_capacity(results.len());
+        for (key, identity) in results {
+            let Some(asked_key) = asked.remove(&key) else {
+                tracing::error!(unexpected_key = ?key, "types_registry batch resolution answered a key it was not asked");
+                return Err(CanonicalError::internal(
+                    "the registry could not match a batch resolution result",
+                )
+                .create());
+            };
+            let identity = identity
+                .map(|identity| {
+                    Ok::<_, CanonicalError>(sdk::EntityIdentity {
+                        gts_id: gts_id(&identity.gts_id)?,
+                        gts_uuid: identity.gts_uuid,
+                    })
+                })
+                .transpose()?;
+            answered.insert(asked_key, identity);
+        }
+        Ok(answered)
     }
 
     /// The discovery page both contracts serve.
@@ -192,6 +232,14 @@ impl PlatformTypesRegistryApi for LocalClient {
         request: sdk::BatchGetEntitiesRequest,
     ) -> Result<sdk::BatchGetEntitiesResponse, CanonicalError> {
         self.batch_get(CallerContext::Platform(ctx), request).await
+    }
+
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &PlatformSecurityContext,
+        keys: Vec<sdk::EntityKey>,
+    ) -> Result<HashMap<sdk::EntityKey, Option<sdk::EntityIdentity>>, CanonicalError> {
+        self.batch_resolve(CallerContext::Platform(ctx), keys).await
     }
 
     async fn list_entities(
@@ -321,6 +369,14 @@ impl TypesRegistryApi for LocalClient {
         self.batch_get(CallerContext::Tenant(ctx), request).await
     }
 
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &SecurityContext,
+        keys: Vec<sdk::EntityKey>,
+    ) -> Result<HashMap<sdk::EntityKey, Option<sdk::EntityIdentity>>, CanonicalError> {
+        self.batch_resolve(CallerContext::Tenant(ctx), keys).await
+    }
+
     async fn list_entities(
         &self,
         ctx: &SecurityContext,
@@ -364,17 +420,11 @@ fn corrupt(
     CanonicalError::internal("the registry could not represent a stored value").create()
 }
 
-/// SDK validator bytes become a domain token, bounded like a key. Oversized values
-/// are refused first; non-UTF-8 values cannot be issued tokens and cause an
-/// unconditional read (DESIGN §3.3).
-fn condition(validator: &sdk::Validator) -> Result<Option<IfNoneMatch>, CanonicalError> {
-    let bytes = validator.as_bytes();
-    if bytes.len() > MAX_KEY_LEN {
-        return Err(ServiceError::ValidatorTooLong { len: bytes.len() }.into());
-    }
-    Ok(std::str::from_utf8(bytes)
+/// Non-UTF-8 bytes cannot be an issued token and cause an unconditional read.
+fn condition(validator: &sdk::Validator) -> Option<IfNoneMatch> {
+    std::str::from_utf8(validator.as_bytes())
         .ok()
-        .map(|token| IfNoneMatch::Validators(vec![token.to_owned()])))
+        .map(|token| IfNoneMatch::Validators(vec![token.to_owned()]))
 }
 
 /// `u64` precondition to the service's `i64`; above `i64::MAX` cannot exist. Refused in

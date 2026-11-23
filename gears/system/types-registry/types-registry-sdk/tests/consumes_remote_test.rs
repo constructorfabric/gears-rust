@@ -32,14 +32,16 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_contract::runtime::config::{CredentialState, InternalTokenProvider};
 use toolkit_security::{PlatformSecurityContext, SecurityContext};
 use types_registry_sdk::{
-    BatchGetEntitiesRequest, EntityKey, ListEntitiesRequest, PlatformTypesRegistryApi, Projection,
-    TypesRegistryApi,
+    BatchGetEntitiesRequest, EntityField, EntityKey, FieldSelection, GtsTypeId,
+    ListEntitiesRequest, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, Projection,
+    ReadOptions, TypesRegistryApi,
 };
 
 /// The kebab case of [`ConsumesFixture`], the name `#[toolkit::consumes]` derives.
 const CONSUMER: &str = "consumes-fixture";
 /// The one entity the stub registry knows: proof an answer came from it.
 const STUB_TYPE: &str = "gts.cf.core.example.stub_only.v1~";
+const STUB_UUID: uuid::Uuid = uuid::Uuid::from_u128(137);
 const BEARER: &str = "consumes-remote-bearer";
 /// The process's internal token, which the runtime hands every resolving client.
 const INTERNAL_TOKEN: &str = "consumes-remote-internal-token";
@@ -90,22 +92,23 @@ struct Received {
     internal_token: Option<String>,
 }
 
-/// A registry stand-in on TCP: every `GET` answers a discovery page holding
-/// [`STUB_TYPE`]; everything it receives is recorded.
+/// A registry stand-in serving one entity over discovery and batch reads.
 async fn stub_registry() -> (String, Arc<Mutex<Vec<Received>>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let received = Arc::new(Mutex::new(Vec::new()));
     let log = Arc::clone(&received);
-    let page = json!({
-        "items": [{
-            "gts_id": STUB_TYPE,
-            "gts_uuid": gts::GtsId::try_new(STUB_TYPE).unwrap().to_uuid(),
-            "kind": "type_schema",
-            "lifecycle_status": "active",
-        }],
-        "page_info": {},
-    })
+    let mut entity = json!({
+        "gts_id": STUB_TYPE,
+        "gts_uuid": STUB_UUID,
+        "kind": "type_schema",
+        "lifecycle_status": "active",
+    });
+    let page = json!({"items": [entity], "page_info": {}}).to_string();
+    entity["content"] = json!({"title": "from batchGet"});
+    let batch = json!({"items": [{
+        "entity_key": STUB_TYPE, "status": "found", "etag": "\"t1\"", "entity": entity,
+    }]})
     .to_string();
     tokio::spawn(async move {
         loop {
@@ -129,10 +132,20 @@ async fn stub_registry() -> (String, Arc<Mutex<Vec<Received>>>) {
                 authorization: header("authorization"),
                 internal_token: header("x-toolkit-internal-token"),
             });
+            let body = if head.starts_with("POST ") {
+                let len: usize = header("content-length").unwrap().parse().unwrap();
+                let mut bytes = vec![0; len];
+                stream.read_exact(&mut bytes).await.unwrap();
+                let request: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(request["items"], json!([{"entity_key": STUB_TYPE}]));
+                &batch
+            } else {
+                &page
+            };
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
-                 connection: close\r\n\r\n{page}",
-                page.len()
+                 connection: close\r\n\r\n{body}",
+                body.len()
             );
             drop(stream.write_all(response.as_bytes()).await);
         }
@@ -276,8 +289,34 @@ async fn a_host_without_the_registry_reaches_it_only_through_the_directory() {
             "answered by the stub"
         );
     }
+    // The platform page supplies both keys, even though no exact read has run.
+    let id = GtsTypeId::try_new(STUB_TYPE).unwrap();
+    assert_eq!(
+        platform.resolve_type_uuid(&marker, &id).await.unwrap(),
+        STUB_UUID
+    );
+    assert_eq!(
+        platform.resolve_type_id(&marker, STUB_UUID).await.unwrap(),
+        id
+    );
+    assert_eq!(
+        received.lock().len(),
+        2,
+        "both resolves used the page identity"
+    );
+    let options = ReadOptions::new().with_projection(FieldSelection::with(&[EntityField::Content]));
+    let schema = platform
+        .get_type_schema(&marker, &id, options)
+        .await
+        .expect("exact read");
+    assert_eq!(schema.content, Some(json!({"title": "from batchGet"})));
     let received = received.lock().clone();
-    assert_eq!(received.len(), 2, "{received:?}");
+    assert_eq!(received.len(), 3, "{received:?}");
+    assert!(
+        received[2]
+            .target
+            .starts_with("POST /types-registry/v2/platform/entities:batchGet ")
+    );
     assert!(
         received[0]
             .target

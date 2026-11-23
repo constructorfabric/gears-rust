@@ -15,9 +15,9 @@ use toolkit::api::operation_builder::{
 };
 
 use super::dto::{
-    BatchGetRequest, DeleteEntitiesRequest, EntityDto, EntityLookupsDto, EntityPageDto,
-    GtsEntityDto, ListEntitiesResponse, OperationAcceptedDto, OperationDto,
-    RegisterEntitiesRequest, RegisterEntitiesResponse, SubmitEntitiesRequest,
+    BatchGetRequest, BatchResolveRequest, DeleteEntitiesRequest, EntityDto, EntityLookupsDto,
+    EntityPageDto, EntityResolutionsDto, GtsEntityDto, ListEntitiesResponse, OperationAcceptedDto,
+    OperationDto, RegisterEntitiesRequest, RegisterEntitiesResponse, SubmitEntitiesRequest,
 };
 use super::handlers;
 pub use super::paths::{PLATFORM, V1, V2};
@@ -77,6 +77,7 @@ pub fn register_routes(
     for plane in [Plane::Platform, Plane::Tenant] {
         router = register_exact_read(router, openapi, plane);
         router = register_batch_get(router, openapi, plane);
+        router = register_batch_resolve(router, openapi, plane);
         router = register_discovery(router, openapi, &limits, plane);
     }
 
@@ -441,6 +442,51 @@ fn register_batch_get(router: Router, openapi: &dyn OpenApiRegistry, plane: Plan
     };
     builder
         .json_response_with_schema::<EntityLookupsDto>(
+            openapi,
+            StatusCode::OK,
+            "One result per requested key",
+        )
+        .standard_errors(openapi)
+        .error_413(openapi)
+        .error_415(openapi)
+        .error_422(openapi)
+        .error_503(openapi)
+        .register(router, openapi)
+}
+
+/// `POST {base}/entities:batchResolve`, on either plane: a key's canonical identity
+/// without its state.
+fn register_batch_resolve(router: Router, openapi: &dyn OpenApiRegistry, plane: Plane) -> Router {
+    let base = plane.base();
+    // A read-only custom action and a `POST` for the reasons `:batchGet` is.
+    let builder = OperationBuilder::post(format!("{base}/entities:batchResolve"))
+        .operation_id(plane.operation_id("batch_resolve_identities"))
+        .summary("Resolve a set of GTS entity keys to canonical identities")
+        .description(format!(
+            "Resolve up to 100 keys in one round trip. Each item names one entity in \
+             `entity_key` (a canonical GTS identifier or a Registry Reference UUID), \
+             classified exactly as GET {base}/entities/{{entity_key}} classifies it. \
+             Returns 200 with one result per distinct requested key, in no contractual \
+             order, echoing the key it was asked by, a Registry Reference in canonical \
+             lowercase hyphenated form: `found` with the registered entity's stored \
+             `identity` (`gts_id` and `gts_uuid`), Active or deleted alike, or `not_found`. \
+             A result carries no lifecycle, `etag` or document, and resolution looks up no \
+             validator, schema fingerprint or document. A key named twice, in any UUID \
+             spelling, collapses onto its first mention; the identifier and the Registry \
+             Reference of one entity are two keys and get two results. The limit counts \
+             every item, duplicates included. Query parameters are refused.",
+        ))
+        .tag(API_TAG);
+    let builder = plane
+        .authenticate(builder)
+        .require_license_features::<License>([])
+        .json_request::<BatchResolveRequest>(openapi, "Keys to resolve");
+    let builder = match plane {
+        Plane::Platform => builder.handler(handlers::platform_batch_resolve_entities),
+        Plane::Tenant => builder.handler(handlers::batch_resolve_entities),
+    };
+    builder
+        .json_response_with_schema::<EntityResolutionsDto>(
             openapi,
             StatusCode::OK,
             "One result per requested key",

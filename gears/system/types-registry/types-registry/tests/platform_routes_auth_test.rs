@@ -96,10 +96,18 @@ async fn send(
             .post(&format!("{base}{PLATFORM}/entities:batchGet"))
             .json(&json!({ "items": [{ "entity_key": CF_TYPE }] }))
             .unwrap(),
+        "platform_batch_resolve" => http
+            .post(&format!("{base}{PLATFORM}/entities:batchResolve"))
+            .json(&json!({ "items": [{ "entity_key": CF_TYPE }] }))
+            .unwrap(),
         "platform_list" => http.get(&format!("{base}{PLATFORM}/entities")),
         "tenant_get" => http.get(&format!("{base}{TENANT}/entities/{CF_TYPE}")),
         "tenant_batch_get" => http
             .post(&format!("{base}{TENANT}/entities:batchGet"))
+            .json(&json!({ "items": [{ "entity_key": CF_TYPE }] }))
+            .unwrap(),
+        "tenant_batch_resolve" => http
+            .post(&format!("{base}{TENANT}/entities:batchResolve"))
             .json(&json!({ "items": [{ "entity_key": CF_TYPE }] }))
             .unwrap(),
         "tenant_list" => http.get(&format!("{base}{TENANT}/entities")),
@@ -113,16 +121,22 @@ async fn send(
     (status, body)
 }
 
-const PLATFORM_ROUTES: [&str; 7] = [
+const PLATFORM_ROUTES: [&str; 8] = [
     "submit",
     "batch_delete",
     "delete",
     "operation",
     "platform_get",
     "platform_batch_get",
+    "platform_batch_resolve",
     "platform_list",
 ];
-const TENANT_ROUTES: [&str; 3] = ["tenant_get", "tenant_batch_get", "tenant_list"];
+const TENANT_ROUTES: [&str; 4] = [
+    "tenant_get",
+    "tenant_batch_get",
+    "tenant_batch_resolve",
+    "tenant_list",
+];
 
 /// A canonical `401` with its machine-readable reason, never a `500`.
 fn assert_refused(

@@ -68,7 +68,12 @@ fn the_defaults_are_the_ones_the_spec_documents() {
         cfg.local_client.cache.freshness_window,
         Duration::from_secs(30)
     );
-    assert_eq!(cfg.local_client.cache.store_bound.bytes(), 64 * 1024 * 1024);
+    assert_eq!(
+        cfg.local_client.cache.max_size_bytes.bytes(),
+        64 * 1024 * 1024
+    );
+    assert_eq!(cfg.local_client.cache.max_entries, 16_384);
+    assert_eq!(cfg.local_client.cache.max_identity_entries, 16 * 1024);
 }
 
 /// The existing keys are retained (SPEC §10.3), so an existing deployment's
@@ -87,21 +92,28 @@ fn the_pre_existing_keys_are_retained() {
     assert!(cfg.allow_compatibility_force);
 }
 
-/// `freshness_window` / `store_bound` configure the platform API's SDK client cache
+/// `freshness_window` / `max_size_bytes` / `max_entries` / `max_identity_entries` configure the platform API's SDK client cache
 /// (T36); a zero window is meaningful, not refused.
 #[test]
 fn the_client_cache_keys_parse_and_a_zero_window_is_accepted() {
     let cfg = parse(json!({
-        "local_client": { "cache": { "freshness_window": "0s", "store_bound": "16MB" } }
+        "local_client": {
+            "cache": { "freshness_window": "0s", "max_size_bytes": "16MB", "max_entries": 7, "max_identity_entries": 0 }
+        }
     }));
     assert_eq!(cfg.local_client.cache.freshness_window, Duration::ZERO);
     assert_eq!(
-        cfg.local_client.cache.store_bound,
+        cfg.local_client.cache.max_size_bytes,
         ByteSize::from_bytes(16 * 1024 * 1024)
     );
     let client = cfg.local_client.cache.client_cache();
     assert_eq!(client.freshness_window, Duration::ZERO);
-    assert_eq!(client.store_bound, 16 * 1024 * 1024);
+    assert_eq!(client.max_entries, 7);
+    assert_eq!(client.max_size_bytes, 16 * 1024 * 1024);
+    assert_eq!(
+        client.max_identity_entries, 0,
+        "a zero identity entry limit keeps none"
+    );
 }
 
 /// The four legacy `local_client.cache.*` keys stay live until T38 deletes the legacy

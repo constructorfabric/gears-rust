@@ -7,10 +7,12 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::{PlatformSecurityContext, SecurityContext};
 use uuid::Uuid;
 
+use std::collections::HashMap;
+
 use crate::models::{
     BatchGetEntitiesRequest, BatchGetEntitiesResponse, DeleteEntitiesRequest, DeletionOperation,
-    IdempotencyKey, ListEntitiesRequest, ListEntitiesResponse, Operation, RegisterEntitiesRequest,
-    RegistrationOperation,
+    EntityIdentity, EntityKey, IdempotencyKey, ListEntitiesRequest, ListEntitiesResponse,
+    Operation, RegisterEntitiesRequest, RegistrationOperation,
 };
 
 /// The platform-plane Types Registry contract.
@@ -77,6 +79,24 @@ pub trait PlatformTypesRegistryApi: Send + Sync {
         #[secctx] ctx: &PlatformSecurityContext,
         operation_id: Uuid,
     ) -> Result<Operation, CanonicalError>;
+
+    /// Resolve bounded keys to the canonical identity of the registered entity each names,
+    /// Active or deleted: its GTS identifier and Registry Reference, with no lifecycle,
+    /// validator or document. `None` when nothing is registered under the key. The platform
+    /// `resolve_*` helpers go through it.
+    ///
+    /// Bounded and refused as [`Self::batch_get_entities`] is. A client cache answers the
+    /// identities it already knows and sends only the others.
+    ///
+    /// # Errors
+    /// `CanonicalError`; absent keys are answers, not errors. `Internal` when the registry
+    /// leaves a key unanswered or answers it with another entity's identity.
+    #[idempotency(SafeRead)]
+    async fn batch_resolve_identities(
+        &self,
+        #[secctx] ctx: &PlatformSecurityContext,
+        keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError>;
 }
 
 /// The tenant-plane Types Registry contract: the platform's reads, with the same models,
@@ -108,6 +128,18 @@ pub trait TypesRegistryApi: Send + Sync {
         #[secctx] ctx: &SecurityContext,
         request: ListEntitiesRequest,
     ) -> Result<ListEntitiesResponse, CanonicalError>;
+
+    /// As [`PlatformTypesRegistryApi::batch_resolve_identities`], under the tenant's read
+    /// access. The tenant `resolve_*` helpers go through it.
+    ///
+    /// # Errors
+    /// As [`PlatformTypesRegistryApi::batch_resolve_identities`].
+    #[idempotency(SafeRead)]
+    async fn batch_resolve_identities(
+        &self,
+        #[secctx] ctx: &SecurityContext,
+        keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError>;
 }
 
 #[cfg(test)]

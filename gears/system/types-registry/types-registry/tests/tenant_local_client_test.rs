@@ -22,8 +22,8 @@ use types_registry::domain::policy::RegistrationPolicy;
 use types_registry::domain::registry_service::RegistryService;
 use types_registry::infra::outbox::OutboxDispatch;
 use types_registry_sdk::{
-    BatchGetEntitiesRequest, BatchGetItem, Condition, EntityField, EntityFilter, EntityKey,
-    EntityKind, EntityLookup, FieldSelection, IdempotencyKey, ListEntitiesRequest, OperationStatus,
+    BatchGetEntitiesRequest, BatchGetItem, EntityField, EntityFilter, EntityKey, EntityKind,
+    EntityLookup, FieldSelection, IdempotencyKey, ListEntitiesRequest, OperationStatus,
     PageRequest, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, Projection,
     PublisherContext, ReadOptions, RegisterEntitiesRequest, RegisterItem, TypesRegistryApi,
     TypesRegistryApiExt, Validator,
@@ -237,10 +237,7 @@ async fn a_batch_read_is_found_then_unchanged_under_the_same_select() {
     );
 
     let conditional = batch(
-        vec![BatchGetItem {
-            key: key.clone(),
-            if_none_match: first.0[&key].condition(),
-        }],
+        vec![BatchGetItem::new(key.clone()).revalidate(&first.0[&key])],
         projection,
     );
     let again = TypesRegistryApi::batch_get_entities(&h.client, &tenant(), conditional.clone())
@@ -263,22 +260,29 @@ async fn an_unusable_condition_reads_in_full_and_an_oversized_one_is_refused() {
     let h = harness().await;
     seed(&h, vec![create(CF_TYPE, schema(CF_TYPE))]).await;
     let key = EntityKey::from(id(CF_TYPE));
+    let first = TypesRegistryApi::batch_get_entities(
+        &h.client,
+        &tenant(),
+        batch(vec![key.clone().into()], Projection::Default),
+    )
+    .await
+    .expect("first read");
+    let EntityLookup::Found { entity, .. } = &first.0[&key] else {
+        panic!("found")
+    };
     let conditional = |validator: Vec<u8>| {
+        let previous = EntityLookup::Found {
+            entity: entity.clone(),
+            etag: Validator::from_bytes(validator),
+        };
         batch(
-            vec![BatchGetItem {
-                key: key.clone(),
-                if_none_match: Some(Condition::new(
-                    &key,
-                    Validator::from_bytes(validator),
-                    Projection::Default,
-                )),
-            }],
+            vec![BatchGetItem::new(key.clone()).revalidate(&previous)],
             Projection::Default,
         )
     };
 
     // Not UTF-8, so not a token this registry issued: the condition is unusable (DESIGN §3.3).
-    let unusable = conditional(vec![0xff, 0xfe]);
+    let unusable = conditional(vec![0xff; 2048]);
     let tenant_read = TypesRegistryApi::batch_get_entities(&h.client, &tenant(), unusable.clone())
         .await
         .expect("an unusable condition is not a refusal");
@@ -290,8 +294,8 @@ async fn an_unusable_condition_reads_in_full_and_an_oversized_one_is_refused() {
             .expect("reads")
     );
 
-    // The bound holds whatever the bytes are.
-    let oversized = conditional(vec![0xff; 2048]);
+    // The domain service rejects an oversized token.
+    let oversized = conditional(vec![b'a'; 2048]);
     let tenant_refusal =
         TypesRegistryApi::batch_get_entities(&h.client, &tenant(), oversized.clone())
             .await

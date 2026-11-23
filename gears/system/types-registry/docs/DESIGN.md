@@ -1443,12 +1443,7 @@ pub struct BatchGetItem {
     /// One value, one field — `EntityKey` is an enum, and the wire spells it
     /// as the single string `entity_key`, classified exactly as the path segment is.
     pub key: EntityKey,
-    /// Makes the read conditional for that key alone, where the condition
-    /// applies; `None` reads it unconditionally. A `Condition` binds a
-    /// validator to its entity and to the fields held under it, ordinarily
-    /// taken from the answer itself (`EntityLookup::condition`). Transports
-    /// send it only for the same entity and a projection it covers.
-    pub if_none_match: Option<Condition>,
+    // Private revalidation state, set through revalidate(&previous_lookup).
 }
 
 /// Default yields the service default set; Select yields exactly its fields.
@@ -1465,7 +1460,7 @@ pub enum EntityLookup {
     /// `etag` is metadata outside `$select`; it names the entity's state and is
     /// the same under every projection. Named for
     /// the header it is carried in rather than for its `Validator` type, so
-    /// that it pairs by sight with `BatchGetItem::if_none_match`.
+    /// that it pairs by sight with `BatchGetItem::if_none_match_for`.
     Found { snapshot: Box<EntitySnapshot>, etag: Validator },
     /// Validator matched; the snapshot was not transferred. The `etag` is
     /// still returned — RFC 9110 §15.4.5 — so every result but `NotFound`
@@ -1747,7 +1742,20 @@ The P1 SDK cache required by `cpt-cf-types-registry-fr-client-cache` lives in ea
 
 Each client instance stores one entry per `(entity, visibility context, Context Tenant)`, containing the snapshot, the fields it covers, its validator, and the last-confirmed instant. A read is answered from the entry only when the entry covers its normalized projection, and is cut down to exactly that projection. An answer under the entry's validator is merged into the entry, unless the two together would not fit the store, in which case the entry is kept as it was; an answer under a new validator replaces it, and one too large to keep still removes the stale entry. Plane is implicit in the client instance. On the tenant plane, visibility context is the subject tenant from `SecurityContext`; on the platform plane it is a fixed unrestricted marker. Principal identity is otherwise absent because results are not grant-filtered: a `read` grant is gear-wide, so two subjects of one tenant that both hold it see identical content. The consequence is that this cache is not an authorization boundary — within the freshness window a subject whose grant was revoked may still be served an entry an authorized one populated, which is accepted because the consumer process legitimately holds that content already and a strict caller uses `fresh`. Keying by subject instead would multiply entries per end user for the same bytes. This prevents a shared client instance from serving a snapshot visible to one tenant subject to another subject that names the same Context Tenant.
 
-Found entries are indexed by both identifier and UUID so either resolution direction hits the same snapshot.
+Each `Found` supplies the canonical identifier and its Registry Reference. The client
+uses these two keys to address the same snapshot. It learns the binding from the
+registry and can resolve either spelling while the pair is cached. The registry's
+assignment and stability guarantees are defined in ADR-0001.
+
+Identifier/Registry Reference resolution on the platform plane is answered from a separate, entry-bounded identity store kept beside the snapshots: positive only, without window, validator or lifecycle, learned from checked reads that found the entity and left alone by observed mutations, because identity is permanent and a deleted entity still resolves. Unknown keys are read through the snapshot entries under the mandatory fields. A future purge or a change of logical registry resets it.
+
+The P0 tenant client shares one snapshot per entity across all tenants that can see
+it. A separate LRU of visibility confirmations gates reuse. It expires confirmations
+with the freshness window and bounds their total count by `max_entries`. Each
+`NotFound` revokes only the caller's confirmation. The resolving REST client also
+keys confirmations by the bearer used for the registry read. When representations
+depend on visibility context or Context Tenant, the snapshot key must reflect those
+dimensions.
 
 ##### Freshness window
 
@@ -1764,7 +1772,9 @@ Availability drives the default because ADR-0010 may change it without entity mu
 | Knob | Default | Why this value |
 |---|---|---|
 | Freshness window | 30 s | Bounds how long a retired contract can be served as available, while letting a hot path serving hundreds of requests a second revalidate a given entity twice a minute rather than on every call. `0` is meaningful and supported |
-| Store bound | 64 MB of cached snapshots, evicted least-recently-used | §3.2, *Bounded inputs*, caps one resolved document at 1 MB, so an entry-count bound would bound memory to nothing useful — sixty-four entries could be 64 KB or 64 MB |
+| `max_size_bytes` | 64 MiB | Counts compact JSON snapshot bytes and raw validator bytes. An individual entry larger than this budget is returned to the caller without being retained. |
+| `max_entries` | 16 384 snapshots | Limits per-entry overhead for small snapshots. The store evicts least-recently-used entries to meet both limits. Zero disables snapshot retention. |
+| `max_identity_entries` | 16 384 entries | One Registry Reference and one identifier each, at most 1 KB of identifier text, so a few MB at typical lengths; an entry count fits because an identity, unlike a resolved document, has a small fixed ceiling. `0` keeps none: resolutions are then ordinary light reads through the snapshot entries |
 | `fresh` on a read | false | Bypasses the window for one call and revalidates unconditionally. One boolean, and it is what makes the cache safe to leave enabled for a caller that occasionally needs an authoritative verdict |
 
 ##### What is not cached
@@ -1772,7 +1782,7 @@ Availability drives the default because ADR-0010 may change it without entity mu
 - **`NotFound`.** Registration is followed by a read often enough that caching absence would make a newly admitted entity invisible for the length of the window.
 - **`Failed`.** A source that could not answer said nothing about the entity; retaining that as knowledge is the conversion of unavailability into absence that ADR-0002 forbids.
 - **A `ConcreteReferenceSet`.** It is not a snapshot, and a validator over it would have to cover the availability inputs of every member.
-- **A discovery page or its items.** A page is a changing, paginated set rather than an exact-key answer and carries no validators.
+- **Discovery pages and snapshots from their items.** Each list request reads the registry. The P0 platform client learns each returned identifier and Registry Reference for future `resolve_*` calls. The page supplies no snapshot validator.
 - **An operation resource.** `get_operation` reads progress that changes precisely because it is being polled.
 
 ##### Revalidation

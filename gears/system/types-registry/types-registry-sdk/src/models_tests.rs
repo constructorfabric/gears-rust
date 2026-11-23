@@ -4,7 +4,7 @@ use gts::GtsId;
 use uuid::Uuid;
 
 use super::{
-    BatchGetEntitiesRequest, BatchGetItem, Condition, Cursor, EntityField, EntityFilter, EntityKey,
+    BatchGetEntitiesRequest, BatchGetItem, Cursor, EntityField, EntityFilter, EntityKey,
     EntityKind, FieldSelection, IdempotencyKey, LifecycleFilter, ListEntitiesRequest, PageRequest,
     Projection, ReadOptions, Validator,
 };
@@ -483,27 +483,21 @@ fn a_batch_read_keeps_its_keys_in_order_and_conditions_only_the_asked_key() {
     let first = EntityKey::from(id("gts.cf.example.batch.thing.v1~"));
     let second = EntityKey::from(Uuid::nil());
     let validator = Validator::from_bytes(b"etag".to_vec());
-    let condition = Condition::new(&second, validator, Projection::Default);
-    let request = BatchGetEntitiesRequest::new([
-        BatchGetItem::new(first.clone()),
-        BatchGetItem::new(second.clone()).with_if_none_match(condition.clone()),
-    ]);
+    let item = BatchGetItem::for_cache_read(
+        second.clone(),
+        Some(validator.clone()),
+        &Projection::Default.normalized(),
+    );
+    let request = BatchGetEntitiesRequest::new([BatchGetItem::new(first.clone()), item]);
+    assert_eq!(request.items[0].key, first);
+    assert_eq!(request.items[1].key, second);
     assert_eq!(
-        request,
-        BatchGetEntitiesRequest {
-            items: vec![
-                BatchGetItem {
-                    key: first.clone(),
-                    if_none_match: None,
-                },
-                BatchGetItem {
-                    key: second,
-                    if_none_match: Some(condition),
-                },
-            ],
-            projection: Projection::Default,
-            fresh: false,
-        }
+        request.items[0].if_none_match_for(&request.projection),
+        None
+    );
+    assert_eq!(
+        request.items[1].if_none_match_for(&request.projection),
+        Some(&validator)
     );
     let keyed = BatchGetEntitiesRequest::new([first.clone()].map(BatchGetItem::new))
         .with_fresh(true)
@@ -522,8 +516,8 @@ mod conditions {
 
     use super::id;
     use crate::models::{
-        BatchGetItem, Condition, Entity, EntityField, EntityKey, EntityKind, EntityLookup,
-        FieldSelection, LifecycleStatus, Projection, Validator,
+        BatchGetItem, Entity, EntityField, EntityKey, EntityKind, EntityLookup, FieldSelection,
+        LifecycleStatus, Projection, Validator,
     };
 
     const TYPE: &str = "gts.cf.test.pkg.thing.v1~";
@@ -536,7 +530,7 @@ mod conditions {
     /// A snapshot of `gts_id` read with only its content selected.
     fn content_read(gts_id: &str, kind: EntityKind) -> Entity {
         let gts_id = id(gts_id);
-        let gts_uuid = gts_id.to_uuid();
+        let gts_uuid = Uuid::from_u128(137);
         Entity {
             gts_id,
             gts_uuid,
@@ -555,33 +549,52 @@ mod conditions {
         Projection::Select(FieldSelection::with(fields))
     }
 
-    #[test]
-    fn a_condition_of_an_answer_covers_exactly_the_fields_it_carries() {
-        let key = EntityKey::from(id(TYPE));
-        let held = Condition::of(&content_read(TYPE, EntityKind::TypeSchema), etag());
-        assert_eq!(
-            held.validator_for(&key, &select(&[EntityField::Content])),
-            Some(&etag())
-        );
-        assert_eq!(
-            held.validator_for(&key, &FieldSelection::light().into()),
-            Some(&etag())
-        );
-        for wider in [
-            Projection::Default,
-            select(&[EntityField::Content, EntityField::ResolvedSchema]),
-            FieldSelection::full().into(),
-        ] {
-            assert_eq!(held.validator_for(&key, &wider), None, "{wider:?}");
+    fn found(entity: Entity) -> EntityLookup {
+        EntityLookup::Found {
+            entity: Box::new(entity),
+            etag: etag(),
         }
     }
 
-    /// An Instance never has the derived documents or provenance, so holding its content
-    /// covers a read that also selects them.
     #[test]
-    fn an_instance_holds_the_fields_its_kind_never_has() {
-        let key = EntityKey::from(id(INSTANCE));
-        let held = Condition::of(&content_read(INSTANCE, EntityKind::Instance), etag());
+    fn revalidation_uses_both_returned_keys_and_only_the_held_fields() {
+        let snapshot = content_read(TYPE, EntityKind::TypeSchema);
+        let keys = [
+            EntityKey::from(snapshot.gts_id.clone()),
+            EntityKey::from(snapshot.gts_uuid),
+        ];
+        let previous = found(snapshot);
+        for key in keys {
+            let item = BatchGetItem::new(key).revalidate(&previous);
+            assert_eq!(
+                item.if_none_match_for(&select(&[EntityField::Content])),
+                Some(&etag())
+            );
+            assert_eq!(
+                item.if_none_match_for(&FieldSelection::light().into()),
+                Some(&etag())
+            );
+            for wider in [
+                Projection::Default,
+                select(&[EntityField::Content, EntityField::ResolvedSchema]),
+                FieldSelection::full().into(),
+            ] {
+                assert_eq!(item.if_none_match_for(&wider), None, "{wider:?}");
+            }
+        }
+        for key in [EntityKey::from(id(INSTANCE)), EntityKey::from(Uuid::nil())] {
+            let item = BatchGetItem::new(key).revalidate(&previous);
+            assert_eq!(
+                item.if_none_match_for(&select(&[EntityField::Content])),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn an_instance_covers_fields_that_do_not_apply_to_its_kind() {
+        let item = BatchGetItem::new(id(INSTANCE))
+            .revalidate(&found(content_read(INSTANCE, EntityKind::Instance)));
         let documents = select(&[
             EntityField::Content,
             EntityField::ResolvedSchema,
@@ -589,49 +602,24 @@ mod conditions {
             EntityField::EffectiveTraitsSchema,
             EntityField::Provenance,
         ]);
-        assert_eq!(held.validator_for(&key, &documents), Some(&etag()));
-        assert_eq!(held.validator_for(&key, &Projection::Default), None);
-    }
-
-    /// The negative coverage case a caller can construct by hand: held under the
-    /// default projection, read with content. The read goes unconditionally.
-    #[test]
-    fn a_condition_that_does_not_cover_the_read_is_not_sent() {
-        let key = EntityKey::from(id(TYPE));
-        let item = BatchGetItem::new(key.clone()).with_if_none_match(Condition::new(
-            &key,
-            etag(),
-            Projection::Default,
-        ));
-        assert_eq!(item.validator_for(&Projection::Default), Some(&etag()));
-        assert_eq!(item.validator_for(&select(&[EntityField::Content])), None);
+        assert_eq!(item.if_none_match_for(&documents), Some(&etag()));
+        assert_eq!(item.if_none_match_for(&Projection::Default), None);
     }
 
     #[test]
-    fn a_condition_applies_to_either_key_form_of_its_entity_and_no_other() {
-        let by_id = EntityKey::from(id(TYPE));
-        let by_uuid = EntityKey::from(id(TYPE).to_uuid());
-        let held = Condition::new(&by_id, etag(), FieldSelection::full());
-        assert_eq!(held.entity(), by_uuid.to_uuid());
-        for key in [&by_id, &by_uuid] {
-            assert_eq!(held.validator_for(key, &Projection::Default), Some(&etag()));
+    fn results_without_a_snapshot_clear_revalidation() {
+        let lookup = found(content_read(TYPE, EntityKind::TypeSchema));
+        let item = BatchGetItem::new(id(TYPE)).revalidate(&lookup);
+        let light = FieldSelection::light().into();
+        assert_eq!(item.if_none_match_for(&light), Some(&etag()));
+        for previous in [
+            EntityLookup::Unchanged { etag: etag() },
+            EntityLookup::NotFound,
+        ] {
+            assert_eq!(
+                item.clone().revalidate(&previous).if_none_match_for(&light),
+                None
+            );
         }
-        for other in [EntityKey::from(id(INSTANCE)), EntityKey::from(Uuid::nil())] {
-            assert_eq!(held.validator_for(&other, &Projection::Default), None);
-            let item = BatchGetItem::new(other).with_if_none_match(held.clone());
-            assert_eq!(item.validator_for(&Projection::Default), None);
-        }
-    }
-
-    #[test]
-    fn only_a_found_answer_gives_a_condition() {
-        let entity = content_read(TYPE, EntityKind::TypeSchema);
-        let found = EntityLookup::Found {
-            entity: Box::new(entity.clone()),
-            etag: etag(),
-        };
-        assert_eq!(found.condition(), Some(Condition::of(&entity, etag())));
-        assert_eq!(EntityLookup::Unchanged { etag: etag() }.condition(), None);
-        assert_eq!(EntityLookup::NotFound.condition(), None);
     }
 }

@@ -262,18 +262,28 @@ pub struct LocalClientSettings {
     pub cache: CacheSettings,
 }
 
-/// Cache settings: the SDK client cache over the platform API published here, and the
-/// legacy client's per-kind caches until T38 removes them.
+/// Cache settings: the SDK client caches over the platform and tenant APIs published
+/// here, each with its own store under these limits, and the legacy client's per-kind
+/// caches until T38 removes them.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CacheSettings {
-    /// How long the platform API's client cache serves a confirmed entry before it
-    /// revalidates (SPEC §8.3). `0s` revalidates every read.
+    /// How long either API's client cache serves a confirmed entry before it
+    /// revalidates (SPEC §8.3); on the tenant API, also how long a tenant's confirmed
+    /// visibility of an entry is reused. `0s` revalidates every snapshot read.
     #[serde(with = "toolkit_utils::humantime_serde")]
     pub freshness_window: Duration,
-    /// Bytes of snapshots the platform API's client cache holds, evicted
-    /// least-recently-used, e.g. `64MB`.
-    pub store_bound: ByteSize,
+    /// Maximum total bytes of compact JSON snapshots and their raw validators per cache,
+    /// e.g. `64MB`, so up to twice this across both APIs. Each cache evicts
+    /// least-recently-used snapshots.
+    pub max_size_bytes: ByteSize,
+    /// Maximum number of snapshots per cache. Zero disables snapshot retention.
+    pub max_entries: usize,
+    /// Entries — one per entity — of the platform API cache's identity store, which the
+    /// platform `resolve_*` helpers answer from, evicted least-recently-used, with no
+    /// window; the tenant API keeps none. `0` keeps no identities: a snapshot inside the
+    /// freshness window can still answer a key, and other keys go to the registry.
+    pub max_identity_entries: usize,
     /// The legacy client's type-schema cache.
     pub type_schemas: SingleCacheSettings,
     /// The legacy client's instance cache.
@@ -284,9 +294,11 @@ impl Default for CacheSettings {
     fn default() -> Self {
         Self {
             freshness_window: types_registry_sdk::CacheSettings::DEFAULT_FRESHNESS_WINDOW,
-            store_bound: ByteSize::from_bytes(
-                types_registry_sdk::CacheSettings::DEFAULT_STORE_BOUND,
+            max_size_bytes: ByteSize::from_bytes(
+                types_registry_sdk::CacheSettings::DEFAULT_MAX_SIZE_BYTES,
             ),
+            max_entries: types_registry_sdk::CacheSettings::DEFAULT_MAX_ENTRIES,
+            max_identity_entries: types_registry_sdk::CacheSettings::DEFAULT_MAX_IDENTITY_ENTRIES,
             type_schemas: SingleCacheSettings::default(),
             instances: SingleCacheSettings::default(),
         }
@@ -299,7 +311,9 @@ impl CacheSettings {
     pub fn client_cache(&self) -> types_registry_sdk::CacheSettings {
         types_registry_sdk::CacheSettings {
             freshness_window: self.freshness_window,
-            store_bound: self.store_bound.bytes(),
+            max_size_bytes: self.max_size_bytes.bytes(),
+            max_entries: self.max_entries,
+            max_identity_entries: self.max_identity_entries,
         }
     }
 }

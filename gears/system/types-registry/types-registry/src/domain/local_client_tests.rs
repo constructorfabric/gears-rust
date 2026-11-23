@@ -83,19 +83,17 @@ fn a_validator_is_the_token_text_or_an_unusable_condition() {
     let token = sdk::Validator::from_bytes(b"AQID".to_vec());
     assert!(matches!(
         condition(&token),
-        Ok(Some(IfNoneMatch::Validators(tokens))) if tokens == ["AQID"]
+        Some(IfNoneMatch::Validators(tokens)) if tokens == ["AQID"]
     ));
 
     let bytes = sdk::Validator::from_bytes(vec![0xFF, 0xFE]);
-    assert!(
-        matches!(condition(&bytes), Ok(None)),
-        "not UTF-8: no condition"
-    );
+    assert!(condition(&bytes).is_none(), "not UTF-8: no condition");
 
-    let oversized = sdk::Validator::from_bytes(vec![0xFF; 2048]);
+    let long = "v".repeat(2048);
+    let oversized = sdk::Validator::from_bytes(long.as_bytes());
     assert!(matches!(
         condition(&oversized),
-        Err(CanonicalError::InvalidArgument { .. })
+        Some(IfNoneMatch::Validators(tokens)) if tokens == [long]
     ));
 }
 

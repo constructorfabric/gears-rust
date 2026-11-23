@@ -5,6 +5,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use toolkit_macros::domain_model;
 use toolkit_security::crypto::hash::Sha256;
 
+/// Maximum token length accepted by the registry. REST batch reads also bound the quoted tag.
+pub const MAX_VALIDATOR_LEN: usize = 1024;
+
 /// ponytail: ceiling C7 — no visibility or availability inputs yet; P1 adds them
 /// under a new version, which a v2 token then never matches. v1 also digested the
 /// selected fields; its tokens no longer match.

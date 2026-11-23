@@ -15,8 +15,8 @@ use toolkit_db::{DBProvider, DbError};
 use toolkit_gts::{all_inventory_instances, all_inventory_type_schemas};
 use tracing::{debug, info};
 use types_registry_sdk::{
-    CachedPlatformTypesRegistry, PlatformTypesRegistryApi, RegisterResult, RegisterSummary,
-    TypesRegistryApi, TypesRegistryClient,
+    CachedPlatformTypesRegistry, CachedTypesRegistry, PlatformTypesRegistryApi, RegisterResult,
+    RegisterSummary, TypesRegistryApi, TypesRegistryClient,
 };
 
 use crate::config::{RegistryMode, TypesRegistryConfig};
@@ -84,7 +84,7 @@ impl Default for TypesRegistryGear {
     }
 }
 
-/// The seeded database-backed client and the platform API's cache settings, held in the
+/// The seeded database-backed client and both APIs' cache settings, held in the
 /// `ClientHub` only while `init` wires the two contracts: the `provides` factories receive
 /// a context, not the gear.
 struct SeededClient {
@@ -140,12 +140,17 @@ impl TypesRegistryGear {
         )))
     }
 
-    /// `provides` factory: the tenant API over the same seeded database, uncached in P0.
+    /// `provides` factory: the tenant API over the seeded database, behind its own SDK
+    /// client cache, whose snapshots are shared across tenants.
     fn seeded_tenant_api(
         ctx: &GearCtx,
         _policies: Arc<PolicyStack>,
     ) -> anyhow::Result<Arc<dyn TypesRegistryApi>> {
-        Ok(Arc::clone(&Self::seeded(ctx)?.client) as Arc<dyn TypesRegistryApi>)
+        let seeded = Self::seeded(ctx)?;
+        Ok(Arc::new(CachedTypesRegistry::new_local(
+            Arc::clone(&seeded.client) as Arc<dyn TypesRegistryApi>,
+            seeded.cache,
+        )))
     }
 
     /// Publish both contracts over `registry`, through the `provides` wiring.
@@ -269,13 +274,15 @@ impl Gear for TypesRegistryGear {
 
         debug!(
             "Loaded types_registry config: entity_id_fields={:?}, schema_id_fields={:?}, \
-             local_client.cache={{freshness_window={:?}, store_bound={}}}, \
+             local_client.cache={{freshness_window={:?}, max_size_bytes={}, max_entries={}, max_identity_entries={}}}, \
              local_client.cache.type_schemas={{capacity={}, ttl={:?}}}, \
              local_client.cache.instances={{capacity={}, ttl={:?}}}",
             cfg.entity_id_fields,
             cfg.schema_id_fields,
             cfg.local_client.cache.freshness_window,
-            cfg.local_client.cache.store_bound,
+            cfg.local_client.cache.max_size_bytes,
+            cfg.local_client.cache.max_entries,
+            cfg.local_client.cache.max_identity_entries,
             cfg.local_client.cache.type_schemas.capacity,
             cfg.local_client.cache.type_schemas.ttl,
             cfg.local_client.cache.instances.capacity,

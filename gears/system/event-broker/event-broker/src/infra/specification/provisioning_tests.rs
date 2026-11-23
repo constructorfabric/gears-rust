@@ -325,6 +325,23 @@ impl PlatformTypesRegistryApi for ReferencingRegistry {
     ) -> Result<Operation, CanonicalError> {
         self.inner.get_operation(ctx, operation_id).await
     }
+
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &toolkit_security::PlatformSecurityContext,
+        keys: Vec<types_registry_sdk::EntityKey>,
+    ) -> Result<
+        std::collections::HashMap<
+            types_registry_sdk::EntityKey,
+            Option<types_registry_sdk::EntityIdentity>,
+        >,
+        toolkit_canonical_errors::CanonicalError,
+    > {
+        types_registry_sdk::ext::resolve_through_batch_get(keys, |request| {
+            types_registry_sdk::PlatformTypesRegistryApi::batch_get_entities(self, ctx, request)
+        })
+        .await
+    }
 }
 
 fn instance(db: &Arc<DBProvider<toolkit_db::DbError>>) -> TypesRegistrySpecificationManager {

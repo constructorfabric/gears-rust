@@ -4,9 +4,10 @@
 //! Each call that reaches the transport resolves the registry anew and rebuilds the client
 //! only when the endpoint changes (`DirectoryResolvingClient`). While the directory has no
 //! live registry, or cannot answer, such a call is a canonical `ServiceUnavailable`; nothing
-//! falls back to another implementation. A platform read the client cache answers inside
+//! falls back to another implementation. A read the client cache answers inside
 //! its window does not reach the transport.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -19,12 +20,12 @@ use uuid::Uuid;
 
 use super::client::TypesRegistryApiRestClient;
 use super::platform_client::PlatformTypesRegistryApiRestClient;
-use crate::cache::{CacheSettings, CachedPlatformTypesRegistry};
+use crate::cache::{CacheSettings, CachedPlatformTypesRegistry, CachedTypesRegistry};
 use crate::contract::{PlatformTypesRegistryApi, TypesRegistryApi};
 use crate::models::{
     BatchGetEntitiesRequest, BatchGetEntitiesResponse, DeleteEntitiesRequest, DeletionOperation,
-    IdempotencyKey, ListEntitiesRequest, ListEntitiesResponse, Operation, RegisterEntitiesRequest,
-    RegistrationOperation,
+    EntityIdentity, EntityKey, IdempotencyKey, ListEntitiesRequest, ListEntitiesResponse,
+    Operation, RegisterEntitiesRequest, RegistrationOperation,
 };
 
 /// [`PlatformTypesRegistryApi`] on whichever registry the directory names, behind the SDK
@@ -96,6 +97,15 @@ impl PlatformTypesRegistryApi for PlatformTypesRegistryApiRestResolvingClient {
         operation_id: Uuid,
     ) -> Result<Operation, CanonicalError> {
         self.inner.get_operation(ctx, operation_id).await
+    }
+
+    /// The cache's identity store, so a known identity resolves nothing.
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &PlatformSecurityContext,
+        keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
+        self.inner.batch_resolve_identities(ctx, keys).await
     }
 }
 
@@ -170,16 +180,27 @@ impl PlatformTypesRegistryApi for PlatformResolving {
     ) -> Result<Operation, CanonicalError> {
         self.client().await?.get_operation(ctx, operation_id).await
     }
+
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &PlatformSecurityContext,
+        keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
+        self.client()
+            .await?
+            .batch_resolve_identities(ctx, keys)
+            .await
+    }
 }
 
-/// [`TypesRegistryApi`] on whichever registry the directory names. Each call forwards its
-/// own caller's bearer; the tuning's internal-token source is never used.
+/// [`TypesRegistryApi`] on whichever registry the directory names, with an SDK cache
+/// shared across tenants. Each request to the registry forwards the caller's bearer.
 pub struct TypesRegistryApiRestResolvingClient {
-    inner: DirectoryResolvingClient<TypesRegistryApiRestClient>,
+    inner: CachedTypesRegistry,
 }
 
 impl TypesRegistryApiRestResolvingClient {
-    /// Resolve `from_gear` through `resolver` on every call.
+    /// Resolve `from_gear` through `resolver` on calls that reach the registry.
     #[must_use]
     pub fn new(
         resolver: Arc<dyn EndpointResolver>,
@@ -189,11 +210,12 @@ impl TypesRegistryApiRestResolvingClient {
         let inner = DirectoryResolvingClient::new(resolver, from_gear, tuning, |config| {
             TypesRegistryApiRestClient::new(config).map_err(TransportError::network)
         });
-        Self { inner }
-    }
-
-    async fn client(&self) -> Result<Arc<TypesRegistryApiRestClient>, CanonicalError> {
-        Ok(self.inner.resolved().await?)
+        Self {
+            inner: CachedTypesRegistry::new_rest(
+                Arc::new(TenantResolving { inner }),
+                CacheSettings::default(),
+            ),
+        }
     }
 }
 
@@ -204,7 +226,7 @@ impl TypesRegistryApi for TypesRegistryApiRestResolvingClient {
         ctx: &SecurityContext,
         request: BatchGetEntitiesRequest,
     ) -> Result<BatchGetEntitiesResponse, CanonicalError> {
-        self.client().await?.batch_get_entities(ctx, request).await
+        self.inner.batch_get_entities(ctx, request).await
     }
 
     async fn list_entities(
@@ -212,6 +234,58 @@ impl TypesRegistryApi for TypesRegistryApiRestResolvingClient {
         ctx: &SecurityContext,
         request: ListEntitiesRequest,
     ) -> Result<ListEntitiesResponse, CanonicalError> {
-        self.client().await?.list_entities(ctx, request).await
+        self.inner.list_entities(ctx, request).await
+    }
+
+    /// The cache's visibility-confirmed snapshots, so a known identity resolves nothing.
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &SecurityContext,
+        keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
+        self.inner.batch_resolve_identities(ctx, keys).await
+    }
+}
+
+struct TenantResolving {
+    inner: DirectoryResolvingClient<TypesRegistryApiRestClient>,
+}
+
+#[async_trait]
+impl TypesRegistryApi for TenantResolving {
+    async fn batch_get_entities(
+        &self,
+        ctx: &SecurityContext,
+        request: BatchGetEntitiesRequest,
+    ) -> Result<BatchGetEntitiesResponse, CanonicalError> {
+        self.inner
+            .resolved()
+            .await?
+            .batch_get_entities(ctx, request)
+            .await
+    }
+
+    async fn list_entities(
+        &self,
+        ctx: &SecurityContext,
+        request: ListEntitiesRequest,
+    ) -> Result<ListEntitiesResponse, CanonicalError> {
+        self.inner
+            .resolved()
+            .await?
+            .list_entities(ctx, request)
+            .await
+    }
+
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &SecurityContext,
+        keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
+        self.inner
+            .resolved()
+            .await?
+            .batch_resolve_identities(ctx, keys)
+            .await
     }
 }

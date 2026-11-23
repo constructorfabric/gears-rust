@@ -29,7 +29,7 @@ mod rest_client;
 )]
 pub mod testing_platform;
 
-pub use cache::{CacheSettings, CachedPlatformTypesRegistry};
+pub use cache::{CacheSettings, CachedPlatformTypesRegistry, CachedTypesRegistry};
 pub use contract::{
     PlatformTypesRegistryApi, TypesRegistryApi, platform_types_registry_api_ir,
     types_registry_api_ir,
@@ -39,9 +39,9 @@ pub use ext::{PlatformTypesRegistryApiExt, TypesRegistryApiExt};
 pub use gts::{OPERATION_RESOURCE_TYPE, TYPE_RESOURCE_TYPE};
 pub use item_failure::{AdmissionFailure, AdmissionFailureReason, DependencyKind};
 pub use models::{
-    BatchGetEntitiesRequest, BatchGetEntitiesResponse, BatchGetItem, CandidateStatus, Condition,
-    Cursor, DeleteEntitiesRequest, DeleteItem, DeletionItemResult, DeletionOperation,
-    DeletionOutcome, Entity, EntityField, EntityFilter, EntityKey, EntityKind, EntityLookup,
+    BatchGetEntitiesRequest, BatchGetEntitiesResponse, BatchGetItem, CandidateStatus, Cursor,
+    DeleteEntitiesRequest, DeleteItem, DeletionItemResult, DeletionOperation, DeletionOutcome,
+    Entity, EntityField, EntityFilter, EntityIdentity, EntityKey, EntityKind, EntityLookup,
     FieldSelection, IdempotencyKey, Instance, JsonDocument, LifecycleFilter, LifecycleStatus,
     ListEntitiesRequest, ListEntitiesResponse, Operation, OperationStatus, Origin, PageRequest,
     Projection, Provenance, PublisherContext, PublisherVersion, PublisherVersionError, ReadOptions,

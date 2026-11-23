@@ -10,6 +10,7 @@ use crate::domain::error::DomainError;
 use crate::domain::error::LocalClientError;
 use crate::domain::registry_service::{MAX_BATCH_GET_KEYS, MAX_KEY_LEN, ServiceError};
 use crate::domain::selection::{EntityField, SelectionError};
+use crate::domain::validator::MAX_VALIDATOR_LEN;
 
 #[resource_error(gts_id!("cf.core.types_registry.entity.v1~"))]
 pub struct TypeRegistryError;
@@ -504,7 +505,7 @@ pub fn validator_too_long(field_name: &'static str, len: usize) -> CanonicalErro
     invalid_field(
         field_name,
         format!(
-            "each {field_name} entity-tag must be at most {MAX_KEY_LEN} bytes; this one is {len}"
+            "each {field_name} entity-tag must be at most {MAX_VALIDATOR_LEN} bytes; this one is {len}"
         ),
         field::VALIDATION_FAILED,
     )

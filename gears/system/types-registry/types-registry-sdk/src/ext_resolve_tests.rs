@@ -2,7 +2,8 @@
 //! directions.
 //!
 //! A recording decorator makes every read observable: its request, and which context
-//! object it was made under. It can also answer a Registry Reference other than the
+//! object it was made under. It resolves through [`resolve_through_batch_get`], as a test
+//! double with only a batch read does. It can also answer a Registry Reference other than the
 //! identifier's own, to show the helpers return what the registry read, not a local hash.
 
 use std::collections::HashMap;
@@ -15,11 +16,11 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::{PlatformSecurityContext, SecurityContext};
 use uuid::Uuid;
 
-use super::MAX_BATCH_GET_KEYS;
+use super::{MAX_BATCH_GET_KEYS, resolve_through_batch_get};
 use crate::testing_platform::{Call, Fault, MockTypesRegistry, ProtocolFault, Seed};
 use crate::{
     BatchGetEntitiesRequest, BatchGetEntitiesResponse, BatchGetItem, DeleteEntitiesRequest,
-    DeletionOperation, EntityKey, EntityLookup, FieldSelection, IdempotencyKey,
+    DeletionOperation, EntityIdentity, EntityKey, EntityLookup, FieldSelection, IdempotencyKey,
     ListEntitiesRequest, ListEntitiesResponse, Operation, PlatformTypesRegistryApi,
     PlatformTypesRegistryApiExt, Projection, RegisterEntitiesRequest, RegistrationOperation,
     TypesRegistryApi, TypesRegistryApiExt,
@@ -143,6 +144,16 @@ impl PlatformTypesRegistryApi for Recording {
     ) -> Result<Operation, CanonicalError> {
         self.inner.get_operation(ctx, operation_id).await
     }
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &PlatformSecurityContext,
+        keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
+        resolve_through_batch_get(keys, |request| {
+            PlatformTypesRegistryApi::batch_get_entities(self, ctx, request)
+        })
+        .await
+    }
 }
 
 #[async_trait]
@@ -162,6 +173,16 @@ impl TypesRegistryApi for Recording {
         request: ListEntitiesRequest,
     ) -> Result<ListEntitiesResponse, CanonicalError> {
         TypesRegistryApi::list_entities(&self.inner, ctx, request).await
+    }
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &SecurityContext,
+        keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
+        resolve_through_batch_get(keys, |request| {
+            TypesRegistryApi::batch_get_entities(self, ctx, request)
+        })
+        .await
     }
 }
 
@@ -506,6 +527,19 @@ macro_rules! plane_tests {
             }
 
             #[tokio::test]
+            async fn a_reverse_read_answered_with_another_reference_fails() {
+                let client = Recording::seeded();
+                *client.answered_uuid.lock() = Some(Uuid::from_u128(0xA5));
+                let api: &dyn $contract = &client;
+                let ctx = $context;
+                assert_kind($ext::resolve_type_id(api, &ctx, uuid(TYPE)).await, internal);
+                assert_kind(
+                    $ext::resolve_instance_ids(api, &ctx, &[uuid(INSTANCE)]).await,
+                    internal,
+                );
+            }
+
+            #[tokio::test]
             async fn an_empty_resolution_needs_no_transport() {
                 let client = Recording::default();
                 let api: &dyn $contract = &client;
@@ -558,3 +592,170 @@ plane_tests!(
         .build()
         .expect("a caller context")
 );
+
+/// [`resolve_through_batch_get`] reads every key under the mandatory fields and answers
+/// each distinct key once: the registered entity it names, Active or deleted, or `None`.
+#[tokio::test]
+async fn resolving_through_a_batch_read_answers_every_distinct_key_from_one_light_read() {
+    let client = Recording::seeded();
+    let api: &dyn PlatformTypesRegistryApi = &client;
+    let ctx = PlatformSecurityContext::outbound_marker();
+    let keys = [
+        EntityKey::GtsId(GtsId::try_new(TYPE).expect("identifier")),
+        EntityKey::GtsUuid(uuid(DELETED_INSTANCE)),
+        EntityKey::GtsId(GtsId::try_new(UNREGISTERED_TYPE).expect("identifier")),
+    ];
+    let mut asked = keys.to_vec();
+    asked.push(keys[0].clone());
+
+    let identities = api
+        .batch_resolve_identities(&ctx, asked)
+        .await
+        .expect("read");
+
+    assert_eq!(client.reads().len(), 1);
+    client.assert_id_only_reads_under(&ctx);
+    assert_eq!(identities.len(), 3);
+    for (key, id) in [(&keys[0], TYPE), (&keys[1], DELETED_INSTANCE)] {
+        let gts_id = GtsId::try_new(id).expect("identifier");
+        let gts_uuid = gts_id.to_uuid();
+        assert_eq!(
+            identities[key],
+            Some(crate::EntityIdentity { gts_id, gts_uuid })
+        );
+    }
+    assert_eq!(identities[&keys[2]], None);
+}
+
+/// [`resolve_through_batch_get`] reads unconditionally, so a key its read leaves out, or
+/// answers `Unchanged`, is a broken read: it fails as `Internal` rather than posing as an
+/// absent entity.
+#[tokio::test]
+async fn resolving_through_a_batch_read_refuses_a_key_left_unanswered_or_unchanged() {
+    let key = EntityKey::GtsId(GtsId::try_new(TYPE).expect("identifier"));
+    let unchanged = EntityLookup::Unchanged {
+        etag: crate::Validator::from_bytes(b"etag".to_vec()),
+    };
+    for answer in [None, Some(unchanged)] {
+        let result = resolve_through_batch_get(vec![key.clone()], |_| {
+            let answered = answer.clone().map(|lookup| (key.clone(), lookup));
+            async move { Ok(BatchGetEntitiesResponse(answered.into_iter().collect())) }
+        })
+        .await;
+        assert!(
+            matches!(result, Err(CanonicalError::Internal { .. })),
+            "{answer:?}: {result:?}"
+        );
+    }
+}
+
+// the shared check of a batch resolution's answers.
+
+fn identity_of(id: &str) -> EntityIdentity {
+    let gts_id = GtsId::try_new(id).expect("identifier");
+    let gts_uuid = gts_id.to_uuid();
+    EntityIdentity { gts_id, gts_uuid }
+}
+
+/// A batch resolution's answers, by the key asked.
+type Answers = HashMap<EntityKey, Option<EntityIdentity>>;
+
+fn by_id(id: &str) -> EntityKey {
+    EntityKey::GtsId(GtsId::try_new(id).expect("identifier"))
+}
+
+/// What every client accepts from the registry's batch resolution: each distinct key
+/// answered once, found or absent, the identity of the entity its key names.
+#[test]
+fn a_consistent_resolution_is_accepted_per_distinct_key() {
+    let asked = vec![
+        by_id(TYPE),
+        EntityKey::GtsUuid(uuid(TYPE)),
+        by_id(UNREGISTERED_TYPE),
+        by_id(TYPE),
+    ];
+    let answered = HashMap::from([
+        (by_id(TYPE), Some(identity_of(TYPE))),
+        (EntityKey::GtsUuid(uuid(TYPE)), Some(identity_of(TYPE))),
+        (by_id(UNREGISTERED_TYPE), None),
+    ]);
+    assert_eq!(
+        super::checked_resolutions(&asked, answered.clone()).expect("consistent"),
+        answered
+    );
+}
+
+/// Anything else is a protocol fault of the whole batch, never an identity or an absence.
+#[test]
+fn an_inconsistent_resolution_is_refused_whole() {
+    let other_uuid = EntityKey::GtsUuid(uuid(INSTANCE));
+    let cases: Vec<(&str, Vec<EntityKey>, Answers)> = vec![
+        ("no answer at all", vec![by_id(TYPE)], HashMap::new()),
+        (
+            "an unasked key",
+            vec![by_id(TYPE)],
+            HashMap::from([(by_id(TYPE), None), (by_id(INSTANCE), None)]),
+        ),
+        (
+            "another entity's identity",
+            vec![by_id(TYPE)],
+            HashMap::from([(by_id(TYPE), Some(identity_of(INSTANCE)))]),
+        ),
+        (
+            "another Registry Reference's identity",
+            vec![other_uuid.clone()],
+            HashMap::from([(other_uuid, Some(identity_of(TYPE)))]),
+        ),
+        (
+            "two identifiers for one Registry Reference",
+            vec![by_id(TYPE), by_id(INSTANCE)],
+            HashMap::from([
+                (by_id(TYPE), Some(identity_of(TYPE))),
+                (
+                    by_id(INSTANCE),
+                    Some(EntityIdentity {
+                        gts_id: GtsId::try_new(INSTANCE).expect("identifier"),
+                        gts_uuid: uuid(TYPE),
+                    }),
+                ),
+            ]),
+        ),
+        (
+            "two Registry References for one identifier",
+            vec![
+                EntityKey::GtsUuid(uuid(TYPE)),
+                EntityKey::GtsUuid(uuid(INSTANCE)),
+            ],
+            HashMap::from([
+                (EntityKey::GtsUuid(uuid(TYPE)), Some(identity_of(TYPE))),
+                (
+                    EntityKey::GtsUuid(uuid(INSTANCE)),
+                    Some(EntityIdentity {
+                        gts_id: GtsId::try_new(TYPE).expect("identifier"),
+                        gts_uuid: uuid(INSTANCE),
+                    }),
+                ),
+            ]),
+        ),
+        (
+            "found by identifier, absent by Registry Reference",
+            vec![by_id(TYPE), EntityKey::GtsUuid(uuid(TYPE))],
+            HashMap::from([
+                (by_id(TYPE), Some(identity_of(TYPE))),
+                (EntityKey::GtsUuid(uuid(TYPE)), None),
+            ]),
+        ),
+        (
+            "found by Registry Reference, absent by identifier",
+            vec![EntityKey::GtsUuid(uuid(TYPE)), by_id(TYPE)],
+            HashMap::from([
+                (EntityKey::GtsUuid(uuid(TYPE)), Some(identity_of(TYPE))),
+                (by_id(TYPE), None),
+            ]),
+        ),
+    ];
+    for (what, asked, answered) in cases {
+        let error = super::checked_resolutions(&asked, answered).expect_err(what);
+        assert!(internal(&error), "{what}: {error:?}");
+    }
+}

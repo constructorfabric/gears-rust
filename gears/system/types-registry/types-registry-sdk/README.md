@@ -328,11 +328,36 @@ in `ClientHub`. Missing database or failed seeding leaves neither registered;
   It keeps one entry per entity, holding every field read under one validator: a read
   the entry covers is answered from it with exactly the selected fields, an answer under
   the same validator merges into it and one under a new validator replaces it.
+  Snapshot retention is limited by both `max_entries` (16 384 by default) and
+  `max_size_bytes` (64 MiB of compact JSON plus raw validator bytes). The cache evicts
+  least-recently-used entries to meet both limits. Zero for either disables snapshot retention.
   A confirmed entry is served for `freshness_window` (30 s by default), then revalidated
   in one conditional batch; `fresh` revalidates at once. A terminal successful outcome
   this client observes drops the affected entries; a change it did not observe can be
   served until the window ends. `NotFound`, failed reads, discovery pages and
-  operations are never cached, and the tenant API is uncached.
+  operations are never cached.
+- Tenant reads have their own shared snapshot cache (`CachedTypesRegistry`). On the
+  first read of an entity by a tenant, the registry confirms its visibility. If a
+  snapshot is already resident, the client can send its `ETag` and reuse it on
+  `Unchanged`. A `NotFound` clears the caller's confirmation and leaves the shared
+  snapshot available to other confirmed tenants. Confirmations expire after
+  `freshness_window` and their LRU holds at most `max_entries` records. The resolving
+  REST client also binds confirmation to the bearer it forwarded. Authentication and
+  permission errors revoke all confirmations for that viewer. `fresh` checks
+  current visibility and content with the registry. A tenant resolution answers from a
+  snapshot only under a fresh confirmation for that viewer and sends the rest to
+  `:batchResolve`; its `not_found` withdraws that viewer's confirmation of the key.
+- The platform cache keeps each confirmed `(gts_id, gts_uuid)` pair in a separate
+  LRU for the `resolve_*` helpers. Both exact reads and platform discovery pages supply
+  these pairs. After listing an entity, either key resolves locally while the pair is
+  resident. Listing leaves snapshot contents and their freshness unchanged.
+  The LRU keeps up to `max_identity_entries` identities (16 384 by default). With `0`,
+  a resolution is answered only by a resident snapshot confirmed inside the window, or
+  else by the registry's `:batchResolve`. The identity cache
+  keeps successful lookups, has no freshness window and survives observed
+  registrations and deletions, since identity is permanent and a deleted entity still
+  resolves. P0 has no purge; ADR-0013's purge, or a client moved to another logical
+  registry, will need it reset.
 - Legacy and new catalogues share seeds but no later writes until T38. Dependencies
   registered only through legacy cannot support publication through the new API.
 - Shared-database outbox polling can delay admission by one minute; keep
@@ -387,10 +412,9 @@ cache, this flag has no effect.
 
 ### Conditional reads
 
-A validator names an entity's state and is the same under every projection, so
-`Unchanged` says that what you hold is current, not which fields it has. A `Condition`
-binds a validator to its entity and to the fields held under it; take it from the answer
-you hold, never rebuild it from the next request's projection:
+Use `BatchGetItem::new(key).revalidate(&previous_lookup)` to refresh a snapshot you already
+hold. The same `ETag` applies to every projection of the entity. The SDK sends it when the
+previous snapshot contains all the fields requested by the batch.
 
 ```rust,no_run
 use toolkit_security::PlatformSecurityContext;
@@ -404,11 +428,7 @@ async fn refresh(
     key: EntityKey,
     held: &EntityLookup,
 ) -> anyhow::Result<()> {
-    let mut item = BatchGetItem::new(key.clone());
-    // The fields and the entity are read off the snapshot held, not the next request.
-    if let Some(condition) = held.condition() {
-        item = item.with_if_none_match(condition);
-    }
+    let item = BatchGetItem::new(key.clone()).revalidate(held);
     let answer = registry
         .batch_get_entities(ctx, BatchGetEntitiesRequest::new([item]))
         .await?;
@@ -421,17 +441,30 @@ async fn refresh(
 }
 ```
 
-Every transport sends the condition only for the same entity (either key form) and a
-projection its fields cover; otherwise the read goes unconditionally and is answered in
-full. `Condition::new(key, etag, covers)` is for adapters that track coverage themselves.
+A transport calls `item.if_none_match_for(&request.projection)` to obtain the `ETag` to
+send. It returns `None` for a different entity or missing fields. After `Unchanged`,
+keep the original `Found` result for future revalidation. Passing `Unchanged` or
+`NotFound` to `revalidate` makes the next read unconditional.
 
 `resolve_type_uuid` / `resolve_instance_uuid` map registered IDs to Registry
 References; `resolve_type_id` / `resolve_instance_id` reverse them. Plural forms
-follow `batch_get_*` rules. They take no options, select mandatory fields through
-normal caching, and return snapshot values for active or deleted entities.
+follow `batch_get_*` rules. They take no options and return the identifier and Registry
+Reference of active or deleted entities. On both contracts they go through
+`batch_resolve_identities`, served as `POST {base}/entities:batchResolve`: the registry
+returns each key's stored pair, or `not_found`, and reads no snapshot, validator or
+document. The platform client cache answers identities it already knows, then fresh
+resident snapshots, and sends only the others; the tenant cache answers only from a
+snapshot freshly confirmed for the caller. Every client refuses an answer that leaves a
+key out, answers an unasked key, names another entity, or contradicts itself, as
+`Internal`. A remote client needs a registry that serves `:batchResolve`, so deploy the
+registry first. A test double with only a batch read can implement the method with
+`types_registry_sdk::ext::resolve_through_batch_get`.
+For a first lookup by GTS ID, the SDK sends the identifier as given and reads
+`gts_uuid` from the registry response. Eviction removes both keys from the identity LRU.
+Callers migrating from `EntityKey::to_uuid()` can use the matching `resolve_*_uuid`
+helper for a GTS ID or take the UUID already present in `EntityKey::GtsUuid`.
 Unknown or other-kind references return `NotFound` singly, `None` in batches;
 invalid/wrong-kind identifiers return `InvalidArgument` before reading.
-Use `GtsId::to_uuid` for deterministic UUID derivation without registration or a read.
 
 `EntityField::Provenance` selects a managed Type Schema's `provenance` group as a whole:
 `TypeSchema::provenance` is `None` when unselected and `Some(Provenance { .. })` when
@@ -607,7 +640,8 @@ event carries `reconcile_id` directly.
   prerequisites; refused prerequisites block their dependents without supplying their old
   revisions. Independent candidates may still succeed, and dry runs validate against a
   disposable copy. Managed schemas must fully materialize, matching the real registry's
-  rejection of unresolved/circular schema resources. `Fault` delays or fails calls, `reject` and
+  rejection of unresolved/circular schema resources. `Fault` delays or fails calls (`Call::BatchResolve` for identity-only resolution,
+  `Call::BatchGet` for snapshot reads), `reject` and
   `depends_on` steer admission, `strict()` panics on an unexpected call, and `calls`,
   `reads` and `submissions` record what happened. `install` registers it in a `ClientHub`
   under both contracts.

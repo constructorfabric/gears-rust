@@ -25,22 +25,28 @@ pub enum EntityKey {
 }
 
 impl EntityKey {
+    /// Whether the answer carries the exact identifier or Registry Reference requested.
+    pub(crate) fn names(&self, entity: &Entity) -> bool {
+        match self {
+            Self::GtsId(id) => *id == entity.gts_id,
+            Self::GtsUuid(uuid) => *uuid == entity.gts_uuid,
+        }
+    }
+
+    /// Whether the identity carries the exact identifier or Registry Reference requested.
+    pub(crate) fn identifies(&self, identity: &EntityIdentity) -> bool {
+        match self {
+            Self::GtsId(id) => *id == identity.gts_id,
+            Self::GtsUuid(uuid) => *uuid == identity.gts_uuid,
+        }
+    }
+
     /// Kind from the identifier’s trailing `~`; Registry References carry no kind.
     #[must_use]
     pub fn kind(&self) -> Option<EntityKind> {
         match self {
             Self::GtsId(id) => Some(EntityKind::of(id)),
             Self::GtsUuid(_) => None,
-        }
-    }
-
-    /// The Registry Reference of the entity the key names: an identifier's is derived
-    /// from it, so both forms of one entity give the same UUID.
-    #[must_use]
-    pub fn to_uuid(&self) -> Uuid {
-        match self {
-            Self::GtsId(id) => id.to_uuid(),
-            Self::GtsUuid(uuid) => *uuid,
         }
     }
 }
@@ -92,96 +98,28 @@ impl fmt::Debug for Validator {
     }
 }
 
-/// What a caller holds of one entity: the validator a read gave it, and the fields of
-/// the snapshot it holds under that validator.
-///
-/// A validator names the entity's state and is the same under every projection, so
-/// `Unchanged` only says that what the caller holds is current. A condition is
-/// therefore sent only for a read of the same entity whose projection it covers;
-/// any other read goes unconditionally and is answered in full. Validators carry no
-/// identity, so the entity binding is the condition's, never the token's. P0 reads
-/// have one visibility scope (SPEC C7).
+/// The held validator, the keys it belongs to, and the fields it can revalidate.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Condition {
-    entity: Uuid,
+struct Condition {
+    key: EntityKey,
+    registry_reference: Option<Uuid>,
     etag: Validator,
     covers: FieldSelection,
 }
 
 impl Condition {
-    /// What a caller holds after a read answered `entity` with `etag`: the fields the
-    /// snapshot carries, and those its kind never has. Read off the snapshot itself, so
-    /// it cannot claim a field the caller does not hold. This is the ordinary way to a
-    /// condition; [`EntityLookup::condition`] gives it straight from an answer.
-    #[must_use]
-    pub fn of(entity: &Entity, etag: Validator) -> Self {
-        let schema = entity.kind == EntityKind::TypeSchema;
-        let held: Vec<EntityField> = [
-            (EntityField::Origin, entity.origin.is_some(), true),
-            (EntityField::Content, entity.content.is_some(), true),
-            (
-                EntityField::ResolvedSchema,
-                entity.resolved_schema.is_some(),
-                schema,
-            ),
-            (
-                EntityField::EffectiveTraits,
-                entity.effective_traits.is_some(),
-                schema,
-            ),
-            (
-                EntityField::EffectiveTraitsSchema,
-                entity.effective_traits_schema.is_some(),
-                schema,
-            ),
-            (EntityField::Provenance, entity.provenance.is_some(), schema),
-        ]
-        .into_iter()
-        .filter(|(_, present, applicable)| *present || !applicable)
-        .map(|(field, ..)| field)
-        .collect();
+    fn from_snapshot(entity: &Entity, etag: &Validator) -> Self {
+        // A field that does not apply to the kind is covered: the registry never sends it.
+        let held: Vec<EntityField> = EntityField::ALL
+            .into_iter()
+            .filter(|field| entity.has(*field) || !field.applies_to(entity.kind))
+            .collect();
         Self {
-            entity: entity.gts_uuid,
-            etag,
+            key: EntityKey::from(entity.gts_id.clone()),
+            registry_reference: Some(entity.gts_uuid),
+            etag: etag.clone(),
             covers: FieldSelection::with(&held),
         }
-    }
-
-    /// `etag` as read for `key` under `covers`: the projection of the snapshot held. For
-    /// adapters that track coverage themselves; a caller holding the answer uses
-    /// [`Self::of`], which cannot mistake the next read's projection for the held one.
-    #[must_use]
-    pub fn new(key: &EntityKey, etag: Validator, covers: impl Into<Projection>) -> Self {
-        Self {
-            entity: key.to_uuid(),
-            etag,
-            covers: covers.into().normalized(),
-        }
-    }
-
-    /// The entity this condition is about.
-    #[must_use]
-    pub fn entity(&self) -> Uuid {
-        self.entity
-    }
-
-    #[must_use]
-    pub fn etag(&self) -> &Validator {
-        &self.etag
-    }
-
-    /// The fields held under [`Self::etag`].
-    #[must_use]
-    pub fn covers(&self) -> &FieldSelection {
-        &self.covers
-    }
-
-    /// The validator to send with a read of `key` under `projection`: only for the same
-    /// entity, and only when the held fields include every field the read selects.
-    #[must_use]
-    pub fn validator_for(&self, key: &EntityKey, projection: &Projection) -> Option<&Validator> {
-        (key.to_uuid() == self.entity && self.covers.is_superset(&projection.normalized()))
-            .then_some(&self.etag)
     }
 }
 
@@ -189,9 +127,7 @@ impl Condition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchGetItem {
     pub key: EntityKey,
-    /// Makes the read conditional for this key alone, where the condition applies (see
-    /// [`Condition::validator_for`]); `None` reads it unconditionally.
-    pub if_none_match: Option<Condition>,
+    condition: Option<Condition>,
 }
 
 impl BatchGetItem {
@@ -200,24 +136,44 @@ impl BatchGetItem {
     pub fn new(key: impl Into<EntityKey>) -> Self {
         Self {
             key: key.into(),
-            if_none_match: None,
+            condition: None,
         }
     }
 
-    /// Makes this key's read conditional on `condition`, where it applies.
+    /// Revalidate a previous result. Only a `Found` snapshot supplies a validator.
+    /// After `Unchanged`, retain the original `Found` for subsequent reads.
     #[must_use]
-    pub fn with_if_none_match(mut self, condition: Condition) -> Self {
-        self.if_none_match = Some(condition);
+    pub fn revalidate(mut self, previous: &EntityLookup) -> Self {
+        self.condition = match previous {
+            EntityLookup::Found { entity, etag } => Some(Condition::from_snapshot(entity, etag)),
+            EntityLookup::Unchanged { .. } | EntityLookup::NotFound => None,
+        };
         self
     }
 
-    /// The validator a transport sends for this key under `projection`: the condition's,
-    /// where it applies to this key and projection, and otherwise none.
+    /// Forward the cache's already checked validator for exactly this key and selection.
+    pub(crate) fn for_cache_read(
+        key: EntityKey,
+        etag: Option<Validator>,
+        covers: &FieldSelection,
+    ) -> Self {
+        let condition = etag.map(|etag| Condition {
+            key: key.clone(),
+            registry_reference: None,
+            etag,
+            covers: covers.clone(),
+        });
+        Self { key, condition }
+    }
+
+    /// The `ETag` to send in this item's `if_none_match` when the held snapshot names
+    /// this entity and covers the requested fields. The `ETag` itself is projection-independent.
     #[must_use]
-    pub fn validator_for(&self, projection: &Projection) -> Option<&Validator> {
-        self.if_none_match
-            .as_ref()
-            .and_then(|condition| condition.validator_for(&self.key, projection))
+    pub fn if_none_match_for(&self, projection: &Projection) -> Option<&Validator> {
+        let held = self.condition.as_ref()?;
+        let same_entity = self.key == held.key
+            || matches!(&self.key, EntityKey::GtsUuid(uuid) if held.registry_reference == Some(*uuid));
+        (same_entity && held.covers.is_superset(&projection.normalized())).then_some(&held.etag)
     }
 }
 
@@ -312,6 +268,23 @@ impl EntityField {
         Self::LifecycleStatus,
         Self::Origin,
     ];
+
+    /// Whether the registry answers this field for an entity of `kind`: the derived
+    /// documents and provenance belong to a Type Schema only.
+    pub(crate) const fn applies_to(self, kind: EntityKind) -> bool {
+        match self {
+            Self::GtsId
+            | Self::GtsUuid
+            | Self::Kind
+            | Self::LifecycleStatus
+            | Self::Origin
+            | Self::Content => true,
+            Self::ResolvedSchema
+            | Self::EffectiveTraits
+            | Self::EffectiveTraitsSchema
+            | Self::Provenance => matches!(kind, EntityKind::TypeSchema),
+        }
+    }
 
     /// The wire name, as `$select` spells it.
     #[must_use]
@@ -445,6 +418,15 @@ impl ReadOptions {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BatchGetEntitiesResponse(pub HashMap<EntityKey, EntityLookup>);
 
+/// A registered entity's identity, as the `resolve_*` helpers answer it: its canonical
+/// identifier and Registry Reference, without lifecycle, validator or snapshot. See
+/// [`PlatformTypesRegistryApi::batch_resolve_identities`](crate::PlatformTypesRegistryApi::batch_resolve_identities).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EntityIdentity {
+    pub gts_id: GtsId,
+    pub gts_uuid: Uuid,
+}
+
 /// Per-key read result; match future variants with a fallback arm.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -458,19 +440,6 @@ pub enum EntityLookup {
     Unchanged { etag: Validator },
     /// Absent.
     NotFound,
-}
-
-impl EntityLookup {
-    /// The condition a caller holding this answer sends with its next read of the entity:
-    /// [`Condition::of`] a `Found`. `Unchanged` transfers no snapshot, so the caller keeps
-    /// the condition it sent; `NotFound` holds nothing.
-    #[must_use]
-    pub fn condition(&self) -> Option<Condition> {
-        match self {
-            Self::Found { entity, etag } => Some(Condition::of(entity, etag.clone())),
-            Self::Unchanged { .. } | Self::NotFound => None,
-        }
-    }
 }
 
 /// Projected entity with mandatory identity, kind and lifecycle.
@@ -499,6 +468,29 @@ impl Entity {
     #[must_use]
     pub fn segments(&self) -> &[GtsIdSegment] {
         self.gts_id.segments()
+    }
+
+    /// Whether the snapshot carries `field`. A selected JSON `null` is carried.
+    pub(crate) const fn has(&self, field: EntityField) -> bool {
+        match field {
+            EntityField::GtsId
+            | EntityField::GtsUuid
+            | EntityField::Kind
+            | EntityField::LifecycleStatus => true,
+            EntityField::Origin => self.origin.is_some(),
+            EntityField::Content => self.content.is_some(),
+            EntityField::ResolvedSchema => self.resolved_schema.is_some(),
+            EntityField::EffectiveTraits => self.effective_traits.is_some(),
+            EntityField::EffectiveTraitsSchema => self.effective_traits_schema.is_some(),
+            EntityField::Provenance => self.provenance.is_some(),
+        }
+    }
+
+    /// Whether the snapshot carries only fields that apply to its kind.
+    pub(crate) fn fits_its_kind(&self) -> bool {
+        EntityField::ALL
+            .into_iter()
+            .all(|field| field.applies_to(self.kind) || !self.has(field))
     }
 }
 
@@ -563,10 +555,7 @@ impl TryFrom<Entity> for Instance {
         // Reject Type Schema-only fields rather than silently dropping them.
         if snapshot.kind != EntityKind::Instance
             || snapshot.gts_id.is_type()
-            || snapshot.resolved_schema.is_some()
-            || snapshot.effective_traits.is_some()
-            || snapshot.effective_traits_schema.is_some()
-            || snapshot.provenance.is_some()
+            || !snapshot.fits_its_kind()
         {
             return Err(snapshot);
         }

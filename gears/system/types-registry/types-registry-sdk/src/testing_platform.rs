@@ -39,10 +39,11 @@ use crate::gts::{OperationResource, TypeResource};
 use crate::item_failure::{AdmissionFailure, AdmissionFailureReason as Reason, context};
 use crate::models::{
     BatchGetEntitiesRequest, BatchGetEntitiesResponse, DeleteEntitiesRequest, DeletionItemResult,
-    DeletionOperation, DeletionOutcome, Entity, EntityField, EntityKey, EntityKind, EntityLookup,
-    FieldSelection, IdempotencyKey, LifecycleFilter, LifecycleStatus, ListEntitiesRequest,
-    ListEntitiesResponse, Operation, OperationStatus, Origin, Provenance, RegisterEntitiesRequest,
-    RegisterItem, RegistrationItemResult, RegistrationOperation, RegistrationOutcome, Validator,
+    DeletionOperation, DeletionOutcome, Entity, EntityField, EntityIdentity, EntityKey, EntityKind,
+    EntityLookup, FieldSelection, IdempotencyKey, LifecycleFilter, LifecycleStatus,
+    ListEntitiesRequest, ListEntitiesResponse, Operation, OperationStatus, Origin, Provenance,
+    RegisterEntitiesRequest, RegisterItem, RegistrationItemResult, RegistrationOperation,
+    RegistrationOutcome, Validator,
 };
 use crate::reason::aborted;
 
@@ -55,6 +56,7 @@ pub mod conformance;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Call {
     BatchGet,
+    BatchResolve,
     List,
     Register,
     Delete,
@@ -588,7 +590,7 @@ impl MockTypesRegistry {
                     strict.allowed.contains(&call),
                     "MockTypesRegistry (strict): unexpected {call:?} call"
                 );
-                if call == Call::BatchGet {
+                if matches!(call, Call::BatchGet | Call::BatchResolve) {
                     for key in keys {
                         assert!(
                             find(&state.entities, key).is_some()
@@ -1105,7 +1107,7 @@ impl MockTypesRegistry {
                 .then(|| resolve_and_freeze(&mut state.resolver, &mut state.entities, &id));
             let stored = state.entities.get(&id).expect("found above");
             let etag = validator(stored, resolution.as_ref());
-            let lookup = if item.validator_for(&request.projection) == Some(&etag) {
+            let lookup = if item.if_none_match_for(&request.projection) == Some(&etag) {
                 EntityLookup::Unchanged { etag }
             } else {
                 let mut snapshot = snapshot(&id, stored, &fields, resolution.as_ref())?;
@@ -1126,6 +1128,35 @@ impl MockTypesRegistry {
             out.insert(item.key, lookup);
         }
         Ok(BatchGetEntitiesResponse(out))
+    }
+
+    /// The batch resolution both contracts serve: the stored pair of every distinct key,
+    /// Active or deleted, with no resolution, document or validator.
+    async fn resolve_batch(
+        &self,
+        caller: Option<&SecurityContext>,
+        keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
+        if let Some(error) = self.enter(Call::BatchResolve, &keys, caller).await {
+            return Err(error);
+        }
+        if keys.is_empty() || keys.len() > crate::models::MAX_BATCH_GET_KEYS {
+            return Err(items_violation("batch resolution out of range"));
+        }
+        let state = self.state.lock();
+        if state.protocol.has(ProtocolFault::DropAnswers) {
+            return Ok(HashMap::new());
+        }
+        let mut out = HashMap::with_capacity(keys.len());
+        for key in keys {
+            let identity = find(&state.entities, &key).map(|(id, _)| {
+                let gts_id = gts::GtsId::try_new(id).expect("a stored identifier is valid");
+                let gts_uuid = gts_id.to_uuid();
+                EntityIdentity { gts_id, gts_uuid }
+            });
+            out.entry(key).or_insert(identity);
+        }
+        Ok(out)
     }
 
     /// The discovery page both contracts serve.
@@ -1218,6 +1249,14 @@ impl PlatformTypesRegistryApi for MockTypesRegistry {
         request: BatchGetEntitiesRequest,
     ) -> Result<BatchGetEntitiesResponse, CanonicalError> {
         self.read_batch(None, request).await
+    }
+
+    async fn batch_resolve_identities(
+        &self,
+        _ctx: &PlatformSecurityContext,
+        keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
+        self.resolve_batch(None, keys).await
     }
 
     async fn list_entities(
@@ -1371,6 +1410,14 @@ impl TypesRegistryApi for MockTypesRegistry {
         request: BatchGetEntitiesRequest,
     ) -> Result<BatchGetEntitiesResponse, CanonicalError> {
         self.read_batch(Some(ctx), request).await
+    }
+
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &SecurityContext,
+        keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
+        self.resolve_batch(Some(ctx), keys).await
     }
 
     async fn list_entities(

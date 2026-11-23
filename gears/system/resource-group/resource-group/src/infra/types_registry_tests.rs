@@ -363,6 +363,23 @@ impl TypesRegistryApi for ResolvedOverride {
     ) -> Result<ListEntitiesResponse, CanonicalError> {
         self.inner.list_entities(ctx, request).await
     }
+
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        keys: Vec<types_registry_sdk::EntityKey>,
+    ) -> Result<
+        std::collections::HashMap<
+            types_registry_sdk::EntityKey,
+            Option<types_registry_sdk::EntityIdentity>,
+        >,
+        toolkit_canonical_errors::CanonicalError,
+    > {
+        types_registry_sdk::ext::resolve_through_batch_get(keys, |request| {
+            types_registry_sdk::TypesRegistryApi::batch_get_entities(self, ctx, request)
+        })
+        .await
+    }
 }
 
 #[tokio::test]
@@ -553,6 +570,23 @@ impl TypesRegistryApi for Misaddressed {
         request: ListEntitiesRequest,
     ) -> Result<ListEntitiesResponse, CanonicalError> {
         self.inner.list_entities(ctx, request).await
+    }
+
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        keys: Vec<types_registry_sdk::EntityKey>,
+    ) -> Result<
+        std::collections::HashMap<
+            types_registry_sdk::EntityKey,
+            Option<types_registry_sdk::EntityIdentity>,
+        >,
+        toolkit_canonical_errors::CanonicalError,
+    > {
+        types_registry_sdk::ext::resolve_through_batch_get(keys, |request| {
+            types_registry_sdk::TypesRegistryApi::batch_get_entities(self, ctx, request)
+        })
+        .await
     }
 }
 

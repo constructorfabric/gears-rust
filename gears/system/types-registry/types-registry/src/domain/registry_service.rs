@@ -35,7 +35,7 @@ use crate::domain::ports::{
     CurrentReadRow, EntityRow, ListFilter, PageRequest, Stores, snapshot_read,
 };
 use crate::domain::selection::{EntityField, FieldSelection};
-use crate::domain::validator::{IfNoneMatch, Validator};
+use crate::domain::validator::{IfNoneMatch, MAX_VALIDATOR_LEN, Validator};
 
 /// One operation and its per-candidate outcomes, as a caller polls it.
 #[domain_model]
@@ -113,6 +113,15 @@ pub enum EntityLookup {
         etag: Validator,
     },
     NotFound,
+}
+
+/// The canonical identity of a registered entity, Active or deleted, as a batch
+/// resolution answers it: no lifecycle, validator or document.
+#[domain_model]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntityIdentity {
+    pub gts_id: String,
+    pub gts_uuid: Uuid,
 }
 
 /// One key of a batch read; a condition makes just this key conditional.
@@ -218,7 +227,7 @@ pub enum ServiceError {
     BatchReadOutOfRange { count: usize },
     #[error("a key must be at most {MAX_KEY_LEN} bytes; this one is {len}")]
     KeyTooLong { len: usize },
-    #[error("a validator must be at most {MAX_KEY_LEN} bytes; this one is {len}")]
+    #[error("a validator must be at most {MAX_VALIDATOR_LEN} bytes; this one is {len}")]
     ValidatorTooLong { len: usize },
     /// `limit` outside `1..=limits.page_size_max` (D12).
     #[error("a page size must be between 1 and {max}; this request asked for {limit}")]
@@ -561,7 +570,7 @@ impl RegistryService {
     /// # Errors
     /// [`ServiceError::BatchReadOutOfRange`] for an empty or over-long batch,
     /// [`ServiceError::KeyTooLong`] for a key over [`MAX_KEY_LEN`] bytes,
-    /// [`ServiceError::ValidatorTooLong`] for a validator over [`MAX_KEY_LEN`] bytes,
+    /// [`ServiceError::ValidatorTooLong`] for a validator over [`MAX_VALIDATOR_LEN`] bytes,
     /// [`ServiceError::Storage`] for a read failure, or
     /// [`ServiceError::CorruptDocument`] if a stored document is not JSON.
     pub async fn batch_get(
@@ -588,7 +597,7 @@ impl RegistryService {
                 .if_none_match
                 .as_ref()
                 .map(IfNoneMatch::longest)
-                .filter(|len| *len > MAX_KEY_LEN)
+                .filter(|len| *len > MAX_VALIDATOR_LEN)
             {
                 return Err(ServiceError::ValidatorTooLong { len });
             }
@@ -597,22 +606,8 @@ impl RegistryService {
             }
         }
 
-        // A non-canonical identifier cannot be stored, so it never reaches SQL.
-        let gts_ids: Vec<String> = requested
-            .iter()
-            .filter_map(|item| match &item.key {
-                EntityKey::GtsId(gts_id) if is_canonical(gts_id) => Some(gts_id.clone()),
-                EntityKey::GtsId(_) | EntityKey::Uuid(_) => None,
-            })
-            .collect();
-        let gts_uuids: Vec<Uuid> = requested
-            .iter()
-            .filter_map(|item| match item.key {
-                EntityKey::Uuid(gts_uuid) => Some(gts_uuid),
-                EntityKey::GtsId(_) => None,
-            })
-            .collect();
-        if gts_ids.is_empty() && gts_uuids.is_empty() {
+        let lookup = KeyedLookup::of(requested.iter().map(|item| &item.key));
+        if lookup.is_empty() {
             return Ok(requested
                 .into_iter()
                 .map(|item| (item.key, EntityLookup::NotFound))
@@ -628,13 +623,7 @@ impl RegistryService {
         let (answers, rows, current) = provider
             .transaction_with_config(snapshot_read(&self.db), move |tx| {
                 Box::pin(async move {
-                    let mut rows = stores.find_by_gts_ids(tx, &scope, &gts_ids).await?;
-                    rows.extend(stores.find_by_gts_uuids(tx, &scope, &gts_uuids).await?);
-                    // The two identity reads are independent, so a row named by both
-                    // spellings arrives twice; the current-state reads below must
-                    // name it once.
-                    rows.sort_by_key(|row| row.id);
-                    rows.dedup_by_key(|row| row.id);
+                    let mut rows = lookup.rows(&*stores, tx, &scope).await?;
 
                     let etags = validators(&*stores, tx, &scope, &rows).await?;
                     let answers = answer(requested, &rows, &etags);
@@ -684,6 +673,69 @@ impl RegistryService {
                     }
                 };
                 (key, lookup)
+            })
+            .collect())
+    }
+
+    /// Resolve a bounded set of keys to the identity of the registered entity each names,
+    /// Active or deleted, or `None` (DESIGN §3.3).
+    ///
+    /// Bounded, collapsed and answered per key exactly as [`Self::batch_get`] is, but it
+    /// reads only the keyed identity rows: no validator, no Type Schema projection or
+    /// fingerprint, no document. Identity is permanent, so the answer needs no snapshot
+    /// of anything else; the two keyed reads still share one, so one entity named by both
+    /// spellings is found by both or by neither.
+    ///
+    /// # Errors
+    /// [`ServiceError::BatchReadOutOfRange`] for an empty or over-long batch,
+    /// [`ServiceError::KeyTooLong`] for a key over [`MAX_KEY_LEN`] bytes, or
+    /// [`ServiceError::Storage`] for a read failure.
+    pub async fn batch_resolve(
+        &self,
+        _caller: CallerContext<'_>,
+        keys: &[EntityKey],
+    ) -> Result<Vec<(EntityKey, Option<EntityIdentity>)>, ServiceError> {
+        // Bounded on the raw count, duplicates included, before any read.
+        if keys.is_empty() || keys.len() > MAX_BATCH_GET_KEYS {
+            return Err(ServiceError::BatchReadOutOfRange { count: keys.len() });
+        }
+        let mut requested: Vec<EntityKey> = Vec::with_capacity(keys.len());
+        let mut seen: std::collections::HashSet<&EntityKey> =
+            std::collections::HashSet::with_capacity(keys.len());
+        for key in keys {
+            if let EntityKey::GtsId(gts_id) = key
+                && gts_id.len() > MAX_KEY_LEN
+            {
+                return Err(ServiceError::KeyTooLong { len: gts_id.len() });
+            }
+            if seen.insert(key) {
+                requested.push(key.clone());
+            }
+        }
+
+        let lookup = KeyedLookup::of(requested.iter());
+        let rows = if lookup.is_empty() {
+            Vec::new()
+        } else {
+            let provider: DBProvider<ServiceError> = DBProvider::new(self.db.clone());
+            let scope = Self::scope();
+            let stores = Arc::clone(&self.stores);
+            provider
+                .transaction_with_config(snapshot_read(&self.db), move |tx| {
+                    Box::pin(async move { lookup.rows(&*stores, tx, &scope).await })
+                })
+                .await?
+        };
+
+        let rows = RowsByKey::new(&rows);
+        Ok(requested
+            .into_iter()
+            .map(|key| {
+                let identity = rows.get(&key).map(|row| EntityIdentity {
+                    gts_id: row.gts_id.clone(),
+                    gts_uuid: row.gts_uuid,
+                });
+                (key, identity)
             })
             .collect())
     }
@@ -765,6 +817,76 @@ pub(crate) fn is_canonical(gts_id: &str) -> bool {
     GtsId::try_new(gts_id).is_ok_and(|id| id.id() == gts_id)
 }
 
+/// The keyed identity reads both batch reads make: a batch's distinct keys split by
+/// spelling, a non-canonical identifier dropped because it cannot be stored, so it never
+/// reaches SQL.
+struct KeyedLookup {
+    gts_ids: Vec<String>,
+    gts_uuids: Vec<Uuid>,
+}
+
+impl KeyedLookup {
+    fn of<'a>(keys: impl Iterator<Item = &'a EntityKey>) -> Self {
+        let mut lookup = Self {
+            gts_ids: Vec::new(),
+            gts_uuids: Vec::new(),
+        };
+        for key in keys {
+            match key {
+                EntityKey::GtsId(gts_id) if is_canonical(gts_id) => {
+                    lookup.gts_ids.push(gts_id.clone());
+                }
+                EntityKey::GtsId(_) => {}
+                EntityKey::Uuid(gts_uuid) => lookup.gts_uuids.push(*gts_uuid),
+            }
+        }
+        lookup
+    }
+
+    /// Nothing that could be stored is asked: every key is absent without a read.
+    fn is_empty(&self) -> bool {
+        self.gts_ids.is_empty() && self.gts_uuids.is_empty()
+    }
+
+    /// The rows the keys name, each once, by entity id.
+    async fn rows(
+        &self,
+        stores: &dyn Stores,
+        tx: &toolkit_db::DbTx<'_>,
+        scope: &AccessScope,
+    ) -> Result<Vec<EntityRow>, ServiceError> {
+        let mut rows = stores.find_by_gts_ids(tx, scope, &self.gts_ids).await?;
+        rows.extend(stores.find_by_gts_uuids(tx, scope, &self.gts_uuids).await?);
+        // The two identity reads are independent, so a row named by both spellings
+        // arrives twice; the reads that follow must name it once.
+        rows.sort_by_key(|row| row.id);
+        rows.dedup_by_key(|row| row.id);
+        Ok(rows)
+    }
+}
+
+/// Rows found by the key that names them, by either spelling.
+struct RowsByKey<'a> {
+    by_gts_id: BTreeMap<&'a str, &'a EntityRow>,
+    by_gts_uuid: BTreeMap<Uuid, &'a EntityRow>,
+}
+
+impl<'a> RowsByKey<'a> {
+    fn new(rows: &'a [EntityRow]) -> Self {
+        Self {
+            by_gts_id: rows.iter().map(|row| (row.gts_id.as_str(), row)).collect(),
+            by_gts_uuid: rows.iter().map(|row| (row.gts_uuid, row)).collect(),
+        }
+    }
+
+    fn get(&self, key: &EntityKey) -> Option<&'a EntityRow> {
+        match key {
+            EntityKey::GtsId(gts_id) => self.by_gts_id.get(gts_id.as_str()).copied(),
+            EntityKey::Uuid(gts_uuid) => self.by_gts_uuid.get(gts_uuid).copied(),
+        }
+    }
+}
+
 /// The entity ids of one kind, for the kind-specific current-state reads.
 fn ids_of(rows: &[EntityRow], kind: EntityKind) -> Vec<i64> {
     rows.iter()
@@ -810,15 +932,11 @@ fn answer(
     rows: &[EntityRow],
     etags: &BTreeMap<i64, Validator>,
 ) -> Vec<(EntityKey, Answer)> {
-    let by_gts_id: BTreeMap<&str, i64> = rows.iter().map(|r| (r.gts_id.as_str(), r.id)).collect();
-    let by_gts_uuid: BTreeMap<Uuid, i64> = rows.iter().map(|r| (r.gts_uuid, r.id)).collect();
+    let rows = RowsByKey::new(rows);
     requested
         .into_iter()
         .map(|item| {
-            let id = match &item.key {
-                EntityKey::GtsId(gts_id) => by_gts_id.get(gts_id.as_str()).copied(),
-                EntityKey::Uuid(gts_uuid) => by_gts_uuid.get(gts_uuid).copied(),
-            };
+            let id = rows.get(&item.key).map(|row| row.id);
             let answer = match id.and_then(|id| Some((id, *etags.get(&id)?))) {
                 None => Answer::NotFound,
                 Some((_, etag)) if item.if_none_match.as_ref().is_some_and(|c| c.matches(etag)) => {

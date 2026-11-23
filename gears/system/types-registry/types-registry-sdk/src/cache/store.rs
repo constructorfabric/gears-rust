@@ -1,10 +1,14 @@
-//! The cache's bounded store: one entry per entity and scope, holding the fields read
-//! of it so far under one validator, evicted least-recently-used by the bytes it holds.
+//! The cache's bounded store: one entry per entity, holding the fields read
+//! of it so far under one validator, evicted least-recently-used by the bytes it holds,
+//! and found by either spelling a resident snapshot carries.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
-use std::sync::Arc;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
+use gts::GtsId;
 use lru::LruCache;
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -12,36 +16,37 @@ use uuid::Uuid;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use super::identity::Identities;
 use crate::models::{
-    Entity, EntityField, EntityKind, FieldSelection, JsonDocument, LifecycleStatus, Origin,
-    Validator,
+    Entity, EntityField, EntityKey, EntityKind, FieldSelection, JsonDocument, LifecycleStatus,
+    Origin, Validator,
 };
 
-/// Who may see a representation. P0 has one value.
-// ponytail: C7 — visibility context and Context Tenant are fixed for the platform plane
-// in P0. P1 tenancy replaces this marker with the subject tenant and Context Tenant
-// without reshaping the key.
+/// Visibility follows the tenant. Remote confirmations also bind the bearer that was
+/// presented to the registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Scope {
-    /// Unrestricted visibility, no Context Tenant.
-    Platform,
+pub struct TenantViewer {
+    tenant: Uuid,
+    credential: Option<[u8; 32]>,
 }
 
-/// One cached entity as one scope sees it. Every projection of it shares the entry: a
-/// validator names the entity's state, the same under every projection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct EntryKey {
-    pub uuid: Uuid,
-    pub scope: Scope,
-}
-
-impl EntryKey {
-    pub fn new(uuid: Uuid) -> Self {
-        Self {
-            uuid,
-            scope: Scope::Platform,
-        }
+impl TenantViewer {
+    pub const fn new(tenant: Uuid, credential: Option<[u8; 32]>) -> Self {
+        Self { tenant, credential }
     }
+}
+
+struct TenantConfirmation {
+    version: Weak<()>,
+    viewer_epoch: u64,
+    read_at: Instant,
+}
+
+struct TenantVisibility {
+    confirmations: LruCache<(Uuid, TenantViewer), TenantConfirmation>,
+    /// Bounded separately so a credential refusal can revoke every confirmation in O(1).
+    epochs: LruCache<TenantViewer, u64>,
+    last_epoch: u64,
 }
 
 /// A resident entity: the fields read of it so far, all under `etag`.
@@ -56,6 +61,7 @@ pub struct Entry {
     /// When the registry last confirmed `etag` as current.
     pub confirmed_at: Instant,
     pub weight: Weight,
+    tenant_version: Option<Arc<()>>,
 }
 
 /// The bytes a snapshot is charged: its compact JSON as the REST plane writes an entity
@@ -84,10 +90,15 @@ impl Weight {
             })
     }
 
+    /// Total resident payload bytes, including the validator needed for revalidation.
+    pub fn bytes_with_validator(&self, etag: &Validator) -> usize {
+        self.total().saturating_add(etag.as_bytes().len())
+    }
+
     /// Whether a snapshot of this weight can be retained under `bound` at all.
-    pub fn fits(&self, bound: usize) -> bool {
+    pub fn fits(&self, bound: usize, etag: &Validator) -> bool {
         // `usize::MAX` is the unmeasurable charge: never retained, whatever the bound.
-        let bytes = self.total();
+        let bytes = self.bytes_with_validator(etag);
         bytes != usize::MAX && bytes <= bound
     }
 
@@ -318,130 +329,407 @@ impl io::Write for ByteCounter {
     }
 }
 
-/// What the store knows of one entity: its resident entries, the reads in flight
-/// for it, and when anything was last recorded for it — an answer taken into the store or an
-/// invalidation. It lives while either a representation is resident or a read holds a
-/// ticket, so the bookkeeping is bounded by resident entities plus reads in flight.
+/// The reads in flight under one spelling of an entity — its identifier or its Registry
+/// Reference — and when anything was last recorded under it. It lives while a read holds
+/// a ticket on it, so the bookkeeping is bounded by reads in flight.
 #[derive(Debug, Default)]
 struct Slot {
-    keys: Vec<EntryKey>,
     tickets: usize,
-    /// The store's event count when something was last recorded for this entity.
+    /// The store's event count when something was last recorded under this spelling.
     last_event: u64,
 }
 
-/// A read's view of its entity when it started: the entity's last event then.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Ticket {
+/// How a read or an event names its one entity: the key alone, when nothing here knows
+/// its counterpart, or the pair the registry stated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Spelling {
+    Key(EntityKey),
+    Pair(GtsId, Uuid),
+}
+
+impl Spelling {
+    fn parts(&self) -> (Option<&GtsId>, Option<Uuid>) {
+        match self {
+            Self::Key(EntityKey::GtsId(id)) => (Some(id), None),
+            Self::Key(EntityKey::GtsUuid(uuid)) => (None, Some(*uuid)),
+            Self::Pair(id, uuid) => (Some(id), Some(*uuid)),
+        }
+    }
+}
+
+/// Fences visibility confirmation for a viewer while its request is in flight.
+#[derive(Clone, Copy)]
+pub struct TenantTicket {
+    pub viewer: TenantViewer,
     seen: u64,
 }
 
-impl Slot {
-    fn unused(&self) -> bool {
-        self.keys.is_empty() && self.tickets == 0
+fn release_slot<K: Eq + std::hash::Hash>(slots: &mut HashMap<K, Slot>, name: &K) {
+    if let Some(slot) = slots.get_mut(name) {
+        slot.tickets = slot.tickets.saturating_sub(1);
+        if slot.tickets == 0 {
+            slots.remove(name);
+        }
     }
 }
 
-/// Entries bounded by the bytes they hold, indexed by entity so that an invalidation
-/// drops all of them and fences reads that started before it.
+/// A read's view of its entity when it started: the spelling it is fenced under and the
+/// store's event count then. A read that knew only its key is also fenced by any event
+/// that knew only its own, since the two may be one entity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ticket {
+    spelling: Spelling,
+    seen: u64,
+}
+
+/// Entries bounded by the bytes they hold, found by either spelling, with the bookkeeping
+/// that lets an invalidation under either one fence the reads that started before it.
+///
+/// An identifier resolves to the Registry Reference its resident snapshot carries, for
+/// exactly as long as that snapshot stays resident: nothing derives one from the other.
 pub struct Store {
-    entries: LruCache<EntryKey, Entry>,
-    slots: HashMap<Uuid, Slot>,
+    entries: LruCache<Uuid, Entry>,
+    /// The identity store, under the same lock so that an answer's identities are checked
+    /// against both and learned in one critical section. Neither store touches the
+    /// other's recency.
+    pub identities: Identities,
+    tenant_reads: Option<TenantVisibility>,
+    /// A revocation fences requests for this viewer, including requests under an alias
+    /// the cache may only learn after the answer arrives.
+    tenant_in_flight: HashMap<TenantViewer, Slot>,
+    /// The identifier of every resident snapshot, to the Registry Reference it carries.
+    aliases: HashMap<GtsId, Uuid>,
+    by_id: HashMap<GtsId, Slot>,
+    by_uuid: HashMap<Uuid, Slot>,
     /// Events recorded so far, across entities: orders events independently of the clock.
     events: u64,
+    /// The last event recorded under an identifier, or a Registry Reference, whose
+    /// counterpart was not known. Two distinct identifiers, or two distinct Registry
+    /// References, are never one entity, so a read that knew only its key is fenced by
+    /// its own slot and by these one-sided events of the other form only.
+    unresolved_by_id: u64,
+    unresolved_by_uuid: u64,
     used: usize,
     bound: usize,
+    max_entries: usize,
 }
 
 impl Store {
-    pub fn new(bound: usize) -> Self {
+    pub fn new(bound: usize, max_entries: usize) -> Self {
         Self {
             entries: LruCache::unbounded(),
-            slots: HashMap::new(),
+            identities: Identities::new(0),
+            tenant_reads: None,
+            tenant_in_flight: HashMap::new(),
+            aliases: HashMap::new(),
+            by_id: HashMap::new(),
+            by_uuid: HashMap::new(),
             events: 0,
+            unresolved_by_id: 0,
+            unresolved_by_uuid: 0,
             used: 0,
             bound,
+            max_entries,
         }
     }
 
-    /// The entry under `key`, marked most recently used.
-    pub fn get(&mut self, key: &EntryKey) -> Option<&Entry> {
-        self.entries.get(key)
+    /// Where the entry `key` spells is resident.
+    fn resident(&self, key: &EntityKey) -> Option<Uuid> {
+        let uuid = match key {
+            EntityKey::GtsId(id) => *self.aliases.get(id)?,
+            EntityKey::GtsUuid(uuid) => *uuid,
+        };
+        Some(uuid)
     }
 
-    /// The entry under `key`, without marking it used.
-    pub fn peek(&self, key: &EntryKey) -> Option<&Entry> {
-        self.entries.peek(key)
+    /// Remember up to `bound` identities for the platform `resolve_*` helpers.
+    pub fn remember_identities(&mut self, bound: usize) {
+        self.identities = Identities::new(bound);
     }
 
-    /// Registers a read of the entity about to go to the registry. Every ticket is
-    /// [released](Self::release) exactly once.
-    pub fn ticket(&mut self, uuid: Uuid) -> Ticket {
-        let slot = self.slots.entry(uuid).or_default();
-        slot.tickets += 1;
-        Ticket {
-            seen: slot.last_event,
+    /// Limit confirmations independently of the number of tenants and entities.
+    pub fn track_tenant_visibility(&mut self) {
+        self.tenant_reads = NonZeroUsize::new(self.max_entries).map(|limit| TenantVisibility {
+            confirmations: LruCache::sparse(limit),
+            epochs: LruCache::sparse(limit),
+            last_epoch: 0,
+        });
+    }
+
+    pub fn tenant_visible(
+        &mut self,
+        key: &EntityKey,
+        viewer: TenantViewer,
+        now: Instant,
+        window: Duration,
+    ) -> bool {
+        let Some(uuid) = self.resident(key) else {
+            return false;
+        };
+        let Some(reads) = self.tenant_reads.as_mut() else {
+            return false;
+        };
+        let version = self
+            .entries
+            .peek(&uuid)
+            .and_then(|entry| entry.tenant_version.as_ref());
+        let key = (uuid, viewer);
+        let epoch = reads.epochs.peek(&viewer);
+        let visible = reads.confirmations.peek(&key).is_some_and(|seen| {
+            version.is_some_and(|version| std::ptr::eq(seen.version.as_ptr(), Arc::as_ptr(version)))
+                && epoch == Some(&seen.viewer_epoch)
+                && now.saturating_duration_since(seen.read_at) < window
+        });
+        if visible {
+            reads.confirmations.promote(&key);
+            reads.epochs.promote(&viewer);
+        } else {
+            reads.confirmations.pop(&key);
+        }
+        visible
+    }
+
+    pub fn confirm_tenant(
+        &mut self,
+        key: &EntityKey,
+        viewer: TenantViewer,
+        etag: &Validator,
+        read_at: Instant,
+    ) {
+        let Some(uuid) = self.resident(key) else {
+            return;
+        };
+        if let Some(entry) = self.entries.peek(&uuid)
+            && entry.etag == *etag
+            && let Some(version) = &entry.tenant_version
+            && let Some(reads) = self.tenant_reads.as_mut()
+        {
+            let epoch = *reads.epochs.get_or_insert(viewer, || {
+                reads.last_epoch += 1;
+                reads.last_epoch
+            });
+            reads.confirmations.put(
+                (uuid, viewer),
+                TenantConfirmation {
+                    version: Arc::downgrade(version),
+                    viewer_epoch: epoch,
+                    read_at,
+                },
+            );
         }
     }
 
-    pub fn release(&mut self, uuid: Uuid) {
-        if let Some(slot) = self.slots.get_mut(&uuid) {
-            slot.tickets = slot.tickets.saturating_sub(1);
-            if slot.unused() {
-                self.slots.remove(&uuid);
+    pub fn revoke_tenant_reads<'a>(
+        &mut self,
+        viewer: TenantViewer,
+        keys: impl Iterator<Item = &'a EntityKey>,
+    ) {
+        let mut keys = keys.peekable();
+        if keys.peek().is_some() {
+            self.fence_tenant(viewer);
+        }
+        for key in keys {
+            if let Some(uuid) = self.resident(key)
+                && let Some(reads) = self.tenant_reads.as_mut()
+            {
+                reads.confirmations.pop(&(uuid, viewer));
             }
         }
     }
 
-    /// Whether nothing was recorded for the entity since `ticket` was taken. A ticket keeps
-    /// its slot, so the event count it saw is never reused.
-    pub fn quiet_since(&self, uuid: Uuid, ticket: Ticket) -> bool {
-        self.slots
-            .get(&uuid)
+    pub fn revoke_viewer(&mut self, viewer: TenantViewer) {
+        if let Some(reads) = self.tenant_reads.as_mut() {
+            reads.epochs.pop(&viewer);
+        }
+        self.fence_tenant(viewer);
+    }
+
+    fn fence_tenant(&mut self, viewer: TenantViewer) {
+        if let Some(slot) = self.tenant_in_flight.get_mut(&viewer) {
+            slot.last_event += 1;
+        }
+    }
+
+    pub fn tenant_ticket(&mut self, viewer: TenantViewer) -> TenantTicket {
+        let slot = self.tenant_in_flight.entry(viewer).or_default();
+        slot.tickets += 1;
+        TenantTicket {
+            viewer,
+            seen: slot.last_event,
+        }
+    }
+
+    pub fn release_tenant_ticket(&mut self, ticket: TenantTicket) {
+        release_slot(&mut self.tenant_in_flight, &ticket.viewer);
+    }
+
+    /// Whether any read for `viewer` holds a ticket.
+    #[cfg(test)]
+    pub fn tenant_in_flight(&self, viewer: TenantViewer) -> bool {
+        self.tenant_in_flight.contains_key(&viewer)
+    }
+
+    pub fn tenant_ticket_current(&self, ticket: TenantTicket) -> bool {
+        self.tenant_in_flight
+            .get(&ticket.viewer)
             .is_some_and(|slot| slot.last_event == ticket.seen)
     }
 
-    /// Records that an answer for the entity was taken into the store.
-    pub fn record(&mut self, uuid: Uuid) {
+    /// The entry `key` spells, marked most recently used.
+    pub fn get(&mut self, key: &EntityKey) -> Option<&Entry> {
+        let at = self.resident(key)?;
+        self.entries.get(&at)
+    }
+
+    /// The entry `key` spells, without marking it used.
+    pub fn peek(&self, key: &EntityKey) -> Option<&Entry> {
+        self.entries.peek(&self.resident(key)?)
+    }
+
+    /// Whether `gts_id` and `gts_uuid` can be one entity beside every resident one: the
+    /// resident counterpart of either spelling, when it is not the other one. Changes no
+    /// recency.
+    pub fn conflict(&self, gts_id: &GtsId, gts_uuid: Uuid) -> Option<EntityKey> {
+        if let Some(known) = self.aliases.get(gts_id).filter(|known| **known != gts_uuid) {
+            return Some(EntityKey::GtsUuid(*known));
+        }
+        self.entries
+            .peek(&gts_uuid)
+            .filter(|entry| entry.snapshot.gts_id != *gts_id)
+            .map(|entry| EntityKey::GtsId(entry.snapshot.gts_id.clone()))
+    }
+
+    /// The entity `key` spells, by the pair stated for it, or else by the one a resident
+    /// snapshot carries, or else by `key` alone.
+    fn spelling(&self, key: &EntityKey, stated: Option<(&GtsId, Uuid)>) -> Spelling {
+        let resident = || {
+            self.peek(key)
+                .map(|entry| (&entry.snapshot.gts_id, entry.snapshot.gts_uuid))
+        };
+        match stated.or_else(resident) {
+            Some((gts_id, gts_uuid)) => Spelling::Pair(gts_id.clone(), gts_uuid),
+            None => Spelling::Key(key.clone()),
+        }
+    }
+
+    /// Registers a read of the entity `key` spells, about to go to the registry, under
+    /// `key` and the counterpart a resident snapshot carries. Every ticket is
+    /// [released](Self::release) exactly once.
+    pub fn ticket(&mut self, key: &EntityKey) -> Ticket {
+        let spelling = self.spelling(key, None);
+        let (id, uuid) = spelling.parts();
+        if let Some(id) = id {
+            self.by_id.entry(id.clone()).or_default().tickets += 1;
+        }
+        if let Some(uuid) = uuid {
+            self.by_uuid.entry(uuid).or_default().tickets += 1;
+        }
+        Ticket {
+            spelling,
+            seen: self.events,
+        }
+    }
+
+    pub fn release(&mut self, ticket: &Ticket) {
+        let (id, uuid) = ticket.spelling.parts();
+        if let Some(id) = id {
+            release_slot(&mut self.by_id, id);
+        }
+        if let Some(uuid) = uuid {
+            release_slot(&mut self.by_uuid, &uuid);
+        }
+    }
+
+    /// Whether nothing was recorded for the entity since `ticket` was taken: under neither
+    /// spelling it knew, and, if it knew only its key, under no key of the other form known
+    /// only by itself either — that may be the same entity; another key of its own form is
+    /// not. A ticket keeps its slots, so the event counts they saw are never reused.
+    pub fn quiet_since(&self, ticket: &Ticket) -> bool {
+        let quiet = |slot: Option<&Slot>| slot.is_some_and(|slot| slot.last_event <= ticket.seen);
+        let other_form = match &ticket.spelling {
+            Spelling::Pair(..) => 0,
+            Spelling::Key(EntityKey::GtsId(_)) => self.unresolved_by_uuid,
+            Spelling::Key(EntityKey::GtsUuid(_)) => self.unresolved_by_id,
+        };
+        let (id, uuid) = ticket.spelling.parts();
+        other_form <= ticket.seen
+            && id.is_none_or(|id| quiet(self.by_id.get(id)))
+            && uuid.is_none_or(|uuid| quiet(self.by_uuid.get(&uuid)))
+    }
+
+    /// Records that an answer for the entity `key` spells was taken into the store; `stated`
+    /// is the pair the answer, or the entry the read started from, names. Reads in flight
+    /// under either spelling are fenced, and with the key alone, so is every read that
+    /// knew only its own key of the other form.
+    pub fn record(&mut self, key: &EntityKey, stated: Option<(&GtsId, Uuid)>) {
+        let spelling = self.spelling(key, stated);
+        self.event(&spelling);
+    }
+
+    fn event(&mut self, spelling: &Spelling) {
         self.events += 1;
-        if let Some(slot) = self.slots.get_mut(&uuid) {
+        let (id, uuid) = spelling.parts();
+        if let Some(slot) = id.and_then(|id| self.by_id.get_mut(id)) {
             slot.last_event = self.events;
+        }
+        if let Some(slot) = uuid.and_then(|uuid| self.by_uuid.get_mut(&uuid)) {
+            slot.last_event = self.events;
+        }
+        match spelling {
+            Spelling::Key(EntityKey::GtsId(_)) => self.unresolved_by_id = self.events,
+            Spelling::Key(EntityKey::GtsUuid(_)) => self.unresolved_by_uuid = self.events,
+            Spelling::Pair(..) => {}
         }
     }
 
     /// Whether a snapshot of `weight` can be retained at all.
-    pub fn fits(&self, weight: &Weight) -> bool {
-        weight.fits(self.bound)
+    pub fn fits(&self, weight: &Weight, etag: &Validator) -> bool {
+        self.max_entries > 0 && weight.fits(self.bound, etag)
     }
 
-    /// Stores `snapshot`, holding `covers` under `etag`, as `key`'s entry, replacing what
-    /// was there, and evicts the least recently used entries until it fits. A snapshot
+    /// Stores `snapshot`, holding `covers` under `etag`, as its entity's entry, replacing
+    /// what was there, and evicts the least recently used entries until it fits. A snapshot
     /// that does not [fit](Self::fits) is not retained, and the entry it would replace is
     /// dropped rather than left stale. `weight` is [`weight`] of `snapshot`, measured
-    /// before taking the store's lock.
+    /// before taking the store's lock. The caller has checked that its identity has no
+    /// [conflict](Self::conflict) with what is resident; a resident entity it contradicts is
+    /// dropped all the same, so that no spelling ever finds two entities.
     pub fn insert(
         &mut self,
-        key: EntryKey,
         snapshot: Arc<Entity>,
         covers: FieldSelection,
         weight: Weight,
         etag: Validator,
         confirmed_at: Instant,
     ) {
+        let key = snapshot.gts_uuid;
+        if let Some(other) = self.aliases.get(&snapshot.gts_id).copied()
+            && other != snapshot.gts_uuid
+        {
+            self.remove(&other);
+        }
+        let tenant_version = self.tenant_reads.as_ref().map(|_| {
+            self.entries
+                .peek(&key)
+                .filter(|old| old.etag == etag)
+                .and_then(|old| old.tenant_version.clone())
+                .unwrap_or_default()
+        });
         self.remove(&key);
-        if !self.fits(&weight) {
+        if !self.fits(&weight, &etag) {
             return;
         }
-        let bytes = weight.total();
+        let bytes = weight.bytes_with_validator(&etag);
         // `used <= bound` holds throughout, so the subtraction cannot underflow.
-        while bytes > self.bound - self.used {
+        while bytes > self.bound - self.used || self.entries.len() >= self.max_entries {
             let Some((evicted, entry)) = self.entries.pop_lru() else {
                 break;
             };
-            self.forget(&evicted, entry.weight.total());
+            self.forget(&evicted, &entry);
         }
         self.used += bytes;
-        self.slots.entry(key.uuid).or_default().keys.push(key);
+        self.aliases
+            .insert(snapshot.gts_id.clone(), snapshot.gts_uuid);
         self.entries.put(
             key,
             Entry {
@@ -450,52 +738,47 @@ impl Store {
                 etag,
                 confirmed_at,
                 weight,
+                tenant_version,
             },
         );
     }
 
-    /// Records that the registry confirmed `etag` for `key` at `at`, if that is still the
-    /// resident validator; a confirmation never moves the instant back.
-    pub fn confirm(&mut self, key: &EntryKey, etag: &Validator, at: Instant) {
-        if let Some(entry) = self.entries.get_mut(key)
+    /// Records that the registry confirmed `etag` for the entity `key` spells at `at`, if
+    /// that is still the resident validator; a confirmation never moves the instant back.
+    pub fn confirm(&mut self, key: &EntityKey, etag: &Validator, at: Instant) {
+        let Some(resident) = self.resident(key) else {
+            return;
+        };
+        if let Some(entry) = self.entries.get_mut(&resident)
             && entry.etag == *etag
         {
             entry.confirmed_at = entry.confirmed_at.max(at);
         }
     }
 
-    pub fn remove(&mut self, key: &EntryKey) {
+    fn remove(&mut self, key: &Uuid) {
         if let Some(entry) = self.entries.pop(key) {
-            self.forget(key, entry.weight.total());
+            self.forget(key, &entry);
         }
     }
 
-    /// An observed mutation of the entity: every entry of it is dropped, and
-    /// reads that started before it can no longer fill the store. With no slot, nothing
-    /// is resident and no read is in flight, so there is nothing to fence.
-    pub fn invalidate(&mut self, uuid: Uuid) {
-        self.events += 1;
-        let Some(slot) = self.slots.get_mut(&uuid) else {
-            return;
-        };
-        slot.last_event = self.events;
-        for key in std::mem::take(&mut slot.keys) {
-            if let Some(entry) = self.entries.pop(&key) {
-                self.used -= entry.weight.total();
-            }
+    /// An observed mutation of the entity `key` spells — `stated` is its pair, where an
+    /// answer stated one: its entry is dropped, and reads that started before it can no
+    /// longer fill the store, under either spelling known here or, with the key alone,
+    /// any read that knew only its own.
+    pub fn invalidate(&mut self, key: &EntityKey, stated: Option<(&GtsId, Uuid)>) {
+        let spelling = self.spelling(key, stated);
+        if let (_, Some(uuid)) = spelling.parts() {
+            self.remove(&uuid);
         }
-        if slot.unused() {
-            self.slots.remove(&uuid);
-        }
+        self.event(&spelling);
     }
 
-    fn forget(&mut self, key: &EntryKey, weight: usize) {
-        self.used -= weight;
-        if let Some(slot) = self.slots.get_mut(&key.uuid) {
-            slot.keys.retain(|k| k != key);
-            if slot.unused() {
-                self.slots.remove(&key.uuid);
-            }
+    /// Accounts for an entry that left the store, and with it its identifier.
+    fn forget(&mut self, key: &Uuid, entry: &Entry) {
+        self.used -= entry.weight.bytes_with_validator(&entry.etag);
+        if self.aliases.get(&entry.snapshot.gts_id) == Some(key) {
+            self.aliases.remove(&entry.snapshot.gts_id);
         }
     }
 
@@ -504,10 +787,15 @@ impl Store {
         self.used
     }
 
-    /// Whether the store keeps any bookkeeping for the entity.
+    /// Whether the store keeps any bookkeeping under the spelling `name`.
     #[cfg(test)]
-    pub fn indexes(&self, uuid: Uuid) -> bool {
-        self.slots.contains_key(&uuid)
+    pub fn indexes(&self, name: &EntityKey) -> bool {
+        match name {
+            EntityKey::GtsId(id) => self.by_id.contains_key(id) || self.aliases.contains_key(id),
+            EntityKey::GtsUuid(uuid) => {
+                self.by_uuid.contains_key(uuid) || self.entries.contains(uuid)
+            }
+        }
     }
 }
 

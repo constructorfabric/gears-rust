@@ -1654,6 +1654,11 @@ fn both_versions_are_declared_with_distinct_operation_ids() {
             "types_registry.platform.batch_get_entities",
         ),
         (
+            "POST",
+            "/types-registry/v2/platform/entities:batchResolve",
+            "types_registry.platform.batch_resolve_identities",
+        ),
+        (
             "GET",
             "/types-registry/v2/platform/entities",
             "types_registry.platform.list_entities",
@@ -1667,6 +1672,11 @@ fn both_versions_are_declared_with_distinct_operation_ids() {
             "POST",
             "/types-registry/v2/entities:batchGet",
             "types_registry.batch_get_entities",
+        ),
+        (
+            "POST",
+            "/types-registry/v2/entities:batchResolve",
+            "types_registry.batch_resolve_identities",
         ),
         (
             "GET",
@@ -1721,6 +1731,7 @@ fn every_database_route_serves_exactly_one_plane() {
         [
             "GET /types-registry/v2/entities/{entity_key}",
             "POST /types-registry/v2/entities:batchGet",
+            "POST /types-registry/v2/entities:batchResolve",
             "GET /types-registry/v2/entities",
         ],
         "the tenant plane reads entities only: no mutation and no operation read",
@@ -3326,6 +3337,141 @@ async fn an_oversized_batch_read_is_refused_with_its_exact_count() {
     assert_batch_count_refused(&response, 10_000);
 }
 
+// --- `:batchResolve` --------------------------------------------------------
+
+/// `POST {PLATFORM}/entities:batchResolve`.
+fn batch_resolve(body: &Value) -> Request<Body> {
+    post(&format!("{PLATFORM}/entities:batchResolve"), body)
+}
+
+/// Every distinct key's stored identity, Active or deleted, or `not_found`; each result
+/// echoes its key, canonically for a Registry Reference, and carries nothing but the pair.
+/// The tenant plane answers the same body.
+#[tokio::test]
+async fn a_batch_resolution_answers_the_stored_pair_of_every_key() {
+    let router = router_with_db().await;
+    register_type_and_instance(&router).await;
+    register_entity(&router, "arrange-gone", CF_OTHER_TYPE).await;
+    let deleted = call(
+        &router,
+        delete_one(
+            Some("delete-gone"),
+            CF_OTHER_TYPE,
+            "?expected_resource_version=1",
+        ),
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::ACCEPTED, "{:?}", deleted.body);
+    assert_eq!(
+        poll(&router, &deleted).await["items"][0]["status"],
+        json!("succeeded")
+    );
+
+    let uuid_of = |id: &str| gts::GtsId::try_new(id).expect("identifier").to_uuid();
+    let instance_uuid = uuid_of(CF_INSTANCE).to_string();
+    let shouted = instance_uuid.to_uppercase();
+    let body = keys(&[
+        CF_TYPE,
+        &shouted,
+        CF_OTHER_TYPE,
+        CF_ABSENT_TYPE,
+        CF_TYPE,
+        &instance_uuid,
+    ]);
+    let response = call(&router, batch_resolve(&body)).await;
+
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.body);
+    let items = response.body["items"].as_array().expect("items");
+    assert_eq!(items.len(), 4, "one result per distinct key: {items:?}");
+    for (key, id) in [
+        (CF_TYPE, CF_TYPE),
+        (instance_uuid.as_str(), CF_INSTANCE),
+        (CF_OTHER_TYPE, CF_OTHER_TYPE),
+    ] {
+        let item = result_for(&response.body, key);
+        assert_eq!(
+            item,
+            &json!({
+                "entity_key": key,
+                "status": "found",
+                "identity": { "gts_id": id, "gts_uuid": uuid_of(id) },
+            }),
+            "a deleted entity resolves like an Active one"
+        );
+    }
+    assert_eq!(
+        result_for(&response.body, CF_ABSENT_TYPE),
+        &json!({ "entity_key": CF_ABSENT_TYPE, "status": "not_found" })
+    );
+
+    let tenant = call(&router, post(&format!("{V2}/entities:batchResolve"), &body)).await;
+    assert_eq!(tenant.status, StatusCode::OK, "{:?}", tenant.body);
+    let sorted = |body: &Value| {
+        let mut items = body["items"].as_array().expect("items").clone();
+        items.sort_by_key(|item| item["entity_key"].as_str().map(str::to_owned));
+        items
+    };
+    assert_eq!(sorted(&tenant.body), sorted(&response.body));
+}
+
+/// Bounded like a batch read, on the raw item count — duplicates included — before any
+/// key is looked at; past the ceiling items are counted, not kept.
+#[tokio::test]
+async fn a_batch_resolution_is_bounded_on_its_raw_count() {
+    let router = router_with_db().await;
+
+    let empty = call(&router, batch_resolve(&json!({ "items": [] }))).await;
+    assert_batch_count_refused(&empty, 0);
+
+    let at_ceiling = vec![CF_TYPE; MAX_BATCH_GET_KEYS];
+    let response = call(&router, batch_resolve(&keys(&at_ceiling))).await;
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.body);
+    assert_eq!(response.body["items"].as_array().expect("items").len(), 1);
+
+    let past_ceiling = vec![CF_TYPE; MAX_BATCH_GET_KEYS + 1];
+    let response = call(&router, batch_resolve(&keys(&past_ceiling))).await;
+    assert_batch_count_refused(&response, MAX_BATCH_GET_KEYS + 1);
+
+    let items: Vec<Value> = (0..10_000)
+        .map(|i| json!({ "entity_key": format!("k{i}") }))
+        .collect();
+    let response = call(&router, batch_resolve(&json!({ "items": items }))).await;
+    assert_batch_count_refused(&response, 10_000);
+}
+
+/// A key over 1024 bytes, an unknown body field, a condition and a query string are
+/// refused, not ignored.
+#[tokio::test]
+async fn a_batch_resolution_refuses_what_it_does_not_take() {
+    let router = router_with_db().await;
+
+    let long = format!("{}{}", gts::GTS_ID_PREFIX, "a".repeat(1100));
+    let response = call(&router, batch_resolve(&keys(&[&long]))).await;
+    assert_field_refusal(&response, "entity_key", "VALIDATION_FAILED");
+
+    for body in [
+        json!({ "items": [{ "entity_key": CF_TYPE }], "$select": "gts_id" }),
+        json!({ "items": [{ "entity_key": CF_TYPE, "if_none_match": "\"x\"" }] }),
+    ] {
+        let response = call(&router, batch_resolve(&body)).await;
+        assert_eq!(
+            response.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{body}: {:?}",
+            response.body
+        );
+    }
+    let response = call(
+        &router,
+        post(
+            &format!("{PLATFORM}/entities:batchResolve?$select=gts_id"),
+            &keys(&[CF_TYPE]),
+        ),
+    )
+    .await;
+    assert!(response.status.is_client_error(), "{:?}", response.body);
+}
+
 // --- discovery ---------------------------------------------------------------
 
 /// A page carries identity and metadata only: no authored content and none of D3's
@@ -3477,7 +3623,7 @@ async fn a_batch_key_over_1024_bytes_is_refused() {
     assert_field_refusal(&refused, "entity_key", "VALIDATION_FAILED");
 }
 
-/// An item's `if_none_match` has the key's bound: 1024 bytes are served, 1025
+/// An item's `if_none_match` includes its quotes: 1024 bytes are served, 1025
 /// refused, whether the handler (raw value) or the parser (quoted tag) sees it.
 #[tokio::test]
 async fn a_batch_validator_over_1024_bytes_is_refused() {
@@ -5657,6 +5803,10 @@ fn the_sdk_bindings_name_the_routes_the_registry_serves() {
                     "types_registry.platform.batch_delete_entities",
                 ),
                 ("get_operation", "types_registry.platform.get_operation"),
+                (
+                    "batch_resolve_identities",
+                    "types_registry.platform.batch_resolve_identities",
+                ),
             ][..],
         ),
         (
@@ -5665,6 +5815,10 @@ fn the_sdk_bindings_name_the_routes_the_registry_serves() {
             &[
                 ("batch_get_entities", "types_registry.batch_get_entities"),
                 ("list_entities", "types_registry.list_entities"),
+                (
+                    "batch_resolve_identities",
+                    "types_registry.batch_resolve_identities",
+                ),
             ][..],
         ),
     ] {

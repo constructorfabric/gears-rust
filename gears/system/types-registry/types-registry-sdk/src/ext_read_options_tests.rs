@@ -1,5 +1,7 @@
 //! A cache decorator fixture makes discarded read options observable in returned content.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use gts::{GtsId, GtsInstanceId, GtsTypeId};
 use serde_json::json;
@@ -10,9 +12,10 @@ use uuid::Uuid;
 use crate::testing_platform::MockTypesRegistry;
 use crate::{
     BatchGetEntitiesRequest, BatchGetEntitiesResponse, DeleteEntitiesRequest, DeletionOperation,
-    EntityField, FieldSelection, IdempotencyKey, ListEntitiesRequest, ListEntitiesResponse,
-    Operation, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, Projection, ReadOptions,
-    RegisterEntitiesRequest, RegistrationOperation, TypesRegistryApi, TypesRegistryApiExt,
+    EntityField, EntityIdentity, EntityKey, FieldSelection, IdempotencyKey, ListEntitiesRequest,
+    ListEntitiesResponse, Operation, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt,
+    Projection, ReadOptions, RegisterEntitiesRequest, RegistrationOperation, TypesRegistryApi,
+    TypesRegistryApiExt,
 };
 
 struct CachedReads {
@@ -105,6 +108,13 @@ impl PlatformTypesRegistryApi for CachedReads {
     ) -> Result<Operation, CanonicalError> {
         self.current.get_operation(ctx, operation_id).await
     }
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &PlatformSecurityContext,
+        keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
+        PlatformTypesRegistryApi::batch_resolve_identities(&self.current, ctx, keys).await
+    }
 }
 
 #[async_trait]
@@ -122,6 +132,13 @@ impl TypesRegistryApi for CachedReads {
         request: ListEntitiesRequest,
     ) -> Result<ListEntitiesResponse, CanonicalError> {
         TypesRegistryApi::list_entities(&self.current, ctx, request).await
+    }
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &SecurityContext,
+        keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
+        TypesRegistryApi::batch_resolve_identities(&self.current, ctx, keys).await
     }
 }
 

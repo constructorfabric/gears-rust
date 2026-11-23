@@ -12,6 +12,8 @@ import httpx
 
 GTS_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "gts")
 PLATFORM_API = "types-registry/v2/platform"
+# The tenant read routes, served to a bearer (D17).
+TENANT_API = "types-registry/v2"
 # Every request carries this valid W3C `traceparent`, so the wire `trace_id` the
 # canonical error layer echoes is deterministic. `extract_trace_id` prefers the
 # live OTel span, but the request span continues this inbound `traceparent`, so
@@ -376,6 +378,43 @@ def assert_batch(response, expected, *, known_etags=()):
         side["items"].sort(key=lambda item: item["entity_key"])
     assert_json(actual, expected)
     return {item["entity_key"]: item.get("etag") for item in body["items"]}
+
+
+async def batch_resolve(client, api_path, keys, *, params=None):
+    """`POST {api}/entities:batchResolve` with one item per key, in order."""
+    return await client.post(
+        f"{api_path}/entities:batchResolve",
+        json={"items": [{"entity_key": key} for key in keys]},
+        params=params,
+    )
+
+
+def resolved(key, document=None):
+    """One complete resolution result: `found` with the identity `document`
+    was registered under, or `not_found` without one. `key` is the echoed key."""
+    if document is None:
+        return {"entity_key": key, "status": "not_found"}
+    gts_id = document["gts_id"]
+    return {
+        "entity_key": key,
+        "status": "found",
+        "identity": {"gts_id": gts_id, "gts_uuid": gts_uuid(gts_id)},
+    }
+
+
+def assert_resolutions(response, *expected):
+    """Compare a batch resolution body in full, results sorted by echoed key.
+
+    As in `assert_batch`, sorting both sides still catches a missing, extra or
+    duplicated key. Nothing is masked: a resolution has no validator or timestamp,
+    neither in a result nor as a response `ETag`.
+    """
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"].startswith("application/json")
+    assert "etag" not in response.headers, response.headers
+    actual = response.json()
+    actual["items"].sort(key=lambda item: item["entity_key"])
+    assert_json(actual, {"items": sorted(expected, key=lambda item: item["entity_key"])})
 
 
 async def discover(client, api_path, params):

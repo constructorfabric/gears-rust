@@ -18,11 +18,11 @@ use crate::gts::TypeResource;
 use crate::item_failure::{AdmissionFailure, AdmissionFailureReason};
 use crate::models::{
     BatchGetEntitiesRequest, BatchGetEntitiesResponse, Cursor, DeleteEntitiesRequest,
-    DeletionItemResult, DeletionOperation, DeletionOutcome, Entity, EntityField, EntityKey,
-    EntityKind, EntityLookup, JsonDocument, LifecycleFilter, LifecycleStatus, ListEntitiesRequest,
-    ListEntitiesResponse, Operation, OperationStatus, Origin, Projection, Provenance,
-    RegisterEntitiesRequest, RegistrationItemResult, RegistrationOperation, RegistrationOutcome,
-    Validator,
+    DeletionItemResult, DeletionOperation, DeletionOutcome, Entity, EntityField, EntityIdentity,
+    EntityKey, EntityKind, EntityLookup, JsonDocument, LifecycleFilter, LifecycleStatus,
+    ListEntitiesRequest, ListEntitiesResponse, Operation, OperationStatus, Origin, Projection,
+    Provenance, RegisterEntitiesRequest, RegistrationItemResult, RegistrationOperation,
+    RegistrationOutcome, Validator,
 };
 
 // ---- failures ----------------------------------------------------------------
@@ -54,23 +54,6 @@ fn wire_version(key: &str, version: u64) -> Result<i64, CanonicalError> {
     i64::try_from(version).map_err(|_| version_out_of_range(key, version))
 }
 
-/// The registry's bound on a validator, the same as on a key.
-const MAX_VALIDATOR_LEN: usize = 1024;
-
-/// The local client's refusal of a validator over the registry's bound.
-fn validator_too_long(len: usize) -> CanonicalError {
-    TypeResource::invalid_argument()
-        .with_field_violation(
-            field::IF_NONE_MATCH_FIELD,
-            format!(
-                "each {} entity-tag must be at most {MAX_VALIDATOR_LEN} bytes; this one is {len}",
-                field::IF_NONE_MATCH_FIELD
-            ),
-            field::VALIDATION_FAILED,
-        )
-        .create()
-}
-
 // ---- keys, validators, projection -------------------------------------------
 
 /// Classified as the registry classifies a key: a UUID first, otherwise an identifier.
@@ -92,22 +75,16 @@ fn is_etagc(byte: u8) -> bool {
     byte == b'!' || (b'#'..=b'~').contains(&byte)
 }
 
-/// A strong entity-tag: the validator, quoted. One over the registry's bound is refused,
-/// as the local client refuses it, whatever its bytes. Otherwise a validator no registry
-/// issues (bytes no entity-tag can quote) is sent as no condition, so the key reads as
-/// `found` — what the local client answers for a token that matches nothing.
-fn entity_tag(validator: &Validator) -> Result<Option<String>, CanonicalError> {
+/// Quote a validator that can be sent as a strong entity-tag.
+fn entity_tag(validator: &Validator) -> Option<String> {
     let bytes = validator.as_bytes();
-    if bytes.len() > MAX_VALIDATOR_LEN {
-        return Err(validator_too_long(bytes.len()));
-    }
     if bytes.is_empty() || !bytes.iter().copied().all(is_etagc) {
-        return Ok(None);
+        return None;
     }
     // `etagc` is ASCII, so the bytes are UTF-8.
-    Ok(std::str::from_utf8(bytes)
+    std::str::from_utf8(bytes)
         .ok()
-        .map(|token| format!("\"{token}\"")))
+        .map(|token| format!("\"{token}\""))
 }
 
 /// A received strong entity-tag as the validator token, without its quotes.
@@ -230,24 +207,44 @@ struct BatchGetItem {
 }
 
 impl BatchGetBody {
-    pub fn encode(request: &BatchGetEntitiesRequest) -> Result<Self, CanonicalError> {
-        Ok(Self {
+    pub fn encode(request: &BatchGetEntitiesRequest) -> Self {
+        Self {
             items: request
                 .items
                 .iter()
-                .map(|item| {
-                    Ok(BatchGetItem {
-                        entity_key: item.key.to_string(),
-                        if_none_match: item
-                            .validator_for(&request.projection)
-                            .map(entity_tag)
-                            .transpose()?
-                            .flatten(),
-                    })
+                .map(|item| BatchGetItem {
+                    entity_key: item.key.to_string(),
+                    if_none_match: item
+                        .if_none_match_for(&request.projection)
+                        .and_then(entity_tag),
                 })
-                .collect::<Result<_, CanonicalError>>()?,
+                .collect(),
             select: select(&request.projection),
-        })
+        }
+    }
+}
+
+/// `POST …/entities:batchResolve`.
+#[derive(Debug, Serialize)]
+pub struct BatchResolveBody {
+    items: Vec<BatchResolveItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchResolveItem {
+    entity_key: String,
+}
+
+impl BatchResolveBody {
+    pub fn encode(keys: &[EntityKey]) -> Self {
+        Self {
+            items: keys
+                .iter()
+                .map(|key| BatchResolveItem {
+                    entity_key: key.to_string(),
+                })
+                .collect(),
+        }
     }
 }
 
@@ -673,10 +670,16 @@ impl LookupWire {
     fn decode(self) -> Result<(EntityKey, EntityLookup), CanonicalError> {
         let key = entity_key(&self.entity_key)?;
         let lookup = match (self.status, self.etag, self.entity) {
-            (LookupStatusWire::Found, Some(etag), Some(entity)) => EntityLookup::Found {
-                entity: Box::new(entity.decode()?),
-                etag: validator(&etag)?,
-            },
+            (LookupStatusWire::Found, Some(etag), Some(entity)) => {
+                let entity = entity.decode()?;
+                if !key.names(&entity) {
+                    return Err(malformed("lookup", &format_args!("wrong entity for {key}")));
+                }
+                EntityLookup::Found {
+                    entity: Box::new(entity),
+                    etag: validator(&etag)?,
+                }
+            }
             (LookupStatusWire::Unchanged, Some(etag), None) => EntityLookup::Unchanged {
                 etag: validator(&etag)?,
             },
@@ -712,6 +715,89 @@ impl LookupsWire {
             }
         }
         Ok(BatchGetEntitiesResponse(lookups))
+    }
+}
+
+// ---- responses: batch resolution ---------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ResolutionStatusWire {
+    Found,
+    NotFound,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdentityWire {
+    gts_id: String,
+    gts_uuid: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolutionWire {
+    entity_key: String,
+    status: ResolutionStatusWire,
+    #[serde(default)]
+    identity: Option<IdentityWire>,
+}
+
+/// The `:batchResolve` answer: one resolution per distinct key.
+#[derive(Debug, Deserialize)]
+pub struct ResolutionsWire {
+    items: Vec<ResolutionWire>,
+}
+
+impl ResolutionWire {
+    fn decode(self) -> Result<(EntityKey, Option<EntityIdentity>), CanonicalError> {
+        let key = entity_key(&self.entity_key)?;
+        let identity = match (self.status, self.identity) {
+            (ResolutionStatusWire::Found, Some(identity)) => {
+                let identity = EntityIdentity {
+                    gts_id: gts_id(&identity.gts_id)?,
+                    gts_uuid: identity.gts_uuid,
+                };
+                if !key.identifies(&identity) {
+                    return Err(malformed(
+                        "resolution",
+                        &format_args!("wrong entity for {key}"),
+                    ));
+                }
+                Some(identity)
+            }
+            (ResolutionStatusWire::NotFound, None) => None,
+            (status, identity) => {
+                return Err(malformed(
+                    "resolution",
+                    &format_args!(
+                        "{}: {status:?} with{} identity",
+                        self.entity_key,
+                        if identity.is_some() { "" } else { "out" },
+                    ),
+                ));
+            }
+        };
+        Ok((key, identity))
+    }
+}
+
+impl ResolutionsWire {
+    pub fn decode(self) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
+        let mut identities = HashMap::with_capacity(self.items.len());
+        for item in self.items {
+            let (key, identity) = item.decode()?;
+            match identities.entry(key) {
+                Entry::Vacant(slot) => {
+                    slot.insert(identity);
+                }
+                Entry::Occupied(slot) => {
+                    return Err(malformed(
+                        "resolution",
+                        &format_args!("{} twice", slot.key()),
+                    ));
+                }
+            }
+        }
+        Ok(identities)
     }
 }
 
