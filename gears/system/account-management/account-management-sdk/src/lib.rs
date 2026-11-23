@@ -47,6 +47,7 @@ pub mod idp_service_account;
 pub mod idp_user;
 pub mod metadata;
 pub mod precondition;
+pub mod principal_lifecycle;
 pub mod quota;
 pub mod reason;
 pub mod tenant;
@@ -63,8 +64,9 @@ mod user_validation_tests;
 pub use client::AccountManagementClient;
 pub use error::AccountManagementError;
 pub use gts::{
-    CONVERSION_REQUEST_RESOURCE_TYPE, IdpPluginSpecV1, SERVICE_ACCOUNT_RESOURCE_TYPE,
-    TENANT_METADATA_RESOURCE_TYPE, TENANT_RESOURCE_TYPE, USER_RESOURCE_TYPE,
+    CONVERSION_REQUEST_RESOURCE_TYPE, IdpPluginSpecV1, PrincipalLifecycleHookSpecV1,
+    SERVICE_ACCOUNT_RESOURCE_TYPE, TENANT_METADATA_RESOURCE_TYPE, TENANT_RESOURCE_TYPE,
+    USER_RESOURCE_TYPE,
 };
 pub use idp::{
     IdpDeprovisionFailure, IdpDeprovisionTenantRequest, IdpPluginClient, IdpProvisionFailure,
@@ -83,6 +85,9 @@ pub use idp_user::{
 };
 pub use metadata::{
     MetadataEntry, MetadataEntryFilterField, MetadataEntryQuery, UpsertMetadataRequest,
+};
+pub use principal_lifecycle::{
+    PrincipalLifecycleEvent, PrincipalLifecycleHookError, PrincipalLifecycleHookV1,
 };
 pub use tenant::{
     CreateTenantRequest, Tenant, TenantAncestor, TenantId, TenantInfoFilterField, TenantInfoQuery,

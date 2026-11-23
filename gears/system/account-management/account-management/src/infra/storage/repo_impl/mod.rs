@@ -11,6 +11,7 @@ mod hierarchy_read;
 pub(crate) mod integrity;
 mod lifecycle;
 pub mod metadata;
+pub mod pending_deprovision;
 mod reads;
 mod retention;
 mod updates;
@@ -18,6 +19,7 @@ mod updates;
 pub use conversion::ConversionRepoImpl;
 pub use hierarchy_read::TenantHierarchyReadAdapter;
 pub use metadata::MetadataRepoImpl;
+pub use pending_deprovision::PendingDeprovisionRepoImpl;
 
 use std::collections::HashMap;
 use std::sync::Arc;

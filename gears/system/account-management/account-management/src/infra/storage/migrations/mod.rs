@@ -55,6 +55,7 @@ pub mod m0005_tenant_metadata_indexes;
 pub mod m0006_add_conversion_audit_comments;
 pub mod m0007_create_am_leases;
 pub mod m0008_drop_integrity_check_runs;
+pub mod m0009_create_pending_user_deprovisions;
 
 pub struct Migrator;
 
@@ -70,6 +71,7 @@ impl MigratorTrait for Migrator {
             Box::new(m0006_add_conversion_audit_comments::Migration),
             Box::new(m0007_create_am_leases::Migration),
             Box::new(m0008_drop_integrity_check_runs::Migration),
+            Box::new(m0009_create_pending_user_deprovisions::Migration),
         ]
     }
 }

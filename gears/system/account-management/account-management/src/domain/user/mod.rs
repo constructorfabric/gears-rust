@@ -28,6 +28,7 @@
 //! clamp safe for cross-barrier authorization. The domain types here
 //! are REST-ready so that drop-in is a thin handler wiring step.
 
+pub mod pending_deprovision;
 pub mod service;
 
 #[cfg(test)]

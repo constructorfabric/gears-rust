@@ -23,7 +23,8 @@ use crate::domain::tenant::closure::ClosureRow;
 use crate::domain::tenant::model::{NewTenant, TenantModel, TenantStatus};
 use crate::domain::tenant::retention::{HardDeleteEligibility, HardDeleteOutcome};
 use crate::infra::storage::entity::{
-    conversion_requests, tenant_closure, tenant_idp_metadata, tenant_metadata, tenants,
+    conversion_requests, pending_user_deprovisions, tenant_closure, tenant_idp_metadata,
+    tenant_metadata, tenants,
 };
 
 use super::TenantRepoImpl;
@@ -1078,6 +1079,21 @@ pub(super) async fn hard_delete_one(
                 // would orphan rows on SQLite-backed deployments.
                 tenant_idp_metadata::Entity::delete_many()
                     .filter(Condition::all().add(tenant_idp_metadata::Column::TenantId.eq(id)))
+                    .secure()
+                    .scope_with(&AccessScope::allow_all())
+                    .exec(tx)
+                    .await
+                    .map_err(map_scope_to_tx)?;
+
+                // Unfinished user deletions next. A record outlives its
+                // purpose once the tenant is gone (`delete_user` needs an
+                // active tenant to finish it), and the `ON DELETE CASCADE`
+                // declared in `m0009_create_pending_user_deprovisions` is a
+                // silent no-op on SQLite for the same reason as above.
+                pending_user_deprovisions::Entity::delete_many()
+                    .filter(
+                        Condition::all().add(pending_user_deprovisions::Column::TenantId.eq(id)),
+                    )
                     .secure()
                     .scope_with(&AccessScope::allow_all())
                     .exec(tx)

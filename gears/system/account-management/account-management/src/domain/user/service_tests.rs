@@ -539,12 +539,19 @@ async fn create_user_idp_rejects_payload_maps_to_validation() {
 
 // ---- delete_user ---------------------------------------------
 
+/// Make `user_id` a user of the tenant the fake `IdP` is asked about, so
+/// `delete_user`'s membership check finds it and the deletion proceeds.
+fn seed_member(idp: &FakeIdpUserProvisioner, user_id: Uuid) {
+    idp.set_list_items(vec![IdpUser::new(user_id, "member")]);
+}
+
 #[tokio::test]
 async fn delete_user_happy_path_removed() {
     let tenants = Arc::new(FakeTenantRepo::new());
     let tenant_id = Uuid::from_u128(0x30);
     seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
     let idp = Arc::new(FakeIdpUserProvisioner::new());
+    seed_member(&idp, Uuid::from_u128(0xBEEF));
     let svc = make_service(tenants, idp.clone());
 
     let user_id = Uuid::from_u128(0xBEEF);
@@ -568,6 +575,7 @@ async fn delete_user_retry_remains_idempotent() {
     let tenant_id = Uuid::from_u128(0x34);
     seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
     let idp = Arc::new(FakeIdpUserProvisioner::new());
+    seed_member(&idp, Uuid::from_u128(0xBEEF_BEEF));
     let svc = make_service(tenants, idp.clone());
 
     let user_id = Uuid::from_u128(0xBEEF_BEEF);
@@ -593,6 +601,7 @@ async fn delete_user_idp_unavailable_does_not_become_idempotent_success() {
     let tenant_id = Uuid::from_u128(0x32);
     seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
     let idp = Arc::new(FakeIdpUserProvisioner::new());
+    seed_member(&idp, Uuid::from_u128(0xDEAD));
     idp.set_delete_outcome(FakeUserOutcome::Unavailable);
     let svc = make_service(tenants, idp);
 
@@ -613,6 +622,7 @@ async fn delete_user_unsupported_passes_through() {
     let tenant_id = Uuid::from_u128(0x33);
     seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
     let idp = Arc::new(FakeIdpUserProvisioner::new());
+    seed_member(&idp, Uuid::from_u128(0xBEEF));
     idp.set_delete_outcome(FakeUserOutcome::Unsupported);
     let svc = make_service(tenants, idp);
 
@@ -1289,10 +1299,13 @@ async fn user_ops_forward_tenant_idp_metadata_into_tenant_context_on_every_call(
         expected,
         "delete_user MUST forward tenant_idp_metadata blob on the IdP call"
     );
+    // Two list calls reach the IdP: `delete_user`'s membership check, then
+    // the listing itself. Both must carry the blob.
     assert_eq!(
         idp.list_metadata_snapshots(),
-        expected,
-        "list_users MUST forward tenant_idp_metadata blob on the IdP call"
+        vec![expected[0].clone(), expected[0].clone()],
+        "delete_user's membership check and list_users MUST forward \
+         tenant_idp_metadata blob on the IdP call"
     );
 }
 
@@ -1610,6 +1623,7 @@ mod cleanup {
         let group_b = Uuid::from_u128(0xC4);
 
         let idp = Arc::new(FakeIdpUserProvisioner::new());
+        seed_member(&idp, user_id);
         idp.set_delete_outcome(FakeUserOutcome::Ok);
         let rg = Arc::new(FakeMembershipRgClient::with_groups(vec![
             user_group(group_a, tenant_id),
@@ -1646,6 +1660,7 @@ mod cleanup {
         let user_id = Uuid::from_u128(0xE2);
 
         let idp = Arc::new(FakeIdpUserProvisioner::new());
+        seed_member(&idp, user_id);
         idp.set_delete_outcome(FakeUserOutcome::Ok);
         let rg = Arc::new(FakeMembershipRgClient::empty());
         let svc = make_service_with_cleanup(tenants, idp, Arc::clone(&rg));
@@ -1693,6 +1708,7 @@ mod cleanup {
         let user_id = Uuid::from_u128(0xA2);
 
         let idp = Arc::new(FakeIdpUserProvisioner::new());
+        seed_member(&idp, user_id);
         idp.set_delete_outcome(FakeUserOutcome::Ok);
         let rg = Arc::new(FakeMembershipRgClient::with_list_error(
             CanonicalError::internal("connection refused").create(),
@@ -1753,6 +1769,7 @@ mod cleanup {
         };
 
         let idp = Arc::new(FakeIdpUserProvisioner::new());
+        seed_member(&idp, user_id);
         idp.set_delete_outcome(FakeUserOutcome::Ok);
         let rg = Arc::new(FakeMembershipRgClient::with_paged_groups(vec![
             page1, page2,
@@ -1789,6 +1806,7 @@ mod cleanup {
         let group_a = Uuid::from_u128(0xB3);
 
         let idp = Arc::new(FakeIdpUserProvisioner::new());
+        seed_member(&idp, user_id);
         idp.set_delete_outcome(FakeUserOutcome::Ok);
         let rg = Arc::new(
             FakeMembershipRgClient::with_groups(vec![user_group(group_a, tenant_id)])
@@ -1852,4 +1870,270 @@ async fn every_registry_read_names_the_requests_caller() {
         spy.clear();
     }
     assert_eq!(spy.platform_reads(), 0);
+}
+
+// ---------------------------------------------------------------------
+// Principal-lifecycle delivery on delete
+// ---------------------------------------------------------------------
+
+/// Notifier double: records each delivered event and answers with a fixed
+/// result.
+struct RecordingLifecycle {
+    result: std::sync::Mutex<Result<(), account_management_sdk::PrincipalLifecycleHookError>>,
+    seen: std::sync::Mutex<Vec<account_management_sdk::PrincipalLifecycleEvent>>,
+}
+
+impl RecordingLifecycle {
+    fn answering(
+        result: Result<(), account_management_sdk::PrincipalLifecycleHookError>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            result: std::sync::Mutex::new(result),
+            seen: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Answer every later delivery with `result`.
+    fn answer(&self, result: Result<(), account_management_sdk::PrincipalLifecycleHookError>) {
+        *self.result.lock().expect("lock") = result;
+    }
+
+    fn seen(&self) -> Vec<account_management_sdk::PrincipalLifecycleEvent> {
+        self.seen.lock().expect("lock").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::domain::principal_lifecycle::PrincipalLifecycleNotifier for RecordingLifecycle {
+    async fn notify(
+        &self,
+        _ctx: &SecurityContext,
+        event: &account_management_sdk::PrincipalLifecycleEvent,
+    ) -> Result<(), account_management_sdk::PrincipalLifecycleHookError> {
+        self.seen.lock().expect("lock").push(event.clone());
+        self.result.lock().expect("lock").clone()
+    }
+}
+
+#[tokio::test]
+async fn delete_user_delivers_user_deprovisioned_after_the_idp_removed_the_user() {
+    let tenants = Arc::new(FakeTenantRepo::new());
+    let tenant_id = Uuid::from_u128(0x40);
+    seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
+    let idp = Arc::new(FakeIdpUserProvisioner::new());
+    seed_member(&idp, Uuid::from_u128(0x4040));
+    let lifecycle = RecordingLifecycle::answering(Ok(()));
+    let svc = make_service(tenants, idp.clone()).with_principal_lifecycle(lifecycle.clone());
+    let user_id = Uuid::from_u128(0x4040);
+
+    svc.delete_user(&ctx(), tenant_id, user_id)
+        .await
+        .expect("delete succeeds");
+
+    assert_eq!(idp.delete_call_count(), 1);
+    assert_eq!(
+        lifecycle.seen(),
+        vec![
+            account_management_sdk::PrincipalLifecycleEvent::UserDeprovisioned {
+                tenant_id,
+                user_id
+            }
+        ]
+    );
+}
+
+#[tokio::test]
+async fn delete_user_hook_failure_is_retryable_and_the_retry_redelivers() {
+    let tenants = Arc::new(FakeTenantRepo::new());
+    let tenant_id = Uuid::from_u128(0x41);
+    seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
+    let idp = Arc::new(FakeIdpUserProvisioner::new());
+    seed_member(&idp, Uuid::from_u128(0x4141));
+    let lifecycle = RecordingLifecycle::answering(Err(
+        account_management_sdk::PrincipalLifecycleHookError::Retryable {
+            detail: "hook store down".to_owned(),
+        },
+    ));
+    let svc = make_service(tenants, idp).with_principal_lifecycle(lifecycle.clone());
+    let user_id = Uuid::from_u128(0x4141);
+
+    for _ in 0..2 {
+        let err = svc
+            .delete_user(&ctx(), tenant_id, user_id)
+            .await
+            .expect_err("a failing hook fails the delete");
+        assert!(
+            matches!(err, DomainError::ServiceUnavailable { .. }),
+            "{err:?}"
+        );
+    }
+    // The IdP delete is idempotent, so each retry reaches the hooks again.
+    assert_eq!(lifecycle.seen().len(), 2);
+}
+
+#[tokio::test]
+async fn delete_user_idp_failure_delivers_nothing() {
+    // A user the IdP could not remove still exists: no hook may hear that
+    // it is gone.
+    let tenants = Arc::new(FakeTenantRepo::new());
+    let tenant_id = Uuid::from_u128(0x42);
+    seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
+    let idp = Arc::new(FakeIdpUserProvisioner::new());
+    seed_member(&idp, Uuid::from_u128(0x4242));
+    idp.set_delete_outcome(FakeUserOutcome::Unavailable);
+    let lifecycle = RecordingLifecycle::answering(Ok(()));
+    let svc = make_service(tenants, idp).with_principal_lifecycle(lifecycle.clone());
+
+    svc.delete_user(&ctx(), tenant_id, Uuid::from_u128(0x4242))
+        .await
+        .expect_err("IdP failure surfaces");
+
+    assert_eq!(lifecycle.seen(), Vec::new());
+}
+
+// ---------------------------------------------------------------------
+// Membership gate and the record of unfinished deletions
+// ---------------------------------------------------------------------
+
+/// A service with a lifecycle notifier and a record of unfinished
+/// deletions wired, over a fresh tenant `tenant_id`.
+fn gated_service(
+    tenant_id: Uuid,
+    idp: Arc<FakeIdpUserProvisioner>,
+    lifecycle: Arc<RecordingLifecycle>,
+    pending: Arc<crate::domain::user::test_support::FakePendingDeprovisions>,
+) -> UserService {
+    let tenants = Arc::new(FakeTenantRepo::new());
+    seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
+    make_service(tenants, idp)
+        .with_principal_lifecycle(lifecycle)
+        .with_pending_deprovisions(pending)
+}
+
+#[tokio::test]
+async fn delete_user_of_another_tenant_is_a_silent_no_op() {
+    // The caller administers `tenant_id`; the user is not in it (another
+    // tenant's user, or one the IdP never had). The response must match a
+    // real deletion, but nothing may happen: no IdP delete, and above all
+    // no event telling other gears to drop a user that still exists.
+    let tenant_id = Uuid::from_u128(0x50);
+    let idp = Arc::new(FakeIdpUserProvisioner::new());
+    let lifecycle = RecordingLifecycle::answering(Ok(()));
+    let pending = Arc::new(crate::domain::user::test_support::FakePendingDeprovisions::default());
+    let svc = gated_service(tenant_id, idp.clone(), lifecycle.clone(), pending.clone());
+    let stranger = Uuid::from_u128(0x5050);
+
+    svc.delete_user(&ctx(), tenant_id, stranger)
+        .await
+        .expect("same Ok(()) as a real deletion");
+
+    assert_eq!(idp.delete_call_count(), 0, "no IdP delete for a stranger");
+    assert_eq!(lifecycle.seen(), Vec::new(), "no event for a stranger");
+    assert!(!pending.contains(tenant_id, stranger));
+}
+
+#[tokio::test]
+async fn a_finished_deletion_leaves_no_record() {
+    let tenant_id = Uuid::from_u128(0x51);
+    let user_id = Uuid::from_u128(0x5151);
+    let idp = Arc::new(FakeIdpUserProvisioner::new());
+    seed_member(&idp, user_id);
+    let lifecycle = RecordingLifecycle::answering(Ok(()));
+    let pending = Arc::new(crate::domain::user::test_support::FakePendingDeprovisions::default());
+    let svc = gated_service(tenant_id, idp, lifecycle.clone(), pending.clone());
+
+    svc.delete_user(&ctx(), tenant_id, user_id)
+        .await
+        .expect("delete succeeds");
+
+    assert_eq!(lifecycle.seen().len(), 1);
+    assert!(!pending.contains(tenant_id, user_id), "record cleared");
+}
+
+#[tokio::test]
+async fn a_retry_finishes_a_deletion_the_idp_already_carried_out() {
+    // First attempt: the user is in the tenant, the IdP deletes it, then a
+    // hook fails. The deletion stays recorded.
+    let tenant_id = Uuid::from_u128(0x52);
+    let user_id = Uuid::from_u128(0x5252);
+    let idp = Arc::new(FakeIdpUserProvisioner::new());
+    seed_member(&idp, user_id);
+    let lifecycle = RecordingLifecycle::answering(Err(
+        account_management_sdk::PrincipalLifecycleHookError::Retryable {
+            detail: "hook store down".to_owned(),
+        },
+    ));
+    let pending = Arc::new(crate::domain::user::test_support::FakePendingDeprovisions::default());
+    let svc = gated_service(tenant_id, idp.clone(), lifecycle.clone(), pending.clone());
+
+    let err = svc
+        .delete_user(&ctx(), tenant_id, user_id)
+        .await
+        .expect_err("the failing hook fails the delete");
+    assert!(
+        matches!(err, DomainError::ServiceUnavailable { .. }),
+        "{err:?}"
+    );
+    assert!(
+        pending.contains(tenant_id, user_id),
+        "deletion still recorded"
+    );
+
+    // The IdP no longer has the user, and the hook has recovered. The
+    // retry must still reach the hook, because the record says the
+    // deletion is unfinished.
+    idp.set_list_items(Vec::new());
+    lifecycle.answer(Ok(()));
+
+    svc.delete_user(&ctx(), tenant_id, user_id)
+        .await
+        .expect("the retry finishes the deletion");
+
+    assert_eq!(
+        lifecycle.seen(),
+        vec![
+            account_management_sdk::PrincipalLifecycleEvent::UserDeprovisioned {
+                tenant_id,
+                user_id
+            };
+            2
+        ]
+    );
+    assert_eq!(
+        idp.delete_call_count(),
+        2,
+        "the retry re-ran the IdP delete"
+    );
+    assert!(!pending.contains(tenant_id, user_id), "record cleared");
+
+    // Once finished, a further DELETE is the stranger case again.
+    svc.delete_user(&ctx(), tenant_id, user_id)
+        .await
+        .expect("Ok(())");
+    assert_eq!(
+        lifecycle.seen().len(),
+        2,
+        "no event after the deletion finished"
+    );
+}
+
+#[tokio::test]
+async fn an_idp_failure_keeps_the_deletion_recorded() {
+    // The IdP could not delete the user, which therefore still exists: no
+    // event, but the record stays so a retry carries on.
+    let tenant_id = Uuid::from_u128(0x53);
+    let user_id = Uuid::from_u128(0x5353);
+    let idp = Arc::new(FakeIdpUserProvisioner::new());
+    seed_member(&idp, user_id);
+    idp.set_delete_outcome(FakeUserOutcome::Unavailable);
+    let lifecycle = RecordingLifecycle::answering(Ok(()));
+    let pending = Arc::new(crate::domain::user::test_support::FakePendingDeprovisions::default());
+    let svc = gated_service(tenant_id, idp, lifecycle.clone(), pending.clone());
+
+    svc.delete_user(&ctx(), tenant_id, user_id)
+        .await
+        .expect_err("IdP failure surfaces");
+
+    assert_eq!(lifecycle.seen(), Vec::new());
+    assert!(pending.contains(tenant_id, user_id));
 }
