@@ -1,6 +1,7 @@
-//! Service-level integration tests on in-memory SQLite with the production
-//! migration and the dependency doubles of `model_registry::testing`
-//! (DESIGN §4 Testability, PRD §9 acceptance criteria).
+//! Service-level integration tests with the production migration and the
+//! dependency doubles of `model_registry::testing` (DESIGN §4 Testability,
+//! PRD §9 acceptance criteria). On in-memory SQLite by default, on `PostgreSQL`
+//! with `--features integration` (`tests/common`).
 
 #![allow(
     clippy::expect_used,
@@ -26,7 +27,6 @@ use model_registry::domain::credential_check::OwnRowState;
 use model_registry::domain::error::{Dependency, DomainError, Resource};
 use model_registry::domain::service::Service;
 use model_registry::infra::chain_cache::ChainCache;
-use model_registry::infra::storage::migrations::Migrator;
 use model_registry::testing::{
     StaticAuthz, StaticSchemaSource, StaticSecretRefSource, StaticTenantResolver, deny,
     model_update, own_tenant_constraint, permit_with, provider_update, security_context,
@@ -40,14 +40,15 @@ use model_registry_sdk::{
     ApprovalState, ContextWindow, CreateModelRequestV1, CreateProviderRequestV1, ModelCostV1,
     ModelEntryV1, ModelV1, SharingMode, field,
 };
-use sea_orm_migration::MigratorTrait;
 use tenant_resolver_sdk::BarrierMode;
-use toolkit_db::migration_runner::run_migrations_for_testing;
-use toolkit_db::{ConnectOpts, DBProvider, connect_db};
+use toolkit_db::{DBProvider, Db};
 use toolkit_gts::gts_id;
 use toolkit_odata::ODataQuery;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
+
+mod common;
+use common::{KeepAlive, TestDb, test_db};
 
 const OPENAI: &str = gts_id!("cf.genai.model.provider.v1~cf.genai._.openai.v1~");
 const STRICT: &str = gts_id!("cf.genai.model.provider.v1~cf.genai._.strict.v1~");
@@ -63,6 +64,8 @@ struct Harness {
     schemas: Arc<StaticSchemaSource>,
     secrets: Arc<StaticSecretRefSource>,
     clock: Arc<ManualClock>,
+    /// `None` when the database outlives the harness.
+    _db: Option<KeepAlive>,
 }
 
 fn schemas() -> StaticSchemaSource {
@@ -101,19 +104,28 @@ async fn harness_full(
     secrets: StaticSecretRefSource,
     cfg: ModelRegistryConfig,
 ) -> Harness {
-    let raw = connect_db(
-        "sqlite::memory:",
-        ConnectOpts {
-            max_conns: Some(1),
-            min_conns: Some(1),
-            ..Default::default()
-        },
+    let TestDb { db, keep_alive } = test_db().await;
+    harness_on(
+        db,
+        Some(keep_alive),
+        resolver,
+        authz,
+        schemas,
+        secrets,
+        &cfg,
     )
-    .await
-    .expect("in-memory SQLite");
-    run_migrations_for_testing(&raw, Migrator::migrations())
-        .await
-        .expect("migrations");
+}
+
+/// A harness on an existing database.
+fn harness_on(
+    raw: Db,
+    keep_alive: Option<KeepAlive>,
+    resolver: StaticTenantResolver,
+    authz: StaticAuthz,
+    schemas: StaticSchemaSource,
+    secrets: StaticSecretRefSource,
+    cfg: &ModelRegistryConfig,
+) -> Harness {
     let db = Arc::new(DBProvider::<DomainError>::new(raw));
     let authz = Arc::new(authz);
     let resolver = Arc::new(resolver);
@@ -138,7 +150,7 @@ async fn harness_full(
         schemas.clone(),
         secrets.clone(),
         clock.clone(),
-        &cfg,
+        cfg,
     );
     Harness {
         service,
@@ -147,6 +159,7 @@ async fn harness_full(
         schemas,
         secrets,
         clock,
+        _db: keep_alive,
     }
 }
 
@@ -1592,9 +1605,11 @@ fn sharing(shared: bool) -> SharingMode {
     }
 }
 
-/// Builds the catalog and returns, per tenant, the available list and the
-/// set of ids that resolve.
+/// Builds the catalog on `db` and returns, per tenant, the available list and
+/// the set of ids that resolve. Fresh tenants keep it apart from earlier
+/// catalogs on the same database.
 async fn available_and_resolvable(
+    db: &Db,
     catalog: GeneratedCatalog,
 ) -> Vec<(BTreeSet<String>, BTreeSet<String>)> {
     let t = Tenants::new();
@@ -1605,7 +1620,15 @@ async fn available_and_resolvable(
     if catalog.customer_self_managed {
         resolver = resolver.with_self_managed(t.customer);
     }
-    let h = harness(resolver).await;
+    let h = harness_on(
+        db.clone(),
+        None,
+        resolver,
+        StaticAuthz::permit_own_tenant(),
+        schemas(),
+        secrets(),
+        &ModelRegistryConfig::default(),
+    );
     let slots = t
         .all()
         .into_iter()
@@ -1645,25 +1668,42 @@ async fn available_and_resolvable(
     out
 }
 
-proptest::proptest! {
-    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+/// `list_available_models` returns exactly the canonical ids for which
+/// `resolve_model` succeeds, over shadowing, sharing, approval,
+/// enablement, and barriers. The cases share one runtime and one database,
+/// so `PostgreSQL` starts and migrates once.
+#[test]
+fn available_list_equals_resolvable_set_for_any_catalog() {
+    use proptest::test_runner::{Config, TestRunner};
 
-    /// `list_available_models` returns exactly the canonical ids for which
-    /// `resolve_model` succeeds, over shadowing, sharing, approval,
-    /// enablement, and barriers.
-    #[test]
-    fn available_list_equals_resolvable_set_for_any_catalog(catalog in generated_catalog()) {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // The container is removed on drop, which needs an entered runtime.
+    let _entered = runtime.enter();
+    let shared = runtime.block_on(test_db());
+    let mut runner = TestRunner::new(Config {
+        cases: 64,
+        source_file: Some(file!()),
+        test_name: Some(concat!(
+            module_path!(),
+            "::available_list_equals_resolvable_set_for_any_catalog"
+        )),
+        ..Config::default()
+    });
+    let result = runner.run(&generated_catalog(), |catalog| {
         for (tenant, (available, resolvable)) in runtime
-            .block_on(available_and_resolvable(catalog))
+            .block_on(available_and_resolvable(&shared.db, catalog))
             .into_iter()
             .enumerate()
         {
             proptest::prop_assert_eq!(available, resolvable, "tenant #{}", tenant);
         }
+        Ok(())
+    });
+    if let Err(e) = result {
+        panic!("{e}\n{runner}");
     }
 }
 

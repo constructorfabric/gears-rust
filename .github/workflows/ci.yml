@@ -511,6 +511,14 @@ jobs:
           CONSTRUCT_PG_REQUIRE_DOCKER: "1"
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=construct-pg
 
+      - name: Test model-registry (pg, integration)
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
+        # Same shape as credstore above: Docker is on this runner, so a
+        # fallback to SQLite here would be a broken daemon passing green.
+        env:
+          MODEL_REGISTRY_PG_REQUIRE_DOCKER: "1"
+        run: tools/scripts/with_rust_annotations.sh make test-integration LANE=model-registry-pg
+
       - name: Test license-enforcement (pg, integration)
         if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=license-enforcement-pg

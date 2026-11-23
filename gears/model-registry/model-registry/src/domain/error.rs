@@ -221,7 +221,7 @@ impl DomainError {
     pub fn from_enforcer(err: EnforcerError, operation: &'static str) -> Self {
         match err {
             EnforcerError::AccessDenied(denial) => {
-                tracing::debug!(operation, ?denial, "pdp denied");
+                tracing::debug!(operation, ?denial, "access denied");
                 Self::not_permitted(operation)
             }
             EnforcerError::CompileFailed(e) => {

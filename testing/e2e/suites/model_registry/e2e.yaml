@@ -1,0 +1,13 @@
+suite: model-registry
+features:
+  - model-registry
+  - static-tenants
+  - static-authn
+  - static-authz
+launcher: e2e-launcher
+env:
+  APP__SERVER__HOME_DIR: "{root}/target/e2e-home-{suite_key}"
+# Keep the catalog free of rows left by earlier runs.
+clean_home: true
+config_gears:
+  - model-registry
