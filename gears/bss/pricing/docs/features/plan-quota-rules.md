@@ -100,17 +100,17 @@ and derives tenant scope before storage, replay or calls to another gear.
 
 ### Author, check and publish quota rules
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-pricing-flow-plan-quota-rules`
+- [x] `p1` - **ID**: `cpt-cf-bss-pricing-flow-plan-quota-rules`
 
 Implements the package's `cpt-cf-bss-quotas-flow-plan-rules`.
 
 1. [x] - `p1` - Product Manager reads a draft revision with its items and its quota rules, with the revision's ETag; ask `read` on `plan` - `inst-quota-read`
 2. [x] - `p1` - Product Manager selects exact definitions from Products' catalog and puts the complete rule set under the revision's ETag and an idempotency key, by algorithm replace - `inst-quota-replace`
-3. [x] - `p1` - Product Manager reads the revision's checks: one red row per failing quota code, each naming the item, the rule and the field, with the evaluated revision version and digest (D-544) - `inst-quota-check`
+3. [x] - `p1` - Product Manager reads the revision's checks: one red row per failing quota code, each naming the item, the rule and the field, or the item, the sellable cell and the metric that no rule covers, with the evaluated revision version and digest (D-544) - `inst-quota-check`
 4. [x] - `p1` - Submit and every vote recheck the rules by algorithm govern; a red quota row refuses, and an approved revision publishes its rules unchanged - `inst-quota-submit`
 5. [x] - `p1` - Copying a published revision or cloning its plan copies its rules onto the copied items by algorithm govern - `inst-quota-copy`
-6. [ ] - `p1` - A buyer's preview carries the revision's quota terms; the selected quota digest is computed for the requested selection by algorithm accept - `inst-quota-preview`
-7. [ ] - `p1` - Acceptance checks the expected quota digest and freezes the selected rules in the receipt by algorithm accept - `inst-quota-accept`
+6. [x] - `p1` - A buyer's preview (resolve and `GET /resolve`) carries the revision's quota terms; the buyer computes the selected quota digest for its selection with the SDK's `selected_quota_digest`, the selection of algorithm accept - `inst-quota-preview`
+7. [x] - `p1` - Acceptance checks the expected quota digest and freezes the selected rules in the receipt by algorithm accept - `inst-quota-accept`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -138,12 +138,12 @@ Implements the package's `cpt-cf-bss-quotas-algo-plan-rules`.
 
 ### accept
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-pricing-algo-plan-quota-rules-accept`
+- [x] `p1` - **ID**: `cpt-cf-bss-pricing-algo-plan-quota-rules-accept`
 
-1. [ ] - `p1` - Resolve answers every rule of the revision with its pinned evidence and the set digest, or none for a revision without rules - `inst-quota-terms`
-2. [ ] - `p1` - Select the rules whose item and value the sale requests; an item's rule never applies to another value or through the default chain - `inst-quota-select`
-3. [ ] - `p1` - A revision with rules needs the sale's expected quota digest, and it must equal the selected digest; else RESOLUTION_CHANGED - `inst-quota-expected`
-4. [ ] - `p1` - Validate the selected set through Products for acceptance at the accepted quantity, then freeze the rules, their evidence, the original quantity and the selected and snapshot digests in the receipt, in the acceptance transaction - `inst-quota-freeze`
+1. [x] - `p1` - Resolve answers every rule of the revision with its pinned evidence and the set digest, read from the stored rules with no catalog call, or none for a revision without rules - `inst-quota-terms`
+2. [x] - `p1` - Before the selection, a revision with rules needs the sale's expected quota digest and a revision without rules takes none, else RESOLUTION_CHANGED; after the selection (step 3), the expected digest must equal the selected digest, else RESOLUTION_CHANGED - `inst-quota-expected`
+3. [x] - `p1` - A quota is a metric: for each metric of a selected item's rules, select every rule of the item for the requested value and that metric, else every default rule of the item for that metric; a metric with neither is QUOTA_RULE_MISSING, whatever the expected digest and before any catalog call; the price's default chain plays no part - `inst-quota-select`
+4. [x] - `p1` - A sale that selects rules needs a whole quantity from 1 (QUANTITY_INVALID); outside the transaction, validate the selected rules through Products for acceptance at that quantity, the first refusal that applies answering (D-548); freeze each rule with its evidence, final limit and availability revision, the original quantity and the selected and snapshot digests, and check the snapshot with `verify_quota_snapshot`; the acceptance transaction writes the snapshot in the receipt, or rolls back and captures again when the rule set moved - `inst-quota-freeze`
 
 ## 4. States (CDSL)
 
@@ -241,6 +241,7 @@ Verified by `domain::plan_quota::plan_quota_tests::a_complete_body_parses_into_n
 `domain::plan_quota::plan_quota_tests::many_unknown_members_name_the_first_ten_and_count_the_rest`,
 `domain::plan_quota::plan_quota_tests::a_rule_for_a_foreign_item_is_rule_invalid`,
 `domain::plan_quota::plan_quota_tests::a_dimension_value_must_be_the_items_registered_value`,
+`domain::plan_quota::plan_quota_tests::a_default_rule_on_an_item_with_a_dimension_is_accepted`,
 `domain::plan_quota::plan_quota_tests::a_rule_whose_sku_has_no_version_on_the_sale_date_is_rule_invalid`,
 `domain::plan_quota::plan_quota_tests::two_rules_for_one_binding_and_metric_that_apply_together_are_duplicates`,
 `domain::plan_quota::plan_quota_tests::dimension_alternatives_of_one_item_are_not_duplicates`,
@@ -257,6 +258,7 @@ Verified by `domain::plan_quota::plan_quota_tests::a_complete_body_parses_into_n
 `infra::plan_quota::plan_quota_tests::a_set_whose_skus_have_no_version_on_the_sale_date_asks_no_catalog`,
 `infra::plan_quota::plan_quota_tests::the_set_request_carries_each_items_sku_version`,
 `infra::plan_quota::plan_quota_tests::the_evidence_keeps_identity_and_no_text_or_availability`,
+`infra::plan_quota::plan_quota_tests::the_evidence_pins_the_grid_of_the_rules_own_unit`,
 `infra::plan_quota::plan_quota_tests::a_stored_rule_round_trips_with_its_evidence_and_observation`,
 `infra::plan_quota::plan_quota_tests::a_tampered_row_is_a_corrupt_row`,
 `api::plan_quota_authoring::plan_quota_authoring_tests::a_typed_rule_is_sent_as_the_put_body_carries_it`,
@@ -276,6 +278,7 @@ Verified by `domain::plan_quota::plan_quota_tests::a_complete_body_parses_into_n
 `plan_quota_rules::the_same_rules_spelled_otherwise_replay_under_the_key`,
 `plan_quota_rules::a_definition_pending_qualification_is_saved_and_checks_red`,
 `plan_quota_rules::a_duplicate_set_is_409_quota_rule_duplicate`,
+`plan_quota_rules::a_default_rule_on_an_item_with_a_dimension_is_saved`,
 `plan_quota_rules::a_changed_definition_digest_is_409`,
 `plan_quota_rules::a_published_or_pending_revision_refuses_rules`,
 `plan_quota_rules::another_author_is_not_draft_author`,
@@ -291,6 +294,7 @@ Verified by `domain::plan_quota::plan_quota_tests::a_complete_body_parses_into_n
 `plan_quota_rules::the_catalog_is_never_called_on_a_transactions_task`,
 `plan_quota_authoring::the_sdk_get_answers_what_rest_answers`,
 `plan_quota_authoring::the_sdk_replace_answers_what_rest_answers`,
+`plan_quota_authoring::the_sdk_saves_a_default_rule_on_an_item_with_a_dimension`,
 `plan_quota_authoring::the_sdk_check_answers_what_rest_answers`,
 `plan_quota_authoring::the_hub_resolves_the_quota_authoring_client`,
 `postgres_plan_quota_rules::the_quota_rule_endpoints_replace_replay_and_fence_on_postgres` and
@@ -305,8 +309,10 @@ answer before the version (a replay answers the stored body and ETag byte for by
 bound to the `If-Match` version and the rules as they parse, so the same rules spelled otherwise replay), the parse
 (every rule's failures, a stray body member notwithstanding, U+0000 on the member that holds it), then the SKU versions
 on the sale date and Products' validation on a task of their own, outside any transaction, with Pricing's own checks of
-items, dimension values, SKU versions and duplicates. Every known failure but availability is refused at once, each
-named `quota_rules[i].<field>` with its code (a failure of the whole set on `quota_rules`), 409 when every failure is a
+items, dimension values, SKU versions and duplicates; on an item with a dimension, a rule with no dimension value is the
+item's default rule for its quota, and a quota is a metric, whatever its binding; duplicates stay judged by binding and
+metric. Every known failure but availability is refused at once, each named
+`quota_rules[i].<field>` with its code (a failure of the whole set on `quota_rules`), 409 when every failure is a
 conflict code and 400 otherwise, one invalid-argument problem either way; a definition that is not enabled is saved
 (D-542). One transaction then claims the key, checks the draft's version, its items and its sale date, and commits the
 rules, their evidence and availability, the set row, the next version, the audit row and the answer; a transaction
@@ -336,6 +342,10 @@ Verified by `domain::plan_quota::plan_quota_tests::quota_rows_name_the_rule_and_
 `domain::plan_quota::plan_quota_tests::a_violation_without_a_row_of_its_own_turns_rule_invalid_red`,
 `domain::plan_quota::plan_quota_tests::a_rule_is_judged_only_against_the_definition_it_names`,
 `domain::plan_quota::plan_quota_tests::a_rule_resolved_to_another_version_lends_no_metric`,
+`domain::plan_quota::plan_quota_tests::an_uncovered_sellable_cell_turns_quota_rule_missing_red`,
+`domain::plan_quota::plan_quota_tests::per_region_bindings_leave_no_sellable_cell_uncovered`,
+`domain::plan_quota::plan_quota_tests::the_cell_without_a_value_counts_only_where_the_default_chain_prices_it`,
+`domain::plan_quota::plan_quota_tests::a_dimensionless_item_with_rules_leaves_no_cell_uncovered`,
 `domain::plan::tests::a_revision_without_rules_has_no_quota_row`,
 `infra::plan_quota::plan_quota_tests::the_checks_contexts_carry_each_revisions_own_set`,
 `api::rest::authoring::plan_items::tests::a_foreign_key_refusal_of_an_item_delete_is_item_has_quota_rules`,
@@ -344,6 +354,7 @@ Verified by `domain::plan_quota::plan_quota_tests::quota_rows_name_the_rule_and_
 `plan_quota_rules::a_catalog_outage_makes_the_checks_503_not_green`,
 `plan_quota_rules::a_rule_products_does_not_judge_checks_red`,
 `plan_quota_rules::batch_checks_match_the_single_read_with_rules`,
+`plan_quota_rules::an_uncovered_sellable_cell_checks_red_and_refuses_submit`,
 `plan_quota_rules::deleting_an_item_with_rules_is_409_item_has_quota_rules`,
 `plan_quota_rules::deleting_a_draft_with_rules_removes_them`,
 `postgres_plan_quota_rules::the_checks_read_with_rules_on_postgres` and
@@ -352,15 +363,21 @@ Verified by `domain::plan_quota::plan_quota_tests::quota_rows_name_the_rule_and_
 `pricing/src/api/rest/authoring/plan_items.rs`.
 
 The checks of a revision with rules validate them through Products on every read, outside the read transaction (one
-SKU-version read per distinct SKU and sale date, one validation per revision with rules), and add the eight quota rows
-of D-544 after the existing rows, each red row's subjects naming the item, its SKU and entry, the rule and the field
-(`""` for the rule as a whole); a failure of the whole set is a line of its row's detail. A revision without rules has
-no quota row and makes no catalog call. Every checks answer carries `revision_version` and `quota_rules_digest`, and the
-batch answers each revision as the single read does; the checks context reads the rules in two more statements, thirteen
-in all, in one serializable read transaction. A catalog outage is 503 `QUOTA_CATALOG_UNAVAILABLE`, never `ready=true`; a
-rule Products was sent but did not judge reads red, and a revision whose verdict was not read fails closed. Deleting an
-item that a rule names is 409 `ITEM_HAS_QUOTA_RULES`, and deleting a draft removes its rules and set row before its
-items (D-543, D-544, D-545).
+SKU-version read per distinct SKU and sale date, one validation per revision with rules), and add the nine quota rows of
+D-544 after the existing rows, each red row's subjects naming the item, its SKU and entry and, for a failing rule, the
+rule and the field (`""` for the rule as a whole); a failure of the whole set is a line of its row's detail.
+`QUOTA_RULE_MISSING` is red for each sellable cell of an item with rules that selects no rule of a metric the item's
+rules carry: each registered value of the item's dimension, and the cell without a value where the entry's default chain
+has a price in force on the sale date. Each such cell and metric is a line of the set whose subject is the item alone,
+naming the cell and the metric; the row makes no catalog call of its own, and like every red row it refuses submit and
+apply. The row judges the revision's sale date, as every row does: a cell that becomes sellable later (a default-chain
+price that starts after the sale date, or a value registered after submit) has no line, and acceptance refuses its sale
+as `QUOTA_RULE_MISSING`. A revision without rules has no quota row and makes no catalog call. Every checks answer
+carries `revision_version` and `quota_rules_digest`, and the batch answers each revision as the single read does; the
+checks context reads the rules in two more statements, thirteen in all, in one serializable read transaction. A catalog
+outage is 503 `QUOTA_CATALOG_UNAVAILABLE`, never `ready=true`; a rule Products was sent but did not judge reads red, and
+a revision whose verdict was not read fails closed. Deleting an item that a rule names is 409 `ITEM_HAS_QUOTA_RULES`,
+and deleting a draft removes its rules and set row before its items (D-543, D-544, D-545).
 
 Requirement: `cpt-cf-bss-pricing-fr-plan-quota-rules`; PRD AC #27.
 
@@ -420,20 +437,41 @@ Requirement: `cpt-cf-bss-pricing-fr-plan-quota-rules`; PRD AC #27, AC #28.
 
 ### Quota terms in the preview and the receipt
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-pricing-dod-plan-quota-rules-acceptance`
+- [x] `p1` - **ID**: `cpt-cf-bss-pricing-dod-plan-quota-rules-acceptance`
 
-Verified by `digest_tests::selected_quota_digest_follows_the_requested_value_not_the_default_chain`,
-`digest_tests::quota_free_terms_and_request_digests_are_unchanged`,
-`digest_tests::the_snapshot_digest_binds_quantity_and_tenant_axes`,
-`digest_tests::an_expected_digest_moves_the_request_digest_and_a_snapshot_moves_the_terms_digest`,
-`wire::v1::tests::a_receipt_without_quota_reads_and_writes_as_before`,
-`wire::v1::tests::a_receipt_with_a_snapshot_round_trips`,
-`wire::v1::tests::a_snapshot_with_a_bad_digest_is_a_corrupt_row`,
+Verified by `digest_vectors::selected_quota_digest_follows_the_requested_value_not_the_default_chain`,
+`digest_vectors::a_value_takes_its_own_rule_else_the_items_default_rule`,
+`digest_vectors::the_default_rule_is_taken_per_metric`,
+`digest_vectors::per_region_bindings_sell_each_value_with_its_own_rule`,
+`digest_vectors::a_default_on_its_own_binding_is_not_selected_beside_a_rule_of_its_metric`,
+`digest_vectors::two_bindings_of_one_metric_for_one_value_are_both_selected`,
+`digest_vectors::uncovered_quotas_names_each_metric_with_neither_a_rule_nor_a_default`,
+`digest_vectors::the_selected_digest_orders_by_rule_id_and_covers_only_the_selected_rules`,
+`digest_vectors::the_selected_digest_covers_the_unit_grid_and_the_kind`,
+`digest_vectors::quota_free_terms_and_request_digests_are_unchanged`,
+`digest_vectors::the_snapshot_digest_binds_quantity_and_tenant_axes`,
+`digest_vectors::the_snapshot_digest_binds_each_limit_and_availability_revision`,
+`digest_vectors::verify_quota_snapshot_accepts_the_issued_snapshot_and_refuses_each_broken_rule`,
+`digest_vectors::an_expected_digest_moves_the_request_digest_and_a_snapshot_moves_the_terms_digest`,
+`digest_vectors::selected_quota_vector_matches_the_sdk_function`,
+`digest_vectors::quota_snapshot_vector_matches_the_sdk_function`,
+`digest_vectors::quota_terms_vector_adds_two_members_to_the_quota_free_terms`,
+`infra::commercial_terms::wire::v1::v1_tests::a_receipt_without_quota_reads_and_writes_as_before`,
+`infra::commercial_terms::wire::v1::v1_tests::a_receipt_with_a_snapshot_round_trips`,
+`infra::commercial_terms::wire::v1::v1_tests::a_snapshot_keeps_the_kind_and_the_unit_grid`,
+`infra::commercial_terms::wire::v1::v1_tests::a_snapshot_with_a_bad_digest_is_a_corrupt_row`,
+`infra::commercial_terms::wire::v1::v1_tests::a_present_quota_member_is_exact_and_never_null`,
+`infra::commercial_terms::wire::v1::v1_tests::a_stored_snapshot_edited_without_its_digests_is_a_corrupt_row`,
+`infra::plan_quota::plan_quota_tests::stored_evidence_reads_as_the_pinned_evidence`,
+`infra::plan_quota::plan_quota_tests::stored_evidence_that_does_not_read_is_a_corrupt_row`,
+`infra::plan_quota::plan_quota_tests::stored_evidence_with_a_bad_grid_or_kind_is_a_corrupt_row_naming_it`,
 `pricing_read_sdk::resolve_carries_the_quota_terms_of_every_rule`,
 `pricing_read_sdk::a_quota_free_revision_resolves_without_terms`,
 `pricing_read_sdk::resolve_reads_the_quota_terms_without_a_catalog_call`,
 `read_contract::get_resolve_answers_the_quota_terms`,
+`sellability::quota_rule_missing_is_its_own_terms_refusal`,
 `sellability::a_quota_bearing_plan_needs_the_expected_quota_digest`,
+`sellability::a_quota_free_revision_refuses_an_expected_quota_digest`,
 `sellability::a_stale_expected_quota_digest_is_resolution_changed_with_prices_unchanged`,
 `sellability::acceptance_freezes_rules_quantity_and_digests_in_the_receipt`,
 `sellability::a_replay_after_a_catalog_change_answers_the_frozen_receipt`,
@@ -441,20 +479,47 @@ Verified by `digest_tests::selected_quota_digest_follows_the_requested_value_not
 `sellability::per_plan_unit_limits_are_validated_at_the_accepted_quantity`,
 `sellability::a_fractional_quantity_with_rules_is_invalid_quantity`,
 `sellability::a_quota_free_sale_keeps_its_receipt_bytes`,
+`sellability::a_value_with_neither_a_rule_nor_a_default_is_quota_rule_missing`,
+`sellability::a_value_with_only_the_default_rule_freezes_the_default`,
+`sellability::the_cell_without_a_value_of_an_item_with_value_rules_only_is_quota_rule_missing`,
+`sellability::an_eu_sale_freezes_its_own_vcpu_rule_and_the_default_ram_rule`,
+`sellability::per_region_bindings_each_freeze_their_own_rule`,
+`sellability::a_cell_without_a_value_priced_after_the_sale_date_is_refused_at_acceptance`,
+`sellability::quota_rule_missing_follows_the_expected_digest_and_precedes_the_catalog`,
+`sellability::a_sale_that_selects_no_rule_freezes_the_empty_selection`,
+`sellability::an_issued_quota_receipt_passes_the_stored_terms_check`,
+`sellability::a_catalog_outage_at_acceptance_is_503_and_issues_no_receipt`,
+`sellability::a_verdict_that_breaks_the_contract_is_500_and_issues_no_receipt`,
+`sellability::products_checks_map_to_one_acceptance_refusal`,
 `acceptance_receipts::the_receipt_read_returns_the_frozen_snapshot` and Products' in-crate e2e
 `api::rest::quota::plan_rules_e2e_tests::a_purchase_of_two_units_freezes_20_vcpu_and_40_gb`. Implementation markers
 in `pricing-sdk/src/read.rs`, `pricing-sdk/src/acceptance.rs`, `pricing-sdk/src/digest.rs`,
-`pricing/src/infra/commercial_terms/wire/v1.rs`, `pricing/src/infra/pricing_reads.rs` and
-`pricing/src/infra/commercial_terms/check.rs`.
+`pricing/src/infra/plan_quota.rs`, `pricing/src/infra/pricing_reads.rs`, `pricing/src/api/pricing_read.rs`,
+`pricing/src/api/rest/read_contract.rs`, `pricing/src/domain/commercial_terms.rs`,
+`pricing/src/infra/commercial_terms/check.rs` and `pricing/src/infra/commercial_terms/wire/v1.rs`.
 
-Resolve answers a revision's quota terms from its stored rules, with no catalog call, and none for a revision without
-rules; `GET /resolve` carries them too. `selected_quota_digest` follows the value a sale requests, never the default
-chain. A sale of a revision with rules needs the preview's digest, and a missing or other digest is
-`RESOLUTION_CHANGED` even when no price changed. Acceptance validates the selected rules through Products at the
-accepted quantity and freezes the rules, their evidence, each final limit, the original quantity and the selected and
-snapshot digests in the receipt, in the acceptance transaction; a replay answers the frozen receipt after any catalog
-change. The three commercial structs gain optional members in place, and a quota-free sale's digests, receipt bytes,
-seam fixtures and vectors are unchanged (D-547, D-548).
+Resolve answers a revision's quota terms from its stored rules and their stored evidence, with no catalog call, and none
+for a revision without rules; `GET /resolve` carries them too, and stored evidence that does not read is a corrupt row
+(500). A quota is a metric, whatever its binding: for each metric of a selected item's rules, the selection takes every
+rule of the item for the requested value and that metric (two bindings of one metric are both taken), else every default
+rule of the item for that metric, never the price's default chain. Acceptance refuses in this order: a revision with
+rules and no expected quota digest, or a quota-free revision with one, is `RESOLUTION_CHANGED`, so a caller that does
+not know quotas cannot buy a plan with rules; a metric with neither (`uncovered_quotas`) is `QUOTA_RULE_MISSING`, 400
+like the other terms refusals because it depends only on the request and the published rules, so no retry can pass; an
+expected digest other than the selected rules' is `RESOLUTION_CHANGED` even when no price changed; a sale that selects
+rules needs a whole quantity from 1 (`QUANTITY_INVALID`); no refused sale reaches the quota catalog. Acceptance then
+validates the selected rules through Products at the accepted quantity, as the caller, and the first refusal that
+applies answers: `NOT_SELLABLE`, then `RESOLUTION_CHANGED`, then `UNSUPPORTED_TERMS`, then `QUANTITY_INVALID`; an outage
+is 503. It freezes the rules, their evidence, each final limit and availability revision, the original quantity and the
+selected and snapshot digests, checks the snapshot with `verify_quota_snapshot`, and writes it in the receipt in the
+acceptance transaction, which rolls back and captures again when the rule set moved. A Products verdict that breaks the
+contract, or a snapshot that fails the check, is a logged 500 and issues no receipt. A sale that selects no rule freezes
+the empty selection with no catalog call. A replay answers the frozen receipt after any catalog change, and an issued
+receipt passes the stored-terms check at fulfilment. The three commercial structs gain optional members in place, and a
+quota-free sale's digests, receipt bytes, seam fixtures and vectors are unchanged (D-541, D-547, D-548). The pinned
+evidence carries the quota kind and the rule unit's grid and maximum (`unit_min`, `unit_step`, `unit_max`), so a
+consumer that recomputes a limit at another quantity checks it within the frozen evidence; the selected digest covers
+them.
 
 Requirement: `cpt-cf-bss-pricing-fr-plan-quota-rules`; PRD AC #29.
 
@@ -466,7 +531,7 @@ Each criterion below corresponds to exactly one DoD above and cites [PRD §9](..
 | --- | --- | --- |
 | `cpt-cf-bss-pricing-dod-plan-quota-rules-store` | AC #26; `cpt-cf-bss-pricing-fr-plan-quota-rules` | Given stored rules on either engine, when a rule breaks a CHECK, names a missing item, or two replaces race on one version, then the storage refuses or stores one set; an item with rules cannot be deleted, the set's digest ignores input order, and `down` refuses while a rule exists. |
 | `cpt-cf-bss-pricing-dod-plan-quota-rules-authoring` | AC #26; `cpt-cf-bss-pricing-fr-plan-quota-rules` | Given a draft with two items, when its author puts a complete set of rules then the set, its digest and a new ETag are saved together; the old ETag is STALE_REVISION, the same key and body replay the first answer, the same key with another body is IDEMPOTENCY_CONFLICT, an empty array clears the set, and a set with a foreign item, a fractional amount or two rules for one binding and metric changes nothing and names each rule and field. |
-| `cpt-cf-bss-pricing-dod-plan-quota-rules-checks` | AC #27; `cpt-cf-bss-pricing-fr-plan-quota-rules` | Given a revision with rules, when its checks run then each failing rule is a red quota row naming the rule and field, with the evaluated revision version and digest; a quota-free revision's rows are as before, and deleting an item with rules is ITEM_HAS_QUOTA_RULES. |
+| `cpt-cf-bss-pricing-dod-plan-quota-rules-checks` | AC #27; `cpt-cf-bss-pricing-fr-plan-quota-rules` | Given a revision with rules, when its checks run then each failing rule is a red quota row naming the rule and field, and each sellable cell that no rule of a metric covers is a red `QUOTA_RULE_MISSING` line naming its item, with the evaluated revision version and digest; a quota-free revision's rows are as before, and deleting an item with rules is ITEM_HAS_QUOTA_RULES. |
 | `cpt-cf-bss-pricing-dod-plan-quota-rules-governance` | AC #27, AC #28; `cpt-cf-bss-pricing-fr-plan-quota-rules` | Given a revision with rules, when it is submitted, voted, copied or cloned then submit refuses red quota rows, an apply refuses a definition withdrawn after submit, the copy's rules keep their definitions and point at the copied items, and the published revision keeps reading its rules after the withdrawal. |
 | `cpt-cf-bss-pricing-dod-plan-quota-rules-acceptance` | AC #29; `cpt-cf-bss-pricing-fr-plan-quota-rules` | Given a published revision with 10 vCPU per plan unit, when a buyer accepts two units with the preview's quota digest then the receipt freezes the rule, its evidence, quantity 2 and both digests; a stale or missing digest is RESOLUTION_CHANGED even when no price changed. |
 

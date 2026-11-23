@@ -807,6 +807,196 @@
       },
       "canonical_text": "{\"domain\":\"pricing.quota-rules.v1\",\"payload\":{\"rules\":[{\"amount\":\"10\",\"basis\":\"per_plan_unit\",\"definition_ref\":{\"digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"id\":\"00000000-0000-0000-0000-0000000000d1\",\"version\":\"1\"},\"dimension_value\":null,\"item_id\":\"00000000-0000-0000-0000-000000000011\",\"logical_binding_key\":\"compute\",\"rule_id\":\"00000000-0000-0000-0000-000000000001\",\"scope_selection\":{\"region\":\"region-1\",\"resource_pool\":\"pool-1\"},\"subject_selector\":\"resource_owner\",\"unit_ref\":\"gts.cf.bss.products.quota_unit.v1~cf.compute.quota_adapter.vcpu.v1\"},{\"amount\":\"20\",\"basis\":\"per_plan_unit\",\"definition_ref\":{\"digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"id\":\"00000000-0000-0000-0000-0000000000d1\",\"version\":\"1\"},\"dimension_value\":null,\"item_id\":\"00000000-0000-0000-0000-000000000011\",\"logical_binding_key\":\"compute\",\"rule_id\":\"00000000-0000-0000-0000-000000000002\",\"scope_selection\":{\"region\":\"region-1\",\"resource_pool\":\"pool-1\"},\"subject_selector\":\"resource_owner\",\"unit_ref\":\"gts.cf.bss.products.quota_unit.v1~cf.compute.quota_adapter.vcpu.v1\"}]}}",
       "sha256": "3e1f3935aa78d797c72032f6108aebc515ef18a46a86e25786f39b0968fdeae7"
+    },
+    {
+      "name": "selected_quota_v1",
+      "domain": "pricing.selected-quota.v1",
+      "payload": {
+        "rules": [
+          {
+            "rule": {
+              "rule_id": "00000000-0000-0000-0000-000000000001",
+              "definition_ref": {
+                "id": "00000000-0000-0000-0000-0000000000d1",
+                "version": "1",
+                "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              },
+              "item_id": "00000000-0000-0000-0000-000000000003",
+              "dimension_value": "eu",
+              "logical_binding_key": "compute",
+              "subject_selector": "resource_owner",
+              "scope_selection": {
+                "region": "region-1",
+                "resource_pool": "pool-1"
+              },
+              "amount": "10",
+              "unit_ref": "gts.cf.bss.products.quota_unit.v1~cf.compute.quota_adapter.vcpu.v1",
+              "basis": "per_plan_unit"
+            },
+            "evidence": {
+              "sku_id": "00000000-0000-0000-0000-000000000051",
+              "sku_version": "3",
+              "metric_ref": "gts.cf.bss.products.quota_metric.v1~cf.compute.quota_adapter.vcpu.v1",
+              "metric_digest": "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+              "quota_kind": "allocation",
+              "canonical_unit_ref": "gts.cf.bss.products.quota_unit.v1~cf.compute.quota_adapter.vcpu.v1",
+              "unit_digest": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+              "unit_numerator": "1",
+              "unit_denominator": "1",
+              "unit_min": "1",
+              "unit_step": "1",
+              "unit_max": "1024",
+              "mapping": {
+                "id": "00000000-0000-0000-0000-0000000000a1",
+                "version": "1",
+                "digest": "b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3"
+              },
+              "profile": {
+                "id": "00000000-0000-0000-0000-0000000000a2",
+                "version": "2",
+                "digest": "b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4"
+              },
+              "accounting_policy_ref": "gts.cf.bss.products.quota_accounting_policy.v1~cf.compute.quota_adapter.allocated.v1",
+              "accounting_policy_digest": "b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5",
+              "scope_policy_ref": "gts.cf.bss.products.quota_scope_policy.v1~cf.compute.quota_adapter.regional_pool.v1",
+              "scope_policy_digest": "b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6",
+              "initial_set_supported": true,
+              "increase_supported": false
+            }
+          }
+        ]
+      },
+      "canonical_text": "{\"domain\":\"pricing.selected-quota.v1\",\"payload\":{\"rules\":[{\"evidence\":{\"accounting_policy_digest\":\"b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5\",\"accounting_policy_ref\":\"gts.cf.bss.products.quota_accounting_policy.v1~cf.compute.quota_adapter.allocated.v1\",\"canonical_unit_ref\":\"gts.cf.bss.products.quota_unit.v1~cf.compute.quota_adapter.vcpu.v1\",\"increase_supported\":false,\"initial_set_supported\":true,\"mapping\":{\"digest\":\"b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3\",\"id\":\"00000000-0000-0000-0000-0000000000a1\",\"version\":\"1\"},\"metric_digest\":\"b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1\",\"metric_ref\":\"gts.cf.bss.products.quota_metric.v1~cf.compute.quota_adapter.vcpu.v1\",\"profile\":{\"digest\":\"b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4\",\"id\":\"00000000-0000-0000-0000-0000000000a2\",\"version\":\"2\"},\"quota_kind\":\"allocation\",\"scope_policy_digest\":\"b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6\",\"scope_policy_ref\":\"gts.cf.bss.products.quota_scope_policy.v1~cf.compute.quota_adapter.regional_pool.v1\",\"sku_id\":\"00000000-0000-0000-0000-000000000051\",\"sku_version\":\"3\",\"unit_denominator\":\"1\",\"unit_digest\":\"b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2\",\"unit_max\":\"1024\",\"unit_min\":\"1\",\"unit_numerator\":\"1\",\"unit_step\":\"1\"},\"rule\":{\"amount\":\"10\",\"basis\":\"per_plan_unit\",\"definition_ref\":{\"digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"id\":\"00000000-0000-0000-0000-0000000000d1\",\"version\":\"1\"},\"dimension_value\":\"eu\",\"item_id\":\"00000000-0000-0000-0000-000000000003\",\"logical_binding_key\":\"compute\",\"rule_id\":\"00000000-0000-0000-0000-000000000001\",\"scope_selection\":{\"region\":\"region-1\",\"resource_pool\":\"pool-1\"},\"subject_selector\":\"resource_owner\",\"unit_ref\":\"gts.cf.bss.products.quota_unit.v1~cf.compute.quota_adapter.vcpu.v1\"}}]}}",
+      "sha256": "40386e4a1d1d43e42695e9ceb2b8c0634f9a14998e5f0ffa428ffe01aab3e986"
+    },
+    {
+      "name": "quota_snapshot_v1",
+      "domain": "pricing.quota-snapshot.v1",
+      "payload": {
+        "selected_quota_digest": "40386e4a1d1d43e42695e9ceb2b8c0634f9a14998e5f0ffa428ffe01aab3e986",
+        "limits": [
+          {
+            "rule_id": "00000000-0000-0000-0000-000000000001",
+            "limit": "10",
+            "availability_revision": "2"
+          }
+        ],
+        "original_quantity": "1",
+        "tenant_axes": {
+          "seller_tenant_id": "00000000-0000-0000-0000-000000000008",
+          "payer_tenant_id": "00000000-0000-0000-0000-000000000009",
+          "resource_tenant_id": "00000000-0000-0000-0000-00000000000a"
+        },
+        "plan_revision_id": "00000000-0000-0000-0000-000000000007",
+        "order_id": "00000000-0000-0000-0000-00000000000b",
+        "order_version": "18446744073709551615",
+        "line_id": "00000000-0000-0000-0000-00000000000c"
+      },
+      "canonical_text": "{\"domain\":\"pricing.quota-snapshot.v1\",\"payload\":{\"limits\":[{\"availability_revision\":\"2\",\"limit\":\"10\",\"rule_id\":\"00000000-0000-0000-0000-000000000001\"}],\"line_id\":\"00000000-0000-0000-0000-00000000000c\",\"order_id\":\"00000000-0000-0000-0000-00000000000b\",\"order_version\":\"18446744073709551615\",\"original_quantity\":\"1\",\"plan_revision_id\":\"00000000-0000-0000-0000-000000000007\",\"selected_quota_digest\":\"40386e4a1d1d43e42695e9ceb2b8c0634f9a14998e5f0ffa428ffe01aab3e986\",\"tenant_axes\":{\"payer_tenant_id\":\"00000000-0000-0000-0000-000000000009\",\"resource_tenant_id\":\"00000000-0000-0000-0000-00000000000a\",\"seller_tenant_id\":\"00000000-0000-0000-0000-000000000008\"}}}",
+      "sha256": "f8b58aa79412c91dc9e591643c5e9c50fa5cf9eee48df05ec68762d9db89c470"
+    },
+    {
+      "name": "accepted_terms_quota_v1",
+      "domain": "pricing.terms.v1",
+      "payload": {
+        "query": {
+          "tenant_axes": {
+            "seller_tenant_id": "00000000-0000-0000-0000-000000000008",
+            "payer_tenant_id": "00000000-0000-0000-0000-000000000009",
+            "resource_tenant_id": "00000000-0000-0000-0000-00000000000a"
+          },
+          "order_id": "00000000-0000-0000-0000-00000000000b",
+          "order_version": "18446744073709551615",
+          "line_id": "00000000-0000-0000-0000-00000000000c",
+          "plan_id": "00000000-0000-0000-0000-000000000006",
+          "plan_revision_id": "00000000-0000-0000-0000-000000000007",
+          "selections": [
+            {
+              "item_id": "00000000-0000-0000-0000-000000000003",
+              "dimension_value": "eu"
+            }
+          ],
+          "quantity": "1",
+          "market": {
+            "currency": "EUR",
+            "region": "eu"
+          },
+          "start_at": "2026-10-01T10:30:00.000000000Z",
+          "term": {
+            "kind": "fixed_periods",
+            "count": "12"
+          },
+          "billing_terms": {
+            "schema_version": "1",
+            "cycle": "month",
+            "anchor": "calendar",
+            "anchor_at": "2026-10-01T00:00:00.000000000Z",
+            "timezone": "UTC",
+            "source": "explicit_order",
+            "digest": "8bbd1652e172dcb1c4498d7dec92af3b6d7f727d34bb7ffebc8aed1181bda983"
+          },
+          "resolved_bindings_digest": "afa8076d53d6fbf900c49f20065c5bba1a8311bb154b82d4f516861c19cf9678",
+          "hold_policy_version": "18446744073709551615",
+          "expected_quota_digest": "40386e4a1d1d43e42695e9ceb2b8c0634f9a14998e5f0ffa428ffe01aab3e986"
+        },
+        "bindings": [
+          {
+            "item_id": "00000000-0000-0000-0000-000000000003",
+            "price_book_entry_id": "00000000-0000-0000-0000-000000000002",
+            "dimension_key": "region",
+            "dimension_value": "eu",
+            "sku_id": "00000000-0000-0000-0000-000000000004",
+            "sku_version": "1",
+            "sku_code": "CLOUD",
+            "sku_name": "Cloudlet",
+            "unit": "cloudlet_hour",
+            "price": {
+              "price_id": "00000000-0000-0000-0000-000000000001",
+              "price_book_entry_id": "00000000-0000-0000-0000-000000000002",
+              "money_digest": "c677890110054c667a8d9dcabb4299ad5ce65d4209e4f9bd5f128e13a05407b6",
+              "currency": "EUR",
+              "currency_scale": "2",
+              "model": {
+                "kind": "per_unit",
+                "unit_amount": "0.047"
+              },
+              "minimum_fee": null,
+              "effective_from": "2026-09-01",
+              "ends_on": null
+            },
+            "kind": "usage",
+            "recurring_period": null,
+            "via_default": true,
+            "usage_rating_policy": {
+              "policy_id": "00000000-0000-0000-0000-000000000005",
+              "version": "18446744073709551615",
+              "digest": "2bf1fcebb5742b520e2162b6ab65bcad5d04dc8c1100055d77757eaa87a60abc",
+              "content": {
+                "rating_window": {
+                  "kind": "calendar_hour",
+                  "timezone": "UTC"
+                },
+                "aggregation_scope": "subscription_line",
+                "reset": "rating_window_start",
+                "partial_window": "actual_quantity_full_thresholds",
+                "fold": "SUM"
+              }
+            },
+            "invoice": {
+              "template": "{sku}",
+              "template_digest": "89030c318bc320ae10e425e5a24465a7880638f6862299ada453f734b163c636",
+              "template_source": "sku_version",
+              "gl_code": "usage",
+              "tax_category": "standard",
+              "timing": "arrears",
+              "rounding": "half_even"
+            }
+          }
+        ],
+        "quota_snapshot_digest": "f8b58aa79412c91dc9e591643c5e9c50fa5cf9eee48df05ec68762d9db89c470"
+      },
+      "canonical_text": "{\"domain\":\"pricing.terms.v1\",\"payload\":{\"bindings\":[{\"dimension_key\":\"region\",\"dimension_value\":\"eu\",\"invoice\":{\"gl_code\":\"usage\",\"rounding\":\"half_even\",\"tax_category\":\"standard\",\"template\":\"{sku}\",\"template_digest\":\"89030c318bc320ae10e425e5a24465a7880638f6862299ada453f734b163c636\",\"template_source\":\"sku_version\",\"timing\":\"arrears\"},\"item_id\":\"00000000-0000-0000-0000-000000000003\",\"kind\":\"usage\",\"price\":{\"currency\":\"EUR\",\"currency_scale\":\"2\",\"effective_from\":\"2026-09-01\",\"ends_on\":null,\"minimum_fee\":null,\"model\":{\"kind\":\"per_unit\",\"unit_amount\":\"0.047\"},\"money_digest\":\"c677890110054c667a8d9dcabb4299ad5ce65d4209e4f9bd5f128e13a05407b6\",\"price_book_entry_id\":\"00000000-0000-0000-0000-000000000002\",\"price_id\":\"00000000-0000-0000-0000-000000000001\"},\"price_book_entry_id\":\"00000000-0000-0000-0000-000000000002\",\"recurring_period\":null,\"sku_code\":\"CLOUD\",\"sku_id\":\"00000000-0000-0000-0000-000000000004\",\"sku_name\":\"Cloudlet\",\"sku_version\":\"1\",\"unit\":\"cloudlet_hour\",\"usage_rating_policy\":{\"content\":{\"aggregation_scope\":\"subscription_line\",\"fold\":\"SUM\",\"partial_window\":\"actual_quantity_full_thresholds\",\"rating_window\":{\"kind\":\"calendar_hour\",\"timezone\":\"UTC\"},\"reset\":\"rating_window_start\"},\"digest\":\"2bf1fcebb5742b520e2162b6ab65bcad5d04dc8c1100055d77757eaa87a60abc\",\"policy_id\":\"00000000-0000-0000-0000-000000000005\",\"version\":\"18446744073709551615\"},\"via_default\":true}],\"query\":{\"billing_terms\":{\"anchor\":\"calendar\",\"anchor_at\":\"2026-10-01T00:00:00.000000000Z\",\"cycle\":\"month\",\"digest\":\"8bbd1652e172dcb1c4498d7dec92af3b6d7f727d34bb7ffebc8aed1181bda983\",\"schema_version\":\"1\",\"source\":\"explicit_order\",\"timezone\":\"UTC\"},\"expected_quota_digest\":\"40386e4a1d1d43e42695e9ceb2b8c0634f9a14998e5f0ffa428ffe01aab3e986\",\"hold_policy_version\":\"18446744073709551615\",\"line_id\":\"00000000-0000-0000-0000-00000000000c\",\"market\":{\"currency\":\"EUR\",\"region\":\"eu\"},\"order_id\":\"00000000-0000-0000-0000-00000000000b\",\"order_version\":\"18446744073709551615\",\"plan_id\":\"00000000-0000-0000-0000-000000000006\",\"plan_revision_id\":\"00000000-0000-0000-0000-000000000007\",\"quantity\":\"1\",\"resolved_bindings_digest\":\"afa8076d53d6fbf900c49f20065c5bba1a8311bb154b82d4f516861c19cf9678\",\"selections\":[{\"dimension_value\":\"eu\",\"item_id\":\"00000000-0000-0000-0000-000000000003\"}],\"start_at\":\"2026-10-01T10:30:00.000000000Z\",\"tenant_axes\":{\"payer_tenant_id\":\"00000000-0000-0000-0000-000000000009\",\"resource_tenant_id\":\"00000000-0000-0000-0000-00000000000a\",\"seller_tenant_id\":\"00000000-0000-0000-0000-000000000008\"},\"term\":{\"count\":\"12\",\"kind\":\"fixed_periods\"}},\"quota_snapshot_digest\":\"f8b58aa79412c91dc9e591643c5e9c50fa5cf9eee48df05ec68762d9db89c470\"}}",
+      "sha256": "57a606202a59bee06ff529351c30320b9acc82b76ec95a7cf2f2aff449093fcd"
     }
   ],
   "semantic_projections": [

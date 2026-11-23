@@ -56,6 +56,12 @@ fn basis_and_subject_tokens_round_trip() {
         QuotaSubjectSelector::from_token("resource_owner"),
         Some(QuotaSubjectSelector::ResourceOwner)
     );
+    assert_eq!(PlanQuotaKind::Allocation.token(), "allocation");
+    assert_eq!(
+        PlanQuotaKind::from_token("allocation"),
+        Some(PlanQuotaKind::Allocation)
+    );
+    assert_eq!(PlanQuotaKind::from_token("Allocation"), None);
     for state in [
         PlanQuotaAvailabilityState::Enabled,
         PlanQuotaAvailabilityState::Disabled,

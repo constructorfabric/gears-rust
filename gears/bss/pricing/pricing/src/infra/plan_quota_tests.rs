@@ -414,7 +414,7 @@ fn the_evidence_keeps_identity_and_no_text_or_availability() {
             "metric_digest": "b".repeat(64), "quota_kind": "allocation",
             "canonical_unit_ref": VCPU_UNIT,
             "unit": {"unit_ref": VCPU_UNIT, "digest": "c".repeat(64), "numerator": "1",
-                "denominator": "1"},
+                "denominator": "1", "min": "0", "step": "1", "max": "1024"},
             "mapping_ref": {"id": Uuid::from_u128(0xa1), "version": "1", "digest": "d".repeat(64)},
             "profile_ref": {"id": Uuid::from_u128(0xb1), "version": "2", "digest": "e".repeat(64)},
             "qualification_ref": null,
@@ -432,6 +432,151 @@ fn the_evidence_keeps_identity_and_no_text_or_availability() {
         json!({"state": "disabled", "revision": "1", "observed_at": "2026-11-21T08:30:00Z",
             "reason_code": "qualification_pending"})
     );
+}
+
+/// D-547: the evidence pins the grid and maximum of the rule's own unit (`unit_ref`), not those
+/// of another unit the definition allows, and reads them back with the quota kind; a unit
+/// without a maximum stores `max: null` and reads as `None`.
+#[test]
+fn the_evidence_pins_the_grid_of_the_rules_own_unit() {
+    use bss_pricing_sdk::plan_quota::PlanQuotaKind;
+    const PACK_UNIT: &str =
+        "gts.cf.bss.products.quota_unit.v1~cf.compute.quota_adapter.vcpu_pack.v1";
+    let mut d = sample_definition();
+    let mut pack = d.allowed_units[0].clone();
+    pack.unit_ref = PACK_UNIT.into();
+    pack.digest = "9".repeat(64);
+    pack.numerator = "8".into();
+    pack.min = "1".into();
+    pack.step = "2".into();
+    pack.max = None;
+    d.allowed_units.push(pack);
+    let vcpu = evidence_json(&d, VCPU_UNIT);
+    assert_eq!(
+        (
+            &vcpu["unit"]["min"],
+            &vcpu["unit"]["step"],
+            &vcpu["unit"]["max"]
+        ),
+        (&json!("0"), &json!("1"), &json!("1024")),
+        "{vcpu}"
+    );
+    let packed = evidence_json(&d, PACK_UNIT);
+    assert_eq!(
+        packed["unit"],
+        json!({"unit_ref": PACK_UNIT, "digest": "9".repeat(64), "numerator": "8",
+            "denominator": "1", "min": "1", "step": "2", "max": null}),
+        "the pack's own grid, not the vCPU unit's"
+    );
+    let read = evidence_of(&vcpu).unwrap();
+    assert_eq!(read.quota_kind, PlanQuotaKind::Allocation);
+    assert_eq!(
+        (read.unit_min, read.unit_step, read.unit_max),
+        ("0".to_owned(), "1".to_owned(), Some("1024".to_owned()))
+    );
+    let read = evidence_of(&packed).unwrap();
+    assert_eq!(
+        (read.unit_min, read.unit_step, read.unit_max),
+        ("1".to_owned(), "2".to_owned(), None)
+    );
+    assert_eq!(read.unit_numerator, "8");
+}
+
+/// D-547: stored evidence whose quota kind, unit grid or unit maximum does not read is a corrupt
+/// row naming the member: a member missing (`max` included, which may be `null` but not absent),
+/// a value that is not a canonical decimal integer, a `max` below the `min`, or a kind outside
+/// the closed set. A step of `0` and a `max` equal to the `min` read.
+#[test]
+fn stored_evidence_with_a_bad_grid_or_kind_is_a_corrupt_row_naming_it() {
+    /// One damage done to stored evidence, and what the refusal names.
+    type Damage = (&'static str, Box<dyn Fn(&mut Value)>, &'static str);
+    let good = evidence_json(&sample_definition(), VCPU_UNIT);
+    let remove = |member: &'static str| {
+        Box::new(move |e: &mut Value| {
+            e["unit"].as_object_mut().unwrap().remove(member);
+        }) as Box<dyn Fn(&mut Value)>
+    };
+    let cases: Vec<Damage> = vec![
+        ("min absent", remove("min"), "`min`"),
+        ("step absent", remove("step"), "`step`"),
+        ("max absent", remove("max"), "`max`"),
+        (
+            "kind absent",
+            Box::new(|e| {
+                e.as_object_mut().unwrap().remove("quota_kind");
+            }),
+            "`quota_kind`",
+        ),
+        (
+            "min padded",
+            Box::new(|e| e["unit"]["min"] = json!("01")),
+            "unit min",
+        ),
+        (
+            "min negative",
+            Box::new(|e| e["unit"]["min"] = json!("-1")),
+            "unit min",
+        ),
+        (
+            "step a fraction",
+            Box::new(|e| e["unit"]["step"] = json!("1.5")),
+            "unit step",
+        ),
+        (
+            "step empty",
+            Box::new(|e| e["unit"]["step"] = json!("")),
+            "unit step",
+        ),
+        (
+            "max a word",
+            Box::new(|e| e["unit"]["max"] = json!("many")),
+            "unit max",
+        ),
+        (
+            "max above u128::MAX",
+            Box::new(|e| e["unit"]["max"] = json!("340282366920938463463374607431768211456")),
+            "unit max",
+        ),
+        (
+            "max below min",
+            Box::new(|e| {
+                e["unit"]["min"] = json!("5");
+                e["unit"]["max"] = json!("4");
+            }),
+            "unit max is below its unit min",
+        ),
+        (
+            "kind in another case",
+            Box::new(|e| e["quota_kind"] = json!("Allocation")),
+            "quota kind",
+        ),
+        (
+            "kind unknown",
+            Box::new(|e| e["quota_kind"] = json!("consumption")),
+            "quota kind",
+        ),
+    ];
+    for (name, tamper, named) in cases {
+        let mut evidence = good.clone();
+        tamper(&mut evidence);
+        match evidence_of(&evidence) {
+            Err(RepoError::CorruptRow(detail)) => {
+                assert!(detail.contains(named), "{name}: {detail}");
+            }
+            other => panic!("{name}: {other:?} for {evidence}"),
+        }
+    }
+    let mut edge = good;
+    edge["unit"]["step"] = json!("0");
+    edge["unit"]["min"] = json!("1024");
+    let read = evidence_of(&edge).unwrap();
+    assert_eq!(
+        (read.unit_min.as_str(), read.unit_step.as_str()),
+        ("1024", "0"),
+        "a step of 0 admits the min alone, and a max equal to the min reads"
+    );
+    edge["unit"]["max"] = Value::Null;
+    assert_eq!(evidence_of(&edge).unwrap().unit_max, None);
 }
 
 #[test]
@@ -470,6 +615,150 @@ fn a_stored_rule_round_trips_with_its_evidence_and_observation() {
         row_of(tenant, revision, &rule, &changed, at(10)).is_err(),
         "a definition of the same version with another digest is not the rule's verdict"
     );
+}
+
+/// D-547: the stored evidence of a rule reads back as the SDK's pinned evidence: the quota kind,
+/// the mapping and profile references, the rule's unit with its digest, factor, grid and maximum,
+/// both policies and the change support, digests as bytes and versions as positive integers.
+#[test]
+fn stored_evidence_reads_as_the_pinned_evidence() {
+    use bss_pricing_sdk::read::{PinnedQuotaEvidence, QuotaOwnerRef};
+    let d = sample_definition();
+    let evidence = evidence_of(&evidence_json(&d, VCPU_UNIT)).unwrap();
+    let bytes = |c: char| digest_from_hex(&c.to_string().repeat(64)).unwrap();
+    assert_eq!(
+        evidence,
+        PinnedQuotaEvidence {
+            sku_id: SKU,
+            sku_version: NonZeroU64::new(3).unwrap(),
+            metric_ref: VCPU_METRIC.into(),
+            metric_digest: bytes('b'),
+            quota_kind: bss_pricing_sdk::plan_quota::PlanQuotaKind::Allocation,
+            canonical_unit_ref: VCPU_UNIT.into(),
+            unit_digest: bytes('c'),
+            unit_numerator: "1".into(),
+            unit_denominator: "1".into(),
+            unit_min: "0".into(),
+            unit_step: "1".into(),
+            unit_max: Some("1024".into()),
+            mapping: QuotaOwnerRef {
+                id: Uuid::from_u128(0xa1),
+                version: NonZeroU64::MIN,
+                digest: bytes('d'),
+            },
+            profile: QuotaOwnerRef {
+                id: Uuid::from_u128(0xb1),
+                version: NonZeroU64::new(2).unwrap(),
+                digest: bytes('e'),
+            },
+            accounting_policy_ref: ALLOCATED_VCPU.into(),
+            accounting_policy_digest: bytes('2'),
+            scope_policy_ref: REGIONAL_POOL.into(),
+            scope_policy_digest: bytes('3'),
+            initial_set_supported: true,
+            increase_supported: false,
+        }
+    );
+}
+
+/// D-547: stored evidence that does not read as the pinned evidence is a corrupt row (a 500 at
+/// resolve), never a default: a rule unit the definition did not allow (`unit: null`), a digest
+/// that is not 64 lowercase hex characters, a version that is not a canonical integer from 1, a
+/// unit factor that Products' parser refuses (not two amounts from 1 that fit in 128 bits, or not
+/// reduced), and a missing or mistyped member.
+#[test]
+fn stored_evidence_that_does_not_read_is_a_corrupt_row() {
+    /// One damage done to stored evidence.
+    type Damage = Box<dyn Fn(&mut Value)>;
+    let good = evidence_json(&sample_definition(), VCPU_UNIT);
+    let cases: Vec<(&str, Damage)> = vec![
+        ("unit null", Box::new(|e| e["unit"] = Value::Null)),
+        (
+            "unit absent",
+            Box::new(|e| {
+                e.as_object_mut().unwrap().remove("unit");
+            }),
+        ),
+        (
+            "metric digest upper case",
+            Box::new(|e| e["metric_digest"] = json!("B".repeat(64))),
+        ),
+        (
+            "unit digest short",
+            Box::new(|e| e["unit"]["digest"] = json!("c".repeat(63))),
+        ),
+        (
+            "mapping digest",
+            Box::new(|e| e["mapping_ref"]["digest"] = json!("x".repeat(64))),
+        ),
+        (
+            "policy digest",
+            Box::new(|e| e["scope_policy_digest"] = json!("")),
+        ),
+        (
+            "sku version zero",
+            Box::new(|e| e["sku_version"] = json!("0")),
+        ),
+        (
+            "sku version padded",
+            Box::new(|e| e["sku_version"] = json!("03")),
+        ),
+        (
+            "sku version a number",
+            Box::new(|e| e["sku_version"] = json!(3)),
+        ),
+        (
+            "profile version zero",
+            Box::new(|e| e["profile_ref"]["version"] = json!("0")),
+        ),
+        (
+            "numerator",
+            Box::new(|e| e["unit"]["numerator"] = json!("1.0")),
+        ),
+        (
+            "denominator",
+            Box::new(|e| e["unit"]["denominator"] = json!("0")),
+        ),
+        // Products' factor rule (`Factor::parse`): a reduced fraction of two amounts.
+        (
+            "factor not reduced",
+            Box::new(|e| {
+                e["unit"]["numerator"] = json!("2");
+                e["unit"]["denominator"] = json!("4");
+            }),
+        ),
+        (
+            "numerator above u128::MAX",
+            Box::new(|e| {
+                e["unit"]["numerator"] = json!("340282366920938463463374607431768211456");
+            }),
+        ),
+        (
+            "denominator of 40 digits",
+            Box::new(|e| e["unit"]["denominator"] = json!("1".repeat(40))),
+        ),
+        ("sku id", Box::new(|e| e["sku_id"] = json!("not a uuid"))),
+        (
+            "metric absent",
+            Box::new(|e| {
+                e.as_object_mut().unwrap().remove("metric_ref");
+            }),
+        ),
+        (
+            "change support",
+            Box::new(|e| e["change_support"]["increase"] = json!("no")),
+        ),
+        ("not an object", Box::new(|e| *e = json!([]))),
+    ];
+    for (name, tamper) in cases {
+        let mut evidence = good.clone();
+        tamper(&mut evidence);
+        assert!(
+            matches!(evidence_of(&evidence), Err(RepoError::CorruptRow(_))),
+            "{name}: {evidence}"
+        );
+    }
+    assert!(evidence_of(&good).is_ok());
 }
 
 /// One damage done to a stored row.

@@ -156,6 +156,7 @@ fn resolved(items: &[(Uuid, Option<&str>)]) -> ResolvedBindings {
                 binding: Some(binding(*item, *dim)),
             })
             .collect(),
+        quota_terms: None,
     }
 }
 fn item(item_id: Uuid, quantity: &str, dim: Option<&str>) -> SelectedItem {
@@ -964,7 +965,7 @@ fn the_stub_receipt_pins_round_trip_and_verify_against_the_frozen_request() {
         let evidence = SelectionEvidence {
             acceptance_id: receipt.acceptance_id,
             request_digest: line.request_digest,
-            terms_digest: terms_digest(&line.query, &receipt.bindings),
+            terms_digest: terms_digest(&line.query, &receipt.bindings, receipt.quota.as_ref()),
             evaluated_bindings: &receipt.bindings,
         };
         decoded_pin.verify_selection(&line.query, evidence).unwrap();

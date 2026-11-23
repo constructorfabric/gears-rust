@@ -4,17 +4,21 @@
 //!
 //! The double judges only what Pricing needs to see from it: an unknown definition version is
 //! `QUOTA_RULE_INVALID`, another digest `QUOTA_DEFINITION_CHANGED` and a version that is not
-//! enabled `QUOTA_QUALIFICATION_UNAVAILABLE`. Products' own judgement is proven in Products.
+//! enabled `QUOTA_QUALIFICATION_UNAVAILABLE`. With a quantity (an acceptance) it answers each
+//! rule's final limit, the amount times the quantity per plan unit, and a limit above the unit's
+//! `max` is `QUOTA_AMOUNT_INVALID` on `quantity` with no limit. Products' own judgement is proven
+//! in Products.
 #![allow(dead_code)]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 use crate::plan_support::{self, Catalog, Fixture};
 use bss_products_sdk::ProductsQuotaCatalogClientV1;
 use bss_products_sdk::models::SkuType;
 use bss_products_sdk::quota::catalog::{
-    QuotaDefinition, QuotaDefinitionListRequest, QuotaDefinitionPage, QuotaVersion,
+    QuotaBasis, QuotaDefinition, QuotaDefinitionListRequest, QuotaDefinitionPage, QuotaVersion,
 };
 use bss_products_sdk::quota::validation::{
-    QuotaCheck, QuotaCheckCode, QuotaRuleVerdict, QuotaSetRequest, QuotaSetValidation,
+    QUANTITY_FIELD, QuotaCheck, QuotaCheckCode, QuotaRuleVerdict, QuotaSetRequest,
+    QuotaSetValidation,
 };
 use serde_json::{Value, json};
 use std::future::Future;
@@ -123,10 +127,35 @@ impl FakeQuotaCatalog {
             let found = definitions.iter().find(|d| {
                 d.definition_id == rule.definition.id && d.version == rule.definition.version
             });
+            let limit = match (&request.quantity, found) {
+                (Some(quantity), Some(found)) => {
+                    let times: u128 = match rule.basis {
+                        QuotaBasis::Fixed => 1,
+                        QuotaBasis::PerPlanUnit => quantity.parse().unwrap(),
+                    };
+                    let limit = rule.amount.parse::<u128>().unwrap() * times;
+                    let max = found.allowed_units[0]
+                        .max
+                        .as_deref()
+                        .map(|m| m.parse().unwrap());
+                    if max.is_some_and(|max: u128| limit > max) {
+                        checks.push(check(
+                            QuotaCheckCode::AmountInvalid,
+                            rule.rule_id,
+                            QUANTITY_FIELD,
+                            &format!("at quantity {times}, {limit} is above the unit's max"),
+                        ));
+                        None
+                    } else {
+                        Some(limit.to_string())
+                    }
+                }
+                _ => None,
+            };
             rules.push(QuotaRuleVerdict {
                 rule_id: rule.rule_id,
                 definition: found.cloned(),
-                limit: None,
+                limit,
             });
             let Some(found) = found else {
                 checks.push(check(
@@ -377,6 +406,28 @@ pub async fn priced_draft_with_items(f: &Fixture, catalog: &Catalog) -> Draft {
     draft
 }
 
+/// [`draft_with_items`] with two rules on its first item, saved through the `PUT` and published
+/// as an applied unit publishes it: rule 1 sets 10 vCPU and rule 2 sets 20 GiB per plan unit, both
+/// on the binding `compute`. Its entries have no price, so every cell resolves uncovered. Answers
+/// the draft, the saved set and the vCPU and RAM definitions, which `fake` holds.
+pub async fn published_with_rules(
+    f: &Fixture,
+    catalog: &Catalog,
+    fake: &FakeQuotaCatalog,
+) -> (Draft, Value, [QuotaDefinition; 2]) {
+    let draft = draft_with_items(f, catalog).await;
+    let cpu = fake.add(vcpu(draft.sku));
+    let memory = fake.add(ram(draft.sku));
+    let rules = [
+        rule_json(1, &cpu, draft.items[0], "10"),
+        rule_json(2, &memory, draft.items[0], "20"),
+    ];
+    let (s, saved, _) = put(f, &draft, &rules, "published-with-rules").await;
+    assert_eq!(s, 200, "{saved}");
+    plan_support::publish(f, draft.plan, draft.revision).await;
+    (draft, saved, [cpu, memory])
+}
+
 /// Rule `n` (its id `Uuid::from_u128(n)`) on `item`, in the definition's unit, per plan unit,
 /// with the scope the definition's policy asks for.
 pub fn rule_json(n: u128, definition: &QuotaDefinition, item: Uuid, amount: &str) -> Value {
@@ -396,6 +447,35 @@ pub fn rule_json(n: u128, definition: &QuotaDefinition, item: Uuid, amount: &str
         "unit_ref": definition.canonical_unit_ref,
         "basis": "per_plan_unit",
     })
+}
+
+/// Register `eu` and `us` as the values of `region` and give every entry of the fixture that key,
+/// so each item of a draft has a dimension.
+pub async fn priced_by_region(f: &Fixture) {
+    priced_by_region_values(f, &["eu", "us"]).await;
+}
+
+/// [`priced_by_region`] with `values` as the values of `region`.
+pub async fn priced_by_region_values(f: &Fixture, values: &[&str]) {
+    let (s, b, tag) = f
+        .call("GET", "/dimension-keys", json!({}), None, None)
+        .await;
+    assert_eq!(s, 200, "{b}");
+    let (s, b, _) = f
+        .call(
+            "PUT",
+            "/dimension-keys",
+            json!({"items": [{"key": "region", "values": values}]}),
+            Some(&tag),
+            None,
+        )
+        .await;
+    assert_eq!(s, 200, "{b}");
+    plan_support::raw(
+        f,
+        "UPDATE pricing_price_book_entry SET dimension_key = 'region'",
+    )
+    .await;
 }
 
 /// The quota rules path of `draft`'s revision.

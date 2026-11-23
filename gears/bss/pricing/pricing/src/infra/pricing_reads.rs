@@ -1,4 +1,6 @@
 //! Shared tenant-authorized local snapshots and detached dated Products reads.
+//!
+//! @cpt-dod:cpt-cf-bss-pricing-dod-plan-quota-rules-acceptance:p1
 use crate::api::rest::authoring::{
     AuthoringState, configuration,
     support::{self, DoorError, authz_failure},
@@ -18,8 +20,8 @@ use crate::{
             RepoError,
             entity::{plan_revision, price, price_book, price_book_entry},
             repo::{
-                book_repo, dimension_repo, plan_item_repo, plan_repo, plan_revision_repo,
-                price_book_entry_repo, price_repo,
+                book_repo, dimension_repo, plan_item_repo, plan_quota_repo, plan_repo,
+                plan_revision_repo, price_book_entry_repo, price_repo,
             },
         },
     },
@@ -30,6 +32,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use time::Date;
 use toolkit::api::canonical_prelude::resource_error;
 use toolkit_canonical_errors::CanonicalError;
+use toolkit_db::DbTx;
 use toolkit_db::secure::{AccessScope, DBRunner};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -112,6 +115,9 @@ pub struct ReadSnapshot {
     pub resolved: Vec<ItemResolution>,
     pub versions: BTreeMap<Uuid, SkuVersion>,
     pub inputs: BTreeMap<Uuid, resolve::InvoiceInputs>,
+    /// The revision's stored quota rules and their set digest (D-547), read in the same
+    /// transaction; `None` for a revision without rules.
+    pub quota: Option<plan_quota_repo::StoredSet>,
 }
 
 /// Exact local rows used by a resolve, captured in its serializable snapshot.
@@ -177,9 +183,10 @@ fn corrupt(what: String) -> DoorError {
 /// among its plan's revisions (D-447): a published or superseded one resolves on every date
 /// (D-419) — a scheduled one whose date has come reads published, so its answer does not change
 /// when the switch is persisted — and a scheduled one still waiting resolves from its sale date
-/// on (D-454).
+/// on (D-454). The revision's quota rules and set row are read in the same transaction, two more
+/// statements (D-547), so the terms are the snapshot's.
 pub async fn read_stored_at(
-    tx: &impl DBRunner,
+    tx: &DbTx<'_>,
     scope: &AccessScope,
     tenant: Uuid,
     id: Uuid,
@@ -301,6 +308,10 @@ pub async fn read_stored_at(
         });
     }
     let settings = configuration::settings(tx, &children, tenant).await?;
+    // @cpt-begin:cpt-cf-bss-pricing-algo-plan-quota-rules-accept:p1:inst-quota-terms
+    let quota = plan_quota_repo::for_revision(tx, &children, tenant, id).await?;
+    let quota = (!quota.rules.is_empty()).then_some(quota);
+    // @cpt-end:cpt-cf-bss-pricing-algo-plan-quota-rules-accept:p1:inst-quota-terms
     let invoice_line_templates = serde_json::from_value(settings.invoice_line_templates.clone())
         .map_err(|_| {
             corrupt(format!(
@@ -336,6 +347,7 @@ pub async fn read_stored_at(
         resolved: Vec::new(),
         versions: BTreeMap::new(),
         inputs: BTreeMap::new(),
+        quota,
     })
     // @cpt-end:cpt-cf-bss-pricing-flow-read-contract-events:p1:inst-read-contract-events-flow-2
 }

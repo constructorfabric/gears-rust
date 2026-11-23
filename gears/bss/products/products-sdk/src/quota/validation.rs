@@ -28,6 +28,10 @@ pub const MAX_TEXT_BYTES: usize = 512;
 /// The longest unit or metric reference, in bytes: the longest GTS id the catalog stores (the
 /// GTS id maximum), so no reference to a stored unit or metric is refused.
 pub const MAX_REF_BYTES: usize = gts::gts::GTS_ID_MAX_LENGTH;
+/// The name of the request member [`QuotaSetRequest::quantity`]: the field of a
+/// `QUOTA_AMOUNT_INVALID` check ([`QuotaCheck::field`]) on a final limit off its unit's grid at
+/// that quantity, and the field of the refusal of a malformed quantity.
+pub const QUANTITY_FIELD: &str = "quantity";
 
 /// Why Pricing validates: an author's draft and its publication, or a sale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,9 +66,11 @@ pub struct QuotaSetRule {
     pub sku_version: QuotaVersion,
     /// The logical binding the rule's limit applies through: 1 to [`MAX_KEY_BYTES`] bytes.
     pub logical_binding_key: String,
-    /// The requested dimension value the rule applies to; `None` for an item without one, at
-    /// most [`MAX_TEXT_BYTES`] bytes. It is carried, not judged: it groups nothing, and every rule
-    /// of one binding shares one scope, whatever its value (P-D-276).
+    /// The requested dimension value the rule applies to, at most [`MAX_TEXT_BYTES`] bytes;
+    /// `None` for an item without one, and also for an item's default rule, which Pricing selects
+    /// for a value with no rule of the default's metric. It is carried, not judged: Products does
+    /// not judge a default rule either, it groups nothing, and every rule of one binding shares
+    /// one scope, whatever its value (P-D-276).
     pub alternative: Option<String>,
     /// The subject the limit applies to, as the scope policy spells it (`resource_owner`); at
     /// most [`MAX_TEXT_BYTES`] bytes.

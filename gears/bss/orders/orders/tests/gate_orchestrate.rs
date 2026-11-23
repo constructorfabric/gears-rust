@@ -164,6 +164,7 @@ fn catalog() -> CatalogAnswer {
                 cell(ITEM_B, binding(ITEM_B, ONE_TIME_SKU, &ChargeKind::OneTime)),
                 cell(ITEM, binding(ITEM, SKU, &ChargeKind::Recurring)),
             ],
+            quota_terms: None,
         })),
         skus: BTreeMap::from([
             (SKU, PortAnswer::Answered(sku(SKU))),

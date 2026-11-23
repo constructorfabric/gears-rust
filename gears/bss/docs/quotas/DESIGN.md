@@ -335,7 +335,7 @@ Saving a draft changes no existing purchase or OSS state. A non-quota PATCH with
 | `rule_id` | Client-generated UUID, unique within a revision and retained on retry/edit. It is not a tenant quota assignment ID. |
 | `definition_ref` | `{id, version, digest}` selecting one exact Products quota definition. Pricing resolves it and verifies the digest. |
 | `item_id` | Item in this same revision whose SKU matches the definition; foreign or missing items are refused. |
-| `dimension_value` | Nullable requested dimension value: null only for a dimensionless item; otherwise an exact registered value for that item's dimension. Matching follows the requested selection, even when price resolution uses a default chain. No wildcard/fallback rule is inferred. |
+| `dimension_value` | Nullable requested dimension value: null for a dimensionless item. On an item with a dimension, an exact registered value for that item's dimension, or null for the item's explicit default rule for its quota. A quota is a metric (vCPU, RAM and so on), whatever the rule's `logical_binding_key`. Matching follows the requested selection, even when price resolution uses a default chain: for each metric of the item's rules, every rule of the item for the requested value and that metric, else the item's default rules for that metric. A metric with neither refuses acceptance (`QUOTA_RULE_MISSING`), and the revision checks show such a sellable selection red before publication. No wildcard/fallback rule is inferred: a default is authored. |
 | `logical_binding_key` | Stable service/resource slot within this plan, 1–64 ASCII letters, digits, `_`, `-` or `.`. Rules for CPU and RAM in the same slot target the same eventual assignment scope. This key neither resolves a provider scope nor grants tenant authority. |
 | `scope_selection` | Exact opaque dimension values required by the definition's scope policy (§3.3.1.3); retained from plan to receipt and adapter binding. |
 | `subject_selector` | Closed v1 value `resource_owner`; the actual authorized tenant/scope is supplied by purchase and attribution contracts, not hard-coded into the reusable plan. |
@@ -343,9 +343,9 @@ Saving a draft changes no existing purchase or OSS state. A non-quota PATCH with
 
 The resolved definition supplies the metric, unit digests, mapping, qualification/profile and lifecycle behavior. The server retains this evidence. Request metadata cannot override it.
 
-Each selected `(logical_binding_key, metric)` has at most one applicable rule, regardless of item or rule IDs. Alternative dimension selections may have different rules, but both cannot apply to one selection. Changing a metric creates a new rule. Changing its version, amount or profile changes the revision's accepted meaning.
+Each selected `(logical_binding_key, metric)` has at most one applicable rule, regardless of item or rule IDs. Alternative dimension selections may have different rules, but both cannot apply to one selection. A quota is a metric: an item's default rules for a metric apply only to a selection for which the item has no rule of that metric, whatever their bindings, and two bindings of one metric for one value both apply (two adapter targets). One binding carries one scope, so a quota scoped to the region sold uses one binding per region. Changing a metric creates a new rule. Changing its version, amount or profile changes the revision's accepted meaning.
 
-Rules that apply together to a binding must share a supported profile qualified for the complete set. V1 requires one compatible profile across that binding's dimension alternatives. Publication must validate every sellable selection within the qualified bounds. If it cannot, refuse the combination. Checking only the default selection is insufficient. Incomplete editor rows stay client-side until all required fields are present.
+Rules that apply together to a binding must share a supported profile qualified for the complete set. V1 requires one compatible profile across that binding's dimension alternatives. Publication must validate every sellable selection within the qualified bounds. If it cannot, refuse the combination. Checking only the default selection is insufficient. Pricing's revision checks show each selection sellable on the revision's sale date that selects no rule of a metric the item's rules carry as red `QUOTA_RULE_MISSING`, so such a revision cannot be submitted or approved; a selection that becomes sellable after the sale date is refused at acceptance with the same reason. Incomplete editor rows stay client-side until all required fields are present.
 
 Illustrative PUT body: [plan-quota-rules.replace.example.json](schemas/plan-quota-rules.replace.example.json). The example headers carry the revision ETag and one stable operation UUID; neither belongs in the JSON body.
 
@@ -368,7 +368,7 @@ Each digest has a defined scope:
 
 - `quota_rules_digest` covers the revision's full rule collection.
 - `selected_quota_digest` covers applicable normalized rules and pinned dependencies returned by the versioned `PricingReadV1::resolve` extension.
-- `quota_snapshot_digest` also binds the original accepted quantity, tenant axes and purchase provenance.
+- `quota_snapshot_digest` also binds each selected rule's final limit and availability revision, the original accepted quantity, tenant axes and purchase provenance.
 
 Selected-rule arithmetic identity excludes display text, locale and temporary availability observations. Their pinned source evidence is still retained.
 

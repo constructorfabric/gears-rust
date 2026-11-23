@@ -75,7 +75,7 @@ and a reference barrier that cannot race SKU retirement (spec §1, §2 decisions
 | Migration | Approved request to change subscription structure or pins, executed by Subscriptions. |
 | Quota rule | An allocation limit on a plan revision: one exact Products quota definition version, an amount in an allowed unit, a basis (`fixed` or `per_plan_unit`) and a logical binding, for one item of the revision; never a price (D-540, D-541). |
 | Logical binding | A stable service or resource slot within a plan (`logical_binding_key`). The rules of one binding target one eventual assignment scope, and at most one rule per binding and metric applies to a sale (D-542). |
-| Quota digest | `quota_rules_digest` covers a revision's whole rule set; `selected_quota_digest` the rules a sale selects, with their evidence; `quota_snapshot_digest` also the original quantity and the purchase (D-541, D-547, D-548). |
+| Quota digest | `quota_rules_digest` covers a revision's whole rule set; `selected_quota_digest` the rules a sale selects, with their evidence; `quota_snapshot_digest` also each selected rule's final limit and availability revision, the original quantity and the purchase (D-541, D-547, D-548). |
 
 ## 2. Actors
 
@@ -529,7 +529,7 @@ Every price decimal is exact text within published limits, and each price, bindi
 currency spec (D-527 to D-533).
 The quotas programme adds the plan quota rules (D-540 to D-548): `GET` and `PUT /plan-revisions/{id}/quota-rules`
 under the revision's ETag, the PUT with `If-Match` and `Idempotency-Key`; the revision read's `quota_rules` and
-`quota_rules_digest`; the checks' `revision_version` and `quota_rules_digest`, eight quota rows and each subject's
+`quota_rules_digest`; the checks' `revision_version` and `quota_rules_digest`, nine quota rows and each subject's
 `quota_rule_id` and `field`; and 409 `ITEM_HAS_QUOTA_RULES` on an item delete. The SDK adds
 `PricingQuotaAuthoringClientV1` (`get_quota_rules`, `replace_quota_rules` and `check_plan_revision`, answering as the
 GET, the PUT and the revision checks do, D-540), and `ResolvedBindings.quota_terms`,
@@ -678,7 +678,7 @@ earlier pins retain the original GL. Pricing creates no refreeze prices or appro
 | AC #24 | `cpt-cf-bss-pricing-nfr-two-backends` | Given two writers approving intersecting chains on either backend, when they race then approved windows stay nonoverlapping; a losing conditional unit write is UNIT_CONTENDED rather than a second apply. |
 | AC #25 | `cpt-cf-bss-pricing-nfr-idempotency-concurrency` | Given a successful keyed POST, when the same body repeats then the saved response returns without a second object/unit; a changed payload conflicts, stale If-Match preserves state, and concurrent claims cannot both mutate. |
 | AC #26 | `cpt-cf-bss-pricing-fr-plan-quota-rules` | Given a draft with two items, when its author puts a complete set of rules then the set, its digest and a new ETag are saved together; a second put with the old ETag is STALE_REVISION, the same key and body replay the first answer, the same key with another body is IDEMPOTENCY_CONFLICT, an empty array clears the set, and a set with a foreign item, a fractional amount or two rules for one binding and metric changes nothing and names each rule and field. |
-| AC #27 | `cpt-cf-bss-pricing-fr-plan-quota-rules` | Given a revision with rules, when its checks run then each failing rule is a red quota row naming the rule and field, with the evaluated revision version and digest; submit refuses red quota rows, and an apply refuses a definition withdrawn after submit; deleting an item with rules is ITEM_HAS_QUOTA_RULES. |
+| AC #27 | `cpt-cf-bss-pricing-fr-plan-quota-rules` | Given a revision with rules, when its checks run then each failing rule is a red quota row naming the rule and field, and each sellable cell that no rule of a metric covers is a red `QUOTA_RULE_MISSING` line naming its item, with the evaluated revision version and digest; submit refuses red quota rows, and an apply refuses a definition withdrawn after submit; deleting an item with rules is ITEM_HAS_QUOTA_RULES. |
 | AC #28 | `cpt-cf-bss-pricing-fr-plan-quota-rules` | Given a published revision with rules, when it is copied or its plan cloned then the draft's rules keep their definitions and point at the copied items; the published revision keeps reading its rules after its definition is withdrawn. |
 | AC #29 | `cpt-cf-bss-pricing-fr-plan-quota-rules` | Given a published revision with 10 vCPU per plan unit, when a buyer accepts two units with the preview's quota digest then the receipt freezes the rule, its evidence, quantity 2 and both digests; a stale or missing digest is RESOLUTION_CHANGED even when no price changed. |
 

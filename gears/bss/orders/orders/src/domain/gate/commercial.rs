@@ -853,6 +853,7 @@ fn line_request(
         billing_terms,
         resolved_bindings_digest,
         hold_policy_version,
+        expected_quota_digest: None,
     };
     let accepted = query
         .selections
@@ -1279,11 +1280,12 @@ pub fn deterministic_receipt(
     Ok(AcceptanceReceipt {
         acceptance_id,
         request_digest: request_digest(&query),
-        terms_digest: bss_pricing_sdk::digest::terms_digest(&query, &bindings),
+        terms_digest: bss_pricing_sdk::digest::terms_digest(&query, &bindings, None),
         accepted_at,
         hold_until: accepted_at + time::Duration::seconds(i64::from(hold_seconds)),
         bindings,
         query,
+        quota: None,
     })
 }
 

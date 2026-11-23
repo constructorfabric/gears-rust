@@ -13,8 +13,8 @@ use bss_products_sdk::quota::gts::{ScopeDimension, SubjectSelector};
 use bss_products_sdk::quota::units::{Amount, Factor, UnitError, convert};
 use bss_products_sdk::quota::validation::{
     MAX_KEY_BYTES, MAX_LOCALE_BYTES, MAX_REF_BYTES, MAX_RULES, MAX_SCOPE_KEYS,
-    MAX_SCOPE_VALUE_BYTES as MAX_SCOPE_VALUE, MAX_TEXT_BYTES, QuotaChangeKind, QuotaCheck,
-    QuotaCheckCode, QuotaPriorLimit, QuotaRuleVerdict, QuotaSetRequest, QuotaSetRule,
+    MAX_SCOPE_VALUE_BYTES as MAX_SCOPE_VALUE, MAX_TEXT_BYTES, QUANTITY_FIELD, QuotaChangeKind,
+    QuotaCheck, QuotaCheckCode, QuotaPriorLimit, QuotaRuleVerdict, QuotaSetRequest, QuotaSetRule,
     QuotaSetValidation, QuotaValidationPurpose,
 };
 use serde_json::Value;
@@ -149,7 +149,7 @@ fn quantity_refusal(request: &QuotaSetRequest) -> Refusal {
         }
         Some(_) | None => return None,
     };
-    Some(("quantity".to_owned(), detail))
+    Some((QUANTITY_FIELD.to_owned(), detail))
 }
 
 /// Prior limits only with `Increase` and `Unchanged`, and some with them; each within its
@@ -574,7 +574,7 @@ fn final_limit(
     checks.push(check(
         QuotaCheckCode::AmountInvalid,
         vec![rule.rule_id],
-        "quantity",
+        QUANTITY_FIELD,
         why,
     ));
     Limits::default()

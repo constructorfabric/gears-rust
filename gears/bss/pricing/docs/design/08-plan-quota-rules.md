@@ -66,10 +66,10 @@ Actors: `cpt-cf-bss-pricing-actor-product-manager`, `cpt-cf-bss-pricing-actor-pr
 
 1. [ ] - `p1` - Product Manager reads a draft revision with its items and its quota rules, with the revision's ETag; ask `read` on `plan` - `inst-quota-read`
 2. [ ] - `p1` - Product Manager selects exact definitions from Products' catalog and puts the complete rule set under the revision's ETag and an idempotency key, by algorithm replace - `inst-quota-replace`
-3. [ ] - `p1` - Product Manager reads the revision's checks: one red row per failing quota code, each naming the item, the rule and the field, with the evaluated revision version and digest (D-544) - `inst-quota-check`
+3. [ ] - `p1` - Product Manager reads the revision's checks: one red row per failing quota code, each naming the item, the rule and the field, or the item, the sellable cell and the metric that no rule covers, with the evaluated revision version and digest (D-544) - `inst-quota-check`
 4. [ ] - `p1` - Submit and every vote recheck the rules by algorithm govern; a red quota row refuses, and an approved revision publishes its rules unchanged - `inst-quota-submit`
 5. [ ] - `p1` - Copying a published revision or cloning its plan copies its rules onto the copied items by algorithm govern - `inst-quota-copy`
-6. [ ] - `p1` - A buyer's preview carries the revision's quota terms; the selected quota digest is computed for the requested selection by algorithm accept - `inst-quota-preview`
+6. [ ] - `p1` - A buyer's preview (resolve and `GET /resolve`) carries the revision's quota terms; the buyer computes the selected quota digest for its selection with the SDK's `selected_quota_digest`, the selection of algorithm accept - `inst-quota-preview`
 7. [ ] - `p1` - Acceptance checks the expected quota digest and freezes the selected rules in the receipt by algorithm accept - `inst-quota-accept`
 
 ## 3. Processes / Business Logic (CDSL)
@@ -98,10 +98,10 @@ Feature algorithm: `cpt-cf-bss-pricing-algo-plan-quota-rules-govern`.
 
 Feature algorithm: `cpt-cf-bss-pricing-algo-plan-quota-rules-accept`.
 
-1. [ ] - `p1` - Resolve answers every rule of the revision with its pinned evidence and the set digest, or none for a revision without rules - `inst-quota-terms`
-2. [ ] - `p1` - Select the rules whose item and value the sale requests; an item's rule never applies to another value or through the default chain - `inst-quota-select`
-3. [ ] - `p1` - A revision with rules needs the sale's expected quota digest, and it must equal the selected digest; else RESOLUTION_CHANGED - `inst-quota-expected`
-4. [ ] - `p1` - Validate the selected set through Products for acceptance at the accepted quantity, then freeze the rules, their evidence, the original quantity and the selected and snapshot digests in the receipt, in the acceptance transaction - `inst-quota-freeze`
+1. [ ] - `p1` - Resolve answers every rule of the revision with its pinned evidence and the set digest, read from the stored rules with no catalog call, or none for a revision without rules - `inst-quota-terms`
+2. [ ] - `p1` - Before the selection, a revision with rules needs the sale's expected quota digest and a revision without rules takes none, else RESOLUTION_CHANGED; after the selection (step 3), the expected digest must equal the selected digest, else RESOLUTION_CHANGED - `inst-quota-expected`
+3. [ ] - `p1` - A quota is a metric: for each metric of a selected item's rules, select every rule of the item for the requested value and that metric, else every default rule of the item for that metric; a metric with neither is QUOTA_RULE_MISSING, whatever the expected digest and before any catalog call; the price's default chain plays no part - `inst-quota-select`
+4. [ ] - `p1` - A sale that selects rules needs a whole quantity from 1 (QUANTITY_INVALID); outside the transaction, validate the selected rules through Products for acceptance at that quantity, the first refusal that applies answering (D-548); freeze each rule with its evidence, final limit and availability revision, the original quantity and the selected and snapshot digests, and check the snapshot with `verify_quota_snapshot`; the acceptance transaction writes the snapshot in the receipt, or rolls back and captures again when the rule set moved - `inst-quota-freeze`
 
 ## 4. States (CDSL)
 
@@ -132,9 +132,10 @@ Under /bss-pricing/v1:
 - `GET /plan-revisions/{id}` carries `quota_rules` and `quota_rules_digest` (empty and the empty set's digest for a
   revision without rules).
 - `GET /plan-revisions/{id}/checks` and `GET /plan-revisions/checks` carry `revision_version` and
-  `quota_rules_digest`, and for a revision with rules the eight quota rows of D-544 after the existing rows; each
-  subject of a quota row adds `quota_rule_id` and `field` (`""` for the rule as a whole), left out when null. The
-  batch reads each SKU's version once per sale date.
+  `quota_rules_digest`, and for a revision with rules the nine quota rows of D-544 after the existing rows; each
+  subject of a quota row that names a rule adds `quota_rule_id` and `field` (`""` for the rule as a whole), left out
+  when null, and the line of an uncovered sellable cell names only its item. The batch reads each SKU's version once
+  per sale date.
 - `DELETE /plan-items/{id}` adds 409 `ITEM_HAS_QUOTA_RULES`.
 - `bss_pricing_sdk::plan_quota::PricingQuotaAuthoringClientV1`, whose local client the gear registers in the ClientHub
   at init: `get_quota_rules`, `replace_quota_rules` and `check_plan_revision` call the same functions as the GET, the
@@ -163,7 +164,8 @@ revision without rules has none and reads the empty set. The set row and the rul
 transaction, as every Pricing transaction is, so both statements see one snapshot.
 
 The set digest is computed once, at the write, and stored (D-541). The evidence keeps the identity-bearing content of
-the definition, without text and availability; the availability observation is stored apart from it (D-542).
+the definition, without text and availability; the availability observation is stored apart from it (D-542). With the
+rule's unit it keeps that unit's grid and maximum, and it keeps the quota kind; the preview's terms carry both (D-547).
 
 ## 7. Events & Alarms
 
@@ -184,7 +186,7 @@ The sole definitions live in [features/plan-quota-rules.md](../features/plan-quo
 
 1. PRD AC #26 / `cpt-cf-bss-pricing-dod-plan-quota-rules-authoring`: Given a draft with two items, when its author puts a complete set of rules then the set, its digest and a new ETag are saved together; a stale ETag, a replay, a conflicting key, an empty array and an invalid set behave as the criterion states.
 2. PRD AC #26 / `cpt-cf-bss-pricing-dod-plan-quota-rules-store`: Given two concurrent replaces on one version, or an item delete racing a replace, on PostgreSQL, when both run then one set is stored and no rule names a missing item.
-3. PRD AC #27 / `cpt-cf-bss-pricing-dod-plan-quota-rules-checks`: Given a revision with rules, when its checks run then each failing rule is a red quota row naming the rule and field, with the evaluated revision version and digest.
+3. PRD AC #27 / `cpt-cf-bss-pricing-dod-plan-quota-rules-checks`: Given a revision with rules, when its checks run then each failing rule is a red quota row naming the rule and field, and each sellable cell that no rule of a metric covers is a red `QUOTA_RULE_MISSING` line naming its item, with the evaluated revision version and digest.
 4. PRD AC #27, #28 / `cpt-cf-bss-pricing-dod-plan-quota-rules-governance`: Given a revision with rules, when it is submitted, approved, copied or cloned then submit and apply refuse red quota rows, a copy keeps its definitions on the copied items, and the published revision reads its rules after a withdrawal.
 5. PRD AC #29 / `cpt-cf-bss-pricing-dod-plan-quota-rules-acceptance`: Given a published revision with 10 vCPU per plan unit, when a buyer accepts two units with the preview's quota digest then the receipt freezes the rule, its evidence, quantity 2 and both digests; a stale or missing digest is RESOLUTION_CHANGED.
 

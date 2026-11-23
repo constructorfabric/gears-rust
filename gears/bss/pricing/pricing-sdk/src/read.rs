@@ -1,4 +1,6 @@
 //! Typed pricing read contracts.
+//!
+//! @cpt-dod:cpt-cf-bss-pricing-dod-plan-quota-rules-acceptance:p1
 
 use uuid::Uuid;
 
@@ -6,9 +8,12 @@ use rust_decimal::Decimal;
 
 use time::Date;
 
+use std::num::NonZeroU64;
+
 use crate::{
     Digest,
     meter_semantics::MeterRef,
+    plan_quota::{PlanQuotaKind, PlanQuotaRuleV1},
     terms::{BillingCycle, InvoiceInputs, UsageRatingPolicy},
 };
 
@@ -229,6 +234,100 @@ pub struct ResolvedBindings {
 
     /// Cells.
     pub cells: Vec<ResolvedCell>,
+
+    /// The revision's quota rules (D-547); `None` for a revision without rules.
+    pub quota_terms: Option<QuotaTerms>,
+}
+
+/// A version-pinned owner reference (a mapping, a profile), as a rule's definition pinned it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaOwnerRef {
+    /// The record's id.
+    pub id: Uuid,
+    /// The record's version.
+    pub version: NonZeroU64,
+    /// The version's content digest, as Products computed it.
+    pub digest: Digest,
+}
+
+/// What a rule's definition pinned when the rule was saved (D-547): the part of the stored
+/// evidence (D-542) the quota arithmetic needs. No text and no availability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedQuotaEvidence {
+    /// The SKU the definition was approved for.
+    pub sku_id: Uuid,
+    /// The SKU version it was approved against.
+    pub sku_version: NonZeroU64,
+    /// The metric.
+    pub metric_ref: String,
+    /// The metric's registry content digest.
+    pub metric_digest: Digest,
+    /// The quota's kind, as the definition carried it at the save.
+    pub quota_kind: PlanQuotaKind,
+    /// The metric's canonical unit.
+    pub canonical_unit_ref: String,
+    /// The registry content digest of the rule's unit (`unit_ref`).
+    pub unit_digest: Digest,
+    /// The numerator of the rule's unit in the canonical unit, a canonical decimal integer.
+    pub unit_numerator: String,
+    /// The denominator of the rule's unit in the canonical unit, a canonical decimal integer.
+    pub unit_denominator: String,
+    /// The smallest limit in the rule's unit (`unit_ref`), a canonical decimal integer.
+    pub unit_min: String,
+    /// The grid of a limit in the rule's unit, a canonical decimal integer: a limit is
+    /// `unit_min + n × unit_step` for a whole `n ≥ 0`; a step of `0` admits `unit_min` alone.
+    pub unit_step: String,
+    /// The largest limit in the rule's unit, a canonical decimal integer; `None` when the unit
+    /// has no maximum.
+    pub unit_max: Option<String>,
+    /// The adapter mapping.
+    pub mapping: QuotaOwnerRef,
+    /// The adapter profile.
+    pub profile: QuotaOwnerRef,
+    /// The accounting policy.
+    pub accounting_policy_ref: String,
+    /// The accounting policy's content digest.
+    pub accounting_policy_digest: Digest,
+    /// The scope policy.
+    pub scope_policy_ref: String,
+    /// The scope policy's content digest.
+    pub scope_policy_digest: Digest,
+    /// The definition supports an initial set.
+    pub initial_set_supported: bool,
+    /// The definition supports an increase.
+    pub increase_supported: bool,
+}
+
+/// One rule of a revision with its pinned evidence (D-547).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedQuotaRule {
+    /// The rule as the revision stores it.
+    pub rule: PlanQuotaRuleV1,
+    /// What its definition pinned at the save.
+    pub evidence: PinnedQuotaEvidence,
+}
+
+/// Every rule of a revision with the revision's set digest (D-547).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaTerms {
+    /// The revision's stored set digest ([`crate::digest::quota_rules_digest`]).
+    pub quota_rules_digest: Digest,
+    /// Every rule, ordered by `rule_id`.
+    pub rules: Vec<ResolvedQuotaRule>,
+}
+
+/// A quota of a selected item that no rule covers at the requested value (D-547). A quota is a
+/// metric: the item has a rule of the metric, on any binding, but neither one for that value nor
+/// a default rule (no dimension value). [`crate::digest::uncovered_quotas`] names them; an
+/// acceptance refuses such a sale as `QUOTA_RULE_MISSING`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UncoveredQuota {
+    /// The selected item.
+    pub item_id: Uuid,
+    /// The requested dimension value; `None` for a selection without one.
+    pub dimension_value: Option<String>,
+    /// The quota's metric: its definition's `metric_ref`.
+    pub metric_ref: String,
 }
 
 /// `RevisionRef` value in the versioned pricing read contract.

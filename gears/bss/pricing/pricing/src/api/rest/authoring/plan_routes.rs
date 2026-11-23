@@ -822,9 +822,10 @@ pub(super) fn item_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Rout
              ITEM_ENTRY_MISSING (\"Every item points at a price\") red (D-512); submit, the \
              scheduled apply and publish refuse the revision while any row is red. The answer \
              names the revision_version and the quota_rules_digest it judged; a revision with \
-             quota rules is validated by Products on every read and adds eight quota rows after \
-             the others, each red row's subjects naming the item, the quota_rule_id and the \
-             field (D-544). Refusals: 404 for a revision the tenant does not hold; Products' own \
+             quota rules is validated by Products on every read and adds nine quota rows after \
+             the others, each red row's subjects naming the item and, for a failing rule, the \
+             quota_rule_id and the field; an uncovered sellable cell names only its item \
+             (D-544). Refusals: 404 for a revision the tenant does not hold; Products' own \
              refusal; 503 REGISTRY_UNAVAILABLE, or QUOTA_CATALOG_UNAVAILABLE when the Products \
              quota catalog cannot answer, never a ready answer.",
         )

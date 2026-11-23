@@ -1400,7 +1400,7 @@ pub struct PricingPlanQuotaRuleDto {
     pub rule_id: Uuid,
     pub definition_ref: PricingQuotaDefinitionRefDto,
     pub item_id: Uuid,
-    /// The item's dimension value; null only for an item without a dimension.
+    /// The item's dimension value; null for an item without one, or for the item's default rule.
     pub dimension_value: Option<String>,
     pub logical_binding_key: String,
     pub subject_selector: PricingQuotaSubjectSelector,
@@ -1474,7 +1474,7 @@ pub struct PricingPlanQuotaRuleInput {
     pub definition_ref: PricingQuotaDefinitionRefInput,
     /// An item of the same revision.
     pub item_id: Uuid,
-    /// Null for an item without a dimension, else one value of the item's dimension.
+    /// One of the item's dimension values, or null: for an item without one, or its default rule.
     pub dimension_value: Option<String>,
     /// 1 to 64 of ASCII letters, digits, `_`, `-` and `.`.
     pub logical_binding_key: String,
@@ -1601,18 +1601,20 @@ fn nullable<'de, D: serde::Deserializer<'de>, T: serde::Deserialize<'de>>(
     <Option<T> as serde::Deserialize>::deserialize(d).map(Some)
 }
 /// An item a check row is about (D-466): the item, its SKU and the entry it names, and on a quota
-/// row the rule and its member (D-544).
+/// row that names a rule, the rule and its member (D-544); the line of an uncovered sellable cell
+/// names only its item.
 #[toolkit_macros::api_dto(response)]
 pub struct PricingPlanCheckSubject {
     pub item_id: Uuid,
     pub sku_id: Uuid,
     /// Null for an item that names no entry.
     pub price_book_entry_id: Option<Uuid>,
-    /// The quota rule a quota row names; left out on every other row.
+    /// The quota rule a quota row names; left out on every other row, and for an uncovered
+    /// sellable cell, whose line names only its item.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_rule_id: Option<Uuid>,
     /// The rule's top-level member the failure is about (`amount`, `scope_selection`, ...), or
-    /// `""` for the rule as a whole; left out on every other row.
+    /// `""` for the rule as a whole; left out whenever `quota_rule_id` is left out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub field: Option<String>,
 }

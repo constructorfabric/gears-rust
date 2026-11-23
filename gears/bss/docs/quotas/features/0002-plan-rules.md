@@ -76,7 +76,7 @@ This feature covers draft replacement, concurrent editing, copy/clone, approval,
 
 ### 2.1 Plan quota authoring and acceptance
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-quotas-flow-plan-rules`
+- [x] `p1` - **ID**: `cpt-cf-bss-quotas-flow-plan-rules`
 
 **Actor**: `cpt-cf-bss-quotas-actor-seller`.
 
@@ -94,8 +94,8 @@ This feature covers draft replacement, concurrent editing, copy/clone, approval,
 4. [x] - `p1` - Submit the complete quota collection using the saved revision version and operation identity. - `inst-replace`
 5. [x] - `p1` - Read checks for that exact saved revision and inspect every failed rule or field. - `inst-check`
 6. [x] - `p1` - Recheck qualification, then submit and publish through existing approval operations. - `inst-publish`
-7. [ ] - `p1` - Show the selected quota terms and charging terms with the preview digest. - `inst-preview`
-8. [ ] - `p1` - Freeze the selected terms and original quantity only after the expected quota digest matches. - `inst-accept`
+7. [x] - `p1` - Show the selected quota terms and charging terms with the preview digest. - `inst-preview`
+8. [x] - `p1` - Freeze the selected terms and original quantity only after the expected quota digest matches. - `inst-accept`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -185,7 +185,7 @@ This feature uses the owner states defined in DESIGN. It adds no lifecycle state
 
 Owners must implement this behavior and retain passing evidence for every criterion below. Under `DOCS-ONLY` traceability, FEATURE checkboxes and evidence references track implementation. They do not claim that code markers exist or tests have run.
 
-Implementation evidence: Pricing feature [Plan Quota Rules](../../../pricing/docs/features/plan-quota-rules.md) (D-540 … D-546) and Products feature [Quota Set Validation](../../../products/docs/features/quota-set-validation.md) (P-D-275, P-D-276).
+Implementation evidence: Pricing feature [Plan Quota Rules](../../../pricing/docs/features/plan-quota-rules.md) (D-540 … D-546), with its preview and acceptance (D-547, D-548), and Products feature [Quota Set Validation](../../../products/docs/features/quota-set-validation.md) (P-D-275, P-D-276).
 
 **Implements**: `cpt-cf-bss-quotas-flow-plan-rules`, `cpt-cf-bss-quotas-algo-plan-rules`.
 

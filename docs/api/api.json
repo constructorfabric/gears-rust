@@ -12498,10 +12498,10 @@
         "type": "object"
       },
       "PricingPlanCheckSubject": {
-        "description": "An item a check row is about (D-466): the item, its SKU and the entry it names, and on a quota\nrow the rule and its member (D-544).",
+        "description": "An item a check row is about (D-466): the item, its SKU and the entry it names, and on a quota\nrow that names a rule, the rule and its member (D-544); the line of an uncovered sellable cell\nnames only its item.",
         "properties": {
           "field": {
-            "description": "The rule's top-level member the failure is about (`amount`, `scope_selection`, ...), or\n`\"\"` for the rule as a whole; left out on every other row.",
+            "description": "The rule's top-level member the failure is about (`amount`, `scope_selection`, ...), or\n`\"\"` for the rule as a whole; left out whenever `quota_rule_id` is left out.",
             "type": [
               "string",
               "null"
@@ -12520,7 +12520,7 @@
             ]
           },
           "quota_rule_id": {
-            "description": "The quota rule a quota row names; left out on every other row.",
+            "description": "The quota rule a quota row names; left out on every other row, and for an uncovered\nsellable cell, whose line names only its item.",
             "format": "uuid",
             "type": [
               "string",
@@ -13091,7 +13091,7 @@
             "$ref": "#/components/schemas/PricingQuotaDefinitionRefDto"
           },
           "dimension_value": {
-            "description": "The item's dimension value; null only for an item without a dimension.",
+            "description": "The item's dimension value; null for an item without one, or for the item's default rule.",
             "type": [
               "string",
               "null"
@@ -13154,7 +13154,7 @@
             "description": "The exact Products quota definition version: its id, its version a decimal string and its\ndigest 64 lowercase hex characters, as Products' catalog answers them."
           },
           "dimension_value": {
-            "description": "Null for an item without a dimension, else one value of the item's dimension.",
+            "description": "One of the item's dimension values, or null: for an item without one, or its default rule.",
             "type": [
               "string",
               "null"
@@ -14462,12 +14462,229 @@
         ],
         "type": "object"
       },
+      "PricingQuotaEvidenceDto": {
+        "description": "What a rule's definition pinned when the rule was saved (D-547): the part of its stored\nevidence the quota arithmetic needs. Digests are 64 lowercase hex characters and versions\ndecimal strings; no text and no availability.",
+        "properties": {
+          "accounting_policy_digest": {
+            "type": "string"
+          },
+          "accounting_policy_ref": {
+            "type": "string"
+          },
+          "canonical_unit_ref": {
+            "description": "The metric's canonical unit.",
+            "type": "string"
+          },
+          "increase_supported": {
+            "description": "The definition supports an increase.",
+            "type": "boolean"
+          },
+          "initial_set_supported": {
+            "description": "The definition supports an initial set.",
+            "type": "boolean"
+          },
+          "mapping": {
+            "$ref": "#/components/schemas/PricingQuotaOwnerRefDto",
+            "description": "The adapter mapping."
+          },
+          "metric_digest": {
+            "type": "string"
+          },
+          "metric_ref": {
+            "description": "The metric: the rule's quota.",
+            "type": "string"
+          },
+          "profile": {
+            "$ref": "#/components/schemas/PricingQuotaOwnerRefDto",
+            "description": "The adapter profile."
+          },
+          "quota_kind": {
+            "$ref": "#/components/schemas/PricingQuotaKind",
+            "description": "The quota's kind, as the definition carried it at the save."
+          },
+          "scope_policy_digest": {
+            "type": "string"
+          },
+          "scope_policy_ref": {
+            "type": "string"
+          },
+          "sku_id": {
+            "description": "The SKU the definition was approved for.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "sku_version": {
+            "description": "The SKU version it was approved against.",
+            "type": "string"
+          },
+          "unit_denominator": {
+            "description": "The rule's unit in the canonical unit: denominator, a canonical decimal integer.",
+            "type": "string"
+          },
+          "unit_digest": {
+            "description": "The registry content digest of the rule's unit (`unit_ref`).",
+            "type": "string"
+          },
+          "unit_max": {
+            "description": "The largest limit in the rule's unit, a canonical decimal integer; null when the unit has\nno maximum.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "unit_min": {
+            "description": "The smallest limit in the rule's unit, a canonical decimal integer.",
+            "type": "string"
+          },
+          "unit_numerator": {
+            "description": "The rule's unit in the canonical unit: numerator, a canonical decimal integer.",
+            "type": "string"
+          },
+          "unit_step": {
+            "description": "The grid of a limit in the rule's unit, a canonical decimal integer: a limit is\n`unit_min + n × unit_step` for a whole `n ≥ 0`; a step of `0` admits `unit_min` alone.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sku_id",
+          "sku_version",
+          "metric_ref",
+          "metric_digest",
+          "quota_kind",
+          "canonical_unit_ref",
+          "unit_digest",
+          "unit_numerator",
+          "unit_denominator",
+          "unit_min",
+          "unit_step",
+          "mapping",
+          "profile",
+          "accounting_policy_ref",
+          "accounting_policy_digest",
+          "scope_policy_ref",
+          "scope_policy_digest",
+          "initial_set_supported",
+          "increase_supported"
+        ],
+        "type": "object"
+      },
+      "PricingQuotaKind": {
+        "description": "The kind of a quota, as a rule's definition pinned it at the save (D-547): Products' one\nv1 kind.",
+        "enum": [
+          "allocation"
+        ],
+        "type": "string"
+      },
+      "PricingQuotaOwnerRefDto": {
+        "description": "A version-pinned owner reference (a mapping, a profile) as the definition pinned it.",
+        "properties": {
+          "digest": {
+            "description": "The version's content digest, lowercase hex.",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "version": {
+            "description": "The record's version, a decimal string.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "version",
+          "digest"
+        ],
+        "type": "object"
+      },
       "PricingQuotaSubjectSelector": {
         "description": "Whose quota a plan quota rule sets (D-541).",
         "enum": [
           "resource_owner"
         ],
         "type": "string"
+      },
+      "PricingQuotaTermsDto": {
+        "description": "A revision's quota terms on `GET /resolve` (D-547).",
+        "properties": {
+          "quota_rules_digest": {
+            "description": "The revision's stored set digest, lowercase hex (D-541).",
+            "type": "string"
+          },
+          "rules": {
+            "description": "Every rule of the revision, ordered by `rule_id`.",
+            "items": {
+              "$ref": "#/components/schemas/PricingResolvedQuotaRuleDto"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "quota_rules_digest",
+          "rules"
+        ],
+        "type": "object"
+      },
+      "PricingQuotaTermsRuleDto": {
+        "description": "A rule's ten members as stored (D-541): an exact definition version, an amount in an allowed\nunit, a basis, a logical binding and a scope selection, for one item of the revision.",
+        "properties": {
+          "amount": {
+            "description": "A canonical decimal integer in `unit_ref`.",
+            "type": "string"
+          },
+          "basis": {
+            "$ref": "#/components/schemas/PricingQuotaBasis"
+          },
+          "definition_ref": {
+            "$ref": "#/components/schemas/PricingQuotaDefinitionRefDto"
+          },
+          "dimension_value": {
+            "description": "The item's dimension value; null for an item without one, or for the item's default rule.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "item_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "logical_binding_key": {
+            "type": "string"
+          },
+          "rule_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "scope_selection": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "subject_selector": {
+            "$ref": "#/components/schemas/PricingQuotaSubjectSelector"
+          },
+          "unit_ref": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "rule_id",
+          "definition_ref",
+          "item_id",
+          "logical_binding_key",
+          "subject_selector",
+          "scope_selection",
+          "amount",
+          "unit_ref",
+          "basis"
+        ],
+        "type": "object"
       },
       "PricingReferenceOpDto": {
         "properties": {
@@ -14740,6 +14957,17 @@
             "format": "uuid",
             "type": "string"
           },
+          "quota_terms": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PricingQuotaTermsDto",
+                "description": "The revision's quota terms (D-547), as the typed read answers them: every stored rule,\nwhatever item the read names, with the evidence its definition pinned at the save, and the\nstored set digest. Read from the stored rules, with no catalog call. Left out for a\nrevision without rules."
+              }
+            ]
+          },
           "rev_no": {
             "format": "int32",
             "type": "integer"
@@ -14940,6 +15168,24 @@
           "tenant"
         ],
         "type": "string"
+      },
+      "PricingResolvedQuotaRuleDto": {
+        "description": "One rule of a revision's quota terms, with what its definition pinned at the save (D-547).",
+        "properties": {
+          "evidence": {
+            "$ref": "#/components/schemas/PricingQuotaEvidenceDto",
+            "description": "What the rule's definition pinned when the rule was saved."
+          },
+          "rule": {
+            "$ref": "#/components/schemas/PricingQuotaTermsRuleDto",
+            "description": "The rule as stored, without its availability observation."
+          }
+        },
+        "required": [
+          "rule",
+          "evidence"
+        ],
+        "type": "object"
       },
       "PricingResolvedRevisionState": {
         "description": "The state of a revision that resolves, as it reads today (D-447): a published or\nsuperseded one on every date (D-419), a scheduled one from its sale date on (D-454). No\nother resolves.",
@@ -42022,7 +42268,7 @@
     },
     "/bss-pricing/v1/plan-revisions/{id}/checks": {
       "get": {
-        "description": "Returns every check of the revision on its sale date (coverage, SKUs, references, book), whether it may be submitted, and quorum_required, the plan_revision quorum a submit will need (D-481), from fresh SKU reads. An item with no entry keeps the row ITEM_ENTRY_MISSING (\"Every item points at a price\") red (D-512); submit, the scheduled apply and publish refuse the revision while any row is red. The answer names the revision_version and the quota_rules_digest it judged; a revision with quota rules is validated by Products on every read and adds eight quota rows after the others, each red row's subjects naming the item, the quota_rule_id and the field (D-544). Refusals: 404 for a revision the tenant does not hold; Products' own refusal; 503 REGISTRY_UNAVAILABLE, or QUOTA_CATALOG_UNAVAILABLE when the Products quota catalog cannot answer, never a ready answer.",
+        "description": "Returns every check of the revision on its sale date (coverage, SKUs, references, book), whether it may be submitted, and quorum_required, the plan_revision quorum a submit will need (D-481), from fresh SKU reads. An item with no entry keeps the row ITEM_ENTRY_MISSING (\"Every item points at a price\") red (D-512); submit, the scheduled apply and publish refuse the revision while any row is red. The answer names the revision_version and the quota_rules_digest it judged; a revision with quota rules is validated by Products on every read and adds nine quota rows after the others, each red row's subjects naming the item and, for a failing rule, the quota_rule_id and the field; an uncovered sellable cell names only its item (D-544). Refusals: 404 for a revision the tenant does not hold; Products' own refusal; 503 REGISTRY_UNAVAILABLE, or QUOTA_CATALOG_UNAVAILABLE when the Products quota catalog cannot answer, never a ready answer.",
         "operationId": "bss_pricing.get_plan_revision_checks",
         "parameters": [
           {
@@ -47697,7 +47943,7 @@
     },
     "/bss-pricing/v1/resolve": {
       "get": {
-        "description": "Returns, per item of a published or superseded plan revision, or of a scheduled one on or after its sale date, the chain matrix (the default chain and every dimension value) with the price bound on the date, the SKU version in force and the resolved invoice inputs; pins renew a subscription's bindings. A scheduled revision whose date has come resolves as published, on every date, whether or not its switch is persisted yet. No totals. Refusals: 400 QUERY_INVALID, DATE_INVALID, PIN_FOREIGN, PIN_DUPLICATE or PINS_TOO_MANY; 404 for an unknown revision or item; 409 REVISION_NOT_PUBLISHED for a draft or pending revision, REVISION_NOT_YET_AVAILABLE for a scheduled one before its sale date; Products' own refusal of a SKU read; 503 REGISTRY_UNAVAILABLE when Products cannot answer.",
+        "description": "Returns, per item of a published or superseded plan revision, or of a scheduled one on or after its sale date, the chain matrix (the default chain and every dimension value) with the price bound on the date, the SKU version in force and the resolved invoice inputs; pins renew a subscription's bindings. A scheduled revision whose date has come resolves as published, on every date, whether or not its switch is persisted yet. No totals. Refusals: 400 QUERY_INVALID, DATE_INVALID, PIN_FOREIGN, PIN_DUPLICATE or PINS_TOO_MANY; 404 for an unknown revision or item; 409 REVISION_NOT_PUBLISHED for a draft or pending revision, REVISION_NOT_YET_AVAILABLE for a scheduled one before its sale date; Products' own refusal of a SKU read; 503 REGISTRY_UNAVAILABLE when Products cannot answer. A revision with quota rules also answers quota_terms: every stored rule with the evidence its definition pinned at the save and the stored set digest, read with no quota catalog call (D-547).",
         "operationId": "bss_pricing.resolve",
         "parameters": [
           {

@@ -605,7 +605,10 @@ impl World {
 fn assert_receipt(a: &AcceptanceReceipt, q: &NewSaleQuery, now: time::OffsetDateTime) {
     assert_eq!(a.query, *q);
     assert_eq!(a.request_digest, request_digest(q));
-    assert_eq!(a.terms_digest, terms_digest(q, &a.bindings));
+    assert_eq!(
+        a.terms_digest,
+        terms_digest(q, &a.bindings, a.quota.as_ref())
+    );
     assert_eq!(a.accepted_at, now);
     assert_eq!(a.hold_until - a.accepted_at, time::Duration::hours(24));
 }

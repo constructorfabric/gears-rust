@@ -1,4 +1,5 @@
 //! @cpt-dod:cpt-cf-bss-pricing-dod-plan-quota-rules-authoring:p1
+//! @cpt-dod:cpt-cf-bss-pricing-dod-plan-quota-rules-acceptance:p1
 //! The quota catalog port (D-542, D-545): the two calls Pricing makes to Products for quota rules,
 //! the conversion of a stored rule, and the quota half of a detached capture.
 //!
@@ -22,6 +23,7 @@
 //!   digest, the empty set's included, so a set added since is seen.
 use crate::api::rest::authoring::support::{self, DoorError};
 use crate::domain::plan_quota::{RuleItem, digest_from_hex, names_definition, rule_violations};
+use crate::infra::storage::repo::plan_quota_repo::StoredSet;
 use crate::infra::{
     reference_registry, reference_work,
     storage::{
@@ -32,14 +34,17 @@ use crate::infra::{
     usage_policy_wire::digest_text,
 };
 use bss_pricing_sdk::plan_quota::{
-    PlanQuotaBasis, PlanQuotaRuleV1, QuotaDefinitionRef, QuotaSubjectSelector,
+    PlanQuotaBasis, PlanQuotaKind, PlanQuotaRuleV1, QuotaDefinitionRef, QuotaSubjectSelector,
 };
+use bss_pricing_sdk::read::{PinnedQuotaEvidence, QuotaOwnerRef, QuotaTerms, ResolvedQuotaRule};
 use bss_products_sdk::ProductsQuotaCatalogClientV1;
 use bss_products_sdk::quota::catalog::{
     QuotaAvailability, QuotaBasis, QuotaDefinition, QuotaDefinitionListRequest,
-    QuotaDefinitionPage, QuotaDefinitionRef as ProductsDefinitionRef, QuotaOwnerRef, QuotaVersion,
+    QuotaDefinitionPage, QuotaDefinitionRef as ProductsDefinitionRef,
+    QuotaOwnerRef as ProductsOwnerRef, QuotaVersion,
 };
 use bss_products_sdk::quota::gts::QuotaKind;
+use bss_products_sdk::quota::units::{Amount, Factor};
 use bss_products_sdk::quota::validation::{
     QuotaChangeKind, QuotaSetRequest, QuotaSetRule, QuotaSetValidation, QuotaValidationPurpose,
 };
@@ -286,7 +291,7 @@ pub async fn validate(
     answer
 }
 
-fn owner_ref(reference: &QuotaOwnerRef) -> Value {
+fn owner_ref(reference: &ProductsOwnerRef) -> Value {
     json!({
         "id": reference.id,
         "version": reference.version.to_string(),
@@ -302,9 +307,11 @@ const fn kind_token(kind: QuotaKind) -> &'static str {
 
 /// The stored evidence of a resolved definition (D-542): its identity and digest, SKU and SKU
 /// version, metric and its digest and kind, canonical unit, the rule's unit (`unit_ref`) with its
-/// digest and factor (null when the definition does not allow it), the mapping, profile and
-/// qualification references, both policies' references and digests, change support, subject
-/// and resource types. No text and no availability.
+/// digest, factor, grid and maximum (`min`, `step`, `max`, the maximum null when the unit has
+/// none), taken from the definition's allowed unit of that `unit_ref` (the unit is null when the
+/// definition does not allow it), the mapping, profile and qualification references, both
+/// policies' references and digests, change support, subject and resource types. No text and no
+/// availability.
 #[must_use]
 pub fn evidence_json(definition: &QuotaDefinition, unit_ref: &str) -> Value {
     let unit = definition
@@ -317,6 +324,9 @@ pub fn evidence_json(definition: &QuotaDefinition, unit_ref: &str) -> Value {
                 "digest": unit.digest,
                 "numerator": unit.numerator,
                 "denominator": unit.denominator,
+                "min": unit.min,
+                "step": unit.step,
+                "max": unit.max,
             })
         });
     json!({
@@ -509,6 +519,166 @@ pub fn rule_json(rule: &PlanQuotaRuleV1) -> Value {
 /// `CorruptRow` naming the revision and rule ([`stored_rule`]).
 pub fn rule_of(row: &rule_e::Model) -> Result<PlanQuotaRuleV1, RepoError> {
     stored_rule(row).map(|stored| stored.rule)
+}
+
+/// The stored evidence as [`evidence_json`] writes it: only the members the pinned evidence
+/// reads. Versions read through Products' own canonical rule (a decimal string from 1).
+#[derive(serde::Deserialize)]
+struct StoredEvidence {
+    sku_id: Uuid,
+    sku_version: QuotaVersion,
+    metric_ref: String,
+    metric_digest: String,
+    quota_kind: String,
+    canonical_unit_ref: String,
+    unit: Option<StoredUnit>,
+    mapping_ref: ProductsOwnerRef,
+    profile_ref: ProductsOwnerRef,
+    accounting_policy_ref: String,
+    accounting_policy_digest: String,
+    scope_policy_ref: String,
+    scope_policy_digest: String,
+    change_support: StoredChangeSupport,
+}
+
+/// The rule's unit in the stored evidence: its digest, its factor into the canonical unit, and
+/// its grid and maximum. Every member is required, `max` too (`null` when the unit has none): no
+/// evidence was stored without them.
+#[derive(serde::Deserialize)]
+struct StoredUnit {
+    digest: String,
+    numerator: String,
+    denominator: String,
+    min: String,
+    step: String,
+    #[serde(deserialize_with = "present")]
+    max: Option<String>,
+}
+
+/// A member that must be present, `null` included: unlike a plain `Option`, a missing one does
+/// not read.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    <Option<String> as serde::Deserialize>::deserialize(d)
+}
+
+/// The change support in the stored evidence.
+#[derive(serde::Deserialize)]
+struct StoredChangeSupport {
+    initial_set: bool,
+    increase: bool,
+}
+
+/// A rule's stored evidence ([`evidence_json`]) as the SDK's pinned evidence (D-547): the quota
+/// kind, the mapping and profile references (`mapping_ref`, `profile_ref`), the rule's unit
+/// digest, factor, grid and maximum (the `unit` member), both policies and the change support
+/// (`change_support.initial_set`, `change_support.increase`). Digests read from 64 lowercase hex
+/// characters into bytes, versions from canonical decimal strings into positive integers, the
+/// kind through its token; the metric is the one the rule's definition version carried at the
+/// save, the metric Products answers for that version. Products checked the grid when it
+/// approved the unit, so the grid is only read here.
+/// # Errors
+/// `CorruptRow` for evidence that does not read so: a missing or mistyped member, a null `unit`
+/// (the definition did not allow the rule's unit), a digest that is not 64 lowercase hex
+/// characters, a version that is not a canonical integer from 1, a quota kind that is not a known
+/// token, a unit factor that Products' parser refuses ([`Factor::parse`]: two canonical integers
+/// from 1 that fit in 128 bits, without a common divisor), a unit `min`, `step` or `max` that is
+/// not a canonical decimal integer ([`Amount::parse`]: at most 39 digits that fit in 128 bits), or
+/// a `max` below the `min`.
+pub fn evidence_of(evidence: &Value) -> Result<PinnedQuotaEvidence, RepoError> {
+    let corrupt = |what: &str| RepoError::CorruptRow(format!("plan quota rule evidence: {what}"));
+    let stored = <StoredEvidence as serde::Deserialize>::deserialize(evidence)
+        .map_err(|error| corrupt(&format!("it does not read: {error}")))?;
+    let unit = stored.unit.ok_or_else(|| {
+        corrupt("its unit is null: the definition does not allow the rule's unit")
+    })?;
+    let digest = |text: &str, what: &str| {
+        digest_from_hex(text)
+            .ok_or_else(|| corrupt(&format!("{what} is not 64 lowercase hex characters")))
+    };
+    let version = |version: QuotaVersion| {
+        NonZeroU64::new(version.get()).ok_or_else(|| corrupt("a version is not from 1"))
+    };
+    let owner = |reference: &ProductsOwnerRef, what: &str| {
+        Ok::<_, RepoError>(QuotaOwnerRef {
+            id: reference.id,
+            version: version(reference.version)?,
+            digest: digest(&reference.digest, what)?,
+        })
+    };
+    Factor::parse(&unit.numerator, &unit.denominator)
+        .map_err(|error| corrupt(&format!("its unit factor does not read: {error}")))?;
+    let amount = |text: &str, member: &str| {
+        Amount::parse(text)
+            .map_err(|error| corrupt(&format!("its unit {member} does not read: {error}")))
+    };
+    let min = amount(&unit.min, "min")?;
+    amount(&unit.step, "step")?;
+    if let Some(max) = &unit.max
+        && amount(max, "max")? < min
+    {
+        return Err(corrupt("its unit max is below its unit min"));
+    }
+    let quota_kind = PlanQuotaKind::from_token(&stored.quota_kind)
+        .ok_or_else(|| corrupt("its quota kind is not a known token"))?;
+    Ok(PinnedQuotaEvidence {
+        sku_id: stored.sku_id,
+        sku_version: version(stored.sku_version)?,
+        metric_digest: digest(&stored.metric_digest, "its metric digest")?,
+        metric_ref: stored.metric_ref,
+        quota_kind,
+        canonical_unit_ref: stored.canonical_unit_ref,
+        unit_digest: digest(&unit.digest, "its unit digest")?,
+        unit_numerator: unit.numerator,
+        unit_denominator: unit.denominator,
+        unit_min: unit.min,
+        unit_step: unit.step,
+        unit_max: unit.max,
+        mapping: owner(&stored.mapping_ref, "its mapping digest")?,
+        profile: owner(&stored.profile_ref, "its profile digest")?,
+        accounting_policy_digest: digest(
+            &stored.accounting_policy_digest,
+            "its accounting policy digest",
+        )?,
+        accounting_policy_ref: stored.accounting_policy_ref,
+        scope_policy_digest: digest(&stored.scope_policy_digest, "its scope policy digest")?,
+        scope_policy_ref: stored.scope_policy_ref,
+        initial_set_supported: stored.change_support.initial_set,
+        increase_supported: stored.change_support.increase,
+    })
+}
+
+/// A revision's stored set as the preview's quota terms (D-547): every rule in its stored order
+/// (`rule_id`) with the evidence its definition pinned at the save, and the stored set digest.
+/// No catalog call: the terms read only what the set stored.
+/// # Errors
+/// `CorruptRow` for a rule ([`stored_rule`]) or its evidence ([`evidence_of`]) that does not read,
+/// or a set digest that is not 64 lowercase hex characters.
+pub fn quota_terms(set: &StoredSet) -> Result<QuotaTerms, RepoError> {
+    let quota_rules_digest = digest_from_hex(&set.digest).ok_or_else(|| {
+        RepoError::CorruptRow("plan quota set digest is not 64 lowercase hex characters".into())
+    })?;
+    let rules = set
+        .rules
+        .iter()
+        .map(|row| {
+            let stored = stored_rule(row)?;
+            let evidence = evidence_of(&stored.evidence).map_err(|error| match error {
+                RepoError::CorruptRow(why) => RepoError::CorruptRow(format!(
+                    "plan quota rule {} of revision {}: {why}",
+                    row.rule_id, row.revision_id
+                )),
+                other => other,
+            })?;
+            Ok(ResolvedQuotaRule {
+                rule: stored.rule,
+                evidence,
+            })
+        })
+        .collect::<Result<Vec<_>, RepoError>>()?;
+    Ok(QuotaTerms {
+        quota_rules_digest,
+        rules,
+    })
 }
 
 /// The items a capture judged a set against: each item's SKU and entry.

@@ -84,6 +84,32 @@ impl QuotaSubjectSelector {
     }
 }
 
+/// The kind of a quota, as its definition pinned it (Products' `QuotaKind`); v1 knows one value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PlanQuotaKind {
+    /// Capacity the service allocates to a subject and enforces.
+    Allocation,
+}
+
+impl PlanQuotaKind {
+    /// The REST and digest token: `allocation`.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Allocation => "allocation",
+        }
+    }
+
+    /// The kind a token names, if any. Tokens are exact: no case folding.
+    #[must_use]
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "allocation" => Some(Self::Allocation),
+            _ => None,
+        }
+    }
+}
+
 /// An exact Products definition version: its id, its version and the digest Products gave it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct QuotaDefinitionRef {
@@ -104,7 +130,8 @@ pub struct PlanQuotaRuleV1 {
     pub definition_ref: QuotaDefinitionRef,
     /// An item of the same revision.
     pub item_id: Uuid,
-    /// The item's dimension value; `None` only for an item without a dimension.
+    /// The item's dimension value. `None` on an item without a dimension; on an item with one,
+    /// `None` is the item's default rule for its quota (D-541).
     pub dimension_value: Option<String>,
     /// The binding that groups the rules one adapter target provisions together.
     pub logical_binding_key: String,
@@ -190,8 +217,9 @@ pub struct PlanQuotaRulesV1 {
     pub quota_rules_digest: Digest,
 }
 
-/// An item a check row is about: the item, its SKU and its entry, and on a quota row the rule and
-/// its member (D-544).
+/// An item a check row is about: the item, its SKU and its entry, and on a quota row that names a
+/// rule, the rule and its member (D-544); the line of an uncovered sellable cell names only its
+/// item.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanCheckSubjectV1 {
     /// The item.
@@ -200,9 +228,11 @@ pub struct PlanCheckSubjectV1 {
     pub sku_id: Uuid,
     /// The entry the item names; `None` for an item without one.
     pub price_book_entry_id: Option<Uuid>,
-    /// The quota rule a quota row names; `None` on every other row.
+    /// The quota rule a quota row names; `None` on every other row, and for an uncovered sellable
+    /// cell, whose line names only its item.
     pub quota_rule_id: Option<Uuid>,
-    /// The rule's top-level member (`""` for the rule as a whole); `None` on every other row.
+    /// The rule's top-level member (`""` for the rule as a whole); `None` whenever
+    /// `quota_rule_id` is `None`.
     pub field: Option<String>,
 }
 

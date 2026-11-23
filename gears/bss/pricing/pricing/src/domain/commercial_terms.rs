@@ -1,13 +1,19 @@
 //! Pure supported-sale profile. The caller supplies independently resolved selected bindings.
+//!
+//! @cpt-dod:cpt-cf-bss-pricing-dod-plan-quota-rules-acceptance:p1
 use super::{RuleError, book, money, usage_policy};
 use bss_pricing_sdk::{
     Digest,
-    acceptance::{CommercialReason as R, NewSaleQuery, Term},
-    digest::{billing_terms_digest, money_digest, policy_digest, template_digest, terms_digest},
+    acceptance::{AcceptedQuotaSnapshot, CommercialReason as R, NewSaleQuery, Term},
+    digest::{
+        billing_terms_digest, money_digest, policy_digest, template_digest, terms_digest,
+        verify_quota_snapshot,
+    },
     numeric,
     read::{AcceptedBinding, ChargeKind, PriceModel},
     terms::{BillingAnchor, BillingCycle, RatingWindow, Rounding, TermsSource},
 };
+use bss_products_sdk::quota::validation::{QUANTITY_FIELD, QuotaCheck, QuotaCheckCode};
 use std::collections::BTreeSet;
 use time::{Month, Time, UtcOffset};
 
@@ -97,26 +103,71 @@ pub fn validate_commercial_terms(
     Ok(())
 }
 /// Validate an issued receipt as stored: its frozen query and bindings as
-/// [`validate_commercial_terms`] does, then its terms digest recomputed from that content. Each
-/// price is checked at its own stored currency spec, never the current currency table's, so a
-/// receipt replays whatever the table says later; a stored field edited without its digest is
-/// refused.
+/// [`validate_commercial_terms`] does, then its frozen quota snapshot (`quota`, `None` for a
+/// receipt without one) with [`verify_quota_snapshot`] (D-548), then its terms digest recomputed
+/// from that content. The snapshot check recomputes the selected and snapshot digests from the
+/// stored rules, limits, availability revisions and quantity, so an edit of any of them is
+/// refused, not only an edit of the stored snapshot digest. Each price is checked at its own
+/// stored currency spec, never the current currency table's, so a receipt replays whatever the
+/// table says later; a stored field edited without its digest is refused.
 ///
 /// The receipt was checked when it was issued, so any refusal here means the stored row is
 /// corrupt. Fulfilment answers it as a corrupt row (a logged 500), never as a client error.
 /// # Errors
 /// The first refusal of [`validate_commercial_terms`], then `ACCEPTANCE_MISMATCH` when the stored
-/// content no longer hashes to `issued_terms_digest`.
+/// snapshot fails [`verify_quota_snapshot`] or the stored content no longer hashes to
+/// `issued_terms_digest`.
 pub fn validate_stored_terms(
     q: &NewSaleQuery,
     bindings: &[AcceptedBinding],
+    quota: Option<&AcceptedQuotaSnapshot>,
     issued_terms_digest: &Digest,
 ) -> Result<(), RuleError> {
     validate_commercial_terms(q, bindings)?;
-    if terms_digest(q, bindings) != *issued_terms_digest {
+    if verify_quota_snapshot(q, quota).is_err()
+        || terms_digest(q, bindings, quota) != *issued_terms_digest
+    {
         return Err(R::AcceptanceMismatch.into());
     }
     Ok(())
+}
+/// The plan quantity of a sale that selects quota rules (D-548), as Products judges it: a whole
+/// number from 1, written as a canonical decimal integer (`2.00` is `2`). A sale that selects no
+/// rule never asks.
+/// # Errors
+/// `QUANTITY_INVALID` for a fraction or a quantity below 1.
+pub fn quota_quantity(quantity: rust_decimal::Decimal) -> Result<String, RuleError> {
+    let whole = quantity.normalize();
+    if whole.scale() != 0 || whole < rust_decimal::Decimal::ONE {
+        return Err(R::InvalidQuantity.into());
+    }
+    Ok(whole.to_string())
+}
+
+/// The refusal that Products' checks of a sale's selected rules give an acceptance (D-548), the
+/// first that applies in this order: a definition that is not enabled is `NOT_SELLABLE`; a changed
+/// definition is `RESOLUTION_CHANGED`; any check other than a final limit off its grid at the
+/// quantity (`QUOTA_AMOUNT_INVALID` on Products' [`QUANTITY_FIELD`]) is `UNSUPPORTED_TERMS`;
+/// otherwise it is `QUANTITY_INVALID`. A refusal that no quantity can fix wins over one that a new
+/// quantity can fix: a final limit off its grid adds only its own check on `quantity`, so any
+/// other check refuses the sale at every quantity. `None` when there is no check.
+#[must_use]
+pub fn quota_refusal(checks: &[QuotaCheck]) -> Option<R> {
+    let any = |code: QuotaCheckCode| checks.iter().any(|check| check.code == code);
+    let off_grid = |check: &QuotaCheck| {
+        check.code == QuotaCheckCode::AmountInvalid && check.field == QUANTITY_FIELD
+    };
+    if checks.is_empty() {
+        None
+    } else if any(QuotaCheckCode::QualificationUnavailable) {
+        Some(R::NotSellable)
+    } else if any(QuotaCheckCode::DefinitionChanged) {
+        Some(R::ResolutionChanged)
+    } else if checks.iter().all(off_grid) {
+        Some(R::InvalidQuantity)
+    } else {
+        Some(R::UnsupportedTerms)
+    }
 }
 fn validate_billing_terms(q: &NewSaleQuery) -> Result<(), RuleError> {
     let t = &q.billing_terms;

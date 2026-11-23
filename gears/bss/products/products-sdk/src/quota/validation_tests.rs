@@ -1,5 +1,5 @@
-//! The quota-set validation contract (P-D-275, P-D-276): the stable check codes, the answer's
-//! `ok()`, and the definition reference's wire shape.
+//! The quota-set validation contract (P-D-275, P-D-276): the stable check codes, the name of the
+//! `quantity` field, the answer's `ok()`, and the definition reference's wire shape.
 #![allow(clippy::unwrap_used)]
 use super::*;
 
@@ -18,6 +18,11 @@ fn every_check_code_has_its_stable_token() {
             "QUOTA_QUALIFICATION_UNAVAILABLE",
         ]
     );
+}
+
+#[test]
+fn the_quantity_field_has_its_stable_name() {
+    assert_eq!(QUANTITY_FIELD, "quantity");
 }
 
 #[test]

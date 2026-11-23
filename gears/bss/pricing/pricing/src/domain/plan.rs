@@ -12,7 +12,7 @@
 //! @cpt-dod:cpt-cf-bss-pricing-dod-plan-blocked-by:p1
 //! @cpt-dod:cpt-cf-bss-pricing-dod-plan-quota-rules-checks:p1
 //!
-//! A revision with quota rules adds the eight quota rows of D-544 after every other row
+//! A revision with quota rules adds the nine quota rows of D-544 after every other row
 //! ([`super::plan_quota::check_rows`]), judged on the verdict its reader read from Products.
 //! Without that verdict the rows fail closed ([`super::plan_quota::unjudged_rows`]): the
 //! revision never reads ready.
@@ -945,7 +945,7 @@ pub fn checks(ctx: &PlanContext, today: Date) -> Vec<Check> {
     // @cpt-begin:cpt-cf-bss-pricing-flow-plan-quota-rules:p1:inst-quota-check
     if !ctx.quota_rules.is_empty() {
         if let Some(verdict) = &ctx.quota_verdict {
-            out.extend(super::plan_quota::check_rows(ctx, verdict));
+            out.extend(super::plan_quota::check_rows(ctx, verdict, sale));
         } else {
             tracing::error!(
                 revision_id = %ctx.revision.id,

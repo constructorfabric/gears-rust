@@ -635,6 +635,7 @@ mod with_feature {
                 plan_id: query.plan_id,
                 revision_id: query.plan_revision_id,
                 cells: Vec::new(),
+                quota_terms: None,
             })
         }
     }
@@ -654,6 +655,7 @@ mod with_feature {
             plan_id: Uuid::from_u128(1),
             revision_id: REVISION,
             cells: Vec::new(),
+            quota_terms: None,
         };
         NewSaleQuery {
             tenant_axes: TenantAxes {
@@ -677,6 +679,7 @@ mod with_feature {
             billing_terms,
             resolved_bindings_digest: selected_bindings_digest(&resolved, &[]).unwrap(),
             hold_policy_version: 1,
+            expected_quota_digest: None,
         }
     }
 

@@ -227,6 +227,7 @@ impl PricingReadV1 for FakePricing {
                 .lock()
                 .as_ref()
                 .map_or_else(|| self.cells.clone(), |(_, cells)| cells.clone()),
+            quota_terms: None,
         })
     }
     async fn price(

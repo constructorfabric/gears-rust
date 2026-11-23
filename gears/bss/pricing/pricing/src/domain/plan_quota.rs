@@ -10,17 +10,21 @@
 //!   (products P-D-276) into violations of the rules they name, and [`unjudged`] finds the rules
 //!   Products was sent but did not judge against the definition each names (its contract break).
 //! - [`refusal_status`] is the status of a refusal of them, and [`check_rows`] the quota rows of
-//!   a revision's checks.
+//!   a revision's checks, which also show a sellable cell that selects no rule of a metric the
+//!   item's rules carry (`QUOTA_RULE_MISSING`, D-547).
 //!
 //! The parse also keeps every text within the bounds that Products' validation refuses as a
 //! malformed request (`bss_products_sdk::quota::validation`), so a body that parses is never a
 //! Products 400; the caps Pricing keeps of its own are tied to Products' bounds at compile time.
-use super::plan::{Check, PlanContext, Subject};
+use super::plan::{Check, Item, PlanContext, Subject};
+use super::price;
 use bss_pricing_sdk::Digest;
+use bss_pricing_sdk::digest::{CoverageRule, uncovered_metrics};
 use bss_pricing_sdk::plan_quota::{
     BINDING_KEY_MAX, MAX_RULES, PlanQuotaBasis, PlanQuotaRuleV1, QuotaDefinitionRef,
     QuotaSubjectSelector, SCOPE_KEYS_MAX, SCOPE_VALUE_MAX, binding_key_is_valid,
 };
+use bss_pricing_sdk::read::{BindingSelection, UncoveredQuota};
 use bss_products_sdk::quota::catalog::{QuotaDefinition, QuotaVersion};
 use bss_products_sdk::quota::units::Amount;
 use bss_products_sdk::quota::validation::{
@@ -29,6 +33,7 @@ use bss_products_sdk::quota::validation::{
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashSet};
 use std::num::NonZeroU64;
+use time::Date;
 use uuid::Uuid;
 
 /// The body's member, and the path of a violation of the whole set.
@@ -49,6 +54,8 @@ const UNIT_INEXACT: &str = "QUOTA_UNIT_INEXACT";
 const SET_INCOMPATIBLE: &str = "QUOTA_SET_INCOMPATIBLE";
 /// A definition version that is not enabled for sale (Products' check).
 const QUALIFICATION_UNAVAILABLE: &str = "QUOTA_QUALIFICATION_UNAVAILABLE";
+/// A sellable cell that selects no rule of a metric the item's rules carry (D-547).
+const RULE_MISSING: &str = "QUOTA_RULE_MISSING";
 /// The members of a rule, in the order its violations are reported.
 const MEMBERS: [&str; 10] = [
     "rule_id",
@@ -98,6 +105,9 @@ pub struct Violation {
     /// (an unknown member, named in `detail`); `quota_rules` for the whole set.
     pub field: &'static str,
     pub detail: String,
+    /// The item a line of the whole set is about (an uncovered sellable cell, D-544); `None` for
+    /// a rule's violation, which names its rule, and for any other line of the set.
+    pub item: Option<Uuid>,
 }
 
 impl Violation {
@@ -119,6 +129,15 @@ impl Violation {
             rule_id: None,
             field: COLLECTION,
             detail,
+            item: None,
+        }
+    }
+
+    /// A violation of the whole set about one item.
+    fn set_of_item(code: &'static str, item: Uuid, detail: String) -> Self {
+        Self {
+            item: Some(item),
+            ..Self::set(code, detail)
         }
     }
 }
@@ -150,6 +169,7 @@ impl RuleFaults<'_> {
             rule_id: self.rule_id,
             field,
             detail,
+            item: None,
         });
     }
 
@@ -504,7 +524,9 @@ fn dimension_of(object: &Map<String, Value>) -> Result<Option<String>, Fault> {
         },
         Some(_) => Err((
             RULE_INVALID,
-            "dimension_value is a string, or null for an item without a dimension".to_owned(),
+            "dimension_value is a string, or null (an item without a dimension, or an item's \
+             default rule)"
+                .to_owned(),
         )),
     }
 }
@@ -599,6 +621,7 @@ fn parse_rule(
             rule_id: None,
             field: "",
             detail: "a rule is an object".to_owned(),
+            item: None,
         });
         return None;
     };
@@ -685,11 +708,13 @@ fn on(
         rule_id: Some(rule.rule_id),
         field,
         detail,
+        item: None,
     }
 }
 
 /// Each rule's item is one of `items`, and its dimension value is the item's: null for an item
-/// without a dimension, else a value `registry` lists for the item's key (D-542).
+/// without a dimension; on an item with a dimension, a value `registry` lists for the item's key,
+/// or null for the item's default rule (D-541, D-542).
 #[must_use]
 pub fn item_violations(
     rules: &[PlanQuotaRuleV1],
@@ -712,16 +737,11 @@ pub fn item_violations(
             item.dimension_key.as_deref(),
             rule.dimension_value.as_deref(),
         ) {
-            (None, None) => continue,
+            (_, None) => continue,
             (None, Some(value)) => format!(
                 "item {} has no dimension: its dimension value is null, not {}",
                 item.id,
                 quoted(value)
-            ),
-            (Some(key), None) => format!(
-                "item {} is priced by {}: name one of its values",
-                item.id,
-                quoted(key)
             ),
             (Some(key), Some(value)) => {
                 let listed = registry
@@ -771,7 +791,8 @@ pub fn version_violations(
 }
 
 /// Rules for one `(logical_binding_key, metric)` that would apply together: on two items, or on
-/// one item with the same dimension value (D-542). `metric_of` maps a rule id to its
+/// one item with the same dimension value, two default rules (null) included (D-542). An item's
+/// default rule and its rule for a value are alternatives. `metric_of` maps a rule id to its
 /// definition's metric; a rule without one is not compared.
 #[must_use]
 pub fn duplicate_violations(
@@ -864,6 +885,7 @@ pub fn catalog_violations(
                     rule_id: Some(*rule_id),
                     field,
                     detail: detail.clone(),
+                    item: None,
                 },
                 // Products names only the rules it was given; a stranger is kept on the set.
                 None => Violation::set(code, format!("rule {rule_id}: {detail}")),
@@ -1003,8 +1025,8 @@ pub struct RuleSubject {
     pub field: &'static str,
 }
 
-/// The quota rows in their order (D-544), each with its label.
-const ROWS: [(&str, &str); 8] = [
+/// The quota rows in their order (D-544, D-547), each with its label.
+const ROWS: [(&str, &str); 9] = [
     (RULE_INVALID, "Quota rules name catalog definitions"),
     (DEFINITION_CHANGED, "Quota definitions are unchanged"),
     (AMOUNT_INVALID, "Quota amounts are on their grids"),
@@ -1013,37 +1035,142 @@ const ROWS: [(&str, &str); 8] = [
     (RULE_DUPLICATE, "One rule per binding and metric"),
     (SET_INCOMPATIBLE, "Each binding's rules fit together"),
     (QUALIFICATION_UNAVAILABLE, "Quota definitions are sellable"),
+    (RULE_MISSING, "Every sellable cell has a rule per quota"),
 ];
 
-/// The item, SKU, entry, rule and member a violation of `ctx`'s stored rules names; `None` for a
-/// violation of the whole set, or of a rule whose item the revision does not hold.
-fn rule_subject(ctx: &PlanContext, violation: &Violation) -> Option<Subject> {
-    let rule = ctx.quota_rules.get(violation.index?)?;
-    let item = ctx.items.iter().find(|item| item.id == rule.item_id)?;
+/// The subject a violation of `ctx`'s stored rules names (D-466, D-544): for a rule's violation,
+/// its item, SKU and entry with the rule and member; for a line of the set about one item (an
+/// uncovered sellable cell), that item, its SKU and entry with no rule; `None` for any other line
+/// of the set, and for a rule or item the revision does not hold.
+fn subject(ctx: &PlanContext, violation: &Violation) -> Option<Subject> {
+    let (item_id, quota) = match violation.index {
+        Some(index) => {
+            let rule = ctx.quota_rules.get(index)?;
+            let quota = RuleSubject {
+                rule_id: rule.rule_id,
+                field: violation.field,
+            };
+            (rule.item_id, Some(quota))
+        }
+        None => (violation.item?, None),
+    };
+    let item = ctx.items.iter().find(|item| item.id == item_id)?;
     Some(Subject {
         item: item.id,
         sku: item.sku_id,
         entry: item.price_book_entry_id,
-        quota: Some(RuleSubject {
-            rule_id: rule.rule_id,
-            field: violation.field,
-        }),
+        quota,
     })
+}
+
+/// The cells of `item` that a sale can name on `sale` (D-547): each value the dimension registry
+/// lists for the key of the item's entry, and the cell without a value only where the entry's
+/// default chain has a price in force on that day ([`price::version_at`] with no value): the
+/// price that resolve binds for a sale without a value. A cell that becomes sellable after `sale`
+/// is not counted; acceptance refuses its sale. None for an item whose entry the context does not
+/// hold.
+fn sellable_cells(ctx: &PlanContext, item: &Item, sale: Date) -> Vec<Option<String>> {
+    let Some(entry) = ctx
+        .entries
+        .iter()
+        .find(|entry| Some(entry.id) == item.price_book_entry_id)
+    else {
+        return Vec::new();
+    };
+    let mut cells = Vec::new();
+    if price::version_at(&entry.prices, entry.id, sale, None).is_some() {
+        cells.push(None);
+    }
+    if let Some(key) = &entry.dimension_key {
+        cells.extend(
+            ctx.dimension_values
+                .iter()
+                .filter(|(registered, _)| registered == key)
+                .flat_map(|(_, values)| values.iter().cloned().map(Some)),
+        );
+    }
+    cells
+}
+
+/// Why a sellable cell is uncovered: its item, its cell (a registered value through
+/// [`quoted`], or no value) and the metric no rule covers there.
+fn missing_detail(missing: &UncoveredQuota) -> String {
+    let (item, metric) = (missing.item_id, &missing.metric_ref);
+    match &missing.dimension_value {
+        Some(value) => format!(
+            "item {item} at value {}: no rule of {metric:?} for the value and no default rule",
+            quoted(value)
+        ),
+        None => format!("item {item} without a value: no rule of {metric:?} without a value"),
+    }
+}
+
+/// Each sellable cell on `sale` of an item with rules that selects no rule of a metric the
+/// item's rules carry (D-547), as `QUOTA_RULE_MISSING` on the set with the item as its subject
+/// (D-466: the item turns the row red): one violation per item, cell and metric, in the
+/// revision's item order, each item's cells by value (the cell without a value first), then by
+/// metric. A quota is a metric, whatever its binding, and the coverage is the SDK's
+/// ([`uncovered_metrics`]), the rule an acceptance applies to a sale, over the item's own rules
+/// only. A rule's metric is the one `metric_of` holds for the definition version it names; a rule
+/// without one covers nothing and is red on its own rows. The cells come from the context alone,
+/// with no catalog call ([`sellable_cells`]).
+fn missing_violations(
+    ctx: &PlanContext,
+    metric_of: &BTreeMap<Uuid, String>,
+    sale: Date,
+) -> Vec<Violation> {
+    let rules: Vec<CoverageRule<'_>> = ctx
+        .quota_rules
+        .iter()
+        .filter_map(|rule| {
+            metric_of.get(&rule.rule_id).map(|metric| CoverageRule {
+                item_id: rule.item_id,
+                dimension_value: rule.dimension_value.as_deref(),
+                metric_ref: metric,
+            })
+        })
+        .collect();
+    let mut out = Vec::new();
+    for item in &ctx.items {
+        let own: Vec<CoverageRule<'_>> = rules
+            .iter()
+            .filter(|rule| rule.item_id == item.id)
+            .copied()
+            .collect();
+        if own.is_empty() {
+            continue;
+        }
+        let cells: Vec<BindingSelection> = sellable_cells(ctx, item, sale)
+            .into_iter()
+            .map(|dimension_value| BindingSelection {
+                item_id: item.id,
+                dimension_value,
+            })
+            .collect();
+        out.extend(
+            uncovered_metrics(&own, &cells).iter().map(|missing| {
+                Violation::set_of_item(RULE_MISSING, item.id, missing_detail(missing))
+            }),
+        );
+    }
+    out
 }
 
 /// The quota rows of a revision with rules (D-544), in their order, each red with the
 /// subjects of its violations, or green. The violations are Pricing's own of the stored rules
 /// against `ctx` (items and their entries' dimension keys, the dimension registry, the SKU
 /// versions on the sale date, duplicates by the metrics `verdict` resolved for the versions the
-/// rules name) and Products' checks. A rule Products was sent but did not judge against the
+/// rules name, and each sellable cell on `sale` that selects no rule of a metric, D-547) and
+/// Products' checks. A rule Products was sent but did not judge against the
 /// definition it names ([`unjudged`]) is red `QUOTA_RULE_INVALID` on its `definition_ref`, never
 /// green, and logged as Products' contract break. A red row's detail
 /// lists `"<path>: <detail>"` per violation; its subjects name one rule and member per violation,
-/// in that order, and a violation of the whole set names none. A violation whose code has no row
+/// in that order, an uncovered sellable cell names its item with no rule, and any other violation
+/// of the whole set names none. A violation whose code has no row
 /// of its own is never dropped and never green: it turns `QUOTA_RULE_INVALID` red, its code in
 /// its line.
 #[must_use]
-pub fn check_rows(ctx: &PlanContext, verdict: &QuotaSetValidation) -> Vec<Check> {
+pub fn check_rows(ctx: &PlanContext, verdict: &QuotaSetValidation, sale: Date) -> Vec<Check> {
     let items: Vec<RuleItem> = ctx
         .items
         .iter()
@@ -1065,6 +1192,7 @@ pub fn check_rows(ctx: &PlanContext, verdict: &QuotaSetValidation) -> Vec<Check>
         &ctx.quota_sku_versions,
     ));
     violations.extend(duplicate_violations(&ctx.quota_rules, &metric_of));
+    violations.extend(missing_violations(ctx, &metric_of, sale));
     violations.extend(catalog_violations(&ctx.quota_rules, verdict));
     let sent = sent_rules(&ctx.quota_rules, &items, &ctx.quota_sku_versions);
     for (rule_id, why) in unjudged(sent, verdict) {
@@ -1115,7 +1243,7 @@ pub fn unjudged_rows(ctx: &PlanContext) -> Vec<Check> {
     rows(ctx, &violations)
 }
 
-/// The eight quota rows over `violations`, in their order. A violation whose code has no row of
+/// The nine quota rows over `violations`, in their order. A violation whose code has no row of
 /// its own joins `QUOTA_RULE_INVALID`, its code in its line, and is logged: never dropped, never
 /// green.
 fn rows(ctx: &PlanContext, violations: &[Violation]) -> Vec<Check> {
@@ -1154,7 +1282,7 @@ fn rows(ctx: &PlanContext, violations: &[Violation]) -> Vec<Check> {
                 label: (*label).to_owned(),
                 detail,
                 info: false,
-                subjects: found.iter().filter_map(|v| rule_subject(ctx, v)).collect(),
+                subjects: found.iter().filter_map(|v| subject(ctx, v)).collect(),
                 blocked_by_prices: Vec::new(),
             }
         })

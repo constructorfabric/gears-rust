@@ -113,17 +113,22 @@ fn golden_v1_digests_recompute_from_its_content() {
             selection: q.selections[0].clone(),
             binding: Some(binding.clone()),
         }],
+        quota_terms: None,
     };
     assert_eq!(
         q.resolved_bindings_digest,
         selected_bindings_digest(&resolved, &q.selections).unwrap()
     );
     assert_eq!(receipt.request_digest, request_digest(q));
-    assert_eq!(receipt.terms_digest, terms_digest(q, &receipt.bindings));
+    assert_eq!(
+        receipt.terms_digest,
+        terms_digest(q, &receipt.bindings, receipt.quota.as_ref())
+    );
     assert!(
         bss_pricing::domain::commercial_terms::validate_stored_terms(
             q,
             &receipt.bindings,
+            receipt.quota.as_ref(),
             &receipt.terms_digest
         )
         .is_ok(),
@@ -549,6 +554,7 @@ fn a_price_scale_edited_without_its_digest_is_refused() {
     let refused = bss_pricing::domain::commercial_terms::validate_stored_terms(
         &stored.query,
         &stored.bindings,
+        stored.quota.as_ref(),
         &stored.terms_digest,
     )
     .unwrap_err();
@@ -640,9 +646,48 @@ mod boundary;
 
 mod acceptance_support;
 mod plan_support;
+mod quota_sale_support;
+mod quota_support;
 mod seam_support;
 use acceptance_support::AcceptanceFixture;
 use bss_pricing_sdk::acceptance::SellabilityV1;
+
+/// D-548: the receipt read answers a ruled acceptance as it was issued, its frozen quota snapshot
+/// included, also after the definition is withdrawn and the quota catalog is down: the read
+/// decodes the stored receipt and asks no catalog.
+#[tokio::test]
+async fn the_receipt_read_returns_the_frozen_snapshot() {
+    use bss_pricing_sdk::{
+        acceptance::{AcceptanceQuery, PricingAcceptanceV1},
+        read::CatalogRef,
+    };
+    use quota_sale_support::{Metric, rule, sale_with_rules};
+    let s = sale_with_rules(&[rule(1, Metric::Vcpu, None, "10")]).await;
+    let receipt = s.check(&s.sale(None, "2").await, "read-1").await.unwrap();
+    let quota = receipt.quota.as_ref().expect("a frozen snapshot");
+    assert_eq!(quota.rules[0].limit, "20");
+    s.fake.withdraw_all();
+    s.fake.go_down();
+    let read = s
+        .acceptance
+        .acceptance(
+            &s.ctx,
+            AcceptanceQuery {
+                catalog: CatalogRef {
+                    tenant_id: s.ctx.subject_tenant_id(),
+                },
+                acceptance_id: receipt.acceptance_id,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(read, receipt, "the stored receipt, quota included");
+    assert_eq!(
+        s.acceptance_requests().len(),
+        1,
+        "only the acceptance asked"
+    );
+}
 
 #[tokio::test]
 async fn acceptance_retry_does_not_refresh_the_deadline() {

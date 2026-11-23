@@ -14,7 +14,7 @@ use crate::domain::{
 };
 use crate::infra::{approval_kinds::Kind as ApprovalKind, storage::RepoError};
 use bss_approval::{UnitState, Verdict};
-use bss_pricing_sdk::plan_quota::{PlanQuotaBasis, QuotaSubjectSelector};
+use bss_pricing_sdk::plan_quota::{PlanQuotaBasis, PlanQuotaKind, QuotaSubjectSelector};
 use bss_products_sdk::quota::catalog::QuotaAvailabilityState;
 
 macro_rules! closed_set {
@@ -273,6 +273,11 @@ closed_set!(
     readable
     /// Whose quota a plan quota rule sets (D-541).
     PricingQuotaSubjectSelector from QuotaSubjectSelector { ResourceOwner => "resource_owner" }
+);
+closed_set!(
+    /// The kind of a quota, as a rule's definition pinned it at the save (D-547): Products' one
+    /// v1 kind.
+    PricingQuotaKind from PlanQuotaKind { Allocation => "allocation" }
 );
 closed_set!(
     readable

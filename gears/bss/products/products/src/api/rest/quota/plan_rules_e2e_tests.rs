@@ -9,7 +9,9 @@
 //! enabled; a priced draft revision of a plan with one item of the SKU; a `PUT` of 10 vCPU and
 //! 20 GB per plan unit; green checks; a submit at quorum 0 that publishes the rules unchanged.
 //! Then the refusals: an amount off the catalog's grid, a definition pending qualification that is
-//! saved and checks red, and two definitions of two adapter targets on one binding.
+//! saved and checks red, and two definitions of two adapter targets on one binding. Last, a
+//! purchase of two units through Pricing's read and sellability providers freezes 20 vCPU and
+//! 40 GB (pricing D-547, D-548).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
 use std::sync::Arc;
 
@@ -62,6 +64,9 @@ struct PricingOverProducts {
     hub: Arc<toolkit::ClientHub>,
     router: axum::Router,
     user: SecurityContext,
+    /// Pricing's runtime and policy enforcer, for its in-process providers.
+    state: Arc<bss_pricing::api::rest::authoring::AuthoringState>,
+    enforcer: Arc<PolicyEnforcer>,
     _dsn: TestDsn,
 }
 
@@ -107,7 +112,7 @@ impl PricingOverProducts {
             .unwrap(),
         );
         let router = bss_pricing::api::rest::authoring::router(
-            state,
+            state.clone(),
             &toolkit::api::OpenApiRegistryImpl::new(),
         )
         .layer(axum::Extension((*enforcer).clone()));
@@ -115,6 +120,8 @@ impl PricingOverProducts {
             hub,
             router,
             user: tenant_user(tenant),
+            state,
+            enforcer,
             _dsn: dsn,
         }
     }
@@ -180,9 +187,15 @@ impl PricingOverProducts {
         assert_eq!(status, 200, "{body}");
     }
 
-    /// A book, a monthly entry of `sku` priced from today (applied at once), a plan and one item
-    /// of the SKU on that entry in its draft revision 1.
+    /// A book, a monthly per-unit entry of `sku` priced from today (applied at once), a plan and
+    /// one item of the SKU on that entry in its draft revision 1.
     async fn priced_draft_for(&self, sku: Uuid) -> Draft {
+        self.priced_draft_with(sku, "per_unit", json!({"rate": "1"}))
+            .await
+    }
+
+    /// [`Self::priced_draft_for`] with an entry of `model` priced at `price`.
+    async fn priced_draft_with(&self, sku: Uuid, model: &str, price: Value) -> Draft {
         let code = format!("Q{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
         let (book, _) = self
             .written(
@@ -196,7 +209,7 @@ impl PricingOverProducts {
             .written(
                 Method::POST,
                 &format!("/price-books/{book}/entries"),
-                json!({"sku_id": sku, "period": "month", "model": "per_unit"}),
+                json!({"sku_id": sku, "period": "month", "model": model}),
             )
             .await;
         let entry = entry["id"].as_str().unwrap().to_owned();
@@ -206,7 +219,7 @@ impl PricingOverProducts {
             .written(
                 Method::POST,
                 &format!("/price-book-entries/{entry}/prices"),
-                json!({"price": {"rate": "1"}, "eligibility": "all", "effective_from": today}),
+                json!({"price": price, "eligibility": "all", "effective_from": today}),
             )
             .await;
         let price = draft["items"][0]["id"].as_str().unwrap().to_owned();
@@ -513,4 +526,195 @@ async fn vcpu_and_ram_of_two_adapter_targets_cannot_share_a_binding() {
     }
     let (read, _) = pricing.revision_with_etag(draft.revision).await;
     assert_eq!(read["quota_rules"], json!([]), "nothing is written");
+}
+
+/// Pricing D-547, D-548: a purchase of two units of a plan with 10 vCPU and 20 GB per unit, through
+/// the real catalog. The plan is published with its rules; the buyer resolves it through Pricing's
+/// read provider and sends the selected bindings and selected quota digests of the item's cell at
+/// quantity 2, as an order line does; `SellabilityProvider::check` freezes 20 vCPU and 40 GB, each
+/// rule naming its definition by the catalog's own digest, and the receipt read answers the same
+/// receipt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_purchase_of_two_units_freezes_20_vcpu_and_40_gb() {
+    use bss_pricing::api::{
+        pricing_acceptance::PricingAcceptanceProvider, pricing_read::PricingReadProvider,
+        sellability::SellabilityProvider,
+    };
+    use bss_pricing_sdk::acceptance::{
+        AcceptanceQuery, CommandMeta, Market, NewSaleQuery, PricingAcceptanceV1, SellabilityV1,
+        TenantAxes, Term,
+    };
+    use bss_pricing_sdk::digest::{
+        billing_terms_digest, selected_bindings_digest, selected_quota_digest,
+    };
+    use bss_pricing_sdk::read::{BindingSelection, CatalogRef, PricingReadV1, ResolveQuery};
+    use bss_pricing_sdk::terms::{
+        BillingAnchor, BillingCycle, BillingTerms, TermsSource, Timezone,
+    };
+    let tenant = Uuid::new_v4();
+    let q = quota_app(tenant, QuotaFakes::default()).await;
+    let sku = published_sku(&q, tenant).await;
+    let target = q.fresh_target(tenant).await;
+    let cpu = q.approved_on(tenant, target, vcpu_record(), sku, 3).await;
+    let ram = q
+        .approved_on(tenant, target, ram_record_in(GB_UNIT), sku, 3)
+        .await;
+    q.enable(tenant, cpu.0, cpu.1).await;
+    q.enable(tenant, ram.0, ram.1).await;
+    let pricing = PricingOverProducts::new(&q, tenant).await;
+    // The seeded SKU names no invoice inputs: the seller's defaults supply them.
+    let (_, _, tag) = pricing
+        .call(Method::GET, "/settings", None, None, None)
+        .await;
+    let (status, body, _) = pricing
+        .call(
+            Method::PUT,
+            "/settings",
+            Some(json!({"default_timing": "advance", "default_gl": "4000",
+                "default_tax_category": "standard",
+                "invoice_line_templates": {"recurring": "{sku}"}, "currencies": []})),
+            Some(&tag),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    // A flat monthly price: the seeded SKU has no unit, which a per-unit binding needs.
+    let draft = pricing
+        .priced_draft_with(sku, "flat", json!({"amount": "5"}))
+        .await;
+    let cpu_digest = pricing.definition_digest(cpu.0, cpu.1).await;
+    let ram_digest = pricing.definition_digest(ram.0, ram.1).await;
+    let rules = vec![
+        PricingOverProducts::rule(1, cpu, &cpu_digest, draft.item, "10", VCPU_UNIT),
+        PricingOverProducts::rule(2, ram, &ram_digest, draft.item, "20", GB_UNIT),
+    ];
+    let (status, saved, _) = pricing.put_rules(&draft, rules, "k1").await;
+    assert_eq!(status, 200, "{saved}");
+    pricing.set_quorum("plan_revision", 0).await;
+    let (status, published) = pricing.submit(&draft).await;
+    assert_eq!(status, 201, "{published}");
+    assert_eq!(published["revision"]["state"], "published", "{published}");
+
+    let today = time::OffsetDateTime::now_utc().date();
+    let catalog = CatalogRef { tenant_id: tenant };
+    let read = PricingReadProvider::new(pricing.state.clone(), pricing.enforcer.clone());
+    let resolved = read
+        .resolve(
+            &pricing.user,
+            ResolveQuery {
+                catalog: catalog.clone(),
+                revision_id: draft.revision,
+                date: today,
+                item_id: None,
+                pins: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    let terms = resolved
+        .quota_terms
+        .as_ref()
+        .expect("the preview's quota terms");
+    assert_eq!(terms.rules.len(), 2);
+    let selections = vec![BindingSelection {
+        item_id: draft.item,
+        dimension_value: None,
+    }];
+    let mut billing_terms = BillingTerms {
+        schema_version: 1,
+        cycle: BillingCycle::Month,
+        anchor: BillingAnchor::Calendar,
+        anchor_at: today
+            .replace_day(1)
+            .expect("the first day of a month")
+            .midnight()
+            .assume_utc(),
+        timezone: Timezone::Utc,
+        source: TermsSource::ExplicitOrder,
+        digest: [0; 32],
+    };
+    billing_terms.digest = billing_terms_digest(&billing_terms);
+    let query = NewSaleQuery {
+        tenant_axes: TenantAxes {
+            seller_tenant_id: tenant,
+            payer_tenant_id: Uuid::new_v4(),
+            resource_tenant_id: Uuid::new_v4(),
+        },
+        order_id: Uuid::new_v4(),
+        order_version: 1,
+        line_id: Uuid::new_v4(),
+        plan_id: resolved.plan_id,
+        plan_revision_id: resolved.revision_id,
+        resolved_bindings_digest: selected_bindings_digest(&resolved, &selections).unwrap(),
+        expected_quota_digest: Some(selected_quota_digest(terms, &selections)),
+        selections,
+        quantity: rust_decimal::Decimal::TWO,
+        market: Market {
+            currency: "EUR".into(),
+            region: None,
+        },
+        start_at: today.midnight().assume_utc(),
+        term: Term::Rolling,
+        billing_terms,
+        hold_policy_version: 1,
+    };
+    let service = Arc::new(
+        bss_pricing::infra::commercial_terms::CommercialTermsService::new(
+            pricing.state.clone(),
+            pricing.enforcer.clone(),
+            Arc::new(bss_pricing::infra::clock::WallClock),
+            bss_pricing::config::SellerHoldPolicy::default(),
+        ),
+    );
+    let receipt = SellabilityProvider::new(service.clone())
+        .check(
+            &pricing.user,
+            query.clone(),
+            CommandMeta {
+                idempotency_key: "buy-two".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt.query, query);
+    let quota = receipt.quota.as_ref().expect("the frozen quota terms");
+    let frozen: Vec<(Uuid, &str, &str, String)> = quota
+        .rules
+        .iter()
+        .map(|accepted| {
+            let rule = &accepted.rule.rule;
+            let digest =
+                bss_pricing::infra::usage_policy_wire::digest_text(rule.definition_ref.digest);
+            (
+                rule.rule_id,
+                accepted.limit.as_str(),
+                rule.unit_ref.as_str(),
+                digest,
+            )
+        })
+        .collect();
+    assert_eq!(
+        frozen,
+        [
+            (Uuid::from_u128(1), "20", VCPU_UNIT, cpu_digest),
+            (Uuid::from_u128(2), "40", GB_UNIT, ram_digest),
+        ],
+        "20 vCPU and 40 GB, each with the catalog's own definition digest"
+    );
+    assert_eq!(quota.original_quantity, rust_decimal::Decimal::TWO);
+    assert_eq!(
+        Some(quota.selected_quota_digest),
+        query.expected_quota_digest
+    );
+    let read_back = PricingAcceptanceProvider::new(service)
+        .acceptance(
+            &pricing.user,
+            AcceptanceQuery {
+                catalog,
+                acceptance_id: receipt.acceptance_id,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(read_back, receipt);
 }

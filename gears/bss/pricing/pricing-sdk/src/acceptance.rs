@@ -1,6 +1,13 @@
 //! Commercial query values. Acceptance methods and persistence are separate capabilities.
-use crate::{Digest, read::BindingSelection, terms::BillingTerms};
+//!
+//! @cpt-dod:cpt-cf-bss-pricing-dod-plan-quota-rules-acceptance:p1
+use crate::{
+    Digest,
+    read::{BindingSelection, ResolvedQuotaRule},
+    terms::BillingTerms,
+};
 use rust_decimal::Decimal;
+use std::num::NonZeroU64;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -68,6 +75,35 @@ pub struct NewSaleQuery {
     pub resolved_bindings_digest: Digest,
     /// Positive version of the seller's hold policy.
     pub hold_policy_version: u64,
+    /// The preview's `selected_quota_digest`; required when the revision has quota rules
+    /// (D-548). `None` keeps a quota-free request's digests as they were.
+    pub expected_quota_digest: Option<Digest>,
+}
+
+/// One accepted rule and its final limit at the original quantity, in the rule's unit (D-548).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedQuotaRule {
+    /// The selected rule with its pinned evidence.
+    pub rule: ResolvedQuotaRule,
+    /// The final limit, a canonical decimal integer in the rule's `unit_ref`.
+    pub limit: String,
+    /// The revision of the definition's availability the acceptance saw.
+    pub availability_revision: NonZeroU64,
+}
+
+/// The quota evidence frozen with the price terms (D-548).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedQuotaSnapshot {
+    /// The digest of the selected rules ([`crate::digest::selected_quota_digest`]).
+    pub selected_quota_digest: Digest,
+    /// The digest that binds the selection to the accepted limits and the sale
+    /// ([`crate::digest::quota_snapshot_digest`]); [`crate::digest::verify_quota_snapshot`]
+    /// checks a stored snapshot against both digests.
+    pub quota_snapshot_digest: Digest,
+    /// The plan quantity accepted.
+    pub original_quantity: Decimal,
+    /// The selected rules, ordered by `rule_id`, each with its final limit.
+    pub rules: Vec<AcceptedQuotaRule>,
 }
 
 /// Stable commercial refusal metadata, independent of transport and provider failures.
@@ -117,6 +153,10 @@ pub enum CommercialReason {
     InvalidMoney,
     /// `INVALID_TIERS` refusal.
     InvalidTiers,
+    /// `QUOTA_RULE_MISSING` refusal: a quota (a metric) of a selected item has neither a rule for
+    /// the requested dimension value nor a default rule of the item (D-547,
+    /// [`crate::digest::uncovered_quotas`]).
+    QuotaRuleMissing,
     /// `NOT_SELLABLE` refusal.
     NotSellable,
     /// `RESOLUTION_CHANGED` refusal.
@@ -167,6 +207,7 @@ impl CommercialReason {
             Self::TemplateDigestMismatch => "TEMPLATE_DIGEST_MISMATCH",
             Self::InvalidMoney => "AMOUNT_INVALID",
             Self::InvalidTiers => "INVALID_TIERS",
+            Self::QuotaRuleMissing => "QUOTA_RULE_MISSING",
             Self::NotSellable => "NOT_SELLABLE",
             Self::ResolutionChanged => "RESOLUTION_CHANGED",
             Self::AcceptanceMismatch => "ACCEPTANCE_MISMATCH",
@@ -206,6 +247,7 @@ impl CommercialReason {
             Self::TemplateDigestMismatch => "TemplateDigestMismatch",
             Self::InvalidMoney => "InvalidMoney",
             Self::InvalidTiers => "InvalidTiers",
+            Self::QuotaRuleMissing => "QuotaRuleMissing",
             Self::NotSellable => "NotSellable",
             Self::ResolutionChanged => "ResolutionChanged",
             Self::AcceptanceMismatch => "AcceptanceMismatch",
@@ -264,7 +306,8 @@ impl From<CommercialReason> for toolkit_canonical_errors::CanonicalError {
             | R::MoneyDigestMismatch
             | R::TemplateDigestMismatch
             | R::InvalidMoney
-            | R::InvalidTiers => CommercialResource::invalid_argument()
+            | R::InvalidTiers
+            | R::QuotaRuleMissing => CommercialResource::invalid_argument()
                 .with_field_violation("commercial_terms", reason.code(), reason.as_str())
                 .create(),
         }
@@ -327,6 +370,8 @@ pub struct AcceptanceReceipt {
     pub hold_until: OffsetDateTime,
     /// Bindings.
     pub bindings: Vec<crate::read::AcceptedBinding>,
+    /// The frozen quota evidence (D-548); `None` for a revision without rules.
+    pub quota: Option<AcceptedQuotaSnapshot>,
 }
 
 /// Exact accepted terms reference.

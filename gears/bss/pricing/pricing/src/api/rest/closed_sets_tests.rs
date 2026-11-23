@@ -302,8 +302,9 @@ fn a_stored_token_outside_its_set_is_a_corrupt_row_naming_it() {
     }
 }
 
-/// D-541, D-542: a quota rule's basis and subject carry the SDK's tokens, and its saved
-/// availability Products' states; each maps to and from its domain enum one to one.
+/// D-541, D-542, D-547: a quota rule's basis, its subject and its definition's kind carry the
+/// SDK's tokens, and its saved availability Products' states; each maps to and from its domain
+/// enum one to one.
 #[test]
 fn quota_rule_sets_carry_the_sdk_and_products_tokens() {
     assert_eq!(
@@ -324,6 +325,18 @@ fn quota_rule_sets_carry_the_sdk_and_products_tokens() {
             PricingQuotaSubjectSelector::stored,
         ),
         [QuotaSubjectSelector::ResourceOwner.token()]
+    );
+    assert_eq!(
+        round_trips(
+            PricingQuotaKind::ALL,
+            PricingQuotaKind::as_str,
+            PricingQuotaKind::stored,
+        ),
+        [PlanQuotaKind::Allocation.token()]
+    );
+    assert_eq!(
+        PlanQuotaKind::from(PricingQuotaKind::from(PlanQuotaKind::Allocation)),
+        PlanQuotaKind::Allocation
     );
     assert_eq!(
         round_trips(

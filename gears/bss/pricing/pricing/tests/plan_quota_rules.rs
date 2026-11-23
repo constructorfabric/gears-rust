@@ -6,7 +6,8 @@ mod plan_support;
 mod quota_support;
 use bss_pricing::infra::storage::repo::plan_quota_repo::empty_digest;
 use quota_support::{
-    draft_with_items, install, path, priced_draft_with_items, put, ram, rule_json, vcpu,
+    draft_with_items, install, path, priced_by_region, priced_draft_with_items, put, ram,
+    rule_json, vcpu,
 };
 use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
 use serde_json::json;
@@ -617,6 +618,49 @@ async fn a_duplicate_set_is_409_quota_rule_duplicate() {
     assert_eq!(stored(&f, &d).await.0["quota_rules"], json!([]));
 }
 
+/// D-541 (the owner's ruling of 2026-11-22): on an item with a dimension, a rule with no dimension
+/// value is the item's default rule for its quota. It is saved beside a rule for `eu` of the same
+/// quota; two default rules for one quota of one item are `QUOTA_RULE_DUPLICATE` and nothing else.
+#[tokio::test]
+async fn a_default_rule_on_an_item_with_a_dimension_is_saved() {
+    let (f, catalog) = plan_support::setup().await;
+    let fake = install(&f);
+    let d = draft_with_items(&f, &catalog).await;
+    priced_by_region(&f).await;
+    let cpu = fake.add(vcpu(d.sku));
+    let mut eu = rule_json(2, &cpu, d.items[0], "20");
+    eu["dimension_value"] = json!("eu");
+    let (s, saved, _) = put(&f, &d, &[rule_json(1, &cpu, d.items[0], "10"), eu], "k1").await;
+    assert_eq!(s, 200, "{saved}");
+    assert_eq!(saved["quota_rules"][0]["dimension_value"], json!(null));
+    assert_eq!(saved["quota_rules"][1]["dimension_value"], "eu");
+    let moved = quota_support::Draft {
+        etag: format!("\"{}\"", saved["revision_version"]),
+        ..d.clone()
+    };
+    let (s, problem, _) = put(
+        &f,
+        &moved,
+        &[
+            rule_json(1, &cpu, d.items[0], "10"),
+            rule_json(3, &cpu, d.items[0], "30"),
+        ],
+        "k2",
+    )
+    .await;
+    assert_eq!(s, 409, "{problem}");
+    let text = problem.to_string();
+    for path in [
+        "quota_rules[0].logical_binding_key",
+        "quota_rules[1].logical_binding_key",
+    ] {
+        assert!(text.contains(path), "{path}: {text}");
+    }
+    assert!(text.contains("QUOTA_RULE_DUPLICATE"), "{text}");
+    assert!(!text.contains("QUOTA_RULE_INVALID"), "{text}");
+    assert_eq!(stored(&f, &d).await.0, saved, "the refusal wrote nothing");
+}
+
 /// A write that stays contended past the transaction's own retries answers 409 `CONTENDED`; it
 /// writes nothing and leaves the key free.
 #[tokio::test]
@@ -960,15 +1004,116 @@ async fn checks_name_the_rule_field_version_and_digest() {
             "QUOTA_RULE_DUPLICATE",
             "QUOTA_SET_INCOMPATIBLE",
             "QUOTA_QUALIFICATION_UNAVAILABLE",
+            "QUOTA_RULE_MISSING",
         ],
-        "the eight quota rows after every other row, in their order"
+        "the nine quota rows after every other row, in their order"
     );
     let last = checks["checks"].as_array().unwrap().last().unwrap();
-    assert_eq!(last["code"], "QUOTA_QUALIFICATION_UNAVAILABLE");
+    assert_eq!(last["code"], "QUOTA_RULE_MISSING");
     assert_eq!(
         fake.requests().len(),
         3,
         "each checks read validates fresh, once"
+    );
+}
+
+/// D-547: a quota is a metric, and the checks show a sellable cell that selects no rule of one.
+/// An item priced by region whose `apac` cell, and the cell without a value that its default
+/// chain prices, leave RAM uncovered reads red `QUOTA_RULE_MISSING`, a line of the set naming
+/// the item, the cell and the metric, with the item as its subject and no rule (D-466), and
+/// submit refuses it; the row asks Products nothing of its own. The same item with a RAM default
+/// reads green and ready.
+#[tokio::test]
+async fn an_uncovered_sellable_cell_checks_red_and_refuses_submit() {
+    let (f, catalog) = plan_support::setup().await;
+    let fake = install(&f);
+    let d = priced_draft_with_items(&f, &catalog).await;
+    quota_support::priced_by_region_values(&f, &["eu", "us", "apac"]).await;
+    let cpu = fake.add(vcpu(d.sku));
+    let mem = fake.add(ram(d.sku));
+    let item = d.items[0];
+    let ram_at = |n: u128, value: Option<&str>| {
+        let mut rule = rule_json(n, &mem, item, "16");
+        rule["dimension_value"] = json!(value);
+        rule
+    };
+    let rules = vec![
+        rule_json(1, &cpu, item, "10"),
+        ram_at(2, Some("eu")),
+        ram_at(3, Some("us")),
+    ];
+    let (s, saved, etag) = put(&f, &d, &rules, "k1").await;
+    assert_eq!(s, 200, "a draft may leave a cell uncovered: {saved}");
+    let (s, checks) = checks_of(&f, d.revision).await;
+    assert_eq!(s, 200, "{checks}");
+    assert_eq!(checks["ready"], false);
+    let missing = row(&checks, "QUOTA_RULE_MISSING");
+    assert_eq!(missing["ok"], false);
+    let ram_metric = quota_support::RAM_METRIC;
+    assert_eq!(
+        missing["detail"],
+        format!(
+            "quota_rules: item {item} without a value: no rule of \"{ram_metric}\" without a \
+             value; quota_rules: item {item} at value \"apac\": no rule of \"{ram_metric}\" for \
+             the value and no default rule"
+        )
+    );
+    let entry = plan_support::items(&f, d.revision)
+        .await
+        .into_iter()
+        .find(|i| i.id == item)
+        .unwrap()
+        .price_book_entry_id;
+    let subject = json!({"item_id": item, "sku_id": d.sku, "price_book_entry_id": entry});
+    assert_eq!(
+        missing["subjects"],
+        json!([subject, subject]),
+        "each line names its item, with no rule"
+    );
+    let red: Vec<&str> = checks["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["ok"] == false)
+        .map(|c| c["code"].as_str().unwrap())
+        .collect();
+    assert_eq!(red, ["QUOTA_RULE_MISSING"], "{checks}");
+    let (s, refusal, _) = f
+        .call(
+            "POST",
+            &format!("/plan-revisions/{}/submit", d.revision),
+            json!({}),
+            None,
+            Some("s1"),
+        )
+        .await;
+    assert_eq!(s, 400, "{refusal}");
+    let text = refusal.to_string();
+    assert!(
+        text.contains("REVISION_CHECKS_RED") && text.contains("QUOTA_RULE_MISSING"),
+        "{text}"
+    );
+    assert_eq!(
+        fake.requests().len(),
+        3,
+        "the PUT, the checks and the submit's capture validate; the row asks nothing more"
+    );
+    assert!(
+        f.all_units("kind=plan_revision").await.is_empty(),
+        "no unit"
+    );
+
+    let d = quota_support::Draft { etag, ..d };
+    let mut covered = rules;
+    covered.push(ram_at(4, None));
+    let (s, saved, _) = put(&f, &d, &covered, "k2").await;
+    assert_eq!(s, 200, "{saved}");
+    let (s, checks) = checks_of(&f, d.revision).await;
+    assert_eq!(s, 200, "{checks}");
+    assert_eq!(row(&checks, "QUOTA_RULE_MISSING")["ok"], true, "{checks}");
+    assert_eq!(
+        checks["ready"], true,
+        "a RAM default covers every cell: {checks}"
     );
 }
 

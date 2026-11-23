@@ -1,4 +1,6 @@
 //! Authorized in-process pricing reads over the same snapshots as REST.
+//!
+//! @cpt-dod:cpt-cf-bss-pricing-dod-plan-quota-rules-acceptance:p1
 use crate::{
     api::rest::authoring::{
         AuthoringState,
@@ -263,6 +265,10 @@ fn required(value: Option<&str>, field: &'static str) -> Result<String, Canonica
         .map(str::to_owned)
         .ok_or_else(|| incomplete(field))
 }
+/// The snapshot as the typed read answers it: every cell with its binding, and the revision's
+/// quota terms read from its stored rules with no catalog call (D-547), `None` for a revision
+/// without rules. The terms carry every rule of the revision, whatever item the read narrows to,
+/// since the set digest covers them all.
 pub(crate) fn project_resolution(s: &ReadSnapshot) -> Result<ResolvedBindings, CanonicalError> {
     let mut cells = Vec::new();
     for r in &s.resolved {
@@ -383,9 +389,20 @@ pub(crate) fn project_resolution(s: &ReadSnapshot) -> Result<ResolvedBindings, C
             cells.push(ResolvedCell { selection, binding });
         }
     }
+    // @cpt-begin:cpt-cf-bss-pricing-flow-plan-quota-rules:p1:inst-quota-preview
+    // @cpt-begin:cpt-cf-bss-pricing-algo-plan-quota-rules-accept:p1:inst-quota-terms
+    let quota_terms = s
+        .quota
+        .as_ref()
+        .map(crate::infra::plan_quota::quota_terms)
+        .transpose()
+        .map_err(DoorError::from)?;
+    // @cpt-end:cpt-cf-bss-pricing-algo-plan-quota-rules-accept:p1:inst-quota-terms
+    // @cpt-end:cpt-cf-bss-pricing-flow-plan-quota-rules:p1:inst-quota-preview
     Ok(ResolvedBindings {
         plan_id: s.revision.plan_id,
         revision_id: s.revision.id,
         cells,
+        quota_terms,
     })
 }

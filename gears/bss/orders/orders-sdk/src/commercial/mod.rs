@@ -189,7 +189,8 @@ impl<'de> Deserialize<'de> for OrderPin {
 impl OrderPin {
     /// Wrap an issued native receipt without changing issuer digests or terms.
     /// # Errors
-    /// Refuses incomplete, inconsistent, oversized or unrepresentable evidence.
+    /// Refuses incomplete, inconsistent, oversized or unrepresentable evidence, and a receipt with
+    /// quota terms (`Unsupported`), which this codec does not carry.
     pub fn new(
         assessment: AssessmentRef,
         selected: AcceptedVersionRef,
@@ -282,6 +283,11 @@ impl OrderPin {
         if d.schema_version != 2 || q.billing_terms.schema_version != 1 {
             return Err(CodecError::Unsupported);
         }
+        // This copy of Orders does not carry quota terms: the pin has no member for them, so a
+        // receipt with them is refused, never pinned without them.
+        if r.quota.is_some() || q.expected_quota_digest.is_some() {
+            return Err(CodecError::Unsupported);
+        }
         if r.bindings.len() > MAX_BINDINGS || q.selections.len() > MAX_BINDINGS {
             return Err(CodecError::TooLarge);
         }
@@ -367,12 +373,13 @@ impl OrderPin {
                     binding: Some(b.clone()),
                 })
                 .collect(),
+            quota_terms: None,
         };
         if selected_bindings_digest(&resolved, &q.selections).map_err(|_| CodecError::Mismatch)?
             != q.resolved_bindings_digest
             || billing_terms_digest(&q.billing_terms) != q.billing_terms.digest
             || request_digest(q) != r.request_digest
-            || terms_digest(q, &r.bindings) != r.terms_digest
+            || terms_digest(q, &r.bindings, r.quota.as_ref()) != r.terms_digest
         {
             return Err(CodecError::Mismatch);
         }

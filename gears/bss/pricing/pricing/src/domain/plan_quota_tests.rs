@@ -254,6 +254,13 @@ fn every_member_is_required_with_its_type() {
         with("dimension_value", json!(7)),
         one("QUOTA_RULE_INVALID", "quota_rules[0].dimension_value")
     );
+    let mut number = rule_json(1, ITEM_A, "10");
+    number["dimension_value"] = json!(7);
+    assert_eq!(
+        parse_rules(&body(vec![number])).unwrap_err()[0].detail,
+        "dimension_value is a string, or null (an item without a dimension, or an item's default \
+         rule)"
+    );
     let mut absent = rule_json(1, ITEM_A, "10");
     absent.as_object_mut().unwrap().remove("dimension_value");
     assert_eq!(
@@ -552,10 +559,9 @@ fn a_dimension_value_must_be_the_items_registered_value() {
     eu["dimension_value"] = json!("eu");
     let mut apac = rule_json(2, ITEM_A, "10");
     apac["dimension_value"] = json!("apac");
-    let none = rule_json(3, ITEM_A, "10");
-    let mut on_b = rule_json(4, ITEM_B, "10");
+    let mut on_b = rule_json(3, ITEM_B, "10");
     on_b["dimension_value"] = json!("eu");
-    let rules = parsed(vec![eu, apac, none, on_b, rule_json(5, ITEM_B, "1")]);
+    let rules = parsed(vec![eu, apac, on_b, rule_json(4, ITEM_B, "1")]);
     assert_eq!(
         paths(&item_violations(&rules, &items, &registry)),
         [
@@ -567,11 +573,55 @@ fn a_dimension_value_must_be_the_items_registered_value() {
                 "QUOTA_RULE_INVALID",
                 "quota_rules[2].dimension_value".to_owned()
             ),
-            (
-                "QUOTA_RULE_INVALID",
-                "quota_rules[3].dimension_value".to_owned()
-            ),
         ]
+    );
+}
+
+/// D-541 (the owner's ruling of 2026-11-22): a rule with no dimension value on an item that has a
+/// dimension is the item's default rule for its quota. It is accepted beside a rule for a value of
+/// the same quota; two default rules for one quota of one item are a duplicate.
+#[test]
+fn a_default_rule_on_an_item_with_a_dimension_is_accepted() {
+    let items = [RuleItem {
+        id: ITEM_A,
+        sku_id: Uuid::from_u128(5),
+        dimension_key: Some("region".into()),
+    }];
+    let registry = vec![("region".to_owned(), vec!["eu".to_owned(), "us".to_owned()])];
+    let default = rule_json(1, ITEM_A, "10");
+    let mut eu = rule_json(2, ITEM_A, "20");
+    eu["dimension_value"] = json!("eu");
+    let rules = parsed(vec![default.clone(), eu]);
+    assert!(
+        item_violations(&rules, &items, &registry).is_empty(),
+        "a default rule and a rule for eu"
+    );
+    let metric = BTreeMap::from([
+        (Uuid::from_u128(1), "vcpu".to_owned()),
+        (Uuid::from_u128(2), "vcpu".to_owned()),
+        (Uuid::from_u128(3), "vcpu".to_owned()),
+    ]);
+    assert!(
+        duplicate_violations(&rules, &metric).is_empty(),
+        "the default and the eu rule of one quota are alternatives"
+    );
+    let mut again = default.clone();
+    again["rule_id"] = json!(Uuid::from_u128(3));
+    let twice = parsed(vec![default, again]);
+    assert!(item_violations(&twice, &items, &registry).is_empty());
+    assert_eq!(
+        paths(&duplicate_violations(&twice, &metric)),
+        [
+            (
+                "QUOTA_RULE_DUPLICATE",
+                "quota_rules[0].logical_binding_key".to_owned()
+            ),
+            (
+                "QUOTA_RULE_DUPLICATE",
+                "quota_rules[1].logical_binding_key".to_owned()
+            )
+        ],
+        "two default rules for one quota of one item"
     );
 }
 
@@ -890,7 +940,7 @@ fn a_rule_with_no_definition_and_no_check_is_rule_invalid() {
             .all(|v| v.rule_id == Some(Uuid::from_u128(2))),
         "the checks of Products name only rule 2"
     );
-    let rows = check_rows(&ctx, &verdict);
+    let rows = check_rows(&ctx, &verdict, SALE);
     assert_eq!(
         red_codes(&rows),
         ["QUOTA_RULE_INVALID", "QUOTA_SCOPE_UNSUPPORTED"]
@@ -941,7 +991,7 @@ fn a_rule_products_leaves_out_of_its_verdict_reads_red() {
         ids(&unjudged(sent, &empty)),
         [Uuid::from_u128(1), Uuid::from_u128(2)]
     );
-    let rows = check_rows(&ctx, &verdict);
+    let rows = check_rows(&ctx, &verdict, SALE);
     assert_eq!(red_codes(&rows), ["QUOTA_RULE_INVALID"]);
     let invalid = &rows[0];
     assert_eq!(
@@ -1018,6 +1068,11 @@ fn only_a_changed_definition_or_a_duplicate_is_a_conflict() {
 const SKU: Uuid = Uuid::from_u128(5);
 const ENTRY: Uuid = Uuid::from_u128(0xe);
 const BOOK: Uuid = Uuid::from_u128(0xbb);
+/// The sale date the quota rows judge: 2026-11-21.
+const SALE: time::Date = match time::Date::from_calendar_date(2026, time::Month::November, 21) {
+    Ok(date) => date,
+    Err(_) => panic!("a calendar date"),
+};
 
 /// One item `ITEM_A` (SKU 5, an entry without a dimension key) whose SKU has version 3 on the
 /// sale date, and the parsed `rules`; no verdict yet.
@@ -1130,7 +1185,7 @@ fn quota_rows_name_the_rule_and_field() {
         "amount",
         "11 is off the grid",
     )]);
-    let rows = check_rows(&ctx, &verdict);
+    let rows = check_rows(&ctx, &verdict, SALE);
     let amount = rows
         .iter()
         .find(|r| r.code == "QUOTA_AMOUNT_INVALID")
@@ -1153,8 +1208,8 @@ fn quota_rows_name_the_rule_and_field() {
     assert!(!amount.info && amount.blocked_by_prices.is_empty());
     assert_eq!(
         rows.iter().filter(|r| r.ok).count(),
-        7,
-        "the other seven rows are green"
+        8,
+        "the other eight rows are green"
     );
 }
 
@@ -1168,7 +1223,7 @@ fn a_disabled_definition_turns_only_the_qualification_row_red() {
         "disabled: qualification_pending",
     )]);
     assert_eq!(
-        red_codes(&check_rows(&ctx, &verdict)),
+        red_codes(&check_rows(&ctx, &verdict, SALE)),
         ["QUOTA_QUALIFICATION_UNAVAILABLE"]
     );
 }
@@ -1176,7 +1231,7 @@ fn a_disabled_definition_turns_only_the_qualification_row_red() {
 #[test]
 fn the_quota_rows_keep_their_order() {
     let ctx = context_with_rules(vec![rule_json(1, ITEM_A, "10")]);
-    let rows = check_rows(&ctx, &judged(&[1]));
+    let rows = check_rows(&ctx, &judged(&[1]), SALE);
     let codes: Vec<&str> = rows.iter().map(|r| r.code).collect();
     assert_eq!(
         codes,
@@ -1188,7 +1243,8 @@ fn the_quota_rows_keep_their_order() {
             "QUOTA_SCOPE_UNSUPPORTED",
             "QUOTA_RULE_DUPLICATE",
             "QUOTA_SET_INCOMPATIBLE",
-            "QUOTA_QUALIFICATION_UNAVAILABLE"
+            "QUOTA_QUALIFICATION_UNAVAILABLE",
+            "QUOTA_RULE_MISSING"
         ]
     );
     assert!(
@@ -1212,7 +1268,7 @@ fn the_rows_judge_items_versions_and_duplicates_from_the_context() {
             .collect(),
         checks: Vec::new(),
     };
-    let rows = check_rows(&ctx, &verdict);
+    let rows = check_rows(&ctx, &verdict, SALE);
     assert_eq!(
         red_codes(&rows),
         ["QUOTA_RULE_INVALID", "QUOTA_RULE_DUPLICATE"]
@@ -1246,7 +1302,7 @@ fn the_rows_judge_items_versions_and_duplicates_from_the_context() {
     ctx.quota_sku_versions.insert(SKU, 3);
     ctx.quota_rules.truncate(1);
     ctx.quota_rules[0].dimension_value = Some("eu".into());
-    let rows = check_rows(&ctx, &judged(&[1]));
+    let rows = check_rows(&ctx, &judged(&[1]), SALE);
     assert_eq!(red_codes(&rows), ["QUOTA_RULE_INVALID"]);
     assert_eq!(
         rows[0].subjects[0].quota.unwrap().field,
@@ -1272,7 +1328,7 @@ fn a_check_that_names_no_rule_is_a_line_of_its_row_without_a_subject() {
             "no increase",
         ),
     ]);
-    let rows = check_rows(&ctx, &verdict);
+    let rows = check_rows(&ctx, &verdict, SALE);
     let set = rows
         .iter()
         .find(|r| r.code == "QUOTA_SET_INCOMPATIBLE")
@@ -1300,8 +1356,8 @@ fn the_quota_rows_follow_every_other_row_and_fail_closed_without_a_verdict() {
     let unjudged = crate::domain::plan::checks(&ctx, today);
     assert_eq!(
         unjudged.len(),
-        rest.len() + 8,
-        "rules with no verdict still get their eight rows"
+        rest.len() + 9,
+        "rules with no verdict still get their nine rows"
     );
     assert_eq!(&unjudged[..rest.len()], rest.as_slice());
     assert_eq!(
@@ -1335,7 +1391,7 @@ fn the_quota_rows_follow_every_other_row_and_fail_closed_without_a_verdict() {
         "not whole",
     )]));
     let with = crate::domain::plan::checks(&ctx, today);
-    assert_eq!(with.len(), rest.len() + 8);
+    assert_eq!(with.len(), rest.len() + 9);
     assert_eq!(&with[..rest.len()], rest.as_slice());
     assert!(
         with[rest.len()..]
@@ -1362,7 +1418,7 @@ fn every_products_code_turns_its_own_row_red() {
                 checks: vec![check(code, rules, "amount", "x")],
                 ..judged(&[1])
             };
-            let rows = check_rows(&ctx, &verdict);
+            let rows = check_rows(&ctx, &verdict, SALE);
             assert_eq!(red_codes(&rows), [code.code()], "{code:?} on {rules:?}");
             assert!(!crate::domain::plan::ready(&rows), "{code:?} on {rules:?}");
         }
@@ -1380,6 +1436,7 @@ fn a_violation_without_a_row_of_its_own_turns_rule_invalid_red() {
         rule_id: Some(Uuid::from_u128(1)),
         field: "amount",
         detail: "new".to_owned(),
+        item: None,
     };
     let rows = rows(&ctx, &[stray]);
     assert_eq!(red_codes(&rows), ["QUOTA_RULE_INVALID"]);
@@ -1446,7 +1503,7 @@ fn a_rule_is_judged_only_against_the_definition_it_names() {
             [Uuid::from_u128(1)],
             "{what}"
         );
-        let rows = check_rows(&ctx, &verdict);
+        let rows = check_rows(&ctx, &verdict, SALE);
         assert!(!rows[0].ok, "{what}: {:?}", rows[0]);
         assert_eq!(
             rows[0]
@@ -1478,10 +1535,10 @@ fn a_rule_is_judged_only_against_the_definition_it_names() {
     );
     assert!(unjudged(&ctx.quota_rules, &changed).is_empty());
     assert_eq!(
-        red_codes(&check_rows(&ctx, &changed)),
+        red_codes(&check_rows(&ctx, &changed, SALE)),
         ["QUOTA_DEFINITION_CHANGED"]
     );
-    assert!(red_codes(&check_rows(&ctx, &judged(&[1]))).is_empty());
+    assert!(red_codes(&check_rows(&ctx, &judged(&[1]), SALE)).is_empty());
 }
 
 /// The duplicates are judged by the metrics of the definition versions the rules name: a verdict
@@ -1496,7 +1553,7 @@ fn a_rule_resolved_to_another_version_lends_no_metric() {
         resolved_metrics(&ctx.quota_rules, &verdict),
         BTreeMap::from([(Uuid::from_u128(1), "cf.compute.vcpu".to_owned())])
     );
-    let rows = check_rows(&ctx, &verdict);
+    let rows = check_rows(&ctx, &verdict, SALE);
     assert_eq!(red_codes(&rows), ["QUOTA_RULE_INVALID"], "no duplicate");
 }
 
@@ -1534,4 +1591,181 @@ fn many_unknown_members_name_the_first_ten_and_count_the_rest() {
     }
     let v = parse_rules(&body(vec![ten])).unwrap_err();
     assert_eq!(v.len(), 10, "ten are named, none counted: {v:#?}");
+}
+
+// ------------------------------------------------- an uncovered sellable cell (QUOTA_RULE_MISSING)
+
+const VCPU: &str = "cf.compute.vcpu";
+const RAM: &str = "cf.compute.ram";
+
+/// [`context_with_rules`] with `ITEM_A`'s entry priced by `region`, whose registered values are
+/// `values`.
+fn by_region(rules: Vec<Value>, values: &[&str]) -> PlanContext {
+    let mut ctx = context_with_rules(rules);
+    ctx.entries[0].dimension_key = Some("region".into());
+    ctx.dimension_values = vec![(
+        "region".into(),
+        values.iter().map(|v| (*v).to_owned()).collect(),
+    )];
+    ctx
+}
+/// Rule `n` on `ITEM_A` for `value` (`None`: the item's default rule) on `binding`.
+fn cell_rule(n: u128, value: Option<&str>, binding: &str) -> Value {
+    let mut rule = rule_json(n, ITEM_A, "10");
+    rule["dimension_value"] = json!(value);
+    rule["logical_binding_key"] = json!(binding);
+    rule
+}
+/// Products' verdict: each rule resolved with a definition of its metric, and no check.
+fn judged_as(rules: &[(u128, &str)]) -> QuotaSetValidation {
+    QuotaSetValidation {
+        rules: rules
+            .iter()
+            .map(|(n, metric)| QuotaRuleVerdict {
+                rule_id: Uuid::from_u128(*n),
+                definition: Some(definition_of(metric)),
+                limit: None,
+            })
+            .collect(),
+        checks: Vec::new(),
+    }
+}
+/// An approved price of `ITEM_A`'s entry on the chain `dim` (`None`: the default chain) from
+/// `from`, open-ended.
+fn chain_price(n: u128, dim: Option<&str>, from: time::Date) -> crate::domain::price::Price {
+    use crate::domain::{money::PriceData, price::*, price_book_entry::Model};
+    Price {
+        id: Uuid::from_u128(0x9000 + n),
+        price_book_entry_id: ENTRY,
+        version_no: 1,
+        dim_value: dim.map(str::to_owned),
+        model: Model::PerUnit,
+        currency: crate::domain::test_support::spec("EUR", 2),
+        price: Some(PriceData::PerUnit {
+            rate: crate::domain::test_support::dec("0.10"),
+        }),
+        min_fee: None,
+        eligibility: Eligibility::All,
+        effective_from: from,
+        effective_to: None,
+        temporary_until: None,
+        paired_price_id: None,
+        return_of_price_id: None,
+        closed_explicitly: false,
+        state: PriceState::Approved,
+    }
+}
+fn missing_row(rows: &[Check]) -> &Check {
+    rows.iter()
+        .find(|r| r.code == "QUOTA_RULE_MISSING")
+        .unwrap()
+}
+
+/// D-547: a quota is a metric. Every sellable cell of an item with rules must select a rule of
+/// each metric the item's rules carry: a registered value whose metric has neither a rule for
+/// the value nor a default rule turns `QUOTA_RULE_MISSING` red, a line of the set naming the item,
+/// the value and the metric, with the item as its subject (D-466) and no rule, and the revision
+/// is not ready. A default rule of that metric turns it green.
+#[test]
+fn an_uncovered_sellable_cell_turns_quota_rule_missing_red() {
+    assert_eq!(
+        RULE_MISSING,
+        bss_pricing_sdk::acceptance::CommercialReason::QuotaRuleMissing.code(),
+        "the row carries the acceptance's code"
+    );
+    let rules = vec![
+        cell_rule(1, None, "compute"),
+        cell_rule(2, Some("eu"), "compute"),
+        cell_rule(3, Some("us"), "compute"),
+    ];
+    let verdict = judged_as(&[(1, VCPU), (2, RAM), (3, RAM)]);
+    let ctx = by_region(rules.clone(), &["eu", "us", "apac"]);
+    let rows = check_rows(&ctx, &verdict, SALE);
+    assert_eq!(red_codes(&rows), ["QUOTA_RULE_MISSING"]);
+    let missing = missing_row(&rows);
+    assert_eq!(
+        missing.detail,
+        "quota_rules: item 00000000-0000-0000-0000-00000000000a at value \"apac\": no rule of \
+         \"cf.compute.ram\" for the value and no default rule"
+    );
+    assert_eq!(missing.label, "Every sellable cell has a rule per quota");
+    assert_eq!(
+        missing.subjects,
+        [crate::domain::plan::Subject {
+            item: ITEM_A,
+            sku: SKU,
+            entry: Some(ENTRY),
+            quota: None,
+        }],
+        "the item turns the row red; no rule is at fault"
+    );
+    assert!(!crate::domain::plan::ready(&rows));
+
+    let mut with_default = rules;
+    with_default.push(cell_rule(4, None, "compute"));
+    let ctx = by_region(with_default, &["eu", "us", "apac"]);
+    let verdict = judged_as(&[(1, VCPU), (2, RAM), (3, RAM), (4, RAM)]);
+    let rows = check_rows(&ctx, &verdict, SALE);
+    assert!(red_codes(&rows).is_empty(), "a RAM default covers apac");
+}
+
+/// D-547: the checks judge a quota by its metric, whatever its binding: one binding per region
+/// for one metric leaves no sellable cell uncovered; a cell no binding names is uncovered once.
+#[test]
+fn per_region_bindings_leave_no_sellable_cell_uncovered() {
+    let rules = vec![
+        cell_rule(1, Some("eu"), "compute-eu"),
+        cell_rule(2, Some("us"), "compute-us"),
+    ];
+    let verdict = judged_as(&[(1, VCPU), (2, VCPU)]);
+    let rows = check_rows(&by_region(rules.clone(), &["eu", "us"]), &verdict, SALE);
+    assert!(red_codes(&rows).is_empty(), "{rows:#?}");
+    let rows = check_rows(&by_region(rules, &["eu", "us", "apac"]), &verdict, SALE);
+    assert_eq!(
+        missing_row(&rows).detail,
+        "quota_rules: item 00000000-0000-0000-0000-00000000000a at value \"apac\": no rule of \
+         \"cf.compute.vcpu\" for the value and no default rule"
+    );
+}
+
+/// D-547: the cell without a value is sellable only where the revision prices it directly, on the
+/// default chain on the sale date (a sale without a value binds that price); a value's own price,
+/// or a default price from a later day, does not make it sellable.
+#[test]
+fn the_cell_without_a_value_counts_only_where_the_default_chain_prices_it() {
+    let rules = vec![
+        cell_rule(1, Some("eu"), "compute"),
+        cell_rule(2, Some("us"), "compute"),
+    ];
+    let verdict = judged_as(&[(1, VCPU), (2, VCPU)]);
+    let mut ctx = by_region(rules, &["eu", "us"]);
+    assert!(red_codes(&check_rows(&ctx, &verdict, SALE)).is_empty());
+    ctx.entries[0].prices = vec![chain_price(1, Some("eu"), SALE)];
+    assert!(
+        red_codes(&check_rows(&ctx, &verdict, SALE)).is_empty(),
+        "a value's own price"
+    );
+    ctx.entries[0].prices = vec![chain_price(2, None, SALE.next_day().unwrap())];
+    assert!(
+        red_codes(&check_rows(&ctx, &verdict, SALE)).is_empty(),
+        "a default price from a later day"
+    );
+    ctx.entries[0].prices = vec![chain_price(3, None, SALE)];
+    let rows = check_rows(&ctx, &verdict, SALE);
+    assert_eq!(red_codes(&rows), ["QUOTA_RULE_MISSING"]);
+    assert_eq!(
+        missing_row(&rows).detail,
+        "quota_rules: item 00000000-0000-0000-0000-00000000000a without a value: no rule of \
+         \"cf.compute.vcpu\" without a value"
+    );
+}
+
+/// D-547: an item without a dimension sells one cell, without a value, which its rules cover.
+#[test]
+fn a_dimensionless_item_with_rules_leaves_no_cell_uncovered() {
+    let mut ctx = context_with_rules(vec![rule_json(1, ITEM_A, "10")]);
+    ctx.entries[0].prices = vec![chain_price(1, None, SALE)];
+    let rows = check_rows(&ctx, &judged(&[1]), SALE);
+    assert!(red_codes(&rows).is_empty(), "{rows:#?}");
+    assert_eq!(missing_row(&rows).detail, "ok");
 }

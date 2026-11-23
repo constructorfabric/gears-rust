@@ -14,8 +14,8 @@ use bss_pricing_sdk::plan_quota::{
 };
 use bss_products_sdk::quota::catalog::QuotaDefinition;
 use quota_support::{
-    Draft, disabled, draft_with_items, install, path, priced_draft_with_items, put, ram, rule_json,
-    vcpu,
+    Draft, disabled, draft_with_items, install, path, priced_by_region, priced_draft_with_items,
+    put, ram, rule_json, vcpu,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -347,6 +347,37 @@ async fn the_sdk_replace_answers_what_rest_answers() {
             .await
             .contains("REVISION_NOT_DRAFT"),
         "a locked draft"
+    );
+}
+
+/// D-541 (the owner's ruling of 2026-11-22): the SDK saves an item's default rule (no dimension
+/// value on an item with a dimension) beside a rule for `eu` of the same quota, as the `PUT` does.
+#[tokio::test]
+async fn the_sdk_saves_a_default_rule_on_an_item_with_a_dimension() {
+    let (f, catalog) = plan_support::setup().await;
+    let fake = install(&f);
+    let d = draft_with_items(&f, &catalog).await;
+    priced_by_region(&f).await;
+    let cpu = fake.add(vcpu(d.sku));
+    let mut eu = typed(2, &cpu, d.items[0], "20");
+    eu.dimension_value = Some("eu".into());
+    let saved = client(&f)
+        .replace_quota_rules(
+            &f.ctx,
+            d.revision,
+            version(&d.etag),
+            "k1",
+            vec![typed(1, &cpu, d.items[0], "10"), eu],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        saved
+            .quota_rules
+            .iter()
+            .map(|r| r.rule.dimension_value.as_deref())
+            .collect::<Vec<_>>(),
+        [None, Some("eu")]
     );
 }
 

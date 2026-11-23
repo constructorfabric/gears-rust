@@ -4,8 +4,9 @@
 //!
 //! A read writes nothing: no audit row, no idempotency key, no binding. `resolve` reads the stored
 //! revision in ONE transaction (the revision, its plan and items, each entry with ALL its prices,
-//! the dimension registry, the settings and the `keep_for_bound` ids); an unknown or another
-//! tenant's revision is 404 there, before any Products read. The pure model then judges the pins
+//! the dimension registry, the settings, the `keep_for_bound` ids and the revision's quota rules
+//! with their set row, D-547); an unknown or another tenant's revision is 404 there, before any
+//! Products read. The pure model then judges the pins
 //! (`domain::resolve::matrix`), and only then, outside the transaction, is each SKU version read
 //! as of the date through the detached registry (D-421), as pricing's system actor (D-424): the
 //! caller has passed `plan:read` and its tenant holds the revision, the plan read already
@@ -20,6 +21,7 @@
 //!
 //! @cpt-dod:cpt-cf-bss-pricing-dod-binding-sku-version:p1
 //! @cpt-dod:cpt-cf-bss-pricing-dod-price-read-forever:p1
+//! @cpt-dod:cpt-cf-bss-pricing-dod-plan-quota-rules-acceptance:p1
 pub mod dto;
 use super::authoring::{
     AuthoringState,
@@ -47,9 +49,9 @@ use authz_resolver_sdk::PolicyEnforcer;
 use axum::{Extension, Router, extract::Path, http::StatusCode, response::Response};
 use bss_products_sdk::models::SkuVersion;
 use dto::{
-    PricingPinnedPriceDto, PricingResolveBindingDto, PricingResolveChainDto, PricingResolveDto,
-    PricingResolveInputDto, PricingResolveItemDto, PricingResolveMeterDto, PricingResolveQuery,
-    PricingResolveSkuVersionDto,
+    PricingPinnedPriceDto, PricingQuotaTermsDto, PricingResolveBindingDto, PricingResolveChainDto,
+    PricingResolveDto, PricingResolveInputDto, PricingResolveItemDto, PricingResolveMeterDto,
+    PricingResolveQuery, PricingResolveSkuVersionDto,
 };
 use std::{collections::BTreeMap, sync::Arc};
 use time::Date;
@@ -75,7 +77,9 @@ pub fn router(state: Arc<AuthoringState>, openapi: &dyn OpenApiRegistry) -> Rout
              PIN_DUPLICATE or PINS_TOO_MANY; 404 for an unknown revision or item; 409 \
              REVISION_NOT_PUBLISHED for a draft or pending revision, REVISION_NOT_YET_AVAILABLE \
              for a scheduled one before its sale date; Products' own refusal of a SKU read; 503 \
-             REGISTRY_UNAVAILABLE when Products cannot answer.",
+             REGISTRY_UNAVAILABLE when Products cannot answer. A revision with quota rules also \
+             answers quota_terms: every stored rule with the evidence its definition pinned at \
+             the save and the stored set digest, read with no quota catalog call (D-547).",
         )
         .tag("Pricing")
         .authenticated()
@@ -408,5 +412,15 @@ fn render(
         currency: stored.currency.clone(),
         date: date.to_string(),
         items,
+        // @cpt-begin:cpt-cf-bss-pricing-flow-plan-quota-rules:p1:inst-quota-preview
+        quota_terms: stored
+            .quota
+            .as_ref()
+            .map(crate::infra::plan_quota::quota_terms)
+            .transpose()
+            .map_err(stored_failure)?
+            .as_ref()
+            .map(PricingQuotaTermsDto::of),
+        // @cpt-end:cpt-cf-bss-pricing-flow-plan-quota-rules:p1:inst-quota-preview
     })
 }

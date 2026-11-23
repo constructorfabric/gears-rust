@@ -80,7 +80,8 @@ fn two_hundred_line_corpus_has_unique_receipts_and_round_trips() {
         receipt.query.line_id = Uuid::from_u128(10_000 + index);
         receipt.acceptance_id = Uuid::from_u128(20_000 + index);
         receipt.request_digest = digest::request_digest(&receipt.query);
-        receipt.terms_digest = digest::terms_digest(&receipt.query, &receipt.bindings);
+        receipt.terms_digest =
+            digest::terms_digest(&receipt.query, &receipt.bindings, receipt.quota.as_ref());
         assert!(lines.insert(receipt.query.line_id));
         assert!(acceptances.insert(receipt.acceptance_id));
         let pin = OrderPin::new(
