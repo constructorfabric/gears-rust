@@ -21,7 +21,7 @@ GTS schema ID: `gts.cf.core.errors.error_info.v1~`
 ## Constructor Example
 
 ```rust
-use cf_toolkit_errors::CanonicalError;
+use toolkit_canonical_errors::CanonicalError;
 
 let err = CanonicalError::unauthenticated()
     .with_reason("TOKEN_EXPIRED")

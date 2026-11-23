@@ -13,16 +13,25 @@
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `retry_after_seconds` | `u64` | Minimum seconds to wait before retrying |
+| `retry_after_seconds` | `Option<u64>` | Minimum seconds to wait before retrying; omitted when not set |
+| `reason` | `Option<String>` | SDK-defined reason code (e.g., `UPSTREAM_DISABLED`); omitted when not set |
 | `extra` | `Option<Object>` | Reserved for derived GTS type extensions (p3+); absent in p1 |
+
+`reason` is a reason code defined in the SDK of the service that emits the error, as a typed enum, not human-readable text (that is `detail`). Producers send only codes from that enum. `with_reason` accepts any string, so the toolkit does not check the code. A reader keeps an unknown code as is and draws no conclusion from it: for example, an unknown code does not show that a non-idempotent request is safe to retry.
 
 ## Constructor Example
 
 ```rust
-use cf_toolkit_errors::CanonicalError;
+use toolkit_canonical_errors::CanonicalError;
 
 let err = CanonicalError::service_unavailable()
     .with_retry_after_seconds(30)
+    .create();
+
+// With an optional reason code
+let err = CanonicalError::service_unavailable()
+    .with_retry_after_seconds(300)
+    .with_reason("UPSTREAM_DISABLED")
     .create();
 ```
 
@@ -44,12 +53,15 @@ let err = CanonicalError::service_unavailable()
         "status": { "const": 503 },
         "context": {
           "type": "object",
-          "required": ["retry_after_seconds"],
           "properties": {
             "retry_after_seconds": {
               "type": "integer",
               "minimum": 0,
               "description": "Minimum seconds to wait before retrying"
+            },
+            "reason": {
+              "type": "string",
+              "description": "SDK-defined reason code (set via with_reason()); omitted when not set"
             },
             "extra": {
               "type": ["object", "null"],
@@ -74,6 +86,21 @@ let err = CanonicalError::service_unavailable()
   "detail": "Service temporarily unavailable",
   "context": {
     "retry_after_seconds": 30
+  }
+}
+```
+
+With a reason:
+
+```json
+{
+  "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~",
+  "title": "Service Unavailable",
+  "status": 503,
+  "detail": "Service temporarily unavailable",
+  "context": {
+    "retry_after_seconds": 300,
+    "reason": "UPSTREAM_DISABLED"
   }
 }
 ```

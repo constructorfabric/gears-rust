@@ -57,6 +57,20 @@ fn canonical_error_into_response_sets_retry_after_header() {
 }
 
 #[test]
+fn service_unavailable_with_reason_keeps_retry_after_header() {
+    let response = CanonicalError::service_unavailable()
+        .with_retry_after_seconds(30)
+        .with_reason("UPSTREAM_DISABLED")
+        .create()
+        .into_response();
+
+    assert_eq!(
+        response.headers().get(http::header::RETRY_AFTER),
+        Some(&http::HeaderValue::from_static("30"))
+    );
+}
+
+#[test]
 fn service_unavailable_without_retry_hint_omits_retry_after_header() {
     let response = CanonicalError::service_unavailable()
         .create()
@@ -90,6 +104,24 @@ fn another_category_with_retry_field_omits_retry_after_header() {
     let response = problem.into_response();
 
     assert!(response.headers().get(http::header::RETRY_AFTER).is_none());
+}
+
+#[test]
+fn relayed_service_unavailable_with_invalid_reason_keeps_retry_after_header() {
+    let mut problem = Problem::from(
+        CanonicalError::service_unavailable()
+            .with_retry_after_seconds(30)
+            .create(),
+    );
+    problem.context = serde_json::json!({ "retry_after_seconds": 30, "reason": 17 });
+
+    let response = problem.into_response();
+
+    assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response.headers().get(http::header::RETRY_AFTER),
+        Some(&http::HeaderValue::from_static("30"))
+    );
 }
 
 #[test]

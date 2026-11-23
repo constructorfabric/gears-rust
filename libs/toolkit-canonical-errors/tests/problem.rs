@@ -393,6 +393,7 @@ fn round_trip_service_unavailable_preserves_retry_after() {
     match restored {
         CanonicalError::ServiceUnavailable { ctx, .. } => {
             assert_eq!(ctx.retry_after_seconds, Some(30));
+            assert!(ctx.reason.is_none());
         }
         other => panic!("expected ServiceUnavailable, got {other:?}"),
     }
@@ -408,6 +409,69 @@ fn round_trip_service_unavailable_without_retry_after() {
         }
         other => panic!("expected ServiceUnavailable, got {other:?}"),
     }
+}
+
+#[test]
+fn round_trip_service_unavailable_preserves_reason() {
+    let original = CanonicalError::service_unavailable()
+        .with_retry_after_seconds(300)
+        .with_reason("UPSTREAM_DISABLED")
+        .create();
+    let restored = round_trip(original);
+    match restored {
+        CanonicalError::ServiceUnavailable { ctx, .. } => {
+            assert_eq!(ctx.retry_after_seconds, Some(300));
+            assert_eq!(ctx.reason.as_deref(), Some("UPSTREAM_DISABLED"));
+        }
+        other => panic!("expected ServiceUnavailable, got {other:?}"),
+    }
+}
+
+#[test]
+fn service_unavailable_wire_without_reason_is_unchanged() {
+    // Clients built before `reason` existed see the same bytes.
+    let problem = Problem::from(
+        CanonicalError::service_unavailable()
+            .with_retry_after_seconds(30)
+            .create(),
+    );
+    let wire = serde_json::to_string(&problem).unwrap();
+    let expected = format!(
+        r#"{{"type":"{}","title":"Service Unavailable","status":503,"detail":"Service temporarily unavailable","context":{{"retry_after_seconds":30}}}}"#,
+        gts_uri!("cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~"),
+    );
+    assert_eq!(wire, expected);
+}
+
+#[test]
+fn service_unavailable_wire_with_reason() {
+    let problem = Problem::from(
+        CanonicalError::service_unavailable()
+            .with_retry_after_seconds(30)
+            .with_reason("UPSTREAM_NOT_CONTACTED")
+            .create(),
+    );
+    let json = serde_json::to_value(&problem).unwrap();
+    assert_eq!(
+        json["context"],
+        serde_json::json!({ "retry_after_seconds": 30, "reason": "UPSTREAM_NOT_CONTACTED" })
+    );
+}
+
+#[test]
+fn service_unavailable_empty_reason_is_omitted() {
+    // An empty reason is none, as on the `deadline_exceeded` builder.
+    let problem = Problem::from(
+        CanonicalError::service_unavailable()
+            .with_retry_after_seconds(30)
+            .with_reason("")
+            .create(),
+    );
+    let json = serde_json::to_value(&problem).unwrap();
+    assert_eq!(
+        json["context"],
+        serde_json::json!({ "retry_after_seconds": 30 })
+    );
 }
 
 #[test]
@@ -454,11 +518,79 @@ fn round_trip_deadline_exceeded() {
     let original = R::deadline_exceeded("Operation timed out").create();
     let restored = round_trip(original);
     match restored {
-        CanonicalError::DeadlineExceeded { detail, .. } => {
+        CanonicalError::DeadlineExceeded { detail, ctx, .. } => {
             assert_eq!(detail, "Operation timed out");
+            assert!(ctx.reason.is_none());
         }
         other => panic!("expected DeadlineExceeded, got {other:?}"),
     }
+}
+
+#[test]
+fn round_trip_deadline_exceeded_preserves_reason() {
+    let original = R::deadline_exceeded("Operation timed out")
+        .with_reason("REQUEST_MAY_HAVE_BEEN_SENT")
+        .create();
+    let restored = round_trip(original);
+    match restored {
+        CanonicalError::DeadlineExceeded {
+            ctx, resource_type, ..
+        } => {
+            assert_eq!(ctx.reason.as_deref(), Some("REQUEST_MAY_HAVE_BEEN_SENT"));
+            assert_eq!(resource_type.as_deref(), Some(USER_RESOURCE));
+        }
+        other => panic!("expected DeadlineExceeded, got {other:?}"),
+    }
+}
+
+#[test]
+fn deadline_exceeded_empty_reason_is_omitted() {
+    let problem = Problem::from(
+        R::deadline_exceeded("Operation timed out")
+            .with_reason("")
+            .create(),
+    );
+    let json = serde_json::to_value(&problem).unwrap();
+    assert_eq!(
+        json["context"],
+        serde_json::json!({ "resource_type": USER_RESOURCE })
+    );
+}
+
+#[test]
+fn deadline_exceeded_reason_and_resource_in_either_order() {
+    let reason_first = R::deadline_exceeded("Operation timed out")
+        .with_reason("UPSTREAM_NOT_CONTACTED")
+        .with_resource("session-abc")
+        .create();
+    let resource_first = R::deadline_exceeded("Operation timed out")
+        .with_resource("session-abc")
+        .with_reason("UPSTREAM_NOT_CONTACTED")
+        .create();
+    for err in [reason_first, resource_first] {
+        let json = serde_json::to_value(Problem::from(err)).unwrap();
+        assert_eq!(
+            json["context"],
+            serde_json::json!({
+                "reason": "UPSTREAM_NOT_CONTACTED",
+                "resource_type": USER_RESOURCE,
+                "resource_name": "session-abc",
+            })
+        );
+    }
+}
+
+#[test]
+fn deadline_exceeded_wire_without_reason_is_unchanged() {
+    // Clients built before `reason` existed see the same bytes.
+    let problem = Problem::from(R::deadline_exceeded("Operation timed out").create());
+    let wire = serde_json::to_string(&problem).unwrap();
+    let expected = format!(
+        r#"{{"type":"{}","title":"Deadline Exceeded","status":504,"detail":"Operation timed out","context":{{"resource_type":"{}"}}}}"#,
+        gts_uri!("cf.core.errors.err.v1~cf.core.err.deadline_exceeded.v1~"),
+        USER_RESOURCE,
+    );
+    assert_eq!(wire, expected);
 }
 
 #[test]
@@ -657,6 +789,28 @@ fn try_from_malformed_context_returns_error() {
     match CanonicalError::try_from(problem) {
         Err(ProblemConversionError::InvalidContext { category, .. }) => {
             assert_eq!(category, "resource_exhausted");
+        }
+        other => panic!("expected InvalidContext, got {other:?}"),
+    }
+}
+
+#[test]
+fn try_from_non_string_reason_returns_error() {
+    let problem = Problem {
+        problem_type: gts_uri!("cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~")
+            .to_owned(),
+        title: "Service Unavailable".to_owned(),
+        status: Some(503),
+        detail: "Service temporarily unavailable".to_owned(),
+        instance: None,
+        trace_id: None,
+        context: serde_json::json!({ "retry_after_seconds": 30, "reason": 17 }),
+        error_code: None,
+        error_domain: None,
+    };
+    match CanonicalError::try_from(problem) {
+        Err(ProblemConversionError::InvalidContext { category, .. }) => {
+            assert_eq!(category, "service_unavailable");
         }
         other => panic!("expected InvalidContext, got {other:?}"),
     }

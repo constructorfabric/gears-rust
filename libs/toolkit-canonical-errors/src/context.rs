@@ -160,15 +160,51 @@ impl InvalidArgumentV1 {
 
 pub type InvalidArgument = InvalidArgumentV1;
 
+/// An optional reason code is unset when `None` or empty.
+#[allow(
+    clippy::ref_option,
+    reason = "signature required by serde skip_serializing_if"
+)]
+fn reason_is_unset(reason: &Option<String>) -> bool {
+    reason.as_deref().is_none_or(str::is_empty)
+}
+
+/// Read an optional reason code, an empty string as `None`.
+fn empty_reason_as_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.filter(|r| !r.is_empty()))
+}
+
 // 04 DeadlineExceeded — context: DeadlineExceeded
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(clippy::empty_structs_with_brackets)]
-pub struct DeadlineExceededV1 {}
+pub struct DeadlineExceededV1 {
+    /// Machine-readable reason code (e.g. `UPSTREAM_NOT_CONTACTED`). `None`
+    /// and an empty string both mean no reason: neither is sent, and an
+    /// empty wire value reads as `None`.
+    #[serde(
+        default,
+        skip_serializing_if = "reason_is_unset",
+        deserialize_with = "empty_reason_as_none"
+    )]
+    pub reason: Option<String>,
+}
 
 impl DeadlineExceededV1 {
     #[must_use]
     pub fn new() -> Self {
-        Self {}
+        Self { reason: None }
+    }
+
+    /// Set the reason code. An empty string means no reason. The code is
+    /// sent in the public response body: pass a fixed code, never caller
+    /// input or secret data.
+    #[must_use]
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        self.reason = (!reason.is_empty()).then_some(reason);
+        self
     }
 }
 
@@ -361,6 +397,15 @@ pub type Internal = InternalV1;
 pub struct ServiceUnavailableV1 {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_after_seconds: Option<u64>,
+    /// Machine-readable reason code (e.g. `UPSTREAM_NOT_CONTACTED`). `None`
+    /// and an empty string both mean no reason: neither is sent, and an
+    /// empty wire value reads as `None`.
+    #[serde(
+        default,
+        skip_serializing_if = "reason_is_unset",
+        deserialize_with = "empty_reason_as_none"
+    )]
+    pub reason: Option<String>,
 }
 
 impl ServiceUnavailableV1 {
@@ -368,7 +413,18 @@ impl ServiceUnavailableV1 {
     pub fn new(retry_after_seconds: Option<u64>) -> Self {
         Self {
             retry_after_seconds,
+            reason: None,
         }
+    }
+
+    /// Set the reason code. An empty string means no reason. The code is
+    /// sent in the public response body: pass a fixed code, never caller
+    /// input or secret data.
+    #[must_use]
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        self.reason = (!reason.is_empty()).then_some(reason);
+        self
     }
 }
 

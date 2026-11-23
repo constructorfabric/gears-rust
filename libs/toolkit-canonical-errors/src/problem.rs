@@ -720,15 +720,14 @@ impl TryFrom<Problem> for CanonicalError {
 /// Same rule as `CanonicalError::retry_after_seconds`, applied to the wire form
 /// so a `Problem` relayed from another service gets the header too.
 ///
-/// Every other category, and a context that does not deserialize, gets no header.
+/// Every other category, a `service_unavailable` hint that is not a `u64`,
+/// and a `resource_exhausted` context that does not deserialize get no header.
 #[cfg(feature = "axum")]
 fn retry_after_seconds(problem: &Problem) -> Option<u64> {
     match category_from_problem_type(&problem.problem_type)? {
-        "service_unavailable" => {
-            ServiceUnavailable::deserialize(&problem.context)
-                .ok()?
-                .retry_after_seconds
-        }
+        // Only the hint is read, so a bad value in another context field
+        // (e.g. a non-string `reason` from a peer) keeps the header.
+        "service_unavailable" => problem.context.get("retry_after_seconds")?.as_u64(),
         "resource_exhausted" => ResourceExhausted::deserialize(&problem.context)
             .ok()?
             .retry_after_seconds(),
