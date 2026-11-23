@@ -360,7 +360,7 @@ impl SqlConsumptionStore {
             let wakes = AttemptWakes::begin(&self.enqueuer);
             let enqueuer = wakes.enqueuer();
             let clock = Arc::clone(&self.clock);
-            let scope_owned = scope.clone();
+            let grant = scope.clone();
             let events = events.to_vec();
             let write_owned = write.clone();
             let metric = preview.metric.clone();
@@ -369,7 +369,16 @@ impl SqlConsumptionStore {
                 wakes,
                 self.db.transaction_ref_mapped(move |tx| {
                     Box::pin(async move {
-                        let scope = &scope_owned;
+                        // The caller's grant admits the lease row and nothing
+                        // else. A grant for one lease names it by token, and
+                        // only `qe_leases` keys its resource by token: on a hold
+                        // or a counter the resource is a Quota, and a table
+                        // without one drops the constraint and denies
+                        // everything. So the rows this lease owns (its holds,
+                        // their counters, the record and the log) are reached
+                        // under its tenant, which the preview matched, and the
+                        // grant still decides which lease that is.
+                        let scope = &AccessScope::for_tenant(tenant.as_uuid());
                         let now = clock();
                         // Rank 2 first: the scope's stripe (I8), then the record,
                         // so a settlement that already succeeded replays even
@@ -392,7 +401,7 @@ impl SqlConsumptionStore {
                         // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-lock
                         let lease = lease_repo::find_for_update(
                             tx,
-                            scope,
+                            &grant,
                             token.as_uuid(),
                             RowWait::Nowait,
                         )
@@ -509,7 +518,7 @@ impl SqlConsumptionStore {
                         // @cpt-begin:cpt-cf-quota-enforcement-state-lease:p1:inst-lst-commit
                         // @cpt-begin:cpt-cf-quota-enforcement-state-lease:p1:inst-lst-release
                         let state = settlement.state();
-                        if !lease_repo::mark_state(tx, scope, token.as_uuid(), state, now).await? {
+                        if !lease_repo::mark_state(tx, &grant, token.as_uuid(), state, now).await? {
                             return Err(TxError::Storage(StorageError::LeaseNotActive { token }));
                         }
                         // @cpt-end:cpt-cf-quota-enforcement-state-lease:p1:inst-lst-release
